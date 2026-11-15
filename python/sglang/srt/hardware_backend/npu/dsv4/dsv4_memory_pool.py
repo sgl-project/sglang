@@ -8,9 +8,11 @@ rules as the GPU implementation:
 * C128A state follows ``req_pool_idx`` and absolute position.
 
 ``NPUCompressStatePool`` adds the contiguous 3-D view and positive dummy
-location required by the Atlas fused compressor operators. arch22 uses explicit
-locations; Ascend 950 uses the same ring storage through its request-bank (cycle) ABI.
-There is no paged state allocator or ``cache_mode=1`` compatibility storage.
+location required by the Atlas fused compressor operators; the V4 compressor
+op consumes the explicit cache_mode=2 table on every arch. V4.1's ratio-2
+pending-pair pool keeps the plain GPU-style class and is addressed through
+the cycle request-bank ABI instead. There is no paged state allocator or
+``cache_mode=1`` compatibility storage.
 """
 
 from __future__ import annotations
@@ -19,6 +21,7 @@ from typing import List, Optional, Tuple
 
 import torch
 import torch_npu
+from sgl_kernel_npu.operators.mem_cache import kv_compress_epilog
 
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.hardware_backend.npu.dsv4.npu_kv_layout import NPUDSV4KVLayout
@@ -40,7 +43,7 @@ from sglang.srt.runtime_context import get_schedule
 class NPUDeepSeekV4SingleKVPool(DeepSeekV4SingleKVPool):
     """NPU PA_ND variant of the full / SWA / c4 / c128 single-KV pool.
 
-    ``npu_sparse_attn_sharedkv`` reads KV in PA_ND layout
+    The sparse-attention ops read KV in PA_ND layout
     ``(num_pages, kernel_page_size, num_kv_heads=1, dim)`` with ``dim`` packing
     K_nope + K_rope as bf16 before arch35; arch35 uses packed FP8 KV rows (the row
     format comes from :class:`NPUDSV4KVLayout`). C4 uses its native page so
@@ -156,8 +159,8 @@ class NPUCompressStatePool(CompressStatePool):
     a cleared positive dummy row for explicit-location callers.
 
     Location 0 is valid in explicit mode. Invalid/history-padding locations map
-    to the final cleared row instead of ``-1`` because the arch22 kernel consumes
-    unsigned offsets.
+    to the final cleared row instead of ``-1`` because the fused compressor
+    kernels consume unsigned offsets.
     """
 
     def __init__(
@@ -232,11 +235,14 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
     """NPU c4-indexer pool. Allocates only dedicated int8 K + float16 scale
     buffers in PA_ND layout at the native C4 ``kernel_page_size``, written by
     ``torch_npu.npu_scatter_nd_update_`` and read by
-    ``torch.ops.custom.npu_quant_lightning_indexer``. The base packed CUDA
-    ``index_k_with_scale_buffer`` is NOT allocated: every NPU consumer (the
-    compute scatter/read path, the PD ``get_contiguous_buf_infos`` override,
-    and the HiCache indexer regions) addresses the NPU buffers directly, so
-    the CUDA packed buffer would be dead memory.
+    ``cann_ops_transformer.quant_lightning_indexer`` (DSV4; the backend calls
+    it through the ``sgl_kernel_npu.operators.indexer`` wrapper). DSV4.1's
+    low-ratio pools override the row format and are read by the ds41 ops
+    instead. The base packed CUDA ``index_k_with_scale_buffer`` is NOT
+    allocated: every NPU consumer (the compute scatter/read path, the PD
+    ``get_contiguous_buf_infos`` override, and the HiCache indexer regions)
+    addresses the NPU buffers directly, so the CUDA packed buffer would be
+    dead memory.
     """
 
     def __init__(self, *args, kernel_page_size: int, **kwargs):
@@ -504,12 +510,12 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         )
         config = self.compressed_pool_configs[ratio]
         ring_size = self.get_ring_size(ratio)
-        # Ascend 950 cache_mode=2 addresses one ring bank per request.  The arch22
-        # explicit-location path can share the smaller flat pool, but the Ascend 950
-        # cycle ABI needs enough physical banks for every req_pool_idx.
+        # cache_mode=2 addresses one ring bank per request. V4's compressor
+        # op (upstream ABI) reaches the request-scoped c128 banks through the
+        # explicit table's req-position translation, and V4.1's ds41
+        # compressor through the cycle request-bank table — both need enough
+        # physical banks for every req_pool_idx.
         size = config.state_size
-        if is_npu_arch35():
-            size = max(size, self.num_req_slots * ring_size)
         return NPUCompressStatePool(
             size=size,
             ring_size=ring_size,
@@ -657,43 +663,25 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         return data_ptrs, data_lens, item_lens
 
     def get_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
-        """GPU-compatible ``StateType.SWA`` component.
+        """GPU-compatible ``StateType.SWA`` component containing SWA KV only.
 
-        On pre-Ascend 950 (EXPLICIT cache_mode), SWA KV, C4 attention state and C4
-        indexer state retain separate buffers but share the same SWA page/state
-        index.  On Ascend 950 (CYCLE cache_mode) the compressor addresses the C4 state
-        ring by ``req_pool_idx`` instead of SWA page, so C4 state is excluded
-        here and registered separately via :meth:`get_c4_state_buf_infos`.
+        C4 state follows SWA pages on both A3 and Ascend 950, but P and D
+        can have different ring sizes. Register it separately through
+        :meth:`get_c4_state_buf_infos` as equal-sized row items rather than
+        whole rings with different byte strides.
         """
-        data_ptrs: List[int] = []
-        data_lens: List[int] = []
-        item_lens: List[int] = []
-
-        for buf in self.swa_kv_pool.kv_buffer:
-            data_ptrs.append(buf.data_ptr())
-            data_lens.append(buf.nbytes)
-            item_lens.append(buf[0].nbytes)
-
-        if not is_npu_arch35():
-            for pools in (
-                self.compress_state_pools,
-                self.indexer_compress_state_pools,
-            ):
-                for pool in pools:
-                    if pool is None or pool.ratio != 4:
-                        continue
-                    state = pool.kv_score_buffer.kv_score
-                    data_ptrs.append(state.data_ptr())
-                    data_lens.append(state.nbytes)
-                    item_lens.append(state[0].nbytes * pool.ring_size)
-
-        return data_ptrs, data_lens, item_lens
+        buffers = self.swa_kv_pool.kv_buffer
+        return (
+            [buf.data_ptr() for buf in buffers],
+            [buf.nbytes for buf in buffers],
+            [buf[0].nbytes for buf in buffers],
+        )
 
     def get_c4_state_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
         """C4 compress state ring (attention + indexer).
 
         Register one physical state row as an item.  PD peers can have
-        different request-local ring sizes (for example prefill without MTP
+        different SWA-page ring sizes (for example prefill without MTP
         and decode with MTP), so payload indices map the same logical token
         positions into each peer's local ring independently.
         """
@@ -725,9 +713,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
 
     def get_state_cache(self, layer_id: int, from_indexer: bool) -> torch.Tensor:
         """FP32 ``[block_num, ring_size, 2*coff*D]`` view of this layer's
-        kv+score buffer — the fused compressor op
-        (``torch.ops.custom.compressor`` on Ascend 950 and ``torch.ops.npu.compressor``
-        elsewhere)'s ``state_cache`` argument."""
+        kv+score buffer — the public compressor operator's ``state_cache``
+        argument."""
         return self._get_state_pool(layer_id, from_indexer).state_cache_3d
 
     # ------------------------------------------------------------------
@@ -805,7 +792,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
         Routes to c4 / c128 kv_pool by layer compression ratio. Returns
         ``None`` for ratio == 0 (no compress KV exists). The
         from_indexer=True branch returns the dedicated quantized K buffer that
-        ``torch.ops.custom.npu_quant_lightning_indexer`` consumes.
+        ``cann_ops_transformer.quant_lightning_indexer`` consumes.
         """
         self.wait_layer_transfer(layer_id)
         item = self.layer_mapping[layer_id]
@@ -877,8 +864,8 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             )
         if cache_2d.shape[0] == 0:
             return
-        torch.ops.npu.kv_compress_epilog(
-            buf.view(-1, 1, buf.shape[-1]),
+        kv_compress_epilog(
+            buf,
             cache_2d,
             slot_mapping,
             quant_group_size=NPUDSV4KVLayout.V4_FP8.quant_group,

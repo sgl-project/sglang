@@ -70,6 +70,9 @@ def query_marlin_supported_quant_types(
     include_fp_type: bool = True,
     device_capability: Optional[int] = None,
 ):
+    if not _is_cuda:
+        return []
+
     if device_capability is None:
         major, minor = get_device_capability()
         capability = major * 10 + minor if major is not None else None

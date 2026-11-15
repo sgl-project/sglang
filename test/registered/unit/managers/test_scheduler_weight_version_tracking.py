@@ -10,6 +10,7 @@ from sglang.srt.managers.io_struct import (
     EndWeightUpdateReqInput,
     PluginWeightUpdateReqInput,
     PluginWeightUpdateReqOutput,
+    ReleaseMemoryOccupationReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -106,6 +107,7 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         scheduler.deferred_responses = DeferredResponses(
             disaggregation_mode=DisaggregationMode.NULL,
             output_streamer=None,
+            request_retirer=None,
             send_abort=None,
         )
         scheduler.token_to_kv_pool_allocator = None
@@ -126,8 +128,6 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
         scheduler.batch_result_processor = SchedulerBatchResultProcessor(
             is_generation=True,
             disaggregation_mode=DisaggregationMode.NULL,
-            enable_overlap=False,
-            enable_overlap_mlx=False,
             model_config=SimpleNamespace(think_end_ids=None),
             token_to_kv_pool_allocator=MagicMock(),
             tree_cache=scheduler.tree_cache,
@@ -144,6 +144,8 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
             beam_coordinator=MagicMock(),
             request_retirer=release_only_retirer(tree_cache=scheduler.tree_cache),
             abort_request=lambda *args, **kwargs: None,
+            still_in_batch=lambda req: True,
+            prefill_launched_reqs=scheduler.prefill_launched_reqs,
         )
         for name, value in (
             ("get_observability", SimpleNamespace(enable_metrics=False)),
@@ -709,6 +711,25 @@ class TestPluginWeightUpdate(_WeightUpdaterManagerTestBase):
         self.assertFalse(unknown.success)
         self.assertIn("nccl", unknown.message)
         self.assertEqual(called, [])
+
+
+class TestReleaseMemoryRefusal(_WeightUpdaterManagerTestBase):
+    def test_an_idle_rank_refuses_when_a_tp_peer_is_busy(self):
+        """A rank that released alone would wait forever in the group barrier."""
+        manager = self._manager(Mock(), session=False)
+        manager.scheduler = None
+        manager.memory_saver_adapter = Mock()
+
+        def a_peer_is_busy(busy, **kwargs):
+            busy.fill_(1)
+
+        with patch("torch.distributed.all_reduce", side_effect=a_peer_is_busy):
+            output = manager.release_memory_occupation(
+                ReleaseMemoryOccupationReqInput(tags=["cuda_graph"])
+            )
+
+        self.assertFalse(output.success)
+        manager.memory_saver_adapter.pause.assert_not_called()
 
 
 class TestPluginWeightUpdateReply(CustomTestCase):

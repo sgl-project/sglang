@@ -22,6 +22,7 @@ from sglang.kernels.ops.attention.kv_indices import (
     get_num_kv_index_blocks_flashmla,
     get_num_page_per_block_flashmla,
 )
+from sglang.kernels.ops.attention.mla_window_indices import mla_window_sparse_indices
 from sglang.kernels.ops.attention.pad import (
     pad_draft_extend_query as pad_draft_extend_query_triton,
 )
@@ -49,6 +50,7 @@ from sglang.kernels.ops.attention.utils import (
 )
 from sglang.kernels.ops.quantization.fp8_kernel import scaled_fp8_quant
 from sglang.srt.environ import envs
+from sglang.srt.layers.attention.dsa.dsa_dcp import dcp_trtllm_sparse_attention
 from sglang.srt.layers.attention.flashinfer_mla_backend import (
     FlashInferMLAAttnBackend,
     FlashInferMLAMultiStepDraftBackend,
@@ -58,7 +60,7 @@ from sglang.srt.layers.attention.kv_shard_hooks import (
     prepare_kv_shard_forward,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
-from sglang.srt.layers.dcp.layout import get_dcp_lens
+from sglang.srt.layers.dcp.layout import get_dcp_lens, is_mla_dcp_lse_base_on_e
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.mem_cache.layout.paged_view import paged_row_view
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
@@ -85,6 +87,7 @@ if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.dflash_draft_ring import DFlashDraftKVRing
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +112,11 @@ def _multi_ctas_kv_counter_bytes(
     return flashinfer.utils.get_trtllm_gen_multi_ctas_kv_counter_bytes(
         batch_size, num_q_heads, sm_count
     )
+
+
+def trtllm_padded_heads(num_heads: int) -> int:
+    """Pad the unsupported 65-127 MLA query-head range for trtllm-gen."""
+    return 128 if 64 < num_heads < 128 else num_heads
 
 
 def make_persistent_multi_ctas_kv_counter_buffer(
@@ -297,6 +305,23 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self.disable_chunked_prefix_cache = get_schedule().disable_chunked_prefix_cache
 
         self.num_draft_tokens = get_spec().speculative_num_draft_tokens
+        # (id(forward_batch), layer_id, indices, counts); a new forward restarts lower.
+        self._window_index_cache = None
+        self._window_counter_buffer = None
+        self._window_row_indptr = None
+        if model_runner.sliding_window_size is not None and (
+            model_runner.sliding_window_size >= 0
+        ):
+            # Padded graph batch, which can exceed max_running_requests.
+            max_rows = (self.q_indptr_decode.numel() - 1) * (self.num_draft_tokens or 1)
+            self._window_counter_buffer = make_persistent_multi_ctas_kv_counter_buffer(
+                torch.device(self.device),
+                trtllm_padded_heads(self.num_decode_q_heads),
+                max_batch_size=max_rows,
+            )
+            self._window_row_indptr = torch.arange(
+                max_rows + 1, dtype=torch.int32, device=self.device
+            )
         self.dense_q_indptr_verify = (
             self.q_indptr_decode * self.num_draft_tokens
             if self.num_draft_tokens
@@ -305,6 +330,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         self._verify_mask = None
         # Tree-mask scratch is fetched from the target backend only.
         self.is_draft_runner = model_runner.is_draft_worker
+        self._draft_kv_ring = None
 
         # Fused KV-scatter + q-concat on the decode dense-loc path (one launch
         # instead of set_mla_kv_buffer + concat_mla_absorb_q). Disabled under
@@ -1246,6 +1272,10 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         """Run forward for decode using TRTLLM MLA kernel."""
         if get_parallel().dcp_enabled and get_in_autotune_dummy_run():
             return self._dummy_dcp_decode_for_autotune(q, layer)
+        if layer.sliding_window_size >= 0:
+            raise NotImplementedError(
+                "trtllm_mla applies a sliding window only to target-verify forwards."
+            )
 
         merge_query = q_rope is not None
         fused_fp8_query = None
@@ -1413,6 +1443,93 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
         return output.flatten(1), lse
 
+    def set_draft_kv_ring(self, ring: DFlashDraftKVRing) -> None:
+        """Read a DFLASH draft's sliding-window keys from its per-request KV ring
+        instead of the request table."""
+        self._draft_kv_ring = ring
+
+    def _window_sparse_indices(
+        self, layer: RadixAttention, forward_batch: ForwardBatch
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        cache = self._window_index_cache
+        if (
+            cache is not None
+            and cache[0] == id(forward_batch)
+            and cache[1] == layer.layer_id - 1
+        ):
+            self._window_index_cache = (cache[0], layer.layer_id, *cache[2:])
+            return cache[2], cache[3]
+        parallel = get_parallel()
+        ring = self._draft_kv_ring
+        indices, counts = mla_window_sparse_indices(
+            req_to_token=self.req_to_token,
+            req_pool_indices=forward_batch.req_pool_indices,
+            positions=forward_batch.positions,
+            window_left=layer.sliding_window_size,
+            dcp_size=parallel.attn_dcp_size,
+            dcp_rank=parallel.attn_dcp_rank,
+            page_size=self.page_size,
+            v2p=None if ring is not None else self.runner_ids.full_v2p_table,
+            ring_rows_per_req=ring.rows_per_req if ring is not None else 0,
+            min_pos=ring.min_pos if ring is not None else None,
+        )
+        self._window_index_cache = (id(forward_batch), layer.layer_id, indices, counts)
+        return indices, counts
+
+    def _forward_sliding_window(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        layer: RadixAttention,
+        forward_batch: ForwardBatch,
+        metadata: TRTLLMMLADecodeMetadata,
+    ):
+        """Row p attends [p - window, p]; under DCP returns the rank-local (out, lse)."""
+        bs, q_len, heads, head_dim = q.shape
+        rows = bs * q_len
+        assert rows < self._window_row_indptr.numel(), (
+            f"{rows} window rows exceed the {self._window_row_indptr.numel() - 1} "
+            "sized at init"
+        )
+        if get_in_autotune_dummy_run():
+            # Autotune discards attention; its metadata overflows the workspace.
+            out, lse = self._dummy_dcp_decode_for_autotune(
+                q.reshape(rows, heads, head_dim), layer
+            )
+            return (out, lse) if get_parallel().dcp_enabled else out
+        indices, counts = self._window_sparse_indices(layer, forward_batch)
+        kernel_heads = trtllm_padded_heads(heads)
+        query = q.reshape(rows, 1, heads, head_dim)
+        if kernel_heads != heads:
+            padded = query.new_zeros((rows, 1, kernel_heads, head_dim))
+            padded[:, :, :heads].copy_(query)
+            query = padded
+        out, lse = dcp_trtllm_sparse_attention(
+            query=query,
+            block_tables=indices.unsqueeze(1),
+            seq_lens=counts,
+            cu_seqlens_q=self._window_row_indptr[: rows + 1],
+            kv_cache=kv_cache,
+            workspace_buffer=self.workspace_buffer,
+            qk_nope_head_dim=self.qk_nope_head_dim,
+            kv_lora_rank=self.kv_lora_rank,
+            qk_rope_head_dim=self.qk_rope_head_dim,
+            max_seq_len=metadata.max_seq_len_k,
+            sparse_mla_top_k=indices.shape[1],
+            bmm1_scale=self._compute_decode_bmm1_scale(layer),
+            backend="trtllm-gen",
+            skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+            multi_ctas_kv_counter_buffer=self._window_counter_buffer,
+        )
+        out = out.view(rows, kernel_heads, -1)[:, :heads]
+        if not get_parallel().dcp_enabled:
+            return out.reshape(rows, -1)
+        lse = lse[:, :heads]
+        # trtllm-gen returns a base-2 LSE; -inf rows (no owned key) stay -inf.
+        if is_mla_dcp_lse_base_on_e(self.decode_attention_backend_str):
+            lse = lse * math.log(2.0)
+        return out.contiguous().flatten(1), lse.contiguous()
+
     def forward_extend(
         self,
         q: torch.Tensor,
@@ -1435,6 +1552,13 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             and get_in_autotune_dummy_run()
         ):
             return self._dummy_dcp_decode_for_autotune(q, layer)
+        if (
+            layer.sliding_window_size >= 0
+            and not forward_batch.forward_mode.is_target_verify()
+        ):
+            raise NotImplementedError(
+                "trtllm_mla applies a sliding window only to target-verify forwards."
+            )
 
         # The fallback belongs to genuine extend forwards only. Target-verify /
         # draft-extend must never honor it: `forward_prefill_metadata` is a
@@ -1634,6 +1758,15 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
                     unpad_sum_seq_lens_q = total_tokens
 
             assert kv_cache.dtype == self.data_type
+
+            if layer.sliding_window_size >= 0:
+                if needs_unpad:
+                    raise NotImplementedError(
+                        "Sliding-window MLA requires a dense draft window"
+                    )
+                return self._forward_sliding_window(
+                    q, kv_cache, layer, forward_batch, metadata
+                )
 
             if (
                 forward_batch.forward_mode.is_target_verify()

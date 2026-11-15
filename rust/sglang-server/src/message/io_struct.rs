@@ -103,6 +103,15 @@ control_messages! {
         names: Option<Vec<String>>,
     }
 
+    /// Sent once the startup warmup ends: every scheduler rank applies
+    /// `gc_threshold` (`--gc-threshold`) and freezes its garbage collector, as
+    /// after Python's post-warmup `/freeze_gc`. The scheduler sends no reply,
+    /// so it goes out with `CoreHandle::freeze_gc`, never as an awaited
+    /// control request.
+    FreezeGCReq {
+        gc_threshold: Option<Vec<i64>>,
+    }
+
     /// Clear the HiCache storage backend.
     ClearHiCacheReqInput {}
 
@@ -219,6 +228,12 @@ impl<'a> From<&'a GenerateRequest> for TokenizedGenerateReqInput<'a> {
             cache_salt: req.cache_salt.as_deref(),
             kv_hints: req.kv_hints.as_ref(),
         }
+    }
+}
+
+impl FreezeGCReq {
+    pub fn new(rid: String, gc_threshold: Option<Vec<i64>>) -> Self {
+        Self { rid, gc_threshold }
     }
 }
 

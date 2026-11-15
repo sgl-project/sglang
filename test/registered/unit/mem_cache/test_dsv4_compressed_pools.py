@@ -690,7 +690,9 @@ class TestV41KVPoolLayouts(CustomTestCase):
             patch.object(assembler, "DeepSeekV4PagedHostPool", UnpinnedHostPool),
         ):
             _, entries = assembler.build_swa_draft_pools(
-                draft_kv_pool=draft, tree_cache=tree_cache
+                draft_kv_pool=draft,
+                tree_cache=tree_cache,
+                target_window_host=PoolName.SWA,
             )
         host = entries[0].host_pool
         self.assertTrue(host.page_aligned_only)

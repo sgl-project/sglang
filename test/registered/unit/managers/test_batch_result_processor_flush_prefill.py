@@ -36,9 +36,9 @@ PROMPT = 12
 class _StreamFirst(SchedulerBatchResultProcessor):
     __slots__ = ()
 
-    def _flush_prefill(self, batch, kv_ops, skip_stream_req):
+    def _flush_prefill(self, batch, stream_reqs, kv_ops, skip_stream_req):
         self.output_streamer.stream_output(
-            batch.reqs, batch.return_logprob, skip_stream_req
+            stream_reqs, batch.return_logprob, skip_stream_req
         )
         for op in kv_ops:
             op()
@@ -85,7 +85,7 @@ def _run(cls, *, hisparse=False):
     streamer.stream_output.side_effect = lambda *args: log.append("send")
     hisparse_coordinator = (
         SimpleNamespace(
-            request_finished=lambda req: log.append(("hisparse_finished", req.rid)),
+            release_request=lambda req: log.append(("hisparse_finished", req.rid)),
             admit_request_into_staging=lambda req: log.append(("admit", req.rid)),
         )
         if hisparse
@@ -106,6 +106,7 @@ def _run(cls, *, hisparse=False):
             tree_cache=Mock(), hisparse_coordinator=hisparse_coordinator
         ),
         output_streamer=streamer,
+        still_in_batch=lambda req: True,
     )
     batch = _batch()
     result = GenerationBatchResult(
@@ -149,7 +150,7 @@ class TestFlushPrefill(CustomTestCase):
         self.assertEqual(log, ["free_group_begin", SEND, *KV_CALLS, "free_group_end"])
 
     def test_hisparse_calls_are_queued_in_row_order(self):
-        # The order the loop used to run them in, each request_finished just before
+        # The order the loop used to run them in, each release_request just before
         # its row's release.
         kv_calls = [
             ("hisparse_finished", "r0"),

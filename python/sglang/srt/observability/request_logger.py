@@ -18,6 +18,7 @@ import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 from sglang.srt.environ import envs
+from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.runtime_context import get_context, get_exec
 from sglang.srt.sampling.watermarking.core import (
     WATERMARK_CONTAINER_FIELD_NAMES,
@@ -37,6 +38,84 @@ _DEFAULT_WHITELISTED_HEADERS = ["x-smg-routing-key"]
 WHITELISTED_HEADERS = _DEFAULT_WHITELISTED_HEADERS + [
     h.lower() for h in envs.SGLANG_LOG_REQUEST_HEADERS.get()
 ]
+
+# OpenAI chat content-part type -> modality name in the logged summary.
+_OPENAI_PART_MODALITIES = {
+    "image_url": "image",
+    "video_url": "video",
+    "audio_url": "audio",
+    "input_audio": "audio",
+}
+
+
+def _media_payload_len(item: Any) -> int:
+    """Length of a media item's inline payload or reference (characters of a data
+    URI, URL or path, or bytes of raw data); 0 for decoded objects."""
+    if isinstance(item, (str, bytes)):
+        return len(item)
+    if isinstance(item, dict):
+        payload = item.get("url", item.get("data"))
+        return len(payload) if isinstance(payload, (str, bytes)) else 0
+    if isinstance(item, (ImageData, VideoData)):
+        return len(item.url)
+    return 0
+
+
+def _summarize_multimodal(
+    obj: Union[GenerateReqInput, EmbeddingReqInput],
+) -> Dict[str, Dict[str, int]]:
+    """Per-modality item count and payload length, so a log line records that a
+    request carried media without carrying the media itself."""
+    summary: Dict[str, Dict[str, int]] = {}
+    # Normalization repeats the media lists once per parallel sample; count what
+    # the client sent.
+    num_samples = getattr(obj, "parallel_sample_num", 1)
+    for value, modality in (
+        (obj.image_data, "image"),
+        (obj.video_data, "video"),
+        (obj.audio_data, "audio"),
+    ):
+        if value is None:
+            continue
+        if isinstance(value, list) and num_samples > 1:
+            value = value[: len(value) // num_samples]
+        count = payload_len = 0
+        for item in value if isinstance(value, list) else [value]:
+            # A batch request holds one list of items per sub-request.
+            for leaf in item if isinstance(item, list) else [item]:
+                if leaf is None:
+                    continue
+                count += 1
+                payload_len += _media_payload_len(leaf)
+        if count:
+            summary[modality] = {"count": count, "payload_len": payload_len}
+    return summary
+
+
+def _summarize_openai_multimodal(obj: Any) -> Dict[str, Dict[str, int]]:
+    """Media content parts of a dumped chat request, per modality."""
+    summary: Dict[str, Dict[str, int]] = {}
+    messages = obj.get("messages") if isinstance(obj, dict) else None
+    for message in messages if isinstance(messages, list) else ():
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        for part in content:
+            if not isinstance(part, dict):
+                continue
+            part_type = part.get("type")
+            modality = _OPENAI_PART_MODALITIES.get(part_type)
+            if modality is None:
+                continue
+            payload = part.get(part_type)
+            if isinstance(payload, dict):
+                payload = payload.get("url", payload.get("data"))
+            entry = summary.setdefault(modality, {"count": 0, "payload_len": 0})
+            entry["count"] += 1
+            entry["payload_len"] += (
+                len(payload) if isinstance(payload, (str, bytes)) else 0
+            )
+    return summary
 
 
 def _extract_whitelisted_headers(
@@ -102,19 +181,23 @@ class RequestLogger:
 
         max_length, skip_names, _ = self.metadata
         headers = _extract_whitelisted_headers(request)
+        multimodal = _summarize_multimodal(obj)
         obj_to_log = _redact_client_watermark(obj)
         if self.log_requests_format == "json":
             log_data = {
                 "rid": obj.rid,
                 "obj": _transform_data_for_logging(obj_to_log, max_length, skip_names),
             }
+            if multimodal:
+                log_data["multimodal"] = multimodal
             if headers:
                 log_data["headers"] = headers
             log_json(self.targets, "request.received", log_data)
         else:
+            multimodal_str = f", multimodal={multimodal}" if multimodal else ""
             headers_str = f", headers={headers}" if headers else ""
             self._log(
-                f"Receive: obj={_dataclass_to_string_truncated(obj_to_log, max_length, skip_names=skip_names)}{headers_str}"
+                f"Receive: obj={_dataclass_to_string_truncated(obj_to_log, max_length, skip_names=skip_names)}{multimodal_str}{headers_str}"
             )
 
         # FIXME: This is a temporary fix to get the text from the input ids.
@@ -150,18 +233,22 @@ class RequestLogger:
         else:
             obj_to_log = obj
         obj_to_log = _redact_client_watermark(obj_to_log)
+        multimodal = _summarize_openai_multimodal(obj_to_log)
 
         if self.log_requests_format == "json":
             log_data = {
                 "obj": _transform_data_for_logging(obj_to_log, max_length=max_length),
             }
+            if multimodal:
+                log_data["multimodal"] = multimodal
             if headers:
                 log_data["headers"] = headers
             log_json(self.targets, "request.received.openai", log_data)
         else:
+            multimodal_str = f", multimodal={multimodal}" if multimodal else ""
             headers_str = f", headers={headers}" if headers else ""
             self._log(
-                f"Receive OpenAI: obj={_dataclass_to_string_truncated(obj_to_log, max_length)}{headers_str}"
+                f"Receive OpenAI: obj={_dataclass_to_string_truncated(obj_to_log, max_length)}{multimodal_str}{headers_str}"
             )
 
     def log_finished_request(
@@ -179,12 +266,15 @@ class RequestLogger:
 
         max_length, skip_names, out_skip_names = self.metadata
         headers = _extract_whitelisted_headers(request)
+        multimodal = _summarize_multimodal(obj)
         obj_to_log = _redact_client_watermark(obj)
         if self.log_requests_format == "json":
             log_data = {
                 "rid": obj.rid,
                 "obj": _transform_data_for_logging(obj_to_log, max_length, skip_names),
             }
+            if multimodal:
+                log_data["multimodal"] = multimodal
             if headers:
                 log_data["headers"] = headers
             log_data["out"] = _transform_data_for_logging(
@@ -196,8 +286,9 @@ class RequestLogger:
                 obj_to_log, max_length, skip_names=skip_names
             )
             out_str = f", out={_dataclass_to_string_truncated(out, max_length, skip_names=out_skip_names)}"
+            multimodal_str = f", multimodal={multimodal}" if multimodal else ""
             headers_str = f", headers={headers}" if headers else ""
-            self._log(f"Finish: obj={obj_str}{headers_str}{out_str}")
+            self._log(f"Finish: obj={obj_str}{multimodal_str}{headers_str}{out_str}")
 
     def _compute_metadata(
         self,

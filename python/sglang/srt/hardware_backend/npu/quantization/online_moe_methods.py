@@ -14,9 +14,15 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.hardware_backend.npu.quantization.moe_methods import NPUMXFP8MoEMethod
+from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
+    NPUMXFP8MoEMethod,
+    NPUW4A8MXFP4MoEMethod,
+)
 from sglang.srt.hardware_backend.npu.quantization.moe_utils import (
     create_ascend_moe_runner,
+)
+from sglang.srt.hardware_backend.npu.quantization.online_weight_loader import (
+    NPUOnlineMoEWeightLoader,
 )
 from sglang.srt.layers.moe.utils import get_moe_runner_backend
 from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
@@ -65,3 +71,70 @@ class NPUMXFP8OnlineMoEMethod(UnquantizedFusedMoEMethod):
         )
         # Inherited apply() consults this; aiter is CUDA/ROCm-only.
         self._aiter_runner = None
+
+
+class NPUW4A8MXFP4OnlineMoEMethod(UnquantizedFusedMoEMethod):
+    """Online W4A8 MXFP with lazy, independent W13/W2 loading and conversion."""
+
+    def __init__(self, quant_config: Optional["QuantizationConfig"] = None):
+        super().__init__()
+        self.quant_config = quant_config
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        with_bias: bool = False,
+        **extra_weight_attrs,
+    ):
+        load_device = torch.get_default_device()
+        original_loader = extra_weight_attrs["weight_loader"]
+        loader = NPUOnlineMoEWeightLoader(layer, params_dtype, original_loader)
+        # Reuse native weight shapes and attributes without allocating storage.
+        with torch.device("meta"):
+            super().create_weights(
+                layer,
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                params_dtype,
+                with_bias=with_bias,
+                **{**extra_weight_attrs, "weight_loader": loader.weight_loader},
+            )
+        if with_bias:
+            for prefix in ("w13", "w2"):
+                name = f"{prefix}_weight_bias"
+                bias = getattr(layer, name)
+                materialized = torch.nn.Parameter(
+                    torch.empty_like(bias, device=load_device), requires_grad=False
+                )
+                materialized.__dict__.update(bias.__dict__)
+                materialized.weight_loader = original_loader
+                setattr(layer, name, materialized)
+        loader.register_sources()
+        layer._npu_online_moe_loader = loader
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer._npu_online_moe_loader.finish_post_load()
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: "MoeRunnerConfig"
+    ):
+        backend = get_moe_runner_backend()
+        if not (backend.is_auto() or backend.is_ascend()):
+            # Other runners may swap gate/up shards during loading.
+            raise ValueError(
+                "W4A8 MXFP MoE on Ascend requires --moe-runner-backend 'auto' or "
+                f"'ascend', got {backend.value!r}."
+            )
+
+        self.moe_runner_config = moe_runner_config
+        self.runner = create_ascend_moe_runner(
+            layer,
+            moe_runner_config,
+            w13_kernel=NPUW4A8MXFP4MoEMethod(weight_prefix="w13"),
+            w2_kernel=NPUW4A8MXFP4MoEMethod(weight_prefix="w2"),
+        )

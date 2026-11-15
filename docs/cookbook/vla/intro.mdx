@@ -29,3 +29,13 @@ This section keeps VLA policies separate from the diffusion model cookbook so ro
     href="/cookbook/vla/FLUX/FLUX-3-Action"
   />
 </CardGroup>
+
+## Runway
+
+<CardGroup cols={2}>
+  <Card
+    title="Praxis-1"
+    mode="card"
+    href="/cookbook/vla/Runway/Praxis-1"
+  />
+</CardGroup>

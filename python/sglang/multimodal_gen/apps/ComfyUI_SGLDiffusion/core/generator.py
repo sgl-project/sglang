@@ -12,6 +12,7 @@ import sys
 import torch
 
 from ..executors.flux import FluxExecutor
+from ..executors.ltx_av import LTXAVExecutor
 from ..executors.minimax_h3 import (
     FastH3Executor,
     MiniMaxH3Executor,
@@ -77,15 +78,41 @@ def _check_h3_single_file(path: str, sgld_options: dict) -> None:
             "file (e.g. *_int8_convrot), whose per-layer metadata selects the "
             "format, and leave quantization empty"
         )
-    from safetensors import safe_open
 
-    with safe_open(path, framework="pt") as f:
-        if any(".to_gate_compress." in key for key in f.keys()):
-            raise ValueError(
-                "This is a FastH3 checkpoint (VSA gate weights), which the base "
-                "MiniMax H3 model cannot load; load the native FastH3 directory "
-                "with SGLDNativeModelLoader"
-            )
+
+def _default_fasth3_attention(path: str, sgld_options: dict) -> None:
+    """A FastH3 single file runs the VSA-H3 attention it was distilled with.
+
+    FastH3 8-Step V2 trains at 0.8 sparsity, as the native loader defaults, and
+    the same GPU and execution-mode gates apply: elsewhere, and for Ref2VA files
+    (VSA-H3 does not tile the ComfyUI Ref2VA layout), attention stays dense. An
+    explicit attention_backend wins.
+    """
+    from sglang.multimodal_gen.configs.pipeline_configs.minimax_h3 import (
+        vsa_h3_device_supported,
+        vsa_h3_execution_supported,
+    )
+    from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints.minimax_h3 import (
+        has_vsa_gate,
+        is_reference_checkpoint,
+    )
+
+    if "attention_backend" in sgld_options or not has_vsa_gate(path):
+        return
+    if is_reference_checkpoint(path):
+        return
+    if not vsa_h3_device_supported() or not vsa_h3_execution_supported(
+        enable_torch_compile=sgld_options.get("enable_torch_compile"),
+        enable_breakable_cuda_graph=sgld_options.get("enable_breakable_cuda_graph"),
+        ring_degree=sgld_options.get("ring_degree"),
+    ):
+        logger.info(
+            "FastH3 single file runs dense attention: VSA-H3 needs a supported "
+            "GPU and no torch.compile, CUDA graph or ring attention"
+        )
+        return
+    sgld_options["attention_backend"] = "video_sparse_attn_h3"
+    sgld_options.setdefault("attention_backend_config", '{"VSA_sparsity": 0.8}')
 
 
 # Renamed local files and directories miss the registry's path detectors and
@@ -102,6 +129,15 @@ def _looks_like_gguf(path: str) -> bool:
     return path.lower().endswith(".gguf") or (
         ":" in path and path.count("/") == 1 and not os.path.isabs(path)
     )
+
+
+# ensure_executor default: resend the adapters the executor last set.
+_LAST_LORA = object()
+
+
+def _applied(lora):
+    """The LoRA input as the worker sees it: None when it names no adapter."""
+    return lora if lora and lora.get("lora_nickname") else None
 
 
 _NATIVE_MODEL_TYPES = {"FastH3Pipeline": "fast_h3", "VDNH3Pipeline": "vdn_h3"}
@@ -213,6 +249,7 @@ def _load_executor_classes():
         MiniMaxH3Executor,
         FastH3Executor,
         VDNH3Executor,
+        LTXAVExecutor,
         QwenImage21Executor,
     ]
     try:
@@ -302,6 +339,9 @@ class SGLDiffusionGenerator:
         # Executor that sent the last request; differs from self.executor
         # after a cached executor rebuilt the worker.
         self._active_executor = None
+        # Executor whose adapter state the worker has; self.executor stays the
+        # one behind the patcher load_model hands out.
+        self._worker_owner = None
         self.model_type = None
         self.last_options = None
         self._patcher = None
@@ -374,7 +414,7 @@ class SGLDiffusionGenerator:
             kwargs.setdefault("model_id", _H3_MODEL_IDS[pipeline_class_name])
         kwargs = self._server_args_kwargs(kwargs)
         try:
-            from sglang.multimodal_gen.apps.comfyui_worker_patches import (
+            from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.worker_patches import (
                 scheduler_profiles,
             )
 
@@ -501,8 +541,15 @@ class SGLDiffusionGenerator:
             and self._is_live()
         )
 
-    def ensure_executor(self, executor) -> None:
-        """Rebuild the worker if this cached executor no longer owns it."""
+    def ensure_executor(self, executor, lora_input=_LAST_LORA) -> None:
+        """Rebuild the worker if this cached executor no longer owns it.
+
+        The worker ends up with ``lora_input``; by default (mid-run) the
+        adapters the executor last set. ``load_model`` may hand back a live
+        worker built for the same config instead of a new one; that worker
+        still has the adapters its owner set, so they are taken over and
+        reconciled rather than assumed empty. One executor owns a worker.
+        """
         self._active_executor = executor
         if self._owns_live(executor):
             return
@@ -512,14 +559,29 @@ class SGLDiffusionGenerator:
                 "SGLD worker is down and this executor has no reload spec"
             )
         logger.info(
-            "Rebuilding SGLD worker for %s (previous worker was replaced or died)",
+            "Rebinding SGLD worker for %s (previous worker was replaced or died)",
             reload.get("model_path"),
         )
         self.load_model(**reload)
+        lora = executor._lora_input if lora_input is _LAST_LORA else lora_input
+        # After load_model the worker's owner is a fresh executor (no adapters)
+        # when it rebuilt, or the previous owner when it reused a live worker
+        # with the same config, whose adapters are still applied.
+        owner = self._worker_owner
+        on_worker = None
+        if owner is not None and owner is not executor:
+            on_worker = owner._lora_input
+            # It goes through ensure_executor again before its next request.
+            owner.generator = None
+        self._worker_owner = executor
         executor.generator = self.generator
-        lora = executor._lora_input
-        if lora and lora.get("lora_nickname"):
-            executor.set_lora(**lora)
+        executor._lora_input = _applied(on_worker)
+        if _applied(lora) != _applied(on_worker):
+            if _applied(on_worker) is not None:
+                self.generator.unmerge_lora_weights()
+                executor._lora_input = None
+            if _applied(lora) is not None:
+                executor.set_lora(**lora)
         # The new worker's session cache starts empty, so conditioning the
         # old worker already had cannot be restored; resend it.
         executor.begin_sampler_run()
@@ -556,6 +618,7 @@ class SGLDiffusionGenerator:
         self.generator = None
         self.executor = None
         self._active_executor = None
+        self._worker_owner = None
         self.model_type = None
         self._patcher = None
 
@@ -654,7 +717,7 @@ class SGLDiffusionGenerator:
             )
         check_sgld_options(sgld_options)
         plugin = {k: sgld_options.pop(k) for k in PLUGIN_KEYS if k in sgld_options}
-        from sglang.multimodal_gen.apps.comfyui_worker_patches import (
+        from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.worker_patches import (
             canonical_profiles,
             validate_options,
         )
@@ -681,6 +744,8 @@ class SGLDiffusionGenerator:
         else:
             sgld_options.pop("transformer_weights_path", None)
         detect_path = model_path
+        if not native_dir:
+            _default_fasth3_attention(detect_path, sgld_options)
         gather_options = {
             "model_path": detect_path,
             "model_options": model_options,
@@ -745,6 +810,7 @@ class SGLDiffusionGenerator:
         _apply_cache_mode(self.executor, plugin)
         self.executor._sgld_reload = reload_kwargs
         self.executor._ensure_runtime = self.ensure_executor
+        self._worker_owner = self.executor
         comfyui_model.diffusion_model = self.executor
 
         from comfy import model_management

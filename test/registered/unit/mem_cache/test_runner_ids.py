@@ -37,10 +37,13 @@ from types import SimpleNamespace
 
 import torch
 
+from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
+from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.mem_cache.kv.layout.mha import MHASubPoolSpec
+from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 from sglang.test.test_utils import CustomTestCase
@@ -541,6 +544,8 @@ class TestWriteIds(CustomTestCase):
                     kvcache=SimpleNamespace(
                         full_kv_pool=FakeKVCache(pool, "full"),
                         mamba_pool=FakeKVCache(pool, "mamba"),
+                        # No sub-pool plays a role.
+                        layer_router=KVLayerRouter.from_layer_maps(None, ()),
                     ),
                     views=stand_in_views(
                         ChainRoles(owner="full", state="mamba"),
@@ -576,6 +581,55 @@ class TestWriteIds(CustomTestCase):
                 req_pool = SimpleNamespace(req_to_token=virt[None, :])
                 self.assertTrue(
                     torch.equal(cap.get_topk(0, len(virt) + 1, req_pool), expected)
+                )
+
+    def test_capture_capacity_covers_widened_allocator_ids(self):
+        """DCP and KV sharding number slots over every rank's pool, so one
+        rank's pool is too few capture rows."""
+        pool_tokens, ps = 64, 4
+
+        def dcp_paged(dcp_size):
+            # Widened as kv_cache_configurator builds it under DCP.
+            allocator = PagedTokenToKVPoolAllocator(
+                size=pool_tokens * dcp_size,
+                page_size=ps * dcp_size,
+                dtype=torch.float16,
+                device=_DEV,
+                kvcache=None,
+                need_sort=False,
+            )
+            return allocator, allocator.alloc(allocator.available_size())
+
+        def kv_sharded(shard_size):
+            allocator = PageInterleavePoolAllocator(
+                size=pool_tokens,
+                physical_page_size=ps,
+                shard_size=shard_size,
+                dtype=torch.float16,
+                device=_DEV,
+                kvcache=None,
+                need_sort=False,
+            )
+            return allocator, allocator.alloc_cyclic(0, allocator.available_size())
+
+        cases = {
+            "no_dcp": lambda: dcp_paged(1),
+            "dcp4": lambda: dcp_paged(4),
+            "kv_shard4": lambda: kv_sharded(4),
+        }
+        for case, build in cases.items():
+            with self.subTest(case=case):
+                allocator, ids = build()
+                src = RunnerIds(
+                    req_to_token=ids[None, :],
+                    token_to_kv_pool_allocator=allocator,
+                    token_to_kv_pool=SimpleNamespace(id_spaces=_plain_id_spaces),
+                    page_size=ps,
+                    device=_DEV,
+                )
+                # One row per id up to the highest one handed out, and no more.
+                self.assertEqual(
+                    src.capture_token_capacity(pool_tokens), int(ids.max()) + 1
                 )
 
     def test_topk_capture_round_trips_request_token_ids(self):

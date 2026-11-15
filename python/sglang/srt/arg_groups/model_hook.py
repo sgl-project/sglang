@@ -16,6 +16,7 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
     use_mla_backend,
 )
+from sglang.srt.arg_groups.model_overrides.gemma4 import gemma4_attention_backends
 from sglang.srt.arg_groups.overrides import (
     _deepseek_moe_quant_resolution,
     _deepseek_spec_moe_resolution,
@@ -35,7 +36,6 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
-from sglang.srt.configs.quant_utils import get_quantization_config
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
@@ -560,34 +560,6 @@ def handle_model_specific_adjustments(server_args: Any):
                 f"- Decode: {decode_attn_backend}\n"
             )
 
-        quant_method = get_quantization_config(hf_config)
-        is_mxfp4_quant_format = quant_method == "mxfp4"
-        if (
-            not attn_dp_enabled_of(resolved_view(server_args))
-            and cfg.nnodes == 1
-            and get_platform().is_hip
-        ):
-            # TODO (Hubert): Put this back later
-            # server_args.enable_aiter_allreduce_fusion = True
-            # logger.info("Enable Aiter AllReduce Fusion for GptOssForCausalLM")
-            pass
-
-        quantization_config = getattr(hf_config, "quantization_config", None)
-        is_mxfp4_quant_format = (
-            quantization_config is not None
-            and quantization_config.get("quant_method") == "mxfp4"
-        )
-        # The mxfp4 dtype override moved to the override registry
-        # (arg_groups/overrides.py: _gpt_oss_overrides).
-
-        # The moe_runner_backend selection moved to the override registry
-        # (arg_groups/overrides.py: _gpt_oss_overrides).
-
-        if resolved_view(server_args).moe_runner_backend == "triton_kernel":
-            assert resolved_view(server_args).ep_size == 1, (
-                "Triton kernel MoE is only supported when ep_size == 1"
-            )
-
     elif model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM"):
         if model_arch == "MiMoV2ForCausalLM" and not cfg.encoder_only:
             expected_attn_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(hf_config)
@@ -661,21 +633,12 @@ def handle_model_specific_adjustments(server_args: Any):
         prefill_backend, decode_backend = attention_backends_of(
             resolved_view(server_args)
         )
-        accepted_backends = (
-            "trtllm_mha",
-            "triton",
-            "fa4",
-            "fa3",
-            "ascend",
-            "intel_xpu",
-            "intel_amx",
-            "aiter",
-        )
+        accepted_backends = gemma4_attention_backends()
         assert (
             prefill_backend in accepted_backends and decode_backend in accepted_backends
         ), (
-            "Gemma4 only supports trtllm_mha, triton, fa4, fa3, ascend, intel_xpu, intel_amx, or "
-            f"aiter attention backend, got prefill={prefill_backend}, decode={decode_backend}"
+            f"Gemma4 only supports attention backends in {accepted_backends}, "
+            f"got prefill={prefill_backend}, decode={decode_backend}"
         )
 
         # The quantization/moe_runner_backend resolution moved to the override
