@@ -408,6 +408,8 @@ class AnthropicServing:
                     if block.type == "text" and block.text:
                         system_parts.append(block.text)
 
+        # sgl-router's /v1/messages (protocol/anthropic/request.rs) places
+        # inline system text the same way; keep the two in step.
         if self._merge_inline_system:
             for msg in anthropic_request.messages:
                 if msg.role != "system":
@@ -754,7 +756,7 @@ class AnthropicServing:
             adapted_request.received_time = received_time
 
             # Get response from OpenAI handler
-            response = await self.openai_serving_chat._handle_non_streaming_request(
+            response = await self.openai_serving_chat._chat_completion_response(
                 adapted_request, processed_request, raw_request
             )
         except asyncio.CancelledError:

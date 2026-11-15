@@ -5,10 +5,10 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
-    EvictParams,
     InsertParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
@@ -181,7 +181,7 @@ class UnifiedRadixAllocationEvictionRealComponentsFixtures:
     def _evict_for_alloc_after_first_drain(self, cache, component_type):
         capacity = {"available": 0}
         auxiliary_drains = {"count": 0}
-        real_available_size = cache._component_available_size
+        real_available_size = cache._pool_available
         real_free_values = cache._free_values
 
         def available_size(requested_type):
@@ -197,14 +197,16 @@ class UnifiedRadixAllocationEvictionRealComponentsFixtures:
                 capacity["available"] = self._SHORTFALL
 
         params = (
-            EvictParams(swa_num_tokens=self._SHORTFALL)
+            KVDemand(
+                window_tokens={
+                    cache.window_sub_pool_of_slot(component_type): self._SHORTFALL
+                }
+            )
             if component_type is ComponentType.SWA
-            else EvictParams(mamba_num=self._SHORTFALL)
+            else KVDemand(state_slots=self._SHORTFALL)
         )
         with (
-            mock.patch.object(
-                cache, "_component_available_size", side_effect=available_size
-            ),
+            mock.patch.object(cache, "_pool_available", side_effect=available_size),
             mock.patch.object(cache, "_free_values", side_effect=free_values),
         ):
             result = cache.evict_for_alloc(params)

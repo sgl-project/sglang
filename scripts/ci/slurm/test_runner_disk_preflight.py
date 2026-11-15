@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from runner_disk_preflight import main, prune_diagnostics
+from runner_disk_preflight import main, prune_diagnostics, prune_scratch
 
 
 class DiagnosticRetentionTest(unittest.TestCase):
@@ -56,7 +56,12 @@ class DiagnosticRetentionTest(unittest.TestCase):
             with (
                 patch.dict(
                     os.environ,
-                    {"RUNNER_TEMP": str(temp), "GITHUB_WORKSPACE": str(temp)},
+                    {
+                        "RUNNER_TEMP": str(temp),
+                        "GITHUB_WORKSPACE": str(temp),
+                        "RUNNER_NAME": "runner-a",
+                        "HOME": str(root),
+                    },
                 ),
                 patch("runner_disk_preflight.shutil.which", return_value=None),
                 patch("runner_disk_preflight.shutil.disk_usage") as usage,
@@ -68,6 +73,43 @@ class DiagnosticRetentionTest(unittest.TestCase):
                 usage.return_value.free = 100 * 1024**3
                 with self.assertRaisesRegex(SystemExit, "Disk quota exceeded"):
                     main()
+
+
+class ScratchReclaimTest(unittest.TestCase):
+    def test_removes_only_this_runners_and_old_unowned_dirs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            scratch = base / ".mi355x_ci"
+            now = time.time()
+            for name, owner, age_days in (
+                ("mine-crashed", "runner-a", 0),
+                ("other-runner-live", "runner-b", 0),
+                ("unowned-old", None, 2),
+                ("unowned-recent", None, 0),
+            ):
+                leg = scratch / name
+                (leg / "checkout").mkdir(parents=True)
+                if owner is not None:
+                    (leg / ".runner_name").write_text(owner + "\n")
+                os.utime(leg, (now - age_days * 86400,) * 2)
+            outside = base / "valuable"
+            outside.mkdir()
+            (scratch / "linked").symlink_to(outside, target_is_directory=True)
+
+            removed = prune_scratch(scratch, runner_name="runner-a", now=now)
+
+            self.assertEqual(sorted(removed), ["mine-crashed", "unowned-old"])
+            self.assertEqual(
+                {p.name for p in scratch.iterdir()},
+                {"other-runner-live", "unowned-recent", "linked"},
+            )
+            self.assertTrue(outside.is_dir())
+
+    def test_missing_scratch_dir_is_a_no_op(self):
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(
+                prune_scratch(Path(directory) / "absent", runner_name="r", now=0), []
+            )
 
 
 if __name__ == "__main__":

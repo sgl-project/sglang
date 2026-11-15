@@ -196,6 +196,7 @@ fn error(code: u32) -> proto::GenerateStreamItem {
                 error: Some(proto::ErrorBody {
                     message: "engine failed".into(),
                     code,
+                    ..Default::default()
                 }),
                 index: None,
             },
@@ -259,6 +260,7 @@ fn router_ctx_with(
             protocol: WireProtocol::default(),
             dp_ranks: 2,
             grpc_port,
+            supports_inline_system: false,
         };
         registry
             .add_with_cb(spec, Some(Default::default()), profile)

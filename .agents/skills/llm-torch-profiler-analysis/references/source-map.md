@@ -27,7 +27,7 @@ Use these upstream files when the workflow or behavior needs to be justified fro
   - merged distributed trace behavior
   - why merged traces should be treated differently from rank-local traces
 
-- `python/sglang/srt/utils/profile_utils.py`
+- `python/sglang/srt/observability/profile_utils.py`
   - newer profile v2 manager path used for stage-based traces
 
 ## Documentation and tests

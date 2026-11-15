@@ -7,6 +7,7 @@ directory, a moved clone still hits — are checked without a GPU or a compiler.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import pathlib
 import sys
@@ -14,12 +15,24 @@ import sys
 import msgspec
 import pytest
 
-from sglang.kernels.jit.utils.compile import cache, ninja
+from sglang.kernels.jit.utils.compile import cache, ninja, toolchain
 from sglang.kernels.jit.utils.compile.paths import KERNEL_PATH
 from sglang.kernels.jit.utils.compile.spec import BuildSpec
+from sglang.srt.utils import is_xpu
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+
+
+@pytest.fixture(autouse=True)
+def _stub_tvm_ffi_paths(monkeypatch):
+    # XPU images do not ship tvm_ffi; only the paths' text reaches the ninja file.
+    if is_xpu() and importlib.util.find_spec("tvm_ffi") is None:
+        monkeypatch.setattr(
+            toolchain,
+            "tvm_ffi_paths",
+            lambda: (("/opt/tvm_ffi/include",), "/opt/tvm_ffi/lib", "tvm_ffi"),
+        )
 
 
 @pytest.fixture(autouse=True)

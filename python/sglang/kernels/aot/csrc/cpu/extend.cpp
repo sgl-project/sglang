@@ -483,6 +483,9 @@ void extend_attention_cpu(
   // carries no causal order, so it keeps its own path.
   const bool kv_from_cache = !is_cross_attn && !k_extend_opt.has_value();
   // unused when the range comes from the cache - bind them to the buffers
+  if (max_len_extend <= 0) {
+    max_len_extend = extend_seq_lens.max().item<int64_t>();
+  }
   auto k_extend = k_extend_opt.has_value() ? k_extend_opt.value() : k_buffer;
   auto v_extend = v_extend_opt.has_value() ? v_extend_opt.value() : v_buffer;
 

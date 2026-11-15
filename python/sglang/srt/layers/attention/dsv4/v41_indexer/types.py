@@ -7,7 +7,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Protocol, TypeVar
 import msgspec
 import torch
 
-from sglang.srt.utils.common import async_h2d, ceil_align, ceil_div
+from sglang.srt.utils.common import ceil_align, ceil_div
+from sglang.srt.utils.device import async_h2d
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator

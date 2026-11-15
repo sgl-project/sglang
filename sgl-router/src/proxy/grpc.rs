@@ -10,6 +10,7 @@ use super::{breaker_outcome, stream_breaker_outcome, BreakerOutcome, Proxy};
 use crate::config::SamplingField;
 use crate::server::error::{router_grpc_status, ApiError};
 use crate::server::header_utils::should_forward_request_header;
+use crate::server::metrics::MediaCounts;
 use crate::workers::Worker;
 use axum::http::{HeaderMap, StatusCode};
 use futures::stream::{BoxStream, StreamExt, TryStreamExt};
@@ -64,6 +65,30 @@ pub struct RoutingView<'a> {
     pub sampling_params: Option<&'a proto::SamplingParams>,
     pub stream: bool,
     pub rid: Option<&'a str>,
+    /// Media items the request carries, for the access log.
+    pub media: MediaCounts,
+}
+
+fn media_count(input: Option<&proto::MediaInput>) -> u32 {
+    let items = |items: &proto::MediaItems| {
+        items
+            .items
+            .iter()
+            .filter(|item| item.item.is_some())
+            .count()
+    };
+    let count = match input.and_then(|input| input.value.as_ref()) {
+        Some(proto::media_input::Value::Item(_)) => 1,
+        Some(proto::media_input::Value::Many(many)) => items(many),
+        Some(proto::media_input::Value::Nested(nested)) => nested
+            .items
+            .iter()
+            .filter_map(|entry| entry.items.as_ref())
+            .map(items)
+            .sum(),
+        None => 0,
+    };
+    u32::try_from(count).unwrap_or(u32::MAX)
 }
 
 impl<'a> TryFrom<&'a proto::GenerateRequest> for RoutingView<'a> {
@@ -116,6 +141,11 @@ impl<'a> TryFrom<&'a proto::GenerateRequest> for RoutingView<'a> {
             sampling_params,
             stream: request.stream.unwrap_or(false),
             rid,
+            media: MediaCounts {
+                images: media_count(request.image_data.as_ref()),
+                videos: media_count(request.video_data.as_ref()),
+                audios: media_count(request.audio_data.as_ref()),
+            },
         })
     }
 }
@@ -441,6 +471,28 @@ impl Proxy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generate_view_counts_media_fields() {
+        // Preserve access-log counts through the api.v1 media containers,
+        // including null entries and unequal counts for each media kind.
+        let request: proto::GenerateRequest = serde_json::from_value(serde_json::json!({
+            "text": "describe",
+            "image_data": ["a", null, {"url": "b"}],
+            "video_data": "v",
+            "audio_data": [["c", null], null, ["d", "e"]]
+        }))
+        .unwrap();
+        assert_eq!(
+            RoutingView::try_from(&request).unwrap().media,
+            MediaCounts {
+                images: 2,
+                videos: 1,
+                audios: 3
+            }
+        );
+        assert_eq!(media_count(None), 0);
+    }
 
     #[test]
     fn apply_adds_router_fields_without_overriding_the_caller() {
