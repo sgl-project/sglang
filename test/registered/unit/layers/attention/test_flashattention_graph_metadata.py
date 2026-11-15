@@ -30,7 +30,15 @@ def _plain_id_spaces():
 class _DraftWidthModelRunner:
     decode_num_tokens_per_req = ModelRunner.decode_num_tokens_per_req
 
-    def __init__(self, *, algorithm, is_draft_worker, sample_from_anchor):
+    def __init__(
+        self,
+        *,
+        algorithm,
+        is_draft_worker,
+        sample_from_anchor,
+        extra_context_len=0,
+        page_size=1,
+    ):
         self.is_draft_worker = is_draft_worker
         self.spec_algorithm = algorithm
         self.model_config = SimpleNamespace(
@@ -47,14 +55,14 @@ class _DraftWidthModelRunner:
         )
         self.device = "cpu"
         self.req_to_token_pool = SimpleNamespace(
-            req_to_token=torch.zeros((3, 128), dtype=torch.int32)
+            req_to_token=torch.zeros((3, 128 + extra_context_len), dtype=torch.int32)
         )
         self.token_to_kv_pool = SimpleNamespace(
             layer_router=SimpleNamespace(routes_to=lambda _kind: False)
         )
         self.kv_cache_dtype = torch.float16
         self.kv_cache_dtype_str = "auto"
-        self.page_size = 1
+        self.page_size = page_size
         self.sliding_window_size = None
         self.runner_ids = SimpleNamespace(is_translating=False)
         self.attention_chunk_size = None
@@ -81,7 +89,14 @@ class TestFlashAttentionDraftWidth(CustomTestCase):
     """
 
     def _make_backend(
-        self, *, algorithm, is_draft_worker, sample_from_anchor, fa_impl_ver
+        self,
+        *,
+        algorithm,
+        is_draft_worker,
+        sample_from_anchor,
+        fa_impl_ver,
+        extra_context_len=0,
+        page_size=1,
     ):
         spec = SimpleNamespace(
             speculative_algorithm=algorithm.name,
@@ -92,6 +107,8 @@ class TestFlashAttentionDraftWidth(CustomTestCase):
             algorithm=algorithm,
             is_draft_worker=is_draft_worker,
             sample_from_anchor=sample_from_anchor,
+            extra_context_len=extra_context_len,
+            page_size=page_size,
         )
         parallel = SimpleNamespace(
             attn_cp_size=1,
@@ -197,6 +214,38 @@ class TestFlashAttentionDraftWidth(CustomTestCase):
                             actual_query_token_count,
                             "cu_seqlens_q must cover every flattened draft query row",
                         )
+
+    def test_graph_page_tables_span_the_req_to_token_row(self):
+        """A request at its length cap is still verified and drafted a few
+        positions past context_len, inside the req_to_token row headroom. Page
+        tables sized by context_len end before those positions, so the kernel
+        read page ids past its row: another request's page, or an illegal
+        memory access."""
+        context_len, extra_context_len = 128, 21
+        for fa_impl_ver in (3, 4):
+            for page_size in (1, 16):
+                with self.subTest(fa_impl_ver=fa_impl_ver, page_size=page_size):
+                    backend = self._make_backend(
+                        algorithm=SpeculativeAlgorithm.EAGLE,
+                        is_draft_worker=False,
+                        sample_from_anchor=False,
+                        fa_impl_ver=fa_impl_ver,
+                        extra_context_len=extra_context_len,
+                        page_size=page_size,
+                    )
+                    backend.init_cuda_graph_state(max_bs=2, max_num_tokens=16)
+
+                    row_pages = -(-(context_len + extra_context_len) // page_size)
+                    page_table_widths = {
+                        "decode": backend.decode_cuda_graph_metadata["page_table"],
+                        "draft decode": backend.decode_cuda_graph_metadata[
+                            "page_table_draft_decode"
+                        ],
+                        "target verify": backend.target_verify_metadata["page_table"],
+                        "draft extend": backend.draft_extend_metadata["page_table"],
+                    }
+                    for name, page_table in page_table_widths.items():
+                        self.assertEqual(page_table.shape[1], row_pages, name)
 
 
 class TestFlashAttentionGraphMetadata(CustomTestCase):
