@@ -1,0 +1,199 @@
+{
+  "source_parent_commit": "5ccda20ea7371908c8e034752dc3ce70f998f65a",
+  "source_sha256": {
+    "benchmark/gdn_kv_reuse/bench.py": "13d1d34c048b5c69cbd94c698a978d672ab31fd8466c4461af7d493ae6ee2256",
+    "benchmark/gdn_kv_reuse/olmo_fixture/olmo_adapter/__init__.py": "e1b867621d0c039c8db953343ba7263d4f791943dac067ea86e269082fa0682d",
+    "benchmark/gdn_kv_reuse/olmo_fixture/olmo_adapter/backend.py": "917a437dfa3548c760c28b8b53cce1cccc4bcce0dc9a88820956dbcc8d045fd3",
+    "benchmark/gdn_kv_reuse/olmo_fixture/olmo_adapter/model.py": "d1a64f407e56917dbc1c3c7c811782eef03a3f54b50e56051991ccb1c2129894",
+    "benchmark/gdn_kv_reuse/olmo_fixture/sitecustomize.py": "ea187a42f02f2977275b37a65057e9c245de6734b218b0961afaf4ad218c6e71",
+    "python/sglang/kernels/ops/attention/fla/chunk.py": "aac79abc9aebcc59f1d15e5ed353c25429491d5939d16956ed7669027ced1855",
+    "python/sglang/kernels/ops/mamba/gdn_prefill_track.py": "8308bb8c2ee40ff43457f14d3778da3e5b13698072a4613dcdff73c6b765e72b",
+    "python/sglang/srt/environ.py": "36c28c34163aa3acd968dba2f9b56ec42dc88214151159cecef2cf80e174d15d",
+    "python/sglang/srt/layers/attention/flashinfer_backend.py": "c2b4e6566e2e4074cae5cec93e95d69d28a8be595b000cc857c02347038d94d9",
+    "python/sglang/srt/layers/attention/linear/gdn_backend.py": "81f86d7d1272819277e08826dba1cd29a75b9ce0350b692f0b1cfa4fcd91f747",
+    "python/sglang/srt/layers/attention/linear/kernels/gdn_triton.py": "28f5483effc6322481a55a22bf3fc536f2d898c8963de8e8f4975ab0b4c42047",
+    "python/sglang/srt/managers/schedule_batch.py": "73e95c6d3e2f47cc2ffca8d04d3cd8e5bed42873bbc0ee245e262655d4b282d8",
+    "python/sglang/srt/mem_cache/allocation.py": "f612360806be72823ac68db0b57184752ef1f6903eaa296114df1217b3ccaf82",
+    "python/sglang/srt/mem_cache/gdn_kv_reuse.py": "76169112a77958e21885dcffdcdd0fa90f356b8e805762626a6dda939aa80e4a",
+    "python/sglang/srt/mem_cache/unified_radix_cache.py": "78e370e267c09c875078c610ebf2b2d87c2a5ce375c588249105a2bbf30da601",
+    "python/sglang/srt/model_executor/forward_batch_info.py": "546d852bab489b033527c8068e9ef67b1a2c110a74e956b7a8028327d23fd415",
+    "python/sglang/srt/models/qwen3_5.py": "b175eb6c21bbc9cefa42eac4b4c00dd1f7271ca82d846fab32f27a230b6331c9",
+    "test/registered/kernels/ops/attention/test_gdn_track_state.py": "6c3ca5d1f7de4bb5839f87a7454fb31621715a72e076ef2ffa8ce651478b236d",
+    "test/registered/unit/mem_cache/test_gdn_kv_reuse.py": "3846c03b828c57a9e8e3f470182c54b1ec0287cdd316de9f03eb9ebba4ca7683",
+    "benchmark/gdn_kv_reuse/batch_invariant_mm/sitecustomize.py": "bb0f293ff1b86ebb28e76ad2c265b665c6cf19d4aaf6f71742058b2aedf5326c",
+    "benchmark/gdn_kv_reuse/bench_concurrent.py": "7663f569a5d9d51174da01f76f479f4d5ddb65bce3af20217449e5478696b3bf"
+  },
+  "protocol": {
+    "gpu": 1,
+    "concurrency": 8,
+    "chunk": 4096,
+    "long_C": 4096,
+    "long_H": 8192,
+    "long_D": 4096,
+    "short_C": 256,
+    "short_H": 512,
+    "short_D": 256,
+    "weights": "BF16",
+    "ssm_state": "FP32",
+    "matrix_multiplication": "correctness-only fixed-order aten::mm override; not latency data",
+    "attention": "paged FlashInfer",
+    "overlap": false,
+    "graphs": false
+  },
+  "results": {
+    "Qwen3.5-4B": {
+      "long": {
+        "targets": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        },
+        "warm_controls": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        }
+      },
+      "all-reuse": {
+        "targets": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        },
+        "warm_controls": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        }
+      },
+      "mixed": {
+        "targets": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        },
+        "warm_controls": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        }
+      },
+      "activation_checks": {
+        "long_requests_reused": 8,
+        "long_tokens_reused": 25600,
+        "shared_batch_size": 8,
+        "mixed_batch_size": 8,
+        "mixed_reused_requests": 4
+      }
+    },
+    "Qwen3.5-9B": {
+      "long": {
+        "targets": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        },
+        "warm_controls": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        }
+      },
+      "all-reuse": {
+        "targets": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        },
+        "warm_controls": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        }
+      },
+      "mixed": {
+        "targets": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        },
+        "warm_controls": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        }
+      },
+      "activation_checks": {
+        "long_requests_reused": 8,
+        "long_tokens_reused": 25600,
+        "shared_batch_size": 8,
+        "mixed_batch_size": 8,
+        "mixed_reused_requests": 4
+      }
+    },
+    "Olmo-Hybrid-7B": {
+      "long": {
+        "targets": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        },
+        "warm_controls": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        }
+      },
+      "all-reuse": {
+        "targets": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        },
+        "warm_controls": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        }
+      },
+      "mixed": {
+        "targets": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        },
+        "warm_controls": {
+          "matching_token_sequences": 8,
+          "exact_selected_logprobs": 8,
+          "exact_top5": 8,
+          "max_same_token_logprob_diff": 0.0
+        }
+      },
+      "activation_checks": {
+        "long_requests_reused": 8,
+        "long_tokens_reused": 25600,
+        "shared_batch_size": 8,
+        "mixed_batch_size": 8,
+        "mixed_reused_requests": 4
+      }
+    }
+  },
+  "scope": "Base vs reuse targets and Base vs reuse warm controls are separate from within-mode cold/warm partition comparisons. Default CUDA GEMM can change rounded activations and greedy outputs. No general accuracy equivalence claim."
+}

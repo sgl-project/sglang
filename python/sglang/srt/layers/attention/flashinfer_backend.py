@@ -1197,6 +1197,7 @@ class FlashInferAttnBackend(AttentionBackend):
             else:
                 use_ragged = (
                     not self.enable_deterministic
+                    and not forward_batch.full_kv_replay
                     and not is_in_tc_piecewise_cuda_graph()
                     and not self.use_paged
                 )
@@ -1601,15 +1602,31 @@ class FlashInferAttnBackend(AttentionBackend):
         if not self.forward_metadata.use_ragged:
             if k is not None and save_kv_cache:
                 assert v is not None
+                write_loc = KVWriteLoc.for_layer(
+                    forward_batch,
+                    layer,
+                    window_locs=window_write_locs(
+                        self.runner_ids, self.forward_metadata.swa_out_cache_loc
+                    ),
+                )
+                if forward_batch.full_kv_replay:
+                    fresh = forward_batch.full_kv_fresh_token_indices
+                    # Compact K/V must never overwrite borrowed tree-owned slots.
+                    write_loc = KVWriteLoc(
+                        write_loc.loc.index_select(0, fresh),
+                        physical=write_loc.physical,
+                        window_locs=(
+                            {
+                                name: loc.index_select(0, fresh)
+                                for name, loc in write_loc.window_locs.items()
+                            }
+                            if write_loc.window_locs is not None
+                            else None
+                        ),
+                    )
                 self.kv_layers.layer(layer.layer_id).store(
                     layer,
-                    KVWriteLoc.for_layer(
-                        forward_batch,
-                        layer,
-                        window_locs=window_write_locs(
-                            self.runner_ids, self.forward_metadata.swa_out_cache_loc
-                        ),
-                    ),
+                    write_loc,
                     k,
                     v,
                     *self._kv_write_scales(layer),

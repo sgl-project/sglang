@@ -1598,13 +1598,61 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         """Full attention forward pass."""
-        q, k, v, gate = self._prepare_qkv_gate(
-            positions=positions,
-            hidden_states=hidden_states,
-            forward_batch=forward_batch,
-        )
-
-        attn_output = self.attn(q, k, v, forward_batch)
+        if forward_batch.full_kv_replay:
+            q_gate = torch.nn.functional.linear(
+                hidden_states, self.qkv_proj.weight[: 2 * self.q_size]
+            )
+            q, _, gate = fused_qk_gemma_rmsnorm_rope_gate(
+                q_gate,
+                q_gate.new_empty((q_gate.shape[0], 0)),
+                self.q_norm.weight.data,
+                self.k_norm.weight.data,
+                self.rotary_emb.cos_sin_cache,
+                positions,
+                self.q_norm.variance_epsilon,
+                self.num_heads,
+                0,
+                self.head_dim,
+                self.rotary_emb.rotary_dim,
+                has_gate=True,
+                mrope_axis_map=(
+                    self.rotary_emb.axis_map if positions.dim() == 2 else None
+                ),
+            )
+            gate = gate.view(q_gate.shape[0], -1)
+            fresh = forward_batch.full_kv_fresh_token_indices
+            k = v = None
+            if fresh is not None:
+                kv = torch.nn.functional.linear(
+                    hidden_states.index_select(0, fresh),
+                    self.qkv_proj.weight[2 * self.q_size :],
+                )
+                k, v = kv.split(self.kv_size, dim=-1)
+                _, k, _ = fused_qk_gemma_rmsnorm_rope_gate(
+                    k.new_empty((k.shape[0], 0)),
+                    k,
+                    self.q_norm.weight.data,
+                    self.k_norm.weight.data,
+                    self.rotary_emb.cos_sin_cache,
+                    positions.index_select(-1, fresh),
+                    self.q_norm.variance_epsilon,
+                    0,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.rotary_emb.rotary_dim,
+                    has_gate=False,
+                    mrope_axis_map=(
+                        self.rotary_emb.axis_map if positions.dim() == 2 else None
+                    ),
+                )
+            attn_output = self.attn(q, k, v, forward_batch, save_kv_cache=k is not None)
+        else:
+            q, k, v, gate = self._prepare_qkv_gate(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+            attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
             if _fp8_tuple_input(self.o_proj, attn_output.shape[0]):

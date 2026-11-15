@@ -7,8 +7,9 @@ the bucket's fixed row bound and read a per-row mode instead:
 * ``track_mode[r] == 0``: row ``r`` is not tracked (or is padding); no-op.
 * ``track_mode[r] == 1``: the tracked length is chunk aligned; the snapshot is
   the post-extend state of the row's own cache slot.
-* ``track_mode[r] == 2``: the snapshot is the chunk-boundary state stored in
-  ``h[track_h_row[r]]`` (activation dtype), as the eager Triton path reads it.
+* ``track_mode[r] == 2``: the snapshot is ``h[track_h_row[r]]``. Snapshot-capable
+  kernels supply selected FP32 states; the legacy fallback supplies per-chunk
+  states in the activation dtype.
 
 Every tracked row also snapshots its conv window: the ``STATE_LEN`` raw
 pre-conv input rows ending at the tracked boundary.
@@ -65,7 +66,7 @@ def _gdn_track_conv_window_kernel(
 @triton.jit
 def _gdn_track_ssm_kernel(
     ssm_pool,  # [slots, ...] per-slot contiguous
-    h,  # [chunks, ...] per-chunk states
+    h,  # [rows, ...] selected FP32 snapshots or legacy per-chunk states
     track_mode,  # [rows] int32
     track_h_row,  # [rows] int32 row of h holding the chunk-boundary state
     track_dst,  # [rows] int64 physical track slot
