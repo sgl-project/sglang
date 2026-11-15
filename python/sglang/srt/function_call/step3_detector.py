@@ -213,20 +213,22 @@ class Step3Detector(BaseFormatDetector):
         # Check if tool block is ending
         if self.eot_token in self._buffer:
             idx = self._buffer.find(self.eot_token)
-
-            # If we're in the middle of a tool call, we need to handle it
-            if self._in_tool_call:
-                # The buffer before eot_token might contain the end of the current tool call
-                before_eot = self._buffer[:idx]
-                if self.tool_call_end in before_eot:
-                    # Parse this final tool call
-                    result = self._parse_partial_tool_call(tools)
-                    calls.extend(result.calls)
-                else:
-                    # Incomplete tool call - log warning
-                    logger.warning("Tool block ended with incomplete tool call")
-
             remaining = self._buffer[idx + len(self.eot_token) :]
+            self._buffer = self._buffer[:idx]
+
+            # Parse every tool call left before the end of the block; nothing
+            # parses them once the block is finished.
+            while self._in_tool_call or self.tool_call_begin in self._buffer:
+                if not self._in_tool_call:
+                    self._begin_tool_call()
+                if self.tool_call_end not in self._buffer:
+                    logger.warning("Tool block ended with incomplete tool call")
+                    break
+                calls.extend(self._parse_partial_tool_call(tools).calls)
+                if self._in_tool_call:
+                    # The tool call could not be parsed.
+                    break
+
             self._buffer = ""
             self._tool_block_finished = True
 
@@ -238,13 +240,7 @@ class Step3Detector(BaseFormatDetector):
         # Check if we're in a tool call or need to start one
         if not self._in_tool_call:
             if self.tool_call_begin in self._buffer:
-                idx = self._buffer.find(self.tool_call_begin)
-                # Remove any content before tool call begin (shouldn't happen but be safe)
-                self._buffer = self._buffer[idx + len(self.tool_call_begin) :]
-                self._in_tool_call = True
-                self._function_name_sent = False
-                self._current_function_name = ""
-                self._current_parameters = {}
+                self._begin_tool_call()
                 # Fall through to parse the partial tool call
             else:
                 # Wait for tool call to begin
@@ -265,6 +261,8 @@ class Step3Detector(BaseFormatDetector):
             return StreamingParseResult(calls=calls)  # Wait for more text
 
         type_part, invoke_part = self._buffer.split(self.tool_sep, 1)
+        # The buffer can also hold the tool calls after this one.
+        invoke_part = invoke_part.split(self.tool_call_end, 1)[0]
         if type_part.strip() != "function":
             # Invalid tool type, skip this tool call
             self._reset_streaming_state()
@@ -394,6 +392,16 @@ class Step3Detector(BaseFormatDetector):
                 self.current_tool_id += 1
 
         return StreamingParseResult(calls=calls)
+
+    def _begin_tool_call(self):
+        """Start the tool call at the next tool call begin token in the buffer."""
+        idx = self._buffer.find(self.tool_call_begin)
+        # Remove any content before tool call begin (shouldn't happen but be safe)
+        self._buffer = self._buffer[idx + len(self.tool_call_begin) :]
+        self._in_tool_call = True
+        self._function_name_sent = False
+        self._current_function_name = ""
+        self._current_parameters = {}
 
     def _reset_streaming_state(self):
         """Reset streaming state for the next tool call"""
