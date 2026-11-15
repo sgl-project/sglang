@@ -81,10 +81,8 @@ async fn forward_control_req(State(state): State<Arc<AppState>>, body: Bytes) ->
     }
 }
 
-/// The control messages a peer listener relays, each with the HTTP routes that
-/// fan it out, whose levels in `auth_levels.json` the relayed message is held
-/// to (the gRPC methods that fan out the same messages require the same keys).
-/// `FreezeGCReq` is the one message no route fans out.
+/// Each control message a peer listener relays, with the HTTP routes that fan it
+/// out; a relayed message is held to their levels in `auth_levels.json`.
 const RELAYED_BY: &[(&str, &[&str])] = &[
     ("AbortReq", &["/abort_request"]),
     ("GetInternalStateReq", &["/server_info"]),
@@ -1919,8 +1917,6 @@ mod tests {
         let _ = response.await;
     }
 
-    /// Every control message but `FreezeGCReq` is relayed for routes
-    /// `auth_levels.json` declares.
     #[test]
     fn relayed_by_covers_every_control_message() {
         use crate::message::io_struct::ControlRequest;
@@ -1935,7 +1931,6 @@ mod tests {
         }
     }
 
-    /// A message no peer listener relays never reaches the scheduler.
     #[tokio::test]
     async fn peer_route_refuses_a_message_no_listener_relays() {
         let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());

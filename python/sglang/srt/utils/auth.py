@@ -88,12 +88,8 @@ def undeclared_routes(app: Any) -> list[str]:
 
 
 def _get_auth_level_from_app_and_scope(app: Any, scope: dict) -> AuthLevel:
-    """Best-effort resolve auth level by matching the request to a route.
-
-    The route is the one Starlette's router picks: the first full match, else
-    the first route matching the path but not the method, so a wrong method is
-    refused at that route's level before the router answers 405.
-    """
+    """Best-effort resolve the auth level of the route Starlette's router picks,
+    a wrong method included, so it is refused at that route's level before 405."""
     # Import lazily to keep this module unit-test friendly (FastAPI/Starlette are not
     # required unless you actually use the middleware / route matching).
     from starlette.routing import Match
