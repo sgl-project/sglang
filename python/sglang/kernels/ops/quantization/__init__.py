@@ -19,6 +19,16 @@ if TYPE_CHECKING:
 
 register_kernel(
     KernelSpec(
+        op="quantization.groupwise_int8_dequant",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.quantization.groupwise_int8_dequant:groupwise_int8_dequant",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+
+register_kernel(
+    KernelSpec(
         op="quantization.sgl_per_token_quant_fp8",
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.quantization.per_token_quant_fp8:per_token_quant_fp8",
@@ -129,6 +139,24 @@ register_kernel(
         op="quantization.mxfp8_quantize_swizzled",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.quantization.mxfp8_swizzled_triton:mxfp8_quantize_swizzled",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="quantization.mxfp8_group_quant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.quantization.mxfp8_group_quant:mxfp8_group_quant",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="quantization.mxfp4_dequant",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.quantization.mxfp4_dequant:mxfp4_dequant",
         capabilities=CUDA_ONLY,
     )
 )

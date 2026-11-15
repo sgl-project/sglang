@@ -36,7 +36,10 @@ def _runner(is_draft_worker=False):
                 part_indices=lambda part: {},
             )
         ),
-        runner_ids=SimpleNamespace(state_ids=lambda sub_pool: IdSpace(key="state")),
+        runner_ids=SimpleNamespace(
+            state_ids=lambda sub_pool: IdSpace(key="state"),
+            request_ids=lambda: IdSpace(key=("request", None)),
+        ),
     )
 
 

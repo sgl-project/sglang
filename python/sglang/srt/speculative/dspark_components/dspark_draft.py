@@ -25,6 +25,9 @@ from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.draft_parallel import resolve_draft_parallel_layout
 from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
 from sglang.srt.speculative.dspark_components.dspark_planner import VerifyWindow
+from sglang.srt.speculative.online_acceptance_estimator import (
+    OnlineAcceptanceEstimator,
+)
 from sglang.srt.speculative.spec_info import (
     SpeculativeAlgorithm,
     spec_scale_global_num_tokens,
@@ -82,6 +85,7 @@ class DraftProposal(msgspec.Struct, frozen=True):
     # [bs, gamma]; None when the draft has no confidence head.
     confidence: Optional[torch.Tensor] = None
     confidence_raw: Optional[torch.Tensor] = None
+    acceptance_features: Optional[torch.Tensor] = None
     folded: bool = False
     # [bs, gamma + 1] ``[anchor | draft tokens]`` from the draft graph tail; None
     # when the caller builds them.
@@ -361,9 +365,11 @@ class DraftBlockProposer:
         greedy_draft: bool,
         sharded_accept: bool = False,
         dp_moe_sync: bool = False,
+        acceptance_estimator: Optional[OnlineAcceptanceEstimator] = None,
     ) -> None:
         self.draft_model = draft_model
         self.draft_model_runner = draft_model_runner
+        self._acceptance_estimator = acceptance_estimator
         self.gamma = gamma
         self.sample_from_anchor = bool(draft_model.sample_from_anchor)
         self.query_token_num = self.gamma if self.sample_from_anchor else self.gamma + 1
@@ -475,7 +481,7 @@ class DraftBlockProposer:
         )
         draft_block_ids = fwd.draft_block_ids
 
-        confidence = confidence_raw = verify_ids = None
+        confidence = confidence_raw = acceptance_features = verify_ids = None
         folded = False
         if (
             envs.SGLANG_DSPARK_FOLDED_PROPOSAL.get()
@@ -498,7 +504,10 @@ class DraftBlockProposer:
                 ),
                 noise=self._noise if self._sharded_accept else None,
             )
-            if draft_sampler.confidence_out is not None:
+            if draft_sampler.acceptance_features_out is not None:
+                confidence = draft_sampler.confidence_out[:bs]
+                acceptance_features = draft_sampler.acceptance_features_out[:bs]
+            elif draft_sampler.confidence_out is not None:
                 confidence = draft_sampler.confidence_out[:bs]
                 confidence_raw = draft_sampler.confidence_raw_out[:bs]
             if draft_sampler.verify_ids is not None:
@@ -521,7 +530,14 @@ class DraftBlockProposer:
                 greedy_draft=self._greedy_draft,
                 sharded_accept=self._sharded_accept,
             )
-            if self.draft_model.confidence_head is not None:
+            if self._acceptance_estimator is not None:
+                acceptance_features, confidence = self._acceptance_estimator.predict(
+                    logits=draft_block.corrected_logits,
+                    temperatures=torch.where(
+                        draft_block.greedy_mask, 0.0, draft_block.temperatures
+                    ),
+                )
+            elif self.draft_model.confidence_head is not None:
                 confidence, confidence_raw = self.draft_model.compute_confidence(
                     anchor_tokens=draft_block_ids[:, 0],
                     draft_tokens=draft_block.draft_tokens,
@@ -537,6 +553,7 @@ class DraftBlockProposer:
             draft_block=draft_block,
             confidence=confidence,
             confidence_raw=confidence_raw,
+            acceptance_features=acceptance_features,
             folded=folded,
             verify_ids=verify_ids,
         )

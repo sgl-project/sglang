@@ -66,6 +66,18 @@ QUANTIZATION_CHOICES = [
     "humming",
 ]
 
+BUILT_IN_KV_CACHE_DTYPES = (
+    "auto",
+    "fp8_e5m2",
+    "fp8_e4m3",
+    "mxfp8",
+    "bf16",
+    "bfloat16",
+    "nvfp4",
+    "fp4_mx_block16",
+)
+KV_CACHE_DTYPE_CHOICES = list(BUILT_IN_KV_CACHE_DTYPES)
+
 ATTENTION_BACKEND_CHOICES = [
     # Common
     "triton",
@@ -76,7 +88,6 @@ ATTENTION_BACKEND_CHOICES = [
     "qsa",
     "unlimited_ocr_v2",
     "dsv4",
-    "compressed",  # Deprecated alias for "dsv4"
     "ernie55",
     # NVIDIA specific
     "fa3",
@@ -112,6 +123,8 @@ DRAFT_ATTENTION_BACKEND_CHOICES = [
     "intel_xpu",
 ]
 
+DFLASH_MLA_ONLY_DRAFT_BACKENDS = ("cutedsl_mla", "trtllm_mla")
+
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
     "ascend",
     "fa3",
@@ -139,7 +152,6 @@ MOE_RUNNER_BACKEND_CHOICES = [
     "auto",
     "deep_gemm",
     "triton",
-    "triton_kernel",
     "flashinfer_trtllm",
     "experimental_sgl_trtllm",
     "flashinfer_trtllm_routed",
@@ -192,7 +204,15 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "marlin",
 ]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority", "tlru", "joint_lru"]
+RADIX_EVICTION_POLICY_CHOICES = [
+    "lru",
+    "lfu",
+    "slru",
+    "priority",
+    "tlru",
+    "joint_lru",
+    "state_cost",
+]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -224,6 +244,9 @@ add_load_format_choices = LOAD_FORMAT_CHOICES.extend
 # choice let users create contradictory combos (see _handle_load_format).
 
 add_quantization_method_choices = QUANTIZATION_CHOICES.extend
+
+# Use register_kv_cache_dtype, which also records the value's storage dtype.
+add_kv_cache_dtype_choices = KV_CACHE_DTYPE_CHOICES.extend
 
 # --- Attention backends ---
 

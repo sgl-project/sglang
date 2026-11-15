@@ -24,81 +24,125 @@ namespace device::distributed {
 
 inline constexpr uint32_t kMaxWorldSize = 16;
 
-struct Counter {
+/**
+ * \brief The push plane's phase word: one u64 shared by every kernel on the plane.
+ *
+ * Protocol (every kernel that uses the plane, on one stream):
+ *  - A grid has N participants 0..N-1; the defaults make every block of a 1D grid
+ *    one participant. A 2D/3D grid, or a grid where only some blocks take part
+ *    (e.g. one per cluster), must pass idx and num explicitly.
+ *  - Each participant commits exactly once, on every exit path, after its last read
+ *    of the phase. Participant 0 adds 2^32 - (N - 1), the others add 1, so a grid adds
+ *    exactly 2^32: the high half gains 1 and the low half returns to 0. The phase is
+ *    bit 0 of the high half, so reading it is a 32-bit load and an `& 1`.
+ *  - No partial sum carries into the high half, so the phase cannot change before
+ *    the last participant commits. A participant may commit only after every thread
+ *    it covers has read the phase: put a block barrier before the commit, and a
+ *    cluster barrier when other CTAs of the cluster read but do not commit.
+ *  - `load` must come after the PDL wait: only completion of the previous grid makes
+ *    its commits visible. A kernel that only reads the phase (a producer whose paired
+ *    consumer commits) must sit between the previous commit and that consumer.
+ *  - Every rank runs the same sequence of grids on the plane, so phases agree across ranks.
+ *
+ * Nothing checks these rules: a wrong N, or a skipped or doubled commit, silently
+ * desynchronises the phase and corrupts later rounds.
+ */
+struct EpochCounter {
  public:
-  Counter(const Counter&) = delete;
-  SGL_DEVICE uint32_t get() const {
-    return m_counter;
+  EpochCounter(const EpochCounter&) = delete;
+  /// The current phase, 0 or 1. A plain load of the high half: it runs after the PDL wait.
+  SGL_DEVICE uint32_t load() const {
+    return m_half[1] & 1u;
   }
-  SGL_DEVICE void set(uint32_t val) {
-    m_counter = val;
-  }
-  SGL_DEVICE uint32_t inc(uint32_t val) {
-    return ::atomicAdd(&m_counter, val);
+  /// One call per participant, from a single thread; no thread filtering here.
+  SGL_DEVICE void commit(uint32_t idx = blockIdx.x, uint32_t num = gridDim.x) {
+    ptx::red_add_relaxed_gpu(&m_word, idx == 0 ? (uint64_t{1} << 32) - (num - 1) : uint64_t{1});
   }
 
  private:
-  uint32_t m_counter;
+  union {
+    uint64_t m_word;
+    uint32_t m_half[2];  // little-endian: [1] is the high half
+  };
 };
+static_assert(sizeof(EpochCounter) == 8, "must match the counter allocation in custom_all_reduce_v2.py");
 
-/// One block's arrival slot: a flag peers increment plus a phase counter.
-/// Padded to a cache line so neighbouring blocks never share one.
+/**
+ * \brief One cross-rank barrier slot: one arrival counter per ordering class, padded
+ *        to a cache line because the owner's RMWs contend with neighbouring slots.
+ *
+ * A counter holds arrivals not yet taken by the owning rank. Every rank adds 1 per
+ * arrival (unicast or through the multicast alias); the owner then takes `n` (the
+ * world size) at once and, if the balance went negative, waits for it to return to
+ * >= 0. A peer is at most one barrier ahead, so a balance stays in [-n, n - 1].
+ *
+ * Counting cannot tell rounds apart: a peer's next arrival may be taken in place of
+ * another peer's in-flight one. Release arrivals have their own counter so that a
+ * taken stand-in is always a release, whose acquire still orders the missing peer's
+ * writes transitively (its release was acquired by the stand-in's sender first).
+ * A relaxed stand-in would break that, and relaxed barriers promise no ordering.
+ */
 struct alignas(128) Semaphore {
  public:
   Semaphore(const Semaphore&) = delete;
-  SGL_DEVICE Counter* counter_ptr() {
-    return &m_counter;
-  }
-  SGL_DEVICE uint32_t get_relaxed() const {
-    return ptx::load_relaxed_sys(&m_flag);
-  }
   SGL_DEVICE void put_relaxed() {
-    ptx::red_add_relaxed_sys(&m_flag, 1);
+    ptx::red_add_relaxed_sys(&m_relaxed, 1);
   }
   SGL_DEVICE void put_relaxed_multicast() {
-    ptx::multimem_red_add_relaxed(&m_flag, 1);
+    ptx::multimem_red_add_relaxed(&m_relaxed, 1);
   }
-  SGL_DEVICE uint32_t get_acquire() const {
-    return ptx::load_acquire_sys(&m_flag);
-  }
+  /// Also publishes this thread's prior writes to the taker.
   SGL_DEVICE void put_release() {
-    ptx::red_add_release_sys(&m_flag, 1);
+    ptx::red_add_release_sys(&m_release, 1);
   }
   SGL_DEVICE void put_release_multicast() {
-    ptx::multimem_red_add_release(&m_flag, 1);
+    ptx::multimem_red_add_release(&m_release, 1);
+  }
+
+  /// Owner side: take `n` relaxed arrivals, returning once all of them have landed.
+  SGL_DEVICE void take_relaxed(uint32_t n) {
+    if (static_cast<int32_t>(ptx::atomic_add_relaxed_sys(&m_relaxed, -n) - n) >= 0) return;
+    while (static_cast<int32_t>(ptx::load_relaxed_sys(&m_relaxed)) < 0)
+      ;
+  }
+  /// Owner side: take `n` release arrivals and acquire the writes they published.
+  SGL_DEVICE void take_acquire(uint32_t n) {
+    if (static_cast<int32_t>(ptx::atomic_add_acquire_sys(&m_release, -n) - n) >= 0) return;
+    while (static_cast<int32_t>(ptx::load_acquire_sys(&m_release)) < 0)
+      ;
   }
 
  private:
-  uint32_t m_flag;
-  Counter m_counter;
+  uint32_t m_relaxed;  // arrivals from put_relaxed*
+  uint32_t m_release;  // arrivals from put_release*
 };
 static_assert(sizeof(Semaphore) == 128, "must match _SEMAPHORE_BYTES in custom_all_reduce_v2.py");
 
-/// Kernel-facing slice of a push plane: `[offset, offset + size)` within every
-/// slot, with `slot_bytes` as the stride from one slot to the next. Trivially
-/// copyable, so it drops straight into a `__grid_constant__` params struct.
+/**
+ * \brief Kernel-facing slice of a push plane: `[offset, offset + size)` within every
+ *        slot, with `slot_bytes` as the stride from one slot to the next.
+ *
+ * Trivially copyable, so it drops straight into a `__grid_constant__` params struct.
+ */
 template <uint32_t kWorldSize>
 struct PushWorkSpace {
-  std::array<uint8_t*, kWorldSize> workspaces;
-  Counter* counter;  // NOTE: this is a local tensor, so no mc
-  uint8_t* mc_workspace;
-  uint32_t slot_bytes;
+  std::array<uint8_t*, kWorldSize> workspaces;  // every rank's workspace, already offset
+  EpochCounter* counter;                        // rank-local, so no mc
+  uint8_t* mc_workspace;                        // multicast VA of the local workspace, or null
+  uint32_t slot_bytes;                          // stride between slots, not the slice size
 };
 
 /// Kernel-facing slice of a pull plane. The semaphores are indexed by block,
 /// not by byte, so they pass through the slice unchanged.
 template <uint32_t kWorldSize>
 struct PullWorkSpace {
-  std::array<Semaphore*, kWorldSize> semaphores;
-  std::array<uint8_t*, kWorldSize> workspaces;
-  Semaphore* mc_semaphore;
-  uint8_t* mc_workspace;
+  std::array<Semaphore*, kWorldSize> semaphores;  // every rank's semaphore array
+  std::array<uint8_t*, kWorldSize> workspaces;    // every rank's workspace, already offset
+  Semaphore* mc_semaphore;                        // multicast VA of the local semaphores, or null
+  uint8_t* mc_workspace;                          // multicast VA of the local workspace, or null
 };
 
-/// Bit patterns of the lamport "slot empty" marker. A producer rewrites any
-/// +0.0 in its payload to -0.0 (numerically identical for the reduction) so a
-/// consumer can treat a remaining +0.0 as "not arrived yet".
-
+/// The -0.0 bit pattern per element type, which the Lamport protocol writes in place of +0.0.
 template <typename T>
 struct FloatTrait {};
 
@@ -120,6 +164,15 @@ struct FloatTrait<float> {
   static constexpr uint32_t kNegZero = 0x80000000u;
 };
 
+/**
+ * \brief The Lamport "slot empty" marker over a vector of N elements of T.
+ *
+ * The marker is checked per `kAtom`-byte word: an all-zero word means "not arrived
+ * yet". Producers rewrite every all-zero word of their payload to -0.0 in its lowest
+ * element, which reduces to the same value, so a written word is never 0. Consumers
+ * refill the slot with zeros after reading. A word is written by one store, so it
+ * never shows half of a payload; kAtom must not exceed the store width.
+ */
 template <typename T, uint32_t N, uint32_t kAtom = sizeof(T)>
 struct LamportTrait {
   static_assert(kAtom >= sizeof(T) && (kAtom == 2 || kAtom == 4 || kAtom == 8));
@@ -128,6 +181,7 @@ struct LamportTrait {
   static constexpr Packed kNegZero = FloatTrait<T>::kNegZero;
   static constexpr uint32_t kNumPacked = N / (kAtom / sizeof(T));
 
+  /// Producer side: make every word non-zero without changing the reduced value.
   SGL_DEVICE static void clear_pos_zero(void* val) {
     const auto ptr = static_cast<Packed*>(val);
 #pragma unroll
@@ -136,6 +190,7 @@ struct LamportTrait {
     }
   }
 
+  /// Consumer side: whether any word still holds the empty marker.
   SGL_DEVICE static bool has_pos_zero(const void* val) {
     const auto ptr = static_cast<const Packed*>(val);
     bool result = false;
@@ -146,6 +201,7 @@ struct LamportTrait {
     return result;
   }
 
+  /// The empty marker, for the consumer to restore after reading.
   SGL_DEVICE static void fill_pos_zero(void* val) {
     const auto ptr = static_cast<Packed*>(val);
 #pragma unroll
@@ -155,156 +211,123 @@ struct LamportTrait {
   }
 };
 
+/**
+ * \brief Per-block barrier across all ranks, through semaphore `idx` of every rank.
+ *
+ * Stateless: thread `tx < kWorldSize` signals rank tx's slot and thread `rank` takes
+ * kWorldSize arrivals from its own. The block with the same `idx` on every rank must
+ * make the same sequence of arrivals, and `idx` must be below the semaphore capacity.
+ */
 template <uint32_t kWorldSize>
 struct Barrier {
  public:
-  SGL_DEVICE Barrier(Semaphore* const* semaphores, uint32_t rank, uint32_t num_arrives)
-      : m_counter(0), m_rank(rank), m_semaphores(semaphores) {
-    const auto counter = semaphores[rank][blockIdx.x].counter_ptr();
-    const auto signal = num_arrives * kWorldSize;
-    m_counter = threadIdx.x == rank ? counter->inc(signal) : 0;
-  }
+  SGL_DEVICE Barrier(Semaphore* const* semaphores, uint32_t rank, uint32_t idx = blockIdx.x)
+      : m_rank(rank), m_idx(idx), m_semaphores(semaphores) {}
 
   template <bool kNeedFence>
-  SGL_DEVICE void arrive(uint32_t n) const {
+  SGL_DEVICE void arrive() const {
     if (const auto tx = threadIdx.x; tx < kWorldSize) {
-      const auto bx = blockIdx.x;
-      const auto semaphore = &m_semaphores[tx][bx];
-      const auto current = m_counter + n * kWorldSize;
+      const auto semaphore = &m_semaphores[tx][m_idx];
       if constexpr (kNeedFence) {
         semaphore->put_release();
-        if (tx == m_rank) {
-          while (semaphore->get_acquire() - current < kWorldSize)
-            ;
-        }
+        if (tx == m_rank) semaphore->take_acquire(kWorldSize);
       } else {
         semaphore->put_relaxed();
-        if (tx == m_rank) {
-          while (semaphore->get_relaxed() - current < kWorldSize)
-            ;
-        }
+        if (tx == m_rank) semaphore->take_relaxed(kWorldSize);
       }
     }
   }
 
-  SGL_DEVICE void arrive_relaxed(uint32_t n) const {
-    return this->arrive<false>(n);
+  /// Synchronises only; for an arrival that publishes no data.
+  SGL_DEVICE void arrive_relaxed() const {
+    return this->arrive<false>();
   }
 
-  SGL_DEVICE void arrive_rel_acq(uint32_t n) const {
-    return this->arrive<true>(n);
+  /// Also makes this block's prior writes visible to every rank after the barrier.
+  SGL_DEVICE void arrive_rel_acq() const {
+    return this->arrive<true>();
   }
 
  private:
-  uint32_t m_counter;
   uint32_t m_rank;
+  uint32_t m_idx;
   Semaphore* const* m_semaphores;
 };
 
-/// Picks which half of a push plane's `2 * kWorldSize` slots this round owns.
-/// The halves alternate because a round leaves its pos-zero markers behind: a
-/// peer still draining the previous round must not see them refilled.
+/**
+ * \brief Picks which half of a push plane's `2 * kWorldSize` slots this round owns.
+ *
+ * Rank dst's workspace is `[phase][src][slot_bytes]`: slot (dst, src) receives rank
+ * src's data in rank dst. The halves alternate because a round leaves its pos-zero
+ * markers behind: a peer still draining the previous round must not see them refilled.
+ */
 template <uint32_t kWorldSize>
 struct PushEpoch {
  public:
-  SGL_DEVICE PushEpoch(Counter* counter, uint8_t* const* workspaces, uint32_t slot_bytes)
-      : m_counter(counter), m_workspaces(workspaces), m_slot_bytes(slot_bytes), m_epoch(m_counter[blockIdx.x].get()) {}
+  SGL_DEVICE PushEpoch(EpochCounter* counter, uint8_t* const* workspaces, uint32_t slot_bytes)
+      : m_counter(counter), m_workspaces(workspaces), m_slot_bytes(slot_bytes), m_epoch(counter->load()) {}
 
   SGL_DEVICE PushEpoch(const PushWorkSpace<kWorldSize>& ws)
       : PushEpoch(ws.counter, ws.workspaces.data(), ws.slot_bytes) {}
 
   /// Rank `src`'s slot inside rank `dst`'s workspace, for the current epoch.
   SGL_DEVICE void* slot_ptr(uint32_t dst, uint32_t src = 0) const {
-    const auto epoch_stride_bytes = (m_epoch & 1) * m_slot_bytes * kWorldSize;
-    return m_workspaces[dst] + src * m_slot_bytes + epoch_stride_bytes;
+    return m_workspaces[dst] + slot_offset(src);
   }
 
+  /// Byte offset of rank `src`'s slot within any rank's workspace (or its multicast VA).
   SGL_DEVICE uint32_t slot_offset(uint32_t src = 0) const {
-    const auto epoch_stride_bytes = (m_epoch & 1) * m_slot_bytes * kWorldSize;
+    const auto epoch_stride_bytes = m_epoch * m_slot_bytes * kWorldSize;
     return src * m_slot_bytes + epoch_stride_bytes;
   }
 
-  SGL_DEVICE void flip() const {
-    if (threadIdx.x == 0) m_counter[blockIdx.x].set(m_epoch ^ 1);
-  }
-
-  SGL_DEVICE void unsafe_flip_at(uint32_t bx) const {
-    m_counter[bx].set(m_epoch ^ 1);
-  }
-
-  SGL_DEVICE void unsafe_flip_range(uint32_t start, uint32_t finish) const {
-    for (uint32_t idx = start + threadIdx.x; idx < finish; idx += blockDim.x) {
-      m_counter[idx].set(m_epoch ^ 1);
-    }
+  /// `EpochCounter::commit` as a block-collective call: every thread of a
+  /// participating block calls it, and thread 0 issues the single commit.
+  SGL_DEVICE void commit(uint32_t idx = blockIdx.x, uint32_t num = gridDim.x) const {
+    if (threadIdx.x == 0) m_counter->commit(idx, num);
   }
 
  private:
-  Counter* m_counter;
+  EpochCounter* m_counter;
   uint8_t* const* m_workspaces;
   uint32_t m_slot_bytes;
-  uint32_t m_epoch;
+  uint32_t m_epoch;  // 0 or 1
 };
 
-/// Same window protocol as `Barrier`, but a single `multimem.red` reaches every
-/// peer's row at once instead of a `kWorldSize`-wide unicast fan-out. One
-/// thread drives the whole barrier, so `world_size` need not be a constant and
-/// nothing here has to be a template.
-///
-/// Construction only reserves the window; signalling happens in `arrive`. Keep
-/// them separate at the call site: the reservation is worth hoisting above a
-/// PDL wait (it takes the RMW latency off the post-wait critical path) while
-/// the signal must stay after it, since it asserts the producer grid flushed.
+/*
+ * Same protocol as `Barrier`, but a single `multimem.red` reaches every peer's
+ * slot at once instead of a `kWorldSize`-wide unicast fan-out. One thread drives
+ * the whole barrier, so `world_size` need not be a constant and nothing here has
+ * to be a template. Stateless: constructing one at each call site costs nothing.
+ */
 struct McBarrier {
  public:
-  SGL_DEVICE McBarrier(Semaphore* local, Semaphore* mc, uint32_t world_size, uint32_t num_arrives)
-      : m_counter(0), m_world_size(world_size), m_local(local), m_mc(mc) {
-    if (threadIdx.x == 0) {
-      m_counter = local[blockIdx.x].counter_ptr()->inc(num_arrives * world_size);
-    }
-  }
+  SGL_DEVICE McBarrier(Semaphore* local, Semaphore* mc, uint32_t world_size, uint32_t idx = blockIdx.x)
+      : m_world_size(world_size), m_idx(idx), m_local(local), m_mc(mc) {}
 
   template <bool kNeedFence>
-  SGL_DEVICE void arrive(uint32_t n) const {
-    return arrive_at<kNeedFence>(m_local, m_mc, m_world_size, m_counter + n * m_world_size);
-  }
-
-  SGL_DEVICE void arrive_relaxed(uint32_t n) const {
-    return this->arrive<false>(n);
-  }
-
-  SGL_DEVICE void arrive_rel_acq(uint32_t n) const {
-    return this->arrive<true>(n);
-  }
-
-  /// The reserved window base, valid in thread 0. A kernel whose body is
-  /// register-hungry enough that keeping this object live would spill can park
-  /// this one word in shared memory and finish through `arrive_at` instead.
-  SGL_DEVICE uint32_t window() const {
-    return m_counter;
-  }
-
-  /// `arrive` against a window reserved earlier, without holding the object.
-  /// `window` already includes the `n * world_size` offset.
-  template <bool kNeedFence>
-  SGL_DEVICE static void arrive_at(Semaphore* local, Semaphore* mc, uint32_t world_size, uint32_t window) {
+  SGL_DEVICE void arrive() const {
     if (threadIdx.x != 0) return;
-    const auto bx = blockIdx.x;
-    const auto semaphore = &local[bx];
-    const auto mc_semaphore = &mc[bx];
     if constexpr (kNeedFence) {
-      mc_semaphore->put_release_multicast();
-      while (semaphore->get_acquire() - window < world_size)
-        ;
+      m_mc[m_idx].put_release_multicast();
+      m_local[m_idx].take_acquire(m_world_size);
     } else {
-      mc_semaphore->put_relaxed_multicast();
-      while (semaphore->get_relaxed() - window < world_size)
-        ;
+      m_mc[m_idx].put_relaxed_multicast();
+      m_local[m_idx].take_relaxed(m_world_size);
     }
+  }
+
+  SGL_DEVICE void arrive_relaxed() const {
+    return this->arrive<false>();
+  }
+
+  SGL_DEVICE void arrive_rel_acq() const {
+    return this->arrive<true>();
   }
 
  private:
-  uint32_t m_counter;  // window base; meaningful in thread 0, the sole poller
   uint32_t m_world_size;
+  uint32_t m_idx;
   Semaphore* m_local;
   Semaphore* m_mc;
 };
@@ -313,7 +336,7 @@ struct McBarrier {
 
 namespace host::distributed {
 
-using device::distributed::Counter, device::distributed::Semaphore;
+using device::distributed::EpochCounter, device::distributed::Semaphore;
 using device::distributed::PullWorkSpace, device::distributed::PushWorkSpace;
 using TensorView = tvm::ffi::TensorView;
 template <typename T>
@@ -338,7 +361,7 @@ struct BasePlane {
 
 /**
  * \brief Lamport push plane: a zero-filled symmetric workspace plus a
- *        rank-local phase counter.
+ *        rank-local phase word.
  *
  * Each rank owns `2 * world_size` slots of `slot_bytes` (two phases x one
  * producer slot per peer). Producers store into the destination rank's slot
@@ -356,12 +379,13 @@ struct PushPlaneObj : public tvm::ffi::Object, BasePlane {
       uint32_t rank,
       uint32_t world_size,
       std::vector<TensorView> workspaces,  // world_size * [2 * world_size][slot_bytes]
-      TensorView counter,                  // [num_blocks]
-      intptr_t mc_workspace_ptr);
+      TensorView counter,                  // [sizeof(EpochCounter)]
+      intptr_t mc_workspace_ptr,
+      uint32_t default_blocks);
 
-  uint32_t num_blocks;                             // bound to the counter array, hence not tunable
+  uint32_t default_blocks;                         // launch width for callers without their own; any grid is legal
   int64_t slot_bytes;                              // per-slot bytes; each rank holds 2 * world_size slots
-  Counter* counter;                                // rank-local memory
+  EpochCounter* counter;                           // rank-local memory
   std::array<uint8_t*, kMaxWorldSize> workspaces;  // symmetric memory
   uint8_t* mc_workspace;                           // multicast VA of the local workspace (may be null)
 
@@ -387,7 +411,7 @@ struct PushPlaneObj : public tvm::ffi::Object, BasePlane {
  *        semaphores that guard them.
  *
  * Either half may be absent -- pass a 0-element tensor for the one you do not
- * own, which leaves the corresponding `num_bytes` / `num_blocks` at zero and
+ * own, which leaves the corresponding `num_bytes` / `capacity` at zero and
  * makes any kernel needing it fail with a clear message:
  *
  *  - workspaces only: nothing today, but the shape a caller who brings its own
@@ -408,11 +432,13 @@ struct PullPlaneObj : public tvm::ffi::Object, BasePlane {
       uint32_t rank,
       uint32_t world_size,
       std::vector<TensorView> workspaces,  // world_size * [num_bytes]
-      std::vector<TensorView> semaphores,  // world_size * [num_blocks]
+      std::vector<TensorView> semaphores,  // world_size * [capacity]
       intptr_t mc_workspace_ptr,
-      intptr_t mc_semaphore_ptr);
+      intptr_t mc_semaphore_ptr,
+      uint32_t default_blocks);
 
-  uint32_t num_blocks;                               // semaphore capacity; callers clamp their grid to it
+  uint32_t capacity;                                 // semaphore count; a grid may use any idx below it
+  uint32_t default_blocks;                           // launch width for callers without their own
   int64_t num_bytes;                                 // per-rank workspace bytes
   std::array<Semaphore*, kMaxWorldSize> semaphores;  // symmetric memory
   std::array<uint8_t*, kMaxWorldSize> workspaces;    // symmetric memory
@@ -448,9 +474,11 @@ struct CommunicatorObj : public tvm::ffi::Object {
   TVM_FFI_DECLARE_OBJECT_INFO_FINAL("sgl.distributed.Communicator", CommunicatorObj, tvm::ffi::Object);
   static constexpr bool _type_mutable = true;  // the set_pull_* knobs below
 
-  // Only the constructors live in csrc/distributed/registry.cuh: kernel
-  // modules are separate shared objects that see this header but never link
-  // that translation unit, so everything they call has to be inline here.
+  /*
+   * Only the constructors live in csrc/distributed/registry.cuh: kernel
+   * modules are separate shared objects that see this header but never link
+   * that translation unit, so everything they call has to be inline here.
+   */
   CommunicatorObj(Optional<PushPlaneRef> push, Optional<PullPlaneRef> pull);
 
   uint32_t get_rank() const {
@@ -483,9 +511,11 @@ struct CommunicatorObj : public tvm::ffi::Object {
     return *m_pull.value().get();
   }
 
-  /// Both knobs only ever narrow the grid: unset means "the plane's capacity",
-  /// and the multicast width additionally never exceeds the pull width, since
-  /// extra multicast traffic costs NVLS throughput.
+  /*
+   * Unset pull width means the plane's `default_blocks`; both are clamped to
+   * the semaphore capacity, and the multicast width additionally never exceeds
+   * the pull width, since extra multicast traffic costs NVLS throughput.
+   */
   void set_pull_blocks(std::optional<uint32_t> num_blocks) {
     m_pull_blocks = num_blocks;
   }
@@ -493,9 +523,9 @@ struct CommunicatorObj : public tvm::ffi::Object {
     m_pull_multicast_blocks = num_blocks;
   }
   uint32_t get_pull_blocks() const {
-    const auto capacity = get_pull_obj().num_blocks;
-    CHECK_HOST(capacity > 0) << "This pull plane has no semaphores to barrier on";
-    return m_pull_blocks.has_value() ? std::min(*m_pull_blocks, capacity) : capacity;
+    const auto& pull = get_pull_obj();
+    CHECK_HOST(pull.capacity > 0) << "This pull plane has no semaphores to barrier on";
+    return std::min(m_pull_blocks.value_or(pull.default_blocks), pull.capacity);
   }
   uint32_t get_pull_multicast_blocks() const {
     const auto blocks = get_pull_blocks();

@@ -569,7 +569,10 @@ def test_factorized_tree_cuda_graph_replay_reads_new_inputs(width):
                 part_indices=lambda part: {},
             )
         ),
-        runner_ids=SimpleNamespace(state_ids=lambda sub_pool: IdSpace(key="state")),
+        runner_ids=SimpleNamespace(
+            state_ids=lambda sub_pool: IdSpace(key="state"),
+            request_ids=lambda: IdSpace(key=("request", None)),
+        ),
     )
     with get_context().override_server_args(
         speculative_algorithm="UBTREE",

@@ -307,6 +307,21 @@ def _case_expand_prefill_causally(tc):
         num_tokens=num_tokens,
         padded_num_tokens=num_tokens + 5,
     )
+    # Large decode-verify batch: a 16-token BLOCK against a 256-wide request tile.
+    bs_large = 223
+    seq_lens_large = _ri(8, 500, (bs_large,))
+    extend_large = torch.full((bs_large,), 4, device=DEVICE)
+    tc._parity(
+        attn_metadata_kernels.ExpandPrefillCausally,
+        req_pool_indices=torch.randperm(512, device=DEVICE)[:bs_large],
+        seq_lens=seq_lens_large,
+        extend_seq_lens=extend_large,
+        extend_start_loc=torch.cumsum(extend_large, dim=0) - extend_large,
+        seq_lens_cpu=None,
+        extend_seq_lens_cpu=None,
+        num_tokens=bs_large * 4,
+        padded_num_tokens=bs_large * 4 + 61,
+    )
     # Loop branch: uniform extend with CPU lens and no padding.
     bs2, block = 8, 6
     tc._parity(
@@ -452,13 +467,15 @@ def _case_scatter_compact_to_strided(tc):
         compact = torch.randn(
             graph_num_tokens, dim, dtype=torch.bfloat16, device=DEVICE
         )
-        tc._parity(
-            dspark_verify_window.ScatterCompactToStrided,
-            compact=compact,
-            layout=_layout(verify_lens, graph_num_tokens),
-            fill_value=0.0,
-            verify_num_draft_tokens=t,
-        )
+        for fill_value, point_mass_fill in ((0.0, False), (-1.0e4, True)):
+            tc._parity(
+                dspark_verify_window.ScatterCompactToStrided,
+                compact=compact,
+                layout=_layout(verify_lens, graph_num_tokens),
+                fill_value=fill_value,
+                verify_num_draft_tokens=t,
+                point_mass_fill=point_mass_fill,
+            )
 
 
 def _case_schedule_verify_lens_topk(tc):
