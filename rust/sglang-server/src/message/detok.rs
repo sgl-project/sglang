@@ -20,6 +20,8 @@ pub enum DetokMsg {
         decode_logprob_text: bool,
         /// `SamplingParams.no_stop_trim`: keep the matched stop; default trims it.
         no_stop_trim: bool,
+        /// `SamplingParams.skip_special_tokens` for the output text.
+        skip_special_tokens: bool,
     },
     /// One decode step's chunks for *this shard*. Batched because `from-scheduler` blocks
     /// per send.
@@ -30,7 +32,11 @@ pub enum DetokMsg {
     /// scheduler ring). Sent by to-scheduler right after the same rid's `Register`
     /// on the same channel (FIFO), so the shard delivers the text through the
     /// registered sink like a control `Result` and drops the entry.
-    Decode { rid: Rid, token_ids: Vec<u32> },
+    Decode {
+        rid: Rid,
+        token_ids: Vec<u32>,
+        skip_special_tokens: bool,
+    },
     /// Control result: one already-serialized payload delivered to the sink verbatim.
     Result { rid: Rid, payload: bytes::Bytes },
     /// Terminal per-request failure → an `Error` to the sink (a 400, not a crash).

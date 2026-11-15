@@ -30,6 +30,7 @@ class TestExpertDistributionRecorderModeStatic(CustomTestCase):
     """
 
     expert_distribution_recorder_mode = "stat"
+    enable_eplb = True
 
     path = "/tmp/pt"
 
@@ -50,7 +51,7 @@ class TestExpertDistributionRecorderModeStatic(CustomTestCase):
                 "2",
                 "--expert-parallel-size",
                 "2",
-                "--enable-eplb",
+                *(["--enable-eplb"] if cls.enable_eplb else []),
                 "--moe-a2a-backend",
                 "deepep",
                 "--deepep-mode",
@@ -59,6 +60,9 @@ class TestExpertDistributionRecorderModeStatic(CustomTestCase):
                 cls.expert_distribution_recorder_mode,
             ],
             env={
+                "PYTORCH_NPU_ALLOC_CONF": (
+                    "expandable_segments:True,pin_memory_expandable_segments:True"
+                ),
                 "SGLANG_NPU_DISABLE_ACL_FORMAT_WEIGHT": "1",
                 "HCCL_BUFFSIZE": "1024",
                 "DEEPEP_HYBRID_DEPLOYMENT": "1",
@@ -121,10 +125,12 @@ class TestExpertDistributionRecorderModeStatApprox(
 
 class TestExpertDistributionRecorderPerPass(TestExpertDistributionRecorderModeStatic):
     expert_distribution_recorder_mode = "per_pass"
+    enable_eplb = False
 
 
 class TestExpertDistributionRecorderPerToken(TestExpertDistributionRecorderModeStatic):
     expert_distribution_recorder_mode = "per_token"
+    enable_eplb = False
 
 
 if __name__ == "__main__":

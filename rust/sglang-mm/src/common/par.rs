@@ -10,7 +10,7 @@
 //! * **feature off** (the pure-Rust `rlib` that `sglang-server` links): rayon
 //!   is not even a dependency, and everything runs inline on the calling
 //!   thread. A server supplies concurrency across requests and owns its own
-//!   core budget (it pins threads via `core_affinity`), so a library that
+//!   core budget (it pins its threads to a CPU set), so a library that
 //!   silently spawns its own pools would fight it.
 //!
 //! Note that "sequential" here means *inline on the caller*, not a one-thread

@@ -18,6 +18,7 @@ _SUPPORTED_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
 _BIT_EXACT_DTYPES = (torch.float16, torch.bfloat16)
 _TRANSPOSE_TILE = 32
 _MAX_GRID_DIM = 65535
+_TRANSPOSED = -1  # route: the Triton kernel for the transposed-dense layout
 
 
 @cache_once
@@ -39,7 +40,7 @@ def _jit_residual_gate_add_module(dtype: torch.dtype) -> Module:
 
 
 def _fake_impl(
-    residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
+    residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor, mode: int
 ) -> torch.Tensor:
     return torch.empty_strided(
         residual.shape,
@@ -50,16 +51,10 @@ def _fake_impl(
 
 
 def _residual_gate_add_cuda_impl(
-    residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
+    residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor, gate_mode: int
 ) -> torch.Tensor:
-    out = torch.empty_strided(
-        residual.shape,
-        residual.stride(),
-        dtype=residual.dtype,
-        device=residual.device,
-    )
+    out = torch.empty_like(residual)  # residual is contiguous on this path
     module = _jit_residual_gate_add_module(residual.dtype)
-    gate_mode = _gate_mode(residual, gate)
     if gate_mode == 3:
         # AdaLN unbind views have gaps between batch rows. Only copy the small
         # [B, 1, D] gate, never expand it across the token dimension.
@@ -180,15 +175,48 @@ def _residual_gate_add_transposed(residual, update, gate):
     fake_impl=_fake_impl,
 )
 def _residual_gate_add_custom_op(
-    residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
+    residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor, mode: int
 ) -> torch.Tensor:
+    if residual.get_device() == torch.cuda.current_device():
+        return _launch(residual, update, gate, mode)
     with torch.cuda.device(residual.device):
-        # Take the Triton path only for the transposed-dense layout it was
-        # benchmarked on. For the contiguous layouts every other diffusion model
-        # uses, the existing JIT CUDA kernel is faster at every measured shape.
-        if _is_transposed_dense_residual(residual, update, gate):
-            return _residual_gate_add_transposed(residual, update, gate)
-        return _residual_gate_add_cuda_impl(residual, update, gate)
+        return _launch(residual, update, gate, mode)
+
+
+def _launch(
+    residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor, mode: int
+) -> torch.Tensor:
+    if mode == _TRANSPOSED:
+        return _residual_gate_add_transposed(residual, update, gate)
+    return _residual_gate_add_cuda_impl(residual, update, gate, mode)
+
+
+def _route(residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor):
+    """The kernel for these operands: a gate mode, _TRANSPOSED, or None if unsupported."""
+    if not (
+        torch.version.hip is None
+        and residual.dtype in _SUPPORTED_DTYPES
+        and residual.dtype == update.dtype == gate.dtype
+        and residual.is_cuda
+        and residual.device == update.device == gate.device
+        and residual.dim() >= 2
+        and residual.numel() > 0
+        and update.shape == residual.shape
+    ):
+        return None
+    # Take the Triton path only for the transposed-dense layout it was
+    # benchmarked on. For the contiguous layouts every other diffusion model
+    # uses, the existing JIT CUDA kernel is faster at every measured shape.
+    if _is_transposed_dense_residual(residual, update, gate):
+        return _TRANSPOSED
+    if not (residual.is_contiguous() and update.is_contiguous()):
+        return None
+    mode = _gate_mode(residual, gate)
+    if mode == 2 and not _is_per_token_gate(residual, gate):
+        return None
+    if mode != 3 and not gate.is_contiguous():
+        return None
+    return mode
 
 
 def _gate_mode(residual: torch.Tensor, gate: torch.Tensor) -> int:
@@ -232,10 +260,10 @@ def _is_transposed_dense_residual(
         return False
     batch, tokens, hidden_size = residual.shape
     return (
-        batch <= _MAX_GRID_DIM
+        residual.stride() == (tokens * hidden_size, 1, tokens)
+        and batch <= _MAX_GRID_DIM
         and (tokens + _TRANSPOSE_TILE - 1) // _TRANSPOSE_TILE <= _MAX_GRID_DIM
         and (hidden_size + _TRANSPOSE_TILE - 1) // _TRANSPOSE_TILE <= _MAX_GRID_DIM
-        and residual.stride() == (tokens * hidden_size, 1, tokens)
         and update.is_contiguous()
         and gate.is_contiguous()
     )
@@ -244,48 +272,26 @@ def _is_transposed_dense_residual(
 def can_use_residual_gate_add_cuda(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> bool:
-    return (
-        torch.version.hip is None
-        and residual.dtype in _SUPPORTED_DTYPES
-        and residual.dtype == update.dtype
-        and residual.dtype == gate.dtype
-        and residual.is_cuda
-        and update.is_cuda
-        and gate.is_cuda
-        and residual.device == update.device == gate.device
-        and residual.dim() >= 2
-        and residual.numel() > 0
-        and update.shape == residual.shape
-        and (
-            gate.shape == residual.shape
-            or _is_row_broadcast_gate(residual, gate)
-            or _is_per_token_gate(residual, gate)
-            or _is_batched_row_gate(residual, gate)
-        )
-        and (
-            (residual.is_contiguous() and update.is_contiguous())
-            or _is_transposed_dense_residual(residual, update, gate)
-        )
-        and (gate.is_contiguous() or _is_batched_row_gate(residual, gate))
-    )
+    return _route(residual, update, gate) is not None
 
 
 def residual_gate_add_cuda(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> torch.Tensor:
-    if not can_use_residual_gate_add_cuda(residual, update, gate):
+    mode = _route(residual, update, gate)
+    if mode is None:
         raise RuntimeError("unsupported input for residual_gate_add CUDA")
-    return _residual_gate_add_custom_op(residual, update, gate)
+    return _residual_gate_add_custom_op(residual, update, gate, mode)
 
 
 def residual_gate_add(
     residual: torch.Tensor, update: torch.Tensor, gate: torch.Tensor
 ) -> torch.Tensor:
     """Use the bit-exact fast path for supported layouts, otherwise eager."""
-    if residual.dtype in _BIT_EXACT_DTYPES and can_use_residual_gate_add_cuda(
-        residual, update, gate
-    ):
-        return _residual_gate_add_custom_op(residual, update, gate)
+    if residual.dtype in _BIT_EXACT_DTYPES:
+        mode = _route(residual, update, gate)
+        if mode is not None:
+            return _residual_gate_add_custom_op(residual, update, gate, mode)
     return residual + update * gate
 
 

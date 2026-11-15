@@ -44,6 +44,11 @@ in the GitHub search bar.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Series of advanced reasoning-optimized models (including a 671B MoE) trained with reinforcement learning; top performance on complex reasoning, math, and code tasks. <a href="/cookbook/autoregressive/DeepSeek/DeepSeek-V3">SGLang provides Deepseek v3/R1 model-specific optimizations</a> and <a href="../advanced_features/separate_reasoning">Reasoning Parser</a></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Xing4_0**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`XingChen-AGI/Xing4.0-29B-A4B`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>China Telecom's MoE model with MLA attention and mHC (Manifold-constrained Hyper-Connection) residual streams; supports native MTP speculative decoding, tool calling, and reasoning. <a href="../advanced_features/tool_parser">Tool-call parser</a> and <a href="../advanced_features/separate_reasoning">Reasoning parser</a></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Kimi K2** (Thinking, Instruct)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`moonshotai/Kimi-K2-Instruct`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Moonshot AI's 1 trillion parameter MoE model (32B active) with 128K–256K context; state-of-the-art agentic intelligence with stable long-horizon agency across 200–300 sequential tool calls. Features MLA attention and native INT4 quantization. <a href="../advanced_features/separate_reasoning">See Reasoning Parser docs</a></td>
@@ -167,6 +172,11 @@ in the GitHub search bar.
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**ERNIE-4.5** (4.5, 4.5MoE series)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`baidu/ERNIE-4.5-21B-A3B-PT`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Baidu's ERNIE-4.5 series which consists of MoE with 47B and 3B active parameters, with the largest model having 424B total parameters, as well as a 0.3B dense model.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**ERNIE 5.5 Flash**</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`baidu/ERNIE-5.5-Flash-Base`, `baidu/ERNIE-5.5-Flash-Base-BF16`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Baidu's ERNIE 5.5 Flash (`Ernie5_5_MoeForCausalLM`), a 280B-total / 14B-active MoE: 37 heavily compressed attention (HCA) layers and 6 full-context MLA layers with DSA sparse attention, low-rank gated attention with a cross-head post-mix (VHA), manifold-constrained hyper-connections, and Multi-Router latent MoE layers with 512 experts (top-10) plus a shared expert. The Base checkpoints (FP8 and BF16) are served through the completions endpoint; ERNIE-5.5-Flash (FP8 / FP4 / BF16), with the `ernie55` reasoning and tool-call parsers and a DSpark draft, is coming soon, and attention TP must divide the 8 output groups. See the ERNIE-5.5-Flash cookbook page for recipes.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>**Arcee AFM-4.5B**</td>

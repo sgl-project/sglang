@@ -50,7 +50,12 @@ from sglang.srt.utils.common import ceil_align
 # layer boundaries with the standard participant linears, and for which SP
 # has been validated. Other models reject --enable-layernorm-sp at construction.
 # The mechanism is generic; extend the allowlist as families are validated.
-SP_SUPPORTED_ARCHITECTURES = frozenset({"Qwen3ForCausalLM"})
+MUSE_SP_ARCHITECTURES = frozenset({"MuseSparkForConditionalGeneration"})
+SP_SUPPORTED_ARCHITECTURES = MUSE_SP_ARCHITECTURES | frozenset({"Qwen3ForCausalLM"})
+
+
+def is_muse_spark_architecture(architecture: Optional[str]) -> bool:
+    return architecture in MUSE_SP_ARCHITECTURES
 
 
 def initialize_layernorm_sp(*, model_config) -> None:
@@ -68,16 +73,34 @@ def layernorm_sp_enabled() -> bool:
     return get_flags().sp.enabled
 
 
-def runs_sp(forward_mode) -> bool:
-    """Whether this forward runs SP: an enabled model, prefill only.
+def runs_sp(forward_mode, num_tokens: Optional[int] = None) -> bool:
+    """Whether this forward runs SP: an enabled model, prefill only, and more
+    than --layernorm-sp-min-tokens tokens (0, the default, admits every pass).
+
+    ``num_tokens`` is the pass's token count, before the entry scatter. Every
+    in-tree caller passes it, so the entry scatter, the layer-boundary entry and
+    the exit gathers take the same decision for one pass. In a captured prefill
+    graph the entry decides on the bucket size while the exit gather outside
+    the graph sees the real count; they agree because the threshold is a
+    captured bucket (checked at resolution, ``handle_layernorm_sp``). A caller
+    that asks only about decode / verify passes may omit the count: those
+    never run SP. An extend pass without it raises.
 
     Code outside the CUDA-graph-captured region must use this and not
     ``get_forward().sp_active``: Python writes made inside that region do not
     re-execute on graph replay, so the flag is stale there.
     """
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
-    return layernorm_sp_enabled() and forward_mode == ForwardMode.EXTEND
+    if not (layernorm_sp_enabled() and forward_mode == ForwardMode.EXTEND):
+        return False
+    if num_tokens is None:
+        raise ValueError(
+            "runs_sp needs num_tokens (the pass's token count) for an extend pass: "
+            "without it the caller skips --layernorm-sp-min-tokens and, on a pass "
+            "at or under the threshold, disagrees with the entry and exit gathers."
+        )
+    return num_tokens > get_parallel().layernorm_sp_min_tokens
 
 
 class _SPForwardState:
@@ -151,7 +174,7 @@ def maybe_exit_gather(
     and the predicate from ``runs_sp``, so this stays correct on CUDA graph
     replay, where the writes made inside the captured region do not re-execute.
     """
-    if not runs_sp(forward_mode) or input_ids is None:
+    if input_ids is None or not runs_sp(forward_mode, input_ids.shape[0]):
         return hidden_states, hidden_states_before_norm
     num_tokens = input_ids.shape[0]
     hidden_states = sp_exit_gather(hidden_states, num_tokens=num_tokens)
@@ -180,12 +203,16 @@ except Exception:
 
 
 def sp_fused_matmul_eligible(linear) -> bool:
-    """Whether the torch symm_mem fused matmul+collective fast-path applies: the
-    ops are available and ``linear`` is unquantized, bias-free, bf16/fp16 (the
-    case the fused ops support). Depends only on static layer properties, so the
-    decision is identical across TP ranks.
+    """Whether the selected fused matmul+collective path applies.
+
+    Muse Spark selects CUTLASS; other models keep the Torch symmetric-memory
+    path. Both require an unquantized, bias-free bf16/fp16 linear. The decision
+    depends only on static layer properties and is identical across TP ranks.
     """
-    if not _HAS_TORCH_SYMM_MEM_FUSED or linear.bias is not None:
+    if (
+        not (_HAS_TORCH_SYMM_MEM_FUSED or getattr(linear, "_sp_use_cutlass", False))
+        or linear.bias is not None
+    ):
         return False
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 
@@ -201,11 +228,25 @@ def column_parallel_g_matmul(
 
     The input is this rank's sequence shard ``[M_pad/tp, K]``; all-gather it back
     to the full sequence, matmul, and narrow to the real token count (recorded at
-    the entry scatter). Uses the fused symm-mem kernel when eligible (all-gather +
-    GEMM in one shot), else a plain all-gather + matmul.
+    the entry scatter). Eligible Muse Spark layers use one CUTLASS GEMM with
+    tile-gated all-gather; other models retain their existing implementation.
     """
     num_tokens = sp_num_tokens()
     if sp_fused_matmul_eligible(linear):
+        if getattr(linear, "_sp_use_cutlass", False):
+            from sglang.kernels.ops.communication.sp_collective_gemm import (
+                all_gather_matmul,
+            )
+            from sglang.srt.layers.communication.sp_collective_gemm_workspace import (
+                sp_collective_gemm_workspace,
+            )
+
+            return all_gather_matmul(
+                input_parallel.contiguous(),
+                linear.weight,
+                get_parallel().tp_group.device_group,
+                workspace=sp_collective_gemm_workspace,
+            )[:num_tokens]
         group_name = get_parallel().tp_group.device_group.group_name
         _, mm_outputs = torch.ops.symm_mem.fused_all_gather_matmul(
             input_parallel.contiguous(),
@@ -224,8 +265,8 @@ def row_parallel_gbar_matmul(linear, input_: torch.Tensor, bias) -> torch.Tensor
     Computes ``input_ @ weight.T`` and reduce-scatters (sum) the result across the
     TP group along dim 0, leaving this rank's ``[M_pad/tp, h]`` shard. The token
     dim is padded to a multiple of tp_size (padding rows are zeros, dropped by the
-    exit gather). Uses the fused symm-mem kernel when eligible, else matmul + a
-    plain reduce-scatter.
+    exit gather). Eligible Muse Spark layers use one CUTLASS GEMM with a
+    multicast reduce-scatter epilogue; other models retain their existing path.
     """
     tp_size = linear.tp_group.world_size if linear.tp_group is not None else 1
     x = input_.contiguous()
@@ -234,6 +275,20 @@ def row_parallel_gbar_matmul(linear, input_: torch.Tensor, bias) -> torch.Tensor
     if padded != num_tokens:
         x = torch.nn.functional.pad(x, (0, 0, 0, padded - num_tokens))
     if sp_fused_matmul_eligible(linear):
+        if getattr(linear, "_sp_use_cutlass", False):
+            from sglang.kernels.ops.communication.sp_collective_gemm import (
+                matmul_reduce_scatter,
+            )
+            from sglang.srt.layers.communication.sp_collective_gemm_workspace import (
+                sp_collective_gemm_workspace,
+            )
+
+            return matmul_reduce_scatter(
+                x,
+                linear.weight,
+                get_parallel().tp_group.device_group,
+                workspace=sp_collective_gemm_workspace,
+            )
         group_name = get_parallel().tp_group.device_group.group_name
         return torch.ops.symm_mem.fused_matmul_reduce_scatter(
             x,

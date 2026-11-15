@@ -8,6 +8,8 @@ from typing import Any
 
 from torch import nn
 
+logger = logging.getLogger(__name__)
+
 RejectReason = Callable[[nn.Module], str | None]
 
 
@@ -16,15 +18,24 @@ class QualityGatedFusion:
 
     The marker metadata describes the model attribute(s) owned by a site. The
     enabled flag remains a plain module attribute so compiled model forwards
-    can read it without depending on this helper object.
+    can read it without depending on this helper object. ``reject_reason``
+    holds the static guards :meth:`mount` checks on every marked site.
     """
 
-    __slots__ = ("enabled_attr", "marker_attr", "name")
+    __slots__ = ("enabled_attr", "marker_attr", "name", "reject_reason")
 
-    def __init__(self, *, name: str, marker_attr: str, enabled_attr: str) -> None:
+    def __init__(
+        self,
+        *,
+        name: str,
+        marker_attr: str,
+        enabled_attr: str,
+        reject_reason: RejectReason | None = None,
+    ) -> None:
         self.name = name
         self.marker_attr = marker_attr
         self.enabled_attr = enabled_attr
+        self.reject_reason = reject_reason
 
     def mark(self, module: nn.Module, metadata: Any = True) -> None:
         setattr(module, self.marker_attr, metadata)
@@ -41,32 +52,25 @@ class QualityGatedFusion:
             if hasattr(module, self.marker_attr):
                 yield module
 
-    def mount(
-        self,
-        root: nn.Module,
-        *,
-        reject_reason: RejectReason | None = None,
-        logger: logging.Logger | None = None,
-    ) -> bool:
+    def mount(self, root: nn.Module) -> bool:
         """Enable every eligible site, or leave the whole family disabled."""
         sites = list(self.iter_sites(root))
         if not sites:
             return False
 
-        if reject_reason is not None:
+        if self.reject_reason is not None:
             for site in sites:
-                reason = reject_reason(site)
+                reason = self.reject_reason(site)
                 if reason is None:
                     continue
                 self._set_enabled(sites, False)
-                if logger is not None:
-                    logger.info(
-                        "%s: %s site failed static guards (%s); keeping the "
-                        "whole model on the reference path",
-                        self.name,
-                        type(site).__name__,
-                        reason,
-                    )
+                logger.info(
+                    "%s: %s site failed static guards (%s); keeping the "
+                    "whole model on the reference path",
+                    self.name,
+                    type(site).__name__,
+                    reason,
+                )
                 return False
 
         self._set_enabled(sites, True)

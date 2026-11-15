@@ -3,6 +3,8 @@
 
 use thiserror::Error;
 
+use crate::multi_modality::worker::MediaError;
+
 // Some variants are emitted only once their stage matures (real validation,
 // the deferred Encoder, HF detok). They are part of the stable error surface.
 #[allow(dead_code)]
@@ -14,8 +16,11 @@ pub enum Error {
     #[error("tokenize failed: {0}")]
     Tokenize(String),
 
+    /// The multimodal processor failed the request, keeping Python's status
+    /// class: refused media (an undecodable image, a placeholder that matches
+    /// no item, ...) is the client's, anything else the server's.
     #[error("encode failed: {0}")]
-    Encode(String),
+    Encode(MediaError),
 
     #[error("detokenize failed: {0}")]
     Detokenize(String),
@@ -42,7 +47,7 @@ impl Error {
         matches!(
             self,
             Error::Tokenize(_)
-                | Error::Encode(_)
+                | Error::Encode(MediaError::Server(_))
                 | Error::Detokenize(_)
                 | Error::Codec(_)
                 | Error::Internal(_)

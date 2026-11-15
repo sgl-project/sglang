@@ -6,11 +6,14 @@
  * normed_out:   [M, K] bf16, the normed rows; null unless requested.
  * fp4_out:      [M, K/2] u8, packed e2m1 pairs (low nibble first).
  * sf_out:       [M, K/16] u8, e4m3 block scales in linear (row-major) layout.
- * per_token_scale: [M] fp32.
+ * per_token_scale: [M] fp32; per-token mode only.
+ * global_scale: [1] fp32 static encode scale (w13_input_scale_quant); static mode only.
  *
  * The quantizer reproduces FlashInfer's `nvfp4_quantize(per_token_activation=True,
  * backend="cute-dsl", sfLayout=layout_linear)` byte for byte: the same
  * rcp.approx / cvt.rn.satfinite sequence applied to the bf16-rounded normed row.
+ * Static mode reproduces FlashInfer's CUDA `fp4_quantize(global_sf, sf_vec_size=16,
+ * is_sf_swizzled_layout=False)` the same way.
  */
 
 #include <sgl_kernel/tensor.h>
@@ -38,6 +41,7 @@ struct NormFp4QuantParams {
   void* __restrict__ fp4_out;
   void* __restrict__ sf_out;
   void* __restrict__ per_token_scale;
+  const float* __restrict__ global_scale;
   float eps;
   float global_scale_inv;
   int num_rows;
@@ -111,9 +115,23 @@ SGL_DEVICE float mul_f32(float a, float b) {
   return r;
 }
 
+SGL_DEVICE float output_scale_static(uint32_t fp8, float block_max, float global_scale) {
+  if (block_max == 0.0f) return 0.0f;
+  fp8_e4m3_t sf;
+  sf.__x = static_cast<uint8_t>(fp8);
+  return rcp_approx_ftz(mul_f32(static_cast<float>(sf), rcp_approx_ftz(global_scale)));
+}
+
 }  // namespace device::norm_fp4_quant
 
-template <int64_t kHidden, int kNumThreads, bool kUsePDL, bool kQuant, bool kNormedOut, bool kHasWeight>
+template <
+    int64_t kHidden,
+    int kNumThreads,
+    bool kUsePDL,
+    bool kQuant,
+    bool kNormedOut,
+    bool kHasWeight,
+    bool kStaticScale>
 __global__ void __launch_bounds__(kNumThreads)
     muse_spark_norm_fp4_quant_kernel(const __grid_constant__ NormFp4QuantParams params) {
   using namespace device;
@@ -123,6 +141,7 @@ __global__ void __launch_bounds__(kNumThreads)
   constexpr int kNumWarps = kNumThreads / kWarpThreads;
   static_assert(kHidden % (kNumThreads * kBlock) == 0);
   static_assert(kQuant || kNormedOut);
+  static_assert(kQuant || !kStaticScale);
 
   using BF16Vec = AlignedVector<bf16x2_t, 4>;  // 8 bf16 = 16B; two per block
 
@@ -180,7 +199,7 @@ __global__ void __launch_bounds__(kNumThreads)
         v.y *= wf.y;
       }
       normed[p][q] = cast<bf16x2_t>(v);
-      if constexpr (kQuant) {
+      if constexpr (kQuant && !kStaticScale) {
         const auto r = cast<fp32x2_t>(normed[p][q]);
         local_amax = fmaxf(local_amax, fmaxf(fabsf(r.x), fabsf(r.y)));
       }
@@ -199,23 +218,27 @@ __global__ void __launch_bounds__(kNumThreads)
   }
 
   if constexpr (kQuant) {
-    float* max_smem = kNumWarps == 1 ? smem : smem + kNumWarps;
-    float row_amax = warp::reduce_max(local_amax);
-    if constexpr (kNumWarps > 1) {
-      const int lane = threadIdx.x % kWarpThreads;
-      if (lane == 0) max_smem[threadIdx.x / kWarpThreads] = row_amax;
-      __syncthreads();
-      row_amax = warp::reduce_max(lane < kNumWarps ? max_smem[lane] : 0.0f);
-    }
-
-    float per_token_scale = 0.0f;
     float encode_scale = kFloat32Max;
-    if (row_amax != 0.0f) {
-      per_token_scale = mul_f32(row_amax, params.global_scale_inv);
-      encode_scale = rcp_approx_ftz(per_token_scale);
-    }
-    if (threadIdx.x == 0) {
-      static_cast<float*>(params.per_token_scale)[row] = per_token_scale;
+    if constexpr (kStaticScale) {
+      encode_scale = params.global_scale[0];
+    } else {
+      float* max_smem = kNumWarps == 1 ? smem : smem + kNumWarps;
+      float row_amax = warp::reduce_max(local_amax);
+      if constexpr (kNumWarps > 1) {
+        const int lane = threadIdx.x % kWarpThreads;
+        if (lane == 0) max_smem[threadIdx.x / kWarpThreads] = row_amax;
+        __syncthreads();
+        row_amax = warp::reduce_max(lane < kNumWarps ? max_smem[lane] : 0.0f);
+      }
+
+      float per_token_scale = 0.0f;
+      if (row_amax != 0.0f) {
+        per_token_scale = mul_f32(row_amax, params.global_scale_inv);
+        encode_scale = rcp_approx_ftz(per_token_scale);
+      }
+      if (threadIdx.x == 0) {
+        static_cast<float*>(params.per_token_scale)[row] = per_token_scale;
+      }
     }
 
     const float fp4_max_rcp = rcp_approx_ftz(6.0f);
@@ -235,7 +258,8 @@ __global__ void __launch_bounds__(kNumThreads)
       }
       const float scale_f = mul_f32(encode_scale, mul_f32(block_max, fp4_max_rcp));
       const uint32_t fp8 = cvt_f32_to_e4m3(scale_f) & 0xFFu;
-      const float out_scale = output_scale(fp8, encode_scale);
+      const float out_scale =
+          kStaticScale ? output_scale_static(fp8, block_max, encode_scale) : output_scale(fp8, encode_scale);
 #pragma unroll
       for (int i = 0; i < kBlock; ++i)
         f[i] = mul_f32(f[i], out_scale);
@@ -248,7 +272,7 @@ __global__ void __launch_bounds__(kNumThreads)
   PDLTriggerSecondary<kUsePDL>();
 }
 
-template <int64_t kHidden, int kNumThreads, bool kUsePDL, bool kQuant, bool kNormedOut>
+template <int64_t kHidden, int kNumThreads, bool kUsePDL, bool kQuant, bool kNormedOut, bool kStaticScale>
 struct MuseSparkNormFp4Quant {
   static void
   run(const tvm::ffi::TensorView x,
@@ -257,6 +281,7 @@ struct MuseSparkNormFp4Quant {
       const tvm::ffi::Optional<tvm::ffi::TensorView> fp4_out,
       const tvm::ffi::Optional<tvm::ffi::TensorView> sf_out,
       const tvm::ffi::Optional<tvm::ffi::TensorView> per_token_scale,
+      const tvm::ffi::Optional<tvm::ffi::TensorView> global_scale,
       double eps,
       double global_scale_inv) {
     using namespace host;
@@ -283,7 +308,14 @@ struct MuseSparkNormFp4Quant {
     if constexpr (kQuant) {
       TensorMatcher({M, K2}).with_dtype<uint8_t>().with_device(device_).verify(fp4_out.value());
       TensorMatcher({M, K16}).with_dtype<uint8_t>().with_device(device_).verify(sf_out.value());
+    }
+    RuntimeCheck(per_token_scale.has_value() == (kQuant && !kStaticScale), "per_token_scale is per-token mode only");
+    if (per_token_scale.has_value()) {
       TensorMatcher({M}).with_dtype<fp32_t>().with_device(device_).verify(per_token_scale.value());
+    }
+    RuntimeCheck(global_scale.has_value() == kStaticScale, "global_scale is static mode only");
+    if constexpr (kStaticScale) {
+      TensorMatcher({1}).with_dtype<fp32_t>().with_device(device_).verify(global_scale.value());
     }
 
     const auto num_rows = static_cast<int>(M.unwrap());
@@ -295,7 +327,8 @@ struct MuseSparkNormFp4Quant {
         .normed_out = kNormedOut ? normed_out.value().data_ptr() : nullptr,
         .fp4_out = kQuant ? fp4_out.value().data_ptr() : nullptr,
         .sf_out = kQuant ? sf_out.value().data_ptr() : nullptr,
-        .per_token_scale = kQuant ? per_token_scale.value().data_ptr() : nullptr,
+        .per_token_scale = per_token_scale.has_value() ? per_token_scale.value().data_ptr() : nullptr,
+        .global_scale = kStaticScale ? static_cast<const float*>(global_scale.value().data_ptr()) : nullptr,
         .eps = static_cast<float>(eps),
         .global_scale_inv = static_cast<float>(global_scale_inv),
         .num_rows = num_rows,
@@ -306,11 +339,13 @@ struct MuseSparkNormFp4Quant {
     if (weight.has_value()) {
       LaunchKernel(grid, kNumThreads, device)
           .enable_pdl(kUsePDL)(
-              muse_spark_norm_fp4_quant_kernel<kHidden, kNumThreads, kUsePDL, kQuant, kNormedOut, true>, params);
+              muse_spark_norm_fp4_quant_kernel<kHidden, kNumThreads, kUsePDL, kQuant, kNormedOut, true, kStaticScale>,
+              params);
     } else {
       LaunchKernel(grid, kNumThreads, device)
           .enable_pdl(kUsePDL)(
-              muse_spark_norm_fp4_quant_kernel<kHidden, kNumThreads, kUsePDL, kQuant, kNormedOut, false>, params);
+              muse_spark_norm_fp4_quant_kernel<kHidden, kNumThreads, kUsePDL, kQuant, kNormedOut, false, kStaticScale>,
+              params);
     }
   }
 };

@@ -70,7 +70,7 @@ class HYV4MTPDecoderLayer(nn.Module):
             is_nextn=True,
             reduce_results=False,
         )
-        if hasattr(self.mlp, "shared_experts"):
+        if self.mlp.shared_experts is not None:
             self.mlp.shared_experts.swiglu_limit = None
         self.attn_boundary, self.ffn_boundary = append_stages(
             (

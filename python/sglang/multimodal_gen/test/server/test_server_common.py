@@ -13,6 +13,7 @@ import os
 import queue
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -42,6 +43,9 @@ from sglang.multimodal_gen.test.server.test_server_utils import (
 )
 from sglang.multimodal_gen.test.server.testcase_configs import (
     BASELINE_CONFIG,
+    OUTPUT_CHANGE_MIN_MEAN_ABS_DIFF,
+    OUTPUT_MATCH_MAX_MEAN_ABS_DIFF,
+    OUTPUT_MATCH_MIN_PSNR,
     DiffusionTestCase,
     PerformanceSummary,
     ScenarioConfig,
@@ -56,6 +60,8 @@ from sglang.multimodal_gen.test.test_utils import (
     audio_gt_exists,
     compare_audio_with_gt,
     compare_with_gt,
+    compute_mean_abs_diff,
+    compute_psnr,
     encode_audio_gt_wav,
     extract_audio_pcm_from_video_bytes,
     extract_key_frames_from_video,
@@ -114,6 +120,22 @@ def _print_case_log_separator(case_id: str, state: str) -> None:
         f"{_CASE_LOG_SEPARATOR}",
         flush=True,
     )
+
+
+def _key_frame_distances(
+    case_id: str, label: str, frames: list[np.ndarray], reference: list[np.ndarray]
+) -> tuple[list[float], list[float]]:
+    """Per-key-frame mean_abs_diff and PSNR of ``frames`` against ``reference``."""
+    pairs = list(zip(frames, reference, strict=True))
+    mean_abs_diffs = [compute_mean_abs_diff(frame, ref) for frame, ref in pairs]
+    psnrs = [compute_psnr(frame, ref) for frame, ref in pairs]
+    print(
+        f"[Output Reference] {case_id}: {label}: "
+        f"mean_abs_diff=[{', '.join(f'{value:.3f}' for value in mean_abs_diffs)}] "
+        f"psnr=[{', '.join(f'{value:.2f}' for value in psnrs)}]",
+        flush=True,
+    )
+    return mean_abs_diffs, psnrs
 
 
 @pytest.fixture
@@ -1463,6 +1485,85 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         logger.info("[Multi-LoRA] All multi-LoRA tests passed for %s", case.id)
 
+    def _key_frames(self, case: DiffusionTestCase, content: bytes) -> list[np.ndarray]:
+        if case.server_args.modality == "video":
+            return extract_key_frames_from_video(content)
+        return [image_bytes_to_numpy(content)]
+
+    def _generate_key_frames(
+        self, ctx: ServerContext, case: DiffusionTestCase, **extras: Any
+    ) -> list[np.ndarray]:
+        """Key frames of the case's request with ``extras`` overriding its own."""
+        generate_fn = get_generate_fn(
+            model_path=case.server_args.model_path,
+            modality=case.server_args.modality,
+            sampling_params=replace(
+                case.sampling_params,
+                extras={**case.sampling_params.extras, **extras},
+            ),
+        )
+        _, content = self._run_generation_with_server_watchdog(
+            ctx, case.id, generate_fn, self._client(ctx)
+        )
+        return self._key_frames(case, content)
+
+    def _test_output_references(
+        self, ctx: ServerContext, case: DiffusionTestCase, content: bytes
+    ) -> None:
+        """Compare the case's output with other requests to the same server.
+
+        Same prompt and seed, so a reference differs from the case's request
+        only in its quality level, or in the LoRA adapter being off.
+        """
+        compared = [("output", self._key_frames(case, content))]
+        failures = []
+        if case.reference_quality is not None:
+            label = f"quality={case.reference_quality}"
+            reference = self._generate_key_frames(
+                ctx, case, quality=case.reference_quality
+            )
+            mean_abs_diffs, psnrs = _key_frame_distances(
+                case.id, f"output vs {label}", compared[0][1], reference
+            )
+            if (
+                max(mean_abs_diffs) > OUTPUT_MATCH_MAX_MEAN_ABS_DIFF
+                or min(psnrs) < OUTPUT_MATCH_MIN_PSNR
+            ):
+                failures.append(
+                    f"output does not match {label}: "
+                    f"max mean_abs_diff={max(mean_abs_diffs):.3f} "
+                    f"(<= {OUTPUT_MATCH_MAX_MEAN_ABS_DIFF}), "
+                    f"min psnr={min(psnrs):.2f} (>= {OUTPUT_MATCH_MIN_PSNR})"
+                )
+            compared.append((label, reference))
+
+        if case.run_lora_effect_check:
+            base_url = f"http://localhost:{ctx.port}/v1"
+            # unmerge turns the adapter off in every merge mode; merge restores it
+            resp = requests.post(
+                f"{base_url}/unmerge_lora_weights", timeout=_CONTROL_API_TIMEOUT_SECS
+            )
+            assert resp.status_code == 200, f"unmerge_lora_weights failed: {resp.text}"
+            try:
+                without_lora = self._generate_key_frames(ctx, case)
+            finally:
+                resp = requests.post(
+                    f"{base_url}/merge_lora_weights",
+                    timeout=_CONTROL_API_TIMEOUT_SECS,
+                )
+            assert resp.status_code == 200, f"merge_lora_weights failed: {resp.text}"
+            for label, frames in compared:
+                mean_abs_diffs, _ = _key_frame_distances(
+                    case.id, f"{label} vs LoRA off", frames, without_lora
+                )
+                if min(mean_abs_diffs) < OUTPUT_CHANGE_MIN_MEAN_ABS_DIFF:
+                    failures.append(
+                        f"{label} barely changes with the LoRA off: "
+                        f"min mean_abs_diff={min(mean_abs_diffs):.3f} "
+                        f"(>= {OUTPUT_CHANGE_MIN_MEAN_ABS_DIFF})"
+                    )
+        assert not failures, "\n".join(failures)
+
     def _test_v1_models_endpoint(
         self, ctx: ServerContext, case: DiffusionTestCase
     ) -> None:
@@ -1624,6 +1725,21 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
         if case.run_lora_dynamic_load_check:
             self._test_dynamic_lora_loading(diffusion_server, case)
 
+        failures = []
+        if case.lead_sampling_params is not None:
+            label = "lead request"
+            _print_case_log_separator(case.id, f"BEGIN {label}")
+            try:
+                self._test_lead_request(case, diffusion_server)
+            except pytest.skip.Exception as exc:
+                failures.append(f"[{label}] Required request skipped: {exc}")
+                _print_case_log_separator(case.id, f"FAILED {label}")
+            except (Exception, pytest.fail.Exception) as exc:
+                failures.append(f"[{label}] {exc}")
+                _print_case_log_separator(case.id, f"FAILED {label}")
+            else:
+                _print_case_log_separator(case.id, f"PASSED {label}")
+
         for warmup_index in range(case.perf_warmup_requests):
             label = f"request warmup {warmup_index + 1}/{case.perf_warmup_requests}"
             _print_case_log_separator(case.id, f"BEGIN {label}")
@@ -1646,7 +1762,6 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
             )
             _print_case_log_separator(case.id, f"END {label}")
 
-        failures = []
         for request_index in range(1, case.perf_repeat_requests + 1):
             label = f"request {request_index}/{case.perf_repeat_requests}"
             _print_case_log_separator(case.id, f"BEGIN {label}")
@@ -1676,6 +1791,26 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
 
         if failures:
             pytest.fail("\n\n".join(failures), pytrace=False)
+
+    def _test_lead_request(
+        self,
+        case: DiffusionTestCase,
+        diffusion_server: ServerContext,
+    ) -> None:
+        """Send the lead request; check it against its own golden."""
+        lead = case.lead_case()
+        generate_fn = get_generate_fn(
+            model_path=lead.server_args.model_path,
+            modality=lead.server_args.modality,
+            sampling_params=lead.sampling_params,
+        )
+        _, content = self.run_and_collect(
+            diffusion_server, lead.id, generate_fn, collect_perf=False
+        )
+        if os.environ.get("SGLANG_GEN_GT", "0") == "1":
+            self._save_gt_output(lead, content)
+        elif lead.run_consistency_check:
+            self._validate_consistency(lead, content)
 
     def _test_diffusion_request(
         self,
@@ -1773,6 +1908,13 @@ Pinned revision used by this check: {SGL_TEST_FILES_CI_DATA_REVISION}
                     "audio consistency",
                     lambda: self._validate_audio_consistency(case, content),
                 )
+
+        # before the LoRA checks below, which change the server's adapter state
+        if case.reference_quality is not None or case.run_lora_effect_check:
+            run_case_check(
+                "output references",
+                lambda: self._test_output_references(diffusion_server, case, content),
+            )
 
         if case.run_lora_basic_api_check:
             run_case_check(

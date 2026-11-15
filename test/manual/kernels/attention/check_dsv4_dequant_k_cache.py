@@ -3,7 +3,9 @@ import torch
 from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
     NOPE_ROPE_BYTES,
     PADDED_SCALE_PER_TOKEN,
-    dequantize_k_cache_paged,
+    dequantize_k_cache_paged_dsv4,
+)
+from sglang.test.kernels.deepseek_v4.k_cache_reference import (
     dequantize_k_cache_paged_ref,
 )
 
@@ -27,7 +29,7 @@ if __name__ == "__main__":
         0, num_pages * page_size, (num_tokens,), dtype=torch.int32, device=device
     )
 
-    out_kernel = dequantize_k_cache_paged(quant_k_cache, page_table, page_size)
+    out_kernel = dequantize_k_cache_paged_dsv4(quant_k_cache, page_table, page_size)
     out_ref = dequantize_k_cache_paged_ref(quant_k_cache, page_table, page_size)
 
     torch.testing.assert_close(out_kernel, out_ref, atol=0, rtol=0, equal_nan=True)

@@ -2,16 +2,16 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import torch
 import triton
 import triton.language as tl
 
-from sglang.kernels.ops.moe.dsv4 import (
-    silu_and_mul_clamp,
-    silu_and_mul_masked_post_quant,
-)
+from sglang.kernels.arch import current_arch
+from sglang.kernels.ops.activation.silu_and_mul_clamp import silu_and_mul_clamp
+from sglang.kernels.ops.moe.dsv4 import silu_and_mul_masked_post_quant
 from sglang.kernels.ops.moe.triton_pad_expert_counts import pad_expert_counts
 from sglang.kernels.ops.quantization.per_token_group_quant import per_token_group_quant
 
@@ -34,6 +34,7 @@ from sglang.srt.layers.moe.moe_runner.base import (
     register_pre_permute,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_a2a_backend
+from sglang.srt.layers.offloader import get_offloader
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
@@ -48,7 +49,6 @@ from sglang.srt.utils import (
     is_musa,
     is_npu,
 )
-from sglang.srt.utils.offloader import get_offloader
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher.deepep import (
@@ -86,8 +86,14 @@ else:
     _legacy_silu_and_mul = None
 
 
-_DEEPGEMM_ON_H20 = get_bool_env_var("SGLANG_DEEPGEMM_ON_H20")
 _masked_standard_layout_memory_budget_bytes: Optional[int] = None
+
+
+@lru_cache(maxsize=1)
+def _is_h20() -> bool:
+    # H20 and H20-3e are the only SM90 parts with 78 SMs.
+    arch = current_arch()
+    return arch.is_sm(9, 0) and arch.num_sms == 78
 
 
 # TODO(kaixih@nvidia): ideally we should merge this logic into
@@ -298,6 +304,9 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
     w13_scale: Optional[torch.Tensor] = None
     w2_scale: Optional[torch.Tensor] = None
     block_shape: Optional[List[int]] = None
+    # w2's scale block when Fp8MoEMethod refines it apart from block_shape for a
+    # TP shard that splits checkpoint blocks; requantized to per-row UE8M0.
+    w2_block_shape: Optional[List[int]] = None
     # DSV4 mxfp4 layout flag; selects recipe_a=(1,128)/recipe_b=(1,32) downstream.
     is_fp4_experts: bool = False
     use_mxfp8: bool = False
@@ -318,6 +327,7 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
         activation_block_size: Optional[int],
         hidden_size: int,
         activation_scale_width: int,
+        down: bool = False,
     ) -> tuple[Optional[tuple[int, int]], Optional[tuple[int, int]]]:
         """Return DeepGEMM A/B scale recipes from explicit layout metadata."""
         if self.use_mxfp8:
@@ -335,6 +345,9 @@ class DeepGemmMoeQuantInfo(MoeQuantInfo):
             return (self.block_shape[0], activation_block_size), weight_recipe
         if self.is_fp4_experts:
             return (1, 128), (1, 32)
+        if down and self.w2_block_shape is not None:
+            gran_k = self.w2_block_shape[1]
+            return (1, activation_block_size or gran_k), (1, gran_k)
         return None, None
 
 
@@ -402,7 +415,9 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.kernels.ops.moe.dsv4 import silu_and_mul_contig_post_quant
+        from sglang.kernels.ops.activation.silu_and_mul_clamp import (
+            silu_and_mul_contig_post_quant,
+        )
         from sglang.kernels.ops.moe.ep_moe_kernels import tma_align_input_scale
         from sglang.kernels.ops.quantization.fp8_kernel import (
             create_per_token_group_quant_fp8_output_scale,
@@ -423,6 +438,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         N = quant_info.w13_weight.size(1)
         K = hidden_states_shape[1]
         scale_block_size = quant_info.block_shape[1] if quant_info.use_mxfp8 else 128
+        if quant_info.w2_block_shape is not None:
+            scale_block_size = quant_info.w2_block_shape[1]
 
         if all_tokens == 0:
             if trace_deepep_v2_contig:
@@ -623,10 +640,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             down_input_scale = tma_align_input_scale(down_input_scale)
 
         # The down activation is quantized here, independently of dispatch.
-        recipe_a_down, _ = quant_info.scale_recipes(
+        recipe_a_down, recipe_b_down = quant_info.scale_recipes(
             activation_block_size=scale_block_size,
             hidden_size=down_input_fp8.shape[-1],
             activation_scale_width=down_input_scale.shape[-1],
+            down=True,
         )
         deep_gemm_wrapper.grouped_gemm_nt_f8f8bf16_contig(
             (down_input_fp8, down_input_scale),
@@ -634,7 +652,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             down_output,
             m_indices,
             recipe_a=recipe_a_down,
-            recipe_b=recipe_b,
+            recipe_b=recipe_b_down,
         )
         if trace_deepep_v2_contig:
             torch.cuda.synchronize()
@@ -747,6 +765,8 @@ class DeepGemmRunnerCore(MoeRunnerCore):
 
         use_mxfp8 = quant_info.use_mxfp8
         scale_block_size = quant_info.block_shape[1] if quant_info.block_shape else 128
+        if quant_info.w2_block_shape is not None:
+            scale_block_size = quant_info.w2_block_shape[1]
 
         recipe_a, recipe_b = quant_info.scale_recipes(
             activation_block_size=runner_input.activation_scale_block_size,
@@ -864,10 +884,11 @@ class DeepGemmRunnerCore(MoeRunnerCore):
                 down_input_scale
             )
 
-        recipe_a_down, _ = quant_info.scale_recipes(
+        recipe_a_down, recipe_b_down = quant_info.scale_recipes(
             activation_block_size=scale_block_size,
             hidden_size=down_input.shape[-1],
             activation_scale_width=down_input_scale.shape[-1],
+            down=True,
         )
         with use_symmetric_memory(
             get_parallel().tp_group, disabled=not is_allocation_symmetric()
@@ -881,9 +902,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             gemm_overlap_args_dict = {}
         else:
             down_gemm_overlap_args.start_event.record()
-            max_block_n = (
-                160 if (_DEEPGEMM_ON_H20 and runner_input.expected_m <= 64) else 256
-            )
+            max_block_n = 160 if (_is_h20() and runner_input.expected_m <= 64) else 256
             gemm_overlap_args_dict = {
                 "overlap_args": down_gemm_overlap_args,
                 "max_block_n": max_block_n,
@@ -896,7 +915,7 @@ class DeepGemmRunnerCore(MoeRunnerCore):
             masked_m,
             expected_m,
             recipe_a=recipe_a_down,
-            recipe_b=recipe_b,
+            recipe_b=recipe_b_down,
             **gemm_overlap_args_dict,
         )
         if trace_deepep_v2_masked:
@@ -1509,7 +1528,9 @@ def _varlen_deep_gemm_situ_mul_quant(
     linear_beta: float,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Fused SiTU activation + per-group fp8 quant via CUDA JIT kernel."""
-    from sglang.kernels.ops.moe import situ_and_mul_masked_post_quant
+    from sglang.kernels.ops.moe.kimi_k3_situ_and_mul_quant import (
+        situ_and_mul_masked_post_quant,
+    )
 
     E, N, D_2 = gateup_output.shape
     D = D_2 // 2
@@ -1685,10 +1706,14 @@ def _situ_mul_quant_contig_kernel(
     up_t = 2.0 * tl.sigmoid(2.0 * up / situ_linear_beta) - 1.0
     y = gate * situ_linear_beta * up_t
     amax = tl.clamp(tl.max(tl.abs(y), axis=1), min=1e-10, max=float("inf"))
-    q = (y * (448.0 / amax)[:, None]).to(tl.float8e4nv)
+    # Quantize with the power-of-two (UE8M0) scale the GEMM reads, not amax / 448.
+    bits = (amax / 448.0).to(tl.int32, bitcast=True)
+    exp = (bits >> 23) + ((bits & 0x7FFFFF) != 0).to(tl.int32)
+    scale = (exp << 23).to(tl.float32, bitcast=True)
+    q = (y / scale[:, None]).to(tl.float8e4nv)
     tl.store(q_ptr + row * N + offs, q, mask=mask)
     srow = tl.arange(0, KG_POW2)
-    tl.store(s_ptr + row * KG + srow, amax / 448.0, mask=srow < KG)
+    tl.store(s_ptr + row * KG + srow, scale, mask=srow < KG)
 
 
 def _apply_swiglu_limit(

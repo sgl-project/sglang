@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=146, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=179, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=270, suite="stage-b-test-1-gpu-small-amd")
 """
 Usage:
@@ -173,6 +173,10 @@ class TestVisionChunkedPrefill(CustomTestCase):
                 "--chunked-prefill-size",
                 f"{chunked_prefill_size}",
             ],
+            # llava's per-image CPU preprocessing times out after REQUEST_TIMEOUT
+            # (default 10 s); a batch of video frames exceeds that on CI hosts
+            # with slower CPUs.
+            env={"REQUEST_TIMEOUT": "60"},
         )
         return process.pid
 
@@ -202,9 +206,9 @@ class TestVisionChunkedPrefill(CustomTestCase):
 
         # None-chunked
         logger.info("Phase 2: Testing with chunked_prefill_size=-1 (no chunking)")
+        no_chunked_server_pid = self.launch_server(chunked_prefill_size=-1)
+        logger.info(f"Non-chunked server started with pid={no_chunked_server_pid}")
         try:
-            no_chunked_server_pid = self.launch_server(chunked_prefill_size=-1)
-            logger.info(f"Non-chunked server started with pid={no_chunked_server_pid}")
             outputs_no_chunked = []
             for i, (batch, num_frame) in enumerate(zip(batches, num_frames)):
                 logger.info(f"Non-chunked test iteration {i + 1}/{len(batches)}")

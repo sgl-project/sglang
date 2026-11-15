@@ -2,21 +2,12 @@
 
 from __future__ import annotations
 
-import logging
 from functools import cache
 
 import torch
 import torch.nn as nn
 
 from sglang.kernels.ops.diffusion.sites.quality_gate import QualityGatedFusion
-
-logger = logging.getLogger(__name__)
-
-_FUSION = QualityGatedFusion(
-    name="HunyuanVideo strided QK RMSNorm",
-    marker_attr="_sgl_hunyuan_qknorm_site",
-    enabled_attr="_sgl_hunyuan_qknorm_enabled",
-)
 
 
 @cache
@@ -30,26 +21,18 @@ def _get_qk_rmsnorm_cute():
     return qk_rmsnorm_cute
 
 
-def mark_hunyuan_qknorm_site(module: nn.Module) -> None:
-    _FUSION.mark(module)
-
-
 def _site_reject_reason(_site: nn.Module) -> str | None:
     if _get_qk_rmsnorm_cute() is None:
         return "FlashInfer CuTe QK RMSNorm unavailable"
     return None
 
 
-def mount_hunyuan_qknorm(root: nn.Module) -> bool:
-    return _FUSION.mount(
-        root,
-        reject_reason=_site_reject_reason,
-        logger=logger,
-    )
-
-
-def unmount_hunyuan_qknorm(root: nn.Module) -> None:
-    _FUSION.unmount(root)
+HUNYUAN_QKNORM = QualityGatedFusion(
+    name="HunyuanVideo strided QK RMSNorm",
+    marker_attr="_sgl_hunyuan_qknorm_site",
+    enabled_attr="_sgl_hunyuan_qknorm_enabled",
+    reject_reason=_site_reject_reason,
+)
 
 
 def try_hunyuan_qknorm(
@@ -62,7 +45,7 @@ def try_hunyuan_qknorm(
 ) -> tuple[torch.Tensor, torch.Tensor] | None:
     """Normalize strided Hunyuan Q/K views without materializing inputs."""
     if not (
-        _FUSION.is_enabled(site)
+        HUNYUAN_QKNORM.is_enabled(site)
         and not torch.compiler.is_compiling()
         and q.is_cuda
         and q.dtype == torch.bfloat16

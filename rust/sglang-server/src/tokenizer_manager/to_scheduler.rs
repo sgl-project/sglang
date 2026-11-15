@@ -10,6 +10,7 @@ use crate::message::response::ResponseItem;
 use crate::runtime::Runnable;
 use crate::tokenizer_manager::channel::ToSchedulerTx;
 pub use crate::tokenizer_manager::to_scheduler_types::{Limits, MmDispatch};
+pub(crate) use crate::tokenizer_manager::to_scheduler_validation::fit_input;
 use crate::tokenizer_manager::to_scheduler_validation::{
     check_total_tokens, validate, validate_input_ids,
 };
@@ -63,6 +64,20 @@ impl Intake {
     }
 }
 
+/// The scheduler's `AbortReq` for one request.
+fn abort_req(rid: &Rid) -> Option<SchedulerRequest> {
+    match ControlRequest::AbortReq(AbortReq::new(rid.as_str().to_string(), false)).encode() {
+        Ok(header) => Some(SchedulerRequest {
+            header,
+            buffers: Vec::new(),
+        }),
+        Err(e) => {
+            tracing::error!(rid = %rid, error = %e, "abort encode failed");
+            None
+        }
+    }
+}
+
 /// Which lane produced the next item.
 enum Lane {
     Abort(AbortSource),
@@ -96,6 +111,10 @@ impl Runnable for Intake {
                 }
                 Some(Lane::Event(TmEvent::Tokenized(req) | TmEvent::Encoded(req))) => {
                     self.drive(req)
+                }
+                Some(Lane::Event(TmEvent::OneWay { control, queued })) => {
+                    // The caller may have stopped waiting; the push stands.
+                    let _ = queued.send(self.push_one_way(&control));
                 }
                 None => {
                     // Shutdown, or the inbox closed. Drain whatever is still queued
@@ -166,19 +185,26 @@ impl Intake {
                         let _ = req.state.apply(Event::Error(e)); // → Failed
                         continue;
                     }
-                    if !self.register_detok(&req) {
-                        let _ = req
-                            .state
-                            .apply(Event::Error(Error::Internal("detok shard gone".into())));
-                        continue;
+                    // A tokenize request is answered by the tokenizer pool
+                    // through its own sink, never by a detok shard.
+                    if !matches!(req.kind, RequestKind::Tokenize { .. }) {
+                        if !self.register_detok(&req) {
+                            let _ = req
+                                .state
+                                .apply(Event::Error(Error::Internal("detok shard gone".into())));
+                            continue;
+                        }
+                        registered = true;
                     }
-                    registered = true;
                     // `validate` advanced Received → Validating; keep driving.
                 }
-                // Control and detokenize skip normalization (no sampling params)
-                // straight to the pre-send checks; generate goes to Normalizing.
+                // Control, detokenize and tokenize skip normalization (no
+                // sampling params) straight to the pre-send checks; generate
+                // goes to Normalizing.
                 RequestState::Validating => match &req.kind {
-                    RequestKind::Control(_) | RequestKind::Detokenize { .. } => {
+                    RequestKind::Control(_)
+                    | RequestKind::Detokenize { .. }
+                    | RequestKind::Tokenize { .. } => {
                         let _ = req
                             .state
                             .apply(Event::Validated(ValidationOutcome::AlreadyTokenized));
@@ -241,6 +267,11 @@ impl Intake {
                 // is recorded in `request_states` and honored when it returns.
                 RequestState::Encoding => {
                     let rid = req.rid.clone();
+                    if let RequestKind::Generate(g) = &mut req.kind
+                        && let Some(mm) = g.mm.as_mut()
+                    {
+                        mm.admission.queued_at = Some(std::time::Instant::now());
+                    }
                     // Full = the pool can't keep up, so back-pressure like a full
                     // to_scheduler channel. Disconnected = pool gone. Either way
                     // flume hands the request back.
@@ -308,7 +339,7 @@ impl Intake {
                 }
                 // Hand the request to the stage that answers it: the scheduler
                 // channel (generate payload or control frame), or -- for detokenize
-                // — the detok shard itself.
+                // and tokenize — the detok shard or the tokenizer pool itself.
                 RequestState::Queued => {
                     // The patterns bind nothing, so the match reads only the
                     // discriminant and `req` can be moved into each push.
@@ -316,6 +347,7 @@ impl Intake {
                         RequestKind::Generate(_) => self.push_to_channel(req),
                         RequestKind::Control(_) => self.push_control_to_channel(req),
                         RequestKind::Detokenize { .. } => self.push_detokenize_to_shard(req),
+                        RequestKind::Tokenize { .. } => self.push_tokenize_to_pool(req),
                     }
                     return;
                 }
@@ -344,12 +376,19 @@ impl Intake {
     /// stop in the output) — so the shard needs no back-reference to the request.
     /// Returns `false` if the shard is gone.
     fn register_detok(&self, req: &Request) -> bool {
-        let (decode_logprob_text, no_stop_trim) = match &req.kind {
+        let (decode_logprob_text, no_stop_trim, skip_special_tokens) = match &req.kind {
             RequestKind::Generate(g) => (
                 g.return_text_in_logprobs.unwrap_or(false),
                 g.sampling_params.no_stop_trim,
+                g.sampling_params.skip_special_tokens,
             ),
-            RequestKind::Control(_) | RequestKind::Detokenize { .. } => (false, false),
+            RequestKind::Control(_)
+            | RequestKind::Detokenize { .. }
+            | RequestKind::Tokenize { .. } => (
+                false, /* decode_logprob_text */
+                false, /* no_stop_trim */
+                true,  /* skip_special_tokens */
+            ),
         };
         self.senders
             .detok_for(&req.rid)
@@ -358,6 +397,7 @@ impl Intake {
                 sink: req.sink.clone(),
                 decode_logprob_text,
                 no_stop_trim,
+                skip_special_tokens,
             })
             .is_ok()
     }
@@ -367,7 +407,11 @@ impl Intake {
     /// already holds this rid's sink: `register_detok` queued `Register` on the
     /// same channel from this same thread, so FIFO gives Register → Decode.
     fn push_detokenize_to_shard(&self, mut req: Request) {
-        let RequestKind::Detokenize { token_ids } = &req.kind else {
+        let RequestKind::Detokenize {
+            token_ids,
+            skip_special_tokens,
+        } = &req.kind
+        else {
             self.fail(
                 &mut req,
                 Error::Internal("non-detokenize request reached push_detokenize_to_shard".into()),
@@ -383,10 +427,26 @@ impl Intake {
             .send(DetokMsg::Decode {
                 rid: req.rid.clone(),
                 token_ids,
+                skip_special_tokens: *skip_special_tokens,
             })
             .is_err()
         {
             self.fail(&mut req, Error::Internal("detok shard gone".into()), true);
+        }
+    }
+
+    /// Hand a `Tokenize` request to the tokenizer pool, which answers it
+    /// through the request's own sink. It was never registered with a detok
+    /// shard, so a failure here has nothing to deregister.
+    fn push_tokenize_to_pool(&self, req: Request) {
+        if let Err(err) = self.senders.tokenizer_tx.send(req) {
+            // Pool gone (workers exited); flume hands the request back.
+            let mut req = err.into_inner();
+            self.fail(
+                &mut req,
+                Error::Internal("tokenizer pool gone".into()),
+                false, /* registered */
+            );
         }
     }
 
@@ -416,19 +476,46 @@ impl Intake {
         }
     }
 
+    /// Push a control message the scheduler does not answer. Nothing would
+    /// retry it, so it takes the reserved lane: a full request ring cannot
+    /// drop it.
+    fn push_one_way(&self, control: &ControlRequest) -> Result<(), Error> {
+        let header = control.encode()?;
+        if self.to_scheduler_tx.push_priority(SchedulerRequest {
+            header,
+            buffers: Vec::new(),
+        }) {
+            Ok(())
+        } else {
+            Err(Error::Internal("to_scheduler channel closed".into()))
+        }
+    }
+
     /// Client disconnected (or a detok terminal): deregister the sink, then push an
     /// `AbortReq(rid)` so the scheduler stops generating for it.
     ///
-    /// A failed push is logged, not retried: the scheduler keeps generating and the
-    /// chunks arrive for a rid no longer in the detok table, where they are dropped.
-    /// That wastes GPU work until the request finishes on its own, but it cannot be
-    /// misdelivered — the rid is unique to this request for the process's lifetime
-    /// ([`Rid::from_client`]), so no later request can ever answer to it.
+    /// Aborts use the reserved scheduler-control lane, so request-ring
+    /// backpressure cannot discard cancellation after public selector state is
+    /// retired.
     ///
     /// A request out in a pool never reached the scheduler, so there is nothing to
     /// abort there yet: it is marked `Aborted` and dropped when it returns.
+    ///
+    /// An `/abort_request` ([`AbortSource::Request`]) for a request the
+    /// scheduler has keeps its sink, so the scheduler's terminal output still
+    /// reaches the client, and queues behind the request on the request ring:
+    /// the reserved lane could overtake it, and the scheduler would then run
+    /// the request it never saw aborted to completion. On a full ring it is
+    /// handled like any other abort and the client's call ends on its own.
     fn on_abort(&mut self, source: AbortSource) {
         let rid = source.rid().clone();
+        if matches!(source, AbortSource::Request(_))
+            && !self.request_states.contains_key(&rid)
+            && let Some(abort) = abort_req(&rid)
+            && self.to_scheduler_tx.try_push(abort)
+        {
+            return;
+        }
         let _ = self
             .senders
             .detok_for(&rid)
@@ -438,23 +525,14 @@ impl Intake {
             tracing::debug!(rid = %rid, "abort recorded for request");
             return;
         }
+        if matches!(source, AbortSource::Local(_)) {
+            return;
+        }
 
-        // The channel is BOUNDED and drops pushes under exactly the load this matters
-        // for, so report the miss rather than assuming the scheduler was told.
-        match ControlRequest::AbortReq(AbortReq::new(rid.as_str().to_string(), false)).encode() {
-            Ok(header) => {
-                if !self.to_scheduler_tx.try_push(SchedulerRequest {
-                    header,
-                    buffers: Vec::new(),
-                }) {
-                    tracing::error!(
-                        rid = %rid,
-                        "abort dropped: to_scheduler channel is full; the scheduler keeps generating \
-                         for this request until it finishes on its own"
-                    );
-                }
-            }
-            Err(e) => tracing::error!(rid = %rid, error = %e, "abort encode failed"),
+        if let Some(abort) = abort_req(&rid)
+            && !self.to_scheduler_tx.push_priority(abort)
+        {
+            tracing::debug!(rid = %rid, "abort ignored during scheduler shutdown");
         }
     }
 
