@@ -47,7 +47,8 @@ def _runner_config_labels():
 
 
 def _registrations(path, register_name):
-    """Return [(est_time, runner_config, suite)] or None if any estimate is unusable."""
+    """Return [(est_time, runner_config, suite, stage)] or None if any estimate is
+    unusable."""
     try:
         tree = ast.parse(path.read_text())
     except (OSError, SyntaxError):
@@ -73,7 +74,7 @@ def _registrations(path, register_name):
         ):
             return None
         tags = []
-        for key in ("runner_config", "suite"):
+        for key in ("runner_config", "suite", "stage"):
             try:
                 tags.append(ast.literal_eval(kwargs[key]))
             except (KeyError, ValueError, TypeError):
@@ -117,6 +118,7 @@ def estimate_seconds(command, root, mode, runs_on="", suite=""):
         "cuda": "register_cuda_ci",
         "cpu": "register_cpu_ci",
         "npu": "register_npu_ci",
+        "amd": "register_amd_ci",
     }.get(mode)
     if register_name is None:
         return None
@@ -126,13 +128,20 @@ def estimate_seconds(command, root, mode, runs_on="", suite=""):
         return None
     if mode == "cuda":
         labels = _runner_config_labels()
-        matching = [est for est, rc, _ in found if rc and labels.get(rc) == runs_on]
+        matching = [est for est, rc, *_ in found if rc and labels.get(rc) == runs_on]
     elif mode == "npu":
-        matching = [est for est, _, s in found if s == suite]
+        matching = [est for est, _, s, _ in found if s == suite]
+    elif mode == "amd":
+        # ci_register's effective_suite: `stage=` with `runner_config=` names it.
+        matching = [
+            est
+            for est, rc, s, stage in found
+            if (f"{stage}-test-{rc}" if stage and rc else s) == suite
+        ]
     else:
-        matching = [est for est, _, suite in found if suite in UBUNTU_CPU_SUITES]
+        matching = [est for est, _, suite, _ in found if suite in UBUNTU_CPU_SUITES]
     # A file may register on multiple pools; without a match, stay conservative.
-    return max(matching or [est for est, _, _ in found])
+    return max(matching or [est for est, *_ in found])
 
 
 def _pack(items):

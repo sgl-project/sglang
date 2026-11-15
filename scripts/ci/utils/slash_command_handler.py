@@ -12,9 +12,10 @@ from pathlib import Path
 import requests
 from github import Auth, Github
 
-# Import scripts/ci/ modules (sibling-up dir): runner_configs, npu_suites, and
-# the rerun partitioner.
+# Import scripts/ci/ modules (sibling-up dir): runner_configs, npu_suites,
+# amd_suites, and the rerun partitioner.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+import amd_suites as _amd_suites  # noqa: E402
 import npu_suites as _npu_suites  # noqa: E402
 import partition_rerun_tests as _partition  # noqa: E402
 import runner_configs as _runner_configs  # noqa: E402
@@ -1019,12 +1020,11 @@ def _extract_legacy_suites(content):
     return _extract_suites(content, "register_cuda_ci")
 
 
-# Backends with no job in rerun-test.yml (cuda / multimodal_gen / cpu / npu
-# only) and no runner_config in runner_configs.yml, so no dispatch can be built
-# for them.
+# Backends with no job in rerun-test.yml (cuda / multimodal_gen / cpu / npu /
+# amd only) and no runner_config in runner_configs.yml, so no dispatch can be
+# built for them.
 # Mirrors `REGISTER_MAPPING` in python/sglang/test/ci/ci_register.py.
 _OTHER_BACKEND_REGISTERS = {
-    "register_amd_ci": "AMD",
     "register_xpu_ci": "XPU",
     "register_musa_ci": "MUSA",
     "register_mlx_ci": "MLX",
@@ -1102,7 +1102,7 @@ def _resolve_runner_config(rc, full_path, suite):
 def detect_suite(file_path_from_test, hw=None):
     """
     Read a test file and extract dispatch info from register_cuda_ci,
-    register_cpu_ci, or register_npu_ci.
+    register_cpu_ci, register_npu_ci, or register_amd_ci.
 
     `hw` is a key of RERUN_HW: the file's registrations for that backend, or
     [] when it has none. Without `hw`, the first backend in RERUN_HW that the
@@ -1117,14 +1117,15 @@ def detect_suite(file_path_from_test, hw=None):
     one path; the legacy single-string `suite=` carries no runner_config and is
     reported as non-dispatchable.
 
-    CPU files yield a single-element list, NPU files one dict per
-    `register_npu_ci(...)` call. A file with no recognised (or no
+    CPU files yield a single-element list, NPU and AMD files one dict per
+    `register_npu_ci(...)` or `register_amd_ci(...)` call. A file with no recognised (or no
     dispatchable) registration yields a one-element list whose dict has an
     `error` set.
 
     Each dict has keys: suite, runner_label, install_script,
     install_timeout, rdma_devices, mode, error; a dispatchable one also
-    has stage (the registered CI stage, e.g. `base-b`, the NPU suite, or None).
+    has stage (the registered CI stage, e.g. `base-b`, the NPU or AMD suite, or
+    None).
     """
     full_path = f"test/{file_path_from_test}"
     with open(full_path, "r") as f:
@@ -1215,8 +1216,8 @@ def _no_rerun_backend_error(full_path, content):
             _dispatch_err(
                 suites[0] if suites else None,
                 f"`{full_path}` is registered for {backends}{where}, not for "
-                f"CUDA, CPU, or NPU; rerun-test.yml has no {backends} job. Rerun it "
-                f"with /rerun-failed-ci, or dispatch the {backends} workflow "
+                f"CUDA, CPU, NPU, or AMD; rerun-test.yml has no {backends} job. Rerun "
+                f"it with /rerun-failed-ci, or dispatch the {backends} workflow "
                 f"manually.",
             )
         ]
@@ -1224,9 +1225,9 @@ def _no_rerun_backend_error(full_path, content):
     return [
         _dispatch_err(
             None,
-            f"No `register_cuda_ci(runner_config=...)`, `register_cpu_ci()`, or "
-            f"`register_npu_ci()` found in `{full_path}`. This file may not be a "
-            f"registered CI test.",
+            f"No `register_cuda_ci(runner_config=...)`, `register_cpu_ci()`, "
+            f"`register_npu_ci()`, or `register_amd_ci()` found in `{full_path}`. "
+            f"This file may not be a registered CI test.",
         )
     ]
 
@@ -1279,9 +1280,52 @@ def _detect_npu(full_path, content):
     return out
 
 
+def _detect_amd(full_path, content):
+    if not re.search(r"^[^#\n]*register_amd_ci\s*\(", content, re.MULTILINE):
+        return []
+    try:
+        registries, _ = _ci_register.ut_parse_one_file(full_path)
+        suites = _amd_suites.load_suites()
+    except (SyntaxError, ValueError) as e:
+        return [_dispatch_err(None, f"Cannot resolve AMD registrations: {e}")]
+    out = []
+    for r in registries:
+        if r.backend != _ci_register.HWBackend.AMD:
+            continue
+        suite = r.effective_suite
+        if r.nightly or suite not in suites:
+            out.append(
+                _dispatch_err(
+                    suite,
+                    f"AMD suite `{suite}` of `{full_path}` has no job in "
+                    f"{' or '.join(_amd_suites.WORKFLOWS)} that sets up with "
+                    f"`setup-amd-ci`, the only AMD jobs /rerun-test reproduces "
+                    f"(nightly and disaggregation suites are not supported).",
+                )
+            )
+        else:
+            out.append(
+                {
+                    "suite": suite,
+                    "stage": suite,
+                    "runner_label": suites[suite].runs_on,
+                    "install_script": "",
+                    "install_timeout": "",
+                    "rdma_devices": "",
+                    "mode": "amd",
+                    "error": None,
+                }
+            )
+    return out
+
+
 # /rerun-test backends -> (label, detector). Without `--hw`, a file runs on the
 # first one it registers.
-RERUN_HW = {"cuda": ("CUDA/CPU", _detect_cuda_or_cpu), "npu": ("NPU", _detect_npu)}
+RERUN_HW = {
+    "cuda": ("CUDA/CPU", _detect_cuda_or_cpu),
+    "npu": ("NPU", _detect_npu),
+    "amd": ("AMD", _detect_amd),
+}
 
 
 def _resolve_test_spec(test_spec, hw=None):
@@ -1374,8 +1418,9 @@ def _resolve_test_spec(test_spec, hw=None):
             "mode": mode,
             "stage": info["stage"],
             "runs_on": info["runner_label"],
-            # The suite the npu stage workflow runs; cuda/cpu jobs run files directly.
-            "suite": info["suite"] if mode == "npu" else "",
+            # The suite the npu stage workflow runs, or whose container setup the
+            # amd job reproduces; cuda/cpu jobs need none.
+            "suite": info["suite"] if mode in ("npu", "amd") else "",
             "install_script": info["install_script"],
             "install_timeout": info["install_timeout"],
             "rdma_devices": info["rdma_devices"],
@@ -1462,8 +1507,8 @@ def _dispatch_batch(
             "reply_marker": reply_marker,
             "refresh_precision_baseline": str(refresh_precision_baseline).lower(),
         }
-        # Only npu dispatches send `suite`, so cuda/cpu ones still match the
-        # inputs of a PR branch's older rerun-test.yml.
+        # Only npu and amd dispatches send `suite`, so cuda/cpu ones still match
+        # the inputs of a PR branch's older rerun-test.yml.
         if batch[0]["suite"]:
             inputs["suite"] = batch[0]["suite"]
         if is_fork:
@@ -1633,8 +1678,8 @@ def handle_rerun_test(
             f"- `/rerun-test {CHANGED_TESTS_FLAG}` (or `{CHANGED_TESTS_SHORT_FLAG}`; "
             "every test file this PR adds or modifies)\n"
             f"- `/rerun-test {HW_FLAG} npu test_foo.py` (backends to run on: "
-            f"`cuda`, `npu`, a list such as `cuda,npu`, or `all`; without it a "
-            "file runs on CUDA/CPU if registered there, else on NPU)"
+            f"`cuda`, `npu`, `amd`, a list such as `cuda,amd`, or `all`; without "
+            "it a file runs on the first of CUDA/CPU, NPU, and AMD it registers)"
         )
         return False
 
