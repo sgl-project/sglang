@@ -129,7 +129,15 @@ class CustomAllreduce:
         else:
             # meta data buffers need to be "uncached" for signal on MI200
             self.meta = ops.allocate_meta_buffer(ops.meta_size() + max_size)
-            self.buffer = torch.empty(max_size, dtype=torch.uint8, device=self.device)
+            if full_nvlink:
+                self.buffer = torch.empty(
+                    max_size, dtype=torch.uint8, device=self.device
+                )
+            else:
+                # Without XGMI, peers read this buffer over PCIe and would miss
+                # writes still held in this GPU's L2 (gfx11 cannot flush it from
+                # a kernel), so the staging buffer bypasses the cache.
+                self.buffer = ops.allocate_meta_buffer(max_size)
             handle = ops.get_meta_buffer_ipc_handle(self.meta)
             shard_data = (
                 bytes(handle),  # ipc handle to base ptr

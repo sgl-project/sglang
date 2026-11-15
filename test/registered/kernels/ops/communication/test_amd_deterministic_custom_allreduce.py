@@ -294,6 +294,81 @@ def oversized_worker(world_size, rank, port):
     dist.destroy_process_group()
 
 
+def fresh_input_worker(world_size, rank, port):
+    """Reduce new data on every call, eagerly and from a CUDA graph.
+
+    Repeating one input cannot catch a rank that reads a peer's previous input,
+    which is what happens when the peer's copy is still in its L2 (PCIe pairs).
+    """
+    envs.SGLANG_USE_1STAGE_ALLREDUCE.set("1")
+    device = torch.device(f"cuda:{rank}")
+    torch.cuda.set_device(device)
+
+    dist.init_process_group(
+        backend="nccl",
+        init_method=f"tcp://localhost:{port}",
+        rank=rank,
+        world_size=world_size,
+    )
+
+    from torch.distributed import new_group
+
+    from sglang.srt.distributed.device_communicators.custom_all_reduce import (
+        CustomAllreduce,
+    )
+
+    dist.barrier()
+    ar_group = new_group(backend="gloo")
+    dist.barrier()
+
+    custom_ar = CustomAllreduce(group=ar_group, device=device)
+    if custom_ar.disabled or not custom_ar.use_amd_deterministic_impl:
+        if rank == 0:
+            print("Custom AR not available or not deterministic; skipping")
+        dist.destroy_process_group()
+        return
+
+    gen = torch.Generator(device=device).manual_seed(1234 + rank)
+
+    def check(result, inp, what):
+        gathered = [torch.empty_like(inp) for _ in range(world_size)]
+        dist.all_gather(gathered, inp)
+        # The 1-stage kernel adds ranks in order in fp32 and rounds once.
+        expected = gathered[0].float()
+        for other in gathered[1:]:
+            expected += other.float()
+        wrong = (result != expected.to(inp.dtype)).sum().reshape(1)
+        # Fail on every rank together; a lone failing rank would hang the others.
+        dist.all_reduce(wrong)
+        assert wrong.item() == 0, (
+            f"rank {rank}, {what}: {wrong.item()} elements across ranks differ "
+            "from the sum of the gathered inputs"
+        )
+
+    for rows in (8, 16, 256):
+        inp = torch.empty(rows, 5120, dtype=torch.bfloat16, device=device)
+        for call in range(20):
+            inp.normal_(generator=gen)
+            result = custom_ar.custom_all_reduce(inp)
+            assert result is not None, "custom all-reduce declined the input"
+            check(result, inp, f"eager, {rows} rows, call {call}")
+
+    inp = torch.zeros(16, 5120, dtype=torch.bfloat16, device=device)
+    graph = torch.cuda.CUDAGraph()
+    with custom_ar.capture():
+        with torch.cuda.graph(graph):
+            out = custom_ar.custom_all_reduce(inp)
+    for call in range(20):
+        inp.normal_(generator=gen)
+        graph.replay()
+        check(out, inp, f"graph replay {call}")
+
+    if rank == 0:
+        print("  ✓ fresh inputs match the gathered sum (eager and graph)")
+    dist.barrier()
+    dist.destroy_process_group()
+
+
 def run_workers(target, title):
     world_size = 8
     available_gpus = torch.cuda.device_count()
@@ -334,6 +409,7 @@ def run_workers(target, title):
 def main():
     run_workers(worker, "Deterministic Kernel All-Reduce Determinism Test")
     run_workers(oversized_worker, "Deterministic Kernel Oversized Input Test")
+    run_workers(fresh_input_worker, "Deterministic Kernel Fresh Input Test")
 
 
 requires_two_gpus = pytest.mark.skipif(
@@ -352,6 +428,12 @@ def test_deterministic_custom_allreduce():
 def test_deterministic_custom_allreduce_oversized_input():
     """Test inputs larger than the staging buffer, repeated."""
     run_workers(oversized_worker, "Deterministic Kernel Oversized Input Test")
+
+
+@requires_two_gpus
+def test_deterministic_custom_allreduce_fresh_inputs():
+    """Test that every call reduces the current inputs, eagerly and in a graph."""
+    run_workers(fresh_input_worker, "Deterministic Kernel Fresh Input Test")
 
 
 if __name__ == "__main__":
