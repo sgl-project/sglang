@@ -17,6 +17,8 @@ import sglang as sgl
 from sglang.srt.utils import MultiprocessingSerializer, kill_process_tree
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 from sglang.test.test_utils import (
+    ADMIN_API_KEY_FOR_TEST,
+    ADMIN_HEADERS_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -198,7 +200,12 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
             cls.model,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=["--max-running-requests", 8],
+            other_args=[
+                "--max-running-requests",
+                8,
+                "--admin-api-key",
+                ADMIN_API_KEY_FOR_TEST,
+            ],
         )
 
     @classmethod
@@ -229,6 +236,7 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
         response = requests.post(
             self.base_url + "/pause_generation",
             json={"mode": mode},
+            headers=ADMIN_HEADERS_FOR_TEST,
         )
         ret = response.json()
         return ret
@@ -237,12 +245,17 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
         response = requests.post(
             self.base_url + "/continue_generation",
             json={},
+            headers=ADMIN_HEADERS_FOR_TEST,
         )
         ret = response.json()
         return ret
 
     def run_update_weights(self, named_tensors, flush_cache=True):
-        requests.post(self.base_url + "/begin_weight_update", json={})
+        requests.post(
+            self.base_url + "/begin_weight_update",
+            json={},
+            headers=ADMIN_HEADERS_FOR_TEST,
+        )
         response = requests.post(
             self.base_url + "/update_weights_from_tensor",
             json={
@@ -251,8 +264,13 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
                 ],
                 "flush_cache": flush_cache,
             },
+            headers=ADMIN_HEADERS_FOR_TEST,
         )
-        requests.post(self.base_url + "/end_weight_update", json={})
+        requests.post(
+            self.base_url + "/end_weight_update",
+            json={},
+            headers=ADMIN_HEADERS_FOR_TEST,
+        )
         ret = response.json()
         return ret
 
@@ -284,6 +302,7 @@ class TestServerUpdateWeightsFromTensorNonBlocking(CustomTestCase):
                 response = requests.post(
                     self.base_url + "/get_weights_by_name",
                     json={"name": param_name},
+                    headers=ADMIN_HEADERS_FOR_TEST,
                 )
                 actual_values = torch.tensor(response.json())[0, :5]
                 assert torch.allclose(

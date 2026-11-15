@@ -8,6 +8,8 @@ from transformers import AutoModelForCausalLM
 import sglang as sgl
 from sglang.srt.utils import get_device
 from sglang.test.test_utils import (
+    ADMIN_API_KEY_FOR_TEST,
+    ADMIN_HEADERS_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
@@ -56,6 +58,8 @@ class TestGetWeightsByName(CustomTestCase):
                     str(tp),
                     "--dp-size",
                     str(dp),
+                    "--admin-api-key",
+                    ADMIN_API_KEY_FOR_TEST,
                 ),
             )
 
@@ -79,6 +83,7 @@ class TestGetWeightsByName(CustomTestCase):
                 requests.get(
                     f"{DEFAULT_URL_FOR_TEST}/get_weights_by_name",
                     json={"name": "lm_head.weight", "truncate_size": truncate_size},
+                    headers=ADMIN_HEADERS_FOR_TEST,
                 ).json()
             )
         print("assert_tie_word_embeddings of hf and backend")
@@ -119,6 +124,7 @@ class TestGetWeightsByName(CustomTestCase):
             runtime_ret = requests.get(
                 f"{DEFAULT_URL_FOR_TEST}/get_weights_by_name",
                 json={"name": param_name, "truncate_size": truncate_size},
+                headers=ADMIN_HEADERS_FOR_TEST,
             ).json()
             runtime_ret = _process_return(runtime_ret)
             np.testing.assert_allclose(runtime_ret, param_np, rtol=1e-5, atol=1e-5)
