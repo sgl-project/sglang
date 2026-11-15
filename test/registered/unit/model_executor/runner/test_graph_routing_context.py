@@ -342,6 +342,37 @@ class TestGraphRoutingContext(CustomTestCase):
     def test_cpu_replay_failure_restores_parent(self):
         self._assert_failure_restores_parent(*self._cpu_runner())
 
+    def test_nested_forward_modes_restore_after_failure(self):
+        """Prefill specialization must not leak into decode/verify scopes."""
+        outer_batch = _batch(1, 1)
+        outer_batch.forward_mode = ForwardMode.EXTEND
+        outer = ForwardContext(
+            attn_backend=object(), forward_mode=ForwardMode.TARGET_VERIFY
+        )
+        with forward_context(outer, forward_batch=outer_batch):
+            self.assertEqual(get_forward_context().forward_mode, ForwardMode.EXTEND)
+            # A nested attention-only override inherits the current phase even
+            # when it already owns a separate routing bound getter.
+            child = ForwardContext(
+                attn_backend=object(), moe_num_token_non_padded=lambda: None
+            )
+            with forward_context(child):
+                self.assertEqual(get_forward_context().forward_mode, ForwardMode.EXTEND)
+            with forward_context(
+                ForwardContext(attn_backend=object(), forward_mode=ForwardMode.DECODE)
+            ):
+                self.assertEqual(get_forward_context().forward_mode, ForwardMode.DECODE)
+            verify = _batch(1, 1)
+            verify.forward_mode = ForwardMode.TARGET_VERIFY
+            with self.assertRaisesRegex(RuntimeError, "verify failed"):
+                with forward_context(outer, forward_batch=verify):
+                    self.assertEqual(
+                        get_forward_context().forward_mode, ForwardMode.TARGET_VERIFY
+                    )
+                    raise RuntimeError("verify failed")
+            self.assertEqual(get_forward_context().forward_mode, ForwardMode.EXTEND)
+        self.assertFalse(has_forward_context())
+
 
 if __name__ == "__main__":
     unittest.main()

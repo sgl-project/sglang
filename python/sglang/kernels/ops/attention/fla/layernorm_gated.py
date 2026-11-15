@@ -279,6 +279,7 @@ def _layer_norm_fwd(
     is_rms_norm=False,
     activation: str = "swish",
     quant_heads: int = 0,
+    batch_invariant: bool = False,
 ):
     M, N = x.shape
     if group_size is None:
@@ -319,7 +320,9 @@ def _layer_norm_fwd(
     # heuristics for number of warps
     num_warps = min(max(BLOCK_N // 256, 1), 8)
     # Calculate rows per block based on SM count
-    rows_per_block = calc_rows_per_block(M, x.device)
+    rows_per_block = (
+        MAX_ROWS_PER_BLOCK if batch_invariant else calc_rows_per_block(M, x.device)
+    )
     quant = {}
     # quant_heads: one block per token, same per-warp row split (rows round identically), FP8 (q, scale) out
     if quant_heads:

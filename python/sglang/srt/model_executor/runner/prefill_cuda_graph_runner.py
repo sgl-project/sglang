@@ -208,40 +208,52 @@ def _uses_gdn_linear_attention(attn_backend: Any) -> bool:
     )
 
 
-def _gdn_projection_is_m_invariant(projection: torch.nn.Module) -> bool:
-    """Loaded SM100 projection paths qualified for padded GDN prefills."""
+def _gdn_projection_padding_max_tokens(projection: torch.nn.Module) -> Optional[int]:
+    """None permits padding at any M; zero requires exact capture buckets."""
     from sglang.srt.layers.quantization.fp4_utils import get_fp4_gemm_runner_backend
     from sglang.srt.layers.quantization.modelopt_quant import (
+        GDN_FP8_PREFILL_MAX_TOKENS,
         ModelOptFp4LinearMethod,
         ModelOptFp8LinearMethod,
     )
 
     method = projection.quant_method
     if projection.bias is not None:
-        return False
-    if type(method) is ModelOptFp8LinearMethod:
-        return (
-            not method.use_marlin
-            and projection.use_flashinfer_bmm
-            and projection.input_scale is not None
-            and projection.weight.dtype == torch.float8_e4m3fn
-        )
-    if type(method) is ModelOptFp4LinearMethod:
-        return (
-            method.quant_mode == "w4a4"
-            and get_fp4_gemm_runner_backend().is_flashinfer()
-            and projection.weight.dtype == torch.uint8
-        )
-    return False
+        return 0
+    if type(method) is ModelOptFp8LinearMethod and (
+        not method.use_marlin
+        and projection.use_flashinfer_bmm
+        and projection.input_scale is not None
+        and projection.weight.dtype == torch.float8_e4m3fn
+    ):
+        return None if get_platform().is_sm100 else method.gdn_prefill_max_tokens
+    if type(method) is ModelOptFp4LinearMethod and (
+        method.quant_mode == "w4a4" and projection.weight.dtype == torch.uint8
+    ):
+        backend = get_fp4_gemm_runner_backend()
+        if get_platform().is_sm100 and backend.is_flashinfer():
+            return None
+        if backend.is_flashinfer_cutlass() and (
+            projection.input_size_per_partition,
+            projection.output_size_per_partition,
+        ) in ((5120, 34816), (17408, 5120)):
+            # Includes the SM120 M=9 KDA fast path, checked against CUTLASS.
+            return GDN_FP8_PREFILL_MAX_TOKENS
+    return 0
 
 
-def _requires_exact_gdn_prefill_bucket(model_runner: ModelRunner) -> bool:
+def _gdn_prefill_padding_max_tokens(model_runner: ModelRunner) -> Optional[int]:
     if not is_cuda() or not _uses_gdn_linear_attention(model_runner.attn_backend):
-        return False
-    # SM120's per-tensor FP8 projections can also vary with M. The qualified
-    # SM100 paths below must not be generalized from a checkpoint's label.
-    if not get_platform().is_sm100 or get_flags().sp.enabled:
-        return True
+        return None
+    if (
+        not (get_platform().is_sm100 or get_platform().is_sm120)
+        or get_flags().sp.enabled
+    ):
+        return 0
+    if get_platform().is_sm120 and (
+        get_parallel().tp_size != 1 or get_parallel().pp_size != 1
+    ):
+        return 0
 
     from sglang.srt.layers.linear import LinearBase, MergedColumnParallelLinear
     from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
@@ -251,6 +263,7 @@ def _requires_exact_gdn_prefill_bucket(model_runner: ModelRunner) -> bool:
     layer_model = _resolve_transformer_layer_model(model_runner.model)
     skipped = set()
     found_gdn = False
+    padding_limit = None
     for module in layer_model.modules():
         if isinstance(module, (Qwen3_5GatedDeltaNet, Qwen3GatedDeltaNet)):
             found_gdn = True
@@ -267,14 +280,16 @@ def _requires_exact_gdn_prefill_bucket(model_runner: ModelRunner) -> bool:
             ):
                 # _forward_ba_proj uses the persistent, row-invariant matmul.
                 skipped.add(ba)
-        if (
-            isinstance(module, LinearBase)
-            and module not in skipped
-            and not _gdn_projection_is_m_invariant(module)
-        ):
-            return True
+        if isinstance(module, LinearBase) and module not in skipped:
+            limit = _gdn_projection_padding_max_tokens(module)
+            if limit == 0:
+                return 0
+            if limit is not None:
+                padding_limit = (
+                    limit if padding_limit is None else min(padding_limit, limit)
+                )
     # Includes MHA and FFN projections, but not the eager LM head or vision tower.
-    return not found_gdn
+    return padding_limit if found_gdn else 0
 
 
 def get_prefill_num_tokens_to_capture(capture_tokens: Sequence[int]) -> list[int]:
@@ -418,7 +433,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     _backend_vote_prefill_cuda_graph = None
     _captured_attn_metadata_max_bs: Optional[int] = None
     _dcp_extend_active = False
-    _requires_exact_prefill_bucket: bool = False
+    _prefill_padding_max_tokens: Optional[int] = None
     dllm_attention = None
 
     @property
@@ -480,9 +495,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 False,
             )
         )
-        self._requires_exact_prefill_bucket = _requires_exact_gdn_prefill_bucket(
-            model_runner
-        )
+        self._prefill_padding_max_tokens = _gdn_prefill_padding_max_tokens(model_runner)
         # bs in prefill carries the captured shape (token count for
         # tc_piecewise) — one shape knob per phase.
         capture_tokens = prefill_config.bs
@@ -1604,7 +1617,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         if num_tokens > self.max_num_tokens:
             return False
         padded_num_tokens = self._pad_to_bucket(num_tokens, self.capture_num_tokens)
-        if self._requires_exact_prefill_bucket and padded_num_tokens != num_tokens:
+        if (
+            padded_num_tokens != num_tokens
+            and self._prefill_padding_max_tokens is not None
+            and padded_num_tokens > self._prefill_padding_max_tokens
+        ):
             return False
         if padded_num_tokens > num_tokens * _MAX_PREFILL_CUDA_GRAPH_PADDING_FACTOR:
             return False

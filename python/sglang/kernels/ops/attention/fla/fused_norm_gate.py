@@ -209,6 +209,7 @@ def layer_norm_gated_fwd(
     residual_dtype: torch.dtype = None,
     is_rms_norm: bool = False,
     g_strided: tuple[int, int, int] | None = None,  # (heads, token stride, head stride)
+    batch_invariant: bool = False,
 ):
     if residual is not None:
         residual_dtype = residual.dtype
@@ -244,7 +245,12 @@ def layer_norm_gated_fwd(
         use_pdl = is_arch_support_pdl()
         BT = 32
         use_bt8 = 8 <= T <= 256 if is_rms_norm and activation == "sigmoid" else T == 64
-        if use_pdl and use_bt8 and (D, x.dtype) == (128, torch.bfloat16):
+        if (
+            not batch_invariant
+            and use_pdl
+            and use_bt8
+            and (D, x.dtype) == (128, torch.bfloat16)
+        ):
             if current_arch().is_sm(10, 3):
                 # Small sigmoid-gated RMSNorm batches use eight rows per CTA.
                 # Other norm modes retain their T=64 selection.
@@ -326,6 +332,7 @@ class LayerNormGatedFunction(torch.autograd.Function):
         prenorm: bool = False,
         residual_in_fp32: bool = False,
         is_rms_norm: bool = False,
+        batch_invariant: bool = False,
     ):
         x_shape_og = x.shape
         g_shape_og = g.shape
@@ -365,6 +372,7 @@ class LayerNormGatedFunction(torch.autograd.Function):
             residual_dtype=residual_dtype,
             is_rms_norm=is_rms_norm,
             g_strided=g_strided,
+            batch_invariant=batch_invariant,
         )
         ctx.save_for_backward(residual_out, g, weight, bias, mean, rstd)
         ctx.x_shape_og = x_shape_og
@@ -389,6 +397,7 @@ def rms_norm_gated(
     prenorm: bool = False,
     residual_in_fp32: bool = False,
     eps: float = 1e-6,
+    batch_invariant: bool = False,
 ):
     return LayerNormGatedFunction.apply(
         x,
@@ -401,6 +410,7 @@ def rms_norm_gated(
         prenorm,
         residual_in_fp32,
         True,
+        batch_invariant,
     )
 
 
@@ -438,6 +448,7 @@ class FusedRMSNormGated(nn.Module):
         residual: torch.Tensor | None = None,
         prenorm: bool = False,
         residual_in_fp32: bool = False,
+        batch_invariant: bool = False,
     ) -> torch.Tensor:
         if _use_cpu:
             assert self.activation == "silu", (
@@ -457,4 +468,5 @@ class FusedRMSNormGated(nn.Module):
                 eps=self.eps,
                 prenorm=prenorm,
                 residual_in_fp32=residual_in_fp32,
+                batch_invariant=batch_invariant,
             )

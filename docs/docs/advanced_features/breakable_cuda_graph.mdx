@@ -102,12 +102,29 @@ linear projections use the supported static ModelOpt FP8 FlashInfer BMM or
 ModelOpt NVFP4 W4A4 FlashInfer paths. The BF16 `in_proj_ba` is exempt only when
 it uses the batch-invariant prefill matmul; the convolution weight is not a GEMM.
 
+Regular CUDA GDN prefills also use fixed gated-normalization row tiles in both
+Qwen3.5 and Qwen3-Next. Padding can otherwise change the norm's reduction layout,
+including on SM100/SM103; on SM120, even 7 to 8 tokens exposed output drift.
+Pure decode, target verification, draft extends, and unrelated norm callers
+retain their existing paths.
+
+On SM120, qualified Qwen3.5/Qwen3-Next ModelOpt FP8 projections use fixed
+prefill GEMM tiles for at most 256 tokens. The same kernels run in eager and
+graph prefills. This path requires TP=PP=1, supported loaded projection
+dimensions, and the qualified CUTLASS path for any NVFP4 MLP projections.
+No environment override is required.
+
+For this SM120 path, padded replay requires **every remaining projection** to
+qualify and the **captured bucket**, not just the request, to be at most 256. With
+buckets `[128, 256, 512]`, a qualifying SM120 model can replay 193 tokens padded
+to 256; 257 tokens run eagerly, while an exact 512-token request can still
+replay using the existing large-prefill kernels.
+
 If a remaining projection (including `in_proj_qkvz`, `out_proj`, attention or
-MLP projections) stays BF16 or selects another kernel path, prefill replay
-requires an exact captured token count. The same restriction applies on other
-CUDA architectures, including SM120 where FP8 projections can also vary with
-token count. For example, with buckets `[16, 20]`, an affected model can replay
-20-token extends but runs 17-token extends eagerly instead of padding to 20.
+MLP projections) stays BF16 or selects an unqualified kernel, prefill replay
+requires an exact captured token count. Other CUDA architectures also retain
+this restriction. For example, with buckets `[16, 20]`, an affected model can
+replay 20-token extends but runs 17-token extends eagerly.
 
 `--enable-mixed-chunk` does not override this numerical check, even for batches
 containing only prefill requests. Non-GDN models and non-CUDA backends retain

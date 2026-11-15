@@ -48,6 +48,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.modelopt_quant import enable_gdn_fp8_prefill
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
@@ -602,7 +603,16 @@ class Qwen3GatedDeltaNet(nn.Module):
             core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
             core_attn_out = core_attn_out_pad
 
-        core_attn_out = self.norm(core_attn_out, z)
+        if (
+            _is_cuda
+            and forward_batch.forward_mode.is_context_parallel_extend()
+            and isinstance(self.norm, FusedRMSNormGated)
+        ):
+            # SM103 otherwise selects different row tiles for small batches.
+            core_attn_out = self.norm(core_attn_out, z, batch_invariant=True)
+        else:
+            # The TC-piecewise RMSNorm path already fixes its reduction layout.
+            core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
 
@@ -1100,6 +1110,7 @@ class Qwen3NextModel(nn.Module):
         self.layers = make_layers(
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
+        enable_gdn_fp8_prefill(self.layers)
 
         self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.infer_count = 0
