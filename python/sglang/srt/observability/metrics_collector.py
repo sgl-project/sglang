@@ -2637,6 +2637,23 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        self.window_eviction_num_tokens = Counter(
+            name="sglang:window_evicted_tokens_total",
+            documentation="Sliding-window (SWA) KV token slots that eviction "
+            "freed, per window sub-pool. sglang:evicted_tokens_total counts "
+            "the full-attention pool only.",
+            labelnames=list(labels.keys()) + ["window"],
+        )
+
+        self.window_tail_miss_num_tokens = Counter(
+            name="sglang:window_tail_miss_tokens_total",
+            documentation="Prefix tokens that a request could not reuse at "
+            "admission. Their full-attention KV was still cached, but no "
+            "sliding-window tail was cached right before them. The tail was "
+            "evicted or never kept. The request recomputes these tokens.",
+            labelnames=labels.keys(),
+        )
+
         self.load_back_duration_seconds = Histogram(
             name="sglang:load_back_duration_seconds",
             documentation="GPU-stream span of a merged host-to-device load-back "
@@ -2712,6 +2729,16 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
 
     def increment_eviction_num_tokens(self, num_tokens: int) -> None:
         self.eviction_num_tokens.labels(**self.labels).inc(num_tokens)
+
+    def increment_window_eviction_num_tokens(
+        self, num_tokens: int, window: str
+    ) -> None:
+        self.window_eviction_num_tokens.labels(**self.labels, window=window).inc(
+            num_tokens
+        )
+
+    def increment_window_tail_miss_num_tokens(self, num_tokens: int) -> None:
+        self.window_tail_miss_num_tokens.labels(**self.labels).inc(num_tokens)
 
     def increment_load_back_num_tokens(self, num_tokens: int, pool: str) -> None:
         self.load_back_num_tokens.labels(**self.labels, pool=pool).inc(num_tokens)

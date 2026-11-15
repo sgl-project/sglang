@@ -1062,14 +1062,45 @@ class UnifiedRadixCache(BasePrefixCache):
 
         # Report full-layer tokens only
         self.update_eviction_metrics(tracker[BASE_COMPONENT_TYPE], start_time)
+        window_num_tokens_evicted = {
+            name: tracker.get(ct, 0)
+            for ct, name in self._window_sub_pools_by_slot().items()
+        }
+        self._update_window_eviction_metrics(tracker)
         return EvictResult(
             num_tokens_evicted=tracker[BASE_COMPONENT_TYPE],
             mamba_num_evicted=tracker.get(self.slot_id(TREE_STATE), 0),
-            window_num_tokens_evicted={
-                name: tracker.get(ct, 0)
-                for ct, name in self._window_sub_pools_by_slot().items()
-            },
+            window_num_tokens_evicted=window_num_tokens_evicted,
         )
+
+    def _update_window_eviction_metrics(
+        self, tracker: dict[ComponentType, int]
+    ) -> None:
+        if self.metrics_collector is None:
+            return
+        for slot, window in self._window_metric_labels_by_slot().items():
+            num_tokens = tracker.get(slot, 0)
+            if num_tokens > 0:
+                self.metrics_collector.increment_window_eviction_num_tokens(
+                    num_tokens=num_tokens, window=window
+                )
+
+    def _window_metric_labels_by_slot(self) -> dict[ComponentType, str]:
+        labels = self.__dict__.get("_window_slot_metric_labels")
+        if labels is None:
+            # Use the label that the window pool gauges publish.
+            # On static SWA pools it is window_<N>, but the sub-pool name is swa.
+            label_by_sub_pool = {
+                usage.name: usage.label
+                for usage in self.kv_storage().usage()
+                if usage.metrics == "window"
+            }
+            labels = {
+                slot: label_by_sub_pool.get(sub_pool, sub_pool)
+                for slot, sub_pool in self._window_sub_pools_by_slot().items()
+            }
+            self.__dict__["_window_slot_metric_labels"] = labels
+        return labels
 
     def _free_values(
         self,

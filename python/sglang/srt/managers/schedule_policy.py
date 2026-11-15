@@ -1278,6 +1278,18 @@ class PrefillAdder:
             return encoder_swa_replay.replay_len(prefix_len)
         return 0
 
+    def _account_window_tail_miss(self, req: Req, prefix_len: int) -> None:
+        # swa_branching_seqlen is the page-aligned hit that the full KV allows.
+        # prefix_len is shorter when no SWA tail is cached before that point.
+        branching_seqlen = req.swa_branching_seqlen
+        if branching_seqlen is None or branching_seqlen <= prefix_len:
+            return
+        metrics_collector = self.tree_cache.metrics_collector
+        if metrics_collector is not None:
+            metrics_collector.increment_window_tail_miss_num_tokens(
+                branching_seqlen - prefix_len
+            )
+
     def _account_prefill_cache_admission(self, req: Req, prefix_len: int) -> None:
         if req.retracted_stain:
             # Retraction attribution is intentionally omitted for now; discard
@@ -1290,6 +1302,7 @@ class PrefillAdder:
             )
             return
 
+        self._account_window_tail_miss(req, prefix_len)
         if prefix_len > 0:
             device_hit, host_hit, storage_hit = split_cached_prefix_by_tier(
                 prefix_len=prefix_len,
