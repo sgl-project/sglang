@@ -362,7 +362,7 @@ class NPUDeepSeekV4IndexerPool(DeepSeekV4IndexerPool):
 class DSV41NPUIndexerPool(NPUDeepSeekV4IndexerPool):
     """NPU DeepSeek-V4.1 low-ratio indexer K pool (packed fp4).
 
-    ``indexer_prologue_k`` consumes two separate PA_ND buffers
+    ``indexer_prologue_k_dsl`` consumes two separate PA_ND buffers
     (vendor operator design notes, ``indexer_prologue_k_dsl`` README)::
 
         k_cache        uint8 [pages, page_size // ratio, 1, index_head_dim // 2]
@@ -570,7 +570,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
     ) -> NPUDeepSeekV4IndexerPool:
         assert not index_k_page8, (
             "index_k_page8 is a CUDA/AITER fp4 layout; the NPU pool expresses "
-            "the same packing through indexer_prologue_k's combined_block_size."
+            "the same packing through indexer_prologue_k_dsl's combined_block_size."
         )
         is_v41 = self._is_v41_model()
         if force_fp4:

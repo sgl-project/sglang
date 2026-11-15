@@ -96,30 +96,31 @@ def _seqused_q_kwargs(cu_seqlens_q: Optional[torch.Tensor]) -> dict:
 
 @functools.cache
 def _ds41_ops():
-    """Resolve seven migrated DSL functions and the ops-transformer compressor
-    wrapper (whose CANN backend is the vendored ds41 compressor)."""
+    """Resolve the seven DSV4.1 DSL operator APIs (``_dsl`` suffix, sgl-kernel-npu
+    #2fd12542) and the ops-transformer compressor wrapper (whose CANN backend is
+    the vendored ds41 compressor)."""
     from sgl_kernel_npu.operators.attention import (
         compressor_v2,
-        mixed_quant_sparse_flash_mla,
-        mixed_quant_sparse_flash_mla_metadata,
+        mixed_quant_sparse_flash_mla_dsl,
+        mixed_quant_sparse_flash_mla_metadata_dsl,
     )
     from sgl_kernel_npu.operators.indexer import (
-        indexer_prologue_k,
-        quant_lightning_indexer,
-        quant_lightning_indexer_metadata,
-        quant_sparse_lightning_indexer,
-        quant_sparse_lightning_indexer_metadata,
+        indexer_prologue_k_dsl,
+        quant_lightning_indexer_dsl,
+        quant_lightning_indexer_metadata_dsl,
+        quant_sparse_lightning_indexer_dsl,
+        quant_sparse_lightning_indexer_metadata_dsl,
     )
 
     return SimpleNamespace(
         compressor=compressor_v2,
-        indexer_prologue_k=indexer_prologue_k,
-        mixed_quant_sparse_flash_mla=mixed_quant_sparse_flash_mla,
-        mixed_quant_sparse_flash_mla_metadata=mixed_quant_sparse_flash_mla_metadata,
-        quant_lightning_indexer=quant_lightning_indexer,
-        quant_lightning_indexer_metadata=quant_lightning_indexer_metadata,
-        quant_sparse_lightning_indexer=quant_sparse_lightning_indexer,
-        quant_sparse_lightning_indexer_metadata=quant_sparse_lightning_indexer_metadata,
+        indexer_prologue_k_dsl=indexer_prologue_k_dsl,
+        mixed_quant_sparse_flash_mla_dsl=mixed_quant_sparse_flash_mla_dsl,
+        mixed_quant_sparse_flash_mla_metadata_dsl=mixed_quant_sparse_flash_mla_metadata_dsl,
+        quant_lightning_indexer_dsl=quant_lightning_indexer_dsl,
+        quant_lightning_indexer_metadata_dsl=quant_lightning_indexer_metadata_dsl,
+        quant_sparse_lightning_indexer_dsl=quant_sparse_lightning_indexer_dsl,
+        quant_sparse_lightning_indexer_metadata_dsl=quant_sparse_lightning_indexer_metadata_dsl,
     )
 
 
@@ -1411,7 +1412,7 @@ class LowRatioCompressAscendBackendMixin:
             cache_index=cache_index.to(torch.int64),
             norm_eps=indexer.k_norm.eps,
         )
-        ds41.indexer_prologue_k(
+        ds41.indexer_prologue_k_dsl(
             **common,
             k_cache=pool.get_index_k(layer.layer_id),
             k_scale_cache=pool.get_index_scale(layer.layer_id),
@@ -1420,7 +1421,7 @@ class LowRatioCompressAscendBackendMixin:
         if indexer.is_candidate_source:
             # Level-two K for QSLI: the same rows again, eight to a record,
             # fused with their scales.
-            ds41.indexer_prologue_k(
+            ds41.indexer_prologue_k_dsl(
                 **common,
                 k_cache=self._dsv41_qsli_cache(layer),
                 k_scale_cache=None,
@@ -1519,7 +1520,7 @@ class LowRatioCompressAscendBackendMixin:
                 f"DeepSeek-V4.1 QLI for layer {layer.layer_id} has no {key}; the "
                 "kernel-metadata builder must run before the source layers."
             )
-        result = _ds41_ops().quant_lightning_indexer(
+        result = _ds41_ops().quant_lightning_indexer_dsl(
             q=q_packed,
             k=k,
             w=w,
@@ -1626,7 +1627,7 @@ class LowRatioCompressAscendBackendMixin:
             )
         topk = self._dsv4_index_topk
         qsli_k = self._dsv41_qsli_cache(layer)
-        indices, _ = _ds41_ops().quant_sparse_lightning_indexer(
+        indices, _ = _ds41_ops().quant_sparse_lightning_indexer_dsl(
             q=q_packed,
             # QSLI takes the record rows without the singleton head axis.
             k=qsli_k.squeeze(-2),
@@ -1709,7 +1710,7 @@ class LowRatioCompressAscendBackendMixin:
             cmp_lens = (kv_lens // ratio).to(torch.int32)
             keep(
                 f"c{ratio}a_qli_metadata",
-                ds41.quant_lightning_indexer_metadata(
+                ds41.quant_lightning_indexer_metadata_dsl(
                     cu_seqlens_q=cu_seqlens_q,
                     seqused_q=None,
                     seqused_k=cmp_lens,
@@ -1742,7 +1743,7 @@ class LowRatioCompressAscendBackendMixin:
             # instance from the plain per-ratio one.
             keep(
                 f"c{candidate_ratio}a_qli_candidate_metadata",
-                ds41.quant_lightning_indexer_metadata(
+                ds41.quant_lightning_indexer_metadata_dsl(
                     cu_seqlens_q=cu_seqlens_q,
                     seqused_q=None,
                     seqused_k=cmp_lens,
@@ -1777,7 +1778,7 @@ class LowRatioCompressAscendBackendMixin:
             )
             keep(
                 f"c{candidate_ratio}a_qsli_metadata",
-                ds41.quant_sparse_lightning_indexer_metadata(
+                ds41.quant_sparse_lightning_indexer_metadata_dsl(
                     candidate_block_length=visible_blocks.to(torch.int32).view(-1, 1),
                     cu_seqlens_q=cu_seqlens_q,
                     seqused_q=None,
@@ -1800,7 +1801,7 @@ class LowRatioCompressAscendBackendMixin:
 
     # ---- mixed-quant sparse MLA -----------------------------------------------
     #
-    # V4.1 attends with ``ds41.mixed_quant_sparse_flash_mla``: the window and
+    # V4.1 attends with ``ds41.mixed_quant_sparse_flash_mla_dsl``: the window and
     # compressed sides are passed purely as explicit sparse indices + topk
     # lengths. Row widths match the pools built in dsv4_memory_pool.py
     # (ori 544B, cmp 320B).
@@ -1928,7 +1929,7 @@ class LowRatioCompressAscendBackendMixin:
             else:
                 cmp_lengths = self._dsv41_cmp_topk_length(forward_batch, ratio)
             key = f"{attention_type}_metadata"
-            metadata = ds41.mixed_quant_sparse_flash_mla_metadata(
+            metadata = ds41.mixed_quant_sparse_flash_mla_metadata_dsl(
                 ori_topk_length=win_lengths,
                 cmp_topk_length=cmp_lengths,
                 cu_seqlens_q=cu_seqlens_q,
@@ -2035,7 +2036,7 @@ class LowRatioCompressAscendBackendMixin:
         # (unused, empty) softmax-lse tensors explicitly.
         attn_out = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
         lse = torch.empty((0,), dtype=torch.float32, device=q.device)
-        _ds41_ops().mixed_quant_sparse_flash_mla(
+        _ds41_ops().mixed_quant_sparse_flash_mla_dsl(
             q, out=attn_out, lse=lse, **attn_kwargs
         )
         return attn_out
@@ -2238,7 +2239,7 @@ class LowRatioCompressAscendBackendMixin:
         probe_cmp_lengths = torch.zeros((t, 1), dtype=torch.int32, device=device)
         for ratio in (0, *self._dsv41_low_ratios()):
             attention_type = "win" if ratio == 0 else f"c{ratio}a"
-            probe = ds41.mixed_quant_sparse_flash_mla_metadata(
+            probe = ds41.mixed_quant_sparse_flash_mla_metadata_dsl(
                 ori_topk_length=metadata.dsv41_win_topk_length,
                 cmp_topk_length=probe_cmp_lengths,
                 cu_seqlens_q=cu_seqlens_q,
@@ -2258,7 +2259,7 @@ class LowRatioCompressAscendBackendMixin:
                 self.graph_metadata[key] = buf
             metadata.kernel_metadata[f"{attention_type}_metadata"] = buf
         for ratio in self._dsv41_low_ratios():
-            probe = ds41.quant_lightning_indexer_metadata(
+            probe = ds41.quant_lightning_indexer_metadata_dsl(
                 cu_seqlens_q=cu_seqlens_q,
                 seqused_q=None,
                 seqused_k=torch.zeros(bs, dtype=torch.int32, device=device),
@@ -2298,7 +2299,7 @@ class LowRatioCompressAscendBackendMixin:
                 f"({self._dsv41_candidate_topk_blocks}/{block})."
             )
         local_cmp_lens = torch.zeros(bs, dtype=torch.int32, device=device)
-        probe = ds41.quant_lightning_indexer_metadata(
+        probe = ds41.quant_lightning_indexer_metadata_dsl(
             cu_seqlens_q=cu_seqlens_q,
             seqused_q=None,
             seqused_k=local_cmp_lens,
@@ -2331,7 +2332,7 @@ class LowRatioCompressAscendBackendMixin:
             probe_candidate_lengths = torch.ones(
                 (t, 1), dtype=torch.int32, device=device
             )
-            probe = ds41.quant_sparse_lightning_indexer_metadata(
+            probe = ds41.quant_sparse_lightning_indexer_metadata_dsl(
                 candidate_block_length=probe_candidate_lengths,
                 cu_seqlens_q=cu_seqlens_q,
                 seqused_q=None,
@@ -4112,7 +4113,7 @@ class DeepseekV4AscendAttnBackend(
                 layer_id=layer.layer_id, swa_k=k, forward_batch=forward_batch
             )
         if self._dsv4_has_low_ratio:
-            # V4.1 uses ds41.mixed_quant_sparse_flash_mla for every ratio:
+            # V4.1 uses ds41.mixed_quant_sparse_flash_mla_dsl for every ratio:
             # both sides are explicit sparse indices, so ratio 0 included.
             return self._forward_low_ratio_attention(
                 q, layer, forward_batch, attn_sink, compress_ratio
