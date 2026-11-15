@@ -5870,6 +5870,7 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         "enable_trace": ["--enable-trace"],
         "completion_template": ["--completion-template", "deepseek_coder"],
         "hf_chat_template_name": ["--hf-chat-template-name", "tool_use"],
+        "trust_request_chat_template": ["--trust-request-chat-template"],
         "enable_custom_logit_processor": ["--enable-custom-logit-processor"],
         "enable_return_routed_experts": ["--enable-return-routed-experts"],
         "enable_lora": ["--enable-lora"],
