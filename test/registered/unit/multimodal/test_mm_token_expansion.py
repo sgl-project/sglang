@@ -47,7 +47,10 @@ from sglang.srt.managers.multimodal_processor import (
     get_mm_processor,
     import_processors,
 )
-from sglang.srt.multimodal.media_io import configure_media_url_security
+from sglang.srt.multimodal.media_io import (
+    configure_media_url_security,
+    media_url_security_config,
+)
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
@@ -75,11 +78,12 @@ from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
-class TestMMTokenExpansion(unittest.TestCase):
+class TestMMTokenExpansion(CustomTestCase):
     def test_preserves_non_media_ids_and_does_not_expand_insertions_again(self):
         original_input_ids = [71, 72, 99, 80, 98, 99, 81]
         expanded_input_ids = expand_token_placeholders(
@@ -185,7 +189,7 @@ class _ImageVideoStrategy(TokenSpaceProcessStrategy):
 _IMAGES_THEN_VIDEO = [(Modality.IMAGE,), (Modality.IMAGE,), (Modality.VIDEO,)]
 
 
-class TestLocateMedia(unittest.TestCase):
+class TestLocateMedia(CustomTestCase):
     def test_each_modality_takes_its_placeholder_tokens_in_list_order(self):
         strategy = _ImageVideoStrategy(None, None)
         spans = strategy.locate_media(
@@ -213,7 +217,7 @@ class TestLocateMedia(unittest.TestCase):
             )
 
 
-class TestTokenSpaceProcessor(unittest.TestCase):
+class TestTokenSpaceProcessor(CustomTestCase):
     def _processor(self, strategy_class=_ImageWidthStrategy):
         processor = TokenSpaceProcessor.for_strategy(strategy_class)(
             None,
@@ -382,7 +386,7 @@ def _token_space_defaults(strategy_class):
 _MODEL_TYPES_BY_ARCH = {}
 
 
-class TestTokenSpaceSGLangProcessor(unittest.TestCase):
+class TestTokenSpaceSGLangProcessor(CustomTestCase):
     def test_strategies_keep_the_legacy_processor_defaults(self):
         """A token-space model loads and schedules media like the legacy processor it replaces."""
         import_processors("sglang.srt.multimodal.processors")
@@ -514,14 +518,14 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
             allow_local_media_files=False,
         )
         publish(server_args, role="test")
-        with patch(
-            "sglang.srt.multimodal.multimodal_processor_mixin.configure_media_url_security"
-        ) as configure:
-            processor = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
-                _ImageWidthStrategy, TokenSpaceServingSpec
-            )(None, server_args, _bare_tokenizer(), None)
+        configure_media_url_security([], 64)
+        processor = TokenSpaceSGLangProcessor.for_strategy_and_serving_spec(
+            _ImageWidthStrategy, TokenSpaceServingSpec
+        )(None, server_args, _bare_tokenizer(), None)
         self.addCleanup(processor.shutdown)
-        configure.assert_called_once_with(["media.example.com"], 7, 3.0, False)
+        self.assertEqual(
+            media_url_security_config(), (["media.example.com"], 7, 3.0, False)
+        )
 
     def test_serving_offsets_come_from_mm_spans(self):
         """Adjacent images form one placeholder run; only mm_spans can divide it."""
@@ -592,6 +596,7 @@ class TestTokenSpaceSGLangProcessor(unittest.TestCase):
         self.assertEqual(item_hash((1, 2)), item_hash((1, 2)))
 
     def test_finalizing_cache_identities_keeps_the_served_identity(self):
+        """The tokenizer manager calls it on every multimodal request; bound items keep their identity."""
         reset_context()
         self.addCleanup(reset_context)
         server_args = ServerArgs(
