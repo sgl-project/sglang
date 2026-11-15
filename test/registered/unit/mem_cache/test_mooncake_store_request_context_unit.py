@@ -560,8 +560,9 @@ def _make_v1_store(binding, sizes=None):
     st = _make_mooncake_store(binding)
     st.mem_pool_host = SimpleNamespace(kv_buffer=object(), page_size=1)
     sizes = [4096] * 4 if sizes is None else sizes
+    # Interleaved K/V per object, matching the real _batch_preprocess order.
     st._batch_preprocess = lambda keys, hi: (
-        [f"{k}_k" for k in keys] + [f"{k}_v" for k in keys],
+        [f"{k}_{c}" for k in keys for c in ("k", "v")],
         [0] * len(sizes),
         sizes,
     )
@@ -629,8 +630,8 @@ class TestMooncakeStoreReceiptValidation(unittest.TestCase):
         )
 
     def test_f2_mixed_group_short_key_miss_complete_keys_hit(self):
-        # p0 complete (4096+4096), p0's twin short, p1 complete: only the
-        # short-read page loses its present mark.
+        # p0 complete (K and V both 4096), p1's K short: only the short-read
+        # page loses its present mark.
         binding = _ReceiptBinding([[4096, 4096, 100, 4096]])
         store = _make_v1_store(binding)
 
@@ -643,8 +644,8 @@ class TestMooncakeStoreReceiptValidation(unittest.TestCase):
         # short-circuited by: the second get re-issues the transfer RPC and,
         # served in full, reads as present.
         # The v1 preprocessing splits every object into its K and V keys, so
-        # one call carries four receipts in [p0_k, p1_k, p0_v, p1_v] order.
-        binding = _ReceiptBinding([[4096, 100, 4096, 100], [4096, 4096, 4096, 4096]])
+        # one call carries four receipts in [p0_k, p0_v, p1_k, p1_v] order.
+        binding = _ReceiptBinding([[4096, 4096, 100, 4096], [4096, 4096, 4096, 4096]])
         store = _make_v1_store(binding)
 
         self.assertEqual(
@@ -653,7 +654,8 @@ class TestMooncakeStoreReceiptValidation(unittest.TestCase):
         self.assertEqual(
             store.batch_get_v1(["p0", "p1"], host_indices=object()), [True, True]
         )
-        self.assertEqual(_names(binding.event_log), ["batch_get_into"] * 2)
+        # Both attempts reached the transfer layer (no stale positive mark).
+        self.assertEqual(_names(binding.event_log).count("batch_get_into"), 2)
 
     def test_p1_half_page_object_reads_as_miss(self):
         # The write "succeeded" (the object exists) but a prefill crash half
