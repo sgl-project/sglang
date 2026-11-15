@@ -141,7 +141,7 @@ class _Mqa:
         self.k_scale = torch.tensor(0.5)
         self.save_kv_cache = None
 
-    def __call__(self, q, k, v, forward_batch, *, save_kv_cache):
+    def __call__(self, q, k, v, forward_batch, *, save_kv_cache=True, **kwargs):
         self.save_kv_cache = save_kv_cache
         raise _CoreDone
 
@@ -161,6 +161,8 @@ def _rope(rope_cls=RotaryEmbedding, **kwargs):
 
 class _RocmAttn(forward_mla_rocm.DeepseekMLARocmForwardMixin):
     """An attention module every gfx1250 term accepts, before a case breaks one."""
+
+    save_kv_cache = True
 
     def __init__(self, **overrides):
         self.current_attention_backend = "aiter"
@@ -296,8 +298,24 @@ class TestGfx1250RopePlacement(_Gfx1250Case):
                 llama_4_scaling=None,
             )
         # The fused kernel writes the cache, so the backend must not write it again.
-        self.assertEqual(attn.attn_mqa.save_kv_cache, not calls)
+        self.assertEqual(attn.attn_mqa.save_kv_cache, attn.save_kv_cache and not calls)
         return bool(calls)
+
+    def test_shared_kv_write_ownership(self):
+        """Shared-KV consumers must preserve provider rows on both decode routes."""
+        for dcp_size in (1, 2):
+            for save_kv_cache in (True, False):
+                with self.subTest(dcp_size=dcp_size, save_kv_cache=save_kv_cache):
+                    attn = _RocmAttn(
+                        current_attention_backend="dsa",
+                        use_dsa=True,
+                        rotary_emb=None,
+                        dcp_size=dcp_size,
+                        save_kv_cache=save_kv_cache,
+                        is_dcp_mla_decode_phase=lambda batch: dcp_size > 1,
+                    )
+                    attn.attn_mqa_for_dcp_decode = attn.attn_mqa
+                    self.assertFalse(self.run_core(attn, _batch()))
 
     def test_rope_is_applied_exactly_once(self):
         """Prepare skips rope exactly when core fuses it; a mismatch rotates
