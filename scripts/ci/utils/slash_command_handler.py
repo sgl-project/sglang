@@ -45,7 +45,7 @@ PRECISION_BASELINE_REFRESH_FLAG = "--refresh-precision-baseline"
 CHANGED_TESTS_FLAG = "--changed"
 CHANGED_TESTS_SHORT_FLAG = "-c"
 HW_FLAG = "--hw"
-# `--hw` values /rerun-test accepts; without it, CUDA/CPU wins over NPU.
+# `--hw` takes a comma-separated list of these; without it, CUDA/CPU wins over NPU.
 RERUN_HW_CHOICES = ("cuda", "npu")
 # CI selections: name -> workflow files and an optional opt-in label.
 # A null label selects existing workflows without a new hardware gate.
@@ -1216,7 +1216,7 @@ def detect_suite(file_path_from_test, hw=None):
     Read a test file and extract dispatch info from register_cuda_ci,
     register_cpu_ci, or register_npu_ci.
 
-    `hw` is the /rerun-test `--hw` value. Without it a CUDA or CPU registration
+    `hw` is one /rerun-test `--hw` item. Without it a CUDA or CPU registration
     wins, and a file registered for NPU and neither of those runs on NPU.
     `npu` uses only the NPU registrations; `cuda` never falls back to them.
 
@@ -1327,8 +1327,8 @@ def detect_suite(file_path_from_test, hw=None):
         return [
             _dispatch_err(
                 None,
-                f"`{full_path}` is registered for NPU, not CUDA or CPU; drop "
-                f"`{HW_FLAG} {hw}` to run it on NPU.",
+                f"`{full_path}` has no CUDA or CPU registration, so "
+                f"`{HW_FLAG} cuda` has nothing to run; it is registered for NPU.",
             )
         ]
 
@@ -1664,7 +1664,9 @@ def handle_rerun_test(
     Handles the /rerun-test command. Resolves all test specs, groups them by
     dispatch shape (mode + runs_on + install_script + install_timeout +
     rdma_devices + the npu_* inputs), and dispatches one workflow per group.
-    `hw` is the `--hw` value, or None without the flag (see detect_suite).
+    `hw` is the raw `--hw` value, or None without the flag. Each of its
+    comma-separated items is resolved on its own (see detect_suite) and the
+    entries are combined.
     """
     if not skip_permission_check and not _check_rerun_test_permissions(
         gh_repo, pr, comment, user_perms, "rerun-test"
@@ -1676,13 +1678,19 @@ def handle_rerun_test(
     ):
         return False
 
-    if hw is not None and hw not in RERUN_HW_CHOICES:
+    hws = [None] if hw is None else hw.split(",")
+    if hw is not None and (
+        set(hws) - set(RERUN_HW_CHOICES) or len(set(hws)) < len(hws)
+    ):
         comment.create_reaction("confused")
-        if hw == "amd":
+        if "amd" in hws:
             pr.create_issue_comment("⛔ AMD is not supported by /rerun-test yet.")
         else:
             choices = ", ".join(f"`{c}`" for c in RERUN_HW_CHOICES)
-            pr.create_issue_comment(f"⛔ `{HW_FLAG}` takes one of {choices}.")
+            pr.create_issue_comment(
+                f"⛔ `{HW_FLAG}` takes one or more of {choices}, comma-separated, "
+                "each at most once."
+            )
         return False
 
     if not test_specs and not include_changed_tests:
@@ -1700,7 +1708,8 @@ def handle_rerun_test(
             "every test file this PR adds or modifies)\n"
             f"- `/rerun-test {HW_FLAG} npu test_foo.py` (run a file's NPU "
             "registrations even if it also registers CUDA; a file registered "
-            "only for NPU runs there without the flag)"
+            f"only for NPU runs there without the flag; `{HW_FLAG} cuda,npu` "
+            "runs both)"
         )
         return False
 
@@ -1727,14 +1736,16 @@ def handle_rerun_test(
     resolve_failures = []
     seen_failures = set()
 
-    def _record_failure(spec, error):
+    def _record_failure(spec, error, hw=None):
         # De-dupe failures by canonical path so the same un-dispatchable file
-        # reported two ways (explicit + glob, or two globs) yields one line.
+        # reported two ways (explicit + glob, or two globs) yields one line per
+        # `--hw` item, and an error every item hits (a missing file) one line.
         key = spec.strip().strip("\"'`")
         if key.startswith("test/"):
             key = key[len("test/") :]
-        if key not in seen_failures:
-            seen_failures.add(key)
+        keys = {(key, hw), (key, error)}
+        if not keys & seen_failures:
+            seen_failures.update(keys)
             resolve_failures.append({"spec": spec, "error": error})
 
     expanded_specs = []
@@ -1771,15 +1782,16 @@ def handle_rerun_test(
     resolved = []
     seen_commands = set()
     for spec in expanded_specs:
-        for r in _resolve_test_spec(spec, hw):
-            if r.get("error"):
-                _record_failure(r["spec"], r["error"])
-                continue
-            key = (r["mode"], r["runs_on"], r["test_command"])
-            if key in seen_commands:
-                continue
-            seen_commands.add(key)
-            resolved.append(r)
+        for item in hws:
+            for r in _resolve_test_spec(spec, item):
+                if r.get("error"):
+                    _record_failure(r["spec"], r["error"], item)
+                    continue
+                key = (r["mode"], r["runs_on"], r["test_command"])
+                if key in seen_commands:
+                    continue
+                seen_commands.add(key)
+                resolved.append(r)
 
     if refresh_precision_baseline:
         is_exact_precision_test = (

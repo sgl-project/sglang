@@ -342,7 +342,7 @@ class TestHwFlag(_TempRepo):
             'register_npu_ci(est_time=60, suite="base-b-test-1-npu-a3")',
         )
         [entry] = handler._resolve_test_spec(path, hw="cuda")
-        self.assertIn("drop `--hw cuda`", entry["error"])
+        self.assertIn("has no CUDA or CPU registration", entry["error"])
 
     def test_pop_hw_flag(self):
         self.assertEqual(
@@ -352,9 +352,17 @@ class TestHwFlag(_TempRepo):
         self.assertEqual(handler._pop_hw_flag(["a.py"]), (None, ["a.py"]))
 
     def test_unsupported_hw_is_rejected_before_dispatch(self):
+        amd = "⛔ AMD is not supported by /rerun-test yet."
+        bad = "⛔ `--hw` takes one or more of `cuda`, `npu`, comma-separated, each at most once."
         for hw, reply in (
-            ("amd", "⛔ AMD is not supported by /rerun-test yet."),
-            ("", "⛔ `--hw` takes one of `cuda`, `npu`."),
+            ("amd", amd),
+            ("cuda,amd", amd),
+            ("", bad),
+            ("tpu", bad),
+            ("cuda,tpu", bad),
+            ("cuda,", bad),
+            ("cuda,,npu", bad),
+            ("npu,npu", bad),
         ):
             pr = mock.MagicMock()
             with mock.patch.object(handler.requests, "post") as post:
@@ -367,13 +375,13 @@ class TestHwFlag(_TempRepo):
                     token="t",
                     hw=hw,
                 )
-            self.assertFalse(ok)
+            self.assertFalse(ok, hw)
             pr.create_issue_comment.assert_called_once_with(reply)
             post.assert_not_called()
 
 
 class TestDispatchNpu(_TempRepo):
-    def _run(self, specs):
+    def _run(self, specs, hw=None):
         gh_repo = mock.MagicMock(full_name="o/r")
         gh_repo.get_workflows.return_value = [
             types.SimpleNamespace(name="Rerun Test", id=7)
@@ -401,8 +409,10 @@ class TestDispatchNpu(_TempRepo):
                 {"cooldown_interval_minutes": 0},
                 specs,
                 token="t",
+                hw=hw,
             )
         self.assertTrue(ok)
+        self.reply = pr.create_issue_comment.return_value.edit.call_args.args[0]
         return [p["inputs"] for p in posts]
 
     def test_suites_on_one_runner_dispatch_separately(self):
@@ -459,6 +469,33 @@ class TestDispatchNpu(_TempRepo):
                 "npu_collect_nightly_tests": "false",
             },
         )
+
+    def test_hw_list_dispatches_each_backend(self):
+        path = self.write_test(
+            "registered/core/test_both.py",
+            """
+            register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")
+            register_npu_ci(est_time=60, suite="base-b-test-1-npu-a3")
+            """,
+        )
+        inputs = self._run([path], hw="cuda,npu")
+        self.assertEqual(
+            [(i["mode"], i["npu_suite"]) for i in inputs],
+            [("cuda", ""), ("npu", "base-b-test-1-npu-a3")],
+        )
+        self.assertNotIn("⛔", self.reply)
+
+    def test_hw_list_rejects_only_the_missing_backend(self):
+        path = self.write_test(
+            "registered/core/test_cuda.py",
+            'register_cuda_ci(est_time=60, stage="base-b", runner_config="1-gpu-large")',
+        )
+        [inputs] = self._run([path, "test_missing.py"], hw="cuda,npu")
+        self.assertEqual(inputs["mode"], "cuda")
+        rejections = [l for l in self.reply.split("\n") if l.startswith("⛔")]
+        self.assertEqual(len(rejections), 2)
+        self.assertIn("has no `register_npu_ci(...)`", rejections[0])
+        self.assertIn("`test_missing.py`", rejections[1])
 
 
 class TestNpuStageInputs(unittest.TestCase):
