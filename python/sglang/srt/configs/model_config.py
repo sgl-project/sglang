@@ -218,6 +218,8 @@ def is_deepseek_dsa(config) -> bool:
             "HYV4ForCausalLMNextN",
             "Ernie5_5_MoeForCausalLM",
             "Ernie5_5_MoeForCausalLMNextN",
+            "GigaChat4ForCausalLM",
+            "GigaChat4ForCausalLMNextN",
         )
         and _hf_attr(config, "index_topk") is not None
     ) or is_kimi_k31(config)
@@ -1261,6 +1263,8 @@ class ModelConfig:
             and self.hf_config.architectures[0] == "GigaChat35ForCausalLM"
         ):
             self.hf_config.architectures[0] = "GigaChat35ForCausalLMNextN"
+        if is_draft_model and self.hf_config.architectures[0] == "GigaChat4ForCausalLM":
+            self.hf_config.architectures[0] = "GigaChat4ForCausalLMNextN"
         if (
             is_draft_model
             and self.hf_config.architectures[0] == "Step3p7ForConditionalGeneration"
@@ -1563,6 +1567,8 @@ class ModelConfig:
             or "GigaChat35ForCausalLM" in self.hf_config.architectures
             or "GigaChat35ForCausalLMNextN" in self.hf_config.architectures
             or "Xing4_0ForCausalLM" in self.hf_config.architectures
+            or "GigaChat4ForCausalLM" in self.hf_config.architectures
+            or "GigaChat4ForCausalLMNextN" in self.hf_config.architectures
         ):
             self.head_dim = 256
             self.attention_arch = AttentionArch.MLA
