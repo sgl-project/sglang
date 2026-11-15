@@ -129,10 +129,10 @@ impl SwaComponent {
                 node.is_root(),
                 node.device_lock_ref(SWA) > 0,
                 node.has_device_value(SWA),
-                // A write-through backup or a buffer-mode backup reads the node
-                // as it is now, and in buffer mode the walk that would split the
-                // node is the backup's own D2H pin.
-                node.write_through_pending_id.is_some() || node.buffer_backup_pending,
+                // A write-through backup reads the node as it is now. The
+                // buffer-mode guard lives on the Python side
+                // (`inflight_backup_pools`), which the Rust core cannot see.
+                node.write_through_pending_id.is_some(),
                 node.key.atom_len(),
             )
         };
@@ -560,6 +560,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             node.set_device_value(FULL, value_slice.copy());
             cache_actions.push(Box::new(FreeDeviceKVFullOnly {
                 indices: vec![old_full],
+                tree_owned: true,
             }));
             cache_actions.push(Box::new(SwaRebuild {
                 node_id: node.id,
@@ -595,6 +596,7 @@ impl<K: ChildKeyType> TreeComponent<K> for SwaComponent {
             node.set_device_value(FULL, new_full.copy());
             cache_actions.push(Box::new(FreeDeviceKVFullOnly {
                 indices: vec![old_full],
+                tree_owned: true,
             }));
             cache_actions.push(Box::new(SwaRebuild {
                 node_id: node_ext_id,
