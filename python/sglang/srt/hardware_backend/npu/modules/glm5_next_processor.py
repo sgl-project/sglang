@@ -6,82 +6,49 @@ at most 8 dimensions, so keep the upstream preprocessing flow and replace only
 that layout transformation.
 """
 
-from functools import wraps
-
 import torch
 from sgl_kernel_npu.operators.multimodal import flatten_patches
 
 
-def npu_wrapper_glm5_next_image_patchify(func):
-    @wraps(func)
-    def patchify(
-        self,
-        images: torch.Tensor,
-        patch_size: int,
-        merge_size: int,
-        temporal_patch_size: int,
-    ) -> tuple[torch.Tensor, int, int]:
-        flattened_patches, grid_t, grid_h, grid_w = flatten_patches(
-            images.unsqueeze(1),
-            patch_size=patch_size,
-            merge_size=merge_size,
-            temporal_patch_size=temporal_patch_size,
-        )
-        if grid_t != 1:
-            raise ValueError(f"Expected one temporal image grid, got {grid_t}")
-        return flattened_patches, grid_h, grid_w
-
-    return patchify
+def _npu_image_patchify(
+    self,
+    images: torch.Tensor,
+    patch_size: int,
+    merge_size: int,
+    temporal_patch_size: int,
+) -> tuple[torch.Tensor, int, int]:
+    flattened_patches, grid_t, grid_h, grid_w = flatten_patches(
+        images.unsqueeze(1),
+        patch_size=patch_size,
+        merge_size=merge_size,
+        temporal_patch_size=temporal_patch_size,
+    )
+    if grid_t != 1:
+        raise ValueError(f"Expected one temporal image grid, got {grid_t}")
+    return flattened_patches, grid_h, grid_w
 
 
-def npu_wrapper_glm5_next_video_patchify(func):
-    @wraps(func)
-    def patchify(
-        self,
-        videos: torch.Tensor,
-        patch_size: int,
-        merge_size: int,
-        temporal_patch_size: int,
-    ) -> tuple[torch.Tensor, int, int, int]:
-        return flatten_patches(
-            videos,
-            patch_size=patch_size,
-            merge_size=merge_size,
-            temporal_patch_size=temporal_patch_size,
-        )
-
-    return patchify
+def _npu_video_patchify(
+    self,
+    videos: torch.Tensor,
+    patch_size: int,
+    merge_size: int,
+    temporal_patch_size: int,
+) -> tuple[torch.Tensor, int, int, int]:
+    return flatten_patches(
+        videos,
+        patch_size=patch_size,
+        merge_size=merge_size,
+        temporal_patch_size=temporal_patch_size,
+    )
 
 
-_NPU_PATCH_MARKER = "_sglang_npu_safe_glm5_next_patchify"
-
-
-def npu_apply_glm5_next_preprocess_patch(processor) -> bool:
+def npu_apply_glm5_next_preprocess_patch(processor) -> None:
     """Patch the concrete GLM5-Next processors held by ``processor``.
 
     ``trust_remote_code`` loads classes below ``transformers_modules.*`` rather
     than ``transformers.models.glm5_next.*``. Patching the instances' concrete
     classes covers both layouts without depending on a generated module name.
-    Return True only when every present inner processor exposes ``patchify``.
     """
-    patches = []
-    for kind, wrapper in (
-        ("image", npu_wrapper_glm5_next_image_patchify),
-        ("video", npu_wrapper_glm5_next_video_patchify),
-    ):
-        inner = getattr(processor, f"{kind}_processor", None)
-        if inner is None:
-            continue
-        inner_type = type(inner)
-        if not callable(getattr(inner_type, "patchify", None)):
-            return False
-        patches.append((inner_type, wrapper))
-
-    for processor_type, wrapper in patches:
-        original = getattr(processor_type, "patchify", None)
-        if getattr(original, _NPU_PATCH_MARKER, False):
-            continue
-        patched = wrapper(original)
-        setattr(patched, _NPU_PATCH_MARKER, True)
-        setattr(processor_type, "patchify", patched)
-    return bool(patches)
+    type(processor.image_processor).patchify = _npu_image_patchify
+    type(processor.video_processor).patchify = _npu_video_patchify
