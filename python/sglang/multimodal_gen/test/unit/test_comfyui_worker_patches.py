@@ -8,8 +8,15 @@ import types
 from dataclasses import dataclass
 
 import pytest
+import torch
 
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion import worker_patches as patches
+from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.worker_patches import (
+    h3 as h3_profile,
+)
+from sglang.multimodal_gen.runtime import distributed
+from sglang.multimodal_gen.runtime.distributed import parallel_state
+from sglang.multimodal_gen.runtime.models.dits import minimax_h3
 
 
 def test_registered_names_only():
@@ -167,6 +174,62 @@ def test_h3_dynamic_lora_rejected():
 
     with pytest.raises(ValueError, match="LoRA"):
         _reject_lora("adapter")
+
+
+def test_h3_install_disables_nested_norm2_fusion_for_reference_only(monkeypatch):
+    block = minimax_h3.MiniMaxH3DiTBlock.__new__(minimax_h3.MiniMaxH3DiTBlock)
+    torch.nn.Module.__init__(block)
+    block.preserve_input_for_cache_dit = False
+    block.mlp = types.SimpleNamespace(fc1=object())
+    block.norm2 = types.SimpleNamespace(weight=torch.ones(1), eps=1e-6)
+    block.attn = types.SimpleNamespace()
+    block.attn._attend = types.MethodType(
+        minimax_h3.MiniMaxH3Attention._attend, block.attn
+    )
+    monkeypatch.setattr(
+        minimax_h3,
+        "MINIMAX_H3_NORM_MODULATE",
+        types.SimpleNamespace(is_enabled=lambda _: True),
+    )
+    monkeypatch.setattr(
+        minimax_h3, "can_use_indexed_gate_rmsnorm_scale_shift", lambda *args: True
+    )
+    original = minimax_h3.MiniMaxH3DiTBlock._fuses_gate_norm2
+    inputs = (None,) * 6
+    assert block._fuses_gate_norm2(*inputs)
+
+    model = types.SimpleNamespace(
+        blocks=[block],
+        adaln_t_table=None,
+        adaln_cache=None,
+        final_layer=types.SimpleNamespace(_pdd_heads=None),
+        parameters=lambda: iter(
+            [types.SimpleNamespace(device=types.SimpleNamespace(type="cuda"))]
+        ),
+        named_modules=lambda: (),
+        _embed=lambda *args: None,
+        forward=lambda **kwargs: None,
+    )
+    monkeypatch.setattr(minimax_h3, "MiniMaxH3DiTModel", types.SimpleNamespace)
+    monkeypatch.setattr(distributed, "get_tp_world_size", lambda: 1)
+    monkeypatch.setattr(parallel_state, "get_ring_ctx", lambda: (1, 0))
+    monkeypatch.setattr(parallel_state, "get_ulysses_ctx", lambda: (1, 0))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (9, 0))
+    version = h3_profile.importlib.metadata.version
+    monkeypatch.setattr(
+        h3_profile.importlib.metadata,
+        "version",
+        lambda name: "0.2.36" if name == "comfy-kitchen" else version(name),
+    )
+    kitchen = types.ModuleType("comfy_kitchen")
+    kitchen.rms_rope_split_half_ = lambda *args: None
+    monkeypatch.setitem(sys.modules, "comfy_kitchen", kitchen)
+
+    h3_profile.install(types.SimpleNamespace(modules={"transformer": model}))
+
+    assert not block._fuses_gate_norm2(*inputs)
+    assert minimax_h3.MiniMaxH3DiTBlock._fuses_gate_norm2 is original
+    assert original(block, *inputs)
 
 
 @pytest.fixture
