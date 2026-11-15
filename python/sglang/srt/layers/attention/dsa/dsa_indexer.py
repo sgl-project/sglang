@@ -1665,6 +1665,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     dtype=torch.int32,
                     device=q_fp8.device,
                 )
+            # under DCP, block_tables cover only this rank's index-K shard
+            row_lens = seqlens_32_2d.view(-1) if dcp_size > 1 else seqlens_32
+            schedule = None
+            if _use_aiter_preshuffle and envs.SGLANG_DSA_MQA_PERSISTENT_SCHEDULE.get():
+                schedule = dsa_indexer_hip.paged_logits_persistent_schedule(
+                    forward_batch, layer_id, row_lens, max_seq_len
+                )
             # DP-attention can pad q/weights beyond the real metadata rows.
             # Aiter has no q_offset argument, so trim its inputs explicitly;
             # top-k padding is restored below for the downstream consumer.
@@ -1672,12 +1679,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 q_fp8[:q_offset],
                 kv_cache_fp8,
                 weights[:q_offset],
-                # under DCP, block_tables cover only this rank's index-K shard
-                seqlens_32_2d.view(-1) if dcp_size > 1 else seqlens_32,
+                row_lens,
                 block_tables,
                 max_seq_len,
                 preshuffle=_use_aiter_preshuffle,
                 kv_block_size=block_kv,
+                persistent_schedule=schedule,
             )
         elif _is_xpu:
             logits = sgl_fp8_paged_mqa_logits(
