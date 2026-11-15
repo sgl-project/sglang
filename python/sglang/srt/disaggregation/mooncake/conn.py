@@ -63,6 +63,9 @@ from sglang.srt.disaggregation.utils import (
     should_send_replicated_state,
     slice_dsa_tail_dst_ptrs_for_pp,
 )
+from sglang.srt.distributed.device_communicators.kv_transfer_engine import (
+    TransferIntent,
+)
 from sglang.srt.distributed.parallel_state import get_mooncake_transfer_engine
 from sglang.srt.environ import envs
 from sglang.srt.observability.mooncake_trace import (
@@ -846,8 +849,13 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             return 0
 
         src_addrs, dst_addrs, lengths = zip(*transfer_blocks)
+        # The decode side is blocked on this KV, so it rides the foreground lane.
         return self.engine.batch_transfer_sync(
-            mooncake_session_id, list(src_addrs), list(dst_addrs), list(lengths)
+            mooncake_session_id,
+            list(src_addrs),
+            list(dst_addrs),
+            list(lengths),
+            TransferIntent.FOREGROUND,
         )
 
     def _state_stride_mismatch(
@@ -2038,7 +2046,11 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             total_slices = len(src_addr_list)
             length_list = [heads_bytes_per_token_to_send] * total_slices
             return self.engine.batch_transfer_sync(
-                mooncake_session_id, src_addr_list, dst_addr_list, length_list
+                mooncake_session_id,
+                src_addr_list,
+                dst_addr_list,
+                length_list,
+                TransferIntent.FOREGROUND,
             )
 
         futures = [
@@ -3576,12 +3588,12 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             session_id.encode("ascii"),
             packed_kv_data_ptrs,
             packed_aux_data_ptrs,
-            # Always sent, empty unless customized-info transfer is enabled.
+            # Always sent, empty unless exchange_aux_item_lens.
             (
                 struct.pack(
                     f"{len(self.kv_args.aux_item_lens)}Q", *self.kv_args.aux_item_lens
                 )
-                if self.customized_info_enabled
+                if self.exchange_aux_item_lens
                 else b""
             ),
             packed_state_data_ptrs,
