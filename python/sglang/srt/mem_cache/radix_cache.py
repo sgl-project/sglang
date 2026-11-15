@@ -486,7 +486,7 @@ class RadixCache(BasePrefixCache):
                 priority=priority,
             )
         )
-        req.kv.cache_inserted_len = max(req.kv.cache_inserted_len, key_len)
+        req.kv.record_insert(key_len)
         if split_prompt:
             # Split the leaf at the prompt boundary so eviction can drop the
             # output KV without the prompt; a prefix re-insert only changes topology.
@@ -517,9 +517,11 @@ class RadixCache(BasePrefixCache):
             return
         token_ids = req.full_untruncated_fill_ids[:up_to]
         # Pure-SWA trees never cache what the window already evicted.
-        swa_evict_floor = req.kv.swa_evict_floor
+        window_evict_floor = req.kv.window_evict_floor
         key_limit = (
-            ceil_align(swa_evict_floor, self.page_size) if swa_evict_floor > 0 else None
+            ceil_align(window_evict_floor, self.page_size)
+            if window_evict_floor > 0
+            else None
         )
         radix_key, _, _ = self._insert_cache(
             req, token_ids, key_limit=key_limit, split_prompt=True
@@ -541,7 +543,7 @@ class RadixCache(BasePrefixCache):
         # With page_size > 1 the partial page stays in the request's row but not
         # in the tree; cache_protected_len marks the tree-owned part so the next
         # checkpoint or release_kv_cache frees the rest.
-        req.kv.cache_protected_len = len(new_indices)
+        req.kv.protect_prefix(len(new_indices))
 
         self.unlock(req.lock)
         req.lock = self.lock(new_last_node)

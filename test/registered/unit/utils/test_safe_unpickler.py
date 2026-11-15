@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import torch
 
-from sglang.srt.utils.common import (
+from sglang.srt.utils.serialization import (
     MultiprocessingSerializer,
     SafeUnpickler,
     safe_pickle_loads,

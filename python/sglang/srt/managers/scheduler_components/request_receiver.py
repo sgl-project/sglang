@@ -51,6 +51,9 @@ from sglang.srt.utils import (
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
+    from sglang.srt.managers.scheduler_components.request_retirer import (
+        RequestRetirer,
+    )
     from sglang.srt.rust_server.server import RustServer
     from sglang.srt.server_args import ServerArgs
     from sglang.test.scripted_runtime.scheduler_hook import ScriptedSchedulerHook
@@ -71,15 +74,25 @@ class SchedulerRequestReceiver:
     server_args: ServerArgs
     model_config: ModelConfig
     max_recv_per_poll: int
-    stream_output: Callable[..., None]
+    request_retirer: RequestRetirer
     get_last_batch: Callable[[], Any]
+    # SGLANG_RUST_SERVER: requests are drained from the embedded Rust
+    # listener's ring rather than received over zmq.
+    rust_server_mode: bool
     scripted_scheduler_hook: Optional[ScriptedSchedulerHook] = None
     scheduler_stage_metrics: Optional[SchedulerStageMetricsRecorder] = None
 
     def recv_limit_reached(self, num_recv_reqs: int) -> bool:
-        if self.max_recv_per_poll < 0:
-            return False
-        return num_recv_reqs >= self.max_recv_per_poll
+        return self.max_recv_per_poll >= 0 and num_recv_reqs >= self.max_recv_per_poll
+
+    def has_pending(self) -> bool:
+        return False
+
+    def wait_for_progress(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
 
     @scheduler_stage_method(SCHEDULER_STAGE_RECV_REQUESTS)
     def recv_requests(
@@ -90,7 +103,9 @@ class SchedulerRequestReceiver:
         local_reqs are aborts the caller decided on this rank; they ride the
         same broadcast as the pulled requests.
         """
+        return self._recv_requests(local_reqs)
 
+    def _recv_requests(self, local_reqs: Optional[List[AbortReq]]) -> List:
         if self.scripted_scheduler_hook is not None:
             self.scripted_scheduler_hook.step()
 
@@ -98,6 +113,13 @@ class SchedulerRequestReceiver:
             if not self.recv_skipper.handle(self.get_last_batch()):
                 return []
 
+        recv_reqs = self._recv_and_broadcast(local_reqs)
+
+        self._finalize_shm_features(recv_reqs)
+
+        return recv_reqs
+
+    def _recv_and_broadcast(self, local_reqs: Optional[List[AbortReq]]) -> List:
         recv_reqs = self._pull_raw_reqs()
 
         if self.input_blocker is not None:
@@ -108,11 +130,7 @@ class SchedulerRequestReceiver:
         if get_parallel().pp_rank == 0:
             self.unwrap_pickle_wrapper(recv_reqs)
 
-        recv_reqs = self._apply_mm_receiver(recv_reqs)
-
-        self._finalize_shm_features(recv_reqs)
-
-        return recv_reqs
+        return self._apply_mm_receiver(recv_reqs)
 
     def _pull_raw_reqs(self) -> Optional[List]:
         if get_parallel().pp_rank == 0:
@@ -122,7 +140,7 @@ class SchedulerRequestReceiver:
                 # Rust ringbuffer backend: drain the in-process ring fed by the
                 # embedded Rust TokenizerManager instead of a zmq socket. Same
                 # non-blocking, msgpack-decoded contract as the zmq path below.
-                if envs.SGLANG_RUST_SERVER.get():
+                if self.rust_server_mode:
                     recv_reqs.extend(
                         self.recv_from_tokenizer.drain(self.max_recv_per_poll)
                     )
@@ -208,7 +226,11 @@ class SchedulerRequestReceiver:
                 recv_reqs = [*recv_reqs, *local_reqs]
             if get_parallel().tp_size != 1:
                 tp_group = get_parallel().tp_group
-                exchange = get_shm_exchange(tp_group.cpu_group, "recv")
+                exchange = get_shm_exchange(
+                    group=tp_group.cpu_group,
+                    kind="recv",
+                    multihost=envs.SGLANG_OPT_SCHEDULER_SHM_SYNC_MULTIHOST.get(),
+                )
                 if exchange is not None:
                     recv_reqs = _broadcast_via_exchange(
                         recv_reqs, exchange=exchange, tp_group=tp_group
@@ -252,7 +274,7 @@ class SchedulerRequestReceiver:
                 else:
                     status_code = HTTPStatus(int(error_code))
                 prepare_abort(req, error_msg, status_code=status_code)
-                self.stream_output([req], req.return_logprob)
+                self.request_retirer.retire_unadmitted(req)
         return recv_reqs
 
     def _finalize_shm_features(self, recv_reqs: Optional[List]) -> None:

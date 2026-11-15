@@ -9,6 +9,7 @@ for _mod, _fn, _backend in (
     ("plan.api", "launch_canary_plan_kernels", KernelBackend.JIT),
     ("write", "launch_canary_write_kernel", KernelBackend.JIT),
     ("verify", "launch_canary_verify_kernel", KernelBackend.JIT),
+    ("canary_info", "launch_canary_info_kernel", KernelBackend.JIT),
     (
         "scatter_req_token_ids",
         "launch_scatter_req_token_ids_kernel",

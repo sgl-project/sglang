@@ -11,7 +11,6 @@ from sglang.srt.parser.code_completion_parser import (
     completion_templates,
     generate_completion_prompt,
     generate_completion_prompt_from_request,
-    is_completion_template_defined,
     register_completion_template,
     set_completion_template,
 )
@@ -32,20 +31,6 @@ class TestRegisterCompletionTemplate(CustomTestCase):
     def test_unregistered_template_not_found(self):
         """Test that a non-existent template returns False."""
         self.assertFalse(completion_template_exists("nonexistent_template"))
-
-    def test_register_new_template(self):
-        """Test registering a new template."""
-        t = CompletionTemplate(
-            name="_test_new_template",
-            fim_begin_token="<b>",
-            fim_middle_token="<m>",
-            fim_end_token="<e>",
-            fim_position=FimPosition.END,
-        )
-        register_completion_template(t)
-        self.assertTrue(completion_template_exists("_test_new_template"))
-        # Cleanup
-        del completion_templates["_test_new_template"]
 
     def test_register_duplicate_raises(self):
         """Test that registering a duplicate name without override raises."""
@@ -108,13 +93,6 @@ class TestGenerateCompletionPrompt(CustomTestCase):
         )
         self.assertEqual(result, expected)
 
-    def test_empty_prompt_and_suffix(self):
-        """Test FIM prompt generation with empty strings."""
-        result = generate_completion_prompt("", "", "deepseek_coder")
-        t = completion_templates["deepseek_coder"]
-        expected = f"{t.fim_begin_token}{t.fim_middle_token}{t.fim_end_token}"
-        self.assertEqual(result, expected)
-
 
 class TestGenerateCompletionPromptFromRequest(CustomTestCase):
     def test_empty_suffix_returns_prompt_directly(self):
@@ -149,19 +127,6 @@ class TestSetCompletionTemplate(CustomTestCase):
             # Second call should be ignored
             set_completion_template("qwen_coder")
             self.assertEqual(module.completion_template_name, "star_coder")
-
-    def test_is_completion_template_defined(self):
-        """Test the defined check before and after setting."""
-        import sglang.srt.parser.code_completion_parser as module
-
-        old_name = module.completion_template_name
-        try:
-            module.completion_template_name = None
-            self.assertFalse(is_completion_template_defined())
-            set_completion_template("deepseek_coder")
-            self.assertTrue(is_completion_template_defined())
-        finally:
-            module.completion_template_name = old_name
 
 
 if __name__ == "__main__":

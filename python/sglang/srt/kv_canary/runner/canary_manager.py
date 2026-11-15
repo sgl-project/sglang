@@ -7,9 +7,11 @@ from typing import TYPE_CHECKING, Iterator, Optional, Sequence
 
 import torch
 
+from sglang.kernels.ops.kv_canary.canary_info import launch_canary_info_kernel
 from sglang.kernels.ops.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.environ import envs
-from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup
+from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
+from sglang.srt.kv_canary.canary_info.aux_output import CanaryInfoDeviceOutput
 from sglang.srt.kv_canary.capacities import CanaryLaunchCapacities
 from sglang.srt.kv_canary.config import CanaryConfig
 from sglang.srt.kv_canary.endpoint import (
@@ -29,9 +31,11 @@ from sglang.srt.kv_canary.single_forward_manager.manager import (
 )
 from sglang.srt.kv_canary.state import CanaryDeviceState
 from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
+from sglang.srt.managers.auxiliary_output import append_auxiliary_output
 from sglang.srt.utils import create_device_stream
 
 if TYPE_CHECKING:
+    from sglang.srt.layers.logits_processor import LogitsProcessorOutput
     from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
@@ -66,6 +70,19 @@ class CanaryManager:
 
         self._buffer_groups: tuple[CanaryBufferGroup, ...] = tuple(buffer_groups)
         self._launch_capacities = launch_capacities
+        self._is_eagle_draft_decode = is_eagle_draft_decode
+        self._canary_info_buf: Optional[torch.Tensor] = (
+            next(
+                (g.k_tail for g in self._buffer_groups if g.kind is PoolKind.FULL), None
+            )
+            if config.enable_info and not is_eagle_draft_decode
+            else None
+        )
+        if config.enable_info and not is_eagle_draft_decode:
+            assert self._canary_info_buf is not None, (
+                "KvCanaryInfo requires a FULL pool group"
+            )
+        assert self._canary_info_buf is None or self._canary_info_buf.is_contiguous()
 
         self._device_state = CanaryDeviceState.allocate(
             config=config,
@@ -283,6 +300,84 @@ class CanaryManager:
                 outer_step_counter=self._outer_step_counter,
                 maybe_inaccurate_forward_batch=maybe_inaccurate_forward_batch,
             )
+
+    @property
+    def _canary_info_enabled(self) -> bool:
+        return (
+            self.config.enable_info
+            and self._canary_info_buf is not None
+            and not self._is_eagle_draft_decode
+        )
+
+    def _compute_canary_info(
+        self,
+        *,
+        forward_batch: ForwardBatch,
+        out_cache_loc: torch.Tensor,
+        next_token_ids: torch.Tensor,
+        accept_lens: Optional[torch.Tensor],
+    ) -> CanaryInfoDeviceOutput:
+        bs = int(out_cache_loc.shape[0])
+        sampling_info = forward_batch.sampling_info
+        out = torch.empty_like(out_cache_loc, dtype=torch.int64)
+        launch_canary_info_kernel(
+            canary_buf=self._canary_info_buf,
+            out_cache_loc=out_cache_loc,
+            next_token_ids=next_token_ids,
+            accept_lens=accept_lens,
+            temperatures=sampling_info.temperatures[:bs],
+            top_ps=sampling_info.top_ps[:bs],
+            top_ks=sampling_info.top_ks[:bs],
+            min_ps=sampling_info.min_ps[:bs],
+            out=out,
+        )
+        return CanaryInfoDeviceOutput(values=out)
+
+    def on_sampled(
+        self,
+        *,
+        logits_output: LogitsProcessorOutput,
+        forward_batch: ForwardBatch,
+        next_token_ids: torch.Tensor,
+    ) -> None:
+        if not self._canary_info_enabled:
+            return
+        bs = int(next_token_ids.shape[0])
+        last_slot_indices = self._req_to_token_pool.req_to_token[
+            forward_batch.req_pool_indices[:bs], forward_batch.seq_lens[:bs] - 1
+        ]
+        logits_output.auxiliary_device_output = append_auxiliary_output(
+            logits_output.auxiliary_device_output,
+            self._compute_canary_info(
+                forward_batch=forward_batch,
+                out_cache_loc=last_slot_indices.view(bs, 1),
+                next_token_ids=next_token_ids.view(bs, 1),
+                accept_lens=None,
+            ),
+        )
+
+    def on_verify_accept(
+        self,
+        *,
+        logits_output: LogitsProcessorOutput,
+        verify_forward_batch: ForwardBatch,
+        predict: torch.Tensor,
+        accept_lens: torch.Tensor,
+        num_draft_tokens: int,
+    ) -> None:
+        if not self._canary_info_enabled:
+            return
+        logits_output.auxiliary_device_output = append_auxiliary_output(
+            logits_output.auxiliary_device_output,
+            self._compute_canary_info(
+                forward_batch=verify_forward_batch,
+                out_cache_loc=verify_forward_batch.out_cache_loc[
+                    : accept_lens.numel() * num_draft_tokens
+                ].view(accept_lens.numel(), num_draft_tokens),
+                next_token_ids=predict.view(accept_lens.numel(), num_draft_tokens),
+                accept_lens=accept_lens,
+            ),
+        )
 
     def mark_init_finished(self) -> None:
         for single_forward_manager in self._single_forward_managers:

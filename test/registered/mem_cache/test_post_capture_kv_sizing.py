@@ -12,6 +12,7 @@ This test launches a server with the feature enabled and asserts that:
 import os
 import re
 import unittest
+from types import SimpleNamespace
 
 import requests
 
@@ -23,7 +24,6 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    SimpleNamespace,
     popen_launch_server,
 )
 

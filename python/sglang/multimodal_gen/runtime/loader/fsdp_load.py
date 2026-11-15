@@ -495,7 +495,10 @@ def maybe_load_fsdp_model(
         # move to device to perform postprocessing
         _move_to_device_preserving_meta(model, weight_postprocess_device)
 
-    process_model_weights_after_loading(model)
+    process_model_weights_after_loading(
+        model,
+        None if use_fsdp else weight_load_plan.layerwise_postprocess_device,
+    )
     model.post_load_weights()
 
     finalize_loaded_model(model)

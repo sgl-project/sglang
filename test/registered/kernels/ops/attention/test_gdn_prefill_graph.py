@@ -5,7 +5,8 @@ One bucket is captured once, then replayed for batches of different shapes:
 several sequences, cached prefixes, padding past the batch, chunk-aligned and
 unaligned prefix-cache snapshots, and a batch without tracking. Each replay must
 match the eager path bit for bit on the output, the conv / SSM state pools and
-the track slots, for FP32 and BF16 SSM states.
+the track slots, for FP32 and BF16 SSM states. Building the eager metadata of a
+tracked batch must not sync the host.
 """
 
 import unittest
@@ -23,12 +24,14 @@ from sglang.srt.layers.attention.linear.gdn_prefill_graph import (
 )
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace
-from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.mem_cache.kv.router import KVLayerRouter
+from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 HEADS, V_HEADS, HEAD_DIM, CONV = 2, 4, 128, 4
 DIM = (2 * HEADS + V_HEADS) * HEAD_DIM
@@ -65,6 +68,7 @@ def _layer():
 def _backend(conv_pool, ssm_pool):
     """The production backend on test pools: slot of request i is i + 1."""
     backend = GDNAttnBackend.__new__(GDNAttnBackend)
+    backend.state_pool = None
     cache = SimpleNamespace(conv=[conv_pool], temporal=ssm_pool)
     backend.req_to_token_pool = SimpleNamespace(
         get_mamba_indices=lambda req_pool_indices: (req_pool_indices + 1).to(
@@ -73,7 +77,7 @@ def _backend(conv_pool, ssm_pool):
     )
     backend._state_ids = IdSpace(key=("state", None))
     pool = SimpleNamespace(layer_transfer_counter=None, start_layer=0)
-    pool.layer_router = KVLayerRouter.from_layer_maps(pool, ())
+    pool.layer_router = KVLayerRouter.from_layer_maps(pool, (), owner="full")
     pool.layer_router.bind_part(
         sub_pool="state",
         part=STATE_PART,
@@ -168,6 +172,17 @@ class TestGDNPrefillGraph(CustomTestCase):
                 meta=meta,
                 forward_batch=batch,
                 cache_indices=self.backend._prefill_graph_cache_indices(batch),
+            )
+        if batch.mamba_track_indices is None:
+            self.assertIsNone(self.backend.state_tracking_indices)
+        else:
+            torch.testing.assert_close(
+                self.backend.state_tracking_indices,
+                batch.mamba_track_indices.to(meta.track_dst.dtype),
+            )
+            self.assertEqual(
+                self.backend.state_tracking_indices.data_ptr(),
+                meta.track_dst.data_ptr(),
             )
 
     def _capture(self):
@@ -265,6 +280,29 @@ class TestGDNPrefillGraph(CustomTestCase):
                         track=track,
                         seed=100 + i,
                     )
+
+    def test_eager_metadata_with_tracking_does_not_sync(self):
+        """Prefill metadata is built while the previous forward still runs; a host
+        sync there holds the scheduler until that forward ends."""
+        self._setup(torch.float32)
+        override = get_context().override_server_args(_mamba_cache_chunk_size=CHUNK)
+        override.install()
+        self.addCleanup(override.restore)
+        extend_kernel = self.backend.kernel_dispatcher.extend_kernel
+        # Row 0 snapshots mid-chunk, row 1 on a chunk boundary, row 2 untracked.
+        lens, prefixes, track = [200, 70, 33], [0, 64, 0], {0: 130, 1: 64}
+        for uses_checkpoints in (False, True):
+            with self.subTest(uses_checkpoints=uses_checkpoints):
+                batch = _batch(lens, prefixes, track=track)
+                torch.cuda.synchronize()
+                with patch.object(
+                    extend_kernel, "uses_state_checkpoints", uses_checkpoints
+                ):
+                    torch.cuda.set_sync_debug_mode("error")
+                    try:
+                        self.backend.init_forward_metadata(batch)
+                    finally:
+                        torch.cuda.set_sync_debug_mode("default")
 
 
 if __name__ == "__main__":

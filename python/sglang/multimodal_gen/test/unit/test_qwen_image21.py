@@ -29,10 +29,8 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
 )
 from sglang.multimodal_gen.configs.sample.qwenimage import QwenImage2512SamplingParams
 from sglang.multimodal_gen.configs.sample.qwenimage21 import QwenImage21SamplingParams
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.registry import _get_config_info
 from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
     replay_token_scope,
@@ -407,6 +405,9 @@ def test_prompt_cache_skips_processor_and_weight_preparation(device):
             data={
                 "input_ids": torch.tensor([[1, len(text[0]), 99, 99, image_value, 0]]),
                 "attention_mask": torch.tensor([[1, 1, 1, 1, 1, 0]]),
+                "pixel_values": torch.tensor(
+                    list(kwargs["images"][0].getdata()), dtype=torch.float32
+                ),
             }
         )
 
@@ -506,9 +507,16 @@ def test_condition_slots_expand_to_actual_latent_grid():
 
 
 class _RecordingAttention(torch.nn.Module):
-    def forward(self, x, ropes, prefixes, layouts, caches, prefix_pad):
+    def forward(
+        self, x, ropes, prefixes, layouts, caches, prefix_pad, project_out=True
+    ):
         self.seen = caches
         return torch.zeros_like(x), [None] * len(caches)
+
+
+class _IdentityFeedForward(torch.nn.Module):
+    def forward(self, x, use_packed_bf16=False):
+        return x
 
 
 def _block_recording_caches(layer_id, dim=4):
@@ -519,7 +527,7 @@ def _block_recording_caches(layer_id, dim=4):
     block.img_norm1 = torch.nn.LayerNorm(dim, elementwise_affine=False)
     block.img_norm2 = torch.nn.LayerNorm(dim, elementwise_affine=False)
     block.attn = _RecordingAttention()
-    block.img_mlp = torch.nn.Identity()
+    block.img_mlp = _IdentityFeedForward()
     return block
 
 

@@ -15,7 +15,7 @@ from sglang import assistant, function, gen, system, user
 from sglang import image
 from sglang import RuntimeEndpoint
 from sglang.lang.api import set_default_backend
-from sglang.srt.utils import load_image
+from sglang.srt.multimodal.media_io import load_image
 from sglang.test.doc_patch import launch_server_cmd
 from sglang.utils import print_highlight, terminate_process, wait_for_server
 

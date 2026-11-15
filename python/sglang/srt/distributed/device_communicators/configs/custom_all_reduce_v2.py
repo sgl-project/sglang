@@ -31,18 +31,20 @@ class Range(NamedTuple):
 class Heuristic(NamedTuple):
     """Self-contained algo ranges for one dispatch context (graph or eager).
 
-    Five algos are tried in order of preference (fastest first):
+    Six algos are tried in order of preference (fastest first):
       1. ``1shot_push``:    nbytes <= ``one_shot_push_threshold``
-      2. ``2shot_push``:    nbytes <= ``two_shot_push_threshold``
-      3. ``1shot_pull``:    nbytes <= ``one_shot_pull_threshold``
-      4. ``2shot_pull`` mc: nbytes in ``mc.min_bytes..mc.max_bytes``
+      2. ``hier_2shot_push``: nbytes in ``hier_2shot_push.min_bytes..max_bytes``
+                            (only when the group is made of DPX pairs)
+      3. ``2shot_push``:    nbytes <= ``two_shot_push_threshold``
+      4. ``1shot_pull``:    nbytes <= ``one_shot_pull_threshold``
+      5. ``2shot_pull`` mc: nbytes in ``mc.min_bytes..mc.max_bytes``
                             (only when multicast is enabled at runtime)
-      5. ``2shot_pull``:    nbytes <= ``two_shot_pull_threshold``
+      6. ``2shot_pull``:    nbytes <= ``two_shot_pull_threshold``
     Above all of these, the caller falls back to NCCL.
 
     Setting two adjacent thresholds equal effectively disables the middle
-    algo; leaving ``mc`` / ``two_shot_push_threshold`` at the default
-    disables that algo.
+    algo; leaving ``mc`` / ``two_shot_push_threshold`` / ``hier_2shot_push``
+    at the default disables that algo.
 
     The field order below is the positional layout of the table rows
     (``1shot_push, 1shot_pull, 2shot_pull, mc``); ``two_shot_push_threshold``
@@ -54,6 +56,7 @@ class Heuristic(NamedTuple):
     two_shot_pull_threshold: int
     mc: Range = Range(0, 0)  # default: multicast disabled in this context
     two_shot_push_threshold: int = 0  # default: 2shot_push disabled
+    hier_2shot_push: Range = Range(0, 0)  # default: hier_2shot_push disabled
 
     def max_push_bytes(self, world_size: int) -> int:
         """Per-slot push plane bytes this heuristic needs."""
@@ -84,6 +87,8 @@ class Heuristic(NamedTuple):
                 self.two_shot_push_threshold,
                 two_shot_push_max_bytes(max_push_bytes, world_size),
             ),
+            # sized by its own range, outside the push slots
+            hier_2shot_push=self.hier_2shot_push,
         )
 
 
@@ -104,7 +109,7 @@ class AllReduceConfig(NamedTuple):
     The two ``Heuristic`` entries describe the size crossover for each
     dispatch context (CUDA-graph capture vs eager). Block-count knobs apply
     to the kernel grid:
-      - ``num_push_blocks``: 1shot_push grid (bound to the counter array)
+      - ``num_push_blocks``: 1shot / 2shot push grid
       - ``num_pull_blocks``: 1shot_pull (any mode) and non-mc 2shot_pull
       - ``num_mc_blocks``  : mc 2shot_pull; ``None`` disables multicast
     """
@@ -321,10 +326,67 @@ def _sm90_configs(num_sm: int) -> dict[int, AllReduceConfig]:
     }
 
 
+# ROCm (MI350X / gfx950). Block counts tuned at TP2/4/6/8; the thresholds are
+# still the conservative default.
+@cache
+def _rocm_configs(num_sm: int) -> dict[int, AllReduceConfig]:
+    default = AllReduceConfig(
+        graph=Heuristic(1 * MB, 1 * MB, 16 * MB),
+        eager=Heuristic(1 * MB, 1 * MB, 16 * MB),
+        num_push_blocks=num_sm,
+        # each pull block runs its own cross-GPU barrier: 32 blocks are 40-65%
+        # faster than one per CU at TP8 from 1 MB, and within a few % of the
+        # best grid at TP2/4/6
+        num_pull_blocks=32,
+        num_mc_blocks=None,
+    )
+    return {world_size: default for world_size in range(2, 9)}
+
+
+# ROCm (MI450 / gfx1250, 96 CUs). Tuned at TP8, also with one rank arriving late
+# and a GEMM before each all-reduce (the serving decode pattern). A grid of one
+# block per CU loses the most under skew; 2shot_push beats 1shot_push from
+# 128 KB and the pull algos at every size; above 8 MB RCCL is faster than a
+# 64-block 2shot_push.
+@cache
+def _rocm_gfx1250_configs(num_sm: int) -> dict[int, AllReduceConfig]:
+    heuristic = Heuristic(64 * KB, 0, 0, two_shot_push_threshold=8 * MB)
+    default = AllReduceConfig(
+        graph=heuristic,
+        eager=heuristic,
+        num_push_blocks=min(num_sm, 64),
+        num_pull_blocks=32,
+        num_mc_blocks=None,
+    )
+    configs = {world_size: default for world_size in range(2, 9)}
+    # 16 ranks span two DPX hosts in one UALink fabric clique. Tuned there with
+    # and without a late rank: across hosts 2shot_push pays two fabric hops, so
+    # 1shot_push wins to 256 KB, and a block per CU keeps 2shot_push ahead of
+    # RCCL to 64 MB. When every SoC's two DPX partitions are in the group,
+    # hier_2shot_push reduces each pair first, so only half the tensor crosses
+    # the fabric: above 256 KB it beats 2shot_push by 17-31% back to back and
+    # 9-14% with a late rank, so it takes over to 64 MB.
+    tp16 = heuristic._replace(
+        one_shot_push_threshold=256 * KB,
+        two_shot_push_threshold=64 * MB,
+        hier_2shot_push=Range(256 * KB, 64 * MB),
+    )
+    configs[16] = default._replace(
+        graph=tp16, eager=tp16, num_push_blocks=min(num_sm, 96)
+    )
+    return configs
+
+
 @cache
 def _get_all_reduce_configs() -> dict[int, AllReduceConfig]:
+    props = torch.cuda.get_device_properties()
+    num_sm = props.multi_processor_count
+    if torch.version.hip:
+        # ROCm reports gfx9xx as capability 9.x: never fall into the SM90 table
+        if props.gcnArchName.startswith("gfx1250"):
+            return _rocm_gfx1250_configs(num_sm)
+        return _rocm_configs(num_sm)
     cuda_major, cuda_minor = torch.cuda.get_device_capability()
-    num_sm = torch.cuda.get_device_properties().multi_processor_count
     if cuda_major == 9:
         return _sm90_configs(num_sm)
     if cuda_major == 10:

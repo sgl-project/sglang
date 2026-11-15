@@ -249,6 +249,35 @@ pub struct RequestLogContext {
     pub outcome: RequestOutcome,
     /// Router-minted engine ID, logged beside the caller's correlation ID.
     pub engine_rid: Option<String>,
+    /// Media items the request carried, so the line says it was multimodal.
+    pub media: MediaCounts,
+}
+
+/// Media items of a request, counted per modality at the edge; the router
+/// never keeps the media itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MediaCounts {
+    pub images: u32,
+    pub videos: u32,
+    pub audios: u32,
+}
+
+impl MediaCounts {
+    /// Counts one OpenAI chat content part by its `type`; text parts count nothing.
+    pub fn add_part(&mut self, part_type: &str) {
+        match part_type {
+            "image_url" => self.images = self.images.saturating_add(1),
+            "video_url" => self.videos = self.videos.saturating_add(1),
+            "audio_url" | "input_audio" => self.audios = self.audios.saturating_add(1),
+            _ => {}
+        }
+    }
+
+    pub fn add(&mut self, other: MediaCounts) {
+        self.images = self.images.saturating_add(other.images);
+        self.videos = self.videos.saturating_add(other.videos);
+        self.audios = self.audios.saturating_add(other.audios);
+    }
 }
 
 /// Final outcome of a 2xx SSE stream.

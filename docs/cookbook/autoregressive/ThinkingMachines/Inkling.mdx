@@ -1,7 +1,6 @@
 ---
 title: Inkling
 description: "Deploy Inkling with SGLang — verified launch commands, tuning, and multimodal / reasoning / tool-calling usage for Thinking Machines' 975B Mixture-of-Experts model with 1M-token context."
-tag: NEW
 ---
 
 ## Deployment
