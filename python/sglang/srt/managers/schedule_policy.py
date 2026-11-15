@@ -1706,6 +1706,10 @@ class PrefillAdder:
         """whether running work must finish before another admission attempt"""
         return bool(self.can_run_list) or not self.running_batch.is_empty()
 
+    def admission_capacity(self) -> Optional[tuple[int, ...]]:
+        """the capacity a refused candidate waits on to grow"""
+        return self.memory_budget.admission_capacity()
+
     @capacity_decision
     def add_one_req(
         self, req: Req, has_chunked_req: bool, truncation_align_size: Optional[int]

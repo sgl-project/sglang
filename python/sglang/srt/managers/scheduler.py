@@ -4777,9 +4777,8 @@ class Scheduler(
                     running_batch.batch_is_full = adder.batch_is_full_after_rejection(
                         req
                     )
-                    running_batch.capacity_at_refusal = (
-                        adder.memory_budget.admission_capacity()
-                    )
+                    if self.is_hybrid_swa:
+                        running_batch.capacity_at_refusal = adder.admission_capacity()
                 # revert matched mamba idx to avoid memory leak, if req is not added.
                 # Only free if the slot was freshly allocated in this batch (not
                 # pre-existing from a session). Session-held slots have their own
