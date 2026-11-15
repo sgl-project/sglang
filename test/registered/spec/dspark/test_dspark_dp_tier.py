@@ -98,6 +98,7 @@ class TestDraftDpSyncMetadata(CustomTestCase):
         )
         proposer.draft_model_runner = SimpleNamespace(device="cpu")
         proposer._num_token_non_padded = torch.empty((1,), dtype=torch.int32)
+        proposer._num_token_non_padded_value = None
 
         forward_batch = SimpleNamespace(input_ids=torch.arange(6))
         batch = SimpleNamespace(
