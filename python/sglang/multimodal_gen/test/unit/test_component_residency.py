@@ -204,6 +204,7 @@ def test_mapped_component_reuses_snapshot_mutation_and_sleep_boundaries(
     strategy.prefetch_for_use(module, use, state)
     strategy.wait_for_use(module, use, state)
     pipeline = SimpleNamespace(modules={"transformer": module})
+    pipeline._lora_module = LoRAPipeline._lora_module.__get__(pipeline)
     controller = MemoryOccupationController(pipeline, rank=0, use_fsdp_inference=False)
     controller._move_modules(["transformer"], "cpu")
     assert module.weight.data_ptr() == pointer
