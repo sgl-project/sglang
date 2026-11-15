@@ -1310,10 +1310,10 @@ Two-level caching for optimal performance:
 </table>
 
 ```bash Command
---enable-l0-cache \
---l0-max-entries 10000 \
---enable-l1-cache \
---l1-max-memory 52428800  # 50MB
+--tokenizer-cache-enable-l0 \
+--tokenizer-cache-l0-max-entries 10000 \
+--tokenizer-cache-enable-l1 \
+--tokenizer-cache-l1-max-memory 52428800  # 50MB
 ```
 
 ***

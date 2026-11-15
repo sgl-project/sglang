@@ -1,16 +1,16 @@
 from __future__ import annotations
 
-import os
 from typing import TYPE_CHECKING
 
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import per_tensor_quant_mla_fp8
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
-    get_token_to_kv_pool,
+    get_kv_layers,
 )
 from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
@@ -35,6 +35,7 @@ class DeepseekMLAFusedRopeRocmForwardMixin:
         self.rocm_fused_decode_mla = get_bool_env_var(
             "SGLANG_ROCM_FUSED_DECODE_MLA", "false"
         )
+        self.rocm_fused_mla_rope_fusion = envs.SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION.get()
 
     def forward_absorb_fused_mla_rope_prepare(
         self: DeepseekV2AttentionMLA,
@@ -43,9 +44,7 @@ class DeepseekMLAFusedRopeRocmForwardMixin:
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
     ):
-        enable_rope_fusion = (
-            os.getenv("SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION", "1") == "1"
-        )
+        enable_rope_fusion = self.rocm_fused_mla_rope_fusion
         # NOTE: hidden_states can be a tuple for some quantization paths.
         # For shape/device/dtype, use the first tensor; still pass the original
         # hidden_states through linear ops which may accept tuple inputs.
@@ -130,10 +129,10 @@ class DeepseekMLAFusedRopeRocmForwardMixin:
             )
 
         # save current latent cache.
-        get_token_to_kv_pool().set_kv_buffer(
+        get_kv_layers().layer(self.attn_mqa.layer_id).store(
             self.attn_mqa, KVWriteLoc.for_batch(forward_batch), k_input, None
         )
-        key_cache_buf = get_token_to_kv_pool().get_key_buffer(self.attn_mqa.layer_id)
+        key_cache_buf = get_kv_layers().read(self.attn_mqa.layer_id).key()
         val_cache_buf = key_cache_buf[..., : self.kv_lora_rank]
 
         return (
@@ -197,7 +196,7 @@ class DeepseekMLAFusedRopeRocmForwardMixin:
 
         if enable_rope_fusion:
             k_input[..., self.kv_lora_rank :] = k_pe_output
-            get_token_to_kv_pool().set_kv_buffer(
+            get_kv_layers().layer(self.attn_mqa.layer_id).store(
                 self.attn_mqa, KVWriteLoc.for_batch(forward_batch), k_input, None
             )
 

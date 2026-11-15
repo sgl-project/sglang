@@ -8,7 +8,7 @@ rounding the standalone pair produces, so both outputs are bitwise identical to
 ``rmsnorm`` followed by ``mxfp8_quantize(..., is_sf_swizzled_layout=True)``.
 
 The scale factors use FlashInfer's 128x4 swizzle:
-``off = (g // 4) * 512 + ((r % 32) * 4 + ((r // 32) % 4)) * 4 + (g % 4)``
+``off = (r // 128) * ceil(G / 4) * 512 + (g // 4) * 512 + ((r % 32) * 4 + ((r // 32) % 4)) * 4 + (g % 4)``
 over a row count padded to a multiple of 128, with the UE8M0 conversion
 (positive rounding, subnormals included) that ``mxfp8_quantize`` uses.
 """
@@ -48,5 +48,6 @@ def mxfp8_epilogue(
     sf, scale = ue8m0_scale(amax)
     q = tl.minimum(tl.maximum(v * scale[:, None], -448.0), 448.0).to(tl.float8e4nv)
     tl.store(Q + row * K + idx, q, gmask[:, None])
-    off = (g // 4) * 512 + ((row % 32) * 4 + ((row // 32) % 4)) * 4 + (g % 4)
+    tile = (row // 128) * (((GROUPS + 3) // 4) * 512)
+    off = tile + (g // 4) * 512 + ((row % 32) * 4 + ((row // 32) % 4)) * 4 + (g % 4)
     tl.store(S + off, sf.to(tl.uint8), gmask)

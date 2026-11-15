@@ -10,15 +10,17 @@ from typing import Any
 from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
     resolve_cp_tp_group_sharing,
 )
+from sglang.srt.arg_groups.model_override_base import (
+    model_config_of,
+    resolved_view,
+    resolving_view,
+)
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
     _dcp_comm_backend_default,
     _dp_lm_head_validation,
     _tp_lm_head_all_to_all_default,
     declare_resolution,
-    model_config_of,
-    resolved_view,
-    resolving_view,
     run_post_process_pass,
     should_report_expert_balancedness,
 )
@@ -71,6 +73,7 @@ def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> 
     )
     kimi_k3 = architecture in (
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
     )
     if nemotron and cfg.attn_cp_size > 1:
@@ -191,13 +194,20 @@ def handle_context_parallelism(server_args: Any):
             "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
         )
 
-    from sglang.srt.layers.cp.base import init_cp_strategy
+    from sglang.srt.layers.cp.base import init_cp_strategy, is_cp_sharded_padded
 
     init_cp_strategy(
         enable_prefill_cp=bool(cfg.enable_prefill_cp),
         cp_size=cfg.attn_cp_size,
         cp_strategy=cfg.cp_strategy,
+        cp_kv_layout=cfg.cp_kv_layout,
     )
+    if cfg.enable_unified_memory and is_cp_sharded_padded():
+        raise ValueError(
+            f"--cp-kv-layout {cfg.cp_kv_layout} keeps each rank's KV sharded "
+            "and padded, which --enable-unified-memory does not support; "
+            "drop one of them."
+        )
 
 
 def handle_shared_experts_tp(server_args: Any):
@@ -212,17 +222,24 @@ def handle_shared_experts_tp(server_args: Any):
         attn_cp_size=view.attn_cp_size,
         attn_dp_size=cfg.attn_dp_size,
     )
-    if size < 1 or attn_tp_size % size != 0:
+    # Shared experts can gather token rows across CP as well as attention TP,
+    # then reduce-scatter to the original shards. A subgroup must still fit
+    # inside one attention-DP replica / PP stage.
+    replica_size = attn_tp_size * view.attn_cp_size
+    if size < 1 or replica_size % size != 0:
         raise ValueError(
             f"--shared-experts-tp-size ({size}) must be a positive divisor "
-            f"of attention TP size ({attn_tp_size})."
+            f"of attention replica size ({replica_size}, attention TP x CP)."
         )
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         raise ValueError(
             "--shared-experts-tp-size requires a Kimi-K3 model configuration."
         )
     model_arch = model_config_of(server_args).hf_config.architectures[0]
-    if model_arch != "KimiK3ForConditionalGeneration":
+    if model_arch not in (
+        "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
+    ):
         raise ValueError("--shared-experts-tp-size is only supported for Kimi-K3.")
     if cfg.moe_a2a_backend not in (
         "deepep",
@@ -366,26 +383,37 @@ def handle_data_parallelism(server_args: Any):
 
     run_post_process_pass(server_args, _tp_lm_head_all_to_all_default)
     run_post_process_pass(server_args, _dp_lm_head_validation)
-    if resolving_view(server_args).enable_tp_lm_head_all_to_all:
+    if _graph_may_capture_collectives(server_args):
         _disable_nccl_graph_buffer_registration(
-            "the graph-captured TP LM-head all-to-all can deadlock with "
+            "graph replay of captured cross-rank collectives can hang with "
             "registered buffers"
         )
-    if _graph_pool_is_pausable(server_args):
-        _disable_nccl_graph_buffer_registration(
-            "graph replay can hang once torch_memory_saver resume remaps the "
-            "graph pool, leaving the capture-time registrations on released pages"
-        )
 
 
-def _graph_pool_is_pausable(server_args: Any) -> bool:
-    """Whether CUDA graphs are captured into torch_memory_saver memory, which
-    release/resume of the `cuda_graph` tag remaps to new physical pages at the
-    same virtual addresses."""
-    return bool(
-        resolving_view(server_args).enable_memory_saver
-        and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
-    )
+def _graph_may_capture_collectives(server_args: Any) -> bool:
+    """Whether any captured CUDA graph can hold a cross-rank collective.
+
+    Conservative workaround, root cause still open: multi-node TP16 decode
+    replay hangs with NCCL_GRAPH_REGISTER on even with the TP LM-head
+    all-to-all and the pausable graph pool both off, and stops hanging once
+    the registration is off. Graph-pool address reuse is the suspected
+    trigger, not a confirmed mechanism, so the guard keys on any multi-rank
+    capture rather than on the feature flags that first exposed it. Checking
+    every phase also keeps the prefill-into-pausable-pool case the old pool
+    guard covered.
+
+    Errs toward True. Later passes can still narrow cuda_graph_config. On the
+    reproducing deployment, a single 10-minute run showed no throughput
+    difference with the registration off; other deployment shapes are
+    unmeasured.
+    """
+    view = resolving_view(server_args)
+    if max(view.tp_size, view.ep_size, view.dp_size) <= 1:
+        return False
+    config = view.cuda_graph_config
+    if config is None:
+        return True
+    return any(config[phase].backend != Backend.DISABLED for phase in Phase.ALL)
 
 
 def _disable_nccl_graph_buffer_registration(reason: str) -> None:
@@ -705,9 +733,6 @@ def handle_elastic_ep(server_args: Any):
             assert not cfg.forward_hooks, (
                 "Elastic EP CUDA graph recapture does not support forward hooks."
             )
-            assert not cfg.enable_pdmux, (
-                "Elastic EP CUDA graph recapture does not support PDMux."
-            )
         assert attn_dp_enabled_of(resolved), (
             "Elastic EP scale-up requires attention DP (--attn-dp-size); "
             "without it the TP group is not equivalent to WORLD and the "
@@ -746,6 +771,16 @@ def handle_eplb_and_dispatch(server_args: Any):
         )
         logger.warning(
             "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
+        )
+
+    if cfg.enable_eplb and cfg.expert_distribution_recorder_mode in (
+        "per_pass",
+        "per_token",
+    ):
+        raise ValueError(
+            "--enable-eplb needs --expert-distribution-recorder-mode stat or "
+            "stat_approx; the detailed recorder modes (per_pass/per_token) only "
+            f"support file dumps (got {cfg.expert_distribution_recorder_mode})."
         )
 
     # Without an a2a backend all EP ranks run the MoE over the same tokens and

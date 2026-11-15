@@ -21,14 +21,16 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     SidecarPoolSpec,
 )
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components.base import ComponentType
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 SIDECAR = PoolName.DEEPSEEK_V4_C4_INDEXER_STATE
 
@@ -39,11 +41,11 @@ def _pipeline(*, tail_only: bool, window: int = 2, swa_page_size: int = 2):
     cache.enable_storage = True
     cache.cache_controller.mem_pool_host.entry_map = {
         pool: SimpleNamespace(host_pool=SimpleNamespace(page_size=swa_page_size))
-        for pool in (PoolName.SWA, PoolName.AUXILIARY_SWA)
+        for pool in (PoolName.SWA, "window_16")
     }
-    cache.token_to_kv_pool_allocator.get_kvcache.return_value = SimpleNamespace(
-        size=128
-    )
+    kv_cache = SimpleNamespace(size=128, start_layer=0, layer_num=1)
+    kv_cache.layer_router = PlainPoolRouter(kv_cache, IdSpaceKind.FULL)
+    cache.token_to_kv_pool_allocator.get_kvcache.return_value = kv_cache
     cache.sidecar_pool_specs = [
         SidecarPoolSpec(
             pool_name=SIDECAR,
@@ -58,8 +60,8 @@ def _pipeline(*, tail_only: bool, window: int = 2, swa_page_size: int = 2):
             swa_component=SimpleNamespace(
                 pool_name=PoolName.SWA, full_window_pages=window
             ),
-            auxiliary_swa_component=SimpleNamespace(
-                pool_name=PoolName.AUXILIARY_SWA, full_window_pages=window + 1
+            further_window_components=(
+                SimpleNamespace(pool_name="window_16", full_window_pages=window + 1),
             ),
             write_backlog_cap=128,
         )
@@ -112,7 +114,7 @@ class TestSWATailOnlyBackup(unittest.TestCase):
         return intents[pool], swa, sidecar
 
     def test_admission_and_launch_keep_the_node_tail(self):
-        for pool, window in ((PoolName.SWA, 2), (PoolName.AUXILIARY_SWA, 3)):
+        for pool, window in ((PoolName.SWA, 2), ("window_16", 3)):
             with self.subTest(pool=pool):
                 pipeline, cache = _pipeline(tail_only=True)
                 hashes = [f"page-{i}" for i in range(6)]

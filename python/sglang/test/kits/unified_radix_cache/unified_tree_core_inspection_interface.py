@@ -27,8 +27,6 @@ if TYPE_CHECKING:
 class UnifiedTreeCoreInspectionInterface(UnifiedTreeCoreInterface):
     """Test-only inspection and control contract for shared backend tests."""
 
-    # ==== Read-only inspection ====
-
     @abstractmethod
     def contains_node(self, node_id: NodeId) -> bool: ...
 
@@ -125,8 +123,6 @@ class UnifiedTreeCoreInspectionInterface(UnifiedTreeCoreInterface):
         """Protected token count for one component (0 if the component is absent)."""
         ...
 
-    # ==== White-box state controls ====
-
     @abstractmethod
     def set_node_hash_values(
         self, node_id: NodeId, hash_values: Optional[list[str]]
@@ -193,8 +189,6 @@ class UnifiedTreeCoreInspectionInterface(UnifiedTreeCoreInterface):
     def update_duplicate_tracking(self, node_id: NodeId) -> None:
         """Refresh duplicate-host tracking for the node."""
         ...
-
-    # ==== Targeted white-box operations ====
 
     @abstractmethod
     def advance_insert_walk_once(self) -> None:

@@ -7,6 +7,11 @@ import logging
 import os
 from typing import Any
 
+from sglang.srt.arg_groups.model_override_base import (
+    model_config_of,
+    resolved_view,
+    resolving_view,
+)
 from sglang.srt.arg_groups.overrides import (
     _a2a_backend_overrides,
     _a2a_ep_size,
@@ -17,9 +22,6 @@ from sglang.srt.arg_groups.overrides import (
     flashinfer_a2a_max_dispatch_tokens_per_rank,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
-    model_config_of,
-    resolved_view,
-    resolving_view,
     run_post_process_pass,
 )
 from sglang.srt.configs.moe_model_registry import (
@@ -28,14 +30,11 @@ from sglang.srt.configs.moe_model_registry import (
 )
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
+from sglang.srt.layers.moe.utils import AscendOpsConfig
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
-from sglang.srt.utils.common import (
-    get_bool_env_var,
-    is_gfx1250_supported,
-    is_sm100_supported,
-    parse_connector_type,
-)
+from sglang.srt.utils.common import get_bool_env_var, parse_connector_type
+from sglang.srt.utils.device import is_gfx1250_supported, is_sm100_supported
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +73,20 @@ def handle_moe_kernel_config(server_args: Any):
 
     cfg = resolving_view(server_args)
 
+    if cfg.paged_experts_enable_disk and not cfg.enable_paged_experts:
+        raise ValueError(
+            "The argument paged-experts-enable-disk requires --enable-paged-experts."
+        )
+    if cfg.paged_experts_host_memory_gb is not None:
+        if not cfg.enable_paged_experts:
+            raise ValueError(
+                "The argument paged-experts-host-memory-gb requires --enable-paged-experts."
+            )
+        if not 0 < cfg.paged_experts_host_memory_gb < float("inf"):
+            raise ValueError(
+                "--paged-experts-host-memory-gb must be a finite number greater than 0."
+            )
+
     run_post_process_pass(server_args, _moe_runner_backend_quant_constraints)
 
     view = resolved_view(server_args)
@@ -106,9 +119,10 @@ def handle_moe_kernel_config(server_args: Any):
         assert view.moe_a2a_backend in [
             "none",
             "deepep",
-            "flashinfer",
+            "flashinfer_nvlink_one_sided",
         ], (
-            f"flashinfer_cutedsl supports moe_a2a_backend='none', 'deepep', or 'flashinfer', "
+            "flashinfer_cutedsl supports moe_a2a_backend='none', 'deepep', or "
+            "'flashinfer_nvlink_one_sided', "
             f"got '{view.moe_a2a_backend}'."
         )
         if view.moe_a2a_backend == "deepep" and (
@@ -117,7 +131,7 @@ def handle_moe_kernel_config(server_args: Any):
         ):
             raise ValueError(
                 "flashinfer_cutedsl per-token NVFP4 activation requires "
-                "moe_a2a_backend='none' or 'flashinfer'."
+                "moe_a2a_backend='none' or 'flashinfer_nvlink_one_sided'."
             )
 
     if view.moe_runner_backend in ["flashinfer_trtllm", "experimental_sgl_trtllm"]:
@@ -141,9 +155,10 @@ def handle_moe_kernel_config(server_args: Any):
             "modelopt_fp4",
             "modelopt_mixed",
             "nvfp4_online",
+            "minimax_m3_nvfp4",
             None,
         ], (
-            f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'modelopt_mixed', 'nvfp4_online', or bfloat16 (None)."
+            f"Invalid quantization '{view.quantization}'. \nFlashInfer TRTLLM routed MOE supports only: 'fp8', 'mxfp8', 'modelopt_fp4', 'modelopt_mixed', 'nvfp4_online', 'minimax_m3_nvfp4', or bfloat16 (None)."
         )
 
     # The runner-driven shared-experts fusion disables moved to the
@@ -231,12 +246,28 @@ def validate_flashinfer_megamoe_envs() -> None:
             f"{combine_dtype!r} is incompatible with "
             "SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE=1."
         )
+    decode_tokens = envs.SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK.get()
+    if decode_tokens < 0:
+        raise ValueError(
+            "SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK="
+            f"{decode_tokens} must be 0 (off) or positive."
+        )
+    # 0 derives the main capacity from resolved limits; the first MegaMoE layer
+    # build checks the decode capacity against that derived value.
+    max_tokens = envs.SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK.get()
+    if 0 < max_tokens <= decode_tokens:
+        raise ValueError(
+            "SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK="
+            f"{decode_tokens} must be below "
+            f"SGLANG_FLASHINFER_MEGAMOE_MAX_TOKENS_PER_RANK={max_tokens}."
+        )
 
 
 def validate_flashinfer_megamoe_model(server_args: Any) -> None:
     model_config = model_config_of(server_args)
     architectures = model_config.hf_config.architectures or []
     validated_architectures = (
+        "BeamForCausalLM",
         "DeepseekV2ForCausalLM",
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
@@ -277,6 +308,66 @@ def validate_flashinfer_megamoe_model(server_args: Any) -> None:
             f"quantization={quantization!r}. Standard FP8 MoE checkpoints "
             "are not supported."
         )
+    # These are the configs whose MoE layers build ModelOptNvFp4FusedMoEMethod
+    # or its nvfp4_online subclass, the only path with a decode workspace.
+    uses_modelopt_nvfp4_moe = (
+        quantization in ("modelopt_fp4", "nvfp4_online")
+        or model_config.nvfp4_moe_meta is not None
+    )
+    if (
+        envs.SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK.get() > 0
+        and not uses_modelopt_nvfp4_moe
+    ):
+        logger.warning(
+            "SGLANG_FLASHINFER_MEGAMOE_DECODE_MAX_TOKENS_PER_RANK is ignored: "
+            "FlashInfer MegaMOE builds the decode workspace only for ModelOpt "
+            "NVFP4 MoE layers, got quantization=%r.",
+            quantization,
+        )
+
+
+def validate_ascend_ops_config(view: Any) -> dict:
+    """Validate and report the configuration for the Ascend Ops backend."""
+    a2a_backend = view.moe_a2a_backend
+    draft_a2a_backend = view.speculative_moe_a2a_backend
+    main_uses_ascend_ops = a2a_backend == "ascend_ops"
+    draft_uses_ascend_ops = draft_a2a_backend == "ascend_ops"
+    ascend_ops_selected = main_uses_ascend_ops or draft_uses_ascend_ops
+    moe_ascend_ops_config = view.moe_ascend_ops_config
+
+    if moe_ascend_ops_config is not None and not ascend_ops_selected:
+        raise ValueError(
+            "--moe-ascend-ops-config requires the main or speculative MoE backend "
+            f"to be ascend_ops; got main={a2a_backend!r}, "
+            f"draft={draft_a2a_backend!r}."
+        )
+    if not ascend_ops_selected:
+        return {}
+
+    if not get_platform().is_npu:
+        raise ValueError(
+            "--moe-a2a-backend ascend_ops is only supported on NPU "
+            "for both the main and speculative draft model."
+        )
+    try:
+        parsed_moe_ascend_ops_config = AscendOpsConfig.from_json_str(
+            moe_ascend_ops_config
+        )
+    except ValueError as exc:
+        raise ValueError(
+            f"Invalid --moe-ascend-ops-config for ascend_ops MoE backend: {exc}"
+        ) from exc
+    logger.info(
+        "ascend_ops MoE backend enabled for main=%s, draft=%s with "
+        "prefill=%s, decode=%s, low_latency comm_alg dispatch=%r combine=%r.",
+        main_uses_ascend_ops,
+        draft_uses_ascend_ops,
+        parsed_moe_ascend_ops_config.prefill,
+        parsed_moe_ascend_ops_config.decode,
+        parsed_moe_ascend_ops_config.ll_dispatch_alg,
+        parsed_moe_ascend_ops_config.ll_combine_alg,
+    )
+    return {}
 
 
 def handle_a2a_moe(server_args: Any):
@@ -287,6 +378,14 @@ def handle_a2a_moe(server_args: Any):
 
     cfg = resolving_view(server_args)
 
+    # Check the requested backend before Waterfill's backend override. Waterfill
+    # currently supports DeepEP/MegaMOE only; otherwise the override below would
+    # hide an explicitly incompatible ascend_ops selection.
+    if cfg.enable_waterfill and cfg.moe_a2a_backend == "ascend_ops":
+        raise ValueError(
+            "--enable-waterfill is incompatible with --moe-a2a-backend ascend_ops."
+        )
+
     run_post_process_pass(server_args, _a2a_backend_overrides)
     run_post_process_pass(server_args, _a2a_ep_size)
 
@@ -294,6 +393,7 @@ def handle_a2a_moe(server_args: Any):
     # pipeline (arg_groups/overrides.py: _a2a_fusion_adjustments),
     # invoked here at the legacy write slots.
     run_post_process_pass(server_args, _a2a_fusion_adjustments)
+    run_post_process_pass(server_args, validate_ascend_ops_config)
 
     a2a_backend = resolved_view(server_args).moe_a2a_backend
     if cfg.enable_waterfill:
@@ -302,12 +402,12 @@ def handle_a2a_moe(server_args: Any):
         )
         logger.info(f"Waterfill is enabled with moe_a2a_backend='{a2a_backend}'.")
 
-    if a2a_backend != "flashinfer" and cfg.flashinfer_a2a_dispatch_type not in (
-        None,
-        "auto",
+    if a2a_backend != "flashinfer_nvlink_one_sided" and (
+        cfg.flashinfer_a2a_dispatch_type not in (None, "auto")
     ):
         raise ValueError(
-            "--flashinfer-a2a-dispatch-type requires --moe-a2a-backend flashinfer."
+            "--flashinfer-a2a-dispatch-type requires "
+            "--moe-a2a-backend flashinfer_nvlink_one_sided."
         )
 
     if a2a_backend == "flashinfer_megamoe":
@@ -458,15 +558,8 @@ def handle_a2a_moe(server_args: Any):
     # The resolving view, not the field: `_a2a_backend_overrides` may have
     # moved this already (waterfill forces `deepep`).
     a2a_now = resolved_view(server_args).moe_a2a_backend
-    if (a2a_now == "none" and get_platform().is_npu) or a2a_now == "ascend_tp":
-        # FIXME (OrangeRedeng): for some reasons if pass "ascend_tp" accuracy drops to zero
-        declare_resolution(
-            server_args,
-            "_handle_a2a_moe",
-            moe_a2a_backend="none",
-        )
 
-    if a2a_now == "flashinfer":
+    if a2a_now == "flashinfer_nvlink_one_sided":
         view = resolved_view(server_args)
         architectures = model_config_of(server_args).hf_config.architectures
         architecture = architectures[0] if architectures else None
@@ -636,6 +729,23 @@ def validate_deepep_v2_speculative_draft(server_args: Any) -> None:
         )
 
 
+def resolve_ascend_ops_speculative_draft(view: Any) -> dict:
+    """Keep the Ascend Ops target and speculative backends consistent."""
+    if view.moe_a2a_backend == "ascend_ops":
+        if view.speculative_moe_a2a_backend != "ascend_ops":
+            logger.info(
+                "The main MoE backend is ascend_ops; setting the speculative "
+                "draft MoE backend to ascend_ops."
+            )
+        return {"speculative_moe_a2a_backend": "ascend_ops"}
+
+    assert view.speculative_moe_a2a_backend != "ascend_ops", (
+        "The speculative draft MoE backend cannot be ascend_ops when the main "
+        f"MoE backend is {view.moe_a2a_backend!r}."
+    )
+    return {}
+
+
 def required_deepep_v2_prefill_tokens_per_rank(server_args: Any) -> int:
     """Largest prefill dispatch on one rank, after topology and model sharding."""
     view = resolved_view(server_args)
@@ -748,7 +858,7 @@ def validate_flashinfer_a2a_token_budget(server_args: Any) -> None:
     """Fail fast if the per-rank FlashInfer A2A workspace cannot hold the
     largest forward; at runtime the dispatcher asserts on the first such batch."""
     view = resolved_view(server_args)
-    if view.moe_a2a_backend != "flashinfer":
+    if view.moe_a2a_backend != "flashinfer_nvlink_one_sided":
         return
     if view.disaggregation_mode != "decode" and view.chunked_prefill_size <= 0:
         raise ValueError(

@@ -1,0 +1,14 @@
+{"forward_mode": 1, "request_infos": [{"extend_input_len": 1, "prefix_indices_len": 255}], "iter_latency": 0.002675119787454605}
+{"forward_mode": 1, "request_infos": [{"extend_input_len": 8, "prefix_indices_len": 256}], "iter_latency": 0.0030074845999479294}
+{"forward_mode": 1, "request_infos": [{"extend_input_len": 128, "prefix_indices_len": 0}], "iter_latency": 0.0027154013514518738}
+{"forward_mode": 1, "request_infos": [{"extend_input_len": 128, "prefix_indices_len": 128}], "iter_latency": 0.0027412977069616318}
+{"forward_mode": 1, "request_infos": [{"extend_input_len": 16, "prefix_indices_len": 256}], "iter_latency": 0.002909639850258827}
+{"forward_mode": 1, "request_infos": [{"extend_input_len": 8, "prefix_indices_len": 272}], "iter_latency": 0.002743590623140335}
+{"forward_mode": 1, "request_infos": [{"extend_input_len": 128, "prefix_indices_len": 0}], "iter_latency": 0.002713024616241455}
+{"forward_mode": 1, "request_infos": [{"extend_input_len": 128, "prefix_indices_len": 128}], "iter_latency": 0.0027074161916971207}
+{"forward_mode": 1, "request_infos": [{"extend_input_len": 32, "prefix_indices_len": 256}], "iter_latency": 0.0030285529792308807}
+{"forward_mode": 1, "request_infos": [{"extend_input_len": 8, "prefix_indices_len": 288}], "iter_latency": 0.0027687866240739822}
+{"forward_mode": 1, "request_infos": [{"extend_input_len": 128, "prefix_indices_len": 0}], "iter_latency": 0.002656087279319763}
+{"forward_mode": 1, "request_infos": [{"extend_input_len": 64, "prefix_indices_len": 128}, {"extend_input_len": 64, "prefix_indices_len": 0}], "iter_latency": 1.545724280178547}
+{"forward_mode": 1, "request_infos": [{"extend_input_len": 128, "prefix_indices_len": 64}], "iter_latency": 0.0031625479459762573}
+{"forward_mode": 1, "request_infos": [{"extend_input_len": 8, "prefix_indices_len": 192}], "iter_latency": 0.0028553567826747894}
