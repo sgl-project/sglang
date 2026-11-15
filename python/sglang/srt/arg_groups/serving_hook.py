@@ -100,13 +100,16 @@ def handle_ssl_validation(server_args: Any):
                 "1024 and 2147483647."
             )
 
-        try:
-            import granian  # noqa: F401
-        except ImportError:
-            raise ValueError(
-                "--enable-http2 requires the 'granian' package. "
-                'Install it with: pip install "sglang[http2]"'
-            )
+        # The Rust listener serves HTTP/2 itself; only the Python frontend
+        # runs on Granian.
+        if not envs.SGLANG_RUST_SERVER.get():
+            try:
+                import granian  # noqa: F401
+            except ImportError:
+                raise ValueError(
+                    "--enable-http2 requires the 'granian' package. "
+                    'Install it with: pip install "sglang[http2]"'
+                )
 
         if cfg.enable_ssl_refresh:
             raise ValueError(
@@ -299,7 +302,7 @@ def handle_deprecated_args(server_args: Any):
         enable_flashinfer_allreduce_fusion=False,
     )
     # Deprecated attention-backend aliases.
-    aliases = {"compressed": "dsv4", "tokenspeed_mla": "cutedsl_mla"}
+    aliases = {"tokenspeed_mla": "cutedsl_mla"}
     renamed = {}
     for attr in (
         "attention_backend",
@@ -452,9 +455,6 @@ def handle_environment_variables(server_args: Any):
     envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if cfg.enable_torch_compile else "0")
     if cfg.mamba_ssm_dtype is not None:
         envs.SGLANG_MAMBA_SSM_DTYPE.set(cfg.mamba_ssm_dtype)
-    envs.SGLANG_DISABLE_OUTLINES_DISK_CACHE.set(
-        "1" if cfg.disable_outlines_disk_cache else "0"
-    )
     envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
         "1" if cfg.enable_deterministic_inference else "0"
     )

@@ -21,7 +21,10 @@ from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 # Register for AMD CI - DeepSeek-V3.2 basic benchmark (~90 min)
 register_amd_ci(
-    est_time=5400, suite="nightly-perf-8-gpu-mi35x-deepseek-v32-basic", nightly=True
+    est_time=5400,
+    suite="nightly-perf-8-gpu-mi35x-deepseek-v32-basic",
+    nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 

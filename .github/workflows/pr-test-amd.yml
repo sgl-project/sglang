@@ -635,6 +635,12 @@ jobs:
   # scarcest AMD runner pool, so a PR run only asks it for a runner once its
   # MI300 tests have passed. Scheduled runs skip the wait jobs and still run
   # this in parallel.
+  #
+  # Scheduled runs, and maintainer dispatches of main without a PR head SHA, run
+  # on the MI35x nodes scheduled through Spur (linux-sglang-mi35x-spur), where
+  # this pool's hours-long queue doesn't apply. Those runners only accept this
+  # workflow from main (their job-start hook), so PR code, a workflow_call from
+  # another workflow, and pr_head_sha dispatches stay on linux-mi35x-gpu-1.
   stage-b-test-1-gpu-small-amd-mi35x:
     name: ${{ format('stage-b-test-1-gpu-small-amd-mi35x ({0}, {1})', matrix.rocm_version, matrix.runner) }}
     needs: [check-changes, call-gate, wait-for-stage-b-amd]
@@ -652,29 +658,63 @@ jobs:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
-        runner: [linux-mi35x-gpu-1]
+        runner: ${{ fromJson((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && !inputs.pr_head_sha)) && endsWith(github.workflow_ref, '/.github/workflows/pr-test-amd.yml@refs/heads/main') && '["linux-sglang-mi35x-spur"]' || '["linux-mi35x-gpu-1"]') }}
     runs-on: ${{matrix.runner}}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          # The Spur runners keep their work directory on shared storage.
+          persist-credentials: ${{ matrix.runner != 'linux-sglang-mi35x-spur' }}
 
       - name: Ensure VRAM is clear
+        if: matrix.runner != 'linux-sglang-mi35x-spur'
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
+        if: matrix.runner != 'linux-sglang-mi35x-spur'
         run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ matrix.rocm_version }}"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
+        if: matrix.runner != 'linux-sglang-mi35x-spur'
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
+        if: matrix.runner != 'linux-sglang-mi35x-spur'
         timeout-minutes: 75
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-1-gpu-small-amd-mi35x ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+
+      # The launcher submits one Slurm job that runs the same container steps on
+      # a cluster node and streams its log here; see its header.
+      - name: Run test on a Spur cluster node
+        if: matrix.runner == 'linux-sglang-mi35x-spur'
+        timeout-minutes: 110
+        env:
+          # Keeps the run dir of each ROCm leg apart when one runner takes two.
+          MATRIX_CONFIG_NAME: ${{ matrix.rocm_version }}
+        run: |
+          bash scripts/ci/slurm/launch_amd_ci_mi35x.sh \
+            --suite stage-b-test-1-gpu-small-amd-mi35x \
+            --gpus 1 \
+            --rocm-version "${{ matrix.rocm_version }}" \
+            -- ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+
+      - name: Cancel cluster jobs on failure/cancel
+        if: matrix.runner == 'linux-sglang-mi35x-spur' && (failure() || cancelled())
+        continue-on-error: true
+        run: |
+          # Same prefix launch_amd_ci_mi35x.sh names its jobs with. %200j widens
+          # the name column; Spur's squeue does not accept --me.
+          PREFIX="amd-ci-${RUNNER_NAME}-${GITHUB_RUN_ID}-"
+          JOBS=$(squeue --noheader --format="%i %200j" | grep -F "$PREFIX" | awk '{print $1}' || true)
+          if [ -n "$JOBS" ]; then
+            echo "Cancelling: $JOBS"
+            scancel $JOBS
+          fi
 
   stage-b-test-1-gpu-large-amd:
     name: ${{ format('stage-b-test-1-gpu-large-amd ({0}, linux-{1}-1gpu-sglang, {2})', matrix.rocm_version, inputs.runner_arch || 'mi300', matrix.part) }}
@@ -1193,6 +1233,11 @@ jobs:
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file 5400 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 
+  # Scheduled runs, and maintainer dispatches of main without a PR head SHA, run
+  # on the MI35x nodes scheduled through Spur (linux-sglang-mi35x-spur), holding
+  # a whole node like linux-mi35x-gpu-8. Those runners only accept this workflow
+  # from main (their job-start hook), so PR code, a workflow_call from another
+  # workflow, and pr_head_sha dispatches stay on linux-mi35x-gpu-8.
   stage-c-test-large-8-gpu-amd-mi35x:
     name: ${{ format('stage-c-test-large-8-gpu-amd-mi35x ({0}, {1}, {2})', matrix.rocm_version, matrix.runner, matrix.part) }}
     needs: [check-changes, call-gate, wait-for-stage-b-amd]
@@ -1210,7 +1255,7 @@ jobs:
       fail-fast: false
       matrix:
         rocm_version: ${{ fromJson(needs.check-changes.outputs.rocm_versions) }}
-        runner: [linux-mi35x-gpu-8]
+        runner: ${{ fromJson((github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && !inputs.pr_head_sha)) && endsWith(github.workflow_ref, '/.github/workflows/pr-test-amd.yml@refs/heads/main') && '["linux-sglang-mi35x-spur"]' || '["linux-mi35x-gpu-8"]') }}
         part: [0]
     runs-on: ${{matrix.runner}}
     steps:
@@ -1218,22 +1263,58 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+          # The Spur runners keep their work directory on shared storage.
+          persist-credentials: ${{ matrix.runner != 'linux-sglang-mi35x-spur' }}
 
       - name: Ensure VRAM is clear
+        if: matrix.runner != 'linux-sglang-mi35x-spur'
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
 
       - name: Start CI container
+        if: matrix.runner != 'linux-sglang-mi35x-spur'
         run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ matrix.rocm_version }}"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
       - name: Install dependencies
+        if: matrix.runner != 'linux-sglang-mi35x-spur'
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
+        if: matrix.runner != 'linux-sglang-mi35x-spur'
         timeout-minutes: 60
         run: |
           bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-c-test-large-8-gpu-amd-mi35x --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file 3600 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+
+      # The launcher submits one Slurm job that runs the same container steps on
+      # a cluster node and streams its log here; see its header. --gpus 8 holds
+      # the node whole.
+      - name: Run test on a Spur cluster node
+        if: matrix.runner == 'linux-sglang-mi35x-spur'
+        timeout-minutes: 110
+        env:
+          # Keeps the run dir of each leg apart when one runner takes two.
+          MATRIX_CONFIG_NAME: ${{ matrix.rocm_version }}-${{ matrix.part }}
+        run: |
+          bash scripts/ci/slurm/launch_amd_ci_mi35x.sh \
+            --suite stage-c-test-large-8-gpu-amd-mi35x \
+            --gpus 8 \
+            --rocm-version "${{ matrix.rocm_version }}" \
+            -- --auto-partition-id ${{ matrix.part }} --auto-partition-size 1 --timeout-per-file 3600 \
+            ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
+
+      - name: Cancel cluster jobs on failure/cancel
+        if: matrix.runner == 'linux-sglang-mi35x-spur' && (failure() || cancelled())
+        continue-on-error: true
+        run: |
+          # Same prefix launch_amd_ci_mi35x.sh names its jobs with. %200j widens
+          # the name column; Spur's squeue does not accept --me.
+          PREFIX="amd-ci-${RUNNER_NAME}-${GITHUB_RUN_ID}-"
+          JOBS=$(squeue --noheader --format="%i %200j" | grep -F "$PREFIX" | awk '{print $1}' || true)
+          if [ -n "$JOBS" ]; then
+            echo "Cancelling: $JOBS"
+            scancel $JOBS
+          fi
 
   # =============================================== Disaggregation ====================================================
   stage-b-test-large-8-gpu-mi35x-disaggregation-amd:

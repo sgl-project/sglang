@@ -80,6 +80,7 @@ __all__ = [
     "is_pin_memory_available",
     "async_h2d",
     "async_h2d_stack",
+    "async_h2d_tensor",
     "async_d2h",
     "get_dispatch_device_backend",
     "get_device_module",
@@ -634,6 +635,18 @@ def async_h2d_stack(
         (len(tensors), *tensors[0].shape), dtype=tensors[0].dtype, pin_memory=pin
     )
     return torch.stack(tensors, out=out).to(device, non_blocking=pin)
+
+
+def async_h2d_tensor(tensor: torch.Tensor, device: torch.device | str) -> torch.Tensor:
+    """Copy ``tensor`` to ``device``, staging host tensors in pinned memory."""
+    if not tensor.is_cpu:
+        return tensor.to(device)
+    # Pinned memory is off under Confidential Computing and for CPU targets.
+    if not is_pin_memory_available(device):
+        return tensor.to(device, non_blocking=True)
+    if not tensor.is_pinned():
+        tensor = tensor.pin_memory()
+    return tensor.to(device, non_blocking=True)
 
 
 def async_d2h(tensor: torch.Tensor) -> torch.Tensor:

@@ -76,7 +76,6 @@ ATTENTION_BACKEND_CHOICES = [
     "qsa",
     "unlimited_ocr_v2",
     "dsv4",
-    "compressed",  # Deprecated alias for "dsv4"
     "ernie55",
     # NVIDIA specific
     "fa3",
@@ -111,6 +110,8 @@ DRAFT_ATTENTION_BACKEND_CHOICES = [
     "trtllm_mha",
     "intel_xpu",
 ]
+
+DFLASH_MLA_ONLY_DRAFT_BACKENDS = ("cutedsl_mla", "trtllm_mla")
 
 DETERMINISTIC_ATTENTION_BACKEND_CHOICES = [
     "ascend",

@@ -11,8 +11,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 # ==============================================================================
-"""Multi-GPU tests for logical-page KV cache sharding: the real NCCL
-layer-ahead gather over a real 2-rank process group.
+"""Multi-GPU tests for logical-page KV cache sharding: the real layer-ahead
+gather over a real 2-rank process group, through the multicast allgather on
+GPUs with CUDA multicast, and through NCCL with it disabled.
 
 ``test_page_interleave_shard.py`` pins the plan arithmetic on CPU stubs. These
 tests drive real pools, which is the only check that the plan the stubs
@@ -21,7 +22,7 @@ validate actually addresses the bytes the collective delivers:
 1. MLA pool sharded across the attention-TP group: replicated writes are
    owner-filtered into disjoint pool stripes; a later batch's chunked-prefix
    read (get_mla_kv_buffer) assembles the full prefix from all ranks via the
-   layer-ahead NCCL allgather and must return the canonical bytes.
+   layer-ahead allgather and must return the canonical bytes.
 2. MHA pool sharded across the attention-CP group: the post-allgather full
    chunk is staged into the scratch chunk region and owner-persisted; a later
    batch reads prefix+chunk through the translated page table (the scratch),
@@ -30,10 +31,12 @@ validate actually addresses the bytes the collective delivers:
    exact KV bytes, separate target/draft storage and scratch plans, fragmented
    pages, partial tail pages, both MLA write APIs, and local/nonzero draft
    layer IDs across batches.
-4. Symmetric-window buffer lifetime: deregistration before the free.
+4. The multicast gather copies on copy engines (no NCCL kernel), and every
+   rank falls back to NCCL together for a cross-node group or a rank without
+   a multicast mapping.
 
-The copy-engine (zero-SM) gathers need NCCL >= 2.31.2 and live in
-``test/manual/mem_cache/test_page_interleave_zero_sm_gather.py``.
+``TestSymmetricBufferLifetime`` covers the NCCL symmetric-window allocator
+(``allocate_symmetric_buffer``), which the pool no longer uses.
 
 Registered for base-b 2-gpu-large and base-c 4-gpu-b200; multi-GPU tests skip
 when too few CUDA devices are visible. Run directly with:
@@ -43,8 +46,10 @@ when too few CUDA devices are visible. Run directly with:
 
 import ctypes
 import gc
+import math
 import os
 import unittest
+import unittest.mock
 from types import SimpleNamespace
 
 import torch
@@ -54,9 +59,14 @@ from sglang.srt.distributed import (
     init_distributed_environment,
     initialize_model_parallel,
 )
+from sglang.srt.distributed.device_communicators.multicast_all_gather import (
+    _multicast_address,
+    has_multicast_support,
+)
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     allocate_symmetric_buffer,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
 from sglang.srt.mem_cache.page_interleave import PageShardSpec, get_kv_shard_group
@@ -70,8 +80,8 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
-register_cuda_ci(est_time=120, stage="base-b", runner_config="2-gpu-large")
-register_cuda_ci(est_time=120, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=180, stage="base-b", runner_config="2-gpu-large")
+register_cuda_ci(est_time=180, stage="extra-b", runner_config="4-gpu-b200")
 
 _GATHER_WORLD = 2
 _GATHER_LAYER_NUM = 4
@@ -147,6 +157,18 @@ def _fake_req_to_token(groups, seq_len, device):
     return row[:, :seq_len] if seq_len < row.shape[1] else row
 
 
+def _check_gather_path(pool, multicast=None):
+    """The pool runs exactly one gather: the multicast one iff ``multicast``
+    (None: either, as the host allows). Multicast ones copy in small chunks."""
+    gather = pool._multicast_gather
+    assert (gather is None) != (pool.kv_gather_comm is None)
+    if multicast is not None:
+        assert (gather is not None) == multicast, "unexpected prefix gather"
+    if gather is not None:
+        # Several copies per gather here, each but the last 1026 bytes.
+        gather.chunk_bytes = 1026
+
+
 def _check(rank, name, got, expect, atol=0.0):
     ok = torch.allclose(got.float(), expect.float(), atol=atol, rtol=0)
     max_err = (got.float() - expect.float()).abs().max().item()
@@ -154,7 +176,7 @@ def _check(rank, name, got, expect, atol=0.0):
     assert ok, f"[rank {rank}] {name} mismatch (max_err={max_err})"
 
 
-def _run_mla(rank, world, port):
+def _run_mla(rank, world, port, multicast=None):
     _dist_init(rank, world, port, attn_cp_size=1)
 
     group = get_parallel().attn_tp_group
@@ -179,6 +201,7 @@ def _run_mla(rank, world, port):
         shard_spec=spec,
         shard_group=group,
     )
+    _check_gather_path(pool, multicast)
     device = pool.kv_buffer[0].device
 
     # ---- chunk 1: replicated write, owner-filtered persist -----------------
@@ -276,7 +299,7 @@ def _run_mla(rank, world, port):
     return pool, req_to_token, prefix_len, seq_len
 
 
-def _run_mha(rank, world, port):
+def _run_mha(rank, world, port, multicast=None):
     _dist_init(rank, world, port, attn_cp_size=world)
 
     group = get_parallel().attn_cp_group
@@ -303,6 +326,7 @@ def _run_mha(rank, world, port):
         shard_spec=spec,
         shard_group=group,
     )
+    _check_gather_path(pool, multicast)
     device = pool.k_buffer[0].device
 
     def kv_value(locs, layer_id, is_v):
@@ -410,6 +434,7 @@ def _mtp_make_pool(rank, group, kind, start_layer, layer_num):
             head_dim=_GATHER_HEAD_DIM,
             enable_alt_stream=False,
         )
+    _check_gather_path(pool)
     for local_layer in range(layer_num):
         for buffer in _mtp_buffers(pool, kind, local_layer):
             buffer.fill_(_MTP_UNWRITTEN)
@@ -465,6 +490,7 @@ def _mtp_make_draft_pool(target, allocator, kind, start_layer):
         )
     assert pool.shard_spec is target.shard_spec
     assert pool.shard_group is target.shard_group
+    _check_gather_path(pool)
     for buffer in _mtp_buffers(pool, kind, 0):
         buffer.fill_(_MTP_UNWRITTEN)
     return pool
@@ -620,7 +646,10 @@ def _run_mtp(rank, port, kind):
     pools = [target, *drafts]
     for other in drafts:
         assert other._page_pos.data_ptr() != target._page_pos.data_ptr()
-        assert other.kv_gather_comm is not target.kv_gather_comm
+        if target._multicast_gather is None:
+            assert other.kv_gather_comm is not target.kv_gather_comm
+        else:
+            assert other._multicast_gather is not target._multicast_gather
         for slot, target_slot in zip(other._slots, target._slots):
             for name in slot.tensors:
                 assert (
@@ -675,7 +704,7 @@ def _run_mtp(rank, port, kind):
     torch.cuda.device_count() < 2, "page-interleave gather needs 2 CUDA devices"
 )
 class TestPageInterleaveGatherMultiGpu(CustomTestCase):
-    """Real pools, real NCCL, 2 ranks — one mp.spawn per phase.
+    """Real pools, real gathers, 2 ranks — one mp.spawn per phase.
 
     Separate spawns (and separate ports) because each phase builds its own
     process group with a different attention-CP width.
@@ -692,6 +721,178 @@ class TestPageInterleaveGatherMultiGpu(CustomTestCase):
 
     def test_mtp_mha_shard_over_attention_cp(self):
         mp.spawn(_run_mtp, args=(29814, "mha"), nprocs=_GATHER_WORLD, join=True)
+
+    def test_nccl_gather_mla_shard_over_attention_tp(self):
+        with envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(False):
+            mp.spawn(
+                _run_mla,
+                args=(_GATHER_WORLD, 29815, False),
+                nprocs=_GATHER_WORLD,
+                join=True,
+            )
+
+    def test_nccl_gather_mha_shard_over_attention_cp(self):
+        with envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(False):
+            mp.spawn(
+                _run_mha,
+                args=(_GATHER_WORLD, 29816, False),
+                nprocs=_GATHER_WORLD,
+                join=True,
+            )
+
+
+def _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len):
+    """Names of the GPU kernels and copies one sharded batch's gathers issue."""
+    torch.cuda.synchronize()
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA]
+    ) as prof:
+        pool.begin_shard_extend(
+            req_to_token, torch.tensor([0]), [prefix_len], [seq_len]
+        )
+        for layer_id in range(_GATHER_LAYER_NUM):
+            pool.get_key_buffer(layer_id)
+        torch.cuda.synchronize()
+    return [
+        event.name
+        for event in prof.events()
+        if event.device_type == torch.autograd.DeviceType.CUDA
+    ]
+
+
+def _run_multicast_mla(rank, world, port):
+    pool, req_to_token, prefix_len, seq_len = _run_mla(
+        rank, world, port, multicast=True
+    )
+    activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
+    nccl_kernels = sorted({name for name in activity if "nccl" in name.lower()})
+    assert not nccl_kernels, f"gather ran NCCL kernels: {nccl_kernels}"
+    # The multicast chunk copies are peer copies; the plan's own host syncs
+    # are device-to-host copies.
+    block_bytes = pool._send_rows.numel() * pool._slots[0].tensors["kv"][0].nbytes
+    chunks = math.ceil(block_bytes / pool._multicast_gather.chunk_bytes)
+    copies = activity.count("Memcpy PtoP (Device -> Device)")
+    assert chunks > 1 and copies == _GATHER_LAYER_NUM * chunks, (copies, chunks)
+    torch.distributed.barrier()
+
+
+def _run_cross_node_mla(rank, world, port):
+    with unittest.mock.patch(
+        "sglang.srt.mem_cache.page_interleave_pool.in_the_same_node_as",
+        lambda pg, source_rank: [r == source_rank for r in range(world)],
+    ):
+        pool, req_to_token, prefix_len, seq_len = _run_mla(
+            rank, world, port, multicast=False
+        )
+    activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
+    assert any("nccl" in name.lower() for name in activity), activity
+
+
+class _WithoutMulticast:
+    """A rendezvous handle whose multicast mapping is missing."""
+
+    multicast_ptr = 0
+
+    def __init__(self, handle):
+        self._handle = handle
+
+    def __getattr__(self, name):
+        return getattr(self._handle, name)
+
+
+def _run_unmapped_rank_mla(rank, world, port, unmapped_call):
+    """Rank 1 gets no multicast mapping for the scratch (rendezvous call 0)
+    or for the gather's control buffer (call 1). Rank 0 has both and must
+    still pick NCCL with rank 1, without waiting for it in a barrier."""
+    from torch.distributed import _symmetric_memory as symm_mem
+
+    rendezvous, calls = symm_mem.rendezvous, []
+
+    def rendezvous_on_rank_1_without_multicast(tensor, group):
+        handle = rendezvous(tensor, group)
+        calls.append(tensor)
+        if rank == 1 and len(calls) - 1 == unmapped_call:
+            return _WithoutMulticast(handle)
+        return handle
+
+    with unittest.mock.patch.object(
+        symm_mem, "rendezvous", rendezvous_on_rank_1_without_multicast
+    ):
+        pool, req_to_token, prefix_len, seq_len = _run_mla(
+            rank, world, port, multicast=False
+        )
+    assert len(calls) == 2
+    activity = _gather_gpu_activity(pool, req_to_token, prefix_len, seq_len)
+    assert any("nccl" in name.lower() for name in activity), activity
+
+
+def _probe_multicast_mapping(rank, world, port, availability):
+    from torch.distributed import _symmetric_memory as symm_mem
+
+    _dist_init(rank, world, port, attn_cp_size=1)
+    group = get_parallel().attn_tp_group.cpu_group
+    errors, buffers, handles = [], [], []
+    # Probe both mappings independently of the pool's gather selection. The
+    # driver can advertise multicast while cuMulticastBindMem still fails.
+    for name, nbytes in (("output", 4096), ("control", 128)):
+        buf = symm_mem.empty(nbytes, dtype=torch.uint8, device=f"cuda:{rank}")
+        handle = symm_mem.rendezvous(buf, group.group_name)
+        buffers.append(buf)
+        handles.append(handle)
+        try:
+            _multicast_address(buf, handle, rank, world)
+        except ValueError as error:
+            errors.append(f"{name}: {error}")
+    # Keep both allocations and handles alive until every rank has checked.
+    torch.distributed.barrier(group=group)
+    availability.put((rank, errors))
+
+
+@unittest.skipIf(
+    torch.cuda.device_count() < 2 or not has_multicast_support(torch.device("cuda", 0)),
+    "the multicast gather needs 2 CUDA devices with multicast",
+)
+class TestPageInterleaveMulticastGather(CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        availability = mp.get_context("spawn").SimpleQueue()
+        try:
+            cls._spawn(_probe_multicast_mapping, 29821, availability)
+            results = [availability.get() for _ in range(_GATHER_WORLD)]
+        finally:
+            availability.close()
+        errors = [
+            f"rank {rank}: {', '.join(errors)}"
+            for rank, errors in sorted(results)
+            if errors
+        ]
+        if errors:
+            raise unittest.SkipTest(
+                "CUDA multicast mapping unavailable: " + "; ".join(errors)
+            )
+
+    @staticmethod
+    def _spawn(target, port, *args):
+        with envs.SGLANG_ENABLE_KV_SHARD_ZERO_SM_GATHER.override(True):
+            mp.spawn(
+                target,
+                args=(_GATHER_WORLD, port, *args),
+                nprocs=_GATHER_WORLD,
+                join=True,
+            )
+
+    def test_gather_issues_no_nccl_kernels(self):
+        self._spawn(_run_multicast_mla, 29817)
+
+    def test_cross_node_group_keeps_nccl_gather(self):
+        self._spawn(_run_cross_node_mla, 29818)
+
+    def test_rank_without_scratch_mapping_moves_every_rank_to_nccl(self):
+        self._spawn(_run_unmapped_rank_mla, 29819, 0)
+
+    def test_rank_without_control_mapping_moves_every_rank_to_nccl(self):
+        self._spawn(_run_unmapped_rank_mla, 29820, 1)
 
 
 @unittest.skipIf(not torch.cuda.is_available(), "needs a CUDA device")
