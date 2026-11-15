@@ -198,6 +198,7 @@ def add_api_key_middleware(app, *, get_keys: Callable[[], tuple]):
     """Enforce the endpoint auth levels; `get_keys` returns `(api_key, admin_api_key)` per request."""
     # Import lazily so `decide_request_auth()` can be unit-tested without FastAPI installed.
     from fastapi.responses import ORJSONResponse
+    from starlette._utils import get_route_path
     from starlette.datastructures import Headers
 
     class _ApiKeyASGIMiddleware:
@@ -215,7 +216,7 @@ def add_api_key_middleware(app, *, get_keys: Callable[[], tuple]):
             api_key, admin_api_key = get_keys()
             decision = decide_request_auth(
                 method=scope.get("method", "GET"),
-                path=scope["path"],
+                path=get_route_path(scope),
                 authorization_header=Headers(scope=scope).get("Authorization"),
                 api_key=api_key,
                 admin_api_key=admin_api_key,
