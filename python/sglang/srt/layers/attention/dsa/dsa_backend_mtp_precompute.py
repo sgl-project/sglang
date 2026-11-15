@@ -119,10 +119,11 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
     ) -> PrecomputedMetadata:
-        """Precompute metadata for normal decode mode."""
+        """Precompute decode metadata, including this draft step's chain."""
         max_len = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
-        if self.draft_decode_len:
-            seq_lens = seq_lens + self.draft_decode_len
+        draft_decode_len = getattr(self, "draft_decode_len", 0)
+        if draft_decode_len:
+            seq_lens = seq_lens + draft_decode_len
 
         if (
             (_is_cuda or _is_hip) and self.dsa_index_kpool <= 1

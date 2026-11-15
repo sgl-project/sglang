@@ -5,8 +5,12 @@ from __future__ import annotations
 from typing import Iterable, Tuple
 
 import torch
+import torch.nn.functional as F
+from torch import nn
 
+from sglang.kernels.ops.activation.silu_and_mul_clamp import silu_and_mul_clamp
 from sglang.srt.layers.linear import ColumnParallelLinear
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.models.dflash import (
     DFlash2DraftModel,
     DFlashDecoderLayer,
@@ -17,7 +21,28 @@ from sglang.srt.models.gigachat35 import (
     _remap_gigachat_weight_names,
     build_norm,
 )
-from sglang.srt.utils import add_prefix
+from sglang.srt.utils import is_cuda
+
+_is_cuda = is_cuda()
+
+
+class GigaChat4DFlash2SiluAndMul(nn.Module):
+    def __init__(self, limit: float) -> None:
+        super().__init__()
+        self.limit = limit
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if (
+            _is_cuda
+            and x.is_cuda
+            and x.dtype in (torch.float16, torch.bfloat16)
+            and x.numel() > 0
+        ):
+            out = x.new_empty((*x.shape[:-1], x.shape[-1] // 2))
+            silu_and_mul_clamp(x, out, self.limit)
+            return out
+        gate, up = x.chunk(2, dim=-1)
+        return F.silu(gate.clamp(max=self.limit)) * up.clamp(-self.limit, self.limit)
 
 
 class GigaChat4DFlash2Attention(GigaChat35AttentionMLA, DFlashMLAAttention):
@@ -59,6 +84,9 @@ class GigaChat4DFlash2DecoderLayer(DFlashDecoderLayer):
 
     def __init__(self, config, **kwargs) -> None:
         super().__init__(config=config, **kwargs)
+        swiglu_limit = float(getattr(config, "swiglu_limit", None) or 0.0)
+        if config.hidden_act == "silu" and swiglu_limit > 0:
+            self.mlp.act_fn = GigaChat4DFlash2SiluAndMul(swiglu_limit)
         self.input_layernorm = build_norm(config, config.hidden_size)
         self.post_attention_layernorm = build_norm(config, config.hidden_size)
         if config.layernorm_type == "pre_post":
@@ -71,10 +99,13 @@ class GigaChat4DFlash2DraftModel(DFlash2DraftModel):
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
+        shift_label = getattr(config, "dflash_config", {}).get("shift_label", True)
+        if not isinstance(shift_label, bool):
+            raise ValueError("dflash_config.shift_label must be a bool")
+        self.num_stages = int(config.num_hidden_layers)
         self.norm = build_norm(config, config.hidden_size)
         self.hidden_norm = build_norm(config, config.hidden_size)
-        # GigaChat trains every DFlash2 draft so row i drafts token i + 1.
-        self.shift_label = True
+        self.shift_label = shift_label
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> None:
         super().load_weights(_remap_gigachat_weight_names(weights))
