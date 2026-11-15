@@ -15,7 +15,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget i
     HostPinBudget,
     host_copies_would_not_fit,
     module_weight_bytes,
-    shared_pool_available_bytes,
+    physical_host_memory_available_bytes,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
@@ -410,7 +410,9 @@ class LayerwiseOffloadStrategy(ComponentResidencyStrategy):
             # The room the cache will have for this component's next stream is
             # what is available now less what the stages in between need.
             room_bytes = max(
-                0, shared_pool_available_bytes() - SHARED_POOL_NEXT_STAGE_HEADROOM_BYTES
+                0,
+                physical_host_memory_available_bytes()
+                - SHARED_POOL_NEXT_STAGE_HEADROOM_BYTES,
             )
             paged_out = 0
             for manager in module.layerwise_offload_managers:

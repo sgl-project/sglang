@@ -2,6 +2,7 @@
 #include <sgl_kernel/utils.h>
 
 #include <sgl_kernel/math.cuh>
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
@@ -106,9 +107,10 @@ SGL_DEVICE IndexPacked index_rope_quant_pack(fp32x2_t head, fp32x2_t tail, fp32x
   float data[4];
   data[0] = head.x;
   data[1] = head.y;
+  // The contraction is spelled out so `index_q_block_kernel` matches it bit for bit;
   // `rope_tail` ends in `.to(x.dtype)`, so the rotated pair is rounded again.
-  const auto rotated =
-      cast<fp32x2_t>(cast<bf16x2_t>(fp32x2_t{tail.x * freq.x - tail.y * freq.y, tail.x * freq.y + tail.y * freq.x}));
+  const auto rotated = cast<fp32x2_t>(cast<bf16x2_t>(fp32x2_t{
+      __fmaf_rn(tail.x, freq.x, -__fmul_rn(tail.y, freq.y)), __fmaf_rn(tail.x, freq.y, __fmul_rn(tail.y, freq.x))}));
   data[2] = rotated.x;
   data[3] = rotated.y;
 
@@ -293,6 +295,147 @@ __global__ __launch_bounds__(kFp4RopeWarpsPerCTA* device::kWarpThreads) void ind
   }
 }
 
+#ifndef USE_ROCM
+/// Threads per CTA of `index_q_block_kernel`: 64 (token, head) rows.
+constexpr uint32_t kIndexQBlockThreads = 256;
+
+/// \brief Absmax of one 32-element block as a tree; seeded with 0 so a NaN is
+///        dropped exactly as the `fmaxf` chain from 0 drops it.
+SGL_DEVICE float index_block_absmax(const float (&v)[deepseek_v4::fp4::kBlockSize]) {
+  static_assert(deepseek_v4::fp4::kBlockSize == 32);
+  float m[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i)
+    m[i] = fmaxf(fmaxf(fabsf(v[4 * i]), fabsf(v[4 * i + 1])), fmaxf(fabsf(v[4 * i + 2]), fabsf(v[4 * i + 3])));
+#pragma unroll
+  for (int i = 0; i < 4; ++i)
+    m[i] = fmaxf(m[i], m[i + 4]);
+  return fmaxf(fmaxf(m[0], m[2]), fmaxf(fmaxf(m[1], m[3]), 0.0f));
+}
+
+/// \brief `index_pack_exponent(amax)` without the division, for an `amax` that is
+///        an e2m1 grid value times a power of two.
+///
+/// Such an amax is 1 or 1.5 times 2^E, so `ceil_ue8m0(amax / 6)` is its biased
+/// exponent minus 2; the 1e-4 floor (biased 114) covers zero and subnormals, and
+/// 255 (inf/nan) still lands on the 254 clamp.
+SGL_DEVICE uint32_t index_pack_exponent_grid(float amax) {
+  const auto biased = static_cast<int32_t>((__float_as_uint(amax) >> 23) & 0xFF);
+  const auto exponent = biased == 255 ? 255 : biased - 2;
+  return static_cast<uint32_t>(min(max(exponent, 114), 254));
+}
+
+/// \brief `index_q_kernel` for prefill-sized row counts: one thread per 32-element
+///        fp4 block instead of one warp per row.
+///
+/// Every fp4 stage of `index_rope_quant_pack` is per element except the two block
+/// absmaxes, and a max is exact in any order, so a thread holding its whole block
+/// computes the same bytes with no shuffles. Warps 0-3 of a CTA take the head
+/// blocks of its 64 rows and warps 4-7 the RoPE blocks, so the RoPE branch is
+/// warp-uniform; each thread issues all of its loads before any math.
+template <bool kUsePDL, int64_t kHeadDim, int64_t kRopeDim, typename PosT, bool kWeights>
+__global__ __launch_bounds__(kIndexQBlockThreads) void index_q_block_kernel(const IndexQParams params) {
+  using namespace device;
+  namespace fp4 = deepseek_v4::fp4;
+
+  static_assert(kHeadDim == 128 && kRopeDim == 64, "the block split assumes a 64 + 64 (RoPE tail) row");
+  constexpr uint32_t kBlock = fp4::kBlockSize;
+  constexpr uint32_t kBlocksPerRow = kHeadDim / kBlock;
+  constexpr uint32_t kRopeBlock = (kHeadDim - kRopeDim) / kBlock;
+  constexpr uint32_t kHalf = kIndexQBlockThreads / 2;
+  static_assert(kBlocksPerRow == 2 * kRopeBlock, "each half of the CTA owns two blocks per row");
+
+  const bool rope = threadIdx.x >= kHalf;
+  const auto t = threadIdx.x % kHalf;
+  const auto row = blockIdx.x * (kIndexQBlockThreads / kBlocksPerRow) + t / kRopeBlock;
+  const auto blk = (rope ? kRopeBlock : 0) + t % kRopeBlock;
+  if (row >= params.num_rows) return;
+
+  // The position lookup is independent of the PDL producer.
+  const auto position = static_cast<int64_t>(static_cast<const PosT*>(params.positions)[row / params.heads]);
+  PDLWaitPrimary<kUsePDL>();
+
+  constexpr uint32_t kVecWords = kMaxVecBytes / sizeof(uint32_t);
+  using vec_t = AlignedVector<uint32_t, kVecWords>;
+  const auto* in = params.input + static_cast<int64_t>(row) * kHeadDim + blk * kBlock;
+  vec_t raw[kBlock / 2 / kVecWords];
+#pragma unroll
+  for (uint32_t i = 0; i < kBlock / 2 / kVecWords; ++i)
+    raw[i].load(in, i);
+  vec_t freq[kBlock / kVecWords];
+  if (rope) {
+    const auto* f = params.freqs_cis + position * kRopeDim + (blk - kRopeBlock) * kBlock;
+#pragma unroll
+    for (uint32_t i = 0; i < kBlock / kVecWords; ++i)
+      freq[i].load(f, i);
+  }
+
+  float v[kBlock];
+#pragma unroll
+  for (uint32_t j = 0; j < kBlock / 2; ++j) {
+    const auto word = raw[j / kVecWords][j % kVecWords];
+    const auto f = cast<fp32x2_t>(*reinterpret_cast<const bf16x2_t*>(&word));
+    v[2 * j] = f.x;
+    v[2 * j + 1] = f.y;
+  }
+  if (rope) {
+#pragma unroll
+    for (uint32_t j = 0; j < kBlock / 2; ++j) {
+      const float x = v[2 * j], y = v[2 * j + 1];
+      const float fx = __uint_as_float(freq[2 * j / kVecWords][2 * j % kVecWords]);
+      const float fy = __uint_as_float(freq[2 * j / kVecWords][2 * j % kVecWords + 1]);
+      // `index_rope_quant_pack`'s rotation, fma(x, fx, -(y * fy)) and fma(x, fy, y * fx),
+      // rounded to bf16 again as `rope_tail` does.
+      const auto rotated = cast<fp32x2_t>(
+          cast<bf16x2_t>(fp32x2_t{__fmaf_rn(x, fx, -__fmul_rn(y, fy)), __fmaf_rn(x, fy, __fmul_rn(y, fx))}));
+      v[2 * j] = rotated.x;
+      v[2 * j + 1] = rotated.y;
+    }
+  }
+
+  // `fp4::fake_quant_x2` up to its final `* scale`: v becomes the e2m1 grid value.
+  const auto [scale, inv_scale] = fp4::block_scale(index_block_absmax(v));
+#pragma unroll
+  for (uint32_t i = 0; i < kBlock; i += 2) {
+    const auto code = __nv_cvt_float2_to_fp4x2(
+        fp32x2_t{__fmaf_rn(v[i], inv_scale, 0.0f), __fmaf_rn(v[i + 1], inv_scale, 0.0f)}, __NV_E2M1, cudaRoundNearest);
+    const auto grid = cast<fp32x2_t>(fp16x2_t{__nv_cvt_fp4x2_to_halfraw2(code, __NV_E2M1)});
+    v[i] = grid.x;
+    v[i + 1] = grid.y;
+  }
+  // The fake-quant value is grid * scale and both scales are powers of two, so
+  // (grid * scale) * pack_inv_scale == grid * (scale * pack_inv_scale) exactly.
+  const auto exponent = index_pack_exponent_grid(__fmul_rn(index_block_absmax(v), scale));
+  const auto factor = __fmul_rn(scale, deepseek_v4::fp8::inv_scale_ue8m0(static_cast<int32_t>(exponent)));
+
+  using out_vec_t = AlignedVector<uint32_t, 4>;
+  out_vec_t out;
+#pragma unroll
+  for (uint32_t w = 0; w < 4; ++w) {
+    uint32_t word = 0;
+#pragma unroll
+    for (uint32_t b = 0; b < 4; ++b) {
+      const auto i = (w * 4 + b) * 2;
+      const auto code = __nv_cvt_float2_to_fp4x2(
+          fp32x2_t{__fmul_rn(v[i], factor), __fmul_rn(v[i + 1], factor)}, __NV_E2M1, cudaRoundNearest);
+      word |= (static_cast<uint32_t>(code) & 0xFFu) << (b * 8);
+    }
+    out[w] = clear_negative_zero(word);
+  }
+  out.store(params.payload + static_cast<int64_t>(row) * (kHeadDim / 2) + blk * (kBlock / 2));
+  reinterpret_cast<uint8_t*>(params.scale)[static_cast<int64_t>(row) * kBlocksPerRow + blk] =
+      static_cast<uint8_t>(exponent);
+
+  if constexpr (kWeights) {
+    // Match `head_weights(x).float()`: the bf16 round-trip is part of the reference.
+    if (blk == 0) {
+      const auto w = cast<float>(params.head_weights[row]) * params.weight_scale;
+      params.weights_out[row] = cast<float>(cast<bf16_t>(w));
+    }
+  }
+}
+#endif  // USE_ROCM
+
 /// \brief Host side of `index_k_kernel`.
 template <int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, uint32_t kRatio, bool kUsePDL>
 struct IndexKKernel {
@@ -360,6 +503,14 @@ struct IndexQKernel {
 
   template <typename PosT, bool kWeights>
   static constexpr auto kernel = index_q_kernel<kUsePDL, kHeadDim, kRopeDim, PosT, kWeights>;
+#ifndef USE_ROCM
+  template <typename PosT, bool kWeights>
+  static constexpr auto block_kernel = index_q_block_kernel<kUsePDL, kHeadDim, kRopeDim, PosT, kWeights>;
+  /// (token, head) rows from which SM100-family GPUs take `index_q_block_kernel`:
+  /// prefill chunks, and decode / verify batches that reach it (e.g. 64 requests x
+  /// 4-token verify x 32 heads). Smaller batches keep the warp-per-row kernel.
+  static constexpr uint32_t kBlockKernelMinRows = 8192;
+#endif
 
   /// \param input `[num_tokens, heads, kHeadDim]` bf16, `wq_b(q_lora)`.
   /// \param freqs_cis `[max_pos, kRopeDim]` fp32, real/imag interleaved.
@@ -442,6 +593,21 @@ struct IndexQKernel {
         .heads = static_cast<uint32_t>(H.unwrap()),
     };
     const auto i32 = pos_dtype.is_type<int32_t>();
+#ifndef USE_ROCM
+    if (num_rows >= kBlockKernelMinRows && runtime::get_cc_major(device_.unwrap().device_id) == 10) {
+      // The block kernel moves input and freqs_cis rows in 32-byte vectors and payload
+      // rows in 16-byte vectors; a misaligned view fails here instead of faulting.
+      TensorMatcher({N, H, kHeadDim}).with_dtype<bf16_t>().ensure_alignment(32).verify(input);
+      TensorMatcher({-1, kRopeDim}).with_dtype<fp32_t>().ensure_alignment(32).verify(freqs_cis);
+      TensorMatcher({R, kHeadDim / 2}).with_dtype<int8_t>().ensure_alignment(16).verify(payload);
+      const auto bk = weights ? (i32 ? block_kernel<int32_t, true> : block_kernel<int64_t, true>)
+                              : (i32 ? block_kernel<int32_t, false> : block_kernel<int64_t, false>);
+      constexpr uint32_t kRowsPerCTA = kIndexQBlockThreads / (kHeadDim / deepseek_v4::fp4::kBlockSize);
+      LaunchKernel(div_ceil(num_rows, kRowsPerCTA), kIndexQBlockThreads, device_.unwrap())  //
+          .enable_pdl(kUsePDL)(bk, params);
+      return;
+    }
+#endif
     const auto k = weights ? (i32 ? kernel<int32_t, true> : kernel<int64_t, true>)
                            : (i32 ? kernel<int32_t, false> : kernel<int64_t, false>);
     LaunchKernel(div_ceil(num_rows, kFp4RopeWarpsPerCTA), kBlockSize, device_.unwrap())  //

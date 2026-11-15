@@ -13,9 +13,15 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(
     est_time=5,
     stage="base-b-kernel-benchmark",
-    runner_config="1-gpu-large",
+    runner_config="1-gpu-small",
+    disabled="requires SM120; no benchmark lane runs SM120",
 )
-register_amd_ci(est_time=5, stage="jit-kernel-benchmark", runner_config="amd")
+register_amd_ci(
+    est_time=5,
+    stage="jit-kernel-benchmark",
+    runner_config="amd",
+    disabled="requires SM120; self-skips on ROCm",
+)
 
 
 def _make_inputs(m: int, n: int, k: int, device: str = "cuda"):

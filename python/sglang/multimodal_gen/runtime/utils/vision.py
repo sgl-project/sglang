@@ -19,7 +19,7 @@ from packaging import version
 
 from sglang.kernels import get_kernel
 from sglang.srt.environ import envs
-from sglang.srt.utils.common import get_image_bytes as srt_get_image_bytes
+from sglang.srt.multimodal.media_io import get_image_bytes as srt_get_image_bytes
 
 if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
     PIL_INTERPOLATION = {

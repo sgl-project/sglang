@@ -14,7 +14,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.sana_wm import SanaWMPipelin
 from sglang.multimodal_gen.configs.sample.sana_wm import SanaWMSamplingParams
 from sglang.multimodal_gen.registry import _get_config_info, get_pipeline_config_classes
 from sglang.multimodal_gen.runtime import server_args as server_args_module
-from sglang.multimodal_gen.runtime.models.dits.sana_wm import (
+from sglang.multimodal_gen.runtime.models.dits.sana_wm_components import (
     _downscale_to_reference_rms,
     _gdn_chunk_scan_forward,
     _gdn_scan_forward,
