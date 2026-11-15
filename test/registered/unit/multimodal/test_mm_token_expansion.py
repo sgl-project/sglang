@@ -68,11 +68,11 @@ from sglang.srt.multimodal.token_space_mm_process.registry import (
     TOKEN_SPACE_STRATEGY_MAPPING,
     register_token_space_models,
 )
+from sglang.srt.multimodal.token_space_mm_process.serving_processor import (
+    TokenSpaceSGLangProcessor,
+)
 from sglang.srt.multimodal.token_space_mm_process.serving_spec import (
     TokenSpaceServingSpec,
-)
-from sglang.srt.multimodal.token_space_mm_process.sglang import (
-    TokenSpaceSGLangProcessor,
 )
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
