@@ -2638,12 +2638,6 @@ class DeepseekV4AscendAttnBackend(
         """
         if spec_algorithm is None or spec_algorithm.is_none():
             return
-        if spec_algorithm.is_dflash_family():
-            raise ValueError(
-                "DeepSeek-V4 / V4.1 on NPU does not support DFLASH speculative "
-                "decoding: the verify compression metadata assumes seq_lens "
-                "excludes the draft block. Use EAGLE, NGRAM or DSpark instead."
-            )
         if (
             self._dsv4_is_v41_model
             and not spec_algorithm.is_dspark()
