@@ -149,6 +149,40 @@ class TestDcpExtendGatherBreak(unittest.TestCase):
         )
         self.assertTrue(torch.all(capture_batch.attn_dcp_metadata.dcp_kv_buffer == 0.0))
 
+    def test_gather_handles_none_metadata_safely(self):
+        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+            bcg_dcp_extend_kv_gather,
+        )
+
+        live_batch = _batch(5, [0])
+        live_batch.attn_dcp_metadata = None
+        k_nope = torch.ones((8, 1, KV_LORA_RANK))
+        k_pe = torch.full((8, 1, ROPE_DIM), 2.0)
+        with set_forward_batch(live_batch), prefill_graph_scope(full_graph=False):
+            bcg_dcp_extend_kv_gather(None, None, live_batch, KV_LORA_RANK, k_nope, k_pe)
+
+    def test_gather_handles_none_kv_buffer_safely(self):
+        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+            bcg_dcp_extend_kv_gather,
+        )
+
+        live_batch = _batch(5, [0])
+        live_batch.attn_dcp_metadata = _metadata(5)
+        live_batch.attn_dcp_metadata.dcp_kv_buffer = None
+        k_nope = torch.ones((8, 1, KV_LORA_RANK))
+        k_pe = torch.full((8, 1, ROPE_DIM), 2.0)
+        with set_forward_batch(live_batch), prefill_graph_scope(full_graph=False):
+            bcg_dcp_extend_kv_gather(None, None, live_batch, KV_LORA_RANK, k_nope, k_pe)
+
+
+class TestGlm4MoeLiteDcp(unittest.TestCase):
+    def test_glm4_moe_lite_has_dcp_planner(self):
+        from sglang.srt.models.glm4_moe_lite import Glm4MoeLiteForCausalLM
+
+        self.assertTrue(
+            hasattr(Glm4MoeLiteForCausalLM, "prepare_context_parallel_metadata_for_dcp")
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
