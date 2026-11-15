@@ -1,3 +1,4 @@
+import inspect
 import itertools
 import json
 import os
@@ -1095,7 +1096,10 @@ class TestImplicitToolStartOnRealBackends(CustomTestCase):
         from sglang.srt.constrained.outlines_backend import OutlinesGrammar
 
         guide = RegexGuide.from_regex(regex, TransformerTokenizer(self.hf_tokenizer))
-        return OutlinesGrammar(guide, None)
+        parameters = inspect.signature(OutlinesGrammar.__init__).parameters
+        if "jump_forward_map" in parameters:
+            return OutlinesGrammar(guide, None)
+        return OutlinesGrammar(guide)
 
     def _xgrammar(self, regex):
         import xgrammar as xgr
