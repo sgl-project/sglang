@@ -78,6 +78,16 @@ ROUTE_AUTH_LEVELS = {
     },
     AuthLevel.ADMIN_OPTIONAL: {
         "/abort_request",
+        "/flush_cache",
+        "/freeze_gc",
+        "/get_remote_instance_transfer_engine_info",
+        "/hicache/storage-backend/clear",
+        "/is_scaling_elastic_ep",
+        "/list_external_corpora",
+        "/remote_instance_transfer_engine_info",
+        "/set_trace_level",
+    },
+    AuthLevel.ADMIN_FORCE: {
         "/add_external_corpus",
         "/begin_weight_update",
         "/configure_logging",
@@ -86,29 +96,21 @@ ROUTE_AUTH_LEVELS = {
         "/dump_expert_distribution_record",
         "/dumper/{method}",
         "/end_weight_update",
-        "/flush_cache",
-        "/freeze_gc",
-        "/get_remote_instance_transfer_engine_info",
         "/get_weights_by_name",
         "/hicache/storage-backend",
-        "/hicache/storage-backend/clear",
         "/init_weights_send_group_for_remote_instance",
         "/init_weights_update_group",
-        "/is_scaling_elastic_ep",
-        "/list_external_corpora",
         "/load_lora_adapter",
         "/load_lora_adapter_from_tensors",
         "/pause_generation",
         "/pd_role_switch",
         "/plugin_weight_update",
         "/release_memory_occupation",
-        "/remote_instance_transfer_engine_info",
         "/remove_external_corpus",
         "/resume_memory_occupation",
         "/scale_elastic_ep",
         "/send_weights_to_remote_instance",
         "/set_internal_state",
-        "/set_trace_level",
         "/slow_down",
         "/start_expert_distribution_record",
         "/start_profile",
@@ -147,7 +149,10 @@ class TestEveryRouteDeclaresItsAuthLevel(CustomTestCase):
 
     def test_rust_server_tables_agree(self):
         source = RUST_AUTH.read_text()
-        for name, level in (("ADMIN_OPTIONAL_PATHS", AuthLevel.ADMIN_OPTIONAL),):
+        for name, level in (
+            ("ADMIN_FORCE_PATHS", AuthLevel.ADMIN_FORCE),
+            ("ADMIN_OPTIONAL_PATHS", AuthLevel.ADMIN_OPTIONAL),
+        ):
             body = re.search(rf"const {name}: &\[&str\] = &\[(.*?)\];", source, re.S)
             paths = set(re.findall(r'"(/[^"]*)"', body.group(1)))
             self.assertTrue(paths)
