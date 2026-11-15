@@ -1283,7 +1283,9 @@ class Engine(EngineScoreMixin, EngineBase):
                         f"different --engine-info-bootstrap-port."
                     )
                 engine_info_bootstrap_server = EngineInfoBootstrapServer(
-                    host=get_serving().host, port=bootstrap_port
+                    host=get_serving().host,
+                    port=bootstrap_port,
+                    admin_api_key=get_serving().admin_api_key,
                 )
 
             # Launch daemons (daemon mode only). The handles travel back to the

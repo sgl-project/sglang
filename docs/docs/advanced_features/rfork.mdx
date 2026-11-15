@@ -75,13 +75,17 @@ python -m sglang.launch_server [args] \
 
 ### TransferEngine as backend
 
+Set the same `SGLANG_ADMIN_API_KEY` (or `--admin-api-key`) on all seed ranks and client instances. Bootstrap metadata registration and discovery require this key; a server without an admin key rejects these calls with HTTP 403.
+
 seed instance:
 ```shell Command
+export SGLANG_ADMIN_API_KEY=[admin_api_key]
 python -m sglang.launch_server [args] \
   --remote-instance-weight-loader-start-seed-via-transfer-engine
 ```
 
 ```shell Command
+export SGLANG_ADMIN_API_KEY=[admin_api_key]
 python -m sglang.launch_server [args] \
   --load-format remote_instance \
   --remote-instance-weight-loader-seed-instance-ip [seed_instance_ip] \
