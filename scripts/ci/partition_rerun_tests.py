@@ -104,7 +104,7 @@ def _multimodal_estimates(root):
     return cases, standalone
 
 
-def estimate_seconds(command, root, mode, runs_on=""):
+def estimate_seconds(command, root, mode, runs_on="", suite=""):
     if mode == "multimodal_gen":
         filename, _, selector = command.split()[0].partition("::")
         cases, standalone = _multimodal_estimates(root)
@@ -113,7 +113,11 @@ def estimate_seconds(command, root, mode, runs_on=""):
             return cases.get(case.group(1))
         return standalone.get(filename, standalone.get(Path(filename).name))
 
-    register_name = {"cuda": "register_cuda_ci", "cpu": "register_cpu_ci"}.get(mode)
+    register_name = {
+        "cuda": "register_cuda_ci",
+        "cpu": "register_cpu_ci",
+        "npu": "register_npu_ci",
+    }.get(mode)
     if register_name is None:
         return None
     filename = command.split()[0].split("::", 1)[0]
@@ -123,6 +127,8 @@ def estimate_seconds(command, root, mode, runs_on=""):
     if mode == "cuda":
         labels = _runner_config_labels()
         matching = [est for est, rc, _ in found if rc and labels.get(rc) == runs_on]
+    elif mode == "npu":
+        matching = [est for est, _, s in found if s == suite]
     else:
         matching = [est for est, _, suite in found if suite in UBUNTU_CPU_SUITES]
     # A file may register on multiple pools; without a match, stay conservative.
@@ -138,13 +144,13 @@ def _pack(items):
         count += 1
 
 
-def partition_commands(commands, root, mode, runs_on=""):
+def partition_commands(commands, root, mode, runs_on="", suite=""):
     order = [c.strip() for c in commands.splitlines() if c.strip()]
     if not order:
         raise ValueError("No test commands supplied")
     alone, items = [], []
     for idx, command in enumerate(order):
-        estimate = estimate_seconds(command, root, mode, runs_on)
+        estimate = estimate_seconds(command, root, mode, runs_on, suite)
         if estimate is None or estimate > PARTITION_SECONDS:
             alone.append([idx])
         else:
@@ -169,8 +175,17 @@ if __name__ == "__main__":
         Path(os.environ["TEST_ROOT"]),
         os.environ["MODE"],
         os.environ.get("RUNS_ON", ""),
+        os.environ.get("SUITE", ""),
     )
     for partition in matrix["include"]:
         print(f"Partition {partition['partition']}:\n{partition['test_command']}")
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
         output.write(f"matrix={json.dumps(matrix, separators=(',', ':'))}\n")
+        if os.environ["MODE"] == "npu":
+            # The NPU stage takes every file in one list and splits it itself.
+            size = len(matrix["include"])
+            partitions = {"size": size, "arr": list(range(size))}
+            files = "\n".join(f"test/{c}" for c in os.environ["TEST_COMMAND"].split())
+            output.write(f"partitions={json.dumps(partitions)}\n")
+            # JSON-encoded so the multi-line list fits one output line.
+            output.write(f"only_tests={json.dumps(files)}\n")
