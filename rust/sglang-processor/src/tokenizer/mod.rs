@@ -45,6 +45,27 @@ pub trait TextTokenizer: Send + Sync {
     }
 }
 
+/// `--tokenizer-backend`: the library that encodes text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TokenizerBackend {
+    #[default]
+    HuggingFace,
+    /// The `fastokens` crate; decoding stays on Hugging Face's `tokenizers`.
+    Fastokens,
+}
+
+impl std::str::FromStr for TokenizerBackend {
+    type Err = String;
+
+    fn from_str(name: &str) -> Result<Self, String> {
+        match name {
+            "huggingface" => Ok(Self::HuggingFace),
+            "fastokens" => Ok(Self::Fastokens),
+            _ => Err(format!("unknown tokenizer backend '{name}'")),
+        }
+    }
+}
+
 /// Real tokenizer over two already-loaded dynamo handles. Dynamo fixes
 /// `add_special_tokens` when loading, so selecting the mode at request time
 /// requires one handle for each setting.
@@ -78,6 +99,26 @@ pub fn load_tokenizer(
     Ok(tokenizer)
 }
 
+/// Load `tokenizer_path`'s `tokenizer.json` on fastokens, which encodes without
+/// the post-processor's special tokens.
+fn load_fastokens(
+    path: &str,
+    revision: Option<&str>,
+) -> Result<dynamo_tokenizers::Tokenizer, String> {
+    let file = resolve_tokenizer_file(path, revision)
+        .filter(|file| file.ends_with(".json"))
+        .ok_or_else(|| {
+            format!("the fastokens tokenizer backend needs a tokenizer.json, and '{path}' has none")
+        })?;
+    let tokenizer = dynamo_tokenizers::FastTokenizer::from_file(&file).map_err(|e| {
+        format!(
+            "fastokens failed to load {file}: {e}. Re-run without --tokenizer-backend=fastokens"
+        )
+    })?;
+    tracing::info!(%path, "loaded tokenizer on fastokens");
+    Ok(std::sync::Arc::new(tokenizer).into())
+}
+
 impl DynamoTokenizer {
     /// Over loaded handles, with no configured BOS for
     /// [`TextTokenizer::encode_chat`] to drop; [`Self::load`] reads it.
@@ -95,10 +136,33 @@ impl DynamoTokenizer {
     /// Load the tokenizer at `path` (see [`load_tokenizer`]) in both
     /// special-token modes, with the BOS its `tokenizer_config.json` names.
     pub fn load(path: &str, revision: Option<&str>) -> Result<Self, String> {
-        let mut tokenizer = Self::new(
-            load_tokenizer(Some(path), revision, false)?,
-            load_tokenizer(Some(path), revision, true)?,
-        );
+        Self::load_with_backend(path, revision, TokenizerBackend::HuggingFace)
+    }
+
+    /// [`Self::load`], encoding on `backend`. Fastokens adds no special tokens, so
+    /// it also serves `add_special_tokens` only when the tokenizer adds none.
+    pub fn load_with_backend(
+        path: &str,
+        revision: Option<&str>,
+        backend: TokenizerBackend,
+    ) -> Result<Self, String> {
+        let with_specials = load_tokenizer(Some(path), revision, true)?;
+        let mut tokenizer = match backend {
+            TokenizerBackend::HuggingFace => {
+                Self::new(load_tokenizer(Some(path), revision, false)?, with_specials)
+            }
+            TokenizerBackend::Fastokens => {
+                let fast = load_fastokens(path, revision)?;
+                let added = with_specials
+                    .num_special_tokens_added()
+                    .map_err(|e| format!("tokenizer special-token count failed ({path}): {e}"))?;
+                if added == 0 {
+                    Self::new(fast.clone(), fast)
+                } else {
+                    Self::new(fast, with_specials)
+                }
+            }
+        };
         tokenizer.bos = configured_bos(&tokenizer.without_specials, path, revision);
         Ok(tokenizer)
     }
@@ -214,5 +278,92 @@ mod tests {
             tokenizer.encode_chat(&prompt, "<s><s>It").unwrap(),
             vec![2, 0, 0, 3]
         );
+    }
+
+    /// A BPE `tokenizer.json` whose post-processor adds `<s>` when `bos` is set.
+    fn write_bpe_tokenizer(name: &str, bos: bool) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("processor-{name}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let words = ["a", "b", "c", "\u{2581}", "ab", "\u{2581}ab", "bc", "<s>"];
+        let vocab: serde_json::Map<String, serde_json::Value> = words
+            .iter()
+            .enumerate()
+            .map(|(id, word)| (word.to_string(), id.into()))
+            .collect();
+        let post_processor = if bos {
+            serde_json::json!({"type": "TemplateProcessing",
+                "single": [{"SpecialToken": {"id": "<s>", "type_id": 0}},
+                    {"Sequence": {"id": "A", "type_id": 0}}],
+                "pair": [{"Sequence": {"id": "A", "type_id": 0}}],
+                "special_tokens": {"<s>": {"id": "<s>", "ids": [7], "tokens": ["<s>"]}}})
+        } else {
+            serde_json::Value::Null
+        };
+        let tokenizer = serde_json::json!({
+            "version": "1.0",
+            "truncation": null,
+            "padding": null,
+            "added_tokens": [{"id": 7, "content": "<s>", "single_word": false, "lstrip": false,
+                "rstrip": false, "normalized": false, "special": true}],
+            "normalizer": {"type": "Replace", "pattern": {"String": " "}, "content": "\u{2581}"},
+            "pre_tokenizer": {"type": "Split", "pattern": {"String": " "},
+                "behavior": "MergedWithPrevious", "invert": false},
+            "post_processor": post_processor,
+            "decoder": null,
+            "model": {"type": "BPE", "dropout": null, "unk_token": null,
+                "continuing_subword_prefix": null, "end_of_word_suffix": null,
+                "fuse_unk": false, "byte_fallback": false, "ignore_merges": false,
+                "vocab": vocab,
+                "merges": [["a", "b"], ["\u{2581}", "ab"], ["b", "c"]]},
+        });
+        std::fs::write(dir.join("tokenizer.json"), tokenizer.to_string()).unwrap();
+        dir
+    }
+
+    /// Fastokens adds no special tokens, so a tokenizer that adds one must keep
+    /// `add_special_tokens` encodes on Hugging Face.
+    #[test]
+    fn fastokens_ids_match_huggingface_in_both_special_token_modes() {
+        for bos in [false, true] {
+            let dir = write_bpe_tokenizer(if bos { "fast-bos" } else { "fast" }, bos);
+            let path = dir.to_str().unwrap();
+            let reference = DynamoTokenizer::load(path, None).unwrap();
+            let fast = DynamoTokenizer::load_with_backend(path, None, TokenizerBackend::Fastokens)
+                .unwrap();
+            std::fs::remove_dir_all(&dir).ok();
+            for text in ["ab abc", "<s>ab  ab<s> bc a"] {
+                for add_special_tokens in [false, true] {
+                    assert_eq!(
+                        fast.encode(text, add_special_tokens).unwrap(),
+                        reference.encode(text, add_special_tokens).unwrap(),
+                        "bos={bos} text={text:?} add_special_tokens={add_special_tokens}"
+                    );
+                }
+            }
+            assert_eq!(fast.encode("ab abc", false).unwrap(), vec![4, 5, 2]);
+            assert_eq!(
+                fast.encode("ab", true).unwrap(),
+                if bos { vec![7, 4] } else { vec![4] }
+            );
+            let segments = [
+                EncodeSegment::new("<s>ab", true),
+                EncodeSegment::new(" bc", true),
+            ];
+            assert_eq!(
+                fast.encode_segments(&segments, true).unwrap(),
+                reference.encode_segments(&segments, true).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn fastokens_needs_a_tokenizer_json() {
+        let dir = std::env::temp_dir().join(format!("processor-fast-none-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("tiktoken.model");
+        std::fs::write(&path, "").unwrap();
+        let error = load_fastokens(path.to_str().unwrap(), None).err().unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(error.contains("needs a tokenizer.json"), "{error}");
     }
 }
