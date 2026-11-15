@@ -37,6 +37,7 @@ from sglang.kernels.ops.sampling.softcap_row_argmax import (
     merge_row_argmax_shards,
     softcap_row_argmax,
 )
+from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
 from sglang.srt.beam_search.logits_capture import BeamLogitsCapture
 from sglang.srt.distributed.device_communicators import triton_symm_mem_ag
 from sglang.srt.environ import envs
@@ -58,6 +59,10 @@ from sglang.srt.layers.logprob_processor import (
     get_token_ids_logprobs_raw,
     get_top_logprobs_raw,
 )
+from sglang.srt.layers.quantization.unquant import (
+    bf16_gemm_dispatch,
+    get_bf16_gemm_backend,
+)
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.managers.auxiliary_output import DeviceAuxiliaryOutput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -76,6 +81,7 @@ from sglang.srt.utils.device import (
     is_hip,
     is_npu,
     is_pin_memory_available,
+    is_sm120,
     use_intel_amx_backend,
 )
 
@@ -94,6 +100,30 @@ def _aiter_lm_head_ok(hidden_states: torch.Tensor, weight: torch.Tensor) -> bool
         _use_aiter_lm_head
         and hidden_states.dim() == 2
         and hidden_states.dtype == weight.dtype == torch.bfloat16
+    )
+
+
+def _sm120_bf16_lm_head_candidate(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    out: Optional[torch.Tensor],
+) -> bool:
+    # Row-count, layout and alignment checks stay inside bf16_gemm_dispatch.
+    return (
+        get_bf16_gemm_backend().is_gemv()
+        and not get_exec().deterministic.enable_deterministic_inference
+        and not is_batch_invariant_mode_enabled()
+        and hidden_states.ndim == 2
+        and hidden_states.is_cuda
+        and hidden_states.device == weight.device
+        and hidden_states.dtype == weight.dtype == torch.bfloat16
+        and not hidden_states.requires_grad
+        and not weight.requires_grad
+        and hidden_states.shape[-1] == 2560
+        and weight.shape == (248320, 2560)
+        and is_sm120()
+        # Preserve the caller-owned BF16 output path.
+        and (out is None or out.dtype != torch.bfloat16)
     )
 
 
@@ -1361,6 +1391,11 @@ class LogitsProcessor(nn.Module):
                 )
             elif _aiter_lm_head_ok(hidden_states, lm_head.weight):
                 logits = tgemm.mm(hidden_states, lm_head.weight)
+            elif (
+                embedding_bias is None
+                and _sm120_bf16_lm_head_candidate(hidden_states, lm_head.weight, out)
+            ):
+                logits = bf16_gemm_dispatch(hidden_states, lm_head.weight, None)
             else:
                 lhs = hidden_states.to(lm_head.weight.dtype)
                 if out is not None and out.dtype == lm_head.weight.dtype:

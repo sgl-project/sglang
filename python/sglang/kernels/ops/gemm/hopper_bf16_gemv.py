@@ -55,6 +55,18 @@ def _jit_hopper_bf16_gemv_module(n: int, k: int) -> Module:
 
 
 def use_hopper_bf16_gemv(m: int, n: int, k: int) -> bool:
+    # Additional single-row BF16 shapes validated on RTX 5070 Ti.
+    if (
+        current_arch().is_sm(12, 0)
+        and m == 1
+        and (n, k) in {
+            (18432, 2560),  # MLP gate/up
+            (12288, 2560),  # GDN QKVZ
+            (248320, 2560),  # LM head
+        }
+    ):
+        return True
+
     if _is_sm12x():
         # SM12x: kUnroll==1 needs only 16B-aligned K (128 for margin);
         # 12288 <= N < 32768 stays on cuBLAS, which already saturates DRAM there.
