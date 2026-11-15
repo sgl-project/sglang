@@ -77,7 +77,7 @@ class PythonicDetector(BaseFormatDetector):
         normal_text = normal_text_before + normal_text_after
 
         try:
-            call_text, kw_renamed = rename_reserved_kwargs(tool_call_text)
+            call_text, renamed_kwargs = rename_reserved_kwargs(tool_call_text)
             module = safe_ast_parse(call_text)
             parsed = getattr(module.body[0], "value", None)
             if not (
@@ -109,8 +109,10 @@ class PythonicDetector(BaseFormatDetector):
                         arguments[keyword.arg] = self._get_parameter_value(
                             keyword.value
                         )
-                    if kw_renamed:
-                        arguments = restore_reserved_kwarg_names(arguments)
+                    if renamed_kwargs:
+                        arguments = restore_reserved_kwarg_names(
+                            arguments, renamed_kwargs
+                        )
                     # allow_nan=False: a non-finite float (e.g. the literal
                     # 1e999 overflowing to inf) would otherwise serialize as
                     # Infinity, which is not valid JSON for downstream clients.

@@ -193,11 +193,8 @@ class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBas
                     # forward branch in UnquantizedFusedMoEMethod). The loader's
                     # shared_w13 [up||gate] swap keys on the same predicate.
                     # Routed quant-EXCLUDED bf16 layers keep the triton runner.
-                    return UnquantizedFusedMoEMethod(
-                        use_triton_kernels=False,
-                        use_flashinfer_trtllm_moe=True,
-                    )
-                return UnquantizedFusedMoEMethod(use_triton_kernels=False)
+                    return UnquantizedFusedMoEMethod(use_flashinfer_trtllm_moe=True)
+                return UnquantizedFusedMoEMethod()
             logger.debug(f"quantizing fused MoE layer: {prefix}")
             # Upstream ModelOpt NVFP4 fused-MoE method. It de-interleaves the Inkling
             # interleaved-w13 layout when the layer sets inference_moe_w13_interleaved.

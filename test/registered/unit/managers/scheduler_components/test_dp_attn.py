@@ -717,6 +717,7 @@ class TestDPShutdownVote(CustomTestCase):
         scheduler.spec_algorithm = SpeculativeAlgorithm.NONE
         scheduler.require_mlp_sync = True
         scheduler.gracefully_exit = False
+        scheduler.rust_server = None
         Scheduler.init_dp_attn_adapter(scheduler)
         adapter = scheduler.dp_attn_adapter
         adapter.on_peer_shutdown()
@@ -742,6 +743,110 @@ class TestDPShutdownVote(CustomTestCase):
         self.assertEqual(info._get_fallback_tensor(device="cpu")[11].item(), 0)
         info.finalize_local()
         self.assertTrue(info.any_shutting_down)
+
+
+class TestDPDrainColumn(CustomTestCase):
+    """Every attention-DP group's listener drain state rides each step's
+    MLP-sync gather to every listener."""
+
+    def _gather(self, *, local_state: int, peer_state: int, skip_gather=False):
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.DECODE,
+            batch_size=lambda: 1,
+            spec_info=None,
+            reqs=[SimpleNamespace(rid="req-0", seqlen=1)],
+            seq_lens_cpu=None,
+            dp_balance_stats=None,
+        )
+        tbo_preparer = Mock()
+        tbo_preparer.prepare_all_gather.return_value = (True, ForwardMode.DECODE.value)
+        tbo_preparer.compute_output.return_value = (None, ForwardMode.DECODE)
+
+        def fake_exchange(output, local, group, **_):
+            peer = local.clone()
+            peer[12] = peer_state
+            output.copy_(torch.stack([local, peer]).flatten())
+
+        on_drain_rows = Mock()
+        adapter = dp_attn.SchedulerDPAttnAdapter(
+            model_runner=SimpleNamespace(
+                prefill_cuda_graph_runner=None,
+                spec_algorithm=SpeculativeAlgorithm.NONE,
+                model_config=object(),
+            ),
+            req_to_token_pool=None,
+            token_to_kv_pool_allocator=None,
+            tree_cache=None,
+            offload_tags=set(),
+            model_config=None,
+            enable_overlap=False,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            get_require_mlp_sync=lambda: True,
+            get_drain_state=lambda: local_state,
+            on_drain_rows=on_drain_rows,
+        )
+        with (
+            envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(skip_gather),
+            patch.object(dp_attn, "TboDPAttentionPreparer", return_value=tbo_preparer),
+            patch.object(dp_attn, "world_dp_gather_enabled", return_value=False),
+            patch.object(
+                dp_attn,
+                "get_parallel",
+                return_value=SimpleNamespace(
+                    num_dp_ranks=2,
+                    attn_tp_size=1,
+                    attn_cp_size=1,
+                    dwdp_size=1,
+                    tp_group=SimpleNamespace(
+                        device_group=object(),
+                        device="cpu",
+                        cpu_group=object(),
+                        active_ranks_cpu=torch.ones(2, dtype=torch.int64),
+                    ),
+                ),
+            ),
+            patch.object(dp_attn, "check_cuda_graph_backend", return_value=False),
+            patch.object(dp_attn, "cuda_graph_fully_disabled", return_value=True),
+            patch.object(dp_attn, "require_mlp_tp_gather", return_value=True),
+            patch.object(
+                dp_attn,
+                "get_schedule",
+                return_value=SimpleNamespace(disable_overlap_schedule=True),
+            ),
+            patch.object(dp_attn, "exchange_sync_rows", side_effect=fake_exchange),
+        ):
+            adapter.prepare_mlp_sync_batch(batch)
+        return on_drain_rows
+
+    def test_every_listener_row_reaches_the_callback(self):
+        self._gather(local_state=5, peer_state=1).assert_called_once_with([5, 1])
+
+    def test_no_callback_without_gathered_metadata(self):
+        self._gather(local_state=1, peer_state=1, skip_gather=True).assert_not_called()
+
+    def test_column_defaults(self):
+        # Python mode gathers 0; an inactive slot decodes as no listener.
+        info = dp_attn.MLPSyncBatchInfo(
+            num_dp_ranks=1,
+            tp_size=1,
+            cp_size=1,
+            num_tokens=0,
+            num_tokens_for_logprob=0,
+            can_run_decode_cuda_graph=True,
+            can_run_draft_cuda_graph=True,
+            can_run_prefill_cuda_graph=False,
+            is_extend_in_batch=False,
+            local_can_run_tbo=False,
+            local_forward_mode=ForwardMode.IDLE.value,
+        )
+        self.assertEqual(info._get_local_tensor(device="cpu")[12].item(), 0)
+        self.assertEqual(
+            info._get_fallback_tensor(device="cpu")[12].item(),
+            dp_attn.DRAIN_STATE_NO_LISTENER,
+        )
+        info.drain_state = 5
+        info.finalize_local()
+        self.assertEqual(info.tp0_info_cpu[:, 12].tolist(), [5])
 
 
 _EXCHANGE_WORLDS = (2, 3, 4, 5, 6, 8)
@@ -786,6 +891,7 @@ def _exchange_worker(rank, world, port, out_q):
                     is_shutting_down=(
                         round_idx == _EXCHANGE_ROUNDS - 1 and rank == sub - 1
                     ),
+                    drain_state=(rank + round_idx) % 8,
                 )
                 local = info._get_local_tensor(device="cpu")
                 reference = torch.zeros(sub * local.numel(), dtype=torch.int64)
@@ -815,6 +921,7 @@ def _exchange_worker(rank, world, port, out_q):
                         info.global_attention_pairs,
                         info.can_run_decode_cuda_graph,
                         info.any_shutting_down,
+                        info.tp0_info_cpu[:, 12].tolist(),
                     )
                 )
     finally:
@@ -846,10 +953,17 @@ class TestSyncRowExchangeGloo(CustomTestCase):
             for proc in procs:
                 proc.start()
             for _ in range(sum(_EXCHANGE_WORLDS) * _EXCHANGE_ROUNDS):
-                sub, round_idx, rank, same, tokens, pairs, graph, stop = out_q.get(
-                    timeout=240
+                sub, round_idx, rank, same, tokens, pairs, graph, stop, drain = (
+                    out_q.get(timeout=240)
                 )
-                results[(sub, round_idx, rank)] = (same, tokens, pairs, graph, stop)
+                results[(sub, round_idx, rank)] = (
+                    same,
+                    tokens,
+                    pairs,
+                    graph,
+                    stop,
+                    drain,
+                )
             for proc in procs:
                 proc.join(timeout=60)
                 self.assertEqual(proc.exitcode, 0)
@@ -862,7 +976,9 @@ class TestSyncRowExchangeGloo(CustomTestCase):
         for sub in _EXCHANGE_WORLDS:
             for round_idx in range(_EXCHANGE_ROUNDS):
                 for rank in range(sub):
-                    same, tokens, pairs, graph, stop = results[(sub, round_idx, rank)]
+                    same, tokens, pairs, graph, stop, drain = results[
+                        (sub, round_idx, rank)
+                    ]
                     self.assertTrue(
                         same, f"world {sub} round {round_idx} rank {rank} differs"
                     )
@@ -876,6 +992,8 @@ class TestSyncRowExchangeGloo(CustomTestCase):
                     self.assertFalse(graph)
                     # One rank's ShutdownReq reaches every rank in the same step.
                     self.assertEqual(stop, round_idx == _EXCHANGE_ROUNDS - 1)
+                    # Every rank's drain state, one row per DP rank.
+                    self.assertEqual(drain, [(r + round_idx) % 8 for r in range(sub)])
 
 
 if __name__ == "__main__":

@@ -38,7 +38,7 @@ from sglang.srt.function_call.mistral_detector import MistralDetector
 from sglang.srt.function_call.parser_names import TOOL_CALL_PARSER_NAMES
 from sglang.srt.function_call.pythonic_detector import PythonicDetector
 from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
-from sglang.srt.function_call.utils import get_schema_properties
+from sglang.srt.function_call.utils import get_schema_properties, rename_reserved_kwargs
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -559,6 +559,100 @@ class TestPythonicDetector(unittest.TestCase):
         self.assertEqual(len(stream_result.calls), 1)
         stream_params = json.loads(stream_result.calls[0].parameters)
         self.assertEqual(stream_params, params)
+
+    def test_reserved_kwarg_reverse_mapping_preserves_other_names_and_values(self):
+        cases = [
+            (
+                '[get_weather(from=1, from_pyreservedkw_=2, '
+                'from_pyreservedkw__pyreservedkw_=3, location="from=, in=, class=", '
+                'payload={"class": "in=", "from_pyreservedkw_": 4}, '
+                'enabled=True, missing=None)]',
+                [
+                    {
+                        "from": 1,
+                        "from_pyreservedkw_": 2,
+                        "from_pyreservedkw__pyreservedkw_": 3,
+                        "location": "from=, in=, class=",
+                        "payload": {"class": "in=", "from_pyreservedkw_": 4},
+                        "enabled": True,
+                        "missing": None,
+                    }
+                ],
+            ),
+            (
+                "[get_weather(from_pyreservedkw_=2)]",
+                [{"from_pyreservedkw_": 2}],
+            ),
+            (
+                "[get_weather(from=1), get_weather(from_pyreservedkw_=2, in=3)]",
+                [{"from": 1}, {"from_pyreservedkw_": 2, "in": 3}],
+            ),
+        ]
+        for detector_type in (PythonicDetector, Lfm2Detector):
+            for streaming in (False, True):
+                for content, expected in cases:
+                    with self.subTest(
+                        detector=detector_type.__name__,
+                        streaming=streaming,
+                        content=content,
+                    ):
+                        text = content
+                        if detector_type is Lfm2Detector:
+                            text = (
+                                "<|tool_call_start|>" + content + "<|tool_call_end|>"
+                            )
+                        detector = detector_type()
+                        if streaming:
+                            split = len(text) // 2
+                            first = detector.parse_streaming_increment(
+                                text[:split], self.tools
+                            )
+                            self.assertEqual(first.calls, [])
+                            result = detector.parse_streaming_increment(
+                                text[split:], self.tools
+                            )
+                        else:
+                            result = detector.detect_and_parse(text, self.tools)
+                        self.assertEqual(
+                            [call.name for call in result.calls],
+                            ["get_weather"] * len(expected),
+                        )
+                        self.assertEqual(
+                            [json.loads(call.parameters) for call in result.calls],
+                            expected,
+                        )
+
+    def test_reserved_kwarg_rewrite_leaves_nonkeyword_identifiers_unchanged(self):
+        text = (
+            'from_pyreservedkw_(from=1, value=from_pyreservedkw_, '
+            'other=True, text="class=2")'
+        )
+        rewritten, renamed = rename_reserved_kwargs(text)
+        replacement = "from_pyreservedkw__pyreservedkw_"
+        self.assertEqual(rewritten, text.replace("(from=", f"({replacement}="))
+        self.assertEqual(renamed, {replacement: "from"})
+
+    def test_lfm2_salvaged_calls_keep_individual_reserved_kwarg_mappings(self):
+        text = (
+            "<|tool_call_start|>[get_weather(from=1, in_pyreservedkw_=2), "
+            "broken(value=), get_weather(in=3, from_pyreservedkw_=4)]"
+            "<|tool_call_end|>"
+        )
+        for streaming in (False, True):
+            with self.subTest(streaming=streaming):
+                detector = Lfm2Detector()
+                if streaming:
+                    result = detector.parse_streaming_increment(text, self.tools)
+                else:
+                    result = detector.detect_and_parse(text, self.tools)
+                self.assertEqual(len(result.calls), 2)
+                self.assertEqual(
+                    [json.loads(call.parameters) for call in result.calls],
+                    [
+                        {"from": 1, "in_pyreservedkw_": 2},
+                        {"in": 3, "from_pyreservedkw_": 4},
+                    ],
+                )
 
     def test_parse_streaming_no_brackets(self):
         """Test parsing text with no brackets (no tool calls)."""
