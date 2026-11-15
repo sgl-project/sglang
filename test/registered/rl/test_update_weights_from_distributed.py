@@ -32,13 +32,14 @@ import sglang as sgl
 from sglang.srt.utils import init_custom_process_group
 from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorBucket
 from sglang.test.test_utils import (
-    ADMIN_API_KEY_FOR_TEST,
     ADMIN_HEADERS_FOR_TEST,
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    admin_post,
     is_in_amd_ci,
     is_in_ci,
     popen_launch_server,
@@ -110,10 +111,8 @@ def _warmup_update(
         )
         engine.end_weight_update()
     else:
-        requests.post(
-            f"{url}/begin_weight_update", json={}, headers=ADMIN_HEADERS_FOR_TEST
-        )
-        requests.post(
+        admin_post(f"{url}/begin_weight_update", json={})
+        admin_post(
             f"{url}/update_weights_from_distributed",
             json={
                 "names": names,
@@ -123,11 +122,8 @@ def _warmup_update(
                 "load_format": load_format,
                 "flush_cache": not (pause_generation_mode == "in_place"),
             },
-            headers=ADMIN_HEADERS_FOR_TEST,
         )
-        requests.post(
-            f"{url}/end_weight_update", json={}, headers=ADMIN_HEADERS_FOR_TEST
-        )
+        admin_post(f"{url}/end_weight_update", json={})
 
 
 def init_process(
@@ -347,8 +343,7 @@ def init_process_sgl(
                 str(tp_size),
                 "--cuda-graph-max-bs-decode",
                 2,
-                "--admin-api-key",
-                ADMIN_API_KEY_FOR_TEST,
+                *ADMIN_LAUNCH_ARGS_FOR_TEST,
             ),
         )
     torch.cuda.synchronize()
@@ -381,7 +376,7 @@ def init_process_sgl(
             backend="nccl",
         )
     else:
-        requests.post(
+        admin_post(
             f"{url}/init_weights_update_group",
             json={
                 "master_address": "localhost",
@@ -391,7 +386,6 @@ def init_process_sgl(
                 "group_name": "test_parameter_update_group",
                 "backend": "nccl",
             },
-            headers=ADMIN_HEADERS_FOR_TEST,
         )
 
     if pause_generation_mode in ["in_place", "retract"]:
@@ -431,10 +425,9 @@ def init_process_sgl(
     shapes = [state_dict_key_to_shape[parameter_name] for parameter_name in names]
 
     if pause_generation_mode in ["in_place", "retract"]:
-        requests.post(
+        admin_post(
             url + "/pause_generation",
             json={"mode": pause_generation_mode},
-            headers=ADMIN_HEADERS_FOR_TEST,
         )
     torch.cuda.synchronize()
     barrier.wait()
@@ -465,10 +458,8 @@ def init_process_sgl(
         )
         engine.end_weight_update()
     else:
-        requests.post(
-            f"{url}/begin_weight_update", json={}, headers=ADMIN_HEADERS_FOR_TEST
-        )
-        requests.post(
+        admin_post(f"{url}/begin_weight_update", json={})
+        admin_post(
             f"{url}/update_weights_from_distributed",
             json={
                 "names": names,
@@ -478,26 +469,21 @@ def init_process_sgl(
                 "load_format": load_format,
                 "flush_cache": not (pause_generation_mode == "in_place"),
             },
-            headers=ADMIN_HEADERS_FOR_TEST,
         )
-        requests.post(
-            f"{url}/end_weight_update", json={}, headers=ADMIN_HEADERS_FOR_TEST
-        )
+        admin_post(f"{url}/end_weight_update", json={})
     torch.cuda.synchronize()
     time_end_update = time.perf_counter()
     if pause_generation_mode in ["in_place", "retract"]:
-        requests.post(
+        admin_post(
             url + "/continue_generation",
             json={},
-            headers=ADMIN_HEADERS_FOR_TEST,
         )
 
         # discard unfinished requests to save test overhead
         time.sleep(2)
-        requests.post(
+        admin_post(
             url + "/pause_generation",
             json={"mode": "abort"},
-            headers=ADMIN_HEADERS_FOR_TEST,
         )
 
     # Measure the latency of broadcast/weights update.
@@ -533,12 +519,11 @@ def init_process_sgl(
         )
         assert success is True
     else:
-        response = requests.post(
+        response = admin_post(
             f"{url}/destroy_weights_update_group",
             json={
                 "group_name": "test_parameter_update_group",
             },
-            headers=ADMIN_HEADERS_FOR_TEST,
         )
         assert response.status_code == 200
 
