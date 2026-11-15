@@ -123,6 +123,21 @@ class TestUnifiedMemoryStats(CustomTestCase):
         self.assertEqual(counters.urgent_compaction_moves, moved)
         self.assertEqual(counters.opportunistic_compactions, 1)
 
+    def test_a_device_pack_counts_the_pages_it_absorbed(self):
+        """A device pack's moves stay on the device: it counts as a pack with
+        the pages its span gave back, never as host moves."""
+        taken = self._take(8)
+        self.allocator.free(torch.cat([taken[1], taken[3], taken[5]]))
+        self.assertTrue(self.full.can_pack_on_device())
+        self.full.pack_on_device()
+        stats = self.allocator.stats().bands[self.full.sub_pool_name]
+        self.assertEqual((stats.live_pages, stats.hole_pages), (5, 0))
+        counters = stats.counters
+        self.assertEqual(counters.device_packs, 1)
+        self.assertEqual(counters.device_pack_absorbed_pages, 3)
+        self.assertEqual(counters.urgent_compactions, 0)
+        self.assertEqual(counters.urgent_compaction_moves, 0)
+
     def test_storage_reports_bands_by_published_label(self):
         storage = self.bundle.storage
         labels = {u.label for u in storage.usage()}

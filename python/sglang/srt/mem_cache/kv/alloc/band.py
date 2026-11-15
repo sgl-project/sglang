@@ -2953,6 +2953,7 @@ class Band:
             self._stats_n_device_packs += 1
             # The frontier moves from ``end - first`` pages to the live count.
             self._stats_n_pages_absorbed += end - first - live
+            self.counters.note_device_pack(end - first - live)
             self._maybe_emit_stats()
 
     def _move_packed_pages(

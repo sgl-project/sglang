@@ -569,13 +569,18 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
         )
         self.unified_memory_compactions_total = Counter(
             name="sglang:unified_memory_compactions_total",
-            documentation="Compaction passes that moved pages, by sub-pool and mode (urgent or opportunistic).",
+            documentation="Compaction passes, by sub-pool and mode: host passes that moved pages (urgent or opportunistic), and every device pack (device_pack).",
             labelnames=[*sub_pool_labelnames, "mode"],
         )
         self.unified_memory_compaction_moved_pages_total = Counter(
             name="sglang:unified_memory_compaction_moved_pages_total",
-            documentation="Pages compaction moved, by sub-pool and mode (urgent or opportunistic).",
+            documentation="Pages host compaction passes moved, by sub-pool and mode (urgent or opportunistic); a device pack's moves stay on the device.",
             labelnames=[*sub_pool_labelnames, "mode"],
+        )
+        self.unified_memory_device_pack_absorbed_pages_total = Counter(
+            name="sglang:unified_memory_device_pack_absorbed_pages_total",
+            documentation="Pages device packs absorbed (the span shrinking to the live count), by sub-pool.",
+            labelnames=sub_pool_labelnames,
         )
         self.unified_memory_float_relocations_total = Counter(
             name="sglang:unified_memory_float_relocations_total",
@@ -1611,6 +1616,17 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
                     sub_pool=sub_pool,
                     mode=mode,
                 )
+            self._log_total(
+                self.unified_memory_compactions_total,
+                c.device_packs,
+                sub_pool=sub_pool,
+                mode="device_pack",
+            )
+            self._log_total(
+                self.unified_memory_device_pack_absorbed_pages_total,
+                c.device_pack_absorbed_pages,
+                sub_pool=sub_pool,
+            )
             self._log_total(
                 self.unified_memory_float_relocations_total,
                 c.float_relocations,

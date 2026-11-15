@@ -73,19 +73,19 @@ from sglang.srt.mem_cache.kv.alloc.pricing import (
     snapshot_chain,
 )
 from sglang.srt.mem_cache.kv.alloc.signals import NetworkWaiter
-from sglang.srt.mem_cache.kv.alloc.stats import (
-    REFUSED,
-    BandLayout,
-    ChainCounters,
-    ChainStats,
-    free_gaps,
-)
 from sglang.srt.mem_cache.kv.alloc.stage_capacity import (
     StageCapacity,
     StageGeometry,
     check_stage_pools,
     simulated_snapshot,
     stage_geometry,
+)
+from sglang.srt.mem_cache.kv.alloc.stats import (
+    REFUSED,
+    BandLayout,
+    ChainCounters,
+    ChainStats,
+    free_gaps,
 )
 from sglang.srt.mem_cache.kv.memory.arena import KVArena
 from sglang.srt.mem_cache.utils import get_num_new_pages
@@ -1859,6 +1859,7 @@ class ChainAllocator(BaseTokenToKVPoolAllocator):
             return
         packed = self._pack_ends_on_device(demands)
         if packed is not None:
+            self.counters.note_plan(packed.step)
             yield packed
             return
         # Settle pending pages first, so the plan and its realization see holes

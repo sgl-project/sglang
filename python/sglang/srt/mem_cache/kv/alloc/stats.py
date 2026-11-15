@@ -27,6 +27,10 @@ class BandCounters(msgspec.Struct, kw_only=True):
     urgent_compaction_moves: int = 0
     opportunistic_compactions: int = 0
     opportunistic_compaction_moves: int = 0
+    # Packs done on the device, whose moves are never read on the host, and
+    # the pages each absorbed (the span shrinking to the live count).
+    device_packs: int = 0
+    device_pack_absorbed_pages: int = 0
     # A float's relocations into a planned block, and the pages they copied.
     float_relocations: int = 0
     float_relocated_pages: int = 0
@@ -38,6 +42,10 @@ class BandCounters(msgspec.Struct, kw_only=True):
         else:
             self.opportunistic_compactions += 1
             self.opportunistic_compaction_moves += moves
+
+    def note_device_pack(self, absorbed: int) -> None:
+        self.device_packs += 1
+        self.device_pack_absorbed_pages += absorbed
 
     def note_relocation(self, moves: int) -> None:
         self.float_relocations += 1
