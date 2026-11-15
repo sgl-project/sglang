@@ -730,6 +730,7 @@ def commit_after_verify(
         track,
         steps,
         src_indices_raw=rows,
+        rows_loop=envs.SGLANG_MAMBA_SSM_COMMIT_ROW_LOOP.get(),
     )
 
 

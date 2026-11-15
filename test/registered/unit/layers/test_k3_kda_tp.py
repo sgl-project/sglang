@@ -812,7 +812,9 @@ def _commit_worker(rank, world, port, backend, counts, q):
         last = torch.arange(n) if n else None
         calls = []
 
-        def scatter(caches, slots, last, track, steps, src_indices_raw=None):
+        def scatter(
+            caches, slots, last, track, steps, src_indices_raw=None, rows_loop=False
+        ):
             calls.append((caches, slots, last, src_indices_raw))
 
         with (

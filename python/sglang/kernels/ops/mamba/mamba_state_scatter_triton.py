@@ -413,6 +413,125 @@ def fused_mamba_state_scatter_with_mask(
 
 
 @triton.jit
+def _ssm_scatter_rows_loop_kernel(
+    src_ptr,
+    dst_ptr,
+    idx1_ptr,
+    step1_ptr,
+    idx2_ptr,
+    step2_ptr,
+    rows_ptr,
+    n_req,
+    HAS_SET2: tl.constexpr,
+    elem_per_entry: tl.constexpr,
+    src_layer_stride,
+    src_req_stride,
+    src_step_stride,
+    dst_layer_stride,
+    dst_req_stride,
+    src_req_size,
+    src_step_size,
+    dst_req_size,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """One program per (layer, element block) looping over the requests: a padded
+    request list with few valid entries costs no per-request programs."""
+    pid_layer = tl.program_id(0).to(tl.int64)
+    pid_block = tl.program_id(1).to(tl.int64)
+    offsets = pid_block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offsets < elem_per_entry
+    src_base = src_ptr + pid_layer * src_layer_stride + offsets
+    dst_base = dst_ptr + pid_layer * dst_layer_stride + offsets
+    for r in range(0, n_req):
+        src_idx = tl.load(rows_ptr + r).to(tl.int64)
+        for k in tl.static_range(2 if HAS_SET2 else 1):
+            if k == 0:
+                step_idx = tl.load(step1_ptr + r).to(tl.int64)
+                dst_idx = tl.load(idx1_ptr + r).to(tl.int64)
+            else:
+                step_idx = tl.load(step2_ptr + r).to(tl.int64)
+                dst_idx = tl.load(idx2_ptr + r).to(tl.int64)
+            if (
+                (step_idx >= 0)
+                & (step_idx < src_step_size)
+                & (dst_idx >= 0)
+                & (dst_idx < dst_req_size)
+                & (src_idx >= 0)
+                & (src_idx < src_req_size)
+            ):
+                data = tl.load(
+                    src_base + src_idx * src_req_stride + step_idx * src_step_stride,
+                    mask=mask,
+                )
+                tl.store(dst_base + dst_idx * dst_req_stride, data, mask=mask)
+
+
+def ssm_scatter_rows_loop(
+    dst: torch.Tensor,  # [num_layers, cache_size, *state_shape]
+    src: torch.Tensor,  # [num_layers, spec_size, draft_tokens, *state_shape]
+    dst_indices: torch.Tensor,
+    step_indices: torch.Tensor,
+    src_rows: torch.Tensor,
+    dst_indices2: torch.Tensor | None = None,
+    step_indices2: torch.Tensor | None = None,
+) -> None:
+    """``fused_mamba_state_scatter_with_mask`` over the accept set and the optional
+    track set (same scratch rows) in one launch whose grid does not grow with the
+    request count. Same copies, so bitwise identical results."""
+    n = step_indices.shape[0]
+    if n == 0:
+        return
+    if dst.ndim < 2 or src.ndim < 3 or dst.shape[0] != src.shape[0]:
+        raise ValueError(f"Unexpected shapes: {dst.shape=} {src.shape=}")
+    if dst.shape[2:] != src.shape[3:]:
+        raise ValueError(
+            f"Trailing dims mismatch: {dst.shape[2:]=} vs {src.shape[3:]=}"
+        )
+    has2 = step_indices2 is not None
+    for t in (dst_indices, src_rows) + ((dst_indices2, step_indices2) if has2 else ()):
+        if t.shape != step_indices.shape:
+            raise ValueError(
+                f"index length mismatch: {t.shape=} vs {step_indices.shape=}"
+            )
+    _require_entry_contiguous_dst(dst, 2, "ssm_scatter_rows_loop")
+    if not src.is_contiguous():
+        raise ValueError("src tensor must be contiguous")
+    idx1, st1, rows = (
+        dst_indices.contiguous(),
+        step_indices.contiguous(),
+        src_rows.contiguous(),
+    )
+    idx2, st2 = (
+        (dst_indices2.contiguous(), step_indices2.contiguous()) if has2 else (idx1, st1)
+    )
+    elem_per_entry = dst.numel() // (dst.shape[0] * dst.shape[1])
+    BLOCK_SIZE = 4096
+    grid = (dst.shape[0], triton.cdiv(elem_per_entry, BLOCK_SIZE))
+    _ssm_scatter_rows_loop_kernel[grid](
+        src,
+        dst,
+        idx1,
+        st1,
+        idx2,
+        st2,
+        rows,
+        n,
+        has2,
+        elem_per_entry,
+        src.stride(0),
+        src.stride(1),
+        src.stride(2),
+        dst.stride(0),
+        dst.stride(1),
+        src.shape[1],
+        src.shape[2],
+        dst.shape[1],
+        BLOCK_SIZE=BLOCK_SIZE,
+        num_warps=8,
+    )
+
+
+@triton.jit
 def _fused_conv_window_scatter_with_mask_kernel(
     src_ptr,
     dst_ptr,
@@ -785,13 +904,27 @@ def scatter_mamba_states_after_mtp_verify(
     mamba_track_indices: torch.Tensor | None,
     mamba_steps_to_track: torch.Tensor | None,
     src_indices_raw: torch.Tensor | None = None,
+    rows_loop: bool = False,
 ) -> None:
     """Scatter per-step verify states (ssm + all conv types) into the
-    persistent caches, plus the interval-crossing track slots."""
+    persistent caches, plus the interval-crossing track slots. ``rows_loop``
+    (with explicit ``src_indices_raw``) commits the SSM states with one launch
+    whose grid does not grow with the request count, for request lists that are
+    mostly padding (KDA TP commits every DP rank's padded list)."""
     ssm_states = mamba_caches.temporal
     intermediate_state_cache = mamba_caches.intermediate_ssm
 
-    if ssm_states.numel() > 0:
+    if ssm_states.numel() > 0 and rows_loop and src_indices_raw is not None:
+        ssm_scatter_rows_loop(
+            ssm_states,
+            intermediate_state_cache,
+            state_indices_tensor,
+            last_correct_step_indices,
+            src_indices_raw,
+            mamba_track_indices,
+            mamba_steps_to_track,
+        )
+    elif ssm_states.numel() > 0:
         fused_mamba_state_scatter_with_mask(
             ssm_states,
             intermediate_state_cache,
