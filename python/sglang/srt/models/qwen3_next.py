@@ -13,6 +13,9 @@ from sglang.kernels.ops.attention.qk_gemma_norm_rope import qk_gemma_norm_rope
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat,
 )
+from sglang.srt.batch_invariant_ops.batch_invariant_ops import (
+    _matmul_persistent_triton,
+)
 from sglang.srt.configs.qwen3_next import Qwen3NextConfig
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
@@ -45,6 +48,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding, get_rope
@@ -66,7 +70,7 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import Qwen2MoeMLP, Qwen2MoeSparseMoeBlock
-from sglang.srt.runtime_context import get_parallel, get_stream
+from sglang.srt.runtime_context import get_forward, get_parallel, get_stream
 from sglang.srt.utils import (
     LazyValue,
     cpu_has_amx_support,
@@ -167,6 +171,36 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
     raise TypeError(
         f"{linear.__class__.__name__} cannot consume fused AR quant tuple input"
     )
+
+
+def _forward_ba_proj(
+    ba_proj: nn.Module,
+    x: torch.Tensor,
+    forward_batch: Optional[ForwardBatch],
+) -> torch.Tensor:
+    if (
+        _is_cuda
+        and forward_batch is not None
+        and forward_batch.forward_mode.is_extend()
+        and not forward_batch.forward_mode.is_target_verify()
+        and type(ba_proj) is MergedColumnParallelLinear
+        and isinstance(ba_proj.quant_method, UnquantizedLinearMethod)
+        and ba_proj.bias is None
+        and not ba_proj.gather_output
+        and not get_forward().sp_active
+        and isinstance(x, torch.Tensor)
+        and x.is_cuda
+        and x.dtype == torch.bfloat16
+        and ba_proj.weight.dtype == torch.bfloat16
+        and x.shape[0] > 0
+        and x.numel() > 0
+    ):
+        # Keep GDN gate projections M-invariant across padded prefill graph buckets.
+        return _matmul_persistent_triton(
+            x.reshape(-1, x.shape[-1]), ba_proj.weight.t(), torch.bfloat16
+        ).view(*x.shape[:-1], ba_proj.weight.shape[0])
+    out, _ = ba_proj(x)
+    return out
 
 
 class Qwen3GatedDeltaNet(nn.Module):
@@ -465,7 +499,11 @@ class Qwen3GatedDeltaNet(nn.Module):
 
         return query, key, value, z, b, a
 
-    def _forward_input_proj(self, hidden_states: torch.Tensor):
+    def _forward_input_proj(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: Optional[ForwardBatch] = None,
+    ):
         if (
             _is_cpu
             or _is_npu
@@ -498,11 +536,15 @@ class Qwen3GatedDeltaNet(nn.Module):
             self.alt_stream.wait_stream(current_stream)
             projected_states_qkvz, _ = self.in_proj_qkvz(hs_qkvz)
             with torch.cuda.stream(self.alt_stream):
-                projected_states_ba, _ = self.in_proj_ba(hs_ba)
+                projected_states_ba = _forward_ba_proj(
+                    self.in_proj_ba, hs_ba, forward_batch
+                )
             current_stream.wait_stream(self.alt_stream)
         else:
             projected_states_qkvz, _ = self.in_proj_qkvz(hs_qkvz)
-            projected_states_ba, _ = self.in_proj_ba(hs_ba)
+            projected_states_ba = _forward_ba_proj(
+                self.in_proj_ba, hs_ba, forward_batch
+            )
         return projected_states_qkvz, projected_states_ba
 
     def forward(
@@ -511,7 +553,7 @@ class Qwen3GatedDeltaNet(nn.Module):
         forward_batch: ForwardBatch,
     ):
         projected_states_qkvz, projected_states_ba = self._forward_input_proj(
-            hidden_states
+            hidden_states, forward_batch
         )
 
         if self.num_v_heads // self.num_k_heads in [1, 2, 4] and not _is_cpu:
