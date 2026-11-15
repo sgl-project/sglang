@@ -29,8 +29,8 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.server_fixtures.disaggregation_fixture import get_rdma_devices_args
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
-    ADMIN_API_KEY_FOR_TEST,
     ADMIN_HEADERS_FOR_TEST,
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     CustomTestCase,
@@ -216,7 +216,7 @@ class _ElasticScaleUpEndToEndBase(CustomTestCase):
             dcp_size=cls.DCP_SIZE,
         )
         primary_args.extend(cls.ATTENTION_BACKEND_ARGS)
-        primary_args.extend(["--admin-api-key", ADMIN_API_KEY_FOR_TEST])
+        primary_args.extend(ADMIN_LAUNCH_ARGS_FOR_TEST)
         primary_env = os.environ.copy()
         visible_devices = _visible_device_ids()
         if len(visible_devices) < cls.PRIMARY_TP:
