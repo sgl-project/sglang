@@ -2137,6 +2137,11 @@ class AscendAttnBackend(AttentionBackend):
                 actual_seq_qlen,
                 actual_seq_lengths_kv,
             )
+            logical_rows = getattr(self.forward_metadata, "cp_query_num_tokens", None)
+            if logical_rows is not None:
+                # All-masked physical PCP rows can produce NaNs. They must
+                # not reach the output projection or subsequent reductions.
+                attn_out[logical_rows:].zero_()
         else:
             if topk_indices is not None:
                 topk_indices = self._pad_topk_indices(topk_indices, q_nope.shape[0])
