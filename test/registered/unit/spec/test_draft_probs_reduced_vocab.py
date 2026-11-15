@@ -8,6 +8,7 @@ the chain kernel -- which indexes ``q`` by target token id -- can read it.
 """
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -128,17 +129,30 @@ class TestScatterDraftProbsToTargetVocab(CustomTestCase):
 
 
 class TestVerifyDraftProbsVocabularyMapping(CustomTestCase):
+    def make_worker(self, hot_token_id, target_vocab_size):
+        worker = object.__new__(EagleDraftWorker)
+        worker.hot_token_id = hot_token_id
+        worker.target_worker = SimpleNamespace(
+            model_config=SimpleNamespace(vocab_size=target_vocab_size)
+        )
+        worker._init_draft_probs_vocab_scatter()
+        return worker
+
+    def test_reduced_identity_prefix_is_expanded(self):
+        """A zero-offset reduced map still needs target-width zero padding."""
+        worker = self.make_worker(torch.arange(4, dtype=torch.int64), 8)
+        rows = [torch.rand(2, 4) for _ in range(3)]
+        tokens = torch.tensor([[0, 1, 2], [1, 2, 3]])
+
+        out = worker._build_verify_draft_probs(rows, tokens)
+
+        self.assertEqual(out.shape, (2, 3, 8))
+        torch.testing.assert_close(out[..., :4], torch.stack(rows, dim=1))
+        self.assertEqual(out[..., 4:].count_nonzero().item(), 0)
+
     def test_full_width_permutation_is_scattered(self):
         """A full-width permutation must not take the identity-map fast path."""
-        worker = object.__new__(EagleDraftWorker)
-        worker.hot_token_id = torch.tensor([1, 0, 2, 3], dtype=torch.int64)
-        worker.target_vocab_size = 4
-        worker.draft_probs_need_vocab_scatter = not torch.equal(
-            worker.hot_token_id,
-            torch.arange(
-                worker.hot_token_id.numel(), device=worker.hot_token_id.device
-            ),
-        )
+        worker = self.make_worker(torch.tensor([1, 0, 2, 3], dtype=torch.int64), 4)
         rows = [torch.rand(2, 4) for _ in range(3)]
         tokens = worker.hot_token_id[torch.tensor([[0, 1, 2], [1, 2, 3]])]
 
@@ -153,15 +167,7 @@ class TestVerifyDraftProbsVocabularyMapping(CustomTestCase):
 
     def test_full_width_identity_map_returns_stacked_distribution(self):
         """Identity maps must not allocate and scatter a duplicate q tensor."""
-        worker = object.__new__(EagleDraftWorker)
-        worker.hot_token_id = torch.arange(4, dtype=torch.int64)
-        worker.target_vocab_size = 4
-        worker.draft_probs_need_vocab_scatter = not torch.equal(
-            worker.hot_token_id,
-            torch.arange(
-                worker.hot_token_id.numel(), device=worker.hot_token_id.device
-            ),
-        )
+        worker = self.make_worker(torch.arange(4, dtype=torch.int64), 4)
         rows = [torch.rand(2, 4) for _ in range(3)]
         tokens = torch.tensor([[0, 1, 2], [1, 2, 3]])
 
@@ -176,10 +182,7 @@ class TestVerifyDraftProbsVocabularyMapping(CustomTestCase):
 
     def test_chain_rows_keep_step_order(self):
         """Distinct per-step distributions must stay aligned with their tokens."""
-        worker = object.__new__(EagleDraftWorker)
-        worker.hot_token_id = torch.arange(4, dtype=torch.int64)
-        worker.target_vocab_size = 4
-        worker.draft_probs_need_vocab_scatter = False
+        worker = self.make_worker(torch.arange(4, dtype=torch.int64), 4)
         rows = [torch.full((2, 4), i + 1, dtype=torch.float32) for i in range(3)]
 
         out = worker._build_verify_draft_probs(

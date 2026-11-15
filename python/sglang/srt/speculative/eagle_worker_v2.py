@@ -260,18 +260,9 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         self.init_token_map()
         self.init_lm_head()
-        self.draft_probs_need_vocab_scatter = (
-            self.hot_token_id is not None
-            and not torch.equal(
-                self.hot_token_id,
-                torch.arange(
-                    self.hot_token_id.numel(), device=self.hot_token_id.device
-                ),
-            )
-        )
+        self._init_draft_probs_vocab_scatter()
 
         if get_spec().speculative_use_rejection_sampling:
-            self.target_vocab_size = self.target_worker.model_config.vocab_size
             if (
                 self.hot_token_id is not None
                 and self.hot_token_id.shape[0] != self.target_vocab_size
@@ -291,6 +282,20 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     "target tokens are never proposed and keep their full target "
                     "probability in the residual."
                 )
+
+    def _init_draft_probs_vocab_scatter(self) -> None:
+        self.target_vocab_size = self.target_worker.model_config.vocab_size
+        if self.hot_token_id is None:
+            self.draft_probs_need_vocab_scatter = False
+            return
+        self.draft_probs_need_vocab_scatter = (
+            # An identity-prefix map still needs expansion to the target width.
+            self.hot_token_id.numel() != self.target_vocab_size
+            or not torch.equal(
+                self.hot_token_id,
+                torch.arange(self.target_vocab_size, device=self.hot_token_id.device),
+            )
+        )
 
     @property
     def draft_probs_vocab_size(self) -> int:
