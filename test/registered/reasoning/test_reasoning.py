@@ -3,7 +3,7 @@ import unittest
 
 import requests
 
-from sglang.srt.utils import kill_process_tree
+from sglang.srt.utils import is_hip, kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kits.reasoning_kit import (
     ReasoningTokenUsageMixin,
@@ -17,11 +17,14 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=129, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=100, stage="base-b", runner_config="1-gpu-small")
 # Backend-specific: the thinking-token and separate-reasoning assertions read
 # decoded output from a 30B MoE, so a ROCm fused-MoE or sampling regression
 # shows up here as malformed reasoning_content that CUDA cannot catch.
 register_amd_ci(est_time=200, suite="stage-b-test-1-gpu-small-amd")
+
+# CUDA only needs a Qwen3 thinking model for the parser path; AMD keeps the MoE.
+MODEL = DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST if is_hip() else "Qwen/Qwen3-1.7B"
 
 
 class TestEnableThinking(
@@ -31,7 +34,7 @@ class TestEnableThinking(
 
     @classmethod
     def setUpClass(cls):
-        cls.model = DEFAULT_ENABLE_THINKING_MODEL_NAME_FOR_TEST
+        cls.model = MODEL
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.api_key = "sk-1234"
         cls.init_reasoning_token_verifier()

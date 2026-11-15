@@ -17,13 +17,16 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.layers.moe.moe_runner.aiter import AiterQuantType
 from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.utils import (
+    TRITON_PADDING_SIZE,
     MoeA2ABackend,
     MoeRunnerBackend,
     RoutingMethodType,
+    get_moe_padding_size,
 )
 from sglang.srt.layers.quantization import fp8 as fp8_module
 from sglang.srt.layers.quantization import mxfp4_flashinfer_cutlass_moe as cutlass_mxfp4
@@ -41,7 +44,7 @@ from sglang.srt.runtime_context import get_context, get_flags, get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 _ACTIVATION_PARAMS = ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit")
 
@@ -404,6 +407,19 @@ class TestFp8MoEAiterWeightLayout(CustomTestCase):
 
     def test_non_fnuz_shuffles_only_for_aiter_runner(self):
         self._check_layout(fnuz=False)
+
+
+class TestMoePaddingEnv(CustomTestCase):
+    def test_moe_padding_accepts_bool_spellings(self):
+        """`SGLANG_MOE_PADDING=true` crashed the import of the Triton MoE modules."""
+        for value, expected in (
+            ("true", TRITON_PADDING_SIZE),
+            ("1", TRITON_PADDING_SIZE),
+            ("false", 0),
+            ("0", 0),
+        ):
+            with self.subTest(value=value), envs.SGLANG_MOE_PADDING.override(value):
+                self.assertEqual(get_moe_padding_size(False), expected)
 
 
 if __name__ == "__main__":

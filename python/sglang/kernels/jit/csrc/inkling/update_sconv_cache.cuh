@@ -100,7 +100,7 @@ struct UpdateSconvCacheKernel {
     auto W1s = SymbolicSize{"W_minus_1"};
     auto B = SymbolicSize{"B"};
     auto dev = SymbolicDevice{};
-    dev.set_options<kDLCUDA>();
+    dev.set_options<kDLGPU>();
     W1s.set_value(W1);
 
     // x channel-contiguous (may be a non-contiguous row view); cache contiguous

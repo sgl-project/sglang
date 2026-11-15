@@ -16,6 +16,7 @@ import torch.nn.functional as F
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once, empty_sentinel, load_jit, make_cpp_args
 from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import fp8_grid_quantize
 
@@ -75,14 +76,10 @@ def _config_table(section: str) -> Dict[str, str]:
 
 
 @cache_once
-def _gfx_name() -> str:
-    return torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
-
-
-@cache_once
 def _select_config(bucket: int, n: int, k: int) -> _GemvConfig:
     """The tuned configuration for (gfx, N, K, M bucket), else the heuristic."""
-    key = f"{_gfx_name()}:{n}:{k}:{bucket}"
+    hip = current_arch().hip
+    key = f"{hip.gcn_arch}:{n}:{k}:{bucket}"
     entry = _config_table("configs").get(key)
     if entry is None:
         return _default_config(bucket)
@@ -173,7 +170,8 @@ def _large_m_bucket(m: int) -> int:
 def _large_m_tile(m: int, n: int, k: int) -> Tuple[int, int, int, int, int]:
     """The dot_scaled tile (BM, BN, BK, warps, split_k) of m's bucket."""
     bucket = _large_m_bucket(m)
-    entry = _config_table("large_m").get(f"{_gfx_name()}:{n}:{k}:{bucket}")
+    hip = current_arch().hip
+    entry = _config_table("large_m").get(f"{hip.gcn_arch}:{n}:{k}:{bucket}")
     if entry is None:
         return _DEFAULT_SMALL_M_TILE if bucket <= 1024 else _DEFAULT_LARGE_M_TILE
     return tuple(int(v) for v in entry.split(","))

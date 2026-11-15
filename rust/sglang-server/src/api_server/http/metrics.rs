@@ -15,6 +15,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 
 use super::app::AppState;
+use super::auth::DeclaredRoute;
 use crate::utils::prometheus;
 
 /// Python's `CONTENT_TYPE_PLAIN_0_0_4`, the type it answers a scrape that
@@ -25,9 +26,9 @@ const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 /// Python's mount also answers any `/metrics` subpath.
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/metrics", get(metrics))
-        .route("/metrics/", get(metrics))
-        .route("/metrics/{*path}", get(metrics))
+        .declared_route("/metrics", get(metrics))
+        .declared_route("/metrics/", get(metrics))
+        .declared_route("/metrics/{*path}", get(metrics))
 }
 
 async fn metrics(State(state): State<Arc<AppState>>) -> Response {
@@ -77,17 +78,22 @@ mod tests {
             ..Default::default()
         });
         let state = Arc::new(AppState {
-            core: crate::api_server::core::CoreHandle::new(
+            core: crate::api_server::handlers::CoreHandle::new(
                 flume::unbounded().0,
                 flume::unbounded().0,
-                crate::api_server::core::CoreConfig {
+                crate::api_server::handlers::CoreConfig {
                     response_capacity: 8,
                     response_activity: Default::default(),
                     startup_ready: true,
                     is_disaggregation: false,
                     mm_limits: Default::default(),
+                    multimodal: false,
+                    peer_endpoints: Vec::new(),
                     metadata: Default::default(),
                     metrics: frontend,
+                    request_log: None,
+                    generate_validator: None,
+                    abort_hook: None,
                 },
             ),
             generation_policy: crate::message::request::GenerationPolicy::from(
@@ -96,6 +102,7 @@ mod tests {
             server_args,
             chat_formatter: None,
             generate_hook: None,
+            openai_chat: None,
         });
         routes().with_state(state)
     }

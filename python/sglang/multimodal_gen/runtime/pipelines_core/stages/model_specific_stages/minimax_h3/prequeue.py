@@ -12,6 +12,7 @@ from __future__ import annotations
 from typing import Any
 
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+    MINIMAX_H3_DEFAULT_REFERENCE_RESIZE_MODE,
     MINIMAX_H3_MAX_DURATION_SECONDS,
     MINIMAX_H3_MIN_DURATION_SECONDS,
     MINIMAX_H3_SUPPORTED_FPS,
@@ -312,7 +313,7 @@ def minimax_h3_prepare_for_queue(batch: Any) -> MiniMaxH3ResolvedPlan:
                 reference_resize_mode = getattr(
                     batch.sampling_params,
                     "reference_resize_mode",
-                    "diffusers",
+                    MINIMAX_H3_DEFAULT_REFERENCE_RESIZE_MODE,
                 )
                 resolved = minimax_h3_resolve_reference_image_shape(
                     width=width,

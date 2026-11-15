@@ -5,9 +5,7 @@ from typing import Optional
 
 import torch
 
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    ComponentType,
-)
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -25,6 +23,9 @@ class CacheConfig:
     decoder_swa_bounded_replay: bool = False
 
     enable_mamba_extra_buffer: bool = False
+    enable_mamba_extra_buffer_lazy: bool = False
+    # Two ping-pong tracking slots with the overlap scheduler, one without.
+    enable_overlap_schedule: bool = True
     mamba_cache_size: int = 20
     mamba_intermediate_size: int = 256
     mamba_n_groups: int = 1
@@ -33,6 +34,7 @@ class CacheConfig:
     mamba_state_size: int = 16
     mamba_conv_kernel: int = 4
     enable_int8_mamba_checkpoint: bool = False
+    hybrid_cache_checkpoints_level: int = 3
 
     kv_size: int = 256
     max_num_reqs: int = 10

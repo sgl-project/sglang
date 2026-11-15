@@ -25,11 +25,7 @@ from sglang.srt.configs.nano_nemotron_vl import (
     NemotronH_Nano_VL_V2_Config,
     NemotronH_Omni_Reasoning_V3_Config,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.nano_nemotron_vl import (
     NemotronH_Nano_Omni_Reasoning_V3,
     NemotronH_Nano_VL_V2,
@@ -45,12 +41,13 @@ from sglang.srt.multimodal.internvl_utils import (
     resize_image_to_pixels,
     video_to_pixel_values,
 )
+from sglang.srt.multimodal.media_io import sample_video_frames
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
 from sglang.srt.runtime_context import get_model
-from sglang.srt.utils.common import sample_video_frames
 
 logger = logging.getLogger(__name__)
 

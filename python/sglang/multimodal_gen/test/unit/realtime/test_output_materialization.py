@@ -6,8 +6,8 @@ import torch
 
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     MAX_FRAME_INTERPOLATION_EXP,
-    DataType,
 )
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     materialize_output_sample,
     save_outputs,

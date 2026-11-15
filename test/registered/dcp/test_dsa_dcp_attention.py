@@ -14,7 +14,7 @@ from sglang.srt.layers.attention.dsa.dsa_dcp import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="4-gpu-b200")
 
 TOPK = 2048
 SCALE = 1 / math.sqrt(192)

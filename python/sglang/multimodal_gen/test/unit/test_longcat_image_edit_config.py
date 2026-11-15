@@ -5,7 +5,6 @@ import types
 import pytest
 import torch
 
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.longcat_image import (
     LongCatImageEditPipelineConfig,
     LongCatImagePipelineConfig,
@@ -15,6 +14,7 @@ from sglang.multimodal_gen.configs.sample.longcat_image import (
     LongCatImageEditSamplingParams,
     LongCatImageEditTurboSamplingParams,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 
 @pytest.fixture
