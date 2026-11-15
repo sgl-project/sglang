@@ -145,8 +145,7 @@ jobs:
         # which the step above does not fetch.
         run: cargo test --locked --release --workspace -- --skip chat_render_parity_matrix
 
-      # Seeded generation uses only a local mock engine and the tiny tokenizer.
-      # Kept separate from the ordinary suite so a wedged case has a process deadline.
+      # Run separately so a hung fuzz test is stopped by the CI step timeout.
       - name: HTTP chat fuzz smoke
         timeout-minutes: 3
         working-directory: sgl-router
