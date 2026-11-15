@@ -458,7 +458,7 @@ Tool Call: None
 #### 5.1.1 Latency Benchmark
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-5-FP8 \
   --dataset-name random \
@@ -513,7 +513,7 @@ Max ITL (ms):                            29.50
 #### 5.1.2 Throughput Benchmark
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model zai-org/GLM-5-FP8 \
   --dataset-name random \

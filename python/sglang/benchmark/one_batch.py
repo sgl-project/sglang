@@ -64,11 +64,8 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
-    resolution_result,
-    resolving_view,
-)
+from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.distributed import bootstrap
@@ -78,9 +75,12 @@ from sglang.srt.distributed.parallel_state import (
 )
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
+from sglang.srt.hf_transformers import get_tokenizer
+from sglang.srt.layers.dp_attention import require_mlp_sync, require_mlp_tp_gather
 from sglang.srt.layers.moe import initialize_moe_config
 from sglang.srt.layers.quantization.fp4_utils import initialize_fp4_gemm_config
 from sglang.srt.layers.quantization.fp8_utils import initialize_fp8_gemm_config
+from sglang.srt.layers.quantization.unquant import initialize_bf16_gemm_config
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.dp_attn import prepare_mlp_sync_batch_raw
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
@@ -107,12 +107,9 @@ from sglang.srt.utils import (
     get_bool_env_var,
     kill_process_tree,
     maybe_reindex_device_id,
-    require_mlp_sync,
-    require_mlp_tp_gather,
     set_gpu_proc_affinity,
     suppress_other_loggers,
 )
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
 
 
 def _init_process_global_configs() -> None:
@@ -123,6 +120,7 @@ def _init_process_global_configs() -> None:
     """
     initialize_moe_config()
     initialize_fp8_gemm_config()
+    initialize_bf16_gemm_config()
     initialize_fp4_gemm_config()
 
 
@@ -497,6 +495,7 @@ def extend(reqs, model_runner):
     dummy_tree_cache = TreeCacheNamespace(
         page_size=get_schedule().page_size,
         device=model_runner.device,
+        req_to_token_pool=model_runner.req_to_token_pool,
         token_to_kv_pool_allocator=model_runner.token_to_kv_pool_allocator,
     )
 

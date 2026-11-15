@@ -418,6 +418,49 @@ def test_gt_generation_runs_both_requests(harness, monkeypatch):
     runner._validate_consistency.assert_not_called()
 
 
+@pytest.mark.parametrize("mode", ["pass", "fail", "gen_gt"])
+def test_lead_request_runs_first_against_its_own_golden(harness, monkeypatch, mode):
+    runner, case = harness
+    case = replace(
+        case,
+        lead_sampling_params=DiffusionSamplingParams(
+            prompt="first", output_size="1360x768"
+        ),
+    )
+    gen_gt = mode == "gen_gt"
+    monkeypatch.setenv("SGLANG_GEN_GT", "1" if gen_gt else "0")
+    record = None if gen_gt else _perf_record()
+    generate = Mock(
+        side_effect=[(None, b"lead"), (record, b"first"), (record, b"second")]
+    )
+    monkeypatch.setattr(runner, "run_and_collect", generate)
+    save = Mock()
+    monkeypatch.setattr(runner, "_save_gt_output", save)
+    if mode == "fail":
+        runner._validate_consistency.side_effect = [
+            AssertionError("streaks"),
+            None,
+            None,
+        ]
+        with pytest.raises(pytest.fail.Exception, match="lead request.*streaks"):
+            runner.test_diffusion_generation(case, SimpleNamespace(load_time_ms=100))
+    else:
+        runner.test_diffusion_generation(case, SimpleNamespace(load_time_ms=100))
+
+    checked = save if gen_gt else runner._validate_consistency
+    assert [call.args[0].id for call in checked.call_args_list] == [
+        "first_lead",
+        "first",
+        "first",
+    ]
+    lead, content = checked.call_args_list[0].args
+    assert content == b"lead"
+    assert lead.sampling_params.output_size == "1360x768"
+    assert lead.sampling_params.extras["quality"] == "exact"
+    assert not generate.call_args_list[0].kwargs["collect_perf"]
+    assert len(runner._perf_results) == (0 if gen_gt else 2)
+
+
 def test_baseline_generation_keeps_worst_of_both_requests(harness, monkeypatch):
     runner, case = harness
     monkeypatch.setenv("SGLANG_GEN_BASELINE", "1")

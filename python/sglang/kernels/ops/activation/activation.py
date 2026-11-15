@@ -6,7 +6,6 @@ import torch
 
 from sglang.kernels.jit.utils import (
     cache_once,
-    get_activation_cuda_cflags,
     is_arch_support_pdl,
     load_jit,
     make_cpp_args,
@@ -18,16 +17,12 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def activation_module(dtype: torch.dtype, *, fast_math: bool = True) -> Module:
-    fast_math_flags = get_activation_cuda_cflags()
-    if not fast_math and not fast_math_flags:
-        return activation_module(dtype)
-    args = make_cpp_args(dtype, is_arch_support_pdl())
+def activation_module(dtype: torch.dtype, *, fast_math: bool) -> Module:
+    args = make_cpp_args(dtype, is_arch_support_pdl(), fast_math)
     return load_jit(
-        "activation" if fast_math else "rounded_activation",
+        "activation",
         *args,
         cuda_files=["elementwise/activation.cuh"],
-        extra_cuda_cflags=fast_math_flags if fast_math else [],
         cuda_wrappers=[
             ("run_activation", f"ActivationKernel<{args}>::run_activation"),
             (
@@ -43,11 +38,63 @@ def activation_module(dtype: torch.dtype, *, fast_math: bool = True) -> Module:
                 f"ActivationKernel<{args}>::run_activation_filtered",
             ),
             (
+                "run_activation_sorted_filtered",
+                f"ActivationKernel<{args}>::run_activation_sorted_filtered",
+            ),
+            (
                 "run_unary_activation",
                 f"ActivationKernel<{args}>::run_unary_activation",
             ),
+            (
+                "build_silu_rounding_table",
+                f"ActivationKernel<{args}>::build_silu_rounding_table",
+            ),
+            (
+                "run_silu_and_mul_rounded_table_out",
+                f"ActivationKernel<{args}>::run_silu_and_mul_rounded_table_out",
+            ),
+            (
+                "run_silu_and_mul_rounded_table_input_inplace",
+                f"ActivationKernel<{args}>::run_silu_and_mul_rounded_table_input_inplace",
+            ),
         ],
     )
+
+
+@cache_once
+def _silu_rounding_table_supported(device_index: int) -> bool:
+    # measured on sm_10x, where the expf + divide made the kernel ALU-bound; the
+    # 128 KiB shared-memory table needs the opt-in carve-out
+    props = torch.cuda.get_device_properties(device_index)
+    return (
+        torch.version.hip is None
+        and props.major == 10
+        and props.shared_memory_per_block_optin >= (1 << 16) * 2
+    )
+
+
+_silu_rounding_tables: dict[tuple[torch.dtype, int], torch.Tensor] = {}
+
+
+def _silu_rounding_table(input: torch.Tensor) -> torch.Tensor | None:
+    """Every 16-bit input's rounded SiLU for the rounding kernels, or None where
+    the table kernel does not apply (also before a table exists under graph
+    capture, which must not allocate it)."""
+    if input.dtype not in (torch.bfloat16, torch.float16) or not input.is_cuda:
+        return None
+    key = (input.dtype, input.device.index)
+    table = _silu_rounding_tables.get(key)
+    if table is not None:
+        return table
+    if (
+        not _silu_rounding_table_supported(input.device.index)
+        or torch.cuda.is_current_stream_capturing()
+    ):
+        return None
+    table = torch.empty(1 << 16, dtype=input.dtype, device=input.device)
+    activation_module(input.dtype, fast_math=False).build_silu_rounding_table(table)
+    _silu_rounding_tables[key] = table
+    return table
 
 
 SUPPORTED_ACTIVATIONS = {"silu", "gelu", "gelu_tanh"}
@@ -59,7 +106,7 @@ def _run_activation_inplace(
     op_name: str, input: torch.Tensor, out: torch.Tensor
 ) -> None:
     hidden_size = input.shape[-1] // 2
-    module = activation_module(input.dtype)
+    module = activation_module(input.dtype, fast_math=True)
     input_2d = input.view(-1, hidden_size * 2)
     out_2d = out.view(-1, hidden_size)
     module.run_activation(input_2d, out_2d, op_name)
@@ -74,6 +121,12 @@ def _run_activation_with_rounding_inplace(
     module = activation_module(input.dtype, fast_math=False)
     input_2d = input.view(-1, hidden_size * 2)
     out_2d = out.view(-1, hidden_size)
+    table = (
+        _silu_rounding_table(input) if op_name == "silu" and not clamp_limit else None
+    )
+    if table is not None:
+        module.run_silu_and_mul_rounded_table_out(input_2d, out_2d, table)
+        return
     module.run_activation_with_rounding(input_2d, out_2d, op_name, clamp_limit)
 
 
@@ -82,6 +135,12 @@ def _run_silu_and_mul_with_rounding_inplace(input: torch.Tensor) -> None:
     hidden_size = input.shape[-1] // 2
     module = activation_module(input.dtype, fast_math=False)
     input_2d = input.view(-1, hidden_size * 2)
+    table = _silu_rounding_table(input)
+    if table is not None:
+        module.run_silu_and_mul_rounded_table_input_inplace(
+            input_2d, input_2d[:, :hidden_size], table
+        )
+        return
     module.run_activation_with_rounding_input_inplace(
         input_2d, input_2d[:, :hidden_size], "silu"
     )
@@ -96,10 +155,35 @@ def _run_activation_filtered_inplace(
     expert_step: int,
 ) -> None:
     hidden_size = input.shape[-1] // 2
-    module = activation_module(input.dtype)
+    module = activation_module(input.dtype, fast_math=True)
     input_2d = input.view(-1, hidden_size * 2)
     out_2d = out.view(-1, hidden_size)
     module.run_activation_filtered(input_2d, out_2d, expert_ids, expert_step, op_name)
+
+
+@register_custom_op(mutates_args=["out"])
+def _run_activation_sorted_filtered_inplace(
+    op_name: str,
+    input: torch.Tensor,
+    out: torch.Tensor,
+    expert_ids: torch.Tensor,
+    expert_step: int,
+    sorted_token_ids: torch.Tensor,
+    num_tokens_post_padded: torch.Tensor,
+    num_valid_tokens: int,
+) -> None:
+    hidden_size = input.shape[-1] // 2
+    module = activation_module(input.dtype, fast_math=True)
+    module.run_activation_sorted_filtered(
+        input.view(-1, hidden_size * 2),
+        out.view(-1, hidden_size),
+        expert_ids,
+        expert_step,
+        sorted_token_ids,
+        num_tokens_post_padded,
+        num_valid_tokens,
+        op_name,
+    )
 
 
 def run_activation(
@@ -108,6 +192,10 @@ def run_activation(
     out: Optional[torch.Tensor],
     expert_ids: Optional[torch.Tensor] = None,
     expert_step: int = 1,
+    *,
+    sorted_token_ids: Optional[torch.Tensor] = None,
+    num_tokens_post_padded: Optional[torch.Tensor] = None,
+    num_valid_tokens: int = 0,
 ) -> torch.Tensor:
     """Apply ``op_name`` activation followed by element-wise multiplication.
 
@@ -115,6 +203,12 @@ def run_activation(
     routed expert id is ``-1``. ``expert_step`` is 1 for per-token routing and
     ``BLOCK_SIZE_M`` for sorted/TMA routing — i.e. ``expert_ids[token_id //
     expert_step]`` is consulted before computing each row.
+
+    For the sorted, block-padded layout (``moe_align_block_size`` output with
+    ``expert_step = BLOCK_SIZE_M``), also pass ``sorted_token_ids``,
+    ``num_tokens_post_padded`` and ``num_valid_tokens`` (``topk_ids.numel()``)
+    to skip the padding rows the down GEMM never reads; skipped rows of ``out``
+    are left unwritten.
     """
     assert op_name in SUPPORTED_ACTIVATIONS, f"Unsupported activation: {op_name}"
     hidden_size = input.shape[-1] // 2
@@ -128,7 +222,21 @@ def run_activation(
         # true dtype, so normalize here instead of asserting downstream.
         if expert_ids.dtype != torch.int32:
             expert_ids = expert_ids.to(torch.int32)
-        _run_activation_filtered_inplace(op_name, input, out, expert_ids, expert_step)
+        if sorted_token_ids is None:
+            _run_activation_filtered_inplace(
+                op_name, input, out, expert_ids, expert_step
+            )
+        else:
+            _run_activation_sorted_filtered_inplace(
+                op_name,
+                input,
+                out,
+                expert_ids,
+                expert_step,
+                sorted_token_ids,
+                num_tokens_post_padded,
+                num_valid_tokens,
+            )
     return out
 
 
@@ -177,8 +285,21 @@ def silu_and_mul(
     out: Optional[torch.Tensor] = None,
     expert_ids: Optional[torch.Tensor] = None,
     expert_step: int = 1,
+    *,
+    sorted_token_ids: Optional[torch.Tensor] = None,
+    num_tokens_post_padded: Optional[torch.Tensor] = None,
+    num_valid_tokens: int = 0,
 ) -> torch.Tensor:
-    return run_activation("silu", input, out, expert_ids, expert_step)
+    return run_activation(
+        "silu",
+        input,
+        out,
+        expert_ids,
+        expert_step,
+        sorted_token_ids=sorted_token_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        num_valid_tokens=num_valid_tokens,
+    )
 
 
 def silu_and_mul_with_activation_rounding(
@@ -216,8 +337,21 @@ def gelu_and_mul(
     out: Optional[torch.Tensor] = None,
     expert_ids: Optional[torch.Tensor] = None,
     expert_step: int = 1,
+    *,
+    sorted_token_ids: Optional[torch.Tensor] = None,
+    num_tokens_post_padded: Optional[torch.Tensor] = None,
+    num_valid_tokens: int = 0,
 ) -> torch.Tensor:
-    return run_activation("gelu", input, out, expert_ids, expert_step)
+    return run_activation(
+        "gelu",
+        input,
+        out,
+        expert_ids,
+        expert_step,
+        sorted_token_ids=sorted_token_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        num_valid_tokens=num_valid_tokens,
+    )
 
 
 def gelu_tanh_and_mul(
@@ -225,5 +359,18 @@ def gelu_tanh_and_mul(
     out: Optional[torch.Tensor] = None,
     expert_ids: Optional[torch.Tensor] = None,
     expert_step: int = 1,
+    *,
+    sorted_token_ids: Optional[torch.Tensor] = None,
+    num_tokens_post_padded: Optional[torch.Tensor] = None,
+    num_valid_tokens: int = 0,
 ) -> torch.Tensor:
-    return run_activation("gelu_tanh", input, out, expert_ids, expert_step)
+    return run_activation(
+        "gelu_tanh",
+        input,
+        out,
+        expert_ids,
+        expert_step,
+        sorted_token_ids=sorted_token_ids,
+        num_tokens_post_padded=num_tokens_post_padded,
+        num_valid_tokens=num_valid_tokens,
+    )

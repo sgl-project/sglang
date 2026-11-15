@@ -13,7 +13,6 @@ import torch
 from torch.nn import functional
 
 VAE_SPATIAL_FACTOR: int = 16
-VAE_TEMPORAL_FACTOR: int = 4
 
 # trained base resolutions: visual_size -> [(H, W), ...]
 RESOLUTIONS: dict[int, list[tuple[int, int]]] = {

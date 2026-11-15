@@ -13,7 +13,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=3, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestLongcatShortcut(CustomTestCase):
@@ -78,7 +78,12 @@ class TestLongcatShortcut(CustomTestCase):
             ),
             patch_communicator(
                 "get_parallel",
-                return_value=SimpleNamespace(attn_tp_group=object()),
+                return_value=SimpleNamespace(
+                    attn_tp_group=object(),
+                    attn_tp_size=tp,
+                    attn_dp_enabled=False,
+                    disable_attn_tp_gather=False,
+                ),
             ),
         ):
             hidden, _ = layer(

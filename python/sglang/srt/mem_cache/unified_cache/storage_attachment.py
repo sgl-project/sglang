@@ -14,11 +14,13 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.arg_groups.kv_shard_hook import kv_shard_storage_backend_supported
+from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.buffer_mode.pipeline import validate_buffer_only_stack
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
-from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_STORAGE,
     StorageMetricsCollector,
@@ -66,6 +68,19 @@ class StorageAttachment:
         )
         if invalid is not None:
             return False, invalid
+        if (
+            hicache_write_policy == "write_back"
+            and cache.host_memory_mode == "buffer_only"
+        ):
+            # Startup resolves write_back to write_through in buffer_only mode:
+            # there is no host tier to write back to, so an eviction would only
+            # queue a backup it then drops.
+            return (
+                False,
+                "hicache_write_policy write_back is not supported with "
+                "--hicache-host-memory-mode buffer_only: host memory is only a "
+                "staging buffer. Use write_through.",
+            )
 
         controller = cache.cache_controller
         if controller is None:
@@ -73,6 +88,15 @@ class StorageAttachment:
                 False,
                 "HiCache is not initialized (no cache controller); "
                 "launch with --enable-hierarchical-cache to attach a backend.",
+            )
+        if page_interleave_shard_size(
+            cache.token_to_kv_pool_allocator
+        ) > 1 and not kv_shard_storage_backend_supported(storage_backend):
+            # Runtime attach bypasses kv_shard_hook.py's startup validation.
+            return (
+                False,
+                "--enable-kv-cache-sharding does not support a HiCache storage "
+                "backend yet.",
             )
 
         # Write-back can retain auxiliary host rows without FULL, or backed
@@ -135,12 +159,14 @@ class StorageAttachment:
             cache.is_write_back,
         )
         try:
-            prefetch_threshold = self.resolve_prefetch_threshold(prefetch_threshold)
             if cache.host_memory_mode == "buffer_only":
                 validate_buffer_only_stack(
                     sidecar_pool_specs=cache.sidecar_pool_specs,
                     host_pool_group=cache.host_pool_group,
-                    swa_component=cache.components.get(ComponentType.SWA),
+                    swa_component=cache.component_of(TREE_WINDOW),
+                    further_window_components=tuple(
+                        cache.components[ct] for ct in cache.window_slots()[1:]
+                    ),
                     storage_prefetch_threshold=prefetch_threshold,
                 )
             # New workers must see the requested policy from their first operation.
@@ -290,16 +316,6 @@ class StorageAttachment:
         else:
             cache.storage_metrics_collector = None
 
-    def resolve_prefetch_threshold(self, configured: int) -> int:
-        """Use the same complete-window minimum for every buffer-mode anchor."""
-        cache = self._cache
-        window = cache.sliding_window_size
-        if not window or cache.host_memory_mode != "buffer_only":
-            return configured
-        page_size = cache.page_size
-        window_tokens = ((window + page_size - 1) // page_size) * page_size
-        return max(configured, window_tokens)
-
     def _resolve_metrics_collector(
         self,
         storage_backend: Optional[str],
@@ -398,7 +414,7 @@ class StorageAttachment:
         and `ongoing_backup` are already empty, so this normally finds nothing. It
         earns its keep on the atexit path, which has no such guard.
 
-        Two deliberate departures from `release_aborted_request`, which does the
+        Two deliberate departures from `_abandon_attempt`, which does the
         same bookkeeping while the storage threads are still running:
 
         * no cross-rank barrier -- at process exit the other ranks may already be
@@ -440,9 +456,11 @@ class StorageAttachment:
                 cache.dec_host_lock_ref(node_id, lock_params)
             except Exception:
                 logger.exception("Failed to release host lock for backup op %s", ack_id)
+        cache._backup_requested_tokens.clear()
 
         for handle in list(cache._storage_prefetch_hit_remaining_by_reqid):
             cache.discard_storage_prefetch_accounting(handle)
         cache.prefetch_loaded_tokens_by_reqid.clear()
         cache.prefetch_loaded_storage_start_by_reqid.clear()
         cache.storage_prefetch_retries.clear()
+        cache._storage_prefetch_wait.clear()

@@ -4,12 +4,12 @@ from sglang.kernels.jit.benchmark import marker
 from sglang.kernels.ops.attention.dsv4.fp4_indexer import (
     fp4_index_logits_decode,
     fp4_index_logits_paged,
-    store_fp4_index_k_cache,
 )
 from sglang.kernels.ops.attention.dsv4.topk import (
     plan_topk_v2,
     topk_transform_paged_v2,
 )
+from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache import store_fp4_index_k_cache
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(

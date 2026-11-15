@@ -76,6 +76,23 @@ X264_PRESETS: tuple[str, ...] = (
     "veryslow",
     "placebo",
 )
+# RIFE multiplies the frame count by 2**exp and recurses forever for exp < 1.
+# The upper bound (16x) is arbitrary; each step doubles RIFE calls and frames.
+MIN_FRAME_INTERPOLATION_EXP = 1
+MAX_FRAME_INTERPOLATION_EXP = 4
+
+
+def validate_frame_interpolation_exp(exp: int) -> None:
+    if (
+        isinstance(exp, bool)
+        or not isinstance(exp, int)
+        or not MIN_FRAME_INTERPOLATION_EXP <= exp <= MAX_FRAME_INTERPOLATION_EXP
+    ):
+        raise ValueError(
+            "frame_interpolation_exp must be an int in "
+            f"[{MIN_FRAME_INTERPOLATION_EXP}, {MAX_FRAME_INTERPOLATION_EXP}], "
+            f"got {exp!r}"
+        )
 
 
 @dataclass(frozen=True)
@@ -218,6 +235,33 @@ def align_num_frames_for_num_gpus(
     return new_latent_num_frames
 
 
+# Arbitrary upper bounds; upscaling_scale squares the pixel count.
+_FRAME_INTERPOLATION_SCALE_RANGE = (0.25, 4.0)
+_MAX_UPSCALING_SCALE = 8
+
+
+def _check_postprocess_controls(params: "SamplingParams") -> None:
+    scale = params.frame_interpolation_scale
+    low, high = _FRAME_INTERPOLATION_SCALE_RANGE
+    if (
+        isinstance(scale, bool)
+        or not isinstance(scale, (int, float))
+        or not low <= scale <= high
+    ):
+        raise ValueError(
+            f"frame_interpolation_scale must be in [{low}, {high}], got {scale!r}"
+        )
+    up = params.upscaling_scale
+    if (
+        isinstance(up, bool)
+        or not isinstance(up, int)
+        or not 1 <= up <= _MAX_UPSCALING_SCALE
+    ):
+        raise ValueError(
+            f"upscaling_scale must be an int in [1, {_MAX_UPSCALING_SCALE}], got {up!r}"
+        )
+
+
 @dataclass
 class SamplingParams:
     """
@@ -243,7 +287,12 @@ class SamplingParams:
     # All fields below are copied from ForwardBatch
 
     # Image inputs
-    image_path: str | list[str] | None = None
+    # Per-request conditioning input: excluded from the dynamic-batch
+    # signature so image-conditioned requests can still group (the grouping
+    # gate is supports_batching_image_conditioning()).
+    image_path: str | list[str] | None = field(
+        default=None, metadata={"batch_sig_exclude": True}
+    )
 
     # Video inputs (video-to-video conditioning)
     video_path: str | list[str] | None = None
@@ -412,6 +461,8 @@ class SamplingParams:
 
     # return output file paths directly to client
     return_file_paths_only: bool = True
+    # also return each image's encoded bytes, which are written to disk only when save_output
+    return_image_bytes: bool = False
     enable_sequence_shard: bool | None = None
     diffusers_kwargs: dict | None = None
     max_sequence_length: int | None = None
@@ -537,6 +588,18 @@ class SamplingParams:
     def num_samples_per_request(self) -> int:
         """Number of final samples produced by one expanded scheduler request."""
         return 1
+
+    def should_use_classifier_free_guidance(self) -> bool:
+        cfg_scale = (
+            self.true_cfg_scale
+            if self.true_cfg_scale is not None
+            else self.guidance_scale
+        )
+        return (
+            cfg_scale is not None
+            and cfg_scale > 1.0
+            and self.negative_prompt is not None
+        )
 
     @classmethod
     def default_image_output_format(cls) -> str | None:
@@ -665,6 +728,9 @@ class SamplingParams:
         if not isinstance(self.fps, int) or self.fps <= 0:
             raise ValueError(f"fps must be a positive int, got {self.fps!r}")
 
+        # scale bounds follow RIFE's supported range.
+        _check_postprocess_controls(self)
+
         # num_frames is already asserted in __post_init__, but keep a friendly error here too
         # (e.g., when validation is triggered from other code paths).
         if not isinstance(self.num_frames, int) or self.num_frames <= 0:
@@ -680,6 +746,8 @@ class SamplingParams:
                 raise ValueError(
                     f"num_inference_steps must be a positive int, got {self.num_inference_steps!r}"
                 )
+
+        validate_frame_interpolation_exp(self.frame_interpolation_exp)
 
         if self.progressive_mode not in ("fullres", "dct", "dct_rewind"):
             raise ValueError(
@@ -757,10 +825,6 @@ class SamplingParams:
             )
 
         RLRolloutArgs.validate_sampling_params(self)
-
-    def check_sampling_param(self):
-        # Keep backward-compatibility for old call sites.
-        self._validate()
 
     def _validate_with_pipeline_config(self, pipeline_config):
         """
@@ -1379,7 +1443,7 @@ class SamplingParams:
             "--true-cfg-scale",
             type=float,
             dest="true_cfg_scale",
-            help="True CFG scale for models that distinguish distilled guidance from standard CFG (e.g., Qwen-Image)",
+            help="True CFG scale for models that distinguish distilled guidance from standard CFG (e.g., Qwen-Image, FLUX.1)",
         )
         add_argument(
             "--guidance-rescale",
@@ -1635,6 +1699,29 @@ class SamplingParams:
             "--upscaling-scale",
             type=int,
             help="Upscaling factor (default: 4).",
+        )
+        # HunyuanImage-3 and similar model-specific tokenizer/prompt arguments
+        add_argument(
+            "--bot-task",
+            dest="bot_task",
+            type=str,
+            help=(
+                "Tokenizer bot task (model-specific). For HunyuanImage-3: "
+                "auto, image, think, recaption, think_recaption, img_ratio, none. "
+                "Controls the bot response prefix in the tokenizer."
+            ),
+        )
+        add_argument(
+            "--system-prompt",
+            dest="system_prompt",
+            type=str,
+            help=(
+                "System prompt: preset name or raw custom text. "
+                "Presets: none, en_unified, en_vanilla, en_recaption, "
+                "en_think_recaption, dynamic, auto. "
+                "Any other string is used directly as the system prompt. "
+                "Default: en_unified."
+            ),
         )
         return parser
 

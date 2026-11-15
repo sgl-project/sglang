@@ -46,6 +46,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -55,7 +57,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_parallel
-from sglang.srt.utils import LazyValue, add_prefix, make_pp_layers
+from sglang.srt.utils import LazyValue
 
 logger = logging.getLogger(__name__)
 
@@ -172,6 +174,7 @@ class LagunaMoE(nn.Module):
             scoring_func=config.moe_router_score_func,
             correction_bias=self.gate.e_score_correction_bias,
         )
+        self.topk.bind_runner_backend(self.experts.runner_backend)
 
         # HF safetensors key is singular `shared_expert.…`; mirror so the
         # default loader picks it up without remapping.
@@ -418,12 +421,8 @@ class LagunaDecoderLayer(nn.Module):
             prefix=add_prefix("self_attn", prefix),
         )
 
-        mlp_types = config.mlp_layer_types
-        self.is_layer_sparse = mlp_types[layer_id] == "sparse"
-        is_next_layer_sparse = (
-            layer_id + 1 < config.num_hidden_layers
-            and mlp_types[layer_id + 1] == "sparse"
-        )
+        attn, ffn = self.stage_facts(config, layer_id)
+        self.is_layer_sparse = ffn.sparse
 
         if self.is_layer_sparse:
             self.mlp = LagunaMoE(
@@ -448,13 +447,25 @@ class LagunaDecoderLayer(nn.Module):
         )
 
         self.attn_boundary, self.ffn_boundary = append_stages(
-            (declare_attn(), self.input_layernorm),
-            (
-                declare_ffn(
-                    sparse=self.is_layer_sparse,
-                    next_layer_sparse=is_next_layer_sparse,
-                ),
-                self.post_attention_layernorm,
+            (attn, self.input_layernorm),
+            (ffn, self.post_attention_layernorm),
+        )
+
+    @staticmethod
+    def stage_facts(config: LagunaConfig, layer_id: int):
+        """The stages the layer at ``layer_id`` declares, from the config: the
+        model's shared declaration function (see make_layers)."""
+        mlp_types = config.mlp_layer_types
+        is_layer_sparse = mlp_types[layer_id] == "sparse"
+        is_next_layer_sparse = (
+            layer_id + 1 < config.num_hidden_layers
+            and mlp_types[layer_id + 1] == "sparse"
+        )
+        return (
+            declare_attn(),
+            declare_ffn(
+                sparse=is_layer_sparse,
+                next_layer_sparse=is_next_layer_sparse,
             ),
         )
 
@@ -519,6 +530,7 @@ class LagunaModel(nn.Module):
                 prefix=prefix,
             ),
             prefix=add_prefix("layers", prefix),
+            stage_facts=lambda idx: decoder_layer_type.stage_facts(config, idx),
         )
         if self.pp_group.is_last_rank:
             self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)

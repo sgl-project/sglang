@@ -20,6 +20,8 @@ import uvicorn
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import PlainTextResponse
 
+from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
+
 logger = logging.getLogger(__name__)
 
 
@@ -42,7 +44,7 @@ class EngineInfoBootstrapServer:
         self.transfer_engine_info: Dict[int, Tuple] = {}
         self.lock = threading.Lock()
 
-        app = FastAPI()
+        app = FastAPI(**fastapi_telemetry_disabled_kwargs())
 
         @app.get("/health")
         def health():

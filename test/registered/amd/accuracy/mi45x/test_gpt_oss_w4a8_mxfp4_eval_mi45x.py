@@ -78,7 +78,6 @@ MI45X_GPT_OSS_W4A8_MXFP4_MODELS = [
         # Mxfp4MoEMethod weight shuffle). Other AITER MXFP4 callers default
         # to INTERLEAVE, so opt out explicitly here.
         env_vars={
-            "AITER_FORCE_A8W4": "1",
             "ENABLE_CK": "0",
             "HSA_COREDUMP_PATTERN": "/dev/null",
             "SGLANG_USE_AITER": "1",

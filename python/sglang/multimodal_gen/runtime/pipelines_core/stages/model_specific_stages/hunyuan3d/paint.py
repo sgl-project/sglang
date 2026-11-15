@@ -181,10 +181,16 @@ class Hunyuan3DPaintPreprocessStage(PipelineStage):
             ComponentUse(stage_name, "delight_vae", phase="decode"),
         ]
 
-    @staticmethod
-    def _unwrap_mesh(mesh: Any) -> Any:
-        from sglang.multimodal_gen.runtime.utils.mesh3d_utils import mesh_uv_wrap
+    def _unwrap_mesh(self, mesh: Any) -> Any:
+        from sglang.multimodal_gen.runtime.utils.mesh3d_utils import (
+            mesh_simplify,
+            mesh_uv_wrap,
+        )
 
+        # xatlas time grows superlinearly with face count; the raw shape mesh
+        # has ~650k faces at the default octree resolution.
+        if self.config.paint_use_remesh:
+            mesh = mesh_simplify(mesh)
         return mesh_uv_wrap(mesh)
 
     @staticmethod
@@ -821,11 +827,12 @@ class Hunyuan3DPaintPostprocessStage(PipelineStage):
         return_path = batch.extra["shape_return_path"]
         obj_dir = os.path.dirname(obj_path) or "."
         files_before_export = set(os.listdir(obj_dir))
-        textured_mesh.export(obj_path)
         if self.config.paint_save_glb:
             return_path = os.path.splitext(obj_path)[0] + ".glb"
             textured_mesh.export(return_path)
             self._cleanup_obj_artifacts(obj_path, files_before_export)
+        else:
+            textured_mesh.export(obj_path)
 
         return OutputBatch(output_file_paths=[return_path], metrics=batch.metrics)
 

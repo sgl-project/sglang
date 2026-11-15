@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=742, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=679, stage="extra-b", runner_config="4-gpu-h100")
 
 MAMBA_MODEL = "Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
 MAMBA_CHUNK_SIZE = 64
@@ -85,7 +85,12 @@ class TestUnifiedMambaHiCache(UnifiedRadixTreeTestMixin, CustomTestCase):
         make_mamba_prefill_assert(chunk_size=MAMBA_CHUNK_SIZE)
     )
     decode_cache_assert = staticmethod(
-        make_mamba_decode_assert(track_interval=MAMBA_TRACK_INTERVAL)
+        # The small KV pool can trigger retraction and retain a prefix-relative
+        # prefill checkpoint instead of the last absolute decode checkpoint.
+        make_mamba_decode_assert(
+            track_interval=MAMBA_TRACK_INTERVAL,
+            max_checkpoint_lag=MAMBA_CHUNK_SIZE - 1,
+        )
     )
 
     @classmethod

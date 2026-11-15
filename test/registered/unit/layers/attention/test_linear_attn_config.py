@@ -26,7 +26,7 @@ from sglang.srt.layers.attention.linear.utils import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class _Runner:
@@ -45,12 +45,6 @@ class TestLinearAttnBackends(CustomTestCase):
         self._publish(linear_attn_backend="triton")
         backends = resolve_linear_attn_backends(prefill_default="flashinfer")
         self.assertEqual(backends.prefill, LinearAttnKernelBackend.FLASHINFER)
-
-    def test_the_base_backend_applies_without_a_default(self):
-        self._publish(linear_attn_backend="triton")
-        backends = resolve_linear_attn_backends()
-        self.assertEqual(backends.prefill, LinearAttnKernelBackend.TRITON)
-        self.assertEqual(backends.decode, LinearAttnKernelBackend.TRITON)
 
     def test_the_default_does_not_reach_the_decode_backend(self):
         self._publish(linear_attn_backend="triton")

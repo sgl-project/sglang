@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 from unittest import mock
 
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader import (
     NativeComponentLoaderRequired,
 )
@@ -22,7 +23,7 @@ class TestTransformerLoaderFallbackAdmission(unittest.TestCase):
             "transformer_weights_path": None,
             "nunchaku_config": None,
             "quantization": None,
-            "pipeline_config": SimpleNamespace(native_only_components=()),
+            "pipeline_config": PipelineConfig(),
             "tp_size": 1,
             "sp_degree": 1,
             "ulysses_degree": 1,
@@ -32,6 +33,7 @@ class TestTransformerLoaderFallbackAdmission(unittest.TestCase):
             "dp_size": 1,
             "use_fsdp_inference": False,
             "resolve_component_attention_backend": mock.Mock(return_value=(None, None)),
+            "resolve_component_backend_by_role": mock.Mock(return_value={}),
             "requested_component_attention_backend": mock.Mock(return_value=None),
             "should_direct_gpu_weight_load_component": mock.Mock(return_value=False),
             "should_use_fsdp_for_component": mock.Mock(return_value=fsdp_requested),

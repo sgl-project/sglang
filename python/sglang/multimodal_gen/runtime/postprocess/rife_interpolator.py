@@ -12,6 +12,7 @@ The FrameInterpolator wrapper and integration code are original work.
 
 import os
 import time
+from collections import OrderedDict
 from typing import Optional
 
 import numpy as np
@@ -19,7 +20,14 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.multimodal_gen.configs.sample.sampling_params import (
+    validate_frame_interpolation_exp,
+)
 from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.postprocess.bounded_cache import (
+    cache_get,
+    cache_put,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -28,7 +36,9 @@ logger = init_logger(__name__)
 _DEFAULT_RIFE_HF_REPO = "elfgum/RIFE-4.22.lite"
 
 # Module-level cache: model_path -> Model instance
-_MODEL_CACHE: dict[str, "Model"] = {}
+_MODEL_CACHE: "OrderedDict[str, Model]" = OrderedDict()
+# Arbitrary; paths are client-chosen, so the cache must be bounded.
+_MAX_CACHED_MODELS = 4
 _MAX_RIFE_BATCH_PAIRS = 16
 
 
@@ -300,7 +310,7 @@ class Model:
             else:
                 return {k: v for k, v in param.items() if "module." not in k}
 
-        state = torch.load(flownet_path, map_location="cpu", weights_only=False)
+        state = torch.load(flownet_path, map_location="cpu", weights_only=True)
         self.flownet.load_state_dict(convert(state), strict=False)
         logger.info("Loaded RIFE weights from %s", flownet_path)
 
@@ -314,10 +324,11 @@ class Model:
         """Interpolate a single intermediate frame between img0 and img1."""
         n, c, h, w = img0.shape
 
-        # Pad to multiples of 32 so that RIFE's downsample/upsample round-trips
-        # preserve spatial dimensions exactly.
-        ph = ((h - 1) // 32 + 1) * 32
-        pw = ((w - 1) // 32 + 1) * 32
+        # At scale < 1 the deepest IFBlock divides spatial dims by 32/scale,
+        # so the pad unit must grow accordingly; upstream RIFE uses max(32, 32/scale).
+        _pad_unit = max(32, int(32 / scale))
+        ph = ((h - 1) // _pad_unit + 1) * _pad_unit
+        pw = ((w - 1) // _pad_unit + 1) * _pad_unit
         pad = (0, pw - w, 0, ph - h)
         img0 = F.pad(img0, pad)
         img1 = F.pad(img1, pad)
@@ -350,7 +361,6 @@ class FrameInterpolator:
 
     def __init__(self, model_path: Optional[str] = None):
         self._model_path = model_path
-        self._resolved_path: Optional[str] = None
 
     def _ensure_model_loaded(self) -> Model:
         """Load RIFE model weights.
@@ -368,17 +378,16 @@ class FrameInterpolator:
         # Resolve: local path pass-through, HF repo ID → download & cache
         model_path = maybe_download_model(model_path)
 
-        self._resolved_path = model_path
-
-        if model_path in _MODEL_CACHE:
-            return _MODEL_CACHE[model_path]
+        cached_model = cache_get(_MODEL_CACHE, model_path)
+        if cached_model is not None:
+            return cached_model
 
         device = current_platform.get_local_torch_device()
         model = Model()
         model.load_model(model_path, strip_module_prefix=True)
         model.eval()
         model.flownet = model.flownet.to(device)
-        _MODEL_CACHE[model_path] = model
+        cache_put(_MODEL_CACHE, model_path, model, max_size=_MAX_CACHED_MODELS)
         logger.info("RIFE model loaded on device: %s", device)
         return model
 
@@ -466,6 +475,7 @@ class FrameInterpolator:
         Returns:
             (interpolated_frames, multiplier) where multiplier = 2**exp.
         """
+        validate_frame_interpolation_exp(exp)
         if len(frames) < 2:
             logger.warning(
                 "Frame interpolation requires at least 2 frames; returning input unchanged."

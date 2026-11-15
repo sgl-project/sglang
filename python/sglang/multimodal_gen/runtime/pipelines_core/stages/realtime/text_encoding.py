@@ -38,22 +38,6 @@ def _normalize_prompt_value(
     return value
 
 
-def _copy_tensor_list(
-    value: list[torch.Tensor] | None,
-) -> list[torch.Tensor] | None:
-    if value is None:
-        return None
-    return list(value)
-
-
-def _copy_seq_lens(
-    value: list[list[int]] | None,
-) -> list[list[int]] | None:
-    if value is None:
-        return None
-    return [list(seq_lens) for seq_lens in value]
-
-
 _TEXT_CACHE_TENSOR_LIST_FIELDS = (
     "prompt_embeds",
     "pooled_embeds",
@@ -77,9 +61,11 @@ _TEXT_CACHE_DEFAULT_EMPTY_LIST_FIELDS = {
 
 
 def _copy_text_cache_field(name: str, value):
+    if value is None:
+        return None
     if name in _TEXT_CACHE_SEQ_LENS_FIELDS:
-        return _copy_seq_lens(value)
-    return _copy_tensor_list(value)
+        return [list(seq_lens) for seq_lens in value]
+    return list(value)
 
 
 class RealtimeTextState(BaseRealtimeState):

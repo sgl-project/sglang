@@ -22,7 +22,6 @@ class XpuPlatform(Platform):
     device_name: str = "xpu"
     device_type: str = "xpu"
     dispatch_key: str = "XPU"
-    device_control_env_var: str = "ZE_AFFINITY_MASK"
 
     @classmethod
     def get_local_torch_device(cls) -> torch.device:
@@ -50,22 +49,6 @@ class XpuPlatform(Platform):
         """Get total memory of the Intel XPU device in bytes."""
         props = torch.xpu.get_device_properties(device_id)
         return props.total_memory
-
-    @classmethod
-    def is_async_output_supported(cls, enforce_eager: bool | None) -> bool:
-        """Check if async output is supported on Intel XPU."""
-        if enforce_eager:
-            logger.warning(
-                "To see benefits of async output processing, disable enforce-eager. "
-                "Since enforce-eager is enabled, async output processor cannot be used"
-            )
-            return False
-        return True
-
-    @classmethod
-    def log_warnings(cls) -> None:
-        """Log any XPU-specific warnings."""
-        pass
 
     @classmethod
     def get_current_memory_usage(
@@ -185,12 +168,6 @@ class XpuPlatform(Platform):
         return (
             "sglang.multimodal_gen.runtime.layers.attention.backends.sdpa.SDPABackend"
         )
-
-    @classmethod
-    def get_device_communicator_cls(cls) -> str:
-        """Get device communicator class for Intel XPU distributed communication."""
-        # Use base communicator for now; can be updated to use oneCCL-based communicator
-        return "sglang.multimodal_gen.runtime.distributed.device_communicators.base_device_communicator.DeviceCommunicatorBase"
 
     @classmethod
     def get_all_to_all_communicator_cls(cls) -> str:

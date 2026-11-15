@@ -16,7 +16,7 @@
 import dataclasses
 import json
 import logging
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Union
 
 import torch
 from xgrammar import (
@@ -26,6 +26,7 @@ from xgrammar import (
     StructuralTag,
     StructuralTagItem,
     TokenizerInfo,
+    VocabType,
     bitmask_dtype,
     get_bitmask_shape,
 )
@@ -42,7 +43,7 @@ from sglang.srt.constrained.json_schema_validation import (
 )
 from sglang.srt.constrained.utils import is_legacy_structural_tag
 from sglang.srt.utils import is_hip
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.device import is_pin_memory_available
 
 _is_hip = is_hip()
 
@@ -164,40 +165,6 @@ class XGrammarGrammar(BaseGrammarObject):
             grammar_stats,
         )
 
-    def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
-        s = self.matcher.find_jump_forward_string()
-        if s:
-            return [], s
-        return None
-
-    def jump_forward_str_state(self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
-        _, data = helper
-        return data, -1
-
-    def jump_and_retokenize(
-        self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
-    ):
-        k = 0
-        for i, old_id in enumerate(old_output_ids):
-            if old_id == new_output_ids[i]:
-                k = i + 1
-            else:
-                break
-
-        # rollback to the last token that is the same
-        if k < len(old_output_ids):
-            self.matcher.rollback(len(old_output_ids) - k)
-
-        for i in range(k, len(new_output_ids)):
-            if not self.matcher.accept_token(new_output_ids[i]):
-                raise ValueError(
-                    f"Token not accepted during retokenization: {new_output_ids[i]} "
-                    f"at position {i}\n"
-                    f"Old output IDs: {old_output_ids}\n"
-                    f"New output IDs: {new_output_ids}\n"
-                    f"Key string: {self.key_string}"
-                )
-
     def __repr__(self):
         return f"XGrammarGrammar({self.key_string=}, {self.accepted_tokens=}, {self.current_token=})"
 
@@ -241,7 +208,9 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
                     f"Failed to create XGrammar TokenizerInfo from tokenizer: {e}"
                 )
 
+        self._tokenizer_info = tokenizer_info
         self.grammar_compiler = GrammarCompiler(tokenizer_info=tokenizer_info)
+        self._framing_compiler = self._new_framing_compiler(tokenizer_info)
         self.vocab_size = vocab_size
         self.override_stop_tokens = override_stop_tokens
         self.any_whitespace = any_whitespace
@@ -250,6 +219,41 @@ class XGrammarGrammarBackend(BaseGrammarBackend):
     @property
     def is_support_token_filter(self):
         return True
+
+    @staticmethod
+    def _new_framing_compiler(tokenizer_info: TokenizerInfo) -> GrammarCompiler:
+        # The cache mixes up token-level structural tags of different shapes, so
+        # framed grammars compile uncached (seen on xgrammar 0.2.1 through 0.2.7).
+        return GrammarCompiler(tokenizer_info=tokenizer_info, cache_enabled=False)
+
+    def reserve_framing_tokens(self, token_ids: Sequence[int]) -> None:
+        info = self._tokenizer_info
+        reserved = set(token_ids)
+        # A leading 0xFF is invalid UTF-8, so framed text cannot match these while
+        # token elements still match by id; string tool tags spell them, so only framing.
+        vocab = [
+            b"\xff" + piece if token_id in reserved else piece
+            for token_id, piece in enumerate(info.decoded_vocab)
+        ]
+        self._framing_compiler = self._new_framing_compiler(
+            TokenizerInfo(
+                vocab,
+                VocabType.RAW,
+                vocab_size=info.vocab_size,
+                stop_token_ids=info.stop_token_ids,
+            )
+        )
+
+    def compile_framed_grammar(
+        self, grammar: XGrammarGrammar, frame: Callable[[dict], dict]
+    ) -> XGrammarGrammar:
+        tag = json.dumps(
+            frame({"type": "grammar", "grammar": str(grammar.ctx.grammar)})
+        )
+        ctx = self._framing_compiler.compile_structural_tag(tag)
+        return self._from_context(
+            ctx, tag, GrammarStats(dispatch_type="structural_tag")
+        )
 
     @staticmethod
     def allocate_vocab_mask(vocab_size: int, batch_size: int, device) -> torch.Tensor:

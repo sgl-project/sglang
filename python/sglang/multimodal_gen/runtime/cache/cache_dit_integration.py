@@ -13,6 +13,7 @@ import torch
 import torch.distributed as dist
 
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+    get_classifier_free_guidance_world_size,
     get_ring_parallel_world_size,
     get_tp_world_size,
     get_ulysses_parallel_world_size,
@@ -426,6 +427,12 @@ _CUSTOM_BLOCK_ADAPTER_SPECS: dict[str, CustomBlockAdapterSpec] = {
         blocks_attr="blocks",
         forward_pattern=ForwardPattern.Pattern_3,
     ),
+    # The joint single-stream trunk; the per-modality mode blocks before it run
+    # depth-major over a ModuleDict, which a BlockAdapter cannot express.
+    "Flux3ImageDiT": CustomBlockAdapterSpec(
+        blocks_attr="single_blocks",
+        forward_pattern=ForwardPattern.Pattern_3,
+    ),
 }
 
 
@@ -529,6 +536,7 @@ def enable_cache_on_transformer(
     sp_group: Optional[torch.distributed.ProcessGroup] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
     has_separate_cfg: bool = False,
+    joint_cfg_decision: bool = False,
 ) -> torch.nn.Module:
     """Enable cache-dit on a transformer module, by wrapping the module with cache-dit
 
@@ -542,6 +550,9 @@ def enable_cache_on_transformer(
         has_separate_cfg: Whether the run issues separate conditional/unconditional
             passes per step (CFG). Used by custom adapters (ERNIE, Krea-2); a
             mismatch only disables caching, never corrupts output.
+        joint_cfg_decision: The model batches its CFG pair into one forward, so
+            one cache decision covers both; CFG-parallel ranks then decide
+            together instead of independently.
 
     """
     if not config.enabled:
@@ -669,6 +680,12 @@ def enable_cache_on_transformer(
 
             context_manager._sglang_tp_sp_group = tp_sp_group
 
+    if joint_cfg_decision and get_classifier_free_guidance_world_size() > 1:
+        context_manager = getattr(transformer, "_context_manager", None)
+        if context_manager is not None:
+            # The DiT group spans the CFG ranks (and any TP ranks within them).
+            context_manager._sglang_tp_sp_group = get_dit_group()
+
     return transformer
 
 
@@ -680,6 +697,7 @@ def enable_cache_on_dual_transformer(
     model_name: str = "wan2.2",
     sp_group: Optional[torch.distributed.ProcessGroup] = None,
     tp_group: Optional[torch.distributed.ProcessGroup] = None,
+    has_separate_cfg: bool = True,
 ) -> tuple[torch.nn.Module, torch.nn.Module]:
     """Enable cache-dit on dual transformers using BlockAdapter.
 
@@ -861,7 +879,7 @@ def enable_cache_on_dual_transformer(
             params_modifiers=[primary_modifier, secondary_modifier],
             check_forward_pattern=adapter_spec.check_forward_pattern,
             check_num_outputs=adapter_spec.check_num_outputs,
-            has_separate_cfg=adapter_spec.has_separate_cfg,
+            has_separate_cfg=adapter_spec.has_separate_cfg and has_separate_cfg,
         ),
         parallelism_config=None,
     )

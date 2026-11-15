@@ -16,7 +16,7 @@ from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import sock_recv, sock_send, wrap_as_pickle
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import get_device
+from sglang.srt.utils.device import get_device
 from sglang.srt.utils.network import get_free_port, get_zmq_socket_on_host
 from sglang.test.scripted_runtime.io_struct import (
     HookReady,
@@ -27,6 +27,7 @@ from sglang.test.scripted_runtime.io_struct import (
     Shutdown,
 )
 from sglang.test.scripted_runtime.utils import close_zmq_socket
+from sglang.test.test_utils import ADMIN_API_KEY_FOR_TEST
 
 DEFAULT_RUN_TIMEOUT_S: float = 120.0
 
@@ -132,7 +133,9 @@ class ScriptedHttpServer:
         fatal_error: Optional[OutOfBandError] = None
         try:
             try:
-                sock_send(self._socket, wrap_as_pickle(Shutdown()))
+                # A PAIR send blocks while no peer is connected, so a dead
+                # server would hang it; NOBLOCK raises zmq.Again instead.
+                sock_send(self._socket, wrap_as_pickle(Shutdown()), flags=zmq.NOBLOCK)
             except zmq.ZMQError:
                 pass
 
@@ -258,6 +261,7 @@ def _spawn_server_process(
         host=SERVER_HOST,
         port=get_free_port(),
         disable_prefill_cuda_graph=True,
+        admin_api_key=ADMIN_API_KEY_FOR_TEST,
         **CANARY_LAUNCH_DEFAULTS,
     )
     launch_kwargs.update(engine_kwargs)

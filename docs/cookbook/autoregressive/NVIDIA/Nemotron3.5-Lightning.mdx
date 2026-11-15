@@ -1,7 +1,6 @@
 ---
 title: Nemotron3.5-Lightning
 description: "Deploy NVIDIA Nemotron 3.5 Lightning with SGLang — NVFP4 serving with MTP, DFlash, and DSpark speculative decoding, reasoning, and tool calling."
-tag: NEW
 ---
 
 ## Deployment

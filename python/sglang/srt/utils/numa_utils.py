@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import ctypes
 import glob
 import logging
@@ -10,13 +12,15 @@ import subprocess
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_cpu_ids_by_node, is_cuda, is_xpu
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
 
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
@@ -31,6 +35,9 @@ def configure_subprocess(server_args: ServerArgs, gpu_id: int):
         if numa_node is not None:
             # _numactl_cpu_mem_args returns None (warn/raise) on empty CPU intersection (#26983).
             numactl_args = _numactl_cpu_mem_args(numa_node, gpu_id)
+            if numactl_args is not None and not _can_set_mempolicy():
+                numactl_args = _strip_memory_args(numactl_args)
+                _log_cpu_only_binding(numa_node)
             if numactl_args is not None:
                 # Verify numactl can actually apply the binding before we exec it
                 # in front of the interpreter; relax the memory policy if not.
@@ -125,7 +132,7 @@ def _get_nvml_device_index(device_id: int) -> int:
 def get_numa_node_if_available(server_args: ServerArgs, gpu_id: int) -> Optional[int]:
     """
     Returns the NUMA node for the given GPU id. If it is not set in the server_args, it will try to query the NUMA node for the GPU.
-    If the NUMA node is not available, has already been configured externally, or the user lacks permission to set NUMA affinity, it will return None.
+    If the NUMA node is not available or has already been configured externally, it will return None.
 
     Args:
         server_args: The server arguments.
@@ -183,7 +190,19 @@ def numa_bind_to_node(node: int):
         os.sched_setaffinity(0, target_cpus)
     else:
         libnuma.numa_run_on_node(ctypes.c_int(node))
-    libnuma.numa_set_preferred(ctypes.c_int(node))
+    # Without memory policy, CPU affinity alone keeps first-touch allocations local;
+    # measured on FLUX.1 TP2 on GB300, run-to-run spread fell from 26-60% to 6-8%.
+    if _can_set_mempolicy():
+        libnuma.numa_set_preferred(ctypes.c_int(node))
+    else:
+        _log_cpu_only_binding(node)
+
+
+def _log_cpu_only_binding(node: int) -> None:
+    logger.info(
+        f"NUMA memory policy not permitted; binding CPUs only to NUMA node {node}. "
+        "If using docker, --cap-add SYS_NICE also binds host memory."
+    )
 
 
 class _Bitmask(ctypes.Structure):
@@ -362,6 +381,7 @@ def _can_set_mempolicy() -> bool:
 def _is_numa_available() -> bool:
     """
     Check if NUMA is available and not already configured externally.
+    A host where only CPU affinity can be set (a container without SYS_NICE) counts.
     """
     if not (_is_cuda or _is_xpu):
         return False
@@ -373,12 +393,6 @@ def _is_numa_available() -> bool:
     if not shutil.which("numactl") and envs.SGLANG_NUMA_BIND_V2.get():
         logger.debug(
             "numactl command not found, skipping NUMA node configuration for GPU. Install numactl (e.g., apt-get install numactl) to enable automatic NUMA binding."
-        )
-        return False
-
-    if not _can_set_mempolicy():
-        logger.warning(
-            "User lacks permission to set NUMA affinity, skipping NUMA node configuration for GPU. If using docker, try adding --cap-add SYS_NICE to your docker run command."
         )
         return False
 
@@ -448,26 +462,26 @@ def init_threads_binding(
 ):
     omp_cpuids = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "all")
     cpu_ids_by_node = get_cpu_ids_by_node()
-    n_numa_node = len(cpu_ids_by_node)
+    n_node = len(cpu_ids_by_node)
     if omp_cpuids == "all":
-        assert world_size <= n_numa_node, (
+        assert world_size <= n_node, (
             f"SGLANG_CPU_OMP_THREADS_BIND is not set, in this case, "
-            f"the total number of ranks (dp_size * tp_size * pp_size = {world_size}) should be smaller than or equal to number of numa node on the machine {n_numa_node}. "
-            f"If you need more ranks than the number of numa nodes, please set the CPU cores for each rank via SGLANG_CPU_OMP_THREADS_BIND explicitly. "
+            f"the total number of ranks (dp_size * tp_size * pp_size = {world_size}) should be smaller than or equal to number of numa/CBB nodes on the machine ({n_node}). "
+            f"If you need more ranks than the number of numa/CBB nodes, please set the CPU cores for each rank via SGLANG_CPU_OMP_THREADS_BIND explicitly. "
             f"For example, on a machine with 2 numa nodes, where core 0-31 are on numa node 0 and core 32-63 are on numa node 1, "
-            f"it is suggested to use -tp 2 and bind tp rank 0 to core 0-31 and tp rank 1 to core 32-63. "
+            f"it is suggested to use --tp 2 and bind tp rank 0 to core 0-31 and tp rank 1 to core 32-63. "
             f"This is the default behavior if SGLANG_CPU_OMP_THREADS_BIND is not set and it is the same as setting SGLANG_CPU_OMP_THREADS_BIND=0-31|32-63. "
-            f"If you do need more ranks than the number of numa nodes, you could set SGLANG_CPU_OMP_THREADS_BIND explicitly for example SGLANG_CPU_OMP_THREADS_BIND=0-15|16-31|32-47|48-63 and run with -tp 4. "
-            f"If you don't want each rank to use all the cores on one numa node, you could set for example SGLANG_CPU_OMP_THREADS_BIND=0-15|32-47 and run with -tp 2."
+            f"If you do need more ranks than the number of numa nodes, you could set SGLANG_CPU_OMP_THREADS_BIND explicitly for example SGLANG_CPU_OMP_THREADS_BIND=0-15|16-31|32-47|48-63 and run with --tp 4. "
+            f"If you don't want each rank to use all the cores on one numa node, you could set for example SGLANG_CPU_OMP_THREADS_BIND=0-15|32-47 and run with --tp 2."
         )
-        if world_size < n_numa_node:
+        if world_size < n_node:
             logger.warning(
-                f"Detected the current machine has {n_numa_node} numa nodes available, but the total number of ranks (dp_size * tp_size * pp_size) is {world_size}, so only {world_size} numa nodes are used."
+                f"Detected the current machine has {n_node} numa/CBB nodes available, but the total number of ranks (dp_size * tp_size * pp_size) is {world_size}, so only {world_size} numa/CBB nodes are used."
             )
-        assert 0 <= numa_index < n_numa_node, (
+        assert 0 <= numa_index < n_node, (
             f"NUMA index {numa_index} (derived from the worker's global device id / gpu_id) "
-            f"is out of range for {n_numa_node} numa nodes. This usually means dp_size * tp_size "
-            f"exceeds the number of numa nodes; reduce it, or set SGLANG_CPU_OMP_THREADS_BIND explicitly."
+            f"is out of range for {n_node} numa/CBB nodes. This usually means dp_size * tp_size "
+            f"exceeds the number of numa/CBB nodes; reduce it, or set SGLANG_CPU_OMP_THREADS_BIND explicitly."
         )
         local_omp_cpuid = cpu_ids_by_node[numa_index]
     else:
@@ -485,9 +499,9 @@ def init_threads_binding(
             f"Ensure the number of '|'-separated bind groups matches dp_size * tp_size * pp_size (across all DP workers)."
         )
         local_omp_cpuid = threads_bind_list[numa_index]
-        if world_size > n_numa_node:
+        if world_size > n_node:
             logger.warning(
-                f"The total number of ranks ({world_size}) is larger than numa node number ({n_numa_node}), "
+                f"The total number of ranks ({world_size}) is larger than numa/CBB node number ({n_node}), "
                 f"in this case the available memory amount of each rank cannot be determined in prior. "
                 f"Please set proper `--max-total-tokens` to avoid the out-of-memory error."
             )

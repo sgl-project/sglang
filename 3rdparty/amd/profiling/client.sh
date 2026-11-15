@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # Start profiling via API
-curl http://localhost:30000/start_profile -H "Content-Type: application/json"
+curl http://localhost:30000/start_profile -H "Content-Type: application/json" -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}"
 
 # Benchmark serving using sglang with random dataset and tokenizer
 # Define the log file with a timestamp
@@ -9,7 +9,7 @@ TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 LOGFILE="sglang_client_log_$TIMESTAMP.json"
 
 # Run the benchmark with specified parameters and save logs
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
     --backend sglang \
     --tokenizer Xenova/grok-1-tokenizer \
     --dataset-name random \
@@ -20,7 +20,7 @@ python3 -m sglang.bench_serving \
     --output-file online.jsonl 2>&1 | tee "$LOGFILE"
 
 # Stop profiling via API
-curl http://localhost:30000/stop_profile -H "Content-Type: application/json"
+curl http://localhost:30000/stop_profile -H "Content-Type: application/json" -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}"
 
 # Convert tracing file to csv & json
 sqlite3 trace.rpd ".mode csv" ".header on" ".output trace.csv" "select * from top;" ".output stdout"

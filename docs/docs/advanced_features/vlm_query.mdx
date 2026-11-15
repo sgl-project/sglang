@@ -34,6 +34,38 @@ SGLang supports three ways to pass visual data, each optimized for different sce
 
 The examples below demonstrate all three approaches with both Qwen2.5-VL and Llama 4 models.
 
+## Multimodal cache identity
+
+SGLang identifies actual media features or supplied embeddings using full 256-bit
+digests. Cache identities also include tensor shape and dtype, container boundaries,
+modality, model-specific metadata, and the effective model/processor configuration.
+CPU and CUDA tensor hashing use BLAKE3; GPU hashing transfers only the digests to
+the host. These are collision-resistant identifiers, not a mathematical guarantee
+that collisions are impossible.
+
+- `mm_hashes` remains accepted for compatibility, but cannot override cache keys
+  or skip server-side content hashing. External routers must not assume that a
+  supplied scalar hash equals SGLang's internal KV-cache key.
+- `mm_content_hashes` describes source content. Keep
+  `--trust-mm-content-hashes` disabled for untrusted clients; enabling it allows
+  preprocessing-cache lookup before verifying the supplied media.
+- Embedding caching and batch deduplication retain the full identity. KV caching
+  namespaces each request by its ordered media identities and `cache_salt`, so a
+  short placeholder collision cannot reuse another image's KV state. Requests
+  with identical media can still share prefixes; requests with different media
+  do not share even their common text prefix. This can increase prefill cost for
+  workloads with long shared instructions and changing images.
+- Pin model revisions when sharing encoder caches. Clear caches or restart when
+  replacing weights or processor implementations in place; a configuration
+  fingerprint is not a checksum of all model weights.
+
+Custom processors must hash the final model-facing features and metadata before
+exporting CUDA transport handles. The shared frontend finalization path then binds
+the processor namespace and updates any prebuilt padding together; composite
+processors must delegate this step to their inner processor.
+Keep server-created full identities intact across transport and never use a
+truncated scalar hash as an embedding or KV-cache identity.
+
 ## Querying Qwen2.5-VL Model
 
 ```python Example

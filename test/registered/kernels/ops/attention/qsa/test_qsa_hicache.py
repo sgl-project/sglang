@@ -12,6 +12,12 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.hybrid_cache.host_pool_config import (
+    prepare_host_pool_config,
+)
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+    _build_sidecar_host_pool,
+)
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.qsa import QSAIndexerPoolHost
@@ -24,6 +30,22 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b
 
 PAGE = 64
 RATIO = 4
+
+
+def build_indexer_host(device, anchor, drafts=()):
+    # Layers 7 and 11 are transfer layers 3 and 7 of a stage starting at layer 4.
+    config = prepare_host_pool_config(
+        root=device,
+        full_layer_mapping={3: 0, 7: 1},
+        transfer_layer_id_max=8,
+        transfer_page_size=PAGE,
+        packed_draft_device_pools=drafts,
+    )
+    (sidecar,) = config.sidecars
+    assert sidecar.pool_name is PoolName.INDEXER
+    return _build_sidecar_host_pool(
+        config=sidecar, root=config.root, root_host_pool=anchor
+    )
 
 
 def make_device_pool(layers, start_layer=0):
@@ -50,8 +72,21 @@ def pools(request):
     layout, backend = request.param
     publish(ServerArgs(model_path="dummy"), role="test")
     device = make_device_pool([7, 11], start_layer=4)
-    anchor = MHATokenToKVPoolHost(device.full_kv_pool, 2, 0, PAGE, layout)
-    host = QSAIndexerPoolHost(device, anchor)
+    anchor = MHATokenToKVPoolHost(
+        device.full_kv_pool.get_device_pool_infos()[0].buffer_info,
+        2,
+        0,
+        PAGE,
+        layout,
+        device_capacity_tokens=device.full_kv_pool.size
+        if device.full_kv_pool.host_capacity_tokens is None
+        else device.full_kv_pool.host_capacity_tokens,
+        start_layer=device.full_kv_pool.start_layer,
+        end_layer=device.full_kv_pool.end_layer,
+        write_back_staging=device.full_kv_pool.hicache_write_back_staging,
+    )
+    host = build_indexer_host(device, anchor)
+    assert isinstance(host, QSAIndexerPoolHost)
     try:
         yield device, anchor, host, backend
     finally:
@@ -195,7 +230,7 @@ def test_qsa_file_restart_and_missing_sidecar(pools):
 def test_packed_mtp_indexer_roundtrip(pools):
     device, anchor, _, backend = pools
     draft = make_device_pool([0])
-    host = QSAIndexerPoolHost(device, anchor, mtp_draft_device_pools=(draft,))
+    host = build_indexer_host(device, anchor, (draft,))
     try:
         source, destination, host_indices = slots([3, 1]), slots([4, 2]), slots([0, 2])
         all_buffers = [
