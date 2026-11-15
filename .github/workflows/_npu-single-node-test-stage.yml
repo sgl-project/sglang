@@ -75,12 +75,18 @@ on:
         description: 'Coverage-recommended test files for this suite (one repo-relative path per line, from recommend-tests-from-coverage). Empty = run the full suite.'
         type: string
         default: ''
+      collect_nightly_tests:
+        description: 'Pass run_suite.py --nightly (collects nightly-registered tests) while keeping the PR install. is_nightly_pipeline_job implies it.'
+        type: boolean
+        default: false
 
 env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check }}
 
 concurrency:
-  group: ascend-nightly-e2e-singlenode-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_suite }}
+  # inputs.ref keeps /rerun-test runs for different fork PRs apart: they all
+  # dispatch from main, so workflow_ref and ref alone are shared.
+  group: ascend-nightly-e2e-singlenode-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.ref }}-${{ inputs.test_suite }}
   cancel-in-progress: true
 
 jobs:
@@ -385,6 +391,8 @@ jobs:
           NIGHTLY_FLAG=""
           if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
             NIGHTLY_FLAG="--nightly --continue-on-error"
+          elif [ "${{ inputs.collect_nightly_tests }}" = "true" ]; then
+            NIGHTLY_FLAG="--nightly"
           fi
 
           # Append configuration arguments when the test suite is split into multiple parallel jobs.

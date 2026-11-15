@@ -16,6 +16,8 @@ STEP_TIMEOUT_SECONDS = 60 * 60
 UBUNTU_CPU_SUITES = {"base-a-test-cpu"}
 # rerun-test never builds sgl-kernel, so `$b200_runner` resolves to this pool.
 B200_RERUN_RUNNER = "4-gpu-b200"
+# Modes whose job calls an NPU stage workflow (see npu_suites.py).
+NPU_MODES = ("npu", "npu_single_node")
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -44,6 +46,16 @@ def _runner_config_labels():
     except ImportError:  # no PyYAML: fall back to the largest registration
         return {}
     return {name: resolve_runs_on(cfg) for name, cfg in runner_configs.load().items()}
+
+
+@functools.cache
+def _npu_suite_labels():
+    try:
+        sys.path.insert(0, str(_REPO_ROOT / "scripts/ci"))
+        import npu_suites
+    except ImportError:  # no PyYAML: fall back to the largest registration
+        return {}
+    return {name: suite.runs_on for name, suite in npu_suites.load_suites().items()}
 
 
 def _registrations(path, register_name):
@@ -113,7 +125,11 @@ def estimate_seconds(command, root, mode, runs_on=""):
             return cases.get(case.group(1))
         return standalone.get(filename, standalone.get(Path(filename).name))
 
-    register_name = {"cuda": "register_cuda_ci", "cpu": "register_cpu_ci"}.get(mode)
+    register_name = {
+        "cuda": "register_cuda_ci",
+        "cpu": "register_cpu_ci",
+        **{npu_mode: "register_npu_ci" for npu_mode in NPU_MODES},
+    }.get(mode)
     if register_name is None:
         return None
     filename = command.split()[0].split("::", 1)[0]
@@ -123,6 +139,9 @@ def estimate_seconds(command, root, mode, runs_on=""):
     if mode == "cuda":
         labels = _runner_config_labels()
         matching = [est for est, rc, _ in found if rc and labels.get(rc) == runs_on]
+    elif mode in NPU_MODES:
+        labels = _npu_suite_labels()
+        matching = [est for est, _, suite in found if labels.get(suite) == runs_on]
     else:
         matching = [est for est, _, suite in found if suite in UBUNTU_CPU_SUITES]
     # A file may register on multiple pools; without a match, stay conservative.
@@ -163,14 +182,34 @@ def partition_commands(commands, root, mode, runs_on=""):
     }
 
 
+def npu_stage_inputs(matrix):
+    """`partitions` and `only_tests` for an NPU stage workflow, which takes every
+    file as one repo-relative list and splits it with run_suite.py itself."""
+    size = len(matrix["include"])
+    files = [
+        f"test/{command.split()[0]}"
+        for partition in matrix["include"]
+        for command in partition["test_command"].splitlines()
+    ]
+    return {"size": size, "arr": list(range(size))}, "\n".join(files)
+
+
 if __name__ == "__main__":
+    mode = os.environ["MODE"]
     matrix = partition_commands(
         os.environ["TEST_COMMAND"],
         Path(os.environ["TEST_ROOT"]),
-        os.environ["MODE"],
+        mode,
         os.environ.get("RUNS_ON", ""),
     )
     for partition in matrix["include"]:
         print(f"Partition {partition['partition']}:\n{partition['test_command']}")
     with open(os.environ["GITHUB_OUTPUT"], "a") as output:
         output.write(f"matrix={json.dumps(matrix, separators=(',', ':'))}\n")
+        if mode in NPU_MODES:
+            partitions, only_tests = npu_stage_inputs(matrix)
+            output.write(
+                f"partitions={json.dumps(partitions, separators=(',', ':'))}\n"
+            )
+            # JSON-encoded so the multi-line list fits one output line.
+            output.write(f"only_tests={json.dumps(only_tests)}\n")
