@@ -230,11 +230,10 @@ impl WorkerSelectionStage {
             return None;
         }
 
-        // Select using policies
-        let policy = match model_id {
-            Some(model) => self.policy_registry.get_policy_or_default(model),
-            None => self.policy_registry.get_default_policy(),
-        };
+        // PD pools use their own policies (--prefill-policy / --decode-policy);
+        // model_id only scopes the worker pools below.
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let decode_policy = self.policy_registry.get_decode_policy();
 
         // Get cached hash ring for consistent hashing (O(log n) lookup)
         let hash_ring = self
@@ -247,24 +246,27 @@ impl WorkerSelectionStage {
             headers,
             hash_ring,
         };
-        let prefill_idx = policy.select_worker(&available_prefill, &info).await?;
-        let decode_idx = policy.select_worker(&available_decode, &info).await?;
+        let prefill_idx = prefill_policy
+            .select_worker(&available_prefill, &info)
+            .await?;
+        let decode_idx = decode_policy
+            .select_worker(&available_decode, &info)
+            .await?;
 
         let model = model_id.unwrap_or(UNKNOWN_MODEL_ID);
-        let policy_name = policy.name();
 
         // Record worker selection metrics for both prefill and decode
         Metrics::record_worker_selection(
             metrics_labels::WORKER_PREFILL,
             metrics_labels::CONNECTION_GRPC,
             model,
-            policy_name,
+            prefill_policy.name(),
         );
         Metrics::record_worker_selection(
             metrics_labels::WORKER_DECODE,
             metrics_labels::CONNECTION_GRPC,
             model,
-            policy_name,
+            decode_policy.name(),
         );
 
         Some((

@@ -114,11 +114,16 @@ impl RouterManager {
 
             info!("PD disaggregation auto-enabled for IGW mode, creating PD routers");
 
+            // Resolve PD pool policies from the config (falls back to the main policy)
+            let main_policy = &config.router_config.policy;
+            let prefill_policy = config.router_config.mode.get_prefill_policy(main_policy);
+            let decode_policy = config.router_config.mode.get_decode_policy(main_policy);
+
             // Create HTTP PD router
             match RouterFactory::create_pd_router(
-                None,
-                None,
-                &config.router_config.policy,
+                Some(prefill_policy),
+                Some(decode_policy),
+                main_policy,
                 app_context,
             )
             .await
@@ -134,9 +139,9 @@ impl RouterManager {
 
             // Create gRPC PD router
             match RouterFactory::create_grpc_pd_router(
-                None,
-                None,
-                &config.router_config.policy,
+                Some(prefill_policy),
+                Some(decode_policy),
+                main_policy,
                 app_context,
             )
             .await
