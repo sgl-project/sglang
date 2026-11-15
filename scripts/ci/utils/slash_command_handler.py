@@ -1035,7 +1035,7 @@ def detect_suite(file_path_from_test, hw=None):
     the main PR test pipeline; the legacy single-string `suite=` carries no
     runner_config and is reported as non-dispatchable. A CPU file yields one
     entry, an NPU or AMD file one per `register_npu_ci(...)` or
-    `register_amd_ci(...)` call.
+    `register_amd_ci(...)` call, less the NPU nightly ones _detect_npu skips.
     """
     full_path = f"test/{file_path_from_test}"
     try:
@@ -1154,6 +1154,13 @@ def _detect_npu(full_path, registrations):
         suites = _npu_suites.load_suites()
     except ValueError as e:
         return [f"Cannot resolve NPU registrations: {e}"]
+    # A nightly suite on a runner a non-nightly suite of the file also runs
+    # on would run the same file on the same hardware again; skip it.
+    non_nightly_runners = {
+        suites[r.effective_suite].runs_on
+        for r in npu
+        if not r.nightly and r.effective_suite in suites and r.disabled is None
+    }
     out = []
     for r in npu:
         suite = r.effective_suite
@@ -1169,6 +1176,8 @@ def _detect_npu(full_path, registrations):
                 f"`{full_path}` is disabled in NPU suite `{suite}` "
                 f"({r.disabled}), so run_suite.py would skip it."
             )
+        elif r.nightly and suites[suite].runs_on in non_nightly_runners:
+            continue
         else:
             out.append(
                 RerunEntry(
@@ -1388,7 +1397,7 @@ def _dispatch_batch(
 
 def _dispatched_reply(gh_repo, batch, marker, run_url):
     """The reply-comment section of a dispatched batch; `marker` lets the run's
-    writeback step find it and replace 🚀 with ✅/❌."""
+    writeback step find it and replace ⏳ with the run's status."""
     if batch[0].mode == "multimodal_gen":
         cmds = [f"python3 -m pytest {r.test_command} -x" for r in batch]
     else:
@@ -1399,6 +1408,8 @@ def _dispatched_reply(gh_repo, batch, marker, run_url):
     )
     label = batch[0].runs_on or batch[0].mode
     count = f"{len(batch)} test{'s' if len(batch) > 1 else ''}"
+    if batch[0].suite:
+        count = f"suite `{batch[0].suite}`, {count}"
     if run_url:
         return (
             f"🚀 `{label}` ({count}): ⏳ [View workflow run]({run_url}) {marker}\n"
