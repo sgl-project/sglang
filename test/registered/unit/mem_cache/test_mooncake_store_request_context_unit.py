@@ -526,5 +526,155 @@ class TestMooncakeStoreWritePathNoContext(unittest.TestCase):
         )
 
 
+class _ReceiptBinding:
+    """Fake MooncakeDistributedStore scripting per-call get receipts.
+
+    Each ``batch_get_into`` call consumes one entry of ``receipt_script`` (a
+    list of per-key byte counts, exactly what the real wheel returns: bytes
+    read on success, negative on error). A short positive receipt is what a
+    half-written object (e.g. a page a crashed writer only partly published)
+    yields, and is the fault this suite injects.
+    """
+
+    def __init__(self, receipt_script):
+        self.event_log = []
+        self.receipt_script = list(receipt_script)
+
+    def set_request_context(self, *a, **k):
+        self.event_log.append(("set_request_context", None))
+
+    def clear_request_context(self):
+        self.event_log.append(("clear_request_context", None))
+
+    def batch_get_into(self, keys, ptrs, sizes, *a, **k):
+        self.event_log.append(("batch_get_into", list(sizes)))
+        return self.receipt_script.pop(0)
+
+    def batch_put_from(self, keys, ptrs, sizes, *a, **k):
+        self.event_log.append(("batch_put_from", list(keys)))
+        return [0] * len(keys)
+
+
+def _make_v1_store(binding, sizes=None):
+    """A MooncakeStore whose buffer-meta plumbing is stubbed to sizes."""
+    st = _make_mooncake_store(binding)
+    st.mem_pool_host = SimpleNamespace(kv_buffer=object(), page_size=1)
+    sizes = [4096] * 4 if sizes is None else sizes
+    st._batch_preprocess = lambda keys, hi: (
+        [f"{k}_k" for k in keys] + [f"{k}_v" for k in keys],
+        [0] * len(sizes),
+        sizes,
+    )
+    return st
+
+
+def _make_v2_store(binding, sizes=None):
+    """A MooncakeStore with a registered KV pool for batch_get_v2."""
+    st = _make_mooncake_store(binding)
+    sizes = [4096, 4096] if sizes is None else sizes
+    host_pool = SimpleNamespace(
+        page_size=1,
+        get_page_buffer_meta=lambda hi: ([0x1, 0x2], sizes),
+    )
+    st.registered_pools = {PoolName.KV: host_pool}
+    st._get_hybrid_page_component_keys = lambda keys, t: (list(keys), 1)
+    return st
+
+
+class TestMooncakeStoreReceiptValidation(unittest.TestCase):
+    """Fault injection on the zero-copy get receipt path.
+
+    The hit flags these APIs return are what the HiCache controller consumes
+    to mark host pages present (``_page_get_zero_copy`` stops at the first
+    miss), so every case here also pins the cache-present behavior: a
+    short-read page must read as absent, never present.
+    """
+
+    def test_validate_receipts_unit_semantics(self):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            validate_receipts,
+        )
+
+        # Full receipt -> hit; short / zero / negative receipt -> miss.
+        self.assertEqual(
+            validate_receipts([4096, 100, 0, -1, -707], [4096] * 5),
+            [True, False, False, False, False],
+        )
+        # Packed multi-buffer keys: the requested length is the size sum.
+        self.assertEqual(
+            validate_receipts([8192, 8191], [[4096, 4096], [4096, 4096]]),
+            [True, False],
+        )
+        # One requested length per receipt, always.
+        with self.assertRaises(ValueError):
+            validate_receipts([4096, 4096], [4096])
+
+    def test_f1_all_keys_short_read_group_miss_without_exception(self):
+        # Every page half served: positive receipts, wrong byte counts.
+        binding = _ReceiptBinding([[100, 100, 100, 100]])
+        store = _make_v1_store(binding)
+
+        self.assertEqual(
+            store.batch_get_v1(["p0", "p1"], host_indices=object()), [False, False]
+        )
+
+        # The v2 hybrid path shares the judgment.
+        v2_binding = _ReceiptBinding([[100, 100]])
+        v2_store = _make_v2_store(v2_binding)
+        transfer = PoolTransfer(
+            name=PoolName.KV, host_indices=[0, 1], keys=["k0", "k1"]
+        )
+        self.assertEqual(
+            v2_store.batch_get_v2([transfer]), {PoolName.KV: [False, False]}
+        )
+
+    def test_f2_mixed_group_short_key_miss_complete_keys_hit(self):
+        # p0 complete (4096+4096), p0's twin short, p1 complete: only the
+        # short-read page loses its present mark.
+        binding = _ReceiptBinding([[4096, 4096, 100, 4096]])
+        store = _make_v1_store(binding)
+
+        self.assertEqual(
+            store.batch_get_v1(["p0", "p1"], host_indices=object()), [True, False]
+        )
+
+    def test_f3_retry_after_short_read_reaches_transfer_layer(self):
+        # A short read must leave no positive mark that a retry could be
+        # short-circuited by: the second get re-issues the transfer RPC and,
+        # served in full, reads as present.
+        binding = _ReceiptBinding([[4096, 100], [4096, 4096]])
+        store = _make_v1_store(binding)
+
+        self.assertEqual(
+            store.batch_get_v1(["p0", "p1"], host_indices=object()), [True, False]
+        )
+        self.assertEqual(
+            store.batch_get_v1(["p0", "p1"], host_indices=object()), [True, True]
+        )
+        self.assertEqual(_names(binding.event_log), ["batch_get_into"] * 2)
+
+    def test_p1_half_page_object_reads_as_miss(self):
+        # The write "succeeded" (the object exists) but a prefill crash half
+        # published it; get() must fail closed, including the 0-byte receipt
+        # the old ">= 0" judgment accepted as a hit.
+        binding = _ReceiptBinding([[100], [0], [4096]])
+        store = _make_mooncake_store(binding)
+
+        self.assertFalse(store.get("k", target_location=0x10, target_sizes=4096))
+        self.assertFalse(store.get("k", target_location=0x10, target_sizes=4096))
+        self.assertTrue(store.get("k", target_location=0x10, target_sizes=4096))
+
+    def test_p2_decode_fetch_short_receipt_degrades_to_recompute(self):
+        # batch_get returns the number of fully-hit pages; a short receipt on
+        # any component of page 0 yields 0 -> the decode side recomputes.
+        binding = _ReceiptBinding([[4096, 100]])
+        store = _make_mooncake_store(binding)
+
+        self.assertEqual(store.batch_get(["k0", "k1"], [0x1, 0x2], [4096, 4096]), 0)
+        # Fully served page -> the same call counts it present.
+        binding.receipt_script.append([4096, 4096])
+        self.assertEqual(store.batch_get(["k0", "k1"], [0x1, 0x2], [4096, 4096]), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

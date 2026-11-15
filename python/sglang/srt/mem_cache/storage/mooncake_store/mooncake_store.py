@@ -38,6 +38,45 @@ DEFAULT_TENANT_ID = "default"
 logger = logging.getLogger(__name__)
 
 
+def validate_receipts(receipts: List[int], requested_lengths: List[Any]) -> List[bool]:
+    """Validate per-key byte receipts of zero-copy get transfers, fail-closed.
+
+    A Mooncake ``batch_get_into`` receipt is the number of bytes actually read
+    for the key: positive on success, negative on error. A partially served
+    object (e.g. a page a crashed writer only half published) still yields a
+    positive but SHORT receipt, so a bare ``receipt > 0`` never proves the
+    transfer completed; only a receipt equal to the requested byte count does.
+    A key whose buffers are packed (``batch_get_into_multi_buffers``) carries a
+    sequence of per-buffer sizes, whose sum is the requested length.
+    """
+    if len(receipts) != len(requested_lengths):
+        raise ValueError(
+            "Receipt validation needs one requested length per receipt: "
+            f"{len(receipts)} != {len(requested_lengths)}"
+        )
+    validated = []
+    for receipt, requested in zip(receipts, requested_lengths):
+        if isinstance(requested, Sequence):
+            expected = sum(requested)
+        else:
+            expected = requested
+        validated.append(receipt > 0 and receipt == expected)
+    return validated
+
+
+def mask_invalid_receipts(
+    receipts: List[int], requested_lengths: List[Any]
+) -> List[int]:
+    """Turn every invalid receipt into an error so hit judgments read
+    ``status_ok AND receipt_valid`` without a signature change."""
+    return [
+        receipt if valid else -1
+        for receipt, valid in zip(
+            receipts, validate_receipts(receipts, requested_lengths)
+        )
+    ]
+
+
 class MooncakeHostTensorAllocator(HostTensorAllocator):
     def __init__(self):
         super().__init__()
@@ -1368,8 +1407,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 for i, res in zip(missing_idx, put_results):
                     io_results[i] = res
         else:
-            io_results = self._get_batch_zero_copy_impl(
-                all_key_strs, all_ptrs, all_sizes
+            io_results = mask_invalid_receipts(
+                self._get_batch_zero_copy_impl(all_key_strs, all_ptrs, all_sizes),
+                all_sizes,
             )
 
         results: dict = {}
@@ -1590,7 +1630,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 len(keys) / (end_time - start_time) * self.gb_per_page
             )
 
-        return self._batch_postprocess(get_results, is_set_operate=False)
+        return self._batch_postprocess(
+            mask_invalid_receipts(get_results, buffer_sizes), is_set_operate=False
+        )
 
     def batch_set_v1(
         self,
@@ -1742,7 +1784,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         get_result = self._get_batch_zero_copy_impl(
             [key], [target_location], [target_sizes]
         )
-        return get_result[0] >= 0
+        # A receipt that only says "no error" (>= 0) also accepts a zero-byte
+        # or short read; require the full requested length.
+        return validate_receipts(get_result, [target_sizes])[0]
 
     def batch_get(
         self,
@@ -1755,8 +1799,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             return 0
 
         start_time = time.perf_counter()
-        get_result = self._get_batch_zero_copy_impl(
-            keys, target_locations, target_sizes
+        get_result = mask_invalid_receipts(
+            self._get_batch_zero_copy_impl(keys, target_locations, target_sizes),
+            target_sizes,
         )
         end_time = time.perf_counter()
 
@@ -1854,6 +1899,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _get_batch_zero_copy_impl(
         self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
     ) -> List[int]:
+        """Per-key byte receipts, one per ``key_strs`` entry: the number of
+        bytes actually read on success, negative on error. Consumers must
+        treat a positive but short receipt as a miss (validate_receipts)."""
         if self._uses_multi_buffer(buffer_ptrs):
             return self.store.batch_get_into_multi_buffers(
                 key_strs, buffer_ptrs, buffer_sizes
