@@ -91,6 +91,7 @@ from sglang.srt.mem_cache.page_interleave import (
     get_kv_shard_group,
     get_shared_kv_shard_pool,
     make_page_shard_spec,
+    page_shard_row_bytes,
 )
 from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveDSATokenToKVPool,
@@ -542,6 +543,14 @@ class KVCacheConfigurator:
         self.kv_shard_rank = self.kv_shard_spec.shard_rank
         self.kv_shard_size = self.kv_shard_spec.shard_size
         self.kv_shard_group = get_kv_shard_group(self.use_mla_backend)
+
+    def page_shard_scratch_row_bytes(self) -> int:
+        """Bytes per token row of the logical-page KV sharding scratch.
+
+        Override when the sharded pool stores wider rows than the standard
+        K/V or MLA layout (for example grouped rows or embedded scales).
+        """
+        return page_shard_row_bytes(self)
 
     def _build_fp4_quant_method(self, *, num_layers: int):
         if not is_float4_e2m1fn_x2(self.kv_cache_dtype):
