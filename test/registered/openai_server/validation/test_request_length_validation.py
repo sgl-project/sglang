@@ -3,20 +3,24 @@ import unittest
 import openai
 import requests
 
-from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_rust_server_built,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=64, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=128, stage="base-b", runner_config="1-gpu-small")
 
 
-class TestRequestLengthValidation(CustomTestCase):
+class _ChatRequestLengthValidation:
+    rust_frontend = False
+    max_tokens_error = "max_completion_tokens is too large"
+
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
@@ -28,12 +32,14 @@ class TestRequestLengthValidation(CustomTestCase):
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             api_key=cls.api_key,
+            env={"SGLANG_RUST_SERVER": "1" if cls.rust_frontend else "0"},
             other_args=("--max-total-tokens", "1000", "--context-length", "1000"),
         )
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if getattr(cls, "process", None) is not None:
+            terminate_and_kill_process_tree(cls.process)
 
     def test_input_length_longer_than_context_length(self):
         client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
@@ -100,10 +106,12 @@ class TestRequestLengthValidation(CustomTestCase):
             )
 
         self.assertIn(
-            "max_completion_tokens is too large",
+            self.max_tokens_error,
             str(cm.exception),
         )
 
+
+class TestRequestLengthValidation(_ChatRequestLengthValidation, CustomTestCase):
     def test_token_ids_logprob_out_of_vocabulary(self):
         headers = {"Authorization": f"Bearer {self.api_key}"}
         for token_ids_logprob in ([-1], [2_000_000_000]):
@@ -167,6 +175,12 @@ class TestRequestLengthValidation(CustomTestCase):
             },
         )
         self.assertEqual(response.status_code, 200)
+
+
+@unittest.skipUnless(is_rust_server_built(), "embedded rust server extension not built")
+class TestRustChatRequestLengthValidation(_ChatRequestLengthValidation, CustomTestCase):
+    rust_frontend = True
+    max_tokens_error = "Requested token count exceeds the model's maximum context length"
 
 
 if __name__ == "__main__":
