@@ -23,7 +23,7 @@ import unittest
 from sglang.srt.entrypoints.engine import _set_envs_and_config
 from sglang.srt.runtime_context import get_observability, reset_context
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils.common import configure_logger
+from sglang.srt.utils.log_utils import configure_logger
 from sglang.test.test_utils import CustomTestCase
 
 # Callees this guard can drive directly. `_set_envs_and_config` is here too: it

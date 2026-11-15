@@ -28,10 +28,10 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
-    get_device_core_count,
     is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
@@ -91,7 +91,6 @@ _MLA_BUCKETS = (
 _MLA_BUCKET_BATCH_FREE = _MLA_BUCKETS[1]
 
 _KEEP_SCHEDULER_SPLITS = None
-_CORE_COUNT = {}
 _LOGGED_TUNE = False
 
 
@@ -121,8 +120,9 @@ def _keep_scheduler_splits() -> bool:
 
 
 def _grouped_head_tiles(head_num: int, kv_group_num: int) -> int:
-    """Stage-1's grid extent along heads."""
-    return triton.cdiv(head_num, min(_GROUPED_BLOCK_H, kv_group_num))
+    """Stage-1's grid extent along heads: a whole number of tiles per KV head."""
+    kv_head_num = triton.cdiv(head_num, kv_group_num)
+    return kv_head_num * triton.cdiv(kv_group_num, _GROUPED_BLOCK_H)
 
 
 def _mla_bucket(batch: int) -> _MlaBucket:
@@ -137,14 +137,6 @@ def _mla_split_budget(num_warps: int, core_count: int) -> int:
     # halving the warps to double how many fit. core_count, not a whole MI355X: a CPX
     # partition exposes 32 of the 256
     return core_count * 4 // num_warps
-
-
-def _mla_core_count(device_index: Optional[int]) -> int:
-    count = _CORE_COUNT.get(device_index)
-    if count is None:
-        count = get_device_core_count(device_index if device_index is not None else 0)
-        _CORE_COUNT[device_index] = count
-    return count
 
 
 def _mla_kv_splits(
@@ -195,7 +187,7 @@ def _mla_launch_plan(
     head_num = q.shape[1]
     head_tiles = _grouped_head_tiles(head_num, head_num // k_buffer.shape[-2])
     splits = _mla_kv_splits(
-        q.shape[0], head_tiles, max_kv_splits, _mla_core_count(q.device.index)
+        q.shape[0], head_tiles, max_kv_splits, current_arch().num_sms
     )
 
     global _LOGGED_TUNE
@@ -596,6 +588,13 @@ def _fwd_grouped_kernel_stage1(
         VALID_BLOCK_H: tl.constexpr = kv_group_num
     cur_head = cur_head_id * VALID_BLOCK_H + tl.arange(0, BLOCK_H)
     mask_h = cur_head < (cur_head_id + 1) * VALID_BLOCK_H
+    # Each KV head owns whole tiles, so a group that is not a multiple of BLOCK_H
+    # ends in a partly filled tile: index the heads from the group's start.
+    if kv_group_num % VALID_BLOCK_H != 0:
+        tile_in_group = cur_head_id % tl.cdiv(kv_group_num, BLOCK_H)
+        head_in_group = tile_in_group * BLOCK_H + tl.arange(0, BLOCK_H)
+        cur_head = cur_kv_head * kv_group_num + head_in_group
+        mask_h = head_in_group < kv_group_num
     mask_h = mask_h & (cur_head < q_head_num)
 
     offs_d = tl.arange(0, BLOCK_DMODEL)
@@ -1348,7 +1347,7 @@ def _lean_num_cus() -> int:
     global _NUM_CU
     if _NUM_CU is None:
         try:
-            _NUM_CU = torch.cuda.get_device_properties(0).multi_processor_count
+            _NUM_CU = current_arch().num_sms
         except Exception:
             _NUM_CU = 304
     return _NUM_CU

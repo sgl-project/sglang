@@ -5,12 +5,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 _MOD = "sglang.srt.managers.scheduler"
 

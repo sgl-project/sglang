@@ -18,6 +18,7 @@ from sglang.srt.function_call.kimik3_detector import KimiK3Detector
 from sglang.srt.function_call.kimik3_format import (
     ARGUMENT_CLOSE,
     CALL_CLOSE,
+    MESSAGE_CLOSE,
     THINK_CLOSE,
     TOOLS_CLOSE,
     TOOLS_OPEN,
@@ -28,7 +29,7 @@ from sglang.srt.function_call.kimik3_structural_tag import (
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=7, suite="base-a-test-cpu")
 
 _CLOSE_TOKEN = "<|close|>"
 _CLOSE_TOKEN_ID = 256
@@ -203,6 +204,48 @@ def test_required_allows_response_prefix_but_requires_tools():
     assert not _accepts(grammar, response)
 
 
+def test_required_rejects_message_close_before_tools():
+    grammar = _grammar([_tool()], tool_choice="required")
+    response = "<|open|>response<|sep|>Hi there!<|close|>response<|sep|>"
+
+    assert not _accepts(grammar, response + MESSAGE_CLOSE)
+    assert not _accepts(
+        grammar, response + MESSAGE_CLOSE + _tools_section(_valid_weather_call())
+    )
+    assert _accepts(
+        grammar, response + _tools_section(_valid_weather_call()) + MESSAGE_CLOSE
+    )
+    assert not _accepts(grammar, response + "<|close|>messagemessage<|sep|>")
+    for near_miss in (
+        "<|close|>Message<|sep|>",
+        "<|close|>_message<|sep|>",
+        TOOLS_CLOSE,
+    ):
+        assert not _accepts(grammar, response + near_miss)
+    assert not _accepts(grammar, "<|open|>response<|sep|>Hi" + TOOLS_CLOSE)
+
+
+def test_tool_choice_none_rejects_tools_section():
+    grammar = _grammar([_tool()], tool_choice="none")
+    plain = "<|open|>response<|sep|>Sunny.<|close|>response<|sep|>" + MESSAGE_CLOSE
+
+    assert _accepts(grammar, plain)
+    assert not _accepts(grammar, _tools_section(_valid_weather_call()) + MESSAGE_CLOSE)
+    assert not _accepts(grammar, "<|open|>tools<|close|>message<|sep|>")
+    assert not _accepts(grammar, "<|sep|><|close|>tools<|sep|>" + MESSAGE_CLOSE)
+    assert not _accepts(grammar, "")
+    for blank in ("", " ", "\n\n"):
+        empty = f"<|open|>response<|sep|>{blank}<|close|>response<|sep|>"
+        assert not _accepts(grammar, empty + MESSAGE_CLOSE)
+    for text in ("é", "👋 hi", "<b>bold</b>", "x"):
+        response = f"<|open|>response<|sep|>{text}<|close|>response<|sep|>"
+        assert _accepts(grammar, response)
+    assert not _accepts(grammar, "<|open|>response<|sep|>x<|close|>Message<|sep|>")
+    assert _accepts(
+        grammar, "<|open|>response<|sep|>- **a** é\n<b><|close|>response<|sep|>"
+    )
+
+
 def test_auto_allows_plain_response_or_multiple_tool_calls():
     grammar = _grammar([_tool(), _tool("forecast")])
     plain = (
@@ -326,6 +369,101 @@ def test_strict_schema_supports_refs_and_mixed_unions():
             )
         ),
     )
+
+
+def _value_tool(value_schema, **extra):
+    return Tool(
+        type="function",
+        function=Function(
+            name="emit",
+            strict=True,
+            parameters={
+                "type": "object",
+                "required": ["value"],
+                "additionalProperties": False,
+                "properties": {"value": value_schema},
+                **extra,
+            },
+        ),
+    )
+
+
+def _accepts_value(grammar, value):
+    return _accepts(
+        grammar,
+        _tools_section(_call("emit", 1, _argument("value", "object", value))),
+    )
+
+
+def test_strict_schema_resolves_refs_into_the_root_structure():
+    sibling = _grammar(
+        [
+            _value_tool(
+                {
+                    "type": "object",
+                    "properties": {
+                        "a": {"type": "string"},
+                        "b": {"$ref": "#/properties/value/properties/a"},
+                    },
+                }
+            )
+        ],
+        tool_choice="required",
+    )
+    assert _accepts_value(sibling, '{"a":"x","b":"y"}')
+    assert not _accepts_value(sibling, '{"b":1}')
+
+    items = _grammar(
+        [
+            _value_tool(
+                {
+                    "type": "object",
+                    "properties": {
+                        "list": {"type": "array", "items": {"type": "string"}},
+                        "one": {"$ref": "#/properties/value/properties/list/items"},
+                    },
+                }
+            )
+        ],
+        tool_choice="required",
+    )
+    assert _accepts_value(items, '{"list":["a"],"one":"b"}')
+    assert not _accepts_value(items, '{"one":2}')
+
+    chained = _grammar(
+        [
+            _value_tool(
+                {
+                    "type": "object",
+                    "properties": {
+                        "a": {"$ref": "#/$defs/S"},
+                        "b": {"type": "integer"},
+                        "c": {"$ref": "#/properties/value/properties/b"},
+                    },
+                },
+                **{"$defs": {"S": {"type": "string"}}},
+            )
+        ],
+        tool_choice="required",
+    )
+    assert _accepts_value(chained, '{"a":"s","b":1,"c":2}')
+    assert not _accepts_value(chained, '{"c":"two"}')
+
+
+def test_strict_schema_resolves_recursive_root_structure_refs():
+    tree = {
+        "type": "object",
+        "properties": {
+            "kids": {
+                "type": "array",
+                "items": {"$ref": "#/properties/value"},
+            }
+        },
+        "additionalProperties": False,
+    }
+    grammar = _grammar([_value_tool(tree)], tool_choice="required")
+    assert _accepts_value(grammar, '{"kids":[{"kids":[]},{}]}')
+    assert not _accepts_value(grammar, '{"kids":[{"kids":[1]}]}')
 
 
 def test_strict_schema_handles_number_enums_and_all_of_integer_constraints():
@@ -837,6 +975,29 @@ def test_reasoning_prefix_is_owned_by_exactly_one_layer():
     assert _accepts(wrapped_by_xgrammar, output)
     assert not _accepts(post_reasoning_only, output)
     assert _accepts(post_reasoning_only, _tools_section(_valid_weather_call()))
+
+
+def test_output_may_start_inside_the_prefilled_response():
+    # Without thinking the prompt ends with the response open marker.
+    call = _tools_section(_valid_weather_call())
+    required = _grammar([_tool()], tool_choice="required")
+    assert _accepts(
+        required, "Hi there!<|close|>response<|sep|>" + call + MESSAGE_CLOSE
+    )
+    assert not _accepts(required, "Hi there!<|close|>response<|sep|>" + MESSAGE_CLOSE)
+    assert not _accepts(
+        required, "Hi<|close|>response<|sep|>" + MESSAGE_CLOSE + call + MESSAGE_CLOSE
+    )
+
+    none = _grammar([_tool()], tool_choice="none")
+    assert _accepts(none, "Sunny.<|close|>response<|sep|>" + MESSAGE_CLOSE)
+    assert not _accepts(none, "<|close|>response<|sep|>" + MESSAGE_CLOSE)
+    assert not _accepts(none, "Sunny.<|close|>response<|sep|>" + call)
+
+
+def test_single_call_auto_admits_the_turn_close():
+    grammar = _grammar([_tool()], parallel_tool_calls=False)
+    assert _accepts(grammar, _tools_section(_valid_weather_call()) + MESSAGE_CLOSE)
 
 
 if __name__ == "__main__":

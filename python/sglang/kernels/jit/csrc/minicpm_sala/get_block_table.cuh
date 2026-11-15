@@ -135,28 +135,28 @@ void verify_inputs(
   // topk_idx: [kHeadGroup, token_num, kSparseTopK]
   TensorMatcher({static_cast<int64_t>(kHeadGroup), token_num, static_cast<int64_t>(kSparseTopK)})
       .with_dtype<int32_t>()
-      .with_device<kDLCUDA>(device)
+      .with_device<kDLGPU>(device)
       .verify(topk_idx);
   // block_table: [batch_size, seqlen_q_max]
   TensorMatcher({batch_size, seqlen_q_max})  //
       .with_dtype<int32_t>()
-      .with_device<kDLCUDA>(device)
+      .with_device<kDLGPU>(device)
       .verify(block_table);
   // token_to_bs / token_pos_in_bs: [token_num]
   TensorMatcher({token_num})  //
       .with_dtype<int32_t>()
-      .with_device<kDLCUDA>(device)
+      .with_device<kDLGPU>(device)
       .verify(token_to_bs)
       .verify(token_pos_in_bs);
   // seqlen_q: [batch_size]
   TensorMatcher({batch_size})  //
       .with_dtype<int32_t>()
-      .with_device<kDLCUDA>(device)
+      .with_device<kDLGPU>(device)
       .verify(seqlen_q);
   // out: [token_num, kHeadGroup, kSparseTopK * kSparseBlockSize]
   TensorMatcher({token_num, static_cast<int64_t>(kHeadGroup), kOutLastDim})
       .with_dtype<int32_t>()
-      .with_device<kDLCUDA>(device)
+      .with_device<kDLGPU>(device)
       .verify(out);
 }
 
@@ -171,7 +171,7 @@ void get_block_table(
   using namespace host;
   SymbolicSize token_num{"token_num"}, batch_size{"batch_size"}, seqlen_q_max{"seqlen_q_max"};
   SymbolicDevice device;
-  device.set_options<kDLCUDA>();
+  device.set_options<kDLGPU>();
   verify_inputs<kSparseTopK, kHeadGroup, kSparseBlockSize>(
       out, topk_idx, block_table, token_to_bs, token_pos_in_bs, seqlen_q, token_num, batch_size, seqlen_q_max, device);
 

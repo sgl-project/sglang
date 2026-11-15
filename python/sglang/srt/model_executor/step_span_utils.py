@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, List, Tuple
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch

@@ -67,7 +67,13 @@ def test_h3_role_admission(variant, role):
     )
     assert isinstance(args.pipeline_config, MiniMaxH3PipelineConfig)
     pipeline = object.__new__(MiniMaxH3Pipeline)
-    pipeline.validate_disagg_role(role)
+    if role in (RoleType.PROMPT_ENCODER, RoleType.IMAGE_ENCODER):
+        with pytest.raises(
+            ValueError, match="does not support separate prompt/image encoder roles"
+        ):
+            pipeline.validate_disagg_role(role)
+    else:
+        pipeline.validate_disagg_role(role)
 
 
 @pytest.mark.parametrize(
