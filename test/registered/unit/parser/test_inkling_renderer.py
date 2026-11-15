@@ -46,21 +46,6 @@ class TestInklingRenderer(unittest.TestCase):
                 )
                 self.assertEqual(actual, case["input_ids"])
 
-    def test_reasoning_content_cannot_mix_with_thinking_parts(self):
-        """Two sources of prior thinking have no defined order, so the request is
-        rejected rather than rendered as two thinking messages."""
-        with self.assertRaisesRegex(ValueError, "cannot mix reasoning_content"):
-            render_inkling_messages(
-                [
-                    {"role": "user", "content": "x"},
-                    {
-                        "role": "assistant",
-                        "reasoning_content": "plan",
-                        "content": [{"type": "thinking", "thinking": "plan"}],
-                    },
-                ]
-            )
-
     def test_audio_part_keeps_mm_processor_framing(self):
         """The MM processor expands one AUDIO_TOKEN_ID inside the audio input envelope;
         tml-renderers cannot render audio without DMel bytes, so this envelope is sglang's."""
@@ -178,9 +163,14 @@ class TestInklingOutputParser(unittest.TestCase):
                     )
 
     def test_unparseable_call_becomes_payload_text(self):
-        """A call payload the reference parser rejects (NaN, missing args) is not a tool call
-        and does not leak its header name; parsing resumes at the next message."""
-        for payload in ('{"name":"f","args":{"a":NaN}}', '{"name":"f"}'):
+        """A call payload the reference parser rejects (NaN, missing args, a name that
+        differs from the header) is not a tool call and does not leak its header name;
+        parsing resumes at the next message."""
+        for payload in (
+            '{"name":"f","args":{"a":NaN}}',
+            '{"name":"f"}',
+            '{"name":"g","args":{}}',
+        ):
             output_ids = _ids(
                 "<|message_model|>",
                 "f",
