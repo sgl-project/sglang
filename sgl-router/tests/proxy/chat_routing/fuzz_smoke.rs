@@ -55,7 +55,7 @@ impl MockResponse {
 #[derive(Clone)]
 struct MockEngineState {
     responses: Arc<Mutex<VecDeque<MockResponse>>>,
-    requests: Arc<Mutex<Vec<Bytes>>>,
+    request_count: Arc<Mutex<usize>>,
 }
 
 /// A local HTTP engine that returns the queued responses in request order.
@@ -70,9 +70,9 @@ impl MockEngine {
     async fn start(responses: Vec<MockResponse>) -> Self {
         async fn chat(
             State(state): State<MockEngineState>,
-            body: Bytes,
+            _body: Bytes,
         ) -> axum::response::Response {
-            state.requests.lock().unwrap().push(body);
+            *state.request_count.lock().unwrap() += 1;
             let reply = state
                 .responses
                 .lock()
@@ -97,7 +97,7 @@ impl MockEngine {
         }
         let state = MockEngineState {
             responses: Arc::new(Mutex::new(responses.into())),
-            requests: Arc::new(Mutex::new(Vec::new())),
+            request_count: Arc::new(Mutex::new(0)),
         };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -121,7 +121,7 @@ impl MockEngine {
     }
 
     fn request_count(&self) -> usize {
-        self.state.requests.lock().unwrap().len()
+        *self.state.request_count.lock().unwrap()
     }
 
     async fn stop(mut self) {
