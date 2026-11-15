@@ -336,6 +336,42 @@ class TestKVControl(CustomTestCase):
             "middle",
         )
 
+    def test_replicated_reservation_identity_is_independent_of_completion_order(self):
+        # One rank observes an execution error before its peer. The next
+        # broadcast submission must still get the same physical read identity.
+        first, second = (
+            KVControl(
+                "engine",
+                "ns",
+                enabled=True,
+                executor=CompletionBoundary(),
+                engine_epoch="shared-epoch",
+            )
+            for _ in range(2)
+        )
+        refs = [submit(core, action()).results[0].ref for core in (first, second)]
+        assert refs[0] == refs[1]
+        first.executor.updates[refs[0].operation_id] = ExecutionUpdate(
+            status=Status.FAILED, quiescent=True, code="storage_error"
+        )
+        assert first.progress()[0].status == Status.FAILED
+        refs2 = [
+            submit(core, action(), message_id="next").results[0].ref
+            for core in (first, second)
+        ]
+        assert refs2[0] == refs2[1] and refs2[0] != refs[0]
+        restarted = KVControl(
+            "engine",
+            "ns",
+            enabled=True,
+            executor=CompletionBoundary(),
+            engine_epoch="fresh-epoch",
+        )
+        assert (
+            submit(restarted, action()).results[0].ref.operation_id
+            != refs[0].operation_id
+        )
+
     def test_executor_failure_origin_survives_drain_ack_and_replay(self):
         """A quiescent cancellation receipt must not relabel a backend exception."""
         observed = completed_outcome()

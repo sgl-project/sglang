@@ -198,6 +198,7 @@ class OperationRegistry:
         self._records = 0
         self._active = 0
         self._sequence = 0
+        self._issued = 0
         self.on_result = None
         self.cache_watermark = None
 
@@ -265,11 +266,17 @@ class OperationRegistry:
         results = {}
         for action in batch.actions:
             self._sequence += 1
+            self._issued += 1
+            # Replicas use the same epoch and reserve commands in the same
+            # order. Completion order must not affect subsequent identities.
+            operation_id = hashlib.sha256(
+                msgspec.json.encode((self.engine_epoch, self._issued))
+            ).hexdigest()[:32]
             ref = OperationRef(
                 context=context,
                 message_id=batch.message_id,
                 action_id=action.action_id,
-                operation_id=uuid.uuid4().hex,
+                operation_id=operation_id,
             )
             results[action.action_id] = OperationResult(
                 ref=ref,

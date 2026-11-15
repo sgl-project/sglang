@@ -4,7 +4,6 @@
 from __future__ import annotations
 
 import time
-import uuid
 from array import array
 from dataclasses import dataclass, field
 
@@ -38,9 +37,7 @@ class _Read:
     key: _ReadKey | CacheRequestHandle
     tokens: tuple
     compatibility: object
-    handle: CacheRequestHandle = field(
-        default_factory=lambda: CacheRequestHandle("native-kv:" + uuid.uuid4().hex, 0)
-    )
+    handle: CacheRequestHandle
     interests: set[str] = field(default_factory=set)
     host_locks: list = field(default_factory=list)
     operation: object = None
@@ -495,7 +492,12 @@ class StorageCacheReads:
             job = self._borrow_ordinary(tokens, compatibility)
         rows = None
         if job is None:
-            job = _Read(key, tokens, compatibility)
+            job = _Read(
+                key,
+                tokens,
+                compatibility,
+                CacheRequestHandle("native-kv:" + work.ref.operation_id, 0),
+            )
             # Validate before registering the job. The first attempt can use
             # this owner-local walk; queued retries must inspect the tree again.
             rows = self._rows(job)

@@ -92,6 +92,7 @@ class KVControl:
         enabled: bool = False,
         executor: Executor | None = None,
         limits: Limits = Limits(),
+        engine_epoch: str | None = None,
         clock: Callable[[], float] = time.monotonic,
     ):
         if type(enabled) is not bool:
@@ -101,7 +102,7 @@ class KVControl:
         self.limits = limits
         self._clock = clock
         self.registry = OperationRegistry(
-            engine_id, namespace, limits=limits, clock=clock
+            engine_id, namespace, engine_epoch=engine_epoch, limits=limits, clock=clock
         )
         self._pending: dict[str, _Pending] = {}
         # Attached actions acquire cache resources in submission order. A
@@ -619,12 +620,16 @@ class KVControl:
                 break
         return tuple(results)
 
-    def reset(self, namespace: str) -> None:
+    def reset(self, namespace: str, *, engine_epoch: str | None = None) -> None:
         """Rotate logical generation after the owner has drained/reset real caches."""
         if self.registry.capacity()["active"]:
             raise ControlError(
                 "busy", "Drain active operations before rotating the epoch"
             )
         self.registry = OperationRegistry(
-            self.registry.engine_id, namespace, limits=self.limits, clock=self._clock
+            self.registry.engine_id,
+            namespace,
+            engine_epoch=engine_epoch,
+            limits=self.limits,
+            clock=self._clock,
         )
