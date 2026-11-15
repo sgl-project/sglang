@@ -122,6 +122,59 @@ mod power_of_two_tests {
         ctx.shutdown().await;
     }
 
+    /// Regular HTTP routing must count in-flight requests in `worker.load()`
+    /// for power_of_two, since its `requests` load metrics compare that counter.
+    #[tokio::test]
+    async fn test_power_of_two_tracks_in_flight_requests() {
+        let config = TestRouterConfig::power_of_two(3603);
+
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                TestWorkerConfig::slow(19606, 500),
+                TestWorkerConfig::slow(19607, 500),
+            ],
+        )
+        .await;
+
+        let app = ctx.create_app().await;
+        let workers = ctx.app_context.worker_registry.get_all();
+        let total_load = || workers.iter().map(|w| w.load()).sum::<usize>();
+        assert_eq!(total_load(), 0);
+
+        let payload = json!({
+            "text": "In-flight load request",
+            "stream": false
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_string(&payload).unwrap()))
+            .unwrap();
+        let handle = tokio::spawn(app.clone().oneshot(req));
+
+        let start = tokio::time::Instant::now();
+        while total_load() == 0 && !handle.is_finished() {
+            assert!(
+                start.elapsed() < tokio::time::Duration::from_secs(5),
+                "timed out waiting for the request to be routed"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            total_load(),
+            1,
+            "the selected worker should count the in-flight request"
+        );
+
+        let resp = handle.await.unwrap().unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(total_load(), 0);
+
+        ctx.shutdown().await;
+    }
+
     /// Test power of two with failing worker uses retry/CB to route to healthy worker
     #[tokio::test]
     async fn test_power_of_two_with_failing_worker() {
