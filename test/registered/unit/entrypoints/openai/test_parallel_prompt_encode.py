@@ -16,6 +16,7 @@ runner is free to make; `_parallel_ok` is pinned per test so the id
 comparisons do not depend on it.
 """
 
+import json
 import random
 import sys
 import unittest
@@ -39,6 +40,7 @@ from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast
 
 from sglang.srt.entrypoints.openai import parallel_prompt_encode as ppe
 from sglang.srt.environ import envs
+from sglang.srt.parser.glm53_chat_template import OrdinaryText
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -641,6 +643,23 @@ class TestPromptSegments(_EncodeCase):
         ]
         for segments in edge_cases + _fuzz_segments():
             self._assert_segments_match_encode(self.tokenizer, segments)
+
+    def test_ordinary_text_segments_skip_added_token_matching(self):
+        """A spelling in an OrdinaryText segment is text: the base vocabulary,
+        the backend without its added tokens, encodes the whole run; the same
+        spelling written by the template is still the added id."""
+        base = Tokenizer.from_str(
+            json.dumps({**json.loads(_safe_backend_json()), "added_tokens": []})
+        )
+        ordinary = "before <|assistant|> after"
+        segments = ["<|user|>", OrdinaryText(ordinary), "<|assistant|>"]
+        ids = ppe.encode_prompt_segments(self.tokenizer, segments, {})
+        self.assertEqual(ids[0], self.tokenizer.convert_tokens_to_ids("<|user|>"))
+        self.assertEqual(ids[-1], self.tokenizer.convert_tokens_to_ids("<|assistant|>"))
+        self.assertNotEqual(
+            ids[1:-1], self.tokenizer.encode(ordinary, add_special_tokens=False)
+        )
+        self.assertEqual(ids[1:-1], base.encode(ordinary, add_special_tokens=False).ids)
 
     def test_text_between_cut_points_is_encoded_once_whatever_the_length(self):
         self._set_min_chars(1 << 20)

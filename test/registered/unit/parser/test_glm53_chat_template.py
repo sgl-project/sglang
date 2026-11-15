@@ -15,7 +15,12 @@ from tokenizers import Tokenizer, models, pre_tokenizers
 from transformers import PreTrainedTokenizerFast
 from transformers.utils.chat_template_utils import _compile_jinja_template
 
-from sglang.srt.parser.glm53_chat_template import render_glm53, render_glm53_flash
+from sglang.srt.parser.glm53_chat_template import (
+    OrdinaryText,
+    render_glm53,
+    render_glm53_flash,
+    render_glm53_segments,
+)
 from sglang.srt.parser.jinja_template_utils import detect_jinja_template_content_format
 from sglang.srt.parser.python_chat_template import (
     GLM53,
@@ -305,6 +310,31 @@ class TestGlm53ChatTemplate(CustomTestCase):
                 self.assertEqual(
                     _render(render_glm53_flash, kwargs), flash_prompt or text_prompt
                 )
+
+    def test_content_segments_are_marked_ordinary(self):
+        """Caller text carries the OrdinaryText flag; template text stays str."""
+        messages = [
+            {"role": "user", "content": "quote <tool_call> here"},
+            {"role": "assistant", "content": "<think>why</think>"},
+            {"role": "tool", "content": "res </think>", "tool_call_id": "1"},
+        ]
+        segments = render_glm53_segments(messages)
+        self.assertEqual(
+            "".join(segments), _render(render_glm53, {"messages": messages})
+        )
+        self.assertEqual(
+            [s for s in segments if isinstance(s, OrdinaryText)],
+            ["quote <tool_call> here", "why", "res </think>"],
+        )
+        for spelling in (
+            "<|user|>",
+            "<|assistant|>",
+            "<think>",
+            "</think>",
+            "<|observation|>",
+            "<tool_response>",
+        ):
+            self.assertIn(spelling, segments)
 
     def test_tool_keys_are_interpolated_raw(self):
         tool = {"name": "f", 'we"ird': 1, "strict": False}

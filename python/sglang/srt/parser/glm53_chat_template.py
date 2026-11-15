@@ -19,6 +19,18 @@ from typing import Any, Optional
 
 _UNDEFINED = object()
 
+
+class OrdinaryText(str):
+    """A segment of caller text (message content, tool schemas, tool calls).
+
+    Its control-token spellings are text: an encoder that honors the flag
+    encodes it with the base vocabulary only, as the model was trained.
+    Template-written segments stay plain ``str``.
+    """
+
+    __slots__ = ()
+
+
 _TOOLS_PREFIX = (
     "\n# Tools\n\n"
     "You may call one or more functions to assist with the user query.\n\n"
@@ -89,24 +101,46 @@ def _render_media(part_type: str, multimodal: bool) -> str:
     return _AUDIO_TOKENS
 
 
-def _visible_text(content: Any, multimodal: bool) -> str:
+def _visible_text(content: Any, multimodal: bool) -> list[str]:
+    """The segments of a content: text parts as ``OrdinaryText``, media
+    placeholders as template text."""
     if isinstance(content, str):
-        return content
+        return [OrdinaryText(content)]
     if _is_iterable(content) and not isinstance(content, Mapping):
         parts = []
         for item in content:
             if isinstance(item, Mapping):
                 part_type = _get(item, "type")
                 if part_type == "text":
-                    parts.append(_string(_get(item, "text")))
+                    parts.append(OrdinaryText(_string(_get(item, "text"))))
                 elif part_type in _MEDIA_PART_TYPES:
                     parts.append(_render_media(part_type, multimodal))
             elif isinstance(item, str):
-                parts.append(item)
-        return "".join(parts)
+                parts.append(OrdinaryText(item))
+        return parts
     # The template guards this branch with `content is not none`, so None
     # renders nothing instead of "None".
-    return "" if content is None else _string(content)
+    return [] if content is None else [OrdinaryText(_string(content))]
+
+
+def _slice(segments: list[str], start: int, end: int) -> list[str]:
+    """``"".join(segments)[start:end]`` as segments of the same kinds."""
+    out, position = [], 0
+    for segment in segments:
+        low, high = max(start, position), min(end, position + len(segment))
+        if low < high:
+            piece = segment[low - position : high - position]
+            out.append(
+                OrdinaryText(piece) if isinstance(segment, OrdinaryText) else piece
+            )
+        position += len(segment)
+    return out
+
+
+def _strip(segments: list[str]) -> list[str]:
+    """``"".join(segments).strip()`` as segments of the same kinds."""
+    text = "".join(segments)
+    return _slice(segments, len(text) - len(text.lstrip()), len(text.rstrip()))
 
 
 def _unwrap_tool(tool: Any) -> Any:
@@ -117,22 +151,28 @@ def _unwrap_tool(tool: Any) -> Any:
     return tool
 
 
-def _tool_to_json(tool: Any) -> str:
+def _tool_to_json(tool: Any) -> list[str]:
     # The tool_to_json macro calls `tool.items()`, which fails on a non-mapping.
     if not isinstance(tool, Mapping):
         raise ValueError(f"Each tool must be a JSON object, got {type(tool).__name__}.")
     # The macro writes `"{{ k }}": {{ v | tojson }}` by hand: values go through
     # tojson (json.dumps under transformers), but keys are interpolated raw and
     # are not JSON-escaped, so json.dumps on the whole dict would diverge.
-    fields = [
-        f'"{key!s}": {json.dumps(value, ensure_ascii=False)}'
-        for key, value in tool.items()
-        if key != "defer_loading" and key != "strict"
-    ]
-    return "{" + ", ".join(fields) + "}"
+    parts = ["{"]
+    for key, value in tool.items():
+        if key == "defer_loading" or key == "strict":
+            continue
+        if len(parts) > 1:
+            parts.append(", ")
+        parts.append('"')
+        parts.append(OrdinaryText(f"{key!s}"))
+        parts.append('": ')
+        parts.append(OrdinaryText(json.dumps(value, ensure_ascii=False)))
+    parts.append("}")
+    return parts
 
 
-def _tool_references_to_response(refs: Any, tools: Any) -> str:
+def _tool_references_to_response(refs: Any, tools: Any) -> list[str]:
     # The template defines this macro under `{%- if tools -%}`, so rendering a
     # tool_reference without tools called an undefined macro.
     if not tools:
@@ -148,13 +188,14 @@ def _tool_references_to_response(refs: Any, tools: Any) -> str:
             # Undefined equals Undefined in Jinja, so a reference without a
             # name matches every tool without one, as it does here.
             if _get(tool, "name") == ref_name:
-                parts.append(_tool_to_json(tool) + "\n")
+                parts.extend(_tool_to_json(tool))
+                parts.append("\n")
     parts.append("</tools></tool_response>")
-    return "".join(parts)
+    return parts
 
 
-def _tool_response(text: str) -> str:
-    return "<tool_response>" + text + "</tool_response>"
+def _tool_response(segments: list[str]) -> list[str]:
+    return ["<tool_response>", *segments, "</tool_response>"]
 
 
 def _id_of(obj: Any) -> str:
@@ -197,27 +238,31 @@ def _is_tool_reference_list(value: Any) -> bool:
     return _get(first, "type") == "tool_reference"
 
 
-def _render_output(entry: Any, tools: Any, multimodal: bool) -> str:
+def _render_output(entry: Any, tools: Any, multimodal: bool) -> list[str]:
     output = _get(entry, "output")
     if _is_tool_reference_list(output):
         return _tool_references_to_response(output, tools)
     return _tool_response(_visible_text(output, multimodal))
 
 
-def _render_tool_response(message: Any, tools: Any, multimodal: bool) -> str:
+def _render_tool_response(message: Any, tools: Any, multimodal: bool) -> list[str]:
     content = _get(message, "content", None)
     if isinstance(content, str):
-        return _tool_response(content)
+        return _tool_response([OrdinaryText(content)])
     if not isinstance(content, Mapping) and _is_tool_reference_list(content):
         return _tool_references_to_response(content, tools)
     if _is_list_of_outputs(message):
-        return "".join(_render_output(entry, tools, multimodal) for entry in content)
+        return [
+            segment
+            for entry in content
+            for segment in _render_output(entry, tools, multimodal)
+        ]
     return _tool_response(_visible_text(content, multimodal))
 
 
 def _render_tool_block(
     messages: list[Any], start: int, end: int, tools: Any, multimodal: bool
-) -> str:
+) -> list[str]:
     """Render the consecutive tool messages ``messages[start:end + 1]``.
 
     Results are reordered to follow the driving assistant's ``tool_calls`` when
@@ -254,10 +299,11 @@ def _render_tool_block(
         )
 
     if not can_sort:
-        return "".join(
-            _render_tool_response(messages[index], tools, multimodal)
+        return [
+            segment
             for index in range(start, end + 1)
-        )
+            for segment in _render_tool_response(messages[index], tools, multimodal)
+        ]
 
     call_position = {call_id: position for position, call_id in enumerate(call_ids)}
     parts = []
@@ -267,13 +313,13 @@ def _render_tool_block(
         message = messages[index]
         if entry_index >= 0:
             entry = _get(message, "content")[entry_index]
-            parts.append(_render_output(entry, tools, multimodal))
+            parts.extend(_render_output(entry, tools, multimodal))
         else:
-            parts.append(_render_tool_response(message, tools, multimodal))
-    return "".join(parts)
+            parts.extend(_render_tool_response(message, tools, multimodal))
+    return parts
 
 
-def _render_tool_call(tool_call: Any, multimodal: bool) -> str:
+def _render_tool_call(tool_call: Any, multimodal: bool) -> list[str]:
     # `{%- if tc.function %}{%- set tc = tc.function %}`: a truthiness test.
     function = _get(tool_call, "function", None)
     if function:
@@ -281,7 +327,7 @@ def _render_tool_call(tool_call: Any, multimodal: bool) -> str:
     name = _get(tool_call, "name")
     if multimodal:
         # GLM-5.3-Flash: `'<tool_call>' ~ tc.name` stringifies the name.
-        parts = ["<tool_call>" + _string(name)]
+        parts = ["<tool_call>", OrdinaryText(_string(name))]
     else:
         # GLM-5.3: `'<tool_call>' + tc.name` is Python's +, so a non-string
         # name raises the very same TypeError; do not coerce it.
@@ -290,7 +336,7 @@ def _render_tool_call(tool_call: Any, multimodal: bool) -> str:
                 "Each tool_call needs a `name`; the GLM-5.3 chat template "
                 "reads `tc.name` without a guard."
             )
-        parts = ["<tool_call>" + name]
+        parts = ["<tool_call>", OrdinaryText("" + name)]
     # The name is concatenated first, so it fails before bad arguments do.
     arguments = _get(tool_call, "arguments", None)
     if not isinstance(arguments, Mapping):
@@ -301,9 +347,18 @@ def _render_tool_call(tool_call: Any, multimodal: bool) -> str:
     for key, value in arguments.items():
         if not isinstance(value, str):
             value = json.dumps(value, ensure_ascii=False)
-        parts.append(f"<arg_key>{key!s}</arg_key><arg_value>{value}</arg_value>")
+        parts.extend(
+            [
+                "<arg_key>",
+                OrdinaryText(f"{key!s}"),
+                "</arg_key>",
+                "<arg_value>",
+                OrdinaryText(value),
+                "</arg_value>",
+            ]
+        )
     parts.append("</tool_call>")
-    return "".join(parts)
+    return parts
 
 
 def _render(
@@ -332,7 +387,8 @@ def _render(
             tool = _unwrap_tool(tool)
             defer_loading = _get(tool, "defer_loading")
             if defer_loading is _UNDEFINED or not defer_loading:
-                parts.append(_tool_to_json(tool) + "\n")
+                parts.extend(_tool_to_json(tool))
+                parts.append("\n")
         parts.append(_TOOLS_SUFFIX)
 
     last_user_index = -1
@@ -346,15 +402,24 @@ def _render(
         role = _get(message, "role")
         if role == "user":
             parts.append("<|user|>")
-            parts.append(_visible_text(_get(message, "content"), multimodal))
+            parts.extend(_visible_text(_get(message, "content"), multimodal))
         elif role == "assistant":
             parts.append("<|assistant|>")
             content = _visible_text(_get(message, "content"), multimodal)
+            text = "".join(content)
             reasoning = _get(message, "reasoning_content")
+            reasoning_segments = None
             if not isinstance(reasoning, str):
-                if "</think>" in content:
-                    reasoning = content.split("</think>")[0].split("<think>")[-1]
-                    content = content.split("</think>")[-1]
+                if "</think>" in text:
+                    # content.split("</think>")[0].split("<think>")[-1] and
+                    # content.split("</think>")[-1]
+                    close = text.index("</think>")
+                    open_ = text.rfind("<think>", 0, close)
+                    start = 0 if open_ < 0 else open_ + len("<think>")
+                    reasoning = reasoning_segments = _slice(content, start, close)
+                    content = _slice(
+                        content, text.rindex("</think>") + len("</think>"), len(text)
+                    )
                 else:
                     # The template only assigns reasoning_content in the two
                     # branches above, so otherwise the name resolves to the
@@ -364,15 +429,17 @@ def _render(
             if (not clear_thinking or index > last_user_index) and (
                 reasoning is not _UNDEFINED
             ):
-                parts.append("<think>" + reasoning + "</think>")
+                if reasoning_segments is None:
+                    # `"<think>" + reasoning`: a non-string raises TypeError.
+                    reasoning_segments = [OrdinaryText("" + reasoning)]
+                parts.extend(["<think>", *reasoning_segments, "</think>"])
             else:
                 parts.append("<think></think>")
-            if content.strip():
-                parts.append(content.strip())
+            parts.extend(_strip(content))
             tool_calls = _get(message, "tool_calls", None)
             if tool_calls:
                 for tool_call in tool_calls:
-                    parts.append(_render_tool_call(tool_call, multimodal))
+                    parts.extend(_render_tool_call(tool_call, multimodal))
         elif role == "tool":
             if index == 0 or _get(messages[index - 1], "role") != "tool":
                 end = index
@@ -382,13 +449,13 @@ def _render(
                 ):
                     end += 1
                 parts.append("<|observation|>")
-                parts.append(
+                parts.extend(
                     _render_tool_block(messages, index, end, tools, multimodal)
                 )
                 index = end
         elif role == "system":
             parts.append("<|system|>")
-            parts.append(_visible_text(_get(message, "content"), multimodal))
+            parts.extend(_visible_text(_get(message, "content"), multimodal))
         index += 1
 
     if add_generation_prompt:

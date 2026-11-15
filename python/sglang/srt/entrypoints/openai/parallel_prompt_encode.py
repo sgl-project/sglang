@@ -45,6 +45,7 @@ from collections import OrderedDict
 from itertools import chain
 
 from sglang.srt.environ import envs
+from sglang.srt.parser.glm53_chat_template import OrdinaryText
 
 logger = logging.getLogger(__name__)
 
@@ -336,6 +337,7 @@ class _SegmentEncoder:
         self.lock = threading.Lock()
         self.cache = OrderedDict()
         self.cached_tokens = 0
+        self.ordinary = None
 
     def cut_id(self, segment):
         token_id = self.raw_ids.get(segment)
@@ -346,7 +348,49 @@ class _SegmentEncoder:
             cuts = self.cuts[segment] = _cuts_at(segment, self.added_tokens)
         return token_id if cuts else None
 
+    def ordinary_backend(self):
+        """The backend without its added vocabulary: control-token spellings
+        are encoded with the base vocabulary like any other text."""
+        if self.ordinary is None:
+            from tokenizers import Tokenizer
+
+            config = json.loads(self.backend.to_str())
+            config["added_tokens"] = []
+            self.ordinary = Tokenizer.from_str(json.dumps(config))
+        return self.ordinary
+
+    def encode_literal_safe(self, segments):
+        """Added-token spellings in template segments are control ids, while
+        ``OrdinaryText`` segments are text. The text between two control ids,
+        template-written or not, is encoded as one run of the base
+        vocabulary, as vLLM's GLM-5.3 renderer does."""
+        layout, run = [], []
+        for segment in segments:
+            if isinstance(segment, OrdinaryText):
+                run.append(segment)
+                continue
+            position = 0
+            for match in self.pattern.finditer(segment):
+                run.append(segment[position : match.start()])
+                text = "".join(run)
+                if text:
+                    layout.append(text)
+                run = []
+                layout.append(self.raw_ids[match.group()])
+                position = match.end()
+            run.append(segment[position:])
+        text = "".join(run)
+        if text:
+            layout.append(text)
+        return self._assemble(layout, ordinary=True)
+
     def encode(self, segments):
+        if (
+            self.pattern is not None
+            and self.npattern is None
+            and any(isinstance(segment, OrdinaryText) for segment in segments)
+        ):
+            return self.encode_literal_safe(segments)
         layout, run = [], []
         for segment in segments:
             if len(segment) <= self.max_cut_len:
@@ -361,18 +405,20 @@ class _SegmentEncoder:
                 run.append(segment)
         if run:
             layout.append("".join(run))
+        return self._assemble(layout, ordinary=False)
 
+    def _assemble(self, layout, ordinary):
         texts = [item for item in layout if isinstance(item, str)]
         known = {}
         with self.lock:
             for text in texts:
-                ids = self.cache.get(text)
+                ids = self.cache.get((ordinary, text))
                 if ids is not None:
-                    self.cache.move_to_end(text)
+                    self.cache.move_to_end((ordinary, text))
                     known[text] = ids
         missing = list(dict.fromkeys(text for text in texts if text not in known))
         if missing:
-            known.update(self._encode(missing))
+            known.update(self._encode(missing, ordinary))
 
         ids = []
         for item in layout:
@@ -382,18 +428,22 @@ class _SegmentEncoder:
                 ids.append(item)
         return ids
 
-    def _encode(self, texts):
+    def _encode(self, texts, ordinary=False):
         min_chars = envs.SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS.get()
+        # Ordinary text is not cut at added-token spellings: they are not
+        # matched there, so a cut could split a pre-token.
+        pattern, npattern = (None, None) if ordinary else (self.pattern, self.npattern)
         chunks, counts = [], []
         for text in texts:
             pieces = (
-                split_prompt(text, self.pattern, self.npattern, self.intra)
+                split_prompt(text, pattern, npattern, self.intra)
                 if len(text) >= min_chars
                 else [text]
             )
             chunks.extend(pieces)
             counts.append(len(pieces))
-        encodings = self.backend.encode_batch(chunks, add_special_tokens=False)
+        backend = self.ordinary_backend() if ordinary else self.backend
+        encodings = backend.encode_batch(chunks, add_special_tokens=False)
         encoded, start = {}, 0
         for text, count in zip(texts, counts):
             encoded[text] = tuple(
@@ -403,11 +453,10 @@ class _SegmentEncoder:
 
         with self.lock:
             for text, ids in encoded.items():
-                if (
-                    text not in self.cache
-                    and len(ids) <= _SEGMENT_CACHE_MAX_ENTRY_TOKENS
-                ):
-                    self.cache[text] = ids
+                if (ordinary, text) not in self.cache and len(
+                    ids
+                ) <= _SEGMENT_CACHE_MAX_ENTRY_TOKENS:
+                    self.cache[(ordinary, text)] = ids
                     self.cached_tokens += len(ids)
             while self.cached_tokens > _SEGMENT_CACHE_MAX_TOKENS:
                 self.cached_tokens -= len(self.cache.popitem(last=False)[1])
@@ -429,7 +478,9 @@ def _segment_encoder_for(tokenizer):
 
 def encode_prompt_segments(tokenizer, segments, encode_kwargs=None):
     """Drop-in for ``parallel_prompt_encode(tokenizer, "".join(segments),
-    encode_kwargs)``."""
+    encode_kwargs)``, except that ``OrdinaryText`` segments are encoded as
+    text (see ``_SegmentEncoder.encode_literal_safe``) when the tokenizer
+    takes the segment path."""
     encode_kwargs = encode_kwargs or {}
     encoder = None
     if envs.SGLANG_PARALLEL_PROMPT_ENCODE.get() and not (
