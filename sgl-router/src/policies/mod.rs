@@ -88,7 +88,7 @@ fn tokenize_text(
     text: &str,
 ) -> Option<Vec<u32>> {
     let tokenizer = tokenizers.get(&model_id.0)?;
-    match adapter::encode(&tokenizer, text) {
+    match crate::off_worker::run(|| adapter::encode(&tokenizer, text)) {
         Ok(ids) if !ids.is_empty() => Some(ids),
         Ok(_) => None,
         Err(e) => {

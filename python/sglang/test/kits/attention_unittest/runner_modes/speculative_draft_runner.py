@@ -20,6 +20,7 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
     EAGLEDraftCudaGraphRunner,
 )
 from sglang.srt.speculative.eagle_info import EagleDraftInput
+from sglang.srt.speculative.eagle_megakernel import STOCK_EAGLE_DRAFT_RUNTIME
 from sglang.srt.speculative.eagle_worker_v2 import EagleDraftWorker
 from sglang.srt.speculative.frozen_kv_mtp_cuda_graph_runner import (
     FrozenKVMTPCudaGraphRunner,
@@ -30,6 +31,9 @@ from sglang.srt.speculative.frozen_kv_mtp_info import (
 )
 from sglang.srt.speculative.frozen_kv_mtp_worker_v2 import FrozenKVMTPDraftWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.test.kits.attention_unittest.attention_methods.dense_attention import (
+    _token_loc as _dsa_token_loc,
+)
 
 from ..attention_methods.dense_attention import (
     DEFAULT_DEVICE,
@@ -52,9 +56,6 @@ from ..attention_methods.dsa_attention import (
     DSA_SPARSE_INDEX_TOPK,
     DSA_SPARSE_RTOL,
     DSAAttentionCase,
-)
-from ..attention_methods.dsa_attention import _token_loc as _dsa_token_loc
-from ..attention_methods.dsa_attention import (
     build_dsa_sparse_attention_fixture,
 )
 from ..attention_methods.dsv4_attention import (
@@ -177,9 +178,13 @@ class _EagleDraftWorkerHarness:
         self.model_config = fixture.runner.model_config
         self.speculative_algorithm = SpeculativeAlgorithm.EAGLE
         self.hot_token_id = None
-        self.megakernel = None
+        self.draft_probs_need_vocab_scatter = False
+        self.draft_runtime = STOCK_EAGLE_DRAFT_RUNTIME
         self.model_runner.forward = model_forward
         self.draft_forward = MethodType(EagleDraftWorker.draft_forward, self)
+        self._build_verify_draft_probs = MethodType(
+            EagleDraftWorker._build_verify_draft_probs, self
+        )
         # draft_forward's topk=1 fast path reads these prealloc buffers (built
         # in EagleDraftWorker.__init__, which the harness skips), so build them
         # here. _rebuild_topk1_chain_buffers asserts num_draft_tokens ==

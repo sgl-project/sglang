@@ -95,6 +95,11 @@ def _hip_gate(pool, dcp_kv_mask=None) -> bool:
     with (
         patch.object(model_utils, "_is_hip", True),
         patch.object(model_utils, "_is_cuda", False),
+        patch.object(
+            model_utils,
+            "get_parallel",
+            return_value=SimpleNamespace(dcp_enabled=False),
+        ),
         patch.object(model_utils, "get_token_to_kv_pool", return_value=pool),
     ):
         return model_utils.enable_fused_set_kv_buffer(
@@ -154,6 +159,36 @@ class TestHipFusedStoreGate(CustomTestCase):
 
     def test_decode_context_parallel_mask_declines(self):
         self.assertFalse(_hip_gate(_static_window_pool(), dcp_kv_mask=object()))
+
+
+class TestDcpFusedStoreGate(CustomTestCase):
+    def test_dcp_without_a_batch_mask_uses_the_backend_store(self):
+        pool = SimpleNamespace(
+            dtype=torch.bfloat16,
+            layer_router=SimpleNamespace(sub_pool=lambda name: None),
+        )
+        for cuda in (True, False):
+            for dcp_size in (1, 2, 4):
+                with (
+                    self.subTest(cuda=cuda, dcp_size=dcp_size),
+                    patch.object(model_utils, "_is_cuda", cuda),
+                    patch.object(model_utils, "_is_hip", not cuda),
+                    patch.object(model_utils, "is_cp_active", return_value=False),
+                    patch.object(
+                        model_utils, "get_token_to_kv_pool", return_value=pool
+                    ),
+                    patch.object(
+                        model_utils,
+                        "get_parallel",
+                        return_value=SimpleNamespace(dcp_enabled=dcp_size > 1),
+                    ),
+                ):
+                    self.assertEqual(
+                        model_utils.enable_fused_set_kv_buffer(
+                            SimpleNamespace(dcp_kv_mask=None)
+                        ),
+                        dcp_size == 1,
+                    )
 
 
 if __name__ == "__main__":

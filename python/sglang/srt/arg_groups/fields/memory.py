@@ -143,6 +143,7 @@ class Memory(msgspec.Struct):
                 "page_first",
                 "page_first_direct",
                 "page_first_kv_split",
+                "layer_first_kv_split",
                 "page_head",
                 "page_unified",
             ],
@@ -272,7 +273,10 @@ class Memory(msgspec.Struct):
         Optional[Dict[str, Any]],
         Arg(
             help=(
-                "JSON configuration for the selected linker backend. Built-in "
+                "JSON configuration for the selected linker backend. Common "
+                "options include load_mode (layer_wise or prefetch) and "
+                "prefetch_policy (best_effort, wait_complete, or timeout). "
+                "Defaults are layer_wise and timeout. Built-in "
                 "backends accept storage options directly. The dynamic backend "
                 "requires linker (class name), linker_module_path (Python "
                 "module), and optional linker_extra_config (object). May be "

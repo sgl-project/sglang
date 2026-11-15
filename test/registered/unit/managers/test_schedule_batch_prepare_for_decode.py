@@ -12,7 +12,7 @@ maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.overlap_utils import resolve_forward_inputs  # noqa: E402
 from sglang.srt.managers.schedule_batch import ScheduleBatch  # noqa: E402
-from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 from sglang.srt.sampling.penaltylib.frequency_penalty import (  # noqa: E402
     BatchedFrequencyPenalizer,
 )
@@ -187,6 +187,8 @@ class TestPrepareForDecodePenaltyHistory(unittest.TestCase):
         future_map = types.SimpleNamespace(
             output_tokens_buf=torch.full((2,), RELAYED_TOKEN, dtype=torch.int64),
             spec_algo=types.SimpleNamespace(is_none=lambda: True),
+            takes_deferred_relay=lambda batch: False,
+            flush_deferred_relay=lambda: None,
         )
         resolve_forward_inputs(batch, future_map)
 
@@ -209,6 +211,8 @@ class TestPrepareForDecodePenaltyHistory(unittest.TestCase):
         future_map = types.SimpleNamespace(
             output_tokens_buf=torch.full((4,), RELAYED_TOKEN, dtype=torch.int64),
             spec_algo=types.SimpleNamespace(is_none=lambda: True),
+            takes_deferred_relay=lambda batch: False,
+            flush_deferred_relay=lambda: None,
         )
         resolve_forward_inputs(prefill, future_map)
 
@@ -274,6 +278,8 @@ class TestOverlapPenaltyStreamOrder(unittest.TestCase):
         future_map = types.SimpleNamespace(
             output_tokens_buf=torch.full((2,), RELAYED_TOKEN, dtype=torch.int64),
             spec_algo=types.SimpleNamespace(is_none=lambda: True),
+            takes_deferred_relay=lambda batch: False,
+            flush_deferred_relay=lambda: None,
         )
         resolve_forward_inputs(batch, future_map)
         self.assertEqual([kind for kind, _ in self.log], ["record"])

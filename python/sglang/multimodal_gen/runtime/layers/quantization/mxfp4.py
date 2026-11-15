@@ -17,7 +17,7 @@ from sglang.multimodal_gen.runtime.models.parameter import (
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.srt.utils.common import direct_register_custom_op
+from sglang.srt.utils.custom_op import direct_register_custom_op
 
 logger = logging.getLogger(__name__)
 _is_hip = is_hip()

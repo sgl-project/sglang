@@ -25,6 +25,7 @@ from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.layer_boundary import layer_stack
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
+from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.layers.moe.utils import get_num_fused_shared_experts
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -32,6 +33,7 @@ from sglang.srt.layers.quantization.modelslim.modelslim import (
     remap_dspark_weight_name_npu,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -43,7 +45,7 @@ from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models import deepseek_v4_boundary as hc_boundary
 from sglang.srt.models import deepseek_v4_mhc as mhc
-from sglang.srt.models.dbrx import ReplicatedLinear
+from sglang.srt.models.deepseek_common.utils import _is_cuda
 from sglang.srt.models.deepseek_v4 import (
     DEEPSEEK_V4_STACKED_PARAMS_MAPPING,
     DeepseekV4CudaDecoderLayer,
@@ -52,7 +54,6 @@ from sglang.srt.models.deepseek_v4 import (
     MqaAttentionBase,
     _apply_wo_a_bf16_matmul,
     _dequant_fp8_wo_a_streaming,
-    _is_cuda,
     hc_head_torch,
     make_hc_head_params,
 )
@@ -69,14 +70,11 @@ from sglang.srt.runtime_context import (
     get_platform,
 )
 from sglang.srt.speculative.dspark_components.dspark_config import (
+    builds_confidence_head,
     get_dspark_sample_from_anchor,
     parse_dspark_draft_config,
 )
-from sglang.srt.speculative.ragged_verify import (
-    RaggedVerifyMode,
-    read_ragged_verify_mode,
-)
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -139,7 +137,6 @@ class DSparkAttention(MqaAttentionBase):
             prefix=add_prefix("attn", prefix),
         )
 
-        self._use_fast_kernel = envs.SGLANG_DSPARK_FAST_KERNEL.get()
         self.alt_streams = alt_streams
         self._multi_stream_bs_limit = 128 if get_platform().is_blackwell else 64
         if _is_npu:
@@ -200,7 +197,7 @@ class DSparkAttention(MqaAttentionBase):
             if q_out is not None and q_out.dtype == torch.float8_e4m3fn:
                 fused_q_norm_rope(q, q_out, None, self.freqs_cis, positions)
                 return q_out
-            if self._use_fast_kernel and not _is_npu:
+            if not _is_npu:
                 fused_rope_inplace(
                     q[..., -self.rope_head_dim :],
                     None,
@@ -215,46 +212,35 @@ class DSparkAttention(MqaAttentionBase):
                 return q
             q_out.copy_(q)
             return q_out
-        if self._use_fast_kernel:
+        if not _is_npu:
             if q_out is None:
                 q_out = torch.empty_like(q)
             fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
             return q_out
-        else:
-            if _is_npu:
-                import torch_npu
+        import torch_npu
 
-                from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import (
-                    Dsv4NpuRoPE,
-                )
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 
-                q = torch_npu.npu_rms_norm(q, self._q_post_norm_weight, self.eps)[0]
-                cos4, sin4 = Dsv4NpuRoPE.for_freqs(self.freqs_cis).get_cos_sin(
-                    positions,
-                    q.dtype,
-                    view_4d=True,
-                    inverse=False,
-                    allow_build=True,
-                    cache_dtype=torch.float32,
-                )
-                Dsv4NpuRoPE.apply_rotary_mul_inplace(
-                    q,
-                    None,
-                    cos4,
-                    sin4,
-                    qk_nope_dim=q.shape[-1] - self.rope_head_dim,
-                )
-            else:
-                q = q * torch.rsqrt(
-                    q.float().square().mean(-1, keepdim=True) + self.eps
-                ).to(q.dtype)
-                apply_rotary_emb(
-                    q[..., -self.rope_head_dim :], self.freqs_cis[positions]
-                )
-            if q_out is not None:
-                q_out.copy_(q)
-                return q_out
-            return q
+        q = torch_npu.npu_rms_norm(q, self._q_post_norm_weight, self.eps)[0]
+        cos4, sin4 = Dsv4NpuRoPE.for_freqs(self.freqs_cis).get_cos_sin(
+            positions,
+            q.dtype,
+            view_4d=True,
+            inverse=False,
+            allow_build=True,
+            cache_dtype=torch.float32,
+        )
+        Dsv4NpuRoPE.apply_rotary_mul_inplace(
+            q,
+            None,
+            cos4,
+            sin4,
+            qk_nope_dim=q.shape[-1] - self.rope_head_dim,
+        )
+        if q_out is not None:
+            q_out.copy_(q)
+            return q_out
+        return q
 
     def forward(
         self,
@@ -343,11 +329,11 @@ class DSparkAttention(MqaAttentionBase):
         if o.shape[1] != self.n_local_heads:
             o = o[:, : self.n_local_heads, :]
 
-        if self._use_fast_kernel:
+        if not _is_npu:
             fused_rope_inplace(
                 o[..., -rd:], None, self.freqs_cis, positions=positions, inverse=True
             )
-        elif _is_npu:
+        else:
             from sglang.srt.hardware_backend.npu.dsv4.dsv4_rope import Dsv4NpuRoPE
 
             cos4, sin4 = Dsv4NpuRoPE.for_freqs(self.freqs_cis).get_cos_sin(
@@ -365,8 +351,6 @@ class DSparkAttention(MqaAttentionBase):
                 sin4,
                 qk_nope_dim=o.shape[-1] - rd,
             )
-        else:
-            apply_rotary_emb(o[..., -rd:], self.freqs_cis[positions], inverse=True)
 
         o = o.view(
             o.shape[0],
@@ -374,7 +358,7 @@ class DSparkAttention(MqaAttentionBase):
             o.shape[1] * o.shape[2] // self.n_local_groups,
         )
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        if self._use_fast_kernel:
+        if not _is_npu:
             o = _apply_wo_a_bf16_matmul(
                 o,
                 wo_a,
@@ -544,13 +528,8 @@ class DSparkV4MarkovHead(BaseDSparkMarkovHead):
 def build_dspark_v4_confidence_head(
     *, config: DeepSeekV4Config, markov_rank: int
 ) -> Optional[DSparkConfidenceHead]:
-    if read_ragged_verify_mode() is RaggedVerifyMode.STATIC:
+    if not builds_confidence_head(config):
         return None
-    if not hasattr(config, "enable_confidence_head"):
-        logger.warning(
-            "DSpark draft config has no enable_confidence_head field; treating the "
-            "confidence head as enabled."
-        )
     with_markov_cfg = getattr(config, "confidence_head_with_markov", None)
     with_markov = (
         (markov_rank > 0) if with_markov_cfg is None else bool(with_markov_cfg)
@@ -920,9 +899,10 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
                 "DeepseekV4ForCausalLMDSpark requires the target embed_tokens "
                 "(call attach_shared_modules first)."
             )
-        x = self.embed_tokens(input_ids)
-        x = x.unsqueeze(1).repeat(1, self.hc_mult, 1)
-        return x
+        return self._expand_hc(self.embed_tokens(input_ids))
+
+    def _expand_hc(self, embeds: torch.Tensor) -> torch.Tensor:
+        return embeds.unsqueeze(1).repeat(1, self.hc_mult, 1)
 
     def forward(
         self,
@@ -948,6 +928,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
     def _forward_impl(self, input_ids, positions, forward_batch, input_embeds):
         if input_embeds is None:
             input_embeds = self.forward_embed(input_ids)
+        elif input_embeds.dim() == 2:
+            input_embeds = self._expand_hc(input_embeds)
         x = input_embeds
         pre = None
         if _is_cuda:
@@ -1131,7 +1113,7 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
             raise ValueError(
                 f"DSpark V4 confidence head is enabled but the checkpoint is missing "
                 f"{sorted(missing)}. Provide a checkpoint with trained confidence weights, "
-                f"or disable the confidence head (enable_confidence_head=False)."
+                f"or set SGLANG_DSPARK_USE_ONLINE_ESTIMATOR=1."
             )
 
     def _remap_dspark_weight_name(self, name: str) -> Optional[str]:

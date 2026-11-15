@@ -603,7 +603,7 @@ sglang serve --model-path google/gemma-4-E2B-it
 **Latency Benchmark (Text)**
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang \
+python3 -m sglang.benchmark.serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 10 --max-concurrency 1
 ```
@@ -630,7 +630,7 @@ Median ITL (ms):                         4.05
 **Latency Benchmark (Image)**
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang-oai-chat \
+python3 -m sglang.benchmark.serving --backend sglang-oai-chat \
   --host 0.0.0.0 --port 30000 \
   --dataset-name image --image-count 2 --image-resolution 720p \
   --random-input-len 128 --random-output-len 1024 \
@@ -660,7 +660,7 @@ Median ITL (ms):                         4.04
 **Throughput Benchmark (Text)**
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang \
+python3 -m sglang.benchmark.serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 1000 --max-concurrency 100
 ```
@@ -687,7 +687,7 @@ Median ITL (ms):                         5.99
 **Throughput Benchmark (Image)**
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang-oai-chat \
+python3 -m sglang.benchmark.serving --backend sglang-oai-chat \
   --host 0.0.0.0 --port 30000 \
   --dataset-name image --image-count 2 --image-resolution 720p \
   --random-input-len 128 --random-output-len 1024 \
@@ -1007,7 +1007,7 @@ sglang serve --model-path google/gemma-4-31B-it
 **Latency Benchmark (Text)**
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang \
+python3 -m sglang.benchmark.serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 10 --max-concurrency 1
 ```
@@ -1034,7 +1034,7 @@ Median ITL (ms):                         24.23
 **Throughput Benchmark (Text)**
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang \
+python3 -m sglang.benchmark.serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 1000 --max-concurrency 100
 ```
@@ -1068,7 +1068,7 @@ sglang serve --model-path google/gemma-4-26B-A4B-it
 **Latency Benchmark (Text)**
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang \
+python3 -m sglang.benchmark.serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 10 --max-concurrency 1
 ```
@@ -1095,7 +1095,7 @@ Median ITL (ms):                         9.57
 **Throughput Benchmark (Text)**
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang \
+python3 -m sglang.benchmark.serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 1000 --max-concurrency 100
 ```
@@ -1129,7 +1129,7 @@ sglang serve --model-path google/gemma-4-12B-it
 **Latency Benchmark (Text)**
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang \
+python3 -m sglang.benchmark.serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 10 --max-concurrency 1
 ```
@@ -1155,7 +1155,7 @@ Median ITL (ms):                         9.19
 **Latency Benchmark (Image)**
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang-oai-chat \
+python3 -m sglang.benchmark.serving --backend sglang-oai-chat \
   --host 0.0.0.0 --port 30000 \
   --dataset-name image --image-count 2 --image-resolution 720p \
   --random-input-len 128 --random-output-len 1024 \
@@ -1183,7 +1183,7 @@ Median ITL (ms):                         9.17
 **Throughput Benchmark (Text)**
 
 ```bash Command
-python3 -m sglang.bench_serving --backend sglang \
+python3 -m sglang.benchmark.serving --backend sglang \
   --host 0.0.0.0 --port 30000 \
   --dataset-name random --num-prompts 1000 --max-concurrency 100
 ```

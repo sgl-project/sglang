@@ -4,13 +4,13 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
+from transformers.models.vitdet.modeling_vitdet import get_rel_pos
 
 from sglang.srt.environ import envs
 from sglang.srt.models.deepseek_ocr import (
     _REL_POS_CACHE,
     DeepseekOCRForCausalLM,
     _cached_rel_pos,
-    get_rel_pos,
 )
 from sglang.srt.models.unlimited_ocr import UnlimitedOCRForCausalLM
 from sglang.srt.models.unlimited_ocr_v2 import (
@@ -189,6 +189,7 @@ class TestUnlimitedOCRPageSlices(CustomTestCase):
         self.assertEqual(len(items), pages)
 
         processor = object.__new__(UnlimitedOCRV2Processor)
+        processor.processor_fingerprint = "test-unlimited-ocr-page-slices"
         items = processor._postprocess_mm_items_before_transport(items, images=None)
 
         page_bytes = 2 * 3 * 64 * 64 * 4

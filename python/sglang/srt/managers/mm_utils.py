@@ -4,6 +4,7 @@ Multi-modality utils
 
 import copy
 import hashlib
+import logging
 import mmap
 import os
 import pickle
@@ -14,11 +15,11 @@ from collections import defaultdict
 from multiprocessing import shared_memory
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+import msgspec
 import numpy as np
 import torch
 from torch import nn
 
-from sglang.kernels.ops.memory.gpu_tensor_hash import gpu_tensor_hash
 from sglang.srt.environ import envs
 from sglang.srt.managers import mm_schedule
 from sglang.srt.managers.io_struct import (
@@ -32,12 +33,13 @@ from sglang.srt.managers.mm_schedule import (
     DataEmbeddingFunc,
     get_embedding_and_mask,
 )
-from sglang.srt.managers.mm_schedule import (
-    init_mm_embedding_cache as init_mm_embedding_cache,
+from sglang.srt.managers.req_types import (
+    MultimodalDataItem,
+    MultimodalInputs,
+    MultimodalProcessorOutput,
 )
-from sglang.srt.managers.req_types import MultimodalProcessorOutput
-from sglang.srt.managers.schedule_batch import MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.multimodal.cache.digest import structured_digest
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.transport import (
     TensorTransportMode,
@@ -55,7 +57,8 @@ from sglang.srt.utils import (
     print_warning_once,
 )
 from sglang.srt.utils.stale_shm_cleanup import make_shm_name
-from sglang.utils import logger
+
+logger = logging.getLogger(__name__)
 
 # NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
 # to ensure consistent logging behavior across the codebase. This prevents issues with log
@@ -308,6 +311,18 @@ def pad_mm_token_pairs(
     return padded_ids
 
 
+def _mm_placeholder_token_id(
+    mm_inputs: MultimodalInputs, modality: Modality
+) -> Optional[int]:
+    if modality == Modality.IMAGE:
+        return mm_inputs.im_token_id
+    if modality == Modality.VIDEO:
+        return mm_inputs.video_token_id
+    if modality == Modality.AUDIO:
+        return mm_inputs.audio_token_id
+    return None
+
+
 def pad_mm_tokens(input_ids: array, mm_inputs: MultimodalInputs) -> array:
     """Pad inclusive per-item offsets without mutating the input token array."""
     assert_int64_array(input_ids, "input_ids")
@@ -324,14 +339,8 @@ def pad_mm_tokens(input_ids: array, mm_inputs: MultimodalInputs) -> array:
     for item in mm_inputs.mm_items:
         items_by_modality[item.modality].append(item)
 
-    token_id_map = {
-        Modality.IMAGE: mm_inputs.im_token_id,
-        Modality.AUDIO: mm_inputs.audio_token_id,
-        Modality.VIDEO: mm_inputs.video_token_id,
-    }
-
     for modality, items in items_by_modality.items():
-        token_id = token_id_map.get(modality)
+        token_id = _mm_placeholder_token_id(mm_inputs=mm_inputs, modality=modality)
 
         if not items or token_id is None:
             continue
@@ -442,6 +451,65 @@ def _scatter_mm_embedding(
     dest.index_copy_(0, rows[:num_src_rows], src)
 
 
+def _fill_mm_placeholder_token_ids(
+    input_ids: torch.Tensor,
+    mm_inputs_list: List[MultimodalInputs],
+    modalities: List[Modality],
+    masks: List[Optional[torch.Tensor]],
+) -> None:
+    for modality, mask in zip(modalities, masks):
+        if mask is None:
+            continue
+        # One processor config per server: requests that carry the id agree.
+        token_ids = (
+            _mm_placeholder_token_id(mm_inputs=mm_inputs, modality=modality)
+            for mm_inputs in mm_inputs_list
+        )
+        token_id = next((t for t in token_ids if t is not None), None)
+        if token_id is not None:
+            input_ids.masked_fill_(mask.view(input_ids.shape), token_id)
+
+
+def _sorted_pad_values_tensor(
+    items: List[MultimodalDataItem], device: torch.device
+) -> torch.Tensor:
+    # Sorted for the searchsorted lookup in _get_multimodal_mask.
+    pad_values = sorted(value for item in items for value in item.padding_values())
+    if device.type == "cuda":
+        # Pinned staging keeps the placeholder copy asynchronous on CUDA.
+        pad_values_cpu = torch.tensor(
+            pad_values, dtype=torch.int64, device="cpu", pin_memory=True
+        )
+        return pad_values_cpu.to(device, non_blocking=True)
+    return torch.as_tensor(pad_values, device=device)
+
+
+def _fill_mm_placeholder_token_ids_from_pad_values(
+    input_ids: torch.Tensor, mm_inputs_list: List[MultimodalInputs]
+) -> None:
+    items = [
+        item
+        for mm_inputs in mm_inputs_list
+        for item in mm_inputs.mm_items
+        if item is not None
+    ]
+    modalities, masks = [], []
+    for modality in Modality.all():
+        modality_items = [item for item in items if item.is_modality(modality=modality)]
+        if modality_items:
+            pad_values = _sorted_pad_values_tensor(
+                items=modality_items, device=input_ids.device
+            )
+            modalities.append(modality)
+            masks.append(mm_schedule._get_multimodal_mask(input_ids, pad_values))
+    _fill_mm_placeholder_token_ids(
+        input_ids=input_ids,
+        mm_inputs_list=mm_inputs_list,
+        modalities=modalities,
+        masks=masks,
+    )
+
+
 def embed_mm_inputs(
     mm_inputs_list: List[MultimodalInputs],
     extend_prefix_lens: List[int],
@@ -497,22 +565,9 @@ def embed_mm_inputs(
             embedder = getattr(multimodal_model, f"get_{modality_id}_feature", None)
         if len(items) != 0:
             assert embedder is not None, f"no embedding method found for {modality}"
-            # Sorted for the searchsorted lookup in _get_multimodal_mask.
-            pad_values = sorted(
-                value for item in items for value in item.padding_values()
+            placeholder_tensor = _sorted_pad_values_tensor(
+                items=items, device=input_ids.device
             )
-            if input_ids.device.type == "cuda":
-                # Pinned staging keeps the placeholder copy asynchronous on CUDA.
-                placeholder_cpu = torch.tensor(
-                    pad_values, dtype=torch.int64, device="cpu", pin_memory=True
-                )
-                placeholder_tensor = placeholder_cpu.to(
-                    input_ids.device, non_blocking=True
-                )
-            else:
-                placeholder_tensor = torch.as_tensor(
-                    pad_values, device=input_ids.device
-                )
             # calculate per request items length offset
             items_size = [0]
             items_offsets = []
@@ -527,6 +582,9 @@ def embed_mm_inputs(
                     flatten_nested_list([item.offsets for item in mm_items])
                 )
 
+            # TODO(esarafian): when EVS prunes tokens this returns a new
+            # input_ids, so forward_batch.input_ids keeps the pad values there
+            # and per-layer embeddings still differ from HF.
             embedding, mask, input_ids = get_embedding_and_mask(
                 data_embedding_func=embedder,
                 embedding_items=items,
@@ -550,6 +608,14 @@ def embed_mm_inputs(
             masks += [mask]
 
     # 3. Get input embeddings
+    # Models may read input_ids after this routine (e.g. per-layer N-gram
+    # embeddings); give multimodal positions their placeholder token id.
+    _fill_mm_placeholder_token_ids(
+        input_ids=input_ids,
+        mm_inputs_list=mm_inputs_list,
+        modalities=modalities,
+        masks=masks,
+    )
     vocab_size = input_embedding.num_embeddings
     # Important: clamp after getting original multimodal regions
     # Clamp input ids. This is because the input_ids for the multimodal tokens are
@@ -681,6 +747,10 @@ def _embed_mm_inputs_with_split(
             input_embeds[start : start + req_len] = sub_embeds[
                 offset : offset + req_len
             ]
+            # embed_mm_inputs rewrote the torch.cat copy; mirror it into input_ids.
+            input_ids[start : start + req_len] = sub_input_ids[
+                offset : offset + req_len
+            ]
             if (
                 input_deepstack_embeds is not None
                 and "input_deepstack_embeds" in sub_info
@@ -708,16 +778,18 @@ def prepare_mm_inputs(
 
     Preserve multimodal cache/offload bookkeeping and the MTP embedding copy.
     Additional language-model inputs, such as DeepStack features, update kwargs.
-    Non-first pipeline ranks consume proxy tensors and return no embeddings.
+    Non-first pipeline ranks consume proxy tensors and return no embeddings;
+    they still write the placeholder token ids into input_ids.
     """
     assert hasattr(language_model, "get_input_embeddings")
     embed_tokens = language_model.get_input_embeddings()
+    is_mm_extend = (
+        not forward_batch.forward_mode.is_decode()
+        and not forward_batch.forward_mode.is_target_verify()
+        and forward_batch.contains_mm_inputs()
+    )
     if not hasattr(language_model, "pp_group") or language_model.pp_group.is_first_rank:
-        if (
-            not forward_batch.forward_mode.is_decode()
-            and not forward_batch.forward_mode.is_target_verify()
-            and forward_batch.contains_mm_inputs()
-        ):
+        if is_mm_extend:
             mm_inputs_list = [
                 mm_input for mm_input in forward_batch.mm_inputs if mm_input is not None
             ]
@@ -836,6 +908,15 @@ def prepare_mm_inputs(
             forward_batch.input_embeds.copy_(input_embeds)
             input_embeds = forward_batch.input_embeds
     else:
+        if is_mm_extend:
+            _fill_mm_placeholder_token_ids_from_pad_values(
+                input_ids=input_ids,
+                mm_inputs_list=[
+                    mm_input
+                    for mm_input in forward_batch.mm_inputs
+                    if mm_input is not None
+                ],
+            )
         input_embeds = None
     return input_embeds
 
@@ -895,64 +976,33 @@ def data_hash(data) -> int:
 
 
 def tensor_hash(tensor_list) -> int:
-    """
-    hash a tensor or a tensor list
-    """
-    tensor = tensor_list
-    if isinstance(tensor_list, list):
-        tensor_list = flatten_nested_list(tensor_list)
-        tensors = [
-            x.flatten() if isinstance(x, torch.Tensor) else x for x in tensor_list
-        ]
-        # GPU path: concat + triton hash (unchanged)
-        if any(isinstance(t, torch.Tensor) and t.is_cuda for t in tensors):
-            tensor = torch.concat(tensors)
-            return gpu_tensor_hash(tensor.cuda())
-        # CPU path: hash each tensor incrementally without concat
-        hasher = hashlib.sha256()
-        for t in tensors:
-            t = t.detach().cpu().contiguous()
-            hasher.update(memoryview(t.reshape(-1).view(torch.uint8).numpy()))
-        hash_bytes = hasher.digest()[:8]
-        return int.from_bytes(hash_bytes, byteorder="big", signed=False)
-
-    # Single tensor
-    if tensor.is_cuda:
-        return gpu_tensor_hash(tensor.cuda())
-    tensor = tensor.detach().cpu().contiguous()
-    hasher = hashlib.sha256()
-    hasher.update(memoryview(tensor.reshape(-1).view(torch.uint8).numpy()))
-    hash_bytes = hasher.digest()[:8]
-    return int.from_bytes(hash_bytes, byteorder="big", signed=False)
+    """Compatibility scalar; cache identities must use hash_feature_digest."""
+    return int.from_bytes(structured_digest(tensor_list)[:8], "big")
 
 
-def hash_feature(f):
-    if isinstance(f, list):
-        # A list may mix ShmPointerMMData and plain tensors, since wrapping
-        # falls back to inline transport per element when shm allocation fails.
-        if len(f) > 0 and any(isinstance(x, ShmPointerMMData) for x in f):
-            return tensor_hash(
-                [x.tensor if isinstance(x, ShmPointerMMData) else x for x in f]
-            )
-        if len(f) > 0 and isinstance(f[0], torch.Tensor):
-            return tensor_hash(f)
-        return data_hash(tuple(flatten_nested_list(f)))
-    elif isinstance(f, np.ndarray):
-        arr = np.ascontiguousarray(f)
-        hasher = hashlib.sha256()
-        hasher.update(memoryview(arr))
-        hash_bytes = hasher.digest()[:8]
-        return int.from_bytes(hash_bytes, byteorder="big", signed=False)
-    elif isinstance(f, torch.Tensor):
-        return tensor_hash([f])
-    elif isinstance(f, CudaIpcTensorTransportProxy):
-        reconstruct_t = f.reconstruct_on_target_device(torch.cuda.current_device())
-        return tensor_hash([reconstruct_t])
-    elif isinstance(f, ShmPointerMMData):
-        if f.precomputed_hash is not None:
-            return f.precomputed_hash
-        return tensor_hash([f.tensor])
-    return data_hash(f)
+def _identity_data(value):
+    if isinstance(value, ShmPointerMMData):
+        # Reading must not consume the handle needed by the encoder later.
+        return value.tensor
+    if isinstance(value, CudaIpcTensorTransportProxy):
+        raise RuntimeError("Multimodal identity must be computed before CUDA transport")
+    if isinstance(value, list):
+        return [_identity_data(part) for part in value]
+    if isinstance(value, tuple):
+        return tuple(_identity_data(part) for part in value)
+    if isinstance(value, dict):
+        return {key: _identity_data(part) for key, part in value.items()}
+    return value
+
+
+def hash_feature_digest(value) -> bytes:
+    """Hash actual transport contents, never its address or a scalar hint."""
+    return structured_digest(_identity_data(value))
+
+
+def hash_feature(value) -> int:
+    """Legacy scalar hash. Embedding and prefix caches use the full digest."""
+    return int.from_bytes(hash_feature_digest(value)[:8], "big")
 
 
 def extend_mrope_positions_for_retracted_request(
@@ -1175,7 +1225,7 @@ def _try_simple_split(item, num_items, expanded_mm_items):
         new_item.model_specific_data = _split_model_data_for_item(
             item.model_specific_data, i, num_items, patch_slices, total_num_patches
         )
-        new_item.hash = None
+        new_item.clear_identity()
         expanded_mm_items.append(new_item)
     return True
 
@@ -1257,7 +1307,7 @@ def get_new_expanded_mm_items(original_mm_items):
                         num_items=num_items,
                         total_feature_len=total_feature_len,
                     )
-                    new_item.hash = None
+                    new_item.clear_identity()
                     expanded_mm_items.append(new_item)
 
             elif item.is_video():
@@ -1343,7 +1393,7 @@ def get_new_expanded_mm_items(original_mm_items):
                         num_items=num_videos,
                         total_feature_len=total_feature_len,
                     )
-                    new_item.hash = None
+                    new_item.clear_identity()
                     expanded_mm_items.append(new_item)
             else:
                 if not _try_simple_split(item, num_items, expanded_mm_items):
@@ -1515,6 +1565,36 @@ def _model_specific_shm_values(item):
             yield key, value
 
 
+def _compact_inline_tensors(value, memo=None):
+    """Keep pickle from serializing a CPU view's entire backing storage.
+
+    Per-image slices can share the storage of a whole image batch. PyTorch's
+    pickle reducer serializes that storage for each distinct Tensor, even when
+    the slice is contiguous. Only compact oversized CPU storage at the inline
+    transport boundary; SHM and GPU transport features need no such copy.
+    """
+    if memo is None:
+        memo = {}
+    if isinstance(value, torch.Tensor):
+        if (
+            value.is_cpu
+            and value.layout == torch.strided
+            and value.untyped_storage().nbytes() > value.numel() * value.element_size()
+        ):
+            key = id(value)
+            if key not in memo:
+                memo[key] = value.clone(memory_format=torch.contiguous_format)
+            return memo[key]
+        return value
+    if isinstance(value, list):
+        return [_compact_inline_tensors(item, memo) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_compact_inline_tensors(item, memo) for item in value)
+    if isinstance(value, dict):
+        return {key: _compact_inline_tensors(item, memo) for key, item in value.items()}
+    return value
+
+
 def _wrap_shm_or_inline(tensor: torch.Tensor, precomputed_hash: Optional[int] = None):
     """Wrap a tensor in ShmPointerMMData, falling back to inline (pickled)
     transport when shared memory cannot be allocated, e.g. /dev/shm is full
@@ -1527,7 +1607,7 @@ def _wrap_shm_or_inline(tensor: torch.Tensor, precomputed_hash: Optional[int] = 
             f"({e}); falling back to inline transport. "
             f"Consider increasing /dev/shm size."
         )
-        return tensor
+        return _compact_inline_tensors(tensor)
 
 
 def _wrap_tensor_or_list(value, precomputed_hash: Optional[int] = None):
@@ -1606,28 +1686,42 @@ def _wrap_model_specific_data(item) -> None:
 
 def wrap_shm_features(obj):
     """
-    Scan the object for multimodal tensors and wrap them in SHM pointers.
+    Wrap multimodal features in SHM pointers, or compact inline CPU storage.
     """
-    if _get_is_default_transport() or get_serving().skip_tokenizer_init:
-        return obj
+    use_shm = not (_get_is_default_transport() or get_serving().skip_tokenizer_init)
 
     if obj.mm_inputs:
+        inline_memo = {}
         wrap_model_data = (
-            obj.mm_inputs.shm_model_specific_data
+            use_shm
+            and obj.mm_inputs.shm_model_specific_data
             and envs.SGLANG_ENABLE_UOCR_SHM_WRAP_MODEL_DATA.get()
         )
         for item in obj.mm_inputs.mm_items:
             item_hash = item.hash
             if item.feature is not None:
-                item.feature = _wrap_tensor_or_list(
-                    item.feature, precomputed_hash=item_hash
+                item.feature = (
+                    _wrap_tensor_or_list(item.feature, precomputed_hash=item_hash)
+                    if use_shm
+                    else _compact_inline_tensors(item.feature, inline_memo)
                 )
             if item.precomputed_embeddings is not None:
-                item.precomputed_embeddings = _wrap_tensor_or_list(
-                    item.precomputed_embeddings, precomputed_hash=item_hash
+                item.precomputed_embeddings = (
+                    _wrap_tensor_or_list(
+                        item.precomputed_embeddings, precomputed_hash=item_hash
+                    )
+                    if use_shm
+                    else _compact_inline_tensors(
+                        item.precomputed_embeddings, inline_memo
+                    )
                 )
             if wrap_model_data:
                 _wrap_model_specific_data(item)
+            # Compact remaining inline tensors after the optional SHM wrapping.
+            # SHM pointers and shape-only placeholder crops stay unchanged.
+            item.model_specific_data = _compact_inline_tensors(
+                item.model_specific_data, inline_memo
+            )
     return obj
 
 
@@ -1687,6 +1781,36 @@ def discard_shm_features(obj) -> None:
         # leaks a multi-megabyte /dev/shm allocation.
         for _key, value in _model_specific_shm_values(item):
             value.close_and_unlink()
+
+
+def strip_mm_features_for_pp_relay(reqs: List) -> List:
+    """Copy requests for the next PP stage without raw multimodal features.
+
+    Only the first PP rank embeds multimodal inputs; later ranks need just the pad
+    values, which come from the item hash, so hashed items drop their feature tensor.
+    """
+    return [_strip_mm_features(req) for req in reqs]
+
+
+def _strip_mm_features(req):
+    if isinstance(req, BaseBatchReq):
+        return msgspec.structs.replace(
+            req, batch=[_strip_mm_features(sub_req) for sub_req in req.batch]
+        )
+    if not isinstance(req, (TokenizedGenerateReqInput, TokenizedEmbeddingReqInput)):
+        return req
+    if not isinstance(req.mm_inputs, MultimodalProcessorOutput):
+        return req
+    items = req.mm_inputs.mm_items
+    if not any(item.hash is not None and item.feature is not None for item in items):
+        return req
+    # An unhashed item keeps its feature: the next stage hashes it to derive the pad value.
+    stripped_items = [
+        msgspec.structs.replace(item, feature=None) if item.hash is not None else item
+        for item in items
+    ]
+    stripped_mm_inputs = msgspec.structs.replace(req.mm_inputs, mm_items=stripped_items)
+    return msgspec.structs.replace(req, mm_inputs=stripped_mm_inputs)
 
 
 def _unwrap_tensor_or_list(value):

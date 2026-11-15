@@ -71,9 +71,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
 from sglang.multimodal_gen.runtime.managers.memory_managers.memory_occupation_controller import (
     MemoryOccupationController,
 )
-from sglang.multimodal_gen.runtime.managers.request_cancel import (
+from sglang.multimodal_gen.runtime.managers.request_cancel import raise_if_cancelled
+from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
     RequestCancelledError,
-    raise_if_cancelled,
 )
 from sglang.multimodal_gen.runtime.managers.request_gc import request_gc
 from sglang.multimodal_gen.runtime.observability.metrics import (
@@ -87,7 +87,6 @@ from sglang.multimodal_gen.runtime.pipelines_core import (
     build_pipeline,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
-from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import DenoisingStage
 from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
     initialize_current_platform,
@@ -106,6 +105,9 @@ from sglang.multimodal_gen.runtime.realtime.video import (
 )
 from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
 from sglang.multimodal_gen.runtime.utils.common import set_cuda_arch, set_musa_arch
+from sglang.multimodal_gen.runtime.utils.device_errors import (
+    is_unrecoverable_device_error,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
     configure_logger,
     init_logger,
@@ -899,7 +901,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
                 raise _FatalDistributedForward(
                     "Multi-rank forward ran out of memory; restart the server."
                 ) from e
-            if _is_unrecoverable_device_error(e):
+            if is_unrecoverable_device_error(e):
                 # The device can no longer be trusted and even empty_cache() may
                 # fail; exit so the HTTP backend monitor fails pending requests.
                 measure_server_warmup = False
@@ -1772,8 +1774,7 @@ class GPUWorker(GPUWorkerPostTrainingMixin):
     def _drop_breakable_cuda_graphs(self, reason: str) -> None:
         # captured graphs replay the weights and LoRA branches of capture time
         for stage in self.pipeline.stages:
-            if isinstance(stage, DenoisingStage):
-                stage.drop_breakable_cuda_graphs(reason)
+            stage.drop_breakable_cuda_graphs(reason)
 
     def _update_lora_metrics(self) -> None:
         if self.metrics is not None and isinstance(self.pipeline, LoRAPipeline):
@@ -1846,34 +1847,6 @@ exits and the server stops accepting requests. Restart it.
     WSL2/Windows near the memory limit; lower the resolution or memory use, or
     run without expandable_segments.
 """
-
-# Non-OOM device errors after which the CUDA context or the caching allocator
-# cannot be trusted, matched in the message because C10_CUDA_DRIVER_CHECK and
-# allocator asserts surface as plain RuntimeErrors.
-_UNRECOVERABLE_DEVICE_ERROR_MARKERS = (
-    "CUDA driver error:",
-    "CUDA error:",
-    "HIP error:",
-    "CUDACachingAllocator.cpp",
-)
-
-
-# An OOM stays recoverable: the allocator releases what it mapped, and the
-# cache is emptied after the request.
-def _is_unrecoverable_device_error(error: BaseException) -> bool:
-    seen = set()
-    while error is not None and id(error) not in seen:
-        seen.add(id(error))
-        if isinstance(error, _oom_exceptions()):
-            return False
-        message = str(error)
-        if "out of memory" not in message and (
-            isinstance(error, torch.AcceleratorError)
-            or any(marker in message for marker in _UNRECOVERABLE_DEVICE_ERROR_MARKERS)
-        ):
-            return True
-        error = error.__cause__ or error.__context__
-    return False
 
 
 def run_scheduler_process(

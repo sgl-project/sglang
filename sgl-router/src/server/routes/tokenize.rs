@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
+use crate::off_worker;
 use crate::server::app_context::AppContext;
 use crate::server::error::ApiError;
 use crate::tokenizer::adapter;
@@ -41,29 +42,27 @@ pub struct DetokenizeResponse {
     pub text: String,
 }
 
-/// Distinguish a served model started with `--tokenizer-path none` from an unknown one.
-pub(crate) fn tokenizer_for(ctx: &AppContext, model: &str) -> Result<Arc<Tokenizer>, ApiError> {
-    ctx.tokenizers.get(model).ok_or_else(|| {
-        if model == ctx.config.model.id {
-            ApiError::BadRequest(format!("tokenizer disabled for model {model}"))
-        } else {
-            ApiError::ModelNotFound(model.to_owned())
-        }
-    })
+/// The served model's tokenizer. One model is served, so any `model` name uses
+/// it; a model started with `--no-tokenizer` has none.
+pub(crate) fn served_tokenizer(ctx: &AppContext) -> Result<Arc<Tokenizer>, ApiError> {
+    let model = &ctx.config.model.id;
+    ctx.tokenizers
+        .get(model)
+        .ok_or_else(|| ApiError::BadRequest(format!("tokenizer disabled for model {model}")))
 }
 
 pub async fn tokenize(
     State(ctx): State<Arc<AppContext>>,
     Json(req): Json<TokenizeRequest>,
 ) -> Result<Json<TokenizeResponse>, ApiError> {
-    let tok = tokenizer_for(&ctx, &req.model)?;
+    let tok = served_tokenizer(&ctx)?;
     // Structured log on failure so an operator can correlate
     // "every encode for model X errors" against the route, model id, and
     // prompt size. The generic anyhow-chain log in ApiError::Internal still
     // fires from IntoResponse — duplication is intentional: the route-level
     // line carries `model` / `prompt_len`, the IntoResponse line carries
     // the full anyhow chain.
-    let ids = adapter::encode(&tok, &req.prompt).map_err(|e| {
+    let ids = off_worker::run(|| adapter::encode(&tok, &req.prompt)).map_err(|e| {
         tracing::error!(
             route = "/v1/tokenize",
             model = %req.model,
@@ -84,19 +83,20 @@ pub async fn detokenize(
     State(ctx): State<Arc<AppContext>>,
     Json(req): Json<DetokenizeRequest>,
 ) -> Result<Json<DetokenizeResponse>, ApiError> {
-    let tok = tokenizer_for(&ctx, &req.model)?;
+    let tok = served_tokenizer(&ctx)?;
     let text =
-        adapter::decode_complete(&tok, &req.tokens, req.skip_special_tokens).map_err(|e| {
-            tracing::error!(
-                route = "/v1/detokenize",
-                model = %req.model,
-                n_tokens = req.tokens.len(),
-                skip_special = req.skip_special_tokens,
-                error = ?e,
-                "detokenize.decode_complete failed",
-            );
-            ApiError::Internal(e)
-        })?;
+        off_worker::run(|| adapter::decode_complete(&tok, &req.tokens, req.skip_special_tokens))
+            .map_err(|e| {
+                tracing::error!(
+                    route = "/v1/detokenize",
+                    model = %req.model,
+                    n_tokens = req.tokens.len(),
+                    skip_special = req.skip_special_tokens,
+                    error = ?e,
+                    "detokenize.decode_complete failed",
+                );
+                ApiError::Internal(e)
+            })?;
     Ok(Json(DetokenizeResponse {
         model: req.model,
         text,
@@ -122,6 +122,7 @@ mod tests {
             },
             observability: Default::default(),
             model: crate::config::ModelConfig {
+                aliases: Vec::new(),
                 id: "tiny".into(),
                 tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
                 disable_input_ids_forwarding: false,
@@ -372,8 +373,9 @@ mod tests {
         assert_eq!(res.status(), StatusCode::BAD_REQUEST);
     }
 
+    /// Any `model` name tokenizes with the served model's tokenizer.
     #[tokio::test]
-    async fn unknown_model_404() {
+    async fn unknown_model_uses_the_served_tokenizer() {
         let app = crate::server::app::build_router(ctx_with_tiny());
         let body = serde_json::to_vec(&serde_json::json!({
             "model": "nope", "prompt": "x"
@@ -390,10 +392,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(res.status(), StatusCode::NOT_FOUND);
-        assert_eq!(
-            res.headers().get("x-router-error-code").unwrap(),
-            "model_not_found"
-        );
+        assert_eq!(res.status(), StatusCode::OK);
+        let bytes = res.into_body().collect().await.unwrap().to_bytes();
+        let r: TokenizeResponse = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(r.model, "nope");
+        assert!(r.count > 0);
     }
 }

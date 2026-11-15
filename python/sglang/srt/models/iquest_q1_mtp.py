@@ -6,6 +6,7 @@ from torch import nn
 from sglang.srt.configs.iquest_q1 import IQuestQ1MTPConfig
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -17,7 +18,6 @@ from sglang.srt.models.iquest_q1 import (
     IQuestQ1RMSNorm,
     load_iquest_q1_weights,
 )
-from sglang.srt.utils import add_prefix
 
 
 class IQuestQ1MTPInnerLayer(nn.Module):

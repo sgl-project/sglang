@@ -38,7 +38,7 @@ from sglang.srt.layers.layer_boundary import layout as comm_layout
 from sglang.srt.layers.layer_boundary import ops as transport_ops
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.adapters import branch
-from sglang.srt.layers.layer_boundary.construction import BatchVariant
+from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.fusions.allreduce import fused_ffn_input
 from sglang.srt.layers.layer_boundary.ops import (
     attn_cp_reduce_scatter_output,

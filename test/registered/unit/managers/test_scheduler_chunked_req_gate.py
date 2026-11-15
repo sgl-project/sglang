@@ -13,7 +13,12 @@ maybe_stub_sgl_kernel()
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ReqKvInfo
 from sglang.srt.managers.scheduler import Scheduler
-from sglang.srt.managers.scheduler_components.running_reqs import RunningReqs
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    KeyedReqList,
+    ListKind,
+    move,
+)
 from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -33,7 +38,6 @@ def _make_req(
     req.full_untruncated_fill_ids = array("q", fill_ids)
     req.prefix_len = prefix_len
     req.extend_end = fill_len
-    req.inflight_middle_chunks = 0
     req.host_hit_length = 0
     req.kv = ReqKvInfo(req_pool_idx=req_pool_idx)
     req.skip_radix_cache_insert = False
@@ -94,9 +98,11 @@ def _scheduler_for_get_next_batch(*, tree_cache, chunked_req) -> Scheduler:
     s.update_running_batch = MagicMock(side_effect=lambda batch: batch)
     tree_cache.check_hicache_events = MagicMock()
     s.tree_cache = tree_cache
-    s.chunked_req = chunked_req
+    s.chunked_reqs = IndexedReqList(ListKind.CHUNKED)
+    if chunked_req is not None:
+        move([chunked_req], s.chunked_reqs)
     s._pending_chunked_abort_req = None
-    s.running_reqs = RunningReqs()
+    s.running_reqs = KeyedReqList(ListKind.DECODING)
     s.invariant_checker = MagicMock()
     return s
 

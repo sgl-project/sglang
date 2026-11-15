@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.moe_lora import standalone_output_allocation
 from sglang.test.kits.moe_lora_down_b_kit import (
     _HIDDEN,
     _INTO_BASE_TOLERANCE,
@@ -18,7 +19,6 @@ from sglang.test.kits.moe_lora_down_b_kit import (
     _into_base_pair,
     _make_gpu_tensors,
     _run_once,
-    _standalone_output_allocation,
     _token_lora_mapping,
     _workspace_buffer_names,
     cutedsl_cuda_only,
@@ -292,9 +292,7 @@ def test_into_base_pipeline_replays_correctly_in_a_real_cuda_graph(
     from sglang.srt.lora.moe.runner import MoeLoraRunner
 
     device = torch.device("cuda")
-    monkeypatch.setattr(
-        MoeLoraRunner, "_allocate_output", _standalone_output_allocation
-    )
+    monkeypatch.setattr(MoeLoraRunner, "_allocate_output", standalone_output_allocation)
     serial_plan, reordered_plan, launch_config = _into_base_pair()
     num_tokens, num_experts = 64, 4
     gpu = _make_gpu_tensors(num_tokens, num_experts, device)
