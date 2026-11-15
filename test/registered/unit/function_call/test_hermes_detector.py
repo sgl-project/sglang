@@ -172,6 +172,37 @@ class TestHermesDetector(CustomTestCase):
         params = json.loads(full_params)
         self.assertEqual(params["city"], "Tokyo")
 
+    def test_streaming_end_and_next_start_in_one_chunk(self):
+        # With --stream-interval above 1 or speculative decoding, the end token
+        # of one call and the start token of the next can arrive in one chunk.
+        detector = HermesDetector()
+        first = '\n{"name": "get_weather", "arguments": {"city": "Beijing"}}\n'
+        second = '\n{"name": "search", "arguments": {"query": "news"}}\n'
+        chunks = [
+            "<tool_call>",
+            *first,
+            "</tool_call>\n<tool_call>",
+            *second,
+            "</tool_call>",
+        ]
+        normal_text, names, params = "", [], {}
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            normal_text += result.normal_text
+            for call in result.calls:
+                if call.name:
+                    names.append(call.name)
+                params[call.tool_index] = params.get(call.tool_index, "") + (
+                    call.parameters or ""
+                )
+
+        self.assertEqual(normal_text.strip(), "")
+        self.assertEqual(names, ["get_weather", "search"])
+        self.assertEqual(
+            [json.loads(params[i]) for i in sorted(params)],
+            [{"city": "Beijing"}, {"query": "news"}],
+        )
+
 
 if __name__ == "__main__":
     import unittest
