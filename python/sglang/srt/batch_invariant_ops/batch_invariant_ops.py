@@ -850,7 +850,7 @@ def _log_softmax_batch_invariant(input, dim, _half_to_float):
 
 def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = None):
     assert dtype is None or dtype == torch.float32, f"unsupported dtype: {dtype}"
-    if len(dim) == 1:
+    if dim is not None and len(dim) == 1:
         return mean_dim(input, dim[0], keepdim=keepdim)
     else:
         assert input.dtype in {
@@ -858,6 +858,9 @@ def mean_batch_invariant(input, dim, keepdim=False, dtype: torch.dtype | None = 
             torch.bfloat16,
             torch.float32,
         }, "only float types supported for now"
+        # aten::mean.dim reduces over every dim when dim is None or an empty list.
+        if not dim:
+            dim = list(range(input.ndim))
         n_elems = 1
         for d in dim:
             n_elems *= input.shape[d]
