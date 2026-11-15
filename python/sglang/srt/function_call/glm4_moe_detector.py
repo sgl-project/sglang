@@ -835,10 +835,10 @@ class Glm4MoeDetector(BaseFormatDetector):
 
             if (
                 arg_type == "string"
-                and _argument_allows_null(func_name, arg_key, tools)
                 and is_good_json
                 and parsed_value is None
                 and _is_json_null(arg_value)
+                and _argument_allows_null(func_name, arg_key, tools)
             ):
                 arguments[arg_key] = None
             elif arg_type == "string":
