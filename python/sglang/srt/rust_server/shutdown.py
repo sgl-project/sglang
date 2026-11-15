@@ -18,7 +18,10 @@ goes out; it also arrives from a wedged scheduler, whose listener closes
 without waiting when its last health probe failed, as Python's drain skips.
 As in Python, a scheduler still releasing its resources when the bound
 expires is killed mid-release; with several nodes, the other nodes' ranks can
-then hang in a collective until the orchestrator kills them.
+then hang in a collective until the orchestrator kills them. A scheduler that
+already exited can stay unreapable while the kernel frees its memory (seconds
+for a large HiCache host pool); the SIGKILL neither speeds that up nor changes
+its exit status, and the reap waits for it.
 
 With attention DP, the launcher of every node relays SIGTERM to the listeners
 on its node. The MLP-sync gather of every step carries each DP listener's
@@ -33,10 +36,11 @@ the event loop at the same step.
 A launcher that got no SIGTERM (another node's, or one scheduler's own, began
 the drain) treats its first scheduler exiting 0 as that gang shutdown: it
 stops its subprocess watchdog and bounds the other schedulers by the same
-exit bound. A crashed scheduler also exits 0, but only after sending SIGQUIT
-to this process, whose handler kills the process tree; with a
-``--custom-sigquit-handler`` that does not, the other schedulers are killed
-once the bound expires and the launcher returns. Without a local
+exit bound. A crashed scheduler exits non-zero after sending SIGQUIT to this
+process, whose handler kills the process tree; with a
+``--custom-sigquit-handler`` that does not, the same bound applies with the
+watchdog left armed, so the other schedulers are killed once it expires and
+the launcher returns. Without a local
 listener-hosting scheduler (elastic EP joiners and plain data parallelism,
 whose schedulers the DP controller starts) the main process keeps its previous
 SIGTERM behavior.
@@ -61,6 +65,8 @@ _POLL_SECS = 1.0
 # How long the killed schedulers get to be reaped: Python's drain reaps them
 # through ``kill_process_tree``, whose default ``wait_timeout`` this is.
 _REAP_TIMEOUT_SECS = 60
+# How often the reap re-checks the schedulers it waits for.
+_REAP_POLL_SECS = 0.1
 
 
 class RustServerSigtermDrain:
@@ -114,7 +120,7 @@ class RustServerSigtermDrain:
 
     def wait(self) -> None:
         """Block until every scheduler exited, or, once draining (or once a
-        scheduler exited 0 without a SIGTERM here), until Python's
+        scheduler exited without a SIGTERM here), until Python's
         scheduler-exit bound expires; the schedulers still alive then
         are killed and reaped, as Python's drain does, so a caller without the
         CLI's process-tree cleanup (a multiprocessing target) does not wait on
@@ -150,22 +156,42 @@ class RustServerSigtermDrain:
                     "shutdown, bounding the others by "
                     f"{_SCHEDULER_EXIT_TIMEOUT_SECS}s"
                 )
-            if exit_deadline is not None and time.monotonic() >= exit_deadline:
+            elif (
+                exit_deadline is None
+                and not self._sigterm_received
+                and any(proc.exitcode is not None for proc in procs)
+            ):
+                # A crash: the watchdog stays armed so it is still reported.
+                exit_deadline = time.monotonic() + _SCHEDULER_EXIT_TIMEOUT_SECS
                 logger.warning(
-                    f"Schedulers still alive {_SCHEDULER_EXIT_TIMEOUT_SECS}s "
-                    "after the drain, killing them: "
-                    f"{[proc.pid for proc in alive]}"
+                    "Scheduler crashed; bounding the others by "
+                    f"{_SCHEDULER_EXIT_TIMEOUT_SECS}s"
+                )
+            if exit_deadline is not None and time.monotonic() >= exit_deadline:
+                elapsed = (
+                    _SCHEDULER_EXIT_TIMEOUT_SECS + time.monotonic() - exit_deadline
+                )
+                logger.info(
+                    f"Scheduler exit deadline reached after {elapsed:.1f}s; sending "
+                    f"SIGKILL to unreaped schedulers: {[proc.pid for proc in alive]}"
                 )
                 for proc in alive:
                     proc.kill()
+                # Polled: join(timeout) blocks in waitpid once the sentinel
+                # closes, which a process in exit teardown does before it is
+                # reapable.
                 reap_deadline = time.monotonic() + _REAP_TIMEOUT_SECS
-                for proc in alive:
-                    proc.join(max(0.0, reap_deadline - time.monotonic()))
-                if unreaped := [proc.pid for proc in alive if proc.is_alive()]:
-                    raise RuntimeError(
+                while (
+                    unreaped := [proc.pid for proc in alive if proc.is_alive()]
+                ) and time.monotonic() < reap_deadline:
+                    time.sleep(_REAP_POLL_SECS)
+                if unreaped:
+                    message = (
                         f"{len(unreaped)} scheduler(s) not reaped within "
                         f"{_REAP_TIMEOUT_SECS}s after SIGKILL; pids={unreaped}"
                     )
+                    logger.error(message)
+                    raise RuntimeError(message)
                 return
             multiprocessing.connection.wait(
                 [proc.sentinel for proc in alive] + [self._notify],

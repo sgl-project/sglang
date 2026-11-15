@@ -125,6 +125,10 @@ class TestNPUKimiK3_W4A8_32P_GPQA(TestNpuAccuracyMultiNodePdMixTestCaseBase):
     accuracy = 0.935
     max_retries = 1
     datasets = ["gpqa_diamond"]
+    # Weekday nightly overrides this to gsm8k (baseline is provisional).
+    dataset_baselines = {
+        "gsm8k": 0.92,
+    }
     few_shot_num = 0
     eval_batch_size = 32
     generation_config = {

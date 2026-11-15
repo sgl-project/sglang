@@ -10,6 +10,10 @@ fi
 # shadow the installed package on sys.path.
 cd "${sglang_source_path}"
 
+# CI hosts mount /root/.cache/huggingface read-only, but --trust-remote-code
+# needs a writable transformers dynamic-module cache.
+export HF_MODULES_CACHE="${HF_MODULES_CACHE:-/tmp/hf_modules}"
+
 echo "NPU info:"
 npu-smi info
 
@@ -98,18 +102,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-# use sglang from source or from image
-if [ "${INSTALL_SGLANG_FROM_SOURCE}" = "true" ] || [ "${INSTALL_SGLANG_FROM_SOURCE}" = "True" ];then
-    echo "Use sglang from source: ${sglang_source_path}"
-    export PYTHONPATH=${sglang_source_path}/python:$PYTHONPATH
-else
-    echo "Use sglang from docker image"
-    sglang_pkg_path=/sgl-workspace/sglang/python
-    ascend_test_util_path=${sglang_pkg_path}/sglang/test/ascend
-    mkdir -p "${ascend_test_util_path}"
-    mv "${ascend_test_util_path}" "${ascend_test_util_path}_bak"
-    cp -r ${sglang_source_path}/python/sglang/test/ascend "${ascend_test_util_path}"
-fi
+# Run the checkout's sglang; the image only supplies the environment.
+export PYTHONPATH="${sglang_source_path}/python${PYTHONPATH:+:${PYTHONPATH}}"
 
 # set environment of cann
 . /usr/local/Ascend/cann/set_env.sh

@@ -118,6 +118,7 @@ class TestDraftSamplerVerifyIds(unittest.TestCase):
         s.out = torch.zeros(max_bs * gamma, dtype=torch.int64)
         s.verify_ids = torch.full((max_bs, gamma + 1), -1, dtype=torch.int64)
         s.confidence_out = None
+        s.acceptance_estimator = None
         draft = torch.arange(bs * gamma, dtype=torch.int64).view(bs, gamma) + 100
 
         def step(model_hidden, anchor):

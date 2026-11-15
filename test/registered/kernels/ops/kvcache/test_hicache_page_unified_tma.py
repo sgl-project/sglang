@@ -1,5 +1,6 @@
 """TMA load-back of page_unified host pages, including grouped KV heads."""
 
+import contextlib
 import sys
 from types import SimpleNamespace
 from unittest import mock
@@ -8,7 +9,6 @@ import pytest
 import torch
 
 from sglang.kernels.ops.kvcache import hicache
-from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=40, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -23,8 +23,8 @@ pytestmark = pytest.mark.skipif(
 
 @pytest.fixture(autouse=True)
 def uncached_tma_gate(monkeypatch):
-    # Production fixes this flag for a process. These tests switch it in one
-    # process to exercise the real environment gate and both transfer paths.
+    # Production caches this gate for a process. These tests mock the TMA module
+    # and switch the gate in one process to exercise both transfer paths.
     monkeypatch.setattr(
         hicache, "use_hicache_tma_kernel", hicache.use_hicache_tma_kernel.__wrapped__
     )
@@ -160,7 +160,15 @@ def test_page_unified_tma_and_register_parity(
     # final layer window of a partitioned page object.
     with mock.patch.object(hicache, "_jit_hicache_tma_module", return_value=proxy):
         for enabled in (True, False):
-            with envs.SGLANG_HICACHE_TMA_TRANSFER.override(enabled):
+            # The disabled pass forces the register kernel for the parity check.
+            gate = (
+                contextlib.nullcontext()
+                if enabled
+                else mock.patch.object(
+                    hicache, "use_hicache_tma_kernel", return_value=False
+                )
+            )
+            with gate:
                 for layer in selected_layers:
                     k.fill_(17)
                     v.fill_(29)
@@ -191,25 +199,22 @@ def test_page_unified_tma_and_register_parity(
 
 
 def test_page_unified_gate_and_oversized_row_fallback():
-    with envs.SGLANG_HICACHE_TMA_TRANSFER.override(True):
-        assert not hicache._use_page_unified_tma_kernel(group_bytes=0, block_quota=2)
-        assert not hicache._use_page_unified_tma_kernel(group_bytes=18, block_quota=2)
-        assert not hicache._use_page_unified_tma_kernel(
-            group_bytes=32784, block_quota=2
-        )
-        # Oversized rows remain supported by the existing register copy path.
-        src = _source((3, 2, 1, 16392), torch.bfloat16, "cpu")
-        k = torch.zeros((4, 1, 16392), dtype=torch.bfloat16, device="cuda")
-        src_indices = torch.tensor([2, 0], device="cuda")
-        dst_indices = torch.tensor([1, 3], device="cuda")
-        expected = _expected(src, k, src_indices, dst_indices, 1, is_mla=True)
-        with mock.patch.object(
-            hicache,
-            "_jit_hicache_tma_module",
-            side_effect=AssertionError("oversized TMA row"),
-        ):
-            _launch(k, k, src, src_indices, dst_indices, 1, is_mla=True)
-        torch.testing.assert_close(k.cpu(), expected, rtol=0, atol=0)
+    assert not hicache._use_page_unified_tma_kernel(group_bytes=0, block_quota=2)
+    assert not hicache._use_page_unified_tma_kernel(group_bytes=18, block_quota=2)
+    assert not hicache._use_page_unified_tma_kernel(group_bytes=32784, block_quota=2)
+    # Oversized rows remain supported by the existing register copy path.
+    src = _source((3, 2, 1, 16392), torch.bfloat16, "cpu")
+    k = torch.zeros((4, 1, 16392), dtype=torch.bfloat16, device="cuda")
+    src_indices = torch.tensor([2, 0], device="cuda")
+    dst_indices = torch.tensor([1, 3], device="cuda")
+    expected = _expected(src, k, src_indices, dst_indices, 1, is_mla=True)
+    with mock.patch.object(
+        hicache,
+        "_jit_hicache_tma_module",
+        side_effect=AssertionError("oversized TMA row"),
+    ):
+        _launch(k, k, src, src_indices, dst_indices, 1, is_mla=True)
+    torch.testing.assert_close(k.cpu(), expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("is_mla", [False, True])
@@ -228,40 +233,39 @@ def test_page_unified_empty_and_cuda_graph(is_mla):
     v = torch.full_like(k, 29)
     empty = torch.empty(0, dtype=torch.int64, device="cuda")
     src_indices, dst_indices = _indices(page_size, num_pages, torch.int64, "scatter")
-    with envs.SGLANG_HICACHE_TMA_TRANSFER.override(True):
-        _launch(k, v, src, empty, empty, 2, is_mla=is_mla)
-        assert (k == 17).all() and (v == 29).all()
-        stream = torch.cuda.Stream()
-        stream.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(stream):
-            _launch(k, v, src, src_indices, dst_indices, 2, is_mla=is_mla)
-        torch.cuda.current_stream().wait_stream(stream)
-        graph = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(graph):
-            _launch(k, v, src, src_indices, dst_indices, 2, is_mla=is_mla)
-        for _ in range(3):
-            k.fill_(17)
-            v.fill_(29)
-            graph.replay()
-        torch.testing.assert_close(
-            k.cpu(),
-            _expected(
-                src, torch.full_like(k, 17), src_indices, dst_indices, 2, is_mla=is_mla
-            ),
-            rtol=0,
-            atol=0,
+    _launch(k, v, src, empty, empty, 2, is_mla=is_mla)
+    assert (k == 17).all() and (v == 29).all()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        _launch(k, v, src, src_indices, dst_indices, 2, is_mla=is_mla)
+    torch.cuda.current_stream().wait_stream(stream)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        _launch(k, v, src, src_indices, dst_indices, 2, is_mla=is_mla)
+    for _ in range(3):
+        k.fill_(17)
+        v.fill_(29)
+        graph.replay()
+    torch.testing.assert_close(
+        k.cpu(),
+        _expected(
+            src, torch.full_like(k, 17), src_indices, dst_indices, 2, is_mla=is_mla
+        ),
+        rtol=0,
+        atol=0,
+    )
+    if not is_mla:
+        expected_v = _expected(
+            src,
+            torch.full_like(v, 29),
+            src_indices,
+            dst_indices,
+            2,
+            is_mla=False,
+            component=1,
         )
-        if not is_mla:
-            expected_v = _expected(
-                src,
-                torch.full_like(v, 29),
-                src_indices,
-                dst_indices,
-                2,
-                is_mla=False,
-                component=1,
-            )
-            torch.testing.assert_close(v.cpu(), expected_v, rtol=0, atol=0)
+        torch.testing.assert_close(v.cpu(), expected_v, rtol=0, atol=0)
 
 
 if __name__ == "__main__":

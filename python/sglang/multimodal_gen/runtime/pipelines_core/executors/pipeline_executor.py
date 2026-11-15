@@ -30,7 +30,6 @@ from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
-from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import (
     SGLDiffusionProfiler,
     maybe_record_function,
@@ -41,18 +40,6 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 
 logger = init_logger(__name__)
-
-
-class Timer(StageProfiler):
-    """
-    A wrapper around StageProfiler to maintain backward compatibility.
-    It forces simple logging behavior (log start/end) regardless of env vars.
-    """
-
-    def __init__(self, name="Stage"):
-        super().__init__(
-            stage_name=name, logger=logger, metrics=None, log_stage_start_end=True
-        )
 
 
 class PipelineExecutor(ABC):

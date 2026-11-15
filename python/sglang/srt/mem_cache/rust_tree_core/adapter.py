@@ -27,7 +27,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.events import (
+    KvEventLoraNames,
+    enable_mm_routing_labels,
+    mm_routing_spans,
+)
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -57,7 +61,6 @@ from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import StorageBackupSpec
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
-    JOINT_LRU_EVICTION_POLICY,
     BufferBackupSnapshot,
     BufferBackupState,
     DecSwaLockOnlyResult,
@@ -71,6 +74,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     RadixCacheWalkResult,
     TreePathNodeInfo,
     UnifiedTreeCoreInterface,
+    uses_joint_lru,
 )
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
@@ -146,6 +150,11 @@ def _kv_event_from_tagged(
             cache_salt=event[6],
             session_id=event[7],
             lora_name=lora_name,
+            mm_routing_spans=(
+                mm_routing_spans(event[3], event[4], len(event[1]))
+                if dynamo_format
+                else None
+            ),
         )
     if tag == "block_removed":
         seed = (
@@ -196,7 +205,7 @@ def _cache_action_from_tagged(action: tuple, ids: _CoreIds) -> CacheAction:
     if tag == "free_device_kv":
         return FreeDeviceKV(indices=list(action[1]))
     if tag == "free_device_kv_full_only":
-        return FreeDeviceKVFullOnly(indices=list(action[1]))
+        return FreeDeviceKVFullOnly(indices=list(action[1]), tree_owned=action[2])
     if tag == "backup_kv":
         return BackupKV(node_ids=list(action[1]))
     if tag == "mamba_evict_excess_path_states":
@@ -365,6 +374,8 @@ class _RustKVCacheEventRecorder:
     ):
         self._binding = binding
         self.enabled = enabled
+        if enabled and dynamo_format:
+            enable_mm_routing_labels()
         self._lora_names = lora_names
         self._dynamo_format = dynamo_format
 
@@ -384,6 +395,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     _bindings = bindings
     supports_rotation_base = True
+    supports_joint_eviction = True
 
     def _cache_action_from_tagged(self, action: tuple) -> CacheAction | ComponentAction:
         return _cache_action_from_tagged(action, self._ids)
@@ -495,6 +507,12 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         # The core keeps each family's slot by its own id; translate at the
         # binding, so the tree's ids never reach it.
         self._ids = _CoreIds(params.tree_slots)
+        # The window slot the joint order covers (the tree's one window).
+        self.joint_window_type: Optional[ComponentType] = (
+            self.slot_id(TREE_WINDOW)
+            if uses_joint_lru(params, self.tree_components)
+            else None
+        )
         # Validate the same constructor options as Python before passing the
         # configured eviction parameters to the native strategy.
         eviction_strategy = get_eviction_strategy(
@@ -563,18 +581,12 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
         mamba_max_states_per_path = (
-            get_exec().mamba.mamba_max_states_per_path if has_mamba else -1
+            get_exec().mamba.mamba_path_state_cap if has_mamba else -1
         )
 
         self._binding = self._binding_class()(
             self._bindings.TreeCoreInitParamsBinding(
-                # This core keeps no joint order; joint_lru evicts each
-                # component as lru here.
-                eviction_policy=(
-                    "lru"
-                    if params.eviction_policy.lower() == JOINT_LRU_EVICTION_POLICY
-                    else params.eviction_policy
-                ),
+                eviction_policy=params.eviction_policy,
                 slru_protected_threshold=getattr(
                     eviction_strategy, "protected_threshold", 2
                 ),
@@ -602,6 +614,8 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 mamba_host_only_checkpoint=(
                     host_only_mamba_checkpoint() if has_mamba else False
                 ),
+                # The joint Full/SWA LRU, kept only where uses_joint_lru holds.
+                joint_lru=uses_joint_lru(params, self.tree_components),
             ),
             # Each slot's id and family: the native core picks a slot's driver
             # by its family.
@@ -750,6 +764,16 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         return result
 
     # ==== Device eviction (driven step-wise by the Controller's evict()) ====
+
+    def start_joint_eviction(self) -> None:
+        self._binding.start_joint_eviction()
+
+    def next_joint_eviction_victim(self) -> Optional[tuple[ComponentType, NodeId]]:
+        victim = self._binding.next_joint_eviction_victim()
+        return None if victim is None else (self._ids.tree(victim[0]), victim[1])
+
+    def end_joint_eviction(self) -> None:
+        self._binding.end_joint_eviction()
 
     def evict_device_start(
         self, component_type: ComponentType, request_cnt: int
