@@ -545,7 +545,8 @@ void rotary_embedding_cpu(
     int64_t head_size,
     at::Tensor& cos_sin_cache,
     bool is_neox);
-void apply_rotary_pos_emb_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
+void apply_rotary_pos_emb_cpu(
+    at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin, int64_t unsqueeze_dim);
 
 // multidimensional rope
 void apply_multidimensional_rope_cpu(at::Tensor& query, at::Tensor& key, at::Tensor& cos, at::Tensor& sin);
@@ -999,7 +1000,8 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "rotary_embedding_cpu(Tensor positions, Tensor(a!) query, Tensor(b!) key, int head_size, Tensor cos_sin_cache, "
       "bool is_neox) -> ()");
   m.impl("rotary_embedding_cpu", torch::kCPU, &rotary_embedding_cpu);
-  m.def("apply_rotary_pos_emb_cpu(Tensor(a!) query, Tensor(b!) key, Tensor cos, Tensor sin) -> ()");
+  m.def(
+      "apply_rotary_pos_emb_cpu(Tensor(a!) query, Tensor(b!) key, Tensor cos, Tensor sin, int unsqueeze_dim=1) -> ()");
   m.impl("apply_rotary_pos_emb_cpu", torch::kCPU, &apply_rotary_pos_emb_cpu);
 
   // multidimensional rope

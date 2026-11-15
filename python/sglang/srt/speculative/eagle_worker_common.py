@@ -44,7 +44,7 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_nan,
     maybe_detect_oob,
 )
-from sglang.srt.utils.common import is_npu
+from sglang.srt.utils.device import is_npu
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()

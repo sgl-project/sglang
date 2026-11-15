@@ -812,13 +812,10 @@ Adjustments are not in the commands below. Add them when they apply:
 ```bash Command
 SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
 SGLANG_DSV4_UNIFIED_KV_FP8=1 \
-SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1 \
 SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
 SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
 AITER_BF16_FP8_MOE_BOUND=0 \
-SGLANG_OPT_USE_AITER_BATCHED_GEMM=1 \
-SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1 \
 python3 -m sglang.launch_server \
   --model-path deepseek-ai/DeepSeek-V4-Pro-0813 \
   --trust-remote-code \
@@ -853,13 +850,10 @@ python3 -m sglang.launch_server \
 ```bash Command
 SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
 SGLANG_DSV4_UNIFIED_KV_FP8=1 \
-SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1 \
 SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
 SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
 AITER_BF16_FP8_MOE_BOUND=0 \
-SGLANG_OPT_USE_AITER_BATCHED_GEMM=1 \
-SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1 \
 SGLANG_SHARED_EXPERT_TP1=1 \
 SGLANG_DP_SHARED_EXPERT_LOCAL=1 \
 SGLANG_DP_USE_GATHERV=1 \
@@ -903,14 +897,10 @@ python3 -m sglang.launch_server \
 ```bash Command
 SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS=1 \
 SGLANG_DSV4_UNIFIED_KV_FP8=1 \
-SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP=1 \
 SGLANG_USE_ROCM700A=0 \
 TORCH_BLAS_PREFER_HIPBLASLT=1 \
 SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton \
 AITER_BF16_FP8_MOE_BOUND=0 \
-SGLANG_OPT_USE_AITER_BATCHED_GEMM=1 \
-SGLANG_OPT_FP8_WO_A_FUSED_INVROPE=1 \
-SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 \
 SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR=16384 \
 SGLANG_AMD_FLYDSL_MEGA_MOE_DECODE_MTPR=512 \
 AITER_MEGA_FIXED_SLOT_MAX_MTPR=1023 \
@@ -961,7 +951,7 @@ python3 -m sglang.launch_server \
   --watchdog-timeout 3600
 ```
 
-This command adds expert parallelism on top of the DP8 one. [§3.7](#3-7-pd-disaggregation-on-mi355x-mori-io) explains `SGLANG_AMD_USE_FLYDSL_MEGA_MOE`, `SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR` and the MORI symmetric heap; the heap is 16 GiB here rather than 8 GiB because `--mem-fraction-static 0.85` leaves more GPU memory free. `SGLANG_DP_USE_REDUCE_SCATTER=0` turns off the reduce-scatter path that MegaMoE's all-to-all replaces. The three `SGLANG_AITER_MEGA_*` variables and `--enable-eplb` enable expert-load balancing, recorded during prefill only. `SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE=7` keeps each RCCL P2P group under 31 ops during EPLB rebalance.
+This command adds expert parallelism on top of the DP8 one. [§3.7](#3-7-pd-disaggregation-on-mi355x-mori-io) explains `SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR` and the MORI symmetric heap; the heap is 16 GiB here rather than 8 GiB because `--mem-fraction-static 0.85` leaves more GPU memory free. `SGLANG_DP_USE_REDUCE_SCATTER=0` turns off the reduce-scatter path that MegaMoE's all-to-all replaces. The three `SGLANG_AITER_MEGA_*` variables and `--enable-eplb` enable expert-load balancing, recorded during prefill only. `SGLANG_EPLB_P2P_BATCH_CHUNK_SIZE=7` keeps each RCCL P2P group under 31 ops during EPLB rebalance.
 
 ### 3.7 PD Disaggregation on MI355X (MORI-IO)
 
@@ -1029,7 +1019,6 @@ The two commands below are that pair at concurrency 256, on one prefill node and
 
 ```bash Command
 GPU_MAX_HW_QUEUES=5 \
-SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1 \
 SGLANG_AMD_FLYDSL_MEGA_QUANT=a8w4 \
 MORI_SHMEM_HEAP_SIZE=8G \
 SGLANG_DSV4_UNIFIED_KV_FP8=1 \
@@ -1131,7 +1120,7 @@ The rest of the difference is the prefill-only set already described above: `--c
 
 On the prefill env:
 
-- `SGLANG_AMD_USE_FLYDSL_MEGA_MOE=1` is required. `--moe-a2a-backend megamoe` alone runs the DeepGEMM MegaMoE path, which has no ROCm kernel. Do not set this variable on decode: the scheduler reads it too, so it also changes how decode schedules batches.
+- On ROCm, `--moe-a2a-backend megamoe` runs Aiter MegaMoEv2.
 - `SGLANG_AMD_FLYDSL_MEGA_MOE_MTPR` must be at least `--chunked-prefill-size / attn_dp_size`, here 65536 / 8. Below that SGLang reports no error and runs fused MoE for the extra tokens. 8192 is the default, so the command omits this variable. Set it explicitly if you increase the per-rank chunk size.
 - `MORI_SHMEM_HEAP_SIZE` sizes the MORI symmetric heap, where MegaMoEv2 allocates its dispatch and combine buffers. It needs about 0.51 GiB per 1024 tokens of MTPR — about 4.2 GiB at 8192 — and the 4 GiB default fails during CUDA graph capture. SGLang allocates the whole heap at the first MegaMoE forward pass, after the KV cache pool, so it consumes the GPU memory `--mem-fraction-static` left free whether MegaMoE fills it or not. 8 GiB fits next to `0.92`; [§3.6](#3-6-agentic-long-context-with-hicache-dram-offload-mi355x-fp4-dspark) runs at `0.85` and can afford more.
 

@@ -27,6 +27,12 @@ from sglang.srt.multimodal.encoder_preprocessing import (
     EncoderPreprocessOutput,
     invoke_encoder_preprocessor,
 )
+from sglang.srt.multimodal.media_io import (
+    CLIENT_MEDIA_EXCEPTIONS,
+    load_audio,
+    load_image,
+    load_video,
+)
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.glm4v import (
     _glm_effective_presize_budget,
@@ -49,12 +55,6 @@ from sglang.srt.runtime_context import (
     get_serving,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    CLIENT_MEDIA_EXCEPTIONS,
-    load_audio,
-    load_image,
-    load_video,
-)
 
 logger = logging.getLogger(__name__)
 

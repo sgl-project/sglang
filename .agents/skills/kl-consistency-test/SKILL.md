@@ -174,10 +174,11 @@ at the operator directly, and has done so reliably: run it once and read off the
 first layer whose output differs while its inputs are bit-identical.
 
 ```bash
+export SGLANG_ADMIN_API_KEY=<key>
 DUMPER_ENABLE=0 DUMPER_SERVER_PORT=reuse DUMPER_NON_INTRUSIVE_MODE=all \
 DUMPER_DIR=/path/to/dumps python3 -m sglang.launch_server ... \
   --disable-cuda-graph --disable-prefill-cuda-graph
-curl -X POST localhost:PORT/dumper/configure -d '{"enable": true, "exp_name": "dec"}'
+curl -X POST localhost:PORT/dumper/configure -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" -d '{"enable": true, "exp_name": "dec"}'
 ```
 
 Five settings that are each required, and each fails silently if wrong:

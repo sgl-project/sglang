@@ -22,6 +22,7 @@ from sglang.srt.platforms.device_mixin import DeviceMixin, PlatformEnum
 if TYPE_CHECKING:
     import torch
 
+    from sglang.srt.layers.moe.expert_executor import MoeExpertExecutorContext
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.managers.io_struct import ProfileReq
 
@@ -138,6 +139,43 @@ class SRTPlatform(DeviceMixin):
         """Return the full device-graph backend class for this platform."""
         return None
 
+    def get_moe_expert_executor_cls(
+        self, context: MoeExpertExecutorContext
+    ) -> Optional[type[torch.nn.Module]]:
+        """Return a platform-specific MoE expert executor class.
+
+        Returning ``None`` keeps SGLang's built-in MoE implementation. The
+        returned class must accept the model's standard expert constructor
+        arguments, expose a ``runner_backend`` attribute compatible with
+        ``MoeRunnerBackendLike`` (or ``None``), and support the
+        ``forward(hidden_states, topk_output)`` call. The model binds that
+        backend to its ``TopK`` instance and remains responsible for producing
+        ``topk_output``. Existing model loaders remain responsible for
+        checkpoint loading, so the class must preserve the ``FusedMoE`` expert
+        parameter ABI (``w13_*``/``w2_*`` names and their ``weight_loader``
+        callbacks).
+
+        Models opt into this hook individually; Gemma4 is currently the only
+        caller that supplies ``MoeExpertExecutorContext``.
+        """
+        return None
+
+    def get_weight_update_handlers(self) -> dict[str, Callable[..., Any]]:
+        """Weight transports this platform serves through /plugin_weight_update, by name.
+
+        A handler is the receive half of a weight update, like
+        ``receive_weights_from_distributed``: ``handler(context=PluginWeightUpdateContext,
+        payload=dict)`` runs on every TP rank inside a begin/end_weight_update session and
+        returns the ``(name, tensor)`` pairs it received. The core loads them into the
+        selected runners exactly as /update_weights_from_distributed does. A handler that
+        writes parameters itself (through ``context.runners``) returns ``[]``, so
+        end_weight_update runs post_load_weights, as after peer (p2p) writes. An exception
+        on any rank fails the request on all ranks, after the ranks that succeeded have
+        loaded their share, so the caller redoes the bucket or retires the engine; the
+        transport owns its timeouts.
+        """
+        return {}
+
     def get_kv_pool_cls(self, *, kind: KVPoolKind) -> Optional[type]:
         """Return this platform's KV pool class for ``kind``, or None.
 
@@ -245,6 +283,27 @@ class SRTPlatform(DeviceMixin):
 
     def support_mamba_cache_extra_buffer(self) -> bool:
         """Whether this out-of-tree platform supports Mamba cache snapshots."""
+        return False
+
+    def supports_kv_cache_dtype(self, kv_cache_dtype: str) -> bool:
+        """Whether this out-of-tree platform serves a platform-registered KV
+        cache dtype.
+
+        Consulted only for ``--kv-cache-dtype`` values added with
+        ``register_kv_cache_dtype`` and only on out-of-tree platforms; in-tree
+        platforms always reject those values, and built-in dtypes are validated
+        as before. Return True only if the pools this platform returns from
+        ``get_kv_pool_cls`` store the format and its own attention backend reads
+        it: in-tree pools and attention backends have no path for it. The pool
+        is constructed with the registered storage dtype and reads the format
+        from the ``kv_cache_dtype`` server argument. Core rejects a model that
+        builds a pool kind this platform does not provide (a hybrid DSA model
+        with sliding-window layers builds both ``dsa`` and ``mla`` pools), and PD
+        disaggregation, hierarchical cache, LMCache and
+        ``--prefill-only-disable-kv-cache``. The platform must reject any pool
+        kind it provides but cannot serve with the format, which core cannot
+        detect, and any head size or feature it cannot serve.
+        """
         return False
 
     # ------------------------------------------------------------------

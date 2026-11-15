@@ -19,6 +19,9 @@ INDEX_HEAD_DIM = 128
 INDEX_K_PAYLOAD_BYTES = tl.constexpr(64)
 INDEX_K_SCALE_BYTES = tl.constexpr(4)
 INDEX_K_SLOT_BYTES = INDEX_K_PAYLOAD_BYTES.value + INDEX_K_SCALE_BYTES.value
+# Paged decode batches up to this many rows split all rows' tiles evenly over the GPU;
+# scores are bitwise identical to the per-row grid.
+_PAGED_BALANCED_MAX_BATCH = 4096
 
 
 @triton.jit
@@ -559,9 +562,7 @@ def fp4_index_logits_paged(
     )
     if not batch or not max_len:
         return out
-    from sglang.srt.environ import envs
-
-    if envs.SGLANG_OPT_DSV41_FAST_DECODE_INDEXER.get() and batch <= 4096:
+    if batch <= _PAGED_BALANCED_MAX_BATCH:
         _launch_fp4_index_logits_paged_balanced(
             q,
             weights,

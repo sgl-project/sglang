@@ -11,6 +11,7 @@ REASONING_PARSER_NAMES = [
     "deepseek-v4",
     "deepseek-v41",
     "dots",
+    "ernie55",
     "glm45",
     "ling3",
     "hunyuan",

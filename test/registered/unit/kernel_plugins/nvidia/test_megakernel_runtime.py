@@ -8,6 +8,7 @@ from unittest.mock import Mock, call, patch
 
 import torch
 from msgspec.structs import replace
+from transformers import PretrainedConfig
 
 from sglang.kernels.plugin_kernels.nvidia import spec as registry
 from sglang.srt.kernel_plugins.nvidia import binding
@@ -29,6 +30,16 @@ from _fakes import (  # noqa: E402
 )
 
 register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
+
+
+def _cuda_model_runner(lm):
+    """A CUDA model runner stub for warmup; its model is not a linear-attention
+    hybrid, so warmup compiles no GDN prefill kernels."""
+    return SimpleNamespace(
+        model=lm,
+        device="cuda",
+        model_config=SimpleNamespace(hf_config=PretrainedConfig()),
+    )
 
 
 class OtherBinding:
@@ -101,7 +112,9 @@ class TestMegakernelRuntime(CustomTestCase):
                 "allreduce"
             ),
             _pre_initialize_fi_a2a_workspace=lambda: events.append("a2a"),
+            _pre_initialize_dcp_push_combine=lambda: events.append("dcp"),
             _pre_initialize_pcie_ipc_workspace=lambda: events.append("pcie"),
+            _finalize_symm_workspaces=lambda: events.append("symm"),
             _autotune_buffers=lambda: (object(), 1),
             _flashinfer_autotune=lambda **kw: events.append("autotune"),
         )
@@ -201,13 +214,15 @@ class TestMegakernelRuntime(CustomTestCase):
         lm = self._install_spec(replace(SPEC, prepare=prepare), model=model)
         built = binding.built_megakernel(lm)
         self.assertIs(lm.prepare_before_cuda_graph_capture, original)
-        mr = SimpleNamespace(model=lm, device="cuda")
+        mr = _cuda_model_runner(lm)
         expected = [
             "allreduce",
             "a2a",
+            "dcp",
             "pcie",
             ("model", mr),
             ("plugin", built, prepared_view),
+            "symm",
             "autotune",
             "extend",
         ]
@@ -275,10 +290,10 @@ class TestMegakernelRuntime(CustomTestCase):
                     ),
                     self.assertRaisesRegex(RuntimeError, f"{failed_stage} failed"),
                 ):
-                    self._warmup(SimpleNamespace(model=lm, device="cuda"), events)
+                    self._warmup(_cuda_model_runner(lm), events)
                 self.assertEqual(
                     events,
-                    ["allreduce", "a2a", "pcie"]
+                    ["allreduce", "a2a", "dcp", "pcie"]
                     + stages[: stages.index(failed_stage) + 1],
                 )
 
@@ -305,7 +320,7 @@ class TestMegakernelRuntime(CustomTestCase):
             MegakernelBinding, "preparation_view", return_value=prepared_view
         ):
             lm = self._install_spec(spec, is_draft=True)
-            self._warmup(SimpleNamespace(model=lm, device="cuda"), [])
+            self._warmup(_cuda_model_runner(lm), [])
         self.assertIs(zero.prepared, prepared_view)
         self.assertIs(binding.built_megakernel(lm), zero)
         self.assertIs(binding.megakernel_draft_sampler(lm), print)
@@ -466,6 +481,55 @@ class TestMegakernelRuntime(CustomTestCase):
         runner.buffers.aux_hidden_states = torch.empty_like(aux)
         with self.assertRaisesRegex(RuntimeError, "decode_graph_aux_hidden_states"):
             lm.context.binding.assert_live()
+
+    def test_prefill_step_uses_prefill_view_not_forward_view(self):
+        """A prefill step must call prefill_view(), not forward_view(forward_batch),
+        and must not seal graph-static tensors (prefill runs eagerly, never captured)."""
+        from sglang.kernels.plugin_kernels.nvidia.spec import Step
+
+        prefill_step = Step(mode="prefill", rows=8)
+        prefill_built = SimpleNamespace(
+            widths=(4,),
+            draft_sampler=None,
+            draft_loop=None,
+            draft_extend=None,
+            begin_draft_round=None,
+            graph_variants=None,
+            speculative_runtime_hooks=None,
+            summary=lambda: "prefill-fake",
+            plan=lambda ids, fb, *a, **kw: prefill_step,
+            forward=lambda step, orig, *a, **kw: ("megakernel", step),
+        )
+        with patch.object(binding, "find_spec", return_value=(SPEC, "")):
+            with patch.object(
+                SPEC.__class__, "build", create=True, return_value=prefill_built
+            ):
+                lm = self._install_spec(
+                    replace(SPEC, build=lambda m, hf, ctx: prefill_built), tokens=1
+                )
+        with (
+            patch.object(MegakernelBinding, "prefill_view", return_value="pview"),
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+        ):
+            result = lm(batch(4).input_ids, None, batch(4))
+        tag, ran_step = result
+        self.assertEqual(tag, "megakernel")
+        self.assertEqual(ran_step.mode, "prefill")
+        self.assertEqual(ran_step.view, "pview")
+        MegakernelBinding.forward_view.assert_not_called()
+        MegakernelBinding.seal_capture_view.assert_not_called()
+
+    def test_decode_step_does_not_call_prefill_view(self):
+        """A decode step must call forward_view(forward_batch) and not prefill_view."""
+        with patch.object(MegakernelBinding, "prefill_view", return_value="pview"):
+            lm = install(tokens=1)
+            forward_batch = batch(4)
+            with patch.object(
+                torch.cuda, "is_current_stream_capturing", return_value=False
+            ):
+                lm(forward_batch.input_ids, None, forward_batch)
+            MegakernelBinding.forward_view.assert_called_once_with(forward_batch)
+            MegakernelBinding.prefill_view.assert_not_called()
 
 
 if __name__ == "__main__":

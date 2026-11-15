@@ -203,6 +203,15 @@ fn json_error(status: StatusCode, message: &str) -> Response {
     (status, Json(serde_json::json!({ "error": message }))).into_response()
 }
 
+/// Query string of `POST /flush_cache`.
+#[derive(Debug, Deserialize)]
+pub struct FlushParams {
+    /// Seconds each engine waits for its in-flight requests before flushing.
+    /// Without it an engine flushes at once, freeing KV a PD transfer may
+    /// still be reading.
+    timeout: Option<f64>,
+}
+
 /// `POST /flush_cache` — fan SGLang's `/flush_cache` admin call out to every
 /// registered worker and report a per-worker breakdown.
 ///
@@ -213,13 +222,17 @@ fn json_error(status: StatusCode, message: &str) -> Response {
 /// out-of-band admin call would skew the state the request router uses to
 /// pick workers.
 ///
-/// The caller's `Authorization` header is forwarded, so engines started with
-/// `--api-key` flush only for a caller holding that key.
+/// The caller's `Authorization` header and `?timeout=` are forwarded, so engines
+/// started with `--api-key` flush only for a caller holding that key.
 ///
 /// Status: `200 OK` when every worker flushed successfully (or the fleet is
 /// empty); `502 BAD_GATEWAY` when at least one worker failed. The JSON body
 /// always carries the full breakdown so a partial failure is actionable.
-pub async fn flush_cache(State(ctx): State<Arc<AppContext>>, headers: HeaderMap) -> Response {
+pub async fn flush_cache(
+    State(ctx): State<Arc<AppContext>>,
+    headers: HeaderMap,
+    Query(params): Query<FlushParams>,
+) -> Response {
     let workers = ctx.registry.all();
     let total_workers = workers.len();
 
@@ -240,6 +253,7 @@ pub async fn flush_cache(State(ctx): State<Arc<AppContext>>, headers: HeaderMap)
         ctx.proxy.admin_client(),
         ctx.proxy.request_timeout,
         headers.get(header::AUTHORIZATION),
+        params.timeout,
     )
     .await;
 
@@ -283,6 +297,7 @@ async fn fan_out_flush(
     client: &Client,
     timeout: Duration,
     auth: Option<&HeaderValue>,
+    flush_timeout: Option<f64>,
 ) -> (Vec<String>, Vec<FailedWorker>) {
     // Snapshot the URLs into owned Strings up front so the per-worker stream
     // does not borrow the `workers` slice across the await points.
@@ -295,6 +310,9 @@ async fn fan_out_flush(
                 .timeout(timeout);
             if let Some(auth) = auth {
                 request = request.header(header::AUTHORIZATION, auth);
+            }
+            if let Some(flush_timeout) = flush_timeout {
+                request = request.query(&[("timeout", flush_timeout)]);
             }
             async move { (url, request.send().await) }
         })
@@ -485,6 +503,39 @@ mod tests {
         assert_eq!(res.status(), StatusCode::OK);
         let (status, _) = post_flush(ctx_with_workers(&[&url])).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    /// The caller's `?timeout=` reaches workers, so they flush once idle
+    /// rather than at once; without one, none is sent.
+    #[tokio::test]
+    async fn forwards_flush_timeout() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let record = Arc::clone(&seen);
+        let app = Router::new().route(
+            "/flush_cache",
+            post(move |uri: axum::http::Uri| async move {
+                *record.lock().unwrap() = Some(uri.query().map(str::to_owned));
+                StatusCode::OK
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await });
+        let ctx = ctx_with_workers(&[&url]);
+
+        for (uri, forwarded) in [
+            ("/flush_cache?timeout=2.5", Some("timeout=2.5")),
+            ("/flush_cache", None),
+        ] {
+            let request = Request::post(uri).body(Body::empty()).unwrap();
+            let res = crate::server::app::build_router(Arc::clone(&ctx))
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(res.status(), StatusCode::OK, "{uri}");
+            let query = seen.lock().unwrap().take().expect("worker flushed");
+            assert_eq!(query.as_deref(), forwarded, "{uri}");
+        }
     }
 
     /// A worker URL with a trailing slash must still resolve to

@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import pickle
+import socket
 import subprocess
 import sys
 import tempfile
@@ -408,6 +409,10 @@ def is_one_nvlink_clique(
             "GPU fabric clique query failed (%r); custom-AR stays intra-node.", e
         )
         clique = None
+    if clique is not None and not any(clique[0]):
+        # A zero cluster UUID marks a fabric that ends at its node (an HGX
+        # NVSwitch baseboard), whose clique id repeats on every node.
+        clique = (*clique, socket.gethostname())
     # Always all-gather (every rank calls it once) so a failed query on any rank
     # resolves to a clean False rather than a collective mismatch.
     world_size = dist.get_world_size(group=group)
@@ -426,12 +431,11 @@ def is_weak_contiguous(inp: torch.Tensor):
 
 
 def can_p2p(rank: int, world_size: int) -> bool:
-    # SGLANG_SKIP_P2P_CHECK can be set to False in sglang
-    SGLANG_SKIP_P2P_CHECK = os.getenv("SGLANG_SKIP_P2P_CHECK", "0") == "1"
+    skip_p2p_check = sglang_envs.SGLANG_SKIP_P2P_CHECK.get()
     for i in range(world_size):
         if i == rank:
             continue
-        if SGLANG_SKIP_P2P_CHECK:
+        if skip_p2p_check:
             logger.info("Skipping P2P check and trusting the driver's P2P report.")
             return torch.cuda.can_device_access_peer(rank, i)
         if not gpu_p2p_access_check(rank, i):

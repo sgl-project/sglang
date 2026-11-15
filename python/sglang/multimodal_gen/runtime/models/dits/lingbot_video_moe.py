@@ -50,7 +50,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.srt.utils import add_prefix
+from sglang.srt.layers.utils.common import add_prefix
 
 LINGBOT_VIDEO_FP32_MODULES = (
     "time_embedder",
