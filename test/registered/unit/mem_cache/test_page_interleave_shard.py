@@ -69,6 +69,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     allocate_symmetric_buffer,
 )
 from sglang.srt.environ import envs
+from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache import page_interleave
 from sglang.srt.mem_cache.allocator.page_interleave import (
@@ -117,6 +118,7 @@ from sglang.srt.mem_cache.pool_host.page_interleave import (
     PageInterleaveHostPool,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_cache.storage_attachment import StorageAttachment
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
@@ -2142,14 +2144,102 @@ class TestOwnedRows(CustomTestCase):
 
 class TestStorageAttachRefusedUnderSharding(CustomTestCase):
     def test_runtime_attach_is_refused(self):
-        """The launch gate rejects --hicache-storage-backend under sharding;
-        the runtime attach endpoint must not slip L3 past it."""
-        cache = SimpleNamespace(
-            cache_controller=object(), token_to_kv_pool_allocator=_make_allocator()
+        cases = (
+            ("file", "buffer_only", "not --hicache-storage-backend 'file'"),
+            ("mooncake", "cache", "requires --hicache-host-memory-mode buffer_only"),
         )
-        ok, message = StorageAttachment(cache).attach(storage_backend="file")
-        self.assertFalse(ok)
-        self.assertIn("--enable-kv-cache-sharding", message)
+        for backend, mode, error in cases:
+            with self.subTest(backend=backend, mode=mode):
+                cache = SimpleNamespace(
+                    cache_controller=SimpleNamespace(storage_host_pool=_host_pool(0)),
+                    token_to_kv_pool_allocator=_make_allocator(),
+                    host_memory_mode=mode,
+                )
+                ok, message = StorageAttachment(cache).attach(storage_backend=backend)
+                self.assertFalse(ok)
+                self.assertIn(error, message)
+
+
+class TestShardedMooncakeStorageIO(CustomTestCase):
+    def _store(self, host_pool):
+        store = MooncakeStore.__new__(MooncakeStore)
+        if isinstance(host_pool, PageInterleaveHostPool):
+            store.kv_shard_host_pool = host_pool
+        return store
+
+    def test_pages_of_other_owners_report_success(self):
+        pool = _host_pool(1)
+        host = pool.alloc(8 * PS, start_owner=1)
+        self.assertEqual(_page_classes(host), [1, 2, 3, 0, 1, 2, 3, 0])
+        keys = list("abcdefgh")
+        calls = []
+
+        def io(owned_keys, rows):
+            calls.append((owned_keys, rows))
+            return [True, False]
+
+        results = self._store(pool)._on_owned_pages(keys, host, io)
+        self.assertEqual(results, [True] * 4 + [False] + [True] * 3)
+        ((owned_keys, rows),) = calls
+        self.assertEqual(owned_keys, ["a", "e"])
+        owned = pool.placement.local_mask(host, 1)
+        self.assertTrue(torch.equal(rows, pool.placement.local_index(host[owned])))
+
+    def test_sidecars_follow_the_anchor_owners(self):
+        pool = _host_pool(2)
+        host = pool.alloc(4 * PS, start_owner=0)
+        transfers = [
+            PoolTransfer(name=name, keys=list("abcd"), host_indices=host)
+            for name in (PoolName.KV, PoolName.INDEXER)
+        ]
+        seen = {}
+
+        def io(owned):
+            seen.update({t.name: t.keys for t in owned})
+            return {t.name: [False] for t in owned}
+
+        results = self._store(pool)._on_owned_transfers(transfers, io)
+        self.assertEqual(seen, {PoolName.KV: ["c"], PoolName.INDEXER: ["c"]})
+        self.assertEqual(
+            results,
+            {
+                name: [True, True, False, True]
+                for name in (PoolName.KV, PoolName.INDEXER)
+            },
+        )
+
+    def test_rank_without_owned_pages_issues_no_io(self):
+        pool = _host_pool(3)
+        host = pool.alloc(2 * PS, start_owner=0)
+        transfer = PoolTransfer(name=PoolName.KV, keys=["a", "b"], host_indices=host)
+        io = unittest.mock.Mock()
+        self.assertEqual(
+            self._store(pool)._on_owned_transfers([transfer], io),
+            {PoolName.KV: [True, True]},
+        )
+        io.assert_not_called()
+
+    def test_unsharded_pool_passes_through(self):
+        io = unittest.mock.Mock(return_value=[True])
+        store = self._store(SimpleNamespace())
+        self.assertEqual(store._on_owned_pages(["a"], torch.arange(PS), io), [True])
+        io.assert_called_once()
+
+
+class TestShardedStorageWriters(CustomTestCase):
+    def test_every_shard_rank_writes_its_pages(self):
+        controller = SimpleNamespace(storage_host_pool=_host_pool(0))
+        cases = ((4, 0, False), (4, 1, True), (1, 1, False))
+        for cp_size, tp_rank, skip in cases:
+            with self.subTest(cp_size=cp_size, tp_rank=tp_rank):
+                parallel = SimpleNamespace(attn_cp_size=cp_size, attn_tp_rank=tp_rank)
+                with unittest.mock.patch(
+                    "sglang.srt.managers.cache_controller.get_parallel",
+                    return_value=parallel,
+                ):
+                    self.assertEqual(
+                        HiCacheController.backup_skip.fget(controller), skip
+                    )
 
 
 class TestOwnerMatchedLoadBack(CustomTestCase):

@@ -45,8 +45,8 @@ def register_kv_shard_transfer_backend(name: str) -> None:
 
 
 # HiCache storage backends whose reads and writes cover only each shard rank's
-# own pages. None upstream.
-_KV_SHARD_STORAGE_BACKENDS: set = set()
+# own pages. Mooncake keys replicated (MLA) pages by no rank.
+_KV_SHARD_STORAGE_BACKENDS: set = {"mooncake"}
 
 
 def register_kv_shard_storage_backend(name: str) -> None:
@@ -56,6 +56,33 @@ def register_kv_shard_storage_backend(name: str) -> None:
 
 def kv_shard_storage_backend_supported(name: Optional[str]) -> bool:
     return name in _KV_SHARD_STORAGE_BACKENDS
+
+
+def kv_shard_storage_error(
+    storage_backend: str, host_memory_mode: str, *, is_mla: bool
+) -> Optional[str]:
+    """Why a HiCache storage backend cannot serve a KV-sharded pool, or None.
+    Checked at launch and again at runtime attach."""
+    if not kv_shard_storage_backend_supported(storage_backend):
+        return (
+            "--enable-kv-cache-sharding supports HiCache host offload but not "
+            f"--hicache-storage-backend {storage_backend!r}: the storage path "
+            "reads and writes whole pages per rank, not each rank's own stripe."
+        )
+    if host_memory_mode != "buffer_only":
+        # Only buffer mode draws a storage hit's host bounce in its chain's
+        # owner phase.
+        return (
+            "--enable-kv-cache-sharding with a HiCache storage backend requires "
+            "--hicache-host-memory-mode buffer_only."
+        )
+    if storage_backend == "mooncake" and not is_mla:
+        return (
+            "--enable-kv-cache-sharding with Mooncake HiCache storage supports "
+            "only MLA models: MHA keys name the TP rank, which spans the shard "
+            "axis."
+        )
+    return None
 
 
 def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> None:
@@ -209,21 +236,17 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "--enable-kv-cache-sharding and --cp-kv-layout cannot be combined: "
             "each sets the KV cache layout across the prefill CP ranks."
         )
-    if (
-        cfg.enable_hierarchical_cache
-        and cfg.hicache_storage_backend is not None
-        and not kv_shard_storage_backend_supported(cfg.hicache_storage_backend)
-    ):
-        raise ValueError(
-            "--enable-kv-cache-sharding supports HiCache host offload but not "
-            "--hicache-storage-backend yet: the storage path reads and writes "
-            "whole pages per rank, not each rank's own stripe."
+    if cfg.enable_hierarchical_cache and cfg.hicache_storage_backend is not None:
+        error = kv_shard_storage_error(
+            cfg.hicache_storage_backend,
+            cfg.hicache_host_memory_mode,
+            is_mla=use_mla_backend(server_args),
         )
+        if error is not None:
+            raise ValueError(error)
     if cfg.enable_hierarchical_cache and is_deepseek_dsa(
         model_config_of(server_args).hf_config
     ):
-        if cfg.hicache_host_memory_mode != "cache":
-            raise ValueError("CP-sharded DSA HiCache requires host memory mode cache")
         if cfg.hicache_io_backend != "kernel" or cfg.hicache_mem_layout not in (
             "layer_first",
             "page_first",
