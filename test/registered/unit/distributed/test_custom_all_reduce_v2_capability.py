@@ -140,6 +140,99 @@ def test_gfx1250_table_enables_hier_only_at_tp16():
 
 
 @pytest.mark.parametrize(
+    ("world_size", "nbytes", "expected"),
+    [
+        (2, 64 * _KB, "ONE_SHOT_PUSH"),
+        (2, 64 * _KB + 16, "TWO_SHOT_PUSH"),
+        (2, 8 * _MB, "TWO_SHOT_PUSH"),
+        (2, 8 * _MB + 16, "RING_SIMPLE"),
+        (4, 64 * _KB, "ONE_SHOT_PUSH"),
+        (4, 64 * _KB + 16, "TWO_SHOT_PUSH"),
+        (4, 16 * _MB, "TWO_SHOT_PUSH"),
+        (4, 16 * _MB + 16, "RING_SIMPLE"),
+        (8, 64 * _KB, "ONE_SHOT_PUSH"),
+        (8, 128 * _KB, "TWO_SHOT_PUSH"),
+        (8, 8 * _MB, "TWO_SHOT_PUSH"),
+        (8, 8 * _MB + 16, "RING_SIMPLE"),
+    ],
+)
+def test_gfx1250_table_picks_measured_best(world_size, nbytes, expected):
+    comm = _gfx1250_comm(world_size)
+    assert (
+        _choice_name(
+            custom_all_reduce_v2.choose_algo(comm.config, nbytes, can_use_graph=False)
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("world_size", "nbytes", "expected"),
+    [
+        (2, 2 * _MB, "ONE_SHOT_PUSH"),
+        (2, 2 * _MB + 16, "TWO_SHOT_PUSH"),
+        (2, 16 * _MB, "TWO_SHOT_PUSH"),
+        (2, 16 * _MB + 16, "RING_SIMPLE"),
+        (3, 64 * _KB + 16, "TWO_SHOT_PUSH"),
+        (3, 8 * _MB + 16, "RING_SIMPLE"),
+        (4, 2 * _MB, "ONE_SHOT_PUSH"),
+        (4, 2 * _MB + 16, "TWO_SHOT_PUSH"),
+        (4, 32 * _MB, "TWO_SHOT_PUSH"),
+        (4, 32 * _MB + 16, "RING_SIMPLE"),
+        (8, 768 * _KB, "ONE_SHOT_PUSH"),
+        (8, 768 * _KB + 16, "TWO_SHOT_PUSH"),
+        (8, 32 * _MB, "TWO_SHOT_PUSH"),
+        (8, 32 * _MB + 16, "RING_SIMPLE"),
+    ],
+)
+def test_gfx1250_dev_kernarg_table(world_size, nbytes, expected):
+    comm = _gfx1250_comm(world_size, dev_kernarg=True)
+    assert (
+        _choice_name(
+            custom_all_reduce_v2.choose_algo(comm.config, nbytes, can_use_graph=False)
+        )
+        == expected
+    )
+
+
+@pytest.mark.parametrize("dev_kernarg", [False, True])
+@pytest.mark.parametrize("world_size", range(2, 9))
+def test_gfx1250_table_has_no_rccl_gap(world_size, dev_kernarg):
+    """Every 16 B multiple up to 4 GB picks a carv2 algo."""
+    comm = _gfx1250_comm(world_size, dev_kernarg)
+    heuristic = comm.config.graph
+    edges = {
+        16,
+        heuristic.one_shot_push_threshold,
+        heuristic.two_shot_push_threshold,
+        heuristic.ring_simple.min_bytes,
+        heuristic.ring_simple.max_bytes,
+    }
+    for edge in edges:
+        for nbytes in (edge - 16, edge, edge + 16):
+            if 0 < nbytes <= 4 * 1024 * _MB:
+                assert (
+                    custom_all_reduce_v2.choose_algo(
+                        comm.config, nbytes, can_use_graph=False
+                    )
+                    is not None
+                ), nbytes
+
+
+def _gfx1250_comm(world_size, dev_kernarg=False):
+    from sglang.srt.distributed.device_communicators.configs import (
+        custom_all_reduce_v2 as cfg,
+    )
+
+    comm = object.__new__(custom_all_reduce_v2.CustomAllReduceV2)
+    comm.disabled = True
+    # config is a property; assigning it clears the eager-plan cache
+    comm._eager_plan_cache = {}
+    comm.config = cfg._rocm_gfx1250_configs.__wrapped__(96, dev_kernarg)[world_size]
+    return comm
+
+
+@pytest.mark.parametrize(
     ("max_size", "sizes_own_push", "hier_max", "two_shot"),
     [
         # a pair slot holds half a message and stays within max_size; 2shot_push
@@ -172,7 +265,9 @@ def test_hier_sizing(max_size, sizes_own_push, hier_max, two_shot):
 def _choice_name(choice):
     if choice is None:
         return None
-    return "HIER_2SHOT_PUSH" if choice.use_hier else choice.algo.name
+    if choice.use_hier:
+        return "HIER_2SHOT_PUSH"
+    return "RING_SIMPLE" if choice.use_ring else choice.algo.name
 
 
 @pytest.mark.parametrize(
@@ -182,7 +277,8 @@ def _choice_name(choice):
         (32 * _MB, "HIER_2SHOT_PUSH"),
         # above the clipped hier range, 2shot_push keeps its tuned sizes
         (48 * _MB, "TWO_SHOT_PUSH"),
-        (64 * _MB + 32, None),
+        # past the hier range at TP16, ring_simple takes over
+        (64 * _MB + 32, "RING_SIMPLE"),
     ],
 )
 def test_pick_config_hier_at_default_cap(nbytes, expected):
