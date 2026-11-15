@@ -149,6 +149,34 @@ class TestDcpExtendGatherBreak(unittest.TestCase):
         )
         self.assertTrue(torch.all(capture_batch.attn_dcp_metadata.dcp_kv_buffer == 0.0))
 
+    def test_gather_skips_missing_metadata_or_buffer(self):
+        from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
+            bcg_dcp_extend_kv_gather,
+        )
+
+        k_nope = torch.ones((8, 1, KV_LORA_RANK))
+        k_pe = torch.full((8, 1, ROPE_DIM), 2.0)
+        no_buf = _metadata(5)
+        no_buf.dcp_kv_buffer = None
+
+        for name, metadata in (("none_metadata", None), ("none_kv_buffer", no_buf)):
+            for in_graph_scope in (True, False):
+                with self.subTest(case=name, in_graph_scope=in_graph_scope):
+                    batch = _batch(5, [0])
+                    batch.attn_dcp_metadata = metadata
+                    if in_graph_scope:
+                        with (
+                            set_forward_batch(batch),
+                            prefill_graph_scope(full_graph=False),
+                        ):
+                            bcg_dcp_extend_kv_gather(
+                                None, None, batch, KV_LORA_RANK, k_nope, k_pe
+                            )
+                    else:
+                        bcg_dcp_extend_kv_gather(
+                            None, None, batch, KV_LORA_RANK, k_nope, k_pe
+                        )
+
 
 if __name__ == "__main__":
     unittest.main()
