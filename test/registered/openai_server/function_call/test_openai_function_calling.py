@@ -906,6 +906,35 @@ class TestOpenAIPythonicFunctionCalling(CustomTestCase):
             f"Function name '{names}' should container either 'get_weather' or 'get_tourist_attractions'",
         )
 
+    def test_pythonic_forced_tool_choice(self):
+        """A forced tool choice returns the constrained JSON as tool calls."""
+        client = openai.Client(api_key=self.api_key, base_url=self.base_url)
+        for tool_choice, allowed_names in (
+            (
+                {"type": "function", "function": {"name": "get_tourist_attractions"}},
+                {"get_tourist_attractions"},
+            ),
+            ("required", {"get_weather", "get_tourist_attractions"}),
+        ):
+            response = client.chat.completions.create(
+                model=self.model,
+                messages=self.PYTHONIC_MESSAGES,
+                tools=self.PYTHONIC_TOOLS,
+                tool_choice=tool_choice,
+                temperature=0.1,
+                max_tokens=2048,
+                stream=False,
+            )
+            choice = response.choices[0]
+            self.assertTrue(
+                choice.message.tool_calls, f"No tool_calls: {choice.message.content!r}"
+            )
+            self.assertFalse(choice.message.content)
+            self.assertEqual(choice.finish_reason, "tool_calls")
+            for tool_call in choice.message.tool_calls:
+                self.assertIn(tool_call.function.name, allowed_names)
+                json.loads(tool_call.function.arguments)
+
     def test_pythonic_tool_call_streaming(self):
         """
         Test: Streaming pythonic tool call format; assert tool_call index is present.
