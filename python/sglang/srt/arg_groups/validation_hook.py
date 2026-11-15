@@ -125,7 +125,6 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     # The Rust media fetcher caps a download at this field's default, 64 MiB.
     "media_url_max_file_size_mb",
     "enable_trace",
-    "warmups",
     "completion_template",
     "hf_chat_template_name",
     "enable_custom_logit_processor",
@@ -134,11 +133,7 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     "lora_paths",
     "tokenizer_mode",
     "tokenizer_backend",
-    # Python warns on long GCs only when this is positive.
-    "gc_warning_threshold_secs",
     "tokenizer_metrics_allowed_custom_labels",
-    # The Rust listener speaks HTTP/1 only.
-    "enable_http2",
     # The Rust multimodal pipelines keep no preprocessing-artifact cache, and
     # Python's changes the pad values of the items it serves. A model package
     # whose Rust server caches honors it (`rust_server_unsupported_args`).
@@ -162,7 +157,6 @@ def rust_server_unsupported_args(
 
     An argument counts as set when it differs from its default; where the
     default is off (``None``, ``False`` or empty), any falsy value is off too.
-    A threshold Python disables when not positive is set only when positive.
     """
     cfg = resolving_view(server_args)
     defaults = {
@@ -173,9 +167,7 @@ def rust_server_unsupported_args(
         if name in honored:
             continue
         value, default = getattr(cfg, name), defaults[name]
-        if name == "gc_warning_threshold_secs":
-            is_set = value > 0
-        elif default is None or default is False or default == []:
+        if default is None or default is False or default == []:
             is_set = bool(value)
         else:
             is_set = value != default
@@ -264,11 +256,22 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
                 "SGLANG_ENABLE_PP_SPEC is not compatible with attention DP "
                 "(--attn-dp-size)"
             )
+            assert not cfg.enable_return_routed_experts, (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with "
+                "--enable-return-routed-experts"
+            )
         else:
             assert cfg.disaggregation_mode == "prefill", (
                 "PP + speculative decoding (MTP) is only supported on prefill nodes "
                 "(disaggregation-mode=prefill)"
             )
+    # Stage 0 relays its received requests to the next stage every
+    # iteration, but later stages only receive on the iterations the recv
+    # skipper lets through, so the stages fall out of step.
+    assert cfg.scheduler_recv_interval <= 1, (
+        "--scheduler-recv-interval > 1 is not supported with pipeline "
+        "parallelism; use --scheduler-recv-interval 1"
+    )
     assert cfg.min_free_slots_delay is None, (
         "--min-free-slots-delay is not supported with pipeline "
         "parallelism: allocatable slots per microbatch are bounded by "
@@ -693,10 +696,23 @@ def validate_experimental_sgl_marlin(server_args: Any):
     validate_experimental_sgl_marlin_server_args(server_args, view)
 
 
+# Multimodal architectures whose processor, encoder and decoder run on MPS.
+_MPS_MULTIMODAL_ARCHITECTURES = frozenset({"UnlimitedOCRV2ForCausalLM"})
+# Model-specific attention backends with an MPS implementation, by architecture.
+_MPS_MODEL_ATTENTION_BACKENDS = {"unlimited_ocr_v2": "UnlimitedOCRV2ForCausalLM"}
+
+
+def _model_architectures(model_config: Any) -> tuple:
+    return tuple(model_config.hf_config.architectures or ())
+
+
 def validate_mps_model_config(
     model_config: Any,
     *,
     lora_enabled: bool = False,
+    attention_backend: Optional[str] = None,
+    prefill_attention_backend: Optional[str] = None,
+    decode_attention_backend: Optional[str] = None,
 ) -> None:
     """Validate checkpoint-derived MPS constraints."""
     quantization = getattr(model_config, "quantization", None)
@@ -706,7 +722,21 @@ def validate_mps_model_config(
             "the resolved model configuration detected "
             f"quantization={quantization!r}"
         )
-    if bool(getattr(model_config, "is_multimodal", False)):
+    for backend in (
+        attention_backend,
+        prefill_attention_backend,
+        decode_attention_backend,
+    ):
+        if backend in _MPS_MODEL_ATTENTION_BACKENDS:
+            required = _MPS_MODEL_ATTENTION_BACKENDS[backend]
+            if required not in _model_architectures(model_config):
+                raise ValueError(
+                    f"The {backend} attention backend on Torch MPS serves "
+                    f"only {required}"
+                )
+    if bool(getattr(model_config, "is_multimodal", False)) and not (
+        _MPS_MULTIMODAL_ARCHITECTURES.intersection(_model_architectures(model_config))
+    ):
         raise ValueError(
             "Torch MPS multimodal serving does not yet have a model-specific "
             "end-to-end contract; use a text-only model until its encoder, "
@@ -736,7 +766,13 @@ def validate_standard_mps_server_args(server_args: Any):
     """Validate execution modes supported by the Torch MPS path."""
 
     cfg = resolving_view(server_args)
-    supported_attention_backends = {None, "torch_native"}
+    # Model-specific backends are checked against the architecture in
+    # validate_mps_model_config.
+    supported_attention_backends = {
+        None,
+        "torch_native",
+        *_MPS_MODEL_ATTENTION_BACKENDS,
+    }
     for field in (
         "attention_backend",
         "prefill_attention_backend",

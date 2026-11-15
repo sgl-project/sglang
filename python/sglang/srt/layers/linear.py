@@ -245,6 +245,11 @@ class LinearBase(torch.nn.Module):
     # Module value under self._modules, which this default then shadows on read.
     # VocabParallelEmbedding and FusedMoE carry the same default.
     scheme = None
+    # Set on a layer whose input producer hands it an already-quantized NVFP4
+    # (fp4, swizzled block scale) tuple instead of an activation; the quant
+    # method then skips its own input quantization. An explicit opt-in, so a
+    # stray tuple cannot silently bypass quantization.
+    _accepts_prequantized_fp4: bool = False
     tp_group: GroupCoordinator | _LogicalGroup | _ReplicatedGroup | None = None
 
     def __init__(

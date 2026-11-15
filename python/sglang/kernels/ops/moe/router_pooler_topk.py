@@ -425,14 +425,19 @@ def _joint_finish(
 # writing the same ``[SK, M, 4608]`` partials. Tuned on MI355X (bench_joint_fp8.py).
 FP8_JOINT = {
     32: (64, 256, 4, 8, 3),
-    64: (64, 128, 4, 8, 3),
-    128: (64, 128, 4, 8, 2),
+    64: (32, 128, 4, 4, 2),
+    128: (64, 128, 4, 8, 3),
+    256: (64, 128, 4, 8, 3),
+    512: (128, 128, 4, 8, 2),
 }
-# Measured 10-23 (bench_joint_fp8.py): 21-22 us at 24-32 rows vs 26.9 for the aiter BF16 launch; at 33-128 rows
-# the BF16 row-major joint (17.6 us at 64 rows) beats this tiling (72 + 8 router tiles x 4 splits = 288 programs,
-# a 32-program tail wave), so the FP8 form stops at 32 rows until the router tiles are balanced into the grid.
+# Measured 10-23 (bench_joint_fp8.py): 21-22 us at 24-32 rows vs 26.9 for the aiter BF16 launch. MI355X, whole
+# front (GEMM + epilogue) in CUDA graphs, vs the BF16 row-major joint: 28.3 -> 25.4 us at 40 rows, 30.0 -> 27.3 at
+# 64, 35.7 -> 30.1 at 72, 41.6 -> 34.9 at 128; vs the unfused router GEMM + routing + BF16 pooler + norm above 128
+# rows: 79.1 -> 38.2 us at 136, 89.2 -> 46.7 at 256, 106.0 -> 54.1 at 384, 131.5 -> 71.5 at 512.
 FP8_JOINT_MIN_M = 17
-FP8_JOINT_MAX_M = 32
+FP8_JOINT_MAX_M = 512
+# Largest row tile of the FP8 joint partials; more rows take more tiles along the grid's third axis.
+FP8_JOINT_MAX_TILE_M = 128
 
 
 @triton.jit
@@ -452,8 +457,8 @@ def _joint_fp8_partial(
     N: tl.constexpr = 4608
     K: tl.constexpr = 8192
     KT_PER: tl.constexpr = K // BK // SK
-    pn, pk = tl.program_id(0), tl.program_id(1)
-    m = tl.arange(0, BM)
+    pn, pk, pm = tl.program_id(0), tl.program_id(1), tl.program_id(2)
+    m = pm * BM + tl.arange(0, BM)
     kk = pk * KT_PER * BK + tl.arange(0, BK)
     nn = tl.arange(0, BN)
     acc = tl.zeros((BM, BN), tl.float32)
@@ -513,15 +518,16 @@ def joint_router_pooler_topk_fp8(
     assert k == 8192 and packed.shape == (4608, 8192) and xq.shape == x.shape
     wq, ws = pooler_fp8
     bn, bk, sk, warps, stages = FP8_JOINT[_bm(m)]
+    tile_m = min(_bm(m), FP8_JOINT_MAX_TILE_M)
     partial = torch.empty((sk, m, 4608), device=x.device, dtype=torch.float32)
-    _joint_fp8_partial[(4608 // bn, sk)](
+    _joint_fp8_partial[(4608 // bn, sk, triton.cdiv(m, tile_m))](
         xq,
         x,
         wq,
         packed[4096:],
         partial,
         m,
-        _bm(m),
+        tile_m,
         bn,
         bk,
         sk,
