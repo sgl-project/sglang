@@ -598,12 +598,9 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "pipeline parallelism (whole-envelope transfer has no per-layer "
             "entries to subset)."
         )
-        assert not (
-            cfg.disaggregation_transfer_backend == "mooncake"
-            and cfg.speculative_algorithm is not None
-        ), (
+        assert cfg.speculative_algorithm is None, (
             "--enable-unified-memory with PD disaggregation does not support "
-            "speculative decoding with the Mooncake transfer backend."
+            "speculative decoding."
         )
         # This flag also selects decode's non-blocking metadata readback, which
         # records a receive as in flight before its destination is published.

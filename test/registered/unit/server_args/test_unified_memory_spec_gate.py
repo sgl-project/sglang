@@ -193,5 +193,18 @@ class TestUnifiedMemorySpecGate(CustomTestCase):
         )
 
 
+class TestUnifiedMemoryPDBackends(CustomTestCase):
+    def test_nixl_and_mooncake_keep_the_same_pd_restrictions(self):
+        for backend in ("nixl", "mooncake"):
+            fields = dict(
+                disaggregation_mode="prefill", disaggregation_transfer_backend=backend
+            )
+            with self.subTest(backend=backend):
+                self.assertTrue(_accepts(None, **fields))
+                self.assertFalse(_accepts("EAGLE", **fields))
+                self.assertFalse(_accepts(None, pp_size=2, **fields))
+                self.assertFalse(_accepts(None, dcp_size=2, **fields))
+
+
 if __name__ == "__main__":
     unittest.main()
