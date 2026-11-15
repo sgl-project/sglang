@@ -41,6 +41,7 @@ struct EngineState {
     cancelled: bool,
     claims: BTreeMap<String, Value>,
     pin_missing: bool,
+    page_size: Option<u64>,
     epoch: String,
     fail_residency: bool,
     fail_capabilities: bool,
@@ -104,6 +105,9 @@ async fn capabilities(State(state): State<Arc<Mutex<EngineState>>>) -> Json<Valu
     if s.feedback && !s.hide_feedback {
         reply["data"]["feedback"] = json!({"query":"events","version":"1.0","source_id":"control:mock","source_epoch":s.feedback_epoch,
             "recovery":"query_known_scopes","cache_watermark":cache_watermark(&s)});
+    }
+    if let Some(page_size) = s.page_size {
+        reply["data"]["public_protocol"]["prefix"]["page_size"] = json!(page_size);
     }
     Json(reply)
 }
@@ -889,6 +893,54 @@ async fn request_prefetch_uses_the_selected_worker_without_waiting_for_control()
             }
         }).await.expect("completed request-triggered hint must release its intent slot");
     }
+}
+
+#[tokio::test]
+async fn long_input_keeps_an_executable_control_prefix() {
+    let engine = Engine::start().await;
+    // A page size that does not divide the scope limit exercises alignment.
+    engine.state.lock().unwrap().page_size = Some(96);
+    let router = router(&[&engine], false, true).await;
+    let ids: Vec<_> = (0..70_000).collect();
+    let response = reqwest::Client::new()
+        .post(format!("{}/generate", router.url))
+        .header("x-kv-control-authorization", "Bearer test-control")
+        .json(&json!({"input_ids":ids,"kv_context":{
+            "session_id":"long","incarnation":"task-1","branch_id":"main",
+            "revision":1,"branch_revision":1,"request_id":"r","request_incarnation":"one"
+        }}))
+        .send()
+        .await
+        .unwrap();
+    assert!(response.status().is_success());
+    let target = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Some(target) = {
+                let state = engine.state.lock().unwrap();
+                assert_eq!(state.inference[0]["input_ids"], json!(ids));
+                assert!(state.inference[0].get("kv_context").is_none());
+                state
+                    .commands
+                    .iter()
+                    .find(|c| c["kind"] == "submit")
+                    .map(|c| {
+                        assert_eq!(
+                            c["envelope"]["actions"][0]["action_type"],
+                            "sglang.prefetch"
+                        );
+                        c["envelope"]["actions"][0]["payload"]["target"].clone()
+                    })
+            } {
+                break target;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("bounded prefix should still be submitted");
+    let end = 65_536 / 96 * 96;
+    assert_eq!(target["end_token"], end);
+    assert_eq!(target["token_ids"], json!(ids[..end]));
 }
 
 #[tokio::test]

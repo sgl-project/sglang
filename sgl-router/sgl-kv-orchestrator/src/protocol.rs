@@ -12,6 +12,7 @@ pub const PROTOCOL_VERSION: &str = "0.1";
 pub const ACTION_VERSION: &str = "1.0";
 pub const HASH_SCHEME: &str = "sglang.sha256.u32le.i64.v1";
 pub const MAX_INTEGER: u64 = (1 << 53) - 1;
+pub(crate) const MAX_SCOPE_TOKENS: usize = 65_536;
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Envelope {

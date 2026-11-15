@@ -3,7 +3,7 @@
 //! remain logically known after material eviction while execution reports gaps.
 use crate::{
     models::{PrefixTarget, SessionIdentity},
-    protocol::MAX_INTEGER,
+    protocol::{MAX_INTEGER, MAX_SCOPE_TOKENS},
     session_index::{
         BranchRevision, ContentKey, ContentNode, RequestIdentity, SessionIndex, SnapshotId,
     },
@@ -230,10 +230,10 @@ impl SessionIndex {
                 end_token: scope.end_token,
             });
         }
-        if scope.end_token > 65_536 {
+        if scope.end_token > MAX_SCOPE_TOKENS as u64 {
             gaps.push(MaterializationGap::ProtocolTokenLimit {
                 end_token: scope.end_token,
-                max_tokens: 65_536,
+                max_tokens: MAX_SCOPE_TOKENS as u64,
             });
         }
         let mut node = Some(scope.content.as_ref());

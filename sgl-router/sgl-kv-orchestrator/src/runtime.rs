@@ -6,7 +6,7 @@ use super::{
 use crate::{
     models::{PrefixTarget, SessionIdentity},
     operations::{DemandBook, DemandId},
-    protocol::{parse_action, Action},
+    protocol::{parse_action, Action, MAX_SCOPE_TOKENS},
     session_index::{
         Association, AssociationProvenance, ContentKey, ContentRegistration, RequestIdentity,
         ResourceKind, SessionIndex,
@@ -171,7 +171,9 @@ impl Runtime {
         permit.send(Message::Routed {
             context: context.clone(),
             worker: worker.into(),
-            tokens: tokens.filter(|t| t.len() <= 65_536).map(<[u32]>::to_vec),
+            // Inference keeps the full input. Only the reusable control prefix
+            // needs to fit the Engine's scope limit.
+            tokens: tokens.map(|t| t[..t.len().min(MAX_SCOPE_TOKENS)].to_vec()),
             salt: salt.map(str::to_string),
             observed_at: Instant::now(),
             prefetch_end,
@@ -266,7 +268,7 @@ fn validate_input(value: &Value) -> Result<(), String> {
     .filter(|v| !v.is_null())
     {
         let tokens = tokens.as_array().ok_or("tokens must be a flat array")?;
-        if tokens.len() > 65_536
+        if tokens.len() > MAX_SCOPE_TOKENS
             || tokens
                 .iter()
                 .any(|token| token.as_u64().is_none_or(|n| n > u32::MAX as u64))
@@ -1214,7 +1216,7 @@ impl Actor {
                     "request_observed" => {
                         let tokens: Vec<u32> = serde_json::from_value(value["input_ids"].clone())
                             .map_err(|e| e.to_string())?;
-                        if tokens.len() > 65_536 {
+                        if tokens.len() > MAX_SCOPE_TOKENS {
                             return Err("token capacity".into());
                         }
                         let context = KvContext {
