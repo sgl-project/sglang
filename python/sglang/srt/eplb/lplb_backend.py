@@ -1,7 +1,8 @@
 """Platform dispatch for the LPLB kernel backends.
 
 CUDA uses the fused JIT kernels in :mod:`sglang.kernels.ops.lplb.cuda_solver`
-(Hopper+); Ascend NPU uses the Triton-Ascend ports under
+(Hopper+); Ascend NPU uses the registered Triton-Ascend operators in
+``sgl_kernel_npu.operators.moe.lplb``, adapted by
 :mod:`sglang.srt.hardware_backend.npu.lplb.npu_solver`.  Both backends expose
 the same ``prep_lp_inputs`` / ``solve_ipm`` / ``extract_log2phy_prob`` /
 ``dispatch_probability`` surface, so callers select one here and stay free of

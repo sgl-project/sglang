@@ -195,8 +195,7 @@ class LPLBSolver:
         # Pre-allocate the buffers the fused prep / IPM / post kernels write
         # into. All writes are contiguous full-tensor stores (no strided
         # ``out=`` semantics), so the reuse is safe under high concurrency.
-        # ``_x`` is reused by the CUDA backend; the NPU IPM kernel allocates its
-        # own output, so ``_solve`` always uses the returned tensor.
+        # Both backends write ``_x`` through the ``result`` argument.
         self._A_full = torch.empty(nc, nv, dtype=torch.float32, device=device)
         self._A_full[:, : nv - 1].copy_(self.A_base)
         self._b = torch.empty(nc, dtype=torch.float32, device=device)
@@ -259,8 +258,8 @@ class LPLBSolver:
 
         Pipeline: prep_lp_inputs → solve_ipm → extract_log2phy_prob.
         The kernels are selected per platform (CUDA JIT or Ascend NPU Triton).
-        The prep/post kernels write into pre-allocated buffers; the NPU IPM
-        kernel allocates and returns its own output.
+        The prep/post kernels write into pre-allocated buffers; the IPM kernel
+        writes the pre-allocated ``_x`` and returns it.
         Raises if no backend is available.
         """
         from sglang.srt.eplb.lplb_backend import get_lplb_backend
@@ -276,9 +275,8 @@ class LPLBSolver:
             self.B1,
             self._A_base_row_sum,
         )
-        # The NPU kernel allocates its own output and ignores ``result``, so use
-        # the returned tensor instead of assuming the pre-allocated buffer was
-        # written (CUDA still reuses ``self._x``).
+        # Both backends write into the pre-allocated ``self._x``; use the
+        # returned tensor so the call site stays backend-agnostic.
         x = backend.solve_ipm(self._A_full, self._b, self.c_vec, result=self._x)
         backend.extract_log2phy_prob(
             self._log2phy_prob,
