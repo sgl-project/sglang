@@ -52,6 +52,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     SidecarPoolSpec,
 )
 from sglang.srt.mem_cache.pool_host.base import HostKVCache
+from sglang.srt.mem_cache.pool_host.page_interleave import PageInterleaveHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage_prefetch import (
     StagedPrefetchPlan,
@@ -1105,11 +1106,18 @@ class BufferModePipeline:
         # One ack id per write: a node may have several pools in flight.
         self._backup_ack_seq += 1
         ack_id = -(1 << 40) - self._backup_ack_seq
+        shard_kwargs = {}
+        if self._kv_shard_host_pool() is not None:
+            # Logical-page KV sharding: staging slots take the node's page owners.
+            shard_kwargs["start_owner"] = cache.tree_core.rotation_phase_of(
+                snapshot.node_id
+            )
         host_indices = cc.write(
             device_value,
             node_id=ack_id,
             extra_pools=transfers or None,
             flush=False,
+            **shard_kwargs,
         )
         if host_indices is None:
             self._backup_ack_seq -= 1
@@ -1321,7 +1329,40 @@ class BufferModePipeline:
             allow_partial=False,
             min_tokens=cache.prefetch_threshold,
             evict_host=cache.evict_host,
+            start_owner=self._prefetch_start_owner(operation.handle),
         )
+
+    def _kv_shard_host_pool(self) -> Optional[PageInterleaveHostPool]:
+        host_pool = self._cache.cache_controller.mem_pool_host.anchor_entry.host_pool
+        return host_pool if isinstance(host_pool, PageInterleaveHostPool) else None
+
+    def _prefetch_start_owner(self, request: CacheRequestHandle) -> Optional[int]:
+        """Logical-page KV sharding: the owner class of the bounce's first page.
+        It continues the owner rotation of the device prefix the fetch extends
+        (UnifiedTreeNode.rotation_base); a new chain starts on the least-full
+        host class."""
+        host_pool = self._kv_shard_host_pool()
+        if host_pool is None:
+            return None
+        tree_core = self._cache.tree_core
+        prefix_tokens = self._prefetch_prefix_ctx[request][0]
+        matched_len, node_id, _ = tree_core.match_full_device_prefix(
+            self.prefetch_prefix_key(request)
+        )
+        base = tree_core.rotation_base_of(node_id) if matched_len else None
+        if base is None:
+            base = host_pool.least_full_class()
+        return base + len(prefix_tokens) // self._cache.page_size
+
+    def _staged_rotation_base(self, f: _StagedPrefetch) -> Optional[int]:
+        """Logical-page KV sharding: the chain rotation base the staged slots'
+        owners imply for the fetched span."""
+        host_pool = self._kv_shard_host_pool()
+        if host_pool is None or f.host_indices is None or not len(f.host_indices):
+            return None
+        first_owner = int(host_pool.placement.owner_of(f.host_indices[:1]))
+        first_page = f.matched_len // self._cache.page_size
+        return (first_owner - first_page) % host_pool.shard_size
 
     def _defer_prefetch_for_host_capacity(
         self, request: CacheRequestHandle, tokens: int
@@ -1539,6 +1580,23 @@ class BufferModePipeline:
                 req.rid,
                 joint_len,
                 head_end,
+            )
+            self._refetch_staged(f)
+            return False
+        rotation_base = self._staged_rotation_base(f)
+        if (
+            rotation_base is not None
+            and matched_len > 0
+            and self._cache.tree_core.rotation_base_of(node_id) != rotation_base
+        ):
+            # Logical-page KV sharding: the device prefix is now a chain whose
+            # page owners the staged slots do not continue.
+            logger.warning(
+                "HiCache staged prefetch deferred req=%s reason=rotation "
+                "matched=%d tokens=%d",
+                req.rid,
+                matched_len,
+                f.num_tokens,
             )
             self._refetch_staged(f)
             return False
@@ -1923,8 +1981,13 @@ class BufferModePipeline:
             component.restore_buffer_mapping(torch.cat(full_parts), window_dev)
         cache.name_loaded_window_rows_by_owner(state.load_transfers)
 
+        shard_kwargs = {}
+        rotation_base = self._staged_rotation_base(f)
+        if rotation_base is not None:
+            # Logical-page KV sharding: the loaded prefix keeps its slots' owners.
+            shard_kwargs["rotation_base"] = rotation_base
         insert_result = self._insert_loaded_prefix(
-            state, req, plan, prefix_indices=prefix_indices
+            state, req, plan, prefix_indices=prefix_indices, **shard_kwargs
         )
         self.ongoing_buffer_load_back[load_back_id] = state
         match = cache.match_prefix(MatchPrefixParams(key=key))
@@ -2047,6 +2110,7 @@ class BufferModePipeline:
         plan: StagedPrefetchPlan,
         *,
         prefix_indices: torch.Tensor,
+        rotation_base: Optional[int] = None,
     ) -> InsertResult:
         # Publish via a plain insert under the admission lock choreography;
         # the caller's request lock then pins the span (load_back pattern).
@@ -2063,6 +2127,7 @@ class BufferModePipeline:
                 component_evicted_seqlens={
                     ct: window.start for ct, window in plan.windows.items()
                 },
+                rotation_base=rotation_base,
                 **insert_fields,
             )
         )

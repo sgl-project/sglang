@@ -134,8 +134,6 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     "tokenizer_mode",
     "tokenizer_backend",
     "tokenizer_metrics_allowed_custom_labels",
-    # The Rust listener speaks HTTP/1 only.
-    "enable_http2",
     # The Rust multimodal pipelines keep no preprocessing-artifact cache, and
     # Python's changes the pad values of the items it serves. A model package
     # whose Rust server caches honors it (`rust_server_unsupported_args`).
