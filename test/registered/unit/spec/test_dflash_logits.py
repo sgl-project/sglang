@@ -82,6 +82,7 @@ def test_selector_prediction_rows_follow_shift_label(path, shift_label, position
             _selector_sampling_enabled=False,
             _selector_sample=None,
             _acceptance_estimator=None,
+            _fused_select=None,
         )
         tokens = worker_mod.DFlashWorkerV2._propose_selector_block(
             worker,
@@ -448,6 +449,7 @@ def test_worker_folds_a_gate_admitted_quantized_selector_head(monkeypatch):
         _selector_sampling_enabled=True,
         _acceptance_estimator=None,
         _runtime=None,
+        _fused_select=None,
         _target_worker=SimpleNamespace(
             model_runner=SimpleNamespace(model=SimpleNamespace(lm_head=quant_head))
         ),
@@ -512,6 +514,7 @@ def test_disabled_selector_sampling_forces_greedy_draft():
         selector=selector,
         block_size=2,
         _selector_sampling_enabled=False,
+        _fused_select=None,
         _selector_sample=None,
         _acceptance_estimator=None,
     )
