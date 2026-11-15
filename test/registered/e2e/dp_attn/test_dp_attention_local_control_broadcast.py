@@ -20,12 +20,12 @@ from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.pause_generation_kit import PauseResumeInPlaceMixin
 from sglang.test.test_utils import (
-    ADMIN_API_KEY_FOR_TEST,
-    ADMIN_HEADERS_FOR_TEST,
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_MODEL_NAME_FOR_TEST_MLA,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    admin_post,
     popen_launch_server,
 )
 
@@ -54,8 +54,7 @@ class TestDPAttentionLocalControlBroadcast(PauseResumeInPlaceMixin, CustomTestCa
                 "--attn-dp-size",
                 "2",
                 "--enable-dp-attention-local-control-broadcast",
-                "--admin-api-key",
-                ADMIN_API_KEY_FOR_TEST,
+                *ADMIN_LAUNCH_ARGS_FOR_TEST,
             ],
         )
 
@@ -82,10 +81,9 @@ class TestDPAttentionLocalControlBroadcast(PauseResumeInPlaceMixin, CustomTestCa
         return [o["output_ids"] for o in outputs]
 
     def _post_control(self, route: str, payload: dict):
-        requests.post(
+        admin_post(
             f"{self.base_url}/{route}",
             json=payload,
-            headers=ADMIN_HEADERS_FOR_TEST,
             timeout=60,
         ).raise_for_status()
 
