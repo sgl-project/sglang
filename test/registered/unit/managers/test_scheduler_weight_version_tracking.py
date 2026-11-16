@@ -587,6 +587,24 @@ class TestTensorUpdatePartiallyApplied(_WeightUpdaterManagerTestBase):
         self.assertEqual(self.recorded, [])
         self.assertEqual(len(flushes), 1)
 
+    def test_rejection_here_still_flushes_when_another_rank_applied(self):
+        manager, flushes = self._manager_with_flush_log(_runner((False, "refuses")))
+        manager.tp_cpu_group = object()
+
+        def another_rank_applied(flags, **kwargs):
+            flags[1] = 1
+
+        with (
+            patch("torch.distributed.get_world_size", return_value=2),
+            patch("torch.distributed.all_reduce", side_effect=another_rank_applied),
+        ):
+            output = manager.update_weights_from_tensor(_request())
+
+        self.assertFalse(output.success)
+        self.assertIn("refuses", output.message)
+        self.assertEqual(self.recorded, [])
+        self.assertEqual(len(flushes), 1)
+
 
 class TestPluginWeightUpdate(_WeightUpdaterManagerTestBase):
     def setUp(self):
