@@ -53,6 +53,48 @@ _MIN_GROUP_WAVES = 3
 # groups are not measured
 _AUTO_PLAIN_MIN_BYTES = {3: 48 << 20, 4: 128 << 20}
 
+# What an expired in-kernel peer wait leaves in the transport's timeout word:
+# the code of its site. The plain exchange's spin_wait stores TIMEOUT_EXCHANGE
+# without the peer it waited for (kSpinWaitTimeout in ipc_a2a.cuh).
+TIMEOUT_EXCHANGE = 400
+_TIMEOUT_SITES = (
+    # (code, the path, its switch)
+    (TIMEOUT_EXCHANGE, "copy-engine all-to-all", "SGLANG_DIFFUSION_IPC_A2A_MULTI=0"),
+)
+
+
+class IpcPeerTimeoutError(RuntimeError):
+    """An in-kernel peer wait of the copy-engine transport expired: the request
+    computed on incomplete data, and what the peers hold is unknown, so the
+    server must be restarted (the HTTP server turns unhealthy with this)."""
+
+
+def describe_peer_timeouts(codes: list[int], ranks: list[int], budget_s: float) -> str:
+    """The error for timeout words ``codes`` of the group members with global
+    ranks ``ranks`` (0: that member's waits all completed)."""
+    waits: dict[tuple[str, str], list[int]] = {}
+    switches = []
+    for rank, code in zip(ranks, codes):
+        if code == 0:
+            continue
+        base, path, switch = max(site for site in _TIMEOUT_SITES if site[0] <= code)
+        peer = "a peer" if base == TIMEOUT_EXCHANGE else f"rank {ranks[code - base]}"
+        waits.setdefault((path, peer), []).append(rank)
+        if switch not in switches:
+            switches.append(switch)
+    listed = "; ".join(
+        f"rank{'s' if len(who) > 1 else ''} {', '.join(map(str, who))} waited for "
+        f"{peer} in the {path}"
+        for (path, peer), who in waits.items()
+    )
+    return (
+        f"Ulysses IPC peer wait timed out after {budget_s:g} s: {listed}. The request "
+        "ran on incomplete data and was failed; the transport state is unknown, so "
+        "restart the server's process group. Raise SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS "
+        "if a rank can legitimately stall that long, or turn the path off with "
+        f"{' '.join(switches)}."
+    )
+
 
 @functools.lru_cache(maxsize=None)
 def _sm_count(device: int) -> int:
@@ -1068,27 +1110,28 @@ class IpcA2AMultiState:
         return buffers[r][slot]
 
     def check_timeout(self) -> None:
-        """Retire the transport on every rank if any rank's spin expired.
+        """Fail the request on every rank if any rank's in-kernel peer wait
+        expired; a group collective, run after each denoising stage (before
+        anything decodes or saves its output).
 
-        A spin only flags the peer it waited on, so agree across the whole group
-        at the request boundary: a rank that retired alone would post an NCCL
-        all-to-all that its IPC peers never join. Expiry means a peer went
-        silent for the whole budget and that exchange returned incomplete data,
-        so this raises instead of serving the result.
+        A rank that retired alone would post an NCCL all-to-all that its IPC
+        peers never join, so agree across the whole group. Expiry means a peer
+        went silent for the whole budget, so the stage computed on incomplete
+        data. The transport is retired and IpcPeerTimeoutError marks the server
+        unusable.
         """
         if self.failed or not self.inited:
             return
-        expired = self.timed_out.clone()
-        dist.all_reduce(expired, op=dist.ReduceOp.MAX, group=self.group)
-        if expired.item() == 0:
+        codes = torch.empty(self.world, dtype=torch.int32, device="cuda")
+        dist.all_gather_into_tensor(codes, self.timed_out, group=self.group)
+        codes = codes.tolist()
+        if not any(codes):
             return
         self.failed = True
-        raise RuntimeError(
-            "IPC all-to-all gave up waiting for a peer after "
-            f"{envs.SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS:g} ms, so that exchange "
-            "returned incomplete data. The transport is now disabled on every "
-            "rank; retry the request over NCCL, or set "
-            "SGLANG_DIFFUSION_IPC_A2A_MULTI=0."
+        raise IpcPeerTimeoutError(
+            describe_peer_timeouts(
+                codes, dist.get_process_group_ranks(self.group), self.budget_ns / 1e9
+            )
         )
 
 

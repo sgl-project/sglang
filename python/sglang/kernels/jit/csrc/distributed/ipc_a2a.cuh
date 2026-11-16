@@ -9,6 +9,10 @@
 
 namespace sglang::ipc_a2a {
 
+// what an expired spin_wait leaves in the timeout words (peer not recorded);
+// the other waits store a site code plus the peer (ipc_a2a_multi.py)
+constexpr int kSpinWaitTimeout = 400;
+
 __device__ __forceinline__ unsigned long long now_ns() {
   unsigned long long t;
   asm volatile("mov.u64 %0, %%globaltimer;" : "=l"(t));
@@ -22,8 +26,8 @@ __global__ void spin_wait_kernel(
   while (*flag < t) {
     if (now_ns() - start > budget_ns) {
       // both ranks must retire the transport at the same request boundary
-      *timed_out = 1;
-      *peer_timed_out = 1;
+      *timed_out = kSpinWaitTimeout;
+      *peer_timed_out = kSpinWaitTimeout;
       __threadfence_system();
       return;
     }

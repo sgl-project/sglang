@@ -358,34 +358,132 @@ def _worker() -> int:
     return 1 if verdict.item() else 0
 
 
+def _timeout_worker() -> int:
+    """An expired peer wait: the last rank arrives three budgets late, so its
+    peers' waits expire after SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS and
+    check_timeout fails the request on every rank, naming the path."""
+    import time
+
+    import torch.distributed as dist
+
+    from sglang.multimodal_gen.runtime.distributed.parallel_state import (
+        get_sp_group,
+        maybe_init_distributed_environment_and_model_parallel,
+    )
+
+    rank = int(os.environ["RANK"])
+    world = int(os.environ["WORLD_SIZE"])
+    torch.cuda.set_device(rank)
+    maybe_init_distributed_environment_and_model_parallel(
+        tp_size=1, sp_size=world, ulysses_degree=world
+    )
+
+    from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
+        IPC_A2A_MULTI,
+        TIMEOUT_EXCHANGE,
+        IpcPeerTimeoutError,
+        ipc_a2a_multi_ready,
+    )
+
+    group = get_sp_group().ulysses_group
+    if not ipc_a2a_multi_ready(group, enabled=True):
+        print("SKIP no peer-to-peer copy-engine transport", flush=True)
+        return 0
+    state = IPC_A2A_MULTI
+    budget_ns = state.budget_ns
+    budget_s = budget_ns / 1e9
+    late = world - 1
+    failures = []
+
+    def run_late(name, call, expected, waited, max_budgets):
+        # the first call sets up the buffers (a collective) under a budget no
+        # setup skew reaches; then the late rank sleeps through three budgets
+        state.budget_ns = 60 * 10**9
+        if call() is None:
+            failures.append(f"{name}: the transport declined the call")
+        torch.cuda.synchronize()
+        dist.barrier()
+        state.budget_ns = budget_ns
+        if rank == late:
+            time.sleep(3 * budget_s)
+        start = time.monotonic()
+        for _ in range(4):
+            call()
+        torch.cuda.synchronize()
+        elapsed = time.monotonic() - start
+        if state.timed_out.item() != expected:
+            failures.append(f"{name}: code {state.timed_out.item()} != {expected}")
+        if rank != late and not budget_s <= elapsed < max_budgets * budget_s:
+            failures.append(f"{name}: four calls took {elapsed:.3f} s")
+        try:
+            state.check_timeout()
+            failures.append(f"{name}: check_timeout passed")
+        except IpcPeerTimeoutError as e:
+            if f"after {budget_s:g} s: {waited}." not in str(e):
+                failures.append(f"{name}: {str(e)[:300]}")
+        if not state.failed:
+            failures.append(f"{name}: the transport stayed in use")
+
+    # the plain exchange: a spin flags both sides, so every rank holds the
+    # code, and each later spin on the late rank spends its own budget until
+    # that rank's rows arrive
+    send = torch.randn(world, 4096, dtype=torch.bfloat16, device="cuda")
+    everyone = ", ".join(map(str, range(world)))
+    run_late(
+        "exchange",
+        lambda: state.exchange(send),
+        TIMEOUT_EXCHANGE,
+        f"ranks {everyone} waited for a peer in the copy-engine all-to-all",
+        max_budgets=5,
+    )
+
+    verdict = torch.tensor([len(failures)], device="cuda")
+    dist.all_reduce(verdict)
+    if failures:
+        print(f"rank{rank} MISMATCH: {failures[:8]}", flush=True)
+    if rank == 0:
+        print(
+            f"PEER_TIMEOUT {'FAIL' if verdict.item() else 'PASS'} world={world}",
+            flush=True,
+        )
+    dist.barrier()
+    dist.destroy_process_group()
+    return 1 if verdict.item() else 0
+
+
+def _run_ranks(test, world: int, port: int, marker: str, *worker_args: str, **env: str):
+    if not current_platform.is_cuda():
+        test.skipTest("CUDA-IPC transport is unavailable on this platform")
+    if torch.cuda.device_count() < world:
+        test.skipTest(f"needs {world} GPUs")
+    proc = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            f"--nproc-per-node={world}",
+            f"--master-port={port}",
+            __file__,
+            *worker_args,
+        ],
+        capture_output=True,
+        text=True,
+        timeout=1200,
+        env={**os.environ, **env},
+    )
+    print(proc.stdout[-4000:])
+    if proc.returncode != 0:
+        print(proc.stderr[-4000:], file=sys.stderr)
+    test.assertEqual(proc.returncode, 0, "copy-engine all-to-all diverged")
+    if "SKIP" not in proc.stdout:
+        test.assertIn(f"{marker} PASS world={world}", proc.stdout)
+
+
 class TestIpcA2AMultiGpu(CustomTestCase):
     def _run(self, world: int, port: int, *worker_args: str, **env: str):
-        if not current_platform.is_cuda():
-            self.skipTest("CUDA-IPC transport is unavailable on this platform")
-        if torch.cuda.device_count() < world:
-            self.skipTest(f"needs {world} GPUs")
-        proc = subprocess.run(
-            [
-                sys.executable,
-                "-m",
-                "torch.distributed.run",
-                f"--nproc-per-node={world}",
-                f"--master-port={port}",
-                __file__,
-                "--worker",
-                *worker_args,
-            ],
-            capture_output=True,
-            text=True,
-            timeout=1200,
-            env={**os.environ, **env},
+        _run_ranks(
+            self, world, port, "IPC_A2A_MULTI_PARITY", "--worker", *worker_args, **env
         )
-        print(proc.stdout[-4000:])
-        if proc.returncode != 0:
-            print(proc.stderr[-4000:], file=sys.stderr)
-        self.assertEqual(proc.returncode, 0, "copy-engine all-to-all diverged")
-        if "SKIP" not in proc.stdout:
-            self.assertIn(f"IPC_A2A_MULTI_PARITY PASS world={world}", proc.stdout)
 
     def test_two_ranks_match_sequential_bitwise(self):
         self._run(2, 29527)
@@ -400,6 +498,30 @@ class TestIpcA2AMultiGpu(CustomTestCase):
             "--deny-pidfd-getfd",
             PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True",
         )
+
+
+class TestPeerTimeoutMultiGpu(CustomTestCase):
+    """An expired peer wait fails the request on every rank and names the path
+    it waited in."""
+
+    def _run(self, world: int, port: int):
+        _run_ranks(
+            self,
+            world,
+            port,
+            "PEER_TIMEOUT",
+            "--timeout-worker",
+            SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS="300",
+        )
+
+    def test_two_ranks(self):
+        self._run(2, 62657)
+
+    def test_four_ranks(self):
+        self._run(4, 62662)
+
+    def test_eight_ranks(self):
+        self._run(8, 62667)
 
 
 class TestAutoPipelineGroups(CustomTestCase):
@@ -473,6 +595,8 @@ class TestPlainExchangeTransport(CustomTestCase):
 
 
 if __name__ == "__main__":
+    if "--timeout-worker" in sys.argv:
+        raise SystemExit(_timeout_worker())
     if "--worker" in sys.argv:
         if "--deny-pidfd-getfd" in sys.argv:
             _deny_pidfd_getfd()
