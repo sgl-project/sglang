@@ -21,11 +21,41 @@ from sglang.srt.model_executor.cuda_graph_config import (
     PhaseConfig,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
+from sglang.srt.server_args import ServerArgs
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 class TestNemotronFastDiffuser(CustomTestCase):
+    def test_inherited_errors_name_the_selected_algorithm(self):
+        """Invalid options must name the selected algorithm, not its base class."""
+        for algorithm in (NemotronFastDiffuser, NemotronLinearSpec):
+            with self.subTest(algorithm=algorithm.__name__):
+                args = ServerArgs(model_path="dummy", device="cuda", dllm_fdfo=True)
+                args._model_config = SimpleNamespace(quantization=None)
+                algorithm.configure_server_args(args)
+                args.enable_lora = True
+                with self.assertRaisesRegex(
+                    ValueError,
+                    f"^{algorithm.__name__} does not support LoRA or quantized weights$",
+                ):
+                    algorithm.configure_server_args(args)
+
+                config = DllmConfig(
+                    algorithm=algorithm.__name__,
+                    algorithm_config={},
+                    block_size=4,
+                    mask_id=0,
+                    max_running_requests=1,
+                    first_done_first_out_mode=True,
+                )
+                algorithm(config)
+                config.algorithm_config = {"unknown_option": True}
+                with self.assertRaisesRegex(
+                    ValueError, f"^Unknown {algorithm.__name__} options:"
+                ):
+                    algorithm(config)
+
     def test_launch_keeps_graph_choices_and_disables_prefix_caching(self):
         for decode, prefill in (
             (Backend.FULL, Backend.BREAKABLE),

@@ -21,20 +21,20 @@ class NemotronFastDiffuser(DllmAlgorithm):
     def configure_server_args(cls, server_args):
         cfg = resolving_view(server_args)
         if cfg.device != "cuda":
-            raise ValueError("NemotronFastDiffuser requires a CUDA GPU")
+            raise ValueError(f"{cls.__name__} requires a CUDA GPU")
         if not cfg.dllm_fdfo:
-            raise ValueError("NemotronFastDiffuser requires FDFO scheduling")
+            raise ValueError(f"{cls.__name__} requires FDFO scheduling")
         if cfg.pp_size > 1 or cfg.dcp_size > 1 or cfg.attn_cp_size > 1:
-            raise ValueError("NemotronFastDiffuser does not support PP or CP")
+            raise ValueError(f"{cls.__name__} does not support PP or CP")
         if cfg.enable_dp_attention:
-            raise ValueError("NemotronFastDiffuser does not support attention DP")
+            raise ValueError(f"{cls.__name__} does not support attention DP")
         if cfg.enable_lora or model_config_of(server_args).quantization is not None:
             raise ValueError(
-                "NemotronFastDiffuser does not support LoRA or quantized weights"
+                f"{cls.__name__} does not support LoRA or quantized weights"
             )
         if cfg.speculative_algorithm is not None or cfg.enable_two_batch_overlap:
             raise ValueError(
-                "NemotronFastDiffuser does not support speculative or two-batch overlap decoding"
+                f"{cls.__name__} does not support speculative or two-batch overlap decoding"
             )
         declare_resolution(
             server_args,
@@ -70,7 +70,9 @@ class NemotronFastDiffuser(DllmAlgorithm):
         options = config.algorithm_config
         unknown = options.keys() - {"block_size", "threshold"}
         if unknown:
-            raise ValueError(f"Unknown NemotronFastDiffuser options: {sorted(unknown)}")
+            raise ValueError(
+                f"Unknown {type(self).__name__} options: {sorted(unknown)}"
+            )
         self.threshold = options.get("threshold", 0.9)
         if (
             isinstance(self.threshold, bool)
@@ -84,7 +86,9 @@ class NemotronFastDiffuser(DllmAlgorithm):
             or not isinstance(self.block_size, int)
             or self.block_size < 2
         ):
-            raise ValueError("NemotronFastDiffuser block_size must be an integer >= 2")
+            raise ValueError(
+                f"{type(self).__name__} block_size must be an integer >= 2"
+            )
 
     def run(self, model_runner, forward_batch, algo_states=None):
         if not forward_batch.forward_mode.is_dllm_extend():
@@ -94,7 +98,7 @@ class NemotronFastDiffuser(DllmAlgorithm):
             return out.logits_output, [], None, states, out.can_run_graph
         if algo_states is None or any(state is None for state in algo_states):
             raise RuntimeError(
-                "NemotronFastDiffuser is missing its causal context seed"
+                f"{type(self).__name__} is missing its causal context seed"
             )
         return super().run(model_runner, forward_batch, algo_states)
 
@@ -128,7 +132,7 @@ class NemotronFastDiffuser(DllmAlgorithm):
             state["steps"] += 1
             if not done[index] and state["steps"] >= self.block_size:
                 raise RuntimeError(
-                    "NemotronFastDiffuser could not resolve its mask tokens"
+                    f"{type(self).__name__} could not resolve its mask tokens"
                 )
         return done
 
