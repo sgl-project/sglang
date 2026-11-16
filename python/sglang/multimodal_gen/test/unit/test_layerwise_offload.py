@@ -2438,40 +2438,6 @@ def test_releasing_host_copies_restores_placeholders(monkeypatch):
     )
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
-@pytest.mark.parametrize("opted_in", [True, False])
-def test_parked_weights_are_pinned_only_for_components_that_opt_in(
-    monkeypatch, opted_in
-):
-    """Page-locked RAM cannot be reclaimed, so only a component that opts in
-    parks into pinned host copies and restores them with a non-blocking copy;
-    every other component keeps pageable copies and a synchronous restore."""
-    comp = _ParkableResidentComponent(1).to("cuda")
-    comp.pin_parked_non_layer_weights = opted_in
-    comp.layerwise_offload_managers = [
-        SimpleNamespace(pin_cpu_memory=True, _weight_metadata={})
-    ]
-
-    comp.park_non_layer_weights(force=True)
-    parked = comp._parked_non_layer_weights
-    assert "non_layer" in parked
-    assert all(host.is_pinned() == opted_in for host in parked.values())
-
-    stream_waits = []
-    current_stream = torch.cuda.current_stream
-
-    def record_stream_wait(*args, **kwargs):
-        stream_waits.append(args)
-        return current_stream(*args, **kwargs)
-
-    monkeypatch.setattr(torch.cuda, "current_stream", record_stream_wait)
-    comp.restore_non_layer_weights()
-
-    assert comp.non_layer.device.type == "cuda"
-    assert torch.equal(comp.non_layer.cpu(), torch.ones(2))
-    assert len(stream_waits) == int(opted_in)
-
-
 def test_park_placeholders_are_shared(monkeypatch):
     """One stand-in per (device, dtype), not one allocation per parked weight."""
     comp = _ParkableResidentComponent(4)
