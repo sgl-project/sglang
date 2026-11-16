@@ -210,6 +210,17 @@ def aiter_decode_workspace_bytes_per_row(
     return num_heads * num_partitions * (head_dim + 2) * 4
 
 
+def _aiter_kv_cache_is_vectorized_5d() -> bool:
+    """Whether MHATokenToKVPool picks the SHUFFLE 5D layout (memory_pool.py:
+    SGLANG_USE_AITER on HIP, no HND override, SGLANG_AITER_KV_CACHE_LAYOUT)."""
+    return (
+        _is_hip
+        and envs.SGLANG_USE_AITER.get()
+        and not envs.SGLANG_USE_HND_KVCACHE.get()
+        and envs.SGLANG_AITER_KV_CACHE_LAYOUT.get().lower() == "vectorized_5d"
+    )
+
+
 def _pd_prefill_skips_mamba_spec_state() -> bool:
     # Prefill never runs TARGET_VERIFY, so the plain hybrid req pool skips the
     # verify-only snapshots; role-switch and unified-memory pools still allocate them.
@@ -3391,12 +3402,15 @@ class KVCacheConfigurator:
 
     def _aiter_decode_workspace_bytes_per_row(self) -> int:
         """Bytes per request-pool row of all the aiter decode workspaces this
-        rank allocates after the KV pool: the target backend's plus, under
-        EAGLE/standalone, one per draft backend. 0 when there are none."""
+        rank allocates after the KV pool: the target runner's backends plus the
+        draft runners' under EAGLE/standalone. 0 when there are none."""
         if (
             not _is_hip
             or self.is_draft_worker
             or envs.SGLANG_USE_AITER_UNIFIED_ATTN.get()
+            # paged_attention_ragged is the only workspace reader; the SHUFFLE
+            # 5D pool decodes through pa_decode_gluon instead.
+            or _aiter_kv_cache_is_vectorized_5d()
         ):
             return 0
         prefill_backend, decode_backend = attention_backends()
@@ -3408,33 +3422,65 @@ class KVCacheConfigurator:
             and not self.use_mla_backend
             and not self.is_hybrid_swa
         ):
-            total += aiter_decode_workspace_bytes_per_row(
+            # Two-batch overlap builds a primary backend and two children.
+            num_target_backends = (
+                3 if get_exec().overlap.enable_two_batch_overlap else 1
+            )
+            total += num_target_backends * aiter_decode_workspace_bytes_per_row(
                 num_heads=self.model_config.num_attention_heads
                 // get_parallel().attn_tp_size,
                 head_dim=self.model_config.head_dim,
                 context_len=self.model_config.context_len,
             )
-        if self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone():
-            # The draft worker shares this request pool and builds steps - 1
-            # multi-step decode backends plus one draft-extend backend.
-            draft_backend = get_spec().speculative_draft_attention_backend
-            num_steps = get_spec().speculative_num_steps or 1
-            num_draft_backends = int((draft_backend or prefill_backend) == "aiter")
-            if num_steps > 1 and (draft_backend or decode_backend) == "aiter":
-                num_draft_backends += num_steps - 1
-            draft_config = self.spec_aux_config.draft_model_config or self.model_config
-            if (
-                num_draft_backends
-                and draft_config.attention_arch != AttentionArch.MLA
-                and not (self.is_hybrid_swa and draft_config.is_hybrid_swa)
-            ):
-                total += num_draft_backends * aiter_decode_workspace_bytes_per_row(
-                    num_heads=draft_config.num_attention_heads
-                    // self.draft_attn_tp_size,
-                    head_dim=draft_config.head_dim,
-                    context_len=draft_config.context_len,
-                )
+        num_draft_backends = self._num_aiter_draft_backends(
+            prefill_backend, decode_backend
+        )
+        draft_config = self.spec_aux_config.draft_model_config or self.model_config
+        if (
+            num_draft_backends
+            and draft_config.attention_arch != AttentionArch.MLA
+            and not (self.is_hybrid_swa and draft_config.is_hybrid_swa)
+        ):
+            total += num_draft_backends * aiter_decode_workspace_bytes_per_row(
+                num_heads=draft_config.num_attention_heads // self.draft_attn_tp_size,
+                head_dim=draft_config.head_dim,
+                context_len=draft_config.context_len,
+            )
         return total
+
+    def _num_aiter_draft_backends(
+        self, prefill_backend: str, decode_backend: str
+    ) -> int:
+        """AiterAttnBackends the EAGLE/standalone draft runners build on the
+        shared request pool. Each draft runner first builds its own backend
+        (ModelRunner.init_attention_backends; no two-batch overlap for a draft),
+        then DraftBackendFactory adds steps - 1 multi-step decode backends and
+        a draft-extend backend (multi-layer EAGLE: one draft-extend backend per
+        step runner, no multi-step decode backend). Frozen-KV MTP reuses its
+        runner's backend or builds a non-aiter one."""
+        spec = get_spec()
+        if not (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone()):
+            return 0
+        draft_backend = spec.speculative_draft_attention_backend
+        num_steps = spec.speculative_num_steps or 1
+        runner_backends = (
+            (draft_backend,) if draft_backend else (prefill_backend, decode_backend)
+        )
+        runner_is_aiter = "aiter" in runner_backends
+        if self.spec_algorithm.is_frozen_kv_mtp():
+            return int(runner_is_aiter)
+        extend_backend = draft_backend or (
+            decode_backend
+            if spec.speculative_attention_mode == "decode"
+            else prefill_backend
+        )
+        extend_is_aiter = extend_backend == "aiter"
+        if spec.enable_multi_layer_eagle and self.spec_algorithm.is_eagle():
+            return num_steps * (int(runner_is_aiter) + int(extend_is_aiter))
+        count = int(runner_is_aiter) + int(extend_is_aiter)
+        if num_steps > 1 and (draft_backend or decode_backend) == "aiter":
+            count += num_steps - 1
+        return count
 
     def _reserve_aiter_decode_workspace(
         self,
@@ -3482,6 +3528,17 @@ class KVCacheConfigurator:
                 1, (budget_bytes // 2 + headroom) // (per_row * rows_per_request)
             )
             reserved = charge(request_cap)
+            if reserved > budget_bytes:
+                raise RuntimeError(
+                    f"The aiter decode workspace for a single request "
+                    f"({per_row * rows_per_request / (1 << 30):.2f} GB, sized by "
+                    f"context_len={self.model_config.context_len}) does not fit in "
+                    f"the KV cache budget ({budget_bytes / (1 << 30):.2f} GB) plus "
+                    f"the runtime slack. Try: (1) a smaller --context-length, "
+                    f"(2) a larger --tp-size (fewer heads per rank), or (3) an "
+                    f"explicit --mem-fraction-static that leaves room for it (an "
+                    f"explicit value is used as-is, with no workspace reserve)."
+                )
             logger.warning(
                 "max_running_requests is capped to %d (per dp worker) so the aiter "
                 "decode workspace (%.2f MB per request) leaves half of the KV "
