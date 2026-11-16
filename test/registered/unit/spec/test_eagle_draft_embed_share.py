@@ -35,6 +35,9 @@ def _run(replicate: bool) -> list:
         patch.object(
             EagleDraftWorker, "init_lm_head", lambda self: calls.append("lm_head")
         ),
+        patch.object(
+            EagleDraftWorker, "_init_draft_probs_vocab_scatter", lambda self: None
+        ),
         patch(
             "sglang.srt.speculative.eagle_worker_v2.get_spec",
             return_value=SimpleNamespace(speculative_use_rejection_sampling=False),
