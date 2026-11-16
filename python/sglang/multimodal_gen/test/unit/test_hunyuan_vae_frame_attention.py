@@ -7,10 +7,17 @@ import pytest
 import torch
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from sglang.multimodal_gen.configs.models.vaes.hunyuanvae import (
+    HunyuanVAEArchConfig,
+    HunyuanVAEConfig,
+)
 from sglang.multimodal_gen.runtime.layers.parallel_conv import (
     disable_spatial_parallel_decode,
 )
+from sglang.multimodal_gen.runtime.models.vaes import hunyuanvae
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.models.vaes.hunyuanvae import (
+    AutoencoderKLHunyuanVideo,
     HunyuanVAEAttention,
     HunyuanVideoMidBlock3D,
     HunyuanVideoUpsampleCausal3D,
@@ -149,3 +156,46 @@ def test_upsample_releases_intermediates_before_convolution():
         dim=2,
     )
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+
+@torch.no_grad()
+def test_decode_fuses_group_norm_silu_only_behind_the_decode_gate():
+    """The fused GroupNorm+SiLU kernel is not bit-identical to the eager chain:
+    a decode outside an enabled fast-path gate (quality="exact") must not
+    launch it and must equal the eager chain."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    torch.manual_seed(0)
+    config = HunyuanVAEConfig(
+        arch_config=HunyuanVAEArchConfig(
+            latent_channels=4,
+            block_out_channels=(8, 8, 8),
+            down_block_types=("HunyuanVideoDownBlock3D",) * 3,
+            up_block_types=("HunyuanVideoUpBlock3D",) * 3,
+            layers_per_block=1,
+            norm_num_groups=4,
+            temporal_compression_ratio=4,
+            mid_block_add_attention=False,
+        ),
+        load_encoder=False,
+    )
+    vae = AutoencoderKLHunyuanVideo(config).to(device).eval()
+    latents = torch.randn(1, 4, 2, 10, 12, device=device)
+
+    with patch.object(
+        hunyuanvae, "apply_group_norm_silu", wraps=hunyuanvae.apply_group_norm_silu
+    ) as fused:
+        exact = vae.decode(latents)
+        assert fused.call_count == 0
+        with use_vae_fast_path(vae, True):
+            vae.decode(latents)
+        assert fused.call_count > 0
+    with (
+        use_vae_fast_path(vae, True),
+        patch.object(
+            hunyuanvae,
+            "apply_group_norm_silu",
+            side_effect=lambda x, norm, act: act(norm(x)),
+        ),
+    ):
+        reference = vae.decode(latents)
+    assert torch.equal(exact, reference)

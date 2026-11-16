@@ -43,6 +43,10 @@ from sglang.multimodal_gen.runtime.models.vaes.common import (
     can_install_spatial_shard_parallel_decode,
     should_run_spatial_shard_parallel_decode,
 )
+from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
+    VaeFastPathGate,
+    register_vae_fast_path_gate,
+)
 
 
 def prepare_causal_attention_mask(
@@ -85,17 +89,31 @@ def _make_spatial_parallel_conv3d(
     return spatial_conv
 
 
+def _group_norm_silu(
+    hidden_states: torch.Tensor,
+    norm: nn.GroupNorm,
+    nonlinearity: nn.Module,
+    decode_gate: VaeFastPathGate | None,
+) -> torch.Tensor:
+    # The fused kernel is not bit-identical to the eager chain, so a decoder
+    # site runs it only while its decode-scoped gate is on (not quality="exact").
+    if decode_gate is None or decode_gate.enabled:
+        return apply_group_norm_silu(hidden_states, norm, nonlinearity)
+    return nonlinearity(norm(hidden_states))
+
+
 def _apply_group_norm_silu(
     hidden_states: torch.Tensor,
     norm: nn.GroupNorm,
     nonlinearity: nn.Module,
     spatial_parallel: bool,
+    decode_gate: VaeFastPathGate | None,
 ) -> torch.Tensor:
     if not spatial_parallel:
-        return apply_group_norm_silu(hidden_states, norm, nonlinearity)
+        return _group_norm_silu(hidden_states, norm, nonlinearity, decode_gate)
     hidden_states, heights = gather_variable_height(hidden_states)
-    hidden_states = apply_group_norm_silu(
-        hidden_states.contiguous(), norm, nonlinearity
+    hidden_states = _group_norm_silu(
+        hidden_states.contiguous(), norm, nonlinearity, decode_gate
     )
     return chunk_height_by_sizes(hidden_states, heights)
 
@@ -359,18 +377,28 @@ class HunyuanVideoResnetBlockCausal3D(nn.Module):
                 in_channels, out_channels, 1, 1, 0
             )
         self.spatial_parallel = False
+        # set on the decoder's blocks; the encoder's blocks carry no gate
+        self.decode_fast_path_gate: VaeFastPathGate | None = None
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = hidden_states.contiguous()
         residual = hidden_states
 
         hidden_states = _apply_group_norm_silu(
-            hidden_states, self.norm1, self.nonlinearity, self.spatial_parallel
+            hidden_states,
+            self.norm1,
+            self.nonlinearity,
+            self.spatial_parallel,
+            self.decode_fast_path_gate,
         )
         hidden_states = self.conv1(hidden_states)
 
         hidden_states = _apply_group_norm_silu(
-            hidden_states, self.norm2, self.nonlinearity, self.spatial_parallel
+            hidden_states,
+            self.norm2,
+            self.nonlinearity,
+            self.spatial_parallel,
+            self.decode_fast_path_gate,
         )
         hidden_states = self.dropout(hidden_states)
         hidden_states = self.conv2(hidden_states)
@@ -842,6 +870,7 @@ class HunyuanVideoDecoder3D(nn.Module):
         )
 
         self.spatial_parallel = False
+        self.decode_fast_path_gate: VaeFastPathGate | None = None
         self.gradient_checkpointing = False
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -868,6 +897,7 @@ class HunyuanVideoDecoder3D(nn.Module):
             self.conv_norm_out,
             self.conv_act,
             self.spatial_parallel,
+            self.decode_fast_path_gate,
         )
         hidden_states = self.conv_out(hidden_states)
 
@@ -946,6 +976,13 @@ class AutoencoderKLHunyuanVideo(ParallelTiledVAE):
             if can_install_spatial_shard_parallel_decode(self.config):
                 _enable_hunyuan_decoder_spatial_parallel(self.decoder)
                 self._spatial_parallel_decode_enabled = True
+            decode_gate = VaeFastPathGate()
+            for module in self.decoder.modules():
+                if isinstance(
+                    module, (HunyuanVideoResnetBlockCausal3D, HunyuanVideoDecoder3D)
+                ):
+                    module.decode_fast_path_gate = decode_gate
+            register_vae_fast_path_gate(self, decode_gate)
 
     def _should_use_spatial_parallel_decode(self, z: torch.Tensor) -> bool:
         return (
