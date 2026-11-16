@@ -476,20 +476,15 @@ class CompressedTensorsConfig(QuantizationConfig):
         else:
             device_capability = torch.cuda.get_device_capability()
 
-        capability_tuple = DeviceCapability(*device_capability)
-
-        if capability_tuple is not None:
-            capability = capability_tuple.to_int()
-            supported = capability >= min_capability
-            if error and not supported:
-                raise RuntimeError(
-                    "Quantization scheme is not supported for "
-                    f"the current GPU. Min capability: {min_capability}. "
-                    f"Current capability: {capability}."
-                )
-            return supported
-        else:
-            return False
+        capability = DeviceCapability(*device_capability).to_int()
+        supported = capability >= min_capability
+        if error and not supported:
+            raise RuntimeError(
+                "Quantization scheme is not supported for "
+                f"the current GPU. Min capability: {min_capability}. "
+                f"Current capability: {capability}."
+            )
+        return supported
 
     def _is_dynamic_token_w4a8(
         self, weight_quant: BaseModel, input_quant: BaseModel
