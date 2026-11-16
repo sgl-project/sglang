@@ -196,7 +196,7 @@ class DeviceMixin:
         raise NotImplementedError
 
     def get_device_name(self, device_id: int = 0) -> str:
-        """[Active] Get human-readable device name."""
+        """[Planned] Get human-readable device name."""
         raise NotImplementedError
 
     def get_device_uuid(self, device_id: int = 0) -> str:
@@ -240,7 +240,7 @@ class DeviceMixin:
 
     @classmethod
     def inference_mode(cls):
-        """[Active] Return inference mode context manager."""
+        """[Planned] Return inference mode context manager."""
         return torch.inference_mode(mode=True)
 
     @classmethod
@@ -261,7 +261,7 @@ class DeviceMixin:
 
     @classmethod
     def get_cpu_architecture(cls) -> "CpuArchEnum":
-        """[Active] Detect CPU architecture."""
+        """[Planned] Detect CPU architecture."""
         import platform as _platform
 
         machine = _platform.machine().lower()
