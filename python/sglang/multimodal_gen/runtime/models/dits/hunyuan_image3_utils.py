@@ -11,8 +11,6 @@ from typing import List, Optional, Tuple
 import torch
 import torch.nn.functional as F
 
-from sglang.multimodal_gen.runtime.platforms import current_platform
-
 
 @lru_cache(maxsize=8)
 def _timestep_freqs(half, max_period, device):
@@ -321,7 +319,7 @@ def segmented_attention(query, key, value, segments, attend):
 @lru_cache(maxsize=1)
 def _hopper_flash_attn_varlen():
     # FA3 runs on sm90 only; elsewhere the masked SDPA path is kept.
-    if not current_platform.is_hopper():
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 9:
         return None
     try:
         from sglang.kernels.ops.attention.flash_attention import (
