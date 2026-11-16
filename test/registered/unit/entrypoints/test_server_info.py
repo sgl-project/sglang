@@ -262,8 +262,6 @@ class TestServerInfoTransportParity(CustomTestCase):
                         return_value=SimpleNamespace(
                             host="127.0.0.1",
                             grpc_port=50051,
-                            smg_grpc_mode=False,
-                            grpc_mode=False,
                         ),
                     ),
                     patch("sglang.srt.rust_extensions.load_rust_extension") as load,
@@ -288,8 +286,6 @@ class TestServerInfoTransportParity(CustomTestCase):
                 return_value=SimpleNamespace(
                     host="127.0.0.1",
                     grpc_port=50051,
-                    smg_grpc_mode=False,
-                    grpc_mode=False,
                 ),
             ),
             patch("sglang.srt.rust_extensions.load_rust_extension") as load,

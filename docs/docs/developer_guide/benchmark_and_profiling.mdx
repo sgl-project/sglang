@@ -117,7 +117,7 @@ python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --d
 python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disaggregation-mode decode --port 30001 --base-gpu-id 1
 
 # start router
-python -m sglang_router.launch_router --pd-disaggregation --prefill http://127.0.0.1:30000 --decode http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
+sgl-router --model-id meta-llama/Llama-3.1-8B-Instruct --no-tokenizer --worker-urls http://127.0.0.1:30000 http://127.0.0.1:30001 --host 0.0.0.0 --port 8000
 
 # send profiling request targeting prefill workers
 python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile --pd-separated --profile-prefill-url http://127.0.0.1:30000

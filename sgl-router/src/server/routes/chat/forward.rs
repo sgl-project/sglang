@@ -754,7 +754,8 @@ fn prompt_dp_rank(
 }
 
 /// Under `--dp-aware` the router owns the rank: the header pins it for chat, and
-/// the body, which `/generate` reads instead, carries it or null to unpin.
+/// the body's `routed_dp_rank`, which `/generate` reads instead, carries it or
+/// null to unpin.
 /// Decode's body also names the pinned prefill rank, so decode need not look it up.
 fn with_dp_rank(
     dp_aware: bool,
@@ -770,10 +771,7 @@ fn with_dp_rank(
         headers.insert(X_DATA_PARALLEL_RANK, HeaderValue::from(rank));
     }
     let rank = rank.map_or_else(|| "null".to_owned(), |rank| rank.to_string());
-    let mut fields = vec![
-        ("routed_dp_rank", rank),
-        ("data_parallel_rank", "null".into()),
-    ];
+    let mut fields = vec![("routed_dp_rank", rank)];
     fields.extend(prefill_rank.map(|rank| ("disagg_prefill_dp_rank", rank.to_string())));
     let body = append_fields(body, &fields).unwrap_or_else(|| body.clone());
     (headers, body)
