@@ -32,21 +32,23 @@ class Range(NamedTuple):
 class Heuristic(NamedTuple):
     """Self-contained algo ranges for one dispatch context (graph or eager).
 
-    Seven algos are tried in order of preference (fastest first):
+    Eight algos are tried in order of preference (fastest first):
       1. ``1shot_push``:    nbytes <= ``one_shot_push_threshold``
       2. ``hier_2shot_push``: nbytes in ``hier_2shot_push.min_bytes..max_bytes``
                             (only when the group is made of DPX pairs)
-      3. ``2shot_push``:    nbytes <= ``two_shot_push_threshold``
-      4. ``1shot_pull``:    nbytes <= ``one_shot_pull_threshold``
-      5. ``2shot_pull`` mc: nbytes in ``mc.min_bytes..mc.max_bytes``
+      3. ``hier_ring_simple``: nbytes in ``hier_ring_simple.min_bytes..max_bytes``
+                            (only when the group is made of partition pairs)
+      4. ``2shot_push``:    nbytes <= ``two_shot_push_threshold``
+      5. ``1shot_pull``:    nbytes <= ``one_shot_pull_threshold``
+      6. ``2shot_pull`` mc: nbytes in ``mc.min_bytes..mc.max_bytes``
                             (only when multicast is enabled at runtime)
-      6. ``2shot_pull``:    nbytes <= ``two_shot_pull_threshold``
-      7. ``ring_simple``:   nbytes in ``ring_simple.min_bytes..max_bytes``
+      7. ``2shot_pull``:    nbytes <= ``two_shot_pull_threshold``
+      8. ``ring_simple``:   nbytes in ``ring_simple.min_bytes..max_bytes``
     Above all of these, the caller falls back to NCCL.
 
     Setting two adjacent thresholds equal effectively disables the middle
     algo; leaving ``mc`` / ``two_shot_push_threshold`` / ``hier_2shot_push``
-    / ``ring_simple`` at the default disables that algo.
+    / ``hier_ring_simple`` / ``ring_simple`` at the default disables that algo.
 
     The field order below is the positional layout of the table rows
     (``1shot_push, 1shot_pull, 2shot_pull, mc``); ``two_shot_push_threshold``
@@ -60,6 +62,7 @@ class Heuristic(NamedTuple):
     two_shot_push_threshold: int = 0  # default: 2shot_push disabled
     hier_2shot_push: Range = Range(0, 0)  # default: hier_2shot_push disabled
     ring_simple: Range = Range(0, 0)  # default: ring_simple disabled
+    hier_ring_simple: Range = Range(0, 0)  # default: hier_ring_simple disabled
 
     def max_push_bytes(self, world_size: int) -> int:
         """Per-slot push plane bytes this heuristic needs."""
@@ -92,8 +95,9 @@ class Heuristic(NamedTuple):
             ),
             # sized by its own range, outside the push slots
             hier_2shot_push=self.hier_2shot_push,
-            # streams through its own FIFO, so no workspace bounds it
+            # stream through their own FIFOs, so no workspace bounds them
             ring_simple=self.ring_simple,
+            hier_ring_simple=self.hier_ring_simple,
         )
 
 
@@ -117,8 +121,8 @@ class AllReduceConfig(NamedTuple):
       - ``num_push_blocks``: 1shot / 2shot push grid
       - ``num_pull_blocks``: 1shot_pull (any mode) and non-mc 2shot_pull
       - ``num_mc_blocks``  : mc 2shot_pull; ``None`` disables multicast
-      - ``num_ring_simple_channels``: ring_simple grid, one channel (ring) per
-                             block
+      - ``num_ring_simple_channels``: ring_simple and hier_ring_simple grid,
+                             one channel (ring) per block
     """
 
     graph: Heuristic
@@ -362,11 +366,21 @@ def _rocm_configs(num_sm: int) -> dict[int, AllReduceConfig]:
 def _rocm_gfx1250_configs(
     num_sm: int, dev_kernarg: bool = False
 ) -> dict[int, AllReduceConfig]:
-    def config(one_shot: int, two_shot_push: int) -> AllReduceConfig:
+    def config(
+        one_shot: int, two_shot_push: int, hier_ring_from: int = 0
+    ) -> AllReduceConfig:
         # 4 GB keeps every dtype's element count in 32 bits
         ring = Range(max(one_shot, two_shot_push) + 16, 4 * 1024 * MB)
+        hier_ring = (
+            Range(hier_ring_from, ring.max_bytes) if hier_ring_from else Range(0, 0)
+        )
         heuristic = Heuristic(
-            one_shot, 0, 0, two_shot_push_threshold=two_shot_push, ring_simple=ring
+            one_shot,
+            0,
+            0,
+            two_shot_push_threshold=two_shot_push,
+            ring_simple=ring,
+            hier_ring_simple=hier_ring,
         )
         return AllReduceConfig(
             graph=heuristic,
@@ -402,7 +416,20 @@ def _rocm_gfx1250_configs(
         cutoffs.update(
             {2: (2 * MB, 16 * MB), 4: (2 * MB, 32 * MB), 8: (768 * KB, 32 * MB)}
         )
-    configs = {ws: config(*cutoff) for ws, cutoff in cutoffs.items()}
+    # Where the group is made of partition pairs (both partitions of every
+    # accelerator), hier_ring_simple takes over from 2shot_push and ring_simple
+    # from these sizes; the table keeps them as the fallback for other groups.
+    # An accelerator's partitions share its links to the others, while the
+    # link between them is separate, so splitting every chunk across the pair
+    # cuts what each accelerator sends to the others from 2 * (2m - 1) / 2m of
+    # the tensor (m accelerators) to 2 * (m - 1) / m. Back to back (graph,
+    # bf16, median of 3) it beats ring_simple by 10-17% from 64 MB to 256 MB at
+    # TP4 and TP8, and 2shot_push from 12 MB at TP4 and 20 MB at TP8; only the
+    # `=1` rows take it so far.
+    hier_ring_from = {4: 8 * MB + 16, 8: 16 * MB + 16} if dev_kernarg else {}
+    configs = {
+        ws: config(*cutoff, hier_ring_from.get(ws, 0)) for ws, cutoff in cutoffs.items()
+    }
     # 16 ranks span two hosts in one fabric clique. Tuned there with and
     # without a late rank: across hosts 2shot_push pays two fabric hops, so
     # 1shot_push wins to 256 KB, and a block per CU keeps 2shot_push ahead of
