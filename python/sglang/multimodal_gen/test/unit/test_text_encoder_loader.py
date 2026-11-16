@@ -11,6 +11,7 @@ import transformers
 from safetensors.torch import save_file
 from torch import nn
 
+from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5Config
 from sglang.multimodal_gen.runtime.layers.linear import LinearBase
 from sglang.multimodal_gen.runtime.layers.quantization.comfy_int8 import (
@@ -33,6 +34,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.kitchen_w4a8_conf
 from sglang.multimodal_gen.runtime.layers.quantization.fp8 import Fp8Config
 from sglang.multimodal_gen.runtime.layers.quantization.gguf import GGUFConfig
 from sglang.multimodal_gen.runtime.layers.quantization.mxfp8 import MXFP8Config
+from sglang.multimodal_gen.runtime.layers.rotary_embedding import RotaryEmbedding
+from sglang.multimodal_gen.runtime.layers.rotary_embedding.factory import _ROPE_DICT
 from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
@@ -112,6 +115,56 @@ def test_encoder_load_copies_host_checkpoint_into_final_parameters(
         torch.testing.assert_close(
             parameter.cpu(), expected.to(parameter.dtype), rtol=0, atol=0
         )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
+def test_offloaded_encoder_builds_resident_rope_cache(
+    tmp_path, single_process_model_parallel
+):
+    """CPU and CUDA round some cos/sin entries apart; offload must not change them."""
+    hf_config = transformers.Qwen3Config(
+        vocab_size=64,
+        hidden_size=256,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=128,
+        max_position_embeddings=40960,
+        rope_theta=1000000.0,
+    )
+    reference = transformers.Qwen3Model(hf_config)
+    save_file(
+        {name: p.detach().clone() for name, p in reference.named_parameters()},
+        tmp_path / "model.safetensors",
+    )
+
+    def rope_caches(starts_on_cpu):
+        config = Qwen3TextConfig()
+        config.update_model_arch(hf_config.to_dict())
+        config.arch_config.architectures = ["Qwen3ForCausalLM"]
+        with mock.patch.dict(_ROPE_DICT, clear=True):
+            loaded = TextEncoderLoader().load_model(
+                str(tmp_path),
+                config,
+                SimpleNamespace(pipeline_config=None),
+                dtype="bf16",
+                component_starts_on_cpu=starts_on_cpu,
+            )
+        caches = [
+            m.cos_sin_cache for m in loaded.modules() if isinstance(m, RotaryEmbedding)
+        ]
+        assert caches
+        for cache in caches:
+            assert cache.device.type == ("cpu" if starts_on_cpu else "cuda")
+            assert cache.dtype == torch.bfloat16
+        return [cache.cpu() for cache in caches]
+
+    resident = rope_caches(starts_on_cpu=False)
+    offloaded = rope_caches(starts_on_cpu=True)
+    assert len(offloaded) == len(resident)
+    for a, b in zip(offloaded, resident):
+        torch.testing.assert_close(a, b, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("backend", ["int8", "nvfp4"])

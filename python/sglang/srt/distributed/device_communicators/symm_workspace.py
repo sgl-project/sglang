@@ -523,11 +523,14 @@ def finalize_symm_workspaces() -> None:
     """Allocate every workspace still pending (collective on each group).
 
     Must run before CUDA graph capture: a capture in progress on any stream makes the
-    driver refuse the multicast mapping. Groups go in name order, the same on every
-    rank, so ranks that share several groups do not wait on each other.
+    driver refuse the multicast mapping. Preserve the collective registration order
+    of groups, as eager allocation would. Sorting names can interleave group families
+    differently on different ranks, desynchronizing PyTorch's process-wide symmetric
+    memory exchange counter. Callers must register overlapping groups in a consistent
+    order, just as they must create their process groups in a consistent order.
     """
-    for name in sorted(_WORKSPACES):
-        for workspace in _WORKSPACES[name]:
+    for workspaces in _WORKSPACES.values():
+        for workspace in workspaces:
             workspace.finalize()
 
 
