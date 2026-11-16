@@ -112,11 +112,14 @@ class TestKTNPUOffload(unittest.TestCase):
 
         fake_npu = SimpleNamespace(npu=SimpleNamespace(_launch_host_func=launch))
         x = SimpleNamespace(device="npu:0")
-        with patch.dict(sys.modules, {"torch_npu": fake_npu}), patch.object(
-            torch,
-            "npu",
-            SimpleNamespace(current_stream=lambda device: stream),
-            create=True,
+        with (
+            patch.dict(sys.modules, {"torch_npu": fake_npu}),
+            patch.object(
+                torch,
+                "npu",
+                SimpleNamespace(current_stream=lambda device: stream),
+                create=True,
+            ),
         ):
             kt_npu.submit_npu_graph(wrapper, x, "ids", "weights")
         self.assertEqual(events, ["copy", "launch", "cpu"])
@@ -165,8 +168,9 @@ class TestKTNPUOffload(unittest.TestCase):
         )
         module = importlib.util.module_from_spec(wrapper_spec)
         stubs[wrapper_spec.name] = module
-        with patch.dict(sys.modules, stubs), patch.object(
-            torch, "compile", lambda **kwargs: lambda fn: fn
+        with (
+            patch.dict(sys.modules, stubs),
+            patch.object(torch, "compile", lambda **kwargs: lambda fn: fn),
         ):
             wrapper_spec.loader.exec_module(module)
             for graph in (False, True):
@@ -189,13 +193,11 @@ class TestKTNPUOffload(unittest.TestCase):
                     ids = torch.tensor([[0, 1]])
                     weights = torch.tensor([[0.25, 0.75]])
                     dispatch = dispatch_type(x, topk_type(weights, ids, None))
-                    with patch.object(
-                        module, "npu_graph_capturing", return_value=graph
-                    ), patch.object(
-                        module, "_kt_stream_handle", return_value=42
-                    ), patch.object(
-                        module, "submit_npu_graph"
-                    ) as graph_submit:
+                    with (
+                        patch.object(module, "npu_graph_capturing", return_value=graph),
+                        patch.object(module, "_kt_stream_handle", return_value=42),
+                        patch.object(module, "submit_npu_graph") as graph_submit,
+                    ):
                         result = method.apply(None, dispatch)
                     torch.testing.assert_close(
                         result.hidden_states,
