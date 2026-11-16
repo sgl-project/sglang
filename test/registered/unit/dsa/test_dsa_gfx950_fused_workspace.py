@@ -3,6 +3,7 @@ dtype) serves every layer, and it is only ever allocated up front.  A counting
 double stands in for _Workspace, so only the bookkeeping is under test."""
 
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from sglang.srt.layers.attention.dsa import gfx950_fused_indexer as fd
@@ -22,6 +23,26 @@ class CountingWorkspace:
         CountingWorkspace.made += 1
         self.max_cols = max_cols
         self.page_table = None
+
+
+class TestFusedIndexerHardwareGate(unittest.TestCase):
+    """The kernels are raw gfx950 code, so the gate admits exactly that target:
+    not another vendor, not an older or newer gfx family."""
+
+    def _supported(self, hip):
+        with mock.patch.object(
+            fd, "current_arch", return_value=SimpleNamespace(hip=hip)
+        ):
+            return fd.supported_hardware()
+
+    def test_only_gfx950(self):
+        self.assertTrue(self._supported(SimpleNamespace(gcn_arch="gfx950")))
+        for gcn_arch in ("gfx942", "gfx1250", "gfx9500"):
+            with self.subTest(gcn_arch=gcn_arch):
+                self.assertFalse(self._supported(SimpleNamespace(gcn_arch=gcn_arch)))
+
+    def test_not_hip(self):
+        self.assertFalse(self._supported(None))
 
 
 class TestFusedIndexerWorkspace(unittest.TestCase):
