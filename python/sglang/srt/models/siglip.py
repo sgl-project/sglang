@@ -149,7 +149,6 @@ class SiglipEncoderLayer(nn.Module):
         hidden_states = self.self_attn(
             hidden_states,
             attention_mask=attn_mask,
-            # causal_attention_mask=causal_attention_mask,
         )
 
         hidden_states = residual + hidden_states
@@ -254,13 +253,6 @@ class SiglipVisionTransformer(nn.Module):
             prefix=add_prefix("encoder", prefix),
         )
 
-        num_hidden_layers = config.num_hidden_layers
-        if len(self.encoder.layers) > config.num_hidden_layers:
-            raise ValueError(
-                f"The original encoder only has {num_hidden_layers} "
-                f"layers, but you requested {len(self.encoder.layers)} layers."
-            )
-
         # VisionAttention in SiglipEncoderLayer is multihead attention
         self.post_layernorm = nn.LayerNorm(embed_dim, eps=config.layer_norm_eps)
 
@@ -276,12 +268,7 @@ class SiglipVisionTransformer(nn.Module):
             self.post_layernorm.weight.dtype
         )
 
-        return_all_hidden_states = False
-
-        last_hidden_state = self.encoder(
-            inputs_embeds=hidden_states,
-            return_all_hidden_states=return_all_hidden_states,
-        )
+        last_hidden_state = self.encoder(inputs_embeds=hidden_states)
 
         last_hidden_state = self.post_layernorm(last_hidden_state)
 
