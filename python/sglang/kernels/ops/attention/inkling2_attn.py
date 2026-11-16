@@ -183,45 +183,6 @@ def combine_gate_sink(o_partial, m_partial, l_partial, *, gate, sinks):
     return out
 
 
-def rel_bias_partials(
-    q,
-    k_cache,
-    v_cache,
-    page_table,
-    seqused_k,
-    rel_bias,
-    softmax_scale,
-    out,
-    *,
-    window_size_left,
-    verify,
-):
-    """Split-KV partials of paged attention with the compact relative bias, for
-    combine_gate_sink; verify: several queries per sequence (MTP verify)."""
-    from sglang.kernels.ops.attention.flash_attn.cute.flash_fwd_sm100_bias_decode import (
-        paged_rel_bias_decode,
-    )
-    from sglang.srt.utils import get_device_core_count
-
-    return paged_rel_bias_decode(
-        q,
-        k_cache,
-        v_cache,
-        page_table,
-        seqused_k,
-        rel_bias,
-        softmax_scale,
-        out,
-        window_size_left=window_size_left,
-        reduce=False,
-        num_sms=(
-            get_device_core_count(q.device.index)
-            if verify and window_size_left is None
-            else None
-        ),
-    )
-
-
 @cache_once
 def _gate_sink_module(heads, head_dim, group, padded_group):
     args = f"{heads}, {head_dim}, {group}, {padded_group}"
