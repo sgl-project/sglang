@@ -637,6 +637,34 @@ class SchedulerMetricsReporter:
         w_bytes = float(dtype_num_bytes)
         cache_bytes = float(dtype_num_bytes)
 
+        # Weight-only quantization (W4A16/W8A16-style: GPTQ/AWQ/compressed-tensors)
+        # stores weights at a narrower width than the activation dtype above, so
+        # charging w_bytes at the activation width overcounts weight-read
+        # bandwidth by roughly (activation_bits / weight_bits) -- e.g. ~4x for a
+        # 4-bit-weight model read as if it were bf16. Prefer the quant config's
+        # own published global_compression_ratio (compressed-tensors) when
+        # present, since it already accounts for group-size scale/zero-point
+        # overhead and any unquantized layers (e.g. lm_head) that a naive
+        # bits-only ratio would miss; fall back to a bits-per-weight ratio for
+        # GPTQ/AWQ-style flat configs that don't publish a ratio.
+        hf_quant_config = getattr(model_config, "hf_quant_config", None) or {}
+        weight_compression_ratio = hf_quant_config.get("global_compression_ratio")
+        if not weight_compression_ratio:
+            weight_bits = (
+                hf_quant_config.get("bits")
+                or hf_quant_config.get("num_bits")
+                or hf_quant_config.get("w_bit")
+            )
+            if weight_bits is None:
+                for group in (hf_quant_config.get("config_groups") or {}).values():
+                    weight_bits = (group or {}).get("weights", {}).get("num_bits")
+                    if weight_bits:
+                        break
+            if weight_bits:
+                weight_compression_ratio = (dtype_num_bytes * 8) / float(weight_bits)
+        if weight_compression_ratio and weight_compression_ratio > 1:
+            w_bytes = float(dtype_num_bytes) / float(weight_compression_ratio)
+
         # MLA has a shared per-token KV latent (not per-head K/V like GQA).
         is_mla = getattr(model_config, "attention_arch", None) == AttentionArch.MLA
         if is_mla and num_attn_heads > 0:
