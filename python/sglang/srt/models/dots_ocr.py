@@ -66,16 +66,7 @@ class DotsOCRForCausalLM(nn.Module):
         assert image_grid_thw.dim() == 2, f"{image_grid_thw.dim()=}"
 
         # Process through vision tower
-        image_embeds = self.visual(pixel_values, image_grid_thw)
-
-        # Ensure consistent dtype for FlashInfer compatibility
-        # Force bfloat16 to match model's expected dtype
-        if hasattr(self.model, "embed_tokens"):
-            target_dtype = self.model.embed_tokens.weight.dtype
-            if image_embeds.dtype != target_dtype:
-                image_embeds = image_embeds.to(target_dtype)
-
-        return image_embeds
+        return self.visual(pixel_values, image_grid_thw)
 
     def _pad_vit_attn_dummy_heads(self, name: str, loaded_weight: torch.Tensor):
         """pad attn qkv weights for dummy heads"""
