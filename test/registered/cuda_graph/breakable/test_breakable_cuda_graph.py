@@ -1,5 +1,6 @@
 import unittest
 import weakref
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -21,12 +22,11 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    SimpleNamespace,
     popen_launch_server,
 )
 
 # CI Registration — large suite to fit the integration test's server startup.
-register_cuda_ci(est_time=92, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=164, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=200, suite="stage-c-test-large-8-gpu-amd-mi35x")
 
 

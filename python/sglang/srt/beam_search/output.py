@@ -40,7 +40,7 @@ def pack_beam_search_output(req: Req) -> Optional[BeamSearchOutput]:
     """Top num_return sequences, best score first; None for a group that ended
     without results. Finish reasons are JSON: the carrier crosses IPC."""
     # Scheduler-side only; keep schedule_batch out of the module import graph.
-    from sglang.srt.managers.schedule_batch import FINISH_LENGTH, FINISH_MATCHED_TOKEN
+    from sglang.srt.managers.req_types import FINISH_LENGTH, FINISH_MATCHED_TOKEN
 
     group = req.beam_group
     results = getattr(group, "final_results", None)

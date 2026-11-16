@@ -37,7 +37,7 @@ else:
         helion_fused_recurrent_kda_replayssm_decode,
     )
 
-register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 pytestmark = pytest.mark.skipif(
     not HELION_AVAILABLE,

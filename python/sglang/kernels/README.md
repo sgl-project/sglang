@@ -20,6 +20,8 @@ sglang/kernels/
   fused_op.py    # BaseFusedOp: per-operator multi-backend contract
   kernel_api_logging.py  # kernel API crash-debugging decorator
   numerics.py    # shared numerics helpers for bit-exact Triton kernels
+  arch/          # current_arch(): cached facts about the local GPU (CUDA,
+                 # HIP or a base DeviceArch), shared by kernels and srt
   ops/
     <group>/     # one subpackage per operator group (see list below)
   jit/           # shared JIT build/runtime infra: utils/ (incl. the Helion
@@ -43,7 +45,8 @@ under `ops/` (a model-named file or subpackage inside a group is fine).
 
 `lora` is its own group because it has a distinct responsibility: the adapter
 kernels that only the LoRA runtime in `srt/lora` calls (`dense/` SGMV GEMMs and
-their tuning data, `moe/` fused MoE-LoRA). It also keeps the experimental
+their tuning data, `moe/` fused MoE-LoRA, `common/` the routing and A/B kernels
+both share). It also keeps the experimental
 TRT-LLM LoRA path whole as `dense/trtllm_lora_temp/` and
 `moe/trtllm_lora_temp/`; the latter includes the FlashInfer overlay and the
 flag-gated routing kernels that `srt/layers/moe/topk.py` reaches.

@@ -36,11 +36,14 @@ def _manager(
 ) -> MooncakeKVManager:
     manager = MooncakeKVManager.__new__(MooncakeKVManager)
     manager.customized_info_enabled = False
+    manager.exchange_aux_item_lens = False
     manager.enable_deferred_decode_kv_release = enabled
     manager.request_status = {} if status is None else {ROOM: status}
     manager._deferred_ack_targets = {}
     manager._deferred_ack_poisoned_rooms = set()
     manager._staging_outstanding = {}
+    manager.failure_records = {}
+    manager.failure_lock = threading.Lock()
     manager.check_status = lambda room: manager.request_status[room]
     manager.update_status = lambda room, value: manager.request_status.__setitem__(
         room, value
@@ -96,6 +99,9 @@ class TestMooncakeAbortNotification(
 
         with self.assertRaisesRegex(RuntimeError, "Transfer thread failed"):
             manager.transfer_worker(queue, MagicMock())
+        # The failed worker marks its room failed, so no wait on it hangs.
+        self.assertEqual(manager.request_status[ROOM], KVPoll.Failed)
+        self.assertIn("Transfer worker failed", manager.failure_records[ROOM])
         manager.check_status = lambda room: manager.request_status[room]
 
     def _prepare_worker(self, manager, num_dsts: int = 1) -> None:

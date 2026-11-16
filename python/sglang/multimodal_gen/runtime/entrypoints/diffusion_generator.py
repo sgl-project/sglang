@@ -15,10 +15,8 @@ import time
 from contextlib import ExitStack
 from typing import Any, List, Optional, Union
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     ListLorasReq,
     MergeLoraWeightsReq,
@@ -28,20 +26,22 @@ from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import (
     GenerationResult,
-    expand_request_outputs,
     format_lora_message,
     map_request_outputs,
     prepare_request,
     save_outputs,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import Req
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    expand_request_outputs,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
 from sglang.multimodal_gen.runtime.platforms.plugins import apply_plugin_hooks
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     select_output_rollout_trajectory,
 )
 from sglang.multimodal_gen.runtime.scheduler_client import sync_scheduler_client
-from sglang.multimodal_gen.runtime.server_args import PortArgs, ServerArgs
+from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.server_warmup import (
     run_sync_client_warmup,
     should_run_explicit_client_warmup,
@@ -118,7 +118,6 @@ class DiffGenerator:
             server_args: The inference arguments
         """
         self.server_args = server_args
-        self.port_args = PortArgs.from_server_args(server_args)
 
         # The executor is now a client to the Scheduler service
         self.local_scheduler_process: list[mp.Process] | None = None

@@ -10,7 +10,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=4, suite="stage-a-unit-test-npu")
+register_npu_ci(est_time=4, suite="base-a-test-npu")
 
 from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
     is_fia_nz,
@@ -170,12 +170,11 @@ class TestIsFiaNz(unittest.TestCase):
         ):
             self.assertTrue(is_fia_nz())
 
-    def test_fia_nz_without_mlapo_raises(self):
+    def test_fia_nz_does_not_need_mlapo(self):
         with patch.dict(os.environ):
             os.environ.pop("SGLANG_NPU_USE_MLAPO", None)
             os.environ["SGLANG_USE_FIA_NZ"] = "1"
-            with self.assertRaises(AssertionError):
-                is_fia_nz()
+            self.assertTrue(is_fia_nz())
 
 
 if __name__ == "__main__":

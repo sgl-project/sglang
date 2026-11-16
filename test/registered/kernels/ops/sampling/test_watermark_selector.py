@@ -7,7 +7,6 @@ from sglang.kernels.ops.sampling.textseal_selector import (
     can_use_finite_topk_watermark,
     force_watermark_tokens_triton,
     prepare_watermark_contexts_triton,
-    select_watermark_tokens_triton,
 )
 from sglang.srt.sampling.watermarking.core import (
     WatermarkState,
@@ -18,44 +17,7 @@ from sglang.srt.sampling.watermarking.core import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
-
-
-def test_selector_matches_torch_across_split_boundaries():
-    generator = torch.Generator().manual_seed(7)
-    batch_size = 5
-    vocab_size = 16397
-    probabilities = torch.rand(batch_size, vocab_size, generator=generator)
-    support_lengths = torch.tensor([1, 8191, 8192, 8193, vocab_size])
-    support = torch.arange(vocab_size).view(1, -1) < support_lengths.view(-1, 1)
-    probabilities = torch.where(support, probabilities, 0.0)
-    probabilities /= probabilities.sum(dim=-1, keepdim=True)
-    context_hashes = torch.tensor([0, 1, 2**31 - 1, 2**32 - 1, 1145416960])
-    keys = torch.tensor([0, 1, -1, -(2**63), 0x0123456789ABCDEF])
-
-    expected = select_watermark_tokens_torch(probabilities, context_hashes, keys)
-    actual = select_watermark_tokens_triton(
-        probabilities.cuda(), context_hashes.cuda(), keys.cuda()
-    ).cpu()
-
-    torch.testing.assert_close(actual.to(torch.int64), expected)
-    keys_b = torch.tensor([1, -1, 0, 0x1111222233334444, -(2**63)])
-    mixing_thresholds = torch.tensor(
-        [1, 1 << 30, 1 << 31, 3 << 30, (1 << 32) - 1], dtype=torch.int64
-    )
-
-    expected_dual = select_watermark_tokens_torch(
-        probabilities, context_hashes, keys, keys_b, mixing_thresholds
-    )
-    actual_dual = select_watermark_tokens_triton(
-        probabilities.cuda(),
-        context_hashes.cuda(),
-        keys.cuda(),
-        keys_b.cuda(),
-        mixing_thresholds.cuda(),
-    ).cpu()
-
-    torch.testing.assert_close(actual_dual.to(torch.int64), expected_dual)
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 
 def test_hash_near_uint32_max_does_not_override_probability():
@@ -72,12 +34,6 @@ def test_hash_near_uint32_max_does_not_override_probability():
     assert boundary_hash >= (1 << 32) - 128
     assert (
         select_watermark_tokens_torch(probabilities, context_hashes, keys).item() == 0
-    )
-    assert (
-        select_watermark_tokens_triton(
-            probabilities.cuda(), context_hashes.cuda(), keys.cuda()
-        ).item()
-        == 0
     )
 
     logits = probabilities.log().cuda()

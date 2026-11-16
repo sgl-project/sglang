@@ -1,49 +1,9 @@
 #include "common.h"
 #include "gemm.h"
 #include "vec.h"
+#include "vec_pack.h"
 
 namespace {
-
-// convert to vnni format
-// from [N, K] to [K/2, N, 2] for bfloat16 and float16
-template <typename scalar_t>
-inline void
-pack_vnni(scalar_t* __restrict__ packed, const scalar_t* __restrict__ weight, int64_t N, int64_t K, int64_t lda) {
-  const int64_t VNNI_BLK = 2;
-  for (int64_t n = 0; n < N; ++n) {
-    for (int64_t k = 0; k < K / VNNI_BLK; ++k) {
-      for (int64_t d = 0; d < VNNI_BLK; ++d) {
-        packed[k * N * VNNI_BLK + n * VNNI_BLK + d] = weight[n * lda + k * VNNI_BLK + d];
-      }
-    }
-  }
-}
-
-#if defined(CPU_CAPABILITY_AVX512)
-template <>
-inline void pack_vnni(
-    at::BFloat16* __restrict__ packed, const at::BFloat16* __restrict__ weight, int64_t N, int64_t K, int64_t lda) {
-  const float* src = reinterpret_cast<const float*>(weight);
-  float* dst = reinterpret_cast<float*>(packed);
-  int64_t K2 = K >> 1;
-  int64_t lda2 = lda >> 1;
-  int64_t ldb2 = N * 2 >> 1;
-
-  __m512i vinputs[16];
-
-  for (int64_t n = 0; n < N; n += 16) {
-    for (int64_t k2 = 0; k2 < K2; k2 += 16) {
-      for (int64_t d = 0; d < 16; ++d) {
-        vinputs[d] = _mm512_loadu_si512(src + (n + d) * lda2 + k2);
-      }
-      transpose_16x16_32bit(vinputs);
-      for (int64_t d = 0; d < 16; ++d) {
-        _mm512_storeu_si512(dst + (k2 + d) * ldb2 + n, vinputs[d]);
-      }
-    }
-  }
-}
-#endif
 
 // apply bias: C [M, N] ldc, Ctmp: [M, N]
 template <typename scalar_t>
@@ -91,9 +51,9 @@ void conv3d_embed_kernel_impl(
   // K in gemm
   const int64_t K = IC * D * H * W;
 
-  // input : [ N/BLOCK_M, BLOCK_M, IC, D, H, W]
-  // weight: [OC/BLOCK_N, IC, D, H*W/2, BLOCK_N, 2]
-  // out   : [N/BLOCK_M, BLOCK_M, OC/BLOCK_N, BLOCK_N]
+  // input : [N, K]
+  // weight: [OC/BLOCK_N, K/2, BLOCK_N, 2]
+  // out   : [N, OC]
   parallel_2d(MB, NB, [&](int64_t mb0, int64_t mb1, int64_t nb0, int64_t nb1) {
     alignas(64) float Ctmp[BLOCK_M * BLOCK_N];
 
@@ -135,13 +95,10 @@ void conv3d_embed_kernel_impl(
 
 }  // anonymous namespace
 
-// [NB]: use blocked format for weight of OIDHW
+// [NB]: use blocked format for weight of OIDHW.
 //
-//   from [OC, Cin, D, H, W]
-//   view [OC / BLOCK_N, BLOCK_N, Cin, D, H * W]
-//   view [OC / BLOCK_N, IC, D, BLOCK_N, H * W]
-//   to   [OC / BLOCK_N][IC, D][H * W / 2, BLOCK_N, 2]
-//        +- parallel -+- seq -+------ mma ----------+
+//   from [OC / BLOCK_N, BLOCK_N, K]
+//   to   [OC / BLOCK_N, K / 2, BLOCK_N, 2]
 //
 at::Tensor conv3d_embed_weight_pack(const at::Tensor& weight) {
   CHECK_INPUT(weight);
@@ -154,37 +111,22 @@ at::Tensor conv3d_embed_weight_pack(const at::Tensor& weight) {
 
   constexpr int64_t BLOCK_N = block_size_n();
   TORCH_CHECK(OC % BLOCK_N == 0, "conv3d_embed_weight_pack: expect OC dividable by ", BLOCK_N);
-  TORCH_CHECK((H * W) % TILE_K == 0, "conv3d_embed_weight_pack: expect IC dividable by ", TILE_K);
 
-  // strides
-  int64_t stride_nb = BLOCK_N * IC * D * H * W;
-  int64_t stride_ic = D * H * W;
-  int64_t stride_d = H * W;
-
+  const int64_t K = IC * D * H * W;
+  TORCH_CHECK(K % 2 == 0, "conv3d_embed_weight_pack: expect K divisible by 2, got ", K);
   const int64_t NB = div_up(OC, BLOCK_N);
   at::Tensor packed_weight = at::empty_like(weight);
   AT_DISPATCH_REDUCED_FLOATING_TYPES(weight.scalar_type(), "conv3d_embed_weight_pack", [&] {
-    // parallel {NB, IC, D}
-    at::parallel_for(0, NB * IC * D, 0, [&](int64_t begin, int64_t end) {
-      int64_t nb{0}, ic{0}, d{0};
-      data_index_init(begin, nb, NB, ic, IC, d, D);
-
+    at::parallel_for(0, NB, 0, [&](int64_t begin, int64_t end) {
       const scalar_t* w_data = weight.data_ptr<scalar_t>();
       scalar_t* packed_data = packed_weight.data_ptr<scalar_t>();
 
-      for (int64_t i = begin; i < end; ++i) {
+      for (int64_t nb = begin; nb < end; ++nb) {
         int64_t n = nb * BLOCK_N;
-        int64_t n_size = std::min(BLOCK_N, OC - n);  // BLOCK_N
+        scalar_t* packed_block = packed_data + nb * BLOCK_N * K;
+        const scalar_t* weight_block = w_data + n * K;
 
-        pack_vnni<scalar_t>(
-            packed_data + i * (BLOCK_N * H * W),
-            w_data + nb * stride_nb + ic * stride_ic + d * stride_d,
-            n_size,
-            H * W,
-            IC * D * H * W);
-
-        // move to the next index
-        data_index_step(nb, NB, ic, IC, d, D);
+        pack_vnni<scalar_t>(packed_block, weight_block, BLOCK_N, K, K, BLOCK_N);
       }
     });
   });

@@ -4,6 +4,7 @@
 use serde_json::{Map, Value, json};
 
 use super::schema_types::normalize_json_schema_types;
+use crate::render::RenderError;
 
 /// The request's `continue_final_message`, coerced as pydantic's `bool`.
 pub fn continues_final_message(request: &Value) -> Result<bool, String> {
@@ -96,6 +97,36 @@ pub(super) fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>, String> {
         .iter()
         .map(|tool| Ok(json!({"type": "function", "function": function_dump(tool)?})))
         .collect()
+}
+
+/// `normalize_assistant_tool_call_arguments(strict=True)`: string arguments must
+/// parse to a JSON object. Nesting beyond serde_json's recursion limit, which
+/// orjson parses, is left to the engine.
+pub(super) fn parse_tool_arguments(message: &mut Value) -> Result<(), RenderError> {
+    if message["role"] != "assistant" {
+        return Ok(());
+    }
+    let calls = message.get_mut("tool_calls").and_then(Value::as_array_mut);
+    for arguments in calls
+        .into_iter()
+        .flatten()
+        .filter_map(|call| call.get_mut("function")?.get_mut("arguments"))
+    {
+        if let Some(text) = arguments.as_str() {
+            let parsed = serde_json::from_str::<Value>(text).map_err(|error| {
+                if error.to_string().starts_with("recursion limit exceeded") {
+                    RenderError::Declined("deeply nested tool arguments".into())
+                } else {
+                    "Assistant tool call function.arguments must be valid JSON.".into()
+                }
+            })?;
+            if !parsed.is_object() {
+                return Err("Assistant tool call function.arguments must be a JSON object.".into());
+            }
+            *arguments = parsed;
+        }
+    }
+    Ok(())
 }
 
 /// `protocol.py::Function.model_dump()`, after `Tool._propagate_defer_loading`

@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.kernels.ops.attention.msa_v1.compact_dequant import dequant_nvfp4_page_table
+from sglang.kernels.ops.kvcache.msa_v1_compact_dequant import dequant_nvfp4_page_table
 from sglang.srt.layers.attention.minimax_sparse_ops.msa_plan import (
     MSA_V1_DECODE_INDEXER_AVAILABLE,
     MSAV1DecodeAttentionPlan,
