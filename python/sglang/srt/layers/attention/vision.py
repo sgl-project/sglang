@@ -540,12 +540,11 @@ class VisionTritonAttention(nn.Module):
             seq_lens = forward_metadata.seq_lens
             max_seqlen = forward_metadata.max_seqlen
             output = torch.empty_like(q)
-        elif envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
+        elif isinstance(cu_seqlens, list):
+            # ViT CUDA graph runners pass [cu_seqlens, seq_lens, max_seqlen]; models
+            # without a runner keep passing tensors even when the graph env var is set.
             if "output_ws" not in kwargs:
                 raise RuntimeError("output_ws should be prepared for cuda-graph mode")
-
-            if not isinstance(cu_seqlens, list):
-                raise RuntimeError("cuda-graph mode cu_seqlens should be a list")
 
             output = kwargs["output_ws"]
             cu_seqlens_gpu = cu_seqlens[0]
@@ -611,9 +610,9 @@ class VisionFlash3Attention(nn.Module):
         if forward_metadata is not None:
             cu_seqlens_gpu = forward_metadata.cu_seqlens
             max_seqlen = forward_metadata.max_seqlen
-        elif envs.SGLANG_VIT_ENABLE_CUDA_GRAPH.get():
-            if not isinstance(cu_seqlens, list):
-                raise RuntimeError("cuda-graph mode cu_seqlens should be a list")
+        elif isinstance(cu_seqlens, list):
+            # ViT CUDA graph runners pass [cu_seqlens, max_seqlen]; models without
+            # a runner keep passing tensors even when the graph env var is set.
             cu_seqlens_gpu = cu_seqlens[0]
             max_seqlen = cu_seqlens[1]
         else:

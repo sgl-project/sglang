@@ -103,6 +103,71 @@ def test_fa4_seqlens_from_vit_cuda_graph_list(monkeypatch, graph_env):
     assert calls[0]["cu_seqlens_q"] is cu_seqlens
 
 
+def test_fa3_tensor_seqlens_with_vit_cuda_graph_env(monkeypatch):
+    # A model without a ViT CUDA graph runner passes tensor cu_seqlens; setting
+    # SGLANG_VIT_ENABLE_CUDA_GRAPH for another model must not make FA3 raise.
+    monkeypatch.setenv("SGLANG_VIT_ENABLE_CUDA_GRAPH", "1")
+    monkeypatch.setattr(vision, "_is_cuda", True)
+    calls = []
+
+    def fake_flash_attn_func(q, k, v, **kwargs):
+        calls.append(kwargs)
+        return q
+
+    monkeypatch.setattr(vision, "flash_attn_func", fake_flash_attn_func, raising=False)
+    q = torch.randn(6, 2, 8)
+    cu_seqlens = torch.tensor([0, 4, 6], dtype=torch.int32)
+    backend = vision.VisionFlash3Attention()
+
+    backend(q, q, q, cu_seqlens=[cu_seqlens, 4], bsz=1, seq_len=6)
+    backend(q, q, q, cu_seqlens=cu_seqlens, bsz=1, seq_len=6, max_seqlen=4)
+
+    for kwargs in calls:
+        assert torch.equal(kwargs["cu_seqlens_q"], cu_seqlens)
+        assert kwargs["max_seqlen_q"] == kwargs["max_seqlen_k"] == 4
+    assert calls[0]["cu_seqlens_q"] is cu_seqlens
+
+
+def test_triton_tensor_seqlens_with_vit_cuda_graph_env(monkeypatch):
+    # Same contract for the Triton backend: the list form (with its output
+    # workspace) comes only from a graph runner, tensors take the eager path.
+    monkeypatch.setenv("SGLANG_VIT_ENABLE_CUDA_GRAPH", "1")
+    calls = []
+
+    def fake_context_attention_fwd(
+        q, k, v, o, cu_seqlens, seq_lens, max_seqlen, **kwargs
+    ):
+        calls.append((o, cu_seqlens, seq_lens, max_seqlen))
+
+    monkeypatch.setattr(vision, "context_attention_fwd", fake_context_attention_fwd)
+    q = torch.randn(6, 2, 8)
+    cu_seqlens = torch.tensor([0, 4, 6], dtype=torch.int32)
+    seq_lens = torch.tensor([4, 2], dtype=torch.int32)
+    output_ws = torch.empty_like(q)
+    backend = vision.VisionTritonAttention()
+
+    out = backend(
+        q,
+        q,
+        q,
+        cu_seqlens=[cu_seqlens, seq_lens, 4],
+        bsz=1,
+        seq_len=6,
+        output_ws=output_ws,
+    )
+    backend(
+        q, q, q, cu_seqlens=cu_seqlens, bsz=1, seq_len=6, max_seqlen=4, output_ws=None
+    )
+
+    assert out is output_ws
+    assert calls[0][1] is cu_seqlens
+    for o, cu, lens, max_seqlen in calls:
+        assert o.shape == q.shape
+        assert torch.equal(cu, cu_seqlens)
+        assert torch.equal(lens, seq_lens)
+        assert max_seqlen == 4
+
+
 def test_explicit_backend_without_published_mm_context(monkeypatch, npu_platform):
     monkeypatch.setattr(
         vision,
