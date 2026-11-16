@@ -29,11 +29,45 @@ else
 fi
 echo "===== Install kubernetes - End ====="
 
-echo "===== Install blake3 - Begin ====="
-# sglang.srt.multimodal.cache.digest imports blake3 at module import time;
-# the nightly NPU images do not ship it.
-pip install blake3 -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
-echo "===== Install blake3 - End ====="
+echo "===== Install missing deps - Begin ====="
+# The pods run the checkout's sglang (newer than the frozen images), so the
+# packages below must be brought up to date here; public wheels come from the
+# tuna mirror.
+pip install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple \
+    blake3 \
+    "grpcio>=1.81.1" "grpcio-health-checking>=1.81.1" "grpcio-reflection>=1.81.1" \
+    "protobuf>=6.33.5"
+echo "===== Install missing deps - End ====="
+
+# sgl_kernel_npu ships as a zip on GitHub releases (same source the image
+# build uses). The merged main requires >= 2026.11.0.post3
+# (operators.mem_cache); upgrade in place when the release is reachable,
+# otherwise keep the image version and let the server fail with a clear
+# ModuleNotFoundError.
+if python -c "import torch_npu" 2>/dev/null; then
+  SGL_KERNEL_NPU_TAG=2026.11.0.post5
+  TORCH_VER=$(python -c "import torch; print(torch.__version__.split('+')[0])")
+  CANN_VER=$(ls /usr/local/Ascend | grep -oE "cann-[0-9.]+" | head -1 | cut -d- -f2)
+  if npu-smi info -t board -i 0 -c 0 2>/dev/null | grep -q "950"; then
+    NPU_DEVICE=950
+  else
+    NPU_DEVICE=a3
+  fi
+  KERNEL_URL="https://github.com/sgl-project/sgl-kernel-npu/releases/download/${SGL_KERNEL_NPU_TAG}/sgl-kernel-npu-${SGL_KERNEL_NPU_TAG}-torch${TORCH_VER}-py312-cann${CANN_VER}-${NPU_DEVICE}-$(arch).zip"
+  echo "Upgrade sgl_kernel_npu from ${KERNEL_URL}"
+  mkdir -p /tmp/sgl-kernel-npu && cd /tmp/sgl-kernel-npu
+  if wget -q "${KERNEL_URL}"; then
+    unzip -o ./*.zip
+    pip install --no-deps ./sgl_kernel_npu*.whl
+    cd /
+    rm -rf /tmp/sgl-kernel-npu
+    echo "sgl_kernel_npu upgraded to ${SGL_KERNEL_NPU_TAG}"
+  else
+    cd /
+    rm -rf /tmp/sgl-kernel-npu
+    echo "WARNING: failed to download ${KERNEL_URL}; keeping the image's sgl_kernel_npu."
+  fi
+fi
 
 PYTHON_FOR_SGLANG="python"
 PIP_FOR_SGLANG="pip"
