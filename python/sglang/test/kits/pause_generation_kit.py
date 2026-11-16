@@ -3,6 +3,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
+from sglang.test.test_utils import admin_post
+
 _REQUEST_TIMEOUT = 180
 
 
@@ -50,7 +52,7 @@ class PauseResumeInPlaceMixin:
 
             # Pause all targets
             for url in target_urls:
-                requests.post(
+                admin_post(
                     url + "/pause_generation",
                     json={"mode": "in_place"},
                     timeout=30,
@@ -79,7 +81,7 @@ class PauseResumeInPlaceMixin:
 
             # Resume all targets (reverse order to unblock downstream first)
             for url in reversed(target_urls):
-                requests.post(
+                admin_post(
                     url + "/continue_generation",
                     json={},
                     timeout=30,
