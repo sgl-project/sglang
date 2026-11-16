@@ -226,11 +226,7 @@ class GPUEnv(BaseEnv):
                 text=True,
                 check=True,
             )
-            return {
-                "NVIDIA Topology": (
-                    "\n" + result.stdout if result.returncode == 0 else None
-                )
-            }
+            return {"NVIDIA Topology": "\n" + result.stdout}
         except (subprocess.SubprocessError, OSError):
             return {}
 
@@ -303,9 +299,7 @@ class HIPEnv(BaseEnv):
                 text=True,
                 check=True,
             )
-            return {
-                "AMD Topology": "\n" + result.stdout if result.returncode == 0 else None
-            }
+            return {"AMD Topology": "\n" + result.stdout}
         except (subprocess.SubprocessError, OSError):
             return {}
 
@@ -444,11 +438,7 @@ class NPUEnv(BaseEnv):
                 text=True,
                 check=True,
             )
-            return {
-                "Ascend Topology": (
-                    "\n" + result.stdout if result.returncode == 0 else None
-                )
-            }
+            return {"Ascend Topology": "\n" + result.stdout}
         except (subprocess.SubprocessError, OSError):
             return {}
 
@@ -534,11 +524,7 @@ class MUSAEnv(BaseEnv):
                 text=True,
                 check=True,
             )
-            return {
-                "MTHREADS Topology": (
-                    "\n" + result.stdout if result.returncode == 0 else None
-                )
-            }
+            return {"MTHREADS Topology": "\n" + result.stdout}
         except (subprocess.SubprocessError, OSError):
             return {}
 
