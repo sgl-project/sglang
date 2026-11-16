@@ -142,13 +142,8 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
 
     # Path / checkpoint resolution
     @staticmethod
-    def _resolve_shape_dir(
-        model_path: str,
-        subfolder: str,
-        use_safetensors: bool,
-        variant: str | None,
-    ) -> tuple[str, str]:
-        """Locate (or download) the shape subfolder and return (config_path, ckpt_path)."""
+    def _locate_subfolder(model_path: str, subfolder: str) -> str:
+        """Return the local path of a model subfolder, downloading it when absent."""
         local_path = os.path.join(model_path, subfolder)
         if not os.path.exists(local_path):
             local_path = os.path.expanduser(local_path)
@@ -163,6 +158,17 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
                 allow_patterns=[f"{subfolder}/**"],
             )
             local_path = os.path.join(downloaded, subfolder)
+        return local_path
+
+    @staticmethod
+    def _resolve_shape_dir(
+        model_path: str,
+        subfolder: str,
+        use_safetensors: bool,
+        variant: str | None,
+    ) -> tuple[str, str]:
+        """Locate (or download) the shape subfolder and return (config_path, ckpt_path)."""
+        local_path = Hunyuan3D2Pipeline._locate_subfolder(model_path, subfolder)
 
         config_path = os.path.join(local_path, "config.yaml")
         if not os.path.exists(config_path):
@@ -196,20 +202,7 @@ class Hunyuan3D2Pipeline(ComposedPipelineBase):
         subfolder: str,
         required_files: tuple[str, ...],
     ) -> str:
-        local_path = os.path.join(model_path, subfolder)
-        if not os.path.exists(local_path):
-            local_path = os.path.expanduser(local_path)
-
-        if not os.path.exists(local_path):
-            logger.info(
-                "Local path %s not found, downloading from HuggingFace Hub",
-                local_path,
-            )
-            downloaded = snapshot_download(
-                repo_id=model_path,
-                allow_patterns=[f"{subfolder}/**"],
-            )
-            local_path = os.path.join(downloaded, subfolder)
+        local_path = Hunyuan3D2Pipeline._locate_subfolder(model_path, subfolder)
 
         for relative_path in required_files:
             required_file = os.path.join(local_path, relative_path)

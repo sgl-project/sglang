@@ -207,6 +207,40 @@ def test_cache_stores_only_consumed_text_conditioning(output_type, device, monke
     assert cache.bytes <= cache.max_bytes
 
 
+@torch.no_grad()
+def test_encode_text_applies_per_call_tokenizer_overrides():
+    """Per-call padding / truncation must reach the tokenizer and override the
+    config's tokenizer kwargs."""
+    config = make_text_config()
+    config.text_encoder_configs = [
+        SimpleNamespace(tokenizer_kwargs={"padding": "longest", "truncation": True})
+    ]
+    tokenize = config.tokenize_prompt
+    seen_tok_kwargs = []
+
+    def recording_tokenize(texts, tokenizer, tok_kwargs):
+        seen_tok_kwargs.append(dict(tok_kwargs))
+        return tokenize(texts, tokenizer, tok_kwargs)
+
+    config.tokenize_prompt = recording_tokenize
+    with patch(_GLOBAL_ARGS_PATCH, return_value=MagicMock()):
+        stage = TextEncodingStage(
+            text_encoders=[FullHiddenStateEncoder().eval()], tokenizers=[object()]
+        )
+    stage._begin_text_encoder_use = MagicMock()
+    stage._text_encode_dp_group = MagicMock(return_value=None)
+
+    stage.encode_text(
+        "hello",
+        make_server_args(pipeline_config=config),
+        device="cpu",
+        padding="max_length",
+        truncation=False,
+    )
+
+    assert seen_tok_kwargs == [{"padding": "max_length", "truncation": False}]
+
+
 class DummyTextEncodingStage(TextEncodingStage):
     def __init__(self):
         with patch(_GLOBAL_ARGS_PATCH) as mock_global_args:

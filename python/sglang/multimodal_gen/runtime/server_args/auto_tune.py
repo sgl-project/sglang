@@ -162,7 +162,7 @@ class ServerArgsAutoTuner:
 
     def _resolve_keep_resident_min_available_gb(
         self, deployment_config: ModelDeploymentConfig
-    ) -> float | None:
+    ) -> float:
         # explicit per-model > task-type default > global default
         explicit = deployment_config.keep_resident_min_available_gb
         if explicit is not None:
@@ -259,9 +259,7 @@ class ServerArgsAutoTuner:
         )
         all_resident = self._keeps_all_components_resident()
         if all_resident or (
-            min_available_gb is not None
-            and disable_threshold_gb is not None
-            and min_available_gb >= disable_threshold_gb
+            min_available_gb is not None and min_available_gb >= disable_threshold_gb
         ):
             changed = []
             components = set(
@@ -740,9 +738,6 @@ class ServerArgsAutoTuner:
 
         deployment_config = self._deployment_config()
         threshold_gb = self._resolve_keep_resident_min_available_gb(deployment_config)
-        if threshold_gb is None:
-            return components
-
         min_available_gb = self._get_min_available_device_memory_gb()
         if min_available_gb is None or min_available_gb < threshold_gb:
             return components

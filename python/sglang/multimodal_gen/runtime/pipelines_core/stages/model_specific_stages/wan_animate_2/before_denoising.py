@@ -17,10 +17,7 @@ import numpy as np
 import torch
 from einops import rearrange
 
-from sglang.multimodal_gen.runtime.distributed import (
-    get_local_torch_device,
-    get_sp_world_size,
-)
+from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
 )
@@ -212,7 +209,6 @@ class WanAnimate2RequestState(msgspec.Struct, kw_only=True):
     """Clip-independent state, computed once, reused by every clip."""
 
     device: torch.device
-    sp_size: int
     generator: torch.Generator
     inputs: _WanAnimate2Inputs
 
@@ -511,7 +507,6 @@ class WanAnimate2BeforeDenoisingStage(TextEncodingStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         device = get_local_torch_device()
-        sp_size = max(1, int(get_sp_world_size()))
 
         inputs = _WanAnimate2Inputs.from_request(batch)
 
@@ -522,7 +517,6 @@ class WanAnimate2BeforeDenoisingStage(TextEncodingStage):
         request_state = self._build_request_state(
             inputs,
             device,
-            sp_size,
             generator,
             server_args,
             audio=audio,
@@ -547,7 +541,6 @@ class WanAnimate2BeforeDenoisingStage(TextEncodingStage):
         self,
         inputs: _WanAnimate2Inputs,
         device: torch.device,
-        sp_size: int,
         generator: torch.Generator,
         server_args: ServerArgs,
         *,
@@ -633,7 +626,6 @@ class WanAnimate2BeforeDenoisingStage(TextEncodingStage):
 
         return WanAnimate2RequestState(
             device=device,
-            sp_size=sp_size,
             generator=generator,
             inputs=inputs,
             letterbox_info=letterbox_info,

@@ -23,6 +23,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.p
     _preprocess_image,
     _resize_with_pad_image_tensor,
 )
+from sglang.multimodal_gen.runtime.vla import cuda_graph
 from sglang.multimodal_gen.runtime.vla.cuda_graph import (
     VLADenoiseGraphRunner,
     VLADenoiseGraphSignature,
@@ -79,7 +80,6 @@ def test_denoise_graph_skips_prefix_copy_for_same_digest(monkeypatch):
         static_x_t=torch.empty(1, 2, 4),
         static_timestep=torch.empty(1),
         static_output=torch.empty(1, 2, 4),
-        current_context_id=123,
         current_context_digest="same",
     )
 
@@ -105,7 +105,6 @@ def test_denoise_graph_copies_mutable_prefix_graph_output():
         static_x_t=torch.empty(1, 2, 4),
         static_timestep=torch.empty(1),
         static_output=torch.empty(1, 2, 4),
-        current_context_id=123,
     )
     current_context = _prefix_context(2.0, None)
     current_context.layout["mutable_graph_output"] = True
@@ -118,6 +117,26 @@ def test_denoise_graph_copies_mutable_prefix_graph_output():
         captured.static_prefix_context.prefix_pad_masks,
         current_context.prefix_pad_masks,
     )
+
+
+def test_denoise_graph_copies_a_new_prefix_at_a_recycled_address(monkeypatch):
+    """A request's K/V object can be allocated at the address of the previous
+    request's freed one; the replay must still use the new observation."""
+    # Every object reports one address, as when the allocator reuses a freed block.
+    monkeypatch.setattr(cuda_graph, "id", lambda obj: 4096, raising=False)
+    runner = VLADenoiseGraphRunner(enabled=True)
+    captured = _CapturedDenoiseGraph(
+        graph=object(),
+        static_prefix_context=_prefix_context(0.0, None),
+        static_x_t=torch.empty(1, 2, 4),
+        static_timestep=torch.empty(1),
+        static_output=torch.empty(1, 2, 4),
+    )
+
+    runner._sync_context_if_needed(captured, _prefix_context(1.0, None))
+    runner._sync_context_if_needed(captured, _prefix_context(2.0, None))
+
+    assert captured.static_prefix_context.past_key_values[0][0].eq(2.0).all()
 
 
 def _denoise_signature(prefix_len: int) -> VLADenoiseGraphSignature:

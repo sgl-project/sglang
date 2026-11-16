@@ -184,6 +184,35 @@ class TestExplicitCliArgs(unittest.TestCase):
                     ServerArgs.get_provided_args(parsed, unknown), {field: value}
                 )
 
+    def test_abbreviated_flags_keep_their_value(self):
+        """argparse accepts an unambiguous prefix of a flag (--tp 2 sets tp_size);
+        the value must count as provided instead of being dropped for the default."""
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        for argv, field, value in (
+            (["--tp", "2"], "tp_size", 2),
+            (["--num-gpu=4"], "num_gpus", 4),
+        ):
+            with self.subTest(argv=argv), patch.object(sys, "argv", ["sglang", *argv]):
+                parsed, unknown = parser.parse_known_args(argv)
+                self.assertEqual(getattr(parsed, field), value)
+                self.assertEqual(unknown, [])
+                self.assertEqual(
+                    ServerArgs.get_provided_args(parsed, unknown), {field: value}
+                )
+
+    def test_full_flag_registered_later_is_not_taken_for_an_abbreviation(self):
+        """A flag another module adds to the same parser is matched exactly by
+        argparse; it must not be resolved to a server flag it happens to prefix."""
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        parser.add_argument("--tp", type=int)
+        argv = ["--tp", "2"]
+        with patch.object(sys, "argv", ["sglang", *argv]):
+            parsed, unknown = parser.parse_known_args(argv)
+            self.assertIsNone(parsed.tp_size)
+            self.assertEqual(ServerArgs.get_provided_args(parsed, unknown), {"tp": 2})
+
 
 class _CudaPlatformTestCase(unittest.TestCase):
     def setUp(self):
