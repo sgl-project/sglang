@@ -58,6 +58,7 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import (
     init_logger,
 )
 from sglang.multimodal_gen.test.test_utils import print_divider, print_value_formatted
+from sglang.srt.arg_groups.argparse_actions import DeprecatedAction
 
 logger = init_logger(__name__)
 
@@ -98,7 +99,6 @@ class BenchArgs:
     num_inference_steps: int = 20
     guidance_scale: float = 7.5
     seed: int = 42
-    disable_safety_checker: bool = False
 
     # Output Configuration
     width: int = 32
@@ -147,8 +147,8 @@ class BenchArgs:
         parser.add_argument("--seed", type=int, default=42, help="Random seed")
         parser.add_argument(
             "--disable-safety-checker",
-            action="store_true",
-            help="Disable NSFW detection",
+            action=DeprecatedAction,
+            help="(Deprecated) No effect: generation runs no safety checker.",
         )
 
         # Output Configuration
@@ -502,8 +502,6 @@ def throughput_test(
         "num_profiled_timesteps": bench_args.num_profiled_timesteps,
         "profile_all_stages": bench_args.profile_all_stages,
     }
-    if bench_args.disable_safety_checker:
-        _sampling_params["safety_checker"] = None
 
     if manifest is None:
         all_prompts = [request.prompt for request in dataset_requests]
