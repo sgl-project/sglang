@@ -77,7 +77,9 @@ def run_profile(
 
 
 if __name__ == "__main__":
-    parser = ArgumentParser(description="Benchmark the online serving throughput.")
+    parser = ArgumentParser(
+        description="Run live profiling on a running SGLang server."
+    )
     parser.add_argument(
         "--url",
         type=str,

@@ -375,7 +375,7 @@ class Runtime:
 
         Args:
             log_level: Log level for the server.
-            timeout: Timeout in seconds for waiting for the server to start.
+            launch_timeout: Timeout in seconds for waiting for the server to start.
             *args: Additional arguments passed to ServerArgs.
             **kwargs: Additional keyword arguments passed to ServerArgs.
         """
