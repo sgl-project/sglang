@@ -220,7 +220,9 @@ def get_git_commit_hash() -> str:
         if not commit_hash:
             commit_hash = (
                 subprocess.check_output(
-                    ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+                    ["git", "rev-parse", "HEAD"],
+                    stderr=subprocess.DEVNULL,
+                    cwd=os.path.dirname(os.path.abspath(__file__)),
                 )
                 .strip()
                 .decode("utf-8")
