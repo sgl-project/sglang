@@ -7,6 +7,7 @@ from sglang.srt.entrypoints.openai.protocol import Function, Tool
 from sglang.srt.environ import envs
 from sglang.srt.function_call.base_format_detector import BaseFormatDetector
 from sglang.srt.function_call.core_types import StreamingParseResult
+from sglang.srt.function_call.internlm_detector import InternlmDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(5, "base-a-test-cpu")
@@ -76,6 +77,33 @@ def test_unknown_tool_name_forwarded(caplog):
         assert result.calls[0].name == "unknown_tool"
         assert result.calls[0].tool_index == -1
         assert json.loads(result.calls[0].parameters)["city"] == "Paris"
+
+
+def test_internlm_forwards_unknown_tool_and_keeps_known_calls():
+    """With forwarding on, an unknown InternLM call is forwarded with index -1
+    and the known calls of the same message are still returned."""
+    tools = [
+        Tool(
+            function=Function(
+                name="get_weather", parameters={"type": "object", "properties": {}}
+            )
+        )
+    ]
+    text = (
+        'Checking.<|action_start|> <|plugin|>\n{"name": "get_weather", '
+        '"parameters": {"city": "Paris"}}<|action_end|>'
+        '<|action_start|> <|plugin|>\n{"name": "unknown_tool", '
+        '"parameters": {"city": "Rome"}}<|action_end|>'
+    )
+    with envs.SGLANG_FORWARD_UNKNOWN_TOOLS.override(True):
+        result = InternlmDetector().detect_and_parse(text, tools)
+
+    assert result.normal_text == "Checking."
+    assert [(c.name, c.tool_index) for c in result.calls] == [
+        ("get_weather", 0),
+        ("unknown_tool", -1),
+    ]
+    assert json.loads(result.calls[1].parameters) == {"city": "Rome"}
 
 
 if __name__ == "__main__":
