@@ -23,6 +23,7 @@ from sglang.srt.arg_groups.model_overrides import gemma2_gemma3  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import gemma4  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import gigachat35  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import glm4_moe  # noqa: F401
+from sglang.srt.arg_groups.model_overrides import glm5_next  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import gpt_oss  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import granitemoehybrid  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import inkling  # noqa: F401

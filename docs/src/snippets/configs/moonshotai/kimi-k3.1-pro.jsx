@@ -126,7 +126,7 @@ export const config = {
             "--speculative-draft-model-path RadixArk/Kimi-K3.1-Dflash2-Preview",
             `--speculative-dflash-block-size ${config.dflashBlock(s)}`,
             "--speculative-draft-kv-cache-dtype fp8_e4m3",
-            // The draft KV ring (default on, colocated only) needs an MLA draft backend; DCP
+            // The draft KV ring (default on) needs an MLA draft backend; DCP
             // forces this one anyway, so pinning it keeps DCP and non-DCP recipes on the same
             // path. ROCm's Triton draft backend keeps the per-token draft pool.
             `--speculative-draft-attention-backend ${config.isAmd(s) ? "triton" : "cutedsl_mla"}`,
