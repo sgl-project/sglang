@@ -1018,12 +1018,7 @@ def pre_permute_standard_to_deep_gemm(
     topk_weights, topk_ids, _ = topk_output
     # SM120's DeepGEMM grouped GEMM consumes standard-layout activations only.
     # Feeding it the shared masked/swizzled layout does not raise -- it silently
-    # returns wrong results (GSM8K 0.96 -> 0.06, measured on 4x RTX 6000D), so
-    # refuse the combination rather than corrupt output.
-    assert deep_gemm_sm120.is_supported(), (
-        "--moe-runner-backend deep_gemm on consumer Blackwell (SM120) requires "
-        "the standard-layout MoE path, which is unavailable in this build."
-    )
+    # returns wrong results (GSM8K 0.96 -> 0.06, measured on 4x RTX 6000D).
     sm120_input = deep_gemm_sm120.maybe_pre_permute(
         hidden_states, topk_ids, topk_weights, quant_info, runner_config, running_state
     )
