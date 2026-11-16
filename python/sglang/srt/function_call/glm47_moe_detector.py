@@ -430,6 +430,24 @@ class Glm47MoeDetector(BaseFormatDetector):
         Returns:
             JSON string increment to append to the output
         """
+        if (
+            self._stream_state == StreamState.IN_VALUE
+            and not self._xml_tag_buffer
+            and "<" not in raw_increment
+        ):
+            if not raw_increment:
+                return ""
+            value_type = self._cached_value_type or "string"
+            self._current_value += raw_increment
+            if value_type in ("auto", "number", "integer"):
+                return ""
+            if value_type == "string":
+                prefix = "" if self._value_started else '"'
+                self._value_started = True
+                return prefix + json.dumps(raw_increment, ensure_ascii=False)[1:-1]
+            self._value_started = True
+            return raw_increment
+
         json_output = ""
 
         for char in raw_increment:
