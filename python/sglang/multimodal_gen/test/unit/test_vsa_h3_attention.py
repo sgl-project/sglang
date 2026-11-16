@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from unittest import mock
 
 import pytest
 import torch
+import triton
 
 from sglang.multimodal_gen.runtime.layers.attention.backends import vsa_h3_kernels
 from sglang.multimodal_gen.runtime.layers.attention.backends.video_sparse_attn_h3 import (
@@ -223,6 +225,48 @@ def test_topk_list_kernel_compiles_once_per_bucket(monkeypatch) -> None:
         )
         assert torch.equal(lists[:, num_prefix:n_tiles, : num_prefix + keep], reference)
     assert len(cache) == 1
+
+
+def _same_bytes(a: torch.Tensor, b: torch.Tensor) -> bool:
+    return a.dtype == b.dtype and torch.equal(a.view(torch.uint8), b.view(torch.uint8))
+
+
+@requires_cuda
+def test_untile_kernel_compiles_once_per_mode(monkeypatch) -> None:
+    """The used rows and the tile count follow the prompt length; each
+    divisibility class must reuse one variant per mode and give the bytes of
+    the length-specialized kernel."""
+    kernel = vsa_h3_kernels._untile_kernel
+    cache = _fresh_compile_cache(monkeypatch, kernel)
+    specialized = triton.jit(kernel.fn)
+    block = vsa_h3_kernels.VSA_H3_KERNEL_BLOCK
+    # (tiles, used rows): each divisible by 16 or not
+    for n_tiles, used in ((32, 2048), (32, 2047), (33, 2096), (33, 2100)):
+        total = n_tiles * block
+        out, gate = (
+            torch.randn(7, total, HEAD_DIM, device="cuda").to(torch.bfloat16)
+            for _ in range(2)
+        )
+        compress = torch.randn(7, n_tiles, HEAD_DIM, device="cuda")
+        dst = torch.randperm(total, device="cuda").to(torch.int32)
+        for has_gate in (True, False):
+            results = []
+            for jit in (kernel, specialized):
+                result = torch.empty(
+                    total, 7, HEAD_DIM, dtype=torch.bfloat16, device="cuda"
+                )
+                with mock.patch.object(vsa_h3_kernels, "_untile_kernel", jit):
+                    vsa_h3_kernels.vsa_h3_untile(
+                        out,
+                        gate if has_gate else None,
+                        compress if has_gate else None,
+                        dst,
+                        used,
+                        result,
+                    )
+                results.append(result)
+            assert _same_bytes(*results)
+    assert len(cache) == 2
 
 
 def _masked_dense_reference(meta, used, q, k, v, gate, sparsity):

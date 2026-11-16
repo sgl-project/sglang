@@ -428,7 +428,11 @@ def vsa_h3_pack_tiles(
     )
 
 
-@triton.jit
+# used and N_TILES follow the prompt length; specializing on their
+# divisibility compiled new variants on the request path. They bound the row
+# mask and index the compression rows, while the vector accesses run along
+# HEAD_DIM, so the arithmetic is unchanged.
+@triton.jit(do_not_specialize=["used", "N_TILES"])
 def _untile_kernel(
     OutTiled,
     Gate,
