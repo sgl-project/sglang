@@ -176,6 +176,9 @@ def prepare_kv_for_attention(
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_xpu = is_xpu()
+# TileLang sparse attention reads the top-k page table in 64-column blocks
+# (_forward_tilelang pads the table to this multiple).
+_TILELANG_TOPK_COL_BLOCK = 64
 
 if _is_hip:
     from sglang.kernels.ops.attention.dsa.triton_kernel import get_valid_kv_indices
@@ -4864,6 +4867,23 @@ class DeepseekSparseAttnBackend(
             topk_transform_method = TopkTransformMethod.PAGED
         return topk_transform_method
 
+    def _decode_topk_out_col_align(self, forward_batch: ForwardBatch) -> int:
+        """Let the k-pool indexer emit TileLang's padded top-k width directly.
+
+        forward_decode hands fused top-k indices to _forward_tilelang unchanged,
+        which otherwise pads them to a 64-column multiple with cat + fill in
+        every DSA layer."""
+        if (
+            _is_hip
+            and self.dsa_index_kpool > 1
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and self.dsa_decode_impl == "tilelang"
+            and self.use_fused_topk
+            and self.hisparse_coordinator is None
+        ):
+            return _TILELANG_TOPK_COL_BLOCK
+        return 1
+
     def get_indexer_metadata(
         self, layer_id: int, forward_batch: ForwardBatch
     ) -> DSAIndexerMetadata:
@@ -4881,6 +4901,7 @@ class DeepseekSparseAttnBackend(
                 forward_batch.forward_mode
             ),
             topk_backend=self.dsa_topk_backend,
+            topk_out_col_align=self._decode_topk_out_col_align(forward_batch),
             paged_mqa_schedule_metadata=self.forward_metadata.paged_mqa_schedule_metadata,
             paged_mqa_ctx_lens_2d=self.forward_metadata.paged_mqa_ctx_lens_2d,
             force_unfused_topk=force_unfused,

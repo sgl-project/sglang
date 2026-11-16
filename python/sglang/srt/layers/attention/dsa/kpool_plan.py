@@ -576,6 +576,18 @@ def _compute_pool_schedule_metadata(
     )
 
 
+def _pooled_paged_mqa_metadata_enabled(forward_mode: ForwardMode) -> bool:
+    """Whether the step builds the pooled seqlens / page table once for all layers.
+
+    Without it every DSA layer rebuilds both (4 small kernels per layer) in
+    IndexerKPool._get_kpool_decode_metadata. On ROCm only decode takes this path;
+    the schedule metadata and the top-k v2 plan stay CUDA-only (both return None).
+    """
+    if is_cuda():
+        return True
+    return is_hip() and forward_mode.is_decode_or_idle()
+
+
 def init_pooled_paged_mqa_metadata(
     metadata: DSAMetadata,
     seqlens_32: torch.Tensor,
@@ -588,7 +600,7 @@ def init_pooled_paged_mqa_metadata(
 ) -> DSAMetadata:
     if (
         not _is_kpool_layout_enabled(kpool, physical_page_size)
-        or not is_cuda()
+        or not _pooled_paged_mqa_metadata_enabled(forward_mode)
         or not (forward_mode.is_decode_or_idle() or forward_mode.is_target_verify())
     ):
         return metadata
@@ -634,7 +646,7 @@ def update_pooled_paged_mqa_metadata(
 ) -> None:
     if (
         not _is_kpool_layout_enabled(kpool, physical_page_size)
-        or not is_cuda()
+        or not _pooled_paged_mqa_metadata_enabled(forward_mode)
         or not (forward_mode.is_decode_or_idle() or forward_mode.is_target_verify())
     ):
         return

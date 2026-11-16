@@ -66,6 +66,9 @@ from sglang.srt.runtime_context import get_device, get_exec
 
 logger = logging.getLogger(__name__)
 
+_is_hip = is_hip()
+
+
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
@@ -758,6 +761,7 @@ class IndexerKPool(MultiPlatformOp):
         out_rows: Optional[int] = None,
         page_table_row_index: Optional[torch.Tensor] = None,
         topk_v2_plan: Optional[torch.Tensor] = None,
+        out_col_align: int = 1,
     ) -> torch.Tensor:
         from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
             topk_from_pooled_history_logits,
@@ -787,6 +791,7 @@ class IndexerKPool(MultiPlatformOp):
             out_rows=out_rows,
             page_table_row_index=page_table_row_index,
             topk_v2_plan=topk_v2_plan,
+            out_col_align=out_col_align,
         )
 
     def _get_kpool_decode_metadata(
@@ -1082,6 +1087,12 @@ class IndexerKPool(MultiPlatformOp):
             page_table=page_table_1,
             topk_offsets=topk_offsets,
             out_rows=num_q_padded if num_q_padded != n_real else None,
+            out_col_align=(
+                getattr(metadata, "topk_out_col_align", 1)
+                if forward_batch.forward_mode.is_decode_or_idle()
+                and page_table_1 is not None
+                else 1
+            ),
         )
         return topk_result
 
@@ -1623,6 +1634,71 @@ class IndexerKPool(MultiPlatformOp):
             return None
         return self._get_topk_paged(forward_batch, layer_id, q_fp8, weights, metadata)
 
+    def _use_hip_decode_path(
+        self, forward_batch: ForwardBatch, enable_dual_stream: bool
+    ) -> bool:
+        """ROCm decode with the query prep in one kernel (_forward_hip_decode).
+
+        Needs: no RoPE between wq_b and the Hadamard (it moves into the quant
+        kernel), one 128-wide quant block per head, the single-stream schedule,
+        and the TileLang act_quant the kernel reproduces (not gfx1250, which takes
+        the Triton act_quant)."""
+        from sglang.srt.utils import is_gfx1250_supported
+
+        return (
+            _is_hip
+            and not is_gfx1250_supported()
+            and forward_batch.forward_mode.is_decode_or_idle()
+            and not enable_dual_stream
+            and (self.skip_rope or self.rope_head_dim == 0)
+            and self.head_dim == 128
+            and self.block_size == self.head_dim
+        )
+
+    def _forward_hip_decode(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        metadata: BaseIndexerMetadata,
+        return_indices: bool,
+    ) -> Optional[torch.Tensor]:
+        """Decode indexer with the query Hadamard, act_quant and the head-gate
+        scaling in one kernel (kpool_q_rotate_quant_gate). The key side (wk,
+        k_norm, the k-pool cache write) is the generic path's, unchanged. Same
+        results as the generic path, bit for bit.
+        """
+        from sglang.srt.layers.attention.dsa.kpool_fp8_index import (
+            kpool_q_rotate_quant_gate,
+        )
+
+        query, _ = self.wq_b(q_lora)
+        query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
+        key, _ = self.wk(x)
+        key = self.k_norm(key)
+        self._compress_write(
+            x=x,
+            key=key,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            metadata=metadata,
+        )
+        if not return_indices:
+            return None
+        head_weights, _ = self.weights_proj(x.float())
+        q_fp8, weights = kpool_q_rotate_quant_gate(
+            query,
+            head_weights,
+            rotate=True,
+            round_scale=self.scale_fmt is not None,
+            weight_scale_1=self.n_heads**-0.5,
+            weight_scale_2=self.softmax_scale,
+        )
+        return self._get_topk_paged(forward_batch, layer_id, q_fp8, weights, metadata)
+
     def forward_cuda(
         self,
         x: torch.Tensor,
@@ -1730,6 +1806,17 @@ class IndexerKPool(MultiPlatformOp):
                 act_quant=act_quant,
                 metadata=metadata,
                 enable_dual_stream=enable_dual_stream,
+                return_indices=return_indices,
+            )
+
+        if self._use_hip_decode_path(forward_batch, enable_dual_stream):
+            return self._forward_hip_decode(
+                x=x,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=layer_id,
+                metadata=metadata,
                 return_indices=return_indices,
             )
 
