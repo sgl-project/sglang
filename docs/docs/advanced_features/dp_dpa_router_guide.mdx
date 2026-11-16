@@ -1,14 +1,14 @@
 ---
-title: "DP, DPA and SGLang DP Router"
+title: "DP, DPA and sgl-router"
 metatags:
-    description: "Learn the differences between Data Parallelism, Data Parallelism Attention, and SGLang Model Gateway routing for production DP deployments."
+    description: "Learn the differences between Data Parallelism, Data Parallelism Attention, and sgl-router routing for production DP deployments."
 ---
 
-This guide explains the difference between Data Parallelism (DP) and Data Parallelism Attention (DPA), how to enable each mode correctly, and how to use the SGLang Model Gateway (SMG) for production-grade DP deployments.
+This guide explains the difference between Data Parallelism (DP) and Data Parallelism Attention (DPA), how to enable each mode correctly, and how to use `sgl-router`, SGLang's router, for production-grade DP deployments.
 
 ## Data Parallelism (DP)
 
-**Data Parallelism (DP)** is the most common parallelism strategy that replicates the entire model across multiple GPU sets and processes different batches of requests in parallel. Each GPU set handles independent requests. With dedicated routing strategies, as we will introduce later, with those proper routing algorithms in SGLang Model Gateway, the throughput of your serving system could be multiplied nearly linearly.
+**Data Parallelism (DP)** is the most common parallelism strategy that replicates the entire model across multiple GPU sets and processes different batches of requests in parallel. Each GPU set handles independent requests. With dedicated routing strategies, as we will introduce later, with those proper routing algorithms in `sgl-router`, the throughput of your serving system could be multiplied nearly linearly.
 
 ### Key characteristics
 
@@ -150,9 +150,9 @@ Prefill / colocated workers will fallback to TP LMHead with allgather, as well a
 
 ### Standard DP for MLA models
 
-Note that MLA models, of course, also support DP. Suppose you want to enable standard DP for MLA models. First, launch each MLA model's replica independently. You may launch these replicas one by one with DPA enabled. After launching each MLA model's replica, launch an SMG and connect all the replicas to the SMG. A detailed explanation of SMG is as follows.
+Note that MLA models, of course, also support DP. Suppose you want to enable standard DP for MLA models. First, launch each MLA model's replica independently. You may launch these replicas one by one with DPA enabled. After launching each MLA model's replica, launch `sgl-router` and connect all the replicas to it. A detailed explanation of `sgl-router` is as follows.
 
-## Modern Data Parallelism SGLang Model Gateway (SMG)
+## Data Parallelism with sgl-router
 
 ### Native DP Mode
 
@@ -173,26 +173,15 @@ python -m sglang.launch_server \
 - No fault tolerance or circuit breakers
 - Not suitable for production workloads
 
-⚠️ Native DP is **highly not recommended for use right now**. It is only used in some ancient/outdated RL frameworks. You can use SGLang Model Gateway (SMG) to power up your data parallelism in any use case.
+⚠️ Native DP is **highly not recommended for use right now**. It is only used in some ancient/outdated RL frameworks. You can use `sgl-router` to power up your data parallelism in any use case.
 
-### SMG-Based DP (Recommended)
+### sgl-router-Based DP (Recommended)
 
-Starting from September 2024, SGLang Model Gateway, i.e., SMG, formerly named as SGLang DP Router, was built especially as a production-ready DP routing system with Rust. It starts from DP routing, but later we further expanded its scope to coordinate RL, PD Disaggregation, and other scenarios. This doc only discusses SMG's usage in DP routing. For other usage, please refer to [SGLang Model Gateway Documentation](/docs/advanced_features/sgl_model_gateway).
+`sgl-router` is SGLang's router, written in Rust to keep routing overhead low. It serves one model and spreads its requests across that model's SGLang servers, picking a server per request from live load, KV-cache prefix matches, or session affinity. It also routes prefill/decode disaggregation (see [PD Disaggregation](./pd_disaggregation#router-integration)); this doc only discusses its usage in DP routing.
 
-> To achieve the best production-level routing performance and reduce the overhead to an extreme extent, we use Rust to build SMG, but not Python, since Python is never FAST enough.
+**We strongly recommend running separate SGLang servers behind `sgl-router` for production-grade Data Parallelism.** This provides significant advantages over native DP mode.
 
-**We strongly recommend using the SGLang Model Gateway (SMG) for production-grade Data Parallelism.** SMG provides significant advantages over native DP mode.
-
-```bash
-# SMG-based DP mode (Recommended)
-python -m sglang_router.launch_server \
-    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
-    --dp-size 4
-```
-
-⚠️ Note that **SMG and Naive DP share the same launching parameter, `--dp-size`**. But the entrypoint of Naive DP is `python -m sglang.launch_server`, and SMG's entrypoint is `python -m sglang_router.launch_server`.
-
-**Advantages of SMG-Based DP:**
+**Advantages of sgl-router-Based DP:**
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -204,7 +193,7 @@ python -m sglang_router.launch_server \
     <tr style={{borderBottom: "2px solid #d55816"}}>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Feature</th>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Native DP</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>SMG-Based DP</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>sgl-router-Based DP</th>
     </tr>
   </thead>
   <tbody>
@@ -231,29 +220,29 @@ python -m sglang_router.launch_server \
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Worker Health Monitoring</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Basic</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ Circuit breakers, health checks</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ Circuit breakers</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Reliability</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Basic</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ Retries, rate limiting, queuing</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ Retries, admission limits</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Observability</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Basic metrics</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ 40+ Prometheus metrics, OpenTelemetry</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ Prometheus metrics</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Hot Worker Add/Remove</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>❌ No</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ Yes</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>✅ Yes (Kubernetes service discovery)</td>
     </tr>
   </tbody>
 </table>
 
-### SMG's Performance
+### Cache-Aware Routing Performance
 
-The cache-aware routing policy in SMG significantly improves performance for workloads with shared prefixes:
+Cache-aware routing significantly improves performance for workloads with shared prefixes:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -265,7 +254,7 @@ The cache-aware routing policy in SMG significantly improves performance for wor
     <tr style={{borderBottom: "2px solid #d55816"}}>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>Metric</th>
       <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.05)"}}>Without Cache-Aware</th>
-      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>With Cache-Aware SMG</th>
+      <th style={{textAlign: "left", padding: "10px 12px", fontWeight: 700, whiteSpace: "nowrap", backgroundColor: "rgba(255,255,255,0.02)"}}>With Cache-Aware Routing</th>
     </tr>
   </thead>
   <tbody>
@@ -291,7 +280,7 @@ The cache-aware routing policy in SMG significantly improves performance for wor
 - ~Never use Native/Naive DP~
 - Learning material of DP routing
 
-**Use SMG-Based DP when:**
+**Use sgl-router-Based DP when:**
 
 - In any case, when you think DP is needed
 - Production deployments
@@ -301,82 +290,73 @@ The cache-aware routing policy in SMG significantly improves performance for wor
 - You require detailed observability and metrics
 - You want to have highly efficient RL rollout systems
 
-Note that for RL rollout systems, **there are four crucial reasons that SMG-Based DP is far better than naive DP routing**. Details can be found at [Load Balancing Router in RL](/docs/advanced_features/sglang_for_rl#load-balancing-router).
+Note that for RL rollout systems, **there are four crucial reasons that sgl-router-based DP is far better than naive DP routing**. Details can be found at [Load Balancing Router in RL](/docs/advanced_features/sglang_for_rl#load-balancing-router).
 
-### Quick Start For SMG
+### Quick Start For sgl-router
 
 **Installation**
 
-```bash
-pip install sglang-router
-# or
-pip install "sglang[all]"
-```
-
-**Option A: Co-launch Workers and SMG (Simplest)**
-
-This is the easiest way to get started - SMG and workers are launched together:
+`sgl-router` is pre-installed on the `PATH` of the SGLang Docker images. If you installed SGLang from source, build it from the `sgl-router` directory of the SGLang repository (this needs a Rust toolchain, e.g., from [rustup](https://rustup.rs)) and put it on your `PATH`:
 
 ```bash
-python -m sglang_router.launch_server \
-    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
-    --dp-size 4 \
-    --host 0.0.0.0 \
-    --port 30000
+cd sgl-router
+cargo build --release --bin sgl-router
+cp target/release/sgl-router /usr/local/bin/
 ```
 
-**Option B: Separate Launch (Multi-Node)**
+**1. Launch workers**
 
-For distributed deployments across multiple machines:
-
-1. Launch workers on each node
+Launch one SGLang server per replica, on one or more nodes. `--kv-events-config` publishes the KV-cache events that the `cache_aware` policy builds its prefix tree from, and `--load-publish-endpoint auto` publishes the load reports that load-aware routing reads. On a single node, give each server its own GPUs (`--base-gpu-id`), `--port`, and KV-event endpoint port.
 
 ```bash
 # Node 1
 python -m sglang.launch_server \
     --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --kv-events-config '{"publisher":"zmq","endpoint":"tcp://*:5557","topic":"kv"}' \
+    --load-publish-endpoint auto \
     --port 8000
 
 # Node 2
 python -m sglang.launch_server \
     --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --kv-events-config '{"publisher":"zmq","endpoint":"tcp://*:5557","topic":"kv"}' \
+    --load-publish-endpoint auto \
     --port 8000
 ```
 
-2. Launch SMG pointing to workers
+**2. Launch sgl-router pointing to workers**
 
 ```bash
-python -m sglang_router.launch_router \
+sgl-router \
+    --model-id meta-llama/Meta-Llama-3.1-8B-Instruct \
     --worker-urls http://node1:8000 http://node2:8000 \
+    --chat-routing reorg \
     --policy cache_aware \
     --host 0.0.0.0 \
     --port 30000
 ```
 
-**Option C: Dynamic Worker Registration**
+`--model-id` must match the servers' model name, which is their `--served-model-name`, or their `--model-path` when that flag is not set. The router loads the tokenizer for `--model-id` from Hugging Face; for a local checkpoint, pass `--tokenizer-path /path/to/checkpoint/tokenizer.json`. Wait for `curl http://localhost:30000/readiness` to return HTTP 200, which means the workers are registered.
 
-For elastic deployments where workers can be added/removed dynamically:
+**Elastic deployments on Kubernetes**
+
+For deployments where workers are added and removed dynamically, `sgl-router` can discover them from Kubernetes EndpointSlices instead of a static `--worker-urls` list. `--selector` matches the labels of the workers' Service:
 
 ```bash
-# Launch SMG first
-python -m sglang_router.launch_router \
+sgl-router \
+    --model-id meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --chat-routing reorg \
     --policy cache_aware \
+    --service-discovery \
+    --service-discovery-namespace default \
+    --selector app=sglang-llama \
     --host 0.0.0.0 \
     --port 30000
-
-# Register workers dynamically
-curl -X POST http://localhost:30000/workers \
-    -H "Content-Type: application/json" \
-    -d '{"url": "http://worker1:8000"}'
-
-curl -X POST http://localhost:30000/workers \
-    -H "Content-Type: application/json" \
-    -d '{"url": "http://worker2:8000"}'
 ```
 
 ### Load Balancing Policies
 
-SMG supports multiple load balancing policies:
+`sgl-router` supports multiple load balancing policies:
 
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
   <colgroup>
@@ -415,75 +395,72 @@ SMG supports multiple load balancing policies:
   </tbody>
 </table>
 
-**Cache-Aware Policy (Default, Recommended)**
+**Cache-Aware Policy (Recommended)**
 
 The cache-aware policy provides the best performance for most workloads:
 
 ```bash
-python -m sglang_router.launch_router \
+sgl-router \
+    --model-id meta-llama/Meta-Llama-3.1-8B-Instruct \
     --worker-urls http://worker1:8000 http://worker2:8000 \
+    --chat-routing reorg \
     --policy cache_aware \
-    --cache-threshold 0.5 \
-    --balance-abs-threshold 32 \
-    --balance-rel-threshold 1.5 \
-    --eviction-interval-secs 120 \
-    --max-tree-size 67108864
+    --cache-affinity-min-matched-tokens 1024 \
+    --affinity-mode balanced
 ```
 
 **How it works:**
 
-1. Maintains an approximate radix tree for each worker based on request history
-2. Routes requests to workers with the highest prefix match (cache hit)
-3. Falls back to shortest-queue routing when load is imbalanced
-4. Automatically evicts old entries to prevent memory overflow
+1. Maintains a radix tree of each worker's cached prefixes, built from the KV-cache events the workers publish
+2. Routes requests to the worker with the longest cached prefix of the prompt, if it matches at least `--cache-affinity-min-matched-tokens` tokens
+3. Falls back to `power_of_two` when no worker has such a prefix or the preferred worker is at an admission limit; with `--affinity-mode balanced`, it also switches away from the preferred worker when that worker is much more loaded than an alternative (`--affinity-load-factor`, `--affinity-load-gap`)
 
 ### Best Practices
 
 1. **Start with `cache_aware` policy** - It provides the best balance between cache locality and load distribution for most workloads
-2. **Use SMG for production** - Prefer `sglang_router.launch_server` over `sglang.launch_server` for better reliability and observability
-3. **Enable health checks** - Configure `--router-health-check-interval-secs` to detect and remove unhealthy workers automatically
+2. **Use sgl-router for production** - Prefer separate servers behind `sgl-router` over a single `sglang.launch_server --dp-size` for better reliability and observability
+3. **Enable retries and keep the circuit breaker** - `--retry-max-attempts` resends a request that failed before any response to another worker, and a worker leaves routing after `--cb-threshold` consecutive failures until it recovers
 
 **Recommended command with best practices applied:**
 
 ```bash
-python -m sglang_router.launch_server \
-    --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
-    --dp-size 4 \
-    --router-policy cache_aware \
-    --router-health-check-interval-secs 30 \
-    --router-prometheus-port 10001 \
+sgl-router \
+    --model-id meta-llama/Meta-Llama-3.1-8B-Instruct \
+    --worker-urls http://node1:8000 http://node2:8000 \
+    --chat-routing reorg \
+    --policy cache_aware \
+    --retry-max-attempts 3 \
+    --cb-threshold 3 \
     --host 0.0.0.0 \
     --port 30000
 ```
 
-For advanced configuration (circuit breakers, retries, Prometheus metrics, K8s integration), see [SGLang Model Gateway Documentation](/docs/advanced_features/sgl_model_gateway).
+For advanced configuration (admission limits, session affinity, DP-rank routing, Kubernetes integration), see `sgl-router --help` and the [sgl-router README](https://github.com/sgl-project/sglang/blob/main/sgl-router/README.md).
 
 ### Verifying Traffic Distribution
 
-After launching SMG, verify that traffic is being distributed correctly:
+After launching `sgl-router`, verify that traffic is being distributed correctly:
 
-**1. Check worker status:**
+**1. Check that the workers are registered:**
 
 ```bash
-curl http://localhost:30000/workers
+curl http://localhost:30000/readiness
 ```
 
-**2. Check load distribution:**
+**2. Check load distribution in the router's Prometheus metrics:**
 
 ```bash
-curl http://localhost:30000/get_loads
+curl http://localhost:30000/metrics
 ```
 
-**3. Monitor metrics (if Prometheus enabled):**
-
-```bash
+```text
 # Key metrics to check
-smg_router_requests_total{model="..."}
-smg_worker_requests_active{worker="..."}
-sglang_cache_hit_rate{source="..."}
+sgl_router_workers{mode="..."}
+sgl_router_worker_requests_total{worker_url="..."}
+sgl_router_worker_inflight_requests{worker_url="..."}
 ```
 
-For detailed metrics and monitoring setup, see [SGLang Model Gateway Documentation](/docs/advanced_features/sgl_model_gateway).
+For detailed metrics and monitoring setup, see the [sgl-router monitoring guide](https://github.com/sgl-project/sglang/blob/main/sgl-router/monitoring/README.md).
 
 ## Reference
 
@@ -507,7 +484,7 @@ For detailed metrics and monitoring setup, see [SGLang Model Gateway Documentati
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Easy to understand, not rust based</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>SMG-Based DP</strong></td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><strong>sgl-router-Based DP</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><strong>Production (recommended)</strong></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Cache-aware routing, high availability</td>
     </tr>
@@ -527,9 +504,9 @@ For detailed metrics and monitoring setup, see [SGLang Model Gateway Documentati
 **Recommended production setup for DeepSeek:**
 1. Enable **DPA** for attention layers (`--attn-dp-size 8`)
 2. Enable **EP** for MoE layers (`--ep 8 --moe-a2a-backend deepep`)
-3. Use **SMG** with **cache_aware** policy
+3. Use **sgl-router** with **cache_aware** policy
 
 **Related documentation:**
 - [Expert Parallelism](./expert_parallelism) - DeepEP, Two-Batch Overlap, EPLB
-- [SGLang Model Gateway Documentation](./sgl_model_gateway) - SMG configuration & troubleshooting
+- [sgl-router README](https://github.com/sgl-project/sglang/blob/main/sgl-router/README.md) - router configuration & routing policies
 - [Large-Scale EP Blog](https://lmsys.org/blog/2025-05-05-large-scale-ep/) - 96 GPU deployment guide
