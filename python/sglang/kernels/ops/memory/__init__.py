@@ -8,7 +8,6 @@ The Triton kernels migrated here live in this package
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.spec import (
     CUDA_ONLY,
-    CapabilityRequirement,
     KernelBackend,
     KernelSpec,
 )
@@ -103,14 +102,5 @@ register_kernel(
         op="memory.interleave_rows",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.memory.interleave_rows:interleave_rows",
-    )
-)
-
-register_kernel(
-    KernelSpec(
-        op="memory.npu_alloc_extend",
-        backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.memory.npu_allocator:alloc_extend_kernel",
-        capabilities=frozenset({CapabilityRequirement.NPU}),
     )
 )

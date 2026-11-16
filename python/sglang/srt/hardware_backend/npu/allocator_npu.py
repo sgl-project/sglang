@@ -55,7 +55,7 @@ class NPUPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             return None
 
         if num_new_pages_item < 200:
-            from sglang.kernels.ops.memory.npu_allocator import alloc_extend_kernel
+            from sgl_kernel_npu.mem_cache.npu_allocator import alloc_extend_kernel
 
             out_indices = torch.empty(
                 (extend_num_tokens,),

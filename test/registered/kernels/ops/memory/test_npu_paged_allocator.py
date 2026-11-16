@@ -5,8 +5,8 @@ import unittest
 
 import torch
 import torch_npu  # noqa: F401
+from sgl_kernel_npu.mem_cache.npu_allocator import alloc_extend_kernel
 
-from sglang.kernels.ops.memory.npu_allocator import alloc_extend_kernel
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import CustomTestCase
 
