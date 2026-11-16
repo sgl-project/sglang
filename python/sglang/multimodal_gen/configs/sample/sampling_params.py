@@ -1135,8 +1135,8 @@ class SamplingParams:
             type=str,
             help="Request task (for example t2i, i2i, t2v, i2v, v2v, f2v); must be supported by the pipeline.",
         )
-        # Predict the shot length from the caption, overriding `--num-frames`.
         add_argument("--use-diffusion-decoder", action="store_true")
+        # Predict the shot length from the caption, overriding `--num-frames`.
         add_argument("--auto-duration", action="store_true")
         add_argument("--auto-duration-min-seconds", type=float)
         add_argument("--auto-duration-max-seconds", type=float)
