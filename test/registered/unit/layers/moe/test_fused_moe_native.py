@@ -1,9 +1,11 @@
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 from torch.nn import functional as F
 
+from sglang.srt.layers.moe import fused_moe_native
 from sglang.srt.layers.moe.fused_moe_native import (
     fused_moe_forward_native,
     moe_forward_native,
@@ -146,16 +148,24 @@ class TestFusedMoeNative(CustomTestCase):
 
     def test_fused_native_applies_routed_scaling_factor(self):
         """Matches the Triton runner, which scales the combined routed output
-        unless TopK already folded the factor into topk_weights."""
+        unless TopK already folded the factor into topk_weights: always under
+        aiter, otherwise when the layer fuses it there."""
         num_experts, hidden_size, intermediate_size, top_k = 4, 8, 6, 2
         cases = [
-            (activation, is_gated, fused_in_topk)
+            (activation, is_gated, fused_in_topk, use_aiter)
             for activation, is_gated in (("relu2", False), ("silu", True))
             for fused_in_topk in (False, True)
+            for use_aiter in (False, True)
         ]
-        for activation, is_gated, fused_in_topk in cases:
-            with self.subTest(
-                activation=activation, is_gated=is_gated, fused_in_topk=fused_in_topk
+        for activation, is_gated, fused_in_topk, use_aiter in cases:
+            with (
+                self.subTest(
+                    activation=activation,
+                    is_gated=is_gated,
+                    fused_in_topk=fused_in_topk,
+                    use_aiter=use_aiter,
+                ),
+                mock.patch.object(fused_moe_native, "_use_aiter", use_aiter),
             ):
                 torch.manual_seed(0)
                 w13_rows = intermediate_size * (2 if is_gated else 1)
@@ -192,7 +202,8 @@ class TestFusedMoeNative(CustomTestCase):
                     ),
                 ).hidden_states
 
-                expected = reference if fused_in_topk else 2.5 * reference
+                folded_in_topk = fused_in_topk or use_aiter
+                expected = reference if folded_in_topk else 2.5 * reference
                 torch.testing.assert_close(output, expected)
 
     def test_non_gated_rejects_unknown_activation(self):
