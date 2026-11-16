@@ -6,8 +6,11 @@ from unittest.mock import MagicMock, patch
 
 import sglang
 from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components import request_retirer
 from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
+from sglang.srt.runtime_context import get_context, publish, reset_context
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq, release_only_retirer
 from sglang.test.test_utils import CustomTestCase
@@ -73,6 +76,58 @@ def _req(finished_reason, calls):
 
 
 class TestRelease(CustomTestCase):
+    def test_state_preserving_retraction_is_limited_to_dsv4(self):
+        """Models without supported sidecars must retain their normal backup."""
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="scheduler")
+        for is_dsv4 in (False, True):
+            with self.subTest(dsv4=is_dsv4):
+                req = FakeReq(
+                    kv=ReqKvInfo(req_pool_idx=1, kv_allocated_len=3),
+                    hisparse_retraction_pending=False,
+                )
+
+                def preserve(request):
+                    request.hisparse_retraction_pending = True
+
+                coordinator = SimpleNamespace(
+                    is_dsv4_hisparse=is_dsv4,
+                    release_request=lambda req: None,
+                    retract_req_state_preserving=preserve,
+                )
+                retirer = object.__new__(request_retirer.RequestRetirer)
+                retirer.hisparse_coordinator = coordinator
+                retirer.tree_cache = SimpleNamespace(
+                    req_to_token_pool=object(), token_to_kv_pool_allocator=object()
+                )
+                backup_state = object()
+
+                def backup(request, *args):
+                    request.kv.retraction_backup = backup_state
+                    return True
+
+                def release(request, tree, *, checkpoint, keep_req_pool_row):
+                    if not keep_req_pool_row:
+                        request.kv.req_pool_idx = None
+                    request.kv.mark_kv_released()
+
+                with (
+                    get_context().override_server_args(disaggregation_mode="decode"),
+                    patch.object(
+                        request_retirer, "backup_kv_cache", side_effect=backup
+                    ),
+                    patch.object(
+                        request_retirer, "release_kv_cache", side_effect=release
+                    ),
+                ):
+                    self.assertTrue(retirer.retract(req, offload_kv=True))
+                self.assertEqual(req.hisparse_retraction_pending, is_dsv4)
+                self.assertIs(
+                    req.kv.retraction_backup, None if is_dsv4 else backup_state
+                )
+                self.assertEqual(req.kv.req_pool_idx, 1 if is_dsv4 else None)
+
     def _release(self, req, calls, checkpoint=False, verb="release"):
         tree_cache = MagicMock()
         tree_cache.finish.side_effect = lambda handle, outcome: calls.append(outcome)

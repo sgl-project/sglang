@@ -106,6 +106,9 @@ class RequestRetirer:
             if (
                 get_disagg().disaggregation_mode == "decode"
                 and offload_kv
+                # The sidecars currently cover DSV4 indexer K and SWA only.
+                # Other HiSparse models must keep their existing backup path.
+                and self.hisparse_coordinator.is_dsv4_hisparse
                 and not getattr(req, "hisparse_retraction_pending", False)
             ):
                 # HiSparse state-preserving retraction: the host pool already

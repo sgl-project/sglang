@@ -199,6 +199,65 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
         self.assertIn(0, coordinator.spec_swap._scratch_reqs)
         self.assertFalse(req.hisparse_retraction_pending)
 
+    def test_dsv4_sidecars_restore_into_new_logical_pages(self):
+        """Indexer K and the live SWA window survive physical page reuse."""
+        for fp4 in (False, True):
+            with self.subTest(fp4=fp4):
+                coordinator, req, _, _ = self._retraction_fixture()
+                coordinator.is_dsv4_hisparse = True
+                coordinator.sliding_window_size = 2
+                coordinator.token_to_kv_pool_allocator.page_size = 2
+                coordinator.token_to_kv_pool_allocator.translate_loc_from_full_to_swa = (
+                    lambda ids: ids + 2
+                )
+                coordinator.req_to_token_pool.req_to_token = torch.tensor([[2, 3, 6]])
+                tensors = [
+                    torch.arange(40).reshape(10, 4) + layer * 100 for layer in range(6)
+                ]
+                indexer = SimpleNamespace(
+                    index_k_with_scale_buffer=None if fp4 else tensors[:2],
+                    index_k_payload_buffer=tensors[:2],
+                    index_k_scale_buffer=tensors[2:4],
+                )
+                swa = SimpleNamespace(kv_buffer=tensors[4:])
+                coordinator.token_to_kv_pool_allocator.get_kvcache = lambda: (
+                    SimpleNamespace(c4_indexer_kv_pool=indexer, swa_kv_pool=swa)
+                )
+                index_tensors = tensors[:4] if fp4 else tensors[:2]
+                expected_index = [
+                    buf[torch.tensor([1, 3])].clone() for buf in index_tensors
+                ]
+                expected_swa = [
+                    buf[torch.tensor([2, 4])].clone() for buf in swa.kv_buffer
+                ]
+                event = SimpleNamespace(
+                    record=lambda stream: None, synchronize=lambda: None
+                )
+                with (
+                    patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
+                    patch(
+                        "sglang.srt.managers.hisparse_coordinator.device_module",
+                        SimpleNamespace(
+                            Event=lambda: event, current_stream=lambda: None
+                        ),
+                    ),
+                ):
+                    coordinator._backup_indexer_rows(req, 3, 0)
+                    coordinator._backup_swa_rows(req, 3, 0)
+                    for buf in tensors:
+                        buf.fill_(-1)
+                    coordinator.req_to_token_pool.req_to_token[0] = torch.tensor(
+                        [10, 11, 14]
+                    )
+                    coordinator._restore_indexer_rows(req, 0)
+                    coordinator._restore_swa_rows(req, 0)
+                for buf, expected in zip(index_tensors, expected_index, strict=True):
+                    torch.testing.assert_close(buf[torch.tensor([5, 7])], expected)
+                for buf, expected in zip(swa.kv_buffer, expected_swa, strict=True):
+                    torch.testing.assert_close(buf[torch.tensor([6, 8])], expected)
+                self.assertIsNone(req.hisparse_indexer_backup)
+                self.assertIsNone(req.hisparse_swa_backup)
+
     def test_spec_decode_reserve_allocates_logical_pages_only(self):
         logical_locs = torch.tensor([64, 65, 66, 67], dtype=torch.int64)
         allocator = SimpleNamespace(
