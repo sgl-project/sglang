@@ -608,7 +608,6 @@ class Step3p5Model(nn.Module):
 
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
-            # 1,
             lambda idx, prefix: Step3p5DecoderLayer(
                 layer_id=idx,
                 config=config,
@@ -623,12 +622,6 @@ class Step3p5Model(nn.Module):
             self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer(return_tuple=True)
-
-    def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
-        if hasattr(self.config, "scale_emb"):
-            return self.get_input_embeddings()(input_ids) * self.config.scale_emb
-        else:
-            return self.get_input_embeddings()(input_ids)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
@@ -656,7 +649,6 @@ class Step3p5Model(nn.Module):
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
             hidden_states = layer(positions, hidden_states, forward_batch)
-            # break
         if not self.pp_group.is_last_rank:
             return residual_batch.to_pp(hidden_states, forward_batch)
         else:
@@ -666,7 +658,6 @@ class Step3p5Model(nn.Module):
                 return residual_batch.to_pp(hidden_states, forward_batch)
             else:
                 if hidden_states.shape[0] > 0:
-                    # if forward_batch.return_hidden_states_before_norm:
                     hidden_states_before_norm = residual_batch.snapshot(
                         hidden_states, forward_batch
                     )
@@ -717,38 +708,18 @@ class Step3p5ForCausalLM(nn.Module):
             config, quant_config=quant_config, prefix=add_prefix("model", prefix)
         )
 
-        self.tie_word_embeddings = False
-        self.num_fused_shared_experts = 0
-
         # handle the lm head on different pp ranks
         if self.pp_group.is_last_rank:
-            if self.pp_group.world_size == 1 and self.tie_word_embeddings:
-                self.lm_head = self.model.embed_tokens
-            else:
-                self.lm_head = ParallelLMHead(
-                    config.vocab_size,
-                    config.hidden_size,
-                    quant_config=quant_config,
-                    use_attn_tp_group=get_parallel().enable_dp_lm_head,
-                    prefix=add_prefix("lm_head", prefix),
-                )
+            self.lm_head = ParallelLMHead(
+                config.vocab_size,
+                config.hidden_size,
+                quant_config=quant_config,
+                use_attn_tp_group=get_parallel().enable_dp_lm_head,
+                prefix=add_prefix("lm_head", prefix),
+            )
         else:
             # ranks other than the last rank will have a placeholder layer
             self.lm_head = PPMissingLayer()
-
-        # perform weight tying for PP
-        if self.pp_group.world_size > 1 and self.tie_word_embeddings:
-            if self.pp_group.is_first_rank:
-                self.pp_group.send(
-                    self.model.embed_tokens.weight, dst=self.pp_group.world_size - 1
-                )
-            elif self.pp_group.is_last_rank:
-                emb_token_weight = self.pp_group.recv(
-                    size=self.lm_head.weight.shape,
-                    dtype=next(self.model.parameters()).dtype,
-                    src=0,
-                )
-                self.lm_head.weight.copy_(emb_token_weight)
 
         self.logits_processor = LogitsProcessor(config)
 
@@ -819,14 +790,11 @@ class Step3p5ForCausalLM(nn.Module):
             (".gate_up_proj", ".up_proj", 1),
         ]
 
-        if self.num_fused_shared_experts > 0:
-            assert self.num_fused_shared_experts == 1
-
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
             ckpt_up_proj_name="up_proj",
-            num_experts=self.config.moe_num_experts + self.num_fused_shared_experts,
+            num_experts=self.config.moe_num_experts,
         )
 
         params_dict = dict(self.named_parameters())
@@ -865,11 +833,6 @@ class Step3p5ForCausalLM(nn.Module):
                                 else self.config.num_hidden_layers
                             )
                             if layer_id != nextn_layer_id:
-                                # # nextn/MTP load: only keep the appended nextn layers.
-                                # # Expected layer ids: [num_hidden_layers, num_hidden_layers + num_nextn_layers).
-                                # start = self.config.num_hidden_layers
-                                # end = self.config.num_hidden_layers + num_nextn_layers
-                                # if not (start <= layer_id < end):
                                 continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -908,12 +871,9 @@ class Step3p5ForCausalLM(nn.Module):
 
                     for mapping in expert_params_mapping:
                         param_name, weight_name, expert_id, shard_id = mapping
-                        if expert_id == self.config.moe_num_experts:
-                            continue
                         if not match_expert_and_shard_ids(name, weight_name):
                             continue
                         part_name = weight_name.split(".")[-2]
-                        fake_weight_name = name.replace(part_name, weight_name[:-1])
                         actual_param_name = name.replace(part_name + ".", param_name)
                         if actual_param_name not in params_dict:
                             continue

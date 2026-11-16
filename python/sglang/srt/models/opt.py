@@ -219,7 +219,6 @@ class OPTDecoder(nn.Module):
     def __init__(
         self,
         config: OPTConfig,
-        layer_id: int = 0,
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ):
@@ -310,7 +309,6 @@ class OPTDecoder(nn.Module):
             return PPProxyTensors({"hidden_states": hidden_states})
         if self.final_layer_norm is not None:
             hidden_states = self.final_layer_norm(hidden_states)
-            # 没有经过这里
         if self.project_out is not None:
             hidden_states, _ = self.project_out(hidden_states)
         return hidden_states
@@ -325,8 +323,6 @@ class OPTModel(nn.Module):
     ) -> None:
         super().__init__()
 
-        # config = vllm_config.model_config.hf_config
-        # quant_config = vllm_config.quant_config
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -377,10 +373,6 @@ class OPTModel(nn.Module):
 
 
 class OPTForCausalLM(nn.Module):
-    # BitandBytes specific attributes
-    # in TP, these weights are partitioned along the column dimension (dim=-1)
-    column_parallel_weights_modules = [".down_proj.", ".o_proj."]
-
     def __init__(
         self,
         config: OPTConfig,
@@ -476,8 +468,6 @@ class OPTForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                # if is_pp_missing_parameter(name, self):
-                #     continue
                 param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
@@ -486,8 +476,6 @@ class OPTForCausalLM(nn.Module):
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
-                # if is_pp_missing_parameter(name, self):
-                #     continue
                 if name not in params_dict:
                     continue
                 if name in params_dict.keys():
@@ -509,19 +497,6 @@ class OPTForCausalLM(nn.Module):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
-
-    def get_module_name_from_weight_name(self, name):
-        for param_name, weight_name, shard_id, num_shard in self.stacked_params_mapping:
-            if weight_name in name:
-                return (
-                    name.replace(weight_name, param_name)[: -len(".weight")],
-                    num_shard,
-                )
-        return name[: -len(".weight")], 1
-
-    def get_num_params(self):
-        params_dict = dict(self.named_parameters())
-        return len(params_dict)
 
     def get_weights_by_name(
         self, name: str, truncate_size: int = 100, tp_size: int = 1

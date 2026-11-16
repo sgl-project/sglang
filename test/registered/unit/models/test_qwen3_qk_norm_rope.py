@@ -7,6 +7,9 @@ from unittest.mock import patch
 import pytest
 import torch
 
+from sglang.kernels.arch._cuda import CudaArch
+from sglang.kernels.arch._hip import HipArch
+from sglang.kernels.arch.base import DeviceArch
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import factory
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
@@ -172,6 +175,32 @@ def test_constructor_exclusions(runtime, settings, layer_args, deterministic_env
         layer = make_layer(**layer_args)
         assert not layer.use_table_qk_norm_rope
         assert not layer.use_prefill_qk_norm_rope
+
+
+def cuda_arch(major, minor):
+    arch = CudaArch()
+    arch.props = SimpleNamespace(major=major, minor=minor)
+    return arch
+
+
+@pytest.mark.parametrize(
+    "arch,should_prefill",
+    [
+        (cuda_arch(9, 0), True),
+        (cuda_arch(10, 0), False),
+        (cuda_arch(10, 3), False),
+        (cuda_arch(12, 0), False),
+        (HipArch(), False),
+        (DeviceArch(), False),
+    ],
+    ids=["sm90", "sm100", "sm103", "sm120", "hip", "other"],
+)
+def test_prefill_path_follows_architecture_family(arch, should_prefill):
+    with patch.object(qwen3, "current_arch", return_value=arch):
+        layer = make_layer()
+    # The decode-side table kernel is not tied to one family.
+    assert layer.use_table_qk_norm_rope
+    assert layer.use_prefill_qk_norm_rope == should_prefill
 
 
 @pytest.mark.parametrize("excluded", ["caller", "backend", "head_dim", "weights"])
