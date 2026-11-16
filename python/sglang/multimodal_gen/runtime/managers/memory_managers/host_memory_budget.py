@@ -106,19 +106,26 @@ def _cgroup_dirs(mount: str) -> list[str]:
     return dirs
 
 
-# memory.stat keys for the page cache a cgroup is charged for: v2, then v1.
-_CGROUP_FILE_CACHE_KEYS = ("file", "cache")
+# memory.stat keys for the reclaimable page cache: v1's subtree totals, then v2's
+# (hierarchical already). Both are the file LRUs, which leave out shmem.
+_CGROUP_FILE_CACHE_KEYS = (
+    ("total_active_file", "total_inactive_file"),
+    ("active_file", "inactive_file"),
+)
 
 
 def _cgroup_file_cache_bytes(directory: str) -> int:
+    stat = {}
     try:
         with open(os.path.join(directory, "memory.stat")) as handle:
             for line in handle:
                 key, _, value = line.partition(" ")
-                if key in _CGROUP_FILE_CACHE_KEYS:
-                    return int(value)
+                stat[key] = int(value)
     except (OSError, ValueError):
-        pass
+        return 0
+    for keys in _CGROUP_FILE_CACHE_KEYS:
+        if all(key in stat for key in keys):
+            return sum(stat[key] for key in keys)
     return 0
 
 
@@ -133,9 +140,8 @@ def cgroup_memory_limit_bytes(
     commit memory the process cannot have.
 
     A cgroup is charged for the page cache it touches, so its usage grows by
-    the whole checkpoint the process maps. ``exclude_file_cache`` reports the
-    anonymous share alone, for callers that may spend cache the kernel would
-    reclaim under the cap anyway.
+    the whole checkpoint the process maps. ``exclude_file_cache`` leaves out
+    the cache on the file LRUs, which the kernel reclaims under the cap.
     """
     for mount, limit_name, usage_name in _CGROUP_MOUNTS:
         tightest = None
@@ -155,9 +161,19 @@ def cgroup_memory_limit_bytes(
 
 
 def physical_host_memory_available_bytes() -> int:
-    """What the machine itself can still give: kernel available under any cgroup cap."""
+    """What the machine itself can still give: kernel available under any cgroup cap.
+
+    Page cache charged to the cgroup counts as available, as MemAvailable counts
+    it outside one: the kernel reclaims it under the cap. That includes a
+    mapping's own cached pages, which are the room it needs to stay cached, and
+    a layer pinned out of the mapping stops needing them.
+
+    Both file LRUs count, not only the inactive one the kubelet subtracts:
+    which list a page sits on follows its access history and the LRU
+    implementation, so the active list holds cold cache too.
+    """
     available = int(psutil.virtual_memory().available)
-    capped = cgroup_memory_limit_bytes()
+    capped = cgroup_memory_limit_bytes(exclude_file_cache=True)
     if capped is None:
         return available
     limit, usage = capped
@@ -186,22 +202,6 @@ def host_memory_available_bytes() -> int:
             pass
         return max(0, int(forced_gib * GIB_BYTES) - own_anonymous)
     return physical_host_memory_available_bytes()
-
-
-def shared_pool_available_bytes() -> int:
-    """Bytes a shared host/device pool can still give this process.
-
-    The device's own free figure is the kernel's MemFree, which leaves out the
-    page cache -- memory the kernel hands back on demand and a placement may
-    therefore spend. A cgroup cap is honoured on its anonymous share only, for
-    the same reason: the cache charged to the cgroup is reclaimed under the cap.
-    """
-    available = int(psutil.virtual_memory().available)
-    capped = cgroup_memory_limit_bytes(exclude_file_cache=True)
-    if capped is None:
-        return available
-    limit, anonymous = capped
-    return min(available, max(0, limit - anonymous))
 
 
 def host_copies_are_redundant() -> bool:
@@ -346,7 +346,9 @@ def describe_host_memory() -> str:
     if capped is None:
         return f"{available / GIB_BYTES:.1f} GiB available (no cgroup cap)"
     limit, usage = capped
+    _, unreclaimable = cgroup_memory_limit_bytes(exclude_file_cache=True)
     return (
         f"{available / GIB_BYTES:.1f} GiB available "
-        f"(cgroup cap {limit / GIB_BYTES:.1f} GiB, in use {usage / GIB_BYTES:.1f} GiB)"
+        f"(cgroup cap {limit / GIB_BYTES:.1f} GiB, in use {usage / GIB_BYTES:.1f} GiB "
+        f"of which {(usage - unreclaimable) / GIB_BYTES:.1f} GiB reclaimable cache)"
     )

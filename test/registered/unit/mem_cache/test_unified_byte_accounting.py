@@ -129,7 +129,7 @@ class TestChainFrontierOrder(unittest.TestCase):
         past the down member's LIVE low frontier. Both sides must be populated
         for this to be real corruption: an empty down band cannot overlap,
         its low frontier IS the buffer top."""
-        full, swa = _paged_pair(lazy=False)
+        full, swa = _paged_pair(lazy=True)
         chain = mea._end_pair_chain(full, swa)
         up, down = chain
         self.assertEqual(up.grow_direction, "up")

@@ -75,10 +75,12 @@ class QuantoInt8LinearMethod(LinearMethodBase):
         weight_scale = Parameter(
             torch.empty(
                 sum(output_partition_sizes),
-                1
-                if self.group_size is None
-                else (input_size_per_partition + self.group_size - 1)
-                // self.group_size,
+                (
+                    1
+                    if self.group_size is None
+                    else (input_size_per_partition + self.group_size - 1)
+                    // self.group_size
+                ),
                 dtype=self.scale_dtype or params_dtype,
             ),
             requires_grad=False,
@@ -92,7 +94,13 @@ class QuantoInt8LinearMethod(LinearMethodBase):
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         if self.group_size is not None:
+            weight = layer.weight
             scales = layer.weight_scale
+            if weight.ndim != 2 or weight.dtype != torch.int8:
+                raise ValueError("INT8 weight must be a two-dimensional INT8 tensor")
+            rows, width = weight.shape
+            if scales.shape != (rows, (width + self.group_size - 1) // self.group_size):
+                raise ValueError("INT8 scales have an incompatible groupwise shape")
             if not torch.isfinite(scales).all() or not (scales > 0).all():
                 raise ValueError("INT8 scales must be finite and positive")
 
@@ -119,6 +127,21 @@ class QuantoInt8LinearMethod(LinearMethodBase):
         if self.group_size is None:
             weight = layer.weight.to(dtype=x.dtype)
             weight.mul_(layer.weight_scale.to(dtype=x.dtype))
+        elif (
+            self.group_size == 128
+            and x.is_cuda
+            and torch.version.hip is None
+            and x.dtype == torch.bfloat16
+            and layer.weight.dtype == torch.int8
+            and layer.weight_scale.dtype == torch.float32
+            and layer.weight.is_contiguous()
+            and layer.weight_scale.is_contiguous()
+        ):
+            from sglang.kernels.ops.quantization.groupwise_int8_dequant import (
+                groupwise_int8_dequant,
+            )
+
+            weight = groupwise_int8_dequant(layer.weight, layer.weight_scale)
         else:
             out, width = layer.weight.shape
             if width % self.group_size == 0:

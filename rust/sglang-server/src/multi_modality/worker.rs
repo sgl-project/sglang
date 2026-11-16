@@ -4,9 +4,9 @@
 
 use std::sync::Arc;
 
-use sglang_mm::driver::{self, Output};
-use sglang_mm::pipeline::{MmFamilyProcessor, PositionOutput, Tensor, TensorData};
-use sglang_mm::registry::build_pipeline;
+use sglang_mm::pipeline::{Tensor, TensorData};
+use sglang_processor::MmOutput;
+use sglang_processor::dynamo_multimodal::processor::{self as dynamo, PositionOutput};
 
 use super::encoded::{MRope, MmEncodedEntry, MmEncodedItem, MmMeta, MmMetaValue, MmModality};
 use crate::message::buffers::{Buffer, BufferData, BufferStore};
@@ -56,6 +56,9 @@ pub struct MmProcessOutput {
     /// The final placeholder-expanded prompt ids.
     pub input_ids: TokenIds,
     pub result: MmEncodedEntry,
+    /// Whatever the processor hands itself from [`MmProcessor::process`] to
+    /// [`MmProcessor::processed`]; dropped before the request is queued.
+    pub extension: Option<Box<dyn std::any::Any + Send>>,
 }
 
 /// The request a multimodal result belongs to (see [`MmProcessor::processed`]).
@@ -64,6 +67,9 @@ pub struct MmRequestInfo<'a> {
     /// The rid the client sent (or the minted one), not the scheduler's
     /// uniquified rid.
     pub rid: &'a str,
+    /// The uniquified rid, unique among the process's requests: the
+    /// [`crate::GenerateRequest::rid`] a [`crate::GenerateHook`] saw.
+    pub runtime_rid: &'a str,
     pub bootstrap_room: Option<i64>,
 }
 
@@ -101,6 +107,20 @@ pub trait MmProcessor: Send + Sync {
         Ok(())
     }
 
+    /// One I/O-backed source the processor already holds (e.g. in a cache),
+    /// its bytes charged to `budget`. Runs on an async worker before the
+    /// source's blocking fetch is scheduled, so it must not block. `None`
+    /// leaves the source to [`MmProcessor::fetch_media`], which also reports
+    /// any failure.
+    fn cached_media(
+        &self,
+        _source: &str,
+        _modality: MmModality,
+        _budget: &crate::MediaByteBudget,
+    ) -> Option<bytes::Bytes> {
+        None
+    }
+
     /// Fetch one I/O-backed source, charging its bytes to `budget`; runs on
     /// the API runtime's blocking pool. `Ok(None)` leaves the source to the
     /// built-in fetcher (`http(s)://`, `file://` and absolute paths), which
@@ -114,47 +134,80 @@ pub trait MmProcessor: Send + Sync {
         Ok(None)
     }
 
+    /// How long one source's blocking fetch (this processor's, then the
+    /// built-in fetcher's) may take before the request fails without
+    /// waiting for it; the fetch thread finishes on its own. `None` waits
+    /// for the fetch to return.
+    fn media_fetch_deadline(&self) -> Option<std::time::Duration> {
+        None
+    }
+
     /// Finish item layout after caller hash overrides, before feature publication.
+    /// An item whose feature or metadata changes here must not keep a
+    /// precomputed `identity`.
     fn finalize(&self, _entry: &mut MmEncodedEntry) -> Result<(), String> {
         Ok(())
     }
 
     /// Observe a request's final result, as the scheduler will receive it
-    /// (with the caller's `mm_hashes` applied, finalized, validated, and its
-    /// ids fitted to the context), on the worker before the request is queued
-    /// for the scheduler. Lets an implementation hand the result on without
-    /// waiting for the scheduler to drain the request. The default does
-    /// nothing.
+    /// (with the caller's `mm_hashes` applied, finalized, validated, each
+    /// item's `identity` filled in, and its ids fitted to the context), on the
+    /// worker before the request is queued for the scheduler. Lets an
+    /// implementation hand the result on without waiting for the scheduler to
+    /// drain the request. The default does nothing.
     fn processed(&self, _request: MmRequestInfo<'_>, _output: &MmProcessOutput) {}
-}
 
-struct QwenMmProcessor {
-    family: Box<dyn MmFamilyProcessor>,
-}
-
-impl QwenMmProcessor {
-    fn new(spec: MmSpec) -> Result<Self, String> {
-        Ok(Self {
-            family: build_pipeline(spec.pipeline)?,
-        })
+    /// [`processed`](Self::processed), able to fail the request: `Err`
+    /// rejects it with the error's class, as a [`process`](Self::process)
+    /// error does, instead of queuing it for the scheduler. For an
+    /// implementation that hands the result on and must not leave the request
+    /// running when it cannot. The default observes the result with
+    /// `processed` and queues the request.
+    fn try_processed(
+        &self,
+        request: MmRequestInfo<'_>,
+        output: &MmProcessOutput,
+    ) -> Result<(), MediaError> {
+        self.processed(request, output);
+        Ok(())
     }
 }
 
-impl MmProcessor for QwenMmProcessor {
+/// The built-in path: SGLang's image pipeline (`sglang_processor::mm`) over the
+/// request's resolved media bytes.
+struct ImageMmProcessor {
+    pipeline: sglang_processor::MmProcessor,
+}
+
+impl MmProcessor for ImageMmProcessor {
     fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, MediaError> {
-        let input = super::payload::to_mm_input(input_ids, mm)?;
-        // The driver fails on the request's sources, images, and prompt layout.
-        let output = driver::process(self.family.as_ref(), input).map_err(MediaError::Client)?;
-        encode_driver_output(output).map_err(MediaError::Server)
+        if !mm.video_data.is_empty() || !mm.audio_data.is_empty() {
+            return Err(MediaError::Client(
+                "unsupported modality: video/audio input".into(),
+            ));
+        }
+        let media = super::payload::resolve_media_work(input_ids, mm)?;
+        let input_ids = (media.input_ids.iter())
+            .map(|&id| {
+                i32::try_from(id)
+                    .map_err(|_| MediaError::Server(format!("mm: token id {id} out of range")))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let images: Vec<&[u8]> = media.images.iter().map(|image| image.as_ref()).collect();
+        // The pipeline fails on the request's images and prompt layout.
+        let output = (self.pipeline)
+            .process(&input_ids, &images)
+            .map_err(|error| MediaError::Client(error.to_string()))?;
+        encode_output(output).map_err(MediaError::Server)
     }
 }
 
-/// Map the driver's output straight onto the common encoded result: each
+/// Map the pipeline's output straight onto the common encoded result: each
 /// feature tensor is moved with its own shape and dtype, the per-item span
 /// and hash ride along, and every auxiliary tensor is translated once into
 /// the sidecar's metadata form. Nothing is reconstructed from lengths.
-fn encode_driver_output(output: Output) -> Result<MmProcessOutput, String> {
-    let Output {
+fn encode_output(output: MmOutput) -> Result<MmProcessOutput, String> {
+    let MmOutput {
         input_ids,
         items,
         offsets,
@@ -173,28 +226,46 @@ fn encode_driver_output(output: Output) -> Result<MmProcessOutput, String> {
         .map(|(item, span)| {
             Ok(MmEncodedItem {
                 modality: MmModality::Image,
-                feature: item.feature,
+                feature: tensor(item.feature)?,
                 hash: item.hash,
+                identity: None,
                 offsets: vec![span],
                 model_specific_data: item
                     .aux
                     .into_iter()
-                    .map(|(name, tensor)| Ok((name.clone(), aux_meta(&name, tensor)?)))
+                    .map(|(name, aux)| {
+                        let meta = aux_meta(&name, tensor(aux)?)?;
+                        Ok((name, meta))
+                    })
                     .collect::<Result<_, String>>()?,
             })
         })
         .collect::<Result<Vec<_>, String>>()?;
     let mrope = match positions {
-        PositionOutput::Rope1D => None,
         PositionOutput::MRope { positions, delta } => Some(MRope { positions, delta }),
+        _ => None,
     };
     Ok(MmProcessOutput {
-        input_ids,
+        input_ids: input_ids.into_iter().map(i64::from).collect(),
         result: MmEncodedEntry {
             items,
             token_ids: None,
             mrope,
         },
+        extension: None,
+    })
+}
+
+/// Dynamo's tensor as the one every processor hands the worker.
+fn tensor(tensor: dynamo::Tensor) -> Result<Tensor, String> {
+    let data = match tensor.data {
+        dynamo::TensorData::F32(values) => TensorData::F32(values),
+        dynamo::TensorData::I64(values) => TensorData::I64(values),
+        _ => return Err("mm: unsupported tensor dtype from dynamo-multimodal".into()),
+    };
+    Ok(Tensor {
+        shape: tensor.shape,
+        data,
     })
 }
 
@@ -225,10 +296,11 @@ pub struct MmContext {
 
 impl MmContext {
     pub fn new(spec: MmSpec) -> Result<Self, String> {
-        let feature_shm = spec.feature_shm;
+        let pipeline =
+            sglang_processor::MmProcessor::from_spec(spec.pipeline).map_err(|e| e.to_string())?;
         Ok(Self {
-            processor: Arc::new(QwenMmProcessor::new(spec)?),
-            feature_shm,
+            processor: Arc::new(ImageMmProcessor { pipeline }),
+            feature_shm: spec.feature_shm,
             limits: None,
         })
     }
@@ -354,6 +426,10 @@ fn process(
         .result
         .validate(output.input_ids.len())
         .map_err(Error::Internal)?;
+    output
+        .result
+        .resolve_identities()
+        .map_err(Error::Internal)?;
     // Intake fits the ids to the context (`check_total_tokens`) before the
     // scheduler sees them; fit them first, so `processed` sees the same ids. A
     // prompt intake will reject is not observed.
@@ -362,7 +438,9 @@ fn process(
         .as_ref()
         .is_none_or(|limits| fit_input(&mut output.input_ids, limits).is_ok());
     if fits {
-        ctx.processor.processed(request, &output);
+        ctx.processor
+            .try_processed(request, &output)
+            .map_err(Error::Encode)?;
     }
     let buffers = make_buffers(output.result, ctx.feature_shm).map_err(Error::Internal)?;
     Ok((output.input_ids, buffers))
@@ -421,6 +499,7 @@ impl Runnable for MmWorker {
                 let mm = g.mm.take().map(|m| *m).unwrap_or_default();
                 let request = MmRequestInfo {
                     rid: req.rid.client_facing(),
+                    runtime_rid: req.rid.as_str(),
                     bootstrap_room: g.bootstrap_room,
                 };
                 match process(&self.ctx, request, input_ids, mm) {
@@ -430,10 +509,8 @@ impl Runnable for MmWorker {
                         g.mm_buffers = buffers;
                         Event::EncodeDone
                     }
-                    Err(error) => {
-                        tracing::warn!(rid = %req.rid, %error, "mm processing rejected");
-                        Event::Error(error)
-                    }
+                    // Intake logs the failure when it fails the request.
+                    Err(error) => Event::Error(error),
                 }
             } else {
                 tracing::error!(rid = %req.rid, "mm pool received a non-generate request");
@@ -451,8 +528,10 @@ impl Runnable for MmWorker {
 
 #[cfg(test)]
 mod tests {
-    use sglang_mm::driver::OutputItem;
     use std::collections::BTreeMap;
+
+    use sglang_processor::MmOutputItem;
+    use sglang_processor::dynamo_multimodal::processor as dynamo;
 
     use super::*;
     use crate::message::buffers::find;
@@ -477,6 +556,7 @@ mod tests {
                             data: TensorData::F32(vec![1.0]),
                         },
                         hash: 7,
+                        identity: None,
                         offsets: self.offsets.clone(),
                         model_specific_data: BTreeMap::from([(
                             "clip_index".to_owned(),
@@ -486,40 +566,36 @@ mod tests {
                     token_ids: None,
                     mrope: None,
                 },
+                extension: None,
             })
         }
     }
 
-    /// The driver's output maps onto the encoded result without any
+    fn dynamo_tensor(shape: Vec<usize>, data: dynamo::TensorData) -> dynamo::Tensor {
+        dynamo::Tensor { shape, data }
+    }
+
+    /// The pipeline's output maps onto the encoded result without any
     /// reconstruction: feature tensors keep their shape and dtype, spans and
     /// hashes ride per item, integer aux tensors become metadata, and M-RoPE
     /// carries over; 1-D positions leave `mrope` empty.
     #[test]
-    fn driver_output_maps_directly() {
-        let item = |shape: Vec<usize>, hash| OutputItem {
-            feature: Tensor {
-                shape,
-                data: TensorData::F32(vec![0.5; 12]),
-            },
+    fn pipeline_output_maps_directly() {
+        let item = |shape: Vec<usize>, hash| MmOutputItem {
+            feature: dynamo_tensor(shape, dynamo::TensorData::F32(vec![0.5; 12])),
             aux: vec![
                 (
                     "image_grid_thw".into(),
-                    Tensor {
-                        shape: vec![3],
-                        data: TensorData::I64(vec![1, 2, 3]),
-                    },
+                    dynamo_tensor(vec![3], dynamo::TensorData::I64(vec![1, 2, 3])),
                 ),
                 (
                     "clip_index".into(),
-                    Tensor {
-                        shape: vec![],
-                        data: TensorData::I64(vec![7]),
-                    },
+                    dynamo_tensor(vec![], dynamo::TensorData::I64(vec![7])),
                 ),
             ],
             hash,
         };
-        let output = Output {
+        let output = MmOutput {
             input_ids: vec![1, 2, 2, 3],
             items: vec![item(vec![6, 2], 11), item(vec![2, 6], 22)],
             offsets: vec![(1, 2), (3, 3)],
@@ -528,7 +604,7 @@ mod tests {
                 delta: -2,
             },
         };
-        let encoded = encode_driver_output(output).unwrap();
+        let encoded = encode_output(output).unwrap();
         assert_eq!(encoded.input_ids, [1, 2, 2, 3]);
         let items = &encoded.result.items;
         assert_eq!(items[0].feature.shape, [6, 2], "shape kept, not rebuilt");
@@ -547,34 +623,28 @@ mod tests {
         let mrope = encoded.result.mrope.as_ref().unwrap();
         assert_eq!((mrope.positions.len(), mrope.delta), (12, -2));
 
-        let plain = Output {
+        let plain = MmOutput {
             input_ids: vec![1],
             items: vec![],
             offsets: vec![],
             positions: PositionOutput::Rope1D,
         };
-        assert!(encode_driver_output(plain).unwrap().result.mrope.is_none());
+        assert!(encode_output(plain).unwrap().result.mrope.is_none());
 
-        let bad = Output {
+        let bad = MmOutput {
             input_ids: vec![1],
-            items: vec![OutputItem {
-                feature: Tensor {
-                    shape: vec![1],
-                    data: TensorData::F32(vec![1.0]),
-                },
+            items: vec![MmOutputItem {
+                feature: dynamo_tensor(vec![1], dynamo::TensorData::F32(vec![1.0])),
                 aux: vec![(
                     "scale".into(),
-                    Tensor {
-                        shape: vec![1],
-                        data: TensorData::F32(vec![1.0]),
-                    },
+                    dynamo_tensor(vec![1], dynamo::TensorData::F32(vec![1.0])),
                 )],
                 hash: 1,
             }],
             offsets: vec![(0, 0)],
             positions: PositionOutput::Rope1D,
         };
-        let Err(err) = encode_driver_output(bad) else {
+        let Err(err) = encode_output(bad) else {
             panic!("an f32 aux tensor must be rejected");
         };
         assert!(err.contains("no metadata form"), "{err}");
@@ -589,6 +659,7 @@ mod tests {
                 data: TensorData::F32(feature),
             },
             hash,
+            identity: None,
             offsets: vec![span],
             model_specific_data: BTreeMap::from([(
                 "image_grid_thw".to_owned(),
@@ -792,6 +863,7 @@ mod tests {
 
     const NO_REQUEST: MmRequestInfo<'static> = MmRequestInfo {
         rid: "r",
+        runtime_rid: "r",
         bootstrap_room: None,
     };
 
@@ -822,12 +894,17 @@ mod tests {
     }
 
     /// Finalization sees the caller's hashes and is validated; `processed`
-    /// observes only a valid finalized result.
+    /// observes only a valid finalized result, with each item's identity
+    /// already hashed over its final feature: the identity the scheduler
+    /// receives in `mm.meta`.
     #[test]
     fn finalization_runs_after_caller_hashes_and_is_validated() {
+        /// Each item's hash and identity, as `processed` saw them.
+        type Observed = Vec<(u64, [u8; 32])>;
+
         struct FinalizingProcessor {
             final_end: u32,
-            processed: std::sync::Mutex<Vec<Vec<u64>>>,
+            processed: std::sync::Mutex<Vec<Observed>>,
         }
 
         impl MmProcessor for FinalizingProcessor {
@@ -850,6 +927,7 @@ mod tests {
                         data: TensorData::F32(vec![2.0]),
                     },
                     hash: parent_hash + 2,
+                    identity: None,
                     offsets: vec![(1, self.final_end)],
                     model_specific_data: BTreeMap::new(),
                 });
@@ -857,8 +935,15 @@ mod tests {
             }
 
             fn processed(&self, _request: MmRequestInfo<'_>, output: &MmProcessOutput) {
-                let hashes = output.result.items.iter().map(|item| item.hash).collect();
-                self.processed.lock().unwrap().push(hashes);
+                let items = output.result.items.iter();
+                let observed = items
+                    .map(|item| {
+                        let identity = item.identity.expect("resolved before `processed`");
+                        assert_eq!(Ok(identity), item.hash_identity());
+                        (item.hash, identity)
+                    })
+                    .collect();
+                self.processed.lock().unwrap().push(observed);
             }
         }
 
@@ -883,14 +968,24 @@ mod tests {
                 assert!(processed.is_empty(), "an invalid result is not observed");
                 continue;
             }
-            assert_eq!(processed, [vec![43, 44]]);
+            let [observed] = processed.as_slice() else {
+                panic!("observed once: {processed:?}");
+            };
+            let hashes: Vec<_> = observed.iter().map(|(hash, _)| *hash).collect();
+            assert_eq!(hashes, [43, 44]);
+            assert_ne!(observed[0].1, observed[1].1);
             let (ids, buffers) = result.expect("valid finalized items");
             assert_eq!(ids, [1, 2]);
             assert!(find(&buffers, "mm.feature.1").is_some());
             let meta: serde_json::Value = rmpv::ext::from_value(decoded_meta(&buffers)).unwrap();
             assert_eq!(meta["items"].as_array().unwrap().len(), 2);
-            assert_eq!(meta["items"][0]["hash"].as_u64(), Some(43));
-            assert_eq!(meta["items"][1]["hash"].as_u64(), Some(44));
+            for (index, (hash, identity)) in observed.iter().enumerate() {
+                assert_eq!(meta["items"][index]["hash"].as_u64(), Some(*hash));
+                assert_eq!(
+                    meta["items"][index]["identity"],
+                    serde_json::json!(identity)
+                );
+            }
         }
     }
 
@@ -970,8 +1065,9 @@ mod tests {
         assert!(find(&g.mm_buffers, "mm.meta").is_some());
 
         // The processor's own failure and a malformed result (span past the
-        // prompt) fail the request in place as the server's fault; a refusal
-        // as the client's.
+        // prompt) fail the request in place as the server's fault; a refusal,
+        // in processing or once processed, as the client's. Intake logs the
+        // failure, so the worker does not.
         let failing: Arc<dyn MmProcessor> = Arc::new(FailingProcessor(MediaError::Server(
             "audio decode: Cannot allocate memory".into(),
         )));
@@ -981,14 +1077,21 @@ mod tests {
         });
         let refusing: Arc<dyn MmProcessor> =
             Arc::new(FailingProcessor(MediaError::Client("bad image".into())));
-        for (processor, server_fault) in [(failing, true), (malformed, true), (refusing, false)] {
+        let refusing_processed: Arc<dyn MmProcessor> = Arc::new(RefusingProcessed);
+        for (processor, server_fault) in [
+            (failing, true),
+            (malformed, true),
+            (refusing, false),
+            (refusing_processed, false),
+        ] {
             let (mm_tx, mm_rx) = flume::unbounded::<Request>();
             let (tm_tx, tm_rx) = flume::unbounded::<TmEvent>();
             let ctx = Arc::new(MmContext::with_processor(processor, false));
-            let worker = std::thread::spawn(move || MmWorker::new(mm_rx, tm_tx, ctx).run());
             mm_tx.send(encoding_req("bad", vec![1, 2])).unwrap();
             drop(mm_tx);
-            worker.join().unwrap();
+            let logs = crate::utils::logging::capture_logs();
+            MmWorker::new(mm_rx, tm_tx, ctx).run();
+            assert_eq!(logs.text(), "");
             let TmEvent::Encoded(req) = tm_rx.try_recv().expect("returned") else {
                 panic!("expected Encoded");
             };
@@ -1012,32 +1115,66 @@ mod tests {
         }
     }
 
+    /// A processor that refuses each valid result once processed.
+    struct RefusingProcessed;
+
+    impl MmProcessor for RefusingProcessed {
+        fn process(&self, input_ids: TokenIds, mm: MmData) -> Result<MmProcessOutput, MediaError> {
+            ExternalProcessor {
+                shape: vec![1],
+                offsets: vec![(1, 1)],
+            }
+            .process(input_ids, mm)
+        }
+
+        fn try_processed(
+            &self,
+            _request: MmRequestInfo<'_>,
+            _output: &MmProcessOutput,
+        ) -> Result<(), MediaError> {
+            Err(MediaError::Client("cannot hand the result on".into()))
+        }
+    }
+
     /// `processed` sees the result the scheduler gets -- the caller's hash
-    /// applied -- under the client's rid and the request's bootstrap room.
+    /// applied -- under the client's rid, the uniquified rid and the request's
+    /// bootstrap room, with what `process` handed it.
     #[test]
     fn processed_observes_the_final_result_with_request_identity() {
         use std::sync::Mutex;
 
-        /// What `processed` saw, as `rid room ids hashes`.
+        /// What `processed` saw, as `rid room ids hashes extension`, and the
+        /// uniquified rid.
         #[derive(Default)]
-        struct Observing(Mutex<Vec<String>>);
+        struct Observing(Mutex<Vec<(String, String)>>);
         impl MmProcessor for Observing {
             fn process(
                 &self,
                 input_ids: TokenIds,
                 mm: MmData,
             ) -> Result<MmProcessOutput, MediaError> {
-                ExternalProcessor {
+                let output = ExternalProcessor {
                     shape: vec![1],
                     offsets: vec![(1, 1)],
                 }
-                .process(input_ids, mm)
+                .process(input_ids, mm)?;
+                Ok(MmProcessOutput {
+                    extension: Some(Box::new("handed on")),
+                    ..output
+                })
             }
             fn processed(&self, request: MmRequestInfo<'_>, output: &MmProcessOutput) {
                 let hashes: Vec<u64> = output.result.items.iter().map(|item| item.hash).collect();
-                self.0.lock().unwrap().push(format!(
-                    "{} {:?} {:?} {hashes:?}",
-                    request.rid, request.bootstrap_room, output.input_ids
+                let extension = output
+                    .extension
+                    .as_ref()
+                    .and_then(|extension| extension.downcast_ref::<&str>());
+                self.0.lock().unwrap().push((
+                    format!(
+                        "{} {:?} {:?} {hashes:?} {extension:?}",
+                        request.rid, request.bootstrap_room, output.input_ids
+                    ),
+                    request.runtime_rid.to_owned(),
                 ));
             }
         }
@@ -1049,6 +1186,8 @@ mod tests {
         let worker = std::thread::spawn(move || MmWorker::new(mm_rx, tm_tx, ctx).run());
         let mut req = encoding_req("unused", vec![1, 2]);
         req.rid = crate::message::ids::Rid::from_client("client");
+        let runtime_rid = req.rid.as_str().to_owned();
+        assert_ne!(runtime_rid, "client");
         let RequestKind::Generate(g) = &mut req.kind else {
             panic!("generate")
         };
@@ -1060,7 +1199,13 @@ mod tests {
         mm_tx.send(req).unwrap();
         drop(mm_tx);
         worker.join().unwrap();
-        assert_eq!(*processor.0.lock().unwrap(), ["client Some(9) [1, 2] [42]"]);
+        assert_eq!(
+            *processor.0.lock().unwrap(),
+            [(
+                r#"client Some(9) [1, 2] [42] Some("handed on")"#.to_owned(),
+                runtime_rid
+            )]
+        );
     }
 
     /// `processed` sees the ids intake forwards, fitted to the context as

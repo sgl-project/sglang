@@ -20,6 +20,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.nomas import (
     NomasPipelineConfig,
     nomas_postprocess_text,
 )
+from sglang.multimodal_gen.runtime.layers.kvcache.nomas_segment_cache import (
+    NomasAttentionPlan,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -45,9 +48,6 @@ from sglang.multimodal_gen.runtime.loader.transformer_load_utils import (
     resolve_transformer_quant_load_spec,
 )
 from sglang.multimodal_gen.runtime.models.dits.nomas import NomasTransformer3DModel
-from sglang.multimodal_gen.runtime.models.dits.nomas_kv_cache import (
-    NomasAttentionPlan,
-)
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
@@ -344,6 +344,37 @@ def test_fused_qk_norm_rope_and_modulate_cast_are_bitwise_exact():
         fused = layers.modulate_for_linear(x, shift, scale)
     assert fused.dtype == torch.bfloat16
     assert torch.equal(fused, layers.modulate(x, shift, scale).to(torch.bfloat16))
+
+
+@pytest.mark.skipif(not is_nvidia_cuda, reason="fused kernels need CUDA")
+@torch.inference_mode()
+def test_mean_square_fusion_preserves_compiled_rope_and_camera_fallback():
+    from sglang.multimodal_gen.runtime.models.dits import nomas_layers as layers
+
+    for dim in (128, 64):
+        x = torch.randn(1, 2000, 3, 16, dim, device="cuda", dtype=torch.bfloat16)[
+            :, :, 1
+        ]
+        norm = layers.RMSNorm(dim).cuda().bfloat16()
+        norm.weight.normal_(1, 0.1)
+        angles = torch.randn(2000, dim, device="cuda")
+        freqs = (angles.cos(), angles.sin())
+        cos, sin = layers._rope_tables(x, freqs)
+        expected = layers._compiled_norm_rotate()(
+            x,
+            x.float().square().mean(-1, keepdim=True),
+            norm.eps,
+            norm.weight,
+            cos,
+            sin,
+            torch.bfloat16,
+        )
+        assert torch.equal(
+            layers.rms_norm_rotate(norm, x, freqs, torch.bfloat16), expected
+        )
+        if dim == 128:
+            assert layers._MEAN_SQUARE.is_verified((x.shape, x.stride(), x.device))
+            assert not layers._MEAN_SQUARE.disabled
 
 
 @pytest.mark.skipif(not is_nvidia_cuda, reason="fused kernels need CUDA")
@@ -837,6 +868,69 @@ def test_pixelumm_fused_qk_norm_mrope_is_bitwise_exact(tokens, heads, batch):
         x, cos, sin, attention.q_norm_t, attention.q_norm_hw, x.dtype
     )
     assert torch.equal(actual, expected)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or torch.version.hip is not None,
+    reason="requires NVIDIA CUDA",
+)
+@torch.inference_mode()
+def test_pixelumm_mrope_fusion_matches_compiled_reference_and_fallback(monkeypatch):
+    from sglang.kernels import ops
+    from sglang.kernels.arch import current_arch
+    from sglang.kernels.ops.diffusion import BitExactFusionGate
+    from sglang.multimodal_gen.runtime.models.vaes import nomas
+
+    if not current_arch().is_sm_at_least(10):
+        pytest.skip("fusion requires SM100+")
+    gate = BitExactFusionGate("test Nomas VAE MRoPE", per_signature=True)
+    monkeypatch.setattr(nomas, "_QK_MROPE_FUSION", gate)
+    kernel = ops.diffusion.fused_nomas_qk_norm_mrope
+    calls = []
+
+    def counted(*args):
+        calls.append(args[0].shape)
+        return kernel(*args)
+
+    monkeypatch.setattr(ops.diffusion, "fused_nomas_qk_norm_mrope", counted)
+    torch.manual_seed(831)
+    for dim, batch, tokens, heads in (
+        (128, 1, 16384, 32),
+        (128, 2, 36, 8),
+        (64, 2, 36, 8),
+    ):
+        attention = (
+            nomas.GenAttention(nomas.GenExpertArch(hidden_size=128, head_dim=dim))
+            .cuda()
+            .bfloat16()
+        )
+        attention.q_norm_t.weight.normal_()
+        attention.q_norm_hw.weight.normal_()
+        x = torch.randn(batch, 35200, heads, dim, device="cuda", dtype=torch.bfloat16)[
+            :, :tokens
+        ]
+        cos, sin = nomas.mrope_tables(attention.arch, (10, 44, 80), "cuda")
+        cos, sin = cos[:, :tokens], sin[:, :tokens]
+        half = dim // 2
+        expected = nomas._compiled_qk_norm_mrope()(
+            x,
+            nomas._mean_square(x[..., :half]),
+            nomas._mean_square(x[..., half:]),
+            attention.q_norm_t.eps,
+            attention.q_norm_t.weight,
+            attention.q_norm_hw.weight,
+            cos,
+            sin,
+            attention.arch.rope_sections,
+            x.dtype,
+        )
+        before = len(calls)
+        actual = attention._prepare_qk(
+            x, cos, sin, attention.q_norm_t, attention.q_norm_hw, x.dtype
+        )
+        assert torch.equal(actual.view(torch.int16), expected.view(torch.int16))
+        assert (len(calls) > before) == (dim == 128)
+    assert gate.verified_sigs and not gate.disabled
 
 
 def test_scheduler_loader_uses_effective_shift(tmp_path):
@@ -1364,6 +1458,39 @@ def test_int8_group_boundary_and_partial_final_group(int8_layer):
     inputs[1, 128] = 1
     expected = (127 * int8_layer.weight_scale).bfloat16().T + int8_layer.bias
     torch.testing.assert_close(int8_layer(inputs), expected, rtol=0, atol=0)
+
+
+def test_int8_loading_rejects_invalid_group_metadata(int8_layer):
+    """Reject malformed groupwise scales during weight loading."""
+    int8_layer.quant_method.process_weights_after_loading(int8_layer)
+    int8_layer.weight_scale = torch.nn.Parameter(
+        torch.ones((2, 1), dtype=torch.float32), requires_grad=False
+    )
+    with pytest.raises(ValueError, match="groupwise shape"):
+        int8_layer.quant_method.process_weights_after_loading(int8_layer)
+
+
+@torch.inference_mode()
+def test_int8_dequant_survives_device_moves_and_compile(int8_layer):
+    """Fused dequantization supports component offload and compiled inference."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    inputs = torch.ones(2, 130, dtype=torch.bfloat16)
+    expected = int8_layer(inputs)
+    int8_layer.quant_method.process_weights_after_loading(int8_layer)
+    for device in ("cuda", "cpu", "cuda"):
+        int8_layer.to(device)
+        actual = int8_layer(inputs.to(device)).cpu()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    compiled = torch.compile(int8_layer, fullgraph=True)
+    torch.testing.assert_close(compiled(inputs.cuda()).cpu(), expected, rtol=0, atol=0)
+    if torch.cuda.device_count() > 1:
+        current = torch.cuda.current_device()
+        other = (current + 1) % torch.cuda.device_count()
+        int8_layer.to(f"cuda:{other}")
+        actual = int8_layer(inputs.to(f"cuda:{other}")).cpu()
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert torch.cuda.current_device() == current
 
 
 @pytest.mark.parametrize(
