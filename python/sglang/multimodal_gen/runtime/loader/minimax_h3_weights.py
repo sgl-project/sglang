@@ -111,9 +111,27 @@ def validate_minimax_h3_checkpoint_variant(
         )
 
 
+def minimax_h3_safetensors_from_comfy_export(safetensors_list: list[str]) -> bool:
+    """Whether the checkpoint was written by ComfyUI.
+
+    ComfyUI stores the originating model config in the safetensors
+    ``__metadata__`` block, whereas Diffusers and transformers exports only
+    carry a ``format`` entry.
+    """
+    for path in safetensors_list:
+        if not path.endswith(".safetensors"):
+            continue
+        with safe_open(path, framework="pt", device="cpu") as checkpoint:
+            metadata = checkpoint.metadata() or {}
+        if "config" in metadata:
+            return True
+    return False
+
+
 __all__ = [
     "comfy_quant_key_filter",
     "inspect_minimax_h3_safetensors",
+    "minimax_h3_safetensors_from_comfy_export",
     "resolve_minimax_h3_checkpoint_quantization",
     "validate_minimax_h3_checkpoint_variant",
 ]

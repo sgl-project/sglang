@@ -24,6 +24,7 @@ from sglang.multimodal_gen.runtime.loader.gguf_weights import gguf_weights_itera
 from sglang.multimodal_gen.runtime.loader.minimax_h3_weights import (
     comfy_quant_key_filter,
     inspect_minimax_h3_safetensors,
+    minimax_h3_safetensors_from_comfy_export,
     resolve_minimax_h3_checkpoint_quantization,
     validate_minimax_h3_checkpoint_variant,
 )
@@ -348,6 +349,23 @@ class TransformerLoader(OnlineQuantizationComponentLoader):
                             "MiniMax-H3 pruned curve checkpoints cannot use a "
                             "separate AdaLN cache or online AdaLN rebuild"
                         )
+                if (
+                    checkpoint_quant_config is None
+                    and dit_config.arch_config.checkpoint_qkv_layout is None
+                    and dit_config.arch_config.qkv_checkpoint_grouped
+                    and not dit_config.arch_config.checkpoint_uses_diffusers_layout
+                    and minimax_h3_safetensors_from_comfy_export(safetensors_list)
+                ):
+                    logger.warning(
+                        "MiniMax-H3 weight override %s looks like a ComfyUI export, "
+                        "but the base transformer config declares no "
+                        "checkpoint_qkv_layout. ComfyUI exports store fused QKV as "
+                        "[q_all, k_all, v_all], so the default head-interleaved "
+                        "reorder will corrupt the output. Set "
+                        '`"checkpoint_qkv_layout": "native"` in the base component '
+                        "config, or load a Diffusers-format component instead.",
+                        component_server_args.transformer_weights_path,
+                    )
 
         resolve_checkpoint_quantization = getattr(
             model_cls, "resolve_checkpoint_quantization", None
