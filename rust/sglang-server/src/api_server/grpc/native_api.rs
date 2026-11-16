@@ -40,6 +40,13 @@ pub(super) fn generate_stream(
 
         // Poll all receivers concurrently; re-arm a receiver's future after each
         // non-terminal event so its stream keeps flowing.
+        let mut calls = calls;
+        if let Err(error) = futures::future::try_join_all(
+            calls.iter_mut().map(|call| call.preflight()),
+        ).await {
+            yield Err(status(error));
+            return;
+        }
         let mut pending = FuturesUnordered::new();
         for (i, call) in calls.into_iter().enumerate() {
             pending.push(recv_indexed(i, call));

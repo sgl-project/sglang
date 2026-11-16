@@ -669,9 +669,7 @@ mod tests {
         assert!(harness.abort_rx.try_recv().is_err());
     }
 
-    /// A runtime failure after admission is this request's in-stream error item
-    /// (the SSE error frame's twin, `type` and `retryable` included), not an
-    /// RPC status; the call is disarmed.
+    /// Initial validation failures use INVALID_ARGUMENT; runtime failures retain error items.
     #[tokio::test]
     async fn runtime_failure_rides_the_stream_as_an_error_item() {
         use crate::utils::error::Error;
@@ -700,7 +698,15 @@ mod tests {
             assert!(intake.admission.try_accept());
             intake.sink.try_send(ResponseItem::Error(failure)).unwrap();
 
-            let error = stream_error(stream.next().await.unwrap().unwrap());
+            let item = stream.next().await.unwrap();
+            if code == 400 {
+                let error = item.unwrap_err();
+                assert_eq!(error.code(), Code::InvalidArgument);
+                assert!(error.message().contains("bad sampling"));
+                assert!(stream.next().await.is_none());
+                continue;
+            }
+            let error = stream_error(item.unwrap());
             assert_eq!(error.index, None);
             let body = error.error.unwrap();
             assert_eq!(body.code, code);
@@ -901,7 +907,7 @@ mod tests {
         assert_eq!(second.request.text.as_deref(), Some("b"));
         first
             .sink
-            .try_send(ResponseItem::Error(crate::utils::error::Error::Validation(
+            .try_send(ResponseItem::Error(crate::utils::error::Error::Internal(
                 "first failed".into(),
             )))
             .unwrap();
