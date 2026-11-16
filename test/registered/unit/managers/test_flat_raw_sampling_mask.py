@@ -10,7 +10,10 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 maybe_stub_sgl_kernel()
 
 from sglang.srt.managers.io_struct import GenerateReqInput
-from sglang.srt.managers.tokenizer_manager import ReqState, TokenizerManager
+from sglang.srt.managers.tokenizer_manager import (
+    ReqState,
+    _add_sampling_mask_to_meta_info,
+)
 from sglang.srt.observability.req_time_stats import APIServerReqTimeStats
 from sglang.srt.sampling.sampling_mask import SamplingMaskChunk
 
@@ -23,12 +26,6 @@ _FLAT_KEYS = (
 )
 # The output sampling masks of three batches, one row of token ids per output token.
 _ROWS = [[[5, 7, 9], [2]], [[4, 1], [8, 6, 3, 0]], [[11]]]
-
-
-class _TokenizerManagerStub:
-    """Borrow the real sampling mask meta_info method without a full manager."""
-
-    add_sampling_mask_to_meta_info = TokenizerManager.add_sampling_mask_to_meta_info
 
 
 def _chunk(rows, support_logprobs: bool) -> SamplingMaskChunk:
@@ -57,7 +54,7 @@ def _make_state(**obj_kwargs) -> ReqState:
 def _meta_info(state: ReqState, chunks, finished: bool) -> dict:
     meta_info = {}
     for i, chunk in enumerate(chunks):
-        _TokenizerManagerStub().add_sampling_mask_to_meta_info(
+        _add_sampling_mask_to_meta_info(
             meta_info, state, chunk, finished=finished and i == len(chunks) - 1
         )
     return meta_info

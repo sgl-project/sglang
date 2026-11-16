@@ -478,6 +478,38 @@ def _build_flat_sampling_mask_fields(
     return fields
 
 
+def _add_sampling_mask_to_meta_info(
+    meta_info: dict,
+    state: ReqState,
+    chunk: Optional[SamplingMaskChunk],
+    finished: bool,
+):
+    if chunk is not None:
+        if state.obj.return_flat_raw_sampling_mask:
+            state.output_token_sampling_mask_chunks.append(chunk)
+        else:
+            masks, logprobs = chunk.to_lists(
+                support_logprobs=state.obj.sampling_logprobs_mode == "support"
+            )
+            state.output_token_sampling_mask.extend(masks)
+            state.output_token_sampling_logprobs.extend(logprobs)
+            meta_info["output_token_sampling_mask"] = state.output_token_sampling_mask
+            meta_info["output_token_sampling_logprobs"] = (
+                state.output_token_sampling_logprobs
+            )
+            meta_info["output_token_sampling_mask_length"] = len(
+                state.output_token_sampling_mask
+            )
+    # Built once on the finished response; streaming is rejected.
+    if state.obj.return_flat_raw_sampling_mask and finished:
+        meta_info.update(
+            _build_flat_sampling_mask_fields(
+                state.output_token_sampling_mask_chunks,
+                return_b64=state.obj.return_flat_raw_sampling_mask_b64,
+            )
+        )
+
+
 def _build_flat_top_logprobs_fields_from_arrays(
     side: str,
     val_arr: np.ndarray,
@@ -2830,7 +2862,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 and state.obj.return_sampling_mask
             ):
                 output_sampling_mask = recv_obj.output_token_sampling_mask
-                self.add_sampling_mask_to_meta_info(
+                _add_sampling_mask_to_meta_info(
                     meta_info,
                     state,
                     None if output_sampling_mask is None else output_sampling_mask[i],
@@ -3125,40 +3157,6 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state,
                 key,
                 values[index],
-            )
-
-    def add_sampling_mask_to_meta_info(
-        self,
-        meta_info: dict,
-        state: ReqState,
-        chunk: Optional[SamplingMaskChunk],
-        finished: bool,
-    ):
-        if chunk is not None:
-            if state.obj.return_flat_raw_sampling_mask:
-                state.output_token_sampling_mask_chunks.append(chunk)
-            else:
-                masks, logprobs = chunk.to_lists(
-                    support_logprobs=state.obj.sampling_logprobs_mode == "support"
-                )
-                state.output_token_sampling_mask.extend(masks)
-                state.output_token_sampling_logprobs.extend(logprobs)
-                meta_info["output_token_sampling_mask"] = (
-                    state.output_token_sampling_mask
-                )
-                meta_info["output_token_sampling_logprobs"] = (
-                    state.output_token_sampling_logprobs
-                )
-                meta_info["output_token_sampling_mask_length"] = len(
-                    state.output_token_sampling_mask
-                )
-        # Built once on the finished response; streaming is rejected.
-        if state.obj.return_flat_raw_sampling_mask and finished:
-            meta_info.update(
-                _build_flat_sampling_mask_fields(
-                    state.output_token_sampling_mask_chunks,
-                    return_b64=state.obj.return_flat_raw_sampling_mask_b64,
-                )
             )
 
     def add_logprob_to_meta_info(
