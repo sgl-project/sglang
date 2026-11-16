@@ -482,6 +482,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 parallel_group="replicated"
                 if get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_ascend_ops()
                 or get_moe_a2a_backend().is_mooncake()
                 or get_moe_a2a_backend().is_nixl()
                 or get_moe_a2a_backend().is_mori()
@@ -548,6 +549,7 @@ class Glm4MoeSparseMoeBlock(nn.Module):
 
         self._enable_a2a_moe = (
             get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_ascend_ops()
             or get_moe_a2a_backend().is_mooncake()
             or get_moe_a2a_backend().is_nixl()
             or get_moe_a2a_backend().is_mori()
