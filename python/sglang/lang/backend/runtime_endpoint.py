@@ -36,7 +36,6 @@ class RuntimeEndpoint(BaseBackend):
         admin_api_key: Optional[str] = None,
     ):
         super().__init__()
-        self.support_concate_and_append = True
 
         self.base_url = base_url
         self.api_key = api_key
