@@ -282,7 +282,9 @@ def mode2_parity():
                 with make_selector(*variant) as selector:
                     got = top_k_v2_selections(selector, lens, width, k, seed=width)
                 for name, rows in want.items():
-                    differ = [b for b, (w, g) in enumerate(zip(rows, got[name])) if w != g]
+                    differ = [
+                        b for b, (w, g) in enumerate(zip(rows, got[name])) if w != g
+                    ]
                     assert not differ, (
                         f"{name}, width {width}, k {k}: {variant} picks differ from "
                         f"sgl-kernel mode 2 in rows {differ}"
