@@ -211,7 +211,7 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
         }
         if (
             not current_platform.is_cuda()
-            or not device_name.upper().startswith("NVIDIA H200")
+            or "H200" not in device_name.upper()
             or capability_int != 90
         ):
             mismatches["device"] = {

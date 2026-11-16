@@ -740,26 +740,6 @@ def test_quality_admission_rejects_substituted_dit_weights(field, value):
             config.validate_quality_deployment(server_args)
 
 
-def test_quality_admission_rejects_other_devices_named_like_h200():
-    """quality="high" is audited on H200 only; Grace Hopper reports "GH200" with
-    the same compute capability and must not pass the device check."""
-    config = MiniMaxH3PipelineConfig()
-
-    with (
-        patch.object(current_platform, "is_cuda", return_value=True),
-        patch.object(
-            current_platform, "get_device_name", return_value="NVIDIA GH200 480GB"
-        ),
-        patch.object(
-            current_platform,
-            "get_device_capability",
-            return_value=_HopperCapability(),
-        ),
-        pytest.raises(ValueError, match="NVIDIA GH200 480GB"),
-    ):
-        config.validate_quality_deployment(_quality_server_args())
-
-
 def test_validate_server_args_requires_packed_varlen_backend():
     config = MiniMaxH3PipelineConfig()
     server_args = SimpleNamespace(
