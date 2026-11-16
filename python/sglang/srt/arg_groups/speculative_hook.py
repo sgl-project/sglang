@@ -50,11 +50,11 @@ def _should_auto_enable_hip_rejection_sampling(
 ) -> bool:
     """Whether HIP may default ``speculative_use_rejection_sampling`` on.
 
-    Rejection sampling still cannot consume a reduced / hot draft vocab
-    (``eagle_worker_v2`` FIXME: scatter via the d2t map). Auto-enabling there
-    would crash configs that previously ran greedy on HIP, including EAGLE3
-    stage-a ``test_basic_sanity_eagle3`` (draft 32000 vs target 128256). Skip
-    EAGLE3 and any EAGLE run that already has a token map.
+    Rejection sampling can now consume a reduced / hot draft vocab --
+    ``eagle_worker_v2`` scatters ``q`` onto the target vocab through the d2t map
+    -- but that path is not validated on ROCm, so auto-enabling is still withheld
+    for EAGLE3 and for any EAGLE run that already has a token map. Passing the
+    flag explicitly works.
 
     Also skip when ``SGLANG_SIMULATE_ACC_LEN`` is on: AgentX throughput still
     runs the real EAGLE verify then overwrites accept length, so the Triton
@@ -437,6 +437,7 @@ def _handle_dflash(server_args: ServerArgs) -> None:
 
     _resolve_dflash_draft_attention_backend(server_args)
     _reject_dflash_sliding_mla_draft_window(server_args)
+    _resolve_dflash_draft_kv_ring(server_args)
 
     if cfg.max_running_requests is None:
         declare_resolution(
@@ -720,8 +721,7 @@ def _handle_dspark(server_args: ServerArgs) -> None:
                 f"(attn_cp_size={cfg.attn_cp_size})."
             )
         if (
-            not _is_npu
-            and cfg.speculative_moe_a2a_backend is not None
+            cfg.speculative_moe_a2a_backend is not None
             and cfg.speculative_moe_a2a_backend != cfg.moe_a2a_backend
         ):
             raise ValueError(
@@ -1081,6 +1081,41 @@ def _reject_dflash_sliding_mla_draft_window(server_args: ServerArgs) -> None:
             f"with sliding-window layers on {draft_backend}: the backend applies "
             "the draft's own window."
         )
+
+
+def _resolve_dflash_draft_kv_ring(server_args: ServerArgs) -> None:
+    """Runs after the draft backend is final, which it reads."""
+    from sglang.srt.speculative.dflash_draft_ring import (
+        draft_kv_ring_unsupported_reason,
+    )
+
+    switch = envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING
+    if not switch.get():
+        logger.info("DFLASH draft KV ring: off, SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=0.")
+        return
+    cfg = resolving_view(server_args)
+    reason = draft_kv_ring_unsupported_reason(
+        lambda: _load_draft_hf_config(cfg),
+        draft_backend=cfg.speculative_draft_attention_backend,
+        disaggregation_mode=cfg.disaggregation_mode,
+        disaggregation_transfer_backend=cfg.disaggregation_transfer_backend,
+        disaggregation_decode_host_receive_threshold=(
+            cfg.disaggregation_decode_host_receive_threshold
+        ),
+        enable_unified_memory=cfg.enable_unified_memory,
+        dcp_size=cfg.dcp_size,
+    )
+    if reason is not None:
+        if switch.is_set():
+            raise ValueError(f"SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=1, but {reason}.")
+        logger.info("DFLASH draft KV ring: off, %s.", reason)
+        return
+    logger.info("DFLASH draft KV ring: on.")
+    declare_resolution(
+        server_args,
+        "_resolve_dflash_draft_kv_ring",
+        speculative_dflash_draft_kv_ring=True,
+    )
 
 
 def _handle_frozen_kv_mtp(server_args: ServerArgs) -> None:

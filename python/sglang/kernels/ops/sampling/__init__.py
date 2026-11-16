@@ -165,3 +165,11 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="sampling.radix_topk",
+        backend=KernelBackend.FLASHINFER,
+        target="sglang.kernels.ops.sampling.topk:radix_topk",
+        capabilities=CUDA_ONLY,
+    )
+)
