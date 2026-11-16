@@ -14,8 +14,8 @@ use serde_json::{Map, Value};
 use sglang_api_types::api::v1::{GenerateResponse, GenerateStreamError};
 use sglang_processor::dynamo_tokenizers::{DecodeResult, Tokenizer};
 use sglang_processor::openai::{
-    ChatModel, ChatResponder, OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Reply, TokenPieces,
-    lower_chat,
+    ChatModel, ChatResponder, OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, ROUTING_KEY_HEADER,
+    Reply, TokenPieces, lower_chat,
 };
 use sglang_processor::{DynamoTokenizer, TemplateArgs, TemplateError};
 
@@ -161,7 +161,7 @@ pub(super) async fn chat(
 ) -> Option<Response> {
     state.openai_chat.as_ref()?;
     let header = |name: &str| headers.get(name)?.to_str().ok().map(str::to_owned);
-    let routing_key = header("x-smg-routing-key");
+    let routing_key = header(ROUTING_KEY_HEADER);
     let sglext_ids = ["x-sglext-return-input-ids", "x-sglext-return-output-ids"]
         .into_iter()
         .any(|name| header(name).as_deref() == Some("1"));
@@ -542,6 +542,30 @@ mod tests {
         assert_eq!(value["type"], "BadRequestError");
         let message = value["message"].as_str().unwrap();
         assert!(message.contains("exceeds the maximum"), "{message}");
+    }
+
+    /// Chat lowers to the native request, so it refuses what `/generate`
+    /// refuses: a custom logit processor Python would run, but not an empty
+    /// name, which Python reads as none.
+    #[tokio::test]
+    async fn chat_refuses_a_custom_logit_processor() {
+        for (processor, status) in [("", StatusCode::OK), ("cls", StatusCode::BAD_REQUEST)] {
+            let app = lowered_state(|rid| chunk(rid, "ok", true));
+            let body = json!({
+                "model": "model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "custom_logit_processor": processor,
+            });
+            let response = post_json(app, "/v1/chat/completions", body).await;
+            assert_eq!(response.status(), status, "{processor:?}");
+            if status == StatusCode::BAD_REQUEST {
+                let value = body_json(response).await;
+                assert_eq!(
+                    value["message"],
+                    "custom_logit_processor is not supported by the Rust server"
+                );
+            }
+        }
     }
 
     /// With `n` choices, a prompt's one-element lists cover every choice, as

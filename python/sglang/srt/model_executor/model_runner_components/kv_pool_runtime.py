@@ -18,6 +18,7 @@ from sglang.srt.runtime_context import (
     get_mm,
     get_parallel,
     get_schedule,
+    get_spec,
     pre_capture_activation_reserve_mb,
 )
 from sglang.srt.utils.device import get_available_gpu_memory, get_device_memory_capacity
@@ -40,9 +41,11 @@ def is_post_capture_kv_active(
 ) -> bool:
     if is_draft_worker:
         # A dflash-family draft pool is indexed by the target's token ids, so it
-        # follows the target pool's post-capture backing.
+        # follows the target pool's post-capture backing. A draft KV ring is a
+        # fixed pool indexed by request slot instead.
         return (
             spec_algorithm.is_dflash_family()
+            and not get_spec().speculative_dflash_draft_kv_ring
             and token_to_kv_pool_allocator.get_kvcache().post_capture_active
         )
     return post_capture_kv_sizing_planned(server_args) and current_platform.is_cuda()

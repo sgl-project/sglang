@@ -217,6 +217,29 @@ class QSAMTPSharedSparseIndices:
         return out
 
 
+class QSAStepView(msgspec.Struct, frozen=True):
+    """A step's QSA data for a megakernel (graph-static under capture)."""
+
+    metadata: QwenSparseAttnMetadata
+    # a draft decode step's reused draft-extend selection, per QSA layer and slot
+    mtp_indices: Optional[torch.Tensor]
+    mtp_captured_len: Optional[torch.Tensor]
+
+
+class QSAPoolView(msgspec.Struct, frozen=True):
+    """The QSA pool's buffers per QSA layer (ascending), for a megakernel."""
+
+    layer_ids: Tuple[int, ...]
+    k: Tuple[torch.Tensor, ...]
+    v: Tuple[torch.Tensor, ...]
+    compressed_k: Tuple[torch.Tensor, ...]  # slot = token slot // compress_ratio
+    key_state: Tuple[torch.Tensor, ...]  # pending raw-key ring
+    rope_positions: torch.Tensor  # [request slots * ratio, 3] of the pending keys
+    compress_ratio: int
+    compressed_page_size: int
+    token_topk: int
+
+
 class QwenSparseAttnBackend(AttentionBackend):
     """QSA backend using trtllm-gen decode with a packed FA2/FA4 fallback."""
 
@@ -1212,6 +1235,31 @@ class QwenSparseAttnBackend(AttentionBackend):
 
     def set_mtp_shared_sparse_indices(self, state) -> None:
         self._mtp_shared_sparse_indices = state
+
+    def megakernel_step_view(self, forward_batch) -> QSAStepView:
+        state = self._mtp_shared_sparse_indices
+        return QSAStepView(
+            metadata=self._resolve_metadata(forward_batch),
+            mtp_indices=None if state is None else state.indices,
+            mtp_captured_len=None if state is None else state.captured_len,
+        )
+
+    def megakernel_pool_view(self) -> QSAPoolView:
+        pool = self.token_to_kv_pool
+        router = pool.layer_router
+        layer_ids = router.layer_ids()
+        layers = tuple(router.read(i) for i in layer_ids)
+        return QSAPoolView(
+            layer_ids=layer_ids,
+            k=tuple(layer.key() for layer in layers),
+            v=tuple(layer.value() for layer in layers),
+            compressed_k=tuple(map(pool.get_qsa_compressed_k_buffer, layer_ids)),
+            key_state=tuple(map(pool.get_qsa_key_state_buffer, layer_ids)),
+            rope_positions=pool.qsa_rope_position_buffer,
+            compress_ratio=pool.qsa_compress_ratio,
+            compressed_page_size=pool.qsa_compressed_page_size,
+            token_topk=pool.qsa_token_topk,
+        )
 
     def should_reuse_mtp_sparse_indices(self, forward_batch) -> bool:
         """Draft decode steps reuse the draft-extend selection."""

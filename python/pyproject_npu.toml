@@ -30,6 +30,9 @@ dependencies = [
   "einops",
   "fastapi",
   "gguf",
+  "grpcio>=1.81.1",
+  "grpcio-health-checking>=1.81.1",
+  "grpcio-reflection>=1.81.1",
   "hf_transfer",
   "huggingface_hub",
   "interegular",
@@ -49,6 +52,7 @@ dependencies = [
   # The Rust image pipeline (dynamo-multimodal) reproduces Pillow 12.x bicubic.
   "pillow<13",
   "prometheus-client>=0.20.0",
+  "protobuf>=6.33.5",
   "psutil",
   "py-spy",
   "pybase64",
@@ -60,7 +64,6 @@ dependencies = [
   "scipy",
   "sentencepiece==0.2.1",  # 0.2.2 rejects null pieces in InternVL tokenizers.
   "setproctitle",
-  "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
   "tiktoken",
   "timm==1.0.25",

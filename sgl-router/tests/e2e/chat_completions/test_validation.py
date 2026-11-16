@@ -1,6 +1,4 @@
-"""Basic chat-completions correctness — ported from SMG's
-``e2e_test/chat_completions/test_validation.py``, narrowed to the
-subset that exercises sgl-router (not SMG's per-message validators).
+"""Basic chat-completions correctness through sgl-router.
 
 The shape:
   - single-worker regular-mode router

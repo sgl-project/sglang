@@ -112,6 +112,8 @@ def _make_prealloc_queue(
     )
     # Disable the SWA-tail branch; this test only exercises the pool-length gate.
     queue._uses_swa_tail_prealloc = MagicMock(return_value=False)
+    # A request table without state slots: the ceiling prices tokens alone.
+    queue.req_to_token_pool = SimpleNamespace(holds_state_slots=False)
 
     model_runner = SimpleNamespace(max_token_pool_size=max_token_pool_size)
     tp_worker = SimpleNamespace(model_runner=model_runner)
