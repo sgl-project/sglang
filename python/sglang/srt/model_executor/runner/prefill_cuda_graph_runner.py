@@ -235,6 +235,16 @@ def _resolve_transformer_layer_model(model: torch.nn.Module) -> torch.nn.Module:
     return layer_model
 
 
+def set_external_prefill_body(model: torch.nn.Module, body: Any) -> None:
+    """Mark the transformer body prefill graphs capture as a kernel plugin's
+    (spec.SupportsPrefillBody), which reads the pools inside the graph."""
+    model.__dict__["_external_prefill_body"] = body
+
+
+def external_prefill_body(model: torch.nn.Module) -> Optional[Any]:
+    return model.__dict__.get("_external_prefill_body")
+
+
 def _build_layer_model_forward_kwargs(
     layer_model: torch.nn.Module,
     forward_batch: ForwardBatch,
@@ -1352,6 +1362,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
             assert self.attn_metadata_buffers is not None
             self.attn_metadata_buffers[shape_key] = metadata
+            body = external_prefill_body(self.model_runner.model)
+            if body is not None and metadata is not None:
+                body.refill_prefill_graph(metadata, forward_batch)
 
     def _prepare_forward_metadata_for_replay(
         self,
@@ -1414,6 +1427,9 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 forward_batch,
                 static_forward_batch=static_forward_batch,
             )
+            body = external_prefill_body(self.model_runner.model)
+            if body is not None and metadata is not None:
+                body.refill_prefill_graph(metadata, forward_batch)
 
         return attn_backend.resolve_prefill_shared_read_ends(
             forward_batch, build_snapshot=build_snapshot
@@ -2468,8 +2484,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
     def _wait_for_layer_loads(self) -> None:
         # Full replay skips the pool accessors. BCG's dynamic KDA waits do not
-        # cover Full graph's KV/state reads, so Full still needs this barrier.
-        if not self._is_full_backend:
+        # cover Full graph's KV/state reads, so Full still needs this barrier;
+        # so does a BCG replay of an external body, which reads the pools in-graph.
+        if not (
+            self._is_full_backend
+            or external_prefill_body(self.model_runner.model) is not None
+        ):
             return
         counter = self.model_runner.token_to_kv_pool.layer_transfer_counter
         if counter is not None and counter.consumer_index >= 0:

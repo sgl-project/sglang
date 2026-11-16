@@ -222,18 +222,18 @@ CUDA_VISIBLE_DEVICES=0,1 sglang generate \
   --save-output --perf-dump-path joy_echo_h200.json.perf
 ```
 
-For BCG, add `--enable-breakable-cuda-graph --warmup-resolutions 640x384 --warmup-num-frames 33`. Check for successful `[Diffusion BCG] captured` logs and absence of request signature misses. Keep the same model ID, resolution, frame count and quality as warmup.
+For BCG, add `--enable-breakable-cuda-graph --warmup-resolutions 640x384 --warmup-num-frames 33 --warmup-sampling-params '{"quality": "exact"}'`. Check for successful `[Diffusion BCG] captured` logs and absence of request signature misses. Keep the same model ID, resolution, frame count and quality as warmup.
 
 Two fresh-process saved requests per configuration, after request warmup:
 
-| Lossless mode | Auto residency E2E | All resident E2E | Reduction | Peak reserved per rank, auto → resident |
+| Exact mode | Auto residency E2E | All resident E2E | Reduction | Peak reserved per rank, auto → resident |
 | --- | ---: | ---: | ---: | ---: |
 | Eager | 2.563 s | 2.366 s | 7.65% | 46.43 → 69.32 GiB |
 | BCG | 1.229 s | 1.058 s | 13.88% | 48.77–48.88 → 69.32 GiB |
 
-Loading, warmup and profiling are excluded from these timings. The paired eager profiles remove 71 pinned host-to-device copies (13.07 GB, 278.86 ms on the profiled rank), with the same 77,045 kernel launches. All eight lossless outputs have pixel-identical video frames; audio differences are comparable to baseline repeat variability. These results cover this compact single-shot workload, rather than the default 121-frame or multi-shot memory-bank workload.
+Loading, warmup and profiling are excluded from these timings. The paired eager profiles remove 71 pinned host-to-device copies (13.07 GB, 278.86 ms on the profiled rank), with the same 77,045 kernel launches. All eight exact-quality outputs have pixel-identical video frames; audio differences are comparable to baseline repeat variability. These results cover this compact single-shot workload, rather than the default 121-frame or multi-shot memory-bank workload.
 
-Use `quality=lossless` for this recipe. High-mode output did not pass the separate quality comparison, and high + BCG is rejected by the runtime. If a larger request exceeds available memory, return to auto residency or keep only selected components resident.
+Use `quality=exact` for this recipe. High-mode output did not pass the separate quality comparison; under BCG, warmup captures at the server's default level (`lossless`) unless `--warmup-sampling-params` sets `quality`, and a request at any other level runs eager. If a larger request exceeds available memory, return to auto residency or keep only selected components resident.
 
 ## 5. Practical Tips
 
