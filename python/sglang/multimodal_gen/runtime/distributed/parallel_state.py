@@ -235,6 +235,8 @@ def init_parallel_group_coordinator(
             **kwargs,
         )
     else:
+        from sglang.multimodal_gen.runtime.platforms import current_platform
+
         group_name = {
             "pipeline": "pp_group",
             "tensor": "tp_group",
@@ -247,7 +249,9 @@ def init_parallel_group_coordinator(
             local_rank=local_rank,
             torch_distributed_backend=backend,
             use_device_communicator=parallel_mode != "tensor",
-            use_srt_custom_allreduce=parallel_mode == "tensor",
+            use_srt_custom_allreduce=(
+                parallel_mode == "tensor" and current_platform.is_cuda()
+            ),
             group_name=group_name,
         )
 
