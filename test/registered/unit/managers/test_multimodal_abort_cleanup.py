@@ -28,6 +28,7 @@ from sglang.srt.managers.req_types import (
 )
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.request_list import move
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
@@ -380,11 +381,12 @@ def kept_rows():
     mm_schedule.release_prefill_rows()
 
 
-def _admission_scheduler(chunked_req):
-    """A scheduler whose admission records how many kept entries it found."""
+def _admission_scheduler():
+    """A scheduler between two chunks of a prefill, whose admission records how
+    many kept entries it found."""
     scheduler = Scheduler.__new__(Scheduler)
     empty_request_lists(scheduler)
-    scheduler.chunked_req = chunked_req
+    move([MagicMock(owner_list=None)], scheduler.chunked_reqs)
     scheduler.prefill_delayer = None
     scheduler.scheduler_stage_metrics = None
     scheduler.entries_at_admission = []
@@ -398,23 +400,23 @@ def _admission_scheduler(chunked_req):
 
 
 def test_kept_rows_stay_while_a_request_is_mid_prefill_and_go_after(kept_rows):
-    scheduler = _admission_scheduler(chunked_req=object())
+    scheduler = _admission_scheduler()
     scheduler.get_new_batch_prefill(running_batch=None)
 
     # An abort or the last chunk leaves no chunked request for the next step.
-    scheduler.chunked_req = None
+    move([scheduler.chunked_req], scheduler.prefill_launched_reqs)
     scheduler.get_new_batch_prefill(running_batch=None)
 
     assert scheduler.entries_at_admission == [1, 0]
 
 
 def test_last_chunk_still_reads_its_kept_rows(kept_rows):
-    scheduler = _admission_scheduler(chunked_req=object())
+    scheduler = _admission_scheduler()
 
     def last_chunk(prefill_delayer_single_pass, running_batch):
         # add_chunked_req returns None for a request's last chunk, whose
         # forward in this step still reads the kept rows.
-        scheduler.chunked_req = None
+        move([scheduler.chunked_req], scheduler.prefill_launched_reqs)
         return None, running_batch
 
     scheduler._get_new_batch_prefill_raw = last_chunk
@@ -424,14 +426,14 @@ def test_last_chunk_still_reads_its_kept_rows(kept_rows):
 
 
 def test_bootstrap_failure_releases_kept_rows_before_admission(kept_rows):
-    scheduler = _admission_scheduler(chunked_req=object())
+    scheduler = _admission_scheduler()
     scheduler.process_pending_chunked_abort = Mock()
     scheduler._process_hicache_events = Mock()
     scheduler.resolve_waiting_queue_bootstrap = Mock()
 
     def bootstrap_failed(last_batch, running_batch):
         # process_prefill_chunk drops a chunked request whose bootstrap failed.
-        scheduler.chunked_req = None
+        move([scheduler.chunked_req], scheduler.prefill_launched_reqs)
 
     scheduler.process_prefill_chunk = Mock(side_effect=bootstrap_failed)
     scheduler.dp_attn_adapter = Mock()
@@ -447,8 +449,7 @@ def test_bootstrap_failure_releases_kept_rows_before_admission(kept_rows):
 def _pause_scheduler(disaggregation_mode):
     scheduler = Scheduler.__new__(Scheduler)
     empty_request_lists(scheduler)
-    scheduler._engine_paused = False
-    scheduler._pause_started_at = None
+    scheduler.pause_state = PauseState()
     scheduler.enable_overlap = False
     scheduler.enable_overlap_mlx = False
     scheduler.last_batch = None
@@ -459,12 +460,15 @@ def _pause_scheduler(disaggregation_mode):
     scheduler.decode_offload_manager = None
     scheduler.tree_cache = MagicMock()
     scheduler.request_retirer = MagicMock()
-    scheduler._add_request_to_queue = MagicMock()
+    scheduler._add_request_to_queue = MagicMock(
+        side_effect=lambda req, **_: move([req], scheduler.waiting_queue)
+    )
     scheduler.metrics_reporter = MagicMock()
     scheduler.metrics_reporter.current_scheduler_metrics_enabled = False
     scheduler.kv_events_publisher = MagicMock()
-    scheduler.chunked_req = MagicMock()
-    scheduler.chunked_req.finished.return_value = False
+    chunked_req = MagicMock(owner_list=None)
+    chunked_req.finished.return_value = False
+    move([chunked_req], scheduler.chunked_reqs)
     return scheduler
 
 
@@ -520,12 +524,15 @@ def test_weights_only_memory_release_drops_kept_rows(kept_rows):
 @pytest.mark.parametrize("prefix_len, in_progress", [(4, True), (0, False)])
 def test_dllm_context_is_in_progress_once_part_is_prefilled(prefix_len, in_progress):
     manager = DllmManager(dllm_config=None, abort=Mock())
-    manager.waiting_queue.join(
+    move(
         [
             SimpleNamespace(
-                dllm_phase=DllmReqPhase.STAGING_PREFILL, prefix_len=prefix_len
+                dllm_phase=DllmReqPhase.STAGING_PREFILL,
+                prefix_len=prefix_len,
+                owner_list=None,
             )
-        ]
+        ],
+        manager.waiting_queue,
     )
 
     assert manager.any_context_in_progress() is in_progress
@@ -535,14 +542,12 @@ def test_dllm_abort_drops_only_the_aborted_rows(published_server_args, kept_rows
     # Other dLLM contexts stay part-way prefilled; only the aborted one's rows go.
     req = Req("dllm-video", "", [1], SamplingParams())
     survivor = Req("dllm-other", "", [1], SamplingParams())
-    scheduler = _queued_scheduler(req)
-    scheduler.waiting_queue.clear()
+    scheduler = _queued_scheduler(None)
     scheduler.dllm_config = object()
     scheduler.dllm_manager = DllmManager(
         dllm_config=None, abort=scheduler._abort_dllm_req
     )
-    scheduler.dllm_manager.waiting_queue.join([req, survivor])
-    scheduler.dllm_manager.staging_queue.extend([req, survivor])
+    move([req, survivor], scheduler.dllm_manager.waiting_queue)
     kept_rows.clear()
     kept_rows[(req.rid, "item")] = object()
     kept_rows[(survivor.rid, "item")] = object()
@@ -550,7 +555,6 @@ def test_dllm_abort_drops_only_the_aborted_rows(published_server_args, kept_rows
     scheduler.abort_request(AbortReq(rid=req.rid))
 
     assert list(scheduler.dllm_manager.waiting_queue) == [survivor]
-    assert scheduler.dllm_manager.staging_queue == [survivor]
     assert list(kept_rows) == [(survivor.rid, "item")]
 
 

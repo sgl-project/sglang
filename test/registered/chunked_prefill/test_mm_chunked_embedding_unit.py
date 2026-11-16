@@ -418,7 +418,7 @@ def test_multimodal_static_cache_reuses_precomputed_combined_hash(monkeypatch):
     input_ids = torch.zeros(TOTAL_LEN, dtype=torch.long)
     encoder = Mock(side_effect=AssertionError("cache hit should not call encoder"))
     chunk, _ = mm_schedule._get_chunked_embedding_full(
-        encoder, items, ITEM_OFFSETS, 0, TOTAL_LEN, input_ids, _CPU
+        encoder, items, ITEM_OFFSETS, 0, TOTAL_LEN, input_ids, _CPU, owner=None
     )
     assert torch.equal(chunk, expected)
     assert combine_spy.call_count == 1
