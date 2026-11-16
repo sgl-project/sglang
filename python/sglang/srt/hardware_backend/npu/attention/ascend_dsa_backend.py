@@ -31,6 +31,20 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
 
 
+@dataclass(frozen=True)
+class AscendDSACPReadMetadata:
+    """Vendor query view; full-request KPool metadata remains unchanged.
+
+    Like GPU local_query_inputs, this view only changes reads. Interleaved
+    queries are one-query segments for the Ascend request-level indexer ABI.
+    """
+
+    pool_query_ends: torch.Tensor
+    pool_key_lens: torch.Tensor
+    pool_tail_lens: torch.Tensor
+    pool_page_table: torch.Tensor
+
+
 @dataclass
 class AscendDSAForwardMetadata(ForwardMetadata):
     """Attention/read inputs and shared extend or speculative write plans."""
@@ -61,6 +75,7 @@ class AscendDSAForwardMetadata(ForwardMetadata):
     kpool_write_plan: Optional[KPoolWritePlan] = None
     # None outside PCP; padding is excluded from pooled-indexer queries.
     cp_query_num_tokens: Optional[int] = None
+    cp_read_metadata: Optional[AscendDSACPReadMetadata] = None
 
 
 @dataclass(frozen=True)
@@ -284,12 +299,14 @@ class AscendDSAAttnBackend(AscendAttnBackend):
         # Interleave queries have gaps: represent each as a one-query request
         # whose KV endpoint is its original position, including any prefix.
         ratio = self.dsa_index_kpool
-        metadata.pool_query_ends = torch.arange(
-            1, local_idx.numel() + 1, dtype=torch.int64, device=device
+        metadata.cp_read_metadata = AscendDSACPReadMetadata(
+            pool_query_ends=torch.arange(
+                1, local_idx.numel() + 1, dtype=torch.int64, device=device
+            ),
+            pool_key_lens=(causal_lens // ratio).to(torch.int64),
+            pool_tail_lens=(causal_lens % ratio).to(torch.int64),
+            pool_page_table=metadata.pool_page_table.index_select(0, batch_ids),
         )
-        metadata.pool_key_lens = (causal_lens // ratio).to(torch.int64)
-        metadata.pool_tail_lens = (causal_lens % ratio).to(torch.int64)
-        metadata.pool_page_table = metadata.pool_page_table.index_select(0, batch_ids)
 
         # Sparse attention consumes padded local Q rows, whereas compression
         # keeps the original request-level page table and global positions.
@@ -419,6 +436,7 @@ def _get_topk_npu(
     )
 
     metadata = metadata.attn_metadata
+    read_metadata = metadata.cp_read_metadata or metadata
     output_rows = query.shape[0]
     if metadata.cp_query_num_tokens is not None:
         # CP padding must never participate in index selection or tail packing.
@@ -442,10 +460,10 @@ def _get_topk_npu(
     ) = prepare_pool_key_indexer_inputs(
         query,
         weights,
-        metadata.pool_query_ends,
-        metadata.pool_key_lens,
-        metadata.pool_tail_lens,
-        metadata.pool_page_table,
+        read_metadata.pool_query_ends,
+        read_metadata.pool_key_lens,
+        read_metadata.pool_tail_lens,
+        read_metadata.pool_page_table,
     )
 
     pool = get_token_to_kv_pool()
@@ -470,7 +488,7 @@ def _get_topk_npu(
     result = pack_pool_key_indexer_indices(
         indices=indices[: query.shape[0]],
         positions=positions,
-        query_ends=metadata.pool_query_ends,
+        query_ends=read_metadata.pool_query_ends,
         topk=index_topk,
         pool_size=index_kpool,
     )
@@ -515,7 +533,7 @@ def _compress_write_npu(
     elif mode.is_extend_without_speculative():
         # Adjacent compression groups span CP ranks. All ranks materialize
         # the same ordered inputs and update replicated cache/tail state.
-        key, gate_score, positions = materialize_compression_inputs(
+        key, gate_score, _ = materialize_compression_inputs(
             key, gate_score, positions, forward_batch
         )
         _compress_write_extend_npu(
