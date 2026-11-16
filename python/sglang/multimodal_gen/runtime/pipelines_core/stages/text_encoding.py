@@ -623,6 +623,10 @@ class TextEncodingStage(ConditionEncodingStage):
                 server_args.pipeline_config, i
             ):
                 tok_kwargs["max_length"] = max_length
+            if truncation is not None:
+                tok_kwargs["truncation"] = truncation
+            if padding is not None:
+                tok_kwargs["padding"] = padding
 
             text_inputs: dict = server_args.pipeline_config.tokenize_prompt(
                 processed_text_list, tokenizer, tok_kwargs
