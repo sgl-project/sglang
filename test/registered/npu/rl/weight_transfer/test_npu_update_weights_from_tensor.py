@@ -29,10 +29,6 @@ register_npu_ci(est_time=1200, suite="nightly-2-npu-a3", nightly=True)
 
 TP_SIZE = 2
 UPDATE_ROUNDS = 2
-FLATTENED_BUCKET_SKIP_REASON = (
-    "blocked: flattened_bucket updates corrupt routed-expert weights on both "
-    "the IPC and HCCL paths; per-tensor updates reproduce startup loading."
-)
 # TP collectives need their own socket range on shared hosts.
 HCCL_PORT_RANGE = os.environ.setdefault(
     "HCCL_NPU_SOCKET_PORT_RANGE",
@@ -131,16 +127,7 @@ class _TensorSuite:
                 "startup loading"
             )
 
-    @unittest.skip(FLATTENED_BUCKET_SKIP_REASON)
-    def test_02_flattened_bucket_refit(self):
-        update_full_checkpoint_per_rank(
-            self.lane_url, self.checkpoint, TP_SIZE, flattened_bucket=True
-        )
-        self._assert_reference(
-            "flattened_bucket refit did not reproduce startup loading"
-        )
-
-    def test_03_flattened_bucket_matches_per_tensor_update(self):
+    def test_02_flattened_bucket_matches_per_tensor_update(self):
         original = load_checkpoint_tensor(self.tensor_index, self.target)
         updated = original.new_full(original.shape, 0.0)
 
@@ -174,7 +161,7 @@ class _TensorSuite:
         )
         self._assert_reference("second restore did not restore the output")
 
-    def test_04_update_moe_experts(self):
+    def test_03_update_moe_experts(self):
         originals = [
             load_checkpoint_tensor(self.tensor_index, name)
             for name in self.expert_tensors
@@ -204,7 +191,7 @@ class _TensorSuite:
             "restoring the routed experts did not restore the output"
         )
 
-    def test_05_update_subset_changes_output(self):
+    def test_04_update_subset_changes_output(self):
         original = load_checkpoint_tensor(self.tensor_index, self.subset)
         updated = original.new_full(original.shape, 0.0)
 

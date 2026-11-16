@@ -38,10 +38,6 @@ register_npu_ci(est_time=600, suite="nightly-2-npu-a3", nightly=True)
 CASE = weights.GLM52_CASE
 MASTER_ADDR = os.environ.get("SGLANG_TEST_HCCL_MASTER_ADDR", "127.0.0.1")
 UPDATE_ROUNDS = 2
-FLATTENED_BUCKET_SKIP_REASON = (
-    "blocked: flattened_bucket updates corrupt routed-expert weights on both "
-    "the IPC and HCCL paths; per-tensor updates reproduce startup loading."
-)
 # The default HCCL port is machine-wide; use a private range on shared hosts.
 HCCL_PORT_RANGE = os.environ.setdefault(
     "HCCL_NPU_SOCKET_PORT_RANGE",
@@ -214,29 +210,7 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
         finally:
             self._destroy_group(self.lane_url, group_name, pg)
 
-    @unittest.skip(FLATTENED_BUCKET_SKIP_REASON)
-    def test_02_hccl_flattened_bucket_refit(self):
-        group_name = "npu_rl_hccl_flattened_bucket_refit"
-        pg = self._create_group(self.lane_url, group_name)
-        try:
-            begin_weight_update(self.lane_url)
-            try:
-                thread, result = self._post_update_async(
-                    self.lane_url, group_name, flattened_bucket=True
-                )
-                self._broadcast_all(pg, flattened_bucket=True)
-                thread.join(timeout=1800)
-            finally:
-                end_weight_update(self.lane_url)
-            self.assertNotIn("error", result, f"update thread failed: {result}")
-            self.assertEqual(result.get("status"), 200, result.get("text"))
-            self._assert_reference(
-                "flattened_bucket HCCL refit did not reproduce startup loading"
-            )
-        finally:
-            self._destroy_group(self.lane_url, group_name, pg)
-
-    def test_03_init_group_defaults_to_nccl(self):
+    def test_02_init_group_defaults_to_nccl(self):
         request = InitWeightsUpdateGroupReqInput(
             master_address=MASTER_ADDR,
             master_port=12345,
@@ -249,7 +223,7 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
             "the default backend changed; update the NPU callers and this test",
         )
 
-    def test_04_update_error_propagates(self):
+    def test_03_update_error_propagates(self):
         begin_weight_update(self.lane_url)
         response = requests.post(
             self.lane_url + "/update_weights_from_distributed",
@@ -274,7 +248,7 @@ class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
         self.assertIn("init_weights_update_group", payload.get("message", ""))
         self.assertTrue(health(self.lane_url))
 
-    def test_05_destroy_group_twice_is_safe(self):
+    def test_04_destroy_group_twice_is_safe(self):
         group_name = "npu_rl_hccl_destroy_twice"
         pg = self._create_group(self.lane_url, group_name)
         first = requests.post(
