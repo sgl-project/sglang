@@ -171,10 +171,8 @@ class WeightCacheDaemon:
         self.moe_a2a_backend = cfg.moe_a2a_backend
         self.deepep_mode = cfg.deepep_mode
         self.load_format = cfg.load_format
-        self.dtype = cfg.dtype
         self.quantization = cfg.quantization
         self.model_loader_extra_config = cfg.model_loader_extra_config
-        self.trust_remote_code = cfg.trust_remote_code
         self.revision = cfg.revision
         self.dist_init_method = dist_init_method
 
@@ -298,13 +296,8 @@ class WeightCacheDaemon:
         # Initialize distributed backend for model loading
         # (must be done after server_args and model_config are available)
         # Build model config first, then init distributed
-        model_config = ModelConfig(
-            model_path=self.model_path,
-            trust_remote_code=self.trust_remote_code,
-            revision=self.revision,
-            dtype=self.dtype,
-            quantization=self.quantization,
-        )
+        # Use the same context length and model overrides as the target runner.
+        model_config = ModelConfig.from_server_args(server_args)
 
         # Build cache config fingerprint before loading the model.
         # Loading may mutate hf_config.quantization_config (e.g. via

@@ -282,6 +282,31 @@ class TestGlobalRankAndPaths(CustomTestCase):
 
 
 class TestDaemonLaunchConfiguration(CustomTestCase):
+    def test_daemon_uses_the_target_model_config(self):
+        from unittest import mock
+
+        from sglang.srt.configs.model_config import ModelConfig
+        from sglang.srt.server_args import ServerArgs
+        from sglang.srt.weight_cache import daemon
+
+        args = ServerArgs(model_path="dummy", context_length=4096)
+        with (
+            mock.patch.object(daemon, "current_platform"),
+            mock.patch.object(daemon, "publish"),
+            mock.patch.object(daemon.torch, "set_num_threads"),
+            mock.patch("sglang.srt.layers.moe.initialize_moe_config"),
+            mock.patch.object(
+                ModelConfig,
+                "from_server_args",
+                side_effect=RuntimeError("config probe"),
+            ) as build_config,
+        ):
+            owner = daemon.WeightCacheDaemon(args, gpu_id=0, tp_rank=0, pp_rank=0)
+            with self.assertRaisesRegex(RuntimeError, "config probe"):
+                owner.load()
+
+        build_config.assert_called_once_with(args)
+
     def test_spawn_forwards_complete_server_args_without_projection(self):
         from sglang.srt.weight_cache import daemon
 
