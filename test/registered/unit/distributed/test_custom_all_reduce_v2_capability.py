@@ -384,10 +384,6 @@ def test_skip_p2p_check_accepts_true(monkeypatch):
     assert custom_all_reduce_utils.can_p2p(rank=0, world_size=2)
 
 
-if __name__ == "__main__":
-    raise SystemExit(pytest.main([__file__, "-v"]))
-
-
 def test_quick_all_reduce_names_invalid_quantization_level(monkeypatch, caplog):
     """An unknown ROCM_QUICK_REDUCE_QUANTIZATION value leaves quick all-reduce
     disabled and the warning names the rejected value."""
@@ -400,3 +396,7 @@ def test_quick_all_reduce_names_invalid_quantization_level(monkeypatch, caplog):
 
     assert quick.disabled
     assert "Invalid quantization level: int4" in caplog.text
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
