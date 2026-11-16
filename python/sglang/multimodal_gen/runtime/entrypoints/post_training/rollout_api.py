@@ -341,7 +341,7 @@ async def rollout_generate(request: RolloutRequest):
     if output_batch.error:
         raise HTTPException(status_code=500, detail=output_batch.error)
     rollout_responses = _build_response(
-        request_id, request.prompt, request.seed, request.rollout, output_batch
+        request_id, request.prompt, sampling_params.seed, request.rollout, output_batch
     )
     payload = [r.model_dump() for r in rollout_responses]
     return Response(

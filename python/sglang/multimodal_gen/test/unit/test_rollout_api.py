@@ -364,6 +364,52 @@ class TestBuildResponse(unittest.TestCase):
         self.assertIsNotNone(resps[0].generated_output)
 
 
+class TestRolloutGenerateEndpoint(unittest.TestCase):
+    def test_request_without_seed_reports_the_seed_that_was_used(self):
+        """`seed` is optional on the request; a seedless rollout must return the
+        generated sample with the default seed it ran with, not fail after generation."""
+        import asyncio
+        from unittest.mock import patch
+
+        import msgspec
+
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+        from sglang.multimodal_gen.runtime.entrypoints.post_training import (
+            rollout_api,
+        )
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
+            RolloutRequest,
+        )
+
+        async def forward(pipeline_request):
+            return OutputBatch(output=torch.zeros(1, 3, 1, 8, 8))
+
+        def build_sampling_params(request_id, **kwargs):
+            return SamplingParams(request_id=request_id, **kwargs)
+
+        with (
+            patch.object(rollout_api, "get_global_server_args", return_value=None),
+            patch.object(rollout_api, "build_sampling_params", build_sampling_params),
+            patch.object(rollout_api, "prepare_request", lambda **kwargs: None),
+            patch.object(
+                rollout_api,
+                "async_scheduler_client",
+                types.SimpleNamespace(forward=forward),
+            ),
+        ):
+            response = asyncio.run(
+                rollout_api.rollout_generate(
+                    RolloutRequest(prompt="x", num_inference_steps=4, rollout=False)
+                )
+            )
+
+        payload = msgspec.msgpack.decode(response.body)
+        self.assertEqual(len(payload), 1)
+        self.assertEqual(payload[0]["seed"], SamplingParams.seed)
+
+
 class TestBuildSamplingKwargs(unittest.TestCase):
     def _make_request(self, **overrides):
         from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
