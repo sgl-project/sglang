@@ -225,6 +225,7 @@ LINEAR_ATTN_KERNEL_BACKEND_CHOICES = [
     "ptx_kda",
     "helion",
     "intel_xpu",
+    "tlx",
 ]
 
 
