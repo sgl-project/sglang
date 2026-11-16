@@ -500,6 +500,7 @@ class Engine(EngineScoreMixin, EngineBase):
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
         session_id: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, Iterator[Dict]]:
@@ -542,6 +543,7 @@ class Engine(EngineScoreMixin, EngineBase):
             external_trace_header=external_trace_header,
             rid=rid,
             session_id=session_id,
+            parent_session_id=parent_session_id,
             session_params=session_params,
             priority=priority,
         )
@@ -615,6 +617,7 @@ class Engine(EngineScoreMixin, EngineBase):
         session_params: Optional[Dict] = None,
         priority: Optional[int] = None,
         session_id: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
         *,
         cache_salt: Optional[Union[List[str], str]] = None,
     ) -> Union[Dict, AsyncIterator[Dict]]:
@@ -657,6 +660,7 @@ class Engine(EngineScoreMixin, EngineBase):
             external_trace_header=external_trace_header,
             rid=rid,
             session_id=session_id,
+            parent_session_id=parent_session_id,
             session_params=session_params,
             priority=priority,
         )
@@ -2037,7 +2041,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if _is_cuda:
             assert_pkg_version(
                 "sglang-kernel",
-                "0.4.9",
+                "0.4.11",
                 "Please reinstall the latest version with `pip install sglang-kernel --force-reinstall`",
             )
 

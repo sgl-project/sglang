@@ -32,6 +32,7 @@ from sglang.srt.mem_cache.events import (
     enable_mm_routing_labels,
     mm_routing_spans,
 )
+from sglang.srt.mem_cache.evict_policy import StateCostStrategy
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -592,6 +593,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 ),
                 tlru_tail_budget=tlru_tail_budget,
                 tlru_float_config=tlru_float_config,
+                state_cost=(
+                    (eviction_strategy.d, eviction_strategy.e)
+                    if isinstance(eviction_strategy, StateCostStrategy)
+                    else None
+                ),
                 page_size=params.page_size,
                 is_write_back=False,
                 enable_hicache=False,
@@ -866,6 +872,17 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     def component_protected_size(self, component_type: ComponentType) -> int:
         return self._binding.component_protected_size(self._ids.core(component_type))
+
+    # ---- Cache-residency bindings (cache_residency.py; Rust TreeCore built with them) ----
+
+    def configure_cache_residency(self, *, host_evict_first: bool) -> None:
+        self._binding.configure_cache_residency(host_evict_first)
+
+    def cache_residency_stats(self) -> dict[str, int]:
+        return self._binding.cache_residency_stats()
+
+    def mark_host_evict_first(self, node_ids: Sequence[NodeId]) -> int:
+        return self._binding.mark_host_evict_first(list(node_ids))
 
     def full_evictable_size(self) -> int:
         return self._binding.full_evictable_size()

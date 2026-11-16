@@ -367,6 +367,9 @@ from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import (
 from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
     UocrSchedulerRuntime,
 )
+from sglang.srt.multimodal.token_space_mm_process.registry import (
+    register_token_space_models,
+)
 from sglang.srt.multimodal.transport.receive_budget import ReceiveFeatureBudget
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
@@ -992,6 +995,7 @@ class Scheduler(
         ):
             try:
                 import_processors("sglang.srt.multimodal.processors")
+                register_token_space_models()
                 self._mm_processor = get_mm_processor(
                     self.model_config.hf_config,
                     server_args,
@@ -1499,6 +1503,19 @@ class Scheduler(
 
         self._prefill_decode_interval_remaining -= 1
         return True
+
+    def _negotiate_prefill_delayer_while_deferring(self) -> None:
+        # A DP peer below prefill_decode_interval_min_bs does not defer and runs
+        # the delayer's all-gather; join it with nothing to prefill.
+        if (
+            not self.require_mlp_sync
+            or self.prefill_decode_interval_min_bs == 0
+            or self.prefill_delayer is None
+        ):
+            return
+        PrefillDelayerSinglePassExecutor(
+            self.prefill_delayer, token_usage=0.0
+        ).finalize(actual_prefill_bs=0)
 
     def _arm_prefill_decode_interval(self, batch: Optional[ScheduleBatch]) -> None:
         if self.prefill_decode_interval == 0 or batch is None:
@@ -3338,6 +3355,7 @@ class Scheduler(
                 stream=recv_req.stream,
                 lora_id=recv_req.lora_id,
                 session_id=recv_req.session_id,
+                parent_session_id=recv_req.parent_session_id,
                 input_embeds=recv_req.input_embeds,
                 positional_embed_overrides=recv_req.positional_embed_overrides,
                 token_type_ids=recv_req.token_type_ids,
@@ -4337,6 +4355,7 @@ class Scheduler(
             new_batch = self.get_new_batch_dllm(running_batch, staged)
         elif self._should_defer_prefill(running_batch):
             new_batch = None
+            self._negotiate_prefill_delayer_while_deferring()
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run

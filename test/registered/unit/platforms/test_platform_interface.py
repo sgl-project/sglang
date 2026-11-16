@@ -192,6 +192,9 @@ class TestSRTPlatform(CustomTestCase):
             )
         )
 
+    def test_base_kv_cache_dtype_capability_default_is_conservative(self):
+        self.assertFalse(SRTPlatform().supports_kv_cache_dtype("example_platform_kv"))
+
     def test_mamba_cache_extra_buffer_capability(self):
         self.assertFalse(SRTPlatform().support_mamba_cache_extra_buffer())
 
