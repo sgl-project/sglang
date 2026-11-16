@@ -22,12 +22,12 @@ HIDDEN = 8
 
 
 class TestKimiK3MegaMoeGlobalTokens(CustomTestCase):
-    def _run(self, num_tokens, global_num_tokens, capture=False):
+    def _run(self, num_tokens, global_num_tokens, capture=False, ep_size=EP_SIZE):
         calls = []
         fake_deep_gemm = ModuleType("deep_gemm")
         fake_deep_gemm.fp8_fp4_mega_moe = lambda y, *a, **kw: calls.append(kw)
         buf = SimpleNamespace(
-            group=SimpleNamespace(size=lambda: EP_SIZE),
+            group=SimpleNamespace(size=lambda: ep_size),
             num_max_tokens_per_rank=8192,
             x=None,
             x_sf=None,
@@ -74,6 +74,18 @@ class TestKimiK3MegaMoeGlobalTokens(CustomTestCase):
         counts = [8192, 0, 64, 2048]
         for rank_rows in counts:
             self.assertEqual(self._run(rank_rows, counts), sum(counts))
+
+    def test_attention_tp_slices_share_the_ep_wide_count(self):
+        # DP4 x attention TP2 on EP8: the counts are padded to attention-TP
+        # multiples and each rank runs half of its DP group's rows.
+        counts = [8192, 0, 64, 2048]
+        for dp_rows in counts:
+            self.assertEqual(
+                self._run(dp_rows // 2, counts, ep_size=2 * len(counts)), sum(counts)
+            )
+
+    def test_no_hint_when_ep_is_not_a_multiple_of_dp(self):
+        self.assertIsNone(self._run(16, [16] * 3))
 
     def test_no_hint_without_dp_counts_or_during_capture(self):
         self.assertIsNone(self._run(16, None))

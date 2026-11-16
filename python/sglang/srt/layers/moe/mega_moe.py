@@ -682,7 +682,10 @@ def run_mega_routed_experts(
 
 def _mega_moe_global_tokens_hint(buf) -> Optional[int]:
     counts = get_dp_global_num_tokens()
-    if not counts or len(counts) != buf.group.size():
+    # With attention TP inside each DP group, EP a2a MoE runs on each rank's
+    # attention-TP slice of its group's rows, and the counts are padded to
+    # attention-TP multiples, so their sum is still the EP-wide row count.
+    if not counts or buf.group.size() % len(counts) != 0:
         return None
     if get_is_capture_mode() or is_dsa_enable_prefill_cp():
         return None
