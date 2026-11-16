@@ -1101,6 +1101,10 @@ async def get_request(
     slowdown_factor: float = 1.0,
 ) -> AsyncGenerator[DatasetRow, None]:
     if use_trace_timestamps:
+        if any(request.timestamp is None for request in input_requests):
+            raise ValueError(
+                "--use-trace-timestamps requires every request to have a timestamp"
+            )
         print(
             f"Using trace timestamps for request generation with slowdown factor {slowdown_factor}."
         )
@@ -1573,7 +1577,12 @@ async def benchmark(
         )
         pbar_total *= args.mooncake_num_rounds
     else:
-        request_generator = get_request(input_requests, request_rate)
+        request_generator = get_request(
+            input_requests,
+            request_rate,
+            use_trace_timestamps=use_trace_timestamps,
+            slowdown_factor=mooncake_slowdown_factor,
+        )
 
     # Prepare LoRA request distribution parameters
     if lora_request_distribution == "distinct":
