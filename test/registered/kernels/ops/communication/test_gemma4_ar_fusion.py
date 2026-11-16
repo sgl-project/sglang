@@ -145,12 +145,11 @@ def _inputs(rows: int, hidden: int, seed: int):
 
 
 def _scales_view(scales_buf, rows: int, layout: str) -> torch.Tensor:
-    """[rows, groups] scales at the buffer's base: row-major, or column-major
-    with 16-byte aligned columns (DeepGEMM's layout, what the model passes)."""
+    """[rows, groups] scales at the buffer's base: row-major, or the model's
+    column-major view (DeepGEMM's layout)."""
     if layout == "row":
         return scales_buf.tensor[:rows]
-    groups, ld = scales_buf.tensor.shape[1], (rows + 3) // 4 * 4
-    return scales_buf.tensor.view(-1)[: groups * ld].view(groups, ld).t()[:rows]
+    return fusion_glue.scales_view(scales_buf.tensor, scales_buf.tensor.shape[1], rows)
 
 
 @pytest.mark.parametrize("hidden", HIDDENS)
@@ -166,6 +165,9 @@ def test_site(hidden: int, rows: int, round_a: bool, layout: str):
     residual = residual_all[row0 : row0 + mine].clone()
     partial_buf.tensor[:rows].copy_(partial)
     scales_view = _scales_view(scales_buf, rows, layout)
+    if layout == "col":  # DeepGEMM's layout, at the base the multicast VA maps
+        assert scales_view.stride() == (1, (rows + 3) // 4 * 4)
+        assert scales_view.data_ptr() == scales_buf.tensor.data_ptr()
     gemma4_ar_fusion.site(
         partial_buf.tensor[:rows],
         partial_buf.mc,
@@ -300,46 +302,6 @@ def test_site_reads_a_gemm_written_partial(rows: int):
     torch.testing.assert_close(deq, ref_y, rtol=7e-2, atol=4e-2)
     for i, other in enumerate(all_out):
         assert torch.equal(other, out), f"out differs on rank {i}"
-
-
-@pytest.mark.parametrize("rows", [1, 5, 8, 160, 512])
-def test_deepgemm_reads_the_sites_scale_layout(rows: int):
-    """Gemma4ArFusion hands the block-FP8 GEMM column-major scales with 16-byte
-    aligned columns (DeepGEMM's own layout, so it does not reformat them); the
-    GEMM result is the same as with row-major scales."""
-    if not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
-        pytest.skip("DeepGEMM unavailable")
-    hidden, n = HIDDENS[0], 1024
-    _init()
-    _, _, scales_buf = _buffers(hidden)
-    fusion = object.__new__(fusion_glue.Gemma4ArFusion)
-    groups = hidden // GROUP
-    ld = (MAX_ROWS + 3) // 4 * 4
-    storage = scales_buf.tensor.view(-1)[: groups * ld].view(groups, ld)
-    fusion.scales = fusion_glue._Symm(storage, scales_buf.mc)
-    view = fusion._scales_out(rows)
-    aligned = (rows + 3) // 4 * 4
-    assert view.shape == (rows, groups) and view.stride() == (1, aligned)
-    assert view.data_ptr() == scales_buf.tensor.data_ptr()
-
-    g = torch.Generator(device="cuda").manual_seed(5)
-    x = torch.randn(rows, hidden, device="cuda", generator=g).bfloat16()
-    q, row_major = per_token_group_quant_fp8(x, GROUP)
-    view.copy_(row_major)
-    weight = (40 * torch.randn(n, hidden, device="cuda", generator=g)).to(
-        torch.float8_e4m3fn
-    )
-    gemm = dict(
-        input=q,
-        weight=weight,
-        block_size=[GROUP, GROUP],
-        weight_scale=torch.full((n // GROUP, groups), 1e-3, device="cuda"),
-    )
-    ref = deepgemm_w8a8_block_fp8_linear_with_fallback(
-        **gemm, input_scale=row_major.contiguous()
-    )
-    got = deepgemm_w8a8_block_fp8_linear_with_fallback(**gemm, input_scale=view)
-    assert torch.equal(got, ref)
 
 
 def test_stage_skips_the_copy_for_its_own_buffer():

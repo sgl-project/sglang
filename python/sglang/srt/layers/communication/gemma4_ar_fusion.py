@@ -33,6 +33,14 @@ def _tma_aligned_rows(num_tokens: int) -> int:
     return (num_tokens + 3) // 4 * 4
 
 
+def scales_view(storage: torch.Tensor, groups: int, num_tokens: int) -> torch.Tensor:
+    """[num_tokens, groups] column-major view of the fp32 scale storage, columns
+    padded to 16 bytes, starting at its base (the address its multicast VA maps):
+    the layout DeepGEMM reads without reformatting it."""
+    ld = _tma_aligned_rows(num_tokens)
+    return storage.view(-1)[: groups * ld].view(groups, ld).t()[:num_tokens]
+
+
 def requested() -> bool:
     return bool(envs.SGLANG_GEMMA4_AR_FUSION.get())
 
@@ -186,14 +194,6 @@ class Gemma4ArFusion:
             staged.copy_(partial)
         return staged
 
-    def _scales_out(self, num_tokens: int) -> torch.Tensor:
-        """[num_tokens, H / 128] column-major view, rows padded to 16 bytes,
-        starting at the buffer's base (the address its multicast VA maps)."""
-        groups, ld = self.scales.tensor.shape[0], _tma_aligned_rows(num_tokens)
-        return (
-            self.scales.tensor.view(-1)[: groups * ld].view(groups, ld).t()[:num_tokens]
-        )
-
     def site(
         self,
         partial: torch.Tensor,
@@ -212,7 +212,7 @@ class Gemma4ArFusion:
         """
         T = partial.shape[0]
         row0, rows = self.rows(T)
-        scales = self._scales_out(T)
+        scales = scales_view(self.scales.tensor, self.scales.tensor.shape[0], T)
         self._mod.site(
             self._stage(partial),
             self.partial.mc,
