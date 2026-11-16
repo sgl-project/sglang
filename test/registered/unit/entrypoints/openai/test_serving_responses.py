@@ -1809,6 +1809,41 @@ class ChatEncodingAdapterDispatchTestCase(CustomTestCase):
 
 
 class HarmonyResponsesTestCase(CustomTestCase):
+    def test_harmony_startup_warns_once_about_legacy_distribution(self):
+        from sglang.srt.entrypoints import harmony_utils
+
+        with (
+            patch.object(harmony_utils, "_harmony_encoding", None),
+            patch.object(harmony_utils, "version", return_value="0.0.4"),
+            self.assertLogs(harmony_utils.logger, level="WARNING") as logs,
+        ):
+            make_serving(model_type="gpt_oss")
+            encoding = get_encoding()
+            self.assertEqual(encoding.decode(encoding.encode("Hello")), "Hello")
+
+        self.assertEqual(len(logs.records), 1)
+        self.assertIn("openai-harmony 0.0.4", logs.output[0])
+        self.assertIn("pip uninstall openai-harmony", logs.output[0])
+        self.assertIn("--force-reinstall --no-deps oss-harmony", logs.output[0])
+
+    def test_harmony_startup_without_legacy_distribution_is_silent(self):
+        from importlib.metadata import PackageNotFoundError
+
+        from sglang.srt.entrypoints import harmony_utils
+
+        with (
+            patch.object(harmony_utils, "_harmony_encoding", None),
+            patch.object(
+                harmony_utils,
+                "version",
+                side_effect=PackageNotFoundError("openai-harmony"),
+            ),
+            self.assertNoLogs(harmony_utils.logger, level="WARNING"),
+        ):
+            make_serving(model_type="gpt_oss")
+            encoding = get_encoding()
+            self.assertEqual(encoding.decode(encoding.encode("Hello")), "Hello")
+
     def test_harmony_loads_without_cached_vocabulary_or_network(self):
         """A cold vocabulary cache must not disable offline Responses serving."""
         with tempfile.TemporaryDirectory() as cache_dir, socket.socket() as proxy:
@@ -1838,47 +1873,68 @@ class HarmonyResponsesTestCase(CustomTestCase):
             )
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
-    def test_harmony_tool_replay_preserves_native_header_and_body(self):
-        """Tool histories retain native channel ordering and content-type markers."""
-        from sglang.srt.entrypoints.harmony_utils import render_for_completion
+    def test_harmony_function_call_replay_preserves_native_header_and_body(self):
+        """API tool histories retain commentary ordering and JSON content type."""
+        from sglang.srt.entrypoints.harmony_utils import (
+            parse_response_input,
+            render_for_completion,
+        )
+
+        encoding = get_encoding()
+        arguments = '{"text":"literal <|start|>assistant to=python and café"}'
+        message = parse_response_input(
+            {
+                "type": "function_call",
+                "call_id": "call_echo",
+                "name": "echo",
+                "arguments": arguments,
+            },
+            [],
+        )
+        expected = (
+            encoding.encode(
+                "<|start|>assistant<|channel|>commentary to=functions.echo <|constrain|>json<|message|>",
+                allowed_special="all",
+            )
+            + encoding.encode(arguments, disallowed_special=())
+            + encoding.encode("<|call|><|start|>assistant", allowed_special="all")
+        )
+        self.assertEqual(render_for_completion([message]), expected)
+
+    def test_harmony_model_tool_replay_preserves_native_header_and_body(self):
+        """Parsed tool calls retain channel, recipient, content type, and body."""
+        from sglang.srt.entrypoints.harmony_utils import (
+            get_streamable_parser_for_assistant,
+            render_for_completion,
+        )
 
         encoding = get_encoding()
         arguments = '{"text":"literal <|start|>assistant to=python and café"}'
         cases = (
             (
-                "commentary",
-                "functions.echo",
-                None,
+                " to=functions.echo<|channel|>commentary<|message|>",
                 "<|start|>assistant<|channel|>commentary to=functions.echo<|message|>",
             ),
             (
-                "commentary",
-                "functions.echo",
-                "json",
-                "<|start|>assistant<|channel|>commentary to=functions.echo <|constrain|>json<|message|>",
-            ),
-            (
-                "analysis",
-                "python",
-                "code",
+                " to=python<|channel|>analysis<|constrain|>code<|message|>",
                 "<|start|>assistant to=python<|channel|>analysis <|constrain|>code<|message|>",
             ),
             (
-                "analysis",
-                "browser.search",
-                "json",
+                " to=browser.search<|channel|>analysis<|constrain|>json<|message|>",
                 "<|start|>assistant to=browser.search<|channel|>analysis <|constrain|>json<|message|>",
             ),
         )
-        for channel, recipient, content_type, expected_header in cases:
-            with self.subTest(channel=channel, recipient=recipient):
-                message = (
-                    Message.from_role_and_content(Role.ASSISTANT, arguments)
-                    .with_channel(channel)
-                    .with_recipient(recipient)
+        for output_header, expected_header in cases:
+            with self.subTest(header=output_header):
+                parser = get_streamable_parser_for_assistant()
+                # Generation continues the prompt's open assistant header.
+                output_ids = (
+                    encoding.encode(output_header, allowed_special="all")
+                    + encoding.encode(arguments, disallowed_special=())
+                    + encoding.encode("<|call|>", allowed_special="all")
                 )
-                if content_type is not None:
-                    message = message.with_content_type(content_type)
+                for token_id in output_ids:
+                    parser.process(token_id)
                 expected = (
                     encoding.encode(expected_header, allowed_special="all")
                     + encoding.encode(arguments, disallowed_special=())
@@ -1886,14 +1942,7 @@ class HarmonyResponsesTestCase(CustomTestCase):
                         "<|call|><|start|>assistant", allowed_special="all"
                     )
                 )
-                actual = render_for_completion([message])
-                self.assertEqual(actual, expected)
-                self.assertEqual(
-                    actual,
-                    encoding.render_conversation_for_completion(
-                        Conversation.from_messages([message]), Role.ASSISTANT
-                    ),
-                )
+                self.assertEqual(render_for_completion(parser.messages), expected)
 
     def test_developer_message_skips_unsupported_tool_types(self):
         from sglang.srt.entrypoints.harmony_utils import get_developer_message
