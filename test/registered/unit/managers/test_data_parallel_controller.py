@@ -785,7 +785,6 @@ def _receive_round(*, pulled_by_rank: list, local_control: bool) -> list:
         recv_skipper=None,
         input_blocker=None,
         mm_receiver=None,
-        server_args=SimpleNamespace(),
         model_config=SimpleNamespace(is_multimodal=False),
         max_recv_per_poll=-1,
         request_retirer=None,

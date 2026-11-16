@@ -2702,7 +2702,6 @@ class Scheduler(
             recv_skipper=self.recv_skipper,
             input_blocker=self.input_blocker,
             mm_receiver=self.mm_receiver,
-            server_args=self.server_args,
             model_config=self.model_config,
             max_recv_per_poll=self.max_recv_per_poll,
             request_retirer=self.request_retirer,
@@ -2856,7 +2855,6 @@ class Scheduler(
             global_tokens = from_cp_sharded(global_tokens)
         self.load_inquirer = SchedulerLoadInquirer(
             disaggregation_mode=self.disaggregation_mode,
-            server_args=self.server_args,
             # The worker reports logical DCP capacity; add KV shard widening.
             max_total_num_tokens=global_tokens,
             max_running_requests=self.max_running_requests,
