@@ -10,8 +10,11 @@ from sglang.kernels.ops.mamba.mamba_state_indices_triton import (
     fused_replay_state_indices,
 )
 from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
+    _state_multi_eligible,
     fused_conv_window_scatter_with_mask,
     fused_mamba_state_scatter_with_mask,
+    fused_state_scatter_multi,
+    int32_scatter_rows,
     scatter_mamba_states_after_mtp_verify,
     track_mamba_states_all_layers,
     track_mamba_states_if_needed,
@@ -61,6 +64,8 @@ logger = logging.getLogger(__name__)
 _validate_mamba_replay_state_indices = (
     envs.SGLANG_VALIDATE_MAMBA_REPLAY_STATE_INDICES.get()
 )
+# the verify commit's PLE side states in one launch
+_COMMIT_MULTI_SCATTER = envs.SGLANG_OPT_SPEC_COMMIT_MULTI_SCATTER.get()
 
 
 class MambaAttnBackendBase(AttentionBackend):
@@ -255,9 +260,11 @@ class MambaAttnBackendBase(AttentionBackend):
                 forward_batch.req_pool_indices[:bs]
             ).to(dtype=torch.int32)
         if forward_batch.mamba_track_indices is not None:
+            # Kept int64 when translated: every layer's track writes index the pool
+            # with these, and indexing with an int32 tensor casts it to int64 each time.
             forward_batch.mamba_track_indices = self._translate_mamba_indices(
                 forward_batch.mamba_track_indices
-            )
+            ).to(torch.int64)
         # Resolve the tracked-row selection once per forward
         cpu_track_metadata = self._has_cpu_prefill_track_metadata(forward_batch)
         if cpu_track_metadata:
@@ -506,7 +513,8 @@ class MambaAttnBackendBase(AttentionBackend):
             dtype=start_indices.dtype,
         )
 
-        return indices.clamp(0, query_start_loc[-1] - 1)
+        # A tensor bound: a 0-dim CUDA tensor passed as a Python scalar syncs the host.
+        return torch.minimum(indices.clamp(min=0), query_start_loc[-1] - 1)
 
     def _init_track_ssm_indices(
         self, mamba_cache_indices: torch.Tensor, forward_batch: ForwardBatch
@@ -1877,6 +1885,26 @@ def commit_ple_states_after_verify(
             )
         )
 
+    if _COMMIT_MULTI_SCATTER and state_pairs:
+        if src_indices_raw is None and _state_multi_eligible(state_pairs):
+            fused_state_scatter_multi(
+                state_pairs,
+                state_indices_tensor,
+                last_correct_step_indices,
+                mamba_track_indices,
+                mamba_steps_to_track,
+            )
+            return
+        # The per-pair launches below, on rows cast once.
+        state_indices_tensor, last_correct_step_indices, src_indices_raw = (
+            int32_scatter_rows(
+                state_indices_tensor, last_correct_step_indices, src_indices_raw
+            )
+        )
+        if mamba_track_indices is not None:
+            mamba_track_indices, mamba_steps_to_track, _ = int32_scatter_rows(
+                mamba_track_indices, mamba_steps_to_track, src_indices_raw
+            )
     scatter = HybridLinearAttnBackend._scatter_speculative_state_with_mask
     for state, intermediate_state in state_pairs:
         scatter(

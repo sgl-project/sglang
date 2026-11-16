@@ -2154,7 +2154,7 @@ def npu_hc_pre(
     hc_eps: float,
     forward_batch=None,
 ) -> tuple:
-    """NPU-accelerated hc_pre via sgl-kernel-npu's public mHC API.
+    """NPU-accelerated hc_pre via the fused pre+sinkhorn op.
 
     Returns (y, post, comb, norm_fused).  norm_fused is always False
     because npu_hc_pre does not fold input_layernorm — the caller must
@@ -2179,27 +2179,12 @@ def npu_hc_pre(
         )
         return y, post, comb, False
 
-    # Note the return order: (y, post, comb) — y is the (T, hidden)
-    # mixed activation, and post / comb are the hc_post inputs.
-    # Preserve the vendor output dtype in the kernel API. This caller casts y
-    # to the input dtype for downstream aclnnRmsNorm, which has no
-    # x=fp32 / gamma=bf16 overload.
-    from sgl_kernel_npu.operators.hyper_conn import mhc_pre_sinkhorn
+    from sgl_kernel_npu.operators.hyper_conn import mhc_pre_dpskv4
 
-    y, post, comb = mhc_pre_sinkhorn(
-        x,
-        hc_fn,
-        hc_scale,
-        hc_base,
-        hc_mult=hc_mult,
-        num_iters=hc_sinkhorn_iters,
-        norm_eps=rms_norm_eps,
-        hc_eps=hc_eps,
+    y, post, comb = mhc_pre_dpskv4(
+        x, hc_fn, hc_scale, hc_base, hc_mult, hc_sinkhorn_iters, hc_eps, rms_norm_eps
     )
-    # npu_hc_pre uses norm_eps for sinkhorn's internal RMS only; it does
-    # not fold input_layernorm. Return norm_fused=False so the caller
-    # applies the layernorm itself, matching the deepgemm/torch paths.
-    return y.to(dtype), post, comb, False
+    return y, post, comb, False
 
 
 @triton.jit

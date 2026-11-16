@@ -23,6 +23,12 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
     HybridLinearAttnBackend,
 )
 from sglang.srt.layers.attention.linear.gdn_backend import GDNAttnBackend
+from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
+    QSAMTPSharedSparseIndices,
+    QSAPoolView,
+    QSAStepView,
+    QwenSparseAttnBackend,
+)
 from sglang.srt.layers.attention.trtllm_mha_backend import TRTLLMHAAttnBackend
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.managers import overlap_utils
@@ -65,6 +71,31 @@ class KvPool:
         )
 
 
+class QsaPool(KvPool):
+    qsa_compress_ratio, qsa_compressed_page_size, qsa_token_topk = 4, 16, 8
+
+    def __init__(self):
+        super().__init__()
+        self.compressed = {i: torch.zeros(3, 1, 2) for i in (3, 7)}
+        self.key_state = {i: torch.zeros(8, 1, 2) for i in (3, 7)}
+        self.qsa_rope_position_buffer = torch.zeros(8, 3, dtype=torch.int64)
+
+    def get_qsa_compressed_k_buffer(self, layer_id):
+        return self.compressed[layer_id]
+
+    def get_qsa_key_state_buffer(self, layer_id):
+        return self.key_state[layer_id]
+
+
+def _qsa(pool):
+    return _backend(
+        QwenSparseAttnBackend,
+        forward_metadata=SimpleNamespace(),
+        token_to_kv_pool=pool,
+        _mtp_shared_sparse_indices=None,
+    )
+
+
 def _state_pool():
     state = SimpleNamespace(
         conv=[torch.zeros(2, 2)],
@@ -102,8 +133,8 @@ def _trtllm(pool):
     )
 
 
-def _hybrid():
-    pool = KvPool()
+def _hybrid(pool=None, full=_trtllm):
+    pool = KvPool() if pool is None else pool
     pool.layer_router.bind_part(
         sub_pool="mamba", part=STATE_PART, view=_state_pool(), indices={0: 1, 2: 0}
     )
@@ -119,7 +150,7 @@ def _hybrid():
     )
     return _backend(
         HybridLinearAttnBackend,
-        full_attn_backend=_trtllm(pool),
+        full_attn_backend=full(pool),
         linear_attn_backend=gdn,
         token_to_kv_pool=pool,
         req_to_token_pool=SimpleNamespace(),
@@ -156,7 +187,10 @@ def _megakernel(**entries):
             cuda_graph_runner=None,
             draft_runner=SimpleNamespace(
                 model=_model(**entries),
-                model_config=SimpleNamespace(hidden_size=4, dtype=torch.float32),
+                model_config=SimpleNamespace(
+                    hidden_size=4, spec_hidden_size=4, dtype=torch.float32
+                ),
+                spec_algorithm=SimpleNamespace(is_standalone=lambda: False),
             ),
         ),
     )
@@ -375,6 +409,29 @@ class TestEagleBinding(CustomTestCase):
             if owner in members:
                 self.assertIn(attr, members[owner], name)
 
+    def test_a_backend_with_its_own_views_supplies_the_step_and_pool_data(self):
+        pool = QsaPool()
+        backend = _hybrid(pool, full=_qsa)
+        qsa = backend.full_attn_backend
+        binding = eb.EagleBinding(model=torch.nn.Module())
+        view = _view(binding, backend)
+        self.assertIsInstance(view.attn, QSAStepView)
+        self.assertIs(view.attn.metadata, qsa.forward_metadata)
+        self.assertIsInstance(view.kv, QSAPoolView)
+        self.assertEqual(view.kv.layer_ids, (3, 7))
+        self.assertIs(view.kv.compressed_k[1], pool.compressed[7])
+        # a draft's decode steps get its draft extend's selection
+        shared = QSAMTPSharedSparseIndices(
+            layer_ids=(3, 7), num_requests=2, token_topk=8, tail_width=4, device="cpu"
+        )
+        qsa.set_mtp_shared_sparse_indices(shared)
+        self.assertIs(_view(binding, backend).attn.mtp_indices, shared.indices)
+        # the pool view is sealed at its first read, as KvPoolBuffers is
+        with patch.object(eb, "get_attn_backend", return_value=backend):
+            pool.compressed[7] = torch.zeros(3, 1, 2)
+            with self.assertRaisesRegex(RuntimeError, "kv was reallocated"):
+                binding.assert_live()
+
     def test_pool_views_keep_layer_offsets_and_fp8_scales(self):
         """Routed views use local indices; plain pools use model layer IDs.
         Neither choice may change which layer's FP8 scales accompany its KV."""
@@ -442,6 +499,18 @@ class TestEagleBinding(CustomTestCase):
             view = binding.prefill_view()
         self.assertIs(view.state.temporal, state.temporal)
         self.assertIs(view.state_indices, meta.mamba_cache_indices)
+        self.assertEqual((view.is_graph, view.prefill_graph_metadata), (False, None))
+        linear.prefill_graph_metadata = SimpleNamespace()  # a graph bucket's tables
+        with patch.object(eb, "get_attn_backend", return_value=backend):
+            view = binding.prefill_view()
+        self.assertIs(view.prefill_graph_metadata, linear.prefill_graph_metadata)
+        runner = SimpleNamespace(
+            attn_backend=backend,
+            req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros(9, 4)),
+        )
+        prepared = binding.preparation_view(runner)
+        self.assertEqual(prepared.num_request_rows, 9)
+        self.assertIs(prepared.mamba, _view(binding, backend).mamba)
 
     def test_existing_forward_wrapper_selects_the_prefill_data_view(self):
         views = SimpleNamespace(
@@ -512,7 +581,8 @@ class TestEagleBinding(CustomTestCase):
             for cls in vars(eb).values()
             if isinstance(cls, type) and issubclass(cls, msgspec.Struct)
         }
-        allowed = {torch.Tensor, int, float, bool, type(None)} | structs
+        allowed = {torch.Tensor, int, float, bool, type(None), msgspec.Struct}
+        allowed |= structs
         for cls in structs:
             for field, hint in typing.get_type_hints(cls).items():
                 for leaf in _leaves(hint):
@@ -520,6 +590,14 @@ class TestEagleBinding(CustomTestCase):
 
 
 class TestEagleEntries(CustomTestCase):
+    def test_a_draft_step_fold_is_offered_only_by_a_build_that_has_one(self):
+        fold = object()
+        model = _model(draft_step_fold=fold)
+        self.assertIs(runtime.megakernel_entry(model, "draft_step_fold"), fold)
+        self.assertIsNone(runtime.megakernel_entry(_model(), "draft_step_fold"))
+        # not a draft-loop entry: the stock dispatch stays
+        self.assertIsNone(_init(draft={"draft_step_fold": fold}))
+
     def test_always_present_dispatch_preserves_the_stock_path(self):
         stock_result = object()
         with patch.object(eagle_megakernel, "init_eagle_megakernel", return_value=None):
@@ -607,6 +685,8 @@ class TestEagleEntries(CustomTestCase):
                     prepare=None,
                     max_rows=4,
                     numerics=SimpleNamespace(kind=SimpleNamespace(value="exact")),
+                    binding="",
+                    prefill_graph=False,
                 )
                 hooks = []
                 refused = (
@@ -1013,6 +1093,57 @@ class TestSpecRelayBypass(CustomTestCase):
 
         future_map._stash.assert_called_once_with(indices, payload)
         self.assertIsNone(future_map._deferred_relay)
+
+
+class TestDraftOutputWidth(CustomTestCase):
+    def test_extend_outputs_follow_the_draft_hidden_stream(self):
+        for width, dtype, reuse in (
+            (4, torch.float32, True),
+            (16, torch.float32, False),
+        ):
+            with self.subTest(width=width, dtype=dtype):
+                supplied = {}
+
+                def extend(**buffers):
+                    supplied.update(buffers)
+                    return lambda bs: (lambda io: None) if bs == 1 else None
+
+                mk = _megakernel(draft_extend=extend)
+                mk._draft_config.spec_hidden_size = width
+                hidden = torch.zeros((2, 4), dtype=dtype)
+                mk._draft_worker.cuda_graph_runner = SimpleNamespace(
+                    buffers=SimpleNamespace(
+                        topk_index=torch.zeros((2, 1), dtype=torch.int64),
+                        topk_p=torch.ones((2, 1)),
+                        hidden_states=hidden,
+                    )
+                )
+                runner = SimpleNamespace(
+                    max_bs=1, device="cpu", captured_req_width=4, capture_bs=(1,)
+                )
+                with (
+                    patch.object(
+                        overlap_utils, "spec_relay_bypass_enabled", return_value=True
+                    ),
+                    patch.object(
+                        eagle_megakernel,
+                        "get_parallel",
+                        return_value=SimpleNamespace(moe_ep_size=1),
+                    ),
+                    patch.object(eagle_megakernel, "megakernel_agree"),
+                ):
+                    self.assertEqual(mk.bind_extend_graphs(runner), {1})
+                self.assertEqual(supplied["hidden"].shape, (1, width))
+                self.assertEqual(
+                    supplied["hidden"].data_ptr() == hidden.data_ptr(), reuse
+                )
+
+    def test_no_recurrent_hidden_stream_keeps_stock(self):
+        factory = MagicMock()
+        mk = _megakernel(draft_extend=factory)
+        mk._draft_runner.spec_algorithm = SimpleNamespace(is_standalone=lambda: True)
+        self.assertEqual(mk.bind_extend_graphs(SimpleNamespace()), frozenset())
+        factory.assert_not_called()
 
 
 if __name__ == "__main__":
