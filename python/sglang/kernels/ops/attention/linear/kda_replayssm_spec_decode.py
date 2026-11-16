@@ -203,61 +203,21 @@ def commit_kda_replayssm_spec(
     given) the same replay snapshots the interval-crossing state into the track
     slot in one pass, so no separate track scatter / force-flush is needed.
     """
-    num_slots, HV, V, K = checkpoint_state.shape
-    B = ssm_state_indices.shape[0]
-    BK = triton.next_power_of_2(K)
-    BV = min(triton.next_power_of_2(V), KDA_FOLD_BLOCK_V)
-    grid = (triton.cdiv(V, BV), B, HV)
-    has_track = mamba_track_indices is not None and mamba_steps_to_track is not None
-    if has_track:
-        track_idx_t = mamba_track_indices
-        steps_t = mamba_steps_to_track
-        stride_track = track_idx_t.stride(0)
-        stride_steps = steps_t.stride(0)
-    else:
-        track_idx_t = ssm_state_indices  # unused (HAS_TRACK False); pass a valid ptr
-        steps_t = accept_lens
-        stride_track = 0
-        stride_steps = 0
-    kda_replayssm_exact_fold_kernel[grid](
-        checkpoint_state,
-        rawv_cache,
-        rawk_cache,
-        gk_cache,
-        beta_cache,
-        ssm_state_indices,
-        accept_lens,
-        track_idx_t,
-        steps_t,
-        checkpoint_state.stride(0),
-        rawv_cache.stride(0),
-        rawk_cache.stride(0),
-        gk_cache.stride(0),
-        beta_cache.stride(0),
-        0,  # stride_*_layer unused: single-layer entry, i_layer == 0
-        0,
-        0,
-        0,
-        0,
-        ssm_state_indices.stride(0),
-        accept_lens.stride(0),
-        stride_track,
-        stride_steps,
-        H=num_k_heads,
-        HV=HV,
-        K=K,
-        V=V,
-        BK=BK,
-        BV=BV,
-        MAX_CACHE_LEN=max_cache_len,
-        USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
-        NULL_BLOCK_ID=null_block_id,
-        HAS_TRACK=has_track,
-        ring_indices=ssm_state_indices if ring_indices is None else ring_indices,
-        stride_ring=0 if ring_indices is None else ring_indices.stride(0),
-        SEPARATE_RING_INDEX=ring_indices is not None,
-        num_warps=1,
-        num_stages=3,
+    commit_kda_replayssm_spec_all_layers(
+        checkpoint_state=checkpoint_state.unsqueeze(0),
+        rawv_cache=rawv_cache.unsqueeze(0),
+        rawk_cache=rawk_cache.unsqueeze(0),
+        gk_cache=gk_cache.unsqueeze(0),
+        beta_cache=beta_cache.unsqueeze(0),
+        ssm_state_indices=ssm_state_indices,
+        accept_lens=accept_lens,
+        max_cache_len=max_cache_len,
+        num_k_heads=num_k_heads,
+        mamba_track_indices=mamba_track_indices,
+        mamba_steps_to_track=mamba_steps_to_track,
+        use_qk_l2norm_in_kernel=use_qk_l2norm_in_kernel,
+        null_block_id=null_block_id,
+        ring_indices=ring_indices,
     )
 
 
