@@ -322,6 +322,8 @@ class Envs:
     # Copy rank-local MoE slices into independent CPU storage before H2D when
     # they reference a larger mmap-backed checkpoint storage.
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
+    # Limit simultaneous CPU-to-device weight copies in the DeepSeek V4 loader.
+    SGLANG_DSV4_LOAD_MAX_WORKERS = EnvInt(None)
     SGLANG_LOAD_SNAPSHOT_USE_ZMQ = EnvBool(False)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
@@ -1384,6 +1386,12 @@ class Envs:
     # Enable per-token FP32 activation scaling for serialized ModelOpt FP4 with
     # FlashInfer TRT-LLM or CuTe DSL v2 MoE.
     SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION = EnvBool(False)
+
+    # Communication precision is independent of native MXFP4 expert weights.
+    SGLANG_FLASHINFER_RDMA_WIRE_DTYPE = EnvStr("nvfp4")
+    # Native MXFP4 checkpoints have no calibrated NVFP4 activation scale.
+    # Require an explicit, cross-rank-agreed transport scale for this bridge.
+    SGLANG_FLASHINFER_RDMA_NVFP4_GLOBAL_SCALE = EnvFloat(None)
     # Use BF16 activations with FlashInfer CuTe DSL NVFP4 dense and MoE weights,
     # including the flashinfer_megamoe runner (BF16 combine).
     SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16 = EnvBool(False)

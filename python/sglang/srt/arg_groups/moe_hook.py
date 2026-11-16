@@ -853,16 +853,18 @@ def handle_flashinfer_rdma(server_args: Any) -> None:
         "DeepseekV2ForCausalLM",
         "DeepseekV3ForCausalLM",
         "DeepseekV32ForCausalLM",
+        "DeepseekV4ForCausalLM",
+        "DeepseekV41ForCausalLM",
         "Glm4MoeForCausalLM",
         "GlmMoeDsaForCausalLM",
         "Glm5NextForConditionalGeneration",
     }
     if not architectures or architectures[0] not in supported:
         raise ValueError(
-            "flashinfer_rdma currently supports the GLM and DeepSeek V2/V3 MoE families."
+            "flashinfer_rdma currently supports the GLM and DeepSeek V2/V3/V4 MoE families."
         )
     if (
-        cfg.tp_size not in (4, 8)
+        cfg.tp_size < 2
         or cfg.attn_dp_size != cfg.tp_size
         or not attn_dp_enabled_of(cfg)
         or cfg.attn_cp_size != 1
@@ -872,7 +874,7 @@ def handle_flashinfer_rdma(server_args: Any) -> None:
         or cfg.dwdp_size != 1
     ):
         raise ValueError(
-            "flashinfer_rdma requires TP4/ADP4/EP4 or TP8/ADP8/EP8, "
+            "flashinfer_rdma requires TP=attention DP=EP with at least two ranks, "
             "with PP1, CP1, DCP1, MoE-DP1 and DWDP1."
         )
     for name in (
@@ -896,24 +898,39 @@ def handle_flashinfer_rdma(server_args: Any) -> None:
         )
     if cfg.elastic_ep_backend is not None:
         raise ValueError("flashinfer_rdma does not support elastic expert parallelism.")
-    if cfg.moe_runner_backend not in ("auto", "flashinfer_cutlass"):
+    if cfg.moe_runner_backend not in ("auto", "flashinfer_cutlass", "flashinfer_mxfp4"):
         raise ValueError(
-            "flashinfer_rdma requires --moe-runner-backend flashinfer_cutlass."
+            "flashinfer_rdma requires flashinfer_cutlass or flashinfer_mxfp4."
         )
+    draft_a2a_backend = (
+        "flashinfer_rdma"
+        if cfg.speculative_algorithm == "DSPARK"
+        and architectures[0] in ("DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM")
+        else "none"
+    )
     if cfg.speculative_algorithm and cfg.speculative_moe_a2a_backend not in (
         None,
-        "none",
+        draft_a2a_backend,
     ):
-        raise ValueError("flashinfer_rdma requires --speculative-moe-a2a-backend none.")
+        raise ValueError(
+            "flashinfer_rdma requires --speculative-moe-a2a-backend "
+            f"{draft_a2a_backend} for this speculative model."
+        )
     if cfg.flashinfer_rdma_max_tokens_per_rank <= 0:
         raise ValueError("--flashinfer-rdma-max-tokens-per-rank must be positive.")
     declare_resolution(
         server_args,
         "_handle_a2a_moe",
-        moe_runner_backend="flashinfer_cutlass",
+        moe_runner_backend=(
+            "flashinfer_cutlass"
+            if cfg.moe_runner_backend == "auto"
+            else cfg.moe_runner_backend
+        ),
         disable_overlap_schedule=True,
         speculative_moe_a2a_backend=(
-            "none" if cfg.speculative_algorithm else cfg.speculative_moe_a2a_backend
+            draft_a2a_backend
+            if cfg.speculative_algorithm
+            else cfg.speculative_moe_a2a_backend
         ),
         cuda_graph_config=with_phase(
             cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED

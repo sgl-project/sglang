@@ -17,6 +17,49 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestPlatformDispatch(unittest.TestCase):
+    def test_rdma_skips_independent_prefill_tail_graph(self):
+        from sglang.srt.environ import envs
+        from sglang.srt.layers.moe.utils import MoeA2ABackend
+        from sglang.srt.models import deepseek_v4_replay_tail as tail
+
+        model = SimpleNamespace(
+            tail_writes_source_kv=True, late_layer_start=1, end_layer=2
+        )
+        for backend in (MoeA2ABackend.FLASHINFER_RDMA, MoeA2ABackend.NONE):
+            with (
+                self.subTest(backend=backend),
+                patch.object(tail, "get_moe_a2a_backend", return_value=backend),
+                patch.object(tail, "is_cuda", return_value=True),
+                envs.SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS.override(128),
+                envs.SGLANG_ENABLE_GRAPH_POOL_BORROW.override(False),
+                patch.object(
+                    tail.DecoderReplayTail, "__init__", return_value=None
+                ) as init,
+            ):
+                runner = tail.DecoderReplayTail.maybe_create(model)
+            if backend.is_flashinfer_rdma():
+                self.assertIsNone(runner)
+                init.assert_not_called()
+            else:
+                self.assertIsInstance(runner, tail.DecoderReplayTail)
+                init.assert_called_once()
+
+    def test_native_mxfp4_offload_selects_only_expert_weights_and_scales(self):
+        from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
+            Mxfp4FlashinferCutlassMoEMethod,
+        )
+
+        experts = SimpleNamespace(
+            quant_method=object.__new__(Mxfp4FlashinferCutlassMoEMethod)
+        )
+        self.assertEqual(
+            deepseek_v4._native_mxfp4_offload_param_names(experts),
+            ["w13_weight", "w2_weight", "w13_weight_scale_inv", "w2_weight_scale_inv"],
+        )
+        experts.quant_method = object()
+        with self.assertRaisesRegex(ValueError, "native MXFP4"):
+            deepseek_v4._native_mxfp4_offload_param_names(experts)
+
     def test_cuda_main_loop_materializes_and_clears_output(self):
         from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 

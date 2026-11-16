@@ -485,6 +485,33 @@ def fused_experts_none_to_flashinfer_mxfp4(
     )
 
 
+@register_fused_func("flashinfer_rdma", "flashinfer_mxfp4")
+def fused_experts_rdma_to_flashinfer_mxfp4(
+    dispatch_output: FlashinferDispatchOutput,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> FlashinferCombineInput:
+    from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferCombineInput
+    from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
+
+    if not isinstance(quant_info, FlashInferCutlassMxfp4MoeQuantInfo):
+        raise TypeError(
+            "FlashInfer RDMA native MXFP4 requires the SM120 CUTLASS runner"
+        )
+    if dispatch_output.hidden_states.dtype != torch.bfloat16:
+        raise TypeError("Native MXFP4 RDMA bridge must provide dequantized BF16 rows")
+    # Decode rows retain global expert IDs and unit weights. Prefill retains
+    # original route weights. The existing EP finalize also zeros padding rows.
+    result = _fused_experts_flashinfer_mxfp4_cutlass(
+        StandardDispatchOutput(
+            dispatch_output.hidden_states, None, dispatch_output.topk_output
+        ),
+        quant_info,
+        runner_config,
+    )
+    return FlashinferCombineInput(hidden_states=result.hidden_states)
+
+
 def _fused_experts_flashinfer_mxfp4_cutlass(
     dispatch_output: StandardDispatchOutput,
     quant_info: FlashInferCutlassMxfp4MoeQuantInfo,

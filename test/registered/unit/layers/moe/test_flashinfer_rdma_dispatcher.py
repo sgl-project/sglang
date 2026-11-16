@@ -4,12 +4,14 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferCombineInput
 from sglang.srt.layers.moe.token_dispatcher.flashinfer_rdma import (
     FlashinferRdmaDispatcher,
     _validate_parallel_topology,
     close_flashinfer_rdma_buffers,
 )
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -35,8 +37,66 @@ def _parallel(ep, rank):
 
 
 class TestFlashinferRdmaDispatcher(CustomTestCase):
+    def test_native_mxfp4_wire_contract_before_buffer_allocation(self):
+        group = Mock()
+        group.size.return_value, group.rank.return_value = 4, 0
+        parallel = _parallel(4, 0)
+        parallel.tp_group = parallel.moe_ep_group = SimpleNamespace(device_group=group)
+        config = SimpleNamespace(
+            runner_backend=MoeRunnerBackend.FLASHINFER_MXFP4,
+            apply_router_weight_on_input=False,
+        )
+        tensor = torch.tensor
+
+        def cpu_tensor(*args, **kwargs):
+            kwargs["device"] = "cpu"
+            return tensor(*args, **kwargs)
+
+        with (
+            patch(f"{MODULE}.get_parallel", return_value=parallel),
+            patch(
+                f"{MODULE}.dist.get_process_group_ranks", return_value=list(range(4))
+            ),
+            patch(f"{MODULE}.dist.all_reduce") as reduce,
+            patch(f"{MODULE}.torch.tensor", side_effect=cpu_tensor),
+            patch(
+                f"{MODULE}._shared_state",
+                return_value=SimpleNamespace(packed=torch.empty(2, 5120)),
+            ) as shared,
+        ):
+            for wire in ("bf16", "nvfp4"):
+                with (
+                    self.subTest(wire=wire),
+                    envs.SGLANG_FLASHINFER_RDMA_WIRE_DTYPE.override(wire),
+                    envs.SGLANG_FLASHINFER_RDMA_NVFP4_GLOBAL_SCALE.override(0.1),
+                ):
+                    dispatcher = FlashinferRdmaDispatcher(
+                        group, 6, 384, 96, 5120, config, 54
+                    )
+                    self.assertEqual(shared.call_args.kwargs["wire_dtype"], wire)
+                    dispatcher.set_quant_config({})
+                    if wire == "nvfp4":
+                        expected = tensor(0.1, dtype=torch.float32).item()
+                        self.assertEqual(dispatcher.wire_global_scale, expected)
+                        self.assertTrue(
+                            torch.all(dispatcher.packed_global_scales == expected)
+                        )
+                    else:
+                        self.assertIsNone(dispatcher.wire_global_scale)
+                        self.assertIsNone(dispatcher.packed_global_scales)
+            self.assertEqual(reduce.call_count, 4)
+            for scale in (0.0, -1.0, float("nan"), float("inf"), 1e50, 1e-50):
+                with (
+                    self.subTest(scale=scale),
+                    envs.SGLANG_FLASHINFER_RDMA_WIRE_DTYPE.override("nvfp4"),
+                    envs.SGLANG_FLASHINFER_RDMA_NVFP4_GLOBAL_SCALE.override(scale),
+                    self.assertRaises(ValueError),
+                ):
+                    FlashinferRdmaDispatcher(group, 6, 384, 96, 5120, config, 54)
+            self.assertEqual(shared.call_count, 2)
+
     def test_topology_requires_matching_token_and_expert_owners(self):
-        for ep in (4, 8):
+        for ep in (4, 8, 16, 32):
             ranks = list(range(ep, 2 * ep))
             arguments = dict(
                 group_ranks=ranks, group_rank=1, tp_ranks=ranks, ep_ranks=ranks
@@ -61,6 +121,7 @@ class TestFlashinferRdmaDispatcher(CustomTestCase):
 
     def test_nvfp4_scale_must_be_shared_finite_and_positive(self):
         dispatcher = object.__new__(FlashinferRdmaDispatcher)
+        dispatcher.native_mxfp4 = False
         dispatcher.group = object()
         for scale in (None, torch.ones(2), torch.ones(1, dtype=torch.bfloat16)):
             with (

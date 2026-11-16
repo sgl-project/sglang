@@ -12,6 +12,7 @@ from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
     FlashInferCutlassMxfp4MoeQuantInfo,
     _fused_experts_flashinfer_mxfp4_cutlass,
     _run_flashinfer_cutlass,
+    fused_experts_rdma_to_flashinfer_mxfp4,
     materialize_swiglu_params_for_cutlass,
 )
 from sglang.srt.layers.moe.token_dispatcher.flashinfer import FlashinferDispatchOutput
@@ -43,6 +44,32 @@ class _SingleRankMoeLayer(torch.nn.Module):
 
 
 class TestMaterializeSwigluParamsForCutlass(CustomTestCase):
+    def test_rdma_mxfp4_bridge_preserves_routes_and_native_quant_info(self):
+        standard = _dispatch_output(2)
+        dispatch = FlashinferDispatchOutput(
+            standard.hidden_states,
+            None,
+            standard.topk_output,
+            torch.empty_like(standard.hidden_states),
+        )
+        quant = FlashInferCutlassMxfp4MoeQuantInfo(
+            *(torch.empty(0) for _ in range(4)),
+            mxfp4_weight_global_scale=torch.ones(1),
+        )
+        with mock.patch(
+            "sglang.srt.layers.moe.moe_runner.flashinfer_cutlass._fused_experts_flashinfer_mxfp4_cutlass",
+            return_value=standard,
+        ) as run:
+            result = fused_experts_rdma_to_flashinfer_mxfp4(
+                dispatch, quant, MoeRunnerConfig()
+            )
+            converted, received_quant, _ = run.call_args.args
+            self.assertIs(converted.hidden_states, standard.hidden_states)
+            self.assertIs(converted.topk_output, standard.topk_output)
+            self.assertIsNone(converted.hidden_states_scale)
+            self.assertIs(received_quant, quant)
+            self.assertIs(result.hidden_states, standard.hidden_states)
+
     def test_rdma_and_nvlink_keep_the_global_expert_id_kernel_layout(self):
         standard = _dispatch_output(2)
         output = torch.empty(2, HIDDEN, dtype=torch.bfloat16)

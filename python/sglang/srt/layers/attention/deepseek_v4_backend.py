@@ -1648,7 +1648,8 @@ class DeepseekV4AttnBackend(
             # The SM120 FP4 kernel schedules split_kv=128, while the generic
             # JIT metadata planner encodes split_kv=256.
             force_deep_gemm_metadata=(
-                self.enable_deepseek_v4_fp4_indexer and get_platform().is_sm120
+                get_platform().is_sm120
+                and (self.enable_deepseek_v4_fp4_indexer or compress_ratio in (1, 2))
             ),
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             compress_ratio=compress_ratio,
@@ -3047,7 +3048,6 @@ class DeepseekV4AttnBackend(
     def _use_sparse_prefill(
         self, forward_batch: ForwardBatch, *, num_qo_tokens: int
     ) -> bool:
-
         cp_active = is_cp_active(forward_batch)
         cp_sparse_prefill = (
             cp_active

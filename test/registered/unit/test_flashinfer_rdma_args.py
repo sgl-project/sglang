@@ -81,6 +81,72 @@ class TestFlashinferRdmaArgs(CustomTestCase):
             _a2a_fusion_adjustments(cfg), {"disable_shared_experts_fusion": True}
         )
 
+    def test_native_mxfp4_dspark_resolves_target_and_draft_rdma(self):
+        from sglang.srt.arg_groups.model_override_base import dspark_dp_a2a_backends
+
+        for architecture in ("DeepseekV4ForCausalLM", "DeepseekV41ForCausalLM"):
+            self.assertIn("flashinfer_rdma", dspark_dp_a2a_backends(architecture))
+            for ep in (4, 8, 16, 32):
+                cfg = self.config(
+                    tp_size=ep,
+                    attn_dp_size=ep,
+                    ep_size=ep,
+                    moe_runner_backend="flashinfer_mxfp4",
+                    speculative_algorithm="DSPARK",
+                    speculative_num_draft_tokens=6,
+                )
+                cfg._model_config.hf_config.architectures = [architecture]
+                with (
+                    self.subTest(architecture=architecture, ep=ep),
+                    patch.object(moe_hook, "resolved_view", return_value=cfg),
+                    patch.object(moe_hook, "declare_resolution") as declare,
+                ):
+                    moe_hook.handle_flashinfer_rdma(cfg)
+                resolution = declare.call_args.kwargs
+                self.assertEqual(resolution["moe_runner_backend"], "flashinfer_mxfp4")
+                self.assertEqual(
+                    resolution["speculative_moe_a2a_backend"], "flashinfer_rdma"
+                )
+                cfg.speculative_moe_a2a_backend = "none"
+                with (
+                    patch.object(moe_hook, "resolved_view", return_value=cfg),
+                    self.assertRaisesRegex(
+                        ValueError, "flashinfer_rdma for this speculative model"
+                    ),
+                ):
+                    moe_hook.handle_flashinfer_rdma(cfg)
+
+    def test_native_mxfp4_auto_runner_keeps_other_quantization_defaults(self):
+        from sglang.srt.arg_groups.model_overrides import deepseek_v4
+        from sglang.srt.environ import envs
+
+        for is_fp4, quantization, expected in (
+            (True, "fp8", "flashinfer_mxfp4"),
+            (True, None, "flashinfer_mxfp4"),
+            (False, "fp8", None),
+            (True, "modelopt_fp4", None),
+        ):
+            cfg = self.config(device="cuda", quantization=quantization)
+            hf = SimpleNamespace(
+                architectures=["DeepseekV4ForCausalLM"], model_type="deepseek_v41"
+            )
+            model = SimpleNamespace(is_fp4_experts=is_fp4, nvfp4_moe_meta=None)
+            with (
+                self.subTest(is_fp4=is_fp4, quantization=quantization),
+                patch.object(deepseek_v4, "resolving_view", return_value=cfg),
+                patch.object(deepseek_v4, "model_config_of", return_value=model),
+                patch.object(
+                    deepseek_v4,
+                    "get_platform",
+                    return_value=SimpleNamespace(
+                        is_hip=False, is_sm90=False, is_sm100=False, is_sm120=True
+                    ),
+                ),
+                envs.SGLANG_DSV4_FP4_DEQUANT.override(False),
+            ):
+                resolved = deepseek_v4._deepseek_v4_overrides(cfg, hf)
+            self.assertEqual(resolved.get("moe_runner_backend"), expected)
+
     def test_unsupported_layouts_and_features_fail_before_allocation(self):
         for change in (
             dict(tp_size=2),

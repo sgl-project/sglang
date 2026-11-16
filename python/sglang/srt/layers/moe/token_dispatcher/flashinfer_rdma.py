@@ -1,18 +1,25 @@
-"""FlashInfer RDMA dispatch/combine for NVFP4 expert parallel decode.
+"""FlashInfer RDMA dispatch/combine for expert parallel decode.
 
-Decode uses NVFP4 in both communication directions and the existing CUTLASS
-expert runner. Eager prefill uses BF16 gather/compute/reduce-scatter to avoid
+ModelOpt NVFP4 experts consume received packed activations directly. Native
+MXFP4 experts retain their checkpoint format and consume dequantized BF16 rows
+through the existing MXFP8 x MXFP4 CUTLASS runner. Their communication format
+is configured independently of the weight format. Eager prefill uses BF16
+gather/compute/reduce-scatter to avoid
 reserving an expert-major RDMA workspace for the much larger prefill batch.
 """
 
 from __future__ import annotations
 
+import logging
+import math
+import struct
 from dataclasses import dataclass
 from typing import Any
 
 import torch
 import torch.distributed as dist
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import (
     get_dp_global_num_tokens,
     get_is_extend_in_batch,
@@ -25,6 +32,7 @@ from sglang.srt.layers.moe.topk import StandardTopKOutput, TopKOutputChecker
 from sglang.srt.runtime_context import get_parallel, get_resources
 
 _BUFFER_KEY = "flashinfer_rdma_alltoall"
+logger = logging.getLogger(__name__)
 
 
 def _validate_parallel_topology(
@@ -33,8 +41,8 @@ def _validate_parallel_topology(
     """Each rank must own distinct tokens and a distinct expert partition."""
     ranks = tuple(group_ranks)
     ep = len(ranks)
-    if ep not in (4, 8) or len(set(ranks)) != ep:
-        raise ValueError("FlashInfer RDMA requires four or eight distinct ranks")
+    if ep < 2 or len(set(ranks)) != ep:
+        raise ValueError("FlashInfer RDMA requires at least two distinct ranks")
     expected_widths = {
         "tp_size": ep,
         "attn_dp_size": ep,
@@ -82,8 +90,8 @@ class _RdmaState:
     owner: object | None = None
 
 
-def _shared_state(group, *, hidden, num_experts, topk, capacity):
-    key = (_BUFFER_KEY, id(group), hidden, num_experts, topk, capacity)
+def _shared_state(group, *, hidden, num_experts, topk, capacity, wire_dtype):
+    key = (_BUFFER_KEY, id(group), hidden, num_experts, topk, capacity, wire_dtype)
     resources = get_resources().buffers
     if key in resources:
         return resources[key]
@@ -103,29 +111,30 @@ def _shared_state(group, *, hidden, num_experts, topk, capacity):
     local_experts = num_experts // ep
     cap = ep * capacity
     rows = cap * topk
+    width = hidden // 2 if wire_dtype == "nvfp4" else hidden
+    sf_width = hidden // 16 if wire_dtype == "nvfp4" else 0
+    dtype = torch.uint8 if wire_dtype == "nvfp4" else torch.bfloat16
     device = torch.device("cuda", torch.cuda.current_device())
     buffer = RdmaMoeAlltoAll(
         group,
         num_max_dispatch_tokens_per_rank=capacity,
         hidden=hidden,
         num_experts=num_experts,
-        config=RdmaMoeAlltoAllConfig(communication_dtype="nvfp4"),
+        config=RdmaMoeAlltoAllConfig(communication_dtype=wire_dtype),
     )
     state = _RdmaState(
         buffer=buffer,
         outputs=(
+            torch.empty((local_experts, cap, width), dtype=dtype, device=device),
             torch.empty(
-                (local_experts, cap, hidden // 2), dtype=torch.uint8, device=device
-            ),
-            torch.empty(
-                (local_experts, cap, hidden // 16), dtype=torch.uint8, device=device
+                (local_experts, cap, sf_width), dtype=torch.uint8, device=device
             ),
             torch.empty(local_experts, dtype=torch.int32, device=device),
             torch.empty((local_experts, cap), dtype=torch.int32, device=device),
             torch.empty((local_experts, ep), dtype=torch.int64, device=device),
         ),
-        packed=torch.empty((rows, hidden // 2), dtype=torch.uint8, device=device),
-        packed_sf=torch.empty((rows, hidden // 16), dtype=torch.uint8, device=device),
+        packed=torch.empty((rows, width), dtype=dtype, device=device),
+        packed_sf=torch.empty((rows, sf_width), dtype=torch.uint8, device=device),
         ids=torch.empty((rows, 1), dtype=torch.int32, device=device),
         weights=torch.empty((rows, 1), dtype=torch.float32, device=device),
         slot_map=torch.empty(rows, dtype=torch.int32, device=device),
@@ -142,7 +151,7 @@ def _shared_state(group, *, hidden, num_experts, topk, capacity):
 
 
 class FlashinferRdmaDispatcher(BaseDispatcher):
-    """Serial NVFP4 RDMA dispatch/combine with full decode CUDA graphs.
+    """Serial RDMA dispatch/combine with full decode CUDA graphs.
 
     ``max_tokens_per_rank`` counts physical token rows, including all verify
     tokens when speculative decoding is enabled. Layers share one workspace
@@ -161,10 +170,12 @@ class FlashinferRdmaDispatcher(BaseDispatcher):
         params_dtype=None,
     ):
         super().__init__()
-        if not moe_runner_config.runner_backend.is_flashinfer_cutlass():
-            raise ValueError(
-                "FlashInfer RDMA requires the flashinfer_cutlass MoE runner"
-            )
+        self.native_mxfp4 = moe_runner_config.runner_backend.is_flashinfer_mxfp4()
+        if not (
+            self.native_mxfp4
+            or moe_runner_config.runner_backend.is_flashinfer_cutlass()
+        ):
+            raise ValueError("FlashInfer RDMA requires a supported CUTLASS MoE runner")
         if moe_runner_config.apply_router_weight_on_input:
             raise ValueError(
                 "FlashInfer RDMA applies routing weights after expert compute"
@@ -192,17 +203,96 @@ class FlashinferRdmaDispatcher(BaseDispatcher):
         self.topk = router_topk
         self.hidden = hidden_size
         self.capacity = max_tokens_per_rank
+        self.wire_dtype = envs.SGLANG_FLASHINFER_RDMA_WIRE_DTYPE.get()
+        if self.wire_dtype not in ("nvfp4", "bf16"):
+            raise ValueError("FlashInfer RDMA wire dtype must be nvfp4 or bf16")
+        if not self.native_mxfp4 and self.wire_dtype != "nvfp4":
+            raise ValueError(
+                "BF16 wire is currently enabled only for native MXFP4 experts"
+            )
+        self.wire_global_scale = None
+        if self.native_mxfp4:
+            if self.wire_dtype == "nvfp4":
+                scale = envs.SGLANG_FLASHINFER_RDMA_NVFP4_GLOBAL_SCALE.get()
+                if scale is None or not math.isfinite(scale) or scale <= 0:
+                    raise ValueError(
+                        "Native MXFP4 + NVFP4 wire requires an explicit positive finite "
+                        "SGLANG_FLASHINFER_RDMA_NVFP4_GLOBAL_SCALE"
+                    )
+                try:
+                    self.wire_global_scale = struct.unpack(
+                        "f", struct.pack("f", scale)
+                    )[0]
+                except OverflowError as exc:
+                    raise ValueError(
+                        "RDMA wire global scale overflows float32"
+                    ) from exc
+                if (
+                    not math.isfinite(self.wire_global_scale)
+                    or self.wire_global_scale <= 0
+                ):
+                    raise ValueError(
+                        "RDMA wire global scale must be positive finite float32"
+                    )
+            # Fail before creating differently sized NCCL windows if ranks disagree.
+            contract = torch.tensor(
+                [int(self.wire_dtype == "nvfp4"), self.wire_global_scale or 0.0],
+                dtype=torch.float32,
+                device="cuda",
+            )
+            low, high = contract.clone(), contract.clone()
+            dist.all_reduce(low, op=dist.ReduceOp.MIN, group=group)
+            dist.all_reduce(high, op=dist.ReduceOp.MAX, group=group)
+            if not torch.equal(low, high):
+                raise ValueError(
+                    "FlashInfer RDMA wire dtype/global scale disagree across ranks"
+                )
+            # The native kernel receives float32, and dequantization must use
+            # exactly that same rounded scalar.
+            self.wire_global_scale = (
+                float(low[1].item()) if self.wire_dtype == "nvfp4" else None
+            )
+            if self.wire_global_scale is not None and self.wire_global_scale == 0:
+                raise ValueError("FlashInfer RDMA wire global scale underflows float32")
+            if self.ep_rank == 0:
+                logger.info(
+                    "Native MXFP4 RDMA: wire=%s, NVFP4 global_scale=%s, "
+                    "NVFP4 nonzero block-scale underflow at block_max<=%s, "
+                    "scale saturation above block_max=%s; expert input=BF16->MXFP8, "
+                    "checkpoint MXFP4 weights unchanged",
+                    self.wire_dtype,
+                    self.wire_global_scale,
+                    None
+                    if self.wire_global_scale is None
+                    else 3 / (512 * self.wire_global_scale),
+                    None
+                    if self.wire_global_scale is None
+                    else 2688 / self.wire_global_scale,
+                )
         self.state = _shared_state(
             group,
             hidden=hidden_size,
             num_experts=num_experts,
             topk=router_topk,
             capacity=max_tokens_per_rank,
+            wire_dtype=self.wire_dtype,
+        )
+        self.packed_global_scales = (
+            torch.full(
+                (self.state.packed.shape[0], 1),
+                self.wire_global_scale,
+                dtype=torch.float32,
+                device=self.state.packed.device,
+            )
+            if self.native_mxfp4 and self.wire_dtype == "nvfp4"
+            else None
         )
         self._pending = None
 
     def set_quant_config(self, quant_config):
         super().set_quant_config(quant_config)
+        if self.native_mxfp4:
+            return
         scale = quant_config.get("input_global_scale")
         if (
             not isinstance(scale, torch.Tensor)
@@ -253,35 +343,48 @@ class FlashinferRdmaDispatcher(BaseDispatcher):
             raise ValueError(
                 "Decode/verify token rows exceed --flashinfer-rdma-max-tokens-per-rank"
             )
-        from flashinfer import nvfp4_block_scale_interleave
-
         from sglang.srt.layers.moe.token_dispatcher.flashinfer_rdma_kernels import (
             pack_expert_rows,
         )
-        from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
 
-        if hidden_states.shape[0]:
-            x, sf = fp4_quantize(
+        state = self.state
+        if self.native_mxfp4:
+            recv, recv_sf, counts, handle, _ = state.buffer.dispatch(
                 hidden_states,
-                self.quant_config["input_global_scale"],
-                is_sf_swizzled_layout=False,
+                ids,
+                input_dtype="bf16",
+                nvfp4_global_scale=self.wire_global_scale or 1.0,
+                out=state.outputs,
+                return_recv_hook=False,
             )
         else:
-            x = torch.empty(
-                (0, self.hidden // 2), dtype=torch.uint8, device=hidden_states.device
+            from sglang.srt.layers.quantization.fp4_utils import fp4_quantize
+
+            if hidden_states.shape[0]:
+                x, sf = fp4_quantize(
+                    hidden_states,
+                    self.quant_config["input_global_scale"],
+                    is_sf_swizzled_layout=False,
+                )
+            else:
+                x = torch.empty(
+                    (0, self.hidden // 2),
+                    dtype=torch.uint8,
+                    device=hidden_states.device,
+                )
+                sf = torch.empty(
+                    (0, self.hidden // 16),
+                    dtype=torch.uint8,
+                    device=hidden_states.device,
+                )
+            recv, recv_sf, counts, handle, _ = state.buffer.dispatch(
+                x,
+                ids,
+                x_scales=sf,
+                input_dtype="prequantized",
+                out=state.outputs,
+                return_recv_hook=False,
             )
-            sf = torch.empty(
-                (0, self.hidden // 16), dtype=torch.uint8, device=hidden_states.device
-            )
-        state = self.state
-        recv, recv_sf, counts, handle, _ = state.buffer.dispatch(
-            x,
-            ids,
-            x_scales=sf,
-            input_dtype="prequantized",
-            out=state.outputs,
-            return_recv_hook=False,
-        )
         pack_expert_rows(
             recv,
             recv_sf,
@@ -294,13 +397,26 @@ class FlashinferRdmaDispatcher(BaseDispatcher):
             ep_rank=self.ep_rank,
             num_experts=self.num_experts,
         )
-        packed_sf = nvfp4_block_scale_interleave(state.packed_sf)
+        if self.native_mxfp4:
+            packed = (
+                state.buffer.dequantize_nvfp4_to_bf16(
+                    state.packed, self.packed_global_scales, state.packed_sf
+                )
+                if self.wire_dtype == "nvfp4"
+                else state.packed
+            )
+            packed_sf = None
+        else:
+            from flashinfer import nvfp4_block_scale_interleave
+
+            packed = state.packed
+            packed_sf = nvfp4_block_scale_interleave(state.packed_sf)
         self._pending = ("decode", ids, weights, handle, hidden_states.shape[0])
         state.owner = self
         # Compact rows use unit weights. Original routing weights are applied
         # exactly once, by combine after expert computation.
         return FlashinferDispatchOutput(
-            state.packed,
+            packed,
             packed_sf,
             StandardTopKOutput(state.weights, state.ids, None),
             state.compact_output,
@@ -368,7 +484,9 @@ class FlashinferRdmaDispatcher(BaseDispatcher):
                 handle,
                 topk_idx=ids,
                 topk_weights=weights,
-                global_scale=state.combine_scales,
+                global_scale=state.combine_scales
+                if self.wire_dtype == "nvfp4"
+                else None,
                 out=output,
                 return_recv_hook=False,
             )

@@ -1,8 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Four-rank SM120 RDMA integration test with real NVFP4 CUTLASS experts.
+"""SM120 RDMA integration test with real NVFP4 or native MXFP4 CUTLASS experts.
 
 Run with an RDMA-capable FlashInfer/NCCL installation:
     torchrun --standalone --nproc-per-node=4 test/manual/ep/test_flashinfer_rdma.py
+
+Use torchrun's node/rank rendezvous options for multi-node EP. The test derives
+its expert group from WORLD_SIZE; local rank only selects the CUDA device.
+
+Set TEST_NATIVE_MXFP4=1 to test native MXFP4 weights with an explicit
+SGLANG_FLASHINFER_RDMA_NVFP4_GLOBAL_SCALE (for example, 1.0). Set
+SGLANG_FLASHINFER_RDMA_WIRE_DTYPE=bf16 only for the explicit BF16 baseline.
 
 Tests non-unit routing weights, uneven/empty ranks, eager prefill fallback and
 CUDA-graph replay with changing inputs, routes and weights. Source-order direct
@@ -32,13 +39,21 @@ def _decode_nvfp4(packed, block_scales, global_scale):
 
 
 def main():
-    if int(os.environ.get("WORLD_SIZE", "1")) != 4:
-        raise ValueError("Run with torchrun --nproc-per-node=4")
-    rank = int(os.environ["LOCAL_RANK"])
-    torch.cuda.set_device(rank)
-    device = torch.device("cuda", rank)
+    ep = int(os.environ.get("WORLD_SIZE", "1"))
+    if ep < 2:
+        raise ValueError("Run with torchrun and at least two ranks")
+    native_mxfp4 = os.environ.get("TEST_NATIVE_MXFP4") == "1"
+    rank = int(os.environ["RANK"])
+    local_rank = int(os.environ["LOCAL_RANK"])
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
     dist.init_process_group("nccl", timeout=timedelta(minutes=5))
-    from flashinfer import nvfp4_batched_quantize, nvfp4_block_scale_interleave
+    from flashinfer import (
+        mxfp4_quantize,
+        mxfp8_quantize,
+        nvfp4_batched_quantize,
+        nvfp4_block_scale_interleave,
+    )
     from flashinfer.fused_moe import cutlass_fused_moe
     from flashinfer.fused_moe.core import ActivationType
 
@@ -46,7 +61,9 @@ def main():
     from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
     from sglang.srt.layers.moe.moe_runner.flashinfer_cutlass import (
         FlashInferCutlassMoeQuantInfo,
+        FlashInferCutlassMxfp4MoeQuantInfo,
         fused_experts_flashinfer_to_flashinfer_cutlass,
+        fused_experts_rdma_to_flashinfer_mxfp4,
     )
     from sglang.srt.layers.moe.token_dispatcher import flashinfer_rdma as rdma
     from sglang.srt.layers.moe.topk import StandardTopKOutput
@@ -56,14 +73,14 @@ def main():
     from sglang.srt.server_args import ServerArgs
 
     get_context().set_server_args(
-        ServerArgs(model_path="unused", tp_size=4, attn_dp_size=4, ep_size=4)
+        ServerArgs(model_path="unused", tp_size=ep, attn_dp_size=ep, ep_size=ep)
     )
     get_parallel().override_permanently(
         tp_rank=rank, attn_dp_rank=rank, moe_ep_rank=rank
     )
     group = GroupCoordinator(
-        [list(range(4))],
-        rank,
+        [list(range(ep))],
+        local_rank,
         "nccl",
         True,
         False,
@@ -75,12 +92,12 @@ def main():
     )
     get_parallel().override_permanently(tp_group=group, moe_ep_group=group)
     parallel = SimpleNamespace(
-        tp_size=4,
-        attn_dp_size=4,
+        tp_size=ep,
+        attn_dp_size=ep,
         attn_tp_size=1,
         attn_cp_size=1,
         attn_dcp_size=1,
-        moe_ep_size=4,
+        moe_ep_size=ep,
         moe_tp_size=1,
         moe_dp_size=1,
         tp_rank=rank,
@@ -89,31 +106,58 @@ def main():
         tp_group=group,
         moe_ep_group=group,
     )
-    hidden, experts, intermediate, topk, capacity, ep = 4096, 288, 128, 8, 68, 4
+    hidden, experts, intermediate, topk, capacity = (
+        (5120, 384, 384, 6, 54) if native_mxfp4 else (4096, 288, 128, 8, 68)
+    )
+    if experts % ep:
+        raise ValueError(
+            f"The test's {experts} experts must divide evenly across {ep} ranks"
+        )
+
+    def quantize_weights(src):
+        if native_mxfp4:
+            pairs = [mxfp4_quantize(row) for row in src]
+            return tuple(torch.stack([pair[i] for pair in pairs]) for i in range(2))
+        return nvfp4_batched_quantize(src, scale.reshape(1))
+
     local_experts = experts // ep
     scale = torch.tensor(256.0, device=device)
     torch.manual_seed(20261115 + rank)
     src = torch.randn(
         (local_experts, 2 * intermediate, hidden), device=device, dtype=torch.bfloat16
     ) / math.sqrt(hidden)
-    w13, sf13 = nvfp4_batched_quantize(src, scale.reshape(1))
+    w13, sf13 = quantize_weights(src)
     del src
     src = torch.randn(
         (local_experts, hidden, intermediate), device=device, dtype=torch.bfloat16
     ) / math.sqrt(intermediate)
-    w2, sf2 = nvfp4_batched_quantize(src, scale.reshape(1))
+    w2, sf2 = quantize_weights(src)
     del src
-    sf13 = sf13.view(torch.uint8).reshape(local_experts, 2 * intermediate, hidden // 16)
-    sf2 = sf2.view(torch.uint8).reshape(local_experts, hidden, intermediate // 16)
-    alpha = torch.full((local_experts,), 1.0 / 65536.0, device=device)
-    quant = FlashInferCutlassMoeQuantInfo(
-        "fp4",
-        w13.view(torch.uint8),
-        w2.view(torch.uint8),
-        [scale, sf13, alpha, scale, sf2, alpha],
-        torch.bfloat16,
-        apply_routed_scaling_factor=False,
-    )
+    if native_mxfp4:
+        weight_global_scale = torch.ones(local_experts, device=device)
+        quant = FlashInferCutlassMxfp4MoeQuantInfo(
+            w13_weight=w13,
+            w2_weight=w2,
+            w13_weight_scale=sf13,
+            w2_weight_scale=sf2,
+            mxfp4_weight_global_scale=weight_global_scale,
+        )
+        expert_fn = fused_experts_rdma_to_flashinfer_mxfp4
+    else:
+        sf13 = sf13.view(torch.uint8).reshape(
+            local_experts, 2 * intermediate, hidden // 16
+        )
+        sf2 = sf2.view(torch.uint8).reshape(local_experts, hidden, intermediate // 16)
+        alpha = torch.full((local_experts,), 1.0 / 65536.0, device=device)
+        quant = FlashInferCutlassMoeQuantInfo(
+            "fp4",
+            w13.view(torch.uint8),
+            w2.view(torch.uint8),
+            [scale, sf13, alpha, scale, sf2, alpha],
+            torch.bfloat16,
+            apply_routed_scaling_factor=False,
+        )
+        expert_fn = fused_experts_flashinfer_to_flashinfer_cutlass
     config = MoeRunnerConfig(
         num_experts=experts,
         num_local_experts=local_experts,
@@ -123,7 +167,11 @@ def main():
         activation="silu",
         is_gated=True,
         routed_scaling_factor=2.5,
-        runner_backend=MoeRunnerBackend.FLASHINFER_CUTLASS,
+        runner_backend=(
+            MoeRunnerBackend.FLASHINFER_MXFP4
+            if native_mxfp4
+            else MoeRunnerBackend.FLASHINFER_CUTLASS
+        ),
         layer=SimpleNamespace(
             moe_tp_size=1, moe_tp_rank=0, moe_ep_size=ep, moe_ep_rank=rank
         ),
@@ -139,19 +187,23 @@ def main():
             capacity,
             torch.bfloat16,
         )
-    dispatcher.set_quant_config({"input_global_scale": scale})
-    direct_scales = [
-        scale,
-        sf13.view(torch.int32),
-        alpha,
-        scale,
-        sf2.view(torch.int32),
-        alpha,
-    ]
+    dispatcher.set_quant_config({} if native_mxfp4 else {"input_global_scale": scale})
+    direct_scales = (
+        [
+            sf13.view(torch.int32),
+            weight_global_scale,
+            sf2.view(torch.int32),
+            weight_global_scale,
+        ]
+        if native_mxfp4
+        else [scale, sf13.view(torch.int32), alpha, scale, sf2.view(torch.int32), alpha]
+    )
 
     def direct(x, sf, ids, weights):
         out = torch.zeros((x.shape[0], hidden), device=device, dtype=torch.bfloat16)
         if x.shape[0]:
+            if native_mxfp4:
+                x, sf = mxfp8_quantize(x, is_sf_swizzled_layout=True, alignment=32)
             cutlass_fused_moe(
                 output=out,
                 input=x,
@@ -169,6 +221,7 @@ def main():
                 tune_max_num_tokens=4096,
                 activation_type=ActivationType.Swiglu,
                 enable_alltoall=False,
+                use_mxfp8_act_scaling=native_mxfp4,
                 use_fused_finalize=True,
             )
             dist.all_reduce(out, group=group.device_group)
@@ -180,18 +233,34 @@ def main():
             return torch.empty((0, hidden), device=device, dtype=torch.bfloat16)
         if not decode:
             return direct(global_x, None, routes, weights)
-        q, sf = fp4_quantize(global_x, scale, is_sf_swizzled_layout=False)
-        q = q.repeat_interleave(topk, dim=0)
-        sf = nvfp4_block_scale_interleave(sf.repeat_interleave(topk, dim=0))
+        if native_mxfp4:
+            if dispatcher.wire_dtype == "nvfp4":
+                globals_ = torch.full(
+                    (n, 1), dispatcher.wire_global_scale, device=device
+                )
+                wire, blocks = dispatcher.state.buffer.quantize_bf16_to_nvfp4(
+                    global_x, globals_
+                )
+                x = _decode_nvfp4(wire, blocks, globals_).to(torch.bfloat16)
+            else:
+                x = global_x
+            q, sf = x.repeat_interleave(topk, dim=0), None
+        else:
+            q, sf = fp4_quantize(global_x, scale, is_sf_swizzled_layout=False)
+            q = q.repeat_interleave(topk, dim=0)
+            sf = nvfp4_block_scale_interleave(sf.repeat_interleave(topk, dim=0))
         expert = direct(
             q, sf, routes.reshape(-1, 1), torch.ones((n * topk, 1), device=device)
         )
-        amax = expert.float().abs().amax(-1, keepdim=True)
-        output_scale = torch.where(amax > 0, 2688.0 / amax.clamp_min(1e-20), 1.0)
-        wire, blocks = dispatcher.state.buffer.quantize_bf16_to_nvfp4(
-            expert, output_scale
-        )
-        decoded = _decode_nvfp4(wire, blocks, output_scale)
+        if dispatcher.wire_dtype == "nvfp4":
+            amax = expert.float().abs().amax(-1, keepdim=True)
+            output_scale = torch.where(amax > 0, 2688.0 / amax.clamp_min(1e-20), 1.0)
+            wire, blocks = dispatcher.state.buffer.quantize_bf16_to_nvfp4(
+                expert, output_scale
+            )
+            decoded = _decode_nvfp4(wire, blocks, output_scale)
+        else:
+            decoded = expert.float()
         expected = torch.zeros((n, hidden), device=device)
         for k in range(topk):
             expected = torch.addcmul(
@@ -226,6 +295,10 @@ def main():
                         "max_abs_error": max(gathered),
                         "real_cutlass": True,
                         "native_dispatcher": True,
+                        "ep_size": ep,
+                        "weight_dtype": "mxfp4" if native_mxfp4 else "nvfp4",
+                        "wire_dtype": dispatcher.wire_dtype,
+                        "wire_global_scale": dispatcher.wire_global_scale,
                     }
                 ),
                 flush=True,
@@ -233,10 +306,10 @@ def main():
 
     try:
         for name, sizes in [
-            ("uniform", [8] * 4),
-            ("uneven_empty_rank", [0, 1, 5, 8]),
-            ("all_invalid", [8] * 4),
-            ("all_empty", [0] * 4),
+            ("uniform", [8] * ep),
+            ("uneven_empty_rank", [(0, 1, 5, 8)[r % 4] for r in range(ep)]),
+            ("all_invalid", [8] * ep),
+            ("all_empty", [0] * ep),
         ]:
             torch.manual_seed(1234)
             all_x = torch.randn(
@@ -260,7 +333,7 @@ def main():
 
             def cycle():
                 d = dispatcher.dispatch(x, top)
-                y = fused_experts_flashinfer_to_flashinfer_cutlass(d, quant, config)
+                y = expert_fn(d, quant, config)
                 return dispatcher.combine(y)
 
             with (

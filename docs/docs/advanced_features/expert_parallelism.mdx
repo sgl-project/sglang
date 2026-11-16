@@ -140,7 +140,7 @@ Currently, DeepEP, Mooncake, NIXL-EP, `ascend_fuseep`, `pplx` and MORI only supp
 
 ### FlashInfer RDMA on SM120
 
-Use `--moe-a2a-backend flashinfer_rdma` for NVFP4 expert dispatch and
+Use `--moe-a2a-backend flashinfer_rdma` for expert dispatch and
 weighted combine on SM120 GPUs with RDMA-capable NICs. Non-self decode
 transfers use RDMA, including transfers within a host. The backend reuses
 FlashInfer CUTLASS for expert computation and supports decode CUDA Graphs.
@@ -149,8 +149,8 @@ Prerequisites:
 
 - A FlashInfer build containing [FlashInfer PR #9449](https://github.com/flashinfer-ai/flashinfer/pull/9449), which provides `flashinfer.comm.RdmaMoeAlltoAll`.
 - Matching NCCL 2.30.7 headers and runtime with GDAKI, CUDA, and working GPUDirect RDMA. Follow the dependency setup in that FlashInfer change.
-- A gated ModelOpt NVFP4 MoE checkpoint from the GLM or DeepSeek V2/V3 family, with static activation scales and BF16 hidden states. GLM-5.3 Flash is the measured model.
-- Four or eight GPUs, with attention DP and expert parallelism both equal to TP size. CP, DCP, PP, MoE DP and DWDP must each be 1.
+- A gated ModelOpt NVFP4 MoE checkpoint from the GLM or DeepSeek V2/V3 family with static activation scales, or native MXFP4 experts from DeepSeek V4/V4.1. Both paths require BF16 hidden states.
+- At least two GPUs, with attention DP and expert parallelism both equal to TP size. The expert count must be divisible by EP size. CP, DCP, PP, MoE DP and DWDP must each be 1. Four- and eight-GPU deployments have been tested; cross-node EP16/32 are admitted by the topology checks but still require validation on the target deployment.
 
 For an eight-GPU deployment, set `MODEL_PATH` to your NVFP4 checkpoint:
 
@@ -180,9 +180,86 @@ target model still uses RDMA during verification. Overlap, dynamic expert
 placement, redundant experts, EPLB, elastic EP and paged experts are not
 supported by this backend.
 
-Both dispatch and combine use NVFP4, which is lossy. Validate model quality
-for your workload before deployment. NVFP4 dispatch with BF16 combine is not
-exposed by this backend.
+ModelOpt experts use NVFP4 in both communication directions. Native MXFP4
+experts support either BF16/BF16 or NVFP4/NVFP4 communication, selected with
+`SGLANG_FLASHINFER_RDMA_WIRE_DTYPE=bf16|nvfp4` (default: `nvfp4`). Mixed
+dispatch/combine dtypes are not exposed. NVFP4 communication is lossy;
+validate model quality for your workload before deployment.
+
+#### DeepSeek V4.1 with native MXFP4 experts
+
+Use a FlashInfer build that includes H5120 support in both the RDMA kernels
+and quantization helpers from PR #9449. Native MXFP4 weights and their E8M0
+scales are preserved. The SM120 CUTLASS runner quantizes expert activations
+to MXFP8. With NVFP4 communication, received rows are first dequantized to
+BF16; NVFP4 block scales are not reinterpreted as MXFP4 scales.
+
+The following single-node example uses BF16 communication. `MODEL_PATH`
+must refer to the native DeepSeek V4.1 checkpoint with FP8 dense weights and
+MXFP4 experts; `--quantization fp8` selects its loader without converting the
+expert weights to NVFP4.
+
+```bash
+export SGLANG_FLASHINFER_RDMA_WIRE_DTYPE=bf16
+export SGLANG_DSV4_LOAD_MAX_WORKERS=1
+python -m sglang.launch_server \
+  --model-path "$MODEL_PATH" --trust-remote-code --language-model-only \
+  --dtype bfloat16 --quantization fp8 \
+  --tp-size 8 --attn-dp-size 8 --ep-size 8 --enable-dp-lm-head \
+  --attention-backend dsv4 --dsv4-attn-backend flashmla \
+  --kv-cache-dtype fp8_e4m3 \
+  --moe-a2a-backend flashinfer_rdma --moe-runner-backend flashinfer_mxfp4 \
+  --fp4-gemm-backend flashinfer_cutlass \
+  --engram-config '{"placement":"cpu","replication":"per_node","lookup":"all_reduce"}' \
+  --speculative-algorithm DSPARK --speculative-dspark-block-size 5 \
+  --speculative-num-draft-tokens 6 \
+  --speculative-draft-model-path "$MODEL_PATH" \
+  --speculative-draft-model-quantization fp8 \
+  --speculative-moe-runner-backend flashinfer_mxfp4 \
+  --speculative-moe-a2a-backend flashinfer_rdma \
+  --context-length 16384 \
+  --chunked-prefill-size 2048 --max-prefill-tokens 2048 \
+  --max-running-requests 64 --min-free-slots-delay 1 \
+  --cuda-graph-max-bs-decode 8 --flashinfer-rdma-max-tokens-per-rank 54
+```
+
+DSPARK uses RDMA for both target and draft experts, with DP LM head enabled.
+The admission threshold allows all eight requests per DP rank to run together.
+Those eight local requests require 48 target verification rows. Size the
+communication capacity for the largest actual target or draft forward,
+including graph padding. Enlarging capacity also enlarges fixed staging buffers.
+
+To select NVFP4 communication, set `SGLANG_FLASHINFER_RDMA_WIRE_DTYPE=nvfp4`
+and explicitly provide `SGLANG_FLASHINFER_RDMA_NVFP4_GLOBAL_SCALE` on every
+rank. Native MXFP4 checkpoints do not provide a calibrated NVFP4 activation
+scale. This positive finite FP32 scalar must agree across ranks and stays
+fixed through CUDA Graph replay. The scale affects quantization range and
+precision; it is not a weight-conversion setting. Combine computes its
+per-row NVFP4 scales from expert outputs.
+
+`SGLANG_DSV4_LOAD_MAX_WORKERS` optionally limits the target model's concurrent
+weight-copy workers; unset preserves the executor default. DSPARK's draft
+loader is already sequential. TP shards with intermediate dimensions such as
+288 or 576 are padded after loading to CUTLASS's 128-element alignment, with
+gate/up halves and down-projection scales padded consistently.
+
+For deployments that need CPU expert offload, the existing OffloaderV2 options
+can select native MXFP4 expert weights and scales while leaving attention and
+Engram outside the offloaded submodule. For example,
+`--offload-group-size 20 --offload-num-in-group 7 --offload-prefetch-step 1 --offload-mode cpu`
+offloads 14 of 40 target layers. Reserve sufficient host memory for pinned
+expert weights and CPU Engram. For TP expert offload, set
+`SGLANG_DSV4_DECODER_TAIL_GRAPH_MAX_ROWS=0`
+when using this offload path to disable the prefill decoder-tail local graphs;
+full target/draft decode graphs remain available. RDMA disables these local
+prefill tail graphs automatically. Offload is disabled by default
+and adds host-to-device transfer cost on each target forward.
+
+For a multi-node deployment, use the existing Engram configuration with
+`"replication":"none"`; the example's `per_node` sharing is for one host.
+Changing the EP size also changes expert partitions, GIN context limits,
+memory requirements and the RDMA fabric requirements. The four/eight-GPU
+results do not establish correctness or performance at EP16/32.
 
 ### Examples
 

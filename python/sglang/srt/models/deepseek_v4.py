@@ -3891,6 +3891,23 @@ DeepseekV4DecoderLayer = (
 )
 
 
+def _native_mxfp4_offload_param_names(experts):
+    from sglang.srt.layers.quantization.mxfp4_flashinfer_cutlass_moe import (
+        Mxfp4FlashinferCutlassMoEMethod,
+    )
+
+    if not isinstance(experts.quant_method, Mxfp4FlashinferCutlassMoEMethod):
+        raise ValueError(
+            "DeepSeek V4 expert offload requires native MXFP4 CUTLASS experts."
+        )
+    return [
+        "w13_weight",
+        "w2_weight",
+        "w13_weight_scale_inv",
+        "w2_weight_scale_inv",
+    ]
+
+
 class DeepseekV4Model(nn.Module):
     fall_back_to_pt_during_load = False
     # Class-level default for instances built without running __init__.
@@ -3973,6 +3990,15 @@ class DeepseekV4Model(nn.Module):
                 moe_routed_quant_stream=self.moe_routed_quant_stream,
             ),
             prefix=add_prefix("layers", prefix),
+            offloader_kwargs=(
+                dict(
+                    # Engram and attention stay outside the offloaded submodule.
+                    submodule_accessor=lambda layer: layer.mlp.experts,
+                    whitelist_param_names_creator=_native_mxfp4_offload_param_names,
+                )
+                if get_exec().offload.offload_group_size > 0
+                else None
+            ),
             final_read=hc_boundary.FinalRead() if _is_cuda else None,
             stage_facts=functools.partial(hc_boundary.stages, config)
             if _is_cuda
@@ -5520,7 +5546,12 @@ class DeepseekV4ForCausalLM(nn.Module):
             assert self.num_fused_shared_experts == 1
             log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
+        load_max_workers = envs.SGLANG_DSV4_LOAD_MAX_WORKERS.get()
+        if load_max_workers is not None and load_max_workers <= 0:
+            raise ValueError("SGLANG_DSV4_LOAD_MAX_WORKERS must be positive")
+        with concurrent.futures.ThreadPoolExecutor(
+            max_workers=load_max_workers
+        ) as executor:
             futures = []
             weight_names = []
             for name, loaded_weight in weights:
