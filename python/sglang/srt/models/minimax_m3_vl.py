@@ -123,6 +123,7 @@ class MiniMaxM3SparseForConditionalGeneration(nn.Module):
                 config, "multimodal_projector_bias", True
             ),
             patch_merge_bias=getattr(config, "patch_merge_bias", True),
+            projector_hidden_act=getattr(config, "projector_hidden_act", "gelu"),
         )
 
         self.encoder_processor = None
