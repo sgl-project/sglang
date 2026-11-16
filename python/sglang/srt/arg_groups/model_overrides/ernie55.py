@@ -116,7 +116,6 @@ def _validate_features(cfg: Any) -> None:
 
 
 def _validate_speculative(cfg: Any) -> None:
-    # Runs before NEXTN is resolved to EAGLE, so it sees the raw CLI spelling.
     algo = (cfg.speculative_algorithm or "").upper()
     is_mtp = algo in ("EAGLE", "NEXTN")
     if algo not in ("", "DSPARK") and not is_mtp:

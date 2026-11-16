@@ -106,6 +106,14 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # Before any reader of speculative_algorithm: the flag may reset it.
     run_hook(handle_aux_hidden_state_capture, server_args)
 
+    from sglang.srt.arg_groups.speculative_hook import (
+        handle_speculative_algorithm_alias,
+        handle_speculative_decoding,
+    )
+
+    # Before any hook compares speculative_algorithm by name.
+    run_hook(handle_speculative_algorithm_alias, server_args)
+
     # Reject an explicitly enabled but incompatible hardware runtime before
     # model path resolution, downloads, or the dummy-model short circuit.
     from sglang.srt.arg_groups.parallel_hook import validate_prefill_cp_platform
@@ -320,8 +328,6 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(validate_experimental_sgl_marlin, server_args)
 
     run_post_process_pass(server_args, _pipeline_parallel_overlap_disable)
-
-    from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 
     run_hook(handle_speculative_decoding, server_args)
     run_post_process_pass(server_args, resolve_ascend_ops_speculative_draft)

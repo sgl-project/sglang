@@ -50,7 +50,7 @@ def resolve_cp_tp_group_sharing(server_args: Any, model: Any) -> None:
         raise ValueError(f"CP-TP group sharing requires --cp-strategy {strategy}.")
 
     arch = model.hf_config.architectures[0]
-    # This hook runs before speculative defaults and NEXTN alias resolution.
+    # This hook runs before the speculative defaults are resolved.
     # Native MTP keeps the target's CP/TP placement. DFLASH consumes the
     # target's gathered hidden states and runs its draft with ordinary TP.
     # Both integrated and PD prefill consume the CP-gathered target states.

@@ -17,6 +17,7 @@ from unittest.mock import patch
 
 from sglang.srt.arg_groups import pipeline as pipeline_module
 from sglang.srt.arg_groups import resolution_hooks as hooks_module
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.resolution_hooks import (
     _OVERRIDABLE_HOOKS,
@@ -246,6 +247,33 @@ class TestEndToEnd(_IsolatedRegistry):
         self.assertIsNotNone(
             resolution_result(sa, "chunked_prefill_size"),
             "steps after handle_cuda_graph_config did not run",
+        )
+
+    def test_the_model_overrides_see_the_canonical_speculative_algorithm(self):
+        """`NEXTN` and lower-case names are accepted spellings, and the
+        per-model overrides compare the algorithm by its canonical name. A
+        spelling that reaches them untranslated silently skips what they
+        declare for `EAGLE`."""
+        seen = {}
+
+        @register_resolution_hook("handle_model_specific_adjustments")
+        def _record(server_args, previous):
+            seen[server_args.speculative_algorithm] = resolving_view(
+                server_args
+            ).speculative_algorithm
+            previous(server_args)
+
+        for spelling in ("EAGLE", "NEXTN", "eagle", "nextn"):
+            sa = ServerArgs(
+                model_path=self._config_dir,
+                device="cuda",
+                speculative_algorithm=spelling,
+            )
+            sa.resolve_once()
+            self.assertEqual(resolution_result(sa, "speculative_algorithm"), "EAGLE")
+        self.assertEqual(
+            seen,
+            {"EAGLE": "EAGLE", "NEXTN": "EAGLE", "eagle": "EAGLE", "nextn": "EAGLE"},
         )
 
     def test_with_nothing_registered_resolution_is_unchanged(self):
