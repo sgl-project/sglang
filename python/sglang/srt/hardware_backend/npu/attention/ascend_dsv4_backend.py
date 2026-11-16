@@ -2615,33 +2615,34 @@ class DeepseekV4AscendAttnBackend(
     def _validate_spec_support(self, spec_algorithm) -> None:
         """The gate for every speculative-decoding constraint of this backend.
 
-        DeepSeek-V4.1 (ratios 1/2) pins the verify layout too: its low-ratio rows
-        assume the STATIC request-major rectangle, so COMPACT's ragged layout is
-        rejected at startup. That check stays on ``_dsv4_has_low_ratio`` (a draft
-        worker empties its ratios and writes no compressed rows).
+        DeepSeek-V4.1 (ratios 1/2) runs DSpark on the STATIC verify layout only.
+        Its low-ratio rows assume the STATIC request-major rectangle, so another
+        spec algorithm, or a ragged mode (CAP_ACCEPT / COMPACT), would scatter
+        this step's compressed rows to stale slots; both are rejected at startup.
+        The generation is read from ``_dsv4_is_v41_model`` rather than the ratio
+        list, which a draft worker empties.
 
         DSV4 (ratios 4/128) runs EAGLE / NGRAM / DSpark / DFLASH. A DFLASH verify
         batch's ``seq_lens`` already carry the draft block, so the graph max_len
-        skips the draft add for it (``_is_dflash_verify``). DeepSeek-V4.1 supports
-        DSpark only.
+        skips the draft add for it (``_is_dflash_verify``).
         """
         if spec_algorithm is None or spec_algorithm.is_none():
             return
+        if not self._dsv4_is_v41_model:
+            return
         # ``is_dflash_family()`` also covers DSpark (the family shares
-        # DFlashVerifyInfo); gate on ``is_dflash()`` so DSpark passes.
-        if spec_algorithm.is_dflash() and self._dsv4_is_v41_model:
+        # DFlashVerifyInfo); gate on ``is_dspark()`` so DSpark passes.
+        if not spec_algorithm.is_dspark():
             raise ValueError(
                 "DeepSeek-V4.1 on NPU supports only DSpark speculative "
                 f"decoding (static mode), got {spec_algorithm!r}."
             )
-        if (
-            self._dsv4_is_v41_model
-            and not spec_algorithm.is_dspark()
-            and read_ragged_verify_mode() is not RaggedVerifyMode.STATIC
-        ):
+        ragged_mode = read_ragged_verify_mode()
+        if ragged_mode is not RaggedVerifyMode.STATIC:
             raise ValueError(
-                "DeepSeek-V4.1 on NPU supports only DSpark speculative"
-                f"decoding(static mode), got {spec_algorithm!r}."
+                "DeepSeek-V4.1 on NPU supports only DSpark speculative "
+                "decoding in static mode (SGLANG_RAGGED_VERIFY_MODE=static), "
+                f"got SGLANG_RAGGED_VERIFY_MODE={ragged_mode.value!r}."
             )
 
     def _validate_draft_window_rows(self) -> None:
