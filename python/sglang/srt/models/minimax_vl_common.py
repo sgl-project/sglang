@@ -763,7 +763,6 @@ class MiniMaxVLVisionModel(nn.Module):
         prefix: str = "",
         multimodal_projector_bias: bool = True,
         patch_merge_bias: bool = True,
-        projector_hidden_act: str = "gelu",
     ) -> None:
         super().__init__()
         self.config = config
@@ -782,7 +781,7 @@ class MiniMaxVLVisionModel(nn.Module):
         self.multi_modal_projector = MiniMaxVLMultiModalProjector(
             vision_hidden_size=config.hidden_size,
             text_hidden_size=text_hidden_size,
-            projector_hidden_act=projector_hidden_act,
+            projector_hidden_act=getattr(config, "projector_hidden_act", "gelu"),
             multimodal_projector_bias=multimodal_projector_bias,
             projector_hidden_size=projector_hidden_size,
             quant_config=quant_config,
@@ -797,7 +796,7 @@ class MiniMaxVLVisionModel(nn.Module):
         self.patch_merge_mlp = MiniMaxVLPatchMerger(
             spatial_merge_size=spatial_merge_size,
             text_hidden_size=text_hidden_size,
-            projector_hidden_act=projector_hidden_act,
+            projector_hidden_act=getattr(config, "projector_hidden_act", "gelu"),
             patch_merge_bias=patch_merge_bias,
             projector_hidden_size=projector_hidden_size,
             quant_config=quant_config,

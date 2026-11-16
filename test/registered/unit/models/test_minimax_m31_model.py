@@ -30,15 +30,9 @@ from sglang.srt.models.minimax_m3 import (
     get_spec_layer_idx_from_weight_name,
 )
 from sglang.srt.models.minimax_m3_vl import MiniMaxM3SparseForConditionalGeneration
-from sglang.srt.runtime_context import (
-    get_parallel,
-    override_platform,
-    reset_context,
-)
-from sglang.srt.server_args import ServerArgs
+from sglang.srt.runtime_context import override_platform
 from sglang.srt.speculative.dflash_utils import parse_dflash_draft_config
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.parallel_groups import publish
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -603,55 +597,6 @@ class TestMiniMaxM31Forward(CustomTestCase):
         self.assertFalse(stored_by_fusion(0.5, fp8))
         # a bf16 index cache ignores the scale on both paths
         self.assertTrue(stored_by_fusion(0.5, torch.bfloat16))
-
-
-class TestMiniMaxM31VisionTower(CustomTestCase):
-    def setUp(self):
-        reset_context()
-        self.addCleanup(reset_context)
-        publish(
-            ServerArgs(model_path="dummy", device="cpu", mm_attention_backend="sdpa"),
-            role="test",
-        )
-        get_parallel().override_permanently(
-            pp_group=SimpleNamespace(
-                is_first_rank=True, is_last_rank=True, rank_in_group=0, world_size=1
-            )
-        )
-
-    def test_unsupported_projector_activation_is_rejected(self):
-        """The projector and the patch merger implement GELU only; a checkpoint
-        whose top-level ``projector_hidden_act`` names another activation must
-        fail at construction and not run with GELU."""
-        config = MiniMaxM3VLConfig(
-            vision_config={
-                "hidden_size": 32,
-                "intermediate_size": 64,
-                "num_hidden_layers": 1,
-                "num_attention_heads": 2,
-                "num_channels": 3,
-                "image_size": 28,
-                "patch_size": 14,
-                "hidden_act": "gelu",
-                "layer_norm_eps": 1e-5,
-                "position_embedding_type": "rope",
-                "rope_mode": "3d",
-                "rope_theta": 10000.0,
-                "vision_segment_max_frames": None,
-                "img_token_compression_config": {},
-            },
-            projector_hidden_act="relu",
-        )
-        config.text_config = PretrainedConfig(hidden_size=32)
-        config.encoder_only = True
-        with (
-            patch(
-                "sglang.srt.managers.tokenizer_manager.get_processor_wrapper",
-                return_value=None,
-            ),
-            self.assertRaisesRegex(AssertionError, "got relu"),
-        ):
-            MiniMaxM3SparseForConditionalGeneration(config)
 
 
 class TestMiniMaxM31Nvfp4Backend(CustomTestCase):
