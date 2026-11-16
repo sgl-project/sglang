@@ -406,6 +406,14 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
                             weight_block_size,
                             torch.bfloat16,
                         )
+                elif _is_npu:
+                    # NPU MLA BMMs consume BF16 derived weights with scales applied.
+                    w = block_quant_dequant(
+                        weight,
+                        weight_scale,
+                        weight_block_size,
+                        torch.bfloat16,
+                    )
                 else:
                     w, scale = block_quant_to_tensor_quant(
                         weight, weight_scale, weight_block_size
@@ -535,6 +543,8 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
             self.config.q_lora_rank is not None
         )
         cached_a_proj = {} if fuse_qkv_a_proj else None
+        cached_indexer_weights_proj = {}
+        indexer_weights_proj_name = "model.mtp.layers.0.self_attn.indexer.weights_proj"
 
         nextn_layer_prefix = "model.layers.0"
         nextn_spec_weight_names = [
@@ -581,7 +591,9 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
             weight_names_mapping.update(
                 {
                     "model.mtp.layers.0.self_attn.indexer.wq_b.weight": "layers.0.self_attn.indexer.wq_b.weight",
+                    "model.mtp.layers.0.self_attn.indexer.wq_b.weight_scale_inv": "layers.0.self_attn.indexer.wq_b.weight_scale_inv",
                     "model.mtp.layers.0.self_attn.indexer.wk.weight": "layers.0.self_attn.indexer.wk.weight",
+                    "model.mtp.layers.0.self_attn.indexer.wk.weight_scale_inv": "layers.0.self_attn.indexer.wk.weight_scale_inv",
                     "model.mtp.layers.0.self_attn.indexer.k_norm.weight": "layers.0.self_attn.indexer.k_norm.weight",
                     "model.mtp.layers.0.self_attn.indexer.weights_proj.weight": "layers.0.self_attn.indexer.weights_proj.weight",
                 }
@@ -593,6 +605,33 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
             for name, loaded_weight in weights:
                 if ".mtp." not in name:
                     continue
+                if _is_npu and name.startswith(indexer_weights_proj_name + "."):
+                    suffix = name.removeprefix(indexer_weights_proj_name + ".")
+                    if suffix == "weight_scale_inv" or (
+                        suffix == "weight"
+                        and loaded_weight.dtype
+                        in (
+                            torch.float8_e4m3fn,
+                            torch.float8_e4m3fnuz,
+                        )
+                    ):
+                        # The NPU indexer keeps weights_proj in FP32, including
+                        # when the MTP checkpoint serializes it as block-FP8.
+                        cached_indexer_weights_proj[suffix] = loaded_weight
+                        if not {"weight", "weight_scale_inv"}.issubset(
+                            cached_indexer_weights_proj
+                        ):
+                            continue
+                        loaded_weight = block_quant_dequant(
+                            cached_indexer_weights_proj["weight"],
+                            cached_indexer_weights_proj["weight_scale_inv"],
+                            self.quant_config.weight_block_size,
+                            params_dict[
+                                "model.decoder.self_attn.indexer.weights_proj.weight"
+                            ].dtype,
+                        )
+                        cached_indexer_weights_proj.clear()
+                        name = indexer_weights_proj_name + ".weight"
                 if name in weight_names_mapping:
                     name = weight_names_mapping[name]
                 if name.startswith("layers.0"):
@@ -724,6 +763,11 @@ class LongcatFlashForCausalLMNextN(LongcatFlashForCausalLM):
                         )
             for future in concurrent.futures.as_completed(futures):
                 future.result()
+        if cached_indexer_weights_proj:
+            raise ValueError(
+                "Incomplete FP8 MTP indexer.weights_proj checkpoint: "
+                "both weight and weight_scale_inv are required"
+            )
         self.post_load_weights()
 
 
