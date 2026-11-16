@@ -55,7 +55,9 @@ def _make_batch() -> tuple[Req, ScheduleBatch]:
     req.kv.kv_committed_len = 2
 
     batch = ScheduleBatch(reqs=[req])
-    batch.token_to_kv_pool_allocator = SimpleNamespace(storage=None)
+    batch.token_to_kv_pool_allocator = SimpleNamespace(
+        storage=None, state=SimpleNamespace(tracks_decode_state=True)
+    )
     batch.tree_cache = SimpleNamespace(
         page_size=TRACK_INTERVAL, supports_mamba=lambda: False
     )
@@ -295,7 +297,8 @@ class TestMambaLazyBoundaryWithoutSlot(unittest.TestCase):
         batch.token_to_kv_pool_allocator = SimpleNamespace(
             storage=storage,
             state=SimpleNamespace(
-                slots=SimpleNamespace(slots_fit=lambda count: count <= int(took))
+                slots=SimpleNamespace(slots_fit=lambda count: count <= int(took)),
+                tracks_decode_state=True,
             ),
         )
         return req, batch

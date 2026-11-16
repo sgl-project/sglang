@@ -21,8 +21,13 @@ for mod in (
     "torch_npu",
     "torch_npu.contrib",
     "sgl_kernel_npu",
+    "sgl_kernel_npu.operators",
+    "sgl_kernel_npu.operators.attention",
+    "sgl_kernel_npu.operators.indexer",
+    "sgl_kernel_npu.operators.mem_cache",
     "sgl_kernel_npu.attention",
     "sgl_kernel_npu.attention.sinks_attention",
+    "sgl_kernel_npu.kvcacheio",
     "sgl_kernel_npu.norm",
     "sgl_kernel_npu.norm.add_rmsnorm_bias",
     "sglang.srt.speculative",
@@ -80,6 +85,10 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
 )
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_req_to_token_pool import (
     DSV4ReqToTokenTablesMixin,
+)
+
+_BACKEND_NPU_OPS = (
+    "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.npu_attention_ops"
 )
 
 
@@ -752,33 +761,23 @@ class TestArch35SparseAttentionDispatch(unittest.TestCase):
         "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35"
     )
 
+    @patch(_BACKEND_NPU_OPS)
     @patch(_ARCH35_PATCH_TARGET, return_value=True)
-    def test_arch35_uses_kv_quant_ops_and_layout_kwargs(self, _):
-        with patch("torch.ops.custom", MagicMock(), create=True) as custom_ops:
-            metadata_op, attention_op = _sparse_attn_ops()
-            kwargs = _sparse_attn_kv_quant_kwargs()
-
-        self.assertIs(
-            metadata_op, custom_ops.npu_kv_quant_sparse_attn_sharedkv_metadata
-        )
-        self.assertIs(attention_op, custom_ops.npu_kv_quant_sparse_attn_sharedkv)
+    def test_arch35_uses_kv_quant_ops_and_layout_kwargs(self, _, ops):
+        metadata_op, attn_op = _sparse_attn_ops()
+        self.assertIs(metadata_op, ops.mixed_quant_sparse_flash_mla_metadata)
+        self.assertIs(attn_op, ops.mixed_quant_sparse_flash_mla)
         self.assertEqual(
-            kwargs,
-            {"kv_quant_mode": 1, "tile_size": 64, "rope_head_dim": 64},
+            _sparse_attn_kv_quant_kwargs(), {"quant_mode": 1, "rope_head_dim": 64}
         )
 
+    @patch(_BACKEND_NPU_OPS)
     @patch(_ARCH35_PATCH_TARGET, return_value=False)
-    def test_pre_arch35_keeps_legacy_ops_without_quant_kwargs(self, _):
-        with (
-            patch("torch.ops.custom", MagicMock(), create=True) as custom_ops,
-            patch("torch.ops.npu", MagicMock(), create=True) as npu_ops,
-        ):
-            metadata_op, attention_op = _sparse_attn_ops()
-            kwargs = _sparse_attn_kv_quant_kwargs()
-
-        self.assertIs(metadata_op, custom_ops.npu_sparse_attn_sharedkv_metadata)
-        self.assertIs(attention_op, custom_ops.npu_sparse_attn_sharedkv)
-        self.assertEqual(kwargs, {})
+    def test_pre_arch35_uses_the_smla_pair_without_quant_kwargs(self, _, ops):
+        metadata_op, attn_op = _sparse_attn_ops()
+        self.assertIs(metadata_op, ops.sparse_flash_mla_metadata)
+        self.assertIs(attn_op, ops.sparse_flash_mla)
+        self.assertEqual(_sparse_attn_kv_quant_kwargs(), {})
 
 
 class TestSparseAttentionMetadata(unittest.TestCase):
@@ -790,20 +789,21 @@ class TestSparseAttentionMetadata(unittest.TestCase):
         cu_seqlens_q = torch.tensor([0, 2, 3], dtype=torch.int32)
         seqused_kv = torch.tensor([8, 12], dtype=torch.int32)
 
-        for is_arch35, metadata_op_name in (
-            (False, "npu_sparse_attn_sharedkv_metadata"),
-            (True, "npu_kv_quant_sparse_attn_sharedkv_metadata"),
-        ):
+        for is_arch35 in (False, True):
             with (
                 self.subTest(is_arch35=is_arch35),
                 patch(self._ARCH35_PATCH_TARGET, return_value=is_arch35),
-                patch("torch.ops.custom", MagicMock(), create=True) as custom_ops,
-                patch("torch.ops.npu", MagicMock(), create=True),
+                patch(_BACKEND_NPU_OPS) as ops,
             ):
                 backend = DeepseekV4AscendAttnBackend.__new__(
                     DeepseekV4AscendAttnBackend
                 )
-                backend.forward_metadata = SimpleNamespace()
+                backend.forward_metadata = SimpleNamespace(
+                    ori_sparse_indices=None,
+                    ori_mask_mode=4,
+                    ori_win_left=127,
+                    ori_win_right=0,
+                )
                 backend._is_dspark_draft_worker = False
                 backend._dsv4_sliding_window_size = 128
                 backend._dsv4_q_head_num = 64
@@ -821,32 +821,27 @@ class TestSparseAttentionMetadata(unittest.TestCase):
                     actual_seq_lengths_kv=seqused_kv,
                 )
 
-                metadata_op = getattr(custom_ops, metadata_op_name)
+                metadata_op = (
+                    ops.mixed_quant_sparse_flash_mla_metadata
+                    if is_arch35
+                    else ops.sparse_flash_mla_metadata
+                )
                 self.assertEqual(metadata_op.call_count, 3)
                 for call in metadata_op.call_args_list:
-                    self.assertIs(call.kwargs["cu_seqlens_q"], cu_seqlens_q)
-                    self.assertIs(call.kwargs["seqused_kv"], seqused_kv)
+                    self.assertIs(call.kwargs["seqused_ori_kv"], seqused_kv)
 
-    def test_dspark_host_metadata_receives_host_sequence_lengths(self):
-        cu_seqlens_q = torch.tensor([0, 2, 3], dtype=torch.int32)
+    def test_dspark_metadata_uses_the_sparse_dialect(self):
+        cu_seqlens_q = torch.tensor([0, 2, 4], dtype=torch.int32)
         seqused_kv = torch.tensor([8, 12], dtype=torch.int32)
-        cu_seqlens_q_cpu = cu_seqlens_q.clone()
-        seqused_kv_cpu = seqused_kv.clone()
 
         metadata_op = MagicMock()
-        with (
-            patch("torch.ops.npu", MagicMock(), create=True),
-            patch(
-                "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._sparse_attn_ops",
-                return_value=(metadata_op, MagicMock()),
-            ),
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend._sparse_attn_ops",
+            return_value=(metadata_op, MagicMock()),
         ):
             backend = DeepseekV4AscendAttnBackend.__new__(DeepseekV4AscendAttnBackend)
-            backend.forward_metadata = SimpleNamespace(
-                actual_seq_lengths_q_pa_cpu=cu_seqlens_q_cpu,
-                seq_lens_cpu_int=seqused_kv_cpu,
-            )
-            backend._is_dspark_draft_worker = True
+            backend.forward_metadata = SimpleNamespace()
+            backend._is_dspark_draft_block = lambda _fb: True
             backend._dsv4_sliding_window_size = 128
             backend._dsv4_q_head_num = 64
             backend._dsv4_kv_head_num = 1
@@ -854,19 +849,35 @@ class TestSparseAttentionMetadata(unittest.TestCase):
             backend._dsv4_has_c4 = False
             backend._dsv4_has_c128 = False
 
-            kernel_metadata = backend._kernel_metadata_from_parts(
+            forward_batch = SimpleNamespace(
+                spec_info=SimpleNamespace(draft_token_num=2),
+                seq_lens=seqused_kv,
+                out_cache_loc=torch.zeros(4, dtype=torch.int64),
+            )
+            backend._init_dspark_sparse_metadata(forward_batch)
+            backend._kernel_metadata_from_parts(
                 bs=2,
                 actual_seq_lengths_q_pa=cu_seqlens_q,
                 actual_seq_lengths_kv=seqused_kv,
             )
 
+        fm = backend.forward_metadata
+        # Trailing window then the draft block, -1 padded; window+2 topk each.
+        torch.testing.assert_close(
+            fm.ori_sparse_indices[2, 0, :14], torch.arange(14, dtype=torch.int32)
+        )
+        torch.testing.assert_close(
+            fm.ori_topk_length.flatten(),
+            torch.tensor([10, 10, 14, 14], dtype=torch.int32),
+        )
         metadata_op.assert_called_once()
-        self.assertIs(kernel_metadata["c1a_metadata"], metadata_op.return_value)
-        self.assertIs(metadata_op.call_args.kwargs["cu_seqlens_q"], cu_seqlens_q_cpu)
-        actual_seqused_kv = metadata_op.call_args.kwargs["seqused_kv"]
-        torch.testing.assert_close(actual_seqused_kv, seqused_kv_cpu[:2])
-        self.assertEqual(actual_seqused_kv.dtype, torch.int32)
-        self.assertEqual(actual_seqused_kv.device.type, "cpu")
+        kwargs = metadata_op.call_args.kwargs
+        self.assertEqual(kwargs["ori_mask_mode"], 0)
+        self.assertEqual(kwargs["ori_topk"], 256)
+        self.assertIs(kwargs["ori_topk_length"], fm.ori_topk_length)
+        self.assertIs(kwargs["seqused_ori_kv"], seqused_kv)
+        self.assertEqual(kwargs["ori_win_left"], 129)
+        self.assertNotIn("seqused_kv", kwargs)
 
 
 class TestGetKvIndices(unittest.TestCase):
@@ -1023,6 +1034,14 @@ class TestStepOutCacheLoc(unittest.TestCase):
 
 
 class TestCompressorEpilogEmptyWrite(unittest.TestCase):
+    def setUp(self):
+        probe = patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.is_npu_arch35",
+            return_value=False,
+        )
+        probe.start()
+        self.addCleanup(probe.stop)
+
     @staticmethod
     def _backend(*, loc, graph_mode=False):
         backend = CompressorAscendBackendMixin.__new__(CompressorAscendBackendMixin)
@@ -1079,11 +1098,15 @@ class TestCompressorEpilogEmptyWrite(unittest.TestCase):
     def test_all_slots_masked_skips_fused_indexer_write(self):
         backend = self._backend(loc=torch.zeros(3, dtype=torch.int32))
         compressor = self._compressor(li_kv_dtype="float8", is_in_indexer=True)
-        with patch("torch.ops.custom", MagicMock(), create=True) as custom_ops:
+        quant_cache = MagicMock()
+        with patch(
+            "sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend.npu_cache_ops.indexer_quant_cache",
+            quant_cache,
+        ):
             backend._compressor_epilog_npu(
                 compressor, torch.zeros(3, 512), self._verify_batch()
             )
-        custom_ops.indexer_compress_epilog.assert_not_called()
+        quant_cache.assert_not_called()
 
 
 if __name__ == "__main__":
