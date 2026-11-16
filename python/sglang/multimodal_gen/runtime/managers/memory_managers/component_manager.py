@@ -672,7 +672,7 @@ class ComponentResidencyManager:
 
                 self._debug_requests_seen = getattr(self, "_debug_requests_seen", 0) + 1
                 log_host_memory_breakdown(
-                    self.placement_modules(),
+                    self.pipeline.modules,
                     label=f"after request {self._debug_requests_seen}",
                 )
         self._prefetch_next_request()
