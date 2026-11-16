@@ -325,9 +325,6 @@ class NanbeigeModel(nn.Module):
         # For EAGLE3 / DFLASH: capture *before* unrolled layer id (ids already +1'd).
         self.layers_to_capture = []
 
-    def get_input_embedding(self, input_ids):
-        return self.embed_tokens(input_ids)
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -439,9 +436,6 @@ class NanbeigeForCausalLM(nn.Module):
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=True)
         # For EAGLE3 support
         self.capture_aux_hidden_states = False
-
-    def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
-        return self.model.get_input_embedding(input_ids)
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens

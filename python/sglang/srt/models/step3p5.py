@@ -624,12 +624,6 @@ class Step3p5Model(nn.Module):
         else:
             self.norm = PPMissingLayer(return_tuple=True)
 
-    def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
-        if hasattr(self.config, "scale_emb"):
-            return self.get_input_embeddings()(input_ids) * self.config.scale_emb
-        else:
-            return self.get_input_embeddings()(input_ids)
-
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
