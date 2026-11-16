@@ -23,6 +23,9 @@ after the partials' loads.
 K_a and K_b tile rows on their slowest grid axis: up to _ROW_TILE rows a call runs one BM = next_pow2(rows) tile,
 above that tiles of _ROW_TILE rows, so every row goes through the arithmetic of a single-tile call.
 The per-device workspace is reused by every seam; seams on one stream run in order, so it needs no clearing.
+The row window takes decode batches and extends of any length, so the kernels do not specialize on M. The first call
+compiles every tile configuration; extends and batches past the captured graph sizes would otherwise compile some of them
+while serving.
 """
 
 from __future__ import annotations
@@ -80,7 +83,7 @@ def _hc_combine_apply_kernel(
     tl.store(out_ptr + offs, tl.fma(a, y, r).to(out_ptr.dtype.element_ty), mask=mask)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _hc_seam_down_kernel(
     M,
     y_ptr,
@@ -252,7 +255,7 @@ def _gate_row(
     )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _hc_seam_reduce_kernel(
     M,
     p_ptr,
@@ -341,7 +344,7 @@ def _hc_seam_reduce_kernel(
                 )
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["M"])
 def _hc_seam_up_kernel(
     M,
     t_ptr,
@@ -457,7 +460,7 @@ def hc_gated_combine(
     return out
 
 
-def hc_seam(
+def _seam(
     y: Optional[torch.Tensor],
     residual: torch.Tensor,
     gate_prev: Optional[torch.Tensor],
@@ -467,11 +470,6 @@ def hc_seam(
     w_inject_next: Optional[torch.Tensor],
     eps: float,
 ):
-    """Combine (when ``y`` is given) + norm + low-rank gated mix (+ the next combine's gate).
-
-    Returns (residual_new, mixed [M, HS] bf16, gate_new fp32 [M, HC] or None). Inputs must be contiguous bf16;
-    ``gate_prev`` fp32 [M, HC]. At most MAX_ROWS rows.
-    """
     rows = residual.shape[0]
     if rows > MAX_ROWS:
         raise ValueError(f"hc_seam: {rows} rows, the workspace holds 1..{MAX_ROWS}")
@@ -561,3 +559,50 @@ def hc_seam(
         num_warps=KB_WARPS_BM32 if bm == 32 else KB_WARPS,
     )
     return r_new, mixed, gate_new
+
+
+_warmed: set = set()
+
+
+def _warm_up(residual, norm_w, w_down, w_up, eps):
+    """Run every tile configuration once on zeros: BM 16 / 32 / 64 (the last with row gates) x combine x gate."""
+    device = residual.device
+    _warmed.add(device)
+    w_inject = torch.zeros((HC, HC * HS), dtype=w_down.dtype, device=device)
+    for rows in (16, 32, KF_ROW_GATES):
+        r = torch.zeros((rows, HC * HS), dtype=residual.dtype, device=device)
+        y = torch.zeros((rows, HS), dtype=residual.dtype, device=device)
+        gate = torch.zeros((rows, HC), dtype=torch.float32, device=device)
+        for combine in (True, False):
+            for inject in (w_inject, None):
+                _seam(
+                    y if combine else None,
+                    r,
+                    gate if combine else None,
+                    norm_w,
+                    w_down,
+                    w_up,
+                    inject,
+                    eps,
+                )
+
+
+def hc_seam(
+    y: Optional[torch.Tensor],
+    residual: torch.Tensor,
+    gate_prev: Optional[torch.Tensor],
+    norm_w: torch.Tensor,
+    w_down: torch.Tensor,
+    w_up: torch.Tensor,
+    w_inject_next: Optional[torch.Tensor],
+    eps: float,
+):
+    """Combine (when ``y`` is given) + norm + low-rank gated mix (+ the next combine's gate).
+
+    Returns (residual_new, mixed [M, HS] bf16, gate_new fp32 [M, HC] or None). Inputs must be contiguous bf16;
+    ``gate_prev`` fp32 [M, HC]. At most MAX_ROWS rows.
+    """
+    # Not inside a capture: the warm-up's launches would be recorded into the graph.
+    if residual.device not in _warmed and not torch.cuda.is_current_stream_capturing():
+        _warm_up(residual, norm_w, w_down, w_up, eps)
+    return _seam(y, residual, gate_prev, norm_w, w_down, w_up, w_inject_next, eps)

@@ -1,4 +1,6 @@
+import importlib
 import sys
+from collections import defaultdict
 
 import pytest
 import torch
@@ -102,6 +104,38 @@ def test_fused_combine_equals_separate_combine(rows):
     _, mixed, gate = hc_seam(None, r_split, None, *w)
     for a, b in zip(fused, (r_split, mixed, gate)):
         assert torch.equal(a, b)
+
+
+def test_first_call_compiles_every_tile_config_once(monkeypatch):
+    """The first call compiles all 12 tile configurations (down 6, reduce 3, up 3), and
+    no later row count, decode or extend, compiles another."""
+    mod = importlib.import_module("sglang.kernels.ops.gemm.hc_seam")
+    kernels = (
+        mod._hc_seam_down_kernel,
+        mod._hc_seam_reduce_kernel,
+        mod._hc_seam_up_kernel,
+    )
+    for k in kernels:
+        monkeypatch.setattr(k, "device_caches", defaultdict(k.create_binder))
+    monkeypatch.setattr(mod, "_warmed", set())
+    device = torch.cuda.current_device()
+
+    def variants():
+        return [len(k.device_caches[device][0]) for k in kernels]
+
+    gen = torch.Generator(device="cuda").manual_seed(0)
+    s = _stage(gen)
+    w = (s["norm_w"], s["w_down"], s["w_up"])
+
+    y, r, gate_prev = _activations(gen, 1)
+    hc_seam(y, r, gate_prev, *w, s["w_inject"], EPS)
+    assert variants() == [6, 3, 3]
+    for rows in (1, 2, 16, 17, 33, 64, 129, 137, 160, 193):
+        y, r, gate_prev = _activations(gen, rows)
+        hc_seam(y, r, gate_prev, *w, s["w_inject"], EPS)
+        hc_seam(None, r, None, *w, s["w_inject"], EPS)
+        hc_seam(None, r, None, *w, None, EPS)
+    assert variants() == [6, 3, 3]
 
 
 def _gated_residual(s, **kwargs):
