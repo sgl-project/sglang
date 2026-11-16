@@ -126,9 +126,12 @@ def validate_mamba_extra_buffer(view, hf_config: Any, *, mamba_cache_chunk_size_
         "extra_buffer requires platform support for Mamba cache state snapshots."
     )
     if view.mamba_radix_cache_strategy == "extra_buffer_lazy":
-        # The PD-disagg decode pool is not wired for lazy slots.
-        assert view.disaggregation_mode == "null", (
-            "extra_buffer_lazy unsupported under PD disaggregation; use "
+        # The PD-disagg decode pool is not wired for lazy slots. A PD prefill worker
+        # tracks only chunked-prefill boundaries, where each boundary donates its slot
+        # to the radix tree and takes a fresh one before the next chunk is scheduled,
+        # so the single preallocated tracking slot is never overwritten in flight.
+        assert view.disaggregation_mode != "decode", (
+            "extra_buffer_lazy unsupported on a PD decode worker; use "
             "--mamba-radix-cache-strategy extra_buffer."
         )
         # eagle/ngram/dspark/dflash all verify through
