@@ -53,7 +53,6 @@ from sglang.srt.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import is_hip
 
 expert_distribution_recorder = ExpertDistributionRecorder()
 
@@ -784,14 +783,9 @@ class HunYuanMoEV1ForCausalLM(nn.Module):
             if not isinstance(self.model.layers[layer_idx], nn.Identity):
                 layer_self_attn = self.model.layers[layer_idx].self_attn
 
-            if is_hip():
-                # The scaling factor convention we are assuming is
-                # quantized_value * scaling_factor ~= true_value
-                # which is consistent with the practice of setting
-                # scaling_factor = tensor_amax / FPtype_max
-                scaling_factor *= 2
-            if hasattr(layer_self_attn, "kv_scale"):
-                layer_self_attn.attn._kv_scale = scaling_factor
+            if hasattr(layer_self_attn.attn, "k_scale"):
+                layer_self_attn.attn.k_scale = scaling_factor
+                layer_self_attn.attn.v_scale = scaling_factor
             else:
                 raise RuntimeError(
                     "Self attention has no KV cache scaling factor attribute!"
