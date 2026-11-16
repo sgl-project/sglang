@@ -38,6 +38,15 @@ def cpu_profile(**kwargs):
 
 class TestDiffusionProfiler(unittest.TestCase):
     def setUp(self):
+        # SRT mutates members of the shared pybind enum, not just public aliases.
+        # __members__ retains the native values required by Kineto's C++ bindings.
+        self.enterContext(
+            patch.multiple(
+                torch_profiler.ProfilerActivity,
+                CPU=torch_profiler.ProfilerActivity.__members__["CPU"],
+                CUDA=torch_profiler.ProfilerActivity.__members__["CUDA"],
+            )
+        )
         self.directory = self.enterContext(tempfile.TemporaryDirectory(dir=Path.cwd()))
         self.npu_platform = self.enterContext(
             patch.object(profiler_module.current_platform, "is_npu", return_value=True)
@@ -148,16 +157,27 @@ class TestDiffusionProfiler(unittest.TestCase):
             "diffusion_profiler_tests", __file__
         )
         module = importlib.util.module_from_spec(spec)
+        patched_cpu, patched_cuda = object(), object()
         with (
             patch.object(torch.profiler, "profile", object()),
             patch.object(torch.profiler, "schedule", object()),
+            patch.object(torch_profiler.ProfilerActivity, "CPU", patched_cpu),
+            patch.object(torch_profiler.ProfilerActivity, "CUDA", patched_cuda),
         ):
             spec.loader.exec_module(module)
-            schedule = module.TORCH_SCHEDULE(wait=0, warmup=1, active=1, repeat=1)
-            with module.FakeNPUProfile(schedule=schedule) as profiler:
-                profiler.step()
-                torch.ones(1).add_(1)
-                profiler.step()
+            # Re-enter the fixture after SRT-style in-place enum patches.
+            fixture = module.TestDiffusionProfiler()
+            try:
+                fixture.setUp()
+                schedule = module.TORCH_SCHEDULE(wait=0, warmup=1, active=1, repeat=1)
+                with module.FakeNPUProfile(schedule=schedule) as profiler:
+                    profiler.step()
+                    torch.ones(1).add_(1)
+                    profiler.step()
+            finally:
+                fixture.doCleanups()
+            self.assertIs(torch_profiler.ProfilerActivity.CPU, patched_cpu)
+            self.assertIs(torch_profiler.ProfilerActivity.CUDA, patched_cuda)
         profiler.prof_if.analyse.assert_not_called()
         self.assertTrue(profiler.events())
 
