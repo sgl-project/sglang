@@ -1730,17 +1730,7 @@ class MiniCPMV:
     ) -> None:
         super().__init__()
 
-        # 4.6+ carry their own ``model_type`` instead of a numeric
-        # ``config.version``; older versionless configs keep the legacy
-        # ``(2, 6)`` default.
-        model_type = getattr(config, "model_type", None)
-        if model_type in _MODEL_TYPE_VERSIONS:
-            version = _MODEL_TYPE_VERSIONS[model_type]
-        elif not hasattr(config, "version"):
-            version = (2, 6)
-        else:
-            version = str(config.version).split(".")
-            version = tuple([int(x) for x in version])
+        version = get_version_by_config(config)
         # Dispatch class based on version
         instance_class = _SUPPORT_VERSION.get(version)
         if instance_class is None:
