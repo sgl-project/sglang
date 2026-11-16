@@ -331,6 +331,25 @@ class TestReasonerGrammarBackend(CustomTestCase):
         )
         return XGrammarGrammarBackend(tokenizer, len(vocab)), tokenizer
 
+    def test_strict_thinking_without_a_grammar_masks_cpu_logits(self):
+        """A strict-thinking request with no grammar masks through the backend.
+        That path must apply its mask to CPU logits like a grammar object
+        does: the MLX runner builds its mask rows on the CPU."""
+        backend, tokenizer = self._make_xgrammar_backend()
+        reasoner = ReasonerGrammarBackend(
+            backend, self._make_parser(), tokenizer, enable_strict_thinking=True
+        )
+        strict = reasoner.init_strict_reasoning_grammar(reasoning=True)
+        mask = strict.allocate_vocab_mask(backend.vocab_size, 1, "cpu")
+        strict.fill_vocab_mask(mask, 0)
+        logits = torch.zeros(1, backend.vocab_size)
+
+        strict.apply_vocab_mask(logits, mask)
+
+        # "<tool_call>" is excluded while thinking; the tokenizer is byte-level.
+        self.assertEqual(logits[0, ord("<")].item(), float("-inf"))
+        self.assertEqual(logits[0, ord("x")].item(), 0.0)
+
     def _vocab_mask(self, grammar, vocab_size):
         mask = torch.full((1, (vocab_size + 31) // 32), -1, dtype=torch.int32)
         grammar.fill_vocab_mask(mask, 0)
