@@ -307,7 +307,7 @@ class TinyDSV4ModelConfig:
             ],
             candidate_source_layer_id=-1,
             candidate_topk_blocks=0,
-            candidate_block_size=0,
+            candidate_block_size=1,
             model_type="deepseek_v41",
         )
         self.hf_config.get_text_config = lambda: self.hf_config
