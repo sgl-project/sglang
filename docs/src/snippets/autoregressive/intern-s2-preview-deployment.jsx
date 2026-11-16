@@ -154,7 +154,7 @@ export const InternS2PreviewDeployment = () => {
               const isChecked = values[option.name] === item.id;
               const isDisabled = values.hardware === 'xeon' && key !== 'hardware';
               return (
-                  <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}) }}>
+                <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}) }}>
                   <input
                     type="radio"
                     name={option.name}
