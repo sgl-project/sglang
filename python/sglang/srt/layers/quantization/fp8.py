@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
@@ -277,6 +278,9 @@ class Fp8Config(QuantizationConfig):
         # DSV4 mxfp4-packed (True) vs converted FP8 (False); injected by
         # model_loader from ModelConfig. Default False off the DSV4 path.
         self.is_fp4_experts = is_fp4_experts
+        # Routed experts served as MXFP8 while the other layers keep this config's
+        # format; injected by model_loader from ModelConfig.
+        self.is_mxfp8_experts = False
         self.dequant_fp4_to_fp8 = False
         self.is_dsv4_fp4_experts = False
         self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
@@ -386,6 +390,13 @@ class Fp8Config(QuantizationConfig):
             scale_fmt=scale_fmt,
         )
 
+    def _mxfp8_expert_config(self) -> Fp8Config:
+        """This config with MXFP8 weights, for the routed-expert layers only."""
+        expert_config = copy.copy(self)
+        expert_config.use_mxfp8 = True
+        expert_config.weight_block_size = [1, 32]
+        return expert_config
+
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> Optional[QuantizeMethodBase]:
@@ -420,7 +431,9 @@ class Fp8Config(QuantizationConfig):
 
                 return NPUMXFP8OnlineMoEMethod(self)
 
-            fp8_method = Fp8MoEMethod(self)
+            fp8_method = Fp8MoEMethod(
+                self._mxfp8_expert_config() if self.is_mxfp8_experts else self
+            )
 
             if self.is_fp4_experts and self.dequant_fp4_to_fp8:
                 assert get_moe_runner_backend().is_auto(), (
