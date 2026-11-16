@@ -213,7 +213,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                     device=self.device,
                 )
                 self.k_scale_buffer = list(self._hicache_k_scale_buffer.unbind(0))
-                # HiCache mirrors dynamic K scales. Static V scales stay on the NPU.
+                # With None, HiCache falls back to get_kv_size_bytes(), counting NPU-only static V scales.
                 self.host_capacity_bytes = (
                     self._hicache_k_buffer.nbytes
                     + self._hicache_v_buffer.nbytes
