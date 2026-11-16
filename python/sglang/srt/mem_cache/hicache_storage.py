@@ -556,6 +556,9 @@ class HiCacheStorage(ABC):
     def clear(self) -> None:
         pass
 
+    def close(self) -> None:
+        pass
+
     def get_stats(self):
         return None
 
