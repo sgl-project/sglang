@@ -133,7 +133,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     "--ep-num-redundant-experts",
     16,
     "--dp-size",
-    4,
+    16,
     "--optimistic-prefill-attempts",
     1,
     "--json-model-override-args",
