@@ -52,6 +52,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
 )
 from sglang.srt.runtime_context import get_disagg, get_exec
 
+
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -211,8 +212,8 @@ class MambaComponent(TreeComponent):
         # Full KV may extend beyond the latest reusable Mamba state. The branching
         # point is the last Mamba-cache-chunk-aligned position within the Full-KV hit
         # that lies beyond the current Mamba boundary. With HiCache, incremental
-        # persistence of a new branching state is currently write-through only;
-        # write-back eviction may discard the device-only state.
+        # persistence of a new branching state is eager only for write-through;
+        # write-back preserves it when its device slot is evicted.
         branching_seqlen = branching_checkpoint_depth(
             result.full_kv_hit_length, mamba_boundary_len, self.mamba_checkpoint_grid
         )
@@ -639,11 +640,12 @@ class MambaComponent(TreeComponent):
             self.tree_core.enable_hicache
             and self.tree_core.is_write_back
             and cd.host_value is None
-            and not x.backuped
             and x.component_data[BASE_COMPONENT_TYPE].value is not None
         ):
             # Keep the state live until the controller has attempted its host
-            # backup. Session cursors advance after the resumed tombstone.
+            # backup, including on a node whose Full KV is already backed up
+            # (backuped covers Full KV only). Session cursors advance after
+            # the resumed tombstone.
             return InternalStateBackup(node_id=x.id, num_tokens=1)
         self.tree_core._evict_component_and_detach_lru(
             x,
