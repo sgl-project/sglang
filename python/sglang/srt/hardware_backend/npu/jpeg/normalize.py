@@ -1,7 +1,13 @@
-"""Round odd SOF0 dimensions within the existing 4:2:0 MCU grid.
+"""Prepare odd-sized JPEG headers for the even-sized JPEGD/VPC NV12 path.
 
-Only a private JPEGD input copy changes; entropy data and request bytes remain
-intact. The RGB result is cropped back to the original valid dimensions.
+This is encoded-header preparation, not model pixel normalization. Baseline
+4:2:0 JPEGs encode 16x16-pixel minimum coded units (MCUs). Rounding an odd width
+or height up by one stays within its existing MCU grid, so the compressed scan
+data need not change. Only a private copy's SOF0 dimensions are rewritten;
+VPCJPEGDecoder crops the RGB output back to the original valid dimensions.
+
+The caller must first validate the input with inspect_jpeg. These helpers do
+not make progressive JPEGs or other sampling formats supported.
 """
 
 import struct
@@ -14,7 +20,14 @@ class UnsupportedSOF(ValueError):
 def inspect_420_sof(
     data: bytes | bytearray | memoryview, width: int, height: int
 ) -> int:
-    """Return the SOF0 height-field offset, without decoding or copying pixels."""
+    """Validate baseline 8-bit 4:2:0 headers and locate their dimension fields.
+
+    Walk length-delimited markers up to the frame header, check its dimensions
+    against Pillow's metadata, and require Y22/Cb11/Cr11 sampling. Return the
+    height-field offset (width follows it), without decoding pixels. Valid but
+    unsupported frame types raise UnsupportedSOF; malformed headers raise
+    ValueError rather than silently entering the PIL fallback.
+    """
     if data[:2] != b"\xff\xd8":
         raise ValueError("SOF normalization requires JPEG SOI")
     position = 2
@@ -84,6 +97,13 @@ def inspect_420_sof(
 def normalize_420_sof(
     data: bytes | bytearray | memoryview, width: int, height: int
 ) -> bytes | bytearray | memoryview:
+    """Prepare even decode dimensions while preserving the caller's JPEG bytes.
+
+    Already-even inputs retain their storage. Otherwise validate the SOF0
+    header, copy the encoded buffer, and round only its width/height fields up
+    by one. The caller retains the original dimensions for the final RGB crop.
+    Eligibility checks belong to inspect_jpeg, including for the even fast path.
+    """
     if not (width % 2 or height % 2):
         return data
     offset = inspect_420_sof(data, width, height)

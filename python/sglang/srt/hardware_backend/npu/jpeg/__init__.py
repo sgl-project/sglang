@@ -81,7 +81,7 @@ def _decoder(device):
             _ensure_cleanup_context(device)
             previous[1].close()
             del _live[id(previous[1])]
-        from sglang.srt.hardware_backend.npu.jpeg.vpc import VPCJPEGDecoder
+        from sglang.srt.hardware_backend.npu.jpeg.dvpp import VPCJPEGDecoder
 
         decoder = VPCJPEGDecoder(device)
         _live[id(decoder)] = _Entry(weakref.ref(threading.current_thread()), decoder)

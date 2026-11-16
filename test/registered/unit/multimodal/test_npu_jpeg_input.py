@@ -346,6 +346,21 @@ class TestNpuJpegInput(unittest.TestCase):
         factory.assert_called_once_with(1)
         self.assertEqual(observed, [(True, bytes(encoded.tolist()), 1)])
 
+    def test_decoder_factory_import_and_reuse(self):
+        # Exercise the real factory after moving VPC into dvpp.py. Only hardware
+        # construction is mocked; the lazy import and per-thread reuse are real.
+        package = "sglang.srt.hardware_backend.npu.jpeg"
+        with (
+            patch.dict(sys.modules, {package + ".dvpp": self.dvpp}),
+            patch.object(self.dvpp, "VPCJPEGDecoder") as constructor,
+            patch.object(self.jpeg, "_local", threading.local()),
+            patch.object(self.jpeg, "_live", {}),
+        ):
+            decoder = self.jpeg._decoder(1)
+            self.assertIs(decoder, constructor.return_value)
+            self.assertIs(self.jpeg._decoder(1), decoder)
+            constructor.assert_called_once_with(1)
+
     def test_public_default_device_and_failure_restore(self):
         data = _encoded_tensor(_jpeg())
         for device, target in (("npu", 3), ("npu:1", 1)):
