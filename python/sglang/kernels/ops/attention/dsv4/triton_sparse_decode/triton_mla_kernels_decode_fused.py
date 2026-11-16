@@ -1637,11 +1637,10 @@ def fused_gather_attn_decode_dsv4_dual_scope(
     topk_length_extra: Optional[torch.Tensor] = None,
     attn_sink: Optional[torch.Tensor] = None,
     s_q: int = 1,
-    force_no_splitk: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """
-    Fused gather+dequant+attention for DSV4 with dual scope (main + extra).
-    Uses Split-K optimization for large total_topk (>= SPLITK_TOPK_THRESHOLD).
+    Fused gather+dequant+attention for DSV4 with dual scope (main + extra), without
+    split-K. The split-K path is fused_gather_attn_decode_dsv4_dual_scope_low_overhead.
 
     Args:
         q: Query tensor [total_tokens, h_q, d_qk]
@@ -1656,9 +1655,6 @@ def fused_gather_attn_decode_dsv4_dual_scope(
         topk_length_extra: Optional per-batch topk length for extra [b]
         attn_sink: Optional attention sink values [h_q]
         s_q: Sequence length per batch
-        force_no_splitk: If True, skip split-K and use the non-splitk kernel
-            directly. Used by the dispatch layer for large batch prefill where
-            the non-splitk fused kernel avoids intermediate buffer allocation.
 
     Returns:
         output: Attention output [total_tokens, h_q, d_v]
@@ -1667,7 +1663,6 @@ def fused_gather_attn_decode_dsv4_dual_scope(
     total_tokens, h_q, d_qk = q.shape
     topk_main = indices_main.shape[1]
     topk_extra = indices_extra.shape[1]
-    total_topk = topk_main + topk_extra
     d_v = DSV4_D_V
     device = q.device
 
@@ -1698,163 +1693,6 @@ def fused_gather_attn_decode_dsv4_dual_scope(
         or kv_cache_size_extra > BUFFER_OPS_DISABLE_THRESHOLD
     )
 
-    split_k = (
-        0
-        if force_no_splitk
-        else _decide_splitk_dual_scope(total_tokens, h_q, total_topk)
-    )
-    if split_k > 0:
-        topk_per_split = (total_topk + split_k - 1) // split_k
-
-        partial_output = torch.empty(
-            split_k, total_tokens, h_q, d_v, dtype=torch.float32, device=device
-        )
-        partial_lse = torch.empty(
-            split_k, total_tokens, h_q, dtype=torch.float32, device=device
-        )
-        output = torch.empty(
-            total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device
-        )
-        lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
-
-        topk_length_main_tensor = (
-            topk_length_main if topk_length_main is not None else lse[:1, 0]
-        )
-        topk_length_extra_tensor = (
-            topk_length_extra if topk_length_extra is not None else lse[:1, 0]
-        )
-        attn_sink_tensor = attn_sink if attn_sink is not None else lse[0, :]
-
-        grid_splitk = lambda meta: (
-            triton.cdiv(h_q, meta["BLOCK_H"]),
-            total_tokens,
-            split_k,
-        )
-
-        def run_splitk_kernel():
-            _fused_gather_attn_dsv4_dual_scope_splitk_kernel[grid_splitk](
-                q,
-                kv_flat_main,
-                indices_main,
-                topk_length_main_tensor,
-                kv_flat_extra,
-                indices_extra,
-                topk_length_extra_tensor,
-                partial_output,
-                partial_lse,
-                sm_scale,
-                total_tokens,
-                _bucket_total_tokens(total_tokens),
-                h_q,
-                topk_main,
-                num_blocks_main,
-                block_size_main,
-                topk_extra,
-                num_blocks_extra,
-                block_size_extra,
-                s_q,
-                topk_per_split,
-                q.stride(0),
-                q.stride(1),
-                q.stride(2),
-                stride_kv_block_main,
-                stride_kv_block_extra,
-                indices_main.stride(0),
-                indices_main.stride(1),
-                indices_extra.stride(0),
-                indices_extra.stride(1),
-                partial_output.stride(0),
-                partial_output.stride(1),
-                partial_output.stride(2),
-                partial_output.stride(3),
-                partial_lse.stride(0),
-                partial_lse.stride(1),
-                partial_lse.stride(2),
-                HAS_TOPK_LENGTH_MAIN=topk_length_main is not None,
-                HAS_TOPK_LENGTH_EXTRA=topk_length_extra is not None,
-            )
-
-        if disable_buffer_ops:
-            with triton.knobs.amd.scope():
-                triton.knobs.amd.use_buffer_ops = False
-                run_splitk_kernel()
-        else:
-            run_splitk_kernel()
-
-        # Use appropriate combine kernel based on split_k
-        if split_k == 8:
-            grid_combine = lambda meta: (
-                total_tokens,
-                triton.cdiv(h_q, meta["BLOCK_H"]),
-            )
-            _combine_splitk_kernel_8_optimized[grid_combine](
-                partial_output,
-                partial_lse,
-                attn_sink_tensor,
-                output,
-                lse,
-                total_tokens,
-                _bucket_total_tokens(total_tokens),
-                h_q,
-                d_v,
-                partial_output.stride(0),
-                partial_output.stride(1),
-                partial_output.stride(2),
-                partial_output.stride(3),
-                partial_lse.stride(0),
-                partial_lse.stride(1),
-                partial_lse.stride(2),
-                output.stride(0),
-                output.stride(1),
-                output.stride(2),
-                lse.stride(0),
-                lse.stride(1),
-                HAS_ATTN_SINK=attn_sink is not None,
-            )
-        else:
-            BLOCK_H_COMBINE = 16
-            BLOCK_D_COMBINE = 128
-            grid_combine = (total_tokens, triton.cdiv(h_q, BLOCK_H_COMBINE))
-
-            if split_k == 2:
-                combine_kernel = _combine_splitk_kernel_2
-            elif split_k == 4:
-                combine_kernel = _combine_splitk_kernel
-            else:
-                raise ValueError(f"Unsupported split_k: {split_k}")
-
-            combine_kernel[grid_combine](
-                partial_output,
-                partial_lse,
-                attn_sink_tensor,
-                output,
-                lse,
-                total_tokens,
-                _bucket_total_tokens(total_tokens),
-                h_q,
-                d_v,
-                partial_output.stride(0),
-                partial_output.stride(1),
-                partial_output.stride(2),
-                partial_output.stride(3),
-                partial_lse.stride(0),
-                partial_lse.stride(1),
-                partial_lse.stride(2),
-                output.stride(0),
-                output.stride(1),
-                output.stride(2),
-                lse.stride(0),
-                lse.stride(1),
-                HAS_ATTN_SINK=attn_sink is not None,
-                BLOCK_H=BLOCK_H_COMBINE,
-                BLOCK_D=BLOCK_D_COMBINE,
-                num_warps=4,
-                num_stages=1,
-            )
-
-        return output, lse
-
-    # Use original kernel for smaller total_topk
     output = torch.empty(total_tokens, h_q, d_v, dtype=torch.bfloat16, device=device)
     lse = torch.empty(total_tokens, h_q, dtype=torch.float32, device=device)
 
@@ -2848,7 +2686,6 @@ def fused_gather_attn_decode_dsv4_dual_scope_low_overhead(
             topk_length_extra,
             attn_sink,
             s_q,
-            force_no_splitk=True,
         )
 
     topk_per_split = (total_topk + split_k - 1) // split_k
