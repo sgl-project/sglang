@@ -280,6 +280,53 @@ class TestHiSparseSpec(CustomTestCase):
         _assert_output_matches_tokens(state, out, top_k_tokens)
         self.assertEqual(int(state.swap_state.scratch_state[0, 0].item()), 782)
 
+    def test_copies_cross_step_unique_misses_over_8192_occurrences(self) -> None:
+        # Eight steps of top-2048 span a 16384-slot scratch-union table, so
+        # hash positions need more than 13 bits.
+        hot_size, page_size = 4096, 64
+        num_steps, top_k, item_words = 8, 2048, 72
+        total_occurrences = num_steps * top_k
+        state = _make_state(
+            num_reqs=1,
+            hot_buffer_size=hot_size,
+            page_size=page_size,
+            scratch_size=hot_size,
+            seq_len=32768,
+            item_words=item_words,
+            metadata_occurrences=total_occurrences,
+        )
+
+        steps = []
+        next_miss = hot_size
+        step_miss_count = 196
+        for step_idx in range(num_steps):
+            hits = torch.roll(
+                torch.arange(hot_size, dtype=torch.int32, device=DEVICE),
+                step_idx * 137,
+            )[: top_k - step_miss_count]
+            misses = torch.arange(
+                next_miss,
+                next_miss + step_miss_count,
+                dtype=torch.int32,
+                device=DEVICE,
+            )
+            next_miss += step_miss_count
+            steps.append(torch.cat((hits, misses)))
+        top_k_tokens = torch.stack(steps).unsqueeze(0).contiguous()
+        seq_lens = torch.full((num_steps,), 32768, dtype=torch.int32, device=DEVICE)
+        out = _run_swap(
+            top_k_tokens=top_k_tokens,
+            seq_lens=seq_lens,
+            state=state,
+        )
+        torch.cuda.synchronize()
+
+        _assert_output_matches_tokens(state, out, top_k_tokens)
+        self.assertEqual(
+            int(state.swap_state.scratch_state[0, 0].item()),
+            num_steps * step_miss_count,
+        )
+
     def test_records_union_plan_for_shared_layer_io(self) -> None:
         hot_size, page_size = 4096, 64
         num_steps, top_k, item_words = 4, 2048, 72
@@ -570,7 +617,7 @@ class TestHiSparseSpec(CustomTestCase):
             item_words=1,
             metadata_occurrences=8192,
         )
-        with self.assertRaisesRegex(ValueError, "2-4 steps"):
+        with self.assertRaisesRegex(ValueError, "2-8 steps"):
             _run_swap(
                 top_k_tokens=torch.zeros(
                     (1, 1, 2048), dtype=torch.int32, device=DEVICE

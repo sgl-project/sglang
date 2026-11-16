@@ -85,7 +85,7 @@ def _run(cls, *, hisparse=False):
     streamer.stream_output.side_effect = lambda *args: log.append("send")
     hisparse_coordinator = (
         SimpleNamespace(
-            request_finished=lambda req: log.append(("hisparse_finished", req.rid)),
+            release_request=lambda req: log.append(("hisparse_finished", req.rid)),
             admit_request_into_staging=lambda req: log.append(("admit", req.rid)),
         )
         if hisparse
@@ -150,7 +150,7 @@ class TestFlushPrefill(CustomTestCase):
         self.assertEqual(log, ["free_group_begin", SEND, *KV_CALLS, "free_group_end"])
 
     def test_hisparse_calls_are_queued_in_row_order(self):
-        # The order the loop used to run them in, each request_finished just before
+        # The order the loop used to run them in, each release_request just before
         # its row's release.
         kv_calls = [
             ("hisparse_finished", "r0"),

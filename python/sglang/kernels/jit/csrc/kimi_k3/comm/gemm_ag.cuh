@@ -22,7 +22,7 @@ namespace sglang {
 
 namespace gemm_ag {
 
-using device::distributed::Counter;
+using device::distributed::EpochCounter;
 // 16B vector = 4 packed bf16 pairs; +0.0 in a pair word is the "not arrived" marker
 using Lamport = device::distributed::LamportTrait<bf16_t, 16 / sizeof(bf16_t), /*kAtom=*/4>;
 
@@ -34,9 +34,9 @@ constexpr uint32_t kSpinVec = 16 / sizeof(bf16_t);  // 8 bf16 (16B) per consumer
 // Producer: per-rank column-slice GEMV, multicast store with Lamport markers.
 
 struct ProducerParams {
-  uint8_t* ws_mc;       // multicast VA of the push workspace base
-  Counter* counter;     // per-block phase counters (READ only here)
-  uint32_t half_bytes;  // bytes per phase half (world_size * slot_bytes)
+  uint8_t* ws_mc;         // multicast VA of the push workspace base
+  EpochCounter* counter;  // the push plane's phase word (READ only here)
+  uint32_t half_bytes;    // bytes per phase half (world_size * slot_bytes)
   uint32_t rank;
 };
 
@@ -72,11 +72,8 @@ __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
   }
 
   PDLWaitPrimary<kUsePDL>();
-  // Every push-workspace consumer flips the WHOLE counter array each round
-  // (each has a tail loop up to num_counters), so all counters hold the same
-  // phase at this point and counter[0] is equivalent to counter[bx]. Reading a
-  // single counter is what frees the producer grid from the counter array size.
-  const uint32_t phase = params.counter[0].get() & 1;
+  // The paired consumer commits this round's phase; the producer only reads it.
+  const uint32_t phase = params.counter->load();
 
   vec_t input_vec[M];
 #pragma unroll
@@ -128,8 +125,7 @@ __global__ __launch_bounds__(K / kVecSize) void gemm_ag_gemv_kernel(
 
 struct ConsumerParams {
   uint8_t* ws_local;      // LOCAL VA of the push workspace base (poll + reset)
-  Counter* counter;       // per-block phase counters (read + flip)
-  uint32_t num_counters;  // full counter array size (PushPlane::num_blocks)
+  EpochCounter* counter;  // the push plane's phase word (read + commit)
   uint32_t half_bytes;    // bytes per phase half (world_size * slot_bytes)
   const bf16_t* b;        // [M, N]
   const bf16_t* c;        // may be null
@@ -172,9 +168,8 @@ SGL_DEVICE void spin_add3_vec(const ConsumerParams& params, uint8_t* half, uint3
   zero.store(src);
 }
 
-// The grid is bound to the counter array (one work block per counter slot plus
-// the cleanup block), so larger batches widen the block (host side) and then
-// stride over the output.
+// The grid is capped at the push plane's launch width, so larger batches widen
+// the block (host side) and then stride over the output.
 template <uint32_t N, uint32_t kWorld, bool kHasC, bool kUsePDL>
 __global__ __launch_bounds__(kMaxSpinBlock) void spin_add3_kernel(const __grid_constant__ ConsumerParams params) {
   using namespace device;
@@ -182,29 +177,18 @@ __global__ __launch_bounds__(kMaxSpinBlock) void spin_add3_kernel(const __grid_c
   static_assert((N / kWorld) % kSpinVec == 0, "a vector must never cross a rank block");
   const auto bx = blockIdx.x;
   const auto tx = threadIdx.x;
-  const uint32_t phase = params.counter[bx].get() & 1;
+  const uint32_t phase = params.counter->load();
 
   PDLTriggerSecondary<kUsePDL>();
 
-  // use the last block to clean up: it flips ITS OWN counter and every one
-  // past the grid (work blocks flip [0, num_blocks - 1) themselves)
-  if (const auto num_blocks = gridDim.x; bx == num_blocks - 1) {
-    [[unlikely]];
-    __syncthreads();  // ensure phase is ready for all threads
-    for (uint32_t i = num_blocks - 1 + tx; i < params.num_counters; i += blockDim.x) {
-      params.counter[i].set(phase ^ 1);
-    }
-    return void();  // this block is done, no output to write
-  }
-
   // Deliberately NO PDLWaitPrimary: the dependency is carried through data
   const auto half = params.ws_local + phase * params.half_bytes;
-  const uint32_t stride = (gridDim.x - 1) * blockDim.x * kSpinVec;
+  const uint32_t stride = gridDim.x * blockDim.x * kSpinVec;
   for (uint32_t elem = (bx * blockDim.x + tx) * kSpinVec; elem < params.num_rows * N; elem += stride) {
     spin_add3_vec<N, kWorld, kHasC>(params, half, elem);
   }
-  __syncthreads();
-  if (tx == 0) params.counter[bx].set(phase ^ 1);
+  __syncthreads();  // every thread has read the phase before this block commits
+  if (tx == 0) params.counter->commit();
 }
 
 // Gather of a precomputed column slice (the GEMM path for larger M): every
@@ -230,19 +214,9 @@ __global__ __launch_bounds__(kMaxSpinBlock) void gather_add3_kernel(const __grid
   const auto tx = threadIdx.x;
 
   PDLWaitPrimary<kUsePDL>();  // the slice GEMM (and the previous push-plane round)
-  const uint32_t phase = consumer.counter[bx].get() & 1;
+  const uint32_t phase = consumer.counter->load();
 
-  if (const auto num_blocks = gridDim.x; bx == num_blocks - 1) {
-    [[unlikely]];
-    PDLTriggerSecondary<kUsePDL>();
-    __syncthreads();
-    for (uint32_t i = num_blocks - 1 + tx; i < consumer.num_counters; i += blockDim.x) {
-      consumer.counter[i].set(phase ^ 1);
-    }
-    return void();
-  }
-
-  const uint32_t stride = (gridDim.x - 1) * blockDim.x * kSpinVec;
+  const uint32_t stride = gridDim.x * blockDim.x * kSpinVec;
   const uint32_t first = (bx * blockDim.x + tx) * kSpinVec;
   // this rank's block of the phase half's dense [world][M][N / world] prefix
   const auto dst = params.ws_mc + phase * consumer.half_bytes +
@@ -260,8 +234,8 @@ __global__ __launch_bounds__(kMaxSpinBlock) void gather_add3_kernel(const __grid
   for (uint32_t elem = first; elem < consumer.num_rows * N; elem += stride) {
     spin_add3_vec<N, kWorld, kHasC>(consumer, half, elem);
   }
-  __syncthreads();
-  if (tx == 0) consumer.counter[bx].set(phase ^ 1);
+  __syncthreads();  // every thread has read the phase before this block commits
+  if (tx == 0) consumer.counter->commit();
 }
 
 }  // namespace gemm_ag
@@ -280,10 +254,7 @@ struct GEMMAGKernel {
   // mean TPOT): 8 -> grid 112, 8.36 ms; 4 -> 224, 8.29 ms; 2 -> 448, 8.21 ms.
   // Standalone GEMV at the same shape: 4.15 / 3.20 / 2.56 us, and 16 -> 4.42 us,
   // so the trend is monotonic and 2 is the floor (the epilogue stores column
-  // pairs, so N_SPLIT must stay even). 8 used to be the largest grid that fit
-  // the old kNumProducerBlocks <= push.num_blocks bound; the producer now reads
-  // a single phase counter, so the grid is free and 112 blocks did not even
-  // fill one per SM.
+  // pairs, so N_SPLIT must stay even).
   static constexpr uint32_t N_SPLIT = 2;
   static constexpr uint32_t kNLocal = N / kWorld;
   static constexpr uint32_t kGemvBlock = K / gemm_ag::kVecSize;
@@ -314,12 +285,9 @@ struct GEMMAGKernel {
         << "staging slice exceeds the push slot size " << push.slot_bytes;
     CHECK_HOST(2 * kWorld * push.slot_bytes <= std::numeric_limits<uint32_t>::max())
         << "push plane exceeds the 32-bit offset range";
-    // one work block per counter slot at most, plus the cleanup block
-    CHECK_HOST(push.num_blocks >= 2) << "needs a work block and a counter-update block";
     return gemm_ag::ConsumerParams{
         .ws_local = push.workspaces[push.rank],
         .counter = push.counter,
-        .num_counters = push.num_blocks,
         .half_bytes = static_cast<uint32_t>(push.slot_bytes * push.world_size),
         .b = static_cast<const bf16_t*>(b.data_ptr()),
         .c = c.has_value() ? static_cast<const bf16_t*>(c.value().data_ptr()) : nullptr,
@@ -328,17 +296,17 @@ struct GEMMAGKernel {
     };
   }
 
-  // {grid, block}: at most one work block per counter slot plus the cleanup
-  // block; widen the block before striding, as each stride is a serial spin.
+  // {grid, block}: at most the push plane's launch width in blocks; widen the
+  // block before striding, as each stride is a serial spin.
   static std::pair<uint32_t, uint32_t>
   consumer_shape(const host::distributed::PushPlaneObj& push, uint32_t num_tokens) {
     const uint32_t num_vecs = num_tokens * N / gemm_ag::kSpinVec;
-    const uint32_t max_work_blocks = push.num_blocks - 1;
+    const uint32_t max_blocks = push.default_blocks;
     uint32_t block = gemm_ag::kSpinBlock;
-    while (block < gemm_ag::kMaxSpinBlock && host::div_ceil(num_vecs, block) > max_work_blocks) {
+    while (block < gemm_ag::kMaxSpinBlock && host::div_ceil(num_vecs, block) > max_blocks) {
       block *= 2;
     }
-    return {std::min<uint32_t>(host::div_ceil(num_vecs, block), max_work_blocks) + 1, block};
+    return {std::min<uint32_t>(host::div_ceil(num_vecs, block), max_blocks), block};
   }
 
   static void
@@ -359,8 +327,7 @@ struct GEMMAGKernel {
     const auto num_tokens = static_cast<uint32_t>(M.unwrap());
     CHECK_HOST(num_tokens >= 1 && num_tokens <= kMaxM);
     const auto params = consumer_params(push, num_tokens, b, c, out);
-    // producer: GEMV. Its grid is not bound to the counter array: it reads only
-    // counter[0] (see gemm_ag_gemv_kernel).
+    // producer: GEMV
     const auto producer_params = gemm_ag::ProducerParams{
         .ws_mc = push.mc_workspace,
         .counter = push.counter,

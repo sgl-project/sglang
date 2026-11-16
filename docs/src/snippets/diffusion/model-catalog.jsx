@@ -4,6 +4,12 @@ export const DiffusionModelCatalog = ({ category }) => {
   const MODEL_CATALOG = {
   image: [
     {
+      name: "MiniMax-H3-Image",
+      modelIds: ["MiniMaxAI/MiniMax-H3-Image"],
+      cookbook: "/cookbook/diffusion/MiniMax/MiniMax-H3-Image",
+      note: "Six-step PDD text-to-image and image editing.",
+    },
+    {
       name: "MOSS-Image",
       modelIds: ["OpenMOSS-Team/MOSS-Image-Base", "OpenMOSS-Team/MOSS-Image-SFT"],
       cookbook: "/cookbook/diffusion/OpenMOSS/MOSS-Image",
@@ -350,6 +356,14 @@ export const DiffusionModelCatalog = ({ category }) => {
       name: "FLUX 3 Action",
       modelIds: ["black-forest-labs/flux-3-action-droid"],
       cookbook: "/cookbook/vla/FLUX/FLUX-3-Action",
+    },
+    {
+      name: "Praxis-1",
+      modelIds: [
+        "runwayml/praxis-1-droid-lerobot",
+        "runwayml/praxis-1-yam-lerobot",
+      ],
+      cookbook: "/cookbook/vla/Runway/Praxis-1",
     },
     {
       name: "LingBotWorld",

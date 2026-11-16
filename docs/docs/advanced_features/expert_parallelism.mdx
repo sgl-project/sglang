@@ -164,7 +164,7 @@ This design supports multiple backends via `--moe-a2a-backend` and `--moe-runner
 [input_hidden_states]
           |
           v
-     TopK.forward -> select_experts / triton_kernels.routing / bypass
+     TopK.forward -> select_experts / bypass
           |
           v
      [TopKOutput]

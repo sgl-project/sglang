@@ -1,4 +1,7 @@
 import ast
+import json
+import logging
+import math
 import threading
 import warnings
 from json import JSONDecodeError, JSONDecoder
@@ -7,9 +10,13 @@ from typing import Any, Dict, Iterable, List, Literal, Optional, Tuple, Union
 
 import orjson
 import partial_json_parser
+from jsonschema import Draft202012Validator
 from partial_json_parser.core.options import Allow
+from referencing import Registry
 
 from sglang.srt.entrypoints.openai.protocol import Tool, ToolChoice
+
+logger = logging.getLogger(__name__)
 
 _STANDARD_JSON_SCHEMA_TYPES = {
     "null",
@@ -448,6 +455,43 @@ def infer_type_from_json_schema(schema: Dict[str, Any]) -> Optional[str]:
         return "array"
 
     return None
+
+
+def _parse_finite_float(value: str) -> float:
+    number = float(value)
+    if not math.isfinite(number):
+        raise ValueError("Non-finite JSON number")
+    return number
+
+
+def convert_string_union_value(
+    value: str, schema: Any, root_schema: Optional[dict] = None
+) -> Any:
+    """Decode a string-typed ``anyOf``/``oneOf`` value to its object/array when it
+    validates against ``schema``; local ``$ref``s resolve against ``root_schema``."""
+    if not (
+        isinstance(schema, dict)
+        and ("anyOf" in schema or "oneOf" in schema)
+        and value.lstrip().startswith(("{", "["))
+    ):
+        return value
+    try:
+        decoded = json.loads(
+            value,
+            parse_constant=_parse_finite_float,
+            parse_float=_parse_finite_float,
+        )
+        if isinstance(decoded, (dict, list)) and Draft202012Validator(
+            root_schema if root_schema is not None else schema,
+            registry=Registry(),
+        ).evolve(schema=schema).is_valid(decoded):
+            return decoded
+    except Exception as exc:
+        logger.debug(
+            "Structured union conversion failed (%s); preserving the original string.",
+            type(exc).__name__,
+        )
+    return value
 
 
 def get_json_schema_constraint(

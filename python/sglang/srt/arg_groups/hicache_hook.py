@@ -39,6 +39,11 @@ def handle_hicache(server_args: Any):
     ):
         raise ValueError("--enable-linker-mla-dedup requires the Mooncake linker.")
     if cfg.enable_unified_cache_external_linker:
+        if cfg.pp_size > 1:
+            raise ValueError(
+                "--enable-unified-cache-external-linker does not support "
+                "pipeline parallelism; use --pp-size 1."
+            )
         if cfg.disable_radix_cache or cfg.radix_cache_backend is not None:
             raise ValueError(
                 "--enable-unified-cache-external-linker requires the default "

@@ -6,6 +6,7 @@ all storage RPCs issued by the hybrid controller carry request/caller metadata
 in ``HiCacheStorageExtraInfo.extra_info``.
 """
 
+import threading
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -31,6 +32,7 @@ def _hybrid_ctrl(page_size=2):
     ctrl = HybridCacheController.__new__(HybridCacheController)
     ctrl.page_size = page_size
     ctrl.storage_backend = MagicMock()
+    ctrl.storage_stop_event = threading.Event()
     return ctrl
 
 

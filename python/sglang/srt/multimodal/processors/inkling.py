@@ -40,6 +40,7 @@ from sglang.srt.multimodal.inkling import (
 from sglang.srt.multimodal.media_io import (
     CLIENT_MEDIA_EXCEPTIONS,
     download_remote_media,
+    media_url_timeout,
 )
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
@@ -87,7 +88,7 @@ def _resolve_media_item(item):
                 base64.b64decode(payload) if ";base64" in header else payload.encode()
             )
         if url.startswith(("http://", "https://")):
-            return download_remote_media(url, timeout=30)
+            return download_remote_media(url, timeout=media_url_timeout(30))
     except CLIENT_MEDIA_EXCEPTIONS as e:
         url_str = url
         if len(url_str) > 100:
