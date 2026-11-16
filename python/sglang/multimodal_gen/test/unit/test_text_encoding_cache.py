@@ -209,8 +209,8 @@ def test_cache_stores_only_consumed_text_conditioning(output_type, device, monke
 
 @torch.no_grad()
 def test_encode_text_applies_per_call_tokenizer_overrides():
-    """Per-call padding / truncation must reach the tokenizer; they used to be
-    accepted and dropped, so the call ran with the config's tokenizer kwargs."""
+    """Per-call padding / truncation must reach the tokenizer and override the
+    config's tokenizer kwargs."""
     config = make_text_config()
     config.text_encoder_configs = [
         SimpleNamespace(tokenizer_kwargs={"padding": "longest", "truncation": True})

@@ -259,8 +259,7 @@ class ServerArgsAutoTuner:
         )
         all_resident = self._keeps_all_components_resident()
         if all_resident or (
-            min_available_gb is not None
-            and min_available_gb >= disable_threshold_gb
+            min_available_gb is not None and min_available_gb >= disable_threshold_gb
         ):
             changed = []
             components = set(

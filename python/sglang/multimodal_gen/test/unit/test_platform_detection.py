@@ -278,10 +278,6 @@ class TestDiffusionPlatformPlugins(unittest.TestCase):
             platforms.resolve_current_platform_cls_qualname()
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 def test_use_aiter_accepts_every_declared_boolean_spelling(monkeypatch):
     """SGLANG_USE_AITER is a declared boolean: a spelling that turns AITER on in
     the LLM layers ("yes") must turn it on in the diffusion layers too."""
@@ -299,3 +295,6 @@ def test_use_aiter_accepts_every_declared_boolean_spelling(monkeypatch):
             patched.undo()
             importlib.reload(aiter)
 
+
+if __name__ == "__main__":
+    unittest.main()

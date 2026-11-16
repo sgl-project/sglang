@@ -149,8 +149,8 @@ def test_diffusers_pipeline_add_stage_accepts_both_argument_orders(legacy_order)
 
 
 def test_unknown_sta_mode_reports_the_configured_name():
-    """An unknown STA mode must surface as the enum lookup error; formatting the
-    log message used to raise UnboundLocalError and hide it."""
+    """An unknown STA mode must surface as the enum lookup error that names the
+    configured mode."""
     stage = DenoisingStage.__new__(DenoisingStage)
     server_args = SimpleNamespace(
         attention_backend_config=SimpleNamespace(STA_mode="STA_BOGUS")
