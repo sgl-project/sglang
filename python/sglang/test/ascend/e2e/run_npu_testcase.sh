@@ -6,6 +6,15 @@ if [ ! -f "${sglang_source_path}/${test_case}" ];then
   exit 0
 fi
 
+# Optional single test method ("Class.method") injected as NPU_TEST_METHOD;
+# empty runs every test defined in the test case file.
+test_method="${NPU_TEST_METHOD:-}"
+test_method_args=()
+if [ -n "${test_method}" ]; then
+  echo "Restricting run to test method: ${test_method}"
+  test_method_args=("${test_method}")
+fi
+
 # Leave the image WORKDIR (/sgl-workspace): the sglang repo cloned there can
 # shadow the installed package on sys.path.
 cd "${sglang_source_path}"
@@ -285,10 +294,10 @@ echo "Log path: ${log_path}"
 
 if [ "${TROUBLE_SHOTTING}" = "true" ] || [ "${TROUBLE_SHOTTING}" = "True" ];then
     echo "TROUBLE_SHOTTING=true, the pod will keep alive for four hour."
-    ( ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" 2>&1 || true ) | tee -a "${log_path}/${tc_name}.log"
+    ( ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" "${test_method_args[@]}" 2>&1 || true ) | tee -a "${log_path}/${tc_name}.log"
     sleep 14400
 else
-    ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" 2>&1 | tee -a "${log_path}/${tc_name}.log"
+    ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" "${test_method_args[@]}" 2>&1 | tee -a "${log_path}/${tc_name}.log"
 fi
 echo "Finished test case ${test_case}"
 

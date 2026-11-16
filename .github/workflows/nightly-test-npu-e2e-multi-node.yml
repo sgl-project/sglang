@@ -74,6 +74,11 @@ on:
         type: string
         default: ''
         description: "If 'true', pods import sglang from the image's site-packages instead of the checkout mounted at /root/sglang/python. Empty/false uses the checkout (nightly default)."
+      test_method:
+        required: false
+        type: string
+        default: ''
+        description: "Single test method to run inside test_case, formatted as Class.method. Empty runs every test in the file."
       sgl_router_artifact:
         required: false
         type: string
@@ -262,6 +267,18 @@ jobs:
           esac
           if [ -n "${use_image_sglang}" ]; then
             CMD="${CMD} --use-image-sglang ${use_image_sglang}"
+          fi
+
+          # Restrict the run to one unittest method inside test_case. The value
+          # ends up in the pod's env, so only plain dotted identifiers pass.
+          test_method="${{ inputs.test_method }}"
+          if [ -n "${test_method}" ]; then
+            if ! echo "${test_method}" | grep -Eq '^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$'; then
+              echo "Invalid test_method: ${test_method}"
+              exit 1
+            fi
+            echo "Test method: ${test_method}"
+            CMD="${CMD} --test-method ${test_method}"
           fi
 
           if [ "$prefill_decode_deployment" = "separation" ];then

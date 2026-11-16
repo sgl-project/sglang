@@ -610,6 +610,7 @@ def run_npu_e2e_test_case(
     container_patches: str = "",
     accuracy_dataset: str = "",
     use_image_sglang: str = "false",
+    test_method: str = "",
 ):
     """The method for running a npu e2e test case.
     Args:
@@ -628,6 +629,8 @@ def run_npu_e2e_test_case(
             isolation when multiple runs share the same k8s namespace.
         accuracy_dataset (str): dataset name injected into multi-node pods as
             NPU_ACCURACY_DATASET (gsm8k on weekdays, gpqa_diamond on weekends).
+        test_method (str): single unittest method ("Class.method") injected into
+            pods as NPU_TEST_METHOD; empty runs every test in test_case.
     """
     random_str = get_unique_random_string(16, True)
 
@@ -680,6 +683,7 @@ def run_npu_e2e_test_case(
                 "run_label": run_label,
                 "run_id": run_id,
                 "use_image_sglang": use_image_sglang,
+                "test_method": test_method,
             }
             create_kube_yaml(
                 kube_yaml_template=KUBE_YAML_TEMPLATE.get(kube_job_type),
@@ -705,6 +709,7 @@ def run_npu_e2e_test_case(
                 "run_id": run_id,
                 "accuracy_dataset": accuracy_dataset,
                 "use_image_sglang": use_image_sglang,
+                "test_method": test_method,
             }
             template_key = (
                 KUBE_JOB_MULTI_PD_MIX_GREEN if env == "green" else kube_job_type
@@ -736,6 +741,7 @@ def run_npu_e2e_test_case(
                 "run_id": run_id,
                 "accuracy_dataset": accuracy_dataset,
                 "use_image_sglang": use_image_sglang,
+                "test_method": test_method,
             }
             template_key = (
                 KUBE_JOB_MULTI_PD_SEPARATION_GREEN if env == "green" else kube_job_type
@@ -960,6 +966,15 @@ if __name__ == "__main__":
         "case scripts still come from the mounted source tree.",
     )
 
+    parser.add_argument(
+        "--test-method",
+        type=str,
+        required=False,
+        default="",
+        help="Single unittest method ('Class.method') to run inside the test "
+        "case; empty runs every test in the file.",
+    )
+
     args = parser.parse_args()
 
     docker_image_url = args.image
@@ -979,6 +994,7 @@ if __name__ == "__main__":
     container_patches = args.container_patches
     accuracy_dataset = args.accuracy_dataset
     use_image_sglang = args.use_image_sglang
+    test_method = args.test_method
 
     kube_name_space = args.kube_name_space
     kube_job_type = args.kube_job_type
@@ -1011,4 +1027,5 @@ if __name__ == "__main__":
         container_patches=container_patches,
         accuracy_dataset=accuracy_dataset,
         use_image_sglang=use_image_sglang,
+        test_method=test_method,
     )

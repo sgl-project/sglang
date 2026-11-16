@@ -60,6 +60,9 @@ jobs:
             decode_size: 1
             router_size: 1
             test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py
+            # Only collect the GPQA accuracy result; the file also carries an
+            # L2 host hit-rate case which belongs to the perf series.
+            test_method: TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh.test_npu_deepseek_v4_flash_0731_w8a8_pd_sep_gpqa_high
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
       runner: linux-amd64-cpu-4
@@ -74,6 +77,7 @@ jobs:
       container_patches: ${{ matrix.container_patches || '' }}
       run_start_metadata: ${{ needs.metadata.outputs.run_start_metadata }}
       use_image_sglang: ${{ inputs.use_image_sglang || 'true' }}
+      test_method: ${{ matrix.test_method || '' }}
     secrets: inherit
 
   publish:

@@ -71,6 +71,8 @@ spec:
             value: "{{ container_patches }}"
           - name: SGLANG_USE_IMAGE
             value: "{{ use_image_sglang }}"
+          - name: NPU_TEST_METHOD
+            value: "{{ test_method }}"
           command: ["/bin/bash", "-c"]
           args:
             - |
@@ -198,6 +200,8 @@ spec:
             value: "{{ container_patches }}"
           - name: SGLANG_USE_IMAGE
             value: "{{ use_image_sglang }}"
+          - name: NPU_TEST_METHOD
+            value: "{{ test_method }}"
           command: ["/bin/bash", "-c"]
           args:
             - |
@@ -325,6 +329,8 @@ spec:
             value: "{{ container_patches }}"
           - name: SGLANG_USE_IMAGE
             value: "{{ use_image_sglang }}"
+          - name: NPU_TEST_METHOD
+            value: "{{ test_method }}"
           command: ["/bin/bash", "-c"]
           args:
             - |
