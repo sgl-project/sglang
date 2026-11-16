@@ -29,6 +29,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
 )
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import get_context, publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -68,6 +69,76 @@ class TestDecodeQueueCleanup(CustomTestCase):
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
+    def test_hisparse_resume_reuses_held_row_when_pool_is_full(self):
+        """Recovery must not need a second request row or overwrite retained host slots."""
+        req = FakeReq(
+            rid="held-row",
+            origin_input_ids=[1, 2, 3],
+            output_ids=[4],
+            kv=ReqKvInfo(),
+            is_retracted=True,
+            hisparse_retraction_pending=True,
+        )
+        rows = ReqToTokenPool(
+            size=1, max_context_len=16, device="cpu", enable_memory_saver=False
+        )
+        rows.alloc([req])
+        row = req.kv.req_pool_idx
+        self.assertEqual(rows.available_size(), 0)
+        coordinator = SimpleNamespace(
+            req_to_host_pool=torch.full((2, 16), -1, dtype=torch.int64),
+            req_to_host_pool_allocated_len=torch.tensor([0, 3]),
+            host_token_len=lambda n: n,
+        )
+        coordinator.req_to_host_pool[row, :3] = torch.tensor([20, 21, 22])
+        fenced = []
+
+        def resume(request):
+            self.assertEqual(fenced, ["forward"])
+            request.hisparse_retraction_pending = False
+
+        coordinator.resume_after_retraction = resume
+        queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
+        queue.retracted_queue = IndexedReqList(ListKind.PD_RETRACTED)
+        needs_row = FakeReq(rid="needs-new-row", is_retracted=True)
+        queue.retracted_queue.join([needs_row, req])
+        queue.req_to_token_pool = rows
+        queue.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=1,
+            device="cpu",
+            state=None,
+            alloc_logical_only=lambda **kw: torch.tensor([5, 6, 7]),
+        )
+        queue.tree_cache = SimpleNamespace(maybe_hand_to_session=lambda req: None)
+        queue.scheduler = SimpleNamespace(
+            enable_hisparse=True,
+            enable_overlap=True,
+            schedule_stream=SimpleNamespace(wait_stream=fenced.append),
+            forward_stream="forward",
+            hisparse_coordinator=coordinator,
+        )
+        queue._uses_swa_reservation = lambda: False
+        queue._uses_swa_tail_prealloc = lambda: False
+        queue._window_tails = lambda n: {}
+        queue._allocatable_token_budgets = lambda **kw: 16
+        queue._prealloc_required = lambda req: (3, {})
+        queue._pending_state_slots = lambda req: 0
+        queue._prealloc_demand = lambda *args, **kw: None
+        queue._admit_preallocation = lambda *args, **kw: True
+        self.assertEqual(queue.resume_retracted_reqs(), [req])
+        self.assertEqual(list(queue.retracted_queue), [needs_row])
+        self.assertEqual(rows.available_size(), 0)
+        self.assertEqual(req.kv.req_pool_idx, row)
+        torch.testing.assert_close(
+            rows.req_to_token[row, :3],
+            torch.tensor([5, 6, 7], dtype=rows.req_to_token.dtype),
+        )
+        torch.testing.assert_close(
+            coordinator.req_to_host_pool[row, :3], torch.tensor([20, 21, 22])
+        )
+        self.assertEqual(req.kv.kv_committed_len, 3)
+        self.assertFalse(req.hisparse_retraction_pending)
 
     def test_paged_swa_retraction_resume_uses_physical_page_budget(self):
         # resume_retracted_reqs reads the retraction backend off the disagg

@@ -1359,8 +1359,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if rids_to_check is not None and req.rid not in rids_to_check:
                 continue
 
-            if self.req_to_token_pool.available_size() <= 0:
-                break
+            hisparse_resume = getattr(req, "hisparse_retraction_pending", False)
+            if not hisparse_resume and self.req_to_token_pool.available_size() <= 0:
+                # A later HiSparse request may already own its row.
+                continue
 
             if not ensure_mamba_capacity(
                 self.req_to_token_pool,
@@ -1385,7 +1387,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             resumed_reqs.append(req)
             req.is_retracted = False
-            hisparse_resume = getattr(req, "hisparse_retraction_pending", False)
             self._pre_alloc(req, skip_host_alloc=hisparse_resume)
             full_allocatable_tokens = self._allocatable_token_budgets(
                 count_retracted=False,
@@ -1397,6 +1398,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                     extra_reserved_reqs=len(resumed_reqs),
                 )
 
+            if self.scheduler.enable_overlap:
+                # Restores of retained HiSparse sidecars also write newly
+                # allocated slots that an earlier forward may still use.
+                self.scheduler.schedule_stream.wait_stream(
+                    self.scheduler.forward_stream
+                )
             if hisparse_resume:
                 # HiSparse state-preserving retraction: the retained
                 # req_to_host_pool row already covers every committed token;
@@ -1406,13 +1413,6 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 assert coordinator is not None
                 coordinator.resume_after_retraction(req)
             else:
-                if self.scheduler.enable_overlap:
-                    # A request that finished last step can still have its
-                    # forward in flight, writing slots this request was just
-                    # given.
-                    self.scheduler.schedule_stream.wait_stream(
-                        self.scheduler.forward_stream
-                    )
                 restore_kv_cache(
                     req,
                     self.tree_cache,
