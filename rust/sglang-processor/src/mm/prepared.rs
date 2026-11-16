@@ -3,8 +3,13 @@
 //! [`PreparedInput::check`] validates encoding, shapes, sizes, names, and span
 //! geometry only. Passing that check does **not** admit a profile, modality, or
 //! tensor name for serving, and does **not** perform model-semantic validation,
-//! layout, positions, hashing, or scheduler construction. Existing family
-//! processors remain responsible for semantic import when that hook exists.
+//! layout, positions, hashing, or scheduler construction.
+//!
+//! [`crate::MmProcessor::finish_prepared`] is the generic completion bridge that
+//! turns already-validated canonical
+//! [`ProcessedItem`](dynamo_multimodal::processor::ProcessedItem) values plus a
+//! checked view into [`crate::MmOutput`]. Profile-owned semantic import remains
+//! outside this module; neither API grants automatic prepared serving.
 //!
 //! [`CheckedPreparedInput::decode_tensors`] converts one item's already-checked
 //! little-endian payloads into native [`Tensor`] values. It never picks a "main"
@@ -96,7 +101,9 @@ pub struct PreparedLimits {
 /// **Warning:** existence of this value means only that structural checks
 /// passed (encoding sizes, ranks, names, span geometry, and the supplied
 /// budgets). It does **not** grant semantic safety, processor admission, or
-/// serving support for any family.
+/// serving support for any family. [`crate::MmProcessor::finish_prepared`]
+/// still requires the profile caller to finish model-semantic validation
+/// first; this handle is not a universal external-tensor admission proof.
 #[derive(Clone, Debug)]
 pub struct CheckedPreparedInput<'a> {
     input: PreparedInput<'a>,

@@ -1,11 +1,19 @@
-//! Structural checks only: synthetic tensors, no model downloads or adapters.
+//! Structural checks and the generic finish_prepared bridge: synthetic tensors
+//! plus tiny fixture images, no model downloads or adapters.
 #![cfg(feature = "mm")]
 
+use std::path::{Path, PathBuf};
+
+use serde_json::json;
 use sglang_processor::ProcessorError;
-use sglang_processor::dynamo_multimodal::processor::{Modality, TensorData};
+use sglang_processor::dynamo_multimodal::processor::{
+    Geometry, Modality, NamedTensors, PositionOutput, ProcessedItem, Tensor, TensorData,
+};
+use sglang_processor::dynamo_multimodal::registry::ProcessorSpec;
 use sglang_processor::prepared::{
     PreparedInput, PreparedItem, PreparedLimits, PreparedTensor, TensorDtype, TokenSpan,
 };
+use sglang_processor::{MmOutput, MmProcessor};
 
 const PROFILE: &str = "test-profile";
 const FINGERPRINT: &str = "test-fingerprint";
@@ -331,4 +339,311 @@ fn nonoverlapping_spans_can_interleave_across_items() {
     // Accepting unknown names/modality structurally is deliberately not a model
     // capability, semantic validation, or serving admission.
     assert_eq!(checked.decode_tensors(1).unwrap()[0].0, "arbitrary_name");
+}
+
+/// Actual Qwen processor knobs, used only by finish_prepared tests below.
+fn qwen_spec() -> ProcessorSpec {
+    serde_json::from_value(json!({
+        "family": "qwen_vl",
+        "image_token_id": 151655,
+        "patch_size": 14,
+        "merge_size": 2,
+        "temporal_patch_size": 2,
+        "min_pixels": 3136,
+        "max_pixels": 12845056,
+        "image_mean": [0.48145466, 0.4578275, 0.40821073],
+        "image_std": [0.26862954, 0.26130258, 0.27577711],
+        "resample": "aten_u8"
+    }))
+    .unwrap()
+}
+
+fn mm_fixtures() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/mm_parity/images")
+}
+
+fn clone_tensor(tensor: &Tensor) -> Tensor {
+    Tensor {
+        shape: tensor.shape.clone(),
+        data: match &tensor.data {
+            TensorData::F32(values) => TensorData::F32(values.clone()),
+            TensorData::I64(values) => TensorData::I64(values.clone()),
+            _ => panic!("unexpected tensor dtype in fixture"),
+        },
+    }
+}
+
+fn clone_aux(aux: &NamedTensors) -> NamedTensors {
+    aux.iter()
+        .map(|(name, tensor)| (name.clone(), clone_tensor(tensor)))
+        .collect()
+}
+
+fn assert_tensor_eq(actual: &Tensor, expected: &Tensor) {
+    assert_eq!(actual.shape, expected.shape);
+    match (&actual.data, &expected.data) {
+        (TensorData::F32(a), TensorData::F32(b)) => {
+            assert!(
+                a.iter()
+                    .map(|v| v.to_bits())
+                    .eq(b.iter().map(|v| v.to_bits()))
+            );
+        }
+        (TensorData::I64(a), TensorData::I64(b)) => assert_eq!(a, b),
+        _ => panic!("tensor dtype mismatch"),
+    }
+}
+
+fn assert_aux_eq(actual: &NamedTensors, expected: &[(String, Tensor)]) {
+    assert_eq!(actual.len(), expected.len());
+    for ((a_name, a_tensor), (e_name, e_tensor)) in actual.iter().zip(expected) {
+        assert_eq!(a_name, e_name);
+        assert_tensor_eq(a_tensor, e_tensor);
+    }
+}
+
+fn assert_positions_eq(actual: &PositionOutput, expected: &PositionOutput) {
+    match (actual, expected) {
+        (
+            PositionOutput::MRope {
+                positions: a,
+                delta: da,
+            },
+            PositionOutput::MRope {
+                positions: b,
+                delta: db,
+            },
+        ) => {
+            assert_eq!(a, b);
+            assert_eq!(da, db);
+        }
+        (PositionOutput::Rope1D, PositionOutput::Rope1D) => {}
+        _ => panic!("position scheme mismatch"),
+    }
+}
+
+fn assert_output_payload_eq(actual: &MmOutput, expected: &MmOutput) {
+    assert_eq!(actual.input_ids, expected.input_ids);
+    assert_eq!(actual.offsets, expected.offsets);
+    assert_eq!(actual.items.len(), expected.items.len());
+    for (a, e) in actual.items.iter().zip(&expected.items) {
+        assert_tensor_eq(&a.feature, &e.feature);
+        assert_aux_eq(&a.aux, &e.aux);
+    }
+    assert_positions_eq(&actual.positions, &expected.positions);
+}
+
+fn grid_from_aux(aux: &NamedTensors) -> [u32; 3] {
+    let (_, grid) = aux
+        .iter()
+        .find(|(name, _)| name == "image_grid_thw")
+        .expect("missing image_grid_thw");
+    let TensorData::I64(values) = &grid.data else {
+        panic!("image_grid_thw must be i64");
+    };
+    assert_eq!(values.len(), 3);
+    [values[0] as u32, values[1] as u32, values[2] as u32]
+}
+
+fn image_item(feature_token_count: usize, grid: [u32; 3], feature: Tensor) -> ProcessedItem {
+    ProcessedItem {
+        modality: Modality::Image,
+        feature_token_count,
+        feature,
+        aux: vec![(
+            "image_grid_thw".to_string(),
+            Tensor {
+                shape: vec![3],
+                data: TensorData::I64(grid.iter().map(|&v| v as i64).collect()),
+            },
+        )],
+        geometry: Some(Geometry::Grid(grid)),
+    }
+}
+
+#[test]
+fn finish_prepared_rejects_item_count_span_count_modality_and_multi_span() {
+    let processor = MmProcessor::from_spec(qwen_spec()).unwrap();
+    let bytes = 1f32.to_le_bytes();
+    let tensors = [tensor("pixel_values", &[1], &bytes)];
+    let feature = Tensor {
+        shape: vec![1, 1],
+        data: TensorData::F32(vec![0.5]),
+    };
+
+    let single = [item(&tensors, &[TokenSpan { start: 0, end: 1 }])];
+    let checked = input(&[pad_id()], &single)
+        .check(PROFILE, FINGERPRINT, &limits())
+        .unwrap();
+    rejected(
+        processor.finish_prepared(&checked, vec![]),
+        "canonical item count",
+    );
+    rejected(
+        processor.finish_prepared(
+            &checked,
+            vec![
+                image_item(1, [1, 2, 2], clone_tensor(&feature)),
+                image_item(1, [1, 2, 2], clone_tensor(&feature)),
+            ],
+        ),
+        "canonical item count",
+    );
+    rejected(
+        processor.finish_prepared(
+            &checked,
+            vec![ProcessedItem {
+                modality: Modality::Video,
+                ..image_item(1, [1, 2, 2], clone_tensor(&feature))
+            }],
+        ),
+        "Image only",
+    );
+    let video_input = [PreparedItem {
+        modality: Modality::Video,
+        ..item(&tensors, &[TokenSpan { start: 0, end: 1 }])
+    }];
+    let video_checked = input(&[pad_id()], &video_input)
+        .check(PROFILE, FINGERPRINT, &limits())
+        .unwrap();
+    rejected(
+        processor.finish_prepared(
+            &video_checked,
+            vec![image_item(1, [1, 2, 2], clone_tensor(&feature))],
+        ),
+        "does not match input",
+    );
+    rejected(
+        processor.finish_prepared(
+            &checked,
+            vec![image_item(2, [1, 2, 2], clone_tensor(&feature))],
+        ),
+        "feature_token_count",
+    );
+
+    // Structural check permits multiple spans; finish must reject them.
+    let multi_spans = [item(
+        &tensors,
+        &[
+            TokenSpan { start: 0, end: 1 },
+            TokenSpan { start: 2, end: 3 },
+        ],
+    )];
+    let multi_checked = input(&[pad_id(), 7, pad_id()], &multi_spans)
+        .check(PROFILE, FINGERPRINT, &limits())
+        .unwrap();
+    assert_eq!(multi_checked.input().items[0].spans.len(), 2);
+    rejected(
+        processor.finish_prepared(
+            &multi_checked,
+            vec![image_item(1, [1, 2, 2], clone_tensor(&feature))],
+        ),
+        "exactly one feature span",
+    );
+}
+
+fn pad_id() -> i32 {
+    151655
+}
+
+#[test]
+fn finish_prepared_raw_round_trip_two_unequal_images_matches_except_hash() {
+    let processor = MmProcessor::from_spec(qwen_spec()).unwrap();
+    let tiny = std::fs::read(mm_fixtures().join("tiny_10x10.png")).unwrap();
+    let rgba = std::fs::read(mm_fixtures().join("rgba_80x60.png")).unwrap();
+    assert_ne!(tiny, rgba);
+    let pad = pad_id();
+    let placeholders = [151652, pad, 151653, 151652, pad, 151653, 74785, 13];
+    let raw = processor
+        .process(&placeholders, &[&tiny, &rgba])
+        .expect("raw process");
+    assert_eq!(raw.items.len(), 2);
+    assert_ne!(
+        raw.items[0].feature.shape, raw.items[1].feature.shape,
+        "fixtures must stay unequal so dropped-item bugs are visible"
+    );
+    assert_ne!(raw.items[0].hash, 0);
+    assert_ne!(raw.items[1].hash, 0);
+
+    let payloads: Vec<Vec<u8>> = raw
+        .items
+        .iter()
+        .map(|item| match &item.feature.data {
+            TensorData::F32(values) => values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            _ => panic!("fixture pixels must be float32"),
+        })
+        .collect();
+    let shapes: Vec<Vec<u64>> = raw
+        .items
+        .iter()
+        .map(|item| item.feature.shape.iter().map(|&dim| dim as u64).collect())
+        .collect();
+    let tensors: Vec<_> = payloads
+        .iter()
+        .zip(&shapes)
+        .map(|(data, shape)| [tensor("pixel_values", shape, data)])
+        .collect();
+    let spans: Vec<_> = raw
+        .offsets
+        .iter()
+        .map(|&(start, end)| {
+            [TokenSpan {
+                start,
+                end: end + 1,
+            }]
+        })
+        .collect();
+    let prepared_items: Vec<_> = tensors
+        .iter()
+        .zip(&spans)
+        .map(|(tensors, spans)| item(tensors, spans))
+        .collect();
+    let checked = PreparedInput {
+        profile: PROFILE,
+        processor_fingerprint: FINGERPRINT,
+        input_ids: &raw.input_ids,
+        items: &prepared_items,
+    }
+    .check(
+        PROFILE,
+        FINGERPRINT,
+        &PreparedLimits {
+            max_input_tokens: raw.input_ids.len(),
+            max_tensor_bytes: payloads.iter().map(Vec::len).sum(),
+            ..limits()
+        },
+    )
+    .unwrap();
+
+    // The bridge receives tensors decoded from the actual checked wire bytes,
+    // not clones that bypass transport. Model geometry stays with the fixture.
+    let canonical = raw
+        .items
+        .iter()
+        .zip(&raw.offsets)
+        .enumerate()
+        .map(|(index, (item, &(start, end)))| {
+            let (_, feature) = checked
+                .decode_tensors(index)
+                .unwrap()
+                .into_iter()
+                .next()
+                .unwrap();
+            ProcessedItem {
+                modality: Modality::Image,
+                feature_token_count: (end - start + 1) as usize,
+                feature,
+                aux: clone_aux(&item.aux),
+                geometry: Some(Geometry::Grid(grid_from_aux(&item.aux))),
+            }
+        })
+        .collect();
+    let finished = processor
+        .finish_prepared(&checked, canonical)
+        .expect("finish_prepared");
+    assert_output_payload_eq(&finished, &raw);
+    assert_eq!(finished.items[0].hash, 0);
+    assert_eq!(finished.items[1].hash, 0);
+    assert_ne!(finished.items[0].hash, raw.items[0].hash);
+    assert_ne!(finished.items[1].hash, raw.items[1].hash);
 }
