@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Optional, Sequence
+
+import torch
 
 from sglang.srt.configs.model_config import (
     dsa_layer_skips_topk,
@@ -11,18 +13,43 @@ from sglang.srt.configs.model_config import (
     is_deepseek_dsa,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import attention_backends, get_schedule
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget import (
+    BudgetPlan,
+    resolve_sparse_kv_budget,
+)
+from sglang.srt.layers.dp_attention import (
+    get_cuda_graph_max_batch_size,
+    get_eager_max_batch_size,
+)
+from sglang.srt.runtime_context import (
+    attention_backends,
+    get_disagg,
+    get_exec,
+    get_parallel,
+    get_schedule,
+    get_spec,
+)
+from sglang.srt.utils.common import ceil_div
 from sglang.srt.utils.device import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
 
+def use_fused_sparse_kv_offload() -> bool:
+    return envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
+
+
 def is_sparsity_driven_kv_offload_enabled(
     *,
     model_config: ModelConfig,
     use_mla_backend: bool,
+    is_draft_worker: bool = False,
 ) -> bool:
+    # Fused offload is a target-model policy. Draft attention keeps its native KV
+    # pool even though the process inherits the target's environment flags.
+    if use_fused_sparse_kv_offload() and is_draft_worker:
+        return False
     if not envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.get():
         return False
 
@@ -44,6 +71,34 @@ def is_sparsity_driven_kv_offload_enabled(
         raise ValueError(
             "SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD requires max_running_requests "
             "to be set to bound the per-process host KV allocation."
+        )
+    if not use_fused_sparse_kv_offload():
+        return True
+    disagg = get_disagg()
+    if disagg.disaggregation_mode == "prefill":
+        # Prefill publishes native KV pages; fused offload belongs to decode.
+        return False
+    if get_parallel().pp_size != 1 or get_parallel().dcp_enabled:
+        raise ValueError(
+            "Native LIM integration currently requires PP=1 and DCP disabled."
+        )
+    if disagg.disaggregation_mode == "decode":
+        if get_parallel().attn_cp_size != 1:
+            raise ValueError("PD split KV requires context parallelism disabled.")
+        if disagg.enable_pd_role_switch:
+            raise ValueError("PD split KV does not support PD role switching.")
+        if disagg.disaggregation_transfer_backend not in ("ascend", "mooncake"):
+            raise ValueError(
+                "PD split KV requires the Ascend or Mooncake transfer backend."
+            )
+        if disagg.disaggregation_decode_host_receive_threshold < 1:
+            raise ValueError("PD split KV requires host receive threshold 1.")
+    algorithm = (get_spec().speculative_algorithm or "NONE").upper()
+    if algorithm != "NONE" and (
+        algorithm not in ("EAGLE", "NEXTN") or get_spec().speculative_eagle_topk != 1
+    ):
+        raise ValueError(
+            "Sparse KV MTP requires EAGLE/NEXTN with --speculative-eagle-topk 1."
         )
     return True
 
@@ -86,25 +141,91 @@ def get_sparsity_driven_kv_offload_cell_size(
     element_size: int,
     start_layer: int = 0,
     is_draft_worker: bool = False,
+    indexer_layer_ids: Optional[Sequence[int]] = None,
 ) -> Optional[int]:
     if not is_sparsity_driven_kv_offload_enabled(
         model_config=model_config,
         use_mla_backend=use_mla_backend,
+        is_draft_worker=is_draft_worker,
     ):
         return None
 
     index_head_dim = get_sparsity_driven_kv_offload_index_head_dim(
         model_config=model_config
     )
-    from sglang.srt.mem_cache.kv_cache_configurator import (
-        _should_elide_dsa_index_k,
+    if use_fused_sparse_kv_offload() and indexer_layer_ids is not None:
+        num_indexer_layers = len(indexer_layer_ids)
+    else:
+        from sglang.srt.mem_cache.kv_cache_configurator import (
+            _should_elide_dsa_index_k,
+        )
+
+        if _should_elide_dsa_index_k(is_draft_worker=is_draft_worker):
+            num_indexer_layers = sum(
+                not dsa_layer_skips_topk(model_config.hf_config, layer_id)
+                for layer_id in range(start_layer, start_layer + num_layers)
+            )
+        else:
+            num_indexer_layers = num_layers
+    return index_head_dim * element_size * num_indexer_layers
+
+
+def get_sparse_kv_budget(
+    *,
+    model_config: ModelConfig,
+    request_rows: int,
+    context_len: int,
+    num_layers: int,
+    top_k: int,
+    kv_bytes_per_token: int,
+    graph_batch_capacity: Optional[int] = None,
+    kv_dtype: torch.dtype = torch.bfloat16,
+) -> BudgetPlan:
+    query_heads = model_config.num_attention_heads // get_parallel().attn_tp_size
+    # Native SFA accepts 1..64 or 128 query heads per KV head.
+    copy_sfa_query_heads = 128 if 64 < query_heads < 128 else query_heads
+    disagg = get_disagg()
+    prefill_rows = request_rows - 1
+    if disagg.disaggregation_mode == "decode":
+        prefill_rows = 0
+    elif get_schedule().prefill_max_requests is not None:
+        prefill_rows = min(prefill_rows, get_schedule().prefill_max_requests)
+    page_size = get_schedule().page_size
+    aligned_context = ceil_div(context_len, page_size) * page_size
+    if graph_batch_capacity is None:
+        # Reserve before admission determines the final request-pool size.
+        # Capture buckets may round that size up for attention parallelism.
+        graph = get_exec().graph
+        config = graph.cuda_graph_config
+        decode = config.decode if config is not None else None
+        graph_batch_capacity = 0
+        if not graph.disable_cuda_graph:
+            graph_batch_capacity = get_cuda_graph_max_batch_size(request_rows)
+            if decode is not None and decode.bs:
+                graph_batch_capacity = min(max(decode.bs), graph_batch_capacity)
+    return resolve_sparse_kv_budget(
+        model_config=model_config,
+        page_size=page_size,
+        request_rows=request_rows,
+        context_len=context_len,
+        num_layers=num_layers,
+        top_k=top_k,
+        kv_bytes_per_token=kv_bytes_per_token,
+        cache_tokens=envs.SGLANG_NPU_SPARSE_KV_CACHE_SIZE.get(),
+        hbm_budget_bytes=envs.SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB.get() * 1024**2,
+        kv_dtype=kv_dtype,
+        prefill_workspace_tokens=prefill_rows * aligned_context,
+        max_query_width=get_sparse_kv_max_query_width(),
+        copy_sfa_query_heads=copy_sfa_query_heads,
+        graph_batch_capacity=max(
+            request_rows,
+            graph_batch_capacity,
+            get_eager_max_batch_size(request_rows - 1),
+        ),
     )
 
-    if _should_elide_dsa_index_k(is_draft_worker=is_draft_worker):
-        num_indexer_layers = sum(
-            not dsa_layer_skips_topk(model_config.hf_config, layer_id)
-            for layer_id in range(start_layer, start_layer + num_layers)
-        )
-    else:
-        num_indexer_layers = num_layers
-    return index_head_dim * num_indexer_layers * element_size
+
+def get_sparse_kv_max_query_width() -> int:
+    spec = get_spec()
+    # The budget resolver validates the resulting native query geometry.
+    return int(spec.speculative_num_draft_tokens or 1)

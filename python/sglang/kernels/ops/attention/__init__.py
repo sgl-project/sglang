@@ -766,3 +766,21 @@ register_kernel(
         capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
     )
 )
+
+register_kernel(
+    KernelSpec(
+        op="attention.fused_lightning_indexer_manage",
+        backend=KernelBackend.AOT,
+        target="sglang.kernels.ops.attention.npu_lim:fused_lightning_indexer_manage",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="attention.fused_scatter_copy_sparse_flash_attention",
+        backend=KernelBackend.AOT,
+        target="sglang.kernels.ops.attention.npu_copy_sfa:fused_scatter_copy_sparse_flash_attention",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)

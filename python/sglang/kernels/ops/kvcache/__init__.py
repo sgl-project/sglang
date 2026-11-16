@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
-from sglang.kernels.spec import KernelBackend, KernelSpec
+from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
 
 if TYPE_CHECKING:
     import torch
@@ -84,3 +84,23 @@ register_kernel(
         ),
     )
 )
+
+
+register_kernel(
+    KernelSpec(
+        op="kvcache.prepare_sparse_kv_publication",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.kvcache.npu_sparse_kv:prepare_sparse_kv_publication",
+        capabilities=frozenset({CapabilityRequirement.NPU}),
+    )
+)
+
+
+def prepare_sparse_kv_publication(*args, **kwargs):
+    """Prepare sparse KV publication metadata on NPU."""
+    return get_kernel("kvcache.prepare_sparse_kv_publication", KernelBackend.TRITON)(
+        *args, **kwargs
+    )
+
+
+__all__.append("prepare_sparse_kv_publication")
