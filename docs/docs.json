@@ -947,6 +947,7 @@
               "docs/advanced_features/server_arguments",
               "docs/advanced_features/session_radix_cache",
               "docs/advanced_features/radix_eviction_policy",
+              "docs/advanced_features/hybrid_cache_checkpoints",
               "docs/advanced_features/hyperparameter_tuning",
               "docs/advanced_features/text_watermarking",
               "docs/advanced_features/attention_backend",
@@ -988,6 +989,7 @@
                   "docs/advanced_features/unified_memory_design"
                 ]
               },
+              "docs/advanced_features/hybrid_model_memory",
               "docs/advanced_features/sglang_simulator",
               "docs/advanced_features/vlm_query",
               "docs/advanced_features/dp_for_multi_modal_encoder",
@@ -1206,6 +1208,12 @@
                       "docs/hardware-platforms/ascend-npus/optimization/profiling",
                       "docs/hardware-platforms/ascend-npus/optimization/quantization",
                       "docs/hardware-platforms/ascend-npus/optimization/ring_sp_performance"
+                    ]
+                  },
+                  {
+                    "group": "Diffusion",
+                    "pages": [
+                      "docs/hardware-platforms/ascend-npus/diffusion/disaggregation"
                     ]
                   },
                   {
@@ -1537,6 +1545,7 @@
                   {
                     "group": "Thinking Machines",
                     "pages": [
+                      "cookbook/autoregressive/ThinkingMachines/Inkling-2-Small",
                       "cookbook/autoregressive/ThinkingMachines/Inkling",
                       "cookbook/autoregressive/ThinkingMachines/Inkling-Small"
                     ]
@@ -1712,6 +1721,13 @@
                     "tag": "NEW",
                     "pages": [
                       "cookbook/vla/OpenPI/Pi0.5"
+                    ]
+                  },
+                  {
+                    "group": "Runway",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/vla/Runway/Praxis-1"
                     ]
                   }
                 ]

@@ -260,7 +260,7 @@ class UsageInfo(BaseModel):
     # Used to return cached tokens info when --enable-cache-report is set
     prompt_tokens_details: Optional[PromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
-    # The OpenAI location of reasoning_tokens; set only when there are some.
+    # The OpenAI location of reasoning_tokens; always set, so 0 means no reasoning.
     completion_tokens_details: Optional[CompletionTokensDetails] = None
 
 
@@ -844,6 +844,18 @@ class ChatCompletionMessageGenericParam(BaseModel):
     tools: Optional[List[Tool]] = Field(default=None, examples=[None])
     # DeepSeek API prefix completion: continue this final assistant message.
     prefix: Optional[bool] = None
+
+    @model_validator(mode="after")
+    def validate_assistant_tool_call_names(self):
+        # FunctionResponse.name is optional for streaming deltas,
+        # but request history must name each call so the chat template can render it.
+        if self.role != "assistant" or not self.tool_calls:
+            return self
+        for index, tool_call in enumerate(self.tool_calls):
+            name = tool_call.function.name
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"tool_calls[{index}]: 'function.name' is required")
+        return self
 
     @field_validator("role", mode="before")
     @classmethod

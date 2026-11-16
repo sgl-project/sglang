@@ -37,6 +37,10 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux3_image import (
     FLUX3_IMAGE_NAME_PATTERNS,
     is_flux3_image_package,
 )
+from sglang.multimodal_gen.configs.pipeline_configs.praxis import (
+    PRAXIS_HF_PATHS,
+    is_praxis_package,
+)
 from sglang.multimodal_gen.configs.sensenova_u1 import (
     SENSENOVA_U1_MODEL_IDS,
     is_sensenova_u1_adapter_only_model,
@@ -197,6 +201,8 @@ KNOWN_NON_DIFFUSERS_DIFFUSION_MODEL_PATTERNS: Dict[str, str] = {
     "pi05": "Pi05Pipeline",
     "pi0.5": "Pi05Pipeline",
     "flux-3-action": "Flux3ActionPipeline",
+    "praxis-1-droid": "PraxisPipeline",
+    "praxis-1-yam": "PraxisPipeline",
     "herzogenhorn/f3-image-small": "Flux3ImagePipeline",
     **{pattern: "Flux3ImagePipeline" for pattern in FLUX3_IMAGE_NAME_PATTERNS},
     "hunyuan3d": "Hunyuan3D2Pipeline",
@@ -469,6 +475,8 @@ def _get_config_info(
     # Local FLUX 3 Action exports are identified by their manifest, not their name.
     if is_flux3_action_package(model_path):
         return _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME[FLUX3_ACTION_HF_PATHS[0]])
+    if is_praxis_package(model_path):
+        return _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME[PRAXIS_HF_PATHS[0]])
     if is_flux3_image_package(model_path):
         return _CONFIG_REGISTRY.get(_MODEL_HF_PATH_TO_NAME[FLUX3_IMAGE_HF_PATHS[0]])
 
@@ -731,6 +739,8 @@ def get_non_diffusers_pipeline_name(model_path: str) -> Optional[str]:
         return "SenseNovaU1Pipeline"
     if is_flux3_action_package(model_path):
         return "Flux3ActionPipeline"
+    if is_praxis_package(model_path):
+        return "PraxisPipeline"
     if is_flux3_image_package(model_path):
         return "Flux3ImagePipeline"
 

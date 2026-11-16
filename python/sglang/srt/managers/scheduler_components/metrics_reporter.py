@@ -65,6 +65,7 @@ _SPEC_DECODE_SNAPSHOT_ALGORITHMS = (
     SpeculativeAlgorithm.EAGLE3,
     SpeculativeAlgorithm.DFLASH,
     SpeculativeAlgorithm.DSPARK,
+    SpeculativeAlgorithm.STANDALONE,
 )
 ENABLE_METRICS_DEVICE_TIMER = envs.SGLANG_ENABLE_METRICS_DEVICE_TIMER.get()
 CACHE_HIT_RATE_WINDOW_SECONDS = envs.SGLANG_CACHE_HIT_RATE_WINDOW_SECONDS.get()
@@ -1471,6 +1472,10 @@ class SchedulerMetricsReporter:
         )
         self.stats.num_decode_host_receive_queue_reqs = QueueCount.from_reqs(
             host_reqs, priority_enabled
+        )
+        self.stats.pending_prealloc_token_usage = (
+            self.scheduler.disagg_decode_prealloc_queue.num_tokens_pending_prealloc
+            / self.scheduler.max_total_num_tokens
         )
         pool_stats = self.scheduler.pool_stats_observer.get_pool_stats()
         full_tokens, window_tokens = (

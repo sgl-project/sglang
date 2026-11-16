@@ -1,11 +1,13 @@
 export const config = (() => {
   // Derived recipes estimate memory, not latency. Default multi-GPU recipes
-  // require NVLink; RTX 3090 supports a two-card NVLink pair only.
+  // require NVLink or Infinity Fabric; RTX 3090 supports a two-card NVLink pair only.
   const hardware = [
     ["b300", "B300", 288, 1], ["gb300", "GB300", 288, 1],
     ["b200", "B200", 192, 1], ["gb200", "GB200", 192, 1],
     ["h200", "H200", 141, 1], ["h20-3e", "H20-3e", 141, 1],
     ["h100", "H100", 80, 1], ["h800", "H800", 80, 1],
+    ["mi355x", "MI355X", 288, 1], ["mi350x", "MI350X", 288, 1],
+    ["mi325x", "MI325X", 256, 1], ["mi300x", "MI300X", 192, 1],
     ["dgx-spark", "DGX Spark", 128, 1],
     ["rtxpro6000", "RTX PRO 6000 Blackwell", 96, 1],
     ["rtx6000ada", "RTX 6000 Ada", 48, 1],
@@ -17,6 +19,9 @@ export const config = (() => {
     ["rtx3060", "RTX 3060", 12, 1],
   ];
   const profile = (hw) => hardware.find(([id]) => id === hw);
+  // MI355X/MI350X share gfx950 and MI325X/MI300X share gfx942; each pair uses
+  // the measured MI350X or MI325X recipe. The DiT runs dense AITER attention.
+  const isAmd = (hw) => ["mi355x", "mi350x", "mi325x", "mi300x"].includes(hw);
   const maxRecipeGpus = (hw) => hw === "rtx3090" ? 2 : hw === "dgx-spark" || hw.startsWith("rtx") ? 1 : 8;
   // Whole-component placement must fit the encoder; layerwise placement streams
   // its blocks and keeps the native BF16 checkpoint usable on smaller cards.
@@ -35,7 +40,7 @@ export const config = (() => {
   };
   const derivedRecipes = hardware.flatMap(([hw, , , minimum]) => hw === "dgx-spark" ? []
     : [1, 2, 4, 8].filter((gpus) => gpus <= maxRecipeGpus(hw)
-      && (["h200", "b300"].includes(hw) ? gpus > 2 : hw !== "rtxpro6000")).map((gpus) => ({
+      && (["h200", "b300"].includes(hw) ? gpus > 2 : !isAmd(hw) && hw !== "rtxpro6000")).map((gpus) => ({
         id: `${hw}-${gpus}-derived`, hw, nodes: 1, gpus_per_node: gpus,
         ...derivedPlan(hw, gpus), encoder: gpus > 1 ? "fold" : "auto",
         adaln: ["h200", "b300", "rtxpro6000"].includes(hw) ? "auto" : "online",
@@ -46,7 +51,7 @@ export const config = (() => {
     && s.adaln === "auto" && s.warmup === "server";
   const uncachedWorkload = (s) => uncachedServer(s) && s.mode === "edit"
     && s.size === "2048x2048" && s.references === "one" && s.quality === "lossless";
-  const guide4kWorkload = (s) => ["h200", "b300", "rtxpro6000", "dgx-spark"].includes(s.hw) && (
+  const guide4kWorkload = (s) => (["h200", "b300", "rtxpro6000", "dgx-spark"].includes(s.hw) || isAmd(s.hw)) && (
     (s.mode === "t2i" && ["4736x3552", "6272x2688"].includes(s.size))
     || (s.mode === "edit" && s.size === "4096x4096" && s.references === "one")
   );
@@ -71,7 +76,7 @@ export const config = (() => {
   supportedHardware: hardware.map(([id]) => id),
   hardware: hardware.map(([id, label, vram]) => ({ id, label,
     vram: `${vram}GB${id === "dgx-spark" ? " unified" : ""}`,
-    vendor: id.startsWith("rtx") ? "consumer" : ["h200", "h100", "h800", "h20-3e"].includes(id) ? "hopper" : "blackwell" })),
+    vendor: isAmd(id) ? "amd" : id.startsWith("rtx") ? "consumer" : ["h200", "h100", "h800", "h20-3e"].includes(id) ? "hopper" : "blackwell" })),
   groupHardware: false,
   matchDims: [],
   overlayDims: [
@@ -211,6 +216,8 @@ export const config = (() => {
         ...[[2, 1, 1], [1, 2, 1], [1, 1, 2]].flatMap(([tp_size, ulysses_degree, ring_degree]) => ["auto", "resident"].map((placement) => ({ id: `b300-two-${tp_size}-${ulysses_degree}-${ring_degree}-${placement}`, hw: "b300", nodes: 1, gpus_per_node: 2, tp_size, ulysses_degree, ring_degree, placement, encoder: "fold" }))),
         ...["auto", "resident", "offload"].map((placement) => ({ id: `h200-single-${placement}`, hw: "h200", nodes: 1, gpus_per_node: 1, tp_size: 1, ulysses_degree: 1, ring_degree: 1, placement, encoder: "auto" })),
         ...[[2, 1, 1], [1, 2, 1], [1, 1, 2]].flatMap(([tp_size, ulysses_degree, ring_degree]) => ["auto", "resident"].map((placement) => ({ id: `h200-two-${tp_size}-${ulysses_degree}-${ring_degree}-${placement}`, hw: "h200", nodes: 1, gpus_per_node: 2, tp_size, ulysses_degree, ring_degree, placement, encoder: "fold" }))),
+        ...["mi355x", "mi350x", "mi325x", "mi300x"].flatMap((hw) => [[1, 1, 1, 1], [2, 2, 1, 1], [2, 1, 2, 1], [4, 4, 1, 1], [4, 1, 4, 1], [8, 1, 8, 1], [8, 8, 1, 1]]
+          .map(([gpus_per_node, tp_size, ulysses_degree, ring_degree]) => ({ id: `${hw}-${gpus_per_node}-${tp_size}-${ulysses_degree}-${ring_degree}`, hw, nodes: 1, gpus_per_node, tp_size, ulysses_degree, ring_degree, placement: "auto", encoder: "auto", default: gpus_per_node === 8 && ulysses_degree === 8 }))),
         ...["resident", "offload", "layerwise"].map((placement) => ({ id: `rtxpro6000-single-${placement}`, hw: "rtxpro6000", nodes: 1, gpus_per_node: 1, tp_size: 1, ulysses_degree: 1, ring_degree: 1, placement, encoder: "auto", adaln: placement === "layerwise" ? "online" : "auto", default: placement === "resident" })),
         ...derivedRecipes,
       ].map((recipe) => ({
@@ -237,9 +244,10 @@ export const config = (() => {
       validateTopology: (s, t) => {
         const degrees = [t.tp_size, t.ulysses_degree, t.ring_degree];
         const errors = [];
-        if (!profile(s.hw)) errors.push("Choose a listed NVIDIA GPU.");
+        if (!profile(s.hw)) errors.push("Choose a listed GPU.");
         if (s.hw === "dgx-spark" && Number(s.gpus_per_node) !== 1) errors.push("This DGX Spark recipe uses one node with one GB10 GPU.");
         if (s.hw === "dgx-spark" && s.adaln === "resident" && ["auto", "resident"].includes(s.placement)) errors.push("Resident GB10 requires native AdaLN precomputation. Choose Auto or Precompute.");
+        if (isAmd(s.hw) && t.ring_degree > 1) errors.push("Ring parallelism requires FlashAttention. On AMD, use Ulysses or TP.");
         if (Number(s.gpus_per_node) > maxRecipeGpus(s.hw)) errors.push("Default multi-GPU recipes require NVLink. This GPU is limited to a single-card recipe, or a two-card NVLink pair for RTX 3090.");
         if (s.quantization?.startsWith("mxfp8") && ["rtx6000ada", "rtx4090", "rtx4080", "rtx4060ti", "rtx4070", "rtx3090", "rtx3060"].includes(s.hw)) errors.push("Choose FP8 or Native BF16 on this GPU; MXFP8 requires Hopper or newer.");
         if (s.execution === "bcg" && s.warmup === "off") errors.push("Choose Prepare at startup to capture CUDA graphs.");
@@ -263,9 +271,12 @@ export const config = (() => {
       const suggestedRecipe = resource.recommendedRecipe(s);
       const derivedRecipe = suggestedRecipe?.unverified ? suggestedRecipe : undefined;
       const errors = resource.validateTopology(s, topology);
-      const measured2k = s.size === "2048x2048" && (Number(s.gpus_per_node) === 1 || s.quality === "lossless")
+      // AMD Auto keeps the AdaLN weights; its rows measured lossless one-reference requests.
+      const measuredAmd = isAmd(s.hw) && s.quality === "lossless" && s.adaln !== "online" && s.warmup === "server"
+        && (guide4kWorkload(s) || (s.size === "2048x2048" && (s.mode === "t2i" || s.references === "one")));
+      const measured2k = !isAmd(s.hw) && s.size === "2048x2048" && (Number(s.gpus_per_node) === 1 || s.quality === "lossless")
         && !(s.mode === "edit" && s.references === "two" && s.quality === "exact");
-      const measured4k = guide4kWorkload(s) && s.adaln !== "resident" && s.warmup === "server"
+      const measured4k = !isAmd(s.hw) && guide4kWorkload(s) && s.adaln !== "resident" && s.warmup === "server"
         && (s.hw === "h200" ? s.placement === "auto"
           : s.hw === "b300" ? Number(s.gpus_per_node) <= 2
           : Number(s.gpus_per_node) === 1);
@@ -289,7 +300,7 @@ export const config = (() => {
         && (s.hw !== "rtxpro6000" || s.adaln !== "resident")
         && (s.warmup !== "off" || (s.hw === "h200" && Number(s.gpus_per_node) === 1));
       const verified = serveVerified && (s.conditioning === "off" ? uncachedWorkload(s)
-        : s.vae === "local" ? localVaeWorkload(s) : measured2k || measured4k)
+        : s.vae === "local" ? localVaeWorkload(s) : measured2k || measured4k || measuredAmd)
         && (s.png !== "none" || uncompressedPngWorkload(s))
         && (s.delivery !== "url" || fileUrlWorkload(s));
       const flags = ["--model-path {{MODEL_NAME}}", "--backend sglang"];
@@ -312,6 +323,7 @@ export const config = (() => {
           resolvedSettings: {
             placement: s.placement === "auto" ? (s.hw === "dgx-spark" ? "Resident (≥106 GiB free)" : (profile(s.hw)?.[2] || 0) >= 130 ? "Resident" : "Component offload") : undefined,
             adaln: s.adaln === "resident" || (s.adaln === "auto" && !["b300", "h200", "rtxpro6000", "dgx-spark"].includes(s.hw)) ? "Keep weights" : "Precompute",
+            attention: isAmd(s.hw) ? "AITER (auto)" : undefined,
             vae: s.vae === "local" || Number(s.gpus_per_node) === 1 ? "Local tiles" : "Parallel tiles for lossless",
           },
           warnings: s.hw === "dgx-spark"

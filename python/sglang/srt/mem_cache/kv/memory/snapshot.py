@@ -1,4 +1,5 @@
-"""Retraction copies preserve every part of the plan's entries and fixed rows."""
+"""Retraction copies preserve every part of the plan's entries: a request's
+token pages, its state slots and its request sub-pools' units."""
 
 from itertools import product
 from typing import Optional
@@ -18,12 +19,33 @@ class BandSnapshot(msgspec.Struct, kw_only=True):
 
 class StorageSnapshot(msgspec.Struct, kw_only=True):
     bands: dict[str, BandSnapshot]
-    request_parts: dict[str, torch.Tensor] = {}
 
 
-def _physical(band, indices, *, state):
+def _physical(band, indices, *, by_unit):
     indices = indices.to(torch.int64).reshape(-1)
-    return band.ids.translate(indices) if state else band.ids.translate_write(indices)
+    return band.ids.translate(indices) if by_unit else band.ids.translate_write(indices)
+
+
+def _whole_pages(indices, page_size):
+    """Every token id of the pages ``indices`` touch, page by page in order."""
+    pages = torch.unique_consecutive(indices.reshape(-1) // page_size)
+    slots = torch.arange(page_size, dtype=indices.dtype, device=indices.device)
+    return (pages[:, None] * page_size + slots).reshape(-1)
+
+
+def _band_ids(allocator, band, indices, state_indices, request_row):
+    """The ids ``band`` names the request's entries by, and whether they are
+    units (a state slot, a request row) rather than token ids."""
+    if band.sub_pool_name == allocator.roles.state:
+        return state_indices, True
+    if band.sub_pool_name in allocator.roles.requests:
+        if request_row is None:
+            return None, True
+        return torch.tensor([int(request_row)], device=band.device), True
+    if allocator.arena.band(band.sub_pool_name).copies_whole_units:
+        # The page's per-page parts sit past its tokens' rows.
+        return _whole_pages(indices, band.page_size), False
+    return indices, False
 
 
 def _page_positions(indices, page_size):
@@ -89,12 +111,11 @@ def copy_to_cpu(allocator, indices, *, state_indices, request_row):
     current_platform.synchronize()
     bands = {}
     for band in allocator.members:
-        state = band.sub_pool_name == allocator.roles.state
-        ids = state_indices if state else indices
+        ids, by_unit = _band_ids(allocator, band, indices, state_indices, request_row)
         if ids is None:
             continue
         ids = ids.reshape(-1)
-        physical = _physical(band, ids, state=state)
+        physical = _physical(band, ids, by_unit=by_unit)
         positions = torch.nonzero(physical > 0, as_tuple=True)[0]
         snapshot = BandSnapshot(
             positions=positions.cpu(),
@@ -113,21 +134,8 @@ def copy_to_cpu(allocator, indices, *, state_indices, request_row):
                     memory.tensors[part.name], pages[valid], part.row_axis
                 )
         bands[band.sub_pool_name] = snapshot
-    request = {}
-    if request_row is not None:
-        memory = allocator.request_memory
-        if memory is not None:
-            # A row handed out since the last forward holds its previous
-            # request's state until reset; the sync above ordered that forward.
-            allocator.storage.reset_row_before_backup(int(request_row))
-            for part in memory.parts:
-                tensor = memory.tensors[part.name]
-                row = torch.tensor([request_row], device=tensor.device)
-                request[part.name] = _gather_to_cpu(tensor, row, part.row_axis).select(
-                    part.row_axis, 0
-                )
     current_platform.synchronize()
-    return StorageSnapshot(bands=bands, request_parts=request)
+    return StorageSnapshot(bands=bands)
 
 
 def restore_from_cpu(allocator, snapshot, indices, *, state_indices, request_row):
@@ -136,11 +144,10 @@ def restore_from_cpu(allocator, snapshot, indices, *, state_indices, request_row
         saved = snapshot.bands.get(band.sub_pool_name)
         if saved is None:
             continue
-        state = band.sub_pool_name == allocator.roles.state
-        ids = state_indices if state else indices
+        ids, by_unit = _band_ids(allocator, band, indices, state_indices, request_row)
         if ids is None:
-            raise ValueError("restoring recurrent state requires its new slot ids")
-        physical = _physical(band, ids, state=state)
+            raise ValueError(f"restoring {band.sub_pool_name!r} requires its new ids")
+        physical = _physical(band, ids, by_unit=by_unit)
         positions = saved.positions.to(device=physical.device)
         destinations = physical[positions]
         valid = destinations > 0
@@ -168,19 +175,4 @@ def restore_from_cpu(allocator, snapshot, indices, *, state_indices, request_row
                     torch.nonzero(live.cpu(), as_tuple=True)[0],
                     part.row_axis,
                 )
-    if snapshot.request_parts:
-        if request_row is None:
-            raise ValueError("restoring request parts requires the new request row")
-        memory = allocator.request_memory
-        # The backup is the row's whole request memory: no reset follows.
-        allocator.storage.row_state_restored(int(request_row))
-        for part in memory.parts:
-            tensor = memory.tensors[part.name]
-            _scatter_from_cpu(
-                tensor,
-                torch.tensor([request_row], device=tensor.device),
-                snapshot.request_parts[part.name].unsqueeze(part.row_axis),
-                torch.tensor([0]),
-                part.row_axis,
-            )
     current_platform.synchronize()
