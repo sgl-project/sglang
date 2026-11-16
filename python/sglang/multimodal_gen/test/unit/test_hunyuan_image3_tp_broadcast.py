@@ -19,6 +19,7 @@ from sglang.multimodal_gen.runtime.pipelines.hunyuan_image3 import (
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan_image3 import (
     ar_stage,
 )
+from sglang.multimodal_gen.runtime.platforms.rocm import RocmPlatform
 from sglang.multimodal_gen.test.unit.host_sync_guard import forbid_host_syncs
 from sglang.test.test_utils import CustomTestCase
 
@@ -303,6 +304,23 @@ class TestHunyuanImage3PrefixKVCache(CustomTestCase):
             attend,
         )
         torch.testing.assert_close(suffix, self._rows(full)[:, self.PREFIX :])
+
+
+class TestHunyuanImage3FA3Gate(CustomTestCase):
+    def test_fa3_segments_stay_off_on_rocm_gfx950(self):
+        """torch.cuda reports capability (9, 5) on ROCm gfx950; the sm90-only
+        FA3 segment path must not be selected there."""
+        select = hunyuan_image3_utils._hopper_flash_attn_varlen
+        select.cache_clear()
+        self.addCleanup(select.cache_clear)
+        with (
+            patch.object(torch.cuda, "is_available", return_value=True),
+            patch.object(torch.cuda, "get_device_capability", return_value=(9, 5)),
+            patch.object(
+                hunyuan_image3_utils, "current_platform", RocmPlatform, create=True
+            ),
+        ):
+            self.assertIsNone(select())
 
 
 class TestHunyuanImage3MoEAndSchedule(CustomTestCase):
