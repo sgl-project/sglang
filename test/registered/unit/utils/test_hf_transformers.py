@@ -329,6 +329,27 @@ class TestGetTokenizerRevision(CustomTestCase):
         self.assertEqual({revision for _, revision in cache_lookups}, {"rev-a"})
 
 
+class TestMistralConfigRevision(CustomTestCase):
+    def test_params_json_is_fetched_at_the_requested_revision(self):
+        """A Mistral-format config must be parsed from the requested revision's
+        params.json, not from the default branch's."""
+        from sglang.srt.hf_transformers import common as hf_common
+        from sglang.srt.hf_transformers.mistral_utils import load_mistral_config
+
+        params = {"dim": 8, "n_layers": 1, "n_heads": 1, "hidden_dim": 16}
+        with tempfile.TemporaryDirectory() as snapshot_dir:
+            Path(snapshot_dir, "params.json").write_text(json.dumps(params))
+            with patch.object(
+                hf_common, "snapshot_download", return_value=snapshot_dir
+            ) as snapshot_download:
+                config = load_mistral_config(
+                    "org/mistral-revision-test", revision="rev-a"
+                )
+
+        self.assertEqual(config.hidden_size, 8)
+        self.assertEqual(snapshot_download.call_args.kwargs.get("revision"), "rev-a")
+
+
 class TestImageProcessorKwargsPatch(CustomTestCase):
     def test_filters_unsupported_kwargs_and_caches_signature(self):
         class StrictImageProcessor(BaseImageProcessor):

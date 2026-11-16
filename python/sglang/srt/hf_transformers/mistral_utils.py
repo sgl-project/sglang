@@ -374,7 +374,7 @@ def load_mistral_config(
     Returns a ``PretrainedConfig`` with dict sub-configs (text_config,
     vision_config) converted to proper AutoConfig objects.
     """
-    local_path = download_from_hf(model_path)
+    local_path = download_from_hf(model_path, revision=revision)
     parser = MistralConfigParser()
     config_dict, _ = parser.parse(local_path)
 

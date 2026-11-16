@@ -344,6 +344,7 @@ for _cosmos3_edge_config_cls in (
 def download_from_hf(
     model_path: str,
     allow_patterns: Optional[Union[str, list]] = None,
+    revision: Optional[str] = None,
 ):
     if os.path.exists(model_path):
         return model_path
@@ -351,7 +352,9 @@ def download_from_hf(
     if not allow_patterns:
         allow_patterns = ["*.json", "*.bin", "*.model"]
 
-    return snapshot_download(model_path, allow_patterns=allow_patterns)
+    return snapshot_download(
+        model_path, allow_patterns=allow_patterns, revision=revision
+    )
 
 
 def resolve_runai_obj_uri(model_name_or_path: str) -> str:
