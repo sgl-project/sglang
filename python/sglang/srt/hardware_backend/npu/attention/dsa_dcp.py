@@ -50,12 +50,16 @@ def forward_dcp_sparse_attention(
             "NPU DSA+DCP verify KV-length rows must match query rows: "
             f"{local_lens.shape[0]} != {num_query_rows}"
         )
-        actual_seq_lengths_query = torch.arange(
-            1,
-            num_query_rows + 1,
-            device=q_nope.device,
-            dtype=torch.int32,
+        actual_seq_lengths_query = getattr(
+            forward_metadata, "dcp_spec_query_ends", None
         )
+        if actual_seq_lengths_query is None:
+            actual_seq_lengths_query = torch.arange(
+                1,
+                num_query_rows + 1,
+                device=q_nope.device,
+                dtype=torch.int32,
+            )
     else:
         actual_seq_lengths_query = actual_seq_lengths_query.to(
             device=q_nope.device, dtype=torch.int32

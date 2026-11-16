@@ -140,6 +140,7 @@ class ForwardMetadata:
     dcp_spec_seq_lens_cpu_int: Optional[torch.Tensor] = None
     dcp_spec_seq_lens: Optional[torch.Tensor] = None
     dcp_spec_block_tables: Optional[torch.Tensor] = None
+    dcp_spec_query_ends: Optional[torch.Tensor] = None
 
     # swa attention mask for graph mode decode
     swa_mask: Optional[torch.Tensor] = None
@@ -1051,18 +1052,23 @@ class AscendAttnBackend(AttentionBackend):
                 device=self.device,
             )
             if self.speculative_num_draft_tokens is not None:
+                max_spec_rows = max_bs * self.speculative_num_draft_tokens
                 self.graph_metadata["dcp_spec_block_tables"] = torch.zeros(
                     (
-                        max_bs * self.speculative_num_draft_tokens,
+                        max_spec_rows,
                         max_dcp_seq_pages,
                     ),
                     dtype=torch.int32,
                     device=self.device,
                 )
                 self.graph_metadata["dcp_spec_seq_lens"] = torch.zeros(
-                    max_bs * self.speculative_num_draft_tokens,
+                    max_spec_rows,
                     dtype=torch.int32,
                     device=self.device,
+                )
+                # Every DCP Verify row is a separate, single-query sequence.
+                self.graph_metadata["dcp_spec_query_ends"] = torch.arange(
+                    1, max_spec_rows + 1, dtype=torch.int32, device=self.device
                 )
             else:
                 self.graph_metadata["dcp_block_tables"] = torch.zeros(
@@ -1146,6 +1152,9 @@ class AscendAttnBackend(AttentionBackend):
                 "dcp_spec_block_tables"
             ][:num_spec_rows]
             metadata.dcp_spec_seq_lens = self.graph_metadata["dcp_spec_seq_lens"][
+                :num_spec_rows
+            ]
+            metadata.dcp_spec_query_ends = self.graph_metadata["dcp_spec_query_ends"][
                 :num_spec_rows
             ]
         if self.is_hybrid_swa:
