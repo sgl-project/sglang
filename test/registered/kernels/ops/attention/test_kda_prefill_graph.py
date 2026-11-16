@@ -133,6 +133,7 @@ def _batch(extend_lens, prefix_lens, track=None):
 
 class TestKDAPrefillGraph(CustomTestCase):
     prefill_backend = LinearAttnKernelBackend.TRITON
+    ssm_dtype = torch.float32
 
     def setUp(self):
         self.layer = _layer()
@@ -145,7 +146,7 @@ class TestKDAPrefillGraph(CustomTestCase):
                 NUM_SLOTS, HEADS, HEAD_DIM, HEAD_DIM, generator=g, device="cuda"
             )
             * 0.05
-        )
+        ).to(self.ssm_dtype)
         self.backend = _backend(self.conv_pool, self.ssm_pool, self.prefill_backend)
         # Static inputs the captured graph reads.
         self.mixed = torch.zeros(BUCKET, DIM, device="cuda", dtype=torch.bfloat16)
@@ -364,6 +365,15 @@ class TestFlashInferKDAPrefillGraph(TestKDAPrefillGraph):
 
         if not hasattr(kda, "RecurrentKDAPrefillWrapper"):
             raise unittest.SkipTest("FlashInfer lacks the KDA prefill graph wrapper")
+
+
+# Hybrid models usually serve with a bf16 SSM pool (--mamba-ssm-dtype bfloat16).
+class TestKDAPrefillGraphBF16State(TestKDAPrefillGraph):
+    ssm_dtype = torch.bfloat16
+
+
+class TestFlashInferKDAPrefillGraphBF16State(TestFlashInferKDAPrefillGraph):
+    ssm_dtype = torch.bfloat16
 
 
 if __name__ == "__main__":
