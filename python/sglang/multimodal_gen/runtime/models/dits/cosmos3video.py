@@ -65,7 +65,10 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload im
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
-from sglang.multimodal_gen.runtime.platforms import current_platform
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.srt.layers.utils.common import add_prefix
 
@@ -80,6 +83,7 @@ def _can_enable_t1_fused_qk_norm_rope(
     *,
     is_blackwell: bool,
     is_hopper: bool,
+    is_sm121: bool,
     hidden_act: str,
     tp_size: int,
     sp_size: int,
@@ -90,6 +94,11 @@ def _can_enable_t1_fused_qk_norm_rope(
         return False
     if is_blackwell:
         return True
+    if is_sm121:
+        shape = (hidden_act, hidden_size)
+        return (
+            tp_size == 1 and sp_size == 1 and shape in (("relu2", 2048), ("silu", 4096))
+        )
     if not is_hopper or sp_size != 1:
         return False
     if tp_size == 1:
@@ -777,6 +786,7 @@ class Cosmos3CrossAttention(nn.Module):
         prefix: str = "",
         quant_config: QuantizationConfig | None = None,
         supported_attention_backends: set | None = None,
+        default_attention_backend: AttentionBackendEnum | None = None,
     ):
         super().__init__()
         self.hidden_size = hidden_size
@@ -808,6 +818,7 @@ class Cosmos3CrossAttention(nn.Module):
             num_kv_heads=self.local_num_key_value_heads,
             causal=False,
             supported_attention_backends=supported_attention_backends,
+            default_attention_backend=default_attention_backend,
             prefix=add_prefix("attn", prefix),
             is_cross_attention=True,
         )
@@ -1778,6 +1789,10 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         enable_t1_fused_qk_norm_rope = T == 1 and _can_enable_t1_fused_qk_norm_rope(
             is_blackwell=current_platform.is_blackwell(),
             is_hopper=current_platform.is_hopper(),
+            is_sm121=(
+                current_platform.is_cuda()
+                and current_platform.get_device_capability() == (12, 1)
+            ),
             hidden_act=self.hidden_act,
             hidden_size=self.hidden_size,
             tp_size=get_tp_world_size(),

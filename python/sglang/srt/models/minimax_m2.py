@@ -380,8 +380,9 @@ def fused_tp_qknorm(
     k_weight: torch.Tensor,
     eps: float,
 ) -> None:
+    lease, push_blocks = MiniMaxM2QKRMSNorm.COMM_MAP[counter]
     return fused_parallel_qknorm(
-        MiniMaxM2QKRMSNorm.COMM_MAP[counter].obj,
+        lease.get_communicator(push_blocks=push_blocks),
         q,
         k,
         q_weight,
@@ -425,8 +426,9 @@ class MiniMaxM2QKRMSNorm:
     @lru_cache
     @staticmethod
     def _get_comm(device: torch.device, occupancy: int):
-        from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-            CustomAllReduceV2,
+        from sglang.srt.distributed.device_communicators.symm_workspace import (
+            WorkspaceRequest,
+            request_group_workspace,
         )
 
         props = torch.cuda.get_device_properties(device)
@@ -435,23 +437,23 @@ class MiniMaxM2QKRMSNorm:
         if max_tokens is None:
             max_tokens = process_model_config().context_len
         max_tokens = max(max_tokens, get_schedule().max_prefill_tokens)
-        logger.info(f"[AR] Using CustomAllReduceV2 for MiniMaxM2 with {max_tokens = }")
+        logger.info(f"[AR] Fused TP QK-norm for MiniMaxM2 with {max_tokens = }")
         ALIGN = 512
         # typically, this should not exceed 1M, since max_tokens is usually less than 16384
         max_size = ((8 * max_tokens + ALIGN - 1) // ALIGN) * ALIGN
-        comm = CustomAllReduceV2(
-            group=get_parallel().attn_tp_group.cpu_group,
-            device=device,
-            # push-only: no barrier plane and no staging buffer
-            max_pull_size=0,
-            max_pull_blocks=0,
-            max_push_size=max_size,
-            max_push_blocks=props.multi_processor_count * occupancy,
+        lease = request_group_workspace(
+            get_parallel().attn_tp_group,
+            WorkspaceRequest(owner="minimax_m2_qknorm", push_slot_bytes=max_size),
         )
+        if lease is None:
+            return None
         counter = MiniMaxM2QKRMSNorm.COUNTER
         MiniMaxM2QKRMSNorm.COUNTER += 1
-        MiniMaxM2QKRMSNorm.COMM_MAP[counter] = comm
-        return counter if not comm.disabled else None
+        MiniMaxM2QKRMSNorm.COMM_MAP[counter] = (
+            lease,
+            props.multi_processor_count * occupancy,
+        )
+        return counter
 
     def forward(self, q: torch.Tensor, k: torch.Tensor):
         return self._forward_impl(q, k)
