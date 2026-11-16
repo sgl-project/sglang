@@ -41,7 +41,7 @@ from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
-from sglang.srt.runtime_context import derive_attn_tp_size, get_platform
+from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils.common import (
     parse_connector_type,
 )
@@ -84,10 +84,10 @@ def _check_xpu_dcp(server_args: Any, model_config: Any) -> None:
             "--dcp-size."
         )
 
-    attn_tp_size = derive_attn_tp_size(
-        tp_size=tp_size,
-        attn_cp_size=view.attn_cp_size,
-        attn_dp_size=view.attn_dp_size,
+    attn_tp_size = (
+        tp_size
+        // (view.dp_size if view.enable_dp_attention else 1)
+        // view.attn_cp_size
     )
     q_heads = max(1, model_config.get_max_num_attention_heads() // attn_tp_size)
     kv_heads = max(1, model_config.get_num_kv_heads(attn_tp_size, dcp_size))
