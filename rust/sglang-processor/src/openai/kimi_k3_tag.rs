@@ -81,7 +81,7 @@ pub(super) fn auto_tool_call_tag(
         .into_iter()
         .filter(|token| !strip.contains(token))
         .collect();
-    let format = json!({
+    let triggered = json!({
         "type": "triggered_tags",
         "triggers": [TOOLS_OPEN],
         "tags": [tools_tag],
@@ -89,6 +89,13 @@ pub(super) fn auto_tool_call_tag(
         "stop_after_first": !parallel_tool_calls,
         "excludes": excludes,
     });
+    // A serial grammar completes with the tools section, so it must still
+    // admit the message close K3 emits before EOS.
+    let format = if parallel_tool_calls {
+        triggered
+    } else {
+        sequence(vec![triggered, optional_message_close()])
+    };
     Ok(Some(json!({"type": "structural_tag", "format": format})))
 }
 
