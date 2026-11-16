@@ -441,7 +441,9 @@ class _TorchActivationModule:
         out.copy_(torch.relu(input).square())
 
 
-def activation_module(dtype: torch.dtype, *, fast_math: bool) -> Module:
+def activation_module(
+    dtype: torch.dtype, *, fast_math: bool
+) -> Module | _TorchActivationModule:
     if is_musa():
         return _TorchActivationModule(dtype, fast_math=fast_math)
     return _jit_activation_module(dtype, fast_math=fast_math)
