@@ -9,7 +9,10 @@ import shutil
 import tempfile
 import unittest
 
+from sglang.srt.arg_groups.attention_hook import _check_xpu_dcp
+from sglang.srt.arg_groups.model_override_base import model_config_of
 from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.arg_groups.parallel_hook import handle_deprecated_dp_attention
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -151,6 +154,43 @@ class TestAttnDpSize(CustomTestCase):
         self.assertFalse(readback["enable_dp_attention"])
         self.assertEqual(readback["dp_size"], 2)
         self.assertEqual(readback["attn_dp_size"], 1)
+
+    def test_xpu_dcp_sizes_the_gqa_group_from_the_attention_tp_width(self):
+        """Attention DP halves the attention-TP width, which doubles the query
+        heads each rank holds. The Intel XPU DCP check must count them at that
+        width under either spelling, or a GQA group the decode kernel is not
+        built for passes validation."""
+        path = tempfile.mkdtemp(prefix="attn_dp_size_gqa_")
+        self.addCleanup(shutil.rmtree, path, ignore_errors=True)
+        config = dict(
+            _MINI_CONFIG,
+            hidden_size=128,
+            num_attention_heads=64,
+            num_key_value_heads=2,
+        )
+        with open(os.path.join(path, "config.json"), "w") as handle:
+            json.dump(config, handle)
+
+        def check(**fields):
+            server_args = ServerArgs(
+                model_path=path,
+                attention_backend="intel_xpu",
+                tp_size=8,
+                dcp_size=2,
+                **fields,
+            )
+            handle_deprecated_dp_attention(server_args)
+            _check_xpu_dcp(server_args, model_config_of(server_args))
+
+        # Attention-TP width 8: 8 query heads over one KV head per DCP group.
+        check()
+        for fields in (
+            {"attn_dp_size": 2},
+            {"dp_size": 2, "enable_dp_attention": True},
+        ):
+            with self.subTest(**fields):
+                with self.assertRaisesRegex(ValueError, "GQA group of 32"):
+                    check(**fields)
 
     def test_both_cli_spellings_parse(self):
         parser = argparse.ArgumentParser()
