@@ -2,7 +2,6 @@
 
 import math
 import operator
-from collections.abc import Sequence
 from typing import Type
 
 import cutlass
@@ -13,6 +12,8 @@ from cutlass._mlir.dialects import arith as mlir_arith
 from cutlass._mlir.dialects import llvm
 from cutlass._mlir.extras import types as mlir_types
 from cutlass.cutlass_dsl import dsl_user_op
+
+BASE_ALIGN = 16
 
 torch_to_cute_dtype = {
     torch.float16: cute.Float16,
@@ -62,37 +63,6 @@ def make_fake_dense_mn(
         stride=stride,
         assumed_align=align,
     )
-
-
-def assert_cuda_contig(
-    x: torch.Tensor,
-    name: str = "",
-    *,
-    ndim: int | None = None,
-    allow_meta: bool = False,
-) -> None:
-    if not name:
-        name = "tensor"
-    assert x.is_cuda or (allow_meta and x.is_meta), (
-        f"{name} must be on CUDA: device={x.device}"
-    )
-    assert x.is_contiguous(), (
-        f"{name} must be contiguous: shape={x.shape} stride={x.stride()}"
-    )
-    if ndim is not None:
-        assert x.ndim == ndim, f"{name} must be {ndim}D: ndim={x.ndim}"
-
-
-def empty_cuda(
-    *size: int | Sequence[int],
-    dtype: torch.dtype,
-    device: torch.device | str = "cuda",
-) -> torch.Tensor:
-    if len(size) == 1 and not isinstance(size[0], int):
-        normalized_size = tuple(size[0])
-    else:
-        normalized_size = tuple(size)
-    return torch.empty(normalized_size, device=device, dtype=dtype)
 
 
 @dsl_user_op

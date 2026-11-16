@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Decode / MTP verify attention prologue, equal to the Triton _attention_prologue
-// in prologue.py with COMPACT: K/V short convolutions (decode: conv cache shifted,
+// in inkling2_attn_prologue.py with COMPACT: K/V short convolutions (decode: conv
+// cache shifted,
 // tracked rows copied; verify: over the verify tokens, conv windows saved), K L2
 // clip and V RMSNorm, Q L2 clip (head groups optionally padded), and the rel L2
 // clip with the rel-logits projection. Verify can write the rel bias in the layout

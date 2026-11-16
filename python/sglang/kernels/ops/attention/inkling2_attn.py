@@ -5,7 +5,6 @@ from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
 
-PDL = is_arch_support_pdl()
 # Below this many rows the Triton _gate_sink_kernel is faster.
 GATE_SINK_CUDA_MIN_ROWS = 64
 
@@ -178,7 +177,7 @@ def combine_gate_sink(o_partial, m_partial, l_partial, *, gate, sinks):
             triton.next_power_of_2(splits),
             l_partial is not None,
             enable_fp_fusion=False,
-            launch_pdl=PDL,
+            launch_pdl=is_arch_support_pdl(),
         )
     return out
 
@@ -253,7 +252,7 @@ def gate_sink(output, gate, lse, sinks, *, output_dtype, head_groups=None):
             padded_group,
             256,
             enable_fp_fusion=False,
-            launch_pdl=PDL,
+            launch_pdl=is_arch_support_pdl(),
         )
     return result
 
@@ -291,7 +290,7 @@ def compute_log_scaling_tau(positions, n_floor, alpha):
             positions.numel(),
             256,
             enable_fp_fusion=False,
-            launch_pdl=PDL,
+            launch_pdl=is_arch_support_pdl(),
         )
     return output
 
@@ -335,6 +334,6 @@ def pad_head_groups(x, group, padded_group):
             padded_group,
             width,
             1024,
-            launch_pdl=PDL,
+            launch_pdl=is_arch_support_pdl(),
         )
     return out

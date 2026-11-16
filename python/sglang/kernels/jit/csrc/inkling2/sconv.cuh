@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Short convolution over decode / MTP verify / small extend rows, equal to the
-// Triton _sconv_kernel in sconv.py: optional dynamic weights, routed top-k row
+// Triton _sconv_kernel in inkling2_sconv.py: optional dynamic weights, routed top-k row
 // gather, conv cache shift (decode) or per-row conv windows (verify), and the
 // residual-update epilogues.
 

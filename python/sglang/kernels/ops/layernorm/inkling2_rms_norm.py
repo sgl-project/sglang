@@ -8,6 +8,7 @@ import torch
 from cutlass import Float32, const_expr
 
 from sglang.kernels.ops.layernorm.inkling2_cute_utils import (
+    BASE_ALIGN,
     as_norm_rows,
     ceil_div,
     copy_partition,
@@ -243,9 +244,6 @@ class RMSNormFwd:
             copy_n(tXrY, tXgY)
 
 
-BASE_ALIGN = 16
-
-
 @cache
 def _compile_norm(
     x_dtype, weight_dtype, output_dtype, pre_weight_dtype, width, x_layout, preload
@@ -290,8 +288,9 @@ def _compile_norm(
 def rms_norm(x, weight, eps, *, pre_weight=None, output_dtype=None, out=None):
     assert x.is_cuda and x.shape[-1] > 0 and x.shape[-1] % 4 == 0
     shape = x.shape
-    layout = (as_norm_rows(x).ndim, norm_row_alignment(x))
-    x = as_norm_rows(x)
+    rows = as_norm_rows(x)
+    layout = (rows.ndim, norm_row_alignment(x))
+    x = rows
     for parameter in (weight, pre_weight):
         if parameter is not None:
             assert parameter.is_contiguous() and parameter.shape == (x.shape[-1],)

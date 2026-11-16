@@ -5,7 +5,6 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 
-PDL = is_arch_support_pdl()
 
 
 @triton.jit
@@ -164,7 +163,7 @@ def linear_k_group_partials(flat, weight, block_k=256, num_stages=3):
         num_warps=8 if wide else 4,
         num_stages=min(num_stages, 2) if wide else num_stages,
         enable_fp_fusion=False,
-        launch_pdl=PDL,
+        launch_pdl=is_arch_support_pdl(),
     )
     return partials
 
@@ -198,14 +197,14 @@ def linear_k_group_partials_pair(x, weight, x2, weight2):
         num_warps=8 if wide else 4,
         num_stages=2 if wide else 3,
         enable_fp_fusion=False,
-        launch_pdl=PDL,
+        launch_pdl=is_arch_support_pdl(),
     )
     return partials
 
 
-def _linear_k_groups_split(flat, weight, bias, out, block_k=256, num_stages=3):
+def _linear_k_groups_split(flat, weight, bias, out):
     m, n = flat.shape[0], weight.shape[0]
-    partials = linear_k_group_partials(flat, weight, block_k, num_stages)
+    partials = linear_k_group_partials(flat, weight)
     groups = partials.shape[0]
     _linear_k_group_sum[(triton.cdiv(m * n, 256),)](
         partials,
@@ -216,7 +215,7 @@ def _linear_k_groups_split(flat, weight, bias, out, block_k=256, num_stages=3):
         groups,
         bias is not None,
         enable_fp_fusion=False,
-        launch_pdl=PDL,
+        launch_pdl=is_arch_support_pdl(),
     )
 
 

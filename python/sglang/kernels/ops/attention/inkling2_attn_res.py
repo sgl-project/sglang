@@ -36,8 +36,8 @@ class AttnResFwdKernel:
         num_g2s_stages: int,
         vec_size: int,
         reload_X: bool,
-        cluster_size: int = 1,
-        max_N: int = 12,
+        cluster_size: int,
+        max_N: int,
     ):
         assert cluster_size in (1, 2), f"cluster_size={cluster_size!r} must be 1 or 2"
         assert D % cluster_size == 0, (
@@ -725,23 +725,19 @@ def _attn_res_fwd_cutedsl_config(
     N_Q: int,
     has_partial_addend: bool,
     N: int,
-    dtype: torch.dtype,
-    cluster_size: int | None = None,
 ) -> tuple[int, int, int, int]:
     vec_size = 4
     desired_g2s_stages = N + (1 if has_partial_addend else 0)
 
     tuned = _FWD_TUNED.get((D, N_Q))
-    if tuned is not None and cluster_size in (None, tuned[0]):
+    if tuned is not None:
         tuned_cluster_size, num_compute_threads, stages, vec_size = tuned
         num_g2s_stages = (
             desired_g2s_stages if stages == "full" else min(stages, desired_g2s_stages)
         )
         return num_compute_threads, max(2, num_g2s_stages), vec_size, tuned_cluster_size
 
-    if cluster_size is None:
-        cluster_size = 1
-    D_local = D // cluster_size
+    D_local = D
     target = (
         64
         if (N_Q == 1 and D_local < 2688) or D_local < 1536
@@ -767,13 +763,13 @@ def _attn_res_fwd_cutedsl_config(
         num_g2s_stages = 3
     num_g2s_stages = max(2, min(num_g2s_stages, desired_g2s_stages))
 
-    return num_compute_threads, num_g2s_stages, vec_size, cluster_size
+    return num_compute_threads, num_g2s_stages, vec_size, 1
 
 
 @cache
 def _compile_attn_res(width, queries, sources, dtype, normalize_values, has_addend):
     threads, stages, vector, cluster = _attn_res_fwd_cutedsl_config(
-        width, queries, has_addend, sources, dtype
+        width, queries, has_addend, sources
     )
     reload = not (stages == sources + has_addend and (queries == 1 or cluster == 2))
     kernel = AttnResFwdKernel(
@@ -840,9 +836,8 @@ def attn_res(blocks, partial_addend, queries, *, normalize_values=False):
     )
     if not tokens:
         return tuple(output.unbind(0))
-    offsets = tuple(
-        (block.data_ptr() - base.data_ptr()) // base.element_size() for block in blocks
-    )
+    base_ptr, element_size = base.data_ptr(), base.element_size()
+    offsets = tuple((block.data_ptr() - base_ptr) // element_size for block in blocks)
     compiled = _compile_attn_res(
         width,
         n_queries,

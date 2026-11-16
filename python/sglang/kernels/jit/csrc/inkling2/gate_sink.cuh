@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Attention output gate and sink, equal to the Triton _gate_sink_kernel in
-// attention.py: y = x * sigmoid(gate) * sigmoid(lse - sink), with x and lse read
+// inkling2_attn.py: y = x * sigmoid(gate) * sigmoid(lse - sink), with x and lse read
 // from padded head groups when PADDED_GROUP > GROUP.
 
 #include <sgl_kernel/utils.cuh>

@@ -4,8 +4,6 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 
-PDL = is_arch_support_pdl()
-
 
 @triton.jit
 def _residual_add_kernel(output, inputs, size, BLOCK: tl.constexpr):
@@ -28,6 +26,10 @@ def residual_add(*inputs: torch.Tensor) -> torch.Tensor:
     result = torch.empty_like(inputs[0])
     if result.numel():
         _residual_add_kernel[(triton.cdiv(result.numel(), 1024),)](
-            result, inputs, result.numel(), BLOCK=1024, launch_pdl=PDL
+            result,
+            inputs,
+            result.numel(),
+            BLOCK=1024,
+            launch_pdl=is_arch_support_pdl(),
         )
     return result

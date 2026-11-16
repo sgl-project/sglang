@@ -4,7 +4,6 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
 
-PDL = is_arch_support_pdl()
 _CUDA_TYPES = {torch.float32: "float", torch.bfloat16: "__nv_bfloat16"}
 # safe_idx, cache_mask, cu, si, track mask, track indices, src2dst
 _INT_DTYPES = (
@@ -422,6 +421,7 @@ def short_convolution(
     assert window is None or (not decode and window.stride(-1) == 1)
     width = weight.shape[0] if dynamic else weight.shape[1]
     head_dim = x.shape[1] // dynamic_weights.shape[1] if dynamic else x.shape[1]
+    scale = (width * (2 if dynamic else 1) + int(use_residual)) ** -0.5
     output = torch.empty_like(x, memory_format=torch.contiguous_format)
     if x.shape[0]:
         assert x.is_cuda and x.stride(-1) == 1
@@ -449,11 +449,11 @@ def short_convolution(
                 head_dim,
                 dynamic,
                 use_residual,
-                (width * (2 if dynamic else 1) + int(use_residual)) ** -0.5,
+                scale,
                 16,
                 128,
                 enable_fp_fusion=False,
-                launch_pdl=PDL,
+                launch_pdl=is_arch_support_pdl(),
             )
             return output
         if _cuda_sconv(
@@ -467,7 +467,7 @@ def short_convolution(
             head_dim=head_dim,
             decode=decode,
             residual=use_residual,
-            scale=(width * (2 if dynamic else 1) + int(use_residual)) ** -0.5,
+            scale=scale,
             track_mask=track_mask,
             track_indices=track_indices,
             window=window,
@@ -499,7 +499,7 @@ def short_convolution(
             decode,
             track_mask is not None,
             use_residual,
-            (width * (2 if dynamic else 1) + int(use_residual)) ** -0.5,
+            scale,
             256,
             Window=window,
             SWB=window.stride(0) if window is not None else 0,
@@ -507,7 +507,7 @@ def short_convolution(
             SWW=window.stride(2) if window is not None else 0,
             WINDOW=window is not None,
             enable_fp_fusion=False,
-            launch_pdl=PDL,
+            launch_pdl=is_arch_support_pdl(),
         )
     return output
 
@@ -534,6 +534,7 @@ def routed_sconv_epilogue(
     updating the cache)."""
     rows, width = attention.shape
     out = torch.empty_like(attention if partial is None else partial)
+    scale = (weight.shape[1] + 1) ** -0.5
     if rows:
         assert down.stride(-1) == 1 and weight.ndim == 2
         assert cache.ndim == 3 and cache.shape[1:] == (weight.shape[1] - 1, width)
@@ -549,7 +550,7 @@ def routed_sconv_epilogue(
             head_dim=width,
             decode=window is None,
             residual=True,
-            scale=(weight.shape[1] + 1) ** -0.5,
+            scale=scale,
             track_mask=track_mask,
             track_indices=track_indices,
             src2dst=src2dst,
@@ -587,7 +588,7 @@ def routed_sconv_epilogue(
             window is None,
             track_mask is not None,
             True,
-            (weight.shape[1] + 1) ** -0.5,
+            scale,
             256,
             TOP_K=top_k,
             ROUND_BF16=round_bf16,
@@ -598,6 +599,6 @@ def routed_sconv_epilogue(
             SWW=window.stride(2) if window is not None else 0,
             WINDOW=window is not None,
             enable_fp_fusion=False,
-            launch_pdl=PDL,
+            launch_pdl=is_arch_support_pdl(),
         )
     return out

@@ -8,10 +8,9 @@ import torch
 from cutlass import Float32, Int32, const_expr, cute, range_constexpr
 
 from sglang.kernels.ops.layernorm.inkling2_cute_utils import (
-    assert_cuda_contig,
+    BASE_ALIGN,
     ceil_div,
     copy_partition,
-    empty_cuda,
     load_norm_rows,
     make_fake_2d_row_major,
     make_fake_norm_rows,
@@ -23,8 +22,6 @@ from sglang.kernels.ops.layernorm.inkling2_cute_utils import (
     qk_l2_clip_row_stats,
     torch_to_cute_dtype,
 )
-
-BASE_ALIGN = 16
 
 
 class QKL2ClipFwd:
@@ -269,7 +266,8 @@ def qk_l2_clip_fwd_cutedsl(
     rows_per_output_scale = 0
     if output_scale is not None:
         assert not torch.is_grad_enabled(), "output_scale requires no_grad"
-        assert_cuda_contig(output_scale, name="output_scale", ndim=1)
+        assert output_scale.is_cuda and output_scale.is_contiguous()
+        assert output_scale.ndim == 1, f"{output_scale.shape=}"
         assert output_scale.device == x.device, f"{output_scale.device=} {x.device=}"
         assert output_scale.dtype == torch.float32, (
             f"{output_scale.dtype=} must be FP32"
@@ -294,7 +292,7 @@ def qk_l2_clip_fwd_cutedsl(
     output_dtype = output_dtype or x.dtype
     assert M < 2**31, f"{M=} must fit in Int32"
     assert N > 0, f"{N=} must be positive"
-    y = empty_cuda(M, N, dtype=output_dtype)
+    y = torch.empty((M, N), device="cuda", dtype=output_dtype)
     if x.numel() == 0:
         return y
 
