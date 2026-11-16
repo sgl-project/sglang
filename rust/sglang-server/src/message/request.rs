@@ -2,7 +2,9 @@
 //! ([`GenerateBody`] → [`GenerateRequest`]s).
 
 use std::collections::{BTreeMap, HashSet};
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use bytes::Bytes;
 use itertools::izip;
@@ -504,6 +506,7 @@ pub fn into_requests(
                 kv_hints,
                 mm: pack_mm(image_data, video_data, audio_data),
                 mm_buffers: Vec::new(),
+                dispatch_finish_time: DispatchFinishTime::default(),
             }
         },
     )
@@ -722,6 +725,45 @@ pub struct GenerateRequest {
     /// per-item metadata, already placed inline or in shm. Pushed to the scheduler channel
     /// with the request by [`take_buffers`](Self::take_buffers).
     pub mm_buffers: Vec<Buffer>,
+    /// When the request was handed to the scheduler, set by the stage that
+    /// pushes it.
+    pub dispatch_finish_time: DispatchFinishTime,
+}
+
+/// When a request was handed to the scheduler channel: Python's
+/// `APIServerReqTimeStats.api_server_dispatch_finish_time`, as wall time. A
+/// shared cell, so a [`crate::GenerateHook`] that saw the request before it
+/// moved on reads it later.
+///
+/// The stage that pushes the request stamps it just before the push, so the
+/// stamp is in place before any response to the request exists, and clears it
+/// when the push is refused.
+#[derive(Clone, Debug, Default)]
+pub struct DispatchFinishTime(Arc<AtomicU64>);
+
+impl DispatchFinishTime {
+    pub fn get(&self) -> Option<SystemTime> {
+        match self.0.load(Ordering::Acquire) {
+            0 => None,
+            nanos => Some(UNIX_EPOCH + Duration::from_nanos(nanos)),
+        }
+    }
+
+    /// Stamp now, in nanoseconds since the epoch (0 means unstamped).
+    pub fn set_now(&self) {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(1, |since| {
+                u64::try_from(since.as_nanos()).unwrap_or(u64::MAX)
+            })
+            .max(1);
+        self.0.store(nanos, Ordering::Release);
+    }
+
+    /// Unstamp a request whose push was refused: it was never dispatched.
+    pub fn clear(&self) {
+        self.0.store(0, Ordering::Release);
+    }
 }
 
 #[derive(Debug, Clone)]
