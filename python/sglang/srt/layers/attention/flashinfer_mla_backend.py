@@ -12,9 +12,9 @@ from sglang.srt.runtime_context import (
 """
 Support attention backend for flashinfer MLA.
 The flashinfer_mla_disable_ragged flag controls whether to use ragged prefill wrapper and defaults to be false.
-When it's set to false, all wrappers are BatchMLAPaged wrapper.
-When it's set to true, the backend uses BatchRagged and BatchMLAPaged wrapper for prefilling,
+When it's set to false, the backend uses BatchRagged and BatchMLAPaged wrapper for prefilling,
 and uses BatchMLAPaged wrapper for decoding.
+When it's set to true, all wrappers are BatchMLAPaged wrapper.
 More details can be found in https://docs.flashinfer.ai/api/mla.html
 """
 
