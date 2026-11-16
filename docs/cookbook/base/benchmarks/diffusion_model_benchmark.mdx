@@ -4,7 +4,7 @@ metatags:
     description: "Benchmark diffusion model serving throughput and latency with SGLang - supports image and video generation with flexible configurations."
 ---
 
-`sglang.multimodal_gen.benchmarks.bench_serving` is a command-line tool designed to benchmark the online serving throughput and latency of diffusion models. It selects the image or video API from the requested task and offers flexible configurations for request rates, dataset types, and profiling.
+`sglang.multimodal_gen.benchmarks.bench_serving` is a command-line tool designed to benchmark the online serving throughput and latency of diffusion models. It selects the image or video API from the requested task and offers flexible configurations for request rates and dataset types.
 
 ## 1. Quick Start
 
@@ -85,17 +85,17 @@ python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--host`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`localhost`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>The server host (e.g., `127.0.0.1`).</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--port`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`30000`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>The server port.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--model`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`default`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Model name or path.</td>
     </tr>
   </tbody>
@@ -134,7 +134,7 @@ python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--num-prompts`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`10`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>The total number of prompts/requests to execute during the benchmark.</td>
     </tr>
   </tbody>
