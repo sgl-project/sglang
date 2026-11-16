@@ -168,8 +168,17 @@ class TestFoundryAdapter(CustomTestCase):
     def test_record_without_the_flag_in_an_enabled_process_is_refused(self):
         """Foundry's hook, region and env pins cannot be undone in a live
         process: a later record without the flag must not run there."""
-        with _installed(_fake_api()):
+        from sglang.srt.arg_groups.cuda_graph_hook import (
+            validate_cuda_graph_persistence,
+        )
+
+        api = _fake_api()
+        with _installed(api):
             enabled = activate_foundry(_sa("save"))
+            validate_cuda_graph_persistence(_sa())
+            self.assertNotIn(
+                "validate_resolved_server_args", [name for name, *_ in api.calls]
+            )
             with self.assertRaisesRegex(RuntimeError, "cannot be undone"):
                 activate_foundry(_sa())
             self.assertIs(get_foundry_adapter(), enabled)

@@ -370,6 +370,8 @@ def validate_cuda_graph_persistence(server_args: Any):
     check the resolved graph config (including --cuda-graph-config JSON:
     decode full, prefill full or disabled), re-check the pins after the later
     cascades and pin the environment."""
+    if resolving_view(server_args).cuda_graph_persistence is None:
+        return
     from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 
     get_foundry_adapter().validate_resolved_server_args(server_args)
