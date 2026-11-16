@@ -245,11 +245,45 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        return self._apply_weights(layer, x, bias)
+
+    def apply_weights_into(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        output: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """``apply_weights`` into the caller-owned ``output`` (RowParallelLinear's
+        ``output_tensor``). The DeepGEMM block-FP8 linear writes it directly;
+        every other path computes normally and copies."""
+        return self._apply_weights(layer, x, bias, output)
+
+    def _block_fp8_linear_into(self, output: Optional[torch.Tensor], **kwargs):
+        if output is None:
+            return self.w8a8_block_fp8_linear(**kwargs)
+        fn = self.w8a8_block_fp8_linear
+        # only the DeepGEMM linear takes the storage (and copies when its own
+        # fallbacks run); the dispatcher may hand it back as a partial
+        if getattr(fn, "func", fn) is deepgemm_w8a8_block_fp8_linear_with_fallback:
+            return fn(**kwargs, output=output)
+        return output.copy_(fn(**kwargs))
+
+    def _apply_weights(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        bias: Optional[torch.Tensor] = None,
+        output: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        if self.weight_block_size is None and output is not None:
+            return output.copy_(self._apply_weights(layer, x, bias))
         if isinstance(x, tuple) and self.weight_block_size is not None:
             # Pre-quantized per-token-group activation (fp8 [M, K], fp32 scales
             # [M, K / block_k]) from the fused all-reduce epilogue
             # (layers/communication/gemma4_ar_fusion.py).
-            return self.w8a8_block_fp8_linear(
+            return self._block_fp8_linear_into(
+                output,
                 input=x[0],
                 weight=layer.weight,
                 block_size=self.weight_block_size,
@@ -275,7 +309,8 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
                 pre_quant_output_dtype=out_dtype,
             )
         if self.weight_block_size is not None:
-            return self.w8a8_block_fp8_linear(
+            return self._block_fp8_linear_into(
+                output,
                 input=x,
                 weight=layer.weight,
                 block_size=self.weight_block_size,

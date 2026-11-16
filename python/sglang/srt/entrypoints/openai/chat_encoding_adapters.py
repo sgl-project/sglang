@@ -10,22 +10,160 @@ import msgspec
 if TYPE_CHECKING:
     from sglang.srt.entrypoints.openai.protocol import (
         ChatCompletionRequest,
+        ErrorResponse,
         ResponsesRequest,
         Tool,
         ToolCall,
+        UsageInfo,
     )
     from sglang.srt.function_call.core_types import ToolCallItem
 
 EncodingBackend = Literal["builtin", "recipe"]
+HistoryToolCallArguments = Literal["strict", "lenient", "as_sent"]
 
 
 class ChatOutputHooks(msgspec.Struct, frozen=True, kw_only=True):
-    """Chat-handler policies an output adapter needs, bound to one handler."""
+    """Chat-handler policies an adapter needs, bound to one handler."""
 
     thinking_requested: Callable[[ChatCompletionRequest], bool]
     tool_call_parsing_active: Callable[[ChatCompletionRequest], bool]
     history_tool_calls_count: Callable[[ChatCompletionRequest], int]
     tool_call_id: Callable[[ToolCallItem, int], str]
+    effective_tools: Callable[[ChatCompletionRequest], list[Tool]]
+    split_assistant_prefix: Callable[
+        [list[dict[str, Any]], ChatCompletionRequest],
+        tuple[list[dict[str, Any]], Optional[str]],
+    ]
+    append_assistant_prefix: Callable[[list[int], str], list[int]]
+
+
+class ChatWireResponse(Protocol):
+    """How one /v1/chat/completions response goes on the wire."""
+
+    serialization_context: Optional[dict[str, Any]]
+    """The pydantic serialization context of its stream chunks."""
+
+    omit_null_delta: bool
+
+    continuous_usage: bool
+    """Whether increment frames may carry continuous usage stats."""
+
+    split_tool_call_opening: bool
+    """Whether a streamed tool call opens with empty arguments, the arguments
+    the parser already has following in a chunk of their own."""
+
+    errors_end_choices: bool
+    """Whether a mid-stream error ends every open choice with a finish reason
+    instead of sending an error frame."""
+
+    def response_id(self, engine_rid: str) -> str: ...
+
+    def finish_reason(self, reason: Optional[str]) -> Optional[str]: ...
+
+    def finalize_usage(self, usage: UsageInfo, *, cached_tokens: int) -> UsageInfo: ...
+
+    def choice_usage(
+        self,
+        *,
+        prompt_tokens: int,
+        completion_tokens: int,
+        reasoning_tokens: int,
+        cached_tokens: int,
+    ) -> Optional[dict[str, Any]]:
+        """The usage of one choice's end frame; None for none."""
+        ...
+
+    def headers(self) -> dict[str, str]:
+        """Response headers, read once the first engine event was observed."""
+        ...
+
+    def check_abort(
+        self, finish_reason: dict[str, Any], *, stream_started: bool
+    ) -> None:
+        """May raise for an abort that carries an error status."""
+        ...
+
+    def observe(self, index: int, content: dict[str, Any]) -> None:
+        """Sees each engine event of choice ``index`` before its chunks."""
+        ...
+
+    def ends_reasoning(
+        self, index: int, detector: Any, reasoning_text: str, *, finishing: bool
+    ) -> bool:
+        """Whether to send the end-of-thinking frame after this parse step."""
+        ...
+
+    def internal_content(
+        self,
+        index: int,
+        source: Optional[str],
+        *,
+        kind: Literal["reasoning", "content", "tool"],
+    ) -> Optional[list[dict[str, Any]]]:
+        """The ``internal_content`` of a chunk that streams ``source``."""
+        ...
+
+
+class ChatWire(Protocol):
+    def new_response(
+        self, request: ChatCompletionRequest, *, created: int
+    ) -> ChatWireResponse: ...
+
+    def error_body(self, error: ErrorResponse) -> Optional[dict[str, Any]]:
+        """The body of an error response; None for the handler's own."""
+        ...
+
+
+class _OpenAIChatWire:
+    """OpenAI's shape; stateless, so it is also its own per-response object."""
+
+    serialization_context = None
+    omit_null_delta = False
+    continuous_usage = True
+    split_tool_call_opening = False
+    errors_end_choices = False
+
+    def new_response(self, request, *, created):
+        return self
+
+    def error_body(self, error):
+        return None
+
+    def response_id(self, engine_rid):
+        return engine_rid
+
+    def finish_reason(self, reason):
+        return reason
+
+    def finalize_usage(self, usage, *, cached_tokens):
+        return usage
+
+    def choice_usage(
+        self, *, prompt_tokens, completion_tokens, reasoning_tokens, cached_tokens
+    ):
+        return None
+
+    def headers(self):
+        return {}
+
+    def check_abort(self, finish_reason, *, stream_started):
+        return None
+
+    def observe(self, index, content):
+        return None
+
+    def ends_reasoning(self, index, detector, reasoning_text, *, finishing):
+        return False
+
+    def internal_content(self, index, source, *, kind):
+        return None
+
+
+OPENAI_CHAT_WIRE = _OpenAIChatWire()
+
+
+def reported_prompt_tokens(meta_info: dict[str, Any], uncounted: int) -> int:
+    return max(0, meta_info.get("prompt_tokens", 0) - uncounted)
 
 
 class ResponsesOutputStream(Protocol):
@@ -83,9 +221,24 @@ class ChatEncodingAdapter(Protocol):
     """Whether media still has to be collected from the OpenAI messages after
     ``encode_messages`` returns prompt ids."""
 
-    strict_tool_call_arguments: bool
-    """Whether history tool-call ``arguments`` must parse as JSON before
-    ``encode_messages`` sees them; False when the encoding serializes them itself."""
+    history_tool_call_arguments: HistoryToolCallArguments
+    """How history tool-call ``arguments`` reach ``encode_messages``: "strict"
+    parsed as JSON, rejecting any that do not parse; "lenient" parsed where
+    they parse, the encoding serializing the rest itself; "as_sent" unparsed,
+    the encoding parsing them itself."""
+
+    renders_response_format: bool
+    """Whether the prompt carries ``response_format`` instead of a grammar."""
+
+    uncounted_prompt_tokens: int
+    """Prompt tokens the encoding adds that reported usage leaves out."""
+
+    wire: ChatWire
+    """The shape of /v1/chat/completions responses."""
+
+    def validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
+        """The error of a request the encoding rejects, or None."""
+        ...
 
     @property
     def output(self) -> Optional[ChatEncodingOutputAdapter]:
@@ -222,9 +375,10 @@ class ChatEncodingAdapterContext(msgspec.Struct, frozen=True, kw_only=True):
     """Everything a builder may read; a builder takes only what its encoding needs.
 
     Consumers:
-      tokenizer: prompt encoding (Inkling, DeepSeek-V4 / V4.1).
+      tokenizer: prompt encoding (Inkling, DeepSeek-V4 / V4.1, Kimi-K3).
       reasoning_parser, tool_call_parser, chat_hooks: adapter-owned output parsing.
-      hf_config: config-dependent encoding (DeepSeek V4.1 image_token_id).
+      hf_config: config-dependent encoding (DeepSeek V4.1 image_token_id, Kimi-K3.1
+        effort levels).
       model_path, revision: checkpoint files.
       default_chat_template_kwargs: the workers' --default-chat-template-kwargs
         (deepseek-recipe validates the default effort at startup).
@@ -263,6 +417,16 @@ def _build_inkling(ctx: ChatEncodingAdapterContext) -> ChatEncodingAdapter:
     )
 
 
+def _build_kimi_k3(ctx: ChatEncodingAdapterContext) -> ChatEncodingAdapter:
+    from sglang.srt.entrypoints.openai.serving_kimi_k3 import (
+        KimiK3ChatEncodingAdapter,
+    )
+
+    return KimiK3ChatEncodingAdapter(
+        tokenizer=ctx.tokenizer, hf_config=ctx.hf_config, chat_hooks=ctx.chat_hooks
+    )
+
+
 def _build_deepseek_recipe(
     ctx: ChatEncodingAdapterContext,
 ) -> Optional[ChatEncodingAdapter]:
@@ -290,6 +454,7 @@ _BUILDERS: dict[
     ],
 ] = {
     "inkling": {"builtin": _build_inkling},
+    "kimi_k3": {"builtin": _build_kimi_k3},
     "dsv4": {"builtin": _build_deepseek_recipe},
     "dsv41": {"builtin": _build_deepseek_recipe},
 }
