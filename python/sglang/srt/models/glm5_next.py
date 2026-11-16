@@ -2026,18 +2026,6 @@ class Glm5NextForConditionalGeneration(nn.Module):
             ):
                 layer.self_attn._prepare_fused_decode()
 
-    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
-        if self.model is None:
-            raise AttributeError(
-                "load_kv_cache_scales() is not available in encoder-only mode"
-            )
-        if callable(getattr(self.model, "load_kv_cache_scales", None)):
-            self.model.load_kv_cache_scales(quantization_param_path)
-        else:
-            logger.warning(
-                f"{self.model.__class__} does not support loading scaling factors."
-            )
-
     def get_embed_and_head(self):
         if self.model is None or self.lm_head is None:
             raise AttributeError(

@@ -9,6 +9,7 @@ from transformers import Exaone4Config
 
 from sglang.srt.model_executor.model_runner_components import load_model_utils
 from sglang.srt.models.exaone4 import Exaone4ForCausalLM
+from sglang.srt.models.glm5_next import Glm5NextForConditionalGeneration
 from sglang.srt.runtime_context import get_parallel, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -44,6 +45,15 @@ def _exaone4():
     model = Exaone4ForCausalLM(config)
     for param in model.parameters():
         torch.nn.init.normal_(param)
+    return model
+
+
+def _glm5_next_without_kv_scale_loader():
+    """The entry class over a backbone that, like Glm5NextModel, has no
+    load_kv_cache_scales."""
+    model = object.__new__(Glm5NextForConditionalGeneration)
+    torch.nn.Module.__init__(model)
+    model.model = torch.nn.Module()
     return model
 
 
@@ -94,7 +104,10 @@ class TestKvScaleFileRefused(_ContextTestCase):
         """An FP8 KV cache with --quantization-param-path on a model that
         cannot read the file stops with the unsupported-model error; it neither
         crashes inside the model nor reports the scales as loaded."""
-        models = {"exaone4": _exaone4}
+        models = {
+            "exaone4": _exaone4,
+            "glm5_next": _glm5_next_without_kv_scale_loader,
+        }
         for kind, build in models.items():
             with (
                 self.subTest(kind=kind),
