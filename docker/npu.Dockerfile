@@ -90,9 +90,6 @@ RUN set -eux; \
 RUN if [ "$DEVICE_TYPE" = "950" ]; then ZBAL_PKG="memfabric-zbal==${ZBAL_VERSION_950}"; \
     else ZBAL_PKG="memfabric-zbal==${ZBAL_VERSION_A3}"; fi; \
     ${PIP_INSTALL} "$ZBAL_PKG" -i https://pypi.org/simple/
-### Install SGLang Model Gateway
-RUN ${PIP_INSTALL} sglang-router
-
 
 ### Install PyTorch and PTA
 RUN . /etc/environment_new && \
@@ -127,6 +124,18 @@ RUN . /etc/environment_new && \
 RUN git clone https://github.com/sgl-project/sglang --branch ${SGLANG_TAG} /sgl-workspace/sglang && \
     cd /sgl-workspace/sglang/python && rm -rf pyproject.toml && mv pyproject_npu.toml pyproject.toml && \
     ${PIP_INSTALL} -v -e .[all_npu]
+
+# The PD tests launch sgl-router in front of the prefill and decode servers.
+# Built at the toolchain sgl-router pins, which is removed with the target to
+# keep the image small.
+RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none \
+    && export PATH="/root/.cargo/bin:${PATH}" \
+    && cd /sgl-workspace/sglang/sgl-router \
+    && rustup toolchain install \
+    && CARGO_TARGET_DIR=/tmp/sgl-router-target cargo build --locked --release --bin sgl-router \
+    && install -m 0755 /tmp/sgl-router-target/release/sgl-router /usr/local/bin/sgl-router \
+    && rm -rf /root/.cargo /root/.rustup /tmp/sgl-router-target
 
 ENV ASCEND_HOME_PATH=/usr/local/Ascend/cann-${CANN_VERSION}
 

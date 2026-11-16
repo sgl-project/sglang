@@ -99,6 +99,9 @@ from sglang.srt.mem_cache.page_interleave_pool import (
     PageInterleaveMHATokenToKVPool,
     PageInterleaveMLATokenToKVPool,
 )
+from sglang.srt.mem_cache.platform_kv_cache_dtype import (
+    registered_kv_cache_storage_dtype,
+)
 from sglang.srt.mem_cache.swa_memory_pool import SWAKVPool
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.platforms import current_platform
@@ -353,29 +356,6 @@ class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
     unified_total_bytes: Optional[int] = None
 
 
-def mla_draft_rows_are_dcp_collapsed(
-    *,
-    model_config: ModelConfig,
-    use_mla_backend: bool,
-    has_mambaish_state: bool,
-    is_hybrid_swa: bool,
-    kv_cache_dtype: torch.dtype,
-) -> bool:
-    """Whether a draft with this geometry keeps DCP-collapsed (physical) MLA rows;
-    see KVCacheConfigurator.draft_mla_rows_are_physical."""
-    return (
-        get_parallel().attn_dcp_size > 1
-        and use_mla_backend
-        and not has_mambaish_state
-        and not is_hybrid_swa
-        and not is_deepseek_dsa(model_config.hf_config)
-        and not is_deepseek_v4(model_config.hf_config)
-        and not is_float4_e2m1fn_x2(kv_cache_dtype)
-        and not current_platform.is_out_of_tree()
-        and get_exec().kernel.attention_backend != "ascend"
-    )
-
-
 def host_only_mamba_checkpoint() -> bool:
     """Radix mamba checkpoints stay in the hicache host pool.
 
@@ -453,6 +433,7 @@ class KVCacheConfigurator:
     draft_model_idx: Optional[int] = None
     kv_cache_dtype_str: Optional[str] = None
     extra_mamba_cache_bytes_per_req: int = 0
+    extra_mamba_cache_bytes_per_request_row: int = 0
     allocate_intermediate_ssm: bool = True
     mambaish_config: Optional[Any] = field(init=False)
     hybrid_gdn_config: Optional[Any] = field(init=False)
@@ -676,24 +657,19 @@ class KVCacheConfigurator:
 
     @property
     def draft_mla_rows_are_physical(self) -> bool:
-        """Whether the draft's MLA rows are DCP-collapsed like the target's.
-
-        True only for the plain MLA draft pool built by ``_build_mla_kv_pool``:
-        under DCP it writes and reads owner rows at ``loc // dcp_size``
-        (MLATokenToKVPool._scatter_mla_rows, the DCP page table), so it spans
-        and pages the same physical row space as the target. An MHA draft keeps
-        raw widened locs (masked_set_kv_buffer_kernel) and stays logical.
-        """
+        """True when the plain MLA draft pool stores owner rows at ``loc // dcp_size``
+        under DCP (MLATokenToKVPool._scatter_mla_rows), unlike an MHA draft."""
         return (
             self.is_draft_worker
             and get_parallel().attn_dcp_size > 1
-            and mla_draft_rows_are_dcp_collapsed(
-                model_config=self.model_config,
-                use_mla_backend=self.use_mla_backend,
-                has_mambaish_state=self.mambaish_config is not None,
-                is_hybrid_swa=self.is_hybrid_swa,
-                kv_cache_dtype=self.kv_cache_dtype,
-            )
+            and self.use_mla_backend
+            and self.mambaish_config is None
+            and not self.is_hybrid_swa
+            and not is_deepseek_dsa(self.model_config.hf_config)
+            and not is_deepseek_v4(self.model_config.hf_config)
+            and not is_float4_e2m1fn_x2(self.kv_cache_dtype)
+            and not current_platform.is_out_of_tree()
+            and get_exec().kernel.attention_backend != "ascend"
         )
 
     # Note(kpham-sgl):
@@ -726,9 +702,7 @@ class KVCacheConfigurator:
             swa_max_total_num_tokens = config.swa_max_total_num_tokens
 
         # Only drafts that execute without DCP need the full logical token
-        # domain; DCP drafts retain the target's per-rank capacity. A
-        # DCP-collapsed draft only ever addresses the owner rows, so its sizes
-        # stay physical too.
+        # domain; DCP drafts retain the target's per-rank capacity.
         loc_scale = self.loc_space_scale
         max_total_num_tokens *= loc_scale
         if full_max_total_num_tokens is not None:
@@ -866,8 +840,7 @@ class KVCacheConfigurator:
                     (draft_virtual_id_space + page - 1) // page * page
                 )
                 if self.draft_mla_rows_are_physical:
-                    # Owner rows carry one widened id each, so the pool keeps a
-                    # dcp_size-th of the space it is addressed in.
+                    # A rank stores one row per dcp_size widened ids.
                     dcp_size = get_parallel().attn_dcp_size
                     widened_page = page * dcp_size
                     widened = (
@@ -905,7 +878,6 @@ class KVCacheConfigurator:
                 # HiSparse's target allocator hands out logical IDs from its
                 # host-expanded address space. Draft KV is direct-indexed by
                 # those shared IDs, so its GPU pool must span the same space.
-                # A DFLASH draft KV ring is addressed by ring rows instead.
                 draft_virtual_id_space = token_to_kv_pool_allocator.size_full
                 page = max(int(self.pool_page_size or 1), 1)
                 draft_virtual_id_space = (
@@ -1909,6 +1881,7 @@ class KVCacheConfigurator:
         elif (
             get_exec().kernel.attention_backend == "ascend" and not self.mambaish_config
         ):
+            self._reject_registered_kv_cache_dtype(pool="the Ascend KV pool")
             if self.is_hybrid_swa:
                 token_to_kv_pool = self._build_ascend_swa_kv_pool(
                     full_max_total_num_tokens=sizes.full_max_total_num_tokens,
@@ -1967,6 +1940,9 @@ class KVCacheConfigurator:
                     max_total_num_tokens=sizes.max_total_num_tokens,
                 )
             elif is_unlimited_ocr_v2(self.model_config.hf_config):
+                self._reject_registered_kv_cache_dtype(
+                    pool="the Unlimited-OCR-v2 KV pool"
+                )
                 token_to_kv_pool = self._build_unlimited_ocr_v2_kv_pool(
                     max_total_num_tokens=sizes.max_total_num_tokens,
                 )
@@ -2275,7 +2251,19 @@ class KVCacheConfigurator:
     def _resolve_kv_pool_class(self, *, kind: KVPoolKind, default: type) -> type:
         pool_cls = current_platform.get_kv_pool_cls(kind=kind)
         if pool_cls is None:
-            return default
+            if registered_kv_cache_storage_dtype(self.kv_cache_dtype_str) is None:
+                return default
+            # No in-tree pool stores a registered dtype; refuse only when a builder
+            # constructs this kind, so kinds a layout never builds are unaffected.
+            return _platform_kv_pool_required(
+                base=default,
+                message=(
+                    f"--kv-cache-dtype {self.kv_cache_dtype_str} needs a platform KV "
+                    f"pool of kind {kind!r} for this model, but "
+                    f"{type(current_platform).__name__}.get_kv_pool_cls(kind={kind!r}) "
+                    "returns None. Choose another --kv-cache-dtype."
+                ),
+            )
         base = _KV_POOL_BASE_FOR_KIND[kind]
         if not (isinstance(pool_cls, type) and issubclass(pool_cls, base)):
             raise TypeError(
@@ -2283,6 +2271,15 @@ class KVCacheConfigurator:
                 f"returned {pool_cls!r}; expected a subclass of {base.__name__}"
             )
         return pool_cls
+
+    def _reject_registered_kv_cache_dtype(self, *, pool: str) -> None:
+        if registered_kv_cache_storage_dtype(self.kv_cache_dtype_str) is not None:
+            raise ValueError(
+                f"--kv-cache-dtype {self.kv_cache_dtype_str} cannot use {pool}: it "
+                "is built in-tree, not through the platform's get_kv_pool_cls, and "
+                "no in-tree pool stores a platform-registered KV cache dtype. "
+                "Choose another --kv-cache-dtype."
+            )
 
     def _build_ascend_swa_kv_pool(
         self,
@@ -2362,6 +2359,7 @@ class KVCacheConfigurator:
             NPUMLATokenToKVPool,
         )
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+        from sglang.srt.mem_cache.kv_cache_dtype import resolve_indexer_quant_mode
 
         # Indexer uses the allocator-global slot space on DCP target workers.
         dcp_size = get_parallel().attn_dcp_size
@@ -2406,6 +2404,9 @@ class KVCacheConfigurator:
                 else None
             ),
             is_draft_worker=self.is_draft_worker,
+            indexer_quant_mode=resolve_indexer_quant_mode(
+                self.server_args.indexer_kv_cache_dtype, self.kv_cache_dtype
+            ),
             layer_num=self.layer_info.num_effective_layers,
             device=self.device,
             enable_memory_saver=get_exec().features.enable_memory_saver,
@@ -2516,6 +2517,7 @@ class KVCacheConfigurator:
             tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
             max_running_requests=max_running_requests,
             kv_scale_ue8m0=is_kimi_k31(self.model_config.hf_config),
+            fp8_cast_on_write=is_kimi_k31(self.model_config.hf_config),
             use_fp4_indexer=get_exec().kernel.enable_fp4_indexer,
             **pool_kwargs,
         )
@@ -2795,6 +2797,7 @@ class KVCacheConfigurator:
                         self.model_config.hf_config
                     ),
                     kv_scale_ue8m0=is_kimi_k31(self.model_config.hf_config),
+                    fp8_cast_on_write=is_kimi_k31(self.model_config.hf_config),
                     skip_topk_layers=(
                         None
                         if self.is_draft_worker
@@ -2919,6 +2922,7 @@ class KVCacheConfigurator:
         if self.use_mla_backend and is_deepseek_dsa(self.model_config.hf_config):
             return dsa_pool_class
         if _is_npu:
+            self._reject_registered_kv_cache_dtype(pool="the NPU KV pool")
             if self.use_mla_backend:
                 from sglang.srt.hardware_backend.npu.memory_pool_npu import (
                     NPUMLATokenToKVPool,
@@ -3260,8 +3264,6 @@ class KVCacheConfigurator:
         return int(rest_memory * (1 << 30))  # return in bytes
 
     def _calculate_mamba_ratio(self) -> int:
-        # A state-free decode tree holds no state: one slot per request, as
-        # without a radix cache.
         if get_memory().disable_radix_cache or get_exec().mamba.decode_state_free_radix:
             return 1
 
@@ -3650,6 +3652,17 @@ class KVCacheConfigurator:
         extra_per_slot = replayssm_ring_per_slot + int(
             self.extra_mamba_cache_bytes_per_req * pp_layer_scale
         )
+        fixed_state_bytes = replayssm_fixed_bytes
+        if self.extra_mamba_cache_bytes_per_request_row:
+            # live requests, the padding row and a PD decode's pre-allocated rows
+            request_rows = (
+                max(1, get_schedule().max_running_requests // self.attn_dp_size)
+                + 1
+                + self._req_pool_pre_alloc_size()
+            )
+            fixed_state_bytes += request_rows * int(
+                self.extra_mamba_cache_bytes_per_request_row * pp_layer_scale
+            )
         reserves_spec_state = (
             has_spec_dec
             and not replayssm_active
@@ -3683,11 +3696,8 @@ class KVCacheConfigurator:
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
-            get_memory().disable_radix_cache
-            # a state-free decode tree caches no Mamba state either
-            or get_exec().mamba.decode_state_free_radix
+            get_memory().disable_radix_cache or get_exec().mamba.decode_state_free_radix
         ) and get_schedule().max_running_requests is not None:
-            # Use explicitly set max_running_requests when no tree holds states
             get_context().override(
                 "mamba_pool.from_max_running_requests",
                 max_mamba_cache_size=max(
@@ -3741,8 +3751,7 @@ class KVCacheConfigurator:
                 get_context().override(
                     "mamba_pool.memory_budget",
                     max_mamba_cache_size=int(
-                        (mamba_budget_bytes - replayssm_fixed_bytes - per_slot)
-                        // per_slot
+                        (mamba_budget_bytes - fixed_state_bytes - per_slot) // per_slot
                     ),
                 )
 
@@ -3765,7 +3774,7 @@ class KVCacheConfigurator:
         # +1 accounts for each pool's padding slot.
         mamba_state_memory = (
             (get_schedule().max_mamba_cache_size + 1) * (stage_per_req + extra_per_slot)
-            + replayssm_fixed_bytes
+            + fixed_state_bytes
         ) / (1 << 30)
         return total_rest_memory - mamba_state_memory
 
@@ -3837,3 +3846,13 @@ def calculate_mla_kv_cache_dim(
         return fp8_ds_mla_row_width(kv_lora_rank, qk_rope_head_dim)
 
     return kv_cache_dim
+
+
+def _platform_kv_pool_required(*, base: type, message: str) -> type:
+    # Still a subclass of the in-tree default, as the resolver promises a pool
+    # class of that kind; constructing it raises before anything is allocated.
+    class PlatformKVPoolRequired(base):
+        def __init__(self, *args, **kwargs):
+            raise ValueError(message)
+
+    return PlatformKVPoolRequired

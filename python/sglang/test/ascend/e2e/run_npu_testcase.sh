@@ -82,6 +82,13 @@ sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
 
+# Prefer the sgl-router CI built for this commit over the image's copy.
+sgl_router_bin="${sglang_source_path}/sgl-router-bin/sgl-router"
+if "${sgl_router_bin}" --help >/dev/null 2>&1; then
+    export SGLANG_TEST_PD_ROUTER_BINARY="${sgl_router_bin}"
+fi
+echo "sgl-router: $(command -v "${SGLANG_TEST_PD_ROUTER_BINARY:-sgl-router}" || echo 'not found')"
+
 export SGLANG_TEST_MAX_RETRY=0
 export SGLANG_SET_CPU_AFFINITY=1
 export HCCL_HOST_SOCKET_PORT_RANGE="auto"

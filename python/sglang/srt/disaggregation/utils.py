@@ -33,6 +33,7 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -66,21 +67,20 @@ def pp_sync_polls(
     pp_group: GroupCoordinator,
     pp_rank: int,
     pp_size: int,
-    sync_work_list: List,
+    send_window: PPSyncSendWindow,
 ) -> List[int]:
     """Synchronize poll states from PP0 through the PP pipeline.
 
     PP0 provides the data. Each later PP rank receives it from the previous
-    rank and asynchronously forwards it to the next rank.
+    rank and asynchronously forwards it to the next rank. The forwards stay
+    un-waited for the window's depth so this rank's rounds are not tied to the
+    next rank's.
     """
     if pp_size <= 1:
         assert polls is not None
         return polls
 
-    for p2p_work in sync_work_list:
-        p2p_work.work.wait()
-    sync_work_list.clear()
-
+    send_window.begin_round()
     data = polls
     if pp_rank > 0:
         data = pp_group.recv_object(
@@ -88,7 +88,7 @@ def pp_sync_polls(
             tag=P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
         )
     if pp_rank + 1 < pp_size:
-        sync_work_list.extend(
+        send_window.add(
             pp_group.send_object(
                 data,
                 dst=pp_rank + 1,
@@ -124,7 +124,7 @@ def poll_and_all_reduce_prefill_pp(
     pp_group: GroupCoordinator,
     pp_rank: int,
     pp_size: int,
-    pp_poll_sync_work_list: List[torch.distributed.Work],
+    pp_poll_send_window: PPSyncSendWindow,
 ) -> List[int]:
     polls: List[int] = []
     if pp_rank == 0:
@@ -132,7 +132,7 @@ def poll_and_all_reduce_prefill_pp(
         polls = _all_reduce_polls(polls, attn_tp_cpu_group)
         polls = _all_reduce_polls(polls, attn_cp_cpu_group)
     # Propagate PP0's data to other ranks
-    polls = pp_sync_polls(polls, pp_group, pp_rank, pp_size, pp_poll_sync_work_list)
+    polls = pp_sync_polls(polls, pp_group, pp_rank, pp_size, pp_poll_send_window)
     return polls
 
 
@@ -1837,6 +1837,7 @@ def setup_state_kv_args(
     total_kv_layers: Optional[int] = None,
     window_tails: Optional[Dict[str, int]] = None,
     draft_kv_ring: Optional[DFlashDraftKVRing] = None,
+    empty_draft_kv_ring: bool = False,
 ) -> None:
     """Register the storage's state entries in its wire order, and the flags
     peers read from its token KV layout. ``window_tails`` gives the tail each
@@ -1904,10 +1905,7 @@ def setup_state_kv_args(
         append_state_component(
             kv_args, StateType.REQUEST_ROW, *draft_kv_ring.floor_buf_infos()
         )
-    elif (
-        str(get_spec().speculative_algorithm).upper() == "DFLASH"
-        and get_spec().speculative_dflash_draft_kv_ring
-    ):
+    elif empty_draft_kv_ring:
         # A PP stage without the draft keeps empty slots and sends nothing for them.
         append_state_component(kv_args, StateType.DRAFT_RING, [], [], [])
         append_state_component(kv_args, StateType.REQUEST_ROW, [], [], [])
@@ -1919,20 +1917,6 @@ def setup_state_kv_args(
     kv_args.is_hybrid_mla_backend = (
         is_mla_backend(owner_view) and StateType.MAMBA in kv_args.state_types
     )
-    # Per-token bytes of a hybrid DSA pool's index-K page: the fp8 keys of
-    # every token, then their scales. A PD DCP relayout moves the two parts
-    # separately; FP4 keys keep their exponents in other buffers, so they move
-    # only between peers of the same DCP size (page by page).
-    if (
-        kv_args.is_hybrid_mla_backend
-        and StateType.DSA in kv_args.state_types
-        and isinstance(owner_view, DSATokenToKVPool)
-        and owner_view.index_kpool == 1
-        and not owner_view.index_k_fp4
-    ):
-        value_bytes = owner_view.index_head_dim
-        scale_bytes = owner_view.index_head_dim // owner_view.quant_block_size * 4
-        kv_args.dsa_index_k_token_bytes = (value_bytes, scale_bytes)
     if isinstance(owner_view, NPUMLATokenToKVPool):
         kv_args.kv_buf_groups = 3 if owner_view.index_head_dim is not None else 2
         kv_args.hidden_kv_layers = total_kv_layers

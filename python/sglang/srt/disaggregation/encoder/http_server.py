@@ -58,7 +58,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import configure_logger
-from sglang.srt.utils.auth import AuthLevel, add_api_key_middleware, auth_level
+from sglang.srt.utils.auth import add_api_key_middleware
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 logger = logging.getLogger(__name__)
@@ -643,7 +643,6 @@ async def health_generate():
 
 
 @app.api_route("/start_profile", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_FORCE)
 async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = None):
     if dp_dispatcher is not None:
         if obj is not None:
@@ -676,7 +675,6 @@ async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = Non
 
 
 @app.api_route("/stop_profile", methods=["GET", "POST"])
-@auth_level(AuthLevel.ADMIN_FORCE)
 async def stop_profile_async():
     if dp_dispatcher is not None:
         try:

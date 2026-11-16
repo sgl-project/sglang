@@ -1,5 +1,4 @@
-"""SGLANG_OPT_DFLASH_DRAFT_L2_PREFETCH: a branch forked at the draft CUDA graph's head
-prefetches the draft's small non-Linear tensors into L2; the graph's tail joins it."""
+"""Prefetch the draft's small non-Linear tensors into L2 beside its CUDA graph."""
 
 from itertools import chain
 from typing import List
@@ -46,6 +45,7 @@ def draft_l2_prefetch_tensors(draft_model) -> List[torch.Tensor]:
 
 class DraftL2Prefetch:
     def __init__(self, tensors: List[torch.Tensor]):
+        # The table holds raw addresses; this keeps the tensors behind them alive.
         self.tensors = tensors
         self.table = build_l2_prefetch_table(tensors)
         self._stream = torch.cuda.Stream(device=self.table.device)

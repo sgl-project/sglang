@@ -35,7 +35,7 @@ runs:
       uses: actions/cache/restore@v4
       with:
         path: sgl-router-bin/sgl-router
-        key: sgl-router-${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}-${{ hashFiles('sgl-router/**', 'rust/**', '.github/workflows/_pr-test-sgl-router-build.yml', 'scripts/ci/utils/build_sgl_router.sh') }}
+        key: sgl-router-${{ runner.arch == 'ARM64' && 'aarch64' || 'x86_64' }}-${{ hashFiles('sgl-router/**', 'rust/Cargo.toml', 'rust/sglang-api-types/**', 'rust/sglang-processor/**', 'rust/sglang-runtime-v1-types/**', '.github/workflows/_pr-test-sgl-router-build.yml', 'scripts/ci/utils/build_sgl_router.sh') }}
 
     - name: Build sgl-router if neither had it, and export its path
       shell: bash

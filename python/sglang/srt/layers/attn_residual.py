@@ -28,6 +28,7 @@ from sglang.srt.models.utils import bind_or_assign
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
+_SCORE_MAX_BLOCK_H: int = 8192  # one _score_kernel block spans H up to this
 _MAX_ROWS: int = 16  # next_pow2(8 + 1), K3 has <= 8 snapshots
 
 _FAST_SUPPORTED = None
@@ -252,7 +253,7 @@ def _mix_fused(
         bank.stride(1),
         scores.stride(0),
         H=H,
-        BLOCK_H=min(triton.next_power_of_2(H), 8192),
+        BLOCK_H=min(triton.next_power_of_2(H), _SCORE_MAX_BLOCK_H),
         num_warps=8,
     )
 

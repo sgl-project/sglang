@@ -79,11 +79,11 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
                     f"not validated under DCP (got {ragged_mode.value!r})."
                 )
 
-        if cfg.speculative_algorithm in ("DSPARK", "EAGLE3"):
-            # Target-verify + draft-extend must run on the decode (cutedsl_mla)
-            # backend, whose _run_decode_kernel implements the DCP signature
-            # (causal_seqs / cp_world / cp_rank). The default "prefill" routes
-            # them to trtllm_mla, which refuses DCP with q_len > 1.
+            # DSPARK target-verify + draft-extend must run on the decode
+            # (cutedsl_mla) backend, whose _run_decode_kernel implements the DCP
+            # signature (causal_seqs / cp_world / cp_rank). The default
+            # "prefill" routes verify to trtllm_mla, whose base _run_decode_kernel
+            # lacks that DCP path (TypeError: unexpected kwarg 'causal_seqs').
             overrides["speculative_attention_mode"] = "decode"
 
         if get_platform().is_npu:
@@ -243,20 +243,31 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
         ):
             logger.info("Kimi-K3.1 DCP enables replicated Q projection by default.")
             overrides["dcp_replicate_q_proj"] = True
-    overrides.update(_kimi_k31_lossless_defaults(cfg))
-    return overrides
-
-
-def _kimi_k31_lossless_defaults(cfg: Any) -> dict:
-    """Turn on Kimi-K3.1 optimizations that keep model precision unless set:
-    FlashMLA prefill token packing only reorders the sparse-key sum, is
-    self-gated to the layouts it supports and stays off in deterministic mode."""
-    overrides = {}
     if cfg.enable_flashmla_prefill_token_packing is None:
+        logger.info("Kimi-K3.1 enables FlashMLA prefill token packing by default.")
         overrides["enable_flashmla_prefill_token_packing"] = True
-    if overrides:
-        logger.info(f"Kimi-K3.1 enables lossless defaults: {overrides}")
+    overrides["decode_state_free_radix_default"] = True
     return overrides
+
+
+def _reject_flashinfer_mxfp4_cutlass_situ(hf_config: Any) -> None:
+    # On SM90/SM120 Mxfp4MoEMethod picks a CUTLASS runner, which computes
+    # GPT-OSS SwiGLU; only the SM100-family trtllm-gen runner has SiTU. Other
+    # arches have no flashinfer_mxfp4 kernel and fail in Mxfp4MoEMethod.
+    platform = get_platform()
+    if not (platform.is_sm90 or platform.is_sm120):
+        return
+    if not _is_mxfp4_pack_quantized(hf_config):
+        return
+    text_config = getattr(hf_config, "text_config", hf_config)
+    if getattr(text_config, "hidden_act", None) != "situ":
+        return
+    raise RuntimeError(
+        "Kimi-K3 with moe_runner_backend='flashinfer_mxfp4' on "
+        f"SM{platform.device_sm} would run the routed experts with GPT-OSS "
+        "SwiGLU instead of SiTU; only SM100-family GPUs have the SiTU kernels. "
+        "Use --moe-runner-backend marlin on this GPU."
+    )
 
 
 @_register_for("KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration")
@@ -267,6 +278,8 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     # SM107 uses the same packed-MXFP4 runner; leaving auto unresolved falls
     # back to BF16 weight materialization during model loading.
     cfg = resolving_view(server_args)
+    if cfg.moe_runner_backend == "flashinfer_mxfp4":
+        _reject_flashinfer_mxfp4_cutlass_situ(hf_config)
     if cfg.moe_runner_backend != "auto":
         return {}
     if not (get_platform().is_sm100 and get_platform().device_sm in (100, 103, 107)):
