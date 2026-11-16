@@ -2673,11 +2673,12 @@ class DFlashWorkerV2(BaseSpecWorker):
                 # idle rank would disagree with them on DP-gather segment
                 # offsets (padded bucket vs raw counts).
                 idle_verify_forward_batch.can_run_decode_cuda_graph = False
+                if _is_npu:
+                    idle_verify_forward_batch.mark_forward_metadata_ready()
                 self._target_worker.forward_batch_generation(
                     batch=None,
                     forward_batch=idle_verify_forward_batch,
                     is_verify=True,
-                    skip_attn_backend_init=True if _is_npu else None,
                 )
             empty_ids = torch.empty((0,), dtype=torch.int64, device=self.device)
             empty_lens = torch.empty((0,), dtype=torch.int32, device=self.device)
@@ -3102,13 +3103,12 @@ class DFlashWorkerV2(BaseSpecWorker):
         if get_parallel().attn_dp_enabled and batch.is_extend_in_batch:
             verify_forward_batch.can_run_decode_cuda_graph = False
 
+        if not (_is_npu or get_parallel().attn_dp_enabled):
+            verify_forward_batch.mark_forward_metadata_ready()
         target_out = self.target_worker.forward_batch_generation(
             batch=None,
             forward_batch=verify_forward_batch,
             is_verify=True,
-            skip_attn_backend_init=(
-                None if _is_npu or get_parallel().attn_dp_enabled else True
-            ),
         )
         logits_output = target_out.logits_output
         can_run_cuda_graph = target_out.can_run_cuda_graph
