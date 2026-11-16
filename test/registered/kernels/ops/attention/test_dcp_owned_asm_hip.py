@@ -81,17 +81,21 @@ def test_fused_rope_cat_and_cache_matches_dcp_write(T, rank, monkeypatch):
     from sglang.kernels.ops.kvcache.mla_buffer import (
         set_mla_kv_buffer_triton_fp8_quant,
     )
+    from sglang.srt.mem_cache import memory_pool
+    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
     from sglang.srt.models.deepseek_common.attention_forward_methods import (
         forward_mla_rocm,
     )
 
     torch.manual_seed(4)
     rows, max_pos = 4096, 65536
-    monkeypatch.setattr(
-        forward_mla_rocm,
-        "get_parallel",
-        lambda: SimpleNamespace(attn_dcp_size=DCP, attn_dcp_rank=rank),
-    )
+    parallel = SimpleNamespace(attn_dcp_size=DCP, attn_dcp_rank=rank)
+    monkeypatch.setattr(forward_mla_rocm, "get_parallel", lambda: parallel)
+    monkeypatch.setattr(memory_pool, "get_parallel", lambda: parallel)
+    # The owned-row mapping is the pool's; borrow it without a forward context.
+    pool = SimpleNamespace(_write_loc_dcp_span=DCP)
+    pool.owned_write_rows = lambda loc: MLATokenToKVPool.owned_write_rows(pool, loc)
+    monkeypatch.setattr(forward_mla_rocm, "get_token_to_kv_pool", lambda: pool)
     # Distinct widened slots, slot 0 (the reserved padding slot) among them.
     loc = torch.randperm(rows * DCP, device="cuda")[:T]
     loc[T // 2] = 0
