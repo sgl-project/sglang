@@ -22,7 +22,9 @@ if not is_cpu():
 if is_npu():
     from sgl_kernel_npu.operators.attention.gdn import (
         chunk_gated_delta_rule_npu,
-        fused_gdn_decode,
+    )
+    from sgl_kernel_npu.operators.attention.gdn import (
+        fused_gdn_decode as fused_sigmoid_gating_delta_rule_update,
     )
 
     chunk_gated_delta_rule = chunk_gated_delta_rule_npu
@@ -37,10 +39,6 @@ elif is_xpu():
     from sglang.srt.hardware_backend.xpu.kernels.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
-
-
-if not is_npu():
-    fused_gdn_decode = fused_sigmoid_gating_delta_rule_update
 
 
 class TritonGDNKernel(LinearAttnKernelBase):
@@ -158,7 +156,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        return fused_gdn_decode(
+        return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,
             q=q,
@@ -262,10 +260,6 @@ class TritonGDNKernel(LinearAttnKernelBase):
         retrieve_parent_token: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        if is_npu():
-            raise NotImplementedError(
-                "NPU GDN target verification uses AscendGDNAttnBackend."
-            )
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,
@@ -288,3 +282,6 @@ class TritonGDNKernel(LinearAttnKernelBase):
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
         )
+
+    if is_npu():
+        target_verify = LinearAttnKernelBase.target_verify

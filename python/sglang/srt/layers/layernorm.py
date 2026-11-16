@@ -187,10 +187,14 @@ if _is_npu:
     try:
         from sgl_kernel_npu.operators.norm import gemma_rmsnorm as npu_gemma_rms_norm
     except ImportError:
-        # Older wheels expose the architecture-specific Gemma provider.
         try:
             from sgl_kernel_npu.norm.gemma_rmsnorm import npu_gemma_rms_norm
         except ImportError:
+            # sgl-kernel-npu wheels built before the target-specific Gemma provider
+            # landed expose only the torch_npu operator, which is exactly what that
+            # provider binds to on A2/A3 — so those deployments keep working
+            # unchanged. On Ascend 950 the operator is unregistered and the first Gemma
+            # forward fails loudly, same as before this indirection existed.
             npu_gemma_rms_norm = torch_npu.npu_gemma_rms_norm
 
 if _is_mlu:
