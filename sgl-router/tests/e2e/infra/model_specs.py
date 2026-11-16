@@ -1,9 +1,8 @@
 """Model specifications for sgl-router e2e tests.
 
-Adapted from SMG's e2e_test/infra/model_specs.py. The same dict-of-dicts
-shape (so test code reads the same) but the entries are narrower —
-sgl-router tests today target small/medium models only; the larger
-function-calling / reasoning models from SMG are out of scope.
+A dict-of-dicts keyed by model name. sgl-router tests today target
+small/medium models only; larger function-calling / reasoning models are
+out of scope.
 
 Each entry:
     - model: HuggingFace path or local path (env-resolved)
@@ -18,7 +17,6 @@ from __future__ import annotations
 import os
 
 # Local-cache root for CI / cluster nodes that pre-download HF weights.
-# Mirrors the SMG `ROUTER_LOCAL_MODEL_PATH` env var.
 ROUTER_LOCAL_MODEL_PATH = os.environ.get("ROUTER_LOCAL_MODEL_PATH", "")
 
 
@@ -62,7 +60,6 @@ MODEL_SPECS: dict[str, dict] = {
         "features": ["chat", "streaming"],
         "worker_args": CI_WORKER_ARGS,
     },
-    # Standard small chat model — matches SMG's `llama-1b` entry.
     "llama-1b": {
         "model": _resolve_model_path("meta-llama/Llama-3.2-1B-Instruct"),
         "memory_gb": 4,
@@ -70,7 +67,6 @@ MODEL_SPECS: dict[str, dict] = {
         "features": ["chat", "streaming"],
         "worker_args": CI_WORKER_ARGS,
     },
-    # Primary 8B chat model — matches SMG's `llama-8b`.
     "llama-8b": {
         "model": _resolve_model_path("meta-llama/Llama-3.1-8B-Instruct"),
         "memory_gb": 16,

@@ -126,6 +126,9 @@ class MambaAttnBackendBase(AttentionBackend):
         # identity or one gather through the id space's table, both of which
         # `fused_replay_state_indices` reproduces in its own launch.
         self._state_ids = model_runner.runner_ids.state_ids(pool.state_sub_pool)
+        # Request rows as a request-scoped ReplaySSM ring indexes them: the
+        # identity on static pools, the request sub-pool's units under unified.
+        self._ring_ids = model_runner.runner_ids.request_ids()
         self._fused_state_indices_ok = (
             torch.device(self.device).type == "cuda" and pool.holds_state_slots
         )
@@ -174,7 +177,12 @@ class MambaAttnBackendBase(AttentionBackend):
                 "commit writes"
             )
             track = track[:num_requests]
-        return ForwardStateSlots(md.mamba_cache_indices[:num_requests], track)
+        ring = md.replayssm_ring_indices
+        return ForwardStateSlots(
+            md.mamba_cache_indices[:num_requests],
+            track,
+            None if ring is None else ring[:num_requests],
+        )
 
     def state_layer(self, layer_id: int) -> KVLayer:
         """The layer's recurrent-state route, once a layer-wise host load-back
@@ -299,13 +307,15 @@ class MambaAttnBackendBase(AttentionBackend):
         mamba_cache_indices = self._translate_mamba_indices(mamba_cache_indices)
         replayssm_ring_indices = None
         if self._replayssm_request_ring():
-            replayssm_ring_indices = forward_batch.req_pool_indices[:bs].to(
-                dtype=torch.int32
-            )
+            replayssm_ring_indices = self._ring_ids.ids(
+                forward_batch.req_pool_indices[:bs]
+            ).to(dtype=torch.int32)
         if forward_batch.mamba_track_indices is not None:
+            # Kept int64 when translated: every layer's track writes index the pool
+            # with these, and indexing with an int32 tensor casts it to int64 each time.
             forward_batch.mamba_track_indices = self._translate_mamba_indices(
                 forward_batch.mamba_track_indices
-            )
+            ).to(torch.int64)
         # Resolve the tracked-row selection once per forward
         cpu_track_metadata = self._has_cpu_prefill_track_metadata(forward_batch)
         if cpu_track_metadata:
@@ -554,7 +564,8 @@ class MambaAttnBackendBase(AttentionBackend):
             dtype=start_indices.dtype,
         )
 
-        return indices.clamp(0, query_start_loc[-1] - 1)
+        # A tensor bound: a 0-dim CUDA tensor passed as a Python scalar syncs the host.
+        return torch.minimum(indices.clamp(min=0), query_start_loc[-1] - 1)
 
     def _init_track_ssm_indices(
         self, mamba_cache_indices: torch.Tensor, forward_batch: ForwardBatch
@@ -724,7 +735,7 @@ class MambaAttnBackendBase(AttentionBackend):
             return None
         buf = self.replayssm_ring_indices_list[bs - 1]
         n = min(bs, int(req_pool_indices.shape[0]))
-        buf[:n].copy_(req_pool_indices[:n].to(dtype=buf.dtype))
+        buf[:n].copy_(self._ring_ids.ids(req_pool_indices[:n]).to(dtype=buf.dtype))
         if num_padding:
             buf[bs - num_padding : bs].fill_(-1)
         return buf
@@ -1716,8 +1727,8 @@ class HybridLinearAttnBackend(AttentionBackend):
         mamba_pool = self.linear_attn_backend.state_pool
         mamba_caches = mamba_pool.get_speculative_mamba2_params_all_layers()
 
-        # ReplaySSM-KDA: the accepted drafts live in the per-slot ring (written
-        # during verify); no intermediate_ssm is allocated. Replay the accepted
+        # ReplaySSM-KDA: the accepted drafts live in the ring (written during
+        # verify); no intermediate_ssm is allocated. Replay the accepted
         # prefix into `temporal` instead of scattering an intermediate state.
         # dspark/dflash call this method directly; the generic spec_utils commit
         # handles replayssm before reaching here (returns early), so this branch is
@@ -1730,7 +1741,8 @@ class HybridLinearAttnBackend(AttentionBackend):
 
             ring_indices = None
             if mamba_pool.replayssm_request_ring:
-                ring_indices = req_pool_indices[:request_number]
+                assert state_slots.ring is not None, "request-scoped ring without rows"
+                ring_indices = state_slots.ring[:request_number]
             commit_kda_replayssm_after_verify(
                 spec_state=mamba_caches,
                 state_batch_indices=state_indices_tensor,
@@ -1750,11 +1762,11 @@ class HybridLinearAttnBackend(AttentionBackend):
         # committed state after each step as with the KDA fold above; radix
         # donation and state copies read the slot directly. Chain layout only.
         if getattr(mamba_pool, "replayssm_cache_base", None) is not None:
-            assert req_pool_indices is not None, (
-                "the GDN ReplaySSM commit needs the request rows of the ring"
-            )
             if request_number == 0:
                 return
+            assert state_slots.ring is not None, (
+                "the GDN ReplaySSM commit needs the ring rows its verify resolved"
+            )
             from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
                 commit_gdn_replayssm_after_verify,
             )
@@ -1765,7 +1777,7 @@ class HybridLinearAttnBackend(AttentionBackend):
                 cache_base=mamba_pool.replayssm_cache_base,
                 is_flush=mamba_pool.replayssm_is_flush,
                 state_batch_indices=state_indices_tensor,
-                replay_indices=req_pool_indices[:request_number],
+                replay_indices=state_slots.ring[:request_number],
                 accept_lens=last_correct_step_indices + 1,
                 last_correct_step_indices=last_correct_step_indices,
                 fold_every_commit=True,
