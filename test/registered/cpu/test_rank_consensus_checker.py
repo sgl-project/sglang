@@ -259,9 +259,7 @@ class TestAssertSame(RankConsensusCheckerTestCase):
         """If one rank calls assert_same more times than a peer before shutdown(),
         it must be detected as divergence rather than hanging in all_reduce."""
         self.assertFalse(
-            self._spawn(
-                TestAssertSame.call_count_divergence_on_shutdown_fn, tp_size=2
-            )
+            self._spawn(TestAssertSame.call_count_divergence_on_shutdown_fn, tp_size=2)
         )
 
     @staticmethod
