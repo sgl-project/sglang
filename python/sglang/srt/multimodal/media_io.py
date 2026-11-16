@@ -568,6 +568,25 @@ def _warn_fancy_jpeg_fallback(error: str) -> None:
     )
 
 
+_small_npu_jpeg_warning_lock = threading.Lock()
+_small_npu_jpeg_warning_emitted = False
+
+
+def _warn_small_npu_jpeg() -> None:
+    global _small_npu_jpeg_warning_emitted
+    # Unlike lru_cache, this also deduplicates concurrent first calls.
+    with _small_npu_jpeg_warning_lock:
+        if _small_npu_jpeg_warning_emitted:
+            return
+        _small_npu_jpeg_warning_emitted = True
+    logger.warning(
+        "NPU JPEG decoding may be slower than CPU/PIL for small images "
+        "(up to 10,816 pixels, equivalent to 104x104). "
+        "Actual performance depends on CPU configuration and workload. "
+        "Further small-image warnings are suppressed in this process."
+    )
+
+
 def _load_image(
     image_bytes: bytes = b"",
     image_file: str = "",
@@ -605,8 +624,12 @@ def _load_image(
         from sglang.srt.hardware_backend.npu.jpeg import decode_jpeg
 
         encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
-        image_tensor = decode_jpeg(encoded_image, device="npu")
+        image_tensor = decode_jpeg(encoded_image)
         if image_tensor is not None:
+            # Warning range from A3 measurements, not a routing threshold. The
+            # crossover varies with CPU threading and image content.
+            if image_tensor.shape[-2] * image_tensor.shape[-1] <= 104 * 104:
+                _warn_small_npu_jpeg()
             return image_tensor
         # Unsupported devices/images return None; execution errors propagate.
     try:

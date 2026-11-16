@@ -3,7 +3,10 @@
 import base64
 import io
 import tempfile
+import threading
+import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -27,8 +30,11 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
-def encoded_image(fmt="JPEG"):
-    pixels = np.random.RandomState(0).randint(0, 256, (48, 64, 3), dtype=np.uint8)
+def encoded_image(fmt="JPEG", size=(64, 48)):
+    width, height = size
+    pixels = np.random.RandomState(0).randint(
+        0, 256, (height, width, 3), dtype=np.uint8
+    )
     buffer = io.BytesIO()
     Image.fromarray(pixels).save(buffer, format=fmt)
     return buffer.getvalue()
@@ -36,6 +42,9 @@ def encoded_image(fmt="JPEG"):
 
 class TestNPUImageDecodeModes(unittest.TestCase):
     def setUp(self):
+        self.enterContext(
+            patch.object(media_io, "_small_npu_jpeg_warning_emitted", False)
+        )
         self.enterContext(patch.object(media_io, "is_cuda", return_value=False))
         self.enterContext(patch.object(media_io, "is_npu", return_value=True))
         self.decode = self.enterContext(
@@ -78,12 +87,77 @@ class TestNPUImageDecodeModes(unittest.TestCase):
         self.assertIs(image, expected)
         args, kwargs = self.decode.call_args
         self.assertEqual(bytes(args[0].numpy()), data)
-        self.assertEqual(kwargs, {"device": "npu"})
+        self.assertFalse(kwargs)
         self.decode.assert_called_once()
+
+    def test_small_npu_jpeg_warning_uses_pixel_area(self):
+        self.decode.side_effect = None
+        for width, height, should_warn in (
+            (103, 105, True),
+            (104, 104, True),
+            (105, 105, False),
+            (64, 169, True),
+            (169, 64, True),
+            (64, 170, False),
+        ):
+            with self.subTest(size=(width, height)):
+                expected = torch.zeros((3, height, width), dtype=torch.uint8)
+                self.decode.return_value = expected
+                with (
+                    patch.object(media_io, "_small_npu_jpeg_warning_emitted", False),
+                    patch.object(media_io.logger, "warning") as warning,
+                ):
+                    image, _ = media_io.load_image(
+                        encoded_image(size=(width, height)), True
+                    )
+                    self.assertIs(image, expected)
+                    self.assertEqual(warning.call_count, int(should_warn))
+
+    def test_small_npu_jpeg_warns_once_without_changing_dispatch(self):
+        self.decode.side_effect = None
+        with patch.object(media_io.logger, "warning") as warning:
+            self.decode.return_value = torch.zeros((3, 105, 105), dtype=torch.uint8)
+            media_io.load_image(encoded_image(size=(105, 105)), True)
+            self.decode.return_value = None
+            self.assert_pil_pixels(
+                media_io.load_image(encoded_image(), True)[0], encoded_image()
+            )
+            warning.assert_not_called()
+            small = torch.zeros((3, 48, 64), dtype=torch.uint8)
+            data = encoded_image()
+            self.decode.return_value = small
+            for _ in range(1000):
+                self.assertIs(media_io.load_image(data, True)[0], small)
+            warning.assert_called_once()
+            self.assertIn("may be slower", warning.call_args.args[0])
+            self.assertIn("10,816", warning.call_args.args[0])
+            self.assertIn("suppressed in this process", warning.call_args.args[0])
+
+    def test_concurrent_small_npu_images_warn_once(self):
+        data = encoded_image()
+        expected = torch.zeros((3, 48, 64), dtype=torch.uint8)
+        self.decode.side_effect = None
+        self.decode.return_value = expected
+        start = threading.Barrier(8)
+
+        def load(_):
+            start.wait(timeout=5)
+            return media_io.load_image(data, True)[0]
+
+        # Let all first calls overlap while the first log is being written.
+        with patch.object(
+            media_io.logger, "warning", side_effect=lambda *args: time.sleep(0.05)
+        ) as warning:
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                images = list(executor.map(load, range(8)))
+        self.assertTrue(all(image is expected for image in images))
+        warning.assert_called_once()
 
     def test_false_uses_pil_without_dvpp(self):
         data = encoded_image()
-        image, _ = media_io.load_image(data, False)
+        with patch.object(media_io.logger, "warning") as warning:
+            image, _ = media_io.load_image(data, False)
+        warning.assert_not_called()
         self.assert_pil_pixels(image, data)
         self.decode.assert_not_called()
 
