@@ -647,14 +647,6 @@ class HostKVCache(abc.ABC):
             return 0, device_pool.layer_num
         return device_pool._owned_local_layer_range()
 
-    def _effective_host_layer_num(self, device_pool=None) -> int:
-        """Number of layers the host pool allocates for this rank."""
-        device_pool = device_pool or self.device_pool
-        if not self._is_device_layer_sharded(device_pool):
-            return device_pool.layer_num
-        shard_size = device_pool.layer_shard_size
-        return (device_pool.layer_num + shard_size - 1) // shard_size
-
     def _is_device_layer_owned(self, device_pool, layer_id: int) -> bool:
         start, end = self._device_owned_layer_range(device_pool)
         return start <= layer_id < end
