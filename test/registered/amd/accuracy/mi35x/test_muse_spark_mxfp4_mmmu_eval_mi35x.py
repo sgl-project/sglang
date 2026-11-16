@@ -49,9 +49,9 @@ MUSE_SPARK_DRAFT_PATH = os.environ.get(
     "MUSE_SPARK_DRAFT_PATH", "RadixArk/Muse-Spark-Open-DFlash2"
 )
 SERVER_LAUNCH_TIMEOUT = 9000
-# Provisional: there is no AMD MMMU measurement for this model yet. Replace
-# with the measured score minus 0.05 once the first run reports one.
-BASELINE_ACCURACY = 0.50
+# Measured 0.790 on rocm10 (100 samples, real draft acceptance); measured -
+# 0.05, as for the GSM8K gate.
+BASELINE_ACCURACY = 0.74
 TP_SIZE = 8
 MAX_RUNNING_REQUESTS = 64
 
