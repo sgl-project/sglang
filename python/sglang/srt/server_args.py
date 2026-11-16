@@ -232,6 +232,7 @@ class ServerArgs:
         """Leave construction unresolved; launchers and publishers call ``resolve_once``."""
         for name in (
             "disable_outlines_disk_cache",
+            "num_continuous_decode_steps",
             "show_time_cost",
             "triton_attention_reduce_in_fp32",
         ):
@@ -465,6 +466,13 @@ class ServerArgs:
                 default=argparse.SUPPRESS,
                 help="Deprecated. Has no effect.",
             )
+        parser.add_argument(
+            "--num-continuous-decode-steps",
+            action=DeprecatedAction,
+            nargs=None,
+            default=argparse.SUPPRESS,
+            help="Deprecated. Has no effect.",
+        )
         parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",

@@ -7,6 +7,8 @@ translates field annotations into argparse arguments.
 import argparse
 import contextlib
 import io
+import os
+import tempfile
 import unittest
 
 from sglang.srt.arg_groups.overrides import resolution_result
@@ -17,6 +19,7 @@ from sglang.srt.multimodal.media_io import (
 )
 from sglang.srt.runtime_context import get_model, publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -213,6 +216,42 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
                     args = self.parser.parse_args(["--model", "dummy", flag])
                 self.assertIn(f"'{flag}' is deprecated", "\n".join(logs.output))
                 self.assertEqual(vars(args), baseline)
+
+    def test_num_continuous_decode_steps_warns_and_changes_nothing(self):
+        """Nothing reads `--num-continuous-decode-steps N`, but published
+        recipes pass it: it must still parse with its value, say that it has
+        no effect, and leave the arguments as if it were absent -- on the
+        command line, in a config file and as an Engine keyword."""
+        base_args = ["--model", "dummy"]
+        baseline = vars(self.parser.parse_args(base_args))
+        config = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
+        self.addCleanup(os.unlink, config.name)
+        with config:
+            config.write("num-continuous-decode-steps: 2\n")
+        for argv in (
+            base_args + ["--num-continuous-decode-steps", "2"],
+            base_args + ["--num-continuous-decode-steps=4"],
+            ConfigArgumentMerger(self.parser).merge_config_with_args(
+                ["--config", config.name] + base_args
+            ),
+        ):
+            with self.subTest(argv=argv):
+                with self.assertLogs(
+                    "sglang.srt.arg_groups.argparse_actions", level="WARNING"
+                ) as logs:
+                    args = self.parser.parse_args(argv)
+                self.assertIn(
+                    "'--num-continuous-decode-steps' is deprecated and has no effect",
+                    "\n".join(logs.output),
+                )
+                self.assertEqual(vars(args), baseline)
+
+        with self.assertLogs("sglang.srt.server_args", level="WARNING") as logs:
+            ServerArgs(model_path="dummy", num_continuous_decode_steps=2)
+        self.assertIn(
+            "'num_continuous_decode_steps' is deprecated and has no effect",
+            "\n".join(logs.output),
+        )
 
     def test_no_op_python_inputs_still_construct_and_warn(self):
         """Engine kwargs reach the ServerArgs constructor without CLI parsing."""
