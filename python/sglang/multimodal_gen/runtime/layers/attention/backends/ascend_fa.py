@@ -213,10 +213,6 @@ class AscendFABackend(AttentionBackend):
         return AscendFAImpl
 
     @staticmethod
-    def get_metadata_cls() -> type["AttentionMetadata"]:
-        raise NotImplementedError
-
-    @staticmethod
     def get_builder_cls() -> type["AttentionMetadataBuilder"]:
         return AscendFAMetadataBuilder
 

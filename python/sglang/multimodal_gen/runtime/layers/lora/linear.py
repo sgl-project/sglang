@@ -951,24 +951,36 @@ class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
 
 
 class QKVParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
-    def slice_lora_b_weights(
-        self, B: list[torch.Tensor]
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        tp_rank = get_tp_rank()
-        B_q, B_kv = B
+    def slice_lora_b_weights(self, B: torch.Tensor) -> torch.Tensor:
         base_layer = self.base_layer
-        q_proj_shard_size = base_layer.q_proj_shard_size
-        kv_proj_shard_size = base_layer.kv_proj_shard_size
-        num_kv_head_replicas = base_layer.num_kv_head_replicas
+        tp_rank = get_tp_rank()
+        q_size = base_layer.num_heads * base_layer.head_size
+        kv_size = base_layer.num_kv_heads * base_layer.head_size
+        q_start = tp_rank * q_size
+        if B.dim() == 3:
+            # Stacked q / k / v sections have equal sizes, so no head is replicated.
+            return B[:, q_start : q_start + q_size, :]
 
-        q_start_idx = q_proj_shard_size * tp_rank
-        q_end_idx = q_start_idx + q_proj_shard_size
-
-        kv_shard_id = tp_rank // num_kv_head_replicas
-        kv_start_idx = kv_proj_shard_size * kv_shard_id
-        kv_end_idx = kv_start_idx + kv_proj_shard_size
-
-        return B_q[q_start_idx:q_end_idx, :], B_kv[:, kv_start_idx:kv_end_idx, :]
+        q_total = base_layer.total_num_heads * base_layer.head_size
+        kv_total = base_layer.total_num_kv_heads * base_layer.head_size
+        if B.shape[0] != q_total + 2 * kv_total:
+            raise ValueError(
+                f"fused LoRA B has {B.shape[0]} output rows, expected "
+                f"{q_total + 2 * kv_total} for q/k/v sizes "
+                f"{[q_total, kv_total, kv_total]}"
+            )
+        # Ranks that replicate a key/value head share its shard, as in the weight loader.
+        kv_start = (tp_rank // base_layer.num_kv_head_replicas) * kv_size
+        k_start = q_total + kv_start
+        v_start = q_total + kv_total + kv_start
+        return torch.cat(
+            (
+                B[q_start : q_start + q_size],
+                B[k_start : k_start + kv_size],
+                B[v_start : v_start + kv_size],
+            ),
+            dim=0,
+        )
 
 
 class RowParallelLinearWithLoRA(BaseLayerWithLoRA):

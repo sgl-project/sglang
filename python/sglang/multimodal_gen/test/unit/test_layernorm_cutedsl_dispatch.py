@@ -5,9 +5,19 @@ import torch
 
 from sglang.kernels.ops import diffusion
 from sglang.multimodal_gen.runtime.layers.layernorm import (
+    LayerNorm,
     RMSNormScaleShift,
     ScaleResidualLayerNormScaleShift,
 )
+
+
+@pytest.mark.parametrize("elementwise_affine", [True, False])
+def test_layer_norm_can_be_printed(elementwise_affine):
+    """Printing a model prints every submodule; a LayerNorm with or without
+    affine parameters must describe itself instead of raising."""
+    layer = LayerNorm(8, eps=1e-6, elementwise_affine=elementwise_affine)
+
+    assert repr(layer) == "LayerNorm(hidden_size=8, eps=1e-06)"
 
 
 @pytest.mark.parametrize("hidden_size", [257, 8448])

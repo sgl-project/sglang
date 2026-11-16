@@ -30,7 +30,7 @@ def test_invalid_sampling_parameter_answers_400():
         patch.object(
             mesh_api,
             "get_global_server_args",
-            return_value=SimpleNamespace(model_path="dummy"),
+            return_value=SimpleNamespace(model_path="dummy", input_save_path=None),
         ),
         patch.object(mesh_api, "save_image_to_path", _fake_save_image_to_path),
         patch.object(

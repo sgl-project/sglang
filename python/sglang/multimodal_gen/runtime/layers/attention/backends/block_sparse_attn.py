@@ -34,10 +34,6 @@ class BlockSparseAttentionBackend(AttentionBackend):
         return BlockSparseAttentionImpl
 
     @staticmethod
-    def get_metadata_cls() -> type["BlockSparseAttentionMetadata"]:
-        return BlockSparseAttentionMetadata
-
-    @staticmethod
     def get_builder_cls() -> type["BlockSparseAttentionMetadataBuilder"]:
         return BlockSparseAttentionMetadataBuilder
 
