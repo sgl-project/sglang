@@ -354,6 +354,14 @@ def test_router_gemv_is_inventoried_for_cuda_and_hip():
     assert not K.capabilities_satisfied(spec.capabilities, _CPU)
 
 
+def test_softcap_row_argmax_is_inventoried_for_cuda_and_hip():
+    """The op has its own ROCm split path and its caller runs it on HIP."""
+    spec = K.registry.get_backend("sampling.softcap_row_argmax", KernelBackend.TRITON)
+    for platform in (_SM90, _HIP):
+        assert K.capabilities_satisfied(spec.capabilities, platform)
+    assert not K.capabilities_satisfied(spec.capabilities, _CPU)
+
+
 def _readme() -> str:
     return (Path(K.__file__).resolve().parent / "README.md").read_text()
 
