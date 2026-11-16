@@ -509,6 +509,35 @@ class GroupCoordinator:
                 )
             except Exception as e:
                 logger.warning(f"Setup FlashInfer PCIe-IPC allreduce failed with {e}.")
+        # gfx1250 bf16 push all-reduce (Lamport one-/two-shot) for the sizes aiter CA does not cover.
+        self.push_ar = None
+        if (
+            os.environ.get("SGLANG_ROCM_MUSE_PUSH_AR", "0") == "1"
+            and self.world_size in (4, 8)
+            and torch.cuda.is_available()
+            and "gfx1250" in torch.cuda.get_device_properties(self.device).gcnArchName
+        ):
+            try:
+                from sglang.srt.rocm_muse_spark.push_ar import PushAllreduce
+
+                self.push_ar = PushAllreduce(
+                    self.cpu_group,
+                    self.device,
+                    max_bytes=int(
+                        os.environ.get("SGLANG_ROCM_MUSE_PUSH_AR_MAX_BYTES", 8 << 20)
+                    ),
+                )
+                self.push_ar_min_bytes = int(
+                    os.environ.get("SGLANG_ROCM_MUSE_PUSH_AR_MIN_BYTES", (1 << 20) + 1)
+                )
+                logger.info(
+                    "gfx1250 push all-reduce enabled for %s (%d ranks)",
+                    self.unique_name,
+                    self.world_size,
+                )
+            except Exception as e:
+                logger.warning(f"Setup gfx1250 push all-reduce failed with {e}.")
+                self.push_ar = None
         if use_custom_allreduce and self.world_size > 1:
             # Initialize a custom fast all-reduce implementation.
             try:
@@ -983,6 +1012,12 @@ class GroupCoordinator:
                 and self.pymscclpp_comm.should_mscclpp_allreduce(input_)
             )
         if (
+            self.push_ar is not None
+            and input_.numel() * input_.element_size() >= self.push_ar_min_bytes
+            and self.push_ar.applies(input_)
+        ):
+            return "push"
+        if (
             self.ca_comm is not None
             and not self.ca_comm.disabled
             and not should_use_pymscclpp_allreduce
@@ -1070,8 +1105,19 @@ class GroupCoordinator:
         qr_comm = self.qr_comm
         pymscclpp_comm = self.pymscclpp_comm
         torch_symm_mem_comm = self.torch_symm_mem_comm
-        assert any([qr_comm, ca_comm, pymscclpp_comm, torch_symm_mem_comm, pynccl_comm])
-        if outplace_all_reduce_method == "ca":
+        assert any(
+            [
+                qr_comm,
+                ca_comm,
+                pymscclpp_comm,
+                torch_symm_mem_comm,
+                pynccl_comm,
+                self.push_ar,
+            ]
+        )
+        if outplace_all_reduce_method == "push":
+            out = self.push_ar(input_)
+        elif outplace_all_reduce_method == "ca":
             assert not ca_comm.disabled
             out = ca_comm.custom_all_reduce(input_)
         elif outplace_all_reduce_method == "qr":

@@ -32,7 +32,15 @@ SHARED_ROUTER_POOLER = envs.SGLANG_ROCM_MUSE_SHARED_ROUTER_POOLER.get()
 JOINT_ROUTER_POOLER = envs.SGLANG_ROCM_MUSE_JOINT_ROUTER_POOLER.get()
 # The joint form's pooler tiles run on an FP8 copy of the pooler when the boundary kernel hands over the FP8
 # activation (same switch as the FP8 dense GEMMs).
-JOINT_POOLER_FP8 = JOINT_ROUTER_POOLER and envs.SGLANG_ROCM_MUSE_DENSE_FP8.get()
+# The pooler's FP8 copy is gfx950-only (as the dense FP8 copies); gfx1250 runs the BF16 weight.
+JOINT_POOLER_FP8 = (
+    JOINT_ROUTER_POOLER
+    and envs.SGLANG_ROCM_MUSE_DENSE_FP8.get()
+    and not (
+        torch.cuda.is_available()
+        and "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
+    )
+)
 _JOINT_ROWS = (8, 16, 24)
 # Rows above 64 go to the joint form wherever it has a row-major tile (BM 128 in bf16_tiled_small_m_gemm.ROW_MAJOR).
 JOINT_MAX_ROWS = envs.SGLANG_ROCM_MUSE_JOINT_ROUTER_MAX_ROWS.get()

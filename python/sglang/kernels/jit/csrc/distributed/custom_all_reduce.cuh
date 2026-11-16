@@ -485,7 +485,10 @@ struct AllReduceKernel {
       if (two_shot && is_gfx1250() && nbytes <= int64_t{4} << 20) block_size = 256u;
       if constexpr (kWorldSize <= 8) {
         if (two_shot && is_gfx1250() && nbytes >= kTwoShotPushUnrolledMinBytes<kWorldSize>) {
-          LaunchKernel(push.default_blocks, kTwoShotPushThreads, stream)  //
+          // one block per CU for the large two-shot push: fewer blocks leave a late rank exposed, and more than
+          // one co-resident block per CU is not guaranteed (the Lamport polls would hang)
+          const auto num_blocks = std::max(push.default_blocks, runtime::get_sm_count(in.device().device_id));
+          LaunchKernel(num_blocks, kTwoShotPushThreads, stream)  //
               .enable_pdl(kUsePDL)(all_reduce_2shot_push_unrolled_kernel<T, kWorldSize, kUsePDL, PushParams>, params);
           return out;
         }
