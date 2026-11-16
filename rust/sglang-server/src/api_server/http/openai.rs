@@ -13,6 +13,7 @@ use axum::{
 };
 use futures::StreamExt;
 use sglang_processor::ChatFormatterOptions;
+use sglang_processor::openai::OPENAI_MAX_N;
 use std::sync::Arc;
 
 mod chat;
@@ -148,7 +149,8 @@ async fn collect_output(mut call: CoreCall) -> Result<CoreOutput, (StatusCode, S
 }
 
 /// A JSON request body as `Json` extracts it (the same rejections), with its
-/// bytes when the request log logs OpenAI requests as the client sent them.
+/// bytes once read: [`n_error`] reads them, and the request log logs OpenAI
+/// requests as the client sent them.
 pub(super) struct LoggedJson<T> {
     pub(super) body: Result<Json<T>, JsonRejection>,
     pub(super) raw: Option<Bytes>,
@@ -162,7 +164,7 @@ impl<T: serde::de::DeserializeOwned> FromRequest<Arc<AppState>> for LoggedJson<T
         state: &Arc<AppState>,
     ) -> Result<Self, Self::Rejection> {
         // `Json` refuses a body that is not JSON before reading it.
-        if !state.core.logs_openai_requests() || !json_content_type(request.headers()) {
+        if !json_content_type(request.headers()) {
             let body = Json::from_request(request, state).await;
             return Ok(Self { body, raw: None });
         }
@@ -177,8 +179,8 @@ impl<T: serde::de::DeserializeOwned> FromRequest<Arc<AppState>> for LoggedJson<T
         };
         let body = Json::from_bytes(&raw);
         Ok(Self {
-            raw: body.is_ok().then_some(raw),
             body,
+            raw: Some(raw),
         })
     }
 }
@@ -280,6 +282,76 @@ fn model_error(model: &str, served_model_name: &str) -> Option<String> {
             "model `{model}` asks for LoRA adapter `{adapter}`; LoRA is not supported by the Rust server"
         )
     })
+}
+
+/// Why a chat or completions body's `n` cannot be served, if it cannot:
+/// Python's request models refuse it outside `[1, OPENAI_MAX_N]` in field
+/// validation, before the handler runs, taking an integral float as an
+/// integer and refusing `null`, which the typed requests take as unset.
+/// (The content-type check and model-level `before` validators come
+/// earlier.) The typed requests hold a `u8`, so this reads the raw body as
+/// Python's HTTP server does, with orjson: every number as `f64` past 64
+/// bits. A number past `f64` and a body that is not UTF-8 fail to decode
+/// there, so they are left to the parse, as are other values.
+fn n_error(body: &[u8]) -> Option<String> {
+    // Skipped strings are not checked for UTF-8, so check the whole body.
+    let body = std::str::from_utf8(body).ok()?;
+    let BodyN(n) = serde_json::from_str(body).ok()?;
+    let n = n?.get();
+    if n == "null" {
+        return Some("n must be an integer".to_owned());
+    }
+    // serde_json reads a long integer as `f64` and fails past its range.
+    let n = serde_json::from_str::<f64>(n).ok()?;
+    if n.fract() != 0.0 {
+        None
+    } else if n < 1.0 {
+        Some("n must be at least 1".to_owned())
+    } else if n > OPENAI_MAX_N as f64 {
+        Some(format!("n must be at most {OPENAI_MAX_N}"))
+    } else {
+        None
+    }
+}
+
+/// A JSON object's last `n` member, as orjson keeps it, as its JSON text;
+/// the other members are skipped.
+struct BodyN<'a>(Option<&'a serde_json::value::RawValue>);
+
+impl<'de> serde::Deserialize<'de> for BodyN<'de> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Members;
+        impl<'de> serde::de::Visitor<'de> for Members {
+            type Value = BodyN<'de>;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a JSON object")
+            }
+
+            fn visit_map<A: serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<BodyN<'de>, A::Error> {
+                let mut n = None;
+                while let Some(key) = map.next_key::<String>()? {
+                    if key == "n" {
+                        n = Some(map.next_value()?);
+                    } else {
+                        map.next_value::<serde::de::IgnoredAny>()?;
+                    }
+                }
+                Ok(BodyN(n))
+            }
+        }
+        deserializer.deserialize_map(Members)
+    }
+}
+
+/// Python's `validate_n`, which runs once the request is logged: `n` within
+/// `SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ`, which a negative `cap` disables.
+fn batch_n_error(n: u64, cap: i64) -> Option<String> {
+    let exceeds = u64::try_from(cap).is_ok_and(|cap| n > cap);
+    exceeds.then(|| format!("n must be an integer in [1, {cap}], got {n}."))
 }
 
 #[cfg(test)]

@@ -40,9 +40,9 @@ use super::pd_routing::PDRoutingFields;
 use super::template::{RenderedChat, render_chat};
 use super::tools::{apply_tool_constraint, chat_delta, chat_finish_reason, parse_chat_tool_calls};
 use super::{
-    AppState, ChatFormatter, ChatTemplateKwargs, collect_output, contains_media,
-    contains_non_image_media, error_payload, indexed_decode_stream, model_error, openai_error,
-    submit_generation, unix_seconds_u32,
+    AppState, ChatFormatter, ChatTemplateKwargs, batch_n_error, collect_output, contains_media,
+    contains_non_image_media, error_payload, indexed_decode_stream, model_error, n_error,
+    openai_error, submit_generation, unix_seconds_u32,
 };
 use crate::api_server::core::{CoreEvent, CoreOutput, OpenAiRequest};
 use crate::api_server::handlers::CoreCall;
@@ -50,7 +50,7 @@ use crate::message::config::{DefaultSamplingParams, ServerArgs};
 use crate::message::finish_reason::{FinishKind, FinishReason, Matched};
 use crate::message::ids::Rid;
 use crate::message::multimodal::MmItem;
-use crate::message::request::{GenerateRequest, MmData};
+use crate::message::request::{GenerateRequest, MmData, max_batch_reqs_per_http_req};
 use crate::message::response::ChunkExtras;
 use crate::message::sampling::SamplingParams;
 use crate::message::types::OneOrMany;
@@ -98,6 +98,9 @@ async fn chat_completions(
     if let Some(response) = lowered::chat(&state, &headers, &body).await {
         return response;
     }
+    if let Some(message) = n_error(&body) {
+        return openai_error(StatusCode::BAD_REQUEST, message, false);
+    }
     let ChatBody {
         request:
             ChatRequest {
@@ -116,11 +119,11 @@ async fn chat_completions(
     let tool_choice = dynamo_tool_choice(&request.tool_choice);
     let tools =
         sglang_processor::chat_tool_definitions(request.tools.as_deref(), &request.messages);
-    // Python logs the request once its `_validate_request` accepts it, so
-    // only the checks this server shares with it (messages, media for a
-    // text-only model, tool definitions, tool choice) come first; a request
-    // this server goes on to refuse, or to serve where Python would refuse
-    // it, is logged.
+    // Python logs the request once its request model and `_validate_request`
+    // accept it, so only the checks this server shares with them (`n` above,
+    // messages, media for a text-only model, tool definitions, tool choice)
+    // come first; a request this server goes on to refuse, or to serve where
+    // Python would refuse it, is logged.
     if state.core.logs_openai_requests()
         && !request.messages.is_empty()
         && (state.server_args.model_is_multimodal() || !has_media_part(&raw["messages"]))
@@ -145,17 +148,10 @@ async fn chat_completions(
         Ok(images) => images,
         Err(message) => return openai_error(StatusCode::BAD_REQUEST, message, false),
     };
-    if request.n == Some(0) {
-        return openai_error(StatusCode::BAD_REQUEST, "n must be at least 1", false);
-    }
-    #[allow(deprecated)]
-    let max_tokens = request.max_completion_tokens.or(request.max_tokens);
-    if max_tokens == Some(0) {
-        return openai_error(
-            StatusCode::BAD_REQUEST,
-            "max_completion_tokens must be positive",
-            false,
-        );
+    let batch_cap = max_batch_reqs_per_http_req();
+    let batch_n = u64::from(request.n.unwrap_or(1));
+    if let Some(message) = batch_n_error(batch_n, batch_cap) {
+        return openai_error(StatusCode::BAD_REQUEST, message, false);
     }
     if request.modalities.as_ref().is_some_and(|modalities| {
         serde_json::to_value(modalities).is_ok_and(|value| value.to_string().contains("\"audio\""))
@@ -1192,14 +1188,15 @@ mod tests {
 
     use super::super::ChatFormatter;
     use super::super::test_utils::{
-        answering_app_state_with, answering_app_state_with_item, body_json, chat_submitted, chunk,
-        post_json, with_cached_tokens,
+        answering_app_state_with, answering_app_state_with_item, answering_app_state_with_request,
+        body_json, chat_submitted, chunk, post_json, with_cached_tokens,
     };
     use super::{
         OutputParsing, SamplingDefaults, chat_event_stream, chat_images, chat_logprobs,
         chat_sampling_params, merge_template_stops, unary_chat,
     };
     use crate::message::config::{DefaultSamplingParams, ServerArgs};
+    use crate::message::request::{Request, RequestKind};
     use crate::message::response::{ChunkEvent, ChunkExtras, ResponseItem};
     use axum::http::StatusCode;
     use futures::StreamExt;
@@ -1370,6 +1367,148 @@ mod tests {
                 .max_new_tokens,
             None
         );
+    }
+
+    /// Python's `effective_max_tokens`: `max_completion_tokens` wins whenever
+    /// it is set, an explicit zero included.
+    #[test]
+    fn max_completion_tokens_takes_precedence_including_zero() {
+        for (max_completion_tokens, max_tokens, expected) in [
+            (Some(0), Some(5), Some(0)),
+            (Some(0), None, Some(0)),
+            (None, Some(0), Some(0)),
+            (Some(7), Some(5), Some(7)),
+            (Some(7), Some(0), Some(7)),
+            (None, Some(5), Some(5)),
+        ] {
+            let mut request = request();
+            request.max_completion_tokens = max_completion_tokens;
+            #[allow(deprecated)]
+            {
+                request.max_tokens = max_tokens;
+            }
+            let sampling = chat_sampling_params(&request, &SamplingDefaults::CHAT).unwrap();
+            assert_eq!(
+                sampling.max_new_tokens, expected,
+                "max_completion_tokens={max_completion_tokens:?} max_tokens={max_tokens:?}"
+            );
+        }
+    }
+
+    /// A scheduler honoring the output limit: that many tokens, then a `length` finish.
+    fn honor_output_limit(request: &Request) -> ResponseItem {
+        let RequestKind::Generate(generation) = &request.kind else {
+            unreachable!("chat submits generations");
+        };
+        let tokens = generation.sampling_params.max_new_tokens.unwrap() as usize;
+        ResponseItem::Done(ChunkEvent {
+            rid: request.rid.as_str().into(),
+            text: "x".repeat(tokens),
+            token_ids: vec![1; tokens],
+            prompt_tokens: 5,
+            completion_tokens: tokens as u64,
+            finish_reason: Some(
+                serde_json::from_value(serde_json::json!({"type": "length", "length": tokens}))
+                    .unwrap(),
+            ),
+            ..Default::default()
+        })
+    }
+
+    /// An explicit zero output limit, which `max_completion_tokens` sets over
+    /// `max_tokens`, is served as Python serves it: every choice empty with a
+    /// `length` finish and no completion tokens, unary and streamed.
+    #[tokio::test]
+    async fn zero_output_limit_is_served() {
+        for reasoning_parser in [None, Some("deepseek-r1")] {
+            let args = ServerArgs {
+                served_model_name: "model".into(),
+                reasoning_parser: reasoning_parser.map(str::to_owned),
+                ..Default::default()
+            };
+            let formatter =
+                sglang_processor::load_chat_formatter(None, None, None, Some("chatml")).unwrap();
+            let state = answering_app_state_with_request(
+                Arc::new(args),
+                formatter,
+                None,
+                honor_output_limit,
+            );
+            let app = super::super::routes().with_state(state);
+            for (limits, text) in [
+                (serde_json::json!({"max_completion_tokens": 0}), ""),
+                (serde_json::json!({"max_tokens": 0}), ""),
+                (
+                    serde_json::json!({"max_tokens": 5, "max_completion_tokens": 0}),
+                    "",
+                ),
+                (
+                    serde_json::json!({"max_tokens": 0, "max_completion_tokens": 2}),
+                    "xx",
+                ),
+            ] {
+                let mut body = serde_json::json!({
+                    "model": "model",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "n": 2,
+                });
+                for (key, value) in limits.as_object().unwrap() {
+                    body[key] = value.clone();
+                }
+                let tokens = 2 * text.len();
+                // Reasoning or content, as the parser splits it.
+                let output = |delta: &serde_json::Value| {
+                    ["reasoning_content", "content"]
+                        .iter()
+                        .filter_map(|field| delta[field].as_str())
+                        .collect::<String>()
+                };
+
+                let response = post_json(app.clone(), "/v1/chat/completions", body.clone()).await;
+                assert_eq!(response.status(), StatusCode::OK, "{body}");
+                let value = body_json(response).await;
+                let choices = value["choices"].as_array().unwrap();
+                assert_eq!(choices.len(), 2, "{value}");
+                for choice in choices {
+                    assert_eq!(output(&choice["message"]), text, "{value}");
+                    assert_eq!(choice["finish_reason"], "length", "{value}");
+                }
+                assert_eq!(value["usage"]["completion_tokens"], tokens, "{value}");
+
+                body["stream"] = true.into();
+                body["stream_options"] = serde_json::json!({"include_usage": true});
+                let response = post_json(app.clone(), "/v1/chat/completions", body.clone()).await;
+                assert_eq!(response.status(), StatusCode::OK, "{body}");
+                let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+                    .await
+                    .unwrap();
+                let sse = std::str::from_utf8(&bytes).unwrap();
+                assert!(sse.trim_end().ends_with("data: [DONE]"), "{sse}");
+                let frames: Vec<serde_json::Value> = sse
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter(|data| *data != "[DONE]")
+                    .map(|data| serde_json::from_str(data).unwrap())
+                    .collect();
+                for index in 0..2 {
+                    let deltas: Vec<&serde_json::Value> = frames
+                        .iter()
+                        .flat_map(|frame| frame["choices"].as_array().unwrap())
+                        .filter(|choice| choice["index"] == index)
+                        .collect();
+                    let streamed: String = deltas.iter().map(|c| output(&c["delta"])).collect();
+                    assert_eq!(streamed, text, "{sse}");
+                    let finishes: Vec<&serde_json::Value> = deltas
+                        .iter()
+                        .map(|choice| &choice["finish_reason"])
+                        .filter(|finish| !finish.is_null())
+                        .collect();
+                    assert_eq!(finishes, ["length"], "{sse}");
+                }
+                let usage = &frames.last().unwrap()["usage"];
+                assert_eq!(usage["completion_tokens"], tokens, "{sse}");
+            }
+        }
     }
 
     #[test]

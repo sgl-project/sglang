@@ -22,14 +22,14 @@ use super::super::auth::DeclaredRoute;
 use super::super::dp_relay::HintRoute;
 use super::pd_routing::PDRoutingFields;
 use super::{
-    AppState, LoggedJson, MAX_OPENAI_CHOICES, collect_output, error_payload, indexed_decode_stream,
-    model_error, openai_error, submit_generation, unix_seconds_u32,
+    AppState, LoggedJson, MAX_OPENAI_CHOICES, batch_n_error, collect_output, error_payload,
+    indexed_decode_stream, model_error, n_error, openai_error, submit_generation, unix_seconds_u32,
 };
 use crate::api_server::core::{CoreError, CoreEvent, CoreOutput, OpenAiRequest};
 use crate::api_server::handlers::CoreCall;
 use crate::message::finish_reason::Matched;
 use crate::message::ids::Rid;
-use crate::message::request::GenerateRequest;
+use crate::message::request::{GenerateRequest, max_batch_reqs_per_http_req};
 use crate::message::response::ChunkExtras;
 use crate::message::sampling::SamplingParams;
 use crate::message::types::{OneOrMany, TokenIds};
@@ -75,6 +75,9 @@ async fn completions(
     headers: HeaderMap,
     LoggedJson { body, raw }: LoggedJson<CompletionRequest>,
 ) -> Response {
+    if let Some(message) = raw.as_deref().and_then(n_error) {
+        return openai_error(StatusCode::BAD_REQUEST, message, false);
+    }
     let CompletionRequest {
         request,
         skip_special_tokens,
@@ -88,6 +91,7 @@ async fn completions(
     // Python logs the request once its model and `_validate_request` accept
     // it, so only the checks this server shares with them come first.
     if let Some(raw) = raw
+        && state.core.logs_openai_requests()
         && request.max_tokens != Some(0)
         && !python_empty_prompt(&request.prompt)
     {
@@ -130,8 +134,10 @@ async fn completions(
             false,
         );
     }
-    if request.n == Some(0) {
-        return openai_error(StatusCode::BAD_REQUEST, "n must be at least 1", false);
+    let batch_cap = max_batch_reqs_per_http_req();
+    let batch_n = u64::from(request.n.unwrap_or(1));
+    if let Some(message) = batch_n_error(batch_n, batch_cap) {
+        return openai_error(StatusCode::BAD_REQUEST, message, false);
     }
     let prompts = match completion_prompt_specs(&request.prompt) {
         Ok(prompts) => prompts,

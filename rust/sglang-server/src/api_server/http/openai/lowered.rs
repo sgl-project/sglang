@@ -23,14 +23,14 @@ use super::super::dp_relay::HintRoute;
 use super::super::request_headers::apply_header_overrides;
 use super::chat::ChatBody;
 use super::template::RenderedChat;
-use super::{AppState, ChatFormatter};
+use super::{AppState, ChatFormatter, batch_n_error};
 use crate::api_server::core::{CoreError, OpenAiRequest, ReceivedAs};
 use crate::api_server::http::native_api::{
     GenerateItem, RequestState, RequestTiming, drain_unary_frame, generate_requests,
     generation_event_stream_with,
 };
 use crate::message::config::ServerArgs;
-use crate::message::request::check_prompt_copies;
+use crate::message::request::{check_prompt_copies, max_batch_reqs_per_http_req};
 use crate::utils::error::Error;
 
 /// The server facts and tokenizer the processor's chat layer reads.
@@ -172,6 +172,10 @@ pub(super) async fn chat(
         .log_openai_request(OpenAiRequest::ChatCompletion, body, headers);
 
     let stream = generate["stream"] == true;
+    let n = generate["sampling_params"]["n"].as_u64().unwrap_or(1);
+    if let Some(message) = batch_n_error(n, max_batch_reqs_per_http_req()) {
+        return Some(error_response(StatusCode::BAD_REQUEST, &message));
+    }
     if let Err(error) = copy_prompt_per_choice(&mut generate) {
         return Some(error_response(StatusCode::BAD_REQUEST, &error.to_string()));
     }
@@ -473,11 +477,12 @@ mod tests {
     use axum::Router;
 
     use super::super::test_utils::{
-        answering_app_state_with, answering_app_state_with_item, body_json, checkpoint_formatter,
-        chunk, oneshot, post_json, with_cached_tokens,
+        answering_app_state_with, answering_app_state_with_item, answering_app_state_with_request,
+        body_json, checkpoint_formatter, chunk, oneshot, post_json, with_cached_tokens,
     };
     use super::*;
-    use crate::message::response::{ChunkExtras, ResponseItem};
+    use crate::message::request::RequestKind;
+    use crate::message::response::{ChunkEvent, ChunkExtras, ResponseItem};
 
     /// A byte-level word tokenizer's `tokenizer.json`; id 3 is `é`'s bytes.
     fn tokenizer_path() -> &'static str {
@@ -524,10 +529,10 @@ mod tests {
         super::super::routes().with_state(state)
     }
 
-    /// An `n` past the batch cap is a 400 before the prompt is copied, not a
-    /// capacity-overflow panic.
+    /// An `n` the typed request cannot hold, streamed, is the typed handler's
+    /// unary 400.
     #[tokio::test]
-    async fn oversized_n_is_rejected_before_copying_the_prompt() {
+    async fn huge_n_is_refused_by_the_typed_handler() {
         let app = lowered_state(|rid| chunk(rid, "ok", true));
         let body = json!({
             "model": "model",
@@ -538,10 +543,308 @@ mod tests {
         let response = post_json(app, "/v1/chat/completions", body).await;
         // Unary, as Python answers a failure before the first chunk.
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        // Past `OPENAI_MAX_N`, the typed handler answers.
         let value = body_json(response).await;
-        assert_eq!(value["type"], "BadRequestError");
-        let message = value["message"].as_str().unwrap();
-        assert!(message.contains("exceeds the maximum"), "{message}");
+        assert_eq!(value["error"]["message"], "n must be at most 128");
+    }
+
+    /// The copies of a prompt are bounded before any is made: a long prompt
+    /// under an `n` the request models allow is a 400, not an allocation.
+    #[test]
+    fn prompt_copies_are_bounded_before_copying() {
+        let mut generate = json!({
+            "input_ids": vec![1; 100_000],
+            "sampling_params": {"n": 128},
+        });
+        let error = copy_prompt_per_choice(&mut generate)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("byte limit"), "{error}");
+        assert_eq!(generate["input_ids"].as_array().unwrap().len(), 100_000);
+        assert_eq!(generate["sampling_params"]["n"], 128);
+    }
+
+    /// `SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ` bounds `n` below `OPENAI_MAX_N` on
+    /// every OpenAI route, as Python's `validate_n` does. The cap is read once
+    /// per process, so the check runs alone in a child test process.
+    #[test]
+    fn batch_cap_bounds_n_on_every_route() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "api_server::http::openai::lowered::tests::batch_cap_child",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .env(BATCH_CAP_CHILD_ENV, "1")
+            .env("SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ", "4")
+            .output()
+            .unwrap();
+        let log = String::from_utf8_lossy(&output.stdout);
+        assert!(output.status.success(), "{log}");
+        assert!(
+            log.contains("1 passed"),
+            "the child test did not run: {log}"
+        );
+    }
+
+    const BATCH_CAP_CHILD_ENV: &str = "SGLANG_TEST_OPENAI_BATCH_CAP_CHILD";
+
+    #[tokio::test]
+    #[ignore = "run by batch_cap_bounds_n_on_every_route in its own process"]
+    async fn batch_cap_child() {
+        if std::env::var_os(BATCH_CAP_CHILD_ENV).is_none() {
+            return;
+        }
+        let formatter = sglang_processor::load_chat_formatter(None, None, None, Some("chatml"));
+        let args = Arc::new(ServerArgs {
+            served_model_name: "model".into(),
+            ..Default::default()
+        });
+        let typed = answering_app_state_with(args, formatter.unwrap(), None, "ok");
+        let typed = super::super::routes().with_state(typed);
+        let lowered = lowered_state(|rid| chunk(rid, "ok", true));
+        let messages = json!([{"role": "user", "content": "hi"}]);
+        let mut refusals = Vec::new();
+        for (route, app, path, body) in [
+            (
+                "chat",
+                &typed,
+                "/v1/chat/completions",
+                json!({"messages": messages}),
+            ),
+            (
+                "completions",
+                &typed,
+                "/v1/completions",
+                json!({"prompt": "hi"}),
+            ),
+            (
+                "lowered chat",
+                &lowered,
+                "/v1/chat/completions",
+                json!({"messages": messages}),
+            ),
+        ] {
+            let mut body = body.clone();
+            body["model"] = json!("model");
+            body["n"] = json!(4);
+            let response = post_json(app.clone(), path, body.clone()).await;
+            assert_eq!(response.status(), StatusCode::OK, "{route}");
+            let choices = body_json(response).await["choices"]
+                .as_array()
+                .unwrap()
+                .len();
+            assert_eq!(choices, 4, "{route}");
+            body["n"] = json!(5);
+            let response = post_json(app.clone(), path, body).await;
+            let status = response.status();
+            let value = body_json(response).await;
+            let error = value.get("error").unwrap_or(&value);
+            refusals.push((route, status.as_u16(), error["message"].clone()));
+        }
+        let message = json!("n must be an integer in [1, 4], got 5.");
+        let expected = [
+            ("chat", 400, message.clone()),
+            ("completions", 400, message.clone()),
+            ("lowered chat", 400, message),
+        ];
+        assert_eq!(refusals, expected);
+    }
+
+    /// A negative output limit or `top_logprobs`, which Python's request model
+    /// refuses, is left to the typed handler, which refuses it.
+    #[tokio::test]
+    async fn negative_limits_are_refused_by_the_typed_handler() {
+        let app = lowered_state(|rid| chunk(rid, "ok", true));
+        let prefix = "Failed to deserialize the JSON body into the target type: ";
+        let cases = [
+            json!({"max_tokens": -1, "max_completion_tokens": 0}),
+            json!({"max_tokens": -5, "max_completion_tokens": 3}),
+            json!({"top_logprobs": -1}),
+        ];
+        let mut refusals = Vec::new();
+        for limits in &cases {
+            let mut body =
+                json!({"model": "model", "messages": [{"role": "user", "content": "hi"}]});
+            for (key, value) in limits.as_object().unwrap() {
+                body[key] = value.clone();
+            }
+            let response = post_json(app.clone(), "/v1/chat/completions", body).await;
+            let status = response.status().as_u16();
+            refusals.push((
+                status,
+                body_json(response).await["error"]["message"].clone(),
+            ));
+        }
+        let expected = [
+            (
+                400,
+                json!(format!("{prefix}invalid value: integer `-1`, expected u32")),
+            ),
+            (
+                400,
+                json!(format!("{prefix}invalid value: integer `-5`, expected u32")),
+            ),
+            (
+                400,
+                json!(format!("{prefix}invalid value: integer `-1`, expected u8")),
+            ),
+        ];
+        assert_eq!(refusals, expected, "{cases:?}");
+    }
+
+    /// An `n` past `OPENAI_MAX_N` is left to the typed handler, which refuses it.
+    #[tokio::test]
+    async fn n_past_openai_max_n_is_refused() {
+        let app = lowered_state(|rid| chunk(rid, "ok", true));
+        for stream in [false, true] {
+            let body = json!({
+                "model": "model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "n": 129,
+                "stream": stream,
+            });
+            let response = post_json(app.clone(), "/v1/chat/completions", body).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "stream={stream}"
+            );
+            let value = body_json(response).await;
+            assert_eq!(
+                value["error"]["message"], "n must be at most 128",
+                "{value}"
+            );
+        }
+    }
+
+    /// An explicit `null` `n`, which the lowerer cannot read, is left to the
+    /// typed handler, which refuses it as Python's request model does.
+    #[tokio::test]
+    async fn null_n_is_refused_by_the_typed_handler() {
+        let app = lowered_state(|rid| chunk(rid, "ok", true));
+        for stream in [false, true] {
+            let body = json!({
+                "model": "model",
+                "messages": [{"role": "user", "content": "hi"}],
+                "n": null,
+                "stream": stream,
+            });
+            let response = post_json(app.clone(), "/v1/chat/completions", body).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::BAD_REQUEST,
+                "stream={stream}"
+            );
+            let value = body_json(response).await;
+            assert_eq!(value["error"]["message"], "n must be an integer", "{value}");
+        }
+    }
+
+    /// An explicit zero output limit, which `max_completion_tokens` sets over
+    /// `max_tokens`, reaches the engine: no tokens and a `length` finish.
+    #[tokio::test]
+    async fn zero_output_limit_reaches_the_engine() {
+        let formatter = checkpoint_formatter(&json!({}), "{{ messages[0].content }}");
+        let args = ServerArgs {
+            served_model_name: "model".into(),
+            ..Default::default()
+        };
+        // Generates the limit's tokens, or 16 when unlimited.
+        let state = answering_app_state_with_request(
+            Arc::new(args),
+            formatter,
+            Some(tokenizer()),
+            |request| {
+                let RequestKind::Generate(generation) = &request.kind else {
+                    unreachable!("chat submits generations");
+                };
+                let tokens = generation.sampling_params.max_new_tokens.unwrap_or(16) as usize;
+                let length = json!({"type": "length", "length": tokens});
+                ResponseItem::Done(ChunkEvent {
+                    rid: request.rid.as_str().into(),
+                    text: "!".repeat(tokens),
+                    token_ids: vec![1; tokens],
+                    prompt_tokens: 5,
+                    completion_tokens: tokens as u64,
+                    finish_reason: Some(serde_json::from_value(length).unwrap()),
+                    ..Default::default()
+                })
+            },
+        );
+        let app = super::super::routes().with_state(state);
+        let cases = [
+            json!({"max_completion_tokens": 0}),
+            json!({"max_tokens": 0}),
+            json!({"max_tokens": 5, "max_completion_tokens": 0}),
+            json!({"max_tokens": 0, "max_completion_tokens": 2}),
+        ];
+        let mut replies = Vec::new();
+        for limits in &cases {
+            let mut body =
+                json!({"model": "model", "messages": [{"role": "user", "content": "hi"}]});
+            for (key, value) in limits.as_object().unwrap() {
+                body[key] = value.clone();
+            }
+            let value = body_json(post_json(app.clone(), "/v1/chat/completions", body).await).await;
+            // Served by the processor, which reports reasoning tokens.
+            assert!(value["usage"].get("reasoning_tokens").is_some(), "{value}");
+            let choice = &value["choices"][0];
+            replies.push(json!([
+                choice["message"]["content"],
+                choice["finish_reason"],
+                value["usage"]["completion_tokens"],
+            ]));
+        }
+        let expected = [
+            json!(["", "length", 0]),
+            json!(["", "length", 0]),
+            json!(["", "length", 0]),
+            json!(["!!", "length", 2]),
+        ];
+        assert_eq!(replies, expected, "{cases:?}");
+
+        // Streamed: no content, one `length` finish, and no completion tokens.
+        let body = json!({
+            "model": "model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_completion_tokens": 0,
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        });
+        let response = post_json(app, "/v1/chat/completions", body).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+            .await
+            .unwrap();
+        let sse = String::from_utf8(bytes.to_vec()).unwrap();
+        assert!(sse.trim_end().ends_with("data: [DONE]"), "{sse}");
+        let chunks: Vec<Value> = sse
+            .split("\n\n")
+            .filter_map(|event| event.strip_prefix("data: "))
+            .filter_map(|data| serde_json::from_str(data).ok())
+            .collect();
+        let choices: Vec<&Value> = chunks
+            .iter()
+            .flat_map(|chunk| chunk["choices"].as_array().unwrap())
+            .collect();
+        let content: String = choices
+            .iter()
+            .filter_map(|choice| choice["delta"]["content"].as_str())
+            .collect();
+        assert_eq!(content, "", "{sse}");
+        let finishes: Vec<&Value> = choices
+            .iter()
+            .map(|choice| &choice["finish_reason"])
+            .filter(|finish| !finish.is_null())
+            .collect();
+        assert_eq!(finishes, ["length"], "{sse}");
+        let usage = chunks
+            .iter()
+            .find_map(|chunk| chunk.get("usage").filter(|usage| !usage.is_null()))
+            .unwrap_or_else(|| panic!("no usage chunk: {sse}"));
+        assert_eq!(usage["completion_tokens"], 0, "{sse}");
     }
 
     /// Chat lowers to the native request, so it refuses what `/generate`

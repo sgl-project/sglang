@@ -15,6 +15,8 @@ use crate::utils::{error::Error, regex::RegexPattern};
 const SAMPLING_EPS: f64 = 1e-6;
 /// `TOP_K_ALL = 1 << 30` — `top_k` sentinel for "consider the whole vocabulary".
 const TOP_K_ALL: i64 = 1 << 30;
+/// A larger bias, divided by a temperature >= `SAMPLING_EPS`, overflows f32 and NaNs the softmax.
+const LOGIT_BIAS_ABS_MAX: f64 = 1e30;
 /// Most stop STRINGS accepted per request. The scheduler scans the decoded text
 /// once per stop per decode step, so this is a per-step multiplier: 50k stops
 /// measured 20.4 ms/step from a 586 KB body.
@@ -222,7 +224,7 @@ pub struct SamplingParams {
 
     // Logit processing and reproducibility.
     /// Token id (as a string key, matching Python) → bias. Keys are vocab-bounded
-    /// by [`verify`](Self::verify).
+    /// and values magnitude-bounded by [`verify`](Self::verify).
     #[serde(default)]
     pub logit_bias: Option<BTreeMap<String, f64>>,
     #[serde(default)]
@@ -503,7 +505,7 @@ impl SamplingParams {
         // *range* check needs the vocab size (`None` = unknown, skip it); the key
         // format is checked either way, since `int(key)` runs regardless.
         if let Some(logit_bias) = &self.logit_bias {
-            for key in logit_bias.keys() {
+            for (key, &bias) in logit_bias {
                 let token_id: u64 = key
                     .parse()
                     .map_err(|_| bad(format!("logit_bias keys must be token ids, got {key:?}")))?;
@@ -511,6 +513,13 @@ impl SamplingParams {
                     return Err(bad(format!(
                         "logit_bias must have keys in [0, {}], got {token_id}",
                         vocab_size - 1
+                    )));
+                }
+                if !bias.is_finite() || bias.abs() > LOGIT_BIAS_ABS_MAX {
+                    return Err(bad(format!(
+                        "logit_bias values must be finite numbers with magnitude <= \
+                         {LOGIT_BIAS_ABS_MAX:?}, got {} for token {key}.",
+                        py_float_repr(bias)
                     )));
                 }
             }
@@ -587,6 +596,15 @@ impl SamplingParams {
 
 fn bad(msg: String) -> Error {
     Error::Validation(msg)
+}
+
+/// Python's float `repr`, valid only for NaN, +-inf and finite `|x| >= 1e16` (exponent form).
+fn py_float_repr(x: f64) -> String {
+    if x.is_nan() {
+        "nan".into()
+    } else {
+        format!("{x:e}").replacen('e', "e+", 1)
+    }
 }
 
 /// Widen a `str | [str]` API alias into the list form the internal field holds.
@@ -1116,6 +1134,108 @@ mod tests {
             let _ = norm_err(json);
         }
         assert!(norm(r#"{"logit_bias": {"7": 1.0}}"#).logit_bias.is_some());
+    }
+
+    fn with_bias(token: &str, bias: f64) -> SamplingParams {
+        SamplingParams {
+            logit_bias: Some(BTreeMap::from([(token.to_string(), bias)])),
+            ..SamplingParams::default()
+        }
+    }
+
+    /// The scheduler divides the f32 bias by a temperature as low as
+    /// `SAMPLING_EPS`; a value past 1e30, or a non-finite one, NaNs the softmax.
+    /// JSON cannot carry inf or NaN, but gRPC's `double` can.
+    #[test]
+    fn logit_bias_values_are_finite_and_at_most_1e30() {
+        for bias in [1e30, -1e30, 0.0, -100.0] {
+            with_bias("7", bias)
+                .normalize(false, TEST_VOCAB)
+                .unwrap_or_else(|e| panic!("{bias:?} is in range but was rejected: {e}"));
+        }
+        let mut wrong = Vec::new();
+        // Each value as Python's message prints it (`{bias!r}`).
+        for (bias, repr) in [
+            (1e30_f64.next_up(), "1.0000000000000002e+30"),
+            ((-1e30_f64).next_down(), "-1.0000000000000002e+30"),
+            (1e31, "1e+31"),
+            (-1e31, "-1e+31"),
+            (f64::INFINITY, "inf"),
+            (f64::NEG_INFINITY, "-inf"),
+            (f64::NAN, "nan"),
+        ] {
+            let want = format!(
+                "logit_bias values must be finite numbers with magnitude <= 1e30, \
+                 got {repr} for token 0."
+            );
+            match with_bias("0", bias).normalize(false, TEST_VOCAB) {
+                Err(err) if err.to_string().contains(&want) => {}
+                got => wrong.push(format!("{repr}: {:?}", got.map_err(|e| e.to_string()))),
+            }
+        }
+        assert!(wrong.is_empty(), "want Python's message: {wrong:#?}");
+        // Python checks each entry's key before its value, so a bad key wins.
+        let err = with_bias("1000", f64::INFINITY).normalize(false, 1000);
+        assert!(err.unwrap_err().to_string().contains("must have keys in"));
+        let err = with_bias("abc", f64::NAN).normalize(false, 1000);
+        assert!(err.unwrap_err().to_string().contains("must be token ids"));
+    }
+
+    /// What native `/generate` JSON delivers here (body as axum's `Json<Value>`
+    /// parses it, then the wire params): a literal past f64 range or a non-number
+    /// fails to parse, while an integer too big for u64 parses as a finite f64.
+    #[test]
+    fn logit_bias_json_values_reach_verify_only_when_finite() {
+        use sglang_api_types::api::v1 as api;
+
+        fn native(json: &str) -> Result<SamplingParams, String> {
+            let body: serde_json::Value = serde_json::from_str(json).map_err(|e| e.to_string())?;
+            let wire: api::SamplingParams =
+                serde_json::from_value(body).map_err(|e| e.to_string())?;
+            SamplingParams::try_from(wire)
+        }
+
+        let past_f64 = format!(r#"{{"logit_bias": {{"0": 1{}}}}}"#, "0".repeat(400));
+        for json in [
+            r#"{"logit_bias": {"0": 1e309}}"#,
+            r#"{"logit_bias": {"0": -1e309}}"#,
+            &past_f64,
+        ] {
+            let err = native(json).expect_err("must not parse");
+            assert!(err.contains("number out of range"), "{json}: {err}");
+        }
+        for json in [
+            r#"{"logit_bias": {"0": "1.0"}}"#,
+            r#"{"logit_bias": {"0": "Infinity"}}"#,
+            r#"{"logit_bias": {"0": true}}"#,
+            r#"{"logit_bias": {"0": null}}"#,
+            r#"{"logit_bias": {"0": [1.0]}}"#,
+        ] {
+            let err = native(json).expect_err("must not parse");
+            assert!(err.contains("invalid type"), "{json}: {err}");
+        }
+
+        let mut at_max = native(r#"{"logit_bias": {"0": 1000000000000000000000000000000}}"#)
+            .expect("10^30 parses");
+        at_max
+            .normalize(false, TEST_VOCAB)
+            .expect("10^30 rounds to 1e30");
+
+        let err = native(r#"{"logit_bias": {"0": 1e31}}"#)
+            .unwrap()
+            .normalize(false, TEST_VOCAB)
+            .unwrap_err();
+        assert!(err.to_string().contains("got 1e+31 for token 0."), "{err}");
+
+        let mut sp = native(r#"{"logit_bias": {"0": 1000000000000000000000000000000000000000}}"#)
+            .expect("an integer past u64 parses as f64");
+        assert_eq!(sp.logit_bias.as_ref().unwrap()["0"], 1e39);
+        let Err(err) = sp.normalize(false, TEST_VOCAB) else {
+            panic!("1e39 is out of range but was accepted");
+        };
+        // Python prints this JSON integer as an int; without serde_json's
+        // `arbitrary_precision` only the f64 reaches here, so it prints as a float.
+        assert!(err.to_string().contains("got 1e+39 for token 0."), "{err}");
     }
 
     /// Both `stop_regex` caps, neither of which had a test: deleting either `if`

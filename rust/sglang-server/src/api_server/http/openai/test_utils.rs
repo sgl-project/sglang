@@ -19,7 +19,7 @@ use futures::StreamExt;
 use serde_json::json;
 use tower::util::ServiceExt;
 
-use super::{indexed_decode_stream, model_error, openai_error, routes};
+use super::{batch_n_error, indexed_decode_stream, model_error, openai_error, routes};
 use crate::api_server::core::CoreEvent;
 use crate::api_server::handlers::{CoreCall, CoreHandle};
 use crate::message::config::ServerArgs;
@@ -197,7 +197,7 @@ fn answering_app_state_logged(
         server_args(),
         formatter.unwrap(),
         None,
-        |rid| chunk(rid, "ok", true),
+        |request| chunk(request.rid.as_str(), "ok", true),
         Some(request_log),
     )
 }
@@ -221,6 +221,22 @@ pub(super) fn answering_app_state_with_item(
     tokenizer: Option<sglang_processor::dynamo_tokenizers::Tokenizer>,
     answer: impl Fn(&str) -> ResponseItem + Send + 'static,
 ) -> Arc<super::AppState> {
+    answering_app_state_built(
+        server_args,
+        formatter,
+        tokenizer,
+        move |request| answer(request.rid.as_str()),
+        None,
+    )
+}
+
+/// [`answering_app_state_with`], answering each request with `answer(request)`.
+pub(super) fn answering_app_state_with_request(
+    server_args: Arc<ServerArgs>,
+    formatter: super::ChatFormatter,
+    tokenizer: Option<sglang_processor::dynamo_tokenizers::Tokenizer>,
+    answer: impl Fn(&crate::message::request::Request) -> ResponseItem + Send + 'static,
+) -> Arc<super::AppState> {
     answering_app_state_built(server_args, formatter, tokenizer, answer, None)
 }
 
@@ -228,7 +244,7 @@ fn answering_app_state_built(
     server_args: Arc<ServerArgs>,
     formatter: super::ChatFormatter,
     tokenizer: Option<sglang_processor::dynamo_tokenizers::Tokenizer>,
-    answer: impl Fn(&str) -> ResponseItem + Send + 'static,
+    answer: impl Fn(&crate::message::request::Request) -> ResponseItem + Send + 'static,
     request_log: Option<Arc<crate::api_server::core::RequestLog>>,
 ) -> Arc<super::AppState> {
     let (intake_tx, intake_rx) = flume::unbounded();
@@ -237,7 +253,7 @@ fn answering_app_state_built(
         let mut open = Vec::new();
         while let Ok(TmEvent::Intake { request, admission }) = intake_rx.recv_async().await {
             assert!(admission.try_accept());
-            request.sink.try_send(answer(request.rid.as_str())).unwrap();
+            request.sink.try_send(answer(&request)).unwrap();
             open.push(request);
         }
     });
@@ -423,10 +439,6 @@ async fn chat_handler_validates_before_submit() {
             json!({"model": "model", "messages": [{"role": "user", "content": "hi"}], "audio": {"input_audio": {"data": "x", "format": "wav"}}}),
             "audio",
         ),
-        (
-            json!({"model": "model", "messages": [{"role": "user", "content": "hi"}], "max_completion_tokens": 0}),
-            "max_completion_tokens=0",
-        ),
     ];
     for (body, label) in cases {
         let response = post_json(app.clone(), "/v1/chat/completions", body).await;
@@ -440,6 +452,340 @@ async fn chat_handler_validates_before_submit() {
     )
     .await;
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+/// Python's request models bound `n` by `OPENAI_MAX_N`: both routes refuse a
+/// larger one, streamed or not, before rendering or submitting any choice.
+#[tokio::test]
+async fn openai_handlers_bound_n() {
+    let served = routes().with_state(answering_app_state());
+    let closed = routes().with_state(app_state(frontend_closed()));
+    let messages = json!([{"role": "user", "content": "hi"}]);
+    for (path, body) in [
+        ("/v1/completions", json!({"model": "model", "prompt": "hi"})),
+        (
+            "/v1/chat/completions",
+            json!({"model": "model", "messages": messages}),
+        ),
+    ] {
+        let mut body = body.clone();
+        body["n"] = json!(128);
+        let response = post_json(served.clone(), path, body.clone()).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let choices = body_json(response).await["choices"]
+            .as_array()
+            .unwrap()
+            .len();
+        assert_eq!(choices, 128, "{path}");
+        for n in [129, 255] {
+            for stream in [false, true] {
+                body["n"] = json!(n);
+                body["stream"] = json!(stream);
+                for app in [&served, &closed] {
+                    let response = post_json(app.clone(), path, body.clone()).await;
+                    assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path} {body}");
+                    let error = body_json(response).await["error"].clone();
+                    assert_eq!(error["message"], "n must be at most 128", "{path} {body}");
+                }
+            }
+        }
+    }
+    // The total across prompts keeps its own bound.
+    let body = json!({"model": "model", "prompt": vec!["hi"; 33], "n": 128});
+    let response = post_json(closed, "/v1/completions", body).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        body_json(response).await["error"]["message"],
+        "prompt count times n exceeds the maximum of 4096"
+    );
+}
+
+/// Post the JSON text `body` to `path`, which refuses it for its `n`.
+async fn assert_n_refused(app: &Router, path: &str, body: &str, message: &str) {
+    let request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(Body::from(body.to_owned()))
+        .unwrap();
+    let response = oneshot(app.clone(), request).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{path} {body}");
+    let error = body_json(response).await["error"].clone();
+    assert_eq!(error["message"], message, "{path} {body}");
+}
+
+/// Python's request model bounds `n` before the handler runs, so an `n` out
+/// of range is the refusal, whatever else the chat request gets wrong.
+#[tokio::test]
+async fn chat_refuses_n_before_other_checks() {
+    let app = routes().with_state(app_state(core_handle()));
+    let text = json!([{"role": "user", "content": "hi"}]);
+    // The model is text-only.
+    let image = json!([{"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+    ]}]);
+    for mut body in [
+        json!({"model": "model", "messages": []}),
+        json!({"model": "model:adapter", "messages": text}),
+        json!({"model": "model", "messages": image}),
+    ] {
+        body["n"] = json!(129);
+        let body = body.to_string();
+        assert_n_refused(&app, "/v1/chat/completions", &body, "n must be at most 128").await;
+    }
+}
+
+/// [`chat_refuses_n_before_other_checks`] for completions. `max_tokens=0` is
+/// left out: Python's request model refuses it along with `n`.
+#[tokio::test]
+async fn completions_refuse_n_before_other_checks() {
+    let app = routes().with_state(app_state(core_handle()));
+    for mut body in [
+        json!({"model": "model:adapter", "prompt": "hi"}),
+        json!({"model": "model", "prompt": "hi", "prompt_embeds": [[1.0]]}),
+        json!({"model": "model", "prompt": "hi", "suffix": "x"}),
+        json!({"model": "model", "prompt": "hi", "best_of": 2}),
+        json!({"model": "model", "prompt": ""}),
+    ] {
+        body["n"] = json!(129);
+        let body = body.to_string();
+        assert_n_refused(&app, "/v1/completions", &body, "n must be at most 128").await;
+    }
+}
+
+/// Python's request models take any integer, or an integral float, as `n` and
+/// refuse it by the same bound past the `u8` the typed requests hold.
+#[tokio::test]
+async fn openai_handlers_bound_n_past_u8() {
+    let app = routes().with_state(app_state(core_handle()));
+    for (path, fields) in [
+        (
+            "/v1/chat/completions",
+            r#""messages": [{"role": "user", "content": "hi"}]"#,
+        ),
+        ("/v1/completions", r#""prompt": "hi""#),
+    ] {
+        for (n, message) in [
+            ("256", "n must be at most 128"),
+            ("-1", "n must be at least 1"),
+            ("0", "n must be at least 1"),
+            ("200.0", "n must be at most 128"),
+            // serde_json reads an integer past 64 bits as `f64`.
+            ("100000000000000000000", "n must be at most 128"),
+            ("-100000000000000000000", "n must be at least 1"),
+        ] {
+            let body = format!(r#"{{"model": "model", {fields}, "n": {n}}}"#);
+            assert_n_refused(&app, path, &body, message).await;
+        }
+    }
+}
+
+/// The chat and completions routes with a valid body's members but `n`.
+const N_ROUTES: [(&str, &str); 2] = [
+    (
+        "/v1/chat/completions",
+        r#""messages": [{"role": "user", "content": "hi"}]"#,
+    ),
+    ("/v1/completions", r#""prompt": "hi""#),
+];
+
+/// Post the bytes `body` to `path`: the status and the error message.
+async fn post_raw(app: &Router, path: &str, body: Vec<u8>) -> (StatusCode, serde_json::Value) {
+    let request = Request::builder()
+        .method("POST")
+        .uri(path)
+        .header("content-type", "application/json")
+        .body(Body::from(body))
+        .unwrap();
+    let response = oneshot(app.clone(), request).await;
+    let status = response.status();
+    (
+        status,
+        body_json(response).await["error"]["message"].clone(),
+    )
+}
+
+/// Python's orjson reads an integer past 64 bits as a float, so an `n` past
+/// `u64` but within `f64` is still refused by the bound.
+#[tokio::test]
+async fn openai_handlers_bound_n_past_u64() {
+    let app = routes().with_state(app_state(core_handle()));
+    let past_u64 = ["9".repeat(20), format!("1{}", "0".repeat(24))];
+    let near_max = format!("1{}", "0".repeat(300));
+    for (path, fields) in N_ROUTES {
+        for n in past_u64.iter().chain([&near_max]) {
+            for (n, message) in [
+                (n.clone(), "n must be at most 128"),
+                (format!("-{n}"), "n must be at least 1"),
+            ] {
+                let body = format!(r#"{{"model": "model", {fields}, "n": {n}}}"#);
+                assert_n_refused(&app, path, &body, message).await;
+            }
+        }
+    }
+}
+
+/// Python's orjson fails to decode a number past `f64`, before any field is
+/// validated, so such an `n` gets the parse error the same body gets with
+/// another key in its place, at the same position and naming `n`.
+#[tokio::test]
+async fn openai_handlers_leave_n_past_f64_to_the_parse() {
+    let app = routes().with_state(app_state(core_handle()));
+    let huge = format!("1{}", "0".repeat(309));
+    let long = "1".repeat(4300);
+    for (path, fields) in N_ROUTES {
+        for n in [
+            huge.clone(),
+            format!("-{huge}"),
+            long.clone(),
+            "1e400".to_owned(),
+        ] {
+            let body = |key: &str| format!(r#"{{"model": "model", {fields}, "{key}": {n}}}"#);
+            let (status, message) = post_raw(&app, path, body("x").into_bytes()).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path} {message}");
+            let prefix = "Failed to parse the request body as JSON: x: number out of range ";
+            let message = message.as_str().unwrap_or_default();
+            assert!(message.starts_with(prefix), "{path} {message}");
+            let parse = json!(message.replacen("JSON: x: ", "JSON: n: ", 1));
+            let refused = post_raw(&app, path, body("n").into_bytes()).await;
+            assert_eq!(refused, (status, parse), "{path} n of {} chars", n.len());
+        }
+    }
+}
+
+/// Python decodes the body before reading any member, so a body that is not
+/// UTF-8 gets the parse error, not the `n` refusal.
+#[tokio::test]
+async fn openai_handlers_refuse_a_non_utf8_body_before_n() {
+    let app = routes().with_state(app_state(core_handle()));
+    for (path, member) in [
+        (
+            "/v1/chat/completions",
+            &b"\"messages\": [{\"role\": \"user\", \"content\": \"\xff\"}]"[..],
+        ),
+        ("/v1/completions", &b"\"prompt\": \"\xff\""[..]),
+    ] {
+        let body = |n: &[u8]| [&br#"{"model": "model", "#[..], member, n, b"}"].concat();
+        let (status, message) = post_raw(&app, path, body(b"")).await;
+        assert!(status.is_client_error(), "{path} {status}");
+        assert!(
+            message
+                .as_str()
+                .is_some_and(|m| !m.is_empty() && !m.starts_with("n must be")),
+            "{path} {message}"
+        );
+        for n in [&br#", "n": 200"#[..], br#", "n": 0"#] {
+            let refused = post_raw(&app, path, body(n)).await;
+            assert_eq!(refused, (status, message.clone()), "{path}");
+        }
+    }
+}
+
+/// Only the top-level `n` is read, as Python's orjson keeps it: the
+/// last duplicate, by its decoded key; nested ones are other fields' values.
+#[tokio::test]
+async fn openai_handlers_read_the_top_level_n() {
+    let app = routes().with_state(app_state(core_handle()));
+    let refused =
+        |message: &serde_json::Value| message.as_str().is_some_and(|m| m.starts_with("n must be"));
+    for (path, fields) in N_ROUTES {
+        // Nested `n` members are not the request's `n`.
+        let nested = if path == "/v1/chat/completions" {
+            r#""messages": [{"role": "user", "content": "hi", "n": 200}], "logit_bias": {"n": 200}"#
+        } else {
+            r#""prompt": "hi", "logit_bias": {"n": 200}"#
+        };
+        let body = format!(r#"{{"model": "model", {nested}}}"#);
+        let (_, message) = post_raw(&app, path, body.into_bytes()).await;
+        assert!(!refused(&message), "{path} nested: {message}");
+        // The last duplicate counts.
+        let body = format!(r#"{{"model": "model", {fields}, "n": 200, "n": 1}}"#);
+        let (_, message) = post_raw(&app, path, body.into_bytes()).await;
+        assert!(!refused(&message), "{path} duplicate: {message}");
+        let body = format!(r#"{{"model": "model", {fields}, "n": 1, "n": 200}}"#);
+        assert_n_refused(&app, path, &body, "n must be at most 128").await;
+        // An escaped key is decoded first.
+        let body = format!(r#"{{"model": "model", {fields}, "\u006e": 200}}"#);
+        assert_n_refused(&app, path, &body, "n must be at most 128").await;
+        // A float within the bound, integral or not, is left to the parse.
+        for n in ["128.0", "128.5"] {
+            let body = format!(r#"{{"model": "model", {fields}, "n": {n}}}"#);
+            let (_, message) = post_raw(&app, path, body.into_bytes()).await;
+            assert!(!refused(&message), "{path} {n}: {message}");
+        }
+    }
+}
+
+/// Python's request models refuse an explicit `null` `n`, which is not an
+/// integer, before the handler runs; an omitted `n` is one choice.
+#[tokio::test]
+async fn openai_handlers_refuse_a_null_n() {
+    let served = routes().with_state(answering_app_state());
+    let closed = routes().with_state(app_state(frontend_closed()));
+    for (path, fields) in N_ROUTES {
+        let body = format!(r#"{{"model": "model", {fields}}}"#);
+        let response = post_json(served.clone(), path, serde_json::from_str(&body).unwrap()).await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        let choices = body_json(response).await["choices"]
+            .as_array()
+            .unwrap()
+            .len();
+        assert_eq!(choices, 1, "{path}");
+        for stream in ["false", "true"] {
+            let body = format!(r#"{{"model": "model", {fields}, "n": null, "stream": {stream}}}"#);
+            for app in [&served, &closed] {
+                assert_n_refused(app, path, &body, "n must be an integer").await;
+            }
+        }
+    }
+}
+
+/// Python's `validate_n` bound: `n` up to the batch cap is served, and a
+/// negative cap is none.
+#[test]
+fn batch_cap_bounds_n_unless_negative() {
+    assert_eq!(batch_n_error(4, 4), None);
+    assert_eq!(
+        batch_n_error(5, 4).as_deref(),
+        Some("n must be an integer in [1, 4], got 5.")
+    );
+    assert_eq!(
+        batch_n_error(1, 0).as_deref(),
+        Some("n must be an integer in [1, 0], got 1.")
+    );
+    assert_eq!(batch_n_error(u64::MAX, -1), None);
+}
+
+/// Values outside the request types' integer ranges are refused while the
+/// body is parsed.
+#[tokio::test]
+async fn chat_refuses_values_its_request_type_cannot_hold() {
+    let app = routes().with_state(app_state(core_handle()));
+    let prefix = "Failed to deserialize the JSON body into the target type: ";
+    for (field, value, error) in [
+        (
+            "top_logprobs",
+            json!(-1),
+            "invalid value: integer `-1`, expected u8",
+        ),
+        (
+            "max_tokens",
+            json!(-1),
+            "invalid value: integer `-1`, expected u32",
+        ),
+        (
+            "max_tokens",
+            json!(true),
+            "invalid type: boolean `true`, expected u32",
+        ),
+    ] {
+        let mut body = json!({"model": "model", "messages": [{"role": "user", "content": "hi"}]});
+        body[field] = value;
+        let response = post_json(app.clone(), "/v1/chat/completions", body.clone()).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        let message = body_json(response).await["error"]["message"].clone();
+        assert_eq!(message, format!("{prefix}{error}"), "{body}");
+    }
 }
 
 /// Python's chat and completions handlers serve any `model` name and echo it
@@ -573,6 +919,10 @@ async fn openai_request_lines_carry_whitelisted_headers() {
             "/v1/chat/completions",
             json!({"model": "model", "messages": messages}),
         ),
+        (
+            "/v1/chat/completions",
+            json!({"model": "model", "messages": messages, "max_completion_tokens": 0}),
+        ),
     ] {
         let req = Request::builder()
             .method("POST")
@@ -616,6 +966,52 @@ async fn openai_request_lines_carry_whitelisted_headers() {
         (
             "/v1/completions",
             json!({"model": "model", "prompt": ["", ""]}),
+            false,
+        ),
+        // Python's request models refuse an `n` out of range before it is logged.
+        (
+            "/v1/completions",
+            json!({"model": "model", "prompt": "hi", "n": 0}),
+            false,
+        ),
+        (
+            "/v1/completions",
+            json!({"model": "model", "prompt": "hi", "n": 129}),
+            false,
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model": "model", "messages": messages, "n": 0}),
+            false,
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model": "model", "messages": messages, "n": 129}),
+            false,
+        ),
+        (
+            "/v1/completions",
+            json!({"model": "model", "prompt": "hi", "suffix": "x", "n": 129}),
+            false,
+        ),
+        (
+            "/v1/completions",
+            json!({"model": "model", "prompt": "hi", "n": 256}),
+            false,
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model": "model:adapter", "messages": messages, "n": 129}),
+            false,
+        ),
+        (
+            "/v1/completions",
+            json!({"model": "model", "prompt": "hi", "n": null}),
+            false,
+        ),
+        (
+            "/v1/chat/completions",
+            json!({"model": "model", "messages": messages, "n": null}),
             false,
         ),
         (

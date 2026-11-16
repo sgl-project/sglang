@@ -22,7 +22,7 @@ use super::wire::{
     Reply, StreamState, abort_event, finish_fields, logprob_slice, logprobs_length, now,
     unary_reply,
 };
-use super::{OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
+use super::{OPENAI_MAX_N, OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Unsupported};
 use crate::py::python_json;
 use crate::think::{ReasoningDefault, ReasoningOptions, ThinkConfig, ThinkDetector, think_config};
 use crate::tool_call::{ToolCallItem, ToolDetector, tool_call_id, tool_detector};
@@ -363,6 +363,14 @@ struct ChatRequest {
     bootstrap_room: Option<OneOrList<i64>>,
     routed_dp_rank: Option<i64>,
     disagg_prefill_dp_rank: Option<i64>,
+}
+
+impl ChatRequest {
+    /// `effective_max_tokens`: `max_completion_tokens` when set, an explicit
+    /// zero included, else `max_tokens`.
+    fn effective_max_tokens(&self) -> Option<i64> {
+        self.max_completion_tokens.or(self.max_tokens)
+    }
 }
 
 /// Fields that change behavior this module does not reproduce yet.
@@ -806,7 +814,16 @@ fn validate(
     model: &ChatModel,
 ) -> Result<(), Unsupported> {
     let invalid = Err(Unsupported("invalid_request"));
-    if request.messages.is_empty() || request.n < 1 {
+    if request.messages.is_empty() || !(1..=OPENAI_MAX_N).contains(&request.n) {
+        return invalid;
+    }
+    // Python's request model also refuses these below zero.
+    let limits = [
+        request.max_tokens,
+        request.max_completion_tokens,
+        request.top_logprobs,
+    ];
+    if limits.into_iter().flatten().any(|limit| limit < 0) {
         return invalid;
     }
     if !request.messages.iter().all(valid_message) {
@@ -819,11 +836,8 @@ fn validate(
     {
         return invalid;
     }
-    let max_output = request
-        .max_completion_tokens
-        .filter(|&n| n != 0)
-        .or(request.max_tokens);
-    if let Some(max_output) = max_output.filter(|&n| n != 0) {
+    // Python checks the limit by truthiness, so a zero one passes.
+    if let Some(max_output) = request.effective_max_tokens().filter(|&n| n != 0) {
         let Some(context) = settings.context_length.or(model.context_length) else {
             return Err(Unsupported("context_length_unknown"));
         };
@@ -946,10 +960,7 @@ fn generate_body(
     };
     let sampling = SamplingParams {
         temperature: Some(param(request.temperature, "temperature", 1.0)?),
-        max_new_tokens: request
-            .max_completion_tokens
-            .filter(|&n| n != 0)
-            .or(request.max_tokens),
+        max_new_tokens: request.effective_max_tokens(),
         min_new_tokens: Some(request.min_tokens),
         stop: request.stop.clone().map(Into::into),
         stop_token_ids: request.stop_token_ids.clone(),
@@ -1617,6 +1628,117 @@ mod tests {
             {"role": "tool", "content": "42", "tool_call_id": "c"},
         ]);
         assert_eq!(unsupported(messages), None);
+    }
+
+    /// `body`'s fields over a one-message chat, lowered under a 4-token context
+    /// with a renderer that accepts anything, or why it is not.
+    fn lower(body: Value, settings: &OpenAiSettings) -> Result<GenerateRequest, &'static str> {
+        let mut request = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        for (key, value) in body.as_object().unwrap() {
+            request[key] = value.clone();
+        }
+        let model = ChatModel {
+            context_length: Some(4),
+            ..ChatModel::default()
+        };
+        lower_chat(
+            &serde_json::to_vec(&request).unwrap(),
+            &OpenAiHeaders::default(),
+            settings,
+            &model,
+            |_: &Value| Some(vec![1]),
+            None,
+        )
+        .map(|(lowered, _)| lowered)
+        .map_err(|reason| reason.0)
+    }
+
+    fn max_new_tokens(lowered: &GenerateRequest) -> Option<i64> {
+        match lowered
+            .sampling_params
+            .as_ref()
+            .and_then(|p| p.value.as_ref())
+        {
+            Some(sampling_params_or_list::Value::One(sampling)) => sampling.max_new_tokens,
+            _ => unreachable!("one sampling configuration"),
+        }
+    }
+
+    /// An `n` outside Python's `[1, OPENAI_MAX_N]` goes to the engine, whose
+    /// request model refuses it.
+    #[test]
+    fn n_outside_python_bounds_goes_to_the_engine() {
+        let settings = OpenAiSettings::default();
+        assert!(lower(json!({"n": 128}), &settings).is_ok());
+        for n in [0, 129, i64::MAX] {
+            assert_eq!(
+                lower(json!({"n": n}), &settings).err(),
+                Some("invalid_request"),
+                "n={n}"
+            );
+        }
+    }
+
+    /// Python's request model refuses a negative output limit or `top_logprobs`,
+    /// whichever limit takes precedence, so such a request goes to the engine.
+    #[test]
+    fn negative_limits_go_to_the_engine() {
+        let settings = OpenAiSettings::default();
+        assert!(lower(json!({"top_logprobs": 0}), &settings).is_ok());
+        for limits in [
+            json!({"top_logprobs": -1}),
+            json!({"logprobs": true, "top_logprobs": -1}),
+            json!({"max_tokens": -1}),
+            json!({"max_completion_tokens": -1}),
+            json!({"max_tokens": -1, "max_completion_tokens": 0}),
+            json!({"max_tokens": -5, "max_completion_tokens": 3}),
+        ] {
+            assert_eq!(
+                lower(limits.clone(), &settings).err(),
+                Some("invalid_request"),
+                "{limits}"
+            );
+        }
+    }
+
+    /// Python's `effective_max_tokens`: `max_completion_tokens` wins whenever it
+    /// is set, an explicit zero included, in the context check as in the request.
+    #[test]
+    fn max_completion_tokens_takes_precedence_including_zero() {
+        let settings = OpenAiSettings::default();
+        let cases = [
+            json!({"max_completion_tokens": 0, "max_tokens": 3}),
+            json!({"max_completion_tokens": 0, "max_tokens": 5}),
+            json!({"max_completion_tokens": 0}),
+            json!({"max_tokens": 0}),
+            json!({"max_completion_tokens": 4, "max_tokens": 5}),
+            json!({"max_tokens": 4}),
+            json!({}),
+            json!({"max_completion_tokens": 5, "max_tokens": 0}),
+        ];
+        let lowered: Vec<_> = cases
+            .iter()
+            .map(|limits| lower(limits.clone(), &settings).map(|lowered| max_new_tokens(&lowered)))
+            .collect();
+        let invalid = Err("invalid_request");
+        let expected = [
+            Ok(Some(0)),
+            Ok(Some(0)),
+            Ok(Some(0)),
+            Ok(Some(0)),
+            Ok(Some(4)),
+            Ok(Some(4)),
+            Ok(None),
+            invalid,
+        ];
+        assert_eq!(lowered, expected, "{cases:?}");
+        // Past the context only under auto-truncation.
+        let truncating = OpenAiSettings {
+            allow_auto_truncate: true,
+            ..OpenAiSettings::default()
+        };
+        let lowered = lower(json!({"max_completion_tokens": 5}), &truncating).unwrap();
+        assert_eq!(max_new_tokens(&lowered), Some(5));
     }
 
     #[test]

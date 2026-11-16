@@ -51,7 +51,7 @@ pub(super) fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> 
     // Multimodal processors may consume sentinel ids outside the vocabulary.
     // Validate their resulting ids at PreSendValidating instead. Non-MM client
     // ids can be rejected now.
-    if let RequestKind::Generate(g) = &req.kind {
+    if let RequestKind::Generate(g) = &mut req.kind {
         if !g.has_multimodal() {
             validate_input_ids(g, vocab_size)?;
         }
@@ -64,6 +64,18 @@ pub(super) fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> 
                     )));
                 }
             }
+        }
+        if g.return_logprob {
+            // Invalid counts can corrupt the batch or fail torch.topk past the vocab size.
+            let k = g.top_logprobs_num;
+            if k < 0 || k as u64 > vocab_size {
+                return Err(Error::Validation(format!(
+                    "top_logprobs must be an integer in [0, {vocab_size}], got {k}."
+                )));
+            }
+        } else {
+            // A logprob batch gathers every request's count, including disabled ones.
+            g.top_logprobs_num = 0;
         }
     }
 

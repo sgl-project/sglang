@@ -35,6 +35,11 @@ use sglang_processor::dynamo_renderer::RenderedPrompt;
 static MAX_BATCH_REQS_PER_HTTP_REQ: LazyLock<i64> =
     LazyLock::new(|| env_i64("SGLANG_MAX_BATCH_REQS_PER_HTTP_REQ", 4096));
 
+/// [`MAX_BATCH_REQS_PER_HTTP_REQ`]; a negative value disables it.
+pub(crate) fn max_batch_reqs_per_http_req() -> i64 {
+    *MAX_BATCH_REQS_PER_HTTP_REQ
+}
+
 fn batch_size_exceeds_limit(batch_size: usize, limit: i64) -> bool {
     limit >= 0 && batch_size as u128 > limit as u128
 }
