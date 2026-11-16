@@ -28,18 +28,19 @@ SLOTS, RING_LEN = 8, 16
 
 def test_only_small_kimi_k3_kda_batches_take_the_narrow_tile():
     for n in (1, 4):
-        for target_verify in (True, False):
-            assert _select_recurrent_launch_config(
-                n=n, h=H, hv=HV, k=K, v=V, is_kda=True, target_verify=target_verify
-            ) == (8, 1)
-    assert _select_recurrent_launch_config(
-        n=5, h=H, hv=HV, k=K, v=V, is_kda=True, target_verify=True
-    ) == (32, 1)
+        assert _select_recurrent_launch_config(
+            n=n, h=H, hv=HV, k=K, v=V, is_kda=True, target_verify=False
+        ) == (8, 1)
+    # Target verify takes the day-0 tiles measured for the 8-token K3.1 verify.
+    for n, tile in ((1, 4), (4, 8), (5, 16), (9, 32)):
+        assert _select_recurrent_launch_config(
+            n=n, h=H, hv=HV, k=K, v=V, is_kda=True, target_verify=True
+        ) == (tile, 1)
     assert _select_recurrent_launch_config(
         n=1, h=H, hv=HV, k=K, v=V, is_kda=False, target_verify=True
     ) == (32, 1)
     assert _select_recurrent_launch_config(
-        n=1, h=8, hv=8, k=K, v=V, is_kda=True, target_verify=True
+        n=1, h=8, hv=8, k=K, v=V, is_kda=True, target_verify=False
     ) == (32, 1)
 
 

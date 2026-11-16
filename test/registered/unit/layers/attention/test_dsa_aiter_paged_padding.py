@@ -59,7 +59,11 @@ def test_aiter_paged_rows_and_restored_padding(
         torch.testing.assert_close(seq_lens, lengths)
         assert blocks is page_table
         assert cache.shape == (1, page_size, 1, 132)
-        assert kwargs == {"preshuffle": preshuffle, "kv_block_size": page_size}
+        assert kwargs == {
+            "preshuffle": preshuffle,
+            "kv_block_size": page_size,
+            "persistent_schedule": schedule if preshuffle else None,
+        }
         return torch.arange(max_len, dtype=torch.float32).repeat(real_rows, 1)
 
     def topk_transform(logits, topk):
@@ -80,6 +84,10 @@ def test_aiter_paged_rows_and_restored_padding(
         get_dsa_extend_len_cpu=lambda: extend_lengths,
         topk_transform=topk_transform,
     )
+    schedule = object()
+    indexer_hip = SimpleNamespace(
+        paged_logits_persistent_schedule=lambda *args: schedule
+    )
     indexer = dsa_indexer.Indexer.__new__(dsa_indexer.Indexer)
     torch.nn.Module.__init__(indexer)
     indexer.paged_mqa_logits_backend = DSAPagedMQALogitsBackend.AITER
@@ -91,6 +99,7 @@ def test_aiter_paged_rows_and_restored_padding(
         mock.patch.object(dsa_indexer, "_is_cuda", False),
         mock.patch.object(dsa_indexer, "_is_xpu", False),
         mock.patch.object(dsa_indexer, "_use_aiter_preshuffle", preshuffle),
+        mock.patch.object(dsa_indexer, "dsa_indexer_hip", indexer_hip, create=True),
         mock.patch.object(dsa_indexer, "get_token_to_kv_pool", return_value=pool),
         mock.patch.object(
             dsa_indexer, "aiter_paged_mqa_logits", side_effect=kernel
