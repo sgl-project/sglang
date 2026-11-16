@@ -19,7 +19,7 @@ Use as a context manager:
         gw.start_regular(model_id="...", tokenizer_path="...", worker_urls=[...])
         resp = httpx.post(f"{gw.base_url}/v1/chat/completions", json=...)
 
-or pytest fixture style (see e2e_test/conftest.py).
+or pytest fixture style (see tests/e2e/conftest.py).
 """
 
 from __future__ import annotations
