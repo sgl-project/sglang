@@ -244,23 +244,31 @@ def test_failed_post_update_flush_still_records_version():
     record.assert_called_once_with(new_version="2")
 
 
-def test_scheduler_rejects_draft_models_before_updating():
-    update = MagicMock()
+@pytest.mark.parametrize(
+    "draft_runners",
+    [[("draft", object())], []],
+    ids=["draft_model", "ngram_or_uno"],
+)
+def test_scheduler_rejects_only_draft_workers_with_weights(draft_runners):
+    # NGRAM and UNO run a speculative worker that owns no draft weights.
+    update = MagicMock(return_value=(True, ""))
     scheduler = SchedulerWeightUpdaterManager(
         tp_worker=SimpleNamespace(update_weights_from_modelexpress=update),
-        draft_worker=object(),
+        draft_worker=SimpleNamespace(weight_update_runners=lambda: draft_runners),
         memory_saver_adapter=None,
-        flush_cache=MagicMock(),
+        flush_cache=MagicMock(return_value=True),
         is_fully_idle=MagicMock(),
+        scheduler=SimpleNamespace(record_weight_version_change=MagicMock()),
     )
 
     result = scheduler.update_weights_from_modelexpress(
         UpdateWeightsFromModelExpressReqInput(weight_version="2")
     )
 
-    assert result.success is False
-    assert "draft models" in result.message
-    update.assert_not_called()
+    has_draft_weights = bool(draft_runners)
+    assert result.success is not has_draft_weights
+    assert ("draft models" in result.message) is has_draft_weights
+    assert update.called is not has_draft_weights
 
 
 def test_scheduler_rejects_pipeline_parallelism_before_updating(monkeypatch):

@@ -206,7 +206,7 @@ class SchedulerWeightUpdaterManager:
                 success=False,
                 message="ModelExpress does not support pipeline parallelism",
             )
-        if self.draft_worker is not None:
+        if self.draft_worker is not None and self.draft_worker.weight_update_runners():
             return UpdateWeightsFromModelExpressReqOutput(
                 success=False, message="ModelExpress does not support draft models"
             )
