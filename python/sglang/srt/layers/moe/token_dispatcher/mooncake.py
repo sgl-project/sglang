@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
 from enum import Enum, auto
 from typing import NamedTuple, Optional
 
@@ -302,7 +301,6 @@ class _MooncakeEPDispatcherImpl:
         )
 
 
-@dataclass
 class _Stage(Enum):
     INITIAL = auto()
     AFTER_DISPATCH_A = auto()

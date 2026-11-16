@@ -4,7 +4,6 @@ import inspect
 import logging
 import os
 from contextlib import nullcontext
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.environ import envs
@@ -978,7 +977,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
 
 
-@dataclass
 class _Stage(Enum):
     INITIAL = auto()
     AFTER_DISPATCH_A = auto()
