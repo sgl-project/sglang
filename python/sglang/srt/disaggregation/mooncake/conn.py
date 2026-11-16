@@ -1086,6 +1086,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # A DFLASH draft KV ring has no draft KV entries to reslice: it
             # sends its replicated window rows as a DRAFT_RING state instead.
             and StateType.DRAFT_RING not in self.kv_args.state_types
+            and self.kv_args.num_draft_entries > 0
         ):
             # Appended draft MHA KV uses physical TP shards, while target MLA
             # KV is replicated. The draft transfer cannot reslice those shards.
@@ -1138,6 +1139,37 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if not dst_data_ptrs or not dst_item_lens:
                 # Nothing published for this component; let the send path report it.
                 fully_checked = False
+                continue
+            if (
+                st == StateType.SWA
+                and not self.is_mla_backend
+                and not self.is_hybrid_mla_backend
+                and self.attn_tp_size != registration_info.dst_attn_tp_size
+            ):
+                # Heterogeneous TP uses per-peer strides, not equal page lengths.
+                try:
+                    self._get_mha_head_slice_blocks(
+                        src_ptrs=self.kv_args.state_data_ptrs[i],
+                        src_item_lens=self.kv_args.state_item_lens[i],
+                        dst_ptrs=dst_data_ptrs,
+                        dst_item_lens=dst_item_lens,
+                        src_page_indices=np.empty(0, dtype=np.int32),
+                        dst_page_indices=np.empty(0, dtype=np.int32),
+                        dst_attn_tp_size=registration_info.dst_attn_tp_size,
+                        dst_tp_rank=registration_info.dst_tp_rank,
+                        src_layer_ids=(
+                            self.kv_args.state_layer_ids[i]
+                            if i < len(self.kv_args.state_layer_ids)
+                            else []
+                        ),
+                        dst_layer_ids=(
+                            registration_info.dst_state_layer_ids[i]
+                            if i < len(registration_info.dst_state_layer_ids)
+                            else []
+                        ),
+                    )
+                except (RuntimeError, ValueError) as error:
+                    return False, f"SWA head-slice layout mismatch: {error}"
                 continue
             try:
                 mismatch = self._state_stride_mismatch(
@@ -2480,6 +2512,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 target_rank_registration_info.dst_attn_tp_size
                             ),
                             executor=executor,
+                            src_layer_ids=src_state_layer_ids,
+                            dst_layer_ids=dst_state_layer_ids,
                         )
                         or rc
                     )
@@ -2749,6 +2783,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_tp_rank: int,
         dst_attn_tp_size: int,
         executor: concurrent.futures.ThreadPoolExecutor,
+        src_layer_ids: Optional[List[int]] = None,
+        dst_layer_ids: Optional[List[int]] = None,
     ) -> int:
         blocks = self._get_mha_head_slice_blocks(
             src_ptrs=src_state_data_ptrs,
@@ -2759,6 +2795,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             dst_page_indices=np.asarray(dst_swa_page_indices),
             dst_attn_tp_size=dst_attn_tp_size,
             dst_tp_rank=dst_tp_rank,
+            src_layer_ids=src_layer_ids,
+            dst_layer_ids=dst_layer_ids,
         )
         logger.warning_once(
             "Using SWA state head-slice transfer for different attention TP sizes: "
@@ -2909,6 +2947,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     ),
                                 )
                                 break
+
+                        if req.mooncake_session_id in kv_chunk.destination_results:
+                            if kv_chunk.is_last_chunk:
+                                polls.append(
+                                    kv_chunk.destination_results[
+                                        req.mooncake_session_id
+                                    ]
+                                )
+                                dst_ranks_infos.append((req.endpoint, req.dst_port))
+                            continue
 
                         target_rank_registration_info: KVArgsRegisterInfo = (
                             self.decode_kv_args_table[req.mooncake_session_id]
@@ -3125,6 +3173,9 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                 self._poison_unsettled_send(req.room)
                             polls.append(True if ret == 0 else False)
                             dst_ranks_infos.append((req.endpoint, req.dst_port))
+                            kv_chunk.destination_results[req.mooncake_session_id] = (
+                                ret == 0
+                            )
 
                             # Only sync status when all the dst ranks have received the kvcache
                             if len(polls) == req.required_dst_info_num:
@@ -3139,6 +3190,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                         else f"Failed to send aux data of {req.room}"
                                     ),
                                 )
+                        else:
+                            kv_chunk.destination_results[req.mooncake_session_id] = True
                     else:
                         # Dummy request means the decode instance is not used, so its status can be marked as success directly
                         # Dummy request does not need to sync status to decode endpoint

@@ -46,6 +46,7 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.pp_consensus_store import PPConsensusStore
 from sglang.srt.disaggregation.utils import (
     MetadataBuffers,
+    build_transfer_entry_pairs,
     check_stage_state_wires,
     check_state_wire,
     filter_kv_indices_for_cp_rank,
@@ -952,6 +953,12 @@ class CommonKVManager(BaseKVManager):
                 int(part.decode("ascii")) for part in msg[1:5]
             )
             writer_id = msg[5].decode("ascii")
+            if len(msg) > 6:
+                # Destination sessions are shared across PP writers; use the source rank.
+                writer_id = f"prefill-rank:{int(msg[6].decode('ascii'))}"
+            else:
+                # Legacy frames carry no source identity; retain arrival counting.
+                writer_id = None
         except (IndexError, ValueError, UnicodeDecodeError):
             logger.warning("Dropping malformed CHUNK_READY message")
             return True
@@ -1917,10 +1924,11 @@ class CommonKVManager(BaseKVManager):
         dst_page_indices: npt.NDArray[np.int32],
         dst_attn_tp_size: int,
         dst_tp_rank: int,
+        src_layer_ids: Optional[List[int]] = None,
+        dst_layer_ids: Optional[List[int]] = None,
     ) -> List[Tuple[npt.NDArray[np.uint64], npt.NDArray[np.uint64], int]]:
-        # SWA state has no layer ids and its pool starts every PP stage at layer
-        # 0, so a prefill stage's entries cannot be paired with the decode layers.
-        if self.pp_size > 1:
+        # Dense local SWA indices cannot locate a PP stage's global layers.
+        if self.pp_size > 1 and not (src_layer_ids and dst_layer_ids):
             raise RuntimeError(
                 "PD Disaggregation does NOT support PD different TP sizes for "
                 "non-MLA SWA hybrid models with pipeline parallelism yet."
@@ -1937,23 +1945,47 @@ class CommonKVManager(BaseKVManager):
             resolve_total_kv_heads,
         )
 
-        src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, num_layers = (
-            self.get_mha_kv_ptrs_with_pp(src_ptrs, dst_ptrs)
-        )
-        _, _, dst_k_lens, dst_v_lens, _ = self.get_mha_kv_ptrs_with_pp(
-            src_item_lens, dst_item_lens
-        )
-        entries = list(
-            zip(
-                src_k_ptrs + src_v_ptrs,
-                dst_k_ptrs + dst_v_ptrs,
-                src_item_lens,
-                dst_k_lens + dst_v_lens,
+        if src_layer_ids or dst_layer_ids:
+            if len(src_item_lens) != len(src_ptrs) or len(dst_item_lens) != len(
+                dst_ptrs
+            ):
+                raise RuntimeError(
+                    "SWA pointer and page-stride metadata lengths must match"
+                )
+            pairs = build_transfer_entry_pairs(
+                src_layer_ids or [],
+                dst_layer_ids or [],
+                len(src_ptrs),
+                len(dst_ptrs),
+                allow_positional_fallback=self.pp_size == 1,
             )
-        )
+            entries = [
+                (src_ptrs[i], dst_ptrs[j], src_item_lens[i], dst_item_lens[j])
+                for i, j in pairs
+            ]
+        else:
+            src_k_ptrs, src_v_ptrs, dst_k_ptrs, dst_v_ptrs, num_layers = (
+                self.get_mha_kv_ptrs_with_pp(src_ptrs, dst_ptrs)
+            )
+            _, _, dst_k_lens, dst_v_lens, _ = self.get_mha_kv_ptrs_with_pp(
+                src_item_lens, dst_item_lens
+            )
+            entries = list(
+                zip(
+                    src_k_ptrs + src_v_ptrs,
+                    dst_k_ptrs + dst_v_ptrs,
+                    src_item_lens,
+                    dst_k_lens + dst_v_lens,
+                )
+            )
+            if 2 * num_layers != len(src_ptrs):
+                raise RuntimeError(
+                    "Head-sliced PD transfer needs matching per-layer K/V buffers: "
+                    f"prefill has {len(src_ptrs)} entries, decode has {len(dst_ptrs)}"
+                )
         # A single page-envelope region (unified memory) has no per-layer K/V
         # split to slice heads from.
-        if len(entries) != len(src_ptrs) or 2 * num_layers != len(src_ptrs):
+        if len(entries) != len(src_ptrs):
             raise RuntimeError(
                 "Head-sliced PD transfer needs matching per-layer K/V buffers: "
                 f"prefill has {len(src_ptrs)} entries, decode has {len(dst_ptrs)}"

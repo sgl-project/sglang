@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Optional
 
 from sglang.kernels.registry import register_kernel
 from sglang.kernels.selector import get_kernel
-from sglang.kernels.spec import KernelBackend, KernelSpec
+from sglang.kernels.spec import CapabilityRequirement, KernelBackend, KernelSpec
 
 if TYPE_CHECKING:
     import torch
@@ -84,3 +84,15 @@ register_kernel(
         ),
     )
 )
+
+
+for _fn in ("gather_strided_staging", "scatter_strided_staging"):
+    register_kernel(
+        KernelSpec(
+            op=f"kvcache.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.kvcache.strided_staging:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.CUDA}),
+        )
+    )
+del _fn

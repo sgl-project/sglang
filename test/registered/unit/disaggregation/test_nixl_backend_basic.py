@@ -853,7 +853,7 @@ class TestNixlDecodeListener(CustomTestCase):
             with self.assertRaises(SystemExit):
                 thread.call_args.kwargs["target"]()
         mgr._staging_handler.handle_chunk_arrived.assert_called_once_with(
-            11, 0, 0, 2, "decode_agent"
+            11, 0, 0, 2, "prefill-rank:0"
         )
         self.assertEqual(receiver.poll(), KVPoll.Success)
 

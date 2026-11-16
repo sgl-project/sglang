@@ -1030,7 +1030,7 @@ class SchedulerPPMixin:
         draft_input = result.next_draft_input
         if (
             draft_input is not None
-            and not batch.spec_algorithm.is_dspark()
+            and not batch.spec_algorithm.is_dflash_family()
             and draft_input.topk_p is not None
         ):
             tensor_dict["draft_topk_p"] = draft_input.topk_p.contiguous()
@@ -1329,12 +1329,13 @@ class SchedulerPPMixin:
                 dsa_topk_indices=pp_outputs.tensors.get("draft_dsa_topk_indices"),
             )
             batch.spec_info = next_draft_input
-        elif batch.spec_algorithm.is_dspark():
-            from sglang.srt.speculative.dspark_components.dspark_draft import (
-                make_next_draft_input,
+        elif batch.spec_algorithm.is_dflash_family():
+            from sglang.srt.speculative.draft_worker_common import (
+                make_draft_input_v2,
             )
 
-            next_draft_input = make_next_draft_input(
+            # Same as the PD decode's first draft input: the bonus token only.
+            next_draft_input = make_draft_input_v2(
                 bonus_tokens=next_token_ids,
                 new_seq_lens=batch.seq_lens,
             )
