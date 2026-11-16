@@ -719,7 +719,30 @@ def test_upscaler_uses_bounded_cache(monkeypatch):
     monkeypatch.setattr(realesrgan_upscaler, "current_platform", _CPU)
     for path in ["a.pth", "b.pth"]:
         realesrgan_upscaler.ImageUpscaler(model_path=path)._ensure_model_loaded()
-    assert list(realesrgan_upscaler._MODEL_CACHE) == ["b.pth"]
+    assert list(realesrgan_upscaler._MODEL_CACHE) == [("b.pth", False)]
+
+
+def test_upscaler_cache_keeps_fp32_and_fp16_models_apart(monkeypatch, tmp_path):
+    """Offline upscaling asks for fp32 and realtime upscaling for fp16 from the
+    same weight file; each must get its own dtype whichever ran first."""
+    monkeypatch.setattr(realesrgan_upscaler, "_MODEL_CACHE", OrderedDict())
+    monkeypatch.setattr(
+        realesrgan_upscaler, "_RESOLVED_MODEL_PATH_CACHE", OrderedDict()
+    )
+    monkeypatch.setattr(realesrgan_upscaler, "current_platform", _CPU)
+    path = str(tmp_path / "tiny.pth")
+    net = realesrgan_upscaler.SRVGGNetCompact(num_feat=4, num_conv=1, upscale=2)
+    torch.save(net.state_dict(), path)
+
+    def load(half_precision):
+        upscaler = realesrgan_upscaler.ImageUpscaler(
+            model_path=path, half_precision=half_precision
+        )
+        return upscaler._ensure_model_loaded()
+
+    assert load(False).dtype == torch.float32
+    assert load(True).dtype == torch.float16
+    assert load(False).dtype == torch.float32
 
 
 def test_rife_uses_bounded_cache(monkeypatch):
