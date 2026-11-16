@@ -547,7 +547,7 @@ class TestMpsDeviceMixin(CustomTestCase):
             patch.object(torch.xpu, "is_available", return_value=False),
             patch.object(torch.mps, "is_available", return_value=True),
             patch.object(torch.mps, "device_count", return_value=1),
-            patch.object(device_utils, "empty_device_cache"),
+            patch.object(torch.mps, "empty_cache"),
             # The Linux CPU suite has no MPS device name.
             patch("torch.backends.mps.get_name", return_value="Apple M-series"),
             patch(
