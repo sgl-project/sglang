@@ -12,7 +12,6 @@ from typing import (
     Dict,
     List,
     Literal,
-    NamedTuple,
     Optional,
     Tuple,
     cast,
@@ -78,6 +77,7 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,
 )
+from sglang.srt.platforms.device_mixin import DeviceCapability
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
@@ -99,23 +99,6 @@ __all__ = ["CompressedTensorsLinearMethod"]
 
 SPARSITY_CONFIG_NAME: Literal["sparsity_config"] = "sparsity_config"
 QUANTIZATION_SCHEME_MAP_TYPE = Dict[str, Optional[Dict[str, QuantizationArgs]]]
-
-
-class DeviceCapability(NamedTuple):
-    major: int
-    minor: int
-
-    def as_version_str(self) -> str:
-        return f"{self.major}.{self.minor}"
-
-    def to_int(self) -> int:
-        """
-        Express device capability as an integer ``<major><minor>``.
-
-        It is assumed that the minor version is always a single digit.
-        """
-        assert 0 <= self.minor < 10
-        return self.major * 10 + self.minor
 
 
 # The MLP prefix of a plain `ignore` entry that names its layer.
