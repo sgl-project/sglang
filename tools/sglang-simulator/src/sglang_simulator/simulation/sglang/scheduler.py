@@ -4,7 +4,7 @@ import json
 import os
 import time
 from dataclasses import asdict
-from typing import Any
+from typing import Any, Optional
 
 from sglang_simulator.compat import validate_simulator_server_args
 from sglang_simulator.hook import (
@@ -14,6 +14,7 @@ from sglang_simulator.hook import (
 )
 from sglang_simulator.hook.utils import get_obj_from_args
 from sglang_simulator.simulation.manager import ConfigManager, Envs, StateManager
+from sglang_simulator.simulation.sglang.model_runner import record_kv_cache_geometry
 from sglang_simulator.simulation.sglang.req_stats_manager import request_stats_manager
 from sglang_simulator.simulation.sglang.utils import (
     resolve_model_info,
@@ -32,6 +33,9 @@ from sglang_simulator.time_predictor import ScheduleBatch as SimulationScheduleB
 from sglang_simulator.time_predictor import ScheduleRequest
 from sglang_simulator.utils import get_logger
 from sglang_simulator.utils.json import CustomJsonEncoder
+
+# Idle step used when no KV transfer completion is pending.
+IDLE_CLOCK_STEP_S = 0.005
 
 logger = get_logger("sgl_simulator")
 
@@ -238,9 +242,10 @@ class ReqDispatcher:
 
         if recv_reqs and StateManager.get_last_real_time_ts() == 0:
             StateManager.set_last_real_time_ts(time.time())
-            StateManager.set_global_clock(
-                now if self.mode == SimulationMode.BLOCKING else 0
-            )
+            # An OFFLINE clock is 0 after a reset and may already sit at the first
+            # arrival; rewinding it would serve that request before it arrived.
+            if self.mode == SimulationMode.BLOCKING:
+                StateManager.set_global_clock(now)
 
         return recv_reqs
 
@@ -281,6 +286,9 @@ class C_SchedulerHook(BaseHook):
 
     SIMULATION_BATCH: SimulationScheduleBatch = None
     OVERLAP_SCHEDULE: bool = False
+    # Reported in a prefill instance's metrics.json; the PD runner builds KV
+    # waves from it.
+    KV_LAYOUT: Optional[dict] = None
     SIM_MODE = SimulationMode(Envs.simulation_mode())
     # Shared singleton instance with `C_SchedulerRequestReceiver.REQ_DISPATCHER`.
     REQ_DISPATCHER = ReqDispatcher(SIM_MODE)
@@ -291,6 +299,7 @@ class C_SchedulerHook(BaseHook):
         original_recv_requests = getattr(target, "recv_requests", None)
         original_prefetch_kvcache = target._prefetch_kvcache
         original_get_new_batch_prefill = target.get_new_batch_prefill
+        original_get_new_prebuilt_batch = target.get_new_prebuilt_batch
         original_run_batch = target.run_batch
         original_process_batch_result = target.process_batch_result
         original_event_loop_normal = target.event_loop_normal
@@ -341,7 +350,12 @@ class C_SchedulerHook(BaseHook):
                 sched_config = ConfigManager.get_scheduler_config()
 
                 C_SchedulerHook.INFERENCE_PREDICTOR = (
-                    ConfigManager.get_inference_time_predictor(model, hw, sched_config)
+                    ConfigManager.get_inference_time_predictor(
+                        model,
+                        hw,
+                        sched_config,
+                        disaggregation_mode=self.server_args.disaggregation_mode,
+                    )
                 )
             except Exception as e:
                 logger.error(
@@ -349,10 +363,81 @@ class C_SchedulerHook(BaseHook):
                 )
                 raise e
 
+            record_kv_cache_geometry(self.token_to_kv_pool_allocator.get_kvcache())
+            if self.server_args.disaggregation_mode == "prefill":
+                C_SchedulerHook.KV_LAYOUT = {
+                    "page_size": self.server_args.page_size,
+                    "bytes_per_token": ConfigManager.get_kv_cache_bytes(),
+                    "chunked_prefill_size": self.chunked_prefill_size,
+                }
+
         def wrapped_recv_requests(self, *args, **kwargs) -> list:
             recv_reqs = original_recv_requests(self, *args, **kwargs)
             C_SchedulerHook.REQ_DISPATCHER.add(recv_reqs)
             return C_SchedulerHook.REQ_DISPATCHER.dispatch()
+
+        def waits_without_batch(scheduler, running_batch) -> bool:
+            """No batch runs, but a request waits to be scheduled or for its KV."""
+            decode_queues = (
+                scheduler.disagg_decode_prealloc_queue,
+                scheduler.disagg_decode_transfer_queue,
+            )
+            return len(running_batch.reqs) == 0 and (
+                len(scheduler.waiting_queue) > 0
+                or any(
+                    queue is not None and len(queue.queue) > 0
+                    for queue in decode_queues
+                )
+            )
+
+        def idle_advance() -> float:
+            # Land exactly on the next KV transfer completion, since a fixed step
+            # would round every transfer up, but never past the next arrival.
+            now = StateManager.get_global_clock()
+            target = StateManager.next_pending_transfer_completion(now)
+            if target is None:
+                return IDLE_CLOCK_STEP_S
+
+            if C_SchedulerHook.SIM_MODE == SimulationMode.OFFLINE and (
+                C_SchedulerHook.REQ_DISPATCHER.has_next()
+            ):
+                target = min(
+                    target, C_SchedulerHook.REQ_DISPATCHER.next_req_from_future_ts()
+                )
+
+            return max(0.0, target - now)
+
+        def account_new_batch(scheduler, new_batch, running_batch) -> None:
+            """Record queueing for an admitted batch, or move an idle clock."""
+            now = time.time()
+            if new_batch is not None:
+                for req in new_batch.reqs:
+                    req_stats = request_stats_manager.get_req_stats(req.rid)
+                    req_stats.final_device_hit_len = req.cached_tokens
+                    if req_stats.queue_end == -1:
+                        if C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING:
+                            req_stats.queue_end = now
+                        else:
+                            req_stats.queue_end = StateManager.get_global_clock()
+                    else:
+                        # Chunked request
+                        pass
+            elif waits_without_batch(scheduler, running_batch):
+                # Prefetching, or a decode instance waiting on a KV cache transfer:
+                # those requests sit in the transfer queue, not in waiting_queue.
+                advance = idle_advance()
+                StateManager.step_global_clock(advance)
+                StateManager.set_current_inference_dur(advance)
+            else:
+                # Idle stage, there are some requests pendding in the future queue.
+                if C_SchedulerHook.SIM_MODE == SimulationMode.OFFLINE and (
+                    C_SchedulerHook.REQ_DISPATCHER.has_next()
+                    and len(running_batch.reqs) == 0
+                ):
+                    next_created_time = (
+                        C_SchedulerHook.REQ_DISPATCHER.next_req_from_future_ts()
+                    )
+                    StateManager.set_global_clock(next_created_time + 1e-6)
 
         def wrapped_get_new_batch_prefill(self, *args, **kwargs):
             start = time.perf_counter()
@@ -367,33 +452,7 @@ class C_SchedulerHook(BaseHook):
             # A plan reports the running batch before self.running_batch is updated.
             running_batch = getattr(result, "running_batch", self.running_batch)
 
-            now = time.time()
-            if new_batch is not None:
-                for req in new_batch.reqs:
-                    req_stats = request_stats_manager.get_req_stats(req.rid)
-                    req_stats.final_device_hit_len = req.cached_tokens
-                    if req_stats.queue_end == -1:
-                        if C_SchedulerHook.SIM_MODE == SimulationMode.BLOCKING:
-                            req_stats.queue_end = now
-                        else:
-                            req_stats.queue_end = StateManager.get_global_clock()
-                    else:
-                        # Chunked request
-                        pass
-            elif len(running_batch.reqs) == 0 and len(self.waiting_queue) > 0:
-                # Prefetching
-                StateManager.step_global_clock(0.005)
-                StateManager.set_current_inference_dur(0.005)
-            else:
-                # Idle stage, there are some requests pendding in the future queue.
-                if C_SchedulerHook.SIM_MODE == SimulationMode.OFFLINE and (
-                    C_SchedulerHook.REQ_DISPATCHER.has_next()
-                    and len(running_batch.reqs) == 0
-                ):
-                    next_created_time = (
-                        C_SchedulerHook.REQ_DISPATCHER.next_req_from_future_ts()
-                    )
-                    StateManager.set_global_clock(next_created_time + 1e-6)
+            account_new_batch(self, new_batch, running_batch)
             logger.debug(
                 f"Get new batch prefill: global iteration={StateManager.get_iteration()}, "
                 f"new batch={new_batch.batch_size() if new_batch is not None else 0}, "
@@ -401,6 +460,22 @@ class C_SchedulerHook(BaseHook):
             )
 
             return result
+
+        def wrapped_get_new_prebuilt_batch(self, *args, **kwargs):
+            start = time.perf_counter()
+            new_batch = original_get_new_prebuilt_batch(self, *args, **kwargs)
+            C_SchedulerHook.GET_NEW_BATCH_PREFILL_TIME_COST = (
+                time.perf_counter() - start
+            )
+
+            account_new_batch(self, new_batch, self.running_batch)
+            logger.debug(
+                f"Get new prebuilt batch: global iteration={StateManager.get_iteration()}, "
+                f"new batch={new_batch.batch_size() if new_batch is not None else 0}, "
+                f"prealloc queue={len(self.disagg_decode_prealloc_queue.queue)}, "
+                f"transfer queue={len(self.disagg_decode_transfer_queue.queue)}"
+            )
+            return new_batch
 
         def wrapped_prefetch_kvcache(self, *args, **kwargs):
             original_prefetch_kvcache(self, *args, **kwargs)
@@ -415,11 +490,30 @@ class C_SchedulerHook(BaseHook):
             req_stats.recv_host_hit_len = req.host_hit_length
 
         def wrapped_run_batch(self, *args, **kwargs):
-            ret = original_run_batch(self, *args, **kwargs)
-
             batch = get_obj_from_args(
                 "sglang.srt.managers.schedule_batch.ScheduleBatch", *args, **kwargs
             )
+            record_early_sends = (
+                self.server_args.disaggregation_mode == "prefill"
+                and batch is not None
+                and batch.forward_mode.is_extend()
+            )
+            sent_before = (
+                [req.start_send_idx for req in batch.reqs] if record_early_sends else []
+            )
+
+            ret = original_run_batch(self, *args, **kwargs)
+
+            if record_early_sends:
+                # SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX sends a cached
+                # prefix before the forward; the clock still reads the batch start.
+                batch_start = StateManager.get_global_clock()
+                for req, before in zip(batch.reqs, sent_before):
+                    if req.start_send_idx > before:
+                        req_stats = request_stats_manager.get_req_stats(req.rid)
+                        req_stats.kv_prefill_chunks.append(
+                            {"t": batch_start, "extend_end": req.start_send_idx}
+                        )
 
             if ret.__class__.__name__ == "GenerationBatchResult":
                 simulation_batch = SimulationScheduleBatch(reqs=[])
@@ -503,18 +597,32 @@ class C_SchedulerHook(BaseHook):
                 # Step CPU overhead BEFORE recording latencies,
                 # so current iter's CPU time is reflected in current iter's TTFT.
                 now = time.time()
-                cpu_overhead = max(
-                    now - StateManager.get_last_real_time_ts() - blocked_l2_wall_dur,
-                    0.0,
-                )
-                StateManager.step_global_clock(cpu_overhead)
+                cpu_overhead = 0.0
+                if not ConfigManager.ignore_cpu_overhead():
+                    cpu_overhead = max(
+                        now
+                        - StateManager.get_last_real_time_ts()
+                        - blocked_l2_wall_dur,
+                        0.0,
+                    )
+                    StateManager.step_global_clock(cpu_overhead)
                 StateManager.set_last_real_time_ts(now)
 
                 request_response_time = StateManager.get_global_clock()
+                # Record Prefill EXTEND completions. The runner converts these
+                # events into page-aligned KV waves after the Prefill pass.
+                record_kv_chunks = (
+                    self.server_args.disaggregation_mode == "prefill"
+                    and batch.forward_mode.is_extend()
+                )
                 # Request statistics
                 for req in batch.reqs:
+                    req_stats = request_stats_manager.get_req_stats(req.rid)
+                    if record_kv_chunks:
+                        req_stats.kv_prefill_chunks.append(
+                            {"t": request_response_time, "extend_end": req.extend_end}
+                        )
                     if len(req.output_ids) != 0:  # not chunked
-                        req_stats = request_stats_manager.get_req_stats(req.rid)
                         req_stats.gen_token_latencies.append(
                             request_response_time
                             - req_stats.last_event_time  # queue duration
@@ -567,6 +675,8 @@ class C_SchedulerHook(BaseHook):
                     item.queue_start -= min_created_time
                     item.queue_end -= min_created_time
                     item.last_event_time -= min_created_time
+                    for chunk in item.kv_prefill_chunks:
+                        chunk["t"] -= min_created_time
 
                 metrics = calc_metrics(stats)
                 metrics["time_cost"] = (
@@ -579,6 +689,8 @@ class C_SchedulerHook(BaseHook):
                     calc_iteration_metrics(C_SchedulerHook.ITERATION_STATS, metrics)
                 )
                 metrics.update(C_SchedulerHook.INFERENCE_PREDICTOR.get_metrics())
+                if C_SchedulerHook.KV_LAYOUT is not None:
+                    metrics["kv_layout"] = C_SchedulerHook.KV_LAYOUT
 
                 try:
                     with open(f"{output_dir}/metrics.json", "w") as f:
@@ -636,6 +748,7 @@ class C_SchedulerHook(BaseHook):
         target.event_loop_overlap = override_event_loop_overlap
         target.__init__ = wrapped_init
         target.get_new_batch_prefill = wrapped_get_new_batch_prefill
+        target.get_new_prebuilt_batch = wrapped_get_new_prebuilt_batch
         target.run_batch = wrapped_run_batch
         target.process_batch_result = wrapped_process_batch_result
         target._prefetch_kvcache = wrapped_prefetch_kvcache

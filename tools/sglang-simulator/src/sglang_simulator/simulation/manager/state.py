@@ -1,3 +1,6 @@
+from typing import Optional
+
+
 class StateManager:
     _iteration: int = 0
     _global_clock: float = 0
@@ -12,6 +15,36 @@ class StateManager:
     _last_real_time_ts: float = 0
     _last_flush_time_ts: float = 0
 
+    # In-flight KV cache transfers, keyed by request id, valued by the simulated
+    # clock time the transfer completes. A decode instance waiting on these has
+    # no batch to run, so they are the only thing that can move its clock.
+    _pending_transfer_completions: dict[str, float] = {}
+
+    @classmethod
+    def set_pending_transfer_completion(cls, rid: str, completion_time: float) -> None:
+        cls._pending_transfer_completions[rid] = completion_time
+
+    @classmethod
+    def get_pending_transfer_completion(cls, rid: str) -> Optional[float]:
+        return cls._pending_transfer_completions.get(rid)
+
+    @classmethod
+    def clear_pending_transfer_completion(cls, rid: str) -> None:
+        cls._pending_transfer_completions.pop(rid, None)
+
+    @classmethod
+    def next_pending_transfer_completion(cls, after: float) -> Optional[float]:
+        """Earliest in-flight transfer completion at or after `after`.
+
+        Equality matters for transfers that complete immediately (for example
+        without a KV transfer model): one zero-length idle turn lets the
+        scheduler poll and commit them without an artificial fixed step.
+        """
+        pending = [
+            ts for ts in cls._pending_transfer_completions.values() if ts >= after
+        ]
+        return min(pending) if pending else None
+
     @classmethod
     def reset(cls):
         cls._iteration = 0
@@ -25,6 +58,8 @@ class StateManager:
         cls._hicache_l2_load_units = 0
         cls._hicache_l2_load_bytes = 0
         cls._last_real_time_ts = 0
+
+        cls._pending_transfer_completions.clear()
 
     @classmethod
     def inc_iteration(cls) -> None:

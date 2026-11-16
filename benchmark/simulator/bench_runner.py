@@ -4,7 +4,7 @@ import asyncio
 import atexit
 import json
 import os
-from typing import Iterator
+from typing import Iterator, Optional
 
 import numpy as np
 from msgspec.structs import asdict
@@ -16,7 +16,6 @@ from sglang_simulator.utils.logger import get_logger
 SGLANG_SIMULATOR_OUTPUT_DIR = os.getenv(
     "SGLANG_SIMULATOR_OUTPUT_DIR", "/tmp/sglang_simulator/output"
 )
-SIMULATION_METRICS_PATH = f"{SGLANG_SIMULATOR_OUTPUT_DIR}/metrics.json"
 os.environ["SGLANG_SIMULATOR_OUTPUT_DIR"] = SGLANG_SIMULATOR_OUTPUT_DIR
 
 if os.getenv("SGLANG_SIMULATOR_OUTPUT_MODE") is None:
@@ -36,11 +35,27 @@ logger = get_logger("sglang_simulator")
 class SGLangBenchmarkRunner(BaseBenchmarkRunner):
     """Run a simulator workload directly through SGLang's in-process Engine."""
 
-    def __init__(self, server_args: ServerArgs):
+    def __init__(self, server_args: ServerArgs, output_dir: Optional[str] = None):
+        # A spawned scheduler reads its output directory from the environment as
+        # it starts, so set it per runner: a PD run has several in one process.
+        self.output_dir = output_dir or SGLANG_SIMULATOR_OUTPUT_DIR
+        self.metrics_path = f"{self.output_dir}/metrics.json"
+
         # Disable features that are unnecessary for simulation.
         server_args_kwargs = asdict(server_args)
         apply_simulator_server_args(server_args_kwargs)
-        self.engine = SGLangSimulationEngine(**server_args_kwargs)
+
+        previous_output_dir = os.environ.get("SGLANG_SIMULATOR_OUTPUT_DIR")
+        os.environ["SGLANG_SIMULATOR_OUTPUT_DIR"] = self.output_dir
+        try:
+            self.engine = SGLangSimulationEngine(**server_args_kwargs)
+        finally:
+            # Otherwise the next engine spawned here would inherit it.
+            if previous_output_dir is None:
+                os.environ.pop("SGLANG_SIMULATOR_OUTPUT_DIR", None)
+            else:
+                os.environ["SGLANG_SIMULATOR_OUTPUT_DIR"] = previous_output_dir
+
         self.server_args = self.engine.server_args
         self._shutdown = False
 
@@ -70,6 +85,11 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
                 "total_request": len(dataset),  # Include the warmup requests.
                 "created_time": created_time,
             }
+            # The PD runner sets this on the decode pass; Decode waits for it.
+            if "kv_xfer_visible_s" in req.custom_params:
+                simulation_params["kv_xfer_visible_s"] = req.custom_params[
+                    "kv_xfer_visible_s"
+                ]
 
             yield (req, simulation_params)
 
@@ -80,8 +100,8 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
     ):
         await self.engine.tokenizer_manager.start_profile()
 
-        if os.path.exists(SIMULATION_METRICS_PATH):
-            with open(SIMULATION_METRICS_PATH, "w") as metrics_file:
+        if os.path.exists(self.metrics_path):
+            with open(self.metrics_path, "w") as metrics_file:
                 # Clear data from a previous benchmark in the same process.
                 pass
 
@@ -104,6 +124,7 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
                             "simulation": simulation_params
                         },
                     },
+                    **req.extra_args,
                 )
             )
             tasks.append(task)
@@ -113,13 +134,13 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
         # Trigger the simulator's profile handler to flush final metrics.
         await self.engine.tokenizer_manager.start_profile()
 
-        if os.path.exists(SIMULATION_METRICS_PATH):
-            with open(SIMULATION_METRICS_PATH) as metrics_file:
+        if os.path.exists(self.metrics_path):
+            with open(self.metrics_path) as metrics_file:
                 metrics = json.load(metrics_file)
         else:
             logger.error(
                 f"Failed to load metrics from serving backend. The metrics file "
-                f"should be loaded from {SIMULATION_METRICS_PATH}."
+                f"should be loaded from {self.metrics_path}."
             )
             return None
 
@@ -132,7 +153,7 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
 
     def get_iteration_stats(self) -> list[dict]:
         data = []
-        file_path = f"{SGLANG_SIMULATOR_OUTPUT_DIR}/iteration.jsonl"
+        file_path = f"{self.output_dir}/iteration.jsonl"
         if os.path.exists(file_path):
             with open(file_path) as stats_file:
                 line = stats_file.readline()
@@ -145,7 +166,7 @@ class SGLangBenchmarkRunner(BaseBenchmarkRunner):
 
     def get_request_stats(self) -> list[dict]:
         data = []
-        file_path = f"{SGLANG_SIMULATOR_OUTPUT_DIR}/request.jsonl"
+        file_path = f"{self.output_dir}/request.jsonl"
         if os.path.exists(file_path):
             with open(file_path) as stats_file:
                 line = stats_file.readline()

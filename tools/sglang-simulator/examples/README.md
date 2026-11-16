@@ -2,9 +2,13 @@
 
 The example assets are organized by purpose:
 
-- `sim_configs/`: standalone AISimulate SOL, AISimulate SILICON, ML, and replay simulator configs;
+- `sim_configs/`: standalone AISimulate SOL, AISimulate SILICON, ML, and replay simulator configs,
+  and `pd_ml.json` with a PD `kv_transfer_config`, whose predictor paths are
+  placeholders for your own trained bundles;
 - `assets/`: the small illustrative ML model, replay table, and test tokenizer;
 - `workloads/`: ShareGPT and timestamped simulator/Autobench workload examples;
+- `network_profiles/`: the KV transfer profile format with made-up values, not a
+  measured network;
 
 The ML model is an illustrative constant-latency sklearn model, not a calibrated
 hardware predictor. Rebuild it and the tokenizer with:

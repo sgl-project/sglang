@@ -12,6 +12,9 @@ class GenericRequest:
     input_length: int = -1
     output_length: int = -1
     custom_params: dict = field(default_factory=dict)
+    # Engine keyword arguments such as PD's `bootstrap_room`; `custom_params`
+    # carries simulator parameters through the sampling params instead.
+    extra_args: dict = field(default_factory=dict)
 
     def __post_init__(self):
         if self.prompt is None and self.token_ids is None:

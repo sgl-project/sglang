@@ -21,6 +21,13 @@ SIMULATOR_SERVER_ARG_OVERRIDES = {
 }
 
 
+# SGLang rejects the fake transport on prefill, which gets a fake sender from
+# C_PrefillBootstrapQueueHook instead; kept apart so non-PD runs carry neither.
+SIMULATOR_DECODE_OVERRIDES = {
+    "disaggregation_transfer_backend": "fake",
+}
+
+
 class SGLangCompatibilityError(RuntimeError):
     pass
 
@@ -43,13 +50,23 @@ def _require_parameters(function, required: set[str], surface: str) -> None:
         )
 
 
+def _disaggregation_mode(target):
+    if isinstance(target, dict):
+        return target.get("disaggregation_mode")
+    return target.disaggregation_mode
+
+
 def apply_simulator_server_args(target) -> None:
     """Apply simulator-owned values before constructing the final ServerArgs."""
+    overrides = dict(SIMULATOR_SERVER_ARG_OVERRIDES)
+    if _disaggregation_mode(target) == "decode":
+        overrides.update(SIMULATOR_DECODE_OVERRIDES)
+
     if isinstance(target, dict):
-        target.update(SIMULATOR_SERVER_ARG_OVERRIDES)
+        target.update(overrides)
         return
 
-    for name, value in SIMULATOR_SERVER_ARG_OVERRIDES.items():
+    for name, value in overrides.items():
         setattr(target, name, value)
 
 
