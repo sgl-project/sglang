@@ -2,7 +2,7 @@
 
 // Fixup kernel for TRT-LLM ragged attention zero-KV rows.
 // For sequences with kv_len == 0, forces out=0 and lse=-inf.
-// 2D grid: (blocks_per_seq, batch_size). Y-dim early-exits for non-zero KV.
+// One CTA per (sequence, query offset), with a flat launch grid.
 // Uses vectorised float4 stores for bandwidth efficiency.
 
 #include <sgl_kernel/tensor.h>
@@ -75,8 +75,9 @@ __global__ void fixup_zero_kv_rows_kernel(
     const int32_t* __restrict__ kv_lens,
     const int32_t* __restrict__ cum_seq_lens,
     const int out_stride,
-    const int lse_stride) {
-  const int seq_idx = blockIdx.y;
+    const int lse_stride,
+    const int blocks_per_seq) {
+  const int seq_idx = blockIdx.x / blocks_per_seq;
   if (kv_lens[seq_idx] > 0) return;
 
   const int tok_start = cum_seq_lens[seq_idx];
@@ -84,8 +85,7 @@ __global__ void fixup_zero_kv_rows_kernel(
   const int num_tokens = tok_end - tok_start;
   if (num_tokens <= 0) return;
 
-  // blockIdx.x selects a token within this sequence.
-  const int tok = tok_start + blockIdx.x;
+  const int tok = tok_start + blockIdx.x % blocks_per_seq;
   if (tok >= tok_end) return;
 
   // Each block handles one token: zero out[tok] and set lse[tok] = -inf.
@@ -121,9 +121,10 @@ void fixup_zero_kv_rows(
   const int nh = static_cast<int>(num_heads.unwrap());
   const int vd = static_cast<int>(v_head_dim.unwrap());
 
-  // Grid: one block per (token, sequence). X = max tokens in any seq.
-  const int blocks_x = static_cast<int>(max_seq_len);
-  dim3 grid(blocks_x, bs);
+  if (bs == 0 || max_seq_len == 0) return;
+  const int64_t total_blocks = bs * max_seq_len;
+  RuntimeCheck(total_blocks > 0 && total_blocks <= 2147483647, "invalid fixup grid size");
+  dim3 grid(static_cast<unsigned int>(total_blocks));
   dim3 block(kFixupBlockSize);
 
   LaunchKernel(grid, block, device.unwrap())(
@@ -133,7 +134,8 @@ void fixup_zero_kv_rows(
       static_cast<const int32_t*>(kv_lens.data_ptr()),
       static_cast<const int32_t*>(cum_seq_lens.data_ptr()),
       nh * vd,
-      nh);
+      nh,
+      static_cast<int>(max_seq_len));
 }
 
 }  // namespace sglang
