@@ -17,7 +17,7 @@ import requests
 
 from sglang.srt.environ import envs
 
-PROFILER_DIR = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+PROFILER_DIR = envs.SGLANG_TORCH_PROFILER_DIR.get()
 
 
 def run_profile(

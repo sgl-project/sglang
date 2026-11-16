@@ -260,17 +260,17 @@ def throughput_test_once(
     ]
 
     if profile:
-        assert "SGLANG_TORCH_PROFILER_DIR" in os.environ, (
+        assert envs.SGLANG_TORCH_PROFILER_DIR.is_set(), (
             "Please set SGLANG_TORCH_PROFILER_DIR."
         )
-        os.makedirs(os.environ["SGLANG_TORCH_PROFILER_DIR"], exist_ok=True)
+        os.makedirs(envs.SGLANG_TORCH_PROFILER_DIR.get(), exist_ok=True)
         known_files = None
         backend.start_profile(
             num_steps=profile_steps,
             activities=profile_activities,
         )
         if profile_steps:
-            dir = os.getenv("SGLANG_TORCH_PROFILER_DIR")
+            dir = envs.SGLANG_TORCH_PROFILER_DIR.get()
             known_files = set(os.listdir(dir))
 
     st = time.perf_counter()
@@ -283,7 +283,7 @@ def throughput_test_once(
     latency = time.perf_counter() - st
 
     if profile:
-        dir = os.getenv("SGLANG_TORCH_PROFILER_DIR")
+        dir = envs.SGLANG_TORCH_PROFILER_DIR.get()
         if not profile_steps:
             known_files = set(os.listdir(dir))
         # With --profile-steps the scheduler auto-stops mid-run after N steps, so

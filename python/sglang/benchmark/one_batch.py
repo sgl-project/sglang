@@ -74,6 +74,7 @@ from sglang.srt.distributed.parallel_state import (
     destroy_model_parallel,
 )
 from sglang.srt.entrypoints.engine import _set_envs_and_config
+from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
 from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.layers.dp_attention import require_mlp_sync, require_mlp_tp_gather
@@ -654,7 +655,7 @@ def _read_prompts_from_file(prompt_file, rank_print):
 
 
 def _get_torch_profiler_output_dir():
-    return os.environ.get("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+    return envs.SGLANG_TORCH_PROFILER_DIR.get()
 
 
 def _create_torch_profiler_filename(

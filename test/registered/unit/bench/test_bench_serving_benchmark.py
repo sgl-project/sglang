@@ -1,4 +1,4 @@
-"""Regression tests for bench_serving's --use-trace-timestamps replay."""
+"""Regression tests for bench_serving's benchmark() run, against a stub server."""
 
 import asyncio
 import json
@@ -9,23 +9,30 @@ import time
 import unittest
 from argparse import Namespace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from unittest.mock import patch
 
 from sglang.benchmark.datasets.common import DatasetRow
 from sglang.benchmark.serving import benchmark, get_request, set_global_args
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=14, suite="base-a-test-cpu")
+register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 
 # Gap between the two trace rows; far above the stub server's response time.
 TRACE_GAP_MS = 400.0
 
 
-class _ChatHandler(BaseHTTPRequestHandler):
-    """Records the prompt and the arrival time of every chat request."""
+class _ServerHandler(BaseHTTPRequestHandler):
+    """Records the prompt and arrival time of every chat request, and every
+    cache flush."""
 
     def do_POST(self):  # noqa: N802
         arrival = time.monotonic()
+        if self.path.startswith("/flush_cache"):
+            self.server.flushes.append(self.path)
+            self.send_response(200)
+            self.end_headers()
+            return
         body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
         self.server.arrivals.append((body["messages"][0]["content"], arrival))
         message = {"role": "assistant", "content": "hi"}
@@ -50,24 +57,23 @@ class _Tokenizer:
         return text.split()
 
 
-class TestBenchServingTraceTimestamps(CustomTestCase):
+class _BenchmarkRunTestCase(CustomTestCase):
     def setUp(self):
-        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _ChatHandler)
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _ServerHandler)
         self.server.arrivals = []
+        self.server.flushes = []
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
         self.addCleanup(self.server.server_close)
         self.addCleanup(self.server.shutdown)
         self.output_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.output_dir.cleanup)
 
-    def test_requests_are_sent_at_their_trace_timestamps(self):
-        """With use_trace_timestamps, benchmark() must send each request at its trace
-        offset, not all at once at the request rate while reporting a "trace" run."""
+    def _run(self, rows, backend, use_trace_timestamps=False):
         set_global_args(
             Namespace(
-                backend="vllm-chat",
+                backend=backend,
                 dataset_name="custom",
-                num_prompts=2,
+                num_prompts=len(rows),
                 warmup_requests=0,
                 disable_stream=True,
                 disable_ignore_eos=True,
@@ -86,16 +92,9 @@ class TestBenchServingTraceTimestamps(CustomTestCase):
             )
         )
         base_url = f"http://127.0.0.1:{self.server.server_port}"
-        rows = [
-            DatasetRow(
-                prompt="late", prompt_len=1, output_len=1, timestamp=TRACE_GAP_MS
-            ),
-            DatasetRow(prompt="early", prompt_len=1, output_len=1, timestamp=0.0),
-        ]
-
-        result = asyncio.run(
+        return asyncio.run(
             benchmark(
-                backend="vllm-chat",
+                backend=backend,
                 api_url=base_url + "/v1/chat/completions",
                 base_url=base_url,
                 model_id="dummy-model",
@@ -110,9 +109,23 @@ class TestBenchServingTraceTimestamps(CustomTestCase):
                 extra_request_body={},
                 profile=False,
                 warmup_requests=0,
-                use_trace_timestamps=True,
+                use_trace_timestamps=use_trace_timestamps,
             )
         )
+
+
+class TestBenchServingTraceTimestamps(_BenchmarkRunTestCase):
+    def test_requests_are_sent_at_their_trace_timestamps(self):
+        """With use_trace_timestamps, benchmark() must send each request at its trace
+        offset, not all at once at the request rate while reporting a "trace" run."""
+        rows = [
+            DatasetRow(
+                prompt="late", prompt_len=1, output_len=1, timestamp=TRACE_GAP_MS
+            ),
+            DatasetRow(prompt="early", prompt_len=1, output_len=1, timestamp=0.0),
+        ]
+
+        result = self._run(rows, backend="vllm-chat", use_trace_timestamps=True)
 
         self.assertEqual(result["request_rate"], "trace")
         self.assertEqual(result["completed"], 2)
@@ -136,6 +149,21 @@ class TestBenchServingTraceTimestamps(CustomTestCase):
 
         with self.assertRaisesRegex(ValueError, "timestamp"):
             asyncio.run(drain())
+
+
+class TestBenchServingCiCacheFlush(_BenchmarkRunTestCase):
+    def test_ci_flag_is_read_as_the_declared_boolean(self):
+        """In CI an sglang backend's cache is flushed before the measured run;
+        SGLANG_IS_IN_CI must count for every spelling the declared boolean takes."""
+        row = DatasetRow(prompt="p", prompt_len=1, output_len=1)
+        for value, flushes in [("yes", 1), ("0", 0)]:
+            with (
+                self.subTest(value=value),
+                patch.dict(os.environ, {"SGLANG_IS_IN_CI": value}),
+            ):
+                self.server.flushes.clear()
+                self._run([row], backend="sglang-oai-chat")
+                self.assertEqual(len(self.server.flushes), flushes)
 
 
 if __name__ == "__main__":

@@ -55,6 +55,7 @@ from sglang.benchmark.utils import (
     set_ulimit,
 )
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
+from sglang.srt.environ import envs
 from sglang.srt.utils.auth import admin_auth_headers
 from sglang.srt.utils.network import resolve_base_url, resolve_host_port
 
@@ -67,12 +68,6 @@ TERM_PLOTLIB_AVAILABLE = (importlib.util.find_spec("termplotlib") is not None) a
 )
 
 global args
-
-
-# don't want to import sglang package here
-def _get_bool_env_var(name: str, default: str = "false") -> bool:
-    value = os.getenv(name, default)
-    return value.lower() in ("true", "1")
 
 
 def _create_bench_client_session():
@@ -889,7 +884,7 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
 
                 output_dir = getattr(args, "profile_output_dir", None)
                 if output_dir is None:
-                    output_dir = os.getenv("SGLANG_TORCH_PROFILER_DIR", "/tmp")
+                    output_dir = envs.SGLANG_TORCH_PROFILER_DIR.get()
                 output_dir = Path(os.path.abspath(os.path.normpath(output_dir))) / str(
                     time.time()
                 )
@@ -1526,7 +1521,7 @@ async def benchmark(
     # request-local prefix reuse. vLLM exposes a different, development-mode
     # endpoint for the same purpose.
     should_flush_cache = (
-        "sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")
+        "sglang" in backend and envs.SGLANG_IS_IN_CI.get()
     ) or flush_cache
     if should_flush_cache:
         flush_server_cache(
