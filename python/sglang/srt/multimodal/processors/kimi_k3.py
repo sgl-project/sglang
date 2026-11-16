@@ -246,6 +246,7 @@ def _preprocess_k3_video(
             image_bias,
             config.patch_size,
             to_chw=lambda frame: frame,
+            max_gpu_resize_pixels=_MAX_GPU_RESIZE_PIXELS,
         )
         _, grid_h, grid_w = grids[0].tolist()
         timestamps.append(_format_k3_timestamp(chunk[0], video.avg_fps))
