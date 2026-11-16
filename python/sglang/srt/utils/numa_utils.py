@@ -1,15 +1,15 @@
 from __future__ import annotations
 
+import atexit
 import ctypes
 import glob
 import logging
 import math
 import multiprocessing
 import os
-import random
 import shutil
 import subprocess
-import time
+import tempfile
 from contextlib import contextmanager
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
@@ -88,12 +88,15 @@ def _create_numactl_executable(numactl_args: str):
     old_executable = os.fsdecode(multiprocessing.spawn.get_executable())
     script = f'''#!/bin/sh
 exec numactl {numactl_args} {old_executable} "$@"'''
-    path = Path(
-        f"/tmp/sglang_temp_file_{time.time()}_{random.randrange(0, 10000000)}.sh"
-    )
-    path.write_text(script)
-    path.chmod(0o777)
-    return str(path), f"{script=}"
+    # The script is the spawned worker's interpreter: only this user may write it.
+    fd, path = tempfile.mkstemp(prefix="sglang_numactl_", suffix=".sh")
+    with os.fdopen(fd, "w") as f:
+        f.write(script)
+    os.chmod(path, 0o700)
+    # sh opens the script after the spawn's exec has returned to the parent, so it
+    # cannot be unlinked when the executable is restored; remove it at exit.
+    atexit.register(Path(path).unlink, missing_ok=True)
+    return path, f"{script=}"
 
 
 @contextmanager

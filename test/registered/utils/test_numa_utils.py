@@ -1,13 +1,18 @@
 import ctypes
 import os
+import stat
+import subprocess
+import sys
 import unittest
 from contextlib import ExitStack
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.utils.numa_utils import (
+    _create_numactl_executable,
     _handle_numa_bind_failure,
     _is_numa_available,
     _node_cpus,
@@ -652,6 +657,37 @@ class TestConfigureSubprocessProbeFailure(unittest.TestCase):
             self.assertIn("Invalid argument", str(cm.exception))
             mock_create.assert_not_called()
             mock_mp.assert_not_called()
+
+
+class TestNumactlWrapperScript(unittest.TestCase):
+    def test_wrapper_is_writable_only_by_its_owner(self):
+        """The wrapper becomes the worker's interpreter, so no other user may
+        be able to rewrite it between its creation and the spawn."""
+        path, _ = _create_numactl_executable(numactl_args="--cpunodebind=0")
+        self.addCleanup(Path(path).unlink, missing_ok=True)
+
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+        self.assertEqual(mode & 0o077, 0, oct(mode))
+        self.assertTrue(os.access(path, os.X_OK))
+
+    def test_wrapper_does_not_outlive_the_launcher(self):
+        """Every worker launch writes one wrapper; none may be left behind
+        once the launching process has exited."""
+        launcher = (
+            "from sglang.srt.utils.numa_utils import _create_numactl_executable\n"
+            "print(_create_numactl_executable(numactl_args='--cpunodebind=0')[0])"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", launcher],
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        path = Path(result.stdout.strip().splitlines()[-1])
+        self.addCleanup(path.unlink, missing_ok=True)
+
+        self.assertFalse(path.exists())
 
 
 if __name__ == "__main__":
