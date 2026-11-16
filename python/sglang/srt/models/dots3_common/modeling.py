@@ -774,12 +774,7 @@ class Dots3AttentionMLA(nn.Module):
                 return Dots3AttnForwardMethod.MHA_CHUNKED_KV
             else:
                 return Dots3AttnForwardMethod.MLA
-        elif attention_backend in ("flashmla", "triton", "nsa"):
-            return Dots3AttnForwardMethod.MLA
-        else:
-            raise NotImplementedError(
-                f"Dots3 only supports CUDA attention backends (fa3, triton, flashmla, nsa), got: {attention_backend}"
-            )
+        return Dots3AttnForwardMethod.MLA
 
     def _apply_attention_gate(self, attn_output: torch.Tensor, g: torch.Tensor):
         if attn_output.ndim != 3:
@@ -1915,11 +1910,10 @@ class Dots3LanguageModelForCausalLM(nn.Module):
             )
 
         # Always fuse q_a_proj/kv_a_proj_with_mqa/g_proj when loading Dots3.
-        fuse_qkv_a_g_proj = True
         assert self.config.q_lora_rank is not None, (
             "Dots3 requires q_lora_rank to enable fused_qkv_a_g_proj_with_mqa loading."
         )
-        cached_a_proj = {} if fuse_qkv_a_g_proj else None
+        cached_a_proj = {}
 
         def shard_g_proj_for_attention_tp(
             weight: torch.Tensor,
@@ -2177,14 +2171,10 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                         # Skip loading norm if not last rank in pipeline parallelism
                         if ".norm." in name and not self.pp_group.is_last_rank:
                             continue
-                        if (
-                            fuse_qkv_a_g_proj
-                            and ".self_attn." in name
-                            and (
-                                "q_a_proj" in name
-                                or "kv_a_proj_with_mqa" in name
-                                or "g_proj" in name
-                            )
+                        if ".self_attn." in name and (
+                            "q_a_proj" in name
+                            or "kv_a_proj_with_mqa" in name
+                            or "g_proj" in name
                         ):
                             cached_a_proj[name] = loaded_weight
                             if "q_a_proj" in name:
@@ -2254,7 +2244,7 @@ class Dots3LanguageModelForCausalLM(nn.Module):
                                 executor.submit(weight_loader, param, loaded_weight)
                             )
 
-            if fuse_qkv_a_g_proj and cached_a_proj:
+            if cached_a_proj:
                 unresolved = sorted(cached_a_proj.keys())
                 preview = ", ".join(unresolved[:6])
                 extra = f" (+{len(unresolved) - 6} more)" if len(unresolved) > 6 else ""
