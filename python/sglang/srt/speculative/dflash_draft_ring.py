@@ -14,10 +14,16 @@ compute this layout and change together.
 
 ``min_pos`` floors each request's window at its prefix-cache hit, whose draft
 KV the ring never had.
+
+Under PD disaggregation prefill sends a request's last window of ring rows
+(``transfer_rows``, positionally matched like the SWA_RING state) and its
+``min_pos`` row; a decode rank keeps the positions it owns.
 """
 
-from typing import Any, Callable, Optional
+from contextlib import nullcontext
+from typing import Any, Callable, List, Optional, Tuple
 
+import numpy as np
 import torch
 
 from sglang.kernels.ops.speculative.dflash_ring_locs import dflash_ring_block_locs
@@ -30,13 +36,20 @@ def draft_kv_ring_unsupported_reason(
     *,
     draft_backend: Optional[str],
     disaggregation_mode: str = "null",
+    disaggregation_transfer_backend: str = "mooncake",
+    disaggregation_decode_host_receive_threshold: float = 1.0,
     enable_unified_memory: bool = False,
     dcp_size: int = 1,
 ) -> Optional[str]:
     """Why a ring cannot serve this draft, or None. Loads the draft config only
     once the launch flags allow a ring."""
-    if disaggregation_mode != "null":
-        return "PD disaggregation does not transfer the ring yet"
+    if disaggregation_mode != "null" and disaggregation_transfer_backend != "mooncake":
+        return (
+            f"the {disaggregation_transfer_backend} PD transfer backend does not "
+            "send the ring"
+        )
+    if disaggregation_decode_host_receive_threshold < 1:
+        return "decode host KV buffering receives only SWA state"
     if enable_unified_memory:
         return "--enable-unified-memory places the draft KV in the target's pool"
     if draft_backend not in DFLASH_MLA_ONLY_DRAFT_BACKENDS:
@@ -112,12 +125,24 @@ class DFlashDraftKVRing:
         dcp_size: int,
         req_to_token_rows: int,
         device: torch.device,
+        window_left: int,
+        dcp_rank: int,
+        pool,
     ):
         self.rows_per_req = rows_per_req
         self.dcp_size = dcp_size
+        self.window_left = window_left
+        self.dcp_rank = dcp_rank
+        self.pool = pool
         # Positions a ring holds without wrapping onto each other.
         self.span = rows_per_req * dcp_size
-        self.min_pos = torch.zeros(req_to_token_rows, dtype=torch.int32, device=device)
+        # PD writes min_pos rows remotely; Mooncake's NVLink transport only
+        # reaches memory from the KV pools' cuMemCreate pool.
+        mem_pool = pool.maybe_get_custom_mem_pool()
+        with torch.cuda.use_mem_pool(mem_pool) if mem_pool else nullcontext():
+            self.min_pos = torch.zeros(
+                req_to_token_rows, dtype=torch.int32, device=device
+            )
         # The req_generation each slot's floor was recorded at.
         self._floor_generation = torch.full((req_to_token_rows,), -1, dtype=torch.int64)
 
@@ -181,4 +206,33 @@ class DFlashDraftKVRing:
         device = self.min_pos.device
         self.min_pos[slots.to(device, non_blocking=True)] = floors.to(
             device, non_blocking=True
+        )
+
+    def transfer_rows(self, req_pool_idx: int, seq_len: int) -> np.ndarray:
+        """This rank's ring rows of the last window before ``seq_len``, in
+        position order; row 0 (the sink) for a position another rank owns."""
+        positions = torch.arange(
+            max(0, seq_len - self.window_left - 1), seq_len, dtype=torch.int64
+        )
+        rows = self.locs(torch.full_like(positions, req_pool_idx), positions)
+        rows = rows // self.dcp_size
+        rows[positions % self.dcp_size != self.dcp_rank] = 0
+        return rows.to(torch.int32).numpy()
+
+    def reset_floor(self, req_pool_idx: int, seq_len: int) -> None:
+        """PD decode, only for a request no transfer sends a floor to: prefill's
+        remote write must be the floor's only writer."""
+        self.min_pos[req_pool_idx].fill_(seq_len)
+
+    def ring_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        """The draft pool's buffers with one item per ring row."""
+        ptrs, lens, item_lens = self.pool.get_contiguous_buf_infos()
+        return ptrs, lens, [n // self.pool.page_size for n in item_lens]
+
+    def floor_buf_infos(self) -> Tuple[List[int], List[int], List[int]]:
+        """``min_pos`` with one item per req pool row."""
+        return (
+            [self.min_pos.data_ptr()],
+            [self.min_pos.nbytes],
+            [self.min_pos.element_size()],
         )

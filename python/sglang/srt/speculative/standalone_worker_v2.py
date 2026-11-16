@@ -28,10 +28,8 @@ from sglang.srt.speculative.spec_utils import (
     draft_tp_context,
     get_plan_stream,
 )
-from sglang.srt.utils import get_bool_env_var
 
 logger = logging.getLogger(__name__)
-SGLANG_RETURN_ORIGINAL_LOGPROB = get_bool_env_var("SGLANG_RETURN_ORIGINAL_LOGPROB")
 
 
 class StandaloneDraftWorker(EagleDraftWorker):
@@ -62,13 +60,6 @@ class StandaloneDraftWorker(EagleDraftWorker):
         )
 
         self._rebuild_topk1_chain_buffers()
-
-        # Set constant
-        from sglang.srt.speculative.eagle_info import EagleDraftInput
-
-        EagleDraftInput.ALLOC_LEN_PER_DECODE = max(
-            self.speculative_num_steps * self.topk, self.speculative_num_draft_tokens
-        )
 
         # Retain the target's attention topology when swapping TP groups.
         self.parallel_layout = resolve_draft_parallel_layout(

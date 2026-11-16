@@ -552,7 +552,6 @@ class Cosmos3SimAutoRolloutStage(PipelineStage):
         }
 
     def _prepare(self, batch: Req, device: torch.device) -> _Session:
-        manifest = self.manifest
         extra = batch.extra
         if extra.get(EXTRA_KNOWN_VIEWS):
             raise ValueError(
