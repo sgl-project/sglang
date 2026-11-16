@@ -10,8 +10,6 @@
 #include <cutlass/util/packed_stride.hpp>
 #include <tvm/ffi/container/tensor.h>
 
-#include <type_traits>
-
 namespace sglang::inkling2_nvfp4 {
 
 using namespace cute;
@@ -19,17 +17,14 @@ using Problems = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
 using FP4 = cutlass::float_e2m1_t;
 using FP8 = cutlass::float_ue4m3_t;
 
-// kSwap: weights are A (M = n) and token rows are B (N = rows), so D is the
-// column-major (n, rows) view of the row-major (rows, n) output.
 template <
     class Arch,
     class Tile,
     class Schedule,
-    bool kSwap,
     class Cluster = Shape<_1, _1, _1>,
     class EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm>
 struct Config {
-  using LayoutD = std::conditional_t<kSwap, cutlass::layout::ColumnMajor, cutlass::layout::RowMajor>;
+  using LayoutD = cutlass::layout::RowMajor;
   using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       Arch,
       cutlass::arch::OpClassTensorOp,
@@ -67,41 +62,22 @@ struct Config {
   using LayoutSFA = typename Mainloop::InternalLayoutSFA;
   using LayoutSFB = typename Mainloop::InternalLayoutSFB;
   using ScaleConfig = typename Mainloop::Sm1xxBlkScaledConfig;
-  static constexpr bool swap = kSwap;
 };
 
-// SM103 runs the Ultra (K = 768) kernels; other Blackwell parts (SM100) the
-// 1-SM NVFP4 kernels with the same scale layout. 128x192 Wide tiles serve
-// prefill-sized row counts.
+// SM103 runs the Ultra (K = 768) kernel; other Blackwell parts (SM100) the
+// 1-SM NVFP4 kernel with the same scale layout.
 #if SGL_CUDA_ARCH == 1030
-using Default = Config<
-    cutlass::arch::Sm103,
-    Shape<_128, _128, Int<768>>,
-    cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmBlockScaledMxNvf4UltraVs16Sm103,
-    false>;
 using Wide = Config<
     cutlass::arch::Sm103,
     Shape<_128, Int<192>, Int<768>>,
-    cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmBlockScaledMxNvf4UltraVs16Sm103,
-    false>;
+    cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmBlockScaledMxNvf4UltraVs16Sm103>;
 #else
-using Default = Config<
-    cutlass::arch::Sm100,
-    Shape<_128, _128, _256>,
-    cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmNvf4Sm100,
-    false>;
 using Wide = Config<
     cutlass::arch::Sm100,
     Shape<_128, Int<192>, _256>,
-    cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmNvf4Sm100,
-    false>;
+    cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmNvf4Sm100>;
 #endif
-using Swap = Config<
-    cutlass::arch::Sm100,
-    Shape<_128, _64, _256>,
-    cutlass::gemm::KernelPtrArrayTmaWarpSpecialized1SmNvf4Sm100,
-    true>;
-using ScaleConfig = Default::ScaleConfig;
+using ScaleConfig = Wide::ScaleConfig;
 
 template <class C>
 struct Buffers {
@@ -171,16 +147,8 @@ int64_t workspace_size_impl(int64_t experts, int64_t rows, int64_t n, int64_t k,
   return bytes + C::Gemm::get_workspace_size(arguments(b, experts, sm_count));
 }
 
-int64_t workspace_size(int64_t experts, int64_t rows, int64_t n, int64_t k, int64_t sm_count) {
-  return workspace_size_impl<Default>(experts, rows, n, k, sm_count);
-}
-
 int64_t wide_workspace_size(int64_t experts, int64_t rows, int64_t n, int64_t k, int64_t sm_count) {
   return workspace_size_impl<Wide>(experts, rows, n, k, sm_count);
-}
-
-int64_t swap_workspace_size(int64_t experts, int64_t rows, int64_t n, int64_t k, int64_t sm_count) {
-  return workspace_size_impl<Swap>(experts, rows, n, k, sm_count);
 }
 
 template <class C>
@@ -204,29 +172,16 @@ __device__ void prepare_expert(
   FP8 const* xse = b.x_scales + int64_t(scale_start) * scale_k;
   FP8 const* wse = w_scales + int64_t(e) * weight_scale_size(n, k);
   b.d[e] = y + int64_t(start) * n;
-  if constexpr (C::swap) {
-    b.problems[e] = make_shape(n, m, k);
-    b.a[e] = we;
-    b.b[e] = xe;
-    b.sa[e] = wse;
-    b.sb[e] = xse;
-    b.stride_a[e] = cutlass::make_cute_packed_stride(typename C::StrideA{}, make_shape(n, k, 1));
-    b.stride_b[e] = cutlass::make_cute_packed_stride(typename C::StrideB{}, make_shape(m, k, 1));
-    b.stride_d[e] = cutlass::make_cute_packed_stride(typename C::StrideD{}, make_shape(n, m, 1));
-    b.layout_a[e] = C::ScaleConfig::tile_atom_to_shape_SFA(make_shape(n, m, k, 1));
-    b.layout_b[e] = C::ScaleConfig::tile_atom_to_shape_SFB(make_shape(n, m, k, 1));
-  } else {
-    b.problems[e] = make_shape(m, n, k);
-    b.a[e] = xe;
-    b.b[e] = we;
-    b.sa[e] = xse;
-    b.sb[e] = wse;
-    b.stride_a[e] = cutlass::make_cute_packed_stride(typename C::StrideA{}, make_shape(m, k, 1));
-    b.stride_b[e] = cutlass::make_cute_packed_stride(typename C::StrideB{}, make_shape(n, k, 1));
-    b.stride_d[e] = cutlass::make_cute_packed_stride(typename C::StrideD{}, make_shape(m, n, 1));
-    b.layout_a[e] = C::ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
-    b.layout_b[e] = C::ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
-  }
+  b.problems[e] = make_shape(m, n, k);
+  b.a[e] = xe;
+  b.b[e] = we;
+  b.sa[e] = xse;
+  b.sb[e] = wse;
+  b.stride_a[e] = cutlass::make_cute_packed_stride(typename C::StrideA{}, make_shape(m, k, 1));
+  b.stride_b[e] = cutlass::make_cute_packed_stride(typename C::StrideB{}, make_shape(n, k, 1));
+  b.stride_d[e] = cutlass::make_cute_packed_stride(typename C::StrideD{}, make_shape(m, n, 1));
+  b.layout_a[e] = C::ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
+  b.layout_b[e] = C::ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
 }
 
 // Launched with PDL: it reads only routing metadata that is complete before the
@@ -247,27 +202,6 @@ __global__ void prepare(
   int e = blockIdx.x * blockDim.x + threadIdx.x;
   if (e < experts) prepare_expert(b, x, w, w_scales, y, counts, offsets, e, n, k);
   asm volatile("griddepcontrol.wait;" ::: "memory");
-}
-
-template <class C>
-__global__ void swizzle_x(Buffers<C> b, FP8 const* scales, int const* counts, int const* offsets, int experts, int k) {
-  int row = blockIdx.x;
-  if (row < offsets[0] || row >= offsets[experts - 1] + counts[experts - 1]) return;
-  int lo = 0, hi = experts;
-  while (lo + 1 < hi) {
-    int mid = (lo + hi) / 2;
-    if (offsets[mid] <= row)
-      lo = mid;
-    else
-      hi = mid;
-  }
-  int local_row = row - offsets[lo];
-  for (int col = threadIdx.x; col < k / 16; col += blockDim.x) {
-    auto* dst = const_cast<FP8*>(C::swap ? b.sb[lo] : b.sa[lo]);
-    auto offset = C::swap ? b.layout_b[lo](make_coord(local_row, col * 16, 0))
-                          : b.layout_a[lo](make_coord(local_row, col * 16, 0));
-    dst[offset] = scales[int64_t(row) * (k / 16) + col];
-  }
 }
 
 // The weight scale layout depends only on (n, k), so it is built once at load.
@@ -295,7 +229,6 @@ void swizzle_weight_scales(tvm::ffi::TensorView scales, tvm::ffi::TensorView out
 template <class C>
 void run_impl(
     tvm::ffi::TensorView x,
-    FP8 const* xs,
     tvm::ffi::TensorView w,
     tvm::ffi::TensorView ws,
     tvm::ffi::TensorView counts,
@@ -303,32 +236,6 @@ void run_impl(
     tvm::ffi::TensorView y,
     tvm::ffi::TensorView workspace,
     int64_t sm_count);
-
-void run(
-    tvm::ffi::TensorView x,
-    tvm::ffi::TensorView xs,
-    tvm::ffi::TensorView w,
-    tvm::ffi::TensorView ws,
-    tvm::ffi::TensorView counts,
-    tvm::ffi::TensorView offsets,
-    tvm::ffi::TensorView y,
-    tvm::ffi::TensorView workspace,
-    int64_t sm_count) {
-  run_impl<Default>(x, static_cast<FP8 const*>(xs.data_ptr()), w, ws, counts, offsets, y, workspace, sm_count);
-}
-
-void run_swap(
-    tvm::ffi::TensorView x,
-    tvm::ffi::TensorView xs,
-    tvm::ffi::TensorView w,
-    tvm::ffi::TensorView ws,
-    tvm::ffi::TensorView counts,
-    tvm::ffi::TensorView offsets,
-    tvm::ffi::TensorView y,
-    tvm::ffi::TensorView workspace,
-    int64_t sm_count) {
-  run_impl<Swap>(x, static_cast<FP8 const*>(xs.data_ptr()), w, ws, counts, offsets, y, workspace, sm_count);
-}
 
 // Activation scales already written in the GEMM layout at wide_x_scales_offset.
 void run_wide_preswizzled(
@@ -340,7 +247,7 @@ void run_wide_preswizzled(
     tvm::ffi::TensorView y,
     tvm::ffi::TensorView workspace,
     int64_t sm_count) {
-  run_impl<Wide>(x, nullptr, w, ws, counts, offsets, y, workspace, sm_count);
+  run_impl<Wide>(x, w, ws, counts, offsets, y, workspace, sm_count);
 }
 
 int64_t wide_x_scales_offset(int64_t experts, int64_t rows, int64_t n, int64_t k) {
@@ -352,7 +259,6 @@ int64_t wide_x_scales_offset(int64_t experts, int64_t rows, int64_t n, int64_t k
 template <class C>
 void run_impl(
     tvm::ffi::TensorView x,
-    FP8 const* xs,
     tvm::ffi::TensorView w,
     tvm::ffi::TensorView ws,
     tvm::ffi::TensorView counts,
@@ -395,11 +301,6 @@ void run_impl(
           n,
           k) == cudaSuccess,
       "Cannot launch NVFP4 GEMM prepare");
-  if (xs != nullptr) {
-    auto scale_bytes = static_cast<char*>(workspace.data_ptr()) + bytes - reinterpret_cast<char*>(b.x_scales);
-    RuntimeCheck(cudaMemsetAsync(b.x_scales, 0, scale_bytes, stream) == cudaSuccess, "Cannot initialize NVFP4 scales");
-    swizzle_x<C><<<rows, 128, 0, stream>>>(b, xs, count_ptr, offset_ptr, experts, k);
-  }
   RuntimeCheck(cudaGetLastError() == cudaSuccess, "Cannot prepare NVFP4 GEMM");
   typename C::Gemm gemm;
   RuntimeCheck(gemm.can_implement(args) == cutlass::Status::kSuccess, "Unsupported NVFP4 GEMM shape");

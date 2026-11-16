@@ -11,115 +11,6 @@ PDL = is_arch_support_pdl()
 
 
 @triton.jit
-def _expert_matmul(
-    X,
-    XS,
-    W,
-    WS,
-    Y,
-    Counts,
-    Offsets,
-    Schedule,
-    M: tl.constexpr,
-    N: tl.constexpr,
-    K: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
-    if Schedule is None:
-        expert = tl.program_id(0).to(tl.int64)
-        rows = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-        row_ids = expert * M + rows
-        row_mask = rows < M
-    else:
-        entry = tl.load(Schedule + tl.program_id(0))
-        if entry == -1:
-            return
-        expert = (entry & 0xFFFF).to(tl.int64)
-        rows = (entry >> 16) * BLOCK + tl.arange(0, BLOCK)
-        row_ids = tl.load(Offsets + expert).to(tl.int64) + rows
-        row_mask = rows < tl.load(Counts + expert)
-    col0 = tl.program_id(2) * BLOCK
-    cols = col0 + tl.arange(0, BLOCK)
-    k = tl.arange(0, BLOCK)
-    scale_k = tl.arange(0, BLOCK // 32)
-    acc = tl.zeros((BLOCK, BLOCK), tl.float32)
-    for tile in range(tl.cdiv(K, BLOCK)):
-        offsets = tile * BLOCK + k
-        scales = tile * (BLOCK // 32) + scale_k
-        x = tl.load(
-            X + row_ids[:, None] * K + offsets[None, :],
-            row_mask[:, None] & (offsets[None, :] < K),
-            other=0.0,
-        )
-        w = W.load([(expert * N + col0).to(tl.int32), tile * BLOCK])
-        xs = tl.load(
-            XS + row_ids[:, None] * (K // 32) + scales[None, :],
-            row_mask[:, None] & (scales[None, :] < K // 32),
-            other=0,
-        )
-        ws = tl.load(
-            WS + expert * N * (K // 32) + cols[:, None] * (K // 32) + scales[None, :],
-            (cols[:, None] < N) & (scales[None, :] < K // 32),
-            other=0,
-        )
-        acc = tl.dot_scaled(x, xs, "e4m3", w.T, ws, "e4m3", acc, fast_math=True)
-    tl.store(
-        Y + row_ids[:, None] * N + cols[None, :],
-        acc,
-        row_mask[:, None] & (cols[None, :] < N),
-    )
-
-
-def expert_matmul(
-    x: torch.Tensor, weight: torch.Tensor, scales: torch.Tensor, *, metadata=None
-):
-    experts, output_size, width = weight.shape
-    if metadata is None:
-        if x.ndim == 2:
-            x = x.unsqueeze(0).expand(experts, -1, -1)
-        if x.ndim != 3 or x.shape[0] != experts or x.shape[-1] != width:
-            raise ValueError("MXFP8 expert input and weight shapes do not match")
-        rows = x.shape[1]
-        out_shape = (experts, rows, output_size)
-        counts, offsets, schedule = None, None, None
-        grid = (experts, triton.cdiv(rows, 128), triton.cdiv(output_size, 128))
-    else:
-        if x.ndim != 2 or x.shape[1] != width:
-            raise ValueError(
-                "Grouped MXFP8 inputs must be a matrix of reordered tokens"
-            )
-        rows = x.shape[0]
-        out_shape = (rows, output_size)
-        counts, offsets, schedule = metadata
-        grid = (min(schedule.numel(), rows), 1, triton.cdiv(output_size, 128))
-    values, x_scales = mxfp8_quantize(x.contiguous())
-    out = torch.empty(out_shape, dtype=x.dtype, device=x.device)
-    if rows:
-        _expert_matmul[grid](
-            values,
-            x_scales,
-            TensorDescriptor.from_tensor(
-                weight.view(experts * output_size, width), [128, 128]
-            ),
-            scales,
-            out,
-            counts,
-            offsets,
-            schedule,
-            rows,
-            output_size,
-            width,
-            128,
-            num_warps=4,
-            num_stages=4,
-            launch_pdl=PDL,
-        )
-    return out
-
-
-@triton.jit
 def _routed_swap_ab_matmul(
     X,
     XS,
@@ -183,8 +74,7 @@ def _routed_swap_ab_matmul(
 def _routed_matmul(
     values, x_scales, rows, tokens, weight, scales, metadata, dst2src, top_k
 ):
-    """Routed rows of the grouped MXFP8 GEMM as weight-rows x tokens tiles;
-    bitwise equal to _expert_matmul's tokens x weight-rows tiles."""
+    """Routed rows of the grouped MXFP8 GEMM as weight-rows x tokens tiles."""
     experts, output_size, width = weight.shape
     counts, offsets, schedule = metadata
     out = torch.empty((rows, output_size), dtype=torch.bfloat16, device=values.device)
@@ -216,8 +106,8 @@ def _routed_matmul(
 
 
 def routed_expert_matmul(x, dst2src, top_k, weight, scales, metadata):
-    """expert_matmul over pre_reorder(x) rows, quantizing the token rows once and
-    gathering them through dst2src."""
+    """Grouped MXFP8 GEMM over the routed token rows of x (row r reads token
+    dst2src[r] // top_k), quantizing the token rows once."""
     values, x_scales = mxfp8_quantize(x.contiguous())
     return _routed_matmul(
         values,
@@ -235,8 +125,8 @@ def routed_expert_matmul(x, dst2src, top_k, weight, scales, metadata):
 def routed_swiglu_expert_matmul(
     gate_up, gammas, gate_cap, up_cap, weight, scales, metadata, tokens
 ):
-    """expert_matmul over routed_swiglu(gate_up, ...) rows, with the swiglu fused
-    into the activation quantization."""
+    """Grouped MXFP8 GEMM over the capped swiglu of the gate_up rows, with the
+    swiglu fused into the activation quantization."""
     rows, width = gate_up.shape[0], gate_up.shape[1] // 2
     counts, offsets, _ = metadata
     values = torch.empty(
@@ -399,8 +289,8 @@ def _cutlass_workspace(device, experts, rows, n, k):
 
 
 def prefill_expert_matmul(x, dst2src, top_k, weight, weight_scales, counts, offsets):
-    """expert_matmul over pre_reorder(x) rows of this rank's experts on the CUTLASS
-    grouped GEMM: token rows are quantized once and gathered in expert order."""
+    """routed_expert_matmul for this rank's experts on the CUTLASS grouped GEMM:
+    token rows are quantized once and gathered in expert order."""
     experts, output_size, width = weight.shape
     rows = dst2src.numel()
     values, scales = mxfp8_quantize(x.contiguous())
@@ -433,8 +323,7 @@ def prefill_expert_matmul(x, dst2src, top_k, weight, weight_scales, counts, offs
 def prefill_swiglu_expert_matmul(
     gate_up, gammas, gate_cap, up_cap, weight, weight_scales, counts, offsets
 ):
-    """prefill_expert_matmul over routed_swiglu(gate_up, ...) rows, with the
-    swiglu fused into the activation quantization."""
+    """routed_swiglu_expert_matmul on the CUTLASS grouped GEMM."""
     experts, output_size, width = weight.shape
     rows = gate_up.shape[0]
     workspace, _ = _cutlass_workspace(gate_up.device, experts, rows, output_size, width)

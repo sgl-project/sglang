@@ -69,24 +69,6 @@ def mxfp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 @triton.jit
-def _swiglu(
-    X,
-    G,
-    Y,
-    N: tl.constexpr,
-    SIZE: tl.constexpr,
-    GATE_CAP: tl.constexpr,
-    UP_CAP: tl.constexpr,
-    BLOCK: tl.constexpr,
-):
-    i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
-    gate = tl.load(X + 2 * i, i < SIZE, other=0).to(tl.float32)
-    up = tl.load(X + 2 * i + 1, i < SIZE, other=0).to(tl.float32)
-    gamma = tl.load(G + i // N, i < SIZE, other=0)
-    tl.store(Y + i, _capped_swiglu(gate, up, gamma, GATE_CAP, UP_CAP), i < SIZE)
-
-
-@triton.jit
 def _capped_swiglu(gate, up, gamma, GATE_CAP: tl.constexpr, UP_CAP: tl.constexpr):
     sigmoid = tl.inline_asm_elementwise(
         "{ .reg .f32 t; mul.rn.f32 t, $1, 0fBFB8AA3B; "
@@ -119,23 +101,6 @@ def _capped_swiglu(gate, up, gamma, GATE_CAP: tl.constexpr, UP_CAP: tl.constexpr
     return ((gate * sigmoid) * up) * gamma
 
 
-def swiglu(x: torch.Tensor, gammas: torch.Tensor, gate_cap: float, up_cap: float):
-    out = x.new_empty(x.shape[0], x.shape[1] // 2)
-    if out.numel():
-        _swiglu[(triton.cdiv(out.numel(), 256),)](
-            x,
-            gammas,
-            out,
-            out.shape[1],
-            out.numel(),
-            gate_cap,
-            up_cap,
-            256,
-            enable_fp_fusion=False,
-        )
-    return out
-
-
 @triton.jit
 def _row_expert(Offsets, row, E: tl.constexpr, SEARCH: tl.constexpr):
     experts = tl.arange(0, 1 << SEARCH)
@@ -149,76 +114,6 @@ def _nvfp4_row_scale(XAmax, WAmax, WDenominator, expert, row):
     return (tl.load(XAmax + row) * tl.load(WAmax + expert)) * libdevice.rcp_rn(
         denominator
     )
-
-
-@triton.jit
-def _routed_swiglu(
-    X,
-    XAmax,
-    WAmax,
-    WDenominator,
-    Offsets,
-    G,
-    Y,
-    N: tl.constexpr,
-    E: tl.constexpr,
-    SCALED: tl.constexpr,
-    GATE_CAP: tl.constexpr,
-    UP_CAP: tl.constexpr,
-    BLOCK: tl.constexpr,
-    SEARCH: tl.constexpr,
-):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
-    row = tl.program_id(0)
-    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
-    inside = (row >= tl.load(Offsets)) & (row < tl.load(Offsets + E))
-    mask = (cols < N) & inside
-    gate = tl.load(X + row.to(tl.int64) * 2 * N + 2 * cols, mask, other=0)
-    up = tl.load(X + row.to(tl.int64) * 2 * N + 2 * cols + 1, mask, other=0)
-    if SCALED:
-        scale = _nvfp4_row_scale(
-            XAmax, WAmax, WDenominator, _row_expert(Offsets, row, E, SEARCH), row
-        )
-        gate = tl.where(mask, (gate * scale).to(Y.dtype.element_ty), 0)
-        up = tl.where(mask, (up * scale).to(Y.dtype.element_ty), 0)
-    gamma = tl.load(G + row)
-    y = _capped_swiglu(gate.to(tl.float32), up.to(tl.float32), gamma, GATE_CAP, UP_CAP)
-    tl.store(Y + row.to(tl.int64) * N + cols, y, cols < N)
-
-
-def routed_swiglu(
-    x, gammas, offsets, gate_cap, up_cap, *, out_dtype=None, nvfp4_scales=None
-):
-    """swiglu over rows in [offsets[0], offsets[-1]); other rows act as zero input.
-
-    With nvfp4_scales=(x_amax, w_amax, w_denominator), x is the raw FP32 GEMM
-    accumulator and each row is first scaled and rounded like the GEMM output."""
-    experts = offsets.numel() - 1
-    out = torch.empty(
-        (x.shape[0], x.shape[1] // 2), device=x.device, dtype=out_dtype or x.dtype
-    )
-    if out.numel():
-        x_amax, w_amax, w_denominator = nvfp4_scales or (None, None, None)
-        _routed_swiglu[(out.shape[0], triton.cdiv(out.shape[1], 512))](
-            x,
-            x_amax,
-            w_amax,
-            w_denominator,
-            offsets,
-            gammas,
-            out,
-            out.shape[1],
-            experts,
-            nvfp4_scales is not None,
-            gate_cap,
-            up_cap,
-            512,
-            experts.bit_length(),
-            enable_fp_fusion=False,
-            launch_pdl=PDL,
-        )
-    return out
 
 
 @triton.jit
