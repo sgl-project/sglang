@@ -407,22 +407,20 @@ class TestDensePrefillIndexer(CustomTestCase):
                     )
 
     def test_flashinfer_source_consumer_and_replay(self):
-        """The same protocol under FlashInfer's fused and unfused top-k with a small
-        index tie-break; zero queries tie every score, so the source's blocks and
-        every top-k must be the lowest logical ones."""
-        for fused in (True, False):
-            for zero_queries in (False, True):
-                with (
-                    self.subTest(fused=fused, zero_queries=zero_queries),
-                    envs.SGLANG_DSA_FUSE_TOPK.override(fused),
-                    envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override("small"),
-                ):
-                    self.check_source_consumer_and_replay(
-                        ratio=1,
-                        zero_queries=zero_queries,
-                        selector=TopKSelector(DSATopKBackend.FLASHINFER),
-                        ties_keep_first=zero_queries,
-                    )
+        """The same protocol under FlashInfer's top-k with a small index tie-break;
+        zero queries tie every score, so the source's blocks and every top-k must be
+        the lowest logical ones."""
+        for zero_queries in (False, True):
+            with (
+                self.subTest(zero_queries=zero_queries),
+                envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override("small"),
+            ):
+                self.check_source_consumer_and_replay(
+                    ratio=1,
+                    zero_queries=zero_queries,
+                    selector=TopKSelector(DSATopKBackend.FLASHINFER),
+                    ties_keep_first=zero_queries,
+                )
 
     def test_unfiltered_and_zero_length_requests(self):
         for request_lengths in ([(257, 8192)], [(1, 0), (1, 1), (0, 7)]):

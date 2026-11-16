@@ -1,7 +1,5 @@
-import gc
 import sys
 import unittest
-import weakref
 from itertools import product
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -251,9 +249,8 @@ class TestDSV41FlashInferTopK(CustomTestCase):
     def test_flashinfer_modes_reach_every_selection(self):
         """Every V4.1 selection hands FlashInfer the deterministic and tie-break
         modes, the graph-safe path and its page size (a zero page spanning the row
-        for plain positions), never asks top_k to sort, which its graph-safe CUB
-        path cannot, and SGLANG_DSA_FUSE_TOPK picks the fused page-table transform
-        over top_k plus a torch translation."""
+        for plain positions), and never asks top_k to sort, which its graph-safe
+        CUB path cannot."""
         scores = torch.randn(2, 96)
         lens = torch.tensor([40, 96], dtype=torch.int32)
         metadata = SimpleNamespace(
@@ -265,81 +262,35 @@ class TestDSV41FlashInferTopK(CustomTestCase):
         )
         blocks = torch.arange(24, dtype=torch.int32).view(2, 12)
         modes = {"deterministic": True, "tie_break": 2, "dsa_graph_safe": True}
-        for fuse_topk in (False, True):
-            with self.subTest(fuse_topk=fuse_topk):
-                flashinfer = self._fake_flashinfer()
-                with (
-                    patch.dict(sys.modules, {"flashinfer": flashinfer}),
-                    envs.SGLANG_DSA_FUSE_TOPK.override(fuse_topk),
-                    envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.override(True),
-                    envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override("large"),
-                ):
-                    selector = TopKSelector(DSATopKBackend.FLASHINFER)
-                    out = torch.empty((2, 4), dtype=torch.int32)
-                    selector.dense(scores, 4)
-                    values, indices = selector.dense(scores, 4, sorted=True)
-                    selector.ragged(scores, lens, out=out, offsets=lens)
-                    selector.raw(scores, lens, out=out, plan=None)
-                    selector.paged_from_metadata(scores, metadata, out)
-                    selector.sparse(
-                        scores, lens, [(blocks, out), (blocks, torch.empty_like(out))]
-                    )
-                self.assertTrue(torch.equal(values, values.sort(-1, True).values))
-                self.assertTrue(torch.equal(values, scores.gather(1, indices)))
-                self.assertEqual(
-                    [call.kwargs["sorted"] for call in flashinfer.top_k.call_args_list],
-                    [False] * flashinfer.top_k.call_count,
-                )
-                transform = flashinfer.top_k_page_table_transform
-                if not fuse_topk:
-                    transform.assert_not_called()
-                    self.assertEqual(flashinfer.top_k.call_count, 6)
-                    for call in flashinfer.top_k.call_args_list:
-                        self.assertLessEqual(modes.items(), call.kwargs.items())
-                    continue
-                self.assertEqual(flashinfer.top_k.call_count, 2)
-                page_sizes = [
-                    call.kwargs["page_size"] for call in transform.call_args_list
-                ]
-                self.assertEqual(page_sizes, [128, 128, 64, 8])
-                for mock in (flashinfer.top_k, transform):
-                    for call in mock.call_args_list:
-                        self.assertLessEqual(modes.items(), call.kwargs.items())
-
-    def test_unfused_selections_hold_no_per_width_state(self):
-        """Prefill score widths change with every batch, so the torch and unfused
-        FlashInfer selections must free the index ranges they build per width; V4's
-        own transform keeps one per width in a module-global cache never freed."""
-        arange = torch.arange
-        built = []
-
-        def tracked_arange(*args, **kwargs):
-            tensor = arange(*args, **kwargs)
-            built.append(weakref.ref(tensor))
-            return tensor
-
-        for topk_backend in (DSATopKBackend.TORCH, DSATopKBackend.FLASHINFER):
-            with (
-                self.subTest(topk_backend=topk_backend),
-                patch.dict(sys.modules, {"flashinfer": self._fake_flashinfer()}),
-                envs.SGLANG_DSA_FUSE_TOPK.override(False),
-                patch.object(torch, "arange", tracked_arange),
-            ):
-                selector = TopKSelector(topk_backend)
-                for width in (96, 200, 333):
-                    scores = torch.randn(3, width)
-                    lens = torch.tensor([width, width // 2, 1], dtype=torch.int32)
-                    metadata = SimpleNamespace(
-                        compressed_seq_lens=lens,
-                        page_table=arange(18, dtype=torch.int32).view(3, 6),
-                        compressed_page_size=64,
-                    )
-                    out = torch.empty((3, 4), dtype=torch.int32)
-                    selector.raw(scores, lens, out=out, plan=None)
-                    selector.paged_from_metadata(scores, metadata, out)
-        gc.collect()
-        self.assertTrue(built)
-        self.assertEqual([ref for ref in built if ref() is not None], [])
+        flashinfer = self._fake_flashinfer()
+        with (
+            patch.dict(sys.modules, {"flashinfer": flashinfer}),
+            envs.SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC.override(True),
+            envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override("large"),
+        ):
+            selector = TopKSelector(DSATopKBackend.FLASHINFER)
+            out = torch.empty((2, 4), dtype=torch.int32)
+            selector.dense(scores, 4)
+            values, indices = selector.dense(scores, 4, sorted=True)
+            selector.ragged(scores, lens, out=out, offsets=lens)
+            selector.raw(scores, lens, out=out, plan=None)
+            selector.paged_from_metadata(scores, metadata, out)
+            selector.sparse(
+                scores, lens, [(blocks, out), (blocks, torch.empty_like(out))]
+            )
+        self.assertTrue(torch.equal(values, values.sort(-1, True).values))
+        self.assertTrue(torch.equal(values, scores.gather(1, indices)))
+        self.assertEqual(
+            [call.kwargs["sorted"] for call in flashinfer.top_k.call_args_list],
+            [False] * flashinfer.top_k.call_count,
+        )
+        self.assertEqual(flashinfer.top_k.call_count, 2)
+        transform = flashinfer.top_k_page_table_transform
+        page_sizes = [call.kwargs["page_size"] for call in transform.call_args_list]
+        self.assertEqual(page_sizes, [128, 128, 64, 8])
+        for mock in (flashinfer.top_k, transform):
+            for call in mock.call_args_list:
+                self.assertLessEqual(modes.items(), call.kwargs.items())
 
     def test_flashinfer_dense_blocks_publish_ascending_ids(self):
         """Dense-block consumers lay out candidate columns in published order and
@@ -420,9 +371,9 @@ class TestDSV41FlashInferTopK(CustomTestCase):
         buffer per device between the two."""
         from sglang.srt.layers.attention.dsv4.v41_indexer import sparse_table as mod
 
-        for topk_backend in (DSATopKBackend.SGL_KERNEL, DSATopKBackend.FLASHINFER):
+        for topk_backend in DSATopKBackend:
             with self.subTest(topk_backend=topk_backend):
-                can_overlap = topk_backend.is_sgl_kernel()
+                can_overlap = not topk_backend.is_flashinfer()
                 backend = object.__new__(mod.SparseTableBackend)
                 backend.token_to_kv_pool = None
                 backend.topk_blocks = 2

@@ -1,11 +1,12 @@
 """The top-k selections of the V4.1 index layers under ``--dsa-topk-backend``.
 
-sgl-kernel keeps DeepSelect, top-k v2 and the bf16 sparse kernel. flashinfer uses
-FlashInfer's fused page-table transform; torch, and flashinfer with SGLANG_DSA_FUSE_TOPK
-off, run DSA's unfused ``topk_func`` and translate its columns in torch. FlashInfer runs
-under SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC and SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK
-and breaks ties by score column, so every caller lays its columns out in logical order:
-positions, block ids, or ascending candidate blocks."""
+flashinfer runs every selection through FlashInfer's fused page-table transform (``top_k``
+for torch-scored rows) under SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC and
+SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK. FlashInfer breaks ties by score column, so every
+caller lays its columns out in logical order: positions, block ids, or ascending
+candidate blocks. sgl-kernel keeps DeepSelect, top-k v2 and the bf16 sparse kernel.
+torch has no V4.1 top-k of its own and runs them too, as on main, with
+``use_topk_v2`` off, so its fp32 paged decode takes top-k v1."""
 
 from __future__ import annotations
 
@@ -34,31 +35,30 @@ from sglang.srt.layers.attention.dsv4.indexer import (
     topk_transform_paged_bf16,
 )
 
-# Arbitrary cap on the scores one unfused selection chunk copies and masks.
-_UNFUSED_CHUNK_BYTES = 256 << 20
-
 
 class TopKSelector:
     """Selections are int32, ``-1`` padded and unordered, written into contiguous
     outputs with one row per score row."""
 
     def __init__(self, backend: DSATopKBackend) -> None:
-        self.backend = backend
-        self.flashinfer_fused = (
-            backend.is_flashinfer() and envs.SGLANG_DSA_FUSE_TOPK.get()
-        )
+        if backend.is_sgl_kernel() or backend.is_torch():
+            # V4.1 has no torch top-k: torch runs sgl-kernel's selections, as on main,
+            # where its PagedIndexerMetadata.use_topk_v2 stays off.
+            self.backend = DSATopKBackend.SGL_KERNEL
+        elif backend.is_flashinfer():
+            self.backend = DSATopKBackend.FLASHINFER
+        else:
+            raise ValueError(f"Unsupported {backend = } for the V4.1 index-layer top-k")
         # FlashInfer's CUB top-k scratch is one buffer per device, so two of its
         # selections must not run on different streams at once.
-        self.can_overlap_streams = not backend.is_flashinfer()
+        self.can_overlap_streams = self.backend.is_sgl_kernel()
 
     def dense(
         self, scores: torch.Tensor, k: int, *, sorted: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """``(values, int64 indices)`` over the last dim of torch-scored rows."""
-        if self.backend.is_sgl_kernel() or self.backend.is_torch():
+        if self.backend.is_sgl_kernel():
             return scores.topk(k, dim=-1, sorted=sorted)
-        if not self.backend.is_flashinfer():
-            raise ValueError(f"unsupported DSA top-k backend {self.backend}")
         import flashinfer
 
         # FlashInfer's graph-safe CUB path cannot sort, and it is the only graph-safe
@@ -135,21 +135,22 @@ class TopKSelector:
         if rows is not None:
             seq_lens, page_table, out = seq_lens[rows], page_table[rows], out[rows]
         page_size = metadata.compressed_page_size
-        if not self.backend.is_sgl_kernel():
-            self._paged(logits, seq_lens, page_table, out, page_size)
-        elif logits.dtype == torch.bfloat16:
-            topk_transform_paged_bf16(logits, seq_lens, page_table, out, page_size)
-        elif metadata.use_topk_v2:
-            topk_transform_paged_v2(
-                logits,
-                seq_lens,
-                page_table,
-                out,
-                page_size,
-                metadata.topk_metadata if plan is None else plan,
-            )
-        else:
-            topk_transform_paged(logits, seq_lens, page_table, out, page_size)
+        if self.backend.is_sgl_kernel():
+            if logits.dtype == torch.bfloat16:
+                topk_transform_paged_bf16(logits, seq_lens, page_table, out, page_size)
+            elif metadata.use_topk_v2:
+                topk_transform_paged_v2(
+                    logits,
+                    seq_lens,
+                    page_table,
+                    out,
+                    page_size,
+                    metadata.topk_metadata if plan is None else plan,
+                )
+            else:
+                topk_transform_paged(logits, seq_lens, page_table, out, page_size)
+            return
+        self._paged(logits, seq_lens, page_table, out, page_size)
 
     def sparse(
         self,
@@ -159,7 +160,7 @@ class TopKSelector:
     ) -> None:
         """Top-k of each row of the bf16 sparse ``logits`` within its first
         ``valid_lens`` columns, into every ``(blocks, out)`` pair: column ``j`` as
-        ``blocks[b, j // 8] * 8 + j % 8``. Off sgl-kernel one selection feeds them all."""
+        ``blocks[b, j // 8] * 8 + j % 8``. Under FlashInfer one selection feeds them all."""
         if self.backend.is_sgl_kernel():
             for blocks, out in outputs:
                 topk_transform_sparse(logits, valid_lens, blocks, out)
@@ -180,7 +181,7 @@ class TopKSelector:
     def order_candidates(self, blocks: torch.Tensor) -> torch.Tensor:
         """Published candidate block ids in the order a consumer lays out its columns:
         ascending for FlashInfer, whose index tie-break then follows positions."""
-        if not self.backend.is_flashinfer():
+        if self.backend.is_sgl_kernel():
             return blocks
         padding = torch.iinfo(blocks.dtype).max
         ordered = torch.where(blocks < 0, padding, blocks).sort(dim=-1).values
@@ -206,27 +207,14 @@ class TopKSelector:
         *,
         out_raw_indices: Optional[torch.Tensor] = None,
     ) -> None:
-        lens = lens.reshape(-1).to(torch.int32)
-        if self.flashinfer_fused:
-            topk_transform_flashinfer_fused(
-                scores,
-                lens,
-                page_table,
-                out,
-                page_size,
-                out_raw_indices=out_raw_indices,
-            )
-            return
-        # The unfused top-k copies and masks the scores it selects from, so bound that
-        # scratch by row chunks instead of copying a whole prefill score tile.
-        row_bytes = max(1, scores.shape[1] * scores.element_size())
-        rows_per_chunk = max(1, _UNFUSED_CHUNK_BYTES // row_bytes)
-        for start in range(0, scores.shape[0], rows_per_chunk):
-            rows = slice(start, start + rows_per_chunk)
-            columns = self.backend.topk_func(scores[rows], lens[rows], out.shape[1])
-            out[rows].copy_(_through_table(columns, page_table[rows], page_size))
-            if out_raw_indices is not None:
-                out_raw_indices[rows].copy_(columns)
+        topk_transform_flashinfer_fused(
+            scores,
+            lens.reshape(-1).to(torch.int32),
+            page_table,
+            out,
+            page_size,
+            out_raw_indices=out_raw_indices,
+        )
 
 
 def _flashinfer_modes() -> Dict[str, object]:
