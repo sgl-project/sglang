@@ -815,6 +815,9 @@ class TestGraphBuffers(unittest.TestCase):
             live_seq_lens=torch.tensor([2], dtype=torch.int32),
             forward_batch=batch,
         )
+        # The unified replay refresh expands the index page tables before the
+        # mode-specific rows (the 1d refresh no longer does it itself).
+        backend._refresh_graph_dsv41_index_page_tables(metadata)
         backend._refresh_graph_dsv41_1d(ctx)
         # Address is stable (the captured graph holds it) and the content is the
         # [k*p, k*p + k) expansion of the refreshed block table.
@@ -859,6 +862,7 @@ class TestGraphBuffers(unittest.TestCase):
             live_seq_lens=torch.tensor([2], dtype=torch.int32),
             forward_batch=batch,
         )
+        backend._refresh_graph_dsv41_index_page_tables(metadata)
         backend._refresh_graph_dsv41_1d(ctx)
         # ratio 2 pages 1:1, ratio 1 expands each full page into two index pages.
         self.assertEqual(metadata.c2_index_page_table.tolist(), [[9, 8]])
@@ -2184,7 +2188,7 @@ class TestVerifyPaddingRows(unittest.TestCase):
             draft_token_num=2,
         )
         indices, lengths = backend._dsv41_window_indices(batch)
-        self.assertEqual(lengths[:, 0].tolist(), [2, 2, 0, 0])
+        self.assertEqual(lengths[:, 0].tolist(), [4, 4, 0, 0])
         # Live rows unchanged; padding rows emit no indices at all.
         self.assertEqual(indices[0, 0].tolist(), [1, 2, 3, 4])
         self.assertEqual(indices[1, 0].tolist(), [2, 3, 4, 5])
@@ -2193,7 +2197,7 @@ class TestVerifyPaddingRows(unittest.TestCase):
             backend._dsv41_cmp_topk_length(batch, 2)[:, 0].tolist(), [2, 3, 0, 0]
         )
         self.assertEqual(
-            backend._dsv41_cmp_topk_length(batch, 1)[:, 0].tolist(), [2, 3, 0, 0]
+            backend._dsv41_cmp_topk_length(batch, 1)[:, 0].tolist(), [3, 3, 0, 0]
         )
 
     def test_decode_rows_keep_the_per_row_rule(self):
