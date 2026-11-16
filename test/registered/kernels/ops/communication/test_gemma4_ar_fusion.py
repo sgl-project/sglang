@@ -388,7 +388,8 @@ def test_decode_graphs_match_nccl_and_stock_kernels():
     CustomAllReduceV2 call (it shares the fused kernel's barrier plane at a
     different grid) and an attention site, an MLP site and the final site.
     Replayed in shuffled order with fresh inputs, with one rank delayed before
-    the replay and another inside the graph, against NCCL + the stock kernels."""
+    the replay and another inside the graph, against NCCL + the stock kernels
+    (the stock all-reduce against the exact fp32 sum)."""
     hidden = HIDDENS[0]
     coord = _init()
     rank, world_size = coord.rank, coord.world_size
@@ -504,13 +505,16 @@ def test_decode_graphs_match_nccl_and_stock_kernels():
         torch.cuda.synchronize()
 
         (a, y), quant, final = _stock_layer(partials, residual_all, w, scalar)
-        side_ref = small.clone()
-        dist.all_reduce(side_ref, group=coord.device_group)
+        # the exact sum: NCCL accumulates bf16 along the ring and drifts past
+        # 2e-2 at TP8; the stock all-reduce stays within one bf16 rounding of it
+        side_ref = torch.stack([t.float() for t in _gather(small)]).sum(0)
         fused = [o.clone() for pair in st["outs"] for o in pair] + [st["final"].clone()]
         # gather before any assert: a rank that fails alone would hang its peers
         gathered = [_gather(t) for t in fused]
         try:
-            torch.testing.assert_close(st["side"], side_ref, rtol=2e-2, atol=2e-2)
+            torch.testing.assert_close(
+                st["side"].float(), side_ref, rtol=1e-2, atol=1e-3
+            )
             for (out, scales), ref, (_, ref_scales) in zip(st["outs"], (a, y), quant):
                 deq = out.float() * scales.repeat_interleave(GROUP, dim=1)
                 torch.testing.assert_close(deq, ref.float(), rtol=7e-2, atol=4e-2)
