@@ -273,8 +273,6 @@ class StandardDispatcher(BaseDispatcher):
                     if _MASK_DP_PAD_MOE and is_dp_max_padding():
                         mask_dp_pad_moe_topk_ids(topk_ids_local)
                     topk_output = topk_output._replace(topk_ids=topk_ids_local)
-                elif TopKOutputChecker.format_is_triton_kernels(topk_output):
-                    raise NotImplementedError()
 
         return StandardDispatchOutput(
             hidden_states=hidden_states,

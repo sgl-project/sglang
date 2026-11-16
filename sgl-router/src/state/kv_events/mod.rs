@@ -1,15 +1,14 @@
 //! ZMQ-based KV-cache event indexer for cache-aware routing.
 //!
 //! Decodes the msgpack wire format emitted by SGLang's `ZmqEventPublisher`
-//! (`python/sglang/srt/utils/event_publisher.py`; KV event types in
-//! `python/sglang/srt/disaggregation/kv_events.py`) and maintains the
+//! (`python/sglang/srt/disaggregation/kv_events.py`) and maintains the
 //! router-side index used for cache-aware request routing.
 //!
 //! # Submodules
 //!
 //! - [`wire`] — msgpack types and [`decode_event_batch`]; the contract
 //!   with the SGLang publisher. Pure decoding; no I/O.
-//! - [`hash`] — block-hash compute mirroring SGLang `RadixKey.hash_page`.
+//! - [`hash`] — block-hash compute mirroring SGLang `get_hash_str`.
 //! - [`tree`] — hash-keyed radix tree consumed by the routing path,
 //!   tracking the storage tier each worker holds a block on.
 //! - [`tally`] — per-(kind, medium) counters of the events the pump applied.

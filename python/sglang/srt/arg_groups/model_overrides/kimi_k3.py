@@ -184,18 +184,17 @@ def _kimi_k3_overrides(server_args: Any, hf_config: Any) -> dict:
 @_register_for("KimiK31ForConditionalGeneration")
 def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
     cfg = resolving_view(server_args)
-    if cfg.enable_unified_memory:
-        raise ValueError("Kimi-K3.1 does not support --enable-unified-memory yet.")
     overrides = {}
     if cfg.dcp_size > 1:
-        if (
-            cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH")
-            or cfg.disaggregation_mode != "null"
-        ):
+        if cfg.speculative_algorithm not in (None, "DSPARK", "DFLASH"):
             raise ValueError(
-                "Kimi-K3.1 DCP supports only DSPARK and DFLASH speculative "
-                "decoding, and not PD disaggregation yet."
+                "Kimi-K3.1 DCP supports only DSPARK and DFLASH speculative decoding."
             )
+        if (
+            cfg.disaggregation_mode != "null"
+            and cfg.disaggregation_transfer_backend != "mooncake"
+        ):
+            raise ValueError("Kimi-K3.1 DCP supports PD only over Mooncake.")
         if cfg.speculative_algorithm == "DSPARK":
             from sglang.srt.speculative.ragged_verify import (
                 RaggedVerifyMode,
@@ -227,6 +226,12 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
                 "(--dsa-topk-backend sgl-kernel, SGLANG_OPT_USE_TOPK_V2 and "
                 "SGLANG_DSA_FUSE_TOPK on)."
             )
+        if cfg.enable_return_indexer_topk or envs.SGLANG_DSA_TOPK_BROADCAST.get():
+            # the sharded indexer returns only this rank's local KV slots
+            raise ValueError(
+                "Kimi-K3.1 DCP does not support --enable-return-indexer-topk "
+                "or SGLANG_DSA_TOPK_BROADCAST."
+            )
         if cfg.dcp_replicate_q_proj is None and cfg.dcp_comm_backend in (
             "a2a",
             "fi_a2a",
@@ -234,6 +239,26 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
             logger.info("Kimi-K3.1 DCP enables replicated Q projection by default.")
             overrides["dcp_replicate_q_proj"] = True
     return overrides
+
+
+def _reject_flashinfer_mxfp4_cutlass_situ(hf_config: Any) -> None:
+    # On SM90/SM120 Mxfp4MoEMethod picks a CUTLASS runner, which computes
+    # GPT-OSS SwiGLU; only the SM100-family trtllm-gen runner has SiTU. Other
+    # arches have no flashinfer_mxfp4 kernel and fail in Mxfp4MoEMethod.
+    platform = get_platform()
+    if not (platform.is_sm90 or platform.is_sm120):
+        return
+    if not _is_mxfp4_pack_quantized(hf_config):
+        return
+    text_config = getattr(hf_config, "text_config", hf_config)
+    if getattr(text_config, "hidden_act", None) != "situ":
+        return
+    raise RuntimeError(
+        "Kimi-K3 with moe_runner_backend='flashinfer_mxfp4' on "
+        f"SM{platform.device_sm} would run the routed experts with GPT-OSS "
+        "SwiGLU instead of SiTU; only SM100-family GPUs have the SiTU kernels. "
+        "Use --moe-runner-backend marlin on this GPU."
+    )
 
 
 @_register_for("KimiK3ForConditionalGeneration", "KimiK31ForConditionalGeneration")
@@ -244,6 +269,8 @@ def _kimi_k3_moe_runner_overrides(server_args: Any, hf_config: Any) -> dict:
     # SM107 uses the same packed-MXFP4 runner; leaving auto unresolved falls
     # back to BF16 weight materialization during model loading.
     cfg = resolving_view(server_args)
+    if cfg.moe_runner_backend == "flashinfer_mxfp4":
+        _reject_flashinfer_mxfp4_cutlass_situ(hf_config)
     if cfg.moe_runner_backend != "auto":
         return {}
     if not (get_platform().is_sm100 and get_platform().device_sm in (100, 103, 107)):
