@@ -249,7 +249,7 @@ export const Gemma4Deployment = () => {
         next.checkpoint = 'standard';
         next.speculative = 'disabled';
       }
-      if (next.hardware === 'xeon' && next.checkpoint === 'qat') {
+      if (optionName === 'hardware' && value === 'xeon') {
         next.checkpoint = 'standard';
       }
       return next;

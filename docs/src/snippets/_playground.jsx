@@ -2727,7 +2727,7 @@ export const Playground = ({ config }) => {
   // flags already carry the family, or the base cell sizes the pool explicitly
   // with --max-mamba-cache-size (the ratio would contradict its slot count).
   const withRatio = (fl, value) => {
-    if (baseCell.autoMambaRatio === false || !value) return fl;
+    if (!value) return fl;
     if (fl.some((f) =>
       f.startsWith("--mamba-full-memory-ratio") || f.startsWith("--max-mamba-cache-size"))) return fl;
     const out = [...fl];
