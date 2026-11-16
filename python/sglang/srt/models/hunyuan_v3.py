@@ -411,7 +411,6 @@ class HYV3DecoderLayer(nn.Module):
                 quant_config=quant_config,
                 prefix=f"{prefix}.mlp",
             )
-            self.block_type = "feedforward"
         else:
             self.mlp = HYV3MoEFused(
                 config=config,
@@ -420,7 +419,6 @@ class HYV3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
                 alt_stream=alt_stream,
             )
-            self.block_type = "moe"
 
     def forward(
         self,

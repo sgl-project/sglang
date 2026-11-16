@@ -61,13 +61,6 @@ class Ministral3Attention(LlamaAttention):
         # Ministral3 specific: llama 4 style scaling beta
         self.llama_4_scaling_beta = config.rope_parameters.get("llama_4_scaling_beta")
 
-        # sliding window
-        self.sliding_window = getattr(config, "sliding_window", None)
-        if self.sliding_window is not None:
-            # Update RadixAttention with sliding window if needed
-            # currently RadixAttention in sglang handles this mostly via logic in forward/flashinfer
-            pass
-
     def forward(
         self,
         positions: torch.Tensor,

@@ -18,7 +18,6 @@ from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp4LinearMethod,
 )
-from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -120,9 +119,6 @@ class InklingQuantizationConfigBase:
 
 
 class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBase):
-    moe_ep_size: int
-    nvfp4_moe_backend: str
-
     def __init__(
         self,
         is_checkpoint_nvfp4_serialized: bool = False,
@@ -132,8 +128,6 @@ class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBas
         packed_modules_mapping: dict[str, list[str]] | None = None,
         # New Inkling args
         scales_2d: bool = False,
-        moe_ep_size: int = 1,
-        nvfp4_moe_backend: str = "trtllm-routed",
     ) -> None:
         # unfortunately parent types are completely incorrect
         super().__init__(
@@ -150,8 +144,6 @@ class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBas
         else:
             self.dim1_group_size = 1
         self.dim2_group_size = group_size
-        self.moe_ep_size = moe_ep_size
-        self.nvfp4_moe_backend = nvfp4_moe_backend
 
     @classmethod
     def get_name(cls) -> str:
@@ -207,8 +199,6 @@ class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBas
         exclude_modules = _map_exclude_modules(parent_config.exclude_modules)
         quant_config = config["quantization"]
         scales_2d = quant_config.get("scales_2d", False)
-        moe_ep_size = quant_config.get("moe_ep_size", 1)
-        nvfp4_moe_backend = quant_config.get("nvfp4_moe_backend", "trtllm-routed")
         return cls(
             is_checkpoint_nvfp4_serialized=parent_config.is_checkpoint_nvfp4_serialized,
             kv_cache_quant_algo=parent_config.kv_cache_quant_algo,
@@ -216,8 +206,6 @@ class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBas
             exclude_modules=exclude_modules,
             packed_modules_mapping=parent_config.packed_modules_mapping,
             scales_2d=scales_2d,
-            moe_ep_size=moe_ep_size,
-            nvfp4_moe_backend=nvfp4_moe_backend,
         )
 
     @classmethod
@@ -246,8 +234,6 @@ class InklingModelOptNvfp4Config(ModelOptFp4Config, InklingQuantizationConfigBas
         scales_2d = weight_quant_cfg["block_sizes"].get("-2") is not None
 
         quant_config["scales_2d"] = scales_2d
-        quant_config["moe_ep_size"] = get_parallel().moe_ep_size
-        quant_config["nvfp4_moe_backend"] = "trtllm-routed"
 
         # force parent class to fallback to nested format.
         return cls.from_config({"quantization": quant_config})

@@ -31,11 +31,9 @@ The weight name remapping mirrors :class:`MistralForCausalLMMistralFormat` and
 adds the eagle-specific entries for ``eagle_linear`` → ``model.fc``.
 """
 
-import logging
 from collections.abc import Iterable
 from typing import Optional, Tuple
 
-import regex as re
 import torch
 from torch import nn
 from transformers import PretrainedConfig
@@ -50,9 +48,8 @@ from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.models.llama import LlamaDecoderLayer, LlamaForCausalLM
 from sglang.srt.models.llama_eagle import LlamaForCausalLMEagle
+from sglang.srt.models.mistral import MistralForCausalLMMistralFormat
 from sglang.srt.runtime_context import get_parallel
-
-logger = logging.getLogger(__name__)
 
 
 class MistralEagleModel(nn.Module):
@@ -185,26 +182,8 @@ class MistralForCausalLMEagle(LlamaForCausalLMEagle):
             self, self._remap_mistral_to_llama(weights)
         )
 
-    def _remap_mistral_to_llama(
-        self, weights: Iterable[Tuple[str, torch.Tensor]]
-    ) -> Iterable[Tuple[str, torch.Tensor]]:
-        for name, loaded_weight in weights:
-            if name.startswith("model.") or name.startswith("lm_head."):
-                yield name, loaded_weight
-                continue
-            for k, v in self.remapping.items():
-                match = re.fullmatch(k, name)
-                if match:
-                    name = match.expand(v)
-                    break
-            else:
-                logger.warning(f"Unrecognized weight: {name}. Skipping.")
-                continue
-            if name.endswith(".qscale_act"):
-                name = re.sub(r"\.qscale_act$", ".input_scale", name)
-            elif name.endswith(".qscale_weight"):
-                name = re.sub(r"\.qscale_weight$", ".weight_scale", name)
-            yield name, loaded_weight
+    # The target loader's generator, applied to this class's remapping.
+    _remap_mistral_to_llama = MistralForCausalLMMistralFormat._remap_mistral_to_llama
 
 
 EntryClass = [MistralForCausalLMEagle]
