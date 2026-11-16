@@ -559,6 +559,13 @@ class Step3VisionAttention(nn.Module):
 
         super().__init__()
         self.num_heads = num_heads
+        self.out_proj = RowParallelLinear(
+            dim,
+            dim,
+            bias=True,
+            quant_config=quant_config,
+            prefix=add_prefix("out_proj", prefix),
+        )
 
         self.attn = VisionAttention(
             embed_dim=dim,
