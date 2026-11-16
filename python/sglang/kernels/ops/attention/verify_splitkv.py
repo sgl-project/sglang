@@ -41,9 +41,8 @@ from sglang.srt.utils import is_hip
 _MIN_BLOCK_KV = 32
 
 # AMD/CDNA-only Triton launch hints (waves_per_eu, matrix_instr_nonkdim); NVIDIA's
-# Triton rejects these kwargs, so only pass them on ROCm. In production this kernel
-# is dispatched only on AMD (see TritonAttnBackend); keeping it NV-safe lets the
-# numerics test run on the CUDA CI lane.
+# Triton rejects these kwargs, so only pass them on ROCm. The kernel itself is
+# dispatched on CUDA and on gfx950 (see TritonAttnBackend).
 _IS_HIP = is_hip()
 _AMD_LAUNCH_KWARGS = {"waves_per_eu": 4, "matrix_instr_nonkdim": 16} if _IS_HIP else {}
 
