@@ -85,6 +85,9 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
         self._lmcache_closed = False
         atexit.register(self.shutdown)
 
+    def external_store_alignment(self) -> int:
+        return self.lmcache_connector.chunk_size
+
     def is_backuped(self, node_id: NodeId) -> bool:
         # LMCache rebuilds lookup keys from tokens, so any L1 node is valid.
         return True
