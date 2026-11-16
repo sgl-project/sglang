@@ -182,6 +182,24 @@ class TestExplicitCliArgs(unittest.TestCase):
                 )
 
 
+    def test_abbreviated_flags_keep_their_value(self):
+        """argparse accepts an unambiguous prefix of a flag (--tp 2 sets tp_size);
+        the value must count as provided instead of being dropped for the default."""
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        for argv, field, value in (
+            (["--tp", "2"], "tp_size", 2),
+            (["--num-gpu=4"], "num_gpus", 4),
+        ):
+            with self.subTest(argv=argv), patch.object(sys, "argv", ["sglang", *argv]):
+                parsed, unknown = parser.parse_known_args(argv)
+                self.assertEqual(getattr(parsed, field), value)
+                self.assertEqual(unknown, [])
+                self.assertEqual(
+                    ServerArgs.get_provided_args(parsed, unknown), {field: value}
+                )
+
+
 class _CudaPlatformTestCase(unittest.TestCase):
     def setUp(self):
         super().setUp()
