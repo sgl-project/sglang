@@ -433,6 +433,7 @@ class KVCacheConfigurator:
     draft_model_idx: Optional[int] = None
     kv_cache_dtype_str: Optional[str] = None
     extra_mamba_cache_bytes_per_req: int = 0
+    extra_mamba_cache_bytes_per_request_row: int = 0
     allocate_intermediate_ssm: bool = True
     mambaish_config: Optional[Any] = field(init=False)
     hybrid_gdn_config: Optional[Any] = field(init=False)
@@ -3609,6 +3610,17 @@ class KVCacheConfigurator:
         extra_per_slot = replayssm_ring_per_slot + int(
             self.extra_mamba_cache_bytes_per_req * pp_layer_scale
         )
+        fixed_state_bytes = replayssm_fixed_bytes
+        if self.extra_mamba_cache_bytes_per_request_row:
+            # live requests, the padding row and a PD decode's pre-allocated rows
+            request_rows = (
+                max(1, get_schedule().max_running_requests // self.attn_dp_size)
+                + 1
+                + self._req_pool_pre_alloc_size()
+            )
+            fixed_state_bytes += request_rows * int(
+                self.extra_mamba_cache_bytes_per_request_row * pp_layer_scale
+            )
         reserves_spec_state = (
             has_spec_dec
             and not replayssm_active
@@ -3699,8 +3711,7 @@ class KVCacheConfigurator:
                 get_context().override(
                     "mamba_pool.memory_budget",
                     max_mamba_cache_size=int(
-                        (mamba_budget_bytes - replayssm_fixed_bytes - per_slot)
-                        // per_slot
+                        (mamba_budget_bytes - fixed_state_bytes - per_slot) // per_slot
                     ),
                 )
 
@@ -3723,7 +3734,7 @@ class KVCacheConfigurator:
         # +1 accounts for each pool's padding slot.
         mamba_state_memory = (
             (get_schedule().max_mamba_cache_size + 1) * (stage_per_req + extra_per_slot)
-            + replayssm_fixed_bytes
+            + fixed_state_bytes
         ) / (1 << 30)
         return total_rest_memory - mamba_state_memory
 

@@ -738,6 +738,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
 
     def _prefill_graph_extend_supported(self) -> bool:
         from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+            external_prefill_body,
             get_prefill_num_tokens_to_capture,
         )
 
@@ -745,16 +746,23 @@ class GDNAttnBackend(MambaAttnBackendBase):
         capture_tokens = get_exec().graph.cuda_graph_config.prefill.bs or []
         supported = (
             is_cuda()
-            and isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel)
             and not self.enable_mis
             # The track plan's h rows assume the delta-rule chunk size.
             and self.mamba_chunk_size == FLA_CHUNK_SIZE
             and all(conv.is_contiguous() for conv in mamba_cache.conv)
             and mamba_cache.temporal.is_contiguous()
-            and buckets_keep_chunk_o_block_size(
+        )
+        if isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel):
+            supported = supported and buckets_keep_chunk_o_block_size(
                 get_prefill_num_tokens_to_capture(capture_tokens)
             )
-        )
+        elif supported:
+            # Another extend kernel is captured only inside an external body.
+            body = external_prefill_body(self._model_runner.model)
+            max_seqs = None if body is None else body.linear_prefill_graph_seqs(self)
+            supported = max_seqs is not None
+            if supported:
+                self.prefill_graph_max_seqs = min(self.req_to_token_pool.size, max_seqs)
         rank0_log(
             "GDN prefill extend inside breakable prefill CUDA graphs: "
             + ("on" if supported else "unsupported here, layers keep breaking")
@@ -1331,6 +1339,8 @@ class GDNAttnBackend(MambaAttnBackendBase):
         """forward_extend's plain-extend chain on a captured bucket's static
         tables, so every launch grid depends only on the bucket. Rows past the
         batch belong to no sequence; chunk_fwd_o leaves them zero."""
+        if not isinstance(self.kernel_dispatcher.extend_kernel, TritonGDNKernel):
+            raise RuntimeError("only an external prefill body captures this extend")
         meta = self.prefill_graph_metadata
         layer_cache = self.state_layer_cache(layer.layer_id)
         conv_states = layer_cache.conv[0]
