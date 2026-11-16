@@ -184,7 +184,6 @@ def get_default_config(
     K: int,
     topk: int,
     dtype: Optional[str],
-    is_marlin: bool,
     block_shape: Optional[List[int]] = None,
 ) -> Dict[str, int]:
     if get_exec().deterministic.enable_deterministic_inference:
@@ -250,8 +249,7 @@ def get_default_config(
             "BLOCK_SIZE_K": 32,
             "GROUP_SIZE_M": 8,
         }
-        # A heuristic: fused marlin works faster with this config for small M
-        if M <= E or (is_marlin and M <= 32):
+        if M <= E:
             config = {
                 "BLOCK_SIZE_M": 16,
                 "BLOCK_SIZE_N": 32,
@@ -267,7 +265,6 @@ def try_get_optimal_moe_config(
     top_k: int,
     dtype: Optional[str],
     M: int,
-    is_marlin: bool = False,
     block_shape: Optional[List[int]] = None,
     per_channel_quant: bool = False,
     return_down_config: bool = False,
@@ -306,9 +303,7 @@ def try_get_optimal_moe_config(
             config = configs[min(configs.keys(), key=lambda x: abs(x - M))]
         else:
             # Else use the default config
-            config = get_default_config(
-                M, E, N, w1_shape[2], top_k, dtype, is_marlin, block_shape
-            )
+            config = get_default_config(M, E, N, w1_shape[2], top_k, dtype, block_shape)
         if return_down_config:
             down_configs = get_moe_configs(
                 E,

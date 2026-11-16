@@ -50,18 +50,14 @@ try:
     from humming.config import GemmType as HummingGemmType
     from humming.config import InputQuantizationMode
     from humming.layer import HummingMethod
-
-    _humming_available = True
 except ModuleNotFoundError:
-    _humming_available = False
+    pass
 
 
 def get_standard_humming_moe_gemm_type() -> HummingGemmType:
     env_gemm_type_str = envs.SGLANG_HUMMING_MOE_GEMM_TYPE.get().lower()
     if env_gemm_type_str == "grouped":
         gemm_type = HummingGemmType.GROUPED_CONTIGUOUS
-    elif env_gemm_type_str == "indexed":
-        gemm_type = HummingGemmType.INDEXED
     else:
         gemm_type = HummingGemmType.INDEXED
 
