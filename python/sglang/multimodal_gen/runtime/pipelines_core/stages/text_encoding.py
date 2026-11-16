@@ -510,8 +510,6 @@ class TextEncodingStage(ConditionEncodingStage):
         max_length: int | None = None,
         truncation: bool | None = None,
         padding: bool | str | None = None,
-        return_overflowing_tokens=None,
-        return_length=None,
     ):
         """
         Encode plain text using selected text encoder(s) and return embeddings.
