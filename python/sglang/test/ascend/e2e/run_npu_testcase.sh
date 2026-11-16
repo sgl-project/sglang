@@ -214,11 +214,14 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-# Always use the checkout's sglang as the Python package source. The image
-# only supplies the runtime environment (CANN, driver, prebuilt libraries).
-# Test helper modules (append_ld_library_path, write_memfabric_tent_conf, ...)
-# live in the checkout and must shadow whatever the image bundled.
-export PYTHONPATH="${sglang_source_path}/python${PYTHONPATH:+:${PYTHONPATH}}"
+# The sglang package comes from the image's site-packages (PYTHONPATH below is intentionally NOT prepended). 
+# However, test helper modules shipped in the PR  must be available on top of whatever the image bundled, 
+# so we rsync the checkout's python/sglang/test tree into site-packages before anything imports it.
+IMAGE_SGLANG_PKG="$(python -c 'import sglang, os; print(os.path.dirname(sglang.__file__))')"
+if [ -d "${IMAGE_SGLANG_PKG}/test" ] && [ -d "${sglang_source_path}/python/sglang/test" ]; then
+    echo "Syncing PR sglang/test → ${IMAGE_SGLANG_PKG}/test"
+    cp -r "${sglang_source_path}/python/sglang/test/ascend/"* "${IMAGE_SGLANG_PKG}/test/ascend/"
+fi
 
 # set environment of cann
 . /usr/local/Ascend/cann/set_env.sh
