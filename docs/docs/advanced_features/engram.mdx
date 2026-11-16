@@ -97,9 +97,10 @@ all-reduce.
   through `/proc`. The TP group must sit on one node (`--nnodes 1`) and the ranks must share a PID
   namespace. This mapping usually gets no huge pages unless shmem transparent huge pages are on.
 - **`replication` `group_shards`**: CUDA with fabric handles between all GPUs of the group (one
-  NVLink domain, across nodes included). Set `SGLANG_DSV41_ENGRAM_GROUP_SIZE` to the total GPU
-  count of the servers sharing the table, and `SGLANG_DSV41_ENGRAM_GROUP_STORE` to a directory all
-  of them see, empty for each deployment; each GPU holds `1 / group size` of the table, and a
+  NVLink domain, across nodes included). Set `group_size` to the total GPU count of the servers
+  sharing the table, and `group_store` to a directory all of them see, empty for each deployment,
+  for example `{"placement": "cpu", "replication": "group_shards", "group_size": 28,
+  "group_store": "/shared/run-42/engram"}`; each GPU holds `1 / group size` of the table, and a
   server starts once every slice of the group is loaded. `lookup` is always `peer_read`. Pipeline
   parallelism is not supported, and a server that restarts needs the whole group restarted with a
   new store.

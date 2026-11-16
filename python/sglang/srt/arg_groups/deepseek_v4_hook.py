@@ -111,7 +111,13 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
             logger.warning(
                 "%s deprecated; use --engram-config '%s' instead.",
                 ", ".join(legacy),
-                json.dumps(dataclasses.asdict(config)),
+                json.dumps(
+                    {
+                        k: v
+                        for k, v in dataclasses.asdict(config).items()
+                        if k in ("placement", "replication", "lookup")
+                    }
+                ),
             )
     else:
         if legacy:
@@ -139,15 +145,10 @@ def _resolve_engram_config(server_args: ServerArgs) -> None:
             "--engram-config: replication 'per_node' needs the TP group on one node."
         )
     if config.replication == EngramReplication.GROUP_SHARDS:
-        if (
-            not envs.SGLANG_DSV41_ENGRAM_GROUP_STORE.get()
-            or envs.SGLANG_DSV41_ENGRAM_GROUP_SIZE.get() < cfg.tp_size
-        ):
+        if config.group_size < cfg.tp_size:
             raise ValueError(
-                "--engram-config: replication 'group_shards' needs "
-                "SGLANG_DSV41_ENGRAM_GROUP_STORE, a directory every server of the "
-                "group sees, and SGLANG_DSV41_ENGRAM_GROUP_SIZE, the group's GPU "
-                "count (at least --tp-size)."
+                "--engram-config: replication 'group_shards' needs 'group_size' of "
+                "at least --tp-size."
             )
         if cfg.pp_size > 1:
             raise ValueError(

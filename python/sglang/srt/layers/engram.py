@@ -987,10 +987,18 @@ _group_slot: Optional[int] = None
 class _GroupShards(_PeerShards):
     """Replication group_shards: each table split by rows over the GPUs of every
     server in the group, each slice in its GPU's HBM or host-NUMA memory, shared
-    through FABRIC handles published in SGLANG_DSV41_ENGRAM_GROUP_STORE."""
+    through FABRIC handles published in the config's group_store."""
 
     def __init__(
-        self, num_embeddings: int, dim: int, layer_id: int, *, mxfp4: bool, host: bool
+        self,
+        num_embeddings: int,
+        dim: int,
+        layer_id: int,
+        *,
+        mxfp4: bool,
+        host: bool,
+        group_size: int,
+        group_store: str,
     ):
         global _group_slot
         from sglang.srt.utils.cuda_vmm_utils import (
@@ -1000,8 +1008,8 @@ class _GroupShards(_PeerShards):
         )
 
         drv = _get_cuda_driver()
-        self.world = envs.SGLANG_DSV41_ENGRAM_GROUP_SIZE.get()
-        store = envs.SGLANG_DSV41_ENGRAM_GROUP_STORE.get()
+        self.world = group_size
+        store = group_store
         if _group_slot is None:
             _group_slot = _claim_group_slot(store, self.world)
         self.slot = _group_slot
@@ -1096,21 +1104,21 @@ def _claim_group_slot(store: str, world: int) -> int:
             os.remove(marker)
             raise RuntimeError(
                 f"engram group store {store} is not empty: use an empty "
-                "SGLANG_DSV41_ENGRAM_GROUP_STORE for each deployment"
+                "group_store for each deployment"
             )
         _publish(marker, stamp)
     elif _wait_json(marker, timeout_s=60.0) != stamp:
         raise RuntimeError(
             f"engram group store {store} is not for {stamp!r}: use an empty "
-            "SGLANG_DSV41_ENGRAM_GROUP_STORE for each deployment"
+            "group_store for each deployment"
         )
     for slot in range(world):
         if _create_exclusive(os.path.join(store, f"slot{slot}")):
             return slot
     raise RuntimeError(
         f"engram group store {store}: all {world} slots are taken; use an empty "
-        "SGLANG_DSV41_ENGRAM_GROUP_STORE for each deployment and set "
-        "SGLANG_DSV41_ENGRAM_GROUP_SIZE to the group's GPU count"
+        "group_store for each deployment and set group_size to the "
+        "group's GPU count"
     )
 
 
@@ -1293,6 +1301,8 @@ class EngramEmbedding(nn.Module):
                 layer_id,
                 mxfp4=mxfp4,
                 host=config.placement == EngramPlacement.CPU,
+                group_size=config.group_size,
+                group_store=config.group_store,
             )
             self.row_start, self.rows = self.peer.row_start, self.peer.rows
             weight, scale = self.peer.views()
