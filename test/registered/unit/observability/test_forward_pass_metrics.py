@@ -2097,6 +2097,55 @@ class TestEstimatedPerfConstants(CustomTestCase):
             baseline_weight_bytes / 2.0, self.reporter._weight_read_bytes_per_token
         )
 
+    def test_non_gated_mlp_uses_two_matrix_formula(self):
+        # Plain 2-matrix FFNs (GPT-2/GPT-BigCode/StarCoder2's c_fc+c_proj,
+        # Apertus's xIELU up_proj+down_proj with no gate_proj, Jais's ReLU^2)
+        # must be charged at 4x FLOPs / 2x weight-elems, not the gated
+        # 6x/3x SwiGLU multiplier -- confirmed against the real MLP class
+        # source for starcoder2.py and apertus.py.
+        gated = _fake_model_config(
+            hidden_size=256,
+            num_attention_layers=2,
+            head_dim=0,
+            hf_text_config_overrides={"intermediate_size": 1024, "hidden_act": "silu"},
+        )
+        non_gated = _fake_model_config(
+            hidden_size=256,
+            num_attention_layers=2,
+            head_dim=0,
+            hf_text_config_overrides={
+                "intermediate_size": 1024,
+                "hidden_act": "gelu_pytorch_tanh",
+            },
+        )
+        self._init(gated)
+        gated_flops = self.reporter._linear_flops_per_token
+        gated_weight_bytes = self.reporter._weight_read_bytes_per_token
+        self._init(non_gated)
+        self.assertAlmostEqual(
+            gated_flops * (4.0 / 6.0), self.reporter._linear_flops_per_token
+        )
+        self.assertAlmostEqual(
+            gated_weight_bytes * (2.0 / 3.0),
+            self.reporter._weight_read_bytes_per_token,
+        )
+
+    def test_unset_hidden_act_defaults_to_gated(self):
+        # Regression guard: hidden_act is unset in most of this test file's
+        # fake configs (and in any real config this estimator doesn't
+        # recognize) -- it must keep defaulting to the historical gated
+        # (6x/3x) assumption, not silently flip to non-gated.
+        config = _fake_model_config(
+            hidden_size=256,
+            num_attention_layers=2,
+            head_dim=0,
+            hf_text_config_overrides={"intermediate_size": 1024},
+        )
+        self._init(config)
+        self.assertAlmostEqual(
+            self.reporter._linear_flops_per_token, 6.0 * 256 * 1024 * 2
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

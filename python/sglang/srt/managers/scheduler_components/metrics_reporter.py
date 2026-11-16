@@ -746,16 +746,59 @@ class SchedulerMetricsReporter:
                 or 0
             )
             active_expert_units = float(num_experts_per_tok) + shared_expert_count
+            # MoE experts are gated (SwiGLU) in every architecture this estimator
+            # currently special-cases (Mixtral/DeepSeek/Qwen-MoE/OLMoE/GraniteMoE),
+            # so mlp_weight_mult stays at the gated 3x multiplier here -- set
+            # explicitly (rather than left to the dense branch below) so
+            # _ffn_act_bytes_per_token's shared reference to it stays correct
+            # regardless of which branch ran.
+            mlp_weight_mult = 3.0
             mlp_flops = 6.0 * hidden_size * moe_intermediate_size * active_expert_units
             mlp_weight_elems_per_layer = (
-                3.0 * hidden_size * moe_intermediate_size * active_expert_units
+                mlp_weight_mult * hidden_size * moe_intermediate_size * active_expert_units
             )
         else:
+            # Dense (non-MoE) FFN FLOPs/weight-elems depend on whether the FFN is
+            # gated (SwiGLU-style: separate gate_proj + up_proj + down_proj, 3
+            # weight matrices -- Llama/Mistral/Qwen/Granite/Gemma) or a plain
+            # 2-matrix FFN (up/fc_in + down/fc_out with the nonlinearity applied
+            # directly -- GPT-2/GPT-BigCode/StarCoder2, and novel non-gated
+            # activations like Apertus's xIELU or Jais's ReLU^2). Charging a
+            # 2-matrix FFN at the 3-matrix (6x/3x) multiplier overcounts weight-
+            # read bandwidth by 1.5x -- confirmed by reading the actual MLP class
+            # for starcoder2.py (c_fc + c_proj only) and apertus.py ("with
+            # xielu, there's no gate_proj"). Default to the historical gated
+            # assumption (matches the common case -- Llama/Mistral/Qwen/Granite/
+            # Gemma are all gated, and preserves existing behavior/test
+            # expectations when hidden_act is unset or unrecognized) and only
+            # switch to the 2-matrix multiplier for activations confirmed to
+            # pair with a plain, non-gated FFN in their model's own sglang
+            # implementation.
+            hidden_act = str(getattr(hf_text_config, "hidden_act", "") or "").lower()
+            _NON_GATED_MLP_ACTIVATIONS = {
+                "gelu",
+                "gelu_new",
+                "gelu_fast",
+                "gelu_pytorch_tanh",
+                "gelu_python",
+                "quick_gelu",
+                "relu",
+                "relu2",
+                "squared_relu",
+                "xielu",
+            }
+            is_gated_mlp = hidden_act not in _NON_GATED_MLP_ACTIVATIONS
+            mlp_flop_mult = 6.0 if is_gated_mlp else 4.0
+            mlp_weight_mult = 3.0 if is_gated_mlp else 2.0
             mlp_flops = (
-                6.0 * hidden_size * intermediate_size if intermediate_size > 0 else 0.0
+                mlp_flop_mult * hidden_size * intermediate_size
+                if intermediate_size > 0
+                else 0.0
             )
             mlp_weight_elems_per_layer = (
-                3.0 * hidden_size * intermediate_size if intermediate_size > 0 else 0.0
+                mlp_weight_mult * hidden_size * intermediate_size
+                if intermediate_size > 0
+                else 0.0
             )
 
         self._linear_flops_per_token = max(
@@ -790,7 +833,7 @@ class SchedulerMetricsReporter:
             + hidden_size * act_bytes * num_attn_layers
         )
         self._ffn_act_bytes_per_token = (
-            3.0 * intermediate_size * act_bytes * num_mlp_layers
+            mlp_weight_mult * intermediate_size * act_bytes * num_mlp_layers
             if intermediate_size > 0
             else 0.0
         )
