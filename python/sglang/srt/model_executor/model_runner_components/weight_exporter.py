@@ -38,6 +38,26 @@ class WeightExporter:
         if reason is not None:
             raise RuntimeError(reason)
 
+    def _rank_group(
+        self, ports: str, group_name: str
+    ) -> tuple[str, str, Optional[str]]:
+        # These fields come from a remote client: report a bad request back,
+        # since an assert here would take down the seed's scheduler.
+        if group_name == "":
+            return "", "", "Group name cannot be empty"
+        ports_list = ports.split(",")
+        if len(ports_list) != self.tp_size:
+            return (
+                "",
+                "",
+                (
+                    f"Expected {self.tp_size} ports, but got {len(ports_list)} ports; "
+                    "the client's TP size must match the seed's."
+                ),
+            )
+        group_port = ports_list[self.tp_rank]
+        return group_port, f"{group_name}_{group_port}_{self.tp_rank}", None
+
     def init_weights_send_group_for_remote_instance(
         self,
         master_address,
@@ -54,14 +74,12 @@ class WeightExporter:
         assert torch.distributed.is_initialized(), (
             "Default torch process group must be initialized"
         )
-        assert group_name != "", "Group name cannot be empty"
-
-        ports_list = ports.split(",")
-        assert len(ports_list) == self.tp_size, (
-            f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
-        )
-        group_port = ports_list[self.tp_rank]
-        group_name = f"{group_name}_{group_port}_{self.tp_rank}"
+        group_port, group_name, error = self._rank_group(ports, group_name)
+        if error is not None:
+            logger.error(
+                f"Rejecting init_weights_send_group_for_remote_instance: {error}"
+            )
+            return False, error
         backend = "hccl" if backend == "nccl" and is_npu() else backend
         device_type = "cuda" if not is_npu() else "npu"
         if is_xpu():
@@ -110,16 +128,12 @@ class WeightExporter:
         assert torch.distributed.is_initialized(), (
             "Default torch process group must be initialized"
         )
-        assert group_name != "", "Group name cannot be empty"
+        group_port, group_name, error = self._rank_group(ports, group_name)
+        if error is not None:
+            logger.error(f"Rejecting send_weights_to_remote_instance: {error}")
+            return False, error
 
-        ports_list = ports.split(",")
-        assert len(ports_list) == self.tp_size, (
-            f"Expected {self.tp_size} ports, but got {len(ports_list)} ports."
-        )
-        group_port = ports_list[self.tp_rank]
-        group_name = f"{group_name}_{group_port}_{self.tp_rank}"
-
-        if self._weights_send_group[group_name] is not None:
+        if self._weights_send_group.get(group_name) is not None:
             send_group = self._weights_send_group[group_name]
         else:
             message = f"Group {group_name} not in _weights_send_group list. Please call `init_weights_send_group_for_remote_instance` first."
