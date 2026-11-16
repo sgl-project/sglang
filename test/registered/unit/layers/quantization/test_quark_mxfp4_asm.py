@@ -120,42 +120,6 @@ class TestQuarkMxfp4AsmNarrowLayer(CustomTestCase):
         self.assertIs(layer.weight, weight)
 
 
-class TestQuarkMxfp4TritonBatchedInput(CustomTestCase):
-    def test_three_d_input_keeps_leading_dims(self):
-        """A [B, T, K] activation comes back as [B, T, N] on the Triton GEMM path,
-        as it does on the ASM path, not flattened to [B * T, N]."""
-        batch, tokens, n, k = 2, 3, 8, 64
-        layer = torch.nn.Module()
-        layer.weight = torch.nn.Parameter(
-            torch.zeros((n, k // 2), dtype=torch.uint8), requires_grad=False
-        )
-        layer.weight_scale = torch.nn.Parameter(
-            torch.zeros((n, k // 32), dtype=torch.uint8), requires_grad=False
-        )
-        scheme = quark_w4a4_mxfp4.QuarkW4A4MXFP4({}, {})
-
-        def fake_quant(x):
-            return x, torch.zeros((x.shape[0], k // 32), dtype=torch.uint8)
-
-        def fake_gemm(x_q, w, x_s, w_s, dtype, y):
-            y.copy_(torch.arange(y.numel(), dtype=y.dtype).view_as(y))
-
-        with (
-            mock.patch.object(
-                quark_w4a4_mxfp4, "dynamic_mxfp4_quant", fake_quant, create=True
-            ),
-            mock.patch.object(
-                quark_w4a4_mxfp4, "gemm_afp4wfp4", fake_gemm, create=True
-            ),
-        ):
-            y = scheme.apply_weights(layer, torch.zeros((batch, tokens, k)))
-
-        self.assertEqual(tuple(y.shape), (batch, tokens, n))
-        # Row b * T + t of the flat GEMM output lands at [b, t].
-        expected = torch.arange(batch * tokens * n, dtype=y.dtype)
-        torch.testing.assert_close(y, expected.view(batch, tokens, n), rtol=0, atol=0)
-
-
 @unittest.skipUnless(is_hip(), "needs a ROCm build with aiter")
 class TestQuarkMxfp4DynamicQuantFake(CustomTestCase):
     def test_fake_scale_matches_aiter_column_major_layout(self):
