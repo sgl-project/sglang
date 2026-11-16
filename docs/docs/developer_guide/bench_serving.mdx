@@ -449,8 +449,8 @@ python3 -m sglang.benchmark.serving \
   --dataset-name mooncake \
   --mooncake-slowdown-factor 1.0 \
   --mooncake-num-rounds 1000 \
-  --mooncake-workload conversation|mooncake|agent|synthetic
-  --use-trace-timestamps true \
+  --mooncake-workload conversation|mooncake|toolagent|synthetic \
+  --use-trace-timestamps \
   --random-output-len 256
 ```
 
