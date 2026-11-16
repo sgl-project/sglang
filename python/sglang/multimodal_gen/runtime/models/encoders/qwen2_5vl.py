@@ -1024,24 +1024,6 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
     layer_names = [*TextEncoder.layer_names, "model.visual.blocks"]
     _fsdp_forward_methods = ("generate",)
 
-    # BitandBytes specific attributes
-    default_bitsandbytes_target_modules = [
-        ".gate_up_proj.",
-        ".down_proj.",
-        ".q_proj.",
-        ".k_proj.",
-        ".v_proj.",
-        ".o_proj.",
-    ]
-    bitsandbytes_stacked_params_mapping = {
-        # shard_name, weight_name, index
-        "q_proj": ("qkv_proj", 0),
-        "k_proj": ("qkv_proj", 1),
-        "v_proj": ("qkv_proj", 2),
-        "gate_proj": ("gate_up_proj", 0),
-        "up_proj": ("gate_up_proj", 1),
-    }
-
     def __init__(
         self,
         config: Qwen2_5VLConfig,
