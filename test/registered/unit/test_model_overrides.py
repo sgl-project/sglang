@@ -1294,6 +1294,50 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             [("_mimo_v2_overrides", expected)],
                         )
 
+    def test_kimi_k3_flashinfer_mxfp4_rejects_situ_without_trtllm_gen(self):
+        """An explicit flashinfer_mxfp4 on SM90/SM120 ran K3's SiTU experts as SwiGLU."""
+        from sglang.srt.arg_groups.model_overrides.kimi_k3 import (
+            _kimi_k3_moe_runner_overrides,
+        )
+
+        def _k3_hf(hidden_act, flat=False):
+            qc = {"config_groups": {"group_0": {"format": "mxfp4-pack-quantized"}}}
+            text_config = SimpleNamespace(hidden_act=hidden_act, quantization_config=qc)
+            return text_config if flat else SimpleNamespace(text_config=text_config)
+
+        def _run(runner, hf_config, **platform):
+            with override_platform(**platform):
+                return _kimi_k3_moe_runner_overrides(
+                    SimpleNamespace(moe_runner_backend=runner), hf_config
+                )
+
+        def _gpu(sm):
+            return dict(
+                is_cuda=True,
+                is_sm90=sm == 90,
+                is_sm100=sm // 10 == 10,
+                is_sm120=sm // 10 == 12,
+                device_sm=sm,
+            )
+
+        hopper = _gpu(90)
+        for platform in (hopper, _gpu(120)):
+            for flat in (False, True):
+                with self.subTest(flat=flat, **platform):
+                    with self.assertRaisesRegex(RuntimeError, "marlin"):
+                        _run("flashinfer_mxfp4", _k3_hf("situ", flat), **platform)
+        # SM110 has no flashinfer_mxfp4 kernel; Mxfp4MoEMethod reports that.
+        for platform in (_gpu(100), _gpu(103), _gpu(110)):
+            with self.subTest(**platform):
+                self.assertEqual(
+                    _run("flashinfer_mxfp4", _k3_hf("situ"), **platform), {}
+                )
+        self.assertEqual(_run("marlin", _k3_hf("situ"), **hopper), {})
+        self.assertEqual(_run("flashinfer_mxfp4", _k3_hf("silu"), **hopper), {})
+        self.assertEqual(
+            _run("flashinfer_mxfp4", _k3_hf("silu", flat=True), **hopper), {}
+        )
+
     def test_mimo_v2_family_is_registered(self):
         with override_platform(is_sm100=False):
             self.assertEqual(
@@ -3133,8 +3177,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import _dsa_kv_cache_dtype_default
 
-        def _view(**kw):
-            hf = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
+        def _view(learnable_sink=False, **kw):
+            hf = SimpleNamespace(
+                architectures=["DeepseekV32ForCausalLM"], learnable_sink=learnable_sink
+            )
             defaults = dict(
                 kv_cache_dtype="auto",
                 dsa_prefill_backend=None,
@@ -3149,6 +3195,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
             override_platform(is_npu=False),
             override_platform(is_xpu=False),
+            override_platform(is_hip=False),
         ):
             with patch("torch.cuda.get_device_capability", return_value=(9, 0)):
                 # Hopper: auto -> bfloat16
@@ -3173,6 +3220,53 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 self.assertEqual(
                     _dsa_kv_cache_dtype_default(_view()),
                     {"kv_cache_dtype": "fp8_e4m3"},
+                )
+        # gfx950 reports capability 9.5.
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
+            override_platform(is_hip=True),
+            patch("torch.cuda.get_device_capability", return_value=(9, 5)),
+            patch(
+                "sglang.srt.arg_groups.overrides.is_gfx95_supported",
+                return_value=True,
+            ),
+            envs.SGLANG_USE_AITER.override(True),
+        ):
+            self.assertEqual(
+                _dsa_kv_cache_dtype_default(_view()),
+                {"kv_cache_dtype": "fp8_e4m3"},
+            )
+            for backend in ("triton", "tilelang"):
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(
+                        _view(dsa_prefill_backend=backend, dsa_decode_backend=backend)
+                    ),
+                    {"kv_cache_dtype": "fp8_e4m3"},
+                )
+            self.assertEqual(
+                _dsa_kv_cache_dtype_default(_view(learnable_sink=True)),
+                {"kv_cache_dtype": "bfloat16"},
+            )
+            self.assertEqual(
+                _dsa_kv_cache_dtype_default(
+                    _view(dsa_prefill_backend="aiter", dsa_decode_backend="aiter")
+                ),
+                {"kv_cache_dtype": "bfloat16"},
+            )
+            with envs.SGLANG_USE_AITER.override(False):
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(_view()),
+                    {"kv_cache_dtype": "bfloat16"},
+                )
+            with patch(
+                "sglang.srt.arg_groups.overrides.is_gfx95_supported",
+                return_value=False,
+            ):
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(_view()),
+                    {"kv_cache_dtype": "bfloat16"},
                 )
 
     def test_deepseek_v4_kv_cache_dtype_pass(self):
@@ -4537,6 +4631,37 @@ class TestQwen3VLHopperServingOverrides(CustomTestCase):
         self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 2048)
 
 
+class TestLfm3SpeculativeDecoding(CustomTestCase):
+    def test_speculative_decoding_is_rejected(self):
+        from sglang.srt.arg_groups.model_overrides.lfm3 import _lfm3_overrides
+
+        for algorithm in ("EAGLE", "EAGLE3", "NGRAM"):
+            with self.subTest(algorithm=algorithm):
+                args = SimpleNamespace(speculative_algorithm=algorithm)
+                with self.assertRaisesRegex(ValueError, "speculative decoding"):
+                    _lfm3_overrides(args, None)
+
+    def test_dp_attention_is_rejected(self):
+        from sglang.srt.arg_groups.model_overrides.lfm3 import _lfm3_overrides
+
+        args = SimpleNamespace(speculative_algorithm=None, attn_dp_size=2)
+        with self.assertRaisesRegex(ValueError, "DP attention"):
+            _lfm3_overrides(args, None)
+
+    def test_explicit_ragged_flashinfer_prefill_is_rejected(self):
+        from sglang.srt.arg_groups.model_overrides.lfm3 import _lfm3_overrides
+
+        args = SimpleNamespace(
+            speculative_algorithm=None,
+            attn_dp_size=1,
+            attention_backend="flashinfer",
+            prefill_attention_backend=None,
+        )
+        with envs.SGLANG_FLASHINFER_USE_PAGED.override(False):
+            with self.assertRaisesRegex(ValueError, "paged prefill"):
+                _lfm3_overrides(args, None)
+
+
 class TestKimiK31HiSparseDsaBackends(CustomTestCase):
     @staticmethod
     def _resolve(**fields):
@@ -4611,6 +4736,58 @@ class TestDeterministicAttentionBackendOnXpu(unittest.TestCase):
                 self._view("triton")
             )
         self.assertEqual(updates, {})
+
+
+class TestGlm5NextAgenticMambaPool(CustomTestCase):
+    ARCH = "Glm5NextForConditionalGeneration"
+
+    def _declared(self, supports_extra_buffer=True, **fields):
+        from sglang.srt.arg_groups.model_overrides.glm5_next import (
+            _glm5_next_overrides,
+        )
+
+        args = dict(
+            mamba_full_memory_ratio=None,
+            mamba_radix_cache_strategy="auto",
+            disaggregation_mode="null",
+            disable_overlap_schedule=False,
+            pp_size=1,
+        )
+        args.update(fields)
+        with patch.object(
+            overrides_module,
+            "supports_mamba_cache_extra_buffer",
+            return_value=supports_extra_buffer,
+        ):
+            return _glm5_next_overrides(
+                SimpleNamespace(**args), SimpleNamespace(architectures=[self.ARCH])
+            )
+
+    def test_defaults_to_agentic_pool(self):
+        self.assertEqual(
+            self._declared(),
+            {
+                "mamba_full_memory_ratio": 0.25,
+                "mamba_radix_cache_strategy": "extra_buffer_lazy",
+            },
+        )
+
+    def test_explicit_values_and_unsupported_lazy_keep_their_strategy(self):
+        self.assertEqual(
+            self._declared(mamba_full_memory_ratio=0.9),
+            {"mamba_radix_cache_strategy": "extra_buffer_lazy"},
+        )
+        for fields in (
+            dict(mamba_radix_cache_strategy="extra_buffer"),
+            dict(supports_extra_buffer=False),
+            dict(disaggregation_mode="prefill"),
+            dict(disable_overlap_schedule=True),
+            dict(pp_size=2),
+        ):
+            with self.subTest(**fields):
+                self.assertEqual(
+                    self._declared(**fields), {"mamba_full_memory_ratio": 0.25}
+                )
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import pickle
 import shutil
 import signal
 import socket
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -25,6 +26,7 @@ from sglang.srt.arg_groups.attention_hook import (
     handle_attention_backend_compatibility,
     handle_deterministic_inference,
 )
+from sglang.srt.arg_groups.choices import KV_CACHE_DTYPE_CHOICES
 from sglang.srt.arg_groups.cuda_graph_hook import (
     apply_cuda_graph_compatibility,
     finalize_cuda_graph_prefill_max_context,
@@ -46,6 +48,7 @@ from sglang.srt.arg_groups.kv_cache_hook import (
     handle_cache_compatibility,
     handle_kv4_compatibility,
     handle_nvfp4_prefill_kv_dequant_dtype,
+    handle_platform_kv_cache_dtype_compatibility,
     validate_prefill_only_disable_kv_cache_args,
 )
 from sglang.srt.arg_groups.kv_shard_hook import (
@@ -78,6 +81,7 @@ from sglang.srt.arg_groups.parallel_hook import (
 )
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
 from sglang.srt.arg_groups.serving_hook import (
+    handle_admin_api_key_env,
     handle_crash_dump_env,
     handle_deprecated_args,
     handle_load_balance_method,
@@ -108,6 +112,7 @@ from sglang.srt.layers.moe.utils import (
     FlashinferA2ADispatchType,
     get_flashinfer_a2a_dispatch_type,
 )
+from sglang.srt.mem_cache import platform_kv_cache_dtype
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     CudaGraphConfig,
@@ -147,21 +152,21 @@ class TestServerArgsPositionalOrder(CustomTestCase):
             (95, "disable_attn_tp_gather"),
             (96, "enable_p2p_check"),
             (97, "device"),
-            (532, "grpc_response_timeout_secs"),
-            (533, "enable_paged_experts"),
-            (534, "paged_experts_num_resident"),
-            (535, "enable_nvidia_megakernel"),
-            (536, "enable_megamoe_for_layernorm_sp"),
+            (530, "grpc_response_timeout_secs"),
+            (531, "enable_paged_experts"),
+            (532, "paged_experts_num_resident"),
+            (533, "enable_nvidia_megakernel"),
+            (534, "enable_megamoe_for_layernorm_sp"),
         ):
             with self.subTest(index=index):
                 self.assertEqual(fields[index].name, name)
         defaults = ServerArgs(model_path="dummy")
-        # Surviving legacy inputs retain their slots after an intentional removal.
-        positional = [getattr(defaults, field.name) for field in fields[:533]]
+        # deprecated constructor fields keep their historical slots
+        positional = [getattr(defaults, field.name) for field in fields[:531]]
         positional[95] = True
         positional[96] = False
         positional[97] = "cpu"
-        positional[532] = 123.0
+        positional[530] = 123.0
 
         args = ServerArgs(*positional)
 
@@ -1002,6 +1007,30 @@ class TestPrepareServerArgs(CustomTestCase):
             )
         )
 
+    def test_config_deprecated_no_op_boolean_flags(self):
+        """Retired booleans in YAML remain accepted without changing arguments."""
+        parser = argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        base_args = ["--model-path", "dummy"]
+        baseline = vars(parser.parse_args(base_args))
+
+        for flag in (
+            "disable-outlines-disk-cache",
+            "show-time-cost",
+            "triton-attention-reduce-in-fp32",
+        ):
+            for value in (True, False):
+                with (
+                    self.subTest(flag=flag, value=value),
+                    tempfile.NamedTemporaryFile(mode="w", suffix=".yaml") as f,
+                ):
+                    f.write(f"{flag}: {str(value).lower()}\n")
+                    f.flush()
+                    merged = ConfigArgumentMerger(parser).merge_config_with_args(
+                        ["--config", f.name] + base_args
+                    )
+                    self.assertEqual(vars(parser.parse_args(merged)), baseline)
+
     def test_config_nested_dict_args_are_json(self):
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False) as f:
             f.write("mm-process-config:\n  image:\n    resize: 128\n")
@@ -1090,6 +1119,24 @@ class TestImageProcessorBackend(CustomTestCase):
             handle_deprecated_args(server_args)
 
 
+class TestAdminApiKeyEnv(CustomTestCase):
+    def test_env_fills_a_missing_flag(self):
+        server_args = ServerArgs(model_path="dummy")
+
+        with envs.SGLANG_ADMIN_API_KEY.override("sk-env"):
+            handle_admin_api_key_env(server_args)
+
+        self.assertEqual(resolution_result(server_args, "admin_api_key"), "sk-env")
+
+    def test_flag_wins_over_env(self):
+        server_args = ServerArgs(model_path="dummy", admin_api_key="sk-flag")
+
+        with envs.SGLANG_ADMIN_API_KEY.override("sk-env"):
+            handle_admin_api_key_env(server_args)
+
+        self.assertEqual(resolution_result(server_args, "admin_api_key"), "sk-flag")
+
+
 class TestTokenspeedMlaAlias(CustomTestCase):
     def test_maps_to_cutedsl_with_fp8_kv(self):
         server_args = ServerArgs(model_path="dummy", attention_backend="tokenspeed_mla")
@@ -1159,6 +1206,20 @@ class TestFlashinferMoeA2AAlias(CustomTestCase):
             "flashinfer_nvlink_one_sided",
         )
         self.assertIsNone(resolution_result(server_args, "speculative_moe_a2a_backend"))
+
+
+class TestTokenSpaceProcessorArgs(CustomTestCase):
+    def test_rejects_encoder_disaggregation(self):
+        for role in ("encoder_only", "language_only"):
+            with self.subTest(role=role):
+                server_args = ServerArgs(
+                    model_path="dummy",
+                    enable_token_space_processor=True,
+                    **{role: True},
+                )
+
+                with self.assertRaisesRegex(ValueError, "encoder disaggregation"):
+                    pd_disaggregation_hook.handle_encoder_disaggregation(server_args)
 
 
 class TestMultimodalFeatureTransport(CustomTestCase):
@@ -1710,6 +1771,68 @@ class TestKV4Compatibility(unittest.TestCase):
         args = self._make_nvfp4_args(enable_unified_memory=True)
         with self.assertRaisesRegex(ValueError, "enable-unified-memory"):
             handle_kv4_compatibility(args)
+
+
+_PLATFORM_KV_CACHE_DTYPE = "example_platform_kv"
+
+
+def _register_platform_kv_cache_dtype(test):
+    """Register a platform KV cache dtype for ``test`` only; both stores are global."""
+    choices = list(KV_CACHE_DTYPE_CHOICES)
+    test.addCleanup(KV_CACHE_DTYPE_CHOICES.__setitem__, slice(None), choices)
+    registry = patch.dict(
+        platform_kv_cache_dtype._REGISTERED_KV_CACHE_DTYPES, clear=True
+    )
+    registry.start()
+    test.addCleanup(registry.stop)
+    platform_kv_cache_dtype.register_kv_cache_dtype(_PLATFORM_KV_CACHE_DTYPE)
+
+
+class TestPlatformKVCacheDtypeCompatibility(CustomTestCase):
+    """A registered KV cache dtype has no in-tree implementation: only an
+    out-of-tree platform that declares it may select it, and not with core's
+    per-head KV layout paths."""
+
+    def setUp(self):
+        _register_platform_kv_cache_dtype(self)
+
+    @staticmethod
+    def _resolve(
+        *, out_of_tree, declared, kv_cache_dtype=_PLATFORM_KV_CACHE_DTYPE, **overrides
+    ):
+        args = ServerArgs(
+            model_path="dummy", kv_cache_dtype=kv_cache_dtype, **overrides
+        )
+        with patch("sglang.srt.arg_groups.kv_cache_hook.current_platform") as platform:
+            platform.is_out_of_tree.return_value = out_of_tree
+            platform.supports_kv_cache_dtype.side_effect = lambda dtype: (
+                dtype in declared
+            )
+            handle_platform_kv_cache_dtype_compatibility(args)
+
+    def test_only_an_out_of_tree_platform_declaring_the_dtype_accepts_it(self):
+        name = _PLATFORM_KV_CACHE_DTYPE
+        for out_of_tree, declared in ((False, {name}), (True, set())):
+            with (
+                self.subTest(out_of_tree=out_of_tree, declared=declared),
+                self.assertRaisesRegex(ValueError, "does not declare support"),
+            ):
+                self._resolve(out_of_tree=out_of_tree, declared=declared)
+        self._resolve(out_of_tree=True, declared={name})
+
+    def test_built_in_dtypes_ignore_the_platform_declaration(self):
+        self._resolve(out_of_tree=True, declared=set(), kv_cache_dtype="fp8_e4m3")
+
+    def test_declared_dtype_rejects_pd_and_host_kv_pools(self):
+        for flag, overrides in (
+            ("--disaggregation-mode", {"disaggregation_mode": "prefill"}),
+            ("--enable-hierarchical-cache", {"enable_hierarchical_cache": True}),
+            ("--enable-lmcache", {"enable_lmcache": True}),
+        ):
+            with self.subTest(flag=flag), self.assertRaisesRegex(ValueError, flag):
+                self._resolve(
+                    out_of_tree=True, declared={_PLATFORM_KV_CACHE_DTYPE}, **overrides
+                )
 
 
 class TestLoraForwardDomains(unittest.TestCase):
@@ -2624,7 +2747,17 @@ class TestPortArgs(unittest.TestCase):
         with self.assertRaises(ValueError):
             PortArgs.init_new(server_args)
 
-    def test_init_new_with_single_node_dp_attention(self):
+    def _assert_endpoint_ports_checked(self, port_args, wait_port_available):
+        checked = [args[0] for args, _ in wait_port_available.call_args_list]
+        for ipc_name in (
+            port_args.tokenizer_ipc_name,
+            port_args.scheduler_input_ipc_name,
+            port_args.detokenizer_ipc_name,
+        ):
+            self.assertIn(int(ipc_name.rsplit(":", 1)[1]), checked)
+
+    @patch("sglang.srt.server_args.wait_port_available")
+    def test_init_new_with_single_node_dp_attention(self, wait_port_available):
 
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
@@ -2641,6 +2774,7 @@ class TestPortArgs(unittest.TestCase):
         )
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("tcp://127.0.0.1:"))
         self.assertIsInstance(port_args.nccl_port, int)
+        self._assert_endpoint_ports_checked(port_args, wait_port_available)
 
     @patch("sglang.srt.server_args.wait_port_available")
     def test_init_new_with_dp_rank(self, wait_port_available):
@@ -2688,7 +2822,8 @@ class TestPortArgs(unittest.TestCase):
                 )
                 self.assertIsInstance(port_args.nccl_port, int)
 
-    def test_init_new_with_ipv4_address(self):
+    @patch("sglang.srt.server_args.wait_port_available")
+    def test_init_new_with_ipv4_address(self, wait_port_available):
         server_args = ServerArgs(model_path="dummy")
         server_args.port = 30000
         server_args.nccl_port = None
@@ -2705,6 +2840,7 @@ class TestPortArgs(unittest.TestCase):
         )
         self.assertTrue(port_args.detokenizer_ipc_name.startswith("tcp://192.168.1.1:"))
         self.assertIsInstance(port_args.nccl_port, int)
+        self._assert_endpoint_ports_checked(port_args, wait_port_available)
 
     def test_init_new_with_malformed_ipv4_address(self):
         server_args = ServerArgs(model_path="dummy")
@@ -2838,6 +2974,28 @@ class TestSSLArgs(unittest.TestCase):
                 self._validate_ssl(enable_http_worker_reuseport=True, **kwargs)
             self.assertIn("--enable-http-worker-reuseport", str(context.exception))
         self._validate_ssl(enable_http_worker_reuseport=True, tokenizer_worker_num=2)
+
+    def test_enable_http2_needs_granian_only_on_the_python_frontend(self):
+        # Real models run this validation; the Rust listener serves HTTP/2
+        # itself, so only the Python frontend needs Granian. Both frontends
+        # check the HTTP/2 settings.
+        with patch.dict(sys.modules, {"granian": None}):
+            for rust_server in (False, True):
+                with (
+                    self.subTest(rust_server=rust_server),
+                    envs.SGLANG_RUST_SERVER.override(rust_server),
+                ):
+                    if rust_server:
+                        self._validate_ssl(enable_http2=True)
+                    else:
+                        with self.assertRaisesRegex(ValueError, "'granian' package"):
+                            self._validate_ssl(enable_http2=True)
+                    with self.assertRaisesRegex(
+                        ValueError, "--http2-max-concurrent-streams"
+                    ):
+                        self._validate_ssl(
+                            enable_http2=True, http2_max_concurrent_streams=0
+                        )
 
     @patch("os.path.isfile", return_value=True)
     def test_enable_ssl_refresh_with_ssl_accepted(self, _mock_isfile):
@@ -3487,6 +3645,11 @@ class TestPrefillOnlyDisableKvCache(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "nvfp4.*fp4_mx_block16"):
                     self._validate_prefill_only_args(kv_cache_dtype=kv_cache_dtype)
 
+    def test_rejects_platform_registered_kv_cache_dtype(self):
+        _register_platform_kv_cache_dtype(self)
+        with self.assertRaisesRegex(ValueError, "platform-registered"):
+            self._validate_prefill_only_args(kv_cache_dtype=_PLATFORM_KV_CACHE_DTYPE)
+
 
 class TestPipelineParallelCompat(CustomTestCase):
     """Features supported with `pipeline-parallel-size > 1`."""
@@ -3500,6 +3663,7 @@ class TestPipelineParallelCompat(CustomTestCase):
             disaggregation_mode="prefill",
             min_free_slots_delay=None,
             scheduler_recv_interval=1,
+            enable_return_routed_experts=False,
         )
         cfg.update(overrides)
         return SimpleNamespace(**cfg)
@@ -3675,6 +3839,53 @@ class TestPipelineParallelPrefillCudaGraphPolicy(CustomTestCase):
                     handle_gpu_memory_settings(args)
                 prefill = resolution_result(args, "cuda_graph_config").prefill
                 self.assertEqual((prefill.max_bs, prefill.bs[-1]), (expected, expected))
+
+
+class TestDecodeCudaGraphCeilingByMemoryTier(CustomTestCase):
+    def _resolve_decode(self, gpu_mem_mb, tp_size, max_bs=None):
+        args = ServerArgs(
+            model_path="dummy",
+            tp_size=tp_size,
+            mem_fraction_static=0.8,
+            cuda_graph_config=CudaGraphConfig(decode=PhaseConfig(max_bs=max_bs)),
+        )
+        with (
+            patch(
+                "sglang.srt.arg_groups.memory_hook.use_mla_backend",
+                return_value=False,
+            ),
+            patch(
+                "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+                return_value=gpu_mem_mb,
+            ),
+        ):
+            handle_gpu_memory_settings(args)
+        return resolution_result(args, "cuda_graph_config").decode
+
+    def test_ceiling_never_drops_as_memory_grows(self):
+        """A larger GPU must not get a smaller default ceiling, or decode batches
+        between the two ceilings run eager only on the larger GPU."""
+        gib = (16, 24, 35, 40, 45, 48, 60, 80, 96, 192)
+        ceilings = [self._resolve_decode(g * 1024, 1).max_bs for g in gib]
+        self.assertEqual(ceilings, sorted(ceilings), dict(zip(gib, ceilings)))
+
+    def test_default_ceiling_for_35_to_60_gib(self):
+        cases = (
+            # (reported MiB, tp_size, expected decode max_bs)
+            (35 * 1024, 1, 128),
+            (46068, 1, 128),  # L40S, A40
+            (60 * 1024 - 1, 1, 128),
+            (60 * 1024, 1, 256),
+            (46068, 4, 160),
+        )
+        for gpu_mem_mb, tp_size, expected in cases:
+            with self.subTest(gpu_mem_mb=gpu_mem_mb, tp_size=tp_size):
+                decode = self._resolve_decode(gpu_mem_mb, tp_size)
+                self.assertEqual((decode.max_bs, decode.bs[-1]), (expected, expected))
+
+    def test_explicit_ceiling_is_kept(self):
+        decode = self._resolve_decode(46068, 1, max_bs=64)
+        self.assertEqual((decode.max_bs, decode.bs[-1]), (64, 64))
 
 
 class TestCudaGraphDisaggregationRoles(CustomTestCase):
@@ -4331,8 +4542,8 @@ class TestHandleCrashDumpEnv(CustomTestCase):
 
 class TestGrpcServerArgs(CustomTestCase):
     """Native gRPC is enabled by --grpc-port (or SGLANG_GRPC_PORT) and runs
-    alongside HTTP; --smg-grpc-mode (and the deprecated --grpc-mode) select the
-    legacy SMG server. Worker-threads / max-prefill-tokens are env-only knobs.
+    alongside HTTP; --grpc-mode serves the encoder over gRPC. Worker-threads /
+    max-prefill-tokens are env-only knobs.
 
     The gRPC setup lives in `serving_hook.handle_deprecated_args`, which
     __post_init__ skips for dummy models, so these tests build a dummy
@@ -4446,11 +4657,6 @@ class TestGrpcServerArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "requires --grpc-port"):
             handle_deprecated_args(sa)
 
-    def test_sidecar_rejects_legacy_grpc(self):
-        sa = self._args(sidecar="example.sidecar", smg_grpc_mode=True)
-        with self.assertRaisesRegex(ValueError, "native gRPC server"):
-            handle_deprecated_args(sa)
-
     def test_sidecar_rejects_empty_value(self):
         sa = self._args(sidecar="", grpc_port=50051)
         with self.assertRaisesRegex(ValueError, "must not be empty"):
@@ -4561,24 +4767,6 @@ class TestGrpcServerArgs(CustomTestCase):
         proc.join.assert_called_once_with(timeout=42.0)
         kill_tree.assert_called_once_with(1234, wait_timeout=42.0)
 
-    def test_legacy_smg_derives_grpc_port_from_http_port(self):
-        sa = self._args(port=30000, smg_grpc_mode=True)
-        handle_deprecated_args(sa)
-        self.assertEqual(resolution_result(sa, "grpc_port"), 40000)
-
-    def test_grpc_mode_is_deprecated_alias_for_smg_grpc_mode(self):
-        sa = self._args(grpc_mode=True)
-        with self.assertLogs(serving_hook.logger, level="WARNING") as cm:
-            handle_deprecated_args(sa)
-        self.assertTrue(resolution_result(sa, "smg_grpc_mode"))
-        self.assertTrue(any("--grpc-mode is deprecated" in line for line in cm.output))
-
-    def test_legacy_smg_takes_precedence_over_grpc_port(self):
-        sa = self._args(grpc_port=50051, smg_grpc_mode=True)
-        handle_deprecated_args(sa)
-        self.assertTrue(resolution_result(sa, "smg_grpc_mode"))
-        self.assertEqual(resolution_result(sa, "grpc_port"), 50051)
-
     def test_native_grpc_rejects_multi_tokenizer(self):
         sa = self._args(grpc_port=40000, tokenizer_worker_num=2)
         with self.assertRaises(ValueError):
@@ -4588,6 +4776,22 @@ class TestGrpcServerArgs(CustomTestCase):
         sa = self._args(grpc_port=40000, api_key="secret")
         with self.assertRaises(ValueError):
             handle_deprecated_args(sa)
+
+    def test_native_grpc_rejects_admin_key_from_env(self):
+        sa = self._args(grpc_port=40000)
+        with envs.SGLANG_ADMIN_API_KEY.override("secret"):
+            handle_admin_api_key_env(sa)
+        with self.assertRaisesRegex(ValueError, "SGLANG_ADMIN_API_KEY"):
+            handle_deprecated_args(sa)
+
+    def test_admin_key_env_resolves_before_the_grpc_check(self):
+        from sglang.srt.arg_groups import pipeline
+
+        source = Path(pipeline.__file__).read_text()
+        self.assertLess(
+            source.index("run_hook(handle_admin_api_key_env"),
+            source.index("run_hook(handle_deprecated_args"),
+        )
 
     def test_invalid_grpc_worker_threads_rejected(self):
         sa = self._args(grpc_port=40000)
@@ -5185,10 +5389,10 @@ class TestLaunchCommand(CustomTestCase):
 
 
 class TestAccessKeyRedaction(CustomTestCase):
-    """The access keys and the TLS key password reach nothing that reports the
-    configuration: not the launch command, `/server_info`, the startup log or
-    the record's repr. Anyone holding the API key can read those, and the
-    admin key must stay out of their reach."""
+    """The access keys, the TLS key password and the HiCache storage config
+    reach nothing that reports the configuration: not the launch command,
+    `/server_info`, the startup log or the record's repr. Anyone holding the
+    API key can read those, and the admin key must stay out of their reach."""
 
     # Spellings argparse accepts: an abbreviation with `=`, a value with a
     # space, a value that spells another key flag, and a repeated flag.
@@ -5203,6 +5407,8 @@ class TestAccessKeyRedaction(CustomTestCase):
         "second-admin",
         "--ssl-keyfile-password",
         "tls-secret",
+        "--hicache-storage-backend-extra-config",
+        '{"secret_key": "s3-secret"}',
     ]
     SECRETS = (
         "alpha beta",
@@ -5210,6 +5416,7 @@ class TestAccessKeyRedaction(CustomTestCase):
         "--admin-api-key=x",
         "second-admin",
         "tls-secret",
+        "s3-secret",
     )
 
     def _assert_no_secret(self, text: str):
@@ -5222,7 +5429,8 @@ class TestAccessKeyRedaction(CustomTestCase):
             server_args.launch_command,
             "--model-path /tmp/x --api-key <redacted> --admin-api-ke=<redacted> "
             "--api-key=<redacted> --admin-api-key <redacted> "
-            "--ssl-keyfile-password <redacted>",
+            "--ssl-keyfile-password <redacted> "
+            "--hicache-storage-backend-extra-config <redacted>",
         )
         # Redaction is for display only: the server still authenticates with
         # the values the operator gave, the last of each repeated flag.
@@ -5236,6 +5444,7 @@ class TestAccessKeyRedaction(CustomTestCase):
         self.assertEqual(info["api_key"], "<redacted>")
         self.assertEqual(info["admin_api_key"], "<redacted>")
         self.assertEqual(info["ssl_keyfile_password"], "<redacted>")
+        self.assertEqual(info["hicache_storage_backend_extra_config"], "<redacted>")
         self._assert_no_secret(json.dumps(info, default=str))
         unset = build_server_info(prepare_server_args(["--model-path", "/tmp/x"]), {})
         self.assertIsNone(unset["api_key"])
@@ -5641,7 +5850,6 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         "allowed_media_domains": ["--allowed-media-domains", "example.com"],
         "media_url_max_file_size_mb": ["--media-url-max-file-size-mb", "0"],
         "enable_trace": ["--enable-trace"],
-        "warmups": ["--warmups", "voice_chat"],
         "completion_template": ["--completion-template", "deepseek_coder"],
         "hf_chat_template_name": ["--hf-chat-template-name", "tool_use"],
         "enable_custom_logit_processor": ["--enable-custom-logit-processor"],
@@ -5650,12 +5858,10 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         "lora_paths": ["--lora-paths", "adapter=/adapters/a"],
         "tokenizer_mode": ["--tokenizer-mode", "slow"],
         "tokenizer_backend": ["--tokenizer-backend", "fastokens"],
-        "gc_warning_threshold_secs": ["--gc-warning-threshold-secs", "1"],
         "tokenizer_metrics_allowed_custom_labels": [
             "--tokenizer-metrics-allowed-custom-labels",
             "tenant",
         ],
-        "enable_http2": ["--enable-http2"],
         "mm_preprocess_cache_size_mb": ["--mm-preprocess-cache-size-mb", "512"],
         "language_only": ["--language-only"],
         "checkpoint_engine_wait_weights_before_ready": [
@@ -5708,14 +5914,14 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
                 "dummy",
                 "--mm-preprocess-cache-size-mb",
                 "512",
-                "--enable-http2",
+                "--return-output-ids",
             ]
         )
         self.assertEqual(
             validation_hook.rust_server_unsupported_args(
                 args, honored={"mm_preprocess_cache_size_mb"}
             ),
-            ["--enable-http2"],
+            ["--return-output-ids"],
         )
 
     def test_supported_and_default_valued_args_pass(self):
@@ -5735,10 +5941,18 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
                 "--default-chat-template-kwargs",
                 '{"enable_thinking": false}',
                 "--enable-strict-thinking",
+                "--enable-http2",
+                "--http2-max-concurrent-streams",
+                "64",
                 "--api-key",
                 "sk-test",
                 "--admin-api-key",
                 "sk-admin",
+                # Run by the Rust server's startup work.
+                "--warmups",
+                "voice_chat",
+                "--gc-warning-threshold-secs",
+                "1",
                 # Refused arguments at their default values.
                 "--media-url-max-file-size-mb",
                 "64",
@@ -5746,9 +5960,6 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
                 "auto",
                 "--tokenizer-backend",
                 "huggingface",
-                # Python disables the GC warning when this is not positive.
-                "--gc-warning-threshold-secs",
-                "-1",
                 # The preprocessing cache off, as in the Rust pipelines.
                 "--mm-preprocess-cache-size-mb",
                 "0",
