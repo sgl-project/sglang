@@ -88,13 +88,10 @@ from sglang.srt.models.kimi_linear import KimiDeltaAttention
 from sglang.srt.models.utils import apply_qk_norm, bind_or_assign
 from sglang.srt.runtime_context import (
     get_parallel,
-    get_platform,
     get_stream,
 )
 from sglang.srt.utils import (
     BumpAllocator,
-    is_cuda,
-    is_flashinfer_available,
     log_info_on_rank0,
 )
 
@@ -116,10 +113,6 @@ def _get_awq_dequantize():
 
         return awq_dequantize
     return None
-
-
-_is_flashinfer_available = is_flashinfer_available()
-_is_sm100_supported = is_cuda() and get_platform().is_sm100
 
 
 class DsV3MLA(DeepseekV2AttentionMLA):
@@ -1188,15 +1181,6 @@ class BailingMoELinearDecoderLayer(nn.Module):
 
         return hidden_states
 
-    @staticmethod
-    def shared_moe_coefficient_loader(
-        param: torch.Tensor, loaded_weight: torch.Tensor
-    ) -> None:
-        assert param.size() == loaded_weight.size()
-
-        param.data.copy_(loaded_weight.to(torch.float32))
-        return
-
 
 class BailingMoELinearModel(nn.Module):
     def __init__(
@@ -1280,7 +1264,6 @@ class BailingMoELinearModel(nn.Module):
             self.norm = RMSNorm(config.hidden_size, **norm_kwargs)
         else:
             self.norm = PPMissingLayer()
-        self.embed_scale = 1.0
 
         # Hidden-state capture for speculative decoding (DSpark / DFlash / EAGLE3).
         # When set, ``forward`` appends each captured layer's final
@@ -1721,9 +1704,6 @@ class BailingMoeV3ForCausalLM(nn.Module):
         # block-fp8 weight for DeepGEMM (with the format_ue8m0 reentry
         # guard); a second model-level pass double-packs the scales and
         # crashes, which is why deepseek_v2 dropped its copy too.
-
-    def get_decoder_attention_types(self):
-        return self.model.decoder_attention_types
 
     def get_input_embeddings(self) -> nn.Module:
         return self.model.word_embeddings
