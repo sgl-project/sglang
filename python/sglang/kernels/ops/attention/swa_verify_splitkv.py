@@ -9,6 +9,8 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.gqa_verify_splitkv import _verify_reduce
+
 
 @triton.jit
 def _swa_verify_partials(
@@ -127,36 +129,6 @@ def _swa_verify_partials(
     )
 
 
-@triton.jit
-def _swa_verify_reduce(
-    PARTIAL,
-    MAXIMUM,
-    DENOM,
-    OUT,
-    V_SCALE,
-    HEADS: tl.constexpr,
-    SPLITS: tl.constexpr,
-    o_stride_0: tl.constexpr,
-    o_stride_1: tl.constexpr,
-):
-    token, head = tl.program_id(0), tl.program_id(1)
-    segments = tl.arange(0, SPLITS)
-    d = tl.arange(0, 64)
-    index = (token * HEADS + head) * SPLITS + segments
-    maximum = tl.load(MAXIMUM + index)
-    denom = tl.load(DENOM + index)
-    global_max = tl.max(tl.where(denom > 0, maximum, float("-inf")), axis=0)
-    global_max = tl.where(global_max > float("-inf"), global_max, 0.0)
-    weights = tl.where(denom > 0, tl.exp2(maximum - global_max), 0.0)
-    total = tl.sum(denom * weights, axis=0)
-    partial = tl.load(PARTIAL + index[:, None] * 64 + d[None, :])
-    accum = tl.sum(partial * weights[:, None], axis=0)
-    inverse = tl.where(total > 0, 1.0 / total, 0.0)
-    if V_SCALE is not None:
-        inverse *= tl.load(V_SCALE)
-    tl.store(OUT + token * o_stride_0 + head * o_stride_1 + d, accum * inverse)
-
-
 def swa_verify_splitkv(
     q,
     k,
@@ -223,7 +195,7 @@ def swa_verify_splitkv(
     if defer_reduce:
         # the caller merges the partials itself (verify_reduce_norm_gate)
         return partial, maximum, denom
-    _swa_verify_reduce[(q.shape[0], q.shape[1])](
+    _verify_reduce[(q.shape[0], q.shape[1])](
         partial,
         maximum,
         denom,
