@@ -1048,7 +1048,7 @@ class BailingMoELinearForCausalLM(nn.Module):
 
         if self.pp_group.is_last_rank:
             self.lm_head = (
-                self.word_embeddings
+                self.model.word_embeddings
                 if config.tie_word_embeddings
                 else ParallelLMHead(
                     config.vocab_size,
