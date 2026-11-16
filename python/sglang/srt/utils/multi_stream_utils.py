@@ -7,10 +7,6 @@ import torch
 from sglang.srt.runtime_context import get_forward
 
 
-def set_do_multi_stream(enable: bool):
-    get_forward().set("multi_stream", enable)
-
-
 def do_multi_stream() -> bool:
     return get_forward().multi_stream
 

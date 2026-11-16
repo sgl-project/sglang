@@ -227,7 +227,7 @@ struct FusedStoreCacheFlashMLAKernel {
 
     auto N = SymbolicSize{"num_tokens"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
     TensorMatcher({N, 512})  // input
         .with_dtype<Float>()
         .with_device(device_)
@@ -287,7 +287,7 @@ struct FusedStoreCacheIndexerKernel {
 
     auto N = SymbolicSize{"num_tokens"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
     TensorMatcher({N, 128})  // input
         .with_dtype<Float>()
         .with_device(device_)

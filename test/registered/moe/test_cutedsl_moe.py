@@ -21,7 +21,7 @@ except ImportError:
     CuteDslMoEWrapper = None
     convert_sf_to_mma_layout = None
 
-register_cuda_ci(est_time=17, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=18, stage="extra-b", runner_config="4-gpu-b200")
 
 SKIP_TEST = torch.cuda.get_device_capability() < (10, 0)
 SKIP_REASON = "Nvfp4 Requires compute capability of 10 or above."
@@ -426,7 +426,7 @@ class TestCuteDslV2(unittest.TestCase):
       - MMA-layout blockscales (convert_sf_to_mma_layout)
 
     This is the path used with --moe-runner-backend flashinfer_cutedsl and
-    --moe-a2a-backend none or flashinfer (i.e. NOT deepep).
+    --moe-a2a-backend none or flashinfer_nvlink_one_sided (i.e. NOT deepep).
     """
 
     @unittest.skipIf(SKIP_TEST, SKIP_REASON)

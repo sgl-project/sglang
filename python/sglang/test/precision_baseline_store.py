@@ -217,6 +217,7 @@ _MANIFEST_PROMOTE_KEYS = (
     "num_layers_failed",
     "max_rel_diff",
     "ci_run_id",
+    "ci_runner",
 )
 
 
@@ -233,9 +234,9 @@ def push_run(
     if config.read_only:
         raise PermissionError("precision baseline store is read-only")
 
-    # Dedup: same model+date+sha → skip tensor upload but still refresh meta
-    # + comparator_report + append a new manifest row, so pass-1 baseline and
-    # pass-2 stats both land. force=True re-uploads tensors too.
+    # Dedup: same model+date+sha -> a failed push skips the tensor upload but
+    # still refreshes meta + comparator_report and appends a manifest row.
+    # force=True re-uploads tensors too.
     api = HfApi(token=_store_token())
     date_str, date_path = _today_path()
     model_sanitized = _sanitize_model_name(model)
@@ -246,7 +247,12 @@ def push_run(
 
     existing_rows, existing_text = _read_manifest(config)
     tensors_already_present = any(r.get("run_path") == run_path for r in existing_rows)
-    skip_tensors = tensors_already_present and not force
+    # fetch serves a non-failed row's tensors as the next baseline, so such a
+    # push must upload its own; reusing tensors an earlier failed push left
+    # at this path would promote them to the baseline under a passed label.
+    skip_tensors = (
+        tensors_already_present and not force and meta["pass_label"] == "failed"
+    )
 
     with tempfile.TemporaryDirectory() as stage_dir:
         stage = Path(stage_dir)

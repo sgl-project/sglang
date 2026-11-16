@@ -75,8 +75,8 @@ TRITON_SPARSE_BLOCK_SIZES = (SPARSE_Q_BLOCK_SIZE, SPARSE_KV_BLOCK_SIZE)
 # exceeds one tile, so its sparse map must be (2 * tile_m, tile_n) = (256, 128);
 # SM90 stages one, so (128, 128). The kernel derives these from its own
 # heuristic and rejects metadata that disagrees. SM120 (consumer Blackwell) has
-# no block-sparse forward kernel. See flash_attn/cute/interface.py and
-# flash_attn/cute/block_sparsity.py::infer_block_sparse_expected_shapes.
+# no block-sparse forward kernel. See sglang/kernels/ops/attention/flash_attn/cute/
+# interface.py and block_sparsity.py::infer_block_sparse_expected_shapes.
 FA4_SPARSE_BLOCK_SIZES_BY_CAPABILITY: dict[int, tuple[int, int]] = {
     9: (128, 128),
     10: (256, 128),
@@ -120,7 +120,8 @@ def fa4_sparse_available(device: torch.device | None = None) -> bool:
         return False
     try:
         import cutlass  # noqa: F401
-        import flash_attn.cute  # noqa: F401
+
+        import sglang.kernels.ops.attention.flash_attn.cute  # noqa: F401
     except Exception as exc:  # noqa: BLE001
         logger.debug(
             "Cosmos3 FA4 unavailable; falling back to Triton: %s", exc, exc_info=True
@@ -131,7 +132,7 @@ def fa4_sparse_available(device: torch.device | None = None) -> bool:
 
 def resolve_masked_backend(device: torch.device | None = None) -> str:
     """The masked-family kernel for ``device``: FA4 block-sparse where its kernels run
-    (SM90 Hopper, SM100 Blackwell, with the flash-attn CuTe package), else Triton.
+    (SM90 Hopper, SM100 Blackwell, with the FA4 CuTe kernels importable), else Triton.
 
     Hopper joined the default on Oct 2 2026 after the H200 A/B: both kernels at
     bf16 rounding from the dense oracle, FA4 2x faster per call.
@@ -463,23 +464,6 @@ def _make_pair_allowed(
     return pair_allowed
 
 
-def multiview_pair_predicate(
-    metadata: MultiviewFlexMetadata,
-    q_index: torch.Tensor,
-    kv_index: torch.Tensor,
-) -> torch.Tensor:
-    """Evaluate the exact token visibility predicate (also used as mask_mod)."""
-    pair_allowed = _make_pair_allowed(
-        metadata.query_vectors(),
-        metadata.key_vectors(),
-        metadata.attention_scope,
-        metadata.decomposed_temporal_window_seconds,
-        metadata.control_attends_sensor,
-        metadata.lidar_attends_captions,
-    )
-    return pair_allowed(q_index, kv_index)
-
-
 def _semantic_groups(
     vectors: tuple[torch.Tensor, ...],
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -763,28 +747,6 @@ def get_multiview_attention_plan(
     )
     plan = sparsity if layout.backend == "fa4" else sparsity.to_block_mask()
     context.mask_cache[key] = plan
-    return plan, geometry
-
-
-def get_multiview_block_mask(
-    context: MultiviewAttentionContext,
-    *,
-    real_und_len: int,
-    real_q_len: int,
-    device: torch.device,
-) -> tuple[BlockMask, PaddedAttentionGeometry]:
-    """Request-local ``BlockMask`` for the Triton FlexAttention backend."""
-    plan, geometry = get_multiview_attention_plan(
-        context,
-        real_und_len=real_und_len,
-        real_q_len=real_q_len,
-        device=device,
-    )
-    if not isinstance(plan, BlockMask):
-        raise TypeError(
-            "Cosmos3 multiview get_multiview_block_mask requires backend='triton', "
-            f"got {context.layout.backend!r}; use get_multiview_attention_plan instead."
-        )
     return plan, geometry
 
 

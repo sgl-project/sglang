@@ -22,7 +22,7 @@ from sglang.srt.managers.io_struct import ScaleElasticEPReqInput
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 def test_attention_topology_mapping_and_complete_boundaries():

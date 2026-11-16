@@ -1,6 +1,6 @@
 import unittest
 
-from sglang.srt.managers.schedule_batch import FINISH_ABORT
+from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.scripted_runtime.context import ScriptedContext
 from sglang.test.scripted_runtime.http_server import ScriptedHttpServer
@@ -17,7 +17,7 @@ from sglang.test.scripted_runtime_chunked_helpers import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=297, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=311, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=460, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
