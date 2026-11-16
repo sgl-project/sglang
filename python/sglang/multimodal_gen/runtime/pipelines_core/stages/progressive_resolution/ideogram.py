@@ -380,10 +380,8 @@ class Ideogram4ProgressiveDenoisingStage(
         # The text encoder ran at full-res, so batch.prompt_embeds[0] has shape
         # [B, max_text_tokens + full_res_image_tokens, d_llm].  The DiT forward
         # expects llm_features and x=pos_z to share the same sequence length, so
-        # we bilinearly resize the image portion of llm_features to the low-res grid.
-        # ProgressiveDenoisingStage.forward() sets batch.height = init_h_pixel =
-        # (H_lat // downsample) * latent_scale before calling us, so:
-        #   orig_grid_{h,w} = grid_{h,w} * downsample  (downsample = 2^levels)
+        # the image rows are replaced by zeros at the low-res token count and
+        # the text rows are kept (see _adapt_llm_features).
         full_res_llm = batch.prompt_embeds[0]
         batch.prompt_embeds[0] = _adapt_llm_features(
             full_res_llm, max_text_tokens, num_image_tokens
@@ -417,7 +415,7 @@ class Ideogram4ProgressiveDenoisingStage(
         )
 
         # Expose a sigma_NOISE tensor for stage-transition logic (find_transition_steps)
-        # and DWT upsample (sigma_t = sigmas[stage_end]).
+        # and the DCT upsample (sigma_t = sigmas[stage_end]).
         #
         # schedule_values convention: sigma_clean, index 0 = clean end (≈1),
         # index N = noisy end (≈0). Step step_index k uses internal index i = N-1-k,
