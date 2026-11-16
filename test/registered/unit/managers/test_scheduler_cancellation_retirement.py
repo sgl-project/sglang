@@ -147,12 +147,16 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         enter_scope(self, envs.SGLANG_ENABLE_CANCEL_RETIREMENT_RECEIPTS.override(True))
         self.outputs = []
         self.abort_observer = None
+        self.drop_receipt_sends = 0
 
     def _scheduler(self, *, cache_enabled=False):
         return make_cpu_scheduler(self._send_output, cache_enabled=cache_enabled)
 
     def _send_output(self, output, req):
         if isinstance(output, CancellationRetirementOutput):
+            if self.drop_receipt_sends > 0:
+                self.drop_receipt_sends -= 1
+                raise OSError("control link down")
             self.outputs.append((output, req))
         elif self.abort_observer is not None:
             self.abort_observer(req)
@@ -237,6 +241,31 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         scheduler._check_cancellation_retirements()
         self.assertEqual(self.outputs[-1][0].status, "retired")
         self.assertIsNone(scheduler._cancellation_retirements["operation-a"].req)
+
+    def test_retraction_abort_waits_for_launched_steps_without_finishing_in_place(self):
+        scheduler = self._scheduler()
+        req = self._req(scheduler)
+        first, second = ScheduleBatch(reqs=[req]), ScheduleBatch(reqs=[req])
+        first.add_inflight_step()
+        second.add_inflight_step()
+        move([req], scheduler.running_reqs)
+        scheduler.running_batch = second
+        self._cancel(scheduler, req)
+
+        scheduler.request_retirer.retract(req, offload_kv=False)
+        scheduler.request_retirer.abort_retracted(req, reason=req.to_finish)
+        self.assertFalse(req.finished())
+        self.assertFalse(req.kv.holds_kv)
+        self.assertTrue(req.kv.is_kv_released)
+        scheduler._check_cancellation_retirements()
+        self.assertEqual(self.outputs, [])
+
+        scheduler._on_step_processed(first, None)
+        self.assertEqual(self.outputs, [])
+        scheduler._on_step_processed(second, None)
+        self.assertEqual([out.status for out, _ in self.outputs], ["retired"])
+        self.assertFalse(req.finished())
+        self.assertEqual(scheduler.req_to_token_pool.available_size(), 8)
 
     def test_parked_chunked_abort_releases_real_resources_before_receipt(self):
         scheduler = self._scheduler()
@@ -349,6 +378,29 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         self.assertTrue(req.kv.holds_kv)
         self.assertEqual(req.inflight_steps, 1)
 
+    def test_failed_receipt_delivery_is_retried_within_ttl(self):
+        self.drop_receipt_sends = 1
+        scheduler = self._scheduler()
+        req = self._req(scheduler)
+        move([req], scheduler.waiting_queue)
+        control = self._cancel(scheduler, req)
+
+        # The cached result exists, but the first delivery failed and the
+        # route is kept on the completed entry for a later scheduler step.
+        self.assertEqual(self.outputs, [])
+        entry = scheduler._cancellation_retirements[control.cancellation_id]
+        self.assertEqual(entry.status, "retired")
+        self.assertEqual(len(entry.replies), 1)
+
+        entry.next_retry_at = 0.0
+        scheduler._check_cancellation_retirements()
+        self.assertEqual([out.status for out, _ in self.outputs], ["retired"])
+        self.assertEqual(entry.replies, {})
+
+        # A frontend retry with the same operation replays the cached result.
+        self._cancel(scheduler, req)
+        self.assertEqual([out.status for out, _ in self.outputs][-1], "retired")
+
     def test_legacy_prefix_abort_and_targeted_chunk_retry_remain_separate(self):
         scheduler = self._scheduler()
         old = self._req(scheduler)
@@ -435,6 +487,42 @@ class TestSchedulerCancellationRetirement(CustomTestCase):
         scheduler.handle_cancellation_retirement(http_control)
         self.assertEqual(self.outputs[-1][0].status, "retired")
         self.assertEqual(self.outputs[-1][0].rid, other.rid)
+
+    def test_rust_receipt_redelivery_keeps_correlation_after_target_rid_reuse(self):
+        scheduler = self._scheduler()
+        target = self._req(scheduler, rid="internal-gen", instance="original")
+        move([target], scheduler.waiting_queue)
+        control = CancellationRetirementReq(
+            rid="rust-control-corr",
+            cancellation_id="rust-op",
+            request_instance_id=target.request_instance_id,
+            target_rid=target.rid,
+        )
+        self.drop_receipt_sends = 1
+        scheduler.handle_cancellation_retirement(control)
+        self.assertEqual(self.outputs, [])
+        self.assertTrue(target.kv.is_kv_released)
+        entry = scheduler._cancellation_retirements[control.cancellation_id]
+        self.assertEqual(entry.status, "retired")
+        self.assertIsNone(entry.req)
+        self.assertEqual(len(entry.replies), 1)
+
+        replacement = self._req(scheduler, rid=target.rid, instance="replacement")
+        move([replacement], scheduler.waiting_queue)
+        entry.next_retry_at = 0.0
+        scheduler._check_cancellation_retirements()
+
+        self.assertEqual(len(self.outputs), 1)
+        output, route = self.outputs[0]
+        self.assertEqual(output.status, "retired")
+        self.assertEqual(output.rid, control.rid)
+        self.assertEqual(output.request_instance_id, "original")
+        self.assertIs(route, control)
+        self.assertEqual(entry.replies, {})
+        self.assertFalse(replacement.finished())
+        self.assertIsNone(replacement.to_finish)
+        self.assertTrue(replacement.kv.holds_kv)
+        self.assertIn(replacement, scheduler.waiting_queue)
 
     def test_rust_server_presence_no_longer_excludes_retirement_scope(self):
         scheduler = self._scheduler()

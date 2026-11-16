@@ -472,6 +472,7 @@ LOAD_STALL_REFRESH_S = 0.05
 CANCELLATION_RETIREMENT_MAX_ENTRIES = 256
 CANCELLATION_RETIREMENT_TTL_S = 300.0
 CANCELLATION_RETIREMENT_MAX_ROUTES = 8
+CANCELLATION_RETIREMENT_RETRY_S = 0.5
 
 
 @dataclasses.dataclass
@@ -485,6 +486,7 @@ class _CancellationRetirement:
     )
     status: Optional[str] = None
     reason: str = ""
+    next_retry_at: float = 0.0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -6564,6 +6566,8 @@ class Scheduler(
             or self.decode_offload_manager is not None
         ):
             return "unsupported_cache_ownership"
+        if use_mlx():
+            return "unsupported_mlx_backend"
         if (
             not self.spec_algorithm.is_none()
             or self.dllm_config is not None
@@ -6589,7 +6593,7 @@ class Scheduler(
 
     def _reply_cancellation_retirement(
         self, recv_req: CancellationRetirementReq, status: str, reason: str = ""
-    ) -> None:
+    ) -> bool:
         try:
             self.send_control_output(
                 CancellationRetirementOutput(
@@ -6601,12 +6605,14 @@ class Scheduler(
                 ),
                 recv_req,
             )
+            return True
         except Exception:
-            # A lost optional receipt must not interrupt inference. The bounded
-            # result cache lets the caller retry its operation identity.
+            # A lost optional receipt must not interrupt inference. Keep the
+            # route so a later scheduler step can redeliver the cached result.
             logger.warning(
                 "Failed to send cancellation retirement receipt", exc_info=True
             )
+            return False
 
     def _complete_cancellation_retirement(
         self, entry: _CancellationRetirement, status: str, reason: str = ""
@@ -6615,8 +6621,10 @@ class Scheduler(
         entry.req = None
         entry.expires_at = time.monotonic() + CANCELLATION_RETIREMENT_TTL_S
         replies, entry.replies = entry.replies, {}
-        for recv_req in replies.values():
-            self._reply_cancellation_retirement(recv_req, status, reason)
+        for route, recv_req in replies.items():
+            if not self._reply_cancellation_retirement(recv_req, status, reason):
+                entry.replies[route] = recv_req
+                entry.next_retry_at = time.monotonic() + CANCELLATION_RETIREMENT_RETRY_S
 
     def _check_cancellation_retirements(self) -> None:
         """Observe scheduler-owned row/state and host-step retirement only.
@@ -6635,6 +6643,14 @@ class Scheduler(
             if entry.status is not None:
                 if now >= entry.expires_at:
                     del entries[operation]
+                elif entry.replies and now >= entry.next_retry_at:
+                    for route, recv_req in list(entry.replies.items()):
+                        if self._reply_cancellation_retirement(
+                            recv_req, entry.status, entry.reason
+                        ):
+                            entry.replies.pop(route, None)
+                    if entry.replies:
+                        entry.next_retry_at = now + CANCELLATION_RETIREMENT_RETRY_S
             elif now >= entry.expires_at:
                 self._complete_cancellation_retirement(
                     entry, "unknown", "receipt_expired"
@@ -6654,7 +6670,7 @@ class Scheduler(
                     entry, "unsupported", scope_error
                 )
             elif (
-                req.finished()
+                (req.finished() or req.retraction_aborted)
                 and req.inflight_steps == 0
                 and not req.kv.holds_kv
                 and not req.kv.holds_mamba
@@ -6726,7 +6742,10 @@ class Scheduler(
         batches = self._collect_inflight_batches()
         # Result intake may run between launches even without continuous input
         # polling. Include each launch's immutable snapshot in identity lookup.
-        batches.extend(batch for batch, _ in self.result_queue)
+        for item in self.result_queue:
+            # Overlap-MLX stores backend-specific pending jobs in this queue.
+            if isinstance(item, tuple) and len(item) == 2:
+                batches.append(item[0])
         for batch in batches:
             if batch is not None:
                 candidates.update(batch.reqs)

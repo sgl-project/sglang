@@ -18,7 +18,7 @@ Opt-in `wait_for_retirement_ms` (0..30000) with a nonempty `cancellation_id` (â‰
 
 **Semantics.** Capture exactly one original internal rid under the public ID before cancel; retries reuse that capture and must not recapture by public RID. Ambiguous duplicate public IDs and `abort_all` are refused for the wait mode. A wait timeout returns `success=true`, `retirement_confirmed=false`; retry the same `cancellation_id` within a bounded five-minute retention window (capacity 256). After retention expiry the server does not claim idempotency or old-target safety. Unknown or lost receipts return `FailedPrecondition` / `Unavailable`. A Generate `CANCELLED` outcome, channel closure, or load counter is not retirement. Positive confirmation covers scheduler ownership (or Intake-local proof the request was never admitted), not native/MM worker completion, PD drain, or CUDA-wide idle.
 
-**Prior art.** [PR #48624](https://github.com/sgl-project/sglang/pull/48624) provides the Python HTTP scheduler receipt implementation reused here for Rust text control.
+**Dependency.** [PR #50617](https://github.com/sgl-project/sglang/pull/50617) (replacing #48624) provides the Python HTTP and scheduler receipt implementation reused here for Rust text control. The integration includes its `44d5424d37` core, including failed-delivery retry, MLX rejection and retraction-abort retirement fences; the scheduler core should land first. Rust HTTP waiting remains unsupported; native `api.v1` uses the typed Rust integration below.
 
 This change is stacked on that unmerged PR. Its opt-in feature flag must be set
 before engine startup. The first supported scheduler scope is unified,
