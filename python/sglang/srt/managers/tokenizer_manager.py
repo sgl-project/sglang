@@ -1536,6 +1536,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "sampling_logprobs_mode can only be set when "
                     "return_sampling_mask=true."
                 )
+            if obj.return_flat_raw_sampling_mask and not obj.return_sampling_mask:
+                raise ValueError(
+                    "return_flat_raw_sampling_mask can only be set when "
+                    "return_sampling_mask=true."
+                )
 
     def _validate_joint_schema_request(
         self, obj: Union[GenerateReqInput, EmbeddingReqInput], input_ids: List[int]

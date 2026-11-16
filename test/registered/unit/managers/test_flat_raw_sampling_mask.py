@@ -73,7 +73,10 @@ def _flat_values(fields: dict, key: str) -> np.ndarray:
 
 class TestFlatRawSamplingMaskValidation(CustomTestCase):
     def test_flag_defaults_off_and_valid(self):
-        for kwargs in ({}, {"return_flat_raw_sampling_mask": True}):
+        for kwargs in (
+            {},
+            {"return_sampling_mask": True, "return_flat_raw_sampling_mask": True},
+        ):
             GenerateReqInput(text="hello", **kwargs).normalize_batch_and_arguments()
 
     def test_flag_rejects_stream(self):

@@ -304,7 +304,8 @@ class GenerateReqInput:
     # Base64-encode the flat arrays. Requires one of the two flags above.
     return_flat_raw_top_logprobs_b64: bool = False
     # Return output sampling masks as flat arrays plus row lengths instead of the
-    # nested per-token lists, on the finished response only.
+    # nested per-token lists, on the finished response only. Requires
+    # return_sampling_mask.
     return_flat_raw_sampling_mask: bool = False
     # Base64-encode those arrays. Requires return_flat_raw_sampling_mask.
     return_flat_raw_sampling_mask_b64: bool = False
