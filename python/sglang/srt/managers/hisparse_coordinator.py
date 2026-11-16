@@ -1665,15 +1665,7 @@ class HiSparseCoordinator:
         # Same for the SWA window rows (device logical-slot space as well).
         self._backup_swa_rows(req, committed_len, req_pool_idx)
 
-        # release device buffer indices (same ownership union request_finished
-        # computes; over-allocation slots carry stale -1/0 entries that are
-        # filtered out below)
-        current_cap = int(self.req_device_buffer_size[req_pool_idx])
-        if current_cap > 0:
-            side_buf_hi = self.req_to_device_buffer[req_pool_idx, :current_cap]
-            all_hi = torch.unique(side_buf_hi[side_buf_hi > 0])
-            if all_hi.numel() > 0:
-                self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
+        self._release_device_buffer(req_pool_idx)
 
         allocated_locs = self.req_to_token_pool.req_to_token[
             req_pool_idx, :allocated_len
@@ -1742,6 +1734,7 @@ class HiSparseCoordinator:
             self.req_device_buffer_tokens[
                 :, req.kv.req_pool_idx, : self.device_buffer_size
             ] = -1
+            self.spec_swap.invalidate_cache(req.kv.req_pool_idx)
         # Restore the indexer-K rows into the fresh logical slots BEFORE the
         # first forward pass: the DSA top-k selection reads the indexer K via
         # the page table over those slots, and would otherwise score garbage.
@@ -1756,6 +1749,22 @@ class HiSparseCoordinator:
         self._skip_first_backup[req.kv.req_pool_idx] = True
         req.hisparse_retraction_pending = False
         req.hisparse_staging = False
+
+    def _release_device_buffer(self, req_pool_idx: int) -> None:
+        """Release the current per-layer cache/scratch ownership exactly once."""
+        current_cap = int(self.req_device_buffer_size[req_pool_idx])
+        if current_cap > 0:
+            owned_locs = self.req_device_buffer_token_locs[
+                :, req_pool_idx, :current_cap
+            ].reshape(-1)
+            owned_locs = self.spec_swap.extend_owned_locs(req_pool_idx, owned_locs)
+            all_hi = torch.unique(owned_locs[owned_locs > 0])
+            if all_hi.numel() > 0:
+                self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
+            self.spec_swap.clear_scratch(req_pool_idx)
+        else:
+            # Before admission, scratch has not participated in any rotations.
+            self.spec_swap.free_unrotated_scratch(req_pool_idx)
 
     def _release_decode(self, req: Req):
         # release resources only after the execution of a potential overlapped batch
@@ -1775,20 +1784,9 @@ class HiSparseCoordinator:
             req_pool_idx, :allocated_len
         ]
 
-        # The spec commit kernel rotates physical locations between each
-        # layer's persistent cache and scratch.  Their current union is the
-        # request's allocation ownership; the original side-buffer row is no
-        # longer authoritative after the first rotation.
         current_cap = int(self.req_device_buffer_size[req_pool_idx])
+        self._release_device_buffer(req_pool_idx)
         if current_cap > 0:
-            owned_locs = self.req_device_buffer_token_locs[
-                :, req_pool_idx, :current_cap
-            ].reshape(-1)
-            owned_locs = self.spec_swap.extend_owned_locs(req_pool_idx, owned_locs)
-            all_hi = torch.unique(owned_locs[owned_locs > 0])
-            if all_hi.numel() > 0:
-                self.token_to_kv_pool_allocator.free_hisparse_indices(all_hi)
-
             compressed_locs = (
                 self.mem_pool_device.translate_loc_from_full_to_compressed(
                     allocated_locs
@@ -1797,11 +1795,6 @@ class HiSparseCoordinator:
             self.mem_pool_device.full_to_hisparse_device_index_mapping[
                 compressed_locs
             ] = 0
-        else:
-            # The request can finish or be aborted during prefill, before a
-            # device side buffer exists.  Its ordinary prefill mapping is still
-            # owned by release_kv_cache; only release our separate workspace.
-            self.spec_swap.free_unrotated_scratch(req_pool_idx)
 
         host_indices = self.mem_pool_host.allocated_host_indices(
             self.req_to_host_pool,
@@ -1819,7 +1812,6 @@ class HiSparseCoordinator:
         self.req_to_host_pool[req.kv.req_pool_idx, :] = -1
         self.req_to_host_pool_allocated_len[req.kv.req_pool_idx] = 0
         self.lru_slots[:, req.kv.req_pool_idx, :].copy_(self._lru_init)
-        self.spec_swap.clear_scratch(req_pool_idx)
         self._skip_first_backup[req.kv.req_pool_idx] = False
 
     def _run_swap_in_kernel(

@@ -151,6 +151,54 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
                 self.assertEqual(freed_host, set())
                 self.assertTrue(req.hisparse_retraction_pending)
 
+    def test_retract_releases_rotated_ownership_and_scratch(self):
+        """Free the current cache/scratch union, including per-layer rotations."""
+        coordinator, req, freed_device, freed_host = self._retraction_fixture()
+        coordinator.spec_swap.enabled = True
+        coordinator.spec_swap._scratch_reqs = {0}
+        coordinator.spec_swap.req_to_scratch = torch.tensor([[[8, 12]], [[9, 11]]])
+        coordinator.req_device_buffer_token_locs = torch.tensor(
+            [[[11, 9, 10]], [[8, 12, 10]]]
+        )
+        coordinator.retract_req_state_preserving(req)
+        self.assertEqual(freed_device, {8, 9, 10, 11, 12})
+        self.assertEqual(freed_host, set())
+        self.assertNotIn(0, coordinator.spec_swap._scratch_reqs)
+        self.assertEqual(coordinator.spec_swap.req_to_scratch.count_nonzero(), 0)
+
+    def test_long_resume_invalidates_spec_cache_index(self):
+        """A fresh all-miss buffer must not retain the reset's hot-token index."""
+        coordinator, req, _, _ = self._retraction_fixture()
+        coordinator.top_k = 1024
+        coordinator.device_buffer_size = 4096
+        coordinator.padded_buffer_size = 4160
+        coordinator.mem_pool_device.page_size = 64
+        coordinator.req_to_token_pool.req_to_token = torch.arange(4097).reshape(1, -1)
+        coordinator.req_to_device_buffer = torch.zeros((1, 4160), dtype=torch.int64)
+        coordinator.req_device_buffer_tokens = torch.full(
+            (2, 1, 4160), -1, dtype=torch.int32
+        )
+        coordinator.req_device_buffer_token_locs = torch.full_like(
+            coordinator.req_device_buffer_tokens, -1
+        )
+        coordinator._device_buffer_arange_i32 = torch.arange(4096, dtype=torch.int32)
+        coordinator.token_to_kv_pool_allocator.alloc_device_buffer = lambda *args: (
+            torch.arange(64, 4224)
+        )
+        coordinator.token_to_kv_pool_allocator.hisparse_attn_allocator = (
+            SimpleNamespace(alloc=lambda size: torch.arange(8192, 8192 + size))
+        )
+        coordinator.spec_swap = HiSparseSpecSwapManager(coordinator, num_draft_tokens=2)
+        req.kv.set_row_len(4097)
+        req.hisparse_retraction_pending = True
+        coordinator.resume_after_retraction(req)
+        self.assertTrue(torch.all(coordinator.spec_swap._cache_index == -1))
+        self.assertTrue(
+            torch.all(coordinator.req_device_buffer_tokens[:, 0, :4096] == -1)
+        )
+        self.assertIn(0, coordinator.spec_swap._scratch_reqs)
+        self.assertFalse(req.hisparse_retraction_pending)
+
     def test_spec_decode_reserve_allocates_logical_pages_only(self):
         logical_locs = torch.tensor([64, 65, 66, 67], dtype=torch.int64)
         allocator = SimpleNamespace(
