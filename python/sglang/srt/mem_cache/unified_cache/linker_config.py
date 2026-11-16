@@ -12,7 +12,7 @@ from typing import Any
 
 def parse_linker_load_options(
     config: dict[str, Any] | None,
-) -> tuple[str, str, float, dict[str, Any]]:
+) -> tuple[str, str, dict[str, Any]]:
     """Separate common load options from backend-specific configuration."""
     if config is not None and not isinstance(config, dict):
         raise ValueError(
@@ -21,21 +21,11 @@ def parse_linker_load_options(
     backend_config = dict(config or {})
     load_mode = backend_config.pop("load_mode", "layer_wise")
     prefetch_policy = backend_config.pop("prefetch_policy", "timeout")
-    prefetch_max_pool_ratio = backend_config.pop("prefetch_max_pool_ratio", 0.5)
     if load_mode not in ("layer_wise", "prefetch"):
         raise ValueError(f"Invalid linker load_mode: {load_mode!r}.")
     if prefetch_policy not in ("best_effort", "wait_complete", "timeout"):
         raise ValueError(f"Invalid linker prefetch_policy: {prefetch_policy!r}.")
-    if (
-        isinstance(prefetch_max_pool_ratio, bool)
-        or not isinstance(prefetch_max_pool_ratio, (int, float))
-        or not 0 < prefetch_max_pool_ratio <= 1
-    ):
-        raise ValueError(
-            "Invalid linker prefetch_max_pool_ratio: "
-            f"{prefetch_max_pool_ratio!r}; expected a number in (0, 1]."
-        )
-    return load_mode, prefetch_policy, float(prefetch_max_pool_ratio), backend_config
+    return load_mode, prefetch_policy, backend_config
 
 
 @dataclass(frozen=True)

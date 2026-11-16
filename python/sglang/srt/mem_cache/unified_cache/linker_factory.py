@@ -68,9 +68,7 @@ def create_unified_cache_linker(
     components: set[ComponentType],
     forward_stream: torch.cuda.Stream | None = None,
 ) -> UnifiedCacheLinker:
-    load_mode, prefetch_policy, prefetch_max_pool_ratio, backend_config = (
-        parse_linker_load_options(config)
-    )
+    load_mode, prefetch_policy, backend_config = parse_linker_load_options(config)
     extra_config = backend_config
     if backend == "dynamic":
         config = UnifiedCacheLinkerConfig.from_dict(
@@ -122,5 +120,4 @@ def create_unified_cache_linker(
     )
     linker.load_mode = load_mode
     linker.prefetch_policy = prefetch_policy
-    linker.prefetch_max_pool_ratio = prefetch_max_pool_ratio
     return linker
