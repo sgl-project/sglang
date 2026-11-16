@@ -8,6 +8,7 @@ import os
 import shutil
 import tempfile
 import unittest
+from unittest import mock
 
 from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import (
     HiCacheL3Cleaner,
@@ -16,6 +17,7 @@ from sglang.srt.mem_cache.storage.nixl.nixl_cleaner import (
 )
 from sglang.srt.mem_cache.storage.nixl.nixl_utils import (
     NixlBackendConfig,
+    NixlBackendSelection,
     NixlFileManager,
 )
 from sglang.test.test_utils import CustomTestCase
@@ -224,6 +226,31 @@ class TestHiCacheL3Cleaner(CustomTestCase):
 
         with self.assertRaises(ValueError):
             cfg.get_l3_cleaner_config()
+
+
+class _FailingPluginListAgent:
+    def get_plugin_list(self):
+        raise RuntimeError("plugin discovery failed")
+
+
+class TestNixlPluginSelection(CustomTestCase):
+    _PLUGIN_ENV = "SGLANG_HICACHE_NIXL_BACKEND_PLUGIN"
+
+    def test_no_active_plugin_falls_back_to_env_then_auto(self):
+        """A fully qualified config that marks no plugin active selects the
+        plugin like an empty config does: the env var, else "auto"."""
+        cfg = NixlBackendConfig({"plugin": {"posix": {"active": False}, "gds": {}}})
+        with mock.patch.dict(os.environ):
+            os.environ.pop(self._PLUGIN_ENV, None)
+            self.assertEqual(cfg.get_specified_plugin(), "auto")
+            os.environ[self._PLUGIN_ENV] = "GDS"
+            self.assertEqual(cfg.get_specified_plugin(), "GDS")
+
+    def test_create_backend_reports_plugin_listing_failure(self):
+        """A failure before the plugin list is known is reported as False, not
+        raised out of the error handler."""
+        selection = NixlBackendSelection("auto", None)
+        self.assertFalse(selection.create_backend(_FailingPluginListAgent()))
 
 
 if __name__ == "__main__":
