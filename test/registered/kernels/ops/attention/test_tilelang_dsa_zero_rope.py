@@ -8,9 +8,9 @@ import torch
 from sglang.kernels.ops.attention.dsa.dequant_k_cache import (
     _infer_dsa_dims,
     dequantize_k_cache,
-    dequantize_k_cache_paged,
+    dequantize_k_cache_paged_dsa,
 )
-from sglang.kernels.ops.attention.dsa.quant_k_cache import quantize_k_cache
+from sglang.kernels.ops.quantization.dsa_quant_k_cache import quantize_k_cache
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -48,7 +48,7 @@ class TestScaledCacheLayouts(CustomTestCase):
                 torch.testing.assert_close(restored, source, atol=0.08, rtol=0.08)
 
                 pages = torch.tensor([7, 1, 1, 4], device="cuda", dtype=torch.int32)
-                gathered = dequantize_k_cache_paged(packed, pages)
+                gathered = dequantize_k_cache_paged_dsa(packed, pages)
                 expected = restored.view(8, 1, -1)[pages]
                 torch.testing.assert_close(gathered, expected, atol=0, rtol=0)
 

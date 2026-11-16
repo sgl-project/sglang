@@ -1146,6 +1146,36 @@ def cvt_tensor_ue8m0_to_bf16(
         scales_out_x2[i] = cvt_bf16x2_ue8m0x2(scales_x2[i])
 
 
+@dsl_user_op
+def cvt_f16x2_e4m3x2(a: cutlass.Int16, *, loc=None, ip=None) -> cutlass.Int32:
+    """Packed e4m3x2 -> f16x2 (sm_89+); exact, since every e4m3 value is an f16."""
+    return cutlass.Int32(
+        llvm.inline_asm(
+            T.i32(),
+            [cutlass.Int16(a).ir_value(loc=loc, ip=ip)],
+            "cvt.rn.f16x2.e4m3x2 $0, $1;",
+            "=r,h",
+            has_side_effects=False,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
+        )
+    )
+
+
+@cute.jit
+def cvt_tensor_e4m3_to_f16(src: cute.Tensor, dst: cute.Tensor):
+    n = cute.size(src)
+    assert n % 2 == 0
+    assert cute.size(dst) == n
+    assert src.element_type.width == 8
+    assert dst.element_type == cutlass.Float16
+
+    src_x2 = cute.recast_tensor(src, dtype=cutlass.Int16)
+    dst_x2 = cute.recast_tensor(dst, dtype=cutlass.Int32)
+    for i in cutlass.range_constexpr(n // 2):
+        dst_x2[i] = cvt_f16x2_e4m3x2(src_x2[i])
+
+
 @cute.jit
 def get_batch_from_cu_tensor(idx: Int32, cu_tensor: cute.Tensor) -> Int32:
     """Binary search to determine batch from packed index in a cumulative tensor"""

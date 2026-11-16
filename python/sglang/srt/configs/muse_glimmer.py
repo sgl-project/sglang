@@ -51,12 +51,17 @@ class MuseGlimmerVisionConfig(PretrainedConfig):
         pos_emb_height: int = 32,
         pos_emb_width: int = 32,
         rope_theta: float = 10000.0,
+        head_dim: Optional[int] = None,
         **kwargs,
     ):
         self.hidden_size = hidden_size
         self.intermediate_size = intermediate_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
+        # Pinned so it survives CPU TP padding of num_attention_heads.
+        self.head_dim = (
+            head_dim if head_dim is not None else hidden_size // num_attention_heads
+        )
         self.hidden_act = hidden_act
         self.layer_norm_eps = layer_norm_eps
         self.attention_types = attention_types
@@ -140,6 +145,7 @@ class MuseGlimmerConfig(PretrainedConfig):
         self.out_hidden_size = out_hidden_size
         self.projector_hidden_act = projector_hidden_act
         self.projector_hidden_size = projector_hidden_size
+        self.padded_projector_hidden_size = projector_hidden_size
         super().__init__(
             tie_word_embeddings=tie_word_embeddings,
             bos_token_id=bos_token_id,

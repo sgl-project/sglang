@@ -34,24 +34,30 @@ from pathlib import Path
 from typing import Any, AsyncGenerator, Callable, Dict, List, Optional, Tuple, Union
 
 import aiohttp
+import msgspec
 import numpy as np
 import orjson
 import requests
 from tqdm.asyncio import tqdm
-from transformers import AutoTokenizer, PreTrainedTokenizerBase
+from transformers import PreTrainedTokenizerBase
 
 from sglang.benchmark.datasets import DatasetRow, get_dataset
 from sglang.benchmark.datasets.mooncake import get_mooncake_request_over_time
+from sglang.benchmark.goodput import (
+    GOODPUT_SLO_METRICS,
+    calculate_goodput,
+    print_goodput,
+)
 from sglang.benchmark.utils import (
     get_tokenizer,
     parse_custom_headers,
     remove_prefix,
     set_ulimit,
 )
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+from sglang.srt.constants import ROUTING_KEY_HEADER
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
+from sglang.srt.utils.auth import admin_auth_headers
 from sglang.srt.utils.network import resolve_base_url, resolve_host_port
-
-_ROUTING_KEY_HEADER = "X-SMG-Routing-Key"
 
 _EMBEDDING_UNSUPPORTED_DATASETS = {"image", "mmmu", "mooncake"}
 
@@ -326,7 +332,7 @@ async def async_request_openai_completions(
 
         headers = get_request_headers()
         if request_func_input.routing_key:
-            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
+            headers[ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -482,7 +488,7 @@ async def async_request_openai_chat_completions(
 
         headers = get_request_headers()
         if request_func_input.routing_key:
-            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
+            headers[ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -719,7 +725,7 @@ async def async_request_sglang_generate(
 
         headers = get_request_headers()
         if request_func_input.routing_key:
-            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
+            headers[ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -833,7 +839,7 @@ async def async_request_openai_embeddings(
 
         headers = get_request_headers()
         if request_func_input.routing_key:
-            headers[_ROUTING_KEY_HEADER] = request_func_input.routing_key
+            headers[ROUTING_KEY_HEADER] = request_func_input.routing_key
 
         output = RequestFuncOutput.init_new(request_func_input)
 
@@ -909,7 +915,10 @@ async def async_request_profile(api_url: str) -> RequestFuncOutput:
                 body["start_step"] = str(args.profile_start_step)
             if hasattr(args, "profile_steps") and args.profile_steps is not None:
                 body["num_steps"] = str(args.profile_steps)
-            async with session.post(url=api_url, json=body) as response:
+            headers = admin_auth_headers(getattr(args, "admin_api_key", None))
+            async with session.post(
+                url=api_url, json=body, headers=headers
+            ) as response:
                 if response.status == 200:
                     output.success = True
                 else:
@@ -1009,6 +1018,7 @@ def flush_server_cache(
     base_url: str,
     backend: str,
     flush_cache_timeout: float = _DEFAULT_SGLANG_FLUSH_CACHE_TIMEOUT,
+    admin_api_key: Optional[str] = None,
 ) -> None:
     """Flush an engine's prefix cache after benchmark warmup."""
     if backend.startswith("vllm"):
@@ -1018,7 +1028,7 @@ def flush_server_cache(
     elif backend.startswith("sglang"):
         response = requests.post(
             base_url + "/flush_cache",
-            headers=get_auth_headers(),
+            headers=admin_auth_headers(admin_api_key) or get_auth_headers(),
             params={"timeout": flush_cache_timeout},
         )
     else:
@@ -1514,7 +1524,12 @@ async def benchmark(
         "sglang" in backend and _get_bool_env_var("SGLANG_IS_IN_CI")
     ) or flush_cache
     if should_flush_cache:
-        flush_server_cache(base_url, backend, flush_cache_timeout)
+        flush_server_cache(
+            base_url,
+            backend,
+            flush_cache_timeout,
+            getattr(args, "admin_api_key", None),
+        )
 
     await asyncio.sleep(1.0)
 
@@ -1666,6 +1681,11 @@ async def benchmark(
         accept_length=accept_length,
         plot_throughput=args.plot_throughput,
     )
+    goodput = None
+    if args.goodput:
+        goodput = calculate_goodput(
+            outputs=outputs, goodput_slos=dict(args.goodput), dur_s=benchmark_duration
+        )
 
     print("\n{s:{c}^{n}}".format(s=" Serving Benchmark Result ", n=50, c="="))
     print("{:<40} {:<10}".format("Backend:", backend))
@@ -1735,6 +1755,8 @@ async def benchmark(
     print("{:<40} {:<10.2f}".format("Concurrency:", metrics.concurrency))
     if accept_length:
         print("{:<40} {:<10.2f}".format("Accept length:", accept_length))
+    if goodput:
+        print_goodput(goodput)
     print("{s:{c}^{n}}".format(s="End-to-End Latency", n=50, c="-"))
     print(
         "{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms)
@@ -1894,6 +1916,9 @@ async def benchmark(
             "max_concurrent_requests": metrics.max_concurrent_requests,
         }
 
+        if goodput:
+            result.update(msgspec.structs.asdict(goodput))
+
         if args.cache_report:
             result["cache_report"] = {
                 "total_prompt_tokens": total_prompt_tokens,
@@ -1952,13 +1977,10 @@ async def benchmark(
     return result | result_details
 
 
-def check_chat_template(model_path):
-    try:
-        tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-        return "chat_template" in tokenizer.init_kwargs
-    except Exception as e:
-        print(f"Fail to load tokenizer config with error={e}")
-        return False
+def has_chat_template(tokenizer) -> bool:
+    return bool(getattr(tokenizer, "chat_template", None)) or (
+        "chat_template" in getattr(tokenizer, "init_kwargs", {})
+    )
 
 
 def set_global_args(args_: argparse.Namespace):
@@ -2025,6 +2047,9 @@ def run_benchmark(args_: argparse.Namespace):
 
     if not hasattr(args, "cache_report"):
         args.cache_report = False
+
+    if not hasattr(args, "goodput"):
+        args.goodput = None
 
     if getattr(args, "print_requests", False):
         assert args.backend == "sglang-oai-chat"  # only support this now
@@ -2117,12 +2142,6 @@ def run_benchmark(args_: argparse.Namespace):
         print("No model specified or found. Please provide a model using `--model`.")
         sys.exit(1)
 
-    if args.backend not in _EMBEDDING_BACKENDS and not check_chat_template(args.model):
-        print(
-            "\nWARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.\n"
-            "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
-        )
-
     if (
         args.backend in _EMBEDDING_BACKENDS
         and args.dataset_name in _EMBEDDING_UNSUPPORTED_DATASETS
@@ -2165,6 +2184,11 @@ def run_benchmark(args_: argparse.Namespace):
         tokenizer_id = args.model
 
     tokenizer = get_tokenizer(tokenizer_id)
+    if args.backend not in _EMBEDDING_BACKENDS and not has_chat_template(tokenizer):
+        print(
+            "\nWARNING It is recommended to use the `Chat` or `Instruct` model for benchmarking.\n"
+            "Because when the tokenizer counts the output tokens, if there is gibberish, it might count incorrectly.\n"
+        )
     input_requests = get_dataset(args, tokenizer, model_id)
 
     # compatible with SimpleNamespace
@@ -2226,16 +2250,34 @@ def _finite_positive_float(value) -> float:
     return parsed
 
 
+def _goodput_slo(pair: str) -> Tuple[str, float]:
+    """argparse type for one --goodput KEY:VALUE entry; VALUE is in milliseconds."""
+    name, _, value = pair.partition(":")
+    if name not in GOODPUT_SLO_METRICS:
+        raise argparse.ArgumentTypeError(
+            f"expected KEY:VALUE with KEY in {', '.join(GOODPUT_SLO_METRICS)}, "
+            f"got {pair!r}"
+        )
+    return name, _finite_positive_float(value)
+
+
 def _validate_parsed_gsp_args(
     parser: argparse.ArgumentParser, args: argparse.Namespace
 ) -> None:
-    """Reject malformed GSP distribution/alpha combinations at parse time.
+    """Reject unsupported GSP argument combinations at parse time.
 
     Invoked from the CLI entry point right after ``parser.parse_args()`` so
     users see a clear argparse-style error before any server, model, or
     tokenizer setup runs and masks the real cause with an unrelated network
     failure.
     """
+    if (
+        getattr(args, "dataset_name", None) == "generated-shared-prefix"
+        and getattr(args, "tokenize_prompt", False)
+        and getattr(args, "gsp_num_turns", 1) > 1
+    ):
+        parser.error("--tokenize-prompt requires --gsp-num-turns=1")
+
     distribution = getattr(args, "gsp_group_distribution", None)
     alpha = getattr(args, "gsp_zipf_alpha", None)
     if distribution == "zipf" and alpha is None:
@@ -2455,6 +2497,16 @@ def cli_main():
         "--output-details", action="store_true", help="Output details of benchmarking."
     )
     parser.add_argument(
+        "--goodput",
+        nargs="+",
+        type=_goodput_slo,
+        default=None,
+        metavar="KEY:VALUE",
+        help="SLOs for goodput as KEY:VALUE pairs in milliseconds, with KEY in "
+        f"{', '.join(GOODPUT_SLO_METRICS)}, e.g. --goodput ttft:500 tpot:50. A request "
+        "counts toward goodput only if it succeeds and meets every given SLO.",
+    )
+    parser.add_argument(
         "--print-requests",
         action="store_true",
         help="Print requests immediately during benchmarking. Useful to quickly realize issues.",
@@ -2539,6 +2591,13 @@ def cli_main():
         action="store_true",
         help="Use Torch Profiler. The endpoint must be launched with "
         "SGLANG_TORCH_PROFILER_DIR to enable profiler.",
+    )
+    parser.add_argument(
+        "--admin-api-key",
+        type=str,
+        default=None,
+        help="The server's --admin-api-key, which --profile requires and "
+        "--flush-cache uses when the server has one (default: SGLANG_ADMIN_API_KEY).",
     )
     parser.add_argument(
         "--plot-throughput",
@@ -2715,7 +2774,7 @@ def cli_main():
     group.add_argument(
         "--gsp-send-routing-key",
         action="store_true",
-        help="Send routing key in requests via X-SMG-Routing-Key header. Requests with the same prefix share the same routing key.",
+        help="Send routing key in requests via X-SGL-Routing-Key header. Requests with the same prefix share the same routing key.",
     )
     group.add_argument(
         "--gsp-num-turns",

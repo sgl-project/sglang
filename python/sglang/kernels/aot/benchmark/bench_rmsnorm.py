@@ -13,7 +13,7 @@ import triton
 import triton.testing
 from sgl_kernel.utils import is_arch_support_pdl
 
-from sglang.utils import is_in_ci
+from sglang.srt.environ import envs
 
 # Optional imports
 try:
@@ -33,7 +33,7 @@ except ImportError:
     vllm_ops = None
     VLLM_AVAILABLE = False
 
-IS_CI = is_in_ci()
+IS_CI = envs.SGLANG_IS_IN_CI.get()
 
 
 def str2int_list(arg: str) -> List[int]:

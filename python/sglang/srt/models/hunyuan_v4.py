@@ -393,8 +393,8 @@ class HYV4Attention(DeepseekV2AttentionMLA):
     @staticmethod
     def _resolve_gate_fallback_backend() -> str:
         try:
-            from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (  # noqa: F401
-                sigmoid_gate_mul,
+            from sglang.kernels.ops.elementwise.elementwise import (  # noqa: F401
+                fused_sigmoid_mul,
             )
         except ImportError:
             return "eager"
@@ -498,11 +498,11 @@ class HYV4Attention(DeepseekV2AttentionMLA):
                 f"output shape: {tuple(gate.shape)} != {tuple(attn_out.shape)}"
             )
         if backend == "triton" and attn_out.is_cuda:
-            from sglang.kernels.ops.moe.triton_sigmoid_gate_mul import (
-                sigmoid_gate_mul,
+            from sglang.kernels.ops.elementwise.elementwise import (
+                fused_sigmoid_mul,
             )
 
-            return sigmoid_gate_mul(attn_out, gate)
+            return fused_sigmoid_mul(attn_out, gate)
         return attn_out * torch.sigmoid(gate)
 
     def prepare_attention_output_gate(self, hidden_states):
@@ -630,7 +630,7 @@ class HYV4DecoderLayer(nn.Module):
                 alt_stream=alt_stream,
                 reduce_results=False,
             )
-            if hasattr(self.mlp, "shared_experts"):
+            if self.mlp.shared_experts is not None:
                 self.mlp.shared_experts.swiglu_limit = None
         self.hc_attn_layer = HYV4HCLayer(config, f"{prefix}.hc_attn_layer")
         self.hc_mlp_layer = HYV4HCLayer(config, f"{prefix}.hc_mlp_layer")

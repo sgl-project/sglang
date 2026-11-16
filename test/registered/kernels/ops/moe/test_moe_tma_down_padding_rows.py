@@ -7,6 +7,7 @@ compared bitwise; a tolerance would hide a row mix-up.
 """
 
 import unittest
+from unittest.mock import patch
 
 import torch
 
@@ -124,6 +125,84 @@ class TestMoeTmaDownPaddingRows(CustomTestCase):
                         self.assertFalse(tma.isnan().any())
                         self.assertGreater(ref.abs().max().item(), 0.1)
                         self.assertTrue(torch.equal(tma, ref))
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 9,
+    "requires sm90+ for TMA",
+)
+class TestMoeTmaHiddenAlignment(CustomTestCase):
+    def test_unaligned_hidden_keeps_down_tma(self):
+        import importlib
+
+        from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
+        from sglang.srt.layers.moe.moe_runner.triton_utils import (
+            fused_moe_triton_config as cfg,
+        )
+        from sglang.srt.layers.moe.topk import StandardTopKOutput
+
+        moe = importlib.import_module(
+            "sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe"
+        )
+        native_invoke = moe.invoke_fused_moe_kernel
+        flags = []
+
+        def invoke(*args, **kwargs):
+            flags.append((kwargs.get("a_use_tma", False), kwargs["b_use_tma"]))
+            return native_invoke(*args, **kwargs)
+
+        with (
+            get_context().override_server_args(enable_deterministic_inference=False),
+            get_parallel().override(tp_group=None),
+        ):
+            for dtype in (torch.bfloat16, torch.float16):
+                for hidden in (256, 257, 264):
+                    with self.subTest(dtype=dtype, hidden=hidden):
+                        torch.manual_seed(hidden)
+                        x = torch.randn(129, hidden, device="cuda", dtype=dtype)
+                        w1 = (
+                            torch.randn(8, 256, hidden, device="cuda") / hidden**0.5
+                        ).to(dtype)
+                        w2 = (torch.randn(8, hidden, 128, device="cuda") / 128**0.5).to(
+                            dtype
+                        )
+                        routing = StandardTopKOutput(
+                            torch.rand(129, 2, device="cuda").softmax(-1),
+                            torch.rand(129, 8, device="cuda")
+                            .topk(2, dim=-1)
+                            .indices.to(torch.int32),
+                            torch.empty(0, device="cuda"),
+                        )
+                        runner = MoeRunnerConfig(
+                            num_experts=8,
+                            num_local_experts=8,
+                            top_k=2,
+                            inplace=False,
+                            gate_up_interleaved=False,
+                        )
+                        with patch.object(cfg, "get_moe_configs", return_value=None):
+                            reference = moe.fused_experts(x, w1, w2, routing, runner)
+                        config = cfg.get_default_config(
+                            129, 8, 128, hidden, 2, None, False
+                        )
+                        flags.clear()
+                        with (
+                            patch.object(
+                                cfg,
+                                "get_moe_configs",
+                                return_value={129: dict(config, USE_TMA=True)},
+                            ),
+                            patch.object(
+                                moe, "invoke_fused_moe_kernel", side_effect=invoke
+                            ),
+                        ):
+                            actual = moe.fused_experts(x, w1, w2, routing, runner)
+                        self.assertEqual(
+                            flags, [(False, hidden % 8 == 0), (True, True)]
+                        )
+                        self.assertGreater(reference.abs().max().item(), 0.1)
+                        self.assertTrue(torch.isfinite(actual).all())
+                        self.assertTrue(torch.equal(actual, reference))
 
 
 if __name__ == "__main__":

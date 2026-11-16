@@ -15,7 +15,6 @@
 """Inference-only Qwen3.5 model and Qwen3.5 MoE model compatible with HuggingFace weights."""
 
 import logging
-import os
 from functools import lru_cache
 from typing import Iterable, Optional, Set, Tuple, Union
 
@@ -45,9 +44,11 @@ from sglang.srt.configs.qwen3_5 import (
 )
 
 # Distributed
+from sglang.srt.distributed import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location import ModelConfigForExpertLocation
+from sglang.srt.hf_transformers import get_processor, get_rope_config
 from sglang.srt.layers.attention.mamba.mamba import mamba_v2_sharded_weight_loader
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -98,10 +99,13 @@ from sglang.srt.layers.quantization.unquant import (
     UnquantizedLinearMethod,
     bf16_gemm_dispatch,
 )
+from sglang.srt.layers.quantization.utils import validate_quant_param_compatibility
 from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -112,6 +116,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
+    maybe_remap_kv_scale_name,
     sharded_weight_loader,
 )
 from sglang.srt.models.qwen2_moe import (
@@ -126,6 +131,7 @@ from sglang.srt.models.utils import (
     WeightsMapper,
     fused_qk_gemma_rmsnorm,
     fused_qk_gemma_rmsnorm_with_gate,
+    maybe_enable_silu_fp4_quant_fusion,
 )
 from sglang.srt.runtime_context import (
     get_exec,
@@ -140,7 +146,6 @@ from sglang.srt.runtime_context import (
 # Utils
 from sglang.srt.utils import (
     LazyValue,
-    add_prefix,
     cpu_has_amx_support,
     get_bool_env_var,
     is_cpu,
@@ -149,11 +154,8 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
     is_xpu,
-    make_pp_layers,
-    set_weight_attrs,
     use_intel_amx_backend,
 )
-from sglang.srt.utils.hf_transformers_utils import get_processor, get_rope_config
 
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
@@ -183,18 +185,27 @@ _qknorm_use_alt_stream = _is_cuda or (
 _gdn_decode_fused_proj_conv = (
     _is_cuda and envs.SGLANG_ENABLE_GDN_DECODE_FUSED_PROJ_CONV.get()
 )
+_gdn_online_mxfp4 = (
+    ("in_proj_qkvz", "out_proj")
+    if envs.SGLANG_ROCM_GDN_ONLINE_MXFP4.get() and _use_aiter and _is_gfx95
+    else ()
+)
 _is_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 
 # Head-group ratios (num_v_heads // num_k_heads) served by the fused
 # split/reshape/cat Triton kernel. On AMD/aiter the ratio-8 layout is also
 # covered by the fused kernel, which removes the two `.contiguous()` copies
-# plus the `torch.cat` of the unfused fallback. On CUDA the ratio-3 dense 27B
-# layout is handled by the Triton kernel's per-head walk (the CPU fused op
+# plus the `torch.cat` of the unfused fallback. On CUDA and HIP, ratio-3
+# layouts are handled by the Triton kernel's per-head walk (the CPU fused op
 # still requires a power-of-two group). Other backends keep the original
 # tuple so their control flow is unchanged.
 _GDN_FUSED_QKVZBA_RATIOS = (
-    (1, 2, 4, 8) if _use_aiter else (1, 2, 3, 4) if _is_cuda else (1, 2, 4)
+    (1, 2, 3, 4, 8)
+    if _use_aiter
+    else (1, 2, 3, 4)
+    if (_is_cuda or _is_hip)
+    else (1, 2, 4)
 )
 
 cached_get_processor = lru_cache(get_processor)
@@ -207,33 +218,6 @@ def _disable_shared_experts_fusion() -> bool:
     # The deferred-finalize ABI needs the shared expert as a separate, gated
     # local contribution; it cannot consume a shared slot fused into routed MoE.
     return bool(uses_cutedsl_ar_fusion() or is_shared_experts_fusion_disabled())
-
-
-def _maybe_enable_silu_fp4_quant_fusion(mlp: nn.Module) -> None:
-    """Fuse SiLU+mul with the down_proj NVFP4 input quantization.
-
-    Replaces the separate act_and_mul and per-token FP4 quantize kernels with
-    one FlashInfer kernel and feeds down_proj a prequantized (fp4, scale)
-    tuple. Enabled when both dense-MLP projections use the NVFP4 (W4A4)
-    linear method; kill switch: SGLANG_DISABLE_SILU_FP4_QUANT_FUSION=1.
-    """
-    if os.environ.get("SGLANG_DISABLE_SILU_FP4_QUANT_FUSION", "0") == "1":
-        return
-    from sglang.srt.layers.quantization.modelopt_quant import ModelOptFp4LinearMethod
-
-    if not (
-        isinstance(mlp.gate_up_proj.quant_method, ModelOptFp4LinearMethod)
-        and mlp.gate_up_proj.quant_method.quant_mode == "w4a4"
-        and isinstance(mlp.down_proj.quant_method, ModelOptFp4LinearMethod)
-    ):
-        return
-    try:
-        from flashinfer import silu_and_mul_scaled_nvfp4_experts_quantize  # noqa: F401
-    except ImportError:
-        return
-    mlp._enable_silu_fp4_quant_fusion = True
-    mlp.down_proj._accepts_prequantized_fp4 = True
-    logger.info("Enabled fused SiLU+mul+FP4-quant for dense MLP down_proj input.")
 
 
 def _use_mnnvl_cutedsl_fusion(config: Qwen3_5TextConfig, is_nextn: bool) -> bool:
@@ -315,7 +299,7 @@ def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
 
 
 def _fp8_tuple_input(linear: nn.Module, num_tokens: int) -> bool:
-    """Whether the producer hands ``linear`` a per-token FP8 (q, scale) pair (SGLANG_ROCM_SMALLM_FP8_PROJ)."""
+    """Whether the producer hands ``linear`` a per-token FP8 (q, scale) pair for the gfx950 small-M FP8 GEMM."""
     scheme = getattr(linear, "scheme", None)
     return (
         _use_aiter
@@ -346,6 +330,9 @@ def _select_fused_ar_input_for_linear(hidden_states, linear: nn.Module):
 
 
 if _is_npu:
+    from sgl_kernel_npu.norm.split_qkv_rmsnorm_mrope import (
+        triton_split_qkv_rmsnorm_mrope,
+    )
     from sgl_kernel_npu.norm.split_qkv_rmsnorm_rope import (
         split_qkvgate_gemma_rmsnorm_rope,
     )
@@ -524,6 +511,22 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             prefix=add_prefix("out_proj", prefix),
         )
 
+        if _gdn_online_mxfp4 and config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
+            from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4 import (
+                AiterMxfp4OnlineLinearMethod,
+            )
+
+            # The loader quantizes these in process_weights_after_loading.
+            # gemm_a4w4 needs N, K % 256 == 0; other shapes stay BF16.
+            for name in _gdn_online_mxfp4:
+                proj = getattr(self, name)
+                if (
+                    isinstance(proj.quant_method, UnquantizedLinearMethod)
+                    and proj.weight.dtype == torch.bfloat16
+                    and all(d % 256 == 0 for d in proj.weight.shape)
+                ):
+                    proj.quant_method = AiterMxfp4OnlineLinearMethod()
+
     @staticmethod
     def _override_weight_loader(param, loader):
         """Robustly override loader for:
@@ -546,17 +549,27 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         # Fresh attribute on a normal tensor/Parameter
         set_weight_attrs(param, {"weight_loader": loader})
 
-    def _bind_packed_weight_loaders(self, module):
+    @classmethod
+    def _bind_packed_weight_loaders(cls, module):
         """Bind packed-checkpoint-aware loaders to all relevant params of a merged module."""
-        for attr_name in ("weight", "weight_scale_inv", "weight_scale", "input_scale"):
+        for attr_name in (
+            "weight",
+            "weight_scale_inv",
+            "weight_scale",
+            "input_scale",
+            "qweight",
+            "qzeros",
+            "scales",
+            "g_idx",
+        ):
             param = getattr(module, attr_name, None)
             if param is None:
                 continue
             original_loader = getattr(param, "weight_loader", None)
             if original_loader is None:
                 continue
-            wrapped_loader = self._make_packed_weight_loader(module, original_loader)
-            self._override_weight_loader(param, wrapped_loader)
+            wrapped_loader = cls._make_packed_weight_loader(module, original_loader)
+            cls._override_weight_loader(param, wrapped_loader)
 
     @staticmethod
     def _get_split_sizes_for_param(module, param, loaded_shard_id):
@@ -574,6 +587,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # One logical scale per logical shard.
             return [1 for _ in loaded_shard_id]
 
+        packed_dim = getattr(param, "packed_dim", None)
+        if packed_dim is not None and packed_dim == getattr(param, "output_dim", None):
+            # INT4 checkpoints pack several output values into each int32, so
+            # checkpoint-side split sizes must be expressed in packed units.
+            packed_factor = param.packed_factor
+            return [
+                round(module.output_sizes[idx] // packed_factor)
+                for idx in loaded_shard_id
+            ]
+
         # Normal weight / non-block quant tensor
         return [module.output_sizes[idx] for idx in loaded_shard_id]
 
@@ -589,6 +612,14 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             # Only intercept split-checkpoint tuple shards.
             # int shard_id and None should preserve original behavior.
             if isinstance(loaded_shard_id, tuple):
+                # Input-replicated / non-output-sharded parameters (such as GPTQ
+                # g_idx RowvLLMParameter) do not define output_dim and must pass
+                # straight through to the underlying loader instead of splitting.
+                if getattr(param, "output_dim", None) is None and not isinstance(
+                    param, PerTensorScaleParameter
+                ):
+                    return original_weight_loader(param, loaded_weight, loaded_shard_id)
+
                 split_sizes = cls._get_split_sizes_for_param(
                     module, param, loaded_shard_id
                 )
@@ -656,9 +687,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         *,
         parallel_group: LinearParallelGroup = "tp",
     ) -> MergedColumnParallelLinear:
-        # Qwen3.5 has separate in_proj_b and in_proj_a weights in the
-        # checkpoint, which are loaded into the fused in_proj_ba parameter
-        # via stacked_params_mapping with shard_id 0 and 1 respectively.
+        # Qwen3.5 stores in_proj_b and in_proj_a separately in checkpoints and
+        # fuses them into in_proj_ba via stacked_params_mapping (shard_id 0/1).
+        # Let quant_config decide quantized vs. unquantized init from explicit
+        # dynamic rules or checkpoint tensor precision, rather than shape.
         return MergedColumnParallelLinear(
             input_size=hidden_size,
             output_sizes=[num_v_heads, num_v_heads],
@@ -720,6 +752,10 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             and qkvz.bias is None
             and ba.bias is None
         ):
+            return
+        if qkvz.weight.device.type == "cpu" or ba.weight.device.type == "cpu":
+            # CPU offload stages registered parameters, but this derived cache
+            # would remain on the host. Keep the separate-projection path.
             return
         fused = torch.cat([qkvz.weight.data, ba.weight.data], dim=0).contiguous()
         self._fused_in_proj_qkvz_width = qkvz.weight.shape[0]
@@ -938,40 +974,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             projected_states_ba, _ = self.in_proj_ba(hs_bf16)
         return projected_states_qkvz, projected_states_ba
 
-    def _forward_xpu(
-        self,
-        backend: object,
-        projected_states_qkvz: torch.Tensor,
-        projected_states_ba: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ):
-        core_attn_out, z = backend.forward_fused_gdn(
-            self.attn,
-            forward_batch,
-            projected_states_qkvz,
-            projected_states_ba,
-        )
-
-        assert core_attn_out is not None, "XPU backend must support fused GDN"
-
-        z_shape_og = z.shape
-        # reshape input data into 2D tensor
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
-
-        # Add padding for DP-Attn
-        if core_attn_out.shape != z.shape:
-            core_attn_out_pad = torch.zeros_like(z)
-            core_attn_out_pad[: core_attn_out.shape[0], :] = core_attn_out
-            core_attn_out = core_attn_out_pad
-
-        core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
-        core_attn_out = core_attn_out.reshape(*core_attn_out.shape[:-2], -1)
-
-        output, _ = self.out_proj(core_attn_out)
-        return output
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -987,16 +989,6 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             hidden_states
         )
 
-        if _is_xpu and get_exec().mamba.linear_attn_backend == "intel_xpu":
-            from sglang.srt.model_executor.forward_context import get_attn_backend
-
-            backend = get_attn_backend()
-            backend = getattr(backend, "linear_attn_backend", backend)
-            if backend.supports_fused_gdn(self.attn, forward_batch):
-                return self._forward_xpu(
-                    backend, projected_states_qkvz, projected_states_ba, forward_batch
-                )
-
         use_strided_prefill_z = False
         packed_verify = False
         if forward_batch.forward_mode.is_target_verify():
@@ -1007,6 +999,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             packed_verify = getattr(backend, "supports_packed_verify", False)
         use_fused_proj_conv = (
             _gdn_decode_fused_proj_conv
+            and not (_is_xpu and get_exec().mamba.linear_attn_backend == "intel_xpu")
             and (forward_batch.forward_mode.is_decode() or packed_verify)
             and isinstance(projected_states_qkvz, torch.Tensor)
             and isinstance(projected_states_ba, torch.Tensor)
@@ -1028,8 +1021,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             else:
                 num_k_heads_tp = triton.cdiv(self.num_k_heads, self.attn_tp_size)
                 num_v_heads_tp = triton.cdiv(self.num_v_heads, self.attn_tp_size)
+            # The strided views feed only prefill GDN; DP-relabeled decode rows
+            # run the decode kernels, so pick the layout from the logical mode.
             use_strided_prefill_z = (
-                _is_cuda and forward_batch.forward_mode.is_extend_without_speculative()
+                _is_cuda
+                and forward_batch.logical_forward_mode.is_extend_without_speculative()
             )
             split_fn = (
                 qwen3_5_gdn_prefill_projection_views
@@ -1163,7 +1159,7 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
                 # The stage boundary completes this stage's sum.
                 reduce_results=False,
             )
-            _maybe_enable_silu_fp4_quant_fusion(self.mlp)
+            maybe_enable_silu_fp4_quant_fusion(self.mlp)
         else:
             raise ValueError(f"Invalid model type: {config.model_type}")
 
@@ -1227,6 +1223,31 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         return ffn_exit.finish(hidden_states)
 
 
+def _refreshes_rope_cos_sin(
+    config: Qwen3_5TextConfig, layer_id: int, is_nextn: bool
+) -> bool:
+    """rotary_emb is shared by all layers, so its per-forward cos/sin is refreshed
+    once, at the first full-attention layer this PP stage owns.
+
+    layer_id must be a full-attention layer; linear-attention layers near the
+    stage start would also pass the check below. Only Qwen3_5AttentionDecoderLayer
+    calls this, and it is built only for "attention" entries of layers_block_type.
+    """
+    # Drafts keep the unsplit numbering.
+    stage_start = 0
+    if not is_nextn:
+        stage_start, _ = get_pp_indices(
+            config.num_hidden_layers,
+            get_parallel().pp_rank,
+            get_parallel().pp_size,
+        )
+    owned_by_stage = layer_id >= stage_start
+    # Full-attention layers are interval apart, so only the stage's first one
+    # lies within interval of its start.
+    first_in_stage = layer_id < stage_start + config.full_attention_interval
+    return owned_by_stage and first_in_stage
+
+
 class Qwen3_5AttentionDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Full Attention."""
 
@@ -1247,6 +1268,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         self.hidden_size = config.hidden_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
         self.attn_tp_size = get_parallel().attn_tp_size
+        self.refreshes_rope_cos_sin = _refreshes_rope_cos_sin(
+            config, layer_id, is_nextn
+        )
         # A Qwen3.5 draft is rewritten to the MTP arch (model_config._config_draft_model),
         # so is_nextn marks it. Drafts are TP-sharded and do not replicate KV under DCP.
         dcp_size = 1 if is_nextn else get_parallel().attn_dcp_size
@@ -1331,6 +1355,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             prefix=f"{prefix}.attn",
             quant_config=quant_config,
         )
+        if (
+            _is_npu
+            and quant_config is not None
+            and quant_config.get_name() == "modelslim"
+        ):
+            quant_config.init_kv_cache(self.attn, prefix, qkv_proj=self.qkv_proj)
 
         # Dense MLP for non-MoE variant
         if config.model_type == "qwen3_5_text":
@@ -1509,10 +1539,34 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
         return q, k, v, gate
 
+    def forward_prepare_npu_prefill(self, positions, hidden_states):
+        rotary_emb = self.rotary_emb
+        if not getattr(rotary_emb, "mrope_section", None):
+            return self.forward_prepare_native(positions, hidden_states)
+
+        qkv, _ = self.qkv_proj(hidden_states)
+        if positions.ndim == 1:
+            positions = positions.expand(3, -1)
+        cos_sin = rotary_emb.cos_sin_cache[positions].to(qkv)
+        q, k, v, gate = triton_split_qkv_rmsnorm_mrope(
+            qkv=qkv,
+            q_weight=self.q_norm.gemma_weight,
+            k_weight=self.k_norm.gemma_weight,
+            cos_sin=cos_sin,
+            num_q_heads=self.num_heads,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_dim,
+            eps=self.q_norm.variance_epsilon,
+            mrope_section=rotary_emb.mrope_section,
+            is_interleaved=rotary_emb.mrope_interleaved,
+            rope_dim=rotary_emb.rotary_dim,
+            has_gate=self.attn_output_gate,
+        )
+        return q, k, v, gate if self.attn_output_gate else None
+
     def forward_prepare_npu(self, positions, hidden_states, forward_batch):
         qkv, _ = self.qkv_proj(hidden_states)
-        # Calculate first full attention layer ID based on config
-        if self.attn.layer_id == (self.config.full_attention_interval - 1):
+        if self.refreshes_rope_cos_sin:
             self.rotary_emb.get_cos_sin_with_position(positions)
 
         q, k, v, gate = split_qkvgate_gemma_rmsnorm_rope(
@@ -1545,11 +1599,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=hidden_states,
             )
-        if (
-            not _is_npu
-            or forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
-            or not self.attn_output_gate
-        ):
+        if _is_npu and forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed():
+            return self.forward_prepare_npu_prefill(positions, hidden_states)
+        if not _is_npu or not self.attn_output_gate:
             return self.forward_prepare_native(
                 positions=positions,
                 hidden_states=hidden_states,
@@ -1821,13 +1873,24 @@ class Qwen3_5ForCausalLM(nn.Module):
     def prepare_before_cuda_graph_capture(self, model_runner) -> None:
         if _use_aiter and self.config.model_type in _QWEN3_5_ROCM_PACKED_MODEL_TYPES:
             packed = 0
+            mxfp4 = 0
             for module in self.modules():
                 if isinstance(module, Qwen3_5GatedDeltaNet):
+                    mxfp4 += sum(
+                        hasattr(getattr(module, name, None), "mxfp4_preshuffle_tuned")
+                        for name in _gdn_online_mxfp4
+                    )
                     module.finalize_fused_in_proj()
                     packed += int(module._fused_in_proj_weight is not None)
             logger.info(
                 "Packed BF16/FP8 GDN input projection enabled for %d layers", packed
             )
+            if _gdn_online_mxfp4:
+                logger.info(
+                    "Online MXFP4 GDN %s: %d projections",
+                    ",".join(_gdn_online_mxfp4),
+                    mxfp4,
+                )
 
     def set_dflash_layers_to_capture(self, layers_to_capture: list[int]):
         self.layers_to_capture = layers_to_capture
@@ -1954,6 +2017,10 @@ class Qwen3_5ForCausalLM(nn.Module):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            if _is_npu and ".fa_" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
             layer_id = get_layer_id(name)
             if (
                 layer_id is not None
@@ -1970,6 +2037,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                     continue
 
                 name = name.replace(weight_name, param_name)
+                validate_quant_param_compatibility(name, params_dict)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -1983,6 +2051,7 @@ class Qwen3_5ForCausalLM(nn.Module):
                 weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                validate_quant_param_compatibility(name, params_dict)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -2151,6 +2220,10 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            if _is_npu and ".fa_" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
 
             layer_id = get_layer_id(name)
             if (
@@ -2185,6 +2258,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                 if "mlp.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
+                validate_quant_param_compatibility(name, params_dict)
                 # Skip loading extra parameters for GPTQ/modelopt models.
                 if name.endswith(ignore_suffixes) and name not in params_dict:
                     continue
@@ -2297,6 +2371,7 @@ class Qwen3_5MoeForCausalLM(Qwen3_5ForCausalLM):
                         # This is an expert weight but not mapped to this rank, skip all remaining processing
                         continue
 
+                    validate_quant_param_compatibility(name, params_dict)
                     # Skip loading extra parameters for GPTQ/modelopt models.
                     if name.endswith(ignore_suffixes) and name not in params_dict:
                         continue
@@ -2420,6 +2495,10 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            if _is_npu and ".fa_" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
             if (
                 self.config.tie_word_embeddings
                 and self.pp_group.is_last_rank
@@ -2447,6 +2526,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     continue
 
                 name = name.replace(weight_name, param_name)
+                validate_quant_param_compatibility(name, params_dict)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
                     continue
@@ -2465,6 +2545,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
                     name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
                     name = name.replace(r"model.visual.", r"visual.")
 
+                validate_quant_param_compatibility(name, params_dict)
                 # print(name, loaded_weight.shape)
                 # Skip loading extra bias for GPTQ models.
                 if name.endswith(".bias") and name not in params_dict:
@@ -2718,6 +2799,10 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 name = name.replace(r"model.language_model.", r"model.")
             if ".self_attn." in name:
                 name = name.replace(".self_attn", "")
+            if _is_npu and ".fa_" in name:
+                name = maybe_remap_kv_scale_name(name, params_dict)
+                if name is None:
+                    continue
             if (
                 self.config.tie_word_embeddings
                 and self.pp_group.is_last_rank
@@ -2768,6 +2853,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                 if "mlp.experts" in name:
                     continue
                 name = name.replace(weight_name, param_name)
+                validate_quant_param_compatibility(name, params_dict)
                 # Skip loading extra parameters for GPTQ/modelopt models.
                 if name.endswith(ignore_suffixes) and name not in params_dict:
                     continue
@@ -2889,6 +2975,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
                         name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
                         name = name.replace(r"model.visual.", r"visual.")
 
+                    validate_quant_param_compatibility(name, params_dict)
                     # Skip loading extra parameters for GPTQ/modelopt models.
                     if name.endswith(ignore_suffixes) and name not in params_dict:
                         continue

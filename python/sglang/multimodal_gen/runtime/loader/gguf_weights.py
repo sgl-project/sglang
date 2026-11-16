@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from sglang.srt.utils.hf_transformers import check_gguf_file
+from sglang.srt.hf_transformers import check_gguf_file
 
 if TYPE_CHECKING:
     import gguf

@@ -46,18 +46,20 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
-from sglang.srt.layers.moe.topk import TopK
+from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
+from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
 
@@ -250,6 +252,7 @@ class AfmoeMoE(nn.Module):
                 if _is_npu
                 else {}
             ),
+            output_format=TopKOutputFormat.STANDARD,
         )
 
     def pack_params(self) -> None:
@@ -389,15 +392,6 @@ class AfmoeAttention(nn.Module):
         self.k_norm = RMSNorm(self.head_dim, eps=eps)
         self.sliding_window = sliding_window
 
-    def _apply_qk_norm(
-        self, q: torch.Tensor, k: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        q_heads = self.q_norm(q.reshape(-1, self.head_dim))
-        k_heads = self.k_norm(k.reshape(-1, self.head_dim))
-        q = q_heads.view(q.shape)
-        k = k_heads.view(k.shape)
-        return q, k
-
     def forward(
         self,
         positions: torch.Tensor,
@@ -406,7 +400,13 @@ class AfmoeAttention(nn.Module):
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = self._apply_qk_norm(q, k)
+        q, k = apply_qk_norm(
+            q=q,
+            k=k,
+            q_norm=self.q_norm,
+            k_norm=self.k_norm,
+            head_dim=self.head_dim,
+        )
 
         if self.is_local_attention:
             q, k = self.rotary_emb(positions, q, k)

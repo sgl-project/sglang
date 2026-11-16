@@ -15,13 +15,13 @@ from sglang.multimodal_gen.configs.models.vaes.longcat_image import (
 )
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
-    ModelTaskType,
     TextConditioningOutput,
     pack_latents_2x2,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     get_sp_world_size,
     model_parallel_is_initialized,

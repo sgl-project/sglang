@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.ops.attention.flash_attention import flash_attn_with_kvcache
-from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.kernels.ops.attention.kv_indices import create_flashinfer_kv_indices_triton
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.layers.attention.minicpm.sparse_utils import (
     MiniCPMSparseMetadata,

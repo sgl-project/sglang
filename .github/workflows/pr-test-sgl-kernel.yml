@@ -56,7 +56,7 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda*
+          pattern: wheel-python3.11-cuda*
 
       - uses: ./.github/actions/download-rust-ext
         with:
@@ -95,7 +95,7 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda*
+          pattern: wheel-python3.11-cuda*
 
       - uses: ./.github/actions/download-rust-ext
         with:
@@ -146,7 +146,7 @@ jobs:
         with:
           path: python/sglang/kernels/aot/dist/
           merge-multiple: true
-          pattern: wheel-python3.10-cuda*
+          pattern: wheel-python3.11-cuda*
 
       - uses: ./.github/actions/download-rust-ext
         with:
@@ -181,7 +181,7 @@ jobs:
   #       with:
   #         path: python/sglang/kernels/aot/dist/
   #         merge-multiple: true
-  #         pattern: wheel-python3.10-cuda*
+  #         pattern: wheel-python3.11-cuda*
 
   #     - name: Install dependencies
   #       run: |

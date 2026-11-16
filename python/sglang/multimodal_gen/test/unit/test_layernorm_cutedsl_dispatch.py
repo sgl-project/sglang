@@ -1,22 +1,19 @@
-import sys
-from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
 
+from sglang.kernels.ops import diffusion
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     RMSNormScaleShift,
-    ScaleResidualRMSNormScaleShift,
+    ScaleResidualLayerNormScaleShift,
 )
-
-_CUTEDSL_MODULE = "sglang.kernels.ops.diffusion.norm.scale_residual_norm_cutedsl"
 
 
 @pytest.mark.parametrize("hidden_size", [257, 8448])
 @pytest.mark.parametrize(
     "layer_cls,num_inputs",
-    [(RMSNormScaleShift, 3), (ScaleResidualRMSNormScaleShift, 5)],
+    [(RMSNormScaleShift, 3), (ScaleResidualLayerNormScaleShift, 5)],
 )
 def test_cuda_falls_back_for_unsupported_hidden_size(
     hidden_size, layer_cls, num_inputs
@@ -47,9 +44,7 @@ def test_norm_scale_shift_cuda_uses_cutedsl_for_supported_hidden_size(monkeypatc
         return expected
 
     monkeypatch.setitem(
-        sys.modules,
-        _CUTEDSL_MODULE,
-        SimpleNamespace(fused_norm_scale_shift=fused_norm_scale_shift),
+        vars(diffusion), "fused_norm_scale_shift", fused_norm_scale_shift
     )
 
     assert layer.forward_cuda(x, shift, scale) is expected

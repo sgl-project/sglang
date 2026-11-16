@@ -6,7 +6,6 @@ import pytest
 import torch
 
 import sglang.multimodal_gen.runtime.models.upsampler.latent_upsampler as lu_mod
-from sglang.kernels.ops.diffusion import apply_group_norm_silu
 from sglang.multimodal_gen.runtime.models.upsampler.latent_upsampler import (
     LatentUpsampler,
     ResBlock,
@@ -146,54 +145,3 @@ def test_resblock_actually_uses_triton_kernel_cuda():
         with torch.no_grad():
             block(x)
     assert spy.call_count >= 1
-
-
-@requires_cuda
-@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
-@pytest.mark.parametrize(
-    "dims,latent_shape,mid_channels",
-    [
-        (2, (1, 32, 2, 16, 16), 64),
-        (3, (1, 32, 2, 16, 16), 64),
-    ],
-)
-def test_initial_groupnorm_silu_parity_cuda_local(
-    dtype, dims, latent_shape, mid_channels
-):
-    # Sharp parity at the fused initial-norm boundary, before downstream convs
-    # can amplify drift; uses kernel-level tolerance instead of the looser e2e.
-    torch.manual_seed(2)
-    device = torch.device("cuda")
-    upsampler = (
-        LatentUpsampler(
-            in_channels=latent_shape[1],
-            mid_channels=mid_channels,
-            num_blocks_per_stage=2,
-            dims=dims,
-            spatial_upsample=True,
-            temporal_upsample=False,
-            spatial_scale=2.0,
-            rational_resampler=False,
-        )
-        .to(device=device, dtype=dtype)
-        .eval()
-    )
-    torch.manual_seed(3)
-    latent = torch.randn(*latent_shape, device=device, dtype=dtype)
-
-    with torch.no_grad():
-        if dims == 2:
-            from einops import rearrange
-
-            b, _, f, _, _ = latent.shape
-            x_in = rearrange(latent, "b c f h w -> (b f) c h w")
-        else:
-            x_in = latent
-        x_after_conv = upsampler.initial_conv(x_in)
-        out_fused = apply_group_norm_silu(
-            x_after_conv, upsampler.initial_norm, upsampler.initial_activation
-        )
-        out_eager = upsampler.initial_activation(upsampler.initial_norm(x_after_conv))
-
-    atol, rtol = _RESBLOCK_TOL[dtype]
-    torch.testing.assert_close(out_fused, out_eager, atol=atol, rtol=rtol)

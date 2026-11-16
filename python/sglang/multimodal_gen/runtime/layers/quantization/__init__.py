@@ -5,9 +5,6 @@ from typing import Literal, get_args
 from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config import (
     QuantizationConfig,
 )
-from sglang.multimodal_gen.runtime.layers.quantization.method_names import (
-    canonical_quantization_method,
-)
 
 QuantizationMethods = Literal[
     "auto-round",
@@ -21,46 +18,12 @@ QuantizationMethods = Literal[
     "mxfp4",
     "mxfp4_npu",
     "convrot_int8",
-    # deprecated alias of convrot_int8
-    "kitchen_int8",
 ]
 
 QUANTIZATION_METHODS: list[str] = list(get_args(QuantizationMethods))
 
-# The customized quantization methods which will be added to this dict.
-_CUSTOMIZED_METHOD_TO_QUANT_CONFIG: dict[str, type[QuantizationConfig]] = {}
-
-
-def register_quantization_config(quantization: str):
-    """Register a customized vllm quantization config.
-
-    When a quantization method is not supported by vllm, you can register a customized
-    quantization config to support it.
-
-    Args:
-        quantization (str): The quantization method name.
-
-
-    """  # noqa: E501
-
-    def _wrapper(quant_config_cls):
-        if quantization in QUANTIZATION_METHODS:
-            raise ValueError(
-                f"The quantization method `{quantization}` is already exists."
-            )
-        if not issubclass(quant_config_cls, QuantizationConfig):
-            raise ValueError(
-                "The quantization config must be a subclass of `QuantizationConfig`."
-            )
-        _CUSTOMIZED_METHOD_TO_QUANT_CONFIG[quantization] = quant_config_cls
-        QUANTIZATION_METHODS.append(quantization)
-        return quant_config_cls
-
-    return _wrapper
-
 
 def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
-    quantization = canonical_quantization_method(quantization)
     if quantization not in QUANTIZATION_METHODS:
         raise ValueError(f"Invalid quantization method: {quantization}")
 
@@ -104,8 +67,6 @@ def get_quantization_config(quantization: str) -> type[QuantizationConfig]:
         "mxfp4_npu": NPUMXFP4Config,
         "convrot_int8": ConvRotInt8Config,
     }
-    # Update the `method_to_config` with customized quantization methods.
-    method_to_config.update(_CUSTOMIZED_METHOD_TO_QUANT_CONFIG)
 
     return method_to_config[quantization]
 

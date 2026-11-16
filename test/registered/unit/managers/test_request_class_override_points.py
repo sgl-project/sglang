@@ -17,7 +17,7 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     BatchTokenizedGenerateReqInput,
     GenerateReqInput,
@@ -32,7 +32,7 @@ from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.session.session_controller import Session
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 VOCAB = 128
 
@@ -127,7 +127,7 @@ class TestRequestClassOverridePoints(CustomTestCase):
         manager.model_config = SimpleNamespace(vocab_size=VOCAB)
         manager.fake_bootstrap_room_counter = 0
         manager.rid_to_state = {
-            "r0": SimpleNamespace(time_stats=APIServerReqTimeStats())
+            "r0": SimpleNamespace(time_stats=APIServerReqTimeStats(), abort_sent=False)
         }
         obj = GenerateReqInput(input_ids=[1, 2], rid="r0", sampling_params={})
 

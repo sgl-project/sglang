@@ -15,13 +15,11 @@ from sglang.multimodal_gen.configs.models.vaes.ltx_video import (
     LTXVideoVAEConfig,
     get_ltx_video_decode_scale_and_shift,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
     get_sp_world_size,
@@ -210,6 +208,7 @@ class LTX2PipelineConfig(PipelineConfig):
             keep_resident_min_available_gb=70,
             keep_resident_components=("dit",),
             auto_cfg_parallel_degree_by_num_gpus=((4, 1), (8, 1)),
+            bcg_default_pipeline_class_names=("LTX2TwoStagePipeline",),
         )
 
     def prepare_latent_shape(self, batch, batch_size, num_frames):

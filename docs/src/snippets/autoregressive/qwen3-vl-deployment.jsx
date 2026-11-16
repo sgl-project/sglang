@@ -221,7 +221,11 @@ export const Qwen3VLDeployment = () => {
     }
 
     if (hardware === 'b300') {
-      cmd += ' \\\n  --attention-backend flashinfer';
+      const attentionBackend =
+        modelsize === '4b' && quantization === 'bf16' && thinking === 'instruct'
+          ? 'trtllm_mha'
+          : 'flashinfer';
+      cmd += ` \\\n  --attention-backend ${attentionBackend}`;
       cmd += ' \\\n  --enforce-disable-flashinfer-allreduce-fusion';
     }
 
