@@ -32,10 +32,11 @@ from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_DFLASH,
     DEFAULT_TARGET_MODEL_DFLASH,
     CustomTestCase,
+    get_gpu_count,
 )
 
 # The ring needs a draft attention backend that only Blackwell serves.
-register_cuda_ci(est_time=600, stage="nightly", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=1300, stage="nightly", runner_config="4-gpu-b200")
 
 
 def _ring_eligible_draft_config(config: dict) -> dict:
@@ -173,9 +174,17 @@ class PackedNextnMixin(HiCacheUnifiedSpecStorageMixin):
     prompt_extra_tokens = 2
     max_new_tokens = 96
     draft_tokens = 4
-    # Per-page object suffixes and sizes of the class's topology: literals.
-    target_objects: dict = {}
-    draft_objects: dict = {}
+    # A floor between the accept length the draft reaches on the test
+    # prompts and the one it falls to when a reload brings no draft KV back.
+    # The EAGLE3 floor of hicache_spec_storage_common.py (7.0 of 8 draft
+    # tokens) is out of reach of a one-layer MTP draft with 4.
+    min_accept_length = None
+    # Chunk coordinates and sizes of one page at the class's topology, and
+    # the digests in front of them where they are pinned.
+    target_chunks: dict = {}
+    draft_chunks: dict = {}
+    target_digest = None
+    draft_digest = None
     nextn_args = [
         "--trust-remote-code",
         "--speculative-algorithm",
@@ -188,60 +197,88 @@ class PackedNextnMixin(HiCacheUnifiedSpecStorageMixin):
         "4",
     ]
 
+    @classmethod
+    def setUpClass(cls):
+        require_model_snapshot(cls.model)
+        super().setUpClass()
+
     def scrub_prompt(self, seed):
         return self.text_prompt(SCRUB_NOTICE)
 
     def _pages(self, objects):
-        """page hash -> {suffix: size}"""
+        """page hash -> {digest: {chunk coordinate: size}}"""
         pages = {}
         for name, (size, _) in objects.items():
-            page, suffix = name.split("_", 1)
-            pages.setdefault(page, {})[suffix] = size
+            page, digest, coordinate = name[: -len(".bin")].split("_", 2)
+            pages.setdefault(page, {}).setdefault(digest, {})[coordinate] = size
         return pages
 
-    def _assert_untouched(self, objects):
-        now = self.l3_objects()
+    def _assert_untouched(self, objects, now):
+        """Names, sizes and sha256 of earlier objects are what they were."""
         self.assertEqual({name: now.get(name) for name in objects}, objects)
         return now
 
-    def _assert_draft_meaningful(self, result):
-        """The draft is consulted and is right about some tokens, not all."""
+    def _assert_draft_at_work(self, result, label):
+        """The draft is consulted and is right about some tokens, not all:
+        above the class's floor, below the ceiling of a perfect draft."""
         verify_ct, accept_length = self.spec_stats(result)
+        print(f"{type(self).__name__} {label}: {verify_ct=} {accept_length=:.3f}")
         self.assertGreater(verify_ct, 1)
-        self.assertGreater(accept_length, 1.2)
+        self.assertGreaterEqual(accept_length, self.min_accept_length)
         self.assertLess(accept_length, self.draft_tokens)
 
+    def _assert_reloaded_elsewhere(self, result, prompt, reference, label):
+        """A hit in another process or topology: the target's output and the
+        draft's work both hold."""
+        self.assert_storage_hit(result)
+        self.assert_close_output(result, reference)
+        self.assert_kl_against_recompute(result, prompt)
+        self._assert_draft_at_work(result, label)
+        self.assertGreaterEqual(
+            self.spec_stats(result)[1], 0.9 * self.spec_stats(reference)[1]
+        )
+
+    def _audit_pages(self, objects, min_pages):
+        """Every page holds exactly its target chunks and its draft chunks,
+        each kind under one digest. Returns (target digest, draft digest)."""
+        pages = self._pages(objects)
+        self.assertGreaterEqual(len(pages), min_pages)
+        digests = {digest for chunks in pages.values() for digest in chunks}
+        (target,) = [d for d in digests if d.startswith("ukv1-")]
+        (draft,) = [d for d in digests if d.startswith("ukd1-")]
+        expected = {target: self.target_chunks, draft: self.draft_chunks}
+        for page, chunks in pages.items():
+            self.assertEqual(chunks, expected, page)
+        if self.target_digest is not None:
+            self.assertEqual((target, draft), (self.target_digest, self.draft_digest))
+        return target, draft
+
+
+class SameTopologyPackedNextn(PackedNextnMixin):
     def test_draft_kv_follows_its_pages_to_l3_and_back(self):
         prompt = self.text_prompt(NOTICE)
         salt = uuid.uuid4().hex
+        on_files = self.storage_backend == "file"
 
         # 1. Same process: the L3 hit reproduces the device-cache hit, the
         # draft's work included.
         self.launch_server(self.nextn_args)
         device_hit, storage_hit = self.reload_in_process(prompt, salt, seed=1)
-        self._assert_draft_meaningful(device_hit)
+        self._assert_draft_at_work(device_hit, "device hit")
         self.assertEqual(self.spec_stats(storage_hit), self.spec_stats(device_hit))
+        if on_files:
+            written = self.wait_for_backups()
+            target, draft = self._audit_pages(written, 2 * self.prompt_pages)
 
-        # Every page holds exactly its target chunks and its draft chunks.
-        written = self.l3_objects()
-        expected = {**self.target_objects, **self.draft_objects}
-        pages = self._pages(written)
-        self.assertGreaterEqual(len(pages), 2 * self.prompt_pages)
-        for page, chunks in pages.items():
-            self.assertEqual(chunks, expected, page)
-
-        # 2. After a restart the pages come back with their draft KV.
+        # 2. After a restart the pages come back with their draft KV, and
+        # reading leaves every object as it was.
         self.launch_server(self.nextn_args)
-        restarted = self.generate(prompt, salt)
-        self.assert_storage_hit(restarted)
-        self.assert_close_output(restarted, device_hit)
-        self.assert_kl_against_recompute(restarted, prompt)
-        self.assertGreaterEqual(
-            self.spec_stats(restarted)[1], 0.9 * self.spec_stats(device_hit)[1]
+        self._assert_reloaded_elsewhere(
+            self.generate(prompt, salt), prompt, device_hit, "after restart"
         )
-        # Backups are asynchronous: take stock once the server is down.
-        self.stop_server()
-        written = self._assert_untouched(written)
+        if on_files:
+            written = self._assert_untouched(written, self.wait_for_backups())
+            self._audit_pages(written, 2 * self.prompt_pages)
 
         # 3. Another draft: a miss on the draft chunk alone. The reader
         # recomputes, adds its own draft chunks and leaves the target's.
@@ -250,33 +287,34 @@ class PackedNextnMixin(HiCacheUnifiedSpecStorageMixin):
         missed = self.generate(prompt, salt)
         self.assertEqual(missed["meta_info"]["cached_tokens"], 0)
         self.flush_cache()
-        backfilled = self.generate(prompt, salt)
-        self.assert_storage_hit(backfilled)
-        self.stop_server()
-        now = self._assert_untouched(written)
+        self.assert_storage_hit(self.generate(prompt, salt))
+        if not on_files:
+            return
+        now = self._assert_untouched(written, self.wait_for_backups())
         added = self._pages({name: now[name] for name in now if name not in written})
-        draft_sizes = sorted(self.draft_objects.values())
         backfilled_pages = 0
         for page, chunks in added.items():
-            drafts = {s: size for s, size in chunks.items() if s.startswith("ukd1-")}
-            # Draft chunks of another draft digest, never the first draft's.
-            self.assertEqual(sorted(drafts.values()), draft_sizes, page)
-            self.assertFalse(set(drafts) & set(self.draft_objects), chunks)
-            targets = {s: size for s, size in chunks.items() if s not in drafts}
-            if targets:
+            # Draft chunks under another digest, never the first draft's.
+            (other,) = [d for d in chunks if d.startswith("ukd1-")]
+            self.assertNotEqual(other, draft)
+            self.assertEqual(chunks[other], self.draft_chunks, page)
+            if len(chunks) == 1:
+                backfilled_pages += 1
+            else:
                 # A page this reader was first to compute (the generated
                 # tail can differ between a cold and a cached run).
-                self.assertEqual(targets, self.target_objects, page)
-            else:
-                backfilled_pages += 1
+                self.assertEqual(
+                    chunks, {other: self.draft_chunks, target: self.target_chunks}
+                )
         self.assertGreaterEqual(backfilled_pages, self.prompt_pages)
 
-        # 4. Control: with every draft object of the first draft zeroed, the
-        # pages still hit and the output holds, and the draft's work shows
-        # the loss. Without this, step 1 would not prove that draft KV is
-        # what came back.
+        # 4. Control: with every object of the first draft zeroed, the pages
+        # still hit and the output holds, and the draft's work shows the
+        # loss. Without this, step 1 would not prove that draft KV is what
+        # came back.
+        self.stop_server()
         for name in written:
-            if name.split("_", 1)[1] in self.draft_objects:
+            if f"_{draft}_" in name:
                 path = os.path.join(self.storage_path, name)
                 with open(path, "r+b") as f:
                     f.write(bytes(os.path.getsize(path)))
@@ -284,25 +322,104 @@ class PackedNextnMixin(HiCacheUnifiedSpecStorageMixin):
         degraded = self.generate(prompt, salt)
         self.assert_storage_hit(degraded)
         self.assert_close_output(degraded, device_hit)
+        verify_ct, accept_length = self.spec_stats(degraded)
+        print(f"{type(self).__name__} zeroed drafts: {verify_ct=} {accept_length=:.3f}")
         self.assertNotEqual(self.spec_stats(degraded), self.spec_stats(device_hit))
-        self.assertLess(
-            self.spec_stats(degraded)[1], 0.9 * self.spec_stats(device_hit)[1]
-        )
+        self.assertLess(accept_length, 0.9 * self.spec_stats(device_hit)[1])
+        self.assertLess(accept_length, self.min_accept_length)
 
 
-class TestUnifiedKeysPackedNextnMHA(PackedNextnMixin, CustomTestCase):
-    """MiMo-7B: 36 layers x 8 kv heads x 128, one bundled MTP layer, TP1."""
+# MiMo-7B: 36 layers x 8 kv heads x 128 in bfloat16, one bundled MTP layer.
+# Measured on B200: accept length 2.13 and 2.00 on the two prompts, 1.85 with
+# the draft objects zeroed.
+MIMO = "XiaomiMiMo/MiMo-7B-RL"
+MIMO_MIN_ACCEPT_LENGTH = 1.95
+MIMO_LAYER_BYTES_PER_HEAD = 2 * PAGE_SIZE * 128 * 2
 
-    model = "XiaomiMiMo/MiMo-7B-RL"
-    target_objects = {
-        "ukv1-0934a4e4e4ce8776_L0-36_H0.bin": 36 * 2 * PAGE_SIZE * 8 * 128 * 2
-    }
-    draft_objects = {"ukd1-044423b746c1f19a_D0-1_H0.bin": 2 * PAGE_SIZE * 8 * 128 * 2}
+
+class TestUnifiedKeysPackedNextnMHA(SameTopologyPackedNextn, CustomTestCase):
+    """One rank owns all 8 heads: one target chunk and one draft chunk a page."""
+
+    model = MIMO
+    min_accept_length = MIMO_MIN_ACCEPT_LENGTH
+    target_chunks = {"L0-36_H0": 36 * 8 * MIMO_LAYER_BYTES_PER_HEAD}
+    draft_chunks = {"D0-1_H0": 8 * MIMO_LAYER_BYTES_PER_HEAD}
+    # The target digest is the one of a deployment without speculation.
+    target_digest = "ukv1-0934a4e4e4ce8776"
+    draft_digest = "ukd1-044423b746c1f19a"
+
+
+class TestUnifiedKeysPackedNextnMooncake(SameTopologyPackedNextn, CustomTestCase):
+    """The same flow on Mooncake, where a test cannot list or alter objects."""
+
+    model = MIMO
+    min_accept_length = MIMO_MIN_ACCEPT_LENGTH
+    storage_backend = "mooncake"
+    expected_storage_backend = "MooncakeStore"
+
+
+class TestUnifiedKeysPackedNextnMLA(SameTopologyPackedNextn, CustomTestCase):
+    """GLM-4.7-Flash: 47 layers of 576-wide latent KV, replicated across
+    ranks, so the chunks carry no head coordinate. Measured on B200: accept
+    length 2.74, and 2.18 with the draft objects zeroed."""
+
+    model = "zai-org/GLM-4.7-Flash"
+    min_accept_length = 2.5
+    nextn_args = [
+        *PackedNextnMixin.nextn_args,
+        "--attention-backend",
+        "trtllm_mla",
+    ]
+    target_chunks = {"L0-47": 47 * PAGE_SIZE * 576 * 2}
+    draft_chunks = {"D0-1": PAGE_SIZE * 576 * 2}
 
     @classmethod
     def setUpClass(cls):
-        require_model_snapshot(cls.model)
+        if not is_sm100_supported():
+            raise unittest.SkipTest("trtllm_mla needs Blackwell")
         super().setUpClass()
+
+
+@unittest.skipUnless(get_gpu_count() >= 2, "Requires 2 GPUs for the TP2 server")
+class TestUnifiedKeysPackedNextnCrossTP(PackedNextnMixin, CustomTestCase):
+    """8 kv heads in 2-head chunks: a TP2 rank owns 2 of them, a TP1 rank 4,
+    for the target layers and for the draft layer alike."""
+
+    model = MIMO
+    min_accept_length = MIMO_MIN_ACCEPT_LENGTH
+    unified_server_args = ["--hicache-storage-head-partition", "2"]
+    target_chunks = {
+        f"L0-36_H{g}": 36 * 2 * MIMO_LAYER_BYTES_PER_HEAD for g in range(4)
+    }
+    draft_chunks = {f"D0-1_H{g}": 2 * MIMO_LAYER_BYTES_PER_HEAD for g in range(4)}
+
+    def test_draft_kv_moves_between_tp2_and_tp1(self):
+        prompt_a, prompt_b = self.text_prompt(NOTICE), self.text_prompt(SCRUB_NOTICE)
+        salt_a, salt_b = uuid.uuid4().hex, uuid.uuid4().hex
+        tp2 = [*self.nextn_args, "--tp-size", "2"]
+
+        self.launch_server(tp2)
+        tp2_hit, _ = self.reload_in_process(prompt_a, salt_a, seed=1)
+        self._assert_draft_at_work(tp2_hit, "TP2 device hit")
+        written = self.wait_for_backups()
+        self._audit_pages(written, 2 * self.prompt_pages)
+
+        # TP1 assembles its pages from both TP2 ranks' chunks.
+        self.launch_server(self.nextn_args)
+        self._assert_reloaded_elsewhere(
+            self.generate(prompt_a, salt_a), prompt_a, tp2_hit, "TP1 reads TP2"
+        )
+        tp1_hit, _ = self.reload_in_process(prompt_b, salt_b, seed=2)
+        written = self._assert_untouched(written, self.wait_for_backups())
+        self._audit_pages(written, 3 * self.prompt_pages)
+
+        # And each TP2 rank takes its half of what TP1 wrote.
+        self.launch_server(tp2)
+        self._assert_reloaded_elsewhere(
+            self.generate(prompt_b, salt_b), prompt_b, tp1_hit, "TP2 reads TP1"
+        )
+        written = self._assert_untouched(written, self.wait_for_backups())
+        self._audit_pages(written, 3 * self.prompt_pages)
 
 
 if __name__ == "__main__":

@@ -10,6 +10,7 @@ import math
 import os
 import random
 import tempfile
+import time
 import unittest
 import uuid
 from typing import Dict, List, Optional
@@ -70,10 +71,22 @@ class HiCacheUnifiedSpecStorageMixin:
     def setUpClass(cls):
         cls._storage_dir = tempfile.TemporaryDirectory(prefix="hicache_unified_spec_")
         cls.storage_path = cls._storage_dir.name
+        cls.mooncake = None
+        if cls.storage_backend == "mooncake":
+            from sglang.test.mooncake_utils import MooncakeTestServices
+
+            # The store lives in the external client, so pages survive the
+            # servers that a test starts and stops.
+            cls.mooncake = MooncakeTestServices(
+                protocol="tcp", store_segment_size=16 << 30
+            )
+            cls.mooncake.start()
 
     @classmethod
     def tearDownClass(cls):
         cls.stop_server()
+        if cls.mooncake is not None:
+            cls.mooncake.stop()
         cls._storage_dir.cleanup()
 
     @classmethod
@@ -113,6 +126,7 @@ class HiCacheUnifiedSpecStorageMixin:
         env = {
             **os.environ,
             "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.storage_path,
+            **(cls.mooncake.server_env() if cls.mooncake is not None else {}),
         }
         cls.process = popen_launch_server(
             cls.model,
@@ -262,6 +276,27 @@ class HiCacheUnifiedSpecStorageMixin:
         self.assert_storage_hit(storage_hit)
         self.assert_same_output(storage_hit, device_hit)
         return device_hit, storage_hit
+
+    def wait_for_backups(self, timeout: float = 120.0) -> Dict[str, tuple]:
+        """The file backend's objects once the server has stopped writing.
+
+        Backups run behind the requests. Stopping a server in the middle of
+        one leaves a page without some of its chunks, so wait until the
+        directory has not changed for a few seconds.
+        """
+        deadline = time.monotonic() + timeout
+        listing, stable_since = None, time.monotonic()
+        while time.monotonic() < deadline:
+            current = {
+                name: os.path.getsize(os.path.join(self.storage_path, name))
+                for name in os.listdir(self.storage_path)
+            }
+            if current != listing:
+                listing, stable_since = current, time.monotonic()
+            elif time.monotonic() - stable_since >= 5:
+                return self.l3_objects()
+            time.sleep(1)
+        self.fail("the L3 store kept changing")
 
     def l3_objects(self) -> Dict[str, tuple]:
         """name -> (size, sha256) of every object of the file backend."""
