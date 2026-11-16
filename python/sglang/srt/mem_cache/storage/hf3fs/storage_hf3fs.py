@@ -2,6 +2,7 @@ import atexit
 import concurrent.futures
 import json
 import logging
+import os
 import signal
 import threading
 import time
@@ -12,7 +13,6 @@ from typing import Any, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
@@ -307,7 +307,7 @@ class HiCacheHF3FS(HiCacheStorage):
 
         mla_unsupported_msg = f"MLA model is not supported without global metadata server, please refer to https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/mem_cache/storage/hf3fs/docs/deploy_sglang_3fs_multinode.md"
 
-        config_path = envs.SGLANG_HICACHE_HF3FS_CONFIG_PATH.get()
+        config_path = os.getenv(HiCacheHF3FS.default_env_var)
         if not config_path:
             if is_mla_model:
                 raise ValueError(mla_unsupported_msg)
