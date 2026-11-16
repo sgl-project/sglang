@@ -277,7 +277,7 @@ class TestNPUImageDecodeModes(unittest.TestCase):
             _processor=object(),
             gpu_image_decode=True,
             image_processor_backend="pil",
-            mm_feature_transport="cpu",
+            _feature_transport=SimpleNamespace(mm_feature_transport="cpu"),
             image_config={},
             video_config={},
             audio_config={},

@@ -7,6 +7,7 @@ import torch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import _resolve_dflash_draft_kv_ring
+from sglang.srt.disaggregation.utils import draft_kv_ring_row_pairs
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.server_args import ServerArgs
@@ -68,9 +69,22 @@ class TestResolveDraftKVRing(CustomTestCase):
                 args = _args(speculative_draft_attention_backend=backend)
                 self.assertTrue(self._resolve(args))
 
+    def test_on_under_pd_over_mooncake(self):
+        with _switch():
+            args = _args(
+                disaggregation_mode="decode", disaggregation_transfer_backend="mooncake"
+            )
+            self.assertTrue(self._resolve(args))
+
     def test_off_by_launch_flags_without_loading_the_draft(self):
         cases = {
-            "prefill": _args(disaggregation_mode="prefill"),
+            "prefill over nixl": _args(
+                disaggregation_mode="prefill", disaggregation_transfer_backend="nixl"
+            ),
+            "decode host receive": _args(
+                disaggregation_mode="decode",
+                disaggregation_decode_host_receive_threshold=0.5,
+            ),
             "unified": _args(enable_unified_memory=True),
             "flashinfer": _args(speculative_draft_attention_backend="flashinfer"),
         }
@@ -101,7 +115,10 @@ class TestResolveDraftKVRing(CustomTestCase):
 
     def test_explicit_on_where_not_served_is_an_error(self):
         with _switch(True), self.assertRaises(ValueError):
-            self._resolve(_args(disaggregation_mode="prefill"), draft_cfg=None)
+            args = _args(
+                disaggregation_mode="prefill", disaggregation_transfer_backend="nixl"
+            )
+            self._resolve(args, draft_cfg=None)
 
     def test_explicit_off_is_kept(self):
         with _switch(False):
@@ -110,9 +127,10 @@ class TestResolveDraftKVRing(CustomTestCase):
 
 WINDOW_LEFT = 1023
 BLOCK = 8
+_NO_MEM_POOL = SimpleNamespace(maybe_get_custom_mem_pool=lambda: None)
 
 
-def _ring(dcp, req_to_token_rows=4):
+def _ring(dcp, req_to_token_rows=4, dcp_rank=0, pool=_NO_MEM_POOL):
     return DFlashDraftKVRing(
         rows_per_req=draft_kv_ring_rows_per_req(
             window_left=WINDOW_LEFT, block_size=BLOCK, dcp_size=dcp
@@ -120,6 +138,9 @@ def _ring(dcp, req_to_token_rows=4):
         dcp_size=dcp,
         req_to_token_rows=req_to_token_rows,
         device="cpu",
+        window_left=WINDOW_LEFT,
+        dcp_rank=dcp_rank,
+        pool=pool,
     )
 
 
@@ -169,6 +190,65 @@ class TestDraftKVRingLayout(CustomTestCase):
         self.assertEqual(pool.alloc_rows(1), [slot])
         ring.record_floors([req], [5], pool.req_generation)
         self.assertEqual(int(ring.min_pos[slot]), 5)
+
+
+class TestDraftKVRingPDTransfer(CustomTestCase):
+    def _received(self, prefill_dcp, decode_dcp, seq_len):
+        received = {}
+        for rank in range(decode_dcp):
+            src_rank = rank if prefill_dcp == decode_dcp else 0
+            prefill = _ring(prefill_dcp, req_to_token_rows=8, dcp_rank=src_rank)
+            decode = _ring(decode_dcp, req_to_token_rows=8, dcp_rank=rank)
+            src, dst = draft_kv_ring_row_pairs(
+                prefill.transfer_rows(3, seq_len).tolist(),
+                decode.transfer_rows(5, seq_len).tolist(),
+            )
+            first = max(0, seq_len - WINDOW_LEFT - 1)
+            positions = [p for p in range(first, seq_len) if p % decode_dcp == rank]
+            received[rank] = (positions, src, dst, prefill, decode)
+        return received
+
+    def test_each_decode_rank_gets_the_window_positions_it_owns(self):
+        for prefill_dcp, decode_dcp in ((1, 8), (8, 8)):
+            for seq_len in (5, WINDOW_LEFT + 1, 5000):
+                with self.subTest(prefill=prefill_dcp, decode=decode_dcp, L=seq_len):
+                    received = self._received(prefill_dcp, decode_dcp, seq_len)
+                    for positions, src, dst, prefill, decode in received.values():
+                        pos = torch.tensor(positions, dtype=torch.int64)
+                        # The rows each side's own locs give those positions.
+                        self.assertEqual(
+                            src,
+                            (
+                                prefill.locs(torch.full_like(pos, 3), pos)
+                                // prefill_dcp
+                            ).tolist(),
+                        )
+                        self.assertEqual(
+                            dst,
+                            (
+                                decode.locs(torch.full_like(pos, 5), pos) // decode_dcp
+                            ).tolist(),
+                        )
+
+    def test_buffer_infos_address_one_ring_row_per_item(self):
+        page_size = 64
+        pool = SimpleNamespace(
+            page_size=page_size,
+            maybe_get_custom_mem_pool=lambda: None,
+            get_contiguous_buf_infos=lambda: (
+                [1000, 2000],
+                [page_size * 576 * 10, page_size * 576 * 10],
+                [page_size * 576, page_size * 576],
+            ),
+        )
+        ring = _ring(8, pool=pool)
+        self.assertEqual(
+            ring.ring_buf_infos(),
+            ([1000, 2000], [page_size * 5760] * 2, [576, 576]),
+        )
+        ptrs, lens, item_lens = ring.floor_buf_infos()
+        self.assertEqual(ptrs, [ring.min_pos.data_ptr()])
+        self.assertEqual((lens, item_lens), ([4 * 4], [4]))
 
 
 if __name__ == "__main__":

@@ -19,6 +19,10 @@ from sglang.kernels.ops.speculative.cache_locs import (
 from sglang.kernels.ops.speculative.eagle import (
     fill_accept_out_cache_loc_func,
 )
+from sglang.kernels.plugin_kernels.nvidia.spec import (
+    RecurrentCommitIO,
+    SupportsRecurrentCommit,
+)
 from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.configs.draft_parallel import DraftParallelLayout
 from sglang.srt.configs.hybrid_arch import mambaish_config
@@ -29,6 +33,7 @@ from sglang.srt.distributed.parallel_state import (
     patch_tensor_parallel_group,
 )
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia.binding import built_megakernel
 from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.cp.base import disable_cp_strategy
 from sglang.srt.managers.schedule_batch import set_mamba_track_indices_from_reqs
@@ -44,7 +49,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     is_cuda,
     is_hip,
-    is_musa,
     is_npu,
     is_xpu,
     next_power_of_2,
@@ -57,7 +61,6 @@ from sglang.srt.utils.nvtx_utils import profile_range
 _is_cuda = is_cuda()
 _is_hip = is_hip()
 _is_npu = is_npu()
-_is_musa = is_musa()
 _is_xpu = is_xpu()
 
 if TYPE_CHECKING:
@@ -283,6 +286,28 @@ def sample_draft_proposal(
     return probs, topk_p, topk_index
 
 
+def scatter_draft_probs_to_target_vocab(
+    draft_probs: torch.Tensor,
+    hot_token_id: torch.Tensor,
+    target_vocab_size: int,
+) -> torch.Tensor:
+    """Map reduced-vocabulary probabilities onto target token ids.
+
+    ``hot_token_id`` maps the draft head's columns to target vocabulary columns.
+    Columns outside the hot vocabulary have zero probability. The result is fp32,
+    and the caller owns it independently of later calls.
+    """
+    out = torch.zeros(
+        (*draft_probs.shape[:-1], target_vocab_size),
+        dtype=torch.float32,
+        device=draft_probs.device,
+    )
+    # hot_token_id must contain unique target IDs.
+    # index_copy_ accepts the 1-D vocabulary map directly.
+    out.index_copy_(-1, hot_token_id, draft_probs.to(torch.float32))
+    return out
+
+
 # Simulate acceptance length for benchmarking purposes
 SIMULATE_ACC_LEN = envs.SGLANG_SIMULATE_ACC_LEN.get()  # turn off if < 0
 SIMULATE_ACC_METHOD = envs.SGLANG_SIMULATE_ACC_METHOD.get()
@@ -312,9 +337,6 @@ def check_simulate_acc_token_mode() -> None:
 
 
 TREE_TRAVERSE_TIME_THRESHOLD = 1  # TODO: set this properly
-TREE_SPEC_KERNEL_AVAILABLE = (
-    _is_cuda or _is_musa
-)  # This kernel is only available for CUDA and MUSA now
 
 
 def draft_kv_indices_buffer_width(
@@ -1111,6 +1133,9 @@ def prepare_mamba_track_for_verify(batch: ScheduleBatch) -> None:
     """
     if not get_exec().mamba.enable_mamba_extra_buffer:
         return
+    if not batch.token_to_kv_pool_allocator.state.tracks_decode_state:
+        batch.mamba_track_indices = batch.mamba_track_mask = None
+        return
     track_positions = None
     if get_exec().mamba.enable_mamba_extra_buffer_lazy:
         track_positions = batch.mamba_lazy_spec_track_positions_cpu
@@ -1237,6 +1262,39 @@ def commit_mamba_states_after_verify(
     else:
         last_correct_step_indices, mamba_steps_to_track = prepared_step_indices
 
+    built = built_megakernel(model_runner.model)
+    if isinstance(built, SupportsRecurrentCommit):
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            commit_ple_states_after_verify,
+        )
+
+        if state_slots is None:
+            state_slots = model_runner.attn_backend.forward_state_slots(
+                bs, batch.mamba_track_indices
+            )
+        working = state_slots.working[:bs]
+        track = None if batch.mamba_track_indices is None else state_slots.track[:bs]
+        io = RecurrentCommitIO(
+            state_slots=working,
+            track_slots=track,
+            request_rows=batch.req_pool_indices[:bs],
+            accept_lens=accept_lens,
+            last_step=last_correct_step_indices,
+            track_steps=mamba_steps_to_track,
+            draft_token_num=draft_token_num,
+            src_indices_raw=src_indices_raw,
+        )
+        if built.commit_recurrent_state(io):
+            commit_ple_states_after_verify(
+                model_runner.token_to_kv_pool.layer_router,
+                working,
+                last_correct_step_indices,
+                track,
+                mamba_steps_to_track,
+                src_indices_raw,
+            )
+            return
+
     replay_state_indices = replay_track_indices = None
     if mamba_pool is not None and (
         mamba_pool.replayssm_spec_fold or mamba_pool.replayssm_cache_base is not None
@@ -1245,8 +1303,8 @@ def commit_mamba_states_after_verify(
             commit_ple_states_after_verify,
         )
 
-        # Persistent destinations are state slots; replay/scratch rows still
-        # index requests.
+        # Persistent destinations are state slots; a request-scoped ring is
+        # indexed by the rows the forward resolved (`ForwardStateSlots.ring`).
         if state_slots is None:
             state_slots = model_runner.attn_backend.forward_state_slots(
                 bs, batch.mamba_track_indices
@@ -1299,6 +1357,8 @@ def commit_mamba_states_after_verify(
         )
 
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
+        assert state_slots.ring is not None, "the GDN ring is indexed per request"
+        replay_indices = state_slots.ring[:bs]
         # Advance the request cursors by the accepted count (incl. the bonus
         # token), fold capacity rows into `temporal`, and roll back conv.
         commit_gdn_replayssm_after_verify(
@@ -1307,7 +1367,7 @@ def commit_mamba_states_after_verify(
             cache_base=mamba_pool.replayssm_cache_base,
             is_flush=mamba_pool.replayssm_is_flush,
             state_batch_indices=replay_state_indices,
-            replay_indices=batch.req_pool_indices,
+            replay_indices=replay_indices,
             accept_lens=accept_lens,
             last_correct_step_indices=last_correct_step_indices,
             max_spec_len=draft_token_num,
@@ -1345,7 +1405,9 @@ def commit_mamba_states_after_verify(
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
         ring_indices = None
         if mamba_pool.replayssm_request_ring:
-            ring_indices = batch.req_pool_indices[: replay_state_indices.shape[0]]
+            # The ring rows the forward resolved, never the live request table.
+            assert state_slots.ring is not None, "request-scoped ring without rows"
+            ring_indices = state_slots.ring[: replay_state_indices.shape[0]]
         commit_kda_replayssm_after_verify(
             spec_state=spec_state,
             state_batch_indices=replay_state_indices,
@@ -1389,6 +1451,7 @@ def relayed_commit_state_slots(
     return ForwardStateSlots(
         state_ids.ids(req_pool.get_mamba_indices(batch.req_pool_indices)),
         None if track is None else state_ids.ids(track),
+        model_runner.runner_ids.request_ids().ids(batch.req_pool_indices),
     )
 
 
@@ -1396,7 +1459,10 @@ def spec_prepare_for_decode(batch: ScheduleBatch) -> None:
     """eagle/ngram share a stateless free function; dflash keeps stateful
     prep on its draft input -- the dispatcher routes.
     """
-    if get_exec().mamba.enable_mamba_extra_buffer_lazy:
+    if (
+        get_exec().mamba.enable_mamba_extra_buffer_lazy
+        and batch.token_to_kv_pool_allocator.state.tracks_decode_state
+    ):
         # Scheduler phase (outside forward isolation).
         batch.mamba_lazy_spec_prepare(
             mamba_track_grid(batch.tree_cache.page_size),
