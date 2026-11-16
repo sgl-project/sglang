@@ -395,8 +395,10 @@ class ExaoneMoEAttention(nn.Module):
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
+            # config.sliding_window counts the current token; the layer's
+            # window is the number of earlier tokens.
             sliding_window_size=(
-                config.sliding_window if self.sliding_window else None
+                config.sliding_window - 1 if self.sliding_window else None
             ),
         )
         self.layer_id = layer_id
