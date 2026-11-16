@@ -1587,7 +1587,6 @@ class MultiHeadedAttention(nn.Module):
         self.linear_v = nn.Linear(n_value, attention_inner_dim // group_size)
         self.linear_out = nn.Linear(attention_inner_dim // group_size, n_value)
 
-        self.attn = torch.jit.Attribute(None, Optional[Tensor])
         self.dropout = nn.Dropout(p=dropout_rate)
         self.dropout_rate = dropout_rate
         self.use_pt_scaled_dot_product_attention = use_pt_scaled_dot_product_attention
@@ -1692,8 +1691,6 @@ class MultiHeadedAttention(nn.Module):
                 scores = scores + relative_attention_bias
 
             attn = masked_softmax(scores, mask)  # (batch, head, time1, time2)
-
-            self.attn = attn
 
             p_attn = self.dropout(attn)
             x = torch.matmul(p_attn.to(v.dtype), v)  # (batch, head, time1, d_k)
