@@ -400,6 +400,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s.max_running_requests = 4
         s.enable_lora = False
         s.enable_hicache_storage = False
+        s.enable_unified_cache_external_linker = False
         s.enable_lmcache = False
         s.truncation_align_size = None
         s._add_request_to_queue = Mock()

@@ -361,6 +361,7 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.enable_hisparse = False
         scheduler.enable_hierarchical_cache = False
         scheduler.enable_lmcache = False
+        scheduler.enable_unified_cache_external_linker = False
         scheduler.draft_worker = None
         scheduler.request_receiver = object.__new__(SchedulerRequestReceiver)
         scheduler.deferred_responses = DeferredResponses(
