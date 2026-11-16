@@ -1577,6 +1577,47 @@ class HiSparseCoordinator:
         restore_done.synchronize()
         req.hisparse_indexer_backup = None
 
+    def _backup_retraction_tail(self, req: Req) -> None:
+        """Flush a completed forward's token before releasing its device slot.
+
+        Eager backup normally saves it during preparation of the NEXT forward.
+        Retraction runs before that preparation. Spec commit and initial PD
+        admission already persist their tokens and need no extra transfer.
+        """
+        req_pool_idx = req.kv.req_pool_idx
+        committed_len = req.kv.kv_committed_len
+        if (
+            self.spec_swap.enabled
+            or self._skip_first_backup[req_pool_idx]
+            or committed_len % self.compress_ratio != 0
+        ):
+            return
+        host_len = self.host_token_len(committed_len)
+        if host_len == 0:
+            return
+        host_locs = self.mem_pool_host.alloc_paged_token_slots(
+            self.req_to_host_pool,
+            self.req_to_host_pool_allocated_len,
+            req_pool_idx,
+            host_len - 1,
+            1,
+        )
+        slot = min(host_len - 1, self.device_buffer_size)
+        device_locs = self.req_to_device_buffer[req_pool_idx, slot : slot + 1]
+        if self.is_dsv4_hisparse:
+            self.mem_pool_host.backup_tokens_from_device_all_layer(
+                host_locs, device_locs
+            )
+        else:
+            self.mem_pool_host.backup_from_device_all_layer(
+                self.mem_pool_device, host_locs, device_locs, io_backend="kernel"
+            )
+        # Retraction is a one-shot operation. Complete the copy before returning
+        # slots to the allocator or letting another stream reuse their storage.
+        done = device_module.Event()
+        done.record(device_module.current_stream())
+        done.synchronize()
+
     def retract_req_state_preserving(self, req: Req) -> None:
         """Retract a request while keeping its host-pool recovery state.
 
@@ -1611,6 +1652,8 @@ class HiSparseCoordinator:
         # mark never shrinks -- see allocate_spec_decode -- and those verify
         # slots have no data written yet).
         committed_len = req.kv.kv_committed_len
+
+        self._backup_retraction_tail(req)
 
         # Preserve the indexer K (DSA top-k selection data). Unlike the C4 KV,
         # it lives in the device logical-slot space (prefill transfers it over

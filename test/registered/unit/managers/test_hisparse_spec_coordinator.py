@@ -78,6 +78,79 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
             0,
         )
 
+    def test_retract_flushes_the_committed_tail_before_free(self):
+        """A forward's last KV token may not have reached eager backup yet."""
+        for ratio, committed, already_backed in (
+            (1, 3, False),
+            (4, 12, False),
+            (4, 11, False),
+            (4, 12, True),
+        ):
+            with self.subTest(
+                ratio=ratio, committed=committed, already_backed=already_backed
+            ):
+                coordinator, req, freed_device, freed_host = self._retraction_fixture()
+                coordinator.is_dsv4_hisparse = ratio == 4
+                coordinator.compress_ratio = ratio
+                coordinator.device_buffer_size = 2
+                coordinator._skip_first_backup[0] = already_backed
+                req.kv.kv_allocated_len = req.kv.kv_committed_len = committed
+                coordinator.req_to_token_pool.req_to_token = torch.arange(
+                    committed
+                ).reshape(1, -1)
+                coordinator.token_to_kv_pool_allocator.get_kvcache = lambda: (
+                    SimpleNamespace()
+                )
+                host_values = torch.full((32,), -1)
+                device_values = torch.arange(16) + 100
+                pending = []
+
+                def backup(host_ids, device_ids):
+                    pending.append(
+                        lambda: host_values.index_copy_(
+                            0, host_ids, device_values[device_ids]
+                        )
+                    )
+
+                def synchronize():
+                    for copy in pending:
+                        copy()
+                    pending.clear()
+
+                coordinator.mem_pool_host.alloc_paged_token_slots = (
+                    lambda table, lengths, row, start, size: table[
+                        row, start : start + size
+                    ]
+                )
+                coordinator.mem_pool_host.backup_tokens_from_device_all_layer = backup
+                coordinator.mem_pool_host.backup_from_device_all_layer = (
+                    lambda pool, host_ids, device_ids, **kw: backup(
+                        host_ids, device_ids
+                    )
+                )
+                needs_flush = committed % ratio == 0 and not already_backed
+
+                def free(ids):
+                    if needs_flush:
+                        self.assertEqual(int(host_values[22]), int(device_values[10]))
+                    freed_device.update(ids.tolist())
+
+                coordinator.token_to_kv_pool_allocator.free_hisparse_indices = free
+                event = SimpleNamespace(
+                    record=lambda stream: None, synchronize=synchronize
+                )
+                with patch(
+                    "sglang.srt.managers.hisparse_coordinator.device_module",
+                    SimpleNamespace(Event=lambda: event, current_stream=lambda: None),
+                ):
+                    coordinator.retract_req_state_preserving(req)
+                self.assertEqual(
+                    int(host_values[22]), int(device_values[10]) if needs_flush else -1
+                )
+                self.assertEqual(freed_device, {8, 9, 10})
+                self.assertEqual(freed_host, set())
+                self.assertTrue(req.hisparse_retraction_pending)
+
     def test_spec_decode_reserve_allocates_logical_pages_only(self):
         logical_locs = torch.tensor([64, 65, 66, 67], dtype=torch.int64)
         allocator = SimpleNamespace(
