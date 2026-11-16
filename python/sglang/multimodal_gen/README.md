@@ -23,7 +23,7 @@ SGLang Diffusion has the following features:
 
 ### AMD/ROCm Support
 
-SGLang Diffusion supports AMD Instinct GPUs through ROCm. On AMD platforms, we use the Triton attention backend and leverage AITER kernels for optimized layernorm and other operations. See the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for setup instructions.
+SGLang Diffusion supports AMD Instinct GPUs through ROCm. On AMD Instinct GPUs, the default attention backend is AITER (`aiter`), and with `SGLANG_USE_AITER=1` (set in the ROCm images) AITER kernels are also used for layernorm and other operations. `--attention-backend torch_sdpa` is also available; use it on Strix Halo / gfx1151, where AITER is not supported. See the [installation guide](https://docs.sglang.io/docs/sglang-diffusion/installation) for setup instructions.
 
 ### Moore Threads/MUSA Support
 
@@ -110,6 +110,14 @@ sglang generate \
 ```
 
 For more usage examples (e.g. OpenAI compatible API, server mode), check the [CLI reference](https://docs.sglang.io/docs/sglang-diffusion/api/cli).
+
+## SGLang-Diffusion Adoption & Integrations
+
+<p align="center">
+  <img src="../../../assets/sglang-diffusion/adoption.png" alt="SGLang-Diffusion adopters and integrations: Ant Group, Baseten, Black Forest Labs, Boson AI, fal, Google, Infinigence, Krea, Modal, MOSS, Skywork, Sol-Engine, Tencent Hunyuan, and TikTok" width="800">
+</p>
+
+[fal](https://blog.fal.ai/h3-max-built-with-fal-inference-and-training/) ported SGLang-Diffusion's H3 implementation to its Falcon inference engine.
 
 ## Contributing
 
