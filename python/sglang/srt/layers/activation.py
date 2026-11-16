@@ -22,6 +22,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from transformers import PretrainedConfig
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.distributed import (
     divide,
@@ -56,6 +57,18 @@ _is_hip = is_hip()
 _is_xpu = is_xpu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
+
+# The jit act-and-mul kernel requires the per-rank hidden size to be a
+# multiple of the vector width (kMaxVecBytes/dtype: 32B on SM100+, else 16B --
+# RuntimeCheck "hidden size must be divisible by vector size" in
+# kernels/jit/csrc/elementwise/activation.cuh). Route unaligned shapes to the
+# sgl_kernel implementation (e.g. DeepSeek-V2-Lite dense 10944/8 = 1368 at
+# tp8, 1368 % 16 != 0).
+def _jit_act_supported(out: torch.Tensor) -> bool:
+    vec_bytes = current_arch().cuda.max_vec_bytes
+    return out.shape[-1] % (vec_bytes // out.dtype.itemsize) == 0
+
+
 if _is_cuda:
     from sgl_kernel import gelu_and_mul as _sgl_gelu_and_mul
     from sgl_kernel import gelu_tanh_and_mul as _sgl_gelu_tanh_and_mul
@@ -73,21 +86,6 @@ if _is_cuda:
     from sglang.kernels.ops.activation.activation import (
         silu_and_mul as _jit_silu_and_mul,
     )
-
-    # The jit act-and-mul kernel requires the per-rank hidden size to be a
-    # multiple of the vector width (kMaxVecBytes/dtype: 32B on SM100+, else 16B --
-    # RuntimeCheck "hidden size must be divisible by vector size" in
-    # kernels/jit/csrc/elementwise/activation.cuh). Route unaligned shapes to the
-    # sgl_kernel implementation (e.g. DeepSeek-V2-Lite dense 10944/8 = 1368 at
-    # tp8, 1368 % 16 != 0).
-    _jit_act_max_vec_bytes: Optional[int] = None
-
-    def _jit_act_supported(out: torch.Tensor) -> bool:
-        global _jit_act_max_vec_bytes
-        if _jit_act_max_vec_bytes is None:
-            major, _ = torch.cuda.get_device_capability()
-            _jit_act_max_vec_bytes = 32 if major >= 10 else 16
-        return out.shape[-1] % (_jit_act_max_vec_bytes // out.dtype.itemsize) == 0
 
     def _act_and_mul(jit_fn, sgl_fn, input: torch.Tensor, out=None) -> torch.Tensor:
         if out is None:
