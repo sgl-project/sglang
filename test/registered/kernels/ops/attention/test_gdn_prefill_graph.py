@@ -288,6 +288,16 @@ class TestGDNPrefillGraph(CustomTestCase):
                         seed=100 + i,
                     )
 
+    def test_graph_split_hands_views_to_the_extend(self):
+        """The captured chain passes the Triton extend split views of the conv
+        output, as the eager extend does, instead of a contiguous copy."""
+        self._setup(torch.float32)
+        mixed = torch.randn(64, self.dim, device="cuda", dtype=torch.bfloat16)
+        for t in self.backend._split_prefill_qkv(self.layer, mixed):
+            self.assertEqual(
+                t.untyped_storage().data_ptr(), mixed.untyped_storage().data_ptr()
+            )
+
     def test_eager_padded_rows_stay_zero(self):
         """DP attention pads input_ids and extend_num_tokens past the batch's
         real tokens but not the sequence lengths. The eager extend must keep
