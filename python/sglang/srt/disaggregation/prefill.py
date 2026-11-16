@@ -1703,12 +1703,24 @@ class SchedulerDisaggregationPrefillMixin:
         page_size = self.token_to_kv_pool_allocator.page_size
         start_idx = req.start_send_idx
         transfer_input_len = len(req.origin_input_ids)
+        # Tail mode: the decode worker computes the last W prompt tokens from
+        # a real extend, so only [0, N - W) transfers. At least one token
+        # always transfers so the receiver's completion machinery sees a real
+        # KV chunk; the metadata buffer still describes the handoff.
+        tail = get_disagg().disaggregation_decode_tail_tokens
+        if tail:
+            transfer_input_len = max(
+                1, transfer_input_len - min(tail, transfer_input_len - 1)
+            )
         end_idx = (
             end_idx if end_idx is not None else min(req.extend_end, transfer_input_len)
         )
 
         if not last_chunk:
-            end_idx = clamp_kv_send_end(req, self.tree_cache, end_idx=end_idx)
+            end_idx = min(
+                clamp_kv_send_end(req, self.tree_cache, end_idx=end_idx),
+                transfer_input_len,
+            )
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size
             if self.enable_staging:

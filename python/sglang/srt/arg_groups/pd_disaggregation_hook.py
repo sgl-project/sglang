@@ -95,6 +95,49 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 f"{cfg.disaggregation_transfer_backend!r}."
             )
 
+    if cfg.disaggregation_decode_tail_tokens:
+        tail = cfg.disaggregation_decode_tail_tokens
+        if tail < 0:
+            raise ValueError("--disaggregation-decode-tail-tokens must be >= 0")
+        if cfg.disaggregation_mode not in ("prefill", "decode"):
+            raise ValueError(
+                "--disaggregation-decode-tail-tokens requires "
+                "--disaggregation-mode prefill or decode"
+            )
+        unsupported = []
+        if tail == 0:
+            unsupported.append("a tail of zero (drop the flag instead)")
+        if resolved_view(server_args).speculative_algorithm is not None:
+            unsupported.append(
+                "speculative decoding "
+                f"(--speculative-algorithm {resolved_view(server_args).speculative_algorithm}); the "
+                "draft extend over the tail is a later phase"
+            )
+        if cfg.pp_size != 1:
+            unsupported.append("pipeline parallelism")
+        if cfg.dp_size != 1:
+            unsupported.append("data parallelism")
+        if cfg.attn_cp_size != 1 or cfg.dcp_size != 1:
+            unsupported.append("context parallelism")
+        if cfg.enable_two_batch_overlap:
+            unsupported.append("two-batch overlap")
+        if cfg.enable_mixed_chunk:
+            unsupported.append("mixed chunked prefill")
+        if cfg.enable_lora:
+            unsupported.append("LoRA")
+        if cfg.enable_hisparse:
+            unsupported.append("HiSparse")
+        if cfg.dsv41_encoder_only_prefill:
+            unsupported.append(
+                "--dsv41-encoder-only-prefill (the model-specific form of the "
+                "same mode; use one)"
+            )
+        if unsupported:
+            raise ValueError(
+                "--disaggregation-decode-tail-tokens does not support: "
+                + ", ".join(unsupported)
+            )
+
     if cfg.disaggregation_mode == "decode":
         if cfg.disaggregation_decode_enable_radix_cache:
             if cfg.enable_hisparse:
