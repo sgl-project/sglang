@@ -1,11 +1,13 @@
 from typing import Optional, Tuple, Union
 
 import torch
-from sgl_kernel_npu.fla.fused_gdn_gating import fused_gdn_gating_kernel_without_sigmoid
-from sgl_kernel_npu.fla.utils import prepare_chunk_indices
+from sgl_kernel_npu.implementation.triton.attention.gdn.gdn_utils import (
+    prepare_chunk_indices,
+)
 from sgl_kernel_npu.operators.attention.gdn import (
     chunk_gated_delta_rule,
     fused_gdn_gating,
+    fused_gdn_gating_without_sigmoid,
     recurrent_gated_delta_rule,
 )
 from sgl_kernel_npu.operators.mamba import causal_conv1d
@@ -260,9 +262,7 @@ class AscendGDNAttnBackend(AscendMambaAttnBackendBase):
             )
             conv_states[:, -(kernel_size - 1) :, :] = conv_states_for_prefill
         if is_target_verify:
-            g, beta = fused_gdn_gating_kernel_without_sigmoid(
-                layer.A_log, a, b, layer.dt_bias
-            )
+            g, beta = fused_gdn_gating_without_sigmoid(layer.A_log, a, b, layer.dt_bias)
             beta = beta.unsqueeze(0)
             num_heads, head_k_dim = layer.num_q_heads, layer.head_q_dim
             num_value_heads, head_v_dim = layer.num_v_heads, layer.head_v_dim

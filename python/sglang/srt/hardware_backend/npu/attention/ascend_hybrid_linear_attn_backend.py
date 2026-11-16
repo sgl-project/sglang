@@ -3,7 +3,7 @@ from typing import Optional, Union
 
 import torch
 import triton
-from sgl_kernel_npu.mamba.mamba_state_update_triton import (
+from sgl_kernel_npu.operators.mamba import (
     conv_state_rollback,
     move_intermediate_cache,
 )

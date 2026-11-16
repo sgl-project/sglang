@@ -2,9 +2,11 @@ import math
 from typing import Optional
 
 import torch
-from sgl_kernel_npu.fla.kda_gate import fused_kda_gate_npu
-from sgl_kernel_npu.fla.kda_target_verify import kda_target_verify_npu
-from sgl_kernel_npu.operators.attention.kda import chunk_kda_fwd
+from sgl_kernel_npu.operators.attention.kda import (
+    chunk_kda_fwd,
+    fused_kda_gate,
+    kda_target_verify,
+)
 from sgl_kernel_npu.operators.mamba import causal_conv1d
 
 from sglang.kernels.ops.attention.fla.l2norm import l2norm_fwd
@@ -324,7 +326,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         Optional[torch.Tensor],
     ]:
         """Activate raw gate and beta projections in FP32 for Ascend prefill."""
-        preactivated_g = fused_kda_gate_npu(
+        preactivated_g = fused_kda_gate(
             g.flatten(-2),
             layer.A_log,
             layer.head_k_dim,
@@ -414,7 +416,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
         # Activate the forget gate and beta in FP32 before entering the
         # recurrent kernel to match the checkpoint's verify contract.
         # This stays in the Ascend backend so shared/GPU model code is unchanged.
-        preactivated_a = fused_kda_gate_npu(
+        preactivated_a = fused_kda_gate(
             dense_a.flatten(-2),
             layer.A_log,
             layer.head_k_dim,
@@ -422,7 +424,7 @@ class AscendKDAAttnBackend(KDAAttnBackend):
             lower_bound=layer.lower_bound,
         )
         preactivated_b = dense_b.float().sigmoid()
-        out = kda_target_verify_npu(
+        out = kda_target_verify(
             A_log=layer.A_log,
             dt_bias=layer.dt_bias,
             q=q,
@@ -498,12 +500,12 @@ class AscendKDAHybridLinearAttnBackend:
                 req_pool_indices=None,
                 state_slots=None,
             ):
-                from sgl_kernel_npu.mamba.mamba_state_update_triton import (
-                    conv_state_rollback,
-                    move_intermediate_cache_kda,
-                )
                 from sgl_kernel_npu.mamba.speculative_state_scatter import (
                     speculative_state_scatter_npu,
+                )
+                from sgl_kernel_npu.operators.mamba import (
+                    conv_state_rollback,
+                    move_intermediate_cache_kda,
                 )
 
                 del req_pool_indices
