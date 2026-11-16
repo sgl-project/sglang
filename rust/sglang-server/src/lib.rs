@@ -29,6 +29,7 @@ pub use api_server::http::pre_generate::abortable_before_generate;
 #[cfg(feature = "test-support")]
 pub mod test_support {
     pub use crate::api_server::http::pre_generate::test_support::*;
+    pub use crate::multi_modality::encoded::test_support::*;
     pub use crate::utils::runtime::test_support::*;
 }
 pub use message::config::{
@@ -40,7 +41,7 @@ pub use message::request::{GenerateRequest, MediaAdmission, MmData, ProcessorFet
 pub use message::sampling::SamplingParams;
 pub use message::types::TokenIds;
 pub use multi_modality::encoded::{
-    MRope, MmEncodedEntry, MmEncodedItem, MmMetaValue, MmModality, MmTokenIds,
+    MRope, MmEncodedEntry, MmEncodedItem, MmMetaValue, MmModality, MmTokenIds, feature_digest,
 };
 pub use multi_modality::payload::{ResolvedMediaWork, resolve_media_work};
 pub use multi_modality::worker::{MediaError, MmProcessOutput, MmProcessor, MmRequestInfo};
