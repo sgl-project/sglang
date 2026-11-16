@@ -1,5 +1,6 @@
 """Non-CUDA platforms keep decoder, draft and operation contracts."""
 
+import os
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -17,6 +18,57 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
 class TestPlatformDispatch(unittest.TestCase):
+    @patch.dict(os.environ)
+    def test_q8_sparse_prefill_query_heads_follow_runtime_route(self):
+        """Native Q must reach ETAP; decode, verify and CP keep their padded Q."""
+        from sglang.srt.layers.attention import deepseek_v4_backend as backend_mod
+        from sglang.srt.layers.cp.interleave import InterleaveContextParallelMetadata
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+
+        os.environ.pop("SGLANG_DSV4_Q8KV8_PREFILL", None)
+        backend = backend_mod.DeepseekV4AttnBackend.__new__(
+            backend_mod.DeepseekV4AttnBackend
+        )
+        backend.trtllm_attn = False
+        backend.is_dsv41 = True
+        backend.mega_attn = False
+        backend.forward_metadata = SimpleNamespace(late_layer_tail=None)
+        backend.token_to_kv_pool = SimpleNamespace(request_window=None)
+        platform = SimpleNamespace(is_sm90=True, is_sm120=False)
+        layer = deepseek_v4.MqaAttentionBase.__new__(deepseek_v4.MqaAttentionBase)
+        torch.nn.Module.__init__(layer)
+        layer.n_heads = 64
+        with (
+            patch.object(deepseek_v4, "get_platform", return_value=platform),
+            patch.object(backend_mod, "get_platform", return_value=platform),
+            patch.object(backend_mod, "is_cp_active", side_effect=lambda b: b.cp),
+            backend_mod.envs.SGLANG_OPT_FLASHMLA_SPARSE_PREFILL.override(True),
+        ):
+            for heads in (8, 16, 32):
+                layer.n_local_heads = heads
+                layer.attn_tp_size = 64 // heads
+                for prefill, mode, cp, expected in (
+                    ("flashmla_sparse_q8", ForwardMode.EXTEND, False, heads),
+                    ("auto", ForwardMode.EXTEND, False, 64),
+                    ("flashmla_sparse_q8", ForwardMode.DECODE, False, 64),
+                    ("flashmla_sparse_q8", ForwardMode.TARGET_VERIFY, False, 64),
+                    ("flashmla_sparse_q8", ForwardMode.DRAFT_EXTEND_V2, False, 64),
+                    ("flashmla_sparse_q8", ForwardMode.EXTEND, True, 64),
+                ):
+                    with self.subTest(heads=heads, prefill=prefill, mode=mode, cp=cp):
+                        backend.dsv4_prefill_backend = prefill
+                        batch = SimpleNamespace(
+                            forward_mode=mode,
+                            cp=cp,
+                            attn_cp_metadata=InterleaveContextParallelMetadata(),
+                        )
+                        self.assertEqual(
+                            layer._kernel_num_heads(
+                                1, forward_batch=batch, attn_backend=backend
+                            ),
+                            expected,
+                        )
+
     def test_cuda_main_loop_materializes_and_clears_output(self):
         from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 

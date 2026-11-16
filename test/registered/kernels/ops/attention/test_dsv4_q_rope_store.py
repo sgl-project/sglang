@@ -46,6 +46,9 @@ class TestQRopeStore(CustomTestCase):
                     fused_rope_inplace(expected[..., 448:], None, freqs, positions)
                     fused_q_norm_rope(q, output, None, freqs, positions)
                     torch.testing.assert_close(output, expected, rtol=0, atol=0)
+                    native_output = torch.empty_like(expected)
+                    fused_q_norm_rope(q, native_output, None, freqs, positions)
+                    torch.testing.assert_close(native_output, output, rtol=0, atol=0)
                     torch.testing.assert_close(q, original, rtol=0, atol=0)
                     self.assertTrue((padding[:, heads:] == 7).all().item())
 
@@ -73,6 +76,9 @@ class TestQRopeStore(CustomTestCase):
                     torch.testing.assert_close(
                         padding[:, :16], expected, rtol=0, atol=0
                     )
+                    native_output = torch.empty_like(expected)
+                    fused_q_norm_rope(q, native_output, None, freqs, positions)
+                    torch.testing.assert_close(native_output, expected, rtol=0, atol=0)
                     torch.testing.assert_close(q, original, rtol=0, atol=0)
                     self.assertTrue((padding[:, 16:] == 7).all().item())
 

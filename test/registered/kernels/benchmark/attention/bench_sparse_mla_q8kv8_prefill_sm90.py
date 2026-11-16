@@ -28,6 +28,8 @@ if IS_CI:
     CASES = [
         (2, 1024, 64, 512, 128),
         (2, 1024, 64, 576, 128),
+        (64, 8192, 8, 512, 640),
+        (64, 8192, 16, 576, 2048),
     ]
 else:
     CASES = [
@@ -36,15 +38,20 @@ else:
         (4096, 65536, 128, 576, 2048),
         (4096, 8192, 64, 512, 512),
         (4096, 32768, 64, 512, 512),
+        *[
+            (256, 8192, h, d, k)
+            for h in (8, 16, 32)
+            for d, k in ((512, 640), (576, 2176))
+        ],
     ]
 
     # This official benchmark intentionally measures the no-sink path. Current
     # DeepSeek NSA E2E does not pass a per-head attention sink into sparse MLA, so
     # sink-enabled timings are kernel feature coverage rather than E2E proxy data.
 
-LINE_VALS = ["q16_bf16_flashmla", "q8_fp8_jit"]
-LINE_NAMES = ["Q16 BF16 FlashMLA", "Q8 FP8 JIT"]
-STYLES = [("orange", "--"), ("blue", "-")]
+LINE_VALS = ["q16_bf16_flashmla", "q8_fp8_jit", "q8_fp8_padded"]
+LINE_NAMES = ["Q16 BF16 FlashMLA", "Q8 FP8 JIT", "Q8 FP8 padded heads"]
+STYLES = [("orange", "--"), ("blue", "-"), ("green", "--")]
 
 
 def _sm90_available() -> bool:
@@ -117,12 +124,16 @@ def bench_sparse_mla_q8kv8_prefill_sm90(
         def fn():
             return flash_mla_sparse_fwd(q, kv, indices, sm_scale, D_V)
 
-    elif provider == "q8_fp8_jit":
+    elif provider in ("q8_fp8_jit", "q8_fp8_padded"):
         if not _sm90_available():
             raise RuntimeError("Q8KV8 sparse prefill benchmark requires SM90 CUDA")
         q, kv, indices, sm_scale, q_scale, kv_scale = _make_q8_inputs(
             s_q, s_kv, h_q, d_qk, topk
         )
+        if provider == "q8_fp8_padded" and h_q < 64:
+            padded_q = torch.zeros(s_q, 64, d_qk, device=q.device, dtype=q.dtype)
+            padded_q[:, :h_q].copy_(q)
+            q = padded_q
 
         def fn():
             return sparse_mla_q8kv8_prefill_fwd(
