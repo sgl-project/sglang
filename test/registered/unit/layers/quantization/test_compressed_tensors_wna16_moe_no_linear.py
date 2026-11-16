@@ -51,6 +51,12 @@ def _make_wna16_moe_config(targets, num_bits, **weight_overrides):
 
 
 class TestWNA16MoENoLinearGroup(CustomTestCase):
+    def setUp(self):
+        # The XPU branch keys on a module-level flag, so pin it off unless a test turns it on.
+        patcher = mock.patch.object(compressed_tensors, "_is_xpu", False)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def _assert_wna16_moe(self, config_dict, expected_bits):
         quant_config = CompressedTensorsConfig.from_config(config_dict)
         self.assertNotIn("Linear", quant_config.target_scheme_map)
@@ -127,6 +133,59 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
 
                 self.assertIsInstance(scheme, CompressedTensorsWNA16MoE)
                 self.assertNotIsInstance(scheme, CompressedTensorsWNA16TritonMoE)
+
+    def test_xpu_int4_auto_uses_triton(self):
+        for group_size in (32, 128):
+            with self.subTest(group_size=group_size):
+                quant_config = CompressedTensorsConfig.from_config(
+                    _make_wna16_moe_config(
+                        ["re:.*mlp.experts.*"],
+                        num_bits=4,
+                        group_size=group_size,
+                    )
+                )
+
+                with (
+                    mock.patch.object(compressed_tensors, "_is_xpu", True),
+                    mock.patch.object(
+                        compressed_tensors,
+                        "get_moe_runner_backend",
+                        return_value=MoeRunnerBackend.AUTO,
+                    ),
+                ):
+                    scheme = quant_config.get_moe_scheme(
+                        torch.nn.Module(), layer_name=EXPERTS_LAYER
+                    )
+
+                self.assertIsInstance(scheme, CompressedTensorsWNA16TritonMoE)
+
+    def test_xpu_rejects_unvalidated_triton_layouts(self):
+        cases = {
+            "asymmetric": (4, {"symmetric": False}),
+            "channel": (4, {"strategy": "channel", "group_size": None}),
+            "group64": (4, {"group_size": 64}),
+            "actorder": (4, {"actorder": "group"}),
+            "int8": (8, {}),
+        }
+        for name, (num_bits, overrides) in cases.items():
+            with self.subTest(name=name):
+                quant_config = CompressedTensorsConfig.from_config(
+                    _make_wna16_moe_config(
+                        ["re:.*mlp.experts.*"], num_bits=num_bits, **overrides
+                    )
+                )
+                with (
+                    mock.patch.object(compressed_tensors, "_is_xpu", True),
+                    mock.patch.object(
+                        compressed_tensors,
+                        "get_moe_runner_backend",
+                        return_value=MoeRunnerBackend.AUTO,
+                    ),
+                    self.assertRaisesRegex(ValueError, "WNA16 MoE on XPU"),
+                ):
+                    quant_config.get_moe_scheme(
+                        torch.nn.Module(), layer_name=EXPERTS_LAYER
+                    )
 
     def test_explicit_triton_rejects_unvalidated_layout(self):
         quant_config = CompressedTensorsConfig.from_config(
