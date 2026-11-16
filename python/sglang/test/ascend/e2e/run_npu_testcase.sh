@@ -180,19 +180,53 @@ sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
 
-# Prefer the sgl-router CI built for this commit over whatever PATH resolves.
-# The image does not ship the exact name `sgl-router` but may ship
-# `sglang-router` via pip install; fall back to it when neither the CI
-# artifact nor PATH's `sgl-router` is present.
+# Prefer the sgl-router built for this commit (CI artifact), then whatever PATH
+# resolves, and finally a prebuilt aarch64 package published on OBS. The image
+# ships neither, and the pip-installed `sglang-router` is a different CLI.
+SGL_ROUTER_OBS_URL="https://sglang-npu.obs.cn-southwest-2.myhuaweicloud.com/sgl-router/bin/sgl-router-aarch64-npu.zip"
+
+download_sgl_router() {
+    local archive=/tmp/sgl-router-aarch64-npu.zip
+    local dest_dir=/tmp/sgl-router-bin
+    mkdir -p "${dest_dir}"
+    echo "sgl-router not found locally, downloading ${SGL_ROUTER_OBS_URL}"
+    # OBS lives in the same region as the cluster; bypass any image proxy.
+    if command -v curl >/dev/null 2>&1; then
+        (
+            unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+            curl -fsSL -o "${archive}" "${SGL_ROUTER_OBS_URL}"
+        ) || return 1
+    elif command -v wget >/dev/null 2>&1; then
+        (
+            unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+            wget -q -O "${archive}" "${SGL_ROUTER_OBS_URL}"
+        ) || return 1
+    else
+        echo "Neither curl nor wget is available to download sgl-router"
+        return 1
+    fi
+    python -m zipfile -e "${archive}" "${dest_dir}" || return 1
+    local bin
+    bin="$(find "${dest_dir}" -type f -name 'sgl-router' -print -quit)"
+    if [ -z "${bin}" ]; then
+        echo "sgl-router binary not found in ${archive}"
+        return 1
+    fi
+    chmod +x "${bin}"
+    DOWNLOADED_SGL_ROUTER="${bin}"
+}
+
 sgl_router_bin="${sglang_source_path}/sgl-router-bin/sgl-router"
 if "${sgl_router_bin}" --help >/dev/null 2>&1; then
     export SGLANG_TEST_PD_ROUTER_BINARY="${sgl_router_bin}"
 elif command -v sgl-router >/dev/null 2>&1; then
     export SGLANG_TEST_PD_ROUTER_BINARY="$(command -v sgl-router)"
-elif command -v sglang-router >/dev/null 2>&1; then
-    export SGLANG_TEST_PD_ROUTER_BINARY="$(command -v sglang-router)"
+elif download_sgl_router; then
+    export SGLANG_TEST_PD_ROUTER_BINARY="${DOWNLOADED_SGL_ROUTER}"
+else
+    echo "WARNING: sgl-router is unavailable, PD router tests will fail"
 fi
-echo "sgl-router: $(command -v "${SGLANG_TEST_PD_ROUTER_BINARY:-sgl-router}" || echo 'not found')"
+echo "sgl-router: ${SGLANG_TEST_PD_ROUTER_BINARY:-not found}"
 
 export SGLANG_TEST_MAX_RETRY=0
 export SGLANG_SET_CPU_AFFINITY=1

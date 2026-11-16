@@ -53,16 +53,13 @@ jobs:
       max-parallel: 1
       matrix:
         include:
-          # DeepSeek-V4-Flash-0731-w8a8: one prefill node + one decode node,
-          # mooncake + TENT transport, GPQA accuracy.
-          - name: deepseek_v4_flash_0731_w8a8_1p1d_16p_mooncake_gpqa
+          - name: test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa
             test_type: accuracy
             prefill_decode_deployment: separation
             prefill_size: 1
             decode_size: 1
             router_size: 1
             test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py
-            container_patches: ""
     uses: ./.github/workflows/nightly-test-npu-e2e-multi-node.yml
     with:
       runner: linux-amd64-cpu-4
@@ -72,12 +69,10 @@ jobs:
       decode_size: ${{ matrix.decode_size }}
       router_size: ${{ matrix.router_size }}
       test_case: ${{ matrix.test_case }}
-      # PR-triggered runs have no inputs: they fall back to the dispatch image.
       image: ${{ inputs.image || 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B031' }}
       prefill_decode_deployment: ${{ matrix.prefill_decode_deployment }}
-      container_patches: ${{ matrix.container_patches }}
+      container_patches: ${{ matrix.container_patches || '' }}
       run_start_metadata: ${{ needs.metadata.outputs.run_start_metadata }}
-      # PR-triggered runs have no inputs; they fall back to the dispatch defaults.
       use_image_sglang: ${{ inputs.use_image_sglang || 'true' }}
     secrets: inherit
 
