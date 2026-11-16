@@ -25,6 +25,7 @@ from sglang.srt.disaggregation.common.staging_handler import (
 from sglang.srt.disaggregation.common.utils import (
     FastQueue,
     TransferKVChunk,
+    concurrent_contiguous_runs,
     group_concurrent_contiguous,
 )
 from sglang.srt.disaggregation.decode import DecodeRequest, DecodeTransferQueue
@@ -2120,6 +2121,37 @@ class TestGroupConcurrentContiguous(unittest.TestCase):
     def test_mismatched_nonempty_lengths_raise(self):
         with self.assertRaises(ValueError):
             group_concurrent_contiguous(self._arr([1, 2, 3]), self._arr([1, 2]))
+        with self.assertRaises(ValueError):
+            concurrent_contiguous_runs(self._arr([1, 2, 3]), self._arr([1, 2]))
+
+    def test_array_runs_are_the_list_groups(self):
+        rng = np.random.default_rng(0)
+        cases = [
+            ([], []),
+            ([], [1, 2]),
+            ([3, 4], []),
+            ([4], [9]),
+            ([4, 5, 6], [9, 10, 11]),
+            ([4, 5, 6], [9, 3, 4]),
+            ([7, 3, 4, 5], [1, 2, 3, 4]),
+        ]
+        for _ in range(200):
+            n = int(rng.integers(1, 64))
+            src = np.sort(rng.choice(512, n, replace=False))
+            dst = np.arange(n) + int(rng.integers(0, 64))
+            if rng.random() < 0.5:
+                dst = rng.permutation(512)[:n]
+            cases.append((src.tolist(), dst.tolist()))
+        for src, dst in cases:
+            src_starts, dst_starts, lengths = concurrent_contiguous_runs(
+                self._arr(src), self._arr(dst)
+            )
+            src_groups, dst_groups = group_concurrent_contiguous(
+                self._arr(src), self._arr(dst)
+            )
+            self.assertEqual(src_starts.tolist(), [g[0] for g in src_groups])
+            self.assertEqual(dst_starts.tolist(), [g[0] for g in dst_groups])
+            self.assertEqual(lengths.tolist(), [len(g) for g in src_groups])
 
 
 class TestStagingWatermark(unittest.TestCase):

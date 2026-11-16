@@ -16,6 +16,7 @@ lies past it.
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from typing import Dict, Optional, Sequence, Tuple
 
 import msgspec
@@ -28,6 +29,8 @@ from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv.plan import KVStoragePlan
 from sglang.srt.mem_cache.kv_vmm_backing import KvVmmBufferOwner
 from sglang.srt.mem_cache.memory_pool import KvBufferDesc
+from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
+from sglang.srt.utils import is_cuda
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 logger = logging.getLogger(__name__)
@@ -134,7 +137,20 @@ class KVArena:
                 self._vmm_owner.ensure_prefix(self._sink)
                 self.accessible_bytes = self._sink
             else:
-                self.raw = torch.empty(total_bytes, dtype=torch.uint8, device=device)
+                # Mooncake MNNVL peer writes require cuMemCreate fabric allocations.
+                enable_custom_mem_pool, custom_mem_pool, _ = (
+                    maybe_init_custom_mem_pool(device=device)
+                    if is_cuda()
+                    else (False, None, None)
+                )
+                with (
+                    torch.cuda.use_mem_pool(custom_mem_pool)
+                    if enable_custom_mem_pool
+                    else nullcontext()
+                ):
+                    self.raw = torch.empty(
+                        total_bytes, dtype=torch.uint8, device=device
+                    )
                 self.accessible_bytes = total_bytes
         self._initialize(self.raw[: self.accessible_bytes])
 

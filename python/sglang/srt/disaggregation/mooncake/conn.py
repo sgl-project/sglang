@@ -41,6 +41,7 @@ from sglang.srt.disaggregation.common.utils import (
     TransferKVChunk,
     bind_thread_to_device,
     build_dcp_token_transfer_plan,
+    concurrent_contiguous_runs,
     group_concurrent_contiguous,
     pack_int_lists,
     run_on_device,
@@ -1202,19 +1203,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         even on a non-MLA backend, for K-only state buffers (e.g. MiniMax sparse
         index) whose per-layer list must not be half-split into K/V.
         """
-        # Host and device buffers may use different destination page spaces.
-        # Build both transfer plans once, then select per destination buffer.
-        prefill_kv_blocks, dst_kv_blocks = group_concurrent_contiguous(
-            prefill_data_indices, dst_data_indices
-        )
-        device_prefill_kv_blocks = device_dst_kv_blocks = None
-        if dst_device_data_indices is not None:
-            device_prefill_kv_blocks, device_dst_kv_blocks = (
-                group_concurrent_contiguous(
-                    prefill_data_indices, dst_device_data_indices
-                )
-            )
-
         layers_params = None
 
         # Skipped once registration has cleared this peer's layout.
@@ -1329,50 +1317,67 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             ]
         assert layers_params is not None
 
+        # Scattered pages yield one run per page, so list grouping causes GC churn.
+        def runs_for(index_slice: slice) -> tuple:
+            # Host and device buffers may use different destination page spaces.
+            kv_runs = concurrent_contiguous_runs(
+                prefill_data_indices[index_slice], dst_data_indices[index_slice]
+            )
+            device_kv_runs = None
+            if dst_device_data_indices is not None:
+                device_kv_runs = concurrent_contiguous_runs(
+                    prefill_data_indices[index_slice],
+                    dst_device_data_indices[index_slice],
+                )
+            return kv_runs, device_kv_runs
+
         def set_transfer_blocks(
-            src_ptr: int, dst_ptr: int, item_len: int
+            src_ptr: int, dst_ptr: int, item_len: int, runs: tuple
         ) -> List[Tuple[int, int, int]]:
-            transfer_blocks = []
+            kv_runs, device_kv_runs = runs
             if dst_device_data_ptrs and int(dst_ptr) in dst_device_data_ptrs:
-                assert (
-                    device_prefill_kv_blocks is not None
-                    and device_dst_kv_blocks is not None
-                )
-                src_blocks, dst_blocks = (
-                    device_prefill_kv_blocks,
-                    device_dst_kv_blocks,
-                )
+                assert device_kv_runs is not None
+                src_starts, dst_starts, lengths = device_kv_runs
             else:
-                src_blocks, dst_blocks = prefill_kv_blocks, dst_kv_blocks
-            for prefill_index, decode_index in zip(src_blocks, dst_blocks):
-                src_addr = src_ptr + int(prefill_index[0]) * item_len
-                dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                length = item_len * len(prefill_index)
-                transfer_blocks.append((src_addr, dst_addr, length))
-            return transfer_blocks
+                src_starts, dst_starts, lengths = kv_runs
+            return list(
+                zip(
+                    (src_ptr + src_starts * item_len).tolist(),
+                    (dst_ptr + dst_starts * item_len).tolist(),
+                    (lengths * item_len).tolist(),
+                )
+            )
 
         # Worker function for processing a single layer
-        def process_layer(src_ptr: int, dst_ptr: int, item_len: int) -> int:
-            transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len)
+        def process_layer(
+            src_ptr: int, dst_ptr: int, item_len: int, runs: tuple
+        ) -> int:
+            transfer_blocks = set_transfer_blocks(src_ptr, dst_ptr, item_len, runs)
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         # Worker function for processing all layers in a batch
-        def process_layers(layers_params: List[Tuple[int, int, int]]) -> int:
+        def process_layers(
+            layers_params: List[Tuple[int, int, int]], runs: tuple
+        ) -> int:
             transfer_blocks = []
             for src_ptr, dst_ptr, item_len in layers_params:
-                transfer_blocks.extend(set_transfer_blocks(src_ptr, dst_ptr, item_len))
+                transfer_blocks.extend(
+                    set_transfer_blocks(src_ptr, dst_ptr, item_len, runs)
+                )
             return self._transfer_data(mooncake_session_id, transfer_blocks)
 
         if (
             self.enable_custom_mem_pool
             and self.custom_mem_pool_type != "INTRA_NODE_NVLINK"
         ):
+            runs = runs_for(slice(None))
             futures = [
                 executor.submit(
                     process_layer,
                     src_ptr,
                     dst_ptr,
                     item_len,
+                    runs,
                 )
                 for (src_ptr, dst_ptr, item_len) in layers_params
             ]
@@ -1383,56 +1388,16 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # users explicitly opt in to bounded index batches.
             max_batch_indices = self.max_transfer_batch_indices
             if max_batch_indices <= 0 or prefill_data_indices.size <= max_batch_indices:
-                return process_layers(layers_params)
-
-            def process_index_batch(
-                prefill_blocks,
-                dst_blocks,
-                device_prefill_blocks=None,
-                device_dst_blocks=None,
-            ) -> int:
-                transfer_blocks = []
-                for src_ptr, dst_ptr, item_len in layers_params:
-                    if dst_device_data_ptrs and int(dst_ptr) in dst_device_data_ptrs:
-                        assert (
-                            device_prefill_blocks is not None
-                            and device_dst_blocks is not None
-                        )
-                        src_blocks, target_blocks = (
-                            device_prefill_blocks,
-                            device_dst_blocks,
-                        )
-                    else:
-                        src_blocks, target_blocks = prefill_blocks, dst_blocks
-                    for prefill_index, decode_index in zip(src_blocks, target_blocks):
-                        src_addr = src_ptr + int(prefill_index[0]) * item_len
-                        dst_addr = dst_ptr + int(decode_index[0]) * item_len
-                        length = item_len * len(prefill_index)
-                        transfer_blocks.append((src_addr, dst_addr, length))
-                return self._transfer_data(mooncake_session_id, transfer_blocks)
+                return process_layers(layers_params, runs_for(slice(None)))
 
             for start in range(
                 0,
                 prefill_data_indices.size,
                 max_batch_indices,
             ):
-                batch_prefill_blocks, batch_dst_blocks = group_concurrent_contiguous(
-                    prefill_data_indices[start : start + max_batch_indices],
-                    dst_data_indices[start : start + max_batch_indices],
-                )
-                batch_device_prefill_blocks = batch_device_dst_blocks = None
-                if dst_device_data_indices is not None:
-                    batch_device_prefill_blocks, batch_device_dst_blocks = (
-                        group_concurrent_contiguous(
-                            prefill_data_indices[start : start + max_batch_indices],
-                            dst_device_data_indices[start : start + max_batch_indices],
-                        )
-                    )
-                ret = process_index_batch(
-                    batch_prefill_blocks,
-                    batch_dst_blocks,
-                    batch_device_prefill_blocks,
-                    batch_device_dst_blocks,
+                ret = process_layers(
+                    layers_params,
+                    runs_for(slice(start, start + max_batch_indices)),
                 )
                 if ret != 0:
                     return ret

@@ -11,7 +11,10 @@ import numpy as np
 import torch
 
 from sglang.srt.disaggregation.base.conn import KVPoll, StateType
-from sglang.srt.disaggregation.common.utils import TransferKVChunk
+from sglang.srt.disaggregation.common.utils import (
+    TransferKVChunk,
+    group_concurrent_contiguous,
+)
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, MooncakeKVSender
 from sglang.srt.distributed.device_communicators.kv_transfer_engine import (
@@ -143,6 +146,84 @@ class TestMooncakeTransferBatching(unittest.TestCase):
             ],
             any_order=True,
         )
+
+
+class TestMooncakeScatteredPages(unittest.TestCase):
+    SRC = np.array([3, 4, 5, 9, 10, 20, 21, 22, 23, 40], dtype=np.int32)
+    DST = np.array([0, 1, 2, 3, 4, 8, 9, 10, 11, 12], dtype=np.int32)
+    DEVICE_DST = np.array([30, 31, 32, 50, 51, 52, 53, 54, 70, 71], dtype=np.int32)
+    LAYERS = [(1000, 5000, 10), (2000, 6000, 20)]
+
+    def _sent(self, *, custom_pool, max_batch, device_dst):
+        manager = TestMooncakeTransferBatching._make_manager(
+            enable_custom_mem_pool=custom_pool, max_batch_indices=max_batch
+        )
+        with concurrent.futures.ThreadPoolExecutor() as executor:
+            ret = MooncakeKVManager._send_kvcache_generic(
+                manager,
+                mooncake_session_id="session",
+                src_data_ptrs=[1000, 2000],
+                dst_data_ptrs=[5000, 6000],
+                item_lens=[10, 20],
+                prefill_data_indices=self.SRC,
+                dst_data_indices=self.DST,
+                executor=executor,
+                dst_device_data_indices=self.DEVICE_DST if device_dst else None,
+                dst_device_data_ptrs={6000} if device_dst else None,
+            )
+        self.assertEqual(ret, 0)
+        return [c.args[1:4] for c in manager.engine.batch_transfer_sync.call_args_list]
+
+    def _expected(self, *, layers, lo, hi, device_dst):
+        srcs, dsts, lens = [], [], []
+        for src_ptr, dst_ptr, item_len in layers:
+            dst = self.DEVICE_DST if device_dst and dst_ptr == 6000 else self.DST
+            src_groups, dst_groups = group_concurrent_contiguous(
+                self.SRC[lo:hi], dst[lo:hi]
+            )
+            for g, h in zip(src_groups, dst_groups):
+                srcs.append(src_ptr + g[0] * item_len)
+                dsts.append(dst_ptr + h[0] * item_len)
+                lens.append(len(g) * item_len)
+        return (srcs, dsts, lens)
+
+    def test_batched_branches_send_one_block_per_run(self):
+        for max_batch in (0, 4):
+            for device_dst in (False, True):
+                with self.subTest(max_batch=max_batch, device_dst=device_dst):
+                    step = max_batch or self.SRC.size
+                    self.assertEqual(
+                        self._sent(
+                            custom_pool=False,
+                            max_batch=max_batch,
+                            device_dst=device_dst,
+                        ),
+                        [
+                            self._expected(
+                                layers=self.LAYERS,
+                                lo=lo,
+                                hi=lo + step,
+                                device_dst=device_dst,
+                            )
+                            for lo in range(0, self.SRC.size, step)
+                        ],
+                    )
+
+    def test_custom_pool_branch_sends_one_block_per_run_per_layer(self):
+        for device_dst in (False, True):
+            with self.subTest(device_dst=device_dst):
+                self.assertCountEqual(
+                    self._sent(custom_pool=True, max_batch=4, device_dst=device_dst),
+                    [
+                        self._expected(
+                            layers=[layer],
+                            lo=0,
+                            hi=self.SRC.size,
+                            device_dst=device_dst,
+                        )
+                        for layer in self.LAYERS
+                    ],
+                )
 
 
 class TestMiniMaxStateTransfer(CustomTestCase):

@@ -132,6 +132,27 @@ class AuxDataCodec:
         return
 
 
+def concurrent_contiguous_runs(
+    src_indices: npt.NDArray[np.int32], dst_indices: npt.NDArray[np.int32]
+) -> Tuple[npt.NDArray[np.int64], npt.NDArray[np.int64], npt.NDArray[np.int64]]:
+    if src_indices.size == 0 or dst_indices.size == 0:
+        empty = np.empty(0, dtype=np.int64)
+        return empty, empty, empty
+    if src_indices.size != dst_indices.size:
+        raise ValueError(
+            "concurrent_contiguous_runs requires equal-length src/dst index arrays, "
+            f"got {src_indices.size} and {dst_indices.size}"
+        )
+    brk = np.where((np.diff(src_indices) != 1) | (np.diff(dst_indices) != 1))[0] + 1
+    starts = np.concatenate(([0], brk))
+    lengths = np.diff(np.concatenate((starts, [src_indices.size])))
+    return (
+        src_indices[starts].astype(np.int64),
+        dst_indices[starts].astype(np.int64),
+        lengths.astype(np.int64),
+    )
+
+
 def group_concurrent_contiguous(
     src_indices: npt.NDArray[np.int32], dst_indices: npt.NDArray[np.int32]
 ) -> Tuple[List[npt.NDArray[np.int32]], List[npt.NDArray[np.int32]]]:

@@ -30,6 +30,7 @@ import msgspec
 import sglang.srt.configs.hybrid_arch as hybrid_arch
 from sglang.srt.arg_groups.kv_cache_hook import handle_unified_memory_pool
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.runtime_context import override_platform
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -164,6 +165,22 @@ class TestUnifiedMemorySpecGate(CustomTestCase):
         for algorithm in ("DSPARK", "EAGLE"):
             for topk in (2, 4):
                 self.assertFalse(_accepts(algorithm, topk=topk), f"{algorithm} {topk}")
+
+    def test_pd_speculative_decoding_over_mooncake_needs_cuda(self):
+        """Both PD roles require CUDA when Mooncake carries a speculative draft."""
+        for mode in ("prefill", "decode"):
+            for algorithm in ("DFLASH", "EAGLE", None):
+                for is_cuda in (True, False):
+                    with self.subTest(mode=mode, algorithm=algorithm, cuda=is_cuda):
+                        with override_platform(is_cuda=is_cuda):
+                            accepted = _accepts(
+                                algorithm,
+                                draft_backend="trtllm_mha",
+                                disaggregation_mode=mode,
+                                disaggregation_transfer_backend="mooncake",
+                                pp_size=1,
+                            )
+                        self.assertEqual(accepted, is_cuda or algorithm is None)
 
     def test_buffer_only_hicache_refused_under_pipeline_parallelism(self):
         """Unified memory with more than one pipeline stage refuses buffer_only
