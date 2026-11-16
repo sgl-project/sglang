@@ -1590,7 +1590,6 @@ async def run_dp_worker(
         if get_observability().extra_metric_labels:
             labels.update(get_observability().extra_metric_labels)
         server_module.encoder_metrics_collector = EncoderMetricsCollector(labels)
-        enc.dp_rank = dp_rank
 
     max_batch_size, coalesce_same_turn = _resolve_encoder_batch_policy(
         enc.model_type,

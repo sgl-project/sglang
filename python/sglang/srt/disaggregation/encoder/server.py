@@ -547,7 +547,6 @@ class MMEncoder:
         argument."""
         assert_published(server_args, role="encoder")
         logger.info(f"init MMEncoder {rank}/{get_parallel().tp_size}")
-        self.server_args = server_args
         configure_media_url_security(
             get_mm().allowed_media_domains,
             get_mm().media_url_max_file_size_mb,
@@ -557,9 +556,6 @@ class MMEncoder:
         self.transfer_backend = get_disagg().encoder_transfer_backend
         self.use_mooncake = self.transfer_backend == "mooncake"
         self.rank = rank
-        # DP rank for metric labels; overridden by runtime.run_dp_worker.
-        # 0 in the single-instance (non-DP) path.
-        self.dp_rank = 0
         self.profiler = EncoderProfiler(rank)
 
         self.model_config = ModelConfig.from_server_args(

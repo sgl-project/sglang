@@ -900,9 +900,6 @@ class WaitingMMRequestBase(ABC):
     ):
         self.rid = rid
         self.recv_req = recv_req
-        self.mm_inputs = None
-        self.error = None
-        self.thread = None
         self.mm_processor = mm_processor
         self.encoder_urls = encoder_urls
         self.model_type = model_type
@@ -1901,11 +1898,9 @@ class MMReceiverBase(ABC):
         # A scheduler-side receiver works across its TP group; the tokenizer
         # side has no placement.
         parallel = get_parallel()
-        self.pp_rank = parallel.pp_rank if scheduler is not None else None
         self.tp_rank = parallel.tp_rank if scheduler is not None else None
         self.tp_size = parallel.tp_size
         self.tp_group = parallel.tp_group if scheduler is not None else None
-        self.nnodes = get_parallel().nnodes
         self.hostname = get_local_ip_auto()
         self.waiting_list: List[WaitingMMRequestBase] = []
         self.waiting_by_rid: Dict[str, WaitingMMRequestBase] = {}
