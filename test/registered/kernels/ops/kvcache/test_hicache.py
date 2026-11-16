@@ -1,4 +1,6 @@
+import contextlib
 import sys
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -9,8 +11,10 @@ from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_mla_page_unified_lf,
     transfer_hicache_one_layer_page_unified_lf,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.pool_host import unified as unified_host
 from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     alloc_with_pin_memory,
@@ -989,6 +993,118 @@ def test_dsv4_v41_draft_swa_sidecar_moves_whole_pages():
     finally:
         torch.cuda.synchronize()
         host.destroy()
+        reset_context()
+
+
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
+@pytest.mark.parametrize("page_size", [1, 16, 64])
+@pytest.mark.parametrize("side", ["full", "swa"])
+@pytest.mark.skipif(not is_cuda(), reason="Row-split envelope copy is CUDA only")
+def test_unified_envelope_kernel_copy_moves_whole_pages(dtype, page_size, side):
+    """CUDA kernel copies preserve named page bytes and leave other pages untouched."""
+    publish(ServerArgs(model_path="dummy"), role="tokenizer")
+    bundle = build_test_unified_pools(
+        device=DEVICE,
+        kv_cache_dtype=dtype,
+        head_num=2,
+        head_dim=64,
+        v_head_dim=64,
+        swa_head_num=1,
+        swa_head_dim=32,
+        swa_v_head_dim=32,
+        page_size=page_size,
+        start_layer=0,
+        end_layer=4,
+        swa_attention_layer_ids=[3],
+        full_attention_layer_ids=[0, 1, 2],
+        total_bytes=1 << 22,
+        enable_memory_saver=False,
+        need_sort=False,
+        lazy_compaction=True,
+    )
+    pool = bundle.token_to_kv_pool
+    hosts = UnifiedPageEnvelopeHostPool.build_hybrid_swa_pool_pair(
+        device_pools=tuple(map(pool.layer_router.view, ("full", "swa"))),
+        host_to_device_ratio=1.0,
+        host_size=0,
+        page_size=page_size,
+        layout="layer_first",
+        allocator_type="default",
+    )
+    host = dict(zip(("full", "swa"), hosts))[side]
+    device_pages = host._device_page_buffer
+    host_pages = host._host_page_buffer_view
+    generator = torch.Generator().manual_seed(page_size)
+    count = min(device_pages.shape[0], host_pages.shape[0]) // 2
+    device_ids = torch.randperm(device_pages.shape[0], generator=generator)[:count]
+    host_ids = torch.randperm(host_pages.shape[0], generator=generator)[:count]
+    copy_kernel = unified_host.transfer_kv_per_layer_mla
+    launches = []
+
+    def recorded(**kwargs):
+        launches.append(kwargs)
+        return copy_kernel(**kwargs)
+
+    def rows(pages):
+        return (pages[:, None] * page_size + torch.arange(page_size)).reshape(-1)
+
+    def check_launch(src_pages, dst_pages, quota):
+        (launch,) = launches
+        launches.clear()
+        assert launch["item_size"] == host.size_per_token
+        assert torch.equal(launch["src_indices"].cpu(), rows(src_pages))
+        assert torch.equal(launch["dst_indices"].cpu(), rows(dst_pages))
+        if page_size == 1:
+            assert "block_quota" not in launch
+        elif quota is None:
+            assert 2 <= launch["block_quota"] <= 16
+        else:
+            assert launch["block_quota"] == quota
+
+    try:
+        for quota in (None, 1, 16):
+            override = (
+                contextlib.nullcontext()
+                if quota is None
+                else envs.SGLANG_HICACHE_BLOCK_QUOTA.override(quota)
+            )
+            with (
+                override,
+                patch.object(
+                    unified_host, "transfer_kv_per_layer_mla", side_effect=recorded
+                ),
+            ):
+                device_pages.copy_(torch.randint_like(device_pages, 256))
+                host_pages.copy_(torch.randint_like(host_pages, 256))
+                expected = host_pages.clone()
+                expected[host_ids] = device_pages[device_ids.to(DEVICE)].cpu()
+                host.backup_from_device_all_layer_physical(
+                    None,
+                    rows(host_ids).to(DEVICE),
+                    rows(device_ids).to(DEVICE),
+                    "kernel",
+                )
+                torch.cuda.synchronize()
+                assert torch.equal(host_pages, expected)
+                check_launch(device_ids, host_ids, quota)
+
+                host_pages.copy_(torch.randint_like(host_pages, 256))
+                expected = device_pages.clone()
+                expected[device_ids.to(DEVICE)] = host_pages[host_ids].to(DEVICE)
+                host.load_to_device_per_layer_physical(
+                    None,
+                    rows(host_ids).to(DEVICE),
+                    rows(device_ids).to(DEVICE),
+                    0,
+                    "kernel",
+                )
+                torch.cuda.synchronize()
+                assert torch.equal(device_pages, expected)
+                check_launch(host_ids, device_ids, quota)
+    finally:
+        torch.cuda.synchronize()
+        for host_pool in hosts:
+            host_pool.destroy()
         reset_context()
 
 

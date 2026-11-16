@@ -5,11 +5,16 @@ from contextlib import contextmanager
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.device_pool_info import MHABufferInfo, PageEnvelopeBufferInfo
 from sglang.srt.mem_cache.kv.memory.host_backing import _SharedPageEnvelopeHostBacking
 from sglang.srt.mem_cache.pool_host.base import HostKVCache
 from sglang.srt.utils import is_cuda, is_hip
 from sglang.srt.utils.device import async_h2d_tensor
+
+# Arbitrary quotas: target 512 token rows per block and cap at 16 blocks.
+_ITEMS_PER_BLOCK = 512
+_MAX_TRANSFER_BLOCKS = 16
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -343,6 +348,43 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
                 page_size=1,
             )
 
+    def _copies_token_rows(self, io_backend: str) -> bool:
+        return (
+            io_backend == "kernel"
+            and _is_cuda
+            and self.page_size > 1
+            and self._device_page_buffer.device.type == "cuda"
+        )
+
+    def _transfer_token_rows(
+        self,
+        *,
+        src: torch.Tensor,
+        dst: torch.Tensor,
+        src_indices: torch.Tensor,
+        dst_indices: torch.Tensor,
+    ) -> None:
+        # Token-major envelopes let token IDs index rows directly.
+        num_items = src_indices.numel()
+        if num_items % self.page_size != 0:
+            raise ValueError(
+                "Unified page-envelope transfer index count must be page-aligned; "
+                f"got {num_items} indices for page_size={self.page_size}."
+            )
+        block_quota = envs.SGLANG_HICACHE_BLOCK_QUOTA.get()
+        if block_quota is None:
+            block_quota = min(
+                _MAX_TRANSFER_BLOCKS, max(2, -(-num_items // _ITEMS_PER_BLOCK))
+            )
+        transfer_kv_per_layer_mla(
+            src=src.view(-1, self.size_per_token),
+            dst=dst.view(-1, self.size_per_token),
+            src_indices=src_indices.to(dtype=torch.int64).contiguous(),
+            dst_indices=dst_indices.to(dtype=torch.int64).contiguous(),
+            item_size=self.size_per_token,
+            block_quota=block_quota,
+        )
+
     @contextmanager
     def _direct_transfer(self, host_indices, device_indices, io_backend):
         self._shared_backing.acquire_layout()
@@ -383,6 +425,14 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         self, device_pool, host_indices, device_indices, io_backend
     ):
         if not self._has_transfer_indices(host_indices, device_indices):
+            return
+        if self._copies_token_rows(io_backend):
+            self._transfer_token_rows(
+                src=self._device_page_buffer,
+                dst=self._host_page_buffer_view,
+                src_indices=device_indices,
+                dst_indices=host_indices,
+            )
             return
         self._transfer_pages(
             self._device_page_buffer,
@@ -440,6 +490,14 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         if layer_id != 0 or not self._has_transfer_indices(
             host_indices, device_indices
         ):
+            return
+        if self._copies_token_rows(io_backend):
+            self._transfer_token_rows(
+                src=self._host_page_buffer_view,
+                dst=self._device_page_buffer,
+                src_indices=host_indices,
+                dst_indices=device_indices,
+            )
             return
         self._transfer_pages(
             self._host_page_buffer_view,
