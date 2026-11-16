@@ -22,13 +22,14 @@ from sglang.srt.managers.cache_controller import (
     HiCacheController,
     check_dcp_l3_extra_pool,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolName, l3_page_span
+from sglang.srt.mem_cache.hicache_storage import HiCacheStorage, PoolName, l3_page_span
 from sglang.srt.mem_cache.kv.layout.mha import MHAView
 from sglang.srt.mem_cache.kv.layout.mla import MLAView
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.dsa import DSAIndexerPoolHost
 from sglang.srt.mem_cache.pool_host.mamba import MambaPoolHost
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.storage import StorageBackendFactory
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -212,7 +213,9 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
                             )
 
     @staticmethod
-    def _attach_storage(pool, mode="cache"):
+    def _attach_storage(
+        pool, mode="cache", backend="file", backend_extra_config=None
+    ):
         cc = HiCacheController.__new__(HiCacheController)
         cc.mem_pool_host = cc.storage_host_pool = pool
         cc.page_size = pool.logical_page_size
@@ -236,7 +239,9 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
                 "sglang.srt.mem_cache.storage.StorageBackendFactory.create_backend"
             ),
         ):
-            cc.attach_storage_backend("file")
+            cc.attach_storage_backend(
+                backend, storage_backend_extra_config=backend_extra_config
+            )
         return cc
 
     def test_unified_mla_dcp_keeps_native_l3_host_layout(self):
@@ -375,6 +380,62 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
                 pool = _make_host_pool(0, dcp_size=dcp_size)
                 with self.assertRaisesRegex(NotImplementedError, "buffer_only"):
                     self._attach_storage(pool, mode="buffer_only")
+
+    def test_dynamic_backend_attaches_under_dcp_only_when_it_opts_in(self):
+        class _OptedIn(HiCacheStorage):
+            supports_dcp_shards = True
+
+        class _Default(HiCacheStorage):
+            pass
+
+        extra = {
+            "backend_name": "dyn",
+            "module_path": __name__,
+            "class_name": "_Default",
+        }
+        with mock.patch.object(
+            StorageBackendFactory,
+            "_load_backend_class",
+            side_effect=lambda module_path, class_name, backend_name: {
+                "_OptedIn": _OptedIn,
+                "_Default": _Default,
+            }[class_name],
+        ):
+            pool = _make_host_pool(0, dcp_size=2, layout="page_first")
+            with self.assertRaisesRegex(NotImplementedError, "supports_dcp_shards"):
+                self._attach_storage(
+                    pool, backend="dynamic", backend_extra_config=dict(extra)
+                )
+            with self.assertRaisesRegex(NotImplementedError, "supports_dcp_shards"):
+                self._attach_storage(pool, backend="dynamic")
+            with self.assertRaisesRegex(NotImplementedError, "requires file or Mooncake"):
+                self._attach_storage(pool, backend="other")
+            opted_in = dict(extra, class_name="_OptedIn")
+            cc = self._attach_storage(
+                pool, backend="dynamic", backend_extra_config=opted_in
+            )
+            self.assertTrue(cc.enable_storage)
+
+    def test_dynamic_backend_class_resolution(self):
+        extra = {"backend_name": "dyn", "module_path": "m", "class_name": "C"}
+        with mock.patch.object(
+            StorageBackendFactory, "_load_backend_class", return_value=HiCacheStorage
+        ) as load:
+            self.assertIs(
+                StorageBackendFactory.dynamic_backend_class("dynamic", extra),
+                HiCacheStorage,
+            )
+            load.assert_called_once_with("m", "C", "dyn")
+            for backend, config in (
+                ("file", extra),
+                ("dynamic", None),
+                ("dynamic", {}),
+                ("dynamic", {"backend_name": "dyn"}),
+            ):
+                self.assertIsNone(
+                    StorageBackendFactory.dynamic_backend_class(backend, config)
+                )
+        self.assertFalse(HiCacheStorage.supports_dcp_shards)
 
     def test_logical_and_physical_sizing(self):
         pool = _make_host_pool(dcp_rank=3)

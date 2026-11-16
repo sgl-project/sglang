@@ -377,6 +377,11 @@ class HiCacheStorage(ABC):
     It abstracts the underlying storage mechanism, allowing different implementations to be used.
     """
 
+    # A dynamic backend sets this True to be attached under DCP > 1. It then
+    # owns the DCP shard identity: each rank reads and writes only its own
+    # shard of MLA KV, keyed by ``HiCacheStorageConfig.dcp_rank``.
+    supports_dcp_shards: bool = False
+
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         self.mem_pool_host = mem_pool_host
