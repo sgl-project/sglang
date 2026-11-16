@@ -261,6 +261,15 @@ _KIMI_K3_ARCHITECTURES = (
 )
 
 
+_KDA_WEIGHT_SHARD_LOAD_FORMATS_REFUSED = (
+    "sharded_state",
+    "presharded",
+    "remote",
+    "remote_instance",
+    "ipc_cache",
+)
+
+
 def handle_kda_weight_shard(server_args: Any):
     cfg = resolving_view(server_args)
     size = cfg.kda_weight_shard_size
@@ -291,6 +300,23 @@ def handle_kda_weight_shard(server_args: Any):
         )
     if view.attn_cp_size > 1:
         raise ValueError("--kda-weight-shard-size does not support --attn-cp-size > 1.")
+    if cfg.pp_size > 1:
+        raise ValueError(
+            "--kda-weight-shard-size does not support pipeline parallelism."
+        )
+    # These loaders bypass the model's load_weights (or, for the weight cache, also
+    # post_load_weights), which is what fills each rank's shard.
+    if cfg.load_format in _KDA_WEIGHT_SHARD_LOAD_FORMATS_REFUSED:
+        raise ValueError(
+            f"--kda-weight-shard-size does not support --load-format {cfg.load_format}: "
+            "the shards are filled by the model's load_weights (use a checkpoint format "
+            "such as auto or safetensors, or dummy)."
+        )
+    if cfg.weight_cache_mode != "off":
+        raise ValueError(
+            "--kda-weight-shard-size does not support --weight-cache-mode "
+            f"{cfg.weight_cache_mode}: cached weights skip the shard loaders."
+        )
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         raise ValueError(
             "--kda-weight-shard-size requires a Kimi-K3 model configuration."
@@ -301,13 +327,13 @@ def handle_kda_weight_shard(server_args: Any):
             f"--kda-weight-shard-size is only supported for Kimi-K3 (got {architecture})."
         )
     graph = cfg.cuda_graph_config
-    if graph is not None and graph.decode.backend == Backend.FULL:
-        raise ValueError(
-            "--kda-weight-shard-size issues its layer-weight gathers between graph "
-            "segments and cannot run inside a full decode CUDA graph; use "
-            "--cuda-graph-backend-decode breakable or disabled (weight sharding is "
-            "meant for prefill)."
-        )
+    for phase in ("prefill", "decode"):
+        if graph is not None and getattr(graph, phase).backend == Backend.FULL:
+            raise ValueError(
+                "--kda-weight-shard-size issues its layer-weight gathers between graph "
+                f"segments and cannot run inside a full {phase} CUDA graph; use "
+                f"--cuda-graph-backend-{phase} breakable or disabled."
+            )
 
 
 def handle_decode_context_parallelism(server_args: Any):
