@@ -1251,6 +1251,13 @@ def _fwd_kernel_unified(
     mask_indptr,
     sink_ptr,
     window_start_pos,
+    tree_indices,
+    tree_lengths,
+    tree_positions,
+    tree_stride,
+    tree_state,
+    state_stride_q,
+    state_stride_h,
     sm_scale_withk,
     v_scale,
     kv_group_num,
@@ -1280,6 +1287,8 @@ def _fwd_kernel_unified(
     IS_CAUSAL: tl.constexpr,
     USE_CUSTOM_MASK: tl.constexpr,
     HAS_SINK: tl.constexpr,
+    USE_TREE: tl.constexpr = False,
+    TREE_PREFIX_STAGE: tl.constexpr = False,
     IS_GFX1250: tl.constexpr = False,
     PAGE_SIZE: tl.constexpr = 1,
     SCORE_MOD: tl.constexpr = None,
@@ -1289,13 +1298,17 @@ def _fwd_kernel_unified(
     aux0_len=0,
 ):
     """
-    Unified 1-stage kernel for deterministic extend attention.
+    Unified KV traversal for deterministic extend attention.
     Both prefix and extend KV are accessed through the unified kv_indices.
     """
     cur_seq = tl.program_id(0)
     cur_head = tl.program_id(1)
     cur_block_m = tl.program_id(2)
-    cur_kv_head = cur_head // kv_group_num
+    if USE_TREE:
+        head_blocks = tl.cdiv(kv_group_num, BLOCK_M)
+        cur_kv_head = cur_head // head_blocks
+    else:
+        cur_kv_head = cur_head // kv_group_num
 
     # Load sequence information
     cur_seq_q_start_idx = tl.load(qo_indptr + cur_seq)
@@ -1305,8 +1318,14 @@ def _fwd_kernel_unified(
     cur_seq_prefix_len = tl.load(prefix_lens + cur_seq)
 
     # Grid axis 2 spans the batch-max extend length; the store is masked by mask_m.
-    if cur_block_m * BLOCK_M >= cur_seq_q_len:
-        return
+    if USE_TREE:
+        if cur_block_m >= cur_seq_q_len:
+            return
+        tree_len = tl.load(tree_lengths + cur_seq_q_start_idx + cur_block_m)
+        cur_seq_kv_len = cur_seq_prefix_len + tree_len
+    else:
+        if cur_block_m * BLOCK_M >= cur_seq_q_len:
+            return
 
     # Load window start position for sliding window attention
     # This is the absolute position of the first key in the window (0 if no sliding window)
@@ -1321,13 +1340,30 @@ def _fwd_kernel_unified(
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_dv = tl.arange(0, BLOCK_DV)
     offs_m = tl.arange(0, BLOCK_M)
-    mask_m = (cur_block_m * BLOCK_M + offs_m) < cur_seq_q_len
+    if USE_TREE:
+        # Each query has a different ancestor path. Reuse its K/V tile across
+        # the query heads sharing a KV head, instead of across tree siblings.
+        q_row = tl.full((BLOCK_M,), cur_block_m, tl.int32)
+        group_head = (cur_head % head_blocks) * BLOCK_M + offs_m
+        q_head = cur_kv_head * kv_group_num + group_head
+        mask_m = group_head < kv_group_num
+        q_position = tl.load(tree_positions + cur_seq_q_start_idx + cur_block_m)
+    else:
+        q_row = cur_block_m * BLOCK_M + offs_m
+        q_head = tl.full((BLOCK_M,), cur_head, tl.int32)
+        mask_m = q_row < cur_seq_q_len
+        if TREE_PREFIX_STAGE:
+            q_position = tl.load(
+                tree_positions + cur_seq_q_start_idx + q_row, mask_m, other=0
+            )
+        else:
+            q_position = cur_seq_prefix_len + q_row
     mask_d = offs_d < Lq
     mask_dv = offs_dv < Lv
 
     # XAI temperature handling
     if xai_temperature_len > 0:
-        offs_qidx = cur_seq_prefix_len + cur_block_m * BLOCK_M + offs_m
+        offs_qidx = q_position
         xai_temperature_reg = tl.where(
             offs_qidx < xai_temperature_len,
             1.0,
@@ -1336,8 +1372,8 @@ def _fwd_kernel_unified(
 
     # Load Q
     offs_q = (
-        (cur_seq_q_start_idx + cur_block_m * BLOCK_M + offs_m[:, None]) * stride_qbs
-        + cur_head * stride_qh
+        (cur_seq_q_start_idx + q_row[:, None]) * stride_qbs
+        + q_head[:, None] * stride_qh
         + offs_d[None, :]
     )
     q = tl.load(Q + offs_q, mask=(mask_m[:, None]) & (mask_d[None, :]), other=0.0)
@@ -1345,8 +1381,8 @@ def _fwd_kernel_unified(
     if BLOCK_DPE > 0:
         offs_dpe = BLOCK_DMODEL + tl.arange(0, BLOCK_DPE)
         offs_qpe = (
-            (cur_seq_q_start_idx + cur_block_m * BLOCK_M + offs_m[:, None]) * stride_qbs
-            + cur_head * stride_qh
+            (cur_seq_q_start_idx + q_row[:, None]) * stride_qbs
+            + q_head[:, None] * stride_qh
             + offs_dpe[None, :]
         )
         qpe = tl.load(Q + offs_qpe, mask=mask_m[:, None], other=0.0)
@@ -1358,7 +1394,33 @@ def _fwd_kernel_unified(
     e_max = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
 
     start_k, end_k = 0, cur_seq_kv_len
-    if IS_CAUSAL and SLIDING_WINDOW_SIZE > 0 and not USE_CUSTOM_MASK:
+    if USE_TREE or TREE_PREFIX_STAGE:
+        state_offset = (
+            cur_seq_q_start_idx + q_row
+        ) * state_stride_q + q_head * state_stride_h
+        prefix_end = cur_seq_prefix_len // BLOCK_N * BLOCK_N
+        if TREE_PREFIX_STAGE:
+            end_k = prefix_end
+        else:
+            # Continue the unnormalized FP32 online-softmax state. Combining
+            # separately normalized prefix/suffix results would round twice.
+            acc = tl.load(
+                tree_state + state_offset[:, None] + offs_dv[None, :],
+                mask_m[:, None] & mask_dv[None, :],
+                other=0.0,
+            )
+            deno = tl.load(tree_state + state_offset + Lv, mask_m, other=0.0)
+            e_max = tl.load(
+                tree_state + state_offset + Lv + 1, mask_m, other=float("-inf")
+            )
+            start_k = prefix_end
+    if (
+        IS_CAUSAL
+        and SLIDING_WINDOW_SIZE > 0
+        and not USE_CUSTOM_MASK
+        and not USE_TREE
+        and not TREE_PREFIX_STAGE
+    ):
         first_query = cur_block_m * BLOCK_M
         last_query = tl.minimum(first_query + BLOCK_M, cur_seq_q_len)
         start_k = tl.maximum(0, cur_seq_prefix_len + first_query - SLIDING_WINDOW_SIZE)
@@ -1386,7 +1448,7 @@ def _fwd_kernel_unified(
             final_mask &= custom_mask != 0
 
         # Apply causal mask for extend part
-        if IS_CAUSAL and not USE_CUSTOM_MASK:
+        if IS_CAUSAL and not USE_CUSTOM_MASK and not USE_TREE and not TREE_PREFIX_STAGE:
             # Determine if current KV block is in extend region
             # Only apply causal mask when both Q and K are in extend region
             q_idx = cur_block_m * BLOCK_M + offs_m[:, None]
@@ -1406,12 +1468,12 @@ def _fwd_kernel_unified(
         if SLIDING_WINDOW_SIZE > 0:
             # Sliding window mask with correct absolute positions
             # Q absolute position: window_start + prefix_len + q_position_in_extend
-            q_abs_pos = (
-                cur_window_start
-                + cur_seq_prefix_len
-                + cur_block_m * BLOCK_M
-                + offs_m[:, None]
-            )
+            if USE_TREE:
+                q_abs_pos = q_position
+            elif TREE_PREFIX_STAGE:
+                q_abs_pos = q_position[:, None]
+            else:
+                q_abs_pos = cur_window_start + q_position[:, None]
 
             # K absolute position: window_start + k_index_in_unified_array
             k_abs_pos = cur_window_start + start_n + offs_n[None, :]
@@ -1429,8 +1491,28 @@ def _fwd_kernel_unified(
 
         if not SKIP_TILE:
             # Load KV indices
+            logical_k = start_n + offs_n
+            if USE_TREE:
+                # Keep the prefix and ancestors in a single, fixed-width
+                # reduction. Masked siblings must not shift a visible key's
+                # lane or the boundary between online-softmax tiles.
+                suffix_column = tl.load(
+                    tree_indices
+                    + (cur_seq_q_start_idx + cur_block_m) * tree_stride
+                    + logical_k
+                    - cur_seq_prefix_len,
+                    mask=mask_n & (logical_k >= cur_seq_prefix_len),
+                    other=0,
+                )
+                physical_k = tl.where(
+                    logical_k < cur_seq_prefix_len,
+                    logical_k,
+                    cur_seq_prefix_len + suffix_column,
+                )
+            else:
+                physical_k = logical_k
             offs_kv_loc = tl.load(
-                kv_indices + cur_seq_kv_start_idx + start_n + offs_n,
+                kv_indices + cur_seq_kv_start_idx + physical_k,
                 mask=mask_n,
                 other=0,
             ).to(tl.int64)
@@ -1499,15 +1581,30 @@ def _fwd_kernel_unified(
                 qk = logit_cap * tanh(qk / logit_cap)
 
             if xai_temperature_len > 0:
-                qk *= xai_temperature_reg[:, None]
+                if USE_TREE:
+                    qk *= xai_temperature_reg
+                else:
+                    qk *= xai_temperature_reg[:, None]
 
             if SCORE_MOD is not None:
+                if USE_TREE:
+                    score_q_position = q_position
+                    score_k_position = cur_window_start + start_n + offs_n[None, :]
+                    score_head = q_head[:, None]
+                elif TREE_PREFIX_STAGE:
+                    score_q_position = q_position[:, None]
+                    score_k_position = cur_window_start + start_n + offs_n[None, :]
+                    score_head = cur_head
+                else:
+                    score_q_position = q_position[:, None]
+                    score_k_position = start_n + offs_n[None, :]
+                    score_head = cur_head
                 qk = SCORE_MOD(
                     qk,
-                    (cur_seq_prefix_len + cur_block_m * BLOCK_M + offs_m)[:, None],
-                    start_n + offs_n[None, :],
-                    (cur_seq_q_start_idx + cur_block_m * BLOCK_M + offs_m)[:, None],
-                    cur_head,
+                    score_q_position,
+                    score_k_position,
+                    (cur_seq_q_start_idx + q_row)[:, None],
+                    score_head,
                     final_mask,
                     Aux0,
                     aux0_stride_t,
@@ -1556,15 +1653,25 @@ def _fwd_kernel_unified(
 
             e_max = n_e_max
 
+    if TREE_PREFIX_STAGE:
+        tl.store(
+            tree_state + state_offset[:, None] + offs_dv[None, :],
+            acc,
+            mask_m[:, None] & mask_dv[None, :],
+        )
+        tl.store(tree_state + state_offset + Lv, deno, mask_m)
+        tl.store(tree_state + state_offset + Lv + 1, e_max, mask_m)
+        return
+
     # Handle sink tokens
     if HAS_SINK:
-        cur_sink = tl.load(sink_ptr + cur_head)
+        cur_sink = tl.load(sink_ptr + q_head, mask=mask_m, other=0.0)
         deno += tl.exp(cur_sink - e_max)
 
     # Store output
     offs_o = (
-        (cur_seq_q_start_idx + cur_block_m * BLOCK_M + offs_m[:, None]) * stride_obs
-        + cur_head * stride_oh
+        (cur_seq_q_start_idx + q_row[:, None]) * stride_obs
+        + q_head[:, None] * stride_oh
         + offs_dv[None, :]
     )
     tl.store(
@@ -1598,9 +1705,15 @@ def extend_attention_fwd_unified(
     page_size: int = 1,
     score_mod=None,
     aux_tensors=None,
+    tree_indices=None,
+    tree_lengths=None,
+    tree_positions=None,
 ):
     """
-    Unified 1-stage extend attention for deterministic inference.
+    Unified prefix/extend attention with a fixed reduction order.
+
+    Tree verification shares complete prefix tiles, then continues the same
+    online-softmax reduction over each query's remaining prefix and ancestors.
 
     Args:
         q: Query tensor [num_tokens, num_heads, head_dim]
@@ -1622,6 +1735,10 @@ def extend_attention_fwd_unified(
         window_start_pos: Absolute position of first key in sliding window [batch_size]
                          (None if sliding window not used)
         xai_temperature_len: XAI temperature length
+        tree_indices: Optional ordered ancestor columns within the extend region,
+                      [num_tokens, max_len_extend]. The prefix must be fully visible.
+        tree_lengths: Number of ancestors, including self, for each tree query.
+        tree_positions: Absolute positions of the tree queries [num_tokens].
     """
     Lq, Lv = q.shape[-1], v_buffer.shape[-1]
 
@@ -1642,7 +1759,8 @@ def extend_attention_fwd_unified(
     kv_head_num = k_buffer.shape[-2]
     kv_group_num = q.shape[1] // kv_head_num
 
-    USE_CUSTOM_MASK = custom_mask is not None
+    USE_TREE = tree_indices is not None
+    USE_CUSTOM_MASK = custom_mask is not None and not USE_TREE
     HAS_SINK = sinks is not None
 
     # For sliding window attention, window_start_pos tracks the absolute position
@@ -1652,6 +1770,14 @@ def extend_attention_fwd_unified(
         window_start_pos = torch.zeros(batch_size, dtype=torch.int32, device=q.device)
 
     grid = (batch_size, head_num, triton.cdiv(max_len_extend, BLOCK_M))
+    tree_state = None
+    if USE_TREE:
+        assert tree_lengths is not None and tree_positions is not None
+        # Accumulator, denominator, and running maximum, without normalization.
+        # Storage depends on the queries, not on the cached context length.
+        tree_state = torch.empty(
+            (q.shape[0], head_num, Lv + 2), dtype=torch.float32, device=q.device
+        )
     num_stages = 1
 
     extra_kargs = {}
@@ -1669,7 +1795,7 @@ def extend_attention_fwd_unified(
         score_mod, aux_tensors
     )
 
-    _fwd_kernel_unified[grid](
+    kernel_args = (
         q,
         o,
         k_buffer,
@@ -1682,6 +1808,13 @@ def extend_attention_fwd_unified(
         mask_indptr,
         sinks,
         window_start_pos,
+        tree_indices,
+        tree_lengths,
+        tree_positions,
+        tree_indices.stride(0) if USE_TREE else 0,
+        tree_state,
+        tree_state.stride(0) if USE_TREE else 0,
+        tree_state.stride(1) if USE_TREE else 0,
         sm_scale * k_scale,
         v_scale,
         kv_group_num,
@@ -1697,13 +1830,14 @@ def extend_attention_fwd_unified(
         k_tok_stride,
         v_page_stride,
         v_tok_stride,
+    )
+    kernel_kwargs = dict(
         SLIDING_WINDOW_SIZE=sliding_window_size,
         logit_cap=logit_cap,
         xai_temperature_len=xai_temperature_len,
         BLOCK_DMODEL=BLOCK_DMODEL,
         BLOCK_DPE=BLOCK_DPE,
         BLOCK_DV=BLOCK_DV,
-        BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         Lq=Lq,
         Lv=Lv,
@@ -1717,9 +1851,37 @@ def extend_attention_fwd_unified(
         aux0_stride_t=aux0_stride_t,
         aux0_stride_h=aux0_stride_h,
         aux0_len=aux0_len,
-        num_warps=num_warps,
         num_stages=num_stages,
         **extra_kargs,
+    )
+    if USE_TREE:
+        # Share complete prefix tiles across queries as in ordinary extend.
+        # The path-specific stage starts at this same BLOCK_N boundary, so it
+        # can continue the exact online reduction, including a partial prefix
+        # tile followed by ancestors. No separate prefix/suffix LSE merge.
+        _fwd_kernel_unified[grid](
+            *kernel_args,
+            **kernel_kwargs,
+            BLOCK_M=BLOCK_M,
+            USE_TREE=False,
+            TREE_PREFIX_STAGE=True,
+            num_warps=num_warps,
+        )
+        # Keep BLOCK_N and num_warps unchanged: changing the warp count can
+        # change the column reduction and FP32 rounding across a prefix split.
+        # Only shrink the independent row tile for the path-specific head group.
+        BLOCK_M = 16
+        grid = (
+            batch_size,
+            kv_head_num * triton.cdiv(kv_group_num, BLOCK_M),
+            max_len_extend,
+        )
+    _fwd_kernel_unified[grid](
+        *kernel_args,
+        **kernel_kwargs,
+        BLOCK_M=BLOCK_M,
+        USE_TREE=USE_TREE,
+        num_warps=num_warps,
     )
 
 

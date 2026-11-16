@@ -9,7 +9,10 @@ import msgspec
 import torch
 import triton
 
-from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
+from sglang.kernels.ops.attention.metadata import (
+    get_num_kv_splits_triton,
+    prepare_tree_suffix_indices,
+)
 from sglang.kernels.ops.attention.mla_kv_pack_quantize_fp8 import (
     mla_kv_pack_quantize_fp8,
 )
@@ -48,6 +51,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
 from sglang.srt.speculative.eagle_utils import draft_step_writes
+from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.speculative.spec_utils import (
     draft_kv_indices_buffer_width,
     draft_kv_indices_used_len,
@@ -161,6 +165,9 @@ class ForwardMetadata:
     lean_locks: Optional[torch.Tensor] = None
     # One int32, set by get_num_kv_splits when the decode seq lens are uneven
     uneven_batch: Optional[torch.Tensor] = None
+    # Deterministic tree attention: original suffix columns in ancestor order.
+    tree_indices: Optional[torch.Tensor] = None
+    tree_lengths: Optional[torch.Tensor] = None
 
     @property
     def swa_out_cache_loc(self) -> Optional[torch.Tensor]:
@@ -1245,6 +1252,49 @@ class TritonAttnBackend(AttentionBackend):
             lean_locks=lean_locks,
             uneven_batch=uneven_batch,
         )
+        self.init_forward_metadata_in_graph(forward_batch)
+
+    def init_forward_metadata_in_graph(self, forward_batch: ForwardBatch):
+        spec_info = forward_batch.spec_info
+        metadata = self.forward_metadata
+        if not (
+            self.enable_deterministic
+            and forward_batch.forward_mode.is_target_verify()
+            and metadata.custom_mask is not None
+            and spec_info is not None
+            and spec_info.spec_input_type
+            in (
+                SpecInputType.EAGLE_VERIFY,
+                SpecInputType.FROZEN_KV_MTP_VERIFY,
+                SpecInputType.NGRAM_VERIFY,
+            )
+        ):
+            return
+
+        # Read the full tree mask inside capture, after draft has filled it.
+        # These static-shape buffers are shared by every layer, and the packing
+        # kernel is replayed with the new mask on every captured forward.
+        metadata.tree_indices, metadata.tree_lengths = prepare_tree_suffix_indices(
+            metadata.qo_indptr,
+            forward_batch.seq_lens,
+            metadata.mask_indptr,
+            metadata.custom_mask,
+            metadata.max_extend_len,
+            forward_batch.positions.numel(),
+        )
+        # Match the absolute KV tile boundaries used by deterministic prefill.
+        # The leading padding remains masked by each query's logical window.
+        bs = forward_batch.batch_size
+        for rail in metadata.windows.values():
+            window_lens = rail.kv_indptr[1 : bs + 1] - rail.kv_indptr[:bs]
+            rail.aligned_kv_indptr, rail.aligned_kv_indices = (
+                self.align_window_kv_to_tiles(
+                    rail.kv_indptr,
+                    rail.kv_indices,
+                    forward_batch.seq_lens[:bs] - window_lens,
+                    bs,
+                )
+            )
 
     def init_cuda_graph_state(
         self,
@@ -1910,7 +1960,7 @@ class TritonAttnBackend(AttentionBackend):
                 q, k, v, layer, forward_batch, causal, logits_soft_cap, sinks
             )
 
-        # Deterministic mode: use unified 1-stage kernel
+        # Deterministic mode: use a unified prefix/extend reduction order.
         if self.enable_deterministic:
             return self._forward_extend_unified(
                 q,
@@ -2289,7 +2339,7 @@ class TritonAttnBackend(AttentionBackend):
         aux_tensors=None,
     ):
         """
-        Unified 1-stage extend attention for deterministic inference.
+        Unified prefix/extend attention for deterministic inference.
         Both prefix and extend KV are accessed through unified kv_indices.
         """
         bs = forward_batch.batch_size
@@ -2326,7 +2376,12 @@ class TritonAttnBackend(AttentionBackend):
             ):
                 prefix_kv_indptr = rail.aligned_kv_indptr
                 prefix_kv_indices = rail.aligned_kv_indices
-                window_start_pos = forward_batch.extend_prefix_lens[:bs] - (
+                full_prefix_lens = (
+                    forward_batch.seq_lens
+                    if forward_batch.forward_mode.is_target_verify()
+                    else forward_batch.extend_prefix_lens
+                )
+                window_start_pos = full_prefix_lens[:bs] - (
                     prefix_kv_indptr[1 : bs + 1] - prefix_kv_indptr[:bs]
                 )
         else:
@@ -2421,6 +2476,13 @@ class TritonAttnBackend(AttentionBackend):
             page_size=self.page_size,
             score_mod=score_mod,
             aux_tensors=aux_tensors,
+            tree_indices=self.forward_metadata.tree_indices,
+            tree_lengths=self.forward_metadata.tree_lengths,
+            tree_positions=(
+                forward_batch.positions
+                if self.forward_metadata.tree_indices is not None
+                else None
+            ),
         )
 
         return o
