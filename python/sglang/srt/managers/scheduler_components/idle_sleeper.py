@@ -7,6 +7,7 @@ import zmq
 from sglang.srt.environ import envs
 from sglang.srt.observability.req_time_stats import real_time
 from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_device
 
 if TYPE_CHECKING:
     from sglang.srt.rust_server.server import RustServer
@@ -61,7 +62,11 @@ class RustServerIdleSleeper:
         self.timeout_ms = timeout_ms
         self.last_empty_time = real_time()
         self.can_empty_cache = can_empty_cache
-        self.empty_cache_interval = envs.SGLANG_EMPTY_CACHE_INTERVAL.get()
+        # Python's loop empties the cache only in its IdleSleeper, which it
+        # installs only with --sleep-on-idle.
+        self.empty_cache_interval = (
+            envs.SGLANG_EMPTY_CACHE_INTERVAL.get() if get_device().sleep_on_idle else -1
+        )
 
     def maybe_sleep(self):
         self.rust_server.wait_request(self.timeout_ms)

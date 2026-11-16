@@ -39,7 +39,7 @@ jobs:
       (github.event_name == 'push' || github.event.inputs.target == 'all' || github.event.inputs.target == 'cu130')
     strategy:
       matrix:
-        python-version: ["3.10"]
+        python-version: ["3.11"]
         cuda-version: ["13.0"]
         arch: [x86_64, aarch64]
         include:
@@ -134,10 +134,12 @@ jobs:
         run: |
           if [ -z "${{ inputs.tag_name }}" ]; then
             TAG_NAME="v$(cat python/sglang/kernels/aot/python/sgl_kernel/version.py | cut -d'"' -f2)"
-            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
           else
-            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
+            TAG_NAME="${{ inputs.tag_name }}"
           fi
+          # Prefix with the package name so the release tag in sgl-project/whl
+          # does not collide with other packages that share the version number.
+          echo "tag_name=sglang-kernel-${TAG_NAME}" >> $GITHUB_OUTPUT
 
       - name: Release
         uses: softprops/action-gh-release@v2
@@ -174,8 +176,9 @@ jobs:
       matrix:
         python-version: ["3.10"]
         # ROCm 10.0.0 builds inside a Python 3.12 container; the wheel is still
-        # tagged cp310-abi3 (wheel.py-api in pyproject.toml), so it stays under
-        # the same python-version leg as the 7.x wheels.
+        # tagged cp310-abi3 (build_rocm.sh sets wheel.py-api to cp310 for every
+        # ROCm flavor), so it stays under the same python-version leg as the 7.x
+        # wheels.
         #
         # A dispatch that names one flavor builds only that flavor. Every extra
         # leg is another image build on the shared AMD node, and its release job
@@ -236,10 +239,12 @@ jobs:
         run: |
           if [ -z "${{ inputs.tag_name }}" ]; then
             TAG_NAME="v$(cat python/sglang/kernels/aot/python/sgl_kernel/version.py | cut -d'"' -f2)"
-            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
           else
-            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
+            TAG_NAME="${{ inputs.tag_name }}"
           fi
+          # Prefix with the package name so the release tag in sgl-project/whl
+          # does not collide with other packages that share the version number.
+          echo "tag_name=sglang-kernel-${TAG_NAME}" >> $GITHUB_OUTPUT
 
       - name: Release
         uses: softprops/action-gh-release@v2
@@ -288,10 +293,12 @@ jobs:
         run: |
           if [ -z "${{ inputs.tag_name }}" ]; then
             TAG_NAME="v$(cat python/sglang/kernels/aot/python/sgl_kernel/version.py | cut -d'"' -f2)"
-            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
           else
-            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
+            TAG_NAME="${{ inputs.tag_name }}"
           fi
+          # Prefix with the package name so the release tag in sgl-project/whl
+          # does not collide with other packages that share the version number.
+          echo "tag_name=sglang-kernel-${TAG_NAME}" >> $GITHUB_OUTPUT
 
       - name: Release
         uses: softprops/action-gh-release@v2
@@ -388,10 +395,12 @@ jobs:
         run: |
           if [ -z "${{ inputs.tag_name }}" ]; then
             TAG_NAME="v$(cat python/sglang/kernels/aot/python/sgl_kernel/version.py | cut -d'"' -f2)"
-            echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
           else
-            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
+            TAG_NAME="${{ inputs.tag_name }}"
           fi
+          # Prefix with the package name so the release tag in sgl-project/whl
+          # does not collide with other packages that share the version number.
+          echo "tag_name=sglang-kernel-${TAG_NAME}" >> $GITHUB_OUTPUT
 
       - name: Release
         uses: softprops/action-gh-release@v2

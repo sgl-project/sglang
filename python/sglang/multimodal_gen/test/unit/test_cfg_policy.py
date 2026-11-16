@@ -103,3 +103,65 @@ class TestCFGNormalizationPerSample(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCFGNormalizationUnderSequenceParallel(unittest.TestCase):
+    """Under SP each rank combines only its latent shard; the norm must be the whole latent's."""
+
+    @staticmethod
+    def _request(sp_sharded):
+        req = MagicMock()
+        req.cfg_normalization = True
+        req.guidance_rescale = 0
+        req.did_sp_shard_latents = sp_sharded
+        return req
+
+    @staticmethod
+    def _pipeline_config(gather):
+        pipeline_config = MagicMock()
+        pipeline_config.postprocess_cfg_noise.side_effect = lambda _, noise, __: noise
+        pipeline_config.gather_latents_for_sp.side_effect = gather
+        return pipeline_config
+
+    def test_sp_shards_match_single_rank_bitwise(self):
+        from unittest.mock import patch
+
+        from sglang.multimodal_gen.configs.pipeline_configs.zimage import (
+            ZImageCFGPolicy,
+        )
+
+        generator = torch.Generator().manual_seed(0)
+        # [B, C, F, H, W] as in Z-Image, sharded along H over 2 ranks
+        pos = torch.randn(1, 16, 1, 8, 8, generator=generator)
+        neg = torch.randn(1, 16, 1, 8, 8, generator=generator)
+        neg[..., :4, :] *= 0.1
+        policy = ZImageCFGPolicy()
+
+        single = policy.combine(
+            [pos, neg], self._request(False), 5.0, self._pipeline_config(None)
+        )
+
+        full_pred = pos.float() + 5.0 * (pos.float() - neg.float())
+        shards = []
+        with patch(
+            "sglang.multimodal_gen.runtime.distributed.parallel_state.get_sp_world_size",
+            return_value=2,
+        ):
+            for rank in range(2):
+                rows = slice(4 * rank, 4 * rank + 4)
+                pos_r, neg_r = pos[..., rows, :], neg[..., rows, :]
+                pred_r = pos_r.float() + 5.0 * (pos_r.float() - neg_r.float())
+
+                def gather(tensor, batch, pred_r=pred_r):
+                    return full_pred if torch.equal(tensor, pred_r) else pos.float()
+
+                shards.append(
+                    policy.combine(
+                        [pos_r, neg_r],
+                        self._request(True),
+                        5.0,
+                        self._pipeline_config(gather),
+                    )
+                )
+
+        self.assertTrue(torch.equal(torch.cat(shards, dim=3), single))

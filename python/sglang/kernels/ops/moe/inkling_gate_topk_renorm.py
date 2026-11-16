@@ -1,11 +1,10 @@
 """Shape-specialized Inkling MoE gate top-k + renorm JIT kernels.
 
-Three families, all specialized for the Inkling gate layout (logits
+Two families, both specialized for the Inkling gate layout (logits
 ``[tokens, 258]`` fp32 = 256 routed + 2 shared experts, top-6 selection by
 ``sigmoid(logit) + bias``, logsigmoid renorm over selected ++ shared):
 
-- ``inkling_gate_topk_renorm``      -- v1 warp-per-row gate (int64 indices).
-- ``inkling_gate_topk_renorm_v2``   -- v2 gate: wide vector loads, int32
+- ``inkling_gate_topk_renorm_v2``   -- gate: wide vector loads, int32
   indices, optional PDL, in-register raw-logit carry (no re-gather).
 - ``inkling_gate_gemv`` / ``inkling_gate_gemv_fused`` -- expert-per-block GEMV
   of the gate linear (x [tokens, 6144] bf16 @ W [264, 6144] bf16 -> fp32
@@ -41,8 +40,6 @@ def _jit_module() -> Module:
         "fast_math",
         cuda_files=["moe/inkling_gate_topk_renorm.cuh"],
         cuda_wrappers=[
-            ("inkling_gate_topk_renorm", "inkling_gate_topk_renorm"),
-            ("inkling_gate_topk_renorm_packed", "inkling_gate_topk_renorm_packed"),
             ("inkling_gate_topk_renorm_v2", "inkling_gate_topk_renorm_v2"),
             (
                 "inkling_gate_topk_renorm_v2_packed",
@@ -56,21 +53,6 @@ def _jit_module() -> Module:
     )
 
 
-def _launch_inkling_gate_topk_renorm(
-    logits: torch.Tensor,
-    bias: torch.Tensor,
-    global_scale: torch.Tensor,
-    routed_w: torch.Tensor,
-    shared_w: torch.Tensor,
-    indices: torch.Tensor,
-    route_scale: float,
-) -> None:
-    module = _jit_module()
-    module.inkling_gate_topk_renorm(
-        logits, bias, global_scale, routed_w, shared_w, indices, float(route_scale)
-    )
-
-
 def _check_gate_inputs(
     logits: torch.Tensor, bias: torch.Tensor, global_scale: torch.Tensor
 ) -> None:
@@ -79,65 +61,6 @@ def _check_gate_inputs(
     assert bias.is_cuda and bias.dtype == torch.float32 and bias.shape == (256,)
     assert global_scale.is_cuda and global_scale.dtype == torch.float32
     assert global_scale.numel() == 1
-
-
-def inkling_gate_topk_renorm(
-    logits: torch.Tensor,
-    bias: torch.Tensor,
-    global_scale: torch.Tensor,
-    route_scale: float,
-    *,
-    return_packed: bool = False,
-) -> (
-    tuple[torch.Tensor, torch.Tensor, torch.Tensor] | tuple[torch.Tensor, torch.Tensor]
-):
-    """Select top-6 routed experts from 256 and renorm with 2 shared experts.
-
-    This is specialized for the Inkling fused gate layout:
-    ``logits`` is ``[tokens, 258]`` fp32, where columns ``0:256`` are routed
-    experts and columns ``256:258`` are shared experts. The top-k selection key is
-    ``sigmoid(logits[:, :256]) + bias``; renorm is over sigmoid(raw logits) for
-    the selected routed experts plus both shared experts.
-
-    ``return_packed=True`` emits the FlashInfer routed-MoE pack instead of the
-    routed_w + indices pair: ``packed[t,6]`` int32 = ``(expert_id << 16) | bf16
-    weight bits``. Returns ``(packed, shared_w)``.
-    """
-    _check_gate_inputs(logits, bias, global_scale)
-
-    tokens = logits.shape[0]
-    shared_w = torch.empty(
-        (tokens, _N_SHARED), dtype=torch.float32, device=logits.device
-    )
-    if return_packed:
-        packed = torch.empty((tokens, _TOPK), dtype=torch.int32, device=logits.device)
-        if tokens == 0:
-            return packed, shared_w
-        _jit_module().inkling_gate_topk_renorm_packed(
-            logits,
-            bias.contiguous(),
-            global_scale.contiguous(),
-            packed,
-            shared_w,
-            float(route_scale),
-        )
-        return packed, shared_w
-
-    routed_w = torch.empty((tokens, _TOPK), dtype=torch.float32, device=logits.device)
-    indices = torch.empty((tokens, _TOPK), dtype=torch.int64, device=logits.device)
-    if tokens == 0:
-        return routed_w, shared_w, indices
-
-    _launch_inkling_gate_topk_renorm(
-        logits,
-        bias.contiguous(),
-        global_scale.contiguous(),
-        routed_w,
-        shared_w,
-        indices,
-        route_scale,
-    )
-    return routed_w, shared_w, indices
 
 
 def inkling_gate_topk_renorm_v2(
@@ -150,7 +73,12 @@ def inkling_gate_topk_renorm_v2(
     enable_pdl: bool = False,
     warps_per_block: int = 0,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None, torch.Tensor, torch.Tensor | None]:
-    """v2 gate kernel; same math as v1 but int32 indices and optional PDL.
+    """Select top-6 routed experts from 256 and renorm with 2 shared experts.
+
+    ``logits`` is ``[tokens, 258]`` fp32: columns ``0:256`` are routed experts
+    and ``256:258`` shared experts. The selection key is
+    ``sigmoid(logits[:, :256]) + bias``; renorm is over sigmoid(raw logits) of
+    the selected routed experts plus both shared experts.
 
     Returns ``(routed_w, indices, shared_w, packed)`` where the unused half is
     ``None`` depending on ``return_packed`` -- mirroring the triton

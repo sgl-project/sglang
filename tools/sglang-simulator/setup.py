@@ -18,4 +18,11 @@ setup(
     packages=find_packages(where="src"),
     package_dir={"": "src"},
     py_modules=["usercustomize"],
+    package_data={
+        "sglang_simulator.tools.collect_baseline": ["README.md"],
+        "sglang_simulator.tools.train_ml_time_predictor": [
+            "README.md",
+            "example_steps.jsonl",
+        ],
+    },
 )

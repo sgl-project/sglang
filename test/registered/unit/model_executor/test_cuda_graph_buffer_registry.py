@@ -18,9 +18,11 @@ import dataclasses
 import unittest
 from types import SimpleNamespace
 from typing import Optional
+from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     CudaGraphBufferRegistry,
     GraphSlot,
@@ -29,7 +31,7 @@ from sglang.srt.model_executor.cuda_graph_buffer_registry import (
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
 
 @dataclasses.dataclass
@@ -260,6 +262,38 @@ class TestFillFromAndExtract(unittest.TestCase):
             )
         )
 
+    def test_padding_reset_follows_each_axis(self):
+        """A replay may pad bs alone (ragged verify slots) or tokens alone (prefill
+        buckets); the padded axis's tail is still reset."""
+        r = self._build_registry()
+
+        def fill(*, raw_bs, raw_num_tokens):
+            for name in ("req_pool_indices", "seq_lens", "out_cache_loc"):
+                r.get_slot(name).buffer.fill_(99)
+            fb = _MiniForwardBatch(
+                batch_size=raw_bs,
+                req_pool_indices=torch.arange(raw_bs, dtype=torch.int64) + 1,
+                seq_lens=torch.arange(raw_bs, dtype=torch.int32) + 20,
+                out_cache_loc=torch.arange(raw_num_tokens, dtype=torch.int64) + 100,
+            )
+            r.fill_from(
+                fb,
+                raw_bs=raw_bs,
+                padded_bs=4,
+                raw_num_tokens=raw_num_tokens,
+                padded_num_tokens=8,
+            )
+            return lambda name: r.get_slot(name).buffer.tolist()
+
+        with envs.SGLANG_OPT_CUDA_GRAPH_FILL_FAST_PATH.override(True):
+            slots = fill(raw_bs=2, raw_num_tokens=8)
+            self.assertEqual(slots("req_pool_indices"), [1, 2, 0, 0])
+            self.assertEqual(slots("seq_lens"), [20, 21, 5, 5])
+            slots = fill(raw_bs=4, raw_num_tokens=6)
+            self.assertEqual(
+                slots("out_cache_loc"), [100, 101, 102, 103, 104, 105, 0, 0]
+            )
+
     def test_keep_pad_preserves_padded_tail(self):
         r = _make_registry(max_bs=4, max_num_tokens=8)
         r.register_slot(
@@ -339,6 +373,52 @@ class TestFillFromAndExtract(unittest.TestCase):
         # Template itself NOT mutated (replace returns a new instance).
         self.assertEqual(fb.batch_size, 2)
         self.assertIsNot(fb_view, fb)
+
+
+class TestFieldCopyPlan(unittest.TestCase):
+    def test_one_plan_per_destination_layout(self):
+        from sglang.kernels.ops.memory import small_field_copy
+
+        dst, other = torch.zeros(4), torch.zeros(4)
+        src = torch.ones(4)
+        plans = []
+
+        def make_plan():
+            plans.append(Mock(return_value=True))
+            return plans[-1]
+
+        with (
+            patch.object(small_field_copy, "_PLANS", {}),
+            patch.object(small_field_copy, "SmallFieldCopyPlan", make_plan),
+        ):
+            for dsts in ([dst], [dst], [other], [dst, other]):
+                self.assertTrue(small_field_copy.cached_small_field_copy(dsts, [src]))
+        self.assertEqual(len(plans), 3)
+        self.assertEqual(plans[0].call_count, 2)
+
+    def test_grouped_copy_tries_the_plan_first_only_when_enabled(self):
+        from sglang.srt.model_executor import cuda_graph_buffer_registry as registry
+        from sglang.srt.model_executor.runner_utils import buffers
+
+        dst = SimpleNamespace(is_cuda=True)
+        for module in (registry, buffers):
+            for enabled, planned in ((False, True), (True, True), (True, False)):
+                with (
+                    self.subTest(module=module.__name__, enabled=enabled),
+                    patch.object(module, "_FIELD_COPY_PLAN", enabled),
+                    patch(
+                        "sglang.kernels.ops.memory.small_field_copy."
+                        "cached_small_field_copy",
+                        return_value=planned,
+                    ) as plan,
+                    patch(
+                        "sglang.kernels.ops.memory.small_copy.try_small_copy",
+                        return_value=True,
+                    ) as small_copy,
+                ):
+                    module._grouped_foreach_copy_([dst], [object()])
+                self.assertEqual(plan.call_count, int(enabled))
+                self.assertEqual(small_copy.call_count, int(not (enabled and planned)))
 
 
 class TestMissingAndOptionalSlots(unittest.TestCase):

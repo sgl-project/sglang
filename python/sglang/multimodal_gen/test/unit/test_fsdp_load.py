@@ -3,8 +3,10 @@
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 from safetensors.torch import safe_open, save_file
 from torch import nn
@@ -12,6 +14,7 @@ from torch import nn
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     ReplicatedLinear,
+    RowParallelLinear,
     UnquantizedLinearMethod,
 )
 from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
@@ -43,6 +46,11 @@ class _ReplicatedLinearModel(_UniformDtypeModel):
     def __init__(self) -> None:
         super().__init__()
         self.proj = ReplicatedLinear(4, 4, bias=False)
+
+
+class _TransposedReplicatedLinear(ReplicatedLinear):
+    def weight_loader(self, param, loaded_weight):
+        super().weight_loader(param, loaded_weight.T)
 
 
 class _CustomEntrypointModel(_UniformDtypeModel):
@@ -290,6 +298,29 @@ class TestOrdinaryWeightLoading(unittest.TestCase):
             fsdp_load._can_assign_tensor_without_copy(tp_param, tensor, tp_param)
         )
 
+    def test_custom_linear_loader_is_not_bypassed(self):
+        """Storage adoption must preserve a subclass's checkpoint transformation."""
+        devices = ["cpu", "cuda:0"] if torch.cuda.is_available() else ["cpu"]
+        for device in devices:
+            with torch.device("meta"):
+                model = _UniformDtypeModel()
+                model.proj = _TransposedReplicatedLinear(4, 4, bias=False)
+            checkpoint_weight = torch.arange(
+                16, dtype=torch.float32, device=device
+            ).reshape(4, 4)
+            fsdp_load.load_model_from_full_model_state_dict(
+                model,
+                iter((("proj.weight", checkpoint_weight),)),
+                checkpoint_load_device=torch.device(device),
+                param_dtype=torch.float32,
+                strict=True,
+                param_names_mapping=fsdp_load.get_param_names_mapping({}),
+                allow_device_tensor_assignment=True,
+            )
+            torch.testing.assert_close(
+                model.proj.weight, checkpoint_weight.T, rtol=0, atol=0
+            )
+
 
 class TestDevicePostprocessMove(unittest.TestCase):
     def test_postprocess_move_preserves_meta_buffers_for_post_load_weights(self):
@@ -467,7 +498,7 @@ class TestRankLocalSafetensorsRead(unittest.TestCase):
                     shard_dim=0,
                     tp_rank=0,
                     tp_size=2,
-                    output_sizes=[4, 4, 4],
+                    shard_sizes=[4, 4, 4],
                 )
                 rank1 = rank_local_checkpoint.read_tp_local_tensor(
                     sources,
@@ -475,7 +506,7 @@ class TestRankLocalSafetensorsRead(unittest.TestCase):
                     shard_dim=0,
                     tp_rank=1,
                     tp_size=2,
-                    output_sizes=[4, 4, 4],
+                    shard_sizes=[4, 4, 4],
                 )
 
             torch.testing.assert_close(naive, fused[:6])
@@ -502,9 +533,76 @@ class TestRankLocalSafetensorsRead(unittest.TestCase):
                     tp_rank=1,
                     tp_size=2,
                 )
+                segmented = rank_local_checkpoint.read_tp_local_tensor(
+                    sources,
+                    {file_path: handle},
+                    shard_dim=1,
+                    tp_rank=1,
+                    tp_size=2,
+                    shard_sizes=[2, 2],
+                )
 
             expected = torch.cat((first[:, 2:4], second[:, 2:4]))
             torch.testing.assert_close(tensor, expected)
+            torch.testing.assert_close(segmented, torch.cat((first, second))[:, [1, 3]])
             self.assertEqual(
                 rank_local_checkpoint.tp_local_shape(sources, 1, 2), (8, 2)
             )
+
+    @pytest.mark.usefixtures("single_process_model_parallel")
+    def test_rank_local_row_segments_reach_final_parameters(self):
+        weight = torch.arange(96, dtype=torch.bfloat16).reshape(4, 24)
+        bias = torch.arange(4, dtype=torch.bfloat16)
+        mapping = fsdp_load.get_param_names_mapping({})
+        with tempfile.TemporaryDirectory() as temp_dir:
+            file_path = str(Path(temp_dir) / "model.safetensors")
+            save_file({"proj.weight": weight, "proj.bias": bias}, file_path)
+            for tp_size in (2, 4):
+                for rank in range(tp_size):
+                    with (
+                        self.subTest(tp_size=tp_size, rank=rank),
+                        patch.object(
+                            rank_local_checkpoint,
+                            "get_tp_world_size",
+                            return_value=tp_size,
+                        ),
+                        patch.object(
+                            rank_local_checkpoint, "get_tp_rank", return_value=rank
+                        ),
+                    ):
+                        with torch.device("meta"):
+                            model = _UniformDtypeModel()
+                            model.proj = RowParallelLinear(
+                                24,
+                                4,
+                                input_sizes=[8, 16],
+                                params_dtype=torch.bfloat16,
+                                tp_group=SimpleNamespace(
+                                    world_size=tp_size, rank_in_group=rank
+                                ),
+                            )
+                        state = rank_local_checkpoint.try_load_rank_local_tp_state_dict(
+                            model, [file_path], mapping
+                        )
+                        self.assertIsNotNone(state)
+                        fsdp_load.load_model_from_full_model_state_dict(
+                            model,
+                            iter(()),
+                            checkpoint_load_device=torch.device("cpu"),
+                            param_dtype=torch.bfloat16,
+                            strict=True,
+                            preconverted_state_dict=state,
+                        )
+                        expected = torch.cat(
+                            [
+                                part.chunk(tp_size, dim=1)[rank]
+                                for part in weight.split([8, 16], dim=1)
+                            ],
+                            dim=1,
+                        )
+                        torch.testing.assert_close(
+                            model.proj.weight, expected, rtol=0, atol=0
+                        )
+                        torch.testing.assert_close(
+                            model.proj.bias, bias, rtol=0, atol=0
+                        )

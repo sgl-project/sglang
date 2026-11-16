@@ -1,4 +1,5 @@
 import unittest
+from unittest.mock import patch
 
 import torch
 import triton
@@ -8,20 +9,20 @@ from sglang.kernels.ops.attention.fla.cumsum import chunk_local_cumsum
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_kda_packed_decode,
 )
-from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
-    fused_sigmoid_gating_delta_rule_update,
-)
 from sglang.kernels.ops.attention.fla.index import prepare_chunk_indices
 from sglang.kernels.ops.attention.fla.kda import (
     chunk_kda,
     fused_recurrent_kda,
     kda_gate_chunk_cumsum,
 )
-from sglang.srt.utils.common import get_device
+from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
+    fused_sigmoid_gating_delta_rule_update,
+)
+from sglang.srt.utils.device import get_device
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=25, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=28, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=12, stage="stage-b", runner_config="1-gpu-large-amd")
 
 
@@ -710,6 +711,27 @@ class TestKDAPackedDecode(unittest.TestCase):
             rtol=1e-2,
         )
 
+    @unittest.skipIf(torch.version.hip, "Safe-gate packed decode is CUDA-only")
+    def test_safe_gate_packed_decode_stays_on_triton(self):
+        """Safe-gate layers take packed decode on CUDA, on the triton kernel: the
+        row-streaming kernel is slower at their 8-32 heads per rank."""
+        from sglang.kernels.ops.attention import kda_packed_decode as row_kernel
+        from sglang.srt.layers.attention.linear.kda_backend import KDAKernelDispatcher
+        from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
+
+        backend = LinearAttnKernelBackend.TRITON
+        dispatcher = KDAKernelDispatcher(
+            decode_backend=backend, prefill_backend=backend, verify_backend=backend
+        )
+        self.assertTrue(dispatcher.supports_packed_decode_safe_gate)
+        inputs = list(self._make_inputs(16, 8, 8, 128, 128, 20, torch.bfloat16, "cuda"))
+        inputs[5] = inputs[5].float()
+        with patch.object(row_kernel, "kda_packed_decode", side_effect=AssertionError):
+            self._run_packed(*inputs, 8, 128, 128, lower_bound=-5.0)
+            # Without the safe gate the same inputs reach the row kernel.
+            with self.assertRaises(AssertionError):
+                self._run_packed(*inputs, 8, 128, 128)
+
 
 @unittest.skipIf(not torch.cuda.is_available(), "Test requires CUDA")
 class TestKDAVerifyDecodeParity(CustomTestCase):
@@ -790,6 +812,7 @@ class TestKDAVerifyDecodeParity(CustomTestCase):
         )
         return decode_output, decode_state, verify_output, verify_state[slots]
 
+    @unittest.skipIf(torch.version.hip, "match_cutedsl_decode is NVIDIA-only")
     def test_bf16_state_verify_matches_single_token_launches(self):
         for K in (128, 64):
             with self.subTest(head_dim=K):
@@ -818,6 +841,7 @@ class TestKDAVerifyDecodeParity(CustomTestCase):
             verify_output.float(), decode_output.float(), atol=2e-2, rtol=1e-2
         )
 
+    @unittest.skipIf(torch.version.hip, "match_cutedsl_decode is NVIDIA-only")
     def test_fp32_state_pool_is_not_rounded(self):
         _, decode_state, _, verify_state = self._run_decode_loop_and_verify(
             B=2, T=16, H=4, K=128, state_dtype=torch.float32, match_decode=True
@@ -825,6 +849,13 @@ class TestKDAVerifyDecodeParity(CustomTestCase):
         self.assertTrue(torch.equal(verify_state, decode_state))
         rounded = verify_state.to(torch.bfloat16).to(torch.float32)
         self.assertFalse(torch.equal(verify_state, rounded))
+
+    @unittest.skipUnless(torch.version.hip, "ROCm rejects the parity mode")
+    def test_parity_mode_is_rejected_on_rocm(self):
+        with self.assertRaises(NotImplementedError):
+            self._run_decode_loop_and_verify(
+                B=1, T=1, H=1, K=64, state_dtype=torch.bfloat16, match_decode=True
+            )
 
 
 if __name__ == "__main__":

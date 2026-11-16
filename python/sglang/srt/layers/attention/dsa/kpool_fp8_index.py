@@ -4,10 +4,14 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import (
     INDEXER_K_CACHE_PRESHUFFLE_TILE,
     aiter_can_use_preshuffle_paged_mqa,
 )
+from sglang.srt.utils import is_cuda
+
+_is_cuda = is_cuda()
 
 BLOCK_SIZE_K = 64
 INDEX_HEAD_DIM = 128
@@ -586,6 +590,177 @@ def _append_kpool_tail_to_topk_kernel(
     tl.store(out_ptr + row * out_stride_0 + cols * out_stride_1, value, mask=mask)
 
 
+def _kpool_topk_v2_enabled() -> bool:
+    return _is_cuda and envs.SGLANG_OPT_USE_TOPK_V2.get()
+
+
+def build_kpool_topk_v2_plan(pool_lens: torch.Tensor) -> Optional[torch.Tensor]:
+    if not _kpool_topk_v2_enabled():
+        return None
+    plan = pool_lens.new_empty((pool_lens.shape[0] + 1, 2), dtype=torch.int32)
+    refresh_kpool_topk_v2_plan(plan=plan, pool_lens=pool_lens)
+    return plan
+
+
+def refresh_kpool_topk_v2_plan(*, plan: torch.Tensor, pool_lens: torch.Tensor) -> None:
+    from sglang.kernels.ops.attention.dsv4.topk import plan_topk_v2
+
+    plan_topk_v2(pool_lens.to(torch.int32), out=plan)
+
+
+def _kpool_topk_v2_layout_ok(*, logits: torch.Tensor, pool_size: int) -> bool:
+    return (
+        _kpool_topk_v2_enabled()
+        and logits.dtype == torch.float32
+        and logits.stride(1) == 1
+        and logits.stride(0) % 4 == 0
+        and logits.data_ptr() % 16 == 0
+        and pool_size > 1
+        and pool_size & (pool_size - 1) == 0
+    )
+
+
+def _can_use_kpool_topk_v2(
+    *,
+    logits: torch.Tensor,
+    pool_size: int,
+    row_starts: torch.Tensor | None,
+    page_table_row_index: torch.Tensor | None,
+) -> bool:
+    return (
+        row_starts is None
+        and page_table_row_index is None
+        and logits.shape[1] % 4 == 0
+        and _kpool_topk_v2_layout_ok(logits=logits, pool_size=pool_size)
+    )
+
+
+def _alloc_kpool_topk_out(
+    *, logits: torch.Tensor, rows: int, out_cols: int, out_rows: int | None
+) -> torch.Tensor:
+    if out_rows is None or out_rows == rows:
+        return logits.new_empty((rows, out_cols), dtype=torch.int32)
+    return logits.new_full((out_rows, out_cols), -1, dtype=torch.int32)
+
+
+def _kpool_topk_v2_ragged(
+    *,
+    logits: torch.Tensor,
+    group_lengths: torch.Tensor,
+    pool_size: int,
+    topk: int,
+    page_table: torch.Tensor | None,
+    page_table_row_index: torch.Tensor | None,
+    topk_offsets: torch.Tensor | None,
+    seq_lens: torch.Tensor | None,
+    row_starts: torch.Tensor | None,
+    out_rows: int | None,
+) -> torch.Tensor:
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_kpool_ragged_v2
+
+    rows = logits.shape[0]
+    out_cols = topk + (pool_size - 1 if seq_lens is not None else 0)
+    full = _alloc_kpool_topk_out(
+        logits=logits, rows=rows, out_cols=out_cols, out_rows=out_rows
+    )
+    topk_transform_kpool_ragged_v2(
+        scores=logits,
+        pool_lens=group_lengths.to(torch.int32),
+        out=full[:rows],
+        pool_size=pool_size,
+        row_starts=None if row_starts is None else row_starts.to(torch.int32),
+        token_seq_lens=None if seq_lens is None else seq_lens.to(torch.int32),
+        page_table=page_table,
+        page_table_row_index=(
+            None
+            if page_table_row_index is None
+            else page_table_row_index.to(torch.int32)
+        ),
+        out_offsets=topk_offsets,
+    )
+    return full
+
+
+def _kpool_topk_v2(
+    *,
+    logits: torch.Tensor,
+    group_lengths: torch.Tensor,
+    pool_size: int,
+    topk: int,
+    page_table: torch.Tensor | None,
+    topk_offsets: torch.Tensor | None,
+    seq_lens: torch.Tensor | None,
+    out_rows: int | None,
+    topk_v2_plan: torch.Tensor,
+) -> torch.Tensor:
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_kpool_v2
+
+    rows = logits.shape[0]
+    group_lengths = group_lengths.to(torch.int32)
+    out_cols = topk + (pool_size - 1 if seq_lens is not None else 0)
+    full = _alloc_kpool_topk_out(
+        logits=logits, rows=rows, out_cols=out_cols, out_rows=out_rows
+    )
+    topk_transform_kpool_v2(
+        scores=logits,
+        pool_lens=group_lengths,
+        out=full[:rows],
+        pool_size=pool_size,
+        metadata=topk_v2_plan,
+        token_seq_lens=None if seq_lens is None else seq_lens.to(torch.int32),
+        page_table=page_table,
+        out_offsets=topk_offsets,
+    )
+    return full
+
+
+def _try_kpool_topk_v2(
+    *,
+    logits: torch.Tensor,
+    group_lengths: torch.Tensor,
+    kpool: int,
+    topk: int,
+    page_table: torch.Tensor | None,
+    page_table_row_index: torch.Tensor | None,
+    topk_offsets: torch.Tensor | None,
+    seq_lens: torch.Tensor | None,
+    row_starts: torch.Tensor | None,
+    out_rows: int | None,
+    topk_v2_plan: torch.Tensor | None,
+) -> torch.Tensor | None:
+    if topk_v2_plan is not None and _can_use_kpool_topk_v2(
+        logits=logits,
+        pool_size=kpool,
+        row_starts=row_starts,
+        page_table_row_index=page_table_row_index,
+    ):
+        return _kpool_topk_v2(
+            logits=logits,
+            group_lengths=group_lengths,
+            pool_size=kpool,
+            topk=topk,
+            page_table=page_table,
+            topk_offsets=topk_offsets,
+            seq_lens=seq_lens,
+            out_rows=out_rows,
+            topk_v2_plan=topk_v2_plan,
+        )
+    if _kpool_topk_v2_layout_ok(logits=logits, pool_size=kpool):
+        return _kpool_topk_v2_ragged(
+            logits=logits,
+            group_lengths=group_lengths,
+            pool_size=kpool,
+            topk=topk,
+            page_table=page_table,
+            page_table_row_index=page_table_row_index,
+            topk_offsets=topk_offsets,
+            seq_lens=seq_lens,
+            row_starts=row_starts,
+            out_rows=out_rows,
+        )
+    return None
+
+
 def topk_from_pooled_history_logits(
     logits: torch.Tensor,
     group_lengths: torch.Tensor,
@@ -597,6 +772,7 @@ def topk_from_pooled_history_logits(
     row_starts: torch.Tensor | None = None,
     out_rows: int | None = None,
     page_table_row_index: torch.Tensor | None = None,
+    topk_v2_plan: torch.Tensor | None = None,
 ) -> torch.Tensor:
     assert logits.ndim == 2
     assert group_lengths.ndim == 1
@@ -606,7 +782,6 @@ def topk_from_pooled_history_logits(
     assert out_rows is None or out_rows >= logits.shape[0]
     assert page_table_row_index is None or page_table is not None
 
-    _, cols = logits.shape
     group_topk = history_group_budget_for_topk(topk, kpool)
     if topk_offsets is not None and topk_offsets.ndim == 2:
         assert topk_offsets.shape[1] == 1
@@ -623,6 +798,22 @@ def topk_from_pooled_history_logits(
             "index_kpool topk requires CUDA float32 logits; PyTorch topk fallback "
             f"is disabled. Got device={logits.device}, dtype={logits.dtype}."
         )
+
+    v2_result = _try_kpool_topk_v2(
+        logits=logits,
+        group_lengths=group_lengths,
+        kpool=kpool,
+        topk=topk,
+        page_table=page_table,
+        page_table_row_index=page_table_row_index,
+        topk_offsets=topk_offsets,
+        seq_lens=seq_lens,
+        row_starts=row_starts,
+        out_rows=out_rows,
+        topk_v2_plan=topk_v2_plan,
+    )
+    if v2_result is not None:
+        return v2_result
 
     if group_topk in (128, 160, 192, 224, 256, 512):
         from sglang.kernels.ops.attention.dsa.kpool_topk_transform import (
@@ -648,6 +839,35 @@ def topk_from_pooled_history_logits(
         padded[: result.shape[0]] = result
         return padded
 
+    return _kpool_topk_unfused(
+        logits=logits,
+        group_lengths=group_lengths,
+        kpool=kpool,
+        topk=topk,
+        group_topk=group_topk,
+        page_table=page_table,
+        page_table_row_index=page_table_row_index,
+        topk_offsets=topk_offsets,
+        seq_lens=seq_lens,
+        row_starts=row_starts,
+        out_rows=out_rows,
+    )
+
+
+def _kpool_topk_unfused(
+    *,
+    logits: torch.Tensor,
+    group_lengths: torch.Tensor,
+    kpool: int,
+    topk: int,
+    group_topk: int,
+    page_table: torch.Tensor | None,
+    page_table_row_index: torch.Tensor | None,
+    topk_offsets: torch.Tensor | None,
+    seq_lens: torch.Tensor | None,
+    row_starts: torch.Tensor | None,
+    out_rows: int | None,
+) -> torch.Tensor:
     assert page_table_row_index is None, (
         "page_table_row_index requires the fused fast_kpool group_topk path"
     )
@@ -662,7 +882,7 @@ def topk_from_pooled_history_logits(
     )
 
     rank = torch.arange(group_topk, device=logits.device, dtype=torch.int32)
-    max_valid_groups = min(cols, group_topk)
+    max_valid_groups = min(logits.shape[1], group_topk)
     valid_counts = torch.minimum(
         group_lengths.to(torch.int32),
         torch.full_like(group_lengths.to(torch.int32), max_valid_groups),
@@ -1448,133 +1668,6 @@ def _scatter_kpool_tail_updates_kernel(
     )
     tl.store(tail_k_ptr + dst, k, mask=mask)
     tl.store(tail_score_ptr + dst, s, mask=mask)
-
-
-@triton.jit
-def _pack_pool_slots_to_payload_kernel(
-    buf_ptr,
-    locs_ptr,
-    payload_ptr,
-    payload_bytes: tl.constexpr,
-    index_page_size: tl.constexpr,
-    head_dim: tl.constexpr,
-    page_bytes: tl.constexpr,
-    scale_region_off: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    row = tl.program_id(0)
-    loc = tl.load(locs_ptr + row).to(tl.int64)
-    page = loc // index_page_size
-    slot = loc % index_page_size
-    page_base = page * page_bytes
-
-    offs = tl.arange(0, BLOCK_D)
-    mask = offs < head_dim
-    src = page_base + slot * head_dim + offs
-    val = tl.load(buf_ptr + src, mask=mask, other=0).to(tl.uint8)
-    tl.store(payload_ptr + row * payload_bytes + offs, val, mask=mask)
-
-    s_offs = tl.arange(0, 4)
-    s_src = page_base + scale_region_off + slot * 4 + s_offs
-    s_val = tl.load(buf_ptr + s_src).to(tl.uint8)
-    tl.store(payload_ptr + row * payload_bytes + head_dim + s_offs, s_val)
-
-
-@triton.jit
-def _select_and_scatter_pool_slots_kernel(
-    recv_ptr,
-    owner_ptr,
-    locs_ptr,
-    buf_ptr,
-    cp_rank: tl.constexpr,
-    payload_bytes: tl.constexpr,
-    index_page_size: tl.constexpr,
-    head_dim: tl.constexpr,
-    page_bytes: tl.constexpr,
-    scale_region_off: tl.constexpr,
-    n_total: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    row = tl.program_id(0)
-    owner = tl.load(owner_ptr + row).to(tl.int64)
-    if owner == cp_rank:
-        return
-
-    loc = tl.load(locs_ptr + row).to(tl.int64)
-    page = loc // index_page_size
-    slot = loc % index_page_size
-    page_base = page * page_bytes
-    recv_row_base = (owner * n_total + row) * payload_bytes
-
-    offs = tl.arange(0, BLOCK_D)
-    mask = offs < head_dim
-    val = tl.load(recv_ptr + recv_row_base + offs, mask=mask, other=0).to(tl.uint8)
-    dst = page_base + slot * head_dim + offs
-    tl.store(buf_ptr + dst, val, mask=mask)
-
-    s_offs = tl.arange(0, 4)
-    s_val = tl.load(recv_ptr + recv_row_base + head_dim + s_offs).to(tl.uint8)
-    s_dst = page_base + scale_region_off + slot * 4 + s_offs
-    tl.store(buf_ptr + s_dst, s_val)
-
-
-def all_gather_and_scatter_pool_slots(
-    buf: torch.Tensor,
-    local_locs: torch.Tensor,
-    owner_rank: torch.Tensor,
-    cp_size: int,
-    cp_rank: int,
-    index_page_size: int,
-) -> None:
-    from sglang.srt.layers.dp_attention import attn_cp_all_gather_into_tensor
-
-    assert buf.is_contiguous()
-    n_total = local_locs.shape[0]
-    if n_total == 0 or cp_size <= 1:
-        return
-
-    head_dim = INDEX_HEAD_DIM
-    payload_bytes = head_dim + 4
-    scale_region_off = index_page_size * head_dim
-    page_bytes = buf.shape[1]
-    device = buf.device
-
-    send_payload = torch.empty(
-        (n_total, payload_bytes), dtype=torch.uint8, device=device
-    )
-    _pack_pool_slots_to_payload_kernel[(n_total,)](
-        buf,
-        local_locs,
-        send_payload,
-        payload_bytes=payload_bytes,
-        index_page_size=index_page_size,
-        head_dim=head_dim,
-        page_bytes=page_bytes,
-        scale_region_off=scale_region_off,
-        BLOCK_D=triton.next_power_of_2(head_dim),
-    )
-
-    recv = torch.empty(
-        (cp_size, n_total, payload_bytes), dtype=torch.uint8, device=device
-    )
-    attn_cp_all_gather_into_tensor(
-        recv.view(cp_size * n_total, payload_bytes), send_payload
-    )
-
-    _select_and_scatter_pool_slots_kernel[(n_total,)](
-        recv,
-        owner_rank,
-        local_locs,
-        buf,
-        cp_rank=cp_rank,
-        payload_bytes=payload_bytes,
-        index_page_size=index_page_size,
-        head_dim=head_dim,
-        page_bytes=page_bytes,
-        scale_region_off=scale_region_off,
-        n_total=n_total,
-        BLOCK_D=triton.next_power_of_2(head_dim),
-    )
 
 
 @triton.jit

@@ -3,13 +3,17 @@ from __future__ import annotations
 import torch
 
 from sglang.srt.lora.backend.base_backend import BaseLoRABackend
+from sglang.srt.lora.dense.plan import DenseLoraKind
+from sglang.srt.lora.utils import capturing_lora_graph
 from sglang.srt.models.inkling_common.dense_mlp import InklingBatchDenseMLP
+from sglang.srt.models.inkling_common.kernels.comm import symm_mem_all_reduce
 
 
 class InklingBatchDenseMLPWithLoRA(InklingBatchDenseMLP):
     """LoRA layer for Inkling's dense shared-expert sink."""
 
-    is_shared_fused_moe = True
+    set_lora = False
+    is_shared_fused_moe = False
 
     def initialize_lora(self, lora_backend: BaseLoRABackend) -> None:
         problems = []
@@ -31,6 +35,7 @@ class InklingBatchDenseMLPWithLoRA(InklingBatchDenseMLP):
         self.register_buffer("_w1_delta", None, persistent=False)
         self.register_buffer("_a_cat", None, persistent=False)
         self._lora_routing_cache = {}
+        self.is_shared_fused_moe = True
         lora_backend.is_moe_lora = True
 
     def set_lora_info(
@@ -241,3 +246,166 @@ class InklingBatchDenseMLPWithLoRA(InklingBatchDenseMLP):
             linearized_weights,
             use_reduce_scatter,
         )
+
+
+class InklingBatchDenseMLPWithLoRAV2(InklingBatchDenseMLP):
+    """Dense-engine LoRA for Inkling's shared-expert sink."""
+
+    set_lora = False
+    is_shared_fused_moe = False
+
+    def initialize_lora(self, lora_backend: BaseLoRABackend) -> None:
+        if getattr(lora_backend, "runner", None) is None:
+            raise ValueError(
+                f"{type(self).__name__} needs a backend with the dense engine"
+            )
+        if not self._linearized_bf16_enabled:
+            raise ValueError(
+                f"{type(self).__name__} needs the linearized BF16 shared sink"
+            )
+        if not self._w13_gate_up_contiguous:
+            raise ValueError(
+                "The V2 shared sink must select contiguous W13 before loading"
+            )
+        self.lora_backend = lora_backend
+        self.set_lora = False
+        self.register_buffer("_down_cat", None, persistent=False)
+        self.is_shared_fused_moe = True
+        lora_backend.is_moe_lora = True
+
+    def set_lora_info(
+        self,
+        gate_up_lora_a_weights: torch.Tensor,
+        gate_up_lora_b_weights: torch.Tensor,
+        down_lora_a_weights: torch.Tensor,
+        down_lora_b_weights: torch.Tensor,
+    ) -> None:
+        n = self.n_shared_experts
+        slots, outer, two_rank, _ = gate_up_lora_a_weights.shape
+        _, _, two_f, rank = gate_up_lora_b_weights.shape
+        hidden = down_lora_b_weights.shape[2]
+        if (
+            outer not in (1, n)
+            or down_lora_b_weights.shape[1] != outer
+            or gate_up_lora_b_weights.shape[1] != n
+            or down_lora_a_weights.shape[1] != n
+            or two_rank != 2 * rank
+            or down_lora_a_weights.shape[2] != rank
+            or down_lora_b_weights.shape[-1] != rank
+        ):
+            raise ValueError(
+                "Inkling shared-sink LoRA pool buffers do not agree: expected gate-up A "
+                f"[slots, 1 or {n}, 2R, H], gate-up B [slots, {n}, 2F, R], down A "
+                f"[slots, {n}, R, F], down B [slots, 1 or {n}, H, R] with one layout"
+            )
+        shared = outer == 1
+        shape = (slots, rank, n * (two_f // 2)) if shared else (slots, hidden, n * rank)
+        down_cat = self._down_cat
+        if down_cat is None:
+            down_cat = down_lora_a_weights.new_empty(shape)
+        elif tuple(down_cat.shape) != shape:
+            raise RuntimeError(
+                "Shared-sink LoRA pool shape changed after initialization: "
+                f"{tuple(down_cat.shape)} -> {shape}"
+            )
+        device = gate_up_lora_b_weights.device
+        # Pool factors are max-rank padded and already scaled.
+        ranks = torch.full((slots,), rank, dtype=torch.int32, device=device)
+        scalings = torch.ones(slots, dtype=torch.float32, device=device)
+
+        gate_up = dict(
+            kind=DenseLoraKind.SINK_GATE_UP,
+            a=(
+                gate_up_lora_a_weights[:, 0]
+                if shared
+                else gate_up_lora_a_weights.reshape(slots, n * 2 * rank, -1)
+            ),
+            b=gate_up_lora_b_weights.view(slots, n * two_f, rank),
+            offsets=tuple(range(0, n * two_f + 1, two_f // 2)),
+            lora_ranks=ranks,
+            scalings=scalings,
+            a_blocks=2 if shared else 2 * n,
+            bridge_slices=2 if shared else 0,
+        )
+        if shared:
+            down = dict(
+                kind=DenseLoraKind.LINEAR,
+                a=down_cat,
+                b=down_lora_b_weights[:, 0],
+                offsets=(0, hidden),
+                lora_ranks=ranks,
+                scalings=scalings,
+            )
+        else:
+            # Each A block reads one expert's activation window.
+            down = dict(
+                kind=DenseLoraKind.SINK_DOWN,
+                a=down_lora_a_weights.view(slots, n * rank, -1),
+                b=down_cat,
+                offsets=(0, hidden),
+                lora_ranks=ranks * n,
+                scalings=scalings,
+                a_blocks=n,
+                a_windowed=True,
+            )
+        source = (down_lora_a_weights if shared else down_lora_b_weights).permute(
+            0, 2, 1, 3
+        )
+        self._down_refresh = source, down_cat.view_as(source)
+        self._down_cat = down_cat
+        self._gate_up, self._down = gate_up, down
+        self.set_lora = True
+        self.on_lora_slots_updated()
+
+    def on_lora_slots_updated(self, slot_ids: set[int] | None = None) -> None:
+        if not self.set_lora:
+            return
+        source, target = self._down_refresh
+        # Keep the derived buffer's address stable across graph replays.
+        with torch.no_grad():
+            for slot in range(source.shape[0]) if slot_ids is None else slot_ids:
+                target[slot].copy_(source[slot])
+
+    # Both wrappers receive the same pool factors and TP slicing geometry.
+    slice_moe_lora_a_weights = InklingBatchDenseMLPWithLoRA.slice_moe_lora_a_weights
+    slice_moe_lora_b_weights = InklingBatchDenseMLPWithLoRA.slice_moe_lora_b_weights
+    _slice_down_lora_a = InklingBatchDenseMLPWithLoRA._slice_down_lora_a
+    _slice_gate_up_lora_b = InklingBatchDenseMLPWithLoRA._slice_gate_up_lora_b
+
+    def _forward_bf16_linearized(
+        self,
+        x_td: torch.Tensor,
+        gammas_ts: torch.Tensor,
+        linearized_weights: tuple[torch.Tensor, torch.Tensor],
+        use_reduce_scatter: bool,
+    ) -> torch.Tensor:
+        # Capture LoRA even without an active adapter, for later replay batches
+        # (except the decode runner's LoRA-free "nolora" graph).
+        if not self.set_lora or not (
+            getattr(self.lora_backend.batch_info, "has_active_lora", False)
+            or capturing_lora_graph()
+        ):
+            return super()._forward_bf16_linearized(
+                x_td, gammas_ts, linearized_weights, use_reduce_scatter
+            )
+        w13_lin, w2_lin = linearized_weights
+        t, n = x_td.shape[0], self.n_shared_experts
+        y = self._lora_gemm(x_td, lambda: torch.mm(x_td, w13_lin.T), **self._gate_up)
+        act_flat = self._swiglu(y.view(t, n, -1), gammas_ts).reshape(t, -1)
+        out_td = self._lora_gemm(
+            act_flat, lambda: torch.mm(act_flat, w2_lin), **self._down
+        )
+        if not use_reduce_scatter and self.tp_group is not None:
+            out_td = symm_mem_all_reduce(out_td, self.tp_group)
+        return out_td
+
+    def _lora_gemm(self, x: torch.Tensor, base_fn, *, kind, **site) -> torch.Tensor:
+        runner = self.lora_backend.runner
+        plan = runner.plan_for(
+            kind,
+            site["b"].shape[-1],
+            x.shape[-1],
+            site["offsets"][-1],
+            num_tokens=x.shape[0],
+        )
+        return runner.apply(x, base_fn, plan, **site)
