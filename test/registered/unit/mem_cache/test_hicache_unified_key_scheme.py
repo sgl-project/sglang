@@ -1135,16 +1135,431 @@ class TestUnifiedChunkTiling(CustomTestCase):
             controller._generate_storage_config("org/model")
 
 
-class TestUnifiedLateHostPool(CustomTestCase):
+def _draft_entry(*, mla=False, head_group_num=2, name="draft", dtype=torch.bfloat16):
+    """A draft KV pool of its own geometry: 5 layers of 64-wide rows, 4 kv
+    heads on this rank (or one latent row for MLA), in bfloat16."""
+    return SimpleNamespace(
+        name=name,
+        is_primary_index_anchor=False,
+        # An MLA pool view says whether its rows are replicated across ranks.
+        device_pool=SimpleNamespace(dtype=dtype, storage_rank_replicated=mla),
+        host_pool=SimpleNamespace(
+            page_unified_layout=PageUnifiedLayout(
+                page_size=16,
+                layer_num=5,
+                head_num=1 if mla else 4,
+                head_group_num=1 if mla else head_group_num,
+                head_dim=64,
+                itemsize=2,
+                is_mla=mla,
+            )
+        ),
+    )
+
+
+class _DraftSidecarPlanning:
+    """Runs the controller's planner for a pool beside the KV anchor."""
+
+    MODULE = "sglang.srt.managers.cache_controller"
+    TARGET = dict(
+        model_id="org/model",
+        dtype="float8_e4m3fn",
+        page_size=16,
+        rank_replicated=False,
+        total_kv_heads=8,
+        head_group=2,
+        layer_partition=4,
+    )
+
+    def _planning(
+        self,
+        controller,
+        *,
+        algorithm="DFLASH",
+        draft_id="org/dflash@main",
+        attn_tp_rank=1,
+        pp_size=1,
+        cp=(0, 1),
+        head_partition=2,
+        backend="file",
+    ):
+        controller.storage_backend_type = backend
+        controller.unified_kv_namespace = derive_namespace(**self.TARGET)
+        memory = SimpleNamespace(
+            hicache_storage_key_scheme="unified",
+            hicache_storage_head_partition=head_partition,
+            hicache_storage_layer_partition=4,
+            hicache_storage_draft_id=draft_id,
+        )
+        parallel = SimpleNamespace(
+            tp_rank=attn_tp_rank,
+            tp_size=2,
+            attn_tp_rank=attn_tp_rank,
+            attn_tp_size=2,
+            attn_dcp_size=1,
+            attn_dcp_rank=0,
+            pp_rank=pp_size - 1,
+            pp_size=pp_size,
+        )
+        stack = ExitStack()
+        stack.enter_context(patch(f"{self.MODULE}.get_memory", return_value=memory))
+        stack.enter_context(patch(f"{self.MODULE}.get_parallel", return_value=parallel))
+        stack.enter_context(
+            patch(
+                f"{self.MODULE}.get_spec",
+                return_value=SimpleNamespace(speculative_algorithm=algorithm),
+            )
+        )
+        stack.enter_context(
+            patch(f"{self.MODULE}.is_dp_attention_enabled", return_value=False)
+        )
+        stack.enter_context(
+            patch.object(controller, "get_attn_cp_rank_and_size", return_value=cp)
+        )
+        return stack
+
+    def _draft_digest(self, **overrides):
+        """The draft digest from literals: nothing here is read from the plan."""
+        fields = dict(
+            target=namespace_digest(derive_namespace(**self.TARGET)),
+            algorithm="DFLASH",
+            draft_id="org/dflash@main",
+            placement="sidecar",
+            dtype="bfloat16",
+            rank_replicated=False,
+            total_kv_heads=8,
+            head_group=2,
+            row_width=64,
+            layer_num=5,
+            object_layout="page-unified-v1",
+        )
+        fields.update(overrides)
+        return draft_namespace_digest(DraftKVNamespace(**fields))
+
+
+class TestControllerUnifiedDraftSidecar(_DraftSidecarPlanning, CustomTestCase):
+    def _controller(self):
+        return object.__new__(HiCacheController)
+
+    def _plan(self, entry=None, **planning):
+        controller = self._controller()
+        with self._planning(controller, **planning):
+            return controller._plan_unified_sidecar(entry or _draft_entry())
+
+    def test_draft_pool_pages_are_chunks_on_the_drafts_own_grid(self):
+        # One (head group, 5 layers) cell: K and V of 16 tokens x 2 heads x 64
+        # in bfloat16.
+        cell = 5 * 2 * 16 * 2 * 64 * 2
+        chunks = self._plan()
+        digest = self._draft_digest()
+        # Attention-TP rank 1 of 2 owns head groups 2 and 3 of 4.
+        self.assertEqual(chunks.suffixes, (f"{digest}_D0-5_H2", f"{digest}_D0-5_H3"))
+        self.assertEqual(chunks.spans, ((0, cell), (cell, cell)))
+        self.assertTrue(chunks.is_writer)
+        self.assertEqual(
+            self._plan(attn_tp_rank=0).suffixes,
+            (f"{digest}_D0-5_H0", f"{digest}_D0-5_H1"),
+        )
+
+    def test_draft_identity_is_the_drafts_own(self):
+        # The target is fp8 with 128-wide rows; none of it names the draft.
+        base = self._plan().suffixes
+        self.assertTrue(base[0].startswith(self._draft_digest()))
+        other_dtype = self._plan(_draft_entry(dtype=torch.float8_e5m2)).suffixes
+        self.assertTrue(
+            other_dtype[0].startswith(self._draft_digest(dtype="float8_e5m2"))
+        )
+        other_id = self._plan(draft_id="another").suffixes
+        self.assertTrue(other_id[0].startswith(self._draft_digest(draft_id="another")))
+        self.assertEqual(len({base[0], other_dtype[0], other_id[0]}), 3)
+
+    def test_replicated_draft_has_one_chunk_and_one_writer(self):
+        digest = self._draft_digest(
+            rank_replicated=True, total_kv_heads=0, head_group=0
+        )
+        page = 5 * 16 * 64 * 2
+        for attn_tp_rank in (0, 1):
+            with self.subTest(attn_tp_rank=attn_tp_rank):
+                chunks = self._plan(_draft_entry(mla=True), attn_tp_rank=attn_tp_rank)
+                self.assertEqual(chunks.suffixes, (f"{digest}_D0-5",))
+                self.assertEqual(chunks.spans, ((0, page),))
+                # Every rank holds the same bytes: rank 0 writes them.
+                self.assertEqual(chunks.is_writer, attn_tp_rank == 0)
+
+    def test_one_writer_per_draft_object(self):
+        for mla in (False, True):
+            for cp_rank in (0, 1):
+                with self.subTest(mla=mla, cp_rank=cp_rank):
+                    if cp_rank:
+                        with self.assertRaisesRegex(
+                            NotImplementedError, "prefill context parallelism"
+                        ):
+                            self._plan(_draft_entry(mla=mla), cp=(cp_rank, 2))
+                        continue
+                    writers = {}
+                    for attn_tp_rank in (0, 1):
+                        chunks = self._plan(
+                            _draft_entry(mla=mla), attn_tp_rank=attn_tp_rank
+                        )
+                        for suffix in chunks.suffixes:
+                            writers.setdefault(suffix, []).append(chunks.is_writer)
+                    self.assertEqual(len(writers), 1 if mla else 4)
+                    for suffix, flags in writers.items():
+                        self.assertEqual(sum(flags), 1, suffix)
+
+    def test_pools_without_unified_keys_are_refused(self):
+        cases = {
+            "draft_swa": dict(entry=_draft_entry(name="draft_swa")),
+            "draft_indexer": dict(entry=_draft_entry(name="draft_indexer")),
+            "mamba": dict(entry=_draft_entry(name="mamba")),
+            "None": dict(entry=SimpleNamespace()),
+            "draft": dict(entry=SimpleNamespace(name="draft", host_pool=object())),
+        }
+        for name, case in cases.items():
+            with (
+                self.subTest(name),
+                self.assertRaisesRegex(
+                    NotImplementedError, f"hybrid pools: {name} has no unified keys"
+                ),
+            ):
+                self._plan(**case)
+        # The sidecar path is shared with EAGLE3 and DSPARK drafts.
+        for algorithm in ("EAGLE3", "DSPARK", "EAGLE", None):
+            with (
+                self.subTest(algorithm=algorithm),
+                self.assertRaisesRegex(
+                    NotImplementedError, "hybrid pools: draft has no unified keys"
+                ),
+            ):
+                self._plan(algorithm=algorithm)
+
+    def test_draft_pools_that_cannot_be_named_safely_are_refused(self):
+        dcp_entry = _draft_entry()
+        dcp_entry.host_pool.dcp_size = 2
+        sharded_mla = _draft_entry(mla=True)
+        sharded_mla.device_pool.storage_rank_replicated = False
+        # A pool that does not say is not taken for replicated.
+        unknown_mla = _draft_entry(mla=True)
+        del unknown_mla.device_pool.storage_rank_replicated
+        cases = {
+            "Mooncake backend": dict(backend="mooncake"),
+            "single pipeline stage": dict(pp_size=2),
+            "full pages": dict(entry=dcp_entry),
+            "not known to be replicated": dict(entry=sharded_mla),
+            "not known to be replicated ": dict(entry=unknown_mla),
+            "draft id": dict(draft_id=None),
+            "prefill context parallelism": dict(cp=(0, 2)),
+        }
+        for message, case in cases.items():
+            with (
+                self.subTest(message),
+                self.assertRaisesRegex(NotImplementedError, message.strip()),
+            ):
+                self._plan(**case)
+        # Without attached unified-key storage there is no target to bind to.
+        controller = self._controller()
+        with self._planning(controller):
+            controller.unified_kv_namespace = None
+            with self.assertRaisesRegex(NotImplementedError, "no unified-key storage"):
+                controller._plan_unified_sidecar(_draft_entry())
+        # 1 kv head per rank could be replication: the operator must say so.
+        one_head = _draft_entry(head_group_num=1)
+        one_head.host_pool.page_unified_layout = PageUnifiedLayout(
+            page_size=16,
+            layer_num=5,
+            head_num=1,
+            head_group_num=1,
+            head_dim=64,
+            itemsize=2,
+        )
+        with self.assertRaisesRegex(NotImplementedError, "1 kv head per rank"):
+            self._plan(one_head, head_partition=None)
+        # The head partition must divide the draft's local kv heads too.
+        with self.assertRaisesRegex(ValueError, "must divide this rank's 4"):
+            self._plan(head_partition=3)
+
+    def test_host_pool_must_be_cut_into_the_planned_head_groups(self):
+        # Built without the head partition, the page is head-major over all 4
+        # heads: a chunk span would cut across layers.
+        with self.assertRaisesRegex(ValueError, "2 head groups.*holds 1"):
+            self._plan(_draft_entry(head_group_num=1))
+
+    def test_attach_plans_pools_that_joined_before_storage(self):
+        """A runtime re-attach: the draft pool is already in the group."""
+        fixture = TestControllerUnifiedKeys()
+        controller = fixture._controller()
+        host_pool = controller.storage_host_pool
+        host_pool.layout = "page_unified"
+        host_pool.storage_format_tag = None
+        controller.mem_pool_host.layout = "page_unified"
+        controller.enable_storage_metrics = False
+        with self._planning(controller, head_partition=4):
+            target_only = controller._generate_storage_config("org/model")
+            self.assertEqual(target_only.unified_pool_chunks, {})
+            draft = _draft_entry(head_group_num=1)
+            controller.mem_pool_host.entries.append(draft)
+            config = controller._generate_storage_config("org/model")
+            self.assertEqual(config.unified_suffixes, target_only.unified_suffixes)
+            self.assertEqual(
+                config.unified_chunk_spans, target_only.unified_chunk_spans
+            )
+            self.assertEqual(list(config.unified_pool_chunks), ["draft"])
+            # The draft is bound to the namespace this attach derived, not to
+            # one left over on the controller.
+            target = derive_namespace(**{**self.TARGET, "head_group": 4})
+            self.assertEqual(controller.unified_kv_namespace, target)
+            digest = self._draft_digest(target=namespace_digest(target), head_group=4)
+            self.assertEqual(
+                config.unified_pool_chunks["draft"].suffixes, (f"{digest}_D0-5_H1",)
+            )
+            # Any other pool beside the anchor still fails the attach.
+            controller.mem_pool_host.entries.append(_draft_entry(name="draft_swa"))
+            with self.assertRaisesRegex(NotImplementedError, "single page_unified"):
+                controller._generate_storage_config("org/model")
+            controller.mem_pool_host.entries[-1] = _draft_entry(name="draft")
+            controller.mem_pool_host.entries[-2] = SimpleNamespace()
+            with self.assertRaisesRegex(NotImplementedError, "single page_unified"):
+                controller._generate_storage_config("org/model")
+
+    def test_failed_attach_leaves_no_target_namespace_behind(self):
+        """The namespace is that of the attached storage: a pool that
+        registers later must not take its target from an attach that failed."""
+        left_over = derive_namespace(**self.TARGET)
+
+        def controller_with(*entries):
+            controller = TestControllerUnifiedKeys()._controller()
+            controller.storage_host_pool.layout = "page_unified"
+            controller.storage_host_pool.storage_format_tag = None
+            controller.mem_pool_host.layout = "page_unified"
+            controller.mem_pool_host.entries.extend(entries)
+            controller.enable_storage_metrics = False
+            controller.enable_storage = False
+            controller.prefetch_hits_sync_groups = []
+            controller.prefetch_completion_sync_groups = []
+            return controller
+
+        # The pool that is already in the group is refused while it is planned.
+        controller = controller_with(_draft_entry(head_group_num=1))
+        with (
+            self._planning(controller, head_partition=4, draft_id=None),
+            self.assertRaisesRegex(NotImplementedError, "draft id"),
+        ):
+            self.assertEqual(controller.unified_kv_namespace, left_over)
+            controller._generate_storage_config("org/model")
+        self.assertIsNone(controller.unified_kv_namespace)
+        # The backend cannot be created.
+        controller = controller_with()
+        with (
+            self._planning(controller, head_partition=4),
+            patch.object(controller, "_stop_storage_threads"),
+            patch(
+                "sglang.srt.mem_cache.storage.StorageBackendFactory.create_backend",
+                side_effect=RuntimeError("no backend"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "no backend"),
+        ):
+            controller.attach_storage_backend("file", model_name="org/model")
+        self.assertIsNone(controller.unified_kv_namespace)
+        self.assertFalse(controller.enable_storage)
+
+
+class TestUnifiedLateHostPool(_DraftSidecarPlanning, CustomTestCase):
     def _controller(self, unified_suffixes):
         controller = object.__new__(HybridCacheController)
         controller.mem_pool_host = MagicMock(spec=HostPoolGroup)
         controller.enable_storage = True
         controller.storage_backend = MagicMock()
         controller.storage_host_pool = SimpleNamespace(dcp_size=1)
-        controller.storage_config = SimpleNamespace(unified_suffixes=unified_suffixes)
+        controller.storage_config = SimpleNamespace(
+            unified_suffixes=unified_suffixes, unified_pool_chunks={}
+        )
         controller.extra_host_mem_release_queues = {}
         return controller
+
+    def test_named_pool_is_planned_before_it_joins_and_registers(self):
+        controller = self._controller(["ukv1-abc_L0-4"])
+        entry = _draft_entry()
+        seen = {}
+        controller.mem_pool_host.add_entry.side_effect = lambda _: seen.update(
+            add=dict(controller.storage_config.unified_pool_chunks)
+        )
+        controller.storage_backend.register_mem_host_pool_v2.side_effect = lambda *_: (
+            seen.update(
+                register=dict(controller.storage_config.unified_pool_chunks),
+                added=controller.mem_pool_host.add_entry.called,
+            )
+        )
+        with self._planning(controller):
+            controller.register_host_pool_entry(entry)
+        chunks = controller.storage_config.unified_pool_chunks["draft"]
+        self.assertEqual(len(chunks.suffixes), 2)
+        # The backend reads the plan while the pool registers.
+        self.assertEqual(
+            seen,
+            {"add": {"draft": chunks}, "register": {"draft": chunks}, "added": True},
+        )
+        controller.storage_backend.register_mem_host_pool_v2.assert_called_once_with(
+            entry.host_pool, "draft"
+        )
+
+    def test_refused_draft_pool_leaves_no_plan_behind(self):
+        controller = self._controller(["ukv1-abc_L0-4"])
+        with (
+            self._planning(controller, backend="mooncake"),
+            self.assertRaisesRegex(NotImplementedError, "Mooncake backend"),
+        ):
+            controller.register_host_pool_entry(_draft_entry())
+        self.assertEqual(controller.storage_config.unified_pool_chunks, {})
+        controller.mem_pool_host.add_entry.assert_not_called()
+        controller.storage_backend.register_mem_host_pool_v2.assert_not_called()
+
+    def test_plan_does_not_outlive_a_pool_that_failed_to_register(self):
+        earlier = SimpleNamespace(is_writer=True)
+        for step in ("add_entry", "register_mem_host_pool_v2"):
+            for previous in ({}, {"draft": earlier}):
+                with self.subTest(step=step, previous=previous):
+                    controller = self._controller(["ukv1-abc_L0-4"])
+                    pool_chunks = controller.storage_config.unified_pool_chunks
+                    pool_chunks.update(previous)
+                    seen = []
+
+                    def fail(*_):
+                        seen.append(dict(pool_chunks))
+                        raise RuntimeError("no room")
+
+                    owner = (
+                        controller.mem_pool_host
+                        if step == "add_entry"
+                        else controller.storage_backend
+                    )
+                    getattr(owner, step).side_effect = fail
+                    with (
+                        self._planning(controller),
+                        self.assertRaisesRegex(RuntimeError, "no room"),
+                    ):
+                        controller.register_host_pool_entry(_draft_entry())
+                    # The failing step saw the new plan; nothing keeps it.
+                    self.assertEqual(len(seen[0]["draft"].suffixes), 2)
+                    self.assertEqual(pool_chunks, previous)
+                    self.assertIs(
+                        controller.storage_config.unified_pool_chunks, pool_chunks
+                    )
+
+    def test_planned_writer_backs_up_the_pool_whatever_the_kv_writer_is(self):
+        for kv_writer in (False, True):
+            for is_writer in (False, True):
+                with self.subTest(kv_writer=kv_writer, is_writer=is_writer):
+                    controller = self._controller(["ukv1-abc_L0-4"])
+                    controller.storage_backend_type = "file"
+                    controller.storage_config.is_storage_writer = kv_writer
+                    controller.storage_config.unified_pool_chunks["draft"] = (
+                        SimpleNamespace(is_writer=is_writer)
+                    )
+                    transfer = SimpleNamespace(name="draft")
+                    self.assertEqual(controller.should_backup(transfer), is_writer)
+                    # A pool without a plan keeps the legacy rule.
+                    other = SimpleNamespace(name="swa")
+                    self.assertEqual(controller.should_backup(other), kv_writer)
 
     def test_pool_without_unified_keys_is_refused_before_it_joins(self):
         controller = self._controller(["ukv1-abc_L0-4"])

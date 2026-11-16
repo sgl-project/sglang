@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
+    UnifiedPoolChunks,
     count_pool_hits,
 )
 
@@ -43,10 +44,12 @@ from sglang.srt.layers.dp_attention import (
     is_dp_attention_enabled,
 )
 from sglang.srt.mem_cache.hicache_key_scheme import (
+    KVCacheNamespace,
     UnifiedKVPlan,
     draft_namespace_digest,
     namespace_digest,
     normalize_dtype,
+    plan_unified_draft_sidecar,
     plan_unified_kv,
     validate_unified_chunk_tiling,
     with_packed_draft,
@@ -373,6 +376,9 @@ class HiCacheController:
         # A unified pool's storage: copies are recorded on it, so a page move
         # waits for the copies that touch its pages.
         self.kv_storage = kv_storage
+        # Target namespace of the attached unified-key storage: a host pool
+        # that registers later derives its own keys from it.
+        self.unified_kv_namespace: Optional[KVCacheNamespace] = None
         self.attn_cp_group = attn_cp_group
         self.attn_tp_group = attn_tp_group
         self.pp_group = pp_group
@@ -823,6 +829,7 @@ class HiCacheController:
                 pass
             self.storage_backend = None
             self.storage_backend_type = None
+            self.unified_kv_namespace = None
             self.enable_storage = False
             self.page_get_func = self._generic_page_get
             self.page_set_func = self._generic_page_set
@@ -868,6 +875,7 @@ class HiCacheController:
 
         self.storage_backend = None
         self.storage_backend_type = None
+        self.unified_kv_namespace = None
         self.enable_storage = False
         self.page_get_func = self._generic_page_get
         self.page_set_func = self._generic_page_set
@@ -938,6 +946,8 @@ class HiCacheController:
         model_name = storage_model_name(model_name, self.storage_host_pool)
         unified_plan = self._build_unified_plan(model_name, attn_cp_size)
         unified_chunk_spans = None
+        unified_pool_chunks = {}
+        self.unified_kv_namespace = None
         if unified_plan is not None:
             # Keys are layer-major/head-minor; the physical page is head-major.
             # Keep each key paired with its byte span instead of slicing pages
@@ -945,6 +955,19 @@ class HiCacheController:
             layout = self.storage_host_pool.page_unified_layout
             unified_chunk_spans = unified_plan.chunk_spans(layout)
             validate_unified_chunk_tiling(unified_chunk_spans, layout.bytes_per_page)
+            self.unified_kv_namespace = unified_plan.namespace
+            # Pools that joined before storage attached (a runtime re-attach).
+            anchor_entry = getattr(self.mem_pool_host, "anchor_entry", None)
+            try:
+                for entry in getattr(self.mem_pool_host, "entries", []):
+                    if entry is not anchor_entry:
+                        unified_pool_chunks[entry.name] = self._plan_unified_sidecar(
+                            entry
+                        )
+            except Exception:
+                # No storage attaches, so there is no target to take.
+                self.unified_kv_namespace = None
+                raise
 
         return HiCacheStorageConfig(
             tp_rank=tp_rank,
@@ -964,6 +987,7 @@ class HiCacheController:
             extra_config=storage_backend_extra_config,
             unified_suffixes=(unified_plan.suffixes if unified_plan else None),
             unified_chunk_spans=unified_chunk_spans,
+            unified_pool_chunks=unified_pool_chunks,
             dcp_size=dcp_size,
             dcp_rank=get_parallel().attn_dcp_rank,
             logical_page_size=self.page_size if dcp_size > 1 else None,
@@ -978,8 +1002,14 @@ class HiCacheController:
             return None
         parallel = get_parallel()
         host_pool = self.storage_host_pool
+        anchor_entry = getattr(self.mem_pool_host, "anchor_entry", None)
         if (
-            len(getattr(self.mem_pool_host, "entries", [])) > 1
+            any(
+                # The draft KV pool is named, or refused, on its own.
+                entry is not anchor_entry
+                and getattr(entry, "name", None) != PoolName.DRAFT
+                for entry in getattr(self.mem_pool_host, "entries", [])
+            )
             or getattr(host_pool, "page_unified_layout", None) is None
         ):
             raise NotImplementedError(
@@ -995,7 +1025,6 @@ class HiCacheController:
         draft_layer_num = host_pool.layer_num - target_layer_num
         # Host pools retain physical buffer descriptors, not the device pool.
         # A hybrid controller can wrap a different pool than its storage anchor.
-        anchor_entry = getattr(self.mem_pool_host, "anchor_entry", None)
         device_pool = (
             anchor_entry.device_pool
             if anchor_entry is not None
@@ -1110,16 +1139,93 @@ class HiCacheController:
         )
         return plan
 
-    def _plan_unified_sidecar(self, entry) -> None:
-        """Refuse a host pool beside the KV anchor: it has no unified keys.
+    def _plan_unified_sidecar(self, entry) -> UnifiedPoolChunks:
+        """Name the pages of a host pool beside the KV anchor, or refuse it.
 
         The unified scheme names every stored byte by what it holds. A pool
         without such names would be stored under rank-suffix keys, or not at
         all, so it is refused when it registers rather than at its first IO.
+        Only the draft KV pool of DFLASH has names: its pages are chunks under
+        a draft digest, on the draft's own head grid.
         """
-        raise NotImplementedError(
-            f"The unified key scheme does not support hybrid pools: "
-            f"{entry.name} has no unified keys."
+        name = getattr(entry, "name", None)
+        layout = getattr(getattr(entry, "host_pool", None), "page_unified_layout", None)
+        algorithm = (
+            get_spec().speculative_algorithm
+            if name == PoolName.DRAFT and layout is not None
+            else None
+        )
+        if algorithm != "DFLASH":
+            raise NotImplementedError(
+                f"The unified key scheme does not support hybrid pools: "
+                f"{name} has no unified keys."
+            )
+        memory = get_memory()
+        parallel = get_parallel()
+        attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
+        draft_id = memory.hicache_storage_draft_id
+        refusals = (
+            (
+                self.storage_backend_type == "mooncake",
+                "the Mooncake backend has no unified keys for a draft KV pool",
+            ),
+            (parallel.pp_size != 1, "the draft needs a single pipeline stage"),
+            (
+                getattr(entry.host_pool, "dcp_size", 1) > 1,
+                "storage objects must contain full pages (no DCP)",
+            ),
+            (
+                layout.is_mla
+                and not getattr(entry.device_pool, "storage_rank_replicated", False),
+                "its latent rows are not known to be replicated across ranks",
+            ),
+            (
+                self.unified_kv_namespace is None,
+                "no unified-key storage is attached to take its target from",
+            ),
+            (
+                not draft_id,
+                "a draft id is resolved at startup (--hicache-storage-draft-id)",
+            ),
+        )
+        for refused, why in refusals:
+            if refused:
+                raise NotImplementedError(
+                    f"The unified key scheme cannot store the {algorithm} draft "
+                    f"KV pool: {why}."
+                )
+        plan = plan_unified_draft_sidecar(
+            target=self.unified_kv_namespace,
+            algorithm=algorithm,
+            draft_id=draft_id,
+            # Logical dtype, as for the target: fp8 variants store as uint8.
+            dtype=normalize_dtype(entry.device_pool.dtype),
+            rank_replicated=layout.is_mla,
+            local_kv_heads=layout.head_num,
+            row_width=layout.head_dim,
+            layer_num=layout.layer_num,
+            attn_tp_rank=parallel.attn_tp_rank,
+            attn_tp_size=parallel.attn_tp_size,
+            attn_cp_size=attn_cp_size,
+            head_group=memory.hicache_storage_head_partition,
+        )
+        # Raises when the pool was not cut into the plan's head groups.
+        spans = plan.chunk_spans(layout)
+        validate_unified_chunk_tiling(spans, layout.bytes_per_page)
+        logger.info(
+            "HiCache unified L3 keys: %s pool draft id=%r namespace=%s chunks=%s",
+            name,
+            draft_id,
+            draft_namespace_digest(plan.draft_namespace),
+            plan.suffixes,
+        )
+        return UnifiedPoolChunks(
+            suffixes=tuple(plan.suffixes),
+            spans=tuple(spans),
+            # One writer per object: a head-sharded draft's chunks belong to
+            # one attention-TP rank each, a replicated draft's to rank 0.
+            is_writer=attn_cp_rank == 0
+            and (not layout.is_mla or parallel.attn_tp_rank == 0),
         )
 
     def reset(self):
@@ -1536,6 +1642,13 @@ class HiCacheController:
                 current_kv_derived_transfers, extra_info=extra_info
             )
             sidecar_hits = count_pool_hits(sidecar_results)
+            storage_config = getattr(self, "storage_config", None)
+            if getattr(storage_config, "unified_suffixes", None) is not None:
+                # Unified keys: a named pool that the backend did not report
+                # was not read, so none of its pages may be published. Under
+                # rank-suffix keys such a pool is ignored, as it always was.
+                for transfer in kv_derived_transfers:
+                    sidecar_hits.setdefault(transfer.name, 0)
 
         # Clamp to minimal number of hits.
         return min([kv_hits, *sidecar_hits.values()])

@@ -10,15 +10,19 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.mem_cache.hicache_key_scheme import (
+    plan_unified_draft_sidecar,
     plan_unified_kv,
     with_packed_draft,
 )
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
+    HiCacheStorageExtraInfo,
     PoolName,
     PoolTransfer,
+    UnifiedPoolChunks,
 )
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -443,6 +447,438 @@ class TestUnifiedFileChunks(unittest.TestCase):
         self.assertTrue(legacy.set("legacy", value))
         self.assertIs(legacy.get("legacy", target), target)
         torch.testing.assert_close(target, value)
+
+
+class _PagedHostPool:
+    """Several pages; the host index of a page's first token is page * page_size."""
+
+    def __init__(self, layout, pages):
+        self.page_unified_layout = layout
+        self.page_size = layout.page_size
+        self.pages = pages
+
+    def get_data_page(self, offset, flat=False):
+        page = self.pages[offset // self.page_size]
+        return page.flatten() if flat else page
+
+    def get_dummy_flat_data_page(self):
+        return torch.empty_like(self.pages[0]).flatten()
+
+    def set_from_flat_data_page(self, offset, page):
+        self.pages[offset // self.page_size].copy_(page.reshape_as(self.pages[0]))
+
+
+_PAGES = 3
+
+
+def _draft_logical_pages():
+    """The whole draft's pages: 4 heads x 3 layers of 8-wide int16 rows, a
+    geometry of its own beside the target's 4 layers of 4-wide int32 rows.
+    Every scalar identifies its page/head/layer/component/token coordinate."""
+    return torch.arange(_PAGES * 4 * 3 * 2 * 4 * 8, dtype=torch.int16).reshape(
+        _PAGES, 4, 3, 2, 4, 1, 8
+    )
+
+
+def _draft_rank(tp_size=1, tp_rank=0, draft_id="x", is_writer=True):
+    """One rank's planned chunks, layout and pages of the draft KV pool."""
+    heads = 4 // tp_size
+    layout = PageUnifiedLayout(
+        page_size=4,
+        layer_num=3,
+        head_num=heads,
+        head_group_num=heads,
+        head_dim=8,
+        itemsize=2,
+    )
+    target = plan_unified_kv(
+        model_id="test/model",
+        dtype="int32",
+        page_size=4,
+        rank_replicated=False,
+        local_kv_heads=heads,
+        attn_tp_rank=tp_rank,
+        attn_tp_size=tp_size,
+        attn_cp_size=1,
+        start_layer=0,
+        end_layer=4,
+        is_final_stage=True,
+        head_group=1,
+        layer_partition=2,
+    )
+    plan = plan_unified_draft_sidecar(
+        target=target.namespace,
+        algorithm="DFLASH",
+        draft_id=draft_id,
+        dtype="int16",
+        rank_replicated=False,
+        local_kv_heads=heads,
+        row_width=8,
+        layer_num=3,
+        attn_tp_rank=tp_rank,
+        attn_tp_size=tp_size,
+        attn_cp_size=1,
+        head_group=1,
+    )
+    chunks = UnifiedPoolChunks(
+        suffixes=tuple(plan.suffixes),
+        spans=tuple(plan.chunk_spans(layout)),
+        is_writer=is_writer,
+    )
+    pages = _draft_logical_pages()[:, tp_rank * heads : (tp_rank + 1) * heads]
+    return chunks, layout, pages.contiguous()
+
+
+class TestUnifiedFileDraftSidecar(unittest.TestCase):
+    """A draft KV pool beside the target's: chunks of its own, on its own grid."""
+
+    KEYS = [f"page{i}" for i in range(_PAGES)]
+
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        context = envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.override(
+            self.directory.name
+        )
+        context.__enter__()
+        self.addCleanup(context.__exit__, None, None, None)
+
+    def _backend(self, tp_size=1, tp_rank=0, *, draft=None, kv_pages=None, **config):
+        """A rank's backend with its KV pool and, planned by ``draft``, its
+        draft pool. Returns the backend and both pools."""
+        kv_config, kv_layout, kv_page = _rank(tp_size, 1, tp_rank, 0)
+        if kv_pages is None:
+            kv_pages = torch.stack([kv_page + 100000 * i for i in range(_PAGES)])
+        kv_pool = _PagedHostPool(kv_layout, kv_pages)
+        if config:
+            kv_config = replace(kv_config, **config)
+        backend = HiCacheFile(kv_config)
+        backend.register_mem_pool_host(kv_pool)
+        backend.register_mem_host_pool_v2(kv_pool, PoolName.KV)
+        draft_pool = None
+        if draft is not None:
+            chunks, layout, pages = draft
+            draft_pool = _PagedHostPool(layout, pages)
+            # The controller adds the plan before it registers the pool.
+            kv_config.unified_pool_chunks[PoolName.DRAFT] = chunks
+            backend.register_mem_host_pool_v2(draft_pool, PoolName.DRAFT)
+        return backend, kv_pool, draft_pool
+
+    def _transfers(self, *names):
+        return [
+            PoolTransfer(
+                name=name, keys=self.KEYS, host_indices=torch.arange(_PAGES * 4)
+            )
+            for name in names
+        ]
+
+    def _write(self, tp_size=1, **draft):
+        backends = []
+        for tp_rank in range(tp_size):
+            backend, _, _ = self._backend(
+                tp_size, tp_rank, draft=_draft_rank(tp_size, tp_rank, **draft)
+            )
+            self.assertEqual(
+                backend.batch_set_v2(self._transfers(PoolName.KV, PoolName.DRAFT)),
+                {PoolName.KV: [True] * _PAGES, PoolName.DRAFT: [True] * _PAGES},
+            )
+            backends.append(backend)
+        return backends
+
+    def _files(self):
+        return {
+            path.name: path.read_bytes()
+            for path in sorted(Path(self.directory.name).iterdir())
+        }
+
+    def test_each_draft_object_holds_its_head_groups_draft_layers(self):
+        self._write(tp_size=2)
+        files = self._files()
+        draft = {name: data for name, data in files.items() if "ukd1-" in name}
+        # 4 head groups a page; the target's 8 chunks a page are as before.
+        self.assertEqual(len(draft), _PAGES * 4)
+        self.assertEqual(len(files), _PAGES * (4 + 8))
+        logical = _draft_logical_pages()
+        for page, key in enumerate(self.KEYS):
+            for head in range(4):
+                (name,) = [
+                    n
+                    for n in draft
+                    if n.startswith(f"{key}_ukd1-") and n.endswith(f"_D0-3_H{head}.bin")
+                ]
+                self.assertEqual(
+                    draft[name], logical[page, head].contiguous().numpy().tobytes()
+                )
+
+    def test_target_objects_do_not_change_with_a_draft_pool(self):
+        backend, _, _ = self._backend()
+        backend.batch_set_v2(self._transfers(PoolName.KV))
+        target_only = self._files()
+        for name in target_only:
+            (Path(self.directory.name) / name).unlink()
+        self._write()
+        with_draft = self._files()
+        self.assertEqual(
+            {name: with_draft.get(name) for name in target_only}, target_only
+        )
+        self.assertTrue(
+            all("ukd1-" in name for name in set(with_draft) - set(target_only))
+        )
+
+    def test_draft_chunks_reshard_across_tp_sizes(self):
+        for writer, reader in ((2, 1), (1, 2)):
+            with self.subTest(writer=writer, reader=reader):
+                for name in self._files():
+                    (Path(self.directory.name) / name).unlink()
+                self._write(tp_size=writer)
+                for tp_rank in range(reader):
+                    chunks, layout, expected = _draft_rank(reader, tp_rank)
+                    backend, _, draft_pool = self._backend(
+                        reader,
+                        tp_rank,
+                        draft=(chunks, layout, torch.full_like(expected, -1)),
+                    )
+                    result = backend.batch_exists_v2(
+                        self.KEYS, self._transfers(PoolName.DRAFT)
+                    )
+                    self.assertEqual(result.kv_hit_pages, _PAGES)
+                    self.assertEqual(
+                        backend.batch_get_v2(self._transfers(PoolName.DRAFT)),
+                        {PoolName.DRAFT: [True] * _PAGES},
+                    )
+                    torch.testing.assert_close(
+                        draft_pool.pages, expected, rtol=0, atol=0
+                    )
+
+    def test_a_page_is_a_hit_only_with_every_draft_chunk(self):
+        for damage in ("missing", "short"):
+            with self.subTest(damage=damage):
+                for name in self._files():
+                    (Path(self.directory.name) / name).unlink()
+                self._write()
+                chunks, layout, expected = _draft_rank()
+                path = Path(self.directory.name) / f"page1_{chunks.suffixes[-1]}.bin"
+                if damage == "missing":
+                    path.unlink()
+                else:
+                    path.write_bytes(path.read_bytes()[:-1])
+                backend, _, draft_pool = self._backend(
+                    draft=(chunks, layout, torch.full_like(expected, -1))
+                )
+                result = backend.batch_exists_v2(
+                    self.KEYS, self._transfers(PoolName.DRAFT)
+                )
+                self.assertEqual(result.kv_hit_pages, 1)
+                self.assertEqual(result.extra_pool_hit_pages[PoolName.KV], _PAGES)
+                self.assertEqual(result.extra_pool_hit_pages[PoolName.DRAFT], 1)
+                self.assertEqual(
+                    backend.batch_get_v2(self._transfers(PoolName.DRAFT)),
+                    {PoolName.DRAFT: [True, False, True]},
+                )
+                # Nothing of the damaged page reaches the host pool.
+                self.assertTrue(torch.all(draft_pool.pages[1] == -1))
+                torch.testing.assert_close(
+                    draft_pool.pages[0], expected[0], rtol=0, atol=0
+                )
+
+    def test_another_draft_misses_on_the_draft_chunks_alone(self):
+        self._write(draft_id="draft-a")
+        before = self._files()
+        chunks, layout, expected = _draft_rank(draft_id="draft-b")
+        backend, _, draft_pool = self._backend(
+            draft=(chunks, layout, torch.full_like(expected, -1))
+        )
+        result = backend.batch_exists_v2(self.KEYS, self._transfers(PoolName.DRAFT))
+        self.assertEqual(result.kv_hit_pages, 0)
+        self.assertEqual(result.extra_pool_hit_pages[PoolName.KV], _PAGES)
+        self.assertEqual(
+            backend.batch_get_v2(self._transfers(PoolName.DRAFT)),
+            {PoolName.DRAFT: [False] * _PAGES},
+        )
+        self.assertTrue(torch.all(draft_pool.pages == -1))
+        # Its own backup adds its draft objects and rewrites nothing.
+        self._write(draft_id="draft-b")
+        after = self._files()
+        self.assertEqual({name: after[name] for name in before}, before)
+        self.assertEqual(len(after) - len(before), _PAGES * 4)
+
+    def test_a_pool_without_planned_chunks_is_refused_when_it_registers(self):
+        chunks, layout, pages = _draft_rank()
+        backend, _, _ = self._backend()
+        pool = _PagedHostPool(layout, pages)
+        for name in (PoolName.DRAFT, PoolName.MAMBA, PoolName.DRAFT_SWA):
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(NotImplementedError, "has no unified keys"),
+            ):
+                backend.register_mem_host_pool_v2(pool, name)
+            self.assertNotIn(name, backend.registered_pools)
+        with self.assertRaisesRegex(NotImplementedError, "has no unified keys"):
+            backend.batch_exists_v2(self.KEYS, self._transfers(PoolName.DRAFT))
+
+    def test_a_plan_belongs_to_the_pool_it_was_made_for(self):
+        chunks, layout, pages = _draft_rank()
+        backend, _, _ = self._backend(draft=(chunks, layout, pages))
+        pool = _PagedHostPool(layout, pages)
+        with self.assertRaisesRegex(NotImplementedError, "mamba has no unified keys"):
+            backend.register_mem_host_pool_v2(pool, PoolName.MAMBA)
+        # Nor may a second pool repeat the names of one that is registered.
+        backend._storage_config.unified_pool_chunks[PoolName.DRAFT_INDEXER] = chunks
+        with self.assertRaisesRegex(ValueError, "draft_indexer must be nonempty"):
+            backend.register_mem_host_pool_v2(pool, PoolName.DRAFT_INDEXER)
+        self.assertNotIn(PoolName.DRAFT_INDEXER, backend.registered_pools)
+        self.assertNotIn(PoolName.MAMBA, backend.registered_pools)
+
+    def test_planned_chunks_must_name_every_byte_of_the_pools_page(self):
+        chunks, layout, pages = _draft_rank()
+        cases = {
+            "gap": replace(chunks, spans=chunks.spans[:-1] + ((0, 1),)),
+            "short": replace(
+                chunks, suffixes=chunks.suffixes[:-1], spans=chunks.spans[:-1]
+            ),
+            "unpaired": replace(chunks, suffixes=chunks.suffixes[:-1]),
+            "duplicate": replace(chunks, suffixes=chunks.suffixes[:1] * 4),
+        }
+        for name, bad in cases.items():
+            with self.subTest(name), self.assertRaises(ValueError):
+                self._backend(draft=(bad, layout, pages))
+        # A target suffix must not come back as a draft's.
+        kv_config, _, _ = _rank()
+        stolen = replace(
+            chunks, suffixes=(kv_config.unified_suffixes[0],) + chunks.suffixes[1:]
+        )
+        with self.assertRaises(ValueError):
+            self._backend(draft=(stolen, layout, pages))
+
+    def test_only_the_planned_writer_owns_and_evicts_draft_files(self):
+        cap = {"extra_config": {"max_size": 1 << 20, "min_free_space": 0}}
+        writer, _, _ = self._backend(draft=_draft_rank(), **cap)
+        chunks = _draft_rank()[0]
+        stem = f"page0_{chunks.suffixes[0]}"
+        self.assertTrue(writer._evictor._owns(stem))
+        self.assertEqual(
+            writer.batch_set_v2(self._transfers(PoolName.DRAFT)),
+            {PoolName.DRAFT: [True] * _PAGES},
+        )
+        self.assertEqual(len(writer._evictor._lru), _PAGES * 4)
+        # A restarted writer adopts the draft files that are already there,
+        # beside the target files it found first, and counts each file once.
+        writer.batch_set_v2(self._transfers(PoolName.KV))
+        restarted, _, _ = self._backend(draft=_draft_rank(), **cap)
+        self.assertEqual(len(restarted._evictor._lru), _PAGES * (4 + 8))
+        self.assertEqual(
+            restarted._evictor._total_bytes,
+            sum(len(data) for data in self._files().values()),
+        )
+        reader, _, _ = self._backend(draft=_draft_rank(is_writer=False), **cap)
+        self.assertFalse(reader._evictor._owns(stem))
+        self.assertEqual(
+            {name for name in reader._evictor._lru if "ukd1-" in name}, set()
+        )
+
+    def _controller(self, backend, kv_pool, config):
+        controller = object.__new__(HiCacheController)
+        controller.page_size = 4
+        controller.storage_backend = backend
+        controller.storage_host_pool = kv_pool
+        controller.storage_config = config
+        controller.page_get_func = controller._generic_page_get
+        return controller
+
+    def test_read_publishes_only_pages_restored_in_both_pools(self):
+        """The reader's slots hold another prompt's bytes: a draft page that
+        does not come back must not be published with them."""
+        self._write()
+        chunks, layout, expected = _draft_rank()
+        (Path(self.directory.name) / f"page1_{chunks.suffixes[0]}.bin").unlink()
+        kv_expected = self._backend()[1].pages
+        backend, kv_pool, draft_pool = self._backend(
+            draft=(chunks, layout, torch.full_like(expected, -1)),
+            kv_pages=torch.full_like(kv_expected, -1),
+        )
+        controller = self._controller(backend, kv_pool, backend._storage_config)
+        operation = SimpleNamespace(request_id="r", is_terminated=lambda: False)
+        hit_pages = controller._page_transfer_kv_batch(
+            operation,
+            self.KEYS,
+            torch.arange(_PAGES * 4),
+            HiCacheStorageExtraInfo(),
+            [PoolTransfer(name=PoolName.DRAFT, indices_from_pool=PoolName.KV)],
+        )
+        self.assertEqual(hit_pages, 1)
+        torch.testing.assert_close(kv_pool.pages[0], kv_expected[0], rtol=0, atol=0)
+        torch.testing.assert_close(draft_pool.pages[0], expected[0], rtol=0, atol=0)
+        self.assertTrue(torch.all(draft_pool.pages[1] == -1))
+
+    def test_a_named_pool_the_backend_does_not_report_publishes_nothing(self):
+        self._write()
+        backend, kv_pool, _ = self._backend(draft=_draft_rank())
+        controller = self._controller(backend, kv_pool, backend._storage_config)
+        operation = SimpleNamespace(request_id="r", is_terminated=lambda: False)
+        args = (
+            operation,
+            self.KEYS,
+            torch.arange(_PAGES * 4),
+            HiCacheStorageExtraInfo(),
+            [PoolTransfer(name=PoolName.DRAFT, indices_from_pool=PoolName.KV)],
+        )
+        self.assertEqual(controller._page_transfer_kv_batch(*args), _PAGES)
+        with patch.object(backend, "batch_get_v2", return_value={}):
+            self.assertEqual(controller._page_transfer_kv_batch(*args), 0)
+        # The same for a pool that has no unified keys.
+        legacy = [PoolTransfer(name=PoolName.INDEXER, indices_from_pool=PoolName.KV)]
+        with patch.object(backend, "batch_get_v2", return_value={}):
+            self.assertEqual(controller._page_transfer_kv_batch(*args[:-1], legacy), 0)
+        with patch.object(
+            backend, "batch_get_v2", return_value={"indexer": [True, True, False]}
+        ):
+            self.assertEqual(controller._page_transfer_kv_batch(*args[:-1], legacy), 2)
+        # Every named pool counts, whichever the backend left out.
+        both = args[-1] + legacy
+        for reported in ({"draft": [True] * _PAGES}, {"indexer": [True] * _PAGES}):
+            with patch.object(backend, "batch_get_v2", return_value=reported):
+                self.assertEqual(
+                    controller._page_transfer_kv_batch(*args[:-1], both), 0
+                )
+
+    def test_rank_suffix_keys_ignore_a_pool_the_backend_does_not_report(self):
+        """Without the unified scheme the read path is what it was: only the
+        pools a backend reports limit the pages that are published."""
+        self._write()
+        backend, kv_pool, _ = self._backend(draft=_draft_rank())
+        operation = SimpleNamespace(request_id="r", is_terminated=lambda: False)
+        indexer = PoolTransfer(name=PoolName.INDEXER, indices_from_pool=PoolName.KV)
+        swa = PoolTransfer(name=PoolName.SWA, indices_from_pool=PoolName.KV)
+        args = (
+            operation,
+            self.KEYS,
+            torch.arange(_PAGES * 4),
+            HiCacheStorageExtraInfo(),
+        )
+        rank_suffix = SimpleNamespace(unified_suffixes=None, unified_pool_chunks={})
+        controllers = {
+            "rank-suffix": self._controller(backend, kv_pool, rank_suffix),
+            # Fixtures of other tests build the controller without a config.
+            "no config": self._controller(backend, kv_pool, None),
+        }
+        del controllers["no config"].storage_config
+        cases = (
+            ({}, [indexer], _PAGES),
+            ({}, [indexer, swa], _PAGES),
+            ({"swa": [True] * _PAGES}, [indexer, swa], _PAGES),
+            ({"swa": [True, False, False]}, [indexer, swa], 1),
+            ({"indexer": [True, True, False]}, [indexer], 2),
+        )
+        for name, controller in controllers.items():
+            for reported, transfers, hit_pages in cases:
+                with (
+                    self.subTest(name, reported=reported),
+                    patch.object(backend, "batch_get_v2", return_value=reported),
+                ):
+                    self.assertEqual(
+                        controller._page_transfer_kv_batch(*args, transfers),
+                        hit_pages,
+                    )
 
 
 if __name__ == "__main__":

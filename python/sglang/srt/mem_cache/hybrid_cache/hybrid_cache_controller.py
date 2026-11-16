@@ -536,14 +536,29 @@ class HybridCacheController(BaseHiCacheController):
             # Sidecars added after attach (e.g. the DFLASH draft) miss the
             # attach-time DCP check.
             check_dcp_l3_extra_pool(entry, self.storage_host_pool)
-        if storage_attached and self.storage_config.unified_suffixes is not None:
+        planned = storage_attached and self.storage_config.unified_suffixes is not None
+        if planned:
             # Before the entry joins the group: a refused pool must not stay.
-            self._plan_unified_sidecar(entry)
-        self.mem_pool_host.add_entry(entry)
-        if not entry.is_primary_index_anchor:
-            self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
-        if storage_attached:
-            self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+            # The backend reads the plan when the pool registers below.
+            pool_chunks = self.storage_config.unified_pool_chunks
+            previous = pool_chunks.get(entry.name)
+            pool_chunks[entry.name] = self._plan_unified_sidecar(entry)
+        try:
+            self.mem_pool_host.add_entry(entry)
+            if not entry.is_primary_index_anchor:
+                self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
+            if storage_attached:
+                self.storage_backend.register_mem_host_pool_v2(
+                    entry.host_pool, entry.name
+                )
+        except Exception:
+            if planned:
+                # The pool did not register: its plan does not outlive that.
+                if previous is None:
+                    pool_chunks.pop(entry.name, None)
+                else:
+                    pool_chunks[entry.name] = previous
+            raise
 
     @staticmethod
     def parse_storage_backend_extra_config(
@@ -2044,6 +2059,11 @@ class HybridCacheController(BaseHiCacheController):
             _finish_op_trace(operation)
 
     def should_backup(self, transfer: PoolTransfer) -> bool:
+        # Unified keys name each object once across ranks: its planned writer.
+        chunks = self.storage_config.unified_pool_chunks.get(transfer.name)
+        if chunks is not None:
+            return chunks.is_writer
+
         if not self.backup_skip:
             return True
 

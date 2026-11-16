@@ -584,6 +584,24 @@ class TestMooncakeUnifiedKeys(CustomTestCase):
                     )
                 self.assertEqual(cluster.registered_buffers, 0)
 
+    def test_hybrid_pools_are_refused_when_they_register(self):
+        """Not at their first IO, where the refusal is only logged."""
+        cluster = _FakeCluster()
+        rank = _Rank(cluster, mla=False, tp_rank=0, tp_size=1, head_partition=2)
+        registered = cluster.registered_buffers
+        for name in (PoolName.DRAFT, PoolName.MAMBA):
+            with (
+                self.subTest(name=name),
+                self.assertRaisesRegex(
+                    NotImplementedError, f"hybrid pools: {name} has no unified keys"
+                ),
+            ):
+                rank.store.register_mem_host_pool_v2(object(), name)
+            self.assertNotIn(name, getattr(rank.store, "registered_pools", {}))
+        self.assertEqual(cluster.registered_buffers, registered)
+        # The KV anchor's own v2 registration stays a no-op.
+        rank.store.register_mem_host_pool_v2(object(), PoolName.KV)
+
     def test_hybrid_pool_transfers_are_refused(self):
         cluster = _FakeCluster()
         rank = _Rank(cluster, mla=False, tp_rank=0, tp_size=1, head_partition=2)

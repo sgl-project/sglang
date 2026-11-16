@@ -901,6 +901,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # v2 here only registers additional hybrid pools.
         if host_pool_name == PoolName.KV:
             return
+        if self.unified_suffixes is not None:
+            # At registration, not at the pool's first IO, where the refusal
+            # would only be logged and leave a server with a dead L3.
+            raise NotImplementedError(
+                "The unified key scheme does not support hybrid pools: "
+                f"{host_pool_name} has no unified keys."
+            )
         if host_pool_name == PoolName.DRAFT:
             self.registered_pools[host_pool_name] = host_pool
             super().register_buffer(host_pool.kv_buffer)

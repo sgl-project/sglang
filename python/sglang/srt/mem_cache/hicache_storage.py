@@ -7,7 +7,7 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Iterable, List, Optional, Sequence, Set
 
@@ -22,6 +22,20 @@ logger = logging.getLogger(__name__)
 
 # Max pages per batched storage IO call.
 STORAGE_BATCH_SIZE = 128
+
+
+@dataclass(frozen=True)
+class UnifiedPoolChunks:
+    """Unified-key objects of one host pool beside the KV pool, on this rank.
+
+    ``suffixes`` are the chunk coordinates the rank owns and ``spans`` their
+    byte ranges in one page of that pool, paired in the same order.
+    """
+
+    suffixes: tuple[str, ...]
+    spans: tuple[tuple[int, int], ...]
+    # Whether this rank writes the pool's objects; every rank reads them.
+    is_writer: bool
 
 
 @dataclass
@@ -51,6 +65,10 @@ class HiCacheStorageConfig:
     # Byte ranges in a local page, paired with unified_suffixes in the same
     # order. The key grid is layer-major, whereas page bytes are head-major.
     unified_chunk_spans: Optional[List[tuple[int, int]]] = None
+    # Unified key scheme: the named host pools beside the KV pool, by pool
+    # name. A pool that is not here has no unified keys and must be refused.
+    # The controller adds a pool before it registers it with the backend.
+    unified_pool_chunks: dict[str, UnifiedPoolChunks] = field(default_factory=dict)
 
     # Whole-page replication can differ from the target's attention layout.
     rank_replicated: Optional[bool] = None
@@ -811,6 +829,8 @@ class HiCacheFile(HiCacheStorage):
         """Derive the per-deployment key suffix from the storage config."""
         self._unified_suffixes = None
         self._unified_chunk_sizes = {}
+        # Registered pools beside the KV pool: name -> (suffixes, spans).
+        self._unified_pool_chunks = {}
         self._unified_chunk_spans = storage_config.unified_chunk_spans
         if storage_config.unified_suffixes is not None:
             # The chunk coordinate replaces the whole rank/pp/cp suffix family;
@@ -850,8 +870,8 @@ class HiCacheFile(HiCacheStorage):
                     )
                 )
             self.config_suffix = self._unified_suffixes[0]
-            # Unified keys currently support only a single KV pool, without
-            # TP-sharded sidecars. Keep all key lookups in its chunk namespace.
+            # Unified keys carry no rank: a pool beside the KV pool brings its
+            # own chunk suffixes when it registers.
             self.tp_config_suffix = self.config_suffix
             return
         if self._unified_chunk_spans is not None:
@@ -899,6 +919,7 @@ class HiCacheFile(HiCacheStorage):
             or file_path
         )
 
+        self._storage_config = storage_config
         self._init_config_suffix(storage_config)
         tp_rank = storage_config.tp_rank
         attn_cp_rank = storage_config.attn_cp_rank
@@ -957,13 +978,59 @@ class HiCacheFile(HiCacheStorage):
             ),
         )
 
-    def _validate_unified_page_bytes(self, page_bytes: int) -> None:
-        if self._unified_chunk_spans is not None:
-            expected = sum(length for _, length in self._unified_chunk_spans)
+    def _validate_unified_page_bytes(self, page_bytes: int, spans=None) -> None:
+        spans = self._unified_chunk_spans if spans is None else spans
+        if spans is not None:
+            expected = sum(length for _, length in spans)
             if page_bytes != expected:
                 raise ValueError(
                     f"Unified chunk spans cover {expected} bytes, but the page has {page_bytes}."
                 )
+
+    def _unified_chunks(self, pool_name: Optional[str] = None):
+        """``(suffixes, spans)`` of one pool's chunks under unified keys."""
+        if pool_name in (None, "__default__", PoolName.KV):
+            return self._unified_suffixes, self._unified_chunk_spans
+        if pool_name not in self._unified_pool_chunks:
+            raise NotImplementedError(
+                f"Unified file storage does not support sidecar pools: "
+                f"{pool_name} has no unified keys."
+            )
+        return self._unified_pool_chunks[pool_name]
+
+    def _register_unified_pool_chunks(self, host_pool, host_pool_name) -> None:
+        """Take the chunks the controller planned for a pool beside the KV pool."""
+        chunks = self._storage_config.unified_pool_chunks.get(host_pool_name)
+        if chunks is None:
+            raise NotImplementedError(
+                f"Unified file storage does not support sidecar pools: "
+                f"{host_pool_name} has no unified keys."
+            )
+        suffixes = tuple(f"_{suffix}" for suffix in chunks.suffixes)
+        taken = set(self._unified_chunk_sizes) | set(self._unified_suffixes)
+        if (
+            not suffixes
+            or len(suffixes) != len(chunks.spans)
+            or len(set(suffixes)) != len(suffixes)
+            or taken & set(suffixes)
+        ):
+            raise ValueError(
+                f"Unified storage suffixes of pool {host_pool_name} must be "
+                f"nonempty, unique and paired with chunk spans."
+            )
+        from sglang.srt.mem_cache.hicache_key_scheme import (
+            validate_unified_chunk_tiling,
+        )
+
+        validate_unified_chunk_tiling(
+            chunks.spans, host_pool.page_unified_layout.bytes_per_page
+        )
+        self._unified_pool_chunks[host_pool_name] = (suffixes, tuple(chunks.spans))
+        self._unified_chunk_sizes.update(
+            zip(suffixes, (length for _, length in chunks.spans))
+        )
+        if chunks.is_writer:
+            self._evictor.own(suffixes)
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         if self._unified_chunk_spans is not None:
@@ -975,22 +1042,23 @@ class HiCacheFile(HiCacheStorage):
     def register_mem_host_pool_v2(self, host_pool: HostKVCache, host_pool_name):
         if self._unified_suffixes is not None:
             if host_pool_name != PoolName.KV:
-                raise NotImplementedError(
-                    "Unified file storage does not support sidecar pools."
-                )
-            if self._unified_chunk_spans is not None:
+                self._register_unified_pool_chunks(host_pool, host_pool_name)
+            elif self._unified_chunk_spans is not None:
                 self._validate_unified_page_bytes(
                     host_pool.page_unified_layout.bytes_per_page
                 )
         super().register_mem_host_pool_v2(host_pool, host_pool_name)
 
-    def _page_chunks(self, key: str, page: torch.Tensor):
-        self._validate_unified_page_bytes(page.numel() * page.element_size())
+    def _page_chunks(
+        self, key: str, page: torch.Tensor, pool_name: Optional[str] = None
+    ):
+        suffixes, spans = self._unified_chunks(pool_name)
+        self._validate_unified_page_bytes(page.numel() * page.element_size(), spans)
         data = page.contiguous().view(torch.uint8).reshape(-1)
-        spans = self._unified_chunk_spans or ((0, data.numel()),)
+        spans = spans or ((0, data.numel()),)
         return [
             (key + suffix, data[offset : offset + length])
-            for suffix, (offset, length) in zip(self._unified_suffixes, spans)
+            for suffix, (offset, length) in zip(suffixes, spans)
         ]
 
     def _get_suffixed_key(self, key: str) -> str:
@@ -1007,11 +1075,9 @@ class HiCacheFile(HiCacheStorage):
     def _get_component_keys(self, key: str, component_name: Optional[str] = None):
         if self._unified_suffixes is None:
             return (self._get_component_key(key, component_name),)
-        if component_name not in (None, "__default__", PoolName.KV):
-            raise NotImplementedError(
-                "Unified file storage does not support sidecar pools."
-            )
-        return tuple(key + suffix for suffix in self._unified_suffixes)
+        # The page hash alone: a pool's chunk suffixes say what it holds.
+        suffixes, _ = self._unified_chunks(component_name)
+        return tuple(key + suffix for suffix in suffixes)
 
     def _scan_existing_files_to_metadata_cache(self) -> None:
         try:
@@ -1036,12 +1102,17 @@ class HiCacheFile(HiCacheStorage):
     ) -> torch.Tensor | None:
         if self._unified_suffixes is None:
             return self._get_file(self._get_suffixed_key(key), target_location)
+        return self._get_unified_page(key, target_location)
+
+    def _get_unified_page(
+        self, key: str, target_location: torch.Tensor, pool_name: Optional[str] = None
+    ) -> torch.Tensor | None:
         # Do not expose a partially restored page if any chunk is missing,
         # truncated, or evicted between the existence check and the read.
         scratch = torch.empty_like(
             target_location, memory_format=torch.contiguous_format
         )
-        for suffixed, chunk in self._page_chunks(key, scratch):
+        for suffixed, chunk in self._page_chunks(key, scratch, pool_name):
             if self._get_file(suffixed, chunk) is None:
                 return None
         target_location.copy_(scratch)
@@ -1089,12 +1160,19 @@ class HiCacheFile(HiCacheStorage):
     ) -> bool:
         if self._unified_suffixes is None:
             return self._set_file(self._get_suffixed_key(key), value)
-        for suffixed, chunk in self._page_chunks(key, value):
+        return self._set_unified_page(key, value)
+
+    def _set_unified_page(
+        self, key: str, value: torch.Tensor, pool_name: Optional[str] = None
+    ) -> bool:
+        for suffixed, chunk in self._page_chunks(key, value, pool_name):
             if not self._set_file(suffixed, chunk):
                 return False
         # A small LRU cap may have evicted an earlier chunk while publishing
         # a later one. Partial pages must not be acknowledged as complete.
-        return self.exists(key)
+        return all(
+            self._file_exists(stem) for stem in self._get_component_keys(key, pool_name)
+        )
 
     def _set_file(self, suffixed: str, value: torch.Tensor) -> bool:
         tensor_path = os.path.join(self.file_path, f"{suffixed}.bin")
@@ -1277,8 +1355,14 @@ class HiCacheFile(HiCacheStorage):
 
     def _read_page(self, pool_name: str, key: str, host_pool, page_offset: int) -> bool:
         """Read one page from storage into host_pool at page_offset."""
-        storage_key = self._log_key(pool_name, key)
-        data_page = self.get(storage_key, host_pool.get_dummy_flat_data_page())
+        if self._unified_suffixes is not None:
+            data_page = self._get_unified_page(
+                key, host_pool.get_dummy_flat_data_page(), pool_name
+            )
+        else:
+            data_page = self.get(
+                self._log_key(pool_name, key), host_pool.get_dummy_flat_data_page()
+            )
         if data_page is None:
             return False
         host_pool.set_from_flat_data_page(page_offset, data_page)
@@ -1288,9 +1372,10 @@ class HiCacheFile(HiCacheStorage):
         self, pool_name: str, key: str, host_pool, page_offset: int
     ) -> bool:
         """Write one page from host_pool at page_offset to storage as raw bytes."""
-        storage_key = self._log_key(pool_name, key)
         data_page = host_pool.get_data_page(page_offset, flat=True)
-        return self.set(storage_key, data_page)
+        if self._unified_suffixes is not None:
+            return self._set_unified_page(key, data_page, pool_name)
+        return self.set(self._log_key(pool_name, key), data_page)
 
     def _batch_io_v2(self, transfers: List[PoolTransfer], op_fn):
         results: dict[str, List[bool]] = {}

@@ -145,6 +145,22 @@ class LRUFileEvictor:
     def _owns(self, suffixed_key: str) -> bool:
         return suffixed_key.endswith(self._owned_suffixes)
 
+    def own(self, suffixes: Tuple[str, ...]) -> None:
+        """Also create and evict files that end in one of ``suffixes``.
+
+        For a host pool that registers after the backend was built. Files of
+        these suffixes already on disk are adopted as the most recently used.
+        """
+        self._owned_suffixes = (*self._owned_suffixes, *suffixes)
+        if not self._eviction_enabled:
+            return
+        with self._lock:
+            self._scan_existing_files()
+            if self.max_size_bytes > 0 and self._total_bytes > self.max_size_bytes:
+                self._evict_locked(0)
+            if self.min_free_bytes > 0:
+                self._enforce_free_space_locked(0)
+
     def reserve(self, suffixed_key: str, value_bytes: int, key: str = "") -> bool:
         """Admit a new write of ``value_bytes``, evicting LRU victims as needed.
 
@@ -279,7 +295,7 @@ class LRUFileEvictor:
         return fs[1] - value_bytes >= self.min_free_bytes
 
     def _scan_existing_files(self) -> None:
-        """Seed LRU index from disk on startup (oldest mtime first)."""
+        """Seed LRU index from disk (oldest mtime first); tracked files stay."""
         try:
             names = os.listdir(self.file_path)
         except FileNotFoundError:
@@ -290,7 +306,7 @@ class LRUFileEvictor:
                 continue
             stem = fn[:-4]
             # Only files belonging to this rank/model.
-            if not self._owns(stem):
+            if not self._owns(stem) or stem in self._lru:
                 continue
             fp = os.path.join(self.file_path, fn)
             try:
