@@ -35,7 +35,7 @@ import torch
 from sglang.srt.environ import envs
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import check_pkg_version_at_least, get_bool_env_var, is_mlu
+from sglang.srt.utils.common import check_pkg_version_at_least, is_mlu
 
 logger = logging.getLogger(__name__)
 
@@ -405,7 +405,7 @@ def is_flashinfer_available():
     Check whether flashinfer is available.
     As of Oct. 6, 2024, it is only available on NVIDIA GPUs.
     """
-    if not get_bool_env_var("SGLANG_IS_FLASHINFER_AVAILABLE", default="true"):
+    if not envs.SGLANG_IS_FLASHINFER_AVAILABLE.get():
         return False
     return importlib.util.find_spec("flashinfer") is not None and is_cuda()
 

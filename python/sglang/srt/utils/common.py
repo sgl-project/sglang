@@ -179,9 +179,7 @@ def temp_set_env(*, allow_sglang: bool = False, **env_vars: Any):
                 os.environ[key] = value
 
 
-_ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
-    "SGLANG_ENABLE_TORCH_INFERENCE_MODE", "false"
-)
+_ENABLE_TORCH_INFERENCE_MODE = envs.SGLANG_ENABLE_TORCH_INFERENCE_MODE.get()
 
 
 class DynamicGradMode(_DecoratorContextManager):
