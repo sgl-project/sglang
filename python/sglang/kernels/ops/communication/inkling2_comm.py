@@ -6,7 +6,6 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import load_jit
-from sglang.kernels.ops.inkling2.moe import fence_system
 
 _RANK_ORDER_MAX_BYTES = {2: 1200 * 1024, 4: 512 * 1024, 8: 288 * 1024, 16: 64 * 1024}
 
@@ -326,6 +325,20 @@ def _peer_barrier(FlagPtrs, State, rank, WORLD: tl.constexpr):
         seen = tl.atomic_add(own + peer, 0, sem="acquire", scope="sys")
         while seen < epoch:
             seen = tl.atomic_add(own + peer, 0, sem="acquire", scope="sys")
+
+
+@triton.jit
+def fence_system(THREADS: tl.constexpr):
+    """fence.sc.sys once per thread: its earlier stores, including NVLink stores
+    to peers, are visible system-wide before any later signal."""
+    tl.inline_asm_elementwise(
+        "fence.sc.sys; mov.b32 $0, $1;",
+        "=r,r",
+        [tl.full([THREADS], 0, tl.int32)],
+        dtype=tl.int32,
+        is_pure=False,
+        pack=1,
+    )
 
 
 @triton.jit
