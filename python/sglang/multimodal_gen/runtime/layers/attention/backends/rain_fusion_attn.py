@@ -35,10 +35,6 @@ class RainFusionAttentionBackend(AttentionBackend):
         return RainFusionAttentionImpl
 
     @staticmethod
-    def get_metadata_cls() -> type["RainFusionAttentionMetadata"]:
-        return RainFusionAttentionMetadata
-
-    @staticmethod
     def get_builder_cls() -> type["RainFusionAttentionMetadataBuilder"]:
         return RainFusionAttentionMetadataBuilder
 

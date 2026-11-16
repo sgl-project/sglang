@@ -22,10 +22,6 @@ class FlashInferFA2Backend(AttentionBackend):
         return FlashInferFA2Impl
 
     @staticmethod
-    def get_metadata_cls() -> type[AttentionMetadata]:
-        raise NotImplementedError
-
-    @staticmethod
     def get_builder_cls() -> type[AttentionMetadataBuilder]:
         raise NotImplementedError
 

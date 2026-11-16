@@ -184,11 +184,6 @@ class AITERQuantBackend(AttentionBackend):
         return AITERQuantImpl
 
     @staticmethod
-    def get_metadata_cls() -> type["AttentionMetadata"]:
-        # AITER quant backend does not require special metadata.
-        return AttentionMetadata
-
-    @staticmethod
     def get_builder_cls() -> type["AttentionMetadataBuilder"]:
         raise NotImplementedError(
             "AITER quant backend does not have a metadata builder."

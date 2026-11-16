@@ -171,10 +171,6 @@ class VideoSparseAttentionH3Backend(AttentionBackend):
         return VideoSparseAttentionH3Impl
 
     @staticmethod
-    def get_metadata_cls() -> type["VideoSparseAttentionH3Metadata"]:
-        return VideoSparseAttentionH3Metadata
-
-    @staticmethod
     def get_builder_cls() -> type["VideoSparseAttentionH3MetadataBuilder"]:
         return VideoSparseAttentionH3MetadataBuilder
 

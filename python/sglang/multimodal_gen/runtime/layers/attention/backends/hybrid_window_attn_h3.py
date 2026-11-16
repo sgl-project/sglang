@@ -56,10 +56,6 @@ class HybridWindowAttentionH3Backend(AttentionBackend):
         return HybridWindowAttentionH3Impl
 
     @staticmethod
-    def get_metadata_cls() -> type[HybridWindowAttentionH3Metadata]:
-        return HybridWindowAttentionH3Metadata
-
-    @staticmethod
     def get_builder_cls() -> type[HybridWindowAttentionH3MetadataBuilder]:
         return HybridWindowAttentionH3MetadataBuilder
 
