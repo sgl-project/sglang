@@ -1524,47 +1524,6 @@ def grouped_topk_xpu(
 
 
 @torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
-def kimi_k2_biased_topk_impl(
-    hidden_states: torch.Tensor,
-    gating_output: torch.Tensor,
-    correction_bias: torch.Tensor,
-    topk: int,
-    renormalize: bool,
-    routed_scaling_factor: Optional[float] = None,
-    apply_routed_scaling_factor_on_output: Optional[bool] = False,
-):
-    """
-    Optimized version for num_expert_group=1 case (e.g., Kimi K2 with 384 experts).
-    Simplifies the grouped topk logic by removing unnecessary group masking operations.
-    Note: This function assumes num_fused_shared_experts=0.
-    """
-    assert hidden_states.shape[0] == gating_output.shape[0], "Number of tokens mismatch"
-
-    scores = gating_output.sigmoid()
-    num_token = scores.shape[0]
-
-    # When num_expert_group=1, no need for group masking
-    # Directly compute scores with correction bias
-    tmp_scores = scores.view(num_token, -1) + correction_bias.unsqueeze(0)
-
-    # Directly select topk experts (no need to sort since num_fused_shared_experts=0)
-    _, topk_ids = torch.topk(tmp_scores, k=topk, dim=-1, sorted=False)
-    topk_weights = scores.gather(1, topk_ids)
-
-    if renormalize:
-        # fp32 like the reference gate (the epsilon is not representable in
-        # fp16); the sum dtype and the division's type promotion upcast inside
-        # the existing kernels, so no extra cast launch is needed
-        topk_weights_sum = topk_weights.sum(dim=-1, keepdim=True, dtype=torch.float32)
-        topk_weights = topk_weights / (topk_weights_sum + _RENORMALIZE_SUM_EPSILON)
-    if apply_routed_scaling_factor_on_output:
-        topk_weights *= routed_scaling_factor
-
-    topk_weights, topk_ids = topk_weights.to(torch.float32), topk_ids.to(torch.int32)
-    return topk_weights, topk_ids
-
-
-@torch.compile(dynamic=True, backend=get_compiler_backend(), disable=_is_npu)
 def biased_topk_impl(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,

@@ -20,7 +20,6 @@ from sglang.srt.layers.moe.topk import (
     biased_topk_impl,
     fused_topk_torch_native,
     grouped_topk_gpu,
-    kimi_k2_biased_topk_impl,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -103,13 +102,6 @@ class TestTopkRenormalizeDegenerate(CustomTestCase):
             topk_group=4,
         )
         self._check(weights, "biased_grouped_topk_impl")
-
-    def test_kimi_k2_biased_topk_impl(self):
-        hidden, logits, bias = self._inputs()
-        weights, _ = kimi_k2_biased_topk_impl(
-            hidden, logits, bias, topk=TOPK, renormalize=True
-        )
-        self._check(weights, "kimi_k2_biased_topk_impl")
 
     def test_fused_topk_torch_native_sigmoid_bias(self):
         hidden, logits, bias = self._inputs()
