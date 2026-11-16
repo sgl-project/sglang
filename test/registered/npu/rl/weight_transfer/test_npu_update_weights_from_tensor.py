@@ -213,9 +213,13 @@ def _make_suite(case):
     name = "TestNpuUpdateWeightsFromTensor_" + case.id.replace("-", "_").replace(
         ".", "_"
     )
-    return type(
+    suite = type(
         name, (_TensorSuite, CustomTestCase), {"CASE": case, "__module__": __name__}
     )
+    return unittest.skipUnless(
+        weights.case_available(case),
+        f"model not found: {case.local_path or case.model}",
+    )(suite)
 
 
 for _case in weights.MODEL_CASES:

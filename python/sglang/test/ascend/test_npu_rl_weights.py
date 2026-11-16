@@ -75,6 +75,15 @@ def model_path(case: WeightUpdateModelCase) -> str:
     raise RuntimeError(f"{case.id}: config.json not found")
 
 
+def case_available(case: WeightUpdateModelCase) -> bool:
+    """Whether the case's model directory is present on this host."""
+    try:
+        model_path(case)
+    except RuntimeError:
+        return False
+    return True
+
+
 @lru_cache(maxsize=None)
 def _raw_config(case_id: str, path: str) -> str:
     with open(os.path.join(path, "config.json"), encoding="utf-8") as handle:

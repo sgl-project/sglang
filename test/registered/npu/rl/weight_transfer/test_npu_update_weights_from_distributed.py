@@ -71,6 +71,10 @@ def _pick_norm(manifest):
     raise AssertionError("no norm tensor found")
 
 
+@unittest.skipUnless(
+    weights.case_available(CASE),
+    f"model not found: {CASE.local_path or CASE.model}",
+)
 class TestNpuUpdateWeightsFromDistributed(CustomTestCase):
     @classmethod
     def setUpClass(cls):
