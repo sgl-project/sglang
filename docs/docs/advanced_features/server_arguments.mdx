@@ -319,6 +319,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--allow-header-priority` / `--no-allow-header-priority`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Accept X-Priority and RFC 9218 Priority on chat/completion requests in priority mode. Does not affect legacy x-override-priority. See Request priority headers below.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Auto (`None`): enabled only with `--enable-priority-scheduling`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Boolean flag pair (enable / disable)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-http2`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Serve HTTP/2 alongside HTTP/1.1 on the same port: clients may use h2c (cleartext HTTP/2) or plain HTTP/1.1. The Python frontend switches from Uvicorn to Granian and requires 'pip install sglang[http2]'; the Rust frontend (SGLANG_RUST_SERVER=1) serves it natively.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
@@ -332,6 +338,66 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
 </tbody>
 </table>
+
+### Request priority headers
+
+For `/v1/chat/completions` and `/v1/completions`, you can supply priority without
+changing the JSON body. These headers require `--enable-priority-scheduling`;
+`--schedule-policy priority` is not how you enable SGLang's priority mode.
+
+By default, the server accepts these headers only in priority mode. You can
+explicitly enable them with `--allow-header-priority` or disable them with
+`--no-allow-header-priority`. Neither flag enables priority scheduling itself.
+
+The server resolves priority in this order:
+
+1. Explicit body `priority`, including `0`, negative integers, and `null`.
+2. `X-Priority`, containing a signed integer.
+3. The integer urgency `u=0..7` in the [RFC 9218](https://www.rfc-editor.org/rfc/rfc9218.html)
+   `Priority` dictionary, multiplied by ten (`u=0` becomes `0`, `u=7` becomes `70`).
+4. The existing `--default-priority-value`, if configured. Otherwise priority stays
+   `None` and the scheduler uses its existing unset-priority behavior. An explicit
+   body `null` skips the new headers but still allows this configured default.
+
+The mapping does not change SGLang's scheduling direction: **higher integers run
+first by default**. Use `--schedule-low-priority-values-first` if lower RFC urgency
+values should run first. Negative priorities retain their existing meaning. All
+sources still pass through the existing signed 64-bit priority validation.
+
+For example, against an already running priority-enabled server:
+
+```bash theme={null}
+curl http://localhost:30000/v1/completions \
+  -H 'Content-Type: application/json' \
+  -H 'Priority: u=0, i' \
+  -d '{"model":"MODEL_PATH","prompt":"Hello","max_tokens":8}'
+```
+
+Header names are case-insensitive. A selected `X-Priority` must be a single
+header value: malformed values, comma-separated values, or repeated fields return
+HTTP 400. `Priority` uses a structured-field parser, not a substring match:
+multiple field lines are combined with commas and duplicate dictionary keys use
+the last value, as specified by RFC 8941. Valid unknown dictionary members and
+item parameters are ignored. Malformed dictionaries, missing urgency, and urgency
+values of the wrong type (including booleans, strings, and decimals) or outside
+`0..7` are ignored, falling back to the configured default rather than injecting
+RFC 9218's default urgency of three. Lower-precedence headers are not parsed when
+the body or a legacy override already supplies priority; disabled headers are
+also ignored, even when malformed.
+
+The existing `x-override-priority` remains an **explicit override**, not another
+body-first header: with `SGLANG_ENABLE_REQUEST_HEADER_OVERRIDES=true`, chat
+requests keep its existing precedence over both body and new headers, including
+when `--no-allow-header-priority` is set. Its existing integer parsing, errors, and
+chat-only scope are unchanged; this does not add that override to completions.
+
+<Warning>
+Priority is a scheduling hint, not authorization. At an untrusted edge, validate
+or strip client body priorities and all priority headers before injecting a
+tenant's permitted value. Disabling the new headers does not disable body
+priority or the separately enabled legacy override. Intermediaries must forward
+the chosen header; this option does not change model-gateway forwarding rules.
+</Warning>
 
 ## Quantization and data type
 <table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>

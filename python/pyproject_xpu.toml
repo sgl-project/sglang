@@ -30,6 +30,7 @@ dependencies = [
   "einops",
   "fastapi",
   "gguf",
+  "http-sf>=1.5.0,<2",
   "interegular",
   "IPython",
   "llguidance>=1.7.6,<2.0.0",

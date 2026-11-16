@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import msgspec
 import orjson
+from fastapi import HTTPException
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
 from sglang.srt.configs.model_config import UNLIMITED_OCR_V2_ARCH
@@ -1027,6 +1028,11 @@ class ChatDocSplitter:
         # an HTTP error, not an SSE payload.
         try:
             first_chunk = await generator.__anext__()
+        except HTTPException as e:
+            await generator.aclose()
+            return self._serving.create_error_response(
+                message=e.detail, err_type=str(e.status_code), status_code=e.status_code
+            )
         except ValueError as e:
             await generator.aclose()
             return self._serving.create_error_response(str(e))

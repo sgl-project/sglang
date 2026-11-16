@@ -40,6 +40,7 @@ dependencies = [
   "fastapi",
   "flashinfer_python[cu13]==0.7.4", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
+  "http-sf>=1.5.0,<2",
   "humming-kernels[cu13]==0.1.18",
   "interegular",
   "IPython",
