@@ -194,6 +194,10 @@ def test_gfx1250_table_picks_measured_best(world_size, nbytes, expected):
         (8, 16 * _MB + 16, "HIER_RING_SIMPLE"),
         (8, 16 * _MB + 32, "HIER_RING_SIMPLE"),
         (8, 32 * _MB + 16, "HIER_RING_SIMPLE"),
+        # hier_2shot_push is tried before hier_ring_simple and keeps its range
+        (16, 32 * _MB + 32, "HIER_2SHOT_PUSH"),
+        (16, 64 * _MB, "HIER_2SHOT_PUSH"),
+        (16, 64 * _MB + 16, "HIER_RING_SIMPLE"),
     ],
 )
 def test_gfx1250_dev_kernarg_table(world_size, nbytes, expected):
@@ -235,7 +239,11 @@ def test_gfx1250_table_has_no_rccl_gap(world_size, dev_kernarg):
 @pytest.mark.parametrize("paired", [True, False])
 @pytest.mark.parametrize(
     ("world_size", "two_shot", "hier_from"),
-    [(4, 16 * _MB, 8 * _MB + 16), (8, 32 * _MB, 16 * _MB + 16)],
+    [
+        (4, 16 * _MB, 8 * _MB + 16),
+        (8, 32 * _MB, 16 * _MB + 16),
+        (16, 64 * _MB, 32 * _MB + 16),
+    ],
 )
 def test_hier_ring_plan(monkeypatch, paired, world_size, two_shot, hier_from):
     """Partition pairs keep hier_ring_simple from its range up; other groups keep the table."""
@@ -392,6 +400,42 @@ def test_pick_config_hier_at_default_cap(nbytes, expected):
     )
     fitted = dpx_hier_all_reduce._fit_hier(config, hier_max)
     choice = custom_all_reduce_v2.choose_algo(fitted, nbytes, can_use_graph=False)
+    assert _choice_name(choice) == expected
+
+
+@pytest.mark.parametrize(
+    ("nbytes", "expected"),
+    [
+        (2 * _MB, "TWO_SHOT_PUSH"),
+        (32 * _MB, "HIER_2SHOT_PUSH"),
+        # past the clipped hier range, hier_ring_simple rather than 2shot_push
+        (32 * _MB + 32, "HIER_RING_SIMPLE"),
+        (48 * _MB, "HIER_RING_SIMPLE"),
+        (64 * _MB + 32, "HIER_RING_SIMPLE"),
+    ],
+)
+def test_tp16_dev_kernarg_plan_at_default_cap(monkeypatch, nbytes, expected):
+    from sglang.srt.distributed.device_communicators import (
+        gfx1250_fabric,
+        ring_simple_all_reduce,
+    )
+    from sglang.srt.distributed.device_communicators.configs import (
+        custom_all_reduce_v2 as cfg,
+    )
+
+    pairs = [[2 * i, 2 * i + 1] for i in range(8)]
+    monkeypatch.setattr(gfx1250_fabric, "probe_dpx_pairs", lambda group, device: pairs)
+    config = cfg._rocm_gfx1250_configs.__wrapped__(96, True)[16]
+    hier_max = dpx_hier_all_reduce._hier_max_bytes(
+        config, 16 * _MB, sizes_own_push=False
+    )
+    planned, _, _ = ring_simple_all_reduce.HierRingSimpleAllReduce.plan(
+        group=object(),
+        device=object(),
+        config=dpx_hier_all_reduce._fit_hier(config, hier_max),
+        buffer_size=ring_simple_all_reduce.HIER_RING_SIMPLE_BUFFER_SIZE,
+    )
+    choice = custom_all_reduce_v2.choose_algo(planned, nbytes, can_use_graph=False)
     assert _choice_name(choice) == expected
 
 

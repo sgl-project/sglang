@@ -453,6 +453,13 @@ def _rocm_gfx1250_configs(
         hier_2shot_push=Range(2 * MB + 16, 64 * MB),
         ring_simple=Range(64 * MB + 16, 4 * 1024 * MB),
     )
+    if dev_kernarg:
+        # Partition pairs at TP16: hier_ring_simple beats ring_simple by 17% at
+        # 128 MB and 7% at 512 MB, also with a late rank, and 2shot_push from
+        # 32 MB (21% at 64 MB). hier_2shot_push is tried first and keeps the
+        # sizes it covers, so this takes 32-64 MB only where the default
+        # max_size caps hier at 32 MB.
+        tp16 = tp16._replace(hier_ring_simple=Range(32 * MB + 16, 4 * 1024 * MB))
     configs[16] = configs[8]._replace(graph=tp16, eager=tp16, num_push_blocks=num_sm)
     return configs
 
