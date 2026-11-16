@@ -312,9 +312,9 @@ class SpeculativeAlgorithm(Enum):
     ) -> Optional[Union[Type[BaseSpecWorker], Type[TpModelWorker], Type[NGRAMWorker]]]:
 
         cfg = resolving_view(server_args)
-        assert not self.is_none(), (
-            "Cannot create worker for NONE speculative algorithm."
-        )
+        assert (
+            not self.is_none()
+        ), "Cannot create worker for NONE speculative algorithm."
 
         platform_worker_cls = self.get_platform_worker_cls()
         if platform_worker_cls is not None:
@@ -323,6 +323,12 @@ class SpeculativeAlgorithm(Enum):
         if self.is_dflash():
             # V2 worker drives both overlap and non-overlap (scheduler runs it
             # synchronously when overlap is disabled), same as EAGLE.
+            import os
+
+            if os.getenv("SGLANG_DMTP_T1_RESIDUAL", "0") == "1":
+                from sglang.srt.speculative.dmtp_worker import DMTPWorkerV2
+
+                return DMTPWorkerV2
             from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 
             return DFlashWorkerV2
