@@ -1088,8 +1088,6 @@ def main(server_args, bench_args):
         for proc in workers:
             proc.join()
 
-        proc.terminate()
-
 
 def cli_main():
     parser = argparse.ArgumentParser()

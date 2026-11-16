@@ -444,8 +444,6 @@ def throughput_test(
             backend = _create_ray_engine_backend(server_args)
         else:
             backend = Engine(server_args=server_args)
-        if not backend:
-            raise ValueError("Please provide valid engine arguments")
     elif bench_args.backend == "runtime":
         backend = Runtime(**dict(cfg._raw_input))
     else:
