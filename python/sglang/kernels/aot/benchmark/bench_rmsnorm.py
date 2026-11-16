@@ -233,6 +233,7 @@ def calculate_diff(batch_size, seq_len, hidden_size, use_residual=True):
         print("✅ All available implementations match")
     else:
         print("❌ Implementations differ")
+    return all_match
 
 
 # CI environment uses simplified parameters
