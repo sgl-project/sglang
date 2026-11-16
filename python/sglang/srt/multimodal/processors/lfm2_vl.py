@@ -63,11 +63,11 @@ class Lfm2VlImageProcessor(SGLangBaseProcessor):
             input_ids = self._tokenizer(
                 input_text, return_tensors="pt", add_special_tokens=False
             ).input_ids
-            return {
-                "input_ids": input_ids.squeeze(0).tolist(),
-                "mm_items": [],
-                "im_token_id": self.IMAGE_TOKEN_ID,
-            }
+            return MultimodalProcessorOutput(
+                input_ids=input_ids.squeeze(0).tolist(),
+                mm_items=[],
+                im_token_id=self.IMAGE_TOKEN_ID,
+            )
 
         base_output = await self.load_mm_data(
             prompt=input_text,

@@ -198,7 +198,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         :param text: The complete text to parse.
         :param tools: List of available tools.
-        :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
+        :return: StreamingParseResult with normal text and parsed tool calls.
         """
         idx = text.find(self.bot_token)
         if idx != -1:

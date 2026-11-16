@@ -18,7 +18,6 @@ from typing import List, Optional
 
 from transformers import CONFIG_MAPPING
 from transformers import Lfm2Config as HFLfm2Config
-from transformers.utils import logging
 
 from sglang.srt.configs.mamba_utils import (
     Mamba2CacheParams,
@@ -26,8 +25,6 @@ from sglang.srt.configs.mamba_utils import (
     mamba2_state_dtype,
 )
 from sglang.srt.runtime_context import get_parallel
-
-logger = logging.get_logger(__name__)
 
 
 class Lfm2Config(HFLfm2Config):

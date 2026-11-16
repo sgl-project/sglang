@@ -27,8 +27,7 @@ _MAMBA1_CACHE_CHUNK_SIZE = 256
 def _mamba1_cache_params(config) -> Mamba2CacheParams:
     from sglang.srt.runtime_context import get_parallel
 
-    parallel = get_parallel()
-    tp_world_size = parallel.tp_size if parallel else 1
+    tp_world_size = get_parallel().tp_size
     shape = Mamba2StateShape.create_full_rank(
         tp_world_size=tp_world_size,
         intermediate_size=config.intermediate_size,

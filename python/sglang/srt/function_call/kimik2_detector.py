@@ -73,11 +73,6 @@ class KimiK2Detector(BaseFormatDetector):
             re.DOTALL,
         )
 
-        self.stream_tool_call_portion_regex = re.compile(
-            r"<\|tool_call_begin\|>\s*(?P<tool_call_id>[^\s<|]+)\s*<\|tool_call_argument_begin\|>\s*(?P<function_arguments>\{.*)",
-            re.DOTALL,
-        )
-
         self._last_arguments = ""
         self._current_stream_function_name: str | None = None
 
@@ -225,9 +220,6 @@ class KimiK2Detector(BaseFormatDetector):
             emit, hold = self._split_pending_start(self._buffer)
             self._buffer = hold
             return StreamingParseResult(normal_text=_strip_special_tokens(emit))
-
-        if not hasattr(self, "_tool_indices"):
-            self._tool_indices = self._get_tool_indices(tools)
 
         normal_text_parts: list[str] = []
         calls: list[ToolCallItem] = []

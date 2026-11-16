@@ -217,6 +217,40 @@ class TestMistralDetector(CustomTestCase):
         params = json.loads(full_params)
         self.assertEqual(params["city"], "Tokyo")
 
+    def test_streaming_content_keeps_closing_brackets(self):
+        """Content streamed while tools are declared keeps every closing
+        bracket, including one that starts a chunk."""
+        detector = MistralDetector()
+        chunks = ["See [1", "] and a[0]", " = b[1]."]
+        normal_text = "".join(
+            detector.parse_streaming_increment(chunk, self.tools).normal_text
+            for chunk in chunks
+        )
+        self.assertEqual(normal_text, "See [1] and a[0] = b[1].")
+
+    def test_streaming_json_array_consumes_only_its_closing_bracket(self):
+        """The bracket that closes a JSON-array call is not content; brackets
+        in the text after the call are."""
+        detector = MistralDetector()
+        chunks = [
+            "[TOOL_CALLS] [",
+            '{"name": "get_weather", ',
+            '"arguments": {"city": "Beijing"}}',
+            "]",
+            " Done [1].",
+        ]
+        all_calls = []
+        normal_text = ""
+        for chunk in chunks:
+            result = detector.parse_streaming_increment(chunk, self.tools)
+            all_calls.extend(result.calls)
+            normal_text += result.normal_text
+
+        self.assertEqual(normal_text, " Done [1].")
+        self.assertEqual([c.name for c in all_calls if c.name], ["get_weather"])
+        params = json.loads("".join(c.parameters for c in all_calls))
+        self.assertEqual(params, {"city": "Beijing"})
+
 
 if __name__ == "__main__":
     import unittest

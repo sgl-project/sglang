@@ -799,7 +799,6 @@ class Lfm2Detector(BaseFormatDetector):
 
         # Check for partial bot_token at the end
         partial_bot = self._ends_with_partial_token(self._buffer, self.bot_token)
-        partial_eot = self._ends_with_partial_token(self._buffer, self.eot_token)
 
         # Find bot_token position
         bot_pos = self._buffer.find(self.bot_token)
@@ -824,17 +823,7 @@ class Lfm2Detector(BaseFormatDetector):
         eot_pos = self._buffer.find(self.eot_token, bot_pos + len(self.bot_token))
 
         if eot_pos == -1:
-            # No end token yet - check if we might have a partial one
-            if partial_eot:
-                # Hold back the partial token, but we need to keep buffering
-                # Just emit any normal text before the tool call
-                if normal_text_before:
-                    self._buffer = self._buffer[bot_pos:]
-                    return StreamingParseResult(normal_text=normal_text_before)
-                # Keep buffering
-                return StreamingParseResult(normal_text="")
-
-            # No end token and no partial - keep buffering but emit normal text
+            # No end token yet - keep buffering but emit normal text
             if normal_text_before:
                 self._buffer = self._buffer[bot_pos:]
                 return StreamingParseResult(normal_text=normal_text_before)
@@ -848,6 +837,10 @@ class Lfm2Detector(BaseFormatDetector):
 
         # Parse the complete block
         result = self.detect_and_parse(tool_call_block, tools)
+        # A streamed tool_index is the call ordinal across all blocks.
+        for call in result.calls:
+            self.current_tool_id += 1
+            call.tool_index = self.current_tool_id
 
         # Update buffer with remaining text
         self._buffer = remaining
