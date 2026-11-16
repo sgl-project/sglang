@@ -9,6 +9,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
     CompressedTensorsConfig,
 )
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+    CompressedTensorsW4AFP8MoE,
     CompressedTensorsWNA16MoE,
     CompressedTensorsWNA16TritonMoE,
 )
@@ -73,6 +74,31 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
     def test_per_layer_fqn_expert_targets_int4(self):
         config = _make_wna16_moe_config(PER_LAYER_EXPERT_TARGETS, num_bits=4)
         self._assert_wna16_moe(config, expected_bits=4)
+
+    def test_w4afp8_reads_matched_group_without_linear_target(self):
+        """W4AFP8 MoE takes bits and group size from the matched expert group.
+
+        A config whose groups target the experts by regex has no "Linear" entry;
+        the scheme must not look one up.
+        """
+        config = _make_wna16_moe_config(["re:.*mlp.experts.*"], num_bits=4)
+        config["config_groups"]["group_0"]["input_activations"] = {
+            "num_bits": 8,
+            "type": "float",
+            "symmetric": True,
+            "strategy": "token",
+            "dynamic": True,
+        }
+        quant_config = CompressedTensorsConfig.from_config(config)
+        self.assertNotIn("Linear", quant_config.target_scheme_map)
+
+        scheme = quant_config.get_moe_scheme(
+            torch.nn.Module(), layer_name=EXPERTS_LAYER
+        )
+
+        self.assertIsInstance(scheme, CompressedTensorsW4AFP8MoE)
+        self.assertEqual(scheme.num_bits, 4)
+        self.assertEqual(scheme.group_size, 128)
 
     def test_unsupported_bits_error_is_one_message(self):
         """The unsupported-bits error reads as a sentence, not a tuple repr."""

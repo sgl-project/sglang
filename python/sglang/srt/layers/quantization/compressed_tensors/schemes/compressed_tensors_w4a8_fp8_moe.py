@@ -84,7 +84,7 @@ class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
         input_quant,
     ):
         self.quant_config = quant_config
-        config = self.quant_config.target_scheme_map["Linear"].get("weights")
+        config = weight_quant
         self.num_bits = config.num_bits
         self.packed_factor = 32 // config.num_bits
         self.group_size = config.group_size
