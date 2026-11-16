@@ -14,6 +14,7 @@ render = [
     "dep:dynamo-protocols",
     "dep:dynamo-renderer",
     "dep:minijinja",
+    "dep:minijinja-contrib",
     "dep:deepseek-recipe",
     "dep:deepseek-recipe-core",
     "dep:deepseek-recipe-encoding",
@@ -48,6 +49,7 @@ hf-hub = { version = "0.4", default-features = false }
 regex = { version = "1", optional = true }
 uuid = { workspace = true, optional = true }
 minijinja = { version = "2.24.0", features = ["unstable_machinery"], optional = true }
+minijinja-contrib = { version = "2.24.0", features = ["pycompat"], optional = true }
 
 # Keep this paired with the server until Dynamo exposes a smaller tokenizer API.
 dynamo-tokenizers = { version = "4.3.1", optional = true }

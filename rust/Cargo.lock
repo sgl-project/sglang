@@ -4132,6 +4132,7 @@ dependencies = [
  "futures",
  "hf-hub",
  "minijinja",
+ "minijinja-contrib",
  "regex",
  "serde",
  "serde_json",

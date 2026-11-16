@@ -55,6 +55,9 @@ pub enum ChatFormatter {
     HuggingFace {
         formatter: PromptFormatter,
         thinking: ThinkingTemplates,
+        /// The template's own error for a developer turn, which Dynamo would
+        /// render as a system turn instead.
+        developer_error: Option<String>,
     },
     KimiK25 {
         formatter: PromptFormatter,
@@ -113,8 +116,17 @@ impl ChatFormatter {
         request: &dyn OAIChatLikeRequest,
     ) -> Result<RenderedPrompt, TemplateError> {
         match self {
-            ChatFormatter::HuggingFace { formatter, .. }
-            | ChatFormatter::Glm53(formatter)
+            ChatFormatter::HuggingFace {
+                formatter,
+                developer_error,
+                ..
+            } => match developer_error {
+                Some(message) if has_developer_turn(request) => Err(TemplateError::Renderer {
+                    message: message.clone(),
+                }),
+                _ => render_oai(formatter, request),
+            },
+            ChatFormatter::Glm53(formatter)
             | ChatFormatter::MiniMaxM3 { formatter, .. }
             | ChatFormatter::Qwen38 { formatter, .. }
             | ChatFormatter::Step3p5 { formatter, .. } => render_oai(formatter, request),
@@ -360,6 +372,16 @@ impl ChatFormatter {
             ChatFormatter::MiniMaxM3 { .. } | ChatFormatter::Legacy(_) => None,
         }
     }
+}
+
+fn has_developer_turn(request: &dyn OAIChatLikeRequest) -> bool {
+    request.messages().try_iter().is_ok_and(|mut messages| {
+        messages.any(|message| {
+            message
+                .get_attr("role")
+                .is_ok_and(|role| role.as_str() == Some("developer"))
+        })
+    })
 }
 
 fn render_oai(
