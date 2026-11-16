@@ -341,6 +341,8 @@ class SchedulerRequestReceiver:
                 req.mm_inputs = error
 
     def _split_work_and_control_reqs(self, recv_reqs: List):
+        # An AbortReq arrives behind its request on this DP group's own socket;
+        # the work channel keeps that order, the broadcast from global rank 0 does not.
         work_reqs = [
             req
             for req in recv_reqs
@@ -351,6 +353,7 @@ class SchedulerRequestReceiver:
                     TokenizedEmbeddingReqInput,
                     BatchTokenizedGenerateReqInput,
                     BatchTokenizedEmbeddingReqInput,
+                    AbortReq,
                 ),
             )
         ]
@@ -364,6 +367,7 @@ class SchedulerRequestReceiver:
                     TokenizedEmbeddingReqInput,
                     BatchTokenizedGenerateReqInput,
                     BatchTokenizedEmbeddingReqInput,
+                    AbortReq,
                 ),
             )
         ]

@@ -118,7 +118,6 @@ POSITIONAL_FIELD_ORDER = (
     "host",
     "port",
     "fastapi_root_path",
-    "smg_grpc_mode",
     "grpc_mode",
     "grpc_port",
     "grpc_worker_threads",
@@ -173,7 +172,6 @@ POSITIONAL_FIELD_ORDER = (
     "crash_dump_folder",
     "show_time_cost",
     "enable_metrics",
-    "smg_http_sidecar_port",
     "enable_mfu_metrics",
     "enable_metrics_for_all_schedulers",
     "load_snapshot_publish_interval",
@@ -574,6 +572,7 @@ POSITIONAL_FIELD_ORDER = (
     "disaggregation_max_top_logprobs_num",
     "shortest_prefill_aging_factor",
     "enable_token_space_processor",
+    "indexer_kv_cache_dtype",
     "elastic_ep_retiree_lifecycle",
     "elastic_ep_reuse_cuda_graph",
 )
