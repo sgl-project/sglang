@@ -109,7 +109,6 @@ try:
 except ImportError:
     enable_flashinfer_fp4_gemm = False
     reorder_rows_for_gated_act_gemm = None
-    shuffle_matrix_a = None
     shuffle_matrix_sf_a = None
 
 # Initialize logger for the module
@@ -281,8 +280,6 @@ def slice_nvfp4_output(
 
 # TODO make it true by default when the DeepEP PR is merged
 MOE_NVFP4_DISPATCH = envs.SGLANG_MOE_NVFP4_DISPATCH.get()
-# Supported activation schemes for the current configuration
-ACTIVATION_SCHEMES = ["static"]
 
 
 def _use_nvfp4_dispatch() -> bool:
@@ -351,7 +348,7 @@ class ModelOptQuantConfig(QuantizationConfig):
     def get_scaled_act_names(self) -> List[str]:
         return []
 
-    def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):  # noqa: B027
+    def apply_weight_name_mapper(self, hf_to_sglang_mapper: WeightsMapper):
         # Map excluded module patterns from HF layout to sglang layout.
         # Ref: HF hf_quant_config.json for nvidia/Kimi-K2.5-NVFP4
         # https://huggingface.co/nvidia/Kimi-K2.5-NVFP4/blob/main/hf_quant_config.json
@@ -1151,8 +1148,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
-
         # Use FP8 dtype if checkpoint is serialized, otherwise use the default dtype
         weight_dtype = (
             torch.float8_e4m3fn
@@ -1209,11 +1204,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
             )
             layer.register_parameter("w13_weight_scale", w13_weight_scale)
             layer.register_parameter("w2_weight_scale", w2_weight_scale)
-
-            # Set weight loader attributes for scales
-            extra_weight_attrs.update(
-                {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
-            )
 
             # INPUT SCALES - Per-tensor scaling for ModelOpt
             w13_input_scale = PerTensorScaleParameter(
@@ -1430,7 +1420,6 @@ class ModelOptFp8MoEMethod(FusedMoEMethodBase):
                 fused_experts_none_to_flashinfer_trtllm_fp8,
                 get_activation_type,
             )
-            from sglang.srt.layers.moe.utils import RoutingMethodType
 
             _SUPPORTED_FP8_ACTIVATIONS = {"silu", "relu2"}
             assert self.moe_runner_config.activation in _SUPPORTED_FP8_ACTIVATIONS, (
@@ -2434,9 +2423,9 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
 
     @property
     def enable_flashinfer_cutlass_moe(self) -> bool:
+        """Access the global enable_flashinfer_cutlass_moe setting."""
         from sglang.srt.layers.moe import get_moe_runner_backend
 
-        """Access the global enable_flashinfer_cutlass_moe setting."""
         return get_moe_runner_backend().is_flashinfer_cutlass()
 
     @property
@@ -2621,12 +2610,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 swizzle_blockscale(layer.w2_weight_scale), requires_grad=False
             )
 
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
-
-        extra_weight_attrs.update(
-            {"quant_method": FusedMoeWeightScaleSupported.BLOCK.value}
-        )
-
         w13_weight_scale_shape = (
             (layer.num_local_experts, 2)
             if layer.moe_runner_config.is_gated
@@ -2660,10 +2643,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
                 weight_loader=weight_loader,
             )
             layer.register_parameter("w2_weight_scale_inv", w2_source_weight_scale_inv)
-
-        extra_weight_attrs.update(
-            {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
-        )
 
         is_nvfp4_online = self.quant_config.get_name() == "nvfp4_online"
         # nvfp4_online installs per-token activation scales after loading;
@@ -3277,7 +3256,6 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
                 FlashInferTrtllmFp4MoeQuantInfo,
             )
-            from sglang.srt.layers.moe.utils import RoutingMethodType
 
             # Determine routing method type based on layer configuration
             routing_method_type = getattr(
