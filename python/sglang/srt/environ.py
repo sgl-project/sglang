@@ -2223,7 +2223,7 @@ class Envs:
     SGLANG_OPT_USE_INKLING_FUSED_ATTN_PROLOGUE = EnvBool(True)
     # Override shared-expert selection: true uses grouped GEMM, false uses BMM.
     # When unset, selection follows model, quantization, and LoRA requirements.
-    SGLANG_OPT_USE_INKLING_SHARED_FUSED_MOE = EnvBool(False)
+    SGLANG_OPT_USE_INKLING_SHARED_FUSED_MOE = EnvBool(True)
     # Fold the MoE shared-expert partials into the custom AR kernels instead
     # of a separate {routed + shared} torch.add per MoE layer; some buckets
     # keep a pre-add during the AR stage-in. torch.add numerics
