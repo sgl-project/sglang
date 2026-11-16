@@ -26,6 +26,9 @@ from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
     rowmajor_gemm,
     rowmajor_gemm_applies,
 )
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
 
 
 @triton.jit
@@ -435,7 +438,7 @@ class FusedKVMaterializeHelper:
         assert self._v_workspace is not None
 
         proj_out_2d = self._proj_workspace[:total_ctx]
-        if rowmajor_gemm_applies(ctx_hidden, self.flat_kv_weight):
+        if _is_hip and rowmajor_gemm_applies(ctx_hidden, self.flat_kv_weight):
             proj_out_2d = rowmajor_gemm(ctx_hidden, self.flat_kv_weight)
         elif self._mm_out_supported:
             try:

@@ -487,10 +487,14 @@ class DFlashAttention(nn.Module):
                 table_qk_norm_rope_,
             )
 
-            # K and V land in their own contiguous rows, which the attention backend
-            # would otherwise copy them into.
-            k = qkv.new_empty((qkv.shape[0], self.kv_size))
-            v = qkv.new_empty((qkv.shape[0], self.kv_size))
+            # ROCm Muse path: K and V land in their own contiguous rows, which the
+            # attention backend would otherwise copy them into.
+            kv_out = None
+            if _muse_gfx95_like:
+                kv_out = (
+                    qkv.new_empty((qkv.shape[0], self.kv_size)),
+                    qkv.new_empty((qkv.shape[0], self.kv_size)),
+                )
             table_qk_norm_rope_(
                 qkv,
                 positions,
@@ -501,9 +505,13 @@ class DFlashAttention(nn.Module):
                 self.num_kv_heads,
                 self.head_dim,
                 self.q_norm.variance_epsilon,
-                kv_out=(k, v),
+                kv_out=kv_out,
             )
-            q = qkv[:, : self.q_size]
+            if kv_out is None:
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            else:
+                q = qkv[:, : self.q_size]
+                k, v = kv_out
         else:
             q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
             # In-place QK kernels use weight directly; Gemma requires 1 + weight.
@@ -1259,6 +1267,7 @@ class DFlashDraftModel(nn.Module):
             projected = self.fc(target_hidden)[0]
         elif (
             self.shards_context_fc
+            and _muse_gfx95_like
             and get_parallel().tp_size > 1
             and not get_parallel().attn_dp_enabled
             and self.fc.out_features % get_parallel().tp_size == 0
@@ -1753,11 +1762,13 @@ class DFlash2DraftModel(DFlashDraftModel):
 
     def __init__(self, config, quant_config=None, prefix: str = "") -> None:
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
-        # The block attends to its own K/V directly, and the worker rewrites the block's
-        # committed cache rows from the target's hidden states after verify; no later
-        # step reads the rest. So the block's K/V never need to reach the cache.
-        for layer in self.layers:
-            layer.self_attn.save_kv_cache = False
+        # On the ROCm Muse attention path the block attends to its own K/V directly, and the
+        # worker rewrites the block's committed cache rows from the target's hidden states
+        # after verify; no later step reads the rest. So the block's K/V never need to reach
+        # the cache there. Other backends read the block's K/V from the cache.
+        if _muse_gfx95_like:
+            for layer in self.layers:
+                layer.self_attn.save_kv_cache = False
         draft_config = self.draft_config
         if not draft_config.selector_rank:
             raise ValueError(
