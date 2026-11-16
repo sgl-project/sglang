@@ -2,7 +2,7 @@
 # Copyright 2023 Antgroup and The HuggingFace Inc. team. All rights reserved.
 import copy
 import logging
-from typing import Callable, Iterable, Optional, Set, Tuple, Union
+from typing import Iterable, Optional, Set, Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -65,42 +65,22 @@ from sglang.srt.models.utils import WeightsMapper, apply_qk_norm, bind_or_assign
 from sglang.srt.runtime_context import (
     get_device,
     get_parallel,
-    get_platform,
     get_stream,
 )
 from sglang.srt.utils import (
     BumpAllocator,
     cpu_has_amx_support,
-    get_device_sm,
     is_cpu,
     is_cuda,
-    is_flashinfer_available,
-    is_gfx95_supported,
     is_hip,
-    is_npu,
 )
 from sglang.srt.utils.log_utils import rank0_log
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
-_is_npu = is_npu()
 _is_fp8_fnuz = is_fp8_fnuz()
-_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-_device_sm = get_device_sm()
-_is_gfx95_supported = is_gfx95_supported()
-
-_use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
-
-if _use_aiter_gfx95:
-    pass
-
-if _is_hip:
-    pass
-
-_is_flashinfer_available = is_flashinfer_available()
-_is_sm100_supported = is_cuda() and get_platform().is_sm100
 
 
 class DsV3MLA(DeepseekV2AttentionMLA):
@@ -110,9 +90,7 @@ class DsV3MLA(DeepseekV2AttentionMLA):
             self.rotary_emb.forward = self.rotary_emb.forward_cuda
 
 
-LoraConfig = None
 logger = logging.getLogger(__name__)
-_is_cpu = is_cpu()
 
 
 def is_linear_layer(layer_idx, layer_group_size):
@@ -122,33 +100,6 @@ def is_linear_layer(layer_idx, layer_group_size):
         return (layer_idx + 1) % layer_group_size != 0
     else:
         return False
-
-
-def is_pp_missing_parameter(
-    name: str,
-    model: torch.nn.Module,
-) -> bool:
-    if isinstance(model, PPMissingLayer):
-        return True
-    return False
-
-
-def weight_loader_with_alias(alias: str):
-    def wrapper(func: Callable):
-        def inner_func(
-            param: torch.Tensor,
-            loaded_weight: torch.Tensor,
-            *args,
-            prefix: str = None,
-            **kwargs,
-        ):
-            # pf = "[vLLM][load]" + " " if prefix is None else f"[{prefix}] "
-            value = func(param, loaded_weight, *args, **kwargs)
-            return value
-
-        return inner_func
-
-    return wrapper
 
 
 class BailingMLP(nn.Module):
@@ -589,7 +540,6 @@ class BailingMoELinearAttention(nn.Module):
         q = q.view((qkv.shape[0], self.tp_heads, self.head_dim))
         k = k.view((qkv.shape[0], self.tp_kv_heads, self.head_dim))
         v = v.view((qkv.shape[0], self.tp_kv_heads, self.head_dim))
-        # logger.warning(f"===={self.layer_id=}, 1-2 {q.shape=}, {k.shape=}, {v.shape=}")
 
         if self.linear_scale:
             q = q * self.scaling
@@ -846,9 +796,6 @@ class BailingMoELinearDecoderLayer(nn.Module):
         **kwargs,
     ) -> torch.Tensor:
         hidden_states = self.attn_boundary.prepare(hidden_states, forward_batch)
-        # logger.warning(
-        #     f"===={self.layer_id=}, 1 shape= {hidden_states.shape}, {residual.shape}"
-        # )
         if not forward_batch.forward_mode.is_idle():
             if self.use_mla:
                 hidden_states = self.attention(
@@ -863,26 +810,11 @@ class BailingMoELinearDecoderLayer(nn.Module):
                     positions=positions,
                     forward_batch=forward_batch,
                 )
-        # logger.warning(
-        #     f"===={self.layer_id=}, 2 shape= {hidden_states.shape}, {residual.shape}"
-        # )
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
-        # logger.warning(
-        #     f"===={self.layer_id=}, 3 shape= {hidden_states.shape}, {residual.shape}"
-        # )
         hidden_states = self.mlp(hidden_states)
         hidden_states = self.ffn_boundary.finish(hidden_states, forward_batch)
         return hidden_states
-
-    @staticmethod
-    def shared_moe_coefficient_loader(
-        param: torch.Tensor, loaded_weight: torch.Tensor
-    ) -> None:
-        assert param.size() == loaded_weight.size()
-
-        param.data.copy_(loaded_weight.to(torch.float32))
-        return
 
 
 class BailingMoELinearModel(nn.Module):
@@ -955,7 +887,6 @@ class BailingMoELinearModel(nn.Module):
             self.norm = RMSNorm(config.hidden_size, **norm_kwargs)
         else:
             self.norm = PPMissingLayer()
-        self.embed_scale = 1.0
         return
 
     def forward(
@@ -1334,9 +1265,6 @@ class BailingMoELinearForCausalLM(nn.Module):
                         module.weight, module.weight_scale_inv, weight_block_size
                     )
 
-    def get_decoder_attention_types(self):
-        return self.model.decoder_attention_types
-
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -1365,13 +1293,10 @@ class BailingMoELinearForCausalLM(nn.Module):
         def load_linear_attn_weight(
             name: str, loaded_weight: torch.Tensor, self
         ) -> None:
-            if is_pp_missing_parameter(name, self):
-                return
             param = params_dict[name]
             weight_loader = getattr(
                 param, "weight_loader", BailingMoELinearAttention.weight_direct_load
             )
-            weight_loader = weight_loader_with_alias(name)(weight_loader)
             weight_loader(param, loaded_weight)
             return
 
@@ -1462,8 +1387,6 @@ class BailingMoELinearForCausalLM(nn.Module):
                     continue
                 if name not in params_dict:
                     continue
-                if is_pp_missing_parameter(name, self):
-                    continue
 
                 param = params_dict[name]
                 weight_loader = param.weight_loader
@@ -1477,8 +1400,6 @@ class BailingMoELinearForCausalLM(nn.Module):
                     name = name.replace(weight_name, param_name)
 
                     if name not in params_dict:
-                        continue
-                    if is_pp_missing_parameter(name, self):
                         continue
                     param = params_dict[name]
                     weight_loader = param.weight_loader
@@ -1551,8 +1472,6 @@ class BailingMoELinearForCausalLM(nn.Module):
                             name = name.replace(".dense.", ".o_proj.")
                             if name not in params_dict:
                                 continue
-                        if is_pp_missing_parameter(name, self):
-                            continue
                         if (
                             "attention" in name
                             and "slope" not in name
