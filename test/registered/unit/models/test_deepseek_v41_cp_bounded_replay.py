@@ -52,7 +52,7 @@ def make_tail(*, cp=True, graph=False):
         swa_out_cache_loc=torch.arange(4),
         cp_metadata=object() if cp else None,
         global_token_indices=indices if cp else None,
-        real_rows_count=3 if graph else None,
+        real_rows_count=(2 if cp else 3) if graph else None,
     )
 
 
@@ -261,6 +261,29 @@ class TestCpBoundedReplayOutput(CustomTestCase):
         self.assertEqual(args[4].shape[0], 3)
         torch.testing.assert_close(
             output.hidden_states_token_indices, tail.token_indices[:3]
+        )
+
+    def test_cp_graph_tail_trims_gathered_rows_using_global_count(self):
+        model, batch, tail = make_model(), make_batch(), make_tail(graph=True)
+        backend = SimpleNamespace(
+            tail_forward_metadata=SimpleNamespace(late_layer_tail=tail)
+        )
+        raw = ((torch.ones(8, 3), torch.ones(8, 6)), torch.ones(8, 9))
+        with (
+            mock.patch.object(deepseek_v4, "get_attn_backend", return_value=backend),
+            mock.patch.object(
+                deepseek_v4.LogitsMetadata,
+                "from_forward_batch",
+                return_value=SimpleNamespace(),
+            ),
+        ):
+            output = model._postprocess_output(raw, batch.input_ids, batch)
+        args, _ = model.logits_processor.call_args
+        torch.testing.assert_close(args[0], tail.global_token_indices)
+        self.assertEqual(args[1].shape[0], 4)
+        self.assertEqual(args[4].shape[0], 4)
+        torch.testing.assert_close(
+            output.hidden_states_token_indices, tail.global_token_indices
         )
 
     def test_prompt_logprob_offsets_use_compact_lengths(self):

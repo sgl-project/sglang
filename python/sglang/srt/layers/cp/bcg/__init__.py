@@ -71,9 +71,10 @@ def supports_prefill_cp_bcg(server_args: ServerArgs) -> bool:
             supports_decoder_bounded_prefill_cp_bcg,
         )
 
-        if (
-            combination[1] != CPAttentionBackendKind.DSV4
-            or not supports_decoder_bounded_prefill_cp_bcg(cfg)
+        if combination[
+            1
+        ] != CPAttentionBackendKind.DSV4 or not supports_decoder_bounded_prefill_cp_bcg(
+            cfg
         ):
             return False
     return get_cp_bcg_input_type(*combination).supports(server_args)
