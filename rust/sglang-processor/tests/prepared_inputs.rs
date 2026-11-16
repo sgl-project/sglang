@@ -15,6 +15,7 @@ use sglang_processor::prepared::{
 };
 use sglang_processor::{MmOutput, MmProcessor};
 
+const PAD_ID: i32 = 151655;
 const PROFILE: &str = "test-profile";
 const FINGERPRINT: &str = "test-fingerprint";
 
@@ -472,7 +473,7 @@ fn finish_prepared_rejects_item_count_span_count_modality_and_multi_span() {
     };
 
     let single = [item(&tensors, &[TokenSpan { start: 0, end: 1 }])];
-    let checked = input(&[pad_id()], &single)
+    let checked = input(&[PAD_ID], &single)
         .check(PROFILE, FINGERPRINT, &limits())
         .unwrap();
     rejected(
@@ -503,7 +504,7 @@ fn finish_prepared_rejects_item_count_span_count_modality_and_multi_span() {
         modality: Modality::Video,
         ..item(&tensors, &[TokenSpan { start: 0, end: 1 }])
     }];
-    let video_checked = input(&[pad_id()], &video_input)
+    let video_checked = input(&[PAD_ID], &video_input)
         .check(PROFILE, FINGERPRINT, &limits())
         .unwrap();
     rejected(
@@ -529,7 +530,7 @@ fn finish_prepared_rejects_item_count_span_count_modality_and_multi_span() {
             TokenSpan { start: 2, end: 3 },
         ],
     )];
-    let multi_checked = input(&[pad_id(), 7, pad_id()], &multi_spans)
+    let multi_checked = input(&[PAD_ID, 7, PAD_ID], &multi_spans)
         .check(PROFILE, FINGERPRINT, &limits())
         .unwrap();
     assert_eq!(multi_checked.input().items[0].spans.len(), 2);
@@ -542,17 +543,13 @@ fn finish_prepared_rejects_item_count_span_count_modality_and_multi_span() {
     );
 }
 
-fn pad_id() -> i32 {
-    151655
-}
-
 #[test]
 fn finish_prepared_raw_round_trip_two_unequal_images_matches_except_hash() {
     let processor = MmProcessor::from_spec(qwen_spec()).unwrap();
     let tiny = std::fs::read(mm_fixtures().join("tiny_10x10.png")).unwrap();
     let rgba = std::fs::read(mm_fixtures().join("rgba_80x60.png")).unwrap();
     assert_ne!(tiny, rgba);
-    let pad = pad_id();
+    let pad = PAD_ID;
     let placeholders = [151652, pad, 151653, 151652, pad, 151653, 74785, 13];
     let raw = processor
         .process(&placeholders, &[&tiny, &rgba])
