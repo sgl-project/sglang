@@ -156,25 +156,14 @@ BUDGET_GRANULARITY = 8  # Q64 x K64 default; SM90 sage_fp8 uses exact block coun
 VALID_N = (1, 2, 4, 8)  # sub-blocks per query/key block
 
 
-def _snap_up_to_8(topk: int, num_blocks: int) -> int:
-    """Round a block budget up to what the kernel is going to charge for anyway.
-
-    ``bsa_attn_blk64_fwd`` pads each query row's block count up to a multiple of
-    ``BUDGET_GRANULARITY`` with phantom slots that repeat the last real block and
-    are then masked out of the softmax. Asking for 148 blocks therefore costs
-    exactly what 152 costs, with four of the slots computed and thrown away.
-    Measured at S=37.7k on B200, 2 prompts in one session: 152 blocks take
-    16.055 s against 16.061 s for 148, and 120 take 15.490 s against 15.496 s
-    for 118 -- free, inside the noise. So take the blocks.
-
-    The consequence for the caller is that ``sparsity`` is an upper bound rather
-    than an exact figure: 0.75 of 590 blocks becomes 152 kept, 0.7424 dropped.
-    """
-    return _snap_up(topk, num_blocks, BUDGET_GRANULARITY)
-
-
 def _snap_up(topk: int, num_blocks: int, granularity: int) -> int:
-    """Clamp a requested budget and round it to a kernel's billing unit."""
+    """Clamp a requested budget and round it to a kernel's billing unit.
+
+    ``bsa_attn_blk64_fwd`` pads each query row's block count to a multiple of
+    ``BUDGET_GRANULARITY`` with masked phantom slots, so the rounded-up blocks
+    are free (B200, S=37.7k: 152 blocks 16.055 s vs 16.061 s for 148), and
+    ``sparsity`` is an upper bound: 0.75 of 590 blocks keeps 152.
+    """
     if granularity < 1:
         raise ValueError(f"budget granularity must be positive, got {granularity}")
     return min(num_blocks, max(1, -(-topk // granularity)) * granularity)

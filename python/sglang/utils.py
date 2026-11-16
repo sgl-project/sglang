@@ -1,6 +1,5 @@
 """Common utilities"""
 
-import importlib
 import json
 import logging
 import os
@@ -9,21 +8,17 @@ import ssl
 import subprocess
 import sys
 import time
-import traceback
 import urllib.request
 import weakref
-from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from functools import cached_property, wraps
 from io import BytesIO
 from json import dumps
-from typing import Any, Callable, List, Optional, Tuple, Type, Union
+from typing import Any, Optional, Union
 
 import numpy as np
 import pybase64
 import requests
-from IPython.display import HTML, display
-from pydantic import BaseModel
 from tqdm import tqdm
 
 from sglang.srt.environ import envs
@@ -84,42 +79,6 @@ def execute_once(func):
 @execute_once
 def info_once(message: str):
     logger.info(message)
-
-
-def convert_json_schema_to_str(json_schema: Union[dict, str, Type[BaseModel]]) -> str:
-    """Convert a JSON schema to a string.
-    Parameters
-    ----------
-    json_schema
-        The JSON schema.
-    Returns
-    -------
-    str
-        The JSON schema converted to a string.
-    Raises
-    ------
-    ValueError
-        If the schema is not a dictionary, a string or a Pydantic class.
-    """
-    if isinstance(json_schema, dict):
-        schema_str = json.dumps(json_schema)
-    elif isinstance(json_schema, str):
-        schema_str = json_schema
-    elif issubclass(json_schema, BaseModel):
-        schema_str = json.dumps(json_schema.model_json_schema())
-    else:
-        raise ValueError(
-            f"Cannot parse schema {json_schema}. The schema must be either "
-            + "a Pydantic class, a dictionary or a string that contains the JSON "
-            + "schema specification"
-        )
-    return schema_str
-
-
-def get_exception_traceback():
-    etype, value, tb = sys.exc_info()
-    err_str = "".join(traceback.format_exception(etype, value, tb))
-    return err_str
 
 
 def is_same_type(values: list):
@@ -317,73 +276,6 @@ def encode_video_base64(video_path: str, num_frames: int = 16):
     return video_base64
 
 
-def _is_chinese_char(cp: int):
-    """Checks whether CP is the codepoint of a CJK character."""
-    # This defines a "chinese character" as anything in the CJK Unicode block:
-    #   https://en.wikipedia.org/wiki/CJK_Unified_Ideographs_(Unicode_block)
-    #
-    # Note that the CJK Unicode block is NOT all Japanese and Korean characters,
-    # despite its name. The modern Korean Hangul alphabet is a different block,
-    # as is Japanese Hiragana and Katakana. Those alphabets are used to write
-    # space-separated words, so they are not treated specially and handled
-    # like the all of the other languages.
-    if (
-        (cp >= 0x4E00 and cp <= 0x9FFF)
-        or (cp >= 0x3400 and cp <= 0x4DBF)  #
-        or (cp >= 0x20000 and cp <= 0x2A6DF)  #
-        or (cp >= 0x2A700 and cp <= 0x2B73F)  #
-        or (cp >= 0x2B740 and cp <= 0x2B81F)  #
-        or (cp >= 0x2B820 and cp <= 0x2CEAF)  #
-        or (cp >= 0xF900 and cp <= 0xFAFF)
-        or (cp >= 0x2F800 and cp <= 0x2FA1F)  #
-    ):  #
-        return True
-
-    return False
-
-
-def find_printable_text(text: str):
-    """Returns the longest printable substring of text that contains only entire words."""
-    # Borrowed from https://github.com/huggingface/transformers/blob/061580c82c2db1de9139528243e105953793f7a2/src/transformers/generation/streamers.py#L99
-
-    # After the symbol for a new line, we flush the cache.
-    if text.endswith("\n"):
-        return text
-    # If the last token is a CJK character, we print the characters.
-    elif len(text) > 0 and _is_chinese_char(ord(text[-1])):
-        return text
-    # Otherwise if the penultimate token is a CJK character, we print the characters except for the last one.
-    elif len(text) > 1 and _is_chinese_char(ord(text[-2])):
-        return text[:-1]
-    # Otherwise, prints until the last space char (simple heuristic to avoid printing incomplete words,
-    # which may change with the subsequent token -- there are probably smarter ways to do this!)
-    else:
-        return text[: text.rfind(" ") + 1]
-
-
-class LazyImport:
-    """Lazy import to make `import sglang` run faster."""
-
-    def __init__(self, module_name: str, class_name: str):
-        self.module_name = module_name
-        self.class_name = class_name
-        self._module = None
-
-    def _load(self):
-        if self._module is None:
-            module = importlib.import_module(self.module_name)
-            self._module = getattr(module, self.class_name)
-        return self._module
-
-    def __getattr__(self, name: str):
-        module = self._load()
-        return getattr(module, name)
-
-    def __call__(self, *args, **kwargs):
-        module = self._load()
-        return module(*args, **kwargs)
-
-
 def download_and_cache_file(url: str, filename: Optional[str] = None):
     """Read and cache a file from a url."""
     if filename is None:
@@ -427,6 +319,8 @@ def is_in_ci() -> bool:
 
 def print_highlight(html_content: str):
     if is_in_ci():
+        from IPython.display import HTML, display
+
         html_content = str(html_content).replace("\n", "<br>")
         display(HTML(f"<strong style='color: #00008B;'>{html_content}</strong>"))
     else:
@@ -599,52 +493,6 @@ def wait_for_server(
         """)
 
 
-class TypeBasedDispatcher:
-    def __init__(self, mapping: List[Tuple[Type, Callable]]):
-        # Use dictionary for fast exact type matching, using OrderedDict(mapping)
-        # to maintains registration order
-        self._mapping = OrderedDict(mapping)
-        # MRO cache for inheritance-based matching
-        self._mro_cache = {}
-        self._fallback_fn = None
-
-    def add_fallback_fn(self, fallback_fn: Callable):
-        self._fallback_fn = fallback_fn
-
-    def __iadd__(self, other: "TypeBasedDispatcher"):
-        for ty, fn in other._mapping.items():
-            if ty not in self._mapping:
-                self._mapping[ty] = fn
-
-        self._mro_cache.clear()
-        return self
-
-    def __call__(self, obj: Any):
-        obj_type = type(obj)
-        # 1. First try exact match(o(1))
-        fn = self._mapping.get(obj_type)
-        if fn is not None:
-            return fn(obj)
-
-        # 2. If exact match fails, check MRO cache
-        cached_fn = self._mro_cache.get(obj_type)
-        if cached_fn is not None:
-            return cached_fn(obj)
-
-        # 3.search in registration order for compatible type(maintains origin behavior)
-        for ty, fn in self._mapping.items():
-            if isinstance(obj, ty):
-                self._mro_cache[obj_type] = fn
-                return fn(obj)
-
-        # 4. if no matching type found, cache this result
-        self._mro_cache[obj_type] = None
-
-        if self._fallback_fn is not None:
-            return self._fallback_fn(obj)
-        raise ValueError(f"Invalid object: {obj}")
-
-
 def trim_overlap(existing_text, new_chunk):
     """
     Finds the largest suffix of 'existing_text' that is a prefix of 'new_chunk'
@@ -685,12 +533,3 @@ async def async_stream_and_merge(llm, prompt, sampling_params):
         cleaned_chunk = trim_overlap(final_text, chunk_text)
         final_text += cleaned_chunk
         yield cleaned_chunk  # yield the non-overlapping portion
-
-
-def resolve_obj_by_qualname(qualname: str) -> Any:
-    """
-    Resolve an object by its fully qualified name.
-    """
-    module_name, obj_name = qualname.rsplit(".", 1)
-    module = importlib.import_module(module_name)
-    return getattr(module, obj_name)

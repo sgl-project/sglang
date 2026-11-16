@@ -38,17 +38,18 @@ class HiddenStatesDynamicQuant(BaseHiddenStatesQuant):
     def __init__(self, quant_dtype: torch.dtype, use_mx_quant: bool = False) -> None:
         super().__init__(quant_dtype)
         if use_mx_quant or quant_dtype == torch.float8_e4m3fn:
-            self._op = torch.ops.npu.npu_dynamic_mx_quant
+            self._op_name = "npu_dynamic_mx_quant"
         elif quant_dtype in (torch.int8, torch.quint4x2):
-            self._op = torch.ops.npu.npu_dynamic_quant
+            self._op_name = "npu_dynamic_quant"
         else:
             raise ValueError(f"Unsupported dynamic quant dtype: {quant_dtype}")
 
     def __call__(
         self, hidden_states: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        quantized, scale = self._op(hidden_states, dst_type=self.quant_dtype)
-        return quantized, scale
+        # Resolve lazily so construction does not require torch_npu.
+        op = getattr(torch.ops.npu, self._op_name)
+        return op(hidden_states, dst_type=self.quant_dtype)
 
 
 class HiddenStatesStaticQuant(BaseHiddenStatesQuant):

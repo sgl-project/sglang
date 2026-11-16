@@ -1,19 +1,33 @@
 import sys
+from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+from sglang.srt.runtime_context import get_context
+from sglang.srt.speculative.dflash_utils import build_speculative_verify_target_probs
+from sglang.srt.speculative.eagle_utils import _apply_joint_top_k_top_p
 from sglang.test.ci.ci_register import register_cuda_ci
 
 if torch.version.cuda is not None:
+    from flashinfer.sampling import top_k_renorm_probs, top_p_renorm_probs
+
     from sglang.kernels.ops.speculative.sampling import (
         tree_speculative_sampling_target_only,
     )
+    from sglang.srt.speculative.uno_utils import _build_sparse_target_support_tensors
 else:
     from sgl_kernel import tree_speculative_sampling_target_only
 
-register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+    from sglang.kernels.ops.sampling.renorm_triton import (
+        top_k_renorm_probs_triton as top_k_renorm_probs,
+    )
+    from sglang.kernels.ops.sampling.renorm_triton import (
+        top_p_renorm_probs_triton as top_p_renorm_probs,
+    )
+
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 test_cases = [
     (
@@ -215,6 +229,133 @@ def test_target_only_sampling_cdf_boundaries(
 
     assert predicts[0].item() == expected_token
     assert accept_token_num.item() == expected_accept_token_num
+
+
+@pytest.fixture
+def joint_top_k_top_p_case(request):
+    override = get_context().override_server_args(tp_size=1)
+    override.install()
+    request.addfinalizer(override.restore)
+    original_probs = torch.tensor(
+        [[0.35, 0.25, 0.20, 0.05, 0.03, 0.03, 0.03, 0.03, 0.03]],
+        device="cuda",
+    )
+    sampling_info = SimpleNamespace(
+        temperatures=torch.ones((1, 1), device="cuda"),
+        need_top_k_sampling=True,
+        need_top_p_sampling=True,
+        top_ks=torch.tensor([4], dtype=torch.int32, device="cuda"),
+        top_ps=torch.tensor([0.82], device="cuda"),
+    )
+    expected_probs = torch.zeros_like(original_probs)
+    expected_probs[0, :4] = original_probs[0, :4] / original_probs[0, :4].sum()
+    return original_probs, sampling_info, expected_probs
+
+
+def test_eagle_preserves_original_top_p_nucleus(joint_top_k_top_p_case):
+    """Production renormalizers must retain token 3: its original preceding
+    mass is 0.80 < top_p, while its top-k-normalized mass exceeds top_p."""
+    original_probs, sampling_info, expected_probs = joint_top_k_top_p_case
+    filtered_probs = _apply_joint_top_k_top_p(
+        original_probs,
+        sampling_info,
+        draft_token_num=1,
+        top_k_renorm_prob=top_k_renorm_probs,
+        top_p_renorm_prob=top_p_renorm_probs,
+    )
+    torch.testing.assert_close(filtered_probs, expected_probs)
+
+
+@pytest.mark.parametrize("use_sparse_topk", [False, True], ids=["dense", "sparse"])
+def test_speculative_target_preserves_original_top_p_nucleus(
+    joint_top_k_top_p_case, use_sparse_topk
+):
+    """Dense and sparse targets must retain token 3 using its original
+    preceding mass of 0.80, not its top-k-normalized mass of 0.80 / 0.85."""
+    original_probs, sampling_info, expected_probs = joint_top_k_top_p_case
+    filtered_probs = build_speculative_verify_target_probs(
+        next_token_logits=original_probs.log(),
+        sampling_info=sampling_info,
+        draft_token_num=1,
+        bs=1,
+        max_top_k=4,
+        uniform_top_k_value=4,
+        use_sparse_topk=use_sparse_topk,
+    ).view_as(original_probs)
+    torch.testing.assert_close(filtered_probs, expected_probs)
+
+
+@pytest.mark.skipif(torch.version.cuda is None, reason="UNO compact path requires CUDA")
+def test_uno_compact_preserves_original_top_p_nucleus(joint_top_k_top_p_case):
+    """Compact support must retain token 3 using its original preceding
+    mass of 0.80, not its top-k-normalized mass of 0.80 / 0.85."""
+    original_probs, sampling_info, expected_probs = joint_top_k_top_p_case
+    support_ids, support_probs = _build_sparse_target_support_tensors(
+        next_token_logits=original_probs.log(),
+        temperatures=sampling_info.temperatures,
+        top_ks=sampling_info.top_ks,
+        top_ps=sampling_info.top_ps,
+        batch_size=1,
+        forward_width=1,
+        max_top_k=4,
+    )
+    torch.testing.assert_close(
+        support_ids,
+        torch.tensor([[[0, 1, 2, 3]]], dtype=support_ids.dtype, device="cuda"),
+    )
+    torch.testing.assert_close(support_probs, expected_probs[:, :4].view(1, 1, 4))
+
+
+@pytest.mark.skipif(torch.version.cuda is None, reason="UNO compact path requires CUDA")
+@pytest.mark.parametrize("requests", [1, 16, 68])
+def test_uno_fused_top_p_mass_matches_the_compiled_bound(requests, monkeypatch):
+    """SGLANG_OPT_SPEC_FUSED_TOP_P_MASS: the compiled bound up to fp32 summation order,
+    and the same kept supports."""
+    from sglang.kernels.ops.speculative.top_p_mass import top_p_for_top_k_support
+    from sglang.srt.speculative import uno_utils
+    from sglang.srt.speculative.dflash_utils import _adjust_top_p_for_top_k
+
+    width, vocab, max_top_k = 4, 248320, 20
+    rows = requests * width
+    g = torch.Generator(device="cuda").manual_seed(requests)
+    logits = torch.randn(rows, vocab, generator=g, device="cuda") * 2.5
+    peaks = torch.randint(0, vocab, (rows, 8), generator=g, device="cuda")
+    logits.scatter_add_(1, peaks, torch.rand(rows, 8, generator=g, device="cuda") * 12)
+    temperatures = 0.5 + torch.rand(requests, 1, generator=g, device="cuda")
+    top_ks = torch.randint(2, max_top_k + 1, (requests,), generator=g, device="cuda")
+    top_ps = 0.6 + 0.4 * torch.rand(requests, generator=g, device="cuda")
+
+    topk_logits = torch.topk(logits, max_top_k, dim=-1).values
+    expanded_t = temperatures.repeat_interleave(width, dim=0)
+    valid = torch.arange(max_top_k, device="cuda")[None, :] < top_ks.repeat_interleave(
+        width
+    ).view(rows, 1)
+    scaled = (topk_logits / expanded_t).masked_fill(~valid, float("-inf"))
+    want = _adjust_top_p_for_top_k(
+        scaled, logits, top_ps.repeat_interleave(width).view(rows, 1), expanded_t
+    )
+    got = top_p_for_top_k_support(
+        topk_logits, logits, temperatures, top_ks, top_ps, width
+    )
+    torch.testing.assert_close(got, want, rtol=1e-5, atol=0)
+
+    supports = {}
+    for fused in (False, True):
+        monkeypatch.setattr(uno_utils, "_FUSED_TOP_P_MASS", fused)
+        supports[fused] = _build_sparse_target_support_tensors(
+            next_token_logits=logits,
+            temperatures=temperatures,
+            top_ks=top_ks,
+            top_ps=top_ps,
+            batch_size=requests,
+            forward_width=width,
+            max_top_k=max_top_k,
+        )
+    assert torch.equal(supports[False][0], supports[True][0])
+    assert torch.equal(supports[False][1] > 0, supports[True][1] > 0)
+    torch.testing.assert_close(
+        supports[True][1], supports[False][1], rtol=1e-5, atol=1e-7
+    )
 
 
 if __name__ == "__main__":
