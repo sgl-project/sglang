@@ -637,7 +637,7 @@ def _prologue_module(
         *(str(v) for v in flags),
         str(weight_dtype).split(".")[-1],
         str(scale_dtype).split(".")[-1],
-        cuda_files=["inkling2/prologue.cuh"],
+        cuda_files=["attention/inkling2_attn_prologue.cuh"],
         cuda_wrappers=[
             (
                 "run",
