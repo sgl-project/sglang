@@ -6,7 +6,6 @@ import triton.language as tl
 from sglang.kernels.jit.utils import is_arch_support_pdl
 
 
-
 @triton.jit
 def _linear_k_groups(
     X,
