@@ -762,8 +762,6 @@ class AutoencoderKLLTX2Audio(ParallelTiledVAE):
     LTX2 audio VAE for encoding and decoding audio latent representations.
     """
 
-    _supports_gradient_checkpointing = False
-
     def __init__(
         self,
         config: LTXAudioVAEConfig,

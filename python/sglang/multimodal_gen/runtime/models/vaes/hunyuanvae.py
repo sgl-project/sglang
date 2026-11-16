@@ -471,7 +471,6 @@ class HunyuanVideoMidBlock3D(nn.Module):
         self.resnets = nn.ModuleList(resnets)
 
         self.spatial_parallel = False
-        self.gradient_checkpointing = False
 
     def _run_attention(
         self, attn: HunyuanVAEAttention, hidden_states: torch.Tensor
@@ -504,25 +503,13 @@ class HunyuanVideoMidBlock3D(nn.Module):
         return hidden_states
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if torch.is_grad_enabled() and self.gradient_checkpointing:
-            hidden_states = self._gradient_checkpointing_func(
-                self.resnets[0], hidden_states
-            )
+        hidden_states = self.resnets[0](hidden_states)
 
-            for attn, resnet in zip(self.attentions, self.resnets[1:], strict=True):
-                if attn is not None:
-                    hidden_states = self._run_attention(attn, hidden_states)
+        for attn, resnet in zip(self.attentions, self.resnets[1:], strict=True):
+            if attn is not None:
+                hidden_states = self._run_attention(attn, hidden_states)
 
-                hidden_states = self._gradient_checkpointing_func(resnet, hidden_states)
-
-        else:
-            hidden_states = self.resnets[0](hidden_states)
-
-            for attn, resnet in zip(self.attentions, self.resnets[1:], strict=True):
-                if attn is not None:
-                    hidden_states = self._run_attention(attn, hidden_states)
-
-                hidden_states = resnet(hidden_states)
+            hidden_states = resnet(hidden_states)
 
         return hidden_states
 
@@ -573,15 +560,9 @@ class HunyuanVideoDownBlock3D(nn.Module):
         else:
             self.downsamplers = None
 
-        self.gradient_checkpointing = False
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if torch.is_grad_enabled() and self.gradient_checkpointing:
-            for resnet in self.resnets:
-                hidden_states = self._gradient_checkpointing_func(resnet, hidden_states)
-        else:
-            for resnet in self.resnets:
-                hidden_states = resnet(hidden_states)
+        for resnet in self.resnets:
+            hidden_states = resnet(hidden_states)
 
         if self.downsamplers is not None:
             for downsampler in self.downsamplers:
@@ -635,16 +616,9 @@ class HunyuanVideoUpBlock3D(nn.Module):
         else:
             self.upsamplers = None
 
-        self.gradient_checkpointing = False
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        if torch.is_grad_enabled() and self.gradient_checkpointing:
-            for resnet in self.resnets:
-                hidden_states = self._gradient_checkpointing_func(resnet, hidden_states)
-
-        else:
-            for resnet in self.resnets:
-                hidden_states = resnet(hidden_states)
+        for resnet in self.resnets:
+            hidden_states = resnet(hidden_states)
 
         if self.upsamplers is not None:
             for upsampler in self.upsamplers:
@@ -747,25 +721,13 @@ class HunyuanVideoEncoder3D(nn.Module):
             block_out_channels[-1], conv_out_channels, kernel_size=3
         )
 
-        self.gradient_checkpointing = False
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.conv_in(hidden_states)
 
-        if torch.is_grad_enabled() and self.gradient_checkpointing:
-            for down_block in self.down_blocks:
-                hidden_states = self._gradient_checkpointing_func(
-                    down_block, hidden_states
-                )
-
-            hidden_states = self._gradient_checkpointing_func(
-                self.mid_block, hidden_states
-            )
-        else:
-            for down_block in self.down_blocks:
-                hidden_states = down_block(hidden_states)
-            assert self.mid_block is not None
-            hidden_states = self.mid_block(hidden_states)
+        for down_block in self.down_blocks:
+            hidden_states = down_block(hidden_states)
+        assert self.mid_block is not None
+        hidden_states = self.mid_block(hidden_states)
 
         hidden_states = apply_group_norm_silu(
             hidden_states, self.conv_norm_out, self.conv_act
@@ -871,25 +833,14 @@ class HunyuanVideoDecoder3D(nn.Module):
 
         self.spatial_parallel = False
         self.decode_fast_path_gate: VaeFastPathGate | None = None
-        self.gradient_checkpointing = False
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.conv_in(hidden_states)
 
-        if torch.is_grad_enabled() and self.gradient_checkpointing:
-            hidden_states = self._gradient_checkpointing_func(
-                self.mid_block, hidden_states
-            )
+        hidden_states = self.mid_block(hidden_states)
 
-            for up_block in self.up_blocks:
-                hidden_states = self._gradient_checkpointing_func(
-                    up_block, hidden_states
-                )
-        else:
-            hidden_states = self.mid_block(hidden_states)
-
-            for up_block in self.up_blocks:
-                hidden_states = up_block(hidden_states)
+        for up_block in self.up_blocks:
+            hidden_states = up_block(hidden_states)
 
         # post-process
         hidden_states = _apply_group_norm_silu(
@@ -924,8 +875,6 @@ class AutoencoderKLHunyuanVideo(ParallelTiledVAE):
     This model inherits from [`ModelMixin`]. Check the superclass documentation for it's generic methods implemented
     for all models (such as downloading or saving).
     """
-
-    _supports_gradient_checkpointing = True
 
     def __init__(
         self,

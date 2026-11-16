@@ -466,7 +466,6 @@ class Qwen2_5_VLTextModel(nn.Module):
         )
         self.has_sliding_layers = "sliding_attention" in self.config.layer_types
 
-        self.gradient_checkpointing = False
         # Initialize weights and apply final processing
         # self.post_init()
 

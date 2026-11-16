@@ -412,7 +412,6 @@ class LingBotVideoBlock(nn.Module):
 
 class LingBotVideoTransformer3DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     _no_split_modules = ("LingBotVideoBlock",)
-    _keep_in_fp32_modules = tuple(LINGBOT_VIDEO_FP32_MODULES)
 
     _fsdp_shard_conditions = [is_lingbot_block]
     _compile_conditions = [is_lingbot_block]

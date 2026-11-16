@@ -911,8 +911,6 @@ class WanMidBlock(nn.Module):
         self.attentions = nn.ModuleList(attentions)
         self.resnets = nn.ModuleList(resnets)
 
-        self.gradient_checkpointing = False
-
     def forward(self, x):
         return mid_block_forward(self, x)
 
@@ -1164,7 +1162,6 @@ class WanEncoder3d(nn.Module):
         self.norm_out = WanRMS_norm(out_dim, images=False)
         self.conv_out = CausalConv3d(out_dim, z_dim, 3, padding=1)
 
-        self.gradient_checkpointing = False
         self.world_size = 1
         self.rank = 0
         if dist.is_initialized():
@@ -1282,8 +1279,6 @@ class WanResidualUpBlock(nn.Module):
         else:
             self.upsampler = None
 
-        self.gradient_checkpointing = False
-
     def forward(self, x):
         return residual_up_block_forward(self, x)
 
@@ -1333,8 +1328,6 @@ class WanUpBlock(nn.Module):
         self.upsamplers = None
         if upsample_mode is not None:
             self.upsamplers = nn.ModuleList([resample_cls(out_dim, mode=upsample_mode)])
-
-        self.gradient_checkpointing = False
 
     def forward(self, x):
         return up_block_forward(self, x)
@@ -1498,7 +1491,6 @@ class WanDecoder3d(nn.Module):
         self.norm_out = WanRMS_norm(out_dim, images=False)
         self.conv_out = CausalConv3d(out_dim, out_channels, 3, padding=1)
 
-        self.gradient_checkpointing = False
         self.world_size = 1
         self.rank = 0
         if dist.is_initialized():
@@ -1592,7 +1584,6 @@ class AutoencoderKLWan(ParallelTiledVAE):
     Introduced in [Wan 2.1].
     """
 
-    _supports_gradient_checkpointing = False
     supports_decode_on_frames = True
 
     def __init__(

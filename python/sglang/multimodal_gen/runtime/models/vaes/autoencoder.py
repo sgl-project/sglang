@@ -62,7 +62,6 @@ class AutoencoderKL(AutoencoderKLMixin, nn.Module, LayerwiseOffloadableModuleMix
     """
 
     layerwise_offload_dit_group_enabled = False
-    _supports_gradient_checkpointing = True
     _no_split_modules = ["BasicTransformerBlock", "ResnetBlock2D"]
     layer_names = ["encoder.down_blocks", "decoder.up_blocks"]
 

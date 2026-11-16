@@ -535,7 +535,6 @@ class PiGemmaModel(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps, cond_dim=cond_dim
         )
         self.rotary_emb = PiGemmaRotaryEmbedding(config=config)
-        self.gradient_checkpointing = False
 
     def get_input_embeddings(self) -> nn.Module:
         return self.embed_tokens

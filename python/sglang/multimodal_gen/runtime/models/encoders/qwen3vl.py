@@ -537,7 +537,6 @@ class Qwen3VLTextModel(nn.Module):
             ]
         )
         self.norm = _make_text_rms_norm(config.hidden_size, config.rms_norm_eps)
-        self.gradient_checkpointing = False
 
         # Initialize weights and apply final processing
 
