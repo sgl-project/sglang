@@ -282,6 +282,3 @@ class TritonGDNKernel(LinearAttnKernelBase):
             cache_steps=cache_steps,
             retrieve_parent_token=retrieve_parent_token,
         )
-
-    if is_npu():
-        target_verify = LinearAttnKernelBase.target_verify
