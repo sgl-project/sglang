@@ -2031,6 +2031,23 @@ class ServingChatTestCase(CustomTestCase):
 
         self.assertTrue(adapted.require_reasoning)
 
+    def test_harmony_reasoning_keeps_delimiters_for_non_gpt_oss_models(self):
+        """Explicit Harmony parsers need markers even when the model architecture
+        does not activate GPT-OSS's native detokenization special case."""
+        for parser, skip in (
+            ("gpt-oss", False),
+            ("llm-jp-harmony", False),
+            (None, True),
+            ("qwen3", True),
+        ):
+            with self.subTest(parser=parser):
+                request = ChatCompletionRequest(
+                    model="x", messages=[{"role": "user", "content": "Hello"}]
+                )
+                self.chat.reasoning_parser = parser
+                self.chat._patch_reasoning_skip_special_tokens(request)
+                self.assertEqual(request.skip_special_tokens, skip)
+
     def test_process_messages_records_template_reasoning_state(self):
         self.chat.default_chat_template_kwargs = {"thinking": True}
         self.template_manager.reasoning_config = ReasoningToggleConfig(
