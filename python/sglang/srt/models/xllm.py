@@ -961,6 +961,7 @@ class XllmSparseMoeBlock(nn.Module):
                 parallel_group="replicated"
                 if (
                     get_moe_a2a_backend().is_deepep()
+                    or get_moe_a2a_backend().is_ascend_ops()
                     or get_moe_a2a_backend().is_mori()
                     or get_moe_a2a_backend().is_flashinfer()
                 )
@@ -1041,7 +1042,11 @@ class XllmSparseMoeBlock(nn.Module):
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
 
-        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_mori():
+        if (
+            get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_ascend_ops()
+            or get_moe_a2a_backend().is_mori()
+        ):
             return self._forward_deepep(hidden_states, forward_batch)
 
         if hidden_states.shape[0] == 0:

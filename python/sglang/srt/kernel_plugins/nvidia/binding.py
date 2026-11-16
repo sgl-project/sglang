@@ -37,6 +37,8 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
     PostVerifyStrategy,
     SpeculativeRuntimeHooks,
     Step,
+    SupportsPrefillBody,
+    SupportsStateSlotReset,
     find_spec,
     registered_architectures,
     spec_registered,
@@ -51,8 +53,11 @@ from sglang.srt.plugins import GENERAL_PLUGINS_GROUP
 from sglang.srt.runtime_context import (
     get_context,
     get_device,
+    get_disagg,
     get_exec,
+    get_memory,
     get_parallel,
+    get_schedule,
     get_spec,
 )
 
@@ -292,8 +297,12 @@ class ForwardView:
             # Optional operations stay lazy; hybrid consumers retain only the
             # typed surface above, not a reference to the backend.
             self._backend = backend
-            self.metadata = backend.forward_metadata
             self.kv_pool = KvPoolView(backend.token_to_kv_pool, seal_cache)
+
+    @property
+    def metadata(self) -> Any:
+        # Read on use: a composite backend keeps it in its children.
+        return self._backend.forward_metadata
 
     @property
     def use_fused_topk(self) -> bool:
@@ -1180,6 +1189,49 @@ def megakernel_enabled() -> bool:
     return get_exec().kernel.enable_nvidia_megakernel
 
 
+def _kimi_build_widths(
+    max_rows: int, tokens: int, architectures: Any, *, is_draft: bool
+) -> tuple[int, ...]:
+    """Omit unreachable q6 widths without changing eager or graph dispatch.
+
+    Preparation precedes KV sizing. For ordinary TP8, the resolved request
+    limit bounds the eventual pool, and unaligned graph buckets are clamped
+    to that pool. Keep every intervening width for eager execution and buckets
+    added during sizing. Unknown bounds or other layouts retain full preparation.
+    """
+    widths = tuple(range(tokens, max_rows + 1, tokens))
+    if is_draft or tuple(architectures or ()) != ("KimiK3ForConditionalGeneration",):
+        return widths
+    from sglang.srt.layers.dp_attention import get_cuda_graph_batch_size_alignment
+
+    config, parallel, disagg = get_spec(), get_parallel(), get_disagg()
+    graph = get_exec().graph.cuda_graph_config
+    request_limit = get_schedule().max_running_requests
+    if (
+        tokens == 6
+        and config.speculative_algorithm == "DSPARK"
+        and not config.speculative_adaptive
+        and type(request_limit) is int
+        and request_limit > 0
+        and parallel.tp_size == 8
+        and parallel.pp_size
+        == parallel.dp_size
+        == parallel.attn_cp_size
+        == parallel.dcp_size
+        == 1
+        and not parallel.enable_dp_attention
+        and disagg.disaggregation_mode == "null"
+        and not disagg.enable_pd_role_switch
+        and graph is not None
+        and graph.decode.backend == Backend.FULL
+        and get_cuda_graph_batch_size_alignment() == 1
+    ):
+        widths = tuple(range(tokens, min(max_rows, request_limit * tokens) + 1, tokens))
+    # Every target rank participates, including ranks retaining full preparation.
+    megakernel_agree(widths, what="Kimi preparation widths")
+    return widths
+
+
 def install_megakernel(
     *,
     model: torch.nn.Module,
@@ -1196,13 +1248,16 @@ def install_megakernel(
     # Resolution checked the target's spec on the server arguments; a draft's spec
     # is checked only here, on what the runner reads (no server-argument checks).
     reasons = _requirement_reasons(spec=spec, hf_config=hf_config)
+    reasons += _layout_reasons()
     reasons += _model_disable_reasons(spec=spec, model=model, hf_config=hf_config)
     _refuse(_gather_reasons(reasons))
 
     tokens = _tokens_per_request()
-    binding = _binding_class(hf_config.architectures)(model=model)
+    binding = _binding_class(hf_config.architectures, kind=spec.binding)(model=model)
     context = BuildContext(
-        widths=tuple(range(tokens, spec.max_rows + 1, tokens)),
+        widths=_kimi_build_widths(
+            spec.max_rows, tokens, hf_config.architectures, is_draft=is_draft
+        ),
         tokens_per_request=tokens,
         deadline_s=deadline_s(get_device().watchdog_timeout),
         binding=binding,
@@ -1262,12 +1317,16 @@ def install_megakernel(
     )
     dispatch = _Dispatch(built=built, original=model.forward, binding=binding)
     model.forward = dispatch.wrapped()
+    if spec.prefill_graph:
+        _install_prefill_body(model, spec=spec, dispatch=dispatch)
     if _decode_graphs_enabled():
         capture_tail_hooks.append(_CaptureCheck(spec=spec, dispatch=dispatch))
 
 
-def built_megakernel(model: torch.nn.Module) -> Optional[BuiltMegakernel]:
+def built_megakernel(model: Optional[torch.nn.Module]) -> Optional[BuiltMegakernel]:
     """The object the spec built for this model, or None."""
+    if model is None:
+        return None
     installed: Optional[_InstalledMegakernel] = model.__dict__.get("_megakernel")
     return None if installed is None else installed.built
 
@@ -1281,6 +1340,15 @@ def prepare_megakernel(model_runner: ModelRunner) -> None:
         installed.prepare(
             installed.built, installed.binding.preparation_view(model_runner)
         )
+    own_state = megakernel_state(model_runner.model)
+    if own_state is not None:
+        model_runner.token_to_kv_pool_allocator.state.own_state = own_state
+
+
+def megakernel_state(model: torch.nn.Module) -> Optional[SupportsStateSlotReset]:
+    """The installed build when it keeps recurrent state of its own, else None."""
+    built = built_megakernel(model)
+    return built if isinstance(built, SupportsStateSlotReset) else None
 
 
 def bind_speculative_runtime_hooks(
@@ -1382,6 +1450,7 @@ def _entries(built: BuiltMegakernel) -> Mapping[str, Optional[Callable]]:
         "draft_loop": built.draft_loop,
         "draft_extend": built.draft_extend,
         "begin_draft_round": built.begin_draft_round,
+        "draft_step_fold": getattr(built, "draft_step_fold", None),  # optional
     }
 
 
@@ -1395,8 +1464,16 @@ def _offered_graph_variants(
     return {} if built is None or built.graph_variants is None else built.graph_variants
 
 
-def _binding_class(architectures: Optional[list[str]]) -> type:
-    """Return the binding for the first registered model architecture."""
+# MegakernelSpec.binding -> the binding SGLang builds for that spec.
+BINDING_KINDS: Mapping[str, type] = MappingProxyType(
+    {"default": MegakernelBinding, "eagle_hybrid": EagleBinding}
+)
+
+
+def _binding_class(architectures: Optional[list[str]], kind: str = "") -> type:
+    """Return the binding the spec names, else that of the first known architecture."""
+    if kind:
+        return BINDING_KINDS[kind]
     for arch in architectures or ():
         if arch in _BINDINGS:
             return _BINDINGS[arch]
@@ -1452,6 +1529,10 @@ def _requirement_reasons(
     """The spec's requirements this runner can check without the server arguments."""
     req, tp_size = spec.requires, get_parallel().tp_size
     reasons = []
+    if spec.binding and spec.binding not in BINDING_KINDS:
+        reasons.append(
+            f"binding {spec.binding!r} is not one of {sorted(BINDING_KINDS)}"
+        )
     # an empty set accepts any TP size, as at argument resolution
     if req.tp_sizes and tp_size not in req.tp_sizes:
         reasons.append(f"tp_size {tp_size} is not one of {sorted(req.tp_sizes)}")
@@ -1470,6 +1551,23 @@ def _requirement_reasons(
         f"{what} {v!r} is not {want!r}" for what, v, want in exactly if v != want
     ]
     return reasons
+
+
+def _layout_reasons() -> list[str]:
+    """Pool layouts no megakernel can address, whichever steps or entries it
+    offers: a target step reads the same pools as the draft entries."""
+    if (
+        get_memory().enable_unified_memory
+        and get_exec().mamba.enable_linear_replayssm_spec
+    ):
+        # A megakernel addresses the ReplaySSM speculative ring by request slot and
+        # its cursors with unit stride; unified memory keeps the ring in units of its
+        # request sub-pool and the cursors strided inside each unit.
+        return [
+            "the ReplaySSM speculative ring of --enable-linear-replayssm-spec is "
+            "not addressable under --enable-unified-memory"
+        ]
+    return []
 
 
 def _model_disable_reasons(
@@ -1525,7 +1623,7 @@ class _Dispatch:
                 view = (
                     self.binding.prefill_view()
                     if step.mode == "prefill"
-                    else self.binding.forward_view()
+                    else self.binding.forward_view(forward_batch)
                 )
             return self.built.forward(
                 msgspec.structs.replace(step, view=view),
@@ -1538,6 +1636,42 @@ class _Dispatch:
             )
 
         return forward
+
+    def wrapped_body(self, original: Callable) -> Callable:
+        # The prefill graph runner inspects the layer module's forward signature.
+        @functools.wraps(original)
+        def forward(input_ids, positions, forward_batch, *args, **kwargs):
+            step = self.built.plan_body(input_ids, forward_batch, *args, **kwargs)
+            if step is None:
+                return original(input_ids, positions, forward_batch, *args, **kwargs)
+            return self.built.forward_body(
+                msgspec.structs.replace(step, view=self.binding.prefill_view()),
+                original,
+                input_ids,
+                positions,
+                forward_batch,
+                *args,
+                **kwargs,
+            )
+
+        return forward
+
+
+def _install_prefill_body(
+    model: torch.nn.Module, *, spec: MegakernelSpec, dispatch: _Dispatch
+) -> None:
+    """Route the layer module's forward, as the prefill graph runner resolves it."""
+    from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+        _resolve_transformer_layer_model,
+        set_external_prefill_body,
+    )
+
+    if not isinstance(dispatch.built, SupportsPrefillBody):
+        _refuse([f"{spec.name} sets prefill_graph without SupportsPrefillBody"])
+    layer_model = _resolve_transformer_layer_model(model)
+    layer_model.forward = dispatch.wrapped_body(layer_model.forward)
+    set_external_prefill_body(model, dispatch.built)
+    logger.info("NVIDIA megakernel: %s plans the prefill body", spec.name)
 
 
 class _CaptureCheck:
