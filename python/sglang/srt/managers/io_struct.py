@@ -2189,8 +2189,8 @@ class UpdateWeightsFromDistributedReqInput(BaseReq, kw_only=True):
     weight_version: Optional[str] = None
     # Optional format specification for loading
     load_format: Optional[str] = None
-    # which runners the op applies to
-    selector: Literal["target", "draft", "all"] = "all"
+    # which runners the load applies to; None: those the session opened
+    selector: Optional[Literal["target", "draft", "all"]] = None
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
 
@@ -2217,8 +2217,8 @@ class UpdateWeightsFromTensorReqInput(BaseReq, kw_only=True):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
-    # which runners the op applies to
-    selector: Literal["target", "draft", "all"] = "all"
+    # which runners the load applies to; None: those the session opened
+    selector: Optional[Literal["target", "draft", "all"]] = None
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
 
@@ -2405,8 +2405,8 @@ class PluginWeightUpdateReqInput(BaseReq, kw_only=True):
     abort_all_requests: bool = False
     # Optional: Update weight version along with weights
     weight_version: Optional[str] = None
-    # which runners the op applies to
-    selector: Literal["target", "draft", "all"] = "all"
+    # which runners the load applies to; None: those the session opened
+    selector: Optional[Literal["target", "draft", "all"]] = None
     # Whether to call torch.cuda.empty_cache() during flush
     torch_empty_cache: bool = False
 

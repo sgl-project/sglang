@@ -1715,7 +1715,8 @@ class Engine(EngineScoreMixin, EngineBase):
         )
 
     def begin_weight_update(self, selector: str = "all"):
-        """Open a weight-update session; close it with end_weight_update()."""
+        """Open a weight-update session on the runners `selector` names; the update
+        calls inside it load into those runners. Close it with end_weight_update()."""
         obj = BeginWeightUpdateReqInput(selector=selector)
         return self.loop.run_until_complete(
             self.tokenizer_manager.begin_weight_update(obj, None)
