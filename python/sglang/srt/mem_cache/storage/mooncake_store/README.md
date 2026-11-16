@@ -99,9 +99,11 @@ Speculative decoding:
   EAGLE, a draft loaded with random weights, or
   `SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND=1`.
 - DFLASH without its draft KV ring keeps the draft KV in a host pool of its
-  own. Mooncake has no unified keys for that pool yet and refuses it at
-  startup; the file backend stores its pages as `{page}_{draft digest}_D0-{n}[_H{g}]`,
-  cut by `--hicache-storage-head-partition` applied to the draft's kv heads.
+  own. Its pages are stored as `{page}_{draft digest}_D0-{n}[_H{g}]`: all
+  draft layers of a head group in one object, cut by
+  `--hicache-storage-head-partition` applied to the draft's kv heads, which
+  it therefore has to divide as well. A page is a hit only with its draft
+  chunks; a deployment without the draft reads the target chunks alone.
   The draft digest names the draft as for NEXTN-style MTP: by its path and
   revision, or by `--hicache-storage-draft-id`. Refused at startup with
   pipeline parallelism, prefill context parallelism, PD disaggregation,

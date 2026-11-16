@@ -12,6 +12,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.mem_cache.hicache_key_scheme import (
+    plan_unified_draft_sidecar,
     plan_unified_kv,
     with_packed_draft,
 )
@@ -19,6 +20,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     PoolName,
     PoolTransfer,
+    UnifiedPoolChunks,
 )
 from sglang.srt.mem_cache.pool_host.base import HostKVCache
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
@@ -40,6 +42,13 @@ class _FakeCluster:
     def __init__(self):
         self.objects = {}
         self.registered_buffers = 0
+        self.registered = []
+
+    def holds(self, ptr, size):
+        return size == 0 or any(
+            base <= ptr and ptr + size <= base + length
+            for base, length in self.registered
+        )
 
 
 def _fake_store_class(cluster):
@@ -49,6 +58,7 @@ def _fake_store_class(cluster):
 
         def register_buffer(self, ptr, size):
             cluster.registered_buffers += 1
+            cluster.registered.append((ptr, size))
             return 0
 
         def put(self, key, value, *args):
@@ -65,9 +75,14 @@ def _fake_store_class(cluster):
             return [1 if key in cluster.objects else 0 for key in keys]
 
         def batch_put_from(self, keys, ptrs, sizes, *config):
+            codes = []
             for key, ptr, size in zip(keys, ptrs, sizes):
+                if not cluster.holds(ptr, size):
+                    codes.append(-1)
+                    continue
                 cluster.objects.setdefault(key, ctypes.string_at(ptr, size))
-            return [0] * len(keys)
+                codes.append(0)
+            return codes
 
         def batch_get_into(self, keys, ptrs, sizes):
             results = []
@@ -75,7 +90,7 @@ def _fake_store_class(cluster):
                 data = cluster.objects.get(key)
                 # Like Mooncake: only a buffer smaller than the object fails; a
                 # larger one takes the object and reports the object's size.
-                if data is None or len(data) > size:
+                if data is None or len(data) > size or not cluster.holds(ptr, size):
                     results.append(-1)
                     continue
                 ctypes.memmove(ptr, data, len(data))
@@ -212,6 +227,7 @@ class _Rank:
             unified_suffixes=self.plan.suffixes,
             unified_chunk_spans=self.plan.chunk_spans(self.layout),
         )
+        self.config = config
         with patch.dict("sys.modules", _fake_mooncake_modules(cluster)):
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
                 MooncakeStore,
@@ -584,7 +600,7 @@ class TestMooncakeUnifiedKeys(CustomTestCase):
                     )
                 self.assertEqual(cluster.registered_buffers, 0)
 
-    def test_hybrid_pools_are_refused_when_they_register(self):
+    def test_pools_without_planned_chunks_are_refused_when_they_register(self):
         """Not at their first IO, where the refusal is only logged."""
         cluster = _FakeCluster()
         rank = _Rank(cluster, mla=False, tp_rank=0, tp_size=1, head_partition=2)
@@ -609,6 +625,408 @@ class TestMooncakeUnifiedKeys(CustomTestCase):
         transfer = PoolTransfer(name=PoolName.MAMBA, keys=["p"])
         with self.assertRaisesRegex(NotImplementedError, "hybrid pools"):
             rank.store.batch_exists_v2(["p"], [transfer])
+
+
+# A draft KV pool beside the target's (DFLASH without its ring): 3 layers of
+# 16-wide rows on 4 kv heads, where the target has 4 layers of 8-wide rows.
+DRAFT_LAYERS = 3
+DRAFT_HEAD_DIM = 16
+
+
+def _draft_logical_pages(count):
+    generator = torch.Generator().manual_seed(20261120)
+    shape = (DRAFT_LAYERS, 2, PAGE_SIZE, TOTAL_KV_HEADS, DRAFT_HEAD_DIM)
+    return [
+        torch.randn(shape, generator=generator).to(torch.bfloat16) for _ in range(count)
+    ]
+
+
+class _DraftRank(_Rank):
+    """A rank whose store also holds the planned draft KV pool."""
+
+    def __init__(self, cluster, *, tp_rank, tp_size, head_partition, draft_id="x"):
+        super().__init__(
+            cluster,
+            mla=False,
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            head_partition=head_partition,
+        )
+        local_heads = TOTAL_KV_HEADS // tp_size
+        self.draft_layout = PageUnifiedLayout(
+            page_size=PAGE_SIZE,
+            layer_num=DRAFT_LAYERS,
+            head_num=local_heads,
+            head_group_num=local_heads // head_partition,
+            head_dim=DRAFT_HEAD_DIM,
+            itemsize=2,
+        )
+        self.draft_plan = plan_unified_draft_sidecar(
+            target=self.plan.namespace,
+            algorithm="DFLASH",
+            draft_id=draft_id,
+            dtype="bfloat16",
+            rank_replicated=False,
+            local_kv_heads=local_heads,
+            row_width=DRAFT_HEAD_DIM,
+            layer_num=DRAFT_LAYERS,
+            attn_tp_rank=tp_rank,
+            attn_tp_size=tp_size,
+            attn_cp_size=1,
+            head_group=head_partition,
+        )
+        self.draft_pool = _UnifiedHostPool(self.draft_layout)
+        # The controller adds the plan before it registers the pool.
+        self.config.unified_pool_chunks[PoolName.DRAFT] = UnifiedPoolChunks(
+            suffixes=tuple(self.draft_plan.suffixes),
+            spans=tuple(self.draft_plan.chunk_spans(self.draft_layout)),
+            is_writer=True,
+        )
+        registered = cluster.registered_buffers
+        self.store.register_mem_host_pool_v2(self.draft_pool, PoolName.DRAFT)
+        # Zero-copy IO needs the pool's buffer registered with the store.
+        assert cluster.registered_buffers == registered + 1
+        buffer = self.draft_pool.kv_buffer
+        assert cluster.registered[-1] == (
+            buffer.data_ptr(),
+            buffer.numel() * buffer.element_size(),
+        )
+
+    def expected_draft_page(self, page):
+        layout = self.draft_layout
+        heads = page[:, :, :, self.first_head : self.first_head + layout.head_num]
+        return heads.reshape(
+            DRAFT_LAYERS,
+            2,
+            PAGE_SIZE,
+            layout.head_group_num,
+            layout.heads_per_group,
+            DRAFT_HEAD_DIM,
+        ).permute(3, 0, 1, 2, 4, 5)
+
+    def fill_draft_from(self, logical, host_pages):
+        for host_page, page in zip(host_pages, logical):
+            self.draft_pool.kv_buffer[host_page] = self.expected_draft_page(page)
+
+    def transfer(self, keys, host_pages):
+        return PoolTransfer(
+            name=PoolName.DRAFT, keys=keys, host_indices=_page_indices(host_pages)
+        )
+
+
+class TestMooncakeUnifiedDraftSidecar(CustomTestCase):
+    # Stored under the model name's key prefix: "org-model_{key}_{suffix}".
+    KEYS = ["page0", "page1", "page2"]
+
+    def _write(self, cluster, tp_size, head_partition, logical, **kwargs):
+        writers = [
+            _DraftRank(
+                cluster,
+                tp_rank=r,
+                tp_size=tp_size,
+                head_partition=head_partition,
+                **kwargs,
+            )
+            for r in range(tp_size)
+        ]
+        for writer in writers:
+            writer.fill_draft_from(logical, host_pages=[2, 0, 1])
+            self.assertEqual(
+                writer.store.batch_set_v2([writer.transfer(self.KEYS, [2, 0, 1])]),
+                {PoolName.DRAFT: [True] * 3},
+            )
+        return writers
+
+    def test_draft_chunks_reshard_across_tp_sizes(self):
+        for writer_tp, reader_tp, head_partition in ((2, 1, 1), (1, 2, 1), (2, 1, 2)):
+            with self.subTest(writer=writer_tp, reader=reader_tp, hp=head_partition):
+                cluster = _FakeCluster()
+                logical = _draft_logical_pages(len(self.KEYS))
+                self._write(cluster, writer_tp, head_partition, logical)
+                groups = TOTAL_KV_HEADS // head_partition
+                self.assertEqual(len(_chunk_keys(cluster)), len(self.KEYS) * groups)
+                # Each object: one head group's draft layers, K and V, straight
+                # from the logical page.
+                for key, page in zip(self.KEYS, logical):
+                    for group in range(groups):
+                        (name,) = [
+                            k
+                            for k in _chunk_keys(cluster)
+                            if k.startswith(f"org-model_{key}_ukd1-")
+                            and k.endswith(f"_D0-{DRAFT_LAYERS}_H{group}")
+                        ]
+                        heads = slice(
+                            group * head_partition, (group + 1) * head_partition
+                        )
+                        self.assertEqual(
+                            cluster.objects[name],
+                            page[:, :, :, heads]
+                            .contiguous()
+                            .view(torch.uint8)
+                            .numpy()
+                            .tobytes(),
+                        )
+                for tp_rank in range(reader_tp):
+                    reader = _DraftRank(
+                        cluster,
+                        tp_rank=tp_rank,
+                        tp_size=reader_tp,
+                        head_partition=head_partition,
+                    )
+                    # No target objects were written: the draft pool's own
+                    # verdict is complete, the page is not a hit.
+                    result = reader.store.batch_exists_v2(
+                        self.KEYS, [reader.transfer(self.KEYS, [1, 2, 0])]
+                    )
+                    self.assertEqual(result.kv_hit_pages, 0)
+                    self.assertEqual(
+                        reader.store.batch_get_v2(
+                            [reader.transfer(self.KEYS, [1, 2, 0])]
+                        ),
+                        {PoolName.DRAFT: [True] * 3},
+                    )
+                    for host_page, page in zip([1, 2, 0], logical):
+                        self.assertTrue(
+                            torch.equal(
+                                reader.draft_pool.kv_buffer[host_page],
+                                reader.expected_draft_page(page),
+                            )
+                        )
+
+    def _with_target(self, rank, logical_kv):
+        rank.fill_from(logical_kv, host_pages=[0, 1, 2])
+        self.assertEqual(
+            rank.store.batch_set_v1(self.KEYS, _page_indices([0, 1, 2])), [True] * 3
+        )
+
+    def test_a_page_is_a_hit_only_with_every_draft_chunk(self):
+        cluster = _FakeCluster()
+        logical = _draft_logical_pages(len(self.KEYS))
+        (writer,) = self._write(cluster, 1, 2, logical)
+        self._with_target(writer, _logical_pages(mla=False, count=3))
+        transfer = writer.transfer(self.KEYS, [0, 1, 2])
+        result = writer.store.batch_exists_v2(self.KEYS, [transfer])
+        self.assertEqual(result.kv_hit_pages, 3)
+        # Without its second draft chunk, page 1 ends the prefix.
+        del cluster.objects[f"org-model_page1_{writer.draft_plan.suffixes[1]}"]
+        result = writer.store.batch_exists_v2(self.KEYS, [transfer])
+        self.assertEqual(result.kv_hit_pages, 1)
+        self.assertEqual(result.extra_pool_hit_pages[PoolName.KV], 3)
+        self.assertEqual(result.extra_pool_hit_pages[PoolName.DRAFT], 1)
+        self.assertEqual(
+            writer.store.batch_get_v2([transfer]),
+            {PoolName.DRAFT: [True, False, True]},
+        )
+        # Another draft's reader finds the target pages and no draft page.
+        other = _DraftRank(
+            cluster, tp_rank=0, tp_size=1, head_partition=2, draft_id="another"
+        )
+        result = other.store.batch_exists_v2(
+            self.KEYS, [other.transfer(self.KEYS, [0, 1, 2])]
+        )
+        self.assertEqual(result.kv_hit_pages, 0)
+        self.assertEqual(result.extra_pool_hit_pages[PoolName.KV], 3)
+
+    def test_short_draft_object_fails_the_read_of_its_page(self):
+        """Mooncake reads a shorter object into a larger buffer and reports
+        success; the rest of the chunk's span would keep the slot's bytes."""
+        cluster = _FakeCluster()
+        logical = _draft_logical_pages(len(self.KEYS))
+        (writer,) = self._write(cluster, 1, 2, logical)
+        name = f"org-model_page1_{writer.draft_plan.suffixes[0]}"
+        cluster.objects[name] = cluster.objects[name][:-2]
+        reader = _DraftRank(cluster, tp_rank=0, tp_size=1, head_partition=2)
+        self.assertEqual(
+            reader.store.batch_get_v2([reader.transfer(self.KEYS, [0, 1, 2])]),
+            {PoolName.DRAFT: [True, False, True]},
+        )
+
+    def test_partial_backup_writes_only_missing_objects_at_their_own_bytes(self):
+        """Page 1's draft chunks and one of page 2's exist already: the other
+        objects must still come from their own pages and spans."""
+        cluster = _FakeCluster()
+        logical = _draft_logical_pages(len(self.KEYS))
+        writer = _DraftRank(cluster, tp_rank=0, tp_size=1, head_partition=2)
+        first, second = writer.draft_plan.suffixes
+        sentinels = {
+            f"org-model_page1_{first}": b"sentinel-1a",
+            f"org-model_page1_{second}": b"sentinel-1b",
+            f"org-model_page2_{first}": b"sentinel-2a",
+        }
+        cluster.objects.update(sentinels)
+        writer.fill_draft_from(logical, host_pages=[2, 0, 1])
+        self.assertEqual(
+            writer.store.batch_set_v2([writer.transfer(self.KEYS, [2, 0, 1])]),
+            {PoolName.DRAFT: [True] * 3},
+        )
+        for name, data in sentinels.items():
+            self.assertEqual(cluster.objects[name], data)
+        for key, page, groups in ((0, logical[0], (0, 1)), (2, logical[2], (1,))):
+            for group in groups:
+                heads = slice(group * 2, (group + 1) * 2)
+                self.assertEqual(
+                    cluster.objects[
+                        f"org-model_page{key}_{writer.draft_plan.suffixes[group]}"
+                    ],
+                    page[:, :, :, heads]
+                    .contiguous()
+                    .view(torch.uint8)
+                    .numpy()
+                    .tobytes(),
+                )
+
+    def test_a_plan_belongs_to_the_pool_it_was_made_for(self):
+        cluster = _FakeCluster()
+        rank = _DraftRank(cluster, tp_rank=0, tp_size=1, head_partition=2)
+        chunks = rank.config.unified_pool_chunks[PoolName.DRAFT]
+        self.assertEqual(rank.store.unified_pool_chunks, {PoolName.DRAFT: chunks})
+        # The draft pool's plan does not name another pool.
+        with self.assertRaisesRegex(NotImplementedError, "mamba has no unified keys"):
+            rank.store.register_mem_host_pool_v2(rank.draft_pool, PoolName.MAMBA)
+        # Nor may a second pool repeat the names of one that is registered.
+        rank.config.unified_pool_chunks[PoolName.DRAFT_INDEXER] = chunks
+        with self.assertRaisesRegex(ValueError, "draft_indexer must be nonempty"):
+            rank.store.register_mem_host_pool_v2(
+                rank.draft_pool, PoolName.DRAFT_INDEXER
+            )
+        self.assertEqual(list(rank.store.unified_pool_chunks), [PoolName.DRAFT])
+
+    def test_two_planned_pools_keep_their_own_names_spans_and_bytes(self):
+        cluster = _FakeCluster()
+        rank = _DraftRank(cluster, tp_rank=0, tp_size=1, head_partition=2)
+        first = rank.config.unified_pool_chunks[PoolName.DRAFT]
+        # A second pool with a plan of its own: another digest, 4 chunks.
+        layout = PageUnifiedLayout(
+            page_size=PAGE_SIZE,
+            layer_num=DRAFT_LAYERS,
+            head_num=TOTAL_KV_HEADS,
+            head_group_num=TOTAL_KV_HEADS,
+            head_dim=DRAFT_HEAD_DIM,
+            itemsize=2,
+        )
+        plan = plan_unified_draft_sidecar(
+            target=rank.plan.namespace,
+            algorithm="DFLASH",
+            draft_id="second",
+            dtype="bfloat16",
+            rank_replicated=False,
+            local_kv_heads=TOTAL_KV_HEADS,
+            row_width=DRAFT_HEAD_DIM,
+            layer_num=DRAFT_LAYERS,
+            attn_tp_rank=0,
+            attn_tp_size=1,
+            attn_cp_size=1,
+            head_group=1,
+        )
+        second = UnifiedPoolChunks(
+            tuple(plan.suffixes), tuple(plan.chunk_spans(layout)), True
+        )
+        self.assertEqual(len(second.suffixes), 4)
+        self.assertFalse(set(first.suffixes) & set(second.suffixes))
+        pool = _UnifiedHostPool(layout)
+        name = PoolName.DRAFT_INDEXER
+        # One repeated name is enough, whichever of the earlier pool's.
+        rank.config.unified_pool_chunks[name] = UnifiedPoolChunks(
+            second.suffixes[:3] + first.suffixes[1:], second.spans, True
+        )
+        with self.assertRaisesRegex(ValueError, "draft_indexer must be nonempty"):
+            rank.store.register_mem_host_pool_v2(pool, name)
+        rank.config.unified_pool_chunks[name] = second
+        rank.store.register_mem_host_pool_v2(pool, name)
+        self.assertEqual(
+            rank.store.unified_pool_chunks, {PoolName.DRAFT: first, name: second}
+        )
+        rank.fill_draft_from(_draft_logical_pages(3), host_pages=[0, 1, 2])
+        draft_expected = rank.draft_pool.kv_buffer.clone()
+        generator = torch.Generator().manual_seed(7)
+        pool.kv_buffer.copy_(
+            torch.randn(pool.kv_buffer.shape, generator=generator).to(torch.bfloat16)
+        )
+        expected = pool.kv_buffer.clone()
+        transfers = [
+            rank.transfer(self.KEYS, [0, 1, 2]),
+            PoolTransfer(
+                name=name, keys=self.KEYS, host_indices=_page_indices([0, 1, 2])
+            ),
+        ]
+        self.assertEqual(
+            rank.store.batch_set_v2(transfers),
+            {PoolName.DRAFT: [True] * 3, name: [True] * 3},
+        )
+        self.assertEqual(
+            _chunk_keys(cluster),
+            sorted(
+                f"org-model_{key}_{suffix}"
+                for key in self.KEYS
+                for suffix in first.suffixes + second.suffixes
+            ),
+        )
+        for page, key in enumerate(self.KEYS):
+            for chunks, source in ((first, draft_expected), (second, expected)):
+                raw = source[page].contiguous().view(torch.uint8).numpy().tobytes()
+                for suffix, (offset, length) in zip(chunks.suffixes, chunks.spans):
+                    self.assertEqual(
+                        cluster.objects[f"org-model_{key}_{suffix}"],
+                        raw[offset : offset + length],
+                    )
+        pool.kv_buffer.zero_()
+        rank.draft_pool.kv_buffer.zero_()
+        self.assertEqual(
+            rank.store.batch_get_v2(transfers),
+            {PoolName.DRAFT: [True] * 3, name: [True] * 3},
+        )
+        self.assertTrue(torch.equal(pool.kv_buffer, expected))
+        self.assertTrue(torch.equal(rank.draft_pool.kv_buffer, draft_expected))
+
+    def test_a_planned_pools_page_must_be_one_run(self):
+        """A chunk's span is an offset into its page's run, as for the KV
+        pool: a pool that hands out a page in pieces would be cut wrongly."""
+        cluster = _FakeCluster()
+        rank = _DraftRank(cluster, tp_rank=0, tp_size=1, head_partition=2)
+        rank.fill_draft_from(_draft_logical_pages(3), host_pages=[0, 1, 2])
+        one_run = rank.draft_pool.get_page_buffer_meta
+
+        def two_runs(indices):
+            ptrs, sizes = one_run(indices)
+            return (
+                [
+                    half
+                    for ptr, size in zip(ptrs, sizes)
+                    for half in (ptr, ptr + size // 2)
+                ],
+                [size // 2 for size in sizes for _ in range(2)],
+            )
+
+        rank.draft_pool.get_page_buffer_meta = two_runs
+        transfers = [rank.transfer(self.KEYS, [0, 1, 2])]
+        for io in (rank.store.batch_set_v2, rank.store.batch_get_v2):
+            with self.subTest(io=io.__name__), self.assertRaises(AssertionError):
+                io(transfers)
+        self.assertEqual(_chunk_keys(cluster), [])
+        rank.draft_pool.get_page_buffer_meta = one_run
+        self.assertEqual(
+            rank.store.batch_set_v2(transfers), {PoolName.DRAFT: [True] * 3}
+        )
+
+    def test_planned_chunks_must_name_the_pools_page_and_no_other_object(self):
+        cluster = _FakeCluster()
+        rank = _DraftRank(cluster, tp_rank=0, tp_size=1, head_partition=2)
+        chunks = rank.config.unified_pool_chunks[PoolName.DRAFT]
+        cases = {
+            "gap": UnifiedPoolChunks(chunks.suffixes, chunks.spans[:1] * 2, True),
+            "unpaired": UnifiedPoolChunks(chunks.suffixes[:1], chunks.spans, True),
+            "duplicate": UnifiedPoolChunks(chunks.suffixes[:1] * 2, chunks.spans, True),
+            "target": UnifiedPoolChunks(
+                (rank.plan.suffixes[0], chunks.suffixes[1]), chunks.spans, True
+            ),
+        }
+        for name, bad in cases.items():
+            with self.subTest(name), self.assertRaises(ValueError):
+                fresh = _Rank(
+                    _FakeCluster(), mla=False, tp_rank=0, tp_size=1, head_partition=2
+                )
+                fresh.config.unified_pool_chunks[PoolName.DRAFT] = bad
+                fresh.store.register_mem_host_pool_v2(rank.draft_pool, PoolName.DRAFT)
 
 
 if __name__ == "__main__":

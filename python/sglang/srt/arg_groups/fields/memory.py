@@ -224,9 +224,9 @@ class Memory(msgspec.Struct):
                 "serve head- and layer-partitioned grids. Speculative decoding "
                 "is supported with NEXTN-style MTP, whose packed draft layer "
                 "is stored as a chunk of its own; with DFLASH, whose draft KV "
-                "pool is stored as chunks of its own on the file backend, or "
-                "not at all with its draft KV ring; and with FROZEN_KV_MTP, "
-                "which keeps no draft KV in the host cache."
+                "pool is stored as chunks of its own, or not at all with its "
+                "draft KV ring; and with FROZEN_KV_MTP, which keeps no draft "
+                "KV in the host cache."
             ),
             choices=["rank-suffix", "unified"],
         ),

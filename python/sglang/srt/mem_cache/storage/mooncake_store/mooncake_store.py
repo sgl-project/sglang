@@ -786,6 +786,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 )
 
             self.registered_pools = {}
+            # Unified keys of registered pools beside the KV pool, by name.
+            self.unified_pool_chunks = {}
 
             self.gb_per_page = None
             self.prefetch_pgs = []
@@ -902,12 +904,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         if host_pool_name == PoolName.KV:
             return
         if self.unified_suffixes is not None:
-            # At registration, not at the pool's first IO, where the refusal
-            # would only be logged and leave a server with a dead L3.
-            raise NotImplementedError(
-                "The unified key scheme does not support hybrid pools: "
-                f"{host_pool_name} has no unified keys."
-            )
+            self._register_unified_pool_chunks(host_pool, host_pool_name)
+            return
         if host_pool_name == PoolName.DRAFT:
             self.registered_pools[host_pool_name] = host_pool
             super().register_buffer(host_pool.kv_buffer)
@@ -921,6 +919,41 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # accessor, or ordinary KV-like host pools used as SWA side pools.
         for buf in self._iter_host_pool_buffers(host_pool):
             super().register_buffer(buf)
+
+    def _register_unified_pool_chunks(self, host_pool, host_pool_name) -> None:
+        """Take the chunks the controller planned for a pool beside the KV pool.
+
+        A pool without a plan has no unified keys. It is refused here and not
+        at its first IO, where the refusal would only be logged and leave a
+        server with a dead L3.
+        """
+        chunks = self.storage_config.unified_pool_chunks.get(host_pool_name)
+        if chunks is None:
+            raise NotImplementedError(
+                "The unified key scheme does not support hybrid pools: "
+                f"{host_pool_name} has no unified keys."
+            )
+        taken = set(self.unified_suffixes)
+        for planned in self.unified_pool_chunks.values():
+            taken.update(planned.suffixes)
+        if (
+            not chunks.suffixes
+            or len(chunks.suffixes) != len(chunks.spans)
+            or len(set(chunks.suffixes)) != len(chunks.suffixes)
+            or taken & set(chunks.suffixes)
+        ):
+            raise ValueError(
+                f"unified suffixes of pool {host_pool_name} must be nonempty, "
+                f"unique and paired with chunk spans: {chunks.suffixes}."
+            )
+        # Reads land straight in the host page, so an unnamed byte would
+        # keep the slot's previous content.
+        validate_unified_chunk_tiling(
+            chunks.spans, host_pool.page_unified_layout.bytes_per_page
+        )
+        self.unified_pool_chunks[host_pool_name] = chunks
+        self.registered_pools[host_pool_name] = host_pool
+        super().register_buffer(host_pool.kv_buffer)
 
     def _tag_keys(self, keys: List[str]) -> List[str]:
         if self.config_prefix is None:
@@ -1074,11 +1107,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         self, page_keys: List[str], transfer: PoolTransfer
     ) -> Tuple[List[str], int]:
         if self.unified_suffixes is not None:
-            # Rank-suffixed sidecar keys would break the topology-free contract.
-            raise NotImplementedError(
-                "The unified key scheme does not support hybrid pools: "
-                f"{transfer.name} has no unified keys."
-            )
+            chunks = self.unified_pool_chunks.get(transfer.name)
+            if chunks is None:
+                # Rank-suffixed sidecar keys would break the topology-free
+                # contract.
+                raise NotImplementedError(
+                    "The unified key scheme does not support hybrid pools: "
+                    f"{transfer.name} has no unified keys."
+                )
+            # Page-major / chunk-minor, the order _build_pool_buffer_meta()
+            # cuts each page's run in.
+            return [
+                f"{page_key}_{suffix}"
+                for page_key in page_keys
+                for suffix in chunks.suffixes
+            ], len(chunks.suffixes)
         host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
         if host_pool is None:
             raise ValueError(f"Unregistered Mooncake hybrid pool: {transfer.name}")
@@ -1329,8 +1372,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             key_strs = self._tag_keys(key_strs)
             start = len(all_key_strs)
             all_key_strs.extend(key_strs)
+            chunks = (
+                self.unified_pool_chunks.get(transfer.name)
+                if self.unified_suffixes is not None
+                else None
+            )
             buffer_requests.append(
-                (host_pool, host_indices, key_strs, key_multiplier, start)
+                (
+                    host_pool,
+                    host_indices,
+                    key_strs,
+                    key_multiplier,
+                    start,
+                    None if chunks is None else chunks.spans,
+                )
             )
             if is_set and self._can_use_group_semantics():
                 all_group_ids.extend(
@@ -1342,7 +1397,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             return {}
 
         exist_result = self._batch_exist(all_key_strs) if is_set else None
-        for host_pool, host_indices, key_strs, key_multiplier, start in buffer_requests:
+        for (
+            host_pool,
+            host_indices,
+            key_strs,
+            key_multiplier,
+            start,
+            chunk_spans,
+        ) in buffer_requests:
             pool_ptrs, pool_sizes = self._build_pool_buffer_meta(
                 host_pool=host_pool,
                 host_indices=host_indices,
@@ -1353,6 +1415,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     if exist_result is not None
                     else None
                 ),
+                chunk_spans=chunk_spans,
             )
             all_ptrs.extend(pool_ptrs)
             all_sizes.extend(pool_sizes)
@@ -1390,6 +1453,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             io_results = self._get_batch_zero_copy_impl(
                 all_key_strs, all_ptrs, all_sizes
             )
+            if self.unified_suffixes is not None:
+                # Mooncake reads a shorter object into a larger buffer and
+                # reports success; the rest of that chunk's span would keep
+                # stale bytes.
+                io_results = [
+                    result if result == size else -1
+                    for result, size in zip(io_results, all_sizes)
+                ]
 
         results: dict = {}
         for name, key_multiplier, start, end in prepared:
@@ -1407,6 +1478,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         key_strs: List[str],
         key_multiplier: int,
         exist_states: Optional[List[int]],
+        chunk_spans: Optional[Sequence[Tuple[int, int]]] = None,
     ) -> Tuple[List[Any], List[Any]]:
         # Only pages the store is missing need per-layer addresses. Zero
         # placeholders keep result and group offsets aligned for the rest.
@@ -1440,6 +1512,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         selected_keys = [key_strs[i] for i in object_indices]
         ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
+        if chunk_spans is not None:
+            # A unified page is one run; each chunk is that run's address
+            # plus the chunk's offset, in the key order of a page.
+            assert len(ptr_list) * len(chunk_spans) == len(selected_keys)
+            element_size_list = [length for _ in ptr_list for _, length in chunk_spans]
+            ptr_list = [ptr + offset for ptr in ptr_list for offset, _ in chunk_spans]
         if len(ptr_list) != len(selected_keys):
             ptr_list, element_size_list = self._pack_multi_buffer_meta(
                 selected_keys, ptr_list, element_size_list

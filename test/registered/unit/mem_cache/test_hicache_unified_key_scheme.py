@@ -1,3 +1,4 @@
+import itertools
 import threading
 import unittest
 from contextlib import ExitStack
@@ -262,7 +263,6 @@ class TestUnifiedKeySchemeSpeculative(CustomTestCase):
             speculative_algorithm="DFLASH", speculative_draft_model_path="org/dflash"
         )
         cases = {
-            "the Mooncake backend": dict(hicache_storage_backend="mooncake"),
             "buffer_only": dict(hicache_host_memory_mode="buffer_only"),
             "random weights": dict(speculative_draft_load_format="dummy"),
             "--enable-streaming-session": dict(enable_streaming_session=True),
@@ -303,6 +303,15 @@ class TestUnifiedKeySchemeSpeculative(CustomTestCase):
             _resolve_through_speculative(
                 patches=_dflash_with_ring("the draft is not MLA"), **dflash
             )
+        # Both backends of the unified scheme store the draft pool.
+        args = _resolve_through_speculative(
+            patches=_dflash_with_ring("the draft is not MLA"),
+            hicache_storage_backend="mooncake",
+            **dflash,
+        )
+        self.assertEqual(
+            resolution_result(args, "hicache_storage_draft_id"), "org/dflash@main"
+        )
 
     def test_every_other_algorithm_is_refused_by_name(self):
         # These handlers need a draft checkpoint or more arguments.
@@ -1381,6 +1390,21 @@ class TestControllerUnifiedDraftSidecar(_DraftSidecarPlanning, CustomTestCase):
             (f"{digest}_D0-5_H0", f"{digest}_D0-5_H1"),
         )
 
+    def test_plan_does_not_depend_on_the_storage_backend(self):
+        # Both backends of the unified scheme store the same objects.
+        for mla in (False, True):
+            for attn_tp_rank in (0, 1):
+                with self.subTest(mla=mla, attn_tp_rank=attn_tp_rank):
+                    mooncake, file = (
+                        self._plan(
+                            _draft_entry(mla=mla),
+                            attn_tp_rank=attn_tp_rank,
+                            backend=backend,
+                        )
+                        for backend in ("mooncake", "file")
+                    )
+                    self.assertEqual(mooncake, file)
+
     def test_draft_identity_is_the_drafts_own(self):
         # The target is fp8 with 128-wide rows; none of it names the draft.
         base = self._plan().suffixes
@@ -1462,7 +1486,6 @@ class TestControllerUnifiedDraftSidecar(_DraftSidecarPlanning, CustomTestCase):
         unknown_mla = _draft_entry(mla=True)
         del unknown_mla.device_pool.storage_rank_replicated
         cases = {
-            "Mooncake backend": dict(backend="mooncake"),
             "single pipeline stage": dict(pp_size=2),
             "full pages": dict(entry=dcp_entry),
             "not known to be replicated": dict(entry=sharded_mla),
@@ -1506,6 +1529,11 @@ class TestControllerUnifiedDraftSidecar(_DraftSidecarPlanning, CustomTestCase):
 
     def test_attach_plans_pools_that_joined_before_storage(self):
         """A runtime re-attach: the draft pool is already in the group."""
+        for backend in ("file", "mooncake"):
+            with self.subTest(backend=backend):
+                self._check_attach_plans_pools(backend)
+
+    def _check_attach_plans_pools(self, backend):
         fixture = TestControllerUnifiedKeys()
         controller = fixture._controller()
         host_pool = controller.storage_host_pool
@@ -1513,7 +1541,7 @@ class TestControllerUnifiedDraftSidecar(_DraftSidecarPlanning, CustomTestCase):
         host_pool.storage_format_tag = None
         controller.mem_pool_host.layout = "page_unified"
         controller.enable_storage_metrics = False
-        with self._planning(controller, head_partition=4):
+        with self._planning(controller, head_partition=4, backend=backend):
             target_only = controller._generate_storage_config("org/model")
             self.assertEqual(target_only.unified_pool_chunks, {})
             draft = _draft_entry(head_group_num=1)
@@ -1625,8 +1653,8 @@ class TestUnifiedLateHostPool(_DraftSidecarPlanning, CustomTestCase):
     def test_refused_draft_pool_leaves_no_plan_behind(self):
         controller = self._controller(["ukv1-abc_L0-4"])
         with (
-            self._planning(controller, backend="mooncake"),
-            self.assertRaisesRegex(NotImplementedError, "Mooncake backend"),
+            self._planning(controller, pp_size=2),
+            self.assertRaisesRegex(NotImplementedError, "single pipeline stage"),
         ):
             controller.register_host_pool_entry(_draft_entry())
         self.assertEqual(controller.storage_config.unified_pool_chunks, {})
@@ -1666,20 +1694,23 @@ class TestUnifiedLateHostPool(_DraftSidecarPlanning, CustomTestCase):
                     )
 
     def test_planned_writer_backs_up_the_pool_whatever_the_kv_writer_is(self):
-        for kv_writer in (False, True):
-            for is_writer in (False, True):
-                with self.subTest(kv_writer=kv_writer, is_writer=is_writer):
-                    controller = self._controller(["ukv1-abc_L0-4"])
-                    controller.storage_backend_type = "file"
-                    controller.storage_config.is_storage_writer = kv_writer
-                    controller.storage_config.unified_pool_chunks["draft"] = (
-                        SimpleNamespace(is_writer=is_writer)
-                    )
-                    transfer = SimpleNamespace(name="draft")
-                    self.assertEqual(controller.should_backup(transfer), is_writer)
-                    # A pool without a plan keeps the legacy rule.
-                    other = SimpleNamespace(name="swa")
-                    self.assertEqual(controller.should_backup(other), kv_writer)
+        for kv_writer, is_writer, backend in itertools.product(
+            (False, True), (False, True), ("file", "mooncake")
+        ):
+            with self.subTest(
+                kv_writer=kv_writer, is_writer=is_writer, backend=backend
+            ):
+                controller = self._controller(["ukv1-abc_L0-4"])
+                controller.storage_backend_type = backend
+                controller.storage_config.is_storage_writer = kv_writer
+                controller.storage_config.unified_pool_chunks["draft"] = (
+                    SimpleNamespace(is_writer=is_writer)
+                )
+                transfer = SimpleNamespace(name="draft")
+                self.assertEqual(controller.should_backup(transfer), is_writer)
+                # A pool without a plan keeps the legacy rule.
+                other = SimpleNamespace(name="swa")
+                self.assertEqual(controller.should_backup(other), kv_writer)
 
     def test_pool_without_unified_keys_is_refused_before_it_joins(self):
         controller = self._controller(["ukv1-abc_L0-4"])

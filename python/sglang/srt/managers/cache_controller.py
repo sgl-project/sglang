@@ -1165,10 +1165,6 @@ class HiCacheController:
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
         draft_id = memory.hicache_storage_draft_id
         refusals = (
-            (
-                self.storage_backend_type == "mooncake",
-                "the Mooncake backend has no unified keys for a draft KV pool",
-            ),
             (parallel.pp_size != 1, "the draft needs a single pipeline stage"),
             (
                 getattr(entry.host_pool, "dcp_size", 1) > 1,

@@ -371,12 +371,6 @@ def _validate_unified_draft_kv(server_args: Any) -> None:
             "SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND=1: skipped steps leave draft "
             "rows unwritten",
         ),
-        (
-            algorithm == "DFLASH" and cfg.hicache_storage_backend == "mooncake",
-            "the Mooncake backend, which has no unified keys for the draft KV "
-            "pool of DFLASH without its draft KV ring (the 'DFLASH draft KV "
-            "ring' log line says why the ring is off)",
-        ),
     )
     for refused, what in refusals:
         if refused:
