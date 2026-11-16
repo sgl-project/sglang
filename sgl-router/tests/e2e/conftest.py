@@ -39,7 +39,6 @@ logger = logging.getLogger(__name__)
 
 # Make `from infra import gateway, model_pool, model_specs` resolve from
 # tests under tests/e2e/ without requiring a sibling `__init__.py` chain.
-# Mirrors SMG's e2e_test/conftest.py sys.path setup.
 _E2E_DIR = Path(__file__).resolve().parent
 if str(_E2E_DIR) not in sys.path:
     sys.path.insert(0, str(_E2E_DIR))
