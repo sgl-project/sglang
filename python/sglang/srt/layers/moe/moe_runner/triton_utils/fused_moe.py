@@ -18,6 +18,7 @@ from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.kernels.ops.activation.silu_and_mul_block_quant import (
     silu_and_mul_block_quant_two_group,
 )
+from sglang.kernels.ops.moe.fused_moe_triton_host_copy import host_expert_ids
 from sglang.kernels.ops.moe.fused_moe_triton_kernels import (
     act_and_mul_triton,
     invoke_fused_moe_kernel,
@@ -478,6 +479,8 @@ def _prepare_fused_moe_run(
 
     num_tokens = hidden_states.shape[0]
     E = w1.shape[0]
+    # Paged experts, fused host copy: ids past w1's slots are experts in host memory.
+    E += host_expert_ids(w1)
     config_dtype = get_config_dtype_str(
         use_fp8_w8a8=use_fp8_w8a8,
         use_int8_w8a8=use_int8_w8a8,

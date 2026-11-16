@@ -355,7 +355,17 @@ __global__ void Marlin(
     bool has_bias,
     bool use_atomic_add,   // whether to use atomic add to reduce
     bool use_fp32_reduce,  // whether to use fp32 global reduce
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+    int max_shared_mem,
+    int64_t B_host_delta,                          // host weight table - B, in int4 units
+    int64_t scales_host_delta,                     // host scale table - scales_ptr, in int4 units
+    const uint16_t* __restrict__ scale2_host,      // host global scale table (NVFP4)
+    const int32_t* __restrict__ expert_slot_ptr,   // expert -> the slot it is paged into
+    int host_slots,                                // number of slots; ids from here on are on host
+    const int32_t* __restrict__ host_count_ptr) {  // [1] experts this launch reads from the host
+#else
     int max_shared_mem) {
+#endif
   // Each threadblock processes one "stripe" of the B matrix with (roughly) the
   // same size, which might involve multiple column "slices" (of width 16 *
   // `thread_n_blocks`). Stripes are defined as shown in the 3x3 matrix 5 SM
@@ -398,6 +408,12 @@ __global__ void Marlin(
   scalar_t2 global_scale;
 
   constexpr bool has_act_order = group_blocks == 0;
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+  static_assert(
+      w_type == host::kFE2M1f && group_blocks > 0 && group_blocks <= thread_k_blocks && !kIsEP && !kHasBias &&
+          kExpertIdsAreSorted,
+      "the fused host copy covers NVFP4 and MXFP4 experts with sorted ids");
+#endif
 
   constexpr int pack_factor = 32 / w_type.size_bits();
   static_assert(thread_m_blocks == 1 || !m_block_size_8);
@@ -477,6 +493,9 @@ __global__ void Marlin(
   int k_tiles = prob_k / 16 / thread_k_blocks;
   int n_tiles = prob_n / 16 / thread_n_blocks;
   int iters = div_ceil(k_tiles * n_tiles * parallel, gridDim.x);
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+  const int host_groups = host_count_ptr[0];  // experts this launch reads from the host
+#endif
 
   if constexpr (!has_act_order && group_blocks != -1) {
     if (group_blocks >= thread_k_blocks) {
@@ -497,9 +516,17 @@ __global__ void Marlin(
 
   int par_id = 0;
   int block_id = -1;
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+  int expert_id = 0;  // the host branch widens it where it multiplies
+#else
   int64_t expert_id = 0;  // use int64 to avoid computation result overflow
+#endif
   int old_expert_id = 0;
   int64_t B_expert_off = 0;
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+  // From the tables a host expert is read from to its slot, in int4 units.
+  int64_t store_b_off = 0, store_s_off = 0;
+#endif
 
   int4* sh_block_sorted_ids_int4 = sh;
   int4* sh_rd_block_sorted_ids_int4 = sh_block_sorted_ids_int4 + moe_block_size / 4;
@@ -520,6 +547,35 @@ __global__ void Marlin(
     slice_col = slice_col_par % n_tiles;
     par_id = slice_col_par / n_tiles;
   }
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+  // The host columns (the last `spread_hosts` groups) are spread through the column order, one per stretch
+  // of positions at a pseudo-random spot, so that blocks do not reach host reads together.
+  int spread_hosts = 0;                            // 0: the sorted order
+  int stretch = 0, stretch_end = 0, host_pos = 0;  // the stretch the block is in
+  int res_col = 0, res_par = 0;                    // the resident column that comes next
+  bool host_step = false;                          // the current column is a host column
+  auto enter_stretch = [&](int s) {
+    const uint32_t first = (static_cast<uint32_t>(s) * parallel + spread_hosts - 1) / spread_hosts;
+    const uint32_t end = (static_cast<uint32_t>(s + 1) * parallel + spread_hosts - 1) / spread_hosts;
+    uint32_t h = static_cast<uint32_t>(s) * 2654435761u;
+    h ^= h >> 15;
+    stretch = s;
+    stretch_end = end;
+    host_pos = first + h % (end - first);
+  };
+  // The positions are 32-bit products: above 10,000 groups the sorted order is kept.
+  if (host_groups > 0 && parallel <= 10000 && slice_col_par < n_tiles * parallel) {
+    spread_hosts = min(host_groups, parallel);
+    enter_stretch(static_cast<uint32_t>(slice_col_par) * spread_hosts / parallel);
+    host_step = slice_col_par == host_pos;
+    const int res = slice_col_par - stretch - (slice_col_par > host_pos);  // resident columns before here
+    const int column = host_step ? (parallel - spread_hosts) * n_tiles + stretch : res;
+    slice_col = column % n_tiles;
+    par_id = column / n_tiles;
+    res_col = (res + !host_step) % n_tiles;
+    res_par = (res + !host_step) / n_tiles;
+  }
+#endif
   if (parallel * n_tiles >= gridDim.x) {
     // when parallel * n_tiles >= sms
     // then there are at most $sms$ conflict tile blocks
@@ -623,6 +679,29 @@ __global__ void Marlin(
       }
     }
 
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+    // An id of host_slots + e is expert e, which no slot holds yet: read it from the host tables.
+    const bool on_host = expert_id >= host_slots;
+    const bool was_on_host = old_expert_id >= host_slots;
+    const int64_t row = on_host ? expert_id - host_slots : expert_id;
+    const int64_t old_row = was_on_host ? old_expert_id - host_slots : old_expert_id;
+    uint16_t val = 0;
+    if constexpr (s_type == host::kFE4M3fn) {
+      val = (on_host ? scale2_host : scale2_ptr)[row];
+      global_scale = Dtype::num2num2(*reinterpret_cast<scalar_t*>(&val));
+    }
+    B_expert_off = row * prob_n * prob_k / (pack_factor * 4) + (on_host ? B_host_delta : 0);
+    scales_ptr += (row - old_row) * scales_expert_stride +
+                  (static_cast<int64_t>(on_host) - static_cast<int64_t>(was_on_host)) * scales_host_delta;
+    if (on_host) {
+      const int64_t slot = expert_slot_ptr[row];
+      store_b_off = slot * prob_n * prob_k / (pack_factor * 4);
+      store_s_off = (slot - row) * scales_expert_stride - scales_host_delta;
+      if constexpr (s_type == host::kFE4M3fn) {
+        if (threadIdx.x == 0) const_cast<uint16_t*>(scale2_ptr)[slot] = val;
+      }
+    }
+#else
     if constexpr (w_type == host::kFE2M1f && s_type == host::kFE4M3fn) {
       uint16_t val = scale2_ptr[expert_id];
       global_scale = Dtype::num2num2(*reinterpret_cast<scalar_t*>(&val));
@@ -630,6 +709,7 @@ __global__ void Marlin(
 
     B_expert_off = expert_id * prob_n * prob_k / (pack_factor * 4);
     scales_ptr += (expert_id - old_expert_id) * scales_expert_stride;
+#endif
     if constexpr (has_zp) {
       zp_ptr += (expert_id - old_expert_id) * zp_expert_stride;
     }
@@ -692,11 +772,40 @@ __global__ void Marlin(
       if (threadIdx.x == 0) locks[locks_off] = 1 - slice_count;
     }
 
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+    bool new_group = false;
+    if (spread_hosts > 0) {
+      if (!first_init) {
+        if (slice_col_par == stretch_end) enter_stretch(stretch + 1);
+        host_step = slice_col_par == host_pos;
+        int next_par;
+        if (host_step) {
+          slice_col = stretch % n_tiles;
+          next_par = parallel - spread_hosts + stretch / n_tiles;
+        } else {
+          slice_col = res_col;
+          next_par = res_par;
+          if (++res_col == n_tiles) {
+            res_col = 0;
+            res_par++;
+          }
+        }
+        new_group = next_par != par_id;
+        par_id = next_par;
+      }
+    } else if (slice_col == n_tiles) {
+      slice_col = 0;
+      par_id++;
+      new_group = true;
+    }
+    if (new_group) update_next_moe_block_data();
+#else
     if (slice_col == n_tiles) {
       slice_col = 0;
       par_id++;
       update_next_moe_block_data();
     }
+#endif
   };
 
   update_next_moe_block_data();
@@ -1057,6 +1166,26 @@ __global__ void Marlin(
     __syncthreads();
   };
 
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+  // Write the stage that has just landed in shared memory into the slot of the host expert it was read
+  // from. The stage is `lead` tiles behind the fetch pointers.
+  auto store_stage = [&](int pipe, int lead) {
+    if (expert_id < host_slots) return;
+    const int4* sh_b_stage = sh_b + b_sh_stage * pipe;
+#pragma unroll
+    for (int i = 0; i < b_sh_wr_iters; i++) {
+      int4* dst = const_cast<int4*>(B_ptr[i]) - lead * b_gl_rd_delta_o + store_b_off;
+#pragma unroll
+      for (int j = 0; j < b_thread_vecs; j++)
+        dst[j] = sh_b_stage[b_sh_wr_delta * i + b_sh_wr + j];
+    }
+    if (s_sh_wr_pred) {
+      int4* dst = const_cast<int4*>(scales_ptr) + store_s_off;
+      dst[s_gl_rd - lead * s_gl_rd_delta * s_tb_groups] = (sh_s + s_sh_stage * pipe)[s_sh_wr];
+    }
+  };
+
+#endif
   // Load the next sub-tile from the current location in the shared memory pipe
   // into the current register buffer.
   auto fetch_to_registers = [&](int k, int pipe, int pipe_a = 0) {
@@ -1761,6 +1890,9 @@ __global__ void Marlin(
 
     zero_accums();
     wait_for_stage();
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+    store_stage(0, min(stages - 1, slice_iters));
+#endif
     init_same_group(0);
     fetch_to_registers(0, 0);
     fetch_scales_to_registers(0, 0);
@@ -1781,6 +1913,12 @@ __global__ void Marlin(
     // have even length meaning that the next iteration will always start at
     // index 0.
 
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+    // Slices read from the host run a second copy of this loop, which also stores each stage: a store in
+    // the one loop slows every slice.
+    // clang-format off
+    auto run_tiles = [&](auto storing) {
+#endif
     for (int stage_group_id = 0; stage_group_id < max_num_stage_groups; stage_group_id++) {
 #pragma unroll
       for (int pipe = 0; pipe < stages;) {
@@ -1798,6 +1936,11 @@ __global__ void Marlin(
             fetch_to_shared((pipe + stages - 1) % stages, pipe, slice_iters >= stages, idx);
             pipe++;
             wait_for_stage();
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+            if constexpr (decltype(storing)::value) {
+              if (slice_iters > 1) store_stage(pipe % stages, min(stages - 1, slice_iters - 1));
+            }
+#endif
             init_same_group(pipe % stages);
           }
           matmul(k);
@@ -1831,6 +1974,15 @@ __global__ void Marlin(
         break;
       }
     }
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+    };
+    // clang-format on
+    if (expert_id >= host_slots) {
+      run_tiles(std::true_type{});
+    } else {
+      run_tiles(std::false_type{});
+    }
+#endif
 
     // Process results and, if necessary, proceed to the next column slice.
     // While this pattern may not be the most readable, other ways of writing
@@ -1931,6 +2083,10 @@ __global__ void Marlin(
       slice_col_par++;
       slice_col++;
       is_first_matmul_in_slice = true;
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+      const int old_par_id = par_id;
+      const bool was_host_step = host_step;
+#endif
       init_slice();
 
       // Should we load A matrix in next slice?
@@ -1941,7 +2097,13 @@ __global__ void Marlin(
       // `prob_k > thread_k_blocks * 16 * stages * max_num_stage_groups`:
       //    when the required shared memory size is larger than
       //    the remaining shared memory
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+      // In the spread order a group starts at any column: load A when the group changed.
+      const bool group_start = spread_hosts > 0 ? par_id != old_par_id : slice_col == 0;
+      if (group_start || old_slice_row || prob_k > thread_k_blocks * 16 * stages * max_num_stage_groups) {
+#else
       if (slice_col == 0 || old_slice_row || prob_k > thread_k_blocks * 16 * stages * max_num_stage_groups) {
+#endif
         should_load_a = true;
       } else {
         should_load_a = false;
@@ -1957,6 +2119,15 @@ __global__ void Marlin(
           for (int i = 0; i < b_sh_wr_iters; i++)
             B_ptr[i] -= b_gl_stride;
         }
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+        if (host_step || was_host_step) {
+          // A host column is not the neighbour of the column before it: address it from scratch.
+#pragma unroll
+          for (int i = 0; i < b_sh_wr_iters; i++)
+            B_ptr[i] = B + b_gl_rd_delta_i * i + b_gl_stride * (threadIdx.x / b_sh_stride_threads) +
+                       (threadIdx.x % b_sh_stride_threads) * b_thread_vecs + b_sh_stride * slice_col;
+        }
+#endif
 
         bias_gl_rd = (thread_n_blocks * 16 / 8) * slice_col + threadIdx.x;
         // Update slice k/n for scales loading

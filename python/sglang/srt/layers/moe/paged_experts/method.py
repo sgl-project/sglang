@@ -336,6 +336,8 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
                 contract=self.contract,
                 routed_scaling_factor=self.routed_scaling_factor,
             )
+            if get_exec().moe.paged_experts_fused_host_copy:
+                self._fuse_host_copy(layer, residency)
         self.executor = EagerExecutor(
             base_method=self.format.runner_method(self.base_method),
             store=self.store,
@@ -345,6 +347,85 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             routed_scaling_factor=self.routed_scaling_factor,
             device_residency=residency,
         )
+        self.executor.fused_host_copy = (
+            self.device_executor is not None and self.device_executor.fused_host_copy
+        )
+
+    def _fuse_host_copy(self, layer, residency) -> None:
+        """--paged-experts-fused-host-copy: give the layer's MoE kernel the host copy of each slot
+        table, so that it pages experts in itself in this layer's device-planned steps."""
+        from sglang.srt.layers.moe.paged_experts.runners import MARLIN, TRITON
+
+        if self.tiered or self.contract not in (TRITON, MARLIN):
+            raise ValueError(
+                "--paged-experts-fused-host-copy needs the triton or Marlin MoE runner and does "
+                "not support the disk tier"
+            )
+        if self.contract is TRITON:
+            self._fuse_host_copy_triton(layer, residency)
+        else:
+            self._fuse_host_copy_marlin(layer, residency)
+        self.device_executor.fused_host_copy = True
+
+    def _fuse_host_copy_triton(self, layer, residency) -> None:
+        from sglang.kernels.ops.moe.fused_moe_triton_host_copy import HOST_COPIES
+
+        for name, host in self.store.host.items():
+            gpu = getattr(layer, name).data
+            if host[0].numel() == 0:
+                continue
+            if gpu.dim() != 3 or gpu.dtype not in (torch.bfloat16, torch.float16):
+                raise ValueError(
+                    "--paged-experts-fused-host-copy on the triton MoE runner supports "
+                    f"unquantized expert weights; {name} is {gpu.dtype} with {gpu.dim()} dimensions"
+                )
+            HOST_COPIES[gpu.data_ptr()] = (host, residency.expert_slot, residency.count)
+
+    def _fuse_host_copy_marlin(self, layer, residency) -> None:
+        from sglang.kernels.ops.moe.moe_wna16_marlin import HOST_COPIES, HostCopy
+        from sglang.kernels.ops.moe.paged_experts import (
+            paged_experts_host_device_pointer,
+        )
+
+        host = self.store.host
+        weights = ("w13_weight", "w2_weight")
+        tables = {w: (f"{w}_scale", f"{w}_scale_2") for w in weights}
+        known = {n for w, (s, g) in tables.items() for n in (w, s, g)}
+        if (
+            not set(host) <= known
+            or not all(w in host and tables[w][0] in host for w in weights)
+            or host[tables[weights[0]][0]].dtype
+            not in (torch.float8_e4m3fn, torch.float8_e8m0fnu)
+        ):
+            raise ValueError(
+                "--paged-experts-fused-host-copy on the Marlin MoE runner needs NVFP4 or MXFP4 "
+                f"experts; this layer pages {sorted(host)}"
+            )
+
+        def address(name: str, gpu: torch.Tensor) -> int:
+            # The kernel reaches a host table as an offset from the slot table, in 16-byte units.
+            pointer = paged_experts_host_device_pointer(host[name])
+            if (pointer - gpu.data_ptr()) % 16 or not gpu.is_contiguous():
+                raise ValueError(
+                    f"--paged-experts-fused-host-copy: {name}'s host and slot tables are not "
+                    "contiguous and 16 bytes apart modulo 16"
+                )
+            return pointer
+
+        for weight, (scales, global_scale) in tables.items():
+            gpu = getattr(layer, weight).data
+            HOST_COPIES[gpu.data_ptr()] = HostCopy(
+                weight=address(weight, gpu),
+                scales=address(scales, getattr(layer, scales).data),
+                global_scale=(
+                    paged_experts_host_device_pointer(host[global_scale])
+                    if global_scale in host
+                    else 0
+                ),
+                num_experts=self.num_experts,
+                expert_slot=residency.expert_slot,
+                count=residency.count,
+            )
 
     def apply(self, layer, dispatch_output):
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput

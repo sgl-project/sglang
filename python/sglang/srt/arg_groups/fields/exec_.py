@@ -1131,6 +1131,14 @@ class ExecMoe(msgspec.Struct):
         "--paged-experts-enable-disk, the experts that do not fit what is available at "
         "startup within the container's memory limit go to disk, keeping 10 GiB free.",
     ] = None
+    paged_experts_fused_host_copy: A[
+        bool,
+        "With --enable-paged-experts on the triton MoE runner (unquantized experts) or the "
+        "Marlin MoE runner (NVFP4 or MXFP4 experts): a decode step on a CUDA graph does not "
+        "copy its missing experts before the MoE kernel. The kernel reads them from pinned "
+        "host memory and writes them into their slots as it computes, so the copy overlaps "
+        "the other experts' work.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Ktransformers/AMX expert parallelism

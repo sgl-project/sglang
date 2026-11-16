@@ -33,6 +33,9 @@ namespace {
 // Graph replay at E=512/K=400/T=80: 14.88 us at 1 warp, 4.36 at 8; 16 buys nothing.
 constexpr int kDecideThreads = 256;
 
+// Marks a staged routed id whose expert the step pages in (``host_ids`` below).
+constexpr int kPagedIn = 1 << 30;
+
 // The evictions are serial and committed one at a time by lane 0 of warp 0; each victim search is
 // spread over that warp. The scan over the routed entries is a ballot compaction, and the search
 // reads the staged last-use copy instead of paying a global round trip per page-in.
@@ -49,8 +52,10 @@ __global__ void paged_experts_decide_kernel(
     int32_t* src,           // [K] out: experts to page in
     int32_t* dst,           // [K] out: their slots
     int32_t* count,         // [1] out: number of page-ins
-    int32_t* run_ids,       // [T] out: slot of each entry (0 for padding)
-    float* run_w) {         // [T] out: weight of each entry (0 for padding)
+    int32_t* run_ids,       // [T] out: slot of each entry (0 for padding); with ``host_ids``,
+                            //     K + expert for an entry whose expert is paged in
+    float* run_w,           // [T] out: weight of each entry (0 for padding)
+    bool host_ids) {        // fused host copy: the MoE kernel does the page-ins (see run_ids)
   extern __shared__ int s_state[];
   int32_t* s_expert_slot = s_state;                    // [E]
   int32_t* s_slot_expert = s_state + E;                // [K]
@@ -135,14 +140,20 @@ __global__ void paged_experts_decide_kernel(
     if (lane == 0) {
       *count = n;
       *s_count = n;
+      if (host_ids) {  // every entry of an expert that was missing
+        for (int j = 0; j < nmiss; ++j)
+          s_topk[s_miss[j]] |= kPagedIn;
+      }
     }
   }
   __syncthreads();  // the slots of the experts paged in above, and the plan size
   const int n = *s_count;
   for (int i = tid; i < T; i += blockDim.x) {
-    const int e = s_topk[i];
+    const int id = s_topk[i];
+    const bool paged_in = id >= 0 && (id & kPagedIn) != 0;
+    const int e = paged_in ? id - kPagedIn : id;
     const int s = (e < 0 || e >= E) ? -1 : s_expert_slot[e];
-    run_ids[i] = s >= 0 ? s : 0;
+    run_ids[i] = s < 0 ? 0 : paged_in ? K + e : s;
     run_w[i] = s >= 0 ? weights[i] : 0.f;
   }
   __syncthreads();  // every reader of the staged state has finished with it
@@ -349,7 +360,8 @@ void paged_experts_decide(
     tvm::ffi::TensorView dst,
     tvm::ffi::TensorView count,
     tvm::ffi::TensorView run_ids,
-    tvm::ffi::TensorView run_w) {
+    tvm::ffi::TensorView run_w,
+    int64_t host_ids) {
   using namespace sglang::host;
   using sglang::kDLGPU;
 
@@ -395,7 +407,8 @@ void paged_experts_decide(
       static_cast<int32_t*>(dst.data_ptr()),
       static_cast<int32_t*>(count.data_ptr()),
       static_cast<int32_t*>(run_ids.data_ptr()),
-      static_cast<float*>(run_w.data_ptr()));
+      static_cast<float*>(run_w.data_ptr()),
+      host_ids != 0);
 }
 
 void paged_experts_gather(

@@ -32,9 +32,15 @@ namespace sglang {
 
 namespace device::marlin_moe {
 
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+__global__ void MarlinDefault(MARLIN_KERNEL_PARAMS, MARLIN_HOST_COPY_PARAMS){};
+
+using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS, MARLIN_HOST_COPY_PARAMS);
+#else
 __global__ void MarlinDefault(MARLIN_KERNEL_PARAMS){};
 
 using MarlinFuncPtr = void (*)(MARLIN_KERNEL_PARAMS);
+#endif
 
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
 
@@ -466,16 +472,20 @@ MarlinFuncPtr get_marlin_kernel(
   if (false) {
   }
 
+#ifndef SGL_MARLIN_MOE_HOST_COPY
   COMMON_GET_IF(host::kU4)
   COMMON_GET_IF(host::kU4B8)
   COMMON_GET_IF(host::kU8B128)
+#endif
 
   NVFP4_GET_IF(host::kFE2M1f)
 
+#ifndef SGL_MARLIN_MOE_HOST_COPY
   BIGGROUP_GET_IF(host::kFE4M3fn)
 
   ACT_GET_IF(host::kU4B8)
   ACT_GET_IF(host::kU8B128)
+#endif
   if (std::is_same<scalar_t, nv_bfloat16>::value) {
     if (false) {
     }
@@ -524,7 +534,12 @@ exec_config_t determine_exec_config(
                                                 : sizeof(small_batch_thread_configs) / sizeof(thread_config_t);
 
   int count = 0;
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+  // All 65536 registers of an SM, 4 bytes each: at 128 per thread four 128-thread blocks still fit.
+  constexpr int device_max_reg_size = 256 * 1024;
+#else
   constexpr int device_max_reg_size = 255 * 1024;
+#endif
   for (int i = 0; i < thread_configs_size; i++) {
     thread_config_t th_config = thread_configs[i];
 
@@ -648,7 +663,17 @@ void marlin_mm(
     int sms,
     bool use_atomic_add,
     bool use_fp32_reduce,
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+    bool is_zp_float,
+    int64_t B_host_delta,
+    int64_t scales_host_delta,
+    const void* scale2_host,
+    const void* expert_slot,
+    int host_slots,
+    const void* host_count) {
+#else
     bool is_zp_float) {
+#endif
   int thread_m_blocks = div_ceil(moe_block_size, 16);
   bool m_block_size_8 = moe_block_size == 8;
 
@@ -871,7 +896,13 @@ void marlin_mm(
       A_ptr, B_ptr, C_ptr, C_tmp_ptr, bias_ptr, s_ptr, s2_ptr, zp_ptr, g_idx_ptr,
       sorted_token_ids_ptr, expert_ids_ptr, num_tokens_past_padded_ptr,
       topk_weights_ptr, top_k, mul_topk_weights, is_ep, num_groups, prob_m,
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+      prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce, max_shared_mem,
+      B_host_delta, scales_host_delta, (const uint16_t*)scale2_host, (const int32_t*)expert_slot, host_slots,
+      (const int32_t*)host_count);
+#else
       prob_n, prob_k, locks, has_bias, use_atomic_add, use_fp32_reduce, max_shared_mem);
+#endif
   // clang-format on
 }
 
@@ -919,7 +950,19 @@ void moe_wna16_marlin_gemm(
     int64_t group_size,
     bool use_atomic_add,
     bool use_fp32_reduce,
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+    bool is_zp_float,
+    // Paged experts, fused host copy: the host tables as offsets from the slot tables in 16-byte units,
+    // and device addresses of the other inputs (see marlin_template.h).
+    int64_t b_host_delta,
+    int64_t scales_host_delta,
+    int64_t scale2_host,
+    int64_t expert_slot,
+    int64_t host_slots,
+    int64_t host_count) {
+#else
     bool is_zp_float) {
+#endif
   using namespace host;
 
   static_assert(!kIsEP || !kExpertIdsAreSorted, "Sorted block IDs are specialized only without EP");
@@ -1166,7 +1209,17 @@ void moe_wna16_marlin_gemm(
           sms,
           use_atomic_add,
           use_fp32_reduce,
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+          is_zp_float,
+          b_host_delta,
+          scales_host_delta,
+          reinterpret_cast<const void*>(scale2_host),
+          reinterpret_cast<const void*>(expert_slot),
+          static_cast<int>(host_slots),
+          reinterpret_cast<const void*>(host_count));
+#else
           is_zp_float);
+#endif
 }
 
 }  // namespace sglang

@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Dict, Optional
 
+import msgspec
 import torch
 
 from sglang.kernels.arch import current_arch
@@ -43,6 +44,79 @@ def _jit_moe_wna16_marlin_module(
                 f"moe_wna16_marlin_gemm<{args}>",
             )
         ],
+    )
+
+
+class HostCopy(msgspec.Struct, frozen=True):
+    """Paged experts, fused host copy: every expert of one GEMM's slot tables in pinned host
+    memory, so that the kernel pages an expert in itself (marlin_template.h)."""
+
+    weight: int  # device address of the host table of packed weights
+    scales: int  # ... of the block scales
+    global_scale: int  # ... of the NVFP4 global scales; 0 without them
+    num_experts: int
+    expert_slot: torch.Tensor  # [E] int32: the slot each expert is paged into
+    count: torch.Tensor  # [1] int32: experts the current step pages in
+
+
+# By the address of the slot table of packed weights; set by sglang.srt.layers.moe.paged_experts.
+HOST_COPIES: Dict[int, HostCopy] = {}
+
+
+def host_expert_ids(b_q_weight: torch.Tensor) -> int:
+    """How many expert ids past its slots the routed entries of ``b_q_weight`` may use: with a host
+    copy an id of K + e is expert e, read from host memory; 0 without one."""
+    host = HOST_COPIES.get(b_q_weight.data_ptr()) if HOST_COPIES else None
+    return 0 if host is None else host.num_experts
+
+
+def _host_copy_args(
+    host: Optional[HostCopy], b_q_weight: torch.Tensor, b_scales: torch.Tensor
+) -> tuple:
+    """The fused-host-copy kernel's extra arguments: the host tables as offsets from the slot
+    tables in 16-byte units, then addresses and the slot count. None without a host copy."""
+    if host is None:
+        return ()
+    return (
+        (host.weight - b_q_weight.data_ptr()) // 16,
+        (host.scales - b_scales.data_ptr()) // 16,
+        host.global_scale,
+        host.expert_slot.data_ptr(),
+        b_q_weight.shape[0],
+        host.count.data_ptr(),
+    )
+
+
+@cache_once
+def _jit_moe_wna16_marlin_host_copy_module(
+    dtype: torch.dtype,
+    is_ep: bool,
+    has_bias: bool,
+    expert_ids_are_sorted: bool = False,
+    zero_inactive_output: bool = False,
+    has_inactive_prefix_count: bool = False,
+) -> Module:
+    """The kernel with the fused host copy: the same source built with SGL_MARLIN_MOE_HOST_COPY, as
+    a module of its own. The module above is built from the text that macro leaves out."""
+    args = make_cpp_args(
+        dtype,
+        is_ep,
+        has_bias,
+        expert_ids_are_sorted,
+        zero_inactive_output,
+        has_inactive_prefix_count,
+    )
+    return load_jit(
+        "moe_wna16_marlin_host_copy",
+        *args,
+        cuda_files=["gemm/marlin_moe/moe_wna16_marlin.cuh"],
+        cuda_wrappers=[
+            (
+                "moe_wna16_marlin_gemm",
+                f"moe_wna16_marlin_gemm<{args}>",
+            )
+        ],
+        extra_cuda_cflags=["-DSGL_MARLIN_MOE_HOST_COPY"],
     )
 
 
@@ -165,7 +239,13 @@ def moe_wna16_marlin_gemm(
     b_bias_t = _or_empty(b_bias_or_none, device, a.dtype)
     global_scale_t = _or_empty(global_scale_or_none, device, a.dtype)
 
-    module = _jit_moe_wna16_marlin_module(
+    host = HOST_COPIES.get(b_q_weight.data_ptr()) if HOST_COPIES else None
+    load_module = (
+        _jit_moe_wna16_marlin_module
+        if host is None
+        else _jit_moe_wna16_marlin_host_copy_module
+    )
+    module = load_module(
         a.dtype,
         is_ep,
         has_bias,
@@ -207,6 +287,7 @@ def moe_wna16_marlin_gemm(
         use_atomic_add,
         use_fp32_reduce,
         is_zp_float,
+        *_host_copy_args(host, b_q_weight, b_scales),
     )
 
     return c
