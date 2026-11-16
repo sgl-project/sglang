@@ -9,6 +9,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
+
 class _RecordingImpl:
     """Stands in for the all-to-all library behind a staged dispatcher."""
 
