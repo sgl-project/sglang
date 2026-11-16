@@ -19,7 +19,6 @@ from sglang.srt.layers.attention.qsa.metadata import (
 )
 from sglang.srt.layers.attention.qsa.mqa import (
     HAS_TILELANG,
-    QSA_DECODE_Q_PREP_ALIGNMENT,
     qsa_mqa_decode,
     qsa_mqa_prefill,
     qsa_mqa_prefill_relative,
@@ -36,6 +35,7 @@ from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
 from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.utils.device import is_gfx95_supported
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
@@ -753,15 +753,18 @@ class QSAIndexer(MultiPlatformOp):
                 logical_positions,
                 indexer_metadata.compress_member_rows is not None,
             )
+        # The tilelang decode MQA kernel needs query heads in multiples of 8.
+        q_heads_padded = ((self.index_n_heads + 7) // 8) * 8
+        if is_gfx95_supported():
+            # Pad to the kernel's 16-wide MFMA here so the decode wrapper need not copy Q.
+            q_heads_padded = ((self.index_n_heads + 15) // 16) * 16
         q, token_k, state_stored = self.project_qk(
             hidden_states,
             positions,
             pool=indexer_metadata.token_to_kv_pool,
             cache_loc=state_slots,
             q_heads_padded=(
-                # Pad to the indexer Q-prep alignment (see mqa.py).
-                -(-self.index_n_heads // QSA_DECODE_Q_PREP_ALIGNMENT)
-                * QSA_DECODE_Q_PREP_ALIGNMENT
+                q_heads_padded
                 if (forward_mode.is_decode() or is_target_verify or is_draft_extend)
                 else None
             ),

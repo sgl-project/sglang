@@ -560,16 +560,6 @@ def tilelang_qsa_mqa_prefill_relative(
 # CTAs per decode row: few enough levels to bound the TileLang specializations, and
 # a grid of about four waves (at least one CTA per row).
 _DECODE_CTAS_PER_ROW_LEVELS = (1, 16, 256)
-# CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires sixteen.
-QSA_DECODE_HEAD_ALIGNMENT = 16 if is_hip() else 8
-# Head padding of the indexer's fused Q prep. On gfx95 it pads to the kernel width so
-# the wrapper need not copy Q; elsewhere it keeps eight and the wrapper pads the rest.
-QSA_DECODE_Q_PREP_ALIGNMENT = QSA_DECODE_HEAD_ALIGNMENT if is_gfx95_supported() else 8
-# Four wavefronts per CTA: about 1.5x faster than 128 threads on MI355X (gfx950).
-_DECODE_THREADS = 256 if is_gfx95_supported() else 128
-# Four consecutive groups per CTA over a page-table-wide grid: 1.2-1.7x faster than
-# the fixed CTAs per row on MI355X at 50k-200k context (bit-exact).
-_DECODE_GROUPS_PER_CTA = 4 if is_gfx95_supported() else 0
 
 
 @functools.lru_cache(maxsize=None)
@@ -622,16 +612,21 @@ def tilelang_qsa_mqa_decode(
             dtype=torch.float32,
             device=q.device,
         )
+    # MI355X: four wavefronts per CTA (about 1.5x) and four consecutive groups per CTA
+    # over a page-table-wide grid (1.2-1.7x at 50k-200k context, bit-exact); other
+    # devices keep the kernel defaults.
+    gfx95_launch = {"threads": 256, "groups_per_cta": 4} if is_gfx95_supported() else {}
     # An empty page table would give the page-table-wide grid zero CTAs.
     if (
         not q.shape[0]
         or not max_model_len
-        or (_DECODE_GROUPS_PER_CTA and not page_table.shape[1])
+        or (gfx95_launch and not page_table.shape[1])
     ):
         return logits
-    # Zero-padding preserves the weight-free head sum.
+    # CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires
+    # sixteen. Zero-padding preserves the weight-free head sum on both paths.
     query_heads, head_dim = q.shape[1:]
-    head_alignment = QSA_DECODE_HEAD_ALIGNMENT
+    head_alignment = 16 if is_hip() else 8
     kernel_heads = max(
         head_alignment,
         ((query_heads + head_alignment - 1) // head_alignment) * head_alignment,
@@ -653,12 +648,11 @@ def tilelang_qsa_mqa_decode(
         # Unused with groups_per_cta (it sets the grid); fixed so it does not
         # multiply the kernel specializations.
         ctas_per_row=(
-            1 if _DECODE_GROUPS_PER_CTA else _decode_ctas_per_row(q.shape[0], q.device)
+            1 if gfx95_launch else _decode_ctas_per_row(q.shape[0], q.device)
         ),
         min_scored_len=min_scored_len,
-        threads=_DECODE_THREADS,
         dtype=_TILELANG_DTYPES[scoring_dtype],
-        groups_per_cta=_DECODE_GROUPS_PER_CTA,
+        **gfx95_launch,
     )(
         q_kernel.unsqueeze(1).contiguous(),
         k_cache.to(scoring_dtype).contiguous(),
