@@ -40,8 +40,8 @@ inline constexpr int64_t kTwoShotPushUnrolledMinBytes =
 /// `kWarpThreads * unroll` vectors and issue every load of a hunk before using
 /// any, and slot payload moves as device-scope loads and batched system-scope
 /// stores while the input and output take plain accesses. The
-/// tail past the last whole hunk takes the per-vector path. Single node only
-/// (at most 8 ranks).
+/// tail past the last whole hunk takes the per-vector path. Each peer needs a
+/// warp of its own, so the grid must hold at least `kWorldSize - 1` warps.
 template <typename T, uint32_t kWorldSize, bool kUsePDL, typename Params>
 __global__ __launch_bounds__(kTwoShotPushThreads, 1) __attribute__((
     amdgpu_waves_per_eu(1, 2))) void all_reduce_2shot_push_unrolled_kernel(const __grid_constant__ Params params) {

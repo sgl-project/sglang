@@ -480,7 +480,9 @@ struct AllReduceKernel {
       // 1shot_push (TP4/6 -4..-8%, TP8 up to -22%); 2shot_push does not gain
       if (!two_shot && num_vecs >= 8192) block_size = 1024u;
       if constexpr (kWorldSize <= 16) {
-        if (two_shot && is_gfx1250() && nbytes >= kTwoShotPushUnrolledMinBytes<kWorldSize>) {
+        // the unrolled kernel gives every peer a warp; smaller grids take the per-vector kernel
+        const bool enough_warps = push.default_blocks * (kTwoShotPushThreads / device::kWarpThreads) >= kWorldSize - 1;
+        if (two_shot && is_gfx1250() && enough_warps && nbytes >= kTwoShotPushUnrolledMinBytes<kWorldSize>) {
           LaunchKernel(push.default_blocks, kTwoShotPushThreads, stream)  //
               .enable_pdl(kUsePDL)(all_reduce_2shot_push_unrolled_kernel<T, kWorldSize, kUsePDL, PushParams>, params);
           return out;
