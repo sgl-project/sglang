@@ -61,12 +61,21 @@ class TestEagleDraftEmbedShare(CustomTestCase):
             _run(False), ["target_pool", "draft_pool", "token_map", "lm_head"]
         )
 
-    def test_init_ends_with_the_early_share(self):
+    def test_init_shares_once_after_the_draft_runner_exists(self):
+        # The tests above call the early share directly, since running __init__ needs
+        # a GPU and a model. This guards the call site: __init__ must still make the
+        # call, once, after the draft model is built. Its exact position is free.
         tree = ast.parse(textwrap.dedent(inspect.getsource(EagleDraftWorker.__init__)))
-        last = tree.body[0].body[-1]
-        self.assertEqual(
-            ast.unparse(last), "self._maybe_share_embed_before_pool_sizing()"
-        )
+        body = [ast.unparse(stmt) for stmt in tree.body[0].body]
+        share = [
+            i
+            for i, s in enumerate(body)
+            if s == "self._maybe_share_embed_before_pool_sizing()"
+        ]
+        runner = [i for i, s in enumerate(body) if s.startswith("self.draft_runner =")]
+        self.assertEqual(len(share), 1, "__init__ must call the early share once")
+        self.assertEqual(len(runner), 1, "__init__ must set self.draft_runner once")
+        self.assertGreater(share[0], runner[0])
 
 
 if __name__ == "__main__":
