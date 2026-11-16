@@ -69,6 +69,12 @@ on:
         type: string
         default: ''
         description: 'Accuracy dataset injected into pods as NPU_ACCURACY_DATASET (gsm8k on weekdays, gpqa_diamond on weekends)'
+      # Declared for compatibility with the caller; the restored image mode
+      # does not consume the prebuilt router artifact.
+      sgl_router_artifact:
+        required: false
+        type: string
+        default: ''
 
 concurrency:
   group: ascend-nightly-multi-node-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_config_name }}
