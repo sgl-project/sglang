@@ -160,22 +160,35 @@ class WeightUpdater:
             return False, message
 
         try:
-            try:
-                if not staged.applied:
-                    DefaultModelLoader.restore_weights_before_loading(
-                        self.get_model(), torch.device(self.device)
-                    )
-                install_metrics = generator.apply_weight(staged)
-                logger.info(
-                    "ModelExpress refit metrics version=%s: %s",
-                    weight_version,
-                    {**staged.metrics, **(install_metrics or {})},
+            if not staged.applied:
+                DefaultModelLoader.restore_weights_before_loading(
+                    self.get_model(), torch.device(self.device)
                 )
-            finally:
-                staged.release()
+            install_metrics = generator.apply_weight(staged)
+            logger.info(
+                "ModelExpress refit metrics version=%s: %s",
+                weight_version,
+                {**staged.metrics, **(install_metrics or {})},
+            )
             success, message = True, ""
         except Exception as exc:
-            success, message = False, str(exc)
+            success, message = (
+                False,
+                (
+                    f"Failed to install ModelExpress version {weight_version}: {exc}. "
+                    "The weights may be partially updated."
+                ),
+            )
+        finally:
+            try:
+                staged.release()
+            except Exception:
+                # The install is already committed; a lease cleanup error must
+                # not hide it from the scheduler, or the cache is never flushed.
+                logger.exception(
+                    "Failed to release ModelExpress weight version %s after install",
+                    weight_version,
+                )
         return _combine_tp_results(success, message)
 
     def close_modelexpress(self) -> None:

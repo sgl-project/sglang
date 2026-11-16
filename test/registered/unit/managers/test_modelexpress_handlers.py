@@ -387,14 +387,21 @@ def test_staging_error_is_reported_without_installing():
     assert generator.applied == []
 
 
-def test_apply_error_is_reported_and_releases_staging():
+@pytest.mark.parametrize("release_fails", [False, True])
+def test_apply_error_is_reported_and_releases_staging(release_fails):
     generator = Generator()
     generator.apply_error = RuntimeError("apply failed")
+    if release_fails:
+        generator.release_error = RuntimeError("lease unavailable")
     updater = model_updater(generator)
     success, message = updater.update_weights_from_modelexpress("2")
 
     assert success is False
-    assert message == "apply failed"
+    # A cleanup error must not replace the install error.
+    assert message == (
+        "Failed to install ModelExpress version 2: apply failed. "
+        "The weights may be partially updated."
+    )
     assert generator.staged[0].released == 1
 
 
@@ -413,18 +420,34 @@ def test_update_can_retry_after_staging_failure():
     assert generator.staged[0].released == 1
 
 
-def test_staged_cleanup_failure_is_reported(monkeypatch):
+def test_release_error_after_install_still_flushes_and_records_version():
     generator = Generator()
+    generator.release_error = RuntimeError("lease unavailable")
     updater = model_updater(generator)
-    staged = Staged("2")
-    staged.release_error = RuntimeError("lease unavailable")
-    monkeypatch.setattr(generator, "stage_weight", lambda **_kwargs: staged)
+    events = MagicMock()
+    events.flush.return_value = True
+    scheduler = SchedulerWeightUpdaterManager(
+        tp_worker=SimpleNamespace(
+            update_weights_from_modelexpress=lambda request: (
+                updater.update_weights_from_modelexpress(request.weight_version)
+            )
+        ),
+        draft_worker=None,
+        memory_saver_adapter=None,
+        flush_cache=events.flush,
+        is_fully_idle=MagicMock(),
+        scheduler=SimpleNamespace(record_weight_version_change=events.record),
+    )
+    request = UpdateWeightsFromModelExpressReqInput(weight_version="2")
 
-    success, message = updater.update_weights_from_modelexpress("2")
+    result = scheduler.update_weights_from_modelexpress(request)
 
-    assert success is False
-    assert message == "lease unavailable"
-    assert staged.released == 1
+    assert (result.success, result.message) == (True, "")
+    assert events.mock_calls == [
+        call.record(new_version="2"),
+        call.flush(empty_cache=request.torch_empty_cache),
+    ]
+    assert generator.staged[0].released == 1
 
 
 def test_generator_initialization_failure_is_reported(modelexpress_modules):
