@@ -219,6 +219,7 @@ class HiCacheHF3FS(HiCacheStorage):
         self.is_page_first_layout = is_page_first_layout
         self.enable_storage_metrics = enable_storage_metrics
         self.use_mock_client = use_mock_client
+        self.numel = self.bytes_per_page // self.dtype.itemsize
         self.num_pages = self.file_size // self.bytes_per_page
         self.skip_backup = False
         if self.is_mla_model and self.rank != 0:
@@ -538,7 +539,7 @@ class HiCacheHF3FS(HiCacheStorage):
     def clear(self) -> None:
         try:
             self.metadata_client.clear(self.rank)
-            for ctx in self._pool_storage_ctx.values():
+            for ctx in getattr(self, "_pool_storage_ctx", {}).values():
                 self.metadata_client.clear(self.rank, namespace=ctx.namespace)
             logger.info(f"Cleared HiCacheHF3FS for rank {self.rank}")
         except Exception as e:
@@ -548,7 +549,7 @@ class HiCacheHF3FS(HiCacheStorage):
         try:
             for c in self.clients:
                 c.close()
-            for ctx in self._pool_storage_ctx.values():
+            for ctx in getattr(self, "_pool_storage_ctx", {}).values():
                 for c in ctx.clients:
                     c.close()
             self.executor.shutdown(wait=True)
