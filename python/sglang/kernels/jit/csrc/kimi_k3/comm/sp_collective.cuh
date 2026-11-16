@@ -264,8 +264,8 @@ SGL_DEVICE void push_rows_unrolled(const PeerGroup& g, const vec_t* src, vec_t* 
 /// kPushed: as `reduce_scatter_res_kernel`'s, the producer filled every slot (its own rank's too) and only the
 /// reduction runs.
 template <uint32_t kWorldSize, bool kHasResidual, bool kUsePDL, bool kPushed = false>
-__global__ __launch_bounds__(kUnrolledThreads, 1) void reduce_scatter_res_unrolled_kernel(
-    const __grid_constant__ Params params) {
+__global__
+__launch_bounds__(kUnrolledThreads, 1) void reduce_scatter_res_unrolled_kernel(const __grid_constant__ Params params) {
   using vec_t = device::AlignedVector<bf16x2_t, 4>;  // 16 B
   constexpr uint32_t kUnroll = kUnrolledReduceUnroll;
   constexpr uint32_t kHunk = device::kWarpThreads * kUnroll;
@@ -297,8 +297,8 @@ __global__ __launch_bounds__(kUnrolledThreads, 1) void reduce_scatter_res_unroll
     poll_ptrs[i] = reinterpret_cast<const vec_t*>(params.push_workspaces[r] + phase_offset + i * params.stride_bytes);
   }
   const auto mine = input + r * len;
-  const auto residual = reinterpret_cast<const vec_t*>(
-      params.residual + (params.residual_is_local ? 0 : int64_t{r} * len * 16));
+  const auto residual =
+      reinterpret_cast<const vec_t*>(params.residual + (params.residual_is_local ? 0 : int64_t{r} * len * 16));
   const auto output = reinterpret_cast<vec_t*>(params.output);
   const auto zero = empty_vec<vec_t>();
 
@@ -586,8 +586,8 @@ struct SPCollectiveKernel {
 
   /// The reduction half of `reduce_scatter_res` for rows a producer pushed itself (`reduce_scatter_res_kernel` with
   /// kPushed): `output` = this rank's shard, every rank's slot of the current phase holding its partial rows.
-  static void reduce_scatter_pushed(
-      CommunicatorRef ref, TensorView output, int64_t num_blocks, int64_t block_size, bool unrolled) {
+  static void
+  reduce_scatter_pushed(CommunicatorRef ref, TensorView output, int64_t num_blocks, int64_t block_size, bool unrolled) {
     using namespace host;
     const auto& push = ref.get()->get_push_obj();
     check_push_launch(num_blocks, block_size);
@@ -613,7 +613,6 @@ struct SPCollectiveKernel {
     host::LaunchKernel(num_blocks, block_size, output.device())
         .enable_pdl(kUsePDL)(sp_collective::reduce_scatter_res_kernel<kWorldSize, false, kUsePDL, true>, params);
   }
-
 
   static void
   all_gather(CommunicatorRef ref, TensorView input, TensorView output, int64_t num_blocks, int64_t block_size) {

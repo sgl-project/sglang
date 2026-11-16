@@ -28,7 +28,8 @@ import torch
 import torch.distributed as dist
 
 from sglang.srt.distributed import get_tp_group
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.rocm_muse_spark import router_pooler
 from sglang.srt.rocm_muse_spark.sequence_parallel import (
     SP_MIN_TOKENS,
