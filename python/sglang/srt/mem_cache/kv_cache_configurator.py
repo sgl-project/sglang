@@ -2394,8 +2394,21 @@ class KVCacheConfigurator:
                 )
                 if not dsa_layer_skips_topk(self.model_config.hf_config, layer_id)
             )
-        use_dsa_fp8_kv_cache_storage = (
-            self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35
+        if self.kv_cache_dtype == torch.int8:
+            if not is_dsa_model or is_arch35:
+                raise ValueError("INT8 KV cache requires a DSA model on Ascend A3.")
+            if dcp_size > 1:
+                raise ValueError(
+                    "INT8 DSA KV cache does not support decode context parallelism: "
+                    "the quantized SFA operator does not return LSE."
+                )
+            if self.modelslim_cache_layout is not None:
+                raise ValueError(
+                    "DSA C8 KV cache cannot use a ModelSlim FA cache layout."
+                )
+        use_dsa_c8_kv_cache_storage = is_dsa_model and (
+            self.kv_cache_dtype == torch.int8
+            or (self.kv_cache_dtype == torch.float8_e4m3fn and is_arch35)
         )
         dsa_pool_kwargs = {}
         if is_dsa_model and get_dsa_index_kpool(self.model_config.hf_config) > 1:
@@ -2430,7 +2443,7 @@ class KVCacheConfigurator:
                 calculate_mla_kv_cache_dim(
                     model_config=self.model_config, kv_cache_dtype=self.kv_cache_dtype
                 )
-                if use_dsa_fp8_kv_cache_storage
+                if use_dsa_c8_kv_cache_storage
                 else None
             ),
             is_draft_worker=self.is_draft_worker,
@@ -2449,6 +2462,8 @@ class KVCacheConfigurator:
         return token_to_kv_pool
 
     def _build_ascend_mha_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+        if self.kv_cache_dtype == torch.int8:
+            raise ValueError("INT8 KV cache requires a DSA model on Ascend A3.")
         from sglang.srt.hardware_backend.npu.memory_pool_npu import (
             NPUMHATokenToKVPool,
         )
@@ -3854,6 +3869,10 @@ def calculate_mla_kv_cache_dim(
     # For non-DSA models, MLA kv cache dim is simply kv_lora_rank + qk_rope_head_dim
     if not is_dsa_model:
         return kv_cache_dim
+
+    # Ascend INT8 uses the same packed row geometry as scaled FP8 DSA.
+    if kv_cache_dtype == torch.int8:
+        return fp8_ds_mla_row_width(kv_lora_rank, qk_rope_head_dim)
 
     # TRTLLM and Prims-TS use the raw MLA KV layout. In disaggregated serving
     # only the backend for the local role determines the local pool layout; the

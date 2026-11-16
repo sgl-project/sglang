@@ -928,6 +928,22 @@ class TestPrepareServerArgs(CustomTestCase):
         with self.assertRaises(SystemExit):
             parser.parse_args(base_args + ["--dsv4-prefill-backend", "flashmla_kv"])
 
+    def test_speculative_draft_kv_cache_accepts_int8(self):
+        parser = server_args_module.argparse.ArgumentParser()
+        ServerArgs.add_cli_args(parser)
+
+        args = parser.parse_args(
+            [
+                "--model-path",
+                "dummy-model",
+                "--kv-cache-dtype",
+                "bf16",
+                "--speculative-draft-kv-cache-dtype",
+                "int8",
+            ]
+        )
+        self.assertEqual(args.speculative_draft_kv_cache_dtype, "int8")
+
     def test_return_hidden_states_mode_configuration(self):
         def _resolved(**kwargs):
             server_args = ServerArgs(**kwargs)

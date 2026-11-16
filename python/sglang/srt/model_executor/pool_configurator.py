@@ -716,7 +716,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 indexer_quant_mode = resolve_indexer_quant_mode(
                     kvc.server_args.indexer_kv_cache_dtype, dtype
                 )
-                if indexer_quant_mode == QUANT_MODE_TOKEN_INT8:
+                if dtype == torch.int8 or indexer_quant_mode == QUANT_MODE_TOKEN_INT8:
                     if get_dsa_index_kpool(kvc.model_config.hf_config) > 1:
                         raise ValueError(
                             "INT8 indexer KV cache is not supported with NPU KPool."

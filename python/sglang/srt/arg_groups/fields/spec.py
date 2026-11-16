@@ -155,10 +155,11 @@ class Spec(msgspec.Struct):
             "allocated with one slot per target token (draft and target share a slot index "
             "space), so for a small draft it can still rival the target pool: a 5-layer "
             "DFLASH draft costs 10240 bytes/token in bf16. Setting fp8_e4m3 halves the draft "
-            "pool; the saving shows up as free device memory, so raise "
+            "pool, and int8 provides the same storage size on supported Ascend DSA models; "
+            "the saving shows up as free device memory, so raise "
             "--mem-fraction-static to convert it into KV capacity. Default follows "
             "--kv-cache-dtype.",
-            choices=["auto", "fp8_e5m2", "fp8_e4m3", "bf16", "bfloat16"],
+            choices=["auto", "fp8_e5m2", "fp8_e4m3", "int8", "bf16", "bfloat16"],
             resolvable=True,
         ),
     ] = None

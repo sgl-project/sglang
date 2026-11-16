@@ -76,7 +76,7 @@ class TestDynamicInt8MLAProlog(CustomTestCase):
         self.kr_cache = torch.zeros(1, 4, 1, 2, dtype=torch.bfloat16)
         self.pool = SimpleNamespace(
             index_head_dim=4,
-            dsa_kv_cache_store_fp8=False,
+            dsa_kv_cache_store_c8=False,
             get_kv_buffer=lambda _: (self.k_cache, self.kr_cache),
         )
         self.disagg = SimpleNamespace(disaggregation_mode="decode")
@@ -162,6 +162,36 @@ class TestDynamicInt8MLAProlog(CustomTestCase):
             model.v_head_dim,
             model.quant_config,
         )
+
+    def test_dynamic_prolog_writes_packed_int8_cache(self):
+        self.k_cache = torch.zeros(1, 4, 1, 656, dtype=torch.int8)
+        self.kr_cache = torch.empty(0, dtype=torch.bfloat16)
+        self.pool.dsa_kv_cache_store_c8 = True
+        model = self.make_model()
+        preprocess = self.make_preprocess(model)
+        preprocess(self.positions, self.x, self.batch, None)
+        args = self.vendor.npu_mla_prolog_v3.call_args.kwargs
+        self.assertIs(args["kv_cache"], self.k_cache)
+        self.assertIs(args["kr_cache"], self.kr_cache)
+        self.assertEqual(args["weight_quant_mode"], 2)
+        self.assertEqual(args["kv_cache_quant_mode"], 3)
+        self.assertEqual(args["query_quant_mode"], 0)
+        self.assertEqual(args["ckvkr_repo_mode"], 1)
+        self.assertEqual(args["quant_scale_repo_mode"], 1)
+        self.assertEqual(args["tile_size"], 128)
+        torch.testing.assert_close(args["k_nope_clip_alpha"], torch.ones(1))
+        self.assertEqual(args["dequant_scale_x"].dtype, torch.float32)
+        self.assertEqual(args["dequant_scale_x"].shape, (2, 1))
+
+    def test_modelslim_dsa_does_not_require_fa_quantization_metadata(self):
+        quant_config = SimpleNamespace(
+            get_name=lambda: "modelslim",
+            requested_kv_cache_dtype="int8",
+            init_kv_cache=Mock(),
+        )
+        model = SimpleNamespace(quant_config=quant_config, use_dsa=True)
+        self.attention.init_modelslim_mla_kv(model, "model.layers.0.self_attn")
+        quant_config.init_kv_cache.assert_not_called()
 
     def test_dynamic_dispatch_supplies_int8_operator_contract(self):
         """Dynamic ModelSlim must not access static input_offset parameters."""

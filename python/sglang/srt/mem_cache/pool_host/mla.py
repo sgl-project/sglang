@@ -220,7 +220,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         // index_compress_ratio
                     )
                     if native.index_scales is not None:
-                        self._size_per_token += 4 * index_layers // index_compress_ratio
+                        self._size_per_token += (
+                            native.index_scales.dtype.itemsize
+                            * index_layers
+                            // index_compress_ratio
+                        )
                 self.device_kv_buffers = ()
                 self.device_data_ptrs = None
             else:
@@ -365,9 +369,11 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 * self.dtype.itemsize
             )
         if native.index_scales is not None:
-            # FP32 scale mirror
             lengths.append(
-                self.page_num * native.index_scales.shape[2] * index_layers * 4
+                self.page_num
+                * native.index_scales.shape[2]
+                * index_layers
+                * native.index_scales.dtype.itemsize
             )
         return lengths
 
@@ -522,12 +528,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
             )
-        # Host-side mirror of the NPU quantized-Indexer FP32 scale cache.
+        # Preserve the device Indexer scale dtype (INT8: FP16; FP8: FP32).
         self.index_k_scale_buffer = None
         if native.index_scales is not None:
             self.index_k_scale_buffer = alloc_func(
                 (*indexer_dims, 1),
-                dtype=torch.float32,
+                dtype=native.index_scales.dtype,
                 device=self.device,
                 pin_memory=self.pin_memory,
                 allocator=self.allocator,
@@ -1212,6 +1218,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             scale_buffer_data_ptr = (
                 scale_buffer.data_ptr() if scale_buffer is not None else None
             )
+            scale_item_size = (
+                scale_buffer.element_size() if scale_buffer is not None else 0
+            )
             # k row width mirrors the device pool (packed dim for FP8 DSA).
             k_width = self.k_buffer.shape[-1]
             k_item_size = self.k_buffer.element_size()
@@ -1263,14 +1272,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     )
                 if scale_buffer_data_ptr is not None:
                     # Host scale layout is (page_num, num_indexer_layers,
-                    # index_page_size, 1, 1) FP32: one scale value per entry per
+                    # index_page_size, 1, 1): one scale value per entry per
                     # indexer layer.
                     ptr_list.append(
                         scale_buffer_data_ptr
                         + (indices[index] // self.page_size)
                         * index_page_size
                         * num_indexer_layers
-                        * 4
+                        * scale_item_size
                     )
             k_element_size = self.layer_num * k_item_size * self.page_size * k_width
             v_element_size = (
@@ -1282,7 +1291,7 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             index_k_element_size = (
                 num_indexer_layers * index_k_item_size * index_page_size * index_k_width
             )
-            scale_element_size = num_indexer_layers * 4 * index_page_size
+            scale_element_size = num_indexer_layers * scale_item_size * index_page_size
             element_size_list = []
             for _ in range(0, len(indices), self.page_size):
                 element_size_list.append(k_element_size)
