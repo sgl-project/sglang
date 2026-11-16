@@ -128,8 +128,8 @@ def _bind_point(e2e: Path, config_key: str, commit: str, point: str) -> tuple:
         "FRAMEWORK": master["framework"],
         "PRECISION": master["precision"],
         "TP": str(tp),
-        # A row without ep runs EP 1, as InferenceX's matrix defaults it.
-        "EP_SIZE": str(entry.get("ep", 1)),
+        # A row without ep, or with ep: null, runs EP 1 as InferenceX's matrix does.
+        "EP_SIZE": str(entry.get("ep") or 1),
         "PP_SIZE": "1",
         "DCP_SIZE": str(dcp),
         "PCP_SIZE": "1",
