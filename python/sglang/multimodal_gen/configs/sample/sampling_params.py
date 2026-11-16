@@ -16,6 +16,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, ClassVar
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.post_training import RLRolloutArgs
 from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 from sglang.multimodal_gen.configs.utils import expand_path_fields
@@ -530,9 +531,9 @@ class SamplingParams:
         self._validate()
 
         # Allow env var to override num_inference_steps (for faster CI testing on AMD)
-        env_steps = os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS")
+        env_steps = envs.SGLANG_TEST_NUM_INFERENCE_STEPS
         if env_steps is not None and self.num_inference_steps is not None:
-            self.num_inference_steps = int(env_steps)
+            self.num_inference_steps = env_steps
 
         if self.enable_spectrum and isinstance(self.spectrum_params, dict):
             from sglang.multimodal_gen.configs.sample.spectrum import SpectrumParams
