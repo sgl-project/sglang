@@ -20,14 +20,38 @@ def linear_bf16_quack(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     return out
 
 
+@cache
+def _cublaslt_runner_and_config():
+    from flashinfer.autotuner import TuningConfig
+    from flashinfer.gemm.gemm_base import get_mm_bf16_cublaslt_module
+
+    # cuBLASLt enumerates algorithms per exact shape. An algorithm's index
+    # cannot be reused at a different M, even within the same tuning bucket.
+    return (
+        get_mm_bf16_cublaslt_module().cublaslt_bf16_gemm_runner(),
+        TuningConfig(
+            use_cuda_graph=True,
+            use_cold_l2_graph_replay=True,
+            use_cold_l2_cache=True,
+            cold_chain_launches=8,
+            profile_arena_input_indices=(1,),
+        ),
+    )
+
+
 def linear_bf16_cublaslt(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
-    from flashinfer.gemm.gemm_base import bf16_gemm_sm100
+    from flashinfer.autotuner import AutoTuner
 
     out = x.new_empty((x.shape[0], weight.shape[0]))
     # mm_bf16's process-wide scratch buffer is unsafe for concurrent streams
     # or graphs. The allocator owns this call's scratch, including during capture.
     workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=x.device)
-    bf16_gemm_sm100(x, weight.T, None, False, out, workspace, ["cublaslt"])
+    inputs = [x, weight.T, None, False, out, workspace]
+    runner, config = _cublaslt_runner_and_config()
+    runner, tactic = AutoTuner.get().choose_one(
+        "sglang_bf16_cublaslt", [runner], config, inputs
+    )
+    runner(inputs=inputs, tactic=tactic)
     return out
 
 

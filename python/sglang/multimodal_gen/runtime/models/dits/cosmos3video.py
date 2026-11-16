@@ -1031,15 +1031,19 @@ def _sm120_gemm_device_supported(index: int) -> bool:
 
 
 class _Sm120LinearMethod(UnquantizedLinearMethod):
-    # Cosmos3 Bimanual measurements on 188-SM RTX PRO 6000, cuBLAS 13.1.1.3.
-    # Unmeasured shapes and the M224 down / M448 out ties keep native GEMM.
-    # M224 QKV gains are too small to justify runtime autotuning.
-    _backends = {
-        (224, 24576, 4096): linear_bf16_quack,
-        (448, 24576, 4096): linear_bf16_quack,
-        (448, 6144, 4096): linear_bf16_cublaslt,
-        (224, 4096, 4096): linear_bf16_cublaslt,
-        (448, 4096, 12288): linear_bf16_cublaslt,
+    # Coarse M sweeps on 188-SM RTX PRO 6000, cuBLAS 13.1.1.3. Intervals
+    # are inclusive; gaps keep native GEMM where gains are small or negative.
+    # N/K describe the model's projections, not the shared kernel's contract.
+    _backend_ranges = {
+        (24576, 4096): ((64, 2048, linear_bf16_quack),),
+        (4096, 12288): ((64, 512, linear_bf16_quack),),
+        (6144, 4096): (
+            (193, 384, linear_bf16_quack),
+            (385, 448, linear_bf16_cublaslt),
+            (449, 640, linear_bf16_quack),
+            (1024, 2048, linear_bf16_quack),
+        ),
+        (4096, 4096): ((128, 2048, linear_bf16_quack),),
     }
 
     def __init__(self):
@@ -1053,13 +1057,15 @@ class _Sm120LinearMethod(UnquantizedLinearMethod):
             and x.ndim >= 2
             and x.shape[-1] > 0
         ):
-            backend = self._backends.get(
-                (x.numel() // x.shape[-1], *layer.weight.shape)
-            )
-            if backend is not None and _sm120_gemm_device_supported(x.device.index):
-                out = self._gemm(x, layer.weight, bias, backend=backend)
-                if out is not None:
-                    return out
+            m = x.numel() // x.shape[-1]
+            for lower, upper, backend in self._backend_ranges.get(
+                tuple(layer.weight.shape), ()
+            ):
+                if lower <= m <= upper and _sm120_gemm_device_supported(x.device.index):
+                    out = self._gemm(x, layer.weight, bias, backend=backend)
+                    if out is not None:
+                        return out
+                    break
         return super().apply(layer, x, bias)
 
 

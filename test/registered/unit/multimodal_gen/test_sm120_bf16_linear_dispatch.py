@@ -8,6 +8,10 @@ from unittest.mock import patch
 import torch
 import torch.nn.functional as F
 
+from sglang.kernels.ops.gemm.sm120_bf16 import (
+    linear_bf16_cublaslt,
+    linear_bf16_quack,
+)
 from sglang.multimodal_gen.runtime.layers.linear import (
     ColumnParallelLinear,
     RowParallelLinear,
@@ -18,11 +22,14 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     Cosmos3GenDecoderLayer,
     _Sm120LinearMethod,
 )
+from sglang.multimodal_gen.test.quality_tier_admission import (
+    assert_error_no_worse_than_reference,
+)
 from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="diffusion-1-gpu-5090")
+register_cuda_ci(est_time=60, stage="base-b", runner_config="diffusion-1-gpu-5090")
 
 
 @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
@@ -141,24 +148,23 @@ class TestSm120Bf16Linear(CustomTestCase):
     @torch.inference_mode()
     def test_cold_capture_then_warmed_real_backends(self):
         from flashinfer.autotuner import AutoTuner
-        from flashinfer.gemm import gemm_base
         from quack import gemm_interface
 
         # Exercise the real backends on CI's SM120 5090 as well. Only the SKU
         # performance gate is relaxed; shapes, dtypes and kernel calls are real.
-        for n, module, name in (
-            (6144, gemm_base, "bf16_gemm_sm100"),
-            (24576, gemm_interface, "gemm_out"),
+        for m, n, module, name in (
+            (394, 6144, AutoTuner.get(), "choose_one"),
+            (808, 24576, gemm_interface, "gemm_out"),
         ):
             with (
-                self.subTest(n=n),
+                self.subTest(m=m, n=n),
                 patch(
                     "sglang.multimodal_gen.runtime.models.dits.cosmos3video._sm120_gemm_device_supported",
                     return_value=True,
                 ),
             ):
                 method = _Sm120LinearMethod()
-                x, layer = self.inputs(n)
+                x, layer = self.inputs(n=n, m=m)
                 stream = torch.cuda.Stream()
                 stream.wait_stream(torch.cuda.current_stream())
                 modes = []
@@ -211,13 +217,17 @@ class TestSm120Bf16Linear(CustomTestCase):
 
     @torch.inference_mode()
     def test_fallback_does_not_retain_workspace(self):
-        # Ties, low-gain M224 QKV, and unmeasured shapes stay native,
-        # even though the generic executor accepts those dimensions.
+        # Outside the measured intervals, including their gaps, execution
+        # stays native even though the generic executor accepts these shapes.
         for m, n, k in (
-            (448, 4096, 4096),
-            (224, 4096, 12288),
-            (224, 6144, 4096),
-            (223, 4096, 4096),
+            (63, 24576, 4096),
+            (2049, 24576, 4096),
+            (513, 4096, 12288),
+            (192, 6144, 4096),
+            (641, 6144, 4096),
+            (1023, 6144, 4096),
+            (127, 4096, 4096),
+            (224, 512, 256),
         ):
             with (
                 self.subTest(m=m, n=n, k=k),
@@ -240,6 +250,38 @@ class TestSm120Bf16Linear(CustomTestCase):
                 torch.cuda.synchronize()
                 self.assertLessEqual(torch.cuda.memory_allocated(), before)
                 self.assertFalse(method._gemm._warmed)
+
+    @torch.inference_mode()
+    def test_range_interiors_execute_real_backends_with_bf16_parity(self):
+        # Odd lengths must not silently fall back to the former M224/M448
+        # whitelist. Check real execution as well as the FP64 error gate.
+        for m, n, k, backend in (
+            (65, 24576, 4096, linear_bf16_quack),
+            (511, 4096, 12288, linear_bf16_quack),
+            (193, 6144, 4096, linear_bf16_quack),
+            (385, 6144, 4096, linear_bf16_cublaslt),
+            (449, 6144, 4096, linear_bf16_quack),
+            (1025, 6144, 4096, linear_bf16_quack),
+            (129, 4096, 4096, linear_bf16_quack),
+            (2047, 4096, 4096, linear_bf16_quack),
+        ):
+            with (
+                self.subTest(m=m, n=n, k=k),
+                self.context(),
+                patch(
+                    "sglang.multimodal_gen.runtime.models.dits.cosmos3video._sm120_gemm_device_supported",
+                    return_value=True,
+                ),
+            ):
+                x, layer = self.inputs(n=n, k=k, m=m)
+                method = _Sm120LinearMethod()
+                out = method.apply(layer, x)
+                self.assertIn((backend, x.device.index, m, n, k), method._gemm._warmed)
+                assert_error_no_worse_than_reference(
+                    reference_fp64=F.linear(x.double(), layer.weight.double()),
+                    baseline=F.linear(x, layer.weight),
+                    candidate=out,
+                )
 
 
 if __name__ == "__main__":

@@ -73,24 +73,20 @@ def test_nan_inf_and_zero_propagation(backend, n):
 @torch.inference_mode()
 def test_graphs_captured_on_one_stream_replay_independently(backend, n):
     from flashinfer.autotuner import AutoTuner, autotune
-    from flashinfer.gemm import gemm_base
 
     capture_stream = torch.cuda.Stream()
     states = []
     scratch = []
     tactics = []
-    dispatch = gemm_base.bf16_gemm_sm100
     tuner = AutoTuner.get()
     choose_one = tuner.choose_one
 
     def record_tactic(*args, **kwargs):
+        inputs = kwargs["inputs"] if "inputs" in kwargs else args[3]
+        scratch.append(inputs[5].data_ptr())
         runner, tactic = choose_one(*args, **kwargs)
         tactics.append(tactic)
         return runner, tactic
-
-    def record_scratch(*args, **kwargs):
-        scratch.append(args[5].data_ptr())
-        return dispatch(*args, **kwargs)
 
     # The same capture stream must not cause two graphs to share mutable scratch.
     with torch.cuda.stream(capture_stream):
@@ -100,10 +96,7 @@ def test_graphs_captured_on_one_stream_replay_independently(backend, n):
                 backend(x, w)
             capture_stream.synchronize()
             graph = torch.cuda.CUDAGraph()
-            with (
-                patch.object(gemm_base, "bf16_gemm_sm100", record_scratch),
-                patch.object(tuner, "choose_one", record_tactic),
-            ):
+            with patch.object(tuner, "choose_one", record_tactic):
                 with torch.cuda.graph(graph, stream=capture_stream):
                     out = backend(x, w)
             states.append((torch.cuda.Stream(), graph, x, w, out))
@@ -186,6 +179,33 @@ def test_backend_warmup_is_independent_for_same_shape():
             torch.testing.assert_close(
                 out.float(), F.linear(x.float(), w.float()), rtol=0.02, atol=0.03
             )
+
+
+@torch.inference_mode()
+def test_cublaslt_profiles_exact_m_when_shapes_are_interleaved():
+    # cuBLASLt tactic indices refer to per-shape algorithm lists. Bucketed
+    # tuning reused a different M's index and doubled QKV latency after warmup.
+    from flashinfer.gemm.gemm_base import get_mm_bf16_cublaslt_module
+
+    runner = get_mm_bf16_cublaslt_module().cublaslt_bf16_gemm_runner()
+    get_tactics = runner.get_valid_tactics
+    profiled_m = set()
+
+    def record_profile(inputs, profile):
+        profiled_m.add(inputs[0].shape[0])
+        return get_tactics(inputs, profile)
+
+    op = Sm120Bf16Linear()
+    with patch.object(runner, "get_valid_tactics", side_effect=record_profile):
+        for m in (129, 193, 129):
+            x, w = inputs(m, 768, 256)
+            out = op(x, w, backend=linear_bf16_cublaslt)
+            assert_error_no_worse_than_reference(
+                reference_fp64=F.linear(x.double(), w.double()),
+                baseline=F.linear(x, w),
+                candidate=out,
+            )
+    assert profiled_m == {129, 193}
 
 
 if __name__ == "__main__":
