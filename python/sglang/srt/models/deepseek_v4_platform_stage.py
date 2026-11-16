@@ -461,16 +461,18 @@ class NonCudaDecoderMixin:
     def op_gather_a(self, state):
         local = state.pop("hidden_states_mlp_input")
         state.do_shared_local = shared_expert_runs_locally(self.mlp)
-        state.global_hidden, state.gather_event, state.shared_local = (
-            _tbo_gather_moe_input(
-                self.mlp,
-                local,
-                state.forward_batch,
-                state.tbo_subbatch_index,
-                state.do_shared_local,
-            )
+        (
+            state.global_hidden,
+            state.gather_event,
+            state.shared_local,
+            state.gather_keepalive,
+        ) = _tbo_gather_moe_input(
+            self.mlp,
+            local,
+            state.forward_batch,
+            state.tbo_subbatch_index,
+            state.do_shared_local,
         )
-        state.gather_keepalive = local
 
     def op_gather_b(self, state):
         torch.cuda.current_stream().wait_event(state.pop("gather_event"))
@@ -486,7 +488,7 @@ class NonCudaDecoderMixin:
     def op_combine_a(self, state):
         output = state.pop("global_expert_out")
         state.local_out, state.combine_event = _tbo_combine_moe_output(
-            output, state.tbo_subbatch_index
+            output, state.forward_batch, state.tbo_subbatch_index
         )
         state.combine_keepalive = output
 

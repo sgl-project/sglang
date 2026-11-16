@@ -25,7 +25,7 @@ from unittest.mock import MagicMock, patch
 
 import sglang._apple_silicon_memory as apple_mem
 import sglang._platform_stubs as mps_stub
-from sglang.srt.utils.common import get_available_gpu_memory
+from sglang.srt.utils.device import get_available_gpu_memory
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 

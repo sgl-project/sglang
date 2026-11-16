@@ -290,7 +290,7 @@ def get_device_properties(device: Any = 0) -> _MPSDeviceProperties:  # noqa: ARG
         # to recommendedMaxWorkingSetSize (~65-75% of RAM). Advertising the
         # full RAM size lets callers overcommit the GPU working set (#21443).
         # The helper asks the active Apple Silicon runtime (MLX or torch-MPS)
-        # and falls back to total system RAM when the limit is unknown.
+        # and rejects an unknown working-set limit.
         from sglang._apple_silicon_memory import apple_gpu_total_memory
 
         _cached_props = _MPSDeviceProperties(

@@ -1,8 +1,11 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.arg_groups.speculative_hook import (
+    _publish_dspark_mla_draft_backend,
+    _reject_dflash_sliding_mla_draft_window,
     _resolve_dflash_draft_attention_backend,
 )
 from sglang.srt.platforms.interface import SRTPlatform
@@ -10,7 +13,7 @@ from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 HOOK_MODULE = "sglang.srt.arg_groups.speculative_hook"
 
@@ -103,6 +106,98 @@ class TestOOTDFlashHooks(CustomTestCase):
                 self.assertRaisesRegex(ValueError, error),
             ):
                 self._resolve_backend(None, platform)
+
+
+class TestDFlashDraftBackendResolution(CustomTestCase):
+    """MLA drafts fall back to the default MLA draft backend."""
+
+    def _resolve(
+        self,
+        draft_backend,
+        *,
+        mla,
+        target_backend="fa3",
+        resolver=_resolve_dflash_draft_attention_backend,
+    ):
+        args = _make_dflash_args(draft_backend)
+        platform = Mock(spec=SRTPlatform)
+        platform.is_out_of_tree.return_value = False
+        config = SimpleNamespace(
+            num_hidden_layers=1,
+            is_causal=True,
+            dflash_config={"attention_mode": "mla" if mla else "gqa"},
+        )
+        with (
+            patch(f"{HOOK_MODULE}.current_platform", platform),
+            patch(
+                f"{HOOK_MODULE}.get_platform",
+                return_value=SimpleNamespace(is_xpu=False, is_hip=False, is_sm100=True),
+            ),
+            patch(
+                f"{HOOK_MODULE}.attention_backends_of",
+                return_value=(target_backend, target_backend),
+            ),
+            patch(
+                "sglang.srt.hf_transformers.get_config",
+                return_value=config,
+            ),
+        ):
+            resolver(args)
+        return resolution_result(args, "speculative_draft_attention_backend")
+
+    def test_mla_drafts_take_the_default_mla_backend(self):
+        # On SM100 a non-MLA draft leaving trtllm_mha goes to fa4 instead.
+        self.assertEqual(self._resolve("trtllm_mha", mla=True), "flashinfer")
+        # The trtllm-gen MLA decode kernel has no bidirectional mask.
+        self.assertEqual(
+            self._resolve(None, mla=True, target_backend="trtllm_mla"), "flashinfer"
+        )
+        self.assertEqual(self._resolve("trtllm_mha", mla=False), "trtllm_mha")
+
+    def test_mla_dspark_draft_publishes_its_fallback(self):
+        """The KV planners read the published draft backend, so an MLA DSpark
+        draft that would inherit trtllm_mha must publish flashinfer."""
+        for mla, expected in ((True, "flashinfer"), (False, None)):
+            self.assertEqual(
+                self._resolve(
+                    None,
+                    mla=mla,
+                    target_backend="trtllm_mha",
+                    resolver=lambda args, mla=mla: _publish_dspark_mla_draft_backend(
+                        args, SimpleNamespace(is_mla=mla)
+                    ),
+                ),
+                expected,
+            )
+
+
+def _mla_draft(layer_types, sliding_window=None):
+    return {
+        "num_hidden_layers": len(layer_types),
+        "dflash_config": {"attention_mode": "mla"},
+        "layer_types": list(layer_types),
+        "sliding_window": sliding_window,
+    }
+
+
+class TestRejectDflashSlidingMlaDraftWindow(CustomTestCase):
+    def _check(self, draft_backend, window_size, draft_cfg):
+        args = ServerArgs(
+            model_path="dummy",
+            speculative_algorithm="DFLASH",
+            speculative_draft_model_path="draft",
+            speculative_num_draft_tokens=8,
+            speculative_draft_window_size=window_size,
+            speculative_draft_attention_backend=draft_backend,
+        )
+        with patch(f"{HOOK_MODULE}._load_draft_hf_config", return_value=draft_cfg):
+            _reject_dflash_sliding_mla_draft_window(args)
+
+    def test_any_sliding_layer_rejects_the_flag(self):
+        mixed = _mla_draft(["sliding_attention", "full_attention"], 1024)
+        with self.assertRaises(ValueError):
+            self._check("cutedsl_mla", 1024, mixed)
+        self._check("cutedsl_mla", 1024, _mla_draft(["full_attention"] * 7))
 
 
 if __name__ == "__main__":

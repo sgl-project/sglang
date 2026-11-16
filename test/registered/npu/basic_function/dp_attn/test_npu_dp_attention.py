@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 import requests
 
@@ -9,7 +10,6 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 )
 from sglang.test.ascend.npu_eval_accuracy_kit import NPUGSM8KMixin
 from sglang.test.ascend.test_ascend_utils import (
-    IMAGES_EXAMPLE_PATH,
     KIMI_VL_A3B_INSTRUCT_WEIGHTS_PATH,
     QWEN3_32B_WEIGHTS_PATH,
 )
@@ -29,7 +29,7 @@ register_npu_ci(
     est_time=400,
     suite="base-b-test-4-npu-a3",
 )
-register_npu_ci(est_time=2400, suite="nightly-4-npu-a3", nightly=True)
+register_npu_ci(est_time=2700, suite="nightly-4-npu-a3", nightly=True)
 
 
 class TestDPAttentionDP2TP2(
@@ -45,9 +45,7 @@ class TestDPAttentionDP2TP2(
     def setUpClass(cls):
         cls.model = QWEN3_32B_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls._env_override = envs.SGLANG_DISABLE_CONSECUTIVE_PREFILL_OVERLAP.override(
-            True
-        )
+        cls._env_override = envs.SGLANG_DISABLE_OVERLAP_AFTER_PREFILL.override(True)
         cls._env_override.__enter__()
         cls.process = popen_launch_server(
             cls.model,
@@ -81,6 +79,9 @@ class TestDPAttentionMixedChunk(
     # with (4-shot chat, temperature 1.0).
     gsm8k_accuracy_thres = 0.83
     gsm8k_backend = "evalscope"
+    # One full-dataset evalscope pass takes ~32 min, so cap at one re-run
+    # (2 passes ~= 55 min) to stay inside the per-file CI timeout.
+    gsm8k_max_attempts = 2
 
     @classmethod
     def setUpClass(cls):
@@ -155,7 +156,9 @@ class TestDPAttentionDP2TP2VLM(CustomTestCase):
     def setUpClass(cls):
         cls.model = KIMI_VL_A3B_INSTRUCT_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.image_url = IMAGES_EXAMPLE_PATH
+        cls.image_url = str(
+            Path(__file__).resolve().parents[5] / "examples/assets/example_image.png"
+        )
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,

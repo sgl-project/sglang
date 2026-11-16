@@ -9,10 +9,10 @@ from sglang.kernels.ops.attention.dsa.fp8_fused_writer_hip import (
     fused_fp8_writer_geometry_supported,
     prepare_aiter_rope_caches,
 )
-from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=2, suite="stage-a-test-cpu-amd")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class TestFusedFp8WriterHip(CustomTestCase):

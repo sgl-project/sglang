@@ -99,7 +99,7 @@ void rel_proj_small_t(
   auto D = SymbolicSize{"d_rel"};
   auto E = SymbolicSize{"e"};
   auto dev = SymbolicDevice{};
-  dev.set_options<kDLCUDA>();
+  dev.set_options<kDLGPU>();
 
   TensorMatcher({T, H, D}).with_dtype<bf16_t>().with_device(dev).with_strides({-1, D, 1}).verify(r);
   TensorMatcher({D, E}).with_dtype<bf16_t>().with_device(dev).verify(proj);
