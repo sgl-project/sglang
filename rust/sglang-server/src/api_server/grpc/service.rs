@@ -719,6 +719,78 @@ mod tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn first_output_timeout_returns_deadline_exceeded_and_aborts() {
+        let harness = Harness::new(1, false, Duration::from_secs(1));
+        let mut stream = harness
+            .service
+            .generate(Request::new(ids_request(&[1], Some("no-first-output"))))
+            .await
+            .unwrap()
+            .into_inner();
+        let intake = harness.next_generation().await;
+        assert!(intake.admission.try_accept());
+        let next = tokio::spawn(async move {
+            let result = stream.next().await;
+            (result, stream)
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            next.is_finished(),
+            "initial response bypassed the configured timeout"
+        );
+        let (result, stream) = next.await.unwrap();
+        assert_eq!(result.unwrap().unwrap_err().code(), Code::DeadlineExceeded);
+        drop(stream);
+        assert_eq!(
+            harness.abort_rx.recv_async().await.unwrap().rid(),
+            &intake.rid
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batch_first_output_timeout_cancels_waiting_sibling() {
+        let harness = Harness::new(2, false, Duration::from_secs(1));
+        let mut stream = harness
+            .service
+            .generate(Request::new(api::GenerateRequest {
+                text: Some(many_strings(&["ready", "waiting"])),
+                stream: Some(true),
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let first = harness.next_generation().await;
+        let second = harness.next_generation().await;
+        assert!(first.admission.try_accept());
+        assert!(second.admission.try_accept());
+        first
+            .sink
+            .try_send(ResponseItem::Done(chunk(&first.rid, "ok", 1, true)))
+            .unwrap();
+        let next = tokio::spawn(async move {
+            let result = stream.next().await;
+            (result, stream)
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::task::yield_now().await;
+        assert!(
+            next.is_finished(),
+            "one pending child bypassed the batch timeout"
+        );
+        let (result, stream) = next.await.unwrap();
+        assert_eq!(result.unwrap().unwrap_err().code(), Code::DeadlineExceeded);
+        drop(stream);
+        assert_eq!(
+            harness.abort_rx.recv_async().await.unwrap().rid(),
+            &second.rid
+        );
+    }
+
     #[tokio::test]
     async fn per_chunk_timeout_after_progress_returns_deadline_exceeded_and_aborts() {
         let harness = Harness::new(1, false, Duration::from_millis(10));
