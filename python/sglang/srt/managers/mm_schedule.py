@@ -470,7 +470,9 @@ def _get_chunked_embedding_full(
     )
     rows = _find_prefill_rows(key=rows_key, chunk_start=extend_prefix_len)
     embedding_per_req = (
-        rows.result if rows is not None else embedding_cache.get(item_hashes)
+        rows.result
+        if rows is not None
+        else embedding_cache.get(item_hashes, combined_hash=embedding_items_hash)
     )
 
     # A compact feature hash can collide for inputs with different token

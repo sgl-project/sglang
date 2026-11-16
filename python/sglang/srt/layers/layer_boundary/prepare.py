@@ -13,6 +13,7 @@
 # ==============================================================================
 """Complete pending output, update the residual, and read the consumer input."""
 
+from functools import partial
 from typing import Callable, Optional, Tuple, Union
 
 import torch
@@ -40,7 +41,7 @@ from sglang.srt.layers.layer_boundary.adapters.attention import (
     get_attn_tp_context,
     tp_gather,
 )
-from sglang.srt.layers.layer_boundary.contracts import ReadoutFusion
+from sglang.srt.layers.layer_boundary.contracts import EntryPath, ReadoutFusion
 from sglang.srt.layers.layer_boundary.layout import (
     SumGroup,
     _cp_shard_token_rows,
@@ -193,11 +194,13 @@ def _reduce_update_read_dp_gather(
     group: SumGroup = SumGroup.ATTN_TP,
     read: ResidualReadout = NORM_READOUT,
     update: ResidualUpdate = PLAIN_ADD,
+    quant_format: str = "",
 ):
     """Attention DP: complete the attention-TP sum if it is owed, write the
     output into the residual and read the FFN input locally, then gather. With
     ``places_cp_shards`` each CP rank puts its shard of the DP group's tokens
     beside the others' in the group's slot."""
+    _no_quantized_read(quant_format, "_reduce_update_read_dp_gather")
     if gathers_residual:
         residual = update.gather_residual_attn_tp(residual)
     if hidden_states.shape[0] != 0:
@@ -236,10 +239,12 @@ def _dp_gather_sum_read(
     places_cp_shards: bool = False,
     read: ResidualReadout = NORM_READOUT,
     update: ResidualUpdate = PLAIN_ADD,
+    quant_format: str = "",
 ):
     """Attention DP: one rank adds the residual, the gather sums it, then read
     the input from the sum. With ``places_cp_shards`` each CP rank puts its
     shard of the DP group's tokens beside the others' in the group's slot."""
+    _no_quantized_read(quant_format, "_dp_gather_sum_read")
     if gathers_residual:
         residual = attn_tp_gather(residual)
     if get_parallel().attn_tp_rank == 0:
@@ -470,11 +475,13 @@ def _attn_tp_reduce_scatter_update_read(
     read_fusion_indices: Tuple[int, ...] = (),
     read: ResidualReadout = NORM_READOUT,
     update: ResidualUpdate = PLAIN_ADD,
+    quant_format: str = "",
 ):
     """Complete the attention-TP sum onto this rank's slice, slice the residual
     the same way, then write the output into it and read the input; the first
     of the read's ``read_fusions`` that takes the batch does all of this
     instead."""
+    _no_quantized_read(quant_format, "_attn_tp_reduce_scatter_update_read")
     result = _run_read_fusions(
         read_fusions,
         hidden_states,
@@ -503,7 +510,9 @@ def _attn_tp_slice_update_read(
     scatters_residual: bool,
     read: ResidualReadout = NORM_READOUT,
     update: ResidualUpdate = PLAIN_ADD,
+    quant_format: str = "",
 ):
+    _no_quantized_read(quant_format, "_attn_tp_slice_update_read")
     hidden_states = attn_tp_slice(hidden_states).clone()
     if scatters_residual and residual is not None:
         residual = update.slice_residual_attn_tp(residual)
@@ -520,11 +529,13 @@ def _tp_reduce_scatter_update_read_gather(
     reduces: bool = True,
     read: ResidualReadout,
     update: ResidualUpdate,
+    quant_format: str = "",
 ):
     """The residual stays on each rank's slice while the FFN takes the full
     rows: reduce-scatter the attention output onto the slice, which completes
     its sum, write it into the residual and read the FFN input there, then
     gather the input back into the attention output's rows."""
+    _no_quantized_read(quant_format, "_tp_reduce_scatter_update_read_gather")
     parallel = get_parallel()
     if hidden_states.shape[0] == 0:
         return hidden_states, hidden_states
@@ -547,7 +558,9 @@ def _tp_sum_with_residual_read(
     cache=None,
     read: ResidualReadout = NORM_READOUT,
     update: ResidualUpdate = PLAIN_ADD,
+    quant_format: str = "",
 ):
+    _no_quantized_read(quant_format, "_tp_sum_with_residual_read")
     return _tp_all_reduce_with_scattered_residual(hidden_states, residual, norm, read)
 
 
@@ -621,3 +634,32 @@ def _tp_all_reduce_with_scattered_residual(
     scattered_states += residual
     residual = tensor_model_parallel_all_reduce(hidden_states)
     return read.read(residual, norm)
+
+
+def _no_quantized_read(quant_format: str, step: str) -> None:
+    # Only the steps in _QUANTIZED_READ_STEPS hand on a quantized read.
+    if quant_format:
+        raise NotImplementedError(
+            f"{step} cannot read a quantized input ({quant_format=})"
+        )
+
+
+# The steps whose read is the last thing they do, on the rows the stage
+# computes: only they may quantize the input for the stage's first projection.
+_QUANTIZED_READ_STEPS = (_reduce_update_read, _update_read)
+
+
+def reads_quantized(entry: EntryPath) -> bool:
+    """Whether every step ``entry`` may run takes ``quant_format``, with no
+    move of the input after it."""
+    if entry.input_move is not None or not isinstance(entry.prepare, partial):
+        return False
+    steps = (
+        entry.prepare.keywords.get(name)
+        for name in ("step", "completed_step", "written_step")
+    )
+    return all(
+        step is None
+        or (isinstance(step, partial) and step.func in _QUANTIZED_READ_STEPS)
+        for step in steps
+    )

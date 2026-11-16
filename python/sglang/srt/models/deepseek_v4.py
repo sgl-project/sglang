@@ -82,6 +82,7 @@ from sglang.srt.layers.attention.graph_utils import (
 from sglang.srt.layers.aux_hidden_states import AuxHiddenStatePacker
 from sglang.srt.layers.cp.cp_decode_attn_tp import get_cp_decode_attn_tp_ctx
 from sglang.srt.layers.cp.utils import (
+    cp_gather_after_forward,
     cp_gather_full_sequence_states,
     cp_materialize_global_token_order,
     is_cp_active,
@@ -148,6 +149,11 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
+from sglang.srt.model_executor.model_interfaces import (
+    CPBoundedTailLogits,
+    CPLogitsInputs,
+    LanguageModelInputPreparation,
+)
 from sglang.srt.model_executor.runner import (
     compile_in_capture_mode,
     get_is_capture_mode,
@@ -934,7 +940,8 @@ def _low_ratio_sources_break(attn_backend, forward_batch) -> bool:
         forward_batch.forward_mode.is_extend()
         and is_in_breakable_cuda_graph()
         and (
-            not getattr(attn_backend, "low_ratio_prefill_graph", False)
+            is_cp_active(forward_batch)
+            or not getattr(attn_backend, "low_ratio_prefill_graph", False)
             or in_replay_tail_graph()
         )
     )
@@ -1010,6 +1017,7 @@ class MqaAttentionBase(nn.Module):
     # Class-level defaults for subclasses that read them without running __init__.
     wo_a_fp8: bool = False
     wo_a_fp8_block128: bool = False
+    use_mega_attention: bool = False
 
     def __init__(
         self,
@@ -1344,6 +1352,9 @@ class MqaAttentionBase(nn.Module):
     @contextmanager
     def maybe_use_decode_attn_tp(self, forward_batch: ForwardBatch):
         ctx = get_cp_decode_attn_tp_ctx()
+        if not ctx.is_enabled:
+            yield
+            return
         attn = self.attn_mqa if isinstance(self, MQALayer) else self.attn
         with ctx.maybe_use_decode_attn_tp(
             forward_batch,
@@ -1377,7 +1388,6 @@ class MqaAttentionBase(nn.Module):
 
 class MQALayer(MqaAttentionBase):
     is_dsv41: bool = False
-    use_mega_attention: bool = False
 
     def __init__(
         self,
@@ -1636,7 +1646,10 @@ class MQALayer(MqaAttentionBase):
         if forward_batch.forward_mode.is_idle():
             return q.new_zeros(q.shape[0], self.n_local_groups, self.o_lora_rank)
         if not self.mega_wq_b_permuted:
-            q = pack_query(q, kernel_num_heads)
+            out = attn_backend.packed_query_buffer(
+                rows=q.shape[0], padded_heads=kernel_num_heads, dtype=q.dtype
+            )
+            q = pack_query(q, kernel_num_heads, out=out)
         if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
             rows = q.shape[0]
             if self._mega_mxfp8_output(rows):
@@ -1670,6 +1683,7 @@ class MQALayer(MqaAttentionBase):
         out: Optional[torch.Tensor | Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor | Tuple[torch.Tensor, torch.Tensor]:
         """``out`` is a bf16 tensor or an (fp8, DeepGEMM-packed scale) pair."""
+        mhc.run_deferred_attn_stats_fork()
         data, scale = attn_backend.forward(
             q=q,
             k=q,
@@ -3378,7 +3392,11 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
         if (
             self.hc_pre_from_prev_sublayer
-            and (get_platform().is_sm100 or get_platform().is_sm90)
+            and (
+                get_platform().is_sm100
+                or get_platform().is_sm90
+                or get_platform().is_sm120
+            )
             and self.hc_attn_fn.shape == (24, 20480)
             and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
             and getattr(self.config, "model_type", None) == "deepseek_v41"
@@ -3386,8 +3404,11 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         ):
             from sglang.kernels.ops.layernorm.mhc import split_bf16_hc_weight
 
-            if get_platform().is_sm90:
+            if get_platform().is_sm90 or get_platform().is_sm120:
                 # Hopper's compensated projection does not require DeepGEMM.
+                # SM120 takes the same pure-Triton route: the tf32 branch below
+                # is less accurate on this card, and it builds parts at every
+                # row count.
                 self._hc_attn_bf16_parts = split_bf16_hc_weight(self.hc_attn_fn.data)
                 self._hc_ffn_bf16_parts = split_bf16_hc_weight(self.hc_ffn_fn.data)
             else:
@@ -4122,11 +4143,17 @@ class DeepseekV4Model(nn.Module):
         )
         if self.engram_hasher is not None:
             if cp_extend:
-                # n-gram hashing needs each token's predecessors: hash the whole prompt
+                # N-gram hashing needs each token's predecessors, so hash the
+                # whole prompt before selecting this CP rank's interleaved rows.
                 total = int(forward_batch.attn_cp_metadata.total_seq_lens)
-                hash_ids = self.engram_hasher(
-                    forward_batch.input_ids[:total], forward_batch
-                )
+                global_input_ids = forward_batch.input_ids[:total]
+                if is_in_breakable_cuda_graph():
+                    hash_ids = self.engram_hasher.new_hash_ids(global_input_ids)
+                    bcg_deepseek_v4_engram_hash_ids(
+                        self.engram_hasher, global_input_ids, hash_ids
+                    )
+                else:
+                    hash_ids = self.engram_hasher(global_input_ids, forward_batch)
                 parallel = get_parallel()
                 hash_ids = hash_ids[parallel.attn_cp_rank :: parallel.attn_cp_size]
                 pad_rows = hidden_states.shape[0] - hash_ids.shape[0]
@@ -4178,7 +4205,6 @@ class DeepseekV4Model(nn.Module):
                 forward_batch=forward_batch,
                 num_tokens=input_ids.shape[0],
                 tail_in_graph=tail_in_graph,
-                late_dp_counts=late_dp_counts,
             )
         saved_full = None
         # The HIP defer_post gate excludes residual readers. CUDA materializes
@@ -4533,7 +4559,7 @@ class DeepseekV4Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         forward_batch: ForwardBatch,
-        input_embeds: Optional[torch.Tensor],
+        input_embeds: Optional[torch.Tensor] = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
         if not _is_cuda:
@@ -4732,10 +4758,11 @@ class DeepseekV4Model(nn.Module):
             )
         hidden_states = self.norm(hidden_states)
 
-        # CUDA prefill CP: the runner gathers every output, DSpark captures
-        # included, by this rank's full shard layout, so the tail rows go back
-        # into that layout before the gather.
-        cuda_cp_tail = _needs_cp_tail_scatter(tail, forward_batch)
+        # DSpark's model-boundary hook gathers compact tail rows. Other CP
+        # outputs are gathered with this rank's full shard layout.
+        cuda_cp_tail = not capture_dspark and _needs_cp_tail_scatter(
+            tail, forward_batch
+        )
         num_tokens = input_ids.shape[0]
         if tail is not None and (not capture_dspark or cuda_cp_tail):
             # The logits processor indexes rows by the full extend layout.
@@ -4773,7 +4800,14 @@ def _is_quark_checkpoint(config: DeepSeekV4Config) -> bool:
     return quantization_config.get("quant_method") == "quark"
 
 
-class DeepseekV4ForCausalLM(nn.Module):
+def _v41_vision_a2a_supported() -> bool:
+    backend = get_moe_a2a_backend()
+    return backend.is_none() or (_is_cuda and backend.is_megamoe())
+
+
+class DeepseekV4ForCausalLM(
+    nn.Module, LanguageModelInputPreparation, CPBoundedTailLogits
+):
     supports_cuda_vmm_feature_transport = True
 
     @classmethod
@@ -4825,15 +4859,11 @@ class DeepseekV4ForCausalLM(nn.Module):
             and not getattr(config, "language_model_only", False)
         ):
             if (
-                get_parallel().attn_cp_size != 1
-                or get_parallel().pp_group.world_size != 1
-                or not (
-                    get_moe_a2a_backend().is_none()
-                    or (_is_cuda and get_moe_a2a_backend().is_megamoe())
-                )
+                get_parallel().pp_group.world_size != 1
+                or not _v41_vision_a2a_supported()
             ):
                 raise ValueError(
-                    "V4.1 vision supports TP/EP/DP without CP or PP; "
+                    "V4.1 vision supports TP/EP/DP and prefill CP without PP; "
                     "MoE A2A requires CUDA MegaMoE"
                 )
 
@@ -5041,6 +5071,25 @@ class DeepseekV4ForCausalLM(nn.Module):
         """Shared experts fused as routed slots when fusion is on."""
         return hf_config.n_shared_experts or 0
 
+    def prepare_cp_logits_inputs(
+        self, input_ids: torch.Tensor, forward_batch: ForwardBatch
+    ) -> CPLogitsInputs:
+        if not (
+            self.capture_aux_hidden_states
+            and self.model.late_layer_start is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return CPLogitsInputs(input_ids, forward_batch)
+
+        tail = get_attn_backend().tail_forward_metadata.late_layer_tail
+        if tail is None:
+            raise RuntimeError("CP bounded-tail logits require prepared tail metadata")
+        logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
+        logits_metadata.extend_seq_lens = tail.extend_seq_lens
+        logits_metadata.extend_seq_lens_cpu = tail.extend_seq_lens_cpu
+        logits_metadata.extend_logprob_start_lens_cpu = tail.extend_seq_lens_cpu
+        return CPLogitsInputs(tail.rows(input_ids), logits_metadata, tail.token_indices)
+
     def prepare_language_model_inputs(
         self,
         input_ids: torch.Tensor,
@@ -5092,26 +5141,74 @@ class DeepseekV4ForCausalLM(nn.Module):
         if not self.pp_group.is_last_rank:
             return hidden_states
 
+        return self._postprocess_output(hidden_states, input_ids, forward_batch)
+
+    def _get_dspark_prefill_tail(self, forward_batch):
+        if (
+            self.capture_aux_hidden_states
+            and self.model.late_layer_start is not None
+            and forward_batch.forward_mode.is_extend_without_speculative()
+        ):
+            return get_attn_backend().tail_forward_metadata.late_layer_tail
+        return None
+
+    def postprocess_cp_output(self, hidden_states, forward_batch):
+        """Gather the model's output layout before logits and DSpark KV injection."""
+        tail = self._get_dspark_prefill_tail(forward_batch)
+        full_cp_metadata = forward_batch.attn_cp_metadata
+        if tail is not None:
+            if tail.cp_metadata is None or tail.global_token_indices is None:
+                raise RuntimeError(
+                    "CP bounded replay output is missing its tail layout"
+                )
+            forward_batch.attn_cp_metadata = tail.cp_metadata
+        try:
+            aux_hidden_states = None
+            if self.capture_aux_hidden_states:
+                hidden_states, aux_hidden_states = hidden_states
+            stream = torch.cuda.current_stream()
+            hidden_states = cp_gather_after_forward(
+                hidden_states, forward_batch, stream
+            )
+            if aux_hidden_states is not None:
+                aux_hidden_states = cp_gather_after_forward(
+                    aux_hidden_states, forward_batch, stream
+                )
+        finally:
+            forward_batch.attn_cp_metadata = full_cp_metadata
+        if self.capture_aux_hidden_states:
+            hidden_states = hidden_states, aux_hidden_states
+        return self._postprocess_output(
+            hidden_states, forward_batch.input_ids, forward_batch
+        )
+
+    def _postprocess_output(self, hidden_states, input_ids, forward_batch):
         aux_hidden_states = None
         if self.capture_aux_hidden_states:
             hidden_states, aux_hidden_states = hidden_states
         hidden_states, pre_hc_head = hidden_states
 
         logits_metadata = forward_batch
-        tail = None
-        if (
-            self.capture_aux_hidden_states
-            and self.model.late_layer_start is not None
-            and forward_batch.forward_mode.is_extend_without_speculative()
-        ):
-            tail = get_attn_backend().tail_forward_metadata.late_layer_tail
-            input_ids = tail.rows(input_ids)
+        tail = self._get_dspark_prefill_tail(forward_batch)
+        token_indices = None
+        if tail is not None:
+            # CP output has been gathered into compact global request order.
+            # Ordinary prefill retains the rank-local/graph tail selector.
+            token_indices = tail.global_token_indices
+            input_ids = (
+                input_ids[token_indices]
+                if token_indices is not None
+                else tail.rows(input_ids)
+            )
+            if token_indices is None:
+                token_indices = tail.token_indices
             if tail.real_rows_count is not None:
                 # Fixed-capacity tail block from the prefill CUDA graph: drop padding.
                 n = tail.real_rows_count
                 input_ids = input_ids[:n]
                 hidden_states = hidden_states[:n]
                 pre_hc_head = pre_hc_head[:n]
+                token_indices = token_indices[:n]
                 if aux_hidden_states is not None:
                     aux_hidden_states = aux_hidden_states[:n]
             logits_metadata = LogitsMetadata.from_forward_batch(forward_batch)
@@ -5142,11 +5239,7 @@ class DeepseekV4ForCausalLM(nn.Module):
             ),
         )
         if tail is not None:
-            output.hidden_states_token_indices = (
-                tail.token_indices[: tail.real_rows_count]
-                if tail.real_rows_count is not None
-                else tail.token_indices
-            )
+            output.hidden_states_token_indices = token_indices
         return output
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
