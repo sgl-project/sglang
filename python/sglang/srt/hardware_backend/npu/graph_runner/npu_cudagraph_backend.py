@@ -12,11 +12,13 @@ non-NPU hosts.
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
+import weakref
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
-from functools import partial
+from functools import cache, cached_property, partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
@@ -31,6 +33,7 @@ from sglang.srt.distributed.device_communicators.pynccl_allocator import (
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.hardware_backend.npu.attention.dcp import get_mla_dcp_backend
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.base_graph_backend import (
     BaseGraphBackend,
@@ -47,6 +50,75 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
+
+# CANN defines separate flags for event creation and recording in acl_rt.h.
+ACL_EVENT_SYNC = 0x01  # Cross-stream synchronization.
+ACL_EVENT_RECORD_EXTERNAL = 0x01  # Make the graph record visible outside the graph.
+
+
+def _call_acl(function, *args):
+    result = function(*args)
+    if result:
+        raise RuntimeError(f"{function.__name__} failed with ACL error {result}")
+
+
+@cache
+def get_npu_shared_read_event_api():
+    """Resolve the optional external-event API once, before graph capture."""
+    try:
+        import acl
+
+        if not hasattr(acl.rt, "create_event_ex_with_flag"):
+            return None
+        function = ctypes.CDLL("libascendcl.so").aclrtRecordEventWithFlag
+    except (AttributeError, ImportError, OSError):
+        return None
+
+    function.argtypes = (ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32)
+    function.restype = ctypes.c_int
+    return acl.rt, function
+
+
+class NPUSharedReadEvent:
+    """Record a graph node that a stream outside the replay can wait on."""
+
+    @classmethod
+    def create(cls, device_module):
+        api = get_npu_shared_read_event_api()
+        if api is None:
+            return None
+        return cls(device_module, *api)
+
+    def __init__(self, device_module, acl_rt, record_event):
+        self._device_module = device_module
+        self._acl_rt = acl_rt
+        self._record_event = record_event
+        self._event, result = self._acl_rt.create_event_ex_with_flag(ACL_EVENT_SYNC)
+        if result:
+            raise RuntimeError(
+                f"create_event_ex_with_flag failed with ACL error {result}"
+            )
+        finalizer = weakref.finalize(
+            self, _call_acl, self._acl_rt.destroy_event, self._event
+        )
+        # CANN owns process-exit cleanup and may shut down before Python finalizers.
+        finalizer.atexit = False
+
+    def record(self, stream=None):
+        if stream is None:
+            stream = self._device_module.current_stream()
+        # Reading npu_stream flushes torch_npu's submission queue before the ACL call.
+        _call_acl(
+            self._record_event,
+            self._event,
+            stream.npu_stream,
+            ACL_EVENT_RECORD_EXTERNAL,
+        )
+
+    def wait(self, stream=None):
+        if stream is None:
+            stream = self._device_module.current_stream()
+        _call_acl(self._acl_rt.stream_wait_event, stream.npu_stream, self._event)
 
 
 class NPUCudaGraphBackend(BaseGraphBackend):
@@ -86,10 +158,18 @@ class NPUCudaGraphBackend(BaseGraphBackend):
         # done reading the host-side seq_lens array before we rewrite it.
         self._rebind_fence = None
 
-    @property
+    @cached_property
     def supports_shared_read_events(self) -> bool:
-        # Preserve the legacy NPUGraphRunner replay behavior.
-        return False
+        runner = self._decode_runner
+        attn = getattr(runner, "attn_backend", None)
+        full = getattr(attn, "full_attn_backend", attn)
+        if not getattr(full, "prepare_in_graph", False):
+            return False
+        # A hybrid runner can only publish once every child has finished its reads.
+        return (
+            attn.shared_read_ends(runner.capture_forward_mode)
+            is SharedReadEnds.IN_REPLAY
+        )
 
     @property
     def cache_loc_dtype(self):
