@@ -32,6 +32,7 @@ from sglang.srt.managers.scheduler_components.output_sender import SenderWrapper
 register_cpu_ci(est_time=35, suite="base-a-test-cpu")
 
 _TEST_CLOCK_DOMAIN = bytes(range(24))
+_WORKER_DONE = "router-delivery-test-done"
 
 
 def _run_child(errors, target, args):
@@ -389,7 +390,12 @@ def _worker(endpoint, ready, result_queue):
     while time.monotonic() < deadline:
         if not poller.poll(100):
             continue
-        objects.append(sock_recv(pull))
+        obj = sock_recv(pull)
+        if isinstance(obj, ConfigureLoggingReq) and obj.log_level == _WORKER_DONE:
+            break
+        objects.append(obj)
+    else:
+        raise TimeoutError("worker did not receive the completion marker")
     result_queue.put(
         {
             "endpoint": endpoint,
@@ -501,6 +507,9 @@ def _delivery_case(pickle_ipc):
             SenderWrapper(push).send_output(
                 AbortReq(rid="legacy", http_worker_ipc="worker-a")
             )
+            # The broadcast marker follows every payload on each router pipe,
+            # so workers can stop without a fixed five-second collection window.
+            SenderWrapper(push).send_output(ConfigureLoggingReq(log_level=_WORKER_DONE))
             router_start.set()
 
             worker_results = [result_queue.get(timeout=8) for _ in workers]
@@ -648,13 +657,19 @@ class TestRouterDeliveryIntegration(CustomTestCase):
                 )
             router.delivery_seconds = _RecordingHistogram(observations)
             original_send = router._send
-            send_count = [0]
+            marker_count = [0]
 
             def send_then_fail(target, message):
                 original_send(target, message)
-                send_count[0] += 1
-                if send_count[0] == 7:
-                    raise RuntimeError("router failed after fanout: " + "X" * 262144)
+                if (
+                    isinstance(message, ConfigureLoggingReq)
+                    and message.log_level == _WORKER_DONE
+                ):
+                    marker_count[0] += 1
+                    if marker_count[0] == len(worker_endpoints):
+                        raise RuntimeError(
+                            "router failed after fanout: " + "X" * 262144
+                        )
 
             router._send = send_then_fail
             ready.set()
@@ -665,8 +680,9 @@ class TestRouterDeliveryIntegration(CustomTestCase):
         with patch(f"{__name__}._router", side_effect=fail_after_fanout):
             with self.assertRaisesRegex(
                 AssertionError, "RuntimeError: router failed after fanout"
-            ):
+            ) as error:
                 _delivery_case(io_struct._USE_PICKLE_IPC)
+            self.assertIn("Child process reported an error", str(error.exception))
 
     def test_worker_late_failure_preserves_traceback(self):
         original_worker = _worker

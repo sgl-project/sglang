@@ -902,6 +902,7 @@ class Scheduler(
             ),
             detokenizer_router_metrics_enabled=(
                 get_observability().enable_metrics
+                and not envs.SGLANG_RUST_SERVER.get()
                 and not self.skip_tokenizer_init
                 and get_serving().detokenizer_worker_num > 1
             ),

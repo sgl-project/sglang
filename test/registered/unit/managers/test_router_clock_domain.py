@@ -25,6 +25,7 @@ from sglang.srt.entrypoints import engine as engine_module
 from sglang.srt.entrypoints.engine import Engine
 from sglang.srt.managers import data_parallel_controller as dp_module
 from sglang.srt.managers import delivery_clock, io_struct
+from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.multi_tokenizer_mixin import MultiDetokenizerRouter
 from sglang.srt.managers.scheduler_components import ipc_channels
@@ -313,6 +314,67 @@ class TestRouterClockDomain(CustomTestCase):
                     side_effect=AssertionError("disabled sender read the clock"),
                 ):
                     channels.send_to_detokenizer.send_output(AbortReq(rid="disabled"))
+
+    def test_rust_server_uses_single_frame_for_local_endpoint(self):
+        ports = _test_port_args("ipc:///detokenizer")
+        for rust_mode in (False, True):
+            for pickle_ipc in (False, True):
+                scheduler = scheduler_module.Scheduler.__new__(
+                    scheduler_module.Scheduler
+                )
+                scheduler.skip_tokenizer_init = False
+                observability = SimpleNamespace(
+                    enable_metrics=True,
+                    enable_metrics_for_all_schedulers=False,
+                    load_snapshot_publish_interval=1.0,
+                )
+                parallel = SimpleNamespace(attn_tp_rank=0, dp_rank=0, num_dp_ranks=1)
+                serving = SimpleNamespace(detokenizer_worker_num=2)
+                socket_mock = MagicMock()
+                with (
+                    self.subTest(rust_mode=rust_mode, pickle_ipc=pickle_ipc),
+                    patch.object(
+                        scheduler_module, "is_scheduler_io_rank", return_value=True
+                    ),
+                    patch.object(
+                        scheduler_module,
+                        "get_observability",
+                        return_value=observability,
+                    ),
+                    patch.object(
+                        scheduler_module, "get_parallel", return_value=parallel
+                    ),
+                    patch.object(scheduler_module, "get_serving", return_value=serving),
+                    patch.object(scheduler_module, "create_load_snapshot_writer"),
+                    patch.object(
+                        scheduler_module.envs.SGLANG_RUST_SERVER,
+                        "get",
+                        return_value=rust_mode,
+                    ),
+                    patch.object(ipc_channels.zmq, "Context"),
+                    patch.object(
+                        ipc_channels, "get_zmq_socket", return_value=socket_mock
+                    ),
+                    patch.object(
+                        ipc_channels, "read_clock_domain", return_value=_DOMAIN
+                    ) as read_domain,
+                    patch.object(io_struct, "_USE_PICKLE_IPC", pickle_ipc),
+                ):
+                    scheduler.init_ipc_channels(ports)
+                    sender = scheduler.ipc_channels.send_to_detokenizer
+                    sender.send_output(AbortReq(rid="rust-mode-framing"))
+                    if rust_mode:
+                        read_domain.assert_not_called()
+                        socket_mock.send_multipart.assert_not_called()
+                        (
+                            socket_mock.send_pyobj if pickle_ipc else socket_mock.send
+                        ).assert_called_once()
+                    else:
+                        read_domain.assert_called_once()
+                        socket_mock.send_multipart.assert_called_once()
+                        self.assertEqual(
+                            len(socket_mock.send_multipart.call_args.args[0]), 2
+                        )
 
 
 class TestClockDomainWire(CustomTestCase):

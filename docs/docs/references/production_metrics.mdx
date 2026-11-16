@@ -9,13 +9,34 @@ An example of the monitoring dashboard is available in [examples/monitoring/graf
 
 ## Scheduler-to-detokenizer-router delivery time
 
-With `--enable-metrics` and more than one detokenizer worker, `sglang:detokenizer_router_delivery_seconds` measures the time from the scheduler's monotonic timestamp taken immediately before payload serialization to the router's monotonic timestamp taken after payload deserialization. It includes serialization, ZMQ send work, IPC queueing, and deserialization.
+When the Python multi-detokenizer router runs with `--enable-metrics`, `sglang:detokenizer_router_delivery_seconds` measures the time from the scheduler's monotonic timestamp taken immediately before payload serialization to the router's monotonic timestamp taken after payload deserialization. It includes serialization, ZMQ send work, IPC queueing, and deserialization.
 
-The router records at most one observation for each scheduler message, before routing, grouping, or control/empty-batch fan-out. It has no request labels. A legacy single-frame message is still routed but has no delivery observation. Metrics-off, single-detokenizer, and `--skip-tokenizer-init` paths retain the original single-frame codec path and do not read a new clock or add a wire frame.
+The router records at most one observation for each scheduler message, before routing, grouping, or control/empty-batch fan-out. It has no request labels. A legacy single-frame message is still routed but has no delivery observation. Metrics-off, single-detokenizer, and `--skip-tokenizer-init` paths retain the original single-frame codec path and do not read a new clock or add a wire frame. Rust-server mode uses an embedded detokenizer instead of this Python router and does not emit this metric.
 
 Monotonic timestamps are comparable only within the same clock domain. On Linux, a timestamped scheduler includes an opaque identity derived from its boot ID and time namespace, and the router records the duration only when that identity matches its own. The native Engine can enable local scheduler candidates even when DP Attention uses a non-loopback TCP endpoint. Remote, unknown, unsupported, or differently namespaced senders remain unobserved; if the identity cannot be read, the scheduler keeps the original single-frame path. The histogram therefore describes only eligible messages, not the entire cluster, and a zero count does not establish that there is no backlog.
 
 Timestamped senders and routers must use the same SGLang wire version: the normal payload is followed by a versioned clock-domain identity and timestamp in one metadata frame, sent atomically for both pickle and msgpack IPC. The metadata frame is 33 bytes, 25 bytes more than the earlier timestamp-only frame. New routers still route legacy single-frame and timestamp-only messages, but cannot observe an unverified timestamp. Older routers do not understand the new metadata frame. This metric is intended to expose scheduler-to-router backlog, not router processing time or downstream detokenizer work.
+
+You can estimate the 99th percentile of sampled delivery time per Prometheus target over five minutes:
+
+```promql
+histogram_quantile(
+  0.99,
+  sum by (job, instance, le) (
+    rate(sglang:detokenizer_router_delivery_seconds_bucket[5m])
+  )
+)
+```
+
+To see the rate of eligible sampled messages:
+
+```promql
+sum by (job, instance) (
+  rate(sglang:detokenizer_router_delivery_seconds_count[5m])
+)
+```
+
+This count excludes unsampled messages, so it does not by itself measure sampling coverage.
 
 ## Language model metrics
 
