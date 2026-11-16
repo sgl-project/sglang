@@ -109,7 +109,7 @@ class FP4RowgroupPrefillWorkspace(NamedTuple):
 
     request_page_table: torch.Tensor
     max_seq_len: int
-    query_start_locs: Dict[Tuple[int, int], torch.Tensor]
+    query_start_locs: Dict[Tuple[int, int, Tuple[int, ...]], torch.Tensor]
 
 
 class FP4KWriteMetadata(NamedTuple):
@@ -362,7 +362,8 @@ def rowgroup_prefill_query_start_loc(
     workspace: FP4RowgroupPrefillWorkspace, rows: slice, rows_per_request: List[int]
 ) -> torch.Tensor:
     """query_start_loc of the consecutive requests rows_per_request scored as rows."""
-    key = (rows.start, rows.stop)
+    # one row span can be split differently when some requests have no rows here
+    key = (rows.start, rows.stop, tuple(rows_per_request))
     query_start_loc = workspace.query_start_locs.get(key)
     if query_start_loc is None:
         query_start_loc = _pinned_int32(

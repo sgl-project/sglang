@@ -488,6 +488,16 @@ def _extend_k_slots(req_to_token, *, ratio, lc_per_req, req_pool_indices, device
     return slots, starts
 
 
+def rows_per_request(metadata, forward_batch) -> Optional[List[int]]:
+    """Rows of each request in this forward's query fields."""
+    if metadata.shard_q is not None:
+        return metadata.shard_q.rows_per_request
+    # bounded replay counts cover only each request's tail
+    if metadata.late_layer_tail is not None:
+        return metadata.late_layer_tail.extend_seq_lens_cpu
+    return _as_int_list(forward_batch.extend_seq_lens_cpu)
+
+
 def low_ratio_index_topk_hip_extend(
     backend,
     layer,
@@ -511,11 +521,7 @@ def low_ratio_index_topk_hip_extend(
         raw_indices.fill_(-1)
 
     seq_lens_cpu = _as_int_list(forward_batch.seq_lens_cpu)
-    # bounded replay counts cover only each request's tail
-    if metadata.late_layer_tail is not None:
-        extend_lens_cpu = metadata.late_layer_tail.extend_seq_lens_cpu
-    else:
-        extend_lens_cpu = _as_int_list(forward_batch.extend_seq_lens_cpu)
+    extend_lens_cpu = rows_per_request(metadata, forward_batch)
     assert seq_lens_cpu is not None and extend_lens_cpu is not None
     lc_per_req = [s // ratio for s in seq_lens_cpu]
     if pos.numel() == 0 or not any(lc_per_req):

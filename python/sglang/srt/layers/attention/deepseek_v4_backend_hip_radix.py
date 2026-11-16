@@ -17,6 +17,7 @@ from typing import (
     Union,
 )
 
+import msgspec
 import torch
 import torch.nn.functional as F
 
@@ -85,12 +86,15 @@ from sglang.srt.layers.attention.dsv4.low_ratio_backend_hip import (
     low_ratio_index_topk_hip_decode,
     low_ratio_index_topk_hip_extend,
     refresh_low_ratio_prefill_workspaces,
+    rows_per_request,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
     PagedIndexerMetadata,
     copy_metadata,
     maybe_copy_inplace,
 )
+from sglang.srt.layers.attention.dsv4.shard_q import MIN_TOKENS as SHARD_Q_MIN_TOKENS
+from sglang.srt.layers.attention.dsv4.shard_q import ShardQ
 from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
     SparsePrefillChunkCache,
     SparsePrefillKVBuffer,
@@ -714,6 +718,8 @@ class DSV4Metadata:
     fp4_q_positions: Optional[torch.Tensor] = field(default=None, repr=False)
     # only on the metadata built for the late layers under decoder SWA bounded replay
     late_layer_tail: Optional[LateLayerTail] = None
+    # set when this rank attends only shard_q.token_ids; query fields hold those rows
+    shard_q: Optional[ShardQ] = None
 
     @property
     def core_metadata(self) -> DSV4AttnMetadata:
@@ -1180,6 +1186,7 @@ class DeepseekV4HipRadixBackend(
         # token map skip an implicit D2H.
         exact_num_tokens: bool = True,
         forward_batch: Optional[ForwardBatch] = None,
+        shard_q: Optional[ShardQ] = None,
     ) -> DSV4Metadata:
         padded_num_tokens = out_cache_loc.shape[0]
         cp_active = forward_batch is not None and is_cp_active(forward_batch)
@@ -1237,8 +1244,12 @@ class DeepseekV4HipRadixBackend(
             num_tokens,
             exact_num_tokens=exact_num_tokens or host_proves_exact_num_tokens,
         )
-        if cp_active:
-            core_attn_metadata.apply_cp_reindex(num_tokens=num_tokens)
+        if cp_active or shard_q is not None:
+            # the cache-write fields stay global: every rank stores all tokens' KV
+            core_attn_metadata.apply_cp_reindex(
+                num_tokens=num_tokens,
+                local_index=None if shard_q is None else shard_q.token_ids,
+            )
             if need_compress:
                 core_attn_metadata.init_flashmla_related()
         if attach_decode_streams:
@@ -1311,6 +1322,7 @@ class DeepseekV4HipRadixBackend(
                 if self.has_c128
                 else _create_dummy_paged_compress_data(compress_ratio=128)
             ),
+            shard_q=shard_q,
             **low_ratio_indexer_metadata,
         )
 
@@ -1882,11 +1894,7 @@ class DeepseekV4HipRadixBackend(
                 refresh_low_ratio_prefill_workspaces(
                     metadata.low_ratio_indexer_metadata_by_ratio(),
                     metadata.fp4_low_ratio_prefill_workspaces,
-                    extend_lens=(
-                        metadata.late_layer_tail.extend_seq_lens_cpu
-                        if metadata.late_layer_tail is not None
-                        else _as_int_list(forward_batch.extend_seq_lens_cpu)
-                    ),
+                    extend_lens=rows_per_request(metadata, forward_batch),
                     max_context_len=self.max_context_len,
                     page8_ratios=self.token_to_kv_pool.low_ratio_index_k_page8_ratios(),
                 )
@@ -2091,6 +2099,7 @@ class DeepseekV4HipRadixBackend(
         *,
         max_seq_len_override: Optional[int] = None,
         use_prefill_cuda_graph: bool = False,
+        shard_q: Optional[ShardQ] = None,
     ):
         self.encoder_replay = forward_batch.encoder_swa_replay
         req_pool_indices = forward_batch.req_pool_indices
@@ -2172,6 +2181,7 @@ class DeepseekV4HipRadixBackend(
                 seq_lens=seq_lens,
                 seq_lens_cpu=seq_lens_cpu,
                 use_prefill_cuda_graph=use_prefill_cuda_graph,
+                shard_q=shard_q,
             )
         else:
             raise NotImplementedError(f"unsupported mode {forward_batch.forward_mode=}")
@@ -2183,7 +2193,9 @@ class DeepseekV4HipRadixBackend(
             return
 
         self._opus_prefill_state = None
-        self.forward_metadata = self._build_forward_metadata(forward_batch)
+        self.forward_metadata = self._build_forward_metadata(
+            forward_batch, shard_q=self._plan_shard_q(forward_batch)
+        )
         self.init_forward_metadata_in_graph(forward_batch)
         self._refresh_fp4_prefill_workspace(forward_batch)
         self.tail_forward_metadata = (
@@ -2192,6 +2204,39 @@ class DeepseekV4HipRadixBackend(
             and not self.is_draft_worker
             and forward_batch.forward_mode.is_extend_without_speculative()
             else None
+        )
+
+    def _plan_shard_q(self, forward_batch: ForwardBatch) -> Optional[ShardQ]:
+        # every input is identical across attention TP, so all ranks take the all-to-alls or none
+        parallel = get_parallel()
+        if (
+            not envs.SGLANG_OPT_DSV4_SHARD_Q.get()
+            or parallel.attn_tp_size == 1
+            or parallel.attn_cp_size != 1
+            or forward_batch.forward_mode != ForwardMode.EXTEND
+            or forward_batch.encoder_swa_replay
+            or self.is_draft_worker
+            or not self.low_ratios
+            or self.has_c4
+            or self.has_c128
+            or self.token_to_kv_pool.request_window is not None
+            or resolve_hip_flashmla_backend() != "aiter_sparse"
+            or forward_batch.seq_lens_cpu is None
+            or forward_batch.extend_seq_lens_cpu is None
+        ):
+            return None
+        extend_lens = _as_int_list(forward_batch.extend_seq_lens_cpu)
+        num_tokens = sum(extend_lens)
+        # DP-attention padding rows belong to no request
+        if (
+            num_tokens < SHARD_Q_MIN_TOKENS
+            or num_tokens != forward_batch.out_cache_loc.shape[0]
+        ):
+            return None
+        return ShardQ.build(
+            extend_lens=extend_lens,
+            positions=forward_batch.positions,
+            group=parallel.attn_tp_group,
         )
 
     def late_layer_num_tokens(self, forward_batch: ForwardBatch) -> Optional[int]:
@@ -2208,6 +2253,7 @@ class DeepseekV4HipRadixBackend(
         seq_lens: torch.Tensor,
         seq_lens_cpu: torch.Tensor,
         use_prefill_cuda_graph: bool = False,
+        shard_q: Optional[ShardQ] = None,
     ) -> DSV4Metadata:
         extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
         extend_seq_lens = forward_batch.extend_seq_lens
@@ -2234,6 +2280,7 @@ class DeepseekV4HipRadixBackend(
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             exact_num_tokens=is_draft,
             forward_batch=forward_batch,
+            shard_q=shard_q,
         )
 
     # ---- decoder SWA bounded replay ---------------------------------------
@@ -3147,12 +3194,20 @@ class DeepseekV4HipRadixBackend(
             )
         )
         extend_seq_lens = forward_batch.extend_seq_lens.to(torch.int32)
+        shard_q = self.forward_metadata.shard_q
+        query_lens = (
+            extend_seq_lens
+            if shard_q is None
+            else torch.tensor(
+                shard_q.rows_per_request, dtype=torch.int32, device=self.device
+            )
+        )
         query_pos = core_attn_metadata.seq_lens_casual[:num_tokens] - 1
         assert query_pos.shape[0] == num_tokens, (query_pos.shape, num_tokens)
         return SparsePrefillChunkCache.build(
             seq_lens=forward_batch.seq_lens.to(torch.int32),
             extend_seq_lens=extend_seq_lens,
-            query_lens=extend_seq_lens,
+            query_lens=query_lens,
             query_pos=query_pos.to(torch.int32),
             req_pool_indices=forward_batch.req_pool_indices.to(torch.int32),
             req_to_token=self.req_to_token,
@@ -3502,6 +3557,12 @@ class DeepseekV4HipRadixBackend(
                 forward_batch.seq_lens_cpu is not None
                 and forward_batch.extend_seq_lens_cpu is not None
             ), "the HIP low-ratio prefill indexer needs the batch's CPU lengths"
+            shard_q = self.forward_metadata.shard_q
+            if shard_q is not None:
+                # the compressor took every row; the indexer scores this rank's
+                x, q_lora, pos = (
+                    _select_rows(t, shard_q.token_ids) for t in (x, q_lora, pos)
+                )
             low_ratio_index_topk_hip_extend(self, layer, x, q_lora, pos, forward_batch)
         else:
             raise NotImplementedError(
@@ -3801,6 +3862,18 @@ class DeepseekV4MultiStepBackend(DeepseekV4HipRadixBackend):
     def on_after_cuda_graph_warmup(self):
         for backend in self.attn_backends:
             backend.on_after_cuda_graph_warmup()
+
+
+def _select_rows(act, index: torch.Tensor):
+    """``act`` at rows ``index``, field by field for HIP's quantized activations."""
+    if isinstance(act, msgspec.Struct):
+        return msgspec.structs.replace(
+            act,
+            **{
+                k: getattr(act, k).index_select(0, index) for k in act.__struct_fields__
+            },
+        )
+    return act.index_select(0, index)
 
 
 def _match_num_queries(
