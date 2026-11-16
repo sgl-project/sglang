@@ -84,13 +84,14 @@ def _matrix_entry(master: dict, point: str, label: str) -> tuple:
         )
     tp, dp_attention = int(match[1]), bool(match[2])
     dcp, conc = int(match[3] or 1), int(match[4])
+    # A row without dcp-size, or with dcp-size: null, is DCP 1.
     entries = [
         (scenario, entry)
         for scenario in master["scenarios"]["agentic-coding"]
         for entry in scenario["search-space"]
         if entry["tp"] == tp
         and bool(entry.get("dp-attn")) == dp_attention
-        and entry.get("dcp-size", 1) == dcp
+        and (entry.get("dcp-size") or 1) == dcp
         and conc in entry["conc-list"]
     ]
     if len(entries) != 1:
