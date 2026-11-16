@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.run_eval import run_eval
+from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -252,6 +253,7 @@ class FlashinferTrtllmGenMoeBackendNVFP4Base:
     backend = None
     model = "nvidia/Qwen3-30B-A3B-NVFP4"
     extra_env = {}
+    extra_args = []
     gsm8k_threshold = 0.89
 
     @classmethod
@@ -271,6 +273,7 @@ class FlashinferTrtllmGenMoeBackendNVFP4Base:
                 "4",
                 "--mem-fraction-static",
                 "0.7",
+                *cls.extra_args,
             ],
         )
 
@@ -355,10 +358,25 @@ class TestFlashinferTrtllmGenMoeBackendNVFP4NemotronNano(
 
     model = "nvidia/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
     backend = "flashinfer_trtllm"
-    # Nano is a chat reasoning model, so this completion-mode eval scores low even
-    # when correct: BF16 on Triton 0.485, NVFP4 on CUTLASS 0.45, padded trtllm
-    # 0.435-0.455. Unpadded (wrong) trtllm scores 0.17.
-    gsm8k_threshold = 0.35
+    extra_args = ["--reasoning-parser", "nemotron_3"]
+    # Padded scores 0.925 here; unpadded (wrong outputs) scores 0.405.
+    gsm8k_threshold = 0.80
+
+    def test_gsm8k(self):
+        # Model card instruct mode: thinking off, greedy.
+        args = SimpleNamespace(
+            base_url=self.base_url,
+            model=self.model,
+            eval_name="gsm8k",
+            num_examples=200,
+            num_threads=128,
+            temperature=0.0,
+            max_tokens=1024,
+            chat_template_kwargs={"enable_thinking": False},
+        )
+        metrics = run_sgl_eval(args)
+        print(f"{metrics=}")
+        self.assertGreater(metrics["score"], self.gsm8k_threshold)
 
 
 if __name__ == "__main__":

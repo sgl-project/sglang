@@ -899,12 +899,9 @@ def trtllm_nvfp4_hidden_alignment(
 ) -> int:
     """Hidden-dim alignment required by the TRT-LLM NVFP4 MoE cubins.
 
-    Every variant needs a hidden size that is a multiple of 256. At a multiple
-    of 128 that is not one of 256, such as Nemotron-3 Nano's 2688, the kernels
-    run but return wrong outputs with no error: Nano scores about 17% on GSM8K
-    unpadded, and 90% padded to 2816 (flashinfer-ai/flashinfer#9333; FlashInfer
-    0.7.4 documents the requirement). The per-token (dynamic activation scale)
-    non-gated variant ships far fewer tile configs and needs 512.
+    The kernels require a hidden size that is a multiple of 256, and of 512
+    for the per-token (dynamic activation scale) non-gated variant. A
+    misaligned hidden size runs without error but returns wrong outputs.
     """
     if use_per_token_activation and not is_gated:
         return 512
