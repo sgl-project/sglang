@@ -1633,8 +1633,6 @@ def mhc_fused_post_pre(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
-    n_splits: int = 1,
-    tile_n: int = 1,
     *,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
