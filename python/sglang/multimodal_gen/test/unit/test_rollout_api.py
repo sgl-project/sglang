@@ -365,9 +365,7 @@ class TestBuildResponse(unittest.TestCase):
 
 
 class TestRolloutGenerateEndpoint(unittest.TestCase):
-    def test_request_without_seed_reports_the_seed_that_was_used(self):
-        """`seed` is optional on the request; a seedless rollout must return the
-        generated sample with the default seed it ran with, not fail after generation."""
+    def _generate(self, **request_fields):
         import asyncio
         from unittest.mock import patch
 
@@ -401,13 +399,34 @@ class TestRolloutGenerateEndpoint(unittest.TestCase):
         ):
             response = asyncio.run(
                 rollout_api.rollout_generate(
-                    RolloutRequest(prompt="x", num_inference_steps=4, rollout=False)
+                    RolloutRequest(
+                        prompt="x",
+                        num_inference_steps=4,
+                        rollout=False,
+                        **request_fields,
+                    )
                 )
             )
 
         payload = msgspec.msgpack.decode(response.body)
         self.assertEqual(len(payload), 1)
-        self.assertEqual(payload[0]["seed"], SamplingParams.seed)
+        return payload[0]
+
+    def test_request_without_seed_reports_the_seed_that_was_used(self):
+        """`seed` is optional on the request; a seedless rollout must return the
+        generated sample with the default seed it ran with, not fail after generation."""
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+
+        self.assertEqual(self._generate()["seed"], SamplingParams.seed)
+
+    def test_request_seed_is_reported_next_to_a_per_sample_seed_list(self):
+        """`extra_sampling_params` may carry a list of seeds, which the response's
+        integer `seed` field cannot hold; the request's own seed is reported."""
+        sample = self._generate(seed=7, extra_sampling_params={"seed": [3, 4]})
+
+        self.assertEqual(sample["seed"], 7)
 
 
 class TestBuildSamplingKwargs(unittest.TestCase):
