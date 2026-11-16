@@ -337,7 +337,7 @@ fn resolve_disaggregation_role(
 }
 
 /// Substitute a wildcard bind host (`*`, `0.0.0.0`, `::`, `[::]`) with
-/// the host parsed from the worker URL — the gateway has to connect to
+/// the host parsed from the worker URL — the router has to connect to
 /// a routable address.  An unparsable worker URL leaves the host
 /// unchanged: the subsequent ZMQ connect will fail visibly with the
 /// wildcard literal, which is the same observable failure mode that
@@ -449,7 +449,7 @@ struct ServerInfoBody {
 #[derive(Debug, Deserialize)]
 pub(crate) struct KvEventsBlock {
     // Forward-compatibility: the only publisher implementation
-    // supported on the gateway side is ZMQ. Keeping the field optional
+    // supported on the router side is ZMQ. Keeping the field optional
     // means a future SGLang that adds a non-ZMQ publisher string won't
     // fail deserialize; the resulting subscriber will still try to open
     // a ZMQ connection and fail visibly.
