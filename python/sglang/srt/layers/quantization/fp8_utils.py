@@ -77,7 +77,7 @@ _is_musa = is_musa()
 # CK builds it lacks the MFMA/WMMA instructions those kernels rely on. Force the
 # pure-triton block-fp8 path on gfx1250.
 _use_aiter = (
-    get_bool_env_var("SGLANG_USE_AITER") and _is_hip and not _is_gfx1250_supported
+    envs.SGLANG_USE_AITER.get() and _is_hip and not _is_gfx1250_supported
 )
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 _use_aiter_gfx942 = _use_aiter and is_gfx942_supported()
