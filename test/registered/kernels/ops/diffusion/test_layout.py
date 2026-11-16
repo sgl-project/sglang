@@ -43,6 +43,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends import (
     flash_attn as _fa_backend,
 )
 from sglang.multimodal_gen.runtime.layers.attention.layer import build_varlen_mask_meta
+from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=110, stage="base-b-kernel-unit", runner_config="1-gpu-large")
@@ -126,6 +127,10 @@ def test_usp_merge_heads_unsupported_inputs_use_exact_fallback():
         )
 
     with patch.object(torch.version, "hip", "6.3"):
+        assert not can_use_usp_merge_heads(x)
+        assert torch.equal(usp_merge_heads(x), x.permute(2, 1, 0, 3, 4).contiguous())
+
+    with patch.object(current_platform, "is_cuda", return_value=False):
         assert not can_use_usp_merge_heads(x)
         assert torch.equal(usp_merge_heads(x), x.permute(2, 1, 0, 3, 4).contiguous())
 
