@@ -399,6 +399,7 @@ class TestHandlerRequestSemantics(CustomTestCase):
         for end in range(1, len(output_ids) + 1):
             last = end == len(output_ids)
             for chunk in chat._encoding_output().stream_chat_chunks(
+                chunk_id="chat",
                 content={
                     "output_ids": output_ids[:end],
                     "meta_info": {

@@ -197,6 +197,7 @@ class ChatEncodingOutputAdapter(Protocol):
         self,
         *,
         content: dict[str, Any],
+        chunk_id: str,
         index: int,
         request: ChatCompletionRequest,
         created: int,

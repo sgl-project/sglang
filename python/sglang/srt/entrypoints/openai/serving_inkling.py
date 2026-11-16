@@ -133,6 +133,7 @@ class InklingChatEncodingAdapter:
         self,
         *,
         content: dict[str, Any],
+        chunk_id: str,
         index: int,
         request: ChatCompletionRequest,
         created: int,
@@ -166,7 +167,7 @@ class InklingChatEncodingAdapter:
         if delta.tool_calls:
             has_tool_calls[index] = True
         return token_output_sse_chunks(
-            chunk_id=content["meta_info"]["id"],
+            chunk_id=chunk_id,
             created=created,
             model=request.model,
             index=index,
