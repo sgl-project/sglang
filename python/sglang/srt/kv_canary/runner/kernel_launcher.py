@@ -15,7 +15,7 @@ from sglang.kernels.ops.kv_canary.verify import (
 from sglang.kernels.ops.kv_canary.write import WritePlan
 from sglang.srt.environ import envs
 from sglang.srt.kv_canary.buffer_group import CanaryBufferGroup, PoolKind
-from sglang.srt.kv_canary.endpoint import CanaryEndpoint
+from sglang.srt.kv_canary.endpoint import CanaryEndpoint, is_sweep_tag
 from sglang.srt.kv_canary.expected_inputs import ExpectedInputs
 from sglang.srt.kv_canary.plan_input import PlanInput
 from sglang.srt.kv_canary.state import ViolationLog
@@ -92,7 +92,7 @@ def launch_endpoints_per_forward(
         for endpoint in endpoints
         if _endpoint_belongs_to_group(endpoint, group)
         and tag_filter(endpoint.kernel_kind)
-        and not _is_sweep_tag(endpoint.kernel_kind)
+        and not is_sweep_tag(endpoint.kernel_kind)
         and passes_v_half_gate(endpoint.kernel_kind)
     ]
     assert len(active_endpoints) > 0
@@ -124,7 +124,7 @@ def launch_endpoints_sweep(
         endpoint
         for endpoint in endpoints
         if _endpoint_belongs_to_group(endpoint, group)
-        and _is_sweep_tag(endpoint.kernel_kind)
+        and is_sweep_tag(endpoint.kernel_kind)
         and passes_v_half_gate(endpoint.kernel_kind)
     ]
     assert len(active_endpoints) > 0
@@ -135,15 +135,6 @@ def launch_endpoints_sweep(
             violation_log=violation_log,
             real_kv_hash_mode=real_kv_hash_mode,
         )
-
-
-def _is_sweep_tag(tag: CanaryLaunchTag) -> bool:
-    return tag in (
-        CanaryLaunchTag.SWEEP_K_FULL,
-        CanaryLaunchTag.SWEEP_V_FULL,
-        CanaryLaunchTag.SWEEP_K_SWA,
-        CanaryLaunchTag.SWEEP_V_SWA,
-    )
 
 
 def _is_v_half_tag(tag: CanaryLaunchTag) -> bool:

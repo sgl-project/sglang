@@ -4,6 +4,7 @@ import functools
 import gc
 import json
 import logging
+import logging.config
 import os
 import re
 import socket
@@ -275,7 +276,6 @@ def configure_logger(server_args, prefix: str = ""):
 
 @functools.lru_cache(None)
 def print_warning_once(msg: str) -> None:
-    # Set the stacklevel to 2 to print the caller's line info
     logger.warning(msg)
 
 
@@ -336,7 +336,7 @@ def configure_gc_warning(warn_threshold_secs):
             duration = time.time() - gc_start_time.get(gen, time.time())
             if duration > warn_threshold_secs:
                 g0, g1, g2 = gc_object_counts()
-                logger.warn(
+                logger.warning(
                     f"LONG GARBAGE COLLECTION DETECTED | Generation {gen} | Duration: {duration:.4f}s | # Objects: gen0={g0}, gen1={g1}, gen2={g2} | "
                     f"This may cause latency jitter. Consider calling the freeze_gc API after sending a few warmup requests."
                 )

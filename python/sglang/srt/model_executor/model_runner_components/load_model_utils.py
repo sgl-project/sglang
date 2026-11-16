@@ -58,7 +58,7 @@ _is_npu = is_npu()
 UNBALANCED_MODEL_LOADING_TIMEOUT_S = 480  # leave more time for post data processing
 
 
-def reserve_rope_cache_for_long_sequences(model, model_config, logger=None):
+def reserve_rope_cache_for_long_sequences(model, model_config):
     """Pre-expand RoPE cache for long sequences and speculative decoding.
 
     Runs inside `ModelRunner`, past publish, so the three config inputs come
@@ -75,7 +75,6 @@ def reserve_rope_cache_for_long_sequences(model, model_config, logger=None):
     base_ctx = (
         get_model().context_length
         or getattr(model_config, "context_len", None)
-        or getattr(model_config, "max_model_len", None)
         or getattr(model_config.hf_text_config, "max_position_embeddings", None)
         or 2048
     )

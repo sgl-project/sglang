@@ -563,6 +563,10 @@ def get_tokenizer(
 
     tokenizer_name = _resolve_tokenizer_name(tokenizer_name, kwargs)
 
+    # Callers spell the revision either way; the HF loaders only read `revision`.
+    revision = kwargs.get("revision") or tokenizer_revision
+    kwargs["revision"] = revision
+
     common_kwargs = dict(
         trust_remote_code=trust_remote_code,
         tokenizer_revision=tokenizer_revision,
@@ -571,7 +575,7 @@ def get_tokenizer(
     )
 
     try:
-        if is_bare_tekken_checkpoint(tokenizer_name, tokenizer_revision):
+        if is_bare_tekken_checkpoint(tokenizer_name, revision):
             from transformers.tokenization_mistral_common import (
                 MistralCommonTokenizer,
             )
@@ -585,7 +589,7 @@ def get_tokenizer(
             )
 
             tokenizer = MistralCommonTokenizer.from_pretrained(
-                tokenizer_name, revision=tokenizer_revision
+                tokenizer_name, revision=revision
             )
         else:
             tokenizer = _auto_tokenizer_from_pretrained(
@@ -603,7 +607,7 @@ def get_tokenizer(
                     tokenizer_name, *args, **common_kwargs
                 )
 
-        return _apply_post_load_fixes(tokenizer, tokenizer_name, tokenizer_revision)
+        return _apply_post_load_fixes(tokenizer, tokenizer_name, revision)
     except Exception as e:
         if tokenizer_backend == "fastokens":
             tokenizer = _load_fastokens_over_repaired_backend(

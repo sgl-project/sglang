@@ -1596,8 +1596,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         ):
             return False
         if getattr(self, "enable_cp_bcg_capture", False):
-            if not is_cp_active(forward_batch):
-                return False
             assert self.prefill_cp_bcg_input is not None
             if (
                 self.prefill_cp_bcg_input.select_replay_bucket_for_batch(
@@ -2474,13 +2472,6 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return output
         assert isinstance(output, PPProxyTensors)
         return _slice_output_rows(output, self.raw_num_tokens)
-
-    def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
-        if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
-            raise RuntimeError(
-                "The runtime hidden-state mode exceeds the fixed CUDA graph "
-                f"capture mode ({self.capture_hidden_mode.name})."
-            )
 
     def _wait_for_layer_loads(self) -> None:
         # Full replay skips the pool accessors. BCG's dynamic KDA waits do not

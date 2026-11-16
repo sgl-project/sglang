@@ -2,15 +2,6 @@ import functools
 import json
 from typing import AbstractSet, Collection, List, Literal, Union
 
-
-class TiktokenProcessor:
-    def __init__(self, name: str):
-        self.tokenizer = TiktokenTokenizer(name)
-
-    def image_processor(self, image):
-        return {"pixel_values": [image]}
-
-
 RESERVED_TOKEN_TEXTS = [f"<|reserved_{i}|>" for i in range(3, 128)]
 CONTROL_TOKEN_TEXTS = [f"<|control{i}|>" for i in range(1, 705)]
 
@@ -19,7 +10,6 @@ PAD = "<|pad|>"
 EOS = "<|eos|>"
 SEP = "<|separator|>"
 
-DEFAULT_SPECIAL_TOKENS = [PAD, SEP, EOS]
 DEFAULT_CONTROL_TOKENS = {"pad": PAD, "sep": EOS, "eos": SEP}
 
 # default + separate each single digit
@@ -67,10 +57,8 @@ class TiktokenTokenizer:
 
         # Copy from train/xlm/tokenizers/tiktoken_wrapper.py::Encoding::__init__
         default_allowed_special = None
-        control_tokens = DEFAULT_CONTROL_TOKENS
         tokenizer = tiktoken.Encoding(**kwargs)
         tokenizer._default_allowed_special = default_allowed_special or set()
-        tokenizer._control_tokens = control_tokens
 
         def encode_patched(
             self,
