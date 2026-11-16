@@ -6,9 +6,11 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+from llguidance import LLTokenizer
 from xgrammar import TokenizerInfo
 
 from sglang.srt.constrained.base_grammar_backend import BaseGrammarBackend
+from sglang.srt.constrained.llguidance_backend import GuidanceBackend
 from sglang.srt.constrained.reasoner_grammar_backend import (
     ReasonerGrammarBackend,
     ReasonerGrammarObject,
@@ -285,6 +287,29 @@ class TestReasonerGrammarBackend(CustomTestCase):
             ("full_assistant_ebnf", 'root ::= "OK"'), reasoning=True
         )
         self.assertIs(bare, inner_grammar)
+
+    def test_wraps_a_backend_that_masks_only_through_its_grammars(self):
+        """llguidance and outlines define the mask operations on the grammar
+        object, not on the backend. With a reasoning parser, a regex / JSON /
+        EBNF request on such a backend must still compile and mask through
+        the compiled grammar."""
+        backend = object.__new__(GuidanceBackend)
+        BaseGrammarBackend.__init__(backend)
+        backend.llguidance_tokenizer = LLTokenizer("byte")
+        reasoner = ReasonerGrammarBackend(
+            backend, self._make_parser(), self._make_tokenizer()
+        )
+
+        wrapped = reasoner._init_value_dispatch(("regex", "[0-9]{1,8}"), False)
+
+        self.assertIsInstance(wrapped, ReasonerGrammarObject)
+        vocab_size = backend.llguidance_tokenizer.vocab_size
+        mask = wrapped.allocate_vocab_mask(vocab_size, 1, "cpu")
+        wrapped.fill_vocab_mask(mask, 0)
+        logits = torch.zeros(1, vocab_size)
+        wrapped.apply_vocab_mask(logits, wrapped.move_vocab_mask(mask, "cpu"))
+        allowed = (logits[0] == 0).nonzero().flatten().tolist()
+        self.assertEqual(allowed, [ord(digit) for digit in "0123456789"])
 
     def _make_xgrammar_backend(self):
         # ASCII plus native framing IDs keeps these checks independent of model files.
