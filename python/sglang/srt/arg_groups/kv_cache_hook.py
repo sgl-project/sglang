@@ -151,6 +151,42 @@ def handle_platform_kv_cache_dtype_compatibility(server_args: Any) -> None:
         )
 
 
+def handle_int8_kv_cache_compatibility(server_args: Any) -> None:
+    """``--kv-cache-dtype int8`` stores the DSA MLA KV as the packed record
+    (INT8 latent | BF16 rope | per-tile scales) that arch35 stores in FP8.
+    Readers without a packed path are rejected when the pool is built, for
+    either dtype; this rejects what is specific to INT8."""
+    cfg = resolving_view(server_args)
+    if cfg.kv_cache_dtype != "int8":
+        return
+    if not get_platform().is_npu:
+        raise ValueError(
+            "--kv-cache-dtype int8 is supported on Ascend NPUs only; no other "
+            "platform has kernels that read an INT8 KV cache."
+        )
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    hf_config = model_config_of(server_args).hf_config
+    if not is_deepseek_dsa(hf_config):
+        raise ValueError(
+            "--kv-cache-dtype int8 stores the packed DSA MLA record, which only "
+            "DSA sparse attention reads back; "
+            f"{hf_config.architectures[0]} is not a DSA model. Use "
+            "--kv-cache-dtype bf16 or auto."
+        )
+    from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
+        is_mla_preprocess_enabled,
+    )
+
+    # Off arch35, MLAProlog writes only a BF16 cache; the packed write needs
+    # arch35 and MXFP8 weights.
+    if is_mla_preprocess_enabled():
+        raise ValueError(
+            "--kv-cache-dtype int8 is not supported with SGLANG_NPU_USE_MLAPO. "
+            "Unset it or use --kv-cache-dtype bf16."
+        )
+
+
 def handle_kv4_compatibility(server_args: Any) -> None:
     """Check FP4 KV cache compatibility with the attention backend"""
 

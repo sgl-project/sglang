@@ -707,6 +707,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
             DSATokenToKVPool.index_k_with_scale_buffer_dtype
         )
         if _is_npu:
+            from sglang.srt.hardware_backend.npu.kv_capability import (
+                resolve_npu_kv_capability,
+            )
             from sglang.srt.mem_cache.kv_cache_dtype import (
                 QUANT_MODE_TOKEN_INT8,
                 resolve_indexer_quant_mode,
@@ -731,7 +734,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     indexer_size_per_token = ceil_div(
                         index_head_dim, get_dsa_index_kpool(kvc.model_config.hf_config)
                     )
-                    element_size = torch._utils._element_size(dtype)
+                    # The unquantized indexer keeps its own dtype, which stays
+                    # BF16 under an INT8 main KV.
+                    element_size = torch._utils._element_size(
+                        resolve_npu_kv_capability(dtype).indexer_kv_dtype
+                    )
         memory_config = get_memory()
         indexer_ratio = 1
         if memory_config.enable_hisparse:

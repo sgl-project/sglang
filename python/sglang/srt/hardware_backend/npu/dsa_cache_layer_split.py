@@ -549,7 +549,7 @@ class LayerSplitNPUMLATokenToKVPool(NPUMLATokenToKVPool):
                 cache_k, cache_v = cache_k.split(
                     [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
                 )
-            packed = self._pack_dsa_fp8_kv_cache(cache_k, cache_v)
+            packed = self._pack_dsa_quant_kv_cache(cache_k, cache_v)
             torch_npu.npu_scatter_nd_update_(
                 self.remote_k_buffer.view(-1, 1, self.kv_cache_dim),
                 loc.view(-1, 1),

@@ -76,6 +76,9 @@ def configure_kv_cache_dtype(
         kv_cache_dtype = torch.float8_e4m3fn
     elif server_args_kv_cache_dtype in ("bf16", "bfloat16"):
         kv_cache_dtype = torch.bfloat16
+    elif server_args_kv_cache_dtype == "int8":
+        # Startup checks and the NPU capability admit it for DSA on A2 only.
+        kv_cache_dtype = torch.int8
     elif server_args_kv_cache_dtype in ("nvfp4", "fp4_mx_block16"):
         if hasattr(torch, "float4_e2m1fn_x2"):
             kv_cache_dtype = torch.float4_e2m1fn_x2
@@ -141,7 +144,7 @@ def resolve_indexer_quant_mode(
     if main_kv_cache_dtype == torch.float8_e4m3fn:
         raise ValueError(
             f"--indexer-kv-cache-dtype={indexer_kv_cache_dtype} requires a "
-            "non-FP8 main KV cache (--kv-cache-dtype auto or bf16), "
+            "non-FP8 main KV cache (--kv-cache-dtype auto, bf16 or int8), "
             f"got {main_kv_cache_dtype}."
         )
     return quant_mode
