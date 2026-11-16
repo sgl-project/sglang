@@ -27,7 +27,7 @@ npx --yes --package=playwright playwright screenshot --channel chrome \
 | Tencent Hunyuan | [Official website](https://hunyuan.tencent.com/) |
 | Infinigence | [Official wordmark](https://www.infinigence-ai.com/static/home/svg/logo.svg) |
 | fal | [Official blog wordmark](https://storage.ghost.io/c/0e/15/0e15ee8a-bd95-4b71-9258-950f77f4d196/content/images/2024/09/fal_logo.svg) |
-| MOSS-Image | [Official repository](https://github.com/OpenMOSS/MOSS-Image/blob/main/assets/logo.svg) |
+| MOSS (image and video) | [Official repository](https://github.com/OpenMOSS/MOSS-Image/blob/main/assets/logo.svg) |
 | Sol-Engine | [Official repository](https://github.com/NVlabs/Sana/blob/sol-engine/assets/sol-engine-logo.png) |
 
 Keep this list specific to SGLang-Diffusion adoption or implementation reuse.
