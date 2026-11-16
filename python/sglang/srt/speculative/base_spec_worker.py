@@ -285,6 +285,10 @@ class BaseSpecWorker(ABC):
         if not draft_runners:
             return HiCacheDraftPlan()
         draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
+        if use_flexkv:
+            # The SDK chooses physical packing. Keep every runner available
+            # even when HiCache classifies this pool as a sidecar.
+            target_model_runner.mtp_draft_device_pools = draft_pools
         if any(runner.runner_ids.is_fused_draft for runner in draft_runners):
             if use_flexkv:
                 raise NotImplementedError(

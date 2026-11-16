@@ -65,9 +65,15 @@ def _flexkv_token_ids(key):
 
 
 def _draft_pool_kwargs(params):
-    pools = getattr(params, "mtp_draft_device_pools", ()) or getattr(
-        params, "sidecar_draft_device_pools", ()
-    )
+    if getattr(params, "mtp_draft_mamba_pools", ()):
+        raise NotImplementedError("FlexKV does not support separate Mamba draft state")
+    # A runner can be exposed by both the packed and sidecar plans. Preserve
+    # every physical pool once, without discarding a distinct sidecar.
+    pools = []
+    for field in ("mtp_draft_device_pools", "sidecar_draft_device_pools"):
+        for pool in getattr(params, field, ()) or ():
+            if not any(pool is existing for existing in pools):
+                pools.append(pool)
     return {"draft_kv_pools": tuple(pools)} if pools else {}
 
 

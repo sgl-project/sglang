@@ -128,13 +128,29 @@ def test_flexkv_activation_passes_the_actual_draft_pool(
     )
     plan = spec.BaseSpecWorker._build_hicache_draft_plan(worker)
     assert plan.device_pools == ((pool,) if packed else (pool, pool))
-    assert target.mtp_draft_device_pools == ((pool,) if packed else ())
+    assert target.mtp_draft_device_pools == ((pool,) if packed else (pool, pool))
     assert _draft_pool_kwargs(NS(mtp_draft_device_pools=(pool,))) == {
         "draft_kv_pools": (pool,)
     }
     runner.runner_ids.is_fused_draft = True
     with pytest.raises(NotImplementedError, match="fused draft"):
         spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+
+
+def test_packed_and_sidecar_pool_descriptions_preserve_every_unique_member():
+    first, second, third = object(), object(), object()
+    params = NS(
+        mtp_draft_device_pools=(first, second),
+        sidecar_draft_device_pools=(second, third),
+    )
+    assert _draft_pool_kwargs(params) == {"draft_kv_pools": (first, second, third)}
+
+
+def test_separate_mamba_draft_state_cannot_be_silently_omitted():
+    with pytest.raises(NotImplementedError, match="Mamba draft state"):
+        _draft_pool_kwargs(
+            NS(mtp_draft_device_pools=(object(),), mtp_draft_mamba_pools=(object(),))
+        )
 
 
 if __name__ == "__main__":

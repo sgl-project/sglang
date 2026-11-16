@@ -61,10 +61,11 @@ def _flexkv_factory(ctx):
             f"FlexKV is installed but incompatible version: {exc}."
         ) from exc
 
-    draft_pools = getattr(ctx.params, "mtp_draft_device_pools", ()) or getattr(
-        ctx.params, "sidecar_draft_device_pools", ()
+    from sglang.srt.mem_cache.storage.flexkv.flexkv_cache_lifecycle import (
+        _draft_pool_kwargs,
     )
-    if (ctx.params.is_eagle or draft_pools) and getattr(
+
+    if (ctx.params.is_eagle or _draft_pool_kwargs(ctx.params)) and getattr(
         FlexKVConnector, "supports_draft_cache", False
     ) is not True:
         raise ValueError(
