@@ -21,7 +21,7 @@ import aiohttp
 import requests
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.hf_transformers import get_tokenizer
 from sglang.test.test_utils import (
     DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,

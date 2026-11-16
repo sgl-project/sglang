@@ -15,7 +15,7 @@ from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
 from sglang.srt.layers.attention.mamba.mamba2_metadata import (
     ForwardMetadata,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
 from sglang.srt.speculative.spec_info import SpecInput

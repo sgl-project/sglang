@@ -144,7 +144,7 @@ deployment commands and benchmark data, see
 
 ### Multi-node online deployment
 
-Multi-node deployment distributes the model across multiple Ascend A3 Series nodes using tensor parallelism while keeping
+Multi-node deployment distributes the model across multiple A3 Series nodes using tensor parallelism while keeping
 prefill and decode on the same nodes (PD mixed mode), suitable for scenarios that need more device memory than a single
 node can provide. This scenario is already covered in the best practice. For the complete, optimized
 deployment commands and benchmark data, see

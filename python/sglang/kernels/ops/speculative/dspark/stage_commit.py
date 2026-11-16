@@ -53,6 +53,7 @@ def stage_commit(
     ``commit_lens_dst[:bs] = commit_lens`` and ``commit_lens_dst[bs:] = 0``."""
     assert cache_loc.is_contiguous() and positions.is_contiguous()
     assert commit_lens.is_contiguous()
+    assert state_slot is None or state_slot.is_contiguous()
     assert (state_slot is None) == (state_slot_dst is None)
     bs, max_bs = commit_lens.shape[0], commit_lens_dst.shape[0]
     _stage_commit_kernel[(1,)](

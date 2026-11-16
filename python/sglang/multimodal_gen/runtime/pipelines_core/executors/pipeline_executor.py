@@ -21,9 +21,9 @@ from sglang.multimodal_gen.runtime.distributed import get_world_rank
 from sglang.multimodal_gen.runtime.managers.progress_reporter import (
     get_progress_reporter,
 )
-from sglang.multimodal_gen.runtime.managers.request_cancel import (
+from sglang.multimodal_gen.runtime.managers.request_cancel import raise_if_cancelled
+from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
     RequestCancelledError,
-    raise_if_cancelled,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -273,8 +273,11 @@ class PipelineExecutor(ABC):
         work can be removed. The base executor simply calls
         ``stage.run_grouped_requests`` for each stage in order.
         """
+        requests = list(batches)
         for stage in stages:
+            raise_if_cancelled(requests)
             batches = stage.run_grouped_requests(batches, server_args)
+        raise_if_cancelled(requests)
         return batches
 
     def execute_group_sequentially(

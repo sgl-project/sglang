@@ -576,23 +576,23 @@ return {
       showWhen: (s) => ["ref_image", "ref_image_audio", "mixed_ref"].includes(s.mode),
       description: "Resize Ref2VA image references before encoding; audio, video, and FL2VA keyframes are unaffected.",
       quality: "Preprocessing policy",
-      default: "diffusers",
+      default: "max",
       options: [
+        {
+          id: "max",
+          label: "Preserve reference resolution",
+          recommended: true,
+          description: "Keep smaller inputs at source scale and downscale only when the short edge exceeds 2048 pixels.",
+        },
         {
           id: "diffusers",
           label: "Diffusers-compatible",
-          recommended: true,
-          description: "Preserve the existing behavior by scaling the reference short edge to 2048 pixels, including upscaling.",
+          description: "Reproduce the original preprocessing by scaling the reference short edge to 2048 pixels, including upscaling.",
         },
         {
           id: "match",
           label: "Match target area",
           description: "Match the target canvas pixel area without upscaling; required by ModelTC Ref2VA Turbo.",
-        },
-        {
-          id: "max",
-          label: "2048 short-edge cap",
-          description: "Keep smaller inputs at source scale and downscale only when the short edge exceeds 2048 pixels.",
         },
       ],
     },
@@ -615,6 +615,10 @@ return {
       },
       verifiedRecipes: [
         { id: "b200-resident-8", hw: "b200", nodes: 1, gpus_per_node: 8, placement: "resident", tp_size: 1, ulysses_degree: 8, ring_degree: 1, encoder: "auto", default: true },
+        // Auto takes the first entry for a GPU count. 4x B200 holds the DiT
+        // resident, which beats FSDP by 4-7% (FL2VA 209f 64.9 vs 67.6 s,
+        // T2VA 124f 36.0 vs 38.7 s); FSDP stays available as a placement.
+        { id: "b200-resident-4", hw: "b200", nodes: 1, gpus_per_node: 4, placement: "resident", tp_size: 1, ulysses_degree: 4, ring_degree: 1, encoder: "auto" },
         { id: "b200-fsdp-4", hw: "b200", nodes: 1, gpus_per_node: 4, placement: "fsdp", tp_size: 1, ulysses_degree: 4, ring_degree: 1, encoder: "auto" },
         { id: "b300-resident-8", hw: "b300", nodes: 1, gpus_per_node: 8, placement: "resident", tp_size: 1, ulysses_degree: 8, ring_degree: 1, encoder: "auto", default: true },
         { id: "b300-fsdp-8", hw: "b300", nodes: 1, gpus_per_node: 8, placement: "fsdp", tp_size: 1, ulysses_degree: 8, ring_degree: 1, encoder: "auto" },

@@ -209,5 +209,220 @@ def test_precompute_skips_oversized_schedule(monkeypatch):
         assert meta.num_splits is None
 
 
+# b = 7 stays below kMinParallelBatch (both walks serial), 8 is the first
+# parallel batch; each (parts, topk, extra_topk) case is a different regime.
+@pytest.mark.parametrize("b", [7, 8, 64, 200, 512])
+@pytest.mark.parametrize(
+    "num_sm_parts,topk,extra_topk", [(148, 2048, 0), (74, 512, 0), (9, 2048, 512)]
+)
+@pytest.mark.parametrize("mode", ["full", "random", "zeros", "ones", "mixed", "skewed"])
+def test_parallel_walk_matches_serial(b, num_sm_parts, topk, extra_topk, mode):
+    """The parallel partition walk reproduces the serial one bit for bit."""
+    from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import (
+        META_INTS,
+        flashmla_sched_meta,
+    )
+
+    seed = b * 31 + num_sm_parts + topk + extra_topk + len(mode)
+    if mode == "skewed":  # a few long requests among short ones
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        topk_length = torch.randint(
+            0, 65, (b,), device="cuda", dtype=torch.int32, generator=g
+        )
+        topk_length[:: max(b // 4, 1)] = topk
+    else:
+        topk_length = _lengths(b, topk, mode, seed)
+    extra_topk_length = (
+        _lengths(b, extra_topk, "random", seed + 1) if extra_topk else None
+    )
+    out = []
+    for parallel in (False, True):
+        meta = torch.full(
+            (num_sm_parts, META_INTS), -7, dtype=torch.int32, device="cuda"
+        )
+        splits = torch.full((b + 1,), -7, dtype=torch.int32, device="cuda")
+        flashmla_sched_meta(
+            meta,
+            splits,
+            topk_length=topk_length,
+            extra_topk_length=extra_topk_length,
+            block_size_n=BLOCK_SIZE_N,
+            fixed_overhead_num_blocks=FIXED_OVERHEAD,
+            topk=topk,
+            extra_topk=extra_topk,
+            schedule="parallel" if parallel else "serial",
+        )
+        out.append((meta, splits))
+    assert torch.equal(out[0][0], out[1][0])
+    assert torch.equal(out[0][1], out[1][1])
+
+
+def test_parallel_walk_replay_switches_with_lengths():
+    """A captured DCP verify schedule can outgrow its parallel workspace."""
+    from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import (
+        META_INTS,
+        flashmla_sched_meta,
+    )
+
+    b, topk, parts = 512, 2048, 148
+    lengths = torch.full((b,), 256, device="cuda", dtype=torch.int32)
+    outputs = [
+        (
+            torch.empty((parts, META_INTS), device="cuda", dtype=torch.int32),
+            torch.empty((b + 1,), device="cuda", dtype=torch.int32),
+        )
+        for _ in range(2)
+    ]
+
+    def run(parallel):
+        flashmla_sched_meta(
+            *outputs[int(parallel)],
+            topk_length=lengths,
+            block_size_n=BLOCK_SIZE_N,
+            fixed_overhead_num_blocks=FIXED_OVERHEAD,
+            topk=topk,
+            schedule="parallel" if parallel else "serial",
+        )
+
+    for parallel in (False, True):
+        run(parallel)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run(True)
+    for length in (256, topk, 0, 384, 448, 1, 256):
+        lengths.fill_(length)
+        graph.replay()
+        run(False)
+        assert torch.equal(outputs[0][0], outputs[1][0])
+        assert torch.equal(outputs[0][1], outputs[1][1])
+
+
+def _replay_schedule(meta, splits, num_blocks):
+    """Replay how the sparse decode kernel and the combine consume a schedule
+    and check it covers every request exactly once; return the costliest
+    partition (blocks plus an overhead per piece)."""
+    meta, splits, num_blocks = meta.tolist(), splits.tolist(), num_blocks.tolist()
+    b = len(num_blocks)
+    assert splits[0] == 0 and all(splits[r + 1] > splits[r] for r in range(b))
+    assert splits[b] <= b + len(meta)
+    pieces = [[] for _ in range(b)]
+    max_cost = 0
+    for part in meta:
+        (
+            begin_req,
+            end_req,
+            begin_block,
+            end_block,
+            begin_split,
+            first_split,
+            last_split,
+        ) = part[:7]
+        if begin_req >= b:
+            continue
+        cost = 0
+        for r in range(begin_req, end_req + 1):
+            start = begin_block if r == begin_req else 0
+            end = end_block if r == end_req else num_blocks[r]
+            split_flag = (
+                first_split if r == begin_req else (last_split if r == end_req else 0)
+            )
+            split_idx = splits[r] + begin_split if r == begin_req else splits[r]
+            assert start < end <= num_blocks[r]
+            pieces[r].append((start, end, split_idx, split_flag))
+            cost += end - start + FIXED_OVERHEAD
+        max_cost = max(max_cost, cost)
+    for r in range(b):
+        pieces[r].sort()
+        n = len(pieces[r])
+        assert n == splits[r + 1] - splits[r]
+        assert [p[0] for p in pieces[r]] == [0] + [p[1] for p in pieces[r][:-1]]
+        assert pieces[r][-1][1] == num_blocks[r]
+        assert sorted(p[2] for p in pieces[r]) == list(range(splits[r], splits[r + 1]))
+        assert all(bool(p[3]) == (n > 1) for p in pieces[r])
+    return max_cost
+
+
+@pytest.mark.parametrize("b", [1, 8, 64, 128, 384, 1000])
+@pytest.mark.parametrize("num_sm_parts", [148, 74, 3])
+@pytest.mark.parametrize("mode", ["full", "random", "zeros", "ones", "mixed", "dcp"])
+def test_windowed_schedule_is_valid(b, num_sm_parts, mode):
+    """The windowed schedule covers every request's blocks exactly once, with
+    the greedy walk's bound on the costliest partition."""
+    from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import (
+        META_INTS,
+        flashmla_sched_meta,
+    )
+
+    topk = 2048
+    seed = b * 7 + num_sm_parts + len(mode)
+    if mode == "dcp":  # this rank's share of the top-k under DCP8
+        g = torch.Generator(device="cuda").manual_seed(seed)
+        topk_length = torch.randint(
+            200, 320, (b,), device="cuda", dtype=torch.int32, generator=g
+        )
+    else:
+        topk_length = _lengths(b, topk, mode, seed)
+    meta = torch.full((num_sm_parts, META_INTS), -7, dtype=torch.int32, device="cuda")
+    splits = torch.full((b + 1,), -7, dtype=torch.int32, device="cuda")
+    flashmla_sched_meta(
+        meta,
+        splits,
+        topk_length=topk_length,
+        block_size_n=BLOCK_SIZE_N,
+        fixed_overhead_num_blocks=FIXED_OVERHEAD,
+        topk=topk,
+        schedule="windowed",
+    )
+    num_blocks = (topk_length.clamp(min=1) + BLOCK_SIZE_N - 1) // BLOCK_SIZE_N
+    max_cost = _replay_schedule(meta.cpu(), splits.cpu(), num_blocks.cpu())
+    total = int(num_blocks.sum()) + FIXED_OVERHEAD * b
+    assert max_cost <= (total + num_sm_parts - 1) // num_sm_parts + FIXED_OVERHEAD
+
+
+@pytest.mark.parametrize("b", [6, 64])
+def test_windowed_schedule_output(b):
+    """FlashMLA gives the same attention on the windowed schedule as on its own."""
+    from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import (
+        flashmla_sched_meta,
+    )
+
+    topk = 2048
+    # A finite cache (random bytes decode to NaNs). Each page holds its tokens'
+    # fp8 nope (448 B) + bf16 rope (128 B), then their ue8m0 scales (8 B).
+    kv = _cache()
+    pages = kv.view(kv.shape[0], -1)
+    tokens = pages[:, : PAGE * 576].view(kv.shape[0], PAGE, 576)
+    g = torch.Generator(device="cuda").manual_seed(b)
+    tokens[..., :448] = torch.randint(
+        0, 0x70, tokens[..., :448].shape, device="cuda", dtype=torch.uint8, generator=g
+    )
+    tokens[..., 448:].view(torch.bfloat16).copy_(
+        torch.randn(tokens.shape[:-1] + (64,), device="cuda", generator=g) * 0.1
+    )
+    pages[:, PAGE * 576 :] = 127
+    topk_length = _lengths(b, topk, "random", b)
+    ref_out, ref_lse, sched = _call(kv, b, 1, topk, topk_length)
+    if sched.tile_scheduler_metadata is None:
+        pytest.skip("FlashMLA did not split the KV for this shape")
+    meta = torch.empty_like(sched.tile_scheduler_metadata)
+    splits = torch.empty_like(sched.num_splits)
+    flashmla_sched_meta(
+        meta,
+        splits,
+        topk_length=topk_length,
+        block_size_n=BLOCK_SIZE_N,
+        fixed_overhead_num_blocks=FIXED_OVERHEAD,
+        topk=topk,
+        schedule="windowed",
+    )
+    out, lse, _ = _call(kv, b, 1, topk, topk_length, meta=(meta, splits))
+    assert torch.isfinite(ref_out).all()
+    torch.testing.assert_close(out, ref_out, rtol=1e-2, atol=1e-2)
+    finite = torch.isfinite(ref_lse)
+    assert torch.equal(finite, torch.isfinite(lse))
+    torch.testing.assert_close(lse[finite], ref_lse[finite], rtol=1e-5, atol=1e-5)
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

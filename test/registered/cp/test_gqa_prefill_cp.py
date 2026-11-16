@@ -1,17 +1,17 @@
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
-    kill_process_tree,
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=564, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=564, stage="nightly", runner_config="4-gpu-h100")
 
 GQA_MODEL_PATH = "Qwen/Qwen3-30B-A3B-FP8"
 

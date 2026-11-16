@@ -18,6 +18,7 @@ from sglang.kernels.ops.attention.cutedsl_gdn import (
 from sglang.srt.layers.attention.linear.kernels.kernel_backend import (
     LinearAttnKernelBase,
 )
+from sglang.srt.layers.attention.linear.kernels.state_pool_io import state_pool_indices
 
 logger = logging.getLogger(__name__)
 
@@ -145,12 +146,7 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
         # Pool state I/O is fused into the h kernel's TMA load/store: pass the
         # pool + per-seq slots and the kernel reads h0/writes ht in place at
         # those rows (no gather/scatter kernels, no [N, Hv, V, K] intermediates).
-        # Remap padding (-1) to the last (sentinel) slot.
-        ssm_cache_indices = torch.where(
-            cache_indices >= 0,
-            cache_indices,
-            ssm_states.shape[0] - 1,
-        ).to(torch.int32)
+        ssm_cache_indices = state_pool_indices(cache_indices, dtype=torch.int32)
 
         chunk_indices, chunk_offsets = self._prepare_meta_fn(
             cu_seqlens, total_seq_len, chunk_size=64

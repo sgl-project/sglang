@@ -68,6 +68,7 @@ if _is_npu:
 logger = logging.getLogger(__name__)
 
 
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4StateBufferInfo
 from sglang.srt.mem_cache.pool_host import HostKVCache
 from sglang.srt.mem_cache.pool_host.base import (
     _WRITE_BACK_STAGING_PAGE_CHUNK,
@@ -773,7 +774,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
     def __init__(
         self,
         pool_name: str,
-        state_pools: list,
+        state_infos: list[DSV4StateBufferInfo],
         num_host_pages: int,
         swa_page_size: int,
         layout: str = "layer_first",
@@ -781,16 +782,14 @@ class DeepSeekV4StateHostPool(HostKVCache):
         pin_memory: bool = True,
         allocator_type: str = "default",
     ):
-        if any(pool is None for pool in state_pools):
-            raise ValueError(f"{pool_name} state_pools must not contain None")
         if _is_xpu:
             require_kvcacheio_ops(
                 pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
             )
 
         self.pool_name = pool_name
-        self.state_pools = state_pools
-        self.layer_num = len(state_pools)
+        self.state_infos = tuple(state_infos)
+        self.layer_num = len(state_infos)
         self.num_host_pages = num_host_pages
         self.swa_page_size = swa_page_size
         self.dtype = torch.uint8
@@ -808,7 +807,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.state_page_bytes = 0
         self.device_page_views = []
         self.gpu_device = device
-        self._init_device_page_views()
+        self._bind_state_buffers()
         self.size_per_token = self.state_page_bytes
 
         requested_bytes = self.layer_num * num_host_pages * self.state_page_bytes
@@ -889,20 +888,16 @@ class DeepSeekV4StateHostPool(HostKVCache):
         self.can_use_write_back_jit = False
         self._init_write_back_staging_buffers()
 
-    def _init_device_page_views(self) -> None:
+    def _bind_state_buffers(self) -> None:
         expected_ring_size = None
         expected_state_page_bytes = None
-        for pool in self.state_pools:
-            state_tensor = pool.kv_score_buffer.kv_score
-            if not state_tensor.is_contiguous():
-                raise ValueError(f"{self.pool_name} state tensor must be contiguous")
-            ring_size = pool.ring_size
-            slot_bytes = state_tensor[0].nbytes
-            state_page_bytes = ring_size * slot_bytes
+        for info in self.state_infos:
+            ring_size = info.ring_size
+            state_page_bytes = info.pages.shape[1]
             if expected_ring_size is None:
                 expected_ring_size = ring_size
                 expected_state_page_bytes = state_page_bytes
-                self.gpu_device = state_tensor.device
+                self.gpu_device = info.pages.device
             elif (
                 expected_ring_size != ring_size
                 or expected_state_page_bytes != state_page_bytes
@@ -911,13 +906,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
                     f"{self.pool_name} state pools must share ring size and slot bytes"
                 )
 
-            state_bytes = state_tensor.view(torch.uint8).reshape(
-                state_tensor.shape[0], -1
-            )
-            usable_slots = (state_tensor.shape[0] // ring_size) * ring_size
-            self.device_page_views.append(
-                state_bytes[:usable_slots].reshape(-1, state_page_bytes)
-            )
+            self.device_page_views.append(info.pages)
 
         self.ring_size = expected_ring_size or 0
         self.state_page_bytes = expected_state_page_bytes or 0
@@ -959,7 +948,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
         """View host state layer ``l`` as ``[pages, 1, R, 1, last_dim]``.
 
         ``last_dim = state_page_bytes // R // state_dtype.itemsize``."""
-        state_dtype = self.state_pools[l].kv_score_buffer.kv_score.dtype
+        state_dtype = self.state_infos[l].dtype
         last_dim = self.state_page_bytes // self.ring_size // state_dtype.itemsize
         if self.layout == "layer_first":
             layer_buffer = self.kv_buffer[l]
@@ -1074,7 +1063,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
             dev_op_indices = self._ring_op_indices(device_rows)
             host_op_indices = self._ring_op_indices(host_rows)
             for l in range(self.layer_num):
-                state_dtype = self.state_pools[l].kv_score_buffer.kv_score.dtype
+                state_dtype = self.state_infos[l].dtype
                 last_dim = (
                     self.state_page_bytes // self.ring_size // state_dtype.itemsize
                 )
@@ -1159,7 +1148,7 @@ class DeepSeekV4StateHostPool(HostKVCache):
             R = self.ring_size
             dev_op_indices = self._ring_op_indices(device_rows)
             host_op_indices = self._ring_op_indices(host_rows)
-            state_dtype = self.state_pools[layer_id].kv_score_buffer.kv_score.dtype
+            state_dtype = self.state_infos[layer_id].dtype
             last_dim = self.state_page_bytes // R // state_dtype.itemsize
             num_dev_pages = self.device_page_views[layer_id].shape[0]
             dev_view = (

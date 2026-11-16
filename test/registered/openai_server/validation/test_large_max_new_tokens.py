@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 import openai
 
 from sglang.srt.utils import kill_process_tree
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.hf_transformers import get_tokenizer
 from sglang.test.ci.ci_register import (
     register_cpu_ci,
     register_cuda_ci,
@@ -25,7 +25,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=70, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=70, stage="base-b", runner_config="1-gpu-small")
 register_cpu_ci(est_time=101, suite="stage-b-test-cpu-intel")
 
 

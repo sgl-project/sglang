@@ -9,14 +9,14 @@ import logging
 import os
 from typing import Any, Optional
 
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.overrides import (
     _gguf_quantization,
     declare_resolution,
-    resolving_view,
     run_post_process_pass,
 )
 from sglang.srt.utils.common import find_local_repo_dir, is_remote_url
-from sglang.srt.utils.hf_transformers_utils import check_gguf_file
+from sglang.srt.utils.hf_transformers import check_gguf_file
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -45,7 +45,7 @@ def handle_model_source_paths(server_args: Any):
 def resolve_hf_gguf_model_path(server_args: Any):
     """Turn a Hub reference to a .gguf into a local file path."""
     cfg = resolving_view(server_args)
-    from sglang.srt.utils.hf_transformers_utils import resolve_hf_gguf_reference
+    from sglang.srt.utils.hf_transformers import resolve_hf_gguf_reference
 
     resolved = resolve_hf_gguf_reference(cfg.model_path, revision=cfg.revision)
     if resolved is not None:

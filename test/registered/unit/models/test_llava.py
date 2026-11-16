@@ -2,8 +2,9 @@ import unittest
 from unittest.mock import patch
 
 from PIL import UnidentifiedImageError
+from transformers.models.auto.modeling_auto import AutoModel
 
-from sglang.srt.models.llava import AutoModel, LlavaForConditionalGeneration
+from sglang.srt.models.llava import LlavaForConditionalGeneration
 from sglang.srt.multimodal.processors.llava import LlavaImageProcessor
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

@@ -26,6 +26,7 @@ import torch
 from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia.binding import prepare_megakernel
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -33,15 +34,14 @@ from sglang.srt.layers.dp_attention import (
     set_is_extend_in_batch,
 )
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
     ForwardBatch,
-    ForwardMode,
     NgramEmbeddingInfo,
     PPProxyTensors,
     enable_num_token_non_padded,
     get_server_return_hidden_states_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_extend,
     run_flashinfer_autotune_forward,
@@ -235,7 +235,6 @@ class BaseRunner(ABC):
         # elastic-EP scale-up widens num_dp_ranks on the published config
         self.num_dp_ranks = get_parallel().num_dp_ranks
         self.pp_size = get_parallel().pp_size
-        self.enable_pdmux = get_disagg().enable_pdmux
         self.return_hidden_states_mode = (
             CaptureHiddenMode.NULL
             if model_runner.is_draft_worker
@@ -276,6 +275,7 @@ class BaseRunner(ABC):
         )
         if prepare_model_resources is not None:
             prepare_model_resources(mr)
+        prepare_megakernel(mr)
 
         if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()

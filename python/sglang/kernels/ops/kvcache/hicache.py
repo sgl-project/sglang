@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     cache_once,
     is_hip_runtime,
@@ -130,7 +131,7 @@ def use_hicache_tma_kernel(
     """
     if _is_hip or not envs.SGLANG_HICACHE_TMA_TRANSFER.get():
         return False
-    if element_size % 16 != 0 or torch.cuda.get_device_capability()[0] < 9:
+    if element_size % 16 != 0 or not current_arch().is_sm_at_least(9):
         return False
     if page_size is not None and page_size % hicache_tma_rows_per_chunk(element_size):
         return False

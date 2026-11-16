@@ -51,8 +51,8 @@ scenarios; use a separate `--out` file when collecting pool-specific candidates.
 `flux1_modelopt_nvfp4_t2i` and 17742.04 ms for
 `qwen_image_2512_modelopt_nvfp4_t2i`. The measured Cirrascale 3 and Cirrascale 4
 runners below also have separate references, and `b200-cirrascale1-4567` reuses
-the `1-0123` references. Other Cirrascale runners retain the defaults until
-calibrated.
+the `1-0123` references. Cirrascale 2 joins the pool below. Other Cirrascale
+runners retain the defaults until calibrated.
 
 The Cirrascale 1, 3 and 4 hosts match on CPU, memory, kernel, driver, VBIOS,
 power limit and GPU settings, and their per-step denoise timings agree, so these
@@ -141,6 +141,22 @@ Each row is the minimum of the job's seven retried attempts, at most 6% below
 the Cirrascale 3 references. Under the pool rule above each half reuses its
 Cirrascale 3 counterpart: 1470.24 / 17894.49 ms for `4-0123`, and 1471.19 /
 17346.65 ms for `4-4567`.
+
+### Cirrascale 2 historical CI reference
+
+`b200-cirrascale2` is one runner over all eight GPUs, with no `-0123`/`-4567`
+suffix, so it matches the `b200-cirrascale2` prefix. It runs the same B200 and
+driver (580.126.20) as Cirrascale 4, and its per-step denoise timings agree:
+
+| CI job | Flux1 E2E (ms) | Flux1 step (ms) | Qwen2512 E2E (ms) | Qwen2512 step (ms) |
+| --- | ---: | ---: | ---: | ---: |
+| [PR #46926, `cirrascale2`](https://github.com/sgl-project/sglang/actions/runs/41712145442/job/126183089454) | 1169–1196 | 80.7–82.9 | 16136–16967 | 317.5–334.0 |
+| [Scheduled, `cirrascale4-4567`](https://github.com/sgl-project/sglang/actions/runs/41624885463/job/125879877166) | 1194.61 | 82.9 | 17071.79 | 336.1 |
+
+The `cirrascale2` row covers all seven attempts. Without an override, every one
+failed both E2E guards against the Verda defaults (1045.89 / 12062.58 ms
+limits). Under the pool rule above it reuses the `4-4567` references: 1471.19 /
+17346.65 ms.
 
 ## Initial loading references
 

@@ -152,10 +152,10 @@ SGLANG_ROOT := $(shell cd $(ROOT_DIR)/../../../../.. && pwd)
 # Run end-to-end test with bench_serving.py
 e2e: check-server
 	@echo "Checking if bench_serving.py is available..."
-	@if python -m sglang.bench_serving --help > /dev/null 2>&1; then \
+	@if python -m sglang.benchmark.serving --help > /dev/null 2>&1; then \
 		echo "✓ Using installed bench_serving.py module"; \
 		USE_SGLANG_ROOT=false; \
-	elif [ -f "$(SGLANG_ROOT)/python/sglang/bench_serving.py" ]; then \
+	elif [ -f "$(SGLANG_ROOT)/python/sglang/benchmark/serving.py" ]; then \
 		echo "✓ Using bench_serving.py from $(SGLANG_ROOT)"; \
 		USE_SGLANG_ROOT=true; \
 	else \
@@ -188,7 +188,7 @@ e2e: check-server
 		TOKENIZER_ARG=""; \
 	fi; \
 	if [ "$$USE_SGLANG_ROOT" = "true" ]; then \
-		cd $(SGLANG_ROOT) && PYTHONPATH=$(SGLANG_ROOT)/python:$$PYTHONPATH python python/sglang/bench_serving.py \
+		cd $(SGLANG_ROOT) && PYTHONPATH=$(SGLANG_ROOT)/python:$$PYTHONPATH python python/sglang/benchmark/serving.py \
 			--backend sglang-oai-chat \
 			--base-url $(E2E_BASE_URL) \
 			$$([ "$(E2E_MODEL)" != "default" ] && echo "--model $(E2E_MODEL)") \
@@ -202,7 +202,7 @@ e2e: check-server
 			--warmup-requests 5 \
 			--disable-tqdm || (echo "✗ E2E test failed"; exit 1); \
 	else \
-		python -m sglang.bench_serving \
+		python -m sglang.benchmark.serving \
 			--backend sglang-oai-chat \
 			--base-url $(E2E_BASE_URL) \
 			$$([ "$(E2E_MODEL)" != "default" ] && echo "--model $(E2E_MODEL)") \

@@ -9,7 +9,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 
 @unittest.skipUnless(torch.version.hip, "ROCm ASM prefill")
@@ -17,7 +17,7 @@ class TestMiniMaxHD128AsmPrefill(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         from sglang.srt.layers.attention import aiter_backend
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
 
         if "gfx950" not in torch.cuda.get_device_properties(0).gcnArchName:
             raise unittest.SkipTest("HD128 ASM prefill requires gfx950")

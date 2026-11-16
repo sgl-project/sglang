@@ -9,11 +9,10 @@ from unittest import mock
 import torch
 
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    ComponentData,
-    ComponentType,
-)
-from sglang.srt.mem_cache.unified_radix_cache import COMPONENT_REGISTRY, UnifiedTreeNode
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import ComponentData
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeNode
+from sglang.srt.mem_cache.unified_radix_cache import COMPONENT_REGISTRY
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.tree_slots import FAMILY_OF
 

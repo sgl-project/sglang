@@ -17,7 +17,6 @@ class MiniMaxH3VideoVAEArchConfig(VAEArchConfig):
     vae_clip_length: int = 17
     vae_token_drop: int = 3
     vae_encoder_tiling: int = 1
-    vae_decoder_tiling: int = 1
     vae_parallel_tiling: int = 1
     vae_tile_size: int = 256
     vae_tile_overlap_min: int = 64

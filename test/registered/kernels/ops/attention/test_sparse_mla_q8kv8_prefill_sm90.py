@@ -718,5 +718,108 @@ def test_q8kv8_topk_length_backscan(s_q: int, topk: int):
     assert torch.equal(got, ref)
 
 
+@pytest.mark.skipif(not _sm90_available(), reason="native H16 prefill requires SM90")
+@pytest.mark.parametrize("topk", [128, 8320, 16384])
+@torch.inference_mode()
+def test_native_h16_matches_bf16_sparse_prefill(topk):
+    from sglang.kernels.ops.attention.dsv4 import cute_sparse_mla_h16 as h16
+    from sglang.kernels.ops.attention.flash_mla_interface import flash_mla_sparse_fwd
+
+    q, kv, indices, scale, _, _, sink, lengths = _make_case(
+        512, True, s_q=4, topk=topk, s_kv=40009
+    )
+    q, kv = (q.float() * 2).bfloat16(), (kv.float() * 2).bfloat16()
+    lengths.copy_(
+        torch.tensor([0, 1, topk - 1, topk], dtype=torch.int32, device="cuda")
+    )
+    indices[0].fill_(-1)
+    indices[1, 0, 0] = 32768  # Production rebased workspaces exceed int16 IDs.
+    indices[3, 0, 1], indices[3, 0, 3] = -1, 40026
+    # Invalid slots read row 0, and a -1e30 sink zeroes the empty-row denominator.
+    indices[indices == 0] = 1
+    kv[0] = float("nan")
+    sink[::2] = -1e30
+    args = dict(
+        q=q[:, :16].contiguous(),
+        kv=kv.squeeze(1),
+        indices=indices.squeeze(1),
+        topk_length=lengths,
+        attn_sink=sink[:16],
+        sm_scale=scale,
+    )
+    actual = h16.cute_sparse_mla_h16_fwd(**args)
+    expected = flash_mla_sparse_fwd(
+        q=q,
+        kv=kv,
+        indices=indices,
+        sm_scale=scale,
+        d_v=512,
+        attn_sink=sink,
+        topk_length=lengths,
+    )[0][:, :16]
+    error = (actual.float() - expected.float()).abs()
+    assert error.max().item() <= 5e-4
+    assert error.mean().item() <= 5e-6
+    torch.testing.assert_close(actual, expected, atol=5e-4, rtol=1e-3)
+    assert torch.count_nonzero(actual[0]).item() == 0
+
+    repeat = h16.cute_sparse_mla_h16_fwd(**args)
+    assert repeat.data_ptr() != actual.data_ptr()
+    assert torch.equal(repeat, actual)
+    compiled = set(h16._COMPILE_CACHE)
+    shorter = h16.cute_sparse_mla_h16_fwd(
+        **dict(
+            args,
+            q=args["q"][:2],
+            kv=args["kv"][:-1],
+            indices=args["indices"][:2],
+            topk_length=lengths[:2],
+        )
+    )
+    assert set(h16._COMPILE_CACHE) == compiled
+    assert torch.equal(shorter, actual[:2])
+
+
+@pytest.mark.skipif(not _sm90_available(), reason="native H16 prefill requires SM90")
+@pytest.mark.parametrize("heads,topk", [(64, 128), (16, 8192)])
+@torch.inference_mode()
+def test_native_h16_int64_offsets(heads, topk):
+    from sglang.kernels.ops.attention.dsv4.cute_sparse_mla_h16 import (
+        cute_sparse_mla_h16_fwd,
+    )
+
+    q, kv, indices, scale, qs, ks, sink, lengths = _make_case(
+        512, True, s_q=2, topk=topk, s_kv=2
+    )
+    q, kv = q[:, :heads].bfloat16().contiguous(), kv[:2].bfloat16()
+    indices[:, :, :2] = torch.tensor([0, 1], dtype=torch.int32, device="cuda")
+    lengths.fill_(2)
+    allow_tf32 = torch.backends.cuda.matmul.allow_tf32
+    try:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        expected = _torch_sparse_attention_ref(
+            q[:, :16], kv, indices, scale, qs, ks, sink[:16], lengths
+        )[0]
+    finally:
+        torch.backends.cuda.matmul.allow_tf32 = allow_tf32
+
+    # Q and KV offsets pass Int32 in both rows, index and output offsets at TOPK 8192.
+    # Only the two boundary queries attend to KV.
+    s_q, s_kv = (1 << 31) // (heads * 512) + 1, (1 << 31) // 512 + 1
+    large_q = torch.zeros((s_q, heads, 512), dtype=q.dtype, device="cuda")
+    large_kv = torch.empty((s_kv, 512), dtype=kv.dtype, device="cuda")
+    large_indices = torch.full((s_q, topk), -1, dtype=torch.int32, device="cuda")
+    large_lengths = torch.zeros(s_q, dtype=torch.int32, device="cuda")
+    large_q[-2:] = q
+    large_kv[-2:] = kv.squeeze(1)
+    large_indices[-2:, :2] = indices[:, 0, :2] + s_kv - 2
+    large_lengths[-2:] = lengths
+    actual = cute_sparse_mla_h16_fwd(
+        large_q, large_kv, large_indices, large_lengths, sink, scale
+    )
+    torch.testing.assert_close(actual[-2:].float(), expected, atol=1e-3, rtol=1e-2)
+    assert torch.count_nonzero(actual[:-2]).item() == 0
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

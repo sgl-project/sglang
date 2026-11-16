@@ -43,7 +43,7 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2MLP as Ernie4MLP
 from sglang.srt.models.llama import LlamaAttention as Ernie4Attention
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix, is_cpu, is_npu, make_layers
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils.hf_transformers import get_rope_config
 
 _is_cpu = is_cpu()
 _is_npu = is_npu()
@@ -60,7 +60,7 @@ class MoEGate(nn.Module):
             torch.empty((config.moe_num_experts, config.hidden_size))
         )
         self.e_score_correction_bias = nn.Parameter(
-            torch.empty((1, config.moe_num_experts))
+            torch.empty((1, config.moe_num_experts), dtype=torch.float32)
         )
 
     def forward(self, hidden_states):

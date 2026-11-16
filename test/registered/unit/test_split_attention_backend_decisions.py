@@ -31,7 +31,10 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
-from sglang.srt.arg_groups.overrides import attention_backends_of, resolved_view
+from sglang.srt.arg_groups.model_override_base import (
+    attention_backends_of,
+    resolved_view,
+)
 
 
 class TestSplitBackendsReachTheDecisions(CustomTestCase):
@@ -87,11 +90,11 @@ class TestSplitBackendsReachTheDecisions(CustomTestCase):
     def test_inkling_selects_the_half_serving_the_forward(self):
         from types import SimpleNamespace
 
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
         from sglang.srt.model_executor.forward_context import (
             ForwardContext,
             forward_context,
         )
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.models.inkling_common.attn import serving_attention_backend
 
         self._publish(

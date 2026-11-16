@@ -27,9 +27,6 @@ from sglang.kernels.ops.communication.muse_spark_all_gather_norm_residual import
     all_gather_norm_residual,
     all_gather_norm_residual_supported,
 )
-from sglang.kernels.ops.gemm.muse_spark_router_gemm import (
-    MAX_TOKENS as ROUTER_GEMM_MAX_TOKENS,
-)
 from sglang.kernels.ops.gemm.muse_spark_router_gemv_cutedsl import (
     router_gemv_cute,
     router_gemv_cute_eligible,
@@ -182,13 +179,17 @@ def _uses_gptq_int4_experts(
     )
 
 
+# Decode batches up to this many tokens keep the fp32 router GEMM.
+_FP32_ROUTER_MAX_TOKENS = 8
+
+
 @functools.lru_cache(maxsize=1)
 def _split_bf16_router_supported() -> bool:
     return is_cuda() and get_device_capability()[0] == 9
 
 
 def _use_split_bf16_router(num_tokens: int) -> bool:
-    if num_tokens <= ROUTER_GEMM_MAX_TOKENS or not _split_bf16_router_supported():
+    if num_tokens <= _FP32_ROUTER_MAX_TOKENS or not _split_bf16_router_supported():
         return False
     return True
 

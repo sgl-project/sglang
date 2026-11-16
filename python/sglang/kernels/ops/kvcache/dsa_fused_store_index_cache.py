@@ -33,7 +33,9 @@ def _jit_dsa_fused_store_module(
 ) -> Module:
     """
     Build a JIT module that exposes:
-      module.fused_store_index_k_cache(input_bf16, index_k_with_scale_u8, loc_i64)
+      module.fused_store_index_k_cache(
+          input_bf16, index_k_with_scale_u8, loc_i64, dcp_size, dcp_rank
+      )
     """
     args = make_cpp_args(key_dtype, indices_dtype, page_size, is_arch_support_pdl())
     return load_jit(
@@ -71,6 +73,8 @@ def fused_store_index_k_cache(
     index_k_with_scale: torch.Tensor,
     out_cache_loc: torch.Tensor,
     page_size: int = 64,
+    dcp_size: int = 1,
+    dcp_rank: int = 0,
 ) -> None:
     """
     Fused: quantize bf16 key (N,128) -> fp8 + fp32 scale and write into DSATokenToKVPool.index_k_with_scale_buffer.
@@ -78,6 +82,8 @@ def fused_store_index_k_cache(
     key:            (num_tokens, 128) bf16 (or reshapeable to it)
     index_k_with_scale:  (num_pages, 64*(128+4)) uint8
     out_cache_loc:       (num_tokens,) int64 token indices in TokenToKVPool
+    dcp_size, dcp_rank:  under DCP, out_cache_loc holds widened slots; only the
+                         rank's own slots are stored, at row slot // dcp_size
     """
     assert key.is_cuda
     assert index_k_with_scale.is_cuda
@@ -102,4 +108,6 @@ def fused_store_index_k_cache(
         index_k_with_scale = index_k_with_scale.contiguous()
 
     module = _jit_dsa_fused_store_module(key.dtype, out_cache_loc.dtype, page_size)
-    module.fused_store_index_k_cache(key, index_k_with_scale, out_cache_loc)
+    module.fused_store_index_k_cache(
+        key, index_k_with_scale, out_cache_loc, dcp_size, dcp_rank
+    )

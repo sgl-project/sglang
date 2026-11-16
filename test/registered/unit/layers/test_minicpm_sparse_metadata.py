@@ -11,17 +11,19 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.mem_cache_utils import routed
 from sglang.test.test_utils import CustomTestCase
 
-with patch.dict(
-    sys.modules,
-    {
-        module: MagicMock()
-        for module in (
-            "sgl_kernel",
-            "sgl_kernel.quantization",
-            "sgl_kernel.scalar_type",
-        )
-    },
-):
+# Stub only these keys: patch.dict would also unload every module first
+# imported under it, and re-importing cutlass's native extension aborts.
+_SGL_KERNEL_STUBS = {
+    module: MagicMock()
+    for module in (
+        "sgl_kernel",
+        "sgl_kernel.quantization",
+        "sgl_kernel.scalar_type",
+    )
+}
+_saved_modules = {name: sys.modules.get(name) for name in _SGL_KERNEL_STUBS}
+sys.modules.update(_SGL_KERNEL_STUBS)
+try:
     from sglang.srt.layers.attention import attention_registry
     from sglang.srt.layers.attention.minicpm import backend as backend_module
     from sglang.srt.layers.attention.minicpm import sparse_utils
@@ -37,6 +39,12 @@ with patch.dict(
         CompressionLevelMetadata,
     )
     from sglang.srt.runtime_context import get_context, get_schedule
+finally:
+    for name, module in _saved_modules.items():
+        if module is None:
+            sys.modules.pop(name, None)
+        else:
+            sys.modules[name] = module
 
 register_cpu_ci(est_time=26, suite="base-a-test-cpu")
 

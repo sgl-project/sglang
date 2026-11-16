@@ -8,13 +8,10 @@ import numpy as np
 import torch
 from PIL import Image
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.interns1 import InternS1ForConditionalGeneration
 from sglang.srt.models.internvl import InternVLChatModel
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     BaseMultiModalProcessorOutput,

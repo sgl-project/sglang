@@ -217,8 +217,6 @@ flashinfer_sources = [
     str(_FLASHINFER_REPO.source_dir / "csrc" / "renorm.cu"),
 ]
 
-all_common_sources = common_sources + flashinfer_sources
-
 # Libraries to link.
 #
 # The cuda_free PPU SDK ships no libcuda/libcublas/libcublasLt; the sailified

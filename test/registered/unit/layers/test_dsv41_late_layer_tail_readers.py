@@ -20,11 +20,8 @@ from sglang.srt.layers.attention.deepseek_v4_backend import (
 )
 from sglang.srt.model_executor import forward_batch_info
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.models.deepseek_common import decoder_swa_bounded_replay
 from sglang.srt.models.deepseek_common.decoder_swa_bounded_replay import (
     late_layer_dp_counts,

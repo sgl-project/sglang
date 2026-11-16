@@ -20,7 +20,8 @@ from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.layers.logits_processor import LogitsMetadata, LogitsProcessor
 from sglang.srt.managers.scheduler_components.dp_attn import MLPSyncBatchInfo
 from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseConfig
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )

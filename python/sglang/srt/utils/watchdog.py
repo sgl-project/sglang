@@ -27,7 +27,7 @@ class Watchdog:
     ) -> Watchdog:
         if watchdog_timeout is None:
             assert test_stuck_time == 0, (
-                f"stuck tester can be enabled only if soft watchdog is enabled."
+                "stuck tester can be enabled only if soft watchdog is enabled."
             )
             return _WatchdogNoop()
         return _WatchdogReal(

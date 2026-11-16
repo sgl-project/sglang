@@ -19,7 +19,7 @@ from sglang.srt.lora.moe.base_gemm_provider.base import (  # noqa: E402
 )
 from sglang.test.ci.ci_register import register_cuda_ci  # noqa: E402
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="fused LoRA stages require CUDA"

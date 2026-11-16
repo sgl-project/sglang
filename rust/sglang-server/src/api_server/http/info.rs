@@ -25,7 +25,7 @@ use std::sync::Arc;
 use super::app::AppState;
 use super::native_api::native_error;
 use crate::api_server::core::{CoreError, FORWARD_PEER_PATH};
-use crate::api_server::handlers::ProfileOutcome;
+use crate::api_server::handlers::{AbortEnding, ProfileOutcome};
 use crate::message::info::ServerInfo;
 use crate::message::io_struct::ProfileOptions;
 
@@ -112,7 +112,8 @@ async fn model_info(State(state): State<Arc<AppState>>) -> Response {
 /// `launch_command`, scheduler init info, `kv_events`), as Python reports
 /// them, beneath the runtime's startup timings, typed allowlisted scheduler
 /// metrics and launch metadata. The raw scheduler state is never visible to
-/// this HTTP adapter.
+/// this HTTP adapter. Under DP, the listener of DP rank 0 adds every rank's
+/// listener as `dp_listeners` (see `CoreHandle::server_info`).
 async fn server_info(State(state): State<Arc<AppState>>) -> Response {
     let info = match await_server_info(&state).await {
         Ok(info) => info,
@@ -195,6 +196,7 @@ struct CheckWeightsBody {
     allow_quant_error: bool,
     skip_tensor_list: Option<Vec<String>>,
     selector: CheckWeightsSelector,
+    names: Option<Vec<String>>,
 }
 
 impl Default for CheckWeightsBody {
@@ -204,6 +206,7 @@ impl Default for CheckWeightsBody {
             allow_quant_error: false,
             skip_tensor_list: None,
             selector: CheckWeightsSelector::All,
+            names: None,
         }
     }
 }
@@ -251,6 +254,7 @@ async fn check_weights(State(state): State<Arc<AppState>>, body: Bytes) -> Respo
             body.allow_quant_error,
             body.skip_tensor_list,
             body.selector.as_str().to_owned(),
+            body.names,
         )
         .await
     {
@@ -384,7 +388,15 @@ struct AbortRequestBody {
 /// `abort_all`, through the core's cancellation registry, as the gRPC `Abort`
 /// does. Python's contract: 200 with an empty body whether or not anything
 /// matched, and an empty rid without `abort_all` is ignored rather than
-/// matching every request, as `TokenizerManager.abort_request` does.
+/// matching every request, as `TokenizerManager.abort_request` does. Each
+/// aborted request ends as Python ends it, on the scheduler's terminal output
+/// with the abort as its finish reason and the partial generation, rather than
+/// on the cancelled error the gRPC `Abort` reports. Under DP, the listener
+/// of DP rank 0 then relays the abort to every other rank's listener through
+/// the control relay (`CoreHandle::abort_peers`), since each one feeds only
+/// its own DP group and tracks only its own generations; a peer's failure is
+/// logged, not answered, and a relayed abort is served locally and never
+/// relayed again.
 async fn abort_request(
     State(state): State<Arc<AppState>>,
     body: Result<Json<AbortRequestBody>, JsonRejection>,
@@ -396,13 +408,18 @@ async fn abort_request(
         }
     };
     let rid = body.rid.unwrap_or_default();
+    let ending = AbortEnding::AbortFinishReason;
     if body.abort_all {
-        state.core.abort(None);
+        state.core.abort(None, ending);
     } else if rid.is_empty() {
         tracing::warn!("ignoring abort_request with an empty rid and abort_all=false");
     } else {
-        state.core.abort(Some(&rid));
+        state.core.abort(Some(&rid), ending);
     }
+    // Detached: the reply does not wait on peers, and a client hanging up
+    // cannot cancel the relay.
+    let core = state.core.clone();
+    tokio::spawn(async move { core.abort_peers(rid, body.abort_all).await });
     StatusCode::OK.into_response()
 }
 
@@ -413,20 +430,41 @@ mod tests {
         http::{Request as HttpRequest, header::CONTENT_TYPE},
     };
     use bytes::Bytes;
+    use futures::StreamExt;
     use tower::ServiceExt;
 
     use super::*;
-    use crate::api_server::core::CoreEvent;
+    use crate::api_server::core::fanout::ControlTarget;
+    use crate::api_server::core::{CoreEvent, peer_endpoints};
     use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata};
-    use crate::message::config::{DisaggregationMode, ModelConfig, ServerArgs};
+    use crate::message::config::{
+        DeploymentInfo, DisaggregationMode, ModelConfig, RustServerEndpoint, ServerArgs,
+    };
     use crate::message::ids::Rid;
+    use crate::message::io_struct::AbortReq;
+    use crate::message::request::Request;
     use crate::message::request::{GenerateRequest, RequestKind};
-    use crate::message::response::ResponseItem;
+    use crate::message::response::{
+        CachedTokensDetails, ChunkEvent, ChunkExtras, ResponseItem, WeightVersionSpan,
+    };
     use crate::tokenizer_manager::wiring::{AbortSource, TmEvent};
     use crate::utils::environ;
 
     fn test_state(
         server_args: ServerArgs,
+    ) -> (
+        Arc<AppState>,
+        flume::Receiver<TmEvent>,
+        flume::Receiver<crate::tokenizer_manager::wiring::AbortSource>,
+    ) {
+        test_state_with_peers(server_args, Vec::new())
+    }
+
+    /// A state whose core answers for the DP ranks `peer_endpoints` reach as
+    /// well as its own.
+    fn test_state_with_peers(
+        server_args: ServerArgs,
+        peer_endpoints: Vec<Arc<dyn ControlTarget>>,
     ) -> (
         Arc<AppState>,
         flume::Receiver<TmEvent>,
@@ -445,7 +483,7 @@ mod tests {
                 is_disaggregation: false,
                 mm_limits: Default::default(),
                 multimodal: false,
-                peer_endpoints: Vec::new(),
+                peer_endpoints,
                 metadata: CoreMetadata::from(server_args.as_ref()),
                 metrics: None,
             },
@@ -538,13 +576,28 @@ mod tests {
     async fn server_info_route_serializes_only_the_typed_public_subset() {
         // Native floats stay JSON numbers; NumPy scalars encoded by Python's
         // msgspec enc_hook=str must remain JSON strings, as before the refactor.
-        assert_server_info_response(rmpv::Value::from(23.616), serde_json::json!(23.616)).await;
-        assert_server_info_response(rmpv::Value::from("23.616"), serde_json::json!("23.616")).await;
+        // Under DP, the listener of DP rank 0 adds every rank's listener as
+        // `dp_listeners`, by rank; the other listeners do not.
+        assert_server_info_response(rmpv::Value::from(23.616), serde_json::json!(23.616), None)
+            .await;
+        assert_server_info_response(
+            rmpv::Value::from("23.616"),
+            serde_json::json!("23.616"),
+            Some(0),
+        )
+        .await;
+        assert_server_info_response(
+            rmpv::Value::from("23.616"),
+            serde_json::json!("23.616"),
+            Some(1),
+        )
+        .await;
     }
 
     async fn assert_server_info_response(
         kvcache: rmpv::Value,
         expected_kvcache: serde_json::Value,
+        dp_rank: Option<u32>,
     ) {
         let launch_fields = serde_json::json!({
             "model_path": "/model",
@@ -552,7 +605,18 @@ mod tests {
             "max_total_num_tokens": 1,
             "launch_command": "launch --tp-size 4",
         });
+        // Gathered in no particular order; published by rank.
+        let listeners = ["http://10.0.0.1:30000", "http://[fd00::2]:30000"];
+        let rust_server_endpoints = match dp_rank {
+            Some(_) => vec![endpoint(1, listeners[1]), endpoint(0, listeners[0])],
+            None => Vec::new(),
+        };
         let (state, intake_rx, abort_rx) = test_state(ServerArgs {
+            deployment_info: DeploymentInfo {
+                dp_rank,
+                rust_server_endpoints,
+                ..Default::default()
+            },
             model_path: "/model".into(),
             served_model_name: "served".into(),
             tokenizer_path: "/local-tokenizer-copy".into(),
@@ -706,7 +770,21 @@ mod tests {
                 .is_none(),
             "uncontracted scheduler fields must not silently become public API"
         );
+        let expected_dp_listeners = (dp_rank == Some(0)).then(|| {
+            serde_json::json!([
+                {"dp_rank": 0, "url": listeners[0]},
+                {"dp_rank": 1, "url": listeners[1]},
+            ])
+        });
+        assert_eq!(body.get("dp_listeners"), expected_dp_listeners.as_ref());
         assert!(abort_rx.try_recv().is_err());
+    }
+
+    fn endpoint(dp_rank: u32, endpoint: &str) -> RustServerEndpoint {
+        RustServerEndpoint {
+            dp_rank,
+            endpoint: endpoint.to_owned(),
+        }
     }
 
     /// `/flush_cache` relays one `FlushCacheReqInput` carrying the query
@@ -806,6 +884,186 @@ mod tests {
         assert!(intake_rx.try_recv().is_err());
     }
 
+    /// The listener an abort reaches cancels the named generations locally,
+    /// answers at once, and relays the abort to every other rank's listener
+    /// as the scheduler's `AbortReq`; a dead peer is only logged. A relayed
+    /// abort is served on the receiving listener alone, and a no-op abort is
+    /// neither served nor relayed.
+    #[tokio::test]
+    async fn abort_request_reaches_every_dp_listener() {
+        // A live peer that reports each abort relayed to it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live = format!("http://{}", listener.local_addr().unwrap());
+        let (received_tx, received_rx) = flume::unbounded::<AbortReq>();
+        let peer_app = Router::new().route(
+            FORWARD_PEER_PATH,
+            post(move |body: Bytes| {
+                let received_tx = received_tx.clone();
+                async move {
+                    let abort = AbortReq::decode(&body).unwrap().expect("an AbortReq");
+                    received_tx.send(abort).unwrap();
+                    (StatusCode::OK, rmp_serde::to_vec(&true).unwrap())
+                }
+            }),
+        );
+        tokio::spawn(async move { axum::serve(listener, peer_app).await.unwrap() });
+        // A dead peer: nothing listens on its port.
+        let dead = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            format!("http://{}", listener.local_addr().unwrap())
+        };
+
+        let info = DeploymentInfo {
+            dp_rank: Some(0),
+            rust_server_endpoints: vec![
+                endpoint(0, "http://127.0.0.1:1"),
+                endpoint(1, &dead),
+                endpoint(2, &live),
+            ],
+            ..Default::default()
+        };
+        let peers = peer_endpoints(&info, 0).unwrap();
+        let (state, intake_rx, abort_rx) = test_state_with_peers(
+            ServerArgs {
+                deployment_info: info,
+                ..Default::default()
+            },
+            peers,
+        );
+        let core = state.core.clone();
+        let app = routes().with_state(state);
+        let post_abort = |uri: &'static str, body: Bytes| {
+            app.clone().oneshot(
+                HttpRequest::builder()
+                    .method("POST")
+                    .uri(uri)
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body))
+                    .unwrap(),
+            )
+        };
+        let relayed = AbortReq::new("client-rid".into(), false).encode().unwrap();
+        for (uri, body, local, forwarded) in [
+            (
+                "/abort_request",
+                Bytes::from_static(br#"{"rid": "client-rid"}"#),
+                true,
+                Some(("client-rid", false)),
+            ),
+            (
+                "/abort_request",
+                Bytes::from_static(br#"{"abort_all": true}"#),
+                true,
+                Some(("", true)),
+            ),
+            (FORWARD_PEER_PATH, relayed, true, None),
+            (
+                "/abort_request",
+                Bytes::from_static(br#"{"rid": ""}"#),
+                false,
+                None,
+            ),
+        ] {
+            let case = format!("{uri} {}", String::from_utf8_lossy(&body));
+            // A live generation each abort but the no-op one names.
+            let call = core
+                .generate(GenerateRequest {
+                    rid: Rid::from_client("client-rid"),
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+            else {
+                panic!("{case}: generate must submit one request");
+            };
+            assert!(admission.try_accept(), "{case}");
+            let response = post_abort(uri, body).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{case}");
+            assert_eq!(
+                matches!(abort_rx.try_recv(), Ok(AbortSource::Request(rid)) if rid == request.rid),
+                local,
+                "{case}: unexpected local abort"
+            );
+            // The aborted call still awaits the scheduler's terminal output;
+            // dropping it releases the request.
+            drop(call);
+            assert!(
+                matches!(abort_rx.try_recv(), Ok(AbortSource::Guard(rid)) if rid == request.rid),
+                "{case}: dropping the call must release the request"
+            );
+            let Some((rid, abort_all)) = forwarded else {
+                continue;
+            };
+            let received =
+                tokio::time::timeout(std::time::Duration::from_secs(10), received_rx.recv_async())
+                    .await
+                    .expect("the live peer never received the abort")
+                    .unwrap();
+            assert_eq!(received.abort_all(), abort_all, "{case}");
+            if abort_all {
+                assert_eq!(received.get_rid().len(), 32, "{case}: a minted rid");
+            } else {
+                assert_eq!(received.get_rid(), rid, "{case}");
+            }
+        }
+        let late = tokio::time::timeout(
+            std::time::Duration::from_millis(500),
+            received_rx.recv_async(),
+        );
+        assert!(late.await.is_err(), "a relayed or no-op abort was relayed");
+        assert!(
+            intake_rx.try_recv().is_err(),
+            "an abort never reaches the scheduler as control"
+        );
+    }
+
+    /// A table that points a listener back at itself (a peer published at
+    /// this listener's own address) cannot loop: its own relayed abort is
+    /// served on the local registry and never relayed again, so one client
+    /// abort is two requests served, the client's and its own.
+    #[tokio::test]
+    async fn a_self_dial_is_one_local_abort() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let own = format!("http://{}", listener.local_addr().unwrap());
+        let info = DeploymentInfo {
+            dp_rank: Some(0),
+            rust_server_endpoints: vec![endpoint(0, &own), endpoint(1, &own)],
+            ..Default::default()
+        };
+        let peers = peer_endpoints(&info, 0).unwrap();
+        let (state, _intake_rx, _abort_rx) = test_state_with_peers(
+            ServerArgs {
+                deployment_info: info,
+                ..Default::default()
+            },
+            peers,
+        );
+        // Aborts are idempotent in the core, so count the requests served.
+        let served = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = served.clone();
+        let app = routes()
+            .with_state(state)
+            .layer(axum::middleware::map_request(
+                move |request: HttpRequest<Body>| {
+                    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    async move { request }
+                },
+            ));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let response = reqwest::Client::new()
+            .post(format!("{own}/abort_request"))
+            .header(CONTENT_TYPE, "application/json")
+            .body(r#"{"abort_all": true}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        assert_eq!(served.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
     /// `/weights_checker` relays one `CheckWeightsReqInput` carrying the body's
     /// fields (Python's defaults for a missing body) and answers with Python's
     /// JSON: the rank records as sent, in order, with the SHA-256 of their
@@ -853,8 +1111,15 @@ mod tests {
             (
                 "POST",
                 r#"{"action": "fingerprint", "allow_quant_error": true,
-                    "skip_tensor_list": ["lm_head"], "selector": "target", "rid": "x"}"#,
-                ("fingerprint", true, Some("lm_head"), "target"),
+                    "skip_tensor_list": ["lm_head"], "selector": "target", "rid": "x",
+                    "names": ["model.weight"]}"#,
+                (
+                    "fingerprint",
+                    true,
+                    Some("lm_head"),
+                    "target",
+                    Some("model.weight"),
+                ),
                 (true, "Success.", ranks.clone()),
                 StatusCode::OK,
                 serde_json::json!({
@@ -868,7 +1133,7 @@ mod tests {
             (
                 "GET",
                 "",
-                ("checksum", false, None, "all"),
+                ("checksum", false, None, "all", None),
                 (false, "rank 1 failed", rmpv::Value::Nil),
                 StatusCode::BAD_REQUEST,
                 serde_json::json!({"success": false, "message": "rank 1 failed"}),
@@ -876,7 +1141,7 @@ mod tests {
             (
                 "POST",
                 "null",
-                ("checksum", false, None, "all"),
+                ("checksum", false, None, "all", None),
                 (true, "Success.", rmpv::Value::Array(vec![])),
                 StatusCode::OK,
                 serde_json::json!({
@@ -916,6 +1181,8 @@ mod tests {
             assert_eq!(header[4].as_bool(), Some(request.1), "{body}");
             assert_eq!(header[5][0].as_str(), request.2, "{body}");
             assert_eq!(header[6].as_str(), Some(request.3), "{body}");
+            assert_eq!(header.as_array().unwrap().len(), 8);
+            assert_eq!(header[7][0].as_str(), request.4, "{body}");
 
             let mut payload = Vec::new();
             rmpv::encode::write_value(
@@ -1199,8 +1466,8 @@ mod tests {
 
     /// `/abort_request` cancels the live generation submitted under the body's
     /// rid, or every one with `abort_all`, and answers Python's empty 200: the
-    /// runtime is told to abort the request and the client's call ends as
-    /// cancelled. A rid nothing runs under is still a 200 with nothing
+    /// scheduler is told to abort the request, and the client's call ends on
+    /// the scheduler's answer. A rid nothing runs under is still a 200 with nothing
     /// aborted, an empty rid without `abort_all` is ignored, and a malformed
     /// body is a 400.
     #[tokio::test]
@@ -1247,21 +1514,229 @@ mod tests {
             }
             if aborted {
                 assert!(
-                    matches!(abort_rx.try_recv(), Ok(AbortSource::Guard(rid)) if rid == request.rid),
-                    "{body}: the runtime must be told to abort the request"
+                    matches!(abort_rx.try_recv(), Ok(AbortSource::Request(rid)) if rid == request.rid),
+                    "{body}: the scheduler must be told to abort the request"
                 );
                 assert!(
-                    matches!(
-                        call.recv().await,
-                        Some(CoreEvent::Failed(CoreError::Cancelled(_)))
-                    ),
-                    "{body}: the client's call ends as cancelled"
+                    futures::FutureExt::now_or_never(call.recv()).is_none(),
+                    "{body}: the call waits for the scheduler's answer"
+                );
+                request
+                    .sink
+                    .try_send(scheduler_abort(&request.rid, "", Vec::new(), 0))
+                    .unwrap();
+                let Some(CoreEvent::Finished(output)) = call.recv().await else {
+                    panic!("{body}: the client's call finishes on the scheduler's abort");
+                };
+                assert_eq!(
+                    output.finish_reason.as_ref().and_then(|r| r.kind_name()),
+                    Some("abort"),
+                    "{body}"
                 );
             } else {
                 assert!(abort_rx.try_recv().is_err(), "{body}: nothing is aborted");
             }
             drop(request);
         }
+    }
+
+    /// The terminal output Python's scheduler sends for a running request an
+    /// `/abort_request` names: the step's tokens, the request's counts, cache
+    /// split and weight-version span, and the plain abort as finish reason.
+    fn scheduler_abort(
+        rid: &Rid,
+        text: &str,
+        token_ids: Vec<i64>,
+        completion_tokens: u64,
+    ) -> ResponseItem {
+        ResponseItem::Done(ChunkEvent {
+            rid: rid.clone(),
+            text: text.into(),
+            token_ids,
+            prompt_tokens: 5,
+            cached_tokens: 2,
+            completion_tokens,
+            finish_reason: Some(
+                serde_json::from_value(serde_json::json!({
+                    "type": "abort",
+                    "message": "Aborted",
+                    "status_code": null,
+                    "err_type": null
+                }))
+                .unwrap(),
+            ),
+            extras: Some(Box::new(ChunkExtras {
+                cached_tokens_details: Some(CachedTokensDetails {
+                    device: 0,
+                    host: 2,
+                    storage: None,
+                    storage_backend: None,
+                }),
+                weight_versions: vec![WeightVersionSpan {
+                    version: "v1".into(),
+                    start: 0,
+                    end: 17,
+                }],
+                ..Default::default()
+            })),
+            ..Default::default()
+        })
+    }
+
+    /// An `/abort_request` leaves the request's sink in place and asks the
+    /// scheduler to abort it, so each surface ends on the scheduler's terminal
+    /// output as Python's server ends it: a native stream on a final frame
+    /// with all the output, the counts, the cache split and the abort as its
+    /// finish reason, then `[DONE]`; a unary `/generate` aborted before any
+    /// intermediate output with a 200 carrying the partial generation; a
+    /// `/v1/completions` stream on a final chunk whose `finish_reason` is
+    /// `abort`, then `[DONE]`.
+    #[tokio::test]
+    async fn abort_request_ends_requests_on_the_schedulers_abort() {
+        let (state, intake_rx, abort_rx) = test_state(ServerArgs::default());
+        let app = routes()
+            .merge(super::super::native_api::routes())
+            .merge(super::super::openai::routes())
+            .with_state(state);
+        let post = |path: &'static str, body: serde_json::Value| {
+            tokio::spawn(
+                app.clone().oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri(path)
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                ),
+            )
+        };
+        // Accept the next generation, optionally streaming one frame of it.
+        let start = |frame: bool| {
+            let intake_rx = intake_rx.clone();
+            async move {
+                let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
+                else {
+                    panic!("expected a generation");
+                };
+                assert!(admission.try_accept());
+                if frame {
+                    request
+                        .sink
+                        .try_send(ResponseItem::Frame(ChunkEvent {
+                            rid: request.rid.clone(),
+                            text: "partial".into(),
+                            token_ids: vec![7],
+                            prompt_tokens: 5,
+                            cached_tokens: 2,
+                            completion_tokens: 1,
+                            ..Default::default()
+                        }))
+                        .unwrap();
+                }
+                request
+            }
+        };
+        // Abort through the route, then answer as the scheduler does.
+        let (post, abort_rx) = (&post, &abort_rx);
+        let abort = |body: serde_json::Value, request: Request, terminal: ResponseItem| async move {
+            let response = post("/abort_request", body).await.unwrap().unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(
+                matches!(abort_rx.try_recv(), Ok(AbortSource::Request(rid)) if rid == request.rid)
+            );
+            request.sink.try_send(terminal).unwrap();
+        };
+        let data = |chunk: &[u8]| -> Vec<String> {
+            std::str::from_utf8(chunk)
+                .unwrap()
+                .split("\n\n")
+                .filter_map(|event| event.strip_prefix("data: ").map(str::to_owned))
+                .collect()
+        };
+
+        let response = post(
+            "/generate",
+            serde_json::json!({"text": "hi", "rid": "stream", "stream": true}),
+        );
+        let request = start(true).await;
+        let mut body = response
+            .await
+            .unwrap()
+            .unwrap()
+            .into_body()
+            .into_data_stream();
+        let first = data(&body.next().await.unwrap().unwrap());
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&first[0]).unwrap()["text"],
+            "partial"
+        );
+        let terminal = scheduler_abort(&request.rid, " end", vec![8], 1);
+        abort(serde_json::json!({"rid": "stream"}), request, terminal).await;
+        let mut rest = Vec::new();
+        while let Some(chunk) = body.next().await {
+            rest.extend(data(&chunk.unwrap()));
+        }
+        let [last, done] = rest.as_slice() else {
+            panic!("expected a final frame and [DONE]: {rest:?}");
+        };
+        let last: serde_json::Value = serde_json::from_str(last).unwrap();
+        assert!(last.get("error").is_none(), "{last}");
+        assert_eq!(last["text"], "partial end");
+        assert_eq!(last["output_ids"], serde_json::json!([7, 8]));
+        let meta = &last["meta_info"];
+        assert_eq!(meta["finish_reason"]["type"], "abort");
+        assert_eq!(meta["finish_reason"]["message"], "Aborted");
+        assert_eq!(meta["prompt_tokens"], 5);
+        assert_eq!(meta["completion_tokens"], 2);
+        assert_eq!(
+            meta["cached_tokens_details"],
+            serde_json::json!({"device": 0, "host": 2})
+        );
+        assert_eq!(meta["weight_versions"][0]["version"], "v1");
+        assert!(meta["e2e_latency"].is_f64());
+        assert_eq!(done, "[DONE]");
+
+        let response = post(
+            "/generate",
+            serde_json::json!({"text": "hi", "rid": "unary"}),
+        );
+        let request = start(false).await;
+        let terminal = scheduler_abort(&request.rid, "seventeen tokens", (1..=17).collect(), 17);
+        abort(serde_json::json!({"rid": "unary"}), request, terminal).await;
+        let response = response.await.unwrap().unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), 64 * 1024).await.unwrap())
+                .unwrap();
+        assert_eq!(body["text"], "seventeen tokens");
+        assert_eq!(body["output_ids"].as_array().unwrap().len(), 17);
+        assert_eq!(body["meta_info"]["completion_tokens"], 17);
+        assert_eq!(body["meta_info"]["finish_reason"]["type"], "abort");
+
+        let response = post(
+            "/v1/completions",
+            serde_json::json!({"model": "m", "prompt": "hi", "stream": true}),
+        );
+        let request = start(true).await;
+        let mut body = response
+            .await
+            .unwrap()
+            .unwrap()
+            .into_body()
+            .into_data_stream();
+        body.next().await.unwrap().unwrap();
+        let terminal = scheduler_abort(&request.rid, "", Vec::new(), 0);
+        abort(serde_json::json!({"abort_all": true}), request, terminal).await;
+        let mut rest = Vec::new();
+        while let Some(chunk) = body.next().await {
+            rest.extend(data(&chunk.unwrap()));
+        }
+        let [last, done] = rest.as_slice() else {
+            panic!("expected a final chunk and [DONE]: {rest:?}");
+        };
+        let last: serde_json::Value = serde_json::from_str(last).unwrap();
+        assert_eq!(last["choices"][0]["finish_reason"], "abort", "{last}");
+        assert_eq!(done, "[DONE]");
     }
 
     /// A forwarded control request reaches the local scheduler under the rid

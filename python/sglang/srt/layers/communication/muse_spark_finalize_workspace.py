@@ -56,32 +56,43 @@ class FinalizePushWorkspace:
             raise ValueError(
                 "Finalize push requires H divisible by 256 and sufficient buffer capacity"
             )
-        self.max_tokens = min(384, self.slot_bytes // (hidden_dim * 2))
+        self.one_shot_max_tokens = min(384, self.slot_bytes // (hidden_dim * 2))
+        # A 2shot_push slot holds a partial half and a reduced half of an M x H / world slice.
+        # 2-shot also needs every rank to own whole 8-column vectors of H.
+        self.two_shot_max_tokens = (
+            self.slot_bytes * self.world_size // (4 * hidden_dim)
+            if hidden_dim % (8 * self.world_size) == 0
+            else 0
+        )
+        self.max_tokens = max(self.one_shot_max_tokens, self.two_shot_max_tokens)
         self.fallback_logged = False
         self.fusion_logged = False
 
     def uses_one_shot_push(self, num_tokens: int) -> bool:
         return self.communicator.uses_one_shot_push(num_tokens * self.hidden_dim * 2)
 
-    def can_fuse(self, tp_group, num_tokens: int) -> bool:
-        """Use custom AR storage while respecting explicit algorithm overrides.
+    def uses_two_shot_push(self, num_tokens: int) -> bool:
+        """Fused 2-shot exactly where the standalone AR would pick 2shot_push."""
+        return num_tokens <= self.two_shot_max_tokens and (
+            self.communicator.uses_two_shot_push(num_tokens * self.hidden_dim * 2)
+        )
 
-        Fusion has a different crossover from a standalone AR launch. Allow
-        push through 384 tokens when its allocated slot fits, even if ordinary
-        CUDA-graph AR would select pull above its 288-token crossover (H=4096),
-        but not where the standalone AR would pick 2shot_push.
-        No standalone AR thresholds or buffer allocations are changed.
+    def can_fuse(self, tp_group, num_tokens: int) -> bool:
+        """Fuse where the standalone AR runs a push algorithm, respecting explicit overrides:
+        2shot_push, or 1shot_push up to 384 tokens. No standalone AR thresholds or buffer
+        allocations are changed.
         """
         if (
             torch.compiler.is_compiling()
             or self.communicator is not tp_group.ca_comm
             or self.communicator.disabled
-            or not 0 < num_tokens <= self.max_tokens
+            or num_tokens <= 0
         ):
             return False
-        if self.world_size > 4 and not self.uses_one_shot_push(num_tokens):
-            return False
-        if self.communicator.uses_two_shot_push(num_tokens * self.hidden_dim * 2):
+        one_shot = num_tokens <= self.one_shot_max_tokens and self.uses_one_shot_push(
+            num_tokens
+        )
+        if not (one_shot or self.uses_two_shot_push(num_tokens)):
             return False
         output = (
             self.peers[self.rank]
@@ -92,10 +103,6 @@ class FinalizePushWorkspace:
         return (
             not tp_group._can_use_flashinfer_allreduce(output)
             and tp_group._resolve_outplace_all_reduce_method(output) == "ca"
-            and (
-                self.communicator.override_algo is None
-                or self.uses_one_shot_push(num_tokens)
-            )
         )
 
     @property
@@ -108,7 +115,12 @@ class FinalizePushWorkspace:
             or output.dtype != torch.bfloat16
             or output.ndim != 2
             or output.shape[1] != self.hidden_dim
-            or output.shape[0] > self.max_tokens
+            or output.shape[0]
+            > (
+                self.two_shot_max_tokens
+                if self.uses_two_shot_push(output.shape[0])
+                else self.one_shot_max_tokens
+            )
             or not output.is_contiguous()
             or output.data_ptr() % 16
         ):

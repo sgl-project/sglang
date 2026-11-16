@@ -1682,12 +1682,15 @@ STANDALONE_FILES = {
         "../single_test_file/test_dp_serving_2_gpu.py",
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py",
         "../single_test_file/test_usp_replicated_parity_2_gpu.py",
+        "../single_test_file/test_cosmos3_action_sp_2_gpu.py",
         "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py",
         "../unit/test_async_output_save.py",
         "../unit/test_kandinsky6_sequence_parallel.py",
+        "../unit/test_kandinsky6_sr_decode_parallel.py",
         "../unit/test_kandinsky6_sr_sequence_parallel.py",
         "../unit/test_nomas_parallel.py",
         "../unit/test_qwen_image21_distributed.py",
+        "../unit/test_text_encoding_cache.py",
     ],
 }
 
@@ -1741,15 +1744,22 @@ STANDALONE_FILE_EST_TIMES = {
         "../single_test_file/test_pynccl_a2a_capture_2_gpu.py": 30.0,
         # two SDPA parity checks on 128+6 rows
         "../single_test_file/test_usp_replicated_parity_2_gpu.py": 30.0,
+        # two spawned ranks on a tiny random-init transformer, no model load;
+        # measured 48 s in CI
+        "../single_test_file/test_cosmos3_action_sp_2_gpu.py": 60.0,
         # no model load; two small all-to-alls
         "../single_test_file/test_vdn_ulysses_exchange_2_gpu.py": 30.0,
         # the unit/ suite runs on one GPU; these files carry its 2-GPU cases
         "../unit/test_async_output_save.py": 20.0,
         "../unit/test_kandinsky6_sequence_parallel.py": 90.0,
+        # 2x GB300: 204 s, six spawned SR decode cases
+        "../unit/test_kandinsky6_sr_decode_parallel.py": 240.0,
         "../unit/test_kandinsky6_sr_sequence_parallel.py": 90.0,
         # H200: TP/SP parity for SDPA and FA3 (55 s each), window decode (22 s)
         "../unit/test_nomas_parallel.py": 140.0,
         "../unit/test_qwen_image21_distributed.py": 40.0,
+        # 2x GB300: 101 s, mostly the spawned DP/FSDP cases
+        "../unit/test_text_encoding_cache.py": 120.0,
     },
 }
 

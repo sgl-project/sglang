@@ -11,10 +11,10 @@ from sglang.multimodal_gen.configs.models.encoders.mistral3 import Mistral3Encod
 from sglang.multimodal_gen.configs.models.vaes.ernie_image import ErnieImageVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
-    ModelTaskType,
     pad_text_embeddings_with_mask,
     shard_rotary_emb_for_sp,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)

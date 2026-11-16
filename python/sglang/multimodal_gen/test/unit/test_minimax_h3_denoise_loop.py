@@ -2,7 +2,7 @@
 """Numerical contract for request-static H3 denoise metadata."""
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -20,6 +20,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.m
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.packed_sequence import (
     minimax_h3_packed_sequence,
     minimax_h3_packed_sequence_ref2va_blocks,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages import (
+    denoising,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
     MiniMaxH3DenoisingStage,
@@ -92,6 +95,28 @@ def _branch(
         token_tags=packed["token_tags"] if token_tags is None else token_tags,
         device=torch.device("cpu"),
     )
+
+
+def test_full_loop_accepts_out_of_tree_platform():
+    """Accept OOT platforms without loading a model or accessing hardware."""
+
+    class DeviceLookupReached(Exception):
+        pass
+
+    platform = Mock()
+    for kind in ("cuda", "hip", "cpu", "mps", "npu", "xpu"):
+        getattr(platform, f"is_{kind}").return_value = False
+    platform.is_out_of_tree.return_value = True
+    platform.get_local_torch_device.side_effect = DeviceLookupReached
+    stage = MiniMaxH3DenoisingStage.__new__(MiniMaxH3DenoisingStage)
+
+    with (
+        patch.object(denoising, "current_platform", platform),
+        patch.object(denoising, "_resolve_full_loop_context"),
+        pytest.raises(DeviceLookupReached),
+    ):
+        stage._run_full_loop(None, None)
+    platform.get_local_torch_device.assert_called_once_with()
 
 
 def test_time_shift_sigmas_build_exact_denoise_step_count():

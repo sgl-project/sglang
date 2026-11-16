@@ -7,8 +7,11 @@ import subprocess
 
 from tvm_ffi.libinfo import find_dlpack_include_path, find_include_path
 
-from sglang.kernels.jit.utils import get_jit_cuda_arch
-from sglang.kernels.jit.utils.arch import get_default_target_flags, make_jit_cuda_arch
+from sglang.kernels.jit.utils.arch import (
+    CompileArch,
+    get_compile_arch,
+    get_default_target_flags,
+)
 from sglang.kernels.jit.utils.compile import DEFAULT_INCLUDE
 from sglang.kernels.jit.utils.deps import REGISTERED_DEPENDENCIES
 
@@ -69,9 +72,9 @@ def generate_clangd():
     if args.cuda_target:
         assert args.cuda_target.count(".") == 1
         major, minor = args.cuda_target.split(".")
-        arch = make_jit_cuda_arch(int(major), int(minor))
+        arch = CompileArch.for_capability(int(major), int(minor))
     else:
-        arch = get_jit_cuda_arch()
+        arch = get_compile_arch()
         assert arch.major > 0, (
             "Cannot detect CUDA architecture, please specify --cuda-target explicitly."
         )
@@ -89,6 +92,10 @@ def generate_clangd():
     if arch.major >= 9:
         compile_flags.append("-D_CG_LIMIT_INCLUDED_DEPENDENCIES=1")
         compile_flags.append("-D_CG_HAS_CLUSTER_GROUP=1")
+
+    # NOTE: like Python's TYPE_CHECKING, set only for IDE indexing; headers use it to
+    # default the macros the JIT passes per module
+    compile_flags.append("-DSGL_TYPE_CHECKING=1")
 
     # NOTE: skip these flags because clangd don't recognize them
     UNSUPPORTED_FLAGS = {"--expt-relaxed-constexpr"}

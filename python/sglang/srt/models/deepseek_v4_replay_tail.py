@@ -31,13 +31,13 @@ from sglang.srt.model_executor.cuda_graph_config import (
     Phase,
     check_cuda_graph_backend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.model_executor.forward_context import (
     forward_context,
     get_attn_backend,
     get_forward_context,
     has_forward_context,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner_components.layer_setup import (
     compute_attention_and_moe_layers,
 )

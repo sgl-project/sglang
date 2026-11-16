@@ -5,6 +5,7 @@ the entries and their structs."""
 
 from __future__ import annotations
 
+import logging
 from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Callable, Optional
 
@@ -14,6 +15,7 @@ from sglang.srt.kernel_plugins.nvidia.binding import (
     megakernel_agree,
     megakernel_enabled,
     megakernel_entry,
+    megakernel_graph_variants,
 )
 from sglang.srt.kernel_plugins.nvidia.eagle_binding import (
     EagleDraftExtendIO,
@@ -32,6 +34,70 @@ if TYPE_CHECKING:
 
 # the draft model's entries
 DRAFT_ENTRIES = ("draft_loop", "draft_extend", "begin_draft_round")
+logger = logging.getLogger(__name__)
+
+
+class EagleDraftRuntime:
+    """Always-present dispatch for draft workers and their graph runners."""
+
+    def bind_draft_graphs(self, runner: Any) -> frozenset[int]:
+        return frozenset()
+
+    def bind_extend_graphs(self, runner: Any) -> frozenset[int]:
+        return frozenset()
+
+    def graph_variants(
+        self,
+        model: torch.nn.Module,
+        runner: str,
+        *,
+        batch_sizes: frozenset[int],
+    ) -> Any:
+        return megakernel_graph_variants(model, runner, batch_sizes=batch_sizes)
+
+    def run_draft_loop(
+        self,
+        *,
+        runner: Any,
+        forward_batch: ForwardBatch,
+        stock: Callable[[], tuple],
+    ) -> tuple:
+        return stock()
+
+    def run_draft_extend(
+        self,
+        *,
+        runner: Any,
+        forward_batch: ForwardBatch,
+        stock: Callable[[], Any],
+    ) -> Any:
+        return stock()
+
+    def note_draft_extend(self) -> None:
+        pass
+
+    def extend_tokens(
+        self,
+        *,
+        runner: Any,
+        batch: ScheduleBatch,
+        stock: Callable[[], tuple],
+        active: bool = True,
+    ) -> tuple:
+        return stock()
+
+    def begin_draft_round(
+        self,
+        *,
+        runner: Any,
+        batch: ScheduleBatch,
+        draft_input: Any,
+        active: bool = True,
+    ) -> None:
+        pass
+
+
+STOCK_EAGLE_DRAFT_RUNTIME = EagleDraftRuntime()
 
 
 def _offers_eagle_entries(*, draft_model: Any) -> bool:
@@ -82,7 +148,13 @@ def init_eagle_megakernel(*, draft_worker: Any) -> Optional[EagleMegakernel]:
     return EagleMegakernel(draft_worker=draft_worker)
 
 
-class EagleMegakernel:
+def init_eagle_draft_runtime(*, draft_worker: Any) -> EagleDraftRuntime:
+    """Resolve draft dispatch once and always return a strategy."""
+    specialized = init_eagle_megakernel(draft_worker=draft_worker)
+    return STOCK_EAGLE_DRAFT_RUNTIME if specialized is None else specialized
+
+
+class EagleMegakernel(EagleDraftRuntime):
     """SGLang's side of the entries, never handed to a plugin: the batch sizes whose
     captured graphs run each entry, their SGLang-owned outputs, and where each draft
     round's input came from."""
@@ -130,11 +202,19 @@ class EagleMegakernel:
             )
         return frozenset(served)
 
-    def run_draft_loop(self, *, runner: Any, forward_batch: ForwardBatch) -> tuple:
+    def run_draft_loop(
+        self,
+        *,
+        runner: Any,
+        forward_batch: ForwardBatch,
+        stock: Callable[[], tuple],
+    ) -> tuple:
         """Inside the draft graph's capture: draft_loop's step in place of
         draft_forward, with the same outputs."""
         bs = int(forward_batch.batch_size)
-        graphs = self._draft_graphs[id(runner)]
+        graphs = self._draft_graphs.get(id(runner))
+        if graphs is None or bs not in graphs.steps:
+            return stock()
         draft_tokens = graphs.draft_tokens[:bs]
         spec_info = forward_batch.spec_info
         graphs.steps[bs](
@@ -173,19 +253,21 @@ class EagleMegakernel:
         with the runner's outputs, and returns the batch sizes whose graphs run it."""
         if self._draft_extend is None:
             return frozenset()
-        out = SimpleNamespace(
-            topk_index=torch.zeros(
-                (runner.max_bs, 1), dtype=torch.int64, device=runner.device
-            ),
-            topk_p=torch.ones(
-                (runner.max_bs, 1), dtype=torch.float32, device=runner.device
-            ),
-            hidden=torch.zeros(
-                (runner.max_bs, self._draft_config.hidden_size),
-                dtype=self._draft_config.dtype,
-                device=runner.device,
-            ),
-        )
+        out = self._draft_inputs_as_extend_outputs(runner.max_bs)
+        if out is None:
+            out = SimpleNamespace(
+                topk_index=torch.zeros(
+                    (runner.max_bs, 1), dtype=torch.int64, device=runner.device
+                ),
+                topk_p=torch.ones(
+                    (runner.max_bs, 1), dtype=torch.float32, device=runner.device
+                ),
+                hidden=torch.zeros(
+                    (runner.max_bs, self._draft_config.hidden_size),
+                    dtype=self._draft_config.dtype,
+                    device=runner.device,
+                ),
+            )
         steps = self._draft_extend(
             tokens_per_request=runner.captured_req_width,
             max_bs=runner.max_bs,
@@ -198,13 +280,51 @@ class EagleMegakernel:
             self._extend_graphs[id(runner)] = SimpleNamespace(steps=served, out=out)
         return frozenset(served)
 
-    def run_draft_extend(self, *, runner: Any, forward_batch: ForwardBatch) -> Any:
+    def _draft_inputs_as_extend_outputs(self, max_bs: int) -> Optional[SimpleNamespace]:
+        """Keep compatible EP1 relay outputs in the next draft's input buffers."""
+        from sglang.srt.managers.overlap_utils import spec_relay_bypass_enabled
+
+        if not spec_relay_bypass_enabled() or get_parallel().moe_ep_size != 1:
+            return None
+        draft_runner = self._draft_worker.cuda_graph_runner
+        if draft_runner is None:
+            return None
+        b = draft_runner.buffers
+        hidden = b.hidden_states
+        if (
+            b.topk_index.shape[0] < max_bs
+            or tuple(b.topk_index.shape[1:]) != (1,)
+            or b.topk_index.dtype != torch.int64
+            or tuple(b.topk_p.shape[1:]) != (1,)
+            or b.topk_p.dtype != torch.float32
+            or hidden is None
+            or hidden.shape[0] < max_bs
+            or hidden.shape[1] != self._draft_config.hidden_size
+            or hidden.dtype != self._draft_config.dtype
+        ):
+            return None
+        logger.info("Draft-extend writes the next draft's inputs in place")
+        return SimpleNamespace(
+            topk_index=b.topk_index[:max_bs],
+            topk_p=b.topk_p[:max_bs],
+            hidden=hidden[:max_bs],
+        )
+
+    def run_draft_extend(
+        self,
+        *,
+        runner: Any,
+        forward_batch: ForwardBatch,
+        stock: Callable[[], Any],
+    ) -> Any:
         """Inside the draft-extend graph's capture: draft_extend's step in place of
         the model's forward; the logits stay inside the megakernel."""
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
         bs = int(forward_batch.batch_size)
-        graphs = self._extend_graphs[id(runner)]
+        graphs = self._extend_graphs.get(id(runner))
+        if graphs is None or bs not in graphs.steps:
+            return stock()
         out = graphs.out
         spec_info = forward_batch.spec_info
         graphs.steps[bs](
@@ -242,23 +362,29 @@ class EagleMegakernel:
         self._input_seq += 1
 
     def extend_tokens(
-        self, *, runner: Any, batch: ScheduleBatch
-    ) -> Optional[tuple[torch.Tensor, torch.Tensor]]:
-        """After a draft-extend replay: (topk_p, topk_index) of a graph draft_extend
-        ran, else None for SGLang's top-1."""
+        self,
+        *,
+        runner: Any,
+        batch: ScheduleBatch,
+        stock: Callable[[], tuple],
+        active: bool = True,
+    ) -> tuple:
+        """Return the final draft proposal, falling back to stock when unserved."""
         graphs = self._extend_graphs.get(id(runner))
-        if graphs is None or runner.bs not in graphs.steps:
-            return None
+        if not active or graphs is None or runner.bs not in graphs.steps:
+            return stock()
         self._served_input = (self._input_seq, _rids(batch))
         raw_bs = runner.raw_bs
-        # the next replay rewrites the buffers before the next round reads them
-        return (
-            graphs.out.topk_p[:raw_bs].clone(),
-            graphs.out.topk_index[:raw_bs].clone(),
-        )
+        # FutureMap owns a relay copy only when the next batch changes.
+        return None, graphs.out.topk_p[:raw_bs], graphs.out.topk_index[:raw_bs]
 
     def begin_draft_round(
-        self, *, runner: Any, batch: ScheduleBatch, draft_input: Any
+        self,
+        *,
+        runner: Any,
+        batch: ScheduleBatch,
+        draft_input: Any,
+        active: bool = True,
     ) -> None:
         """Before a draft graph replays; tells a served batch size's draft_loop where
         its input came from."""
@@ -267,7 +393,8 @@ class EagleMegakernel:
         graphs = self._draft_graphs.get(id(runner))
         bs = len(batch.seq_lens)
         if (
-            self._begin_draft_round is None
+            not active
+            or self._begin_draft_round is None
             or graphs is None
             or _bucket(bs, runner.capture_bs) not in graphs.steps
         ):

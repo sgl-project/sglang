@@ -37,9 +37,11 @@ from sglang.srt.arg_groups.model_overrides import minimax_m2  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import minimax_m3  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import moss_vl  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import muse_glimmer  # noqa: F401
+from sglang.srt.arg_groups.model_overrides import nemotron3_embedding  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import nemotron_h  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import olmo2  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import qwen3_5  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import qwen3_moe  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import qwen3_vl  # noqa: F401
 from sglang.srt.arg_groups.model_overrides import qwen4_exp  # noqa: F401
+from sglang.srt.arg_groups.model_overrides import unlimited_ocr_v2  # noqa: F401

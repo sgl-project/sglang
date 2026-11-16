@@ -7,7 +7,7 @@ from sglang.test.server_fixtures.default_fixture import DefaultServerBase
 
 register_cuda_ci(
     est_time=300,
-    stage="extra-a",
+    stage="nightly",
     runner_config="1-gpu-small",
 )
 

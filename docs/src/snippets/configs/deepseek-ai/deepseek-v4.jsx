@@ -232,7 +232,7 @@ export const config = {
   // Reproduce commands for the Benchmark card's "⚡ Reproduce" modal.
   benchmarkCommands: {
     speed:
-`python3 -m sglang.bench_serving \\
+`python3 -m sglang.benchmark.serving \\
   --backend sglang \\
   --host {{CURL_HOST}} --port {{CURL_PORT}} \\
   --model {{MODEL_NAME}} \\
@@ -2134,7 +2134,7 @@ sgl-eval run mmmu_pro \\
     {
       match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "low-latency", nodes: "single" },
       verified: false,
-      env: ["SGLANG_OPT_USE_JIT_NORM=1", "SGLANG_OPT_USE_TOPK_V2=1"],
+      env: ["SGLANG_OPT_USE_TOPK_V2=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -2153,7 +2153,7 @@ sgl-eval run mmmu_pro \\
       // DSpark is incompatible with DP attention -> target-only.
       match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "balanced", nodes: "single" },
       verified: false,
-      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096", "SGLANG_OPT_USE_JIT_NORM=1", "SGLANG_OPT_USE_TOPK_V2=1"],
+      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096", "SGLANG_OPT_USE_TOPK_V2=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
@@ -2171,7 +2171,7 @@ sgl-eval run mmmu_pro \\
     {
       match: { hw: "b200", variant: "pro-official", quant: "fp4", strategy: "high-throughput", nodes: "single" },
       verified: false,
-      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320", "SGLANG_OPT_USE_JIT_NORM=1", "SGLANG_OPT_USE_TOPK_V2=1"],
+      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=8320", "SGLANG_OPT_USE_TOPK_V2=1"],
       flags: [
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",

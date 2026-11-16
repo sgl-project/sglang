@@ -56,13 +56,12 @@ from sglang.srt.beam_search.fork import (
 from sglang.srt.beam_search.joint_select import joint_select, select_final_topk
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
-from sglang.srt.managers.schedule_batch import (
+from sglang.srt.managers.req_types import (
     FINISH_ABORT,
     FINISH_LENGTH,
     FINISH_MATCHED_TOKEN,
-    Req,
-    ScheduleBatch,
 )
+from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
 from sglang.srt.runtime_context import (
     get_disagg,

@@ -63,11 +63,7 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputs,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.qwen3 import Qwen3Model
@@ -80,6 +76,7 @@ from sglang.srt.multimodal.mm_utils import (
     materialize_multimodal_features,
     run_dp_sharded_mrope_vision_model,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.transport.cuda_ipc import (
     BORROW_CUDA_IPC_FEATURE_KEY,
     CUDA_IPC_FEATURE_COPY_EVENT_KEY,
@@ -95,7 +92,7 @@ from sglang.srt.utils import (
     is_npu,
     round_up,
 )
-from sglang.srt.utils.hf_transformers_utils import get_processor
+from sglang.srt.utils.hf_transformers import get_processor
 
 _is_npu = is_npu()
 graph_runners_dict = defaultdict(lambda: ViTCudaGraphRunner)
@@ -1294,6 +1291,26 @@ class Qwen3LLMModel(Qwen3Model):
         return hidden_states, aux_hidden_states
 
 
+# Matched per dotted component, so `final_layernorm` and friends stay clear.
+IMAGE_GENERATION_HEAD_RE = re.compile(r"(?:x_embedder|t_embedder|final_layer)\d*")
+
+
+# HiDream-O1-Image ships a stock qwen3_vl config and declares this architecture, but
+# bolts a flow-matching pixel head onto the backbone. load_weights drops names it has
+# no parameter for, so without this the server starts clean and then answers empty.
+def check_not_image_generation_head(name: str) -> None:
+    if not any(IMAGE_GENERATION_HEAD_RE.fullmatch(part) for part in name.split(".")):
+        return
+    raise ValueError(
+        f"Weight '{name}' belongs to a pixel-level image-generation head. This "
+        "checkpoint (e.g. HiDream-ai/HiDream-O1-Image) only borrows the Qwen3-VL "
+        "architecture string and generates images rather than text, so it cannot be "
+        "loaded as Qwen3-VL. Serve it with the diffusion runtime instead, e.g. "
+        "`sglang serve --model-path HiDream-ai/HiDream-O1-Image`; that dispatch keys "
+        "off the model path, so keep the checkpoint's original directory name."
+    )
+
+
 class Qwen3VLForConditionalGeneration(nn.Module):
     supports_cuda_vmm_feature_transport = True
 
@@ -1698,6 +1715,7 @@ class Qwen3VLForConditionalGeneration(nn.Module):
         ]
         params_dict = dict(self.named_parameters(remove_duplicate=False))
         for name, loaded_weight in weights:
+            check_not_image_generation_head(name)
             if "rotary_emb.inv_freq" in name:
                 continue
             if "language_model" in name:

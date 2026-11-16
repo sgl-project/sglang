@@ -19,6 +19,7 @@ from .types import (
     DecodeInputs,
     PrefillCandidates,
     PrefillInputs,
+    RowShard,
 )
 
 if TYPE_CHECKING:
@@ -32,6 +33,7 @@ __all__ = [
     "FullTopKIndexer",
     "PrefillCandidates",
     "PrefillInputs",
+    "RowShard",
     "has_dense_fp4_indexer",
     "is_sm100_or_newer",
     "make_candidate_indexer",

@@ -9,7 +9,10 @@ import torch
 
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.environ import envs
-from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
+from sglang.srt.layers.rotary_embedding.utils import (
+    apply_rotary_emb,
+    rotary_embedding_cpu,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, publish_role
 from sglang.srt.utils import (
@@ -437,7 +440,7 @@ class RotaryEmbedding(BaseFusedOp):
             # rotary_embedding_cpu requires query and the cache to share a dtype;
             # forward_cuda/forward_xpu already align them, forward_cpu did not.
             self._match_cos_sin_cache_dtype(query)
-            return torch.ops.sgl_kernel.rotary_embedding_cpu(
+            return rotary_embedding_cpu(
                 positions,
                 query,
                 key,

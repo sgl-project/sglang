@@ -37,7 +37,8 @@ from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
     view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_exec, get_parallel, get_platform
 from sglang.srt.utils import (
     get_bool_env_var,

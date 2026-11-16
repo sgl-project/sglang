@@ -36,7 +36,7 @@ from sglang.srt.layers.attention.qwen_sparse_attn_backend import (
     QwenSparseAttnBackend,
     QwenSparseMultiStepDraftBackend,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.mem_cache_utils import routed
 

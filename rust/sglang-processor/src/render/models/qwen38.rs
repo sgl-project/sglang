@@ -154,7 +154,7 @@ fn template_args(
 
 /// `_process_messages`: the request tools as `Tool.model_dump()` gives them; only
 /// the named tool for a named `tool_choice`, and none for `"none"`.
-fn template_tools(request: &Value) -> Result<Option<Vec<Value>>, String> {
+pub(super) fn template_tools(request: &Value) -> Result<Option<Vec<Value>>, String> {
     let choice = &request["tool_choice"];
     let Some(tools) = request["tools"]
         .as_array()
@@ -280,7 +280,7 @@ fn trims_unlike_python(message: &Value) -> bool {
 /// Whether `value` holds a number Dynamo's serde_json prints unlike Python's
 /// `json.dumps`: floats in exponent notation (`1e-06`, `1e+16`), integers
 /// beyond 64 bits, and negative zero, which serde_json also reads from `-0`.
-fn prints_unlike_python(value: &Value) -> bool {
+pub(super) fn prints_unlike_python(value: &Value) -> bool {
     match value {
         Value::Number(number) => number.as_f64().is_some_and(|f| {
             let positive_zero = f == 0.0 && f.is_sign_positive();

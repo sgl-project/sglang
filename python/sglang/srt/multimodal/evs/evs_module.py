@@ -20,7 +20,7 @@ from dataclasses import dataclass
 import torch
 from transformers import PretrainedConfig
 
-from sglang.srt.managers.schedule_batch import MultimodalDataItem
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.mem_cache.multimodal_cache import EmbeddingResult
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.utils import logger

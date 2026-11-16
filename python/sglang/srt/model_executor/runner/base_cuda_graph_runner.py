@@ -22,7 +22,9 @@ from abc import abstractmethod
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Any, List, Optional, Sequence, Tuple
 
+from sglang.srt.configs.model_config import is_deepseek_dsa
 from sglang.srt.dllm.config import DllmConfig
+from sglang.srt.layers.cp.cp_decode_attn_tp import can_defer_cp_decode_attn_tp
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.runtime_context import (
     get_exec,
@@ -80,8 +82,20 @@ def get_batch_sizes_to_capture(
     if dllm_config is not None and dllm_config.requires_separate_context_encoding:
         num_max_requests = min(num_max_requests, dllm_config.max_running_requests)
 
+    # These are decode/verify/draft buckets, not CP-prefill buckets. On the
+    # full-TP DSA dispatch path their rows are replicated across CP ranks, so
+    # padding to CP width only creates dummy requests (e.g. bs=4 for one
+    # six-token verify at CP8). Keep the original constraint elsewhere.
+    decode_uses_tp_rows = False
+    if can_defer_cp_decode_attn_tp():
+        hf_config = model_runner.model_config.hf_config
+        decode_uses_tp_rows = (
+            is_deepseek_dsa(hf_config)
+            and getattr(hf_config, "q_lora_rank", None) is not None
+        )
     mul_base = get_cuda_graph_batch_size_alignment(
-        gathered_buffer_required=gathered_buffer_required
+        gathered_buffer_required=gathered_buffer_required,
+        include_cp_alignment=not decode_uses_tp_rows,
     )
     # TBO splits each request's rows across two micro-batches, so the
     # alignment constraint applies per request rather than per token row.

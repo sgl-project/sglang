@@ -141,6 +141,10 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
         i_track = -1
         p_track_base = track_state
 
+    o_v = i_v * BV + tl.arange(0, BV)
+    m_v = o_v < V
+    o_k64 = tl.arange(0, 64)
+
     # main recurrence — time is the outer loop
     for i_t in range(NT):
         ########################################################################
@@ -151,38 +155,46 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
             # Load h: from initial_state (i_t==0) or scratch (i_t>0)
             if i_t == 0:
                 if USE_INITIAL_STATE and valid_state:
-                    p_hs = tl.make_block_ptr(
-                        h0, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
-                    )
-                    b_h = tl.load(p_hs, boundary_check=(0, 1)).to(tl.float32)
+                    p_hs = h0 + o_v[:, None] * K + (k_blk + o_k64)[None, :]
+                    b_h = tl.load(
+                        p_hs,
+                        mask=m_v[:, None] & ((k_blk + o_k64)[None, :] < K),
+                        other=0.0,
+                    ).to(tl.float32)
                 else:
                     b_h = tl.zeros([BV, 64], dtype=tl.float32)
             elif valid_state:
-                p_hs = tl.make_block_ptr(
-                    ht, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
-                )
-                b_h = tl.load(p_hs, boundary_check=(0, 1)).to(tl.float32)
+                p_hs = ht + o_v[:, None] * K + (k_blk + o_k64)[None, :]
+                b_h = tl.load(
+                    p_hs,
+                    mask=m_v[:, None] & ((k_blk + o_k64)[None, :] < K),
+                    other=0.0,
+                ).to(tl.float32)
             else:
                 b_h = tl.zeros([BV, 64], dtype=tl.float32)
 
             # Store pre-update h to output
-            p_ho = tl.make_block_ptr(
-                h + i_t * stride_h,
-                (V, K),
-                (K, 1),
-                (i_v * BV, k_blk),
-                (BV, 64),
-                (1, 0),
+            p_ho = (
+                h
+                + i_t.to(tl.int64) * stride_h
+                + o_v[:, None] * K
+                + (k_blk + o_k64)[None, :]
             )
-            tl.store(p_ho, b_h.to(p_ho.dtype.element_ty), boundary_check=(0, 1))
+            tl.store(
+                p_ho,
+                b_h.to(p_ho.dtype.element_ty),
+                mask=m_v[:, None] & ((k_blk + o_k64)[None, :] < K),
+            )
 
             # Mid-sequence checkpoint for the mamba prefix cache: the same
             # pre-update state, kept in fp32 so the caller rounds only once.
             if TRACK_STATE and i_t == i_track:
-                p_track = tl.make_block_ptr(
-                    p_track_base, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
+                p_track = p_track_base + o_v[:, None] * K + (k_blk + o_k64)[None, :]
+                tl.store(
+                    p_track,
+                    b_h,
+                    mask=m_v[:, None] & ((k_blk + o_k64)[None, :] < K),
                 )
-                tl.store(p_track, b_h, boundary_check=(0, 1))
 
             # Accumulate correction: w_k @ h_k^T
             b_w = w_desc.load([i_t * BT, k_blk])
@@ -198,10 +210,9 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
         last_idx = min((i_t + 1) * BT, T) - 1
         if USE_G:
             b_g_last = tl.load(g + bos * H + last_idx * H + i_h)
-            p_g = tl.make_block_ptr(
-                g + bos * H + i_h, (T,), (H,), (i_t * BT,), (BT,), (0,)
-            )
-            b_g = tl.load(p_g, boundary_check=(0,))
+            o_t = (i_t * BT + tl.arange(0, BT)).to(tl.int64)
+            p_g = g + bos * H + i_h + o_t * H
+            b_g = tl.load(p_g, mask=o_t < T, other=0.0)
             b_v = b_v * tl.expand_dims(safe_exp(b_g_last - b_g), 1)
             b_g_last = exp(b_g_last)
 
@@ -214,17 +225,21 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
             # Reload h (same source as Phase 1)
             if i_t == 0:
                 if USE_INITIAL_STATE and valid_state:
-                    p_hs = tl.make_block_ptr(
-                        h0, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
-                    )
-                    b_h = tl.load(p_hs, boundary_check=(0, 1)).to(tl.float32)
+                    p_hs = h0 + o_v[:, None] * K + (k_blk + o_k64)[None, :]
+                    b_h = tl.load(
+                        p_hs,
+                        mask=m_v[:, None] & ((k_blk + o_k64)[None, :] < K),
+                        other=0.0,
+                    ).to(tl.float32)
                 else:
                     b_h = tl.zeros([BV, 64], dtype=tl.float32)
             elif valid_state:
-                p_hs = tl.make_block_ptr(
-                    ht, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
-                )
-                b_h = tl.load(p_hs, boundary_check=(0, 1)).to(tl.float32)
+                p_hs = ht + o_v[:, None] * K + (k_blk + o_k64)[None, :]
+                b_h = tl.load(
+                    p_hs,
+                    mask=m_v[:, None] & ((k_blk + o_k64)[None, :] < K),
+                    other=0.0,
+                ).to(tl.float32)
             else:
                 b_h = tl.zeros([BV, 64], dtype=tl.float32)
 
@@ -250,10 +265,12 @@ def chunk_gated_delta_rule_fwd_kernel_h_blockdim64_k_loop(
 
             # Save updated h to scratch (initial_state) for next time step
             if INPLACE_UPDATE and valid_state:
-                p_hs = tl.make_block_ptr(
-                    ht, (V, K), (K, 1), (i_v * BV, k_blk), (BV, 64), (1, 0)
+                p_hs = ht + o_v[:, None] * K + (k_blk + o_k64)[None, :]
+                tl.store(
+                    p_hs,
+                    b_h.to(p_hs.dtype.element_ty),
+                    mask=m_v[:, None] & ((k_blk + o_k64)[None, :] < K),
                 )
-                tl.store(p_hs, b_h.to(p_hs.dtype.element_ty), boundary_check=(0, 1))
 
 
 def chunk_gated_delta_rule_fwd_h(

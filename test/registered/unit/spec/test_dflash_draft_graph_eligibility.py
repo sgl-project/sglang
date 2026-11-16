@@ -7,7 +7,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.speculative import dflash_worker_v2
 from sglang.srt.speculative.dflash_info_v2 import DFlashDraftInputV2
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2

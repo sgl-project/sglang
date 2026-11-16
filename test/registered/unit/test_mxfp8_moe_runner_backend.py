@@ -10,10 +10,8 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.arg_groups.overrides import (
-    ResolvedView,
-    _moe_runner_backend_quant_constraints,
-)
+from sglang.srt.arg_groups.model_override_base import ResolvedView
+from sglang.srt.arg_groups.overrides import _moe_runner_backend_quant_constraints
 from sglang.srt.runtime_context import override_platform
 from sglang.test.test_utils import CustomTestCase
 

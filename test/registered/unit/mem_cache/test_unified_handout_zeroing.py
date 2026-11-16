@@ -283,6 +283,10 @@ class TestTriPoolSWAHandoutZeroing(unittest.TestCase):
     """A tri-pool hands its sliding-window pages out through the float middle's
     own allocator; they must leave it zeroed like every other MHA page."""
 
+    def setUp(self):
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+        self.addCleanup(reset_context)
+
     def test_fresh_and_recycled_swa_pages_zeroed(self):
         buf, swa, allocator = _build_tri("cuda")
         sa = allocator.swa_attn_allocator

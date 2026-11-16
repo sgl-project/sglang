@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING, Optional
 if TYPE_CHECKING:
     from sglang.srt.server_args import ServerArgs
 
-from sglang.srt.arg_groups.overrides import model_config_of, resolving_view
+from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
 from sglang.srt.runtime_context import attn_dp_enabled_of
 
 logger = logging.getLogger(__name__)

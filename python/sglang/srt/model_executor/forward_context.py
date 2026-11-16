@@ -9,9 +9,9 @@ The active batch lends its MoE bound getter so late preparation and TBO child
 selection stay visible without retaining a parent tensor snapshot.
 
 ModelRunner._forward_raw publishes a fresh ForwardContext for the
-duration of each forward; callers that need a per-call override (PDmux
-per-stream backend, frozen-KV MTP draft loop, TBO per-child dispatch) use
-dataclasses.replace and wrap the override scope with forward_context().
+duration of each forward; callers that need a per-call override (frozen-KV
+MTP draft loop, TBO per-child dispatch) use dataclasses.replace and wrap the
+override scope with forward_context().
 
 Distinct from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph.TcPiecewiseForwardContext,
 which collects compilation-time refs for the piecewise CUDA graph backend.

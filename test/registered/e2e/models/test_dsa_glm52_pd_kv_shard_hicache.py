@@ -17,7 +17,7 @@ import requests
 import torch
 from prometheus_client.parser import text_string_to_metric_families
 
-from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+from sglang.srt.utils.hf_transformers import get_tokenizer
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kits.eval_accuracy_kit import GSM8KMixin, _run_accuracy_eval
 from sglang.test.server_fixtures.disaggregation_fixture import (
@@ -29,7 +29,7 @@ from sglang.test.simple_eval_mixed_prefix_gsm8k import (
 )
 from sglang.utils import download_and_cache_file, read_jsonl
 
-register_cuda_ci(est_time=600, stage="base-c", runner_config="4-gpu-gb300")
+register_cuda_ci(est_time=600, stage="extra-b", runner_config="4-gpu-gb300")
 
 PAGE_SIZE = 64
 PREFILL_POOL_TOKENS = 4096  # Per rank: CP2 has 8192 logical GPU slots.

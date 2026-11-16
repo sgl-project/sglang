@@ -12,7 +12,8 @@ from sglang.kernels.ops.attention.kv_indices import (
 )
 from sglang.kernels.ops.attention.metadata import get_num_kv_splits_triton
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,

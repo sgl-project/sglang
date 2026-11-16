@@ -131,7 +131,7 @@ jobs:
     secrets: inherit
 
   # =============================================== extra-a (1-gpu-small) ===============================================
-  # ~1h of tests in total; two shards keep each under the step timeout.
+  # ~1.5h of tests in total; four shards keep each well under the step timeout.
   extra-a-test-1-gpu-small-amd:
     name: ${{ format('extra-a-test-1-gpu-small-amd ({0}, linux-{1}-1gpu-sglang, {2})', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300', matrix.part) }}
     needs: [call-gate]
@@ -139,7 +139,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1]
+        part: [0, 1, 2, 3]
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -161,14 +161,14 @@ jobs:
         run: bash scripts/ci/amd/amd_ci_install_dependency.sh
 
       - name: Run test
-        timeout-minutes: 45
+        timeout-minutes: 75
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
 
   # =============================================== extra-a (1-gpu-large) ===============================================
   # Single-GPU lora / spec / quant / perf model e2e tests. Runs on the same
   # 1-gpu pool as small (AMD GPUs carry enough VRAM that "large" here is a
-  # CUDA memory-tier label, not a separate AMD runner pool). ~1.5h in total.
+  # CUDA memory-tier label, not a separate AMD runner pool). ~50 min in total.
   extra-a-test-1-gpu-large-amd:
     name: ${{ format('extra-a-test-1-gpu-large-amd ({0}, linux-{1}-1gpu-sglang, {2})', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300', matrix.part) }}
     needs: [call-gate]
@@ -176,7 +176,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        part: [0, 1, 2]
+        part: [0, 1]
     runs-on: ${{ format('linux-{0}-1gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code
@@ -198,7 +198,7 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 3 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
 
   # =============================================== extra-a (2-gpu-large) ===============================================
   # Multi-GPU TP / PP / PD mock-model + kv_canary e2e tests and PP/MoE

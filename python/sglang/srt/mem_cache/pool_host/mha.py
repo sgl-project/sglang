@@ -35,11 +35,10 @@ from sglang.kernels.ops.kvcache.hicache import (
     transfer_hicache_one_layer_page_unified_lf as jit_transfer_hicache_one_layer_page_unified_lf,
 )
 from sglang.srt.mem_cache.device_pool_info import (
+    IndexKeyBufferInfo,
+    IndexKeyLayout,
     KVScaleLayout,
     MHABufferInfo,
-)
-from sglang.srt.mem_cache.memory_pool import (
-    MHATokenToKOnlyPool,
 )
 from sglang.srt.mem_cache.pool_host._kvcacheio import require_kvcacheio_ops
 from sglang.srt.mem_cache.pool_host.base import (
@@ -947,23 +946,43 @@ class MHATokenToKVPoolHost(HostKVCache):
 class MHATokenToKOnlyPoolHost(HostKVCache):
     """Host pool for MiniMax sparse index-K buffers (no index V)."""
 
-    device_pool: MHATokenToKOnlyPool
-
     def __init__(
         self,
-        device_pool: MHATokenToKOnlyPool,
+        buffer_info: IndexKeyBufferInfo,
         anchor_host: MHATokenToKVPoolHost,
         layout: str,
         pin_memory: bool = True,
         device: str = "cpu",
         allocator_type: str = "default",
     ):
+        buffer_info.validate()
+        if (
+            buffer_info.key_layout is not IndexKeyLayout.KEY_ROWS
+            or buffer_info.compress_ratio != 1
+            or buffer_info.page_size != anchor_host.page_size
+        ):
+            raise ValueError(
+                "K-only host requires uncompressed key-row index keys with "
+                f"page_size={anchor_host.page_size}, got "
+                f"key_layout={buffer_info.key_layout}, "
+                f"compress_ratio={buffer_info.compress_ratio}, "
+                f"page_size={buffer_info.page_size}"
+            )
+        first = buffer_info.buffers[0]
+        for layer, buffer in enumerate(buffer_info.buffers):
+            if buffer.shape[1:] != first.shape[1:] or buffer.dtype != first.dtype:
+                raise ValueError(
+                    f"K-only buffer[{layer}] has row_shape={tuple(buffer.shape[1:])}, "
+                    f"dtype={buffer.dtype}, expected {tuple(first.shape[1:])}, "
+                    f"{first.dtype}"
+                )
         self._destroyed = False
         if _is_xpu:
             require_kvcacheio_ops(
                 pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
             )
-        self.device_pool = device_pool
+        self.device_k_buffers = buffer_info.buffers
+        self._transfer_device = first.device
         self.page_size = anchor_host.page_size
         self.layout = layout
         self.pin_memory = pin_memory
@@ -971,13 +990,12 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         self.allocator = get_allocator_from_storage(allocator_type)
         # HostPoolGroup ANDs this over its pools; this pool skips HostKVCache.__init__
         self.can_use_write_back_jit = False
-        self.dtype = device_pool.store_dtype
-        self.start_layer = device_pool.start_layer
-        self.end_layer = device_pool.end_layer
-
-        self.head_num = device_pool.head_num
-        self.head_dim = device_pool.head_dim
-        self.layer_num = device_pool.layer_num
+        self.dtype = first.dtype
+        self.head_num, self.head_dim = first.shape[1:]
+        self.layer_num = len(self.device_k_buffers)
+        # PoolEntry maps model layers onto this compact host buffer axis.
+        self.start_layer = 0
+        self.end_layer = self.layer_num - 1
         self.element_dim = self.head_num * self.head_dim
         self.token_stride_size = self.element_dim * self.dtype.itemsize
         self.layout_dim = self.token_stride_size * self.layer_num
@@ -1008,9 +1026,9 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             page_size=self.page_size, element_size=self.token_stride_size
         )
         self.k_device_ptrs = torch.tensor(
-            [x.data_ptr() for x in self.device_pool.k_buffer],
+            [x.data_ptr() for x in self.device_k_buffers],
             dtype=torch.uint64,
-            device=self.device_pool.device,
+            device=self._transfer_device,
         )
         if self.layout == "page_first":
             transposed = self.k_buffer.transpose(0, 1)
@@ -1021,7 +1039,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             self.k_data_refs = []
         self.k_data_ptrs = make_kernel_ptr_table(
             self.k_data_refs,
-            self.device_pool.device,
+            self._transfer_device,
             host_memory_registered=self.pin_memory,
         )
 
@@ -1055,7 +1073,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             )
         else:
             raise ValueError(f"Unsupported layout: {self.layout}")
-        alloc_func = ALLOC_MEMORY_FUNCS[self.device_pool.device]
+        alloc_func = ALLOC_MEMORY_FUNCS[self._transfer_device.type]
         self.k_buffer = alloc_func(
             dims,
             dtype=self.dtype,
@@ -1108,7 +1126,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
                         page_size=self.page_size,
-                        cache_dst=device_pool.k_buffer[layer_id],
+                        cache_dst=self.device_k_buffers[layer_id],
                         cache_src=self.k_buffer[layer_id],
                         indices_dst=device_indices,
                         indices_src=host_indices,
@@ -1117,7 +1135,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
                 else:
                     transfer_kv_per_layer_mla(
                         src=self.k_buffer[layer_id],
-                        dst=device_pool.k_buffer[layer_id],
+                        dst=self.device_k_buffers[layer_id],
                         src_indices=host_indices,
                         dst_indices=device_indices,
                         item_size=self.token_stride_size,
@@ -1126,7 +1144,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
                 if self.can_use_jit:
                     jit_transfer_hicache_one_layer_mla(
                         page_size=self.page_size,
-                        cache_dst=device_pool.k_buffer[layer_id],
+                        cache_dst=self.device_k_buffers[layer_id],
                         cache_src=self.k_data_refs[layer_id],
                         indices_dst=device_indices,
                         indices_src=host_indices,
@@ -1135,7 +1153,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
                 else:
                     transfer_kv_per_layer_mla_pf_lf(
                         src=self.k_buffer,
-                        dst=device_pool.k_buffer[layer_id],
+                        dst=self.device_k_buffers[layer_id],
                         src_indices=host_indices,
                         dst_indices=device_indices,
                         layer_id=layer_id,
@@ -1148,7 +1166,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             if self.layout == "layer_first":
                 transfer_kv_direct(
                     src_layers=[self.k_buffer[layer_id]],
-                    dst_layers=[device_pool.k_buffer[layer_id]],
+                    dst_layers=[self.device_k_buffers[layer_id]],
                     src_indices=host_indices,
                     dst_indices=device_indices,
                     page_size=self.page_size,
@@ -1156,7 +1174,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
             elif self.layout == "page_first_direct":
                 transfer_kv_per_layer_direct_pf_lf(
                     src_ptrs=[self.k_buffer],
-                    dst_ptrs=[device_pool.k_buffer[layer_id]],
+                    dst_ptrs=[self.device_k_buffers[layer_id]],
                     src_indices=host_indices,
                     dst_indices=device_indices,
                     layer_id=layer_id,
@@ -1177,7 +1195,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
                         jit_transfer_hicache_one_layer_mla(
                             page_size=self.page_size,
                             cache_dst=self.k_buffer[layer_id],
-                            cache_src=device_pool.k_buffer[layer_id],
+                            cache_src=self.device_k_buffers[layer_id],
                             indices_dst=host_indices,
                             indices_src=device_indices,
                             element_dim=self.element_dim,
@@ -1185,7 +1203,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
                 else:
                     for layer_id in range(self.layer_num):
                         transfer_kv_per_layer_mla(
-                            src=device_pool.k_buffer[layer_id],
+                            src=self.device_k_buffers[layer_id],
                             dst=self.k_buffer[layer_id],
                             src_indices=device_indices,
                             dst_indices=host_indices,
@@ -1218,7 +1236,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
         elif io_backend == "direct":
             if self.layout == "layer_first":
                 transfer_kv_direct(
-                    src_layers=device_pool.k_buffer,
+                    src_layers=self.device_k_buffers,
                     dst_layers=self.k_data_refs,
                     src_indices=device_indices,
                     dst_indices=host_indices,
@@ -1226,7 +1244,7 @@ class MHATokenToKOnlyPoolHost(HostKVCache):
                 )
             elif self.layout == "page_first_direct":
                 transfer_kv_all_layer_direct_lf_pf(
-                    src_ptrs=device_pool.k_buffer,
+                    src_ptrs=self.device_k_buffers,
                     dst_ptrs=[self.k_buffer],
                     src_indices=device_indices,
                     dst_indices=host_indices,

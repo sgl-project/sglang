@@ -22,7 +22,7 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (
     DEEPGEMM_SCALE_UE8M0,
     ENABLE_JIT_DEEPGEMM,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_device,
     get_disagg,

@@ -38,7 +38,7 @@ from sglang.srt.models.glm4 import Glm4DecoderLayer
 from sglang.srt.models.glm_ocr import GlmOcrForConditionalGeneration
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import add_prefix
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils.hf_transformers import get_rope_config
 
 logger = logging.getLogger(__name__)
 

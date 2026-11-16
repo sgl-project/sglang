@@ -3,12 +3,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
-    FINISH_LENGTH,
-    Req,
-    ReqKvInfo,
-)
+from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     BasePrefixCache,

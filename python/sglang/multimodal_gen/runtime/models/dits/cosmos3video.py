@@ -23,6 +23,7 @@ from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoC
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
 from sglang.multimodal_gen.runtime.cache.conditioning import cached_conditioning
 from sglang.multimodal_gen.runtime.distributed import (
+    get_local_torch_device,
     get_sp_group,
     get_sp_world_size,
     get_tp_world_size,
@@ -94,6 +95,34 @@ def _can_enable_t1_fused_qk_norm_rope(
     if tp_size == 1:
         return hidden_act != "relu2" or hidden_size == 2048
     return tp_size == 2 and hidden_act == "silu" and hidden_size == 5120
+
+
+def sequence_shard_padding(seq_len: int, world_size: int) -> int:
+    """Tokens appended so a sequence splits evenly over ``world_size`` ranks."""
+    if world_size <= 1:
+        return 0
+    return (-seq_len) % world_size
+
+
+def shard_sequence(
+    tensor: torch.Tensor, world_size: int, rank: int, *, dim: int, pad_last: bool
+) -> torch.Tensor:
+    """This rank's contiguous shard of ``tensor`` along ``dim``.
+
+    The sequence is first padded to a multiple of ``world_size`` by repeating the
+    last entry (``pad_last``, for positions) or with zeros (for tokens).
+    """
+    if world_size <= 1:
+        return tensor
+    pad = sequence_shard_padding(tensor.shape[dim], world_size)
+    if pad:
+        tail = tensor.narrow(dim, tensor.shape[dim] - 1, 1)
+        filler = tail.expand(*[pad if i == dim else -1 for i in range(tensor.ndim)])
+        if not pad_last:
+            filler = torch.zeros_like(filler)
+        tensor = torch.cat([tensor, filler], dim=dim)
+    local = tensor.shape[dim] // world_size
+    return tensor.narrow(dim, rank * local, local).contiguous()
 
 
 # -----------------------------------------------------------------------------
@@ -1600,10 +1629,6 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
 
         action_frames = 0
         if action_latents is not None:
-            if self.sp_size > 1:
-                raise NotImplementedError(
-                    "Cosmos3 action generation does not support sequence parallelism yet"
-                )
             action_frames = action_latents.shape[1]
             if action_domain_ids is None:
                 action_domain_ids = torch.zeros(
@@ -1678,32 +1703,18 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             # Video-only: shard the visual tokens, then add the timestep
             # embedding on the local shard.
             if sequence_shard_enabled:
-                if seq_len_orig % self.sp_size != 0:
-                    seq_shard_pad = self.sp_size - (seq_len_orig % self.sp_size)
-                    pad = torch.zeros(
-                        (batch_size, seq_shard_pad, hidden_gen.shape[2]),
-                        dtype=hidden_gen.dtype,
-                        device=hidden_gen.device,
-                    )
-                    hidden_gen = torch.cat([hidden_gen, pad], dim=1)
-                    if token_noisy_mask is not None:
-                        mask_pad = torch.zeros(
-                            (batch_size, seq_shard_pad, 1),
-                            dtype=token_noisy_mask.dtype,
-                            device=token_noisy_mask.device,
-                        )
-                        token_noisy_mask = torch.cat(
-                            [token_noisy_mask, mask_pad], dim=1
-                        )
-                local_seq_len = hidden_gen.shape[1] // self.sp_size
-                hidden_gen = hidden_gen.view(
-                    batch_size, self.sp_size, local_seq_len, hidden_gen.shape[2]
+                seq_shard_pad = sequence_shard_padding(seq_len_orig, self.sp_size)
+                hidden_gen = shard_sequence(
+                    hidden_gen, self.sp_size, self.sp_rank, dim=1, pad_last=False
                 )
-                hidden_gen = hidden_gen[:, self.sp_rank, :, :]
                 if token_noisy_mask is not None:
-                    token_noisy_mask = token_noisy_mask.view(
-                        batch_size, self.sp_size, local_seq_len, 1
-                    )[:, self.sp_rank, :, :]
+                    token_noisy_mask = shard_sequence(
+                        token_noisy_mask,
+                        self.sp_size,
+                        self.sp_rank,
+                        dim=1,
+                        pad_last=False,
+                    )
             if token_noisy_mask is not None:
                 hidden_gen = hidden_gen + time_embed.unsqueeze(1) * token_noisy_mask
             else:
@@ -1751,19 +1762,12 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
 
             seq_len_orig = hidden_gen.shape[1]
             if sequence_shard_enabled:
-                if seq_len_orig % self.sp_size != 0:
-                    seq_shard_pad = self.sp_size - (seq_len_orig % self.sp_size)
-                    pad = torch.zeros(
-                        (batch_size, seq_shard_pad, hidden_gen.shape[2]),
-                        dtype=hidden_gen.dtype,
-                        device=hidden_gen.device,
-                    )
-                    hidden_gen = torch.cat([hidden_gen, pad], dim=1)
-                local_seq_len = hidden_gen.shape[1] // self.sp_size
-                hidden_gen = hidden_gen.view(
-                    batch_size, self.sp_size, local_seq_len, hidden_gen.shape[2]
+                # The zero pad lands after the last modality (action or sound)
+                # and is dropped again after the post-loop all-gather.
+                seq_shard_pad = sequence_shard_padding(seq_len_orig, self.sp_size)
+                hidden_gen = shard_sequence(
+                    hidden_gen, self.sp_size, self.sp_rank, dim=1, pad_last=False
                 )
-                hidden_gen = hidden_gen[:, self.sp_rank, :, :]
 
         self._ensure_cache_dicts()
 
@@ -1811,12 +1815,9 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
                 text_ids, text_mask, text_pos_ids
             )
             if sequence_shard_enabled:
-                if seq_shard_pad > 0:
-                    pad_pos = vis_pos_ids[:, :, -1:].expand(-1, -1, seq_shard_pad)
-                    vis_pos_ids = torch.cat([vis_pos_ids, pad_pos], dim=2)
-                vis_pos_ids = vis_pos_ids.view(
-                    3, batch_size, self.sp_size, local_seq_len
-                )[:, :, self.sp_rank, :]
+                vis_pos_ids = shard_sequence(
+                    vis_pos_ids, self.sp_size, self.sp_rank, dim=2, pad_last=True
+                )
             cos_sin_gen, gen_rope_cache_positions = (
                 self.language_model.rotary_emb.build_rope_cache_inputs(
                     vis_pos_ids, cache_dtype=hidden_gen.dtype
@@ -2004,8 +2005,8 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
             yield from _try_emit(linear_target)
 
     def post_load_weights(self, target_dtype: torch.dtype = torch.bfloat16) -> None:
-        """Cast non-quantized parameters to their preferred dtypes and rebuild
-        meta-device buffers.
+        """Cast non-quantized parameters to their preferred dtypes,
+        and rebuild the RoPE buffer.
 
         Time-embedder stays in float32 for numerical stability; embeddings and
         the VAE/LLM bridge linears go to ``target_dtype``. Quantized modules
@@ -2013,22 +2014,34 @@ class Cosmos3OmniTransformer(CachableDiT, LayerwiseOffloadableModuleMixin):
         on them would cast their FP8 weights back to BF16/FP32 and break the
         quant kernels.
 
-        Also re-materializes the RoPE ``inv_freq`` buffer, which can land on
-        the meta device when the model is constructed under a meta context.
+        Also rebuilds the RoPE ``inv_freq`` buffer from powers computed on
+        ``get_local_torch_device()``, and places it on the DiT's device.
         """
         # Get the actual device from a loaded parameter
         device = next(self.parameters()).device
 
-        # Recompute RoPE inv_freq buffer on the correct device
-        # This is needed because model is created in meta device context
+        # Compute RoPE on the runtime device so offload preserves resident values
         rotary_emb = self.language_model.rotary_emb
-        if rotary_emb.inv_freq.is_meta:
-            dim = rotary_emb.head_dim
-            inv_freq = 1.0 / (
-                self.rope_theta
-                ** (torch.arange(0, dim, 2, dtype=torch.float32, device=device) / dim)
+        dim = rotary_emb.head_dim
+        runtime_device = get_local_torch_device()
+        if current_platform.is_cuda() and dim & (dim - 1) == 0:
+            # CUDA logspace matches pow for power-of-two dims without its cold load.
+            # CPU and CUDA reciprocals round identically for these FP32 powers.
+            powers = torch.logspace(
+                start=0,
+                end=(dim - 2) / dim,
+                steps=dim // 2,
+                base=self.rope_theta,
+                dtype=torch.float32,
+                device=runtime_device,
             )
-            rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
+            inv_freq = powers.to(device).reciprocal()
+        else:
+            exponents = torch.arange(
+                start=0, end=dim, step=2, dtype=torch.float32, device=runtime_device
+            )
+            inv_freq = (1.0 / (self.rope_theta ** (exponents / dim))).to(device)
+        rotary_emb.register_buffer("inv_freq", inv_freq, persistent=False)
 
         # Collect all quantized submodules so we can skip them during
         # dtype casts.  Calling .to(dtype) on a quantized layer would

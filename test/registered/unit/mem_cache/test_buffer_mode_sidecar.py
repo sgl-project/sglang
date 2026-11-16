@@ -31,9 +31,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     PrefetchOperation,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    ComponentType,
-)
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BufferBackupSnapshot,
     BufferBackupState,

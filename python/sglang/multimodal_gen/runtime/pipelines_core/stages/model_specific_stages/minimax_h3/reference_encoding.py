@@ -40,6 +40,7 @@ from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
 from sglang.multimodal_gen.runtime.distributed.parallel_state import get_replica_group
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+    MINIMAX_H3_DEFAULT_REFERENCE_RESIZE_MODE,
     MINIMAX_H3_REFERENCE_RESIZE_MODES,
     MINIMAX_H3_SUPPORTED_FPS,
 )
@@ -132,15 +133,15 @@ def minimax_h3_resolve_reference_image_shape(
     height: int | float,
     canvas_width: int | float,
     canvas_height: int | float,
-    mode: str = "diffusers",
+    mode: str = MINIMAX_H3_DEFAULT_REFERENCE_RESIZE_MODE,
 ) -> dict[str, Any]:
     """Resolve a ref2va image with a selectable resize policy.
 
     All modes preserve the reference display ratio and round both dimensions
     independently to the nearest 32px grid. ``match`` follows the target canvas
     pixel area without upscaling a smaller reference, ``max`` only downsizes a
-    reference whose short edge exceeds 2048px, and ``diffusers`` always targets
-    a 2048px short edge, including by upscaling.
+    reference whose short edge exceeds 2048px (the default), and ``diffusers``
+    always targets a 2048px short edge, including by upscaling.
     """
 
     try:

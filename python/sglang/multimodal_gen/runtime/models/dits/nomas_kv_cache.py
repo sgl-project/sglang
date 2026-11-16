@@ -174,6 +174,7 @@ class NomasCache(Struct):
 def _flex_kernel():
     from torch.nn.attention.flex_attention import flex_attention
 
+    # Never allow an eager quadratic-memory fallback after graph specialization.
     return torch.compile(flex_attention, dynamic=True, fullgraph=True)
 
 

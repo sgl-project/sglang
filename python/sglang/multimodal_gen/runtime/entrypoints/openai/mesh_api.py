@@ -31,7 +31,7 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
     add_common_data_to_response,
     merge_image_input_list,
     process_generation_batch,
-    sanitize_upload_filename,
+    save_first_input_image,
     save_image_to_path,
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
@@ -171,15 +171,9 @@ async def create_mesh(
             )
 
         uploads_dir = os.path.join("outputs", "uploads")
-        os.makedirs(uploads_dir, exist_ok=True)
-        img = image_list[0]
-        filename = img.filename if hasattr(img, "filename") else "input_image"
-        safe_name = sanitize_upload_filename(filename, "input_image")
         try:
-            input_path = await save_image_to_path(
-                img,
-                os.path.join(uploads_dir, f"{request_id}_{safe_name}"),
-                uploads_root=uploads_dir,
+            input_path = await save_first_input_image(
+                image_list, request_id, uploads_dir
             )
         except Exception as e:
             raise HTTPException(

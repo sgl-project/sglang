@@ -9,26 +9,23 @@ import socket
 import threading
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
+from sglang.srt.multimodal.modality import Modality
+from sglang.srt.multimodal.transport.cuda_ipc import (
+    DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
+    MM_FEATURE_CACHE_SIZE,
+    MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
+    CudaIpcTensorTransportProxy,
+    get_mm_feature_pool_size_per_worker,
 )
 from sglang.srt.multimodal.transport.memory_pool import get_mm_feature_consumer_count
 from sglang.srt.runtime_context import (
     get_mm,
     get_parallel,
     get_serving,
-)
-from sglang.srt.utils.cuda_ipc_transport_utils import (
-    DEFER_CUDA_IPC_FEATURE_RECONSTRUCTION_KEY,
-    MM_FEATURE_CACHE_SIZE,
-    MM_ITEM_MEMORY_POOL_RECYCLE_INTERVAL,
-    CudaIpcTensorTransportProxy,
-    get_mm_feature_pool_size_per_worker,
 )
 from sglang.srt.utils.cuda_vmm_utils import (
     _FD_SEND_TIMEOUT_S,
@@ -46,6 +43,12 @@ from sglang.srt.utils.cuda_vmm_utils import (
     release_mappings,
     tensor_from_pointer,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.managers.req_types import (
+        MultimodalDataItem,
+        MultimodalProcessorOutput,
+    )
 
 logger = logging.getLogger(__name__)
 

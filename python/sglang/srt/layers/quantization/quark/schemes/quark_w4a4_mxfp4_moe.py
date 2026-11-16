@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_weight_sizes
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -44,8 +45,12 @@ logger = logging.getLogger(__name__)
 __all__ = ["QuarkW4A4MXFp4MoE"]
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_gfx95 = is_gfx95_supported()
+# This scheme runs only on the AITER runner, so on the arches AITER has an MXFP4
+# MoE layout for, that layout is bound whatever SGLANG_USE_AITER says.
+_use_aiter = _is_hip and (
+    get_bool_env_var("SGLANG_USE_AITER") or _is_gfx95 or is_gfx1250_supported()
+)
 _is_shuffle_moe_mxfp4 = _use_aiter and _is_gfx95
 _aiter_k3_opt = _use_aiter and get_bool_env_var("SGLANG_AITER_K3_OPT")
 if _use_aiter:
@@ -122,17 +127,13 @@ else:
 
 OCP_MX_BLOCK_SIZE = 32
 
-# HIP GPUs without FP4 hardware or an AITER FP4 MoE kernel (e.g. gfx1151 / Strix
-# Halo) cannot run the AITER path: its scales are laid out for gfx950 and its
-# kernels produce garbage there. Run the MoE as W4A16 instead: keep the packed
-# MXFP4 weights and upcast them inside triton_kernels' matmul, with bf16
-# activations. SGLANG_QUARK_MXFP4_MOE_W4A16=0 opts out.
-_use_triton_w4a16 = (
-    _is_hip
-    and not _is_gfx95
-    and not _is_gfx1250
-    and get_bool_env_var("SGLANG_QUARK_MXFP4_MOE_W4A16", "true")
-)
+# gfx1151 (Strix Halo) has neither FP4 hardware nor an AITER FP4 MoE kernel, so
+# the AITER path cannot run there: its scales are laid out for gfx950 and its
+# kernels produce garbage. Run the MoE as W4A16 instead: keep the packed MXFP4
+# weights and upcast them inside triton_kernels' matmul, with bf16 activations.
+# SGLANG_ENABLE_QUARK_MXFP4_MOE_W4A16=0 opts out.
+_is_gfx1151 = _is_hip and "gfx1151" in torch.cuda.get_device_properties(0).gcnArchName
+_use_triton_w4a16 = _is_gfx1151 and envs.SGLANG_ENABLE_QUARK_MXFP4_MOE_W4A16.get()
 _TRITON_W4A16_NUM_WARPS = 8
 
 
@@ -975,12 +976,18 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         layer.w2_weight_scale = torch.nn.Parameter(w2_weight_scale, requires_grad=False)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        from sglang.srt.layers.moe.moe_runner.aiter import AiterQuantType
+        from sglang.srt.layers.moe.token_dispatcher.base import (
+            build_dispatcher_quant_config,
+        )
+
         if _use_triton_w4a16:
             self._process_weights_triton_w4a16(layer)
             return
-        if not getattr(self, "_owns_moe_runner", False):
+        if not getattr(self, "_owns_moe_weight_layout", False):
             raise RuntimeError(
-                "Quark MXFP4 weight preshuffling requires an owned AITER runner."
+                "Quark MXFP4 weight preshuffling requires a backend that owns "
+                "the resulting weight layout."
             )
 
         if (
@@ -1008,7 +1015,12 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             self._shuffle_gu_interleaved(layer)
             if hasattr(layer, "dispatcher"):
                 layer.dispatcher.set_quant_config(
-                    {"weight_dtype": torch.float4_e2m1fn_x2}
+                    build_dispatcher_quant_config(
+                        layer,
+                        torch.float4_e2m1fn_x2,
+                        AiterQuantType.PER_1X32,
+                        gate_up_interleaved=_is_gfx1250,
+                    )
                 )
             return
 
@@ -1058,7 +1070,18 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         if hasattr(layer, "dispatcher"):
             # Weights are stored as torch.uint8 but semantically MXFP4
-            layer.dispatcher.set_quant_config({"weight_dtype": torch.float4_e2m1fn_x2})
+            layer.dispatcher.set_quant_config(
+                build_dispatcher_quant_config(
+                    layer,
+                    torch.float4_e2m1fn_x2,
+                    AiterQuantType.PER_1X32,
+                    gate_up_interleaved=_is_gfx1250,
+                )
+            )
+
+        from sglang.srt.layers.moe.gluon_backend import prepare_gluon_moe_weights
+
+        prepare_gluon_moe_weights(layer)
 
     def create_moe_runner(
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
@@ -1070,15 +1093,23 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         self.moe_runner_config = moe_runner_config
         self._owns_moe_runner = False
+        self._owns_moe_weight_layout = False
         if _use_triton_w4a16:
             return
         moe_runner_backend = get_moe_runner_backend()
         if moe_runner_backend.is_auto() and get_moe_a2a_backend().supports_aiter():
             moe_runner_backend = MoeRunnerBackend.AITER
 
-        if moe_runner_backend.is_aiter():
+        if moe_runner_backend.is_gluon():
+            # Gluon consumes the serialized MXFP4 weights through the
+            # whole-layer DeepseekV2MoE backend before this scheme's ordinary
+            # routed-expert apply path.
+            self.runner = None
+            self._owns_moe_weight_layout = True
+        elif moe_runner_backend.is_aiter():
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
             self._owns_moe_runner = True
+            self._owns_moe_weight_layout = True
         else:
             raise NotImplementedError(
                 "Quark MXFP4 MoE currently requires the AITER runner; "
@@ -1152,6 +1183,28 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         assert self.moe_runner_config.activation == "silu", (
             f"The W4A16 triton path only supports silu, got {self.moe_runner_config.activation}"
         )
+        # silu_and_mul below is plain SwiGLU on split gate/up halves; the clamped /
+        # alpha-scaled variants (e.g. gpt-oss, DeepSeek-V4) would be silently wrong.
+        cfg = self.moe_runner_config
+        unsupported = {
+            name: value
+            for name, value in (
+                ("gemm1_alpha", cfg.gemm1_alpha),
+                ("gemm1_beta", cfg.gemm1_beta),
+                ("gemm1_clamp_limit", cfg.gemm1_clamp_limit),
+                ("swiglu_limit", cfg.swiglu_limit or None),
+            )
+            if value is not None
+        }
+        if unsupported:
+            raise NotImplementedError(
+                f"The W4A16 triton path does not support SwiGLU variants: {unsupported}"
+            )
+        logger.info_once(
+            "Quark MXFP4 MoE on gfx1151: no FP4 hardware, running the W4A4 MXFP4 "
+            "checkpoint as W4A16 (bf16 activations, MXFP4 weights upcast in "
+            "triton_kernels). Set SGLANG_ENABLE_QUARK_MXFP4_MOE_W4A16=0 to disable."
+        )
         self.num_experts = layer.w13_weight.shape[0]
         self.intermediate_size = layer.w13_weight.shape[1] // 2
         precision_configs = []
@@ -1194,12 +1247,16 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         # Expert-major routing for triton_kernels: row i of the grouped GEMM is flat
         # slot combine[i] (= token * top_k + j), sorted by expert id. Everything
         # stays on device (no bincount) so this is CUDA-graph capturable.
+        # -1 ids (experts on other EP ranks) go to an extra bucket that sorts last,
+        # gets no GEMM rows, and is zeroed before the top_k reduction.
         flat_ids = topk_ids.reshape(-1).to(torch.int64)
+        valid = flat_ids >= 0
+        flat_ids = torch.where(valid, flat_ids, self.num_experts)
         combine = torch.argsort(flat_ids, stable=True).to(torch.int32)
         gather = torch.div(combine, top_k, rounding_mode="trunc")
-        counts = torch.zeros(self.num_experts, dtype=torch.int32, device=x.device)
+        counts = torch.zeros(self.num_experts + 1, dtype=torch.int32, device=x.device)
         counts.scatter_add_(0, flat_ids, torch.ones_like(flat_ids, dtype=torch.int32))
-        ragged = make_ragged_tensor_metadata(counts, num_tokens * top_k)
+        ragged = make_ragged_tensor_metadata(counts[:-1], num_tokens * top_k)
         gammas = topk_weights.reshape(-1).to(torch.float32)[combine]
 
         gate_up = matmul(
@@ -1225,5 +1282,6 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
         )
         # The scatter writes row i to flat slot combine[i] (num_tokens * top_k
         # rows) without reducing over top_k, so do the reduction here.
-        out = out.view(num_tokens, top_k, -1).sum(dim=1)
+        out = out.view(num_tokens, top_k, -1)
+        out = out.masked_fill(~valid.view(num_tokens, top_k, 1), 0).sum(dim=1)
         return StandardCombineInput(hidden_states=out.to(x.dtype))

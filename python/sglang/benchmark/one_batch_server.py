@@ -39,8 +39,8 @@ from sglang.benchmark.stream_metrics import (
 )
 from sglang.benchmark.utils import get_processor, get_tokenizer
 from sglang.profiler import run_profile
-from sglang.srt.arg_groups.overrides import resolving_view
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST
+from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.entrypoints.http_server import launch_server
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import is_blackwell
@@ -571,6 +571,9 @@ def _load_hf_config(name_or_path: str):
 
     from transformers import AutoConfig
 
+    from sglang.srt.utils.hf_transformers_patches import apply_all_hf_patches
+
+    apply_all_hf_patches()
     try:
         return AutoConfig.from_pretrained(name_or_path, trust_remote_code=True)
     except Exception as e:
@@ -1060,7 +1063,12 @@ def _batch_input_lens(input_len_list: str, batch_size: int) -> List[int]:
 
 
 def should_skip_due_to_token_capacity(
-    batch_size, input_len, output_len, skip_token_capacity_threshold, input_len_list=""
+    batch_size,
+    input_len,
+    output_len,
+    skip_token_capacity_threshold,
+    input_len_list="",
+    num_dp_ranks=1,
 ):
     input_tokens = (
         sum(_batch_input_lens(input_len_list, batch_size))
@@ -1068,6 +1076,16 @@ def should_skip_due_to_token_capacity(
         else batch_size * input_len
     )
     resident_tokens = input_tokens + batch_size * output_len
+    if input_len_list and num_dp_ranks > 1:
+        # Requests land on DP rank i % num_dp_ranks (the DP controller's
+        # round-robin), so a ragged batch fills its heaviest rank first; the
+        # requests past that rank's share of the pool would queue.
+        lens = _batch_input_lens(input_len_list, batch_size)
+        heaviest = max(
+            sum(n + output_len for n in lens[rank::num_dp_ranks])
+            for rank in range(num_dp_ranks)
+        )
+        resident_tokens = max(resident_tokens, heaviest * num_dp_ranks)
     if resident_tokens > skip_token_capacity_threshold:
         print(
             "=" * 8
@@ -1283,6 +1301,7 @@ def run_benchmark_internal(
         # vLLM does not expose token capacity or max running requests via API
         skip_token_capacity_threshold = float("inf")
         skip_max_running_requests_threshold = float("inf")
+        num_dp_ranks = 1
     else:
         model_name = None
         response = requests.get(base_url + "/server_info", timeout=DEFAULT_TIMEOUT)
@@ -1457,6 +1476,7 @@ def run_benchmark_internal(
                 ol,
                 skip_token_capacity_threshold,
                 bench_args.input_len_list,
+                num_dp_ranks,
             ):
                 continue
             results.append(
@@ -1510,6 +1530,7 @@ def run_benchmark_internal(
                         ol,
                         skip_token_capacity_threshold,
                         bench_args.input_len_list,
+                        num_dp_ranks,
                     ):
                         continue
                     profile_prefix = (

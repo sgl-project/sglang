@@ -234,7 +234,7 @@ def absorbed_bmm_concat_cast_q_fp8_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
-    K_MODE: tl.constexpr,
+    TWO_DOT: tl.constexpr,
 ):
     # One program per (token-block, head): q_out[m, h, :N] = fp8(bf16(fp32(
     # q_nope[m, h, :K] @ w_kc[h, :K, :N]))) and q_out[m, h, N:] =
@@ -243,34 +243,18 @@ def absorbed_bmm_concat_cast_q_fp8_kernel(
     # so neither the bf16 q_nope_out ([H, T, N], written by cublas and re-read
     # by the concat-cast) nor the standalone concat-cast launch exist anymore.
     #
-    # K handling (K_MODE selects the codegen for the nope-gemm K dimension;
-    # every mode keeps the same fp32-accumulator -> bf16 -> fp8 epilogue):
-    #   0 "single": BLOCK_K == K.  Preload the whole [BLOCK_M, K] a-tile once,
-    #     one tl.dot per N-block — identical codegen to the original
-    #     power-of-2-only kernel (DeepSeek K=128).  For non-power-of-2 K this
-    #     only compiles if the Triton build allows non-power-of-2 tl.arange
-    #     (Triton <= 3.5.x does NOT: "arange's range must be a power of 2").
-    #   1 "loop": split-K loop, K % BLOCK_K == 0, BLOCK_K power of 2 >= 16
-    #     (e.g. K=192 with BLOCK_K=64 -> 3 iterations).  The a-tile is
-    #     re-loaded per (N-block, K-block); slices are L1/L2-resident after
-    #     the first N-block, but the load/dot interleave costs bandwidth
-    #     (measured ~1372 GB/s vs ~2x that for mode 0 at K=128).
-    #   2 "two_dot": K = BLOCK_K + (K - BLOCK_K), both power-of-2 halves
-    #     (192 = 128 + 64).  Both a-tiles preload once before the N-loop;
+    # K handling (both paths keep the same fp32-accumulator -> bf16 -> fp8
+    # epilogue):
+    #   single-dot: BLOCK_K == K, power of 2 (DeepSeek K=128).  Preload the
+    #     whole [BLOCK_M, K] a-tile once, one tl.dot per N-block.
+    #   TWO_DOT: K = BLOCK_K + (K - BLOCK_K), both power-of-2 halves
+    #     (GLM 192 = 128 + 64).  Both a-tiles preload once before the N-loop;
     #     each N-block issues two chained tl.dot into one fp32 accumulator.
-    #     No K-loop, no a re-reads — the direct generalization of mode 0.
-    #   3 "three_dot": K = 3 * BLOCK_K (192 = 3 x 64).  Same as mode 2 with
-    #     three preloaded a-tiles / three chained tl.dot per N-block; the
-    #     hoisted-loads analogue of mode 1 (identical fp32 add order).
-    #   4 "pad": BLOCK_K = next_pow2(K) > K, k-masked loads (zero fill).
-    #     Single tl.dot per N-block; the padded zeros are exact fp32
-    #     additive identities so the result matches a K-wide single dot,
-    #     at the cost of BLOCK_K/K (e.g. 256/192 = 1.33x) extra MMA work.
     #
     # Rounding contract: the fp32 accumulator is rounded to bf16 first (the
     # same output rounding stage as the cublas bf16 bmm) and then converted
     # bf16->fp8 by the same implicit-store conversion the fused concat-cast
-    # kernel uses.  The split-K accumulator stays fp32 across all K-blocks,
+    # kernel uses.  The two-dot accumulator stays fp32 across both halves,
     # so the rounding stages are identical in both layouts.  The rope half is
     # a bit-exact copy of that kernel (loads the post-rope bf16, converts on
     # store).  The nope half is NOT guaranteed bit-exact vs the default path:
@@ -287,8 +271,8 @@ def absorbed_bmm_concat_cast_q_fp8_kernel(
     qout_head = qout_ptr + offs_m64[:, None] * qout_s0 + h * qout_s1
     a_row = a_ptr + offs_m64[:, None] * a_s0 + h * a_s1
     b_head = b_ptr + h * b_s0
-    if K_MODE == 0:
-        # single-dot path (original kernel): BLOCK_K == K, preload a once.
+    if not TWO_DOT:
+        # single-dot path: BLOCK_K == K, preload a once.
         offs_k = tl.arange(0, BLOCK_K)
         a = tl.load(a_row + offs_k[None, :], mask=m_mask[:, None], other=0.0)
         for nb in tl.static_range(N // BLOCK_N):
@@ -298,7 +282,7 @@ def absorbed_bmm_concat_cast_q_fp8_kernel(
             val = acc.to(tl.bfloat16)  # cublas-equivalent bf16 output rounding
             # implicit bf16 -> fp8 conversion on store (same as the concat-cast)
             tl.store(qout_head + offs_n[None, :], val, mask=m_mask[:, None])
-    elif K_MODE == 2:
+    else:
         # two-dot preload: K split as BLOCK_K + (K - BLOCK_K), no K-loop.
         offs_k0 = tl.arange(0, BLOCK_K)
         offs_k1 = BLOCK_K + tl.arange(0, K - BLOCK_K)
@@ -313,58 +297,6 @@ def absorbed_bmm_concat_cast_q_fp8_kernel(
             val = acc.to(tl.bfloat16)  # cublas-equivalent bf16 output rounding
             # implicit bf16 -> fp8 conversion on store (same as the concat-cast)
             tl.store(qout_head + offs_n[None, :], val, mask=m_mask[:, None])
-    elif K_MODE == 3:
-        # three-dot preload: K = 3 * BLOCK_K, a-tiles hoisted out of the N-loop.
-        offs_k0 = tl.arange(0, BLOCK_K)
-        offs_k1 = BLOCK_K + offs_k0
-        offs_k2 = 2 * BLOCK_K + offs_k0
-        a0 = tl.load(a_row + offs_k0[None, :], mask=m_mask[:, None], other=0.0)
-        a1 = tl.load(a_row + offs_k1[None, :], mask=m_mask[:, None], other=0.0)
-        a2 = tl.load(a_row + offs_k2[None, :], mask=m_mask[:, None], other=0.0)
-        for nb in tl.static_range(N // BLOCK_N):
-            offs_n = nb * BLOCK_N + tl.arange(0, BLOCK_N)
-            b0 = tl.load(b_head + offs_k0[:, None] * b_s1 + offs_n[None, :] * b_s2)
-            b1 = tl.load(b_head + offs_k1[:, None] * b_s1 + offs_n[None, :] * b_s2)
-            b2 = tl.load(b_head + offs_k2[:, None] * b_s1 + offs_n[None, :] * b_s2)
-            acc = tl.dot(a0, b0)  # fp32 accumulator
-            acc = tl.dot(a1, b1, acc)
-            acc = tl.dot(a2, b2, acc)  # same fp32 add order as the K_MODE=1 loop
-            val = acc.to(tl.bfloat16)  # cublas-equivalent bf16 output rounding
-            # implicit bf16 -> fp8 conversion on store (same as the concat-cast)
-            tl.store(qout_head + offs_n[None, :], val, mask=m_mask[:, None])
-    elif K_MODE == 4:
-        # padded single dot: BLOCK_K = next_pow2(K), zero-fill the k tail.
-        offs_k = tl.arange(0, BLOCK_K)
-        k_mask = offs_k < K
-        a = tl.load(
-            a_row + offs_k[None, :],
-            mask=m_mask[:, None] & k_mask[None, :],
-            other=0.0,
-        )
-        for nb in tl.static_range(N // BLOCK_N):
-            offs_n = nb * BLOCK_N + tl.arange(0, BLOCK_N)
-            b = tl.load(
-                b_head + offs_k[:, None] * b_s1 + offs_n[None, :] * b_s2,
-                mask=k_mask[:, None],
-                other=0.0,
-            )
-            acc = tl.dot(a, b)  # fp32 accumulator (padded zeros add exactly 0)
-            val = acc.to(tl.bfloat16)  # cublas-equivalent bf16 output rounding
-            # implicit bf16 -> fp8 conversion on store (same as the concat-cast)
-            tl.store(qout_head + offs_n[None, :], val, mask=m_mask[:, None])
-    else:
-        # K_MODE == 1: split-K loop (K % BLOCK_K == 0, e.g. K=192, BLOCK_K=64).
-        for nb in tl.static_range(N // BLOCK_N):
-            offs_n = nb * BLOCK_N + tl.arange(0, BLOCK_N)
-            acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
-            for kb in tl.static_range(K // BLOCK_K):
-                offs_k = kb * BLOCK_K + tl.arange(0, BLOCK_K)
-                a = tl.load(a_row + offs_k[None, :], mask=m_mask[:, None], other=0.0)
-                b = tl.load(b_head + offs_k[:, None] * b_s1 + offs_n[None, :] * b_s2)
-                acc = tl.dot(a, b, acc)  # fp32 accumulator across K-blocks
-            val = acc.to(tl.bfloat16)  # cublas-equivalent bf16 output rounding
-            # implicit bf16 -> fp8 conversion on store (same as the concat-cast)
-            tl.store(qout_head + offs_n[None, :], val, mask=m_mask[:, None])
     offs_r = tl.arange(0, ROPE)
     r = tl.load(
         rope_ptr + offs_m64[:, None] * rope_s0 + h * rope_s1 + offs_r[None, :],
@@ -372,12 +304,6 @@ def absorbed_bmm_concat_cast_q_fp8_kernel(
         other=0.0,
     )
     tl.store(qout_head + N + offs_r[None, :], r, mask=m_mask[:, None])
-
-
-# Non-power-of-2-K variant used by variant="auto" (power-of-2 K always takes
-# the single-dot fast path).  Set to the winner of the K=192 A/B in
-# benchmark/kernels/deepseek/benchmark_q8kv8_q_prep.py; "loop" = the pre-A/B split-K behavior.
-_AUTO_NONPOW2_VARIANT = "two_dot"
 
 
 def _qprep_env_variant():
@@ -401,9 +327,7 @@ def absorbed_bmm_concat_cast_q_fp8(
     block_m: int = 128,
     block_n: int = 64,
     variant: str = "auto",
-    block_k: int = 0,
     num_warps: int = 8,
-    num_stages: int = 0,
 ):
     """Fused absorbed-q bmm + nope/rope concat + bf16->fp8 cast ("born fp8" q).
 
@@ -423,27 +347,12 @@ def absorbed_bmm_concat_cast_q_fp8(
     guaranteed bit-exact; keep this path behind
     ``SGLANG_ENABLE_DSA_Q8KV8_BORN_FP8_Q``.
 
-    K (``qk_nope_head_dim``) supports any multiple of 16 in [16, 256].
-    Power-of-2 K (DeepSeek 128) always takes the preload-once
-    single-``tl.dot`` path.  For other K (GLM 192), ``variant`` selects the
-    K-dimension codegen (every variant keeps the identical fp32 -> bf16 ->
-    fp8 epilogue):
-
-    * ``"auto"``: the current production choice (see
-      ``_AUTO_NONPOW2_VARIANT``).
-    * ``"loop"``: split-K accumulator loop, ``BLOCK_K`` = ``block_k`` or the
-      largest power-of-2 divisor of K capped at 128 (192 -> 64 x 3).
-    * ``"two_dot"``: preload a as two power-of-2 tiles (192 = 128 + 64), two
-      chained ``tl.dot`` per N-block, no K-loop.
-    * ``"three_dot"``: preload a as three K/3 tiles (192 = 3 x 64), three
-      chained ``tl.dot`` per N-block; same fp32 add order as ``"loop"``.
-    * ``"pad"``: single ``tl.dot`` with ``BLOCK_K`` = next_pow2(K) (192 ->
-      256) and zero-masked k tails.
-    * ``"single_k"``: single ``tl.dot`` with ``BLOCK_K`` == K.  Only
-      compiles if the Triton build supports non-power-of-2 ``tl.arange``
-      (Triton <= 3.5.x raises "arange's range must be a power of 2").
-    ``block_m`` / ``block_n`` / ``num_warps`` / ``num_stages`` are tuning
-    knobs for the microbench sweep (0 = Triton default for ``num_stages``).
+    Power-of-2 K (DeepSeek 128) takes the preload-once single-``tl.dot``
+    path; other K (GLM 192) must split into two power-of-2 halves, each >= 16,
+    and runs two chained ``tl.dot`` per N-block.  ``variant`` is ``"auto"``
+    (the Triton kernel), ``"two_dot"`` (the same, by name) or ``"cuda"`` (the
+    SM90 WGMMA kernel).  ``block_m`` / ``block_n`` / ``num_warps`` are tuning
+    knobs for the microbench sweep.
     """
     num_tokens, _, k_dim = q_nope.shape
     n_dim = w_kc.shape[-1]
@@ -474,9 +383,9 @@ def absorbed_bmm_concat_cast_q_fp8(
     # Hand-written SM90 WGMMA kernel (opt-in only; "auto" never routes here).
     # Same fp32 -> bf16 -> fp8 epilogue; bitwise identical to "two_dot" on
     # SM90.  Requires K in {128, 192} and the production N-major w_kc layout
-    # (see the wrapper's asserts); the Triton variants remain the
+    # (see the wrapper's asserts); the Triton kernel remains the
     # general-strides fallback.
-    _valid = ("auto", "cuda", "loop", "two_dot", "three_dot", "pad", "single_k")
+    _valid = ("auto", "cuda", "two_dot")
     if variant not in _valid:
         raise ValueError(
             f"unknown q-prep variant {variant!r} "
@@ -487,45 +396,15 @@ def absorbed_bmm_concat_cast_q_fp8(
 
         q8kv8_qprep_fwd(q_fp8_pad, q_nope, w_kc, q_rope, num_heads)
         return
-    # Resolve (K_MODE, BLOCK_K) from the variant; see the kernel's K-handling
-    # comment for what each mode compiles to.
-    if k_dim & (k_dim - 1) == 0:
-        # power-of-2 K: every variant collapses to the single-dot fast path.
-        k_mode, blk_k = 0, k_dim
+    two_dot = k_dim & (k_dim - 1) != 0
+    if two_dot:
+        blk_k = 1 << (k_dim.bit_length() - 1)  # largest power of 2 < K
+        k1 = k_dim - blk_k
+        assert k1 & (k1 - 1) == 0 and k1 >= 16, (
+            "two_dot needs K = pow2 + pow2 with both halves >= 16"
+        )
     else:
-        v = _AUTO_NONPOW2_VARIANT if variant == "auto" else variant
-        if v == "loop":
-            # Largest power-of-2 divisor of K, capped at 128 (K % 16 == 0
-            # makes this >= 16), unless the caller pinned block_k.
-            blk_k = block_k or min(k_dim & -k_dim, 128)
-            assert k_dim % blk_k == 0 and blk_k & (blk_k - 1) == 0 and blk_k >= 16, (
-                "loop needs BLOCK_K a power-of-2 divisor of K >= 16"
-            )
-            k_mode = 1
-        elif v == "two_dot":
-            blk_k = 1 << (k_dim.bit_length() - 1)  # largest power of 2 < K
-            k1 = k_dim - blk_k
-            assert k1 & (k1 - 1) == 0 and k1 >= 16, (
-                "two_dot needs K = pow2 + pow2 with both halves >= 16"
-            )
-            k_mode = 2
-        elif v == "three_dot":
-            blk_k = k_dim // 3
-            assert k_dim % 3 == 0 and blk_k & (blk_k - 1) == 0 and blk_k >= 16, (
-                "three_dot needs K = 3 * pow2 with pow2 >= 16"
-            )
-            k_mode = 3
-        elif v == "pad":
-            blk_k = 1 << k_dim.bit_length()  # next power of 2 above K
-            k_mode = 4
-        elif v == "single_k":
-            # Non-power-of-2 BLOCK_K == K: compiles only on Triton builds
-            # that allow non-power-of-2 tl.arange (not 3.5.x).
-            blk_k = k_dim
-            k_mode = 0
-        else:
-            raise ValueError(f"unknown absorbed-bmm K variant: {variant!r}")
-    extra = {"num_stages": num_stages} if num_stages else {}
+        blk_k = k_dim
     grid = (triton.cdiv(num_tokens, block_m), num_heads)
     absorbed_bmm_concat_cast_q_fp8_kernel[grid](
         q_fp8_pad,
@@ -548,7 +427,6 @@ def absorbed_bmm_concat_cast_q_fp8(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         BLOCK_K=blk_k,
-        K_MODE=k_mode,
+        TWO_DOT=two_dot,
         num_warps=num_warps,
-        **extra,
     )

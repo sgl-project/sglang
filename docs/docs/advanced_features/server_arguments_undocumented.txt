@@ -17,7 +17,6 @@
 --disaggregation-enable-kv-checksum
 --dsa-paged-mqa-logits-backend
 --dsv4-attn-backend
---dsv4-prefill-backend
 --dwdp-size
 --elastic-ep-initial-size
 --elastic-ep-join-mode

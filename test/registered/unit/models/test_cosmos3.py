@@ -25,7 +25,7 @@ import unittest
 import safetensors.torch
 import torch
 
-from sglang.srt.configs import Cosmos3Config
+from sglang.srt.configs.cosmos3 import Cosmos3Config
 from sglang.srt.configs.load_config import LoadConfig, LoadFormat
 from sglang.srt.model_loader.loader import DefaultModelLoader
 from sglang.srt.models.cosmos3 import Cosmos3ForConditionalGeneration

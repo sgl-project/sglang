@@ -37,7 +37,6 @@ from sglang.srt.mem_cache.kv.alloc.pricing import (
     float_reclaim_satisfied,
     float_token_id_capacity,
 )
-from sglang.srt.mem_cache.swa_memory_pool import filter_window_cpu_copy
 from sglang.srt.runtime_context import get_disagg, get_memory, get_parallel
 from sglang.srt.utils.common import get_num_new_pages
 from sglang.srt.utils.rank_consensus_checker import rank_consensus
@@ -55,22 +54,13 @@ class ChainAdmissionRules(msgspec.Struct, frozen=True, kw_only=True):
     """
 
     window: Literal["none", "split", "joint"]
-    # Full-token equivalents one new state slot takes from the shared bytes; 0: no state.
+    # FULL-token conversion used only by fixed/split admission. Joint policies
+    # keep raw state slots and do not use this conversion.
     state_slot_cost: int = 0
 
 
 def _snapshot(c: ChainAllocator) -> ChainSnapshot:
     return c.pricing_snapshot()
-
-
-def _virtual_tokens_to_physical(virtual_tokens: torch.Tensor, band) -> torch.Tensor:
-    """Virtual token ids -> the band's physical token ids, page-aware. A page
-    the band does not bind yields a negative id."""
-    page_size = band.page_size
-    if page_size == 1:
-        return band.ids.virtual_to_physical[virtual_tokens]
-    physical_pages = band.ids.virtual_to_physical[virtual_tokens // page_size]
-    return physical_pages * page_size + virtual_tokens % page_size
 
 
 def _state_usage(c: ChainAllocator) -> Dict[str, Tuple[int, int]]:
@@ -120,6 +110,67 @@ class _InterimPolicy:
             c, tree_cache, num_tokens
         )
 
+    def prefill_state_fits(
+        self,
+        c,
+        full_tokens,
+        swa_tokens,
+        state_slots,
+        *,
+        full_evictable_tokens=0,
+        swa_evictable_tokens=0,
+        state_evictable_slots=0,
+    ):
+        """Shared-byte competition, separate from token quotas and per-side gates."""
+        from sglang.srt.mem_cache.kv.alloc.pricing import (
+            reclaimed_snapshot,
+            sequential_fit,
+        )
+
+        credits = {c.roles.owner: int(full_evictable_tokens) // c.page_size}
+        if c.roles.window is not None:
+            credits[c.roles.window] = int(swa_evictable_tokens) // c.page_size
+        credits[c.roles.state] = int(state_evictable_slots)
+        snapshot = reclaimed_snapshot(_snapshot(c), credits)
+        demands = [
+            (c.roles.state, int(state_slots)),
+            (c.roles.owner, int(-(-full_tokens // c.page_size))),
+        ]
+        if c.roles.window is None:
+            # Two fixed ends use the same state-before-token take order.
+            return sequential_fit(snapshot, tuple(demands))
+        demands.append((c.roles.window, int(-(-swa_tokens // c.page_size))))
+        # Preserve the split policy's physical surcharge: a pinned window can
+        # strand bytes on either side even when the aggregate arena has room.
+        # State competes for these bytes, but never consumes FULL token IDs.
+        physical_full = c.full_attn_allocator._schedulable_physical_tokens()
+        if full_tokens + state_slots * self._state_slot_cost(c) > (
+            physical_full + full_evictable_tokens
+        ):
+            return False
+        # The old one-window policy retains its per-side physical placement
+        # checks. This additional byte gate prevents state from spending the
+        # same shared bytes as pending tokens, without treating it as FULL IDs.
+        occupied = sum(b.live * b.page_bytes for b in snapshot.bands)
+        requested = sum(
+            snapshot.band(name).page_bytes * pages for name, pages in demands
+        )
+        return (
+            occupied
+            + requested
+            + min(b.min_page * b.page_bytes for b in snapshot.bands)
+            <= snapshot.total_bytes
+        )
+
+    def _state_slot_cost(self, c: ChainAllocator) -> int:
+        """Logical token equivalents of one state slot in the shared arena."""
+        token_page_bytes = sum(
+            band.entry_bytes_per_page for band in (c.full_attn_allocator, *c._windows)
+        )
+        return -(
+            -c.mamba_allocator.entry_bytes_per_page * c.page_size // token_page_bytes
+        )
+
     def mamba_full_cache_donor(self, c: ChainAllocator):
         return None
 
@@ -128,31 +179,12 @@ class _InterimPolicy:
         them, by sub-pool name: tokens, or slots for a state sub-pool."""
         raise NotImplementedError
 
-    def resize(self, c: ChainAllocator, config) -> None:
-        raise NotImplementedError(
-            "post-capture resize is planned only for a full + sliding-window chain"
-        )
-
     def memo_violations(self, c: ChainAllocator) -> List[str]:
         return []
 
-    # Whether a retraction copy carries the request's state; otherwise the
-    # scheduler backs the state up on its own.
-    cpu_copy_carries_state = False
 
-    def get_cpu_copy(
-        self, c: ChainAllocator, indices, *, mamba_indices, req_pool_index
-    ):
-        raise NotImplementedError
-
-    def load_cpu_copy(
-        self, c: ChainAllocator, cpu_copy, indices, *, mamba_indices, req_pool_index
-    ) -> None:
-        raise NotImplementedError
-
-
-class _TokenAndSlotEndsPolicy(_InterimPolicy):
-    """A token end (the owner) and a slot end (per-request state)."""
+class _OwnerEndPolicy(_InterimPolicy):
+    """The token owner, optionally opposite a per-request state end."""
 
     prices_before_take = False
 
@@ -161,7 +193,7 @@ class _TokenAndSlotEndsPolicy(_InterimPolicy):
 
     @property
     def unit_name(self) -> str:
-        return "token-and-slot ends"
+        return "owner end with optional state"
 
     def size(self, c: ChainAllocator) -> int:
         # TOKENS. MUST use the SAME available view as `available_size()`, so the
@@ -184,12 +216,12 @@ class _TokenAndSlotEndsPolicy(_InterimPolicy):
         return (c.full_attn_allocator.max_slots - 1) * get_parallel().attn_dcp_size
 
     def mamba_full_cache_donor(self, c: ChainAllocator):
-        return c
+        return c if c.roles.state is not None else None
 
     def usage(self, c: ChainAllocator) -> Dict[str, Tuple[int, int]]:
         return {
             c.roles.owner: (c.size, c.available_size()),
-            **_state_usage(c),
+            **(_state_usage(c) if c.roles.state is not None else {}),
         }
 
     def prepare_mamba_allocation(self, c: ChainAllocator, target_size: int) -> None:
@@ -202,54 +234,11 @@ class _TokenAndSlotEndsPolicy(_InterimPolicy):
 
     def admission_rules(self, c: ChainAllocator) -> ChainAdmissionRules:
         return ChainAdmissionRules(
-            window="none", state_slot_cost=self._state_slot_cost(c)
+            window="none",
+            state_slot_cost=self._state_slot_cost(c)
+            if c.roles.state is not None
+            else 0,
         )
-
-    def _state_slot_cost(self, c: ChainAllocator) -> int:
-        """Full-token-equivalents of shared-gap bytes ONE mamba state consumes; the
-        prefill planner reserves this so admission stays inside the JOINT budget,
-        rounded UP. The `dcp_size` factor is there because that budget is in widened
-        tokens, one of which is `entry_bytes / dcp_size` local bytes.
-        """
-        return -(
-            -c.mamba_allocator.entry_bytes_per_page
-            * get_parallel().attn_dcp_size
-            // c.full_attn_allocator.entry_bytes
-        )
-
-    def resize(self, c: ChainAllocator, config) -> None:
-        BaseTokenToKVPoolAllocator.resize(c, config)
-
-    cpu_copy_carries_state = True
-
-    def get_cpu_copy(
-        self, c: ChainAllocator, indices, *, mamba_indices, req_pool_index
-    ):
-        owner = c.views[c.roles.owner]
-        kv_cpu = owner.get_cpu_copy(
-            c.full_attn_allocator.ids.translate(indices.to(torch.int64)),
-            req_pool_index=req_pool_index,
-        )
-        state_cpu = None
-        if mamba_indices is not None:
-            state_cpu = c.state.pool.get_cpu_copy(
-                c.state_ids(c.roles.state).ids(mamba_indices)
-            )
-        return kv_cpu, state_cpu
-
-    def load_cpu_copy(
-        self, c: ChainAllocator, cpu_copy, indices, *, mamba_indices, req_pool_index
-    ) -> None:
-        kv_cpu, state_cpu = cpu_copy
-        c.views[c.roles.owner].load_cpu_copy(
-            kv_cpu,
-            c.full_attn_allocator.ids.translate(indices.to(torch.int64)),
-            req_pool_index=req_pool_index,
-        )
-        if state_cpu is not None and mamba_indices is not None:
-            c.state.pool.load_cpu_copy(
-                state_cpu, c.state_ids(c.roles.state).ids(mamba_indices)
-            )
 
 
 class _WindowPolicy(_InterimPolicy):
@@ -271,8 +260,14 @@ class _WindowPolicy(_InterimPolicy):
         legacy_capacities = full_max_total_num_tokens is not None
         self._empty_shared_gap_bytes = fa._current_gap_bytes()
         if legacy_capacities:
-            self._size_full = int(full_max_total_num_tokens)
-            self._size_swa = int(swa_max_total_num_tokens)
+            # Sizing supplies physical rows per rank. All policy capacity and
+            # usage views count the widened logical tokens the bands allocate.
+            self._size_full = (
+                int(full_max_total_num_tokens) * fa.page_size // fa.pool_page_size
+            )
+            self._size_swa = (
+                int(swa_max_total_num_tokens) * sa.page_size // sa.pool_page_size
+            )
         else:
             self._size_full = fa.available_size()
             self._size_swa = min(
@@ -289,7 +284,8 @@ class _WindowPolicy(_InterimPolicy):
         return min(self._size_full, self._size_swa)
 
     def size_full(self, c: ChainAllocator) -> int:
-        return self._size_full
+        cap = c.full_attn_allocator.max_live_tokens
+        return self._size_full if cap is None else min(self._size_full, cap)
 
     def size_swa(self, c: ChainAllocator) -> int:
         return self._size_swa
@@ -362,46 +358,6 @@ class _WindowPolicy(_InterimPolicy):
             f"[joint] stale available_size memo: "
             f"cached={self._joint_avail_memo_tokens}, actual={actual}"
         ]
-
-    def get_cpu_copy(
-        self, c: ChainAllocator, indices, *, mamba_indices, req_pool_index
-    ):
-        # `indices` are virtual token ids; each side copies its physical ones,
-        # and the window only the tokens it still binds.
-        full_phys = _virtual_tokens_to_physical(indices, c.full_attn_allocator)
-        swa_phys = _virtual_tokens_to_physical(indices, c.swa_attn_allocator)
-        full_cpu = c.views[c.roles.owner].get_cpu_copy(
-            full_phys, req_pool_index=req_pool_index
-        )
-        valid = swa_phys >= 0
-        swa_cpu = None
-        if bool(valid.any().item()):
-            swa_cpu = c.views[c.roles.window].get_cpu_copy(swa_phys[valid])
-        return {"full": full_cpu, "swa": swa_cpu, "swa_mask": valid.cpu()}
-
-    def load_cpu_copy(
-        self, c: ChainAllocator, cpu_copy, indices, *, mamba_indices, req_pool_index
-    ) -> None:
-        full_phys = _virtual_tokens_to_physical(indices, c.full_attn_allocator)
-        c.views[c.roles.owner].load_cpu_copy(
-            cpu_copy["full"], full_phys, req_pool_index=req_pool_index
-        )
-        if cpu_copy.get("swa") is None:
-            return
-        window = c.views[c.roles.window]
-        swa_phys = _virtual_tokens_to_physical(indices, c.swa_attn_allocator)
-        old_swa_mask = cpu_copy["swa_mask"].to(indices.device)
-        assert old_swa_mask.shape == indices.shape
-        row_mask = (swa_phys >= 0)[old_swa_mask].cpu()
-        swa_phys = swa_phys[old_swa_mask][row_mask.to(indices.device)]
-        if swa_phys.numel() == 0:
-            return
-        window.load_cpu_copy(
-            filter_window_cpu_copy(
-                window, swa_kv_cpu=cpu_copy["swa"], row_mask=row_mask
-            ),
-            swa_phys,
-        )
 
 
 class _TokenEndsPolicy(_WindowPolicy):
@@ -512,6 +468,7 @@ class _TokenEndsPolicy(_WindowPolicy):
         *,
         full_evictable_tokens: int = 0,
         swa_evictable_tokens: int = 0,
+        auxiliary_swa_evictable_tokens: int = 0,
         empty_pool: bool = False,
         prefer_swa: bool = False,
     ) -> Optional[Tuple[int, int]]:
@@ -535,6 +492,8 @@ class _TokenEndsPolicy(_WindowPolicy):
         *,
         full_evictable_tokens: int = 0,
         swa_evictable_tokens: int = 0,
+        auxiliary_swa_evictable_tokens: int = 0,
+        state_evictable_slots: int = 0,
         empty_pool: bool = False,
         require_token_slack: bool = False,
     ) -> bool:
@@ -683,52 +642,6 @@ class _TokenEndsPolicy(_WindowPolicy):
         # A zero-reclaim plan can still depend on compaction before allocation.
         return c.ensure_capacity(num_tokens, required_swa)
 
-    def resize(self, c: ChainAllocator, config) -> None:
-        """Synchronize allocator capacity after the shared pool is finalized."""
-        if not c.arena.backed_after_capture:
-            raise RuntimeError("ChainAllocator.resize requires post-capture backing")
-        final_pool_bytes = config.unified_memory_pool_bytes
-        if final_pool_bytes is None:
-            raise ValueError(
-                "ChainAllocator.resize requires config.unified_memory_pool_bytes"
-            )
-        if int(final_pool_bytes) != c.arena.total_bytes:
-            raise RuntimeError(
-                "the arena must be backed before allocator.resize: "
-                f"config has {int(final_pool_bytes)} bytes but the pool exposes "
-                f"{c.arena.total_bytes} bytes"
-            )
-        fa, sa = c.full_attn_allocator, c.swa_attn_allocator
-        for allocator in (fa, sa):
-            if allocator.allocated_count() != 0 or allocator._pending_reuse:
-                raise RuntimeError(
-                    f"cannot resize non-empty unified allocator "
-                    f"{allocator.sub_pool_name!r}"
-                )
-        fa._set_capacity(c.arena.num_entries(fa.sub_pool_name))
-        sa._set_capacity(
-            c.arena.num_entries(sa.sub_pool_name),
-            virtual_num_pages=fa.ids.num_virtual_ids,
-        )
-        self._empty_shared_gap_bytes = fa._current_gap_bytes()
-        self._size_full = fa.available_size()
-        self._size_swa = min(
-            sa.available_size(),
-            len(fa.free_virtual_ids) * c.page_size,
-        )
-        self._full_max_total_num_tokens = self._size_full
-        self._swa_max_total_num_tokens = self._size_swa
-        c.get_kvcache().size = fa.max_slots - 1
-        for allocator, host_capacity in (
-            (fa, self._size_full),
-            (sa, self._size_swa),
-        ):
-            pool = c.views[allocator.sub_pool_name]
-            pool.num_pages = allocator.num_pages
-            pool.size = allocator.num_pages * c.page_size - c.page_size
-            pool.host_capacity_tokens = host_capacity
-            pool.host_capacity_bytes = host_capacity * allocator.entry_bytes
-
 
 class _FloatChainPolicy(_WindowPolicy):
     """A slot end, the window floating in the middle, and the owner end:
@@ -769,6 +682,8 @@ class _FloatChainPolicy(_WindowPolicy):
         *,
         full_evictable_tokens: int = 0,
         swa_evictable_tokens: int = 0,
+        auxiliary_swa_evictable_tokens: int = 0,
+        state_evictable_slots: int = 0,
         empty_pool: bool = False,
         require_token_slack: bool = False,
     ) -> bool:
@@ -855,7 +770,7 @@ class _FloatChainPolicy(_WindowPolicy):
                 },
             )
             return c.can_reserve(full_tokens, swa_tokens)
-        need_tokens = -(-int(full_tokens) // c.page_size) * c.page_size
+        need_tokens = int(-(-full_tokens // c.page_size)) * c.page_size
         chain = self._chain(c)
         if not float_token_id_capacity(_snapshot(c), chain, need_tokens):
             return False
@@ -934,12 +849,6 @@ class _FloatChainPolicy(_WindowPolicy):
         c.full_attn_allocator.flush_for_allocation()
         relieve_for_alloc(c.mamba_allocator, target_size)
 
-    def _state_slot_cost(self, c: ChainAllocator) -> int:
-        """Full-token-equivalents one mamba/conv slot removes from the shared buffer:
-        a tri-pool token costs e_f + e_s bytes, and the quotient is rounded UP."""
-        e_tok = c.full_attn_allocator.entry_bytes + c.swa_attn_allocator.entry_bytes
-        return -(-c.mamba_allocator.entry_bytes_per_page // e_tok)
-
     def admission_rules(self, c: ChainAllocator) -> ChainAdmissionRules:
         # State competes for the shared gap too; keep the split token admission
         # plus the state-slot gate until one reservation prices all three.
@@ -951,8 +860,8 @@ class _FloatChainPolicy(_WindowPolicy):
         self, c: ChainAllocator, *, full_capacity, swa_capacity
     ):
         return (
-            (full_capacity, c.conserve_full_available_size()),
-            (swa_capacity, c.conserve_swa_available_size()),
+            (self._size_full, c.conserve_full_available_size()),
+            (self._size_swa, c.conserve_swa_available_size()),
         )
 
     def usage(self, c: ChainAllocator) -> Dict[str, Tuple[int, int]]:
@@ -991,6 +900,8 @@ class _FloatChainPolicy(_WindowPolicy):
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
         full_reclaim = tree_cache.full_evictable_size()
+        if c._full_cap_reclaim(num_tokens) > full_reclaim:
+            return False
         swa_reclaim = tree_cache.swa_evictable_size()
         state_reclaim = tree_cache.mamba_evictable_size()
         fa, sa, ma = (
@@ -1026,8 +937,9 @@ class _FloatChainPolicy(_WindowPolicy):
         if full_reclaim or swa_reclaim:
             result = tree_cache.evict_for_alloc(
                 EvictParams(num_tokens=num_tokens, swa_num_tokens=num_tokens),
-                allocation_reclaim_satisfied=lambda: float_reclaim_satisfied(
-                    _snapshot(c), chain, num_tokens
+                allocation_reclaim_satisfied=lambda: (
+                    not c._full_cap_reclaim(num_tokens)
+                    and float_reclaim_satisfied(_snapshot(c), chain, num_tokens)
                 ),
             )
             state_freed = result.mamba_num_evicted
@@ -1047,8 +959,9 @@ class _FloatChainPolicy(_WindowPolicy):
         if state_quota and tree_cache.mamba_evictable_size():
             result = tree_cache.evict_for_alloc(
                 EvictParams(mamba_num=state_quota),
-                allocation_reclaim_satisfied=lambda: float_reclaim_satisfied(
-                    _snapshot(c), chain, num_tokens
+                allocation_reclaim_satisfied=lambda: (
+                    not c._full_cap_reclaim(num_tokens)
+                    and float_reclaim_satisfied(_snapshot(c), chain, num_tokens)
                 ),
             )
             if (
@@ -1063,6 +976,363 @@ class _FloatChainPolicy(_WindowPolicy):
         )
 
 
+class _MultiWindowPolicy(_WindowPolicy):
+    """Conservative admission for independently retained window bands.
+
+    Admission can credit evictable pages while reservation checks only current
+    geometry. Relief and eviction finish before any physical take is published.
+    Inherited per-side budgets are distinct from equal-demand joint availability.
+    """
+
+    keeps_leak_census = False
+    unit_name = "independent windows"
+
+    def _demands(
+        self, c, full_tokens, swa_tokens, auxiliary_swa_tokens=None, state_slots=0
+    ):
+        auxiliary_swa_tokens = (
+            full_tokens if auxiliary_swa_tokens is None else auxiliary_swa_tokens
+        )
+        page = c.page_size
+        # Request/load-back state is allocated before the token bands.
+        state_demand = ((c.roles.state, int(state_slots)),) if c.roles.state else ()
+        return state_demand + tuple(
+            (
+                b.sub_pool_name,
+                int(
+                    -(
+                        -(
+                            full_tokens
+                            if b is c.full_attn_allocator
+                            else swa_tokens
+                            if b is c.swa_attn_allocator
+                            else auxiliary_swa_tokens
+                        )
+                        // page
+                    )
+                ),
+            )
+            for b in (c.full_attn_allocator, *c._windows)
+        )
+
+    def can_reserve(
+        self,
+        c,
+        full_tokens,
+        swa_tokens,
+        *,
+        auxiliary_swa_tokens=None,
+        full_evictable_tokens=0,
+        swa_evictable_tokens=0,
+        auxiliary_swa_evictable_tokens=0,
+        state_slots=0,
+        state_evictable_slots=0,
+        empty_pool=False,
+        require_token_slack=False,
+    ):
+        from sglang.srt.mem_cache.kv.alloc.pricing import (
+            no_relief_plan,
+            reclaimed_snapshot,
+        )
+
+        if full_tokens < 0 or swa_tokens < 0 or state_slots < 0:
+            return False
+        if require_token_slack and (
+            full_tokens >= self._size_full or swa_tokens >= self._size_swa
+        ):
+            return False
+        snapshot = _snapshot(c)
+        credits = {
+            c.roles.owner: int(full_evictable_tokens) // c.page_size,
+            **{
+                b.sub_pool_name: int(
+                    swa_evictable_tokens
+                    if b is c.swa_attn_allocator
+                    else auxiliary_swa_evictable_tokens
+                )
+                // c.page_size
+                for b in c._windows
+            },
+        }
+        if c.roles.state is not None:
+            credits[c.roles.state] = int(state_evictable_slots)
+        if empty_pool or any(credits.values()):
+            snapshot = reclaimed_snapshot(snapshot, credits, empty_pool=empty_pool)
+        if (
+            int(-(-full_tokens // c.page_size))
+            > snapshot.band(c.roles.owner).free_virtual_pages
+        ):
+            return False
+        if state_slots and (
+            c.roles.state is None
+            or state_slots > snapshot.band(c.roles.state).free_virtual_pages
+        ):
+            return False
+        return (
+            no_relief_plan(
+                snapshot,
+                self._demands(
+                    c, full_tokens, swa_tokens, auxiliary_swa_tokens, state_slots
+                ),
+            )
+            is not None
+        )
+
+    def _compute_available_size(self, c):
+        pages = min(
+            len(c.full_attn_allocator.free_virtual_ids),
+            *(
+                b.available_size() // c.page_size
+                for b in (c.full_attn_allocator, *c._windows)
+            ),
+        )
+        # The no-relief plan is monotone in each band's demand and is also
+        # consumed by allocation, so this is the largest feasible equal demand.
+        low, high = 0, pages
+        while low < high:
+            mid = (low + high + 1) // 2
+            if self.can_reserve(c, mid * c.page_size, mid * c.page_size):
+                low = mid
+            else:
+                high = mid - 1
+        return low * c.page_size
+
+    def ensure_capacity(
+        self, c, full_tokens, swa_tokens, *, auxiliary_swa_tokens=None, state_slots=0
+    ):
+        if self.can_reserve(
+            c,
+            full_tokens,
+            swa_tokens,
+            auxiliary_swa_tokens=auxiliary_swa_tokens,
+            state_slots=state_slots,
+        ):
+            return True
+        for band in self.flush_targets(c):
+            band.flush_for_allocation()
+        if self.can_reserve(
+            c,
+            full_tokens,
+            swa_tokens,
+            auxiliary_swa_tokens=auxiliary_swa_tokens,
+            state_slots=state_slots,
+        ):
+            return True
+        demand = {
+            next(b for b in c.bands if b.sub_pool_name == name): n
+            for name, n in self._demands(
+                c, full_tokens, swa_tokens, auxiliary_swa_tokens, state_slots
+            )
+        }
+        for band in c.bands:
+            if isinstance(band, FloatBand):
+                _float_open_short_side(band, demand)
+                if self.can_reserve(
+                    c,
+                    full_tokens,
+                    swa_tokens,
+                    auxiliary_swa_tokens=auxiliary_swa_tokens,
+                    state_slots=state_slots,
+                ):
+                    return True
+        return False
+
+    def flush_targets(self, c):
+        return tuple(sorted(c.bands, key=lambda b: b.grow_direction != "float"))
+
+    def ask_float_for_room(self, c, need_tokens):
+        self.ensure_capacity(c, need_tokens, need_tokens)
+
+    def admission_rules(self, c):
+        return ChainAdmissionRules(window="joint")
+
+    def swa_capacity_and_available(self, c, *, full_capacity, swa_capacity):
+        return (
+            (self._size_full, c.conserve_full_available_size()),
+            (self._size_swa, c.conserve_swa_available_size()),
+        )
+
+    def usage(self, c):
+        return {
+            b.sub_pool_name: (
+                b.allocated_count() + b.available_size(),
+                b.available_size(),
+            )
+            for b in c.bands
+        }
+
+    def mamba_full_cache_donor(self, c):
+        return c if c.mamba_allocator is not None else None
+
+    def prepare_mamba_allocation(self, c, target_size):
+        c.flush_deferred_full_frees()
+        if target_size > c.mamba_allocator.available_size():
+            relieve_for_alloc(c.mamba_allocator, target_size)
+
+    def prealloc_fits(
+        self,
+        c,
+        tree_cache,
+        full_tokens,
+        swa_tokens,
+        *,
+        full_budget_tokens,
+        swa_budget_tokens=None,
+    ):
+        if full_tokens > full_budget_tokens or (
+            swa_budget_tokens is not None and swa_tokens > swa_budget_tokens
+        ):
+            return False
+        full_evictable = tree_cache.full_evictable_size()
+        swa_evictable = tree_cache.swa_evictable_size()
+        # Budgets already subtract pending requests and decode headroom. Price
+        # those reservations together with this request in the shared envelope.
+        full_tokens += max(
+            0, c.full_available_size() + full_evictable - full_budget_tokens
+        )
+        if swa_budget_tokens is not None:
+            swa_tokens += max(
+                0, c.conserve_swa_available_size() + swa_evictable - swa_budget_tokens
+            )
+        return c.can_reserve(
+            full_tokens,
+            swa_tokens,
+            full_evictable_tokens=full_evictable,
+            swa_evictable_tokens=swa_evictable,
+            auxiliary_swa_evictable_tokens=tree_cache.auxiliary_swa_evictable_size(),
+            state_evictable_slots=(
+                tree_cache.mamba_evictable_size() if c.roles.state is not None else 0
+            ),
+        )
+
+    def prealloc_fits_assumes_reclaim(self, c):
+        return True
+
+    def reclaim_plan(self, c, full_tokens, swa_tokens, **kwargs):
+        # A two-token quota cannot describe independent state/window donors.
+        # Report readiness only; eviction uses the named demands below.
+        return (
+            (0, 0) if self.can_reserve(c, full_tokens, swa_tokens, **kwargs) else None
+        )
+
+    def reclaim_for_prealloc(
+        self,
+        c,
+        tree_cache,
+        full_tokens,
+        swa_tokens,
+        *,
+        auxiliary_swa_tokens=None,
+        state_slots=0,
+    ):
+        if self.evict_to_free_tokens(
+            c,
+            tree_cache,
+            full_tokens,
+            swa_num_tokens=swa_tokens,
+            auxiliary_swa_tokens=auxiliary_swa_tokens,
+            state_slots=state_slots,
+        ):
+            return None
+        return "insufficient capacity for independently retained windows"
+
+    def evict_to_free_tokens(
+        self,
+        c,
+        tree_cache,
+        num_tokens,
+        *,
+        swa_num_tokens=None,
+        auxiliary_swa_tokens=None,
+        state_slots=0,
+    ):
+        from sglang.srt.mem_cache.base_prefix_cache import EvictParams
+
+        required_swa = num_tokens if swa_num_tokens is None else swa_num_tokens
+        if c.ensure_capacity(
+            num_tokens,
+            required_swa,
+            auxiliary_swa_tokens=auxiliary_swa_tokens,
+            state_slots=state_slots,
+        ):
+            return True
+        demands = dict(
+            self._demands(
+                c, num_tokens, required_swa, auxiliary_swa_tokens, state_slots
+            )
+        )
+        byte_demand = sum(
+            demands[b.sub_pool_name] * b.entry_bytes_per_page for b in c.bands
+        )
+        # Retention orders the physical bands; it does not define their roles.
+        quotas = {
+            b.sub_pool_name: -(-byte_demand // b.entry_bytes_per_page) * c.page_size
+            for b in (c.full_attn_allocator, *c._windows)
+        }
+        auxiliary_quota = sum(
+            quotas[b.sub_pool_name] for b in c._windows if b is not c.swa_attn_allocator
+        )
+        state_reclaimed = 0
+        while True:
+            # One band can donate bytes for every consumer. Between bounded
+            # walks, apply relief so a conservative predicate cannot drain the cache.
+            result = tree_cache.evict_for_alloc(
+                EvictParams(
+                    num_tokens=min(
+                        quotas[c.roles.owner], tree_cache.full_evictable_size()
+                    ),
+                    swa_num_tokens=min(
+                        quotas[c.swa_attn_allocator.sub_pool_name],
+                        tree_cache.swa_evictable_size(),
+                    ),
+                    auxiliary_swa_num_tokens=min(
+                        auxiliary_quota, tree_cache.auxiliary_swa_evictable_size()
+                    ),
+                ),
+                allocation_reclaim_satisfied=lambda: c.can_reserve(
+                    num_tokens,
+                    required_swa,
+                    auxiliary_swa_tokens=auxiliary_swa_tokens,
+                    state_slots=state_slots,
+                ),
+            )
+            state_reclaimed += result.mamba_num_evicted
+            if c.ensure_capacity(
+                num_tokens,
+                required_swa,
+                auxiliary_swa_tokens=auxiliary_swa_tokens,
+                state_slots=state_slots,
+            ):
+                return True
+            if not (
+                result.num_tokens_evicted
+                or result.swa_num_tokens_evicted
+                or result.auxiliary_swa_num_tokens_evicted
+            ):
+                break
+        state = c.mamba_allocator
+        if state is None or not tree_cache.mamba_evictable_size():
+            return False
+        # Token eviction can also free attached state; charge it against this phase.
+        state_quota = max(0, -(-byte_demand // state.entry_bytes) - state_reclaimed)
+        if state_quota:
+            tree_cache.evict_for_alloc(
+                EvictParams(mamba_num=state_quota),
+                allocation_reclaim_satisfied=lambda: c.can_reserve(
+                    num_tokens,
+                    required_swa,
+                    auxiliary_swa_tokens=auxiliary_swa_tokens,
+                    state_slots=state_slots,
+                ),
+            )
+        return c.ensure_capacity(
+            num_tokens,
+            required_swa,
+            auxiliary_swa_tokens=auxiliary_swa_tokens,
+            state_slots=state_slots,
+        )
+
+
 def interim_policy_for(
     c: ChainAllocator,
     *,
@@ -1071,6 +1341,12 @@ def interim_policy_for(
 ) -> _InterimPolicy:
     """The policy of the chain's shape: its floats, and whether it has a slot
     end beside the owner."""
+    if len(c._windows) > 1:
+        return _MultiWindowPolicy(
+            c,
+            full_max_total_num_tokens=full_max_total_num_tokens,
+            swa_max_total_num_tokens=swa_max_total_num_tokens,
+        )
     has_float = any(band.grow_direction == "float" for band in c.bands)
     has_window = c.swa_attn_allocator is not None
     has_slots = c.mamba_allocator is not None
@@ -1086,8 +1362,8 @@ def interim_policy_for(
             full_max_total_num_tokens=full_max_total_num_tokens,
             swa_max_total_num_tokens=swa_max_total_num_tokens,
         )
-    if not has_window and has_slots and not has_float:
-        return _TokenAndSlotEndsPolicy(c)
+    if not has_window and not has_float:
+        return _OwnerEndPolicy(c)
     raise ValueError(
         "unified memory has no capacity policy for a chain of "
         f"{[band.sub_pool_name for band in c.bands]}"

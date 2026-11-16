@@ -56,6 +56,9 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         """The state slot allocator, or None without recurrent state."""
         return None if self.state is None else self.state.slots
 
+    # Whether freed pages can wait for in-flight KV writes before PD reuse.
+    supports_reuse_guard = False
+
     @abc.abstractmethod
     def __init__(
         self,

@@ -140,7 +140,7 @@ We tested it based on the `RANDOM` dataset.
 #### Benchmark Prefill Node (TTFT)
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \
@@ -158,7 +158,7 @@ python3 -m sglang.bench_serving \
 #### Benchmark Decode Node (TPOT)
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
     --backend sglang \
     --host 127.0.0.1 \
     --port 6688 \

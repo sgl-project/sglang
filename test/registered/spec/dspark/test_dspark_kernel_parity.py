@@ -25,9 +25,10 @@ from sglang.srt.speculative.dspark_components.dspark_planner import (
     DSparkScheduleConfig,
 )
 from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
+from sglang.srt.utils import get_device
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels import dspark as dspark_kernels
-from sglang.test.test_utils import CustomTestCase, get_device
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=14, stage="base-b", runner_config="1-gpu-small")
 

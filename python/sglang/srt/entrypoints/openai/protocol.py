@@ -230,7 +230,7 @@ class UsageInfo(BaseModel):
 
 
 class StreamOptions(BaseModel):
-    include_usage: Optional[bool] = False
+    include_usage: Optional[bool] = None
     continuous_usage_stats: Optional[bool] = False
 
 
@@ -421,8 +421,9 @@ class CompletionRequest(PDRoutingFields):
     )
 
     images_config: Optional[Dict] = None
-    # Per-request processor overrides; only MiniCPM-V 4.7 reads them (downsample_mode,
+    # Per-request processor overrides; MiniCPM-V 4.7 reads them (downsample_mode,
     # max_slice_nums), flattening images_/videos_kwargs into one request-wide profile.
+    # Unlimited-OCR v2 reads them as defaults under images_config.
     mm_processor_kwargs: Optional[Dict] = None
 
     # Deprecated: use routed_dp_rank instead
@@ -894,16 +895,25 @@ ReasoningEffortType = Optional[
 ]
 
 
-def _has_message_level_tools(messages: Any) -> bool:
+def _message_tools_indices(messages: Any) -> List[int]:
     if not isinstance(messages, list):
-        return False
-    return any(
-        isinstance(message, dict)
-        and isinstance(message.get("role"), str)
-        and message["role"].lower() in ("root", "system", "developer")
-        and bool(message.get("tools"))
-        for message in messages
-    )
+        return []
+    return [
+        index
+        for index, message in enumerate(messages)
+        if isinstance(message, dict) and message.get("tools")
+    ]
+
+
+class DocSplitOptions(BaseModel):
+    """Options for splitting oversized document requests into page batches."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_batch_pages: Optional[int] = Field(default=None, ge=1)
+    overlap_pages: Optional[int] = Field(default=None, ge=0)
+    lookahead_pages: Optional[int] = Field(default=None, ge=0)
+    max_page_tokens: Optional[int] = Field(default=None, ge=1)
 
 
 class ChatCompletionRequest(PDRoutingFields):
@@ -953,6 +963,12 @@ class ChatCompletionRequest(PDRoutingFields):
     tool_choice: Union[ToolChoice, Literal["auto", "required", "none"]] = Field(
         default="auto", examples=["none"]
     )  # noqa
+    # Whether the client sent tool_choice, as opposed to the default filled in
+    # by set_tool_choice_default.
+    _tool_choice_explicit: bool = PrivateAttr(default=False)
+    # Indices of the messages the client sent a non-empty `tools` on, including
+    # user messages, whose model drops the field.
+    _message_tools_indices: List[int] = PrivateAttr(default_factory=list)
     parallel_tool_calls: bool = True
     return_hidden_states: Union[bool, Literal["last"]] = False
     return_routed_experts: bool = False
@@ -1026,9 +1042,11 @@ class ChatCompletionRequest(PDRoutingFields):
 
     images_config: Optional[Dict] = None
     video_config: Optional[Dict] = None
-    # Per-request processor overrides; only MiniCPM-V 4.7 reads them (downsample_mode,
+    # Per-request processor overrides; MiniCPM-V 4.7 reads them (downsample_mode,
     # max_slice_nums), flattening images_/videos_kwargs into one request-wide profile.
+    # Unlimited-OCR v2 reads them as defaults under images_config.
     mm_processor_kwargs: Optional[Dict] = None
+    doc_split_options: Optional[DocSplitOptions] = None
 
     # Custom logit processor for advanced sampling control
     custom_logit_processor: Optional[Union[List[Optional[str]], str]] = None
@@ -1072,17 +1090,28 @@ class ChatCompletionRequest(PDRoutingFields):
     def _handle_deprecated_dp_rank(cls, values):
         return _migrate_deprecated_dp_rank(values)
 
-    @model_validator(mode="before")
+    @model_validator(mode="wrap")
     @classmethod
-    def set_tool_choice_default(cls, values):
-        if values.get("tool_choice") is None:
-            if values.get("tools") is None and not _has_message_level_tools(
-                values.get("messages")
-            ):
+    def set_tool_choice_default(cls, values, handler):
+        if not isinstance(values, dict):
+            return handler(values)
+        explicit = values.get("tool_choice") is not None
+        messages = values.get("messages")
+        message_tools_indices = _message_tools_indices(messages)
+        if not explicit:
+            has_message_level_tools = any(
+                isinstance(messages[index].get("role"), str)
+                and messages[index]["role"].lower() in ("root", "system", "developer")
+                for index in message_tools_indices
+            )
+            if values.get("tools") is None and not has_message_level_tools:
                 values["tool_choice"] = "none"
             else:
                 values["tool_choice"] = "auto"
-        return values
+        request = handler(values)
+        request._tool_choice_explicit = explicit
+        request._message_tools_indices = message_tools_indices
+        return request
 
     @field_validator("reasoning_effort", mode="before")
     @classmethod
@@ -1235,21 +1264,41 @@ class ChatCompletionRequest(PDRoutingFields):
             "watermark": self.watermark,
         }
 
-        if self.response_format and self.response_format.type == "json_schema":
+        forces_tool_call = (
+            tool_call_constraint is not None
+            and tool_call_constraint[0] != "full_assistant_ebnf"
+            and (
+                self.tool_choice == "required"
+                or isinstance(self.tool_choice, ToolChoice)
+            )
+        )
+        response_format = self.response_format
+        # A forced tool call leaves no content for a JSON response_format to
+        # shape. When the renderer states response_format in the prompt, the
+        # tool-call constraint replaces its grammar instead of conflicting.
+        if (
+            forces_tool_call
+            and renderer_handles_response_format
+            and response_format
+            and response_format.type in ("json_object", "json_schema")
+        ):
+            response_format = None
+
+        if response_format and response_format.type == "json_schema":
             # strict=false may only go unconstrained when the renderer forwards
             # response_format to the model; plain chat templates never see it.
             if (
-                self.response_format.json_schema.strict is not False
+                response_format.json_schema.strict is not False
                 or not renderer_handles_response_format
             ):
                 sampling_params["json_schema"] = convert_json_schema_to_str(
-                    self.response_format.json_schema.schema_
+                    response_format.json_schema.schema_
                 )
-        elif self.response_format and self.response_format.type == "json_object":
+        elif response_format and response_format.type == "json_object":
             sampling_params["json_schema"] = '{"type": "object"}'
-        elif self.response_format and self.response_format.type == "structural_tag":
+        elif response_format and response_format.type == "structural_tag":
             sampling_params["structural_tag"] = convert_json_schema_to_str(
-                self.response_format.model_dump(by_alias=True)
+                response_format.model_dump(by_alias=True)
             )
 
         # Check if there are already existing output constraints
@@ -1261,10 +1310,7 @@ class ChatCompletionRequest(PDRoutingFields):
         )
 
         if tool_call_constraint and has_existing_constraints:
-            if tool_call_constraint[0] != "full_assistant_ebnf" and (
-                self.tool_choice == "required"
-                or isinstance(self.tool_choice, ToolChoice)
-            ):
+            if forces_tool_call:
                 raise ValueError(
                     "tool_choice 'required' or a named tool cannot be combined with "
                     "response_format, regex, or ebnf: the tool-call constraint and the "

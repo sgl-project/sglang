@@ -19,9 +19,11 @@ from sglang.multimodal_gen.runtime.loader.component_loaders.component_loader imp
     PipelineComponentLoader,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
-    ComponentResidencyStrategy,
     ComponentUse,
     ResidencyState,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_strategies import (
+    ComponentResidencyStrategy,
 )
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,

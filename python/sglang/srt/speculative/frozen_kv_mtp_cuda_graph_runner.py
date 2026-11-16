@@ -12,12 +12,9 @@ from sglang.srt.layers.dp_attention import (
     set_dp_buffer_len,
     set_is_extend_in_batch,
 )
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.input_buffers import ForwardInputBuffers
 from sglang.srt.model_executor.runner import (
     DecodeCudaGraphRunner,
@@ -109,7 +106,6 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self.attn_backend = self.draft_attn_backend
 
         self.compile_bs = []
-        self.enable_pdmux = False
         self.record_nolora_graph = False
         self.attention_graph_variants = None
         self.is_dllm = False
@@ -199,7 +195,7 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
                 f"{CUDA_GRAPH_CAPTURE_FAILED_MSG}"
             )
 
-    def _make_graph_key(self, bs, stream_idx=None, variant_label=None):
+    def _make_graph_key(self, bs, variant_label=None):
         return ShapeKey(size=bs)
 
     def _replay_graph(self, shape_key, forward_batch):
@@ -247,11 +243,10 @@ class FrozenKVMTPCudaGraphRunner(DecodeCudaGraphRunner):
         self,
         size: int,
         forward: Callable,
-        stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
         attention_variant: Optional[str] = None,
     ):
-        del forward, stream_idx, variant_label, attention_variant
+        del forward, variant_label, attention_variant
         buffers = self.buffers
         request_bs = size
         expanded_bs = request_bs * self.captured_req_width

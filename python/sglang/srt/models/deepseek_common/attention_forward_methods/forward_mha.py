@@ -94,23 +94,21 @@ def use_fused_prefix_extend(backend, forward_batch: ForwardBatch) -> bool:
 
 
 def forward_dsa_indexer_for_mha(
-    indexer,
+    run_indexer,
     *,
     hidden_states: torch.Tensor,
     q_lora: torch.Tensor,
     positions: torch.Tensor,
     forward_batch: ForwardBatch,
-    layer_id: int,
 ) -> None:
     """Fill the indexer K cache and publish an MTP seed when requested."""
     spec_info = forward_batch.spec_info
     seed_buf = spec_info.dsa_seed_topk_capture if spec_info is not None else None
-    topk_indices = indexer(
-        x=hidden_states,
+    topk_indices = run_indexer(
+        hidden_states=hidden_states,
         q_lora=q_lora,
         positions=positions,
         forward_batch=forward_batch,
-        layer_id=layer_id,
         return_indices=seed_buf is not None,
     )
     if seed_buf is None:
@@ -205,12 +203,11 @@ class DeepseekMHAForwardMixin:
                 )
                 if self.should_run_indexer():
                     forward_dsa_indexer_for_mha(
-                        self.indexer,
+                        self.run_mla_indexer,
                         hidden_states=hidden_states,
                         q_lora=q_lora,
                         positions=positions,
                         forward_batch=forward_batch,
-                        layer_id=self.layer_id,
                     )
             else:
                 q = self.q_a_layernorm(q)
@@ -664,7 +661,7 @@ class DeepseekMHAForwardMixin:
             "page_table_1_flattened should have been generated for FP8 MHA path"
         )
 
-        if _use_aiter_gfx95:
+        if _use_aiter_gfx95 and not get_token_to_kv_pool().dsa_kv_cache_store_fp8:
             # ROCm (gfx950) stores the FP8 MLA KV in the raw
             # (kv_lora_rank + qk_rope_head_dim) layout, not the scaled 656-byte
             # layout that dequantize_k_cache_paged_dsa expects (it asserts dim==656).
@@ -730,10 +727,11 @@ class DeepseekMHAForwardMixin:
             concat_mla_k(k=k, k_nope=k_nope, k_rope=k_pe)
         elif (
             _is_cuda
-            and next_power_of_2(self.num_local_heads) == self.num_local_heads
             and next_power_of_2(self.qk_nope_head_dim) == self.qk_nope_head_dim
             and next_power_of_2(self.qk_rope_head_dim) == self.qk_rope_head_dim
         ):
+            # The Triton helper masks padded heads, including Kimi-K3's 12
+            # local heads at TP8; only the feature dimensions need powers of two.
             # fa3 mha support fp8 inputs
             if (
                 self.current_attention_backend == "fa3"

@@ -606,8 +606,16 @@ def _get_full_multimodal_text_prompt(
 
 
 def generate_chat_conv(
-    request: ChatCompletionRequest, template_name: str
+    request: ChatCompletionRequest,
+    template_name: str,
+    *,
+    inline_image_placeholders: bool = False,
 ) -> Conversation:
+    """Build the conversation for ``request`` under ``template_name``.
+
+    ``inline_image_placeholders`` keeps a user message whose text already
+    carries one image token per image as is, instead of adding the tokens again.
+    """
     conv = chat_templates[template_name].copy()
     conv = Conversation(
         name=conv.name,
@@ -667,6 +675,14 @@ def generate_chat_conv(
                 )
                 if add_token_as_needed:
                     image_token = ""
+                if inline_image_placeholders and num_image_url > 0:
+                    text_placeholders = sum(
+                        c.text.count(conv.image_token)
+                        for c in message.content
+                        if c.type == "text"
+                    )
+                    if text_placeholders == num_image_url:
+                        image_token = ""
 
                 audio_token = conv.audio_token
                 video_token = conv.video_token

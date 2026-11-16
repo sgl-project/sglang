@@ -8,12 +8,12 @@ behavior from the platform-agnostic linear-attn dispatch tests.
 import unittest
 from unittest.mock import patch
 
+from sglang.srt.arg_groups.choices import LINEAR_ATTN_KERNEL_BACKEND_CHOICES
 from sglang.srt.layers.attention.linear import gdn_backend
 from sglang.srt.layers.attention.linear.gdn_backend import GDNKernelDispatcher
 from sglang.srt.layers.attention.linear.kda_backend import KDAKernelDispatcher
 from sglang.srt.layers.attention.linear.kernels.gdn_triton import TritonGDNKernel
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
-from sglang.srt.server_args import LINEAR_ATTN_KERNEL_BACKEND_CHOICES
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 

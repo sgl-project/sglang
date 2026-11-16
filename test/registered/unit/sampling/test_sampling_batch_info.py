@@ -12,7 +12,10 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from sglang.srt.constrained.base_grammar_backend import GrammarMask
-from sglang.srt.sampling.custom_logit_processor import DisallowedTokensLogitsProcessor
+from sglang.srt.sampling.custom_logit_processor import (
+    UOCR_PAGE_GUARD_PROCESSOR,
+    DisallowedTokensLogitsProcessor,
+)
 from sglang.srt.sampling.sampling_batch_info import (
     ProcessorEntry,
     SamplingBatchInfo,
@@ -673,13 +676,24 @@ class TestMergeBatch(CustomTestCase):
 # copy_for_forward
 class TestCopyForForward(CustomTestCase):
     def test_returns_copy_without_orchestrator(self):
-        """Test that copy_for_forward returns a copy with orchestrator set to None."""
-        orch = MagicMock(is_required=False)
-        info = _make_info(batch_size=1, penalizer_orchestrator=orch)
-        copied = info.copy_for_forward()
-        self.assertIsNone(copied.penalizer_orchestrator)
-        # Original should still have orchestrator
-        self.assertIsNotNone(info.penalizer_orchestrator)
+        """Both copy implementations preserve every field except the forward-only
+        penalizer removal, including fields declared with init=False."""
+        for fast_path in (False, True):
+            orch = MagicMock(is_required=False)
+            info = _make_info(batch_size=1, penalizer_orchestrator=orch)
+            with (
+                self.subTest(fast_path=fast_path),
+                patch(
+                    "sglang.srt.sampling.sampling_batch_info._fast_copy_enabled",
+                    return_value=fast_path,
+                ),
+            ):
+                copied = info.copy_for_forward()
+            self.assertIsNone(copied.penalizer_orchestrator)
+            self.assertIs(info.penalizer_orchestrator, orch)
+            for name, value in info.__dict__.items():
+                if name != "penalizer_orchestrator":
+                    self.assertIs(copied.__dict__[name], value, name)
 
 
 # from_schedule_batch
@@ -857,6 +871,39 @@ class TestFromScheduleBatch(CustomTestCase):
         entry = left.custom_logit_processor[hash(processor_str)]
         self.assertEqual(entry.rows, [2])
         self.assertEqual(entry.indices.tolist(), [2])
+
+    def test_builtin_page_guard_reaches_logits_with_external_processors_disabled(self):
+        from array import array
+
+        from sglang.srt.layers.sampler import apply_custom_logit_processor
+
+        req = self._make_req()
+        req.origin_input_ids = array("q", [7, 20])
+        req.output_ids = array("q", [7, 10, 11, 12, 13])
+        req.uocr_doc = None
+        req.page_guard_state = None
+        req.custom_logit_processor = UOCR_PAGE_GUARD_PROCESSOR
+        req.sampling_params.custom_params = dict(
+            __req__=req,
+            page_token_id=7,
+            eos_token_id=1,
+            max_page_tokens=3,
+        )
+        batch = MagicMock(reqs=[req], device=DEVICE)
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertTrue(info.has_custom_logit_processor)
+        logits = torch.zeros(1, VOCAB_SIZE)
+        apply_custom_logit_processor(logits, info)
+        self.assertEqual(torch.isfinite(logits[0]).nonzero().flatten().tolist(), [1])
+        self.assertFalse(self._exec_ns.features.enable_custom_logit_processor)
+
+    def test_external_processor_still_requires_the_enable_flag(self):
+        req = self._make_req()
+        req.custom_logit_processor = DisallowedTokensLogitsProcessor.to_str()
+        batch = MagicMock(reqs=[req], device=DEVICE)
+        info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        self.assertFalse(info.has_custom_logit_processor)
+        self.assertIsNone(info.custom_logit_processor)
 
     def test_custom_logit_processor_merging(self):
         """Test deserialization and merging of custom logit processors."""

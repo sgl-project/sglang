@@ -16,7 +16,7 @@ from sglang.srt.layers.attention.dsa.utils import compute_dsa_seqlens
 from sglang.srt.utils import is_cuda, is_hip
 
 if TYPE_CHECKING:
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()

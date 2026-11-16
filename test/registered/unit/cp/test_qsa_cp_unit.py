@@ -16,7 +16,7 @@ from sglang.srt.layers.attention.qwen_sparse_attn_backend import QwenSparseAttnB
 from sglang.srt.layers.cp import base as cp_base
 from sglang.srt.layers.cp import zigzag
 from sglang.srt.layers.cp.base import ContextParallelStrategyKind
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.mem_cache_utils import routed
 

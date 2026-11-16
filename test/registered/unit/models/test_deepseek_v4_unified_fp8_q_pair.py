@@ -16,7 +16,7 @@ import torch
 import sglang.srt.models.deepseek_v4 as deepseek_v4
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsv4 import unified_kv_gate
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -79,6 +79,7 @@ class _Harness(deepseek_v4.MQALayer):
         self.alt_streams = None
         self.dsa_enable_prefill_cp = False
         self.use_fused_wo_a = False
+        self.use_fused_rope_quant = False
         self.use_npu_arch35_mxfp8_wo_a = False
         self.compressor = object()
         self.wo_a = SimpleNamespace(

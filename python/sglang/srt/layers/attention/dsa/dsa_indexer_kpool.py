@@ -11,9 +11,9 @@ from transformers import PretrainedConfig
 
 from sglang.srt.layers.attention.dsa.dsa_indexer import (
     DUAL_STREAM_TOKEN_THRESHOLD,
-    BaseIndexerMetadata,
     rotate_activation,
 )
+from sglang.srt.layers.attention.dsa.dsa_indexer_metadata import BaseIndexerMetadata
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
 from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
     DSAPagedMQALogitsBackend,
@@ -31,7 +31,14 @@ from sglang.srt.layers.attention.mqa_logits_utils import (
 )
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
-from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
+from sglang.srt.utils import (
+    add_prefix,
+    ceil_align,
+    is_cuda,
+    is_gfx1250_supported,
+    is_hip,
+    is_npu,
+)
 
 if is_cuda():
     try:
@@ -1722,7 +1729,7 @@ class IndexerKPool(MultiPlatformOp):
         layer_id: int,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        if is_hip():
+        if is_hip() and not is_gfx1250_supported():
             from sglang.kernels.ops.quantization.act_quant_tilelang import act_quant
         elif not is_npu():
             from sglang.kernels.ops.quantization.act_quant_triton import act_quant

@@ -55,7 +55,7 @@ from sglang.srt.models.glm4v import (
 )
 from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import add_prefix
-from sglang.srt.utils.hf_transformers_utils import get_processor
+from sglang.srt.utils.hf_transformers import get_processor
 
 logger = logging.getLogger(__name__)
 
@@ -205,6 +205,7 @@ class GlmOcrVisionModel(Glm4vVisionModel):
                     prefix=add_prefix(f"blocks.{layer_idx}", prefix),
                     rms_norm_eps=vision_config.rms_norm_eps,
                     attn_qkv_bias=vision_config.attention_bias,
+                    num_dummy_heads=vision_config.num_dummy_heads,
                     use_data_parallel=use_data_parallel,
                 )
                 for layer_idx in range(depth)

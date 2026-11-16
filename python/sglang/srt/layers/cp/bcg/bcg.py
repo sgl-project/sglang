@@ -21,10 +21,7 @@ from typing import TYPE_CHECKING, Any, Dict, Optional
 
 import torch
 
-from sglang.srt.arg_groups.overrides import (
-    resolved_view,
-    resolving_view,
-)
+from sglang.srt.arg_groups.model_override_base import resolved_view, resolving_view
 from sglang.srt.layers.cp.base import (
     ContextParallelStrategyKind,
     get_cp_strategy_kind,
