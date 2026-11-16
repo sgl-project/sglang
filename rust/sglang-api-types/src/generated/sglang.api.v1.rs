@@ -1049,14 +1049,6 @@ pub struct GetServerInfoResponse {
 pub struct PreparedInputCapability {
     #[prost(string, tag = "1")]
     pub profile: ::prost::alloc::string::String,
-    #[prost(uint32, tag = "2")]
-    pub image_token_id: u32,
-    #[prost(uint32, tag = "3")]
-    pub patch_size: u32,
-    #[prost(uint32, tag = "4")]
-    pub merge_size: u32,
-    #[prost(uint32, tag = "5")]
-    pub temporal_patch_size: u32,
     /// Whole-request inline tensor bytes; transport limits may be smaller.
     #[prost(uint64, tag = "6")]
     pub max_inline_bytes: u64,
@@ -1065,6 +1057,10 @@ pub struct PreparedInputCapability {
     /// A matching value is negotiation, not proof of caller preprocessing quality.
     #[prost(string, tag = "7")]
     pub processor_fingerprint: ::prost::alloc::string::String,
+    /// Byte sources supported by this installed profile; only "inline" today.
+    /// A future shared-memory transport uses the same tensor/profile contract.
+    #[prost(string, repeated, tag = "8")]
+    pub transports: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DeploymentInfo {

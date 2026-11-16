@@ -5331,18 +5331,6 @@ impl ::serde::Serialize for PreparedInputCapability {
         ::serde::ser::SerializeMap::serialize_entry(&mut map, "profile", &self.profile)?;
         ::serde::ser::SerializeMap::serialize_entry(
             &mut map,
-            "image_token_id",
-            &self.image_token_id,
-        )?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "patch_size", &self.patch_size)?;
-        ::serde::ser::SerializeMap::serialize_entry(&mut map, "merge_size", &self.merge_size)?;
-        ::serde::ser::SerializeMap::serialize_entry(
-            &mut map,
-            "temporal_patch_size",
-            &self.temporal_patch_size,
-        )?;
-        ::serde::ser::SerializeMap::serialize_entry(
-            &mut map,
             "max_inline_bytes",
             &self.max_inline_bytes,
         )?;
@@ -5351,6 +5339,9 @@ impl ::serde::Serialize for PreparedInputCapability {
             "processor_fingerprint",
             &self.processor_fingerprint,
         )?;
+        if !self.transports.is_empty() {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "transports", &self.transports)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -5368,12 +5359,9 @@ impl<'de> ::serde::Deserialize<'de> for PreparedInputCapability {
                 mut map: A,
             ) -> Result<Self::Value, A::Error> {
                 let mut f_profile = None;
-                let mut f_image_token_id = None;
-                let mut f_patch_size = None;
-                let mut f_merge_size = None;
-                let mut f_temporal_patch_size = None;
                 let mut f_max_inline_bytes = None;
                 let mut f_processor_fingerprint = None;
+                let mut f_transports = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "profile" => {
@@ -5381,32 +5369,6 @@ impl<'de> ::serde::Deserialize<'de> for PreparedInputCapability {
                                 return Err(::serde::de::Error::duplicate_field("profile"));
                             }
                             f_profile = Some(map.next_value::<::prost::alloc::string::String>()?);
-                        }
-                        "image_token_id" => {
-                            if f_image_token_id.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("image_token_id"));
-                            }
-                            f_image_token_id = Some(map.next_value::<u32>()?);
-                        }
-                        "patch_size" => {
-                            if f_patch_size.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("patch_size"));
-                            }
-                            f_patch_size = Some(map.next_value::<u32>()?);
-                        }
-                        "merge_size" => {
-                            if f_merge_size.is_some() {
-                                return Err(::serde::de::Error::duplicate_field("merge_size"));
-                            }
-                            f_merge_size = Some(map.next_value::<u32>()?);
-                        }
-                        "temporal_patch_size" => {
-                            if f_temporal_patch_size.is_some() {
-                                return Err(::serde::de::Error::duplicate_field(
-                                    "temporal_patch_size",
-                                ));
-                            }
-                            f_temporal_patch_size = Some(map.next_value::<u32>()?);
                         }
                         "max_inline_bytes" => {
                             if f_max_inline_bytes.is_some() {
@@ -5425,6 +5387,15 @@ impl<'de> ::serde::Deserialize<'de> for PreparedInputCapability {
                             f_processor_fingerprint =
                                 Some(map.next_value::<::prost::alloc::string::String>()?);
                         }
+                        "transports" => {
+                            if f_transports.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("transports"));
+                            }
+                            f_transports = Some(
+                                map.next_value::<Option<Vec<::prost::alloc::string::String>>>()?
+                                    .unwrap_or_default(),
+                            );
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -5432,12 +5403,9 @@ impl<'de> ::serde::Deserialize<'de> for PreparedInputCapability {
                 }
                 Ok(PreparedInputCapability {
                     profile: f_profile.unwrap_or_default(),
-                    image_token_id: f_image_token_id.unwrap_or_default(),
-                    patch_size: f_patch_size.unwrap_or_default(),
-                    merge_size: f_merge_size.unwrap_or_default(),
-                    temporal_patch_size: f_temporal_patch_size.unwrap_or_default(),
                     max_inline_bytes: f_max_inline_bytes.unwrap_or_default(),
                     processor_fingerprint: f_processor_fingerprint.unwrap_or_default(),
+                    transports: f_transports.unwrap_or_default(),
                 })
             }
         }

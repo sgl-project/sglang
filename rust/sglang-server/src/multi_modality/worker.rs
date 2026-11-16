@@ -224,14 +224,15 @@ impl MmProcessor for ImageMmProcessor {
     fn process(&self, input_ids: TokenIds, mut mm: MmData) -> Result<MmProcessOutput, MediaError> {
         self.check_media(&mm).map_err(MediaError::Client)?;
         if let Some(input) = mm.prepared.take() {
-            return self
+            let output = self
                 .prepared
                 .as_ref()
                 .ok_or_else(|| {
                     MediaError::Client("unsupported prepared multimodal profile".into())
                 })?
-                .encode(input_ids, input)
-                .map_err(MediaError::Client);
+                .encode(&self.pipeline, input_ids, input)
+                .map_err(processor_error)?;
+            return encode_prepared_output(output).map_err(MediaError::Server);
         }
         if !mm.video_data.is_empty() || !mm.audio_data.is_empty() {
             return Err(MediaError::Client(
@@ -254,11 +255,35 @@ impl MmProcessor for ImageMmProcessor {
     }
 }
 
+fn processor_error(error: sglang_processor::ProcessorError) -> MediaError {
+    match error {
+        sglang_processor::ProcessorError::Internal(message) => MediaError::Server(message),
+        error => MediaError::Client(error.to_string()),
+    }
+}
+
+/// Prepared inputs have no encoded-source routing hash. Compute the same
+/// typed-content identity used for cache equality, after the common adapter.
+/// Raw processing retains its existing source-byte routing hashes.
+pub(super) fn encode_prepared_output(output: MmOutput) -> Result<MmProcessOutput, String> {
+    let mut output = encode_output(output)?;
+    for item in &mut output.result.items {
+        let identity = item.cache_identity()?;
+        item.hash = u64::from_be_bytes(
+            identity[..8]
+                .try_into()
+                .map_err(|_| "invalid item identity")?,
+        );
+        item.identity = Some(identity);
+    }
+    Ok(output)
+}
+
 /// Map the pipeline's output straight onto the common encoded result: each
 /// feature tensor is moved with its own shape and dtype, the per-item span
 /// and hash ride along, and every auxiliary tensor is translated once into
 /// the sidecar's metadata form. Nothing is reconstructed from lengths.
-fn encode_output(output: MmOutput) -> Result<MmProcessOutput, String> {
+pub(super) fn encode_output(output: MmOutput) -> Result<MmProcessOutput, String> {
     let MmOutput {
         input_ids,
         items,

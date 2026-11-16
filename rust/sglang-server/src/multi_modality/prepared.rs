@@ -1,19 +1,18 @@
 //! Public, model-profiled CPU inputs. No fetching or preprocessing occurs here;
 //! the result joins the same encoded-item path as the native image processor.
 
-use std::collections::BTreeMap;
-
 use sha2::{Digest, Sha256};
 
 use sglang_api_types::api::v1 as api;
-use sglang_mm::pipeline::{Tensor, TensorData};
-use sglang_processor::dynamo_multimodal::models::qwen_vl::{
-    MropeItem, QwenVlSpec, mrope_image_only,
+use sglang_processor::dynamo_multimodal::models::qwen_vl::QwenVlSpec;
+use sglang_processor::dynamo_multimodal::processor::{
+    Geometry, Modality, ProcessedItem, Tensor as NativeTensor, TensorData as NativeTensorData,
 };
 use sglang_processor::dynamo_multimodal::registry::ProcessorSpec;
+use sglang_processor::prepared::{
+    PreparedInput, PreparedItem, PreparedLimits, PreparedTensor, TensorDtype, TokenSpan,
+};
 
-use super::encoded::{MRope, MmEncodedEntry, MmEncodedItem, MmMetaValue, MmModality};
-use super::worker::MmProcessOutput;
 use crate::message::types::TokenIds;
 
 pub(crate) const QWEN_VL_IMAGE_V1: &str = "qwen_vl_image_v1";
@@ -62,14 +61,14 @@ impl PreparedProfile {
     }
 
     pub(crate) fn capability(&self) -> Option<api::PreparedInputCapability> {
+        if self.spec.image_token_id < 0 {
+            return None;
+        }
         Some(api::PreparedInputCapability {
             profile: QWEN_VL_IMAGE_V1.into(),
-            image_token_id: self.spec.image_token_id.try_into().ok()?,
-            patch_size: self.spec.patch_size.try_into().ok()?,
-            merge_size: self.spec.merge_size.try_into().ok()?,
-            temporal_patch_size: self.spec.temporal_patch_size.try_into().ok()?,
             max_inline_bytes: MAX_INLINE_BYTES,
             processor_fingerprint: self.fingerprint.clone(),
+            transports: vec!["inline".into()],
         })
     }
 
@@ -141,97 +140,135 @@ impl PreparedProfile {
 
     pub(crate) fn encode(
         &self,
+        pipeline: &sglang_processor::MmProcessor,
         input_ids: TokenIds,
         input: api::PreparedMultimodalInput,
-    ) -> Result<MmProcessOutput, String> {
+    ) -> Result<sglang_processor::MmOutput, sglang_processor::ProcessorError> {
         self.check(&input)?;
-        // Every image-pad token belongs to exactly one declared item. Also
-        // reject extra pads outside spans rather than silently losing alignment.
-        let image_token_id = i64::from(self.spec.image_token_id);
+        let ids = input_ids
+            .into_iter()
+            .map(|id| {
+                i32::try_from(id).map_err(|_| format!("prepared token id {id} is outside int32"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // Borrow the public envelope into the common structural contract. No
+        // protobuf type or model registry is added to sglang-processor.
+        let tensors = input
+            .items
+            .iter()
+            .map(|item| {
+                item.tensors
+                    .iter()
+                    .map(|named| {
+                        let tensor = named.tensor.as_ref().ok_or("missing prepared tensor")?;
+                        let dtype = match tensor.dtype.as_str() {
+                            "float32" => TensorDtype::Float32,
+                            "int64" => TensorDtype::Int64,
+                            _ => return Err("unsupported prepared tensor dtype"),
+                        };
+                        Ok(PreparedTensor {
+                            name: &named.name,
+                            dtype,
+                            shape: &tensor.shape,
+                            data: &tensor.data,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, &str>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let spans = input
+            .items
+            .iter()
+            .map(|item| {
+                item.spans
+                    .iter()
+                    .map(|span| TokenSpan {
+                        start: span.start,
+                        end: span.end,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let items = input
+            .items
+            .iter()
+            .zip(&tensors)
+            .zip(&spans)
+            .map(|((item, tensors), spans)| {
+                let modality = match item.modality.as_str() {
+                    "image" => Modality::Image,
+                    "video" => Modality::Video,
+                    "audio" => Modality::Audio,
+                    _ => return Err("unsupported prepared modality"),
+                };
+                Ok(PreparedItem {
+                    modality,
+                    tensors,
+                    spans,
+                })
+            })
+            .collect::<Result<Vec<_>, &str>>()?;
+        let checked = PreparedInput {
+            profile: &input.profile,
+            processor_fingerprint: &input.processor_fingerprint,
+            input_ids: &ids,
+            items: &items,
+        }
+        .check(
+            QWEN_VL_IMAGE_V1,
+            &self.fingerprint,
+            &PreparedLimits {
+                max_tensor_bytes: MAX_INLINE_BYTES as usize,
+                // Each admitted image occupies at least one expanded token.
+                max_items: ids.len(),
+                max_tensors_per_item: 1,
+                max_rank: 2,
+                max_spans_per_item: 1,
+                max_input_tokens: ids.len(),
+            },
+        )?;
+
+        // The active profile still validates required names, grid geometry,
+        // finite pixels, and complete pad coverage. Structural acceptance is
+        // not semantic admission. Reuse canonical community carriers and the
+        // installed processor's positions instead of assembling scheduler data.
+        let image_token_id = self.spec.image_token_id;
         let mut cursor = 0usize;
-        let mut geometry = Vec::with_capacity(input.items.len());
-        for image in &input.items {
+        let mut canonical = Vec::with_capacity(input.items.len());
+        for (index, image) in input.items.iter().enumerate() {
             let (start, end) = qwen_span(image)?;
             let (start, end) = (start as usize, end as usize);
-            if end > input_ids.len()
-                || input_ids[cursor..start].contains(&image_token_id)
-                || input_ids[start..end].iter().any(|&id| id != image_token_id)
+            if ids[cursor..start].contains(&image_token_id)
+                || ids[start..end].iter().any(|&id| id != image_token_id)
             {
                 return Err("prepared image spans do not match expanded input_ids".into());
             }
-            geometry.push(MropeItem {
-                start: start as u32,
-                end: (end - 1) as u32,
-                grid: qwen_item(image)?.1,
+            let grid = qwen_item(image)?.1;
+            let mut decoded = checked.decode_tensors(index)?.into_iter();
+            let (_, feature) = decoded.next().ok_or("missing prepared pixel_values")?;
+            match &feature.data {
+                NativeTensorData::F32(values) if values.iter().all(|value| value.is_finite()) => {}
+                _ => return Err("prepared pixel_values must be finite float32".into()),
+            }
+            canonical.push(ProcessedItem {
+                modality: Modality::Image,
+                feature_token_count: end - start,
+                feature,
+                aux: vec![(
+                    "image_grid_thw".into(),
+                    NativeTensor {
+                        shape: vec![3],
+                        data: NativeTensorData::I64(grid.into_iter().map(i64::from).collect()),
+                    },
+                )],
+                geometry: Some(Geometry::Grid(grid)),
             });
             cursor = end;
         }
-        if input_ids[cursor..].contains(&image_token_id) {
+        if ids[cursor..].contains(&image_token_id) {
             return Err("image-pad tokens outside prepared image spans".into());
         }
-        // Reuse the native model-family implementation, never caller-supplied
-        // unchecked M-RoPE positions or a duplicate position algorithm.
-        let (positions, delta) = mrope_image_only(input_ids.len(), &geometry, self.spec.merge_size)
-            .map_err(|e| e.to_string())?;
-        let items = input
-            .items
-            .into_iter()
-            .map(|image| {
-                let grid = qwen_item(&image)?.1;
-                let (start, end) = qwen_span(&image)?;
-                let tensor = image
-                    .tensors
-                    .into_iter()
-                    .next()
-                    .and_then(|t| t.tensor)
-                    .ok_or("missing prepared pixel_values")?;
-                let values = tensor
-                    .data
-                    .chunks_exact(4)
-                    .map(|chunk| {
-                        let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                        if value.is_finite() {
-                            Ok(value)
-                        } else {
-                            Err("prepared pixel_values must be finite")
-                        }
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
-                let mut item = MmEncodedItem {
-                    modality: MmModality::Image,
-                    feature: Tensor {
-                        shape: tensor.shape.into_iter().map(|d| d as usize).collect(),
-                        data: TensorData::F32(values),
-                    },
-                    // No caller-provided cache identity. Use the same typed-content
-                    // identity as the raw processor, including grid metadata.
-                    hash: 0,
-                    identity: None,
-                    offsets: vec![(start, end - 1)],
-                    model_specific_data: BTreeMap::from([(
-                        "image_grid_thw".into(),
-                        MmMetaValue::Ints(grid.into_iter().map(i64::from).collect()),
-                    )]),
-                };
-                let identity = item.cache_identity()?;
-                item.hash = u64::from_be_bytes(
-                    identity[..8]
-                        .try_into()
-                        .map_err(|_| "invalid item identity")?,
-                );
-                item.identity = Some(identity);
-                Ok(item)
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        Ok(MmProcessOutput {
-            input_ids,
-            result: MmEncodedEntry {
-                items,
-                token_ids: None,
-                mrope: Some(MRope { positions, delta }),
-            },
-            extension: None,
-        })
+        pipeline.finish_prepared(&checked, canonical)
     }
 }
 
@@ -277,7 +314,10 @@ fn qwen_item(item: &api::PreparedMediaItem) -> Result<(&api::InlineTensor, [u32;
 
 #[cfg(test)]
 mod tests {
+    use super::super::encoded::MmMetaValue;
+    use super::super::worker::{MmProcessOutput, encode_prepared_output};
     use super::*;
+    use sglang_mm::pipeline::TensorData;
     use sglang_processor::dynamo_multimodal::models::qwen_vl::Resampler;
 
     fn profile() -> PreparedProfile {
@@ -292,6 +332,20 @@ mod tests {
             image_std: [0.5; 3],
             resample: Resampler::AtenU8,
         })
+    }
+
+    fn encode(
+        input_ids: TokenIds,
+        input: api::PreparedMultimodalInput,
+    ) -> Result<MmProcessOutput, String> {
+        let profile = profile();
+        let pipeline =
+            sglang_processor::MmProcessor::from_spec(ProcessorSpec::QwenVl(profile.spec.clone()))
+                .map_err(|error| error.to_string())?;
+        let output = profile
+            .encode(&pipeline, input_ids, input)
+            .map_err(|error| error.to_string())?;
+        encode_prepared_output(output)
     }
 
     fn input() -> api::PreparedMultimodalInput {
@@ -319,7 +373,7 @@ mod tests {
 
     #[test]
     fn prepared_items_preserve_ids_features_and_native_positions() {
-        let output = profile().encode(vec![10, 99, 20], input()).unwrap();
+        let output = encode(vec![10, 99, 20], input()).unwrap();
         assert_eq!(output.input_ids, vec![10, 99, 20]);
         assert_eq!(output.result.items[0].offsets, vec![(1, 1)]);
         assert_eq!(output.result.items[0].feature.shape, vec![4, 3]);
@@ -380,22 +434,28 @@ mod tests {
 
     #[test]
     fn rejects_nonfinite_pixels_and_unclaimed_or_misaligned_pads() {
-        for ids in [vec![99, 99, 20], vec![10, 20, 99], vec![10]] {
-            assert!(profile().encode(ids, input()).is_err());
+        for ids in [
+            vec![99, 99, 20],
+            vec![10, 20, 99],
+            vec![10],
+            vec![-1, 99, 20],
+            vec![i64::MAX, 99, 20],
+        ] {
+            assert!(encode(ids, input()).is_err());
         }
         let mut request = input();
         request.items[0].tensors[0].tensor.as_mut().unwrap().data[..4]
             .copy_from_slice(&f32::NAN.to_le_bytes());
-        assert!(profile().encode(vec![10, 99, 20], request).is_err());
+        assert!(encode(vec![10, 99, 20], request).is_err());
     }
 
     #[test]
     fn different_prepared_content_has_different_cache_identity() {
-        let first = profile().encode(vec![10, 99, 20], input()).unwrap();
+        let first = encode(vec![10, 99, 20], input()).unwrap();
         let mut request = input();
         request.items[0].tensors[0].tensor.as_mut().unwrap().data[..4]
             .copy_from_slice(&100.0f32.to_le_bytes());
-        let second = profile().encode(vec![10, 99, 20], request).unwrap();
+        let second = encode(vec![10, 99, 20], request).unwrap();
         assert_ne!(
             first.result.items[0].identity,
             second.result.items[0].identity
@@ -414,9 +474,7 @@ mod tests {
             data: (0..48).flat_map(|n| (n as f32).to_le_bytes()).collect(),
         });
         request.items.push(second);
-        let output = profile()
-            .encode(vec![10, 99, 20, 99, 99, 99, 99, 30], request)
-            .unwrap();
+        let output = encode(vec![10, 99, 20, 99, 99, 99, 99, 30], request).unwrap();
         let items = &output.result.items;
         assert_eq!(items[0].offsets, vec![(1, 1)]);
         assert_eq!(items[1].offsets, vec![(3, 6)]);
@@ -430,5 +488,104 @@ mod tests {
             items[1].model_specific_data["image_grid_thw"],
             MmMetaValue::Ints(vec![1, 4, 4])
         );
+    }
+
+    #[test]
+    fn raw_and_wire_prepared_unequal_images_share_exact_scheduler_inputs() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../sglang-processor/tests/fixtures/mm_parity/qwen2.5-vl-3b-instruct.json"
+        ))
+        .unwrap();
+        let spec: ProcessorSpec =
+            serde_json::from_value(fixture["cases"][0]["spec"].clone()).unwrap();
+        let profile = PreparedProfile::from_spec(&spec).unwrap();
+        let pipeline = sglang_processor::MmProcessor::from_spec(spec).unwrap();
+        let first = include_bytes!(
+            "../../../sglang-processor/tests/fixtures/mm_parity/images/tiny_10x10.png"
+        );
+        let second = include_bytes!(
+            "../../../sglang-processor/tests/fixtures/mm_parity/images/rgba_80x60.png"
+        );
+        let pad = profile.spec.image_token_id;
+        let raw = pipeline
+            .process(&[7, pad, 8, pad, 9], &[first.as_slice(), second.as_slice()])
+            .unwrap();
+        assert_ne!(raw.items[0].feature.shape, raw.items[1].feature.shape);
+        let wire_items = raw
+            .items
+            .iter()
+            .zip(&raw.offsets)
+            .map(|(item, &(start, end))| {
+                let NativeTensorData::F32(values) = &item.feature.data else {
+                    panic!("expected pixel values");
+                };
+                let metadata = item
+                    .aux
+                    .iter()
+                    .map(|(name, tensor)| {
+                        let NativeTensorData::I64(values) = &tensor.data else {
+                            panic!("expected integer metadata");
+                        };
+                        api::PreparedMetadata {
+                            name: name.clone(),
+                            values: values.clone(),
+                        }
+                    })
+                    .collect();
+                api::PreparedMediaItem {
+                    modality: "image".into(),
+                    tensors: vec![api::PreparedTensor {
+                        name: "pixel_values".into(),
+                        tensor: Some(api::InlineTensor {
+                            dtype: "float32".into(),
+                            shape: item.feature.shape.iter().map(|&d| d as u64).collect(),
+                            data: values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                        }),
+                    }],
+                    metadata,
+                    spans: vec![api::PreparedTokenSpan {
+                        start,
+                        end: end + 1,
+                    }],
+                }
+            })
+            .collect();
+        let ids = raw.input_ids.iter().copied().map(i64::from).collect();
+        let imported = profile
+            .encode(
+                &pipeline,
+                ids,
+                api::PreparedMultimodalInput {
+                    profile: QWEN_VL_IMAGE_V1.into(),
+                    processor_fingerprint: profile.fingerprint.clone(),
+                    items: wire_items,
+                },
+            )
+            .unwrap();
+        let actual = encode_prepared_output(imported).unwrap();
+        let expected = super::super::worker::encode_output(raw).unwrap();
+        assert_eq!(actual.input_ids, expected.input_ids);
+        assert_eq!(actual.result.items.len(), expected.result.items.len());
+        for (a, b) in actual.result.items.iter().zip(&expected.result.items) {
+            assert_eq!(a.offsets, b.offsets);
+            assert_eq!(a.model_specific_data, b.model_specific_data);
+            assert_eq!(a.feature.shape, b.feature.shape);
+            let (TensorData::F32(a_values), TensorData::F32(b_values)) =
+                (&a.feature.data, &b.feature.data)
+            else {
+                panic!("expected f32 pixels");
+            };
+            assert!(
+                a_values
+                    .iter()
+                    .map(|v| v.to_bits())
+                    .eq(b_values.iter().map(|v| v.to_bits()))
+            );
+            assert_eq!(a.cache_identity().unwrap(), b.cache_identity().unwrap());
+        }
+        let a = actual.result.mrope.unwrap();
+        let b = expected.result.mrope.unwrap();
+        assert_eq!(a.positions, b.positions);
+        assert_eq!(a.delta, b.delta);
     }
 }

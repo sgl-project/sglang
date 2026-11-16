@@ -7,6 +7,29 @@
 use sglang_api_types::api::v1::*;
 
 #[test]
+fn prepared_capability_keeps_transport_discovery_independent_of_model_geometry() {
+    use prost::Message;
+    let capability = PreparedInputCapability {
+        profile: "processor-profile-v1".into(),
+        max_inline_bytes: 64 << 20,
+        processor_fingerprint: "config-fingerprint".into(),
+        transports: vec!["inline".into()],
+    };
+    let json = serde_json::to_value(&capability).unwrap();
+    assert_eq!(json["transports"], serde_json::json!(["inline"]));
+    assert!(json.get("image_token_id").is_none());
+    assert!(json.get("patch_size").is_none());
+    assert_eq!(
+        serde_json::from_value::<PreparedInputCapability>(json).unwrap(),
+        capability
+    );
+    assert_eq!(
+        PreparedInputCapability::decode(capability.encode_to_vec().as_slice()).unwrap(),
+        capability
+    );
+}
+
+#[test]
 fn inline_tensor_preserves_binary_protobuf_and_base64_json() {
     use prost::Message;
     let json = r#"{"dtype":"float32","shape":[1],"data":"AACAPw=="}"#;

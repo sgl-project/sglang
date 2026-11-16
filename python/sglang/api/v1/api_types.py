@@ -917,12 +917,9 @@ class PreparedInputCapability(msgspec.Struct, kw_only=True, frozen=True):
     """sglang.api.v1.PreparedInputCapability: JSON object (unknown keys ignored)."""
 
     profile: str = ""
-    image_token_id: int = 0
-    patch_size: int = 0
-    merge_size: int = 0
-    temporal_patch_size: int = 0
     max_inline_bytes: int = 0
     processor_fingerprint: str = ""
+    transports: List[str] = []
 
     @classmethod
     def from_json_value(cls, value: Any) -> "PreparedInputCapability":
@@ -2816,30 +2813,22 @@ def decode_PreparedInputCapability(value: Any) -> PreparedInputCapability:
     for key, x in m.items():
         if key == "profile":
             kw["profile"] = _expect_str(x, expected="a string")
-        elif key == "image_token_id":
-            kw["image_token_id"] = _expect_uint(x, expected="u32")
-        elif key == "patch_size":
-            kw["patch_size"] = _expect_uint(x, expected="u32")
-        elif key == "merge_size":
-            kw["merge_size"] = _expect_uint(x, expected="u32")
-        elif key == "temporal_patch_size":
-            kw["temporal_patch_size"] = _expect_uint(x, expected="u32")
         elif key == "max_inline_bytes":
             kw["max_inline_bytes"] = _expect_uint(x, expected="u64")
         elif key == "processor_fingerprint":
             kw["processor_fingerprint"] = _expect_str(x, expected="a string")
+        elif key == "transports":
+            kw["transports"] = [] if x is None else [_expect_str(e, expected="a string") for e in _expect_seq(x, expected="a sequence")]
     return PreparedInputCapability(**kw)
 
 
 def encode_PreparedInputCapability(v: PreparedInputCapability) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
     d["profile"] = v.profile
-    d["image_token_id"] = v.image_token_id
-    d["patch_size"] = v.patch_size
-    d["merge_size"] = v.merge_size
-    d["temporal_patch_size"] = v.temporal_patch_size
     d["max_inline_bytes"] = v.max_inline_bytes
     d["processor_fingerprint"] = v.processor_fingerprint
+    if v.transports:
+        d["transports"] = list(v.transports)
     return d
 
 
