@@ -2454,6 +2454,31 @@ class KVCacheConfigurator:
                 "quantized record, which SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD "
                 "cannot read. Disable it or use --kv-cache-dtype bf16."
             )
+        if (
+            main_kv_packed
+            and self.kv_cache_dtype == torch.int8
+            and dcp_size > 1
+            and not self.is_draft_worker
+        ):
+            # DCP sparse attention reads the packed record through
+            # kv_quant_sparse_flash_attention, which is wired for fp8_e4m3 on
+            # arch35 only; the INT8 record has no DCP read path yet.
+            raise ValueError(
+                "--kv-cache-dtype int8 is not supported with --dcp-size > 1. "
+                "Disable DCP or use --kv-cache-dtype bf16."
+            )
+        if (
+            main_kv_packed
+            and self.kv_cache_dtype == torch.int8
+            and dsa_cp_layer_shard_rank is not None
+        ):
+            # The layer-split pool allocates its indexer cache in the main KV
+            # store dtype; the INT8 record keeps a BF16 indexer.
+            raise ValueError(
+                "--kv-cache-dtype int8 is not supported with "
+                "--enable-dsa-cache-layer-split. Disable the layer split or use "
+                "--kv-cache-dtype bf16."
+            )
         pool_cls = NPUMLATokenToKVPool
         pool_kwargs = {}
         if dsa_cp_layer_shard_rank is not None:
@@ -3962,7 +3987,9 @@ def calculate_mla_kv_cache_dim(
     quant_block_size = DSATokenToKVPool.quant_block_size
     # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout
     # (excluding TRTLLM and HIP raw-layout kernels).
-    if kv_cache_dtype == torch.float8_e4m3fn:
+    # An int8 KV cache is only accepted for DSA on non-arch35 Ascend NPUs,
+    # where it is always the packed record.
+    if kv_cache_dtype in (torch.float8_e4m3fn, torch.int8):
         assert kv_lora_rank % quant_block_size == 0, (
             f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
         )

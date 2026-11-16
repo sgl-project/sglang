@@ -17,6 +17,7 @@ import msgspec.structs
 
 import sglang.srt.server_args as server_args_module
 from sglang.srt.arg_groups import (
+    kv_cache_hook,
     parallel_hook,
     pd_disaggregation_hook,
     serving_hook,
@@ -49,6 +50,7 @@ from sglang.srt.arg_groups.hisparse_hook import (
 )
 from sglang.srt.arg_groups.kv_cache_hook import (
     handle_cache_compatibility,
+    handle_int8_kv_cache_compatibility,
     handle_kv4_compatibility,
     handle_nvfp4_prefill_kv_dequant_dtype,
     handle_platform_kv_cache_dtype_compatibility,
@@ -3441,6 +3443,96 @@ class TestWaterfillArgs(CustomTestCase):
         self.assertEqual(resolution_result(server_args, "deepep_mode"), "low_latency")
         self.assertFalse(resolution_result(server_args, "disable_cuda_graph"))
         self.assertTrue(resolution_result(server_args, "enforce_shared_experts_fusion"))
+
+
+class TestInt8KvCacheCompatibility(CustomTestCase):
+    """--kv-cache-dtype int8 is the packed DSA MLA record on Ascend; anything
+    else would take it as a plain one-byte cache."""
+
+    _MLA_PREPROCESS = "sglang.srt.hardware_backend.npu.attention.mla_preprocess"
+
+    def setUp(self):
+        super().setUp()
+        # Both env readers are cached per process; patch them, not the env.
+        for name in ("is_fia_nz", "is_mla_preprocess_enabled"):
+            p = patch(f"{self._MLA_PREPROCESS}.{name}", return_value=False)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _check(self, arch="GlmMoeDsaForCausalLM", **kwargs):
+        server_args = ServerArgs(model_path="dummy", kv_cache_dtype="int8", **kwargs)
+        hf_config = SimpleNamespace(architectures=[arch], index_topk=2048)
+        with patch.object(
+            kv_cache_hook,
+            "model_config_of",
+            return_value=SimpleNamespace(hf_config=hf_config),
+        ):
+            handle_int8_kv_cache_compatibility(server_args)
+
+    def test_the_launcher_pipeline_runs_the_check(self):
+        model_dir = tempfile.mkdtemp(prefix="int8_kv_cache_")
+        self.addCleanup(shutil.rmtree, model_dir, ignore_errors=True)
+        with open(os.path.join(model_dir, "config.json"), "w") as handle:
+            json.dump(
+                {
+                    "architectures": ["LlamaForCausalLM"],
+                    "model_type": "llama",
+                    "hidden_size": 64,
+                    "intermediate_size": 128,
+                    "num_attention_heads": 4,
+                    "num_key_value_heads": 4,
+                    "num_hidden_layers": 2,
+                    "vocab_size": 128,
+                    "max_position_embeddings": 2048,
+                },
+                handle,
+            )
+        server_args = ServerArgs(
+            model_path=model_dir, device="cuda", random_seed=42, kv_cache_dtype="int8"
+        )
+        with self.assertRaisesRegex(ValueError, "Ascend NPUs only"):
+            server_args.resolve_once()
+
+    def test_hisparse_rejects_int8(self):
+        server_args = ServerArgs(
+            model_path="dummy", enable_hisparse=True, kv_cache_dtype="int8"
+        )
+        with self.assertRaisesRegex(ValueError, "int8"):
+            validate_hisparse_kv_cache_dtype(server_args)
+
+    def test_only_dsa_models_on_npu_are_accepted(self):
+        with override_platform(is_cuda=True, is_npu=False):
+            with self.assertRaisesRegex(ValueError, "Ascend NPUs only"):
+                self._check()
+        with override_platform(is_npu=True):
+            with self.assertRaisesRegex(ValueError, "not a DSA model"):
+                self._check(arch="Qwen3ForCausalLM")
+            self._check()
+
+    def test_mlapo_is_rejected(self):
+        """Off arch35, MLAProlog writes only a BF16 cache."""
+        with (
+            override_platform(is_npu=True),
+            patch(
+                f"{self._MLA_PREPROCESS}.is_mla_preprocess_enabled",
+                return_value=True,
+            ),
+        ):
+            with self.assertRaisesRegex(ValueError, "SGLANG_NPU_USE_MLAPO"):
+                self._check()
+
+    def test_features_the_fp8_record_supports_are_accepted(self):
+        """FIA NZ, prefill CP and the host KV pools handle the packed record
+        the same way for FP8 and INT8, so int8 adds no rejection for them."""
+        with (
+            override_platform(is_npu=True),
+            patch(f"{self._MLA_PREPROCESS}.is_fia_nz", return_value=True),
+        ):
+            self._check(
+                attn_cp_size=2,
+                enable_hierarchical_cache=True,
+                disaggregation_decode_retraction_backup="host_pool",
+            )
 
 
 class TestPrefillOnlyDisableKvCache(unittest.TestCase):

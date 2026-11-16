@@ -76,6 +76,7 @@ BUILT_IN_KV_CACHE_DTYPES = (
     "mxfp8",
     "bf16",
     "bfloat16",
+    "int8",
     "nvfp4",
     "fp4_mx_block16",
 )
