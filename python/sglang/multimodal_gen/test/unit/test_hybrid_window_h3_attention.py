@@ -17,7 +17,6 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.hybrid_window_attn_
     HybridWindowAttentionH3Impl,
     HybridWindowAttentionH3MetadataBuilder,
     window_mask_frames,
-    window_mask_reference,
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_vdn import VDNH3Layout
 from sglang.multimodal_gen.runtime.platforms import current_platform
@@ -38,6 +37,30 @@ FRAME_H, FRAME_W = 6, 8
 TOKENS_PER_FRAME = FRAME_H * FRAME_W
 HEADS = 4
 HEAD_DIM = 128
+
+
+def window_mask_reference(
+    hybrid: VDNHybridAttentionArchConfig, layout: VDNH3Layout, device: torch.device
+) -> torch.Tensor:
+    """Dense boolean [used, used] mask of the softmax branch, for tests."""
+    used = layout.used
+    keep = torch.ones(used, used, dtype=torch.bool, device=device)
+    vs, ve = layout.video_start, layout.video_end
+    bounds, dense_rows, dense_cols = window_mask_frames(hybrid, layout.num_frames)
+    tpf = layout.tokens_per_frame
+    rows = torch.arange(vs, ve, device=device)
+    frame_of = (rows - vs) // tpf
+    qf = frame_of[:, None]
+    kf = frame_of[None, :]
+    lo = torch.tensor([b[0] for b in bounds], device=device)[qf]
+    hi = torch.tensor([b[1] for b in bounds], device=device)[qf]
+    inside = (kf >= lo) & (kf <= hi)
+    for f in dense_rows:
+        inside |= qf == f
+    for f in dense_cols:
+        inside |= kf == f
+    keep[vs:ve, vs:ve] = inside
+    return keep
 
 
 def _layout() -> VDNH3Layout:

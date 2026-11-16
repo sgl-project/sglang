@@ -74,30 +74,6 @@ def window_mask_frames(
     return bounds, dense_rows, dense_cols
 
 
-def window_mask_reference(
-    hybrid: VDNHybridAttentionArchConfig, layout: VDNH3Layout, device: torch.device
-) -> torch.Tensor:
-    """Dense boolean [used, used] mask of the softmax branch, for tests."""
-    used = layout.used
-    keep = torch.ones(used, used, dtype=torch.bool, device=device)
-    vs, ve = layout.video_start, layout.video_end
-    bounds, dense_rows, dense_cols = window_mask_frames(hybrid, layout.num_frames)
-    tpf = layout.tokens_per_frame
-    rows = torch.arange(vs, ve, device=device)
-    frame_of = (rows - vs) // tpf
-    qf = frame_of[:, None]
-    kf = frame_of[None, :]
-    lo = torch.tensor([b[0] for b in bounds], device=device)[qf]
-    hi = torch.tensor([b[1] for b in bounds], device=device)[qf]
-    inside = (kf >= lo) & (kf <= hi)
-    for f in dense_rows:
-        inside |= qf == f
-    for f in dense_cols:
-        inside |= kf == f
-    keep[vs:ve, vs:ve] = inside
-    return keep
-
-
 def _merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
     out: list[tuple[int, int]] = []
     for a, b in sorted(ranges):
@@ -505,5 +481,4 @@ __all__ = [
     "HybridWindowAttentionH3Metadata",
     "HybridWindowAttentionH3MetadataBuilder",
     "window_mask_frames",
-    "window_mask_reference",
 ]
