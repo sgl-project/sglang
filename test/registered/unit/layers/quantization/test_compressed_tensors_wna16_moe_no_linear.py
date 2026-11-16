@@ -76,10 +76,10 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
         self._assert_wna16_moe(config, expected_bits=4)
 
     def test_w4afp8_reads_matched_group_without_linear_target(self):
-        """W4AFP8 MoE takes bits and group size from the matched expert group.
+        """W4AFP8 MoE loads a config whose groups target the experts by regex.
 
-        A config whose groups target the experts by regex has no "Linear" entry;
-        the scheme must not look one up.
+        Such a config has no "Linear" entry; bits and group size then come from
+        the matched expert group.
         """
         config = _make_wna16_moe_config(["re:.*mlp.experts.*"], num_bits=4)
         config["config_groups"]["group_0"]["input_activations"] = {
