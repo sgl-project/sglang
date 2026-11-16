@@ -10,10 +10,14 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.hicache_key_scheme import (
+    DraftKVNamespace,
     derive_namespace,
+    draft_namespace_digest,
     namespace_digest,
     normalize_dtype,
     plan_unified_kv,
+    validate_unified_chunk_tiling,
+    with_packed_draft,
 )
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -296,6 +300,205 @@ class TestUnifiedKeyGrid(CustomTestCase):
         plan = _plan(local_kv_heads=4, attn_tp_rank=0, attn_tp_size=2, head_group=2)
         with self.assertRaisesRegex(ValueError, "head groups"):
             plan.chunk_spans(_mha(layer_num=80, head_group_num=1))
+
+
+def _packed(plan, target_layer_num, **overrides):
+    kwargs = dict(
+        target_layer_num=target_layer_num,
+        draft_layer_num=1,
+        algorithm="EAGLE",
+        draft_id="bundled",
+        dtype="bfloat16",
+        row_width=8,
+        attn_tp_rank=0,
+        attn_cp_size=1,
+        is_final_stage=True,
+    )
+    kwargs.update(overrides)
+    return with_packed_draft(plan, **kwargs)
+
+
+class TestPackedDraftPlan(CustomTestCase):
+    """Packed draft rows: chunks of their own, appended after the target's."""
+
+    def _cases(self):
+        # (name, target plan arguments, layout arguments, attention-TP rank)
+        mla = dict(rank_replicated=True, local_kv_heads=0, end_layer=6)
+        mla_layout = dict(head_num=1, head_group_num=1, head_dim=16, is_mla=True)
+        for tp_size, tp_rank, head_group in ((1, 0, 4), (2, 1, 1), (1, 0, 1)):
+            local_heads = 4 // tp_size
+            yield (
+                f"mha_tp{tp_size}_groups{local_heads // head_group}",
+                dict(
+                    local_kv_heads=local_heads,
+                    attn_tp_rank=tp_rank,
+                    attn_tp_size=tp_size,
+                    head_group=head_group,
+                    layer_partition=4,
+                    end_layer=6,
+                ),
+                dict(head_num=local_heads, head_group_num=local_heads // head_group),
+                tp_rank,
+            )
+        yield (
+            "mla",
+            dict(mla, attn_tp_rank=0, attn_tp_size=1, layer_partition=4),
+            mla_layout,
+            0,
+        )
+        yield (
+            "mla_pp_final_stage",
+            dict(mla, attn_tp_rank=1, attn_tp_size=2, start_layer=4, layer_partition=4),
+            mla_layout,
+            1,
+        )
+
+    def test_target_chunks_keep_their_names_and_draft_chunks_follow(self):
+        for name, plan_kwargs, layout_kwargs, tp_rank in self._cases():
+            for draft_layers in (1, 3):
+                with self.subTest(name, draft_layers=draft_layers):
+                    target = _plan(**plan_kwargs)
+                    target_layers = plan_kwargs["end_layer"] - plan_kwargs.get(
+                        "start_layer", 0
+                    )
+                    plan = _packed(
+                        target,
+                        target_layers,
+                        draft_layer_num=draft_layers,
+                        attn_tp_rank=tp_rank,
+                    )
+                    groups = target.head_group_num
+
+                    # The target's part is the target plan, untouched.
+                    self.assertEqual(plan.namespace, target.namespace)
+                    self.assertEqual(
+                        plan.suffixes[: len(target.suffixes)], target.suffixes
+                    )
+                    self.assertEqual(plan.layer_ranges[:-1], target.layer_ranges)
+                    self.assertEqual(plan.head_ranges, target.head_ranges)
+
+                    # One draft chunk per head group, under the draft digest
+                    # and the group's GLOBAL index.
+                    digest = draft_namespace_digest(plan.draft_namespace)
+                    self.assertTrue(digest.startswith("ukd1-"))
+                    if target.namespace.rank_replicated:
+                        expected = [f"{digest}_D0-{draft_layers}"]
+                    else:
+                        expected = [
+                            f"{digest}_D0-{draft_layers}_H{tp_rank * groups + i}"
+                            for i in range(groups)
+                        ]
+                    self.assertEqual(plan.suffixes[len(target.suffixes) :], expected)
+                    self.assertEqual(
+                        plan.layer_ranges[-1],
+                        (target_layers, target_layers + draft_layers),
+                    )
+
+                    # Every byte of the page block is named exactly once, and
+                    # each draft chunk is the draft rows of its head group.
+                    layout = _mha(
+                        layer_num=target_layers + draft_layers, **layout_kwargs
+                    )
+                    spans = plan.chunk_spans(layout)
+                    validate_unified_chunk_tiling(spans, layout.bytes_per_page)
+                    page = torch.empty(layout.page_dims(2), dtype=torch.bfloat16)[1]
+                    for group, (offset, length) in enumerate(spans[-groups:]):
+                        rows = slice(target_layers, target_layers + draft_layers)
+                        view = page[rows] if layout.is_mla else page[group, rows]
+                        self.assertTrue(view.is_contiguous())
+                        self.assertEqual(view.data_ptr() - page.data_ptr(), offset)
+                        self.assertEqual(view.nbytes, length)
+
+    def test_unsafe_packed_plans_are_refused(self):
+        target = _plan(local_kv_heads=8, attn_tp_rank=0, attn_tp_size=1)
+        cases = {
+            "non_final_stage": (dict(is_final_stage=False), ValueError),
+            "prefill_cp": (dict(attn_cp_size=2), NotImplementedError),
+            "no_draft_id": (dict(draft_id=""), ValueError),
+            "no_algorithm": (dict(algorithm=""), ValueError),
+            "no_draft_layer": (dict(draft_layer_num=0), ValueError),
+            "gap_before_the_draft_rows": (dict(target_layer_num=81), ValueError),
+        }
+        for name, (overrides, error) in cases.items():
+            with self.subTest(name), self.assertRaises(error):
+                _packed(target, **{"target_layer_num": 80, **overrides})
+        with self.assertRaisesRegex(ValueError, "already names"):
+            _packed(_packed(target, 80), 81)
+
+
+class TestDraftNamespaceIdentity(CustomTestCase):
+    BASE = dict(
+        target="ukv1-0123456789abcdef",
+        algorithm="EAGLE",
+        draft_id="bundled",
+        placement="packed",
+        dtype="bfloat16",
+        rank_replicated=False,
+        total_kv_heads=8,
+        head_group=2,
+        row_width=128,
+        layer_num=1,
+        object_layout="page_unified/v1",
+    )
+
+    def test_every_field_partitions_the_draft_keyspace(self):
+        base = draft_namespace_digest(DraftKVNamespace(**self.BASE))
+        changes = dict(
+            target="ukv1-fedcba9876543210",
+            algorithm="DFLASH",
+            draft_id="org/draft@main",
+            placement="sidecar",
+            # fp8 variants store as uint8 and must not share a keyspace.
+            dtype="float8_e4m3fn",
+            rank_replicated=True,
+            total_kv_heads=16,
+            head_group=4,
+            row_width=64,
+            layer_num=3,
+            object_layout="page_unified/v2",
+        )
+        self.assertEqual(set(changes), set(self.BASE))
+        digests = {base}
+        for field, value in changes.items():
+            with self.subTest(field):
+                digest = draft_namespace_digest(
+                    DraftKVNamespace(**{**self.BASE, field: value})
+                )
+                self.assertNotIn(digest, digests)
+                digests.add(digest)
+
+    def test_draft_digest_cannot_be_taken_for_a_target_digest(self):
+        digest = draft_namespace_digest(DraftKVNamespace(**self.BASE))
+        self.assertRegex(digest, r"^ukd1-[0-9a-f]{16}$")
+
+    def test_plan_binds_the_draft_to_its_target_and_its_own_dtype(self):
+        def plan(model_id="org/model", target_dtype="float8_e4m3fn", **overrides):
+            target = _plan(
+                model_id=model_id,
+                dtype=target_dtype,
+                local_kv_heads=8,
+                attn_tp_rank=0,
+                attn_tp_size=1,
+            )
+            return target, _packed(target, 80, **overrides)
+
+        target, base = plan(dtype="float8_e4m3fn")
+        # The same draft under another target is another draft keyspace.
+        _, other_target = plan(model_id="org/other", dtype="float8_e4m3fn")
+        # A draft KV dtype of its own: same target chunks, other draft chunk.
+        _, other_dtype = plan(dtype="float8_e5m2")
+        _, other_draft = plan(dtype="float8_e4m3fn", draft_id="org/draft@main")
+        draft_keys = {
+            p.suffixes[-1] for p in (base, other_target, other_dtype, other_draft)
+        }
+        self.assertEqual(len(draft_keys), 4)
+        for same_target in (other_dtype, other_draft):
+            self.assertEqual(same_target.suffixes[:-1], target.suffixes)
+        self.assertEqual(
+            base.draft_namespace.target, namespace_digest(target.namespace)
+        )
+        self.assertEqual(base.draft_namespace.dtype, "float8_e4m3fn")
+        self.assertEqual(other_dtype.draft_namespace.dtype, "float8_e5m2")
 
 
 class TestNamespaceIdentity(CustomTestCase):

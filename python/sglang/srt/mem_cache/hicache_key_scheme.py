@@ -34,6 +34,15 @@ topology.
 The digest prefixes every key, so any identity mismatch misses rather than
 collides. dtype is the LOGICAL one: fp8_e4m3 and fp8_e5m2 never share a
 keyspace even though both store as uint8.
+
+Draft KV of speculative decoding is not part of the model-global grid. Where
+it is cached at all, it gets chunks of its own under a second digest::
+
+    {page_hash}_{draft_digest}_D0-{draft_layers}[_H{head_group}]
+
+The target chunks keep their names and bytes, so a deployment without the
+draft still reads them, and the draft digest names the draft: another draft,
+dtype or geometry misses on the draft chunk alone.
 """
 
 from __future__ import annotations
@@ -95,6 +104,47 @@ def namespace_digest(namespace: KVCacheNamespace) -> str:
     """
     encoded = msgspec.msgpack.encode(namespace)
     return f"ukv{_SCHEMA_VERSION}-{hashlib.sha256(encoded).hexdigest()[:16]}"
+
+
+# Versions the draft encoding independently of the target's.
+_DRAFT_SCHEMA_VERSION = 1
+
+
+class DraftKVNamespace(
+    msgspec.Struct, frozen=True, kw_only=True, forbid_unknown_fields=True
+):
+    """Immutable identity of one keyspace of cached draft KV.
+
+    Everything that must match for two deployments' draft bytes to be
+    interchangeable. The target namespace is embedded by digest: draft KV is
+    computed from the target's hidden states, and the digest also carries the
+    page size and the grid. Field names and order are part of the encoding.
+    """
+
+    schema_version: int = _DRAFT_SCHEMA_VERSION
+    # Digest of the target namespace the draft KV belongs to.
+    target: str
+    # Resolved speculative algorithm, e.g. "EAGLE" for NEXTN-style MTP.
+    algorithm: str
+    # Operator-declared identity of the draft weights.
+    draft_id: str
+    # "packed": rows appended to the target's page block.
+    placement: str
+    # Logical dtype of the draft KV, which need not be the target's.
+    dtype: str
+    rank_replicated: bool
+    total_kv_heads: int
+    head_group: int
+    # Row geometry: a stored object of another shape must not share the key.
+    row_width: int
+    layer_num: int
+    object_layout: str
+
+
+def draft_namespace_digest(namespace: DraftKVNamespace) -> str:
+    """Digest of the draft namespace encoding; "ukd" tells it from a target's."""
+    encoded = msgspec.msgpack.encode(namespace)
+    return f"ukd{_DRAFT_SCHEMA_VERSION}-{hashlib.sha256(encoded).hexdigest()[:16]}"
 
 
 def derive_namespace(
@@ -199,6 +249,9 @@ class UnifiedKVPlan(msgspec.Struct, frozen=True, kw_only=True):
     layer_ranges: list[tuple[int, int]]
     # Head groups, or a single whole-pool range for rank-replicated pools.
     head_ranges: list[tuple[int, int]]
+    # Set by with_packed_draft(): the trailing layer range and its suffixes
+    # then name packed draft rows instead of model layers.
+    draft_namespace: DraftKVNamespace | None = None
 
     @property
     def head_group_num(self) -> int:
@@ -327,6 +380,88 @@ def validate_unified_chunk_tiling(
             f"unified chunk spans cover {end} bytes, but the page block has "
             f"{page_bytes}."
         )
+
+
+def with_packed_draft(
+    plan: UnifiedKVPlan,
+    *,
+    target_layer_num: int,
+    draft_layer_num: int,
+    algorithm: str,
+    draft_id: str,
+    dtype: str,
+    row_width: int,
+    attn_tp_rank: int,
+    attn_cp_size: int,
+    is_final_stage: bool,
+) -> UnifiedKVPlan:
+    """Name the packed draft rows of a page as chunks of their own.
+
+    A host pool with packed drafts holds ``draft_layer_num`` one-layer draft
+    pools at local layers ``[target_layer_num, target_layer_num + draft_layer_num)``
+    of its page block: the tail of every head-group block. Each head group's
+    draft rows become one chunk under the draft digest, appended after the
+    target chunks, so the target plan is returned unchanged in front.
+
+    Raises rather than degrading, like plan_unified_kv().
+    """
+    if draft_layer_num <= 0:
+        raise ValueError(f"draft_layer_num must be positive: {draft_layer_num}")
+    if not algorithm or not draft_id:
+        raise ValueError(
+            "packed draft chunks need the speculative algorithm and a draft id: "
+            "an empty one would merge different drafts into one keyspace."
+        )
+    if plan.draft_namespace is not None:
+        raise ValueError("the unified plan already names packed draft rows.")
+    if plan.layer_ranges[-1][1] != target_layer_num:
+        raise ValueError(
+            f"the target chunks end at local layer {plan.layer_ranges[-1][1]}, "
+            f"but the draft rows start at {target_layer_num}."
+        )
+    if not is_final_stage:
+        # Only the last pipeline stage hosts a draft.
+        raise ValueError("packed draft layers must sit on the final pipeline stage.")
+    if attn_cp_size > 1:
+        # Only CP rank 0 writes, and an existing object is never rewritten.
+        raise NotImplementedError(
+            "The unified key scheme does not store draft KV with prefill context "
+            "parallelism (attn_cp_size > 1)."
+        )
+
+    namespace = DraftKVNamespace(
+        target=namespace_digest(plan.namespace),
+        algorithm=algorithm,
+        draft_id=draft_id,
+        placement="packed",
+        dtype=dtype,
+        # Packed rows share the target's page block, hence its head grid.
+        rank_replicated=plan.namespace.rank_replicated,
+        total_kv_heads=plan.namespace.total_kv_heads,
+        head_group=plan.namespace.head_group,
+        row_width=row_width,
+        layer_num=draft_layer_num,
+        object_layout=plan.namespace.object_layout,
+    )
+    coord = f"{draft_namespace_digest(namespace)}_D0-{draft_layer_num}"
+    if plan.namespace.rank_replicated:
+        suffixes = [coord]
+    else:
+        # The target's global head-group index, in the same head order.
+        first_head_index = attn_tp_rank * plan.head_group_num
+        suffixes = [
+            f"{coord}_H{first_head_index + i}" for i in range(plan.head_group_num)
+        ]
+    return UnifiedKVPlan(
+        namespace=plan.namespace,
+        suffixes=[*plan.suffixes, *suffixes],
+        layer_ranges=[
+            *plan.layer_ranges,
+            (target_layer_num, target_layer_num + draft_layer_num),
+        ],
+        head_ranges=plan.head_ranges,
+        draft_namespace=namespace,
+    )
 
 
 def _resolve_head_group(
