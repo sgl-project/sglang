@@ -437,8 +437,8 @@ pub struct GenerateRequest {
     #[prost(message, optional, tag = "40")]
     pub modalities: ::core::option::Option<OptionalStringList>,
     /// Native Rust image ingress. Requires a profile advertised by GetServerInfo,
-    /// one already-expanded input_ids prompt and no raw media. See
-    /// PREPARED_MULTIMODAL_INPUTS.md. An absent capability means unsupported.
+    /// one already-expanded input_ids prompt and no raw media.
+    /// An absent capability means unsupported.
     #[prost(message, optional, tag = "41")]
     pub prepared_multimodal: ::core::option::Option<PreparedMultimodalInput>,
 }
