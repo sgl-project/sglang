@@ -90,8 +90,6 @@ def _detect_nvfp4_source(config: Dict[str, Any]) -> Optional["Nvfp4SourceConfig"
 
     compressed-tensors NVFP4 is not supported at this time.
     """
-    from sglang.srt.layers.quantization.quark.utils import Nvfp4SourceConfig
-
     quant_method = config.get("quant_method", "")
     quant_algo = (config.get("quant_algo") or "").upper()
 
