@@ -1,9 +1,10 @@
 import asyncio
 import itertools
+import math
 import pickle
 import time
 import zlib
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 import zmq
 import zmq.asyncio
@@ -17,6 +18,7 @@ from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     AutoResidencyReq,
     ListLorasReq,
     MergeLoraWeightsReq,
+    ReleaseRealtimeSessionReq,
     SetLoraReq,
     ShutdownReq,
     UnmergeLoraWeightsReq,
@@ -40,6 +42,9 @@ from sglang.multimodal_gen.runtime.server_args import (
     MAX_SCHEDULER_RPC_TIMEOUT_S,
     ServerArgs,
 )
+from sglang.multimodal_gen.runtime.utils.device_errors import (
+    is_unrecoverable_device_error,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.request_logger import (
     DiffusionRequestLogger,
@@ -48,7 +53,7 @@ from sglang.multimodal_gen.runtime.utils.request_logger import (
 logger = init_logger(__name__)
 
 # Control ops mutate replica state (weights, LoRA, memory, shutdown), so with
-# DP they must reach every replica rather than one.
+# DP they reach every replica unless a fatal device error aborts the fan-out.
 _CONTROL_REQ_TYPES = (
     AutoResidencyReq,
     SetLoraReq,
@@ -120,6 +125,8 @@ def _session_key(batch: Any) -> str | None:
     session must land on the same one."""
     reqs = batch if isinstance(batch, list) else [batch]
     for req in reqs:
+        if isinstance(req, ReleaseRealtimeSessionReq):
+            return req.session_id
         if isinstance(req, Req) and req.realtime_session_id:
             return req.realtime_session_id
     return None
@@ -139,13 +146,24 @@ def _is_warmup_batch(batch: Any) -> bool:
     return bool(reqs) and all(isinstance(req, Req) and req.is_warmup for req in reqs)
 
 
+def _is_fatal_reply(result: Any) -> bool:
+    return (
+        isinstance(result, OutputBatch)
+        and result.error is not None
+        and is_unrecoverable_device_error(result.error)
+    )
+
+
 def _merge_fanout_results(results: list[Any]) -> Any:
-    """One reply for a control op sent to every replica: the first error wins,
-    because "succeeded" must mean succeeded everywhere."""
+    """Prefer fatal device errors, then the first error, over successful replies."""
+    first_error = None
     for result in results:
-        if isinstance(result, OutputBatch) and result.error:
+        if _is_fatal_reply(result):
             return result
-    return results[0]
+        if isinstance(result, OutputBatch) and result.error:
+            if first_error is None:
+                first_error = result
+    return first_error if first_error is not None else results[0]
 
 
 def _auto_residency_status(result: Any) -> str | None:
@@ -225,11 +243,35 @@ class SchedulerClient:
         self.request_logger = DiffusionRequestLogger.from_server_args(server_args)
         self.context = zmq.Context()
 
-    def forward(self, batch: Any, timeout_ms: int | None = None) -> Any:
-        """Sends a batch or request to the scheduler and waits for the response."""
-        return self._forward_routed(batch, timeout_ms)
+    def forward(
+        self,
+        batch: Any,
+        timeout_ms: int | None = None,
+        *,
+        replica: int | None = None,
+        check_worker_health: Callable[[], None] | None = None,
+    ) -> Any:
+        """Sends a batch or request to the scheduler and waits for the response.
 
-    def _forward_one(self, endpoint: str, batch: Any, timeout_ms: int | None) -> Any:
+        `replica` pins an ordinary request to one replica, bypassing the
+        round-robin so the counter only advances for real traffic. Control
+        requests always reach every replica. An optional health check interrupts
+        the wait if an owned worker exits.
+        """
+        if check_worker_health is None:
+            return self._forward_routed(batch, timeout_ms, replica)
+        return self._forward_routed(
+            batch, timeout_ms, replica, check_worker_health=check_worker_health
+        )
+
+    def _forward_one(
+        self,
+        endpoint: str,
+        batch: Any,
+        timeout_ms: int | None,
+        *,
+        check_worker_health: Callable[[], None] | None = None,
+    ) -> Any:
         socket = self.context.socket(zmq.REQ)
         try:
             socket.setsockopt(zmq.LINGER, 0)
@@ -240,6 +282,26 @@ class SchedulerClient:
                     socket.setsockopt(zmq.IDENTITY, identity)
                 socket.connect(endpoint)
                 socket.send_pyobj(_prepare_local_payload(endpoint, batch))
+                if check_worker_health is not None:
+                    # Poll so an owned worker's exit can interrupt an otherwise
+                    # unbounded receive. Keep one deadline across all polls.
+                    deadline = (
+                        time.monotonic() + effective_timeout / 1000
+                        if effective_timeout is not None
+                        else None
+                    )
+                    while True:
+                        check_worker_health()
+                        poll_timeout_ms = 1000
+                        if deadline is not None:
+                            remaining_ms = math.ceil(
+                                (deadline - time.monotonic()) * 1000
+                            )
+                            if remaining_ms <= 0:
+                                raise zmq.Again()
+                            poll_timeout_ms = min(poll_timeout_ms, remaining_ms)
+                        if socket.poll(poll_timeout_ms, zmq.POLLIN):
+                            break
                 output_batch = socket.recv_pyobj()
                 _materialize_output_batch_file_refs(output_batch)
                 _materialize_local_cuda_refs(endpoint, output_batch)
@@ -250,19 +312,41 @@ class SchedulerClient:
         finally:
             socket.close()
 
-    def _forward_routed(self, batch: Any, timeout_ms: int | None) -> Any:
+    def _forward_routed(
+        self,
+        batch: Any,
+        timeout_ms: int | None,
+        replica: int | None = None,
+        *,
+        check_worker_health: Callable[[], None] | None = None,
+    ) -> Any:
         self.request_logger.log_received_request(batch)
         endpoints = self.server_args.scheduler_endpoints
-        if isinstance(batch, _CONTROL_REQ_TYPES) or _is_warmup_batch(batch):
-            results = [self._forward_one(ep, batch, timeout_ms) for ep in endpoints]
+        forward_kwargs = (
+            {"check_worker_health": check_worker_health}
+            if check_worker_health is not None
+            else {}
+        )
+        if isinstance(batch, _CONTROL_REQ_TYPES) or (
+            replica is None and _is_warmup_batch(batch)
+        ):
+            results = []
+            for ep in endpoints:
+                reply = self._forward_one(ep, batch, timeout_ms, **forward_kwargs)
+                results.append(reply)
+                if _is_fatal_reply(reply):
+                    break
             output_batch = (
                 _merge_auto_residency_results(results)
                 if isinstance(batch, AutoResidencyReq)
                 else _merge_fanout_results(results)
             )
         else:
-            replica = _select_replica(batch, len(endpoints), self._replica_counter)
-            output_batch = self._forward_one(endpoints[replica], batch, timeout_ms)
+            if replica is None:
+                replica = _select_replica(batch, len(endpoints), self._replica_counter)
+            output_batch = self._forward_one(
+                endpoints[replica], batch, timeout_ms, **forward_kwargs
+            )
         self.request_logger.log_finished_request(batch, output_batch)
         return output_batch
 
@@ -332,8 +416,15 @@ class AsyncSchedulerClient:
             for task in self._pending_requests:
                 task.cancel()
 
-    async def forward(self, batch: Any, timeout_ms: int | None = None) -> Any:
-        """Sends a batch or request to the scheduler and waits for the response."""
+    async def forward(
+        self, batch: Any, timeout_ms: int | None = None, *, replica: int | None = None
+    ) -> Any:
+        """Sends a batch or request to the scheduler and waits for the response.
+
+        `replica` pins an ordinary request to one replica, bypassing the
+        round-robin so the counter only advances for real traffic. Control
+        requests always reach every replica.
+        """
         self.request_logger.log_received_request(batch)
         if self.context is None:
             raise RuntimeError(
@@ -341,22 +432,23 @@ class AsyncSchedulerClient:
             )
 
         endpoints = self.server_args.scheduler_endpoints
-        if isinstance(batch, _CONTROL_REQ_TYPES) or _is_warmup_batch(batch):
-            # Every replica must receive the state change or calibration
-            # request; the measured values and selected placements may differ.
-            results = await asyncio.gather(
-                *(
-                    self._forward_one(endpoint, batch, timeout_ms)
-                    for endpoint in endpoints
-                )
-            )
+        if isinstance(batch, _CONTROL_REQ_TYPES) or (
+            replica is None and _is_warmup_batch(batch)
+        ):
+            results = []
+            for ep in endpoints:
+                reply = await self._forward_one(ep, batch, timeout_ms)
+                results.append(reply)
+                if _is_fatal_reply(reply):
+                    break
             output_batch = (
                 _merge_auto_residency_results(results)
                 if isinstance(batch, AutoResidencyReq)
                 else _merge_fanout_results(results)
             )
         else:
-            replica = _select_replica(batch, len(endpoints), self._replica_counter)
+            if replica is None:
+                replica = _select_replica(batch, len(endpoints), self._replica_counter)
             output_batch = await self._forward_one(
                 endpoints[replica], batch, timeout_ms
             )

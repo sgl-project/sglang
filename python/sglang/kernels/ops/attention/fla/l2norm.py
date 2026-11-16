@@ -61,13 +61,16 @@ def l2norm_fwd_kernel(
     BT: tl.constexpr,
     BD: tl.constexpr,
 ):
-    i_t = tl.program_id(0)
-    p_x = tl.make_block_ptr(x, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    b_x = tl.load(p_x, boundary_check=(0, 1)).to(tl.float32)
+    i_t = tl.program_id(0).to(tl.int64)
+    o_t = i_t * BT + tl.arange(0, BT)
+    o_d = tl.arange(0, BD)
+    m_x = (o_t[:, None] < T) & (o_d[None, :] < D)
+    p_x = x + o_t[:, None] * D + o_d[None, :]
+    p_y = y + o_t[:, None] * D + o_d[None, :]
+    b_x = tl.load(p_x, mask=m_x, other=0.0).to(tl.float32)
     b_var = tl.sum(b_x * b_x, axis=1)
     b_y = b_x / tl.sqrt(b_var + eps)[:, None]
-    p_y = tl.make_block_ptr(y, (T, D), (D, 1), (i_t * BT, 0), (BT, BD), (1, 0))
-    tl.store(p_y, b_y.to(p_y.dtype.element_ty), boundary_check=(0, 1))
+    tl.store(p_y, b_y.to(p_y.dtype.element_ty), mask=m_x)
 
 
 def l2norm_fwd(
@@ -144,76 +147,54 @@ def gdn_prefill_qkv_prepare_kernel(
     BD: tl.constexpr,
 ):
     """Materialize strided Q/K/V into token-major tensors in one launch."""
-    token_block = tl.program_id(0)
+    token_block = tl.program_id(0).to(tl.int64)
     head_idx = tl.program_id(1)
 
+    o_t = token_block * BT + tl.arange(0, BT)
+    o_d = tl.arange(0, BD)
+    m_x = (o_t[:, None] < T) & (o_d[None, :] < D)
     if head_idx < H_QK:
         # Match l2norm_fwd_kernel's block layout so the BF16 reduction tree is
         # unchanged for strided inputs.
-        q_block = tl.make_block_ptr(
-            q + head_idx * q_stride_h,
-            (T, D),
-            (q_stride_t, q_stride_d),
-            (token_block * BT, 0),
-            (BT, BD),
-            (1, 0),
+        q_block = (
+            q
+            + head_idx * q_stride_h
+            + o_t[:, None] * q_stride_t
+            + o_d[None, :] * q_stride_d
         )
-        k_block = tl.make_block_ptr(
-            k + head_idx * k_stride_h,
-            (T, D),
-            (k_stride_t, k_stride_d),
-            (token_block * BT, 0),
-            (BT, BD),
-            (1, 0),
+        k_block = (
+            k
+            + head_idx * k_stride_h
+            + o_t[:, None] * k_stride_t
+            + o_d[None, :] * k_stride_d
         )
-        q_values = tl.load(q_block, boundary_check=(0, 1)).to(tl.float32)
-        k_values = tl.load(k_block, boundary_check=(0, 1)).to(tl.float32)
-        q_output_block = tl.make_block_ptr(
-            q_out + head_idx * D,
-            (T, D),
-            (H_QK * D, 1),
-            (token_block * BT, 0),
-            (BT, BD),
-            (1, 0),
-        )
-        k_output_block = tl.make_block_ptr(
-            k_out + head_idx * D,
-            (T, D),
-            (H_QK * D, 1),
-            (token_block * BT, 0),
-            (BT, BD),
-            (1, 0),
-        )
+        q_values = tl.load(q_block, mask=m_x, other=0.0).to(tl.float32)
+        k_values = tl.load(k_block, mask=m_x, other=0.0).to(tl.float32)
+        q_output_block = q_out + head_idx * D + o_t[:, None] * (H_QK * D) + o_d[None, :]
+        k_output_block = k_out + head_idx * D + o_t[:, None] * (H_QK * D) + o_d[None, :]
         tl.store(
             q_output_block,
             q_values.to(q_output_block.dtype.element_ty),
-            boundary_check=(0, 1),
+            mask=m_x,
         )
         tl.store(
             k_output_block,
             k_values.to(k_output_block.dtype.element_ty),
-            boundary_check=(0, 1),
+            mask=m_x,
         )
     else:
         value_head = head_idx - H_QK
-        v_block = tl.make_block_ptr(
-            v + value_head * v_stride_h,
-            (T, D),
-            (v_stride_t, v_stride_d),
-            (token_block * BT, 0),
-            (BT, BD),
-            (1, 0),
+        v_block = (
+            v
+            + value_head * v_stride_h
+            + o_t[:, None] * v_stride_t
+            + o_d[None, :] * v_stride_d
         )
-        v_values = tl.load(v_block, boundary_check=(0, 1))
-        v_output_block = tl.make_block_ptr(
-            v_out + value_head * D,
-            (T, D),
-            (H_V * D, 1),
-            (token_block * BT, 0),
-            (BT, BD),
-            (1, 0),
+        v_values = tl.load(v_block, mask=m_x, other=0.0)
+        v_output_block = (
+            v_out + value_head * D + o_t[:, None] * (H_V * D) + o_d[None, :]
         )
-        tl.store(v_output_block, v_values, boundary_check=(0, 1))
+        tl.store(v_output_block, v_values, mask=m_x)
 
 
 def gdn_prefill_qkv_prepare_fwd(

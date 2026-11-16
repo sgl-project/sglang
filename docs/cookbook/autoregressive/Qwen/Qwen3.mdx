@@ -42,16 +42,19 @@ import { Qwen3Deployment } from "/src/snippets/autoregressive/qwen3-deployment.j
 
 ### 3.2 Configuration Tips
 
+- **Qwen3-8B on B300 (BF16, TP1):** SGLang selects `trtllm_mha` by default when speculative decoding is disabled. If your launch command sets `--attention-backend flashinfer`, remove it or replace it with `--attention-backend trtllm_mha`.
 - **Memory Management:** Set lower `--context-length` to conserve memory. A value of `128000` is sufficient for most scenarios, down from the default 262K.
 - **Expert Parallelism:** SGLang supports Expert Parallelism (EP) via `--ep`, allowing experts in MoE models to be deployed on separate GPUs for better throughput. One thing to note is that, for quantized models, you need to set `--ep` to a value that satisfies the requirement: `(moe_intermediate_size / moe_tp_size) % weight_block_size_n == 0, where moe_tp_size is equal to tp_size divided by ep_size.` Note that EP may perform worse in low concurrency scenarios due to additional communication overhead. Check out [Expert Parallelism Deployment](../../../docs/advanced_features/expert_parallelism) for more details.
 - **Kernel Tuning:** For MoE Triton kernel tuning on your specific hardware, refer to [fused_moe_triton](https://github.com/sgl-project/sglang/tree/main/benchmark/kernels/fused_moe_triton).
 - **Qwen3-4B and Qwen3-8B on H200:** For concurrent requests with long prompts, benchmark `--enable-mixed-chunk` to mix decode requests into chunked-prefill batches. This can reduce median time to first token (TTFT), but may increase time per output token (TPOT) and end-to-end tail latency. Compare these metrics and throughput on your workload before enabling it.
+- **Opt-in fused dense prefill:** `--enable-fused-qk-norm-rope` also fuses QK normalization and cached RoPE for ordinary dense-Qwen3 prefill on Hopper, with FP16/BF16, head dimension 128, TP1, no quantization, and FA3 or FlashInfer. It produces contiguous Q while updating packed K; attention and KV-cache handling are unchanged. Other prefill configurations, mixed batches, speculative decoding, scaled RoPE, and deterministic inference retain the separate path. CUDA fusion remains disabled by default; `--no-enable-fused-qk-norm-rope` disables it.
 - **Speculative Decoding:** Using Speculative Decoding for latency-sensitive scenarios.
   - `--speculative-algorithm EAGLE3`: Speculative decoding algorithm
   - `--speculative-num-steps 3`: Number of speculative verification rounds
   - `--speculative-eagle-topk 1`: Top-k sampling for draft tokens
   - `--speculative-num-draft-tokens 4`: Number of draft tokens per step
   - `--speculative-draft-model-path`: The path of the draft model weights. This can be a local folder or a Hugging Face repo ID such as [`lmsys/SGLang-EAGLE3-Qwen3-235B-A22B-Instruct-2507-SpecForge-Meituan`](https://huggingface.co/lmsys/SGLang-EAGLE3-Qwen3-235B-A22B-Instruct-2507-SpecForge-Meituan).
+- **Intel Arc Pro B-Series (BMG):** The BMG command enables XPU graphs (`--cuda-graph-backend-decode full --cuda-graph-backend-prefill breakable`), which need an XPU image built from the current [XPU Dockerfile](https://github.com/sgl-project/sglang/blob/main/docker/xpu.Dockerfile) (oneAPI 2026.1.3). On `lmsysorg/sglang:v0.5.22-xpu` these two flags produce corrupted output; leave them out there, at the cost of much slower decode. See [XPU Graph](../../../docs/hardware-platforms/xpu#xpu-graph-experimental) for details.
 - **Xeon CPU service configuration:** Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for TP (tensor parallel) and NUMA binding settings.
 
 ## 4. Model Invocation
@@ -354,7 +357,7 @@ python -m sglang.launch_server \
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model Qwen/Qwen3-235B-A22B-Instruct-2507 \
   --dataset-name random \
@@ -410,7 +413,7 @@ Max ITL (ms):                            13.45
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model Qwen/Qwen3-235B-A22B-Instruct-2507 \
   --dataset-name random \
@@ -466,7 +469,7 @@ Max ITL (ms):                            457.52
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model Qwen/Qwen3-235B-A22B-Instruct-2507 \
   --dataset-name random \
@@ -532,7 +535,7 @@ python -m sglang.launch_server \
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model Qwen/Qwen3-235B-A22B-Instruct-2507 \
   --dataset-name random \
@@ -588,7 +591,7 @@ Max ITL (ms):                            15.79
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model Qwen/Qwen3-235B-A22B-Instruct-2507 \
   --dataset-name random \
@@ -644,7 +647,7 @@ Max ITL (ms):                            104.94
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model Qwen/Qwen3-235B-A22B-Instruct-2507 \
   --dataset-name random \
@@ -702,7 +705,7 @@ Max ITL (ms):                            408.30
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model Qwen/Qwen3-235B-A22B-Instruct-2507 \
   --dataset-name random \
@@ -758,7 +761,7 @@ Max ITL (ms):                            14.48
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model Qwen/Qwen3-235B-A22B-Instruct-2507 \
   --dataset-name random \
@@ -814,7 +817,7 @@ Max ITL (ms):                            574.64
 - Benchmark Command:
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model Qwen/Qwen3-235B-A22B-Instruct-2507 \
   --dataset-name random \

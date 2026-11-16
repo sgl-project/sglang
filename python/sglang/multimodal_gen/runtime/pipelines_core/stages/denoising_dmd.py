@@ -207,6 +207,7 @@ class DmdDenoisingStage(DenoisingStage):
                         else:
                             latents = pred_video
 
+                        self.check_cancelled(batch)
                         # Update progress bar
                         if i == len(timesteps) - 1 or (
                             (i + 1) > num_warmup_steps

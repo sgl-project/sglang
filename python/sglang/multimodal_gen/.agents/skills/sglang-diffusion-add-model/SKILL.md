@@ -313,21 +313,15 @@ class MyModelPipelineConfig(ImagePipelineConfig):
         ...
         return freqs_cis
 
-    def prepare_pos_cond_kwargs(self, batch, latent_model_input, t, **kwargs):
-        """Build positive conditioning kwargs for each denoising step."""
+    def prepare_pos_cond_kwargs(self, batch, device, rotary_emb, dtype):
+        # Extra DiT forward() kwargs only. DenoisingStage already passes
+        # hidden_states, timestep and encoder_hidden_states (from get_pos_prompt_embeds).
         return {
-            "hidden_states": latent_model_input,
-            "encoder_hidden_states": batch.prompt_embeds[0],
-            "timestep": t,
             # ... model-specific kwargs ...
         }
 
-    def prepare_neg_cond_kwargs(self, batch, latent_model_input, t, **kwargs):
-        """Build negative conditioning kwargs for CFG."""
+    def prepare_neg_cond_kwargs(self, batch, device, rotary_emb, dtype):
         return {
-            "hidden_states": latent_model_input,
-            "encoder_hidden_states": batch.negative_prompt_embeds[0],
-            "timestep": t,
             # ... model-specific kwargs ...
         }
 
@@ -351,7 +345,7 @@ There is no separate `VideoPipelineConfig` base class. For video models, choose
 existing video configs such as Wan, LTX, Hunyuan, Helios, or MOVA when deciding
 whether to subclass `PipelineConfig` directly or use a model-specific base.
 
-**Important**: The `prepare_pos_cond_kwargs` / `prepare_neg_cond_kwargs` methods define what the DiT receives at each denoising step. These must match the DiT's `forward()` signature.
+**Important**: The `prepare_pos_cond_kwargs` / `prepare_neg_cond_kwargs` methods return only the extra kwargs your DiT `forward()` needs beyond `hidden_states`, `timestep` and `encoder_hidden_states`; override `get_pos_prompt_embeds`/`get_neg_prompt_embeds` to change the text embeddings passed.
 
 ### Step 6: Implement the BeforeDenoisingStage (Core Step)
 

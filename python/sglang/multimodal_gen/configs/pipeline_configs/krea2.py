@@ -10,10 +10,8 @@ from sglang.multimodal_gen.configs.models.vaes.base import (
     get_channelwise_decode_scale_and_shift,
 )
 from sglang.multimodal_gen.configs.models.vaes.qwenimage import QwenImageVAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ImagePipelineConfig,
-    ModelTaskType,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import ImagePipelineConfig
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.distributed import (
     get_sp_parallel_rank,
     get_sp_world_size,

@@ -635,6 +635,7 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
                 if clamp_latent is not None:
                     current_latents[:, :, :context_frames] = clamp_latent
 
+                self.check_cancelled(batch)
                 if progress_bar is not None:
                     progress_bar.update()
 
@@ -750,6 +751,7 @@ class LongLive2CausalDenoisingStage(CausalDMDDenoisingStage):
                 if clamp_latent is not None:
                     current_latents[:, :, :context_frames] = clamp_latent
 
+                self.check_cancelled(batch)
                 if progress_bar is not None:
                     progress_bar.update()
 

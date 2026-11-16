@@ -461,7 +461,7 @@ python -m sglang.launch_server \
 - Low Concurrency (Latency-Optimized)
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model deepseek-ai/DeepSeek-V3.1 \
   --dataset-name random \
@@ -514,7 +514,7 @@ Max ITL (ms):                            25.44
 - Medium Concurrency (Balanced)
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model deepseek-ai/DeepSeek-V3.1 \
   --dataset-name random \
@@ -567,7 +567,7 @@ Max ITL (ms):                            453.99
 - High Concurrency (Throughput-Optimized)
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model deepseek-ai/DeepSeek-V3.1 \
   --dataset-name random \
@@ -622,7 +622,7 @@ Max ITL (ms):                            1661.39
 - Low Concurrency
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model deepseek-ai/DeepSeek-V3.1 \
   --dataset-name random \
@@ -675,7 +675,7 @@ Max ITL (ms):                            29.80
 - Medium Concurrency
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model deepseek-ai/DeepSeek-V3.1 \
   --dataset-name random \
@@ -728,7 +728,7 @@ Max ITL (ms):                            164.76
 - High Concurrency
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model deepseek-ai/DeepSeek-V3.1 \
   --dataset-name random \
@@ -783,7 +783,7 @@ Max ITL (ms):                            208.61
 - Low Concurrency
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model deepseek-ai/DeepSeek-V3.1 \
   --dataset-name random \
@@ -836,7 +836,7 @@ Max ITL (ms):                            27.41
 - Medium Concurrency
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model deepseek-ai/DeepSeek-V3.1 \
   --dataset-name random \
@@ -889,7 +889,7 @@ Max ITL (ms):                            2865.73
 - High Concurrency
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model deepseek-ai/DeepSeek-V3.1 \
   --dataset-name random \

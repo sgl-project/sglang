@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     cache_once,
     is_hip_runtime,
@@ -94,6 +95,16 @@ TMA_STORE_WARPS = 4
 TMA_BLOCK_QUOTA = 4
 
 
+def hicache_block_quota_from_env(env) -> int | None:
+    """An env field's CTA quota under the runtime master; None keeps the stock one."""
+    if not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+        return None
+    quota = env.get()
+    if quota is not None and quota <= 0:
+        raise ValueError(f"{env.name} must be a positive CTA count, got {quota}")
+    return quota
+
+
 @cache_once
 def _jit_hicache_tma_module(*, block_quota: int) -> Module:
     args = make_cpp_args(TMA_STAGE_BYTES, TMA_NUM_STAGES, TMA_STORE_WARPS, block_quota)
@@ -106,6 +117,14 @@ def _jit_hicache_tma_module(*, block_quota: int) -> Module:
             ("launch_all", f"&HiCacheTmaKernel<{args}>::run_all"),
             ("launch_one_mla", f"&HiCacheTmaKernel<{args}>::run_one_mla"),
             ("launch_all_mla", f"&HiCacheTmaKernel<{args}>::run_all_mla"),
+            (
+                "launch_one_page_unified",
+                f"&HiCacheTmaKernel<{args}>::run_one_page_unified<false>",
+            ),
+            (
+                "launch_one_mla_page_unified",
+                f"&HiCacheTmaKernel<{args}>::run_one_page_unified<true>",
+            ),
             ("fits_device", f"&HiCacheTmaKernel<{args}>::fits_device"),
         ],
     )
@@ -128,9 +147,7 @@ def use_hicache_tma_kernel(
     A chunk that straddles pages degrades to one bulk op per row, so pages must
     tile the chunk; `page_size=None` (caller unaware of paging) trusts the indices.
     """
-    if _is_hip or not envs.SGLANG_HICACHE_TMA_TRANSFER.get():
-        return False
-    if element_size % 16 != 0 or torch.cuda.get_device_capability()[0] < 9:
+    if _is_hip or element_size % 16 != 0 or not current_arch().is_sm_at_least(9):
         return False
     if page_size is not None and page_size % hicache_tma_rows_per_chunk(element_size):
         return False
@@ -528,6 +545,15 @@ def _jit_hicache_page_unified_module(*, element_size: int, block_quota: int) -> 
     )
 
 
+def _use_page_unified_tma_kernel(*, group_bytes: int, block_quota: int) -> bool:
+    # The page-unified TMA kernel caps chunks to a divisor of the page size,
+    # including pages smaller than a stage. It does not need the legacy
+    # page-size divisibility gate, which assumes a full stage of token rows.
+    return 0 < group_bytes <= TMA_STAGE_BYTES and use_hicache_tma_kernel(
+        element_size=group_bytes, block_quota=block_quota
+    )
+
+
 def can_use_page_unified_load_back_jit_kernel(
     *,
     group_bytes: int,
@@ -537,6 +563,10 @@ def can_use_page_unified_load_back_jit_kernel(
     if group_bytes <= 0 or group_bytes % 16 != 0:
         logger.warning(f"Unsupported {group_bytes = } for page-unified JIT load-back")
         return False
+    if _use_page_unified_tma_kernel(
+        group_bytes=group_bytes, block_quota=block_quota or TMA_BLOCK_QUOTA
+    ):
+        return True
     try:
         _jit_hicache_page_unified_module(
             element_size=group_bytes,
@@ -574,8 +604,9 @@ def transfer_hicache_one_layer_page_unified_lf(
     order; both are CUDA int32/int64 vectors on the destination device.
     One head group's token row must be a positive multiple of 16 bytes.
 
-    Runs on the current CUDA stream. Keep ``src`` alive and unwritten until
-    that stream completes.
+    Uses the TMA staging pipeline on supported SM90+ devices, otherwise the
+    register-copy kernel. Runs on the current CUDA stream. Keep ``src`` alive
+    and unwritten until that stream completes.
     """
     if src.ndim != 7:
         raise ValueError(
@@ -659,10 +690,14 @@ def _transfer_hicache_one_layer_page_unified(
         raise ValueError("Expected a CPU or CUDA-registered host pool")
     if group_bytes % 16:
         raise ValueError("Each copied token row must be 16-byte aligned")
-    module = _jit_hicache_page_unified_module(
-        element_size=group_bytes,
-        block_quota=block_quota or DEFAULT_BLOCK_QUOTA,
-    )
+    tma_quota = block_quota or TMA_BLOCK_QUOTA
+    if _use_page_unified_tma_kernel(group_bytes=group_bytes, block_quota=tma_quota):
+        module = _jit_hicache_tma_module(block_quota=tma_quota)
+    else:
+        module = _jit_hicache_page_unified_module(
+            element_size=group_bytes,
+            block_quota=block_quota or DEFAULT_BLOCK_QUOTA,
+        )
     launch = (
         module.launch_one_mla_page_unified if is_mla else module.launch_one_page_unified
     )
@@ -688,6 +723,29 @@ def _jit_page_unified_write_back(group_bytes: int, *, is_mla: bool = False) -> M
         cuda_files=["kvcacheio/staged_write_back.cuh"],
         cuda_wrappers=[("launch", f"&HiCachePageUnifiedWriteBackKernel<{args}>::run")],
     )
+
+
+def can_use_page_unified_write_back_jit_kernel(
+    *,
+    group_bytes: int,
+    is_mla: bool = False,
+) -> bool:
+    """Probe the module the page-unified write-back actually launches.
+
+    Its own build, not the page_first staged one: same header, a different
+    template instantiation under a different `cache_once` key, so a page_first
+    probe says nothing about whether this one compiles.
+    """
+    logger = logging.getLogger(__name__)
+    if group_bytes <= 0 or group_bytes % 16 != 0:
+        logger.warning(f"Unsupported {group_bytes = } for page-unified write-back")
+        return False
+    try:
+        _jit_page_unified_write_back(group_bytes, is_mla=is_mla)
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to load page-unified JIT write-back kernel: {e}")
+        return False
 
 
 @debug_kernel_api

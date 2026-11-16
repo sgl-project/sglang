@@ -586,6 +586,7 @@ class Ideogram4Transformer2DModel(BaseDiT, LayerwiseOffloadableModuleMixin):
     _supported_attention_backends = {
         AttentionBackendEnum.FA,
         AttentionBackendEnum.TORCH_SDPA,
+        AttentionBackendEnum.AMX_ATTN,
     }
     # The coarse CPU component-offload load changes the packed Ideogram
     # numerical path even if the module is promoted before the real request.

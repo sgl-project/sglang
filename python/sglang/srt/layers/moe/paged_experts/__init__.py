@@ -5,7 +5,8 @@ pinned host memory; outputs are bit-identical to the unpaged layer. See
 ``docs/docs/advanced_features/paged_experts.mdx`` for the design and the execution flow.
 
 Modules: ``formats`` (per quantization method), ``runners`` (per runner backend), ``store``
-(host copy and transfers), ``residency`` (slots and waves), ``executor`` (one forward step),
+(host copy and transfers), ``expert_cache`` (the experts on disk), ``disk_tier`` (experts that
+do not fit the host budget), ``residency`` (slots and waves), ``executor`` (one forward step),
 ``method`` (the ``FusedMoEMethodBase`` wiring them into a ``FusedMoE`` layer).
 """
 
