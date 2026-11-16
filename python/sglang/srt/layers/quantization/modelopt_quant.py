@@ -73,7 +73,6 @@ from sglang.srt.runtime_context import get_exec, get_platform
 from sglang.srt.utils.common import round_up
 from sglang.srt.utils.custom_op import register_custom_op
 from sglang.srt.utils.device import get_device_capability, is_cuda
-from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
@@ -181,15 +180,6 @@ def fp4_gemm(
         )
     else:
         raise ValueError(f"Unsupported FlashInfer FP4 GEMM quant mode: {quant_mode}")
-
-
-if is_cuda() and (not get_platform().is_sm120) and (fp4_quantize is not None):
-
-    @register_fake_if_exists("sgl_kernel::scaled_fp4_quant")
-    def _sgl_kernel_scaled_fp4_quant_fake(
-        output, input, output_scale, input_global_scale
-    ):
-        return
 
 
 # FP4 GEMM alignment constant - CUTLASS/FlashInfer kernels require dimensions divisible by 32
