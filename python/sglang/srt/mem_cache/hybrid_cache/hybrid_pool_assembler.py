@@ -42,6 +42,9 @@ from sglang.srt.mem_cache.pool_host.mha import (
     get_mha_host_pool_cls,
 )
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
+from sglang.srt.mem_cache.pool_host.npu_host_memory import (
+    reserve_dsv4_paged_host_memory,
+)
 from sglang.srt.mem_cache.pool_host.page_interleave import (
     PageInterleaveHostPool,
 )
@@ -233,6 +236,30 @@ def _split_hicache_size(
         hicache_size * size_bytes / total_device_pool_size
         for size_bytes in device_pool_sizes
     )
+
+
+def _pinned_state_host_gb(hicache_size: float) -> Optional[float]:
+    """SGLANG_HICACHE_MAMBA_SIZE_GB, read only with the runtime master; None keeps
+    the proportional split."""
+    from sglang.srt.environ import envs
+
+    if not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+        return None
+    pinned = envs.SGLANG_HICACHE_MAMBA_SIZE_GB.get()
+    if pinned is None:
+        return None
+    if not 0 < pinned < hicache_size:
+        raise ValueError(
+            f"SGLANG_HICACHE_MAMBA_SIZE_GB={pinned} must lie in (0, --hicache-size "
+            f"{hicache_size})"
+        )
+    logger.info(
+        "HiCache: the Mamba state host pool takes %s of %s GB "
+        "(SGLANG_HICACHE_MAMBA_SIZE_GB)",
+        pinned,
+        hicache_size,
+    )
+    return float(pinned)
 
 
 def build_pool_entry(
@@ -854,6 +881,14 @@ def build_deepseek_v4_hicache_stack(
         c128_attn_allocator=c128_attn_allocator,
     )
 
+    reserve_dsv4_paged_host_memory(
+        infos=infos,
+        num_host_pages=num_host_pages,
+        swa_num_host_pages=swa_num_host_pages,
+        c128_num_host_pages=c128_num_host_pages,
+        num_draft_swa_layers=len(mtp_swa_device_buffers),
+    )
+
     logical_host_pool = LogicalHostPool(
         num_host_pages * page_size, page_size, layout=get_memory().hicache_mem_layout
     )
@@ -1095,7 +1130,9 @@ def _state_host_layout() -> str:
     # pool has no separate K/V buffers, so kv_split does not apply; override
     # to page_first_direct.
     layout = get_memory().hicache_mem_layout
-    return "page_first_direct" if layout == "page_first_kv_split" else layout
+    if layout in ("page_first_kv_split", "layer_first_kv_split"):
+        return "page_first_direct"
+    return layout
 
 
 def build_mamba_host_pool(
@@ -1206,9 +1243,14 @@ def build_hybrid_mamba_stack(
     kv_pool = config.root
     kv_host_size, mamba_host_size = None, 0
     if get_memory().hicache_size > 0:
-        kv_host_size, mamba_host_size = _split_hicache_size(
-            get_memory().hicache_size, (kv_pool, mamba_pool)
-        )
+        pinned = _pinned_state_host_gb(get_memory().hicache_size)
+        if pinned is not None:
+            kv_host_size = get_memory().hicache_size - pinned
+            mamba_host_size = pinned
+        else:
+            kv_host_size, mamba_host_size = _split_hicache_size(
+                get_memory().hicache_size, (kv_pool, mamba_pool)
+            )
     index_bytes = _kv_budget_index_bytes(config)
     if index_bytes and kv_host_size is not None:
         kv_bytes = sum(kv_pool.get_kv_size_bytes())
@@ -1411,7 +1453,30 @@ def build_unified_host_stack(
         envelope = None
 
     host_sizes = {s.name: 0 if s.holds_state else None for s in sub_pools}
+    pinned = None
     if memory.hicache_size > 0 and envelope is None:
+        pinned = _pinned_state_host_gb(memory.hicache_size)
+    if pinned is not None:
+        state = [s.name for s in sub_pools if s.holds_state]
+        if len(state) != 1:
+            raise ValueError(
+                "SGLANG_HICACHE_MAMBA_SIZE_GB needs one recurrent-state sub-pool, "
+                f"got {state}"
+            )
+        rest = [s.name for s in sub_pools if not s.holds_state]
+        shares = dict(
+            zip(
+                rest,
+                _split_hicache_size(
+                    memory.hicache_size - pinned,
+                    tuple(storage.view(name) for name in rest),
+                ),
+            )
+        )
+        host_sizes = {
+            name: pinned if name == state[0] else shares[name] for name in host_sizes
+        }
+    elif memory.hicache_size > 0 and envelope is None:
         host_sizes = dict(
             zip(
                 host_sizes,
@@ -1695,7 +1760,7 @@ def _build_mha_mla_host_pool(
     # The global layout is page_first_kv_split only when the target model
     # uses MLA; that layout is MLA-specific, so MHA draft pools must use
     # the non-MLA layout (NPU default: page_first_direct).
-    if is_mha and layout == "page_first_kv_split":
+    if is_mha and layout in ("page_first_kv_split", "layer_first_kv_split"):
         layout = "page_first_direct"
 
     kwargs = dict(
@@ -2015,13 +2080,6 @@ class StackStrategy:
         raise NotImplementedError
 
 
-def _delegate_c128_host_evict(cache, n: int) -> int:
-    """Delegate C128 host pressure to FULL leaf eviction.
-
-    For example, ``n`` C128 slots request ``n * 128`` FULL tokens."""
-    return cache.evict_host(n * 128, ComponentType.FULL)
-
-
 class _DeepSeekV4Strategy(StackStrategy):
     def owns(self, kvcache):
         from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
@@ -2068,9 +2126,9 @@ class _DeepSeekV4Strategy(StackStrategy):
             storage_backend=storage_backend,
             host_swa_evict_fn=lambda n: cache.evict_host(n, ComponentType.SWA),
             device_swa_evict_fn=lambda n: _evict_swa_for_device_alloc(cache, n),
-            # _delegate_c128_host_evict converts C128 slots to FULL tokens.
+            # C128's host eviction counts reclaimed summary slots directly.
             host_c128_evict_fn=(
-                (lambda n: _delegate_c128_host_evict(cache, n))
+                (lambda n: cache.evict_host(n, ComponentType.C128))
                 if independent_c128
                 else None
             ),

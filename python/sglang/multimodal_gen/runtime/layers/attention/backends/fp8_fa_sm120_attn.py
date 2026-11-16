@@ -29,8 +29,6 @@ logger = init_logger(__name__)
 
 
 class FP8FlashAttentionSM120Backend(AttentionBackend):
-    accept_output_buffer: bool = False
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [HEAD_DIM]

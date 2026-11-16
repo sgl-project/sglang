@@ -119,7 +119,7 @@ class TestFusedNormActFp8GroupQuant(CustomTestCase):
                     )
 
     def test_silu_mul_fp8_group_quant(self):
-        from sglang.kernels.ops.quantization.silu_mul_fp8_group_quant import (
+        from sglang.kernels.ops.activation.silu_mul_fp8_group_quant import (
             silu_mul_fp8_group_quant,
         )
         from sglang.srt.layers.activation import SiluAndMul
