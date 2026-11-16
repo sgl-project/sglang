@@ -467,31 +467,16 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
                     )
                     weight_loader(param, loaded_weight)
                 loaded_params.add(name)
-        unloaded_params = params_dict.keys() - loaded_params
-        if unloaded_params:
-            pass
-            # raise RuntimeError(
-            #     f"Some weights are not initialized from checkpoints: {unloaded_params}")
         return loaded_params
 
     def get_embed_and_head(self):
-        # For EAGLE3, we delegate to the language model which should have this method
-        # If the language model doesn't have lm_head (like EAGLE3), we return None for head
-        embed = self.language_model.get_embed()
-        if hasattr(self.language_model, "get_embed_and_head"):
-            return self.language_model.get_embed_and_head()
-        elif hasattr(self.language_model, "lm_head"):
-            return embed, self.language_model.lm_head.weight
-        else:
-            # For EAGLE3, head might not be needed
-            return embed, None
+        return self.language_model.get_embed_and_head()
 
     def get_embed_and_head_for_draft(self, draft_embedding):
         return self.language_model.get_embed_and_head_for_draft(draft_embedding)
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
-        if hasattr(self.language_model, "set_eagle3_layers_to_capture"):
-            self.language_model.set_eagle3_layers_to_capture(layer_ids)
+        self.language_model.set_eagle3_layers_to_capture(layer_ids)
 
 
 EntryClass = Gemma3ForConditionalGeneration

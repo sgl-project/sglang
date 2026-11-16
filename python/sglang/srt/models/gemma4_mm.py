@@ -633,15 +633,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
     ) -> Optional[torch.Tensor]:
         return self.language_model.get_per_layer_inputs(input_ids)
 
-    def project_per_layer_inputs(
-        self,
-        inputs_embeds: torch.Tensor,
-        per_layer_inputs: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        return self.language_model.project_per_layer_inputs(
-            inputs_embeds, per_layer_inputs
-        )
-
     @torch.no_grad()
     def forward(
         self,
@@ -1145,9 +1136,6 @@ class Gemma4ForConditionalGeneration(PreTrainedModel):
             return self.config.intermediate_size[0], self.config.hidden_size
         else:
             raise NotImplementedError()
-
-    def get_embed(self):
-        return self.language_model.embed_tokens.weight
 
     def get_embed_and_head(self):
         if self.pp_group.world_size > 1:

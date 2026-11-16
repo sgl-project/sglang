@@ -296,21 +296,6 @@ class Gemma3nAltUp(nn.Module):
         """Scales the provided 3D tensor."""
         return corrected * self.correct_output_scale.to(corrected.dtype)
 
-    def forward(
-        self, hidden_states: torch.Tensor, activated: torch.Tensor
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Predicts, correct, and optionally scales the output of a layer using trainable maps.
-
-        hidden_states: [num_altup_inputs, num_tokens, hidden_size]
-        """
-
-        predictions = self.predict(hidden_states)
-        corrected = self.correct(predictions=predictions, activated=activated)
-        output = corrected[self.config.altup_active_idx]
-        if self.config.altup_correct_scale:
-            output = self.scale_corrected_output(output)
-        return corrected, output
-
 
 class Gemma3nAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""

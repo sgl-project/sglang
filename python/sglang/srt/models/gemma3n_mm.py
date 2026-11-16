@@ -361,20 +361,6 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
                 dtype=self.language_model.dtype(),
             )
 
-    def get_per_layer_inputs(
-        self, input_ids: torch.LongTensor
-    ) -> Optional[torch.Tensor]:
-        return self.language_model.get_per_layer_inputs(input_ids)
-
-    def project_per_layer_inputs(
-        self,
-        inputs_embeds: torch.Tensor,
-        per_layer_inputs: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        return self.language_model.project_per_layer_inputs(
-            inputs_embeds, per_layer_inputs
-        )
-
     @torch.no_grad()
     def forward(
         self,

@@ -1633,9 +1633,6 @@ class Gemma4ForCausalLM(PreTrainedModel):
         shard_size = (weight.shape[0] + tp_size - 1) // tp_size
         return weight[tp_rank * shard_size : (tp_rank + 1) * shard_size]
 
-    def get_embed(self):
-        return self._shard_weight(self.model.embed_tokens.weight)
-
     def get_embed_and_head(self, *, draft_embedding=None):
         if self.pp_group.world_size > 1:
             # Under PP, embed_tokens lives on the first rank and lm_head on
