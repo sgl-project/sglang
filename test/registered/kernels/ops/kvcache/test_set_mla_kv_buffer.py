@@ -192,15 +192,16 @@ def test_set_mla_kv_buffer_zero_index_can_be_written_when_skip_disabled():
     )
 
 
+@pytest.mark.parametrize("rope_dim", [TRITON_ROPE_DIM, 0])
 @pytest.mark.parametrize("loc_dtype", [torch.int32, torch.int64])
-def test_set_mla_kv_buffer_triton_reserved_skip_index(loc_dtype):
+def test_set_mla_kv_buffer_triton_reserved_skip_index(loc_dtype, rope_dim):
     dtype = torch.bfloat16
     cache_k_nope = torch.randn((4, 1, TRITON_NOPE_DIM), dtype=dtype, device=DEVICE)
-    cache_k_rope = torch.randn((4, 1, TRITON_ROPE_DIM), dtype=dtype, device=DEVICE)
+    cache_k_rope = torch.randn((4, 1, rope_dim), dtype=dtype, device=DEVICE)
     cache_k_nope[[0, 2]] = torch.nan
     cache_k_rope[[0, 2]] = torch.nan
     kv_buffer = torch.randn(
-        (CACHE_SIZE, 1, TRITON_NOPE_DIM + TRITON_ROPE_DIM),
+        (CACHE_SIZE, 1, TRITON_NOPE_DIM + rope_dim),
         dtype=dtype,
         device=DEVICE,
     )
@@ -224,12 +225,15 @@ def test_set_mla_kv_buffer_triton_reserved_skip_index(loc_dtype):
     )
 
 
-def test_set_mla_kv_buffer_triton_zero_index_can_be_written_when_skip_disabled():
+@pytest.mark.parametrize("rope_dim", [TRITON_ROPE_DIM, 0])
+def test_set_mla_kv_buffer_triton_zero_index_can_be_written_when_skip_disabled(
+    rope_dim,
+):
     dtype = torch.bfloat16
     cache_k_nope = torch.randn((1, 1, TRITON_NOPE_DIM), dtype=dtype, device=DEVICE)
-    cache_k_rope = torch.randn((1, 1, TRITON_ROPE_DIM), dtype=dtype, device=DEVICE)
+    cache_k_rope = torch.randn((1, 1, rope_dim), dtype=dtype, device=DEVICE)
     kv_buffer = torch.randn(
-        (CACHE_SIZE, 1, TRITON_NOPE_DIM + TRITON_ROPE_DIM),
+        (CACHE_SIZE, 1, TRITON_NOPE_DIM + rope_dim),
         dtype=dtype,
         device=DEVICE,
     )

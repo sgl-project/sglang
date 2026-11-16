@@ -60,7 +60,7 @@ import triton.language as tl
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.environ import envs
 from sglang.srt.utils import is_hip
-from sglang.srt.utils.common import is_gfx1250_supported
+from sglang.srt.utils.device import is_gfx1250_supported
 
 _is_gfx1250_supported = is_gfx1250_supported()
 

@@ -165,9 +165,10 @@ jobs:
           # docker/xpu.Dockerfile that already ships libssl-dev.
           docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang_xpu apt-get update
           docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang_xpu apt-get install -y libssl-dev
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --upgrade pip
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate "lmcache>=0.3.9" accelerate
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip uninstall -y flashinfer-python sgl-kernel sglang
+          # Pin the image's torch so test deps (e.g. lmcache) cannot swap in a CUDA build.
+          docker exec ci_sglang_xpu bash -c "uv pip freeze --python /opt/venv/bin/python3 | grep -iE '^(torch|torchvision|torchaudio|triton-xpu)==' > /tmp/image-pins.txt"
+          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 -c /tmp/image-pins.txt pytest expecttest ray huggingface_hub tabulate "lmcache>=0.3.9" accelerate
+          docker exec ci_sglang_xpu uv pip uninstall --python /opt/venv/bin/python3 flashinfer-python sgl-kernel sglang
           docker exec ci_sglang_xpu cp /sglang-checkout/python/pyproject_xpu.toml /sglang-checkout/python/pyproject.toml
           # Fetch tags so setuptools_scm resolves a real version instead of
           # falling back to 0.0.0 on a shallow/tag-less checkout.
@@ -195,7 +196,7 @@ jobs:
             --timeout-override kv_canary/test_self_unit_plan_input.py=120
             --timeout-override kernels/ops/kvcache/test_hisparse.py=120
         run: |
-          docker exec ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu,stage-b-test-1-gpu-xpu --timeout-per-file 600 --retry-timeout-increase 0 --enable-retry ${XPU_TIMEOUT_OVERRIDES}"
+          docker exec -e SGLANG_IS_IN_CI=true ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/test && python3 run_suite.py --hw xpu --suite stage-a-test-1-gpu-xpu,stage-b-test-1-gpu-xpu --timeout-per-file 600 --retry-timeout-increase 0 --enable-retry ${XPU_TIMEOUT_OVERRIDES}"
 
       - name: Cleanup container
         if: always()
@@ -272,9 +273,10 @@ jobs:
           # docker/xpu.Dockerfile that already ships libssl-dev.
           docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang_xpu apt-get update
           docker exec -e DEBIAN_FRONTEND=noninteractive ci_sglang_xpu apt-get install -y libssl-dev
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --upgrade pip
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install pytest expecttest ray huggingface_hub tabulate "lmcache>=0.3.9"
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip uninstall -y flashinfer-python sgl-kernel sglang
+          # Pin the image's torch so test deps (e.g. lmcache) cannot swap in a CUDA build.
+          docker exec ci_sglang_xpu bash -c "uv pip freeze --python /opt/venv/bin/python3 | grep -iE '^(torch|torchvision|torchaudio|triton-xpu)==' > /tmp/image-pins.txt"
+          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 -c /tmp/image-pins.txt pytest expecttest ray huggingface_hub tabulate "lmcache>=0.3.9"
+          docker exec ci_sglang_xpu uv pip uninstall --python /opt/venv/bin/python3 flashinfer-python sgl-kernel sglang
           docker exec ci_sglang_xpu cp /sglang-checkout/python/pyproject_xpu.toml /sglang-checkout/python/pyproject.toml
           # Fetch tags so setuptools_scm resolves a real version instead of
           # falling back to 0.0.0 on a shallow/tag-less checkout.
@@ -288,7 +290,7 @@ jobs:
         run: |
           # xpu_b60.json is seeded with this flag on; without it the SYCL queue
           # is deep enough that step timings record host enqueue, not device time.
-          docker exec -e SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1 ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/python && python3 sglang/multimodal_gen/test/run_suite.py --suite 1-gpu-xpu"
+          docker exec -e SGLANG_IS_IN_CI=true -e SGLANG_DIFFUSION_SYNC_STAGE_PROFILING=1 ci_sglang_xpu bash -c "source /opt/venv/bin/activate && cd /sglang-checkout/python && python3 sglang/multimodal_gen/test/run_suite.py --suite 1-gpu-xpu"
 
       - name: Cleanup container
         if: always()

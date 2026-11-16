@@ -636,12 +636,3 @@ def fused_recurrent_linear_replayssm_decode(
         num_stages=num_stages,
     )
     return out, initial_state
-
-
-# Backwards-compatible aliases: the original GDN-only names. Existing callers
-# (backend dispatch, tests, microbench) keep working; ``is_kda`` defaults to
-# False so these are the GDN path unchanged.
-fused_recurrent_gdn_replayssm_decode_kernel = (
-    fused_recurrent_linear_replayssm_decode_kernel
-)
-fused_recurrent_gdn_replayssm_decode = fused_recurrent_linear_replayssm_decode

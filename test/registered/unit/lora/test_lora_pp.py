@@ -13,6 +13,7 @@
 # ==============================================================================
 
 import unittest
+from copy import deepcopy
 from types import SimpleNamespace
 from unittest import mock
 
@@ -23,12 +24,14 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
 from sglang.srt.lora.eviction_policy import get_eviction_policy
 from sglang.srt.lora.lora_drainer import LoRADrainer
 from sglang.srt.lora.lora_manager import LoRAManager
 from sglang.srt.lora.mem_pool import EMPTY_SLOT, LoRAMemoryPool
 from sglang.srt.lora.utils import LoRAType
-from sglang.srt.managers.schedule_policy import AddReqResult
+from sglang.srt.managers.schedule_policy import AddReqResult, SchedulePolicy
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.metrics_reporter import (
     SchedulerMetricsReporter,
@@ -37,8 +40,10 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.runtime_context import get_context, get_parallel
+from sglang.test.scheduler_test_utils import FakeReq
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -106,18 +111,27 @@ class TestAllPPLoras(CustomTestCase):
 
     @mock.patch("time.monotonic", return_value=100.0)
     def test_draining_uses_all_micro_batches(self, _clock):
+        self._check_draining_uses_all_micro_batches(bounded_active=False)
+
+    @mock.patch("time.monotonic", return_value=100.0)
+    def test_draining_uses_all_micro_batches_with_bounded_admission(self, _clock):
+        self._check_draining_uses_all_micro_batches(bounded_active=True)
+
+    def _check_draining_uses_all_micro_batches(self, *, bounded_active):
         def request(lora_id, max_new_tokens):
-            req = _req(lora_id)
-            req.sampling_params = SimpleNamespace(max_new_tokens=max_new_tokens)
-            req.output_ids = []
-            req.is_retracted = False
-            req.time_stats = SimpleNamespace(wait_queue_entry_time=0.0)
-            return req
+            return FakeReq(
+                lora_id=lora_id,
+                finished=lambda: False,
+                sampling_params=SimpleNamespace(max_new_tokens=max_new_tokens),
+                output_ids=[],
+                is_retracted=False,
+                time_stats=SimpleNamespace(wait_queue_entry_time=0.0),
+            )
 
         short, long = request("short", 5), request("long", 100)
         waiting = request("waiting", 100)
         waiting_queue = IndexedReqList(ListKind.WAITING)
-        waiting_queue.join([waiting])
+        move([waiting], waiting_queue)
         first, second = _batch(short), _batch(long)
         for batch in (first, second):
             batch.batch_is_full = False
@@ -144,12 +158,18 @@ class TestAllPPLoras(CustomTestCase):
             dllm_config=None,
             grammar_manager=SimpleNamespace(has_waiting_grammars=lambda: False),
             policy=mock.Mock(
-                calc_priority=lambda waiting, *args, **kwargs: list(waiting)
+                spec=SchedulePolicy,
+                _bounded_active=bounded_active,
+                calc_priority=lambda waiting, *args, **kwargs: list(waiting),
+                admission_candidates=mock.Mock(side_effect=iter),
+                allows_admission=mock.Mock(return_value=True),
             ),
             processed_tokens_counter=0,
             disagg_prefill_bootstrap_queue=None,
+            disagg_prefill_transfer_queue=None,
             get_num_allocatable_reqs=lambda *args, **kwargs: 1,
             get_prefill_adder_class=lambda: lambda *args, **kwargs: adder,
+            request_retirer=None,
             page_size=1,
             tree_cache=SimpleNamespace(buffer_pipeline=None),
             token_to_kv_pool_allocator=SimpleNamespace(state_slots=None),
@@ -188,6 +208,15 @@ class TestAllPPLoras(CustomTestCase):
                     waiting, {req.lora_id for req in scheduler._get_all_pp_reqs()}
                 )
             )
+
+        if bounded_active:
+            self.assertEqual(scheduler.policy.admission_candidates.call_count, 4)
+            self.assertEqual(scheduler.policy.allows_admission.call_count, 4)
+        else:
+            scheduler.policy.admission_candidates.assert_not_called()
+            scheduler.policy.allows_admission.assert_not_called()
+        # The exhausted pass budget stops before any temporary LoRA skip.
+        scheduler.policy.mark_admission_skipped.assert_not_called()
 
 
 class TestFetchKeepsLiveAdapters(CustomTestCase):
@@ -284,6 +313,59 @@ def _load_into_mem_pool(pool, uid, adapter):
 
 
 class TestStagePool(CustomTestCase):
+    def test_hybrid_mlp_allocates_dense_and_expert_buffers_on_local_stage(self):
+        """A dense prefix needs 3D buffers even without shared experts; off-stage
+        layers must still be left unallocated."""
+        config = SimpleNamespace(
+            num_hidden_layers=3,
+            hidden_size=8,
+            num_attention_heads=2,
+            num_key_value_heads=2,
+            intermediate_size=16,
+            moe_intermediate_size=8,
+            num_experts=2,
+        )
+        model = torch.nn.Module()
+        model.config = config
+        model.register_parameter("anchor", torch.nn.Parameter(torch.empty(0)))
+        dense = torch.nn.Module()
+        dense.gate_up_proj = ReplicatedLinear(8, 32, bias=False)
+        dense.down_proj = ReplicatedLinear(16, 8, bias=False)
+        experts = FusedMoE.__new__(FusedMoE)
+        torch.nn.Module.__init__(experts)
+        model.layers = torch.nn.ModuleList([dense, experts, deepcopy(dense)])
+        for has_dense in (True, False):
+            if not has_dense:
+                model.layers[0] = torch.nn.Module()
+                model.layers[2] = torch.nn.Module()
+            with (
+                self.subTest(has_dense=has_dense),
+                get_parallel().override(tp_size=1, tp_rank=0, attn_tp_size=1),
+            ):
+                pool = LoRAMemoryPool(
+                    base_hf_config=config,
+                    max_loras_per_batch=1,
+                    dtype=torch.float32,
+                    max_lora_rank=2,
+                    target_modules={"gate_up_proj", "down_proj"},
+                    base_model=model,
+                    eviction_policy="lru",
+                    lora_added_tokens_size=0,
+                    lora_layer_ids=[0, 1],
+                    has_embed_tokens_lora=False,
+                    has_lm_head_lora=False,
+                )
+                for buffer in (pool.A_buffer, pool.B_buffer):
+                    for name in ("gate_up_proj", "down_proj"):
+                        self.assertEqual(name in buffer, has_dense)
+                        if has_dense:
+                            self.assertEqual(buffer[name][0].ndim, 3)
+                            self.assertIsNone(buffer[name][1])
+                            self.assertIsNone(buffer[name][2])
+                        self.assertEqual(buffer[name + "_moe"][0].ndim, 4)
+                        self.assertEqual(buffer[name + "_moe"][1].ndim, 4)
+                        self.assertIsNone(buffer[name + "_moe"][2])
+
     def test_each_stage_allocates_and_loads_only_its_part(self):
         first = _stage_pool(layers=[0, 1], embed_tokens=True)
         last = _stage_pool(layers=[2, 3], lm_head=True, added_tokens_size=1)

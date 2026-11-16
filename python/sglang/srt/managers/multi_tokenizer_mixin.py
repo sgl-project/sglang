@@ -27,6 +27,7 @@ import pickle
 import signal
 import sys
 import threading
+import traceback
 import zlib
 from functools import lru_cache
 from multiprocessing import shared_memory
@@ -75,7 +76,6 @@ from sglang.srt.utils import (
     kill_process_tree,
 )
 from sglang.srt.utils.network import get_zmq_socket
-from sglang.utils import get_exception_traceback
 
 if TYPE_CHECKING:
     from sglang.srt.managers.detokenizer_manager import DetokenizerManager
@@ -620,8 +620,9 @@ def run_multi_detokenizer_router_process(
         router = MultiDetokenizerRouter(ipc_name_list, port_args)
         router.event_loop()
     except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"MultiDetokenizerRouter hit an exception: {traceback}")
+        logger.error(
+            f"MultiDetokenizerRouter hit an exception: {traceback.format_exc()}"
+        )
         if router is not None:
             router.socket_mapping.clear_all_sockets()
         parent_process.send_signal(signal.SIGQUIT)
@@ -635,8 +636,7 @@ async def print_exception_wrapper(func):
     try:
         await func()
     except Exception:
-        traceback = get_exception_traceback()
-        logger.error(f"MultiTokenizerRouter hit an exception: {traceback}")
+        logger.error(f"MultiTokenizerRouter hit an exception: {traceback.format_exc()}")
         if hasattr(func, "__self__") and isinstance(
             func.__self__, MultiTokenizerRouter
         ):

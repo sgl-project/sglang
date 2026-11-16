@@ -15,7 +15,7 @@ from typing import Optional
 import aiohttp
 import orjson
 import uvicorn
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Header, HTTPException
 from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from sglang_router.router_args import RouterArgs
 
@@ -291,20 +291,25 @@ async def health_generate():
     return Response(status_code=200)
 
 
-async def _post_role_switch(worker_url, body):
+async def _post_role_switch(worker_url, body, authorization=None):
     """POST the role switch to a backend server; return (status, json)."""
+    headers = {"Authorization": authorization} if authorization else None
     try:
         async with aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=lb.timeout)
         ) as session:
-            async with session.post(f"{worker_url}/pd_role_switch", json=body) as resp:
+            async with session.post(
+                f"{worker_url}/pd_role_switch", json=body, headers=headers
+            ) as resp:
                 return resp.status, await resp.json()
     except Exception as e:  # transport error -> report as a failure
         return 502, {"success": False, "message": str(e)}
 
 
 @app.post("/pd_role_switch")
-async def pd_role_switch(request_data: dict):
+async def pd_role_switch(
+    request_data: dict, authorization: Optional[str] = Header(None)
+):
     """Switch a running server's PD role (prefill<->decode) at runtime and
     update the LB's routing lists. Body: {"worker_url", "new_role":
     "prefill"|"decode", "bootstrap_port"?, "decode_cuda_graph_bs"?,
@@ -315,7 +320,10 @@ async def pd_role_switch(request_data: dict):
     routing lists (so no new requests arrive), then retries the switch while
     the server drains its in-flight requests, and only then registers it
     under the new role. A failed server is restored only when the backend
-    confirms that no role state changed."""
+    confirms that no role state changed.
+
+    The caller's Authorization header is forwarded, since the backend requires
+    its admin API key for a role switch."""
     worker_url = request_data.get("worker_url")
     new_role = request_data.get("new_role")
     if worker_url is None:
@@ -338,7 +346,7 @@ async def pd_role_switch(request_data: dict):
 
     deadline = asyncio.get_event_loop().time() + drain_timeout
     while True:
-        status, result = await _post_role_switch(worker_url, body)
+        status, result = await _post_role_switch(worker_url, body, authorization)
         if status == 200 and result.get("success", False):
             break
         # The backend rejects while not idle; keep retrying as it drains.

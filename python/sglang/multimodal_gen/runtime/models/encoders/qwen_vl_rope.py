@@ -5,9 +5,9 @@ from typing import Any
 
 import torch
 
+from sglang.srt.hf_transformers.common import get_rope_config
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
-from sglang.srt.utils.hf_transformers.common import get_rope_config
 
 
 def build_qwen_vl_text_rope(

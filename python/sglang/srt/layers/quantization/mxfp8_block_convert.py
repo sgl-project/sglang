@@ -12,9 +12,12 @@ native DeepSeek-V3 block-fp8 kernels (aiter / triton). The conversion is:
 
 from __future__ import annotations
 
+from functools import lru_cache
 from typing import Tuple
 
 import torch
+
+from sglang.srt.utils.device import is_gfx95_supported, is_gfx942_supported
 
 MXFP8_BLOCK_SIZE = 32
 
@@ -70,3 +73,18 @@ def convert_mxfp8_weight_to_block_fp8(
     """
     bf16 = dequant_mxfp8_2d_to_bf16(weight, scale_u8)
     return bf16_to_block_fp8_128(bf16, block=block)
+
+
+@lru_cache(maxsize=1)
+def mxfp8_block_convert_required():
+    """Whether MXFP8 weights must be converted to block-fp8 [128,128] at load.
+
+    gfx942 (CDNA3) has no hardware MX-scaled matmul: ``tl.dot_scaled`` fails to
+    lower and the gfx950 ``mfma_scale`` intrinsics are unavailable. So MXFP8
+    checkpoints there are converted to block-fp8 [128,128] at load and run
+    through the native block-fp8 kernels. gfx95 keeps its native MX path (this
+    returns False there).
+    """
+    if not torch.version.hip:
+        return False
+    return is_gfx942_supported() and not is_gfx95_supported()

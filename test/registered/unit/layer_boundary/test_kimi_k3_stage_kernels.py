@@ -5,6 +5,7 @@ With SGLANG_K3_SP_ATTN_RES the bank and the stream stay on each rank's shard
 across SP-MoE layers."""
 
 import unittest
+from contextlib import contextmanager
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -34,7 +35,21 @@ CONFIG = SimpleNamespace(
     moe_layer_freq=1,
     routed_expert_hidden_size=2,
     num_hidden_layers=4,
+    is_kda_layer=lambda layer_idx: False,
 )
+
+
+@contextmanager
+def k3_planning(parallel, **options):
+    """fixture.planning, also for the parallel layout K3's own declaration
+    code reads (prefill CP, pipeline width)."""
+    if not hasattr(parallel, "pp_size"):
+        parallel.pp_size = 1
+    with (
+        fixture.planning(parallel, **options),
+        patch.object(kimi_k3, "get_parallel", lambda: parallel),
+    ):
+        yield
 
 
 def moe_layer(*, bank, sp_moe, all_reduce_fusion):
@@ -80,7 +95,7 @@ def declare(layers, *, sp_moe, carries=False, sp_collective=True, config=CONFIG)
             return_value=SimpleNamespace(speculative_algorithm=None),
         ),
         envs.SGLANG_K3_SP_ATTN_RES.override(carries),
-        fixture.planning(
+        k3_planning(
             parallel,
             a2a=sp_moe,
             boundary_reduction="ar",

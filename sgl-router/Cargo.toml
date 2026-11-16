@@ -56,8 +56,10 @@ reqwest = { version = "0.12", features = ["stream", "json", "rustls-tls", "http2
 # Named directly for `Error::is_incomplete_message`, which reqwest does not expose.
 hyper = "1"
 sgl-kv-indexer = { path = "sgl-kv-indexer" }
-# Native SglangService gRPC types, shared with the engine (proto/sglang/runtime/v1).
+# sglang.api.v1 types for the typed generate response.
 sglang-api-types = { path = "../rust/sglang-api-types" }
+# Native SglangService gRPC types, shared with the engine (proto/sglang/runtime/v1).
+sglang-runtime-v1-types = { path = "../rust/sglang-runtime-v1-types" }
 tonic = { version = "0.14.6", features = ["transport"] }
 
 # Serialization

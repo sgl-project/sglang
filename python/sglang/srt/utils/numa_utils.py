@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import ctypes
 import glob
 import logging
@@ -10,13 +12,15 @@ import subprocess
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils import get_cpu_ids_by_node, is_cuda, is_xpu
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
 
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()

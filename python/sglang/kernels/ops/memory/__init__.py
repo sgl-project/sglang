@@ -19,6 +19,8 @@ _TRITON_KERNELS = [
     ("virtual_slot", "free_unbind_inplace"),
     ("virtual_slot", "bind_inplace"),
     ("virtual_slot", "translate_token_ids"),
+    ("page_pack", "pack_pairs"),
+    ("page_pack", "remap_packed_pages"),
 ]
 for _mod, _fn in _TRITON_KERNELS:
     register_kernel(
@@ -34,13 +36,6 @@ __all__ = []
 
 
 # Migrated from srt/layers (RFC #29630, Phase 2.5).
-register_kernel(
-    KernelSpec(
-        op="memory.gpu_tensor_hash",
-        backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.memory.gpu_tensor_hash:gpu_tensor_hash",
-    )
-)
 register_kernel(
     KernelSpec(
         op="memory.gpu_tensor_blake3",
@@ -80,7 +75,7 @@ register_kernel(
     KernelSpec(
         op="memory.small_field_copy",
         backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.memory.small_field_copy:small_field_copy",
+        target="sglang.kernels.ops.memory.small_field_copy:SmallFieldCopyPlan",
         capabilities=CUDA_ONLY,
     )
 )
@@ -90,5 +85,13 @@ register_kernel(
         backend=KernelBackend.JIT,
         target="sglang.kernels.ops.memory.row_compact:row_compact_bf16",
         capabilities=CUDA_ONLY,
+    )
+)
+
+register_kernel(
+    KernelSpec(
+        op="memory.interleave_rows",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.memory.interleave_rows:interleave_rows",
     )
 )

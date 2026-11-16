@@ -28,6 +28,8 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
 register_amd_ci(est_time=35, stage="jit-kernel-unit", runner_config="amd")
+# backend-specific: the topk_length prefill path is gfx950-only.
+register_amd_ci(est_time=35, suite="stage-b-test-1-gpu-small-amd-mi35x")
 pytestmark = pytest.mark.skipif(not is_hip(), reason="ROCm only")
 
 _IS_GFX950 = is_hip() and _is_gfx950_sparse_mla_fp8(
