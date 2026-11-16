@@ -128,7 +128,8 @@ class DraftKVNamespace(
     algorithm: str
     # Operator-declared identity of the draft weights.
     draft_id: str
-    # "packed": rows appended to the target's page block.
+    # "packed": rows appended to the target's page block. "sidecar": a host
+    # pool of its own, whose pages are stored whole.
     placement: str
     # Logical dtype of the draft KV, which need not be the target's.
     dtype: str
@@ -250,7 +251,9 @@ class UnifiedKVPlan(msgspec.Struct, frozen=True, kw_only=True):
     # Head groups, or a single whole-pool range for rank-replicated pools.
     head_ranges: list[tuple[int, int]]
     # Set by with_packed_draft(): the trailing layer range and its suffixes
-    # then name packed draft rows instead of model layers.
+    # then name packed draft rows instead of model layers. Set by
+    # plan_unified_draft_sidecar(): every suffix names draft rows of a pool
+    # of its own, and ``namespace`` is the target's they belong to.
     draft_namespace: DraftKVNamespace | None = None
 
     @property
@@ -460,6 +463,84 @@ def with_packed_draft(
             (target_layer_num, target_layer_num + draft_layer_num),
         ],
         head_ranges=plan.head_ranges,
+        draft_namespace=namespace,
+    )
+
+
+def plan_unified_draft_sidecar(
+    *,
+    target: KVCacheNamespace,
+    algorithm: str,
+    draft_id: str,
+    dtype: str,
+    rank_replicated: bool,
+    local_kv_heads: int,
+    row_width: int,
+    layer_num: int,
+    attn_tp_rank: int,
+    attn_tp_size: int,
+    attn_cp_size: int,
+    head_group: int | None = None,
+) -> UnifiedKVPlan:
+    """Name the pages of a draft KV pool beside the target's as chunks.
+
+    The pool has its own geometry, layer count and dtype, hence its own head
+    grid: ``head_group`` is the fleet's kv heads per chunk applied to the
+    draft's heads. All draft layers of a head group form one chunk. The plan
+    holds the draft chunks alone; the target's are planned by plan_unified_kv().
+
+    Raises rather than degrading, like plan_unified_kv().
+    """
+    if layer_num <= 0:
+        raise ValueError(f"layer_num must be positive: {layer_num}")
+    if not algorithm or not draft_id:
+        raise ValueError(
+            "draft chunks need the speculative algorithm and a draft id: an "
+            "empty one would merge different drafts into one keyspace."
+        )
+    if attn_cp_size > 1:
+        # Only CP rank 0 writes, and an existing object is never rewritten.
+        raise NotImplementedError(
+            "The unified key scheme does not store draft KV with prefill context "
+            "parallelism (attn_cp_size > 1)."
+        )
+    total_kv_heads = 0 if rank_replicated else local_kv_heads * attn_tp_size
+    resolved_head_group = _resolve_head_group(
+        rank_replicated=rank_replicated,
+        local_kv_heads=local_kv_heads,
+        attn_tp_size=attn_tp_size,
+        total_kv_heads=total_kv_heads,
+        head_group=head_group,
+    )
+    namespace = DraftKVNamespace(
+        target=namespace_digest(target),
+        algorithm=algorithm,
+        draft_id=draft_id,
+        placement="sidecar",
+        dtype=dtype,
+        rank_replicated=rank_replicated,
+        total_kv_heads=total_kv_heads,
+        head_group=resolved_head_group,
+        row_width=row_width,
+        layer_num=layer_num,
+        object_layout=PAGE_UNIFIED_OBJECT_LAYOUT,
+    )
+    coord = f"{draft_namespace_digest(namespace)}_D0-{layer_num}"
+    if rank_replicated:
+        suffixes, head_ranges = [coord], [(0, 1)]
+    else:
+        groups_per_rank = local_kv_heads // resolved_head_group
+        first_head_index = attn_tp_rank * groups_per_rank
+        suffixes = [f"{coord}_H{first_head_index + i}" for i in range(groups_per_rank)]
+        head_ranges = [
+            (i * resolved_head_group, (i + 1) * resolved_head_group)
+            for i in range(groups_per_rank)
+        ]
+    return UnifiedKVPlan(
+        namespace=target,
+        suffixes=suffixes,
+        layer_ranges=[(0, layer_num)],
+        head_ranges=head_ranges,
         draft_namespace=namespace,
     )
 

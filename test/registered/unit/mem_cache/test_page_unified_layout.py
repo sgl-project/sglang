@@ -15,6 +15,7 @@ from sglang.srt.mem_cache.hicache_key_scheme import (
     draft_namespace_digest,
     namespace_digest,
     normalize_dtype,
+    plan_unified_draft_sidecar,
     plan_unified_kv,
     validate_unified_chunk_tiling,
     with_packed_draft,
@@ -499,6 +500,168 @@ class TestDraftNamespaceIdentity(CustomTestCase):
         )
         self.assertEqual(base.draft_namespace.dtype, "float8_e4m3fn")
         self.assertEqual(other_dtype.draft_namespace.dtype, "float8_e5m2")
+
+
+class TestSidecarDraftPlan(CustomTestCase):
+    """A draft KV pool of its own: all its layers of a head group are one chunk."""
+
+    TARGET = dict(
+        model_id="org/model",
+        dtype="bfloat16",
+        page_size=64,
+        rank_replicated=False,
+        total_kv_heads=8,
+        head_group=2,
+    )
+
+    def _sidecar(self, **overrides):
+        kwargs = dict(
+            target=derive_namespace(**self.TARGET),
+            algorithm="DFLASH",
+            draft_id="org/dflash@main",
+            dtype="bfloat16",
+            rank_replicated=False,
+            local_kv_heads=4,
+            row_width=128,
+            layer_num=5,
+            attn_tp_rank=1,
+            attn_tp_size=2,
+            attn_cp_size=1,
+            head_group=2,
+        )
+        kwargs.update(overrides)
+        return plan_unified_draft_sidecar(**kwargs)
+
+    def _layout(self, plan, *, heads=4, mla=False):
+        return PageUnifiedLayout(
+            page_size=64,
+            layer_num=5,
+            head_num=1 if mla else heads,
+            head_group_num=plan.head_group_num,
+            head_dim=128,
+            itemsize=2,
+            is_mla=mla,
+        )
+
+    def test_mha_draft_chunks_tile_the_draft_page(self):
+        # 5 layers x 8 kv heads x 128 in bfloat16 at TP2 with 2 heads a chunk:
+        # rank 1 owns head groups 2 and 3 of 4.
+        plan = self._sidecar()
+        digest = draft_namespace_digest(plan.draft_namespace)
+        self.assertEqual(plan.suffixes, [f"{digest}_D0-5_H2", f"{digest}_D0-5_H3"])
+        layout = self._layout(plan)
+        self.assertEqual(layout.bytes_per_page, 655360)
+        spans = plan.chunk_spans(layout)
+        self.assertEqual(spans, [(0, 327680), (327680, 327680)])
+        validate_unified_chunk_tiling(spans, layout.bytes_per_page)
+        self.assertEqual(
+            self._sidecar(attn_tp_rank=0).suffixes,
+            [f"{digest}_D0-5_H0", f"{digest}_D0-5_H1"],
+        )
+
+    def test_tp_shards_of_the_draft_grid_cover_each_other(self):
+        tp1 = self._sidecar(local_kv_heads=8, attn_tp_rank=0, attn_tp_size=1)
+        tp2 = [self._sidecar(attn_tp_rank=rank) for rank in range(2)]
+        tp4 = [
+            self._sidecar(local_kv_heads=2, attn_tp_rank=rank, attn_tp_size=4)
+            for rank in range(4)
+        ]
+        self.assertEqual(tp1.suffixes, [s for plan in tp2 for s in plan.suffixes])
+        self.assertEqual(tp1.suffixes, [s for plan in tp4 for s in plan.suffixes])
+        self.assertEqual(len(set(tp1.suffixes)), 4)
+
+    def test_unset_head_partition_shares_only_within_one_tp_size(self):
+        tp1 = self._sidecar(
+            local_kv_heads=8, attn_tp_rank=0, attn_tp_size=1, head_group=None
+        )
+        tp2 = self._sidecar(head_group=None)
+        self.assertEqual(tp1.draft_namespace.head_group, 8)
+        self.assertEqual(tp2.draft_namespace.head_group, 4)
+        self.assertFalse(set(tp1.suffixes) & set(tp2.suffixes))
+
+    def test_replicated_draft_is_one_chunk_without_a_head_coordinate(self):
+        plans = [
+            self._sidecar(rank_replicated=True, local_kv_heads=1, attn_tp_rank=rank)
+            for rank in range(2)
+        ]
+        self.assertEqual(plans[0].suffixes, plans[1].suffixes)
+        (suffix,) = plans[0].suffixes
+        self.assertTrue(suffix.endswith("_D0-5"))
+        self.assertEqual(plans[0].draft_namespace.total_kv_heads, 0)
+        self.assertEqual(plans[0].draft_namespace.head_group, 0)
+        layout = self._layout(plans[0], mla=True)
+        self.assertEqual(plans[0].chunk_spans(layout), [(0, layout.bytes_per_page)])
+
+    def test_draft_is_bound_to_its_target_and_named_by_its_own_facts(self):
+        base = self._sidecar()
+        namespace = base.draft_namespace
+        self.assertEqual(
+            namespace,
+            DraftKVNamespace(
+                target=namespace_digest(derive_namespace(**self.TARGET)),
+                algorithm="DFLASH",
+                draft_id="org/dflash@main",
+                placement="sidecar",
+                dtype="bfloat16",
+                rank_replicated=False,
+                total_kv_heads=8,
+                head_group=2,
+                row_width=128,
+                layer_num=5,
+                object_layout="page-unified-v1",
+            ),
+        )
+        changes = dict(
+            target=derive_namespace(**{**self.TARGET, "model_id": "org/other"}),
+            algorithm="DSPARK",
+            draft_id="org/other-dflash@main",
+            dtype="float8_e4m3fn",
+            row_width=64,
+            layer_num=3,
+            head_group=4,
+        )
+        keys = {base.suffixes[0]}
+        for field, value in changes.items():
+            with self.subTest(field):
+                suffix = self._sidecar(**{field: value}).suffixes[0]
+                self.assertNotIn(suffix, keys)
+                keys.add(suffix)
+        # Never a packed draft's keyspace, whatever else agrees.
+        packed = DraftKVNamespace(
+            **{
+                **{f: getattr(namespace, f) for f in namespace.__struct_fields__},
+                "placement": "packed",
+            }
+        )
+        self.assertNotEqual(
+            draft_namespace_digest(packed), draft_namespace_digest(namespace)
+        )
+
+    def test_unsafe_sidecar_plans_are_refused(self):
+        with self.assertRaisesRegex(NotImplementedError, "context parallelism"):
+            self._sidecar(attn_cp_size=2)
+        with self.assertRaisesRegex(NotImplementedError, "1 kv head per rank"):
+            self._sidecar(local_kv_heads=1, head_group=None)
+        for field in ("algorithm", "draft_id"):
+            with self.subTest(field), self.assertRaisesRegex(ValueError, "draft id"):
+                self._sidecar(**{field: ""})
+        with self.assertRaisesRegex(ValueError, "must divide this rank's 4"):
+            self._sidecar(head_group=3)
+        with self.assertRaisesRegex(ValueError, "layer_num"):
+            self._sidecar(layer_num=0)
+        # A page cut into other head groups than the plan's cannot be named.
+        plan = self._sidecar()
+        with self.assertRaisesRegex(ValueError, "2 head groups.*holds 1"):
+            plan.chunk_spans(
+                PageUnifiedLayout(
+                    page_size=64,
+                    layer_num=5,
+                    head_num=4,
+                    head_group_num=1,
+                    head_dim=128,
+                    itemsize=2,
+                )
+            )
 
 
 class TestNamespaceIdentity(CustomTestCase):
