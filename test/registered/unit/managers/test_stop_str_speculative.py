@@ -7,6 +7,7 @@ a fake tokenizer; pure CPU. Each test guards a distinct branch of
 
 import unittest
 from array import array
+from itertools import permutations
 
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -67,6 +68,57 @@ def _make_req(output_ids, stop=None, stop_regex=None, eos_token_ids=frozenset())
 
 
 class TestStopStrSpeculative(unittest.TestCase):
+    def test_earliest_stop_is_independent_of_list_order_and_type(self):
+        for stops in permutations([r"b\.", r"a\."]):
+            for kind in ("string", "regex", "mixed"):
+                with self.subTest(stops=stops, kind=kind):
+                    strings = [s.replace("\\", "") for s in stops]
+                    options = {
+                        "string": {"stop": strings},
+                        "regex": {"stop_regex": list(stops)},
+                        "mixed": {"stop": strings[:1], "stop_regex": list(stops[1:])},
+                    }
+                    req = _make_req([60, 61, 62, 63], **options[kind])
+                    req.update_finish_state(new_accepted_len=4)
+                    self.assertTrue(req.finished())
+                    self.assertEqual(req.finished_len, 2)
+                    self.assertEqual(list(req.output_ids_through_stop), [60, 61])
+                    self.assertIn(req.finished_reason.matched, ("a.", r"a\."))
+
+    def test_transient_regex_beats_later_stop_string(self):
+        req = _make_req([60, 61, 62], stop=["b"], stop_regex=[r"\.$"])
+        req.update_finish_state(new_accepted_len=3)
+        self.assertEqual(req.finished_len, 2)
+        self.assertEqual(req.finished_reason.matched, r"\.$")
+
+    def test_earlier_eos_beats_later_text_stop(self):
+        for kind in ("string", "regex"):
+            with self.subTest(kind=kind):
+                req = _make_req(
+                    [60, EOS_ID, STOP_ID],
+                    stop=["STOP"] if kind == "string" else None,
+                    stop_regex=["STOP"] if kind == "regex" else None,
+                    eos_token_ids={EOS_ID},
+                )
+                req.update_finish_state(new_accepted_len=3)
+                self.assertEqual(req.finished_len, 2)
+                self.assertEqual(req.finished_reason.matched, EOS_ID)
+                self.assertEqual(list(req.output_ids_through_stop), [60, EOS_ID])
+
+    def test_earliest_stop_inside_length_cap_beats_later_stop(self):
+        req = _make_req([60, 61, 62, 63], stop=["b.", "a."])
+        req.sampling_params.max_new_tokens = 3
+        req.update_finish_state(new_accepted_len=4)
+        self.assertEqual(req.finished_len, 2)
+        self.assertEqual(req.finished_reason.matched, "a.")
+
+    def test_invalid_regex_preserves_abort_at_length_cap(self):
+        req = _make_req([60, 61])
+        req.sampling_params.stop_regex_strs = ["("]
+        req.sampling_params.max_new_tokens = 1
+        req.update_finish_state(new_accepted_len=2)
+        self.assertEqual(req.finished_reason.to_json()["type"], "abort")
+
     def test_no_stop_does_not_finish(self):
         req = _make_req([10, 11, 12, 20, 21, 22, 23, 24], stop=["STOP"])
         req.update_finish_state(new_accepted_len=6)
