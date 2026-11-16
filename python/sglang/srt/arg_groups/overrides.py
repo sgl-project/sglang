@@ -1125,10 +1125,11 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
         view.flashinfer_allreduce_fusion_backend is None
         and (is_mimo or model_arch in _FLASHINFER_ALLREDUCE_FUSION_ARCHS)
         and not prefer_custom_dsv41
-        and (get_platform().is_sm90 or get_platform().is_sm100)
+        # SM90 is left out: on H200 the custom all-reduce plus fused add-RMSNorm
+        # was as fast or faster for the MoE models measured; opt in via the flag.
+        and get_platform().is_sm100
         and view.tp_size > 1
         and not attn_dp_enabled_of(view)
-        and (view.nnodes == 1 or get_platform().is_sm100)
         and view.moe_a2a_backend == "none"
     ):
         if is_confidential_compute():
