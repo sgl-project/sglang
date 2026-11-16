@@ -2853,7 +2853,9 @@ class MMReceiverGrpc(MMReceiverBase):
         endpoint_encode,
         num_items_assigned=None,
         encode_urls=None,
+        time_stats_json=None,
     ):
+        # time_stats_json is not sent: the gRPC EncodeRequest has no field for it.
         if not mm_data:
             return
 
