@@ -1,11 +1,5 @@
-"""Parity for the row-streamed KDA ReplaySSM ring verify.
-
-Checks ``kda_rowstream_verify_ring`` against the recurrent verify kernel
-(``fused_sigmoid_gating_delta_rule_update`` with ``cache_ring=True``), which is
-what the KDA backend dispatches today. The ring entries feed the commit-time
-replay, so they must match bit for bit; the outputs come out of a reassociated
-FP32 sum and are checked to chunked-vs-recurrent tolerance.
-"""
+"""kda_rowstream_verify_ring against the recurrent verify kernel with cache_ring=True:
+ring entries bit-identical, outputs within chunked-vs-recurrent tolerance."""
 
 import unittest
 
@@ -27,9 +21,7 @@ _DTYPE = torch.bfloat16
 
 def _rings(slots, H, HV, K, V, ring_len, device):
     return dict(
-        replayssm_rawv=torch.zeros(
-            slots, HV, ring_len, V, dtype=_DTYPE, device=device
-        ),
+        replayssm_rawv=torch.zeros(slots, HV, ring_len, V, dtype=_DTYPE, device=device),
         replayssm_rawk=torch.zeros(slots, H, ring_len, K, dtype=_DTYPE, device=device),
         replayssm_g=torch.zeros(
             slots, HV, ring_len, K, dtype=torch.float32, device=device
@@ -73,7 +65,6 @@ class TestKDARowstreamVerifyRing(CustomTestCase):
         V,
         lower_bound,
         ring_indices=False,
-        block_v=None,
         batched_ab=False,
     ):
         device = "cuda"
@@ -89,8 +80,6 @@ class TestKDARowstreamVerifyRing(CustomTestCase):
             rows = None
 
         if batched_ab:
-            # The KDA backend hands the gating inputs over with a leading
-            # batch axis of 1; both layouts must dispatch the same way.
             inp["a"] = inp["a"].unsqueeze(0)
             inp["b"] = inp["b"].unsqueeze(0)
         state_before = inp["state"].clone()
@@ -132,7 +121,6 @@ class TestKDARowstreamVerifyRing(CustomTestCase):
             draft_token_num=T,
             ring_indices=rows,
             lower_bound=lower_bound,
-            block_v=block_v,
             **new_ring,
         )
 
@@ -145,14 +133,11 @@ class TestKDARowstreamVerifyRing(CustomTestCase):
         # Verify never mutates the committed state pool.
         torch.testing.assert_close(inp["state"], state_before, atol=0, rtol=0)
 
-    def test_safe_gate(self):
-        self._check(B=3, T=6, H=2, HV=2, K=128, V=128, lower_bound=-5.0)
-
     def test_softplus_gate(self):
-        self._check(B=2, T=6, H=2, HV=2, K=128, V=128, lower_bound=None, block_v=128)
+        self._check(B=2, T=6, H=2, HV=2, K=128, V=128, lower_bound=None)
 
     def test_gqa_small_head(self):
-        self._check(B=2, T=8, H=1, HV=2, K=64, V=64, lower_bound=-5.0, block_v=32)
+        self._check(B=2, T=8, H=1, HV=2, K=64, V=64, lower_bound=-5.0)
 
     def test_request_scoped_ring_indices(self):
         self._check(
@@ -160,7 +145,9 @@ class TestKDARowstreamVerifyRing(CustomTestCase):
         )
 
     def test_batched_gating_inputs(self):
-        self._check(B=3, T=6, H=2, HV=2, K=128, V=128, lower_bound=-5.0, batched_ab=True)
+        self._check(
+            B=3, T=6, H=2, HV=2, K=128, V=128, lower_bound=-5.0, batched_ab=True
+        )
 
     def test_glm5_shape(self):
         self._check(B=20, T=6, H=64, HV=64, K=128, V=128, lower_bound=-5.0)

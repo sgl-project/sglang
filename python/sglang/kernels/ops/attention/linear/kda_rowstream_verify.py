@@ -1,42 +1,15 @@
 """Row-streamed KDA chain verify for ReplaySSM ring mode.
 
-In ReplaySSM ring mode (``--enable-linear-replayssm-spec``) the dense chain
-verify produces exactly two things the engine consumes: the per-token outputs
-and the ring entries (raw k / raw v / gate / beta). It never needs the per-step
-state snapshots nor the final state -- the commit fold replays the ring. The
-generic recurrent kernel (``fused_sigmoid_gating_delta_rule_update``) still
-materialises ``h_t`` in registers and walks the draft window one token at a
-time: every step does a full ``[K, BV]`` decay, a cross-lane k-reduction, a
-rank-1 update and a cross-lane q-reduction, i.e. ``4 * T`` serial full-tile
-passes with two block reductions each.
+Ring mode consumes only the per-token outputs and the ring entries, so each row's
+state tile ``h0`` is read once and the draft window is applied in chunked form::
 
-This kernel streams each row's state tile ``h0`` once and applies all ``T``
-steps in chunked (WY) form against that single tile::
+    G_t  = sum_{s<=t} g_s                        (per-K, log space)
+    W    = (exp(G) * k_hat) @ h0,  Qh = (exp(G) * q_hat) @ h0
+    A_ts = k_hat_t . (exp(G_t - G_s) k_hat_s), s <  t
+    M_ts = q_hat_t . (exp(G_t - G_s) k_hat_s), s <= t
+    u_t  = beta_t (v_t - W_t - sum_{s<t} A_ts u_s);   o = Qh + M @ u
 
-    G_t   = sum_{s<=t} g_s                           (per-K, log space)
-    W     = (exp(G) * k_hat) @ h0                    [T, BV]
-    Qh    = (exp(G) * q_hat) @ h0                    [T, BV]
-    A_ts  = k_hat_t . (exp(G_t - G_s) * k_hat_s)     s <  t   (state-free)
-    M_ts  = q_hat_t . (exp(G_t - G_s) * k_hat_s)     s <= t   (state-free)
-    u_t   = beta_t * (v_t - W_t - sum_{s<t} A_ts u_s)
-    o     = Qh + M @ u
-
-which is the closed form of the sequential recurrence
-
-    h_t = exp(g_t) h_{t-1} + k_t u_t^T
-    u_t = beta_t (v_t - (exp(g_t) h_{t-1})^T k_t)
-    o_t = h_t^T q_t
-
-that ``fused_sigmoid_gating_delta_rule_update`` evaluates step by step. All four
-contractions become ``tl.dot``s, and the only serial chain left is the
-``T x T`` forward substitution, which never touches the state tile.
-
-The ring entries are formed from the same expressions, at the same point in the
-kernel (pre-l2norm k, pre-delta v, in-kernel gate/beta), so the commit-time
-replay sees bit-identical inputs. The outputs are not bit-identical to the
-recurrent kernel -- the chunked form reassociates the same sums, exactly as the
-chunked prefill scan does relative to the recurrent one. Measured on MI355X the
-deviation stays within one BF16 ulp of the recurrent output.
+The ring entries are written exactly as the recurrent kernel's CACHE_RING writes them.
 """
 
 from typing import Optional
@@ -47,14 +20,9 @@ import triton.language as tl
 
 # tl.dot requires M >= 16; draft windows are shorter than that.
 _MIN_DOT_M = 16
-# Decay exponents are split into exp(G_t - G_ref) * exp(G_ref - G_s) so the pair
-# matrices become one dot. Each half is clamped into the FP32 exponent range,
-# exactly as the chunked KDA prefill scan clamps its own split (chunk_intra.py);
-# a draft window is at most a few tokens, so the clamp is far looser here.
+# clamp for each half of the split decay exponent, as in chunk_intra.py
 _MAX_DECAY_EXP = tl.constexpr(80.0)
-# ROCm lowers an FP32 ``tl.dot`` to the narrow v_mfma_f32_16x16x4_f32 pipe;
-# the 3-way BF16 split keeps ~FP32 accuracy on the wide BF16 MFMA pipe instead.
-# (The chunked KDA prefill scan truncates the same products to plain BF16.)
+# FP32 tl.dot lowers to a narrow MFMA pipe on ROCm; bf16x3 keeps ~FP32 on the wide one
 _DOT_PRECISION = "bf16x3" if torch.version.hip is not None else "ieee"
 
 
@@ -119,8 +87,7 @@ def _kda_rowstream_verify_ring_kernel(
     m_tk = m_t[:, None] & m_k[None, :]
     m_tv = m_t[:, None] & m_v[None, :]
 
-    # Stream the committed state tile once. Issued first so the load latency
-    # overlaps the gate prologue below.
+    # the committed state tile, loaded first to overlap the gate prologue
     idx = tl.load(h0_indices + i_n).to(tl.int64)
     p_h0 = (
         h0_source
@@ -166,9 +133,8 @@ def _kda_rowstream_verify_ring_kernel(
     b_g = tl.where(m_tk, b_g, 0.0)
     b_beta = 1.0 / (1.0 + tl.exp(-b_b))
 
-    # Ring write: raw k (pre-l2norm), raw v (pre-delta), in-kernel gate/beta.
-    # Steps past the ring length are past the committable prefix; dropping them
-    # keeps the write inside this slot (see the recurrent kernel's CACHE_RING).
+    # ring write: raw k (pre-l2norm), raw v (pre-delta), gate, beta; steps past the
+    # ring length are not committable
     if SEPARATE_RING_INDEX:
         ring_slot = tl.load(ring_indices + i_n).to(tl.int64)
     else:
@@ -226,9 +192,8 @@ def _kda_rowstream_verify_ring_kernel(
     b_G = tl.cumsum(b_g, axis=0)
     b_eG = tl.exp(b_G)
 
-    # State-free intra-window pair matrices: A (strictly lower) and M (lower
-    # inclusive). Both contract over K with a per-channel decay, so split the
-    # exponent around the window's last cumulative gate and let one dot do it.
+    # pair matrices A (strictly lower) and M (lower inclusive), the per-channel decay
+    # split around the window's last cumulative gate so each is one dot
     b_G_ref = tl.sum(tl.where((o_t == T - 1)[:, None], b_G, 0.0), 0)
     b_dG = b_G - b_G_ref[None, :]
     b_dec_row = tl.exp(tl.clamp(b_dG, -_MAX_DECAY_EXP, _MAX_DECAY_EXP))
@@ -280,34 +245,16 @@ def kda_rowstream_verify_ring(
     replayssm_g: torch.Tensor,
     replayssm_beta: torch.Tensor,
     ring_indices: Optional[torch.Tensor] = None,
-    scale: Optional[float] = None,
     lower_bound: Optional[float] = None,
-    softplus_beta: float = 1.0,
-    softplus_threshold: float = 20.0,
-    block_v: Optional[int] = None,
-    num_warps: Optional[int] = None,
 ) -> torch.Tensor:
-    """Dense chain target-verify in ReplaySSM ring mode.
-
-    ``q`` / ``k`` are ``[1, N*T, H, K]``, ``v`` is ``[1, N*T, HV, V]``, ``a`` is
-    ``[N*T, HV*K]`` and ``b`` is ``[N*T, HV]`` -- the layout
-    ``fused_sigmoid_gating_delta_rule_update`` takes on the verify path. Returns
-    the per-token outputs shaped like ``v``, and fills the ReplaySSM ring. The
-    committed state pool is never written (verify is ``disable_state_update``).
-    """
+    """Per-token outputs shaped like ``v``; fills the ring, never the state pool.
+    Inputs use the layout ``fused_sigmoid_gating_delta_rule_update`` takes on verify."""
     H, K = q.shape[-2], q.shape[-1]
     HV, V = v.shape[-2], v.shape[-1]
     T = draft_token_num
 
-    if scale is None:
-        scale = K**-0.5
-    if block_v is None:
-        # One CTA per (row, head): the pair matrices above are per-row work, so
-        # splitting V would recompute them once per tile.
-        block_v = V
-    BV = min(block_v, V)
-    if num_warps is None:
-        num_warps = 4
+    # one program per (row, v-head): splitting V would recompute the pair matrices
+    BV = V
     BT = max(_MIN_DOT_M, triton.next_power_of_2(T))
 
     o = torch.empty(v.shape, dtype=q.dtype, device=v.device)
@@ -318,8 +265,8 @@ def kda_rowstream_verify_ring(
         a,
         dt_bias,
         lower_bound if lower_bound is not None else 0.0,
-        softplus_beta,
-        softplus_threshold,
+        1.0,
+        20.0,
         q,
         k,
         v,
@@ -338,7 +285,7 @@ def kda_rowstream_verify_ring(
         replayssm_rawk.stride(0),
         replayssm_g.stride(0),
         replayssm_beta.stride(0),
-        scale,
+        K**-0.5,
         a.stride(-2),
         q.stride(-3),
         k.stride(-3),
@@ -355,7 +302,7 @@ def kda_rowstream_verify_ring(
         USE_LOWER_BOUND=lower_bound is not None,
         SEPARATE_RING_INDEX=ring_indices is not None,
         PREC=_DOT_PRECISION,
-        num_warps=num_warps,
+        num_warps=4,
         num_stages=1,
     )
     return o
