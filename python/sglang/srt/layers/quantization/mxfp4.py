@@ -64,7 +64,6 @@ from sglang.srt.utils import (
     use_intel_amx_backend,
 )
 from sglang.srt.utils.common import get_bool_env_var
-from sglang.srt.utils.custom_op import register_custom_op
 
 # Serialized MXFP4 scales use raw UE8M0 bytes. Keep fresh parameters valid for
 # post-load transforms and dummy initialization; 127 is the neutral scale (1.0).
@@ -268,30 +267,6 @@ def _dequant_mxfp4_to_bf16(packed: torch.Tensor, scale: torch.Tensor) -> torch.T
     return _dequant_mxfp4_to_bf16_torch(packed, scale)
 
 
-def _dequant_mxfp4_fake(
-    x: torch.Tensor, scale: torch.Tensor, float_dtype: torch.dtype
-) -> torch.Tensor:
-    return torch.empty(
-        (*x.shape[:-1], x.shape[-1] * 2), dtype=float_dtype, device=x.device
-    )
-
-
-@register_custom_op(fake_impl=_dequant_mxfp4_fake)
-def dequant_mxfp4(
-    x: torch.Tensor, scale: torch.Tensor, float_dtype: torch.dtype
-) -> torch.Tensor:
-    try:
-        from quark.torch.kernel import mx
-    except ImportError as err:
-        raise ImportError(
-            "The package `amd-quark` is required to use "
-            "MX-FP4 models. Please install it with `pip install "
-            "amd-quark`."
-        ) from err
-
-    return mx.dq_mxfp4(x, scale, float_dtype)
-
-
 class Mxfp4Config(QuantizationConfig):
     def __init__(
         self,
@@ -379,7 +354,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         super().__init__()
 
         self.prefix = prefix
-        self.topk_indices_dtype = None
         self.with_bias = False
         self.use_flashinfer = get_moe_runner_backend().is_flashinfer_mxfp4()
         self.use_marlin = get_moe_runner_backend().is_marlin()
@@ -1772,9 +1746,6 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-
-        from sglang.srt.layers.moe.fused_moe_triton import FusedMoeWeightScaleSupported
-
         w13_weight = torch.nn.Parameter(
             torch.empty(
                 num_experts,
@@ -1810,12 +1781,6 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         )
         layer.register_parameter("w13_weight_scale", w13_weight_scale)
         layer.register_parameter("w2_weight_scale", w2_weight_scale)
-
-        # Add the quantization method used (per tensor/grouped/channel)
-        # to ensure the weight scales are loaded in properly
-        extra_weight_attrs.update(
-            {"quant_method": FusedMoeWeightScaleSupported.TENSOR.value}
-        )
 
         layer.w13_input_scale = None
         layer.w2_input_scale = None
