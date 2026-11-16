@@ -353,7 +353,7 @@ class OpenAI(BaseBackend):
             ret_str = ret.choices[0].text
             ret_token = self.tokenizer.encode(ret_str)[0]
             self.token_usage.prompt_tokens += ret.usage.prompt_tokens
-            self.token_usage.completion_tokens = ret.usage.completion_tokens
+            self.token_usage.completion_tokens += ret.usage.completion_tokens
 
             # TODO:
             # 1. return logits as the scores

@@ -154,10 +154,8 @@ class _FakeTiktoken:
         return [7]
 
 
-class TestOpenAIBackendTokenLimit(CustomTestCase):
-    """Every OpenAI call must carry the one output-length limit its API takes: the
-    completions API has no max_completion_tokens parameter, and a chat call must
-    not send max_tokens and max_completion_tokens together."""
+class _OpenAIBackendTestCase(CustomTestCase):
+    """Runs the OpenAI backend on the real SDK client over a canned transport."""
 
     def setUp(self):
         self.bodies = []
@@ -198,6 +196,12 @@ class TestOpenAIBackendTokenLimit(CustomTestCase):
                 max_retries=0,
                 http_client=httpx.Client(transport=httpx.MockTransport(self._handle)),
             )
+
+
+class TestOpenAIBackendTokenLimit(_OpenAIBackendTestCase):
+    """Every OpenAI call must carry the one output-length limit its API takes: the
+    completions API has no max_completion_tokens parameter, and a chat call must
+    not send max_tokens and max_completion_tokens together."""
 
     def _assert_only_max_tokens(self, expected):
         body = self.bodies[-1]
@@ -255,6 +259,37 @@ class TestOpenAIBackendTokenLimit(CustomTestCase):
 
         self.assertEqual(state["v"], "yes")
         self._assert_only_max_tokens(8)
+
+
+class TestOpenAIBackendAccounting(_OpenAIBackendTestCase):
+    def test_select_adds_to_the_completion_token_total(self):
+        """select must add its completion tokens to the running usage, not replace
+        the total with the count of its last step."""
+        backend = self._backend("gpt-3.5-turbo-instruct", is_chat_model=False)
+
+        @sgl.function
+        def program(s):
+            s += "q" + sgl.gen("a", max_tokens=4)
+            s += sgl.select("c", choices=["yes", "no"])
+
+        program.run(backend=backend, use_thread=False)
+
+        self.assertEqual(len(self.bodies), 2)
+        self.assertEqual(backend.token_usage.completion_tokens, 2)
+
+    def test_bound_function_keeps_api_speculative_execution(self):
+        """bind() must return a function that still runs with the
+        num_api_spec_tokens it was declared with."""
+        backend = self._backend("gpt-4", is_chat_model=True)
+
+        @sgl.function(num_api_spec_tokens=8)
+        def program(s, question):
+            s += sgl.user(question)
+            s += sgl.assistant("A: " + sgl.gen("v", stop="\n"))
+
+        state = program.bind(question="q").run(backend=backend, use_thread=False)
+
+        self.assertEqual(state["v"], "yes")
 
 
 class _FakeAnthropicMessages:
