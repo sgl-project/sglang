@@ -219,7 +219,8 @@ class LogitsProcessorOutput:
     last_hidden_states: Optional[torch.Tensor] = None
 
     ## Part 2: This part will be assigned in python/sglang/srt/layers/sampler.py::Sampler
-    # he log probs of output tokens, if SGLANG_RETURN_ORIGINAL_LOGPROB = True, will get the log probs before applying temperature. If False, will get the log probs before applying temperature.
+    # Log probs of the output tokens. With SGLANG_RETURN_ORIGINAL_LOGPROB set,
+    # they are taken before temperature is applied; otherwise after.
     next_token_logprobs: Optional[torch.Tensor] = None
     # The logprobs and ids of the top-k tokens in output positions. shape: [#seq, k]
     next_token_top_logprobs_val: Optional[List] = None
@@ -1113,12 +1114,7 @@ class LogitsProcessor(nn.Module):
         embedding_bias: Optional[torch.Tensor] = None,
         use_logits_buffer: bool = True,
     ) -> torch.Tensor:
-        """Get logits from hidden_states.
-
-        If sampled_logits_only is True, it means hidden_states only contain the
-        last position (e.g., extend without input logprobs). The caller should
-        guarantee the given hidden_states follow this constraint.
-        """
+        """Get logits from hidden_states."""
         _trace_e2e_logits(
             "get_logits_enter",
             hidden_shape=tuple(hidden_states.shape),
