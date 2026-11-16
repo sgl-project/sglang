@@ -1706,7 +1706,7 @@ def handle_rerun_test(
 
 
 def _pop_hw_flag(args):
-    """Split `--hw <value>` off /rerun-test arguments: (value or None, rest).
+    """Split `--hw <value>` off a rerun command's arguments: (value or None, rest).
 
     A trailing `--hw` with no value yields "", which handle_rerun_test rejects.
     """
@@ -1718,11 +1718,12 @@ def _pop_hw_flag(args):
 
 
 def handle_rerun_group(
-    gh_repo, pr, comment, user_perms, group_names, token, command_label=None
+    gh_repo, pr, comment, user_perms, group_names, token, command_label=None, hw=None
 ):
     """
     Handles the /rerun-group command. Expands one or more registered test
-    groups into test file specs, then reuses /rerun-test dispatch behavior.
+    groups into test file specs, then reuses /rerun-test dispatch behavior,
+    `hw` included.
     """
     if not _check_rerun_test_permissions(
         gh_repo, pr, comment, user_perms, "rerun-group"
@@ -1767,6 +1768,7 @@ def handle_rerun_group(
         token,
         skip_permission_check=True,
         command_label=command_label,
+        hw=hw,
     )
 
 
@@ -2108,7 +2110,7 @@ def main():
             print("Combined command finished, but no actions were taken.")
 
     elif first_line.startswith("/rerun-group"):
-        group_names = first_line.split()[1:]
+        hw, group_names = _pop_hw_flag(first_line.split()[1:])
         handle_rerun_group(
             repo,
             pr,
@@ -2117,6 +2119,7 @@ def main():
             group_names or None,
             token,
             command_label=first_line,
+            hw=hw,
         )
 
     elif first_line.startswith("/rerun-test"):
