@@ -74,17 +74,6 @@ pub(crate) struct BodySnapshot {
     /// The whole body for a crash dump (`None` when not recording).
     dump: Option<Arc<DumpBody>>,
     headers: LoggedHeaders,
-    /// When an HTTP layer started the request before `/generate` ran (work
-    /// an `HttpLayer` does before the handler), so the `Finish` latency
-    /// includes that wait.
-    started_at: Option<Instant>,
-}
-
-impl BodySnapshot {
-    pub(crate) fn started_at(mut self, at: Option<Instant>) -> Self {
-        self.started_at = at;
-        self
-    }
 }
 
 /// A native `/generate` body's bytes as received, and the header overrides
@@ -99,7 +88,12 @@ pub(crate) struct RawBody {
 /// How a generation request reached the core.
 pub(crate) enum ReceivedAs {
     /// A native `/generate` body ([`CoreHandle::snapshot_body`](crate::api_server::handlers::CoreHandle::snapshot_body)).
-    Body(Option<BodySnapshot>),
+    Body {
+        snapshot: Option<BodySnapshot>,
+        /// When an HTTP layer started the request before `/generate` ran
+        /// (work an `HttpLayer` does before the handler).
+        started_at: Option<Instant>,
+    },
     /// Built by an adapter (OpenAI, gRPC) or by the core itself, with the
     /// headers of the HTTP request it came from.
     Typed(LoggedHeaders),
@@ -109,6 +103,21 @@ impl ReceivedAs {
     /// A built request with no HTTP headers (gRPC, the startup warmup).
     pub(crate) fn without_headers() -> Self {
         Self::Typed(LoggedHeaders::default())
+    }
+
+    /// When the request started: when an HTTP layer started it before
+    /// `/generate` ran, else now. The `Finish` latency, `/generate`'s
+    /// `e2e_latency` and the latency metrics count from it, as Python's
+    /// TokenizerManager counts from before the work such a layer takes over
+    /// from it.
+    pub(crate) fn created_at(&self) -> Instant {
+        match self {
+            Self::Body {
+                started_at: Some(at),
+                ..
+            } => *at,
+            _ => Instant::now(),
+        }
     }
 }
 
@@ -220,7 +229,6 @@ impl RequestLog {
             fields,
             dump,
             headers: self.logged_headers(headers),
-            started_at: None,
         })
     }
 
@@ -279,16 +287,17 @@ impl RequestLog {
         batch: bool,
         log_metrics: bool,
     ) -> Vec<RequestRecord> {
-        let created_at = match &received {
-            ReceivedAs::Body(Some(snapshot)) => snapshot.started_at,
-            _ => None,
-        }
-        .unwrap_or_else(Instant::now);
+        let created_at = received.created_at();
         let created_time = unix_time();
         let (obj, items, dumps, headers) = match received {
-            ReceivedAs::Body(Some(snapshot)) => self.body_views(snapshot, requests, batch),
+            ReceivedAs::Body {
+                snapshot: Some(snapshot),
+                ..
+            } => self.body_views(snapshot, requests, batch),
             // A body that is not a JSON object fails to decode before this.
-            ReceivedAs::Body(None) => self.typed_views(requests, batch, LoggedHeaders::default()),
+            ReceivedAs::Body { snapshot: None, .. } => {
+                self.typed_views(requests, batch, LoggedHeaders::default())
+            }
             ReceivedAs::Typed(headers) => self.typed_views(requests, batch, headers),
         };
         if let Some(logger) = &self.logger {
@@ -345,7 +354,6 @@ impl RequestLog {
             fields,
             dump,
             headers,
-            ..
         } = snapshot;
         let logging = self.logger.is_some();
         // Held once for the whole batch, as Python's items share them.

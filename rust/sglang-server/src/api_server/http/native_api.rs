@@ -19,7 +19,7 @@ use super::generate_hook::{
 use super::pre_generate::HeldGeneration;
 use super::request_headers::apply_header_overrides;
 use crate::api_server::core::{
-    BodySnapshot, CoreError, CoreEvent, CoreOutput, HealthStatus, RawBody, ReceivedAs,
+    CoreError, CoreEvent, CoreOutput, HealthStatus, RawBody, ReceivedAs,
     STREAM_INVALID_REQUEST_ERROR,
 };
 use crate::api_server::handlers::{CoreCall, PendingGeneration, recv_indexed};
@@ -641,12 +641,10 @@ async fn generate(
         bytes: raw_body,
         overrides,
     };
-    let snapshot = state
-        .core
-        .snapshot_body(&body, Some(raw_body), &headers)
-        .map(|snapshot| {
-            snapshot.started_at(start.as_ref().map(|Extension(crate::RequestStart(at))| *at))
-        });
+    let received = ReceivedAs::Body {
+        snapshot: state.core.snapshot_body(&body, Some(raw_body), &headers),
+        started_at: start.map(|Extension(crate::RequestStart(at))| at),
+    };
     let (payloads, is_batch) = match generate_requests(&state, body) {
         Ok(requests) => requests,
         Err((code, message, stream)) => return native_error(code, &message, stream),
@@ -657,10 +655,7 @@ async fn generate(
     // equivalent boundary: into_requests() has normalized the body, while prefetch
     // and every downstream stage are still ahead of us. An HTTP layer that did
     // some of that work before this handler ran set where it started.
-    let timing = match start {
-        Some(Extension(crate::RequestStart(at))) => RequestTiming::starting_at(at),
-        None => RequestTiming::new(),
-    };
+    let timing = RequestTiming::starting_at(received.created_at());
     // Shared core admission performs media I/O (URL downloads, file reads)
     // on this async runtime before any request reaches the MM worker pool.
     if !is_batch {
@@ -674,7 +669,7 @@ async fn generate(
             .map(|held| held.claim(&mut payload));
         let client_sampling_params = item_sampling_params(client_sampling_params.as_ref(), 0);
         let request = RequestState::new(&state, &payload, &headers, client_sampling_params, timing);
-        generate_single(&state, payload, held, stream, request, snapshot).await
+        generate_single(&state, payload, held, stream, request, received).await
     } else {
         let requests = payloads
             .iter()
@@ -691,7 +686,7 @@ async fn generate(
                 )
             })
             .collect();
-        generate_batch(&state, payloads, stream, requests, snapshot).await
+        generate_batch(&state, payloads, stream, requests, received).await
     }
 }
 
@@ -809,11 +804,10 @@ async fn generate_single(
     held: Option<PendingGeneration>,
     stream: bool,
     request: RequestState,
-    snapshot: Option<BodySnapshot>,
+    received: ReceivedAs,
 ) -> Response {
     // `return_text_in_logprobs` is decoded on the detok shard into `*_txt`, so
     // the frame builder just reads them — no tokenizer needed here.
-    let received = ReceivedAs::Body(snapshot);
     let call = match held {
         Some(held) => state.core.generate_pending(req, received, held).await,
         None => state.core.generate(req, received).await,
@@ -916,16 +910,12 @@ async fn generate_batch(
     requests: Vec<GenerateRequest>,
     stream: bool,
     request_states: Vec<RequestState>,
-    snapshot: Option<BodySnapshot>,
+    received: ReceivedAs,
 ) -> Response {
     // No cross-item rid collision to worry about: `into_requests` rejected duplicate
     // rids within this batch, and `Rid::from_client` made each one unique against
     // every other in-flight request.
-    let calls = match state
-        .core
-        .generate_batch(requests, ReceivedAs::Body(snapshot))
-        .await
-    {
+    let calls = match state.core.generate_batch(requests, received).await {
         Ok(calls) => calls.into_iter().zip(request_states).collect(),
         Err(error) => return native_core_error(error, stream),
     };
