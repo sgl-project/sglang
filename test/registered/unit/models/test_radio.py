@@ -1,7 +1,6 @@
 """Unit tests for RADIO checkpoint weight loading."""
 
 import unittest
-from types import SimpleNamespace
 
 import torch
 import torch.nn as nn
@@ -26,9 +25,6 @@ class TestRadioWeightLoading(CustomTestCase):
         model = object.__new__(RadioModel)
         nn.Module.__init__(model)
         model.named_parameters = lambda: iter(named_parameters)
-        model.model = SimpleNamespace(
-            patch_generator=SimpleNamespace(_video_embedder_loaded=False)
-        )
         return model
 
     def test_hf_export_maps_embeddings_and_split_qkv(self):
