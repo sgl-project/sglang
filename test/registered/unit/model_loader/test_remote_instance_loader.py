@@ -166,5 +166,106 @@ class TestRemoteInstanceTransferEngineRegistration(CustomTestCase):
         self.assertEqual(set(info), {name for name, _ in model.named_parameters()})
 
 
+def _seed_exporter(*, tp_size):
+    return exporter_mod.WeightExporter(
+        tp_rank=0,
+        tp_size=tp_size,
+        gpu_id=1,
+        get_model_path=lambda: "",
+        get_model=lambda: nn.Linear(2, 2),
+    )
+
+
+class TestRemoteInstanceSeedRejectsBadRequests(CustomTestCase):
+    def test_bad_client_request_is_reported_not_raised(self):
+        """A TP2 client against a TP1 seed, or a send before the group exists,
+        used to raise in the seed's scheduler and take the seed down."""
+        exporter = _seed_exporter(tp_size=1)
+        with (
+            patch.object(exporter_mod, "init_custom_process_group") as init_group,
+            patch.object(
+                exporter_mod.torch.distributed, "is_initialized", return_value=True
+            ),
+        ):
+            requests = {
+                "init, TP-mismatched ports": lambda: (
+                    exporter.init_weights_send_group_for_remote_instance(
+                        master_address="10.0.0.1",
+                        ports="29500,29501",
+                        group_rank=0,
+                        world_size=2,
+                        group_name="send_weights_10.0.0.2",
+                    )
+                ),
+                "send, TP-mismatched ports": lambda: (
+                    exporter.send_weights_to_remote_instance(
+                        master_address="10.0.0.1",
+                        ports="29500,29501",
+                        group_name="send_weights_10.0.0.2",
+                    )
+                ),
+                "send, group never initialized": lambda: (
+                    exporter.send_weights_to_remote_instance(
+                        master_address="10.0.0.1",
+                        ports="29500",
+                        group_name="send_weights_10.0.0.2",
+                    )
+                ),
+            }
+            for case, request in requests.items():
+                with self.subTest(case=case):
+                    ok, message = request()
+                    self.assertFalse(ok)
+                    self.assertTrue(message)
+        init_group.assert_not_called()
+
+
+def _trigger(post):
+    with (
+        patch.object(rfork_utils.requests, "post", post),
+        patch.object(rfork_utils, "_seed_admin_headers", return_value={}),
+    ):
+        return rfork_utils.trigger_init_weights_send_group_for_remote_instance_request(
+            "10.0.0.1", 30000, [29500, 29501], "10.0.0.2"
+        )
+
+
+class TestRemoteInstanceClientAbortsOnSeedRejection(CustomTestCase):
+    def test_trigger_reports_a_rejected_or_unreachable_seed(self):
+        """The trigger ignored the seed's answer, so the client kept waiting in
+        its group rendezvous after the seed had refused."""
+        rejected = MagicMock(status_code=400)
+        rejected.json.return_value = {"success": False, "message": "Expected 1 ports"}
+        ok, message = _trigger(MagicMock(return_value=rejected))
+        self.assertFalse(ok)
+        self.assertIn("Expected 1 ports", message)
+
+        ok, _ = _trigger(MagicMock(side_effect=ConnectionError("refused")))
+        self.assertFalse(ok)
+
+        ok, _ = _trigger(MagicMock(return_value=MagicMock(status_code=200)))
+        self.assertTrue(ok)
+
+    def test_rejection_fails_the_client_server(self):
+        import sglang.srt.model_executor.model_runner_components.load_model_utils as lmu
+
+        for ok in (False, True):
+            with (
+                self.subTest(seed_accepts=ok),
+                patch.object(
+                    lmu,
+                    "trigger_init_weights_send_group_for_remote_instance_request",
+                    return_value=(ok, "" if ok else "rejected"),
+                ),
+                patch.object(lmu.psutil, "Process") as process,
+            ):
+                lmu._init_send_group_or_abort("10.0.0.1", 30000, [29500], "10.0.0.2")
+                sent = process.return_value.parent.return_value.send_signal
+                if ok:
+                    sent.assert_not_called()
+                else:
+                    sent.assert_called_once_with(lmu.signal.SIGQUIT)
+
+
 if __name__ == "__main__":
     unittest.main()
