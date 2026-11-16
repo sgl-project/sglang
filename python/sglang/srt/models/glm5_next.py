@@ -1177,6 +1177,7 @@ class Glm5NextModel(nn.Module):
         self.dflash_capture = False
         if (
             get_moe_a2a_backend().is_deepep()
+            or get_moe_a2a_backend().is_ascend_ops()
             or get_moe_a2a_backend().is_mooncake()
             or get_moe_a2a_backend().is_deepep_v2()
         ):

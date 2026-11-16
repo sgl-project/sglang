@@ -73,6 +73,36 @@ Image models generate one image request as a bounded denoising job, usually with
     href="/cookbook/diffusion/Ernie-Image/Ernie-Image"
     img="/cards/logos/ernie.png"
   />
+  <Card
+    title="FLUX.3"
+    mode="card"
+    href="/cookbook/diffusion/FLUX/FLUX.3"
+    img="/cards/logos/flux.png"
+  />
+  <Card
+    title="MiniMax-H3-Image"
+    mode="card"
+    href="/cookbook/diffusion/MiniMax/MiniMax-H3-Image"
+    img="/cards/logos/minimax.png"
+  />
+  <Card
+    title="MOSS-Image"
+    icon="image"
+    mode="card"
+    href="/cookbook/diffusion/OpenMOSS/MOSS-Image"
+  />
+  <Card
+    title="Anima"
+    icon="image"
+    mode="card"
+    href="/cookbook/diffusion/CircleStone/Anima"
+  />
+  <Card
+    title="HiDream-O1-Image"
+    icon="image"
+    mode="card"
+    href="/cookbook/diffusion/HiDream/HiDream-O1-Image"
+  />
 </CardGroup>
 
 ## Video Models
@@ -80,12 +110,6 @@ Image models generate one image request as a bounded denoising job, usually with
 Video models denoise a bounded latent video sequence for each request. Use these recipes for offline text-to-video, image-to-video, and video generation serving.
 
 <CardGroup cols={3}>
-  <Card
-    title="FLUX.3"
-    mode="card"
-    href="/cookbook/diffusion/FLUX/FLUX.3"
-    img="/cards/logos/flux.png"
-  />
   <Card
     title="Cosmos"
     mode="card"
@@ -129,28 +153,22 @@ Video models denoise a bounded latent video sequence for each request. Use these
     img="/cards/logos/mova.png"
   />
   <Card
-    title="MiniMax-H3-Image"
-    mode="card"
-    href="/cookbook/diffusion/MiniMax/MiniMax-H3-Image"
-    img="/cards/logos/minimax.png"
-  />
-  <Card
     title="MiniMax-H3"
     mode="card"
     href="/cookbook/diffusion/MiniMax/MiniMax-H3"
     img="/cards/logos/minimax.png"
   />
   <Card
-    title="MOSS-Image"
-    icon="image"
-    mode="card"
-    href="/cookbook/diffusion/OpenMOSS/MOSS-Image"
-  />
-  <Card
     title="LingBot Video MoE"
     mode="card"
     href="/cookbook/diffusion/LingBot-Video/LingBot-Video-MoE"
     img="/cards/logos/inclusionai.png"
+  />
+  <Card
+    title="Kandinsky 6"
+    icon="video"
+    mode="card"
+    href="/cookbook/diffusion/Kandinsky/Kandinsky6"
   />
 </CardGroup>
 
@@ -170,6 +188,12 @@ Realtime models keep a session alive and generate chunk by chunk with causal sta
     mode="card"
     href="/cookbook/diffusion/SANA-WM/SANA-WM"
     img="/cards/logos/sana.png"
+  />
+  <Card
+    title="HY-Nomas"
+    mode="card"
+    href="/cookbook/diffusion/HY-Nomas/HY-Nomas"
+    img="/cards/logos/tencent.png"
   />
 </CardGroup>
 

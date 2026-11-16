@@ -28,6 +28,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import msgspec
 import torch
 
 from sglang.srt.mem_cache.kv.layout.mha import DraftMHAView
@@ -1032,6 +1033,97 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
     def _post_capture_bundle(self, total_bytes=_RESERVED_BYTES):
         return _bundle(total_bytes=total_bytes, post_capture_active=True)
 
+    def test_resize_keeps_the_request_sub_pool(self):
+        """Post-capture resizing reaches every band, the request sub-pool's too:
+        it has no view of its own and keeps its request-row id space, so rows
+        bound after the resize still take units."""
+        from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
+        from sglang.srt.mem_cache.kv.decl import (
+            MHAGeometry,
+            StateGeometry,
+            StateReplay,
+            kv_layer_decls,
+            with_state_replay,
+        )
+        from sglang.srt.mem_cache.kv.plan import plan_kv_storage
+
+        setup_allocator_context()
+        state = with_state_replay(
+            StateGeometry(
+                conv_state_shapes=((8, 8),),
+                conv_dtype=torch.float16,
+                temporal_state_shape=(1, 4, 8),
+                temporal_dtype=torch.float32,
+            ),
+            StateReplay(
+                decode=False, speculative=True, is_kda=False, cache_len=16, key_heads=1
+            ),
+            layer_ids=(1,),
+            speculative_num_draft_tokens=3,
+        )
+        plan = plan_kv_storage(
+            kv_layer_decls(
+                full_layer_ids=(0,),
+                full_geometry=MHAGeometry(
+                    head_num=1, head_dim=8, v_head_dim=8, kv_cache_dtype=torch.float16
+                ),
+                state_layer_ids=(1,),
+                state_geometry=state,
+            ),
+            page_size=4,
+            speculative_num_draft_tokens=3,
+        )
+        (request,) = plan.requests()
+        inputs = KVSizingInputs(
+            budget_bytes=1 << 22,
+            max_running_requests=4,
+            radix_cache=False,
+            context_len=16,
+            alignment=1,
+        )
+        captured = size_plan(plan, inputs)
+        storage = build_kv_storage(
+            plan,
+            captured,
+            UnifiedBuildContext(
+                device="cuda",
+                start_layer=0,
+                end_layer=2,
+                enable_memory_saver=False,
+                need_sort=False,
+                max_num_reqs=4,
+                model_context_len=16,
+                state_cache_params=SimpleNamespace(layers=(1,)),
+                speculative_num_draft_tokens=3,
+                post_capture_active=True,
+            ),
+        )
+        a = storage.allocator
+        band = a.request_allocators[request.name]
+        rows = band.ids.num_virtual_ids
+        self.assertEqual(rows, captured.request_rows)
+        final = size_plan(
+            plan,
+            msgspec.structs.replace(inputs, budget_bytes=(1 << 22) - (1 << 20)),
+            frozen=captured,
+        )
+        config = SimpleNamespace(
+            unified_memory_pool_bytes=final.total_bytes,
+            unified_full_cap_tokens=final.full_cap_tokens,
+            full_max_total_num_tokens=final.full_tokens,
+            swa_max_total_num_tokens=final.window_tokens,
+        )
+        a.get_kvcache().finalize_backing(config)
+        a.resize(config)
+        self.assertEqual(band.ids.num_virtual_ids, rows)
+        taken = storage.take_rows(2)
+        self.assertIsNotNone(taken)
+        units = a.request_id_spaces()[request.name].ids(
+            torch.tensor(taken, device="cuda")
+        )
+        self.assertTrue(bool((units > 0).all()))
+        storage.release_rows(taken)
+
     def test_auto_state_shrink_preserves_captured_buffers(self):
         from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
         from sglang.srt.mem_cache.kv.decl import (
@@ -1173,6 +1265,24 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
             for table in (sub.ids.virtual_to_physical, sub.ids.physical_to_virtual)
         ]
         table_ptrs = [table.data_ptr() for table in tables]
+        # The memory clip prices an empty pool of the reserved size, then of
+        # the final size: what it priced before the resize is not kept.
+        clip = dict(
+            token_capacity=10**7,
+            sliding_window_size=64,
+            chunk_size=None,
+            prefill_retire_lag=0,
+            eviction_interval=1,
+        )
+        prompts = (1000, 60000, 120000, 250000)
+
+        def clipped(allocator):
+            return [
+                allocator.max_new_tokens_for_memory(prompt, 100000, **clip)
+                for prompt in prompts
+            ]
+
+        reserved = clipped(allocator)
 
         config = _final_config(bundle)
         bundle.token_to_kv_pool.finalize_backing(config)
@@ -1191,6 +1301,9 @@ class TestUnifiedPostCaptureSizing(CustomTestCase):
         eager = _bundle(total_bytes=_FINAL_BYTES, post_capture_active=False)
         self.assertEqual(_capacities(bundle), _capacities(eager))
         self.assertEqual(allocator.verify_byte_accounting(), [])
+        final = clipped(allocator)
+        self.assertEqual(final, clipped(eager.token_to_kv_pool_allocator))
+        self.assertNotEqual(final, reserved)
 
         # The resized capacity is fully allocatable and accounted.
         n = largest_take(allocator)
