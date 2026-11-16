@@ -109,17 +109,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-# Use the sglang installed in the image; only the checkout's test helpers are
-# overlaid onto it. The pod's site-packages come from the image, so running the
-# checkout's library code requires the image to already satisfy every
-# dependency in python/pyproject_npu.toml (blake3 from #47120 is missing from
-# cann9.1.0-a3-B106), which kills every server start before any test runs.
-echo "Use sglang from docker image"
-sglang_pkg_path=/sgl-workspace/sglang/python
-ascend_test_util_path=${sglang_pkg_path}/sglang/test/ascend
-mkdir -p "${ascend_test_util_path}"
-mv "${ascend_test_util_path}" "${ascend_test_util_path}_bak"
-cp -r "${sglang_source_path}/python/sglang/test/ascend" "${ascend_test_util_path}"
+# Run the checkout's sglang; the image only supplies the environment.
+export PYTHONPATH="${sglang_source_path}/python${PYTHONPATH:+:${PYTHONPATH}}"
 
 # set environment of cann
 . /usr/local/Ascend/cann/set_env.sh
