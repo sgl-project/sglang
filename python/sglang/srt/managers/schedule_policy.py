@@ -69,6 +69,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.capacity import capacity_decision, create_prefill_budget
 from sglang.srt.mem_cache.common import match_kv_cache, touch_waiting_prefix
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
+from sglang.srt.system_prompt.radix_patch import is_system_prefix_cold_seeder
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor import encoder_swa_replay
 
@@ -810,6 +811,14 @@ class AddReqResult(Enum):
     UNSCHEDULABLE = auto()
 
 
+# Fixed-system-prompt cold-start gate: once this many distinct boundary states
+# have been stored with zero warm hits, the workload doesn't reuse shared
+# states and the gate stops serializing it (the mamba slot budget governs).
+# Aligned with the boundary-pin cap (should_pin_boundary_store): past the cap
+# no new boundary state gets pinned anyway.
+_GATE_STORE_DISENGAGE_CAP = 8
+
+
 @dataclass(frozen=True, slots=True)
 class _PrefillAdmission:
     prefix_len: int
@@ -867,6 +876,10 @@ def windows_retire_behind_checkpoints(tree_cache: Optional[BasePrefixCache]) -> 
 
 
 class PrefillAdder:
+    # One-shot 0-match head diagnostics counter (see _log_cold_head_diag).
+    # Class-level: the adder is rebuilt every scheduling pass.
+    _cold_head_diag_logged: int = 0
+
     def __init__(
         self,
         page_size: int,
@@ -1002,6 +1015,11 @@ class PrefillAdder:
             self.rem_mamba_slots = (
                 self.tree_cache.req_to_token_pool.mamba_allocator.schedulable_available_size()
             )
+
+        # Fixed system prompt cold-start gate: lazily-computed count of cold
+        # seeders in the running batch for this pass (see
+        # _cold_seeders_in_flight).
+        self._running_cold_seeder_count: Optional[int] = None
 
         self.priority_scheduling_preemption_threshold = (
             priority_scheduling_preemption_threshold
@@ -1176,6 +1194,120 @@ class PrefillAdder:
         return self.token_to_kv_pool_allocator.request_slot_reserve(
             has_req_pool_slot=req.kv.req_pool_idx is not None,
             prefill_tokens=req.prefix_len + extend_input_len,
+        )
+
+    def cold_start_gate_defers(self, req: Req) -> bool:
+        """Whether the fixed-system-prompt cold-start gate defers `req`.
+
+        While no request has demonstrably MATCHED a cached boundary state,
+        cold seeders (boundary-carrying requests whose match did not reach a
+        cached boundary state) are serialized to one in flight -- it runs to
+        the boundary crossing, donates the shared state (pin-on-store locks
+        it), and every request matched after that classifies warm and flows
+        freely. Without the gate the whole first wave runs cold at the full
+        slot factor each and can exhaust the ratio-1-sized pool before any
+        request finishes donating (the crash-restart death spiral).
+
+        The gate disengages only once a match has actually REACHED a
+        boundary (``system_prefix_warm_hits``): a stored-but-never-hit state
+        proves nothing -- a boundary store from traffic whose tokens diverge
+        from the current requests' (template-kwargs-dependent rendering)
+        must not release the gate for everyone. Escape hatch: after
+        ``_GATE_STORE_DISENGAGE_CAP`` distinct boundary stores with zero
+        hits, the workload demonstrably doesn't reuse shared states
+        (per-request distinct heads); stop serializing it and let the mamba
+        slot budget (``_mamba_slot_budget_for_req`` charges the cold factor
+        slots per cold request against the pool) govern cold concurrency --
+        it adapts to any pool size and workload, no fixed fan-out constant.
+
+        The caller must SKIP the deferred request and keep admitting others
+        (never break the admission loop on this gate): a gated request
+        breaking the loop starves the warm requests behind it (observed:
+        #running-req pinned at 1 with a 50-deep queue).
+        """
+        if not self._cold_start_gate_active():
+            return False
+        self._log_cold_head_diag(req)
+        if self.tree_cache.system_prefix_warm_hits > 0 or (
+            self.tree_cache.system_prefix_boundary_stores
+            >= _GATE_STORE_DISENGAGE_CAP
+        ):
+            return False
+        if not is_system_prefix_cold_seeder(
+            req.system_prefix_boundary,
+            req.prefix_len,
+            req.mamba_branching_seqlen,
+        ):
+            return False
+        return self._cold_seeders_in_flight() >= 1
+
+    def _log_cold_head_diag(self, req: Req) -> None:
+        """One-shot diagnostic for boundary-carrying requests that match zero
+        prefix despite the injected fixed system block.
+
+        Such requests hold the full cold slot count each AND donate a state
+        on their own boundary path, so a workload of them squeezes the pool
+        (observed: 49 of 60 slots held by distinct-path tree states,
+        admission throttled to ~1 request per pass). The only
+        self-consistent explanations are a per-request ``extra_key``/
+        cache_salt (isolated radix key spaces) or a per-request distinct
+        token head -- this log settles which, up to 5 times per process, by
+        dumping the request's extra_key and first 32 input ids. Class-level
+        counter: the adder is rebuilt every scheduling pass, so an instance
+        attribute would reset and spam one line per pass (observed: 3299
+        lines in one run).
+        """
+        if PrefillAdder._cold_head_diag_logged >= 5:
+            return
+        if req.system_prefix_boundary is None or req.prefix_len > 0:
+            return
+        PrefillAdder._cold_head_diag_logged += 1
+        logger.info(
+            "[ColdHeadDiag] 0-match fixed-system-prompt request #%d: "
+            "extra_key=%r input_head=%s",
+            PrefillAdder._cold_head_diag_logged,
+            req.extra_key,
+            list(req.origin_input_ids[:32]),
+        )
+
+    def _cold_start_gate_active(self) -> bool:
+        # Feature off, no mamba pool to protect, or radix disabled (no
+        # boundary-reaching matches -- serializing there would throttle the
+        # whole server). Non-unified caches have no boundary-store
+        # accounting, so the gate is a no-op there.
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        return (
+            self._system_prompt_budget
+            and (self.memory_budget.has_state_slots or self._static_mamba_slots)
+            and not self.tree_cache.disable
+            and isinstance(self.tree_cache, UnifiedRadixCache)
+        )
+
+    def _cold_seeders_in_flight(self) -> int:
+        """Cold seeders in the running batch plus admitted this pass. The
+        running-batch scan is computed once per pass; `can_run_list` grows
+        within the pass so it is recounted per call."""
+        if self._running_cold_seeder_count is None:
+            self._running_cold_seeder_count = (
+                0
+                if self.running_batch is None
+                else sum(
+                    is_system_prefix_cold_seeder(
+                        r.system_prefix_boundary,
+                        r.prefix_len,
+                        r.mamba_branching_seqlen,
+                    )
+                    for r in self.running_batch.reqs
+                )
+            )
+        return self._running_cold_seeder_count + sum(
+            is_system_prefix_cold_seeder(
+                r.system_prefix_boundary,
+                r.prefix_len,
+                r.mamba_branching_seqlen,
+            )
+            for r in self.can_run_list
         )
 
     def _mamba_slot_budget_for_req(self, req: Req, fresh_cow: bool = False) -> int:

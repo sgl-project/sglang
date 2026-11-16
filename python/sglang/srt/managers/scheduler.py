@@ -4891,6 +4891,15 @@ class Scheduler(
             # queued drops the copy its match staged.
             defer_cow_slot = shares_memory(self.token_to_kv_pool_allocator)
             req.init_next_round_input(self.tree_cache, defer_cow_slot=defer_cow_slot)
+            if adder.cold_start_gate_defers(req):
+                # Fixed-system-prompt cold-start gate: defer this request (it
+                # stays queued) but KEEP admitting the others -- returning
+                # OTHER from add_one_req would break the loop and starve the
+                # warm requests behind it (observed: #running-req pinned at 1
+                # with a 50-deep queue). The deferred request's match-time
+                # mamba COW slot is reverted exactly like a rejected one.
+                self._drop_unadmitted_match(req)
+                continue
             if adder.should_defer(req):
                 if defer_cow_slot:
                     self._drop_unadmitted_match(req)
