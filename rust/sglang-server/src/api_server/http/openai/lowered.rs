@@ -209,12 +209,11 @@ pub(super) async fn chat(
         Err(error) => return Some(error_response(error.http_status(), &error.to_string())),
     };
 
-    if stream {
-        for (call, _) in &mut calls {
-            if let Err(error) = call.preflight().await {
-                return Some(error_response(error.http_status(), &error.to_string()));
-            }
-        }
+    if stream
+        && let Err(error) =
+            futures::future::try_join_all(calls.iter_mut().map(|(call, _)| call.preflight())).await
+    {
+        return Some(error_response(error.http_status(), &error.to_string()));
     }
 
     if !stream {

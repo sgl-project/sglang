@@ -54,6 +54,106 @@ from sglang.srt.runtime_context import get_context
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
+class TestBatchStreamValidation(CustomTestCase):
+    def test_later_rejection_prevents_first_success_and_closes_siblings(self):
+        """A successful child cannot hide another child's initial rejection."""
+
+        async def run():
+            first_ready = asyncio.Event()
+            closed = set()
+
+            async def child(rid, reject=False):
+                try:
+                    if reject:
+                        await first_ready.wait()
+                    else:
+                        first_ready.set()
+                    reason = (
+                        {
+                            "type": "abort",
+                            "status_code": 400,
+                            "message": "max_new_tokens exceeds KV cache capacity",
+                        }
+                        if reject
+                        else None
+                    )
+                    yield {"meta_info": {"id": rid, "finish_reason": reason}}
+                finally:
+                    closed.add(rid)
+
+            manager = TokenizerManager.__new__(TokenizerManager)
+            stream = manager._stream_batch_responses(
+                [child("good"), child("bad", True)], ["good", "bad"]
+            )
+            with self.assertRaisesRegex(ValueError, "max_new_tokens"):
+                await stream.__anext__()
+            self.assertEqual(closed, {"good", "bad"})
+
+        asyncio.run(run())
+
+    def test_rejection_cancels_a_sibling_without_output(self):
+        async def run():
+            waiting = asyncio.Event()
+            closed = set()
+
+            async def pending():
+                try:
+                    waiting.set()
+                    await asyncio.Future()
+                    yield {}
+                finally:
+                    closed.add("pending")
+
+            async def rejected():
+                try:
+                    await waiting.wait()
+                    yield {
+                        "meta_info": {
+                            "id": "bad",
+                            "finish_reason": {
+                                "type": "abort",
+                                "status_code": 400,
+                                "message": "KV capacity",
+                            },
+                        }
+                    }
+                finally:
+                    closed.add("bad")
+
+            manager = TokenizerManager.__new__(TokenizerManager)
+            stream = manager._stream_batch_responses(
+                [pending(), rejected()], ["pending", "bad"]
+            )
+            with self.assertRaisesRegex(ValueError, "KV capacity"):
+                await asyncio.wait_for(stream.__anext__(), timeout=2)
+            self.assertEqual(closed, {"pending", "bad"})
+
+        asyncio.run(run())
+
+    def test_valid_batch_preserves_every_first_result(self):
+        async def run():
+            async def child(rid):
+                for count in (1, 2):
+                    yield {
+                        "meta_info": {"id": rid, "finish_reason": None},
+                        "count": count,
+                    }
+
+            manager = TokenizerManager.__new__(TokenizerManager)
+            outputs = [
+                item
+                async for item in manager._stream_batch_responses(
+                    [child("a"), child("b")], ["a", "b"]
+                )
+            ]
+            self.assertEqual(
+                sorted((x["index"], x["count"]) for x in outputs),
+                [(0, 1), (0, 2), (1, 1), (1, 2)],
+            )
+
+        asyncio.run(run())
+
+
 class TestSamplingParamsTruncation(CustomTestCase):
     def test_batch_truncation_is_independent_of_prompt_order(self):
         """A long prompt must not truncate the completion budget of shorter peers."""

@@ -182,7 +182,14 @@ class TestKVCapacityValidation(CustomTestCase):
             DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
             cls.base_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=("--max-total-tokens", "512", "--context-length", "4096"),
+            other_args=(
+                "--max-total-tokens",
+                "512",
+                "--context-length",
+                "4096",
+                "--max-running-requests",
+                "2",
+            ),
             env={"SGLANG_RUST_SERVER": "1" if cls.rust_frontend else "0"},
         )
 
@@ -190,6 +197,86 @@ class TestKVCapacityValidation(CustomTestCase):
     def tearDownClass(cls):
         if cls.process is not None:
             terminate_and_kill_process_tree(cls.process)
+
+    def test_batch_kv_rejection_is_independent_of_item_order(self):
+        for budgets in ((1, 1024), (1024, 1), (1024, 1024)):
+            for stream in (False, True):
+                with self.subTest(budgets=budgets, stream=stream):
+                    response = requests.post(
+                        self.base_url + "/generate",
+                        json={
+                            "text": ["Hello", "Hello"],
+                            "stream": stream,
+                            "sampling_params": [{"max_new_tokens": n} for n in budgets],
+                        },
+                        timeout=30,
+                    )
+                    self.assertEqual(response.status_code, 400, response.text)
+                    self.assertIn("max_new_tokens=1024", response.text)
+                    control = requests.post(
+                        self.base_url + "/generate",
+                        json={
+                            "text": "Hello",
+                            "sampling_params": {"max_new_tokens": 1},
+                        },
+                        timeout=30,
+                    )
+                    self.assertEqual(control.status_code, 200, control.text)
+
+    def test_parallel_choices_reject_kv_budget_before_streaming(self):
+        for path, payload in (
+            (
+                "/generate",
+                {"text": "Hello", "sampling_params": {"max_new_tokens": 1024, "n": 2}},
+            ),
+            (
+                "/v1/completions",
+                {
+                    "model": DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                    "prompt": ["Hello", "Hello"],
+                    "max_tokens": 1024,
+                    "n": 2,
+                },
+            ),
+            (
+                "/v1/chat/completions",
+                {
+                    "model": DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "max_tokens": 1024,
+                    "n": 2,
+                },
+            ),
+        ):
+            with self.subTest(path=path):
+                response = requests.post(
+                    self.base_url + path, json={**payload, "stream": True}, timeout=30
+                )
+                self.assertEqual(response.status_code, 400, response.text)
+                if self.rust_frontend and path == "/generate":
+                    self.assertIn("parallel sampling is not supported", response.text)
+                else:
+                    self.assertIn("max_new_tokens=1024", response.text)
+
+    def test_valid_batch_stream_keeps_all_items(self):
+        response = requests.post(
+            self.base_url + "/generate",
+            json={
+                "text": ["Hello"] * 4,
+                "stream": True,
+                "sampling_params": {"max_new_tokens": 1},
+            },
+            timeout=30,
+        )
+        self.assertEqual(response.status_code, 200, response.text)
+        import json
+
+        items = [
+            json.loads(line[6:])
+            for line in response.text.splitlines()
+            if line.startswith("data: {")
+        ]
+        self.assertEqual(sorted(item["index"] for item in items), list(range(4)))
 
     def test_default_budget_is_not_an_explicit_request(self):
         for params, expected_status in (({}, 200), ({"max_new_tokens": 128}, 400)):
