@@ -47,18 +47,7 @@ MEMORY_ARGS = BASE_ARGS + ("--enable-memory-saver", "--enable-weights-cpu-backup
 NO_MEMORY_ARGS = BASE_ARGS
 
 
-class TestNpuMemoryOccupation(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        # One memory-saver server for all release/resume cases. Restarting a
-        # mempool-backed server repeatedly is what stresses the NPU driver.
-        cls._server = npu_server(MODEL, extra_args=MEMORY_ARGS, env=npu_rl_env())
-        cls.base_url = cls._server.__enter__()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls._server.__exit__(None, None, None)
-
+class _MemoryOccupationCases:
     def test_01_release_weights_frees_memory(self):
         golden = generation_signature(self.base_url, PROMPTS)
         before = npu_free_bytes()
@@ -113,6 +102,35 @@ class TestNpuMemoryOccupation(CustomTestCase):
 
         actual = generation_signature(self.base_url, PROMPTS)
         self.assertEqual(actual, golden, "staged resume changed the output")
+
+
+PRELOAD_ENV = {**npu_rl_env(), "TMS_HOOK_MODE": "preload"}
+
+
+class TestNpuMemoryOccupation(_MemoryOccupationCases, CustomTestCase):
+    @classmethod
+    def setUpClass(cls):
+        # One memory-saver server for all release/resume cases. Restarting a
+        # mempool-backed server repeatedly is what stresses the NPU driver.
+        cls._server = npu_server(MODEL, extra_args=MEMORY_ARGS, env=npu_rl_env())
+        cls.base_url = cls._server.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._server.__exit__(None, None, None)
+
+
+class TestNpuMemoryOccupationPreload(_MemoryOccupationCases, CustomTestCase):
+    """Same cases with the LD_PRELOAD memory-saver mode."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls._server = npu_server(MODEL, extra_args=MEMORY_ARGS, env=PRELOAD_ENV)
+        cls.base_url = cls._server.__enter__()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._server.__exit__(None, None, None)
 
 
 class TestNpuMemoryOccupationFreshServer(CustomTestCase):
