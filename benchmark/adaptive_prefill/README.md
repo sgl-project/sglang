@@ -20,6 +20,8 @@ This launch has not been GPU-validated. `--adaptive-prefill-target-ms` defaults
 to 40, `--adaptive-prefill-token-ms` to 0.02 and
 `--adaptive-prefill-max-decode-rounds` to 8. The existing
 `--prefill-decode-interval` becomes a floor (at least one decode turn).
+`--prefill-decode-interval-min-bs` must remain zero so a small decoding batch
+cannot lose its cadence protection under sustained prompt arrivals.
 
 The controller observes launch-to-completed-host-result time, including host
 processing. It does not add a CUDA synchronization or estimate device-only

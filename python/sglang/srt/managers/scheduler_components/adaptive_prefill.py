@@ -22,7 +22,7 @@ class AdaptivePrefillController:
         if not has_decode:
             return configured
         available_ms = max(self.target_ms * 0.1, self.target_ms - self.decode_ms)
-        tokens = int(available_ms / self.token_ms)
+        tokens = int(min(configured, available_ms / self.token_ms))
         # One page permits progress even when it exceeds the soft time target.
         return min(configured, max(page_size, tokens // page_size * page_size))
 

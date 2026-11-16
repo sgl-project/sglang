@@ -900,11 +900,13 @@ def validate_prefill_decode_interval(server_args: Any):
             or cfg.dllm_algorithm is not None
             or cfg.num_continuous_decode_steps != 1
             or cfg.schedule_policy != "fcfs"
+            or cfg.prefill_decode_interval_min_bs != 0
             or cfg.disaggregation_mode != "null"
         ):
             raise ValueError(
                 "Adaptive prefill requires synchronous single-worker FCFS non-speculative "
-                "generation without mixed chunks, dynamic chunking or disaggregation"
+                "generation with min-bs=0, without mixed chunks, dynamic chunking "
+                "or disaggregation"
             )
 
 

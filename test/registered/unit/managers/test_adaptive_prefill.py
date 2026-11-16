@@ -54,6 +54,10 @@ class TestAdaptivePrefill(CustomTestCase):
             self.assertEqual(s.adaptive_prefill.interval, 1)
 
     def test_budget_and_feedback(self):
+        self.assertEqual(
+            AdaptivePrefillController(token_ms=1e-320).chunk_budget(128, 16, True),
+            128,
+        )
         c = AdaptivePrefillController(target_ms=40, token_ms=1)
         self.assertEqual(c.chunk_budget(128, 16, True), 32)
         c.observe(200, 20)
@@ -135,6 +139,16 @@ class TestAdaptivePrefill(CustomTestCase):
             disable_overlap_schedule=True,
             schedule_policy="fcfs",
         ).resolve_once()
+
+    def test_adaptive_cadence_cannot_bypass_small_decode_batches(self):
+        with self.assertRaisesRegex(ValueError, "min-bs=0"):
+            ServerArgs(
+                model_path="dummy",
+                adaptive_prefill=True,
+                disable_overlap_schedule=True,
+                schedule_policy="fcfs",
+                prefill_decode_interval_min_bs=2,
+            ).resolve_once()
 
 
 if __name__ == "__main__":
