@@ -19,6 +19,7 @@ from sglang.srt.disaggregation.common.staging_buffer import (
 )
 from sglang.srt.disaggregation.common.staging_handler import (
     DecodeStagingHandler,
+    PrefillStagingContext,
     handle_staging_req,
     prefetch_staging_reqs,
 )
@@ -138,6 +139,40 @@ class TestBatchStagingReservations(CustomTestCase):
             prefetch.assert_called_once_with(7)
         del manager._prefetch_staging_reqs
         run(scheduler, batch)
+
+    def test_lazy_prefetch_hook_reaches_nixl_manager(self):
+        """With lazy staging prefetch on, the prefill scheduler's hook must not
+        raise on a NIXL manager; NIXL still requests every chunk of the room."""
+        session = SimpleNamespace(
+            is_dummy=False,
+            agent_name="decode-0",
+            dst_kv_indices=list(range(10)),
+            endpoint="127.0.0.1",
+            dst_port=1234,
+        )
+        manager = NixlKVManager.__new__(NixlKVManager)
+        manager.enable_staging = True
+        manager.kv_buffer_tensors = {"page_size": 16}
+        manager._staging_ctx = PrefillStagingContext()
+        manager.transfer_infos = {7: {"decode-0": session}}
+        manager.decode_kv_args_table = {"decode-0": SimpleNamespace(decode_tp_size=2)}
+        manager.attn_tp_size = 1
+        scheduler = SimpleNamespace(
+            disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager=manager)
+        )
+        batch = SimpleNamespace(reqs=[SimpleNamespace(bootstrap_room=7, extend_end=16)])
+        socket = Mock()
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            get_context().override_server_args(chunked_prefill_size=32),
+            patch("zmq.Context.instance") as context,
+        ):
+            context.return_value.socket.return_value = socket
+            SchedulerDisaggregationPrefillMixin.maybe_prefetch_staging_for_batch(
+                scheduler, batch
+            )
+        messages = [c.args[0] for c in socket.send_multipart.call_args_list]
+        self.assertEqual([int(m[2]) for m in messages], list(range(5)))
 
 
 class TestRequestWindowRetention(CustomTestCase):
