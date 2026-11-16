@@ -775,6 +775,10 @@ class Step3VLForConditionalGeneration(nn.Module):
     def _get_vision_model_output(self, input_tensor: torch.Tensor) -> torch.Tensor:
         return self.vision_model(input_tensor)[:, 4:]
 
+    @property
+    def device(self) -> torch.device:
+        return self.vit_large_projector.weight.device
+
     def _flatten_embeddings(self, embeddings) -> torch.Tensor:
 
         if isinstance(embeddings, torch.Tensor):
