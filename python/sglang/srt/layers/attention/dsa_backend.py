@@ -2400,7 +2400,6 @@ class DeepseekSparseAttnBackend(
         llama_4_scaling: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
         asm_q8: bool = False,
-        row_consumer=None,
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
@@ -2601,7 +2600,6 @@ class DeepseekSparseAttnBackend(
                     layer=layer,
                     topk_indices=shared_topk_indices,
                     asm_q8=asm_q8,
-                    row_consumer=row_consumer,
                 )
             from sglang.kernels.ops.attention.dsa.triton_sparse_mla import (
                 triton_sparse_mla_fwd,
@@ -2809,7 +2807,6 @@ class DeepseekSparseAttnBackend(
         llama_4_scaling: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
         asm_q8: bool = False,
-        row_consumer=None,
     ) -> torch.Tensor:
 
         causal = not layer.is_cross_attention
@@ -2963,7 +2960,6 @@ class DeepseekSparseAttnBackend(
                     layer=layer,
                     topk_indices=shared_topk_indices,
                     asm_q8=asm_q8,
-                    row_consumer=row_consumer,
                 )
             return self._forward_triton_decode(
                 q_nope=q_nope,
@@ -3813,7 +3809,6 @@ class DeepseekSparseAttnBackend(
         layer: RadixAttention,
         topk_indices: Optional[torch.Tensor],
         asm_q8: bool = False,
-        row_consumer=None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Attend the owned slots of the global top-k; one query row per token."""
         from sglang.kernels.ops.attention.dsa.triton_sparse_mla_decode import (
@@ -3852,40 +3847,30 @@ class DeepseekSparseAttnBackend(
                 self._asm_one_scale = torch.ones(
                     1, dtype=torch.float32, device=q_nope.device
                 )
+            return asm_sparse_mla_dcp(
+                q8,
+                kv_cache,
+                indptr,
+                indices,
+                sm_scale,
+                v_head_dim,
+                self._asm_one_scale,
+            )
 
-            def attend(lo: int, hi: int):
-                return asm_sparse_mla_dcp(
-                    q8[lo:hi],
-                    kv_cache,
-                    indptr[lo : hi + 1],
-                    indices,
-                    sm_scale,
-                    v_head_dim,
-                    self._asm_one_scale,
-                )
-
-        else:
-            stream_id = int(torch.cuda.current_stream(q_nope.device).cuda_stream)
-            workspace = self._triton_sparse_mla_workspaces.setdefault(stream_id, [])
-
-            def attend(lo: int, hi: int):
-                out, lse = triton_sparse_mla_decode_splitk(
-                    q_nope=q_nope[lo:hi],
-                    q_rope=q_rope[lo:hi],
-                    kv=kv_cache,
-                    indices=local_page_table[lo:hi].unsqueeze(1),
-                    sm_scale=sm_scale,
-                    d_v=v_head_dim,
-                    workspace=workspace,
-                    return_lse=True,
-                    lengths=owned_counts[lo:hi],
-                )
-                return out.view(hi - lo, heads, v_head_dim), lse
-
-        if row_consumer is None:
-            return attend(0, rows)
-        assert row_consumer.rows == rows
-        return row_consumer.run(attend), None
+        stream_id = int(torch.cuda.current_stream(q_nope.device).cuda_stream)
+        workspace = self._triton_sparse_mla_workspaces.setdefault(stream_id, [])
+        out, lse = triton_sparse_mla_decode_splitk(
+            q_nope=q_nope,
+            q_rope=q_rope,
+            kv=kv_cache,
+            indices=local_page_table.unsqueeze(1),
+            sm_scale=sm_scale,
+            d_v=v_head_dim,
+            workspace=workspace,
+            return_lse=True,
+            lengths=owned_counts,
+        )
+        return out.view(rows, heads, v_head_dim), lse
 
     def _forward_intel_xpu_sparse_decode(
         self,
