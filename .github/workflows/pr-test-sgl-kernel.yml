@@ -28,6 +28,8 @@ on:
 # Workflow-level env is NOT inherited from the caller in reusable workflows.
 # The github context (including github.event_name) IS inherited from the caller.
 env:
+  # Trial branch: each job installs into its own /tmp venv, removed by the cleanup step.
+  USE_VENV: "1"
   # PyTorch stack for scripts/ci/cuda/ci_install_dependency.sh. Set here because
   # some self-hosted runners export an older CU_VERSION into the job environment.
   CU_VERSION: cu134
@@ -77,6 +79,9 @@ jobs:
         run: |
           cd python/sglang/kernels/aot
           pytest tests/
+      - name: Clean up per-job venv
+        if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   sgl-kernel-benchmark-test:
     runs-on: 1-gpu-h100
@@ -128,6 +133,9 @@ jobs:
           done
 
           echo "All benchmark tests completed!"
+      - name: Clean up per-job venv
+        if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   sgl-kernel-b200-test:
     runs-on: ${{ fromJson(inputs.runs_on_map)[inputs.runner_config] }}
@@ -167,6 +175,9 @@ jobs:
         run: |
           cd python/sglang/kernels/aot
           pytest tests/
+      - name: Clean up per-job venv
+        if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   # Adding a single CUDA13 build-and-run check for the kernel
   # TODO: Add back this test when it can pass on CI
