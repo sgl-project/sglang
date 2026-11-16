@@ -53,7 +53,11 @@ pub(super) fn auto_tool_call_tag(
     }
     let call_tags = tools
         .iter()
-        .map(|tool| tool_call_tag(&tool["function"]))
+        .map(|tool| {
+            let function = &tool["function"];
+            auto_arguments_format(&function["parameters"])
+                .map(|arguments| tool_call_tag(function, arguments))
+        })
         .collect::<Option<_>>()
         .ok_or(Unsupported("tool_definition"))?;
     let tools_tag = tool_calls_tag(call_tags, parallel_tool_calls);
@@ -85,19 +89,19 @@ fn sequence(elements: Vec<Value>) -> Value {
     json!({"type": "sequence", "elements": elements})
 }
 
-/// `_tool_call_tag` with `_auto_tool_arguments_format`; `None` past the schema bounds.
-fn tool_call_tag(function: &Value) -> Option<Value> {
+/// `_tool_call_tag`: one call to `function` whose arguments take `arguments`.
+fn tool_call_tag(function: &Value, arguments: Value) -> Value {
     let name = escape_attr(function["name"].as_str().unwrap_or_default());
-    Some(json!({
+    json!({
         "type": "tag",
         "begin": format!("{CALL_OPEN} tool=\"{name}\" index=\""),
         "content": sequence(vec![
             json!({"type": "regex", "pattern": "[1-9][0-9]*"}),
             json!({"type": "const_string", "value": "\"<|sep|>"}),
-            auto_arguments_format(&function["parameters"])?,
+            arguments,
         ]),
         "end": CALL_CLOSE,
-    }))
+    })
 }
 
 /// `_tool_calls_tag`.
@@ -130,7 +134,8 @@ fn nonempty_argument_format(key: &str, xtml_type: &str) -> Value {
     ])
 }
 
-/// `_auto_tool_arguments_format`: required arguments present and non-empty, then any text.
+/// `_auto_tool_arguments_format`: required arguments present and non-empty,
+/// then any text; `None` past the schema bounds.
 fn auto_arguments_format(parameters: &Value) -> Option<Value> {
     let loose = || Some(any_text(&[]));
     let Value::Object(schema) = parameters else {
