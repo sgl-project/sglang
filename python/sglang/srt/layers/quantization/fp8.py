@@ -2109,12 +2109,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             and not self.use_mxfp8
             and not self.is_fp4_expert
             and self.quant_config.is_checkpoint_fp8_serialized
-            and not getattr(layer, "use_presharded_weights", False)
+            and not layer.use_presharded_weights
             # A blockwise tail loads the checkpoint grid as is.
             and not self._supports_blockwise_fp8_tail(layer)
             # apply() sends these to kernels that take the checkpoint block.
             and not _is_cpu
-            and not (_is_xpu and not get_moe_runner_backend().is_triton())
+            and not (
+                _is_xe2_supported
+                and not get_moe_runner_backend().is_triton()
+                and can_use_xpu_fp8_moe(
+                    layer.moe_runner_config,
+                    self.weight_block_size,
+                )
+            )
         ):
             return unrefined
         refined = _tp_refined_moe_block_sizes(
@@ -3289,7 +3296,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 "Fp8MoEMethod has no %s path; using triton for its fp8 experts.",
                 configured_backend.name,
             )
-        elif (
+        if (
             _is_xpu
             and moe_runner_backend.is_intel_xpu()
             and not self.is_fp4_expert
@@ -3303,14 +3310,6 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
         ):
             moe_runner_backend = MoeRunnerBackend.TRITON
-        if (
-            configured_backend.is_flashinfer_cutlass()
-            or configured_backend.is_flashinfer_cutedsl()
-        ):
-            logger.info(
-                "Fp8MoEMethod has no %s path; using triton for its fp8 experts.",
-                configured_backend.name,
-            )
 
         if (
             moe_runner_backend.is_deep_gemm()
