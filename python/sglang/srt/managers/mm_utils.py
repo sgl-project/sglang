@@ -56,11 +56,6 @@ from sglang.srt.utils.stale_shm_cleanup import make_shm_name
 
 logger = logging.getLogger(__name__)
 
-# NOTE: Using the shared logger from sglang.utils instead of creating a module-specific logger
-# to ensure consistent logging behavior across the codebase. This prevents issues with log
-# propagation that can cause some log messages (like 'server is fired up') to not appear
-# in the console when multimodal support is enabled.
-
 _GPU_FEATURE_BUFFER: Optional[torch.Tensor] = None
 _BUFFER_OFFSET = 0
 
