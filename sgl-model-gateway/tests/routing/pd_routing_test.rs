@@ -471,9 +471,9 @@ mod pd_responses_routing_tests {
     }
 
     /// PDRouter must inject the PD bootstrap metadata into both worker
-    /// requests, forward `disagg_prefill_dp_rank` to decode for a DP-aware
-    /// prefill worker, target `/v1/responses` on both workers, and return the
-    /// decode response.
+    /// requests, forward `disagg_prefill_dp_rank` to both prefill and decode
+    /// for a DP-aware prefill worker, target `/v1/responses` on both workers,
+    /// and return the decode response.
     #[tokio::test]
     async fn test_pd_responses_default_buffered_request_injects_bootstrap_metadata() {
         let prefill_bodies = Arc::new(Mutex::new(Vec::new()));
@@ -523,7 +523,7 @@ mod pd_responses_routing_tests {
             prefill_body["bootstrap_room"]
         );
         assert_eq!(prefill_body["data_parallel_rank"], 2);
-        assert!(prefill_body.get("disagg_prefill_dp_rank").is_none());
+        assert_eq!(prefill_body["disagg_prefill_dp_rank"], 2);
         assert_eq!(decode_body["disagg_prefill_dp_rank"], 2);
         prefill_task.abort();
         decode_task.abort();
