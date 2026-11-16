@@ -2549,6 +2549,7 @@ class Qwen3_5ForConditionalGeneration(Qwen3VLForConditionalGeneration):
             loaded_params.update(
                 f"pooler.head.{name}" for name, _ in self.pooler.head.named_parameters()
             )
+        self._check_vision_weights_loaded(loaded_params)
         return loaded_params
 
     def _load_joint_head(self) -> None:
@@ -2969,6 +2970,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3VLForConditionalGeneration):
             }
         )
 
+        self._check_vision_weights_loaded(loaded_params)
         return loaded_params
 
     @property
