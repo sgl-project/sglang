@@ -602,6 +602,7 @@ def run_npu_e2e_test_case(
     run_id: str = "",
     container_patches: str = "",
     accuracy_dataset: str = "",
+    use_image_sglang: str = "false",
 ):
     """The method for running a npu e2e test case.
     Args:
@@ -671,6 +672,7 @@ def run_npu_e2e_test_case(
                 "transformers_version": transformers_version,
                 "run_label": run_label,
                 "run_id": run_id,
+                "use_image_sglang": use_image_sglang,
             }
             create_kube_yaml(
                 kube_yaml_template=KUBE_YAML_TEMPLATE.get(kube_job_type),
@@ -695,6 +697,7 @@ def run_npu_e2e_test_case(
                 "run_label": run_label,
                 "run_id": run_id,
                 "accuracy_dataset": accuracy_dataset,
+                "use_image_sglang": use_image_sglang,
             }
             template_key = (
                 KUBE_JOB_MULTI_PD_MIX_GREEN if env == "green" else kube_job_type
@@ -725,6 +728,7 @@ def run_npu_e2e_test_case(
                 "run_label": run_label,
                 "run_id": run_id,
                 "accuracy_dataset": accuracy_dataset,
+                "use_image_sglang": use_image_sglang,
             }
             template_key = (
                 KUBE_JOB_MULTI_PD_SEPARATION_GREEN if env == "green" else kube_job_type
@@ -939,6 +943,16 @@ if __name__ == "__main__":
         "(gsm8k on weekdays, gpqa_diamond on weekends).",
     )
 
+    parser.add_argument(
+        "--use-image-sglang",
+        type=str,
+        required=False,
+        default="false",
+        help="If 'true', pods import sglang from the image's site-packages "
+        "instead of the checkout mounted at /root/sglang/python. Test "
+        "case scripts still come from the mounted source tree.",
+    )
+
     args = parser.parse_args()
 
     docker_image_url = args.image
@@ -957,6 +971,7 @@ if __name__ == "__main__":
     run_id = args.run_id
     container_patches = args.container_patches
     accuracy_dataset = args.accuracy_dataset
+    use_image_sglang = args.use_image_sglang
 
     kube_name_space = args.kube_name_space
     kube_job_type = args.kube_job_type
@@ -988,4 +1003,5 @@ if __name__ == "__main__":
         run_id=run_id,
         container_patches=container_patches,
         accuracy_dataset=accuracy_dataset,
+        use_image_sglang=use_image_sglang,
     )

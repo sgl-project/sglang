@@ -69,6 +69,11 @@ on:
         type: string
         default: ''
         description: 'Accuracy dataset injected into pods as NPU_ACCURACY_DATASET (gsm8k on weekdays, gpqa_diamond on weekends)'
+      use_image_sglang:
+        required: false
+        type: string
+        default: ''
+        description: "If 'true', pods import sglang from the image's site-packages instead of the checkout mounted at /root/sglang/python. Empty/false uses the checkout (nightly default)."
       sgl_router_artifact:
         required: false
         type: string
@@ -248,6 +253,15 @@ jobs:
           esac
           if [ -n "${accuracy_dataset}" ]; then
             CMD="${CMD} --accuracy-dataset ${accuracy_dataset}"
+          fi
+
+          use_image_sglang="${{ inputs.use_image_sglang }}"
+          case "${use_image_sglang}" in
+            ""|true|false) ;;
+            *) echo "Unsupported use_image_sglang: ${use_image_sglang}"; exit 1 ;;
+          esac
+          if [ -n "${use_image_sglang}" ]; then
+            CMD="${CMD} --use-image-sglang ${use_image_sglang}"
           fi
 
           if [ "$prefill_decode_deployment" = "separation" ];then

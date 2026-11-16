@@ -180,10 +180,17 @@ sysctl -w vm.swappiness=0
 sysctl -w kernel.numa_balancing=0
 sysctl -w kernel.sched_migration_cost_ns=50000
 
-# Prefer the sgl-router CI built for this commit over the image's copy.
+# Prefer the sgl-router CI built for this commit over whatever PATH resolves.
+# The image does not ship the exact name `sgl-router` but may ship
+# `sglang-router` via pip install; fall back to it when neither the CI
+# artifact nor PATH's `sgl-router` is present.
 sgl_router_bin="${sglang_source_path}/sgl-router-bin/sgl-router"
 if "${sgl_router_bin}" --help >/dev/null 2>&1; then
     export SGLANG_TEST_PD_ROUTER_BINARY="${sgl_router_bin}"
+elif command -v sgl-router >/dev/null 2>&1; then
+    export SGLANG_TEST_PD_ROUTER_BINARY="$(command -v sgl-router)"
+elif command -v sglang-router >/dev/null 2>&1; then
+    export SGLANG_TEST_PD_ROUTER_BINARY="$(command -v sglang-router)"
 fi
 echo "sgl-router: $(command -v "${SGLANG_TEST_PD_ROUTER_BINARY:-sgl-router}" || echo 'not found')"
 
@@ -207,8 +214,12 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-# Run the checkout's sglang; the image only supplies the environment.
-export PYTHONPATH="${sglang_source_path}/python${PYTHONPATH:+:${PYTHONPATH}}"
+# Use the checkout's sglang by default; set SGLANG_USE_IMAGE=true to run
+# whatever the image already installed into site-packages (test cases still
+# come from the mounted source tree).
+if [ "${SGLANG_USE_IMAGE:-false}" != "true" ]; then
+    export PYTHONPATH="${sglang_source_path}/python${PYTHONPATH:+:${PYTHONPATH}}"
+fi
 
 # set environment of cann
 . /usr/local/Ascend/cann/set_env.sh

@@ -58,6 +58,8 @@ spec:
           value: "{{ run_label }}"
         - name: SGLANG_IS_IN_CI
           value: "{{ sglang_is_in_ci }}"
+        - name: SGLANG_USE_IMAGE
+          value: "{{ use_image_sglang }}"
         command: ["/bin/bash", "-c"]
         args:
           - |
@@ -168,6 +170,8 @@ spec:
           value: "{{ run_label }}"
         - name: SGLANG_IS_IN_CI
           value: "{{ sglang_is_in_ci }}"
+        - name: SGLANG_USE_IMAGE
+          value: "{{ use_image_sglang }}"
         command: ["/bin/bash", "-c"]
         args:
           - |
@@ -277,6 +281,8 @@ spec:
           value: "{{ run_label }}"
         - name: SGLANG_IS_IN_CI
           value: "{{ sglang_is_in_ci }}"
+        - name: SGLANG_USE_IMAGE
+          value: "{{ use_image_sglang }}"
         command: ["/bin/bash", "-c"]
         args:
           - |

@@ -18,6 +18,11 @@ on:
         required: false
         type: string
         default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B031'
+      use_image_sglang:
+        description: "If 'true' (default), pods import sglang from the image's site-packages. Set 'false' to use the PR checkout's sglang."
+        required: false
+        type: string
+        default: 'true'
 
 concurrency:
   group: npu-release-model-data-${{ github.ref }}
@@ -72,6 +77,8 @@ jobs:
       prefill_decode_deployment: ${{ matrix.prefill_decode_deployment }}
       container_patches: ${{ matrix.container_patches }}
       run_start_metadata: ${{ needs.metadata.outputs.run_start_metadata }}
+      # PR-triggered runs have no inputs; they fall back to the dispatch defaults.
+      use_image_sglang: ${{ inputs.use_image_sglang || 'true' }}
     secrets: inherit
 
   publish:
