@@ -9,15 +9,21 @@ Covers the pieces that are easy to regress and cheap to check on CPU:
   keep language auto-detection off and each implement ``build_sampling_params``
   (duration-scaled ``max_new_tokens`` above a per-model floor) and
   ``build_verbose_response`` (no segments, per-model default language).
+* ``Qwen3ASRAdapter.max_audio_clip_s`` opts into long-audio chunking, since the
+  adapter's 256-token generation cap would otherwise truncate anything past
+  about a minute.
 """
 
+import os
 import unittest
+from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai.protocol import TranscriptionRequest
 from sglang.srt.entrypoints.openai.transcription_adapters import (
     GlmAsrAdapter,
     GraniteSpeechAdapter,
     Qwen2AudioAdapter,
+    Qwen3ASRAdapter,
     WhisperAdapter,
     resolve_adapter,
 )
@@ -145,6 +151,27 @@ class TestSpeechLMAdapterContract(CustomTestCase):
         self.assertEqual(
             adapter.postprocess_text("just the transcript"), "just the transcript"
         )
+
+
+class TestQwen3ASRClipLength(CustomTestCase):
+    """Qwen3-ASR must chunk long audio; a ``None`` clip length silently truncates."""
+
+    @staticmethod
+    def _clip_s(env_value):
+        env = {k: v for k, v in os.environ.items() if k != "SGLANG_ASR_MAX_CLIP_S"}
+        if env_value is not None:
+            env["SGLANG_ASR_MAX_CLIP_S"] = env_value
+        with patch.dict(os.environ, env, clear=True):
+            return Qwen3ASRAdapter().max_audio_clip_s
+
+    def test_default_clip_is_60s(self):
+        self.assertEqual(self._clip_s(None), 60.0)
+
+    def test_zero_disables_chunking(self):
+        self.assertIsNone(self._clip_s("0"))
+
+    def test_override_clip_length(self):
+        self.assertEqual(self._clip_s("30"), 30.0)
 
 
 if __name__ == "__main__":
