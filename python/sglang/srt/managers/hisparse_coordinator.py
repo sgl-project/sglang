@@ -1410,6 +1410,7 @@ class HiSparseCoordinator:
         if req.hisparse_staging:
             self._release_staging(req)
             return
+        self._release_decode(req)
 
     def _indexer_pool(self):
         """The DSV4 C4 indexer pool backing the top-k selection, or None."""
@@ -1713,7 +1714,7 @@ class HiSparseCoordinator:
         req.hisparse_retraction_pending = False
         req.hisparse_staging = False
 
-    def request_finished(self, req: Req):
+    def _release_decode(self, req: Req):
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)

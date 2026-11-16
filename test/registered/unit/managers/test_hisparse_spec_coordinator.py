@@ -22,6 +22,62 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestHiSparseSpecCoordinator(CustomTestCase):
+    def _retraction_fixture(self):
+        coordinator = object.__new__(HiSparseCoordinator)
+        coordinator.device = "cpu"
+        coordinator.is_dsv4_hisparse = False
+        coordinator.compress_ratio = 1
+        coordinator.decode_producer_stream = None
+        coordinator.wait_for_pending_backup = MagicMock()
+        coordinator.req_to_token_pool = SimpleNamespace(
+            req_to_token=torch.tensor([[2, 3, 4]])
+        )
+        mapping = torch.zeros(16, dtype=torch.int64)
+        mapping[2:5] = torch.tensor([8, 9, 10])
+        coordinator.mem_pool_device = SimpleNamespace(
+            layer_num=2,
+            translate_loc_from_full_to_compressed=lambda ids: ids,
+            full_to_hisparse_device_index_mapping=mapping,
+        )
+        freed_device, freed_host = set(), set()
+        coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+            free_hisparse_indices=lambda ids: freed_device.update(ids.tolist()),
+            free_hisparse_mapping_only=lambda ids: mapping.index_fill_(0, ids, 0),
+        )
+        coordinator.mem_pool_host = SimpleNamespace(
+            allocated_host_indices=lambda table, row, length: table[row, : int(length)],
+            free=lambda ids: freed_host.update(ids.tolist()),
+        )
+        coordinator.req_to_host_pool = torch.tensor([[20, 21, 22]])
+        coordinator.req_to_host_pool_allocated_len = torch.tensor([3])
+        coordinator.req_to_device_buffer = torch.tensor([[8, 9, 10]])
+        coordinator.req_device_buffer_size = torch.tensor([3])
+        coordinator.req_device_buffer_tokens = torch.tensor([[[0, 1, 2]]] * 2)
+        coordinator.req_device_buffer_token_locs = torch.tensor([[[8, 9, 10]]] * 2)
+        coordinator._lru_init = torch.arange(3)
+        coordinator.lru_slots = torch.zeros((2, 1, 3), dtype=torch.int64)
+        coordinator._skip_first_backup = [False]
+        coordinator.spec_swap = HiSparseSpecSwapManager(coordinator, num_draft_tokens=0)
+        req = SimpleNamespace(
+            kv=ReqKvInfo(req_pool_idx=0, kv_allocated_len=3, kv_committed_len=3),
+            hisparse_staging=False,
+            hisparse_retraction_pending=False,
+        )
+        return coordinator, req, freed_device, freed_host
+
+    def test_release_request_reclaims_decode_host_and_device_state(self):
+        """Normal completion must reach HiSparse cleanup before the row is freed."""
+        coordinator, req, freed_device, freed_host = self._retraction_fixture()
+        coordinator.release_request(req)
+        self.assertEqual(freed_device, {8, 9, 10})
+        self.assertEqual(freed_host, {20, 21, 22})
+        self.assertEqual(int(coordinator.req_device_buffer_size[0]), 0)
+        self.assertTrue(torch.all(coordinator.req_to_host_pool == -1))
+        self.assertEqual(
+            coordinator.mem_pool_device.full_to_hisparse_device_index_mapping.count_nonzero(),
+            0,
+        )
+
     def test_spec_decode_reserve_allocates_logical_pages_only(self):
         logical_locs = torch.tensor([64, 65, 66, 67], dtype=torch.int64)
         allocator = SimpleNamespace(
