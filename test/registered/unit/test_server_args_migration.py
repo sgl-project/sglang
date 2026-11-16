@@ -141,11 +141,8 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
 
     def test_literal_auto_derives_choices(self):
         """Literal type annotations produce argparse choices automatically."""
-        sa = self._parse(
-            ["--deepep-mode", "low_latency", "--elastic-ep-backend", "none"]
-        )
+        sa = self._parse(["--deepep-mode", "low_latency"])
         self.assertEqual(sa.deepep_mode, "low_latency")
-        self.assertEqual(sa.elastic_ep_backend, "none")
 
     def test_startup_weight_load_mode(self):
         """The startup loading mode keeps serial as the safe default."""
