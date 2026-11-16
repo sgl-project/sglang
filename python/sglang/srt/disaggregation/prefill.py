@@ -1335,7 +1335,8 @@ class SchedulerDisaggregationPrefillMixin:
         for req in self.disagg_prefill_transfer_queue:
             if recv_req.matches(req.rid):
                 logger.debug(f"Abort transfer queue request. {req.rid=}")
-                req.disagg_kv_sender.abort()
+                if hasattr(req.disagg_kv_sender, "abort"):
+                    req.disagg_kv_sender.abort()
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_disagg_prefill_transfer_queue(
