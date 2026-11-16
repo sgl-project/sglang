@@ -152,10 +152,13 @@ def test_index_key_cache_strided_layer_buffer(use_fp4_indexer):
     them, keep working when a layer's buffer is a strided view."""
     _skip_if_unavailable()
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
-    from sglang.srt.runtime_context import get_parallel
+    from sglang.srt.runtime_context import get_context, get_parallel
 
     def make_pool():
-        with get_parallel().override(attn_dcp_size=1):
+        with (
+            get_context().override_server_args(),
+            get_parallel().override(attn_dcp_size=1),
+        ):
             return DSATokenToKVPool(
                 size=256,
                 page_size=PAGE_SIZE,
