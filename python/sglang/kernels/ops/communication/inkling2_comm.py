@@ -240,7 +240,7 @@ def _exchange_module(hidden, top_k, world):
 
 class RoutedExchange:
     """EP combine of routed expert rows without an all-reduce. Each rank writes
-    the rows it owns into its symmetric buffer; after a per-CTA flag barrier,
+    the rows it owns into its symmetric buffer; after a grid barrier,
     every rank sums each token's rows in top-k order, reading each row from its
     owner. Equal to unweighted_post_reorder(all_reduce(routed_rows)): every row
     is nonzero on one rank only. Row buffers alternate between two slots by a
@@ -249,7 +249,7 @@ class RoutedExchange:
 
     def __init__(self, group, max_rows, hidden, device):
         self.world, self.hidden, self.max_rows = group.world_size, hidden, max_rows
-        # Persistent grid: every CTA must be resident for the per-CTA barrier.
+        # Persistent grid: every CTA must be resident for the grid barrier.
         self.max_blocks = (
             2 * torch.cuda.get_device_properties(device).multi_processor_count
         )
@@ -257,9 +257,9 @@ class RoutedExchange:
             group, 2 * max_rows * hidden, torch.bfloat16, device
         )
         self.flags, flags_handle = _symm(
-            group, self.max_blocks * self.world, torch.uint32, device, flags=True
+            group, ar.flags_numel(self.world), torch.uint32, device, flags=True
         )
-        self.state = torch.zeros(self.max_blocks, device=device, dtype=torch.uint32)
+        self.state = torch.zeros(ar.STATE_SIZE, device=device, dtype=torch.uint32)
         self.buffer_ptrs = _ptrs(self.handle, device)
         self.flag_ptrs = _ptrs(flags_handle, device)
         # [call count, CTAs finished in the current call]
