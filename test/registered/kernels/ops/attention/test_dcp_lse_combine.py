@@ -193,6 +193,61 @@ class TestLSECombineEdgeCases(CustomTestCase):
         self.assertTrue((combined[0] == 1).all())
         self.assertTrue((combined[1] == 0).all())
 
+    def _correct_and_sum(self, outputs, lses, is_lse_base_on_e):
+        """Scale every shard's partial with correct_attn_out and add them up."""
+        from sglang.kernels.ops.attention.dcp_kernels import correct_attn_out
+
+        total = None
+        for rank in range(lses.shape[0]):
+            local = outputs[rank].contiguous()
+            corrected, _ = correct_attn_out(
+                local,
+                lses,
+                cp_rank=rank,
+                ctx=None,
+                new_output=local.new_empty(
+                    local.transpose(0, 1).shape, dtype=torch.float32
+                ),
+                is_lse_base_on_e=is_lse_base_on_e,
+            )
+            scaled = corrected.transpose(0, 1).float()
+            total = scaled if total is None else total + scaled
+        return total
+
+    def test_correct_attn_out_zeroes_empty_shards(self):
+        """An empty KV shard carries a -inf LSE and a NaN output row.
+
+        Its weight is zero, so it must contribute an exact zero rather than
+        poisoning the cross-rank sum with NaN -- including the padded row
+        where every shard is empty.
+        """
+        outputs = torch.ones(2, 2, 4, 64, device=self.device, dtype=torch.bfloat16)
+        lses = torch.zeros(2, 2, 4, device=self.device)
+        lses[1, 0] = -torch.inf  # shard 1 owns no KV of row 0
+        lses[:, 1] = -torch.inf  # row 1 is padding: every shard is empty
+        outputs[lses == -torch.inf] = torch.nan
+
+        for base_e in (False, True):
+            with self.subTest(is_lse_base_on_e=base_e):
+                combined = self._correct_and_sum(outputs, lses, base_e)
+                self.assertTrue((combined[0] == 1).all())
+                self.assertTrue((combined[1] == 0).all())
+
+    def test_correct_attn_out_handles_non_power_of_two_shapes(self):
+        """DCP size and head dim are not required to be powers of two."""
+        from sglang.test.kernels.dcp import lse_weighted_combine_cpu
+
+        N, B, H, D = 3, 2, 4, 80
+        torch.manual_seed(0)
+        outputs = torch.randn(N, B, H, D, device=self.device, dtype=torch.bfloat16)
+        lses = torch.randn(N, B, H, device=self.device, dtype=torch.float32)
+
+        combined = self._correct_and_sum(outputs, lses, True)
+        expected = lse_weighted_combine_cpu(
+            outputs.cpu(), lses.cpu(), is_lse_base_on_e=True
+        )
+        torch.testing.assert_close(combined.cpu(), expected, atol=1e-2, rtol=1e-2)
+
     def test_one_shard_dominant(self):
         """One shard has much larger LSE -- output should be close to that shard."""
         from sglang.kernels.ops.attention.dcp_kernels import dcp_lse_combine_triton

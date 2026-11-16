@@ -14,10 +14,11 @@
 
 """Group accessors, LSE-merge and all-gather collectives for decode CP (DCP).
 
-The two LSE-merge variants kept separate (bodies are backend-forced, see
+The LSE-merge variants are kept separate (bodies are backend-forced, see
 PR #25090 vs #14194):
   - cp_lse_ag_out_rs_mha: torch / natural-log logsumexp / all-reduce + head slice
   - cp_lse_ag_out_rs_mla: Triton (log2/exp2) correction / reduce-scatter
+  - cp_lse_ag_out: Triton LSE-only correction / no attention-output collective
 """
 
 import itertools
@@ -85,6 +86,33 @@ def cp_lse_ag_out_rs_mha(
     out = out[:, head_start:head_end, :].contiguous()
     if return_lse:
         return out, global_lse[:, head_start:head_end].contiguous()
+    return out
+
+
+def cp_lse_ag_out(
+    cp_attn_out: torch.Tensor,
+    cp_attn_lse: torch.Tensor,
+    cp_group: GroupCoordinator,
+    is_lse_base_on_e: bool = False,
+) -> torch.Tensor:
+    """Scale this rank's partial by the gathered LSE, keeping all group heads.
+
+    The caller's o_proj all-reduce then sums the context partitions.
+    """
+    if cp_group.world_size == 1 or cp_attn_out.shape[0] == 0:
+        return cp_attn_out
+    lses = _ag_lse(cp_attn_lse.float().contiguous(), cp_group)
+    # The correction kernel accepts a [H,B,D] view; retain contiguous [B,H,D]
+    # storage for the following projection without a transpose/copy kernel.
+    out = torch.empty_like(cp_attn_out, memory_format=torch.contiguous_format)
+    correct_attn_out(
+        cp_attn_out,
+        lses,
+        cp_group.rank_in_group,
+        ctx=None,
+        new_output=out.transpose(0, 1),
+        is_lse_base_on_e=is_lse_base_on_e,
+    )
     return out
 
 
