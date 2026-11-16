@@ -221,7 +221,9 @@ class Memory(msgspec.Struct):
                 "cache. Implies --hicache-mem-layout page_unified and "
                 "--hicache-io-backend kernel. Supported by the file and "
                 "mooncake backends, which store one object per chunk and "
-                "serve head- and layer-partitioned grids."
+                "serve head- and layer-partitioned grids. Speculative decoding "
+                "is supported only where no draft KV enters the host cache "
+                "(DFLASH with its draft KV ring, FROZEN_KV_MTP)."
             ),
             choices=["rank-suffix", "unified"],
         ),

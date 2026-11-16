@@ -165,6 +165,34 @@ def prepare_hicache_staging(
             prepare(pool, sidecar=True)
 
 
+def check_unified_hicache_draft(
+    spec_algorithm: SpeculativeAlgorithm,
+    draft_plan: Optional[HiCacheDraftPlan],
+) -> None:
+    """Refuse a HiCache draft mode that has no unified L3 keys.
+
+    The startup validation knows the algorithm, not what its draft turns out
+    to be: the draft mode is decided by the loaded draft. This runs on the
+    real mode, before the cache tree is built and storage attaches.
+    """
+    memory = get_memory()
+    if (
+        memory.hicache_storage_key_scheme != "unified"
+        # The external linker has no L3 key scheme; the flag is inert there.
+        or memory.enable_unified_cache_external_linker
+    ):
+        return
+    mode = HiCacheDraftMode.NONE if draft_plan is None else draft_plan.mode
+    if mode == HiCacheDraftMode.NONE:
+        # No draft KV reaches the host tier: pages hold the target KV alone.
+        return
+    raise NotImplementedError(
+        f"The unified key scheme does not support HiCache draft mode "
+        f"'{mode.value}' for {spec_algorithm.name}: its draft KV has no unified "
+        f"L3 keys. Use --hicache-storage-key-scheme rank-suffix."
+    )
+
+
 def maybe_register_hicache_draft(
     *,
     tree_cache,
@@ -378,6 +406,8 @@ def build_kv_cache(
     kv_event_lora_names: Optional[KvEventLoraNames] = None,
     draft_window_reaches: Optional[dict[str, int]] = None,
 ) -> KVCacheBuildResult:
+    # First, so nothing is built or attached for a refused draft mode.
+    check_unified_hicache_draft(spec_algorithm, hicache_draft_plan)
     parallel = get_parallel()
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None

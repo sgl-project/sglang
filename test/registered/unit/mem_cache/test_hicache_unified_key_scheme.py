@@ -1,5 +1,6 @@
 import threading
 import unittest
+from contextlib import ExitStack
 from dataclasses import replace
 from tempfile import TemporaryDirectory
 from types import SimpleNamespace
@@ -11,7 +12,12 @@ from sglang.srt.arg_groups.hicache_hook import (
     handle_hicache,
     handle_hicache_ratio_default,
 )
+from sglang.srt.arg_groups.kv_cache_hook import handle_cache_compatibility
 from sglang.srt.arg_groups.overrides import resolution_result
+from sglang.srt.arg_groups.speculative_hook import (
+    _resolve_dflash_draft_kv_ring,
+    handle_speculative_decoding,
+)
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
 from sglang.srt.mem_cache.hicache_key_scheme import (
@@ -24,9 +30,15 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import HostPoolGroup
+from sglang.srt.mem_cache.kv_cache_builder import (
+    build_kv_cache,
+    check_unified_hicache_draft,
+)
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode, HiCacheDraftPlan
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -116,8 +128,10 @@ class TestUnifiedKeySchemeArgs(CustomTestCase):
 
     def test_unified_refuses_speculative_decoding(self):
         # Draft layers sit on the host pool's layer axis but outside the grid.
-        with self.assertRaises(NotImplementedError):
-            _resolve(speculative_algorithm="EAGLE")
+        # The refusal needs the resolved algorithm, so it comes from the hook
+        # that runs after the speculative one, not from handle_hicache().
+        with self.assertRaisesRegex(NotImplementedError, "EAGLE3"):
+            _resolve_through_speculative(speculative_algorithm="EAGLE3")
 
     def test_unified_supports_full_page_attention_cp(self):
         args = _resolve(attn_cp_size=2, enable_prefill_cp=True)
@@ -132,6 +146,217 @@ class TestUnifiedKeySchemeArgs(CustomTestCase):
             _resolve(
                 disaggregation_mode="decode",
                 disaggregation_decode_host_receive_threshold=0.5,
+            )
+
+
+def _resolve_through_speculative(patches=(), **overrides):
+    """The hicache, speculative and cache-compatibility hooks, in pipeline order."""
+    fields = dict(
+        model_path="dummy",
+        device="cuda",
+        enable_hierarchical_cache=True,
+        hicache_storage_backend="file",
+        hicache_storage_key_scheme="unified",
+        speculative_eagle_topk=1,
+        speculative_num_steps=3,
+        speculative_num_draft_tokens=4,
+    )
+    fields.update(overrides)
+    args = ServerArgs(**fields)
+    args._model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(
+            architectures=["LlamaForCausalLM"],
+            get_text_config=lambda: SimpleNamespace(),
+        )
+    )
+    handle_hicache_ratio_default(args)
+    handle_hicache(args)
+    with ExitStack() as stack:
+        for context in patches:
+            stack.enter_context(context)
+        handle_speculative_decoding(args)
+    handle_cache_compatibility(args)
+    return args
+
+
+_SPEC_HOOK = "sglang.srt.arg_groups.speculative_hook"
+
+
+def _dflash_with_ring(ring_unsupported_reason):
+    """DFLASH without a draft checkpoint: only the ring resolution runs for real."""
+    return (
+        patch(
+            f"{_SPEC_HOOK}._handle_dflash", side_effect=_resolve_dflash_draft_kv_ring
+        ),
+        patch(
+            "sglang.srt.speculative.dflash_draft_ring.draft_kv_ring_unsupported_reason",
+            return_value=ring_unsupported_reason,
+        ),
+    )
+
+
+class TestUnifiedKeySchemeSpeculative(CustomTestCase):
+    def test_algorithms_without_draft_kv_in_hicache_are_accepted(self):
+        args = _resolve_through_speculative(speculative_algorithm="FROZEN_KV_MTP")
+        self.assertEqual(
+            resolution_result(args, "speculative_algorithm"), "FROZEN_KV_MTP"
+        )
+
+    def test_promoted_alias_is_judged_by_its_resolved_algorithm(self):
+        # A Gemma4 assistant draft promotes NEXTN to FROZEN_KV_MTP in the
+        # speculative hook; the raw name alone would be refused as EAGLE.
+        promoted = patch(
+            f"{_SPEC_HOOK}._resolve_speculative_algorithm_alias",
+            return_value="FROZEN_KV_MTP",
+        )
+        args = _resolve_through_speculative(
+            patches=(promoted,), speculative_algorithm="NEXTN"
+        )
+        self.assertEqual(
+            resolution_result(args, "speculative_algorithm"), "FROZEN_KV_MTP"
+        )
+        with self.assertRaisesRegex(NotImplementedError, "speculative-algorithm EAGLE"):
+            _resolve_through_speculative(speculative_algorithm="NEXTN")
+
+    def test_dflash_is_accepted_only_with_the_draft_kv_ring(self):
+        args = _resolve_through_speculative(
+            patches=_dflash_with_ring(None), speculative_algorithm="DFLASH"
+        )
+        self.assertTrue(resolution_result(args, "speculative_dflash_draft_kv_ring"))
+        with self.assertRaisesRegex(NotImplementedError, "only with the draft KV ring"):
+            _resolve_through_speculative(
+                patches=_dflash_with_ring("the draft is not MLA"),
+                speculative_algorithm="DFLASH",
+            )
+
+    def test_every_other_algorithm_is_refused_by_name(self):
+        # These handlers need a draft checkpoint or more arguments.
+        handlers = {
+            "DSPARK": (patch(f"{_SPEC_HOOK}._handle_dspark"),),
+            "NGRAM": (patch(f"{_SPEC_HOOK}._handle_ngram"),),
+            "UNO": (patch(f"{_SPEC_HOOK}._handle_uno"),),
+        }
+        for algorithm in ("EAGLE", "EAGLE3", "STANDALONE", "DSPARK", "NGRAM", "UNO"):
+            with (
+                self.subTest(algorithm=algorithm),
+                self.assertRaisesRegex(
+                    NotImplementedError, f"speculative-algorithm {algorithm} "
+                ),
+            ):
+                _resolve_through_speculative(
+                    patches=handlers.get(algorithm, ()),
+                    speculative_algorithm=algorithm,
+                )
+
+    def test_rank_suffix_scheme_is_not_restricted(self):
+        _resolve_through_speculative(
+            speculative_algorithm="EAGLE", hicache_storage_key_scheme="rank-suffix"
+        )
+
+    def test_decode_context_parallelism_is_still_refused_first(self):
+        with self.assertRaisesRegex(NotImplementedError, "decode context parallelism"):
+            _resolve_through_speculative(speculative_algorithm="DFLASH", dcp_size=2)
+
+    def test_host_pools_outside_hierarchical_cache_refuse_every_algorithm(self):
+        # PD decode offload builds its own controller with unified keys.
+        for hierarchical_cache in (False, True):
+            with (
+                self.subTest(hierarchical_cache=hierarchical_cache),
+                self.assertRaisesRegex(
+                    NotImplementedError, "only with --enable-hierarchical-cache"
+                ),
+            ):
+                _resolve_through_speculative(
+                    speculative_algorithm="FROZEN_KV_MTP",
+                    enable_hierarchical_cache=hierarchical_cache,
+                    disaggregation_mode="decode",
+                    disaggregation_decode_enable_offload_kvcache=True,
+                )
+
+    def test_an_inert_unified_flag_stays_inert(self):
+        # Nothing builds a HiCache host pool: the flag has no effect today,
+        # with or without speculative decoding.
+        _resolve_through_speculative(
+            speculative_algorithm="EAGLE", enable_hierarchical_cache=False
+        )
+        # The external linker has no L3 key scheme at all.
+        _resolve_through_speculative(
+            speculative_algorithm="EAGLE",
+            enable_hierarchical_cache=False,
+            hicache_storage_backend=None,
+            enable_unified_cache_external_linker=True,
+        )
+
+
+class TestUnifiedDraftModeGate(CustomTestCase):
+    def _check(
+        self,
+        mode,
+        *,
+        scheme="unified",
+        algorithm=SpeculativeAlgorithm.EAGLE,
+        external_linker=False,
+    ):
+        plan = None if mode is None else HiCacheDraftPlan(mode=mode)
+        memory = SimpleNamespace(
+            hicache_storage_key_scheme=scheme,
+            enable_unified_cache_external_linker=external_linker,
+        )
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_builder.get_memory", return_value=memory
+        ):
+            check_unified_hicache_draft(algorithm, plan)
+
+    def test_modes_without_draft_kv_pass(self):
+        self._check(None, algorithm=SpeculativeAlgorithm.NONE)
+        self._check(HiCacheDraftMode.NONE, algorithm=SpeculativeAlgorithm.FROZEN_KV_MTP)
+
+    def test_modes_with_draft_kv_are_refused_by_name(self):
+        for mode in (
+            HiCacheDraftMode.PACKED,
+            HiCacheDraftMode.SIDECAR,
+            HiCacheDraftMode.FUSED,
+        ):
+            with (
+                self.subTest(mode=mode),
+                self.assertRaisesRegex(
+                    NotImplementedError, f"draft mode '{mode.value}' for EAGLE"
+                ),
+            ):
+                self._check(mode)
+
+    def test_rank_suffix_scheme_is_not_restricted(self):
+        for mode in HiCacheDraftMode:
+            self._check(mode, scheme="rank-suffix")
+
+    def test_external_linker_ignores_the_key_scheme(self):
+        # It builds draft pools of its own and never derives L3 keys.
+        for mode in HiCacheDraftMode:
+            self._check(mode, external_linker=True)
+
+    def test_gate_runs_before_the_cache_is_built(self):
+        # Every other argument is a placeholder: the gate must raise before
+        # the cache tree is built and storage attaches, so none is read.
+        with (
+            patch(
+                "sglang.srt.mem_cache.kv_cache_builder.get_memory",
+                return_value=SimpleNamespace(
+                    hicache_storage_key_scheme="unified",
+                    enable_unified_cache_external_linker=False,
+                ),
+            ),
+            self.assertRaisesRegex(NotImplementedError, "draft mode 'fused'"),
+        ):
+            build_kv_cache(
+                server_args=None,
+                model_config=None,
+                tp_worker=None,
+                page_size=64,
+                spec_algorithm=SpeculativeAlgorithm.DFLASH,
+                enable_metrics=False,
+                enable_kv_cache_events=False,
+                enable_hierarchical_cache=True,
+                hicache_draft_plan=HiCacheDraftPlan(mode=HiCacheDraftMode.FUSED),
             )
 
 
@@ -230,6 +455,37 @@ class TestControllerUnifiedKeys(CustomTestCase):
             self._suffixes(self._controller(mla=True)),
             [f"{namespace_digest(namespace)}_L4-8"],
         )
+
+    def test_target_only_pool_keys_never_read_the_speculative_algorithm(self):
+        # A draft mode that keeps no draft KV in HiCache must derive exactly
+        # the keys of a deployment without speculative decoding. For a
+        # target-only pool the plan has no reason to look at the algorithm,
+        # and must not: any dependence on it would split the keyspace.
+        untouchable = AssertionError("target-only keys must not read the algorithm")
+        for mla, expected in ((False, "_L4-8_H1"), (True, "_L4-8")):
+            namespace = derive_namespace(
+                model_id="org/model",
+                dtype="float8_e4m3fn",
+                page_size=16,
+                rank_replicated=mla,
+                total_kv_heads=0 if mla else 8,
+                head_group=0 if mla else 4,
+                layer_partition=4,
+            )
+            with (
+                self.subTest(mla=mla),
+                patch("sglang.srt.runtime_context.get_spec", side_effect=untouchable),
+                # Also a by-name import, the style of that module.
+                patch(
+                    "sglang.srt.managers.cache_controller.get_spec",
+                    side_effect=untouchable,
+                    create=True,
+                ),
+            ):
+                self.assertEqual(
+                    self._suffixes(self._controller(mla=mla)),
+                    [namespace_digest(namespace) + expected],
+                )
 
     def test_standalone_and_grouped_pools_share_logical_identity(self):
         for mla in (False, True):

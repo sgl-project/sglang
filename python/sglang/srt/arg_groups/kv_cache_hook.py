@@ -6,6 +6,7 @@ from __future__ import annotations
 import logging
 from typing import Any, Iterable, Optional
 
+from sglang.srt.arg_groups.hicache_hook import validate_unified_key_scheme_speculative
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
     model_config_of,
@@ -349,6 +350,8 @@ def handle_prefill_only_disable_kv_cache(server_args: Any) -> None:
 
 def handle_cache_compatibility(server_args: Any) -> None:
     cfg = resolving_view(server_args)
+    # The speculative algorithm is final here; handle_hicache() ran before it.
+    validate_unified_key_scheme_speculative(server_args)
     if (
         cfg.disaggregation_decode_retraction_backup == "host_pool"
         and cfg.disaggregation_mode != "decode"

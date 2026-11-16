@@ -64,14 +64,7 @@ def handle_hicache(server_args: Any):
         return
 
     # Skip all normalization when neither hicache nor decode-offload path is active.
-    if not (
-        cfg.enable_hierarchical_cache
-        or cfg.disaggregation_decode_enable_offload_kvcache
-        or (
-            cfg.disaggregation_mode == "decode"
-            and cfg.disaggregation_decode_retraction_backup in (None, "host_pool")
-        )
-    ):
+    if not _hicache_resolution_active(cfg):
         return
 
     validate_hicache_host_memory_mode(server_args)
@@ -102,6 +95,18 @@ def handle_hicache(server_args: Any):
 
     # Step 3: DCP compatibility for the L2 (device<->host) path.
     resolve_hicache_dcp_compatibility(server_args)
+
+
+def _hicache_resolution_active(cfg: Any) -> bool:
+    """Whether any path that builds a HiCache host pool is on."""
+    return bool(
+        cfg.enable_hierarchical_cache
+        or cfg.disaggregation_decode_enable_offload_kvcache
+        or (
+            cfg.disaggregation_mode == "decode"
+            and cfg.disaggregation_decode_retraction_backup in (None, "host_pool")
+        )
+    )
 
 
 def handle_hicache_ratio_default(server_args: Any):
@@ -215,14 +220,8 @@ def resolve_hicache_key_scheme(server_args: Any):
             f"{', '.join(UNIFIED_KEY_SCHEME_STORAGE_BACKENDS)} backends; got "
             f"{cfg.hicache_storage_backend!r}."
         )
-    if cfg.speculative_algorithm is not None:
-        # Draft layers are appended to the host pool's layer axis but are not
-        # part of the model-global grid, so they would land inside a named
-        # chunk unnamed.
-        raise NotImplementedError(
-            "--hicache-storage-key-scheme unified does not support speculative "
-            "decoding: the draft layers are not part of the L3 layer grid."
-        )
+    # Speculative decoding is checked by validate_unified_key_scheme_speculative()
+    # once the speculative hook has resolved the algorithm.
     if cfg.dcp_size > 1:
         raise NotImplementedError(
             "--hicache-storage-key-scheme unified does not support decode "
@@ -252,6 +251,60 @@ def resolve_hicache_key_scheme(server_args: Any):
         resolutions["hicache_io_backend"] = "kernel"
     if resolutions:
         declare_resolution(server_args, "_resolve_hicache_key_scheme", **resolutions)
+
+
+# Speculative algorithms that keep no draft KV in HiCache: their host pages
+# hold the target KV alone, so the unified keys of a deployment without
+# speculative decoding name every byte.
+_UNIFIED_KEY_SCHEME_DRAFT_FREE_ALGORITHMS = ("FROZEN_KV_MTP",)
+
+
+def validate_unified_key_scheme_speculative(server_args: Any) -> None:
+    """Refuse speculative algorithms whose draft KV has no unified L3 keys.
+
+    Runs after handle_speculative_decoding(): which HiCache draft mode an
+    algorithm takes depends on the resolved algorithm (NEXTN is an alias, a
+    Gemma4 assistant is promoted to FROZEN_KV_MTP) and on the resolved DFLASH
+    draft KV ring, none of which handle_hicache() can see.
+    """
+    cfg = resolving_view(server_args)
+    if (
+        cfg.hicache_storage_key_scheme != "unified"
+        or cfg.enable_unified_cache_external_linker
+        or not _hicache_resolution_active(cfg)
+    ):
+        return
+    algorithm = cfg.speculative_algorithm
+    if algorithm is None:
+        return
+    if (
+        not cfg.enable_hierarchical_cache
+        or cfg.disaggregation_decode_enable_offload_kvcache
+    ):
+        # Decode offload and retraction backup build their own host pools and
+        # controllers; speculative decoding is not covered there.
+        raise NotImplementedError(
+            "--hicache-storage-key-scheme unified supports speculative decoding "
+            "only with --enable-hierarchical-cache, and not with decode KV "
+            "cache offload."
+        )
+    if algorithm in _UNIFIED_KEY_SCHEME_DRAFT_FREE_ALGORITHMS:
+        return
+    if algorithm == "DFLASH":
+        if cfg.speculative_dflash_draft_kv_ring:
+            # A ring holds no prefix, so no draft KV follows a page to L3.
+            return
+        raise NotImplementedError(
+            "--hicache-storage-key-scheme unified supports DFLASH only with the "
+            "draft KV ring: without it the draft KV lives in a sidecar pool that "
+            "has no unified L3 keys (the 'DFLASH draft KV ring' log line says "
+            "why the ring is off). Use --hicache-storage-key-scheme rank-suffix."
+        )
+    raise NotImplementedError(
+        f"--hicache-storage-key-scheme unified does not support "
+        f"--speculative-algorithm {algorithm} (supported: FROZEN_KV_MTP, DFLASH "
+        f"with the draft KV ring). Use --hicache-storage-key-scheme rank-suffix."
+    )
 
 
 def resolve_layout_io_compatibility(server_args: Any):

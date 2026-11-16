@@ -81,8 +81,15 @@ share the cache across attention-TP and PP splits when they set the same
 that every local shard tiles the shared chunk grid. The scheme pins
 `--hicache-mem-layout page_unified` and `--hicache-io-backend kernel`, and a
 page is a hit only when all of its chunks are present. It supports a single
-MHA or MLA KV pool; composite caches, speculative decoding, and DCP are not
-supported.
+MHA or MLA KV pool; composite caches and DCP are not supported.
+
+Speculative decoding is supported only where no draft KV enters the host
+cache: DFLASH with its draft KV ring, and FROZEN_KV_MTP (whose Gemma 4 targets
+are composite caches and stay unsupported for that reason). Their objects are
+exactly those of a deployment without speculative decoding. Other algorithms
+are refused at startup. EAGLE-family algorithms, FROZEN_KV_MTP included, hash
+pages over token pairs, so they never share objects with deployments that
+hash single tokens.
 
 ### GPU staging capacity
 
