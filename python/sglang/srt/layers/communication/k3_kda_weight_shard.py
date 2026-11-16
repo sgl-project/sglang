@@ -1,53 +1,7 @@
 """K3 KDA weight sharding for attention-DP prefill (``--kda-weight-shard-size N``).
 
-Under attention DP every rank runs every KDA layer on its own requests with all
-96 heads, so each rank would hold all 69 KDA layers' projection weights (~61 GB
-BF16). Here each rank of a shard group (N attention-DP ranks holding the same
-attention-TP slice) keeps 1/N of every KDA layer's large projections ([q,k,v,g]
-in-projection and o_proj), and the layer's full weights are gathered into one of
-``D + 1`` rotating slots before the layer runs (``D`` = prefetch depth,
-SGLANG_K3_KDA_WS_PREFETCH_DEPTH, default 1). The KDA math, its state pool and its
-scheduling are untouched: the gathered slot is byte-identical to the replicated
-weights, so outputs are bitwise identical to replicated ADP.
-
-Layout (head-aligned): rank ``r`` keeps exactly what a tensor-parallel rank ``r`` of
-``N`` holds of its slice: heads/N of every row block of the merged [q | k | v | g]
-in-projection and the matching heads/N input columns of o_proj (``unit_pieces``), so
-with N == TP and attention TP 1 a rank's shard is byte-for-byte KDA TP rank r's KDA
-weights (``own_view``). The slot holds the replicated layout ``[qkvg (4P x H) | o_proj
-(H x P)]``; sharded layer ``k`` reads slot ``k % (D + 1)`` through permanent parameter
-views, so nothing is rebound per forward. Shared experts (when replicated under an EP
-all-to-all backend) use the same scheme: [gate | up] rows and down columns.
-
-Gather (``mover="ce"``, default): the shard is one cuMem allocation exported to the
-group and mapped on every peer (``_vmm_alloc_and_peers``: POSIX fds within a host,
-fabric handles across hosts), and it never changes after loading, so a gather is
-peer pulls by the copy engines on a private copy stream, with zero SMs: per peer one
-contiguous copy per in-projection row block and one ``cuMemcpy2DAsync`` for its o_proj
-column slice (the slot's row pitch). This rank's own pieces are copied last from its
-own shard. No barrier and no collective: a rank never waits on a peer, so DP ranks
-idle in a forward need not take part. ``ce_ms`` uses one copy stream per peer.
-
-Schedule (``on_layer_start`` at every decoder layer start, i.e. after the previous
-MoE stage): a sharded layer waits for its gather, then the next ``D`` sharded
-layers' gathers are issued (into the next forward once this one has none left).
-With ``issue_at="core"`` (SGLANG_K3_KDA_WS_ISSUE_AT) a sharded layer issues them from
-``on_core_start`` instead, after its in-projection GEMM, so the pulls overlap the KDA
-core rather than the HBM-bound in-projection.
-The slot a gather overwrites was last read by a layer whose kernels precede the
-issue point on the compute stream; the copy stream waits on it, and a slot is
-never reissued while its layer is pending or running. ``on_moe_start`` (before the
-DEP dispatch) makes the compute stream wait for the gathers this layer issued, so
-gather traffic never overlaps the MoE all-to-all; a gather longer than the
-attention stage becomes a stall there instead (SGLANG_K3_KDA_WS_STATS times it).
-SGLANG_K3_KDA_WS_MOE_WAIT selects when that MoE-stage wait applies: "always" (default),
-"never", or a token count N (only in forwards whose largest per-DP-rank token count is
->= N). Without it the gather runs on through the MoE stage and the only wait is the
-consuming layer's ``on_layer_start``; the slot rules above do not depend on it.
-
-CUDA graphs: issuing a gather inside a capture is refused. The model calls both
-hooks through ``eager_on_graph``, so under the breakable prefill graph they run
-between captured segments in eager stream order; full graphs are not supported.
+Each shard-group rank keeps 1/N of every KDA layer's projections; a layer's full weights
+are gathered into a rotating slot by copy-engine peer pulls before it runs.
 """
 
 from __future__ import annotations
@@ -68,8 +22,7 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 
-# Element alignment of every shard boundary and parameter offset (256 B for bf16), so
-# the parameter views keep the alignment cuBLAS and TMA see on the replicated weights.
+# 256 B for bf16, so parameter views keep the alignment cuBLAS and TMA expect.
 ALIGN = 128
 MOVERS = ("ce", "ce_ms")
 
@@ -77,11 +30,9 @@ MOVERS = ("ce", "ce_ms")
 @dataclass(frozen=True)
 class ParamSpec:
     name: str
-    shape: Tuple[int, ...]  # 2-D [rows, cols]: the parameter as the layer reads it
-    offset: int  # elements, from the start of the layer's flat buffer
-    # How the shard group splits it, as tensor parallelism does: "rows" cuts each of
-    # ``blocks`` row blocks N ways (a merged column-parallel weight: rank r keeps its
-    # rows of every block); "cols" cuts the columns N ways (a row-parallel weight).
+    shape: Tuple[int, ...]
+    offset: int
+    # "rows": each of ``blocks`` row blocks is cut N ways; "cols": columns cut N ways.
     split: str = "rows"
     blocks: int = 1
 
@@ -94,8 +45,6 @@ class ParamSpec:
 
 
 def parse_moe_wait(value: str) -> Optional[int]:
-    """SGLANG_K3_KDA_WS_MOE_WAIT as the smallest forward token count whose MoE stage
-    waits for the layer's gathers: "always" -> 0, "never" -> None, "N" -> N."""
     v = value.strip().lower()
     if v == "always":
         return 0
@@ -109,9 +58,6 @@ def parse_moe_wait(value: str) -> Optional[int]:
 
 
 def layer_layout(shapes: Sequence[tuple]):
-    """Param specs at ALIGN-aligned offsets and the layer's flat size. ``shapes``:
-    ``(name, (rows, cols), split, blocks)`` per parameter (``split`` / ``blocks`` as
-    ParamSpec)."""
     specs, off = [], 0
     for name, shape, split, blocks in shapes:
         if split not in ("rows", "cols") or blocks < 1 or len(shape) != 2:
@@ -124,8 +70,6 @@ def layer_layout(shapes: Sequence[tuple]):
 
 
 def kda_unit_shapes(proj: int, hidden: int) -> list:
-    """A KDA layer's sharded projections as tensor parallelism slices them: the merged
-    [q | k | v | g] in-projection (4 row blocks) and o_proj (columns)."""
     return [
         ("qkvg", (4 * proj, hidden), "rows", 4),
         ("o_proj", (hidden, proj), "cols", 1),
@@ -133,7 +77,6 @@ def kda_unit_shapes(proj: int, hidden: int) -> list:
 
 
 def shared_expert_unit_shapes(intermediate: int, hidden: int) -> list:
-    """Shared experts as tensor parallelism slices them: [gate | up] and down."""
     return [
         ("gate_up", (2 * intermediate, hidden), "rows", 2),
         ("down", (hidden, intermediate), "cols", 1),
@@ -142,9 +85,7 @@ def shared_expert_unit_shapes(intermediate: int, hidden: int) -> list:
 
 @dataclass(frozen=True)
 class _Piece:
-    """This rank's part of one row block (``split="rows"``) or of the columns
-    (``split="cols"``) of a parameter, stored row-major ``[rows, cols]`` at ``off``
-    elements into the unit's shard."""
+    """This rank's part of one row block or column slice of a parameter."""
 
     name: str
     block: int
@@ -156,9 +97,6 @@ class _Piece:
 def unit_pieces(
     specs: Sequence[ParamSpec], group_size: int
 ) -> Tuple[List[_Piece], int]:
-    """Head-aligned shard of one unit (every group rank has the same piece sizes): per
-    parameter, in block order, the rank's rows of each row block, or its column slice.
-    Returns the pieces and the shard elements; every piece starts ALIGN-aligned."""
     pieces, off = [], 0
     for sp in specs:
         R, C = sp.shape
@@ -183,21 +121,7 @@ def unit_pieces(
 
 
 class LayerWeightShard:
-    """Per-rank shard store, gather slots and gather schedule for weight-sharded layers.
-
-    ``units``: ``(decoder layer index, [(name, (rows, cols), split, blocks), ...])`` per
-    sharded layer (``layer_layout``), in ascending layer order; units may have different
-    shapes (the slots are sized to the largest). Unit ``u`` is gathered into slot
-    ``u % (prefetch_depth + 1)``.
-    ``num_layers``: decoder layers in the model (the schedule walks all of them).
-    ``alloc_shard``: allocates this rank's shard buffer (elements).
-    ``peer_shards``: called once with this rank's shard buffer, returns every group
-    rank's shard buffer (index = rank in group) as tensors this rank can copy from.
-    ``mover``: "ce" (one copy stream) or "ce_ms" (one copy stream per peer).
-    ``moe_wait_min_tokens``: ``on_moe_start`` waits for the layer's gathers only in forwards
-    of at least this many tokens (``parse_moe_wait``); 0 always, None never.
-    ``group_barrier``: a barrier over the shard group (``finish_load``).
-    """
+    """Per-rank shard store, gather slots and gather schedule for weight-sharded layers."""
 
     def __init__(
         self,
@@ -284,16 +208,14 @@ class LayerWeightShard:
             (self.num_slots, max(self.e_size)), dtype=dtype, device=device
         )
         self._group_barrier = group_barrier
-        # --load-format dummy: finish_load fills the shard with random values.
         self.dummy_load = False
-        # Per unit: piece index -> the disjoint row ranges [x, y) of the piece loaded so far.
+        # Per unit: piece index -> disjoint row ranges [x, y) loaded so far.
         self._loaded: List[Dict[int, List[Tuple[int, int]]]] = [
             {} for _ in range(self.num_units)
         ]
 
         cuda = device.type == "cuda"
         self._copy_stream = torch.cuda.Stream(device=device) if cuda else None
-        # ce_ms: one extra copy stream per peer, so the copy engines run the pulls concurrently.
         self._peer_streams = (
             [torch.cuda.Stream(device=device) for _ in range(group_size - 1)]
             if cuda and mover == "ce_ms"
@@ -301,15 +223,13 @@ class LayerWeightShard:
         )
         # unit -> ready event (None on CPU) for gathers issued and not yet waited on.
         self._pending: Dict[int, Optional[torch.cuda.Event]] = {}
-        # slot -> unit whose weights it holds or will hold and whose layer has not finished
-        # (pending, or waited on and running); None when the slot may be overwritten.
+        # slot -> unit holding it until that unit's layer finishes; None when free.
         self._slot_owner: List[Optional[int]] = [None] * self.num_slots
         self._running: Optional[int] = None
         # Units whose gather this layer's start issued (the MoE stage waits for them).
         self._issued_this_layer: List[int] = []
-        # Benchmarks: list of (unit, start ev, copies-done ev, ready ev) per gather.
+        # (unit, start ev, copies-done ev, ready ev) per gather.
         self.trace: Optional[list] = None
-        # Stall accounting (stats=True): the MoE-stage wait and the layer-start wait.
         self.stats = False
         self._stall_evs: List[tuple] = []  # (kind, layer, start ev, end ev)
         self.moe_wait_ms_total = 0.0
@@ -319,8 +239,6 @@ class LayerWeightShard:
         self.layer_wait_max_ms = 0.0
         self.layer_wait_count = 0
         self._last_hooked_layer = num_layers
-        # Lean issue (mover "ce" on CUDA): per-unit (dst, src) views and ready events built
-        # once, so a gather is one event wait, its peer copies and one event record.
         self.lean_issue = (
             cuda and mover == "ce" and envs.SGLANG_K3_KDA_WS_LEAN_ISSUE.get()
         )
@@ -330,25 +248,17 @@ class LayerWeightShard:
         self._copy_ctx = torch.cuda.stream(self._copy_stream) if cuda else None
         self._device_index = device.index if cuda else None
 
-    # ---- layout ---------------------------------------------------------------------------
-
     def slot_of(self, u: int) -> int:
         return u % self.num_slots
 
     def unit_buffer(self, u: int) -> torch.Tensor:
-        """Unit ``u``'s full flat weights as the layer reads them."""
         return self.slots[self.slot_of(u), : self.e_size[u]]
 
     def param_view(self, u: int, name: str) -> torch.Tensor:
-        """Parameter ``name`` of unit ``u`` (full, replicated layout): a view of its slot."""
         sp = self.specs[u][name]
         return self.unit_buffer(u)[sp.offset : sp.offset + sp.numel].view(sp.shape)
 
     def own_view(self, u: int, name: str) -> torch.Tensor:
-        """This rank's part of parameter ``name`` of unit ``u``, a view of its shard:
-        exactly what a tensor-parallel rank ``group_rank`` of ``group_size`` holds
-        (``[blocks * rows / N, cols]`` for a row split, ``[rows, cols / N]`` for a
-        column split)."""
         mine = [pc for pc in self.pieces[u] if pc.name == name]
         if not mine:
             raise KeyError(f"unit {u} has no parameter {name!r}")
@@ -361,13 +271,9 @@ class LayerWeightShard:
         base = self.shard_offset[u] + start
         return self.shard[base : base + rows * cols].view(rows, cols)
 
-    # ---- loading ----------------------------------------------------------------------------
-
     def load(
         self, u: int, name: str, loaded: torch.Tensor, row_offset: int = 0
     ) -> None:
-        """Store this rank's part of rows ``[row_offset, row_offset + loaded.shape[0])`` of
-        parameter ``name`` of unit ``u`` (full, unsharded rows)."""
         sp = self.specs[u][name]
         R, C = sp.shape
         if loaded.dim() != 2 or loaded.shape[1] != C:
@@ -387,9 +293,7 @@ class LayerWeightShard:
                 + pc.rows * pc.cols
             ].view(pc.rows, pc.cols)
             if sp.split == "rows":
-                lo = (
-                    pc.block * self.group_size + r
-                ) * pc.rows  # first row of the piece
+                lo = (pc.block * self.group_size + r) * pc.rows
                 x, y = max(lo, row_offset), min(lo + pc.rows, row_offset + n)
                 if x < y:
                     self._mark_loaded(u, i, x - lo, y - lo)
@@ -403,8 +307,6 @@ class LayerWeightShard:
                 )
 
     def _mark_loaded(self, u: int, i: int, x: int, y: int) -> None:
-        """Record rows [x, y) of piece ``i`` of unit ``u``; raises before the write if any
-        of them was already loaded."""
         ranges = self._loaded[u].setdefault(i, [])
         for a, b in ranges:
             if a < y and x < b:
@@ -416,8 +318,6 @@ class LayerWeightShard:
         ranges.append((x, y))
 
     def check_loaded(self) -> None:
-        """Every piece of every unit was loaded exactly once (``_mark_loaded`` keeps the
-        loaded ranges disjoint, so full row counts mean full coverage)."""
         bad = []
         for u, pieces in enumerate(self.pieces):
             for i, pc in enumerate(pieces):
@@ -431,8 +331,6 @@ class LayerWeightShard:
             )
 
     def init_dummy(self, low: float = -1e-3, high: float = 1e-3, seed: int = 1234):
-        """--load-format dummy: fill this rank's shard with random values, as
-        ``initialize_dummy_weights`` does for parameters, and mark every slice loaded."""
         if any(self._loaded):
             raise RuntimeError(
                 "weight shard: dummy init after checkpoint slices loaded"
@@ -445,28 +343,21 @@ class LayerWeightShard:
             self._loaded[u] = {i: [(0, pc.rows)] for i, pc in enumerate(pieces)}
 
     def finish_load(self) -> None:
-        """Check the load, then make sure every group rank's shard has landed on its
-        device before any rank's first gather pulls it."""
         if self.dummy_load and not any(self._loaded):
             self.init_dummy()
         self.check_loaded()
+        # A peer must not pull this shard before its host-to-device copies land.
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         if self._group_barrier is not None:
             self._group_barrier()
 
-    # ---- gather + schedule ------------------------------------------------------------------
-
     def _copy_ops(self, u: int) -> list:
-        """Unit ``u``'s gather as copy ops into the replicated layout of its slot, in
-        rotated peer order (at step i every rank pulls from rank + i, so no source serves
-        two readers at once), this rank's own pieces last. A row-split piece is one
-        contiguous copy; a column-split piece lands with a row pitch, as one 2-D copy
-        (``_memcpy2d``: copy engine, no SMs)."""
         slot = self.unit_buffer(u)
         off, n, r = self.shard_offset[u], self.group_size, self.group_rank
         es = self.shard.element_size()
         ops = []
+        # Rotated peer order so no source serves two readers at once; own pieces last.
         for p in [(r + i) % n for i in range(1, n)] + [r]:
             src_shard = self.shard if p == r else self.peers[p]
             for pc in self.pieces[u]:
@@ -502,7 +393,6 @@ class LayerWeightShard:
             _memcpy2d(spec2d, stream)
 
     def _move(self, u: int) -> None:
-        """Enqueue the gather of unit ``u`` (the current stream is the copy stream)."""
         ops = self._copy_ops(u)
         if self.mover == "ce" or self._copy_stream is None:
             cur = torch.cuda.current_stream(self.device) if self._copy_stream else None
@@ -522,7 +412,6 @@ class LayerWeightShard:
             cur.wait_stream(st)
 
     def issue(self, k: int) -> None:
-        """Start gathering unit ``k`` into its slot (no-op if already pending)."""
         if k in self._pending:
             return
         owner = self._slot_owner[self.slot_of(k)]
@@ -563,13 +452,9 @@ class LayerWeightShard:
         self._pending[k] = ev
 
     def _issue_lean(self, k: int) -> torch.cuda.Event:
-        """``issue``'s copy-stream part with everything per unit precomputed: the copy
-        stream joins the compute stream through one reused event, the peer copies run on
-        cached views, and the unit's own reused ready event marks them done. Reusing the
-        events is safe: a stream wait binds the event's latest record at enqueue time, and
-        a unit is reissued only after its previous gather was waited on."""
         if self._pull_ops is None:
             self._pull_ops = [self._copy_ops(u) for u in range(self.num_units)]
+            # Safe to reuse: a unit is reissued only after its last gather was waited on.
             self._ready_events = [torch.cuda.Event() for _ in range(self.num_units)]
         # Everything enqueued so far, including the last reader of this slot, precedes the copies.
         self._join_event.record(torch.cuda.current_stream(self._device_index))
@@ -587,9 +472,6 @@ class LayerWeightShard:
             self._running = None
 
     def wait(self, k: int) -> None:
-        """Make the current stream wait until unit ``k``'s slot holds its weights; ``k``
-        becomes the running unit (the previous one's kernels are enqueued, so its slot
-        is released)."""
         if self._running != k:
             self._release_running()
         if k not in self._pending:
@@ -600,13 +482,7 @@ class LayerWeightShard:
         self._running = k
 
     def on_layer_start(self, layer_idx: int) -> None:
-        """Call at the start of decoder layer ``layer_idx``, before its attention.
-
-        The previous sharded layer's kernels are all enqueued before this point, so its
-        slot is free for a gather issued from here on. The running unit waits for its
-        gather; then the next ``prefetch_depth`` units are issued, in order, into the
-        following forward once this one has none left, stopping at the first unit whose
-        slot is still held."""
+        # The previous sharded layer's kernels are all enqueued, so its slot is free.
         self._release_running()
         if self.stats and layer_idx <= self._last_hooked_layer:
             self._log_forward_stalls()  # first hooked layer of a new forward
@@ -626,18 +502,12 @@ class LayerWeightShard:
             self._issue_ahead(self.next_unit[layer_idx])
 
     def on_core_start(self, layer_idx: int) -> None:
-        """issue_at="core": call where a sharded layer's attention core starts (after its
-        in-projection GEMM, the HBM-heaviest kernel of the layer); the next units'
-        gathers are issued here instead of at the layer start."""
         k = self.unit_index.get(layer_idx)
         if self.issue_at != "core" or k is None:
             return
         self._issue_ahead(k + 1)
 
     def _issue_ahead(self, first: int) -> None:
-        """Issue, in order, the gathers of the ``prefetch_depth`` units from ``first``
-        (into the next forward once this one has none left), stopping at the first unit
-        whose slot is still held."""
         for j in range(first, first + self.prefetch_depth):
             if j >= self.num_units and (j - self.num_units) >= first:
                 break  # wrapped past this forward's own window
@@ -650,23 +520,14 @@ class LayerWeightShard:
             self._issued_this_layer.append(u)
 
     def needs_layer_hook(self, layer_idx: int) -> bool:
-        """Whether the hooks can act at this layer: sharded layers wait and issue; other
-        layers can only issue the wrap-around prefetch after the last sharded layer (in
-        between, the next sharded layer's gather is already in flight). Under a breakable
-        prefill CUDA graph each hooked call is an eager break, so the other layers stay
-        inside the captured segments."""
         if self.issue_at == "core":
             return True  # non-sharded layers' starts issue the next unit's gather
         return layer_idx in self.unit_index or layer_idx > self.unit_layers[-1]
 
     def moe_wait_needs_tokens(self) -> bool:
-        """Whether ``on_moe_start`` needs the forward's token count to decide."""
         return self.moe_wait_min_tokens not in (0, None)
 
     def moe_wait_units(self, num_tokens: Optional[int] = None) -> List[int]:
-        """Units the MoE stage of the current layer waits for (and forgets them): the
-        gathers this layer issued, unless SGLANG_K3_KDA_WS_MOE_WAIT exempts this forward
-        (those stay pending and are waited on at their own layer's start)."""
         issued, self._issued_this_layer = self._issued_this_layer, []
         if not issued or self.moe_wait_min_tokens is None:
             return []
@@ -681,11 +542,7 @@ class LayerWeightShard:
         return [u for u in issued if u in self._pending]
 
     def on_moe_start(self, layer_idx: int, num_tokens: Optional[int] = None) -> None:
-        """Call where layer ``layer_idx``'s MoE stage starts, before the DEP dispatch: the
-        compute stream waits for the gathers this layer's start issued, so gather traffic
-        never overlaps the MoE all-to-all (an overrun becomes a stall here).
-        ``num_tokens``: the forward's largest per-DP-rank token count (needed only when
-        ``moe_wait_needs_tokens``)."""
+        # Keeps gather NVLink traffic off the MoE all-to-all.
         units = self.moe_wait_units(num_tokens)
         if self._copy_stream is None or not units:
             return
@@ -715,8 +572,6 @@ class LayerWeightShard:
         self._stall_evs.append((kind, layer_idx, e0, e1))
 
     def _log_forward_stalls(self) -> None:
-        """Log the MoE-stage and layer-start wait stalls of the forwards finished since
-        the last call (SGLANG_K3_KDA_WS_STATS)."""
         before = (
             self.moe_wait_ms_total,
             self.moe_wait_count,
@@ -745,7 +600,6 @@ class LayerWeightShard:
             )
 
     def _fold_stalls(self) -> None:
-        """Fold finished stall measurements into the aggregate counters."""
         keep = []
         for kind, layer, e0, e1 in self._stall_evs:
             if not e1.query():
@@ -769,12 +623,8 @@ class LayerWeightShard:
         return sorted(self._pending)
 
     def bytes_per_rank(self) -> Tuple[int, int]:
-        """(shard bytes, slot bytes) held on this rank."""
         shard_b = self.shard.numel() * self.shard.element_size()
         return shard_b, self.slots.numel() * self.slots.element_size()
-
-
-# ---- CUDA driver: VMM shard allocations shared with the group, 2-D copies ------------------
 
 
 class _CuMemLocation(ctypes.Structure):
@@ -810,13 +660,11 @@ _CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 3
 _CU_MEM_ALLOC_GRANULARITY_MINIMUM = 0
 _CU_MEM_HANDLE_TYPE_POSIX_FD = 1
 _CU_MEM_HANDLE_TYPE_FABRIC = 8
-# None, POSIX fd, fabric: the handle types a shard can be allocated with.
 _CU_MEM_HANDLE_TYPES = (0, _CU_MEM_HANDLE_TYPE_POSIX_FD, _CU_MEM_HANDLE_TYPE_FABRIC)
 
 
 class _CudaArray:
-    """``__cuda_array_interface__`` over a raw device range, so ``torch.as_tensor`` wraps it
-    without a copy; holds the owning ``_Vmm`` so the mappings outlive every view."""
+    """Zero-copy tensor view of a device range; keeps its ``_Vmm`` (the mappings) alive."""
 
     def __init__(self, ptr: int, nbytes: int, owner: _Vmm):
         self.owner = owner
@@ -830,9 +678,7 @@ class _CudaArray:
 
 
 class _Vmm:
-    """CUDA driver VMM (libcuda) on one device: physical allocations, VA reservations mapped
-    piecewise onto them, torch views of the VAs. Everything is released once the store and
-    every view are gone."""
+    """CUDA driver VMM allocations, mappings and tensor views on one device."""
 
     def __init__(self, device: torch.device):
         try:
@@ -845,10 +691,9 @@ class _Vmm:
         self.dev_index = (
             device.index if device.index is not None else torch.cuda.current_device()
         )
-        torch.empty(
-            0, device=device
-        )  # the primary context exists before any driver call
-        self._handles: List[int] = []  # created or retained, released at teardown
+        # The primary context must exist before any driver call.
+        torch.empty(0, device=device)
+        self._handles: List[int] = []
         self._maps: List[Tuple[int, int]] = []  # (va, bytes)
         self._reserved: List[Tuple[int, int]] = []
         self._finalizer = weakref.finalize(
@@ -884,7 +729,6 @@ class _Vmm:
         return g.value if rc == 0 else 0
 
     def granularity(self) -> int:
-        """Mapping granularity that serves every handle type the shard could be allocated with."""
         gs = [self._granularity_of(self._prop(ht)) for ht in _CU_MEM_HANDLE_TYPES]
         gs = [g for g in gs if g]
         if not gs:
@@ -909,7 +753,6 @@ class _Vmm:
         return h.value
 
     def export(self, handle: int, handle_type: int):
-        """Shareable handle: an fd (POSIX) or the 64-byte fabric handle."""
         if handle_type == _CU_MEM_HANDLE_TYPE_POSIX_FD:
             fd = ctypes.c_int()
             self._check(
@@ -947,7 +790,6 @@ class _Vmm:
     def map_flat(
         self, handles: Sequence[int], nbytes: Sequence[int], dtype: torch.dtype
     ) -> torch.Tensor:
-        """Whole allocations mapped back to back into one new VA, as one flat tensor."""
         total = sum(nbytes)
         va = self.reserve(total, self.granularity())
         off = 0
@@ -973,7 +815,6 @@ class _Vmm:
         return va.value
 
     def map(self, va: int, nbytes: int, handle: int) -> None:
-        """Map the whole allocation ``handle`` (``nbytes``) at ``va``."""
         self._check(
             self.lib.cuMemMap(
                 ctypes.c_ulonglong(va),
@@ -1009,9 +850,8 @@ class _Vmm:
     def _release(lib, dev_index, maps, reserved, handles) -> None:
         try:
             torch.cuda.synchronize(dev_index)
-        except (
-            Exception
-        ):  # interpreter shutdown: the driver tears the context down anyway
+        except Exception:
+            # Interpreter shutdown: the driver tears the context down anyway.
             return
         for va, nbytes in maps:
             lib.cuMemUnmap(ctypes.c_ulonglong(va), ctypes.c_size_t(nbytes))
@@ -1062,7 +902,6 @@ def _libcuda():
 def _memcpy2d_args(
     *, dst: int, dst_pitch: int, src: int, src_pitch: int, width: int, height: int
 ) -> _CudaMemcpy2D:
-    """A device-to-device 2-D copy (``height`` rows of ``width`` bytes) for ``_memcpy2d``."""
     return _CudaMemcpy2D(
         srcMemoryType=_CU_MEMORYTYPE_DEVICE,
         srcDevice=src,
@@ -1076,9 +915,7 @@ def _memcpy2d_args(
 
 
 def _memcpy2d(args: _CudaMemcpy2D, stream: torch.cuda.Stream) -> None:
-    """cuMemcpy2DAsync on ``stream``: a strided device-to-device copy that the copy
-    engines execute (a column slice of o_proj lands with the full row pitch), where a
-    torch copy into the strided view would launch a kernel."""
+    # Copy-engine strided copy; a torch copy into the strided view would launch a kernel.
     rc = _libcuda().cuMemcpy2DAsync_v2(
         ctypes.byref(args), ctypes.c_void_p(stream.cuda_stream)
     )
@@ -1088,18 +925,14 @@ def _memcpy2d(args: _CudaMemcpy2D, stream: torch.cuda.Stream) -> None:
         )
 
 
-# ---- model wiring ---------------------------------------------------------------------------
-
 _ACTIVE: Optional[LayerWeightShard] = None
-# Shared-expert store (replicated shared experts under EP a2a): one unit per MoE layer.
 _ACTIVE_SHARED: Optional[LayerWeightShard] = None
 _BUILDING = False
 
 
 @contextlib.contextmanager
 def building_target_model():
-    """Scope in which constructed KDA layers belong to the sharded target model (the
-    draft / NextN model is built outside it and keeps replicated weights)."""
+    """KDA layers built in this scope are sharded; the draft model keeps replicated weights."""
     global _BUILDING
     prev, _BUILDING = _BUILDING, True
     try:
@@ -1125,7 +958,6 @@ def _stores() -> List[LayerWeightShard]:
 
 
 def needs_layer_hook(layer_idx: int) -> bool:
-    """Whether any store's layer/MoE hooks act at decoder layer ``layer_idx``."""
     return any(s.needs_layer_hook(layer_idx) for s in _stores())
 
 
@@ -1136,8 +968,6 @@ def on_layer_start(layer_idx: int) -> None:
 
 
 def moe_wait_needs_tokens() -> bool:
-    """Whether ``on_moe_start`` needs the forward's token count (SGLANG_K3_KDA_WS_MOE_WAIT
-    is a threshold), so callers skip computing it otherwise."""
     return any(s.moe_wait_needs_tokens() for s in _stores())
 
 
@@ -1148,22 +978,16 @@ def on_moe_start(layer_idx: int, num_tokens: Optional[int] = None) -> None:
 
 
 def check_all_loaded() -> None:
-    """Every store received exactly its checkpoint slices."""
     for s in _stores():
         s.check_loaded()
 
 
 def finish_load() -> None:
-    """Call from the model's post_load_weights, which every loader runs (load_weights or
-    not): checks each store's slices (random under --load-format dummy), then syncs the
-    shard group so no peer pulls a shard before its host-to-device copies land."""
     for s in _stores():
         s.finish_load()
 
 
 def _exchange_fds(fds: List[int], group, timeout_s: float = 120.0) -> List[List[int]]:
-    """Every group rank's fds (own entry: ``fds``), passed over abstract unix sockets with
-    SCM_RIGHTS: each rank serves its fds to every peer that connects."""
     import socket
     import threading
     import uuid
@@ -1225,9 +1049,6 @@ def _exchange_fds(fds: List[int], group, timeout_s: float = 120.0) -> List[List[
 
 
 def _vmm_alloc_and_peers(group, dtype: torch.dtype, device: torch.device):
-    """The shard as one cuMem allocation, exported to the group (POSIX fds within a host,
-    fabric handles across hosts) and mapped on every peer, so the gathers are peer pulls
-    by the copy engines."""
     import socket
     import time
 
@@ -1288,11 +1109,7 @@ def _vmm_alloc_and_peers(group, dtype: torch.dtype, device: torch.device):
 def shard_group_layout(
     ranks: Sequence[int], attn_tp: int, group_size: int, tp_rank: int
 ) -> tuple[list[list[int]], int, int]:
-    """(every shard group's member ranks, this rank's group index, its rank in the group).
-
-    A shard group holds ``group_size`` attention-DP ranks with the same attention-TP slice
-    (tp rank = dp rank * attn_tp + attention-TP rank); each keeps 1/group_size of that
-    slice. Under attention TP 1 these are runs of consecutive TP ranks."""
+    """(every shard group's member ranks, this rank's group index, its rank in the group)."""
     dp_size = len(ranks) // attn_tp
     if len(ranks) % attn_tp != 0 or dp_size % group_size != 0:
         raise ValueError(
@@ -1323,9 +1140,6 @@ def init_for_model(
     shared_intermediate_size: int = 0,
     dummy_load: bool = False,
 ) -> LayerWeightShard:
-    """Build the process-wide shard stores for the K3 target model (call before its layers):
-    the KDA projections and, for ``shared_expert_layers`` (the MoE layers whose shared
-    experts would be replicated on every rank), the shared experts' gate_up and down."""
     global _ACTIVE, _ACTIVE_SHARED
     if _ACTIVE is not None or _ACTIVE_SHARED is not None:
         raise RuntimeError(
@@ -1357,7 +1171,6 @@ def init_for_model(
     num_layers = config.num_hidden_layers
     kda_ids = [l for l in config.linear_layer_ids if l < num_layers]
     H = config.hidden_size
-    # This rank's attention-TP slice of the KDA projections.
     P = (
         config.linear_attn_config["num_heads"]
         * config.linear_attn_config["head_dim"]
