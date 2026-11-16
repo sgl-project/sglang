@@ -271,9 +271,6 @@ class HfModelConfigParser(ModelConfigParserBase):
         is_ocr2 = _is_deepseek_ocr2_model(config)
 
         if is_ocr2:
-            _override_v_head_dim_if_zero(config)
-            config.model_type = "deepseek-ocr"
-            _set_architectures(config, "DeepseekOCRForCausalLM")
             config = DeepseekVLV2Config.from_pretrained(model, revision=revision)
             _apply_deepseek_ocr_overrides(config, model)
         elif isinstance(config, DeepseekV41Config):
