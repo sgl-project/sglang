@@ -293,13 +293,15 @@ class ServerArgs:
                     or cfg.enable_torch_compile
                     or cfg.enable_memory_saver
                     or cfg.enable_page_major_kv_layout
+                    or cfg.speculative_algorithm
                 ):
                     raise ValueError(
                         "MPS graph execution does not support LoRA, torch.compile, "
-                        "memory saver or page-major KV layouts"
+                        "memory saver, page-major KV layouts or speculative decoding"
                     )
             if cfg.mps_execution_backend == "mlx-compiled" and (
-                cfg.disaggregation_mode != "null"
+                not cfg.disable_overlap_schedule
+                or cfg.disaggregation_mode != "null"
                 or cfg.enable_hierarchical_cache
                 or cfg.enable_lmcache
                 or cfg.enable_session_radix_cache

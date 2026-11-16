@@ -16,7 +16,7 @@ from sglang.srt.hardware_backend.mlx.fx_lowering import (
     build_mlx_fx_plan,
 )
 from sglang.srt.hardware_backend.mps.compiled_region import UnsupportedMlxRegion
-from sglang.srt.utils.tensor_bridge import MlxTensorView
+from sglang.srt.utils.tensor_bridge import MlxTensorView, torch_to_mlx
 
 logger = logging.getLogger(__name__)
 
@@ -124,13 +124,10 @@ class CompiledMlxGraph:
             exported = torch.export.export(
                 model, example_inputs, strict=False, dynamic_shapes=shapes
             )
-        except torch._dynamo.exc.UserError as error:
-            if not dynamic_tokens:
-                raise
-            raise UnsupportedMlxRegion(
-                f"Unsupported dynamic MLX export: {error}"
-            ) from error
-        exported = exported.run_decompositions({})
+            exported = exported.run_decompositions({})
+        except (RuntimeError, ValueError, NotImplementedError) as error:
+            phase = "dynamic MLX export" if dynamic_tokens else "MLX export"
+            raise UnsupportedMlxRegion(f"Unsupported {phase}: {error}") from error
         if any(
             s.kind != OutputKind.USER_OUTPUT
             for s in exported.graph_signature.output_specs
@@ -222,6 +219,7 @@ class CompiledMlxGraph:
                 for tail in (False, True)
             }
         )
+        self._prepared = set()
 
     def _function(self, tail):
         def forward(*flat):
@@ -255,7 +253,24 @@ class CompiledMlxGraph:
                 elif str(node.target) == "sglang.mlx_radix_decode.default":
                     if self.attention is None:
                         raise ValueError("Radix attention lowering was not provided")
-                    tails = (flat[-2][layer], flat[-1][layer]) if tail else None
+                    arguments = node.target._schema.arguments
+                    kw = {
+                        **{arg.name: value for arg, value in zip(arguments, args)},
+                        **kw,
+                    }
+                    tail_k, tail_v = kw.pop("tail_k", None), kw.pop("tail_v", None)
+                    args = tuple(
+                        kw.pop(arg.name)
+                        for arg in arguments
+                        if not arg.kwarg_only and arg.name not in ("tail_k", "tail_v")
+                    )
+                    tails = (
+                        (flat[-2][layer], flat[-1][layer])
+                        if tail
+                        else (tail_k, tail_v)
+                        if tail_k is not None
+                        else None
+                    )
                     values[node] = self.attention(*args, **kw, tails=tails)
                     layer += 1
                 else:
@@ -278,6 +293,7 @@ class CompiledMlxGraph:
         }
 
     def bind(self, inputs):
+        """Bind after the caller fences Torch's producer queue."""
         if self.closed:
             raise RuntimeError("Direct MLX graph is closed")
         signatures = tuple(_signature(x) for x in inputs)
@@ -317,21 +333,52 @@ class CompiledMlxGraph:
                 and _signature(tensor) != self.attribute_signatures[target]
             ):
                 raise ValueError(f"Direct MLX attribute metadata changed: {target}")
-            cached = self.views.get(index)
             if tensor.device.type == "mps":
-                # Shape, dtype, stride and device were checked above.
+                cached = self.views.get(index)
+                # The runner fences producers in _validate_metadata or preparation.
                 if (
                     cached is None
                     or cached.torch_tensor.data_ptr() != tensor.data_ptr()
+                    or (
+                        self.dynamic_tokens
+                        and kind == InputKind.USER_INPUT
+                        and cached.array.shape != tensor.shape
+                    )
                 ):
                     cached = MlxTensorView(tensor, synchronize=False)
                     self.views[index] = cached
                 arrays.append(cached.array)
             else:
-                arrays.append(mx.array(tensor))
+                arrays.append(torch_to_mlx(tensor))
         return tuple(arrays)
 
+    def is_prepared(self, tokens, *, lookahead=False):
+        tails = (False, True) if lookahead else (False,)
+        return all(
+            ((tokens, tail) if self.dynamic_tokens else tail) in self._prepared
+            for tail in tails
+        )
+
+    def prepare(self, arrays, *, tails=None):
+        """Trace a read-only dummy call without submitting inference."""
+        try:
+            outputs = self._call(arrays, tails=tails)
+        except (RuntimeError, ValueError, NotImplementedError) as error:
+            raise UnsupportedMlxRegion(
+                f"Unsupported MLX preparation: {error}"
+            ) from error
+        key = tails is not None
+        if self.dynamic_tokens:
+            key = (arrays[self._token_input].shape[0], key)
+        self._prepared.add(key)
+        return outputs
+
     def launch(self, arrays, *, tails=None):
+        outputs = self._call(arrays, tails=tails)
+        mx.async_eval(*outputs)
+        return outputs
+
+    def _call(self, arrays, *, tails=None):
         if self.closed:
             raise RuntimeError("Direct MLX graph is closed")
         key = tails is not None
@@ -340,16 +387,19 @@ class CompiledMlxGraph:
             if key not in self.compiled:
                 if len(self.compiled) == 4:
                     mx.synchronize()
-                    self.compiled.pop(next(iter(self.compiled)))
+                    evicted = next(iter(self.compiled))
+                    self.compiled.pop(evicted)
+                    self._prepared.discard(evicted)
                 self.compiled[key] = mx.compile(
                     self._function(tails is not None), shapeless=False
                 )
-        outputs = self.compiled[key](*arrays, *(tails or ()))
-        mx.async_eval(*outputs)
-        return outputs
+        return self.compiled[key](*arrays, *(tails or ()))
 
     def close(self):
-        mx.synchronize()
-        self.compiled.clear()
-        self.views.clear()
-        self.closed = True
+        try:
+            mx.synchronize()
+        finally:
+            self.compiled.clear()
+            self._prepared.clear()
+            self.views.clear()
+            self.closed = True

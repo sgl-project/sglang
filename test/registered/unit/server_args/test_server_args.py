@@ -5957,5 +5957,49 @@ class TestPagedExpertsNumResident(unittest.TestCase):
                 _paged_experts_num_resident(bad)
 
 
+class TestCompiledMpsGraphDefaults(CustomTestCase):
+    def test_compiled_defaults_respect_explicit_phase_off_switches(self):
+        from sglang.srt.arg_groups.cuda_graph_hook import parse_cuda_graph_config
+        from sglang.srt.arg_groups.model_override_base import resolved_view
+
+        for backend, flags, expected in (
+            ("eager", {}, ("disabled", "disabled")),
+            ("mlx-compiled", {}, ("full", "full")),
+            (
+                "mlx-compiled",
+                {"disable_prefill_cuda_graph": True},
+                ("disabled", "full"),
+            ),
+            ("mlx-compiled", {"disable_decode_cuda_graph": True}, ("full", "disabled")),
+            (
+                "mlx-compiled",
+                {"cuda_graph_backend_decode": "disabled"},
+                ("full", "disabled"),
+            ),
+            ("mlx-compiled", {"disable_cuda_graph": True}, ("disabled", "disabled")),
+            (
+                "mlx-compiled",
+                {"cuda_graph_config": {"decode": {"backend": "disabled"}}},
+                ("full", "disabled"),
+            ),
+        ):
+            with self.subTest(backend=backend, flags=flags):
+                args = ServerArgs(
+                    model_path="dummy",
+                    device="mps",
+                    attention_backend="torch_native",
+                    mps_execution_backend=backend,
+                    disable_overlap_schedule=True,
+                    **flags,
+                )
+                args._model_config = MagicMock(is_encoder_decoder=False)
+                parse_cuda_graph_config(args)
+                handle_attention_backend_compatibility(args)
+                config = resolved_view(args).cuda_graph_config
+                self.assertEqual(
+                    (config.prefill.backend, config.decode.backend), expected
+                )
+
+
 if __name__ == "__main__":
     unittest.main()

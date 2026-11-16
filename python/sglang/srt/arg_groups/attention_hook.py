@@ -131,30 +131,27 @@ def handle_attention_backend_compatibility(server_args: Any):
     # Torch native and flex attention backends
     attention_backend = resolved_view(server_args).attention_backend
     if attention_backend == "torch_native":
-        logger.warning(
-            "Cuda graph is disabled because of using torch native attention backend"
+        compiled_mps = (
+            cfg.device == "mps" and cfg.mps_execution_backend == "mlx-compiled"
         )
-        declare_resolution(
-            server_args,
-            "_handle_attention_backend_compatibility",
-            cuda_graph_config=with_phase(
-                cfg.cuda_graph_config, Phase.DECODE, backend=Backend.DISABLED
-            ),
-        )
-        prefill_backend = Backend.DISABLED
-        if cfg.device == "mps" and cfg.mps_execution_backend == "mlx-compiled":
-            if (
-                (Phase.PREFILL, "backend") not in server_args._cuda_graph_config_locked
-                or cfg.cuda_graph_config.prefill.backend == Backend.FULL
+        if not compiled_mps:
+            logger.warning(
+                "Cuda graph is disabled because of using torch native attention backend"
+            )
+        for phase in Phase.ALL:
+            backend = Backend.DISABLED
+            if compiled_mps and (
+                (phase, "backend") not in server_args._cuda_graph_config_locked
+                or cfg.cuda_graph_config[phase].backend == Backend.FULL
             ):
-                prefill_backend = Backend.FULL
-        declare_resolution(
-            server_args,
-            "_handle_attention_backend_compatibility",
-            cuda_graph_config=with_phase(
-                cfg.cuda_graph_config, Phase.PREFILL, backend=prefill_backend
-            ),
-        )
+                backend = Backend.FULL
+            declare_resolution(
+                server_args,
+                "_handle_attention_backend_compatibility",
+                cuda_graph_config=with_phase(
+                    cfg.cuda_graph_config, phase, backend=backend
+                ),
+            )
 
     if attention_backend == "flex_attention":
         logger.warning(

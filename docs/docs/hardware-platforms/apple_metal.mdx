@@ -108,8 +108,8 @@ The MLX backend supports two quantization paths on Apple Silicon:
 
 Use `--mps-execution-backend mlx-compiled` to run an exported Torch model's decode
 graph through `mx.compile` with AOT Metal radix attention. Torch retains model
-loading, weight/KV ownership and sampling. Prefill stays eager MPS by default;
-the additional opt-in below compiles eligible uncached prefill. Native MLX is
+loading, weight/KV ownership and sampling. Eligible uncached batch-1 prefill
+is compiled by default alongside decode. Native MLX is
 unchanged. This path uses `torch.export`, not ExecuTorch.
 
 Install the `srt_mps` extra and build the Metal extension in the same environment.
@@ -128,8 +128,22 @@ SGLANG_USE_MLX=0 python -m sglang.launch_server \
 
 The installed `sgl_kernel` package must include `_metal` and
 `_metal.metallib`; missing artifacts produce an error.
-The model graph compiles lazily for each batch shape, so warm up before measuring
-decode throughput. AOT applies to the radix shaders, not the entire model.
+New graph specializations are traced on read-only dummy inputs before admitting
+a live request, without submitting dummy inference or committing warmup K/V.
+Unsupported export or first tracing falls back to eager before admission;
+execution errors after submission propagate instead of retrying eagerly.
+Warm up your request shapes before measuring throughput. AOT applies to the
+radix shaders, not the entire model.
+
+### Compiled prefill
+
+The default compiled-prefill path handles eligible uncached batch-1 prompts
+of up to 32768 tokens, subject to your configured context and KV-pool limits.
+Cached prefixes, multiple requests, requested log probabilities and other
+unsupported batches use eager MPS. To compile decode only, add
+`--cuda-graph-backend-prefill disabled` to the launch command. To leave decode
+eager while using eligible compiled prefill, add
+`--cuda-graph-backend-decode disabled`; decode lookahead is disabled as well.
 
 ### Supported configurations
 
@@ -139,7 +153,7 @@ decode throughput. AOT applies to the radix shaders, not the entire model.
 - Standard Torch-owned MHA KV pools and local radix caching. Keep page size 1
   by default. Sizes 16, 32 and 64 are supported, but larger pages reduce prefix
   sharing granularity and may waste partially filled slots.
-- Default prefill, ineligible batches and unsupported model regions use eager
+- Ineligible prefill, other unsupported batches and unsupported model regions use eager
   MPS with a fallback log. Unexpected execution errors are not silently retried.
 - LoRA, speculative decoding, MoE/recurrent models, distributed execution,
   memory saver, alternate KV layouts and external/disaggregated caches are
@@ -150,12 +164,11 @@ Torch sampling remains authoritative, and only accepted tokens are committed
 to the KV pool. Grammar, bias and penalty processing disable lookahead, not
 ordinary compiled decode. Standalone one-batch execution is synchronous.
 
-With default eager prefill, native MLX remains faster for the measured batch-1 workloads, including
-8192-token input. This is not a single-user agentic-coding performance upgrade;
-the measured throughput gains are at larger batches. See
-[`benchmark/mps/README.md`](https://github.com/sgl-project/sglang/blob/main/benchmark/mps/README.md)
-for results and reproduction commands; standalone timings do not represent
-HTTP-serving performance.
+Do not infer single-user or native-MLX performance parity from larger-batch
+decode improvements. Benchmark both default-prefill and decode-only modes on
+your workload; native MLX remains a separate serving path. Use the
+[HTTP-serving benchmark](/docs/developer_guide/bench_serving) for these
+comparisons; standalone timings do not represent HTTP-serving performance.
 
 ### Custom kernels
 

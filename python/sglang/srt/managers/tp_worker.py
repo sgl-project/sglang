@@ -47,6 +47,7 @@ from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
+from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 from sglang.srt.model_executor.graph_memory_usage import (
@@ -288,7 +289,10 @@ class TpModelWorker(BaseTpWorker):
     """A tensor parallel model worker."""
 
     def enable_execution_lookahead(self) -> Optional[Callable[..., None]]:
-        if get_exec().graph.mps_execution_backend != "mlx-compiled":
+        if (
+            get_exec().graph.mps_execution_backend != "mlx-compiled"
+            or get_exec().graph.cuda_graph_config.decode.backend == Backend.DISABLED
+        ):
             return None
         from sglang.srt.hardware_backend.mps.compiled_runner import CompiledMlxRunner
 

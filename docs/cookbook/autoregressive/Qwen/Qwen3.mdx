@@ -45,8 +45,10 @@ import { Qwen3Deployment } from "/src/snippets/autoregressive/qwen3-deployment.j
 Qwen3-0.6B supports experimental compiled MLX decode with
 `--device mps --dtype bfloat16 --mps-execution-backend mlx-compiled`.
 Build the Metal extension first and keep the default page size 1.
-Torch retains model loading, KV ownership and sampling; prefill remains eager
-MPS. Native MLX is unchanged and remains faster for the measured batch-1 workload.
+Torch retains model loading, KV ownership and sampling. Eligible uncached
+batch-1 prefill is compiled by default; cached-prefix and other ineligible
+prefill runs on eager MPS. Pass `--cuda-graph-backend-prefill disabled` for
+decode-only compilation. Native MLX is unchanged.
 See the [Apple Silicon guide](/docs/hardware-platforms/apple_metal#direct-compiled-mlx-decode)
 for setup and limitations.
 

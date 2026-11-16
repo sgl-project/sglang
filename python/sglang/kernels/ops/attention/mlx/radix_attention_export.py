@@ -5,7 +5,9 @@ from math import isfinite
 import torch
 
 
-def _validate_shapes(q, k, v, kp, vp, table, requests, lengths, scale, page_size):
+def _validate_shapes(
+    q, k, v, kp, vp, table, requests, lengths, scale, page_size, tail_k, tail_v
+):
     if q.ndim != 3 or k.ndim != 3 or kp.ndim != 3 or table.ndim != 2:
         raise ValueError("Unsupported MLX radix tensor rank")
     batch, heads, dim = q.shape
@@ -35,6 +37,18 @@ def _validate_shapes(q, k, v, kp, vp, table, requests, lengths, scale, page_size
         raise ValueError(
             "Radix page_size must be 1, 16, 32 or 64 and divide the pool size"
         )
+    if (tail_k is None) != (tail_v is None) or (
+        tail_k is not None
+        and any(
+            tail.shape != current.shape
+            or tail.dtype != current.dtype
+            or tail.device != current.device
+            for tail, current in ((tail_k, k), (tail_v, v))
+        )
+    ):
+        raise ValueError(
+            "Pending K/V must both match the current K/V shape, dtype and device"
+        )
 
 
 def validate_page_slots(slots, page_size):
@@ -61,6 +75,8 @@ def radix_decode(
     requests: torch.Tensor,
     lengths: torch.Tensor,
     scale: float,
+    tail_k: torch.Tensor | None = None,
+    tail_v: torch.Tensor | None = None,
     *,
     page_size: int = 1,
 ) -> torch.Tensor:
@@ -70,22 +86,40 @@ def radix_decode(
     Pools are [slots, kv_heads, dim], and table maps [request, position] to slots.
     Lengths include the current token. Serving must validate table indices before
     executing the exported graph; the Metal kernel emits NaNs for invalid rows.
+    Optional tail_k/tail_v replace the preceding uncommitted token, with the same
+    shape, dtype and device as current K/V. Neither token is written to the pool.
     """
     _validate_shapes(
-        q, k, v, k_pool, v_pool, table, requests, lengths, scale, page_size
+        q,
+        k,
+        v,
+        k_pool,
+        v_pool,
+        table,
+        requests,
+        lengths,
+        scale,
+        page_size,
+        tail_k,
+        tail_v,
     )
     outputs = []
     for batch, (request, length) in enumerate(
         zip(requests.cpu().tolist(), lengths.cpu().tolist())
     ):
-        if not 0 <= request < table.shape[0] or not 1 <= length <= table.shape[1]:
+        pending = 2 if tail_k is not None else 1
+        if not 0 <= request < table.shape[0] or not pending <= length <= table.shape[1]:
             raise ValueError("Invalid MLX radix request or sequence length")
-        slots = table[request, : length - 1].long()
+        slots = table[request, : length - pending].long()
         if bool(((slots < 0) | (slots >= k_pool.shape[0])).any()):
             raise ValueError("Invalid MLX radix cache slot")
         validate_page_slots(slots, page_size)
-        keys = torch.cat((k_pool[slots], k[batch : batch + 1]))
-        values = torch.cat((v_pool[slots], v[batch : batch + 1]))
+        keys, values = [k_pool[slots]], [v_pool[slots]]
+        if tail_k is not None:
+            keys.append(tail_k[batch : batch + 1])
+            values.append(tail_v[batch : batch + 1])
+        keys = torch.cat((*keys, k[batch : batch + 1]))
+        values = torch.cat((*values, v[batch : batch + 1]))
         groups = q.shape[1] // k.shape[1]
         keys = keys.repeat_interleave(groups, dim=1).float()
         values = values.repeat_interleave(groups, dim=1).float()
@@ -97,8 +131,33 @@ def radix_decode(
 
 
 @radix_decode.register_fake
-def _fake(q, k, v, k_pool, v_pool, table, requests, lengths, scale, *, page_size=1):
+def _fake(
+    q,
+    k,
+    v,
+    k_pool,
+    v_pool,
+    table,
+    requests,
+    lengths,
+    scale,
+    tail_k=None,
+    tail_v=None,
+    *,
+    page_size=1,
+):
     _validate_shapes(
-        q, k, v, k_pool, v_pool, table, requests, lengths, scale, page_size
+        q,
+        k,
+        v,
+        k_pool,
+        v_pool,
+        table,
+        requests,
+        lengths,
+        scale,
+        page_size,
+        tail_k,
+        tail_v,
     )
     return torch.empty_like(q)

@@ -85,7 +85,7 @@ from sglang.srt.mem_cache.layout.token_major import (
 )
 from sglang.srt.mem_cache.utils import maybe_init_custom_mem_pool
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_flags, get_parallel, get_platform
+from sglang.srt.runtime_context import get_exec, get_flags, get_parallel, get_platform
 from sglang.srt.utils import (
     ceil_align,
     cpu_has_amx_support,
@@ -2729,11 +2729,14 @@ class MHATokenToKVPool(KVCache, MHAKVView):
                     # k_cache and v_cache, and when they alias one allocation
                     # AOTAutograd functionalizes it through a synthetic base that
                     # clones the layer's whole KV allocation on every decode step.
-                    # MPS export also needs independent K/V backing allocations.
+                    # Compiled MPS export needs independent K/V allocations too.
                     if (
                         k_shape == v_shape
                         and not _is_hip
-                        and torch.device(self.device).type != "mps"
+                        and not (
+                            torch.device(self.device).type == "mps"
+                            and get_exec().graph.mps_execution_backend == "mlx-compiled"
+                        )
                         and not get_flags().capture.enable_torch_compile
                     ):
                         # Store K and V as block-aligned halves of one allocation

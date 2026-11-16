@@ -438,6 +438,11 @@ def capture_cuda_graphs(
         memory_usage_gb=0,
         capture_time=0,
     )
+    if (
+        model_runner.device == "mps"
+        and get_exec().graph.cuda_graph_config.decode.backend == Backend.DISABLED
+    ):
+        capture_decode_cuda_graph = False
     if capture_decode_cuda_graph:
         model_runner.maybe_init_uocr_greedy_graph()
         if current_platform.capabilities.graph_capture:

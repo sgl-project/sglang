@@ -231,5 +231,76 @@ class TestPagedCompiledMlxServing(TestCompiledMlxServing):
     ]
 
 
+@unittest.skipUnless(
+    torch.backends.mps.is_available() and importlib.util.find_spec("mlx") is not None,
+    "Requires Torch MPS and MLX",
+)
+class TestDefaultCompiledMlxPrefill(CustomTestCase):
+    def test_uncached_lengths_decode_and_prefix_hit(self):
+        from sglang.srt.environ import envs
+
+        log = self.enterContext(tempfile.TemporaryFile(mode="w+"))
+        with envs.SGLANG_USE_MLX.override(False):
+            process = popen_launch_server(
+                try_cached_model("Qwen/Qwen3-0.6B"),
+                DEFAULT_URL_FOR_TEST,
+                timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
+                env=os.environ.copy(),
+                device="mps",
+                return_stdout_stderr=(log, log),
+                other_args=[
+                    "--device",
+                    "mps",
+                    "--dtype",
+                    "bfloat16",
+                    "--mps-execution-backend",
+                    "mlx-compiled",
+                    "--context-length",
+                    "1024",
+                    "--max-total-tokens",
+                    "4096",
+                    "--max-running-requests",
+                    "1",
+                    "--mem-fraction-static",
+                    "0.6",
+                    "--log-level",
+                    "debug",
+                ],
+            )
+        try:
+            outputs = []
+            for index, (token, length) in enumerate(((42, 137), (43, 73), (42, 137))):
+                generated = 128 if index == 0 else 8
+                response = requests.post(
+                    DEFAULT_URL_FOR_TEST + "/generate",
+                    json={
+                        "input_ids": [token] * length,
+                        "sampling_params": {
+                            "temperature": 0,
+                            "max_new_tokens": generated,
+                            "ignore_eos": True,
+                        },
+                    },
+                    timeout=180,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                self.assertEqual(len(payload["output_ids"]), generated)
+                outputs.append(payload["output_ids"])
+                if index == 2:
+                    self.assertGreater(payload["meta_info"]["cached_tokens"], 0)
+                else:
+                    self.assertEqual(payload["meta_info"]["cached_tokens"], 0)
+            self.assertEqual(outputs[0][:8], outputs[2])
+        finally:
+            terminate_and_kill_process_tree(process)
+        log.seek(0)
+        output = log.read()
+        for length in (137, 73):
+            self.assertIn(f"Compiled MLX prefill execution: tokens={length}", output)
+        self.assertIn("Compiled MLX: executions=100", output)
+        self.assertIn("using eager MPS: prefill requires an uncached B1 prompt", output)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
+from typing import NamedTuple
 
 import mlx.core as mx
 import msgspec
@@ -17,7 +18,7 @@ from sglang.kernels.ops.attention.mlx.radix_attention_export import (
     radix_decode,
     validate_page_slots,
 )
-from sglang.srt.compilation.torch_compile_decoration import _to_torch
+from sglang.srt.compilation.torch_compile_decoration import torch_export_mode
 from sglang.srt.hardware_backend.mps.compiled_graph import (
     CompiledMlxGraph,
     host_alias,
@@ -247,14 +248,34 @@ class _DecodeModule(torch.nn.Module):
         )
 
 
-def _batch_inputs(batch: ForwardBatch) -> tuple[torch.Tensor, ...]:
-    return (
-        batch.input_ids,
-        batch.positions,
-        batch.req_pool_indices,
-        batch.seq_lens,
-        batch.out_cache_loc,
+class _BatchInputs(NamedTuple):
+    input_ids: torch.Tensor
+    positions: torch.Tensor
+    requests: torch.Tensor
+    lengths: torch.Tensor
+    locations: torch.Tensor
+
+
+def _batch_inputs(batch: ForwardBatch) -> _BatchInputs:
+    return _BatchInputs(
+        input_ids=batch.input_ids,
+        positions=batch.positions,
+        requests=batch.req_pool_indices,
+        lengths=batch.seq_lens,
+        locations=batch.out_cache_loc,
     )
+
+
+def _following_inputs(bindings, arrays, tokens):
+    following = list(arrays)
+    for index, (kind, target) in enumerate(bindings):
+        if kind == InputKind.USER_INPUT:
+            name = _BatchInputs._fields[target]
+            if name == "input_ids":
+                following[index] = tokens
+            elif name in ("positions", "lengths"):
+                following[index] = following[index] + 1
+    return tuple(following)
 
 
 class CompiledMlxRunner(BaseRunner):
@@ -280,7 +301,7 @@ class CompiledMlxRunner(BaseRunner):
         self.compile_seconds = 0.0
         self._refresh_region()
         if self._prefill and self._unsupported_reason is None:
-            # Export only: no speculative KV writes or hidden warmup inference.
+            # Dummy preparation is read-only and never commits warmup K/V.
             batch = ForwardBatch(
                 forward_mode=ForwardMode.EXTEND,
                 batch_size=1,
@@ -510,26 +531,79 @@ class CompiledMlxRunner(BaseRunner):
         if key not in self._graphs:
             wrapper = self._make_wrapper()
             start = time.perf_counter()
-            _to_torch(mr.model, reverse=False, num_tokens=size)
+            graph = None
             try:
-                with forward_context(ForwardContext(attn_backend=wrapper.attention)):
+                with (
+                    torch_export_mode(mr.model, num_tokens=size),
+                    forward_context(ForwardContext(attn_backend=wrapper.attention)),
+                ):
                     graph = self._compile(wrapper, batch)
+                self._prepare_graph(graph, batch)
+            except (RuntimeError, ValueError, NotImplementedError) as error:
+                if graph is not None:
+                    graph.close()
+                if isinstance(error, UnsupportedMlxRegion):
+                    raise
+                raise UnsupportedMlxRegion(
+                    f"MLX preparation failed: {error}"
+                ) from error
             finally:
-                _to_torch(mr.model, reverse=True, num_tokens=size)
                 wrapper.attention.keys.clear()
                 wrapper.attention.values.clear()
             elapsed = time.perf_counter() - start
             self.compile_seconds += elapsed
             self._graphs[key] = graph
             logger.info(
-                "%s %s graph ready: size=%d, page_size=%d, export=%.3fs",
+                "%s %s graph ready: size=%d, page_size=%d, prepare=%.3fs",
                 type(graph).__name__,
                 "prefill" if self._prefill else "decode",
                 size,
                 mr.token_to_kv_pool.page_size,
                 elapsed,
             )
+        else:
+            graph = self._graphs[key]
+            try:
+                self._prepare_graph(graph, batch)
+            except (RuntimeError, ValueError, NotImplementedError) as error:
+                graph.close()
+                del self._graphs[key]
+                if isinstance(error, UnsupportedMlxRegion):
+                    raise
+                raise UnsupportedMlxRegion(
+                    f"MLX preparation failed: {error}"
+                ) from error
         return self._graphs[key]
+
+    def _prepare_graph(self, graph, batch):
+        size = batch.input_ids.numel()
+        lookahead = not self._prefill and self.model_runner.model_config.context_len > 1
+        if graph.is_prepared(size, lookahead=lookahead):
+            return
+        inputs = _batch_inputs(batch)
+        dummy = inputs._replace(
+            input_ids=torch.zeros_like(inputs.input_ids),
+            positions=(
+                torch.arange(
+                    size, device=inputs.positions.device, dtype=inputs.positions.dtype
+                )
+                if self._prefill
+                else torch.zeros_like(inputs.positions)
+            ),
+            requests=torch.zeros_like(inputs.requests),
+            lengths=torch.full_like(inputs.lengths, size if self._prefill else 1),
+            locations=torch.zeros_like(inputs.locations),
+        )
+        torch.mps.synchronize()
+        arrays = graph.bind(dummy)
+        outputs = graph.prepare(arrays)
+        if lookahead:
+            following = _following_inputs(
+                graph.bindings, arrays, mx.zeros_like(outputs[0][:, 0], dtype=mx.int64)
+            )
+            graph.prepare(following, tails=outputs[1:])
+        if self._prefill:
+            logger.info("Compiled MLX prefill prepared: tokens=%d", size)
 
     def _init_backend(self):
         if (
@@ -651,16 +725,10 @@ class CompiledMlxRunner(BaseRunner):
         ):
             return
         tokens = mx.argmax(outputs[0], axis=-1).astype(mx.int64)
-        following = list(arrays)
-        for index, (kind, target) in enumerate(graph.bindings):
-            if kind == InputKind.USER_INPUT:
-                if target == 0:
-                    following[index] = tokens
-                elif target in (1, 3):
-                    following[index] = following[index] + 1
+        following = _following_inputs(graph.bindings, arrays, tokens)
         # This submission precedes the first wait/export of the current outputs.
         # The previous token's K/V is a graph dependency, not an early pool write.
-        next_outputs = graph.launch(tuple(following), tails=outputs[1:])
+        next_outputs = graph.launch(following, tails=outputs[1:])
         self._pending = _PendingDecode(
             graph=graph,
             outputs=next_outputs,
@@ -716,6 +784,11 @@ class CompiledMlxRunner(BaseRunner):
                 layer, forward_batch.out_cache_loc, keys[index], values[index]
             )
         self.execution_count += 1
+        if self._prefill:
+            logger.debug(
+                "Compiled MLX prefill execution: tokens=%d",
+                forward_batch.input_ids.numel(),
+            )
         if self.execution_count == 1 or self.execution_count % 100 == 0:
             logger.info(
                 "Compiled MLX: executions=%d, enqueued=%d, hits=%d, discarded=%d, discard_reasons=%s",

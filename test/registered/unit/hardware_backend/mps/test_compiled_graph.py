@@ -19,6 +19,319 @@ register_mps_ci(est_time=30, suite="stage-a-unit-test-mps")
     "Requires Torch MPS and MLX",
 )
 class TestCompiledGraph(CustomTestCase):
+    def test_explicit_pending_kv_matches_exported_mlx_without_committing(self):
+        from sglang.kernels.ops.attention.mlx.radix_attention import radix_decode
+        from sglang.kernels.ops.attention.mlx.radix_attention_export import (
+            radix_decode as reference,
+        )
+        from sglang.srt.hardware_backend.mps.compiled_graph import CompiledMlxGraph
+        from sglang.srt.utils.tensor_bridge import mlx_to_torch
+
+        class Model(torch.nn.Module):
+            def forward(self, q, k, v, pool, table, rows, lengths, tk, tv):
+                return reference(
+                    q,
+                    k,
+                    v,
+                    pool,
+                    pool,
+                    table,
+                    rows,
+                    lengths,
+                    0.125,
+                    tail_k=tk,
+                    tail_v=tv,
+                )
+
+        q = torch.zeros(1, 4, 64, device="mps")
+        k = torch.ones(1, 2, 64, device="mps")
+        pool = torch.full((16, 2, 64), float("nan"), device="mps")
+        table = torch.full((1, 16), -1, device="mps", dtype=torch.int32)
+        inputs = (
+            q,
+            k,
+            k * 3,
+            pool,
+            table,
+            torch.tensor([0], device="mps"),
+            torch.tensor([2], device="mps"),
+            k,
+            k * 5,
+        )
+        model = Model()
+        graph = CompiledMlxGraph(
+            model=model, example_inputs=inputs, attention=radix_decode
+        )
+        self.addCleanup(graph.close)
+        torch.mps.synchronize()
+        arrays = graph.bind(inputs)
+        for lookahead in (False, True):
+            with self.subTest(lookahead=lookahead):
+                tails = (
+                    tuple((array * 2)[None] for array in arrays[-2:])
+                    if lookahead
+                    else None
+                )
+                expected_inputs = (
+                    (*inputs[:-2], *(tensor * 2 for tensor in inputs[-2:]))
+                    if lookahead
+                    else inputs
+                )
+                actual = mlx_to_torch(graph.launch(arrays, tails=tails)[0])
+                torch.testing.assert_close(
+                    actual, model(*expected_inputs), rtol=0, atol=0
+                )
+        self.assertTrue(torch.isnan(pool).all().item())
+        self.assertTrue((table == -1).all().item())
+
+    def _runner_fixture(self, *, prefill=False, tokens=1):
+        from sglang.srt.hardware_backend.mps.compiled_runner import CompiledMlxRunner
+        from sglang.srt.layers.logits_processor import LogitsProcessorOutput
+        from sglang.srt.layers.radix_attention import RadixAttention
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+
+        class Model(torch.nn.Module):
+            def __init__(self):
+                super().__init__()
+                self.config = SimpleNamespace(vocab_size=17)
+                self.embed = torch.nn.Embedding(17, 64, device="mps")
+                self.layers = torch.nn.ModuleList([RadixAttention(1, 64, 0.125, 1, 0)])
+
+            def forward(self, input_ids, positions, forward_batch):
+                hidden = self.embed(input_ids) + positions[:, None]
+                hidden = self.layers[0](hidden, hidden, hidden, forward_batch)
+                if forward_batch.forward_mode.is_extend():
+                    hidden = hidden[-1:]
+                return LogitsProcessorOutput(next_token_logits=hidden[:, :17])
+
+        pools = tuple(torch.randn(16, 1, 64, device="mps") for _ in range(2))
+        table = torch.arange(1, 9, device="mps", dtype=torch.int32)[None, :]
+
+        def commit(layer, locations, keys, values):
+            pools[0][locations] = keys
+            pools[1][locations] = values
+
+        runner = object.__new__(CompiledMlxRunner)
+        runner.model_runner = SimpleNamespace(
+            model=Model().eval(),
+            model_config=SimpleNamespace(context_len=8),
+            req_to_token_pool=SimpleNamespace(req_to_token=table),
+            token_to_kv_pool=SimpleNamespace(
+                page_size=1,
+                get_kv_buffer=lambda _: pools,
+                get_key_buffer=lambda _: pools[0],
+                set_kv_buffer=commit,
+            ),
+        )
+        runner._prefill = prefill
+        runner._unsupported_reason = runner._region = None
+        runner._layers = ()
+        runner._max_batch_size = 1
+        runner._graphs = {}
+        runner._unsupported_batches = {}
+        runner._pool_identity = runner._model_structure = None
+        runner._weight_sources = ()
+        runner._fallback_reasons = set()
+        runner.execution_count = 0
+        runner.compile_seconds = 0.0
+        runner._init_backend()
+        runner._refresh_region()
+        self.addCleanup(lambda: [graph.close() for graph in runner._graphs.values()])
+        batch = ForwardBatch(
+            forward_mode=ForwardMode.EXTEND if prefill else ForwardMode.DECODE,
+            batch_size=1,
+            input_ids=torch.ones(tokens, device="mps", dtype=torch.int64),
+            positions=torch.arange(tokens, device="mps"),
+            req_pool_indices=torch.tensor([0], device="mps"),
+            seq_lens=torch.tensor([tokens], device="mps"),
+            seq_lens_sum=tokens,
+            out_cache_loc=torch.arange(1, tokens + 1, device="mps"),
+            extend_num_tokens=tokens if prefill else None,
+            extend_seq_lens=torch.tensor([tokens], device="mps") if prefill else None,
+            extend_seq_lens_cpu=[tokens] if prefill else None,
+            extend_prefix_lens=torch.tensor([0], device="mps") if prefill else None,
+            extend_prefix_lens_cpu=[0] if prefill else None,
+            extend_start_loc=torch.tensor([0], device="mps") if prefill else None,
+        )
+        return runner, batch, pools
+
+    def test_prelaunch_export_and_lazy_trace_failures_fall_back_without_kv_writes(self):
+        """A shape must fail admission before a live request can reach a bad trace."""
+        import mlx.core as mx
+
+        from sglang.srt.runtime_context import get_context
+
+        def lazy_failure(*args, **kwargs):
+            def trace(*flat):
+                raise RuntimeError("unsupported test MLX trace")
+
+            return trace
+
+        for boundary, failure in (
+            (
+                "export",
+                patch(
+                    "torch.export.export",
+                    side_effect=RuntimeError("unsupported export"),
+                ),
+            ),
+            (
+                "non-dynamic export",
+                patch(
+                    "torch.export.export",
+                    side_effect=torch._dynamo.exc.UserError(
+                        torch._dynamo.exc.UserErrorType.INVALID_INPUT,
+                        "unsupported non-dynamic export",
+                    ),
+                ),
+            ),
+            ("lazy trace", patch.object(mx, "compile", side_effect=lazy_failure)),
+            (
+                "compile construction",
+                patch.object(
+                    mx, "compile", side_effect=RuntimeError("unsupported compiler")
+                ),
+            ),
+        ):
+            with (
+                self.subTest(boundary=boundary),
+                get_context().override_server_args(device="mps"),
+            ):
+                runner, batch, pools = self._runner_fixture()
+                before = tuple(pool.clone() for pool in pools)
+                with failure:
+                    self.assertFalse(runner.can_run_graph(batch))
+                self.assertIn(1, runner._unsupported_batches)
+                self.assertFalse(runner.can_run_graph(batch))
+                self.assertEqual(runner.execution_count, 0)
+                for actual, expected in zip(pools, before):
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_admission_traces_without_submitting_or_evaluating_dummy_inference(self):
+        import mlx.core as mx
+
+        from sglang.srt.runtime_context import get_context
+
+        with get_context().override_server_args(device="mps"):
+            runner, batch, pools = self._runner_fixture()
+            with (
+                patch.object(
+                    mx, "async_eval", side_effect=AssertionError("dummy submission")
+                ),
+                patch.object(
+                    mx, "eval", side_effect=AssertionError("dummy evaluation")
+                ),
+            ):
+                self.assertTrue(runner.can_run_graph(batch))
+            self.assertEqual(runner.execution_count, 0)
+            actual = runner.execute(batch)
+            self.assertEqual(runner.execution_count, 1)
+            self.assertTrue(torch.isfinite(actual.next_token_logits).all().item())
+            expected_key = (
+                runner.model_runner.model.embed(batch.input_ids)
+                + batch.positions[:, None]
+            )
+            torch.testing.assert_close(pools[0][1], expected_key)
+
+    def test_new_dynamic_prefill_shape_is_traced_before_admission(self):
+        """A warmed prefill graph does not prove a new length can compile."""
+        import mlx.core as mx
+
+        from sglang.srt.runtime_context import get_context
+
+        with get_context().override_server_args(device="mps"):
+            runner, batch, pools = self._runner_fixture(prefill=True, tokens=3)
+            self.assertTrue(runner.can_run_graph(batch))
+            before = tuple(pool.clone() for pool in pools)
+            batch.input_ids = torch.ones(5, device="mps", dtype=torch.int64)
+            batch.positions = torch.arange(5, device="mps")
+            batch.out_cache_loc = torch.arange(1, 6, device="mps")
+            batch.seq_lens.fill_(5)
+            batch.seq_lens_sum = batch.extend_num_tokens = 5
+            batch.extend_seq_lens.fill_(5)
+            batch.extend_seq_lens_cpu = [5]
+
+            def fail_trace(*args, **kwargs):
+                def trace(*flat):
+                    raise RuntimeError("unsupported new length")
+
+                return trace
+
+            with patch.object(mx, "compile", side_effect=fail_trace):
+                self.assertFalse(runner.can_run_graph(batch))
+            self.assertIn(5, runner._unsupported_batches)
+            self.assertNotIn(3, runner._unsupported_batches)
+            for actual, expected in zip(pools, before):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+
+    def test_preparation_is_read_only_and_execution_errors_are_not_retried(self):
+        """Successful preparation cannot commit KV or hide a later execution error."""
+        from sglang.srt.runtime_context import get_context
+
+        with get_context().override_server_args(device="mps"):
+            runner, batch, pools = self._runner_fixture()
+            before = tuple(pool.clone() for pool in pools)
+            self.assertTrue(runner.can_run_graph(batch))
+            for actual, expected in zip(pools, before):
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+            graph = runner._graph(batch)
+            with patch.object(
+                graph, "launch", side_effect=RuntimeError("execution failed")
+            ):
+                with self.assertRaisesRegex(RuntimeError, "execution failed"):
+                    runner.execute(batch)
+            self.assertNotIn(1, runner._unsupported_batches)
+            self.assertEqual(runner.execution_count, 0)
+
+    def test_dynamic_views_refresh_after_resizing_the_same_torch_objects(self):
+        """Reusing storage must not reuse a stale token-dimension view."""
+        from sglang.srt.hardware_backend.mps.compiled_graph import CompiledMlxGraph
+        from sglang.srt.utils.tensor_bridge import mlx_to_torch
+
+        class Model(torch.nn.Module):
+            def forward(self, ids, positions, requests, lengths, locations):
+                return ids + positions + locations
+
+        storage = torch.arange(16, device="mps")
+        inputs = (
+            storage[:3],
+            storage[:3],
+            torch.tensor([0], device="mps"),
+            torch.tensor([3], device="mps"),
+            storage[:3],
+        )
+        graph = CompiledMlxGraph(
+            model=Model(), example_inputs=inputs, dynamic_tokens=True
+        )
+        self.addCleanup(graph.close)
+        for tokens in (3, 5, 2, 4):
+            for index in (0, 1, 4):
+                inputs[index].resize_(tokens)
+            inputs[3].fill_(tokens)
+            torch.mps.synchronize()
+            actual = mlx_to_torch(graph.launch(graph.bind(inputs))[0])
+            torch.testing.assert_close(actual, Model()(*inputs), rtol=0, atol=0)
+
+    def test_cpu_fp64_binding_does_not_silently_downcast(self):
+        """The graph's CPU branch must preserve values below fp32 resolution."""
+        import mlx.core as mx
+
+        from sglang.srt.hardware_backend.mps.compiled_graph import CompiledMlxGraph
+        from sglang.srt.utils.tensor_bridge import mlx_to_torch
+
+        class Model(torch.nn.Module):
+            def forward(self, x):
+                return x * 2
+
+        inputs = (torch.tensor([1 + 2**-40], dtype=torch.float64),)
+        graph = CompiledMlxGraph(model=Model(), example_inputs=inputs)
+        self.addCleanup(graph.close)
+        with mx.stream(mx.cpu):
+            output = graph.launch(graph.bind(inputs))[0]
+            actual = mlx_to_torch(output, device="cpu")
+        torch.testing.assert_close(actual, Model()(*inputs), rtol=0, atol=0)
+
     def test_dynamic_shape_specialization_is_an_eager_fallback(self):
         """Length-specific branches must not abort dynamic-prefill initialization."""
         from sglang.srt.hardware_backend.mps.compiled_graph import CompiledMlxGraph
@@ -618,6 +931,7 @@ class TestCompiledGraph(CustomTestCase):
             {"enable_hierarchical_cache": True},
             {"enable_lmcache": True},
             {"enable_session_radix_cache": True},
+            {"disable_overlap_schedule": False},
         ):
             with (
                 self.subTest(option=option),
@@ -627,8 +941,16 @@ class TestCompiledGraph(CustomTestCase):
                     model_path="dummy",
                     device="mps",
                     mps_execution_backend="mlx-compiled",
-                    **option,
+                    **{"disable_overlap_schedule": True, **option},
                 ).resolve_once()
+        with self.assertRaisesRegex(ValueError, "speculative"):
+            ServerArgs(
+                model_path="dummy",
+                device="mps",
+                mps_execution_backend="mlx-compiled",
+                disable_overlap_schedule=True,
+                speculative_algorithm="EAGLE",
+            ).resolve_once()
         with self.assertRaisesRegex(ValueError, "standard Torch MPS"):
             ServerArgs(
                 model_path="dummy",
@@ -932,12 +1254,28 @@ class TestCompiledGraph(CustomTestCase):
                             .cpu()
                             .double()(*[x.cpu().double() for x in inputs])
                         )
+                        linear = model.right.linear
+                        without_bias = torch.nn.functional.linear(
+                            inputs[0], linear.weight, None
+                        )
+                        explicit_bias = without_bias + linear.bias + model.right.offset
+                        components = {
+                            "input": inputs[0].cpu().tolist(),
+                            "weight": linear.weight.cpu().tolist(),
+                            "bias": linear.bias.cpu().tolist(),
+                            "offset": model.right.offset.cpu().tolist(),
+                            "mps_linear": linear(inputs[0]).cpu().tolist(),
+                            "mps_no_bias": without_bias.cpu().tolist(),
+                            "mps_explicit_bias_and_offset": explicit_bias.cpu().tolist(),
+                            "eager_minus_cpu": (expected.cpu().double() - cpu).tolist(),
+                        }
                         return (
                             f"{message}\nreplace={replace}, hardware={platform.platform()}, "
                             f"chip={subprocess.check_output(['sysctl', '-n', 'machdep.cpu.brand_string'], text=True).strip()}, "
                             f"torch={torch.__version__}, torch_git={torch.version.git_version}, "
                             f"mlx={version('mlx')}\nactual={actual.cpu().tolist()}\n"
                             f"eager={expected.cpu().tolist()}\ncpu_fp64={cpu.tolist()}\n"
+                            f"components={components}\n"
                             f"bindings={[(i, str(view.torch_tensor.dtype), tuple(view.torch_tensor.shape), tuple(view.torch_tensor.stride()), view.torch_tensor.storage_offset()) for i, view in graph.views.items()]}"
                         )
 

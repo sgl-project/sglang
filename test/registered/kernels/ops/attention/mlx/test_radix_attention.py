@@ -9,10 +9,63 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.test.ci.ci_register import register_mps_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_mps_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_mps_ci(est_time=45, suite="stage-a-unit-test-mps")
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class TestRadixExportContract(CustomTestCase):
+    def test_pending_tail_is_explicit_read_only_and_validated_during_export(self):
+        """An uncommitted previous token must not read its invalid pool slot."""
+        from sglang.kernels.ops.attention.mlx.radix_attention_export import radix_decode
+
+        class Model(torch.nn.Module):
+            def forward(self, q, k, v, pool, table, rows, lengths, tk, tv):
+                return radix_decode(
+                    q,
+                    k,
+                    v,
+                    pool,
+                    pool,
+                    table,
+                    rows,
+                    lengths,
+                    0.125,
+                    tail_k=tk,
+                    tail_v=tv,
+                )
+
+        q = torch.zeros(1, 4, 64)
+        k = torch.ones(1, 2, 64)
+        pool = torch.full((16, 2, 64), float("nan"))
+        table = torch.full((1, 16), -1, dtype=torch.int32)
+        inputs = (
+            q,
+            k,
+            k * 3,
+            pool,
+            table,
+            torch.tensor([0]),
+            torch.tensor([2]),
+            k,
+            k * 5,
+        )
+        model = Model()
+        for run in (
+            model,
+            lambda *args: torch.export.export(model, args, strict=False).module()(
+                *args
+            ),
+        ):
+            torch.testing.assert_close(
+                run(*inputs), torch.full_like(q, 4), rtol=0, atol=0
+            )
+        self.assertTrue(torch.isnan(pool).all().item())
+        self.assertTrue((table == -1).all().item())
+        with self.assertRaisesRegex(ValueError, "Pending K/V"):
+            torch.export.export(model, (*inputs[:-1], inputs[-1].half()), strict=False)
 
 
 @unittest.skipUnless(

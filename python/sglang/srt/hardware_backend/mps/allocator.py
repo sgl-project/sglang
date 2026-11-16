@@ -20,6 +20,10 @@ class MPSPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         extend_num_tokens: int,
         num_new_pages: int = None,
     ):
+        if self.debug_mode:
+            assert torch.all(
+                (last_loc + 1) % self.page_size == prefix_lens % self.page_size
+            )
         if num_new_pages is None:
             num_new_pages = get_num_new_pages(
                 seq_lens=seq_lens_cpu,
@@ -42,6 +46,8 @@ class MPSPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
             page_size=self.page_size,
             device=self.device,
         )
+        if self.debug_mode:
+            assert len(torch.unique(out_indices)) == len(out_indices)
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices
 
@@ -51,6 +57,10 @@ class MPSPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         seq_lens_cpu: torch.Tensor,
         last_loc: torch.Tensor,
     ):
+        if self.debug_mode:
+            assert torch.all(
+                (last_loc + 2) % self.page_size == seq_lens % self.page_size
+            )
         num_new_pages = get_num_new_pages(
             seq_lens=seq_lens_cpu, page_size=self.page_size, decode=True
         )
@@ -59,11 +69,16 @@ class MPSPagedTokenToKVPoolAllocator(PagedTokenToKVPoolAllocator):
         if num_new_pages > len(self.free_pages):
             return None
         if num_new_pages == 0:
-            return last_loc.to(torch.int64) + 1
+            out_indices = last_loc.to(torch.int64) + 1
+            if self.debug_mode:
+                assert len(torch.unique(out_indices)) == len(out_indices)
+            return out_indices
         needs_page = seq_lens % self.page_size == 1
         page_indices = (torch.cumsum(needs_page.long(), dim=0) - 1).clamp(min=0)
         out_indices = torch.where(
             needs_page, self.free_pages[page_indices] * self.page_size, last_loc + 1
         )
+        if self.debug_mode:
+            assert len(torch.unique(out_indices)) == len(out_indices)
         self.free_pages = self.free_pages[num_new_pages:]
         return out_indices

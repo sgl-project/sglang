@@ -115,13 +115,16 @@ def softmax(
     return probs if out is None else out.copy_(probs)
 
 
-def argmax(logits: torch.Tensor) -> torch.Tensor:
+def argmax(logits: torch.Tensor, *, use_mps_kernel: bool = False) -> torch.Tensor:
     """Row-wise int64 argmax of ``[rows, vocab]``; a value tie takes the lowest index.
 
     The CUDA JIT kernel never picks a NaN; the NPU kernel and torch fallback
     preserve torch.argmax's NaN selection.
     """
     import torch
+
+    if use_mps_kernel and logits.device.type == "mps":
+        return get_kernel("sampling.mps_greedy_argmax", KernelBackend.TORCH)(logits)
 
     if logits.is_cuda and PlatformInfo.detect().device_type == "npu":
         if (

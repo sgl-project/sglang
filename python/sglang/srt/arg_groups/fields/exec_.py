@@ -675,7 +675,9 @@ class ExecGraph(msgspec.Struct):
             "torch.export and mx.compile for capability-checked dense model decode "
             "including the existing model forward and logits processor, "
             "with paged radix attention and scheduler-managed greedy lookahead. "
-            "Decode batches up to 16 are compiled; prefill remains eager. "
+            "Decode batches up to 16 and eligible uncached B1 prefill are compiled "
+            "by default. Use --cuda-graph-backend-prefill disabled or "
+            "--cuda-graph-backend-decode disabled to disable either phase. "
             "Unsupported regions use eager MPS with a diagnostic. Native MLX is unchanged.",
             choices=["eager", "mlx-compiled"],
         ),

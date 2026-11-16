@@ -5,6 +5,7 @@ import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
@@ -33,6 +34,36 @@ class _StringAnnotatedMropeModel:
         forward_batch,
     ):
         return input_ids, positions, forward_batch
+
+
+class TestTorchExportMode(CustomTestCase):
+    def test_nested_export_restores_fused_dispatch_after_success_and_failure(self):
+        """An inner export must not undo the caller's compile-safe dispatch."""
+        from sglang.kernels.fused_op import BaseFusedOp
+        from sglang.srt.compilation.torch_compile_decoration import torch_export_mode
+
+        class Op(BaseFusedOp):
+            def forward_native(self, x):
+                return x + 1
+
+        op = Op()
+        op._forward_method = lambda x: x + 9
+        model = torch.nn.Sequential(op, op)
+        value = torch.tensor([1])
+        for fail in (False, True):
+            with self.subTest(fail=fail):
+                try:
+                    with torch_export_mode(model, num_tokens=1):
+                        with torch_export_mode(model, num_tokens=1):
+                            self.assertEqual(model(value).item(), 3)
+                        self.assertEqual(model(value).item(), 3)
+                        if fail:
+                            raise RuntimeError("export failed")
+                except RuntimeError as error:
+                    self.assertTrue(fail)
+                    self.assertEqual(str(error), "export failed")
+                self.assertFalse(op.is_torch_compile)
+                self.assertEqual(model(value).item(), 19)
 
 
 def test_positions_marks_the_token_axis_dynamic_for_mrope_and_1d_rope():

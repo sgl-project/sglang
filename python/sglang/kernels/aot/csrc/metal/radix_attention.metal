@@ -27,7 +27,8 @@ inline void radix_impl(
     if (warp == 0)
       for (uint g = 0; g < G; ++g)
         for (uint d = lane; d < OD; d += 32)
-          out[((row + g) * SPLITS + group.x) * OD + d] = O(NAN);
+          out[((row + g) * SPLITS + group.x) * OD + d] =
+              O(PARTIAL ? (d == D ? -1.0f : 0.0f) : NAN);
     return;
   }
   float query[G][D / 32], acc[G][D / 32], maximum[G], sum[G];
@@ -61,7 +62,8 @@ inline void radix_impl(
       }
     }
     if (slot < 0 || (!current && !previous && slot >= SLOTS)) {
-      for (uint g = 0; g < G; ++g) { maximum[g] = NAN; sum[g] = NAN; }
+      // Negative denominators signal errors without fast-math NaN arithmetic.
+      for (uint g = 0; g < G; ++g) { maximum[g] = 0; sum[g] = -1; }
       break;
     }
     const ulong base = (ulong(slot) * KH + kh) * D;
@@ -96,12 +98,21 @@ inline void radix_impl(
   if (warp == 0) {
     for (uint g = 0; g < G; ++g) {
       float row_max = -INFINITY, denominator = 0, factors[W];
-      for (uint w = 0; w < W; ++w) row_max = max(row_max, maxima[g * W + w]);
+      uint invalid = 0;
+      for (uint w = 0; w < W; ++w) {
+        row_max = max(row_max, maxima[g * W + w]);
+        invalid |= as_type<uint>(sums[g * W + w]);
+      }
+      const ulong ob = ((row + g) * SPLITS + group.x) * OD;
+      if (invalid & 0x80000000u) {
+        for (uint d = lane; d < OD; d += 32)
+          out[ob + d] = O(PARTIAL ? (d == D ? -1.0f : 0.0f) : NAN);
+        continue;
+      }
       for (uint w = 0; w < W; ++w) {
         factors[w] = sums[g * W + w] == 0 ? 0 : metal::fast::exp(maxima[g * W + w] - row_max);
         denominator += sums[g * W + w] * factors[w];
       }
-      const ulong ob = ((row + g) * SPLITS + group.x) * OD;
       for (uint i = 0; i < D / 32; ++i) {
         float numerator = 0;
         for (uint w = 0; w < W; ++w)
@@ -118,7 +129,15 @@ inline void reduce_impl(const device float* partials, device T* out, uint3 group
   const ulong row = ulong(group.z) * H + group.y;
   const ulong base = row * SPLITS * (D + 2);
   float maximum = -INFINITY;
-  for (uint s = 0; s < SPLITS; ++s) maximum = max(maximum, partials[base + s * (D + 2) + D + 1]);
+  uint invalid = 0;
+  for (uint s = 0; s < SPLITS; ++s) {
+    maximum = max(maximum, partials[base + s * (D + 2) + D + 1]);
+    invalid |= as_type<uint>(partials[base + s * (D + 2) + D]);
+  }
+  if (invalid & 0x80000000u) {
+    for (uint i = 0; i < D / 32; ++i) out[row * D + lane + i * 32] = T(NAN);
+    return;
+  }
   float denominator = 0;
   float numerator[D / 32] = {};
   for (uint s = 0; s < SPLITS; ++s) {

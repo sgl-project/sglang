@@ -40,6 +40,21 @@ def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int) -> None:
 
 
 @contextmanager
+def torch_export_mode(model: torch.nn.Module, *, num_tokens: int):
+    """Scope traceable fused-op dispatch without compiling or changing communicators."""
+    entered = []
+    try:
+        for module in model.modules():
+            if isinstance(module, BaseFusedOp) and not module.is_torch_compile:
+                entered.append(module)
+                module.enter_torch_compile(num_tokens=num_tokens)
+        yield
+    finally:
+        for module in reversed(entered):
+            module.leave_torch_compile()
+
+
+@contextmanager
 def patch_model(
     model: torch.nn.Module,
     enable_compile: bool,
