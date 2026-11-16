@@ -400,7 +400,11 @@ def test_cpu_length_gate_respects_backend_capability_and_explicit_override(
         ),
         patch.object(mod.torch, "tensor", side_effect=tensor_on_cpu),
         patch.object(mod, "is_deepseek_dsa", return_value=False),
-        patch.object(mod, "is_sparsity_driven_kv_offload_enabled", return_value=False),
+        patch.object(
+            mod,
+            "resolve_sparse_kv_offload_mode",
+            return_value=mod.SparseKVOffloadMode.DISABLED,
+        ),
         patch.object(mod, "AscendAttnMaskBuilder", return_value=masks),
         patch.object(mod.DllmConfig, "from_server_args", return_value=None),
         patch.object(
