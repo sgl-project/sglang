@@ -23,6 +23,9 @@ from sglang.multimodal_gen.configs.pipeline_configs.flux import (
     FluxPipelineConfig,
 )
 from sglang.multimodal_gen.configs.pipeline_configs.hunyuan import FastHunyuanConfig
+from sglang.multimodal_gen.configs.pipeline_configs.joy_image import (
+    JoyImageEditPipelineConfig,
+)
 from sglang.multimodal_gen.configs.pipeline_configs.lingbot_world import (
     LingBotWorldCausalDMDConfig,
 )
@@ -3956,6 +3959,28 @@ class TestPipelineResolutionCliOverride(unittest.TestCase):
 
         self.assertTrue(server_args.pipeline_config.disable_autocast)
         self.assertTrue(server_args.disable_autocast)
+
+    def test_enable_torch_compile_reaches_server_args_for_joy_image_edit(self):
+        """A pipeline config attribute named like a server flag takes the value
+        and removes it from the server args, so the flag does nothing."""
+        parser = FlexibleArgumentParser()
+        ServerArgs.add_cli_args(parser)
+        argv = [
+            "--model-path",
+            "jdopensource/JoyAI-Image-Edit-Diffusers",
+            "--enable-torch-compile",
+            "true",
+        ]
+
+        with (
+            patch.object(sys, "argv", ["sglang"] + argv),
+            mock_cuda_platform(),
+        ):
+            args, unknown_args = parser.parse_known_args(argv)
+            server_args = ServerArgs.from_cli_args(args, unknown_args)
+
+        self.assertIsInstance(server_args.pipeline_config, JoyImageEditPipelineConfig)
+        self.assertTrue(server_args.enable_torch_compile)
 
 
 class TestDisaggTimeoutArgs(unittest.TestCase):
