@@ -24,6 +24,11 @@ import shutil
 import sys
 import time
 import traceback
+
+# Registers sglang's native config classes (e.g. model_type "dory") before any
+# transformers.AutoConfig lookup, so models with no upstream transformers class can be
+# tokenized and benchmarked.
+import sglang.srt.configs  # noqa: F401, E402
 import uuid
 import warnings
 from argparse import ArgumentParser
