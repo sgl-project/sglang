@@ -122,6 +122,7 @@ impl RouterConfigBuilder {
             balance_rel_threshold,
             eviction_interval_secs,
             max_tree_size,
+            prefill_backlog: Default::default(),
         };
         self
     }
