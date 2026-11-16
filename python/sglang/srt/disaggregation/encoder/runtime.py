@@ -29,7 +29,6 @@ from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.server import (
     ENCODER_MAX_BATCH_SIZE,
     ENCODER_MAX_BATCH_SIZE_EXPLICIT,
-    EncoderProfiler,
     MMEncoder,
     MMError,
     await_task_completion_on_cancel,
@@ -1427,15 +1426,11 @@ async def _dp_worker_handle_profile(
     if dp_type == "start_profile":
         req = request.get("profile_req") or ProfileReq()
         req.req_type = ProfileReqType.START_PROFILE
-        if enc.profiler is None:
-            enc.profiler = EncoderProfiler(dp_rank)
         ok, msg = enc.profiler.start(req)
         detail = (
             f"started profiling, output_dir={enc.profiler.output_dir}" if ok else msg
         )
     else:  # stop_profile
-        if enc.profiler is None:
-            return {"ok": False, "msg": prefix + "profiling not initialized"}
         ok, msg = enc.profiler.stop()
         detail = "stopped profiling" if ok else msg
     return {"ok": ok, "msg": prefix + detail}
@@ -1595,7 +1590,6 @@ async def run_dp_worker(
         if get_observability().extra_metric_labels:
             labels.update(get_observability().extra_metric_labels)
         server_module.encoder_metrics_collector = EncoderMetricsCollector(labels)
-        enc.dp_rank = dp_rank
 
     max_batch_size, coalesce_same_turn = _resolve_encoder_batch_policy(
         enc.model_type,

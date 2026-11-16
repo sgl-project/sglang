@@ -14,6 +14,9 @@ from sglang.srt.compilation.compile_phase import (
     get_pcg_capture_stream,
     is_in_torch_compile_warmup,
 )
+from sglang.srt.distributed.device_communicators.custom_all_reduce_utils import (
+    is_weak_contiguous,
+)
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
     is_in_tc_piecewise_cuda_graph,
 )
@@ -555,12 +558,6 @@ class PyMscclppCommunicator:
             return get_exec().comm.enable_symm_mem
         except ValueError:
             return False
-
-    def _is_weak_contiguous(self, inp: torch.Tensor):
-        return inp.is_contiguous() or (
-            inp.storage().nbytes() - inp.storage_offset() * inp.element_size()
-            == inp.numel() * inp.element_size()
-        )
 
     def _get_tuned_config(self, collective: str, message_size: int):
         if message_size <= 0:
@@ -1141,7 +1138,7 @@ class PyMscclppCommunicator:
     ) -> bool:
         if self.disabled or self.world_size not in _SUPPORTED_WORLD_SIZES:
             return False
-        if not self._is_weak_contiguous(inp):
+        if not is_weak_contiguous(inp):
             return False
         if op is not ReduceOp.SUM:
             return False
