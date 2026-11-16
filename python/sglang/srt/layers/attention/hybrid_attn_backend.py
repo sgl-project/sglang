@@ -54,6 +54,9 @@ class HybridAttnBackend(AttentionBackend):
         self.extend_dummy_seqs_capped_by_req_pool = getattr(
             prefill_backend, "extend_dummy_seqs_capped_by_req_pool", False
         )
+        self.can_replan_padded_batch = getattr(
+            prefill_backend, "can_replan_padded_batch", True
+        ) and getattr(decode_backend, "can_replan_padded_batch", True)
 
     def window_capacity_children(self) -> list:
         return [self.prefill_backend, self.decode_backend]
