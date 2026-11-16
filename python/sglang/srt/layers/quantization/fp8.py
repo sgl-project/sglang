@@ -54,6 +54,7 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.online_fp8_update import OnlineFP8Update
 from sglang.srt.layers.quantization.fp8_utils import (
     _deepgemm_block_fp8_supported,
     _use_aiter_bpreshuffle_gfx95,
@@ -775,6 +776,15 @@ class Fp8LinearMethod(LinearMethodBase):
             is_checkpoint_fp8_serialized=self.is_checkpoint_fp8_serialized,
             params_dtype=params_dtype,
         )
+        if not self.is_checkpoint_fp8_serialized and not self.block_quant:
+            layer._online_fp8_update = OnlineFP8Update(layer, ("weight",))
+
+    def restore_weights_before_loading(self, layer: Module) -> None:
+        if self.is_checkpoint_fp8_serialized:
+            return super().restore_weights_before_loading(layer)
+        if not (_is_cuda and not self.block_quant and not self.use_marlin):
+            raise RuntimeError("Unsupported backend for online FP8 weight refresh")
+        layer._online_fp8_update.begin(layer)
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
         if self.use_npu_block_fp8:
@@ -1224,6 +1234,13 @@ class Fp8LinearMethod(LinearMethodBase):
         layer.input_scale = None
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        update = getattr(layer, "_online_fp8_update", None)
+        if update is not None and update.active:
+            update.finish(layer, self._process_weights_after_loading)
+        else:
+            self._process_weights_after_loading(layer)
+
+    def _process_weights_after_loading(self, layer: Module) -> None:
         if self.block_quant:
             self.process_weights_after_loading_block_quant(layer)
             # Only LinearBase defines this; an MXFP8 ParallelLMHead does not.
@@ -2092,6 +2109,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             and get_moe_runner_backend().is_cutlass()
         ):
             self._ensure_cutlass_buffers_initialized(layer)
+        if (
+            not self.quant_config.is_checkpoint_fp8_serialized
+            and not self.block_quant
+            and not self.is_fp4_expert
+        ):
+            layer._online_fp8_update = OnlineFP8Update(
+                layer, ("w13_weight", "w2_weight")
+            )
+
+    def restore_weights_before_loading(self, layer: Module) -> None:
+        if self.quant_config.is_checkpoint_fp8_serialized or self.is_fp4_expert:
+            return super().restore_weights_before_loading(layer)
+        if not (
+            _is_cuda and not self.block_quant and get_moe_runner_backend().is_triton()
+        ):
+            raise RuntimeError("Unsupported backend for online FP8 weight refresh")
+        layer._online_fp8_update.begin(layer)
 
     def _tp_weight_block_sizes(
         self,
@@ -2883,6 +2917,13 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight.is_shuffled = True
 
     def process_weights_after_loading(self, layer: Module) -> None:
+        update = getattr(layer, "_online_fp8_update", None)
+        if update is not None and update.active:
+            update.finish(layer, self._process_weights_after_loading)
+        else:
+            self._process_weights_after_loading(layer)
+
+    def _process_weights_after_loading(self, layer: Module) -> None:
         if _is_hip and _use_hip_int4:
             self.process_weights_hip_int4(layer)
 
