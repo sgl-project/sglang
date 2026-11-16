@@ -15,7 +15,13 @@ from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.mem_cache import allocation
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
+from sglang.srt.mem_cache.deepseek_v4_buffer_info import DSV4PagedBufferInfo
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo
+from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hisparse_retraction import DSV4RetractionSnapshot
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
+from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import FakeReq
 from sglang.test.test_utils import CustomTestCase
@@ -29,6 +35,7 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
         coordinator.device = "cpu"
         coordinator.is_dsv4_hisparse = False
         coordinator.compress_ratio = 1
+        coordinator.sliding_window_size = 128
         coordinator.decode_producer_stream = None
         coordinator.wait_for_pending_backup = MagicMock()
         coordinator.req_to_token_pool = SimpleNamespace(
@@ -43,6 +50,8 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
         )
         freed_device, freed_host = set(), set()
         coordinator.token_to_kv_pool_allocator = SimpleNamespace(
+            page_size=1,
+            translate_loc_from_full_to_swa=lambda ids: ids,
             free_hisparse_indices=lambda ids: freed_device.update(ids.tolist()),
             free_hisparse_mapping_only=lambda ids: mapping.index_fill_(0, ids, 0),
         )
@@ -101,7 +110,7 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
                     committed
                 ).reshape(1, -1)
                 coordinator.token_to_kv_pool_allocator.get_kvcache = lambda: (
-                    SimpleNamespace()
+                    SimpleNamespace(get_device_pool_infos=lambda: ())
                 )
                 host_values = torch.full((32,), -1)
                 device_values = torch.arange(16) + 100
@@ -201,64 +210,172 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
         self.assertIn(0, coordinator.spec_swap._scratch_reqs)
         self.assertFalse(req.hisparse_retraction_pending)
 
-    def test_dsv4_sidecars_restore_into_new_logical_pages(self):
-        """Indexer K and the live SWA window survive physical page reuse."""
-        for fp4 in (False, True):
-            with self.subTest(fp4=fp4):
-                coordinator, req, _, _ = self._retraction_fixture()
-                coordinator.is_dsv4_hisparse = True
-                coordinator.sliding_window_size = 2
-                coordinator.token_to_kv_pool_allocator.page_size = 2
-                coordinator.token_to_kv_pool_allocator.translate_loc_from_full_to_swa = (
-                    lambda ids: ids + 2
-                )
-                coordinator.req_to_token_pool.req_to_token = torch.tensor([[2, 3, 6]])
-                tensors = [
-                    torch.arange(40).reshape(10, 4) + layer * 100 for layer in range(6)
-                ]
-                indexer = SimpleNamespace(
-                    index_k_with_scale_buffer=None if fp4 else tensors[:2],
-                    index_k_payload_buffer=tensors[:2],
-                    index_k_scale_buffer=tensors[2:4],
-                )
-                swa = SimpleNamespace(kv_buffer=tensors[4:])
-                coordinator.token_to_kv_pool_allocator.get_kvcache = lambda: (
-                    SimpleNamespace(c4_indexer_kv_pool=indexer, swa_kv_pool=swa)
-                )
-                index_tensors = tensors[:4] if fp4 else tensors[:2]
-                expected_index = [
-                    buf[torch.tensor([1, 3])].clone() for buf in index_tensors
-                ]
-                expected_swa = [
-                    buf[torch.tensor([2, 4])].clone() for buf in swa.kv_buffer
-                ]
-                event = SimpleNamespace(
-                    record=lambda stream: None, synchronize=lambda: None
-                )
-                with (
-                    patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
-                    patch(
-                        "sglang.srt.managers.hisparse_coordinator.device_module",
-                        SimpleNamespace(
-                            Event=lambda: event, current_stream=lambda: None
-                        ),
-                    ),
-                ):
-                    coordinator._backup_indexer_rows(req, 3, 0)
-                    coordinator._backup_swa_rows(req, 3, 0)
-                    for buf in tensors:
-                        buf.fill_(-1)
-                    coordinator.req_to_token_pool.req_to_token[0] = torch.tensor(
-                        [10, 11, 14]
-                    )
-                    coordinator._restore_indexer_rows(req, 0)
-                    coordinator._restore_swa_rows(req, 0)
-                for buf, expected in zip(index_tensors, expected_index, strict=True):
-                    torch.testing.assert_close(buf[torch.tensor([5, 7])], expected)
-                for buf, expected in zip(swa.kv_buffer, expected_swa, strict=True):
-                    torch.testing.assert_close(buf[torch.tensor([6, 8])], expected)
-                self.assertIsNone(req.hisparse_indexer_backup)
-                self.assertIsNone(req.hisparse_swa_backup)
+    def test_dsv4_retraction_preserves_every_non_offloaded_native_region(self):
+        """Reused pages must not erase C128 KV or page-owned compressor rings."""
+        with get_context().override_server_args(page_size=256):
+            pool = DeepSeekV4TokenToKVPool(
+                max_num_reqs=2,
+                swa_size=2048,
+                c4_size=512,
+                c128_size=16,
+                c4_state_pool_size=64,
+                c128_state_pool_size=2,
+                page_size=256,
+                swa_page_size=256,
+                dtype=torch.float8_e4m3fn,
+                c4_state_dtype=torch.float32,
+                c128_state_dtype=torch.float32,
+                qk_nope_head_dim=448,
+                qk_rope_head_dim=64,
+                indexer_head_dim=128,
+                layer_num=3,
+                device="cpu",
+                enable_memory_saver=False,
+                compression_ratios=[4, 128, 4],
+                full_size=2048,
+                enable_hisparse=True,
+            )
+        coordinator, req, _, _ = self._retraction_fixture()
+        coordinator.is_dsv4_hisparse = True
+        coordinator.compress_ratio = 4
+        coordinator.sliding_window_size = 128
+        coordinator.device_buffer_size = 2
+        coordinator.padded_buffer_size = 3
+        coordinator._device_buffer_arange_i32 = torch.arange(2, dtype=torch.int32)
+        coordinator.token_to_kv_pool_allocator.page_size = 256
+        coordinator.token_to_kv_pool_allocator.get_kvcache = lambda: pool
+        coordinator.token_to_kv_pool_allocator.translate_loc_from_full_to_swa = (
+            lambda ids: ids + 256
+        )
+        coordinator.token_to_kv_pool_allocator.alloc_device_buffer = lambda ids, size: (
+            torch.tensor([8, 9, 10])
+        )
+        coordinator.mem_pool_device.full_to_hisparse_device_index_mapping.resize_(4096)
+        coordinator.req_to_token_pool.req_to_token = torch.cat(
+            (torch.arange(256, 512), torch.arange(768, 1024), torch.tensor([1280]))
+        ).reshape(1, -1)
+        req.kv.set_row_len(513)
+        req.extend_end = 513
+        # C128 compression state is request-owned, so retaining the row preserves it.
+        request_state = pool.compress_state_pools[1].kv_score_buffer.kv_score
+        request_state.fill_(42)
+        expected, all_buffers = [], []
+        for region in pool.get_device_pool_infos():
+            info = region.buffer_info
+            buffers = (
+                info.buffers
+                if isinstance(info, DSV4PagedBufferInfo)
+                else tuple(state.pages for state in info.states)
+            )
+            for buffer in buffers:
+                buffer.view(torch.uint8).fill_(len(all_buffers) + 1)
+                all_buffers.append(buffer)
+            if region.pool_name == PoolName.DEEPSEEK_V4_C4:
+                continue  # Already held in the persistent HiSparse host pool.
+            # Every KV region spans FULL pages. Window regions span only the
+            # last two pages, including the partial page ending at position 513.
+            old_rows = torch.tensor(
+                [4, 6] if region.indices_from_pool == PoolName.SWA else [1, 3, 5]
+            )
+            new_rows = old_rows + 1
+            expected.extend(
+                (region.pool_name, buffer, new_rows.clone(), buffer[old_rows].clone())
+                for buffer in buffers
+            )
+        event = SimpleNamespace(record=lambda stream: None, synchronize=lambda: None)
+        with (
+            patch.object(torch.Tensor, "pin_memory", lambda tensor: tensor),
+            patch(
+                "sglang.srt.managers.hisparse_coordinator.device_module",
+                SimpleNamespace(Event=lambda: event, current_stream=lambda: None),
+            ),
+        ):
+            for _ in range(2):
+                coordinator._skip_first_backup[0] = True
+                coordinator.retract_req_state_preserving(req)
+                for buffer in all_buffers:
+                    buffer.zero_()  # Another request may reuse every freed page.
+                coordinator.req_to_token_pool.req_to_token += 256
+                coordinator.resume_after_retraction(req)
+                for name, buffer, rows, saved in expected:
+                    with self.subTest(region=name):
+                        torch.testing.assert_close(buffer[rows], saved)
+                    rows += 1
+                self.assertTrue((request_state == 42).all())
+                self.assertIsNone(req.hisparse_retraction_snapshot)
+                self.assertTrue(all((b == 0).all() for b in pool.c4_kv_pool.kv_buffer))
+
+    def test_retraction_snapshot_uses_native_rows_and_validates_before_writes(self):
+        """Smaller native pages survive, and a later invalid region cannot partly restore."""
+        swa = torch.full((80, 3), 7, dtype=torch.uint8)
+        scale = torch.full((40, 5), 9, dtype=torch.uint8)
+
+        def region(name, source, buffer):
+            return DevicePoolInfo(
+                pool_name=name,
+                indices_from_pool=source,
+                layer_ids=(9,),
+                buffer_info=DSV4PagedBufferInfo.from_buffers(
+                    [buffer],
+                    page_slots=8,
+                    layout="index_fp4",
+                ),
+            )
+
+        inventory = [
+            region(PoolName.SWA, PoolName.SWA, swa),
+            region(PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE, PoolName.KV, scale),
+        ]
+        allocator = SimpleNamespace(
+            page_size=256,
+            get_kvcache=lambda: SimpleNamespace(
+                get_device_pool_infos=lambda: inventory
+            ),
+            translate_loc_from_full_to_swa=lambda ids: ids,
+        )
+        old_locs = torch.arange(256, 512)
+        snapshot = DSV4RetractionSnapshot.capture(allocator, old_locs, 128)
+        swa.zero_()
+        scale.zero_()
+        inventory[1] = region(
+            PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE,
+            PoolName.KV,
+            scale[:, :4].contiguous(),
+        )
+        with self.assertRaisesRegex(ValueError, "layout changed"):
+            snapshot.restore(allocator, old_locs - 256)
+        self.assertEqual(swa.count_nonzero(), 0)
+        inventory[1] = region(PoolName.DEEPSEEK_V4_C4_INDEXER_SCALE, PoolName.KV, scale)
+        snapshot.restore(allocator, old_locs - 256)
+        self.assertTrue((swa[:32] == 7).all())
+        self.assertTrue((scale[:8] == 9).all())
+        self.assertEqual(swa[32:].count_nonzero(), 0)
+        self.assertEqual(scale[8:].count_nonzero(), 0)
+
+    def test_unknown_retraction_region_fails_before_releasing_device_state(self):
+        """A new FULL region needs an explicit location mapping before it can be freed."""
+        coordinator, req, freed_device, freed_host = self._retraction_fixture()
+        coordinator.is_dsv4_hisparse = True
+        coordinator._skip_first_backup[0] = True
+        unknown = DevicePoolInfo(
+            pool_name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            layer_ids=(0,),
+            buffer_info=DSV4PagedBufferInfo.from_buffers(
+                [torch.ones((8, 4), dtype=torch.uint8)],
+                page_slots=1,
+                layout="v4",
+            ),
+        )
+        coordinator.token_to_kv_pool_allocator.get_kvcache = lambda: SimpleNamespace(
+            get_device_pool_infos=lambda: (unknown,),
+        )
+        with self.assertRaisesRegex(ValueError, "Unknown HiSparse FULL region"):
+            coordinator.retract_req_state_preserving(req)
+        self.assertFalse(freed_device)
+        self.assertFalse(freed_host)
+        self.assertEqual(int(coordinator.req_device_buffer_size[0]), 3)
+        self.assertFalse(req.hisparse_retraction_pending)
 
     def test_retirement_discards_retained_host_state_and_row(self):
         """An ended retracted request releases its backup through normal retirement."""
@@ -267,8 +384,7 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
         coordinator._skip_first_backup[0] = True
         coordinator.retract_req_state_preserving(req)
         req.kv.mark_kv_released()
-        req.hisparse_indexer_backup = [torch.ones(1)]
-        req.hisparse_swa_backup = [torch.ones(1)]
+        req.hisparse_retraction_snapshot = object()
         freed_rows = []
 
         def free_row(request):
@@ -284,8 +400,7 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
         self.assertEqual(freed_rows, [0])
         self.assertFalse(req.kv.holds_kv)
         self.assertFalse(req.hisparse_retraction_pending)
-        self.assertIsNone(req.hisparse_indexer_backup)
-        self.assertIsNone(req.hisparse_swa_backup)
+        self.assertIsNone(req.hisparse_retraction_snapshot)
         self.assertTrue(torch.all(coordinator.req_to_host_pool == -1))
 
     def test_spec_decode_reserve_allocates_logical_pages_only(self):
@@ -400,7 +515,9 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
         )
         buffer_indices = torch.arange(64, 4224, dtype=torch.int64)
         coordinator.token_to_kv_pool_allocator = SimpleNamespace(
-            alloc_device_buffer=MagicMock(return_value=buffer_indices)
+            page_size=1,
+            translate_loc_from_full_to_swa=lambda ids: ids,
+            alloc_device_buffer=MagicMock(return_value=buffer_indices),
         )
         coordinator.req_to_device_buffer = torch.zeros((1, 4160), dtype=torch.int32)
         coordinator.req_device_buffer_size = torch.zeros(1, dtype=torch.int32)
@@ -456,7 +573,9 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
             transfer_values_on_device=transfer_values
         )
         coordinator.token_to_kv_pool_allocator = SimpleNamespace(
-            full_to_hisparse_device_index_mapping=full_to_device_mapping
+            page_size=1,
+            translate_loc_from_full_to_swa=lambda ids: ids,
+            full_to_hisparse_device_index_mapping=full_to_device_mapping,
         )
 
         coordinator.mem_pool_host = HiSparseHostPoolMixin()
