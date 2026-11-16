@@ -111,7 +111,7 @@ class TestRoutingKeyScheduling(CustomTestCase):
             "max_tokens": max_tokens,
             "temperature": 0,
         }
-        headers = {"x-smg-routing-key": routing_key}
+        headers = {"x-sgl-routing-key": routing_key}
         start_time = time.perf_counter()
         async with aiohttp.ClientSession() as session:
             async with session.post(
