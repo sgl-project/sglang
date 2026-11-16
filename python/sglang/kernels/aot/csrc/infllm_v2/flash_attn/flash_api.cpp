@@ -230,8 +230,8 @@ std::vector<at::Tensor> mha_varlen_fwd_stage1(
   // TORCH_CHECK(is_sm90 || is_sm8x || is_sm75, "FlashAttention only supports Turing GPUs or newer.");
 
   auto q_dtype = q.dtype();
-  // Only the bf16 kernels are built (FP16_SWITCH always selects bfloat16).
-  TORCH_CHECK(q_dtype == torch::kBFloat16, "This flash attention build only supports the bf16 data type");
+  TORCH_CHECK(
+      q_dtype == torch::kFloat16 || q_dtype == torch::kBFloat16, "FlashAttention only support fp16 and bf16 data type");
   if (q_dtype == torch::kBFloat16) {
     // TORCH_CHECK(is_sm90 || is_sm8x, "bfloat16 is only supported on Ampere GPUs or newer");
   }
@@ -307,8 +307,8 @@ std::vector<at::Tensor> mha_varlen_fwd_stage1(
   const int total_q = q.sizes()[0];
 
   TORCH_CHECK(batch_size > 0, "batch size must be positive");
-  // Only the head dimension 64 and 128 kernels are built (HEADDIM_SWITCH).
-  TORCH_CHECK(head_size == 64 || head_size == 128, "This flash attention build only supports head dimension 64 or 128");
+  TORCH_CHECK(head_size <= 256, "FlashAttention forward only supports head dimension at most 256");
+  TORCH_CHECK(head_size % 8 == 0, "query, key, value, and out_ must have a head_size that is a multiple of 8");
   TORCH_CHECK(num_heads % num_heads_k == 0, "Number of heads in key/value must divide number of heads in query");
 
   if (window_size_left >= max_seqlen_k) {
