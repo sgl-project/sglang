@@ -848,6 +848,10 @@ class Lfm2Detector(BaseFormatDetector):
 
         # Parse the complete block
         result = self.detect_and_parse(tool_call_block, tools)
+        # A streamed tool_index is the call ordinal across all blocks.
+        for call in result.calls:
+            self.current_tool_id += 1
+            call.tool_index = self.current_tool_id
 
         # Update buffer with remaining text
         self._buffer = remaining
