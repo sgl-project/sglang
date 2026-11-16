@@ -1101,7 +1101,8 @@ class TestIndexerRopeSource(unittest.TestCase):
             patch.object(rope_mod, "Dsv4NpuRoPE", _RopeStub),
             patch.object(DS41, "quant_lightning_indexer_dsl", _QLI()),
         ):
-            out = backend._dsv41_index_full_topk(
+            # The non-candidate path returns ``(scored, None)``.
+            out, _ = backend._dsv41_index_full_topk(
                 layer,
                 torch.zeros(1, 8),
                 torch.zeros(1, 8),
