@@ -2,7 +2,6 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
-#include <sgl_kernel/math.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
@@ -22,23 +21,16 @@ namespace sglang {
 
 using device::distributed::PushWorkSpace;
 using device::distributed::Semaphore;
-using device::math::fast_mod_div_u32_t;
 
 template <uint32_t kWorldSize>
 struct NVLinkCommPushParams {
   const void* __restrict__ input;
   const void* __restrict__ residual;
   void* __restrict__ output;
-  uint32_t dst_offset;  // AR = rank slot stride; AG = packed token prefix
+  uint32_t dst_offset;  // packed token prefix
   uint32_t rank;
   uint32_t num_push_vecs;
   uint32_t num_poll_vecs;
-  uint32_t num_vecs_per_token;
-  // Ragged split, reduce-scatter only: rank r owns `avg + (r < rem)` tokens of
-  // the input starting at `r * avg + min(r, rem)`.
-  uint32_t tokens_avg;
-  uint32_t tokens_rem;
-  fast_mod_div_u32_t vecs_per_token_div;
   PushWorkSpace<kWorldSize> ws;
 };
 
@@ -48,7 +40,6 @@ struct NVLinkCommPullParams {
   void* __restrict__ output;
   uint32_t num_vecs;
   // multicast buffer
-  uint8_t* input_mc;
   uint8_t* output_mc;
   Semaphore* sem_local;
   Semaphore* sem_mc;
@@ -56,23 +47,11 @@ struct NVLinkCommPullParams {
   uint32_t world_size;
 };
 
-template <bool kHasResidual>
-inline constexpr uint32_t get_poll_group(uint32_t world_size) {
-  if (world_size <= 8) return world_size;
-  return kHasResidual ? 6 : 8;
-}
-
 inline constexpr uint32_t kPushCTASize = 1024;  // max value
 inline constexpr uint32_t kPullCTASize = 512;   // max value
 
 #define PUSH_KERNEL __global__ __launch_bounds__(kPushCTASize, 1)
 #define PULL_KERNEL __global__ __launch_bounds__(kPullCTASize, 1)
-
-enum Primitive {
-  RS = 0b01,     // Reduce-Scatter
-  AG = 0b10,     // All-Gather
-  AR = RS | AG,  // All-Reduce = RS + AG
-};
 
 template <typename vec_t>
 SGL_DEVICE vec_t reduce_vec(vec_t x, vec_t y) {
@@ -80,24 +59,15 @@ SGL_DEVICE vec_t reduce_vec(vec_t x, vec_t y) {
   return device::reduce_vec(arr);
 }
 
-/**
- * \brief Layout:
- * 1. `AG`/`RS`: each rank push to its own slot
- *  [rank0] | [rank 1] | [rank 2] | ...
- * 2. `AG`: each rank push to a contiguous region
- *  [rank0, rank1, rank2, ...]
- *
- * `RS` use swizzle layout for push kernel \n
- * `AG` use normal linear layout for push kernel
- */
-template <typename T, bool kHasResidual, Primitive kPrim, uint32_t kWorldSize, bool kUsePDL>
+/// \brief All-gather push: every rank pushes its shard into one contiguous region
+/// `[rank0, rank1, rank2, ...]` of each peer's plane, then polls its own plane.
+template <typename T, bool kHasResidual, uint32_t kWorldSize, bool kUsePDL>
 PUSH_KERNEL void nvlink_push_kernel(const __grid_constant__ NVLinkCommPushParams<kWorldSize> params) {
   using namespace device;
   enable_smem_spilling();
   constexpr uint32_t kVecSize = 16 / sizeof(T);  // 16 bytes per vector
   using vec_t = device::AlignedVector<packed_t<T>, kVecSize / 2>;
   using Lamport = distributed::LamportTrait<T, kVecSize, /*kAtom=*/4>;
-  constexpr uint32_t kGroup = get_poll_group<kHasResidual>(kWorldSize);
 
   // Round-robin warps to blocks: the poll domain is this rank's shard, so a
   // block-major index would park all of it on the first few CTAs and idle the
@@ -113,164 +83,55 @@ PUSH_KERNEL void nvlink_push_kernel(const __grid_constant__ NVLinkCommPushParams
 
   void* push_ptrs[kWorldSize];
   /// NOTE: broadcast write is only fast when world size is large
-  if constexpr (kWorldSize < 8 && (kPrim & Primitive::AG)) {
+  if constexpr (kWorldSize < 8) {
 #pragma unroll
     for (uint32_t i = 0; i < kWorldSize; ++i) {
-      // `dst_offset` is a slot stride for the all-reduce but a packed token
-      // prefix for the gather, whose consumer reads the plane linearly; this
-      // must stay the same address arithmetic as the multicast branch below.
+      // `dst_offset` is a packed token prefix: the consumer reads the plane linearly;
+      // this must stay the same address arithmetic as the multicast branch below.
       push_ptrs[i] = static_cast<uint8_t*>(epoch.slot_ptr(/*dst=*/i)) + params.dst_offset;
     }
   }
 
   const auto dst_ptr_mc = params.ws.mc_workspace + params.dst_offset + epoch.slot_offset();
-  const auto vpt = params.num_vecs_per_token;
 
   for (auto vid = global_tid; vid < params.num_push_vecs; vid += num_threads) {
-    if constexpr (kPrim & Primitive::AG) {
-      vec_t vec;
-      vec.load(params.input, vid);
-      if constexpr (kHasResidual && kPrim == Primitive::AG) {
-        vec_t res;
-        res.load(params.residual, vid);
-        vec = reduce_vec(vec, res);
-      }
-      Lamport::clear_pos_zero(vec.data());
-      if constexpr (kWorldSize < 8) {
+    vec_t vec;
+    vec.load(params.input, vid);
+    if constexpr (kHasResidual) {
+      vec_t res;
+      res.load(params.residual, vid);
+      vec = reduce_vec(vec, res);
+    }
+    Lamport::clear_pos_zero(vec.data());
+    if constexpr (kWorldSize < 8) {
 #pragma unroll
-        for (uint32_t i = 0; i < kWorldSize; ++i) {
-          ptx::st_relaxed_16B(vec, push_ptrs[i], vid);
-        }
-      } else {
-        ptx::st_multimem_16B(vec, dst_ptr_mc, vid);
+      for (uint32_t i = 0; i < kWorldSize; ++i) {
+        ptx::st_relaxed_16B(vec, push_ptrs[i], vid);
       }
-    } else /* reduce-scatter only */ {
-      const auto [token_id, offset] = math::div(vid, params.vecs_per_token_div);
-      // Both by a compile-time constant, so this is a mask and a shift.
-      const auto dst_rank = token_id % kWorldSize;
-      const auto dst_token_id = token_id / kWorldSize;
-      // Round-robin over peers so every link stays busy instead of one congesting
-      const auto avg_tokens = params.tokens_avg;
-      const auto rem_tokens = params.tokens_rem;
-      const auto rank_prefix = dst_rank * avg_tokens + std::min(dst_rank, rem_tokens);
-      const auto src_token = rank_prefix + dst_token_id;
-      vec_t vec;
-      vec.load(params.input, src_token * vpt + offset);
-      const auto dst_ptr = epoch.slot_ptr(dst_rank, params.rank);
-      Lamport::clear_pos_zero(vec.data());
-      ptx::st_relaxed_16B(vec, dst_ptr, dst_token_id * vpt + offset);
+    } else {
+      ptx::st_multimem_16B(vec, dst_ptr_mc, vid);
     }
   }
 
-  // Poll addresses are linear in the source rank -- one base, `slot_bytes`
-  // apart -- so a base plus a vector-index bias replaces a per-peer pointer table.
   const auto poll_base = epoch.slot_ptr(params.rank);
-  const auto slot_vecs = params.ws.slot_bytes / sizeof(vec_t);
   vec_t pos_zero_vec;
   Lamport::fill_pos_zero(pos_zero_vec.data());
   PDLTriggerSecondary<kUsePDL>();
 
   for (auto vid = global_tid; vid < params.num_poll_vecs; vid += num_threads) {
-    if constexpr (kPrim & Primitive::RS) {
-      constexpr uint32_t kNumPairs = kVecSize / 2;
-      vec_t out_vec;
-
-      if constexpr (kGroup >= kWorldSize) {
-        vec_t vec[kWorldSize + kHasResidual];
-        if constexpr (kHasResidual) vec[kWorldSize].load(params.residual, vid);
-        do {
-          bool has_zero = false;
-#pragma unroll
-          for (uint32_t i = 0; i < kWorldSize; ++i) {
-            ptx::ld_relaxed_16B(vec[i], poll_base, i * slot_vecs + vid);
-          }
-#pragma unroll
-          for (uint32_t i = 0; i < kWorldSize; ++i) {
-            has_zero |= Lamport::has_pos_zero(vec[i].data());
-          }
-          if (!has_zero) break;
-        } while (true);
-        out_vec = reduce_vec(vec);
-#pragma unroll
-        for (uint32_t i = 0; i < kWorldSize; ++i) {
-          ptx::st_global_16B(pos_zero_vec, poll_base, i * slot_vecs + vid);
-        }
-      } else /* > 1 group: divide into chunks */ {
-        fp32x2_t acc[kNumPairs];
-        constexpr uint32_t kNumGroups = div_ceil(kWorldSize, kGroup);
-        vec_t vec[kGroup];
-        vec_t res;
-
-#pragma unroll
-        for (uint32_t g = 0; g < kNumGroups; ++g) {
-          const auto for_each = [&](auto&& fn) {
-#pragma unroll
-            for (uint32_t j = 0; j < kGroup; ++j) {
-              const auto i = g * kGroup + j;
-              if (i >= kWorldSize) continue;
-              fn(i, j);
-            }
-          };
-
-          // Loaded a group early so the fetch overlaps the last poll; it is
-          // folded into the accumulator once the groups are done.
-          if constexpr (kHasResidual) {
-            if (g + 1 == kNumGroups) res.load(params.residual, vid);
-          }
-
-          do {
-            bool has_zero = false;
-            for_each([&](uint32_t i, uint32_t j) {
-              // load all the vectors
-              ptx::ld_relaxed_16B(vec[j], poll_base, i * slot_vecs + vid);
-            });
-            for_each([&](uint32_t, uint32_t j) {
-              // check for zeros
-              has_zero |= Lamport::has_pos_zero(vec[j].data());
-            });
-            if (!has_zero) break;
-          } while (true);
-
-          for_each([&](uint32_t i, uint32_t j) {
-#pragma unroll
-            for (uint32_t k = 0; k < kNumPairs; ++k) {
-              const auto [x, y] = cast<fp32x2_t>(vec[j][k]);
-              acc[k].x = i == 0 ? x : acc[k].x + x;
-              acc[k].y = i == 0 ? y : acc[k].y + y;
-            }
-            ptx::st_global_16B(pos_zero_vec, poll_base, i * slot_vecs + vid);
-          });
-        }
-        if constexpr (kHasResidual) {
-#pragma unroll
-          for (uint32_t k = 0; k < kNumPairs; ++k) {
-            const auto [x, y] = cast<fp32x2_t>(res[k]);
-            acc[k].x += x;
-            acc[k].y += y;
-          }
-        }
-#pragma unroll
-        for (uint32_t k = 0; k < kNumPairs; ++k) {
-          out_vec[k] = cast<packed_t<T>>(acc[k]);
-        }
-      }
-
-      out_vec.store(params.output, vid);
-    } else /* all-gather only */ {
-      vec_t vec;
-      do {
-        ptx::ld_relaxed_16B(vec, poll_base, vid);
-      } while (Lamport::has_pos_zero(vec.data()));
-      vec.store(params.output, vid);
-      ptx::st_global_16B(pos_zero_vec, poll_base, vid);
-    }
+    vec_t vec;
+    do {
+      ptx::ld_relaxed_16B(vec, poll_base, vid);
+    } while (Lamport::has_pos_zero(vec.data()));
+    vec.store(params.output, vid);
+    ptx::st_global_16B(pos_zero_vec, poll_base, vid);
   }
 
   __syncthreads();
   epoch.commit();
 }
 
-template <typename T, bool kHasResidual, Primitive kPrim, bool kUsePDL, uint32_t kPullUnroll>
+template <typename T, bool kHasResidual, bool kUsePDL, uint32_t kPullUnroll>
 PULL_KERNEL void nvlink_pull_kernel(const __grid_constant__ NVLinkCommPullParams params) {
   using namespace device;
   constexpr uint32_t kVecSize = 16 / sizeof(T);  // 16 bytes per vector
@@ -298,11 +159,7 @@ PULL_KERNEL void nvlink_pull_kernel(const __grid_constant__ NVLinkCommPullParams
 #pragma unroll
     for (uint32_t i = 0; i < kPullUnroll; ++i) {
       const auto vid = base + i * kWarpThreads;
-      if constexpr (kPrim & Primitive::RS) {
-        ptx::ld_multimem_16B(vecs[i], params.input_mc, vid);
-      } else {
-        ptx::ld_global_16B(vecs[i], params.input, vid);
-      }
+      ptx::ld_global_16B(vecs[i], params.input, vid);
     }
 
     if constexpr (kHasResidual) {
@@ -319,11 +176,7 @@ PULL_KERNEL void nvlink_pull_kernel(const __grid_constant__ NVLinkCommPullParams
 
 #pragma unroll
     for (uint32_t i = 0; i < kPullUnroll; ++i) {
-      if constexpr (kPrim & Primitive::AG) {
-        ptx::st_multimem_16B(vecs[i], params.output_mc, base + i * kWarpThreads);
-      } else {
-        ptx::st_global_16B(vecs[i], params.output, base + i * kWarpThreads);
-      }
+      ptx::st_multimem_16B(vecs[i], params.output_mc, base + i * kWarpThreads);
     }
   }
 
@@ -332,30 +185,18 @@ PULL_KERNEL void nvlink_pull_kernel(const __grid_constant__ NVLinkCommPullParams
   const auto global_threads = num_warps * kWarpThreads;
   for (auto vid = chunk_offset + global_tid; vid < params.num_vecs; vid += global_threads) {
     vec_t vec;
-    if constexpr (kPrim & Primitive::RS) {
-      ptx::ld_multimem_16B(vec, params.input_mc, vid);
-    } else {
-      ptx::ld_global_16B(vec, params.input, vid);
-    }
+    ptx::ld_global_16B(vec, params.input, vid);
     if constexpr (kHasResidual) {
       vec_t res;
       res.load(params.residual, vid);
       vec = reduce_vec(vec, res);
     }
-    if constexpr (kPrim & Primitive::AG) {
-      ptx::st_multimem_16B(vec, params.output_mc, vid);
-    } else {
-      ptx::st_global_16B(vec, params.output, vid);
-    }
+    ptx::st_multimem_16B(vec, params.output_mc, vid);
   }
 
   PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
-  if constexpr (kPrim & Primitive::AG) {
-    barrier.arrive_rel_acq();
-  } else {  // no store multimem, only local store
-    barrier.arrive_relaxed();
-  }
+  barrier.arrive_rel_acq();
 }
 
 /// Block size for the push kernel: the smallest that still spreads the work
@@ -448,7 +289,7 @@ struct NVLinkComm {
   }
 
  private:
-  template <Primitive kPrim, uint32_t kWorldSize>
+  template <uint32_t kWorldSize>
   static void run_push(
       const PushPlaneObj& push,
       const TensorView in,
@@ -464,35 +305,20 @@ struct NVLinkComm {
     const auto out_nbytes = static_cast<int64_t>(out.numel() * sizeof(T));
     const auto num_tokens = static_cast<uint32_t>(in.size(0));
     const auto out_tokens = static_cast<uint32_t>(out.size(0));
-    const auto total_tokens = kPrim == Primitive::AG ? out_tokens : num_tokens;
+    const auto total_tokens = out_tokens;
     const auto routing = get_routing(total_tokens, rank, kWorldSize);
 
-    uint32_t dst_offset = 0;
-    if constexpr (kPrim == Primitive::AR) {
-      CHECK_HOST(num_tokens == out_tokens);
-      CHECK_HOST(out_nbytes <= push.slot_bytes);
-      dst_offset = static_cast<uint32_t>(rank * slot_bytes);
-    } else if constexpr (kPrim == Primitive::RS) {
-      CHECK_HOST(out_tokens == routing.num_rank_tokens);
-      CHECK_HOST(out_nbytes <= push.slot_bytes);
-      // dst_offset is not used for this case
-    } else {
-      static_assert(kPrim == Primitive::AG);
-      CHECK_HOST(num_tokens == routing.num_rank_tokens);
-      CHECK_HOST(out_nbytes <= slot_bytes * kWorldSize);
-      dst_offset = routing.prefix_tokens * static_cast<uint32_t>(num_vecs_per_token * kVecBytes);
-    }
+    CHECK_HOST(num_tokens == routing.num_rank_tokens);
+    CHECK_HOST(out_nbytes <= slot_bytes * kWorldSize);
+    const uint32_t dst_offset = routing.prefix_tokens * static_cast<uint32_t>(num_vecs_per_token * kVecBytes);
 
     // Slice the whole plane: the kernel reaches every slot, not just this rank's.
     const auto block_size = choose_push_block_size(std::max(num_push_vecs, num_poll_vecs));
-    CHECK_HOST(num_vecs_per_token > 0) << "fast div-mod rejects a zero divisor";
-    const auto in_tokens_total = static_cast<uint32_t>(in.size(0));
-    // The all-reduce reduces the whole tensor on every rank; the other two work
-    // on this rank's shard, so a full-length residual is sliced.
-    const auto residual_domain = kPrim == Primitive::AR ? total_tokens : routing.num_rank_tokens;
+    CHECK_HOST(num_vecs_per_token > 0) << "hidden_size " << hidden_size << " is below one 16-byte vector";
+    // The gather works on this rank's shard, so a full-length residual is sliced.
     const auto residual_ptr = get_residual_ptr(
         residual,
-        residual_domain,
+        routing.num_rank_tokens,
         total_tokens,
         routing.prefix_tokens * static_cast<uint32_t>(num_vecs_per_token * kVecBytes));
     const auto params = NVLinkCommPushParams<kWorldSize>{
@@ -503,24 +329,19 @@ struct NVLinkComm {
         .rank = rank,
         .num_push_vecs = num_push_vecs,
         .num_poll_vecs = num_poll_vecs,
-        .num_vecs_per_token = num_vecs_per_token,
-        .tokens_avg = in_tokens_total / kWorldSize,
-        .tokens_rem = in_tokens_total % kWorldSize,
-        .vecs_per_token_div = fast_mod_div_u32_t{num_vecs_per_token},
         .ws = push.get_workspace<kWorldSize>(/*size=*/0),
     };
-    const auto kernel = residual.has_value() ? nvlink_push_kernel<T, true, kPrim, kWorldSize, kUsePDL>
-                                             : nvlink_push_kernel<T, false, kPrim, kWorldSize, kUsePDL>;
+    const auto kernel = residual.has_value() ? nvlink_push_kernel<T, true, kWorldSize, kUsePDL>
+                                             : nvlink_push_kernel<T, false, kWorldSize, kUsePDL>;
     host::LaunchKernel(push.default_blocks, block_size, device).enable_pdl(kUsePDL)(kernel, params);
   }
 
-  template <Primitive kPrim, uint32_t kPullUnroll>
+  template <uint32_t kPullUnroll>
   static void run_pull(
       const PullPlaneObj& pull,
       const TensorView in,
       const TensorView out,
       const tvm::ffi::Optional<TensorView> residual,
-      uintptr_t in_mc_ptr,
       uintptr_t out_mc_ptr,
       uint32_t num_blocks_hint) {
     CHECK_HOST(pull.mc_semaphore != nullptr);
@@ -529,40 +350,26 @@ struct NVLinkComm {
     const auto world_size = pull.world_size;
     const auto num_tokens = static_cast<uint32_t>(in.size(0));
     const auto out_tokens = static_cast<uint32_t>(out.size(0));
-    const auto total_tokens = kPrim == Primitive::AG ? out_tokens : num_tokens;
+    const auto total_tokens = out_tokens;
     const auto routing = get_routing(total_tokens, rank, world_size);
     const auto num_vecs_per_token = static_cast<uint32_t>(hidden_size / kVecSize);
     const auto bytes_per_token = static_cast<uint32_t>(num_vecs_per_token * kVecBytes);
     const auto prefix_bytes = static_cast<uint32_t>(routing.prefix_tokens * bytes_per_token);
 
     // 0 = no hint, autotune; > 0 always use hint but clip to upper bound
-    if constexpr (kPrim == Primitive::AR) {
-      CHECK_HOST(num_tokens == out_tokens && in_mc_ptr != 0 && out_mc_ptr != 0);
-      in_mc_ptr += prefix_bytes;
-      out_mc_ptr += prefix_bytes;
-      if (num_blocks_hint == 0) num_blocks_hint = host::div_ceil(256u, kPullUnroll * world_size);
-    } else if constexpr (kPrim == Primitive::RS) {
-      CHECK_HOST(out_tokens == routing.num_rank_tokens && in_mc_ptr != 0);
-      in_mc_ptr += prefix_bytes;
-      if (num_blocks_hint == 0) num_blocks_hint = pull.default_blocks;  // use all the blocks for RS
-    } else {
-      static_assert(kPrim == Primitive::AG);
-      CHECK_HOST(num_tokens == routing.num_rank_tokens && out_mc_ptr != 0);
-      out_mc_ptr += prefix_bytes;
-      if (num_blocks_hint == 0) num_blocks_hint = host::div_ceil(128u, kPullUnroll * world_size);
-    }
+    CHECK_HOST(num_tokens == routing.num_rank_tokens && out_mc_ptr != 0);
+    out_mc_ptr += prefix_bytes;
+    if (num_blocks_hint == 0) num_blocks_hint = host::div_ceil(128u, kPullUnroll * world_size);
     /// NOTE: hard limit upper bound is `pull.capacity`
     num_blocks_hint = std::min(num_blocks_hint, pull.capacity);
 
-    // Every pull primitive works on this rank's shard, so a full-length
-    // residual is sliced onto it.
+    // The pull works on this rank's shard, so a full-length residual is sliced onto it.
     const auto residual_ptr = get_residual_ptr(residual, routing.num_rank_tokens, total_tokens, prefix_bytes);
     const auto params = NVLinkCommPullParams{
         .input = in.data_ptr(),
         .residual = residual_ptr,
         .output = out.data_ptr(),
         .num_vecs = static_cast<uint32_t>(routing.num_rank_tokens * num_vecs_per_token),
-        .input_mc = std::bit_cast<uint8_t*>(in_mc_ptr),
         .output_mc = std::bit_cast<uint8_t*>(out_mc_ptr),
         .sem_local = pull.semaphores[rank],
         .sem_mc = pull.mc_semaphore,
@@ -574,8 +381,8 @@ struct NVLinkComm {
     const auto max_vecs_in_world = host::div_ceil(total_tokens, world_size) * num_vecs_per_token;
     const auto max_num_blocks = host::div_ceil(max_vecs_in_world, kPullUnroll * kPullCTASize);
     const auto num_blocks = std::max(1u, std::min(max_num_blocks, num_blocks_hint));
-    const auto kernel = residual.has_value() ? nvlink_pull_kernel<T, true, kPrim, kUsePDL, kPullUnroll>
-                                             : nvlink_pull_kernel<T, false, kPrim, kUsePDL, kPullUnroll>;
+    const auto kernel = residual.has_value() ? nvlink_pull_kernel<T, true, kUsePDL, kPullUnroll>
+                                             : nvlink_pull_kernel<T, false, kUsePDL, kPullUnroll>;
     host::LaunchKernel(num_blocks, kPullCTASize, device).enable_pdl(kUsePDL)(kernel, params);
   }
 
@@ -584,7 +391,7 @@ struct NVLinkComm {
   template <uint32_t kWorldSize>
   static void
   all_gather_push(CommunicatorRef comm, TensorView in, TensorView out, tvm::ffi::Optional<TensorView> residual) {
-    return run_push<Primitive::AG, kWorldSize>(comm->get_push_obj(), in, out, residual);
+    return run_push<kWorldSize>(comm->get_push_obj(), in, out, residual);
   }
 
   // only compile once for each world size
@@ -596,8 +403,7 @@ struct NVLinkComm {
       tvm::ffi::Optional<TensorView> residual,
       int64_t out_mc_ptr,
       uint32_t num_blocks_hint) {
-    return run_pull<Primitive::AG, kPullUnroll>(
-        comm->get_pull_obj(), in, out, residual, 0, out_mc_ptr, num_blocks_hint);
+    return run_pull<kPullUnroll>(comm->get_pull_obj(), in, out, residual, out_mc_ptr, num_blocks_hint);
   }
 };
 
