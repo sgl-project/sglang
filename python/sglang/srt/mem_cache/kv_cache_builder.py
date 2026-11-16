@@ -187,8 +187,6 @@ def maybe_register_hicache_draft(
     if draft_plan.mode != HiCacheDraftMode.SIDECAR:
         return
 
-    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-
     if not isinstance(tree_cache, UnifiedRadixCache):
         raise NotImplementedError("HiCache draft pools require UnifiedRadixCache.")
 

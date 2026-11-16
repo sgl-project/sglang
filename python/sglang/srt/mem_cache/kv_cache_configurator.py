@@ -1209,7 +1209,7 @@ class KVCacheConfigurator:
         this runner's layers declare, with virtual ids above the allocator."""
         from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 
-        has_window, has_state = self._unified_window_and_state()
+        _, has_state = self._unified_window_and_state()
         if self._unified_sized is None:
             raise RuntimeError("unified storage must be sized before construction")
         from sglang.srt.mem_cache.kv.decl import StateLifetime
@@ -3271,7 +3271,7 @@ class KVCacheConfigurator:
         # Apply user-specified upper bound
         if user_limit is not None:
             if user_limit > token_capacity:
-                logging.warning(
+                logger.warning(
                     f"max_total_tokens={user_limit} is larger than the profiled value "
                     f"{token_capacity}. Use the profiled value instead."
                 )
@@ -3413,7 +3413,6 @@ class KVCacheConfigurator:
         from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
         schedule = get_schedule()
-        has_window, has_state = self._unified_window_and_state()
         if self._unified_plan is None:
             placement = self._fused_draft_for_pool_factory(self._fused_draft_decision())
             if (
@@ -3743,7 +3742,6 @@ def calculate_mla_kv_cache_dim(
     *, model_config: ModelConfig, kv_cache_dtype: torch.dtype
 ) -> int:
     is_dsa_model = is_deepseek_dsa(model_config.hf_config)
-    kv_cache_dtype = kv_cache_dtype
     kv_lora_rank = model_config.kv_lora_rank
     qk_rope_head_dim = model_config.qk_rope_head_dim
     kv_cache_dim = kv_lora_rank + qk_rope_head_dim  # default mla kv cache dim
