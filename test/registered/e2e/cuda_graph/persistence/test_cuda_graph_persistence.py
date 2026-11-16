@@ -118,9 +118,8 @@ _foundry_pythonpath: Optional[str] = None
 
 
 def _foundry_env() -> dict:
-    """Environment under which the launched servers import Foundry. CI runners
-    share site-packages between jobs, so there foundry-core goes into a scratch
-    --target dir (once per process) that the servers get on PYTHONPATH."""
+    """Server env importing Foundry; in CI a scratch --target dir on PYTHONPATH,
+    since CI runners share site-packages between jobs."""
     global _foundry_pythonpath
     if not is_in_ci():
         return {}
@@ -150,10 +149,13 @@ def _skip_unless_built_for_this_torch(target: str) -> None:
     runner = torch.__version__.split("+")[0]
     for req in map(Requirement, dist.requires or []):
         if req.name == "torch" and not req.specifier.contains(runner):
-            raise unittest.SkipTest(
+            reason = (
                 f"foundry-core {dist.version} requires {req}, this runner has "
                 f"torch {runner}"
             )
+            # Visible in the job log, not only in the skip summary.
+            print(f"[Foundry e2e] SKIPPED: {reason}", file=sys.stderr, flush=True)
+            raise unittest.SkipTest(reason)
 
 
 def _write_toml(path: str, workspace: str) -> str:
