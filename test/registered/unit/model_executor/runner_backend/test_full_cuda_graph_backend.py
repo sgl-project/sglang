@@ -1,4 +1,4 @@
-"""Unit tests for ``FullCudaGraphBackend.capture_one`` profiling hooks — CPU-only.
+"""CPU tests for FULL profiling hooks and FULL/BCG grouped capture.
 
 These cover the changes from the "cuda graph profile traces" PR that wire the
 runner's torch profiler into the capture loop:
@@ -28,9 +28,8 @@ from unittest import mock
 import torch
 
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
-from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
-    FullCudaGraphBackend,
-)
+from sglang.srt.model_executor.runner_backend import breakable_cuda_graph_backend as bcg
+from sglang.srt.model_executor.runner_backend import full_cuda_graph_backend as full
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -44,17 +43,35 @@ _UNSET = object()
 class _FakeGraphCtx:
     """Stand-in for ``device_module.graph(...)`` — a no-op context manager."""
 
+    def __init__(self, state=None):
+        self.state = state
+
     def __enter__(self):
+        if self.state is not None:
+            self.state.events.append("capture.enter")
+            self.state.active = True
         return self
 
     def __exit__(self, *exc):
+        if self.state is not None:
+            self.state.active = False
+            self.state.events.append("capture.exit")
+            if self.state.fail_exit:
+                self.state.fail_exit = False
+                raise RuntimeError("capture exit")
         return False
 
 
-def _make_backend(runner):
-    """Build a ``FullCudaGraphBackend`` without running ``__init__`` (which would
-    touch CUDA), wiring just the attributes ``capture_one`` reads."""
-    backend = FullCudaGraphBackend.__new__(FullCudaGraphBackend)
+def _make_backend(runner, module=full):
+    """Build a FULL or breakable backend without initializing CUDA."""
+    cls = (
+        module.FullCudaGraphBackend
+        if module is full
+        else module.BreakableCudaGraphBackend
+    )
+    backend = cls.__new__(cls)
+    backend._group_preparation_enabled = False
+    backend._prepared_groups = set()
     backend._graphs = {}
     backend._outputs = {}
     backend._capture_inputs = {}
@@ -69,6 +86,13 @@ def _make_backend(runner):
     backend._cuda_graph_runner = runner
     backend._device_module = runner.device_module
     backend._tp_group = SimpleNamespace(barrier=mock.Mock(name="barrier"))
+    if module is bcg:
+        backend._model_runner = runner.model_runner
+        backend._shared_output_buffer = None
+        backend._debug_eager = False
+        backend._enable_hicache_event_capture = False
+        backend._hicache_graph_events = None
+        backend.deduped_cuda_graph = None
     return backend
 
 
@@ -82,6 +106,14 @@ def _make_runner(*, enable_profile, profiler, num_tokens_per_bs=1, mode_name="DE
         num_tokens_per_bs=num_tokens_per_bs,
         capture_forward_mode=SimpleNamespace(name=mode_name),
         enable_profile_cuda_graph=enable_profile,
+        model_runner=SimpleNamespace(
+            device="cuda",
+            lora_manager=None,
+            attn_backend=SimpleNamespace(requires_per_shape_decode_graph_warmup=False),
+        ),
+        attn_backend=SimpleNamespace(requires_per_shape_decode_graph_warmup=False),
+        cuda_graph_output_capacity_rows=lambda output: None,
+        cuda_graph_output_rows=lambda output: None,
     )
     if profiler is not _UNSET:
         runner._profiler = profiler
@@ -266,6 +298,213 @@ class TestCleanup(CustomTestCase):
         self.assertEqual(backend._graphs, {})
         self.assertEqual(backend._outputs, {})
         self.assertIsNone(backend._pool)
+
+
+@contextlib.contextmanager
+def _backend_env(module, *, enabled, reuse=False):
+    runner = _make_runner(enable_profile=False, profiler=None)
+    backend = _make_backend(runner, module)
+    backend._group_preparation_enabled = enabled
+    backend._reuse_output_buffer = reuse
+    state = SimpleNamespace(active=False, fail_exit=False, events=[])
+    runner.device_module.state = state
+
+    def record(event):
+        if state.active and event in ("sync", "barrier"):
+            raise AssertionError("synchronization during capture")
+        state.events.append(event)
+
+    @contextlib.contextmanager
+    def measure():
+        record("measure.enter")
+        yield
+        record("measure.exit")
+
+    runner.device_module.synchronize.side_effect = lambda: record("sync")
+    backend._tp_group.barrier.side_effect = lambda: record("barrier")
+    backend._precarve = SimpleNamespace(measure=measure, mint=lambda: record("mint"))
+    runner.device_module.graph = lambda **kw: _FakeGraphCtx(state)
+    with contextlib.ExitStack() as stack:
+        stack.enter_context(mock.patch("torch.cuda.CUDAGraph", side_effect=mock.Mock))
+        stack.enter_context(
+            mock.patch.multiple(
+                module,
+                set_graph_pool_id=lambda pool: None,
+                get_or_create_global_graph_memory_pool=lambda device: object(),
+                graph_pool_capture_scope=contextlib.nullcontext,
+                graph_pool_replay_scope=contextlib.nullcontext,
+            )
+        )
+        if module is bcg:
+            stack.enter_context(
+                mock.patch.multiple(
+                    module,
+                    BreakableCUDAGraph=lambda *a, **kw: mock.Mock(),
+                    BreakableCUDAGraphCapture=lambda **kw: _FakeGraphCtx(state),
+                    enable_breakable_cuda_graph=contextlib.nullcontext,
+                )
+            )
+            stack.enter_context(
+                mock.patch.multiple(
+                    module.BreakableCudaGraphBackend,
+                    begin_cuda_graph_capture=lambda self: None,
+                    end_cuda_graph_capture=lambda self: None,
+                )
+            )
+        yield backend, runner.device_module
+
+
+class TestGroupedCapture(CustomTestCase):
+    def test_group_counts_sync_hook_and_formal_capture(self):
+        keys = [
+            ShapeKey(size=8),
+            ShapeKey(size=4),
+            ShapeKey(size=1),
+            ShapeKey(size=2),
+            ShapeKey(size=4, variant_label="lora"),
+            ShapeKey(size=8, variant_label="lora"),
+            ShapeKey(size=2, attention_variant="lora"),
+        ]
+        for module in (full, bcg):
+            for enabled, eager in ((False, [2] * 7), (True, [1, 0, 1, 0, 1, 0, 1])):
+                with self.subTest(backend=module.__name__, enabled=enabled):
+                    with _backend_env(module, enabled=enabled) as (
+                        backend,
+                        device,
+                    ):
+                        hook = mock.Mock(
+                            side_effect=lambda: device.state.events.append("hook")
+                        )
+                        with backend.capture_session(object()):
+                            for key, count in zip(keys, eager):
+
+                                def forward():
+                                    device.state.events.append(
+                                        "capture" if device.state.active else "eager"
+                                    )
+                                    return torch.ones((key.size, 2))
+
+                                device.state.events.clear()
+                                backend.capture_one(key, forward, post_warmup_hook=hook)
+                                expected = []
+                                for step in range(2):
+                                    expected.extend(
+                                        ["sync", "barrier", "measure.enter"]
+                                    )
+                                    if step < count:
+                                        expected.append("eager")
+                                    expected.extend(["measure.exit", "hook"])
+                                expected.extend(
+                                    ["capture.enter", "mint", "capture", "capture.exit"]
+                                )
+                                self.assertEqual(device.state.events, expected)
+                                self.assertTrue(backend.can_run(None, key))
+                                self.assertEqual(
+                                    tuple(backend.replay(key, None).shape),
+                                    (key.size, 2),
+                                )
+
+    def test_session_reset_and_failure_retry(self):
+        for module in (full, bcg):
+            for fail_call in (1, 2, "exit"):
+                with self.subTest(backend=module.__name__, fail_call=fail_call):
+                    with _backend_env(module, enabled=True) as (backend, device):
+                        key = ShapeKey(size=4)
+                        calls = 0
+
+                        def fail():
+                            nonlocal calls
+                            calls += 1
+                            if calls == fail_call:
+                                raise RuntimeError("injected")
+                            return torch.ones((4, 2))
+
+                        with backend.capture_session(object()):
+                            device.state.fail_exit = fail_call == "exit"
+                            with self.assertRaisesRegex(
+                                RuntimeError, "injected|capture exit"
+                            ):
+                                backend.capture_one(key, fail)
+                            self.assertFalse(backend.can_run(None, key))
+                            forward = mock.Mock(return_value=torch.ones((4, 2)))
+                            backend.capture_one(key, forward)
+                            self.assertEqual(forward.call_count, 2)
+                            with self.assertRaisesRegex(RuntimeError, "ready"):
+                                backend.capture_one(
+                                    key, mock.Mock(side_effect=RuntimeError("ready"))
+                                )
+                            forward = mock.Mock(return_value=torch.ones((4, 2)))
+                            backend.capture_one(key, forward)
+                            self.assertEqual(forward.call_count, 1)
+                        with backend.capture_session(object()):
+                            forward = mock.Mock(return_value=torch.ones((4, 2)))
+                            backend.capture_one(key, forward)
+                            self.assertEqual(forward.call_count, 2)
+                        # A separate backend must prepare the same group independently.
+                        with _backend_env(module, enabled=True) as (other, _):
+                            with other.capture_session(object()):
+                                forward = mock.Mock(return_value=torch.ones((4, 2)))
+                                other.capture_one(key, forward)
+                                self.assertEqual(forward.call_count, 2)
+
+    def test_warmup_outputs_released_before_capture(self):
+        for enabled in (False, True):
+            for reuse in (False, True):
+                with self.subTest(enabled=enabled, reuse=reuse):
+                    with _backend_env(full, enabled=enabled, reuse=reuse) as (
+                        backend,
+                        device,
+                    ):
+                        warmups = []
+
+                        def forward():
+                            self.assertTrue(all(ref() is None for ref in warmups))
+                            output = torch.ones((4, 2))
+                            if not device.state.active:
+                                warmups.append(weakref.ref(output))
+                            return output
+
+                        with backend.capture_session(object()):
+                            backend.capture_one(ShapeKey(size=4), forward)
+                        self.assertEqual(len(warmups), 1 if enabled else 2)
+                        self.assertTrue(all(ref() is None for ref in warmups))
+
+    def test_output_buffer_reuse_and_cleanup(self):
+        for module in (full, bcg):
+            with self.subTest(backend=module.__name__):
+                with _backend_env(module, enabled=True, reuse=True) as (backend, _):
+                    large = ShapeKey(size=8)
+                    small = ShapeKey(size=4)
+                    input_owner = torch.ones((2,))
+                    retained = weakref.ref(input_owner)
+                    with backend.capture_session(object()):
+                        backend.capture_one(
+                            large,
+                            lambda: (torch.ones((8, 2)), torch.ones((8, 3))),
+                            capture_inputs=input_owner,
+                        )
+                        backend.capture_one(
+                            small,
+                            lambda: (torch.full((4, 2), 2.0), torch.full((4, 3), 3.0)),
+                        )
+                    del input_owner
+                    self.assertIsNotNone(retained())
+                    first = backend.replay(large, None)
+                    second = backend.replay(small, None)
+                    for index, (large_leaf, small_leaf) in enumerate(
+                        zip(first, second)
+                    ):
+                        self.assertEqual(large_leaf.data_ptr(), small_leaf.data_ptr())
+                        self.assertEqual(tuple(small_leaf.shape), (4, index + 2))
+                        self.assertTrue(
+                            torch.equal(
+                                small_leaf, torch.full((4, index + 2), index + 2.0)
+                            )
+                        )
+                    backend.cleanup()
+                    self.assertFalse(backend.can_run(None, large))
+                    self.assertFalse(backend.can_run(None, small))
+                    self.assertIsNone(retained())
 
 
 if __name__ == "__main__":

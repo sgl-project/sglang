@@ -138,6 +138,14 @@ class AttentionBackend(ABC):
     # snapshotted/restored around a captured metadata-prep replay.
     attn_backend_list: Optional[list] = None
 
+    @property
+    def requires_per_shape_decode_graph_warmup(self) -> bool:
+        """Whether decode capture needs eager preparation for every shape."""
+        return any(
+            backend.requires_per_shape_decode_graph_warmup
+            for backend in self.attn_backend_list or ()
+        )
+
     # Per-iter metadata produced by init_forward_metadata*; backends that use
     # it assign their own type. Declared here so generic snapshot/restore code
     # (metadata glue graph) can read it off any backend without hasattr.
