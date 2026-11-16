@@ -48,8 +48,58 @@ def _wan_14b_coefficients(p: TeaCacheParams) -> list[float]:
     return [-5784.54975374, 5449.50911966, -1811.16591783, 256.27178429, -13.02252404]
 
 
+class _WanT2VResolutionAlignment:
+    """Rounds T2V sizes down to the latent patch grid.
+
+    The DiT floors an odd latent side when it splits it into 2x2 patches, so its
+    output no longer matches the latents. Image-to-video configs size the
+    output from the input image, and the diffusers backend keeps its own size
+    handling.
+    """
+
+    def _adjust_visual_fields(self, server_args, pipeline_config) -> None:
+        super()._adjust_visual_fields(server_args, pipeline_config)
+        self._align_resolution(pipeline_config)
+
+    def prepare_synthetic_warmup_request_for_queue(self, req, server_args) -> None:
+        super().prepare_synthetic_warmup_request_for_queue(req, server_args)
+        # Warmup overwrites the dimensions after _adjust has run.
+        self._align_resolution(server_args.pipeline_config)
+
+    def _align_resolution(self, pipeline_config) -> None:
+        from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+            WanI2VCommonConfig,
+            WanT2V480PConfig,
+        )
+
+        if not isinstance(pipeline_config, WanT2V480PConfig) or isinstance(
+            pipeline_config, WanI2VCommonConfig
+        ):
+            return
+        if self.width is None or self.height is None:
+            return
+        if self.width <= 0 or self.height <= 0:
+            return
+        multiple = (
+            pipeline_config.vae_config.arch_config.spatial_compression_ratio
+            * pipeline_config.dit_config.arch_config.patch_size[1]
+        )
+        requested_size = (self.width, self.height)
+        self.width = max(multiple, self.width // multiple * multiple)
+        self.height = max(multiple, self.height // multiple * multiple)
+        if (self.width, self.height) != requested_size:
+            logger.warning(
+                "Wan T2V requires dimensions divisible by %s; adjusted requested "
+                "resolution from %sx%s to %sx%s",
+                multiple,
+                *requested_size,
+                self.width,
+                self.height,
+            )
+
+
 @dataclass
-class WanT2V_1_3B_SamplingParams(SamplingParams):
+class WanT2V_1_3B_SamplingParams(_WanT2VResolutionAlignment, SamplingParams):
     # Video parameters
     height: int = 480
     width: int = 832
@@ -81,7 +131,7 @@ class WanT2V_1_3B_SamplingParams(SamplingParams):
 
 
 @dataclass
-class WanT2V_14B_SamplingParams(SamplingParams):
+class WanT2V_14B_SamplingParams(_WanT2VResolutionAlignment, SamplingParams):
     # Video parameters
     height: int = 720
     width: int = 1280
@@ -274,7 +324,9 @@ class Wan2_2_TI2V_5B_SamplingParam(Wan2_2_Base_SamplingParams):
 
 
 @dataclass
-class Wan2_2_T2V_A14B_SamplingParam(Wan2_2_Base_SamplingParams):
+class Wan2_2_T2V_A14B_SamplingParam(
+    _WanT2VResolutionAlignment, Wan2_2_Base_SamplingParams
+):
     guidance_scale: float = 4.0  # high_noise
     guidance_scale_2: float = 3.0  # low_noise
     num_inference_steps: int = 40
