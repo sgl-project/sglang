@@ -16,6 +16,14 @@ from sglang.srt.utils.json_response import orjson_response
 router = APIRouter()
 
 
+# The scheduler replies with output=None and the error text when a handler raised.
+def _failed_scheduler_reply(response):
+    return orjson_response(
+        {"success": False, "message": response.error or "Unknown status"},
+        status_code=500,
+    )
+
+
 @router.post("/update_weights_from_disk")
 async def update_weights_from_disk(request: Request):
     """Update model weights from disk inplace without restarting the server."""
@@ -86,6 +94,9 @@ async def update_weights_from_tensor(request: Request):
             status_code=500,
         )
 
+    if response.output is None:
+        return _failed_scheduler_reply(response)
+
     result = response.output
     return orjson_response(
         result,
@@ -130,6 +141,9 @@ async def update_weights_from_tensor_checker(request: Request):
             status_code=500,
         )
 
+    if response.output is None:
+        return _failed_scheduler_reply(response)
+
     result = response.output
     success = result.get("success", False)
     message = result.get("message", "Unknown status")
@@ -151,6 +165,11 @@ async def get_weights_checksum(request: Request):
         response = await async_scheduler_client.forward(req)
     except Exception as e:
         return orjson_response({"error": str(e)}, status_code=500)
+
+    if response.output is None:
+        return orjson_response(
+            {"error": response.error or "Unknown status"}, status_code=500
+        )
 
     return orjson_response(response.output, status_code=200)
 
