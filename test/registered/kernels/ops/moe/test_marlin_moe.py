@@ -148,6 +148,12 @@ def marlin_moe_generate_valid_test_cases():
     for case in all_combinations:
         if is_valid(*case):
             cases.append(case)
+    # Exercise medium-batch alignment with 128 experts and eight-token blocks.
+    cases.extend(
+        (m, 768, 2048, 128, 8, dtype, 128, False, scalar_types.uint4, True)
+        for m in (16, 32)
+        for dtype in (torch.half, torch.bfloat16)
+    )
     return cases
 
 
@@ -298,6 +304,9 @@ class TestFusedMarlinMoe(CustomTestCase):
                 from sglang.srt.layers.moe.topk import fused_topk_torch_native
 
                 topk_weights, topk_ids = fused_topk_torch_native(a, score, topk, False)
+                if e == 128:
+                    # Match the production router dtype for medium-batch alignment.
+                    topk_ids = topk_ids.to(torch.int32)
 
                 torch_output = torch_moe(
                     a,
