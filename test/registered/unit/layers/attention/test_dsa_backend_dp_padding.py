@@ -124,6 +124,7 @@ class TestDSABackendDPPadding(CustomTestCase):
         batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
             out_cache_loc=torch.arange(rows),
+            out_cache_loc_is_physical=False,
             positions=torch.arange(rows),
             mha_return_lse=False,
             _attn_output=None,

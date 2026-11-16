@@ -111,10 +111,9 @@ every flag.
 | `GET /healthz`, `/readyz` | Liveness and readiness; `/health`, `/liveness`, and `/readiness` are aliases |
 | `GET /metrics` | Prometheus metrics, see [monitoring/README.md](monitoring/README.md) |
 
-sgl-model-gateway endpoints for features the router does not provide yet
-(the Responses and Conversations APIs, `/parse/*`, `/workers`,
-`/v1/tokenizers`, `/wasm`, `/ha/*`, `/v1/loads`, `/get_loads`,
-`/engine_metrics`) answer `501` with error code `unsupported_endpoint`.
+Endpoints for features the router does not provide yet (the Responses and
+Conversations APIs, `/v1/loads`) answer `501` with error code
+`unsupported_endpoint`.
 
 Both edges speak cleartext HTTP/2 where the peer does; see
 [operations](#operations). With `--grpc-port`, the router also serves the
@@ -353,6 +352,10 @@ unset fields inherit the CLI flags. See
 - **PD version groups**: `--pd-version-group-label <key>` pairs prefill and
   decode only within the same engine version; see
   [PD version groups](REFERENCE.md#pd-version-groups).
+- **Request body size**: inference routes answer `413` past 32 MiB;
+  `SGLANG_ROUTER_MAX_BODY_BYTES=<bytes>` raises the cap for large multimodal
+  requests, at the cost of more router memory per in-flight request; see
+  [request body size](REFERENCE.md#request-body-size).
 - **Engine API key**: `--worker-api-key` for engines launched with `--api-key`;
   see [engines with `--api-key`](REFERENCE.md#engines-with---api-key).
 - **Sampling contract**: `--override-sampling-params '<json>'` pins sampling

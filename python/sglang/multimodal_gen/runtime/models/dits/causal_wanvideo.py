@@ -141,10 +141,14 @@ class CausalWanSelfAttention(nn.Module):
     ):
         r"""
         Args:
-            x(Tensor): Shape [B, L, num_heads, C / num_heads]
-            seq_lens(Tensor): Shape [B]
-            grid_sizes(Tensor): Shape [B, 3], the second dimension contains (F, H, W)
-            freqs(Tensor): Rope freqs, shape [1024, C / num_heads / 2]
+            q(Tensor): Query, shape [B, L, num_heads, C / num_heads]
+            k(Tensor): Key, shape [B, L, num_heads, C / num_heads]
+            v(Tensor): Value, shape [B, L, num_heads, C / num_heads]
+            freqs_cis(tuple[Tensor, Tensor]): Rope ``(cos, sin)`` tables for the block
+            block_mask(BlockMask): FlexAttention mask for the unpadded batch
+            kv_cache(CausalSelfAttentionKVCache | None): KV cache for causal decoding
+            current_start(int): Frame index the current block starts at
+            cache_start(int | None): Frame index the cached prefix starts at
             complex_freqs(Tensor): Rope complex freqs, shape [L, 1, C / num_heads / 2]
         """
         cos, sin = freqs_cis

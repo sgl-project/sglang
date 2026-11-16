@@ -37,8 +37,6 @@ class SageAttentionBackend(AttentionBackend):
     def supports_ring_rotation(cls) -> bool:
         return True
 
-    accept_output_buffer: bool = True
-
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         # SageAttention 2 pads smaller head dimensions to 64 or 128 internally

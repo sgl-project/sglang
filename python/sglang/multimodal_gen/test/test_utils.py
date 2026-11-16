@@ -37,7 +37,7 @@ logger = init_logger(__name__)
 # NPU/ascend) is read from sgl-project/ci-data-diffusion, where the GT-gen workflows
 # publish.
 SGL_TEST_FILES_CI_DATA_REPO = "sgl-project/ci-data-diffusion"
-SGL_TEST_FILES_CI_DATA_REVISION = "62f587d8f3321a1b8a679a2339df8eeb20319b54"
+SGL_TEST_FILES_CI_DATA_REVISION = "4fe135ff3cb72fca12934948b7a6a26a23e535ff"
 
 # The NPU pin is kept as a separate branch so ascend GT can be bumped independently
 # when it's regenerated on its own cadence. 2173af2f re-generated the MiniMax-H3

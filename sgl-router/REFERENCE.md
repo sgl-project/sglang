@@ -277,6 +277,24 @@ to the whole pool rather than rejecting every request, and failures reopen
 them. `--disable-circuit-breaker` turns it off; a worker that stops answering
 then keeps its share of traffic.
 
+### Request body size
+
+The router buffers each inference request body in full before routing it, so
+it caps the body: `/v1/chat/completions`, `/v1/completions`, `/generate`,
+`/v1/embeddings`, `/v1/classify`, `/v1/rerank` and `/v1/messages` (with
+`count_tokens`) answer `413` past it. The cap is 32 MiB by default; set
+`SGLANG_ROUTER_MAX_BODY_BYTES` to a positive byte count (for example
+`268435456` for 256 MiB) to accept larger multimodal requests carrying several
+base64 images or audio clips. Raising it raises the router's worst-case memory
+too: the body is held in full and parsed (and often rebuilt) while the request
+is prepared, so peak memory per in-flight request is a few times its size. The
+value is bytes, so `256` is a 256-byte cap, not 256 MiB. An empty value keeps
+the default; zero or a value that is not a plain decimal integer (no unit
+suffix) keeps the default and logs a warning. The router logs the effective cap
+at startup. The cap does not change the native gRPC server's inbound message
+limit (half of the 64 MiB engine channel), or the 32 MiB cap on a buffered
+non-streaming Anthropic Messages reply.
+
 ### Engines with `--api-key`
 
 The router reads each worker's `/server_info` and `/model_info` to learn its
@@ -568,6 +586,14 @@ the Messages API does, and a final assistant turn is sent as a prefill
 Every error uses the Anthropic error envelope; 5xx messages are replaced with a
 generic one, and a failed stream still closes its open block and ends with
 `message_stop`.
+
+A `system` turn inside `messages`, as Claude Code sends, stays in place only
+when every worker of the model reports `supports_inline_system` in
+`/server_info`: its chat template renders a system message after the first.
+Otherwise its text joins the leading system message, where the engine's own
+`/v1/messages` puts it, and the turns either side of it stay apart. An engine
+that predates the field counts as not supporting it, and a request that ends
+with a system turn is never a prefill.
 
 `/v1/messages/count_tokens` is answered by the router from the model's chat
 template, without calling an engine. Image tokens are not counted, and a model
