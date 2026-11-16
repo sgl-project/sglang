@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
 
@@ -214,6 +215,8 @@ def _indexer_tp_split_min_rows() -> int:
     return _INDEXER_TP_SPLIT_MIN_ROWS_HIP if _is_hip else _INDEXER_TP_SPLIT_MIN_ROWS
 
 
+# once per process: a missing FlyDSL warns once, not once per layer
+@functools.cache
 def _resolve_hip_prefill_mqa_logits():
     if envs.SGLANG_USE_FLYDSL_DSA_PREFILL_LOGITS.get():
         try:
