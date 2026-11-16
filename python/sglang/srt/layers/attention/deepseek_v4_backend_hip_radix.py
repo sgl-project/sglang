@@ -969,8 +969,7 @@ class DeepseekV4HipRadixBackend(
         )
         # published by the candidate-source layer, consumed by the later index-source layers
         self.candidate_masks = None
-        # this forward's extend slot tables by ratio, shared by that ratio's
-        # index-source layers; rebuilt in _refresh_fp4_prefill_workspace
+        # this forward's extend slot tables by ratio, built in _refresh_fp4_prefill_workspace
         self.low_ratio_extend_k_slots: Dict[int, LowRatioExtendSlots] = {}
         self.enable_deepseek_v4_fp4_indexer: bool = (
             get_exec().kernel.enable_deepseek_v4_fp4_indexer
@@ -1877,8 +1876,6 @@ class DeepseekV4HipRadixBackend(
         kernel reads, so only the pinned buffers it fills may be read from a graph."""
         if metadata is None:
             metadata = self.forward_metadata
-        # a table built for an earlier batch must never be reachable, so drop it here
-        # rather than only where the rebuild runs
         self.low_ratio_extend_k_slots = {}
         if (
             isinstance(metadata, DSV4Metadata)
@@ -1899,8 +1896,6 @@ class DeepseekV4HipRadixBackend(
                     page8_ratios=self.token_to_kv_pool.low_ratio_index_k_page8_ratios(),
                 )
             )
-            # layer independent within a ratio: one build here serves every
-            # index-source layer of that ratio instead of one build per layer
             self.low_ratio_extend_k_slots = build_low_ratio_extend_k_slots(
                 self.req_to_token,
                 ratios=metadata.core_metadata.low_ratios,
