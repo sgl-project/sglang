@@ -6,6 +6,7 @@ Usage:
 
 import os
 import subprocess
+import tempfile
 import time
 import unittest
 
@@ -57,6 +58,33 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
         cls._stop_mooncake_services()
 
     @classmethod
+    def _start_mooncake_service(cls, name, command):
+        """Start a service in its own process group, logging to a file.
+
+        Nothing reads these services' output, and mooncake_master logs a
+        metrics summary every 10 seconds. On a pipe it blocks once the pipe
+        buffer is full (about five minutes in), and every later master RPC
+        times out, which fails any server that takes longer than that to start.
+
+        The log's path is printed. The log is removed when the services are
+        stopped, unless its service had exited by then: that log says why.
+        """
+        log = tempfile.NamedTemporaryFile(
+            prefix=f"mooncake-{name}-", suffix=".log", delete=False
+        )
+        print(f"Mooncake {name} service log: {log.name}")
+        # The service keeps its own descriptor; ours is closed here.
+        with log:
+            process = subprocess.Popen(
+                command,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+                preexec_fn=os.setsid,  # Create new process group
+            )
+        cls._mooncake_service_logs.append((process, log.name))
+        return process
+
+    @classmethod
     def _start_mooncake_services(cls):
         """Start Mooncake metadata and master services with configurable ports and readiness detection"""
         print("Starting Mooncake services...")
@@ -64,10 +92,13 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
             f"Using master port: {cls.mooncake_master_port}, metadata port: {cls.mooncake_metadata_port}"
         )
 
+        cls._mooncake_service_logs = []
+
         # Start metadata service with configurable port
         try:
             # Start metadata server with port configuration
-            cls.metadata_service_process = subprocess.Popen(
+            cls.metadata_service_process = cls._start_mooncake_service(
+                "metadata",
                 [
                     "python3",
                     "-m",
@@ -77,9 +108,6 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
                     "--port",
                     str(cls.mooncake_metadata_port),
                 ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                preexec_fn=os.setsid,  # Create new process group
             )
             print(
                 f"Mooncake metadata service started on port {cls.mooncake_metadata_port}"
@@ -91,11 +119,9 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
         # Start master service with configurable port
         try:
             # Start master server with port configuration
-            cls.master_service_process = subprocess.Popen(
+            cls.master_service_process = cls._start_mooncake_service(
+                "master",
                 ["mooncake_master", "--port", str(cls.mooncake_master_port)],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                preexec_fn=os.setsid,  # Create new process group
             )
             print(f"Mooncake master service started on port {cls.mooncake_master_port}")
         except (FileNotFoundError, subprocess.SubprocessError) as e:
@@ -170,6 +196,8 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
     def _stop_mooncake_services(cls):
         """Stop Mooncake services"""
         print("Stopping Mooncake services...")
+        service_logs = getattr(cls, "_mooncake_service_logs", [])
+        exited = {path for process, path in service_logs if process.poll() is not None}
 
         # Stop metadata service
         if hasattr(cls, "metadata_service_process") and cls.metadata_service_process:
@@ -188,6 +216,17 @@ class HiCacheStorageMooncakeBackendBaseMixin(HiCacheStorageBaseMixin):
                 print("Mooncake master service stopped")
             except (ProcessLookupError, subprocess.TimeoutExpired, OSError) as e:
                 print(f"Warning: Could not stop Mooncake master service: {e}")
+
+        # Remove the services' logs
+        for _, path in service_logs:
+            if path in exited:
+                print(f"A Mooncake service had exited; its log is kept: {path}")
+                continue
+            try:
+                os.unlink(path)
+            except OSError as e:
+                print(f"Warning: Could not remove Mooncake service log {path}: {e}")
+        cls._mooncake_service_logs = []
 
     @classmethod
     def _get_additional_server_args_and_env(cls):
