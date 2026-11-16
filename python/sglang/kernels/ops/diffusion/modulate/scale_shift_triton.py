@@ -641,15 +641,6 @@ def fuse_scale_shift_kernel(
         else:
             sh_sb = sh_sl = sh_sc = 0
 
-        # If both scalars and both zero, copy fast-path
-        if need_scale_scalar and need_shift_scalar:
-            if not (
-                scale_blc.any().to("cpu", non_blocking=True)
-                or shift_blc.any().to("cpu", non_blocking=True)
-            ):
-                output.copy_(x)
-                return output
-
         # NVIDIA: rows of up to 1024 channels, 4096 elements per program, 1.5-1.65x
         # the 128x128 tile on B300 from ~10M elements up (same bytes)
         if x.is_cuda and not is_hip():
