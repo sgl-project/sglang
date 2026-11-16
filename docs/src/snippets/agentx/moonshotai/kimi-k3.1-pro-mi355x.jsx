@@ -559,8 +559,8 @@ export const agentxMi355x = {
        ]
       },
       {
-       "kind": "sglang-router",
-       "cmd": "python3 -m sglang_router.launch_router",
+       "kind": "sgl-router",
+       "cmd": "sgl-router",
        "env": {},
        "args": [
         ["--pd-disaggregation"],

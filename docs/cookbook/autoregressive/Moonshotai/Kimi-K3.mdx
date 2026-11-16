@@ -420,7 +420,7 @@ K3's hybrid HiCache tiers the paged MLA KV **and** the KDA/mamba state across L1
 PD splits prefill and decode into separate server groups; because K3 is hybrid, the transfer moves **both** the paged MLA KV and the KDA recurrent state.
 
 - **Transfer**: the CUDA cells emit **NiXL** (RDMA); Mooncake stays selectable in the Playground. The Ascend NPU cells emit `--disaggregation-transfer-backend ascend` — the KV/KDA transfer rides the Ascend memory fabric instead (see [below](#npu-pd)).
-- **Ports**: prefill `30000`, decode `30100` (derived ZMQ/dist ranges must not collide on a shared host). The positional `8998` after `--prefill` must match `--disaggregation-bootstrap-port`, or only the decode worker registers.
+- **Ports**: prefill `30000`, decode `30100` (derived ZMQ/dist ranges must not collide on a shared host).
 - **Decode state pool**: radix cache disabled — one slot per request; `--mamba-radix-cache-strategy` is inert. Keep `--disaggregation-decode-extra-slots` pinned: unpinned it defaults to twice the batch below 32 requests and **zero** above.
 
 <a id="npu-pd" />
@@ -473,13 +473,12 @@ Deep PP is `--tp-size 1` with one pipeline stage per GPU — `--pp-size 8` on B3
 <Accordion title="Router">
 
 ```bash Command
-python3 -m sglang_router.launch_router \
-  --pd-disaggregation \
-  --prefill http://<prefill-host>:30000 8998 \
-  --decode http://<decode-host>:30100 \
+sgl-router \
+  --model-id <model-path> \
+  --no-tokenizer \
+  --worker-urls http://<prefill-host>:30000 http://<decode-host>:30100 \
   --host 0.0.0.0 --port 8000 \
-  --disable-circuit-breaker \
-  --health-check-interval-secs 999999
+  --disable-circuit-breaker
 ```
 
 </Accordion>

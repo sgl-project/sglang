@@ -98,7 +98,7 @@ rmp-serde = "1"
 # hashes, u64 node ids), off the routing hot path's SipHash cost. The
 # keys are client-derivable, not trusted; what bounds a collision attack
 # is that planting a key costs a real request — see the DoS note in
-# src/policies/kv_events/tree.rs.
+# src/state/kv_events/tree.rs.
 rustc-hash = "2"
 sha2 = "0.10"
 url = "2"
@@ -140,9 +140,7 @@ tonic-prost = "0.14.6"
 # Low-level msgpack encoder used to hand-construct wire bytes in
 # kv_events golden-bytes tests (decode-only path uses rmp-serde).
 rmp = "0.8"
-# Criterion benches that mirror the SMG `radix_tree_benchmark` +
-# `manual_policy_benchmark` so routing-decision latency can be compared
-# apples-to-apples against the gateway being deprecated.
+# Criterion benches for routing-decision latency (benches/, BENCHMARKS.md).
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
 

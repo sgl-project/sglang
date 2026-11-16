@@ -92,8 +92,6 @@ def _reported_deployment_info() -> api_types.DeploymentInfo:
             "timeout",
         ),
         ({"hicache_write_policy": "write_back"}, "hicache_write_policy", "write_back"),
-        ({"smg_grpc_mode": True}, "grpc_port", None),
-        ({"grpc_mode": True}, "grpc_port", None),
         (
             {"grpc_response_timeout_secs": 900},
             "grpc_response_timeout_secs",
@@ -117,6 +115,11 @@ def _reported_deployment_info() -> api_types.DeploymentInfo:
         # launched path.
         ({"tokenizer_path": "/public"}, "tokenizer_path", "tokenizer"),
         ({"tokenizer_path": "/public"}, "public_tokenizer_path", "/public"),
+        # `--warmups` holds health until Python ran them (`rust_server.warmups`).
+        ({"warmups": "voice_chat"}, "custom_warmups_pending", True),
+        # Blank names run nothing, so nothing would release a hold.
+        ({"warmups": ""}, "custom_warmups_pending", False),
+        ({"warmups": " ,"}, "custom_warmups_pending", False),
     ],
     ids=[
         "native-grpc",
@@ -124,8 +127,6 @@ def _reported_deployment_info() -> api_types.DeploymentInfo:
         "hicache_storage_backend_extra_config",
         "hicache_storage_prefetch_policy",
         "hicache_write_policy",
-        "legacy-smg",
-        "deprecated-legacy-smg",
         "grpc-response-timeout",
         "priority-off",
         "priority-on",
@@ -135,6 +136,9 @@ def _reported_deployment_info() -> api_types.DeploymentInfo:
         "mm-limits-keep-order",
         "loaded-tokenizer",
         "public-tokenizer",
+        "custom-warmups",
+        "custom-warmups-empty",
+        "custom-warmups-blank",
     ],
 )
 def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected):

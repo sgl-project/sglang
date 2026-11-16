@@ -28,6 +28,7 @@ class TestSchedulePolicyWaitingQueueMatching(unittest.TestCase):
     def make_policy(self, policy, supports_fast_match_prefix):
         schedule_policy = object.__new__(SchedulePolicy)
         schedule_policy.policy = policy
+        schedule_policy._bounded_active = False
         schedule_policy.tree_cache = SimpleNamespace(
             supports_fast_match_prefix=lambda: supports_fast_match_prefix
         )
@@ -40,6 +41,9 @@ class TestSchedulePolicyWaitingQueueMatching(unittest.TestCase):
 
         policy.tree_cache = SimpleNamespace(supports_fast_match_prefix=lambda: True)
         self.assertTrue(policy.waiting_queue_prefix_matched([None] * 129))
+
+        policy._bounded_active = True
+        self.assertFalse(policy.waiting_queue_prefix_matched([None] * 129))
 
 
 class TestSchedulerLoadInquirer(unittest.TestCase):
