@@ -2119,10 +2119,15 @@ def _load_image(
                 )
 
                 return decode_jpeg_with_fancy_upsampling(image_bytes)
-            from torchvision.io import decode_jpeg  # lazy: ~1 s of torch._dynamo
+            # lazy: ~1 s of torch._dynamo
+            from torchvision.io import ImageReadMode, decode_jpeg
 
             encoded_image = torch.frombuffer(image_bytes, dtype=torch.uint8)
-            image_tensor = decode_jpeg(encoded_image, device="cuda")
+            # Force RGB: UNCHANGED keeps grayscale JPEGs as [1, H, W], which
+            # breaks processors that normalize with three channel means.
+            image_tensor = decode_jpeg(
+                encoded_image, mode=ImageReadMode.RGB, device="cuda"
+            )
             return image_tensor
         except Exception as e:
             if gpu_image_decode == "nvjpeg_fancy":
