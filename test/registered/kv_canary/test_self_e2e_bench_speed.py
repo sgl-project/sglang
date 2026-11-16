@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from typing import ClassVar, Optional
 
-from sglang.bench_one_batch_server import (
+from sglang.benchmark.one_batch_server import (
     BenchArgs,
     BenchOneCaseResult,
     run_benchmark_internal,

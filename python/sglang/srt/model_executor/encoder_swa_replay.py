@@ -99,10 +99,8 @@ def _tail_rows_on_original(
 
 
 def run_encoder_swa_replay(worker, batch):
-    from sglang.srt.model_executor.forward_batch_info import (
-        CaptureHiddenMode,
-        ForwardBatch,
-    )
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_mode import CaptureHiddenMode
 
     runner = worker.model_runner
     window = runner.token_to_kv_pool.request_window

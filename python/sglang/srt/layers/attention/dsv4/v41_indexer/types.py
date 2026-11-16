@@ -7,9 +7,10 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Protocol, TypeVar
 import msgspec
 import torch
 
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.common import async_h2d, ceil_align, ceil_div
 
 if TYPE_CHECKING:
+    from sglang.srt.distributed.parallel_state import GroupCoordinator
     from sglang.srt.layers.attention.dsv4.dsv41_sparse import DeepseekV41Indexer
     from sglang.srt.layers.attention.dsv4.metadata import PagedIndexerMetadata
 
@@ -30,6 +31,38 @@ def get_tail_row_indices(
 class CandidateMetadata:
     def tail(self, rows_per_request: List[int]) -> CandidateMetadata:
         raise NotImplementedError(f"{type(self).__name__} is not a prefill publish")
+
+
+class RowShard(msgspec.Struct, frozen=True, kw_only=True):
+    """This rank's share of a prefill chunk's query rows across a group whose
+    ranks all hold the same rows.
+
+    Each rank scores a contiguous share instead of scoring every row, then
+    all-gathers the selections. Rows are mathematically independent, but bf16
+    logits can vary with the kernel's row count and change picks near the
+    selection floor; alignment alone does not imply bitwise parity."""
+
+    group: GroupCoordinator
+    rank: int
+    world: int
+    # The score kernel groups 128 // heads consecutive rows into one MMA tile;
+    # aligned shares keep every tile's row set the same as unsharded.
+    row_align: int
+
+    def rows_per_rank(self, num_rows: int) -> int:
+        return ceil_align(ceil_div(num_rows, self.world), self.row_align)
+
+    def local_rows(self, num_rows: int) -> slice:
+        per = self.rows_per_rank(num_rows)
+        start = min(self.rank * per, num_rows)
+        return slice(start, min(start + per, num_rows))
+
+    def gather(self, local: torch.Tensor, num_rows: int) -> torch.Tensor:
+        """``[num_rows, ...]`` from every rank's ``[rows_per_rank, ...]`` share;
+        the last share's padding rows fall past ``num_rows`` and are dropped."""
+        gathered = local.new_empty((self.world * local.shape[0], *local.shape[1:]))
+        self.group.all_gather_into_tensor(gathered, local.contiguous())
+        return gathered[:num_rows]
 
 
 class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
@@ -69,6 +102,10 @@ class PrefillInputs(msgspec.Struct, frozen=True, kw_only=True):
     # None when this forward's attention reads only the positions (sparse prefill).
     out_raw_indices: torch.Tensor
     out_page_indices: Optional[torch.Tensor]
+
+    # Set when this rank scores only its share of the dense rows; backends
+    # without a sharded path ignore it and score every row.
+    row_shard: Optional[RowShard] = None
 
     def reset_outputs(self) -> None:
         self.out_raw_indices.fill_(-1)

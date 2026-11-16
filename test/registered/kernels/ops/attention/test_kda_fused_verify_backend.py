@@ -18,7 +18,7 @@ from sglang.srt.layers.attention.linear.kda_backend import (
 )
 from sglang.srt.layers.attention.linear.utils import LinearAttnKernelBackend
 from sglang.srt.mem_cache.memory_pool import MambaPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -136,6 +136,8 @@ class TestKDAFusedVerifyBackend(CustomTestCase):
         backend.state_layer_cache = state.at_layer_idx
         backend.state_pool = SimpleNamespace(
             replayssm_is_kda=ring,
+            replayssm_request_ring=False,
+            enable_linear_replayssm=False,
             get_speculative_mamba2_params_all_layers=lambda: state,
         )
         backend.req_to_token_pool = SimpleNamespace(size=state.temporal.shape[1])

@@ -48,11 +48,8 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
-from sglang.srt.model_executor.forward_batch_info import (
-    ForwardBatch,
-    ForwardMode,
-    PPProxyTensors,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaMLP
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_parallel
@@ -556,31 +553,6 @@ class Llama4ForCausalLM(LlamaForCausalLM):
         prefix: str = "",
     ):
         super().__init__(config, quant_config, prefix)
-
-    @torch.no_grad()
-    def forward_split_prefill(
-        self, input_ids, positions, forward_batch, split_interval, input_embeds=None
-    ):
-        start, end = split_interval
-        if start == 0:
-            residual_batch.start(forward_batch)
-            forward_batch.hidden_states = (
-                self.model.embed_tokens(input_ids)
-                if input_embeds is None
-                else input_embeds
-            )
-        for layer in self.model.layers[start:end]:
-            forward_batch.hidden_states = layer(
-                positions, forward_batch.hidden_states, forward_batch
-            )
-        if end != self.model.config.num_hidden_layers:
-            return None
-        forward_batch.hidden_states = residual_batch.final_norm(
-            forward_batch.hidden_states, forward_batch, self.model.norm
-        )
-        return self.logits_processor(
-            input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-        )
 
     def get_input_embeddings(self):
         return self.model.embed_tokens

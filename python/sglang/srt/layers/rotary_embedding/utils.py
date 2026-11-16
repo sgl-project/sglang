@@ -13,6 +13,34 @@ _is_npu = is_npu()
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 
+
+def rotary_embedding_cpu(
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    head_size: int,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    if query.ndim == 3:
+        query = query.clone()
+        key = key.clone()
+    torch.ops.sgl_kernel.rotary_embedding_cpu(
+        positions, query, key, head_size, cos_sin_cache, is_neox
+    )
+    return query, key
+
+
+def apply_rotary_pos_emb_cpu(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    torch.ops.sgl_kernel.apply_rotary_pos_emb_cpu(query, key, cos, sin)
+    return query, key
+
+
 if _is_npu:
     import torch_npu
 
@@ -141,6 +169,6 @@ def apply_rotary_pos_emb_npu(
 if _is_npu:
     apply_rotary_pos_emb = apply_rotary_pos_emb_npu
 elif _is_cpu and _is_cpu_amx_available:
-    apply_rotary_pos_emb = torch.ops.sgl_kernel.apply_rotary_pos_emb_cpu
+    apply_rotary_pos_emb = apply_rotary_pos_emb_cpu
 else:
     apply_rotary_pos_emb = apply_rotary_pos_emb_native

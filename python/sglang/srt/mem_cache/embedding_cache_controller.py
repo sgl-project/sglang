@@ -16,8 +16,8 @@ try:
 except ImportError:
     transfer_embedding_ranges_direct = None
 
-from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.mem_cache.embedding_store import EmbeddingStore
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)

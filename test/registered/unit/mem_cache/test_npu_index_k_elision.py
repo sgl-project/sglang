@@ -39,6 +39,7 @@ INDEXER_LAYERS = (0, 3, 6)
 
 def _kvc():
     return types.SimpleNamespace(
+        modelslim_cache_layout=None,
         model_config=types.SimpleNamespace(
             hf_config=types.SimpleNamespace(
                 architectures=["GlmMoeDsaForCausalLM"],

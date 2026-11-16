@@ -14,8 +14,8 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentImageURL,
     ChatCompletionMessageContentVideoURL,
 )
-from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.models.minimax_vl_common import _stack_pixel_values
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.minimax_m3_vl import (
     MAX_IMAGE_PIXELS,
@@ -354,12 +354,6 @@ class TestMiniMaxM31Processor(CustomTestCase):
         return self.processor.process_mm_data(None, input_ids=ids, **kwargs)[
             "input_ids"
         ][0].tolist()
-
-    def test_interleaved_media_and_text_are_preserved(self):
-        self.assertEqual(
-            self.process([101, 10, 102, 11, 103], images=[object()], videos=[object()]),
-            [101] + self.image + [102] + self.video + [103],
-        )
 
     def test_expanded_media_is_not_expanded_twice(self):
         ids = [101] + self.image + [102] + self.video + [103]

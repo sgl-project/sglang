@@ -20,6 +20,7 @@ from sglang.srt.managers.io_struct import (
     DetokenizeReleaseReq,
     flatten_output_ids,
 )
+from sglang.srt.runtime_context import get_context
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -155,6 +156,9 @@ def _deliver(detok, outputs):
 
 
 class TestDetokenizeState(CustomTestCase):
+    def setUp(self) -> None:
+        self.enterContext(get_context().override_server_args(kv_canary="none"))
+
     def test_later_rows_decode_with_the_first_rows_header(self):
         detok = _detokenizer()
         sent = {}

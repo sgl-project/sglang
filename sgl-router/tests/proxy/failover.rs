@@ -47,6 +47,7 @@ async fn errors_with_one_dead_worker(max_attempts: u32) -> usize {
         },
         observability: Default::default(),
         model: ModelConfig {
+            aliases: Vec::new(),
             id: "tiny".into(),
             tokenizer_path: Some("tests/fixtures/tiny_tokenizer.json".into()),
             disable_input_ids_forwarding: false,

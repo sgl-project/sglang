@@ -8,6 +8,8 @@
 #pragma once
 #include <sgl_kernel/type.cuh>
 
+#include <cstdint>
+
 namespace sglang {
 
 namespace device::math {
@@ -110,6 +112,21 @@ SGL_DEVICE float fma_f32_bf16(bf16_t a, bf16_t b, float acc) {
 // overload above (the bf16 -> f32 convert is exact).
 SGL_DEVICE float fma_f32_bf16(bf16_t a, float b, float acc) {
   return fmaf(cast<fp32_t>(a), b, acc);
+}
+
+// Packed round-to-nearest addition used by the exact TopK cluster path on SM100+.
+// The fallback preserves the rounding contract without contracting into a neighbouring FMA.
+SGL_DEVICE float2 add_f32x2(float2 a, float2 b) {
+#if SGL_ARCH_BLACKWELL_OR_GREATER
+  float2 d;
+  const auto a_bits = reinterpret_cast<const uint64_t&>(a);
+  const auto b_bits = reinterpret_cast<const uint64_t&>(b);
+  auto& d_bits = reinterpret_cast<uint64_t&>(d);
+  asm("add.rn.f32x2 %0, %1, %2;" : "=l"(d_bits) : "l"(a_bits), "l"(b_bits));
+  return d;
+#else
+  return make_float2(__fadd_rn(a.x, b.x), __fadd_rn(a.y, b.y));
+#endif
 }
 
 /**

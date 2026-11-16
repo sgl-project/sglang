@@ -10,7 +10,8 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.io_struct import ProfileReqOutput
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.step_span_utils import (
     build_detailed_annotation_suffix,
     detailed_annotations_enabled,
@@ -403,12 +404,12 @@ class _ProfilerMemory(_ProfilerConcreteBase):
 class _ProfilerCudart(_ProfilerConcreteBase):
     def start(self):
         if self.first_rank_in_node:
-            logger.info(f"Call cudaProfilerStart")
+            logger.info("Call cudaProfilerStart")
             torch.cuda.cudart().cudaProfilerStart()
 
     def stop(self):
         if self.first_rank_in_node:
-            logger.info(f"Call cudaProfilerStop")
+            logger.info("Call cudaProfilerStop")
             torch.cuda.cudart().cudaProfilerStop()
 
 

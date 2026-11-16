@@ -38,10 +38,7 @@ def _bucket_total_tokens(total_tokens: int) -> int:
 # Constants for DSV4 layout
 # ============================================================================
 DSV4_D_QK = 512
-DSV4_D_NOPE = 448
-DSV4_D_ROPE = 64
 DSV4_D_V = 512
-DSV4_TILE_SIZE = 64
 
 # ============================================================================
 # Dispatch thresholds for split-K decision
@@ -118,10 +115,6 @@ def _decide_splitk_dual_scope(total_tokens: int, h_q: int, total_topk: int) -> i
     else:
         return _select_split_k(total_topk, h_q, total_tokens)
 
-
-DSV4_NUM_TILES = 7
-DSV4_BYTES_PER_TOKEN_DATA = 576  # 448 nope + 128 rope
-DSV4_BYTES_PER_TOKEN_SCALE = 8  # 7 scales + 1 padding
 
 # ============================================================================
 # Helper: Process KV block and compute QK scores + accumulator update

@@ -265,7 +265,7 @@ def get_accel_count(test: CIRegistry) -> Optional[int]:
     """Number of GPUs/NPUs a test's suite runs on, or None if unencoded.
 
     Returns None for suites whose name has no size token -- `stress`,
-    `nightly-amd-vlm`, the CPU suites, and the synthesized `mm-gen-*`
+    `nightly-amd`, the CPU suites, and the synthesized `mm-gen-*`
     suites (multimodal_gen spreads one suite across 1-gpu and 2-gpu
     runners, so there is no single answer to report).
     """

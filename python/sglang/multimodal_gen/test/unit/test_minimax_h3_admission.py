@@ -276,7 +276,11 @@ def test_synthetic_warmup_target_honors_warmup_flags():
     assert target() == TARGET
     assert target(num_frames=345) == {**TARGET, "duration_seconds": 345 / 24.0}
     assert target(resolution="768x1344") == {**TARGET, "aspect_ratio": "9:16"}
-    assert target(resolution="832x464") == TARGET
+    assert target(resolution="1344x768") == TARGET
+    # The short edge follows the flag as well as the aspect.
+    assert target(resolution="832x464") == {**TARGET, "short_edge": 464}
+    assert target(resolution="864x480") == {**TARGET, "short_edge": 480}
+    assert target(resolution="960x544") == {**TARGET, "short_edge": 544}
 
 
 def test_duration_admission_accepts_released_4_to_15_second_range():
@@ -390,11 +394,16 @@ def test_video_adapter_does_not_override_default_reference_resize_mode():
     assert "reference_resize_mode" not in lowered
 
 
-def test_sampling_params_normalizes_reference_resize_mode_and_defaults_to_diffusers():
-    assert MiniMaxH3SamplingParams().reference_resize_mode == "diffusers"
+def test_sampling_params_normalizes_reference_resize_mode():
     assert (
         MiniMaxH3SamplingParams(reference_resize_mode=" MATCH ").reference_resize_mode
         == "match"
+    )
+    assert (
+        MiniMaxH3SamplingParams(
+            reference_resize_mode=" DIFFUSERS "
+        ).reference_resize_mode
+        == "diffusers"
     )
 
 
@@ -408,7 +417,8 @@ def test_sampling_params_rejects_invalid_reference_resize_mode(bad_mode):
     ("sampling_params", "expected_mode"),
     [
         (SimpleNamespace(reference_resize_mode="match"), "match"),
-        (SimpleNamespace(), "diffusers"),
+        (SimpleNamespace(reference_resize_mode="diffusers"), "diffusers"),
+        (SimpleNamespace(), "max"),
     ],
 )
 def test_prequeue_forwards_reference_resize_mode_and_target_canvas(

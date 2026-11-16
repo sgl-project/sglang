@@ -7,7 +7,6 @@ from unittest.mock import MagicMock
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.mem_cache.embedding_cache_controller import (
     EmbeddingCacheController,
     EmbeddingCacheEntry,
@@ -19,6 +18,7 @@ from sglang.srt.mem_cache.embedding_cache_controller import (
     _build_host_device_transfer_plan,
     _build_storage_transfer_buffers,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")

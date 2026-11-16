@@ -11,7 +11,7 @@ from torchvision.transforms import InterpolationMode
 from torchvision.transforms import functional as F
 from transformers import BatchFeature, ProcessorMixin, TensorType
 
-from sglang.srt.managers.schedule_batch import MultimodalProcessorOutput
+from sglang.srt.managers.req_types import MultimodalProcessorOutput
 from sglang.srt.models.step3_vl import Step3VLForConditionalGeneration
 from sglang.srt.models.step3_vl_10b import StepVLForConditionalGeneration
 from sglang.srt.models.step3p7 import Step3p7ForConditionalGeneration

@@ -12,7 +12,7 @@ Use these upstream files when the workflow or behavior needs to be justified fro
 - `python/sglang/test/send_one.py`
   - minimal request path that can trigger profiling from a single command
 
-- `python/sglang/bench_serving.py`
+- `python/sglang/benchmark/serving.py`
   - profile-capable serving benchmark path
   - forwards `profile_activities`, `profile_by_stage`, `profile_stages`, and `profile_prefix`
 

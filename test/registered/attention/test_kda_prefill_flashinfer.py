@@ -41,7 +41,7 @@ from sglang.srt.layers.attention.linear.utils import (  # noqa: E402
 from sglang.srt.layers.attention.mamba.prefill_track_metadata import (  # noqa: E402
     build_prefill_track_plan,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 from sglang.srt.runtime_context import get_parallel  # noqa: E402
 from sglang.test.kits.attention_unittest.attention_methods.kda_attention import (  # noqa: E402
     KDAAttentionCase,

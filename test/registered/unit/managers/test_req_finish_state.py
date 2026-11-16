@@ -5,11 +5,8 @@ import unittest
 from pathlib import Path
 
 from sglang.srt.managers import schedule_batch
-from sglang.srt.managers.schedule_batch import (
-    FINISH_ABORT,
-    FINISH_LENGTH,
-    Req,
-)
+from sglang.srt.managers.req_types import FINISH_ABORT, FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test import field_writes
 from sglang.test.ci.ci_register import register_cpu_ci

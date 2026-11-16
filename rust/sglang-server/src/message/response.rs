@@ -228,7 +228,21 @@ pub struct BatchHeader {
     /// `cached_tokens_split`: one value for the frame, not a column.
     #[serde(default)]
     pub storage_backend: Option<String>,
+    /// A finished request's [`RequestStats`], `None` for one still running;
+    /// empty when no request in the batch finished.
+    #[serde(default)]
+    pub request_stats: Vec<Option<RequestStats>>,
 }
+
+/// The `meta_info` keys Python's TokenizerManager derives from scheduler
+/// state for a finished request (`SchedulerOutputStreamer.get_request_stats`):
+/// the retraction count, the scheduler's timings when metrics are on, and the
+/// speculative-decoding stats. Built by the scheduler with Python's own
+/// helpers, so a native `/generate` terminal frame reports them as they are,
+/// keys and values both, without per-key code here.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct RequestStats(pub serde_json::Map<String, serde_json::Value>);
 
 /// The completion tokens `[start, end)` one weight version produced, as the
 /// scheduler's `WeightVersionSpan` encodes it: `[version, start, end]`.
@@ -544,6 +558,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
         || !(h.decode_latencies.is_empty() || h.decode_latencies.len() == n)
         || !(h.abort_outputs.is_empty() || h.abort_outputs.len() == n)
         || !(h.cached_tokens_split.is_empty() || h.cached_tokens_split.len() == n)
+        || !(h.request_stats.is_empty() || h.request_stats.len() == n)
     {
         reject!()
     }
@@ -655,6 +670,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
         let cached_tokens_details = h.cached_tokens_split.get(i).and_then(|&split| {
             CachedTokensDetails::from_split(split, cached_tokens, storage_backend.as_ref())
         });
+        let request_stats = h.request_stats.get_mut(i).and_then(Option::take);
 
         // Plain decode frame (no request in the batch asked for logprobs/hidden):
         // the extras columns are all zero-width, so skip reading them entirely,
@@ -667,7 +683,8 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
                 || decode_latency.is_some()
                 || abort_output
                 || !customized_info.is_empty()
-                || cached_tokens_details.is_some();
+                || cached_tokens_details.is_some()
+                || request_stats.is_some();
             has_metadata.then(|| {
                 Box::new(ChunkExtras {
                     weight_versions,
@@ -678,6 +695,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
                     abort_output,
                     customized_info,
                     cached_tokens_details,
+                    request_stats,
                     ..Default::default()
                 })
             })
@@ -755,6 +773,7 @@ pub fn for_each_chunk(body: &[u8], mut route: impl FnMut(ChunkEvent)) -> Decoded
                 abort_output,
                 customized_info,
                 cached_tokens_details,
+                request_stats,
                 // Explicit, NOT `..Default::default()` — same reason as `ChunkEvent`
                 // below: a new column must fail to compile here until it is decoded.
                 out_lp_txt: Vec::new(),
@@ -905,12 +924,12 @@ pub struct ChunkEvent {
 }
 
 /// Logprob + hidden-state columns for a [`ChunkEvent`], allocated only when the
-/// request enabled logprobs / hidden states, finished (its weight-version spans),
-/// has media prompt tokens, its batch carried `customized_info` or it reports
-/// its cached tokens by tier. Columnar `val`/`idx` (+ ragged `lens`) buffers
-/// arrive pre-decode; the detok shard fills the parallel `*_txt` columns when
-/// `return_text_in_logprobs` is set. In-process only — no serde (see
-/// [`ChunkEvent`]).
+/// request enabled logprobs / hidden states, finished (its weight-version spans
+/// and request stats), has media prompt tokens, its batch carried
+/// `customized_info` or it reports its cached tokens by tier. Columnar
+/// `val`/`idx` (+ ragged `lens`) buffers arrive pre-decode; the detok shard
+/// fills the parallel `*_txt` columns when `return_text_in_logprobs` is set.
+/// In-process only — no serde (see [`ChunkEvent`]).
 #[derive(Debug, Clone, Default)]
 pub struct ChunkExtras {
     /// Output-token logprobs (parallel `val`/`idx`, one entry per new output token).
@@ -956,6 +975,8 @@ pub struct ChunkExtras {
     /// This request's cached tokens by cache tier, when they say more than
     /// `cached_tokens` does.
     pub cached_tokens_details: Option<CachedTokensDetails>,
+    /// A finished request's stats (see [`BatchHeader::request_stats`]).
+    pub request_stats: Option<RequestStats>,
     /// Decoded logprob token text (`return_text_in_logprobs`), parallel to the
     /// `*_idx` buffers; empty when not requested (the tuple's text slot stays null).
     pub out_lp_txt: Vec<String>,
@@ -985,6 +1006,7 @@ impl ChunkExtras {
             && !self.abort_output
             && self.customized_info.is_empty()
             && self.cached_tokens_details.is_none()
+            && self.request_stats.is_none()
     }
 }
 

@@ -46,7 +46,7 @@ from sglang.srt.managers.io_struct import (
     sock_send,
     wrap_as_pickle,
 )
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
 from sglang.srt.runtime_context import (
     get_disagg,

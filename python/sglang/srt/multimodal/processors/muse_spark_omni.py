@@ -19,11 +19,7 @@ import torch
 from PIL import Image
 from transformers.utils.hub import cached_file
 
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.muse_spark_omni import MuseSparkForConditionalGeneration
 from sglang.srt.multimodal.cache import resolve_multimodal_item_hash
 from sglang.srt.multimodal.encoder_preprocessing import EncoderPreprocessOutput
@@ -31,13 +27,14 @@ from sglang.srt.multimodal.media_artifacts.base import (
     MediaArtifactCacheMixin,
     MediaArtifactInput,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor,
     MultimodalSpecialTokens,
 )
 from sglang.srt.runtime_context import get_mm, get_model
+from sglang.srt.utils.hf_transformers import resolve_image_processor_backend
 from sglang.srt.utils.hf_transformers.common import resolve_runai_obj_uri
-from sglang.srt.utils.hf_transformers_utils import resolve_image_processor_backend
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 logger = logging.getLogger(__name__)
@@ -781,7 +778,7 @@ class MuseSpark1xOmniMultimodalProcessor(
                         content_digest=entry.content_digest,
                         artifact_key=entry.artifact_key,
                         feature_hash=resolve_multimodal_item_hash(
-                            existing_hash=0, namespace=entry.artifact_key
+                            feature=(feature, token_count), namespace=entry.artifact_key
                         ),
                         feature=feature if keep_device else cpu_feature,
                         token_count=token_count,
@@ -826,9 +823,11 @@ class MuseSpark1xOmniMultimodalProcessor(
                 },
             )
             input_ids = self._expand_mm_placeholders(input_ids, images, [], [])
-        output = self._build_output(input_ids, images, [], [])
+        output = self._build_output(input_ids, images, [], [], transport=False)
         for item, artifact in zip(output.mm_items, artifacts):
-            item.set_hash(artifact.feature_hash)
+            item.set_identity(artifact.feature_hash.to_bytes(32, "big"))
+        if self.preprocess_config.use_gpu_preprocess:
+            output.mm_items = self._prepare_mm_items_for_transport(output.mm_items)
         return output
 
     async def process_mm_data_async(

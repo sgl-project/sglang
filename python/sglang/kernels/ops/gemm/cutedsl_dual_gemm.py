@@ -41,6 +41,7 @@ from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack
 from cutlass.utils import blackwell_helpers as sm100_utils
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils import is_sm100_supported
 from sglang.srt.utils.common import direct_register_custom_op
@@ -1336,9 +1337,7 @@ def _dual_gemm_swiglu_fp8_run(
             raise ValueError(
                 f"{quant_mode.name} requires {expected_scales} output scale value(s)"
             )
-    multiprocessor_count = torch.cuda.get_device_properties(
-        x.device
-    ).multi_processor_count
+    multiprocessor_count = current_arch().num_sms
 
     if tactic < 0:
         tactic = _pick_fp8_tactic(
@@ -1471,9 +1470,7 @@ def _dual_gemm_swiglu_run(
     num_tokens, hidden_size, intermediate_size = _validate_float16_inputs(
         x, gate_up_weight
     )
-    multiprocessor_count = torch.cuda.get_device_properties(
-        x.device
-    ).multi_processor_count
+    multiprocessor_count = current_arch().num_sms
     if tactic < 0:
         tactic = _pick_float16_tactic(
             num_tokens,
@@ -1627,9 +1624,7 @@ def can_use_dual_gemm(
     if not quant_mode.is_dynamic:
         return True
 
-    multiprocessor_count = torch.cuda.get_device_properties(
-        torch.cuda.current_device()
-    ).multi_processor_count
+    multiprocessor_count = current_arch().num_sms
     tactic = _pick_fp8_tactic(
         num_tokens,
         hidden_size,

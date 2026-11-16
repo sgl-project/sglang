@@ -7,7 +7,7 @@ DEVICE_TYPE=$1
 
 CANN_VERSION="${CANN_VERSION:-9.1.0}"
 PYTORCH_VERSION="${PYTORCH_VERSION:-2.10.0}"
-SGLANG_KERNEL_NPU_TAG="${SGLANG_KERNEL_NPU_TAG:-2026.9.0.post12}"
+SGLANG_KERNEL_NPU_TAG="${SGLANG_KERNEL_NPU_TAG:-2026.11.0.post1}"
 PYARROW_VERSION="${PYARROW_VERSION:-23.0.1}"
 
 ASCEND_HOME_PATH="${ASCEND_HOME_PATH:-/usr/local/Ascend/cann-${CANN_VERSION}}"
@@ -61,9 +61,9 @@ export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:${PATH}"
 
 ${UV_PIP_INSTALL} pybind11 pyyaml decorator scipy attrs psutil
 
-${PIP_INSTALL} memfabric-hybrid==1.2.1
+${PIP_INSTALL} memfabric-hybrid==1.3.0
 mfcli kernel install
-${PIP_INSTALL} memcache-hybrid==1.2.1
+${PIP_INSTALL} memcache-hybrid==1.3.0
 
 ### Install memfabric-zbal
 if [ "${DEVICE_TYPE}" = "950" ]; then

@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING
 
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
     resolved_view,
     resolving_view,
@@ -101,6 +101,12 @@ def validate_hisparse_feature_combos(server_args: ServerArgs) -> None:
     # A mixed batch cannot merge the HiSparse decode batch.
     if cfg.enable_mixed_chunk:
         raise ValueError("--enable-hisparse does not support --enable-mixed-chunk yet.")
+    # A HiSparse decode receives KV into its host pool, which the checksum does not read.
+    if cfg.disaggregation_mode == "decode" and cfg.disaggregation_enable_kv_checksum:
+        raise ValueError(
+            "--enable-hisparse does not support --disaggregation-enable-kv-checksum "
+            "on a decode server yet."
+        )
 
 
 def validate_hisparse(server_args: ServerArgs) -> None:

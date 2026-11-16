@@ -12,12 +12,14 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.ops.quantization.fp8_kernel import (
+    per_token_group_quant_fp8,
+    scaled_fp8_quant,
+)
 from sglang.srt.layers.quantization.fp8 import Fp8Config, Fp8LinearMethod
 from sglang.srt.layers.quantization.fp8_utils import (
     apply_fp8_linear,
     dispatch_w8a8_block_fp8_linear,
-    per_token_group_quant_fp8,
-    scaled_fp8_quant,
     torch_w8a8_block_fp8_linear,
 )
 from sglang.test.ci.ci_register import register_xpu_ci

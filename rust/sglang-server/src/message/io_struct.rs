@@ -100,6 +100,7 @@ control_messages! {
         allow_quant_error: bool,
         skip_tensor_list: Option<Vec<String>>,
         selector: String,
+        names: Option<Vec<String>>,
     }
 
     /// Clear the HiCache storage backend.
@@ -270,6 +271,7 @@ impl CheckWeightsReqInput {
         allow_quant_error: bool,
         skip_tensor_list: Option<Vec<String>>,
         selector: String,
+        names: Option<Vec<String>>,
     ) -> Self {
         Self {
             rid,
@@ -277,6 +279,7 @@ impl CheckWeightsReqInput {
             allow_quant_error,
             skip_tensor_list,
             selector,
+            names,
         }
     }
 }
@@ -335,6 +338,35 @@ impl AbortReq {
             abort_message: (),
         }
     }
+
+    /// Whether this aborts every live request rather than the one `rid` names.
+    pub fn abort_all(&self) -> bool {
+        self.abort_all
+    }
+
+    /// The `AbortReq` a control message's wire bytes carry, or `None` when
+    /// they carry another message: how a listener tells an abort another
+    /// listener relayed to it from a request for its scheduler. The
+    /// positions are the ones `abort_req_msgpack_shape` pins; the two fields
+    /// after `abort_all` are always `()` from this server, so they are not read.
+    pub fn decode(header: &[u8]) -> Result<Option<Self>, Error> {
+        let value = rmpv::decode::read_value(&mut &header[..])
+            .map_err(|e| Error::Codec(format!("abort request: {e}")))?;
+        let items = value
+            .as_array()
+            .ok_or_else(|| Error::Codec("abort request: not an array".into()))?;
+        if items.first().and_then(rmpv::Value::as_str) != Some(<Self as Tagged>::TAG) {
+            return Ok(None);
+        }
+        let rid = items.get(1).and_then(rmpv::Value::as_str);
+        let abort_all = items.get(3).and_then(rmpv::Value::as_bool);
+        match (rid, abort_all) {
+            (Some(rid), Some(abort_all)) => Ok(Some(Self::new(rid.to_owned(), abort_all))),
+            _ => Err(Error::Codec(
+                "abort request: expected [tag, rid, http_worker_ipc, abort_all, ..]".into(),
+            )),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -357,6 +389,21 @@ mod tests {
         assert_eq!(arr[3].as_bool(), Some(false));
         assert!(arr[4].is_nil());
         assert!(arr[5].is_nil());
+    }
+
+    /// `decode` reads an `AbortReq` back from its own wire bytes, tells
+    /// another message apart by its tag, and refuses bytes of neither shape.
+    #[test]
+    fn abort_req_decodes_from_its_own_wire_bytes_only() {
+        let header = AbortReq::new("12345".into(), true).encode().unwrap();
+        let decoded = AbortReq::decode(&header).unwrap().expect("an AbortReq");
+        assert_eq!(decoded.get_rid(), "12345");
+        assert!(decoded.abort_all());
+        let other = FlushCacheReqInput::new("7".into(), None).encode().unwrap();
+        assert!(AbortReq::decode(&other).unwrap().is_none());
+        assert!(AbortReq::decode(b"\xc0").is_err());
+        let short = rmp_serde::to_vec(&("AbortReq", "12345")).unwrap();
+        assert!(AbortReq::decode(&short).is_err());
     }
 
     #[test]
@@ -385,6 +432,7 @@ mod tests {
             true,
             Some(vec!["lm_head".into()]),
             "target".into(),
+            Some(vec!["model.weight".into()]),
         )
         .encode()
         .unwrap();
@@ -392,9 +440,9 @@ mod tests {
         let arr = val.as_array().expect("array");
         assert_eq!(
             arr.len(),
-            7,
+            8,
             "CheckWeightsReqInput = [tag, rid, http_ipc, action, \
-             allow_quant_error, skip_tensor_list, selector]"
+             allow_quant_error, skip_tensor_list, selector, names]"
         );
         assert_eq!(arr[0].as_str(), Some("CheckWeightsReqInput"));
         assert_eq!(arr[1].as_str(), Some("7"));
@@ -403,6 +451,7 @@ mod tests {
         assert_eq!(arr[4].as_bool(), Some(true));
         assert_eq!(arr[5][0].as_str(), Some("lm_head"));
         assert_eq!(arr[6].as_str(), Some("target"));
+        assert_eq!(arr[7][0].as_str(), Some("model.weight"));
     }
 
     /// `ProfileReq` decodes positionally into Python's 15-field struct: a

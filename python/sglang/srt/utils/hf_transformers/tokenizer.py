@@ -13,6 +13,7 @@
 # ==============================================================================
 """Tokenizer loading utilities."""
 
+import contextlib
 import json
 import logging
 import warnings
@@ -467,6 +468,58 @@ def _ensure_fastokens_patched():
     logger.info("fastokens backend enabled - transformers patched successfully")
 
 
+@contextlib.contextmanager
+def _fastokens_patch_lifted():
+    """Run a load with fastokens' global transformers patch removed."""
+    import fastokens
+
+    fastokens.unpatch_transformers()
+    try:
+        yield
+    finally:
+        fastokens.patch_transformers()
+
+
+def _shim_fastokens_backend(tokenizer):
+    """Back ``tokenizer`` with fastokens' shim; None if fastokens rejects it."""
+    # Workaround: fastokens <= 0.3.5 exposes no public per-tokenizer API (only the
+    # global patch_transformers); drop this private import when it ships one.
+    from fastokens._compat import _TokenizerShim
+
+    if not isinstance(tokenizer, PreTrainedTokenizerFast):
+        return None
+    try:
+        tokenizer._tokenizer = _TokenizerShim(tokenizer._tokenizer)
+    except ValueError:
+        logger.warning("fastokens rejected the repaired backend", exc_info=True)
+        return None
+    return tokenizer
+
+
+def _load_fastokens_over_repaired_backend(tokenizer_name, *args, **kwargs):
+    """Load as the huggingface backend does, then shim the repaired backend.
+
+    Workaround: fastokens <= 0.3.5 shims inside ``from_pretrained``, before
+    ``_fix_v5_tokenizer_components`` restores tokenizer.json's pre-tokenizer, so
+    a v5 class that rebuilt it (LlamaTokenizerFast over a ByteLevel vocab) hands
+    fastokens a Metaspace pre-tokenizer it rejects. Drop once fastokens accepts
+    that backend or offers a per-tokenizer API.
+    """
+    logger.info(
+        "fastokens rejected the patched load of %s; retrying on the repaired backend",
+        tokenizer_name,
+    )
+    try:
+        with _fastokens_patch_lifted():
+            tokenizer = get_tokenizer(
+                tokenizer_name, *args, tokenizer_backend="huggingface", **kwargs
+            )
+    except Exception:
+        logger.warning("huggingface load for the fastokens retry failed", exc_info=True)
+        return None
+    return _shim_fastokens_backend(tokenizer)
+
+
 def get_tokenizer(
     tokenizer_name: str,
     *args,
@@ -553,6 +606,16 @@ def get_tokenizer(
         return _apply_post_load_fixes(tokenizer, tokenizer_name, tokenizer_revision)
     except Exception as e:
         if tokenizer_backend == "fastokens":
+            tokenizer = _load_fastokens_over_repaired_backend(
+                tokenizer_name,
+                *args,
+                tokenizer_mode=tokenizer_mode,
+                trust_remote_code=trust_remote_code,
+                tokenizer_revision=tokenizer_revision,
+                **kwargs,
+            )
+            if tokenizer is not None:
+                return tokenizer
             raise RuntimeError(
                 f"fastokens failed to load tokenizer for {tokenizer_name!r}. "
                 f"This model's tokenizer may not be supported by fastokens — "

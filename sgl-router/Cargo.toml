@@ -62,7 +62,7 @@ tonic = { version = "0.14.6", features = ["transport"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
 
 # Tokenizer auto-download from HuggingFace when --tokenizer-path is omitted.
 # Sync (`ureq`) API only — it runs once at startup; `ureq` is on rustls, so
@@ -101,6 +101,16 @@ rustc-hash = "2"
 sha2 = "0.10"
 url = "2"
 zeromq = { version = "0.6", default-features = false, features = ["tokio-runtime", "tcp-transport"] }
+
+# FIPS 140-3 builds only (`--features fips`): aws-lc-rs's FIPS module becomes the
+# process-wide rustls provider, which reqwest and kube use for every TLS
+# connection. Both are optional, so default builds compile neither.
+aws-lc-rs = { version = "1.18.2", optional = true, features = ["fips"] }
+rustls = { version = "0.23", optional = true, default-features = false, features = ["fips", "std"] }
+
+[features]
+default = []
+fips = ["dep:aws-lc-rs", "dep:rustls"]
 
 [dev-dependencies]
 base64 = "0.22"

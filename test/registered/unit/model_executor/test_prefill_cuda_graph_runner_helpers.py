@@ -8,11 +8,13 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.layers.attention.graph_utils import _zero_padded_tokens
 from sglang.srt.layers.moe.utils import MoeA2ABackend
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_prefill_registry,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode, PPProxyTensors
+from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner_components.misc_utils import (
     resolve_pp_proxy_dspark_hidden_size,
 )
@@ -59,6 +61,52 @@ def _make_pp_buffers_and_registry():
 
 
 class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
+    def test_attention_padding_respects_cuda_moe_and_quantization(self):
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._is_full_backend = True
+        runner.attention_layers = []
+        runner.moe_fusions = []
+        runner.dsa_indexers = None
+        runner.mha_companion_layers = None
+        for cuda, moe_layers, quant_config, quantization, zero_tail in (
+            (True, [], None, None, False),
+            (True, [None, None], None, None, False),
+            (True, [None, object()], None, None, True),
+            (True, [], object(), None, True),
+            (True, [], None, "fp8", True),
+            (False, [], None, None, True),
+            (False, [None, object()], None, None, True),
+        ):
+            with self.subTest(
+                cuda=cuda,
+                moe_layers=moe_layers,
+                quant_config=quant_config,
+                quantization=quantization,
+            ):
+                runner.model_runner = SimpleNamespace(
+                    attn_backend=object(),
+                    model_config=SimpleNamespace(quantization=quantization),
+                )
+                runner.quant_config = quant_config
+                runner.moe_layers = moe_layers
+                output = torch.ones(4, 2)
+                with (
+                    patch(
+                        "sglang.srt.model_executor.runner.prefill_cuda_graph_runner.is_cuda",
+                        return_value=cuda,
+                    ),
+                    runner._prefill_forward_context(
+                        SimpleNamespace(moe_num_token_non_padded=lambda: None),
+                        num_tokens=4,
+                        raw_num_tokens=2,
+                    ),
+                ):
+                    _zero_padded_tokens(output, 2)
+                torch.testing.assert_close(output[:2], torch.ones(2, 2))
+                torch.testing.assert_close(
+                    output[2:], torch.zeros(2, 2) if zero_tail else torch.ones(2, 2)
+                )
+
     def test_capture_buckets_keep_tp_shards_equal(self):
         override = get_context().override_server_args(
             enable_two_batch_overlap=False,
@@ -187,6 +235,11 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         self.assertEqual(captured.tolist(), [[5, 5]] * 2 + [[0, 0]] * 4)
 
     def test_ple_replay_uses_live_request_layout(self):
+        from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+        from sglang.srt.model_executor.forward_context import (
+            ForwardContext,
+            forward_context,
+        )
         from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
             breakable_cuda_graph as bcg,
         )
@@ -203,10 +256,22 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         )
         context = SimpleNamespace(forward_batch=batch)
         capture = Mock(cuda_graph=SimpleNamespace(_break_fns=[]))
-        pool = Mock(get_mamba_indices=lambda indices: indices)
+        pool = SimpleNamespace(
+            state_sub_pool="mamba", get_mamba_indices=lambda indices: indices
+        )
+        backend = SimpleNamespace(
+            req_to_token_pool=pool,
+            runner_ids=RunnerIds(
+                req_to_token=torch.zeros((3, 8), dtype=torch.int32),
+                token_to_kv_pool_allocator=None,
+                token_to_kv_pool=SimpleNamespace(id_spaces=lambda: {}),
+                page_size=1,
+                device="cpu",
+            ),
+        )
         cases = [([8], [0] * 8), ([4, 4], [0] * 4 + [1] * 4)]
         with (
-            patch.object(qwen4_exp, "get_req_to_token_pool", return_value=pool),
+            forward_context(ForwardContext(attn_backend=backend)),
             patch.object(bcg, "_current_capture_var") as active,
             patch.object(
                 qwen4_exp, "get_tc_piecewise_forward_context", return_value=context
@@ -230,6 +295,10 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                 for replay in capture.cuda_graph._break_fns:
                     replay()
                 self.assertEqual(holder.batch.req_indices.tolist(), expected)
+                self.assertEqual(
+                    holder.batch.state_indices.tolist(),
+                    list(range(1, len(lengths) + 1)),
+                )
 
     def test_dspark_proxy_width_requires_receiving_stage_and_model_support(self):
         class Model:

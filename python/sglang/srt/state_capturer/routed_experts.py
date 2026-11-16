@@ -18,6 +18,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_resources,
     get_schedule,
+    is_scheduler_io_rank,
 )
 from sglang.srt.state_capturer.base import BaseTopkCapturer
 
@@ -36,6 +37,8 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
     slicing. The device cache also holds extra columns for any fused shared
     experts; the host cache and user-facing return drop them via the
     [:topk_size] truncation.
+
+    Only the rank that sends outputs keeps a host cache.
     """
 
     @staticmethod
@@ -90,6 +93,9 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
             device=device,
             name="routed_experts",
             device_topk_size=topk_size + num_fused_shared_experts,
+            # Other ranks compute the same ids (or join the gather below) and
+            # send nothing, so they keep no rows.
+            allocate_caches=is_scheduler_io_rank(),
         )
 
         # Rebuild the full token batch before routed-expert readback.
@@ -98,16 +104,15 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
                 get_parallel().attn_tp_size if is_dp_attention_enabled() else 1
             )
             self.gather_buffer = torch.empty(
-                (
-                    self.device_cache.buffer.shape[0] * attn_tp_size,
-                    self.device_cache.buffer.shape[2],
-                ),
+                (max_batch_size * attn_tp_size, self.device_topk_size),
                 dtype=torch.int32,
                 device=device,
             )
 
     def capture(self, layer_id: int, topk_indices: torch.Tensor):
-        device_width = self.device_cache.buffer.shape[2]
+        if self.device_cache is None and not _is_scattered_a2a_backend():
+            return
+        device_width = self.device_topk_size
         if topk_indices.shape[1] != device_width:
             # Routes whose shared columns are appended after capture pass routed ids only.
             if topk_indices.shape[1] != device_width - self.num_fused_shared_experts:
@@ -125,6 +130,9 @@ class RoutedExpertsCapturer(BaseTopkCapturer):
                 : local_topk.size(0) * get_parallel().attn_tp_size
             ]
             attn_tp_all_gather_into_tensor(topk_indices, local_topk)
+        if self.device_cache is None:
+            # Joined the all-gather; the output rank keeps the rows.
+            return
         super().capture(layer_id, topk_indices)
 
     def _get_local_slice(

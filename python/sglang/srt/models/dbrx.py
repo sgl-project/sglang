@@ -23,7 +23,7 @@ from typing import Iterable, Optional, Tuple
 import torch
 import torch.nn as nn
 
-from sglang.srt.configs import DbrxConfig
+from sglang.srt.configs.dbrx import DbrxConfig
 from sglang.srt.distributed import (
     tensor_model_parallel_all_reduce,
 )

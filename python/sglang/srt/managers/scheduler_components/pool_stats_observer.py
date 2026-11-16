@@ -198,16 +198,20 @@ class SchedulerPoolStatsObserver:
 
     def session_held_tokens(self) -> int:
         page_size = self.tree_cache.page_size
-        return sum(kv_private_tokens(kv, page_size) for kv in self._session_kv_rows())
+        total = sum(kv_private_tokens(kv, page_size) for kv in self._session_kv_rows())
+        return total + self.tree_cache.retained_window_tokens()
 
     def session_held_swa_tokens(self) -> int:
         page_size = self.tree_cache.page_size
-        return sum(
+        total = sum(
             kv_private_swa_tokens(kv, page_size) for kv in self._session_kv_rows()
         )
+        return total + self.tree_cache.retained_window_tokens()
 
     def session_held_req_count(self) -> int:
-        return len(self._session_kv_rows())
+        held = len(self._session_kv_rows())
+        held += self.tree_cache.retained_window_req_count()
+        return held
 
     def session_held_mamba_slots(self) -> int:
         return sum(kv_mamba_slots(kv) for kv in self._session_kv_rows())

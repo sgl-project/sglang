@@ -6,6 +6,7 @@ import dataclasses
 import hashlib
 import json
 import struct
+import uuid
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -17,6 +18,8 @@ import torch
 import transformers
 from PIL import Image
 
+from sglang.srt.environ import envs
+from sglang.srt.multimodal.cache.digest import dataclass_items, structured_digest
 from sglang.srt.runtime_context import get_mm, get_model
 
 CONTENT_HASH_PREFIX = "sha256:"
@@ -184,11 +187,9 @@ def media_preprocess_kwargs(
     defaults = defaults or {}
     if dataclasses.is_dataclass(source):
         values = {
-            field.name: value
-            for field, value in zip(
-                dataclasses.fields(source), dataclasses.astuple(source)
-            )
-            if field.name not in _MEDIA_ENVELOPE_FIELDS
+            name: value
+            for name, value in dataclass_items(source)
+            if name not in _MEDIA_ENVELOPE_FIELDS
         }
     elif isinstance(source, Mapping):
         values = {
@@ -225,10 +226,8 @@ def _canonicalize(value: Any) -> Any:
             "type": "dataclass",
             "class": _qualified_type_name(value),
             "fields": [
-                [field.name, _canonicalize(field_value)]
-                for field, field_value in zip(
-                    dataclasses.fields(value), dataclasses.astuple(value)
-                )
+                [name, _canonicalize(field_value)]
+                for name, field_value in dataclass_items(value)
             ],
         }
     if isinstance(value, Enum):
@@ -326,6 +325,44 @@ def build_artifact_key(
     return _digest_bytes(_canonical_json(payload))
 
 
+def resolve_multimodal_item_identity(
+    *,
+    feature: Any = None,
+    precomputed_embeddings: Any = None,
+    modality: str = "",
+    input_format: str = "",
+    metadata: Any = None,
+    namespace: Optional[str] = None,
+    existing_hash: Optional[int] = None,
+) -> bytes:
+    """Identify the actual encoder inputs, including their semantic metadata.
+
+    Scalar hints are supplementary, not substitutes for feature contents. A
+    source/config namespace can be reused without pixels only by server-owned
+    artifacts whose producer has already verified their content.
+    """
+    from sglang.srt.managers.mm_utils import hash_feature_digest
+
+    if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
+        return structured_digest(("uncached-mm", uuid.uuid4().bytes))
+    if namespace is not None:
+        namespace = parse_content_hash(namespace)
+        if existing_hash is not None and existing_hash < 0:
+            raise ValueError("Artifact feature hashes must be nonnegative")
+    return hash_feature_digest(
+        (
+            "multimodal-item-v2",
+            modality,
+            input_format,
+            namespace,
+            existing_hash,
+            feature,
+            precomputed_embeddings,
+            metadata,
+        )
+    )
+
+
 def resolve_multimodal_item_hash(
     *,
     existing_hash: Optional[int] = None,
@@ -333,47 +370,19 @@ def resolve_multimodal_item_hash(
     precomputed_embeddings: Any = None,
     namespace: Optional[str] = None,
 ) -> int:
-    """Unified helper for resolving a hash for MultimodalDataItem cache, optionally scoped to an artifact identity.
+    """Full-width artifact fingerprint; scalar wire hashes are not cache keys.
 
-    Args:
-        namespace: Optional SHA-256 identity covering every input that can change the preprocessing result.
-            It scopes the feature hash so downstream caches cannot reuse embeddings across different preprocessing settings.
+    A namespace covers every source/config input that can change preprocessing.
+    Keep all 256 bits when carrying this value in an in-process artifact.
     """
-    from sglang.srt.environ import envs
-
-    if envs.SGLANG_MM_SKIP_COMPUTE_HASH.get():
-        import uuid
-
-        item_hash = uuid.uuid4().int
-    elif existing_hash is not None:
-        # if exists, reuse
-        item_hash = existing_hash
-    else:
-        # hash from feature
-        from sglang.srt.managers.mm_utils import hash_feature
-
-        value = feature if feature is not None else precomputed_embeddings
-        item_hash = hash_feature(value)
-
-    if namespace is None:
-        return item_hash
-
-    if isinstance(item_hash, bool) or not isinstance(item_hash, int) or item_hash < 0:
-        raise ValueError("item hash must be a non-negative integer")
-    namespace = parse_content_hash(namespace)
-    assert namespace is not None
-    hash_bytes = item_hash.to_bytes(
-        max(1, (item_hash.bit_length() + 7) // 8), byteorder="big", signed=False
-    )
-    digest = _hash_parts(
-        b"multimodal-feature-v1",
-        bytes.fromhex(namespace[len(CONTENT_HASH_PREFIX) :]),
-        hash_bytes,
-    )
     return int.from_bytes(
-        bytes.fromhex(digest[len(CONTENT_HASH_PREFIX) :])[:8],
-        byteorder="big",
-        signed=False,
+        resolve_multimodal_item_identity(
+            existing_hash=existing_hash,
+            feature=feature,
+            precomputed_embeddings=precomputed_embeddings,
+            namespace=namespace,
+        ),
+        "big",
     )
 
 
@@ -402,6 +411,7 @@ def build_processor_fingerprint(
         "processor_class": f"{type(processor).__module__}.{type(processor).__qualname__}",
         "model_type": hf_payload.get("model_type"),
         "architectures": hf_payload.get("architectures"),
+        "model_config": hf_payload,
         "model_revision": get_model().revision,
         "processor_revision": get_model().revision,
         "disable_fast_image_processor": get_mm().disable_fast_image_processor,

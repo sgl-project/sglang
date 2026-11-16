@@ -189,6 +189,8 @@ jobs:
             }
           - { stage: extra-b, runner_config: 8-gpu-h20, timeout_per_file: '3600' }
           - { stage: extra-b, runner_config: 8-gpu-b300, timeout_per_file: '3600' }
+          - { stage: extra-b, runner_config: 2-gpu-gb300, timeout_per_file: '1800', arch: aarch64 }
+          - { stage: extra-b, runner_config: 4-gpu-gb300, timeout_per_file: '1800', arch: aarch64 }
     uses: ./.github/workflows/_pr-test-stage.yml
     with:
       self_name: ${{ matrix.stage }}-test-${{ matrix.runner_config }}
@@ -201,7 +203,9 @@ jobs:
       warmup_deep_gemm_models: ${{ matrix.warmup_deep_gemm_models || '' }}
       warmup_server_models: ${{ matrix.warmup_server_models || '' }}
       warmup_timeout_minutes: ${{ matrix.warmup_timeout || '25' }}
-      rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+      # The artifact is built for x86_64. An aarch64 row passes none, so it
+      # restores the aarch64 cache that pr-test.yml's aarch64 build seeds.
+      rust_ext_artifact: ${{ matrix.arch != 'aarch64' && needs.rust-ext-build.outputs.artifact_name || '' }}
     secrets: inherit
 
   xeon-extra:

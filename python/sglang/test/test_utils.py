@@ -47,9 +47,16 @@ from sglang.srt.utils import (
     kill_process_tree,
     retry,
 )
+from sglang.srt.utils.common import filter_noisy_warnings
+from sglang.srt.utils.hf_transformers_patches import apply_all_hf_patches
 from sglang.srt.utils.network import is_port_available
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.utils import normalize_base_url
+
+# Tests load HF configs, tokenizers, and models straight from transformers.
+apply_all_hf_patches()
+# unittest.main turns DeprecationWarning back on in every test process.
+filter_noisy_warnings()
 
 # General test models
 DEFAULT_MODEL_NAME_FOR_TEST = "meta-llama/Llama-3.1-8B-Instruct"
@@ -904,6 +911,52 @@ def terminate_and_kill_process_tree(
     wait_for_gpu_release(pids)
 
 
+def _assert_pd_server_gpus_visible(other_args, env: Optional[dict]) -> None:
+    """Fail before launch when the server's GPUs are not all visible here.
+
+    A runner that has lost a GPU otherwise fails a rank deep in startup with
+    `invalid device ordinal`, which reads like a code bug. Counts only TP x PP
+    on one node, a lower bound on what the server uses, so this never rejects
+    a launch that could have started. Runs only on the H20 CI runners, which
+    are the ones seen losing a GPU.
+    """
+    if not os.environ.get("RUNNER_LABELS", "").endswith("-gpu-h20"):
+        return
+    # A server env that remaps devices sees a different set than this process.
+    if env is not None and any(
+        env.get(var, os.environ.get(var)) != os.environ.get(var)
+        for var in (
+            "CUDA_VISIBLE_DEVICES",
+            "HIP_VISIBLE_DEVICES",
+            "ROCR_VISIBLE_DEVICES",
+        )
+    ):
+        return
+    parser = argparse.ArgumentParser(add_help=False, exit_on_error=False)
+    parser.add_argument("--tp-size", "--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--pp-size", "--pipeline-parallel-size", type=int, default=1)
+    parser.add_argument("--base-gpu-id", type=int, default=0)
+    parser.add_argument("--gpu-id-step", type=int, default=1)
+    parser.add_argument("--nnodes", type=int, default=1)
+    try:
+        args, _ = parser.parse_known_args([str(x) for x in other_args])
+    except (argparse.ArgumentError, SystemExit, ValueError):
+        return
+    if args.nnodes != 1:
+        return
+    world_size = args.tp_size * args.pp_size
+    needed = args.base_gpu_id + (world_size - 1) * args.gpu_id_step + 1
+    visible = torch.cuda.device_count()
+    if 0 < visible < needed:
+        raise RuntimeError(
+            f"PD server needs GPUs up to index {needed - 1} "
+            f"(base_gpu_id={args.base_gpu_id}, tp_size={args.tp_size}, "
+            f"pp_size={args.pp_size}, gpu_id_step={args.gpu_id_step}) but only "
+            f"{visible} GPUs are visible. The machine is short of GPUs; "
+            f"check the runner's hardware rather than the code under test."
+        )
+
+
 def popen_launch_pd_server(
     model: str,
     base_url: str,
@@ -912,16 +965,16 @@ def popen_launch_pd_server(
     other_args: list[str] = (),
     env: Optional[dict] = None,
     return_stdout_stderr: Optional[tuple] = None,
+    launch_module: str = "sglang.launch_server",
 ):
     _, host, port = base_url.split(":")
     host = host[2:]
-
-    command = "sglang.launch_server"
+    _assert_pd_server_gpus_visible(other_args, env)
 
     command = [
         "python3",
         "-m",
-        command,
+        launch_module,
         "--model-path",
         model,
         *[str(x) for x in other_args],
@@ -1234,7 +1287,7 @@ def run_score_benchmark_multi(
 
     async def _run_benchmark(batch_size, warmup):
         # Load tokenizer for generating test data
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+        from sglang.srt.utils.hf_transformers import get_tokenizer
 
         tokenizer = get_tokenizer(model)
 
@@ -1461,8 +1514,13 @@ def run_bench_serving_multi(
     return res_l
 
 
-def run_bench_one_batch(model, other_args):
-    """Launch an offline process with automatic device detection."""
+def run_bench_one_batch(model, other_args, env=None):
+    """Launch a offline process with automatic device detection.
+
+    Args:
+        device: Device type ("auto", "cuda", "rocm" or "cpu").
+                If "auto", will detect available platforms automatically.
+    """
     # Auto-detect device if needed
 
     device = auto_config_device()
@@ -1483,7 +1541,9 @@ def run_bench_one_batch(model, other_args):
     ]
     if model is not None:
         command += ["--model-path", model]
-    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    process = subprocess.Popen(
+        command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, env=env
+    )
 
     prefill_latency = None
     decode_throughput = None
@@ -1566,7 +1626,7 @@ def run_bench_one_batch_server(
     other_server_args,
     simulate_spec_acc_lens=None,
 ):
-    from sglang.bench_one_batch_server import run_benchmark
+    from sglang.benchmark.one_batch_server import run_benchmark
 
     if simulate_spec_acc_lens is not None:
         env = {**os.environ, "SIMULATE_ACC_LEN": str(simulate_spec_acc_lens)}
@@ -2624,6 +2684,77 @@ def write_results_to_json(model, metrics, mode="a"):
         json.dump(existing_results, f, indent=2)
 
 
+def _parse_cpu_list(spec):
+    """One numa_parse_cpustring-style group ("0,1" / "0-31") into int ids."""
+    cpu_ids = []
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if "-" in token:
+            start, end = token.split("-")
+            cpu_ids.extend(range(int(start), int(end) + 1))
+        else:
+            cpu_ids.append(int(token))
+    return cpu_ids
+
+
+def _bind_groups_from_cpu_ids(cpu_ids, tp_size):
+    cpu_ids = sorted(cpu_ids)
+    quotient, remainder = divmod(len(cpu_ids), tp_size)
+    bind_groups = []
+    offset = 0
+    for rank in range(tp_size):
+        group_size = quotient + (rank < remainder)
+        bind_groups.append(",".join(map(str, cpu_ids[offset : offset + group_size])))
+        offset += group_size
+    return "|".join(bind_groups)
+
+
+def get_available_cpu_ids(min_cpus):
+    """CPU ids confined to an already-set SGLANG_CPU_OMP_THREADS_BIND.
+
+    Returns None when the env var is unset/empty/"all" so callers fall back
+    to their original behavior instead of picking a NUMA node on their own.
+    """
+    bind_value = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "")
+    if not bind_value or bind_value == "all":
+        return None
+
+    cpu_ids = sorted(
+        {cpu_id for group in bind_value.split("|") for cpu_id in _parse_cpu_list(group)}
+    )
+    if len(cpu_ids) < min_cpus:
+        raise RuntimeError(
+            f"Only {len(cpu_ids)} CPUs available "
+            f"(SGLANG_CPU_OMP_THREADS_BIND={bind_value!r}) for TP{min_cpus}"
+        )
+    return cpu_ids
+
+
+def get_tp_cpu_bind(tp_size):
+    """Align an existing SGLANG_CPU_OMP_THREADS_BIND with tp_size ranks."""
+    bind_value = os.environ.get("SGLANG_CPU_OMP_THREADS_BIND", "")
+    if not bind_value or bind_value == "all":
+        return None
+
+    bind_groups = bind_value.split("|")
+    if len(bind_groups) == 1 and tp_size > 1:
+        return _bind_groups_from_cpu_ids(get_available_cpu_ids(tp_size), tp_size)
+    return bind_value
+
+
+def _get_tp_size(args):
+    tp_flags = ("--tp", "--tp-size", "--tensor-parallel-size")
+    for index, arg in enumerate(args):
+        if arg in tp_flags:
+            return int(args[index + 1])
+        for flag in tp_flags:
+            if arg.startswith(f"{flag}="):
+                return int(arg.removeprefix(f"{flag}="))
+    return 1
+
+
 def intel_amx_benchmark(extra_args=None, min_throughput=None):
     def decorator(test_func):
         @wraps(test_func)
@@ -2637,8 +2768,12 @@ def intel_amx_benchmark(extra_args=None, min_throughput=None):
             full_args = common_args + (extra_args or [])
 
             model = test_func(self)
+            env = None
+            bind = get_tp_cpu_bind(_get_tp_size(full_args))
+            if bind is not None:
+                env = {**os.environ, "SGLANG_CPU_OMP_THREADS_BIND": bind}
             prefill_latency, decode_throughput, decode_latency = run_bench_one_batch(
-                model, full_args
+                model, full_args, env=env
             )
 
             print(f"{model=}")

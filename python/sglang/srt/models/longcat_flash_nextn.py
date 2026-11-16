@@ -38,7 +38,7 @@ import torch
 from torch import nn
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
-from sglang.srt.configs import LongcatFlashConfig
+from sglang.srt.configs.longcat_flash import LongcatFlashConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import deep_gemm_wrapper

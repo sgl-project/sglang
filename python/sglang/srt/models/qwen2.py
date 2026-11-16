@@ -60,10 +60,14 @@ from sglang.srt.model_loader.weight_utils import (
     kv_cache_scales_loader,
     supports_quantized_rl_reload,
 )
+from sglang.srt.models.utils import (
+    can_run_silu_fp4_quant_fusion,
+    silu_and_mul_fp4_quant,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_exec, get_parallel
 from sglang.srt.utils import add_prefix, make_pp_layers
-from sglang.srt.utils.hf_transformers_utils import get_rope_config
+from sglang.srt.utils.hf_transformers import get_rope_config
 
 Qwen2Config = None
 
@@ -104,6 +108,10 @@ class Qwen2MLP(nn.Module):
         self.act_fn = SiluAndMul()
         self.dual_gemm = DualGemm(self.gate_up_proj, self.down_proj, hidden_size)
         self.activation_quant = DenseSiluAndMulQuant(self.down_proj)
+        # Off unless the decoder layer enables the fused SiLU+mul+NVFP4 quant path.
+        self._enable_silu_fp4_quant_fusion = False
+        self._masked_m_cache: dict = {}
+        self._down_input_scale_inv_1d = None
 
     def forward(
         self,
@@ -117,7 +125,9 @@ class Qwen2MLP(nn.Module):
             x = self.dual_gemm(x, self.gate_up_proj)
         else:
             gate_up, _ = self.gate_up_proj(x)
-            if forward_batch is not None and forward_batch.forward_mode.is_decode():
+            if can_run_silu_fp4_quant_fusion(self, gate_up):
+                x = silu_and_mul_fp4_quant(self, gate_up)
+            elif forward_batch is not None and forward_batch.forward_mode.is_decode():
                 x = self.activation_quant.forward_decode(
                     gate_up, self.act_fn, self.down_proj
                 )
@@ -591,46 +601,6 @@ class Qwen2ForCausalLM(nn.Module):
                 return self.pooler(hidden_states, forward_batch)
         else:
             return hidden_states
-
-    @torch.no_grad()
-    def forward_split_prefill(
-        self,
-        input_ids: torch.Tensor,
-        positions: torch.Tensor,
-        forward_batch: ForwardBatch,
-        split_interval: Tuple[int, int],  # [start, end) 0-based
-        input_embeds: torch.Tensor = None,
-    ):
-        start, end = split_interval
-        # embed
-        if start == 0:
-            residual_batch.start(forward_batch)
-            if input_embeds is None:
-                forward_batch.hidden_states = self.model.embed_tokens(input_ids)
-            else:
-                forward_batch.hidden_states = input_embeds
-        # decoder layer
-        for i in range(start, end):
-            layer = self.model.layers[i]
-            forward_batch.hidden_states = layer(
-                positions,
-                forward_batch.hidden_states,
-                forward_batch,
-            )
-
-        if end == self.model.config.num_hidden_layers:
-            # norm
-            forward_batch.hidden_states = residual_batch.final_norm(
-                forward_batch.hidden_states, forward_batch, self.model.norm
-            )
-            # logits process
-            result = self.logits_processor(
-                input_ids, forward_batch.hidden_states, self.lm_head, forward_batch
-            )
-        else:
-            result = None
-
-        return result
 
     @property
     def start_layer(self):

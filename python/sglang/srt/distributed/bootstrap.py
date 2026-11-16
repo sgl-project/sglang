@@ -32,7 +32,6 @@ from sglang.srt.layers.layernorm_sp import initialize_layernorm_sp
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
     get_device,
-    get_disagg,
     get_exec,
     get_parallel,
     get_serving,
@@ -330,7 +329,6 @@ def _init_parallel_groups(
         max_world_size=get_parallel().max_ep_size,
     )
     initialize_model_parallel(
-        duplicate_tp_group=get_disagg().enable_pdmux,
         enable_symm_mem=get_exec().comm.enable_symm_mem,
         # Only WORLD is extended during scale-up. The joiner's model-parallel
         # groups are fixed groups local to its launch cohort.

@@ -36,14 +36,12 @@ class UnifiedMambaSlotAllocator:
     def __init__(
         self,
         mea,
-        max_size: int,
         device: str,
         take: Optional[Callable[[int], Optional[torch.Tensor]]] = None,
     ):
         self._multi_ended_allocator = mea
         # Slots are taken through the chain allocator when one owns the band.
         self._take = mea.alloc if take is None else take
-        self._max_size = max_size  # excludes reserved slot 0
         self._device = device
         self._alloc_iter = None  # active alloc_group batch iterator
 
@@ -61,12 +59,12 @@ class UnifiedMambaSlotAllocator:
 
     @property
     def size(self) -> int:
-        return self._max_size
+        return self._multi_ended_allocator.max_slots - 1
 
     def available_size(self) -> int:
         # Slot-conservation count (max - allocated): the leak-check view, NOT the
         # planner value (use schedulable_available_size for that).
-        return self._max_size - self._multi_ended_allocator.allocated_count()
+        return self.size - self._multi_ended_allocator.allocated_count()
 
     def schedulable_available_size(self) -> int:
         # Byte-coordinated count (>= N => alloc(N) succeeds); credits the peer's
@@ -140,7 +138,6 @@ def _wire_mamba_slot_allocator(
     state_pool = state.pool
     slot_allocator = UnifiedMambaSlotAllocator(
         mamba_end,
-        max_size=state_pool.size,
         device=device,
         take=take,
     )

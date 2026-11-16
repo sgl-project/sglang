@@ -29,7 +29,7 @@ from sglang.srt.layers.layer_boundary.residual.stream import (
     OwedOutput,
     ResidualStream,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 

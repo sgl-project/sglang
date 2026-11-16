@@ -536,8 +536,13 @@ class SpecPenaltyKit:
 class SpecFeatureKit:
     """Radix attention, constrained decoding, concurrent abort."""
 
+    radix_num_nodes = 400
+    radix_seed = None
+
     def test_radix_attention(self):
-        run_radix_attention_test(self.base_url)
+        run_radix_attention_test(
+            self.base_url, num_nodes=self.radix_num_nodes, seed=self.radix_seed
+        )
         self.assertIsNone(self.process.poll())
 
     def test_request_abort(self):

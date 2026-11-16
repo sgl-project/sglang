@@ -9,13 +9,14 @@ import triton.language as tl
 
 from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.kernels.ops.layernorm.rmsnorm_fake_quant_amd_gfx95 import (
-    Fp8GridActivation,
-    Mxfp8Activation,
     rmsnorm_fake_quant_row,
     rmsnorm_row_chunk,
     row_major_2d,
 )
-from sglang.srt.environ import envs
+from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
+    Fp8GridActivation,
+    Mxfp8Activation,
+)
 from sglang.srt.utils.common import is_gfx95_supported, is_hip
 
 _is_hip = is_hip()
@@ -671,7 +672,7 @@ def _hc_boundary_partials(
     wide = m >= 2 * _HC_BOUNDARY_WIDE_MIN_M or (
         m >= _HC_BOUNDARY_WIDE_MIN_M and m % 32 == 0
     )
-    if wide and envs.SGLANG_HIP_MHC_BOUNDARY_WIDE_TILE.get():
+    if wide:
         launch = dict(_HC_BOUNDARY_WIDE)
     else:
         launch = dict(

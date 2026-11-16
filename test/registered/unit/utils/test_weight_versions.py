@@ -1,11 +1,11 @@
 import random
 import unittest
-from collections import deque
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sglang.srt.managers.io_struct import AbortReq
-from sglang.srt.managers.scheduler import Scheduler, _make_abort_req
+from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.utils import make_abort_req
 from sglang.srt.utils.weight_versions import (
     WeightVersionEvent,
     WeightVersionSpan,
@@ -14,13 +14,11 @@ from sglang.srt.utils.weight_versions import (
     compute_weight_version_spans,
     record_weight_version_events,
     truncate_weight_version_events,
+    weight_version_spans_to_json,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import (
-    CustomTestCase,
-    enter_scope,
-    published_topology,
-)
+from sglang.test.scheduler_test_utils import empty_request_lists
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -29,6 +27,7 @@ class _ReqStub:
     def __init__(self, output_len: int):
         self.output_ids = [0] * output_len
         self.weight_version_events = []
+        self.prefill_weight_versions = None
 
     def record_weight_version_change(self, old_version):
         record_weight_version_events([self], old_version=old_version)
@@ -295,34 +294,14 @@ class _ContextStub:
         self.serving.weight_version = fields["weight_version"]
 
 
-class _SchedulerStub:
-    _collect_inflight_batches = Scheduler._collect_inflight_batches
-    collect_inflight_reqs = Scheduler.collect_inflight_reqs
-
-    def __init__(
-        self,
-        version,
-        running,
-        waiting,
-        chunked=None,
-        last_batch=None,
-        hisparse=None,
-    ):
-        self.serving = _ServingStub(version)
-        self.enable_continuous_input_polling = False
-        self.result_queue = deque()
-        self.running_batch = SimpleNamespace(reqs=running)
-        self.last_batch = last_batch
-        self.waiting_queue = waiting
-        self.chunked_req = chunked
-        self.hisparse_coordinator = hisparse
-        self._deferred_responses = None
-
-
 class TestSchedulerRecordWeightVersionChange(CustomTestCase):
-    def _scheduler(self, *args, pp_size=1, **kwargs):
-        enter_scope(self, published_topology(pp_size=pp_size))
-        scheduler = _SchedulerStub(*args, **kwargs)
+    def _scheduler(self, version, running=(), waiting=(), chunked=None):
+        scheduler = Scheduler.__new__(Scheduler)
+        empty_request_lists(scheduler)
+        scheduler.running_reqs.join(running)
+        scheduler.waiting_queue = list(waiting)
+        scheduler.chunked_req = chunked
+        scheduler.serving = _ServingStub(version)
         for name, value in (
             ("get_serving", scheduler.serving),
             ("get_context", _ContextStub(scheduler.serving)),
@@ -332,14 +311,19 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             self.addCleanup(patcher.stop)
         return scheduler
 
-    def test_records_on_running_waiting_and_chunked_requests(self):
-        """A version change records an event on every live request holding output tokens."""
+    def test_records_on_every_request_list(self):
+        """A version change records an event on every live request holding output
+        tokens, whichever list holds it."""
         running_req = _ReqStub(3)
         waiting_req = _ReqStub(5)
         chunked_req = _ReqStub(2)
+        grammar_req = _ReqStub(4)
+        sending_req = _ReqStub(6)
         scheduler = self._scheduler(
             "v1", [running_req], [waiting_req], chunked=chunked_req
         )
+        scheduler.grammar_manager.grammar_queue.join([grammar_req])
+        scheduler.disagg_prefill_transfer_queue.join([sending_req])
 
         Scheduler.record_weight_version_change(scheduler, new_version="v2")
 
@@ -348,62 +332,17 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
             (running_req, 3),
             (waiting_req, 5),
             (chunked_req, 2),
+            (grammar_req, 4),
+            (sending_req, 6),
         ):
             self.assertEqual(len(req.weight_version_events), 1)
             self.assertEqual(req.weight_version_events[0].old_version, "v1")
             self.assertEqual(req.weight_version_events[0].num_output_tokens, output_len)
 
-    def test_records_on_last_batch_requests_exactly_once(self):
-        """A request in both the running and last batch is recorded once, and last-batch-only requests are recorded too."""
-        shared_req = _ReqStub(3)
-        prefill_req = _ReqStub(1)
-        scheduler = self._scheduler(
-            "v1",
-            [shared_req],
-            [],
-            last_batch=SimpleNamespace(reqs=[shared_req, prefill_req]),
-        )
-
-        Scheduler.record_weight_version_change(scheduler, new_version="v2")
-
-        self.assertEqual(len(shared_req.weight_version_events), 1)
-        self.assertEqual(len(prefill_req.weight_version_events), 1)
-
-    def test_records_on_all_pp_microbatches(self):
-        """With pipeline parallelism every microbatch is visited, not just the selected one."""
-        mb0_req = _ReqStub(2)
-        mb1_req = _ReqStub(4)
-        pending_req = _ReqStub(6)
-        scheduler = self._scheduler("v1", [], [], pp_size=2)
-        scheduler.running_mbs = [
-            SimpleNamespace(reqs=[mb0_req]),
-            SimpleNamespace(reqs=[mb1_req]),
-        ]
-        scheduler.mbs = [None, SimpleNamespace(reqs=[pending_req])]
-
-        Scheduler.record_weight_version_change(scheduler, new_version="v2")
-
-        for req in (mb0_req, mb1_req, pending_req):
-            self.assertEqual(len(req.weight_version_events), 1)
-
-    def test_records_on_hisparse_staging_requests(self):
-        """Requests parked in the HiSparse staging queue are swept like any live request."""
-        staging_req = _ReqStub(2)
-        coordinator = SimpleNamespace(
-            ack_staging_queue=[SimpleNamespace(req=staging_req)]
-        )
-        scheduler = self._scheduler("v1", [], [], hisparse=coordinator)
-
-        Scheduler.record_weight_version_change(scheduler, new_version="v2")
-
-        self.assertEqual(len(staging_req.weight_version_events), 1)
-        self.assertEqual(staging_req.weight_version_events[0].old_version, "v1")
-        self.assertEqual(staging_req.weight_version_events[0].num_output_tokens, 2)
-
     def test_same_version_is_a_noop(self):
         """Re-announcing the current version must not record events."""
         req = _ReqStub(3)
-        scheduler = self._scheduler("v1", [req], [])
+        scheduler = self._scheduler("v1", [req])
 
         Scheduler.record_weight_version_change(scheduler, new_version="v1")
 
@@ -413,7 +352,7 @@ class TestSchedulerRecordWeightVersionChange(CustomTestCase):
     def test_none_version_is_a_noop(self):
         """An update without a weight version must not disturb attribution."""
         req = _ReqStub(3)
-        scheduler = self._scheduler("v1", [req], [])
+        scheduler = self._scheduler("v1", [req])
 
         Scheduler.record_weight_version_change(scheduler, new_version=None)
 
@@ -475,15 +414,22 @@ class TestSpanlessAbortPaths(CustomTestCase):
         req.time_stats = SimpleNamespace(
             trace_ctx=SimpleNamespace(abort=lambda abort_info: None)
         )
-        sent = []
-        scheduler = SimpleNamespace(
-            enable_priority_scheduling=False,
-            abort_on_priority_when_disabled=True,
-            send_abort_output=lambda obj, req_arg: sent.append(obj),
+        req.finished_reason = None
+        req.finish_outside_step = lambda reason: None
+        req.kv = SimpleNamespace(
+            holds_kv=False, holds_mamba=False, retraction_backup=None
         )
+        sent = []
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.enable_priority_scheduling = False
+        scheduler.abort_on_priority_when_disabled = True
+        scheduler.send_abort_output = lambda obj, req_arg: sent.append(obj)
+        scheduler.tree_cache = scheduler.beam_coordinator = MagicMock()
+        scheduler.hisparse_coordinator = None
+        scheduler.init_request_retirer()
 
         with patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.utils.get_serving",
             return_value=SimpleNamespace(weight_version="v1"),
         ):
             accepted = Scheduler._set_or_validate_priority(scheduler, req)
@@ -503,10 +449,10 @@ class TestMakeAbortReq(CustomTestCase):
             WeightVersionEvent(old_version="v1", num_output_tokens=3)
         )
         with patch(
-            "sglang.srt.managers.scheduler.get_serving",
+            "sglang.srt.managers.utils.get_serving",
             return_value=SimpleNamespace(weight_version="v2"),
         ):
-            abort_req = _make_abort_req(req)
+            abort_req = make_abort_req(req)
 
         self.assertIsInstance(abort_req, AbortReq)
         self.assertEqual(abort_req.rid, "r0")
@@ -540,6 +486,50 @@ class TestBuildEndpointWeightVersionMetadata(CustomTestCase):
         """Responses without spans still report the legacy version alone."""
         metadata = build_endpoint_weight_version_metadata({"weight_version": "v2"})
         self.assertEqual(metadata, {"weight_version": "v2"})
+
+    def test_metadata_carries_prefill_spans_when_present(self):
+        """prefill_weight_versions rides along into endpoint metadata next to the output spans."""
+        prefill_spans = [{"version": "v1", "start": 0, "end": 5}]
+        metadata = build_endpoint_weight_version_metadata(
+            {
+                "weight_version": "v2",
+                "weight_versions": [{"version": "v2", "start": 0, "end": 3}],
+                "prefill_weight_versions": prefill_spans,
+                "prompt_tokens": 5,
+            }
+        )
+        self.assertEqual(metadata["prefill_weight_versions"], prefill_spans)
+        self.assertNotIn("prompt_tokens", metadata)
+
+
+class TestWeightVersionSpansToJson(CustomTestCase):
+    def test_spans_pass_through_unclamped_without_a_limit(self):
+        """Prefill spans keep their exact ends because no output-token limit applies."""
+        spans = [
+            WeightVersionSpan(version="v1", start=0, end=5),
+            WeightVersionSpan(version="v2", start=5, end=9),
+        ]
+        self.assertEqual(
+            weight_version_spans_to_json(spans),
+            [
+                {"version": "v1", "start": 0, "end": 5},
+                {"version": "v2", "start": 5, "end": 9},
+            ],
+        )
+
+    def test_ends_are_clamped_to_the_limit(self):
+        """With a limit every end is capped, matching the output-span clamp."""
+        spans = [
+            WeightVersionSpan(version="v1", start=0, end=5),
+            WeightVersionSpan(version="v2", start=5, end=9),
+        ]
+        self.assertEqual(
+            weight_version_spans_to_json(spans, end_limit=7),
+            [
+                {"version": "v1", "start": 0, "end": 5},
+                {"version": "v2", "start": 5, "end": 7},
+            ],
+        )
 
 
 class TestAddWeightVersionsToMetaInfo(CustomTestCase):

@@ -7,6 +7,11 @@ import logging
 import os
 from typing import Any
 
+from sglang.srt.arg_groups.model_override_base import (
+    model_config_of,
+    resolved_view,
+    resolving_view,
+)
 from sglang.srt.arg_groups.overrides import (
     _a2a_backend_overrides,
     _a2a_ep_size,
@@ -17,9 +22,6 @@ from sglang.srt.arg_groups.overrides import (
     flashinfer_a2a_max_dispatch_tokens_per_rank,
     max_prefill_buffer_tokens,
     max_speculative_num_draft_tokens,
-    model_config_of,
-    resolved_view,
-    resolving_view,
     run_post_process_pass,
 )
 from sglang.srt.configs.moe_model_registry import (

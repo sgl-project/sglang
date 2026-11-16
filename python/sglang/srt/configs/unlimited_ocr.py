@@ -1,10 +1,12 @@
 """Standalone UNLIMITED-OCR configuration and HF processor."""
 
+import hashlib
 import math
-from typing import Dict, List, Tuple
+from collections import OrderedDict
+from typing import Dict, List, Optional, Tuple
 
 import torch
-from PIL import Image, ImageOps
+from PIL import Image
 from transformers import (
     AutoConfig,
     AutoProcessor,
@@ -18,18 +20,39 @@ from sglang.srt.configs.deepseek_ocr import (
     MlpProjectorConfig,
     VisionEncoderConfig,
     VLChatProcessorOutput,
+    crop_image,
     find_closest_aspect_ratio,
+    get_image_size,
+    pad_image,
+    resize_image,
 )
 from sglang.srt.multimodal.customized_mm_processor_utils import (
     register_customized_processor,
 )
 
 
+def merge_mm_processor_kwargs(
+    images_config: Optional[dict], mm_processor_kwargs: Optional[dict]
+) -> Optional[dict]:
+    """Unlimited-OCR v2's ``images_config``, accepting vLLM's ``mm_processor_kwargs``.
+
+    Keys in ``images_config`` win.
+    """
+    if not mm_processor_kwargs:
+        return images_config
+    return {**mm_processor_kwargs, **(images_config or {})}
+
+
+# Unlimited-OCR v2's tile cap; it participates in aspect-ratio selection, so it
+# must match the checkpoint (v1 keeps dynamic_preprocess's 32).
+_V2_MAX_CROPS = 16
+
+
 def dynamic_preprocess(
     image, min_num=2, max_num=32, image_size=640, use_thumbnail=False
 ):
-    """Split an image into tiles based on the best-matching aspect ratio."""
-    orig_width, orig_height = image.size
+    """Split a PIL image or CHW tensor into checkpoint-compatible tiles."""
+    orig_width, orig_height = get_image_size(image)
     aspect_ratio = orig_width / orig_height
 
     target_ratios = set(
@@ -49,7 +72,7 @@ def dynamic_preprocess(
     target_height = image_size * target_aspect_ratio[1]
     blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
 
-    resized_img = image.resize((target_width, target_height))
+    resized_img = resize_image(image, (target_width, target_height))
     processed_images = []
     for i in range(blocks):
         box = (
@@ -58,13 +81,36 @@ def dynamic_preprocess(
             ((i % (target_width // image_size)) + 1) * image_size,
             ((i // (target_width // image_size)) + 1) * image_size,
         )
-        split_img = resized_img.crop(box)
+        split_img = crop_image(resized_img, box)
         processed_images.append(split_img)
     assert len(processed_images) == blocks
     if use_thumbnail and len(processed_images) != 1:
-        thumbnail_img = image.resize((image_size, image_size))
+        thumbnail_img = resize_image(image, (image_size, image_size))
         processed_images.append(thumbnail_img)
     return processed_images, target_aspect_ratio
+
+
+# Per tokenizer-worker memo of preprocessed pages (see _preprocess_page). Every
+# window of a document runs in the one worker that received the document.
+_PAGE_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+# Arbitrary; enough for the lookahead pages of a few concurrent documents.
+_PAGE_CACHE_SIZE = 64
+
+
+def _page_cache_key(image, cropping, base_size, image_size, v2_layout):
+    """Content key of a decoded page, or None for inputs that are not PIL images."""
+    if not isinstance(image, Image.Image):
+        return None
+    digest = hashlib.blake2b(image.tobytes(), digest_size=16).digest()
+    return (
+        digest,
+        image.size,
+        image.mode,
+        bool(cropping),
+        base_size,
+        image_size,
+        v2_layout,
+    )
 
 
 class UnlimitedOCRHFProcessor(ProcessorMixin):
@@ -76,9 +122,11 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
     def __init__(
         self,
         tokenizer: PreTrainedTokenizerFast,
-        candidate_resolutions: Tuple[Tuple[int, int]],
-        patch_size: int,
-        downsample_ratio: int,
+        # v2 omits preprocessor_config.json; defaults give 273 visual tokens per
+        # 1024px base view.
+        candidate_resolutions: Tuple[Tuple[int, int]] = ((1024, 1024),),
+        patch_size: int = 16,
+        downsample_ratio: int = 4,
         image_mean: Tuple[float, float, float] = (0.5, 0.5, 0.5),
         image_std: Tuple[float, float, float] = (0.5, 0.5, 0.5),
         normalize: bool = True,
@@ -146,6 +194,7 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
         base_size: int = None,
         image_size: int = None,
         crop_mode: bool = None,
+        v2_layout: bool = False,
     ):
         """Tokenize messages with embedded images and return processed tensors."""
         base_size = base_size or self.base_size
@@ -176,6 +225,7 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
             cropping=crop_mode,
             base_size=base_size,
             image_size=image_size,
+            v2_layout=v2_layout,
         )
 
         image_index = image_token_cnt
@@ -232,6 +282,7 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
         base_size: int = None,
         image_size: int = None,
         crop_mode: bool = None,
+        v2_layout: bool = False,
         **kwargs,
     ):
         """Process a single prompt with images into model-ready tensors."""
@@ -254,6 +305,7 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
             base_size=base_size,
             image_size=image_size,
             crop_mode=crop_mode,
+            v2_layout=v2_layout,
         )
 
         target_ids = torch.LongTensor(masked_tokenized_str)
@@ -270,7 +322,11 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
         else:
             images = torch.stack(images_list, dim=0)
 
-        images_spatial_crop = torch.stack([images_spatial_crop], dim=0)
+        if v2_layout:
+            # Bundled tensors split on dim 0; one crop-shape row per image.
+            images_spatial_crop = images_spatial_crop.unsqueeze(1)
+        else:
+            images_spatial_crop = torch.stack([images_spatial_crop], dim=0)
 
         prepare = VLChatProcessorOutput(
             input_ids=input_ids,
@@ -299,6 +355,7 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
         base_size: int = None,
         image_size: int = None,
         crop_mode: bool = None,
+        v2_layout: bool = False,
         **kwargs,
     ):
         """Call the processor to tokenize text and images for inference."""
@@ -317,6 +374,7 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
             base_size=base_size if base_size is not None else self.base_size,
             image_size=image_size if image_size is not None else self.image_size,
             crop_mode=crop_mode if crop_mode is not None else self.crop_mode,
+            v2_layout=v2_layout,
         )
         return prepare
 
@@ -328,6 +386,54 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
                 indices.append(index)
         return indices
 
+    def _preprocess_page(self, image, *, cropping, base_size, image_size, v2_layout):
+        """Global view, local crops and tile grid of one page, memoised.
+
+        A split document sends each page twice, as one window's lookahead and
+        the next window's first page; the second time it is a cache hit.
+        """
+        key = _page_cache_key(image, cropping, base_size, image_size, v2_layout)
+        hit = _PAGE_CACHE.get(key) if key is not None else None
+        if hit is not None:
+            _PAGE_CACHE.move_to_end(key)
+            return hit
+        img_w, img_h = get_image_size(image)
+        if img_w <= 640 and img_h <= 640:
+            crop_ratio = [1, 1]
+        else:
+            if cropping:
+                images_crop_raw, crop_ratio = dynamic_preprocess(
+                    image,
+                    image_size=image_size,
+                    **({"max_num": _V2_MAX_CROPS} if v2_layout else {}),
+                )
+            else:
+                crop_ratio = [1, 1]
+
+        if image_size <= 640 and not cropping:
+            image = resize_image(image, (image_size, image_size))
+        if cropping:
+            pad_size = base_size
+        else:
+            pad_size = image_size
+
+        global_view = pad_image(
+            image,
+            (pad_size, pad_size),
+            tuple(int(x * 255) for x in self.image_transform.mean),
+        )
+        num_width_tiles, num_height_tiles = crop_ratio
+        if num_width_tiles > 1 or num_height_tiles > 1:
+            per_image_crops = [self.image_transform(crop) for crop in images_crop_raw]
+        else:
+            per_image_crops = []
+        out = (self.image_transform(global_view), per_image_crops, crop_ratio)
+        if key is not None:
+            _PAGE_CACHE[key] = out
+            while len(_PAGE_CACHE) > _PAGE_CACHE_SIZE:
+                _PAGE_CACHE.popitem(last=False)
+        return out
+
     def tokenize_with_images(
         self,
         conversation: str,
@@ -337,6 +443,7 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
         cropping: bool = True,
         base_size: int = None,
         image_size: int = None,
+        v2_layout: bool = False,
     ):
         """Tokenize text with <image> tags (OCR mode)."""
         base_size = base_size or self.base_size
@@ -358,38 +465,23 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
             tokenized_sep = self.encode(text_sep, bos=False, eos=False)
             tokenized_str += tokenized_sep
             images_seq_mask += [False] * len(tokenized_sep)
-            image_shapes.append(image.size)
+            img_w, img_h = get_image_size(image)
+            image_shapes.append((img_w, img_h))
 
-            if image.size[0] <= 640 and image.size[1] <= 640:
-                crop_ratio = [1, 1]
-            else:
-                if cropping:
-                    images_crop_raw, crop_ratio = dynamic_preprocess(
-                        image, image_size=image_size
-                    )
-                else:
-                    crop_ratio = [1, 1]
-
-            if image_size <= 640 and not cropping:
-                image = image.resize((image_size, image_size))
-            if cropping:
-                pad_size = base_size
-            else:
-                pad_size = image_size
-
-            global_view = ImageOps.pad(
+            global_tensor, per_image_crops, crop_ratio = self._preprocess_page(
                 image,
-                (pad_size, pad_size),
-                color=tuple(int(x * 255) for x in self.image_transform.mean),
+                cropping=cropping,
+                base_size=base_size,
+                image_size=image_size,
+                v2_layout=v2_layout,
             )
-            images_list.append(self.image_transform(global_view))
-
+            images_list.append(global_tensor)
             num_width_tiles, num_height_tiles = crop_ratio
             images_spatial_crop.append([num_width_tiles, num_height_tiles])
-
-            if num_width_tiles > 1 or num_height_tiles > 1:
-                for i in range(len(images_crop_raw)):
-                    images_crop_list.append(self.image_transform(images_crop_raw[i]))
+            if v2_layout:
+                images_crop_list.append(per_image_crops)
+            else:
+                images_crop_list.extend(per_image_crops)
 
             num_queries = math.ceil(
                 (image_size // self.patch_size) / self.downsample_ratio
@@ -462,7 +554,11 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
         else:
             pixel_values = torch.stack(images_list, dim=0)
             images_spatial_crop = torch.tensor(images_spatial_crop, dtype=torch.long)
-            if images_crop_list:
+            if v2_layout:
+                images_crop = _stack_page_crops(
+                    images_crop_list, pixel_values, image_size
+                )
+            elif images_crop_list:
                 images_crop = torch.stack(images_crop_list, dim=0).unsqueeze(0)
             else:
                 images_crop = torch.zeros(
@@ -479,6 +575,35 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
             num_image_tokens,
             image_shapes,
         )
+
+
+def _stack_page_crops(
+    images_crop_list: List[List[torch.Tensor]],
+    pixel_values: torch.Tensor,
+    image_size: int,
+) -> torch.Tensor:
+    """Stack per-page local crops as ``[num_images, max_crops, 3, H, W]``.
+
+    Dim 0 matches bundled multimodal item splitting.
+    """
+    n_crops = max((len(c) for c in images_crop_list), default=0)
+    if not n_crops:
+        return torch.zeros(
+            (len(images_crop_list), 3, image_size, image_size),
+            device=pixel_values.device,
+            dtype=pixel_values.dtype,
+        ).unsqueeze(1)
+    # Pad on the crops' own device and dtype.
+    ref = next(c[0] for c in images_crop_list if c)
+    blank = torch.zeros(3, image_size, image_size, device=ref.device, dtype=ref.dtype)
+    # Pad dim 1; the model trims each image to prod(crop_shape).
+    return torch.stack(
+        [
+            torch.stack(crops + [blank] * (n_crops - len(crops)), dim=0)
+            for crops in images_crop_list
+        ],
+        dim=0,
+    )
 
 
 class UnlimitedLanguageConfig(PretrainedConfig):

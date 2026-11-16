@@ -28,6 +28,16 @@ def _timing_events_supported() -> bool:
         return False
 
 
+@cache
+def _warn_direct_without_metadata_kernels() -> None:
+    logger.warning(
+        "HiCache io backend 'direct' moves KV with copy-engine DMA, which can queue "
+        "ahead of the forward's small metadata host-to-device copies and stall the "
+        "forward; set SGLANG_ENABLE_MLP_SYNC_METADATA_FILL=1 to write that metadata "
+        "with kernels instead."
+    )
+
+
 def make_timing_event_pair():
     timing_enabled = _timing_events_supported()
     kwargs = {"enable_timing": True} if timing_enabled else {}
@@ -57,6 +67,12 @@ class L2TransferEngine:
 
     def __init__(self, io_backend: str):
         self.io_backend = io_backend
+        if (
+            io_backend == "direct"
+            and device_module is torch.cuda
+            and not envs.SGLANG_ENABLE_MLP_SYNC_METADATA_FILL.get()
+        ):
+            _warn_direct_without_metadata_kernels()
         self.device_to_host_stream = device_module.Stream()
         self.host_to_device_stream = device_module.Stream()
         # Index preparation runs here, never queued behind earlier copies: the

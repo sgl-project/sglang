@@ -7,13 +7,14 @@ materialization points while operating directly on the three projection views.
 
 from __future__ import annotations
 
-import os
-
 import torch
 import triton
 import triton.language as tl
 
-_DISABLE_LFM_FUSED_CONV = os.getenv("SGLANG_DISABLE_LFM_FUSED_CONV", "0") == "1"
+from sglang.kernels.arch import current_arch
+from sglang.srt.environ import envs
+
+_DISABLE_LFM_FUSED_CONV = envs.SGLANG_DISABLE_LFM_FUSED_CONV.get()
 
 
 @triton.jit
@@ -240,7 +241,7 @@ def can_use_fused_lfm_short_conv(
         not _DISABLE_LFM_FUSED_CONV
         and b.is_cuda
         and torch.version.hip is None
-        and torch.cuda.get_device_capability(b.device) == (9, 0)
+        and current_arch().is_sm(9, 0)
         and c.is_cuda
         and x.is_cuda
         and weight.is_cuda

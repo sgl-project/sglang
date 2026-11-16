@@ -16,11 +16,7 @@ from transformers import BaseImageProcessor
 
 from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding import MRotaryEmbedding
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalProcessorOutput,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalProcessorOutput
 from sglang.srt.models.cosmos3 import Cosmos3ForConditionalGeneration
 from sglang.srt.models.interns2_mobius import (
     InternS2MobiusForConditionalGeneration,
@@ -42,6 +38,7 @@ from sglang.srt.multimodal.media_artifacts.base import (
     MediaArtifactCacheMixin,
     MediaArtifactInput,
 )
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import (
     BaseMultimodalProcessor as SGLangBaseProcessor,
 )
@@ -843,12 +840,10 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                 feature_offset : feature_offset + feature_length
             ].contiguous()
             feature_offset += feature_length
-            # The artifact key already commits to the media content, processor
-            # fingerprint, and every preprocessing kwarg. Derive the downstream
-            # cache identity from it so independently preprocessed copies in
-            # different tokenizer workers share the same radix/VLM cache key.
+            # hash typed encoder inputs once on a miss; retain the complete
+            # digest even when cache_value drops the device feature
             feature_hash = resolve_multimodal_item_hash(
-                existing_hash=0, namespace=entry.artifact_key
+                feature=(feature, grid), namespace=entry.artifact_key
             )
             artifacts.append(
                 QwenVLImagePreprocessArtifact(
@@ -923,7 +918,7 @@ class QwenVLImageProcessor(MediaArtifactCacheMixin, SGLangBaseProcessor):
                 offsets=[offset],
                 model_specific_data=deepcopy(artifact.model_specific_data),
             )
-            item.set_hash(artifact.feature_hash)
+            item.set_identity(artifact.feature_hash.to_bytes(32, "big"))
             mm_items.append(item)
 
         padded_input_ids = MultimodalProcessorOutput.build_padded_input_ids(

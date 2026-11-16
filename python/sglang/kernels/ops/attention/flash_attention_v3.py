@@ -4,6 +4,7 @@ from typing import Optional, Union
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.environ import envs
@@ -81,7 +82,7 @@ def _load_fa3_kernel_from_sgl():
 
 
 @cache_once
-def _is_fa3_supported(device=None) -> bool:
+def _is_fa3_supported() -> bool:
     #  There some fa3 FYI
     #  FA3 can fail without a enough shared memory for a some shapes, such as higher
     #  hidden_dim or some special cases.
@@ -90,11 +91,12 @@ def _is_fa3_supported(device=None) -> bool:
     #  https://docs.nvidia.com/cuda/cuda-c-programming-guide/#shared-memory-8-x
     #  And for sgl-kernel right now, we can build fa3 on sm80/sm86/sm89/sm90a.
     #  That means if you use A100/A*0/L20/L40/L40s/4090 you can use fa3.
-    major, minor = get_device_capability()
     if is_musa():
+        major, _ = get_device_capability()
         return major >= 3
     if torch.version.cuda is not None and torch.version.cuda >= "12.3":
-        return major == 9 or major == 8
+        arch = current_arch()
+        return arch.is_sm(9) or arch.is_sm(8)
     return False
 
 
