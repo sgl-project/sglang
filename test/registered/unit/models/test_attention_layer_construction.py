@@ -5,16 +5,17 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-from transformers import Gemma2Config
+from transformers import Gemma2Config, GPT2Config
 
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.models.gemma2 import Gemma2Model
+from sglang.srt.models.gpt2 import GPT2Attention
 from sglang.srt.runtime_context import get_parallel, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.parallel_groups import publish
+from sglang.test.parallel_groups import parallel_scope, publish
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -111,6 +112,23 @@ class TestGemma2LayerPrefix(_ContextTestCase):
                 )
             ),
         )
+
+
+class TestGpt2KvHeadsUnderTp(_ContextTestCase):
+    def test_kv_heads_follow_the_rank_share_of_c_attn(self):
+        """Each TP rank's c_attn emits its share of the K/V heads; the
+        attention layer splits K and V by the same per-rank count."""
+        config = GPT2Config(n_embd=32, n_head=4, n_layer=1, vocab_size=64)
+        for tp_size in (1, 2):
+            with (
+                self.subTest(tp_size=tp_size),
+                parallel_scope(
+                    tp_size=tp_size, attn_tp_size=tp_size, moe_tp_size=tp_size
+                ),
+            ):
+                attn = GPT2Attention(layer_id=0, config=config)
+                self.assertEqual(attn.attn.tp_k_head_num, attn.c_attn.num_kv_heads)
+                self.assertEqual(attn.attn.tp_v_head_num, attn.c_attn.num_kv_heads)
 
 
 if __name__ == "__main__":
