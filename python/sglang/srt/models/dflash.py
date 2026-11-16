@@ -158,26 +158,29 @@ def _project_candidate_logits(
     return logits
 
 
-@cache
 def _candidate_ag_ready(group) -> bool:
     # The kernel barriers on k3_ar_fusion's communicator, so only the TP group works.
-    if (
-        not envs.SGLANG_OPT_DFLASH_FUSED_CANDIDATE_AG.get()
-        or not k3_ar_fusion.enabled()
-        or group is not get_parallel().tp_group
-    ):
-        return False
+    return (
+        envs.SGLANG_OPT_DFLASH_FUSED_CANDIDATE_AG.get()
+        and k3_ar_fusion.enabled()
+        and group is get_parallel().tp_group
+        and _candidate_ag_registered()
+    )
+
+
+@cache
+def _candidate_ag_registered() -> bool:
     if not k3_ar_fusion.register_sp_collective_comm():
         logger.warning(
             "DFLASH fused candidate all-gather: another communicator owns "
             "TP%d; using NCCL.",
-            group.world_size,
+            get_parallel().tp_size,
         )
         return False
     logger.info(
         "DFLASH fused candidate all-gather enabled (TP%d, one direct multicast "
         "all-gather of the top-k values and ids)",
-        group.world_size,
+        get_parallel().tp_size,
     )
     return True
 
