@@ -12,6 +12,10 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 
 def make_layer(kind):
+    from sglang.srt.layers.moe.utils import (
+        initialize_moe_config,
+        get_moe_runner_backend,
+    )
     from sglang.srt.layers.quantization.fp8 import (
         Fp8Config,
         Fp8LinearMethod,
@@ -23,6 +27,8 @@ def make_layer(kind):
     get_context().set_server_args(
         ServerArgs(model_path="unused", moe_runner_backend="triton")
     )
+    initialize_moe_config()
+    assert get_moe_runner_backend().is_triton()
     config = Fp8Config(is_checkpoint_fp8_serialized=False)
     with torch.device("cuda"):
         layer = torch.nn.Module()
