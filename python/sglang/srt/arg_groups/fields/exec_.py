@@ -217,6 +217,15 @@ class ExecFeatures(msgspec.Struct):
         "Use the same value on disaggregated prefill and decode nodes; clients "
         "should set top_k below the limit to leave headroom for cutoff ties.",
     ] = 4096
+    sampling_banned_token_ids: A[
+        Optional[List[int]],
+        "Token ids that are never sampled. Their logits get the lowest finite "
+        "value in the target model and in EAGLE, EAGLE3, NEXTN, STANDALONE and "
+        "multi-layer EAGLE drafts, so sampling, speculative verification, draft "
+        "proposals and every returned logprob (output, prompt and scoring) are "
+        "normalized over the remaining tokens. Other drafts are not masked; the "
+        "target rejects their banned proposals.",
+    ] = None
     enable_mis: A[
         bool,
         "Enable Multi-Item Scoring optimization. Combines query and multiple items into a single sequence for efficient batch processing. Requires --attention-backend flashinfer; auto-disables CUDA graph, radix cache, and chunked prefill.",

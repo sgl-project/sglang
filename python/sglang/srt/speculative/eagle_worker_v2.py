@@ -260,6 +260,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         )
         self.init_token_map()
         self.init_lm_head()
+        self.set_banned_token_ids(column_token_ids=self.hot_token_id)
         self._init_draft_probs_vocab_scatter()
 
         if get_spec().speculative_use_rejection_sampling:

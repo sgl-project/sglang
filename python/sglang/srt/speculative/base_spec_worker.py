@@ -79,6 +79,23 @@ class EagleDraftWorkerBase(ABC):
         per-step runner list."""
         return [self.draft_runner]
 
+    def set_banned_token_ids(self, column_token_ids: Optional[torch.Tensor]) -> None:
+        """Mask --sampling-banned-token-ids in the draft logits. Call after the
+        draft head is set up; column_token_ids maps its columns to token ids
+        (a hot-token map), None means column c is token c."""
+        token_ids = get_exec().features.sampling_banned_token_ids
+        if not token_ids:
+            return
+        from sglang.srt.layers.logits_processor import set_banned_token_ids_on_model
+
+        for runner in self.draft_runners:
+            set_banned_token_ids_on_model(
+                model=runner.model,
+                token_ids=token_ids,
+                device=runner.device,
+                column_token_ids=column_token_ids,
+            )
+
     @property
     def graph_memory_usage(self) -> dict[str, float]:
         return merge_graph_memory_usage(
