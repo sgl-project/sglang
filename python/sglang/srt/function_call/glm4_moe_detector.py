@@ -182,7 +182,6 @@ class Glm4MoeDetector(BaseFormatDetector):
             r"<arg_key>(.*?)</arg_key>(?:\\n|\s)*<arg_value>(.*?)</arg_value>",
             re.DOTALL,
         )
-        self._last_arguments = ""
         self.current_tool_id = -1
         self.current_tool_name_sent = False
         self._streamed_raw_length = 0
@@ -499,9 +498,6 @@ class Glm4MoeDetector(BaseFormatDetector):
                 # Could be start of tool call, keep buffering
                 return StreamingParseResult(normal_text="", calls=[])
 
-        if not hasattr(self, "_tool_indices"):
-            self._tool_indices = self._get_tool_indices(tools)
-
         calls: list[ToolCallItem] = []
         try:
             # Try to match a partial or complete tool call
@@ -578,7 +574,6 @@ class Glm4MoeDetector(BaseFormatDetector):
                                     parameters=json_increment,
                                 )
                             )
-                            self._last_arguments += json_increment
                             self.streamed_args_for_tool[self.current_tool_id] += (
                                 json_increment
                             )
@@ -593,7 +588,6 @@ class Glm4MoeDetector(BaseFormatDetector):
                                     parameters=empty_object,
                                 )
                             )
-                            self._last_arguments += empty_object
                             self.streamed_args_for_tool[self.current_tool_id] += (
                                 empty_object
                             )
@@ -608,7 +602,6 @@ class Glm4MoeDetector(BaseFormatDetector):
                                     parameters=closing_brace,
                                 )
                             )
-                            self._last_arguments += closing_brace
                             self.streamed_args_for_tool[self.current_tool_id] += (
                                 closing_brace
                             )
@@ -632,7 +625,6 @@ class Glm4MoeDetector(BaseFormatDetector):
 
                         result = StreamingParseResult(normal_text="", calls=calls)
                         self.current_tool_id += 1
-                        self._last_arguments = ""
                         self.current_tool_name_sent = False
                         self._streamed_raw_length = 0
                         self._reset_streaming_state()

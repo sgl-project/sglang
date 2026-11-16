@@ -108,9 +108,6 @@ class DeepSeekV31Detector(BaseFormatDetector):
                     new_text = new_text.replace(e_token, "")
             return StreamingParseResult(normal_text=new_text)
 
-        if not hasattr(self, "_tool_indices"):
-            self._tool_indices = self._get_tool_indices(tools)
-
         calls: list[ToolCallItem] = []
         try:
             partial_match = re.search(

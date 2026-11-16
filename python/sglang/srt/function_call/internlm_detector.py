@@ -49,7 +49,6 @@ class InternlmDetector(BaseFormatDetector):
         super().__init__()
         self.bot_token = "<|action_start|> <|plugin|>"
         self.eot_token = "<|action_end|>"
-        self.position = 0
 
     def has_tool_call(self, text: str) -> bool:
         """Check if the text contains an InternLM format tool call."""

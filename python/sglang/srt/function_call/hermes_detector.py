@@ -50,10 +50,7 @@ class HermesDetector(BaseFormatDetector):
                 if not raw:
                     continue
                 parsed = json.loads(raw.strip())
-                if isinstance(parsed, list):
-                    calls.extend(self.parse_base_json(parsed, tools))
-                else:
-                    calls.extend(self.parse_base_json(parsed, tools))
+                calls.extend(self.parse_base_json(parsed, tools))
             return StreamingParseResult(normal_text=normal_text, calls=calls)
         except Exception as e:
             logger.error(f"Error in detect_and_parse: {e}")
