@@ -1347,8 +1347,4 @@ def flush_trace_batch(reqs: List[Any]):
     if reqs is None or not get_global_tracing_enabled():
         return
     for req in reqs:
-        time_stats = getattr(req, "time_stats", None)
-        if time_stats is not None:
-            trace_ctx = getattr(time_stats, "trace_ctx", None)
-            if trace_ctx is not None:
-                trace_ctx.flush()
+        req.time_stats.trace_ctx.flush()
