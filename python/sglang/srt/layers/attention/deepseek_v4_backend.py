@@ -508,9 +508,10 @@ class DSV4AttnMetadata:
     c2_sparse_page_indices: Optional[torch.Tensor] = field(init=False, default=None)
     c2_sparse_raw_indices: Optional[torch.Tensor] = field(init=False, default=None)
 
-    # Combined decode tables. Only the c4 tail and lens vary by layer.
+    # Combined decode tables. Only the c4 tail varies by layer.
     trtllm_swa_lens: Optional[torch.Tensor] = None
     trtllm_c4_indices: Optional[torch.Tensor] = None
+    # [indexed ratio, row]: one row per trtllm_indexed_ratios entry.
     trtllm_c4_lens: Optional[torch.Tensor] = None
     trtllm_c128_indices: Optional[torch.Tensor] = None
     trtllm_c128_lens: Optional[torch.Tensor] = None
@@ -626,6 +627,25 @@ class DSV4AttnMetadata:
         else:
             raise ValueError(f"invalid {compress_ratio=}")
 
+    @property
+    def trtllm_indexed_ratios(self) -> Tuple[int, ...]:
+        """The ratios sharing trtllm_c4_indices, in trtllm_c4_lens row order."""
+        return tuple(ratio for ratio in (1, 2, 4) if ratio in self.present_ratios)
+
+    def trtllm_indexed_lens(self, compress_ratio: int) -> torch.Tensor:
+        """SWA_WINDOW plus the ratio's top-k length per row, for TRT-LLM.
+
+        trtllm-gen reads these before its griddepcontrol.wait, where a PDL launch
+        need not see its predecessor's stores, so they are written with the
+        metadata rather than by the per-layer pack right before the launch.
+        """
+        lens = self.trtllm_c4_lens
+        ratios = self.trtllm_indexed_ratios
+        assert lens is not None and lens.shape[0] == len(ratios), (
+            f"{None if lens is None else lens.shape} {ratios=}"
+        )
+        return lens[ratios.index(compress_ratio)]
+
     def init_trtllm_sparse_buffers(self) -> None:
         """Build tile-padded TRT-LLM tables and lengths for indexed attention
         or SWA-only DSpark blocks; indexed tails are refreshed per layer."""
@@ -680,7 +700,15 @@ class DSV4AttnMetadata:
             # Unwritten indexed rows remain inert until the per-layer fill.
             self.trtllm_c4_indices = _tile_padded(-1, width=SWA_WINDOW + w4)
             self.trtllm_c4_indices[:, :SWA_WINDOW].copy_(self.swa_page_indices)
-            self.trtllm_c4_lens = _tile_padded(SWA_WINDOW)
+            ratios = self.trtllm_indexed_ratios
+            lens = torch.full(
+                (len(ratios), n_pad), SWA_WINDOW, **self.cuda_int32_kwargs
+            )
+            for row, ratio in enumerate(ratios):
+                lengths = self.sparse_topk_lengths(ratio)
+                if lengths is not None:
+                    torch.add(lengths, SWA_WINDOW, out=lens[row, :num_tokens])
+            self.trtllm_c4_lens = lens[:, :num_tokens]
         if self.c128_page_indices is not None:
             assert swa_width == SWA_WINDOW
             w128 = self.c128_page_indices.shape[-1]

@@ -76,6 +76,22 @@ def test_sparse_tail_short_sequence_and_padding(dtype):
     assert (totals[1:] == 0).all()
 
 
+def test_sparse_tail_table_only_leaves_lengths():
+    table = torch.full((64, 132), -1, device="cuda", dtype=torch.int32)
+    indices = torch.tensor([[100, 101, -1, -1]], device="cuda", dtype=torch.int32)
+    pack_sparse_tail(indices, None, table[:1], None)
+    torch.testing.assert_close(table[:1, 128:], indices)
+    assert (table[0, :128] == -1).all()
+    assert (table[1:] == -1).all()
+
+
+def test_sparse_tail_rejects_lengths_without_totals():
+    indices = torch.empty((0, 4), dtype=torch.int32)
+    table = torch.empty((0, 132), dtype=torch.int32)
+    with pytest.raises(AssertionError):
+        pack_sparse_tail(indices, torch.empty(0, dtype=torch.int32), table, None)
+
+
 def test_sparse_tail_rejects_float_lengths():
     indices = torch.empty((0, 4), dtype=torch.int32)
     table = torch.empty((0, 132), dtype=torch.int32)
