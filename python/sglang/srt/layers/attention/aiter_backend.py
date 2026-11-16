@@ -754,6 +754,8 @@ class AiterAttnBackend(AttentionBackend):
     # Set in __init__; declared here for tests that build the backend without it
     # (test_aiter_fp8_kv_scales_paths.py).
     deterministic_prefill_max_q: Optional[int] = None
+    muse_extend_gfx1250: bool = False
+    muse_extend_fly_gfx1250: bool = False
 
     def __init__(
         self,
