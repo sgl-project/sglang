@@ -249,6 +249,26 @@ To enable EPLB, use the flags `--enable-eplb`. For optimal performance, increase
 
 For more details, refer to the [EPLB Section in the Large-Scale EP Blog](https://lmsys.org/blog/2025-05-05-large-scale-ep/#expert-parallelism-load-balancer) and the [EPLB Repository](https://github.com/deepseek-ai/eplb).
 
+### Asynchronous EPLB on Ascend NPU (experimental)
+
+On Ascend NPU, `--eplb-async-rebalance` moves placement planning and remote expert reads to a background worker. Each rank stages one layer, and all ranks agree before installing that layer's weights and dispatch metadata at a target forward boundary. The option is disabled by default.
+
+The validated environment is Linux with Ascend 910C, CANN 9.1.0, and PyTorch/torch_npu 2.10. You need the CANN HIXL headers and libraries, a C++ compiler, and Ninja: the transport bridge compiles against your installed CANN when enabled. Set `ASCEND_HOME_PATH` to the CANN installation containing `include/hixl/hixl.h` and `lib64/libcann_hixl.so`.
+
+Add the following options to an existing NPU EP launch with `TP=EP=WORLD` and `PP=1`:
+
+```bash
+--enable-eplb \
+--eplb-async-rebalance \
+--eplb-rebalance-num-iterations 1000 \
+--expert-distribution-recorder-buffer-size 1000 \
+--eplb-rebalance-layers-per-chunk 1
+```
+
+Use a finite positive statistics window no larger than the rebalance interval. Static and dynamic dispatch are supported. This initial implementation requires resident expert weights and rejects LP dispatch, elastic EP, paged experts, CPU offload, memory saver, TBO/SBO, and online weight updates.
+
+Staging and transport registration happen before KV cache sizing and graph capture. Staging holds one layer of physical expert storage, including quantization scales and padding; its size depends on the model and EP degree. Statistics collection, rank agreement, metadata preparation, and installation still run on the forward path. Reads share device and interconnect resources with inference, so benchmark latency and throughput on your workload before enabling this option. A transfer failure whose DMA completion cannot be established terminates the worker instead of reusing potentially active storage.
+
 
 ## Ascend NPU Guidance
 ### Guidance on SGLang configuration in Ascend NPU

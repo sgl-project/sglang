@@ -992,6 +992,9 @@ class ExecMoe(msgspec.Struct):
     ] = None
     init_expert_location: A[str, "Initial location of EP experts."] = "trivial"
     enable_eplb: A[bool, "Enable EPLB algorithm"] = False
+    eplb_async_rebalance: A[
+        bool, "Overlap NPU EPLB expert reads with forward using HIXL (experimental)."
+    ] = False
     eplb_algorithm: A[str, "Chosen EPLB algorithm"] = "auto"
     eplb_rebalance_num_iterations: A[
         int, "Number of iterations to automatically trigger a EPLB re-balance."

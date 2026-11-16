@@ -223,6 +223,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
         self._expert_location_metadata = expert_location_metadata
 
         self._recording = False
+        self.completed_forward_passes = 0
         self._disable_all = False
         self._record_current_pass = False
         self._current_forward_pass_id = Withable()
@@ -291,6 +292,7 @@ class _ExpertDistributionRecorderReal(ExpertDistributionRecorder):
             self._accumulator.append(
                 forward_pass_id, gatherer_key, single_pass_data, outputs
             )
+        self.completed_forward_passes += 1
 
     def on_select_experts(self, topk_ids: torch.Tensor):
         self._on_hook("on_select_experts", topk_ids=topk_ids)

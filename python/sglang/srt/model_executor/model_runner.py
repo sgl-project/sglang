@@ -787,6 +787,18 @@ class ModelRunner:
             is_draft=self.is_draft_worker,
         )
         allocate_mega_moe_buffers(self.model)
+        if self.eplb_manager is not None and get_exec().moe.eplb_async_rebalance:
+            if self.startup_weight_load is not None:
+                raise ValueError(
+                    "Async EPLB requires completed weight loading before registration"
+                )
+            self.eplb_manager.on_model_loaded()
+            # Reuse the existing rank-uniform online-update rejection mechanism.
+            if getattr(self.model, "_derived_weight_cache_error", None) is None:
+                self.model._derived_weight_cache_error = (
+                    "Online weight updates are unsupported with async EPLB: "
+                    "HIXL retains registrations for the original expert storage."
+                )
 
     def init_memory_saver_adapter(self):
         self.memory_saver_adapter = TorchMemorySaverAdapter.create(
