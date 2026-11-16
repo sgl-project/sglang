@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_c
 from sglang.multimodal_gen.runtime.models.bridges.mova_dual_tower import (
     DualTowerConditionalBridge,
 )
+from sglang.multimodal_gen.runtime.models.dits import mova_video_dit
 from sglang.multimodal_gen.runtime.models.dits.mova_audio_dit import WanAudioModel
 from sglang.multimodal_gen.runtime.models.dits.mova_video_dit import WanModel
 from sglang.multimodal_gen.runtime.models.schedulers.flow_match_pair import (
@@ -291,6 +292,46 @@ class TestMOVARopeTables(unittest.TestCase):
             torch.testing.assert_close(
                 built_once, run_steps(rebuild_each_step=True), rtol=0, atol=0
             )
+
+
+@pytest.mark.usefixtures("single_process_model_parallel")
+class TestMOVAVideoPatchify(unittest.TestCase):
+    @torch.no_grad()
+    def test_patch_embedding_layout_follows_platform(self):
+        """The Conv3d patch embedding gets a channels_last_3d input everywhere
+        but on NPU, which does not support that layout."""
+        with tiny_dit_runtime(_DTYPE):
+            video_dit = WanModel(
+                MOVAVideoConfig(
+                    arch_config=MOVAVideoArchConfig(
+                        dim=128,
+                        ffn_dim=64,
+                        text_dim=32,
+                        freq_dim=16,
+                        num_heads=1,
+                        in_dim=4,
+                        out_dim=4,
+                        num_layers=1,
+                        require_vae_embedding=False,
+                    )
+                ),
+                hf_config={},
+            )
+        conv_inputs = []
+        video_dit.patch_embedding.register_forward_pre_hook(
+            lambda module, args: conv_inputs.append(args[0])
+        )
+        latents = torch.randn(1, 4, 3, 4, 6)
+
+        for is_npu in (False, True):
+            with patch.object(
+                mova_video_dit.current_platform, "is_npu", return_value=is_npu
+            ):
+                video_dit.patchify(latents)
+
+        off_npu, on_npu = conv_inputs
+        self.assertTrue(off_npu.is_contiguous(memory_format=torch.channels_last_3d))
+        self.assertFalse(on_npu.is_contiguous(memory_format=torch.channels_last_3d))
 
 
 if __name__ == "__main__":

@@ -498,7 +498,7 @@ class WanModel(CachableDiT, LayerwiseOffloadableModuleMixin):
     def patchify(
         self, x: torch.Tensor, control_camera_latents_input: torch.Tensor | None = None
     ):
-        if current_platform.is_npu:
+        if current_platform.is_npu():
             # torch.channels_last_3d is not supported on NPU
             x = x.contiguous()
         else:
