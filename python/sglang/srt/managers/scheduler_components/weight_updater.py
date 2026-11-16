@@ -41,7 +41,6 @@ from sglang.srt.managers.io_struct import (
     GetWeightsByNameReqOutput,
     InitWeightsUpdateGroupReqInput,
     InitWeightsUpdateGroupReqOutput,
-    ModelExpressWeightUpdateReqOutput,
     PluginWeightUpdateReqInput,
     PluginWeightUpdateReqOutput,
     ReleaseMemoryOccupationReqInput,
@@ -55,6 +54,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromModelExpressReqInput,
+    UpdateWeightsFromModelExpressReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
 )
@@ -202,12 +202,12 @@ class SchedulerWeightUpdaterManager:
         self, recv_req: UpdateWeightsFromModelExpressReqInput
     ):
         if get_parallel().pp_size > 1:
-            return ModelExpressWeightUpdateReqOutput(
+            return UpdateWeightsFromModelExpressReqOutput(
                 success=False,
                 message="ModelExpress does not support pipeline parallelism",
             )
         if self.draft_worker is not None:
-            return ModelExpressWeightUpdateReqOutput(
+            return UpdateWeightsFromModelExpressReqOutput(
                 success=False, message="ModelExpress does not support draft models"
             )
         with self._observe_weight_load("modelexpress"):
@@ -219,7 +219,9 @@ class SchedulerWeightUpdaterManager:
                 )
             if not success:
                 logger.error(message)
-            return ModelExpressWeightUpdateReqOutput(success=success, message=message)
+            return UpdateWeightsFromModelExpressReqOutput(
+                success=success, message=message
+            )
 
     def init_weights_update_group(self, recv_req: InitWeightsUpdateGroupReqInput):
         """Initialize the online model parameter update group."""

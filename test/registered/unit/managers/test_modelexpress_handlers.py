@@ -15,8 +15,8 @@ from sglang.srt.arg_groups.overrides import (
 )
 from sglang.srt.managers import scheduler as scheduler_module
 from sglang.srt.managers.io_struct import (
-    ModelExpressWeightUpdateReqOutput,
     UpdateWeightsFromModelExpressReqInput,
+    UpdateWeightsFromModelExpressReqOutput,
 )
 from sglang.srt.managers.scheduler_components.weight_updater import (
     SchedulerWeightUpdaterManager,
@@ -548,8 +548,8 @@ def test_tokenizer_reports_all_ranks_without_extra_fanout(
     remote_success, paused, multimodal
 ):
     results = [
-        ModelExpressWeightUpdateReqOutput(success=True),
-        ModelExpressWeightUpdateReqOutput(
+        UpdateWeightsFromModelExpressReqOutput(success=True),
+        UpdateWeightsFromModelExpressReqOutput(
             success=remote_success,
             message="" if remote_success else "rank 1 load failed",
         ),

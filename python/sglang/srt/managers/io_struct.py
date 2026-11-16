@@ -2181,7 +2181,7 @@ class UpdateWeightsFromModelExpressReqInput(BaseReq, kw_only=True):
     torch_empty_cache: bool = False
 
 
-class ModelExpressWeightUpdateReqOutput(BaseReq, kw_only=True):
+class UpdateWeightsFromModelExpressReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str = ""
 
