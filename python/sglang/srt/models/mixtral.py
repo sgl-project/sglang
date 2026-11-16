@@ -410,8 +410,14 @@ class MixtralForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
-            if layer_id is not None and (
-                layer_id < self.model.start_layer or layer_id >= self.model.end_layer
+            # GraniteMoeForCausalLM reuses this loader; its model has no start_layer.
+            if (
+                layer_id is not None
+                and hasattr(self.model, "start_layer")
+                and (
+                    layer_id < self.model.start_layer
+                    or layer_id >= self.model.end_layer
+                )
             ):
                 continue
 
