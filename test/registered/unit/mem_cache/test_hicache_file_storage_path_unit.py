@@ -15,7 +15,11 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 import os
 import unittest
 
-from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
+from sglang.srt.mem_cache.hicache_storage import (
+    HiCacheFile,
+    HiCacheStorageConfig,
+    HiCacheStorageFailureInjector,
+)
 from sglang.test.test_utils import CustomTestCase
 
 _ENV = "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR"
@@ -72,6 +76,14 @@ class TestFileStoragePathRouting(CustomTestCase):
         os.environ[_ENV] = "/env/hicache"
         extra = _inject("/mnt/nvme/hicache")
         self.assertEqual(HiCacheFile(_make_config(extra)).file_path, "/env/hicache")
+
+    def test_failure_injector_closes_file_backend(self):
+        """Closing the failure injector must not raise around the file backend,
+        which holds nothing to release."""
+        injector = HiCacheStorageFailureInjector(
+            HiCacheFile(_make_config(_inject(None))), 0.0, 0.0
+        )
+        injector.close()
 
 
 if __name__ == "__main__":
