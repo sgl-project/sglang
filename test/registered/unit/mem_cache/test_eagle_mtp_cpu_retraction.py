@@ -8,10 +8,14 @@ import torch
 
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
-from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.common import discard_kv_cache_backup
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
-from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, MLATokenToKVPool
+from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator
+from sglang.srt.mem_cache.memory_pool import (
+    DSATokenToKVPool,
+    KVCache,
+    MLATokenToKVPool,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
@@ -145,15 +149,24 @@ class TestEagleMtpCpuRetraction(unittest.TestCase):
         req.load_kv_cache(req_pool, allocator)
         self.assertFalse(torch.equal(draft.kv_buffer[0][new], expected))
 
-    def test_no_draft_keeps_existing_cpu_backup(self):
-        allocator = TokenToKVPoolAllocator(
-            96, torch.float32, "cpu", make_pool(100), need_sort=False
-        )
-        req, req_pool = make_req(torch.arange(1, 9))
-        req.offload_kv_cache(req_pool, allocator)
-        self.assertEqual(req.kv.retraction_backup.draft_cpu_tensors, ())
-        req.load_kv_cache(req_pool, allocator)
-        self.assertIsNone(req.kv.retraction_backup)
+    def test_registration_rejects_pool_without_cpu_copy(self):
+        """A draft pool without a CPU copy must fail at startup, not on the first retraction."""
+        no_cpu_copy = type("NoCpuCopyPool", (KVCache,), {})
+        no_cpu_copy.__abstractmethods__ = frozenset()
+        allocator = object.__new__(TokenToKVPoolAllocator)
+        allocator._kvcache = make_pool(100)
+        with self.assertRaisesRegex(NotImplementedError, "NoCpuCopyPool"):
+            allocator.register_cpu_retraction_draft_pools(
+                (object.__new__(no_cpu_copy),)
+            )
+        self.assertEqual(allocator.cpu_retraction_draft_pools, ())
+
+    def test_chain_allocator_refuses_draft_pools(self):
+        """The unified chain hands out virtual ids, so copying draft pools by them reads the wrong rows."""
+        with self.assertRaises(NotImplementedError):
+            object.__new__(ChainAllocator).register_cpu_retraction_draft_pools(
+                (make_pool(200),)
+            )
 
     def test_discard_releases_request_owned_draft_snapshots(self):
         target, draft = make_pool(100), make_pool(200, dsa=True)
@@ -186,9 +199,6 @@ class TestEagleMtpCpuRetraction(unittest.TestCase):
         discard_kv_cache_backup(req, None)
         self.assertIsNone(req.kv.retraction_backup)
 
-    def test_class_default_does_not_require_base_constructor(self):
-        self.assertEqual(BaseTokenToKVPoolAllocator.cpu_retraction_draft_pools, ())
-
 
 class TestEagleCpuRetractionRegistration(unittest.TestCase):
     def test_registration_after_allocation_is_independent_of_hicache(self):
@@ -196,8 +206,11 @@ class TestEagleCpuRetractionRegistration(unittest.TestCase):
             (SpeculativeAlgorithm.EAGLE, False, 1, True),
             (SpeculativeAlgorithm.EAGLE, False, 3, True),
             (SpeculativeAlgorithm.EAGLE3, False, 1, True),
+            # STANDALONE also keeps a separate draft pool on the target's token ids.
+            (SpeculativeAlgorithm.STANDALONE, False, 1, True),
             (SpeculativeAlgorithm.EAGLE, True, 1, False),
             (SpeculativeAlgorithm.DFLASH, False, 1, False),
+            (SpeculativeAlgorithm.FROZEN_KV_MTP, False, 1, False),
         ):
             with self.subTest(algorithm=algorithm, unified=unified, count=count):
                 pools = tuple(object() for _ in range(count))

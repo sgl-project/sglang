@@ -1571,9 +1571,7 @@ class Req(ReqDllmMixin):
                     mamba_indices=self.kv.mamba_pool_idx,
                     req_pool_index=self.kv.req_pool_idx,
                 )
-                for pool in getattr(
-                    token_to_kv_pool_allocator, "cpu_retraction_draft_pools", ()
-                )
+                for pool in token_to_kv_pool_allocator.cpu_retraction_draft_pools
             ),
         )
 
@@ -1595,7 +1593,7 @@ class Req(ReqDllmMixin):
             req_pool_index=self.kv.req_pool_idx,
         )
         for pool, cpu_tensors in zip(
-            getattr(token_to_kv_pool_allocator, "cpu_retraction_draft_pools", ()),
+            token_to_kv_pool_allocator.cpu_retraction_draft_pools,
             self.kv.retraction_backup.draft_cpu_tensors,
             strict=True,
         ):

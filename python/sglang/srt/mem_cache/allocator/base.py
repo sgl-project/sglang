@@ -99,9 +99,11 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
         seen = {id(self.get_kvcache())}
         unique = []
         for pool in pools:
-            if id(pool) not in seen:
-                seen.add(id(pool))
-                unique.append(pool)
+            if id(pool) in seen:
+                continue
+            seen.add(id(pool))
+            _check_cpu_copy_support(pool)
+            unique.append(pool)
         self.cpu_retraction_draft_pools = tuple(unique)
 
     @property
@@ -446,3 +448,18 @@ class BaseTokenToKVPoolAllocator(abc.ABC):
             )
             prev_end = start_pos + n
             yield free_index, start_pos
+
+
+def _check_cpu_copy_support(pool: KVCache) -> None:
+    # Fail at startup rather than on the first CPU retraction.
+    from sglang.srt.mem_cache.memory_pool import KVCache
+
+    cls = type(pool)
+    if (
+        cls.get_cpu_copy is KVCache.get_cpu_copy
+        or cls.load_cpu_copy is KVCache.load_cpu_copy
+    ):
+        raise NotImplementedError(
+            f"{cls.__name__} has no CPU copy, so its draft KV cannot survive "
+            "CPU retraction"
+        )

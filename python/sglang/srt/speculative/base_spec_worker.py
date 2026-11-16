@@ -360,17 +360,20 @@ class BaseSpecWorker(ABC):
             )
         self.req_to_token_pool = req_to_token_pool
         self.token_to_kv_pool_allocator = token_to_kv_pool_allocator
-        spec_algorithm = self.target_worker.model_runner.spec_algorithm
+        # DFlash keeps its own draft-pool registry.
         if (
-            spec_algorithm.is_eagle()
-            and not spec_algorithm.is_frozen_kv_mtp()
+            not self.target_worker.model_runner.spec_algorithm.is_dflash_family()
             and not get_memory().enable_unified_memory
         ):
             # Independent of the HiCache plan: CPU retraction is also used
             # with HiCache off, and multi-layer EAGLE needs every runner.
-            token_to_kv_pool_allocator.register_cpu_retraction_draft_pools(
-                tuple(runner.token_to_kv_pool for runner in self._draft_model_runners())
+            draft_pools = tuple(
+                runner.token_to_kv_pool for runner in self._draft_model_runners()
             )
+            if draft_pools:
+                token_to_kv_pool_allocator.register_cpu_retraction_draft_pools(
+                    draft_pools
+                )
 
     def init_attention_backends(self):
         if self.draft_worker is not None:
