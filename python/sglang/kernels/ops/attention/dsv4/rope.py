@@ -258,7 +258,6 @@ def apply_rotary_emb_flat_kernel(
 
 # Use the batched / contiguous-load rope kernels (faster, coalesced) instead of the
 # per-token kernel. Default OFF; DeepseekV4 enables it via set_batched_rope(True).
-# The env var SGLANG_ROPE_BATCHED=1 still works as an override.
 _USE_BATCHED_ROPE: bool = False
 
 
