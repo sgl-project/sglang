@@ -38,7 +38,6 @@ class TeaCacheContext:
     Attributes:
         current_timestep: Current denoising timestep index (0-indexed).
         num_inference_steps: Total number of inference steps.
-        do_cfg: Whether classifier-free guidance is enabled.
         is_cfg_negative: True if currently processing negative CFG branch.
         teacache_thresh: Threshold for accumulated L1 distance.
         coefficients: Polynomial coefficients for L1 rescaling.
@@ -47,7 +46,6 @@ class TeaCacheContext:
 
     current_timestep: int
     num_inference_steps: int
-    do_cfg: bool
     is_cfg_negative: bool  # For CFG branch selection
     teacache_thresh: float
     coefficients: list[float]
@@ -283,7 +281,6 @@ class TeaCacheMixin:
         # Extract common values
         current_timestep = forward_context.current_timestep
         num_inference_steps = forward_batch.num_inference_steps
-        do_cfg = forward_batch.do_classifier_free_guidance
         is_cfg_negative = forward_batch.is_cfg_negative
         is_cfg_parallel = bool(get_global_server_args().enable_cfg_parallel)
 
@@ -295,7 +292,6 @@ class TeaCacheMixin:
         return TeaCacheContext(
             current_timestep=current_timestep,
             num_inference_steps=num_inference_steps,
-            do_cfg=do_cfg,
             is_cfg_negative=is_cfg_negative,
             teacache_thresh=teacache_params.teacache_thresh,
             coefficients=teacache_params.get_coefficients(),
