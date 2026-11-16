@@ -120,8 +120,6 @@ class CuteDSLGDNKernel(LinearAttnKernelBase):
         self._ensure_extend_loaded(head_k_dim)
 
         total_seq_len = q.shape[1]
-        num_v_heads = v.shape[2]
-        head_v_dim = v.shape[3]
 
         # L2 norm Q/K outside the kernel (same as flashinfer path).
         q_norm = self._l2norm_fn(q[0].contiguous()).unsqueeze(0)
