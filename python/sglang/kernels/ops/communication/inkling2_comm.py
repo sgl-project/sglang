@@ -3,7 +3,12 @@ import torch.distributed._symmetric_memory as symm_mem
 import triton
 import triton.language as tl
 
-from sglang.kernels.jit.utils import cache_once, load_jit
+from sglang.kernels.jit.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 from sglang.kernels.ops.communication import inkling_all_reduce as ar
 
 _RANK_ORDER_MAX_BYTES = {2: 1200 * 1024, 4: 512 * 1024, 8: 288 * 1024, 16: 64 * 1024}
@@ -224,15 +229,12 @@ def oneshot_all_reduce(x, group, acc_f32=False, tag=""):
 
 @cache_once
 def _exchange_module(hidden, top_k, world):
+    args = make_cpp_args(hidden, top_k, world, is_arch_support_pdl())
     return load_jit(
         "inkling2_exchange",
-        str(hidden),
-        str(top_k),
-        str(world),
+        *args,
         cuda_files=["inkling2/exchange.cuh"],
-        cuda_wrappers=[
-            ("combine", f"inkling2_exchange::combine<{hidden}, {top_k}, {world}>")
-        ],
+        cuda_wrappers=[("combine", f"inkling2_exchange::combine<{args}>")],
     )
 
 

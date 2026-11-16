@@ -16,7 +16,7 @@ constexpr int threads(int hidden) {
   return (hidden / 16 + 31) / 32 * 32;
 }
 
-template <int H, int TOPK, int WORLD>
+template <int H, int TOPK, int WORLD, bool USE_PDL>
 __global__ void __launch_bounds__(threads(H)) combine_kernel(
     int64_t const* __restrict__ buffer_ptrs,
     int64_t const* __restrict__ flag_ptrs,
@@ -30,8 +30,8 @@ __global__ void __launch_bounds__(threads(H)) combine_kernel(
     int rank,
     int num_local) {
   __shared__ __nv_bfloat16 const* rows[TOPK];
-  device::PDLWaitPrimary<true>();
-  device::PDLTriggerSecondary<true>();
+  device::PDLWaitPrimary<USE_PDL>();
+  device::PDLTriggerSecondary<USE_PDL>();
   int64_t const call = calls[0];
   int64_t const slot = (call & 1) * slot_size;
   inkling_ar::grid_system_barrier<WORLD>(state, reinterpret_cast<void* const*>(flag_ptrs), rank, 0, false);
@@ -76,7 +76,7 @@ __global__ void __launch_bounds__(threads(H)) combine_kernel(
   }
 }
 
-template <int H, int TOPK, int WORLD>
+template <int H, int TOPK, int WORLD, bool USE_PDL>
 void combine(
     tvm::ffi::TensorView buffer_ptrs,
     tvm::ffi::TensorView flag_ptrs,
@@ -93,8 +93,8 @@ void combine(
   int tokens = out.size(0);
   host::RuntimeCheck(out.size(1) == H && src2dst.size(0) == tokens * TOPK, "Unsupported routed exchange shape");
   host::LaunchKernel(blocks, threads(H), out.device())
-      .enable_pdl(true)(
-          combine_kernel<H, TOPK, WORLD>,
+      .enable_pdl(USE_PDL)(
+          combine_kernel<H, TOPK, WORLD, USE_PDL>,
           static_cast<int64_t const*>(buffer_ptrs.data_ptr()),
           static_cast<int64_t const*>(flag_ptrs.data_ptr()),
           static_cast<uint32_t*>(state.data_ptr()),
