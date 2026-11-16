@@ -46,6 +46,7 @@ class RequestRetirer:
         penalty_status_pool: PenaltyStatusPool,
         send_abort_output: Callable[[AbortReq, Req], None],
         stream_output: Callable[..., None],
+        observe_finished: Optional[Callable[[Req], None]] = None,
     ):
         self.tree_cache = tree_cache
         self.beam_coordinator = beam_coordinator
@@ -54,6 +55,7 @@ class RequestRetirer:
         self.penalty_status_pool = penalty_status_pool
         self.send_abort_output = send_abort_output
         self.stream_output = stream_output
+        self.observe_finished = observe_finished
         # Called once per ended request; gamma-Ada records its latency.
         self.release_observer: Optional[Callable[[Req], None]] = None
 
@@ -93,6 +95,8 @@ class RequestRetirer:
 
     def release(self, req: Req, *, checkpoint: bool) -> None:
         """Give back what an ended request holds; the caller finishes and streams it."""
+        if self.observe_finished is not None:
+            self.observe_finished(req)
         _leave_owner_list(req)
         record_exit(req, "release")
         if self.release_observer is not None:
