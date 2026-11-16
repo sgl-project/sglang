@@ -326,61 +326,59 @@ export const config = {
       ],
       routerOverrides: [
         {
-          // MI35x 1P1D: measured behind the ROCm image's SGLang router.
+          // MI35x 1P1D: its benchmark numbers were measured before the switch to sgl-router.
           when: { hw: ["mi350x", "mi355x"] },
           command:
-`python3 -m sglang_router.launch_router \\
-  --pd-disaggregation \\
-  --prefill http://<prefill-host>:{{PREFILL_PORT}} 8998 \\
-  --decode http://<decode-host>:{{DECODE_PORT}} \\
+`sgl-router \\
+  --model-id {{MODEL_NAME}} \\
+  --no-tokenizer \\
+  --worker-urls http://<prefill-host>:{{PREFILL_PORT}} http://<decode-host>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}} \\
-  --request-timeout-secs 3600`,
+  --request-timeout-secs 3600 \\
+  --stream-idle-timeout-secs 3600 \\
+  --stale-request-timeout-secs 3600`,
         },
         {
           when: { hw: ["m890"] },
           command:
-`SGLANG_ROUTER_STREAM_IDLE_TIMEOUT_SECS=3600 \\
-sgl-router \\
-  --pd-disaggregation \\
-  --prefill http://<prefill-1-head>:{{PREFILL_PORT}} 8998 \\
-  --prefill http://<prefill-2-head>:{{PREFILL_PORT}} 8998 \\
-  --decode http://<decode-head>:{{DECODE_PORT}} \\
+`sgl-router \\
+  --model-id {{MODEL_NAME}} \\
+  --no-tokenizer \\
+  --worker-urls http://<prefill-1-head>:{{PREFILL_PORT}} http://<prefill-2-head>:{{PREFILL_PORT}} http://<decode-head>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}} \\
   --policy power_of_two \\
-  --model-id {{MODEL_NAME}} \\
-  --tokenizer-path {{MODEL_NAME}} \\
+  --stream-idle-timeout-secs 3600 \\
+  --stale-request-timeout-secs 3600 \\
   --request-timeout-secs 540`,
         },
         {
           when: { hw: ["810e"] },
           command:
-`SGLANG_ROUTER_STREAM_IDLE_TIMEOUT_SECS=3600 \\
-sgl-router \\
-  --pd-disaggregation \\
-  --prefill http://<prefill-head>:{{PREFILL_PORT}} 8998 \\
-  --decode http://<decode-head>:{{DECODE_PORT}} \\
+`sgl-router \\
+  --model-id {{MODEL_NAME}} \\
+  --no-tokenizer \\
+  --worker-urls http://<prefill-head>:{{PREFILL_PORT}} http://<decode-head>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}} \\
   --policy power_of_two \\
-  --model-id {{MODEL_NAME}} \\
-  --tokenizer-path {{MODEL_NAME}} \\
+  --stream-idle-timeout-secs 3600 \\
+  --stale-request-timeout-secs 3600 \\
   --request-timeout-secs 540`,
         },
       ],
       router: {
         port: 8000,
-        // The K3.1 build of sgl-router renders the K3 chat template and keeps content-less tool
-        // messages; the stock sglang-router 0.3.2 does neither. Raise the stream-idle timeout
-        // for overloaded benchmarks (the 180 s default kills long-queued streams).
+        // --no-tokenizer leaves chat rendering to the workers. Raise the stream-idle timeout
+        // for overloaded benchmarks (the 180 s default kills long-queued streams), and the
+        // request lifetime with it (the 600 s default would cancel them first).
         command:
-`SGLANG_ROUTER_STREAM_IDLE_TIMEOUT_SECS=3600 \\
-sgl-router \\
-  --pd-disaggregation \\
-  --prefill http://<prefill-host>:{{PREFILL_PORT}} 8998 \\
-  --decode http://<decode-host>:{{DECODE_PORT}} \\
+`sgl-router \\
+  --model-id {{MODEL_NAME}} \\
+  --no-tokenizer \\
+  --worker-urls http://<prefill-host>:{{PREFILL_PORT}} http://<decode-host>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}} \\
   --policy power_of_two \\
-  --model-id moonshotai/Kimi-K3.1-Pro \\
-  --tokenizer-path <Kimi-K3.1-Pro tokenizer.json> \\
+  --stream-idle-timeout-secs 3600 \\
+  --stale-request-timeout-secs 3600 \\
   --request-timeout-secs 540`,
       },
     },
