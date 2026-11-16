@@ -12,9 +12,9 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.model_loader.weight_utils import sharded_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.common import set_weight_attrs
 
 
 class Mixer2RMSNormGated(BaseFusedOp):
@@ -43,7 +43,14 @@ class Mixer2RMSNormGated(BaseFusedOp):
         if self.use_rms_norm:
             # Register norm weight only if we're actually applying RMSNorm
             self.weight = torch.nn.Parameter(torch.ones(self.per_rank_hidden_size))
-            set_weight_attrs(self.weight, {"weight_loader": sharded_weight_loader(0)})
+            set_weight_attrs(
+                self.weight,
+                {
+                    "weight_loader": sharded_weight_loader(
+                        0, parallel_group="attn_tp" if self.use_attn_tp_group else "tp"
+                    )
+                },
+            )
         else:
             # Avoid checkpoint mismatch by skipping unused parameter
             self.register_parameter("weight", None)

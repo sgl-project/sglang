@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=126, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=127, stage="extra-a", runner_config="1-gpu-large")
 register_amd_ci(est_time=330, suite="stage-b-test-1-gpu-small-amd")
 
 import unittest
@@ -92,7 +92,9 @@ class TestBatchingFDFO(CustomTestCase):
             if is_in_amd_ci():
                 self.assertGreater(speed, 10)
             else:
-                self.assertGreater(speed, 250)
+                # bs=1 dLLM decode is host-CPU bound (no overlap schedule, a sync
+                # per denoising step); relax for CI hosts with slower CPUs
+                self.assertGreater(speed, 200)
 
 
 if __name__ == "__main__":

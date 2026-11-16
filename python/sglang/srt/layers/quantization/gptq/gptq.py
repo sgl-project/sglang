@@ -18,6 +18,7 @@ from sglang.srt.layers.quantization.utils import (
     get_linear_quant_method,
     get_scalar_types,
 )
+from sglang.srt.utils import is_hip
 from sglang.srt.utils.patch_torch import register_fake_if_exists
 
 from .schemes import (
@@ -28,6 +29,7 @@ from .schemes import (
     GPTQMarlinLinearScheme,
     GPTQMarlinMoEScheme,
     GPTQMoEAscendScheme,
+    GPTQTritonLinearScheme,
     GPTQXPULinearScheme,
 )
 
@@ -182,6 +184,8 @@ class GPTQConfig(QuantizationConfig):
         )
 
     def get_linear_scheme(self, layer: torch.nn.Module):
+        if is_hip():
+            return GPTQTritonLinearScheme(self)
         return GPTQLinearScheme(self)
 
     def get_moe_scheme(self, layer: torch.nn.Module):
@@ -559,6 +563,9 @@ class GPTQMoEMethod(FusedMoEMethodBase):
     ):
         layer.scheme.create_moe_runner(layer, moe_runner_config)
 
+    def get_moe_runner_backend(self, layer):
+        return layer.scheme.get_moe_runner_backend(layer)
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         layer.scheme.process_weights_after_loading(layer)
 
@@ -650,6 +657,9 @@ class GPTQMarlinMoEMethod(FusedMoEMethodBase):
         self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
     ):
         layer.scheme.create_moe_runner(layer, moe_runner_config)
+
+    def get_moe_runner_backend(self, layer):
+        return layer.scheme.get_moe_runner_backend(layer)
 
     def apply(
         self,

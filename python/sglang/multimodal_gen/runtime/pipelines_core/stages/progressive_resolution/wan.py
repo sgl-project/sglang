@@ -47,11 +47,14 @@ class WanProgressiveDenoisingStage(ProgressiveDenoisingStage):
     - Initial noise must carry the temporal dimension T_lat.
     """
 
-    def __init__(self, transformer, scheduler, pipeline=None, vae=None) -> None:
+    def __init__(
+        self, transformer, scheduler, pipeline=None, transformer_2=None, vae=None
+    ) -> None:
         super().__init__(
             transformer,
             scheduler,
             pipeline=pipeline,
+            transformer_2=transformer_2,
             vae=vae,
             spectrum_A=WAN_SPECTRUM_A,
             spectrum_beta=WAN_SPECTRUM_BETA,
@@ -66,40 +69,6 @@ class WanProgressiveDenoisingStage(ProgressiveDenoisingStage):
         return getattr(arch, "vae_scale_factor", None) or getattr(
             arch, "spatial_compression_ratio", 8
         )
-
-    # ------------------------------------------------------------------
-    # Pack / Unpack overrides  (Wan latent is already [B, C, T, H, W])
-    # ------------------------------------------------------------------
-
-    def _unpack_latent(
-        self, latent: torch.Tensor, h_lat: int, w_lat: int
-    ) -> torch.Tensor:
-        return latent
-
-    def _repack_latent(
-        self,
-        x_spatial: torch.Tensor,
-        h_lat: int,
-        w_lat: int,
-        batch: Req,
-        server_args: ServerArgs,
-    ) -> torch.Tensor:
-        return x_spatial
-
-    # ------------------------------------------------------------------
-    # Resolution-change hook  (no-op for Wan T2V)
-    # ------------------------------------------------------------------
-
-    def _on_resolution_change(
-        self,
-        ctx,
-        batch: Req,
-        server_args: ServerArgs,
-        new_h_pixel: int,
-        new_w_pixel: int,
-    ) -> None:
-        """Wan T2V has no spatial positional embeddings that require updating."""
-        pass
 
     # ------------------------------------------------------------------
     # Resolution alignment  (Wan patch embedding requires even spatial dims)

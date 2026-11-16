@@ -33,7 +33,7 @@ NIXL_COMMON = [
     "--mem-fraction-static",
     "0.78",
 ]
-DP_ATTN = ["--dp", "8", "--enable-dp-attention"]
+DP_ATTN = ["--attn-dp-size", "8"]
 ELASTIC_NIXL = [
     "--elastic-ep-backend",
     "nixl",

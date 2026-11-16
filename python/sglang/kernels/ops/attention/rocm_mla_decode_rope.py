@@ -26,11 +26,7 @@ import triton.language as tl
 from sglang.kernels.ops.attention.decode_attention import (
     _decode_softmax_reducev_fwd,
 )
-
-
-def is_hip():
-    return triton.runtime.driver.active.get_current_target().backend == "hip"
-
+from sglang.srt.utils import is_hip
 
 _is_hip = is_hip()
 

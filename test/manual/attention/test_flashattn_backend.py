@@ -10,11 +10,12 @@ from sglang.srt.layers.attention.flashattention_backend import (
 from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     set_forward_context,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.test_utils import CustomTestCase
 
 
@@ -62,7 +63,6 @@ class MockModelRunner:
                 "enable_deterministic_inference": False,
             },
         )
-        self.attn_cp_size = 1
         # Create a large enough req_to_token_pool to fit the test usage.
         self.req_to_token_pool = type(
             "TokenPool",

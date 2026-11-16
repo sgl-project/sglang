@@ -22,8 +22,7 @@ class TestPrefetchCheckpointsMultiGPU(CustomTestCase):
         cls.engine = sgl.Engine(
             model_path="Qwen/Qwen1.5-MoE-A2.7B-Chat",
             tp_size=4,
-            dp_size=4,
-            enable_dp_attention=True,
+            attn_dp_size=4,
             disable_radix_cache=True,
             weight_loader_prefetch_checkpoints=True,
             cuda_graph_max_bs_decode=1,

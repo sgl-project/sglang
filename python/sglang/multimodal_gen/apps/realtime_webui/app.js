@@ -1,10 +1,8 @@
 const $ = (id) => document.getElementById(id);
 const RAW_RGB_CONTENT_TYPE = "application/x-raw-rgb";
-const RAW_RGB_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgb-delta-gzip";
-const RAW_RGBA_DELTA_GZIP_CONTENT_TYPE = "application/x-raw-rgba-delta-gzip";
 const WEBP_FRAME_CONTENT_TYPE = "image/webp";
 const JPEG_FRAME_CONTENT_TYPE = "image/jpeg";
-const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v10";
+const DECODER_WORKER_URL = "./decoder_worker.js?v=rgb-worker-v11";
 const DEFAULT_PREVIEW_OUTPUT_FORMAT = "webp";
 const DEFAULT_PREVIEW_OUTPUT_QUALITY = 80;
 const MAX_WEBP_PREVIEW_OUTPUT_QUALITY = 80;
@@ -213,7 +211,6 @@ let droppedDecodeFrames = 0;
 let lastDecodeDropAt = 0;
 let lastDecodeDropCount = 0;
 let nextEventId = 1;
-let lastRawRgbFrame = null;
 let decoderWorker = null;
 let decodeWorkerUnavailable = false;
 let decodeRequestId = 1;
@@ -299,7 +296,6 @@ function resetStreamStats() {
   encodedDecodeErrors = 0;
   renderedPreviewFrames = 0;
   controlStateController?.reset({ sendRelease: false });
-  resetDecoderState();
   updateStats();
   $("renderFps").textContent = "0";
   $("latencyText").textContent = "-";
@@ -346,11 +342,6 @@ function ensureDecoderWorker() {
     decoderWorker = null;
     rejectPendingDecodes(event.message || "decode worker failed");
   };
-}
-
-function resetDecoderState() {
-  lastRawRgbFrame = null;
-  if (decoderWorker) decoderWorker.postMessage({ type: "reset" });
 }
 
 async function decodeFrameBatch(header, data) {
@@ -435,11 +426,7 @@ function isWorkerDecodableContentType(contentType) {
 }
 
 function isWorkerDecodableRawContentType(contentType) {
-  return (
-    contentType === RAW_RGB_CONTENT_TYPE ||
-    contentType === RAW_RGB_DELTA_GZIP_CONTENT_TYPE ||
-    contentType === RAW_RGBA_DELTA_GZIP_CONTENT_TYPE
-  );
+  return contentType === RAW_RGB_CONTENT_TYPE;
 }
 
 function updateStats() {
@@ -1040,83 +1027,17 @@ function rgbToImageData(header, payload) {
   return items;
 }
 
-function rgbaToImageData(header, payload) {
-  const width = Number(header.width), height = Number(header.height);
-  const count = Number(header.num_frames);
-  const frameBytes = Number(header.bytes_per_frame);
-  const src = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
-  const items = [];
-  for (let f = 0; f < count; f++) {
-    const offset = f * frameBytes;
-    const imageBytes = new Uint8ClampedArray(
-      src.buffer,
-      src.byteOffset + offset,
-      frameBytes,
-    );
-    items.push({ image: new ImageData(imageBytes, width, height), chunk: header.chunk_index });
-  }
-  return items;
-}
-
-async function gunzipBytes(payload) {
-  if (typeof DecompressionStream === "undefined") {
-    throw new Error("This browser does not support gzip stream decoding");
-  }
-  const stream = new Blob([payload]).stream().pipeThrough(new DecompressionStream("gzip"));
-  return new Uint8Array(await new Response(stream).arrayBuffer());
-}
-
-async function restoreDeltaGzipRawRgb(header, payload) {
-  const frameBytes = Number(header.bytes_per_frame);
-  const count = Number(header.num_frames);
-  const expectedSize = frameBytes * count;
-  const restored = await gunzipBytes(payload);
-  if (restored.length !== expectedSize) {
-    throw new Error(`delta payload size mismatch: expected ${expectedSize}, got ${restored.length}`);
-  }
-  let previous = header.delta_reference === "previous-frame" ? lastRawRgbFrame : null;
-  if (header.delta_reference === "previous-frame" && !previous) {
-    throw new Error("Missing previous frame for delta payload");
-  }
-  for (let f = 0; f < count; f++) {
-    const current = f * frameBytes;
-    if (previous) {
-      for (let i = 0; i < frameBytes; i++) {
-        restored[current + i] ^= previous[i];
-      }
-    }
-    previous = restored.slice(current, current + frameBytes);
-  }
-  return restored;
-}
-
 async function framePayloadToImageData(header, payload) {
-  let rawPayload;
-  const isRgba = header.content_type === RAW_RGBA_DELTA_GZIP_CONTENT_TYPE;
   if (
     header.content_type === WEBP_FRAME_CONTENT_TYPE ||
     header.content_type === JPEG_FRAME_CONTENT_TYPE
   ) {
     return encodedImageToImageData(header, payload);
   } else if (header.content_type === RAW_RGB_CONTENT_TYPE) {
-    rawPayload = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
-  } else if (header.content_type === RAW_RGB_DELTA_GZIP_CONTENT_TYPE) {
-    rawPayload = await restoreDeltaGzipRawRgb(header, payload);
-  } else if (isRgba) {
-    rawPayload = await restoreDeltaGzipRawRgb(header, payload);
-  } else {
-    throw new Error(`Unsupported content type ${header.content_type}`);
+    const rawPayload = payload instanceof Uint8Array ? payload : new Uint8Array(payload);
+    return rgbToImageData(header, rawPayload);
   }
-  const frameBytes = Number(header.bytes_per_frame);
-  const frameCount = Number(header.num_frames);
-  if (frameCount > 0) {
-    const offset = (frameCount - 1) * frameBytes;
-    lastRawRgbFrame = rawPayload.slice(offset, offset + frameBytes);
-  }
-  if (isRgba) {
-    return rgbaToImageData(header, rawPayload);
-  }
-  return rgbToImageData(header, rawPayload);
+  throw new Error(`Unsupported content type ${header.content_type}`);
 }
 
 function isEncodedPreviewContentType(contentType) {
@@ -1344,7 +1265,6 @@ function abortCurrentSession(reason = "session closed by client", {
   controlStateController?.reset({ sendRelease: false });
   pendingHeader = null;
   rejectPendingDecodes("session aborted");
-  resetDecoderState();
   if (clearFrames) {
     clearFrameQueue();
     updateStats();
@@ -1881,7 +1801,6 @@ function selectedTransportLabel() {
 function shortPayloadMode(contentType) {
   if (contentType === WEBP_FRAME_CONTENT_TYPE) return "webp";
   if (contentType === JPEG_FRAME_CONTENT_TYPE) return "jpeg";
-  if (contentType === RAW_RGB_DELTA_GZIP_CONTENT_TYPE) return "delta-gzip";
   if (contentType === RAW_RGB_CONTENT_TYPE) return "raw RGB";
   return contentType;
 }

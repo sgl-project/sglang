@@ -38,9 +38,14 @@ This guide explains the parallelism configuration fields used in SGLang model co
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Expert Parallelism - distributes MoE experts</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`attn_dp_size`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`--attn-dp-size`, `--attention-data-parallel-size`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Attention Data Parallelism - data-parallel attention groups inside the TP group, TP for FFN (hybrid)</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`enable_dp_attention`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`--enable-dp-attention`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>DP for attention, TP for FFN (hybrid)</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><strong>Deprecated.</strong> Use <code>--attn-dp-size &lt;dp-size&gt;</code> instead of <code>--dp-size &lt;dp-size&gt; --enable-dp-attention</code>.</td>
     </tr>
   </tbody>
 </table>

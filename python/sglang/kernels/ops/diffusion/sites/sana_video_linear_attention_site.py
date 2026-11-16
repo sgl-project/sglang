@@ -6,37 +6,17 @@ requesting an FP32 output/accumulator from cuBLAS.  The second GEMM stays in
 FP32.  This removes two large dtype-conversion kernels and lets the first GEMM
 use BF16 Tensor Cores, at the cost of half-precision input rounding.
 
-The default ``quality="lossless"`` path remains the original FP32-input chain
+The default ``quality="exact"`` path remains the original FP32-input chain
 bit-for-bit.  Only the single-batch CUDA layout used by native SANA-Video is
 eligible; unsupported dtypes and layouts fall back to the reference path.
 """
 
 from __future__ import annotations
 
-import logging
-
 import torch
 import torch.nn as nn
 
 from sglang.kernels.ops.diffusion.sites.quality_gate import QualityGatedFusion
-
-logger = logging.getLogger(__name__)
-
-_FUSION = QualityGatedFusion(
-    name="SANA-Video BF16-input linear attention",
-    marker_attr="_sgl_sana_video_linear_attention_site",
-    enabled_attr="_sgl_sana_video_linear_attention_enabled",
-)
-
-
-def mark_sana_video_linear_attention_site(module: nn.Module) -> None:
-    """Mark a SANA-Video linear-attention module; it starts unmounted."""
-    _FUSION.mark(module)
-
-
-def sana_video_linear_attention_active(module: nn.Module) -> bool:
-    """Whether the request-scoped BF16-input path is mounted on ``module``."""
-    return _FUSION.is_enabled(module)
 
 
 def _site_reject_reason(_site: nn.Module) -> str | None:
@@ -45,12 +25,12 @@ def _site_reject_reason(_site: nn.Module) -> str | None:
     return None
 
 
-def mount_sana_video_linear_attention(root: nn.Module) -> bool:
-    return _FUSION.mount(root, reject_reason=_site_reject_reason, logger=logger)
-
-
-def unmount_sana_video_linear_attention(root: nn.Module) -> None:
-    _FUSION.unmount(root)
+SANA_VIDEO_LINEAR_ATTENTION = QualityGatedFusion(
+    name="SANA-Video BF16-input linear attention",
+    marker_attr="_sgl_sana_video_linear_attention_site",
+    enabled_attr="_sgl_sana_video_linear_attention_enabled",
+    reject_reason=_site_reject_reason,
+)
 
 
 def try_sana_video_linear_attention(
@@ -62,7 +42,7 @@ def try_sana_video_linear_attention(
 ) -> torch.Tensor | None:
     """Return the quality-gated attention result, or ``None`` to fall back."""
     if not (
-        _FUSION.is_enabled(site)
+        SANA_VIDEO_LINEAR_ATTENTION.is_enabled(site)
         and query_rotate.is_cuda
         and query_rotate.dtype == torch.bfloat16
         and key_rotate.dtype == query_rotate.dtype

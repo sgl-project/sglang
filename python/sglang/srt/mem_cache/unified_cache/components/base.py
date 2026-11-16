@@ -4,6 +4,7 @@ import dataclasses
 from abc import ABC, abstractmethod
 from collections import defaultdict
 from enum import Enum, IntFlag
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Callable, Optional, Sequence
 
 import torch
@@ -17,31 +18,84 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.hicache_storage import PoolTransfer, PoolTransferResult
-from sglang.srt.mem_cache.unified_cache.component_type import (  # noqa: F401
-    BASE_COMPONENT_TYPE,
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolName,
+    PoolTransfer,
+    PoolTransferResult,
+)
+from sglang.srt.mem_cache.unified_cache.component_type import (
     ComponentType,
+    tree_slot_ids,
 )
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
+    from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+    from sglang.srt.mem_cache.buffer_mode.storage_existence_cache import (
+        PoolBeliefPolicy,
+    )
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+    from sglang.srt.mem_cache.kv.plan import TreeSlot
+    from sglang.srt.mem_cache.pool_host.group import HostPoolGroup, PoolEntry
     from sglang.srt.mem_cache.unified_cache.cache_action import (
         CacheAction,
         ComponentAction,
     )
-    from sglang.srt.mem_cache.unified_cache.unified_tree_core import UnifiedTreeCore
-    from sglang.srt.mem_cache.unified_radix_cache import (
-        NodeId,
-        UnifiedRadixCache,
+    from sglang.srt.mem_cache.unified_cache.components.swa import SWAComponent
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+        UnifiedTreeCore,
         UnifiedTreeNode,
     )
+    from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
+    from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 
-
-_NUM_COMPONENT_TYPES = len(ComponentType)
 
 _LAST_ACCESS_TIME_COUNTER_FLOAT = float64(1.0)
-_COMPONENT_UUID_COUNTER = 1
+# Each component's lock uuids come from a range of their own; a further window
+# slot's range follows its id.
+_COMPONENT_UUID_RANGE_SIZE = 100_000_000_000_000
+_FIXED_UUID_RANGE_INDEX = {
+    ComponentType.SWA: 0,
+    ComponentType.FULL: 1,
+    ComponentType.MAMBA: 2,
+    ComponentType.C128: 3,
+}
+_COMPONENT_UUID_COUNTERS: dict[ComponentType, int] = {}
+
+
+def windows_stand_alone(tree_slots) -> bool:
+    """Whether a tree's window slots each keep their own values apart from the
+    token slot's. A tree keeping one window keeps it coupled to the token
+    slot: a window value is the token value's translation, a recovered window
+    may adopt the incoming token ids, and the window's early release also
+    drops the lower locks on its node. With several windows no window is
+    coupled, and every window follows the same rules."""
+    return sum(slot.family == "window" for slot in tree_slots) > 1
+
+
+def slot_width(tree_components: tuple[ComponentType, ...]) -> int:
+    """The length of a node's record list, which is indexed by component id:
+    an entry per fixed id, and per further id up to the tree's largest. Only
+    the tree's own components get a record of their own
+    (`node_component_records`); every other entry is `ABSENT_COMPONENT_DATA`."""
+    return max(ComponentType.C128, *tree_components) + 1
+
+
+def lru_pointer_slot(
+    component_type: ComponentType,
+    tree_components: tuple[ComponentType, ...],
+    use_host_ptr: bool = False,
+) -> int:
+    """A component's LRU pointer index on the nodes of its tree. The tree
+    numbers only its own components, in order, device lists first and host
+    lists after them, so a node keeps two pointers per component it holds."""
+    slot = tree_components.index(component_type)
+    return slot + len(tree_components) if use_host_ptr else slot
+
+
+def _uuid_range_start(component_type: ComponentType) -> int:
+    index = _FIXED_UUID_RANGE_INDEX.get(component_type, int(component_type))
+    return (index + 1) * _COMPONENT_UUID_RANGE_SIZE
 
 
 @dataclasses.dataclass
@@ -55,6 +109,46 @@ class ComponentData:
     session_ids: Optional[set[str]] = None
 
 
+class _AbsentComponentData(ComponentData):
+    """The record of a component id the tree does not hold. One instance is
+    shared by every node, so it reads as an empty record and refuses writes."""
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError(
+            f"cannot set {name!r}: the tree holds no component for this record"
+        )
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError(
+            f"cannot delete {name!r}: the tree holds no component for this record"
+        )
+
+
+def _absent_component_data() -> ComponentData:
+    record = object.__new__(_AbsentComponentData)
+    for name, value in vars(ComponentData()).items():
+        object.__setattr__(record, name, value)
+    object.__setattr__(record, "metadata", MappingProxyType({}))
+    return record
+
+
+ABSENT_COMPONENT_DATA: ComponentData = _absent_component_data()
+
+
+def node_component_records(
+    tree_components: tuple[ComponentType, ...],
+) -> list[ComponentData]:
+    """A new node's records, indexed by component id: a record of its own for
+    the token component and for each of the tree's components, the shared
+    absent record for every other id."""
+    records = [ABSENT_COMPONENT_DATA] * slot_width(tree_components)
+    records[ComponentType.FULL] = ComponentData()
+    for ct in tree_components:
+        if ct != ComponentType.FULL:
+            records[ct] = ComponentData()
+    return records
+
+
 class EvictLayer(IntFlag):
     """Which storage layer(s) to evict.  Combinable via bitwise OR."""
 
@@ -64,11 +158,44 @@ class EvictLayer(IntFlag):
 
 
 @dataclasses.dataclass(frozen=True)
+class InternalStateBackup:
+    """Pause eviction for a host backup before freeing internal device state."""
+
+    node_id: NodeId
+    # Host capacity required by the backup, in this component's pool units.
+    num_tokens: int
+
+
+@dataclasses.dataclass(frozen=True)
 class PrepareLoadBackResult:
     """Outcome of prepare_load_back; default = nothing to prepare."""
 
     # Freshly allocated device mamba slot, recovered on failure.
     allocated_mamba_slot: Optional[torch.Tensor] = None
+
+
+class BufferLoadBackContext:
+    """A component's part in one buffer-mode load-back; the default has none.
+
+    ``load_xfers`` are H2D destinations beyond the staged transfers. After
+    ``cc.load``, ``finalize_allocation`` commits or rolls back preparation;
+    on success, ``get_insert_fields()`` supplies the node data for insert.
+    ``get_redundant_device_slots()`` returns slots to free after the H2D ack.
+    """
+
+    load_xfers: tuple[PoolTransfer, ...] = ()
+
+    def finalize_allocation(self, success: bool) -> None:
+        """Commit or roll back after allocation; H2D may still be pending."""
+        pass
+
+    def get_insert_fields(self) -> dict[str, Any]:
+        return {}
+
+    def get_redundant_device_slots(
+        self, insert_result: InsertResult
+    ) -> list[tuple[PoolName, torch.Tensor]]:
+        return []
 
 
 @dataclasses.dataclass(frozen=True)
@@ -95,7 +222,6 @@ class LinkerTransferPhase(str, Enum):
 
 class ExternalLinkerLoadPhase(str, Enum):
     PREPARE = "prepare"
-    COMMIT = "commit"
     ABORT = "abort"
 
 
@@ -112,15 +238,27 @@ def get_and_increase_time_counter() -> float64:
     return ret
 
 
-def next_component_uuid() -> int:
-    global _COMPONENT_UUID_COUNTER
-    _COMPONENT_UUID_COUNTER += 1
-    return _COMPONENT_UUID_COUNTER
+def next_component_uuid(component_type: ComponentType) -> int:
+    uuid = (
+        _COMPONENT_UUID_COUNTERS.get(component_type)
+        or _uuid_range_start(component_type)
+    ) + 1
+    _COMPONENT_UUID_COUNTERS[component_type] = uuid
+    return uuid
 
 
 class TreeComponent(ABC):
-    def __init__(self, cache: UnifiedRadixCache, params: CacheInitParams):
+    # The slot family this class keeps (`kv.plan` TREE_*): what its values are
+    # rows of. None when it keeps none of the storage families.
+    family: Optional[str] = None
+
+    def __init__(
+        self, cache: UnifiedRadixCache, params: CacheInitParams, slot: TreeSlot
+    ):
         self.cache = cache
+        # The tree slot this component keeps: its id, family and numbers.
+        self.slot = slot
+        self.component_type = tree_slot_ids(params.tree_slots)[slot.component]
         # Populated when the component passed to TreeCore constructor.
         self.tree_core: Optional[UnifiedTreeCore] = None
         self.is_evict_device_ongoing = False
@@ -316,8 +454,20 @@ class TreeComponent(ABC):
         return cd.host_value is not None
 
     def value_len(self, node: UnifiedTreeNode) -> int:
+        """Length of the stored device indices, including entries without backing."""
         value = node.component_data[self.component_type].value
         return len(value) if value is not None else 0
+
+    def reclaimable_value_len(self, node: UnifiedTreeNode) -> int:
+        """Pool tokens the allocator gets back when this node's device value
+        is evicted. The evictable/protected ledgers count these (prefill
+        admission adds the evictable ledger to the allocator's free space, and
+        the eviction walk counts them toward its request), so they must be in
+        the allocator's units: the value length by default, less for a
+        component whose values are not backed one-to-one by pool rows. A
+        component whose per-node figure changes in place reports the delta
+        through ``UnifiedTreeCore.adjust_component_size``."""
+        return self.value_len(node)
 
     def has_host_value_only(self, node: UnifiedTreeNode) -> bool:
         """Whether this component's data is evicted from device but host-backed."""
@@ -464,6 +614,7 @@ class TreeComponent(ABC):
         node: UnifiedTreeNode,
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
         target: EvictLayer = EvictLayer.DEVICE,
     ) -> tuple[int, int]:
         """Free this component's KV resources on a node being evicted.
@@ -477,7 +628,8 @@ class TreeComponent(ABC):
                     No tombstone — caller will delete the node.
 
         Freed indices are collected into *device_frees*/*host_frees* for the
-        Controller to drain, never freed inline.
+        Controller to drain, never freed inline. Additional cache work is
+        appended to *cache_actions* in the same operation.
 
         Returns (device_freed, host_freed) token counts."""
         ...
@@ -522,16 +674,25 @@ class TreeComponent(ABC):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> Optional[NodeId]:
-        """Advance one eviction step and return a device leaf, if selected.
+        cache_actions: list[CacheAction | ComponentAction],
+    ) -> NodeId | InternalStateBackup | None:
+        """Return a device leaf, an internal backup request, or no selection.
 
         Implementations must return after one allocator-relevant internal
         mutation so the caller can drain pending frees before continuing.
+        Backup requests leave device state intact until the core resumes eviction.
         """
         assert self.is_evict_device_ongoing, (
             f"{self.component_type} device eviction not started"
         )
-        return self._evict_device_next_node(tracker, device_frees, host_frees)
+        return self._evict_device_next_node(
+            tracker, device_frees, host_frees, cache_actions=cache_actions
+        )
+
+    def collapses_leaves(self) -> bool:
+        """Whether this component's device eviction of a device leaf may evict the
+        whole leaf, Full included."""
+        return True
 
     def evict_device_end(self) -> None:
         """Clear this component's device-eviction walk state."""
@@ -552,8 +713,9 @@ class TreeComponent(ABC):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
-    ) -> Optional[NodeId]:
-        """Advance the walk by at most one allocator-relevant mutation."""
+        cache_actions: list[CacheAction | ComponentAction],
+    ) -> NodeId | InternalStateBackup | None:
+        """Select a leaf, request backup, or perform at most one internal mutation."""
         ...
 
     @abstractmethod
@@ -579,7 +741,7 @@ class TreeComponent(ABC):
           node itself (mamba state is per-leaf, not per-path).
 
         When ``lock_host`` is True, the lock applies to host-side state:
-        - Full: single-node host lock.
+        - Full: a one-node UUID-bounded segment that expands across splits.
         - SWA: host window-lock with a dedicated host UUID boundary.
         - Mamba: single-node host lock with host LRU detach."""
         ...
@@ -600,7 +762,8 @@ class TreeComponent(ABC):
         - Mamba: single-node unlock — only decrements lock_ref on the
           node itself.
 
-        When ``lock_host`` is True, the inverse host-side semantics apply."""
+        When ``lock_host`` is True, Full and SWA replay their host boundary
+        UUIDs while Mamba retains its single-node semantics."""
         ...
 
     def prepare_for_caching_req(
@@ -678,6 +841,69 @@ class TreeComponent(ABC):
         """Allocate prefetch staging sized by prepare_prefetch, once the hit is known."""
         return None
 
+    # ---- Buffer-mode backup hooks (hicache_host_memory_mode=buffer_only) ----
+    # Buffer mode writes a node pool by pool: keys per pool come from
+    # ``buffer_backup_keys`` or the BACKUP_HOST transfers, beliefs heal through
+    # ``buffer_belief_policy``; the pipeline pins the node from D2H launch to
+    # ack, so a component dropping rows asks ``buffer_backup_pending`` first.
+
+    def buffer_mode_host_pool_entries(
+        self, host_pool_group: HostPoolGroup
+    ) -> list[PoolEntry]:
+        """Extra host pool entries this component stages through (an entry
+        may alias the anchor's host pool)."""
+        return []
+
+    def buffer_backup_keys(
+        self, node: UnifiedTreeNode, hash_values: list[str]
+    ) -> dict[PoolName, list[str]]:
+        """Per-pool storage keys a backup of ``node`` writes for this component
+        (empty list: withhold the pool; empty dict: derive them from its
+        BACKUP_HOST transfers). A component naming any pool names all of them."""
+        return {}
+
+    def buffer_backup_parent_covered(
+        self, parent_node_id: NodeId, node_id: NodeId
+    ) -> bool:
+        """Whether this component covers the parent of ``node_id`` without
+        the parent's KV pages in storage (no prefix hole for a reader)."""
+        return False
+
+    def buffer_belief_policy(self, pool: PoolName) -> Optional[PoolBeliefPolicy]:
+        """The policy healing ``pool``'s existence beliefs, for a pool this
+        component owns; None picks the built-in one for the transfer's hit
+        policy."""
+        return None
+
+    def create_buffer_pipeline(
+        self,
+        *,
+        swa_component: Optional[SWAComponent],
+        write_backlog_cap: int,
+        max_context_len: int = 0,
+        further_window_components: Sequence[SWAComponent] = (),
+    ) -> BufferModePipeline:
+        """Called on the FULL component to construct the buffer-mode pipeline."""
+        from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+
+        return BufferModePipeline(
+            cache=self.cache,
+            swa_component=swa_component,
+            further_window_components=further_window_components,
+            write_backlog_cap=write_backlog_cap,
+            max_context_len=max_context_len,
+        )
+
+    def prepare_buffer_load_back(
+        self, req: Req, staged: list[PoolTransfer]
+    ) -> Optional[BufferLoadBackContext]:
+        """Validate staged data and prepare this component's load-back context.
+
+        Return None on insufficient device capacity. Invalid staged data is
+        an invariant violation, not a capacity failure.
+        """
+        return BufferLoadBackContext()
+
     def build_hicache_transfers(
         self,
         node: UnifiedTreeNode,
@@ -713,12 +939,21 @@ class TreeComponent(ABC):
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
         host_frees: dict[ComponentType, list[torch.Tensor]],
+        cache_actions: list[CacheAction | ComponentAction],
     ) -> None:
         """Evict from this component's host-side resources, collecting freed
         values into *device_frees*/*host_frees* for the Controller to drain.
         Called by HostPoolGroup when the host pool is full.
         Default no-op for components without host storage."""
         pass
+
+    def storage_and_sub_pool(self):
+        """The storage this component's values are rows of, and the sub-pool
+        among them it holds."""
+        storage = self.cache.kv_storage()
+        return storage, storage.tree_sub_pool(
+            self.component_type.name, family=self.family
+        )
 
     def apply_component_action(self, action: ComponentAction) -> None:
         """Apply a component-routed cache action; dispatched by the cache."""
@@ -750,9 +985,6 @@ class TreeComponent(ABC):
         full_transfer: PoolTransfer,
         transfer: PoolTransfer,
         prefix_len: int,
-        *,
-        insert_result: Optional[InsertResult] = None,
-        canonical_full: Optional[torch.Tensor] = None,
     ) -> Optional[PoolTransfer]:
-        """Prepare, commit, or abort this component's direct load."""
+        """Prepare or abort this component's direct load into ``req``'s slots."""
         return transfer

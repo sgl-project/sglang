@@ -52,12 +52,12 @@ dsr1-fp4-gb200-dynamo-sglang:
 # strategy.matrix.config, fail-fast: false). Each runs a GSM8K accuracy
 # hard-gate before the perf sweep.
 #
-# model_path points at the shared NFS HuggingFace cache dir (models--org--name);
-# the launcher resolves the live snapshot via refs/main, so no hash is hardcoded.
+# `model` is the HF repo id of the checkpoint that is actually loaded. The
+# launcher finds it in the node-local HF cache ($HF_CACHE, set in the workflow)
+# and resolves the snapshot via refs/main, so no path or hash is hardcoded.
 dsv4flash-fp8-mi355x-sglang:
   model: sgl-project/DeepSeek-V4-Flash-FP8
   model-prefix: dsv4flash
-  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Flash-FP8
   runner: mi355x
   precision: fp8
   framework: sglang
@@ -73,7 +73,6 @@ dsv4flash-fp8-mi355x-sglang:
 dsv4pro-fp8-mi355x-sglang:
   model: sgl-project/DeepSeek-V4-Pro-FP8
   model-prefix: dsv4pro
-  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Pro-FP8
   runner: mi355x
   precision: fp8
   framework: sglang
@@ -89,7 +88,6 @@ dsv4pro-fp8-mi355x-sglang:
 dsv4flash-fp4-mi355x-sglang:
   model: deepseek-ai/DeepSeek-V4-Flash
   model-prefix: dsv4flash
-  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash
   runner: mi355x
   precision: fp4
   framework: sglang
@@ -105,7 +103,6 @@ dsv4flash-fp4-mi355x-sglang:
 dsv4pro-fp4-mi355x-sglang:
   model: deepseek-ai/DeepSeek-V4-Pro
   model-prefix: dsv4pro
-  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Pro
   runner: mi355x
   precision: fp4
   framework: sglang
@@ -125,12 +122,11 @@ dsv4pro-fp4-mi355x-sglang:
 #   * -dp8ep8     : DP-attention 8 + narrow within-node EP8
 #   * -dp8ep8-mtp : DP8 + narrow EP8 + EAGLE MTP
 # launch_mi355x.sh reads expert-/data-parallel-size and the `mtp:` section to
-# append --ep-size / --enable-dp-attention --dp-size / --speculative-* flags.
+# append --ep-size / --attn-dp-size / --speculative-* flags.
 
 dsv4flash-fp8-mi355x-mtp-sglang:
   model: sgl-project/DeepSeek-V4-Flash-FP8
   model-prefix: dsv4flash
-  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Flash-FP8
   runner: mi355x
   precision: fp8
   framework: sglang
@@ -146,7 +142,6 @@ dsv4flash-fp8-mi355x-mtp-sglang:
 dsv4flash-fp8-mi355x-dp8ep8-sglang:
   model: sgl-project/DeepSeek-V4-Flash-FP8
   model-prefix: dsv4flash
-  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Flash-FP8
   runner: mi355x
   precision: fp8
   framework: sglang
@@ -162,7 +157,6 @@ dsv4flash-fp8-mi355x-dp8ep8-sglang:
 dsv4flash-fp8-mi355x-dp8ep8-mtp-sglang:
   model: sgl-project/DeepSeek-V4-Flash-FP8
   model-prefix: dsv4flash
-  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Flash-FP8
   runner: mi355x
   precision: fp8
   framework: sglang
@@ -178,7 +172,6 @@ dsv4flash-fp8-mi355x-dp8ep8-mtp-sglang:
 dsv4pro-fp8-mi355x-mtp-sglang:
   model: sgl-project/DeepSeek-V4-Pro-FP8
   model-prefix: dsv4pro
-  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Pro-FP8
   runner: mi355x
   precision: fp8
   framework: sglang
@@ -196,7 +189,6 @@ dsv4pro-fp8-mi355x-mtp-sglang:
 dsv4pro-fp8-mi355x-dp8ep8-sglang:
   model: sgl-project/DeepSeek-V4-Pro-FP8
   model-prefix: dsv4pro
-  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Pro-FP8
   runner: mi355x
   precision: fp8
   framework: sglang
@@ -212,7 +204,6 @@ dsv4pro-fp8-mi355x-dp8ep8-sglang:
 dsv4pro-fp8-mi355x-dp8ep8-mtp-sglang:
   model: sgl-project/DeepSeek-V4-Pro-FP8
   model-prefix: dsv4pro
-  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Pro-FP8
   runner: mi355x
   precision: fp8
   framework: sglang
@@ -228,7 +219,6 @@ dsv4pro-fp8-mi355x-dp8ep8-mtp-sglang:
 dsv4flash-fp4-mi355x-mtp-sglang:
   model: deepseek-ai/DeepSeek-V4-Flash
   model-prefix: dsv4flash
-  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash
   runner: mi355x
   precision: fp4
   framework: sglang
@@ -244,7 +234,6 @@ dsv4flash-fp4-mi355x-mtp-sglang:
 dsv4flash-fp4-mi355x-dp8ep8-sglang:
   model: deepseek-ai/DeepSeek-V4-Flash
   model-prefix: dsv4flash
-  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash
   runner: mi355x
   precision: fp4
   framework: sglang
@@ -260,7 +249,6 @@ dsv4flash-fp4-mi355x-dp8ep8-sglang:
 dsv4flash-fp4-mi355x-dp8ep8-mtp-sglang:
   model: deepseek-ai/DeepSeek-V4-Flash
   model-prefix: dsv4flash
-  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash
   runner: mi355x
   precision: fp4
   framework: sglang
@@ -276,7 +264,6 @@ dsv4flash-fp4-mi355x-dp8ep8-mtp-sglang:
 dsv4pro-fp4-mi355x-mtp-sglang:
   model: deepseek-ai/DeepSeek-V4-Pro
   model-prefix: dsv4pro
-  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Pro
   runner: mi355x
   precision: fp4
   framework: sglang
@@ -292,7 +279,6 @@ dsv4pro-fp4-mi355x-mtp-sglang:
 dsv4pro-fp4-mi355x-dp8ep8-sglang:
   model: deepseek-ai/DeepSeek-V4-Pro
   model-prefix: dsv4pro
-  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Pro
   runner: mi355x
   precision: fp4
   framework: sglang
@@ -308,7 +294,6 @@ dsv4pro-fp4-mi355x-dp8ep8-sglang:
 dsv4pro-fp4-mi355x-dp8ep8-mtp-sglang:
   model: deepseek-ai/DeepSeek-V4-Pro
   model-prefix: dsv4pro
-  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Pro
   runner: mi355x
   precision: fp4
   framework: sglang
@@ -324,11 +309,10 @@ dsv4pro-fp4-mi355x-dp8ep8-mtp-sglang:
 # Kimi-K2.6 (FP8) 2-node 1P1D. Demonstrates the launcher is model-agnostic: all
 # Kimi-specific config lives in the recipe's `model:` block + split attention
 # runtime, with nothing hardcoded in launch_mi355x.sh. Base + EAGLE3 MTP (the
-# MTP leg uses an external draft checkpoint via mtp.draft_model_path).
+# MTP leg uses an external draft checkpoint via mtp.draft_model).
 kimik26-fp8-mi355x-sglang:
   model: moonshotai/Kimi-K2.6
   model-prefix: kimik26
-  model_path: /it-share/model_coverage/models--moonshotai--Kimi-K2.6
   runner: mi355x
   precision: fp8
   framework: sglang
@@ -344,7 +328,6 @@ kimik26-fp8-mi355x-sglang:
 kimik26-fp8-mi355x-mtp-sglang:
   model: moonshotai/Kimi-K2.6
   model-prefix: kimik26
-  model_path: /it-share/model_coverage/models--moonshotai--Kimi-K2.6
   runner: mi355x
   precision: fp8
   framework: sglang
@@ -371,7 +354,6 @@ kimik26-fp8-mi355x-mtp-sglang:
 dsv4flash-fp8-mi355x-ep16-sglang:
   model: sgl-project/DeepSeek-V4-Flash-FP8
   model-prefix: dsv4flash
-  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Flash-FP8
   runner: mi355x
   precision: fp8
   framework: sglang
@@ -387,7 +369,6 @@ dsv4flash-fp8-mi355x-ep16-sglang:
 dsv4flash-fp8-mi355x-ep16-mtp-sglang:
   model: sgl-project/DeepSeek-V4-Flash-FP8
   model-prefix: dsv4flash
-  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Flash-FP8
   runner: mi355x
   precision: fp8
   framework: sglang
@@ -403,7 +384,6 @@ dsv4flash-fp8-mi355x-ep16-mtp-sglang:
 dsv4pro-fp8-mi355x-ep16-sglang:
   model: sgl-project/DeepSeek-V4-Pro-FP8
   model-prefix: dsv4pro
-  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Pro-FP8
   runner: mi355x
   precision: fp8
   framework: sglang
@@ -419,7 +399,6 @@ dsv4pro-fp8-mi355x-ep16-sglang:
 dsv4pro-fp8-mi355x-ep16-mtp-sglang:
   model: sgl-project/DeepSeek-V4-Pro-FP8
   model-prefix: dsv4pro
-  model_path: /it-share/model_coverage/models--sgl-project--DeepSeek-V4-Pro-FP8
   runner: mi355x
   precision: fp8
   framework: sglang
@@ -437,7 +416,6 @@ dsv4pro-fp8-mi355x-ep16-mtp-sglang:
 dsv4flash-fp4-mi355x-ep16-sglang:
   model: deepseek-ai/DeepSeek-V4-Flash
   model-prefix: dsv4flash
-  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash
   runner: mi355x
   precision: fp4
   framework: sglang
@@ -453,7 +431,6 @@ dsv4flash-fp4-mi355x-ep16-sglang:
 dsv4flash-fp4-mi355x-ep16-mtp-sglang:
   model: deepseek-ai/DeepSeek-V4-Flash
   model-prefix: dsv4flash
-  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Flash
   runner: mi355x
   precision: fp4
   framework: sglang
@@ -469,7 +446,6 @@ dsv4flash-fp4-mi355x-ep16-mtp-sglang:
 dsv4pro-fp4-mi355x-ep16-sglang:
   model: deepseek-ai/DeepSeek-V4-Pro
   model-prefix: dsv4pro
-  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Pro
   runner: mi355x
   precision: fp4
   framework: sglang
@@ -485,7 +461,6 @@ dsv4pro-fp4-mi355x-ep16-sglang:
 dsv4pro-fp4-mi355x-ep16-mtp-sglang:
   model: deepseek-ai/DeepSeek-V4-Pro
   model-prefix: dsv4pro
-  model_path: /it-share/model_coverage/models--deepseek-ai--DeepSeek-V4-Pro
   runner: mi355x
   precision: fp4
   framework: sglang
@@ -504,7 +479,6 @@ dsv4pro-fp4-mi355x-ep16-mtp-sglang:
 kimik26-mxfp4-mi355x-ep16-sglang:
   model: amd/Kimi-K2.6-MXFP4
   model-prefix: kimik26
-  model_path: /it-share/model_coverage/models--amd--Kimi-K2.6-MXFP4
   runner: mi355x
   precision: mxfp4
   framework: sglang
@@ -520,7 +494,6 @@ kimik26-mxfp4-mi355x-ep16-sglang:
 kimik26-mxfp4-mi355x-ep16-mtp-sglang:
   model: amd/Kimi-K2.6-MXFP4
   model-prefix: kimik26
-  model_path: /it-share/model_coverage/models--amd--Kimi-K2.6-MXFP4
   runner: mi355x
   precision: mxfp4
   framework: sglang
@@ -533,18 +506,16 @@ kimik26-mxfp4-mi355x-ep16-mtp-sglang:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
           config_file: scripts/ci/slurm/recipes/mi355x-fp8/kimik26/1k1k/2p1d-ep16-mtp-mxfp4.yaml
 
-# AMD MI355X 2-node 1P1D disaggregation for GLM-5.2 (MXFP4) over MORI. GLM uses
+# AMD MI355X 2-node 1P1D disaggregation for GLM-5.1 (MXFP4) over MORI. GLM uses
 # GlmMoeDsaForCausalLM (DeepSeek Sparse Attention, auto-selected) with a built-in
 # NextN MTP head. Four variants mirroring the DeepSeek-V4 basic tier:
 #   * (base)      : TP8, no MTP
 #   * -mtp        : TP8 + NextN MTP
 #   * -dp8ep8     : DP-attention 8 + narrow within-node EP8
 #   * -dp8ep8-mtp : DP8 + narrow EP8 + NextN MTP
-# NOTE: checkpoint on disk is amd/GLM-5.1-MXFP4 (only GLM MXFP4 build mirrored).
-glm52-fp4-mi355x-sglang:
-  model: amd/GLM-5.2-MXFP4
-  model-prefix: glm52
-  model_path: /it-share/model_coverage/models--amd--GLM-5.1-MXFP4
+glm51-fp4-mi355x-sglang:
+  model: amd/GLM-5.1-MXFP4
+  model-prefix: glm51
   runner: mi355x
   precision: fp4
   framework: sglang
@@ -555,12 +526,11 @@ glm52-fp4-mi355x-sglang:
       osl: 1024
       search-space:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
-          config_file: scripts/ci/slurm/recipes/mi355x-fp4/glm52/1k1k/1p1d.yaml
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/glm51/1k1k/1p1d.yaml
 
-glm52-fp4-mi355x-mtp-sglang:
-  model: amd/GLM-5.2-MXFP4
-  model-prefix: glm52
-  model_path: /it-share/model_coverage/models--amd--GLM-5.1-MXFP4
+glm51-fp4-mi355x-mtp-sglang:
+  model: amd/GLM-5.1-MXFP4
+  model-prefix: glm51
   runner: mi355x
   precision: fp4
   framework: sglang
@@ -571,12 +541,11 @@ glm52-fp4-mi355x-mtp-sglang:
       osl: 1024
       search-space:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
-          config_file: scripts/ci/slurm/recipes/mi355x-fp4/glm52/1k1k/1p1d-mtp.yaml
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/glm51/1k1k/1p1d-mtp.yaml
 
-glm52-fp4-mi355x-dp8ep8-sglang:
-  model: amd/GLM-5.2-MXFP4
-  model-prefix: glm52
-  model_path: /it-share/model_coverage/models--amd--GLM-5.1-MXFP4
+glm51-fp4-mi355x-dp8ep8-sglang:
+  model: amd/GLM-5.1-MXFP4
+  model-prefix: glm51
   runner: mi355x
   precision: fp4
   framework: sglang
@@ -587,12 +556,11 @@ glm52-fp4-mi355x-dp8ep8-sglang:
       osl: 1024
       search-space:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
-          config_file: scripts/ci/slurm/recipes/mi355x-fp4/glm52/1k1k/1p1d-dp8ep8.yaml
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/glm51/1k1k/1p1d-dp8ep8.yaml
 
-glm52-fp4-mi355x-dp8ep8-mtp-sglang:
-  model: amd/GLM-5.2-MXFP4
-  model-prefix: glm52
-  model_path: /it-share/model_coverage/models--amd--GLM-5.1-MXFP4
+glm51-fp4-mi355x-dp8ep8-mtp-sglang:
+  model: amd/GLM-5.1-MXFP4
+  model-prefix: glm51
   runner: mi355x
   precision: fp4
   framework: sglang
@@ -603,12 +571,11 @@ glm52-fp4-mi355x-dp8ep8-mtp-sglang:
       osl: 1024
       search-space:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
-          config_file: scripts/ci/slurm/recipes/mi355x-fp4/glm52/1k1k/1p1d-dp8ep8-mtp.yaml
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/glm51/1k1k/1p1d-dp8ep8-mtp.yaml
 
-glm52-fp4-mi355x-ep16-sglang:
-  model: amd/GLM-5.2-MXFP4
-  model-prefix: glm52
-  model_path: /it-share/model_coverage/models--amd--GLM-5.1-MXFP4
+glm51-fp4-mi355x-ep16-sglang:
+  model: amd/GLM-5.1-MXFP4
+  model-prefix: glm51
   runner: mi355x
   precision: fp4
   framework: sglang
@@ -619,12 +586,11 @@ glm52-fp4-mi355x-ep16-sglang:
       osl: 1024
       search-space:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
-          config_file: scripts/ci/slurm/recipes/mi355x-fp4/glm52/1k1k/2p1d-ep16.yaml
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/glm51/1k1k/2p1d-ep16.yaml
 
-glm52-fp4-mi355x-ep16-mtp-sglang:
-  model: amd/GLM-5.2-MXFP4
-  model-prefix: glm52
-  model_path: /it-share/model_coverage/models--amd--GLM-5.1-MXFP4
+glm51-fp4-mi355x-ep16-mtp-sglang:
+  model: amd/GLM-5.1-MXFP4
+  model-prefix: glm51
   runner: mi355x
   precision: fp4
   framework: sglang
@@ -635,4 +601,19 @@ glm52-fp4-mi355x-ep16-mtp-sglang:
       osl: 1024
       search-space:
         - conc-list: [1, 8, 16, 32, 64, 128, 256]
-          config_file: scripts/ci/slurm/recipes/mi355x-fp4/glm52/1k1k/2p1d-ep16-mtp.yaml
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/glm51/1k1k/2p1d-ep16-mtp.yaml
+
+dsv4flash-fp4-mi355x-mooncake-sglang:
+  model: deepseek-ai/DeepSeek-V4-Flash
+  model-prefix: dsv4flash
+  runner: mi355x
+  precision: fp4
+  framework: sglang
+  multinode: true
+  disagg: true
+  seq-len-configs:
+    - isl: 1024
+      osl: 1024
+      search-space:
+        - conc-list: [1, 8, 16, 32, 64, 128, 256]
+          config_file: scripts/ci/slurm/recipes/mi355x-fp4/dsv4flash/1k1k/1p1d-mooncake.yaml

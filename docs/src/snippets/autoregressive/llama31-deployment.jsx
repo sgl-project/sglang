@@ -235,7 +235,6 @@ export const Llama31Deployment = () => {
     // NVIDIA-specific optimizations
     if (!isAMD && !isXeon && hardware !== 'arc_b') {
       if (optimization === 'throughput') {
-        args.push(`--enable-dp-attention`);
         args.push(`--mem-fraction-static 0.85`);
       } else if (optimization === 'latency') {
         args.push(`--speculative-algorithm EAGLE3`);

@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -14,14 +14,18 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.io_struct import (  # noqa: E402
+    ReleaseMemoryOccupationReqInput,
+    ReleaseMemoryOccupationReqOutput,
+)
 from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
     SchedulerRequestReceiver,
 )
 from sglang.srt.managers.scheduler_pp_mixin import (  # noqa: E402
+    PPBatchMetadata,
     SchedulerPPMixin,
-    _pp_exchange_outputs_before_forward,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.runtime_context import get_parallel  # noqa: E402
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
@@ -36,9 +40,8 @@ def _published_topology():
         ranks={"world_rank": 12, "dp_rank": 1},
         tp_size=8,
         pp_size=2,
-        dp_size=2,
+        attn_dp_size=2,
         attn_cp_size=2,
-        enable_dp_attention=True,
     )
 
 
@@ -47,31 +50,20 @@ def _fake_group() -> SimpleNamespace:
 
 
 def _make_receiver() -> SchedulerRequestReceiver:
-    tp_group = _fake_group()
-    attn_tp_group = _fake_group()
-    attn_cp_group = _fake_group()
-    world_group = _fake_group()
     return SchedulerRequestReceiver(
         recv_from_tokenizer=None,
         recv_from_rpc=None,
         recv_skipper=None,
         input_blocker=None,
         mm_receiver=None,
-        tp_group=tp_group,
-        tp_cpu_group=tp_group,
-        attn_tp_group=attn_tp_group,
-        attn_tp_cpu_group=attn_tp_group,
-        attn_cp_group=attn_cp_group,
-        attn_cp_cpu_group=attn_cp_group,
-        world_group=world_group,
         server_args=SimpleNamespace(
-            enable_dp_attention=True,
             enable_dp_attention_local_control_broadcast=False,
         ),
         model_config=SimpleNamespace(is_multimodal=False),
         max_recv_per_poll=-1,
-        stream_output=lambda *args, **kwargs: None,
+        request_retirer=None,
         get_last_batch=lambda: None,
+        rust_server_mode=False,
     )
 
 
@@ -83,7 +75,7 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
         receiver = _make_receiver()
         control_req = SimpleNamespace(kind="control")
         parallel = SimpleNamespace(
-            enable_dp_attention=True,
+            attn_dp_enabled=True,
             enable_dp_attention_local_control_broadcast=True,
             attn_tp_rank=0,
             attn_cp_rank=0,
@@ -117,13 +109,14 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
         receiver = _make_receiver()
         control_req = SimpleNamespace(kind="control")
         parallel = SimpleNamespace(
-            enable_dp_attention=True,
+            attn_dp_enabled=True,
             enable_dp_attention_local_control_broadcast=False,
             attn_tp_rank=0,
             attn_cp_rank=0,
             attn_tp_size=1,
             attn_cp_size=1,
             tp_size=32,
+            tp_group=_fake_group(),
         )
 
         with (
@@ -154,15 +147,16 @@ class TestRequestReceiverBroadcast(unittest.TestCase):
         self.assertEqual(result, [control_req])
         broadcast.assert_called_once_with(
             [control_req],
-            receiver.tp_group.rank,
-            receiver.tp_cpu_group,
-            src=receiver.tp_group.ranks[0],
+            parallel.tp_group.rank,
+            parallel.tp_group.cpu_group,
+            src=parallel.tp_group.ranks[0],
         )
 
 
 class TestPPCPRankOffsets(unittest.TestCase):
     def test_request_receiver_uses_cp_size_for_pp_recv_rank(self):
         enter_scope(self, _published_topology())
+        enter_scope(self, get_parallel().override(world_group=_fake_group()))
         calls = []
 
         def fake_point_to_point_pyobj(data, rank, group, src, dst, **kwargs):
@@ -251,6 +245,7 @@ class TestDSparkPPOutput(CustomTestCase):
                     bonus_tokens=tokens, new_seq_lens=batch.seq_lens
                 ),
                 logits_output=None,
+                routed_experts_output=None,
             ),
             batch,
         )
@@ -258,7 +253,7 @@ class TestDSparkPPOutput(CustomTestCase):
         result = SchedulerPPMixin._pp_prep_batch_result(
             scheduler,
             batch,
-            SimpleNamespace(can_run_cuda_graph=False),
+            PPBatchMetadata(can_run_cuda_graph=False),
             PPProxyTensors(wire),
         )
         self.assertIsInstance(result.next_draft_input, DFlashDraftInputV2)
@@ -269,19 +264,76 @@ class TestDSparkPPOutput(CustomTestCase):
         self.assertEqual(payloads[0].hidden_states.numel(), 0)
 
 
-class TestPPSpecExchangeOrder(unittest.TestCase):
-    def test_extend_launches_before_the_relay_exchange(self):
-        kwargs = dict(spec_relay=True, is_last_rank=False, async_batch_depth=0)
-        extend = SimpleNamespace(
-            forward_mode=ForwardMode.EXTEND, is_extend_in_batch=False
+class TestReleaseVerdictRing(CustomTestCase):
+    REQUEST = ReleaseMemoryOccupationReqInput()
+    RELEASED = ReleaseMemoryOccupationReqOutput(success=True, message="Success")
+    REFUSED = ReleaseMemoryOccupationReqOutput(success=False, message="busy")
+
+    def _stage(self, *, is_first_rank, is_last_rank=False, from_prev_stage=None):
+        return SimpleNamespace(
+            pp_group=SimpleNamespace(
+                is_first_rank=is_first_rank, is_last_rank=is_last_rank
+            ),
+            _pp_release_reqs_awaiting_verdict=(),
+            _pp_release_verdict_send_work=[],
+            _pp_commit_comm_work=Mock(),
+            _pp_send_pyobj_to_next_stage=Mock(return_value=["send"]),
+            _pp_recv_pyobj_from_prev_stage=Mock(return_value=from_prev_stage),
+            send_control_output=Mock(),
         )
-        decode = SimpleNamespace(
-            forward_mode=ForwardMode.DECODE, is_extend_in_batch=False
+
+    def test_the_first_stage_answers_with_the_verdict_that_came_round(self):
+        """Answering at dispatch tells the caller memory is free while later stages hold it."""
+        stage = self._stage(is_first_rank=True, from_prev_stage=[self.REFUSED])
+
+        SchedulerPPMixin._pp_pass_release_verdict(stage, self.RELEASED, self.REQUEST)
+        stage.send_control_output.assert_not_called()
+
+        SchedulerPPMixin._pp_answer_release_requests(stage)
+        stage.send_control_output.assert_called_once_with(self.REFUSED, self.REQUEST)
+
+    def test_a_busy_first_stage_answers_without_waiting_for_later_stages(self):
+        """Later stages need the first stage's next iterations to reach the request."""
+        stage = self._stage(is_first_rank=True)
+
+        SchedulerPPMixin._pp_pass_release_verdict(stage, self.REFUSED, self.REQUEST)
+
+        stage.send_control_output.assert_called_once_with(self.REFUSED, self.REQUEST)
+        self.assertEqual(stage._pp_release_reqs_awaiting_verdict, ())
+
+    def test_a_later_stage_passes_on_an_earlier_refusal(self):
+        stage = self._stage(is_first_rank=False, from_prev_stage=[True, self.REFUSED])
+
+        SchedulerPPMixin._pp_pass_release_verdict(stage, self.RELEASED, self.REQUEST)
+
+        (sent,), _ = stage._pp_send_pyobj_to_next_stage.call_args
+        self.assertEqual(sent, [True, self.REFUSED])
+
+    def test_verdict_sends_wait_until_the_requests_are_relayed(self):
+        """The next stage receives a verdict only after the request list, so waiting
+        on a send between two requests of one poll never returns."""
+        stage = self._stage(is_first_rank=True)
+
+        for _ in range(2):
+            SchedulerPPMixin._pp_pass_release_verdict(
+                stage, self.RELEASED, self.REQUEST
+            )
+        stage._pp_commit_comm_work.assert_not_called()
+
+        relayed = SchedulerPPMixin._pp_send_reqs_to_next_stage(stage, [])
+        self.assertEqual(relayed, ["send", "send", "send"])
+        self.assertEqual(stage._pp_release_verdict_send_work, [])
+
+    def test_the_last_stage_replies_only_to_a_first_stage_that_waits(self):
+        stage = self._stage(
+            is_first_rank=False,
+            is_last_rank=True,
+            from_prev_stage=[False, self.REFUSED],
         )
-        self.assertFalse(
-            _pp_exchange_outputs_before_forward(cur_batch=extend, **kwargs)
-        )
-        self.assertTrue(_pp_exchange_outputs_before_forward(cur_batch=decode, **kwargs))
+
+        SchedulerPPMixin._pp_pass_release_verdict(stage, self.RELEASED, self.REQUEST)
+
+        stage._pp_send_pyobj_to_next_stage.assert_not_called()
 
 
 if __name__ == "__main__":

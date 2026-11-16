@@ -1,6 +1,6 @@
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=606, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=745, stage="nightly", runner_config="4-gpu-b200")
 
 import time
 import unittest
@@ -14,9 +14,11 @@ from sglang.srt.constants import (
 )
 from sglang.srt.utils import kill_process_tree
 from sglang.test.test_utils import (
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    admin_post,
     popen_launch_server,
 )
 
@@ -59,6 +61,7 @@ class UpdateWeightsFromDiskBase:
             *backend_test_suite.get("other_args", ()),
             "--enable-memory-saver",
             "--cuda-graph-backend-prefill=disabled",
+            *ADMIN_LAUNCH_ARGS_FOR_TEST,
         )
         return popen_launch_server(
             self.model,
@@ -77,7 +80,7 @@ class UpdateWeightsFromDiskBase:
         return response.json()
 
     def _post_json(self, endpoint, payload, timeout=None):
-        response = requests.post(
+        response = admin_post(
             f"{self.base_url}{endpoint}",
             json=payload,
             timeout=timeout or self.request_timeout,
@@ -207,9 +210,8 @@ class TestServerUpdateWeightsFromDiskMXFP8(UpdateWeightsFromDiskBase, CustomTest
             "other_args": (
                 "--tp-size",
                 "4",
-                "--dp-size",
+                "--attn-dp-size",
                 "4",
-                "--enable-dp-attention",
                 "--fp8-gemm-backend",
                 "flashinfer_trtllm",
                 "--moe-runner-backend",
@@ -286,9 +288,8 @@ class TestServerUpdateWeightsFromDiskNVFP4W4A16CuteDSL(
             "other_args": (
                 "--tp-size",
                 "4",
-                "--dp-size",
+                "--attn-dp-size",
                 "4",
-                "--enable-dp-attention",
                 "--ep-size",
                 "4",
                 "--fp4-gemm-backend",
@@ -296,6 +297,39 @@ class TestServerUpdateWeightsFromDiskNVFP4W4A16CuteDSL(
                 "--moe-runner-backend",
                 "flashinfer_cutedsl",
                 "--enable-deterministic-inference",
+            ),
+        },
+    )
+
+
+class TestServerUpdateWeightsFromDiskNVFP4W4A16MegaMoE(
+    UpdateWeightsFromDiskBase, CustomTestCase
+):
+    model = "nvidia/Qwen3-30B-A3B-NVFP4"
+    decode_payload = {**UpdateWeightsFromDiskBase.decode_payload, "routed_dp_rank": 0}
+    launch_env = {
+        "SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16": "1",
+        "SGLANG_FLASHINFER_MEGAMOE_IN_KERNEL_FC2_REDUCE": "0",
+        "SGLANG_FLASHINFER_NVFP4_PER_TOKEN_ACTIVATION": "0",
+    }
+    backend_test_suites = (
+        {
+            "name": "flashinfer_megamoe_nvfp4_w4a16",
+            "other_args": (
+                "--dtype",
+                "bfloat16",
+                "--tp-size",
+                "4",
+                "--attn-dp-size",
+                "4",
+                "--ep-size",
+                "4",
+                "--fp4-gemm-backend",
+                "flashinfer_cutedsl",
+                "--moe-runner-backend",
+                "flashinfer_megamoe",
+                "--moe-a2a-backend",
+                "flashinfer_megamoe",
             ),
         },
     )

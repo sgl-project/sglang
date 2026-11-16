@@ -1,16 +1,19 @@
 import itertools
 import unittest
-from functools import lru_cache
 
 import torch
 
-from sglang.kernels.ops.gemm.fp8_kernel import w8a8_block_fp8_matmul
+from sglang.kernels.ops.gemm.fp8_kernel import (
+    w8a8_block_fp8_matmul_deepgemm,
+    w8a8_block_fp8_matmul_triton,
+)
 from sglang.kernels.ops.quantization.fp8_kernel import (
     per_tensor_quant_mla_fp8,
     per_token_group_quant_fp8,
     per_token_group_quant_mla_deep_gemm_masked_fp8,
     static_quant_fp8,
 )
+from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import fused_moe
 from sglang.srt.layers.moe.topk import TopKConfig, select_experts
@@ -22,18 +25,6 @@ from sglang.srt.utils import is_blackwell_supported, is_flashinfer_available
 from sglang.test.test_utils import CustomTestCase
 
 _is_cuda = torch.cuda.is_available() and torch.version.cuda
-
-
-# For test
-@lru_cache(maxsize=1)
-def _get_triton_mxfp8_upcast():
-    try:
-        from triton_kernels.numerics_details.mxfp import upcast_from_mxfp_torch
-    except Exception as err:
-        raise RuntimeError(
-            "MXFP8 dequantization requires triton_kernels with MXFP8 support."
-        ) from err
-    return upcast_from_mxfp_torch
 
 
 # For test
@@ -342,6 +333,16 @@ def native_w8a8_block_fp8_matmul(A, B, As, Bs, block_size, output_dtype=torch.fl
     return C
 
 
+def w8a8_block_fp8_matmul(A, B, As, Bs, block_size, output_dtype):
+    if output_dtype == torch.bfloat16 and deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM:
+        return w8a8_block_fp8_matmul_deepgemm(
+            A, B, As, Bs, block_size, output_dtype=output_dtype
+        )
+    return w8a8_block_fp8_matmul_triton(
+        A, B, As, Bs, block_size, output_dtype=output_dtype
+    )
+
+
 class TestW8A8BlockFP8Matmul(CustomTestCase):
     if not _is_cuda:
         OUT_DTYPES = [torch.float32, torch.half, torch.bfloat16]
@@ -431,8 +432,9 @@ class TestW8A8BlockFP8Matmul(CustomTestCase):
 
 
 def _mxfp8_group_dequant(q: torch.Tensor, scale_u8: torch.Tensor) -> torch.Tensor:
-    upcast_from_mxfp_torch = _get_triton_mxfp8_upcast()
-    return upcast_from_mxfp_torch(q, scale_u8, torch.float32, axis=1)
+    m, k = q.shape
+    scale = (scale_u8.to(torch.int32) << 23).view(torch.float32)
+    return (q.float().view(m, k // 32, 32) * scale.unsqueeze(-1)).view(m, k)
 
 
 class TestMXFP8DenseLinear(CustomTestCase):

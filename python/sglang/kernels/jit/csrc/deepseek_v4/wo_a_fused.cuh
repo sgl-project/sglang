@@ -3,12 +3,12 @@
 // Collapses three launches on the DSV4 decode/verify path (fused_rope_inplace,
 // _wo_a_partial, _wo_a_reduce_quant) into one cluster-launched kernel.
 //
-//   x [T, 2, 4096] bf16 (a strided view of a [T, 64, 512] attention output)
-//   W [2, 1024, 4096] bf16
-//   -> q [T, 2048] e4m3 + scales [8192] ue8m0, and/or y [T, 2048] bf16
+//   x [T, G, 4096] bf16 (a strided view of a [T, 64, 512] attention output)
+//   W [G, 1024, 4096] bf16
+//   -> q [T, G*1024] e4m3 + scales [G*4096] ue8m0, and/or y [T, G*1024] bf16
 //
-// Decomposition: the 2048 output columns split into 32 N-tiles of 64, one per
-// cluster; K splits 8 ways across the cluster's CTAs, so each CTA owns exactly
+// Decomposition: the G*1024 output columns split into G*16 N-tiles of 64, one
+// per cluster; K splits 8 ways across the cluster's CTAs, so each CTA owns exactly
 // one of the group's 8 heads -- and therefore exactly one 64-wide RoPE window,
 // which is exactly one staged K-tile. That is what folds the rope launch in
 // without a grid-wide dependency.
@@ -21,12 +21,14 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
-#include <sgl_kernel/mbarrier.cuh>
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/warp.cuh>
 
 #include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
+#include <sgl_kernel/ptx/async.cuh>
+#include <sgl_kernel/ptx/barrier.cuh>
 
 #include <dlpack/dlpack.h>
 #include <tvm/ffi/container/tensor.h>
@@ -38,40 +40,12 @@
 
 namespace sglang::device::ptx {
 
-// ---- TMA -------------------------------------------------------------------
-// Coordinate convention: the tensor map's globalDim is (inner, outer) -- dim 0
-// is the stride-1 axis -- and the load takes (x = inner, y = outer). Swapping
-// them loads a transposed tile with plausible magnitudes and scrambled pairing.
-// Warm the cache line holding the tensor-map descriptor so the first TMA does
-// not pay the descriptor fetch on top of the DRAM latency.
-SGL_DEVICE void prefetch_tensormap(const void* tmap) {
-  asm volatile("prefetch.tensormap [%0];" ::"l"(tmap) : "memory");
-}
-
-SGL_DEVICE void
-cp_async_bulk_tensor_2d(uint32_t dst_smem, const CUtensorMap* tmap, int32_t x, int32_t y, uint64_t* bar) {
-  asm volatile(
-      "cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes"
-      " [%0], [%1, {%2, %3}], [%4];" ::"r"(dst_smem),
-      "l"(tmap),
-      "r"(x),
-      "r"(y),
-      "r"(to_shared(bar))
-      : "memory");
-}
-
 // Push partial sums into a peer's inbox and credit its mbarrier byte count.
 SGL_DEVICE void st_async_b32(uint32_t dst_dsmem, float value, uint32_t dst_bar) {
   asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.b32 [%0], %1, [%2];" ::"r"(dst_dsmem),
                "f"(value),
                "r"(dst_bar)
                : "memory");
-}
-
-// Generic stores land in a different proxy than the one the MMA and the bulk
-// copy engine read through.
-SGL_DEVICE void fence_proxy_async_shared() {
-  asm volatile("fence.proxy.async.shared::cta;" ::: "memory");
 }
 
 // Retarget a local smem offset at CTA `rank` of this cluster (DSMEM).
@@ -100,10 +74,6 @@ SGL_DEVICE void cluster_arrive_relaxed() {
 }
 SGL_DEVICE void cluster_wait_acquire() {
   asm volatile("barrier.cluster.wait.acquire.aligned;" ::: "memory");
-}
-
-SGL_DEVICE void bar_sync(uint32_t id, uint32_t threads) {
-  asm volatile("bar.sync %0, %1;" ::"r"(id), "r"(threads) : "memory");
 }
 
 // ---- tcgen05 ---------------------------------------------------------------
@@ -234,14 +204,6 @@ constexpr uint32_t inst_desc_bf16(uint32_t M, uint32_t N) {
   return (1u << 4) | (1u << 7) | (1u << 10) | (((N >> 3) & 0x3Fu) << 17) | (((M >> 4) & 0x1Fu) << 24);
 }
 
-SGL_DEVICE void barrier_sync(uint32_t id, uint32_t n) {
-  asm volatile("barrier.sync %0, %1;" ::"r"(id), "r"(n) : "memory");
-}
-
-SGL_DEVICE void barrier_arrive(uint32_t id, uint32_t n) {
-  asm volatile("barrier.arrive %0, %1;" ::"r"(id), "r"(n) : "memory");
-}
-
 }  // namespace sglang::device::ptx
 
 namespace sglang::wo_a_fused {
@@ -250,17 +212,19 @@ namespace sglang::wo_a_fused {
 // Shape
 // ---------------------------------------------------------------------------
 /**
- * \brief Compile-time shape for the TP4 WO-A decomposition.
+ * \brief Compile-time shape for the WO-A decomposition.
  *
  * \tparam kMaxTokens Token capacity; also the MMA's N axis, so a multiple of 8.
+ * \tparam kGroups    Local o_groups: 2 at TP4, 4 at TP2.
  *
- * 2048 output columns split into kClusters N-tiles of kNTile, one per cluster;
- * K splits kSplitK ways across the cluster's CTAs, giving each CTA exactly one
- * of the group's 8 heads and therefore exactly one RoPE window.
+ * kGroups x 1024 output columns split into kClusters N-tiles of kNTile, one per
+ * cluster; K splits kSplitK ways across the cluster's CTAs, giving each CTA
+ * exactly one of the group's 8 heads and therefore exactly one RoPE window.
  */
-template <int kMaxTokens>
+template <int kMaxTokens, int kGroups = 2>
 struct WoATrait {
   static_assert(kMaxTokens == 16 || kMaxTokens == 32, "only the x16/x32 TMEM loads are wired up");
+  static_assert(kGroups == 2 || kGroups == 4, "TP4 (2 local groups) and TP2 (4) only");
 
   static constexpr int kMMax = kMaxTokens;
   static constexpr int kNTile = 64;  // == 2 MXFP8 blocks
@@ -273,7 +237,8 @@ struct WoATrait {
   static constexpr int kHeadStages = kHeadDim / kBlockK;
   static constexpr int kHeadsPerCta = kKSlab / kHeadDim;
   static constexpr int kRopeDim = 64;
-  static constexpr int kNOut = 2048;  // 2 groups x 1024
+  static constexpr int kGroupN = 1024;  // o_lora_rank
+  static constexpr int kNOut = kGroups * kGroupN;
   // One UE8M0 byte per MXFP8 block, for 128 padded token rows.
   static constexpr int kScaleBytes = (kNOut / 32) * 128;
   static constexpr int kClusters = kNOut / kNTile;
@@ -314,7 +279,8 @@ struct WoATrait {
     uint64_t tmem_ld_done;
     uint32_t taddr;
   };
-  // 2 CTAs/SM needs <= 113 KiB each; the 32-cluster wave depends on it.
+  // 2 CTAs/SM needs <= 113 KiB each; the single-wave TP4 grid (32 clusters) depends on it.
+  // TP2 launches 64 clusters / 512 CTAs, ~1.7 waves at 2 CTAs/SM, which likely bounds its WO-A gain.
   static_assert(sizeof(Smem) <= 115712, "smem would drop the kernel to 1 CTA/SM");
 };
 
@@ -359,9 +325,9 @@ __global__ void __cluster_dims__(Trait::kSplitK, 1, 1) __launch_bounds__(Trait::
     const __grid_constant__ CUtensorMap x_map,
     const float* __restrict__ freqs,     // [S, 64] fp32, (cos0, sin0, cos1, ...)
     const PosT* __restrict__ positions,  // [T] int32 or int64
-    fp8_e4m3_t* __restrict__ q,          // [T, 2048], may be null
-    uint8_t* __restrict__ scales_out,    // [8192], may be null when q is
-    bf16_t* __restrict__ y,              // [T, 2048], may be null
+    fp8_e4m3_t* __restrict__ q,          // [T, kNOut], may be null
+    uint8_t* __restrict__ scales_out,    // [kScaleBytes], may be null when q is
+    bf16_t* __restrict__ y,              // [T, kNOut], may be null
     uint32_t m) {
   using namespace device;
   // The trait's shape, unqualified, so the body below reads as plain constants.
@@ -376,6 +342,7 @@ __global__ void __cluster_dims__(Trait::kSplitK, 1, 1) __launch_bounds__(Trait::
   constexpr int kHeadsPerCta = Trait::kHeadsPerCta;
   constexpr int kRopeDim = Trait::kRopeDim;
   constexpr int kNOut = Trait::kNOut;
+  constexpr int kGroupN = Trait::kGroupN;
   constexpr int kWarps = Trait::kWarps;
   constexpr int kThreads = Trait::kThreads;
   constexpr int kDrainWarps = Trait::kDrainWarps;
@@ -400,8 +367,8 @@ __global__ void __cluster_dims__(Trait::kSplitK, 1, 1) __launch_bounds__(Trait::
   const uint32_t lane_id = tx % kWarpThreads;
   const uint32_t rank = ptx::cluster_ctarank();  // == the head this CTA owns
   const uint32_t work_id = blockIdx.x / kSplitK;
-  const uint32_t group = work_id / (1024 / kNTile);
-  const uint32_t n0 = (work_id % (1024 / kNTile)) * kNTile;
+  const uint32_t group = work_id / (kGroupN / kNTile);
+  const uint32_t n0 = (work_id % (kGroupN / kNTile)) * kNTile;
   const uint32_t k0 = rank * kKSlab;
 
   // Before anything else: the descriptor fetch is serial with the first tile's
@@ -441,12 +408,12 @@ __global__ void __cluster_dims__(Trait::kSplitK, 1, 1) __launch_bounds__(Trait::
 
   if (warp_id == TMA_W) {
     // The weights are not the producer kernel's output, so this warp never waits
-    // on PDL and the whole 16 MiB stream overlaps the attention tail.
+    // on PDL and the whole weight stream overlaps the attention tail.
     if (warp::elect_one_lane()) {
 #pragma unroll
       for (int s = 0; s < kStages; ++s) {
         ptx::cp_async_bulk_tensor_2d(
-            ptx::to_shared(smem.w[s]), &w_map, k0 + s * kBlockK, group * 1024 + n0, &smem.w_ready[s]);
+            ptx::to_shared(smem.w[s]), &w_map, k0 + s * kBlockK, group * kGroupN + n0, &smem.w_ready[s]);
         ptx::mbar_arrive_expect_tx(&smem.w_ready[s], kWTile);
       }
     }
@@ -477,9 +444,9 @@ __global__ void __cluster_dims__(Trait::kSplitK, 1, 1) __launch_bounds__(Trait::
         ptx::mbar_arrive_expect_tx(&smem.x_landed[h], kXTile);
       }
     }
-    ptx::barrier_arrive(BAR_MBAR_MMA, 64);
+    ptx::bar_arrive<false>(BAR_MBAR_MMA, 64);
   } else if (warp_id == MMA) {
-    ptx::barrier_sync(BAR_MBAR_MMA, 64);
+    ptx::bar_sync<false>(BAR_MBAR_MMA, 64);
     const uint32_t taddr = smem.taddr;
     if (warp::elect_one_lane()) {
       constexpr uint32_t idesc = ptx::inst_desc_bf16(kNTile, kMMax);
@@ -581,7 +548,7 @@ __global__ void __cluster_dims__(Trait::kSplitK, 1, 1) __launch_bounds__(Trait::
 
     // Only the first kEpiWarps warps own a token; inbox's middle dim is
     // kTokPerRank, and t would otherwise collide with the next rank's tokens.
-    const auto col0 = group * 1024 + n0;
+    const auto col0 = group * kGroupN + n0;
     const auto t = rank * kTokPerRank + warp_id;
     // Unconditional, and before the guard: this is what keeps the CTA alive
     // until every peer's st.async into our inbox has landed. A rank whose tokens
@@ -655,33 +622,6 @@ __global__ void __cluster_dims__(Trait::kSplitK, 1, 1) __launch_bounds__(Trait::
 // Host
 // ---------------------------------------------------------------------------
 
-// `rows`/`row_stride_bytes` describe the outer axis; rows >= rows are out of
-// bounds and TMA zero-fills them, which is how tokens >= m get masked.
-inline CUtensorMap make_map(
-    const void* base, uint64_t cols, uint64_t rows, uint64_t row_stride_bytes, uint32_t box_cols, uint32_t box_rows) {
-  CUtensorMap map{};
-  uint64_t dim[2] = {cols, rows};
-  uint64_t stride[1] = {row_stride_bytes};
-  uint32_t box[2] = {box_cols, box_rows};
-  uint32_t elem_stride[2] = {1, 1};
-  // The only driver-API call in the file; there is no runtime-API tensor-map
-  // encoder, so the module links `-lcuda` for it.
-  cuTensorMapEncodeTiled(
-      &map,
-      CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
-      2,
-      const_cast<void*>(base),
-      dim,
-      stride,
-      box,
-      elem_stride,
-      CU_TENSOR_MAP_INTERLEAVE_NONE,
-      CU_TENSOR_MAP_SWIZZLE_128B,
-      CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
-      CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-  return map;
-}
-
 }  // namespace sglang::wo_a_fused
 
 namespace sglang {
@@ -689,19 +629,20 @@ namespace sglang {
 /**
  * \brief Fused inverse-RoPE + grouped WO-A BF16 GEMM + MXFP8 quantization.
  *
- * \param x         [T, 2, 4096] bf16 attention output; a strided view of a
+ * \tparam kGroups   Local o_groups G.
+ * \param x         [T, G, 4096] bf16 attention output; a strided view of a
  *                  [T, 64, 512] buffer, so only the group and K axes need to be
  *                  contiguous and the row stride is read off the tensor.
- * \param w         [2, 1024, 4096] bf16, contiguous.
+ * \param w         [G, 1024, 4096] bf16, contiguous.
  * \param freqs     [S, 64] fp32 rotation table, (cos0, sin0, cos1, sin1, ...).
  * \param positions [T] absolute token positions, int32 or int64.
  * Exactly one output form must be supplied: either (\p q, \p scales) or \p y.
  *
- * \param q         [T, 2048] e4m3 quantized output; pairs with \p scales.
- * \param scales    [8192] uint8 UE8M0 scales in FlashInfer's 128x4 swizzle.
- * \param y         [T, 2048] bf16, the result before quantization.
+ * \param q         [T, G*1024] e4m3 quantized output; pairs with \p scales.
+ * \param scales    [G*4096] uint8 UE8M0 scales in FlashInfer's 128x4 swizzle.
+ * \param y         [T, G*1024] bf16, the result before quantization.
  */
-template <int kMaxTokens>
+template <int kMaxTokens, int kGroups = 2>
 inline void wo_a_fused_run(
     tvm::ffi::TensorView x,
     tvm::ffi::TensorView w,
@@ -711,8 +652,8 @@ inline void wo_a_fused_run(
     tvm::ffi::Optional<tvm::ffi::TensorView> scales,
     tvm::ffi::Optional<tvm::ffi::TensorView> y) {
   using namespace host;
-  using namespace wo_a_fused;  // make_map, wo_a_fused_kernel
-  using Trait = WoATrait<kMaxTokens>;
+  using namespace wo_a_fused;  // wo_a_fused_kernel
+  using Trait = WoATrait<kMaxTokens, kGroups>;
   constexpr int kMMax = Trait::kMMax;
   constexpr int kNTile = Trait::kNTile;
   constexpr int kBlockK = Trait::kBlockK;
@@ -727,17 +668,17 @@ inline void wo_a_fused_run(
 
   SymbolicSize T = {"num_tokens"};
   // The row stride is captured rather than required: it is 32768 elements when
-  // the attention backend pads to 64 heads and 8192 when it does not.
+  // the attention backend pads to 64 heads and 512 x local heads when it does not.
   SymbolicSize XS0 = {"x_row_stride"};
   SymbolicDevice device_;
   device_.set_options<kDLCUDA>();
 
-  TensorMatcher({T, 2, kGroupK})  //
+  TensorMatcher({T, kGroups, kGroupK})  //
       .with_strides({XS0, kGroupK, 1})
       .with_dtype<bf16_t>()
       .with_device<kDLCUDA>(device_)
       .verify(x);
-  TensorMatcher({2, kNOut / 2, kGroupK})  //
+  TensorMatcher({kGroups, kNOut / kGroups, kGroupK})  //
       .with_dtype<bf16_t>()
       .with_device<kDLCUDA>(device_)
       .verify(w);
@@ -773,17 +714,30 @@ inline void wo_a_fused_run(
   const int64_t x_stride0 = XS0.unwrap();
   const DLDevice device = device_.unwrap();
   CHECK_HOST(m >= 1 && m <= kMMax) << "wo_a_fused supports 1 <= T <= " << kMMax << ", got " << m;
-  CHECK_HOST(x_stride0 >= 2 * kGroupK) << "x row stride must cover both groups, got " << x_stride0;
-  const auto w_map = make_map(w.data_ptr(), kGroupK, kNOut, kGroupK * 2, kBlockK, kNTile);
-  const auto x_map = make_map(x.data_ptr(), 2 * kGroupK, m, x_stride0 * 2, kBlockK, kMMax);
+  CHECK_HOST(x_stride0 >= kGroups * kGroupK)
+      << "x row stride must cover all " << kGroups << " groups, got " << x_stride0;
+  // bf16 maps of (inner = K, outer = rows); x rows >= m are out of bounds and TMA zero-fills them, which is how the
+  // tokens past m get masked.
+  constexpr auto kMapParams = tma::TensorMapParams{
+      .swizzle = CU_TENSOR_MAP_SWIZZLE_128B,
+      .l2_promotion = CU_TENSOR_MAP_L2_PROMOTION_L2_128B,
+  };
+  const auto w_map = tma::make_map(
+      w.data_ptr(), CU_TENSOR_MAP_DATA_TYPE_BFLOAT16, {kGroupK, kNOut}, {kGroupK * 2}, {kBlockK, kNTile}, kMapParams);
+  const auto x_map = tma::make_map(
+      x.data_ptr(),
+      CU_TENSOR_MAP_DATA_TYPE_BFLOAT16,
+      {kGroups * kGroupK, static_cast<cuuint64_t>(m)},
+      {static_cast<cuuint64_t>(x_stride0 * 2)},
+      {kBlockK, kMMax},
+      kMapParams);
   const auto launch = [&](const auto* pos) {
     using PosT = std::decay_t<decltype(*pos)>;
     constexpr auto kernel = wo_a_fused_kernel<Trait, PosT>;
-    [[maybe_unused]] static const auto _ = [] {
-      CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, sizeof(Smem)));
-      CHECK_CUDA(cudaFuncSetAttribute(kernel, cudaFuncAttributePreferredSharedMemoryCarveout, 100));
-      return 0;
-    }();
+    runtime::init_per_device(device, [=] {
+      runtime::set_max_dynamic_smem(kernel, sizeof(Smem));
+      runtime::set_smem_carveout(kernel, cudaSharedmemCarveoutMaxShared);
+    });
     LaunchKernel(kClusters * kSplitK, kThreads, device, sizeof(Smem))
         .config({.use_pdl = true, .cluster_dim = dim3{kSplitK, 1, 1}})(
             kernel,

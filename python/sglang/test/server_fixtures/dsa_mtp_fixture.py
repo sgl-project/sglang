@@ -3,7 +3,7 @@
 Variants combine `DsaMtpServerBase` (server lifecycle) with
 `DsaMtpEvalConfigDefaults` (shared eval thresholds/params),
 `GSM8KMixin` and `SpecDecodingMixin`, then set `model` and per-variant
-overrides (`enable_dp_attention`, `mem_fraction_static`, `bs_1_speed_thres`).
+overrides (`attn_dp_size`, `mem_fraction_static`, `bs_1_speed_thres`).
 
 Example:
     class TestDsv32DP(
@@ -13,7 +13,7 @@ Example:
         SpecDecodingMixin,
     ):
         model = "deepseek-ai/DeepSeek-V3.2"
-        enable_dp_attention = True
+        attn_dp_size = 8
         bs_1_speed_thres = 90
 
 The base itself is NOT a runnable test (no `test_*` methods until a subclass
@@ -50,9 +50,8 @@ class DsaMtpServerBase(CustomTestCase):
     # Subclasses must set `model`; the others have sensible defaults.
     model: str = ""
     tp_size: int = 8
-    dp_size: int = 8
+    attn_dp_size: int = 1
     mem_fraction_static: float = 0.7
-    enable_dp_attention: bool = False
     extra_server_args = ()
 
     # EAGLE MTP config (fixed across DSA-MTP variants).
@@ -65,8 +64,8 @@ class DsaMtpServerBase(CustomTestCase):
     def get_server_args(cls):
         assert cls.model, f"{cls.__name__} must set `model`"
         args = ["--trust-remote-code", "--tp", str(cls.tp_size)]
-        if cls.enable_dp_attention:
-            args += ["--dp", str(cls.dp_size), "--enable-dp-attention"]
+        if cls.attn_dp_size > 1:
+            args += ["--attn-dp-size", str(cls.attn_dp_size)]
         args += [
             "--speculative-algorithm",
             cls.speculative_algorithm,

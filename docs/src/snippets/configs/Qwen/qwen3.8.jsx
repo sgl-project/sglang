@@ -73,7 +73,7 @@ export const config = {
   // exactly rather than drawing a range, so runs stay comparable.
   benchmarkCommands: {
     speed:
-`python3 -m sglang.bench_serving \\
+`python3 -m sglang.benchmark.serving \\
   --backend sglang-oai \\
   --host {{CURL_HOST}} --port {{CURL_PORT}} \\
   --model {{MODEL_NAME}} \\
@@ -358,7 +358,6 @@ export const config = {
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "balanced", nodes: "multi-4" },
       verified: true,
       env: [
-        "SGLANG_DEEPEP_V2_EXPAND_PREFILL=1",
         "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK=2048",
         "SGLANG_DEEPEP_V2_MASKED_NUM_MAX_DISPATCH_TOKENS_PER_RANK=384",
         "EP_DISABLE_GIN=1",
@@ -367,9 +366,8 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 16",
-        "--dp-size 4",
+        "--attn-dp-size 4",
         "--ep-size 16",
-        "--enable-dp-attention",
         "--enable-dp-lm-head",
         "--enable-dp-attention-local-control-broadcast",
         "--moe-dense-tp-size 1",
@@ -443,7 +441,6 @@ export const config = {
       match: { hw: "gb300", variant: "default", quant: "fp8", strategy: "high-throughput", nodes: "multi-4" },
       verified: true,
       env: [
-        "SGLANG_DEEPEP_V2_EXPAND_PREFILL=1",
         "SGLANG_DEEPEP_V2_NUM_MAX_DISPATCH_TOKENS_PER_RANK=2048",
         "SGLANG_DEEPEP_V2_MASKED_NUM_MAX_DISPATCH_TOKENS_PER_RANK=384",
         "EP_DISABLE_GIN=1",
@@ -452,9 +449,8 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 16",
-        "--dp-size 4",
+        "--attn-dp-size 4",
         "--ep-size 16",
-        "--enable-dp-attention",
         "--enable-dp-lm-head",
         "--enable-dp-attention-local-control-broadcast",
         "--moe-dense-tp-size 1",
@@ -521,7 +517,7 @@ export const config = {
     {
       // GB300 / NVFP4, high-throughput — full DP16 attention with EP16 MoE over
       // FlashInfer one-sided A2A, MTP off. flashinfer_trtllm_routed must stay:
-      // with a2a=flashinfer the auto runner resolution aborts at startup.
+      // with a2a=flashinfer_nvlink_one_sided the auto runner resolution aborts at startup.
       // SGLANG_FLASHINFER_NUM_MAX_DISPATCH_TOKENS_PER_RANK is load-bearing —
       // unset it falls back to 1024 and startup raises once 1024 x ep_size no
       // longer covers the largest CuteDSL MoE forward.
@@ -540,8 +536,7 @@ export const config = {
         "--trust-remote-code",
         "--model-path {{MODEL_NAME}}",
         "--tp-size 16",
-        "--dp-size 16",
-        "--enable-dp-attention",
+        "--attn-dp-size 16",
         "--enable-dp-lm-head",
         "--enable-dp-attention-local-control-broadcast",
         "--moe-dense-tp-size 1",
@@ -550,7 +545,7 @@ export const config = {
         "--kv-cache-dtype fp8_e4m3",
         "--linear-attn-prefill-backend flashinfer",
         "--moe-runner-backend flashinfer_trtllm_routed",
-        "--moe-a2a-backend flashinfer",
+        "--moe-a2a-backend flashinfer_nvlink_one_sided",
         "--ep-dispatch-algorithm static",
         "--mamba-radix-cache-strategy extra_buffer",
         "--mamba-ssm-dtype bfloat16",

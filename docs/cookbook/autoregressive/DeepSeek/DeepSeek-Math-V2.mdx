@@ -52,7 +52,7 @@ This section provides deployment configurations optimized for different hardware
 **DP Attention:**
 
 - Enable DP attention for high-throughput scenarios
-- The `--dp` value commonly matches the `--tp` value
+- The `--attn-dp-size` value commonly matches the `--tp` value
 - Trade-off: Higher throughput at the cost of slightly increased latency
 
 ## 4. Model Invocation
@@ -419,7 +419,7 @@ Output throughput: 540.162 token/s
 **Benchmark Command:**
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 \
   --port 30000 \
@@ -477,7 +477,7 @@ Max ITL (ms):                            24.93
 **Benchmark Command:**
 
 ```shell Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --host 127.0.0.1 \
   --port 30000 \

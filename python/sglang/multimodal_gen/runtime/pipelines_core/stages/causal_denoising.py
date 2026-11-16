@@ -145,12 +145,6 @@ class CausalDMDRealtimeCacheContext:
 
 
 class CausalDMDDenoisingStage(DenoisingStage):
-    def default_workload_iterations(
-        self, batch: Req, num_inference_steps: int
-    ) -> int | None:
-        # blocks x fixed DMD steps, known only once the block sizes are laid out
-        return None
-
     """
     Denoising stage for causal diffusion.
     """
@@ -830,6 +824,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
             else:
                 current_latents = x0_btchw.permute(0, 2, 1, 3, 4)
 
+            self.check_cancelled(batch)
             if progress_bar is not None:
                 progress_bar.update()
 
@@ -1258,9 +1253,6 @@ class CausalDMDDenoisingStage(DenoisingStage):
             num_blocks = (t - 1) // self.num_frames_per_block
             block_sizes = [1] + [self.num_frames_per_block] * num_blocks
             start_index = 0
-
-        total_iterations = len(block_sizes) * len(timesteps)
-        batch.record_stage_iterations(total_iterations, total_iterations)
 
         def prepare_context_input(current_latents):
             return current_latents

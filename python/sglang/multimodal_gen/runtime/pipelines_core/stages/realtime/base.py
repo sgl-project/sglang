@@ -14,7 +14,6 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
-    StageParallelismType,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
     scale_and_shift_latents,
@@ -62,10 +61,6 @@ class RealtimeDiffusionStage(PipelineStage):
     @property
     def role_affinity(self):
         return RoleType.MONOLITHIC
-
-    @property
-    def parallelism_type(self) -> StageParallelismType:
-        return StageParallelismType.REPLICATED
 
     def require_session(self, batch: Req, *, context: str | None = None):
         if batch.session is None:

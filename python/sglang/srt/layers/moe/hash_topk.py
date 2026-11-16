@@ -21,9 +21,10 @@ from sglang.srt.layers.moe.topk import (
     _mask_topk_ids_padded_region,
     _zero_topk_weights_padded_region,
     remap_topk_for_per_rank_shared_slots,
+    resolve_routing_inputs,
 )
 from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_flags, get_model
 from sglang.srt.utils import is_hip, is_npu, is_xpu
 
 logger = logging.getLogger(__name__)
@@ -38,33 +39,32 @@ class HashTopK(nn.Module):
         self,
         topk,
         num_experts,
-        num_fused_shared_experts,
+        *,
         vocab_size,
         scoring_func="sqrtsoftplus",
         routed_scaling_factor=1.5,
         apply_routed_scaling_factor_on_output=False,
         layer_id: Optional[int] = None,
+        is_draft: Optional[bool] = None,
     ):
         super().__init__()
         self.layer_id = layer_id
-
-        self.enable_waterfill = (
-            num_fused_shared_experts > 0 and get_exec().moe.enable_waterfill
+        self.is_draft = (
+            get_flags().moe.in_speculative_scope if is_draft is None else is_draft
         )
+
+        self.shared_experts = get_model().shared_experts
+        self.enable_waterfill = self.shared_experts.use_waterfill
         self.waterfill_balancer = None
 
-        if self.enable_waterfill:
-            # Waterfill appends the shared expert after EPLB maps routed IDs.
-            topk -= num_fused_shared_experts
-            num_fused_shared_experts = 0
-
         self.num_experts = num_experts
-        self.topk = topk
+        # topk counts routed experts; the trailing columns the hash router fills
+        # with fused shared experts follow them.
+        self.topk = topk + self.num_shared_topk_slots
         self.routed_scaling_factor = routed_scaling_factor
-        self.num_fused_shared_experts = num_fused_shared_experts
         self.score_func = scoring_func
         self.tid2eid = nn.Parameter(
-            torch.empty(vocab_size, topk - num_fused_shared_experts, dtype=torch.int32),
+            torch.empty(vocab_size, topk, dtype=torch.int32),
             requires_grad=False,
         )
         self._init_default_tid2eid()
@@ -72,11 +72,18 @@ class HashTopK(nn.Module):
         self.apply_routed_scaling_factor_on_output = (
             apply_routed_scaling_factor_on_output
         )
-        if apply_routed_scaling_factor_on_output and num_fused_shared_experts > 0:
+        if apply_routed_scaling_factor_on_output and self.num_shared_topk_slots > 0:
             raise NotImplementedError(
                 "HashTopK + apply_routed_scaling_factor_on_output is not supported "
                 "with fused shared experts; pass --disable-shared-experts-fusion."
             )
+
+    def routing_inputs(self):
+        return resolve_routing_inputs(layer_id=self.layer_id, is_draft=self.is_draft)
+
+    @property
+    def num_shared_topk_slots(self) -> int:
+        return self.shared_experts.num_shared_topk_slots
 
     def _init_default_tid2eid(self) -> None:
         topk = self.tid2eid.shape[1]
@@ -98,8 +105,9 @@ class HashTopK(nn.Module):
     def empty_topk_output(
         self, device: torch.device, *, layer_id: Optional[int] = None
     ):
-        topk = self.topk - self.num_fused_shared_experts
-        if layer_id is not None:
+        topk = self.topk - self.num_shared_topk_slots
+        if not self.is_draft:
+            layer_id = self.layer_id
             from sglang.srt.eplb.lplb_solver import get_global_lplb_solver
 
             lplb_solver = get_global_lplb_solver(layer_id)
@@ -111,8 +119,8 @@ class HashTopK(nn.Module):
         topk_ids = torch.full((0, topk), -1, dtype=torch.int32, device=device)
         router_logits = torch.empty((0, topk), dtype=torch.float32, device=device)
         topk_output = StandardTopKOutput(topk_weights, topk_ids, router_logits)
-        if has_per_rank_fused_shared_slots(self.num_fused_shared_experts):
-            n = self.num_fused_shared_experts
+        if has_per_rank_fused_shared_slots(self.num_shared_topk_slots):
+            n = self.num_shared_topk_slots
             topk_output = topk_output._replace(
                 topk_ids=topk_output.topk_ids.new_empty(
                     (0, topk_output.topk_ids.shape[-1] + n)
@@ -153,7 +161,7 @@ class HashTopK(nn.Module):
             (num_token, self.topk), dtype=scores.dtype, device=scores.device
         )
 
-        if self.num_fused_shared_experts == 1:
+        if self.num_shared_topk_slots == 1:
             topk_ids[:, :-1] = self.tid2eid[input_ids]
             topk_weights[:, :-1] = scores.gather(1, topk_ids[:, :-1])
 
@@ -165,7 +173,7 @@ class HashTopK(nn.Module):
 
             topk_ids[:, -1] = torch.randint(
                 low=self.num_experts,
-                high=self.num_experts + self.num_fused_shared_experts,
+                high=self.num_experts + self.num_shared_topk_slots,
                 size=(num_token,),
                 dtype=topk_ids.dtype,
                 device=topk_ids.device,
@@ -195,7 +203,7 @@ class HashTopK(nn.Module):
 
             num_tokens = router_logits.size(0)
             topk_routed = self.tid2eid.size(1)
-            topk_fused = topk_routed + self.num_fused_shared_experts
+            topk_fused = topk_routed + self.num_shared_topk_slots
             topk_ids = torch.empty(
                 (num_tokens, topk_fused), dtype=torch.int32, device=router_logits.device
             )
@@ -225,6 +233,12 @@ class HashTopK(nn.Module):
         num_token_non_padded: Optional[torch.Tensor] = None,
         expert_location_dispatch_info: Optional[ExpertLocationDispatchInfo] = None,
     ):
+        num_token_non_padded, expert_location_dispatch_info = resolve_routing_inputs(
+            layer_id=self.layer_id,
+            is_draft=self.is_draft,
+            num_token_non_padded=num_token_non_padded,
+            expert_location_dispatch_info=expert_location_dispatch_info,
+        )
         assert input_ids.shape[0] == hidden_states.shape[0] == router_logits.shape[0], (
             f"{input_ids.shape=} {hidden_states.shape=} {router_logits.shape=}"
         )
@@ -238,7 +252,7 @@ class HashTopK(nn.Module):
                 router_logits=router_logits,
                 input_ids=input_ids,
                 tid2eid=self.tid2eid,
-                num_fused_shared_experts=self.num_fused_shared_experts,
+                num_fused_shared_experts=self.num_shared_topk_slots,
                 routed_scaling_factor=self.routed_scaling_factor,
                 scoring_func=self.score_func,
             )
@@ -250,7 +264,10 @@ class HashTopK(nn.Module):
         if self.apply_routed_scaling_factor_on_output:
             topk_weights = topk_weights * self.routed_scaling_factor
 
-        num_fused_shared_experts = self.num_fused_shared_experts
+        num_shared_topk_slots = self.num_shared_topk_slots
+        routed_ids = (
+            topk_ids[:, :-num_shared_topk_slots] if num_shared_topk_slots else topk_ids
+        )
         log2phy_prob = None
         if (
             expert_location_dispatch_info is not None
@@ -262,39 +279,37 @@ class HashTopK(nn.Module):
 
             lplb_solver = get_global_lplb_solver(self.layer_id)
             if lplb_solver is not None:
-                log2phy_prob = lplb_solver.solve(topk_ids)
+                log2phy_prob = lplb_solver.solve(routed_ids)
 
-        recorder_topk_ids = None
-        if has_per_rank_fused_shared_slots(num_fused_shared_experts):
-            shared_cols = topk_ids[:, -num_fused_shared_experts:]
-            routed_cols = topk_ids[:, :-num_fused_shared_experts]
-            routed_cols = topk_ids_logical_to_physical(
-                routed_cols, expert_location_dispatch_info, log2phy_prob
-            )
-            topk_ids = torch.cat([routed_cols, shared_cols], dim=-1)
-            recorder_topk_ids = routed_cols
-
+        routed_cols = topk_ids_logical_to_physical(
+            routed_ids, expert_location_dispatch_info, log2phy_prob
+        )
+        recorder_topk_ids = routed_cols if num_shared_topk_slots else None
+        if has_per_rank_fused_shared_slots(num_shared_topk_slots):
             num_physical_routed_experts = (
                 expert_location_dispatch_info.num_physical_experts
                 if expert_location_dispatch_info is not None
                 else self.num_experts
             )
             topk_ids, topk_weights = remap_topk_for_per_rank_shared_slots(
-                topk_ids,
-                topk_weights,
-                num_fused_shared_experts,
+                routed_cols,
+                topk_weights[:, :-num_shared_topk_slots],
+                num_shared_topk_slots,
                 num_physical_routed_experts,
                 TopKConfig(
                     top_k=self.topk,
-                    num_fused_shared_experts=num_fused_shared_experts,
+                    shared_experts=self.shared_experts,
                     routed_scaling_factor=self.routed_scaling_factor,
+                    apply_routed_scaling_factor_on_output=self.apply_routed_scaling_factor_on_output,
                 ),
             )
-        else:
-            topk_ids = topk_ids_logical_to_physical(
-                topk_ids, expert_location_dispatch_info, log2phy_prob
+        elif num_shared_topk_slots:
+            topk_ids = torch.cat(
+                [routed_cols, topk_ids[:, -num_shared_topk_slots:]], dim=-1
             )
-        if is_hip():
+        else:
+            topk_ids = routed_cols
+        if _is_hip or _is_npu:
             _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
         else:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded)
@@ -302,6 +317,11 @@ class HashTopK(nn.Module):
                 _mask_topk_ids_padded_region(recorder_topk_ids, num_token_non_padded)
         if recorder_topk_ids is None:
             recorder_topk_ids = topk_ids
+        if _is_npu and num_token_non_padded is not None:
+            rows = torch.arange(topk_ids.shape[0], device=topk_ids.device)
+            recorder_topk_ids = recorder_topk_ids.masked_fill(
+                (rows >= num_token_non_padded)[:, None], -1
+            )
         get_global_expert_distribution_recorder().on_select_experts(
             topk_ids=recorder_topk_ids
         )
@@ -309,7 +329,7 @@ class HashTopK(nn.Module):
             topk_weights=topk_weights, topk_ids=topk_ids, router_logits=router_logits
         )
         topk_output = self._apply_waterfill(topk_output, hidden_states.shape[0])
-        if is_hip():
+        if _is_hip or _is_npu:
             _zero_topk_weights_padded_region(
                 topk_output.topk_weights, num_token_non_padded
             )

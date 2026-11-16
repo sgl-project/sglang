@@ -17,12 +17,6 @@ class LTXModelType(Enum):
     VideoOnly = "ltx video only model"
     AudioOnly = "ltx audio only model"
 
-    def is_video_enabled(self) -> bool:
-        return self in (LTXModelType.AudioVideo, LTXModelType.VideoOnly)
-
-    def is_audio_enabled(self) -> bool:
-        return self in (LTXModelType.AudioVideo, LTXModelType.AudioOnly)
-
 
 class LTX2RopeType(str, Enum):
     """

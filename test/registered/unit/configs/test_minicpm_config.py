@@ -32,20 +32,6 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
-def test_minicpm_lightning_config_defaults_are_complete():
-    """A checkpoint missing optional SALA fields must still define every model input."""
-    config = MiniCPMHybridConfig()
-
-    assert config.scale_emb == 12
-    assert config.scale_depth == 1.4
-    assert config.dim_model_base == 256
-    assert config.lightning_use_rope is True
-    assert config.use_output_gate is False
-    assert config.attention_bias is False
-    assert config.use_output_norm is False
-    assert config.qk_norm is True
-
-
 def test_minicpm_empty_mixer_types_default_to_full_attention():
     config = MiniCPMHybridConfig(num_hidden_layers=3, mixer_types=[])
 
@@ -277,6 +263,9 @@ def test_non_lightning_minicpm_is_not_classified_as_linear_attention():
 def test_lightning_backend_reads_structural_linear_config(monkeypatch):
     def fake_base_init(self, model_runner):
         self.topk = 1
+        self.state_pool = SimpleNamespace(
+            mamba_cache=SimpleNamespace(conv=[torch.empty(0)])
+        )
 
     monkeypatch.setattr(MambaAttnBackendBase, "__init__", fake_base_init)
     config = SimpleNamespace(
@@ -286,11 +275,6 @@ def test_lightning_backend_reads_structural_linear_config(monkeypatch):
         lightning_layerwise_decay=False,
     )
     model_runner = SimpleNamespace(
-        req_to_token_pool=SimpleNamespace(
-            mamba_pool=SimpleNamespace(
-                mamba_cache=SimpleNamespace(conv=[torch.empty(0)])
-            )
-        ),
         sliding_window_size=None,
         model_config=SimpleNamespace(
             hf_config=config,

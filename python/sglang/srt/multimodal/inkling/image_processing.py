@@ -12,6 +12,8 @@ from numba import njit
 from transformers.image_processing_utils import BaseImageProcessor, BatchFeature
 from transformers.image_utils import ImageInput
 
+from sglang.srt.multimodal.media_io import read_local_media_file
+
 IMAGE_MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32)
 IMAGE_STD = np.array([0.26862954, 0.2613026, 0.2757771], dtype=np.float32)
 PAD_RAW_VALUE = np.float32(-1.0 / 255.0)
@@ -86,8 +88,7 @@ def _load_image_bytes(image) -> bytes:
                 "upstream (e.g. via SGLang load_mm_data) before preprocessing."
             )
         path = image[len("file://") :] if image.startswith("file://") else image
-        with open(path, "rb") as f:
-            return f.read()
+        return read_local_media_file(path)
 
     from PIL import Image
 
@@ -153,7 +154,10 @@ def _encode_image_bytes(
 
     from PIL import Image
 
-    image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    try:
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    except (OSError, SyntaxError) as e:
+        raise ValueError(f"Could not decode image: {e}") from e
     scaled_size = _scaled_image_dimensions(
         *image.size,
         rescale_image_frac=rescale_image_frac,

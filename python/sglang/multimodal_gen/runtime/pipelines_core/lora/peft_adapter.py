@@ -23,6 +23,9 @@ _UNSUPPORTED_CONFIG_FIELDS = (
     "use_qalora",
 )
 _SAFETENSORS_ALPHA_KEYS = ("lora_alpha", "network_alpha", "alpha")
+# diffusers.loaders.lora_base.LORA_ADAPTER_METADATA_KEY
+_DIFFUSERS_METADATA_KEY = "lora_adapter_metadata"
+_DIFFUSERS_TRANSFORMER_PREFIX = "transformer."
 _NATIVE_LORA_A_SUFFIXES = (
     ".lora_A.weight",
     ".lora_down.weight",
@@ -46,13 +49,53 @@ def _has_unambiguous_global_alpha(file: Any) -> bool:
     return len(ranks) == 1
 
 
-def _load_safetensors_lora_alpha(weight_path: str) -> int | None:
+def _diffusers_peft_config(metadata: Mapping[str, str]) -> dict[str, Any]:
+    """The transformer's LoraConfig that diffusers' save_lora_weights embeds."""
+    raw = metadata.get(_DIFFUSERS_METADATA_KEY)
+    if raw is None:
+        return {}
+    try:
+        packed = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise ValueError(
+            f"safetensors metadata {_DIFFUSERS_METADATA_KEY!r} is not valid JSON"
+        ) from error
+    if not isinstance(packed, dict):
+        raise ValueError(
+            f"safetensors metadata {_DIFFUSERS_METADATA_KEY!r} must be a JSON object"
+        )
+    # Keys are "<component>.<field>"; text-encoder sections do not apply to the DiT.
+    prefix = _DIFFUSERS_TRANSFORMER_PREFIX
+    return {
+        name[len(prefix) :]: value
+        for name, value in packed.items()
+        if name.startswith(prefix)
+    }
+
+
+def _load_safetensors_peft_config(weight_path: str) -> dict[str, Any]:
     if Path(weight_path).suffix.lower() != ".safetensors":
-        return None
+        return {}
     with safe_open(weight_path, framework="pt", device="cpu") as file:
         metadata = file.metadata() or {}
-        if not _has_unambiguous_global_alpha(file):
-            return None
+        global_alpha_is_unambiguous = _has_unambiguous_global_alpha(file)
+    config = _diffusers_peft_config(metadata)
+    if not global_alpha_is_unambiguous:
+        return config
+    metadata_alpha = _declared_global_alpha(metadata)
+    if metadata_alpha is None:
+        return config
+    config_alpha = get_peft_lora_alpha(config)
+    if config_alpha is not None and config_alpha != metadata_alpha:
+        raise ValueError(
+            f"conflicting safetensors LoRA alpha metadata: {_DIFFUSERS_METADATA_KEY} "
+            f"has {config_alpha}, global alpha is {metadata_alpha}"
+        )
+    config["lora_alpha"] = metadata_alpha
+    return config
+
+
+def _declared_global_alpha(metadata: Mapping[str, str]) -> int | None:
     declared = []
     for key in _SAFETENSORS_ALPHA_KEYS:
         value = metadata.get(key)
@@ -81,7 +124,8 @@ def load_peft_config(weight_path: str) -> dict[str, Any]:
             config = json.load(file)
     if not isinstance(config, dict):
         raise ValueError("PEFT adapter_config.json must contain a JSON object")
-    metadata_alpha = _load_safetensors_lora_alpha(weight_path)
+    metadata_config = _load_safetensors_peft_config(weight_path)
+    metadata_alpha = get_peft_lora_alpha(metadata_config)
     config_alpha = get_peft_lora_alpha(config)
     if (
         metadata_alpha is not None
@@ -92,8 +136,8 @@ def load_peft_config(weight_path: str) -> dict[str, Any]:
             "adapter_config.json lora_alpha conflicts with safetensors metadata: "
             f"{config_alpha} != {metadata_alpha}"
         )
-    if metadata_alpha is not None:
-        config.setdefault("lora_alpha", metadata_alpha)
+    for name, value in metadata_config.items():
+        config.setdefault(name, value)
     return config
 
 
@@ -210,11 +254,11 @@ def apply_peft_config(
             )
         compiled_patterns.append((expression, alpha))
 
-    suffix = ".lora_A.weight"
     for name in state_dict:
-        if not name.endswith(suffix):
+        base = name.removesuffix(".weight")
+        if not base.endswith(".lora_A"):
             continue
-        base = name[: -len(suffix)]
+        base = base.removesuffix(".lora_A")
         alpha = next(
             (alpha for pattern, alpha in compiled_patterns if pattern.match(base)), None
         )
@@ -234,12 +278,15 @@ def apply_peft_config(
     if not use_rslora:
         return normalized
 
-    suffix = ".lora_B.weight"
     pairs = 0
     for name, weight in state_dict.items():
-        if not name.endswith(suffix):
+        base = name.removesuffix(".weight")
+        if not base.endswith(".lora_B"):
             continue
-        lora_a = state_dict.get(f"{name[: -len(suffix)]}.lora_A.weight")
+        base = base.removesuffix(".lora_B")
+        lora_a = state_dict.get(
+            f"{base}.lora_A.weight", state_dict.get(f"{base}.lora_A")
+        )
         if lora_a is None or lora_a.ndim < 2 or lora_a.shape[-2] <= 0:
             raise ValueError(f"RSLoRA weight {name!r} has no valid rank-bearing A")
         normalized[name] = weight * math.sqrt(lora_a.shape[-2])

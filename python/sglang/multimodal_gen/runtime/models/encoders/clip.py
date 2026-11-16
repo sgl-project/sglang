@@ -183,6 +183,9 @@ class CLIPTextModel(TextEncoder):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
+            # standalone CLIP text-transformer checkpoints omit the model wrapper
+            if name.startswith(("embeddings.", "encoder.", "final_layer_norm.")):
+                name = f"text_model.{name}"
             name = _srt_clip_param_name(name)
             # Handle q_proj, k_proj, v_proj -> qkv_proj mapping
             for param_name, weight_name, shard_id in stacked_params_mapping:
@@ -411,10 +414,6 @@ class CLIPVisionModel(ImageEncoder):
                 weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
-
-
-class BertModel(CLIPTextModel):
-    pass
 
 
 EntryClass = [CLIPTextModel, CLIPTextModelWithProjection, CLIPVisionModel]

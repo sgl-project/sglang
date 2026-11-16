@@ -138,14 +138,14 @@ export const MiMoV25Deployment = () => {
     const c = {};
     // Both checkpoints are TP-interleaved (Pro: 8, base: 4), so attention-TP per
     // DP group must equal that factor. When the spec carries dp>1 (Pro/Hopper
-    // tp=16, base tp=8) DP-attention with `--dp = tp/factor` is required; without
+    // tp=16, base tp=8) DP-attention with `--attn-dp-size = tp/factor` is required; without
     // it a bare `--tp` gives attn_tp = tp != factor and the loader rejects the
     // checkpoint. When no dp>1 (Pro/Blackwell tp=8, base tp=4) it's a single
     // attention group and DP-attention must stay off.
     if (spec && !jax) {
       const factor = isPro ? 8 : 4;
       if (spec.dp > 1) {
-        c.dpAttention = { force: "enabled", reason: `Checkpoint is TP=${factor}-interleaved; DP-attention is required (--dp = tp/${factor} = ${spec.dp}).` };
+        c.dpAttention = { force: "enabled", reason: `Checkpoint is TP=${factor}-interleaved; DP-attention is required (--attn-dp-size = tp/${factor} = ${spec.dp}).` };
       } else {
         c.dpAttention = { force: "disabled", reason: `Single attention group on this hardware (tp=${factor}, no dp-attention).` };
       }
@@ -243,7 +243,8 @@ export const MiMoV25Deployment = () => {
       // sgl-jax conventions:
       //   - `--tp-size` is always the total JAX device count; per-DP TP is
       //     derived automatically as tp/dp.
-      //   - No `--enable-dp-attention` flag — DP attention is the default
+      //   - No separate attention-DP flag (SGLang's `--attn-dp-size`) —
+      //     sgl-jax's `--dp-size` is DP attention by default
       //     (FFN layers auto-pick EP-split for MoE, attn-TP-split for dense).
       const isV7x = hardware === "tpu-v7x";
       const useEp = expertParallelism === "enabled";
@@ -309,8 +310,7 @@ export const MiMoV25Deployment = () => {
     flags.push(`  --tp ${tp}`);
 
     if (useDpAttn) {
-      flags.push(`  --dp ${dpSize}`);
-      flags.push("  --enable-dp-attention");
+      flags.push(`  --attn-dp-size ${dpSize}`);
       if (!isPro) {
         flags.push("  --enable-dp-lm-head");
         flags.push("  --mm-enable-dp-encoder");

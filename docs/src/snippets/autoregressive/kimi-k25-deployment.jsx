@@ -176,9 +176,9 @@ export const KimiK25Deployment = () => {
     cmd += ` \\\n  --tp ${tpValue}`;
     cmd += ' \\\n  --trust-remote-code';
 
-    // DP Attention: --dp matches --tp
+    // DP Attention: --attn-dp-size matches --tp
     if (values.dpattention === 'enabled') {
-      cmd += ` \\\n  --dp ${tpValue} \\\n  --enable-dp-attention`;
+      cmd += ` \\\n  --attn-dp-size ${tpValue}`;
     }
 
     // Reasoning parser
@@ -196,15 +196,18 @@ export const KimiK25Deployment = () => {
       cmd += ' \\\n  --speculative-algorithm EAGLE3 \\\n  --speculative-num-steps 3 \\\n  --speculative-eagle-topk 1 \\\n  --speculative-num-draft-tokens 4 \\\n  --speculative-draft-model-path lightseekorg/kimi-k2.5-eagle3-mla';
     }
 
-    const usesTokenspeedMla = hardware === 'b300' || hardware === 'gb300';
+    const usesCutedslMla = hardware === 'b300' || hardware === 'gb300';
 
-    // Blackwell (B300/GB300): tokenspeed MLA attention backend
-    if (usesTokenspeedMla) {
-      cmd += ' \\\n  --attention-backend tokenspeed_mla';
+    // Blackwell (B300/GB300): CuteDSL MLA attention backend
+    if (usesCutedslMla) {
+      cmd += ' \\\n  --attention-backend cutedsl_mla';
+      if (speculative === 'enabled') {
+        cmd += ' \\\n  --speculative-attention-mode decode';
+      }
     }
 
-    // FP8 KV cache for AMD memory efficiency and tokenspeed MLA compatibility
-    if (isAMD || usesTokenspeedMla) {
+    // FP8 KV cache for AMD and Blackwell memory efficiency
+    if (isAMD || usesCutedslMla) {
       cmd += ' \\\n  --kv-cache-dtype fp8_e4m3';
     }
 

@@ -20,9 +20,10 @@ from sglang.srt.layers.attention.flashattention_backend import FlashAttentionMet
 from sglang.srt.layers.attention.swa_mla_fallback.ops import (
     gather_page64_kv_latent,
 )
-from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
 
 def _batch(*, bs: int, num_tokens: int, original_bs: int | None = None):

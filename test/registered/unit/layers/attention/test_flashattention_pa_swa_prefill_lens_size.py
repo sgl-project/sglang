@@ -24,17 +24,24 @@ import torch
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
-from sglang.srt.mem_cache.kv_index_translator import KVIndexTranslator
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.srt.mem_cache.page_interleave_pool import PageInterleaveKVPoolMixin
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 
 
 class _FakeShardPool(PageInterleaveKVPoolMixin):
-    pass
+    def id_spaces(self):
+        return {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+
+    @property
+    def layer_router(self):
+        return PlainPoolRouter(self, IdSpaceKind.FULL)
 
 
 def _make_prefill_aware_swa_runner(
@@ -68,20 +75,25 @@ def _make_prefill_aware_swa_runner(
         chunked_prefill_size=8192,
         disable_radix_cache=False,
         enable_prefill_cp=False,
-        enable_dp_attention=False,
     )
-    token_to_kv_pool = token_to_kv_pool if token_to_kv_pool is not None else object()
-    token_to_kv_pool_allocator = object()
+    if token_to_kv_pool is None:
+        token_to_kv_pool = SimpleNamespace(
+            id_spaces=lambda: {IdSpaceKind.FULL: IdSpace(key=(IdSpaceKind.FULL, None))}
+        )
+        token_to_kv_pool.layer_router = PlainPoolRouter(
+            token_to_kv_pool, IdSpaceKind.FULL
+        )
+    token_to_kv_pool_allocator = SimpleNamespace(hands_out_virtual_ids=False)
     return SimpleNamespace(
         sliding_window_size=None,
         model_config=model_config,
         device=device,
         req_to_token_pool=req_to_token_pool,
-        token_to_kv_pool=token_to_kv_pool,  # not a SWAKVPool -> use_sliding_window_kv_pool=False
+        token_to_kv_pool=token_to_kv_pool,  # no window sub-pool -> use_sliding_window_kv_pool=False
         token_to_kv_pool_allocator=token_to_kv_pool_allocator,
-        # A real KVIndexTranslator over this non-unified pool: the probe finds no
+        # A real RunnerIds over this non-unified pool: the probe finds no
         # unified composite, so it is the strict passthrough the backend reads.
-        kv_index_translator=KVIndexTranslator(
+        runner_ids=RunnerIds(
             req_to_token=req_to_token_pool.req_to_token,
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             token_to_kv_pool=token_to_kv_pool,
@@ -91,9 +103,6 @@ def _make_prefill_aware_swa_runner(
         kv_cache_dtype=torch.float16,
         kv_cache_dtype_str="auto",
         page_size=1,
-        attn_cp_size=1,
-        tp_size=1,
-        ps=SimpleNamespace(attn_cp_size=1, tp_size=1),
         is_draft_worker=False,
         server_args=server_args,
         attention_chunk_size=None,

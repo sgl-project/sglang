@@ -12,12 +12,11 @@ from diffusers.models.embeddings import TimestepEmbedding, Timesteps
 from torch import nn
 
 from sglang.kernels.ops.diffusion import (
+    LINGBOT_VIDEO_GATED_RESIDUAL,
+    LINGBOT_VIDEO_RMSNORM,
     can_use_rmsnorm_scale_shift_per_token,
-    lingbot_video_gated_residual_active,
-    mark_lingbot_video_gated_residual_site,
-    mark_lingbot_video_rmsnorm_site,
     rmsnorm_scale_shift_per_token,
-    try_lingbot_video_gated_residual,
+    try_gated_residual,
     try_lingbot_video_rmsnorm,
 )
 from sglang.multimodal_gen.configs.models.dits.lingbot_video_moe import (
@@ -51,7 +50,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     AttentionBackendEnum,
     current_platform,
 )
-from sglang.srt.utils import add_prefix
+from sglang.srt.layers.utils.common import add_prefix
 
 LINGBOT_VIDEO_FP32_MODULES = (
     "time_embedder",
@@ -88,7 +87,7 @@ class LingBotVideoRMSNorm(nn.Module):
         super().__init__()
         self.weight = nn.Parameter(torch.ones(dim))
         self.variance_epsilon = eps
-        mark_lingbot_video_rmsnorm_site(self)
+        LINGBOT_VIDEO_RMSNORM.mark(self)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         fused = try_lingbot_video_rmsnorm(
@@ -114,9 +113,11 @@ def _lingbot_gated_residual(
 
     Uses the request-gated per-token ``residual_gate_add`` fast path when the
     block's quality-gated site is enabled; otherwise the reference FP32
-    multiply form (bit-exact for ``quality="lossless"``).
+    multiply form (bit-exact for ``quality="exact"``).
     """
-    fused = try_lingbot_video_gated_residual(block, residual, update, gate)
+    fused = try_gated_residual(
+        LINGBOT_VIDEO_GATED_RESIDUAL, block, residual, update, gate
+    )
     if fused is not None:
         return fused
     return residual + (gate * update).to(residual.dtype)
@@ -136,7 +137,7 @@ def _lingbot_norm_modulate(
     quality-gated site is enabled; otherwise the reference chain. ``scale`` is
     the raw ``scale_msa/mlp``; the kernel applies ``x * (1 + scale)``.
     """
-    if lingbot_video_gated_residual_active(
+    if LINGBOT_VIDEO_GATED_RESIDUAL.is_enabled(
         block
     ) and can_use_rmsnorm_scale_shift_per_token(x, norm.weight, scale, shift):
         try:
@@ -147,20 +148,6 @@ def _lingbot_norm_modulate(
         except Exception:
             pass
     return (norm(x) * (1.0 + scale) + shift).to(out_dtype)
-
-
-def make_joint_position_ids(
-    text_len: int, grid_t: int, grid_h: int, grid_w: int, device: torch.device
-) -> torch.Tensor:
-    tt = torch.arange(grid_t, device=device, dtype=torch.int32) + (text_len + 1)
-    hh = torch.arange(grid_h, device=device, dtype=torch.int32)
-    ww = torch.arange(grid_w, device=device, dtype=torch.int32)
-    grid = torch.stack(torch.meshgrid(tt, hh, ww, indexing="ij"), dim=-1).flatten(0, 2)
-    text_t = torch.arange(text_len, device=device, dtype=torch.int32) + 1
-    text_pos = torch.stack(
-        [text_t, torch.zeros_like(text_t), torch.zeros_like(text_t)], dim=-1
-    )
-    return torch.cat([grid, text_pos], dim=0)  # (Nx + L, 3)
 
 
 def _joint_position_ids(
@@ -337,7 +324,7 @@ class LingBotVideoBlock(nn.Module):
         self.layer_idx = layer_idx
         h = hidden_size
         self.scale_shift_table = nn.Parameter(torch.zeros(1, 6 * h))
-        mark_lingbot_video_gated_residual_site(self)
+        LINGBOT_VIDEO_GATED_RESIDUAL.mark(self)
         self.norm1 = LingBotVideoRMSNorm(h, norm_eps)
         self.attn = LingBotVideoAttention(
             h,

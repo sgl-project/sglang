@@ -68,9 +68,12 @@ def _silu_and_mul_clamp_kernel(
         )
 
 
-def silu_and_mul_clamp_fp8_grid_supported(intermediate: int) -> bool:
-    """The fp8-grid epilogue needs whole 32-wide groups inside one program."""
-    return intermediate % 32 == 0 and intermediate <= 1024
+def silu_and_mul_clamp_fp8_grid_supported(
+    intermediate: int, multi_block: bool = False
+) -> bool:
+    """The fp8-grid epilogue needs whole 32-wide groups inside one program; 1024-wide programs
+    keep that for any multiple of 32 (multi_block)."""
+    return intermediate % 32 == 0 and (multi_block or intermediate <= 1024)
 
 
 def silu_and_mul_clamp_triton(
@@ -87,8 +90,8 @@ def silu_and_mul_clamp_triton(
     inter_size = N // 2
     fp8_grid = fp8_grid or emit_fp8
     if fp8_grid:
-        assert silu_and_mul_clamp_fp8_grid_supported(inter_size), (
-            f"inter_size {inter_size}: the fp8-grid epilogue needs a multiple of 32 up to 1024"
+        assert silu_and_mul_clamp_fp8_grid_supported(inter_size, multi_block=True), (
+            f"inter_size {inter_size}: the fp8-grid epilogue needs a multiple of 32"
         )
     out = torch.empty(
         (M, inter_size),

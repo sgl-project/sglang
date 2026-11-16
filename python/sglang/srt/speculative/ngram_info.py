@@ -4,7 +4,9 @@ from typing import List, Optional
 
 import torch
 
-from sglang.kernels.ops.attention.utils import create_flashinfer_kv_indices_triton
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind, WindowRead
+from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
+from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 
 
@@ -58,12 +60,19 @@ class NgramVerifyInput(SpecInput):
 
     def generate_attn_arg_prefill(
         self,
+        *,
         req_pool_indices: torch.Tensor,
         paged_kernel_lens: torch.Tensor,
         paged_kernel_lens_sum: int,
-        req_to_token: torch.Tensor,
+        runner_ids: RunnerIds,
+        plan: IterationIds,
+        kind: IdSpaceKind = IdSpaceKind.FULL,
+        window: Optional[WindowRead] = None,
     ):
-        bs = len(req_pool_indices)
+        """CSR verify args. ``paged_kernel_lens`` excludes the verify tokens and
+        is widened here; the `RunnerIds` packs the read ids straight into
+        ``kv_indices``. Under a ``window`` read, the mask carries the window."""
+        bs = req_pool_indices.numel()
 
         cum_kv_seq_len = torch.zeros((bs + 1,), dtype=torch.int32, device=self.device)
 
@@ -75,20 +84,17 @@ class NgramVerifyInput(SpecInput):
             * self.draft_token_num
         )
 
-        kv_indices = torch.empty(
-            paged_kernel_lens_sum + self.draft_token_num * bs,
-            dtype=torch.int32,
-            device=self.device,
-        )
+        total_tokens = paged_kernel_lens_sum + self.draft_token_num * bs
+        kv_indices = torch.empty(total_tokens, dtype=torch.int32, device=self.device)
 
-        create_flashinfer_kv_indices_triton[(bs,)](
-            req_to_token,
-            req_pool_indices,
-            paged_kernel_lens,
-            cum_kv_seq_len,
-            None,
-            kv_indices,
-            req_to_token.size(1),
+        runner_ids.pack_read_stream(
+            plan,
+            req_pool_indices=req_pool_indices,
+            seq_lens=paged_kernel_lens,
+            indptr=cum_kv_seq_len,
+            out=kv_indices,
+            kind=kind,
+            kv_start_idx=None if window is None else window.start,
         )
 
         # Pad custom_mask when CUDA graph pads batch size beyond the actual number of requests.
@@ -109,6 +115,12 @@ class NgramVerifyInput(SpecInput):
                     ),
                 ],
                 dim=0,
+            )
+        if window is not None:
+            custom_mask = window.tree_mask(
+                custom_mask,
+                width=self.draft_token_num,
+                read_lens_sum=paged_kernel_lens_sum,
             )
 
         return kv_indices, cum_kv_seq_len, self.qo_indptr, custom_mask

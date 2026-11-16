@@ -7,7 +7,7 @@ from sglang.srt.utils import get_bool_env_var, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=3, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=3, suite="stage-a-test-1-gpu-small-amd")
 
 torch.manual_seed(0)
 
@@ -25,9 +25,9 @@ _CASES = [
 ]
 
 
-@unittest.skipIf(_use_aiter, reason="SGLANG_USE_AITER=1 will not use vllm path.")
+@unittest.skipUnless(_is_hip, "Requires AMD GPU")
 class TestRotaryEmbeddingNative(CustomTestCase):
-    # Compare RotaryEmbedding.forward_hip() to forward_native().
+    # SGLang's fallback remains in use by Llama when AITER is enabled.
     def _run_case(
         self,
         head_size: int,
@@ -58,14 +58,35 @@ class TestRotaryEmbeddingNative(CustomTestCase):
         )
 
         q_ref, k_ref = rope_ref.forward_native(pos_ids, query.clone(), key.clone())
-        q_hip, k_hip = rope_hip.forward_hip(pos_ids, query.clone(), key.clone())
+        q_hip, k_hip = rope_hip(pos_ids, query.clone(), key.clone())
+        self.assertEqual(rope_hip.cos_sin_cache.dtype, torch.float32)
+
+        # FP32 cache storage must preserve the existing query-dtype arithmetic.
+        from sgl_kernel import rotary_embedding
+
+        q_same, k_same = query.clone(), key.clone()
+        rotary_embedding(
+            pos_ids,
+            q_same,
+            k_same,
+            head_size,
+            rope_hip.cos_sin_cache.to(dtype),
+            is_neox,
+        )
+        torch.testing.assert_close(q_hip, q_same, atol=0, rtol=0)
+        torch.testing.assert_close(k_hip, k_same, atol=0, rtol=0)
 
         torch.testing.assert_close(q_ref, q_hip, atol=1e-2, rtol=1e-2)
         torch.testing.assert_close(k_ref, k_hip, atol=1e-2, rtol=1e-2)
 
     def test_all_cases(self) -> None:
         """Drive over the full parameter matrix using subTest()."""
-        for case in _CASES:
+        cases = _CASES + [
+            (128, 64, 32, 10000, True, torch.float16, "cuda", 1, 32, 4, 2),
+            (128, 64, 32, 10000, False, torch.float16, "cuda", 1, 32, 4, 2),
+            (128, 64, 32, 10000, True, torch.float32, "cuda", 1, 32, 4, 2),
+        ]
+        for case in cases:
             with self.subTest(case=case):
                 self._run_case(*case)
 

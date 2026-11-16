@@ -214,8 +214,8 @@ def test_store_close_lifecycle_is_terminal_and_retains_allocator_roots_in_subpro
         )
 
         runtime_context.get_parallel = lambda: SimpleNamespace(
-            world_rank=0,
-            world_size=1,
+            launch_world_rank=0,
+            launch_world_size=1,
         )
 
         class FakeSession:

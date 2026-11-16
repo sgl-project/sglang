@@ -1,33 +1,33 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.test_utils import maybe_stub_sgl_kernel
-
-maybe_stub_sgl_kernel()
-
 from sglang.srt.managers.io_struct import FlushCacheReqInput
-from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.flush_wrapper import (
     SchedulerFlushWrapper,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=12, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 register_cpu_ci(est_time=8, suite="stage-b-test-cpu-intel")
 
 
 class TestSchedulerFlushCache(unittest.TestCase):
-    def _new_scheduler(self) -> Scheduler:
-        scheduler = Scheduler.__new__(Scheduler)
-        scheduler.ipc_channels = MagicMock()
-        scheduler.flush_cache = MagicMock(return_value=True)
-        scheduler.is_fully_idle = MagicMock(return_value=False)
-        scheduler.flush_wrapper = SchedulerFlushWrapper(
-            flush_cache=scheduler.flush_cache,
-            is_fully_idle=scheduler.is_fully_idle,
-            ipc_channels=scheduler.ipc_channels,
+    def _new_scheduler(self) -> SimpleNamespace:
+        """The wrapper plus the three collaborators it was handed."""
+        flush_cache = MagicMock(return_value=True)
+        is_fully_idle = MagicMock(return_value=False)
+        send_output = MagicMock()
+        return SimpleNamespace(
+            flush_cache=flush_cache,
+            is_fully_idle=is_fully_idle,
+            send_output=send_output,
+            flush_wrapper=SchedulerFlushWrapper(
+                flush_cache=flush_cache,
+                is_fully_idle=is_fully_idle,
+                send_output=send_output,
+            ),
         )
-        return scheduler
 
     def test_immediate_flush_no_timeout(self):
         """No timeout → flush immediately regardless of idle state."""
@@ -89,8 +89,9 @@ class TestSchedulerFlushCache(unittest.TestCase):
 
         self.assertIsNone(scheduler.flush_wrapper._pending)
         scheduler.flush_cache.assert_called_once()
-        out = scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
+        out, answered = scheduler.send_output.call_args.args
         self.assertTrue(out.success)
+        self.assertIs(answered, req)
 
     def test_pending_flush_expires_on_timeout(self):
         scheduler = self._new_scheduler()
@@ -105,7 +106,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
 
         self.assertIsNone(scheduler.flush_wrapper._pending)
         scheduler.flush_cache.assert_not_called()
-        out = scheduler.ipc_channels.send_to_tokenizer.send_output.call_args.args[0]
+        out = scheduler.send_output.call_args.args[0]
         self.assertFalse(out.success)
 
     def test_pending_flush_survives_before_deadline(self):
@@ -120,7 +121,7 @@ class TestSchedulerFlushCache(unittest.TestCase):
             scheduler.flush_wrapper.check_pending()
 
         self.assertIsNotNone(scheduler.flush_wrapper._pending)
-        scheduler.ipc_channels.send_to_tokenizer.send_output.assert_not_called()
+        scheduler.send_output.assert_not_called()
 
 
 if __name__ == "__main__":

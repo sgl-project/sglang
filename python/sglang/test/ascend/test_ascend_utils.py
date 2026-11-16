@@ -34,8 +34,6 @@ STDOUT_FILENAME = "/tmp/stdout.txt"
 # Model weights storage directory
 MODEL_WEIGHTS_DIR = "/root/.cache/modelscope/hub/models/"
 HF_MODEL_WEIGHTS_DIR = "/root/.cache/huggingface/hub/"
-IMAGES_DIR = "/root/.cache/modelscope/hub/datasets/images/"
-VIDEO_DIR = "/root/.cache/modelscope/hub/datasets/video/"
 
 # LLM model weights path
 AFM_4_5B_BASE_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "arcee-ai/AFM-4.5B-Base")
@@ -45,7 +43,6 @@ BAICHUAN2_13B_CHAT_WEIGHTS_PATH = os.path.join(
 C4AI_COMMAND_R_V01_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "CohereForAI/c4ai-command-r-v01"
 )
-C4AI_COMMAND_R_V01_CHAT_TEMPLATE_PATH = "/__w/sglang/sglang/test/registered/npu/llm_models/tool_chat_template_c4ai_command_r_v01.jinja"
 CHATGLM2_6B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "ZhipuAI/chatglm2-6b")
 DBRX_INSTRUCT_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "AI-ModelScope/dbrx-instruct"
@@ -58,6 +55,9 @@ DEEPSEEK_V3_2_EXP_W8A8_WEIGHTS_PATH = os.path.join(
 )
 DEEPSEEK_V3_2_W8A8_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "vllm-ascend/DeepSeek-V3.2-W8A8"
+)
+DEEPSEEK_V4_FLASH_BF16_MODEL_PATH = os.path.join(
+    MODEL_WEIGHTS_DIR, "deepseek-ai/DeepSeek-V4-Flash-BF16"
 )
 DEEPSEEK_CODER_V2_LITE_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct"
@@ -87,6 +87,7 @@ GEMMA_4_26B_A4B_IT_WEIGHTS_PATH = os.path.join(
 GEMMA_4_31B_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "google/gemma-4-31B-it")
 GLM_4_9B_CHAT_WEIGHTS_PATH = os.path.join(MODEL_WEIGHTS_DIR, "ZhipuAI/glm-4-9b-chat")
 GLM_5_1_W4A8_MODEL_PATH = os.path.join(MODEL_WEIGHTS_DIR, "Eco-Tech/GLM-5.1-w4a8")
+GLM_5_2_BF16_MODEL_PATH = os.path.join(MODEL_WEIGHTS_DIR, "ZhipuAI/GLM-5.2")
 GPT_OSS_120B_BF16_WEIGHTS_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "eigen-ai-labs/gpt-oss-120b-bf16"
 )
@@ -367,23 +368,10 @@ QWEN3_VL_30B_A3B_THINKING_MODEL_PATH = os.path.join(
 QWEN3_OMNI_30B_A3B_THINKING_MODEL_PATH = os.path.join(
     MODEL_WEIGHTS_DIR, "Qwen/Qwen3-Omni-30B-A3B-Thinking"
 )
-# Images path
-IMAGES_EXAMPLE_PATH = os.path.join(IMAGES_DIR, "example_image.png")
-IMAGES_023_PATH = os.path.join(IMAGES_DIR, "023.jpg")
-IMAGES_MAN_PATH = os.path.join(IMAGES_DIR, "man.png")
-IMAGES_LOGO_PATH = os.path.join(IMAGES_DIR, "logo.png")
-VIDEO_JOBS_PATH = os.path.join(VIDEO_DIR, "jobs.mp4")
-INVOICE_WITH_BARCODE_LOGO_IMAGES_PATH = os.path.join(
-    IMAGES_DIR, "invoice_with_barcode_logo.jpeg"
-)
 # fmt: on
 
 # Other
-DEEPSEEK_CODER_JSON_PATH = "/__w/sglang/sglang/test/registered/npu/basic_function/parameter/deepseek_coder.json"
 FR_SPEC_TOKEN_MAP_PATH = "/root/.cache/sglang/FR-Spec/freq_32768.pt"
-CONFIG_YAML_PATH = (
-    "/__w/sglang/sglang/test/registered/npu/basic_function/config/config.yaml"
-)
 
 
 class ModelTestConfig(NamedTuple):

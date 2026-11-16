@@ -174,6 +174,9 @@ for (const path of walk(CONFIGS)) {
 
   for (const dim of (config.overlayDims || [])) {
     const ids = (dim.options || []).map((o) => o.id);
+    if (new Set(ids).size !== ids.length) {
+      fail(where, `overlayDims.${dim.id} has duplicate option ids`);
+    }
     if (dim.kind === "number") {
       if (!Number.isInteger(dim.min) || !Number.isInteger(dim.max) || dim.min > dim.max) {
         fail(where, `overlayDims.${dim.id} has invalid numeric bounds`);
@@ -316,7 +319,7 @@ for (const path of walk(CONFIGS)) {
         { hw: "gb200" },
         { hw: "gb300", mode: "i2va" },
         { hw: "gb300", weights: "ref2va", mode: "v2v" },
-        { hw: "gb300", quality: "extra-high" },
+        { hw: "gb300", quality: "lossless" },
         { hw: "gb300", outputs: "2" },
         { hw: "gb300", precision: "fp8" },
         { hw: "gb300", attention: "sage" },
@@ -403,6 +406,84 @@ for (const path of walk(CONFIGS)) {
     }, "curl");
   }
 
+  // Resolved recipes must preserve cell identity and generate one unambiguous
+  // command for every role/overlay selection, including hidden stale picks.
+  if (typeof config.resolveRecipe === "function") {
+    for (const raw of config.cells || []) {
+      let selections = [{ ...raw.match }];
+      for (const dim of config.overlayDims || []) {
+        selections = selections.flatMap((sel) => (dim.options || []).map(
+          (opt) => ({ ...sel, [dim.id]: opt.id })));
+      }
+      for (const sel of selections) {
+        try {
+          const cell = config.resolveRecipe(raw, sel);
+          if (JSON.stringify(cell.match) !== JSON.stringify(raw.match)) {
+            throw new Error("resolver changed match dimensions");
+          }
+          for (const key of ["flags", "env"]) {
+            if (!Array.isArray(cell[key]) || cell[key].some((v) => typeof v !== "string" || /undefined|NaN/.test(v))) {
+              throw new Error(`invalid ${key}`);
+            }
+            const heads = cell[key].map((v) => key === "flags" ? v.split(/[\s=]/)[0] : v.split("=")[0]);
+            if (cell.pd && new Set(heads).size !== heads.length) throw new Error(`duplicate ${key}`);
+          }
+          if (!cell.pd) continue;
+          if (!Number.isInteger(cell.nnodes) || cell.nnodes < 1) throw new Error("PD worker needs an explicit node count");
+          if (!cell.router?.command || !cell.router?.port) throw new Error("PD recipe needs a router");
+          if (cell.pdMode === "router") {
+            if (!cell.commands?.python || !cell.commands?.docker) throw new Error("missing router command format");
+          } else if (!cell.flags.includes(`--disaggregation-mode ${cell.pdMode}`)) {
+            throw new Error("PD role does not match worker flags");
+          }
+        } catch (e) {
+          fail(where, `resolveRecipe ${JSON.stringify(sel)}: ${e.message}`);
+        }
+      }
+    }
+  }
+
+  // Fixed strategy presets from InferenceX PR #3664: c16 / c48 / c256.
+  if (config.modelName === "DeepSeek-V4" && config.resolveRecipe) {
+    const cases = [
+      ["low-latency", 4, 8, 32, 6, 32],
+      ["balanced", 4, 8, 96, 3, 96],
+      ["high-throughput", 8, 8, 512, 3, 64],
+    ];
+    for (const variant of ["pro", "pro-official"]) {
+      for (const [strategy, ptp, dtp, admission, gamma, graphMax] of cases) {
+        for (const pdMode of ["prefill", "decode"]) {
+          const sel = { hw: "mi355x", variant, quant: "fp4", strategy, nodes: "multi-2", pdMode };
+          const raw = config.cells.find((c) => matchIds.every((k) => c.match[k] === sel[k]));
+          if (!raw) { fail(where, `missing MI355X PD ${variant} ${strategy}`); continue; }
+          const cell = config.resolveRecipe(raw, sel);
+          const arg = (head) => cell.flags.find((f) => f.split(/[\s=]/)[0] === head)?.slice(head.length).trim();
+          const prefill = pdMode === "prefill";
+          const official = variant === "pro-official";
+          const expected = {
+            "--tp": String(prefill ? ptp : dtp),
+            "--max-running-requests": String(admission),
+            "--speculative-algorithm": official ? "DSPARK" : "EAGLE",
+            "--speculative-dspark-block-size": official ? String(gamma) : undefined,
+            "--attn-dp-size": strategy === "high-throughput" ? "8" : undefined,
+            "--port": prefill ? "30000" : "30100",
+            "--nnodes": undefined,
+          };
+          for (const [head, value] of Object.entries(expected)) {
+            if (arg(head) !== value) fail(where, `${variant} ${strategy} ${pdMode}: ${head}=${arg(head)}, expected ${value}`);
+          }
+          if (!prefill) {
+            const graph = (arg("--cuda-graph-bs-decode") || "").split(" ").map(Number);
+            if (graph.length !== graphMax || graph.some((v, i) => v !== i + 1)) fail(where, `wrong decode graphs at ${strategy}`);
+          }
+          if (cell.flags.includes("--enable-unified-cache-external-linker") !== prefill
+            || cell.flags.includes("--enable-hierarchical-cache")) fail(where, "PD offload must default to prefill-only UMBP");
+          if (cell.env.some((v) => v.startsWith("SGLANG_SIMULATE_ACC"))) fail(where, "serving recipe must not simulate draft acceptance");
+        }
+      }
+    }
+  }
+
   const pd = (config.playgroundFeatures || {}).pdDisagg;
   if (pd && typeof pd.showWhen === "function") {
     const incompatible = (pd.incompatibleSpeculativeAlgorithms || [])
@@ -473,8 +554,8 @@ for (const path of walkMdx(DIFFUSION_COOKBOOK)) {
     if (!quickStartBody.includes("<Deployment config={config} />")) {
       fail(where, "Quick start must render the command builder before model capabilities");
     }
-    if (!quickStartBody.includes('uv pip install "sglang[diffusion]"')) {
-      fail(where, "Quick start must include the diffusion installation command");
+    if (!quickStartBody.includes("(/docs/sglang-diffusion/installation)")) {
+      fail(where, "Quick start must link to the diffusion installation guide");
     }
   }
 
