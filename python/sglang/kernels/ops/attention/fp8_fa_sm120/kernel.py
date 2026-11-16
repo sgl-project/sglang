@@ -111,6 +111,7 @@ def _fp8_attention_sm120(
     tiled_copy_K: cute.TiledCopy,
     tiled_copy_V: cute.TiledCopy,
     tiled_mma: cute.TiledMma,
+    key_sequence: cutlass.Constexpr,
     cta_tiler: cutlass.Constexpr = (128, 32, 128),
     block_scaled_mma: cutlass.Constexpr = True,
 ):
@@ -311,7 +312,7 @@ def _fp8_attention_sm120(
                 tCrC_row = tCrC[(None, row), m_tile, None]
                 row_scores = tCrC_row.load() * qk_scale
 
-                if cutlass.const_expr(mK.shape[0] != sequence):
+                if cutlass.const_expr(mK.shape[0] != key_sequence):
                     tCrC_row.store(row_scores)
                     for column_group in cutlass.range_constexpr(4):
                         for column_pair in cutlass.range_constexpr(2):
@@ -321,7 +322,7 @@ def _fp8_attention_sm120(
                                 + column_group * 8
                                 + column_pair
                             )
-                            if key_row >= sequence:
+                            if key_row >= key_sequence:
                                 tCrC_row[
                                     column_pair, column_group
                                 ] = -cutlass.Float32.inf
@@ -450,6 +451,7 @@ def fp8_attention_host(
     mScales: cute.Tensor,
     softmax_scale: cutlass.Float32,
     stream,
+    key_sequence: cutlass.Constexpr,
     block_scaled_mma: cutlass.Constexpr = True,
 ):
     mQ = cute.make_tensor(mQ.iterator, cute.select(mQ.layout, mode=[1, 2, 0]))
@@ -542,6 +544,7 @@ def fp8_attention_host(
         tiled_copy_K,
         tiled_copy_V,
         tiled_mma,
+        key_sequence=key_sequence,
         block_scaled_mma=block_scaled_mma,
     ).launch(
         grid=(cute.ceil_div(mQ.shape[0], 128), 1, mQ.shape[2]),

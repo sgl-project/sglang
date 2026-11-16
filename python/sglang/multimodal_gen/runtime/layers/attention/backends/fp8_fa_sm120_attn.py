@@ -6,8 +6,9 @@ E4M3 on the fly (two fused Triton passes), attention runs in FP8 with FP32
 accumulation, and the output is BF16. Expect about 5% relative RMS against cuDNN BF16
 per call on normally distributed inputs.
 
-Scope: dense, non-causal, batch 1, head_dim 128, BF16 inputs on an SM120 device.
-Everything else goes to cuDNN SDPA. Each distinct sequence length compiles once
+Scope: dense, non-causal, batch 1, head_dim 128, BF16 inputs on an SM120 device. K/V
+may differ in length from Q (unmasked cross-attention). Everything else goes to cuDNN
+SDPA. Each distinct (query, key) length pair compiles once
 (about 10 s); later calls with the same shape reuse the compiled kernel. The FP8 and
 output buffers are allocated per call and belong to the caller.
 """
@@ -73,7 +74,7 @@ class FP8FlashAttentionSM120Impl(AttentionImpl):
         """None when the kernel applies to these [S, H, D] tensors, else why not."""
         if self.causal:
             return "causal attention"
-        if query.shape != key.shape or key.shape != value.shape:
+        if query.shape[1:] != key.shape[1:] or key.shape != value.shape:
             return "Q/K/V shapes differ"
         if query.ndim != 3 or query.shape[-1] != HEAD_DIM:
             return f"head_dim {query.shape[-1]} (kernel is head_dim {HEAD_DIM})"
@@ -93,7 +94,7 @@ class FP8FlashAttentionSM120Impl(AttentionImpl):
     # --- kernel path ----------------------------------------------------------
 
     def _run(self, query, key, value):
-        """[S, H, 128] strided BF16 in, a new contiguous [S, H, 128] BF16 out."""
+        """[Sq, H, 128] Q over [Skv, H, 128] K/V, a new contiguous [Sq, H, 128] BF16 out."""
         output, _ = fp8_attention(query, key, value, softmax_scale=self.softmax_scale)
         return output
 
@@ -137,6 +138,8 @@ class FP8FlashAttentionSM120Impl(AttentionImpl):
             else tuple(int(item) for item in cu_seqlens.tolist())
         )
         reason = self._fallback_reason(query, key, value)
+        if reason is None and query.shape != key.shape:
+            reason = "varlen Q and K/V lengths differ"
         if reason is not None:
             self._report_fallback(reason)
             return self.fallback.forward_varlen(

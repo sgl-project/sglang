@@ -85,6 +85,45 @@ def _compiled_kernels():
     return len(_KERNEL_CACHE)
 
 
+def _projected_views(sequence, seed):
+    """Q or K/V for cross-attention: separate [S, H*D] projection outputs."""
+    generator = torch.Generator(device="cuda").manual_seed(seed)
+    x = torch.randn(
+        (sequence, HEADS * HEAD_DIM),
+        device="cuda",
+        dtype=torch.bfloat16,
+        generator=generator,
+    )
+    return x.view(sequence, HEADS, HEAD_DIM)
+
+
+# (queries, keys): LTX-2 video-to-text is 8160 x 1024; the others cover key padding,
+# a partial query tile and K/V longer than Q.
+@pytest.mark.parametrize("queries,keys", [(8160, 1024), (1000, 77), (300, 2050)])
+def test_cross_attention_matches_cudnn(queries, keys):
+    ours, reference = _make_impls()
+    q = _projected_views(queries, seed=1)
+    k = _projected_views(keys, seed=2)
+    v = _projected_views(keys, seed=3)
+
+    output = ours.forward(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), None)
+    expected = reference.forward(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), None)
+
+    assert output.shape == expected.shape == (1, queries, HEADS, HEAD_DIM)
+    assert torch.isfinite(output.float()).all()
+    relative_rms, cosine = _error_metrics(output, expected)
+    assert relative_rms < 0.08, relative_rms
+    assert cosine > 0.995, cosine
+
+
+def test_cross_attention_does_not_reuse_self_attention_kernel():
+    from sglang.kernels.ops.attention.fp8_fa_sm120 import kernel_key
+
+    q = _projected_views(512, seed=4)
+    k = _projected_views(256, seed=5)
+    assert kernel_key(q, k) != kernel_key(q, q)
+
+
 def test_kernel_is_reused_across_calls():
     ours, reference = _make_impls()
     q, k, v = _fused_qkv_views(4096, seed=1)
@@ -176,7 +215,7 @@ def test_prep_defines_every_padded_byte():
     from sglang.kernels.ops.attention.fp8_fa_sm120.plan import _allocate_workspace
 
     q, k, v = _fused_qkv_views(1052)
-    workspace = _allocate_workspace(q)
+    workspace = _allocate_workspace(q, k)
     for buffer in (workspace.q_fp8, workspace.k_fp8, workspace.v_fp8):
         buffer.view(torch.uint8).fill_(0xFF)
 
