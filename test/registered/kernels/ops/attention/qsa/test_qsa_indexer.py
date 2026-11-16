@@ -3,6 +3,7 @@ up to rare last-ulp RMSNorm flips (see assert_bit_comparable). With an fp8
 indexer cache the same rows are cast to e4m3 at the store, so a bf16 last-ulp
 flip may move the e4m3 code by one step (see assert_fp8_within_one_ulp)."""
 
+import math
 from types import SimpleNamespace
 
 import pytest
@@ -330,7 +331,8 @@ def _packed_prefill_case(
     return q, k, as_tensor(starts), as_tensor(ends), max(lengths)
 
 
-@pytest.mark.parametrize("score_scale", [None, 3.0])
+# sqrt(6) is not an fp32 value: an fp32 reciprocal of it would differ from div_.
+@pytest.mark.parametrize("score_scale", [None, 3.0, math.sqrt(6)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float8_e4m3fn])
 @pytest.mark.parametrize(
     "lengths, rows_per_block",

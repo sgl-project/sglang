@@ -5,7 +5,6 @@ import functools
 import math
 from typing import Optional
 
-import numpy as np
 import torch
 
 from sglang.srt.utils.common import is_hip
@@ -478,12 +477,6 @@ def torch_qsa_mqa_prefill_relative(
     return gathered.masked_fill(~valid, -float("inf"))
 
 
-def _reciprocal_fp32(scale: float) -> float:
-    """1 / scale rounded as torch's ``div_`` by a host scalar computes it (fp32),
-    so scaling by a multiply in the kernel matches ``div_`` bit for bit."""
-    return float(np.float32(1.0) / np.float32(scale))
-
-
 def tilelang_qsa_mqa_prefill_relative(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -541,7 +534,9 @@ def tilelang_qsa_mqa_prefill_relative(
         logits,
         starts,
         ends,
-        _reciprocal_fp32(score_scale or math.sqrt(head_dim)),
+        # Multiplying by 1.0 / scale gives the same fp32 scores as the absolute
+        # path's div_ by scale (test_relative_prefill_scores_equal_absolute).
+        1.0 / (score_scale or math.sqrt(head_dim)),
     )
     return logits[:rows]
 
