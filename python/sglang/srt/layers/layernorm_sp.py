@@ -35,7 +35,6 @@ nothing in this module executes.
 
 from __future__ import annotations
 
-import logging
 from typing import Callable, Optional
 
 import torch
@@ -44,8 +43,6 @@ import torch.distributed as dist
 from sglang.srt.runtime_context import get_flags, get_forward, get_parallel
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import ceil_align
-
-logger = logging.getLogger(__name__)
 
 # Architectures whose decoder layers route attention/MLP through
 # layer boundaries with the standard participant linears, and for which SP
@@ -75,12 +72,6 @@ def initialize_layernorm_sp(*, model_config) -> None:
         and architecture in SP_SUPPORTED_ARCHITECTURES
     )
     get_flags().sp.enabled = enabled
-    if enabled:
-        logger.info(
-            "LayerNorm sequence parallelism (SP) ENABLED for architecture=%s; "
-            "prefill uses reduce_scatter+all_gather via the SP region.",
-            architecture,
-        )
 
 
 def layernorm_sp_enabled() -> bool:

@@ -146,18 +146,6 @@ class TestLayerNormSPGating(CustomTestCase):
         self.assertTrue(layernorm_sp.runs_sp(ForwardMode.EXTEND, 1))
         reset_context()
 
-    def test_enabled_logs_explicit_marker(self):
-        """The ENABLED marker is the e2e test's proof that SP truly engaged."""
-        with self.assertLogs("sglang.srt.layers.layernorm_sp", level="INFO") as logs:
-            _initialize(enable=True, arch="Qwen3ForCausalLM")
-        self.assertTrue(
-            any("LayerNorm sequence parallelism (SP) ENABLED" in m for m in logs.output)
-        )
-
-    def test_disabled_logs_no_marker(self):
-        with self.assertNoLogs("sglang.srt.layers.layernorm_sp", level="INFO"):
-            _initialize(enable=False, arch="Qwen3ForCausalLM")
-
 
 class TestSPCollectiveWorkspaceOwnership(CustomTestCase):
     def test_growth_retains_storage_used_by_older_graphs(self):
