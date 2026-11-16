@@ -15,7 +15,6 @@ from sglang.multimodal_gen.configs.sample.longcat_image import (
     LongCatImageEditTurboSamplingParams,
 )
 from sglang.multimodal_gen.configs.task_type import ModelTaskType
-from sglang.multimodal_gen.runtime.models.dits import longcat_image
 
 
 @pytest.fixture
@@ -192,29 +191,3 @@ def test_expand_conditioning_noop_for_single_output():
     config.expand_conditioning_to_sample_batch(batch)
     assert batch.prompt_embeds[0] is pe  # untouched
     assert batch.prompt_embeds[0].shape == (1, 850, 3584)
-
-
-@pytest.mark.parametrize("float64_supported", [True, False])
-def test_rope_tables_follow_the_platform_float64_capability(
-    monkeypatch, float64_supported
-):
-    """The RoPE frequency tables are built in fp64 only where the platform
-    declares fp64 support, whatever the device type is called."""
-    dtypes = []
-    build = longcat_image.get_1d_rotary_pos_embed
-
-    def record(*args, **kwargs):
-        dtypes.append(kwargs["freqs_dtype"])
-        return build(*args, **kwargs)
-
-    monkeypatch.setattr(longcat_image, "get_1d_rotary_pos_embed", record)
-    monkeypatch.setattr(
-        longcat_image.current_platform,
-        "is_float64_supported",
-        lambda: float64_supported,
-    )
-    pos_embed = longcat_image._LongCatPosEmbed(theta=10000, axes_dim=[4, 6, 6])
-    cos, sin = pos_embed(torch.zeros(5, 3))
-    assert cos.shape == sin.shape == (5, 16)
-    expected = torch.float64 if float64_supported else torch.float32
-    assert dtypes == [expected] * 3

@@ -798,7 +798,7 @@ class _LongCatPosEmbed(nn.Module):
         cos_out, sin_out = [], []
         pos = ids.float()
         freqs_dtype = (
-            torch.float64 if current_platform.is_float64_supported() else torch.float32
+            torch.float32 if ids.device.type in ("mps", "npu") else torch.float64
         )
         for i, dim in enumerate(self.axes_dim):
             cos, sin = get_1d_rotary_pos_embed(
