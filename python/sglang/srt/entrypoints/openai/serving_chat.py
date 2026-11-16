@@ -6,7 +6,6 @@ import logging
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import AsyncGenerator
 from enum import Enum
 from http import HTTPStatus
 from typing import (
