@@ -563,10 +563,7 @@ class Pi05PolicyModel(nn.Module):
                 if shape:
                     config.state_dim = int(shape[0])
         config.empty_cameras = int(payload.get("empty_cameras", 0) or 0)
-        for index in range(config.empty_cameras):
-            key = f"empty_camera_{index}"
-            if key not in image_keys:
-                image_keys.append(key)
+        image_keys.extend(f"empty_camera_{i}" for i in range(config.empty_cameras))
         if image_keys:
             config.image_keys = tuple(image_keys)
 
@@ -582,33 +579,37 @@ class Pi05PolicyModel(nn.Module):
         config: Pi05PipelineConfig,
     ) -> Pi05CheckpointManifest:
         path = Path(model_path)
-        processor_state_files = set()
+        weight_files = set(path.glob("*.safetensors"))
+        default = Pi05PipelineConfig()
         for name in ("policy_preprocessor.json", "policy_postprocessor.json"):
             processor_path = path / name
-            if processor_path.is_file():
-                with processor_path.open(encoding="utf-8") as f:
-                    processor = json.load(f)
-                processor_state_files.update(
-                    (path / step["state_file"]).resolve()
-                    for step in processor.get("steps", [])
-                    if step.get("state_file")
+            try:
+                if processor_path.is_file():
+                    with processor_path.open(encoding="utf-8") as f:
+                        processor = json.load(f)
+                    state_files = weight_files & {
+                        path / step["state_file"]
+                        for step in processor.get("steps", [])
+                        if step.get("state_file")
+                    }
+                    for state_file in state_files:
+                        with safe_open(state_file, framework="pt", device="cpu") as f:
+                            keys = f.keys()
+                        if any(
+                            Pi05PolicyModel._component_for_source_key(key, default)
+                            is not None
+                            for key in keys
+                        ):
+                            raise ValueError(f"{state_file.name} holds model weights")
+                    weight_files -= state_files
+            except Exception as e:
+                logger.warning(
+                    "Ignoring LeRobot processor config %s: %s", processor_path, e
                 )
         # LeRobot stores normalization state beside the neural network weights.
         # Its pre/postprocessor files can contain the same tensor names.
-        safetensor_files = sorted(
-            str(p)
-            for p in path.glob("*.safetensors")
-            if p.resolve() not in processor_state_files
-        )
+        safetensor_files = sorted(str(p) for p in weight_files)
         skipped_lm_head_keys: list[str] = []
-
-        try:
-            from safetensors import safe_open
-        except ImportError:
-            return Pi05CheckpointManifest(
-                model_path=model_path,
-                safetensor_files=safetensor_files,
-            )
 
         for filename in safetensor_files:
             with safe_open(filename, framework="pt", device="cpu") as f:
@@ -665,16 +666,17 @@ class Pi05PolicyModel(nn.Module):
             )
         return list(dict.fromkeys(candidates))
 
-    def _component_for_source_key(self, key: str) -> str | None:
+    @staticmethod
+    def _component_for_source_key(key: str, config: Pi05PipelineConfig) -> str | None:
         if key in {
             "paligemma_with_expert.paligemma.lm_head.weight",
             "paligemma_with_expert.paligemma.model.lm_head.weight",
         }:
             return "paligemma"
-        candidates = self._candidate_weight_keys(key)
+        candidates = Pi05PolicyModel._candidate_weight_keys(key)
         if not candidates:
             return None
-        for component, prefixes in self.config.loader_component_map.items():
+        for component, prefixes in config.loader_component_map.items():
             if any(
                 candidate.startswith(prefix)
                 for candidate in candidates
@@ -687,7 +689,7 @@ class Pi05PolicyModel(nn.Module):
         components = self._ROLE_COMPONENTS[self.runtime_role]
         if components is None:
             return True
-        component = self._component_for_source_key(key)
+        component = self._component_for_source_key(key, self.config)
         return component in components
 
     def _should_read_source_key(self, key: str) -> bool:
