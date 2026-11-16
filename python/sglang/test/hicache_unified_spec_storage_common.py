@@ -162,6 +162,34 @@ class HiCacheUnifiedSpecStorageMixin:
         self.assertEqual(len(input_ids), length)
         return input_ids
 
+    def ledger_prompt(self, seed: int, pages: Optional[int] = None) -> List[int]:
+        """Natural sentences of one pattern whose particulars never repeat.
+
+        A draft can follow the pattern from the prefix but has to guess the
+        particulars, so its accept length stays below that of a perfect
+        draft, and falls when its KV of the prefix is lost. A longer prompt
+        of the same seed starts with the shorter one.
+        """
+        from sglang.benchmark.utils import get_tokenizer
+
+        rng = random.Random(seed)
+        days = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+        sellers = ["the baker", "the miller", "the weaver", "the potter", "the smith"]
+        buyers = ["a teacher", "a sailor", "a farmer", "a doctor", "a carpenter"]
+        goods = ["loaves", "sacks of flour", "blankets", "clay jars", "iron nails"]
+        towns = ["Aldery", "Brinmoor", "Castow", "Dunmere", "Elstead", "Farrow"]
+        text = "The ledger of the market, one sale to a line.\n"
+        for _ in range(400):
+            text += (
+                f"On {rng.choice(days)} {rng.choice(sellers)} sold "
+                f"{rng.randint(2, 97)} {rng.choice(goods)} to {rng.choice(buyers)} "
+                f"from {rng.choice(towns)} for {rng.randint(3, 480)} crowns.\n"
+            )
+        length = (pages or self.prompt_pages) * PAGE_SIZE + self.prompt_extra_tokens
+        input_ids = get_tokenizer(self.model).encode(text)[:length]
+        self.assertEqual(len(input_ids), length)
+        return input_ids
+
     @staticmethod
     def spec_stats(result: Dict) -> tuple:
         meta = result["meta_info"]
@@ -195,9 +223,9 @@ class HiCacheUnifiedSpecStorageMixin:
         response.raise_for_status()
         return response.json()
 
-    def assert_storage_hit(self, result: Dict):
+    def assert_storage_hit(self, result: Dict, pages: Optional[int] = None):
         details = result["meta_info"].get("cached_tokens_details") or {}
-        expected = self.prompt_pages * PAGE_SIZE
+        expected = (pages or self.prompt_pages) * PAGE_SIZE
         self.assertEqual(details.get("storage"), expected, details)
         self.assertEqual(details.get("device"), 0, details)
         self.assertEqual(details.get("host"), 0, details)
@@ -287,9 +315,11 @@ class HiCacheUnifiedSpecStorageMixin:
         deadline = time.monotonic() + timeout
         listing, stable_since = None, time.monotonic()
         while time.monotonic() < deadline:
+            # Objects only: a temporary file can vanish while it is listed.
             current = {
                 name: os.path.getsize(os.path.join(self.storage_path, name))
                 for name in os.listdir(self.storage_path)
+                if name.endswith(".bin")
             }
             if current != listing:
                 listing, stable_since = current, time.monotonic()
