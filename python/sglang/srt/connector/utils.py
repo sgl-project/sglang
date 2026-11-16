@@ -29,7 +29,6 @@ def pull_files_from_db(
 
     for file in files:
         destination_file = os.path.join(local_dir, file.removeprefix(prefix))
-        local_dir = Path(destination_file).parent
-        os.makedirs(local_dir, exist_ok=True)
+        os.makedirs(Path(destination_file).parent, exist_ok=True)
         with open(destination_file, "wb") as f:
             f.write(connector.getstr(file).encode("utf-8"))
