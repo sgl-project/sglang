@@ -127,6 +127,24 @@ Add `--image-path first_frame.png` to condition the video on an image. Frame
 counts align to `8n+1`; width and height must be divisible by 32. The 4-step
 preview is a different checkpoint and is not supported by this pipeline.
 
+For repeated requests at a fixed shape on an NVIDIA CUDA GPU with enough memory
+to keep all components resident, capture breakable CUDA graphs at startup:
+
+```bash Command
+sglang serve \
+  --model-path Efficient-Large-Model/SANA-Video_2.0_5B_720p \
+  --performance-mode manual --component-residency=all=resident \
+  --enable-breakable-cuda-graph --enable-torch-compile false \
+  --warmup-resolutions 832x480 --warmup-num-frames 81 \
+  --port 30010
+```
+
+This captures text-to-video and first-frame image-conditioned timestep shapes
+for 832×480, 81-frame requests. Other resolutions or frame counts run eagerly.
+The default prompt length is fixed at 300 tokens, so no text bucket flag is
+needed for this command. Changing quality after startup drops captured graphs
+and runs eagerly until restart.
+
 Add `--quality high` to run the eight softmax anchor layers with BF16-input
 flash attention instead of the FP32 memory-efficient kernel the default path
 uses. Accumulation stays FP32 inside the kernel, but the output is no longer

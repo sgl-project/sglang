@@ -22,6 +22,7 @@ For maintained direct-run and serving examples, see
 Start a server with any example config:
 
 ```bash
+export SGLANG_ADMIN_API_KEY=<key>
 python3 -m sglang_simulator.simulation.sglang.launch_server \
   --model-path /path/to/model \
   --sim-config-path examples/sim_configs/aisimulate_sol.json \
