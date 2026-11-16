@@ -519,6 +519,18 @@ class _FlashAttention2BackendResolver(_CudaAttentionBackendResolver):
         return "sglang.multimodal_gen.runtime.layers.attention.backends.flash_attn_2.FlashAttention2Backend"
 
 
+class _FlashInferFA2BackendResolver(_CudaAttentionBackendResolver):
+    backend = AttentionBackendEnum.FLASHINFER_FA2
+
+    @classmethod
+    def resolve(cls, platform) -> str:
+        try:
+            from flashinfer import single_prefill_with_kv_cache  # noqa: F401
+        except ImportError as error:
+            raise ValueError("FlashInfer FA2 requires flashinfer-python.") from error
+        return "sglang.multimodal_gen.runtime.layers.attention.backends.flashinfer_fa2.FlashInferFA2Backend"
+
+
 class _FlashAttentionBackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.FA
 
@@ -533,13 +545,13 @@ class _FP8FlashAttentionSM120BackendResolver(_CudaAttentionBackendResolver):
     backend = AttentionBackendEnum.FP8_FA_SM120
 
     # CuTe-DSL mma.sync FP8 kernel written for SM120 (GeForce RTX 50 / RTX PRO
-    # Blackwell). Dense non-causal head_dim 128 only; the backend itself falls
+    # Blackwell) and SM121 (GB10). Dense non-causal head_dim 128 only; it falls
     # back to cuDNN SDPA for other calls.
     @classmethod
     def resolve(cls, platform) -> str | AttentionBackendEnum:
-        if platform.get_device_capability() != (12, 0):
+        if platform.get_device_capability() not in ((12, 0), (12, 1)):
             logger.warning(
-                "fp8_fa_sm120 attention needs an SM120 device; falling back to cuDNN SDPA."
+                "fp8_fa_sm120 attention needs SM120/SM121; falling back to cuDNN SDPA."
             )
             return AttentionBackendEnum.TORCH_CUDNN_SDPA
         try:
@@ -581,6 +593,7 @@ _CUDA_ATTENTION_BACKEND_RESOLVERS = {
         _VMOBAAttentionBackendResolver,
         _SubBlockSparseAttentionBackendResolver,
         _FlashAttention2BackendResolver,
+        _FlashInferFA2BackendResolver,
         _FlashAttentionBackendResolver,
         _FP8FlashAttentionSM120BackendResolver,
     )
@@ -592,7 +605,6 @@ class CudaPlatformBase(Platform):
     device_name: str = "cuda"
     device_type: str = "cuda"
     dispatch_key: str = "CUDA"
-    device_control_env_var: str = "CUDA_VISIBLE_DEVICES"
 
     @classmethod
     def get_local_torch_device(cls) -> torch.device:
@@ -810,6 +822,11 @@ class CudaPlatformBase(Platform):
         head_size: int,
         dtype: torch.dtype,
     ) -> str:
+        if selected_backend == AttentionBackendEnum.FLASHINFER_FA2 and dtype not in (
+            torch.float16,
+            torch.bfloat16,
+        ):
+            raise ValueError("FlashInfer FA2 requires float16 or bfloat16 inputs.")
         if selected_backend is None:
             target_backend = cls._resolve_default_attn_backend()
             if target_backend == AttentionBackendEnum.FA and cls.is_blackwell():

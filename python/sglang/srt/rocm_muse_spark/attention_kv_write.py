@@ -33,6 +33,7 @@ logger = logging.getLogger(__name__)
 
 QK_ROPE_CACHE = envs.SGLANG_ROCM_MUSE_QK_ROPE_CACHE.get()
 FUSED_QKV_CACHE = envs.SGLANG_ROCM_MUSE_FUSED_QKV_CACHE.get()
+QK_ROPE_CACHE_MAX_ROWS = envs.SGLANG_ROCM_MUSE_QK_ROPE_CACHE_MAX_ROWS.get()
 _logged: set = set()
 
 
@@ -69,7 +70,7 @@ def _kv_write_target(attention, forward_batch: ForwardBatch) -> _KVWriteTarget |
     if not (
         isinstance(backend, AiterAttnBackend)
         and not backend.use_mla
-        and backend.page_size == 16
+        and backend.page_size in (16, 32, 64, 128)
         and not backend.kv_cache_is_vectorized_5d
         and backend.use_triton_unified_attention
         and not layer.is_cross_attention
@@ -176,7 +177,7 @@ def qk_norm_rope_kv_write(
 ):
     """(q, k) normalized and rotated with K/V already in the cache, or None when the kernel does not apply."""
     if not (
-        0 < q.shape[0] <= 64
+        0 < q.shape[0] <= QK_ROPE_CACHE_MAX_ROWS
         and q.dtype == k.dtype == v.dtype == torch.bfloat16
         and q.stride(1) == k.stride(1) == v.stride(1) == 1
         and _attention_shape_ok(attention, forward_batch)

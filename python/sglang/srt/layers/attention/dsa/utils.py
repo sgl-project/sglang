@@ -508,3 +508,26 @@ def resolve_fp8_mqa_logits_fn():
     import deep_gemm
 
     return deep_gemm.fp8_mqa_logits
+
+
+def use_bf16_indexer_logits() -> bool:
+    return envs.SGLANG_DSA_INDEXER_BF16_LOGITS.get() and is_cuda()
+
+
+def fp8_mqa_logits_bf16(q_fp8, kv_fp8, weights, ks, ke):
+    import deep_gemm
+
+    schedule_meta = deep_gemm.get_mqa_logits_metadata_legacy(
+        ks, ke, kv_fp8[0].shape[0], q_fp8.shape[1]
+    )
+    return deep_gemm.fp8_fp4_mqa_logits_legacy(
+        q_fp8,
+        kv_fp8,
+        weights.to(torch.bfloat16),
+        ks,
+        ke,
+        False,
+        0,
+        torch.bfloat16,
+        schedule_meta,
+    )
