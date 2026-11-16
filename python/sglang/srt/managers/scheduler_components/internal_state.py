@@ -9,7 +9,6 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.managers.io_struct import (
     GetInternalStateReq,
@@ -19,7 +18,7 @@ from sglang.srt.managers.io_struct import (
 )
 from sglang.srt.managers.scheduler_components.memory_usage import build_memory_usage
 from sglang.srt.runtime_context import get_context, get_exec, get_parallel
-from sglang.srt.server_args import compute_world_size
+from sglang.srt.server_args import compute_world_size, redact_server_args_secrets
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 
 if TYPE_CHECKING:
@@ -45,7 +44,9 @@ class SchedulerInternalStateController:
     def get_internal_state(self, recv_req: GetInternalStateReq):
         # Resolved config (pristine server_args + post-publish overrides) so a
         # readback reflects values changed via /set_internal_state, not startup.
-        state = get_context().resolved_server_args_dict()
+        # Every reader reports it (`internal_states` in `/server_info` and
+        # `Engine.get_server_info`), so the credentials stay out.
+        state = redact_server_args_secrets(get_context().resolved_server_args_dict())
         for contribute in (
             self._add_topology,
             self._add_memory_usage,
@@ -82,6 +83,7 @@ class SchedulerInternalStateController:
             startup_available_gb=scheduler.startup_available_gpu_memory_gb,
             token_capacity=scheduler.max_total_num_tokens,
             token_capacity_swa=scheduler.swa_tokens_per_layer,
+            token_capacity_window=scheduler.window_token_capacities(),
             target_graph_memory_usage=scheduler.tp_worker.graph_memory_usage,
             draft_graph_memory_usage=(
                 None if draft_worker is None else draft_worker.graph_memory_usage
@@ -253,33 +255,12 @@ class SchedulerInternalStateController:
         )
 
     def _has_active_sampling_mask_request(self) -> bool:
-        """Whether any unfinished request holding a sampling mask is queued or
-        running, including PP micro-batches and PD decode queues."""
-        scheduler = self.scheduler
-        batches = [scheduler.running_batch, scheduler.last_batch]
-        batches.extend(getattr(scheduler, "running_mbs", ()))
-        batches.extend(getattr(scheduler, "mbs", ()))
-        batches.extend(getattr(scheduler, "last_mbs", ()))
-        queued = [
-            *(req for batch in batches if batch is not None for req in batch.reqs),
-            *scheduler.waiting_queue,
-            *scheduler.grammar_manager.grammar_queue,
-        ]
-        if scheduler.chunked_req is not None:
-            queued.append(scheduler.chunked_req)
-        if scheduler.disaggregation_mode == DisaggregationMode.DECODE:
-            prealloc_queue = scheduler.disagg_decode_prealloc_queue
-            queued.extend(
-                decode_req.req
-                for decode_req in (
-                    *prealloc_queue.queue,
-                    *prealloc_queue.pending_reqs,
-                    *scheduler.disagg_decode_transfer_queue.queue,
-                )
-            )
-            queued.extend(prealloc_queue.retracted_queue)
-            queued.extend(prealloc_queue.held_rebootstrap_reqs)
-        return any(req.return_sampling_mask and not req.finished() for req in queued)
+        """Whether any unfinished live request holds a sampling mask."""
+        return any(
+            req.return_sampling_mask and not req.finished()
+            for reqs in self.scheduler.request_lists().values()
+            for req in reqs
+        )
 
 
 class _UpdateHandler:

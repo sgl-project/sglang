@@ -10,17 +10,12 @@ from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
     MINIMAX_H3_ADALN_MODALITY_NUM,
     MiniMaxH3DiTArchConfig,
 )
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
-)
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
     MiniMaxH3AdalnCache,
 )
-from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
-    ensure_distributed_env_defaults,
-)
 from sglang.multimodal_gen.test.unit.host_sync_guard import forbid_host_syncs
+
+pytestmark = pytest.mark.usefixtures("single_process_model_parallel")
 
 _ARCH = MiniMaxH3DiTArchConfig(
     num_layers=2,
@@ -29,13 +24,6 @@ _ARCH = MiniMaxH3DiTArchConfig(
 )
 _BLOCK_WIDTH = 6 * MINIMAX_H3_ADALN_MODALITY_NUM * _ARCH.hidden_size
 _FINAL_WIDTH = 2 * _ARCH.hidden_size
-
-
-def _ensure_single_process_parallel_runtime() -> None:
-    if model_parallel_is_initialized():
-        return
-    ensure_distributed_env_defaults()
-    maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
 
 
 def _weights_fill(*shape: int, scale: float) -> torch.Tensor:
@@ -76,7 +64,6 @@ def _online_cache(
     host_cache_bytes: int = 0,
     scale: float = 0.0,
 ) -> MiniMaxH3AdalnCache:
-    _ensure_single_process_parallel_runtime()
     weight_path = tmp_path / "model.safetensors"
     _write_online_weights(weight_path, omit=omit, scale=scale)
     cache = MiniMaxH3AdalnCache(
@@ -322,7 +309,6 @@ def test_host_tier_lru_eviction_and_shared_plan_refcount(tmp_path):
 
 
 def test_precision_fp32_projects_in_fp32_then_stores_bf16(tmp_path):
-    _ensure_single_process_parallel_runtime()
     weight_path = tmp_path / "model.safetensors"
     _write_online_weights(weight_path, scale=1.0)
     cache = MiniMaxH3AdalnCache(

@@ -6,12 +6,12 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.arg_groups.overrides import (
     _dllm_attention_backend,
     _dllm_overlap_disable,
     _dllm_page_size,
     declare_resolution,
-    resolving_view,
     run_post_process_pass,
 )
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase

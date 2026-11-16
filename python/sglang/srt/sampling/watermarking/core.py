@@ -560,6 +560,7 @@ class WatermarkState:
         self.partial_scores_buffer = torch.empty(0, dtype=torch.float32, device=device)
         self.partial_token_ids_buffer = torch.empty(0, dtype=torch.int32, device=device)
         self.output_token_ids_buffer = torch.empty(0, dtype=torch.int32, device=device)
+        self.chain_masks: dict[int, torch.Tensor] = {}
         if vocab_size > 0 and self.token_ids.is_cuda:
             self._ensure_selection_buffers(max_num_reqs, vocab_size)
 
@@ -1113,6 +1114,59 @@ class WatermarkState:
         for position in range(accept_tokens.shape[1]):
             valid = position < accept_lens
             self.append(req_pool_indices[valid], accept_tokens[valid, position])
+
+    def force_speculative_chain(
+        self,
+        logits: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        chain_tokens: torch.Tensor,
+        positions: torch.Tensor,
+        sampling_info: SamplingBatchInfo,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        batch_size, chain_length = chain_tokens.shape
+        return self.force_speculative_from_tree(
+            logits=logits,
+            req_pool_indices=req_pool_indices,
+            draft_tokens=chain_tokens.reshape(-1),
+            custom_mask=self._chain_mask(chain_length)[:batch_size].reshape(-1),
+            positions=positions.reshape(-1),
+            sampling_info=sampling_info,
+            draft_token_num=chain_length,
+            full_mask=False,
+        )
+
+    def commit_speculative_chain(
+        self,
+        req_pool_indices: torch.Tensor,
+        context_hashes: torch.Tensor,
+        selected: torch.Tensor,
+        accept_tokens: torch.Tensor,
+        accept_lens: torch.Tensor,
+    ) -> None:
+        batch_size, chain_length = accept_tokens.shape
+        accept_index = torch.arange(
+            batch_size * chain_length, dtype=torch.int32, device=accept_tokens.device
+        ).view(batch_size, chain_length)
+        self.record_speculative(
+            req_pool_indices, context_hashes, selected, accept_index, accept_lens
+        )
+        self.append_speculative(req_pool_indices, accept_tokens, accept_lens)
+
+    def _chain_mask(self, chain_length: int) -> torch.Tensor:
+        mask = self.chain_masks.get(chain_length)
+        if mask is None:
+            mask = (
+                torch.ones(
+                    (chain_length, chain_length),
+                    dtype=torch.bool,
+                    device=self.token_ids.device,
+                )
+                .tril()
+                .expand(self.token_ids.shape[0], -1, -1)
+                .contiguous()
+            )
+            self.chain_masks[chain_length] = mask
+        return mask
 
     def force(
         self,

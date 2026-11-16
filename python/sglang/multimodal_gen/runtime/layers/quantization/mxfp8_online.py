@@ -16,7 +16,7 @@ import torch
 from torch.nn import Module
 from torch.nn.functional import ScalingType, SwizzleType, scaled_mm
 
-from sglang.kernels.ops.diffusion import (
+from sglang.kernels.ops.quantization.mxfp8_swizzled_triton import (
     can_use_mxfp8_swizzled,
     mxfp8_quantize_swizzled,
 )

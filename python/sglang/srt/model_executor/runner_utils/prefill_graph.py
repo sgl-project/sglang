@@ -11,6 +11,7 @@ import torch
 class _PrefillGraphState:
     full_graph: bool
     raw_num_tokens: int | None
+    zero_padded_tail: bool
 
 
 _current: ContextVar[_PrefillGraphState | None] = ContextVar(
@@ -39,9 +40,21 @@ def get_prefill_raw_num_tokens() -> int | None:
     return state.raw_num_tokens if state is not None else None
 
 
+def should_zero_prefill_padding() -> bool:
+    state = _current.get()
+    return state is None or state.zero_padded_tail
+
+
 @contextmanager
-def prefill_graph_scope(*, full_graph: bool, raw_num_tokens: int | None = None):
-    reset_token = _current.set(_PrefillGraphState(full_graph, raw_num_tokens))
+def prefill_graph_scope(
+    *,
+    full_graph: bool,
+    raw_num_tokens: int | None = None,
+    zero_padded_tail: bool = True,
+):
+    reset_token = _current.set(
+        _PrefillGraphState(full_graph, raw_num_tokens, zero_padded_tail)
+    )
     try:
         yield
     finally:

@@ -35,7 +35,7 @@ register_amd_ci(
     suite="stage-b-test-1-gpu-small-amd",
     disabled="see https://github.com/sgl-project/sglang/issues/11127",
 )
-register_cuda_ci(est_time=154, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=105, stage="base-b", runner_config="1-gpu-small")
 
 MODEL_TO_CONFIG = {
     "Alibaba-NLP/gte-Qwen2-1.5B-instruct": (1, 1e-5),
@@ -155,6 +155,30 @@ class TestEmbeddingModels(CustomTestCase):
                     prefill_tolerance,
                     matryoshka_dim=128,
                 )
+
+    def test_embedding_encoding_format(self):
+        model = "Alibaba-NLP/gte-Qwen2-1.5B-instruct"
+        tp_size = MODEL_TO_CONFIG[model][0]
+        torch_dtype = torch.float16
+        prompts = self._truncate_prompts(DEFAULT_PROMPTS, model)
+
+        with SRTRunner(
+            model,
+            tp_size=tp_size,
+            torch_dtype=torch_dtype,
+            model_type="embedding",
+        ) as srt_runner:
+            default_outputs = srt_runner.forward(prompts)
+            tensor_outputs = srt_runner.forward(prompts, encoding_format="tensor")
+
+        for default_emb, tensor_emb in zip(
+            default_outputs.embed_logits, tensor_outputs.embed_logits
+        ):
+            self.assertNotIsInstance(default_emb, torch.Tensor)
+            self.assertIsInstance(tensor_emb, torch.Tensor)
+            self.assertEqual(tensor_emb.dtype, torch_dtype)
+            similarity = get_similarities(default_emb, tensor_emb.float())
+            self.assertTrue(torch.all(abs(similarity - 1) < 1e-5))
 
 
 if __name__ == "__main__":

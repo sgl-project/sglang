@@ -6,7 +6,7 @@ configurations partition independently across GB300 runners. All use default
 decoder bounded replay and explicitly enabled breakable prefill graphs.
 
 They run on two GB300 GPUs (TP2) with the engram tables in host memory
-(SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE). The two engram tables are ~189 GiB in FP8
+(--engram-config '{"placement": "cpu"}'). The two engram tables are ~189 GiB in FP8
 (2 x ~384M rows x 264 B), so at TP2 offloading them frees ~94 GiB per GPU and the
 remaining weights (~143 GiB/GPU) leave room for KV cache, graphs and DSPARK.
 """
@@ -54,8 +54,6 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
         "8192",
     ]
     parallel_args = []
-    # Keep the engram tables in host memory so DSV4.1-Flash fits on two GB300s.
-    server_env = {"SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE": "1"}
 
     @classmethod
     def setUpClass(cls):
@@ -84,10 +82,13 @@ class DSV41FlashAccuracyMixin(GSM8KMixin):
                 "--tool-call-parser",
                 "auto",
                 "--disable-flashinfer-autotune",
+                # Keep the engram tables in host memory so DSV4.1-Flash fits on
+                # two GB300s.
+                "--engram-config",
+                '{"placement": "cpu"}',
                 *cls.parallel_args,
                 *cls.graph_args,
             ],
-            env=cls.server_env,
         )
         cls.addClassCleanup(kill_process_tree, cls.process.pid)
 

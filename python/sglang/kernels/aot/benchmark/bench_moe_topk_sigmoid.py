@@ -6,7 +6,7 @@ import torch
 import triton
 from sgl_kernel import topk_sigmoid
 
-from sglang.utils import is_in_ci
+from sglang.srt.environ import envs
 
 # Optional MUSA import
 try:
@@ -25,7 +25,7 @@ except ImportError:
     musa_topk_sigmoid = None
     MUSA_AVAILABLE = False
 
-IS_CI = is_in_ci()
+IS_CI = envs.SGLANG_IS_IN_CI.get()
 
 
 def torch_topk_sigmoid_native(

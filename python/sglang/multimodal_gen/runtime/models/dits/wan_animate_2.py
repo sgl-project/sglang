@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 from torch.nn.attention.flex_attention import BlockMask, create_block_mask
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.wan_animate_2 import (
     WanAnimate2Config,
 )
@@ -27,6 +28,8 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 from sglang.multimodal_gen.runtime.models.dits.wan_animate_2_block import (
     WanAnimate2TransformerBlock,
     _InContextLayout,
+    _pad_reference_video_kv,
+    _quantize_fp8_per_token_head,
     _reference_video_key_mask,
 )
 from sglang.multimodal_gen.runtime.models.dits.wan_animate_2_clip_conditioning import (
@@ -311,6 +314,24 @@ class WanAnimate2Transformer3DModel(WanTransformer3DModel):
 
         k_by_block: dict[int, torch.Tensor] = {}
         v_by_block: dict[int, torch.Tensor] = {}
+        # Only the slot geometry is read, which depends on the full-clip and reference grids.
+        layout = _InContextLayout(
+            clip_cond.full_clip_grid_sizes,
+            clip_cond.reference_video_grid_sizes,
+            clip_cond.full_clip_grid_sizes,
+        )
+        use_fp8 = envs.SGLANG_DIFFUSION_WAN_ANIMATE_2_FP8_REFERENCE_KV
+        if use_fp8 and (
+            not torch.cuda.is_available()
+            or torch.cuda.get_device_capability() < (8, 9)
+            or torch.version.hip is not None
+        ):
+            raise ValueError(
+                "SGLANG_DIFFUSION_WAN_ANIMATE_2_FP8_REFERENCE_KV needs an NVIDIA GPU with "
+                "float8_e4m3fn support (sm89+)."
+            )
+        k_scale_by_block: dict[int, torch.Tensor] | None = {} if use_fp8 else None
+        v_scale_by_block: dict[int, torch.Tensor] | None = {} if use_fp8 else None
         # Call via __call__ (not forward_ref) so the layerwise-offload hooks fire.
         for idx, block in enumerate(self.blocks):
             hidden_states = block(
@@ -326,7 +347,20 @@ class WanAnimate2Transformer3DModel(WanTransformer3DModel):
                 v_cache=v_by_block,
                 reference_video_key_mask=reference_video_key_mask,
             )
-        return WanAnimate2ReferenceKV(k=k_by_block, v=v_by_block)
+            # Store in the layout forward_gen consumes; one block's extra copy is live at a time.
+            for cache, scales in (
+                (k_by_block, k_scale_by_block),
+                (v_by_block, v_scale_by_block),
+            ):
+                cache[idx] = _pad_reference_video_kv(cache[idx], layout)
+                if scales is not None:
+                    cache[idx], scales[idx] = _quantize_fp8_per_token_head(cache[idx])
+        return WanAnimate2ReferenceKV(
+            k=k_by_block,
+            v=v_by_block,
+            k_scale=k_scale_by_block,
+            v_scale=v_scale_by_block,
+        )
 
     @torch.no_grad()
     def forward(
@@ -438,6 +472,8 @@ class WanAnimate2Transformer3DModel(WanTransformer3DModel):
                 index=idx,
                 k_cache=reference_kv.k,
                 v_cache=reference_kv.v,
+                k_scale_cache=reference_kv.k_scale,
+                v_scale_cache=reference_kv.v_scale,
             )
         return hidden_states
 
