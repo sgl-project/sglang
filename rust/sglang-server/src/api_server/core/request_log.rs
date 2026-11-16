@@ -41,7 +41,7 @@ use super::frame::CoreOutput;
 use crate::message::config::{RequestLogConfig, ServerArgs};
 use crate::message::multimodal::MmItem;
 use crate::message::request::GenerateRequest;
-use crate::message::response::ResponseItem;
+use crate::message::response::{ChunkEvent, ResponseItem};
 
 /// Python's `record_request_for_crash_dump` keeps a finished request this long.
 const CRASH_DUMP_WINDOW_SECS: f64 = 300.0;
@@ -57,6 +57,9 @@ pub(crate) struct RequestLog {
     default_priority: Option<i64>,
     /// The launch weight version the core stamps on every output.
     weight_version: Option<Arc<str>>,
+    /// This listener's data-parallel rank, which the core stamps on every
+    /// output; `None` without data parallelism.
+    dp_rank: Option<u32>,
     /// `--incremental-streaming-output`: a stream's `Finish` shows its last
     /// delta, as Python's does.
     incremental_streaming_output: bool,
@@ -141,6 +144,7 @@ impl RequestLog {
             server_added_custom_params: args.server_added_custom_params.clone(),
             default_priority: args.default_priority_value,
             weight_version: args.weight_version.as_deref().map(Arc::from),
+            dp_rank: args.deployment_info.reported_dp_rank(),
             incremental_streaming_output: args.incremental_streaming_output,
         })))
     }
@@ -167,6 +171,7 @@ impl RequestLog {
             server_added_custom_params: omitted,
             default_priority: None,
             weight_version: Some(Arc::from("default")),
+            dp_rank: None,
             incremental_streaming_output: false,
         })
     }
@@ -301,6 +306,7 @@ impl RequestLog {
             .map(|((obj, dump), request)| {
                 let output = Arc::new(Mutex::new(CoreOutput {
                     weight_version: self.weight_version.clone(),
+                    dp_rank: self.dp_rank,
                     ..Default::default()
                 }));
                 let rid = request.rid.client_facing().to_owned();
@@ -832,11 +838,11 @@ impl RequestRecord {
     pub(crate) fn observe(&mut self, item: &ResponseItem) {
         match item {
             ResponseItem::Frame(chunk) => {
-                let delta = CoreOutput::from(chunk.clone());
+                let delta = self.delta(chunk);
                 lock(&self.output).append_delta(&delta);
             }
             ResponseItem::Done(chunk) => {
-                let delta = CoreOutput::from(chunk.clone());
+                let delta = self.delta(chunk);
                 let output = {
                     let mut output = lock(&self.output);
                     output.append_delta(&delta);
@@ -855,6 +861,15 @@ impl RequestRecord {
                 self.finish(output);
             }
             _ => self.unregister(),
+        }
+    }
+
+    /// `chunk` as an output of the call, which the core stamps with the
+    /// listener's DP rank.
+    fn delta(&self, chunk: &ChunkEvent) -> CoreOutput {
+        CoreOutput {
+            dp_rank: self.log.dp_rank,
+            ..CoreOutput::from(chunk.clone())
         }
     }
 

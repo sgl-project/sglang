@@ -2129,7 +2129,8 @@ mod tests {
             (true, true, true, true, true),
             (true, true, false, false, true),
         ] {
-            // A hooked case also runs as DP rank 1; the rest as the only rank.
+            // A hooked case also runs as DP rank 1, which frames report; the
+            // rest without DP, whose frames report null.
             let dp_rank: u32 = if hook { 1 } else { 0 };
             let server_args = crate::message::config::ServerArgs {
                 incremental_streaming_output: incremental,
@@ -2147,6 +2148,7 @@ mod tests {
                     serde_json::json!({"top_k": 7}),
                 )),
                 deployment_info: crate::message::config::DeploymentInfo {
+                    dp_size: if hook { 2 } else { 1 },
                     dp_rank: Some(dp_rank),
                     ..Default::default()
                 },
@@ -2307,7 +2309,7 @@ mod tests {
                 let terminal = !meta["finish_reason"].is_null();
                 assert_eq!(
                     meta.get("dp_rank"),
-                    Some(&serde_json::json!(dp_rank)),
+                    Some(&serde_json::json!(hook.then_some(dp_rank))),
                     "{case}"
                 );
                 let keys: Vec<&str> = meta.keys().map(String::as_str).collect();

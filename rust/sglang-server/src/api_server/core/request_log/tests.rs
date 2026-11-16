@@ -302,6 +302,7 @@ fn incremental_stream_logs_last_delta() {
         server_added_custom_params: Vec::new(),
         default_priority: None,
         weight_version: Some(Arc::from("default")),
+        dp_rank: None,
         incremental_streaming_output: true,
     });
     let body = serde_json::json!({"rid": "r-inc", "text": "hi", "stream": true});

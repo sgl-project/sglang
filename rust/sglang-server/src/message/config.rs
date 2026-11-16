@@ -613,6 +613,17 @@ pub struct DeploymentInfo {
     pub node_listeners: Vec<NodeRustListener>,
 }
 
+impl DeploymentInfo {
+    /// What Python reports as `meta_info.dp_rank`: the scheduler's DP rank,
+    /// `None` without DP. `dp_rank` is the listener and KV-publisher index, so
+    /// it is 0 without DP. The two agree with more than one DP rank, whether
+    /// attention-DP groups or replicas. A rank set only by `SGLANG_DP_RANK`
+    /// with one DP rank reports `None` here, where Python reports it.
+    pub fn reported_dp_rank(&self) -> Option<u32> {
+        self.dp_rank.filter(|_| self.dp_size > 1)
+    }
+}
+
 /// One DP rank's listener, as a base URL (`http://host:port`).
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct RustServerEndpoint {
