@@ -11,43 +11,30 @@ from sglang.kernels.ops.communication.all_reduce_fusion import (
     moe_finalize_shared_gate_all_reduce,
 )
 from sglang.kernels.ops.moe.shared_expert_gate import shared_expert_gate
-from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
+from sglang.srt.distributed.device_communicators.symm_workspace import (
+    WorkspaceLease,
+    WorkspaceRequest,
+    request_group_workspace,
+)
 from sglang.srt.layers.dp_attention import is_enable_moe_cp_allgather
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.runtime_context import get_exec, get_lora, get_parallel, get_spec
 
 if TYPE_CHECKING:
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
-    )
     from sglang.srt.models.qwen2_moe import Qwen2MoeSparseMoeBlock
 
 
 @lru_cache(None)
-def _get_decode_comm(tp_comm: CustomAllReduceV2) -> CustomAllReduceV2 | None:
-    # custom_all_reduce_v2 imports tvm_ffi, absent on XPU; import it only on
-    # the CUDA path that reaches this cached constructor.
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
+def _get_decode_lease() -> WorkspaceLease | None:
+    return request_group_workspace(
+        get_parallel().tp_group,
+        WorkspaceRequest(owner="qwen4_decode", push_slot_bytes=4 * 1024 * 1024),
     )
-
-    comm = CustomAllReduceV2(
-        tp_comm.group,
-        tp_comm.device,
-        max_pull_size=0,
-        max_pull_blocks=0,
-        max_push_size=4 * 1024 * 1024,
-        max_push_blocks=512,
-    )
-    if comm.disabled:
-        return None
-    register_comm_cleanup(comm)
-    return comm
 
 
 def prepare_qwen4_decode_comm(
     mlp: Qwen2MoeSparseMoeBlock,
-) -> CustomAllReduceV2 | None:
+) -> WorkspaceLease | None:
     parallel = get_parallel()
     if (
         parallel.tp_size != 4
@@ -66,18 +53,11 @@ def prepare_qwen4_decode_comm(
         or torch.cuda.get_device_capability()[0] != 10
     ):
         return None
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
-    )
-
-    tp_comm = parallel.tp_group.ca_comm
-    if not isinstance(tp_comm, CustomAllReduceV2) or tp_comm.disabled:
-        return None
-    return _get_decode_comm(tp_comm)
+    return _get_decode_lease()
 
 
 def qwen4_decode_moe(
-    hidden: torch.Tensor, mlp: Qwen2MoeSparseMoeBlock, comm: CustomAllReduceV2
+    hidden: torch.Tensor, mlp: Qwen2MoeSparseMoeBlock, comm: WorkspaceLease
 ) -> torch.Tensor:
     if mlp.alt_stream is not None and get_is_capture_mode():
         current = torch.cuda.current_stream()
@@ -101,5 +81,5 @@ def qwen4_decode_moe(
         deferred.expert_weights,
         shared,
         gate,
-        comm.obj,
+        comm.get_communicator(),
     )

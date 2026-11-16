@@ -6,7 +6,10 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
+from sglang.srt.layers.moe.utils import MoeRunnerBackend
 from sglang.srt.layers.quantization.mxfp4 import (
+    Mxfp4MoEMethod,
     _prepare_flashinfer_mxfp8_activations,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -167,6 +170,42 @@ class TestMxfp4FlashinferActivationPrep(CustomTestCase):
         self.assertIs(actual_packed, packed_topk)
         self.assertIs(actual_quant, x_quant)
         self.assertTrue(torch.equal(actual_scale.view(torch.uint8), x_scale))
+
+
+class TestMxfp4FlashinferSituGuard(CustomTestCase):
+    def _builds_runner(self, fi_kernel, activation):
+        runner = object()
+        method = Mxfp4MoEMethod.__new__(Mxfp4MoEMethod)
+        method._fi_kernel = fi_kernel
+        method.use_mega_moe = False
+        with (
+            patch(
+                "sglang.srt.layers.quantization.mxfp4.get_moe_runner_backend",
+                return_value=MoeRunnerBackend.FLASHINFER_MXFP4,
+            ),
+            patch(
+                "sglang.srt.layers.quantization.mxfp4.MoeRunner",
+                return_value=runner,
+            ),
+        ):
+            method.create_moe_runner(object(), MoeRunnerConfig(activation=activation))
+        return method.runner is runner
+
+    def test_cutlass_runners_reject_situ(self):
+        """Kimi-K3 on SM90/SM120 loaded and served with GPT-OSS SwiGLU experts."""
+        for fi_kernel in ("cutlass_sm90", "cutlass_sm120"):
+            with self.subTest(fi_kernel=fi_kernel):
+                with self.assertRaisesRegex(NotImplementedError, "SiTU"):
+                    self._builds_runner(fi_kernel, "situ")
+
+    def test_runner_built_when_kernel_has_the_activation(self):
+        for fi_kernel, activation in (
+            ("trtllm_sm100", "situ"),
+            ("cutlass_sm90", "silu"),
+            ("cutlass_sm120", "silu"),
+        ):
+            with self.subTest(fi_kernel=fi_kernel, activation=activation):
+                self.assertTrue(self._builds_runner(fi_kernel, activation))
 
 
 if __name__ == "__main__":
