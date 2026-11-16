@@ -1866,8 +1866,8 @@ def routed_swap_matmul(
     values, x_scales, weight, scales, counts, offsets, schedule, out
 ):
     """out[r] = values[r] @ weight[e].T for the routed rows r of each local expert
-    e (offsets[e] <= r < offsets[e] + counts[e]); values/x_scales/scales use the
-    layouts of the CUTLASS swap path, schedule is route_metadata's 128-row block
+    e (offsets[e] <= r < offsets[e] + counts[e]); values/x_scales are what the routed
+    quantize kernels write, scales what swizzle_weight_scales returns, schedule is route_metadata's 128-row block
     schedule. Other rows of out are left unset."""
     experts, n, packed = weight.shape
     k = packed * 2
