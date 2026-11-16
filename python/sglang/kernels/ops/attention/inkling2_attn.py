@@ -225,14 +225,6 @@ def _cuda_gate_sink(output, gate, lse, sinks, result, group, padded_group):
 def gate_sink(output, gate, lse, sinks, *, output_dtype, head_groups=None):
     """head_groups=(group, padded_group): output and lse hold padded_group heads per
     group of group real heads (padding heads are ignored)."""
-    if not output.is_cuda:
-        scale = torch.sigmoid(lse.float() - sinks.float())
-        output = output.float() * torch.sigmoid(gate.float())
-        return (
-            (output.view(*sinks.shape, -1) * scale.unsqueeze(-1))
-            .flatten(1)
-            .to(output_dtype)
-        )
     heads = sinks.shape[-1]
     group, padded_group = head_groups or (heads, heads)
     assert output.shape[1] == heads // group * padded_group * (gate.shape[1] // heads)
@@ -282,10 +274,6 @@ def _tau_kernel(
 
 
 def compute_log_scaling_tau(positions, n_floor, alpha):
-    if not positions.is_cuda:
-        return 1.0 + alpha * torch.log(
-            torch.clamp((positions + 1).float() / n_floor, min=1.0)
-        )
     output = torch.empty(positions.shape, device=positions.device, dtype=torch.float32)
     if positions.numel():
         _tau_kernel[(triton.cdiv(positions.numel(), 256),)](
