@@ -368,7 +368,12 @@ def _worker_loop() -> None:
         # Drain first.  Block waiting for the first event.
         first = _q.get()
         if first is None:
-            # shutdown() is called.
+            # shutdown() is called when no more events are queued locally.
+            # Still participate in the batch-size and consensus collectives so
+            # if a peer rank queued extra events before shutdown(), all ranks
+            # detect the call-count divergence rather than deadlocking in Gloo.
+            _all_reduce_min_int(0)
+            _check_for_consensus([])
             return
 
         # Drain more whenever available.
@@ -403,18 +408,23 @@ def _all_reduce_min_int(value: int) -> int:
 
 
 def _check_for_consensus(events: list[str]) -> None:
-    # Compute sha1 of concatenation of all msgs.
+    # Compute sha1 of length-framed messages so message boundaries and
+    # empty-batch vs empty-string events cannot collide.
     hasher = hashlib.sha1()
     for msg in events:
-        hasher.update(msg.encode("utf-8"))
+        encoded = msg.encode("utf-8")
+        hasher.update(f"{len(encoded)}:".encode("ascii"))
+        hasher.update(encoded)
 
-    # Determine if some rank has a different value.
+    # Determine if some rank has a different value using a single MIN all_reduce
+    # per group over [digest, 255 - digest] instead of two separate collectives.
     value_bytes = hasher.digest()
-    min_value = torch.tensor(list(hasher.digest()), dtype=torch.uint8)
-    max_value = min_value.clone()
+    digest_tensor = torch.tensor(list(value_bytes), dtype=torch.uint8)
+    combined = torch.cat([digest_tensor, 255 - digest_tensor])
     for group in _sync_groups:
-        dist.all_reduce(min_value, op=dist.ReduceOp.MIN, group=group)
-        dist.all_reduce(max_value, op=dist.ReduceOp.MAX, group=group)
+        dist.all_reduce(combined, op=dist.ReduceOp.MIN, group=group)
+    min_value = combined[:20]
+    max_value = 255 - combined[20:]
     if not torch.equal(min_value, max_value):
         # When divergence, all rank should output the following log.
         logger.critical(
