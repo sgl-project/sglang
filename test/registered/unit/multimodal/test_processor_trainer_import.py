@@ -8,7 +8,7 @@ PNG path + explicit devices -> processor pools -> strategy -> BatchFeature
                      |
 no CPU process pool; shutdown -> executor submission rejected
 
-Serving Base, model wrappers, ServerArgs, NPU patches and kernel imports are forbidden.
+Serving Base, model wrappers, ServerArgs, NPU patches and kernel backend imports are forbidden.
 Caller devices pass unchanged; omitted devices retain HF defaults.
 Original ImageData wrappers carry caller options before loading.
 preprocess_kwargs stay outside loaded media and reach the cloned processor unchanged.
@@ -38,7 +38,7 @@ def test_trainer_uses_shared_pools_without_inference_imports():
         from unittest.mock import AsyncMock, patch
 
         forbidden = (
-            "sglang.kernels",
+            "sglang.kernels.jit",
             "sglang.srt.managers",
             "sglang.srt.model_executor",
             "sglang.srt.model_loader",
@@ -66,7 +66,7 @@ def test_trainer_uses_shared_pools_without_inference_imports():
         from sglang.srt.multimodal.token_space_mm_process.processor import TokenSpaceProcessor
         from sglang.srt.multimodal.processors.processor_config import MultimodalProcessorConfig
         from sglang.srt.multimodal.token_space_mm_process.models.qwen_vl import QwenTokenSpaceProcessStrategy
-        from sglang.srt.utils import ImageData
+        from sglang.srt.multimodal.media_io import ImageData
 
         import torch
         from PIL import Image

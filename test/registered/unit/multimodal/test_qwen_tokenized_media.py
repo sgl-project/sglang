@@ -65,8 +65,9 @@ from sglang.srt.managers.multimodal_processor import (
     PROCESSOR_MAPPING,
     get_mm_processor,
 )
-from sglang.srt.managers.schedule_batch import Modality, MultimodalDataItem
+from sglang.srt.managers.req_types import MultimodalDataItem
 from sglang.srt.models.qwen3_vl import Qwen3VLForConditionalGeneration
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.executor import MultimodalProcessorExecutor
 from sglang.srt.multimodal.processors.qwen_vl import (
     QwenVLImageProcessor,
@@ -89,9 +90,10 @@ from sglang.srt.multimodal.token_space_mm_process.processor import (
     TokenSpaceProcessor,
 )
 from sglang.srt.multimodal.token_space_mm_process.registry import (
+    TOKEN_SPACE_SERVING_SPEC_MAPPING,
     TOKEN_SPACE_STRATEGY_MAPPING,
 )
-from sglang.srt.multimodal.token_space_mm_process.sglang import (
+from sglang.srt.multimodal.token_space_mm_process.serving_processor import (
     TokenSpaceSGLangProcessor,
 )
 from sglang.srt.multimodal.transport.feature_transport import (
@@ -290,6 +292,7 @@ def _make_processor(model_type="qwen3_vl"):
         ),
     )
     processor._disable_fast_image_processor = True
+    processor._processor_fingerprint = "sha256:" + "0" * 64
     processor._serving_spec = processor._serving_spec_class(processor.hf_config)
     _attach_core(
         processor,
@@ -472,6 +475,11 @@ class TestQwenTokenizedMedia(CustomTestCase):
             patch.dict(
                 TOKEN_SPACE_STRATEGY_MAPPING,
                 {"Qwen3VLForConditionalGeneration": QwenTokenSpaceProcessStrategy},
+                clear=True,
+            ),
+            patch.dict(
+                TOKEN_SPACE_SERVING_SPEC_MAPPING,
+                {"Qwen3VLForConditionalGeneration": QwenTokenSpaceServingSpec},
                 clear=True,
             ),
         ):
