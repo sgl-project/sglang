@@ -65,7 +65,13 @@ export const InternS2PreviewDeployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => ({ ...prev, [optionName]: value }));
+    setValues((prev) => {
+      const next = { ...prev, [optionName]: value };
+      if (optionName === 'hardware' && value === 'xeon') {
+        next.mtp = 'disabled';
+      }
+      return next;
+    });
   };
 
   const generateCommand = () => {
@@ -128,6 +134,7 @@ export const InternS2PreviewDeployment = () => {
     color: isDark ? '#e5e7eb' : 'inherit',
   };
   const checkedStyle = { background: '#D45D44', color: 'white', borderColor: '#D45D44' };
+  const disabledStyle = { opacity: 0.45, cursor: 'not-allowed' };
   const subtitleStyle = { display: 'block', fontSize: '9px', marginTop: '1px', lineHeight: '1.1', opacity: 0.7 };
   const commandDisplayStyle = {
     flex: 1,
@@ -152,9 +159,14 @@ export const InternS2PreviewDeployment = () => {
           <div style={itemsStyle}>
             {option.items.map((item) => {
               const isChecked = values[option.name] === item.id;
-              const isDisabled = values.hardware === 'xeon' && key !== 'hardware';
+              const isDisabled = values.hardware === 'xeon' && key === 'mtp' && item.id === 'enabled';
+              const labelStyle = {
+                ...labelBaseStyle,
+                ...(isChecked ? checkedStyle : {}),
+                ...(isDisabled ? disabledStyle : {}),
+              };
               return (
-                <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}) }}>
+                <label key={item.id} style={labelStyle}>
                   <input
                     type="radio"
                     name={option.name}
