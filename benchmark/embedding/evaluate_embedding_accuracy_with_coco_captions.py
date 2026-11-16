@@ -16,12 +16,12 @@ embedding endpoint following scripts/req.py:
     "input": [{"text": "..."}, {"image": "..."}]
   }
 
-The service URL defaults to the hardcoded local-forwarded remote endpoint
-"http://127.0.0.1:30000".
+The service URL defaults to "http://127.0.0.1:30000" and can be configured
+with --host/--port (or overridden directly with --service-url).
 
 Example:
 
-  python scripts/evaluate_coco_captions_qwen_vl.py \
+  python benchmark/embedding/evaluate_embedding_accuracy_with_coco_captions.py \
     --coco-root /data/coco \
     --model qwen3-vl-embedding-2b \
     --split val2017 \
@@ -52,7 +52,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-DEFAULT_SERVICE_URL = "http://127.0.0.1:30000"
+DEFAULT_HOST = "http://127.0.0.1"
+DEFAULT_PORT = 30000
+DEFAULT_SERVICE_URL = f"{DEFAULT_HOST}:{DEFAULT_PORT}"
 
 COCO_URLS = {
     "val2017_images": "http://images.cocodataset.org/zips/val2017.zip",
@@ -115,6 +117,13 @@ class RemoteEmbeddingClient:
         raise RuntimeError(
             f"Embedding request failed after {self.max_retries} attempts: {last_error}"
         )
+
+
+def build_service_url(args: argparse.Namespace) -> str:
+    """Resolve service URL from --service-url or --host/--port."""
+    if args.service_url != DEFAULT_SERVICE_URL:
+        return str(args.service_url).rstrip("/")
+    return f"{args.host.rstrip('/')}:{args.port}"
 
 
 def parse_embedding_response(
@@ -205,6 +214,17 @@ def parse_args() -> argparse.Namespace:
         "--service-url",
         default=DEFAULT_SERVICE_URL,
         help=f"Embedding service base URL. Default: {DEFAULT_SERVICE_URL}.",
+    )
+    model.add_argument(
+        "--host",
+        default=DEFAULT_HOST,
+        help=f"Serving host (scheme + host). Used with --port when --service-url is not overridden. Default: {DEFAULT_HOST}.",
+    )
+    model.add_argument(
+        "--port",
+        type=int,
+        default=DEFAULT_PORT,
+        help=f"Serving port. Used with --host when --service-url is not overridden. Default: {DEFAULT_PORT}.",
     )
     model.add_argument(
         "--model",
@@ -597,10 +617,11 @@ def load_or_compute_embeddings(
             )
         return np, text_embeddings, image_embeddings
 
-    print(f"Remote embedding service: {args.service_url}/v1/embeddings")
+    service_url = build_service_url(args)
+    print(f"Remote embedding service: {service_url}/v1/embeddings")
     print(f"Remote model: {args.model}")
     client = RemoteEmbeddingClient(
-        service_url=args.service_url,
+        service_url=service_url,
         model=args.model,
         timeout=args.request_timeout,
         max_retries=args.max_retries,
@@ -758,6 +779,7 @@ def run_self_test() -> None:
 
 def main() -> int:
     args = parse_args()
+    service_url = build_service_url(args)
     if args.print_requirements:
         print_requirements()
         return 0
@@ -772,6 +794,8 @@ def main() -> int:
         raise SystemExit("--score-chunk-size must be positive.")
     if args.max_retries <= 0:
         raise SystemExit("--max-retries must be positive.")
+    if args.port <= 0:
+        raise SystemExit("--port must be positive.")
 
     if args.download:
         if args.coco_root is None:
@@ -796,7 +820,7 @@ def main() -> int:
     _, tqdm = require_packages()
 
     results: dict[str, Any] = {
-        "service_url": args.service_url,
+        "service_url": service_url,
         "model": args.model,
         "split": args.split,
         "num_images": len(data.image_paths),
