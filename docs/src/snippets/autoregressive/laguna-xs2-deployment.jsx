@@ -127,7 +127,7 @@ export const LagunaXS2Deployment = () => {
     const modelId = modelByQuant[quantization];
     if (!modelId) return `# Error: Unknown quantization: ${quantization}`;
 
-    const tp = hardware !== 'xeon'? 8 : 4;
+    const tp = hardware !== 'xeon' ? 8 : 4;
     const lines = [
       'sglang serve \\',
       `  --model-path ${modelId} \\`,
