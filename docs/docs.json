@@ -107,7 +107,11 @@
     },
     {
       "source": "/advanced_features/dp_dpa_smg_guide.html",
-      "destination": "/docs/advanced_features/dp_dpa_smg_guide"
+      "destination": "/docs/advanced_features/dp_dpa_router_guide"
+    },
+    {
+      "source": "/docs/advanced_features/dp_dpa_smg_guide",
+      "destination": "/docs/advanced_features/dp_dpa_router_guide"
     },
     {
       "source": "/advanced_features/dp_for_multi_modal_encoder.html",
@@ -191,7 +195,11 @@
     },
     {
       "source": "/advanced_features/sgl_model_gateway.html",
-      "destination": "/docs/advanced_features/sgl_model_gateway"
+      "destination": "/docs/advanced_features/dp_dpa_router_guide"
+    },
+    {
+      "source": "/docs/advanced_features/sgl_model_gateway",
+      "destination": "/docs/advanced_features/dp_dpa_router_guide"
     },
     {
       "source": "/advanced_features/sglang_for_rl.html",
@@ -962,7 +970,7 @@
               "docs/advanced_features/quantization",
               "docs/advanced_features/quantized_kv_cache",
               "docs/advanced_features/reasoning_aware_compression",
-              "docs/advanced_features/dp_dpa_smg_guide",
+              "docs/advanced_features/dp_dpa_router_guide",
               "docs/advanced_features/prefill_cp",
               "docs/advanced_features/kv_cache_sharing",
               "docs/advanced_features/dcp",
@@ -995,7 +1003,6 @@
               "docs/advanced_features/dp_for_multi_modal_encoder",
               "docs/advanced_features/cuda_graph_for_multi_modal_encoder",
               "docs/advanced_features/breakable_cuda_graph",
-              "docs/advanced_features/sgl_model_gateway",
               "docs/advanced_features/llm-d",
               "docs/advanced_features/deterministic_inference",
               "docs/advanced_features/observability",
