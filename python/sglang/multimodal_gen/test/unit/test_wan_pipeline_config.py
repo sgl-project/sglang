@@ -5,7 +5,11 @@ import torch
 
 from sglang.multimodal_gen.configs.models.dits.wanvideo import WanVideoConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
+    FastWan2_1_T2V_480P_Config,
+    TurboWanT2V480PConfig,
+    Wan2_2_T2V_A14B_Config,
     WanT2V480PConfig,
+    WanT2V720PConfig,
     t5_postprocess_text,
 )
 
@@ -70,3 +74,20 @@ def test_wan_arch_text_len_follows_the_checkpoint_config():
     config.update_model_arch({"text_len": 226})
     assert config.arch_config.text_len == 226
 
+
+@pytest.mark.parametrize(
+    "config_cls",
+    [
+        WanT2V480PConfig,
+        WanT2V720PConfig,
+        TurboWanT2V480PConfig,
+        FastWan2_1_T2V_480P_Config,
+        Wan2_2_T2V_A14B_Config,
+    ],
+)
+def test_wan_t2v_configs_load_only_the_vae_decoder(config_cls):
+    """Text-to-video never encodes with the VAE, so no T2V config may build the
+    encoder; a subclass hook that replaces the parent hook brings it back."""
+    vae_config = config_cls().vae_config
+    assert vae_config.load_encoder is False
+    assert vae_config.load_decoder is True
