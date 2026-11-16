@@ -596,7 +596,6 @@ def run_npu_e2e_test_case(
     metrics_data_file: str,
     test_case: str,
     sglang_is_in_ci=False,
-    install_sglang_from_source=False,
     env="debug",
     trouble_shotting=False,
     transformers_version="",
@@ -616,7 +615,6 @@ def run_npu_e2e_test_case(
         metrics_data_file (str): the output path of the metrics data file, only for performance testing.
         test_case (str): the test case relative path in sglang source root path. like test/registered/...
         sglang_is_in_ci (bool): whether running in CI environment.
-        install_sglang_from_source (bool): whether installing sglang from source or use docker image directly.
         env (str): the environment to run the test on.  Choose one in ["debug", "ci"]
         run_id (str): the GitHub Actions run_id, used to label pods for run-scoped
             isolation when multiple runs share the same k8s namespace.
@@ -668,7 +666,6 @@ def run_npu_e2e_test_case(
                 "metrics_data_file": metrics_data_file,
                 "test_case": test_case,
                 "sglang_is_in_ci": sglang_is_in_ci,
-                "install_sglang_from_source": install_sglang_from_source,
                 "env": env,
                 "trouble_shotting": trouble_shotting,
                 "transformers_version": transformers_version,
@@ -692,7 +689,6 @@ def run_npu_e2e_test_case(
                 "metrics_data_file": metrics_data_file,
                 "test_case": test_case,
                 "sglang_is_in_ci": sglang_is_in_ci,
-                "install_sglang_from_source": install_sglang_from_source,
                 "env": env,
                 "trouble_shotting": trouble_shotting,
                 "transformers_version": transformers_version,
@@ -723,7 +719,6 @@ def run_npu_e2e_test_case(
                 "metrics_data_file": metrics_data_file,
                 "test_case": test_case,
                 "sglang_is_in_ci": sglang_is_in_ci,
-                "install_sglang_from_source": install_sglang_from_source,
                 "env": env,
                 "trouble_shotting": trouble_shotting,
                 "transformers_version": transformers_version,
@@ -876,12 +871,6 @@ if __name__ == "__main__":
     )
 
     parser.add_argument(
-        "--install-sglang-from-source",
-        action="store_true",
-        help="Used to set env var INSTALL_SGLANG_FROM_SOURCE in pod",
-    )
-
-    parser.add_argument(
         "--kube-name-space",
         type=str,
         required=True,
@@ -962,7 +951,6 @@ if __name__ == "__main__":
     metrics_data_file = args.metrics_data_file
     test_case = args.test_case
     sglang_is_in_ci = args.sglang_is_in_ci
-    install_sglang_from_source = args.install_sglang_from_source
     env = args.env
     trouble_shotting = args.trouble_shotting
     transformers_version = args.transformers_version
@@ -994,7 +982,6 @@ if __name__ == "__main__":
         metrics_data_file=metrics_data_file,
         test_case=test_case,
         sglang_is_in_ci=sglang_is_in_ci,
-        install_sglang_from_source=install_sglang_from_source,
         env=env,
         trouble_shotting=trouble_shotting,
         transformers_version=transformers_version,
