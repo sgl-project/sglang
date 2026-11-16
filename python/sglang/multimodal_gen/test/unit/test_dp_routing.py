@@ -155,9 +155,18 @@ def test_fanout_preserves_fatal_reply_before_later_timeout(client_type, error):
     [(), (None,), ("CUDA out of memory",), ("invalid request",)],
     ids=["fatal-first", "success-first", "oom-first", "ordinary-error-first"],
 )
-def test_fanout_stops_on_fatal_reply_without_deadline(client_type, prior_errors):
+@pytest.mark.parametrize("auto_residency", [False, True])
+def test_fanout_stops_on_fatal_reply_without_deadline(
+    client_type, prior_errors, auto_residency
+):
     fatal = OutputBatch(error="CUDA error: an illegal memory access was encountered")
-    replies = [OutputBatch(error=error) for error in prior_errors] + [fatal]
+    replies = [
+        OutputBatch(
+            error=error,
+            output={"status": "adjusted"} if auto_residency else None,
+        )
+        for error in prior_errors
+    ] + [fatal]
     endpoints = [f"tcp://replica-{i}" for i in range(len(replies) + 1)]
     client = client_type()
     client.server_args = SimpleNamespace(
@@ -176,7 +185,11 @@ def test_fanout_stops_on_fatal_reply_without_deadline(client_type, prior_errors)
 
     mock_type = AsyncMock if client_type is AsyncSchedulerClient else Mock
     client._forward_one = mock_type(side_effect=reply)
-    request = SetLoraReq(lora_nickname="x", lora_path="y")
+    request = (
+        AutoResidencyReq()
+        if auto_residency
+        else SetLoraReq(lora_nickname="x", lora_path="y")
+    )
     if client_type is AsyncSchedulerClient:
         result = asyncio.run(asyncio.wait_for(client.forward(request), timeout=1))
     else:

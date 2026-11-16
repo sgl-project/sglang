@@ -180,6 +180,10 @@ def _merge_auto_residency_results(results: list[Any]) -> Any:
     orchestrator must still run the validation warmup everywhere. A failed
     local rollback remains fatal and takes precedence over that success.
     """
+    fatal = next((result for result in results if _is_fatal_reply(result)), None)
+    if fatal is not None:
+        return fatal
+
     rollback_failed = next(
         (
             result
