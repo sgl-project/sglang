@@ -2,7 +2,7 @@
 
 The reduce-scatter folds the pending attention residual into its reduction
 epilogue.  The matching all-gather reassembles the token shards after MoE.
-Both reuse CustomAllReduceV2's push workspace and fall back as a pair outside
+Both reuse the group's symmetric workspace and fall back as a pair outside
 the checked-in GB200/GB300 tuning envelope.
 """
 
@@ -18,8 +18,8 @@ from sglang.srt.layers.communication import k3_ar_fusion
 from sglang.srt.runtime_context import get_exec, get_parallel
 
 if TYPE_CHECKING:
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        WorkspaceLease,
     )
     from sglang.srt.distributed.parallel_state import GroupCoordinator
 
@@ -37,9 +37,13 @@ _ATTN_RES_AG = "sp_attn_res_ag"  # ... and of its attention-residual fusion
 
 
 class _State:
-    def __init__(self, group: GroupCoordinator, comm: CustomAllReduceV2):
+    def __init__(self, group: GroupCoordinator, lease: WorkspaceLease):
         self.group = group
-        self.comm = comm
+        self.lease = lease
+
+    @property
+    def push_slot_bytes(self) -> int:
+        return self.lease.request.push_slot_bytes
 
 
 _STATE: Optional[_State] = None
@@ -57,41 +61,40 @@ def _init_state() -> Optional[_State]:
     if explicit and not envs.SGLANG_K3_SP_COLLECTIVE.get():
         return None
 
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        V2_PUSH_SLOT,
+        WorkspaceRequest,
+        request_group_workspace,
     )
     from sglang.srt.utils.device import get_device_sm
 
     a2a = get_exec().moe.moe_a2a_backend
     group = get_parallel().attn_tp_group
-    comm = group.ca_comm
     device_sm = get_device_sm()
-    is_custom_allreduce = isinstance(comm, CustomAllReduceV2)
-    if is_custom_allreduce:
-        comm_disabled = comm.disabled
-        has_multicast = comm.has_multicast
-    else:
-        comm_disabled = None
-        has_multicast = None
+    lease = None
     if (
-        device_sm not in (100, 103)
-        or group.world_size not in _SUPPORTED_WORLD_SIZES
-        or a2a not in ("megamoe", "deepep")
-        or not is_custom_allreduce
-        or comm_disabled
-        or not has_multicast
+        device_sm in (100, 103)
+        and group.world_size in _SUPPORTED_WORLD_SIZES
+        and a2a in ("megamoe", "deepep")
     ):
+        # pull barriers only; any request gets at least one semaphore per SM
+        lease = request_group_workspace(
+            group,
+            WorkspaceRequest(
+                owner="k3_sp_collective", push_slot_bytes=V2_PUSH_SLOT, semaphores=1
+            ),
+        )
+    has_multicast = lease is not None and lease.has_multicast
+    if not has_multicast:
         message = (
             "K3 SP collective requires SM100/SM103, TP4/TP8/TP16, "
-            "MegaMoE/DeepEP, and CustomAllReduceV2 with multicast; using NCCL "
-            "(sm=%s, world_size=%s, a2a=%s, comm=%s, disabled=%s, "
-            "has_multicast=%s)."
+            "MegaMoE/DeepEP, and a multicast symmetric workspace; using NCCL "
+            "(sm=%s, world_size=%s, a2a=%s, workspace=%s, has_multicast=%s)."
             % (
                 device_sm,
                 group.world_size,
                 a2a,
-                type(comm).__name__ if comm is not None else None,
-                comm_disabled,
+                lease is not None,
                 has_multicast,
             )
         )
@@ -117,9 +120,11 @@ def _init_state() -> Optional[_State]:
         )
         return None
 
-    sp_collective.register_comm(comm.obj)
-    attn_res_collective.register_comm(comm.obj)
-    _STATE = _State(group, comm)
+    sp_collective.register_comm(lease.get_communicator, world_size=lease.world_size)
+    attn_res_collective.register_comm(
+        lease.get_communicator, world_size=lease.world_size
+    )
+    _STATE = _State(group, lease)
     logger.info(
         "K3 SP collective enabled (TP%d, fused RS residual + AG)",
         group.world_size,
@@ -161,7 +166,7 @@ def requires_symmetric_rs(
         num_tokens,
         device,
         element_size=element_size,
-        max_push_size=state.comm.max_push_size,
+        max_push_size=state.push_slot_bytes,
     )
     if dispatch is not None and dispatch.strategy == "pull":
         return True
@@ -257,7 +262,7 @@ def reduce_scatter_res(
         tensor.shape[0],
         tensor.device,
         element_size=tensor.element_size(),
-        max_push_size=state.comm.max_push_size,
+        max_push_size=state.push_slot_bytes,
     )
     if dispatch is None:
         return None
@@ -376,7 +381,7 @@ def all_gather(tensor: torch.Tensor) -> Optional[torch.Tensor]:
         global_tokens,
         tensor.device,
         element_size=tensor.element_size(),
-        max_push_size=state.comm.max_push_size,
+        max_push_size=state.push_slot_bytes,
     )
     if dispatch is None:
         return None

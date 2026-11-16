@@ -10,6 +10,7 @@ if not is_gfx95_supported():
     pytest.skip("the aiter fp8 quant epilogues are gfx95-only", allow_module_level=True)
 
 from sglang.kernels.ops.quantization.aiter_fp8_quant_triton import (  # noqa: E402
+    silu_and_mul_fp8_per_tensor,
     swiglu_oai_fp8,
 )
 from sglang.srt.layers.moe.moe_runner.triton_utils.fused_moe import (  # noqa: E402
@@ -70,6 +71,42 @@ def test_swiglu_oai_fp8_group_writes_the_separate_kernels_bytes(
     assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
     assert torch.equal(scale.view(torch.int32), scale_ref.view(torch.int32))
     assert scale.stride() == ((1, num_tokens) if transpose_scale else (6, 1))
+
+
+@pytest.mark.parametrize("n", [1408, 12288])
+@pytest.mark.parametrize("num_tokens", [1, 7, 128])
+@torch.inference_mode()
+def test_silu_and_mul_fp8_per_tensor_writes_the_separate_kernels_bytes(num_tokens, n):
+    """Per tensor the fused SiLU-and-mul + quant writes what SiluAndMul followed by
+    aiter's dynamic_per_tensor_quant does: amax * (1 / max) as the scale, and the
+    activation times its approximate v_rcp_f32."""
+    import aiter
+    from sgl_kernel import silu_and_mul
+
+    torch.manual_seed(num_tokens + n)
+    hidden = (torch.randn(num_tokens, 2 * n, device="cuda") * 3).to(torch.bfloat16)
+    act = torch.empty(num_tokens, n, device="cuda", dtype=torch.bfloat16)
+    silu_and_mul(hidden, act)
+    q_ref = torch.empty_like(act, dtype=torch.float8_e4m3fn)
+    scale_ref = torch.empty(1, device="cuda", dtype=torch.float32)
+    aiter.dynamic_per_tensor_quant(q_ref, act, scale_ref)
+
+    q, scale = silu_and_mul_fp8_per_tensor(hidden)
+
+    assert torch.equal(q.view(torch.uint8), q_ref.view(torch.uint8))
+    assert torch.equal(scale.view(torch.int32), scale_ref.view(torch.int32))
+
+
+@torch.inference_mode()
+def test_silu_and_mul_fp8_per_tensor_of_zeros_is_zeros():
+    """aiter writes -448 at scale 0 for an all-zero tensor; the fused kernel writes 0,
+    which dequantizes the same."""
+    hidden = torch.zeros(4, 2 * 1408, device="cuda", dtype=torch.bfloat16)
+
+    q, scale = silu_and_mul_fp8_per_tensor(hidden)
+
+    assert scale.item() == 0.0
+    assert not q.float().any()
 
 
 if __name__ == "__main__":

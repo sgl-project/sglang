@@ -26,8 +26,9 @@ computes each rank's local output directly. It supports non-causal attention
 only and does not compose with `--ulysses-degree` or `--ring-degree` yet.
 Varlen calls through the legacy `UlyssesAttention` adapter and video sparse
 attention are not supported. When no degree is set explicitly, `--sp-degree 2`
-picks K/V gather and larger SP degrees pick Ulysses; under that automatic
-choice, attention calls K/V gather cannot take fall back to the Ulysses
+picks K/V gather, and larger SP degrees pick Ulysses unless the DiT's head
+count does not divide by the SP degree, in which case they pick K/V gather;
+under that automatic choice, attention calls K/V gather cannot take fall back to the Ulysses
 exchange, while an explicit `--kv-gather-degree` fails instead.
 
 Use SP when sequence length or video shape makes the DiT forward pass the bottleneck and the model supports sequence sharding. For latency-oriented multi-GPU Qwen/Wan deployments, also compare against CFG parallelism and FSDP; SP is not automatically the best multi-GPU setting for every model.
@@ -81,8 +82,9 @@ scaling makes the interconnect and input shape part of the selection policy.
 
 ### Ulysses Sequence Parallelism
 
-Above SP degree 2, Ulysses is the default and needs only the total SP degree
-when ring parallelism is not used:
+Above SP degree 2, Ulysses is the default when the DiT's head count divides by
+the SP degree, and needs only the total SP degree when ring parallelism is not
+used:
 
 ```bash
 sglang serve \

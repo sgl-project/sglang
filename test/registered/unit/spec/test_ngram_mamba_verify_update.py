@@ -204,19 +204,24 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
                 torch.testing.assert_close(scatter.call_args.args[4], source_rows)
 
     def test_circular_commit_reads_pp_request_rows(self):
+        from sglang.srt.layers.attention.mamba.mamba2_metadata import (
+            ForwardStateSlots,
+        )
         from sglang.srt.speculative.spec_utils import commit_mamba_states_after_verify
 
         target_worker = MagicMock()
-        req_pool = target_worker.model_runner.req_to_token_pool
+        target_worker.model_runner.attn_backend.forward_state_slots.return_value = (
+            ForwardStateSlots(
+                torch.tensor([5, 7], dtype=torch.int32),
+                ring=torch.tensor([2, 3], dtype=torch.int32),
+            )
+        )
         mamba_pool = MagicMock()
         router = target_worker.model_runner.token_to_kv_pool.layer_router
         router.part_view.return_value = mamba_pool
         mamba_pool.replayssm_spec_fold = False
         mamba_pool.replayssm_is_kda = False
         mamba_pool.replayssm_cache_base = torch.empty(1)
-        req_pool.get_mamba_indices.return_value = torch.tensor(
-            [5, 7], dtype=torch.int32
-        )
         mamba_pool.get_speculative_mamba2_params_all_layers.return_value = (
             self._spec_state()
         )
@@ -249,6 +254,10 @@ class TestPPReplaySSMVerifySourceRows(CustomTestCase):
                 "sglang.kernels.ops.mamba.mamba_state_scatter_triton."
                 "fused_conv_window_scatter_with_mask"
             ) as scatter,
+            patch(
+                "sglang.srt.layers.attention.hybrid_linear_attn_backend."
+                "commit_ple_states_after_verify"
+            ),
         ):
             commit_mamba_states_after_verify(
                 target_worker,
@@ -333,6 +342,7 @@ class TestMtpVerifyHookSignature(CustomTestCase):
         "mamba_steps_to_track",
         "model",
         "req_pool_indices",
+        "state_slots",
     }
     HOOK = "update_mamba_state_after_mtp_verify"
 
@@ -366,6 +376,57 @@ class TestMtpVerifyHookSignature(CustomTestCase):
                 f"{rel}:{lineno} {self.HOOK} is missing {sorted(missing)}; "
                 "the spec workers call this hook by keyword.",
             )
+
+
+def _commit_inputs():
+    return dict(
+        checkpoint_state=torch.zeros(1, 1, 1, 128, 128, dtype=torch.bfloat16),
+        d_cache=torch.zeros(1, 1, 1, 16, 128, dtype=torch.bfloat16),
+        k_cache=torch.zeros(1, 1, 1, 16, 128, dtype=torch.bfloat16),
+        g_cache=torch.zeros(1, 1, 1, 16),
+        d_residual_cache=None,
+        k_residual_cache=None,
+        state_batch_indices=torch.zeros(1, dtype=torch.int64),
+        replay_indices=torch.zeros(1, dtype=torch.int64),
+        write_pos=torch.zeros(1, dtype=torch.int32),
+        cache_base=torch.zeros(1, dtype=torch.int32),
+        is_flush=torch.zeros(1, dtype=torch.int8),
+        accept_lens=torch.ones(1, dtype=torch.int32),
+    )
+
+
+class TestGdnTiledCommitDispatch(CustomTestCase):
+    def test_supported_shapes_launch_the_tiled_commit(self):
+        from sglang.kernels.ops.attention.linear import (
+            gdn_replayssm_spec_decode as replay,
+        )
+
+        for tiled in (False, True):
+            with (
+                self.subTest(tiled=tiled),
+                patch.object(replay, "_use_tiled_commit", return_value=tiled),
+                patch.object(
+                    replay, "_finish_gdn_replayssm_circular_fold_kernel", MagicMock()
+                ) as finish,
+                patch.object(
+                    replay, "gdn_replayssm_compact_commit_kernel", MagicMock()
+                ) as stock,
+                patch.object(
+                    replay, "gdn_replayssm_compact_commit_tiled_kernel", MagicMock()
+                ) as tiled_kernel,
+            ):
+                replay.commit_gdn_replayssm_circular(**_commit_inputs())
+                self.assertEqual(tiled_kernel.__getitem__.call_count, int(tiled))
+                self.assertEqual(stock.__getitem__.call_count, int(not tiled))
+                self.assertEqual(finish.__getitem__.call_count, 1)
+                launched = tiled_kernel if tiled else stock
+                kw = launched.__getitem__.return_value.call_args.kwargs
+                self.assertEqual(
+                    (kw["STRIDE_WP"], kw["STRIDE_CB"], kw["STRIDE_FL"]), (1, 1, 1)
+                )
+                if tiled:  # 32-row V tiles, one row per request
+                    grid = tiled_kernel.__getitem__.call_args.args[0]
+                    self.assertEqual(grid[:2], (128 // 32, 1))
 
 
 if __name__ == "__main__":

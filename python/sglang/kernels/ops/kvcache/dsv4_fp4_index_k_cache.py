@@ -22,7 +22,8 @@ def _store_fp4_index_k_cache_kernel(
 ):
     token_id = tl.program_id(0)
     offsets = tl.arange(0, BLOCK)
-    cache_loc = tl.load(loc + token_id)
+    # int64: a strided page offset can exceed int32 range.
+    cache_loc = tl.load(loc + token_id).to(tl.int64)
     page = cache_loc // page_size
     page_offset = cache_loc - page * page_size
 
@@ -52,6 +53,8 @@ def store_fp4_index_k_cache(
     assert k_fp4.shape == (n_tokens, 64)
     assert k_sf.shape == (n_tokens,)
     assert cache.shape[1] == page_size * INDEX_K_SLOT_BYTES
+    # Pages may be slices of larger per-page entries; the kernel follows stride(0).
+    assert cache.stride(1) == 1, f"{cache.stride()=}"
 
     if n_tokens == 0:
         return

@@ -8,9 +8,11 @@ resident-set trimmer measures only its own mapping, drops its pages once over
 budget without losing what was written through them, and is off when the budget
 is zero or the mapping is pinned.
 
-GPU part (skipped unless the device reads pageable host memory through the host
-page tables, i.e. unified-memory parts such as GB10): the production Triton
-gather kernel reading from the file-backed table matches a torch gather.
+The device check asks for cudaDevAttrPageableMemoryAccess, which GB10 (host
+page tables) and a discrete GPU with HMM both report.
+
+GPU part (skipped unless the device reads pageable host memory): the production
+Triton gather kernel reading from the file-backed table matches a torch gather.
 """
 
 import os
@@ -20,13 +22,18 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.models import qwen4_exp_ple_table
 from sglang.srt.models.qwen4_exp_ple_table import (
     PleFilePrefetcher,
     PleFileRssTrimmer,
     _mapping_rss_bytes,
+    advise_rows_willneed,
     allocate_ple_host_table,
+    check_file_backend_supported,
     default_ple_table_dir,
-    device_uses_host_page_tables,
+    device_faults_pageable_pages,
+    device_reads_pageable_memory,
     make_ple_file_prefetcher,
     make_ple_file_rss_trimmer,
     ple_table_file_name,
@@ -158,6 +165,52 @@ class TestPleFilePrefetcher(CustomTestCase):
                     self.assertEqual(offsets, [0, 4096])
             finally:
                 pf.close()
+
+
+class TestAdviseRowsWillneed(CustomTestCase):
+    """The host gather's synchronous WILLNEED: one posix_fadvise per run of adjacent
+    pages of the table file."""
+
+    # 160-byte rows, as Qwen3.8-Flash-Next's fp8 table.
+    ROW_BYTES = 160
+
+    def _advise(self, rows, error=None):
+        with mock.patch("os.posix_fadvise", side_effect=error) as fadvise:
+            advised = advise_rows_willneed(7, rows, self.ROW_BYTES)
+        return advised, [c.args for c in fadvise.call_args_list]
+
+    def test_merges_adjacent_pages_and_covers_rows_spanning_two(self):
+        # Row 0: page 0; row 25 (bytes 4000-4159): pages 0-1; row 26: page 1;
+        # row 100 (bytes 16000-16159): page 3.
+        advised, calls = self._advise(torch.tensor([25, 0, 26, 100, 0]))
+        self.assertEqual(advised, 3)
+        self.assertEqual(
+            calls,
+            [
+                (7, 0, 2 * 4096, os.POSIX_FADV_WILLNEED),
+                (7, 3 * 4096, 4096, os.POSIX_FADV_WILLNEED),
+            ],
+        )
+
+    def test_no_rows_no_calls(self):
+        advised, calls = self._advise(torch.empty(0, dtype=torch.int64))
+        self.assertEqual((advised, calls), (0, []))
+
+    def test_stops_at_the_first_failed_call(self):
+        advised, calls = self._advise(torch.tensor([0, 100]), error=OSError("EBADF"))
+        self.assertEqual((advised, len(calls)), (0, 1))
+
+    def test_kernel_accepts_the_advice_on_the_table_file(self):
+        with tempfile.TemporaryDirectory() as d:
+            table = allocate_ple_host_table((65536, 160), torch.uint8, "file", d)
+            table[::7].fill_(3)  # some pages written, the rest sparse
+            fd = os.open(table._sglang_ple_file_path, os.O_RDONLY)
+            try:
+                rows = torch.tensor([0, 25, 100, 30000, 65535])
+                # pages 0-1, 3, 1171, 2559
+                self.assertEqual(advise_rows_willneed(fd, rows, 160), 5)
+            finally:
+                os.close(fd)
 
 
 class TestSmapsParsing(CustomTestCase):
@@ -296,9 +349,144 @@ class TestPleFileRssTrimmer(CustomTestCase):
             self.assertFalse(trimmer._thread.is_alive())
 
 
+class _FakeCudart:
+    """cudaDeviceGetAttribute answering from ``attributes`` (cudaDeviceAttr -> value)."""
+
+    def __init__(self, attributes):
+        self.attributes = attributes
+
+    def cudaDeviceGetAttribute(self, value, attribute, device):
+        value._obj.value = self.attributes[attribute.value]
+        return 0
+
+
+class TestFileBackendDeviceCheck(CustomTestCase):
+    PAGEABLE, USES_HOST_PAGE_TABLES = 88, 100  # cudaDeviceAttr
+
+    def _check(self, attributes):
+        with (
+            mock.patch("ctypes.util.find_library", return_value="libcudart.so"),
+            mock.patch("ctypes.CDLL", return_value=_FakeCudart(attributes)),
+        ):
+            check_file_backend_supported(0)
+
+    def test_pageable_access_accepted_with_or_without_host_page_tables(self):
+        for uses_host_page_tables in (1, 0):  # GB10, HMM
+            with self.subTest(uses_host_page_tables=uses_host_page_tables):
+                self._check(
+                    {
+                        self.PAGEABLE: 1,
+                        self.USES_HOST_PAGE_TABLES: uses_host_page_tables,
+                    }
+                )
+
+    def test_no_pageable_access_refused(self):
+        with self.assertRaisesRegex(ValueError, "--ple-offload-backend pinned"):
+            self._check({self.PAGEABLE: 0, self.USES_HOST_PAGE_TABLES: 0})
+
+    def _faults(self, attributes=None, error=None):
+        cdll = (
+            mock.patch("ctypes.CDLL", side_effect=error)
+            if error
+            else mock.patch("ctypes.CDLL", return_value=_FakeCudart(attributes))
+        )
+        with mock.patch("ctypes.util.find_library", return_value="libcudart.so"), cdll:
+            return device_faults_pageable_pages(0)
+
+    def test_faults_pageable_pages_only_without_host_page_tables(self):
+        cases = {
+            "HMM": ({self.PAGEABLE: 1, self.USES_HOST_PAGE_TABLES: 0}, True),
+            "GB10": ({self.PAGEABLE: 1, self.USES_HOST_PAGE_TABLES: 1}, False),
+            "no pageable access": (
+                {self.PAGEABLE: 0, self.USES_HOST_PAGE_TABLES: 0},
+                False,
+            ),
+        }
+        for name, (attributes, expected) in cases.items():
+            with self.subTest(name):
+                self.assertIs(self._faults(attributes), expected)
+
+    def test_unqueryable_device_does_not_fault(self):
+        self.assertIs(self._faults(error=OSError("no libcudart")), False)
+
+
+class _FakeHostRegister:
+    def __init__(self, rc):
+        self.rc, self.calls = rc, []
+
+    def cudaHostRegister(self, ptr, size, flags):
+        self.calls.append((ptr, size, flags))
+        return self.rc
+
+
+class TestPlePinnedHugepageTable(CustomTestCase):
+    def _allocate(self, master, child):
+        sentinel = torch.zeros(4, 8)
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master),
+            envs.SGLANG_OPT_PLE_PINNED_HUGEPAGE.override(child),
+            mock.patch.object(
+                qwen4_exp_ple_table, "_pinned_hugepage_table", return_value=sentinel
+            ) as hugepage,
+            mock.patch.object(torch, "empty", return_value="cudaHostAlloc"),
+        ):
+            table = allocate_ple_host_table((4, 8), torch.float32, "pinned")
+        return table is sentinel, hugepage.called
+
+    def test_needs_the_master_and_the_child(self):
+        self.assertEqual(self._allocate(True, True), (True, True))
+        for master, child in ((False, True), (True, False)):
+            with self.subTest(master=master, child=child):
+                self.assertEqual(self._allocate(master, child), (False, False))
+
+    def test_falls_back_to_cuda_host_alloc(self):
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            envs.SGLANG_OPT_PLE_PINNED_HUGEPAGE.override(True),
+            mock.patch.object(
+                qwen4_exp_ple_table, "_pinned_hugepage_table", return_value=None
+            ),
+            mock.patch.object(torch, "empty", return_value="cudaHostAlloc") as empty,
+        ):
+            allocate_ple_host_table((4, 8), torch.float32, "pinned")
+        self.assertTrue(empty.call_args.kwargs["pin_memory"])
+
+    def _table(self, rc, advice_ok=True):
+        cudart = _FakeHostRegister(rc)
+        advised = []
+
+        def madvise(addr, length, advice):
+            advised.append((addr, length, advice))
+            return advice_ok
+
+        with (
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+            mock.patch.object(qwen4_exp_ple_table, "_madvise", madvise),
+            mock.patch.object(qwen4_exp_ple_table, "_clear_cuda_last_error") as clear,
+        ):
+            table = qwen4_exp_ple_table._pinned_hugepage_table((100, 160), torch.uint8)
+        return table, cudart.calls, advised, clear.called
+
+    def test_aligned_registered_mapping(self):
+        table, registered, advised, cleared = self._table(rc=0)
+        align = qwen4_exp_ple_table._HUGEPAGE_ALIGN
+        self.assertEqual((tuple(table.shape), table.dtype), ((100, 160), torch.uint8))
+        self.assertEqual(table.data_ptr() % align, 0)
+        self.assertEqual(advised, [(table.data_ptr(), 16000, 14)])
+        self.assertEqual(registered, [(table.data_ptr(), 16000, 0)])
+        self.assertFalse(cleared)
+
+    def test_failed_registration_or_advice_returns_none(self):
+        table, _, _, cleared = self._table(rc=1)
+        self.assertIsNone(table)
+        self.assertTrue(cleared)
+        table, registered, _, _ = self._table(rc=0, advice_ok=False)
+        self.assertEqual((table, registered), (None, []))
+
+
 @unittest.skipUnless(
-    torch.cuda.is_available() and device_uses_host_page_tables(0) is True,
-    "needs a device that reads pageable host memory through the host page tables",
+    torch.cuda.is_available() and device_reads_pageable_memory(0) is True,
+    "needs a device that reads pageable host memory",
 )
 class TestPleFileTableGatherOnDevice(CustomTestCase):
     def test_triton_gather_reads_file_backed_table(self):

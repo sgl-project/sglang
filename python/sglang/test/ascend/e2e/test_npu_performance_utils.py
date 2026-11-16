@@ -30,8 +30,8 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     kill_process_group,
     launch_pd_mix_node,
     launch_pd_separation_node,
-    launch_router,
     query_configmap,
+    start_router_thread,
     wait_for_prefill_decode_exit,
     wait_server_ready,
 )
@@ -168,6 +168,7 @@ GLM5_TOP64_PRUNED_GSM8K_MODEL_PATH = (
 GLM_5_1_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.1-w4a8"
 GLM_5_2_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.2-w4a8"
 GLM_5_2_W8A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.2-w8a8"
+GLM_5_3_W8A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.3-w8a8"
 MINIMAX_M2_5_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/MiniMax-M2.5-w8a8-QuaRot"
 )
@@ -1596,14 +1597,7 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
     @check_role(allowed_roles=["router"])
     def start_router_server(cls):
         wait_for_prefill_decode_exit(key=ACTIVE_TEST_CLASS, value=cls.__name__)
-        logger.info(f"Starting router in thread...")
-        sglang_thread = threading.Thread(target=launch_router, args=(cls.model_config,))
-        sglang_thread.daemon = True
-        sglang_thread.start()
-
-        health_check_url = f"{cls.base_url}/health"
-        logger.info(f"Waiting for router to be ready at {health_check_url}")
-        wait_server_ready(health_check_url)
+        start_router_thread(cls.model_config, cls.base_url)
 
         logger.info(
             f"Waiting {SERVER_INITIALIZATION_DELAY} seconds for the server to fully initialize..."

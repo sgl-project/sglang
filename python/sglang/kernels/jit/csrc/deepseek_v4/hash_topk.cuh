@@ -1,6 +1,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/activation.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/warp.cuh>
@@ -15,12 +16,6 @@ namespace sglang {
 // Hash routing ignores scores, so an all-underflowed row would renorm 0/0 to NaN.
 constexpr float kRenormalizeSumEpsilon = 1e-20f;
 
-[[maybe_unused]]
-SGL_DEVICE float act_sqrt_softplus(float x) {
-  const float softplus = fmaxf(x, 0.0f) + log1pf(expf(-fabsf(x)));
-  return sqrtf(softplus);
-}
-
 struct MoEHashTopKParams {
   const float* __restrict__ router_logits;
   const int64_t* __restrict__ input_id;
@@ -34,7 +29,7 @@ struct MoEHashTopKParams {
   float routed_scaling_factor;
 };
 
-template <auto Fn, bool kUsePDL>
+template <bool kUsePDL>
 __global__ void moe_hash_topk_fused(const MoEHashTopKParams __grid_constant__ params) {
   using namespace device;
   const auto& [
@@ -56,7 +51,7 @@ __global__ void moe_hash_topk_fused(const MoEHashTopKParams __grid_constant__ pa
   int32_t expert_id = 0;
   if (lane_id < topk) {
     expert_id = tid2eid[token_id * topk + lane_id];
-    routed_weight = Fn(router_logits[warp_id * num_routed_experts + expert_id]);
+    routed_weight = activation::sqrt_softplus(router_logits[warp_id * num_routed_experts + expert_id]);
   }
 
   const auto routed_sum = device::warp::reduce_sum(routed_weight);
@@ -94,9 +89,9 @@ __global__ void mask_topk_ids_padded_region(const TopKParams __grid_constant__ p
   device::PDLTriggerSecondary<true>();
 }
 
-template <auto Fn, bool kUsePDL>
+template <bool kUsePDL>
 struct HashTopKKernel {
-  static constexpr auto kernel = moe_hash_topk_fused<Fn, kUsePDL>;
+  static constexpr auto kernel = moe_hash_topk_fused<kUsePDL>;
 
   static void
   run(const tvm::ffi::TensorView router_logits,
