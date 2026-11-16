@@ -1453,7 +1453,6 @@ class LoRAMemoryPool:
                     and ("lora_embedding_A" in name or "lora_A" in name)
                 ):
                     buffer_view = self.lm_head_A_buffer[target_module][
-                        # buffer_id, :, :lora_rank
                         buffer_id,
                         :lora_rank,
                         :,
@@ -1570,9 +1569,6 @@ class LoRAMemoryPool:
     ) -> torch.Tensor:
         """
         Get LoRA tensor buffer (automatically handles both 3D and 4D tensors).
-
-        if lora_type == LoRAType.LORA_A:
-            return self.A_buffer[target_module][layer_id]
 
         Args:
             target_module: Target module name (e.g., 'gate_up_proj' or 'gate_up_proj_moe' for MoE)

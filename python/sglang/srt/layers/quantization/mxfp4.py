@@ -702,8 +702,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             self._process_weights_for_sm120_cutlass(layer)
             return
         if self.use_flashinfer:
-            # Per-expert buffers are local (create_weights uses num_local_experts);
-            # the global self.num_experts here breaks EP>1. Mirrors the SM90 path.
+            # Per-expert buffers are local (create_weights receives num_local_experts).
             E = layer.num_local_experts
             _alpha = getattr(layer.moe_runner_config, "gemm1_alpha", None) or 1.702
             _limit = getattr(layer.moe_runner_config, "gemm1_clamp_limit", None) or 7.0
@@ -1105,7 +1104,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         K_pad = self._padded_hidden
         # Use the local expert count (matches the existing buffer allocation in
         # create_weights) so the SM90 cutlass path remains correct under
-        # Expert Parallelism. `self.num_experts` is the *global* count.
+        # Expert Parallelism.
         E = layer.num_local_experts
         device = layer.w13_weight.device
         bias_dtype = layer.w13_weight_bias.dtype
