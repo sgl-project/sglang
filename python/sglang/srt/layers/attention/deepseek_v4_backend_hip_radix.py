@@ -423,8 +423,7 @@ class DSV4AttnMetadata:
     # length-folded aiter_sparse lists keyed by (ratio, address, shape); valid for one forward only
     _aiter_sparse_masked_indices: Optional[dict] = field(default=None, repr=False)
 
-    # {ratio: (fill key, published-mask length)} describing the layer-independent
-    # extend identity fill now in that ratio's sparse buffers; one forward only
+    # {ratio: (fill key, published-mask length)} of the identity fill in its buffers; one forward only
     _identity_fill_memo: Optional[dict] = field(default=None, repr=False)
 
     c0_flashmla_metadata: FlashMLASchedMeta = field(init=False, repr=False)
