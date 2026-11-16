@@ -7,10 +7,6 @@ from typing import TYPE_CHECKING, Any, NamedTuple, Optional, cast
 import numpy as np
 import torch
 
-from sglang.kernels.ops.memory.common import (
-    _get_last_loc_safe_kernel as _get_last_loc_safe_kernel,
-)
-from sglang.kernels.ops.memory.common import get_last_loc_kernel as get_last_loc_kernel
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import (
