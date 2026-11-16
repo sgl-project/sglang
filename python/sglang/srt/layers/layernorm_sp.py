@@ -287,13 +287,8 @@ except Exception:
 
 
 # --- NPU (Ascend) MC2 fused matmul+collective fast-path -----------------------
-# torch_npu mirrors the CUDA symm_mem fused ops with the CANN MC2 (Matmul +
-# Collective-Communication) kernels (CANN >= 8.0.RC2):
-#   npu_mm_reduce_scatter_base == ReduceScatter(x1 @ x2)   [row-parallel g-bar]
-#   npu_all_gather_base_mm     == allgather(x1) @ x2       [column-parallel g]
-# They require fp16/bf16, 2-D inputs and the Hccl backend handle (``hcom``).
-# Availability is probed once at import; on non-NPU builds _HAS_NPU_MC2_FUSED is
-# left False so the fallback collective path is used.
+# CANN >= 8.0.RC2 fused ops: npu_mm_reduce_scatter_base == ReduceScatter(x1 @ x2),
+# npu_all_gather_base_mm == allgather(x1) @ x2; probed once at import.
 _HAS_NPU_MC2_FUSED = False
 _npu_mm_reduce_scatter_base = None
 _npu_all_gather_base_mm = None
@@ -319,9 +314,7 @@ if is_npu():
 
 
 def _npu_hccl_comm_name() -> str:
-    """HCCL communicator handle (``hcom``) of the TP group, consumed by the MC2
-    fused ops. ``device_group`` is the raw torch ProcessGroup; the Hccl backend
-    exposes ``get_hccl_comm_name`` for the global rank."""
+    """HCCL handle (``hcom``) of the TP group, consumed by the MC2 fused ops."""
     tp_group = get_parallel().tp_group
     backend = tp_group.device_group._get_backend(torch.device("npu"))
     return backend.get_hccl_comm_name(tp_group.rank)
