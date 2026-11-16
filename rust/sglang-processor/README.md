@@ -46,12 +46,13 @@ when `tokenizer_config.json` names a tiktoken class, then falls back to
 ## tokenizer
 
 ```rust
-load_tokenizer(path, revision, add_special_tokens) -> Result<dynamo_tokenizers::Tokenizer, String>
+load_tokenizer(path, revision, add_special_tokens, backend) -> Result<dynamo_tokenizers::Tokenizer, String>
 DynamoTokenizer::new(without_specials, with_specials)
 trait TextTokenizer { encode(text, add_special_tokens), encode_segments(segments, add_special_tokens) }
 ```
 
-Pass-through. `load_tokenizer` calls `Tokenizer::from_file_with_options`, and
+Pass-through. `load_tokenizer` calls `Tokenizer::from_file_with_options`, or
+`FastTokenizer::from_file` for `TokenizerBackend::Fastokens`, and
 `encode` / `encode_segments` call the Dynamo tokenizer. Dynamo fixes
 `add_special_tokens` at load time, so `DynamoTokenizer` holds one handle per
 setting and picks one per request.

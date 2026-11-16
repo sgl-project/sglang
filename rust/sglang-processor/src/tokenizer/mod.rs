@@ -77,11 +77,14 @@ pub struct DynamoTokenizer {
 
 /// Load the tokenizer shared (Arc-backed) by the encode pool and detok shards.
 /// `tokenizer_path` is a tokenizer file, a model dir, or an HF Hub repo id
-/// (resolved from the local cache — no network).
+/// (resolved from the local cache — no network). `Fastokens` loads the
+/// `tokenizer.json` and encodes without the post-processor's special tokens, so
+/// it takes only `add_special_tokens = false`.
 pub fn load_tokenizer(
     tokenizer_path: Option<&str>,
     revision: Option<&str>,
     add_special_tokens: bool,
+    backend: TokenizerBackend,
 ) -> Result<dynamo_tokenizers::Tokenizer, String> {
     let path =
         tokenizer_path.ok_or_else(|| "no tokenizer configured: set tokenizer_path".to_string())?;
@@ -90,33 +93,47 @@ pub fn load_tokenizer(
             "no supported tokenizer file found for '{path}' (expected tokenizer.json, tiktoken.model, or *.tiktoken)"
         )
     })?;
-    let tokenizer = dynamo_tokenizers::Tokenizer::from_file_with_options(
-        &file,
-        dynamo_tokenizers::TokenizerOptions { add_special_tokens },
-    )
-    .map_err(|e| format!("tokenizer load failed ({file}): {e}"))?;
-    tracing::info!(%path, "loaded tokenizer");
+    let tokenizer = match backend {
+        TokenizerBackend::HuggingFace => dynamo_tokenizers::Tokenizer::from_file_with_options(
+            &file,
+            dynamo_tokenizers::TokenizerOptions { add_special_tokens },
+        )
+        .map_err(|e| format!("tokenizer load failed ({file}): {e}"))?,
+        TokenizerBackend::Fastokens => {
+            if add_special_tokens {
+                return Err("fastokens encodes without special tokens".to_string());
+            }
+            if !file.ends_with(".json") {
+                return Err(format!(
+                    "the fastokens tokenizer backend needs a tokenizer.json, and '{path}' has none"
+                ));
+            }
+            let fast = dynamo_tokenizers::FastTokenizer::from_file(&file).map_err(|e| {
+                format!(
+                    "fastokens failed to load {file}: {e}. Re-run without --tokenizer-backend=fastokens"
+                )
+            })?;
+            std::sync::Arc::new(fast).into()
+        }
+    };
+    tracing::info!(%path, ?backend, "loaded tokenizer");
     Ok(tokenizer)
 }
 
-/// Load `tokenizer_path`'s `tokenizer.json` on fastokens, which encodes without
-/// the post-processor's special tokens.
-fn load_fastokens(
-    path: &str,
-    revision: Option<&str>,
-) -> Result<dynamo_tokenizers::Tokenizer, String> {
-    let file = resolve_tokenizer_file(path, revision)
-        .filter(|file| file.ends_with(".json"))
-        .ok_or_else(|| {
-            format!("the fastokens tokenizer backend needs a tokenizer.json, and '{path}' has none")
-        })?;
-    let tokenizer = dynamo_tokenizers::FastTokenizer::from_file(&file).map_err(|e| {
-        format!(
-            "fastokens failed to load {file}: {e}. Re-run without --tokenizer-backend=fastokens"
-        )
-    })?;
-    tracing::info!(%path, "loaded tokenizer on fastokens");
-    Ok(std::sync::Arc::new(tokenizer).into())
+/// Whether the `tokenizer.json` post-processor adds tokens to a single sequence,
+/// as Hugging Face's `num_special_tokens_to_add(false)`. A processor type this
+/// does not know counts as adding.
+fn post_processor_adds_tokens(processor: &serde_json::Value) -> bool {
+    match processor["type"].as_str() {
+        None | Some("ByteLevel") => false,
+        Some("TemplateProcessing") => processor["single"]
+            .as_array()
+            .is_none_or(|items| items.iter().any(|item| item.get("Sequence").is_none())),
+        Some("Sequence") => processor["processors"]
+            .as_array()
+            .is_none_or(|items| items.iter().any(post_processor_adds_tokens)),
+        Some(_) => true,
+    }
 }
 
 impl DynamoTokenizer {
@@ -146,25 +163,33 @@ impl DynamoTokenizer {
         revision: Option<&str>,
         backend: TokenizerBackend,
     ) -> Result<Self, String> {
-        let with_specials = load_tokenizer(Some(path), revision, true)?;
-        let mut tokenizer = match backend {
-            TokenizerBackend::HuggingFace => {
-                Self::new(load_tokenizer(Some(path), revision, false)?, with_specials)
+        let without_specials = load_tokenizer(Some(path), revision, false, backend)?;
+        let with_specials = match backend {
+            TokenizerBackend::Fastokens if !Self::adds_special_tokens(path, revision)? => {
+                without_specials.clone()
             }
-            TokenizerBackend::Fastokens => {
-                let fast = load_fastokens(path, revision)?;
-                let added = with_specials
-                    .num_special_tokens_added()
-                    .map_err(|e| format!("tokenizer special-token count failed ({path}): {e}"))?;
-                if added == 0 {
-                    Self::new(fast.clone(), fast)
-                } else {
-                    Self::new(fast, with_specials)
-                }
-            }
+            // Fastokens skips the post-processor, so its tokens come from Hugging Face.
+            _ => load_tokenizer(Some(path), revision, true, TokenizerBackend::HuggingFace)?,
         };
+        let mut tokenizer = Self::new(without_specials, with_specials);
         tokenizer.bos = configured_bos(&tokenizer.without_specials, path, revision);
         Ok(tokenizer)
+    }
+
+    /// Whether the post-processor of the `tokenizer.json` at `path` adds tokens.
+    fn adds_special_tokens(path: &str, revision: Option<&str>) -> Result<bool, String> {
+        let file = resolve_tokenizer_file(path, revision)
+            .ok_or_else(|| format!("no tokenizer file found for '{path}'"))?;
+        #[derive(serde::Deserialize)]
+        struct Spec {
+            #[serde(default)]
+            post_processor: serde_json::Value,
+        }
+        let spec: Spec = serde_json::from_str(
+            &std::fs::read_to_string(&file).map_err(|e| format!("read {file}: {e}"))?,
+        )
+        .map_err(|e| format!("parse {file}: {e}"))?;
+        Ok(post_processor_adds_tokens(&spec.post_processor))
     }
 
     /// The handle that adds the tokenizer's specials, which decoding shares.
@@ -356,13 +381,57 @@ mod tests {
         }
     }
 
+    /// The post-processor rule agrees with Hugging Face's count of added tokens.
+    #[test]
+    fn post_processor_rule_matches_huggingface_count() {
+        let bos = serde_json::json!({"type": "TemplateProcessing",
+            "single": [{"SpecialToken": {"id": "<s>", "type_id": 0}},
+                {"Sequence": {"id": "A", "type_id": 0}}],
+            "pair": [{"Sequence": {"id": "A", "type_id": 0}}],
+            "special_tokens": {"<s>": {"id": "<s>", "ids": [7], "tokens": ["<s>"]}}});
+        let plain = serde_json::json!({"type": "TemplateProcessing",
+            "single": [{"Sequence": {"id": "A", "type_id": 0}}],
+            "pair": [{"Sequence": {"id": "A", "type_id": 0}}],
+            "special_tokens": {}});
+        let byte_level = serde_json::json!({"type": "ByteLevel", "add_prefix_space": false,
+            "trim_offsets": false, "use_regex": false});
+        let processors = [
+            serde_json::Value::Null,
+            byte_level.clone(),
+            plain.clone(),
+            bos.clone(),
+            serde_json::json!({"type": "Sequence", "processors": [byte_level.clone(), plain]}),
+            serde_json::json!({"type": "Sequence", "processors": [byte_level, bos]}),
+            serde_json::json!({"type": "RobertaProcessing", "sep": ["<s>", 7], "cls": ["<s>", 7],
+                "trim_offsets": true, "add_prefix_space": false}),
+        ];
+        for (i, processor) in processors.into_iter().enumerate() {
+            let dir = write_bpe_tokenizer(&format!("post-{i}"), false);
+            let file = dir.join("tokenizer.json");
+            let mut spec: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&file).unwrap()).unwrap();
+            spec["post_processor"] = processor.clone();
+            std::fs::write(&file, spec.to_string()).unwrap();
+            let path = dir.to_str().unwrap();
+            let added = load_tokenizer(Some(path), None, true, TokenizerBackend::HuggingFace)
+                .unwrap()
+                .num_special_tokens_added()
+                .unwrap();
+            let adds = DynamoTokenizer::adds_special_tokens(path, None).unwrap();
+            std::fs::remove_dir_all(&dir).ok();
+            assert_eq!(adds, added > 0, "{processor}");
+        }
+    }
+
     #[test]
     fn fastokens_needs_a_tokenizer_json() {
         let dir = std::env::temp_dir().join(format!("processor-fast-none-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("tiktoken.model");
         std::fs::write(&path, "").unwrap();
-        let error = load_fastokens(path.to_str().unwrap(), None).err().unwrap();
+        let error = load_tokenizer(path.to_str(), None, false, TokenizerBackend::Fastokens)
+            .err()
+            .unwrap();
         std::fs::remove_dir_all(&dir).ok();
         assert!(error.contains("needs a tokenizer.json"), "{error}");
     }
