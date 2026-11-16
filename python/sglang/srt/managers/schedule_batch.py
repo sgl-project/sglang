@@ -477,6 +477,7 @@ class Req(ReqDllmMixin):
         decision_layout: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        disagg_rebootstrap: bool = False,
     ):
         # Input and output info
         self.rid = rid
@@ -796,6 +797,7 @@ class Req(ReqDllmMixin):
         self.bootstrap_host: str = bootstrap_host
         self.bootstrap_port: Optional[int] = bootstrap_port
         self.bootstrap_room: Optional[int] = bootstrap_room
+        self.disagg_rebootstrap = disagg_rebootstrap
         # Prefix excluded from linker offload, in raw tokens before bigram/page alignment.
         self.linker_offload_skip_prefix_len = 0
         # Override embeds give KV that the token ids alone do not determine.
@@ -1621,6 +1623,9 @@ class Req(ReqDllmMixin):
             "bootstrap_host": self.bootstrap_host,
             "bootstrap_port": self.bootstrap_port,
             "bootstrap_room": self.bootstrap_room,
+            # Before the first output, decode still needs its normal tail
+            # extend. Only an emitted sequence resumes from a pending token.
+            "disagg_rebootstrap": bool(self.output_ids),
             "priority": self.priority,
             "extra_key": self.extra_key,
             "cache_salt": self.cache_salt,

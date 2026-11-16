@@ -3354,6 +3354,7 @@ class Scheduler(
                 bootstrap_host=recv_req.bootstrap_host,
                 bootstrap_port=recv_req.bootstrap_port,
                 bootstrap_room=recv_req.bootstrap_room,
+                disagg_rebootstrap=recv_req.disagg_rebootstrap,
                 disagg_mode=self.disaggregation_mode,
                 routed_dp_rank=recv_req.routed_dp_rank,
                 disagg_prefill_dp_rank=recv_req.disagg_prefill_dp_rank,
@@ -3395,12 +3396,15 @@ class Scheduler(
                     recv_req.return_logprob
                     or req.return_hidden_states
                     or req.return_sampling_mask
+                    or req.input_embeds is not None
+                    or req.positional_embed_overrides is not None
                 ):
                     # Phase 1 of the decode-tail mode: the tail extend runs on
                     # decode and does not yet wire input-logprob metadata.
                     error_msg = (
                         "Invalid request: decode-tail mode does not support logprobs, "
-                        f"hidden states or sampling-mask returns yet. {req.rid=}"
+                        "hidden states, sampling-mask returns or explicit embeddings "
+                        f"yet. {req.rid=}"
                     )
                     logger.error(error_msg)
                     prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)

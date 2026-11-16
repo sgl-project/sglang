@@ -10,19 +10,25 @@ requests are outside this initial mode.
 """
 
 import unittest
+from array import array
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
 import sglang.srt.disaggregation.decode_schedule_batch_mixin as mixin_module
+from sglang.srt.arg_groups import pd_disaggregation_hook
+from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.configs.nemotron_h import NemotronHConfig
 from sglang.srt.disaggregation import decode as decode_module
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.disaggregation.utils import pre_alloc_fill_len, tail_transfer_input_len
-from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -41,6 +47,84 @@ class TailTransferInputLenTest(CustomTestCase):
 
     def test_cap_is_identity_without_tail(self):
         self.assertEqual(tail_transfer_input_len(1000, 0), 1000)
+
+    def test_rebootstrap_restores_the_entire_prefix(self):
+        req = Req("resume", None, array("q", [10, 11, 12]), SamplingParams())
+        req.output_ids.extend([20, 21])
+        payload = req.build_rebootstrap_payload()
+        self.assertEqual(payload["input_ids"], [10, 11, 12, 20])
+        self.assertTrue(payload["disagg_rebootstrap"])
+        self.assertEqual(
+            tail_transfer_input_len(
+                len(payload["input_ids"]),
+                2,
+                is_rebootstrap=payload["disagg_rebootstrap"],
+            ),
+            pre_alloc_fill_len(req),
+        )
+        self.assertEqual(list(req.output_ids), [20, 21])
+
+    def test_rebootstrap_marker_preserves_request_splitting_and_ipc_default(self):
+        request = GenerateReqInput(input_ids=[[1], [2]], disagg_rebootstrap=True)
+        request.normalize_batch_and_arguments()
+        self.assertTrue(request[0].disagg_rebootstrap)
+        self.assertTrue(request[1].disagg_rebootstrap)
+        self.assertFalse(TokenizedGenerateReqInput.__struct_defaults__[-1])
+
+    def test_rebootstrap_before_first_sample_keeps_the_tail(self):
+        req = Req("resume", None, array("q", [10, 11, 12]), SamplingParams())
+        payload = req.build_rebootstrap_payload()
+        self.assertFalse(payload["disagg_rebootstrap"])
+        self.assertEqual(
+            tail_transfer_input_len(
+                len(payload["input_ids"]),
+                2,
+                is_rebootstrap=payload["disagg_rebootstrap"],
+            ),
+            1,
+        )
+
+
+class TailModelGuardTest(CustomTestCase):
+    def test_recurrent_config_without_layer_types_is_rejected(self):
+        hf_config = NemotronHConfig(layers_block_type=["mamba", "attention"])
+        model_config = SimpleNamespace(
+            hf_config=hf_config,
+            hf_text_config=SimpleNamespace(),
+            is_draft_model=False,
+            attention_arch=AttentionArch.MHA,
+            is_hybrid_swa=False,
+        )
+        cfg = SimpleNamespace(
+            disaggregation_transfer_backend="mooncake",
+            disaggregation_decode_allocation_policy="early",
+            disaggregation_mode="prefill",
+            disaggregation_decode_host_receive_threshold=1,
+            dcp_size=1,
+            disaggregation_decode_tail_tokens=4,
+            max_prefill_tokens=128,
+            chunked_prefill_size=64,
+            speculative_algorithm=None,
+            pp_size=1,
+            dp_size=1,
+            ep_size=1,
+            attn_cp_size=1,
+            enable_two_batch_overlap=False,
+            enable_mixed_chunk=False,
+            enable_lora=False,
+            enable_hisparse=False,
+            enable_pd_role_switch=False,
+            disaggregation_decode_enable_radix_cache=False,
+        )
+        with (
+            patch.object(pd_disaggregation_hook, "resolving_view", return_value=cfg),
+            patch.object(pd_disaggregation_hook, "resolved_view", return_value=cfg),
+            patch.object(
+                pd_disaggregation_hook, "model_config_of", return_value=model_config
+            ),
+            self.assertRaisesRegex(ValueError, "recurrent state"),
+        ):
+            pd_disaggregation_hook.handle_pd_disaggregation(cfg)
 
 
 class IsTailTransferTest(CustomTestCase):

@@ -3475,7 +3475,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Case 3: Success - commit the transfer
         # A rebootstrap resumes from its last output id, already committed; the
         # prefill's sampled token is dropped.
-        resumes_output = decode_req.is_rebootstrap
+        resumes_output = decode_req.is_rebootstrap and bool(decode_req.req.output_ids)
         if resumes_output:
             assert len(decode_req.req.output_ids) > 0, decode_req.req.rid
         elif _is_tail_transfer(decode_req.req):
@@ -4347,7 +4347,7 @@ class SchedulerDisaggregationDecodeMixin:
             seq_len = (
                 req.kv.kv_committed_len
                 if _is_tail_transfer(req)
-                else len(req.origin_input_ids)
+                else pre_alloc_fill_len(req)
             )
             # The tree cache owns [0, cache_protected_len): the prefix this
             # decode promised at bootstrap, so prefill sent and digested only

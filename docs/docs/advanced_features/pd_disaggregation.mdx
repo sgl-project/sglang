@@ -98,7 +98,10 @@ chunked-prefill and maximum-prefill token budgets.
 Speculative decoding, hybrid/recurrent attention, LoRA, HiSparse, mixed chunking,
 two-batch overlap, decode radix caching, host KV receive and dynamic PD role
 switching are rejected in this mode. Requests returning logprobs, hidden states or
-sampling masks are rejected before admission. Further attention/state families and
+sampling masks, and requests supplying explicit input/positional embeddings, are
+rejected before admission. Decode-side retract/resume restores the entire prefix
+from prefill and retains the already emitted output and pending decode token.
+Further attention/state families and
 checkpoint-loading changes for engines without an LM-head module are follow-up work;
 the standard model loader still loads the usual checkpoint weights.
 

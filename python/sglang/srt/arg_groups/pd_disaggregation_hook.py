@@ -107,6 +107,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         unsupported = []
         if cfg.disaggregation_transfer_backend != "mooncake":
             unsupported.append("transfer backends other than Mooncake")
+        from sglang.srt.configs.hybrid_arch import mambaish_config
         from sglang.srt.configs.model_config import AttentionArch
 
         model_config = model_config_of(server_args)
@@ -114,6 +115,7 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
         if (
             model_config.attention_arch != AttentionArch.MHA
             or model_config.is_hybrid_swa
+            or mambaish_config(model_config) is not None
             or (layer_types and any(layer != "full_attention" for layer in layer_types))
         ):
             unsupported.append(

@@ -549,7 +549,9 @@ class PrefillBootstrapQueue:
         # derived from this registered length.
         n = len(req.origin_input_ids)
         tail = get_disagg().disaggregation_decode_tail_tokens
-        transfer_input_len = tail_transfer_input_len(n, tail) if tail else n
+        transfer_input_len = tail_transfer_input_len(
+            n, tail, is_rebootstrap=req.disagg_rebootstrap
+        )
         return kv_to_page_num(
             transfer_input_len - decode_prefix_len,
             self.scheduler.token_to_kv_pool_allocator.page_size,
@@ -1685,7 +1687,11 @@ class SchedulerDisaggregationPrefillMixin:
         if tail:
             end_idx = min(
                 req.extend_end if end_idx is None else end_idx,
-                tail_transfer_input_len(len(req.origin_input_ids), tail),
+                tail_transfer_input_len(
+                    len(req.origin_input_ids),
+                    tail,
+                    is_rebootstrap=req.disagg_rebootstrap,
+                ),
             )
         if last_chunk and computer is not None:
             if is_health_check_req(req):
@@ -1724,7 +1730,9 @@ class SchedulerDisaggregationPrefillMixin:
         # supports an empty final chunk carrying only the metadata.
         tail = get_disagg().disaggregation_decode_tail_tokens
         if tail:
-            transfer_input_len = tail_transfer_input_len(transfer_input_len, tail)
+            transfer_input_len = tail_transfer_input_len(
+                transfer_input_len, tail, is_rebootstrap=req.disagg_rebootstrap
+            )
         end_idx = min(
             req.extend_end if end_idx is None else end_idx, transfer_input_len
         )

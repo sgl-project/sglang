@@ -328,8 +328,12 @@ def _is_fake_transfer(req: Req) -> bool:
     )
 
 
-def tail_transfer_input_len(prompt_len: int, tail_tokens: int) -> int:
-    """Prompt prefix sent by a decode-tail prefill; short prompts send metadata only."""
+def tail_transfer_input_len(
+    prompt_len: int, tail_tokens: int, *, is_rebootstrap: bool = False
+) -> int:
+    """Rebootstrap restores all KV; new tail requests may send metadata only."""
+    if is_rebootstrap:
+        return prompt_len
     return max(0, prompt_len - tail_tokens)
 
 

@@ -1710,6 +1710,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 bootstrap_host=obj.bootstrap_host,
                 bootstrap_port=obj.bootstrap_port,
                 bootstrap_room=bootstrap_room,
+                disagg_rebootstrap=obj.disagg_rebootstrap,
                 lora_id=obj.lora_id,
                 lora_name=obj.lora_path,
                 input_embeds=input_embeds,
