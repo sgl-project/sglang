@@ -64,7 +64,7 @@ if is_musa() or is_xpu():
     )
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+_use_aiter = envs.SGLANG_USE_AITER.get() and is_hip()
 if _use_aiter:
     from aiter import greedy_sample as _aiter_greedy_sample
 

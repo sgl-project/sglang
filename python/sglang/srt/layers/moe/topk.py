@@ -101,7 +101,7 @@ _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_xpu = is_xpu()
 _is_npu = is_npu()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_musa = is_musa()
 _is_sail = is_sail()
 
