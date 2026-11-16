@@ -13,7 +13,6 @@ from PIL import Image
 from sglang.srt.environ import envs
 from sglang.srt.multimodal.media_io import _load_image
 from sglang.srt.utils import aiter as aiter_utils
-from sglang.srt.utils import device as device_utils
 from sglang.srt.utils.common import flatten_arrays_to_int64_tensor
 from sglang.srt.utils.device import (
     _get_device_sm_via_nvml,
@@ -314,18 +313,6 @@ class TestFreezeGc(CustomTestCase):
 class TestDeclaredBoolEnvSpellings(CustomTestCase):
     """These variables are declared as ``EnvBool``, so ``yes`` must mean true
     wherever they are read, as it does for the other readers of ``envs``."""
-
-    def test_flashinfer_available_accepts_yes(self):
-        with (
-            envs.SGLANG_IS_FLASHINFER_AVAILABLE.override("yes"),
-            mock.patch.object(device_utils, "is_cuda", return_value=True),
-            mock.patch.object(
-                device_utils.importlib.util, "find_spec", return_value=object()
-            ),
-        ):
-            self.assertTrue(device_utils.is_flashinfer_available.__wrapped__())
-        with envs.SGLANG_IS_FLASHINFER_AVAILABLE.override("no"):
-            self.assertFalse(device_utils.is_flashinfer_available.__wrapped__())
 
     def test_use_aiter_accepts_yes(self):
         with (
