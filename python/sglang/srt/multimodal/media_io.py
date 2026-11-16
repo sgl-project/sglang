@@ -744,3 +744,36 @@ def sample_video_frames(video, *, desired_fps: int, max_frames: int) -> list[int
         return list(range(total_frames))
     else:
         return np.linspace(0, total_frames - 1, num_frames, dtype=int).tolist()
+
+
+def encode_video(video_path, frame_count_limit=None):
+    if not os.path.exists(video_path):
+        logger.error(f"Video {video_path} does not exist")
+        return []
+
+    if frame_count_limit == 0:
+        return []
+
+    def uniform_sample(l, n):
+        gap = len(l) / n
+        idxs = [int(i * gap + gap / 2) for i in range(n)]
+        return [l[i] for i in idxs]
+
+    decoder = VideoDecoderWrapper(video_path)
+    avg_fps = decoder.avg_fps
+    total_frames = len(decoder)
+
+    sample_fps = round(avg_fps / 1)
+    if sample_fps == 0:
+        sample_fps = 1
+    frame_indices = [i for i in range(0, total_frames, sample_fps)]
+    if frame_count_limit is not None and len(frame_indices) > frame_count_limit:
+        frame_indices = uniform_sample(frame_indices, frame_count_limit)
+
+    if not frame_indices:
+        return []
+
+    frames_data = decoder.get_frames_at(frame_indices)
+    frames = [Image.fromarray(v.astype("uint8")) for v in frames_data]
+
+    return frames
