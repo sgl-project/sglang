@@ -1,4 +1,5 @@
 import sys
+import weakref
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -494,6 +495,10 @@ def test_host_memory_debug_report_runs_at_the_request_tail(monkeypatch):
         component_residency_strategies={},
     )
     manager = ComponentResidencyManager(pipeline, _server_args())
+    # The report walks every live object; a proxy to a collected object is one of them.
+    referent = torch.nn.Identity()
+    dead_proxy = weakref.proxy(referent)
+    del referent
     reports = []
     real_report = host_memory_breakdown.log_host_memory_breakdown
 
@@ -517,6 +522,10 @@ def test_host_memory_debug_report_runs_at_the_request_tail(monkeypatch):
         (pipeline.modules, "after request 1"),
         (pipeline.modules, "after request 2"),
     ]
+    # The per-mapping tensor count walks the same objects.
+    count, _ = host_memory_breakdown._tensor_ptrs_inside(0, 1 << 62)
+    assert count >= 1
+    del dead_proxy
 
 
 def test_strategy_cache_replaces_stale_component_instance():
