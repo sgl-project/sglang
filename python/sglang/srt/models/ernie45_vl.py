@@ -664,18 +664,6 @@ class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
         forward_batch: ForwardBatch,
         get_embedding: bool = False,
     ):
-        """Run forward pass for Ernie45-VL.
-
-        Args:
-            input_ids: Flattened (concatenated) input_ids corresponding to a
-                batch.
-            positions: Flattened (concatenated) position ids corresponding to a
-                batch.
-                **NOTE**: If mrope is enabled (default setting for Qwen2-VL
-                opensource models), the shape will be `(3, seq_len)`,
-                otherwise it will be `(seq_len,).
-                (Use input_metadata.mrope_positions to replace it)
-        """
         if self.is_mrope_enabled:
             positions = forward_batch.mrope_positions
 
