@@ -21,6 +21,7 @@ use smg_mesh::{
 };
 use tokio::{signal, spawn};
 use tracing::{debug, error, info, warn, Level};
+use validator::Validate;
 use wfaas::LoggingSubscriber;
 
 use crate::{
@@ -75,6 +76,26 @@ pub struct AppState {
     pub router_manager: Option<Arc<RouterManager>>,
     pub mesh_handler: Option<Arc<MeshServerHandler>>,
     pub mesh_sync_manager: Option<Arc<MeshSyncManager>>,
+}
+
+/// Validated OpenAI chat input with the SGLang-only request ID retained.
+///
+/// `ChatCompletionRequest` intentionally models the public OpenAI schema, so
+/// its serde round-trip discards SGLang's `rid` extension. The gateway needs
+/// that ID to preserve a caller's ability to cancel the exact worker request.
+#[derive(Deserialize, validator::Validate)]
+struct ChatCompletionRequestWithSglangRid {
+    #[serde(flatten)]
+    #[validate(nested)]
+    request: ChatCompletionRequest,
+    #[serde(default)]
+    rid: Option<String>,
+}
+
+impl crate::protocols::validated::Normalizable for ChatCompletionRequestWithSglangRid {
+    fn normalize(&mut self) {
+        self.request.normalize();
+    }
 }
 
 async fn parse_function_call(
@@ -184,11 +205,16 @@ async fn generate(
 async fn v1_chat_completions(
     State(state): State<Arc<AppState>>,
     headers: http::HeaderMap,
-    ValidatedJson(body): ValidatedJson<ChatCompletionRequest>,
+    ValidatedJson(body): ValidatedJson<ChatCompletionRequestWithSglangRid>,
 ) -> Response {
     state
         .router
-        .route_chat(Some(&headers), &body, Some(&body.model))
+        .route_chat_with_sglang_rid(
+            Some(&headers),
+            &body.request,
+            Some(&body.request.model),
+            body.rid.as_deref(),
+        )
         .await
 }
 
