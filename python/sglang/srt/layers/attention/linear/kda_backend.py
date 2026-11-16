@@ -1805,9 +1805,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
             return False
         if ragged_layout is not None or retrieve_parent_token is not None:
             return False
-        # Only per-token scratch grows with the verify window; the staged
-        # recurrent state is independent of its length.
-        if not 2 <= draft_token_num <= 16:
+        # draft_token_num = 1 bonus + dspark block size; the CuTe kernel is
+        # specialized per block size and capped at 8 by shared-memory growth.
+        if not 2 <= draft_token_num <= 8:
             return False
         if layer.bias is not None or layer.lower_bound is None:
             return False
