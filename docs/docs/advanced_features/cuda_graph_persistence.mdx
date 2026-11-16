@@ -43,7 +43,7 @@ workspace_root = "/data/foundry_archive/qwen3-1.7b"
 region_size = "256GB"
 ```
 
-`region_size` is the address range every device allocation of a scheduler lands in after Foundry's setup: weights, KV pool, graph memory and symmetric-memory workspaces. Only address space is reserved up front; memory is mapped per allocation. Sizing it is on the user: it must cover what one GPU allocates, which at the default `--mem-fraction-static` is about the GPU's memory. The default is 512GB (64GB in foundry-core 0.1.0rc4, which is smaller than an 80 GB GPU's weights and KV pool, so set it there).
+`region_size` is the address range every device allocation of a scheduler lands in after Foundry's setup: weights, KV pool, graph memory and symmetric-memory reservations under 2 GiB. Only address space is reserved up front; memory is mapped per allocation. Sizing it is on the user: it must cover what one GPU allocates, which at the default `--mem-fraction-static` is about the GPU's memory. The default is 64GB in foundry-core 0.1.0rc4, smaller than an 80 GB GPU's weights and KV pool, so set it there; from foundry-core 0.1.0rc5 it is 512GB.
 
 `save` and `load` must use the same model, flags, parallel layout and GPU type; remove the archive before a `save` of another configuration.
 
@@ -59,28 +59,30 @@ Run engines with and without `--cuda-graph-persistence` in separate processes.
 ## What it changes
 
 - Decode graphs use the `full` backend; prefill graphs are `full` or `disabled` (default `disabled`). Other backends are not supported.
-- FlashInfer autotune is off (`--disable-flashinfer-autotune`): the tuning pass allocates timing-dependently, which `load` cannot repeat. `save` installs the tuned tactics from the autotune cache file that a plain start of the same model and flags writes (under `$SGLANG_CACHE_DIR/flashinfer/autotune/`) and keeps them in the archive; `load` installs them from there. Without that file the kernels use FlashInfer's default tactics and `save` logs a warning.
+- SGLang's FlashInfer autotune pass is off on both sides (`--disable-flashinfer-autotune`, so `save` and `load` select the same kernels): inside the recorded memory layout its allocations are timing-dependent. The flag also turns off FlashInfer's autotuned bf16 GEMM for M <= 16 on SM100/SM103 and the PCIe-IPC all-reduce tuning, so those kernels differ from a start without persistence. To get tuned tactics for the model's FlashInfer MoE / GEMM kernels, start the model once without `--cuda-graph-persistence` (same model and flags): it writes the autotune cache file under `$SGLANG_CACHE_DIR/flashinfer/autotune/`. `save` archives those tactics and `load` installs them and tunes nothing; without that file the kernels use FlashInfer's default tactics and `save` logs a warning.
 - Flags and environment variables that select state a restored graph cannot replay (custom all-reduce IPC buffers, NCCL symmetric memory / NVLS / buffer registration, MSCCL++, two-batch overlap, the memory saver, graph-pool borrow / precarve, the metadata glue graph, the DCP push-combine all-reduce) are pinned, and an explicit contrary value is not supported.
-- Each pin prints a `[Foundry] pin:` line (the graph-backend, profiling and autotune pins with a foundry-core newer than 0.1.0rc4).
-- Speculative decoding is supported for EAGLE / EAGLE3 (target-verify, draft-decode and draft-extend graphs; not adaptive or multi-layer EAGLE) and, with a foundry-core newer than 0.1.0rc4, for the verify-only algorithms DFLASH, NGRAM and DSPARK (target-verify and draft-verify graphs; DSPARK with `SGLANG_DSPARK_USE_GREEDY_DRAFT=1`, since its sampling draft allocates inside the first capture; with 0.1.0rc4 they fall back natively); other speculative algorithms, LoRA, elastic-EP graph recapture, post-capture KV sizing and graph variants (attention variants, sharded-verify logits variants) are not supported.
+- Each pin prints a `[Foundry] pin:` line (the graph-backend, profiling and autotune pins from foundry-core 0.1.0rc5).
+- Speculative decoding is supported for EAGLE / EAGLE3 (target-verify, draft-decode and draft-extend graphs; not adaptive or multi-layer EAGLE) and, with foundry-core 0.1.0rc5 and later, for the verify-only algorithms DFLASH, NGRAM and DSPARK (target-verify and draft-verify graphs; DSPARK with `SGLANG_DSPARK_USE_GREEDY_DRAFT=1`, since its sampling draft allocates inside the first capture; with 0.1.0rc4 they fall back natively); other speculative algorithms, LoRA, elastic-EP graph recapture, post-capture KV sizing and graph variants (attention variants, sharded-verify logits variants) are not supported.
 
 ## Unsupported configurations
 
-A configuration Foundry does not support still runs: Foundry logs the step and the reason, persistence is disabled and the server initialises natively (normal graph capture). Memory failures at startup are not fallbacks either; the scheduler exits, and with a foundry-core newer than 0.1.0rc4 the log names the cause:
-
-```text
-# region_size too small for what the GPU allocates (cuMemAlloc, or the address reservation of torch symmetric memory):
-[HOOK] ERROR: Foundry allocation region exhausted (<call> of <n> bytes at offset <o>, region_size <s> bytes = <g> GiB); raise region_size in the Foundry TOML
-# the GPU itself is full while the region still has room:
-[HOOK] ERROR: GPU out of physical memory (cuMemAlloc: cuMemCreate of <n> bytes at region offset <o> failed; the region still has <g> GiB of address space, so this is not region_size: lower --mem-fraction-static or the batch sizes)
-# the region cannot be reserved at base_addr:
-RuntimeError: [Foundry] could not reserve the allocation region at base_addr=<base> with region_size=<size> (...): choose another base_addr or a smaller region_size in the Foundry TOML
-```
-
-The first two are followed by the CUDA out-of-memory error of the allocation that failed.
+A configuration Foundry does not support still runs: Foundry logs the step and the reason, persistence is disabled and the server initialises natively (normal graph capture).
 
 ```text
 [Foundry] unsupported at capture state: DeepEPv3Dispatcher has no prebuild; cuda-graph persistence disabled, continuing natively
 ```
 
 Foundry detects this while resolving the server args, at the first capture (a MoE dispatcher without `prebuild()`, or with its state still pending) and on `save` at each capture (state created inside the graph capture). A `save` that falls back marks its archive invalid, and a `load` of it also runs natively. Once `load` starts restoring graphs, a Foundry failure is an error.
+
+With foundry-core 0.1.0rc5 and later, a memory failure at startup is not a fallback either: the scheduler exits and the log names the cause (with 0.1.0rc4 an allocation past the region end can fall back to a driver-placed address, and a failed reservation disables the region silently; `save` and `load` then differ).
+
+```text
+# region_size too small for what the GPU allocates (cuMemAlloc / cuMemAllocPitch, or a torch symmetric-memory reservation under 2 GiB):
+[HOOK] ERROR: Foundry allocation region exhausted (<call> of <n> bytes at offset <o>, region_size <s> bytes = <g> GiB); raise region_size in the Foundry TOML
+# the GPU itself is full while the region still has room:
+[HOOK] ERROR: GPU out of physical memory (<call>: cuMemCreate of <n> bytes at region offset <o> failed; the region still has <g> GiB of address space, so this is not region_size: lower --mem-fraction-static or the batch sizes)
+# the region cannot be reserved at base_addr:
+RuntimeError: [Foundry] could not reserve the allocation region at base_addr=<base> with region_size=<size> (...): choose another base_addr or a smaller region_size in the Foundry TOML
+```
+
+The first two are followed by the CUDA out-of-memory error of the allocation that failed.
