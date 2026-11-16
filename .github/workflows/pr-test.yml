@@ -66,7 +66,8 @@ env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ (inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true) && 'true' || 'false' }}
   # PR runs (pull_request_target) also have refs/heads/main but test PR code, so they never bypass.
   PR_TEST_BYPASS_MAINTENANCE_ON_MAIN: ${{ github.event_name != 'pull_request_target' && github.ref == 'refs/heads/main' && 'true' || 'false' }}
-  USE_VENV: false
+  # Trial branch: each job installs into its own /tmp venv (deleted after the job), so torch 2.15 never lands in the runners' shared env.
+  USE_VENV: "1"
 
 # Read-only for every job that runs PR code; called workflows inherit it.
 permissions:
