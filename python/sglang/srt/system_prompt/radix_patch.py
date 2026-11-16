@@ -97,6 +97,117 @@ def seed_mamba_boundary(boundary_len: Optional[int], chunk: int) -> Optional[int
     return boundary_len
 
 
+def suppress_branching_for_system_prefix(
+    branching_seqlen: Optional[int],
+    boundary: Optional[int],
+) -> Optional[int]:
+    """Drop a match-computed branching point on a fixed-system-prompt request.
+
+    Every shareable token of a fixed-system-prompt request lives inside the
+    boundary chunk; the user turn is per-request and is recomputed every time
+    (the usable prefix is already mamba-capped at the boundary state, so the
+    overhang is part of the extend either way). The branching re-track would
+    only allocate the ping-pong tracking buffers (3 mamba slots instead of 1)
+    to snapshot states whose donate keys ``cap_mamba_donate_len`` caps back to
+    the boundary -- they can never enter the tree, so the tracking buys
+    nothing. Returns ``branching_seqlen`` unchanged when the feature is off
+    (``boundary`` unset) or when there is nothing to drop.
+    """
+    if branching_seqlen is not None and boundary:
+        return None
+    return branching_seqlen
+
+
+def skip_unfinished_donate_below_boundary(
+    cache_len: Optional[int],
+    boundary: Optional[int],
+) -> bool:
+    """Whether an unfinished (chunked-prefill) mamba donation should be skipped.
+
+    Fixed system prompt: the only state anyone can reuse is the boundary
+    state -- every request's prefix covers the whole system block, so nobody
+    ever resumes from a shallower checkpoint. Intermediate chunk-boundary
+    states below the boundary are therefore worthless, yet each holds a pool
+    slot while the chunked request is in flight -- exactly the multiplier
+    that exhausted the pool during the cold-start wave (audits showed tens of
+    evictable intermediate states with only a dozen running requests, ending
+    in the ``Can not alloc mamba cache`` assert). Skip them; donate only once
+    the track reaches the boundary (``cache_len == boundary`` after
+    ``cap_mamba_donate_len``). Feature off (``boundary`` unset) keeps the
+    default donate-at-every-chunk-boundary behavior.
+    """
+    return (
+        boundary is not None
+        and boundary > 0
+        and cache_len is not None
+        and cache_len < boundary
+    )
+
+
+def is_new_boundary_store(
+    boundary: Optional[int],
+    insert_key_len: int,
+    mamba_exist: bool,
+) -> bool:
+    """Whether an insert just stored a NEW mamba state at the boundary key.
+
+    Fixed system prompt: a boundary-carrying request's insert key is capped
+    at the boundary (``cap_mamba_donate_len`` / the KV cap), so an insert
+    whose key length equals the boundary IS the shared boundary node of that
+    request's token path. The key-length check also excludes sub-boundary
+    rounds and warm no-op inserts (key 0 -- never a boundary store).
+    """
+    return (
+        boundary is not None
+        and boundary > 0
+        and insert_key_len == boundary
+        and not mamba_exist
+    )
+
+
+def should_pin_boundary_store(
+    boundary: Optional[int],
+    insert_key_len: int,
+    mamba_exist: bool,
+    pinned_count: int,
+    cap: int = 8,
+) -> bool:
+    """Whether an insert that just stored a mamba value should pin its node.
+
+    Pinning each NEW boundary store (``mamba_exist`` False; the store that
+    created a pre-existing state already pinned it, and warm requests never
+    store) keeps the state unevictable under mamba-slot pressure. Per-store
+    rather than one-shot: the warmup seed and real traffic may donate on
+    different token paths (mismatched rendering), and the real path's state
+    must still be pinned after the seed consumed a pin. ``cap`` bounds
+    pathological traffic with many distinct prefixes; the expected steady
+    state is 1-2 pinned nodes.
+    """
+    return is_new_boundary_store(boundary, insert_key_len, mamba_exist) and (
+        pinned_count < cap
+    )
+
+
+def is_system_prefix_cold_seeder(
+    boundary: Optional[int],
+    prefix_indices_len: int,
+    mamba_branching_seqlen: Optional[int],
+) -> bool:
+    """Whether a fixed-system-prompt request must (re)build the boundary state.
+
+    The complement of ``is_system_prefix_warm`` restricted to boundary-carrying
+    requests: the request carries the fixed boundary but its match did not
+    reach a cached boundary state (first pass on an empty or mismatched tree,
+    or the state was evicted). Such a request holds the full cold slot count
+    and is the one that donates the shared state when its prefill crosses the
+    boundary. Boundary-less traffic is never a cold seeder -- the cold-start
+    admission gate must never serialize it.
+    """
+    return boundary is not None and boundary > 0 and not is_system_prefix_warm(
+        boundary, prefix_indices_len, mamba_branching_seqlen
+    )
+
+
 def reseed_mamba_boundary_after_match(
     boundary: Optional[int],
     prefix_indices_len: int,

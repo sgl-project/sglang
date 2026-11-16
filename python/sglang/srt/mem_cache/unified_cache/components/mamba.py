@@ -51,7 +51,11 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BaseEvictionResult,
 )
 from sglang.srt.runtime_context import get_disagg, get_exec
-from sglang.srt.system_prompt.radix_patch import cap_mamba_donate_len
+from sglang.srt.system_prompt.radix_patch import (
+    cap_mamba_donate_len,
+    skip_unfinished_donate_below_boundary,
+    suppress_branching_for_system_prefix,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -217,6 +221,31 @@ class MambaComponent(TreeComponent):
         branching_seqlen = branching_checkpoint_depth(
             result.full_kv_hit_length, mamba_boundary_len, self.mamba_checkpoint_grid
         )
+
+        # Fixed system prompt (--system-prompt): every shareable token lives
+        # inside the fixed boundary chunk and the per-request user turn is
+        # recomputed every time, so the branching re-track is never wanted.
+        # device_indices are already mamba-capped at the boundary state, so
+        # suppressing branching only skips the ping-pong tracking machinery
+        # (3 slots -> 1): the overhang is recomputed as part of the extend
+        # either way. Keeping branching would burn 2 pool slots per request
+        # to re-track states that cap_mamba_donate_len can never store (the
+        # donate key is capped at the boundary, so the tracked states are
+        # freed on mamba_exist and never enter the tree).
+        if params.req is not None:
+            branching_seqlen = suppress_branching_for_system_prefix(
+                branching_seqlen, params.req.system_prefix_boundary
+            )
+            # Warm-hit telemetry for the cold-start gate: this request's
+            # match reached its fixed-system-prompt boundary, so the tree is
+            # demonstrably serving its traffic warm (a stored-but-never-hit
+            # boundary state -- e.g. a seed built with different template
+            # kwargs -- must NOT disengage the gate).
+            if (
+                params.req.system_prefix_boundary is not None
+                and mamba_boundary_len >= params.req.system_prefix_boundary
+            ):
+                self.cache.note_system_prefix_warm_hit()
 
         # HiCache: if mamba was evicted from device but has host backup,
         # ensure mamba_host_hit_length >= 1 so load_back is triggered.
@@ -1056,6 +1085,20 @@ class MambaComponent(TreeComponent):
             return cache_len
         else:
             if cache_len is None:
+                return 0
+            # Fixed system prompt: skip intermediate chunk-boundary donations
+            # below the boundary. Every request's prefix covers the whole
+            # system block, so no future request can ever resume from a
+            # shallower checkpoint -- each intermediate donation only holds a
+            # pool slot while the chunked request is in flight (the cold-wave
+            # multiplier behind the "Can not alloc mamba cache" crash). A
+            # retracted mid-prefill request re-prefills from the boundary
+            # state (or from 0 before crossing it), giving up at most
+            # `boundary` tokens of recompute. Donations resume once the track
+            # reaches the boundary (cache_len == boundary after the cap).
+            if skip_unfinished_donate_below_boundary(
+                cache_len, req.system_prefix_boundary
+            ):
                 return 0
             if self._defers_checkpoint(req, token_ids_len, cache_len):
                 insert_params.mamba_checkpoint_deferred = True
