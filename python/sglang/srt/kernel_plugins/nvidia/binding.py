@@ -45,6 +45,7 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
     SupportsPrefillBody,
     SupportsRank0Broadcast,
     SupportsSampledAccept,
+    SupportsStateSlotReset,
     find_spec,
     registered_architectures,
     spec_registered,
@@ -838,6 +839,12 @@ def built_megakernel(model: Optional[torch.nn.Module]) -> Optional[BuiltMegakern
     if model is None:
         return None
     return model.__dict__.get("_megakernel")
+
+
+def megakernel_state(model: torch.nn.Module) -> Optional[SupportsStateSlotReset]:
+    """The installed build when it keeps recurrent state of its own, else None."""
+    built = built_megakernel(model)
+    return built if isinstance(built, SupportsStateSlotReset) else None
 
 
 def bind_speculative_runtime_hooks(

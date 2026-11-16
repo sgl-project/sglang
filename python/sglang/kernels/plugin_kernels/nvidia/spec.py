@@ -567,6 +567,16 @@ class SupportsRecurrentCommit(Protocol):
 
 
 @runtime_checkable
+class SupportsKdaCommit(Protocol):
+    """A target spec that commits the KDA state after a chain verify in one launch.
+
+    kda_commit returns False, launching nothing, when off; SGLang then commits itself.
+    """
+
+    def kda_commit(self, **kwargs: Any) -> bool: ...
+
+
+@runtime_checkable
 class SupportsDraftAccept(Protocol):
     """A DFlash draft spec that runs the greedy verify accept itself.
 
