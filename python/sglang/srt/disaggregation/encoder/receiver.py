@@ -1927,7 +1927,6 @@ class MMReceiverBase(ABC):
             )
         self.scheduler = scheduler
         self.gpu_id = get_device().gpu_id if scheduler is not None else 0
-        self.wait_timeout = envs.SGLANG_ENCODER_RECV_TIMEOUT.get()
         self.embedding_pool = None
 
         self.model_type = (
@@ -2192,15 +2191,6 @@ class MMReceiverBase(ABC):
     def send_encode_request(
         self, obj, time_stats_json=None, on_dispatch_error=None
     ) -> Optional[threading.Event]:
-        return self._send_encode_request(
-            obj,
-            time_stats_json=time_stats_json,
-            on_dispatch_error=on_dispatch_error,
-        )
-
-    def _send_encode_request(
-        self, obj, time_stats_json=None, on_dispatch_error=None
-    ) -> Optional[threading.Event]:
         mm_data = self._extract_url_data(obj)
         if obj.rid is None:
             obj.rid = uuid.uuid4().hex
@@ -2424,7 +2414,7 @@ class MMReceiverBase(ABC):
             # Per-request sockets receive here; shared-socket requests use this
             # tick to retry pool staging after _drain_scheduler_embeddings().
             waiting_req._try_recv_mm_data()
-            if current_time - waiting_req.start_time > self.wait_timeout:
+            if current_time - waiting_req.start_time > self.recv_timeout:
                 waiting_req.status = WaitingMMRequestStatus.TIMEOUT
                 waiting_req.release_resources()
                 waiting_req.close_recv_socket()
@@ -2466,7 +2456,7 @@ class MMReceiverBase(ABC):
                 abort_reqs.append(
                     (
                         self.create_req(waiting_req.recv_req),
-                        f"Timeout waiting for image embedding after {self.wait_timeout}s",
+                        f"Timeout waiting for image embedding after {self.recv_timeout}s",
                         HTTPStatus.REQUEST_TIMEOUT,
                     )
                 )
@@ -2676,22 +2666,6 @@ class MMReceiverBase(ABC):
 
 
 class MMReceiverHTTP(MMReceiverBase):
-    def __init__(
-        self,
-        server_args: ServerArgs,
-        dtype: Optional[torch.dtype] = None,
-        hf_config: Optional[PretrainedConfig] = None,
-        scheduler: Optional["Scheduler"] = None,
-        encode_urls: Optional[List[str]] = None,
-    ):
-        super().__init__(
-            server_args,
-            dtype=dtype,
-            hf_config=hf_config,
-            scheduler=scheduler,
-            encode_urls=encode_urls,
-        )
-
     # For zmq_to_scheduler and mooncake
     def process_waiting_requests(self, recv_reqs):
         if self.encoder_transfer_backend == "mooncake":
