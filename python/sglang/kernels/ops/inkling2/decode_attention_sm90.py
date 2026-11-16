@@ -73,10 +73,16 @@ def _decode_partials(
     cols = tl.arange(0, BLOCK_N)
     for tile in range(tile_lo, tile_hi):
         pos = tile * BLOCK_N + cols
-        page = tl.load(PageTable + b * SP + (tile * BLOCK_N) // PAGE).to(tl.int64)
-        slot = (tile * BLOCK_N) % PAGE + cols
-        kv_offset = page * SK0 + slot[:, None] * SK1 + hk * SK2 + d[None, :]
         valid = (pos < seqlen) & (pos >= first)
+        if PAGE % BLOCK_N == 0:
+            # The whole tile sits in one page.
+            page = tl.load(PageTable + b * SP + (tile * BLOCK_N) // PAGE).to(tl.int64)
+            row = page * SK0 + ((tile * BLOCK_N) % PAGE + cols) * SK1
+        else:
+            # The tile spans pages (e.g. page size 1): look up each key's page.
+            page = tl.load(PageTable + b * SP + pos // PAGE, pos < seqlen, other=0)
+            row = page.to(tl.int64) * SK0 + (pos % PAGE) * SK1
+        kv_offset = row[:, None] + hk * SK2 + d[None, :]
         k = tl.load(K + kv_offset, valid[:, None], other=0)
         s = tl.dot(q, tl.trans(k)) * scale
         dist = q_pos[:, None] - pos[None, :]
