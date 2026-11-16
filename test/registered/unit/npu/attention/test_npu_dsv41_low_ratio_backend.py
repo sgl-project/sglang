@@ -588,24 +588,30 @@ class TestPdBufferEnumeration(unittest.TestCase):
 
 
 class TestCompact1d(unittest.TestCase):
+    """``_stable_compact_1d``: compact into a fixed buffer without NonZero.
+
+    The helper lives on the concrete backend since the verify/seq-metadata
+    unification; the mixin owns the row-value formulas, not the compaction.
+    """
+
     def test_dense_front_with_custom_fill(self):
         dst = torch.full((5,), 99, dtype=torch.int32)
         values = torch.tensor([10, 20, 30], dtype=torch.int64)
         keep = torch.tensor([True, False, True], dtype=torch.bool)
-        LowRatioCompressAscendBackendMixin._dsv41_compact_1d(dst, values, keep, fill=-1)
+        DeepseekV4AscendAttnBackend._stable_compact_1d(dst, values, keep, fill=-1)
         self.assertEqual(dst.tolist(), [10, 30, -1, -1, -1])
 
     def test_overflow_rows_are_dropped_instead_of_raised(self):
         dst = torch.full((2,), 7, dtype=torch.int32)
         values = torch.tensor([1, 2, 3], dtype=torch.int64)
         keep = torch.tensor([True, True, True])
-        LowRatioCompressAscendBackendMixin._dsv41_compact_1d(dst, values, keep, fill=0)
+        DeepseekV4AscendAttnBackend._stable_compact_1d(dst, values, keep, fill=0)
         self.assertEqual(dst.tolist(), [1, 2])
 
     def test_size_mismatch_is_rejected(self):
         dst = torch.zeros(3, dtype=torch.int32)
         with self.assertRaises(ValueError):
-            LowRatioCompressAscendBackendMixin._dsv41_compact_1d(
+            DeepseekV4AscendAttnBackend._stable_compact_1d(
                 dst, torch.tensor([1, 2]), torch.tensor([True]), fill=0
             )
 
