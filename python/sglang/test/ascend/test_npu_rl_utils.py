@@ -159,17 +159,24 @@ def npu_server(
     """
     port = port or find_available_port(30000)
     base_url = f"http://127.0.0.1:{port}"
-    # Warm the test process's NPU context while the card is idle; the first
+    # Warm the test process's NPU context while the cards are idle; the first
     # in-process mem_get_info() call is otherwise paid while the server is
-    # starting. Then wait for the previous server to hand HBM back, using the
-    # memory fraction this server will reserve plus a fixed margin.
-    npu_free_bytes(0)
+    # starting. Then wait for the previous server to hand HBM back on every
+    # device this server uses (TP x DP x PP), using the memory fraction it will
+    # reserve plus a fixed margin.
     mem_fraction = float(_server_arg(extra_args, "--mem-fraction-static", "0.9"))
     tp_size = max(1, int(_server_arg(extra_args, "--tp-size", "1")))
-    min_free = int(mem_fraction * npu_total_bytes(0)) + MEMORY_WAIT_MARGIN_BYTES
-    for device in range(tp_size):
+    dp_size = max(1, int(_server_arg(extra_args, "--dp-size", "1")))
+    pp_size = max(1, int(_server_arg(extra_args, "--pp-size", "1")))
+    device_count = tp_size * dp_size * pp_size
+
+    for device in range(device_count):
+        npu_free_bytes(device)
+        min_free = (
+            int(mem_fraction * npu_total_bytes(device)) + MEMORY_WAIT_MARGIN_BYTES
+        )
         wait_for_free_memory(device, min_free, timeout=300)
-    baseline_free = npu_free_bytes(0)
+    baseline_free = [npu_free_bytes(device) for device in range(device_count)]
     process = popen_launch_server(
         model_path,
         base_url,
@@ -187,7 +194,8 @@ def npu_server(
             terminate_and_kill_process_tree(process, terminate_timeout=30)
         else:
             process.wait()
-        _wait_for_hbm_baseline(0, baseline_free)
+        for device, baseline in enumerate(baseline_free):
+            _wait_for_hbm_baseline(device, baseline)
 
 
 # ---------------------------------------------------------------------------
