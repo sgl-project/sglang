@@ -46,7 +46,6 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
 )
 from sglang.srt.arg_groups.overrides import (
-    remote_instance_transfer_engine_of,
     resolution_result,
 )
 from sglang.srt.arg_groups.validation_hook import (
@@ -232,6 +231,7 @@ class ServerArgs:
         """Leave construction unresolved; launchers and publishers call ``resolve_once``."""
         for name in (
             "disable_outlines_disk_cache",
+            "num_continuous_decode_steps",
             "show_time_cost",
             "triton_attention_reduce_in_fp32",
         ):
@@ -351,8 +351,8 @@ class ServerArgs:
 
     # The attention-backend allow-list is enforced via
     # --enable-page-major-kv-layout (implied by the unified pool in
-    # _handle_page_major_kv_layout); the model-family gate is enforced at pool
-    # construction in model_runner_kv_cache_mixin._init_pools.
+    # handle_page_major_kv_layout); the model-family gate is enforced at pool
+    # construction in mem_cache/kv_cache_configurator.py (_init_pools).
 
     def _unified_memory_pd_transfer_backends(self) -> set[str]:
         return {"mooncake"}
@@ -466,6 +466,13 @@ class ServerArgs:
                 help="Deprecated. Has no effect.",
             )
         parser.add_argument(
+            "--num-continuous-decode-steps",
+            action=DeprecatedAction,
+            nargs=None,
+            default=argparse.SUPPRESS,
+            help="Deprecated. Has no effect.",
+        )
+        parser.add_argument(
             "--enable-flashinfer-allreduce-fusion",
             action="store_true",
             help="(Deprecated: use --flashinfer-allreduce-fusion-backend=auto) "
@@ -539,11 +546,6 @@ class ServerArgs:
         from sglang.srt.arg_groups.validation_hook import check_server_args
 
         check_server_args(self)
-
-    def remote_instance_weight_loader_use_transfer_engine(self, load_format=None):
-        """``load_format`` overrides the seed's: a draft runner loading under
-        ``--speculative-draft-load-format`` needs its own transfer engine."""
-        return remote_instance_transfer_engine_of(resolving_view(self), load_format)
 
 
 # Collect input fields only; field_order.py preserves positional argument order.
