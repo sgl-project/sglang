@@ -18,6 +18,21 @@ class LayerPullPlan:
     reads: tuple[tuple[int, int, int], ...]  # source rank, source slot, staging slot
     installs: tuple[tuple[int, int], ...]  # staging slot, destination slot
 
+    def install_ranges(self) -> tuple[tuple[int, int, int], ...]:
+        """Combine adjacent source/destination slots without copying untouched slots."""
+        ranges = []
+        for source, destination in self.installs:
+            if ranges:
+                prev_source, prev_destination, length = ranges[-1]
+                if (
+                    source == prev_source + length
+                    and destination == prev_destination + length
+                ):
+                    ranges[-1] = (prev_source, prev_destination, length + 1)
+                    continue
+            ranges.append((source, destination, 1))
+        return tuple(ranges)
+
 
 def plan_layer_pull(
     old: tuple[int, ...],
@@ -34,13 +49,16 @@ def plan_layer_pull(
     if min(old) < 0 or set(new) != set(old):
         raise ValueError("An EPLB plan must preserve every logical expert")
     slots = len(old) // world_size
+    holders_by_expert = {}
+    for slot, expert in enumerate(old):
+        holders_by_expert.setdefault(expert, []).append(slot)
     local_copies, reads, installs = [], [], []
     staged = {}
     for dst, expert in enumerate(new[rank * slots : (rank + 1) * slots]):
         if old[rank * slots + dst] == expert:
             continue
         if expert not in staged:
-            holders = [i for i, value in enumerate(old) if value == expert]
+            holders = holders_by_expert[expert]
             local = [i for i in holders if i // slots == rank]
             if local:
                 local_copies.append((local[0] % slots, dst))

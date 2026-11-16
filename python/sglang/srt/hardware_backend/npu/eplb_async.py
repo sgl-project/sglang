@@ -228,9 +228,11 @@ class NpuEplbRuntime:
     def install(self, layer):
         self._check_stream()
         start = time.perf_counter()
-        for source, destination in self.plans[layer].installs:
+        for source, destination, length in self.plans[layer].install_ranges():
             for weight, buffer in zip(self.weights[layer], self.staging, strict=True):
-                weight[destination].copy_(buffer[source])
+                weight[destination : destination + length].copy_(
+                    buffer[source : source + length]
+                )
         self.metadata.update(self._new_metadata, update_layer_ids=[layer])
         self._consumed = self.device_module.Event()
         self._consumed.record(self._owner_stream)

@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 from sglang.srt.eplb.async_rebalance import (
     AsyncEplbCoordinator,
+    LayerPullPlan,
     Phase,
     RebalanceAborted,
     UnsafeRebalanceFailure,
@@ -98,6 +99,29 @@ class Runtime:
 
 
 class TestAsyncRebalance(unittest.TestCase):
+    def test_install_ranges_preserve_holes_and_replica_sources(self):
+        for installs in (
+            (),
+            ((0, 0), (1, 1), (2, 2)),
+            ((0, 0), (2, 2), (3, 3)),
+            ((0, 0), (0, 1), (2, 2), (3, 3)),
+            ((3, 0), (4, 1), (0, 3)),
+        ):
+            with self.subTest(installs=installs):
+                plan = LayerPullPlan((), (), installs)
+                source = list(range(10, 18))
+                expected = [-1] * 8
+                actual = expected.copy()
+                for src, dst in installs:
+                    expected[dst] = source[src]
+                for src, dst, length in plan.install_ranges():
+                    actual[dst : dst + length] = source[src : src + length]
+                self.assertEqual(actual, expected)
+        self.assertEqual(
+            LayerPullPlan((), (), ((0, 0), (1, 1), (2, 2))).install_ranges(),
+            ((0, 0, 3),),
+        )
+
     def setUp(self):
         self.live = [0, 1, 2, 3]
         collective = Collective(2)
