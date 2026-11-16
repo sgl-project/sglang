@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 from typing import Any
 
-import attentions  # noqa: F401  Registers torch.ops.attentions.sparse_block_estimate.
 import torch
 from sgl_kernel_npu.operators.attention import sparse_block_estimate
 
