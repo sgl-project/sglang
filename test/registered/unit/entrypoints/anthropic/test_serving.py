@@ -529,6 +529,33 @@ class TestAnthropicServing(unittest.TestCase):
         self.assertIsNone(chat_request.tools)
         self.assertEqual(chat_request.tool_choice, "none")
 
+    def test_custom_tool_without_description_matches_openai_path(self):
+        """A tool sent without a description was converted with description "",
+        so templates that dump the whole tool (ERNIE) rendered `"description": ""`
+        where /v1/chat/completions passes none; a described tool keeps its
+        description ahead of its parameters, as the client listed them."""
+        request = self._anthropic_request(
+            tools=[
+                {"name": "bare", "input_schema": {"type": "object"}},
+                {
+                    "name": "read",
+                    "description": "Read a file",
+                    "input_schema": {"type": "object"},
+                },
+            ],
+        )
+
+        bare, read = (
+            tool.function.model_dump()
+            for tool in self._serving()
+            ._convert_to_chat_completion_request(request)
+            .tools
+        )
+
+        self.assertIsNone(bare["description"])
+        self.assertEqual(list(read), ["name", "description", "parameters", "strict"])
+        self.assertEqual(read["description"], "Read a file")
+
     def test_custom_tool_without_schema_is_rejected(self):
         # With the discriminated union, an AnthropicCustomTool variant must
         # carry an input_schema. The check fires at request-parse time

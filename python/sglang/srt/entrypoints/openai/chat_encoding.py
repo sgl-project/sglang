@@ -53,6 +53,12 @@ def resolve_chat_encoding_spec(
     if "InklingForConditionalGeneration" in arch:
         return "inkling"
 
+    # ERNIE 5.5 renders its chat template in Python (ErnieChatTokenizer), not
+    # Jinja, so prompts go through the tokenizer rather than apply_chat_template
+    # on a Jinja string.
+    if "Ernie5_5" in arch or hf_config.model_type == "ernie5_5_moe":
+        return "ernie5_5"
+
     has_chat_template = tokenizer is not None and tokenizer.chat_template is not None
     if "DeepseekV3" in arch and not has_chat_template:
         return "dsv32"
@@ -62,7 +68,7 @@ def resolve_chat_encoding_spec(
 def spec_supports_inline_system(spec: Optional[str]) -> bool:
     """Native encoders verified to render mid-conversation system messages in place."""
     # K3's tokenizer renders in Python, so there is no Jinja source to probe.
-    return spec == "kimi_k3"
+    return spec in ("kimi_k3", "ernie5_5")
 
 
 def spec_owns_reasoning_history(spec: Optional[str]) -> bool:
@@ -85,7 +91,7 @@ def spec_renders_prompt_ids(spec: Optional[str]) -> bool:
     Token-first encoders leave the text prompt empty; the MM processor
     expands their single placeholder ids rather than re-tokenizing text.
     """
-    return spec in ("inkling", "kimi_k3", "dsv41")
+    return spec in ("inkling", "kimi_k3", "dsv41", "ernie5_5")
 
 
 def encode_simple_chat(
@@ -124,6 +130,15 @@ def encode_simple_chat(
             messages, thinking_mode=thinking_mode
         )
         return tokenizer.encode(real_input)
+
+    if spec == "ernie5_5":
+        return tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=False,
+            enable_thinking=thinking_mode == "thinking",
+        )
 
     if getattr(tokenizer, "chat_template", None) is None:
         raise ValueError(
