@@ -182,7 +182,9 @@ class TestMoeTmaHiddenAlignment(CustomTestCase):
                         )
                         with patch.object(cfg, "get_moe_configs", return_value=None):
                             reference = moe.fused_experts(x, w1, w2, routing, runner)
-                        config = cfg.get_default_config(129, 8, 128, hidden, 2, None)
+                        config = cfg.get_default_config(
+                            129, 8, 128, hidden, 2, None, False
+                        )
                         flags.clear()
                         with (
                             patch.object(
