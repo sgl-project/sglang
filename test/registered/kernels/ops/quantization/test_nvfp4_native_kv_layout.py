@@ -295,8 +295,8 @@ def test_nvfp4_native_target_verify_matches_bf16_reference():
 def test_nvfp4_native_scale_move_preserves_logical_rows():
     from sglang.srt.layers.quantization.nvfp4_kv_cache import (
         move_nvfp4_native_scales,
-        nvfp4_v_scale_swizzle_indices,
     )
+    from sglang.test.kernels.nvfp4_kv_reference import nvfp4_v_scale_swizzle_indices
 
     pages, heads, page_size, scale_dim = 3, 2, 16, 8
     k_scale = (

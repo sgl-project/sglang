@@ -15,7 +15,6 @@ from sglang.srt.layers.quantization.quark.schemes import QuarkMoEScheme
 from sglang.srt.layers.quantization.utils import all_close_1d
 from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.utils import (
-    get_bool_env_var,
     is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
@@ -35,7 +34,7 @@ _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 __all__ = ["QuarkW4A8MXFp4MoE"]
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 # gfx1250 (RDNA / gfx12): the aiter CK/ASM fused_moe MXFP4 W4A8 path produces
 # incorrect results, so route through aiter's triton ``moe_gemm_a8w4`` kernel
 # instead. This uses an unpadded, contraction-major weight layout (no aiter

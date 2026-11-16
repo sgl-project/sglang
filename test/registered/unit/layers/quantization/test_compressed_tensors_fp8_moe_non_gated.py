@@ -168,6 +168,18 @@ class TestCompressedTensorsFp8MoENonGated(CustomTestCase):
                     atol=0,
                 )
 
+    def test_runner_backend_without_a_runner_is_rejected_at_construction(self):
+        """A backend this scheme builds no runner for fails when the layer is built,
+        not with an AttributeError on the first forward."""
+        from sglang.srt.layers.moe import MoeRunnerBackend
+        from sglang.srt.runtime_context import get_flags
+
+        with (
+            get_flags().moe.override(runner_backend=MoeRunnerBackend.DEEP_GEMM),
+            self.assertRaisesRegex(ValueError, "got deep_gemm"),
+        ):
+            self._build("block", is_gated=True)
+
 
 if __name__ == "__main__":
     unittest.main()
