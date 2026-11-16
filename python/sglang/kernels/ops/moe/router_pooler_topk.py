@@ -18,11 +18,14 @@ Router ids follow the unfused routing sequence; the pooler and router projection
 FP32 summation order (and, for the joint form, the two-part BF16 router weights).
 """
 
+import functools
+
 import torch
 import triton
 import triton.language as tl
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.gemm.bf16_splitk_gemm import bf16_splitk_gemm_partials
 from sglang.kernels.ops.gemm.bf16_tiled_small_m_gemm import (
     _bm,
@@ -557,10 +560,19 @@ def quantize_joint_pooler(packed):
     return quantized
 
 
+@functools.lru_cache(maxsize=1)
+def _fp8_joint_runs_here() -> bool:
+    """The FP8 joint kernel targets gfx950: its launch table needs up to ~150 KB of LDS per workgroup (gfx950 has
+    160 KB per CU) and it uses OCP FP8 e4m3. Elsewhere callers fall back to the BF16 joint / shared forms."""
+    hip = current_arch().hip
+    return hip is not None and hip.gcn_arch == "gfx950"
+
+
 def joint_router_pooler_fp8_applies(xq, packed, pooler_fp8) -> bool:
     """Rows the FP8 joint form serves: the per-row FP8 activation ``xq`` of up to ``FP8_JOINT_MAX_M`` rows."""
     return (
         pooler_fp8 is not None
+        and _fp8_joint_runs_here()
         and xq.dim() == 2
         and xq.is_contiguous()
         and xq.dtype == torch.float8_e4m3fn
