@@ -20,6 +20,12 @@ from sglang.srt.hardware_backend.npu.attention.mla_preprocess import (
 )
 from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.dsa.dsa_npu_indexer import scattered_to_tp_attn_full
+from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+    dsa_token_shard_redistribute_heads,
+    dsa_token_shard_restore_tokens,
+    dsa_token_shard_slice,
+    get_dsa_token_shard_plan,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
 )
@@ -411,6 +417,8 @@ def forward_dsa_prepare_npu(
     prev_topk_indices: torch.Tensor = None,
 ):
     dynamic_scale = None
+    # Resolved here so the core can read the cached plan back.
+    get_dsa_token_shard_plan(forward_batch)
     mla_preprocess_used = (
         is_mla_preprocess_enabled()
         and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
@@ -583,17 +591,86 @@ def forward_dsa_core_npu(
     gate: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     backend = get_mla_dcp_backend(forward_context.get_attn_backend())
-    attn_output = forward_mla_attention_npu(
-        m,
-        backend,
-        forward_batch,
-        q_nope_out.contiguous(),
-        k_nope.contiguous(),
-        q_pe.contiguous(),
-        k_pe.contiguous(),
-        save_kv_cache=not mla_preprocess_used,
-        topk_indices=topk_indices,
-    )
+    # Never set under DCP: the plan refuses it, so a forward never takes both
+    # paths.
+    dsa_token_shard_plan = get_dsa_token_shard_plan(forward_batch)
+    if dsa_token_shard_plan is None:
+        attn_output = forward_mla_attention_npu(
+            m,
+            backend,
+            forward_batch,
+            q_nope_out.contiguous(),
+            k_nope.contiguous(),
+            q_pe.contiguous(),
+            k_pe.contiguous(),
+            save_kv_cache=not mla_preprocess_used,
+            topk_indices=topk_indices,
+        )
+    else:
+        # Not forward_mla_attention_npu: no DCP partials to merge, and that
+        # helper's closing view assumes per-rank heads, not the full-head
+        # token slice this attention returns.
+        if topk_indices is None or m.attn_mqa_for_dsa_token_shard is None:
+            raise RuntimeError(
+                "DSA token-shard planned this forward but the layer is not set up for "
+                f"it: attn_mqa_for_dsa_token_shard={m.attn_mqa_for_dsa_token_shard is not None}, "
+                f"topk_indices={topk_indices is not None}"
+            )
+        dsa_token_shard_rows = q_nope_out.shape[0]
+        q_nope_out = dsa_token_shard_redistribute_heads(
+            q_nope_out, dsa_token_shard_plan
+        )
+        q_pe = dsa_token_shard_redistribute_heads(q_pe, dsa_token_shard_plan)
+        # A separate name is load-bearing: topk_indices is returned for the
+        # next layer, and rebinding it would hand that a slice of a slice.
+        topk_is_local = getattr(forward_batch, "npu_indexer_topk_is_local", None)
+        if topk_is_local is None:
+            # No indexer ran on this stage: a PP stage starting on a skip-top-k
+            # layer reuses the previous stage's top-k on a fresh batch, and the
+            # flag was set on that batch, not this one. Classify by width --
+            # this rank's rows or the full batch -- because slicing a local
+            # tensor again gives every rank the wrong rows with no shape error.
+            if topk_indices.shape[0] == dsa_token_shard_plan.rows:
+                topk_is_local = True
+            elif topk_indices.shape[0] == dsa_token_shard_rows:
+                topk_is_local = False
+            else:
+                raise RuntimeError(
+                    f"DSA top-k carries {topk_indices.shape[0]} rows, neither "
+                    f"this rank's {dsa_token_shard_plan.rows} nor the batch's "
+                    f"{dsa_token_shard_rows}; refusing to guess its layout"
+                )
+            forward_batch.npu_indexer_topk_is_local = topk_is_local
+        if topk_is_local:
+            # Checked, not assumed: a full-width tensor here gives every rank
+            # but 0 the wrong rows with no shape error.
+            if topk_indices.shape[0] != dsa_token_shard_plan.rows:
+                raise RuntimeError(
+                    "top-k is marked local to this rank but carries "
+                    f"{topk_indices.shape[0]} rows, not the plan's "
+                    f"{dsa_token_shard_plan.rows}"
+                )
+            attn_topk_indices = topk_indices
+        else:
+            attn_topk_indices = dsa_token_shard_slice(
+                topk_indices, dsa_token_shard_plan
+            )
+        attn_output = m.attn_mqa_for_dsa_token_shard(
+            q_nope_out.contiguous(),
+            k_nope.contiguous(),
+            k_nope.contiguous(),
+            forward_batch,
+            save_kv_cache=not mla_preprocess_used,
+            q_rope=q_pe.contiguous(),
+            k_rope=k_pe.contiguous(),
+            topk_indices=attn_topk_indices,
+        )
+        attn_output = dsa_token_shard_restore_tokens(
+            attn_output.reshape(dsa_token_shard_plan.rows, -1, m.kv_lora_rank),
+            dsa_token_shard_plan,
+            dsa_token_shard_rows,
+        )
+        attn_output = attn_output.view(-1, m.num_local_heads, m.kv_lora_rank)
 
     perm_x1 = (1, 0, 2)
     if not _is_npu_arch35 and m.num_local_heads * m.kv_lora_rank >= 65536:
