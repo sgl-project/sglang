@@ -18,14 +18,13 @@ repos:
       - id: check-merge-conflict
       - id: check-shebang-scripts-are-executable
       - id: detect-private-key
-        exclude: ^sgl-model-gateway/tests/.*_test\.rs$
       - id: debug-statements
       - id: no-commit-to-branch
   - repo: https://github.com/PyCQA/isort
     rev: 7.0.0
     hooks:
       - id: isort
-        exclude: '^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$|^python/sglang/(api|json)/v1/.*\.py$'
+        exclude: '^python/sglang/(api|encoder|json)/v1/.*\.pyi?$'
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.1
     hooks:
@@ -33,20 +32,16 @@ repos:
         args:
           - --select=F401,F821,F823,UP037
           - --fix
-        files: ^(benchmark/|docs/|examples/|python/sglang/|sgl-model-gateway/py_*|test/)
+        files: ^(benchmark/|docs/|examples/|python/sglang/|test/)
         exclude: |
           (?x)^(
           .*/__init__\.py$|
           .*\.ipynb$|
           python/sglang/kernels/aot/.*|
-          python/sglang/srt/grpc/.*_pb2\.py$|
-          python/sglang/srt/grpc/.*_pb2_grpc\.py$|
-          python/sglang/srt/grpc/.*_pb2\.pyi$|
-          python/sglang/srt/grpc/.*_pb2_grpc\.pyi$|
-          python/sglang/(api|json)/v1/.*\.py$|
+          python/sglang/(api|encoder|json)/v1/.*\.pyi?$|
           )$
       - id: ruff-format
-        exclude: '^python/sglang/srt/grpc/.*_pb2\.py$|^python/sglang/srt/grpc/.*_pb2_grpc\.py$|^python/sglang/srt/grpc/.*_pb2\.pyi$|^python/sglang/srt/grpc/.*_pb2_grpc\.pyi$|^python/sglang/(api|json)/v1/.*\.py$'
+        exclude: '^python/sglang/(api|encoder|json)/v1/.*\.pyi?$'
   - repo: https://github.com/codespell-project/codespell
     rev: v2.4.1
     hooks:
@@ -164,12 +159,6 @@ repos:
         language: system
         files: ^(python/sglang/(srt|kernels)/.*\.py|scripts/lint/check_srt_utils_imports\.py)$
         pass_filenames: false
-      - id: rustfmt-sgl-model-gateway
-        name: rustfmt sgl-model-gateway (nightly)
-        entry: bash -c 'rustup component add --toolchain nightly rustfmt >/dev/null && cd sgl-model-gateway && cargo +nightly fmt -- --check'
-        language: system
-        files: ^sgl-model-gateway/.*\.rs$
-        pass_filenames: false
       - id: rustfmt-sgl-router
         name: rustfmt sgl-router
         entry: bash -c 'cd sgl-router && cargo fmt --all -- --check'
@@ -183,7 +172,8 @@ repos:
         # cover sglang-mm's PyO3 bindings + rayon fan-out — both sit behind
         # non-default features, so `--workspace` alone never compiles them. protoc
         # is not required: the shared protocol crate falls back to a vendored binary.
-        entry: bash -c 'cd rust && cargo clippy --workspace --fix --allow-dirty --allow-staged && cargo clippy --workspace -- -D warnings && cargo clippy -p sglang-mm --features python,parallel --lib -- -D warnings && cargo clippy --manifest-path sglang-radix-tree/Cargo.toml --all-targets --no-default-features --features tch/doc-only -- -D warnings'
+        # sglang-server uses Linux-only APIs and nothing depends on it, so macOS skips it.
+        entry: bash -c 'cd rust && EXCLUDE=; [ "$(uname)" = Darwin ] && EXCLUDE="--exclude sglang-server"; cargo clippy --workspace $EXCLUDE --fix --allow-dirty --allow-staged && cargo clippy --workspace $EXCLUDE -- -D warnings && cargo clippy -p sglang-mm --features python,parallel --lib -- -D warnings && cargo clippy --manifest-path sglang-radix-tree/Cargo.toml --all-targets --no-default-features --features tch/doc-only -- -D warnings'
         language: system
         files: ^(rust/.*\.(rs|toml)|proto/.*\.(rs|proto|toml))$
         pass_filenames: false
