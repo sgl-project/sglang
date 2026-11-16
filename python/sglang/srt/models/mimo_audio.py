@@ -1357,6 +1357,9 @@ class AudioEncoderMixin:
             config_dict = json.load(f)
         config = MiMoAudioTokenizer.config_class(**config_dict)
         model = MiMoAudioTokenizer(config)
+        if next(model.parameters()).is_meta:
+            # The IPC loader attaches the tokenizer state from the target daemon.
+            return model.to(dtype=torch.bfloat16).eval().requires_grad_(False)
         safetensors_path = os.path.join(path, "model.safetensors")
         bin_path = os.path.join(path, "pytorch_model.bin")
         if os.path.exists(safetensors_path):
