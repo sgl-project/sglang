@@ -114,3 +114,19 @@ def test_failed_update_preserves_serving_weights_and_allows_retry(failure):
     for name, source in sources.items():
         getattr(layer, name).data.copy_(source)
     update.finish(layer, quantize)
+
+
+def test_missing_bias_is_rejected_before_publishing():
+    layer = nn.Module()
+    layer.weight = nn.Parameter(
+        torch.ones(2, 3, dtype=torch.bfloat16), requires_grad=False
+    )
+    layer.bias = nn.Parameter(torch.ones(2), requires_grad=False)
+    update = OnlineFP8Update(layer, ("weight",))
+    serving = dict(layer.named_parameters())
+    update.begin(layer)
+    layer.weight.data.fill_(2)
+    with pytest.raises(ValueError, match="complete finite"):
+        update.finish(layer, lambda _: pytest.fail("quantizer should not run"))
+    assert layer.bias is serving["bias"]
+    assert layer.weight is serving["weight"]

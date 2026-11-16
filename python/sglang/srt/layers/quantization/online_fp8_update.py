@@ -11,7 +11,18 @@ from torch import nn
 
 class OnlineFP8Update:
     def __init__(self, layer: nn.Module, weight_names: tuple[str, ...]):
-        self.weight_names = weight_names
+        self.weight_names = tuple(
+            dict.fromkeys(
+                (
+                    *weight_names,
+                    *(
+                        name
+                        for name, _ in layer.named_parameters(recurse=False)
+                        if name == "bias" or name.endswith("_bias")
+                    ),
+                )
+            )
+        )
         # Record metadata only: do not retain an initial BF16 model copy.
         self.specs = {
             name: (
