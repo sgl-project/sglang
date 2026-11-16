@@ -540,6 +540,32 @@ def fp4_prefill(
     return fp4_prefill_q(indexer, query, x)
 
 
+def tp_split_topk_rows(
+    tp_split, rows: int, topk: int, device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """An equal-stride ``[world * max(sizes), topk]`` top-k buffer and this rank's
+    ``rows`` of its slot, so the TP-split gather is aiter's in-place all-gather instead
+    of PyNCCL ``all_gatherv``."""
+    group, _, _, sizes = tp_split
+    slot = max(sizes)
+    buf = torch.empty((group.world_size * slot, topk), device=device, dtype=torch.int32)
+    mine = group.rank_in_group * slot
+    return buf, buf[mine : mine + rows]
+
+
+def tp_split_gather_topk(tp_split, buf: torch.Tensor, out: torch.Tensor) -> None:
+    """Gather ``tp_split_topk_rows``'s slots and write every rank's rows to ``out``
+    in rank order, which is row order, without the slots' padding."""
+    group, _, _, sizes = tp_split
+    slot = buf.shape[0] // group.world_size
+    mine = group.rank_in_group * slot
+    # int32 rows travel as float32 bits (the custom all-gather is typed)
+    group.all_gather_into_tensor(
+        buf.view(torch.float32), buf[mine : mine + slot].view(torch.float32)
+    )
+    torch.cat([buf[r * slot : r * slot + n] for r, n in enumerate(sizes)], out=out)
+
+
 class Fp32LayerNormHip(LayerNorm):
     """An fp32-weight LayerNorm (Kimi-K3.1's index k_norm) whose bf16 / fp16 input
     runs on gfx950 as fp32 math in one launch instead of upcast + layer_norm +
