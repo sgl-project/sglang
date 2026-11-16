@@ -81,9 +81,7 @@ if TYPE_CHECKING:
 # This can prevent the server from being too conservative.
 # Note that this only clips the estimation in the scheduler but does not change the stop
 # condition. The request can still generate tokens until it hits the unclipped max_new_tokens.
-CLIP_MAX_NEW_TOKENS = int(
-    os.environ.get("SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION", "4096")
-)
+CLIP_MAX_NEW_TOKENS = envs.SGLANG_CLIP_MAX_NEW_TOKENS_ESTIMATION.get()
 
 
 @lru_cache(maxsize=1)
