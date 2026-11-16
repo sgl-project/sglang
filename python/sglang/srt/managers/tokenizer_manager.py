@@ -218,7 +218,6 @@ from sglang.srt.speculative.spec_decoding_metrics import (
 from sglang.srt.utils import (
     configure_gc_warning,
     freeze_gc,
-    get_bool_env_var,
     get_or_create_event_loop,
     kill_process_tree,
     print_warning_once,
@@ -2334,7 +2333,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     input_blocker_guard_region(
                         dispatch_to_scheduler=self._dispatch_to_scheduler,
                     )
-                    if get_bool_env_var("SGLANG_ENABLE_COLOCATED_BATCH_GEN")
+                    if envs.SGLANG_ENABLE_COLOCATED_BATCH_GEN.get()
                     else nullcontext()
                 ):
                     for i in range(batch_size):
