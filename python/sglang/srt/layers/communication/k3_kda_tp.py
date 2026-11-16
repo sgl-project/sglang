@@ -19,7 +19,7 @@ from sglang.srt.layers.dp_attention import (
     _note_dp_gather_in_prefill_graph,
     get_dp_global_num_tokens,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -32,7 +32,7 @@ def _is_kimi_k3() -> bool:
 
 
 def _applies() -> bool:
-    return bool(get_parallel().enable_kda_tp) and _is_kimi_k3()
+    return get_flags().dp.kda_tp and _is_kimi_k3()
 
 
 def enabled() -> bool:

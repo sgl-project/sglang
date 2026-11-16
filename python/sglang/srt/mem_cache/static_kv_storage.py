@@ -726,14 +726,20 @@ class StaticKVStorage:
                 )
             ]
         if shape.has_state:
-            from sglang.srt.mem_cache.allocator.mamba import mamba_slot_capacity
+            from sglang.srt.layers.communication import k3_kda_tp
 
+            capacity = allocator.state.pool.size
+            if k3_kda_tp.state_shard_width() > 1:
+                from sglang.srt.mem_cache.allocator.mamba import mamba_slot_capacity
+
+                # KDA TP: this DP rank allocates only its range of the shared pool.
+                capacity = mamba_slot_capacity(self.requests)
             usage.append(
                 SubPoolUsage(
                     name="mamba",
                     metrics="mamba",
                     label="mamba",
-                    capacity=mamba_slot_capacity(self.requests),
+                    capacity=capacity,
                     available=allocator.state_slots.available_size(),
                 )
             )

@@ -218,6 +218,7 @@ from sglang.srt.runtime_context import (
     get_context,
     get_device,
     get_exec,
+    get_flags,
     get_global_dwdp_manager,
     get_lora,
     get_memory,
@@ -2131,22 +2132,23 @@ class ModelRunner:
                     decode_graph_runner=self.decode_cuda_graph_runner,
                 )
 
-            if (
-                forward_batch.kda_tp_state_imports
-                and forward_batch.dp_kda_tp_state_imports is None
-            ):
-                raise RuntimeError(
-                    "KDA TP: this rank has PD state imports but no DP import counts "
-                    "(the scheduler's DP all-gather did not run)"
-                )
-            if (
-                forward_batch.dp_kda_tp_state_imports is not None
-                and not self.is_draft_worker
-            ):
-                from sglang.srt.layers.communication import k3_kda_tp
+            if get_flags().dp.kda_tp:
+                if (
+                    forward_batch.kda_tp_state_imports
+                    and forward_batch.dp_kda_tp_state_imports is None
+                ):
+                    raise RuntimeError(
+                        "KDA TP: this rank has PD state imports but no DP import counts "
+                        "(the scheduler's DP all-gather did not run)"
+                    )
+                if (
+                    forward_batch.dp_kda_tp_state_imports is not None
+                    and not self.is_draft_worker
+                ):
+                    from sglang.srt.layers.communication import k3_kda_tp
 
-                # KDA TP PD decode: import received states before anything reads them.
-                k3_kda_tp.run_pd_imports(self.req_to_token_pool, forward_batch)
+                    # KDA TP PD decode: import received states before anything reads them.
+                    k3_kda_tp.run_pd_imports(self.req_to_token_pool, forward_batch)
 
             # Replay cuda graph if applicable
             if can_run_graph:
