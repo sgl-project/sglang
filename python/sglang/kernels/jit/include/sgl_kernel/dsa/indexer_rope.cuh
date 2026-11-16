@@ -3,6 +3,7 @@
 #include <sgl_kernel/math.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
+#include <sgl_kernel/warp.cuh>
 
 #include <cstdint>
 
@@ -34,7 +35,7 @@ SGL_DEVICE void apply_neox_rope(
   AlignedVector<float, 4> other;
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
-    other[i] = __shfl_xor_sync(0xFFFFFFFFu, data[i], kRopeSize / 2, kWarpThreads);
+    other[i] = __shfl_xor_sync(warp::kFullMask, data[i], kRopeSize / 2, kWarpThreads);
   }
   if (!is_rope_lane) return;
   const bool is_first_half = (lane_id & (kRopeSize / 2)) == 0;
@@ -65,7 +66,7 @@ SGL_DEVICE void hadamard_128(AlignedVector<float, 4>& data, int32_t lane_id) {
   for (uint32_t mask = 1; mask < kWarpThreads; mask <<= 1) {
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
-      const float other = __shfl_xor_sync(0xFFFFFFFFu, data[i], mask, kWarpThreads);
+      const float other = __shfl_xor_sync(warp::kFullMask, data[i], mask, kWarpThreads);
       data[i] = (lane_id & mask) ? (other - data[i]) : (data[i] + other);
     }
   }

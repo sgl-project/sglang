@@ -9,7 +9,8 @@ import unittest
 import torch
 
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams, Mamba2StateShape
-from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
+from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool
 from sglang.srt.mem_cache.ple_state_pool import NGRAM_PART
 from sglang.test.test_utils import CustomTestCase

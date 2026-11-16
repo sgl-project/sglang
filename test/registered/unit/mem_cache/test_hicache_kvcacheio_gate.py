@@ -31,7 +31,6 @@ _POOL_FILES = [
 ]
 # Pools that call kvcacheio ops but refuse unsupported devices on their own terms.
 _OWN_DEVICE_GATE = {
-    "MambaPoolHost": "refuses XPU at construction",
     "UnifiedPageEnvelopeHostPool": "imports kvcacheio itself and raises off CUDA/ROCm",
 }
 
