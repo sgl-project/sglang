@@ -511,10 +511,7 @@ def extend(reqs, model_runner):
     )
     batch.prepare_for_extend()
     _maybe_prepare_mlp_sync_batch(batch, model_runner)
-    if (
-        batch.input_ids is None
-        and getattr(batch, "prefill_input_ids_cpu", None) is not None
-    ):
+    if batch.input_ids is None and batch.prefill_input_ids_cpu is not None:
         batch.input_ids = batch.prefill_input_ids_cpu.to(
             batch.device, non_blocking=True
         )
@@ -716,7 +713,11 @@ def correctness_test(
         rank_print(f"prefill logits (first half): {next_token_logits} \n")
 
         # Prepare extend inputs
-        torch_runner = getattr(model_runner, "torch_runner", None)
+        torch_runner = (
+            model_runner.torch_runner
+            if isinstance(model_runner, _TorchBenchRunner)
+            else None
+        )
         reqs = prepare_extend_inputs_for_correctness_test(
             bench_args, input_ids, reqs, torch_runner
         )
