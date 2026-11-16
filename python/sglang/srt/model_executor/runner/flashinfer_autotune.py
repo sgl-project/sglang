@@ -120,6 +120,7 @@ def should_run_flashinfer_autotune(
         "flashinfer_mxfp4",
         "flashinfer_cutedsl",
         "flashinfer_cutlass",
+        "flashinfer_cutlass_sm120_swiglu",
         "flashinfer_megamoe",
     ]
 

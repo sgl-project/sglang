@@ -294,7 +294,6 @@ def _use_sm120_nvfp4_swiglu(
     """Whether the fused SM120 NVFP4 SwiGLU MoE kernel can serve this call."""
     return (
         quant_info.quant_type == "fp4"
-        and envs.SGLANG_OPT_SM120_NVFP4_FUSED_MOE.get()
         and runner_config.is_gated
         and runner_config.activation == "silu"
         and quant_info.swiglu_alpha is None
@@ -336,6 +335,7 @@ def _run_flashinfer_cutlass(
     runner_config: MoeRunnerConfig,
     output: Optional[torch.Tensor] = None,
     enable_alltoall: bool = False,
+    sm120_swiglu: bool = False,
 ) -> torch.Tensor:
     flashinfer_cutlass_fused_moe, _ = _flashinfer_cutlass_fused_moe()
 
@@ -373,7 +373,9 @@ def _run_flashinfer_cutlass(
         )
         if result is not None:
             return _maybe_apply_routed_scaling_factor(result, quant_info, runner_config)
-    if _use_sm120_nvfp4_swiglu(quant_info, runner_config, x_sf, enable_alltoall):
+    if sm120_swiglu and _use_sm120_nvfp4_swiglu(
+        quant_info, runner_config, x_sf, enable_alltoall
+    ):
         from sglang.kernels.ops.gemm.sm120_nvfp4_moe import try_nvfp4_moe_swiglu
 
         result = try_nvfp4_moe_swiglu(
@@ -451,6 +453,7 @@ def fused_experts_none_to_flashinfer_cutlass(
     dispatch_output: StandardDispatchOutput,
     quant_info: MoeQuantInfo,
     runner_config: MoeRunnerConfig,
+    sm120_swiglu: bool = False,
 ) -> StandardCombineInput:
     from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
 
@@ -462,8 +465,21 @@ def fused_experts_none_to_flashinfer_cutlass(
         dispatch_output=dispatch_output,
         quant_info=quant_info,
         runner_config=runner_config,
+        sm120_swiglu=sm120_swiglu,
     )
     return StandardCombineInput(hidden_states=output)
+
+
+@register_fused_func("none", "flashinfer_cutlass_sm120_swiglu")
+def fused_experts_none_to_flashinfer_cutlass_sm120_swiglu(
+    dispatch_output: StandardDispatchOutput,
+    quant_info: MoeQuantInfo,
+    runner_config: MoeRunnerConfig,
+) -> StandardCombineInput:
+    """flashinfer_cutlass, with the fused SM120 NVFP4 SwiGLU kernel where it applies."""
+    return fused_experts_none_to_flashinfer_cutlass(
+        dispatch_output, quant_info, runner_config, sm120_swiglu=True
+    )
 
 
 @register_fused_func("flashinfer", "flashinfer_cutlass")
