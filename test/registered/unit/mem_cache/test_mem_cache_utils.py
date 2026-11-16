@@ -207,6 +207,41 @@ class TestGetHashStr(unittest.TestCase):
                 self.assertRegex(get_hash_str(tokens), r"^[0-9a-f]{64}$")
 
 
+class TestPageHashFamilies(unittest.TestCase):
+    """Bigram and plain trees must never derive the same storage page hash.
+
+    The unified L3 key scheme relies on it: EAGLE-family deployments hash
+    token pairs, everything else hashes tokens, and the two share one store.
+    """
+
+    def test_bigram_and_plain_page_hashes_of_the_same_tokens_differ(self):
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+        from sglang.srt.mem_cache.utils import get_storage_hash_str
+
+        page_size = 4
+        tokens = array("q", range(1000, 1000 + 2 * page_size + 1))
+        plain = get_storage_hash_str(
+            RadixKey(tokens, limit=2 * page_size), page_size=page_size
+        )
+        bigram = get_storage_hash_str(
+            RadixKey(tokens, is_bigram=True), page_size=page_size
+        )
+        self.assertEqual(len(plain), 2)
+        self.assertEqual(len(bigram), 2)
+        self.assertTrue(set(plain).isdisjoint(bigram))
+
+    def test_speculative_algorithms_keep_their_page_hash_family(self):
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        # A flip moves that algorithm's pages into the other family: every
+        # stored object becomes unreachable and the sharing matrix changes.
+        bigram = {"EAGLE", "EAGLE3", "FROZEN_KV_MTP"}
+        for name in ("NONE", "DFLASH", "DSPARK", "NGRAM", *sorted(bigram)):
+            with self.subTest(algorithm=name):
+                algorithm = SpeculativeAlgorithm[name]
+                self.assertEqual(algorithm.is_eagle(), name in bigram)
+
+
 class TestStorageHashNamespace(unittest.TestCase):
     def test_node_hashes_isolate_namespaces_and_continue_the_chain(self):
         root = SimpleNamespace(parent=None, key=_HashKey(array("q")), hash_value=None)
