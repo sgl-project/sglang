@@ -555,6 +555,7 @@ def is_jpeg_with_npu(
     if gpu_image_decode == "nvjpeg_fancy":
         return False
     if image_bytes != b"":
+        # JPEG SOI (Start of Image): FF D8; EOI (End of Image): FF D9.
         return image_bytes.startswith(b"\xff\xd8") and image_bytes.endswith(b"\xff\xd9")
     return False
 
