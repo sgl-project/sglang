@@ -2100,6 +2100,12 @@ class KVCache(abc.ABC):
     ) -> None:
         raise NotImplementedError()
 
+    def move_kv_pages(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
+        """Copy whole pages of rows, ``src_loc`` -> ``tgt_loc``; both list every
+        slot of each page, in order. A pool that keeps data per page rather
+        than per token (pooled index keys) overrides this."""
+        self.move_kv_cache(tgt_loc, src_loc)
+
     # Token capacity for host sizing; `size` may count rows in per-layer views.
     host_capacity_tokens: Optional[int] = None
     # Host-budget weight; get_kv_size_bytes may be zero for shared-buffer views.
@@ -4664,6 +4670,9 @@ class HybridLinearKVPool(KVCache):
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         self.full_kv_pool.move_kv_cache(tgt_loc, src_loc)
 
+    def move_kv_pages(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
+        self.full_kv_pool.move_kv_pages(tgt_loc, src_loc)
+
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
         kv_cpu = self.full_kv_pool.get_cpu_copy(indices, req_pool_index=req_pool_index)
         # mamba_pool stores PHYSICAL ids; translate the (unified-pool virtual) ids first.
@@ -5768,6 +5777,18 @@ class DSATokenToKVPool(MLATokenToKVPool):
         """Move latent KV and the DSA indexer cache (key + scale) in lockstep."""
         super().move_kv_cache(tgt_loc, src_loc)
         self.index_key_cache.move(tgt_loc, src_loc)
+
+    def move_kv_pages(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
+        """Copy whole pages: latent KV as tokens, index keys by page, since a
+        pooled key mixes several tokens."""
+        if self.index_kpool == 1:
+            self.move_kv_cache(tgt_loc, src_loc)
+            return
+        super().move_kv_cache(tgt_loc, src_loc)
+        self.index_key_cache.move_pages(
+            tgt_loc[:: self.page_size].long() // self.page_size,
+            src_loc[:: self.page_size].long() // self.page_size,
+        )
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         return self.index_key_cache.get_local_buffer(layer_id)

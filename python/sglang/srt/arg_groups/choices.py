@@ -212,6 +212,7 @@ RADIX_EVICTION_POLICY_CHOICES = [
     "tlru",
     "joint_lru",
     "state_cost",
+    "gds",
 ]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]

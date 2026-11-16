@@ -2015,6 +2015,16 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
             documentation="Number of cached prompt tokens by source (device/host/storage).",
             labelnames=list(labels.keys()) + ["cache_source"],
         )
+        self.cache_miss_tokens_total = (
+            Counter(
+                name="sglang:cache_miss_tokens_total",
+                documentation="Number of uncached prompt tokens by cause "
+                "(new/placement/dependency/capacity).",
+                labelnames=list(labels.keys()) + ["cause"],
+            )
+            if server_args is not None and server_args.enable_cache_miss_attribution
+            else None
+        )
 
         self.num_requests_total = Counter(
             name="sglang:num_requests_total",
@@ -2180,6 +2190,7 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         spec_verify_ct: int = 0,
         is_streaming: bool = False,
         time_per_output_token: Optional[float] = None,
+        cache_miss_tokens: Optional[Dict[str, int]] = None,
     ):
         stream_labels = {
             **labels,
@@ -2189,6 +2200,9 @@ class TokenizerMetricsCollector(_StatLoggerDIMixin):
         self.generation_tokens_total.labels(**stream_labels).inc(generation_tokens)
         if spec_verify_ct > 0:
             self.spec_verify_calls_total.labels(**labels).inc(spec_verify_ct)
+        if cache_miss_tokens and self.cache_miss_tokens_total is not None:
+            for cause, tokens in cache_miss_tokens.items():
+                self.cache_miss_tokens_total.labels(**labels, cause=cause).inc(tokens)
 
         # Report cached tokens with detailed source breakdown
         if cached_tokens > 0:

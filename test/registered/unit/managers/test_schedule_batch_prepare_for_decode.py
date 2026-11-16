@@ -46,6 +46,8 @@ class TestPrepareForDecodeMambaInit(CustomTestCase):
         batch.mamba_cow_src_indices = torch.tensor([1])
         batch.mamba_cow_dst_indices = torch.tensor([2])
         batch.mamba_clear_indices = torch.tensor([3])
+        batch.kv_copy_src_locs = torch.tensor([4])
+        batch.kv_copy_dst_locs = torch.tensor([5])
 
         with patch(
             "sglang.srt.speculative.spec_utils.spec_prepare_for_decode"
@@ -56,6 +58,8 @@ class TestPrepareForDecodeMambaInit(CustomTestCase):
         self.assertIsNone(batch.mamba_cow_src_indices)
         self.assertIsNone(batch.mamba_cow_dst_indices)
         self.assertIsNone(batch.mamba_clear_indices)
+        self.assertIsNone(batch.kv_copy_src_locs)
+        self.assertIsNone(batch.kv_copy_dst_locs)
 
 
 class TestPrepareForDecodeSeqLensOwnership(unittest.TestCase):

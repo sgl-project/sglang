@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import math
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Tuple, Union
+from typing import TYPE_CHECKING, Sequence, Tuple, Union
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.radix_cache import TreeNode
@@ -116,6 +116,46 @@ class StateCostStrategy(EvictionStrategy):
     def restore_cost(self, start: int, end: int) -> float:
         """Seconds of full-model prefill over tokens [start, end)."""
         return self.d * (end - start) + self.e * (end**2 - start**2) / 2e5
+
+
+class GreedyDualSizeStrategy(EvictionStrategy):
+    """The parameters of GreedyDual-Size over a hybrid model's state units.
+    Implements GreedyDual-Size eviction of state units from FlashStates:
+      paper: https://www.alphaxiv.org/abs/2611.flashstate
+      code: https://github.com/FutureMLS-Lab/FlashStates
+      project page: https://flashstates.ai
+
+    The tree core ranks the units (``unified_cache/gds.py``) and the radix
+    cache evicts through them alone; ``get_priority`` returns recency only to
+    complete the strategy interface.
+
+    ``prefill_cost`` is ``[d, e]``: prefilling positions ``[a, b)`` takes
+    ``d (b - a) + e (b^2 - a^2) / 200,000`` seconds. Only ``e / d`` changes the
+    order; the default ``[1, 0]`` ranks a unit by the tokens a hit saves per
+    token it holds. ``leaf_last`` evicts every interior state before any leaf.
+    """
+
+    def __init__(
+        self,
+        prefill_cost: Sequence[float] = (1.0, 0.0),
+        leaf_last: bool = False,
+    ):
+        if len(prefill_cost) != 2:
+            raise ValueError(
+                "gds 'prefill_cost' is [d, e] in --radix-eviction-policy-config, "
+                "the prefill seconds per token and per token per 100,000 tokens "
+                f"of context; got {prefill_cost}."
+            )
+        d, e = (float(c) for c in prefill_cost)
+        if not d > 0 or e < 0:
+            raise ValueError(
+                f"gds 'prefill_cost' needs d > 0 and e >= 0, got [{d}, {e}]."
+            )
+        self.prefill_cost = (d, e)
+        self.leaf_last = bool(leaf_last)
+
+    def get_priority(self, node: TreeNode) -> float:
+        return node.last_access_time
 
 
 class SLRUStrategy(EvictionStrategy):

@@ -574,5 +574,8 @@ POSITIONAL_FIELD_ORDER = (
     "disaggregation_max_top_logprobs_num",
     "shortest_prefill_aging_factor",
     "enable_token_space_processor",
+    "enable_mamba_unit_eviction",
+    "enable_cache_miss_attribution",
+    "enable_mamba_exact_checkpoint",
 )
 # fmt: on

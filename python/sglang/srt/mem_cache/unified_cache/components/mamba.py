@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Callable, Optional, Sequence
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
     EvictParams,
@@ -51,7 +52,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BaseEvictionResult,
 )
-from sglang.srt.runtime_context import get_disagg, get_exec
+from sglang.srt.runtime_context import get_disagg, get_exec, get_spec
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -73,6 +74,21 @@ def branching_checkpoint_depth(
     within the full-KV hit, when past ``mamba_boundary_len``; else None."""
     aligned = full_kv_hit_length // checkpoint_grid * checkpoint_grid
     return aligned if aligned > mamba_boundary_len else None
+
+
+def exact_resume_alignment(kv_pool) -> int:
+    """The multiple a request's end must be for a later request to resume
+    there (--enable-mamba-exact-checkpoint). A DSA pool that pools index keys
+    and keeps a request's keys past its last full group outside its pages
+    (compressed tails) can only resume on group boundaries."""
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool, HybridLinearKVPool
+
+    if (
+        isinstance(kv_pool, (DSATokenToKVPool, HybridLinearKVPool))
+        and kv_pool.index_kpool_compress
+    ):
+        return kv_pool.index_kpool
+    return 1
 
 
 class MambaComponent(TreeComponent):
@@ -124,6 +140,14 @@ class MambaComponent(TreeComponent):
         # checkpoints still being copied to host; see reap_parked_slots.
         self._parked: list = []
         self._step = 0
+        self.exact_checkpoint = (
+            params.enable_mamba_exact_checkpoint and params.enable_mamba_extra_buffer
+        )
+        if self.exact_checkpoint:
+            self.speculative = get_spec().speculative_algorithm is not None
+            self.resume_alignment = exact_resume_alignment(
+                params.token_to_kv_pool_allocator.get_kvcache()
+            )
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
 
@@ -184,6 +208,9 @@ class MambaComponent(TreeComponent):
                 if node.component_data[ct].value is not None:
                     self.tree_core.lru_lists[ct].reset_node_mru(node)
                     self._cost_mark_used(node)
+                    gds = self.tree_core.gds
+                    if gds is not None:
+                        gds.used(node)
             case LRURefreshPhase.INSERT_END:
                 return
             case _:
@@ -471,6 +498,7 @@ class MambaComponent(TreeComponent):
             result.mamba_exist = True
             return
         assert params.mamba_value is not None
+        gds = self.tree_core.gds
         if is_new_leaf:
             node.component_data[self.component_type].value = params.mamba_value
             self.tree_core.lru_lists[self.component_type].insert_mru(node)
@@ -478,6 +506,11 @@ class MambaComponent(TreeComponent):
                 self.reclaimable_value_len(node)
             )
             self._cost_mark_used(node)
+            units = self.tree_core.state_units
+            if units is not None:
+                units.state_changed(node)
+            if gds is not None:
+                gds.added(node)
             self._emit_excess_path_states_eviction(node, cache_actions)
             return
         if node.component_data[self.component_type].value is None:
@@ -493,6 +526,8 @@ class MambaComponent(TreeComponent):
         node.last_access_time = get_and_increase_time_counter()
         self._cost_mark_used(node)
         result.mamba_exist = True
+        if gds is not None:
+            gds.used(node)
 
     def _emit_excess_path_states_eviction(
         self,
@@ -539,6 +574,7 @@ class MambaComponent(TreeComponent):
             return
 
         tracker = {component: 0 for component in self.cache.tree_components}
+        gds = self.tree_core.gds
         for node in reversed(holders):
             if excess <= 0 or node is tail:
                 break
@@ -569,6 +605,9 @@ class MambaComponent(TreeComponent):
                 cache_actions=cache_actions,
                 target=target,
             )
+            if gds is not None:
+                # The units below now gain and hold KV from further up.
+                gds.push_units_below(node)
             excess -= 1
 
     def redistribute_on_node_split(
@@ -582,6 +621,9 @@ class MambaComponent(TreeComponent):
         # HiCache: mamba host_value stays on child (mamba = leaf-only data)
         new_parent.component_data[ct].host_value = None
         new_parent.component_data[ct].host_lock_ref = 0
+        units = self.tree_core.state_units
+        if units is not None:
+            units.split(new_parent, child)
 
     def evict_component(
         self,
@@ -601,6 +643,9 @@ class MambaComponent(TreeComponent):
             freed = self.reclaimable_value_len(node)
             self.tree_core.component_evictable_size_[self.component_type] -= freed
             cd.value = None
+            gds = self.tree_core.gds
+            if gds is not None:
+                gds.removed(node)
 
         # Host layer
         host_lru = self.tree_core.host_lru_lists[self.component_type]
@@ -620,6 +665,9 @@ class MambaComponent(TreeComponent):
             if not host_lru.in_list(node):
                 host_lru.insert_mru(node)
 
+        units = self.tree_core.state_units
+        if units is not None:
+            units.state_changed(node)
         return freed, host_freed
 
     def _evict_device_start(self, request_cnt: int) -> None:
@@ -1049,6 +1097,32 @@ class MambaComponent(TreeComponent):
             and token_ids_len >= len(req.origin_input_ids)
         )
 
+    def _exact_checkpoint_len(self, req: Req, token_ids_len: int) -> Optional[int]:
+        """``token_ids_len`` when the finished request's own state slot holds
+        the state after exactly that many tokens, so the tree can cache it
+        there instead of the last tracked state; else None.
+
+        Implements the exact checkpoint from FlashStates:
+          paper: https://www.alphaxiv.org/abs/2611.flashstate
+          code: https://github.com/FutureMLS-Lab/FlashStates
+          project page: https://flashstates.ai
+
+        A decode step commits its token when it allocates the slot, so the
+        live state follows ``kv_committed_len`` even while an overlapped step
+        still runs; a verify in flight instead moves it past what it commits.
+        """
+        exact = (
+            not isinstance(req.finished_reason, FINISH_ABORT)
+            # A stop inside the committed tokens leaves the state past the key.
+            and 0 < token_ids_len == req.kv.kv_committed_len
+            and not (self.speculative and req.inflight_steps > 1)
+            and token_ids_len % self.resume_alignment == 0
+            and req.beam_group is None
+            and not self._mamba_host_only_checkpoint()
+            and not self.quantizes_checkpoints
+        )
+        return token_ids_len if exact else None
+
     def prepare_for_caching_req(
         self,
         req: Req,
@@ -1072,6 +1146,15 @@ class MambaComponent(TreeComponent):
         if is_finished:
             if cache_len is None:
                 cache_len = 0
+            exact_len = (
+                self._exact_checkpoint_len(req, token_ids_len)
+                if self.exact_checkpoint
+                else None
+            )
+            if exact_len is not None:
+                insert_params.mamba_from_live_slot = True
+                insert_params.mamba_value = req.kv.mamba_pool_idx.unsqueeze(-1).clone()
+                return exact_len
             if self.cache.enable_mamba_extra_buffer:
                 checkpoint = self._select_finished_checkpoint(req, token_ids_len)
                 if checkpoint is None:
@@ -1178,6 +1261,13 @@ class MambaComponent(TreeComponent):
                     self._free_mamba_value(insert_params.mamba_value)
                 storage, sub_pool = self._state()
                 storage.release_state(sub_pool, req)
+                return
+
+            if insert_params is not None and insert_params.mamba_from_live_slot:
+                storage, sub_pool = self._state()
+                storage.release_state(
+                    sub_pool, req, keep_state_slot=mamba_value_inserted
+                )
                 return
 
             if self.cache.enable_mamba_extra_buffer:
