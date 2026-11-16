@@ -107,6 +107,17 @@ PIPELINED_ATTENTION_BACKENDS = (
 )
 
 
+def supports_pipelined_attention(
+    backend: AttentionBackendEnum, impl: AttentionImpl, device: torch.device
+) -> bool:
+    # SpargeAttention's SM90 Sage kernels launch on the default CUDA stream.
+    return backend in PIPELINED_ATTENTION_BACKENDS and not (
+        backend is AttentionBackendEnum.SUBBLOCK_SPARSE_ATTN
+        and impl.schedule.compute_mode == "sage_fp8"
+        and torch.cuda.get_device_capability(device) == (9, 0)
+    )
+
+
 def _resolve_sp_attention_mode(
     *, causal: bool, sparse_backend: bool
 ) -> tuple[str, bool]:
@@ -1683,7 +1694,7 @@ class USPAttention(nn.Module):
             envs.SGLANG_DIFFUSION_FLASHINFER_ULYSSES
             or not q.is_cuda
             or groups in (0, 1)
-            or self.backend not in PIPELINED_ATTENTION_BACKENDS
+            or not supports_pipelined_attention(self.backend, self.attn_impl, q.device)
             or torch.compiler.is_compiling()
             or torch.cuda.is_current_stream_capturing()
         ):

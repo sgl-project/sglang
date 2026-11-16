@@ -83,7 +83,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
     DynamicCudnnSDPAImpl,
 )
 from sglang.multimodal_gen.runtime.layers.attention.layer import (
-    PIPELINED_ATTENTION_BACKENDS,
+    supports_pipelined_attention,
 )
 from sglang.multimodal_gen.runtime.layers.attention.selector import (
     ComponentAttentionBackendNotAppliedError,
@@ -882,7 +882,7 @@ def _minimax_h3_pipelined_attention(
     ):
         return None
     backend = attention._attention_backend_enum
-    if backend not in PIPELINED_ATTENTION_BACKENDS:
+    if not supports_pipelined_attention(backend, attention._attention_impl, q.device):
         return None
     impl = attention._attention_impl
     skip_softmax = getattr(impl, "_request_skip_softmax_threshold", None)
