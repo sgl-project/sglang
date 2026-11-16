@@ -344,10 +344,6 @@ class LogitsMetadata:
     input_logprob_indices_cpu: Optional[List[int]] = None
     token_ids_logprobs: Optional[List[List[int]]] = None
 
-    # logits and logprobs post processing
-    temperature: torch.Tensor = None
-    top_p: torch.Tensor = None
-
     # DP attention metadata. Not needed when DP attention is not used.
     # Number of tokens in the request.
     global_num_tokens_gpu: Optional[torch.Tensor] = None
@@ -459,8 +455,6 @@ class LogitsMetadata:
         if self.global_num_tokens_for_logprob_cpu is not None:
             # create a smaller buffer to reduce peak memory usage
             self.global_dp_buffer_len = sum(self.global_num_tokens_for_logprob_cpu)
-        else:
-            self.global_dp_buffer_len = self.global_dp_buffer_len
 
         self.gathered_buffer = torch.empty(
             (
@@ -532,7 +526,6 @@ class LogitsProcessor(nn.Module):
             self.final_logit_softcapping = None
 
         self.return_full_logits = return_full_logits
-        self.enable_mis = get_exec().features.enable_mis
         features = get_exec().features
         self.keep_last_hidden_states = features.aux_hidden_state_capture is not None
         # Capture-only mode: how many layers the model must capture, when
@@ -1513,7 +1506,6 @@ class LogitsProcessor(nn.Module):
             return logits
         if logits.shape[-1] > self.vocab_size:
             logits = logits[:, : self.vocab_size]
-        logits_width = logits.shape[-1]
         if softcap is not None:
             if logits_buffer is None or tuple(logits_buffer.shape) != tuple(
                 logits.shape
