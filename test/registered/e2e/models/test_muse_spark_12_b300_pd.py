@@ -112,7 +112,6 @@ class TestMuseSpark12B300PD(SpecDecodingMixin, PDDisaggregationServerBase):
         _wait_for_gpu_idle_in_ci(timeout=120)
 
     def flush_cache_for_spec_benchmark(self):
-        # The mini-LB does not expose flush_cache. Clear both worker caches.
         for url in (self.prefill_url, self.decode_url):
             requests.post(f"{url}/flush_cache", timeout=60).raise_for_status()
 
