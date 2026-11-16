@@ -153,6 +153,10 @@ template override with the same checkpoint tokenizer.
 
 ## mm
 
+[Prepared multimodal inputs](PREPARED_INPUTS.md) proposes how externally
+preprocessed tensors could enter the existing processor and handoff path.
+It is a design draft; the current APIs below still accept encoded images.
+
 ```rust
 MmProcessor::from_spec(ProcessorSpec) -> Result<MmProcessor, ProcessorError>
 MmProcessor::process(input_ids, images: &[&[u8]]) -> Result<MmOutput, ProcessorError>
