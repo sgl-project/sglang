@@ -14,7 +14,6 @@
 # ==============================================================================
 """Inference-only Qwen3-VL model compatible with HuggingFace weights."""
 
-import math
 from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
@@ -103,9 +102,7 @@ class Qwen3OmniMoeAudioEncoderLayer(nn.Module):
             prefix=add_prefix("attn", prefix),
         )
         self.self_attn_layer_norm = nn.LayerNorm(self.embed_dim)
-        self.dropout = config.dropout
         self.activation_fn = ACT2FN[config.activation_function]
-        self.activation_dropout = config.activation_dropout
         tp_size = get_parallel().tp_size
         use_replicated = config.encoder_ffn_dim % tp_size != 0
         fc1_cls = ReplicatedLinear if use_replicated else ColumnParallelLinear
@@ -193,12 +190,9 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
 
     def __init__(self, config: Qwen3OmniMoeAudioEncoderConfig, quant_config=None):
         super().__init__(config)
-        self.dropout = config.dropout
 
         embed_dim = config.d_model
-        self.num_mel_bins = config.num_mel_bins
         self.max_source_positions = config.max_source_positions
-        self.embed_scale = math.sqrt(embed_dim) if config.scale_embedding else 1.0
         self.n_window = config.n_window
         self.positional_embedding = SinusoidsPositionEmbedding(
             self.max_source_positions, embed_dim
@@ -245,23 +239,14 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         self.n_window_infer = self.config.n_window_infer
         self.conv_chunksize = self.config.conv_chunksize
 
-    def get_input_embeddings(self) -> nn.Module:
-        return self.conv1
-
-    def set_input_embeddings(self, value: nn.Module):
-        self.conv1 = value
-
     def forward(
         self,
         input_features,
         feature_lens=None,
-        aftercnn_lens=None,
     ):
         r"""
         feature_lens (`torch.LongTensor` of shape `(batch_size,)`):
             mel length
-        aftercnn_lens (`torch.LongTensor` of shape `(batch_size,)`):
-            mel length after cnn
         """
         aftercnn_lens = _get_feat_extract_output_lengths(feature_lens)
         chunk_num = torch.ceil(feature_lens / (self.n_window * 2)).long()
@@ -350,15 +335,6 @@ class Qwen3OmniMoeAudioEncoder(PreTrainedModel):
         hidden_states = self.act(hidden_states)
         hidden_states = self.proj2(hidden_states)[0]
         return BaseModelOutput(last_hidden_state=hidden_states)
-
-    # Ignore copy
-    def _get_feat_extract_output_lengths(self, input_lengths: torch.LongTensor):
-        """
-        Computes the output length of the convolutional layers and the output length of the audio encoder
-        """
-        input_lengths = (input_lengths - 1) // 2 + 1
-        output_lengths = (input_lengths - 2) // 2 + 1
-        return input_lengths, output_lengths
 
 
 class Qwen3OmniMoeVisionPatchMerger(nn.Module):
@@ -486,9 +462,6 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
             norm_eps=getattr(config, "rms_norm_eps", 1e-6),
             prefix=add_prefix("visual", prefix),
         )
-        self.pad_token_id = (
-            self.config.pad_token_id if self.config.pad_token_id is not None else -1
-        )
 
     def get_audio_feature(self, items: List[MultimodalDataItem]):
         device = next(self.audio_tower.parameters()).device
@@ -502,22 +475,13 @@ class Qwen3OmniMoeThinkerForConditionalGeneration(Qwen3VLMoeForConditionalGenera
             .type(self.audio_tower.dtype)
             .to(next(self.audio_tower.parameters()).device)
         )
-        if feature_attention_mask is not None:
-            audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
-            input_features = input_features.permute(0, 2, 1)[
-                feature_attention_mask.bool()
-            ].permute(1, 0)
-        else:
-            audio_feature_lengths = None
-
-        feature_lens = (
-            audio_feature_lengths
-            if audio_feature_lengths is not None
-            else feature_attention_mask.sum(-1)
-        )
+        audio_feature_lengths = torch.sum(feature_attention_mask, dim=1)
+        input_features = input_features.permute(0, 2, 1)[
+            feature_attention_mask.bool()
+        ].permute(1, 0)
         audio_outputs = self.audio_tower(
             input_features,
-            feature_lens=feature_lens,
+            feature_lens=audio_feature_lengths,
         )
         audio_features = audio_outputs.last_hidden_state
 
