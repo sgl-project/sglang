@@ -1436,6 +1436,7 @@ class Scheduler(
         self.pause_state = PauseState()
 
     def init_chunked_prefill(self):
+        self.adaptive_prefill = None
         self.chunked_prefill_size = get_schedule().chunked_prefill_size
         self.prefill_decode_interval = get_schedule().prefill_decode_interval or 0
         self._prefill_decode_interval_remaining = 0
@@ -1463,6 +1464,27 @@ class Scheduler(
         self.is_mixed_chunk = (
             self.chunked_prefill_size is not None and get_schedule().enable_mixed_chunk
         )
+        if get_schedule().adaptive_prefill:
+            from sglang.srt.managers.scheduler_components.adaptive_prefill import (
+                AdaptivePrefillController,
+            )
+
+            if (
+                self.chunked_prefill_size is None
+                or self.chunked_prefill_size < self.page_size
+                or self.model_config.is_multimodal
+                or not self.is_generation
+                or self.require_mlp_sync
+            ):
+                raise ValueError(
+                    "Adaptive prefill requires text-only chunked generation"
+                )
+            self.adaptive_prefill = AdaptivePrefillController(
+                get_schedule().adaptive_prefill_target_ms,
+                get_schedule().adaptive_prefill_token_ms,
+                get_schedule().adaptive_prefill_max_decode_rounds,
+                floor=max(1, self.prefill_decode_interval),
+            )
 
     def maybe_init_dynamic_chunk_sizer(self) -> None:
         """Profile a PP prefill latency model that sizes chunks per stage."""
@@ -1517,7 +1539,9 @@ class Scheduler(
         ).finalize(actual_prefill_bs=0)
 
     def _arm_prefill_decode_interval(self, batch: Optional[ScheduleBatch]) -> None:
-        if self.prefill_decode_interval == 0 or batch is None:
+        controller = getattr(self, "adaptive_prefill", None)
+        interval = controller.interval if controller else self.prefill_decode_interval
+        if interval == 0 or batch is None:
             return
 
         # DP attention synchronizes this flag across ranks. This keeps every
@@ -1529,7 +1553,7 @@ class Scheduler(
             else batch.forward_mode.is_extend()
         )
         if is_extend:
-            self._prefill_decode_interval_remaining = self.prefill_decode_interval
+            self._prefill_decode_interval_remaining = interval
 
     def init_metrics_reporter(self) -> None:
         # Override point for deployments that need a specialized reporter.
@@ -4615,6 +4639,13 @@ class Scheduler(
                 chunked_prefill_size = dynamic_size
 
         # Prefill policy
+        controller = getattr(self, "adaptive_prefill", None)
+        if controller is not None:
+            chunked_prefill_size = controller.chunk_budget(
+                chunked_prefill_size,
+                self.page_size,
+                not running_batch.is_empty() and not running_batch.is_prefill_only,
+            )
         # Get BLOCK_M from the backend for tile-budget admission logic
         attn_backend = self.tp_worker.model_runner.attn_backend
         if hasattr(attn_backend, "extend_attention_block_m"):
@@ -5837,6 +5868,7 @@ class Scheduler(
         elif batch.forward_mode.is_idle():
             self.batch_result_processor.process_batch_result_idle(batch, result)
         self._on_step_processed(batch, result)
+        self._update_adaptive_prefill(batch)
 
         # Submit this batch's queued host backups before the next scheduler step.
         self.tree_cache.flush_pending_backups()
@@ -5852,6 +5884,19 @@ class Scheduler(
         self._maybe_clear_mm_inputs(batch)
         self.maybe_send_health_check_signal()
         self.metrics_reporter.update_device_timer()
+
+    def _update_adaptive_prefill(self, batch: ScheduleBatch):
+        controller = getattr(self, "adaptive_prefill", None)
+        if controller is not None and (
+            batch.forward_mode.is_extend_without_speculative()
+            or batch.forward_mode.is_decode()
+        ):
+            controller.observe(
+                (time.monotonic() - batch.launch_ts) * 1000,
+                batch.extend_num_tokens
+                if batch.forward_mode.is_extend_without_speculative()
+                else 0,
+            )
 
     def _record_step_counters(
         self, batch: ScheduleBatch, result: GenerationBatchResult

@@ -573,5 +573,9 @@ POSITIONAL_FIELD_ORDER = (
     "shortest_prefill_aging_factor",
     "enable_token_space_processor",
     "indexer_kv_cache_dtype",
+    "adaptive_prefill",
+    "adaptive_prefill_target_ms",
+    "adaptive_prefill_token_ms",
+    "adaptive_prefill_max_decode_rounds",
 )
 # fmt: on
