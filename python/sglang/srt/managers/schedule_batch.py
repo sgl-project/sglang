@@ -104,7 +104,6 @@ from sglang.srt.managers.req_types import (
     MultimodalInputs,
     ReturnHiddenStatesMode,
     SamplingLogprobsMode,
-    get_request_return_hidden_states_mode,
     get_return_hidden_states_mode,
 )
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
@@ -180,19 +179,13 @@ def get_batch_return_hidden_states_mode(reqs: List[Req]) -> CaptureHiddenMode:
     return mode
 
 
-def need_return_hidden_states(
-    return_hidden_states: Union[List[ReturnHiddenStatesMode], ReturnHiddenStatesMode],
-) -> bool:
-    return get_request_return_hidden_states_mode(return_hidden_states).need_capture()
-
-
 @lru_cache(maxsize=1)
 def sanity_check_mm_pad_shift_value(vocab_size: int) -> None:
     if vocab_size > MM_PAD_SHIFT_VALUE:
         raise ValueError(
             f"Model vocab_size ({vocab_size}) exceeds MM_PAD_SHIFT_VALUE ({MM_PAD_SHIFT_VALUE}). "
             f"MM pad_values may overlap with valid token IDs. "
-            f"Please increase MM_PAD_SHIFT_VALUE in schedule_batch.py."
+            f"Please increase MM_PAD_SHIFT_VALUE in req_types.py."
         )
 
 
@@ -3421,6 +3414,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.return_hidden_states = self.return_hidden_states_mode.need_capture()
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
+        self.sampling_info.refresh_top_k_flags(
+            [req.sampling_params.top_k for req in self.reqs]
+        )
         if self.spec_info:
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,

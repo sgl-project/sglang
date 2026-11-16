@@ -79,25 +79,16 @@ class TestRequestHoldersAreLists(CustomTestCase):
         self.assertEqual(fields, set())
 
 
-_SRT = pathlib.Path(sglang.srt.__path__[0])
-_EDITS = ("_join", "_leave", "_leave_finished", "_drop_all")
-# `move`, and the retirer module, which takes ending requests out.
+_REPO = pathlib.Path(sglang.srt.__path__[0]).parents[2]
+_SCANNED = ("python/sglang/srt", "python/sglang/test", "test/registered")
+_EDITS = ("_join", "_leave")
+# `move`; the retirer module, which takes ending requests out; its shared test
+# double; and this file, which tests the edits themselves.
 _EDITORS = {
-    "managers/scheduler_components/request_list.py",
-    "managers/scheduler_components/request_retirer.py",
-}
-# The other code that edits a list directly, with its count: each takes a
-# request out before or without its release, or edits a list the retirer does
-# not reach.
-_DIRECT_EDITS = {
-    "disaggregation/decode.py:DecodeTransferQueue.resolve_deferred_releases": 1,
-    "disaggregation/prefill.py:SchedulerDisaggregationPrefillMixin.process_prefill_chunk": 1,
-    "dllm/mixin/scheduler.py:DllmManager.take": 1,
-    "managers/hisparse_coordinator.py:HiSparseCoordinator._release_staging": 1,
-    "managers/scheduler.py:Scheduler._on_step_processed": 2,
-    "managers/scheduler.py:Scheduler._retract_batches": 1,
-    "managers/scheduler_components/deferred_responses.py:DeferredResponses._abort": 1,
-    "managers/scheduler_components/deferred_responses.py:DeferredResponses.stream_released": 1,
+    "python/sglang/srt/managers/scheduler_components/request_list.py",
+    "python/sglang/srt/managers/scheduler_components/request_retirer.py",
+    "python/sglang/test/scheduler_test_utils.py",
+    "test/registered/unit/managers/scheduler_components/test_request_list.py",
 }
 
 
@@ -112,37 +103,58 @@ class _EditCalls(ast.NodeVisitor):
 
     visit_ClassDef = visit_FunctionDef = visit_AsyncFunctionDef = _visit_scope
 
+    def _count(self):
+        self.found[f"{self.path}:{'.'.join(self.scope)}"] += 1
+
     def visit_Call(self, node):
         if isinstance(node.func, ast.Attribute) and node.func.attr in _EDITS:
-            self.found[f"{self.path}:{'.'.join(self.scope)}"] += 1
+            self._count()
         self.generic_visit(node)
+
+    def _visit_assign(self, node):
+        targets = getattr(node, "targets", None) or [node.target]
+        for target in targets:
+            for sub in ast.walk(target):
+                if isinstance(sub, ast.Attribute) and sub.attr == "owner_list":
+                    self._count()
+        self.generic_visit(node)
+
+    visit_Assign = visit_AugAssign = visit_AnnAssign = _visit_assign
 
 
 class TestListEdits(CustomTestCase):
     def test_lists_are_edited_through_move_and_the_retirer(self):
         found = collections.Counter()
-        for file in sorted(_SRT.rglob("*.py")):
-            path = file.relative_to(_SRT).as_posix()
-            source = file.read_text()
-            if path not in _EDITORS and any(f"{e}(" in source for e in _EDITS):
-                _EditCalls(path, found).visit(ast.parse(source))
-        self.assertEqual(dict(found), _DIRECT_EDITS)
+        for root in _SCANNED:
+            self.assertTrue((_REPO / root).is_dir(), root)
+            for file in sorted((_REPO / root).rglob("*.py")):
+                path = file.relative_to(_REPO).as_posix()
+                source = file.read_text()
+                if path not in _EDITORS and any(
+                    key in source for key in (*(f"{e}(" for e in _EDITS), "owner_list")
+                ):
+                    _EditCalls(path, found).visit(ast.parse(source))
+        self.assertEqual(dict(found), {})
+
+    def test_the_scan_counts_an_owner_list_assignment(self):
+        found = collections.Counter()
+        source = "def f(req):\n    req.owner_list = None\n    x._leave([req])\n"
+        _EditCalls("x.py", found).visit(ast.parse(source))
+        self.assertEqual(dict(found), {"x.py:f": 2})
 
 
 class TestKeyedReqList(CustomTestCase):
     def test_join_keeps_order_and_leave_ignores_outsiders(self):
-        a, b, c, outsider = (FakeReq(rid=rid, finished=lambda: False) for rid in "abcx")
+        a, b, c, outsider = (FakeReq(rid=rid) for rid in "abcx")
         running = KeyedReqList(ListKind.DECODING)
         move([a, b], running)
         move([c], running)
         self.assertEqual(list(running), [a, b, c])
 
-        b.finished = lambda: True
-        running._leave_finished()
         running._leave([a, outsider])
 
-        self.assertEqual(list(running), [c])
-        self.assertNotIn(a, running)
+        self.assertEqual(list(running), [b, c])
+        self.assertIsNone(a.owner_list)
 
 
 def _reqs(rids):
@@ -183,19 +195,6 @@ class TestMove(CustomTestCase):
         self.assertIs(a.owner_list, held)
         self.assertIsNone(b.owner_list)
 
-    def test_every_way_out_of_a_list_clears_the_owner(self):
-        a, b, c = _reqs("abc")
-        queue = IndexedReqList(ListKind.WAITING)
-        move([a, b], queue)
-        running = KeyedReqList(ListKind.DECODING)
-        move([c], running)
-
-        queue._leave([a])
-        running._drop_all()
-        queue._drop_all()
-
-        self.assertEqual([r.owner_list for r in (a, b, c)], [None, None, None])
-
     def test_a_request_moved_on_reads_as_gone(self):
         a, b = _reqs("ab")
         queue = IndexedReqList(ListKind.WAITING)
@@ -209,9 +208,7 @@ class TestMove(CustomTestCase):
         self.assertEqual(list(queue.items()), [b])
         self.assertEqual(len(queue), 1)
         self.assertNotIn(a, queue)
-        queue._drop_all()
         self.assertIs(a.owner_list, other)
-        self.assertIsNone(b.owner_list)
 
     def test_a_request_back_in_the_list_it_left_is_in_it_once(self):
         a, b = _reqs("ab")
@@ -248,9 +245,15 @@ class TestAssertEmpty(CustomTestCase):
         lists = {ListKind.PD_SENDING: sending, ListKind.PD_PREALLOC: prealloc}
 
         sending._leave([a])
-        with self.assertRaisesRegex(AssertionError, r"\['PD_PREALLOC'\]"):
+        with self.assertRaisesRegex(RuntimeError, r"\['PD_PREALLOC'\]"):
             assert_empty(lists, PD_KINDS)
         assert_empty(lists, {ListKind.PD_SENDING})
+
+
+class TestPdKinds(CustomTestCase):
+    def test_every_pd_list_kind_is_a_pd_kind(self):
+        pd_named = {kind for kind in ListKind if kind.name.startswith("PD_")}
+        self.assertEqual(pd_named, PD_KINDS)
 
 
 if __name__ == "__main__":
