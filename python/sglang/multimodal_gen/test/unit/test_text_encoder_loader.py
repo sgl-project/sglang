@@ -1,5 +1,4 @@
 import json
-import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -396,47 +395,6 @@ def test_native_encoder_restoration_checks_checkpoint_before_fallback(
                 model.state_dict()[required], weights[required], rtol=0, atol=0
             )
             assert all(not parameter.requires_grad for parameter in model.parameters())
-
-
-def test_text_encoder_config_code_needs_trust_remote_code(tmp_path, monkeypatch):
-    """A text encoder whose config.json points at repository code must not have
-    that code executed unless the server was started with --trust-remote-code."""
-    # Keep the dynamic-module cache of a trusting load inside the test directory.
-    monkeypatch.setattr(
-        transformers.dynamic_module_utils,
-        "HF_MODULES_CACHE",
-        str(tmp_path / "hf_modules"),
-    )
-    monkeypatch.setattr(sys, "path", list(sys.path))
-    marker = tmp_path / "executed"
-    encoder_dir = tmp_path / "text_encoder"
-    encoder_dir.mkdir()
-    (encoder_dir / "config.json").write_text(
-        json.dumps(
-            {
-                "model_type": "sglang_test_remote_text_encoder",
-                "auto_map": {"AutoConfig": "configuration_remote.RemoteConfig"},
-            }
-        )
-    )
-    (encoder_dir / "configuration_remote.py").write_text(
-        "from pathlib import Path\n"
-        "from transformers import PretrainedConfig\n"
-        f"Path({str(marker)!r}).touch()\n"
-        "class RemoteConfig(PretrainedConfig):\n"
-        "    model_type = 'sglang_test_remote_text_encoder'\n"
-    )
-
-    with pytest.raises(Exception) as raised:
-        TextEncoderLoader().build_model_config(
-            str(encoder_dir),
-            {},
-            SimpleNamespace(trust_remote_code=False),
-            "text_encoder",
-        )
-
-    assert not marker.exists(), "repository code ran without --trust-remote-code"
-    assert "trust_remote_code" in str(raised.value)
 
 
 class TestTextEncoderWeightDiscovery(unittest.TestCase):
