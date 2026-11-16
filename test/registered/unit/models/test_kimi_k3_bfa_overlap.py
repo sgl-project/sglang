@@ -227,6 +227,8 @@ class TestKimiK3BfaOverlap(CustomTestCase):
             def _front_shard(self):
                 return None
 
+            _rocm_epi_fuse_ok = False
+
         def module(rows):
             return SimpleNamespace(
                 weight=torch.ones(rows, 16, device="cuda", dtype=torch.bfloat16)
