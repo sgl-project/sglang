@@ -206,6 +206,8 @@ class DSV4CPBCGInput(PrefillCPBCGInput):
             assert strategy is not None
             self.num_token_non_padded.fill_(logical_tokens[strategy.cp_rank])
             forward_batch.num_token_non_padded = self.num_token_non_padded
+            if isinstance(strategy, InterleaveCPStrategy):
+                metadata.moe_local_token_count = self.num_token_non_padded
         self.live_local_tokens = live_local_tokens
 
         if isinstance(get_cp_strategy(), InterleaveCPStrategy):
