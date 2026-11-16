@@ -19,9 +19,8 @@ from sglang.test.ci.ci_register import register_cpu_ci
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 FORWARD_MLA = "sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla"
-MODES = [
+EXTEND_MODES = [
     ForwardMode.EXTEND,
-    ForwardMode.DECODE,
     ForwardMode.TARGET_VERIFY,
     ForwardMode.DRAFT_EXTEND_V2,
 ]
@@ -47,7 +46,6 @@ def _backend(*, shards_index_k: bool, page_table_1_flattened=None):
     [
         ("GlmMoeDsaForCausalLM", True, 4, True),
         ("GlmMoeDsaForCausalLMNextN", True, 4, True),
-        # Blackwell keeps the replicated index-K DCP path on the trtllm kernels.
         ("GlmMoeDsaForCausalLM", False, 4, False),
         ("GlmMoeDsaForCausalLM", True, 1, False),
         ("DeepseekV32ForCausalLM", True, 4, False),
@@ -56,16 +54,14 @@ def _backend(*, shards_index_k: bool, page_table_1_flattened=None):
 def test_glm_shards_index_k_only_under_dcp_on_sm90(arch, is_sm90, dcp_size, expected):
     with override_platform(is_sm90=is_sm90, is_sm100=not is_sm90):
         assert glm_dsa_shards_index_k(_config(arch), dcp_size) is expected
-        # The draft must shard exactly when its target does, or its extend
-        # attends a replicated pool while the target's KV is token-sharded.
+        # The draft must shard exactly when its target does.
         assert dsa_draft_shards_under_dcp(_config(arch), dcp_size) is expected
 
 
 def test_prefix_rows_index_the_ragged_gathered_kv_under_split_index_k():
-    """Under split index-K, dcp_gather_kv_cache returns each request's KV in
-    position order, but page_table_1_flattened holds DCP-widened slot ids;
-    indexing the gathered buffer with those slots read the wrong rows (and
-    out of bounds on long contexts)."""
+    """Under split index-K the prefix KV is the buffer dcp_gather_kv_cache
+    returns in position order, so its rows are 0..n-1, not the DCP-widened
+    slot ids page_table_1_flattened holds."""
     widened_slots = torch.tensor([8, 9, 10, 40, 41], dtype=torch.int32)
     gathered = torch.arange(len(widened_slots)) * 10
     backend = _backend(shards_index_k=True, page_table_1_flattened=widened_slots)
@@ -78,16 +74,15 @@ def test_prefix_rows_stay_the_slot_table_without_split_index_k():
     assert torch.equal(backend._ragged_prefix_kv_rows(), slots)
 
 
-@pytest.mark.parametrize("mode", MODES, ids=lambda m: m.name)
-def test_every_mode_returning_dcp_partials_is_merged_by_forward_mla(mode):
-    """A mode whose backend returns (o, lse) partials must be one that
-    forward_mla merges across DCP ranks; draft extend once returned partials
-    to a layer that expected a plain tensor."""
+@pytest.mark.parametrize("mode", EXTEND_MODES, ids=lambda m: m.name)
+def test_forward_mla_merges_exactly_the_extends_that_return_dcp_partials(mode):
+    """Under split index-K an extend returns (o, lse) partials exactly when the
+    backend attends its local KV shard, so forward_mla must merge across DCP
+    ranks for those modes and for no other extend."""
     backend = _backend(shards_index_k=True)
     layer = SimpleNamespace(dcp_size=4, use_dsa=True)
     with patch(f"{FORWARD_MLA}.dsa_shards_index_k", return_value=True):
         merged = DeepseekMLAForwardMixin.is_dcp_mla_decode_phase(
             layer, SimpleNamespace(forward_mode=mode)
         )
-    if backend._attends_local_kv_shard(mode):
-        assert merged
+    assert merged == backend._attends_local_kv_shard(mode)

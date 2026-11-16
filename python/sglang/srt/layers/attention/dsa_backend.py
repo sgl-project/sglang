@@ -1265,9 +1265,7 @@ class DeepseekSparseAttnBackend(
         )
 
     def _attends_local_kv_shard(self, forward_mode: ForwardMode) -> bool:
-        # Under split index-K, multi-token verify and draft extend attend only
-        # this rank's KV shard and return (o, lse) partials for forward_mla to
-        # merge; other extends gather the full KV first.
+        # forward_mla merges the (o, lse) partials these modes return.
         return self.dsa_shards_index_k and (
             forward_mode.is_target_verify() or forward_mode.is_draft_extend_v2()
         )
@@ -1300,8 +1298,7 @@ class DeepseekSparseAttnBackend(
             self.dsa_shards_index_k
             and (
                 forward_mode.is_decode_or_idle()
-                or forward_mode.is_target_verify()
-                or forward_mode.is_draft_extend_v2()
+                or self._attends_local_kv_shard(forward_mode)
             )
         ):
             return None
@@ -1402,8 +1399,6 @@ class DeepseekSparseAttnBackend(
         rows = self.forward_metadata.page_table_1_flattened
         assert rows is not None
         if self.dsa_shards_index_k:
-            # dcp_gather_kv_cache already returns the KV in ragged order; the
-            # flattened table holds DCP-widened slots, not rows of that buffer.
             return self.get_device_int32_arange(rows.shape[0])
         return rows
 
@@ -4437,7 +4432,7 @@ class DeepseekSparseAttnBackend(
         merge_query = q_rope is not None and self.qk_rope_head_dim > 0
         sharded_dcp = self.dsa_shards_index_k
         dcp_partial = sharded_dcp and (
-            not is_prefill or forward_batch.forward_mode.is_target_verify()
+            not is_prefill or self._attends_local_kv_shard(forward_batch.forward_mode)
         )
         replicated_dcp = self.attn_dcp_size > 1 and not sharded_dcp
         if (dcp_partial or replicated_dcp) and get_in_autotune_dummy_run():

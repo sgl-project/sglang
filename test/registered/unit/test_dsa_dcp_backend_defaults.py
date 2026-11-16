@@ -4,8 +4,12 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.arg_groups.model_overrides.deepseek_v2 import _dsa_dcp_overrides
+from sglang.srt.arg_groups.model_overrides.deepseek_v2 import (
+    _deepseek_family_overrides,
+    _dsa_dcp_overrides,
+)
 from sglang.srt.arg_groups.overrides import _check_dsa_backend_constraints
+from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -32,6 +36,28 @@ def _cfg(**kw):
 
 def _backends(overrides):
     return overrides.get("dsa_prefill_backend"), overrides.get("dsa_decode_backend")
+
+
+_GLM_CONFIG = SimpleNamespace(architectures=["GlmMoeDsaForCausalLM"], index_topk=2048)
+_SPLIT_INDEX_K_FIELDS = ("dsa_prefill_backend", "dsa_decode_backend", "kv_cache_dtype")
+_SPLIT_INDEX_K_MAX_CONTEXT_LEN = 1047552
+
+
+def _glm_overrides(
+    *, is_sm90=True, context_len=_SPLIT_INDEX_K_MAX_CONTEXT_LEN, **fields
+):
+    args = dict(
+        attention_backend=None,
+        prefill_attention_backend=None,
+        decode_attention_backend=None,
+        enable_prefill_cp=False,
+        kv_cache_dtype="auto",
+        _model_config=SimpleNamespace(context_len=context_len),
+    )
+    args.update(fields)
+    with override_platform(is_npu=False, is_xpu=False, is_hip=False, is_sm90=is_sm90):
+        overrides = _deepseek_family_overrides(_cfg(**args), _GLM_CONFIG)
+    return {k: v for k, v in overrides.items() if k in _SPLIT_INDEX_K_FIELDS}
 
 
 class TestDsaDcpBackendDefaults(CustomTestCase):
@@ -66,6 +92,58 @@ class TestDsaDcpBackendDefaults(CustomTestCase):
             )
         self.assertNotIn("dsa_prefill_backend", overrides)
         self.assertNotIn("dsa_decode_backend", overrides)
+
+
+class TestGlmSplitIndexKDcpStartup(CustomTestCase):
+    def test_unset_fields_get_the_supported_values_only_under_dcp_on_sm90(self):
+        self.assertEqual(
+            _glm_overrides(),
+            {
+                "dsa_prefill_backend": "flashmla_sparse_q8",
+                "dsa_decode_backend": "flashmla_kv",
+                "kv_cache_dtype": "fp8_e4m3",
+            },
+        )
+        self.assertEqual(
+            _glm_overrides(
+                is_sm90=False,
+                context_len=_SPLIT_INDEX_K_MAX_CONTEXT_LEN + 1,
+                kv_cache_dtype="bfloat16",
+            ),
+            {"dsa_prefill_backend": "trtllm", "dsa_decode_backend": "trtllm"},
+        )
+        self.assertEqual(
+            _glm_overrides(
+                dcp_size=1,
+                context_len=_SPLIT_INDEX_K_MAX_CONTEXT_LEN + 1,
+                dsa_decode_backend="fa3",
+            ),
+            {},
+        )
+
+    def test_explicit_supported_prefill_backend_is_kept(self):
+        self.assertEqual(
+            _glm_overrides(dsa_prefill_backend="flashmla_kv"),
+            {
+                "dsa_prefill_backend": "flashmla_kv",
+                "dsa_decode_backend": "flashmla_kv",
+                "kv_cache_dtype": "fp8_e4m3",
+            },
+        )
+
+    def test_unsupported_explicit_values_are_rejected(self):
+        for field, value in (
+            ("dsa_prefill_backend", "flashmla_sparse"),
+            ("dsa_decode_backend", "trtllm"),
+            ("kv_cache_dtype", "bfloat16"),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, field.replace("_", "-")):
+                    _glm_overrides(**{field: value})
+
+    def test_context_length_over_the_top_k_row_limit_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "--context-length 1047552"):
+            _glm_overrides(context_len=_SPLIT_INDEX_K_MAX_CONTEXT_LEN + 1)
 
 
 class TestDsaDcpBackendConstraints(CustomTestCase):

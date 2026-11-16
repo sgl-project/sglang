@@ -1296,7 +1296,6 @@ class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> None:
-        # Must run before the KV pools and attention backends are built.
         if glm_dsa_shards_index_k(config, get_parallel().attn_dcp_size):
             set_dsa_shards_index_k()
         super().__init__(config=config, quant_config=quant_config, prefix=prefix)
