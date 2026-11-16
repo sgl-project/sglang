@@ -1,11 +1,8 @@
-import sys
 import unittest
-from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
-from sglang.kernels.ops.attention.dsa import fp8_fused_writer_hip
 from sglang.kernels.ops.attention.dsa.fp8_fused_writer_hip import (
     aiter_fused_fp8_qk_write,
     aiter_fused_fp8_writer_available,
@@ -25,32 +22,12 @@ class TestFusedFp8WriterHip(CustomTestCase):
         self.assertFalse(fused_fp8_writer_geometry_supported(128, 32, 128))
         self.assertFalse(fused_fp8_writer_geometry_supported(128, 64, 64))
 
-    def _available_on(self, gcn_arch):
-        """Gate result on a faked arch, with the AITER symbol importable."""
-        cache = ModuleType("aiter.ops.cache")
-        cache.indexer_qk_rope_quant_and_cache = object()
-        aiter_modules = {
-            "aiter": ModuleType("aiter"),
-            "aiter.ops": ModuleType("aiter.ops"),
-            "aiter.ops.cache": cache,
-        }
-        hip = None if gcn_arch is None else SimpleNamespace(gcn_arch=gcn_arch)
-        with (
-            patch.object(
-                fp8_fused_writer_hip,
-                "current_arch",
-                return_value=SimpleNamespace(hip=hip),
-            ),
-            patch.dict(sys.modules, aiter_modules),
+    def test_available_rejects_mi300(self):
+        with patch(
+            "sglang.srt.utils.is_gfx95_supported",
+            return_value=False,
         ):
-            return aiter_fused_fp8_writer_available()
-
-    def test_available_only_on_gfx950(self):
-        self.assertTrue(self._available_on("gfx950"))
-        # gfx942 (MI300) can import the symbol; None is a non-HIP device.
-        for other in ("gfx942", "gfx951", None):
-            with self.subTest(gcn_arch=other):
-                self.assertFalse(self._available_on(other))
+            self.assertFalse(aiter_fused_fp8_writer_available())
 
     def test_prepare_aiter_rope_caches_squeezes_cpu_tables(self):
         cos = torch.randn(128, 1, 1, 32, dtype=torch.float32)

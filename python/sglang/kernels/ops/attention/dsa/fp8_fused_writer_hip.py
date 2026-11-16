@@ -7,8 +7,6 @@ from typing import Optional
 
 import torch
 
-from sglang.kernels.arch import current_arch
-
 SUPPORTED_HEAD_DIM = 128
 SUPPORTED_ROPE_DIM = 64
 SUPPORTED_QUANT_BLOCK_SIZE = 128
@@ -25,9 +23,10 @@ def fused_fp8_writer_geometry_supported(
 
 
 def aiter_fused_fp8_writer_available() -> bool:
+    from sglang.srt.utils import is_gfx95_supported
+
     # gfx950-only kernel. gfx942 may still import the Python symbol.
-    hip = current_arch().hip
-    if hip is None or hip.gcn_arch != "gfx950":
+    if not is_gfx95_supported():
         return False
     try:
         from aiter.ops.cache import indexer_qk_rope_quant_and_cache  # noqa: F401
