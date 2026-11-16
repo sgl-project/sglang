@@ -209,13 +209,20 @@ class StreamingSession:
 
         return True
 
+    def checkpoints_into_tree(self, req: Req) -> bool:
+        """Whether a checkpoint of ``req`` inserts into the tree: always outside
+        a streaming turn, and in a turn only while its slot publishes the first
+        prompt (`try_checkpoint`). Reads only; callers may ask ahead."""
+        slot = self.borrowed_slot(req)
+        return slot is None or slot.publishes_prompt
+
     def try_checkpoint(self, req: Req, *, up_to: int, **kwargs) -> bool:
         # A turn publishes nothing of its own, except the first prompt: the slot
         # publishes it for other requests to share, and its lock follows the insert.
         slot = self.borrowed_slot(req)
         if slot is None:
             return False
-        if slot.publishes_prompt:
+        if self.checkpoints_into_tree(req):
             req.lock, slot.lock = slot.lock, None
             self.cache.checkpoint_into_tree(req, up_to=up_to, **kwargs)
             self._lock_to_slot(req, slot)
