@@ -2,13 +2,21 @@
 
 import multiprocessing as mp
 import os
+import subprocess
 import sys
 import types
 from dataclasses import dataclass
 
 import pytest
+import torch
 
-from sglang.multimodal_gen.apps import comfyui_worker_patches as patches
+from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion import worker_patches as patches
+from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.worker_patches import (
+    h3 as h3_profile,
+)
+from sglang.multimodal_gen.runtime import distributed
+from sglang.multimodal_gen.runtime.distributed import parallel_state
+from sglang.multimodal_gen.runtime.models.dits import minimax_h3
 
 
 def test_registered_names_only():
@@ -141,7 +149,9 @@ def test_real_spawn_installs_after_load_or_aborts(fail):
 
 
 def test_bound_helper_does_not_change_class_or_other_instances():
-    from sglang.multimodal_gen.apps.comfyui_worker_patches.h3 import bind_with_globals
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.worker_patches.h3 import (
+        bind_with_globals,
+    )
 
     class Example:
         def run(self):
@@ -158,10 +168,68 @@ def test_bound_helper_does_not_change_class_or_other_instances():
 
 
 def test_h3_dynamic_lora_rejected():
-    from sglang.multimodal_gen.apps.comfyui_worker_patches.h3 import _reject_lora
+    from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.worker_patches.h3 import (
+        _reject_lora,
+    )
 
     with pytest.raises(ValueError, match="LoRA"):
         _reject_lora("adapter")
+
+
+def test_h3_install_disables_nested_norm2_fusion_for_reference_only(monkeypatch):
+    block = minimax_h3.MiniMaxH3DiTBlock.__new__(minimax_h3.MiniMaxH3DiTBlock)
+    torch.nn.Module.__init__(block)
+    block.preserve_input_for_cache_dit = False
+    block.mlp = types.SimpleNamespace(fc1=object())
+    block.norm2 = types.SimpleNamespace(weight=torch.ones(1), eps=1e-6)
+    block.attn = types.SimpleNamespace()
+    block.attn._attend = types.MethodType(
+        minimax_h3.MiniMaxH3Attention._attend, block.attn
+    )
+    monkeypatch.setattr(
+        minimax_h3,
+        "MINIMAX_H3_NORM_MODULATE",
+        types.SimpleNamespace(is_enabled=lambda _: True),
+    )
+    monkeypatch.setattr(
+        minimax_h3, "can_use_indexed_gate_rmsnorm_scale_shift", lambda *args: True
+    )
+    original = minimax_h3.MiniMaxH3DiTBlock._fuses_gate_norm2
+    inputs = (None,) * 6
+    assert block._fuses_gate_norm2(*inputs)
+
+    model = types.SimpleNamespace(
+        blocks=[block],
+        adaln_t_table=None,
+        adaln_cache=None,
+        final_layer=types.SimpleNamespace(_pdd_heads=None),
+        parameters=lambda: iter(
+            [types.SimpleNamespace(device=types.SimpleNamespace(type="cuda"))]
+        ),
+        named_modules=lambda: (),
+        _embed=lambda *args: None,
+        forward=lambda **kwargs: None,
+    )
+    monkeypatch.setattr(minimax_h3, "MiniMaxH3DiTModel", types.SimpleNamespace)
+    monkeypatch.setattr(distributed, "get_tp_world_size", lambda: 1)
+    monkeypatch.setattr(parallel_state, "get_ring_ctx", lambda: (1, 0))
+    monkeypatch.setattr(parallel_state, "get_ulysses_ctx", lambda: (1, 0))
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda: (9, 0))
+    version = h3_profile.importlib.metadata.version
+    monkeypatch.setattr(
+        h3_profile.importlib.metadata,
+        "version",
+        lambda name: "0.2.36" if name == "comfy-kitchen" else version(name),
+    )
+    kitchen = types.ModuleType("comfy_kitchen")
+    kitchen.rms_rope_split_half_ = lambda *args: None
+    monkeypatch.setitem(sys.modules, "comfy_kitchen", kitchen)
+
+    h3_profile.install(types.SimpleNamespace(modules={"transformer": model}))
+
+    assert not block._fuses_gate_norm2(*inputs)
+    assert minimax_h3.MiniMaxH3DiTBlock._fuses_gate_norm2 is original
+    assert original(block, *inputs)
 
 
 @pytest.fixture
@@ -170,7 +238,7 @@ def options_module():
     import importlib.util
     from pathlib import Path
 
-    path = Path(patches.__file__).parent.parent / "ComfyUI_SGLDiffusion/options.py"
+    path = Path(patches.__file__).parent.parent / "options.py"
     spec = importlib.util.spec_from_file_location("sgld_options_test", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -215,3 +283,48 @@ def test_legacy_widget_positions_preserved(options_module):
         "memory_mode resident_layers prefetch_layers"
     ).split()
     assert list(options_module._FIELDS) == legacy + ["alignment_mode"]
+
+
+def test_worker_import_does_not_load_comfyui():
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            """
+import sys
+class NoComfyUI:
+    def find_spec(self, fullname, *args):
+        if fullname.endswith("ComfyUI_SGLDiffusion.nodes") or fullname in ("folder_paths", "comfy"):
+            raise AssertionError(f"Worker imported {fullname}")
+sys.meta_path.insert(0, NoComfyUI())
+from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.worker_patches import h3
+""",
+        ],
+        check=True,
+        timeout=30,
+    )
+
+
+@pytest.mark.parametrize("first", ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS"])
+def test_lazy_node_registration(monkeypatch, first):
+    import importlib.util
+    from pathlib import Path
+
+    # ComfyUI loads plugins by file path under its own module name.
+    name = "sgld_custom_node_test"
+    path = Path(patches.__file__).parent.parent / "__init__.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, name, module)
+    spec.loader.exec_module(module)
+    assert "NODE_CLASS_MAPPINGS" not in vars(module)
+    assert module.WEB_DIRECTORY == "./web"
+    nodes = types.ModuleType(name + ".nodes")
+    nodes.NODE_CLASS_MAPPINGS = {"SGLDOptions": object()}
+    nodes.NODE_DISPLAY_NAME_MAPPINGS = {"SGLDOptions": "SGLDiffusion Options"}
+    monkeypatch.setitem(sys.modules, nodes.__name__, nodes)
+    assert getattr(module, first) is getattr(nodes, first)
+    assert module.NODE_CLASS_MAPPINGS is nodes.NODE_CLASS_MAPPINGS
+    assert module.NODE_DISPLAY_NAME_MAPPINGS is nodes.NODE_DISPLAY_NAME_MAPPINGS
+    with pytest.raises(AttributeError):
+        module.unknown_attribute

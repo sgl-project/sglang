@@ -1294,6 +1294,50 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             [("_mimo_v2_overrides", expected)],
                         )
 
+    def test_kimi_k3_flashinfer_mxfp4_rejects_situ_without_trtllm_gen(self):
+        """An explicit flashinfer_mxfp4 on SM90/SM120 ran K3's SiTU experts as SwiGLU."""
+        from sglang.srt.arg_groups.model_overrides.kimi_k3 import (
+            _kimi_k3_moe_runner_overrides,
+        )
+
+        def _k3_hf(hidden_act, flat=False):
+            qc = {"config_groups": {"group_0": {"format": "mxfp4-pack-quantized"}}}
+            text_config = SimpleNamespace(hidden_act=hidden_act, quantization_config=qc)
+            return text_config if flat else SimpleNamespace(text_config=text_config)
+
+        def _run(runner, hf_config, **platform):
+            with override_platform(**platform):
+                return _kimi_k3_moe_runner_overrides(
+                    SimpleNamespace(moe_runner_backend=runner), hf_config
+                )
+
+        def _gpu(sm):
+            return dict(
+                is_cuda=True,
+                is_sm90=sm == 90,
+                is_sm100=sm // 10 == 10,
+                is_sm120=sm // 10 == 12,
+                device_sm=sm,
+            )
+
+        hopper = _gpu(90)
+        for platform in (hopper, _gpu(120)):
+            for flat in (False, True):
+                with self.subTest(flat=flat, **platform):
+                    with self.assertRaisesRegex(RuntimeError, "marlin"):
+                        _run("flashinfer_mxfp4", _k3_hf("situ", flat), **platform)
+        # SM110 has no flashinfer_mxfp4 kernel; Mxfp4MoEMethod reports that.
+        for platform in (_gpu(100), _gpu(103), _gpu(110)):
+            with self.subTest(**platform):
+                self.assertEqual(
+                    _run("flashinfer_mxfp4", _k3_hf("situ"), **platform), {}
+                )
+        self.assertEqual(_run("marlin", _k3_hf("situ"), **hopper), {})
+        self.assertEqual(_run("flashinfer_mxfp4", _k3_hf("silu"), **hopper), {})
+        self.assertEqual(
+            _run("flashinfer_mxfp4", _k3_hf("silu", flat=True), **hopper), {}
+        )
+
     def test_mimo_v2_family_is_registered(self):
         with override_platform(is_sm100=False):
             self.assertEqual(
@@ -3133,8 +3177,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import _dsa_kv_cache_dtype_default
 
-        def _view(**kw):
-            hf = SimpleNamespace(architectures=["DeepseekV32ForCausalLM"])
+        def _view(learnable_sink=False, **kw):
+            hf = SimpleNamespace(
+                architectures=["DeepseekV32ForCausalLM"], learnable_sink=learnable_sink
+            )
             defaults = dict(
                 kv_cache_dtype="auto",
                 dsa_prefill_backend=None,
@@ -3149,6 +3195,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
             override_platform(is_npu=False),
             override_platform(is_xpu=False),
+            override_platform(is_hip=False),
         ):
             with patch("torch.cuda.get_device_capability", return_value=(9, 0)):
                 # Hopper: auto -> bfloat16
@@ -3173,6 +3220,53 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 self.assertEqual(
                     _dsa_kv_cache_dtype_default(_view()),
                     {"kv_cache_dtype": "fp8_e4m3"},
+                )
+        # gfx950 reports capability 9.5.
+        with (
+            patch("sglang.srt.configs.model_config.is_deepseek_dsa", return_value=True),
+            override_platform(is_npu=False),
+            override_platform(is_xpu=False),
+            override_platform(is_hip=True),
+            patch("torch.cuda.get_device_capability", return_value=(9, 5)),
+            patch(
+                "sglang.srt.arg_groups.overrides.is_gfx95_supported",
+                return_value=True,
+            ),
+            envs.SGLANG_USE_AITER.override(True),
+        ):
+            self.assertEqual(
+                _dsa_kv_cache_dtype_default(_view()),
+                {"kv_cache_dtype": "fp8_e4m3"},
+            )
+            for backend in ("triton", "tilelang"):
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(
+                        _view(dsa_prefill_backend=backend, dsa_decode_backend=backend)
+                    ),
+                    {"kv_cache_dtype": "fp8_e4m3"},
+                )
+            self.assertEqual(
+                _dsa_kv_cache_dtype_default(_view(learnable_sink=True)),
+                {"kv_cache_dtype": "bfloat16"},
+            )
+            self.assertEqual(
+                _dsa_kv_cache_dtype_default(
+                    _view(dsa_prefill_backend="aiter", dsa_decode_backend="aiter")
+                ),
+                {"kv_cache_dtype": "bfloat16"},
+            )
+            with envs.SGLANG_USE_AITER.override(False):
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(_view()),
+                    {"kv_cache_dtype": "bfloat16"},
+                )
+            with patch(
+                "sglang.srt.arg_groups.overrides.is_gfx95_supported",
+                return_value=False,
+            ):
+                self.assertEqual(
+                    _dsa_kv_cache_dtype_default(_view()),
+                    {"kv_cache_dtype": "bfloat16"},
                 )
 
     def test_deepseek_v4_kv_cache_dtype_pass(self):
@@ -3286,9 +3380,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 page_size=None,
                 linear_attn_backend="triton",
                 linear_attn_prefill_backend=None,
-                radix_eviction_policy="lru",
-                _radix_eviction_policy_explicitly_set=True,
-                enable_session_radix_cache=False,
             )
             defaults.update(kw)
             return ResolvedView(
@@ -3367,21 +3458,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                         "mamba_radix_cache_strategy": "extra_buffer",
                     },
                 )
-        # an unset eviction policy resolves to gds; an explicit lru and the
-        # session radix cache, which gds rejects on these models, keep lru
-        unset = {"_radix_eviction_policy_explicitly_set": False}
-        self.assertEqual(
-            _mamba_radix_cache_resolution(_view("Qwen3NextForCausalLM", **unset))[
-                "radix_eviction_policy"
-            ],
-            "gds",
-        )
-        for kw in ({}, {**unset, "enable_session_radix_cache": True}):
-            with self.subTest(**kw):
-                self.assertNotIn(
-                    "radix_eviction_policy",
-                    _mamba_radix_cache_resolution(_view("Qwen3NextForCausalLM", **kw)),
-                )
         # GraniteMoeHybrid is guarded on mamba layer types
         self.assertEqual(
             _mamba_radix_cache_resolution(
@@ -3439,9 +3515,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 page_size=None,
                 linear_attn_backend="triton",
                 linear_attn_prefill_backend=None,
-                radix_eviction_policy="lru",
-                _radix_eviction_policy_explicitly_set=True,
-                enable_session_radix_cache=False,
             )
             defaults.update(kw)
             return ResolvedView(

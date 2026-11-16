@@ -497,13 +497,15 @@ curl -sS -L "http://localhost:30010/v1/videos/<VIDEO_ID>/content" \
 The server supports dynamic loading, merging, and unmerging of LoRA adapters.
 
 **Important Notes:**
-- Mutual Exclusion: Only one LoRA configuration can be active per target at a time
+- Mutual Exclusion: Only one LoRA configuration can be active per target at a time; that configuration can contain multiple adapters
 - Switching: To switch LoRAs, deactivate the current LoRA with `unmerge_lora_weights`, then `set` the new one
 - Caching: The server caches loaded LoRA weights in memory. Switching back to a previously loaded LoRA (same path) has little cost
 
 **Set LoRA Adapter**
 
-Loads one or more LoRA adapters and applies them to the model. By default, regular weights are statically merged, while FSDP-sharded weights use dynamic LoRA to avoid full-gather memory peaks.
+Loads one or more LoRA adapters and applies them to the model. Both static merge and dynamic execution support multiple adapters on the same target, with a separate strength for each adapter.
+
+When `merge_mode` is omitted, the request inherits the server's `--lora-merge-mode`. The default policy, `auto`, merges regular weights but uses dynamic LoRA for FSDP-sharded weights, supported quantized or AMX-packed weights that cannot merge in place, and updates estimated to lose more than 50% of their norm to merge rounding. These rules also apply to multiple adapters. Forcing `merge` fails for weights that cannot merge in place; `dynamic` leaves the base weights unchanged and adds the adapters' updates during each forward pass.
 
 **Endpoint:** `POST /v1/set_lora`
 
@@ -515,8 +517,8 @@ Loads one or more LoRA adapters and applies them to the model. By default, regul
   - `"transformer"`: Apply only to the primary transformer (high noise for Wan2.2)
   - `"transformer_2"`: Apply only to transformer_2 (low noise for Wan2.2)
   - `"critic"`: Apply only to the critic model
-- `strength` (float or list of floats, optional): LoRA strength for merge, default 1.0. If a list, must match the length of `lora_nickname`. Values < 1.0 reduce the effect, values > 1.0 amplify the effect
-- `merge_mode` (string, optional): `"auto"` (default server policy), `"merge"` (force static merge), or `"dynamic"` (apply LoRA at forward time)
+- `strength` (float or list of floats, optional): LoRA strength for static merge or dynamic execution, default 1.0. If a list, must match the length of `lora_nickname`. Values < 1.0 reduce the effect, values > 1.0 amplify the effect
+- `merge_mode` (string, optional): `"auto"`, `"merge"` (force static merge), or `"dynamic"` (apply LoRA at forward time). If omitted, inherits `--lora-merge-mode`
 
 **Single LoRA Example:**
 
@@ -544,7 +546,7 @@ curl -X POST http://localhost:30010/v1/set_lora \
       }'
 ```
 
-**Multiple LoRA with Same Target:**
+**Multiple Dynamic LoRAs with the Same Target:**
 
 ```bash Command
 curl -X POST http://localhost:30010/v1/set_lora \
@@ -553,7 +555,8 @@ curl -X POST http://localhost:30010/v1/set_lora \
         "lora_nickname": ["style_lora", "character_lora"],
         "lora_path": ["/path/to/style.safetensors", "/path/to/character.safetensors"],
         "target": "all",
-        "strength": [0.7, 0.9]
+        "strength": [0.7, 0.9],
+        "merge_mode": "dynamic"
       }'
 ```
 

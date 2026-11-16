@@ -23,6 +23,8 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.sgl_eval_utils import run_sgl_eval
 from sglang.test.test_utils import (
+    ADMIN_HEADERS_FOR_TEST,
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_DRAFT_MODEL_EAGLE3,
     DEFAULT_MODEL_NAME_FOR_TEST,
     DEFAULT_TARGET_MODEL_EAGLE3,
@@ -38,6 +40,8 @@ class TestDisaggregationAccuracy(PauseResumeInPlaceMixin, PDDisaggregationServer
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
         cls.pause_generate_url = cls.lb_url
         cls.pause_target_urls = [cls.prefill_url, cls.decode_url]
+        cls.extra_prefill_args = [*ADMIN_LAUNCH_ARGS_FOR_TEST]
+        cls.extra_decode_args = [*ADMIN_LAUNCH_ARGS_FOR_TEST]
         cls.launch_all()
 
     def test_gsm8k(self):
@@ -437,6 +441,7 @@ class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
     def setUpClass(cls):
         super().setUpClass()
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
+        cls.extra_decode_args = [*ADMIN_LAUNCH_ARGS_FOR_TEST]
         cls.launch_all()
 
     def test_retract_pause_decode_running_batch(self):
@@ -469,6 +474,7 @@ class TestDisaggregationPauseResumeDecodeRetract(PDDisaggregationServerBase):
             async with session.post(
                 url,
                 json=json_data,
+                headers=ADMIN_HEADERS_FOR_TEST,
                 timeout=aiohttp.ClientTimeout(total=timeout),
             ) as resp:
                 resp.raise_for_status()
@@ -613,6 +619,7 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
             "--max-running-requests",
             str(cls.MAX_RUNNING),
             "--enable-metrics",
+            *ADMIN_LAUNCH_ARGS_FOR_TEST,
         ]
         cls.launch_all()
 
@@ -635,12 +642,14 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
             async with session.post(
                 self.prefill_url + "/pause_generation",
                 json={"mode": mode},
+                headers=ADMIN_HEADERS_FOR_TEST,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 resp.raise_for_status()
             async with session.post(
                 self.prefill_url + "/continue_generation",
                 json={},
+                headers=ADMIN_HEADERS_FOR_TEST,
                 timeout=aiohttp.ClientTimeout(total=10),
             ) as resp:
                 resp.raise_for_status()
@@ -708,6 +717,7 @@ class TestDisaggregationPauseResumePrefillLeak(PDDisaggregationServerBase):
             async with session.post(
                 url,
                 json=json_data,
+                headers=ADMIN_HEADERS_FOR_TEST,
                 timeout=aiohttp.ClientTimeout(total=30),
             ) as resp:
                 resp.raise_for_status()

@@ -21,8 +21,7 @@ pub(super) fn validate(req: &mut Request, limits: &Limits) -> Result<(), Error> 
 
     // The rid is the request's identity everywhere downstream: it keys the detok
     // table, and it rides on EVERY chunk of EVERY decode step. An unbounded
-    // client-supplied rid is therefore a per-step cost, not a one-off. Python's is
-    // a 32-byte uuid hex, so this is generous.
+    // client-supplied rid is therefore a per-step cost, not a one-off.
     // Measured on the CLIENT-facing form: the uniquifier `Rid::from_client` appends
     // is this server's own overhead, and charging the client for bytes it did not
     // send would reject a rid exactly at the documented limit.

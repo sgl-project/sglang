@@ -16,7 +16,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.evict_policy import GDSStrategy
+from sglang.srt.mem_cache.evict_policy import StateCostStrategy
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -50,7 +50,7 @@ from sglang.srt.mem_cache.unified_cache.components.base import (
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     BaseEvictionResult,
 )
-from sglang.srt.runtime_context import get_exec
+from sglang.srt.runtime_context import get_disagg, get_exec
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -78,7 +78,7 @@ class MambaComponent(TreeComponent):
     component_type = ComponentType.MAMBA
     family = TREE_STATE
     # Subclasses that skip this __init__ (MLX auxiliary state) keep the LRU walk.
-    gds: Optional[GDSStrategy] = None
+    state_cost: Optional[StateCostStrategy] = None
 
     def __init__(
         self, cache: UnifiedRadixCache, params: CacheInitParams, slot: TreeSlot
@@ -101,15 +101,16 @@ class MambaComponent(TreeComponent):
         self.mamba_checkpoint_grid = math.lcm(
             slot.checkpoint_interval, params.page_size
         )
-        self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
-        # --radix-eviction-policy gds: None keeps the LRU walk.
-        self.gds = (
-            GDSStrategy(**(params.eviction_policy_config or {}))
-            if params.eviction_policy.lower() == "gds"
+        self.mamba_max_states_per_path = get_exec().mamba.mamba_path_state_cap
+        self.checkpoints_level = get_exec().mamba.hybrid_cache_checkpoints_level
+        # --radix-eviction-policy state_cost: None keeps the LRU walk.
+        self.state_cost = (
+            StateCostStrategy(**(params.eviction_policy_config or {}))
+            if params.eviction_policy.lower() == "state_cost"
             else None
         )
-        self._gds_watermark = 0.0
-        self._gds_heap: list[tuple[float, int, UnifiedTreeNode]] = []
+        self._cost_watermark = 0.0
+        self._cost_heap: list[tuple[float, int, UnifiedTreeNode]] = []
         from sglang.srt.mem_cache.kv_cache_configurator import (
             host_only_mamba_checkpoint,
         )
@@ -174,7 +175,7 @@ class MambaComponent(TreeComponent):
             case LRURefreshPhase.MATCH_END:
                 if node.component_data[ct].value is not None:
                     self.tree_core.lru_lists[ct].reset_node_mru(node)
-                    self._gds_mark_used(node)
+                    self._cost_mark_used(node)
             case LRURefreshPhase.INSERT_END:
                 return
             case _:
@@ -409,7 +410,7 @@ class MambaComponent(TreeComponent):
             self.tree_core.component_evictable_size_[self.component_type] += (
                 self.reclaimable_value_len(node)
             )
-            self._gds_mark_used(node)
+            self._cost_mark_used(node)
             self._emit_excess_path_states_eviction(node, cache_actions)
             return
         if node.component_data[self.component_type].value is None:
@@ -417,13 +418,13 @@ class MambaComponent(TreeComponent):
                 node.id, self.component_type, params.mamba_value
             )
             node.last_access_time = get_and_increase_time_counter()
-            self._gds_mark_used(node)
-            self._gds_forget_gains(node)
+            self._cost_mark_used(node)
+            self._cost_forget_gains(node)
             self._emit_excess_path_states_eviction(node, cache_actions)
             return
         self.tree_core.lru_lists[self.component_type].reset_node_mru(node)
         node.last_access_time = get_and_increase_time_counter()
-        self._gds_mark_used(node)
+        self._cost_mark_used(node)
         result.mamba_exist = True
 
     def _emit_excess_path_states_eviction(
@@ -557,8 +558,8 @@ class MambaComponent(TreeComponent):
     def _evict_device_start(self, request_cnt: int) -> None:
         """Begin the device-eviction walk from this component's LRU cursor."""
         self._evict_device_request_cnt = request_cnt
-        if self.gds is not None:
-            self._gds_begin_walk()
+        if self.state_cost is not None:
+            self._cost_begin_walk()
             self._evict_device_cursor = None
         elif self.tree_core.enable_session_radix_cache:
             lru = self.tree_core.lru_lists[self.component_type]
@@ -584,8 +585,10 @@ class MambaComponent(TreeComponent):
         from the partition sentinel with session refs on, else it restarts at
         the LRU tail.
         """
-        if self.gds is not None:
-            return self._gds_next_node(tracker, device_frees, host_frees, cache_actions)
+        if self.state_cost is not None:
+            return self._cost_next_node(
+                tracker, device_frees, host_frees, cache_actions
+            )
         ct = self.component_type
         lru = self.tree_core.lru_lists[ct]
         enabled = self.tree_core.enable_session_radix_cache
@@ -663,44 +666,44 @@ class MambaComponent(TreeComponent):
 
     def _evict_device_end(self) -> None:
         """Clear the device-eviction walk cursor state."""
-        if self.gds is not None:
-            self._gds_heap = []
+        if self.state_cost is not None:
+            self._cost_heap = []
         elif self.tree_core.enable_session_radix_cache:
             self.tree_core.lru_lists[self.component_type].cursor_end()
         self._evict_device_cursor = None
 
-    def _gds_mark_used(self, node: UnifiedTreeNode) -> None:
+    def _cost_mark_used(self, node: UnifiedTreeNode) -> None:
         """Stamp a state at the watermark: cached, resumed, or released by its
         last request."""
-        if self.gds is not None:
+        if self.state_cost is not None:
             cd = node.component_data[self.component_type]
-            cd.metadata["gds_stamp"] = self._gds_watermark
+            cd.metadata["cost_stamp"] = self._cost_watermark
 
-    def _gds_forget_gains(self, node: UnifiedTreeNode) -> None:
+    def _cost_forget_gains(self, node: UnifiedTreeNode) -> None:
         """Drop the cached gains a state set on ``node`` can make too high: its
         own, which may predate a shallower state, and those of the nearest
         states below it. Their seeds fall to their stamps, a lower bound, so the
         walk recomputes them before trusting the order."""
-        if self.gds is None:
+        if self.state_cost is None:
             return
         ct = self.component_type
-        node.component_data[ct].metadata.pop("gds_gain", None)
+        node.component_data[ct].metadata.pop("cost_gain", None)
         stack = list(node.children.values())
         while stack:
             x = stack.pop()
             cd = x.component_data[ct]
             if cd.value is not None:
-                cd.metadata.pop("gds_gain", None)
+                cd.metadata.pop("cost_gain", None)
             else:
                 stack.extend(x.children.values())
 
-    def _gds_priority(self, node: UnifiedTreeNode) -> float:
+    def _cost_priority(self, node: UnifiedTreeNode) -> float:
         metadata = node.component_data[self.component_type].metadata
-        return metadata.get("gds_stamp", self._gds_watermark) + metadata.get(
-            "gds_gain", 0.0
+        return metadata.get("cost_stamp", self._cost_watermark) + metadata.get(
+            "cost_gain", 0.0
         )
 
-    def _gds_refresh_gain(self, node: UnifiedTreeNode) -> float:
+    def _cost_refresh_gain(self, node: UnifiedTreeNode) -> float:
         """Recompute the prefill to rebuild ``node`` from the nearest shallower
         device state, or from token 0 without one, and return its priority."""
         ct = self.component_type
@@ -715,41 +718,41 @@ class MambaComponent(TreeComponent):
                 gap = depth
         fallback = 0 if gap is None else depth - gap
         metadata = node.component_data[ct].metadata
-        metadata["gds_gain"] = self.gds.restore_cost(fallback, depth)
-        return self._gds_priority(node)
+        metadata["cost_gain"] = self.state_cost.restore_cost(fallback, depth)
+        return self._cost_priority(node)
 
-    def _gds_begin_walk(self) -> None:
+    def _cost_begin_walk(self) -> None:
         """Seed the walk with the last known gains; a popped entry is rechecked,
         since evicting a shallower state during the walk raises its gain."""
         lru = self.tree_core.lru_lists[self.component_type]
         heap = []
         x = lru.get_lru_no_lock()
         while x is not None:
-            heap.append((self._gds_priority(x), x.id, x))
+            heap.append((self._cost_priority(x), x.id, x))
             x = lru.get_prev_no_lock(x)
         heapq.heapify(heap)
-        self._gds_heap = heap
+        self._cost_heap = heap
 
-    def _gds_is_candidate(self, node: UnifiedTreeNode) -> bool:
+    def _cost_is_candidate(self, node: UnifiedTreeNode) -> bool:
         cd = node.component_data[self.component_type]
         lru = self.tree_core.lru_lists[self.component_type]
         return cd.value is not None and cd.lock_ref == 0 and lru.in_list(node)
 
-    def _gds_pop(self) -> Optional[UnifiedTreeNode]:
-        heap = self._gds_heap
+    def _cost_pop(self) -> Optional[UnifiedTreeNode]:
+        heap = self._cost_heap
         while heap:
             priority, node_id, node = heapq.heappop(heap)
-            if not self._gds_is_candidate(node):
+            if not self._cost_is_candidate(node):
                 continue
-            current = self._gds_refresh_gain(node)
+            current = self._cost_refresh_gain(node)
             if current > priority:
                 heapq.heappush(heap, (current, node_id, node))
                 continue
-            self._gds_watermark = max(self._gds_watermark, current)
+            self._cost_watermark = max(self._cost_watermark, current)
             return node
         return None
 
-    def _gds_next_node(
+    def _cost_next_node(
         self,
         tracker: dict[ComponentType, int],
         device_frees: dict[ComponentType, list[torch.Tensor]],
@@ -762,8 +765,8 @@ class MambaComponent(TreeComponent):
         # A resumed backup that found its victim changed re-selects it here.
         x = self._evict_device_cursor
         self._evict_device_cursor = None
-        if x is None or not self._gds_is_candidate(x):
-            x = self._gds_pop()
+        if x is None or not self._cost_is_candidate(x):
+            x = self._cost_pop()
         if x is None:
             return None
         if x in self.tree_core.evictable_device_leaves:
@@ -833,7 +836,7 @@ class MambaComponent(TreeComponent):
         cd.lock_ref -= 1
         if cd.lock_ref == 0:
             if value is not None:
-                self._gds_mark_used(node)
+                self._cost_mark_used(node)
             self.tree_core._update_evictable_leaf_sets(node)
 
     def _try_alloc_mamba_slot(
@@ -865,6 +868,30 @@ class MambaComponent(TreeComponent):
             self.cache.evict_for_alloc(KVDemand(state_slots=1))
             slot = storage.take_state_slots(sub_pool, 1)
         return slot
+
+    def checkpoint_takes_state_slot(self, req: Req) -> bool:
+        """Whether checkpointing the unfinished ``req`` up to its extend end
+        takes a state slot (`prepare_for_caching_req`)."""
+        if self._mamba_host_only_checkpoint():
+            return False
+        token_ids_len = min(len(req.full_untruncated_fill_ids), req.extend_end)
+        if self.cache.enable_mamba_extra_buffer:
+            cache_len = req.kv.mamba_last_track_seqlen
+            if cache_len is None:
+                return False
+        elif self.quantizes_checkpoints:
+            return False
+        else:
+            cache_len = token_ids_len
+        return not self._defers_checkpoint(req, token_ids_len, cache_len)
+
+    def lease_checkpoint_state_slots(self, reqs: Sequence[Req]):
+        """Lease in one take the slots checkpointing ``reqs`` takes one by
+        one (`_try_alloc_mamba_slot`). A count off by a request costs only a
+        slot given back or a take of its own, never a different decision."""
+        storage, sub_pool = self._state()
+        count = sum(1 for req in reqs if self.checkpoint_takes_state_slot(req))
+        return storage.lease_state_slots(sub_pool, count)
 
     def _alloc_mamba_slot(self, req: Optional[Req] = None) -> torch.Tensor:
         """Allocate a slot required for request state or load-back."""
@@ -931,6 +958,26 @@ class MambaComponent(TreeComponent):
             return None
         return previous_cache_len, pool.get_mamba_ping_pong_other_idx(keep_idx)
 
+    def _defers_checkpoint(
+        self, req: Req, token_ids_len: int, checkpoint_len: int
+    ) -> bool:
+        """Below checkpoint level 3 a running request publishes a state only at
+        its branching point or, on a PD prefill worker, once its prompt is complete.
+        A sliding-window tree keeps every chunk: prefill frees window rows only
+        behind a checkpoint the tree takes."""
+        if self.checkpoints_level >= 3 or self.cache.is_swa_enabled:
+            return False
+        # TODO: Publish streaming sessions' first-prompt FULL KV when KV-only
+        # checkpoints are supported. Session handoff bypasses final insertion,
+        # so deferred prompts currently remain private to their session.
+        branching_seqlen = req.mamba_branching_seqlen
+        if branching_seqlen is not None and checkpoint_len == branching_seqlen:
+            return False
+        return not (
+            get_disagg().disaggregation_mode == "prefill"
+            and token_ids_len >= len(req.origin_input_ids)
+        )
+
     def prepare_for_caching_req(
         self,
         req: Req,
@@ -976,6 +1023,9 @@ class MambaComponent(TreeComponent):
             return cache_len
         else:
             if cache_len is None:
+                return 0
+            if self._defers_checkpoint(req, token_ids_len, cache_len):
+                insert_params.mamba_checkpoint_deferred = True
                 return 0
             if self._mamba_host_only_checkpoint():
                 if self.cache.enable_mamba_extra_buffer:
@@ -1067,6 +1117,8 @@ class MambaComponent(TreeComponent):
                 storage, sub_pool = self._state()
                 storage.release_state(sub_pool, req)
         else:
+            if insert_params.mamba_checkpoint_deferred:
+                return
             if insert_params.mamba_value is not None and (
                 insert_result is None or insert_result.mamba_exist
             ):
@@ -1325,8 +1377,8 @@ class MambaComponent(TreeComponent):
                 self.tree_core.set_component_device_value(
                     node.id, ct, transfer.device_indices.clone()
                 )
-                self._gds_mark_used(node)
-                self._gds_forget_gains(node)
+                self._cost_mark_used(node)
+                self._cost_forget_gains(node)
 
         elif phase == CacheTransferPhase.PREFETCH:
             if not transfers:
