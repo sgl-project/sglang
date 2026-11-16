@@ -2250,6 +2250,9 @@ class Envs:
     # With --moe-a2a-backend megamoe, Inkling2 forwards with fewer tokens (all
     # ranks) keep the routed expert kernels instead of DeepGEMM MegaMoE.
     SGLANG_OPT_INKLING2_MEGA_MOE_MIN_TOKENS = EnvInt(64)
+    # Under MegaMoE, prefill computes the MoE input (AttnRes, norm, router) only
+    # for the tokens this rank dispatches.
+    SGLANG_OPT_INKLING2_MEGA_MOE_LOCAL_INPUT = EnvBool(True)
 
     # ===================================================================
     # DSA backend (GLM 5 and DeepSeek V3.2)
