@@ -564,5 +564,188 @@ def test_mla_page_unified_packed_drafts(draft_num):
     assert_rows(range(total_layers), restored=True)
 
 
+# Real host pools to a real backend and back: the unified plan cuts the page
+# block a writer's host pool produced into objects, and a reader with another
+# TP size reassembles its own page blocks from them. This joins what the
+# kernels write with what the key plan names; neither side's own tests do.
+
+
+def _mha_rank_with_draft(reference_k, reference_v, tp_rank, tp_size, head_partition):
+    """One attention-TP rank's device pools, holding its heads of the reference."""
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
+
+    total_heads = reference_k[0].shape[1]
+    local_heads = total_heads // tp_size
+    heads = slice(tp_rank * local_heads, (tp_rank + 1) * local_heads)
+
+    def make_pool(layer_num):
+        return MHATokenToKVPool(
+            size=PAGE_SIZE * 8,
+            page_size=PAGE_SIZE,
+            dtype=torch.bfloat16,
+            head_num=local_heads,
+            head_dim=HEAD_DIM,
+            layer_num=layer_num,
+            device=DEVICE,
+            enable_memory_saver=False,
+            start_layer=0,
+            end_layer=layer_num,
+        )
+
+    pools = [make_pool(LAYERS), make_pool(1)]
+    k_buffers = [pool.k_buffer[i] for pool in pools for i in range(pool.layer_num)]
+    v_buffers = [pool.v_buffer[i] for pool in pools for i in range(pool.layer_num)]
+    for layer in range(LAYERS + 1):
+        k_buffers[layer].copy_(reference_k[layer][:, heads])
+        v_buffers[layer].copy_(reference_v[layer][:, heads])
+    head_group_num = local_heads // head_partition
+    host_pool = _pinned_host_pool(
+        MHATokenToKVPoolHost,
+        pools[0],
+        head_group_num=head_group_num,
+        draft_buffer_infos=[pools[1].get_device_pool_infos()[0].buffer_info],
+        write_back_staging=_prepare_staging(
+            pools[0], head_group_num=head_group_num, layer_num=LAYERS + 1
+        ),
+    )
+    return pools, k_buffers, v_buffers, host_pool
+
+
+def _file_backend_with_draft(host_pool, tp_rank, tp_size, head_partition):
+    from sglang.srt.mem_cache.hicache_key_scheme import (
+        plan_unified_kv,
+        validate_unified_chunk_tiling,
+        with_packed_draft,
+    )
+    from sglang.srt.mem_cache.hicache_storage import (
+        HiCacheFile,
+        HiCacheStorageConfig,
+        PoolName,
+    )
+
+    layout = host_pool.page_unified_layout
+    plan = plan_unified_kv(
+        model_id="test/model",
+        dtype="bfloat16",
+        page_size=PAGE_SIZE,
+        rank_replicated=False,
+        local_kv_heads=host_pool.head_num,
+        attn_tp_rank=tp_rank,
+        attn_tp_size=tp_size,
+        attn_cp_size=1,
+        start_layer=0,
+        end_layer=LAYERS,
+        is_final_stage=True,
+        head_group=head_partition,
+        layer_partition=2,
+    )
+    plan = with_packed_draft(
+        plan,
+        target_layer_num=host_pool.target_layer_num,
+        draft_layer_num=host_pool.layer_num - host_pool.target_layer_num,
+        algorithm="EAGLE",
+        draft_id="bundled",
+        dtype="bfloat16",
+        row_width=layout.head_dim,
+        attn_tp_rank=tp_rank,
+        attn_cp_size=1,
+        is_final_stage=True,
+    )
+    spans = plan.chunk_spans(layout)
+    validate_unified_chunk_tiling(spans, layout.bytes_per_page)
+    backend = HiCacheFile(
+        HiCacheStorageConfig(
+            tp_rank=tp_rank,
+            tp_size=tp_size,
+            pp_rank=0,
+            pp_size=1,
+            attn_cp_rank=0,
+            attn_cp_size=1,
+            is_mla_model=False,
+            enable_storage_metrics=False,
+            is_page_first_layout=False,
+            model_name="test/model",
+            unified_suffixes=plan.suffixes,
+            unified_chunk_spans=spans,
+            extra_config={"max_size": 0, "min_free_space": 0},
+        )
+    )
+    backend.register_mem_pool_host(host_pool)
+    backend.register_mem_host_pool_v2(host_pool, PoolName.KV)
+    return backend, plan
+
+
+@pytest.mark.parametrize("writer_tp_size", [1, 2])
+def test_packed_draft_pages_reach_another_tp_size_through_file_storage(
+    writer_tp_size, tmp_path
+):
+    from sglang.srt.environ import envs
+    from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+
+    head_num, head_partition = 8, 2
+    keys = ["page-a", "page-b", "page-c"]
+    generator = torch.Generator().manual_seed(20261118)
+    shape = (PAGE_SIZE * 8 + PAGE_SIZE, head_num, HEAD_DIM)
+    reference_k = [torch.empty(shape, dtype=torch.bfloat16) for _ in range(LAYERS + 1)]
+    reference_v = [torch.empty(shape, dtype=torch.bfloat16) for _ in range(LAYERS + 1)]
+    for buffer in (*reference_k, *reference_v):
+        buffer.copy_(
+            torch.randint(0, 128, shape, generator=generator, dtype=torch.int32)
+        )
+    # The pages the keys name, on the writers' device, and where the reader
+    # puts them: other device pages, other host pages.
+    writer_pages, reader_pages = [5, 1, 3], [0, 4, 2]
+
+    with envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.override(str(tmp_path)):
+        for tp_rank in range(writer_tp_size):
+            pools, _, _, host_pool = _mha_rank_with_draft(
+                reference_k, reference_v, tp_rank, writer_tp_size, head_partition
+            )
+            host_indices = _page_indices([2, 6, 0], PAGE_SIZE)
+            host_pool.backup_from_device_all_layer(
+                pools[0],
+                host_indices,
+                _page_indices(writer_pages, PAGE_SIZE).to(DEVICE),
+                "kernel",
+            )
+            torch.cuda.synchronize()
+            backend, plan = _file_backend_with_draft(
+                host_pool, tp_rank, writer_tp_size, head_partition
+            )
+            transfer = PoolTransfer(
+                name=PoolName.KV, keys=keys, host_indices=host_indices
+            )
+            assert backend.batch_set_v2([transfer]) == {PoolName.KV: [True] * 3}
+            # Target chunks: 2 layer ranges x the rank's head groups; then one
+            # draft chunk per head group.
+            groups = head_num // writer_tp_size // head_partition
+            assert len(plan.suffixes) == 2 * groups + groups
+            assert all("ukd1-" in suffix for suffix in plan.suffixes[-groups:])
+
+        # A TP1 reader: empty pools, its own cut of the page block.
+        zeros_k = [torch.zeros_like(buffer) for buffer in reference_k]
+        pools, k_buffers, v_buffers, host_pool = _mha_rank_with_draft(
+            zeros_k, zeros_k, 0, 1, head_partition
+        )
+        backend, plan = _file_backend_with_draft(host_pool, 0, 1, head_partition)
+        assert backend.batch_exists_v2(keys).kv_hit_pages == 3
+        host_indices = _page_indices([7, 3, 5], PAGE_SIZE)
+        transfer = PoolTransfer(name=PoolName.KV, keys=keys, host_indices=host_indices)
+        assert backend.batch_get_v2([transfer]) == {PoolName.KV: [True] * 3}
+
+    device_indices = _page_indices(reader_pages, PAGE_SIZE).to(DEVICE)
+    _load_all(host_pool, pools, host_indices.to(DEVICE), device_indices, LAYERS)
+    source = _page_indices(writer_pages, PAGE_SIZE)
+    for layer in range(LAYERS + 1):
+        kind = "draft" if layer == LAYERS else "target"
+        assert torch.equal(
+            k_buffers[layer][device_indices].cpu(), reference_k[layer][source]
+        ), f"K mismatch at {kind} layer {layer}"
+        assert torch.equal(
+            v_buffers[layer][device_indices].cpu(), reference_v[layer][source]
+        ), f"V mismatch at {kind} layer {layer}"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
