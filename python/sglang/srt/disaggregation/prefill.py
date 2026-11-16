@@ -676,7 +676,7 @@ class SchedulerDisaggregationPrefillMixin:
             return
         lazy = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
         for req in batch.reqs:
-            room = getattr(req, "bootstrap_room", None)
+            room = req.bootstrap_room
             if room is not None and room in kv_mgr.transfer_infos:
                 if lazy and req.extend_end is not None:
                     prefetch(room, upto_tokens=req.extend_end)
@@ -1335,8 +1335,7 @@ class SchedulerDisaggregationPrefillMixin:
         for req in self.disagg_prefill_transfer_queue:
             if recv_req.matches(req.rid):
                 logger.debug(f"Abort transfer queue request. {req.rid=}")
-                if hasattr(req.disagg_kv_sender, "abort"):
-                    req.disagg_kv_sender.abort()
+                req.disagg_kv_sender.abort()
 
     @scheduler_stage_method(SCHEDULER_STAGE_PROCESS_QUEUE)
     def process_disagg_prefill_transfer_queue(
