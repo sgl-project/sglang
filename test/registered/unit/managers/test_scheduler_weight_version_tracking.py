@@ -438,15 +438,20 @@ class TestNativeWeightUpdateAgreement(_WeightUpdaterManagerTestBase):
         local_error=False,
         peer_receive_error=False,
         peer_flush_error=False,
-        peer_exception=False,
+        peer_draft_error=False,
+        events=None,
     ):
-        events = []
+        events = [] if events is None else events
         target, draft = _runner(), _runner()
 
         def load(*args, **kwargs):
             events.append("load")
             if local_error:
                 raise ValueError("local loader failed")
+            return True, "ok"
+
+        def draft_load(*args, **kwargs):
+            events.append("draft_load")
             return True, "ok"
 
         for method in (
@@ -456,6 +461,7 @@ class TestNativeWeightUpdateAgreement(_WeightUpdaterManagerTestBase):
             "update_weights_from_ipc",
         ):
             getattr(target.weight_updater, method).side_effect = load
+            getattr(draft.weight_updater, method).side_effect = draft_load
 
         manager = self._manager(target, draft)
 
@@ -473,10 +479,13 @@ class TestNativeWeightUpdateAgreement(_WeightUpdaterManagerTestBase):
             if not failed:
                 if peer_receive_error or (peer_flush_error and "flush" in events):
                     error = "TP rank 1: peer phase failed"
+                elif peer_draft_error:
+                    if "draft_load" in events:
+                        error = "TP rank 1: peer draft failed"
                 elif not peer_flush_error and "load" in events:
                     error = "TP rank 1: peer loader failed"
                 failed = error is not None
-            outputs[:] = [value, (int(peer_exception and error is not None), error)]
+            outputs[:] = [value, (0, error)]
 
         with (
             get_parallel().override(tp_rank=0, tp_size=2),
@@ -507,28 +516,36 @@ class TestNativeWeightUpdateAgreement(_WeightUpdaterManagerTestBase):
                         getattr(draft.weight_updater, method).call_count, 0
                     )
 
-    def test_local_exception_remains_fatal_after_reaching_agreement(self):
-        """Unexpected exceptions must not let a partially updated engine resume."""
+    def test_peer_draft_failure_fails_every_rank_and_preserves_the_version(self):
+        """A draft that loaded here still fails the update when a peer's draft did not,
+        so a mixed engine never records the new version."""
         for route in self._routes:
             with self.subTest(route=route):
                 self.recorded.clear()
-                with self.assertRaisesRegex(
-                    RuntimeError, "local loader failed.*TP rank 1"
-                ):
-                    self._case(route, local_error=True)
+                output, manager, _, events = self._case(route, peer_draft_error=True)
+                self.assertFalse(output.success)
+                self.assertIn("TP rank 1", output.message)
                 self.assertEqual(self.recorded, [])
+                self.assertFalse(manager._session.loaded_weights)
+                self.assertEqual(events.count("draft_load"), 1)
+                self.assertEqual(events.count("flush"), 1)
 
-    def test_peer_exception_is_fatal_on_the_healthy_rank_too(self):
-        """Healthy ranks must not continue into draft loading after a peer raised."""
+    def test_local_exception_terminates_without_entering_the_agreement(self):
+        """A rank whose loader raised must not wait in the agreement gather: a healthy
+        peer can sit in graph capture's TP barrier, so the gather would hold the
+        scheduler's termination until a collective timeout."""
         for route in self._routes:
             with self.subTest(route=route):
                 self.recorded.clear()
-                with self.assertRaisesRegex(RuntimeError, "TP rank 1"):
-                    self._case(route, peer_exception=True)
+                events = []
+                with self.assertRaisesRegex(ValueError, "local loader failed"):
+                    self._case(route, local_error=True, events=events)
+                self.assertNotIn("agree", events[events.index("load") :])
                 self.assertEqual(self.recorded, [])
 
-    def test_deserialization_exception_is_fatal_before_loading(self):
-        """Tensor intake exceptions must not become a resumable partial update."""
+    def test_deserialization_exception_terminates_without_entering_the_agreement(self):
+        """A rank whose tensor intake raised must exit at once rather than wait in the
+        agreement gather, and must not start loading or record a version."""
         for tp_size in (1, 2):
             with self.subTest(tp_size=tp_size):
                 target = _runner()
@@ -538,19 +555,11 @@ class TestNativeWeightUpdateAgreement(_WeightUpdaterManagerTestBase):
                 )
                 with (
                     get_parallel().override(tp_rank=0, tp_size=tp_size),
-                    patch(
-                        "torch.distributed.all_gather_object",
-                        side_effect=lambda outputs, value, group: outputs.__setitem__(
-                            slice(None), [value, (1, "TP rank 1: peer intake failed")]
-                        ),
-                    ),
-                    self.assertRaisesRegex(
-                        (ValueError, RuntimeError),
-                        "invalid tensor payload"
-                        + (".*TP rank 1" if tp_size > 1 else ""),
-                    ),
+                    patch("torch.distributed.all_gather_object") as gather,
+                    self.assertRaisesRegex(ValueError, "invalid tensor payload"),
                 ):
                     manager.update_weights_from_tensor(_request())
+                gather.assert_not_called()
                 target.weight_updater.update_weights_from_tensor.assert_not_called()
                 self.assertEqual(self.recorded, [])
 

@@ -169,36 +169,27 @@ class SchedulerWeightUpdaterManager:
     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
         self.scheduler.record_weight_version_change(new_version=weight_version)
 
-    def _agree_native_update(
-        self, success: bool, message: str, *, fatal: bool = False
-    ) -> Tuple[bool, str]:
+    def _agree_native_update(self, success: bool, message: str) -> Tuple[bool, str]:
         parallel = get_parallel()
         if parallel.tp_size == 1:
-            if fatal:
-                raise RuntimeError(message)
             return success, message
-        agreed, error, fatal_flags = self._agree_across_tp_ranks(
+        agreed, error, _ = self._agree_across_tp_ranks(
             error=None if success else f"TP rank {parallel.tp_rank}: {message}",
-            # Reuse the gather's per-rank integer metadata for the fatal flag.
-            count=int(fatal),
+            count=0,
         )
-        if any(fatal_flags):
-            raise RuntimeError(error)
         return (True, message) if agreed else (False, error)
 
     def _run_native_update(
         self, update: Callable[[], Tuple[bool, str]]
     ) -> Tuple[bool, str]:
-        fatal = False
+        # An unexpected exception propagates at once to the scheduler's termination path:
+        # a peer may be in a collective (graph capture) that a gather here would not join.
         try:
             success, message = update()
-        except Exception as error:
+        except Exception:
             logger.exception("Native weight update failed on this TP rank")
-            success, message = False, str(error)
-            fatal = True
-        # Unexpected exceptions still terminate the scheduler: a partially
-        # mutated model must not become a recoverable refusal to update.
-        return self._agree_native_update(success, message, fatal=fatal)
+            raise
+        return self._agree_native_update(success, message)
 
     def _update_native_runners(
         self,
@@ -341,16 +332,14 @@ class SchedulerWeightUpdaterManager:
             )
         with self._observe_weight_load("tensor"):
             self.scheduler.wait_for_launched_forward()
-            fatal = False
             try:
                 named_tensors = self.tp_worker.deserialize_own_rank(
                     recv_req.serialized_named_tensors
                 )
-                success, message = True, "Success"
-            except Exception as error:
-                success, message = False, f"Failed to deserialize weights: {error}"
-                fatal = True
-            success, message = self._agree_native_update(success, message, fatal=fatal)
+            except Exception:
+                logger.exception("Failed to deserialize weights on this TP rank")
+                raise
+            success, message = self._agree_native_update(True, "Success")
             if success:
                 success, message = self._update_native_runners(
                     recv_req,
