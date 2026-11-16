@@ -927,8 +927,8 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
 
         if x.dim() == 3:
             three_d = True
-            x = x.view(-1, x.shape[-1])
             output_shape = [*x.shape[:-1], layer.weight.shape[0]]
+            x = x.view(-1, x.shape[-1])
 
         # use_fused_quant_gemm = true, x_q is a bf16/fp16 num
         # x_s is not None = true, x_q is uint8 num
