@@ -9,11 +9,13 @@ import contextlib
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.eplb import expert_distribution
 from sglang.srt.eplb.expert_distribution import (
+    ExpertDistributionRecorder,
     _ExpertDistributionRecorderNoop,
     _ExpertDistributionRecorderReal,
     _SelectExpertsSinglePassGatherer,
@@ -46,6 +48,20 @@ def _model_runner_forward_node(source: str) -> ast.FunctionDef:
                 if isinstance(item, ast.FunctionDef) and item.name == "forward":
                     return item
     raise AssertionError("ModelRunner.forward not found")
+
+
+class TestRecorderWithoutExpertLocation(CustomTestCase):
+    def test_error_names_the_model_hook(self):
+        """Recording on a model without expert location metadata fails with the
+        hint that names the model hook to implement."""
+        exec_config = SimpleNamespace(
+            moe=SimpleNamespace(expert_distribution_recorder_mode="stat")
+        )
+        with patch.object(expert_distribution, "get_exec", return_value=exec_config):
+            with self.assertRaisesRegex(
+                AssertionError, "get_model_config_for_expert_location"
+            ):
+                ExpertDistributionRecorder.init_new(None, rank=0)
 
 
 class TestDisabledForwardPass(CustomTestCase):

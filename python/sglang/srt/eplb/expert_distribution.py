@@ -142,10 +142,10 @@ class ExpertDistributionRecorder(ABC):
     ):
         if get_exec().moe.expert_distribution_recorder_mode is not None:
             assert expert_location_metadata is not None, (
-                "ExpertLocationMetadata is required for expert distribution recording. One possible"
+                "ExpertLocationMetadata is required for expert distribution recording. One possible "
+                "reason is that you are using a model that does not support expert distribution "
+                "recording. Try setting `get_model_config_for_expert_location` in your model."
             )
-            "reason is that you are using a model that does not support expert distribution"
-            "recording. Try setting `get_model_config_for_expert_location` in your model."
             return _ExpertDistributionRecorderReal(expert_location_metadata, rank)
         else:
             return _ExpertDistributionRecorderNoop()
