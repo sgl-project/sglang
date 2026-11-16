@@ -196,12 +196,14 @@ done
 #   <your decode ip>: decode node IP address
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://<your prefill ip1>:8000 8998 \
-    --prefill http://<your prefill ip2>:8000 8999 \
-    --prefill http://<your prefill ip3>:8000 9000 \
-    --decode http://<your decode ip>:8001 \
+sgl-router \
+    --model-id glm-5 \
+    --no-tokenizer \
+    --worker-urls \
+        http://<your prefill ip1>:8000 \
+        http://<your prefill ip2>:8000 \
+        http://<your prefill ip3>:8000 \
+        http://<your decode ip>:8001 \
     --host 127.0.0.1 \
     --port 6688 \
     --policy round_robin
