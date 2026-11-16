@@ -1,5 +1,8 @@
+import ast
 import contextlib
+import inspect
 import sys
+import textwrap
 import types
 import unittest
 from types import SimpleNamespace
@@ -221,6 +224,54 @@ class TestOOTSpecGraphRunnerSelection(CustomTestCase):
         self.assertIs(
             worker.cuda_graph_runner_for_draft_extend,
             runners["draft_extend"].return_value,
+        )
+
+    def test_flashmla_graph_support_is_cuda_scoped_not_prefill_config_scoped(self):
+        tree = ast.parse(
+            textwrap.dedent(
+                inspect.getsource(eagle_worker_v2.EagleDraftWorker._capture_cuda_graphs)
+            )
+        )
+        cuda = next(
+            n
+            for n in ast.walk(tree)
+            if isinstance(n, ast.If)
+            and ast.unparse(n.test) == "_is_cuda"
+            and any(
+                isinstance(c, ast.ImportFrom)
+                and c.module == "sglang.srt.layers.attention.flashmla_backend"
+                for c in n.body
+            )
+        )
+        code = compile(
+            ast.Module(body=[cuda], type_ignores=[]), "<cuda-graph-backends>", "exec"
+        )
+        modules = {}
+        for backend in ("flashattention", "flashmla"):
+            name = "sglang.srt.layers.attention." + backend + "_backend"
+            module = types.ModuleType(name)
+            cls = (
+                "FlashAttentionBackend"
+                if backend == "flashattention"
+                else "FlashMLABackend"
+            )
+            setattr(module, cls, type(cls, (), {}))
+            modules[name] = module
+        scope = dict(_is_cuda=False, graph_supported_backend_types=[])
+        with patch.dict(sys.modules, {name: None for name in modules}):
+            exec(code, scope)
+        self.assertEqual(scope["graph_supported_backend_types"], [])
+        scope["_is_cuda"] = True
+        with patch.dict(sys.modules, modules):
+            exec(code, scope)
+        self.assertEqual(
+            scope["graph_supported_backend_types"],
+            [
+                modules[
+                    "sglang.srt.layers.attention.flashattention_backend"
+                ].FlashAttentionBackend,
+                modules["sglang.srt.layers.attention.flashmla_backend"].FlashMLABackend,
+            ],
         )
 
 

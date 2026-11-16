@@ -7,6 +7,7 @@ from torch.nn.parameter import Parameter
 
 from sglang.srt.hardware_backend.npu.utils import NPUACLFormat, npu_format_cast
 from sglang.srt.layers.quantization.base_config import LinearMethodBase
+from sglang.srt.layers.quantization.npu_mxfp4_utils import MXFP4_BLOCK_SIZE
 
 if TYPE_CHECKING:
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -26,8 +27,16 @@ from sglang.srt.hardware_backend.npu.quantization.linear_utils import (
 logger = logging.getLogger(__name__)
 
 MXFP8_BLOCK_SIZE = 32
-# W4A8_MXFP block (group) size — fixed at 32 by the msmodelslim export format.
-MXFP4_BLOCK_SIZE = 32
+
+
+def _prepare_mxfp4_w4a8_bias(
+    bias: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    """A8W4 matmul requires BF16 bias with shape [1, N]."""
+    if bias is None:
+        return None
+    bias = bias.to(torch.bfloat16)
+    return bias.unsqueeze(0) if bias.ndim == 1 else bias
 
 
 class _NPULinearMethodBase(LinearMethodBase):
@@ -266,10 +275,10 @@ def npu_w8a8_mxfp8_linear(
     input_scale: Optional[torch.Tensor] = None,
     bias: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    """Block-FP8 linear on Atlas A5, used as the ``w8a8_block_fp8_linear``
+    """Block-FP8 linear on Ascend 950, used as the ``w8a8_block_fp8_linear``
     backend on NPU (see ``fp8_utils._dispatch_auto_backend``).
 
-    The loading path requantizes block-FP8 weights into the A5 MXFP8 layout;
+    The loading path requantizes block-FP8 weights into the Ascend 950 MXFP8 layout;
     activations are quantized per call. ``block_size`` is retained for the shared
     block-FP8 backend interface and ``input_scale`` is unused because activation
     scales are always dynamic here.
@@ -346,28 +355,9 @@ class NPU_W4A4DynamicLinearMethod(_NPULinearMethodBase):
 
 
 class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
-    """NPU W4A8 online quantization: MXFP4 weights + MXFP8 activations.
+    """Quantize complete FP16/BF16 Linear weights to MXFP4 during loading.
 
-    This is a *true* W4(weight) A8(activation) path: it mirrors the offline
-    ``W4A8_MXFP`` kernel (``NPUMXFP4W4A8OfflineLinearMethod``) exactly — the only
-    difference is that the FP4 weights are produced online from BF16/FP16
-    (round-to-nearest, no calibration) instead of being loaded from a msmodelslim
-    checkpoint. An earlier version of this method ran a *dual-level* scheme that
-    also compressed the activation to FP4 (W4A4 compute via
-    ``npu_dual_level_quant_matmul``); that was a large accuracy regression — 4-bit
-    activations — so it was replaced with the single-level FP8-activation path
-    below, aligned with the offline W4A8 implementation.
-
-    Weight quantization (process_weights_after_loading):
-        BF16/FP16 weight → npu_dynamic_mx_quant(dst=float4_e2m1fn_x2) → packed FP4
-        + UE8M0 block scale → npu_format_cast to FRACTAL_NZ → transpose [in//2, out]
-
-    Inference (apply):
-        BF16/FP16 activation → npu_dynamic_mx_quant(dst=float8_e4m3fn)  (A8, FP8)
-        → npu_quant_matmul(x2_dtype=float4_e2m1fn_x2, group_sizes=[0, 0, block])
-
-    Hardware: A5 NPU + a recent torch_npu with the FP4 npu_quant_matmul
-    (same requirement as the offline W4A8 path — see that class's docstring).
+    Inference uses the offline packed-weight layout with dynamic MXFP8 inputs.
     """
 
     def create_weights(
@@ -380,24 +370,32 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
-        """Register an unquantized (``params_dtype``) weight placeholder.
-
-        Online quantization needs its own ``create_weights`` because the
-        checkpoint still holds full-precision BF16/FP16 weights: the loader
-        fills this buffer, then ``process_weights_after_loading`` quantizes it to
-        MXFP4 in place. This differs from the offline/int8 methods, whose weights
-        are created by the scheme's own ``create_weights`` to match the
-        already-quantized (FP8 / uint8-packed) layout the checkpoint provides.
-        """
-        create_unquantized_linear_weight(
-            layer,
-            input_size_per_partition,
-            output_partition_sizes,
-            params_dtype,
-            **extra_weight_attrs,
+        """Allocate lazily and convert as soon as the logical weight is loaded."""
+        from sglang.srt.hardware_backend.npu.quantization.online_weight_loader import (
+            NPUOnlineDenseWeightLoader,
         )
 
+        loader = NPUOnlineDenseWeightLoader(
+            layer,
+            params_dtype,
+            extra_weight_attrs.get("weight_loader"),
+            lambda: self._quantize_weights(layer),
+        )
+        with torch.device("meta"):
+            create_unquantized_linear_weight(
+                layer,
+                input_size_per_partition,
+                output_partition_sizes,
+                params_dtype,
+                **{**extra_weight_attrs, "weight_loader": loader.weight_loader},
+            )
+        loader.register_source(layer.weight)
+        layer._npu_online_dense_loader = loader
+
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        layer._npu_online_dense_loader.finish_post_load()
+
+    def _quantize_weights(self, layer: torch.nn.Module) -> None:
         # Online single-level MXFP4 weight quant, then lay the weight out exactly
         # like the offline W4A8 path so the same npu_quant_matmul(x2_dtype=fp4)
         # kernel accepts it. All NPU ops go through torch.ops.npu.* (no torch_npu).
@@ -414,7 +412,11 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
         # npu_dynamic_mx_quant returns the scale as [out, in//64, 2] (3D); older
         # builds may return [out, in//32] (2D) — handle both before the transpose.
         qw, w_scale = torch.ops.npu.npu_dynamic_mx_quant(
-            weight_fp, dst_type=fp4_dtype, round_mode="round"
+            weight_fp,
+            dst_type=fp4_dtype,
+            round_mode="rint",
+            scale_alg=2,
+            dst_type_max=7.25,
         )
 
         # weight: packed FP4 -> FRACTAL_NZ (float8_e4m3fn view) -> transpose
@@ -433,9 +435,6 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
             n, k = w_scale.shape
             w_scale = w_scale.reshape(n, k // 2, 2)
         layer.weight_scale = Parameter(w_scale.transpose(-3, -2), requires_grad=False)
-
-        # Cache FP32 bias once to avoid a per-forward dtype conversion + alloc.
-        cache_linear_bias_fp32(layer)
 
     def apply(
         self,
@@ -460,9 +459,7 @@ class NPUMXFP4W4A8LinearMethod(_NPULinearMethodBase):
             x_2d, dst_type=torch.float8_e4m3fn
         )
 
-        # Use the cached FP32 bias from process_weights_after_loading; fall back
-        # to per-call conversion if the cache was bypassed (e.g. dynamic bias).
-        quant_bias = get_linear_bias_fp32(layer, bias)
+        quant_bias = _prepare_mxfp4_w4a8_bias(bias)
 
         # True W4(weight)A8(activation) matmul, identical to the offline path.
         output = torch.ops.npu.npu_quant_matmul(
@@ -506,7 +503,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
     scale-layout normalization.
 
     ⚠️ REQUIRES a recent torch_npu build for the FP4 ``npu_quant_matmul``. On the
-    A5 this device forces ``allow_internal_format=False`` (the NZ cast still produces
+    Ascend 950 this device forces ``allow_internal_format=False`` (the NZ cast still produces
     a ``FRACTAL_NZ_C0_16`` tensor, which is fine). Older torch_npu (e.g.
     ``2.10.0.dev20260320``) had a broken FP4 matmul that rejected the NZ weight in
     *prefill* with ``x2 should be in ... nz format, but it is 2``;
@@ -574,8 +571,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
             x_2d, dst_type=torch.float8_e4m3fn
         )
 
-        if bias is not None and bias.dtype != torch.float32:
-            bias = bias.to(torch.float32)
+        quant_bias = _prepare_mxfp4_w4a8_bias(bias)
 
         # W4(weight)A8(activation) matmul.
         output = torch.ops.npu.npu_quant_matmul(
@@ -585,7 +581,7 @@ class NPUMXFP4W4A8OfflineLinearMethod(_NPULinearMethodBase):
             scale_dtype=e8m0_dtype,
             pertoken_scale=dynamic_scale,
             pertoken_scale_dtype=e8m0_dtype,
-            bias=bias,
+            bias=quant_bias,
             output_dtype=original_dtype,
             x2_dtype=fp4_dtype,
             group_sizes=[0, 0, MXFP4_BLOCK_SIZE],
@@ -613,7 +609,7 @@ class NPUSingleLevelMXFP4LinearMethod(_NPULinearMethodBase):
         → npu_quant_matmul(x1_dtype = x2_dtype = float4_e2m1fn_x2,
                            group_sizes=[1, 1, MXFP4_BLOCK_SIZE])
 
-    Triggered by ``--quantization mxfp4`` on NPU. Hardware: A5 NPU with a recent
+    Triggered by ``--quantization mxfp4`` on NPU. Hardware: Ascend 950 NPU with a recent
     torch_npu exposing ``float4_e2m1fn_x2``.
     """
 
@@ -774,7 +770,7 @@ class NPUDualLevelMXFP4LinearMethod(NPUSingleLevelMXFP4LinearMethod):
         BF16/FP16 activation → npu_dynamic_dual_level_mx_quant  (A4, dual-level)
         → npu_dual_level_quant_matmul(act, weight, act_l0, w_l0, act_l1, w_l1)
 
-    Reference: Diffusion ``NPUMXFP4DiffusionLinearMethod``. Hardware: A5 NPU
+    Reference: Diffusion ``NPUMXFP4DiffusionLinearMethod``. Hardware: Ascend 950 NPU
     only — the ``DualLevelQuantBatchMatmul`` op is unavailable on A2/A3.
     """
 

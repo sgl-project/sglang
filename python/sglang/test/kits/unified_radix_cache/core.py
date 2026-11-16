@@ -5,26 +5,23 @@ from sglang.srt.managers.schedule_batch import (
     Req,
 )
 from sglang.srt.mem_cache.base_prefix_cache import (
-    EvictParams,
     InsertParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import acquire_rows
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    ComponentType,
-    EvictLayer,
-    TreeComponent,
-)
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import EvictLayer, TreeComponent
 from sglang.srt.mem_cache.unified_cache.components.full import FullComponent
-from sglang.srt.mem_cache.unified_radix_cache import (
-    COMPONENT_REGISTRY,
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
     UnifiedLRUList,
     UnifiedTreeNode,
 )
+from sglang.srt.mem_cache.unified_radix_cache import COMPONENT_REGISTRY
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
@@ -184,7 +181,7 @@ class UnifiedRadixAllocationEvictionRealComponentsFixtures:
     def _evict_for_alloc_after_first_drain(self, cache, component_type):
         capacity = {"available": 0}
         auxiliary_drains = {"count": 0}
-        real_available_size = cache._component_available_size
+        real_available_size = cache._pool_available
         real_free_values = cache._free_values
 
         def available_size(requested_type):
@@ -200,14 +197,16 @@ class UnifiedRadixAllocationEvictionRealComponentsFixtures:
                 capacity["available"] = self._SHORTFALL
 
         params = (
-            EvictParams(swa_num_tokens=self._SHORTFALL)
+            KVDemand(
+                window_tokens={
+                    cache.window_sub_pool_of_slot(component_type): self._SHORTFALL
+                }
+            )
             if component_type is ComponentType.SWA
-            else EvictParams(mamba_num=self._SHORTFALL)
+            else KVDemand(state_slots=self._SHORTFALL)
         )
         with (
-            mock.patch.object(
-                cache, "_component_available_size", side_effect=available_size
-            ),
+            mock.patch.object(cache, "_pool_available", side_effect=available_size),
             mock.patch.object(cache, "_free_values", side_effect=free_values),
         ):
             result = cache.evict_for_alloc(params)

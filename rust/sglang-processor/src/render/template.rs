@@ -74,7 +74,9 @@ impl ChatFormatter {
             self,
             ChatFormatter::HuggingFace { .. }
                 | ChatFormatter::Glm53(_)
+                | ChatFormatter::MiniMaxM3 { .. }
                 | ChatFormatter::Qwen38 { .. }
+                | ChatFormatter::Step3p5 { .. }
         );
         let request = TemplateArgsRequest {
             request,
@@ -105,16 +107,21 @@ fn jinja_tools(body: &Value) -> Option<Value> {
 }
 
 /// `Tool.model_dump()`, after `_validate_request` normalizes the schema types.
+/// `Tool._serialize` drops an unset `defer_loading`, null included.
 fn tool_model_dump(tool: &Value) -> Option<Value> {
     let defer = match &tool["defer_loading"] {
-        Value::Null => Value::Null,
-        defer => pydantic_bool(defer).ok()?.into(),
+        Value::Null => None,
+        defer => Some(pydantic_bool(defer).ok()?),
     };
     let kind = tool
         .get("type")
         .cloned()
         .unwrap_or_else(|| "function".into());
-    Some(json!({"type": kind, "function": function_dump(tool).ok()?, "defer_loading": defer}))
+    let mut dump = json!({"type": kind, "function": function_dump(tool).ok()?});
+    if let Some(defer) = defer {
+        dump["defer_loading"] = defer.into();
+    }
+    Some(dump)
 }
 
 /// [`split_continuation`] over the request's messages when the last is an
@@ -215,10 +222,16 @@ mod tests {
     #[test]
     fn jinja_template_sees_dumped_tools() {
         let formatter = jinja("{{ tools | tojson }}");
-        let tool = json!({"type": "function", "function": {"name": "f", "parameters": {}}});
-        let body = json!({"messages": [{"role": "user", "content": "Hi"}], "tools": [tool]});
-        let dumped = r#"[{"type": "function", "function": {"name": "f", "parameters": {}, "description": null}, "defer_loading": null}]"#;
-        assert_eq!(render(&formatter, body, &HashMap::new()).0, dumped);
+        // An unset tool-level `defer_loading`, sent as null or not at all, is left out.
+        let dumped = r#"[{"type": "function", "function": {"name": "f", "parameters": {}, "description": null}}]"#;
+        for tool in [
+            json!({"type": "function", "function": {"name": "f", "parameters": {}}}),
+            json!({"type": "function", "defer_loading": null,
+                "function": {"name": "f", "parameters": {}}}),
+        ] {
+            let body = json!({"messages": [{"role": "user", "content": "Hi"}], "tools": [tool]});
+            assert_eq!(render(&formatter, body, &HashMap::new()).0, dumped);
+        }
         // A set `strict` stays where the client put it; a tool-level flag propagates.
         let tool = json!({"type": "function", "defer_loading": true,
             "function": {"strict": true, "name": "f", "description": "d"}});

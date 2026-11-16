@@ -1,10 +1,10 @@
 ---
 title: Autoregressive Model Benchmark Documentation
 metatags:
-    description: "Benchmark LLM and VLM serving throughput and latency with sglang.bench_serving - supports SGLang, vLLM, and multiple datasets."
+    description: "Benchmark LLM and VLM serving throughput and latency with sglang.benchmark.serving - supports SGLang, vLLM, and multiple datasets."
 ---
 
-`sglang.bench_serving` is a command-line tool designed to benchmark the online serving throughput and latency of Large Language Models (LLMs) and Vision Language Models(VLMs). It supports various backends (`SGLang`, `vLLM`, etc.) and offers flexible configurations for request rates, dataset types, and profiling.
+`sglang.benchmark.serving` is a command-line tool designed to benchmark the online serving throughput and latency of Large Language Models (LLMs) and Vision Language Models(VLMs). It supports various backends (`SGLang`, `vLLM`, etc.) and offers flexible configurations for request rates, dataset types, and profiling.
 
 ## 1. Quick Start
 
@@ -13,7 +13,7 @@ metatags:
 Run a benchmark using randomly generated prompts with a local SGLang server.
 
 ```bash Command
-python -m sglang.bench_serving --backend sglang --port 30000 --dataset-name random --num-prompts 100
+python -m sglang.benchmark.serving --backend sglang --port 30000 --dataset-name random --num-prompts 100
 ```
 
 ### Real-World Data (ShareGPT)
@@ -21,7 +21,7 @@ python -m sglang.bench_serving --backend sglang --port 30000 --dataset-name rand
 Run a benchmark using the ShareGPT dataset with a specific request rate.
 
 ```shell Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --dataset-name sharegpt \
   --dataset-path ./ShareGPT_V3_unfiltered_cleaned_split.json \

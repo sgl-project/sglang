@@ -54,11 +54,12 @@ def _make_eagle_draft_runner(
     runner.raw_bs = raw_bs
     runner.bs = bs
     runner.model_runner = SimpleNamespace(
+        kv_cache_configurator=SimpleNamespace(modelslim_cache_layout=None),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(
                 architectures=architectures, index_topk=index_topk
             )
-        )
+        ),
     )
     return runner
 
@@ -72,6 +73,7 @@ def _make_decode_runner(raw_bs=2, bs=2):
     runner.bs = bs
     runner.captured_req_width = 1
     runner.model_runner = SimpleNamespace(
+        kv_cache_configurator=SimpleNamespace(modelslim_cache_layout=None),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["Qwen3ForCausalLM"])
         ),

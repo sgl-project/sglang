@@ -34,7 +34,7 @@ from sglang.srt.layers.attention.aiter_utils import (
     get_recommended_splits,
     pa_decode_gluon,
 )
-from sglang.srt.utils.common import async_h2d
+from sglang.srt.utils.device import async_h2d
 
 try:
     from . import gluon_prefill_pair_gfx950

@@ -87,6 +87,15 @@ register_kernel(
     )
 )
 
+register_kernel(
+    KernelSpec(
+        op="layernorm.mhc_post_combine_norm_decode",
+        backend=KernelBackend.JIT,
+        target="sglang.kernels.ops.layernorm.mhc_post_combine_norm_decode:mhc_post_combine_norm_decode",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(10, 0))}),
+    )
+)
+
 # Muse Spark and Beam fused norms. The per-layer ops are inventoried through
 # their class methods; the NVFP4 quant op through its module-level instance.
 for _op, _target, _backends in (
@@ -122,3 +131,14 @@ for _op, _target, _backends in (
             )
         )
 del _op, _target, _backends, _bk
+
+register_kernel(
+    KernelSpec(
+        op="layernorm.fused_kda_output_quant",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.layernorm.fused_kda_output_quant:fused_kda_output_quant",
+        capabilities=frozenset(
+            {CapabilityRequirement.cuda(min_sm=(9, 0), max_sm=(9, 0))}
+        ),
+    )
+)

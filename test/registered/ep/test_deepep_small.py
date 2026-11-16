@@ -1,4 +1,3 @@
-import os
 import unittest
 from types import SimpleNamespace
 
@@ -132,10 +131,6 @@ class TestTBO(CustomTestCase):
                 "--max-running-requests",
                 "512",
             ],
-            env={
-                **os.environ,
-                "SGLANG_TBO_DEBUG": "1",
-            },
         )
 
     @classmethod
@@ -194,10 +189,6 @@ class TestMTPWithTBO(CustomTestCase):
                 "--max-running-requests",
                 "128",
             ],
-            env={
-                **os.environ,
-                "SGLANG_TBO_DEBUG": "1",
-            },
         )
 
     @classmethod

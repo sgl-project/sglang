@@ -506,7 +506,9 @@ class TestLinearParallelGroups(CustomTestCase):
                                         allocator.assert_called_once_with(attn)
                                     else:
                                         allocator.assert_called_once_with(
-                                            tp, disabled=not symmetric
+                                            tp,
+                                            disabled=group == "replicated"
+                                            or not symmetric,
                                         )
                                     self.assertEqual(rank_size(layer), (rank, size))
 
@@ -582,7 +584,9 @@ class TestLinearParallelGroups(CustomTestCase):
                         ) as allocator,
                     ):
                         torch.testing.assert_close(mlp(self.x), expected)
-                        allocator.assert_called_once_with(tp, disabled=False)
+                        allocator.assert_called_once_with(
+                            tp, disabled=group == "replicated"
+                        )
                     if reduces:
                         tp.all_reduce.assert_called_once()
                     else:

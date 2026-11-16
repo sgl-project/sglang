@@ -5,8 +5,9 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+import torch
 
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.entrypoints import diffusion_generator as dg
 from sglang.multimodal_gen.runtime.scheduler_client import SchedulerClient
 from sglang.multimodal_gen.runtime.utils.device_errors import (
@@ -24,11 +25,15 @@ _DEVICE_ERROR = "CUDA error: an illegal memory access was encountered"
         "CUDA error: device-side assert triggered",
         "CUDA error: misaligned address",
         "CUDA error: unspecified launch failure",
+        "CUDA error: invalid argument",
+        "HIP error: invalid device function",
         "CUDA driver error: device not ready",
-        "INTERNAL ASSERT FAILED at CUDACachingAllocator.cpp:467",
+        '!handles_.at(i) INTERNAL ASSERT FAILED at "/__w/pytorch/pytorch/c10/cuda/'
+        'CUDACachingAllocator.cpp":467, please report a bug to PyTorch.',
     ],
 )
 def test_classifies_device_errors_and_wrapped_causes(message):
+    """The worker exits and the client stops reusing the generator on the same set."""
     assert is_unrecoverable_device_error(message)
     error = ValueError("request failed")
     error.__cause__ = RuntimeError(message)
@@ -38,12 +43,21 @@ def test_classifies_device_errors_and_wrapped_causes(message):
     assert is_unrecoverable_device_error(error)
 
 
+def test_accelerator_errors_are_unrecoverable():
+    assert is_unrecoverable_device_error(torch.AcceleratorError("device lost"))
+
+
 @pytest.mark.parametrize(
-    "message",
-    ["CUDA out of memory", "CUDA error: out of memory", "invalid input image"],
+    "error",
+    [
+        RuntimeError("CUDA out of memory"),
+        RuntimeError("CUDA error: out of memory"),
+        torch.OutOfMemoryError("CUDA out of memory. Tried to allocate 2.00 GiB"),
+        RuntimeError("invalid input image"),
+        ValueError("height must be divisible by 16"),
+    ],
 )
-def test_request_errors_are_recoverable(message):
-    error = RuntimeError(message)
+def test_request_errors_are_recoverable(error):
     error.__context__ = error
     assert not is_unrecoverable_device_error(error)
 

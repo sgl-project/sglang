@@ -32,7 +32,9 @@ def _make_args(*, page_size=1, track_interval=2):
     ]
 
 
-class TestQwen3NextLazyExtraBufferAllocFail(KLDivergenceMixin, DefaultServerBase):
+# The pool is reported full, so each boundary evicts cached states before allocating.
+# Eviction may lower cache hits, hence SKIP_CACHE_HIT_ASSERT.
+class TestQwen3NextLazyExtraBufferPoolFull(KLDivergenceMixin, DefaultServerBase):
     model = QWEN3_NEXT_MODEL
     cache_chunk_size = 64
     kl_div_thres = 0.002
@@ -40,18 +42,19 @@ class TestQwen3NextLazyExtraBufferAllocFail(KLDivergenceMixin, DefaultServerBase
 
     @classmethod
     def setUpClass(cls):
-        os.environ["SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL"] = "1"
+        os.environ["SGLANG_TEST_MAMBA_LAZY_POOL_FULL"] = "1"
         os.environ["SGLANG_TEST_SKIP_CACHE_HIT_ASSERT"] = "1"
         super().setUpClass()
 
     @classmethod
     def tearDownClass(cls):
         super().tearDownClass()
-        os.environ.pop("SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL", None)
+        os.environ.pop("SGLANG_TEST_MAMBA_LAZY_POOL_FULL", None)
         os.environ.pop("SGLANG_TEST_SKIP_CACHE_HIT_ASSERT", None)
 
 
-class TestQwen3NextLazyExtraBufferLargePageAllocFail(
+# Same as above with page_size=2.
+class TestQwen3NextLazyExtraBufferLargePagePoolFull(
     KLDivergenceMixin, DefaultServerBase
 ):
     model = QWEN3_NEXT_MODEL
@@ -61,14 +64,14 @@ class TestQwen3NextLazyExtraBufferLargePageAllocFail(
 
     @classmethod
     def setUpClass(cls):
-        os.environ["SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL"] = "1"
+        os.environ["SGLANG_TEST_MAMBA_LAZY_POOL_FULL"] = "1"
         os.environ["SGLANG_TEST_SKIP_CACHE_HIT_ASSERT"] = "1"
         super().setUpClass()
 
     @classmethod
     def tearDownClass(cls):
         super().tearDownClass()
-        os.environ.pop("SGLANG_TEST_MAMBA_LAZY_ALLOC_FAIL", None)
+        os.environ.pop("SGLANG_TEST_MAMBA_LAZY_POOL_FULL", None)
         os.environ.pop("SGLANG_TEST_SKIP_CACHE_HIT_ASSERT", None)
 
 

@@ -12,11 +12,10 @@ from sglang.srt.managers.scheduler_components.dp_attn import (
 from sglang.srt.model_executor import forward_batch_info
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
     ForwardBatch,
-    ForwardMode,
     prefill_graph_tolerates_sum_len,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
     PrefillCudaGraphRunner,
 )
@@ -80,7 +79,7 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         runner.prefer_eager_mixed_prefill = True
         self.assertFalse(runner.can_run_graph(batch))
 
-    def test_replay_snapshot_uses_padded_token_count(self):
+    def test_replay_without_captured_metadata_builds_snapshot(self):
         runner = self._make_runner()
         runner.use_captured_attn_metadata = False
         attn_backend = mock.Mock()
@@ -98,9 +97,7 @@ class TestPrefillCudaGraphPadding(CustomTestCase):
         self.assertIs(shared_read_ends, mock.sentinel.end)
         attn_backend.init_forward_metadata.assert_called_once_with(forward_batch)
         attn_backend.resolve_prefill_shared_read_ends.assert_called_once_with(
-            forward_batch,
-            num_qo_tokens=16,
-            build_snapshot=True,
+            forward_batch, build_snapshot=True
         )
 
     def test_full_replay_pads_request_slot_cpu_mirror(self):

@@ -22,7 +22,6 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     load_cosmos_dreams_manifest,
     resolve_inference_profile,
 )
-from sglang.multimodal_gen.configs.pipeline_configs.base import ModelTaskType
 from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
     Cosmos3Config,
     _transformer_config,
@@ -30,6 +29,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.cosmos3 import (
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 
 # Deployment default from the reference Cosmos-Dreams deployment: 720x1280.
 COSMOS_DREAMS_MAX_PIXELS = 921_600

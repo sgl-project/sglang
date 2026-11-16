@@ -16,14 +16,15 @@ from sglang.srt.layers.attention.trtllm_mla_backend import (
     TRTLLMMLABackend,
     TRTLLMMLADecodeMetadata,
 )
-from sglang.srt.mem_cache.kv.router import STATE_PART, KVLayerRouter
+from sglang.srt.mem_cache.kv.decl import STATE_PART
+from sglang.srt.mem_cache.kv.router import KVLayerRouter
 from sglang.srt.mem_cache.kv.state_storage import StateStorage
 from sglang.srt.mem_cache.memory_pool import (
     HybridLinearKVPool,
     HybridReqToTokenPool,
 )
 from sglang.srt.mem_cache.memory_pool import MambaPool as StatePool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -518,6 +519,13 @@ class TestMegakernelBinding(CustomTestCase):
         minimal.use_fused_topk = True
         self.assertIs(minimal_view.attention, minimal.forward)
         self.assertTrue(minimal_view.use_fused_topk)
+
+        # a composite backend sets its metadata after the view is built
+        composite = SimpleNamespace(token_to_kv_pool=pool)
+        with patch(BACKEND, return_value=composite):
+            view = mb.MegakernelBinding(model=torch.nn.Module()).forward_view()
+        composite.forward_metadata = "late"
+        self.assertEqual(view.metadata, "late")
 
         hybrid_view = mb.ForwardView(minimal, legacy=False)
         self.assertFalse(hasattr(hybrid_view, "_backend"))
