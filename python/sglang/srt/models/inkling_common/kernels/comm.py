@@ -789,9 +789,7 @@ def ar_scattered_sconv_fused(
     # optimal (n/P in + n/P out per rank, no window staging) and each rank
     # convs only its own channels. The price, accepted by design: decode pays
     # a second cross-rank sync round (consumers need full rows, so the
-    # post-conv shard exchange must publish). The one-shot decode and
-    # banded-scattered variants (window-shard push) remain available in the
-    # JIT module / bench harness as alternatives.
+    # post-conv shard exchange must publish).
 
     buf = comm.buffer[:n].view(t, h)
     if input.data_ptr() != buf.data_ptr():
