@@ -166,6 +166,14 @@ impl UnifiedLRUList {
         self.add_node_(cell);
     }
 
+    /// Move a member node to the eviction end; panics if not a member.
+    pub fn move_to_lru(&mut self, node_id: NodeIdx_) {
+        let cell = Self::cell_of_(node_id);
+        self.remove_node_(cell);
+        let last = self.cell_(TAIL).prev;
+        self.add_node_after_(last, cell);
+    }
+
     /// Re-rank the `should_include` nodes from `node_id` up to its root
     /// (exclusive) as the MRU run, deepest first.
     pub fn reset_node_and_parents_mru<K: ChildKeyType>(
@@ -408,6 +416,24 @@ impl UnifiedLRUList {
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct PriorityKey(pub i64, pub i64);
 
+/// A state_cost priority; `total_cmp` gives it the total order a heap needs.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CostPriority(pub f64);
+
+impl Eq for CostPriority {}
+
+impl PartialOrd for CostPriority {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for CostPriority {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.0.total_cmp(&other.0)
+    }
+}
+
 /// Ranks nodes for eviction; lower priority evicts first.
 pub trait EvictionStrategy<K: ChildKeyType> {
     /// The node's eviction priority.
@@ -557,9 +583,11 @@ pub fn get_eviction_strategy<K: ChildKeyType>(
             tail_budget: tlru_tail_budget,
             float_config: tlru_float_config,
         }),
+        // state_cost ranks Mamba states in the component; Full KV stays in recency order.
+        "state_cost" => Box::new(LruStrategy),
         other => panic!(
             "Unknown eviction policy: {other}. Supported policies: \
-             'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru', 'tlru', 'joint_lru'."
+             'lru', 'lfu', 'fifo', 'mru', 'filo', 'priority', 'slru', 'tlru', 'joint_lru', 'state_cost'."
         ),
     }
 }
