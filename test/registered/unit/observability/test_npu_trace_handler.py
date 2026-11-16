@@ -87,6 +87,15 @@ class TestNPUTraceHandler(unittest.TestCase):
 
 class TestSRTNPUTraceHandler(unittest.TestCase):
     def setUp(self):
+        # SRT mutates members of the shared pybind enum, not just public aliases.
+        # __members__ retains the native values required by Kineto's C++ bindings.
+        self.enterContext(
+            patch.multiple(
+                torch_profiler.ProfilerActivity,
+                CPU=torch_profiler.ProfilerActivity.__members__["CPU"],
+                CUDA=torch_profiler.ProfilerActivity.__members__["CUDA"],
+            )
+        )
         self.directory = self.enterContext(tempfile.TemporaryDirectory(dir=Path.cwd()))
         self.events = []
         self.native_analysis = Mock(
@@ -235,12 +244,24 @@ class TestSRTNPUTraceHandler(unittest.TestCase):
     def test_cpu_fixture_ignores_prepatched_public_profile(self):
         spec = importlib.util.spec_from_file_location("srt_profiler_tests", __file__)
         module = importlib.util.module_from_spec(spec)
-        with patch.object(torch.profiler, "profile", object()):
+        patched_cpu, patched_cuda = object(), object()
+        with (
+            patch.object(torch.profiler, "profile", object()),
+            patch.object(torch_profiler.ProfilerActivity, "CPU", patched_cpu),
+            patch.object(torch_profiler.ProfilerActivity, "CUDA", patched_cuda),
+        ):
             spec.loader.exec_module(module)
-            with module.TORCH_PROFILE(
-                activities=[torch.profiler.ProfilerActivity.CPU]
-            ) as profiler:
-                torch.ones(1).add_(1)
+            fixture = module.TestSRTNPUTraceHandler()
+            try:
+                fixture.setUp()
+                with module.TORCH_PROFILE(
+                    activities=[torch.profiler.ProfilerActivity.CPU]
+                ) as profiler:
+                    torch.ones(1).add_(1)
+            finally:
+                fixture.doCleanups()
+            self.assertIs(torch_profiler.ProfilerActivity.CPU, patched_cpu)
+            self.assertIs(torch_profiler.ProfilerActivity.CUDA, patched_cuda)
         self.assertTrue(profiler.events())
 
     def test_non_npu_srt_paths_keep_chrome_trace_export(self):
