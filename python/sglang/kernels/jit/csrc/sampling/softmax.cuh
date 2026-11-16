@@ -57,6 +57,11 @@ SGL_DEVICE uint32_t mapa_shared(uint32_t addr, uint32_t rank) {
   return result;
 }
 
+/// \brief Makes this thread's `mbarrier.init` visible to the cluster without a `MEMBAR.GPU`.
+SGL_DEVICE void fence_mbarrier_init_cluster() {
+  asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+}
+
 SGL_DEVICE void barrier_cluster_arrive_relaxed() {
   asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
 }
@@ -162,7 +167,7 @@ __global__ __launch_bounds__(kSoftmaxThreads, kSoftmaxBlocksPerSM<kSoftmaxThread
     if (tx == 0) {
       ptx::mbar_init(&s_bar, 1);
       ptx::mbar_arrive_expect_tx(&s_bar, pool_size * sizeof(SoftmaxStats));
-      ptx::fence_barrier_init();
+      ptx::fence_mbarrier_init_cluster();
     }
     ptx::barrier_cluster_arrive_relaxed();
   }
