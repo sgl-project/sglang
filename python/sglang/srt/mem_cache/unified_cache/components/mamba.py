@@ -642,9 +642,8 @@ class MambaComponent(TreeComponent):
             and x.component_data[BASE_COMPONENT_TYPE].value is not None
         ):
             # Keep the state live until the controller has attempted its host
-            # backup, including on a node whose Full KV is already backed up
-            # (backuped covers Full KV only). Session cursors advance after
-            # the resumed tombstone.
+            # backup (backuped covers Full KV only). Session cursors advance
+            # after the resumed tombstone.
             return InternalStateBackup(node_id=x.id, num_tokens=1)
         self.tree_core._evict_component_and_detach_lru(
             x,

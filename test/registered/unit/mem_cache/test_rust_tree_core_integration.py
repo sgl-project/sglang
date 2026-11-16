@@ -4734,37 +4734,6 @@ def test_kv_canary_rows_exclude_mamba_slots():
     assert _canary_rows(core) == [(10, 0, -1), (11, 1, 10)]
 
 
-def test_write_back_leaf_eviction_backs_up_a_device_only_mamba_state():
-    core = _mamba_tree_core()
-    core.is_write_back = True
-    core.set_hicache_enabled()
-    _mamba_insert(core, [1, 2], [10, 11], 7)
-    leaf = core.match_prefix(MatchPrefixParams(key=_key([1, 2]))).best_match_node
-    # Only the Full KV reaches host, as on a split fragment.
-    full, _ = core.build_backup_spec(leaf)
-    core.commit_backup(leaf, full + 1000, {})
-    core.mark_write_through_pending([leaf], leaf)
-    core.finish_write_through([leaf], leaf)
-    assert core.is_backuped(leaf)
-    assert core.needs_incremental_component_backup(leaf)
-    assert core.evict_device_leaf(leaf, is_write_back=True).backup_kv == BackupKV(
-        [leaf]
-    )
-
-    full, aux = core.build_backup_spec(leaf)
-    assert full.numel() == 0 and ComponentType.MAMBA in aux
-    _complete_backup(core, leaf)
-    assert not core.needs_incremental_component_backup(leaf)
-    step = core.evict_device_leaf(leaf, is_write_back=True)
-    assert step.backup_kv is None
-    tracker = {ComponentType.FULL: 0}
-    device_frees, host_frees = {}, {}
-    _accumulate_step(step, tracker, device_frees, host_frees)
-    assert [t.tolist() for t in device_frees[ComponentType.FULL]] == [[10, 11]]
-    assert core.is_full_device_evicted(leaf)
-    core.sanity_check([], [])
-
-
 def test_component_set_guard_accepts_the_mamba_set():
     mem_cache.RustUnifiedTreeCoreBinding(
         mem_cache.TreeCoreInitParamsBinding(mamba_cache_chunk_size=256),

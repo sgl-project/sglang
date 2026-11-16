@@ -1312,9 +1312,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     pending_tokens += self.tree_core.mark_write_back_queued(node_id)
                 else:
                     if node_id in copied and self.tree_core.is_backuped(node_id):
-                        # A backed-up node a queued copy covers still needs its
-                        # own component backup; land the batch first, since a
-                        # demote would free slots that copy reads.
+                        # Land the batch first: a demote frees slots its copies read.
                         demote_queued()
                     backup_kv = self._evict_device_leaf(node_id, tracker)
                     if backup_kv is not None:
@@ -1339,8 +1337,7 @@ class UnifiedRadixCache(BasePrefixCache):
                                 node_id, publish
                             )
                         elif self.tree_core.is_backuped(node_id):
-                            # Retain the existing host KV even if an auxiliary
-                            # pool cannot preserve its new device checkpoint.
+                            # Keep host KV even if the component state can't be saved.
                             self._demote(node_id, tracker)
                             logger.warning(
                                 "write_back: device-only component state dropped "
@@ -2239,13 +2236,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def _execute_and_commit_kv_backup(
         self, action: BackupKV, write_back: bool = False
     ) -> Optional[int]:
-        """Return Full-KV tokens queued, or None if no host copy was queued:
-        a host allocation failed, or buffer mode, which only enqueues backup
-        intents.
-
-        Zero is successful for auxiliary-only transfers and already backed-up
-        nodes; callers must still drain queued copies before device eviction.
-        """
+        """Full-KV tokens queued (0 is success); None if no host copy was queued."""
         if self.buffer_pipeline is not None:
             # Buffer mode bypasses the host-backup contiguity below: nothing
             # is ever host-backuped here. Contiguity comes from end-to-end

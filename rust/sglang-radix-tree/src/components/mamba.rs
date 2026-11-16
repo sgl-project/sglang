@@ -240,8 +240,7 @@ impl MambaComponent {
             && !node.has_host_value(MAMBA)
             && node.has_device_value(FULL)
         {
-            // Keep the state live until the controller finishes D->H I/O,
-            // including on a node whose Full KV is already backed up
+            // Keep the state live until the controller finishes D->H I/O
             // (backuped covers Full KV only).
             // Native code never calls Python while holding the tree lock.
             let node_id = node.id;

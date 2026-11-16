@@ -4650,8 +4650,7 @@ impl<K: ChildKeyType> UnifiedTreeCore<K> {
         Ok(self.arena.node(node_id).backuped())
     }
 
-    /// Whether an auxiliary component has device data missing from host,
-    /// even when the node's Full KV is already backed up.
+    /// Whether an auxiliary component has device data missing from host.
     pub fn needs_incremental_component_backup(
         &self,
         node_id: NodeId,

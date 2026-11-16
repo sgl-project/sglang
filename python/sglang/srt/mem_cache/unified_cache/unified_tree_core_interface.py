@@ -250,8 +250,7 @@ class UnifiedTreeCoreInterface(ABC):
 
     @abstractmethod
     def needs_incremental_component_backup(self, node_id: NodeId) -> bool:
-        """Whether an auxiliary component has device data missing from host,
-        even when the node's Full KV is already backed up."""
+        """Whether an auxiliary component has device data missing from host."""
         ...
 
     @abstractmethod

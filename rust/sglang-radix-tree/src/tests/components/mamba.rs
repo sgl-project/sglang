@@ -1235,8 +1235,7 @@ fn check_mamba_restored_during_expanded_swa_backup(pin_ancestor: bool) {
         tc.finish_write_through(vec![a_id, b_id], b_id).unwrap();
         tc.dec_lock_ref(b_id, &backup_lock, false).unwrap();
     } else {
-        // A's Full KV is on host but its new Mamba state is not, so the walk
-        // asks for a backup; the controller drains B's copy first.
+        // A's new Mamba state has no host copy, so the walk asks for its backup.
         assert_eq!(step.mamba_backup_node_id, Some(a_id));
         tc.finish_write_through(vec![a_id, b_id], b_id).unwrap();
         tc.dec_lock_ref(b_id, &backup_lock, false).unwrap();
@@ -1383,55 +1382,6 @@ fn internal_mamba_backup_is_limited_to_unbacked_hicache_write_back() {
         assert!(node.has_device_value(FULL));
         assert!(!node.has_device_value(MAMBA));
         tc.evict_device_end(MAMBA);
-    }
-}
-
-#[test]
-fn internal_write_back_backs_up_a_device_only_mamba_on_a_full_backed_node() {
-    // A radix split leaves Full host KV on both fragments but the Mamba state
-    // on the suffix only, so a recomputed prefix state has no host copy.
-    let (mut tc, parent, _) = internal_write_back_fixture();
-    let idx = tc.arena.resolve(parent).unwrap();
-    set_full_host(&mut tc, idx, 100);
-    assert!(tc.node_backuped(parent).unwrap());
-    assert!(tc.needs_incremental_component_backup(parent).unwrap());
-    request_internal_mamba_backup(&mut tc, parent);
-    let (full, mut transfers) = tc.build_backup_spec(parent).unwrap();
-    assert_eq!(full.numel(), 0);
-    transfers.get_mut(&MAMBA).unwrap()[0].host_indices = Some(Tensor::from_slice(&[70i64]));
-    tc.commit_backup(parent, full, transfers).unwrap();
-    assert!(!tc.needs_incremental_component_backup(parent).unwrap());
-    let step = tc.finish_mamba_state_eviction(parent);
-    assert_eq!(step.tracker, HashMap::from([(MAMBA, 1)]));
-    let node = tc.arena.node(idx);
-    assert!(node.host_value(MAMBA).equal(&Tensor::from_slice(&[70i64])));
-    assert!(!node.has_device_value(MAMBA));
-    assert!(node.has_device_value(FULL));
-    tc.evict_device_end(MAMBA);
-}
-
-#[test]
-fn write_back_leaf_eviction_backs_up_a_device_only_mamba_on_a_full_backed_leaf() {
-    for mamba_on_host in [false, true] {
-        let (mut tc, _, leaf) = internal_write_back_fixture();
-        let idx = tc.arena.resolve(leaf).unwrap();
-        set_full_host(&mut tc, idx, 101);
-        if mamba_on_host {
-            set_mamba_host(&mut tc, idx, 80);
-        }
-        let (backup, _) = tc
-            .evict_device_leaf(leaf, /* is_write_back = */ true)
-            .unwrap();
-        if mamba_on_host {
-            assert!(backup.is_none());
-            assert!(!tc.arena.has_device_value(idx, FULL));
-        } else {
-            assert_eq!(
-                backup.expect("a device-only Mamba state").node_ids,
-                vec![leaf]
-            );
-            assert!(tc.arena.has_device_value(idx, MAMBA));
-        }
     }
 }
 

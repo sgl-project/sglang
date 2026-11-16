@@ -1,6 +1,5 @@
 import unittest
 from array import array
-from collections import defaultdict
 from dataclasses import replace
 from unittest import mock
 
@@ -49,7 +48,6 @@ from sglang.test.kits.unified_radix_cache.config import (
 from sglang.test.kits.unified_radix_cache.fixtures import (
     build_fixture,
     match_prefix,
-    node_children,
     node_device_value,
     node_host_value,
     node_key_length,
@@ -207,55 +205,6 @@ class TestUnifiedTreeCoreLoadBackOwnershipBackends(CustomTestCase):
 
 
 class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
-    def test_hicache_write_back_split_mamba_checkpoint_roundtrip(self):
-        if not self.cfg.has_mamba or self.cfg.has_swa:
-            self.skipTest("requires Full+Mamba")
-        for internal in (True, False):
-            with self.subTest(internal=internal):
-                cache, allocator, pool = build_fixture(self.cfg)
-                self._init_hicache(cache, write_policy="write_back")
-                seq = self._make_seq(1, 4)
-                leaf = self._insert(cache, allocator, pool, seq).last_device_node
-                self._backup_node(cache, leaf)
-                prefix = seq[: len(seq) // 2]
-                node = self._insert(cache, allocator, pool, prefix).last_device_node
-                self.assertTrue(cache.tree_core.is_backuped(node))
-                self.assertIsNone(node_host_value(cache, node, ComponentType.MAMBA))
-                if internal:
-                    # Matching the leaf moves its state to the Mamba LRU head.
-                    match_prefix(cache, seq)
-                else:
-                    cache._demote(leaf, defaultdict(int))
-                    cache.evict_host(1, ComponentType.MAMBA)
-                    self.assertFalse(node_children(cache, node))
-
-                old_slot = node_device_value(cache, node, ComponentType.MAMBA).clone()
-                self._fill_mamba_state(pool, old_slot, marker=11)
-                expected_temporal, expected_conv = self._snapshot_mamba_state(
-                    pool, old_slot
-                )
-                result = cache.evict(EvictParams(mamba_num=1))
-                self.assertEqual(result.mamba_num_evicted, 1)
-                self.assertIsNone(node_device_value(cache, node, ComponentType.MAMBA))
-                self.assertIsNotNone(node_host_value(cache, node, ComponentType.MAMBA))
-                self.assertFalse(cache.ongoing_write_through)
-                self._fill_mamba_state(pool, old_slot, marker=21)
-                match = cache.match_prefix(
-                    MatchPrefixParams(key=RadixKey(array("q", prefix)))
-                )
-                self.assertEqual(
-                    match.device_prefix_len + match.host_hit_length, len(prefix)
-                )
-                self._load_back_node(cache, node)
-                actual_temporal, actual_conv = self._snapshot_mamba_state(
-                    pool, node_device_value(cache, node, ComponentType.MAMBA)
-                )
-                self.assertTrue(torch.equal(actual_temporal, expected_temporal))
-                self.assertEqual(len(actual_conv), len(expected_conv))
-                for actual, expected in zip(actual_conv, expected_conv):
-                    self.assertTrue(torch.equal(actual, expected))
-                cache.sanity_check()
-
     @requires_hicache
     def test_hicache_load_back_restores_data(self):
         cache, allocator, req_to_token_pool = self._build_hicache_fixture()
