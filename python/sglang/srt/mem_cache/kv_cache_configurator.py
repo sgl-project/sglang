@@ -1209,7 +1209,7 @@ class KVCacheConfigurator:
         this runner's layers declare, with virtual ids above the allocator."""
         from sglang.srt.mem_cache.kv.build import UnifiedBuildContext, build_kv_storage
 
-        _, has_state = self._unified_window_and_state()
+        has_window, has_state = self._unified_window_and_state()
         if self._unified_sized is None:
             raise RuntimeError("unified storage must be sized before construction")
         from sglang.srt.mem_cache.kv.decl import StateLifetime
@@ -3413,6 +3413,7 @@ class KVCacheConfigurator:
         from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 
         schedule = get_schedule()
+        has_window, has_state = self._unified_window_and_state()
         if self._unified_plan is None:
             placement = self._fused_draft_for_pool_factory(self._fused_draft_decision())
             if (
