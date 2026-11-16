@@ -477,7 +477,7 @@ def check_server_args(server_args: Any):
 
     # grpc_port is None for HTTP-only launches, so the == comparison is
     # already False there; no explicit None check needed.
-    if not (cfg.smg_grpc_mode or cfg.grpc_mode) and cfg.grpc_port == cfg.port:
+    if cfg.grpc_port == cfg.port:
         raise ValueError(
             f"--grpc-port ({cfg.grpc_port}) must differ from --port ({cfg.port})"
         )

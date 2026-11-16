@@ -853,8 +853,8 @@ export const agentx = {
        }
       },
       {
-       "kind": "sglang-router",
-       "cmd": "python3 -m sglang_router.launch_router",
+       "kind": "sgl-router",
+       "cmd": "sgl-router",
        "env": {},
        "args": [
         ["--host", "0.0.0.0"],
@@ -1006,8 +1006,8 @@ export const agentx = {
        }
       },
       {
-       "kind": "sglang-router",
-       "cmd": "python3 -m sglang_router.launch_router",
+       "kind": "sgl-router",
+       "cmd": "sgl-router",
        "env": {},
        "args": [
         ["--host", "0.0.0.0"],
@@ -1313,8 +1313,8 @@ export const agentx = {
        }
       },
       {
-       "kind": "sglang-router",
-       "cmd": "python3 -m sglang_router.launch_router",
+       "kind": "sgl-router",
+       "cmd": "sgl-router",
        "env": {},
        "args": [
         ["--decode", "http://$DECODE_3_HEAD_IP:30000"],
@@ -1521,8 +1521,8 @@ export const agentx = {
        }
       },
       {
-       "kind": "sglang-router",
-       "cmd": "python3 -m sglang_router.launch_router",
+       "kind": "sgl-router",
+       "cmd": "sgl-router",
        "env": {},
        "args": [
         ["--host", "0.0.0.0"],
@@ -1670,8 +1670,8 @@ export const agentx = {
        }
       },
       {
-       "kind": "sglang-router",
-       "cmd": "python3 -m sglang_router.launch_router",
+       "kind": "sgl-router",
+       "cmd": "sgl-router",
        "env": {},
        "args": [
         ["--decode", "http://$DECODE_4_HEAD_IP:30000"],
@@ -1858,8 +1858,8 @@ export const agentx = {
        }
       },
       {
-       "kind": "sglang-router",
-       "cmd": "python3 -m sglang_router.launch_router",
+       "kind": "sgl-router",
+       "cmd": "sgl-router",
        "env": {},
        "args": [
         ["--decode", "http://$DECODE_1_HEAD_IP:30000"],
@@ -2010,8 +2010,8 @@ export const agentx = {
        }
       },
       {
-       "kind": "sglang-router",
-       "cmd": "python3 -m sglang_router.launch_router",
+       "kind": "sgl-router",
+       "cmd": "sgl-router",
        "env": {},
        "args": [
         ["--decode", "http://$DECODE_2_HEAD_IP:30000"],
@@ -2165,8 +2165,8 @@ export const agentx = {
        }
       },
       {
-       "kind": "sglang-router",
-       "cmd": "python3 -m sglang_router.launch_router",
+       "kind": "sgl-router",
+       "cmd": "sgl-router",
        "env": {},
        "args": [
         ["--decode", "http://$DECODE_2_HEAD_IP:30000"],
@@ -2321,8 +2321,8 @@ export const agentx = {
        }
       },
       {
-       "kind": "sglang-router",
-       "cmd": "python3 -m sglang_router.launch_router",
+       "kind": "sgl-router",
+       "cmd": "sgl-router",
        "env": {},
        "args": [
         ["--decode", "http://$DECODE_3_HEAD_IP:30000"],

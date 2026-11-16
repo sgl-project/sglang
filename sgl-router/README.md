@@ -111,7 +111,7 @@ every flag.
 | `GET /healthz`, `/readyz` | Liveness and readiness; `/health`, `/liveness`, and `/readiness` are aliases |
 | `GET /metrics` | Prometheus metrics, see [monitoring/README.md](monitoring/README.md) |
 
-sgl-model-gateway endpoints for features the router does not provide yet
+Endpoints for features the router does not provide yet
 (the Responses and Conversations APIs, `/parse/*`, `/workers`,
 `/v1/tokenizers`, `/wasm`, `/ha/*`, `/v1/loads`, `/get_loads`,
 `/engine_metrics`) answer `501` with error code `unsupported_endpoint`.
