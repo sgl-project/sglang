@@ -691,13 +691,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     @property
-    def draft_worker(self):
-        # DFLASH drives the draft model through a plain TpModelWorker: the
-        # draft KV is materialized from target hidden states, so there is no
-        # EagleDraftWorkerBase draft/draft_extend split to wrap it in.
-        return self._draft_worker
-
-    @property
     def spec_v2_attn_backends(self) -> tuple:
         # Every attn backend a spec_v2 forward touches; consumed by
         # decide_needs_cpu_seq_lens to gate the seq_lens_cpu D2H.
@@ -1207,13 +1200,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         if name == "_target_worker":
             raise AttributeError(name)
         return getattr(self.target_worker, name)
-
-    def clear_cache_pool(self):
-        # The target worker owns the shared KV allocator/cache. For the compact
-        # sliding-window path, the draft req->token view is rebuilt from committed
-        # target state before each draft forward, so there is nothing persistent
-        # to flush here.
-        pass
 
     def _gather_req_to_token_masked(
         self,
