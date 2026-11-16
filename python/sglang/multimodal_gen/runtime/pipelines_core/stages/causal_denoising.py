@@ -163,12 +163,7 @@ class CausalDMDDenoisingStage(DenoisingStage):
             self.transformer.config.sliding_window_num_frames
         )
 
-        try:
-            self.local_attn_size = getattr(
-                self.transformer.model, "local_attn_size", -1
-            )  # type: ignore
-        except Exception:
-            self.local_attn_size = -1
+        self.local_attn_size = self.transformer.config.local_attn_size
         self.sink_size = self.transformer.config.sink_size
 
         self._causal_attn_metadata_builder_cls = None
