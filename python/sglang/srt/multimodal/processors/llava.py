@@ -105,8 +105,8 @@ class LlavaImageProcessor(BaseMultimodalProcessor):
 
     async def _fetch_remote_image_bytes(self, url):
         # Fetch a remote image's compressed bytes in the io thread pool, retrying
-        # only transient network failures. Each attempt is bounded by
-        # REQUEST_TIMEOUT inside download_remote_media, so total time is bounded.
+        # only transient network failures. Each attempt is bounded by the media
+        # URL timeout inside download_remote_media, so total time is bounded.
         loop = asyncio.get_running_loop()
         max_retries = max(0, int(os.environ.get("SGLANG_MM_LOAD_MAX_RETRIES", "2")))
         delay = 0.5

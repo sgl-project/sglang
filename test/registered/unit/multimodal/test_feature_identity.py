@@ -45,6 +45,9 @@ from sglang.srt.multimodal.processors.muse_spark_omni import (
 )
 from sglang.srt.multimodal.processors.qwen_vl import QwenVLImageProcessor
 from sglang.srt.multimodal.processors.unlimited_ocr import UnlimitedOCRProcessor
+from sglang.srt.multimodal.transport.feature_transport import (
+    MultimodalFeatureTransport,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -94,8 +97,9 @@ class TestFeatureIdentity(CustomTestCase):
         processor.image_config = {}
         processor.mm_preprocess_cache = SimpleNamespace(enabled=True)
         processor.precompute_hash_before_cpu_transfer = False
-        processor.mm_feature_transport = "cpu"
-        processor.use_cuda_ipc = False
+        processor._feature_transport = MultimodalFeatureTransport(
+            "cpu", base_gpu_id=0, skip_mm_pool=True
+        )
         processor.vision_start_token_id, processor.vision_end_token_id = 1, 3
         processor.mm_tokens = SimpleNamespace(
             image_token_id=2, video_token_id=4, audio_token_id=5
@@ -145,8 +149,9 @@ class TestFeatureIdentity(CustomTestCase):
             MuseSpark1xOmniMultimodalProcessor
         )
         processor.preprocess_config = SimpleNamespace(use_gpu_preprocess=False)
-        processor.mm_feature_transport = "cuda_ipc"
-        processor.use_cuda_ipc = True
+        processor._feature_transport = MultimodalFeatureTransport(
+            "cuda_ipc", base_gpu_id=0, skip_mm_pool=True
+        )
         processor.image_start_id, processor.image_end_id = 1, 3
         processor.patch_id, processor.video_id, processor.audio_id = 2, 4, 5
         processor.audio_start_id = processor.audio_end_id = None
@@ -167,7 +172,9 @@ class TestFeatureIdentity(CustomTestCase):
         processor.prepare_media_artifacts = AsyncMock(return_value=artifacts[:1])
         with (
             patch.object(
-                processor, "_wrap_tensor_for_cuda_ipc", side_effect=lambda t: t
+                processor._feature_transport,
+                "_wrap_tensor_for_cuda_ipc",
+                side_effect=lambda t: t,
             ),
             patch.object(
                 MultimodalDataItem, "_input_identity", side_effect=AssertionError
@@ -183,7 +190,9 @@ class TestFeatureIdentity(CustomTestCase):
     def test_transport_preserves_padding_until_frontend_finalization(self):
         processor = LlavaImageProcessor.__new__(LlavaImageProcessor)
         processor.processor_fingerprint = "sha256:" + "12" * 32
-        processor.use_cuda_ipc = True
+        processor._feature_transport = MultimodalFeatureTransport(
+            "cuda_ipc", base_gpu_id=0, skip_mm_pool=True
+        )
         item = _item(torch.arange(8))
         item.offsets = [(1, 8)]
         item.set_pad_value()
@@ -194,7 +203,9 @@ class TestFeatureIdentity(CustomTestCase):
         )
         # Model fast paths may build padding before wrapping transport storage.
         with patch.object(
-            processor, "_wrap_tensor_for_cuda_ipc", side_effect=lambda t: t
+            processor._feature_transport,
+            "_wrap_tensor_for_cuda_ipc",
+            side_effect=lambda t: t,
         ):
             processor._prepare_mm_items_for_transport([item])
         processor.finalize_cache_identities(output)

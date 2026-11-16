@@ -3,30 +3,25 @@ or a direct multicast all-gather (the collective variants of attn_res_fused_tma)
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 import torch
 
 from sglang.kernels.ops.attention.attn_res import _jit_fused_tma_module, _tuning
+from sglang.kernels.ops.communication.comm_registry import CommRegistry
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.communication.all_reduce import Communicator
 
-_COMM_MAP: dict[int, Communicator] = {}
+_COMMS = CommRegistry("attn_res_collective")
 
 
-def register_comm(comm: Communicator) -> None:
-    # One communicator per world_size per process -- see the note in
-    # communication/all_reduce_residual.py::register_comm. The ops key only on world_size, so an
-    # overwrite here would hand the old group's callers the new group's peer
-    # pointers.
-    prev = _COMM_MAP.get(comm.world_size)
-    assert prev is None or prev is comm, (
-        f"a different communicator is already registered for world_size="
-        f"{comm.world_size}"
-    )
-    _COMM_MAP[comm.world_size] = comm
+def register_comm(provider: Callable[[], Communicator], *, world_size: int) -> None:
+    """Register the provider of the communicator these ops launch over; it runs on
+    first launch (see ``CommRegistry``).
+    """
+    _COMMS.register(provider, world_size=world_size)
 
 
 @register_custom_op(mutates_args=["out", "prefix_out"])
@@ -48,7 +43,7 @@ def _attn_res_fused_pull_rs_op(
     consumer_regs: int,
 ) -> None:
     _jit_fused_tma_module(chunk_rows, occupancy, consumer_regs).run_pull_rs(
-        _COMM_MAP[world_size],
+        _COMMS.get(world_size),
         input,
         residual,
         bank,
@@ -81,7 +76,7 @@ def _attn_res_fused_direct_ag_op(
     consumer_regs: int,
 ) -> None:
     _jit_fused_tma_module(chunk_rows, occupancy, consumer_regs).run_direct_ag(
-        _COMM_MAP[world_size],
+        _COMMS.get(world_size),
         prefix_sum,
         bank,
         cw,

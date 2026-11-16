@@ -46,6 +46,9 @@ def bind_separate_buffer_capacity(allocator) -> None:
         allocator.storage = None
     # Its sides own their buffers: nothing is shared with the owner.
     allocator.pools_share_memory = False
+    # A static pool has no request sub-pools: a request row takes no units.
+    if isinstance(getattr(allocator, "request_allocators", None), MagicMock):
+        allocator.request_allocators = {}
     for name, impl in _SEPARATE_BUFFER_METHODS.items():
         setattr(
             allocator,
