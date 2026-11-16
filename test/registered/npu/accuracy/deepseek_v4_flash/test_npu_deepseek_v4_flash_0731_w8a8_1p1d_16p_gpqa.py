@@ -265,7 +265,11 @@ class TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh(
                 **common_envs,
                 **DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS,
             },
-            "router_args": ["--policy", "cache_aware"],
+            # The router is launched with --no-tokenizer (workers tokenize
+            # themselves), which cache_aware routing rejects, so keep the
+            # default policy. With one prefill and one decode worker the choice
+            # does not affect routing anyway.
+            "router_args": [],
             "router_envs": {},
         }
         super().setUpClass()

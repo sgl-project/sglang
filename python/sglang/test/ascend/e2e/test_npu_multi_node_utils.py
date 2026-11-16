@@ -734,7 +734,7 @@ def launch_pd_separation_node(model_config):
 
 
 # Launch router node
-def launch_router(model_config, router_binary):
+def launch_router(model_config, router_binary, process_holder=None):
     logger.info(f"launch_router start ......")
     discover_worker_nodes()
 
@@ -824,6 +824,8 @@ def launch_router(model_config, router_binary):
     try:
         router_process = subprocess.Popen(router_command)
         logger.info(f"Router process started with PID: {router_process.pid}")
+        if process_holder is not None:
+            process_holder.append(router_process)
     except Exception as e:
         raise RuntimeError(f"Failed to start router process: {e}")
 
@@ -832,8 +834,11 @@ def start_router_thread(model_config, base_url):
     logger.info(f"Starting router in thread...")
     # Looked up here so a missing binary fails the test, not the daemon thread.
     router_binary = find_sgl_router_binary()
+    # Filled by launch_router so the readiness wait can fail fast if the router
+    # exits early (e.g. rejected arguments) instead of polling until timeout.
+    process_holder = []
     router_thread = threading.Thread(
-        target=launch_router, args=(model_config, router_binary)
+        target=launch_router, args=(model_config, router_binary, process_holder)
     )
     router_thread.daemon = True
     router_thread.start()
@@ -842,16 +847,18 @@ def start_router_thread(model_config, base_url):
     # prefill and decode workers to be registered.
     health_check_url = f"{base_url}/readiness"
     logger.info(f"Waiting for router to be ready at {health_check_url}")
-    wait_server_ready(health_check_url)
+    wait_server_ready(health_check_url, process_holder=process_holder)
     return router_thread
 
 
-def wait_server_ready(url, timeout=LOCAL_TIMEOUT):
+def wait_server_ready(url, timeout=LOCAL_TIMEOUT, process_holder=None):
     """Wait for the server to be ready.
 
     Args:
         url (str): Server URL to check.
         timeout (int): Timeout in seconds.
+        process_holder (list): Optional single-element list holding the router
+            subprocess, so an early exit fails fast instead of polling.
 
     Raises:
         RuntimeError: If server fails to start within timeout.
@@ -861,6 +868,11 @@ def wait_server_ready(url, timeout=LOCAL_TIMEOUT):
     check_interval = 10
 
     while True:
+        if process_holder and process_holder[0].poll() is not None:
+            raise RuntimeError(
+                f"Router exited with code {process_holder[0].returncode} before "
+                f"serving {url}; check the router output above for the reason"
+            )
         try:
             response = requests.get(url, timeout=30)
             if response.status_code == 200:
