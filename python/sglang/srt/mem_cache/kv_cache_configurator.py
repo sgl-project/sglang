@@ -3523,7 +3523,7 @@ class KVCacheConfigurator:
         # Keep at least half of the KV budget; past that, cap the request slots
         # (the workspace scales with them) instead of starving the KV cache.
         request_cap = None
-        if reserved > budget_bytes // 2:
+        if reserved and reserved > budget_bytes // 2:
             request_cap = max(
                 1, (budget_bytes // 2 + headroom) // (per_row * rows_per_request)
             )
