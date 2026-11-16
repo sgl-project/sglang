@@ -103,7 +103,8 @@ class Step(msgspec.Struct, frozen=True):
     mode is one of:
       "decode"        – autoregressive single-token decode; runs in a CUDA graph.
       "target_verify" – speculative-decoding target verify; runs in a CUDA graph.
-      "prefill"       – context prefill; runs eagerly (never captured in a graph).
+      "prefill"       – context prefill; runs eagerly. With prefill_graph its
+                        transformer body may be captured (SupportsPrefillBody).
     """
 
     mode: str
@@ -396,6 +397,11 @@ class BuiltMegakernel(Protocol):
     SGLang component calls once with its own buffers: like draft_sampler, they return
     bs -> None (SGLang's code at that batch size) or the step to run there, and every
     rank must serve the same sizes. A draft's begin_draft_round is called as it is.
+    A draft's optional draft_step_fold(*, batch_size, num_steps) runs before each
+    topk-1 EAGLE draft graph is captured and returns None or a fold whose
+    finalize(logits, positions, draft_tokens, column, mrope_positions) replaces the
+    greedy chain's top-1 postprocess and M-RoPE + 1, returning (topk_p, topk_index);
+    the round's draft forwards see it as ForwardBatch.draft_step_fold.
     The entries a built object offers must agree on every rank.
 
     A built object may also offer graph_variants: None, or a mapping from a
@@ -447,10 +453,36 @@ ENTRIES = (
     "draft_loop",
     "draft_extend",
     "begin_draft_round",
+    "draft_step_fold",
 )
 # The graph runners a built object's graph_variants may key: the target's verify
 # graphs, the EAGLE draft graphs and the EAGLE draft-extend graphs
 GRAPH_VARIANT_RUNNERS = ("target_verify", "draft_loop", "draft_extend")
+
+
+@runtime_checkable
+class SupportsPrefillBody(Protocol):
+    """A build running a prefill's transformer body (the layer module's forward),
+    which breakable prefill graphs capture per token bucket. plan_body is host-only
+    like plan; forward_body takes and returns what the layer module's forward does.
+    """
+
+    def plan_body(
+        self, input_ids: Any, forward_batch: Any, *args: Any, **kwargs: Any
+    ) -> Optional[Step]: ...
+
+    def forward_body(
+        self, step: Step, original: Callable, *args: Any, **kwargs: Any
+    ) -> Any: ...
+
+    def linear_prefill_graph_seqs(self, backend: Any) -> Optional[int]:
+        """Asked by a linear backend whose own chain cannot be captured: the most
+        sequences a bucket holds when this body runs the extend core in the graph on
+        tables of its own, or None to keep the layers' graph breaks."""
+
+    def refill_prefill_graph(self, metadata: Any, forward_batch: Any) -> None:
+        """Before a bucket's capture and each replay, after the backend filled its
+        per-bucket metadata: refill this body's own tables for that bucket."""
 
 
 @runtime_checkable
@@ -492,14 +524,46 @@ class SupportsDraftEmbed(Protocol):
     def attach_draft_embed(self, **kwargs: Any) -> None: ...
 
 
+class RecurrentCommitIO(msgspec.Struct, frozen=True):
+    """One chain verify's accepted recurrent state, per request ([bs] tensors). The
+    slots are the verify's resolved ones: the request table may name others."""
+
+    state_slots: torch.Tensor
+    track_slots: Optional[torch.Tensor]
+    request_rows: torch.Tensor
+    accept_lens: torch.Tensor  # including the bonus token
+    last_step: torch.Tensor
+    track_steps: Optional[torch.Tensor]
+    draft_token_num: int
+    src_indices_raw: Optional[torch.Tensor]
+
+
 @runtime_checkable
-class SupportsKdaCommit(Protocol):
-    """A target spec that commits the KDA state after a chain verify in one launch.
+class SupportsStateSlotReset(Protocol):
+    """A target build keeping recurrent state of its own beside the state pool,
+    allocated in its prepare and charged to the pool's budget per slot and per
+    request-table row. reset_state_slots(slots, request_rows) runs on the forward
+    stream before each target extend and when a slot is newly bound. False flags
+    drop the per-draft SSM scratch, decode-time checkpoints and host backups."""
 
-    kda_commit returns False, launching nothing, when off; SGLang then commits itself.
-    """
+    state_bytes_per_slot: int
+    state_bytes_per_request_row: int
+    keeps_draft_ssm: bool
+    tracks_decode_state: bool
+    backs_up_state: bool
 
-    def kda_commit(self, **kwargs: Any) -> bool: ...
+    def reset_state_slots(
+        self, slots: torch.Tensor, request_rows: torch.Tensor
+    ) -> None: ...
+
+
+@runtime_checkable
+class SupportsRecurrentCommit(Protocol):
+    """A target build committing a chain verify's recurrent state on the current
+    stream. True: SGLang commits only its per-request side states (PLE); False:
+    SGLang commits as without it. Capturable: no collective or host sync."""
+
+    def commit_recurrent_state(self, io: RecurrentCommitIO) -> bool: ...
 
 
 @runtime_checkable
@@ -579,6 +643,10 @@ class MegakernelSpec(msgspec.Struct, frozen=True):
     tensor_verify_build: Optional[Callable[[Any, float], BuiltMegakernel]] = None
     # Pool preparation after allocation and before any forward or graph capture.
     prepare: Optional[Callable[[BuiltMegakernel, PreparationView], None]] = None
+    # A key of binding.BINDING_KINDS; empty picks the binding by architecture.
+    binding: str = ""
+    # The build offers SupportsPrefillBody.
+    prefill_graph: bool = False
 
 
 # HF architecture -> the "module:attribute" path of its spec
