@@ -593,8 +593,11 @@ class TestNpuMc2FusedPaths(CustomTestCase):
 
     def test_hccl_comm_name_comes_from_tp_rank(self):
         tp = self._tp_group(tp_size=2, rank=3)
-        with patch.object(
-            layernorm_sp, "get_parallel", return_value=SimpleNamespace(tp_group=tp)
+        with (
+            patch.object(
+                layernorm_sp, "get_parallel", return_value=SimpleNamespace(tp_group=tp)
+            ),
+            patch.object(layernorm_sp, "get_device", return_value="cpu"),
         ):
             self.assertEqual(layernorm_sp._npu_hccl_comm_name(), "hcom://0")
         (device_arg,) = tp.device_group._get_backend.call_args.args
