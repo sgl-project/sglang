@@ -36,6 +36,8 @@ _TOP_KS = (16, 32)
 _SELECTOR_RANK = 256
 _MAX_GAMMA = 8
 _SHARD_WIDTH_ALIGN, _SHARD_WIDTH_MIN, _SHARD_WIDTH_MAX = 1024, 8192, 32768
+# The lm_head GEMM's k per stage (lmhead_mma.cuh BLOCK_K; the UMMA kernel needs 64).
+_HIDDEN_ALIGN = 256
 
 
 def _get_fused_select_blocker(
@@ -65,6 +67,8 @@ def _get_fused_select_blocker(
         and _SHARD_WIDTH_MIN <= shard_width <= _SHARD_WIDTH_MAX
     ):
         return f"unsupported lm_head shard width {shard_width}"
+    if lm_head.weight.shape[1] % _HIDDEN_ALIGN != 0:
+        return f"unsupported hidden size {lm_head.weight.shape[1]}"
     tables = (
         selector.hidden_projection.weight,
         selector.predecessor_codebook,
@@ -214,6 +218,11 @@ def build_fused_select(
     )
     if blocker is not None:
         return None, blocker
+    if max_bs == 0:
+        return (
+            None,
+            "no decode CUDA graph batch sizes (the push slot is sized by the largest)",
+        )
     max_rows = max_bs * gamma
     if lm_head.tp_group is None:
         return None, "No TP-group for LMHead"
