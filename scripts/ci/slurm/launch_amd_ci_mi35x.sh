@@ -124,7 +124,10 @@ stream_log() {  # print what the job appended to $LOG since the last call
     local size
     size="$(stat -c %s "$LOG" 2>/dev/null || echo 0)"
     if (( size > LOG_OFFSET )); then
-        tail -c +"$((LOG_OFFSET + 1))" "$LOG" | head -c "$((size - LOG_OFFSET))"
+        # head stops at $size and tail reads to EOF, so neither end of the
+        # pipe closes early: `tail | head` hit SIGPIPE when the job appended
+        # after the stat, and pipefail + set -e then cancelled a healthy job.
+        head -c "$size" "$LOG" | tail -c +"$((LOG_OFFSET + 1))"
         LOG_OFFSET="$size"
     fi
 }
