@@ -4,15 +4,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
-import torch
-
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache import cache_residency
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 from sglang.srt.mem_cache.common import evict_from_tree_cache
-from sglang.srt.mem_cache.kv.alloc.chain import ChainAllocator, ChainRoles
-from sglang.srt.mem_cache.kv.alloc.interim import (
-    _FloatChainPolicy,
-    _OwnerEndPolicy,
-)
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -39,7 +35,9 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         capacity = {"available": 30}
         allocator = MagicMock()
         allocator.available_size.side_effect = lambda: capacity["available"]
-        allocator.mamba_full_cache_donor.return_value = None
+        allocator.owner_available_size.side_effect = lambda: capacity["available"]
+        # Pools that share no memory: the tree walks each target itself.
+        allocator.pools_share_memory = False
         cache.token_to_kv_pool_allocator = allocator
         cache.req_to_token_pool = MagicMock()
 
@@ -63,58 +61,11 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         cache._evict_device_leaf = MagicMock(side_effect=evict_leaf)
         return cache, capacity, leaf_count
 
-    @staticmethod
-    def _build_unified_mamba_donor_cache(
-        *, free_ids: int, byte_slots: int, tri_pool: bool = False
-    ):
-        cache = object.__new__(UnifiedRadixCache)
-        cache.disable = False
-        cache.tree_components = (
-            (ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA)
-            if tri_pool
-            else (ComponentType.FULL, ComponentType.MAMBA)
-        )
-        index_slots(cache, cache.tree_components)
-        cache.is_swa_enabled = tri_pool
-        cache.cache_controller = None
-        cache.metrics_collector = None
-        cache.tree_core = MagicMock()
-        cache.tree_core.full_evictable_size.return_value = 16
-        cache.tree_core.mamba_evictable_size.return_value = 8
-
-        capacity = {"free_ids": free_ids, "byte_slots": byte_slots}
-        allocator = object.__new__(ChainAllocator)
-        allocator.roles = ChainRoles(owner="full", state="mamba")
-        allocator.window_allocators = {}
-        allocator._policy = object.__new__(
-            _FloatChainPolicy if tri_pool else _OwnerEndPolicy
-        )
-        allocator.free_group = None
-        allocator.free_page_reps_group = None
-        allocator.full_page_reps_group = []
-        allocator.full_free_group = []
-        allocator.full_attn_allocator = MagicMock()
-        allocator.full_attn_allocator.schedulable_available_size.return_value = 100
-        allocator.mamba_allocator = MagicMock()
-        allocator.mamba_allocator.available_size.side_effect = lambda: capacity[
-            "free_ids"
-        ]
-        allocator.mamba_allocator.schedulable_available_size.side_effect = lambda: min(
-            capacity["free_ids"], capacity["byte_slots"]
-        )
-        allocator.full_tokens_before_mamba_recheck = MagicMock(return_value=1)
-        # The window band takes no part in the full donor path.
-        allocator.swa_attn_allocator = None
-        allocator.members = (allocator.full_attn_allocator, allocator.mamba_allocator)
-        allocator.state = SimpleNamespace(slots=allocator.mamba_allocator)
-        cache.token_to_kv_pool_allocator = allocator
-        cache.req_to_token_pool = MagicMock()
-        return cache, capacity, allocator
-
     def test_allocation_eviction_stops_when_shared_capacity_is_sufficient(self):
         cache, capacity, leaf_count = self._build_cache(collateral_capacity_gain=70)
 
-        result = cache.evict_for_alloc(EvictParams(num_tokens=70))
+        # 30 available: a 100-token demand is 70 short.
+        result = cache.evict_for_alloc(KVDemand(full_tokens=100))
 
         self.assertEqual(capacity["available"], 100)
         self.assertEqual(leaf_count["value"], 1)
@@ -123,8 +74,8 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
 
     def test_allocation_eviction_runs_to_the_target_when_frees_stay_hidden(self):
         """An allocator can hide freed pages behind a clamp or page rounding, so
-        freeing exactly the shortfall may leave its availability target unmet;
-        an allocation-driven FULL walk must keep going until the target shows."""
+        freeing exactly the shortfall may leave the demand unmet; an
+        allocation-driven FULL walk must keep going until the demand fits."""
         cache, capacity, leaf_count = self._build_cache(collateral_capacity_gain=0)
         cache.tree_core.full_evictable_size.return_value = 60
         quota = {}
@@ -138,7 +89,8 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
 
         cache._evict_device_next_node.side_effect = next_node
 
-        result = cache.evict_for_alloc(EvictParams(num_tokens=20))
+        # 30 available: a 50-token demand is 20 short.
+        result = cache.evict_for_alloc(KVDemand(full_tokens=50))
 
         self.assertEqual(leaf_count["value"], 2)
         self.assertEqual(capacity["available"], 50)
@@ -179,7 +131,7 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         cache.metrics_collector = None
         cache.tree_core = MagicMock()
         cache.token_to_kv_pool_allocator = MagicMock()
-        cache.token_to_kv_pool_allocator.mamba_full_cache_donor.return_value = None
+        cache.token_to_kv_pool_allocator.pools_share_memory = False
 
         capacity = {"available": 0}
         mamba_allocator = MagicMock()
@@ -201,392 +153,11 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
         cache._evict_device_next_node = MagicMock(side_effect=next_node)
         cache._evict_device_leaf = MagicMock(side_effect=evict_leaf)
 
-        result = cache.evict_for_alloc(EvictParams(mamba_num=3))
+        result = cache.evict_for_alloc(KVDemand(state_slots=3))
 
         self.assertEqual(capacity["available"], 3)
         self.assertEqual(result.num_tokens_evicted, 20)
         self.assertEqual(result.mamba_num_evicted, 1)
-
-    def test_mamba_allocation_uses_full_as_donor_for_byte_shortfall(self):
-        cache, capacity, _ = self._build_unified_mamba_donor_cache(
-            free_ids=2, byte_slots=1
-        )
-
-        def next_node(component_type, tracker):
-            if (
-                component_type == ComponentType.FULL
-                and tracker[ComponentType.FULL] < 16
-            ):
-                return 1, True
-            return None, False
-
-        def evict_leaf(_node_id, tracker):
-            tracker[ComponentType.FULL] += 4
-            capacity["byte_slots"] += 1
-            return None
-
-        cache._evict_device_next_node = MagicMock(side_effect=next_node)
-        cache._evict_device_leaf = MagicMock(side_effect=evict_leaf)
-
-        result = cache.evict_for_alloc(EvictParams(mamba_num=1))
-
-        self.assertEqual(capacity, {"free_ids": 2, "byte_slots": 2})
-        self.assertEqual(result.num_tokens_evicted, 4)
-        self.assertEqual(result.mamba_num_evicted, 0)
-        self.assertEqual(
-            cache.tree_core.evict_device_start.call_args_list,
-            [
-                unittest.mock.call(ComponentType.FULL, 16),
-            ],
-        )
-
-    def test_mamba_allocation_recycles_mamba_for_id_shortfall(self):
-        cache, capacity, _ = self._build_unified_mamba_donor_cache(
-            free_ids=0, byte_slots=1
-        )
-
-        def next_node(component_type, tracker):
-            if (
-                component_type == ComponentType.MAMBA
-                and tracker[ComponentType.MAMBA] < 1
-            ):
-                return 1, True
-            return None, False
-
-        def evict_leaf(_node_id, tracker):
-            tracker[ComponentType.MAMBA] += 1
-            capacity["free_ids"] += 1
-            capacity["byte_slots"] += 1
-            return None
-
-        cache._evict_device_next_node = MagicMock(side_effect=next_node)
-        cache._evict_device_leaf = MagicMock(side_effect=evict_leaf)
-
-        result = cache.evict_for_alloc(EvictParams(mamba_num=1))
-
-        self.assertEqual(capacity, {"free_ids": 1, "byte_slots": 2})
-        self.assertEqual(result.num_tokens_evicted, 0)
-        self.assertEqual(result.mamba_num_evicted, 1)
-        cache.tree_core.evict_device_start.assert_called_once_with(
-            ComponentType.MAMBA, 1
-        )
-
-    def test_mamba_allocation_does_not_evict_full_while_id_bound(self):
-        cache, capacity, _ = self._build_unified_mamba_donor_cache(
-            free_ids=0, byte_slots=10
-        )
-
-        def next_node(component_type, tracker):
-            if component_type == ComponentType.FULL and tracker[ComponentType.FULL] < 4:
-                return 1, True
-            return None, False
-
-        def evict_leaf(_node_id, tracker):
-            tracker[ComponentType.FULL] += 4
-            capacity["byte_slots"] += 1
-            return None
-
-        cache._evict_device_next_node = MagicMock(side_effect=next_node)
-        cache._evict_device_leaf = MagicMock(side_effect=evict_leaf)
-
-        result = cache.evict_for_alloc(EvictParams(mamba_num=1))
-
-        self.assertEqual(capacity, {"free_ids": 0, "byte_slots": 10})
-        self.assertEqual(result.num_tokens_evicted, 0)
-        self.assertEqual(result.mamba_num_evicted, 0)
-        cache.tree_core.evict_device_start.assert_called_once_with(
-            ComponentType.MAMBA, 1
-        )
-
-    def test_mamba_allocation_does_not_evict_full_after_partial_id_recovery(self):
-        cache, capacity, _ = self._build_unified_mamba_donor_cache(
-            free_ids=0, byte_slots=10
-        )
-
-        def next_node(component_type, tracker):
-            if (
-                component_type == ComponentType.MAMBA
-                and tracker[ComponentType.MAMBA] < 1
-            ):
-                return 1, True
-            if component_type == ComponentType.FULL and tracker[ComponentType.FULL] < 4:
-                return 2, True
-            return None, False
-
-        def evict_leaf(node_id, tracker):
-            if node_id == 1:
-                tracker[ComponentType.MAMBA] += 1
-                capacity["free_ids"] += 1
-                capacity["byte_slots"] += 1
-            else:
-                tracker[ComponentType.FULL] += 4
-                capacity["byte_slots"] += 1
-            return None
-
-        cache._evict_device_next_node = MagicMock(side_effect=next_node)
-        cache._evict_device_leaf = MagicMock(side_effect=evict_leaf)
-
-        result = cache.evict_for_alloc(EvictParams(mamba_num=2))
-
-        self.assertEqual(capacity, {"free_ids": 1, "byte_slots": 11})
-        self.assertEqual(result.num_tokens_evicted, 0)
-        self.assertEqual(result.mamba_num_evicted, 1)
-        cache.tree_core.evict_device_start.assert_called_once_with(
-            ComponentType.MAMBA, 2
-        )
-
-    def test_mamba_allocation_splits_mixed_id_and_byte_pressure(self):
-        cache, capacity, _ = self._build_unified_mamba_donor_cache(
-            free_ids=3, byte_slots=2
-        )
-
-        def next_node(component_type, tracker):
-            if (
-                component_type == ComponentType.MAMBA
-                and tracker[ComponentType.MAMBA] < 1
-            ):
-                return 1, True
-            if component_type == ComponentType.FULL and tracker[ComponentType.FULL] < 4:
-                return 2, True
-            return None, False
-
-        def evict_leaf(node_id, tracker):
-            if node_id == 1:
-                tracker[ComponentType.MAMBA] += 1
-                capacity["free_ids"] += 1
-                capacity["byte_slots"] += 1
-            else:
-                tracker[ComponentType.FULL] += 4
-                capacity["byte_slots"] += 1
-            return None
-
-        cache._evict_device_next_node = MagicMock(side_effect=next_node)
-        cache._evict_device_leaf = MagicMock(side_effect=evict_leaf)
-
-        result = cache.evict_for_alloc(EvictParams(mamba_num=2))
-
-        self.assertEqual(capacity, {"free_ids": 4, "byte_slots": 4})
-        self.assertEqual(result.num_tokens_evicted, 4)
-        self.assertEqual(result.mamba_num_evicted, 1)
-        self.assertEqual(
-            cache.tree_core.evict_device_start.call_args_list,
-            [
-                unittest.mock.call(ComponentType.MAMBA, 1),
-                unittest.mock.call(ComponentType.FULL, 16),
-            ],
-        )
-
-    def test_full_donor_walk_continues_until_mamba_capacity_is_visible(self):
-        cache, capacity, _ = self._build_unified_mamba_donor_cache(
-            free_ids=2, byte_slots=1
-        )
-        leaf_count = 0
-
-        def next_node(component_type, tracker):
-            if (
-                component_type == ComponentType.FULL
-                and tracker[ComponentType.FULL] < 16
-            ):
-                return tracker[ComponentType.FULL] // 4 + 1, True
-            return None, False
-
-        def evict_leaf(_node_id, tracker):
-            nonlocal leaf_count
-            leaf_count += 1
-            tracker[ComponentType.FULL] += 4
-            if leaf_count == 2:
-                capacity["byte_slots"] += 1
-            return None
-
-        cache._evict_device_next_node = MagicMock(side_effect=next_node)
-        cache._evict_device_leaf = MagicMock(side_effect=evict_leaf)
-
-        result = cache.evict_for_alloc(EvictParams(mamba_num=1))
-
-        self.assertEqual(leaf_count, 2)
-        self.assertEqual(result.num_tokens_evicted, 8)
-        cache.tree_core.evict_device_start.assert_called_once_with(
-            ComponentType.FULL, 16
-        )
-
-    def test_full_donor_defers_preparation_until_safe_lower_bound(self):
-        cache, capacity, allocator = self._build_unified_mamba_donor_cache(
-            free_ids=2, byte_slots=1
-        )
-        leaf_count = 0
-
-        allocator.full_tokens_before_mamba_recheck.return_value = 8
-
-        def prepare(_target_size):
-            if leaf_count >= 2:
-                capacity["byte_slots"] = 2
-
-        allocator.prepare_mamba_allocation = MagicMock(side_effect=prepare)
-        cache._evict_device_next_node = MagicMock(return_value=(1, True))
-
-        def evict_leaf(_node_id, tracker):
-            nonlocal leaf_count
-            leaf_count += 1
-            tracker[ComponentType.FULL] += 4
-            return None
-
-        cache._evict_device_leaf = MagicMock(side_effect=evict_leaf)
-
-        result = cache.evict_for_alloc(EvictParams(mamba_num=1))
-
-        self.assertEqual(leaf_count, 2)
-        self.assertEqual(result.num_tokens_evicted, 8)
-        # One initial layout preparation plus one check at the lower bound.
-        self.assertEqual(allocator.prepare_mamba_allocation.call_count, 2)
-
-    def test_full_donor_observes_cascade_before_lower_bound(self):
-        cache, capacity, allocator = self._build_unified_mamba_donor_cache(
-            free_ids=2, byte_slots=1
-        )
-        allocator.full_tokens_before_mamba_recheck.return_value = 100
-        allocator.prepare_mamba_allocation = MagicMock()
-        cache._evict_device_next_node = MagicMock(return_value=(1, True))
-
-        def evict_leaf(_node_id, tracker):
-            tracker[ComponentType.FULL] += 4
-            tracker[ComponentType.MAMBA] += 1
-            capacity["byte_slots"] = 2
-            return None
-
-        cache._evict_device_leaf = MagicMock(side_effect=evict_leaf)
-
-        result = cache.evict_for_alloc(EvictParams(mamba_num=1))
-
-        self.assertEqual(result.num_tokens_evicted, 4)
-        self.assertEqual(result.mamba_num_evicted, 1)
-        # Only the pre-donor preparation runs; the cheap capacity check stops
-        # before the Full-byte lower bound after the Mamba cascade is visible.
-        allocator.prepare_mamba_allocation.assert_called_once()
-
-    def test_full_donor_rechecks_each_leaf_after_lower_bound(self):
-        cache, capacity, allocator = self._build_unified_mamba_donor_cache(
-            free_ids=2, byte_slots=1
-        )
-        leaf_count = 0
-
-        allocator.full_tokens_before_mamba_recheck.return_value = 8
-
-        def prepare(_target_size):
-            if leaf_count >= 3:
-                capacity["byte_slots"] = 2
-
-        allocator.prepare_mamba_allocation = MagicMock(side_effect=prepare)
-        cache._evict_device_next_node = MagicMock(return_value=(1, True))
-
-        def evict_leaf(_node_id, tracker):
-            nonlocal leaf_count
-            leaf_count += 1
-            tracker[ComponentType.FULL] += 4
-            return None
-
-        cache._evict_device_leaf = MagicMock(side_effect=evict_leaf)
-
-        result = cache.evict_for_alloc(EvictParams(mamba_num=1))
-
-        self.assertEqual(leaf_count, 3)
-        self.assertEqual(result.num_tokens_evicted, 12)
-        # The failed lower-bound check falls back to leaf-granular checks.
-        self.assertEqual(allocator.prepare_mamba_allocation.call_count, 3)
-
-    def test_mamba_cache_is_last_resort_when_full_donor_is_exhausted(self):
-        cache, capacity, _ = self._build_unified_mamba_donor_cache(
-            free_ids=2, byte_slots=0
-        )
-        cache.tree_core.full_evictable_size.return_value = 4
-
-        def next_node(component_type, tracker):
-            if component_type == ComponentType.FULL and tracker[component_type] < 4:
-                return 1, True
-            if component_type == ComponentType.MAMBA and tracker[component_type] < 8:
-                return 2, True
-            return None, False
-
-        def evict_leaf(node_id, tracker):
-            if node_id == 1:
-                tracker[ComponentType.FULL] += 4
-            else:
-                tracker[ComponentType.MAMBA] += 1
-                capacity["free_ids"] += 1
-                capacity["byte_slots"] += 1
-            return None
-
-        cache._evict_device_next_node = MagicMock(side_effect=next_node)
-        cache._evict_device_leaf = MagicMock(side_effect=evict_leaf)
-
-        result = cache.evict_for_alloc(EvictParams(mamba_num=1))
-
-        self.assertEqual(capacity, {"free_ids": 3, "byte_slots": 1})
-        self.assertEqual(result.num_tokens_evicted, 4)
-        self.assertEqual(result.mamba_num_evicted, 1)
-        self.assertEqual(
-            cache.tree_core.evict_device_start.call_args_list,
-            [
-                unittest.mock.call(ComponentType.FULL, 4),
-                unittest.mock.call(ComponentType.MAMBA, 8),
-            ],
-        )
-
-    def test_full_donor_flushes_grouped_frees_before_capacity_recheck(self):
-        cache, capacity, allocator = self._build_unified_mamba_donor_cache(
-            free_ids=2, byte_slots=1
-        )
-        allocator.free_group_begin()
-        allocator.full_attn_allocator.free.side_effect = lambda _indices: (
-            capacity.update(byte_slots=capacity["byte_slots"] + 1)
-        )
-        allocator.mamba_allocator.alloc.side_effect = lambda need_size: (
-            torch.arange(need_size)
-            if min(capacity["free_ids"], capacity["byte_slots"]) >= need_size
-            else None
-        )
-
-        cache._evict_device_next_node = MagicMock(return_value=(1, True))
-
-        def evict_leaf(_node_id, tracker):
-            tracker[ComponentType.FULL] += 4
-            allocator.free(torch.tensor([1], dtype=torch.int64))
-            return None
-
-        cache._evict_device_leaf = MagicMock(side_effect=evict_leaf)
-
-        result = cache.evict_for_alloc(EvictParams(mamba_num=1))
-
-        self.assertEqual(capacity["byte_slots"], 2)
-        self.assertEqual(result.num_tokens_evicted, 4)
-        self.assertEqual(allocator.free_group, [])
-        self.assertEqual(allocator.free_page_reps_group, [])
-        allocator.full_attn_allocator.free.assert_called_once()
-        self.assertIsNotNone(allocator.mamba_allocator.alloc(2))
-        allocator.free_group_end()
-
-    def test_tri_pool_uses_the_same_full_donor_capability(self):
-        cache, capacity, allocator = self._build_unified_mamba_donor_cache(
-            free_ids=2, byte_slots=1, tri_pool=True
-        )
-
-        cache._evict_device_next_node = MagicMock(return_value=(1, True))
-
-        def evict_leaf(_node_id, tracker):
-            tracker[ComponentType.FULL] += 4
-            capacity["byte_slots"] += 1
-            return None
-
-        cache._evict_device_leaf = MagicMock(side_effect=evict_leaf)
-
-        result = cache.evict_for_alloc(EvictParams(mamba_num=1))
-
-        self.assertIs(allocator.mamba_full_cache_donor(), allocator)
-        self.assertEqual(capacity["byte_slots"], 2)
-        self.assertEqual(result.num_tokens_evicted, 4)
-        self.assertEqual(result.mamba_num_evicted, 0)
-        cache.tree_core.evict_device_start.assert_called_once_with(
-            ComponentType.FULL, 16
-        )
 
     def test_common_helper_uses_allocation_aware_entry_point(self):
         tree_cache = MagicMock()
@@ -599,8 +170,144 @@ class TestUnifiedRadixAllocationEviction(CustomTestCase):
 
         evict_from_tree_cache(tree_cache, num_tokens=100)
 
-        tree_cache.evict_for_alloc.assert_called_once_with(EvictParams(num_tokens=70))
+        tree_cache.evict_for_alloc.assert_called_once_with(KVDemand(full_tokens=100))
         tree_cache.evict.assert_not_called()
+
+    def test_default_cache_evicts_the_shortfall_of_a_demand(self):
+        from types import SimpleNamespace
+
+        from sglang.srt.mem_cache.base_prefix_cache import (
+            BasePrefixCache,
+            EvictResult,
+        )
+
+        for supports_swa, demand, expected in [
+            (False, KVDemand(full_tokens=100), EvictParams(num_tokens=70)),
+            (False, KVDemand(full_tokens=30), None),
+            (
+                True,
+                KVDemand(full_tokens=100, window_tokens={"swa": 100}),
+                EvictParams(num_tokens=60, window_num_tokens={"swa": 90}),
+            ),
+            (True, KVDemand(full_tokens=40, window_tokens={"swa": 10}), None),
+        ]:
+            with self.subTest(supports_swa=supports_swa, demand=demand):
+                # Pools of their own; a window pool beside the token pool
+                # leaves the token pool its full side (40 of 30 + 10).
+                allocator = SimpleNamespace(
+                    pools_share_memory=False,
+                    owner_available_size=lambda: 40 if supports_swa else 30,
+                    window_available_size=lambda name: 10,
+                )
+                cache = SimpleNamespace(
+                    token_to_kv_pool_allocator=allocator,
+                    supports_swa=lambda: supports_swa,
+                    window_sub_pools=lambda: (("swa", 4),) if supports_swa else (),
+                    window_available_size=lambda name: allocator.window_available_size(
+                        name
+                    ),
+                    evict=MagicMock(return_value=EvictResult(num_tokens_evicted=1)),
+                )
+                cache.evict_pool_shortfalls = lambda d, cache=cache: (
+                    BasePrefixCache.evict_pool_shortfalls(cache, d)
+                )
+                BasePrefixCache.evict_for_alloc(cache, demand)
+                if expected is None:
+                    cache.evict.assert_not_called()
+                else:
+                    cache.evict.assert_called_once_with(expected)
+
+
+class _ResidencyCore:
+    """A Rust TreeCore stand-in with the cache-residency bindings."""
+
+    def __init__(self):
+        self._binding = SimpleNamespace(
+            configure_cache_residency=None,
+            mark_host_evict_first=None,
+            cache_residency_stats=None,
+        )
+        self.configured = None
+        self.marked = []
+
+    def configure_cache_residency(self, **kwargs):
+        self.configured = kwargs
+
+    def mark_host_evict_first(self, node_ids):
+        self.marked.append(list(node_ids))
+        return len(node_ids)
+
+    def cache_residency_stats(self):
+        return {"host_evict_first_nodes": len(self.marked)}
+
+
+def _req(rid, session, parent=None, last_node=None):
+    return SimpleNamespace(
+        rid=rid, session_id=session, parent_session_id=parent, last_node=last_node
+    )
+
+
+class TestSubagentHostEvictFirst(CustomTestCase):
+    """SGLANG_OPT_HICACHE_SUBAGENT_HOST_EVICT_FIRST: a parent session's next request
+    ranks its finished sub-agents' last nodes first for host eviction."""
+
+    def _residency(self, *, on=True, write_back=True, core=None):
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True),
+            envs.SGLANG_OPT_HICACHE_SUBAGENT_HOST_EVICT_FIRST.override(on),
+        ):
+            return cache_residency.CacheResidency(
+                tree_core=core or _ResidencyCore(), is_write_back=write_back
+            )
+
+    def test_off_by_default_and_checked_when_on(self):
+        with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(True):
+            self.assertFalse(envs.SGLANG_OPT_HICACHE_SUBAGENT_HOST_EVICT_FIRST.get())
+        self.assertIsNone(self._residency(on=False).subagents)
+        with self.assertRaisesRegex(ValueError, "write_back"):
+            self._residency(write_back=False)
+        with self.assertRaisesRegex(RuntimeError, "cache-residency bindings"):
+            self._residency(core=SimpleNamespace(_binding=SimpleNamespace()))
+        core = _ResidencyCore()
+        residency = self._residency(core=core)
+        self.assertEqual(
+            core.configured,
+            {"host_evict_first": True},
+        )
+        self.assertIsNotNone(residency.subagents)
+
+    def test_finished_children_are_marked_at_the_parents_next_request(self):
+        core = _ResidencyCore()
+        tracker = self._residency(core=core).subagents
+        tracker.on_admit(_req("p1", "parent"))
+        tracker.on_admit(_req("c1", "child-a", parent="parent"))
+        tracker.on_admit(_req("c2", "child-b", parent="parent"))
+        tracker.on_release(_req("c1", "child-a", parent="parent", last_node=11))
+        tracker.on_release(_req("p1", "parent", last_node=3))
+        # child-b is still in flight: only child-a is finished
+        tracker.on_admit(_req("p2", "parent"))
+        self.assertEqual(core.marked, [[11]])
+        tracker.on_release(_req("c2", "child-b", parent="parent", last_node=12))
+        tracker.on_admit(_req("p3", "parent"))
+        self.assertEqual(core.marked, [[11], [12]])
+        # a request outside any session, and a parent without sub-agents, mark nothing
+        tracker.on_admit(_req("x", None))
+        tracker.on_admit(_req("p4", "other"))
+        self.assertEqual(len(core.marked), 2)
+
+    def test_radix_cache_hooks_reach_the_tracker(self):
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache._residency = SimpleNamespace(subagents=MagicMock())
+        cache.session = SimpleNamespace(try_match_prefix=lambda params: "matched")
+        cache._components_tuple = ()
+        req = _req("r", "s")
+        self.assertEqual(
+            cache.match_prefix(SimpleNamespace(req=req)),
+            "matched",
+        )
+        cache.on_release(req, checkpointed=True)
+        cache._residency.subagents.on_admit.assert_called_once_with(req)
+        cache._residency.subagents.on_release.assert_called_once_with(req)
 
 
 if __name__ == "__main__":

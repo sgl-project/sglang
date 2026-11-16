@@ -19,9 +19,9 @@ use crate::unified_lru_list::{TlruFloatConfig, TlruPromptEstimate};
 use crate::unified_tree_core::KvCacheEvent;
 use crate::unified_tree_core::{
     BufferBackupSnapshot, BufferBackupState, CacheAction, CacheActions, CacheInitParams,
-    CacheTransferPhase, DecLockRefParams, EvictLayer, EvictionStepResult, InsertParams,
-    InsertResult, InsertStepResult, MatchPrefixParams, MatchResult, PoolHitPolicy, PoolName,
-    PoolTransfer, PoolTransferResult, Req, UnifiedTreeCore,
+    CacheResidencyOptions, CacheTransferPhase, DecLockRefParams, EvictLayer, EvictionStepResult,
+    InsertParams, InsertResult, InsertStepResult, MatchPrefixParams, MatchResult, PoolHitPolicy,
+    PoolName, PoolTransfer, PoolTransferResult, Req, UnifiedTreeCore,
 };
 
 /// Translate only Rust panics; ordinary Python errors pass through unchanged.
@@ -396,6 +396,7 @@ pub struct TreeCoreInitParamsBinding {
     pub slru_protected_threshold: i64,
     pub tlru_tail_budget: usize,
     pub tlru_float_config: Option<TlruFloatConfigBinding>,
+    pub state_cost: Option<(f64, f64)>,
     pub page_size: usize,
     pub is_write_back: bool,
     pub enable_hicache: bool,
@@ -408,6 +409,7 @@ pub struct TreeCoreInitParamsBinding {
     pub mamba_cache_chunk_size: Option<usize>,
     pub mamba_max_states_per_path: Option<usize>,
     pub mamba_host_only_checkpoint: bool,
+    pub joint_lru: bool,
 }
 
 impl TreeCoreInitParamsBinding {
@@ -418,6 +420,7 @@ impl TreeCoreInitParamsBinding {
             slru_protected_threshold: self.slru_protected_threshold,
             tlru_tail_budget: self.tlru_tail_budget,
             tlru_float_config: self.tlru_float_config.as_ref().map(|value| value.config),
+            state_cost: self.state_cost,
             page_size: self.page_size,
             is_write_back: self.is_write_back,
             enable_hicache: self.enable_hicache,
@@ -432,6 +435,7 @@ impl TreeCoreInitParamsBinding {
             mamba_cache_chunk_size: self.mamba_cache_chunk_size,
             mamba_max_states_per_path: self.mamba_max_states_per_path,
             mamba_host_only_checkpoint: self.mamba_host_only_checkpoint,
+            joint_lru: self.joint_lru,
         })
     }
 }
@@ -439,7 +443,7 @@ impl TreeCoreInitParamsBinding {
 #[pymethods]
 impl TreeCoreInitParamsBinding {
     #[new]
-    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false, mamba_host_only_checkpoint = false))]
+    #[pyo3(signature = (eviction_policy = "lru".to_string(), page_size = 1, is_write_back = false, enable_hicache = false, write_through_threshold = 256, device = "cpu".to_string(), swa_sliding_window_size = None, enable_kv_cache_events = false, mamba_cache_chunk_size = None, mamba_max_states_per_path = None, slru_protected_threshold = 2, swa_req_ring = false, tlru_tail_budget = 0, tlru_float_config = None, dynamo_kv_event_format = false, mamba_host_only_checkpoint = false, joint_lru = false, state_cost = None))]
     fn new(
         eviction_policy: String,
         page_size: usize,
@@ -457,12 +461,15 @@ impl TreeCoreInitParamsBinding {
         tlru_float_config: Option<TlruFloatConfigBinding>,
         dynamo_kv_event_format: bool,
         mamba_host_only_checkpoint: bool,
+        joint_lru: bool,
+        state_cost: Option<(f64, f64)>,
     ) -> Self {
         TreeCoreInitParamsBinding {
             eviction_policy,
             slru_protected_threshold,
             tlru_tail_budget,
             tlru_float_config,
+            state_cost,
             page_size,
             is_write_back,
             enable_hicache,
@@ -475,6 +482,7 @@ impl TreeCoreInitParamsBinding {
             mamba_cache_chunk_size,
             mamba_max_states_per_path,
             mamba_host_only_checkpoint,
+            joint_lru,
         }
     }
 }
@@ -1994,6 +2002,27 @@ macro_rules! tree_core_methods {
                     .map_err(node_access_error)
             }
 
+            /// Set the cache-residency switches (all off by default).
+            fn configure_cache_residency(&self, py: Python<'_>, host_evict_first: bool) {
+                let options = CacheResidencyOptions { host_evict_first };
+                py.detach(|| self.core().configure_cache_residency(options));
+            }
+
+            /// Cumulative residency counters, by name.
+            fn cache_residency_stats(&self, py: Python<'_>) -> HashMap<&'static str, u64> {
+                let stats = py.detach(|| self.core().cache_residency_stats());
+                HashMap::from([
+                    ("host_evict_first_marked", stats.host_evict_first_marked),
+                    ("host_evict_first_full_tokens", stats.host_evict_first_full_tokens),
+                    ("host_evict_first_mamba_states", stats.host_evict_first_mamba_states),
+                ])
+            }
+
+            /// Mark finished nodes host evict-first; returns the nodes newly marked.
+            fn mark_host_evict_first(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> usize {
+                py.detach(|| self.core().mark_host_evict_first(node_ids))
+            }
+
             /// Release a node's device KV once its host copy exists.
             fn demote(&self, py: Python<'_>, node_id: NodeId) -> PyResult<DemoteResultBinding> {
                 let result = py
@@ -3374,6 +3403,24 @@ macro_rules! tree_core_binding {
                 catch_native_panic(|| self.inner.mark_write_back_queued(py, node_id, copied))
             }
 
+            /// Set the cache-residency switches (all off by default).
+            fn configure_cache_residency(&self, py: Python<'_>, host_evict_first: bool) -> PyResult<()> {
+                catch_native_panic(|| {
+                    self.inner.configure_cache_residency(py, host_evict_first);
+                    Ok(())
+                })
+            }
+
+            /// Cumulative residency counters, by name.
+            fn cache_residency_stats(&self, py: Python<'_>) -> PyResult<HashMap<&'static str, u64>> {
+                catch_native_panic(|| Ok(self.inner.cache_residency_stats(py)))
+            }
+
+            /// Mark finished nodes host evict-first; returns the nodes newly marked.
+            fn mark_host_evict_first(&self, py: Python<'_>, node_ids: Vec<NodeId>) -> PyResult<usize> {
+                catch_native_panic(|| Ok(self.inner.mark_host_evict_first(py, node_ids)))
+            }
+
             /// Release a node's device KV once its host copy exists.
             fn demote(&self, py: Python<'_>, node_id: NodeId) -> PyResult<DemoteResultBinding> {
                 catch_native_panic(|| self.inner.demote(py, node_id))
@@ -3972,8 +4019,59 @@ macro_rules! tree_core_binding {
     };
 }
 
-tree_core_binding! {
-    core = UnifiedTreeCore;
+// Only UnifiedTreeCore has the joint Full/SWA eviction walk.
+impl<K: ChildKeyType + Send + Sync> TreeCoreBinding<UnifiedTreeCore<K>> {
+    fn start_joint_eviction(&self, py: Python<'_>) {
+        py.detach(|| self.core().start_joint_eviction());
+    }
+
+    fn next_joint_eviction_victim(&self, py: Python<'_>) -> Option<(u8, NodeId)> {
+        py.detach(|| self.core().next_joint_eviction_victim())
+            .map(|(ct, node_id)| (ct as u8, node_id))
+    }
+
+    fn end_joint_eviction(&self, py: Python<'_>) {
+        py.detach(|| self.core().end_joint_eviction());
+    }
+}
+
+// Stamps the UnifiedTreeCore pyclasses, each with the joint-eviction forwarders.
+macro_rules! unified_tree_core_bindings {
+    ($($(#[$doc:meta])* $name:ident, $key:ty;)+) => {
+        tree_core_binding! {
+            core = UnifiedTreeCore;
+            $(
+            $(#[$doc])*
+            $name,
+            $key,
+            {
+                fn start_joint_eviction(&self, py: Python<'_>) -> PyResult<()> {
+                    catch_native_panic(|| {
+                        self.inner.start_joint_eviction(py);
+                        Ok(())
+                    })
+                }
+
+                fn next_joint_eviction_victim(
+                    &self,
+                    py: Python<'_>,
+                ) -> PyResult<Option<(u8, NodeId)>> {
+                    catch_native_panic(|| Ok(self.inner.next_joint_eviction_victim(py)))
+                }
+
+                fn end_joint_eviction(&self, py: Python<'_>) -> PyResult<()> {
+                    catch_native_panic(|| {
+                        self.inner.end_joint_eviction(py);
+                        Ok(())
+                    })
+                }
+            };
+            )+
+        }
+    };
+}
+
+unified_tree_core_bindings! {
     /// The UnifiedTreeCore Python adapter over single-token (unigram) child keys.
     RustUnifiedTreeCoreBinding,
     Vec<i64>;
@@ -4022,7 +4120,14 @@ fn get_hash_str(
     })
 }
 
+/// Residency switches this build carries; a loader checks it before enabling one.
+#[pyfunction]
+fn cache_residency_features() -> Vec<&'static str> {
+    vec!["host_evict_first"]
+}
+
 fn register_mem_cache_module(m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_function(wrap_pyfunction!(cache_residency_features, m)?)?;
     m.add_class::<TlruFloatConfigBinding>()?;
     m.add_function(wrap_pyfunction!(get_hash_str, m)?)?;
     m.add_class::<TreeCoreInitParamsBinding>()?;

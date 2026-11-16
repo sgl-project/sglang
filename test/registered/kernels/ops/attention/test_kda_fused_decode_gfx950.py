@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
-import os
 import unittest
-from unittest.mock import patch
 
 import torch
 import torch.nn.functional as F
@@ -10,6 +8,7 @@ import torch.nn.functional as F
 from sglang.kernels.ops.attention import kda_fused_decode_gfx950
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.linear.kernels.kda_triton import TritonKDAKernel
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
@@ -104,8 +103,7 @@ class TestGfx950KDAFusedDecode(CustomTestCase):
         expected_inputs = _clone_caches(inputs)
         actual_inputs = _clone_caches(inputs)
         # the default backend
-        with patch.dict(os.environ):
-            os.environ.pop("SGLANG_ROCM_K3_KDA_FUSED_BACKEND", None)
+        with envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("gfx950"):
             self.assertTrue(
                 kda_fused_decode_gfx950.covered(
                     *(
@@ -136,6 +134,21 @@ class TestGfx950KDAFusedDecode(CustomTestCase):
         self.assertTrue(
             torch.equal(actual_inputs["conv_state"], expected_inputs["conv_state"])
         )
+
+    def test_bf16_pool_is_not_armed(self):
+        """The kernel takes an FP32 state only, so a BF16 pool must not arm it."""
+        with envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.override("gfx950"):
+            device = torch.device("cuda")
+            self.assertTrue(
+                kda_fused_decode_gfx950.available(
+                    device=device, state_dtype=torch.float32
+                )
+            )
+            self.assertFalse(
+                kda_fused_decode_gfx950.available(
+                    device=device, state_dtype=torch.bfloat16
+                )
+            )
 
     @torch.inference_mode()
     def test_non_positive_slots_are_skipped(self):

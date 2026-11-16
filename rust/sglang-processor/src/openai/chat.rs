@@ -1420,10 +1420,14 @@ impl ChatResponder {
         events
     }
 
-    /// `_reported_prompt_tokens`.
+    /// `_reported_prompt_tokens` and `_reported_cached_tokens`.
     fn report_prompt_tokens(&self, meta: &mut GenerateMetaInfo) {
         meta.prompt_tokens =
             u64::from(meta.prompt_tokens).saturating_sub(self.unreported_prompt_tokens) as u32;
+        if self.unreported_prompt_tokens > 0 {
+            // A full-prompt cache hit also covers the prompt tokens left out above.
+            meta.cached_tokens = meta.cached_tokens.min(meta.prompt_tokens);
+        }
     }
 
     /// A `ToolCall` as Pydantic dumps it, with `_process_tool_call_id`'s id.
@@ -1667,5 +1671,95 @@ mod tests {
             .collect();
         assert!(created.len() > 1, "{events:?}");
         assert!(created.iter().all(|c| *c == json!(1)), "{created:?}");
+    }
+
+    /// A K3 cache hit reaching the generation stub left out of `prompt_tokens`
+    /// is capped at `prompt_tokens`; one ending before the stub, and other
+    /// models, keep the engine's count. Unary, final-usage and continuous-usage
+    /// replies agree.
+    #[test]
+    fn kimi_k3_cached_tokens_exclude_the_generation_stub() {
+        let k3 = ChatModel {
+            chat_encoding_spec: Some("kimi_k3".into()),
+            ..ChatModel::default()
+        };
+        let other = ChatModel::default();
+        // (model, engine prompt, engine cached, reported prompt, reported cached)
+        let cases = [
+            (&k3, 2075, 2073, 2072, 2072),
+            (&k3, 2075, 2000, 2072, 2000),
+            (&other, 2075, 2073, 2075, 2073),
+        ];
+        let stream_options = [
+            None,
+            Some(json!({"include_usage": true})),
+            Some(json!({"continuous_usage_stats": true})),
+        ];
+        for (model, prompt, cached, want_prompt, want_cached) in cases {
+            for options in &stream_options {
+                let usage = one_frame_usage(model, options.as_ref(), prompt, cached);
+                assert_eq!(
+                    usage["prompt_tokens"],
+                    json!(want_prompt),
+                    "{options:?} {usage}"
+                );
+                assert_eq!(
+                    usage["prompt_tokens_details"]["cached_tokens"],
+                    json!(want_cached),
+                    "{options:?} {usage}"
+                );
+            }
+        }
+    }
+
+    /// The usage of a one-frame chat reply with cache reporting on: unary
+    /// without `stream_options`, streamed with them.
+    fn one_frame_usage(
+        model: &ChatModel,
+        stream_options: Option<&Value>,
+        prompt_tokens: u32,
+        cached_tokens: u32,
+    ) -> Value {
+        let mut body = json!({"model": "m", "messages": [{"role": "user", "content": "hi"}]});
+        if let Some(options) = stream_options {
+            body["stream"] = json!(true);
+            body["stream_options"] = options.clone();
+        }
+        let settings = OpenAiSettings {
+            enable_cache_report: true,
+            ..OpenAiSettings::default()
+        };
+        let (_, mut responder) = lower_chat(
+            &serde_json::to_vec(&body).unwrap(),
+            &OpenAiHeaders::default(),
+            &settings,
+            model,
+            |_: &Value| Some(vec![1]),
+            None,
+        )
+        .unwrap();
+        let frame: GenerateResponse = serde_json::from_value(json!({
+            "text": "a",
+            "output_ids": [2],
+            "meta_info": {
+                "id": "r",
+                "finish_reason": {"type": "stop"},
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": 1,
+                "cached_tokens": cached_tokens,
+            },
+        }))
+        .unwrap();
+        if stream_options.is_none() {
+            let reply = responder.unary(vec![frame]).expect("unary reply");
+            return serde_json::from_str::<Value>(&reply.body).unwrap()["usage"].clone();
+        }
+        let mut events = responder.stream_data(Ok(frame)).unwrap();
+        events.extend(responder.stream_end());
+        events
+            .iter()
+            .filter_map(|event| serde_json::from_str::<Value>(event.strip_prefix("data: ")?).ok())
+            .find_map(|chunk| chunk.get("usage").filter(|u| !u.is_null()).cloned())
+            .expect("usage chunk")
     }
 }

@@ -111,6 +111,49 @@ def test_content_masks_model_identity_and_copy_isolation():
 
 
 @torch.no_grad()
+def test_h3_reference_rows_are_cached_per_image_not_per_tile():
+    """A reference re-sent in a later request must skip the whole tiled VAE
+    encode, even when it has more tiles than the cache holds entries."""
+    from PIL import Image
+
+    from sglang.multimodal_gen.configs.models.vaes.minimax_h3_video import (
+        MiniMaxH3VideoVAEArchConfig,
+    )
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.keyframe_encoding import (
+        minimax_h3_encode_keyframe_cond_rows,
+    )
+
+    class TiledVAE(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(()))
+            self.parallel_tiling = False
+            self.calls = 0
+
+        def encode_images(self, image, use_fp16_latent):
+            self.calls += 1
+            for _ in range(200):  # more tiles than the cache's 128 entries
+                self.encode(torch.zeros(1))
+            return [torch.full((24, 1, 4, 4), float(image.getpixel((0, 0))[0]))]
+
+        @cached_vae_encode
+        def encode(self, x):
+            return x
+
+    arch = MiniMaxH3VideoVAEArchConfig(latents_mean=[0.0] * 24, latents_std=[1.0] * 24)
+    vae = TiledVAE().eval()
+    red, blue = Image.new("RGB", (64, 64), "red"), Image.new("RGB", (64, 64), "blue")
+    cache = ConditioningCache(1024 * 1024)
+    with cache.scope():
+        first = minimax_h3_encode_keyframe_cond_rows(vae, red, arch)
+    with cache.scope():
+        again = minimax_h3_encode_keyframe_cond_rows(vae, red.copy(), arch)
+        minimax_h3_encode_keyframe_cond_rows(vae, blue, arch)
+    assert vae.calls == 2
+    torch.testing.assert_close(again, first, rtol=0, atol=0)
+
+
+@torch.no_grad()
 def test_lru_budget_and_oversized_outputs():
     cache = ConditioningCache(32)
     model = Encoder().eval()
@@ -124,6 +167,75 @@ def test_lru_budget_and_oversized_outputs():
     assert cache.evictions == 2
     assert cache.bytes == before == 32
     assert cache.bypasses == 1
+
+
+@torch.no_grad()
+def test_partial_edit_of_request_with_more_than_128_entries_reuses_the_rest():
+    """Editing a few of a request's 148 small entries (tiled VAE references) must
+    recompute only those; a 128-entry LRU evicted all of them between requests."""
+    cache = ConditioningCache(1 << 20)
+    model = Encoder().eval()
+    tiles = [torch.full((4,), float(value)) for value in range(148)]
+    edited = list(tiles)
+    for index in (3, 70, 140):  # a local edit touches a few tiles
+        edited[index] = tiles[index] + 1000
+    with cache.scope():
+        for x in tiles:
+            model(x)
+        for x in edited:
+            model(x)
+    assert (model.calls, cache.hits, cache.evictions) == (151, 145, 0)
+
+
+@torch.no_grad()
+def test_group_tier_keeps_a_stage_with_more_than_128_private_entries():
+    """A grouped stage must reuse every private snapshot within the entry limit;
+    a fixed 128-entry group tier dropped the rest of a large tiled reference."""
+    cache = ConditioningCache(0)  # cross-request tier off, so only group hits count
+    model = Encoder().eval()
+    tiles = [torch.full((4,), float(value)) for value in range(148)]
+    with cache.scope(), cache.group_scope():
+        for _ in range(2):
+            for x in tiles:
+                model(x)
+    assert (model.calls, cache.group_hits) == (148, 148)
+
+
+@torch.no_grad()
+def test_entry_limit_evicts_lru_and_keeps_preferred_entries():
+    model = Encoder().eval()
+
+    def encode(value, *, preferred=False):
+        with prefer_conditioning_cache() if preferred else nullcontext():
+            model(torch.full((4,), float(value)))
+
+    lru = ConditioningCache(1 << 20, max_entries=2)
+    with lru.scope():
+        encode(1)
+        encode(2)
+        encode(1)  # hit: 2 becomes least recent
+        encode(3)  # evicts 2, not 1
+        encode(1)
+        assert lru.hits == 2
+        encode(2)
+        assert lru.hits == 2
+
+    protected = ConditioningCache(1 << 20, max_entries=2)
+    with protected.scope():
+        encode(10, preferred=True)
+        encode(11)
+        encode(12)  # a normal store evicts 11, never the older preferred 10
+        encode(10, preferred=True)
+        encode(12)
+        assert protected.hits == 2
+
+    full = ConditioningCache(1 << 20, max_entries=1)
+    with full.scope():
+        encode(20, preferred=True)
+        encode(21)  # only a preferred entry could make room: bypass
+        assert full.stats()["entries"] == 1 and full.bypasses == 1
+        encode(22, preferred=True)  # a preferred store may evict it
+        assert full.stats()["entries"] == 1 and full.evictions == 1
 
 
 @torch.no_grad()
@@ -468,6 +580,60 @@ def test_rank_local_eviction_forces_collective_miss(tmp_path, disabled_rank, gro
     mp.spawn(
         _rank_eviction,
         args=(f"file://{tmp_path / 'rendezvous'}", disabled_rank, grouped),
+        nprocs=2,
+        join=True,
+    )
+
+
+def _rank_local_vae(rank, init_method):
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=2,
+        init_method=init_method,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        from sglang.multimodal_gen.runtime.cache import conditioning
+
+        # The CPU process group exercises independent rank-local cache state;
+        # no SGLang model-parallel group is needed by this collective-free VAE.
+        conditioning.model_parallel_is_initialized = lambda: True
+        conditioning.get_world_size = dist.get_world_size
+        cache = ConditioningCache(4096)
+        model = VAE().eval()
+        x = torch.ones(1, 4, 2, 2)
+        with torch.no_grad(), cache.scope():
+            model.encode(x)
+            model.encode(x)
+            assert model.calls == 2  # Unknown distributed VAEs still bypass.
+            model.conditioning_encode_is_rank_local = True
+            first = model.encode(x).latent_dist
+            hit = model.encode(x).latent_dist
+            assert model.calls == 3
+            for seed in (42, 1234):
+                torch.testing.assert_close(
+                    first.sample(generator=torch.Generator().manual_seed(seed)),
+                    hit.sample(generator=torch.Generator().manual_seed(seed)),
+                    rtol=0,
+                    atol=0,
+                )
+            if rank == 0:
+                cache.clear()
+            model.encode(x)
+            assert model.calls == (4 if rank == 0 else 3)
+            changed = model.encode(x + 1).latent_dist
+            assert model.calls == (5 if rank == 0 else 4)
+            assert not torch.equal(changed.mean, first.mean)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+def test_rank_local_vae_cache_preserves_sampling_and_independent_eviction(tmp_path):
+    mp.spawn(
+        _rank_local_vae,
+        args=(f"file://{tmp_path / 'vae-rendezvous'}",),
         nprocs=2,
         join=True,
     )

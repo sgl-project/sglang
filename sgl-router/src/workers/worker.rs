@@ -51,6 +51,8 @@ pub struct EngineProfile {
     pub openai: Option<Arc<OpenAiSettings>>,
     /// The engine's native gRPC port; `None` means gRPC clients cannot reach it.
     pub grpc_port: Option<u16>,
+    /// The engine's chat template renders a system message after the first.
+    pub supports_inline_system: bool,
 }
 
 impl From<WireProtocol> for EngineProfile {
@@ -60,6 +62,7 @@ impl From<WireProtocol> for EngineProfile {
             dp_ranks: 1,
             openai: None,
             grpc_port: None,
+            supports_inline_system: false,
         }
     }
 }
@@ -256,6 +259,7 @@ pub struct Worker {
     /// Round-robin position over this worker's DP ranks.
     dp_rank_turn: AtomicUsize,
     openai: Option<Arc<OpenAiSettings>>,
+    supports_inline_system: bool,
 }
 
 impl Worker {
@@ -276,6 +280,7 @@ impl Worker {
             dp_ranks,
             openai,
             grpc_port,
+            supports_inline_system,
         } = profile.into();
         let breaker = match cb {
             Some(cfg) => Arc::new(CircuitBreaker::with_config(cfg)),
@@ -303,11 +308,16 @@ impl Worker {
             dp_rank_inflight: (0..dp_ranks.max(1)).map(|_| AtomicUsize::new(0)).collect(),
             dp_rank_turn: AtomicUsize::new(0),
             openai,
+            supports_inline_system,
         }
     }
 
     pub fn openai_settings(&self) -> Option<&Arc<OpenAiSettings>> {
         self.openai.as_ref()
+    }
+
+    pub fn supports_inline_system(&self) -> bool {
+        self.supports_inline_system
     }
 
     pub fn services(&self) -> BTreeSet<String> {

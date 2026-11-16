@@ -30,6 +30,7 @@ from sglang.test.kernels.deepseek_v4.common import (
 )
 
 register_cuda_ci(est_time=50, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=50, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 _is_xpu = is_xpu()
 if _is_xpu:
@@ -140,6 +141,82 @@ def test_fp4_fused_q_indexer_rope_hadamard_quant(batch_size: int) -> None:
     torch.testing.assert_close(q_fp4.view(torch.uint8), ref_fp4)
     torch.testing.assert_close(q_sf, ref_sf)
     torch.testing.assert_close(weights_out.squeeze(-1), weight.float() * weight_scale)
+
+
+def _index_q_inputs(tokens: int, heads: int, kind: str, gen: torch.Generator):
+    shape = (tokens, heads, HEAD_DIM)
+    device = get_device()
+    x = torch.randn(shape, device=device, generator=gen)
+    if kind == "row_scales":
+        x = x * torch.exp(
+            torch.randn(tokens, heads, 1, device=device, generator=gen) * 6
+        )
+    elif kind == "sparse":
+        x = x * (torch.rand(shape, device=device, generator=gen) < 0.1)
+    elif kind == "tiny":
+        # Below both fp4 amax floors.
+        x = x * 1e-30
+    elif kind == "grid_ties":
+        grid = torch.tensor([0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0, 6.0], device=device)
+        x = x.sign() * grid[torch.randint(0, 8, shape, device=device, generator=gen)]
+    elif kind == "extreme":
+        # Per-row scales across the whole bf16 exponent range, subnormals included.
+        exponent = torch.randint(
+            -150, 126, (tokens, heads, 1), device=device, generator=gen
+        )
+        x = x * torch.exp2(exponent.float())
+    elif kind == "nonfinite":
+        u = torch.rand(shape, device=device, generator=gen)
+        x = torch.where(u < 0.003, float("inf"), x)
+        x = torch.where((u >= 0.003) & (u < 0.006), float("-inf"), x)
+        x = torch.where((u >= 0.006) & (u < 0.009), float("nan"), x)
+    x = x.bfloat16()
+    if kind == "sparse":
+        # Signed zeros: the packer clears the -0 code.
+        negative = torch.rand(shape, device=device, generator=gen) < 0.5
+        x = torch.where((x == 0) & negative, -0.0, x).bfloat16()
+    positions = torch.randint(0, 200000, (tokens,), device=device, generator=gen)
+    head_weights = (
+        torch.randn(tokens, heads, device=device, generator=gen) * 3
+    ).bfloat16()
+    return x, positions, head_weights
+
+
+@pytest.mark.skipif(
+    _is_xpu
+    or not torch.cuda.is_available()
+    or torch.cuda.get_device_capability()[0] != 10,
+    reason="Only SM100-family GPUs take the block kernel; elsewhere both calls use the warp kernel",
+)
+@pytest.mark.parametrize(
+    "kind",
+    ["normal", "row_scales", "sparse", "tiny", "grid_ties", "extreme", "nonfinite"],
+)
+@pytest.mark.parametrize("pos_dtype", [torch.int32, torch.int64])
+def test_index_q_rope_pack_prefill_matches_decode_kernel(kind, pos_dtype) -> None:
+    """Calls of >= 8192 (token, head) rows take the one-thread-per-fp4-block kernel
+    on SM100-family GPUs; 128-token calls keep the warp-per-row kernel. Both must
+    write the same bytes."""
+    from sglang.kernels.ops.attention.dsv4.fp4_indexer_rope import (
+        index_q_rope_pack_weights,
+    )
+
+    heads, tokens = 32, 4100
+    gen = torch.Generator(device=get_device()).manual_seed(0)
+    freqs = torch.randn(200000, 32, 2, device=get_device(), generator=gen)
+    freqs = (freqs / freqs.norm(dim=-1, keepdim=True)).flatten(1).contiguous()
+    x, positions, head_weights = _index_q_inputs(tokens, heads, kind, gen)
+    positions = positions.to(pos_dtype)
+
+    def call(rows: slice):
+        return index_q_rope_pack_weights(
+            x[rows], freqs, positions[rows], head_weights[rows], 0.0625
+        )
+
+    whole = call(slice(None))
+    parts = [call(slice(i, i + 128)) for i in range(0, tokens, 128)]
+    for j, name in enumerate(("payload", "scale", "weights")):
+        assert torch.equal(whole[j], torch.cat([p[j] for p in parts])), name
 
 
 def _make_logits_case(rows: int, heads: int, width: int, seed: int = 719):

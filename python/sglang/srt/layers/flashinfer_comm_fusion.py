@@ -19,6 +19,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     ceil_align,
     get_cuda_driver_bindings,
+    is_confidential_compute,
     is_flashinfer_available,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -49,6 +50,21 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
         raise ValueError(
             "FlashInfer allreduce fusion requires SM90 or SM10X NVIDIA GPUs."
         )
+
+    if is_confidential_compute():
+        if backend in ("mnnvl", "cutedsl"):
+            raise ValueError(
+                "FlashInfer allreduce fusion mnnvl/cutedsl backend requires NVLink "
+                "multicast, unavailable under NVIDIA Confidential Computing. "
+                "Use --flashinfer-allreduce-fusion-backend=trtllm instead."
+            )
+        if is_multi_node:
+            raise ValueError(
+                "FlashInfer allreduce fusion under NVIDIA Confidential Computing "
+                "is single-node only (multi-node needs the mnnvl backend, which "
+                "requires NVLink multicast)."
+            )
+        return "trtllm"
 
     if backend == "cutedsl":
         if not get_platform().is_sm100:
@@ -257,10 +273,16 @@ def _flashinfer_trtllm_workspace_allocation_sizes(
     max_token_num: int,
     hidden_dim: int,
     dtype: torch.dtype,
+    use_symm_device_memory: bool = True,
 ) -> list[int]:
-    """Mirror FlashInfer TRTLLM SymmDeviceMemory local allocation sizes."""
+    """Mirror FlashInfer TRTLLM workspace local allocation sizes.
+
+    Without SymmDeviceMemory (under Confidential Computing) FlashInfer uses torch
+    symmetric memory, so no VMM or multicast granularity applies and
+    ``cuda_driver`` and ``prop`` are unused.
+    """
     elem_size = 4 if dtype == torch.float32 else 2
-    buffer_size = world_size * max_token_num * hidden_dim * 2
+    buffer_size = world_size * max_token_num * hidden_dim * elem_size
     flag_size = world_size * 256 * 4
 
     max_comm_size = 2147483647 & ~((1 << 21) - 1)
@@ -276,6 +298,10 @@ def _flashinfer_trtllm_workspace_allocation_sizes(
         ceil_align(size, 1 << 21)
         for size in (buffer_size, flag_size, lamport_buffer_size)
     )
+    if not use_symm_device_memory:
+        # Symmetric memory adds a signal pad and rounds each buffer up to its
+        # allocation granularity; a 2 MiB margin per buffer covers both.
+        return [size + (1 << 21) for size in buffer_sizes]
 
     signal_pad_size = 2048
     allocation_sizes = []
@@ -332,6 +358,7 @@ def _preflight_check_workspace_memory(
     hidden_dim: int,
     dtype: torch.dtype,
     cpu_group: Optional["torch.distributed.ProcessGroup"] = None,
+    use_symm_device_memory: bool = True,
 ) -> bool:
     """Collectively decide whether to enter FlashInfer workspace creation.
 
@@ -340,6 +367,10 @@ def _preflight_check_workspace_memory(
     exits while peers enter handle exchange, peers can hang until the watchdog
     aborts. Probe the same handle type and allocation sequence first, then vote
     on a CPU group so all ranks proceed or skip together.
+
+    Under Confidential Computing FlashInfer allocates torch symmetric memory
+    instead and CC blocks the cuMemCreate probe, so the probe checks free device
+    memory; the vote still runs.
     """
     import torch.distributed as dist
 
@@ -352,8 +383,10 @@ def _preflight_check_workspace_memory(
 
     allocation_sizes = []
     try:
-        cuda_driver = get_cuda_driver_bindings()
-        prop = _make_flashinfer_workspace_allocation_prop(cuda_driver)
+        cuda_driver = prop = None
+        if use_symm_device_memory:
+            cuda_driver = get_cuda_driver_bindings()
+            prop = _make_flashinfer_workspace_allocation_prop(cuda_driver)
         allocation_sizes = _flashinfer_trtllm_workspace_allocation_sizes(
             cuda_driver,
             prop,
@@ -361,8 +394,12 @@ def _preflight_check_workspace_memory(
             max_token_num,
             hidden_dim,
             dtype,
+            use_symm_device_memory=use_symm_device_memory,
         )
-        local_ok = _probe_cumem_create_sequence(cuda_driver, allocation_sizes, prop)
+        if use_symm_device_memory:
+            local_ok = _probe_cumem_create_sequence(cuda_driver, allocation_sizes, prop)
+        else:
+            local_ok = torch.cuda.mem_get_info()[0] >= sum(allocation_sizes)
     except Exception as e:
         logger.warning(
             "FlashInfer workspace preflight probe failed (%s). "
@@ -384,7 +421,7 @@ def _preflight_check_workspace_memory(
     )
     if flag.item() == 0:
         logger.warning(
-            "FlashInfer workspace preflight: cuMemCreate probe failed on at "
+            "FlashInfer workspace preflight: the memory probe failed on at "
             "least one rank. Skipping allreduce fusion to avoid cross-rank "
             "desync inside the flashinfer collective."
         )
@@ -514,6 +551,7 @@ class FlashInferWorkspaceManager:
             hidden_dim=hidden_dim,
             dtype=dtype,
             cpu_group=cpu_group,
+            use_symm_device_memory=not is_confidential_compute(),
         ):
             _flashinfer_allreduce_unavailable = True
             self.workspace = None

@@ -28,10 +28,11 @@ ScheduleBatch -> ForwardBatch
 from __future__ import annotations
 
 import hashlib
+import logging
 import warnings
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -70,7 +71,10 @@ from sglang.srt.utils import (
     support_triton,
 )
 from sglang.srt.utils.common import ceil_align
-from sglang.srt.utils.device import is_pin_memory_available
+from sglang.srt.utils.device import (
+    async_h2d_stack,
+    is_pin_memory_available,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
@@ -87,9 +91,12 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
+logger = logging.getLogger(__name__)
+
 # Warn-once flag for the deprecated skip_attn_backend_init kwarg; see
 # ForwardBatch.apply_deprecated_skip_attn_backend_init.
 _skip_attn_backend_init_warned = False
+_mrope_text_device_logged = False
 
 _is_npu = is_npu()
 _is_cpu = is_cpu()
@@ -663,6 +670,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For multimodal
     mm_input_embeds: Optional[torch.Tensor] = None
 
+    # spec.BuiltMegakernel's draft_step_fold for this EAGLE draft round
+    draft_step_fold: Optional[Any] = None
+
     # Encoder-decoder cross-attention mask
     cross_attention_custom_mask: Optional[torch.Tensor] = None
 
@@ -684,12 +694,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # Each DP rank's rows from a late-layer row switch on; None on steps that skip
     # the exchange.
     global_late_layer_num_tokens_cpu: Optional[List[int]] = None
+    global_late_layer_tail_graph_compatible: bool = False
 
     # For Qwen2-VL
     mrope_positions: torch.Tensor = None
 
     # For two-batch overlap
     tbo_parent_token_range: Optional[Tuple[int, int]] = None
+    # This DP rank's first row in the parent's gathered layout; non-EP DP TBO only.
+    tbo_parent_dp_offset: Optional[int] = None
     tbo_padded_len: Optional[int] = None
     tbo_children: Optional[List[ForwardBatch]] = None
 
@@ -1216,6 +1229,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
 
         if model_runner.ngram_embedding_manager.enabled:
             ret._init_ngram_embedding_info(batch, device)
+            if _is_npu and ret.forward_mode.is_target_verify():
+                # Stage verify tokens before NPU ngram lookup reads the token table.
+                model_runner.ngram_embedding_manager.prepare_for_verify(ret)
 
         if model_runner.model_config.model_is_mrope:
             if spec_mrope_positions is not None:
@@ -1469,6 +1485,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     def _init_ngram_embedding_info(self, batch: ScheduleBatch, device: torch.device):
         if self.forward_mode.is_decode():
             column_starts, req_lens = self.seq_lens - 1, 1
+        elif _is_npu and self.forward_mode.is_target_verify():
+            # Verify seq_lens excludes the window of draft_token_num input tokens.
+            column_starts = self.seq_lens
+            req_lens = self.spec_info.draft_token_num
         else:
             column_starts, req_lens = self.extend_prefix_lens, self.extend_seq_lens
         self.ngram_embedding_info = NgramEmbeddingInfo.create(
@@ -1508,7 +1528,7 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
                 )
                 for i in range(batch_size)
             ]
-            mrope_delta_tensor = torch.stack(mrope_deltas, dim=0).to(device=device)
+            mrope_delta_tensor = async_h2d_stack(mrope_deltas, device=device)
         next_input_positions = (
             (seq_positions + mrope_delta_tensor).flatten().unsqueeze(0).repeat(3, 1)
         )
@@ -1586,13 +1606,17 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             return
 
         if not has_precomputed_mrope:
-            # Compute all requests together to avoid per-request Python loops.
-            deltas_list = [0] * batch_size
-            for i, mm in enumerate(mm_inputs):
-                deltas_list[i] = mm.mrope_position_delta.item() if mm is not None else 0
-            deltas = torch.tensor(
-                deltas_list, dtype=torch.int64, device=model_runner.device
-            )
+            # Device-resident deltas avoid a host sync that stalls overlap scheduling.
+            device = model_runner.device
+            deltas_list = [
+                (
+                    mm.get_mrope_position_delta_on_device(device)
+                    if mm is not None
+                    else torch.zeros(1, dtype=torch.int64, device=device)
+                )
+                for mm in mm_inputs
+            ]
+            deltas = deltas_list[0] if batch_size == 1 else torch.cat(deltas_list)
             positions_1d = (deltas - 1) + seq_lens_int64
             self.mrope_positions = positions_1d.unsqueeze(0).repeat(3, 1)
             return
@@ -1630,6 +1654,10 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         seq_lens_cpu = self.seq_lens_cpu
         batch_size = seq_lens_cpu.shape[0]
         mm_inputs = batch.multimodal_inputs
+        text_rows = self._text_only_mrope_positions(batch)
+        if text_rows is not None:
+            self.mrope_positions = text_rows
+            return
         rl_on_policy_target = get_exec().deterministic.rl_on_policy_target
         extend_lens = batch.extend_lens
         prefix_lens = batch.prefix_lens
@@ -1680,6 +1708,43 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             mrope_positions_list,
             dim=1,
         ).to(dtype=torch.int64, device=model_runner.device, non_blocking=True)
+
+    def _text_only_mrope_positions(
+        self, batch: ScheduleBatch
+    ) -> Optional[torch.Tensor]:
+        """The text-only rows _compute_mrope_positions_extend's loop builds: the same
+        values compute_position wrote into self.positions, repeated on the device.
+        None sends any other batch to the loop."""
+        global _mrope_text_device_logged
+        if not envs.SGLANG_OPT_MROPE_TEXT_DEVICE_POSITIONS.get():
+            return None
+        extend_lens = batch.extend_lens
+        prefix_lens = batch.prefix_lens
+        positions = self.positions
+        text_only = get_exec().deterministic.rl_on_policy_target is not None or all(
+            mm_input is None for mm_input in batch.multimodal_inputs
+        )
+        if (
+            batch.dllm_config is not None
+            or not text_only
+            or not isinstance(extend_lens, list)
+            or not isinstance(prefix_lens, list)
+            or self.extend_seq_lens_cpu != extend_lens
+            or self.extend_prefix_lens_cpu != prefix_lens
+            or positions is None
+            or positions.dim() != 1
+            or positions.numel() != sum(extend_lens)
+        ):
+            return None
+        if not _mrope_text_device_logged:
+            _mrope_text_device_logged = True
+            logger.info(
+                "Text-only extend mrope rows built on the device "
+                "(SGLANG_OPT_MROPE_TEXT_DEVICE_POSITIONS; first: %d requests, %d tokens)",
+                len(extend_lens),
+                positions.numel(),
+            )
+        return positions.to(torch.int64).unsqueeze(0).repeat(3, 1)
 
     def _pad_tensor_to_size(self, tensor: torch.Tensor, size: int, *, value: int = 0):
         if value == 0:
@@ -1931,13 +1996,21 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ):
             local_late_rows = model_runner.attn_backend.late_layer_num_tokens(self)
             if local_late_rows is not None:
-                late_rows = torch.empty(sync_group_size, dtype=torch.int64)
+                tail_graph_compatible = (
+                    self.forward_mode.is_idle()
+                    or self.forward_mode.is_extend_without_speculative()
+                )
+                late_layout = torch.empty(2 * sync_group_size, dtype=torch.int64)
                 all_gather_single(
-                    late_rows,
-                    torch.tensor([local_late_rows], dtype=torch.int64),
+                    late_layout,
+                    torch.tensor(
+                        [local_late_rows, tail_graph_compatible], dtype=torch.int64
+                    ),
                     group=get_parallel().tp_group.cpu_group,
                 )
-                self.global_late_layer_num_tokens_cpu = late_rows.tolist()
+                late_rows, tail_graph_votes = late_layout.view(-1, 2).T.tolist()
+                self.global_late_layer_num_tokens_cpu = late_rows
+                self.global_late_layer_tail_graph_compatible = all(tail_graph_votes)
 
         TboForwardBatchPreparer.prepare(
             batch=self, is_draft_worker=model_runner.is_draft_worker
@@ -2217,12 +2290,22 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:bs]
         elif self.forward_mode.is_extend():
-            num_tokens = self.seq_lens_sum
+            # Drop the MLP-sync pad rows: a spec draft re-pads the hidden states to
+            # its own bucket. seq_lens_sum also counts the cached prefix.
+            num_tokens = (
+                self._original_num_tokens
+                if self._original_num_tokens is not None
+                else self.seq_lens_sum
+            )
             logits_output.next_token_logits = logits_output.next_token_logits[
                 :num_tokens
             ]
             if logits_output.hidden_states is not None:
                 logits_output.hidden_states = logits_output.hidden_states[:num_tokens]
+            if logits_output.mm_input_embeds is not None:
+                logits_output.mm_input_embeds = logits_output.mm_input_embeds[
+                    :num_tokens
+                ]
 
         # Full aux capture keeps both outputs on the same token rows.
         if (
