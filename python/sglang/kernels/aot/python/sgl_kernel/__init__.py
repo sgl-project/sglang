@@ -117,7 +117,6 @@ else:
         from sgl_kernel.speculative import (
             build_tree_kernel_efficient,
             reconstruct_indices_from_tree_mask,
-            segment_packbits,
             tree_speculative_sampling_target_only,
             verify_tree_greedy,
         )
@@ -180,7 +179,6 @@ else:
         "reconstruct_indices_from_tree_mask",
         "rmsnorm",
         "rotary_embedding",
-        "segment_packbits",
         "sgl_per_token_group_quant_8bit",
         "sgl_per_token_group_quant_fp8",
         "sgl_per_token_group_quant_int8",

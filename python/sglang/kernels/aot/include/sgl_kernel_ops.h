@@ -413,14 +413,6 @@ void build_tree_kernel_efficient(
     int64_t draft_token_num,
     int64_t tree_mask_mode);
 
-void segment_packbits(
-    at::Tensor x,
-    at::Tensor input_indptr,
-    at::Tensor output_indptr,
-    at::Tensor y,
-    int64_t batch_size,
-    int64_t cuda_stream = 0);
-
 /*
  * From csrc/kvcacheio
  */
