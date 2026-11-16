@@ -277,8 +277,6 @@ class TestLIMState(CustomTestCase):
         native_package = ModuleType("sgl_kernel_npu")
         native_package.__path__ = []
         native_api = ModuleType("sgl_kernel_npu.sparsity_driven_kv_offload")
-        native_fused = ModuleType("sgl_kernel_npu.sparsity_driven_kv_offload.fused_shm")
-        native_fused.create_fused_shm_tensor = Mock()
         native_api.unidex_copy_inplace = Mock()
         module_name = (
             "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager"
@@ -288,7 +286,6 @@ class TestLIMState(CustomTestCase):
             {
                 "sgl_kernel_npu": native_package,
                 "sgl_kernel_npu.sparsity_driven_kv_offload": native_api,
-                native_fused.__name__: native_fused,
             },
         ):
             fused_manager = importlib.import_module(module_name)
@@ -327,9 +324,16 @@ class TestLIMState(CustomTestCase):
         pre.fused_prepare_lim_metadata = Mock()
         post.prepare_copy_sfa_metadata = Mock()
 
-        def shm(shape, dtype, device_id, name):
-            tensor = torch.empty(shape, dtype=dtype)
-            return tensor, tensor.data_ptr(), tensor.data_ptr()
+        def host_pool(*, tokens, layers, widths, dtype, device, group):
+            return SimpleNamespace(
+                buffers=[
+                    [
+                        torch.empty((tokens // 128, 128, 1, width), dtype=dtype)
+                        for _ in range(layers)
+                    ]
+                    for width in widths
+                ]
+            )
 
         with (
             get_context().override_server_args(disaggregation_mode="null"),
@@ -342,7 +346,12 @@ class TestLIMState(CustomTestCase):
                     )
                 ),
             ),
-            patch.object(fused_manager, "create_shm_tensor", side_effect=shm),
+            patch(prefix + "memfabric_pool.MemFabricKVPool", side_effect=host_pool),
+            patch.object(
+                fused_manager,
+                "get_parallel",
+                return_value=SimpleNamespace(attn_tp_group=object()),
+            ),
             patch.object(
                 torch, "npu", SimpleNamespace(current_device=lambda: 0), create=True
             ),
@@ -364,8 +373,8 @@ class TestLIMState(CustomTestCase):
         self.assertEqual(
             [tuple(component[0].shape) for component in manager.host_pool.buffers],
             [
-                (1, plan.host_token_capacity, 1, 512),
-                (1, plan.host_token_capacity, 1, 64),
+                (plan.host_token_capacity // 128, 128, 1, 512),
+                (plan.host_token_capacity // 128, 128, 1, 64),
             ],
         )
         self.assertEqual(

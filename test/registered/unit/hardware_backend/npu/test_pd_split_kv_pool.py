@@ -1,7 +1,8 @@
 import ast
+import sys
 import unittest
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import patch
 
 import torch
@@ -86,7 +87,7 @@ class TestPDSplitKVPool(CustomTestCase):
         prefill, decode = _make_pool(), _make_pool()
         k, v = list(decode.k_buffer), list(decode.v_buffer)
         decode.sparse_kv_manager = SimpleNamespace(
-            host_pool=SimpleNamespace(buffers=(k, v), supports_pd_export=True)
+            host_pool=SimpleNamespace(buffers=(k, v))
         )
         decode.k_buffer = decode.v_buffer = None
 
@@ -97,166 +98,257 @@ class TestPDSplitKVPool(CustomTestCase):
         self.assertEqual((lens, page_bytes), prefill.get_contiguous_buf_infos()[1:])
         self.assertEqual(page_bytes, [131072] * 2 + [16384] * 2 + [512] * 2)
 
-    def test_colocated_shm_is_not_exported_as_pd_memory(self):
-        pool = _make_pool()
-        pool.sparse_kv_manager = SimpleNamespace(
-            host_pool=SimpleNamespace(supports_pd_export=False, buffers=([], []))
+    def test_host_group_partitions_by_shared_memory(self):
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.memfabric_pool import (
+            _host_group,
         )
-        expected = (
-            [t.data_ptr() for t in pool.k_buffer]
-            + [t.data_ptr() for t in pool.v_buffer]
-            + [t.data_ptr() for t in pool.index_k_buffer]
-        )
-        self.assertEqual(pool.get_contiguous_buf_infos()[0], expected)
 
-    def test_shm_split_copy_rows_and_attention_pointers(self):
-        # Run the real manager/pool methods with only the NPU allocation and
-        # row-copy boundaries emulated. The fake device pointer is deliberately
-        # different from the CPU address so accidental address substitution fails.
+        singleton = SimpleNamespace(world_size=1)
+        self.assertIs(_host_group(singleton), singleton)
+
+        parent = SimpleNamespace(
+            world_size=4,
+            rank_in_group=0,
+            ranks=[2, 4, 6, 8],
+            cpu_group=object(),
+            device_group=object(),
+        )
+        path = "sglang.srt.distributed.parallel_state.in_the_same_node_as"
+        with (
+            patch(path, return_value=[True] * 4),
+            patch.object(torch.distributed, "new_group") as new_group,
+        ):
+            self.assertIs(_host_group(parent), parent)
+            new_group.assert_not_called()
+
+        masks = [[True, False, True, False], [False, True, False, True]]
+        for rank in range(4):
+            parent.rank_in_group = rank
+            with (
+                patch(path, side_effect=masks),
+                patch.object(torch.distributed, "get_backend", return_value="hccl"),
+                patch.object(
+                    torch.distributed, "new_group", side_effect=["cpu", "device"]
+                ) as create,
+                patch.object(torch.distributed, "broadcast") as broadcast,
+                patch.object(
+                    torch.distributed, "broadcast_object_list"
+                ) as broadcast_object,
+            ):
+                group = _host_group(parent)
+                expected = [2, 6] if rank % 2 == 0 else [4, 8]
+                self.assertEqual(group.ranks, expected)
+                self.assertEqual(group.rank_in_group, rank // 2)
+                self.assertEqual(create.call_args_list[0].kwargs["ranks"], expected)
+                self.assertEqual(create.call_args_list[1].kwargs["backend"], "hccl")
+                group.broadcast(torch.zeros(1), src=0)
+                group.broadcast_object(None, src=0)
+                self.assertEqual(broadcast.call_args.kwargs["src"], expected[0])
+                self.assertEqual(broadcast_object.call_args.kwargs["src"], expected[0])
+
+    def test_offload_writes_once_then_publishes_on_each_rank(self):
+        """A peer must not overwrite the owner's published host KV."""
         path = Path(__file__).resolve().parents[5] / (
             "python/sglang/srt/hardware_backend/npu/"
             "sparsity_driven_kv_offload/fused_manager.py"
         )
         tree = ast.parse(path.read_text(encoding="utf-8"))
-        shm = next(
-            n
-            for n in tree.body
-            if isinstance(n, ast.ClassDef) and n.name == "ShmSplitKVPool"
-        )
         manager = next(
             n
             for n in tree.body
             if isinstance(n, ast.ClassDef) and n.name == "FusedSparseKVCacheManager"
         )
-        attention = next(
+        method = next(
             n
             for n in manager.body
-            if isinstance(n, ast.FunctionDef) and n.name == "copy_sfa_attention"
+            if isinstance(n, ast.FunctionDef) and n.name == "offload_v2"
         )
-        pointers = {}
-        observed = {}
-
-        def copy_sfa(*args, **kwargs):
-            observed["ckv"] = kwargs["dram_kv_dev_ptr"]
-            observed["kpe"] = kwargs["dram_rope_dev_ptr"]
-
-        def allocate(*, shape, dtype, device_id, name):
-            tensor = torch.zeros(shape, dtype=dtype)
-            ptr = 100000 + len(pointers) * 4096
-            pointers[ptr] = tensor.data_ptr()
-            return tensor, tensor.data_ptr(), ptr
-
-        def copy(src, dst, si, di, valid, sd, dd, **kw):
-            for tensor, key in ((src, "src_ptr"), (dst, "dst_ptr")):
-                base = tensor.untyped_storage().data_ptr()
-                matched = [device for device, cpu in pointers.items() if cpu == base]
-                if matched:
-                    self.assertEqual(kw[key], matched[0] + tensor.data_ptr() - base)
-                else:
-                    self.assertNotIn(key, kw)
-            self.assertEqual(sd, src.ndim - 2)
-            self.assertEqual(dd, dst.ndim - 2)
-            src = src.reshape(-1, *src.shape[-2:])
-            dst = dst.reshape(-1, *dst.shape[-2:])
-            dst[di[valid]] = src[si[valid]]
-
-        ns = {
-            "torch": torch,
-            "create_shm_tensor": allocate,
-            "unidex_copy_inplace": copy,
-            "fused_scatter_copy_sparse_flash_attention": copy_sfa,
-        }
-        code = ast.Module(
+        module = ast.Module(
             body=[
-                shm,
-                ast.ClassDef(
-                    name="Manager",
-                    bases=[],
-                    keywords=[],
-                    body=[attention],
-                    decorator_list=[],
+                ast.ImportFrom(
+                    module="__future__", names=[ast.alias(name="annotations")], level=0
                 ),
+                method,
             ],
             type_ignores=[],
         )
-        exec(compile(ast.fix_missing_locations(code), str(path), "exec"), ns)
-        host = ns["ShmSplitKVPool"](
-            shape=(2, 128, 1, 576),
-            widths=(512, 64),
-            layers=2,
-            dtype=torch.bfloat16,
-            device_id=0,
-            name="test",
+        ns = {"torch": torch}
+        exec(compile(ast.fix_missing_locations(module), str(path), "exec"), ns)
+        src, dst = torch.tensor([0]), torch.tensor([1])
+        valid, positions = torch.tensor([True]), torch.tensor([7])
+        current = ("payload", "rows", "valid")
+        kernels = ModuleType("sglang.kernels.ops.kvcache")
+        kernels.prepare_sparse_kv_publication = lambda *args, **kwargs: (
+            src,
+            dst,
+            positions,
+            valid,
+            current,
         )
-        self.assertEqual(
-            [x[0].shape for x in host.buffers], [(2, 128, 1, 512), (2, 128, 1, 64)]
+        mtp = ModuleType(
+            "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp"
         )
-        m = ns["Manager"]()
-        m.kv_lora_rank, m.qk_rope_head_dim = 512, 64
-        m.head_num, m.start_layer = 1, 0
-        m.dev_ptr_list, m.rope_dev_ptr_list = host.dev_ptrs
-        m.fused_attn_out = torch.zeros(1, 1, 512)
-        m.device_kv_buffer = [torch.zeros(128, 1, 512)]
-        m.device_rope_buffer = [torch.zeros(128, 1, 64)]
-        m.lim_adapter = SimpleNamespace(
-            prepare_copy_sfa_metadata=lambda *_: None,
-            _pre_cache_sizes=torch.zeros(1, dtype=torch.int32),
-            block_table=torch.zeros(1, 1, dtype=torch.int32),
+        mtp.sparse_query_width = lambda batch: 1
+        shared = [torch.zeros(2, 1, w) for w in (2, 1)]
+        events = []
+
+        class Pool:
+            def __init__(self, rank):
+                self.rank = rank
+
+            def copy_rows(self, sources, destinations, si, di, mask):
+                for source, destination in zip(sources, destinations):
+                    destination[di[mask]] = source[si[mask]]
+
+            def publish(self):
+                events.append(self.rank)
+
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_extend_without_speculative=lambda: False),
+            req_pool_indices=torch.tensor([0]),
+            seq_lens=torch.tensor([1]),
+            positions=positions,
+            out_cache_loc=dst,
         )
-        m.planner_query_ends = torch.ones(1, dtype=torch.int32)
-        for name in (
-            "planner_actual_seq_lengths_kv",
-            "planner_hbm_block_table",
-            "resident_begin",
-            "resident_end",
+        with patch.dict(sys.modules, {kernels.__name__: kernels, mtp.__name__: mtp}):
+            for rank, value in ((0, 3), (1, 99)):
+                m = SimpleNamespace(
+                    start_layer=0,
+                    size=1,
+                    logical_max_context_len=2,
+                    host_token_capacity=2,
+                    host_pool=Pool(rank),
+                    host_k_buffer=[shared[0]],
+                    host_v_buffer=[shared[1]],
+                )
+                result = ns["offload_v2"](
+                    m,
+                    torch.full((1, 1, 2), value, dtype=shared[0].dtype),
+                    torch.full((1, 1, 1), value, dtype=shared[1].dtype),
+                    SimpleNamespace(layer_id=0),
+                    batch,
+                )
+                self.assertIs(result[0], current)
+                self.assertIs(result[1], positions)
+                self.assertIs(result[2], valid)
+        self.assertEqual(events, [0, 1])
+        for tensor in shared:
+            self.assertTrue(torch.all(tensor[1] == 3))
+
+    def test_shared_host_allocation_and_copy(self):
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.memfabric_pool import (
+            MemFabricKVPool,
+        )
+
+        messages = []
+        events = []
+
+        class Group:
+            world_size = 2
+
+            def __init__(self, rank):
+                self.rank_in_group = rank
+                self.read_index = 0
+
+            def broadcast_object(self, value):
+                if self.rank_in_group == 0:
+                    messages.append(value)
+                    return value
+                result = messages[self.read_index]
+                self.read_index += 1
+                return result
+
+            def barrier(self):
+                pass
+
+            def broadcast(self, tensor, src):
+                events.append((self.rank_in_group, src))
+
+        class OffloadConfig:
+            pass
+
+        allocations = []
+
+        def allocate(shape, dtype, pin_memory):
+            result = torch.zeros(shape, dtype=dtype)
+            allocations.append(result)
+            return result
+
+        def sparse_copy(src, dst, lengths, count, device):
+            for source, destination in zip(src, dst):
+                destination.reshape(-1, 1, destination.shape[-1])[
+                    lengths[1][lengths[2]]
+                ] = source.reshape(-1, 1, source.shape[-1])[lengths[0][lengths[2]]]
+            return 0
+
+        offload = SimpleNamespace(
+            OffloadConfig=OffloadConfig,
+            Scene=SimpleNamespace(SHARED=object()),
+            initialize=lambda config: 0,
+            empty=allocate,
+            sparse_copy=sparse_copy,
+        )
+        package = ModuleType("memfabric_hybrid")
+        package.offload = offload
+        row_module = ModuleType(
+            "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.row_metadata"
+        )
+        row_module.copy_rows_metadata = lambda s, d, si, di, valid: (
+            s,
+            d,
+            (si, di, valid),
+            None,
+        )
+        with (
+            patch(
+                "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.memfabric_pool._host_group",
+                side_effect=lambda group: group,
+            ),
+            patch.dict(
+                sys.modules,
+                {"memfabric_hybrid": package, row_module.__name__: row_module},
+            ),
+            patch.object(
+                torch, "npu", SimpleNamespace(current_device=lambda: 0), create=True
+            ),
         ):
-            setattr(m, name, torch.zeros(1, 1, dtype=torch.long))
-        m.req_to_token_pool = SimpleNamespace(req_to_token=torch.zeros(1, 1))
-        m.host_token_capacity, m._copy_sfa_operator = 256, object()
-        plan = SimpleNamespace(
-            request_safe_slots=torch.zeros(1, dtype=torch.long),
-            query_width=1,
-            source_ids=torch.zeros(1),
-            device_slots=torch.zeros(1),
-            topk_misses=None,
-            miss_sources=None,
-            miss_slots=None,
-            miss_counts=None,
-            valid_rows=torch.ones(1, dtype=torch.bool),
-        )
-        m.copy_sfa_attention(
-            SimpleNamespace(layer_id=0, scaling=1.0),
-            torch.zeros(1, 1, 512),
-            torch.zeros(1, 1, 64),
-            plan,
-            (None, None, None),
-        )
-        self.assertEqual(
-            observed, {"ckv": host.dev_ptrs[0][0], "kpe": host.dev_ptrs[1][0]}
-        )
-        payload = [
-            torch.full((2, 1, width), 17, dtype=torch.bfloat16) for width in (512, 64)
-        ]
-        host.copy_rows(
-            payload,
-            [c[0] for c in host.buffers],
-            torch.tensor([0, 1]),
-            torch.tensor([3, 4]),
-            torch.tensor([True, False]),
-        )
-        for component in host.buffers:
-            self.assertTrue(torch.all(component[0].flatten(0, 1)[3] == 17))
-            self.assertTrue(torch.all(component[0].flatten(0, 1)[4] == 0))
-        offset = [component[0][1] for component in host.buffers]
-        host.copy_rows(
-            payload,
-            offset,
-            torch.tensor([0, 1]),
-            torch.tensor([3, 4]),
-            torch.tensor([True, False]),
-        )
-        for component in host.buffers:
-            self.assertTrue(torch.all(component[0][1, 3] == 17))
+            kwargs = dict(
+                tokens=128,
+                layers=1,
+                widths=(512, 64),
+                dtype=torch.bfloat16,
+                device="cpu",
+            )
+            owner = MemFabricKVPool(group=Group(0), **kwargs)
+            peer = MemFabricKVPool(group=Group(1), **kwargs)
+            self.assertEqual(len(allocations), 2)
+            self.assertEqual(
+                [c[0].data_ptr() for c in owner.buffers],
+                [c[0].data_ptr() for c in peer.buffers],
+            )
+            payload = [
+                torch.full((1, 1, w), 17, dtype=torch.bfloat16) for w in (512, 64)
+            ]
+            owner.copy_rows(
+                payload,
+                [c[0] for c in owner.buffers],
+                torch.tensor([0]),
+                torch.tensor([3]),
+                torch.tensor([True]),
+            )
+            owner.publish()
+            peer.publish()
+            result = [torch.zeros((1, 1, w), dtype=torch.bfloat16) for w in (512, 64)]
+            peer.copy_rows(
+                [c[0] for c in peer.buffers],
+                result,
+                torch.tensor([3]),
+                torch.tensor([0]),
+                torch.tensor([True]),
+            )
+            self.assertEqual(events, [(0, 0), (1, 0)])
+            for tensor in result:
+                self.assertTrue(torch.all(tensor == 17))
 
 
 if __name__ == "__main__":

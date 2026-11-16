@@ -8,6 +8,67 @@ import socket
 import torch
 
 
+class _NodeLocalGroup:
+    """The members of one attention TP group sharing a host memory system."""
+
+    def __init__(self, ranks, global_rank, parent):
+        self.ranks = ranks
+        self.world_size = len(ranks)
+        self.rank_in_group = ranks.index(global_rank)
+        self.cpu_group = self.device_group = None
+        if self.world_size > 1:
+            self.cpu_group = torch.distributed.new_group(
+                ranks=ranks, backend="gloo", use_local_synchronization=True
+            )
+            self.device_group = torch.distributed.new_group(
+                ranks=ranks,
+                backend=torch.distributed.get_backend(parent.device_group),
+                use_local_synchronization=True,
+            )
+
+    def broadcast_object(self, obj, src=0):
+        if self.world_size > 1:
+            values = [obj]
+            torch.distributed.broadcast_object_list(
+                values, src=self.ranks[src], group=self.cpu_group
+            )
+            return values[0]
+        return obj
+
+    def barrier(self):
+        if self.world_size > 1:
+            torch.distributed.barrier(group=self.cpu_group)
+
+    def broadcast(self, tensor, src=0):
+        if self.world_size > 1:
+            torch.distributed.broadcast(
+                tensor, src=self.ranks[src], group=self.device_group
+            )
+        return tensor
+
+
+def _host_group(parent):
+    if parent.world_size == 1:
+        return parent
+
+    from sglang.srt.distributed.parallel_state import in_the_same_node_as
+
+    pending = set(range(parent.world_size))
+    local_ranks = None
+    while pending:
+        source = min(pending)
+        same_node = in_the_same_node_as(parent.cpu_group, source_rank=source)
+        if not same_node[source]:
+            raise RuntimeError("Failed to identify the local shared memory node")
+        members = [i for i in sorted(pending) if same_node[i]]
+        if len(members) == parent.world_size:
+            return parent
+        if parent.rank_in_group in members:
+            local_ranks = [parent.ranks[i] for i in members]
+        pending.difference_update(members)
+    return _NodeLocalGroup(local_ranks, parent.ranks[parent.rank_in_group], parent)
+
+
 class MemFabricKVPool:
     """Own the MF allocations; non-owner ranks only wrap broadcast GVAs.
 
@@ -16,7 +77,6 @@ class MemFabricKVPool:
     """
 
     alignment = 2 * 1024 * 1024
-    supports_pd_export = True
 
     def __init__(self, *, tokens, layers, widths, dtype, device, group):
         if tokens <= 0 or tokens % 128 or layers <= 0 or tuple(widths) != (512, 64):
@@ -26,7 +86,7 @@ class MemFabricKVPool:
         from memfabric_hybrid import offload
 
         self.offload = offload
-        self.group = group
+        self.group = _host_group(group)
         self.rank = self.group.rank_in_group
         self._allocations = []
         sizes = [tokens * width * dtype.itemsize for width in widths]

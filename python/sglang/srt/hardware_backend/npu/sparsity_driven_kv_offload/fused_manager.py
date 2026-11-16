@@ -7,9 +7,6 @@ from typing import TYPE_CHECKING, List, Optional, Union
 
 import torch
 from sgl_kernel_npu.sparsity_driven_kv_offload import unidex_copy_inplace
-from sgl_kernel_npu.sparsity_driven_kv_offload.fused_shm import (
-    create_fused_shm_tensor as create_shm_tensor,
-)
 
 from sglang.kernels.ops.attention.npu_copy_sfa import (
     fused_scatter_copy_sparse_flash_attention,
@@ -23,7 +20,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.prefill_kv_plan 
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.runtime_context import get_disagg, get_parallel
+from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
@@ -36,62 +33,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class ShmSplitKVPool:
-    """Per-rank SHM storage with the same component copy contract as MF."""
-
-    rank = 0
-    supports_pd_export = False
-
-    def __init__(self, *, shape, widths, layers, dtype, device_id, name):
-        self.buffers = [[], []]
-        self.dev_ptrs = [[], []]
-        self._device_pointers = {}
-        for component, width in enumerate(widths):
-            for layer in range(layers):
-                tensor, _, pointer = create_shm_tensor(
-                    shape=(*shape[:-1], width),
-                    dtype=dtype,
-                    device_id=device_id,
-                    name=f"{name}_component_{component}_layer_{layer}",
-                )
-                self.buffers[component].append(tensor)
-                self.dev_ptrs[component].append(pointer)
-                self._device_pointers[tensor.untyped_storage().data_ptr()] = pointer
-
-    def publish(self):
-        pass
-
-    def _device_pointer(self, tensor):
-        if tensor.device.type != "cpu":
-            return None
-        base = tensor.untyped_storage().data_ptr()
-        pointer = self._device_pointers.get(base)
-        return None if pointer is None else pointer + tensor.data_ptr() - base
-
-    def copy_rows(self, sources, destinations, source_rows, destination_rows, valid):
-        for source, destination in zip(sources, destinations):
-            src_ptr = self._device_pointer(source)
-            dst_ptr = self._device_pointer(destination)
-            kwargs = {}
-            if src_ptr is not None:
-                kwargs["src_ptr"] = src_ptr
-            if dst_ptr is not None:
-                kwargs["dst_ptr"] = dst_ptr
-            unidex_copy_inplace(
-                source,
-                destination,
-                source_rows,
-                destination_rows,
-                valid,
-                source.ndim - 2,
-                destination.ndim - 2,
-                block_dim=48,
-                **kwargs,
-            )
-
-
 class FusedSparseKVCacheManager:
-    host_pool: Optional[Union[MemFabricKVPool, ShmSplitKVPool]] = None
+    host_pool: Optional[MemFabricKVPool] = None
 
     def __init__(
         self,
@@ -139,7 +82,7 @@ class FusedSparseKVCacheManager:
         self.host_token_capacity = self.budget.host_token_capacity
         self.device_cache_size = self.budget.cache_tokens
         logger.info(
-            "Sparse KV per rank: K=%d C=%d, managed HBM=%.2f MiB, host KV=%.2f MiB, host_layout=paged_split",
+            "Sparse KV: K=%d C=%d, managed HBM/rank=%.2f MiB, shared host payload=%.2f MiB, host_layout=paged_split",
             self.sparse_topk,
             self.device_cache_size,
             self.budget.managed_hbm_bytes / 1024**2,
@@ -176,42 +119,26 @@ class FusedSparseKVCacheManager:
         except Exception as e:
             self._raise_buffer_allocation_error(name, e)
 
-        # Host KV buffer
-        # [bs, ctx_len, head_num, head_dim] for each layer
+        # Shared host components use [physical_pages, 128, 1, width] per layer.
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
 
         # Radix prefixes use native physical token IDs. Keep host payloads in that
         # same address space; request slots own only bounded HBM residency maps.
-        host_kv_shape = self.budget.host_kv_spec.shape
-        device_id = torch.npu.current_device()
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.memfabric_pool import (
+            MemFabricKVPool,
+        )
 
-        if get_disagg().disaggregation_mode == "decode":
-            from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.memfabric_pool import (
-                MemFabricKVPool,
-            )
-
-            self.host_pool = MemFabricKVPool(
-                tokens=self.host_token_capacity,
-                layers=self.layer_num,
-                widths=(self.kv_lora_rank, self.qk_rope_head_dim),
-                dtype=self.store_dtype,
-                device=self.device,
-                group=get_parallel().attn_tp_group,
-            )
-            self.dev_ptr_list, self.rope_dev_ptr_list = (
-                [x.data_ptr() for x in component]
-                for component in self.host_pool.buffers
-            )
-        else:
-            self.host_pool = ShmSplitKVPool(
-                shape=host_kv_shape,
-                widths=(self.kv_lora_rank, self.qk_rope_head_dim),
-                layers=self.layer_num,
-                dtype=self.store_dtype,
-                device_id=device_id,
-                name=f"host_kv_pool_{id(paged_kv_cache)}_rank_{device_id}",
-            )
-            self.dev_ptr_list, self.rope_dev_ptr_list = self.host_pool.dev_ptrs
+        self.host_pool = MemFabricKVPool(
+            tokens=self.host_token_capacity,
+            layers=self.layer_num,
+            widths=(self.kv_lora_rank, self.qk_rope_head_dim),
+            dtype=self.store_dtype,
+            device=self.device,
+            group=get_parallel().attn_tp_group,
+        )
+        self.dev_ptr_list, self.rope_dev_ptr_list = (
+            [x.data_ptr() for x in component] for component in self.host_pool.buffers
+        )
         self.host_k_buffer, self.host_v_buffer = self.host_pool.buffers
         logger.info(
             "Sparse KV host buffers: layout=split, CKV=%s, KPE=%s, pool=%s",

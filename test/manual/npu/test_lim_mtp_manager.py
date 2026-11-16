@@ -10,10 +10,6 @@ import torch
 
 pytest.importorskip("torch_npu")
 
-from sgl_kernel_npu.sparsity_driven_kv_offload.fused_shm import (
-    free_fused_shm as free_shm,
-)
-
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_attention import (
     forward_fused_sparse_kv_offload,
 )
@@ -25,9 +21,22 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_manager im
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_mode import ForwardMode
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_parallel
 
 K = 2048
+
+
+@pytest.fixture(autouse=True)
+def _single_rank_attention_group():
+    group = SimpleNamespace(
+        rank_in_group=0,
+        world_size=1,
+        broadcast_object=lambda obj: obj,
+        barrier=lambda: None,
+        broadcast=lambda tensor, src: tensor,
+    )
+    with get_parallel().override(attn_tp_group=group):
+        yield
 
 
 class _IndexPool(MLATokenToKVPool):
@@ -157,6 +166,7 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, heads, query_width, capac
         for _ in layer
     ]
     spec = SimpleNamespace(speculative_eagle_topk=1, speculative_num_draft_tokens=Q)
+    manager = None
     try:
         with ExitStack() as stack:
             stack.enter_context(
@@ -257,7 +267,9 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, heads, query_width, capac
                         in_prefix = (ids[idx] >= row * K) & (ids[idx] < (row + 1) * K)
                         in_tail = ids[idx] >= L - Q
                         assert torch.all(in_prefix | in_tail)
-                        selected = host[0, row * CONTEXT + ids[idx].long(), 0].float()
+                        selected = host.view(-1, 576)[
+                            row * CONTEXT + ids[idx].long()
+                        ].float()
                         score = (
                             q[idx].cpu().float() @ selected[:, :512].T
                             + rope[idx].cpu().float() @ selected[:, 512:].T
@@ -318,7 +330,9 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, heads, query_width, capac
                         visible = rolled_length - Q + col + 1
                         assert torch.all((ids[idx] >= 0) & (ids[idx] < visible))
                         assert rolled_length - Q + col in ids[idx].tolist()
-                        selected = host[0, row * CONTEXT + ids[idx].long(), 0].float()
+                        selected = host.view(-1, 576)[
+                            row * CONTEXT + ids[idx].long()
+                        ].float()
                         score = (
                             q[idx].cpu().float() @ selected[:, :512].T
                             + rope[idx].cpu().float() @ selected[:, 512:].T
@@ -350,5 +364,8 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, heads, query_width, capac
                 )
                 assert padding_max == 0
     finally:
-        torch.npu.synchronize()
-        free_shm(device_id)
+        if manager is not None:
+            torch.npu.synchronize()
+            for raw in manager.host_pool._allocations:
+                manager.host_pool.offload.free(raw.data_ptr())
+            manager.host_pool.offload.uninitialize()

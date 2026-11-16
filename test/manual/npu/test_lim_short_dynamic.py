@@ -7,10 +7,6 @@ import torch
 
 pytest.importorskip("torch_npu")
 
-from sgl_kernel_npu.sparsity_driven_kv_offload.fused_shm import (
-    free_fused_shm as free_shm,
-)
-
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_attention import (
     forward_fused_sparse_kv_offload,
 )
@@ -31,6 +27,19 @@ def _bounded_cpu_oracle():
     torch.set_num_threads(2)
     yield
     torch.set_num_threads(previous)
+
+
+@pytest.fixture(autouse=True)
+def _single_rank_attention_group():
+    group = SimpleNamespace(
+        rank_in_group=0,
+        world_size=1,
+        broadcast_object=lambda obj: obj,
+        barrier=lambda: None,
+        broadcast=lambda tensor, src: tensor,
+    )
+    with get_parallel().override(attn_tp_group=group):
+        yield
 
 
 class _IndexPool(MLATokenToKVPool):
@@ -192,7 +201,9 @@ def test_prefill_attention_and_short_residency():
         finally:
             if manager is not None:
                 torch.npu.synchronize()
-                free_shm(torch.npu.current_device())
+                for raw in manager.host_pool._allocations:
+                    manager.host_pool.offload.free(raw.data_ptr())
+                manager.host_pool.offload.uninitialize()
 
 
 @pytest.mark.parametrize(
@@ -591,4 +602,6 @@ def test_short_sparse_graph_lifecycle(
         finally:
             if manager is not None:
                 torch.npu.synchronize()
-                free_shm(torch.npu.current_device())
+                for raw in manager.host_pool._allocations:
+                    manager.host_pool.offload.free(raw.data_ptr())
+                manager.host_pool.offload.uninitialize()
