@@ -98,6 +98,14 @@ jobs:
           pip3 install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple psutil
           # Install kubernetes
           pip3 install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple kubernetes
+          # Stage the NPU kernel wheel on the shared cache so the pods can
+          # install it locally; the pods cannot reach github.com directly.
+          # The runner goes through the cluster outbound proxy instead.
+          mkdir -p /root/.cache/.cache/sgl-kernel-npu
+          wget -q --timeout=60 --tries=2 \
+            -O /root/.cache/.cache/sgl-kernel-npu/kernel.zip \
+            "https://github.com/sgl-project/sgl-kernel-npu/releases/download/2026.11.0.post5/sgl-kernel-npu-2026.11.0.post5-torch2.10.0-py312-cann9.1.0-a3-aarch64.zip" \
+            || echo "::warning::sgl-kernel-npu download failed; pods will try to download it themselves."
           cp $KUBECTL /usr/local/sbin/
 
       - name: Checkout code
