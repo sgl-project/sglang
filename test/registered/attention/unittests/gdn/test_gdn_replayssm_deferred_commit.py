@@ -365,7 +365,14 @@ class TestDeferredGDNCommit(CustomTestCase):
         self.dirty(arm)
         storage = StateStorage.__new__(StateStorage)
         storage.pool = arm.pool
-        storage.slots = SimpleNamespace(free=mock.Mock())
+
+        def free(slots, *, owned=False):
+            self.assertTrue(owned)
+            state = arm.pool.replayssm_deferred_state
+            self.assertEqual(int(state.slot_to_row[slots[0]]), -1)
+            self.assertEqual(int(state.row_to_slot[self.rows[0]]), -1)
+
+        storage.slots = SimpleNamespace(free=mock.Mock(side_effect=free))
         req = SimpleNamespace(kv=SimpleNamespace(mamba_pool_idx=self.slots[0]))
         storage.release(SimpleNamespace(enable_mamba_extra_buffer=False), req)
         self.assertIsNone(req.kv.mamba_pool_idx)
@@ -423,6 +430,72 @@ class TestDeferredGDNCommit(CustomTestCase):
         self.dirty(arm)
         MambaPool.get_cpu_copy(arm.pool, self.slots)
         self.assertEqual(int(arm.pool.replayssm_spec_write_pos.sum()), 0)
+
+    def test_batched_acquire_binds_fresh_and_retained_tracking_slots(self):
+        for retained in (False, True):
+            with self.subTest(retained=retained):
+                arm = self.arm()
+                state = arm.pool.replayssm_deferred_state
+                state.clear()
+                rows, slots = self.rows[:2], self.slots[:2]
+                tracks = torch.tensor(
+                    [[7, 8], [9, 10]], device="cuda", dtype=torch.int32
+                )
+                if retained:
+                    state.bind(rows[:1], slots[:1])
+                    arm.pool.replayssm_spec_write_pos[rows[0]] = 3
+                allocated = torch.cat(
+                    [
+                        slots[1:] if retained else slots,
+                        tracks[1:].flatten() if retained else tracks.flatten(),
+                    ]
+                )
+                storage = StateStorage.__new__(StateStorage)
+                storage.pool = arm.pool
+                storage.slots = SimpleNamespace(alloc=mock.Mock(return_value=allocated))
+                requests = [
+                    SimpleNamespace(
+                        kv=SimpleNamespace(
+                            holds_mamba=retained and i == 0,
+                            mamba_pool_idx=slots[i] if retained and i == 0 else None,
+                            mamba_ping_pong_track_buffer=(
+                                tracks[i] if retained and i == 0 else None
+                            ),
+                        )
+                    )
+                    for i in range(2)
+                ]
+                table = SimpleNamespace(
+                    device="cuda",
+                    enable_mamba_extra_buffer=True,
+                    enable_mamba_extra_buffer_lazy=False,
+                    mamba_initial_tracking_slots=2,
+                    mamba_ping_pong_track_buffer_size=2,
+                    get_mamba_ping_pong_other_idx=lambda _: 1,
+                    req_index_to_mamba_index_mapping=torch.zeros(
+                        fixture.NUM_ROWS, device="cuda", dtype=torch.int32
+                    ),
+                    req_index_to_mamba_ping_pong_track_buffer_mapping=torch.zeros(
+                        fixture.NUM_ROWS, 2, device="cuda", dtype=torch.int32
+                    ),
+                )
+                storage.acquire(table, requests, rows.tolist())
+                storage.slots.alloc.assert_called_once_with(3 if retained else 6)
+                self.assertTrue(torch.equal(state.row_to_slot[rows], slots))
+                self.assertTrue(torch.equal(state.slot_to_row[slots], rows))
+                self.assertTrue(
+                    torch.equal(table.req_index_to_mamba_index_mapping[rows], slots)
+                )
+                self.assertTrue(
+                    torch.equal(
+                        table.req_index_to_mamba_ping_pong_track_buffer_mapping[rows],
+                        tracks,
+                    )
+                )
+                self.assertEqual(
+                    int(arm.pool.replayssm_spec_write_pos[rows[0]]),
+                    3 if retained else 0,
+                )
 
     def test_rejected_non_finite_drafts_across_capacity_folds(self):
         clean, poisoned = self.arm(), self.arm()
