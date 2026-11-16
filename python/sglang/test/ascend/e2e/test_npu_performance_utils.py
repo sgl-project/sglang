@@ -662,8 +662,6 @@ def run_aisbench(
     repeat_rate=None,
     dp=None,
     generation_kwargs=None,
-    seed=None,
-    warmup_requests=None,
 ):
 
     if dataset_type == "sharegpt":
@@ -767,10 +765,6 @@ def run_aisbench(
         cmd += f" --repeat_rate {repeat_rate}"
     if dp is not None:
         cmd += f" --dp {dp}"
-    if seed is not None:
-        cmd += f" --seed {seed}"
-    if warmup_requests:
-        cmd += f" --warmup-requests {warmup_requests}"
     if generation_kwargs:
         cmd += f" --generation-kwargs '{generation_kwargs}'"
 
@@ -1383,8 +1377,6 @@ class TestNpuPerformanceTestCaseBase(CustomTestCase):
                 repeat_rate=self.repeat_rate,
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
-                seed=self.seed,
-                warmup_requests=self.warmup_requests,
             )
             assert_metrics(self, metrics)
 
@@ -1533,8 +1525,6 @@ class TestNpuPerfMultiNodePdMixTestCaseBase(CustomTestCase):
                 repeat_rate=self.repeat_rate,
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
-                seed=self.seed,
-                warmup_requests=self.warmup_requests,
             )
             assert_metrics(self, metrics)
 
@@ -1705,8 +1695,6 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
                 repeat_rate=self.repeat_rate,
                 dp=self.dp,
                 generation_kwargs=self.generation_kwargs,
-                seed=self.seed,
-                warmup_requests=self.warmup_requests,
             )
             assert_metrics(self, metrics)
 
