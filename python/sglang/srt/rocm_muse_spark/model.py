@@ -226,8 +226,10 @@ def _run_tlx_moe(
     elif not moe_supported(hidden_states, topk_ids, w13, w2):
         reason = f"unsupported shapes w13={tuple(w13.shape)} w2={tuple(w2.shape)}"
     else:
+        from sglang.kernels.jit.utils.tlx_runtime import add_missing_hip_options
         from sglang.kernels.tlx_ops.kernels.moe.gfx950 import moe
 
+        add_missing_hip_options()
         return moe(
             x=hidden_states,
             topk_weights=topk_scores,

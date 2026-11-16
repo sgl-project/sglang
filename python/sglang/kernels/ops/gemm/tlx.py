@@ -22,9 +22,15 @@ def mm_supported(x: torch.Tensor, weight: torch.Tensor) -> bool:
 
 def linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
     """``x @ weight.T`` for a ``[N, K]`` weight, over any leading dims of ``x``."""
-    from sglang.kernels.jit.utils.tlx_runtime import add_missing_triton_knobs
+    from sglang.kernels.jit.utils.tlx_runtime import (
+        add_missing_hip_options,
+        add_missing_triton_knobs,
+        inline_intra_wave_pipeline_stages,
+    )
     from sglang.kernels.tlx_ops.kernels.mm.gfx950 import mm
 
     add_missing_triton_knobs()
+    add_missing_hip_options()
+    inline_intra_wave_pipeline_stages()
     out = mm(x.reshape(-1, x.shape[-1]), weight.t())
     return out.view(*x.shape[:-1], weight.shape[0])
