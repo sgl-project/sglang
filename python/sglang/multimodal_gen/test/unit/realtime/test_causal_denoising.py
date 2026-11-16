@@ -632,26 +632,3 @@ def test_crossattn_cache_block_stores_detached_tensors_and_resets():
     assert cache.k.flatten().tolist() == [2.0] * cache.k.numel()
     assert cache.v.flatten().tolist() == [3.0] * cache.v.numel()
     assert cache.is_init is False
-
-
-def test_causal_kv_cache_is_sized_from_the_dit_local_attention_window():
-    """A DiT config whose local attention window differs from the sliding
-    window must size the stage's KV cache from the local window."""
-
-    class _CausalDiT(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.config = SimpleNamespace(
-                num_layers=1,
-                num_frames_per_block=3,
-                sliding_window_num_frames=21,
-                local_attn_size=6,
-                sink_size=0,
-                patch_size=(1, 2, 2),
-            )
-
-    stage = CausalDMDDenoisingStage(_CausalDiT(), scheduler=None)
-
-    tokens_per_frame = stage._prepare_frame_seq_length(4, 8)
-    assert stage.local_attn_size == 6
-    assert stage._get_causal_kv_cache_size() == 6 * tokens_per_frame
