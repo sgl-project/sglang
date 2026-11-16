@@ -32,13 +32,6 @@ class BatchedPenalizerOrchestrator:
     def batch(self) -> ScheduleBatch | None:
         return self._batch_ref()
 
-    @batch.setter
-    def batch(self, value: Optional[ScheduleBatch]):
-        if value is None:
-            self._batch_ref = lambda: None
-        else:
-            self._batch_ref = weakref.ref(value)
-
     def reqs(self):
         return self.batch.reqs
 

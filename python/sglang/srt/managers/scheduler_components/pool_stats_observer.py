@@ -21,9 +21,7 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.mem_cache.kv.storage import KVStorage, SubPoolUsage
     from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage
-
-
-class SchedulerStats: ...  # type: ignore[no-redef]
+    from sglang.srt.observability.metrics_collector import SchedulerStats
 
 
 # A KV record's footprint outside the tree, in whole pages. Each row is summed
