@@ -304,7 +304,8 @@ def backup_kv_cache(
 ) -> bool:
     """Returns False when the request can be neither backed up nor recomputed;
     the caller aborts it."""
-    if backend == "none":
+    state = token_to_kv_pool_allocator.state
+    if backend == "none" or (state is not None and not state.backs_up_state):
         return False
     if retraction_needs_rebootstrap(token_to_kv_pool_allocator):
         if not req.resumable_by_rebootstrap:
