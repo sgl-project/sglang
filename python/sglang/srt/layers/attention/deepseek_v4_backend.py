@@ -270,6 +270,8 @@ def _create_flashmla_metadata():
 # only for that shape and go stale silently if FlashMLA retunes it.
 _FLASHMLA_SCHED_BLOCK_SIZE_N = 64
 _FLASHMLA_SCHED_FIXED_OVERHEAD = 5
+# The same for its head128 kernel (half the SM parts: one per 2-CTA pair).
+_FLASHMLA_HEAD128_SCHED_FIXED_OVERHEAD = 3
 
 
 @functools.lru_cache(maxsize=None)
@@ -301,6 +303,7 @@ def _maybe_precompute_flashmla_sched_meta(
     extra_indices: Optional[torch.Tensor],
     extra_topk_length: Optional[torch.Tensor],
     schedule: Literal["serial", "parallel", "windowed"] = "serial",
+    head128: bool = False,
 ) -> None:
     """Fill the split-KV schedule buffers so `sparse_decode_fwd` skips its own
     `<<<1, 32>>>` scheduling kernel on the decode critical path;
@@ -310,7 +313,7 @@ def _maybe_precompute_flashmla_sched_meta(
         return
     if getattr(flashmla_metadata, "tile_scheduler_metadata", None) is not None:
         return
-    if not _fast_flashmla_sched_shape(q):
+    if not head128 and not _fast_flashmla_sched_shape(q):
         return
     from sglang.kernels.ops.attention import flash_mla_interface
     from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import (
@@ -319,7 +322,9 @@ def _maybe_precompute_flashmla_sched_meta(
     )
 
     b, s_q = q.shape[0], q.shape[1]
-    if flash_mla_interface.supports_native_heads():
+    if head128:
+        num_sm_parts = max(_num_sms(q.device.index) // s_q // 2, 1)
+    elif flash_mla_interface.supports_native_heads():
         # The native-head kernel divides the SMs across head blocks at small
         # batch sizes. The schedule must use the same partition count.
         num_sm_parts = flash_mla_interface.sparse_decode_num_sm_parts(
@@ -337,7 +342,11 @@ def _maybe_precompute_flashmla_sched_meta(
         topk_length=topk_length,
         extra_topk_length=extra_topk_length,
         block_size_n=_FLASHMLA_SCHED_BLOCK_SIZE_N,
-        fixed_overhead_num_blocks=_FLASHMLA_SCHED_FIXED_OVERHEAD,
+        fixed_overhead_num_blocks=(
+            _FLASHMLA_HEAD128_SCHED_FIXED_OVERHEAD
+            if head128
+            else _FLASHMLA_SCHED_FIXED_OVERHEAD
+        ),
         topk=indices.shape[-1],
         extra_topk=0 if extra_indices is None else extra_indices.shape[-1],
         schedule=schedule,

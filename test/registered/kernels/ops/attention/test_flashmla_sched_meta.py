@@ -348,7 +348,8 @@ def test_native_heads_schedule_and_output(heads, batch, mode):
             causal=False,
         )
 
-    assert _flashmla_kv_padded_heads(heads) == heads
+    # The backend sends 65-128 V32 heads to the head128 kernel instead.
+    assert _flashmla_kv_padded_heads(heads, "V32") == (heads if heads <= 64 else 128)
     reference_meta = flash_mla.FlashMLASchedMeta()
     reference, reference_lse = call(q, reference_meta)
     custom_meta = flash_mla.FlashMLASchedMeta()

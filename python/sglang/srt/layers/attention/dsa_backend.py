@@ -307,8 +307,20 @@ def _restore_live_rows(output: torch.Tensor, plan: Optional[_RowPlan]) -> torch.
     return output
 
 
-def _flashmla_kv_padded_heads(num_heads: int) -> int:
+def _flashmla_head128_v32(num_heads: int, kv_format: str) -> bool:
+    # sgl-flash-mla's current decode kernels read V32 caches on head128 only.
+    return (
+        _is_cuda
+        and kv_format == "V32"
+        and 64 < num_heads <= 128
+        and get_platform().is_sm100
+    )
+
+
+def _flashmla_kv_padded_heads(num_heads: int, kv_format: str) -> int:
     """Use native head counts when the installed SM100 kernel supports them."""
+    if _flashmla_head128_v32(num_heads, kv_format):
+        return 128
     if _is_cuda and get_platform().is_sm100 and 1 <= num_heads <= 128:
         from sglang.kernels.ops.attention import flash_mla_interface
 
@@ -834,7 +846,9 @@ class DeepseekSparseAttnBackend(
             deterministic=get_exec().deterministic.enable_deterministic_inference,
         )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
-        self.flashmla_kv_num_q_heads = _flashmla_kv_padded_heads(self.num_q_heads)
+        self.flashmla_kv_num_q_heads = _flashmla_kv_padded_heads(
+            self.num_q_heads, self.flashmla_kv_format
+        )
         # prims_ts: the trtllm route with Prims-TS as the kernel
         self._prims_ts: Optional[PrimsTSSparseMLA] = None
         if "prims_ts" in (self.dsa_prefill_impl, self.dsa_decode_impl):
@@ -854,7 +868,7 @@ class DeepseekSparseAttnBackend(
             )
             self._prims_ts = PrimsTSSparseMLA(torch.device(self.device))
         self.flashmla_kv_num_q_heads_prefill = _flashmla_kv_padded_heads(
-            self.local_num_q_heads
+            self.local_num_q_heads, self.flashmla_kv_format
         )
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
         self._sink_pad_cache: dict[tuple[int, int], torch.Tensor] = {}
@@ -3788,6 +3802,7 @@ class DeepseekSparseAttnBackend(
             if self.dsa_shards_index_k and not dcp_partial
             else self.flashmla_kv_num_q_heads
         )
+        use_head128 = _flashmla_head128_v32(num_q_heads, self.flashmla_kv_format)
         if target_q_heads != num_q_heads:
             # Pad q heads to match FlashMLA decode supported head-count variants.
             q_input = q_all.new_zeros(
@@ -3821,7 +3836,7 @@ class DeepseekSparseAttnBackend(
         assert (
             indices.shape[-1] == self.dsa_index_topk
         )  # requirement of FlashMLA decode kernel
-        if dcp_partial:
+        if dcp_partial and not use_head128:
             tile_scheduler_metadata = self._dcp_flashmla_sched_meta(
                 q_input, indices, topk_length
             )
@@ -3833,23 +3848,28 @@ class DeepseekSparseAttnBackend(
             )
             q_input, indices = _apply_q_row_plan(plan, q_input, indices)
 
-        o, lse = self._call_flash_mla_with_kvcache(
-            q=q_input,
-            k_cache=kv_cache,
-            cache_seqlens=cache_seqlens,
-            head_dim_v=v_head_dim,
-            tile_scheduler_metadata=tile_scheduler_metadata,
-            num_splits=num_splits,
-            topk_length=topk_length,
-            softmax_scale=sm_scale,
-            indices=indices,
-            # doc says it is not used, but if pass in None then error
-            block_table=torch.empty(
-                (q_input.shape[0], 0), dtype=torch.int32, device=q_all.device
-            ),
-            is_fp8_kvcache=True,
-            kv_format=self.flashmla_kv_format,
-        )
+        if use_head128:
+            o, lse = self._flashmla_head128_decode(
+                q_input, kv_cache, indices, topk_length, v_head_dim, sm_scale
+            )
+        else:
+            o, lse = self._call_flash_mla_with_kvcache(
+                q=q_input,
+                k_cache=kv_cache,
+                cache_seqlens=cache_seqlens,
+                head_dim_v=v_head_dim,
+                tile_scheduler_metadata=tile_scheduler_metadata,
+                num_splits=num_splits,
+                topk_length=topk_length,
+                softmax_scale=sm_scale,
+                indices=indices,
+                # doc says it is not used, but if pass in None then error
+                block_table=torch.empty(
+                    (q_input.shape[0], 0), dtype=torch.int32, device=q_all.device
+                ),
+                is_fp8_kvcache=True,
+                kv_format=self.flashmla_kv_format,
+            )
         if target_q_heads != num_q_heads:
             o = o[:, :, :num_q_heads, :]
         if not dcp_partial:
@@ -3859,8 +3879,49 @@ class DeepseekSparseAttnBackend(
         # [T, H], both views into the padded kernel output. A row with no local
         # key gets an LSE of +inf, which the DCP combine kernels treat as -inf.
         o = o.view(-1, num_q_heads, v_head_dim)
-        lse = lse.view(-1, lse.shape[1])[:, :num_q_heads]
+        # [T, H, 1] (legacy) or [T, 1, H] (current kernels)
+        lse = lse.view(-1, target_q_heads)[:, :num_q_heads]
         return o, lse
+
+    def _flashmla_head128_decode(
+        self,
+        q: torch.Tensor,
+        kv_cache: torch.Tensor,
+        indices: torch.Tensor,
+        topk_length: Optional[torch.Tensor],
+        v_head_dim: int,
+        sm_scale: float,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # V32 on the sgl-flash-mla wheel's head128 kernel; q has 128 heads.
+        # The split-KV schedule is built per call, as for DCP above.
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            _maybe_precompute_flashmla_sched_meta,
+        )
+
+        sched_meta = self._call_get_mla_metadata()[0]
+        _maybe_precompute_flashmla_sched_meta(
+            sched_meta,
+            q=q,
+            indices=indices,
+            topk_length=topk_length,
+            extra_indices=None,
+            extra_topk_length=None,
+            schedule="windowed",
+            head128=True,
+        )
+        return self._call_flash_mla_with_kvcache(
+            q=q,
+            k_cache=kv_cache,
+            block_table=None,
+            cache_seqlens=None,
+            head_dim_v=v_head_dim,
+            tile_scheduler_metadata=sched_meta,
+            softmax_scale=sm_scale,
+            is_fp8_kvcache=True,
+            indices=indices,
+            topk_length=topk_length,
+            use_legacy=False,
+        )
 
     def _dcp_flashmla_sched_meta(
         self,
