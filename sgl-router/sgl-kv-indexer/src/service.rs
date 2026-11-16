@@ -13,7 +13,7 @@ use crate::pb::{
     ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvAction,
     ExternalKvActionType, ExternalKvPrefixMatch, GetExternalKvHitCountsRequest,
     GetExternalKvHitCountsResponse, MatchExternalKvPrefixRequest, MatchExternalKvPrefixResponse,
-    MatchExternalKvRequest, MatchExternalKvResponse, TierType, WorkerCacheSpec,
+    MatchExternalKvRequest, MatchExternalKvResponse, WorkerCacheSpec,
 };
 
 /// Protocol-level resource bounds, enforced before a backend sees the request so
@@ -377,10 +377,6 @@ pub fn component_bit(name: &str) -> Option<u32> {
     }
 }
 
-/// Servable tiers as a `1 << TierType` bitmask. V1: HBM + DRAM, SSD excluded.
-const SERVABLE_TIER_MASK: u32 =
-    (1 << (TierType::TierHbm as u32)) | (1 << (TierType::TierDram as u32));
-
 /// Highest `WorkerCacheSpec.version` this build interprets; a higher (future)
 /// version fails closed. Version 0 (proto default) is accepted as current.
 const SUPPORTED_SPEC_VERSION: u32 = 1;
@@ -624,9 +620,12 @@ impl WorkerPrefixScanner {
     }
 }
 
-/// Whether `component` (a single bit) is resident on `block` at some tier that is
-/// both declared servable for that component (`spec_tier_mask`) and servable by
-/// the indexer (`SERVABLE_TIER_MASK`).
+/// Whether `component` (a single bit) is resident on `block` at some tier the
+/// worker declared servable for that component (`spec_tier_mask`). The spec is
+/// the only tier authority: a legacy worker with no spec is tier-blind, so
+/// gating a spec-bearing worker more tightly than a legacy one would make the
+/// same placement routable or not depending on whether the worker declared a
+/// spec at all.
 fn component_available(
     block: Option<&BlockComponents>,
     component: u32,
@@ -635,11 +634,10 @@ fn component_available(
     let Some(block) = block else {
         return false;
     };
-    block.tier_masks.iter().any(|(tier, mask)| {
-        mask & component != 0
-            && tier_in_mask(SERVABLE_TIER_MASK, *tier)
-            && tier_in_mask(spec_tier_mask, *tier)
-    })
+    block
+        .tier_masks
+        .iter()
+        .any(|(tier, mask)| mask & component != 0 && tier_in_mask(spec_tier_mask, *tier))
 }
 
 /// Sorts `(worker_id, address, prefix)` entries by prefix descending and builds

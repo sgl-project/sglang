@@ -11,7 +11,7 @@ use std::sync::Arc;
 use sgl_kv_indexer::pb::{
     ApplyExternalKvBatchRequest, ApplyExternalKvBatchResponse, ExternalKvActionType,
     GetExternalKvHitCountsRequest, GetExternalKvHitCountsResponse, MatchExternalKvPrefixRequest,
-    MatchExternalKvPrefixResponse, MatchExternalKvRequest, MatchExternalKvResponse,
+    MatchExternalKvPrefixResponse, MatchExternalKvRequest, MatchExternalKvResponse, TierType,
     WorkerCacheSpec,
 };
 use sgl_kv_indexer::{
@@ -911,6 +911,77 @@ async fn full_only_prefix_complete_fast_path_matches_reference() {
     assert_eq!(
         prefix_pairs(&fast_response),
         vec![("w-full".to_string(), 2)]
+    );
+}
+
+/// The worker's declared tier mask is the only tier authority, on both scan
+/// paths. The indexer used to intersect it with a hardcoded HBM+DRAM set, so a
+/// bridge started with `KV_INDEXER_FULL_TIERS=HBM,DRAM,SSD` was accepted and
+/// then had its SSD credit dropped at query time, while a legacy worker holding
+/// the same block on SSD kept it.
+#[tokio::test]
+async fn declared_tier_mask_is_the_only_tier_authority() {
+    let (fast, reference) = shared_state_pair();
+    let ssd = TierType::TierSsd as i32;
+    let declaring_ssd = WorkerCacheSpec {
+        version: 1,
+        components: COMPONENT_FULL,
+        swa_window_tokens: 0,
+        full_tier_mask: (1 << hbm()) | (1 << dram()) | (1 << ssd),
+        swa_tier_mask: 0,
+        mamba_tier_mask: 0,
+    };
+    let declaring_hbm_only = WorkerCacheSpec {
+        full_tier_mask: 1 << hbm(),
+        ..declaring_ssd
+    };
+    let hashes = [31, 32, 33];
+    for (worker, addr, spec) in [
+        ("w-ssd", "10.0.0.1:1", declaring_ssd),
+        ("w-hbm", "10.0.0.2:1", declaring_hbm_only),
+    ] {
+        fast.apply_external_kv_batch(apply_with_spec(
+            worker,
+            addr,
+            1,
+            spec,
+            vec![component_report(
+                ssd,
+                &hashes,
+                &[COMPONENT_FULL; 3],
+                &[16; 3],
+            )],
+        ))
+        .await
+        .unwrap();
+    }
+    // Same SSD residency, no spec: a legacy whole-block placement.
+    fast.apply_external_kv_batch(apply_req(
+        "w-legacy",
+        "10.0.0.3:1",
+        1,
+        vec![action(ExternalKvActionType::ActionReport, ssd, &hashes)],
+    ))
+    .await
+    .unwrap();
+
+    let fast_response = fast
+        .match_external_kv_prefix(prefix_req(&hashes))
+        .await
+        .unwrap();
+    let reference_response = reference
+        .match_external_kv_prefix(prefix_req(&hashes))
+        .await
+        .unwrap();
+    assert_eq!(
+        prefix_pairs(&fast_response),
+        prefix_pairs(&reference_response)
+    );
+    // w-hbm declared HBM only, so its SSD copy stays unservable: the declaration
+    // still gates, it is just no longer overruled.
+    assert_eq!(
+        prefix_pairs(&fast_response),
+        vec![("w-legacy".to_string(), 3), ("w-ssd".to_string(), 3)]
     );
 }
 

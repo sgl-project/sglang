@@ -31,8 +31,8 @@ message WorkerCacheSpec {
   uint32 components = 2;
   // Sliding-window size in tokens; used only when SWA is present.
   uint32 swa_window_tokens = 3;
-  // Per-component servable tiers, each a bitmask of (1 << TierType), intersected
-  // with the indexer's servable set (V1: HBM+DRAM) at query time.
+  // Per-component servable tiers, each a bitmask of (1 << TierType). This is the
+  // only tier authority at query time: a block counts only on a tier set here.
   uint32 full_tier_mask = 4;
   uint32 swa_tier_mask = 5;
   uint32 mamba_tier_mask = 6;

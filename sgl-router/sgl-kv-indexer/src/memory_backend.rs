@@ -17,7 +17,7 @@ use crate::pb::{
     ExternalKvActionType, ExternalKvNodeMatch, GetExternalKvHitCountsRequest,
     GetExternalKvHitCountsResponse, HitCountEntry, MatchExternalKvPrefixRequest,
     MatchExternalKvPrefixResponse, MatchExternalKvRequest, MatchExternalKvResponse, TierHashes,
-    TierType, WorkerCacheSpec,
+    WorkerCacheSpec,
 };
 use crate::service::{assemble_prefix_response, prefix_limit, WorkerPrefixScanner, COMPONENT_FULL};
 use crate::{BlockComponents, KvIndexerBackend, WorkerPrefixInput};
@@ -526,17 +526,11 @@ fn block_servable(state: &State, hash: i64, worker_id: &str, kind: FastPathKind)
                 .values()
                 .any(|hashes| hashes.contains(&hash))
         }),
-        FastPathKind::FullOnly { tier_mask } => {
-            let indexer_tiers =
-                (1 << (TierType::TierHbm as u32)) | (1 << (TierType::TierDram as u32));
-            state.blocks.get(&hash).is_some_and(|block| {
-                block.placements.iter().any(|((worker, tier), mask)| {
-                    worker == worker_id
-                        && mask & COMPONENT_FULL != 0
-                        && tier_in_mask(indexer_tiers & tier_mask, *tier)
-                })
+        FastPathKind::FullOnly { tier_mask } => state.blocks.get(&hash).is_some_and(|block| {
+            block.placements.iter().any(|((worker, tier), mask)| {
+                worker == worker_id && mask & COMPONENT_FULL != 0 && tier_in_mask(tier_mask, *tier)
             })
-        }
+        }),
     }
 }
 
@@ -905,6 +899,7 @@ impl KvIndexerBackend for InMemoryKvIndexerBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pb::TierType;
     use std::sync::{mpsc, Arc};
     use std::time::Duration;
 
