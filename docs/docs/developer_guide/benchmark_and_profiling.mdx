@@ -84,12 +84,15 @@ Use `bench_serving` by default unless there are specific needs.
 # set trace path
 export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
 
-# start server
+# start server; profiling needs an admin API key
+export SGLANG_ADMIN_API_KEY=<your-admin-api-key>
 python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
 
 # send profiling request from client
 python -m sglang.benchmark.serving --backend sglang --model meta-llama/Llama-3.1-8B-Instruct --num-prompts 10 --sharegpt-output-len 100 --profile
 ```
+
+`--profile` calls the `/start_profile` and `/stop_profile` admin endpoints, so the server must be launched with `SGLANG_ADMIN_API_KEY` set (or `--admin-api-key`) and `bench_serving` must be given the same key, which it reads from `SGLANG_ADMIN_API_KEY` (or `--admin-api-key`).
 
 For `bench_serving --profile`, the output directory is selected on the client side from `--profile-output-dir` or `SGLANG_TORCH_PROFILER_DIR` (fallback: `/tmp`), then sent in the `/start_profile` request.
 If you call `/start_profile` directly and do not provide `output_dir`, the server uses its own `SGLANG_TORCH_PROFILER_DIR` (fallback: `/tmp`).
@@ -109,6 +112,7 @@ When profiling in PD disaggregation mode, prefill and decode workers **must be p
 export SGLANG_TORCH_PROFILER_DIR=/root/sglang/profile_log
 
 # start prefill and decode servers (see PD disaggregation docs for setup)
+export SGLANG_ADMIN_API_KEY=<your-admin-api-key>
 python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disaggregation-mode prefill
 python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct --disaggregation-mode decode --port 30001 --base-gpu-id 1
 
@@ -177,6 +181,8 @@ python3 -m sglang.test.send_one --profile
 
 SGLang provides HTTP API endpoints to control profiling on a running server. This allows you to start and stop profiling programmatically, which is useful for capturing specific workload patterns.
 
+`/start_profile` and `/stop_profile` are admin endpoints: the server must be launched with `SGLANG_ADMIN_API_KEY` set (or `--admin-api-key`), and each request must carry that key as `Authorization: Bearer <key>`. Without an admin key configured, the server answers HTTP 403 (`--api-key` does not unlock them). The examples below assume the key is exported as `SGLANG_ADMIN_API_KEY`.
+
 #### Using `/start_profile` endpoint
 
 The `/start_profile` endpoint starts profiling on the server. You can control when profiling begins and how long it runs using the following parameters:
@@ -186,6 +192,7 @@ The `/start_profile` endpoint starts profiling on the server. You can control wh
 ```bash Command
 # Start profiling immediately for 10 steps
 curl -X POST http://127.0.0.1:30000/start_profile \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
     "num_steps": 10
@@ -208,6 +215,7 @@ curl -X POST http://127.0.0.1:30000/start_profile \
 ```bash Command
 # Wait 5 steps (warmup), then profile for 10 steps
 curl -X POST http://127.0.0.1:30000/start_profile \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
     "output_dir": "/tmp/profiles",
@@ -221,7 +229,8 @@ curl -X POST http://127.0.0.1:30000/start_profile \
 
 ```bash Command
 # Start profiling without num_steps - must manually stop with /stop_profile
-curl -X POST http://127.0.0.1:30000/start_profile
+curl -X POST http://127.0.0.1:30000/start_profile \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}"
 ```
 
 #### Detailed annotations
@@ -252,6 +261,7 @@ step[TARGET_VERIFY bs=2 g_sq=6 g_sqsq=18 g_sqsk=90 g_sk=30]
 ```bash Command
 # Profile 10 steps with detailed annotations enabled
 curl -X POST http://127.0.0.1:30000/start_profile \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
     "output_dir": "/tmp/profiles",
@@ -269,7 +279,8 @@ The `/stop_profile` endpoint stops an ongoing profiling session and saves the tr
 
 ```bash Command
 # Stop profiling and save traces
-curl -X POST http://127.0.0.1:30000/stop_profile
+curl -X POST http://127.0.0.1:30000/stop_profile \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}"
 ```
 
 This is only needed when you start profiling without specifying `num_steps`. If `num_steps` is specified, profiling will automatically stop after that many steps.
@@ -279,10 +290,12 @@ This is only needed when you start profiling without specifying `num_steps`. If 
 ```bash Command
 # Terminal 1: Start the server
 export SGLANG_TORCH_PROFILER_DIR=/tmp/profiles
+export SGLANG_ADMIN_API_KEY=<your-admin-api-key>
 python -m sglang.launch_server --model-path meta-llama/Llama-3.1-8B-Instruct
 
 # Terminal 2: Start continuous profiling
 curl -X POST http://127.0.0.1:30000/start_profile \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
     "start_step": 3
@@ -292,7 +305,8 @@ curl -X POST http://127.0.0.1:30000/start_profile \
 python -m sglang.benchmark.serving --backend sglang --num-prompts 100
 
 # Terminal 2: Stop profiling when done
-curl -X POST http://127.0.0.1:30000/stop_profile
+curl -X POST http://127.0.0.1:30000/stop_profile \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}"
 ```
 
 ### Profiler Trace Merger for Distributed Traces
@@ -310,6 +324,7 @@ If there is no shared storage accessible across nodes, automatic merging of trac
 ```bash Command
 # Start profiling with automatic trace merging enabled
 curl -X POST <BASE_URL>/start_profile \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
     "output_dir": "/tmp/profiles", # where to store profile traces
@@ -479,6 +494,7 @@ This method allows you to control exactly when profiling starts/stops via HTTP A
 
    ```bash Command
    # Terminal 1: Start server with nsys and capture-range option
+   export SGLANG_ADMIN_API_KEY=<your-admin-api-key>
    nsys profile --trace-fork-before-exec=true \
      --cuda-graph-trace=node \
      --capture-range=cudaProfilerApi \
@@ -492,12 +508,13 @@ This method allows you to control exactly when profiling starts/stops via HTTP A
 
    Note: NVTX markers are not emitted for kernel launches captured by CUDA graphs. Use `--disable-cuda-graph` to ensure all layerwise NVTX markers are emitted in the trace.
 
-2. In another terminal, control profiling via `/start_profile` with `CUDA_PROFILER` activity:
+2. In another terminal, control profiling via `/start_profile` with `CUDA_PROFILER` activity. It is an admin endpoint, hence the `SGLANG_ADMIN_API_KEY` above and the bearer header below:
 
    ```bash Command
    # Terminal 2: Wait for server to be ready, then start CUDA profiling
    # Wait 3 steps for warmup, then profile for 10 steps
    curl -X POST http://127.0.0.1:30000/start_profile \
+     -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" \
      -H "Content-Type: application/json" \
      -d '{
        "start_step": 3,
@@ -517,7 +534,8 @@ This method allows you to control exactly when profiling starts/stops via HTTP A
 
    ```bash Command
    # Terminal 2: Only needed if num_steps was not specified
-   curl -X POST http://127.0.0.1:30000/stop_profile
+   curl -X POST http://127.0.0.1:30000/stop_profile \
+     -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}"
    ```
 
 The `--capture-range=cudaProfilerApi` option tells Nsight Systems to only capture data between `cudaProfilerStart()` and `cudaProfilerStop()` calls (triggered by `/start_profile` and `/stop_profile`), reducing overhead and file size. The `start_step` parameter skips the first 3 steps to avoid capturing warmup overhead.
