@@ -1872,8 +1872,11 @@ class Mxfp4DynamicQuantMoEMethod(FusedMoEMethodBase):
         if moe_runner_backend.is_aiter():
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
-            # TODO(cwan): refactor other backends
-            pass
+            raise ValueError(
+                "Online MXFP4 MoE quantization runs only on the aiter MoE runner; "
+                f"--moe-runner-backend {moe_runner_backend.value} with "
+                f"--moe-a2a-backend {get_moe_a2a_backend().value} does not select it."
+            )
 
     def apply(
         self,

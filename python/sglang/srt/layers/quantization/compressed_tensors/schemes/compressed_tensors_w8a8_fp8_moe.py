@@ -372,8 +372,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
-            # TODO(cwan): refactor other backends
-            pass
+            raise ValueError(
+                "compressed-tensors FP8 MoE supports --moe-runner-backend auto, "
+                "aiter, triton, flashinfer_trtllm and flashinfer_trtllm_routed; "
+                f"got {moe_runner_backend.value}."
+            )
 
     def apply_weights(
         self,
