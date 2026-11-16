@@ -124,9 +124,7 @@ class TestPrefillReservationBudget(CustomTestCase):
         policy.policy = policy_kind
         policy.shortest_prefill_aging_factor = 0.0
         # SPF work reads staged storage through the tree cache; none here.
-        policy.tree_cache = SimpleNamespace(
-            staged_storage_prefix_end=lambda handle: 0
-        )
+        policy.tree_cache = SimpleNamespace(staged_storage_prefix_end=lambda handle: 0)
         scheduler = SimpleNamespace(
             chunked_req=continuation,
             waiting_queue=waiting,
