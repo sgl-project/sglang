@@ -129,14 +129,6 @@ def _extend_runner(raw_bs, *, keep_hidden_in_place=False):
     return runner, forward_batch, select_index
 
 
-class _CopyPlan:  # SmallFieldCopyPlan on CPU
-    def __call__(self, dsts, srcs):
-        assert len(dsts) == len(srcs) > 0
-        for dst, src in zip(dsts, srcs):
-            dst.copy_(src)
-        return True
-
-
 class _RecordingDraftBackend:
     """Records ``(batch_size, seq_lens_sum, seq_lens)`` at every point the runner
     asks for replay metadata, so a test can check they stay consistent.
