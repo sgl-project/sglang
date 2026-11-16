@@ -529,10 +529,10 @@ def test_fp8_h200_shape_dispatch(_fp8_dispatch, m, k, n, expected):
 
 
 @pytest.mark.parametrize("name", ["NVIDIA H100", "NVIDIA GH200", "NVIDIA H200 NVL"])
-def test_fp8_h200_rule_preserves_other_sm90_dispatch(monkeypatch, _fp8_dispatch, name):
+def test_fp8_hopper_rule_preserves_other_sm90_dispatch(monkeypatch, _fp8_dispatch, name):
     op, inputs = _fp8_dispatch
     monkeypatch.setattr(gemm, "current_arch", lambda: SimpleNamespace(name=name))
-    expected = "torch" if name == "NVIDIA H200 NVL" else "aot"
+    expected = "torch" if name in ("NVIDIA H100", "NVIDIA H200 NVL") else "aot"
     assert op(*inputs(), out_dtype=torch.bfloat16) == expected
     # The pre-existing large-M crossover applies to all SM90 devices.
     assert op(*inputs(m=8192), out_dtype=torch.bfloat16) == "torch"
