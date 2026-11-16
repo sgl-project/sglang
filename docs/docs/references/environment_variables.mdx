@@ -1400,6 +1400,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Maximum poll iterations before grammar compilation is treated as stuck.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>10000</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_GRAMMAR_CACHE_MAX_ENTRIES</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Entry-count backstop for the compiled-grammar LRU cache. The primary bound is the <code>--grammar-cache-limit-bytes</code> server argument; <code>0</code> or a negative value disables the count bound.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>64</code></td>
+    </tr>
   </tbody>
 </table>
 

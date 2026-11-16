@@ -289,6 +289,10 @@ class Serving(msgspec.Struct):
         Optional[int],
         "(xgrammar backend only) Max consecutive whitespace chars allowed in JSON constrained output. None means unbounded.",
     ] = None
+    grammar_cache_limit_bytes: A[
+        int,
+        "Host-memory budget in bytes for the compiled-grammar cache (json_schema / regex / EBNF / structural tags). Least recently used grammars are evicted past it; the xgrammar backend applies the same limit to its own compiler cache. 0 or a negative value disables the bound.",
+    ] = 1 << 30
 
     # -------------------------------------------------------------------------
     # Dynamic batch tokenizer

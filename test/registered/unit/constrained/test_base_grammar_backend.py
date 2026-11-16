@@ -320,6 +320,34 @@ class TestCreateGrammarBackend(unittest.TestCase):
         _, kwargs = mock_xgrammar_cls.call_args
         self.assertIsNone(kwargs["model_eos_token_ids"])
 
+    @patch("sglang.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
+    def test_grammar_cache_limit_bytes_reaches_backend(self, mock_xgrammar_cls):
+        """--grammar-cache-limit-bytes is handed to the backend (and from there
+        to xgrammar's compiler cache); the default must reach it too."""
+        mock_xgrammar_cls.return_value = MagicMock(spec=BaseGrammarBackend)
+        args = self._make_server_args("xgrammar", grammar_cache_limit_bytes=4096)
+
+        create_grammar_backend(args, "tok", 32000, None)
+        _, kwargs = mock_xgrammar_cls.call_args
+        self.assertEqual(kwargs["cache_limit_bytes"], 4096)
+
+    @patch("sglang.srt.constrained.reasoner_grammar_backend.ReasonerGrammarBackend")
+    @patch("sglang.srt.constrained.xgrammar_backend.XGrammarGrammarBackend")
+    def test_grammar_cache_limit_bytes_reaches_reasoner_wrapper(
+        self, mock_xgrammar_cls, mock_reasoner_cls
+    ):
+        mock_xgrammar_cls.return_value = MagicMock(spec=BaseGrammarBackend)
+        mock_reasoner_cls.return_value = MagicMock(spec=BaseGrammarBackend)
+        args = self._make_server_args(
+            "xgrammar", reasoning_parser="deepseek-r1", grammar_cache_limit_bytes=4096
+        )
+        tokenizer = MagicMock()
+        tokenizer.encode.return_value = [42]
+
+        create_grammar_backend(args, tokenizer, 32000, think_end_ids=[42])
+        _, kwargs = mock_reasoner_cls.call_args
+        self.assertEqual(kwargs["cache_limit_bytes"], 4096)
+
 
 class TestLlguidanceStructuralTagTriggerPairing(unittest.TestCase):
     """Bug regression: dispatch_structural_tag paired EVERY structure with

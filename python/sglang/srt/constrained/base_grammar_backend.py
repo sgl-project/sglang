@@ -15,15 +15,15 @@
 
 import json
 import logging
-import os
 import time
 from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
-from typing import Callable, List, NamedTuple, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.runtime_context import (
     get_context,
@@ -120,6 +120,12 @@ class BaseGrammarObject:
     def copy(self) -> "BaseGrammarObject":
         return self
 
+    def memory_size_bytes(self) -> Optional[int]:
+        """Approximate host memory held by the compiled artifact behind this
+        grammar, or None when the backend cannot report it (the cache then
+        charges ``BaseGrammarBackend.NOMINAL_GRAMMAR_BYTES``)."""
+        return None
+
     @property
     def finished(self):
         return self._finished
@@ -181,28 +187,42 @@ class InvalidGrammarObject(BaseGrammarObject):
     def __repr__(self):
         return f"InvalidGrammarObject(error_message={self.error_message!r})"
 
+    def memory_size_bytes(self) -> int:
+        return 0  # only an error message; caching it costs nothing
+
 
 class BaseGrammarBackend:
     _enable_strict_thinking: bool = False
 
-    # Compiled grammars are kept in an LRU cache bounded by entry count. Each
-    # compiled grammar holds per-vocabulary token tables (hundreds of MB for a
-    # 150k vocabulary), so an unbounded cache leaks host memory whenever clients
-    # send a different json_schema / regex / EBNF per request. In-flight requests
-    # keep their own ``copy()`` of a grammar, so evicting an entry is safe.
-    DEFAULT_CACHE_MAX_ENTRIES = 64
+    # Compiled grammars are kept in an LRU cache bounded by host memory. Each
+    # compiled grammar holds per-vocabulary token tables, so an unbounded cache
+    # leaks host memory whenever clients send a different json_schema / regex /
+    # EBNF per request. The byte budget (--grammar-cache-limit-bytes) is the
+    # operator-facing bound: it is known before startup, whereas what an entry
+    # count costs depends on the schemas clients happen to send. The entry count
+    # (SGLANG_GRAMMAR_CACHE_MAX_ENTRIES) stays only as a backstop, mainly for
+    # backends that cannot report sizes. In-flight requests keep their own
+    # ``copy()`` of a grammar, so evicting an entry is safe.
+    DEFAULT_CACHE_LIMIT_BYTES = 1 << 30
+    # Charged per entry when the backend has no size API (outlines, llguidance).
+    NOMINAL_GRAMMAR_BYTES = 1 << 20
 
-    def __init__(self, cache_max_entries: Optional[int] = None):
+    def __init__(
+        self,
+        cache_limit_bytes: Optional[int] = None,
+        cache_max_entries: Optional[int] = None,
+    ):
         self.executor = ThreadPoolExecutor()
+        if cache_limit_bytes is None:
+            cache_limit_bytes = self.DEFAULT_CACHE_LIMIT_BYTES
         if cache_max_entries is None:
-            cache_max_entries = int(
-                os.environ.get(
-                    "SGLANG_GRAMMAR_CACHE_MAX_ENTRIES", self.DEFAULT_CACHE_MAX_ENTRIES
-                )
-            )
-        # <= 0 disables the bound (previous behaviour).
-        self.cache_max_entries = cache_max_entries
+            cache_max_entries = envs.SGLANG_GRAMMAR_CACHE_MAX_ENTRIES.get()
+        # <= 0 disables the respective bound.
+        self.cache_limit_bytes = int(cache_limit_bytes)
+        self.cache_max_entries = int(cache_max_entries)
         self.cache: OrderedDict[Tuple[str, str], BaseGrammarObject] = OrderedDict()
+        self._cache_entry_bytes: Dict[Tuple[str, str], int] = {}
+        self.cache_size_bytes = 0
 
     def initialize_vocab_mask_buffer(
         self,
@@ -312,20 +332,48 @@ class BaseGrammarBackend:
         value = self.executor.submit(self._init_value_dispatch, key, require_reasoning)
         return value, False
 
+    def _charge_bytes(self, value: BaseGrammarObject) -> int:
+        size = value.memory_size_bytes()
+        if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+            return self.NOMINAL_GRAMMAR_BYTES
+        return size
+
+    def _over_budget(self) -> bool:
+        return (
+            0 < self.cache_limit_bytes < self.cache_size_bytes
+            or 0 < self.cache_max_entries < len(self.cache)
+        )
+
     def set_cache(self, key: Tuple[str, str], value: BaseGrammarObject):
+        if key in self._cache_entry_bytes:
+            self.cache_size_bytes -= self._cache_entry_bytes[key]
         self.cache[key] = value
         self.cache.move_to_end(key)
-        if self.cache_max_entries > 0:
-            while len(self.cache) > self.cache_max_entries:
-                evicted_key, _ = self.cache.popitem(last=False)
-                logger.debug(
-                    "Grammar cache full (%d entries); evicted %s grammar",
-                    self.cache_max_entries,
-                    evicted_key[0],
-                )
+        size = self._charge_bytes(value)
+        self._cache_entry_bytes[key] = size
+        self.cache_size_bytes += size
+        # The entry just inserted always stays, so an immediately repeated
+        # grammar still hits even when it alone exceeds the budget.
+        while len(self.cache) > 1 and self._over_budget():
+            evicted_key, _ = self.cache.popitem(last=False)
+            self.cache_size_bytes -= self._cache_entry_bytes.pop(evicted_key, 0)
+            logger.debug(
+                "Grammar cache over budget (%d bytes, %d entries); evicted %s grammar",
+                self.cache_limit_bytes,
+                self.cache_max_entries,
+                evicted_key[0],
+            )
+
+    def discard_cache(self, key: Tuple[str, str]) -> None:
+        """Drop one entry (if present) and release its share of the budget."""
+        if key in self.cache:
+            del self.cache[key]
+            self.cache_size_bytes -= self._cache_entry_bytes.pop(key, 0)
 
     def reset(self):
         self.cache.clear()
+        self._cache_entry_bytes.clear()
+        self.cache_size_bytes = 0
 
 
 def register_vocab_mask_buffer(
@@ -379,6 +427,8 @@ def create_grammar_backend(
             server_args, tokenizer, vocab_size, eos_token_ids
         )
 
+    cache_limit_bytes = get_serving().grammar_cache_limit_bytes
+
     # Default grammar backends
     if name == "outlines":
         from sglang.srt.constrained.outlines_backend import OutlinesGrammarBackend
@@ -386,6 +436,7 @@ def create_grammar_backend(
         grammar_backend = OutlinesGrammarBackend(
             tokenizer,
             whitespace_pattern=get_serving().constrained_json_whitespace_pattern,
+            cache_limit_bytes=cache_limit_bytes,
         )
     elif name == "xgrammar":
         from sglang.srt.constrained.xgrammar_backend import (
@@ -403,6 +454,7 @@ def create_grammar_backend(
                 model_eos_token_ids=eos_list,
                 any_whitespace=not get_serving().constrained_json_disable_any_whitespace,
                 max_whitespace_cnt=get_serving().constrained_json_max_whitespace_cnt,
+                cache_limit_bytes=cache_limit_bytes,
             )
         except TokenizerNotSupportedError as e:
             if get_serving().enable_strict_thinking:
@@ -428,6 +480,7 @@ def create_grammar_backend(
             whitespace_pattern=get_serving().constrained_json_whitespace_pattern,
             n_vocab=vocab_size,
             eos_token_ids=eos_token_ids,
+            cache_limit_bytes=cache_limit_bytes,
         )
     elif name == "none":
         if get_serving().enable_strict_thinking:
@@ -457,6 +510,7 @@ def create_grammar_backend(
             reasoning_parser,
             tokenizer,
             enable_strict_thinking=get_serving().enable_strict_thinking,
+            cache_limit_bytes=cache_limit_bytes,
         )
 
     return grammar_backend
