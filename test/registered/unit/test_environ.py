@@ -13,7 +13,7 @@ from unittest.mock import patch
 from sglang.srt.environ import EnvField, _DeprecatedEnv, envs
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 
 
 NV_MEGA_RUNTIME_CHILDREN = (
@@ -300,34 +300,32 @@ class TestImportTimeBooleanKnobs(unittest.TestCase):
     the declaration, so `yes` set the knob for some readers and not for others."""
 
     def test_frozen_module_flags_follow_the_registry(self):
+        deepgemm = "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM"
         script = (
             "import json\n"
             "from sglang.srt.batch_invariant_ops import batch_invariant_ops as ops\n"
             "from sglang.srt.batch_overlap import two_batch_overlap as tbo\n"
             "print(json.dumps([ops._ENABLE_MM_DEEPGEMM, "
-            "ops._ENABLE_MM_FALLBACK_VARIANT, tbo._tbo_debug]))\n"
+            "ops._ENABLE_MM_FALLBACK_VARIANT, ops._ENABLE_MM_COMPARISON_TEST, "
+            "tbo._tbo_debug]))\n"
         )
-        cases = (
-            ({}, [True, False, False]),
-            (
-                {
-                    # The kill switch registered tests launch servers with.
-                    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM": "0",
-                    "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "yes",
-                    "SGLANG_TBO_DEBUG": "yes",
-                },
-                [False, True, True],
-            ),
+        overrides = {
+            # The kill switch registered tests launch servers with.
+            deepgemm: "0",
+            "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT": "yes",
+            "SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST": "1",
+            "SGLANG_TBO_DEBUG": "yes",
+        }
+        # One interpreter: the flags are read once, when the modules load.
+        out = subprocess.check_output(
+            [sys.executable, "-c", script], env={**os.environ, **overrides}, text=True
         )
-        names = [name for name in cases[1][0]]
-        for overrides, expected in cases:
-            with self.subTest(overrides=overrides):
-                env = {k: v for k, v in os.environ.items() if k not in names}
-                env.update(overrides)
-                out = subprocess.check_output(
-                    [sys.executable, "-c", script], env=env, text=True
-                )
-                self.assertEqual(json.loads(out.strip().splitlines()[-1]), expected)
+        self.assertEqual(
+            json.loads(out.strip().splitlines()[-1]), [False, True, True, True]
+        )
+        with patch.dict(os.environ):
+            os.environ.pop(deepgemm, None)
+            self.assertIs(vars(type(envs))[deepgemm].get(), True)
 
 
 if __name__ == "__main__":

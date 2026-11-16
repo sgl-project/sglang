@@ -28,8 +28,10 @@ _ENABLE_MM_DEEPGEMM = envs.SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM.get()
 _ENABLE_MM_FALLBACK_VARIANT = (
     envs.SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT.get()
 )
-# Cross-checks DeepGEMM against the Triton kernel on every call; tests set it.
-_ENABLE_MM_COMPARISON_TEST = False
+# Cross-checks DeepGEMM against the Triton kernel on every call.
+_ENABLE_MM_COMPARISON_TEST = (
+    envs.SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_COMPARISON_TEST.get()
+)
 
 if not _ENABLE_MM_DEEPGEMM:
     print("Disable DeepGEMM in batch invariant ops. Performance may be suboptimal.")
