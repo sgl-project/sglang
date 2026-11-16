@@ -2222,7 +2222,6 @@ class TestStagingScatterLifecycle(CustomTestCase):
             kv_args,
             attn_tp_size=2,
             prefill_attn_tp_size=4,
-            kv_buffer_tensors=None,
             room_receivers={room: receiver},
             room_bootstrap={room: [{"pp_rank": 0}]},
         )
@@ -2478,7 +2477,6 @@ class TestMooncakePPStaging(unittest.TestCase):
             kv_args,
             attn_tp_size=16,
             prefill_attn_tp_size=1,
-            kv_buffer_tensors=None,
             room_receivers={7: receiver},
             room_bootstrap={7: [{"pp_rank": 2}, target]},
         )
