@@ -1,5 +1,6 @@
 """CPU checks of the megakernel install, dispatch and capture check."""
 
+import inspect
 import sys
 import unittest
 from pathlib import Path
@@ -8,10 +9,14 @@ from unittest.mock import Mock, call, patch
 
 import torch
 from msgspec.structs import replace
+from transformers import PretrainedConfig
 
 from sglang.kernels.plugin_kernels.nvidia import spec as registry
 from sglang.srt.kernel_plugins.nvidia import binding
 from sglang.srt.kernel_plugins.nvidia.binding import MegakernelBinding, PreparationView
+from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    external_prefill_body,
+)
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -23,6 +28,7 @@ from _fakes import (  # noqa: E402
     DRAFT,
     ISA,
     SPEC,
+    FakeBuilt,
     Lm,
     batch,
     server_args,
@@ -31,9 +37,37 @@ from _fakes import (  # noqa: E402
 register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
 
 
+def _cuda_model_runner(lm):
+    """A CUDA model runner stub for warmup; its model is not a linear-attention
+    hybrid, so warmup compiles no GDN prefill kernels."""
+    return SimpleNamespace(
+        model=lm,
+        device="cuda",
+        model_config=SimpleNamespace(hf_config=PretrainedConfig()),
+    )
+
+
 class OtherBinding:
     def __init__(self, *, model):
         self.model = model
+
+
+class Body(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.layers = torch.nn.ModuleList()
+
+    def forward(self, input_ids, positions, forward_batch, input_embeds=None):
+        return "standard body"
+
+
+class LayeredLm(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.model = Body()
+
+    def forward(self, input_ids, positions, forward_batch, input_embeds=None):
+        return self.model(input_ids, positions, forward_batch)
 
 
 def install(
@@ -203,7 +237,7 @@ class TestMegakernelRuntime(CustomTestCase):
         lm = self._install_spec(replace(SPEC, prepare=prepare), model=model)
         built = binding.built_megakernel(lm)
         self.assertIs(lm.prepare_before_cuda_graph_capture, original)
-        mr = SimpleNamespace(model=lm, device="cuda")
+        mr = _cuda_model_runner(lm)
         expected = [
             "allreduce",
             "a2a",
@@ -279,7 +313,7 @@ class TestMegakernelRuntime(CustomTestCase):
                     ),
                     self.assertRaisesRegex(RuntimeError, f"{failed_stage} failed"),
                 ):
-                    self._warmup(SimpleNamespace(model=lm, device="cuda"), events)
+                    self._warmup(_cuda_model_runner(lm), events)
                 self.assertEqual(
                     events,
                     ["allreduce", "a2a", "dcp", "pcie"]
@@ -309,7 +343,7 @@ class TestMegakernelRuntime(CustomTestCase):
             MegakernelBinding, "preparation_view", return_value=prepared_view
         ):
             lm = self._install_spec(spec, is_draft=True)
-            self._warmup(SimpleNamespace(model=lm, device="cuda"), [])
+            self._warmup(_cuda_model_runner(lm), [])
         self.assertIs(zero.prepared, prepared_view)
         self.assertIs(binding.built_megakernel(lm), zero)
         self.assertIs(binding.megakernel_draft_sampler(lm), print)
@@ -342,6 +376,40 @@ class TestMegakernelRuntime(CustomTestCase):
             lm = install(tokens=1)
         self.assertIsInstance(lm.context.binding, OtherBinding)
         self.assertIs(lm.context.binding.model, lm)
+
+    def test_a_spec_that_names_its_binding_gets_it_whatever_its_architecture(self):
+        with (
+            patch.dict(binding._BINDINGS, {ARCH: OtherBinding}),
+            patch.object(binding, "BINDING_KINDS", {"other": Mock}),
+        ):
+            lm = self._install_spec(replace(SPEC, binding="other"), tokens=1)
+        self.assertIsInstance(lm.context.binding, Mock)
+        with self.assertRaisesRegex(ValueError, "binding 'nope' is not one of"):
+            self._install_spec(replace(SPEC, binding="nope"), tokens=1)
+
+    def test_a_build_keeping_its_own_state_is_wired_to_the_state_storage(self):
+        from sglang.srt.mem_cache.kv.state_storage import StateStorage
+
+        class OwnStateBuilt(FakeBuilt):
+            state_bytes_per_slot = state_bytes_per_request_row = 0
+            keeps_draft_ssm = tracks_decode_state = backs_up_state = False
+
+            def reset_state_slots(self, slots, request_rows):
+                pass
+
+        own = replace(SPEC, build=lambda m, hf, ctx: OwnStateBuilt(ctx.widths))
+        for spec, keeps_own_state in ((SPEC, False), (own, True)):
+            with self.subTest(keeps_own_state=keeps_own_state):
+                lm = self._install_spec(spec, tokens=1)
+                state = StateStorage.empty("state")
+                runner = SimpleNamespace(
+                    model=lm, token_to_kv_pool_allocator=SimpleNamespace(state=state)
+                )
+                binding.prepare_megakernel(runner)
+                expected = binding.built_megakernel(lm) if keeps_own_state else None
+                self.assertIs(state.own_state, expected)
+                self.assertEqual(state.tracks_decode_state, not keeps_own_state)
+                self.assertEqual(state.backs_up_state, not keeps_own_state)
 
     def test_offered_entries_reach_sglang_only_when_every_rank_offers_them(self):
         registry.register(architecture="EagleDraft", path="_fakes:EAGLE_DRAFT")
@@ -519,6 +587,49 @@ class TestMegakernelRuntime(CustomTestCase):
                 lm(forward_batch.input_ids, None, forward_batch)
             MegakernelBinding.forward_view.assert_called_once_with(forward_batch)
             MegakernelBinding.prefill_view.assert_not_called()
+
+    def _install_body(self, *, prefill_graph=True, **offers):
+        built = FakeBuilt((1, 2, 3, 4))
+        built.plan = lambda *a, **kw: None
+        built.plan_body = lambda ids, fb, *a, **kw: (
+            registry.Step(mode="prefill", rows=int(ids.shape[0]))
+            if ids.shape[0] <= 4
+            else None
+        )
+        built.forward_body = lambda step, original, *a, **kw: (step, original)
+        built.linear_prefill_graph_seqs = lambda backend: None
+        built.refill_prefill_graph = lambda metadata, forward_batch: None
+        for name, value in offers.items():
+            setattr(built, name, value)
+        spec = replace(
+            SPEC, build=lambda m, hf, ctx: built, prefill_graph=prefill_graph
+        )
+        return self._install_spec(spec, model=LayeredLm(), tokens=1)
+
+    def test_prefill_graph_routes_the_layer_model_body(self):
+        stock = Body.forward
+        lm = self._install_body()
+        self.assertIs(external_prefill_body(lm), binding.built_megakernel(lm))
+        # the prefill graph runner binds the layer module's forward by signature
+        self.assertEqual(
+            list(inspect.signature(lm.model.forward).parameters),
+            ["input_ids", "positions", "forward_batch", "input_embeds"],
+        )
+        with (
+            patch.object(MegakernelBinding, "prefill_view", return_value="pview"),
+            patch.object(torch.cuda, "is_current_stream_capturing", return_value=False),
+        ):
+            step, original = lm(batch(4).input_ids, None, batch(4))
+            self.assertEqual(lm(batch(6).input_ids, None, batch(6)), "standard body")
+        self.assertEqual((step.mode, step.rows, step.view), ("prefill", 4, "pview"))
+        self.assertIs(original.__func__, stock)
+
+    def test_prefill_graph_needs_a_body_and_is_off_by_default(self):
+        lm = self._install_body(prefill_graph=False)
+        self.assertNotIn("forward", lm.model.__dict__)
+        self.assertIsNone(external_prefill_body(lm))
+        with self.assertRaisesRegex(ValueError, "without SupportsPrefillBody"):
+            self._install_body(forward_body=None)
 
 
 if __name__ == "__main__":

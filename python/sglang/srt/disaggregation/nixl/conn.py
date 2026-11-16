@@ -3646,12 +3646,12 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
             self.agent.get_agent_metadata(),
             packed_kv_data_ptrs,
             packed_aux_data_ptrs,
-            # Always sent, empty unless customized-info transfer is enabled.
+            # Always sent, empty unless exchange_aux_item_lens.
             (
                 struct.pack(
                     f"{len(self.kv_args.aux_item_lens)}Q", *self.kv_args.aux_item_lens
                 )
-                if self.customized_info_enabled
+                if self.exchange_aux_item_lens
                 else b""
             ),
             packed_state_data_ptrs,
