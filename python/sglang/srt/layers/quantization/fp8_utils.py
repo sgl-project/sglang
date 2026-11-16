@@ -76,9 +76,7 @@ _is_musa = is_musa()
 # gfx1250 (RDNA4) cannot compile the AITER CK quant/GEMM kernels, and even when
 # CK builds it lacks the MFMA/WMMA instructions those kernels rely on. Force the
 # pure-triton block-fp8 path on gfx1250.
-_use_aiter = (
-    envs.SGLANG_USE_AITER.get() and _is_hip and not _is_gfx1250_supported
-)
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip and not _is_gfx1250_supported
 _use_aiter_gfx95 = _use_aiter and _is_gfx95_supported
 _use_aiter_gfx942 = _use_aiter and is_gfx942_supported()
 # Conservative, not a tuned crossover: ptpc beat block-fp8 up to M=512 on
