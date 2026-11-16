@@ -163,11 +163,11 @@ class UnoDraftInput(SpecInput):
         )
         current_device = current_cpu.to(
             batch.device,
-            non_blocking=True,
+            non_blocking=pin_memory,
         )
         next_device = next_cpu.to(
             batch.device,
-            non_blocking=True,
+            non_blocking=pin_memory,
         )
 
         alloc_for_spec_decode(
