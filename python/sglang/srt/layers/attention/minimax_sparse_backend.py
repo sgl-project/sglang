@@ -1342,7 +1342,7 @@ class MiniMaxSparseAttnBackend(AttentionBackend):
 
         def _fia_main():
             # Native Ascend FA (FIA) with a per-query custom block_table.
-            from sgl_kernel_npu.attention.fia_blockq_attention import (
+            from sgl_kernel_npu.operators.attention import (
                 flash_prefill_bnsd_blockq_sparse_fia,
             )
 

@@ -23,7 +23,10 @@ if is_npu():
     from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent_decode_optimized import (
         fused_sigmoid_gating_delta_rule_update_decode_npu as fused_sigmoid_gating_delta_rule_update,
     )
-    from sgl_kernel_npu.operators.attention.gdn import chunk_gated_delta_rule_npu
+    from sgl_kernel_npu.operators.attention.gdn import (
+        chunk_gated_delta_rule_npu,
+        fused_gdn_decode,
+    )
 
     chunk_gated_delta_rule = chunk_gated_delta_rule_npu
 elif is_cpu():
@@ -37,6 +40,10 @@ elif is_xpu():
     from sglang.srt.hardware_backend.xpu.kernels.fla.fused_sigmoid_gating_recurrent import (
         fused_sigmoid_gating_delta_rule_update,
     )
+
+
+if not is_npu():
+    fused_gdn_decode = fused_sigmoid_gating_delta_rule_update
 
 
 class TritonGDNKernel(LinearAttnKernelBase):
@@ -154,7 +161,7 @@ class TritonGDNKernel(LinearAttnKernelBase):
         query_start_loc: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
-        return fused_sigmoid_gating_delta_rule_update(
+        return fused_gdn_decode(
             A_log=A_log,
             dt_bias=dt_bias,
             q=q,
