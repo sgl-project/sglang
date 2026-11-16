@@ -1387,7 +1387,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
 
             resumed_reqs.append(req)
             req.is_retracted = False
-            self._pre_alloc(req, skip_host_alloc=hisparse_resume)
+            if hisparse_resume:
+                self._pre_alloc(req, skip_host_alloc=True)
+            else:
+                self._pre_alloc(req)
             if self.draft_kv_ring is not None:
                 # Its ring rows were not backed up.
                 self.draft_kv_ring.reset_floor(

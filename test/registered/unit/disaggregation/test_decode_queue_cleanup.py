@@ -648,7 +648,8 @@ class TestDeferredDestinationPublish(CustomTestCase):
         queue._pending_state_slots = MagicMock(return_value=0)
         queue._prealloc_demand = MagicMock(return_value=1)
         queue._admit_preallocation = MagicMock(return_value=True)
-        queue._pre_alloc = MagicMock()
+        # Ordinary recovery also supports callbacks accepting only the request.
+        queue._pre_alloc = MagicMock(side_effect=lambda resumed: None)
         queue.draft_kv_ring = MagicMock()
         with (
             patch(
