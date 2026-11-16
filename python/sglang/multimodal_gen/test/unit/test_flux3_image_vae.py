@@ -10,11 +10,11 @@ from unittest import mock
 import torch
 
 from sglang.multimodal_gen.configs.models.vaes.flux3_image import Flux3ImageVAEConfig
+from sglang.multimodal_gen.runtime.models.vaes import flux3_image_vae
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
     VaeFastPathGate,
     use_vae_fast_path,
 )
-from sglang.multimodal_gen.runtime.models.vaes import flux3_image_vae
 from sglang.multimodal_gen.runtime.models.vaes.flux3_image_vae import (
     AttnBlock,
     AutoEncoder,
