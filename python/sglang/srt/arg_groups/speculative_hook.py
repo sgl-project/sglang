@@ -128,24 +128,6 @@ def _resolve_speculative_algorithm_alias(
     return speculative_algorithm
 
 
-def handle_speculative_algorithm_alias(server_args: ServerArgs) -> None:
-    """Fold the case of --speculative-algorithm and resolve NEXTN to EAGLE.
-
-    Runs before any hook compares the algorithm by name. The Gemma4
-    FROZEN_KV_MTP promotion reads the draft config and stays in
-    handle_speculative_decoding.
-    """
-    cfg = resolving_view(server_args)
-    if cfg.speculative_algorithm is None:
-        return
-    algorithm = cfg.speculative_algorithm.upper()
-    declare_resolution(
-        server_args,
-        "handle_speculative_algorithm_alias",
-        speculative_algorithm="EAGLE" if algorithm == "NEXTN" else algorithm,
-    )
-
-
 def handle_speculative_decoding(server_args: ServerArgs) -> None:
     cfg = resolving_view(server_args)
     if (
