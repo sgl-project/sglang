@@ -429,6 +429,9 @@ class HybridCacheController(BaseHiCacheController):
         self._register_thread_trace_info("Prefetch")
         super().prefetch_io_aux_func()
 
+    def _init_prefetch_io_worker(self) -> None:
+        self._register_thread_trace_info("Prefetch")
+
     def _prefetch_producers_alive(self) -> bool:
         thread = self.pp_prefetch_command_thread
         return thread is not None and thread.is_alive()

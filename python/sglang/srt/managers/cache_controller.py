@@ -17,6 +17,7 @@ limitations under the License.
 import logging
 import threading
 import time
+from concurrent.futures import Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, Callable, List, NamedTuple, Optional
@@ -287,6 +288,8 @@ HICACHE_WRITE_STAGING_POOL_FRACTION = 0.2
 # not a queue.
 STORAGE_STOP_JOIN_S = 60.0
 
+DEFAULT_PREFETCH_IO_THREADS = 1
+
 
 class PrefetchOperation(StorageOperation):
     def __init__(
@@ -353,6 +356,10 @@ def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
 
 
 class HiCacheController:
+    prefetch_io_threads: int = DEFAULT_PREFETCH_IO_THREADS
+    prefetch_batch_executor: Optional[ThreadPoolExecutor] = None
+    prefetch_sidecar_executor: Optional[ThreadPoolExecutor] = None
+
     def __init__(
         self,
         token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
@@ -799,6 +806,26 @@ class HiCacheController:
                 self.page_get_func = self._page_get_zero_copy
                 self.page_set_func = self._page_set_zero_copy
 
+            self.prefetch_io_threads = max(
+                1,
+                int(
+                    (self.storage_config.extra_config or {}).get(
+                        "prefetch_io_threads", DEFAULT_PREFETCH_IO_THREADS
+                    )
+                ),
+            )
+            if self.prefetch_io_threads > 1:
+                self.prefetch_batch_executor = ThreadPoolExecutor(
+                    self.prefetch_io_threads,
+                    thread_name_prefix="hicache-prefetch-batch",
+                    initializer=self._init_prefetch_io_worker,
+                )
+                self.prefetch_sidecar_executor = ThreadPoolExecutor(
+                    self.prefetch_io_threads,
+                    thread_name_prefix="hicache-prefetch-sidecar",
+                    initializer=self._init_prefetch_io_worker,
+                )
+
             # Ensure stop_event is clear before starting threads.
             self.storage_stop_event.clear()
             self._start_storage_threads()
@@ -821,6 +848,7 @@ class HiCacheController:
                         self.storage_backend.close()
             except Exception:
                 pass
+            self._shutdown_prefetch_executors()
             self.storage_backend = None
             self.storage_backend_type = None
             self.enable_storage = False
@@ -866,6 +894,7 @@ class HiCacheController:
         except Exception:
             logger.exception("Failed to close storage backend cleanly.")
 
+        self._shutdown_prefetch_executors()
         self.storage_backend = None
         self.storage_backend_type = None
         self.enable_storage = False
@@ -873,6 +902,17 @@ class HiCacheController:
         self.page_set_func = self._generic_page_set
         # Now it's safe to clear the stop event for future re-attach.
         self.storage_stop_event.clear()
+
+    def _init_prefetch_io_worker(self) -> None:
+        pass
+
+    def _shutdown_prefetch_executors(self) -> None:
+        for executor in (self.prefetch_batch_executor, self.prefetch_sidecar_executor):
+            if executor is not None:
+                executor.shutdown(wait=True)
+        self.prefetch_batch_executor = None
+        self.prefetch_sidecar_executor = None
+        self.prefetch_io_threads = DEFAULT_PREFETCH_IO_THREADS
 
     @property
     def backup_skip(self) -> bool:
@@ -1366,60 +1406,71 @@ class HiCacheController:
         return count
 
     def _page_transfer(self, operation: PrefetchOperation) -> int:
-        # Transfer batch by batch
-        prefix_keys = operation.prefix_keys
         kv_derived_transfers = [
             transfer
             for transfer in getattr(operation, "pool_transfers", None) or []
             if transfer.indices_from_pool == PoolName.KV
         ]
+        batches = []
+        prefix_keys = operation.prefix_keys
+        for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
+            batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
+            batch_host_indices = operation.host_indices[
+                i * self.page_size : (i + len(batch_hashes)) * self.page_size
+            ]
+            extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
+            batches.append((batch_hashes, batch_host_indices, extra_info))
+            if prefix_keys is not None:
+                prefix_keys = prefix_keys + batch_hashes
+
+        def read_batch(index: int) -> int:
+            try:
+                return self._page_transfer_kv_batch(
+                    operation, *batches[index], kv_derived_transfers
+                )
+            except Exception:
+                logger.exception(
+                    "HiCache prefetch transfer failed for request %s",
+                    operation.request_id,
+                )
+                return 0
+
+        executor = self.prefetch_batch_executor
+        in_flight: dict[int, Future] = {}
         all_success = True
         completed_pages = 0
-        for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
-            # When an error is occurred, we should keep looping and produce the same number of
-            # PrefetchAck as other ranks do, because prefetch_sync_thread (i.e. consumer of
-            # prefetch_sync_queue) perform reduce on the results.  This is so tricky.
-            # The stop event ends the backend reads the same way: the remaining
-            # acks still go out, carrying what completed.
-            if all_success and (
-                operation.is_terminated() or self.storage_stop_event.is_set()
-            ):
-                all_success = False
-            if all_success:
-                batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
-                batch_host_indices = operation.host_indices[
-                    i * self.page_size : (i + len(batch_hashes)) * self.page_size
-                ]
-
-                # Get one batch token, and update the completed_tokens if succeed
-                extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-
-                try:
-                    hit_pages = self._page_transfer_kv_batch(
-                        operation,
-                        batch_hashes,
-                        batch_host_indices,
-                        extra_info,
-                        kv_derived_transfers,
-                    )
-                except Exception:
-                    logger.exception(
-                        "HiCache prefetch transfer failed for request %s",
-                        operation.request_id,
-                    )
-                    hit_pages = 0
-                # Check termination
-                if hit_pages != len(batch_hashes):
+        try:
+            for i, (batch_hashes, _, _) in enumerate(batches):
+                # Every rank must put one ack per batch, even after a failure,
+                # because prefetch_sync_thread all-reduces them in order. The
+                # stop event ends the backend reads the same way.
+                if all_success and (
+                    operation.is_terminated() or self.storage_stop_event.is_set()
+                ):
                     all_success = False
-                if prefix_keys is not None:
-                    prefix_keys = prefix_keys + batch_hashes
-                completed_pages += hit_pages
-            ack = PrefetchAck(
-                rid=operation.request_id,
-                completed_tokens=completed_pages * self.page_size,
-                operation=operation,
-            )
-            self.prefetch_sync_queue.put(ack)
+                if all_success:
+                    if executor is None:
+                        hit_pages = read_batch(i)
+                    else:
+                        for j in range(
+                            i, min(len(batches), i + self.prefetch_io_threads)
+                        ):
+                            if j not in in_flight:
+                                in_flight[j] = executor.submit(read_batch, j)
+                        hit_pages = in_flight.pop(i).result()
+                    if hit_pages != len(batch_hashes):
+                        all_success = False
+                    completed_pages += hit_pages
+                self.prefetch_sync_queue.put(
+                    PrefetchAck(
+                        rid=operation.request_id,
+                        completed_tokens=completed_pages * self.page_size,
+                        operation=operation,
+                    )
+                )
+        finally:
+            # Read-ahead batches write host rows that the completion ack frees.
+            wait(in_flight.values())
         return completed_pages
 
     def _page_transfer_kv_batch(
@@ -1430,35 +1481,42 @@ class HiCacheController:
         extra_info: HiCacheStorageExtraInfo,
         kv_derived_transfers: List[PoolTransfer],
     ) -> int:
-        """Read a single batch from KV and KV-derived pools (e.g. indexer pool).
+        """Read one L3 batch from the KV pool and its KV-derived pools (e.g. indexer).
 
-        Return the number of hit pages.  If the hits from KV and KV-derived pools differ,
-        clamp to the minimal number of hits.
-
-        Here, "batch" means a single unit of L3 read, not a "batch" in model forward.
+        Return the hit pages, clamped to the smallest hit count across the pools.
         """
-        # Read from KV pool.
-        kv_hits = self.page_get_func(
-            operation, batch_hashes, batch_host_indices, extra_info
-        )
-
-        # Read from KV-derived sidecar pools, if any.
-        sidecar_hits: dict[str, int] = {}
-        if len(kv_derived_transfers) > 0:
-            current_kv_derived_transfers = [
-                PoolTransfer(
-                    name=transfer.name,
-                    host_indices=batch_host_indices,
-                    keys=batch_hashes,
-                )
-                for transfer in kv_derived_transfers
-            ]
-            sidecar_results = self.storage_backend.batch_get_v2(
-                current_kv_derived_transfers, extra_info=extra_info
+        sidecar_transfers = [
+            PoolTransfer(
+                name=transfer.name,
+                host_indices=batch_host_indices,
+                keys=batch_hashes,
             )
-            sidecar_hits = count_pool_hits(sidecar_results)
+            for transfer in kv_derived_transfers
+        ]
+        sidecar_future = None
+        if sidecar_transfers and self.prefetch_sidecar_executor is not None:
+            sidecar_future = self.prefetch_sidecar_executor.submit(
+                self.storage_backend.batch_get_v2,
+                sidecar_transfers,
+                extra_info=extra_info,
+            )
+        try:
+            kv_hits = self.page_get_func(
+                operation, batch_hashes, batch_host_indices, extra_info
+            )
+        finally:
+            if sidecar_future is not None:
+                wait([sidecar_future])
 
-        # Clamp to minimal number of hits.
+        sidecar_hits: dict[str, int] = {}
+        if sidecar_future is not None:
+            sidecar_hits = count_pool_hits(sidecar_future.result())
+        elif sidecar_transfers:
+            sidecar_hits = count_pool_hits(
+                self.storage_backend.batch_get_v2(
+                    sidecar_transfers, extra_info=extra_info
+                )
+            )
         return min([kv_hits, *sidecar_hits.values()])
 
     def _prefetch_producers_alive(self) -> bool:
