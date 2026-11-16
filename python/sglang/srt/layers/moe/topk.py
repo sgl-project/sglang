@@ -2964,6 +2964,47 @@ def select_experts(
                 scoring_func=scoring_func,
             )
         else:
+            if (
+                _is_hip
+                and _use_aiter
+                and not routing_overridden
+                and scoring_func == "sigmoid"
+                and top_k_for_gate == 8
+                and num_shared_topk_slots == 1
+                and not has_per_rank_fused_shared_slots(num_shared_topk_slots)
+                and not apply_routed_scaling_factor_on_output
+                and num_expert_group == 1
+                and topk_group == 1
+                and not is_expert_remapping_enabled()
+                and not _skip_hip_pad_mask
+            ):
+                from sglang.srt.layers.moe import glm_aiter_presort
+
+                if glm_aiter_presort.kernel_ready(router_logits, correction_bias):
+                    shared_weight = topk_config.fused_shared_experts_scaling_factor
+                    topk_weights, topk_ids = glm_aiter_presort.route_and_register(
+                        hidden_states,
+                        router_logits,
+                        correction_bias,
+                        (
+                            routed_scaling_factor
+                            if routed_scaling_factor is not None
+                            else 1.0
+                        ),
+                        1.0 if shared_weight is None else shared_weight,
+                        renormalize,
+                        num_token_non_padded,
+                    )
+                    # What _post_process_topk_ids would hand the capturer and recorder.
+                    routed_topk_ids = topk_ids[:, :num_routed_topk]
+                    capture_routed_experts_if_allowed(
+                        topk_config, layer_id, routed_topk_ids
+                    )
+                    get_global_expert_distribution_recorder().on_select_experts(
+                        topk_ids=routed_topk_ids
+                    )
+                    return StandardTopKOutput(topk_weights, topk_ids, router_logits)
+
             from sglang.srt.layers.moe import route_quant_handoff
 
             route_quant_handoff.bind_select_experts(

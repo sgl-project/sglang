@@ -256,7 +256,7 @@ class AiterRunnerCore(MoeRunnerCore):
             # Pass MORI EPv2's arena view when set, else a matching published buffer.
             output = runner_input.output
             if output is None:
-                output = zero_copy_context.get_moe_output_spec(
+                out_spec = (
                     torch.Size(
                         (
                             runner_input.hidden_states.shape[0],
@@ -270,6 +270,12 @@ class AiterRunnerCore(MoeRunnerCore):
                     ),
                     runner_input.hidden_states.device,
                 )
+                output = zero_copy_context.get_moe_output_spec(*out_spec)
+                if output is None:
+                    # The GLM router may have zeroed this call's output already.
+                    from sglang.srt.layers.moe import glm_aiter_presort
+
+                    output = glm_aiter_presort.take_zeroed_output(*out_spec)
             if output is not None:
                 extra["output"] = output
         extra["moe_sorting_dispatch_policy"] = _MOE_SORTING_DISPATCH_POLICY

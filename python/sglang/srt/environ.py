@@ -1176,6 +1176,13 @@ class Envs:
     # Enable dual-stream MoE (shared experts vs routed experts) on the
     # ROCm/AITER path. Requires GPU_MAX_HW_QUEUES>=5 to avoid HW-queue serialization.
     SGLANG_ROCM_USE_MULTI_STREAM = EnvBool(False)
+    # GLM-5.2 on AITER: route, append the shared expert and emit fused_moe's
+    # general MoE sort (plus its zeroed output) from one launch, up to 64 tokens
+    # (needs the plain-layout register_presorted_moe in AITER).
+    SGLANG_OPT_HIP_GLM_ROUTE_SORT = EnvBool(False)
+    # The sort's block size; AITER re-sorts when its kernel for M uses another.
+    # Its untuned GLM-5.2 A4W4 EP4 decode pipeline uses 32 up to 64 tokens.
+    SGLANG_OPT_HIP_GLM_ROUTE_SORT_BLOCK_M = EnvInt(32)
     SGLANG_ROCM_SMALLM_MOE = EnvBool(True)
     SGLANG_ROCM_SMALLM_FP8_BS = EnvBool(True)
     # Fused Kimi-K3 KDA decode kernel: "gfx950" (SGLang HIP) or "aiter" (FlyDSL);
