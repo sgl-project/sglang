@@ -32,7 +32,6 @@ from sglang.srt.layers.quantization.marlin_utils import (
     marlin_repeat_scales_on_all_ranks,
     marlin_sort_g_idx,
     marlin_zero_points,
-    verify_marlin_supports_shape,
 )
 from sglang.srt.layers.quantization.utils import (
     get_scalar_types,
@@ -64,6 +63,40 @@ WNA16_SUPPORTED_BITS = list(WNA16_SUPPORTED_TYPES_MAP.keys())
 # 8608-wide Gemma-4-31B AWQ checkpoint) is padded up to the next tile here; the
 # extra columns are dropped again in apply_weights().
 MARLIN_TILE_N = 64
+
+# Marlin GEMM thread configs (gptq_marlin.cuh) pair (thread_k, thread_n) as
+# (64, 256), (64, 128) and (128, 64), so K has to be 64-aligned, and a padded
+# width that is only 64-aligned leaves (128, 64) as the usable config.
+MARLIN_GEMM_THREAD_K = 64
+MARLIN_GEMM_THREAD_N = 128
+
+
+def _check_marlin_supports_padded_shape(
+    size_n: int, size_k: int, full_k: int, group_size: int
+) -> None:
+    """Reject shapes that no Marlin GEMM thread config covers.
+
+    `size_n` is the padded width, so it is always a multiple of MARLIN_TILE_N.
+    K must still be aligned to the smallest thread_k, and a width that is only
+    64-aligned leaves (128, 64) as the single usable config.
+    """
+    k_tile = size_k % MARLIN_GEMM_THREAD_K == 0
+    k_wide = size_k % MARLIN_GEMM_THREAD_N == 0
+    n_wide = size_n % MARLIN_GEMM_THREAD_N == 0
+    if not k_tile or not (n_wide or k_wide):
+        raise ValueError(
+            f"No Marlin thread config for input_size_per_partition = {size_k} "
+            f"(K) and output_size_per_partition = {size_n} (N): K must be a "
+            f"multiple of {MARLIN_GEMM_THREAD_K}, and either N or K must be a "
+            f"multiple of {MARLIN_GEMM_THREAD_N}. Consider reducing "
+            "tensor_parallel_size or running with --quantization gptq."
+        )
+    if group_size < full_k and size_k % group_size != 0:
+        raise ValueError(
+            f"input_size_per_partition = {size_k} is not divisible by "
+            f"group_size = {group_size}. Consider reducing tensor_parallel_size "
+            "or running with --quantization gptq."
+        )
 
 
 def _pad_marlin_n(t: torch.Tensor, size_n: int) -> torch.Tensor:
@@ -275,14 +308,15 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
             size_n_padded if size_n_padded != size_n else None
         )
 
-        # Validate the width Marlin will actually see.  The tail columns of the
+        # Validate the shape Marlin will actually see.  The tail columns of the
         # last 64-wide tile are zero padded by the transforms below and are
         # discarded after the GEMM, so they do not constrain the checkpoint
-        # shape (see sgl-project/sglang#43342).
-        verify_marlin_supports_shape(
-            size_n_padded,  # out_features
-            c.partition_weight_shape[0],  # in_features
-            c.full_weight_shape[0],  # in_features
+        # shape (see sgl-project/sglang#43342); the K tile and the GEMM thread
+        # config still do.
+        _check_marlin_supports_padded_shape(
+            size_n_padded,
+            c.partition_weight_shape[0],
+            c.full_weight_shape[0],
             c.group_size,
         )
 
@@ -412,7 +446,11 @@ class CompressedTensorsWNA16(CompressedTensorsLinearScheme):
 
         # Drop the zero-padded tail tile, then add the caller's real-width bias.
         out = _marlin_linear(None)[..., :size_n]
-        return out if bias is None else out + bias
+        if bias is not None:
+            return out + bias
+        # Narrowing the padded rows leaves a non-contiguous view, which the
+        # fused gate/up activations reject, so materialise the real width.
+        return out.contiguous()
 
 
 class XPUCompressedTensorsWNA16(CompressedTensorsWNA16):

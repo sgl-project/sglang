@@ -10,7 +10,9 @@ drops those columns after the GEMM.
 import unittest
 
 import torch
+import torch.nn.functional as F
 
+from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (
     CompressedTensorsWNA16,
 )
@@ -60,26 +62,33 @@ class TestCompressedTensorsWNA16MarlinPad(CustomTestCase):
         if major < 8:
             raise unittest.SkipTest("Marlin requires compute capability >= 8.0")
 
-    def _run_case(self, size_n: int, symmetric: bool):
+    def _run_case(
+        self,
+        size_n: int,
+        symmetric: bool,
+        size_k: int = K,
+        group_size: int = GROUP_SIZE,
+        with_bias: bool = True,
+    ) -> torch.Tensor:
         torch.manual_seed(0)
         device = "cuda"
-        weight = torch.randn((size_n, K), dtype=torch.float32, device=device)
-        q, scale, zp, dequant = _quantize_awq(weight, GROUP_SIZE, symmetric)
+        weight = torch.randn((size_n, size_k), dtype=torch.float32, device=device)
+        q, scale, zp, dequant = _quantize_awq(weight, group_size, symmetric)
 
         layer = torch.nn.Module()
         scheme = CompressedTensorsWNA16(
             strategy="group",
             num_bits=4,
-            group_size=GROUP_SIZE,
+            group_size=group_size,
             symmetric=symmetric,
             actorder=None,
         )
         scheme.create_weights(
             layer,
             output_size=size_n,
-            input_size=K,
+            input_size=size_k,
             output_partition_sizes=[size_n],
-            input_size_per_partition=K,
+            input_size_per_partition=size_k,
             params_dtype=torch.float16,
             weight_loader=lambda *args, **kwargs: None,
         )
@@ -96,13 +105,20 @@ class TestCompressedTensorsWNA16MarlinPad(CustomTestCase):
         else:
             self.assertIsNone(getattr(layer, "marlin_size_n_padded", None))
 
-        x = torch.randn((M, K), dtype=torch.float16, device=device)
-        bias = torch.randn((size_n,), dtype=torch.float16, device=device)
+        x = torch.randn((M, size_k), dtype=torch.float16, device=device)
+        bias = (
+            torch.randn((size_n,), dtype=torch.float16, device=device)
+            if with_bias
+            else None
+        )
         out = scheme.apply_weights(layer, x, bias)
-        ref = x.float() @ dequant.float().T + bias.float()
+        ref = x.float() @ dequant.float().T
+        if bias is not None:
+            ref = ref + bias.float()
 
         self.assertEqual(tuple(out.shape), (M, size_n))
         torch.testing.assert_close(out.float(), ref, atol=0.2, rtol=0.02)
+        return out
 
     def test_n_not_multiple_of_64(self):
         self._run_case(8608, symmetric=False)
@@ -112,6 +128,30 @@ class TestCompressedTensorsWNA16MarlinPad(CustomTestCase):
 
     def test_n_multiple_of_64(self):
         self._run_case(8640, symmetric=False)
+
+    def test_bias_free_gate_up_activation(self):
+        # A fused gate/up projection is consumed by SiluAndMul, which requires
+        # contiguous input.  8624 is not a multiple of 64, so this 2 * 8624 wide
+        # output is padded and narrowed again, and the narrowed view used to come
+        # back non-contiguous.
+
+        size_n = 2 * 8624
+        out = self._run_case(size_n, symmetric=True, with_bias=False)
+        self.assertTrue(out.is_contiguous())
+
+        d = size_n // 2
+        expected = F.silu(out[:, :d]) * out[:, d:]
+        torch.testing.assert_close(SiluAndMul()(out), expected)
+
+    def test_k_aligned_to_64_loads(self):
+        # K = 448 only satisfies the 64-wide Marlin K tile; N = 896 is
+        # 128-aligned, so the (thread_k, thread_n) = (64, 128) config covers it.
+        self._run_case(896, symmetric=True, size_k=448, group_size=64)
+
+    def test_shape_without_thread_config_rejected(self):
+        # K = 448 needs a 128-aligned N, and 832 is only 64-aligned.
+        with self.assertRaisesRegex(ValueError, "No Marlin thread config"):
+            self._run_case(832, symmetric=True, size_k=448, group_size=64)
 
 
 if __name__ == "__main__":
