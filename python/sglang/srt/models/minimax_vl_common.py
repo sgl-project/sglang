@@ -324,7 +324,7 @@ class CLIPEncoderLayer(nn.Module):
             prefix=f"{prefix}.mlp.fc1",
             parallel_group="replicated" if use_data_parallel else "attn_tp",
         )
-        hidden_act = getattr(config, "hidden_act", "gelu")
+        hidden_act = config.hidden_act
         assert hidden_act == "gelu", (
             f"Only gelu activation is supported, got {hidden_act}"
         )
