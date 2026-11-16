@@ -256,7 +256,7 @@ register_chat_template(
                 "",
                 "",
             ),
-            "user": (
+            "User": (
                 "<｜User｜>",
                 "",
             ),

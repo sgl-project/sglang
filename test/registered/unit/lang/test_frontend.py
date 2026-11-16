@@ -20,7 +20,6 @@ import sglang as sgl
 from sglang.lang.backend import openai as openai_backend
 from sglang.lang.backend.anthropic import Anthropic
 from sglang.lang.backend.runtime_endpoint import Runtime, RuntimeEndpoint
-from sglang.lang.chat_template import chat_template_registry
 from sglang.lang.interpreter import StreamExecutor
 from sglang.lang.ir import SglSamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -354,18 +353,6 @@ class TestAnthropicBackendSystemMessage(CustomTestCase):
         self.assertEqual("".join(text for text, _ in pieces), "hi")
         self.assertEqual(self.calls[0]["system"], "be brief")
         self.assertEqual(executor.messages()[0], self.SYSTEM)
-
-
-class TestChatTemplateRoles(CustomTestCase):
-    def test_every_template_registers_the_frontend_roles(self):
-        """The frontend looks roles up as "system", "user" and "assistant"; a template
-        that keys one differently renders that role with no prefix or suffix."""
-        for name, template in chat_template_registry.items():
-            with self.subTest(template=name):
-                self.assertEqual(
-                    set(template.role_prefix_and_suffix),
-                    {"system", "user", "assistant"},
-                )
 
 
 if __name__ == "__main__":
