@@ -147,15 +147,20 @@ class IndexedReqList(ReqList):
         *,
         abort: Optional[Callable[[AbortReq], None]] = None,
         req_of: Callable[[Any], Req] = lambda x: x,
+        on_leave: Optional[Callable[[List[Req]], None]] = None,
     ) -> None:
         self.kind = kind
         self._abort = abort
         self._req_of = req_of
+        self._on_leave = on_leave
         # May still hold items whose request left: a leave only clears the
         # owner; the next iteration, index, join or reorder drops them in one
         # pass.
         self._items: List[Any] = []
         self._num_left = 0
+
+    def set_on_leave(self, callback: Optional[Callable[[List[Req]], None]]) -> None:
+        self._on_leave = callback
 
     def _compact(self) -> None:
         if self._num_left:
@@ -187,6 +192,9 @@ class IndexedReqList(ReqList):
 
     def _leave(self, reqs: Iterable[Req]) -> None:
         """Drop the items of the given requests; ones not in are ignored."""
+        if self._on_leave is not None:
+            reqs = list(reqs)
+            self._on_leave([req for req in reqs if req.owner_list is self])
         for req in reqs:
             if req.owner_list is self:
                 req.owner_list = None
