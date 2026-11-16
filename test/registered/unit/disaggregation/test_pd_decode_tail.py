@@ -13,14 +13,15 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
-import sglang.srt.disaggregation.decode_schedule_batch_mixin as mixin_module
 import torch
+
+import sglang.srt.disaggregation.decode_schedule_batch_mixin as mixin_module
 from sglang.srt.disaggregation import decode as decode_module
-from sglang.srt.disaggregation import prefill as prefill_module
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
-from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, pre_alloc_fill_len
+from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
+from sglang.srt.disaggregation.utils import pre_alloc_fill_len, tail_transfer_input_len
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -30,16 +31,16 @@ register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 class TailTransferInputLenTest(CustomTestCase):
     def test_cap_stops_at_n_minus_w(self):
-        self.assertEqual(prefill_module.tail_transfer_input_len(1000, 10), 990)
+        self.assertEqual(tail_transfer_input_len(1000, 10), 990)
 
     def test_short_prompt_sends_only_metadata(self):
-        self.assertEqual(prefill_module.tail_transfer_input_len(5, 10), 0)
-        self.assertEqual(prefill_module.tail_transfer_input_len(1, 10), 0)
-        self.assertEqual(prefill_module.tail_transfer_input_len(2, 10), 0)
-        self.assertEqual(prefill_module.tail_transfer_input_len(11, 10), 1)
+        self.assertEqual(tail_transfer_input_len(5, 10), 0)
+        self.assertEqual(tail_transfer_input_len(1, 10), 0)
+        self.assertEqual(tail_transfer_input_len(2, 10), 0)
+        self.assertEqual(tail_transfer_input_len(11, 10), 1)
 
     def test_cap_is_identity_without_tail(self):
-        self.assertEqual(prefill_module.tail_transfer_input_len(1000, 0), 1000)
+        self.assertEqual(tail_transfer_input_len(1000, 0), 1000)
 
 
 class IsTailTransferTest(CustomTestCase):
