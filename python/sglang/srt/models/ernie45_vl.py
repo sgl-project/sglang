@@ -197,7 +197,6 @@ class VariableResolutionResamplerModel(nn.Module):
             self.spatial_dim,
             bias=True,
             gather_output=True,
-            quant_config=getattr(config, "quant_config", None),
             prefix=f"{prefix}.spatial_linear1",
         )
 
@@ -208,7 +207,6 @@ class VariableResolutionResamplerModel(nn.Module):
             self.spatial_dim,
             bias=True,
             gather_output=True,
-            quant_config=getattr(config, "quant_config", None),
             prefix=f"{prefix}.spatial_linear2",
         )
 
@@ -220,7 +218,6 @@ class VariableResolutionResamplerModel(nn.Module):
                 self.spatial_dim,
                 bias=True,
                 gather_output=True,
-                quant_config=getattr(config, "quant_config", None),
                 prefix=f"{prefix}.temporal_linear1",
             )
 
@@ -231,7 +228,6 @@ class VariableResolutionResamplerModel(nn.Module):
                 self.spatial_dim,
                 bias=True,
                 gather_output=True,
-                quant_config=getattr(config, "quant_config", None),
                 prefix=f"{prefix}.temporal_linear2",
             )
 
@@ -242,7 +238,6 @@ class VariableResolutionResamplerModel(nn.Module):
             self.out_dim,
             bias=True,
             gather_output=True,
-            quant_config=getattr(config, "quant_config", None),
             prefix=f"{prefix}.mlp",
         )
 
@@ -333,19 +328,6 @@ class VariableResolutionResamplerModel(nn.Module):
             x = fwd_temporal(x)
         x = fwd_mlp(x)
         return x
-
-    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params: set[str] = set()
-
-        for name, loaded_weight in weights:
-            if name not in params_dict:
-                continue
-            param = params_dict[name]
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
 
 
 class Ernie4_5_VisionTransformer(nn.Module):
