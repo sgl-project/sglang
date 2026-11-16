@@ -39,6 +39,7 @@ from sglang.multimodal_gen.runtime.layers.attention import USPAttention
 from sglang.multimodal_gen.runtime.layers.layernorm import RMSNorm as SGLangRMSNorm
 from sglang.multimodal_gen.runtime.layers.layernorm import (
     apply_qk_norm_with_optional_rope,
+    BoundRMSNormNoWeight,
 )
 from sglang.multimodal_gen.runtime.layers.linear import (
     MergedColumnParallelLinear,
@@ -50,7 +51,12 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import (
     apply_flashinfer_rope_qk_inplace,
 )
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
+
+_is_npu = current_platform.is_npu()
 
 ADALN_EMBED_DIM = 256
 
@@ -77,6 +83,23 @@ class LLaDAImageRMSNorm(SGLangRMSNorm):
     def __init__(self, hidden_size: int, eps: float):
         super().__init__(hidden_size, eps=eps, cast_x_before_out_mul=True)
         self.weight.missing_param_init = "ones"
+
+
+def affine_free_rms_norm(
+    dim: int, eps: float, elementwise_affine: bool = False
+) -> nn.Module:
+    """NPU reuses the no-weight RMS op; other backends keep diffusers RMSNorm.
+
+    The text_projection checkpoint stores these norms without a weight, so a
+    weight-bearing norm breaks the strict plain state-dict validation.
+    ``elementwise_affine`` is forwarded to the diffusers branch only; the NPU
+    no-weight op is inherently weight-less.
+    """
+    if _is_npu:
+        return BoundRMSNormNoWeight(eps=eps)
+    # The committed diffusers norm keeps GPU parity: F.rms_norm rounds
+    # differently and shifted bf16 outputs on H200.
+    return RMSNorm(dim, eps=eps, elementwise_affine=elementwise_affine)
 
 
 @dataclass
@@ -147,7 +170,17 @@ class LLaDAImageRopeEmbedder(nn.Module):
 
         frequencies = []
         for axis, axis_frequencies in enumerate(self.freqs_cis):
-            frequencies.append(axis_frequencies[position_ids[:, axis]])
+            if _is_npu:
+                # NPU's advanced-indexing kernel does not support complex64, so
+                # gather the real and imaginary (float32) parts separately.
+                idx = position_ids[:, axis]
+                frequencies.append(
+                    torch.complex(
+                        axis_frequencies.real[idx], axis_frequencies.imag[idx]
+                    )
+                )
+            else:
+                frequencies.append(axis_frequencies[position_ids[:, axis]])
         return torch.cat(frequencies, dim=-1)
 
 
@@ -479,7 +512,9 @@ class _LLaDAImageTransformer2DModel(ModelMixin, ConfigMixin):
 
         def feature_embedder(feature_dim: int) -> nn.Sequential:
             return nn.Sequential(
-                RMSNorm(feature_dim, eps=norm_eps, elementwise_affine=False),
+                affine_free_rms_norm(
+                    feature_dim, eps=norm_eps, elementwise_affine=False
+                ),
                 nn.Linear(feature_dim, dim, bias=True),
             )
 
@@ -1006,9 +1041,17 @@ class LLaDAImageQueryAttention(nn.Module):
                 biases,
             )
         )
-        hidden_states = dispatch_attention_fn(
-            query, key, value, attn_mask=attention_mask[:, None, None, :]
-        )
+        if _is_npu:
+            # NPU fused SDPA misreads broadcast masks (stride-0 query dim);
+            # materialize [B, 1, S_q, L] contiguous before dispatch.
+            attn_mask = (
+                attention_mask[:, None, None, :]
+                .expand(-1, -1, query.shape[1], -1)
+                .contiguous()
+            )
+        else:
+            attn_mask = attention_mask[:, None, None, :]
+        hidden_states = dispatch_attention_fn(query, key, value, attn_mask=attn_mask)
         return self.out_proj(hidden_states.flatten(2, 3))
 
 
@@ -1091,8 +1134,12 @@ class LLaDAImageTextProjectionAttention(nn.Module):
         self.v_proj = nn.Linear(hidden_size, hidden_size, bias=True)
         self.q_proj = nn.Linear(hidden_size, hidden_size, bias=True)
         self.out_proj = nn.Linear(hidden_size, hidden_size, bias=True)
-        self.q_norm = RMSNorm(self.head_dim, eps=norm_eps, elementwise_affine=False)
-        self.k_norm = RMSNorm(self.head_dim, eps=norm_eps, elementwise_affine=False)
+        self.q_norm = affine_free_rms_norm(
+            self.head_dim, eps=norm_eps, elementwise_affine=False
+        )
+        self.k_norm = affine_free_rms_norm(
+            self.head_dim, eps=norm_eps, elementwise_affine=False
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         heads = (self.heads, self.head_dim)
@@ -1126,9 +1173,13 @@ class LLaDAImageTextProjectionBlock(nn.Module):
         self.self_attn = LLaDAImageTextProjectionAttention(
             hidden_size, num_attention_heads, norm_eps
         )
-        self.layer_norm1 = RMSNorm(hidden_size, eps=norm_eps, elementwise_affine=False)
+        self.layer_norm1 = affine_free_rms_norm(
+            hidden_size, eps=norm_eps, elementwise_affine=False
+        )
         self.mlp = LLaDAImageMLP(hidden_size, intermediate_size, approximate="tanh")
-        self.layer_norm2 = RMSNorm(hidden_size, eps=norm_eps, elementwise_affine=False)
+        self.layer_norm2 = affine_free_rms_norm(
+            hidden_size, eps=norm_eps, elementwise_affine=False
+        )
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = hidden_states + self.self_attn(self.layer_norm1(hidden_states))

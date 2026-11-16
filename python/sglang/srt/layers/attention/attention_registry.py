@@ -172,6 +172,18 @@ def create_ascend_backend(runner):
     return AscendAttnBackend(runner)
 
 
+@register_attention_backend("llada2_cfg_ascend")
+def create_llada2_cfg_ascend_backend(runner):
+    if runner.use_mla_backend:
+        raise ValueError("LLaDA2 CFG attention does not use an MLA backend")
+
+    from sglang.srt.hardware_backend.npu.attention.ascend_llada2_cfg_backend import (
+        AscendLLaDA2CFGAttnBackend,
+    )
+
+    return AscendLLaDA2CFGAttnBackend(runner)
+
+
 @register_attention_backend("dsa")
 def create_dsa_backend(runner):
     if _is_sail:

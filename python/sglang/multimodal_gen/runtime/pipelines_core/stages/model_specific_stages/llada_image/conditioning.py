@@ -100,7 +100,11 @@ class LLaDAImageTextEncoderRunner:
             skip_tokenizer_init=True,
             dtype="bfloat16",
             tp_size=1,
-            attention_backend="llada2_cfg_flashinfer",
+            attention_backend=(
+                "llada2_cfg_ascend"
+                if device.type == "npu"
+                else "llada2_cfg_flashinfer"
+            ),
             disable_cuda_graph=True,
             disable_radix_cache=True,
             chunked_prefill_size=-1,

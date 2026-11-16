@@ -392,7 +392,26 @@ class RMSNormNoWeight(CustomOp):
             return self.forward_native(x, eps=eps)
 
     def forward_npu(self, x: torch.Tensor, eps: float) -> torch.Tensor:
+        # fused_rmsnorm_without_weight serves 3-D [B, L, C]; callers also feed
+        # other ranks (1-D, 2-D, 4-D). Normalization runs over the last dim, so
+        # reshaping to [N, 1, C] and back is equivalent.
+        if x.dim() != 3:
+            shape = x.shape
+            return fused_rmsnorm_without_weight(
+                x.reshape(-1, 1, shape[-1]), eps
+            ).reshape(shape)
         return fused_rmsnorm_without_weight(x, eps)
+
+
+class BoundRMSNormNoWeight(RMSNormNoWeight):
+    """RMSNormNoWeight with eps bound at construction; called as ``norm(x)``."""
+
+    def __init__(self, eps: float) -> None:
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self._forward_method(x, self.eps)
 
 
 # Copied and adapted from sglang

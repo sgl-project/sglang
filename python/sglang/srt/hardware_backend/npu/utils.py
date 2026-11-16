@@ -6,7 +6,11 @@ from typing import TYPE_CHECKING, Callable, Optional
 
 import torch
 
-from sglang.srt.arg_groups.model_override_base import resolving_view, use_mla_backend
+from sglang.srt.arg_groups.model_override_base import (
+    is_attention_backend_not_set,
+    resolving_view,
+    use_mla_backend,
+)
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Phase, with_phase
@@ -80,22 +84,25 @@ def set_default_server_args(args: "ServerArgs"):
 
     cfg = resolving_view(args)
 
-    # NPU only works with "ascend" attention backend for now
-    declare_resolution(
-        args,
-        "set_default_server_args",
-        attention_backend="ascend",
-    )
-    declare_resolution(
-        args,
-        "set_default_server_args",
-        prefill_attention_backend="ascend",
-    )
-    declare_resolution(
-        args,
-        "set_default_server_args",
-        decode_attention_backend="ascend",
-    )
+    # NPU only works with "ascend" attention backend for now. Respect an
+    # explicitly requested backend (e.g. the LLaDA-Image CFG variant) so
+    # callers that need a specific NPU-native backend are not silently pinned.
+    if is_attention_backend_not_set(cfg):
+        declare_resolution(
+            args,
+            "set_default_server_args",
+            attention_backend="ascend",
+        )
+        declare_resolution(
+            args,
+            "set_default_server_args",
+            prefill_attention_backend="ascend",
+        )
+        declare_resolution(
+            args,
+            "set_default_server_args",
+            decode_attention_backend="ascend",
+        )
     if cfg.page_size is None:
         declare_resolution(
             args,

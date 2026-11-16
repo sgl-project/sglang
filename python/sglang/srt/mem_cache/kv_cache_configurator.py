@@ -2780,7 +2780,7 @@ class KVCacheConfigurator:
         need_sort = get_disagg().disaggregation_mode in ("decode", "prefill")
         if token_to_kv_pool_allocator is None:
             if _is_npu and (
-                get_exec().kernel.attention_backend == "ascend"
+                get_exec().kernel.attention_backend in ("ascend", "llada2_cfg_ascend")
                 or is_compressed_kv_model
                 or self.hybrid_gdn_config is not None
             ):
