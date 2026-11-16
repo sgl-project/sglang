@@ -5433,6 +5433,49 @@ class ServingChatTestCase(CustomTestCase):
             [[0, 1], [1, 1]],
         )
 
+    def test_streaming_parallel_sampling_sends_one_response_id(self):
+        """n>1 gives each choice its own engine rid; every streamed chunk,
+        the usage chunk included, must still carry one response id."""
+
+        async def mock_generate():
+            stop = {"type": "stop", "matched": None}
+            for index, finish in ((0, None), (1, None), (1, stop), (0, stop)):
+                yield {
+                    "text": f"choice-{index}",
+                    "meta_info": {
+                        "id": f"rid-{index}",
+                        "prompt_tokens": 10,
+                        "completion_tokens": 2,
+                        "cached_tokens": 0,
+                        "finish_reason": finish,
+                    },
+                    "index": index,
+                }
+
+        self.tm.generate_request.return_value = mock_generate()
+        req = ChatCompletionRequest(
+            model="x",
+            messages=[{"role": "user", "content": "Hi?"}],
+            n=2,
+            stream=True,
+            stream_options={"include_usage": True},
+        )
+
+        async def run_route():
+            response = await self.chat._handle_streaming_request(
+                Mock(), req, self.fastapi_request
+            )
+            return [chunk async for chunk in response.body_iterator]
+
+        parsed = self._parse_chunks(
+            get_or_create_event_loop().run_until_complete(run_route())
+        )
+        self.assertEqual(
+            {c["choices"][0]["index"] for c in parsed if c["choices"]}, {0, 1}
+        )
+        self.assertTrue(any(not c["choices"] and c.get("usage") for c in parsed))
+        self.assertEqual({c["id"] for c in parsed}, {"rid-0"})
+
     def _collect_continuous_usage(self, cached_tokens):
         content = {
             "text": "Hello",

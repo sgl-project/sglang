@@ -115,7 +115,8 @@ class ChatWire(Protocol):
 
 
 class _OpenAIChatWire:
-    """OpenAI's shape; stateless, so it is also its own per-response object."""
+    """OpenAI's shape; stateless, so it is also the per-response default of
+    helpers called without one."""
 
     serialization_context = None
     omit_null_delta = False
@@ -124,7 +125,7 @@ class _OpenAIChatWire:
     errors_end_choices = False
 
     def new_response(self, request, *, created):
-        return self
+        return _OpenAIChatWireResponse()
 
     def error_body(self, error):
         return None
@@ -157,6 +158,17 @@ class _OpenAIChatWire:
 
     def internal_content(self, index, source, *, kind):
         return None
+
+
+class _OpenAIChatWireResponse(_OpenAIChatWire):
+    def __init__(self):
+        self._id: Optional[str] = None
+
+    def response_id(self, engine_rid):
+        """Fixed by the first rid, since n>1 gives each choice its own rid."""
+        if self._id is None:
+            self._id = engine_rid
+        return self._id
 
 
 OPENAI_CHAT_WIRE = _OpenAIChatWire()
