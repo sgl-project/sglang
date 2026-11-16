@@ -520,7 +520,7 @@ class SchedulePolicy:
         """
         try:
             policy_enum = CacheAwarePolicy(policy)
-            if getattr(tree_cache, "disable", True):
+            if tree_cache.disable:
                 if policy_enum == CacheAwarePolicy.SHORTEST_PREFILL_FIRST:
                     raise ValueError(
                         "Experimental shortest-prefill-first requires prefix caching"
@@ -1878,7 +1878,7 @@ class PrefillAdder:
         if self.chunked_req_waits:
             return AddReqResult.NO_TOKEN
 
-        if req.sampling_params.ignore_eos and getattr(self.tree_cache, "disable", True):
+        if req.sampling_params.ignore_eos and self.tree_cache.disable:
             return self.add_one_req_ignore_eos(req, truncation_align_size)
 
         max_new = self._swa_new_tokens(req)
