@@ -214,8 +214,8 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-# The sglang package comes from the image's site-packages (PYTHONPATH below is intentionally NOT prepended). 
-# However, test helper modules shipped in the PR  must be available on top of whatever the image bundled, 
+# The sglang package comes from the image's site-packages (PYTHONPATH below is intentionally NOT prepended).
+# However, test helper modules shipped in the PR  must be available on top of whatever the image bundled,
 # so we rsync the checkout's python/sglang/test tree into site-packages before anything imports it.
 IMAGE_SGLANG_PKG="$(python -c 'import sglang, os; print(os.path.dirname(sglang.__file__))')"
 if [ -d "${IMAGE_SGLANG_PKG}/test" ] && [ -d "${sglang_source_path}/python/sglang/test" ]; then
