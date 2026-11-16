@@ -2509,15 +2509,6 @@ class Envs:
     SGLANG_K3_KDA_WS_MOVER = EnvStr("ce")
     # --kda-weight-shard-size: KDA layers gathered ahead of the running one (slots = depth + 1).
     SGLANG_K3_KDA_WS_PREFETCH_DEPTH = EnvInt(1)
-    # --kda-weight-shard-size: issue the next gather at layer start ("layer") or KDA core ("core").
-    SGLANG_K3_KDA_WS_ISSUE_AT = EnvStr("layer")
-    # --kda-weight-shard-size: log the gather wait stalls per forward.
-    SGLANG_K3_KDA_WS_STATS = EnvBool(False)
-    # --kda-weight-shard-size: MoE stage waits for the layer's gathers: "always", "never",
-    # or N (only when the largest per-DP-rank token count is >= N).
-    SGLANG_K3_KDA_WS_MOE_WAIT = EnvStr("always")
-    # --kda-weight-shard-size, mover ce: build gather copy views and events once.
-    SGLANG_K3_KDA_WS_LEAN_ISSUE = EnvBool(True)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)
     SGLANG_KIMI_K3_VIT_CUDA_GRAPH_CACHE_CAPACITY = EnvInt(2)

@@ -127,7 +127,6 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.breakab
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
 )
-from sglang.srt.model_executor.runner_utils.forward_batch import get_forward_batch
 from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
@@ -2568,8 +2567,6 @@ class KimiK3DeltaAttention(nn.Module):
         if defer_f_b:
             self.attn._k3_deferred_f_b = True
 
-        if self._weight_shard is not None and self._weight_shard.issue_at == "core":
-            _k3_weight_shard_core_start(self.layer_idx)
         core_attn_out = self.attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
@@ -3071,31 +3068,8 @@ def _k3_weight_shard_layer_start(layer_idx: int) -> None:
 
 
 @eager_on_graph
-def _k3_weight_shard_core_start(layer_idx: int) -> None:
-    k3_kda_weight_shard.active().on_core_start(layer_idx)
-
-
-@eager_on_graph
-def _k3_weight_shard_moe_start(layer_idx: int, forward_batch: ForwardBatch) -> None:
-    num_tokens = None
-    if k3_kda_weight_shard.moe_wait_needs_tokens():
-        num_tokens = _k3_weight_shard_forward_tokens(forward_batch)
-    k3_kda_weight_shard.on_moe_start(layer_idx, num_tokens)
-
-
-def _k3_weight_shard_forward_tokens(forward_batch: ForwardBatch) -> int:
-    # On breakable-graph replay ``forward_batch`` is the capture-time batch.
-    try:
-        live = get_forward_batch()
-    except RuntimeError:  # eager forward: the argument is the running batch
-        live = forward_batch
-    counts = live.global_num_tokens_cpu
-    if not counts:
-        raise RuntimeError(
-            "SGLANG_K3_KDA_WS_MOE_WAIT token threshold needs the DP token counts "
-            "(global_num_tokens_cpu); --kda-weight-shard-size runs under attention DP"
-        )
-    return max(counts)
+def _k3_weight_shard_moe_start(layer_idx: int) -> None:
+    k3_kda_weight_shard.on_moe_start(layer_idx)
 
 
 class KimiK3DecoderLayer(nn.Module):
@@ -3304,7 +3278,7 @@ class KimiK3DecoderLayer(nn.Module):
         )
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         if self._weight_shard_hook:
-            _k3_weight_shard_moe_start(self.layer_idx, forward_batch)
+            _k3_weight_shard_moe_start(self.layer_idx)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         if isinstance(self.mlp, KimiK3MoE) and self.mlp._use_mega_moe:
             valid_token_count = None
