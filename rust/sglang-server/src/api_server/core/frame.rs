@@ -495,6 +495,11 @@ fn finish_reason(reason: &FinishReason) -> api::FinishReason {
         FinishReason::Known(FinishKind::Stop { matched }) => Kind::Stop(api::FinishStop {
             matched: matched.as_ref().map(matched_value),
         }),
+        // The typed API has no optional limit field; preserve the extended
+        // native shape through its existing raw-JSON passthrough arm.
+        FinishReason::Known(FinishKind::Length { limit: Some(_), .. }) => {
+            Kind::Unknown(serde_json::to_string(reason).expect("finish reason is serializable"))
+        }
         FinishReason::Known(FinishKind::Length { length, .. }) => {
             Kind::Length(api::FinishLength { length: *length })
         }
@@ -552,6 +557,17 @@ mod tests {
 
     fn json<T: serde::Serialize>(value: &T) -> serde_json::Value {
         serde_json::to_value(value).unwrap()
+    }
+
+    #[test]
+    fn native_length_finish_preserves_kv_limit() {
+        for expected in [
+            serde_json::json!({"type": "length", "length": 509, "limit": "kv_cache"}),
+            serde_json::json!({"type": "length", "length": 8}),
+        ] {
+            let reason: FinishReason = serde_json::from_value(expected.clone()).unwrap();
+            assert_eq!(json(&finish_reason(&reason)), expected);
+        }
     }
 
     /// Python parity pinned on the typed shape: a NaN logprob is a null slot,
