@@ -226,7 +226,7 @@ def test_qsa_pool_write_and_padding(monkeypatch, fia):
     monkeypatch.setenv("ASCEND_USE_FIA", "True" if fia else "False")
     _, dtype = configure_kv_cache_dtype(
         server_args_kv_cache_dtype="auto",
-        model=SimpleNamespace(quant_config=None),
+        quant_config=None,
         model_dtype=torch.bfloat16,
         is_draft_worker=False,
         is_dflash=False,
