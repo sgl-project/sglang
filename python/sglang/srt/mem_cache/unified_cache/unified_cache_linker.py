@@ -166,6 +166,9 @@ class UnifiedCacheLinker(ABC):
     pools: dict[PoolName, object]
     load_mode = "layer_wise"
     prefetch_policy = "timeout"
+    # Share of the full KV pool that in-flight prefetch reads may own at once;
+    # the rest stays free or evictable for admitted and chunked requests.
+    prefetch_max_pool_ratio = 0.5
     # None when the current stream is the only one using the pages.
     forward_stream: Optional[torch.cuda.Stream] = None
 
@@ -438,8 +441,13 @@ class UnifiedCacheLinkerWrapper:
         except Exception:
             logger.warning("External linker prefetch lookup failed", exc_info=True)
             restorable = []
+        # Filter before the intersection so every rank stays within its own
+        # budget without an extra collective; a capped read keeps the hit's head.
+        budget_pages = self._prefetch_budget_pages()
         pages = self._sync_restorable_prefix(
-            restorable, num_pages=len(hashes), device_hit_pages=0
+            [length for length in restorable if length <= budget_pages],
+            num_pages=len(hashes),
+            device_hit_pages=0,
         )
         if not pages:
             return
@@ -513,6 +521,12 @@ class UnifiedCacheLinkerWrapper:
             for _, transfer in state.component_transfers
             if transfer.name == pool and transfer.device_indices is not None
         )
+
+    def _prefetch_budget_pages(self) -> int:
+        """Pages a new prefetch read may take under the pool share cap."""
+        pool_tokens = self.cache.token_to_kv_pool_allocator.size_full
+        cap = int(pool_tokens * self.cache_linker.prefetch_max_pool_ratio)
+        return max(0, cap - self.prefetch_size(PoolName.KV)) // self.cache.page_size
 
     def check_prefetch_events(self) -> None:
         if not self.prefetches:

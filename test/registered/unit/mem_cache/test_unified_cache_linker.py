@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
 )
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
+from sglang.srt.mem_cache.prefill_budget import PrefillBudget
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_direct_linker import (
     MooncakeDirectLinker,
@@ -705,6 +706,32 @@ class TestLinkerDevicePrefetch(CustomTestCase):
                 assert self._match(cache, req).device_prefix_len == 6
                 self._assert_balanced(cache, allocator)
                 cache.sanity_check()
+
+    def test_prefetch_burst_leaves_room_for_a_chunked_continuation(self):
+        """A burst of queued prefetches must not take every free KV slot while
+        a chunked request is mid-flight; its next chunk must still fit."""
+        cache, backend, _, allocator = self._fixture()
+        # KV a chunked request already holds for its earlier chunks.
+        chunked_prefix = allocator.alloc(8)
+        # Five queued 3-page (6-token) hits would cover the 24 free slots.
+        for i in range(5):
+            self._enqueue(cache, self._request(f"burst-{i}", start=10 * i + 1))
+
+        chunk = PrefillBudget(allocator, cache).available_chunk_tokens(8)
+        assert chunk == 8
+        chunk_slots = allocator.alloc(chunk)
+        assert chunk_slots is not None
+        # Default cap 0.5 of 32: two full reads, then one cut to its 2-page head.
+        assert cache.linker.prefetch_size(PoolName.KV) == 16
+        assert len(backend.prefetch_futures) == 3
+
+        for future in backend.prefetch_futures:
+            future.set_result(True)
+        cache.linker.check_prefetch_events()
+        assert not cache.linker.prefetches
+        allocator.free(torch.cat([chunked_prefix, chunk_slots]))
+        self._assert_balanced(cache, allocator)
+        cache.sanity_check()
 
     def test_layer_wise_still_uses_queued_loads_without_prefetch(self):
         cache, backend, req, allocator = self._fixture()

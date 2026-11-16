@@ -54,6 +54,12 @@ Set `prefetch_policy` in the same JSON:
   `prefetch_timeout_base` + tokens / 1024 * `prefetch_timeout_per_ki_token` seconds.
   These JSON options default to 1 and 0.25 respectively.
 
+`prefetch_max_pool_ratio` (default `0.5`, range `(0, 1]`) caps the share of the
+full KV pool that in-flight prefetch reads may own at once. A hit that does not
+fit the remaining share is cut to the head that fits. The rest of the pool stays
+free or evictable for admitted and chunked requests, so a burst of queued
+prefetches cannot starve a running chunked prefill.
+
 Stopping the wait cancels queued reads. Running reads retain their private slots
 until every rank stops writing, then discard them without publishing. Pending
 slots count toward GPU capacity. Reset and shutdown drain reads before freeing slots.
