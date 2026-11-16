@@ -182,6 +182,39 @@ class TestBaseReasoningFormatDetector(CustomTestCase):
         self.assertEqual(detector._buffer, "")
         self.assertEqual(detector.finish().reasoning_text, "")
 
+    def test_parse_streaming_increment_no_stream_reasoning_split_delimiters(self):
+        """With stream_reasoning=False, incremental scanning must still detect
+        end tokens and line-anchored tool-start tokens split across chunks."""
+        detector = BaseReasoningFormatDetector(
+            "<think>",
+            "</think>",
+            stream_reasoning=False,
+            tool_start_token="<tool_call>",
+            tool_start_at_line_start=True,
+        )
+        chunks = [
+            "<thi",
+            "nk>first line mentions <tool",
+            "_call> inline\nsec",
+            "ond line\n<tool_",
+            "call>real_call()",
+        ]
+        reasoning_parts = []
+        normal_parts = []
+        for chunk in chunks:
+            res = detector.parse_streaming_increment(chunk)
+            reasoning_parts.append(res.reasoning_text)
+            normal_parts.append(res.normal_text)
+        end = detector.finish()
+        reasoning_parts.append(end.reasoning_text)
+        normal_parts.append(end.normal_text)
+
+        self.assertEqual(
+            "".join(reasoning_parts),
+            "first line mentions <tool_call> inline\nsecond line\n",
+        )
+        self.assertEqual("".join(normal_parts), "<tool_call>real_call()")
+
 
 class TestDeepSeekR1Detector(CustomTestCase):
     def setUp(self):
