@@ -119,10 +119,11 @@ def _oneshot_blocks(tokens):
 class _OneShotAllReduce:
     """Multimem full one-shot all-reduce for decode-sized activations.
 
-    Every rank issues the same multimem.ld_reduce as torch's multimem all-reduce
-    over the whole range, so results are identical. Inputs alternate between
-    two symmetric regions: an input region is rewritten two calls later, after
-    every peer has passed the next call's entry barrier."""
+    Every rank issues the same multimem.ld_reduce over the whole range, so all
+    ranks get the same result. The sum accumulates in BF16; acc_f32 (in-place
+    sizes only) accumulates in FP32, which matches torch's multimem all-reduce.
+    Inputs alternate between two symmetric regions: an input region is rewritten
+    two calls later, after every peer has passed the next call's entry barrier."""
 
     def __init__(self, group, hidden, dtype, device, inplace_tokens):
         self.region = ONESHOT_MAX_TOKENS * hidden
