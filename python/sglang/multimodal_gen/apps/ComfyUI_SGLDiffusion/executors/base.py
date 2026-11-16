@@ -187,7 +187,6 @@ class SGLDiffusionExecutor(torch.nn.Module):
         object.__setattr__(self, "model", model)
         self.dtype = config.unet_config["dtype"]
         self.config = config
-        self.loras = []
         self._lora_input = None
         self._sgld_reload = None
         self._ensure_runtime = None

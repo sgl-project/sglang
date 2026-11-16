@@ -333,7 +333,6 @@ class SGLDiffusionGenerator:
     """
 
     def __init__(self):
-        self.model_path = None
         self.generator = None
         self.executor = None
         # Executor that sent the last request; differs from self.executor
@@ -614,7 +613,6 @@ class SGLDiffusionGenerator:
                 logger.warning("DiffGenerator.shutdown failed", exc_info=True)
             self.kill_generator()
         self.last_options = None
-        self.model_path = None
         self.generator = None
         self.executor = None
         self._active_executor = None
@@ -783,7 +781,6 @@ class SGLDiffusionGenerator:
         # Checks above run first so a rejected config keeps the current worker.
         self.close_generator()
         self.last_options = gather_options
-        self.model_path = detect_path
 
         pipeline_class_name = self.pipeline_class_dict[model_type]
         worker_model_path = runtime_model_path or detect_path
