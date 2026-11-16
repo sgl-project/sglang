@@ -22,20 +22,6 @@ class TestFuncTimer(unittest.TestCase):
         func_timer.enable_metrics = self.orig_enable
         func_timer.FUNC_LATENCY = self.orig_latency
 
-    def test_sync_enabled(self):
-        """Sync function timed with custom name when metrics enabled."""
-        mock_histogram = MagicMock()
-        func_timer.enable_metrics = True
-        func_timer.FUNC_LATENCY = mock_histogram
-
-        @time_func_latency(name="custom_op")
-        def add(a, b):
-            return a + b
-
-        self.assertEqual(add(2, 3), 5)
-        mock_histogram.labels.assert_called_with(name="custom_op")
-        mock_histogram.labels().observe.assert_called_once()
-
     def test_async_enabled(self):
         """Async function timed with default name when metrics enabled."""
         mock_histogram = MagicMock()

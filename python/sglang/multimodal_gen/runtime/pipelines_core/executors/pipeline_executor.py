@@ -21,12 +21,15 @@ from sglang.multimodal_gen.runtime.distributed import get_world_rank
 from sglang.multimodal_gen.runtime.managers.progress_reporter import (
     get_progress_reporter,
 )
+from sglang.multimodal_gen.runtime.managers.request_cancel import raise_if_cancelled
+from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
+    RequestCancelledError,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch, Req
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 from sglang.multimodal_gen.runtime.utils.nvtx_pytorch_hooks import maybe_nvtx_range
-from sglang.multimodal_gen.runtime.utils.perf_logger import StageProfiler
 from sglang.multimodal_gen.runtime.utils.profiler import (
     SGLDiffusionProfiler,
     maybe_record_function,
@@ -37,18 +40,6 @@ if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.pipelines_core.stages.base import PipelineStage
 
 logger = init_logger(__name__)
-
-
-class Timer(StageProfiler):
-    """
-    A wrapper around StageProfiler to maintain backward compatibility.
-    It forces simple logging behavior (log start/end) regardless of env vars.
-    """
-
-    def __init__(self, name="Stage"):
-        super().__init__(
-            stage_name=name, logger=logger, metrics=None, log_stage_start_end=True
-        )
 
 
 class PipelineExecutor(ABC):
@@ -269,8 +260,11 @@ class PipelineExecutor(ABC):
         work can be removed. The base executor simply calls
         ``stage.run_grouped_requests`` for each stage in order.
         """
+        requests = list(batches)
         for stage in stages:
+            raise_if_cancelled(requests)
             batches = stage.run_grouped_requests(batches, server_args)
+        raise_if_cancelled(requests)
         return batches
 
     def execute_group_sequentially(
@@ -292,7 +286,15 @@ class PipelineExecutor(ABC):
                         time.monotonic() - sequential_start_time,
                     )
                 try:
+                    # each rank yields the same outputs, so the check stays a
+                    # collective; after a cancel, each later output stops here
+                    raise_if_cancelled([batch])
                     output = self.execute(remaining_stages, batch, server_args)
+                except RequestCancelledError as e:
+                    logger.info("Stopped request %s: %s", batch.request_id, e)
+                    output = OutputBatch(
+                        error=str(e), cancelled=True, metrics=batch.metrics
+                    )
                 except Exception as e:
                     logger.error(
                         "Sequential DiT/VAE inference failed for request %s: %s",

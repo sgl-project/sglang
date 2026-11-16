@@ -4,6 +4,7 @@ import logging
 
 import torch
 
+from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.multimodal_processor_mixin import (
     MultimodalProcessorMixin,
@@ -13,7 +14,6 @@ from sglang.srt.multimodal.processors.processor_config import MultimodalProcesso
 from sglang.srt.multimodal.token_space_mm_process.expansion import (
     expand_token_placeholders,
 )
-from sglang.srt.utils import ImageData, VideoData
 from sglang.srt.utils.video_decoder import VideoDecoderWrapper
 
 logger = logging.getLogger(__name__)

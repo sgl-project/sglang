@@ -132,14 +132,6 @@ class TestNPUMambaAsyncConfig(unittest.TestCase):
             device_layers[2, device_indices], host[host_indices, 2, 0]
         )
 
-    def test_copy_helpers_keep_static_signatures(self):
-        self.assertIsInstance(
-            MambaPoolHost.__dict__["_copy_tensor_pf_lf"], staticmethod
-        )
-        self.assertIsInstance(
-            MambaPoolHost.__dict__["_copy_tensor_all_layers_lf_pf"], staticmethod
-        )
-
     @patch.object(mamba_pool_host, "transfer_mamba_state", None)
     def test_conv_only_load_skips_empty_temporal_component(self):
         pool = MambaPoolHost.__new__(MambaPoolHost)

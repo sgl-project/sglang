@@ -7,11 +7,8 @@ import torch
 from PIL import Image
 
 from sglang.srt.managers.mm_utils import get_new_expanded_mm_items
-from sglang.srt.managers.schedule_batch import (
-    Modality,
-    MultimodalDataItem,
-    MultimodalInputFormat,
-)
+from sglang.srt.managers.req_types import MultimodalDataItem
+from sglang.srt.multimodal.modality import Modality, MultimodalInputFormat
 from sglang.srt.multimodal.processors.pixtral import PixtralProcessor
 from sglang.srt.multimodal.transport.feature_transport import (
     MultimodalFeatureTransport,
@@ -28,6 +25,7 @@ class TestPixtralProcessor(CustomTestCase):
         processor._feature_transport = MultimodalFeatureTransport(
             "cuda_ipc", base_gpu_id=0, skip_mm_pool=True
         )
+        processor.processor_fingerprint = "sha256:" + "12" * 32
         processor.image_size = 1024
         processor._effective_patch_size = 28
         processor._precompute_hashes_before_cpu_transfer = MagicMock()

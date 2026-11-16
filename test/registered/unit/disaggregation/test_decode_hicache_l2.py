@@ -19,6 +19,9 @@ from sglang.srt.disaggregation.decode_hicache_mixin import (
     HiCacheRestoreGatedKVReceiver,
     HiCacheRestoreResult,
 )
+from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
+    ScheduleBatchDisaggregationDecodeMixin,
+)
 from sglang.srt.disaggregation.utils import poll_and_all_reduce
 from sglang.srt.managers.cache_controller import HiCacheAck
 from sglang.srt.managers.schedule_batch import Req
@@ -37,6 +40,7 @@ from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import tree_slots_of
 
 # The TP case spawns two gloo workers that each re-import torch and sglang.
 register_cpu_ci(est_time=30, suite="base-a-test-cpu")
@@ -135,7 +139,7 @@ class TestDecodeHiCacheL2(CustomTestCase):
                 req_to_token_pool=self.pool,
                 token_to_kv_pool_allocator=self.allocator,
                 page_size=128,
-                tree_components=(ComponentType.FULL,),
+                tree_slots=tree_slots_of((ComponentType.FULL,)),
             )
         )
         self.controller = _CPUController(self.allocator)
@@ -209,6 +213,72 @@ class TestDecodeHiCacheL2(CustomTestCase):
         self.assertEqual(dr.prefix_match.l2_host_hit_length, 128)
         self.assertEqual(dr.prefix_match.l3_storage_hit_length, 0)
         self.cache.unlock(dr.req.lock)
+
+    def test_prebuilt_reports_decode_cache_sources_without_double_counting(self):
+        self._host_prefix()
+        for storage_hit, prefill_sources, expected in (
+            (0, (0, 0, 0), (128, 128, 0)),
+            (0, (192, 0, 0), (192, 64, 0)),
+            (64, (0, 0, 0), (128, 64, 64)),
+            (64, (0, 64, 128), (0, 64, 192)),
+            (128, (0, 0, 0), (128, 0, 128)),
+            (128, (192, 0, 0), (192, 0, 64)),
+            (128, (64, 64, 64), (64, 64, 128)),
+            (128, (300, 0, 0), (300, 0, 0)),
+        ):
+            with self.subTest(storage_hit=storage_hit, prefill_sources=prefill_sources):
+                dr = self._request(0)
+                req = dr.req
+                if storage_hit:
+                    # The L3 read has just inserted the evicted tail into L2.
+                    dr.prefix_match.l2_host_hit_length -= storage_hit
+                    dr.prefix_match.l3_storage_hit_length = storage_hit
+                    self.cache.prefetch_loaded_tokens_by_reqid[
+                        req.cache_request_handle
+                    ] = storage_hit
+                    self.cache.prefetch_loaded_storage_start_by_reqid[
+                        req.cache_request_handle
+                    ] = 256 - storage_hit
+                with patch.object(
+                    self.cache, "check_prefetch_progress", return_value=True
+                ):
+                    self.queue._process_hicache_local_restores([dr])
+                self._complete()
+                self.queue._process_hicache_local_restores([dr])
+                self.assertEqual(dr.hicache_restore_status, HiCacheRestoreResult.READY)
+                self.queue._commit_hicache_local_restore_to_req(dr)
+                req.init_next_round_input()
+                req.extend_end = len(req.origin_input_ids)
+                # Seed counters as DecodeTransferQueue does with Prefill's reply.
+                req.already_computed = req.cached_tokens = sum(prefill_sources)
+                (
+                    req.cached_tokens_device,
+                    req.cached_tokens_host,
+                    req.cached_tokens_storage,
+                ) = prefill_sources
+                batch = SimpleNamespace(
+                    reqs=[req],
+                    device="cpu",
+                    req_to_token_pool=self.pool,
+                    return_logprob=False,
+                    model_config=SimpleNamespace(vocab_size=512),
+                )
+                with patch(
+                    "sglang.srt.disaggregation.decode_schedule_batch_mixin."
+                    "SamplingBatchInfo.from_schedule_batch"
+                ):
+                    ScheduleBatchDisaggregationDecodeMixin.prepare_for_prebuilt(batch)
+                self.cache.unlock(req.lock)
+                self.cache.evict(EvictParams(num_tokens=128))
+                self.assertEqual(req.cached_tokens, sum(expected))
+                self.assertEqual(
+                    (
+                        req.cached_tokens_device,
+                        req.cached_tokens_host,
+                        req.cached_tokens_storage,
+                    ),
+                    expected,
+                )
 
     def test_concurrent_shared_prefix_and_l1_follower_wait_for_dma(self):
         self._host_prefix()

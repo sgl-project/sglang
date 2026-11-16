@@ -6,27 +6,97 @@ from __future__ import annotations
 import logging
 from typing import Any, Optional
 
-from sglang.srt.arg_groups.overrides import (
+from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
-    declare_resolution,
     model_config_of,
     resolved_view,
     resolving_view,
     use_mla_backend,
 )
-from sglang.srt.configs.model_config import is_deepseek_dsa
+from sglang.srt.arg_groups.overrides import declare_resolution
+from sglang.srt.configs.model_config import (
+    get_dsa_index_kpool,
+    get_dsa_index_kpool_compress,
+    is_deepseek_dsa,
+)
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
 from sglang.srt.runtime_context import attn_dp_enabled_of
-from sglang.srt.utils.common import get_device_memory_capacity
+from sglang.srt.utils.device import get_device_memory_capacity
 
 logger = logging.getLogger(__name__)
+
+# GQA prefill attention backends that implement the logical-page KV-shard
+# contract of layers/attention/kv_shard_hooks.py.
+_KV_SHARD_PREFILL_BACKENDS = {"fa3"}
+# Transfer backends whose prefill senders send only their own pages
+# (filter_kv_indices_for_shard_rank) and pair destinations by position.
+_KV_SHARD_TRANSFER_BACKENDS = {"mooncake", "nixl"}
+
+
+def register_kv_shard_prefill_backend(name: str) -> None:
+    """Admit an out-of-tree prefill attention backend for KV sharding."""
+    _KV_SHARD_PREFILL_BACKENDS.add(name)
+
+
+def register_kv_shard_transfer_backend(name: str) -> None:
+    """Admit an out-of-tree disaggregation transfer backend for KV sharding."""
+    _KV_SHARD_TRANSFER_BACKENDS.add(name)
+
+
+# HiCache storage backends whose reads and writes cover only each shard rank's
+# own pages. None upstream.
+_KV_SHARD_STORAGE_BACKENDS: set = set()
+
+
+def register_kv_shard_storage_backend(name: str) -> None:
+    """Admit an out-of-tree HiCache storage backend for KV sharding."""
+    _KV_SHARD_STORAGE_BACKENDS.add(name)
+
+
+def kv_shard_storage_backend_supported(name: Optional[str]) -> bool:
+    return name in _KV_SHARD_STORAGE_BACKENDS
 
 
 def validate_kv_shard_attention_backend(server_args: Any, cfg: Any = None) -> None:
     cfg = cfg or resolving_view(server_args)
     prefill_backend, _ = attention_backends_of(resolved_view(server_args))
-    if prefill_backend == "fa3":
+    if prefill_backend == "dsa":
+        hf_config = model_config_of(server_args).hf_config
+        if (
+            cfg.device != "cuda"
+            or not cfg.enable_prefill_cp
+            or cfg.attn_cp_size <= 1
+            or cfg.cp_strategy != "interleave"
+            or cfg.pp_size != 1
+        ):
+            raise ValueError(
+                "DSA KV sharding requires CUDA interleave prefill CP > 1 and PP1."
+            )
+        if (
+            cfg.dsa_prefill_backend != "trtllm"
+            or cfg.dsa_decode_backend != "trtllm"
+            or cfg.kv_cache_dtype != "fp8_e4m3"
+            or cfg.page_size != 64
+        ):
+            raise ValueError(
+                "DSA KV sharding requires TRTLLM prefill/decode with fp8_e4m3 "
+                "KV and page size 64."
+            )
+        if (
+            cfg.disaggregation_transfer_backend != "mooncake"
+            or cfg.enable_dsa_cache_layer_split
+            or get_dsa_index_kpool(hf_config) != 1
+            or get_dsa_index_kpool_compress(hf_config)
+        ):
+            raise ValueError(
+                "DSA KV sharding requires Mooncake, uncompressed index_kpool=1 "
+                "and no DSA cache layer splitting."
+            )
+        return
+    if is_deepseek_dsa(model_config_of(server_args).hf_config):
+        raise ValueError("DSA KV sharding requires the dsa attention backend.")
+    if prefill_backend in _KV_SHARD_PREFILL_BACKENDS:
         return
     if prefill_backend != "trtllm_mla":
         raise ValueError(
@@ -64,9 +134,19 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "page, which is incompatible with local decode."
         )
     if cfg.speculative_algorithm is not None:
-        raise ValueError(
-            "--enable-kv-cache-sharding does not support speculative decoding."
-        )
+        model_config = model_config_of(server_args)
+        # PP1 is checked once by the DSA backend gate below.
+        if (
+            cfg.speculative_algorithm != "EAGLE"
+            or model_config.hf_config.architectures[0] != "GlmMoeDsaForCausalLM"
+            or model_config.num_nextn_predict_layers != 1
+            or cfg.speculative_eagle_topk != 1
+            or cfg.enable_multi_layer_eagle
+        ):
+            raise ValueError(
+                "KV sharding supports speculative decoding only for GLM DSA "
+                "single-layer NextN MTP with EAGLE and topk=1."
+            )
     if cfg.dllm_algorithm is not None:
         raise ValueError(
             "--enable-kv-cache-sharding does not support diffusion language "
@@ -80,6 +160,10 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "not support "
             f"--radix-cache-backend={cfg.radix_cache_backend!r}."
         )
+    # KV sharding defaults to Python even when the general tree default is Rust.
+    # Preserve an explicit backend choice for validation below.
+    if not envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.is_set():
+        envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.set("python")
     tree_core_backend = envs.SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND.get()
     # A disabled radix cache never matches or inserts, so its tree core never
     # sees a rotation base; chunked continuations keep the base on the request.
@@ -120,12 +204,33 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             "(--dcp-size) are mutually exclusive users of the widened "
             "allocator index space."
         )
-    if cfg.enable_hierarchical_cache:
+    if cfg.enable_prefill_cp and cfg.attn_cp_size > 1 and cfg.cp_kv_layout is not None:
         raise ValueError(
-            "--enable-kv-cache-sharding does not support "
-            "--enable-hierarchical-cache yet: HiCache backup/load assumes "
-            "each rank holds full pages."
+            "--enable-kv-cache-sharding and --cp-kv-layout cannot be combined: "
+            "each sets the KV cache layout across the prefill CP ranks."
         )
+    if (
+        cfg.enable_hierarchical_cache
+        and cfg.hicache_storage_backend is not None
+        and not kv_shard_storage_backend_supported(cfg.hicache_storage_backend)
+    ):
+        raise ValueError(
+            "--enable-kv-cache-sharding supports HiCache host offload but not "
+            "--hicache-storage-backend yet: the storage path reads and writes "
+            "whole pages per rank, not each rank's own stripe."
+        )
+    if cfg.enable_hierarchical_cache and is_deepseek_dsa(
+        model_config_of(server_args).hf_config
+    ):
+        if cfg.hicache_host_memory_mode != "cache":
+            raise ValueError("CP-sharded DSA HiCache requires host memory mode cache")
+        if cfg.hicache_io_backend != "kernel" or cfg.hicache_mem_layout not in (
+            "layer_first",
+            "page_first",
+        ):
+            raise ValueError(
+                "CP-sharded DSA HiCache requires kernel I/O with layer_first or page_first"
+            )
     if cfg.enable_lmcache:
         raise ValueError(
             "--enable-kv-cache-sharding does not support --enable-lmcache."
@@ -168,7 +273,7 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
         )
 
     validate_kv_shard_attention_backend(server_args, cfg)
-    if cfg.disaggregation_transfer_backend not in ("mooncake", "nixl"):
+    if cfg.disaggregation_transfer_backend not in _KV_SHARD_TRANSFER_BACKENDS:
         raise ValueError(
             "--enable-kv-cache-sharding currently only supports the mooncake "
             "and nixl transfer backends: both route sends through "
@@ -184,11 +289,6 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
         )
 
     if use_mla_backend(server_args):
-        if is_deepseek_dsa(model_config.hf_config):
-            raise ValueError(
-                "--enable-kv-cache-sharding does not support DSA models yet "
-                "(indexer buffers are not striped)."
-            )
         if cfg.attn_cp_size <= 1:
             if attn_dp_enabled_of(cfg):
                 raise ValueError(
@@ -264,15 +364,20 @@ def handle_kv_cache_sharding(server_args: Any, gpu_mem: Optional[float] = None) 
             page_size,
         )
 
-    if cfg.cuda_graph_config.prefill.backend != Backend.DISABLED:
+    graph_config = cfg.cuda_graph_config
+    if graph_config.prefill.backend != Backend.DISABLED:
         logger.warning(
             "Prefill CUDA graph (%s) is incompatible with "
             "--enable-kv-cache-sharding; disabling it.",
             cfg.cuda_graph_config.prefill.backend,
         )
-        declarations["cuda_graph_config"] = with_phase(
-            cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
-        )
+        graph_config = with_phase(graph_config, Phase.PREFILL, backend=Backend.DISABLED)
+    if cfg.speculative_algorithm is not None:
+        # P-side draft-extend uses the request's shard plan; ordinary speculative
+        # graph capture has neither that plan nor logical-page allocations.
+        graph_config = with_phase(graph_config, Phase.DECODE, backend=Backend.DISABLED)
+    if graph_config != cfg.cuda_graph_config:
+        declarations["cuda_graph_config"] = graph_config
 
     if declarations:
         declare_resolution(

@@ -21,6 +21,7 @@ from sglang.srt.layers.pooler import Pooler, PoolingType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -30,7 +31,6 @@ from sglang.srt.models import mixtral
 from sglang.srt.models.granite import build_attention_sinks, granite_layer_attn_params
 from sglang.srt.models.utils import WeightsMapper
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import add_prefix
 
 SHARED_MOE_MODEL_TYPES = frozenset({"granitemoeshared", "granitemoe_swa"})
 
@@ -148,6 +148,10 @@ class GraniteMoeMoE(nn.Module):
             params_dtype=params_dtype,
             reduce_results=reduce_results,
             quant_config=quant_config,
+            # granitemoe_load_split_experts maps llmcompressor's per-expert
+            # tensors onto the `_packed` param names, which Mxfp4MoEMethod
+            # does not register.
+            serves_fused_mxfp4=False,
             prefix=f"{prefix}.experts",
         )
         self.topk.bind_runner_backend(self.experts.runner_backend)
@@ -435,6 +439,15 @@ class GraniteMoeModel(nn.Module):
 
 
 class GraniteMoeForCausalLM(nn.Module):
+    # The fused linears and the checkpoint modules they load from. A quant config
+    # that targets q_proj/k_proj/v_proj separately (e.g. compressed-tensors with
+    # its own scheme for attention) can only be matched to qkv_proj through this.
+    # input_linear is GraniteMoeShared's shared-expert gate+up, stored fused.
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "input_linear": ["input_linear"],
+    }
+
     # Legacy and current HF expert / router names with otherwise shared layout
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_suffix={

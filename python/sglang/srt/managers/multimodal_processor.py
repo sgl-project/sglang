@@ -10,7 +10,7 @@ from sglang.srt.multimodal.token_space_mm_process.registry import (
     serving_spec_for,
     strategy_for,
 )
-from sglang.srt.multimodal.token_space_mm_process.sglang import (
+from sglang.srt.multimodal.token_space_mm_process.serving_processor import (
     TokenSpaceSGLangProcessor,
 )
 from sglang.srt.runtime_context import get_mm, get_model

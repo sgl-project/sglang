@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from sglang.srt.managers.mm_utils import general_mm_embed_routine
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cpu_ci

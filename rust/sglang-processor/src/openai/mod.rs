@@ -16,7 +16,7 @@ mod wire;
 use serde::Deserialize;
 use sglang_api_types::api::v1::{GenerateResponse, GenerateStreamError};
 
-pub use chat::{ChatModel, ChatResponder, ReasoningToggle, lower_chat};
+pub use chat::{ChatModel, ChatResponder, DeepSeekOutputError, ReasoningToggle, lower_chat};
 pub use completions::{CompletionResponder, lower_completion};
 pub use pieces::TokenPieces;
 pub use sglang_api_types::api::v1::GenerateRequest;

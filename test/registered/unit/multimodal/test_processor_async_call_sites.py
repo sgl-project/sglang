@@ -102,7 +102,7 @@ def test_every_call_site_can_await():
 
 @pytest.mark.parametrize("media_source", ["arguments", "request"])
 def test_sglang_entry_forwards_the_request_to_its_core(media_source):
-    from sglang.srt.multimodal.token_space_mm_process.sglang import (
+    from sglang.srt.multimodal.token_space_mm_process.serving_processor import (
         TokenSpaceSGLangProcessor,
     )
 

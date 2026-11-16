@@ -1,4 +1,4 @@
-from typing import Any
+from typing import Any, Optional
 
 import msgspec
 
@@ -13,5 +13,7 @@ class MultimodalProcessorConfig(msgspec.Struct, frozen=True, kw_only=True):
     mm_io_worker_num: int = 0
     allowed_media_domains: list[str] = []
     media_url_max_file_size_mb: int = 64
+    media_url_timeout: Optional[float] = None
+    allow_local_media_files: bool = True
     # Keep preprocessed features on the GPU; serving sets it for GPU transports.
     keep_mm_features_on_device: bool = False

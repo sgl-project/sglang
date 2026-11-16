@@ -33,7 +33,8 @@ from sglang.srt.layers.attention.vision import (
 from sglang.srt.layers.conv import Conv2dLayer
 from sglang.srt.layers.linear import ColumnParallelLinear, RowParallelLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.utils import add_prefix, is_npu
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.utils import is_npu
 
 
 class Idefics2VisionMLP(nn.Module):
