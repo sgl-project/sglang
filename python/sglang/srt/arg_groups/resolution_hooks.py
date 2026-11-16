@@ -49,6 +49,7 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_hpu_backends",
         "handle_cpu_backends",
         "handle_npu_backends",
+        "handle_mlu_backends",
         "handle_mps_backends",
         "handle_xpu_backends",
         "handle_sail_backends",

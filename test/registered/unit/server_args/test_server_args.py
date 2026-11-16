@@ -621,6 +621,32 @@ class TestPrepareServerArgs(CustomTestCase):
             with self.subTest(device=device, pool=pool):
                 self._check_with_custom_mem_pool(device, pool)
 
+    def test_mlu_disables_custom_all_reduce_by_default(self):
+        """MLU must not enable unsupported Custom AllReduce by default."""
+        from sglang.srt.runtime_context import get_exec, publish, reset_context
+
+        self.addCleanup(reset_context)
+        with (
+            tempfile.TemporaryDirectory() as model_path,
+            patch.dict(os.environ),
+            patch(
+                "sglang.srt.arg_groups.memory_hook.get_device_memory_capacity",
+                return_value=None,
+            ),
+        ):
+            Path(model_path, "config.json").write_text(
+                json.dumps(
+                    {"model_type": "llama", "architectures": ["LlamaForCausalLM"]}
+                )
+            )
+            for device, disabled in (("mlu", True), ("cuda", False)):
+                with self.subTest(device=device):
+                    args = ServerArgs(
+                        model_path=model_path, device=device, random_seed=42
+                    )
+                    publish(args, role="scheduler")
+                    self.assertIs(get_exec().comm.disable_custom_all_reduce, disabled)
+
     def test_enable_w4a4_mxfp4_megamoe_preserves_legacy_deepgemm_env(self):
         deepgemm_env = {
             "DG_USE_FP4_ACTS": "0",

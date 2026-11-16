@@ -48,6 +48,14 @@ def handle_npu_backends(server_args: Any):
         set_default_server_args(server_args)
 
 
+def handle_mlu_backends(server_args: Any):
+    cfg = resolving_view(server_args)
+    if cfg.device == "mlu":
+        from sglang.srt.hardware_backend.mlu.utils import set_default_server_args
+
+        set_default_server_args(server_args)
+
+
 def handle_mps_backends(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.device == "mps":
