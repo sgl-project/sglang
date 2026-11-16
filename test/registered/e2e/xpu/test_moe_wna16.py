@@ -215,6 +215,7 @@ class TestXpuMoeWna16(CustomTestCase):
         layer.moe_runner_config = runner_config
         layer.num_local_experts = self.num_experts
         layer.intermediate_size_per_partition = self.intermediate
+        layer.use_presharded_weights = False
 
         create_kwargs = dict(
             layer=layer,
