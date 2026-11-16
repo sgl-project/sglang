@@ -1,5 +1,7 @@
 //! Multimodal preprocessing over `dynamo-multimodal`.
 
+pub mod prepared;
+
 use dynamo_multimodal::image::decode::{DecodeLimits, decode_rgb};
 use dynamo_multimodal::processor::{
     DecodedMedia, MmFamilyProcessor, NamedTensors, PositionOutput, ProcessedItem, Tensor,

@@ -1,8 +1,10 @@
 # Proposal: a prepared multimodal input boundary
 
-Status: design draft. This document does not add a processor method, a wire
-format, or support for another model. The entry point and its ownership need
-maintainer agreement before implementation.
+Status: common structural contract and native little-endian tensor decoding are
+implemented in `src/mm/prepared.rs`. Model-semantic import, processor admission,
+`api.v1` wire ingress, and serving support for any family are **not**
+implemented. The raw `MmProcessor::process` path is unchanged. This document is
+not a claim that prepared serving is available.
 
 ## Motivation and existing work
 
@@ -43,13 +45,52 @@ This is an integration gap, not a claim that SGLang has no prepared-input path:
 from that transport change. Neither PR should create another registry of
 `<model>_tensor_adapter` implementations.
 
+**Dependency note.** [#48705](https://github.com/sgl-project/sglang/issues/48705)
+and [#44159](https://github.com/sgl-project/sglang/issues/44159) are related
+trackers for parity and per-item prepared semantics; they are not merge
+prerequisites for this standalone generic structural foundation. The existing
+native multimodal processor path already came from merged
+[#46291](https://github.com/sgl-project/sglang/pull/46291). Wire integration
+remains with [#50701](https://github.com/sgl-project/sglang/pull/50701).
+
+## What is implemented here
+
+`mm::prepared` defines a transport-independent borrowed view
+(`PreparedInput` / `PreparedItem` / `PreparedTensor` / `TokenSpan`), caller
+budgets (`PreparedLimits`), structural validation
+(`PreparedInput::check` → opaque `CheckedPreparedInput`), and per-item native
+decoding (`CheckedPreparedInput::decode_tensors` → `NamedTensors`).
+
+The checked view borrows immutable byte slices; that Rust borrow is not a
+cross-process shared-memory access or lifetime guarantee. Scalar shapes (`[]`)
+have one element; shapes with a zero dimension have none. Only `Float32` and
+`Int64` decode today, matching the dependency's native `TensorData` variants.
+Spans are half-open `[start, end)` on the supplied token IDs; conversion to the
+existing inclusive scheduler offsets remains part of semantic integration.
+
+`check` guarantees only structural properties: profile/fingerprint equality,
+nonempty nonnegative `input_ids` within budget, item/tensor/span counts, unique
+nonempty tensor names within an item, shape rank and exact little-endian
+shape/dtype byte length, total byte budget, and non-overlapping span geometry
+with first-span item order. Expected profile/fingerprint values must come from
+trusted service/processor configuration, not from the request; string equality
+does not prove preprocessing provenance. Passing `check` does **not** grant
+semantic safety, processor admission, or serving support. Float finiteness, required tensor
+names, geometry-to-token alignment, layout, positions, hashes, and scheduler
+items remain outside this module.
+
+`dynamo-multimodal` 0.2.3 has no safe prepared semantic import hook. This crate
+does not invent one, does not treat layout/positions as tensor validators, and
+does not enable prepared serving for any family.
+
 ## Current processor boundary
 
 `MmProcessor::process` currently accepts encoded images and delegates image
 processing, token layout, and positions to the existing `MmFamilyProcessor`.
 Its result is `MmOutput`: expanded token IDs, features and auxiliary tensors,
 item hashes, inclusive item offsets, and positions. The native server already
-has a handoff for this result.
+has a handoff for this result. That raw path is unchanged by the structural
+module above.
 
 The dependency's family interface exposes processing from decoded media,
 layout, and positions. Those methods are not an import validator: layout and
@@ -59,15 +100,17 @@ Adding a common entry point cannot automatically make every model supported.
 
 ## Preferred boundary
 
-Add one prepared-input entry on the existing processor abstraction. Keep
-model semantics with the existing processor implementation, and have both raw
-and prepared paths converge on the normal validated output and server handoff.
-The following responsibilities are proposed, not existing API guarantees:
+Add one prepared-input entry on the existing processor abstraction once a real
+semantic import hook exists. Keep model semantics with the existing processor
+implementation, and have both raw and prepared paths converge on the normal
+validated output and server handoff. The following responsibilities are
+proposed; only the public input/transport structural row is partially realized
+by `mm::prepared` today:
 
 | Boundary | Responsibility |
 | --- | --- |
 | External preprocessor | Produce named tensors and media metadata using the served model's processor configuration; identify the processing stage and configuration. |
-| Public input/transport | Check tensor encoding, dtype, rank, shape/byte consistency, size limits, duplicates, and request ownership; resolve bytes independently of model semantics. |
+| Public input/transport | Check tensor encoding, dtype, rank, shape/byte consistency, size limits, duplicates, and request ownership; resolve bytes independently of model semantics. (`mm::prepared` covers the structural subset of this row.) |
 | Existing processor | Check required tensors and their semantic relationships, supported processing stage, item geometry, and token alignment; compute or validate layout and positions. |
 | Existing engine handoff | Consume the validated result using the normal scheduler path and resource ownership rules. |
 
@@ -118,20 +161,24 @@ it rather than implement both approaches.
    rules? Additional model coverage belongs with those processors, not in this
    transport-focused change.
 
-This draft does not introduce another renderer service, implement shared
+This work does not introduce another renderer service, implement shared
 memory, or change cancellation. Inline bytes and a future shared-memory
 reference can resolve to the same validated tensor input, but shared memory
 needs its own access, lifetime, consumption, cancellation, and restart contract.
 
 ## Validation plan for implementation
 
-First compare raw and prepared paths at the processor boundary: tensor bytes,
-auxiliary tensors, item order, expanded IDs, offsets, positions, and cache
-identity. Include multiple items with unequal geometry and reject malformed
-shapes, incompatible configurations, unsupported stages, and misaligned spans.
-Round-trip the result through the existing scheduler handoff.
+Structural checks and native decoding are covered by
+`tests/prepared_inputs.rs` (synthetic fixtures only). That suite does not claim
+model-semantic parity or serving readiness.
+
+When semantic import exists, compare raw and prepared paths at the processor
+boundary: tensor bytes, auxiliary tensors, item order, expanded IDs, offsets,
+positions, and cache identity. Include multiple items with unequal geometry and
+reject malformed shapes, incompatible configurations, unsupported stages, and
+misaligned spans. Round-trip the result through the existing scheduler handoff.
 
 Then run model output checks on GPU using pinned model and processor versions.
 A Qwen2.5-VL image test is an initial coverage target, not evidence of support
 for all vision models or modalities. No runtime or model tests are claimed by
-this documentation-only draft.
+the structural foundation alone.
