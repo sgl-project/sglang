@@ -128,7 +128,6 @@ class Cosmos3Config(PipelineConfig):
     # Per-request mode defaults are applied in Cosmos3TimestepPreparationStage.
     flow_shift: float | None = None
 
-    precision: str = "bf16"
     vae_precision: str = "bf16"
 
     # Pipeline-level (not sampling) knobs.
