@@ -36,6 +36,7 @@ class _FakeCluster:
 
     def __init__(self):
         self.objects = {}
+        self.registered_buffers = 0
 
 
 def _fake_store_class(cluster):
@@ -44,6 +45,7 @@ def _fake_store_class(cluster):
             return 0
 
         def register_buffer(self, ptr, size):
+            cluster.registered_buffers += 1
             return 0
 
         def put(self, key, value, *args):
@@ -138,6 +140,7 @@ class _Rank:
         end_layer=LAYERS,
         pp_rank=0,
         pp_size=1,
+        unnamed_layers=0,
     ):
         local_heads = 1 if mla else TOTAL_KV_HEADS // tp_size
         groups = 1 if mla else local_heads // head_partition
@@ -145,7 +148,8 @@ class _Rank:
         self.end_layer = end_layer
         self.layout = PageUnifiedLayout(
             page_size=PAGE_SIZE,
-            layer_num=end_layer - start_layer,
+            # Layers of the page block that the plan does not name.
+            layer_num=end_layer - start_layer + unnamed_layers,
             head_num=local_heads,
             head_group_num=groups,
             head_dim=HEAD_DIM,
@@ -401,6 +405,22 @@ class TestMooncakeUnifiedKeys(CustomTestCase):
             )
 
             MooncakeStore(config)
+
+    def test_page_bytes_without_a_chunk_are_refused_at_registration(self):
+        """Reads are zero-copy into the host page: an unnamed byte stays stale."""
+        for mla in (False, True):
+            with self.subTest(mla=mla):
+                cluster = _FakeCluster()
+                with self.assertRaisesRegex(ValueError, "unified chunk spans"):
+                    _Rank(
+                        cluster,
+                        mla=mla,
+                        tp_rank=0,
+                        tp_size=1,
+                        head_partition=2,
+                        unnamed_layers=1,
+                    )
+                self.assertEqual(cluster.registered_buffers, 0)
 
     def test_hybrid_pool_transfers_are_refused(self):
         cluster = _FakeCluster()

@@ -14,11 +14,16 @@ from sglang.srt.arg_groups.hicache_hook import (
 from sglang.srt.arg_groups.overrides import resolution_result
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
-from sglang.srt.mem_cache.hicache_key_scheme import derive_namespace, namespace_digest
+from sglang.srt.mem_cache.hicache_key_scheme import (
+    derive_namespace,
+    namespace_digest,
+    validate_unified_chunk_tiling,
+)
 from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConfig
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import HostPoolGroup
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.srt.server_args import ServerArgs
@@ -476,6 +481,100 @@ class TestControllerUnifiedKeys(CustomTestCase):
                     controller.storage_host_pool.layer_num += 1
                 with self.assertRaises(NotImplementedError):
                     self._suffixes(controller)
+
+
+class TestUnifiedChunkTiling(CustomTestCase):
+    def test_spans_must_name_every_page_byte_exactly_once(self):
+        # Key order is not byte order, so spans arrive unsorted.
+        validate_unified_chunk_tiling([(8, 8), (0, 8), (16, 4)], 20)
+        for name, spans in (
+            ("gap", [(0, 8), (12, 8)]),
+            ("overlap", [(0, 8), (4, 16)]),
+            ("short", [(0, 8), (8, 8)]),
+            ("long", [(0, 8), (8, 16)]),
+            ("offset_start", [(4, 16)]),
+            ("empty_chunk", [(0, 20), (20, 0)]),
+            ("no_chunks", []),
+        ):
+            with self.subTest(case=name), self.assertRaises(ValueError):
+                validate_unified_chunk_tiling(spans, 20)
+
+    def test_controller_refuses_a_plan_that_leaves_page_bytes_unnamed(self):
+        # The page block holds one layer more than the plan names: its bytes
+        # would never be stored, and a zero-copy read would leave them stale.
+        controller = TestControllerUnifiedKeys._controller(None, grouped=False)
+        host_pool = controller.storage_host_pool
+        host_pool.layout = "page_unified"
+        host_pool.storage_format_tag = None
+        host_pool.page_unified_layout = PageUnifiedLayout(
+            page_size=16,
+            layer_num=5,
+            head_num=4,
+            head_group_num=1,
+            head_dim=128,
+            itemsize=1,
+        )
+        controller.enable_storage_metrics = False
+        memory = SimpleNamespace(
+            hicache_storage_key_scheme="unified",
+            hicache_storage_head_partition=4,
+            hicache_storage_layer_partition=4,
+        )
+        parallel = SimpleNamespace(
+            tp_rank=1,
+            tp_size=2,
+            attn_tp_rank=1,
+            attn_tp_size=2,
+            attn_dcp_size=1,
+            attn_dcp_rank=0,
+            pp_rank=1,
+            pp_size=2,
+        )
+        module = "sglang.srt.managers.cache_controller"
+        with (
+            patch(f"{module}.get_memory", return_value=memory),
+            patch(f"{module}.get_parallel", return_value=parallel),
+            patch(f"{module}.is_dp_attention_enabled", return_value=False),
+            patch.object(controller, "get_attn_cp_rank_and_size", return_value=(0, 1)),
+            self.assertRaisesRegex(ValueError, "cover 65536 bytes.*has 81920"),
+        ):
+            controller._generate_storage_config("org/model")
+
+
+class TestUnifiedLateHostPool(CustomTestCase):
+    def _controller(self, unified_suffixes):
+        controller = object.__new__(HybridCacheController)
+        controller.mem_pool_host = MagicMock(spec=HostPoolGroup)
+        controller.enable_storage = True
+        controller.storage_backend = MagicMock()
+        controller.storage_host_pool = SimpleNamespace(dcp_size=1)
+        controller.storage_config = SimpleNamespace(unified_suffixes=unified_suffixes)
+        controller.extra_host_mem_release_queues = {}
+        return controller
+
+    def test_pool_without_unified_keys_is_refused_before_it_joins(self):
+        controller = self._controller(["ukv1-abc_L0-4"])
+        entry = SimpleNamespace(
+            name="draft", host_pool=object(), is_primary_index_anchor=False
+        )
+        with self.assertRaisesRegex(
+            NotImplementedError, "hybrid pools: draft has no unified keys"
+        ):
+            controller.register_host_pool_entry(entry)
+        controller.mem_pool_host.add_entry.assert_not_called()
+        controller.storage_backend.register_mem_host_pool_v2.assert_not_called()
+        self.assertEqual(controller.extra_host_mem_release_queues, {})
+
+    def test_rank_suffix_registration_is_unchanged(self):
+        controller = self._controller(None)
+        entry = SimpleNamespace(
+            name="draft", host_pool=object(), is_primary_index_anchor=False
+        )
+        controller.register_host_pool_entry(entry)
+        controller.mem_pool_host.add_entry.assert_called_once_with(entry)
+        controller.storage_backend.register_mem_host_pool_v2.assert_called_once_with(
+            entry.host_pool, "draft"
+        )
 
 
 class TestFileBackendUnifiedKeys(CustomTestCase):

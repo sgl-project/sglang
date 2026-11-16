@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.hicache_key_scheme import (
     namespace_digest,
     normalize_dtype,
     plan_unified_kv,
+    validate_unified_chunk_tiling,
 )
 from sglang.srt.mem_cache.kv.memory.views import KVLayoutView, MLAKVView
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
@@ -941,6 +942,7 @@ class HiCacheController:
             # consecutively in key order.
             layout = self.storage_host_pool.page_unified_layout
             unified_chunk_spans = unified_plan.chunk_spans(layout)
+            validate_unified_chunk_tiling(unified_chunk_spans, layout.bytes_per_page)
 
         return HiCacheStorageConfig(
             tp_rank=tp_rank,
@@ -1023,6 +1025,18 @@ class HiCacheController:
             plan.suffixes,
         )
         return plan
+
+    def _plan_unified_sidecar(self, entry) -> None:
+        """Refuse a host pool beside the KV anchor: it has no unified keys.
+
+        The unified scheme names every stored byte by what it holds. A pool
+        without such names would be stored under rank-suffix keys, or not at
+        all, so it is refused when it registers rather than at its first IO.
+        """
+        raise NotImplementedError(
+            f"The unified key scheme does not support hybrid pools: "
+            f"{entry.name} has no unified keys."
+        )
 
     def reset(self):
         # Reuse detach's queue wakeups and bounded joins, and fail if any

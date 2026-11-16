@@ -14,6 +14,7 @@ import requests
 import torch
 
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.hicache_key_scheme import validate_unified_chunk_tiling
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
@@ -870,6 +871,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         assert self.store.get(warmup_key) == warmup_value
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
+        if self.unified_chunk_spans is not None:
+            # Reads land straight in the host page, so an unnamed byte would
+            # keep the slot's previous content.
+            validate_unified_chunk_tiling(
+                self.unified_chunk_spans,
+                mem_pool_host.page_unified_layout.bytes_per_page,
+            )
         super().register_mem_pool_host(mem_pool_host)
         if getattr(self.mem_pool_host, "kv_buffer", None) is None:
             # Hybrid logical anchors only own allocation indices. Their physical

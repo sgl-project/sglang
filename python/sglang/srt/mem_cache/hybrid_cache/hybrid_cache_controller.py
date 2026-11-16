@@ -536,6 +536,9 @@ class HybridCacheController(BaseHiCacheController):
             # Sidecars added after attach (e.g. the DFLASH draft) miss the
             # attach-time DCP check.
             check_dcp_l3_extra_pool(entry, self.storage_host_pool)
+        if storage_attached and self.storage_config.unified_suffixes is not None:
+            # Before the entry joins the group: a refused pool must not stay.
+            self._plan_unified_sidecar(entry)
         self.mem_pool_host.add_entry(entry)
         if not entry.is_primary_index_anchor:
             self.extra_host_mem_release_queues.setdefault(entry.name, Queue())

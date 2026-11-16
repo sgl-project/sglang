@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from typing import Sequence
 
 import msgspec
 
@@ -302,6 +303,30 @@ def plan_unified_kv(
             for i in range(groups_per_rank)
         ],
     )
+
+
+def validate_unified_chunk_tiling(
+    spans: Sequence[tuple[int, int]], page_bytes: int
+) -> None:
+    """Require the chunks to name every byte of a page block exactly once.
+
+    A backend restores only the bytes its chunks name. A byte no chunk names
+    is never stored, and on a zero-copy read it keeps whatever the host slot
+    held before and reaches the device as KV.
+    """
+    end = 0
+    for offset, length in sorted(spans):
+        if offset != end or length <= 0:
+            raise ValueError(
+                f"unified chunk spans must cover the page without gaps or "
+                f"overlap: {sorted(spans)}."
+            )
+        end = offset + length
+    if end != page_bytes:
+        raise ValueError(
+            f"unified chunk spans cover {end} bytes, but the page block has "
+            f"{page_bytes}."
+        )
 
 
 def _resolve_head_group(
