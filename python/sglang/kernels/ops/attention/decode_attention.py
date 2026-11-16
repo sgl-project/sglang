@@ -21,7 +21,6 @@ It supports page size = 1.
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage2.py
 
 import logging
-import math
 from typing import NamedTuple, Optional, Tuple
 
 import torch
@@ -1411,12 +1410,6 @@ def cal_num_split_wgs(
     )
     max_ctas_allowed = tl.maximum(tl.cast(num_splits - 1, tl.int32), zero_i)
     ctas_to_use = tl.minimum(ctas_needed, max_ctas_allowed)
-    k = ctas_to_use
-    cap_by_k = tl.where(
-        k <= ctas_high_avail,
-        k * cap_high,
-        total_high_capacity + (k - ctas_high_avail) * cap_low,
-    )
     last_cta = start_cta + ctas_to_use
     last_cta = tl.where(ctas_to_use == 0, start_cta - 1, last_cta)
     return last_cta
@@ -1465,7 +1458,6 @@ def _lean_attention_decode_kernel(
     num_query_heads: tl.constexpr,
     num_rows: tl.constexpr,
     xcd_programs: tl.constexpr,
-    max_output_tile_cnt: tl.constexpr,
     Lk: tl.constexpr,
     Lv: tl.constexpr,
 ):
@@ -1519,7 +1511,7 @@ def _lean_attention_decode_kernel(
         cta_end_tile_gid = iter + (max_tiles_per_wg - 1)
 
     # Use a regular while loop instead of tl.static_range with a dynamic bound to avoid
-    # Triton compiler crashes in the Coalesce pass (max_output_tile_cnt is runtime-computed).
+    # Triton compiler crashes in the Coalesce pass.
     while iter < cta_end_tile_gid:
         tile_row_idx = iter // tiles_per_khead
         tile_idx = tile_row_idx * batch_size
@@ -2038,8 +2030,6 @@ def _decode_lean_attention_fwd(
         torch.cumsum(tiles_per_batch, dim=0).to(torch.int32).contiguous()
     )
 
-    max_output_tile_cnt = math.ceil((head_num * batch) / total_programs) + 4
-
     # Page-aware KV strides. For a 3-D buffer these synthesize page/tok strides so the
     # PAGE_SIZE>1 math collapses to the contiguous slot address; for a 4-D paged buffer they
     # come from the real page/token strides. (See _extract_kv_strides.)
@@ -2088,7 +2078,6 @@ def _decode_lean_attention_fwd(
         num_query_heads=head_num,
         num_rows=num_rows,
         xcd_programs=xcd_programs,
-        max_output_tile_cnt=max_output_tile_cnt,
         Lk=Lk,
         Lv=Lv,
         num_warps=4,
