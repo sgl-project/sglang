@@ -839,7 +839,7 @@ def capture_decode_graph(
         )
         GraphRunnerCls = model_runner._decode_cuda_graph_runner_cls()
         # Platform runners specialize only the stock runner; a model runner's
-        # own subclass (UNO's) does its platform setup itself.
+        # own subclass does its platform setup itself.
         if GraphRunnerCls is DecodeCudaGraphRunner:
             GraphRunnerCls = {
                 "cpu": CPUGraphRunner,

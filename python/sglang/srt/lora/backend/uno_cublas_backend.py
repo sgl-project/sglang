@@ -66,11 +66,11 @@ class UnoCublasLoRABackend(TritonLoRABackend):
         **kwargs,
     ):
         super().__init__(max_loras_per_batch, device, **kwargs)
-        # torch.cuda on CUDA/ROCm, torch.xpu on XPU.
         self._device_module = torch.get_device_module(device)
-        # Workaround: on Arc Pro B60 (torch 2.14+xpu), UNO's batch>1 XPU graphs
-        # with this side-stream fork crash with UR_RESULT_ERROR_OUT_OF_RESOURCES
-        # or hang on replay; drop once that replay works.
+        # Running LoRA-A inline on XPU resolves the out-of-resources (OOM)
+        # failures that the side-stream fork hits in XPU graph replay.
+        # TODO(ANSHUMAN87): revert to the side stream on XPU once test_uno.py
+        # passes with it there.
         self._use_lora_a_side_stream = torch.device(device).type != "xpu"
         # Different CUDA-graph runners may capture and replay on different main
         # streams. Give each main stream its own LoRA-A side stream so concurrently

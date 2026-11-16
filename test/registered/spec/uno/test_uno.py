@@ -1,12 +1,13 @@
-"""End-to-end decode-graph coverage for linear and tree UNO decoding.
+"""End-to-end CUDA-graph coverage for linear and tree UNO decoding.
 
-On XPU it runs on the intel_xpu attention backend with XPU decode graphs.
 The test runs both modes on the same prompts. Linear UNO alternates
 LoRA-draft and clean-target variants in one graph runner. Tree UNO uses a
 private LoRA-draft runner before native EAGLE tree verification. Besides the
 generation contract, short greedy comparisons guard lossless output parity
 with autoregressive decoding, and stochastic requests guard nontrivial TPF for
 both linear and tree sampling on a small, fixed GSM8K sample.
+
+_UnoDecodingMixin is shared with test/registered/e2e/xpu/test_uno_intel_xpu.py.
 """
 
 import os
@@ -18,7 +19,7 @@ import requests
 from huggingface_hub import snapshot_download
 
 from sglang.srt.utils import is_xpu
-from sglang.test.ci.ci_register import register_cuda_ci, register_xpu_ci
+from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
@@ -32,9 +33,6 @@ register_cuda_ci(
     stage="extra-a",
     runner_config="1-gpu-large",
 )
-register_xpu_ci(est_time=900, suite="nightly-xpu-kernel-main-1-gpu", nightly=True)
-
-_is_xpu = is_xpu()
 
 MODEL = "Qwen/Qwen3-8B"
 DEFAULT_UNO_LORA_REPO = "s-sahoo/uno-qwen3-8B"
@@ -47,10 +45,6 @@ MAX_NEW_TOKENS = 128
 # AR decode and UNO verification use different kernel shapes, so compare a
 # bounded greedy prefix instead of requiring full-sequence bitwise identity.
 PARITY_TOKENS = 32
-# XPU bf16 GEMMs are not batch-invariant, so AR's one-row decode and UNO's
-# F-row verify can flip a near-tie; AR alone flipped at a 0.25 gap on B60.
-# Same bound as SpecServerKit's decode-vs-prefill logprob_match_delta.
-XPU_NEAR_TIE_LOGPROB_GAP = 0.5
 # One LoRA draft forward plus one clean verification forward.
 FORWARDS_PER_UNO_CYCLE = 2
 PROMPTS = (
@@ -128,43 +122,26 @@ class TestUnoLoraPathResolution(unittest.TestCase):
         )
 
 
-class TestUnoCudaGraph(CustomTestCase):
+class _UnoDecodingMixin:
+    """AR-parity and TPF contract for linear and tree UNO. Subclasses set the
+    platform launch args, and a near-tie logprob gap where the platform's AR
+    decode and UNO verify kernels are not bitwise comparable."""
+
+    platform_args: tuple[str, ...]
+    # None requires exact greedy parity; otherwise the first divergence may be
+    # AR's runner-up when AR's top-2 logprob gap is within this bound.
+    near_tie_logprob_gap: float | None = None
+
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
         cls.adapter_path = _resolve_uno_lora_path()
 
-    def _platform_args(self) -> list[str]:
-        if _is_xpu:
-            # The BMG cookbook decode setup. The 24 GB card needs a higher
-            # static fraction to hold the 16.4 GB model plus the 1.4 GB UNO
-            # LoRA pool.
-            return [
-                "--attention-backend",
-                "intel_xpu",
-                "--page-size",
-                "64",
-                "--cuda-graph-backend-decode",
-                "full",
-                "--mem-fraction-static",
-                "0.88",
-            ]
-        return [
-            "--attention-backend",
-            "fa3",
-            "--cuda-graph-max-bs-decode",
-            str(len(PROMPTS)),
-            "--mem-fraction-static",
-            "0.7",
-            "--page-size",
-            "1",
-        ]
-
     def _server_args(self, config: _UnoConfig | None) -> list[str]:
         args = [
             "--dtype",
             "bfloat16",
-            *self._platform_args(),
+            *self.platform_args,
             "--max-running-requests",
             str(len(PROMPTS)),
             "--disable-radix-cache",
@@ -197,7 +174,7 @@ class TestUnoCudaGraph(CustomTestCase):
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=self._server_args(None),
             )
-            return self._run_greedy(with_top2=_is_xpu)
+            return self._run_greedy(with_top2=self.near_tie_logprob_gap is not None)
         finally:
             if process is not None:
                 terminate_and_kill_process_tree(process)
@@ -271,7 +248,7 @@ class TestUnoCudaGraph(CustomTestCase):
     ) -> None:
         """Exact greedy parity, except that with ``expected_top2`` the first
         divergence may be AR's runner-up at a near-tie (see
-        XPU_NEAR_TIE_LOGPROB_GAP); later tokens then differ legitimately."""
+        near_tie_logprob_gap); later tokens then differ legitimately."""
         for index, (prompt, actual_ids, expected_ids) in enumerate(
             zip(PROMPTS, actual, expected)
         ):
@@ -302,7 +279,7 @@ class TestUnoCudaGraph(CustomTestCase):
             )
             self.assertLessEqual(
                 best_logprob - runner_up_logprob,
-                XPU_NEAR_TIE_LOGPROB_GAP,
+                self.near_tie_logprob_gap,
                 f"{message}: AR was not near a tie at position {divergence}",
             )
 
@@ -368,6 +345,20 @@ class TestUnoCudaGraph(CustomTestCase):
         self._assert_ar_parity("Tree", tree_output_ids, ar_output_ids, ar_top2)
 
         print(f"UNO GSM8K sample: {linear_tpf=:.3f}, {tree_tpf=:.3f}")
+
+
+@unittest.skipIf(is_xpu(), "CUDA backend pairing; XPU is covered separately")
+class TestUnoCudaGraph(_UnoDecodingMixin, CustomTestCase):
+    platform_args = (
+        "--attention-backend",
+        "fa3",
+        "--cuda-graph-max-bs-decode",
+        str(len(PROMPTS)),
+        "--mem-fraction-static",
+        "0.7",
+        "--page-size",
+        "1",
+    )
 
 
 if __name__ == "__main__":

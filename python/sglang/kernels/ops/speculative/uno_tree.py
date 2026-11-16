@@ -424,8 +424,9 @@ def build_uno_tree_proposal(
             "draft_logits must have shape [B, depth, vocab] with the same B "
             f"as root_tokens; got {tuple(draft_logits.shape)}"
         )
-    if root_tokens.is_cpu or draft_logits.is_cpu:
-        raise ValueError("UNO tree construction requires GPU tensors")
+    # The Triton kernels and their top-k are validated on CUDA/ROCm and XPU.
+    if {root_tokens.device.type, draft_logits.device.type} - {"cuda", "xpu"}:
+        raise ValueError("UNO tree construction requires CUDA or XPU tensors")
     if root_tokens.device != draft_logits.device:
         raise ValueError("tree roots and draft logits must share a device")
     if root_tokens.dtype not in (torch.int32, torch.int64):

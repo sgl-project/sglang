@@ -5,80 +5,64 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from sglang.srt.arg_groups.speculative_hook import _handle_uno
-from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
-def _xpu_args(*, decode_graph_backend, attention_backend="intel_xpu", tree=False):
-    """Startup args for UNO on XPU: linear 8/1/8, or tree 8/16/8."""
-    return SimpleNamespace(
+def _uno_args(**overrides):
+    """UNO linear 8/1/8 on XPU with intel_xpu attention, before overrides."""
+    args = dict(
+        model_path="dummy",
         device="xpu",
-        cuda_graph_config=SimpleNamespace(
-            decode=SimpleNamespace(backend=decode_graph_backend)
-        ),
-        enable_deterministic_inference=False,
-        enable_strict_thinking=False,
-        speculative_draft_model_path=None,
+        speculative_algorithm="UNO",
         uno_lora_path="/tmp/uno-lora",
         speculative_num_draft_tokens=8,
-        speculative_num_steps=7 if tree else 1,
-        speculative_eagle_topk=16 if tree else 1,
-        enable_two_batch_overlap=False,
-        speculative_accept_threshold_single=1.0,
-        speculative_accept_threshold_acc=1.0,
-        tp_size=1,
-        pp_size=1,
-        attn_cp_size=1,
-        enable_lora=False,
-        lora_paths=None,
-        speculative_use_rejection_sampling=False,
-        enable_mixed_chunk=False,
-        attention_backend=attention_backend,
-        prefill_attention_backend=None,
-        decode_attention_backend=None,
+        speculative_num_steps=1,
+        speculative_eagle_topk=1,
+        attention_backend="intel_xpu",
     )
+    args.update(overrides)
+    return ServerArgs(**args)
 
 
-class TestUnoXpuConfig(CustomTestCase):
-    def _handle(self, server_args):
-        with (
-            patch(
-                "sglang.srt.arg_groups.speculative_hook.resolving_view",
-                side_effect=lambda args: args,
-            ),
-            patch(
-                "sglang.srt.arg_groups.speculative_hook.resolved_view",
-                side_effect=lambda args: args,
-            ),
-            patch(
-                "sglang.srt.arg_groups.speculative_hook.attn_dp_enabled_of",
-                return_value=False,
-            ),
-            patch("sglang.srt.arg_groups.speculative_hook.declare_resolution"),
-        ):
-            _handle_uno(server_args)
+_TREE = dict(speculative_num_steps=7, speculative_eagle_topk=16)
 
-    def test_supported_xpu_configs_start(self):
-        """Linear and tree UNO start on either XPU attention backend, with or
-        without XPU decode graphs."""
+
+class TestUnoAttentionBackendConfig(CustomTestCase):
+    def test_xpu_backends_start(self):
+        """Linear and tree UNO start on both XPU attention backends."""
         for tree in (False, True):
-            for decode_graph_backend in (Backend.DISABLED, Backend.FULL):
-                for attention_backend in ("intel_xpu", "triton"):
-                    with self.subTest(
-                        tree=tree,
-                        decode_graph_backend=decode_graph_backend,
-                        attention_backend=attention_backend,
-                    ):
-                        self._handle(
-                            _xpu_args(
-                                decode_graph_backend=decode_graph_backend,
-                                attention_backend=attention_backend,
-                                tree=tree,
-                            )
+            for attention_backend in ("intel_xpu", "triton"):
+                with self.subTest(tree=tree, attention_backend=attention_backend):
+                    _handle_uno(
+                        _uno_args(
+                            attention_backend=attention_backend,
+                            **(_TREE if tree else {}),
                         )
+                    )
+
+    def test_unsupported_backends_are_rejected(self):
+        """A backend outside the device's list, or a prefill/decode split,
+        fails at startup instead of mis-running UNO's draft or verify."""
+        for case, overrides in (
+            ("fa3 on xpu", dict(attention_backend="fa3")),
+            (
+                "split prefill/decode",
+                dict(
+                    prefill_attention_backend="triton",
+                    decode_attention_backend="intel_xpu",
+                ),
+            ),
+            ("intel_xpu on cuda", dict(device="cuda")),
+        ):
+            with (
+                self.subTest(case=case),
+                self.assertRaisesRegex(ValueError, "same attention backend"),
+            ):
+                _handle_uno(_uno_args(**overrides))
 
 
 class TestUnoTreeConfig(CustomTestCase):
