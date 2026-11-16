@@ -6,10 +6,11 @@ call sites keep their order. No GPU, no Foundry.
 """
 
 import ast
+import io
 import sys
 import types
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -98,6 +99,28 @@ def _sa(mode=None, config=None):
     )
 
 
+def _graph_sa(**fields):
+    """The graph fields Foundry pins, at SGLang's defaults unless given."""
+    defaults = dict(
+        cuda_graph_backend_decode=None,
+        cuda_graph_backend_prefill=None,
+        enable_profile_cuda_graph=False,
+        disable_flashinfer_autotune=False,
+    )
+    return SimpleNamespace(**{**defaults, **fields})
+
+
+def _pin_lines(api, server_args):
+    """The ``[Foundry] pin:`` lines the adapter prints while pinning ``server_args``."""
+    with _installed(api), redirect_stderr(io.StringIO()) as err:
+        activate_foundry(_sa("save")).pin_server_args(server_args)
+    return [
+        line
+        for line in err.getvalue().splitlines()
+        if line.startswith("[Foundry] pin:")
+    ]
+
+
 @contextmanager
 def _installed(api):
     """``api`` importable as foundry.integration.sglang.api and a fresh
@@ -118,7 +141,7 @@ def _installed(api):
 def _drive(adapter, body=lambda: None):
     """Every adapter method in process order; ``body`` runs inside the capture
     scope. Returns what the pool-config replay and capture_one gave."""
-    sa = object()
+    sa = _graph_sa()
     adapter.pin_server_args(sa)
     adapter.validate_resolved_server_args(sa)
     with adapter.configure_subprocess(sa):
@@ -232,6 +255,41 @@ class TestFoundryAdapter(CustomTestCase):
                 self.assertEqual(
                     after, ["configure_subprocess"] if step in before_spawn else []
                 )
+
+    def test_pin_line_per_field_foundry_changed(self):
+        """Foundry declares the graph pins without a log line of its own."""
+        from sglang.srt.arg_groups.overrides import declare_resolution
+
+        api = _fake_api()
+        api.pin_server_args = lambda server_args: declare_resolution(
+            server_args,
+            "foundry_test",
+            cuda_graph_backend_decode="full",
+            enable_profile_cuda_graph=False,
+            disable_flashinfer_autotune=True,
+        )
+        self.assertEqual(
+            _pin_lines(api, _graph_sa()),
+            [
+                "[Foundry] pin: cuda_graph_backend_decode='full' (was None)",
+                "[Foundry] pin: disable_flashinfer_autotune=True (was False)",
+            ],
+        )
+
+    def test_no_pin_line_when_nothing_changed(self):
+        from sglang.srt.arg_groups.overrides import declare_resolution
+
+        same = _fake_api()
+        same.pin_server_args = lambda server_args: declare_resolution(
+            server_args, "foundry_test", cuda_graph_backend_decode="full"
+        )
+        for name, api, server_args in (
+            ("nothing declared", _fake_api(), _graph_sa()),
+            ("value already set", same, _graph_sa(cuda_graph_backend_decode="full")),
+            ("unsupported", _fake_api(unsupported_at="pin_server_args"), _graph_sa()),
+        ):
+            with self.subTest(case=name):
+                self.assertEqual(_pin_lines(api, server_args), [])
 
     def test_other_foundry_errors_propagate(self):
         """Only ``Unsupported`` falls back; a Foundry bug must stay an error."""

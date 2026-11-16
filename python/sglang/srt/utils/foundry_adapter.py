@@ -31,10 +31,19 @@ natively). Any other exception from Foundry propagates.
 """
 
 import logging
+import sys
 from contextlib import contextmanager
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
+
+# Fields Foundry's pin_server_args declares without a pin line of its own.
+_GRAPH_PIN_FIELDS = (
+    "cuda_graph_backend_decode",
+    "cuda_graph_backend_prefill",
+    "enable_profile_cuda_graph",
+    "disable_flashinfer_autotune",
+)
 
 # Version of foundry.integration.sglang.api this adapter calls: same major,
 # at least this minor.
@@ -154,7 +163,20 @@ class _FoundryAdapterReal(FoundryAdapter):
             )
 
     def pin_server_args(self, server_args):
+        from sglang.srt.arg_groups.model_override_base import resolving_view
+
+        cfg = resolving_view(server_args)
+        before = {name: getattr(cfg, name) for name in _GRAPH_PIN_FIELDS}
         self._guarded(self._api.pin_server_args, server_args=server_args)
+        for name, old in before.items():
+            new = getattr(cfg, name)
+            if new != old:
+                # stderr: launch_server resolves before logging is configured.
+                print(
+                    f"[Foundry] pin: {name}={new!r} (was {old!r})",
+                    file=sys.stderr,
+                    flush=True,
+                )
 
     def validate_resolved_server_args(self, server_args):
         self._guarded(self._api.validate_resolved_server_args, server_args=server_args)
