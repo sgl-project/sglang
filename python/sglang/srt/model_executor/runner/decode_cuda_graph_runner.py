@@ -1562,13 +1562,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if buf is not None and _dp_tp_moe_masks_pad_rows():
             buf.fill_(raw_num_token)
 
-    def _validate_capture_hidden_mode(self, forward_batch: ForwardBatch) -> None:
-        if self.capture_hidden_mode < forward_batch.capture_hidden_mode:
-            raise RuntimeError(
-                "The runtime hidden-state mode exceeds the fixed CUDA graph "
-                f"capture mode ({self.capture_hidden_mode.name})."
-            )
-
     def load_batch(
         self,
         forward_batch: ForwardBatch,
