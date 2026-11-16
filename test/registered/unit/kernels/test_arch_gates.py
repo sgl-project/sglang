@@ -11,7 +11,7 @@ import sglang.kernels.arch as arch_module
 from sglang.kernels.arch._cuda import CudaArch
 from sglang.kernels.arch._hip import HipArch
 from sglang.kernels.arch.base import DeviceArch
-from sglang.kernels.ops.gemm import bf16_fp32
+from sglang.kernels.ops.gemm import bf16_fp32, hopper_bf16_gemv
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -35,6 +35,8 @@ _ARCHS = {
     "sm90": (_cuda_arch(9, 0), (9, 0)),
     "sm100": (_cuda_arch(10, 0), (10, 0)),
     "sm120": (_cuda_arch(12, 0), (12, 0)),
+    "sm121": (_cuda_arch(12, 1), (12, 1)),
+    "sm130": (_cuda_arch(13, 0), (13, 0)),
     "gfx950": (_hip_arch("gfx950"), (9, 5)),
     "cpu": (DeviceArch(), None),
 }
@@ -78,6 +80,23 @@ def test_hpc_bf16xfp32_gemm_needs_nvidia_sm9x(fake_arch, monkeypatch, arch, expe
         assert bf16_fp32._hpc_gemm_bf16xfp32_available() is expected
     finally:
         bf16_fp32._hpc_gemm_bf16xfp32_available.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "arch,expected",
+    [
+        ("sm90", False),
+        ("sm120", True),
+        ("sm121", True),
+        ("sm130", False),
+        ("gfx950", False),
+    ],
+)
+def test_hopper_bf16_gemv_sm12x_tuning_is_family_12_only(fake_arch, arch, expected):
+    """The SM12x tile and thresholds were tuned on SM120; a later family must
+    not inherit them through a ``major >= 12`` test."""
+    fake_arch(arch)
+    assert hopper_bf16_gemv._is_sm12x() is expected
 
 
 if __name__ == "__main__":
