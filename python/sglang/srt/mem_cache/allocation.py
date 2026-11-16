@@ -60,13 +60,14 @@ if _is_cpu:
         _import_err = str(_e)
 
         def assign_req_to_token_pool_cpu(*args, **kwargs):
-                raise RuntimeError(
-                    f"assign_req_to_token_pool_cpu is unavailable: sgl_kernel failed to "
-                    f"import ({_import_err}). CPU hosts need a "
-                    "CPU-enabled sgl-kernel build; the PyPI sgl_kernel "
-                    "wheel is CUDA-only and cannot even import on a "
-                    "GPU-less host."
-                )
+            raise RuntimeError(
+                f"assign_req_to_token_pool_cpu is unavailable: sgl_kernel failed to "
+                f"import ({_import_err}). CPU hosts need a "
+                "CPU-enabled sgl-kernel build; the PyPI sgl_kernel "
+                "wheel is CUDA-only and cannot even import on a "
+                "GPU-less host."
+            )
+
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req, ScheduleBatch

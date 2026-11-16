@@ -46,24 +46,24 @@ elif _is_cpu:
         _import_err = str(_e)
 
         def sgl_build_tree_kernel_efficient_cpu(*args, **kwargs):
-                raise RuntimeError(
-                    f"sgl_build_tree_kernel_efficient_cpu is unavailable: sgl_kernel failed to "
-                    f"import ({_import_err}). CPU hosts need a "
-                    "CPU-enabled sgl-kernel build; the PyPI sgl_kernel "
-                    "wheel is CUDA-only and cannot even import on a "
-                    "GPU-less host."
-                )
+            raise RuntimeError(
+                f"sgl_build_tree_kernel_efficient_cpu is unavailable: sgl_kernel failed to "
+                f"import ({_import_err}). CPU hosts need a "
+                "CPU-enabled sgl-kernel build; the PyPI sgl_kernel "
+                "wheel is CUDA-only and cannot even import on a "
+                "GPU-less host."
+            )
     except ImportError as _e:
         _import_err = str(_e)
 
         def sgl_verify_tree_greedy_cpu(*args, **kwargs):
-                raise RuntimeError(
-                    f"sgl_verify_tree_greedy_cpu is unavailable: sgl_kernel failed to "
-                    f"import ({_import_err}). CPU hosts need a "
-                    "CPU-enabled sgl-kernel build; the PyPI sgl_kernel "
-                    "wheel is CUDA-only and cannot even import on a "
-                    "GPU-less host."
-                )
+            raise RuntimeError(
+                f"sgl_verify_tree_greedy_cpu is unavailable: sgl_kernel failed to "
+                f"import ({_import_err}). CPU hosts need a "
+                "CPU-enabled sgl-kernel build; the PyPI sgl_kernel "
+                "wheel is CUDA-only and cannot even import on a "
+                "GPU-less host."
+            )
 
 
 class TreeMaskMode(IntEnum):

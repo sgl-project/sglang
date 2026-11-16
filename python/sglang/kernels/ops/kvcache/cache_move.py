@@ -13,13 +13,13 @@ if _is_cpu:
         _import_err = str(_e)
 
         def copy_all_layer_kv_cache_cpu(*args, **kwargs):
-                raise RuntimeError(
-                    f"copy_all_layer_kv_cache_cpu is unavailable: sgl_kernel failed to "
-                    f"import ({_import_err}). CPU hosts need a "
-                    "CPU-enabled sgl-kernel build; the PyPI sgl_kernel "
-                    "wheel is CUDA-only and cannot even import on a "
-                    "GPU-less host."
-                )
+            raise RuntimeError(
+                f"copy_all_layer_kv_cache_cpu is unavailable: sgl_kernel failed to "
+                f"import ({_import_err}). CPU hosts need a "
+                "CPU-enabled sgl-kernel build; the PyPI sgl_kernel "
+                "wheel is CUDA-only and cannot even import on a "
+                "GPU-less host."
+            )
 
 
 @triton.jit
