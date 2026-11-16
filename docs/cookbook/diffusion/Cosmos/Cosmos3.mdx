@@ -173,14 +173,23 @@ the checkpoint's query/KV head divisibility, but not Ring or CFG parallelism.
 Causal pipelines use the exported fixed-step schedule and require guidance `1.0`.
 
 At the default `quality="lossless"`, Sim-Auto computes each chunk's control tokens
-once and reuses them in the chunk's later forwards, and Transfer-Auto and Sim-Auto
-decode with the fused VAE normalization kernel. Send `quality="exact"` to turn
-both off.
+once and reuses them in the chunk's later forwards, and Transfer-Auto, Sim-Auto,
+Sim-Transfer and Bimanual decode with the fused VAE normalization kernel. Send
+`quality="exact"` to turn both off.
 
 Use `--component-residency` for memory-constrained deployments. Joint checkpoints
 register `lidar_encoder` and `lidar_decoder` separately from the camera `vae`.
 Bimanual overlaps causal VAE decode only when the VAE is resident; offloaded VAEs
-use the final serial decode stage. The causal pipelines default to `history_mode: auto`,
+use the final serial decode stage. While it overlaps, a request that only saves its
+video also encodes the MP4 during the rollout. Set
+`SGLANG_DIFFUSION_COSMOS_DREAMS_ROLLOUT_STREAM_PRIORITY=1` to run the rollout on a
+higher-priority CUDA stream than the decode; measure it on your GPU first, since it
+only pays when the rollout leaves the GPU idle between kernels.
+Sim-Transfer encodes its control clip while the clip is still decoding when the
+server runs with `--disable-conditioning-cache`. With the cache on, the clip is
+decoded first, so that a repeated clip can skip the encode; prefer the flag when
+most requests bring a new clip.
+The causal pipelines default to `history_mode: auto`,
 which follows the export's training K/V window: a sliding cache over the artifact's
 `window_frames` and `sink_frames` when the export records `kv_cache_inference_size`, the
 whole clip otherwise; frustum retrieval needs `history_mode: full`. History-window

@@ -17,6 +17,7 @@
 # limitations under the License.
 
 import contextvars
+from collections.abc import Iterable
 from contextlib import contextmanager, nullcontext
 from functools import partial
 
@@ -1736,18 +1737,11 @@ class AutoencoderKLWan(ParallelTiledVAE):
             self.clear_cache()
             if self.config.patch_size is not None:
                 x = patchify(x, patch_size=self.config.patch_size)
-            with forward_context(
-                feat_cache_arg=self._enc_feat_map, feat_idx_arg=self._enc_conv_idx
-            ):
-                t = x.shape[2]
-                iter_ = 1 + (t - 1) // 4
-                for i in range(iter_):
-                    feat_idx.set(0)
-                    if i == 0:
-                        out = self.encoder(x[:, :, :1, :, :])
-                    else:
-                        out_ = self.encoder(x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i, :, :])
-                        out = torch.cat([out, out_], 2)
+            iter_ = 1 + (x.shape[2] - 1) // 4
+            out = self._encode_causal_groups(
+                x[:, :, :1] if i == 0 else x[:, :, 1 + 4 * (i - 1) : 1 + 4 * i]
+                for i in range(iter_)
+            )
             if latent_frames is not None and latent_frames > out.shape[2]:
                 tail = out.new_zeros(
                     (*out.shape[:2], latent_frames - out.shape[2], *out.shape[3:])
@@ -1755,10 +1749,7 @@ class AutoencoderKLWan(ParallelTiledVAE):
                 if out.is_contiguous(memory_format=torch.channels_last_3d):
                     tail = tail.contiguous(memory_format=torch.channels_last_3d)
                 out = torch.cat([out, tail], 2)
-            enc = self.quant_conv(out)
-            mu, logvar = enc[:, : self.z_dim, :, :, :], enc[:, self.z_dim :, :, :, :]
-            enc = torch.cat([mu, logvar], dim=1)
-            enc = DiagonalGaussianDistribution(enc)
+            enc = self._posterior(out)
             self.clear_cache()
         else:
             if latent_frames is not None:
@@ -1773,6 +1764,51 @@ class AutoencoderKLWan(ParallelTiledVAE):
             enc = ParallelTiledVAE.encode(self, x)
 
         return enc
+
+    def encode_causal_groups(
+        self, groups: Iterable[torch.Tensor]
+    ) -> DiagonalGaussianDistribution:
+        """:meth:`encode` of a clip handed over in its causal groups.
+
+        ``groups`` yields ``[B, C, t, H, W]`` pixels: frame 0, then four frames at
+        a time, the slices :meth:`encode` cuts from a whole clip. One group is
+        pulled per encoder call, so a producer may block until its next frames
+        exist. Not cached: a clip that is still arriving has no digest to look up.
+        """
+        if not self.use_feature_cache:
+            raise ValueError(
+                "AutoencoderKLWan.encode_causal_groups needs the cached causal encode."
+            )
+        patch_size = self.config.patch_size
+        self.clear_cache()
+        out = self._encode_causal_groups(
+            group if patch_size is None else patchify(group, patch_size=patch_size)
+            for group in groups
+        )
+        if out is None:
+            raise ValueError("AutoencoderKLWan.encode_causal_groups got no frames.")
+        enc = self._posterior(out)
+        self.clear_cache()
+        return enc
+
+    def _encode_causal_groups(
+        self, groups: Iterable[torch.Tensor]
+    ) -> torch.Tensor | None:
+        """Encoder features of patchified causal groups, concatenated in time."""
+        out = None
+        with forward_context(
+            feat_cache_arg=self._enc_feat_map, feat_idx_arg=self._enc_conv_idx
+        ):
+            for group in groups:
+                feat_idx.set(0)
+                features = self.encoder(group)
+                out = features if out is None else torch.cat([out, features], 2)
+        return out
+
+    def _posterior(self, features: torch.Tensor) -> DiagonalGaussianDistribution:
+        enc = self.quant_conv(features)
+        mu, logvar = enc[:, : self.z_dim, :, :, :], enc[:, self.z_dim :, :, :, :]
+        return DiagonalGaussianDistribution(torch.cat([mu, logvar], dim=1))
 
     def _encode(self, x: torch.Tensor, first_frame=False) -> torch.Tensor:
         with forward_context(first_frame_arg=first_frame):

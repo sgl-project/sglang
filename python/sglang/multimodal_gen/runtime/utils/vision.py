@@ -292,6 +292,15 @@ def iter_video_frames(
         yield np.asarray(frame)
 
 
+def rgb_hwc_uint8(frame: np.ndarray | PIL.Image.Image) -> np.ndarray:
+    """A decoded frame as ``uint8 [H, W, 3]`` RGB; the decoder's own array when it already is one."""
+    if isinstance(frame, np.ndarray):
+        if frame.dtype == np.uint8 and frame.ndim == 3 and frame.shape[2] == 3:
+            return frame
+        frame = PIL.Image.fromarray(frame)
+    return np.asarray(frame.convert("RGB"), dtype=np.uint8)
+
+
 def get_default_height_width(
     image: PIL.Image.Image | np.ndarray | torch.Tensor,
     vae_scale_factor: int,

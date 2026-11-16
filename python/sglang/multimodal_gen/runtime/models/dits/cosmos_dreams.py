@@ -5,18 +5,25 @@ Cosmos-Dreams (Cosmos3-Interactive) reuses the Cosmos3 Omni weights but runs
 the GEN pathway autoregressively over latent frames. Each frame is packed as
 ``[action tokens | vision patches]`` (vision patches only for control-video
 checkpoints) and every GEN layer takes one softmax over
-``[text K/V | committed clean history K/V | current chunk]``. The current
-chunk's post-norm, post-RoPE K/V are returned so the pipeline can commit them
-as history after a clean refresh pass; control-video clips are committed the
-same way, as clean vision frames sharing the target frames' positions.
+``[text K/V | committed clean history K/V | current chunk]``. The caller owns
+that block per layer and hands every forward a slot in it: the forward writes
+the chunk's post-norm, post-RoPE K/V into the slot and reads the block in place,
+so the pipeline commits a clean refresh pass without copying anything.
+Control-video clips are committed the same way, as clean vision frames sharing
+the target frames' positions.
 """
 
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, NamedTuple
 
 import msgspec
 import torch
 
+from sglang.kernels.ops.diffusion import (
+    can_use_fused_inplace_qknorm_rope,
+    fused_qknorm_rope_pack_kv,
+)
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
 from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     ACTION_CONDITIONING_MODE,
@@ -43,16 +50,30 @@ from sglang.multimodal_gen.runtime.platforms import (
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 KVPair = tuple[torch.Tensor, torch.Tensor]
-# Per-layer history: a list, or a view that gathers one layer at a time.
-HistoryKV = Sequence[KVPair]
 logger = init_logger(__name__)
 
 
+class CosmosDreamsKVSlot(NamedTuple):
+    """One layer's K/V views for one forward.
+
+    ``keys``/``values`` are the ``[1, text + history + chunk, H_kv, D]`` block
+    attention reads; ``chunk_keys``/``chunk_values`` are its last
+    ``[1, chunk, H_kv, D]`` tokens, which the forward writes. ``chunk_kv`` is the
+    same chunk as one ``[2, 1, chunk, H_kv, D]`` tensor, keys first, for the
+    kernel that writes both in one launch; None when the two are stored apart.
+    """
+
+    keys: torch.Tensor
+    values: torch.Tensor
+    chunk_keys: torch.Tensor
+    chunk_values: torch.Tensor
+    chunk_kv: torch.Tensor | None = None
+
+
 class CosmosDreamsForwardOutput(msgspec.Struct):
-    """Velocity for the current chunk plus its per-layer ``[1, S, H_kv, D]`` K/V."""
+    """Velocity for the current chunk; its K/V are in the forward's slots."""
 
     video: torch.Tensor
-    current_kv: list[KVPair]
 
 
 def interleave_action_vision_tokens(
@@ -199,21 +220,47 @@ def build_cosmos_dreams_position_ids(
     return torch.cat([action_ids, vision_ids], dim=2).flatten(1, 2)
 
 
-def _joint_attention(
+def _pack_kernel_applies(
+    attention: Cosmos3CrossAttention,
+    q: torch.Tensor,
+    kv_slot: CosmosDreamsKVSlot,
+    cos_sin_cache: torch.Tensor,
+) -> bool:
+    """Whether the kernel that norms and rotates Q/K can also write K/V into the slot.
+
+    Same arithmetic as the in-place kernel ``_apply_qwen3_qk_norm_rope`` picks, so
+    this only saves the two copies into the slot.
+    """
+    return (
+        kv_slot.chunk_kv is not None
+        and envs.SGLANG_ENABLE_FUSED_QKNORM_ROPE
+        and q.device.type == "cuda"
+        and q.dtype == kv_slot.chunk_kv.dtype
+        and attention.norm_q.weight.dtype == q.dtype
+        and attention.norm_k.weight.dtype == q.dtype
+        and attention.norm_q.variance_epsilon == attention.norm_k.variance_epsilon
+        and can_use_fused_inplace_qknorm_rope(
+            attention.head_dim,
+            cos_sin_cache.shape[-1],
+            True,
+            q.dtype,
+            cos_sin_cache.dtype,
+            pack_kv=True,
+        )
+    )
+
+
+def _write_chunk_kv(
     attention: Cosmos3CrossAttention,
     hidden: torch.Tensor,
     *,
-    prefix_k: torch.Tensor,
-    prefix_v: torch.Tensor,
+    kv_slot: CosmosDreamsKVSlot,
     cos_sin_cache: torch.Tensor,
     rope_positions: torch.Tensor,
     null_token_slices: list[slice],
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """One softmax over ``[prefix (text + history) | current chunk]``.
-
-    Returns the attention output and the chunk's K (post-norm, post-RoPE) and V
-    (null-action slots zeroed), which is exactly what history must store.
-    """
+) -> torch.Tensor:
+    """Write the chunk's K (post-norm, post-RoPE) and V (null-action slots zeroed)
+    into ``kv_slot``, which is exactly what history must store; returns its Q."""
     batch_size, seq_len = hidden.shape[:2]
     num_q_heads = attention.local_num_attention_heads
     num_kv_heads = attention.local_num_key_value_heads
@@ -224,24 +271,55 @@ def _joint_attention(
     q = qkv[:, :, :num_q_heads]
     k = qkv[:, :, num_q_heads : num_q_heads + num_kv_heads]
     v = qkv[:, :, num_q_heads + num_kv_heads :]
-    q, k = _apply_qwen3_qk_norm_rope(
-        q,
-        k,
-        attention.norm_q,
-        attention.norm_k,
-        attention.head_dim,
-        cos_sin_cache,
-        rope_positions,
-    )
-    k = k.contiguous()
-    v = v.contiguous()
+    if _pack_kernel_applies(attention, q, kv_slot, cos_sin_cache):
+        # The slot holds the chunk alone, so the kernel packs no prefix.
+        no_prefix = kv_slot.chunk_keys[:, :0]
+        fused_qknorm_rope_pack_kv(
+            q,
+            k,
+            v,
+            no_prefix,
+            no_prefix,
+            kv_slot.chunk_kv,
+            attention.norm_q.weight,
+            attention.norm_k.weight,
+            cos_sin_cache,
+            rope_positions,
+            is_neox=True,
+            eps=attention.norm_q.variance_epsilon,
+            head_dim=attention.head_dim,
+            rope_dim=cos_sin_cache.shape[-1],
+        )
+    else:
+        q, k = _apply_qwen3_qk_norm_rope(
+            q,
+            k,
+            attention.norm_q,
+            attention.norm_k,
+            attention.head_dim,
+            cos_sin_cache,
+            rope_positions,
+        )
+        kv_slot.chunk_keys.copy_(k)
+        kv_slot.chunk_values.copy_(v)
     for null_slice in null_token_slices:
-        v[:, null_slice] = 0.0
-    out = attention.attn(
-        q, torch.cat([prefix_k, k], dim=1), torch.cat([prefix_v, v], dim=1)
-    )
+        kv_slot.chunk_values[:, null_slice] = 0.0
+    return q
+
+
+def _joint_attention(
+    attention: Cosmos3CrossAttention,
+    hidden: torch.Tensor,
+    *,
+    kv_slot: CosmosDreamsKVSlot,
+    **write_kwargs: Any,
+) -> torch.Tensor:
+    """One softmax over ``[text | history | current chunk]``, read in place."""
+    batch_size, seq_len = hidden.shape[:2]
+    q = _write_chunk_kv(attention, hidden, kv_slot=kv_slot, **write_kwargs)
+    out = attention.attn(q, kv_slot.keys, kv_slot.values)
     out, _ = attention.to_out(out.reshape(batch_size, seq_len, -1))
-    return out, k, v
+    return out
 
 
 class CosmosDreamsCrossAttention(Cosmos3CrossAttention):
@@ -256,14 +334,17 @@ class CosmosDreamsCrossAttention(Cosmos3CrossAttention):
 
 
 class CosmosDreamsGenDecoderLayer(Cosmos3GenDecoderLayer):
-    def forward(
-        self, hidden: torch.Tensor, **attention_kwargs: Any
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        attention_output, k, v = _joint_attention(
+    def forward(self, hidden: torch.Tensor, **attention_kwargs: Any) -> torch.Tensor:
+        hidden = hidden + _joint_attention(
             self.cross_attention, self.input_layernorm(hidden), **attention_kwargs
         )
-        hidden = hidden + attention_output
-        return hidden + self.mlp(self.post_attention_layernorm(hidden)), k, v
+        return hidden + self.mlp(self.post_attention_layernorm(hidden))
+
+    def write_kv(self, hidden: torch.Tensor, **write_kwargs: Any) -> None:
+        """Write this layer's K/V for ``hidden`` and stop before its attention."""
+        _write_chunk_kv(
+            self.cross_attention, self.input_layernorm(hidden), **write_kwargs
+        )
 
 
 def project_actions(
@@ -290,14 +371,6 @@ def project_actions(
         )
     flat = action_latents.reshape(tokens, action_latents.shape[-1])
     return projection(flat, domain_ids).reshape(1, tokens, hidden_size)
-
-
-def _prefix_kv(text_kv: KVPair, history_kv: KVPair | None) -> KVPair:
-    text_k, text_v = text_kv
-    if history_kv is None or history_kv[0].shape[1] == 0:
-        return text_k, text_v
-    history_k, history_v = history_kv
-    return torch.cat([text_k, history_k], dim=1), torch.cat([text_v, history_v], dim=1)
 
 
 class CosmosDreamsTransformer(Cosmos3OmniTransformer):
@@ -423,27 +496,112 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
         hidden_states: torch.Tensor,
         timestep: torch.Tensor,
         *,
-        text_kv: list[KVPair],
+        text_length: int,
+        kv_slots: Sequence[CosmosDreamsKVSlot],
         frame_start: int,
         fps: float,
         action_latents: torch.Tensor | None = None,
         action_domain_ids: torch.Tensor | None = None,
-        history_kv: HistoryKV | None = None,
-        condition_vision: bool = False,
         null_action_frame_indexes: Sequence[int] = (),
     ) -> CosmosDreamsForwardOutput:
-        """Denoise (``condition_vision=False``) or clean-refresh one current chunk.
+        """Denoise one current chunk.
 
         ``hidden_states`` is ``[1, C, T, H, W]`` for latent frames
         ``[frame_start, frame_start + T)``; ``action_latents`` is
         ``[1, T * A, action_dim]`` (normalized, zero-padded) and must be omitted
-        for control-video checkpoints. Clean-refresh passes skip the time
-        embedding so the returned K/V are clean history; a control clip is
-        committed with ``condition_vision=True`` exactly like a clean frame.
+        for control-video checkpoints. ``kv_slots`` holds one slot per layer whose
+        block starts with the ``text_length`` prompt tokens.
         """
-        self._validate_forward_inputs(
-            hidden_states, timestep, text_kv=text_kv, history_kv=history_kv
+        if timestep.numel() != 1:
+            raise ValueError(
+                f"Cosmos-Dreams timestep must be a scalar, got {tuple(timestep.shape)}"
+            )
+        hidden, layer_kwargs = self._prepare_chunk(
+            hidden_states,
+            timestep,
+            text_length=text_length,
+            kv_slots=kv_slots,
+            frame_start=frame_start,
+            fps=fps,
+            action_latents=action_latents,
+            action_domain_ids=action_domain_ids,
+            null_action_frame_indexes=null_action_frame_indexes,
         )
+        for layer, kv_slot in zip(self.gen_layers, kv_slots, strict=True):
+            hidden = layer(hidden, kv_slot=kv_slot, **layer_kwargs)
+
+        _, _, num_frames, latent_h, latent_w = hidden_states.shape
+        hidden = self.norm_moe_gen(hidden)
+        _, vision_hidden = split_interleaved_action_vision_tokens(
+            hidden,
+            num_frames=num_frames,
+            action_tokens_per_frame=self.action_tokens_per_frame,
+            vision_tokens_per_frame=self._patch_count(latent_h, latent_w),
+        )
+        video, _ = self.proj_out(vision_hidden.flatten(1, 2))
+        return CosmosDreamsForwardOutput(
+            video=self.unpatchify(video, num_frames, latent_h, latent_w)
+        )
+
+    def write_clean_kv(
+        self,
+        hidden_states: torch.Tensor,
+        *,
+        text_length: int,
+        kv_slots: Sequence[CosmosDreamsKVSlot],
+        frame_start: int,
+        fps: float,
+        action_latents: torch.Tensor | None = None,
+        action_domain_ids: torch.Tensor | None = None,
+        null_action_frame_indexes: Sequence[int] = (),
+    ) -> None:
+        """Clean-refresh one chunk: write its K/V into ``kv_slots`` and nothing else.
+
+        Takes what :meth:`forward` takes, without a timestep: the chunk enters
+        with no time embedding, so the K/V are clean history, and a control clip
+        is committed exactly like a clean frame. The last layer stops once its
+        K/V are written, since nothing reads what it would compute after them.
+        """
+        hidden, layer_kwargs = self._prepare_chunk(
+            hidden_states,
+            None,
+            text_length=text_length,
+            kv_slots=kv_slots,
+            frame_start=frame_start,
+            fps=fps,
+            action_latents=action_latents,
+            action_domain_ids=action_domain_ids,
+            null_action_frame_indexes=null_action_frame_indexes,
+        )
+        last_layer_idx = len(kv_slots) - 1
+        for layer_idx, (layer, kv_slot) in enumerate(
+            zip(self.gen_layers, kv_slots, strict=True)
+        ):
+            if layer_idx == last_layer_idx:
+                layer.write_kv(hidden, kv_slot=kv_slot, **layer_kwargs)
+            else:
+                hidden = layer(hidden, kv_slot=kv_slot, **layer_kwargs)
+
+    def _patch_count(self, latent_h: int, latent_w: int) -> int:
+        grid_h, grid_w, _, _ = self._pad_to_patch_size(latent_h, latent_w)
+        return grid_h * grid_w
+
+    def _prepare_chunk(
+        self,
+        hidden_states: torch.Tensor,
+        timestep: torch.Tensor | None,
+        *,
+        text_length: int,
+        kv_slots: Sequence[CosmosDreamsKVSlot],
+        frame_start: int,
+        fps: float,
+        action_latents: torch.Tensor | None,
+        action_domain_ids: torch.Tensor | None,
+        null_action_frame_indexes: Sequence[int],
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
+        """Embed one chunk (``timestep`` None: clean, no time embedding) and build
+        what every layer takes besides its slot."""
+        self._validate_chunk_inputs(hidden_states, kv_slots=kv_slots)
         self._validate_action_inputs(
             action_latents, action_domain_ids, null_action_frame_indexes
         )
@@ -456,16 +614,14 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
             timestep,
             action_latents=action_latents,
             action_domain_ids=action_domain_ids,
-            condition_vision=condition_vision,
             patch_count=patch_count,
         )
-
         position_ids = build_cosmos_dreams_position_ids(
             frame_start=frame_start,
             num_frames=num_frames,
             grid_h=grid_h,
             grid_w=grid_w,
-            text_length=text_kv[0][0].shape[1],
+            text_length=text_length,
             temporal_modality_margin=self.temporal_margin,
             fps=fps,
             base_fps=self.base_fps,
@@ -485,59 +641,34 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
             tokens_per_frame=action_count + patch_count,
             action_tokens_per_frame=action_count,
         )
+        return hidden, {
+            "cos_sin_cache": cos_sin_cache,
+            "rope_positions": rope_positions,
+            "null_token_slices": null_slices,
+        }
 
-        current_kv: list[KVPair] = []
-        for layer_idx, layer in enumerate(self.gen_layers):
-            prefix_k, prefix_v = _prefix_kv(
-                text_kv[layer_idx],
-                None if history_kv is None else history_kv[layer_idx],
-            )
-            hidden, k, v = layer(
-                hidden,
-                prefix_k=prefix_k,
-                prefix_v=prefix_v,
-                cos_sin_cache=cos_sin_cache,
-                rope_positions=rope_positions,
-                null_token_slices=null_slices,
-            )
-            current_kv.append((k, v))
-
-        hidden = self.norm_moe_gen(hidden)
-        _, vision_hidden = split_interleaved_action_vision_tokens(
-            hidden,
-            num_frames=num_frames,
-            action_tokens_per_frame=action_count,
-            vision_tokens_per_frame=patch_count,
-        )
-        video, _ = self.proj_out(vision_hidden.flatten(1, 2))
-        return CosmosDreamsForwardOutput(
-            video=self.unpatchify(video, num_frames, latent_h, latent_w),
-            current_kv=current_kv,
-        )
-
-    def _validate_forward_inputs(
+    def _validate_chunk_inputs(
         self,
         hidden_states: torch.Tensor,
-        timestep: torch.Tensor,
         *,
-        text_kv: list[KVPair],
-        history_kv: HistoryKV | None,
+        kv_slots: Sequence[CosmosDreamsKVSlot],
     ) -> None:
         if hidden_states.ndim != 5 or hidden_states.shape[0] != 1:
             raise ValueError(
                 f"Cosmos-Dreams hidden_states must have shape [1,C,T,H,W], got {tuple(hidden_states.shape)}"
             )
-        if timestep.numel() != 1:
+        if len(kv_slots) != self.num_hidden_layers:
             raise ValueError(
-                f"Cosmos-Dreams timestep must be a scalar, got {tuple(timestep.shape)}"
+                f"Cosmos-Dreams expected {self.num_hidden_layers} K/V slots, got {len(kv_slots)}"
             )
-        if len(text_kv) != self.num_hidden_layers:
+        _, _, num_frames, latent_h, latent_w = hidden_states.shape
+        chunk_tokens = num_frames * (
+            self.action_tokens_per_frame + self._patch_count(latent_h, latent_w)
+        )
+        if kv_slots[0].chunk_keys.shape[1] != chunk_tokens:
             raise ValueError(
-                f"Cosmos-Dreams expected {self.num_hidden_layers} text KV layers, got {len(text_kv)}"
-            )
-        if history_kv is not None and len(history_kv) != self.num_hidden_layers:
-            raise ValueError(
-                f"Cosmos-Dreams expected {self.num_hidden_layers} history KV layers, got {len(history_kv)}"
+                f"Cosmos-Dreams K/V slots hold {kv_slots[0].chunk_keys.shape[1]} chunk "
+                f"tokens but the chunk has {chunk_tokens}."
             )
 
     def _validate_action_inputs(
@@ -565,11 +696,10 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
     def _embed_chunk(
         self,
         hidden_states: torch.Tensor,
-        timestep: torch.Tensor,
+        timestep: torch.Tensor | None,
         *,
         action_latents: torch.Tensor | None,
         action_domain_ids: torch.Tensor | None,
-        condition_vision: bool,
         patch_count: int,
     ) -> torch.Tensor:
         """Project vision patches and actions, then pack ``[action | vision]`` per frame."""
@@ -579,7 +709,7 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
             self.patchify(hidden_states, num_frames, latent_h, latent_w)
         )
         vision_tokens = vision_tokens.view(1, num_frames, patch_count, self.hidden_size)
-        if not condition_vision:
+        if timestep is not None:
             time_embed = self.time_embedder(timestep.reshape(1).float())
             vision_tokens = vision_tokens + time_embed.to(vision_tokens.dtype).view(
                 1, 1, 1, -1

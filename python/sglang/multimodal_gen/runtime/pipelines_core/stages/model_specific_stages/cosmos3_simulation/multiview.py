@@ -95,6 +95,7 @@ from sglang.multimodal_gen.runtime.utils.vision import (
     iter_video_frames,
     load_image,
     load_video,
+    rgb_hwc_uint8,
 )
 
 logger = init_logger(__name__)
@@ -246,15 +247,6 @@ def load_media_uint8_cthw(
     return fitted
 
 
-def _rgb_hwc_uint8(frame: np.ndarray | PIL.Image.Image) -> np.ndarray:
-    """A decoded frame as ``uint8 [H, W, 3]`` RGB; the decoder's own array when it already is one."""
-    if isinstance(frame, np.ndarray):
-        if frame.dtype == np.uint8 and frame.ndim == 3 and frame.shape[2] == 3:
-            return frame
-        frame = PIL.Image.fromarray(frame)
-    return np.asarray(frame.convert("RGB"), dtype=np.uint8)
-
-
 def _fit_geometry(orig_h: int, orig_w: int, height: int, width: int) -> tuple[int, int]:
     """Resize target before the center crop: the aspect-preserving cover of the canvas."""
     scale = max(width / orig_w, height / orig_h)
@@ -304,7 +296,7 @@ def _fit_frames_uint8_cthw(
                 f"got {out.dtype} {tuple(out.shape)}"
             )
         dest = out
-    arrays = map(_rgb_hwc_uint8, islice(frames, min(max_frames, int(dest.shape[1]))))
+    arrays = map(rgb_hwc_uint8, islice(frames, min(max_frames, int(dest.shape[1]))))
     first = next(arrays, None)
     count = 0
     if first is not None:

@@ -41,22 +41,29 @@ from sglang.multimodal_gen.registry import (
 )
 from sglang.multimodal_gen.runtime.models.dits import cosmos_dreams
 from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
+    CosmosDreamsKVSlot,
+    CosmosDreamsTransformer,
     build_cosmos_dreams_position_ids,
     interleave_action_vision_tokens,
     null_action_token_slices,
     split_interleaved_action_vision_tokens,
 )
 from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
+    FlowMatchEulerDiscreteScheduler,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3 import (
     Cosmos3DecodingStage,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.dreams import (
+    EXTRA_DECODED_OUTPUT,
+    EXTRA_STREAMED_OUTPUT_PATHS,
     CausalDecodeQueue,
+    CosmosDreamsDecodingStage,
     CosmosDreamsRolloutStage,
-    _history_view,
+    FixedStepSchedules,
     _RolloutContext,
     actions_for_frames,
-    append_kv_history,
     closest_canvas,
     commit_clean_kv,
     crop_geometry_to_content,
@@ -73,6 +80,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     prepare_action_rows,
     resolve_geometry,
     sde_step_generator,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.kv_history import (
+    SelectedKVHistory,
+    new_kv_history,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
@@ -654,11 +665,11 @@ class TestCosmosDreamsPositionIds(unittest.TestCase):
             ),
             RecordOps() as ops,
         ):
-            _, _, v = cosmos_dreams._joint_attention(
+            keys, values = torch.zeros(1, 20, 1, 2), torch.zeros(1, 20, 1, 2)
+            cosmos_dreams._joint_attention(
                 attention,
                 hidden,
-                prefix_k=torch.zeros(1, 0, 1, 2),
-                prefix_v=torch.zeros(1, 0, 1, 2),
+                kv_slot=CosmosDreamsKVSlot(keys, values, keys, values),
                 cos_sin_cache=None,
                 rope_positions=None,
                 null_token_slices=slices,
@@ -666,7 +677,7 @@ class TestCosmosDreamsPositionIds(unittest.TestCase):
         self.assertEqual(ops.uploads(), [])
         expected = (hidden + 1).view(1, 20, 1, 2).clone()
         expected[:, [0, 1, 2, 3, 10, 11, 12, 13]] = 0.0
-        torch.testing.assert_close(v, expected, rtol=0, atol=0)
+        torch.testing.assert_close(values, expected, rtol=0, atol=0)
 
 
 class TestCosmosDreamsSdeSeeding(unittest.TestCase):
@@ -687,71 +698,204 @@ class TestCosmosDreamsSdeSeeding(unittest.TestCase):
         }
         self.assertEqual(len(seeds), 800)
 
+    def test_schedule_built_once_steps_like_one_rebuilt_for_every_chunk(self):
+        """Pointing the scheduler back at a prepared schedule must leave it where
+        ``set_timesteps`` and the first step's index lookup would, also when the
+        rollout alternates between the sigma lists of its profile."""
+        device = torch.device("cpu")
+        kept, rebuilt = (
+            FlowMatchEulerDiscreteScheduler(stochastic_sampling=True) for _ in range(2)
+        )
+        schedules = FixedStepSchedules(kept)
+        four_steps, two_steps = (1.0, 0.75, 0.5, 0.25), (1.0, 0.5)
+        noise = torch.Generator().manual_seed(0)
+        with mock.patch.object(
+            kept, "set_timesteps", wraps=kept.set_timesteps
+        ) as builds:
+            for chunk, t_list in enumerate(
+                (four_steps, two_steps, two_steps, four_steps, two_steps)
+            ):
+                steps = schedules.begin_chunk(t_list, device)
+                rebuilt.set_shift(1.0)
+                rebuilt.set_timesteps(sigmas=list(t_list), device=device)
+                self.assertEqual(len(steps), len(t_list))
+                ours = theirs = torch.randn(1, 2, 1, 4, 4, generator=noise)
+                for (timestep, forward_timestep), reference in zip(
+                    steps, rebuilt.timesteps, strict=True
+                ):
+                    self.assertEqual(forward_timestep.tolist(), [float(reference)])
+                    velocity = torch.randn(ours.shape, generator=noise)
+                    ours, theirs = (
+                        scheduler.step(
+                            velocity,
+                            step_timestep,
+                            sample,
+                            generator=torch.Generator().manual_seed(chunk),
+                            return_dict=False,
+                        )[0]
+                        for scheduler, step_timestep, sample in (
+                            (kept, timestep, ours),
+                            (rebuilt, reference, theirs),
+                        )
+                    )
+                self.assertTrue(torch.equal(ours, theirs), f"chunk {chunk}")
+        self.assertEqual(builds.call_count, 2)
+
+
+def _text_kv(layers: int = 2, text_tokens: int = 3) -> list:
+    """Per-layer text K/V labelled -1, so it never collides with a frame label."""
+    return [
+        (
+            torch.full((1, text_tokens, 1, 1), -1.0),
+            torch.full((1, text_tokens, 1, 1), -1.0),
+        )
+        for _ in range(layers)
+    ]
+
+
+def _commit_labelled(history, label: float, tokens: int, *, tail_tokens=None) -> list:
+    """Write ``tokens`` K/V tokens labelled ``label`` as a forward would, commit
+    them, and return the labels attention read during that forward."""
+    slots = history.slots(tokens)
+    for slot in slots:
+        slot.chunk_keys.fill_(label)
+        slot.chunk_values.fill_(label)
+    read = slots[-1].keys[0, :, 0, 0].tolist()
+    history.commit(tokens, tail_tokens=tail_tokens)
+    return read
+
 
 class TestCosmosDreamsKVHistory(unittest.TestCase):
     def test_empty_retrieval_stays_empty_during_clean_commit(self):
-        kv = (torch.ones(1, 2, 1, 1), torch.ones(1, 2, 1, 1))
-        archive = [kv]
-        selected = _history_view(archive, [], tokens_per_frame=1)
-
-        def transformer(latent, timestep, *, history_kv, **kwargs):
-            self.assertEqual(history_kv[0][0].shape[1], 0)
-            return SimpleNamespace(current_kv=[(kv[0][:, :1], kv[1][:, :1])])
-
-        result = commit_clean_kv(
-            transformer,
-            torch.zeros(1, 1, 1, 1, 1),
-            history=archive,
-            read_history=selected,
-            dtype=torch.float32,
+        text_kv = _text_kv(layers=1, text_tokens=2)
+        archive = new_kv_history(
+            text_kv,
             tokens_per_frame=1,
             sink_frames=0,
             window_frames=4,
+            chunk_frames=1,
+            rollout_frames=4,
         )
-        self.assertEqual(result[0][0].shape[1], 3)
+        _commit_labelled(archive, 0.0, 1)
+        _commit_labelled(archive, 1.0, 1)
+        selected = SelectedKVHistory(
+            archive, text_kv, selected_tokens=2, chunk_tokens=1
+        ).select([], tokens_per_frame=1)
 
-    @staticmethod
-    def _frame_kv(frame: int, layers: int = 2, tokens_per_frame: int = 2):
-        value = torch.full((1, tokens_per_frame, 1, 1), float(frame))
-        return [(value.clone(), value.clone()) for _ in range(layers)]
+        def write_clean_kv(latent, *, kv_slots, **kwargs):
+            # Text plus the frame being refreshed: nothing was selected.
+            self.assertEqual(kv_slots[0].keys.shape[1], 3)
+            kv_slots[0].chunk_keys.fill_(2.0)
 
-    def _rollout(self, *, sink_frames: int, window_frames: int, frames: int = 5):
-        history = None
-        for frame in range(frames):
-            history = append_kv_history(
-                history,
-                self._frame_kv(frame),
-                tokens_per_frame=2,
+        commit_clean_kv(
+            SimpleNamespace(write_clean_kv=write_clean_kv),
+            torch.zeros(1, 1, 1, 1, 1),
+            history=selected,
+            dtype=torch.float32,
+            tokens_per_frame=1,
+            window_frames=4,
+        )
+        self.assertEqual(archive.committed(0)[0][0, :, 0, 0].tolist(), [0.0, 1.0, 2.0])
+
+    def test_clean_pass_writes_every_layers_kv_and_skips_the_last_attention(self):
+        """A commit pass leaves K/V behind in every layer; the last layer gets
+        the hidden state of the one before it and never runs its attention."""
+        calls = []
+
+        class Layer:
+            def __init__(self, index):
+                self.index = index
+
+            def __call__(self, hidden, *, kv_slot, **kwargs):
+                calls.append(("layer", self.index, hidden, kv_slot))
+                return hidden + 1
+
+            def write_kv(self, hidden, *, kv_slot, **kwargs):
+                calls.append(("kv_only", self.index, hidden, kv_slot))
+
+        transformer = SimpleNamespace(
+            gen_layers=[Layer(index) for index in range(3)],
+            _prepare_chunk=lambda *args, **kwargs: (0, {}),
+        )
+        CosmosDreamsTransformer.write_clean_kv(
+            transformer,
+            torch.zeros(1, 1, 1, 1, 1),
+            text_length=2,
+            kv_slots=["slot0", "slot1", "slot2"],
+            frame_start=0,
+            fps=30.0,
+        )
+        self.assertEqual(
+            calls,
+            [
+                ("layer", 0, 0, "slot0"),
+                ("layer", 1, 1, "slot1"),
+                ("kv_only", 2, 2, "slot2"),
+            ],
+        )
+
+    def test_history_matches_sink_plus_tail_through_slides_moves_and_growth(self):
+        """The block attention reads is always ``[text | first sink | latest tail |
+        chunk]`` in order, whatever the buffers did underneath: the span drifts on
+        every eviction, moves back to the front when the spare room runs out, and
+        the buffers of an open-ended session double. Tails alternate like the
+        control/RGB commits of a transfer rollout."""
+        tokens, sink_frames, window_frames = 2, 2, 5
+        for rollout_frames in (None, 60):
+            history = new_kv_history(
+                _text_kv(),
+                tokens_per_frame=tokens,
                 sink_frames=sink_frames,
                 window_frames=window_frames,
+                chunk_frames=3,
+                rollout_frames=rollout_frames,
             )
-        return history
+            kept: list[float] = []
+            for frame in range(60):
+                chunk_frames = 1 + frame % 3
+                tail_frames = window_frames - frame % 2
+                label = float(frame)
+                read = _commit_labelled(
+                    history,
+                    label,
+                    chunk_frames * tokens,
+                    tail_tokens=tail_frames * tokens,
+                )
+                chunk = [label] * (chunk_frames * tokens)
+                self.assertEqual(read, [-1.0] * 3 + kept + chunk, msg=f"frame {frame}")
+                kept = kept + chunk
+                bound = (sink_frames + tail_frames) * tokens
+                if len(kept) > bound:
+                    kept = kept[: sink_frames * tokens] + kept[-tail_frames * tokens :]
+                for layer in range(len(history)):
+                    key, value = history.committed(layer)
+                    self.assertEqual(key[0, :, 0, 0].tolist(), kept)
+                    self.assertEqual(value[0, :, 0, 0].tolist(), kept)
 
-    def test_window_keeps_latest_frames(self):
-        history = self._rollout(sink_frames=0, window_frames=3)
-        self.assertEqual(len(history), 2)
-        for key, value in history:
-            torch.testing.assert_close(
-                key[0, :, 0, 0], torch.tensor([2.0, 2.0, 3.0, 3.0, 4.0, 4.0])
-            )
-            torch.testing.assert_close(key, value)
-
-    def test_sink_frames_survive_the_window(self):
-        history = self._rollout(sink_frames=1, window_frames=3)
-        torch.testing.assert_close(
-            history[0][0][0, :, 0, 0],
-            torch.tensor([0.0, 0.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0]),
+    def test_rollout_inside_its_window_gets_exactly_its_length(self):
+        history = new_kv_history(
+            _text_kv(),
+            tokens_per_frame=2,
+            sink_frames=0,
+            window_frames=226,
+            chunk_frames=2,
+            rollout_frames=5,
         )
+        for frame in range(4):
+            _commit_labelled(history, float(frame), 2, tail_tokens=226 * 2)
+        self.assertEqual(history.slots(2)[0].keys.shape[1], 3 + 5 * 2)
+        with self.assertRaisesRegex(ValueError, "cannot take"):
+            history.slots(4)
 
-    def test_layer_count_change_is_rejected(self):
-        history = self._rollout(sink_frames=0, window_frames=3, frames=1)
-        with self.assertRaises(ValueError):
-            append_kv_history(
-                history,
-                self._frame_kv(1, layers=3),
+    def test_open_ended_session_needs_a_window(self):
+        with self.assertRaisesRegex(ValueError, "bounded"):
+            new_kv_history(
+                _text_kv(),
                 tokens_per_frame=2,
                 sink_frames=0,
-                window_frames=3,
+                window_frames=None,
+                chunk_frames=2,
+                rollout_frames=None,
             )
 
 
@@ -1176,7 +1320,9 @@ class TestCosmosDreamsRuntime(unittest.TestCase):
         for mode in ("component-offload", "snapshot-offload", "layerwise-offload"):
             with self.subTest(mode=mode):
                 args.component_residency = {"vae": mode}
-                self.assertIsNone(stage._decode_queue(torch.device("cuda")))
+                self.assertIsNone(
+                    stage._decode_queue(torch.device("cuda"), SimpleNamespace())
+                )
                 self.assertEqual(
                     [use.component_name for use in stage.component_uses(args)],
                     ["transformer"],
@@ -1186,6 +1332,90 @@ class TestCosmosDreamsRuntime(unittest.TestCase):
             [use.component_name for use in stage.component_uses(args)],
             ["transformer", "vae"],
         )
+
+
+class TestCosmosDreamsRolloutStreams(unittest.TestCase):
+    def test_streams_are_made_once_and_reused_across_requests(self):
+        """The CUDA allocator caches freed memory per stream, so a stage that made
+        a new decode or rollout stream per request stranded the previous request's
+        memory and its peak climbed with every request."""
+        with mock.patch.object(ServerArgs, "__post_init__", lambda self: None):
+            args = ServerArgs(model_path="unused", pipeline_config=CosmosDreamsConfig())
+        args.component_residency = {"vae": "resident"}
+        stage = object.__new__(CosmosDreamsRolloutStage)
+        stage.server_args = args
+        stage.overlap_vae_decode = True
+        stage.vae = None
+        stage._decode_stream = stage._priority_stream = None
+        batch = SimpleNamespace(sampling_params=SimpleNamespace(quality="exact"))
+        dreams = (
+            "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages."
+            "cosmos3_simulation.dreams"
+        )
+        with (
+            mock.patch(
+                "torch.cuda.Stream", side_effect=lambda **kwargs: object()
+            ) as make_stream,
+            mock.patch(
+                f"{dreams}.CausalDecodeQueue",
+                side_effect=lambda vae, **kwargs: SimpleNamespace(**kwargs),
+            ),
+            mock.patch.object(
+                CosmosDreamsRolloutStage, "_streamed_encoder", return_value=None
+            ),
+        ):
+            first = stage._decode_queue(torch.device("cuda"), batch)
+            second = stage._decode_queue(torch.device("cuda"), batch)
+            self.assertIs(first.stream, second.stream)
+            # The rollout only gets its own stream when the priority is switched on.
+            self.assertIsNone(stage._priority_stream)
+            self.assertEqual(make_stream.call_count, 1)
+            stage._decode_stream = None
+            switch = "SGLANG_DIFFUSION_COSMOS_DREAMS_ROLLOUT_STREAM_PRIORITY"
+            with mock.patch.dict(os.environ, {switch: "1"}):
+                stage._decode_queue(torch.device("cuda"), batch)
+                priority = stage._priority_stream
+                stage._decode_queue(torch.device("cuda"), batch)
+            self.assertIs(stage._priority_stream, priority)
+            self.assertIsNot(priority, stage._decode_stream)
+            self.assertEqual(make_stream.call_count, 3)
+
+
+class TestCosmosDreamsStreamedOutput(unittest.TestCase):
+    def test_decoding_stage_gets_a_path_frames_or_nothing(self):
+        """A rollout that encoded the MP4 hands over its path and nothing is decoded
+        again; one whose encoder failed hands over nothing, so the decoding stage
+        decodes the latents itself; one without an encoder hands over its frames."""
+        stage = object.__new__(CosmosDreamsRolloutStage)
+
+        def hand_over(encoder, frames="frames"):
+            batch = SimpleNamespace(extra={})
+            queue = SimpleNamespace(submitted=1, encoder=encoder, finish=lambda: frames)
+            with mock.patch.object(CosmosDreamsRolloutStage, "log_info"):
+                stage._hand_over_decode(batch, queue)
+            return batch.extra
+
+        saved = SimpleNamespace(finish=lambda: ["out.mp4"])
+        failed = SimpleNamespace(finish=lambda: None)
+        self.assertEqual(hand_over(saved), {EXTRA_STREAMED_OUTPUT_PATHS: ["out.mp4"]})
+        self.assertEqual(hand_over(failed), {})
+        self.assertEqual(hand_over(None), {EXTRA_DECODED_OUTPUT: "frames"})
+
+        decoding = object.__new__(CosmosDreamsDecodingStage)
+        batch = SimpleNamespace(
+            extra={EXTRA_STREAMED_OUTPUT_PATHS: ["out.mp4"]},
+            metrics=None,
+            rollout_trajectory_data=None,
+        )
+        with mock.patch.object(Cosmos3DecodingStage, "forward") as decode:
+            output = decoding.forward(batch, None)
+            self.assertEqual(
+                (output.output, output.output_file_paths), (None, ["out.mp4"])
+            )
+            decode.assert_not_called()
+            batch.extra.clear()
+            decoding.forward(batch, None)
+            decode.assert_called_once()
 
 
 class TestCosmosDreamsInferenceProfile(unittest.TestCase):
@@ -1376,17 +1606,22 @@ class TestCosmosDreamsInferenceProfile(unittest.TestCase):
             kv_cache_inference_size=cache_size,
             attention_sink_size=sinks,
         )
-        history = None
+        history = new_kv_history(
+            _text_kv(),
+            tokens_per_frame=tokens,
+            sink_frames=profile.sink_frames,
+            window_frames=profile.window_frames,
+            chunk_frames=1,
+            rollout_frames=40,
+        )
         for frame in range(40):
-            block = torch.full((1, tokens, 1, 1), float(frame))
-            history = append_kv_history(
+            _commit_labelled(
                 history,
-                [(block, block)],
-                tokens_per_frame=tokens,
-                sink_frames=profile.sink_frames,
-                window_frames=profile.window_frames,
+                float(frame),
+                tokens,
+                tail_tokens=profile.window_frames * tokens,
             )
-            kept = history[0][0][0, ::tokens, 0, 0].tolist()
+            kept = history.committed(0)[0][0, ::tokens, 0, 0].tolist()
             current = frame + 1
             rolling_start = max(sinks, current - (cache_size - sinks - 1))
             expected = list(range(min(sinks, current))) + list(

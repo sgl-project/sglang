@@ -10,13 +10,16 @@ import torch
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.frustum import (
     POSE_CHUNK_FRAMES,
     FrustumHistorySelector,
-    SelectedHistory,
     chunk_anchored_poses,
     denormalize_unified_slots,
     describe_selection,
     recover_unified_camera_poses,
     resolve_frustum_selector,
     rot6d_to_matrix,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.kv_history import (
+    SelectedKVHistory,
+    new_kv_history,
 )
 
 IMAGE = (640, 360)
@@ -243,26 +246,53 @@ class TestPoseRecovery(unittest.TestCase):
 
 
 class TestSelectedHistory(unittest.TestCase):
-    def test_gathers_selected_frames_per_layer(self):
-        tokens = 3
-        frames = torch.arange(6, dtype=torch.float32).repeat_interleave(tokens)
-        archive = [
-            (frames.view(1, -1, 1, 1) + layer * 100, -frames.view(1, -1, 1, 1))
-            for layer in range(2)
+    def test_reads_selected_frames_and_commits_to_the_archive(self):
+        tokens, layers = 3, 2
+        text_kv = [
+            (torch.full((1, 2, 1, 1), -1.0), torch.full((1, 2, 1, 1), -1.0))
+            for _ in range(layers)
         ]
-        view = SelectedHistory(archive, frame_ids=[0, 3, 5], tokens_per_frame=tokens)
-        self.assertEqual(len(view), 2)
-        self.assertEqual(view.frame_ids, (0, 3, 5))
-        key, value = view[1]
-        self.assertEqual(
-            key[0, :, 0, 0].tolist(), [100, 100, 100, 103, 103, 103, 105, 105, 105]
+        archive = new_kv_history(
+            text_kv,
+            tokens_per_frame=tokens,
+            sink_frames=0,
+            window_frames=None,
+            chunk_frames=2,
+            rollout_frames=8,
         )
-        self.assertEqual(value[0, ::tokens, 0, 0].tolist(), [0, -3, -5])
-        empty = SelectedHistory(archive, frame_ids=[], tokens_per_frame=tokens)
-        self.assertEqual(empty[0][0].shape[1], 0)
-        for bad in ([3, 0], [0, 0], [6], [-1]):
+
+        def write(history, frame: int) -> list:
+            slots = history.slots(tokens)
+            for layer, slot in enumerate(slots):
+                slot.chunk_keys.fill_(frame + layer * 100)
+                slot.chunk_values.fill_(-frame)
+            read = slots[1].keys[0, :, 0, 0].tolist()
+            history.commit(tokens)
+            return read
+
+        for frame in range(6):
+            write(archive, frame)
+        view = SelectedKVHistory(
+            archive, text_kv, selected_tokens=3 * tokens, chunk_tokens=2 * tokens
+        )
+        view.select([0, 3, 5], tokens_per_frame=tokens)
+        self.assertEqual(view.frame_ids, (0, 3, 5))
+        # Two refreshes of one chunk: the second also reads the first's frame.
+        selected = [100.0] * 3 + [103.0] * 3 + [105.0] * 3
+        self.assertEqual(write(view, 6), [-1.0] * 2 + selected + [106.0] * 3)
+        self.assertEqual(
+            write(view, 7), [-1.0] * 2 + selected + [106.0] * 3 + [107.0] * 3
+        )
+        # Both landed in the archive, and a new selection starts from it alone.
+        self.assertEqual(
+            archive.committed(0)[1][0, ::tokens, 0, 0].tolist(),
+            [0, -1, -2, -3, -4, -5, -6, -7],
+        )
+        view.select([], tokens_per_frame=tokens)
+        self.assertEqual(view.slots(tokens)[0].keys.shape[1], 2 + tokens)
+        for bad in ([3, 0], [0, 0], [8], [-1]):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
-                SelectedHistory(archive, frame_ids=bad, tokens_per_frame=tokens)
+                view.select(bad, tokens_per_frame=tokens)
 
     def test_describe_selection(self):
         selector = _selector(

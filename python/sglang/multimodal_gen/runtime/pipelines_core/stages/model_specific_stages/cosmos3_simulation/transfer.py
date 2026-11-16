@@ -13,11 +13,13 @@ paired control/RGB window with pinned sink frames.
 
 import json
 import math
+from collections.abc import Callable, Iterator
+from functools import partial
+from itertools import count
 from typing import Any
 
 import imageio.v3 as iio
 import msgspec
-import numpy as np
 import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
@@ -32,6 +34,7 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     CosmosDreamsManifest,
     CosmosDreamsTransferHistoryProfile,
 )
+from sglang.multimodal_gen.runtime.cache.conditioning import vae_encode_is_cached
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -55,6 +58,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     VIDEO_RES_SIZE_INFO,
     canonical_aspect_ratio,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.control_clip import (
+    ControlClipDecode,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.dreams import (
     EXTRA_GEOMETRY,
     EXTRA_TARGET_LATENT_FRAMES,
@@ -72,6 +78,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     single_prompt,
     tokenize_dreams_prompt,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.kv_history import (
+    CosmosDreamsKVHistory,
+    new_kv_history,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
     StageValidators as V,
 )
@@ -80,11 +90,13 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.validators import (
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
-from sglang.multimodal_gen.runtime.utils.vision import load_video
 
 logger = init_logger(__name__)
 
 EXTRA_CONTROL_LATENT = "cosmos_dreams_control_latent"
+# The control clip while it still decodes, in place of EXTRA_PREPROCESSED_CONTROL
+# and the plan, which the prepare stage records once the clip's length is known.
+EXTRA_CONTROL_DECODE = "cosmos_dreams_control_decode"
 EXTRA_CONTROL_HINT = "cosmos_dreams_control_hint"
 EXTRA_CONTROL_FPS = "cosmos_dreams_control_fps"
 # (height, width) of the control clip before resizing.
@@ -189,16 +201,15 @@ def read_video_fps(path: str) -> float | None:
     return float(fps) if fps else None
 
 
-def load_control_frames(path: str, *, max_frames: int) -> torch.Tensor:
-    """First ``max_frames`` frames of the control clip as ``uint8 [3, T, H, W]``."""
-    frames = load_video(path, max_frames=max_frames)
-    if not frames:
-        raise ValueError(f"No frames decoded from control video {path!r}.")
-    arrays = [
-        np.asarray(frame.convert("RGB"), dtype=np.uint8)
-        for frame in frames[:max_frames]
-    ]
-    return torch.from_numpy(np.stack(arrays, axis=0)).permute(3, 0, 1, 2).contiguous()
+def control_frames_used(
+    decoded_frames: int, *, requested_frames: int, manifest: CosmosDreamsManifest
+) -> int:
+    """Frames of a ``decoded_frames``-long control clip the rollout consumes."""
+    return align_pixel_frames_to_chunks(
+        min(decoded_frames, requested_frames),
+        temporal_compression_factor=manifest.temporal_compression_factor,
+        chunk_size=manifest.chunk_size,
+    )
 
 
 def resize_center_crop_uint8(
@@ -209,6 +220,9 @@ def resize_center_crop_uint8(
         raise ValueError(
             f"Control frames must have shape [3, T, H, W], got {tuple(frames.shape)}."
         )
+    # A decoded clip arrives as a view of channels-last frames; the resize kernel
+    # is chosen by layout, so it gets the channels-first one it was matched on.
+    frames = frames.contiguous()
     orig_h, orig_w = int(frames.shape[2]), int(frames.shape[3])
     scale = max(width / orig_w, height / orig_h)
     resize_h = math.ceil(scale * orig_h)
@@ -292,6 +306,9 @@ def direct_resize_control(
         raise ValueError(
             f"Control frames must have shape [3, T, H, W], got {tuple(frames.shape)}."
         )
+    # A decoded clip arrives as a view of channels-last frames; the resize kernel
+    # is chosen by layout, so it gets the channels-first one it was matched on.
+    frames = frames.contiguous()
     pixels = frames.permute(1, 0, 2, 3)
     size = [int(height), int(width)]
     if hint in ("seg", "edge"):
@@ -310,6 +327,25 @@ def direct_resize_control(
             pixels, size, interpolation=TF.InterpolationMode.BICUBIC, antialias=True
         )
     return resized.permute(1, 0, 2, 3).contiguous()
+
+
+def control_fit(
+    batch: Req, source_hw: tuple[int, int]
+) -> Callable[[torch.Tensor], torch.Tensor] | None:
+    """How ``uint8 [3, T, H, W]`` control frames get onto the request's canvas;
+    None when the direct resize finds them on it already. Every recipe treats
+    each frame alone, so a clip can be fitted in pieces."""
+    height, width = int(batch.height), int(batch.width)
+    if batch.extra[EXTRA_CONTROL_RESIZE_MODE] != TRANSFER_RESIZE_DIRECT:
+        return partial(resize_center_crop_uint8, height=height, width=width)
+    if source_hw == (height, width):
+        return None
+    return partial(
+        direct_resize_control,
+        height=height,
+        width=width,
+        hint=batch.extra[EXTRA_CONTROL_HINT],
+    )
 
 
 def restore_transfer_output_size(
@@ -374,6 +410,24 @@ def normalize_control_pixels(
     return frames.to(dtype) / 127.5 - 1.0
 
 
+def upload_control_frames(frames: torch.Tensor, device: torch.device) -> torch.Tensor:
+    """``uint8 [3, T, H, W]`` control frames on ``device``, contiguous.
+
+    A decoded clip is a view of channels-last host frames: those move as they
+    are, in one copy, and the transpose runs on the device.
+    """
+    channels_last = frames.permute(1, 2, 3, 0)
+    if frames.is_contiguous() or not channels_last.is_contiguous():
+        return frames.to(device=device).contiguous()
+    return channels_last.to(device=device).permute(3, 0, 1, 2).contiguous()
+
+
+def _normalized_latent(vae: Any, latent: torch.Tensor) -> torch.Tensor:
+    mean = torch.as_tensor(vae.config.latents_mean).view(1, -1, 1, 1, 1).to(latent)
+    std = torch.as_tensor(vae.config.latents_std).view(1, -1, 1, 1, 1).to(latent)
+    return ((latent - mean) / std).to(torch.bfloat16)
+
+
 def encode_control_latent(
     vae: Any,
     frames: torch.Tensor,
@@ -385,19 +439,108 @@ def encode_control_latent(
     vae_dtype = next(vae.parameters()).dtype
     # The reference normalizes to [-1, 1] directly in the checkpoint dtype.
     pixels = normalize_control_pixels(
-        frames.unsqueeze(0).to(device=device),
+        upload_control_frames(frames, device).unsqueeze(0),
         dtype=vae_dtype,
         float32_first=float32_normalization,
     )
     with torch.no_grad():
         latent = vae.encode(pixels).mode()
-    mean = torch.as_tensor(vae.config.latents_mean).view(1, -1, 1, 1, 1).to(latent)
-    std = torch.as_tensor(vae.config.latents_std).view(1, -1, 1, 1, 1).to(latent)
-    return ((latent - mean) / std).to(torch.bfloat16)
+    return _normalized_latent(vae, latent)
+
+
+def can_encode_while_decoding(vae: Any) -> bool:
+    """Whether the control encode may start before the clip has fully decoded.
+
+    Needs the VAE's cached causal encode, and no conditioning cache for it: the
+    cache looks the whole clip up first, and a hit skips the encode.
+    """
+    # Asked in the state encode_control_latent calls the VAE in.
+    with torch.no_grad():
+        return vae.use_feature_cache and not vae_encode_is_cached(vae)
+
+
+def encode_decoding_control_latent(
+    vae: Any,
+    decode: ControlClipDecode,
+    *,
+    fit: Callable[[torch.Tensor], torch.Tensor] | None,
+    device: torch.device,
+    float32_normalization: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """:func:`encode_control_latent` of a clip that is still decoding.
+
+    The VAE encodes a clip causally, one group of frames at a time, so each
+    group is fitted, uploaded and encoded once its frames are final while the
+    later ones decode. Returns the latent and the fitted ``[3, T, H, W]`` frames
+    it covers: every whole group of the clip.
+    """
+    vae_dtype = next(vae.parameters()).dtype
+    encoded_frames = 0
+    fitted: list[torch.Tensor] = []
+
+    def groups() -> Iterator[torch.Tensor]:
+        nonlocal encoded_frames
+        for latent_frames in count(1):
+            stop = vae.causal_prefix_frames(latent_frames)
+            if decode.wait(stop) < stop:
+                return
+            frames = decode.frames(encoded_frames, stop)
+            if fit is not None:
+                frames = fit(frames)
+                fitted.append(frames)
+            yield normalize_control_pixels(
+                upload_control_frames(frames, device).unsqueeze(0),
+                dtype=vae_dtype,
+                float32_first=float32_normalization,
+            )
+            encoded_frames = stop
+
+    with torch.no_grad():
+        latent = vae.encode_causal_groups(groups()).mode()
+    frames = (
+        decode.frames(0, encoded_frames) if fit is None else torch.cat(fitted, dim=1)
+    )
+    return _normalized_latent(vae, latent), frames
+
+
+def record_transfer_plan(
+    stage: PipelineStage,
+    batch: Req,
+    *,
+    manifest: CosmosDreamsManifest,
+    frames: torch.Tensor,
+    source: str,
+) -> None:
+    """Record the fitted ``uint8 [3, T, H, W]`` control clip and the chunk
+    partition of the rollout that follows it."""
+    total_frames = int(frames.shape[1])
+    target_frame = latent_frame_count(
+        total_frames, manifest.temporal_compression_factor
+    )
+    if target_frame > MAX_TRAINED_LATENT_FRAMES:
+        stage.log_warning(
+            f"{target_frame} latent frames exceed the trained Transfer horizon of "
+            f"{MAX_TRAINED_LATENT_FRAMES}; quality may degrade past it."
+        )
+    batch.num_frames = total_frames
+    batch.extra[EXTRA_PREPROCESSED_CONTROL] = [frames.unsqueeze(0)]
+    chunk_pixel_frames = manifest.chunk_size * manifest.temporal_compression_factor
+    batch.extra[EXTRA_TRANSFER_PLAN] = {
+        "total_frames": total_frames,
+        "chunk_frames": chunk_pixel_frames,
+        "num_chunks": 1 + (target_frame - 1) // manifest.chunk_size,
+        "stride": chunk_pixel_frames,
+    }
+    batch.extra[EXTRA_TARGET_LATENT_FRAMES] = target_frame
+    stage.log_info(
+        f"Control clip {source} ({batch.extra[EXTRA_CONTROL_HINT]}): {total_frames} "
+        f"frames at {batch.extra[EXTRA_CONTROL_FPS]:.3g} fps on canvas "
+        f"{batch.height}x{batch.width}, {target_frame} latent frames"
+    )
 
 
 class CosmosDreamsControlVideoStage(PipelineStage):
-    """Load the control clip, snap the canvas, and trim it to the chunk partition."""
+    """Start decoding the control clip and snap the canvas to its first frame."""
 
     parallelism_type = StageParallelismType.REPLICATED
 
@@ -435,8 +578,11 @@ class CosmosDreamsControlVideoStage(PipelineStage):
             )
         return fps
 
-    def _load_control(self, batch: Req) -> tuple[torch.Tensor, str, float, str]:
-        """Return ``(frames, hint, fps, source)``; warmup requests get a synthetic clip."""
+    def _start_control(
+        self, batch: Req
+    ) -> tuple[torch.Tensor | ControlClipDecode, str, float, str]:
+        """Return ``(clip, hint, fps, source)``: the clip of a request is still
+        decoding, warmup requests get a synthetic one."""
         manifest = self.manifest
         sampling_params = batch.sampling_params
         if batch.is_warmup:
@@ -456,20 +602,21 @@ class CosmosDreamsControlVideoStage(PipelineStage):
             raise ValueError(
                 f"Checkpoint {manifest.checkpoint_id} accepts control hints {list(allowed_hints)}, got {hint!r}."
             )
-        frames = load_control_frames(
-            control_path, max_frames=int(sampling_params.max_frames)
+        # The rollout never uses more than num_frames of the clip.
+        decode = ControlClipDecode(
+            control_path,
+            max_frames=min(int(sampling_params.max_frames), int(batch.num_frames)),
         )
-        return frames, hint, self._resolve_fps(batch, control_path), control_path
+        try:
+            return decode, hint, self._resolve_fps(batch, control_path), control_path
+        except BaseException:
+            decode.close()
+            raise
 
-    def _fit_control(
-        self,
-        batch: Req,
-        frames: torch.Tensor,
-        *,
-        hint: str,
-        source_hw: tuple[int, int],
-    ) -> torch.Tensor:
-        """Snap the canvas (unless the request fixed it) and bring the clip onto it."""
+    def _resolve_canvas(
+        self, batch: Req, *, hint: str, source_hw: tuple[int, int]
+    ) -> None:
+        """Snap the canvas unless the request fixed it, and settle the resize recipe."""
         direct = self.resize_mode == TRANSFER_RESIZE_DIRECT and not batch.is_warmup
         batch.extra[EXTRA_CONTROL_RESIZE_MODE] = (
             TRANSFER_RESIZE_DIRECT if direct else TRANSFER_RESIZE_CENTER_CROP
@@ -488,67 +635,73 @@ class CosmosDreamsControlVideoStage(PipelineStage):
             distortion = check_direct_distortion(
                 source_hw=source_hw, canvas_hw=(batch.height, batch.width)
             )
-        if not direct:
-            return resize_center_crop_uint8(
-                frames, height=batch.height, width=batch.width
+        if direct:
+            self.log_info(
+                f"Direct resize {source_hw[1]}x{source_hw[0]} -> {batch.width}x{batch.height} "
+                f"({distortion:.2%} aspect distortion, {hint})"
             )
-        self.log_info(
-            f"Direct resize {source_hw[1]}x{source_hw[0]} -> {batch.width}x{batch.height} "
-            f"({distortion:.2%} aspect distortion, {hint})"
-        )
-        return direct_resize_control(
-            frames, height=batch.height, width=batch.width, hint=hint
-        )
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
+        clip, hint, fps, control_path = self._start_control(batch)
+        try:
+            return self._place_control(
+                batch, clip, hint=hint, fps=fps, control_path=control_path
+            )
+        except BaseException:
+            if isinstance(clip, ControlClipDecode):
+                clip.close()
+            raise
+
+    def _place_control(
+        self,
+        batch: Req,
+        clip: torch.Tensor | ControlClipDecode,
+        *,
+        hint: str,
+        fps: float,
+        control_path: str,
+    ) -> Req:
+        """Resolve what the clip's first frame decides: canvas and geometry. A
+        clip that is still decoding goes on to the prepare stage as it is."""
         manifest = self.manifest
-        frames, hint, fps, control_path = self._load_control(batch)
-        source_hw = (int(frames.shape[2]), int(frames.shape[3]))
-        frames = self._fit_control(batch, frames, hint=hint, source_hw=source_hw)
-        total_frames = align_pixel_frames_to_chunks(
-            min(int(frames.shape[1]), int(batch.num_frames)),
-            temporal_compression_factor=manifest.temporal_compression_factor,
-            chunk_size=manifest.chunk_size,
+        decoding = isinstance(clip, ControlClipDecode)
+        source_hw = (
+            clip.source_hw if decoding else (int(clip.shape[2]), int(clip.shape[3]))
         )
-        frames = frames[:, :total_frames]
-        geometry = resolve_geometry(
+        self._resolve_canvas(batch, hint=hint, source_hw=source_hw)
+        batch.fps = int(round(fps))
+        batch.extra[EXTRA_CONTROL_FPS] = fps
+        batch.extra[EXTRA_CONTROL_HINT] = hint
+        batch.extra[EXTRA_CONTROL_SOURCE_HW] = source_hw
+        batch.extra[EXTRA_GEOMETRY] = resolve_geometry(
             height=batch.height,
             width=batch.width,
             manifest=manifest,
             max_pixels=self.max_pixels,
         )
-        target_frame = latent_frame_count(
-            total_frames, manifest.temporal_compression_factor
+        if decoding:
+            batch.extra[EXTRA_CONTROL_DECODE] = clip
+            return batch
+        total_frames = control_frames_used(
+            int(clip.shape[1]),
+            requested_frames=int(batch.num_frames),
+            manifest=manifest,
         )
-        if target_frame > MAX_TRAINED_LATENT_FRAMES:
-            self.log_warning(
-                f"{target_frame} latent frames exceed the trained Transfer horizon of "
-                f"{MAX_TRAINED_LATENT_FRAMES}; quality may degrade past it."
-            )
-        batch.num_frames = total_frames
-        batch.fps = int(round(fps))
-        batch.extra[EXTRA_CONTROL_FPS] = fps
-        batch.extra[EXTRA_CONTROL_HINT] = hint
-        batch.extra[EXTRA_CONTROL_SOURCE_HW] = source_hw
-        batch.extra[EXTRA_PREPROCESSED_CONTROL] = [frames.unsqueeze(0)]
-        chunk_pixel_frames = manifest.chunk_size * manifest.temporal_compression_factor
-        batch.extra[EXTRA_TRANSFER_PLAN] = {
-            "total_frames": total_frames,
-            "chunk_frames": chunk_pixel_frames,
-            "num_chunks": 1 + (target_frame - 1) // manifest.chunk_size,
-            "stride": chunk_pixel_frames,
-        }
-        batch.extra[EXTRA_GEOMETRY] = geometry
-        batch.extra[EXTRA_TARGET_LATENT_FRAMES] = target_frame
-        self.log_info(
-            f"Control clip {control_path} ({hint}): {total_frames} frames at {fps:.3g} fps on "
-            f"canvas {batch.height}x{batch.width}, {target_frame} latent frames"
+        frames = clip[:, :total_frames]
+        fit = control_fit(batch, source_hw)
+        record_transfer_plan(
+            self,
+            batch,
+            manifest=manifest,
+            frames=frames if fit is None else fit(frames),
+            source=control_path,
         )
         return batch
 
 
 class CosmosDreamsTransferPrepareStage(PipelineStage):
-    """Format and tokenize the prompt; VAE-encode the control clip."""
+    """Fit the control clip to the canvas and VAE-encode it; format and tokenize
+    the prompt."""
 
     parallelism_type = StageParallelismType.REPLICATED
 
@@ -571,7 +724,11 @@ class CosmosDreamsTransferPrepareStage(PipelineStage):
         result = VerificationResult()
         result.add_check("geometry", batch.extra.get(EXTRA_GEOMETRY), V.not_none)
         result.add_check(
-            "control_frames", batch.extra.get(EXTRA_PREPROCESSED_CONTROL), V.not_none
+            "control_clip",
+            batch.extra.get(
+                EXTRA_CONTROL_DECODE, batch.extra.get(EXTRA_PREPROCESSED_CONTROL)
+            ),
+            V.not_none,
         )
         return result
 
@@ -596,26 +753,78 @@ class CosmosDreamsTransferPrepareStage(PipelineStage):
             emphasize_control=emphasize,
         )
 
+    def _encode_control(self, batch: Req, device: torch.device) -> torch.Tensor:
+        """VAE-encode the control clip. One that is still decoding is fitted here
+        and its plan recorded; it is encoded as its frames arrive where it can be."""
+        float32_normalization = (
+            batch.extra[EXTRA_CONTROL_RESIZE_MODE] == TRANSFER_RESIZE_DIRECT
+        )
+        decode: ControlClipDecode | None = batch.extra.pop(EXTRA_CONTROL_DECODE, None)
+        if decode is None:
+            return encode_control_latent(
+                self.vae,
+                batch.extra[EXTRA_PREPROCESSED_CONTROL][0][0],
+                device=device,
+                float32_normalization=float32_normalization,
+            )
+        latent = None
+        try:
+            fit = control_fit(batch, decode.source_hw)
+            # With one latent frame per chunk the rollout uses every whole VAE
+            # group of the clip; a longer chunk trims groups only the finished
+            # clip can count.
+            if self.manifest.chunk_size == 1 and can_encode_while_decoding(self.vae):
+                latent, frames = encode_decoding_control_latent(
+                    self.vae,
+                    decode,
+                    fit=fit,
+                    device=device,
+                    float32_normalization=float32_normalization,
+                )
+            total_frames = control_frames_used(
+                decode.wait(),
+                requested_frames=int(batch.num_frames),
+                manifest=self.manifest,
+            )
+            if latent is None:
+                # Trimmed first: a frame the rollout never sees is not resized.
+                frames = decode.frames(0, total_frames)
+                frames = frames if fit is None else fit(frames)
+        finally:
+            decode.close()
+        if int(frames.shape[1]) != total_frames:
+            raise ValueError(
+                f"The control encode covered {int(frames.shape[1])} frames but the "
+                f"rollout of this clip uses {total_frames}."
+            )
+        if latent is not None:
+            self.log_info("Encoded the control clip while it decoded")
+        record_transfer_plan(
+            self, batch, manifest=self.manifest, frames=frames, source=decode.path
+        )
+        if latent is None:
+            latent = encode_control_latent(
+                self.vae,
+                frames,
+                device=device,
+                float32_normalization=float32_normalization,
+            )
+        return latent
+
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         device = get_local_torch_device()
         geometry: CosmosDreamsGeometry = batch.extra[EXTRA_GEOMETRY]
+        with self.use_declared_component(component_name="vae", module=self.vae):
+            latent = self._encode_control(batch, device)
         target_frame: int = batch.extra[EXTRA_TARGET_LATENT_FRAMES]
 
+        # After the encode: the prompt states the clip's length, which a clip
+        # that was still decoding only has now.
         prompt = self._format_prompt(batch, geometry)
         self.log_info(f"Prompt: {prompt}")
         text_ids, text_mask = tokenize_dreams_prompt(
             self.tokenizer, prompt, device=device, system_prompt=TRANSFER_SYSTEM_PROMPT
         )
-
-        frames = batch.extra[EXTRA_PREPROCESSED_CONTROL][0][0]
-        with self.use_declared_component(component_name="vae", module=self.vae):
-            latent = encode_control_latent(
-                self.vae,
-                frames,
-                device=device,
-                float32_normalization=batch.extra[EXTRA_CONTROL_RESIZE_MODE]
-                == TRANSFER_RESIZE_DIRECT,
-            )
         expected = (
             1,
             latent.shape[1],
@@ -649,6 +858,10 @@ class _TransferRolloutContext(msgspec.Struct):
     geometry: CosmosDreamsGeometry
     device: torch.device
     dtype: torch.dtype
+
+    @property
+    def text_length(self) -> int:
+        return int(self.text_kv[0][0].shape[1])
 
 
 class CosmosDreamsTransferRolloutStage(CosmosDreamsRolloutStage):
@@ -685,23 +898,22 @@ class CosmosDreamsTransferRolloutStage(CosmosDreamsRolloutStage):
     def _commit(
         self,
         context: _TransferRolloutContext,
-        history: list[KVPair] | None,
+        history: CosmosDreamsKVHistory,
         latent: torch.Tensor,
         *,
         frame_start: int,
         keep_entries: int | None,
-    ) -> list[KVPair]:
+    ) -> None:
         # The history helper counts frames; here one entry is one control or
         # RGB latent, so the profile hands over entry counts.
-        return commit_clean_kv(
+        commit_clean_kv(
             self.transformer,
             latent,
             history=history,
             dtype=context.dtype,
             tokens_per_frame=context.tokens_per_frame,
-            sink_frames=self.history_profile.sink_entries,
             window_frames=keep_entries,
-            text_kv=context.text_kv,
+            text_length=context.text_length,
             frame_start=frame_start,
             fps=context.fps,
         )
@@ -739,12 +951,21 @@ class CosmosDreamsTransferRolloutStage(CosmosDreamsRolloutStage):
                 f"{profile.window_frames} frames ({profile.sink_frames} pinned); older "
                 "control/RGB pairs are evicted once it fills."
             )
-        history: list[KVPair] | None = None
+        # Every latent frame commits two entries, its control and its RGB; the
+        # control commit keeps the longer tail of the two.
+        history = new_kv_history(
+            text_kv,
+            tokens_per_frame=context.tokens_per_frame,
+            sink_frames=profile.sink_entries,
+            window_frames=profile.entries_after_control_commit(),
+            chunk_frames=manifest.chunk_size,
+            rollout_frames=2 * target_frame,
+        )
         latents: list[torch.Tensor] = []
         for chunk_start, chunk_end in iter_ar_chunk_ranges(
             0, target_frame, manifest.chunk_size
         ):
-            history = self._commit(
+            self._commit(
                 context,
                 history,
                 control[:, :, chunk_start:chunk_end],
@@ -767,20 +988,22 @@ class CosmosDreamsTransferRolloutStage(CosmosDreamsRolloutStage):
             )
             clean_chunk = run_fixed_step_sde(
                 self.transformer,
-                self.scheduler,
+                self.schedules,
                 noise,
                 t_list=manifest.t_list,
                 seed=seed,
                 frame_start=chunk_start,
                 dtype=context.dtype,
-                text_kv=context.text_kv,
+                text_length=context.text_length,
                 fps=context.fps,
-                history_kv=history,
+                kv_slots=history.slots(
+                    (chunk_end - chunk_start) * context.tokens_per_frame
+                ),
             )
             for local_idx, frame_idx in iter_clean_commit_frames(
                 chunk_start, chunk_end, target_frame=target_frame
             ):
-                history = self._commit(
+                self._commit(
                     context,
                     history,
                     clean_chunk[:, :, local_idx : local_idx + 1],

@@ -226,6 +226,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN": _lazy_bool(
         "SGLANG_DIFFUSION_COSMOS3_LIDAR_USE_NATTEN"
     ),
+    # Cosmos-Dreams: issue the rollout on a higher-priority CUDA stream than the
+    # VAE decode that overlaps it. Opt-in: it pays when the rollout leaves the GPU
+    # idle between kernels, and costs time when the rollout keeps the GPU busy.
+    "SGLANG_DIFFUSION_COSMOS_DREAMS_ROLLOUT_STREAM_PRIORITY": _lazy_bool(
+        "SGLANG_DIFFUSION_COSMOS_DREAMS_ROLLOUT_STREAM_PRIORITY"
+    ),
     # Store the Wan-Animate-2 reference-video K/V cache in FP8 e4m3 with per-(token, head)
     # scales, dequantized one block at a time into the attention buffer.
     "SGLANG_DIFFUSION_WAN_ANIMATE_2_FP8_REFERENCE_KV": _lazy_bool(
