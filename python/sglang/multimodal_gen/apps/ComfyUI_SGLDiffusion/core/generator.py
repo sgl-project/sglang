@@ -31,8 +31,6 @@ class _HeaderTensor:
     """Shape-only stand-in so detect_unet_config does not load 66GB weights."""
 
     def __init__(self, shape):
-        import torch
-
         self.shape = torch.Size(shape)
 
     def numel(self):
@@ -458,8 +456,6 @@ class SGLDiffusionGenerator:
         """Worker summary from ServerArgs and the worker's RequestMetrics."""
         if self.generator is None:
             return "SGLD worker: not started (run the workflow once to load a model)"
-        import torch
-
         import sglang
 
         args = self.generator.server_args
