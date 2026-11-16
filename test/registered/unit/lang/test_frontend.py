@@ -1,5 +1,7 @@
 """Regression tests for the sglang.lang frontend, run against stub backends."""
 
+import contextlib
+import copy
 import json
 import threading
 import unittest
@@ -11,6 +13,7 @@ import httpx
 
 import sglang as sgl
 from sglang.lang.backend import openai as openai_backend
+from sglang.lang.backend.anthropic import Anthropic
 from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
 from sglang.lang.interpreter import StreamExecutor
 from sglang.lang.ir import SglSamplingParams
@@ -193,6 +196,70 @@ class TestOpenAIBackendTokenLimit(CustomTestCase):
 
         self.assertEqual(state["v"], "yes")
         self._assert_only_max_tokens(8)
+
+
+class _FakeAnthropicMessages:
+    """Records what each call was sent and answers "hi"."""
+
+    def __init__(self):
+        self.calls = []
+
+    def _record(self, system, messages):
+        self.calls.append({"system": system, "messages": copy.deepcopy(messages)})
+
+    def create(self, *, model, system, messages, **kwargs):
+        self._record(system, messages)
+        return SimpleNamespace(content=[SimpleNamespace(text="hi")])
+
+    @contextlib.contextmanager
+    def stream(self, *, model, system, messages, **kwargs):
+        self._record(system, messages)
+        yield SimpleNamespace(text_stream=iter(["h", "i"]))
+
+
+class TestAnthropicBackendSystemMessage(CustomTestCase):
+    """The system prompt must stay in the program's chat history, so every turn of
+    a conversation is sent with it and state.messages() still shows it."""
+
+    SYSTEM = {"role": "system", "content": "be brief"}
+
+    def setUp(self):
+        self.backend = Anthropic("claude-test", api_key="test")
+        self.backend.client = SimpleNamespace(messages=_FakeAnthropicMessages())
+        self.calls = self.backend.client.messages.calls
+
+    def test_every_turn_is_sent_with_the_system_prompt(self):
+        @sgl.function
+        def program(s):
+            s += sgl.system(self.SYSTEM["content"])
+            s += sgl.user("q1")
+            s += sgl.assistant(sgl.gen("a1"))
+            s += sgl.user("q2")
+            s += sgl.assistant(sgl.gen("a2"))
+
+        state = program.run(backend=self.backend, use_thread=False)
+
+        self.assertEqual([call["system"] for call in self.calls], ["be brief"] * 2)
+        self.assertEqual(
+            [m["role"] for m in self.calls[1]["messages"]],
+            ["user", "assistant", "user"],
+        )
+        self.assertEqual(state.messages()[0], self.SYSTEM)
+
+    def test_streaming_keeps_the_system_prompt(self):
+        executor = StreamExecutor(
+            self.backend, {}, SglSamplingParams(), None, stream=False, use_thread=False
+        )
+        executor.submit(sgl.system(self.SYSTEM["content"]))
+        executor.submit(sgl.user("q"))
+
+        pieces = self.backend.generate_stream(
+            executor, sampling_params=SglSamplingParams(max_new_tokens=4)
+        )
+
+        self.assertEqual("".join(text for text, _ in pieces), "hi")
+        self.assertEqual(self.calls[0]["system"], "be brief")
+        self.assertEqual(executor.messages()[0], self.SYSTEM)
 
 
 if __name__ == "__main__":
