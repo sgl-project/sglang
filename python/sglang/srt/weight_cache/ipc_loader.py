@@ -169,6 +169,9 @@ class IpcModelLoader(BaseModelLoader):
         # replaced via IPC mapping, these views still point to the old
         # meta storage. We must recreate them from the now-valid tensors.
         self._rebuild_stale_views(model)
+        restore_runtime = getattr(model, "restore_ipc_weight_runtime", None)
+        if restore_runtime is not None:
+            restore_runtime()
 
         # The model now points into the daemon's GPU memory via CUDA IPC. If the
         # daemon dies, those pointers dangle, so watch it and fail loud.

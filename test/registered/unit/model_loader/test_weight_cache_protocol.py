@@ -589,5 +589,38 @@ class TestIpcKVScales(CustomTestCase):
         self.assertEqual((owner.k_scale._version, owner.v_scale._version), versions)
 
 
+class TestMiMoIpcRuntime(CustomTestCase):
+    def test_router_uses_the_attached_bias_and_projection_is_not_refolded(self):
+        from sglang.srt.models.mimo_v2 import MiMoV2ForCausalLM, MiMoV2MoE
+
+        owner_folded_value = 0.5
+        model = MiMoV2ForCausalLM.__new__(MiMoV2ForCausalLM)
+        torch.nn.Module.__init__(model)
+        model.config = SimpleNamespace(attention_value_scale=0.5)
+        model.model = torch.nn.Module()
+        layer = torch.nn.Module()
+        model.model.layers = torch.nn.ModuleList([layer])
+        layer.self_attn = SimpleNamespace(
+            o_proj=SimpleNamespace(weight=torch.full((2, 2), owner_folded_value)),
+            v_scale_folded=False,
+        )
+        layer.mlp = MiMoV2MoE.__new__(MiMoV2MoE)
+        torch.nn.Module.__init__(layer.mlp)
+        layer.mlp._enable_a2a_moe = False
+        bias = torch.nn.Parameter(torch.ones(8))
+        layer.mlp.gate = SimpleNamespace(e_score_correction_bias=bias)
+        layer.mlp.topk = SimpleNamespace(
+            topk_config=SimpleNamespace(correction_bias=torch.empty(8, device="meta"))
+        )
+
+        model.restore_ipc_weight_runtime()
+
+        self.assertIs(layer.mlp.topk.topk_config.correction_bias, bias)
+        self.assertTrue(layer.self_attn.v_scale_folded)
+        torch.testing.assert_close(
+            layer.self_attn.o_proj.weight, torch.full((2, 2), owner_folded_value)
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

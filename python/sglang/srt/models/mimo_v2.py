@@ -1782,7 +1782,9 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
 
         self._fold_attention_value_scale_into_o_proj()
 
-    def _fold_attention_value_scale_into_o_proj(self) -> None:
+    def _fold_attention_value_scale_into_o_proj(
+        self, *, weights_already_folded: bool = False
+    ) -> None:
         """Fold ``attention_value_scale`` into the o_proj weights.
 
         Attention is linear in V: ``softmax(qk) @ (s*V) == s * (softmax(qk) @ V)``,
@@ -1801,11 +1803,14 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
             attn = layer.self_attn
             weight = attn.o_proj.weight
             if weight.dtype in (torch.float16, torch.bfloat16, torch.float32):
-                weight.data.mul_(v_scale)
+                if not weights_already_folded:
+                    weight.data.mul_(v_scale)
                 attn.v_scale_folded = True
                 folded += 1
             else:
                 skipped += 1
+        if weights_already_folded:
+            return
         if folded:
             logger.info(
                 f"Folded attention_value_scale={v_scale} into {folded} o_proj "
@@ -1817,6 +1822,18 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
                 f"{skipped} layer(s) with non-fp16/bf16/fp32 o_proj (cannot "
                 "fold into quantized weights)."
             )
+
+    def restore_ipc_weight_runtime(self) -> None:
+        """Rebind local routing state and use the daemon's prepared projections."""
+        if self.model is None:
+            return
+        self._fold_attention_value_scale_into_o_proj(weights_already_folded=True)
+        for module in self.model.modules():
+            if isinstance(module, MiMoV2MoE):
+                bias = module.gate.e_score_correction_bias
+                module.topk.topk_config.correction_bias = bias
+                if module._enable_a2a_moe:
+                    module.correction_bias = bias.data if bias is not None else None
 
     def get_embed_and_head(self):
         assert self.model is not None and self.lm_head is not None, (
