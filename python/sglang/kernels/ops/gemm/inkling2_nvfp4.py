@@ -1,27 +1,27 @@
 import torch
 import triton
 
-from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.kernels.ops.gemm.inkling2_cute_grouped_nvfp4 import routed_swap_matmul
 from sglang.kernels.ops.moe.inkling2_moe import _sm_count, routed_quant_module
 
-SWAP_AB_MAX_ROWS = 20480
 
-
-@cache_once
-def _matmul_module():
-    return load_jit(
-        "inkling2_nvfp4",
-        cuda_files=["inkling2/nvfp4.cuh"],
-        cuda_wrappers=[
-            ("run_wide_preswizzled", "inkling2_nvfp4::run_wide_preswizzled"),
-            ("wide_x_scales_offset", "inkling2_nvfp4::wide_x_scales_offset"),
-            ("wide_workspace_size", "inkling2_nvfp4::wide_workspace_size"),
-            ("swizzle_weight_scales", "inkling2_nvfp4::swizzle_weight_scales"),
-        ],
-        extra_cuda_cflags=["-DCUTLASS_ENABLE_GDC_FOR_SM100=1"],
-        extra_dependencies=["cutlass"],
+def swizzle_block_scales(scales: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    """Write (experts, n, cols) row-major block scales into out (experts, size) in
+    the Blackwell block-scaled layout: 128-row x 4-column tiles of 512 bytes,
+    padding left untouched."""
+    experts, n, cols = scales.shape
+    r = torch.arange(n, device=scales.device)[:, None]
+    c = torch.arange(cols, device=scales.device)[None, :]
+    index = (
+        ((r // 128) * ((cols + 3) // 4) + c // 4) * 512
+        + (r % 32) * 16
+        + ((r // 32) % 4) * 4
+        + c % 4
     )
+    out.view(torch.uint8)[:, index.flatten()] = scales.reshape(experts, -1).view(
+        torch.uint8
+    )
+    return out
 
 
 def swizzled_scale_size(output_size: int, width: int) -> int:
@@ -46,9 +46,7 @@ def swizzle_weight_scales(scales: torch.Tensor) -> torch.Tensor:
         dtype=scales.dtype,
         device=scales.device,
     )
-    if out.numel():
-        _matmul_module().swizzle_weight_scales(scales, out)
-    return out
+    return swizzle_block_scales(scales, out)
 
 
 def _routed_gemm(device, rows, weight, scales, counts, offsets, schedule, quantize):
@@ -57,35 +55,14 @@ def _routed_gemm(device, rows, weight, scales, counts, offsets, schedule, quanti
     block run per expert. Returns the FP32 accumulator and the per-row amax."""
     experts, output_size, packed_width = weight.shape
     width = packed_width * 2
-    module = _matmul_module()
     sm_count = _sm_count(device)
-    wide = rows > SWAP_AB_MAX_ROWS
-    if wide:
-        workspace = torch.empty(
-            module.wide_workspace_size(experts, rows, output_size, width, sm_count),
-            dtype=torch.uint8,
-            device=device,
-        )
-        x_scales = workspace[
-            module.wide_x_scales_offset(experts, rows, output_size, width) :
-        ]
-    else:
-        scale_rows = (rows + 127 * experts + 127) // 128 * 128
-        x_scales = torch.empty(
-            scale_rows * (width // 16), dtype=torch.uint8, device=device
-        )
+    scale_rows = (rows + 127 * experts + 127) // 128 * 128
+    x_scales = torch.empty(scale_rows * (width // 16), dtype=torch.uint8, device=device)
     values = torch.empty((rows, packed_width), dtype=torch.uint8, device=device)
     amax = torch.empty(rows, dtype=torch.float32, device=device)
     quantize(routed_quant_module(width), values, x_scales, amax, sm_count)
     out = torch.empty((rows, output_size), dtype=torch.float32, device=device)
-    if wide:
-        module.run_wide_preswizzled(
-            values, weight, scales, counts, offsets, out, workspace, sm_count
-        )
-    else:
-        routed_swap_matmul(
-            values, x_scales, weight, scales, counts, offsets, schedule, out
-        )
+    routed_swap_matmul(values, x_scales, weight, scales, counts, offsets, schedule, out)
     return out, amax
 
 
