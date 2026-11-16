@@ -14,7 +14,7 @@ MAX_FLY_ENTROPY_TOP_K = 16
 
 class FlyConfig(msgspec.Struct, frozen=True):
     window_size: int
-    entropy_threshold: float = 0.3
+    entropy_threshold: float = 0.5
     entropy_top_k: int = 3
 
 
@@ -26,13 +26,13 @@ def resolve_fly_config(
     entropy_top_k: int,
 ) -> FlyConfig:
     """Validate the FLy settings for ``gamma`` draft tokens per verify; an unset
-    window defaults to ``min(6, gamma - 1)`` as in vLLM."""
+    window defaults to ``min(2, gamma - 1)``."""
     if not 2 <= gamma <= MAX_FLY_GAMMA:
         raise ValueError(
             f"FLy requires 2 to {MAX_FLY_GAMMA} draft tokens per verify, "
             f"got gamma={gamma}."
         )
-    window = min(6, gamma - 1) if window_size is None else int(window_size)
+    window = min(2, gamma - 1) if window_size is None else int(window_size)
     if not 1 <= window < gamma:
         raise ValueError(
             f"FLy window size must be in [1, gamma - 1] = [1, {gamma - 1}], "

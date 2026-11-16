@@ -3,8 +3,8 @@
 FLy (--speculative-use-fly, entropy-gated deferred verification) is a lossy DSpark
 accept that only runs on ROCm. This test launches the setup of
 test_deepseek_v41_flash_eval_mi35x.py (TP4 + EP4, DSpark block size 5) with FLy at
-window 2 and entropy threshold 0.3, the setting vLLM evaluated FLy with on DSpark,
-checks that the server reports FLy on, and that GSM8K accuracy holds.
+its defaults (window 2 and entropy threshold 0.5 at this block size), checks that
+the server resolves them and reports FLy on, and that GSM8K accuracy holds.
 
 The eval is sgl-eval's gsm8k (zero-shot chat, \\boxed{} extraction, math_verify
 grading) on all 1319 questions through run_sgl_eval, at temperature 1.0 and top_p
@@ -42,9 +42,9 @@ DEEPSEEK_V41_FLASH_MODEL_PATH = os.environ.get(
 SERVER_LAUNCH_TIMEOUT = 5400
 TP_SIZE = 4
 FLY_WINDOW_SIZE = 2
-FLY_ENTROPY_THRESHOLD = 0.3
-# Measured 0.9659 on all 1319 questions with this setup on MI35x (accept length
-# 4.51). The threshold sits about 0.05 under that, this repo's convention for
+FLY_ENTROPY_THRESHOLD = 0.5
+# Measured 0.9682 on all 1319 questions with this setup on MI35x (accept length
+# 4.45). The threshold sits about 0.05 under that, this repo's convention for
 # sgl-eval gsm8k.
 ACCURACY_THRESHOLD = 0.91
 
@@ -65,10 +65,6 @@ class TestDeepseekV41FlashFlyEvalMI35x(CustomTestCase):
             "--speculative-dspark-block-size",
             "5",
             "--speculative-use-fly",
-            "--speculative-fly-window-size",
-            str(FLY_WINDOW_SIZE),
-            "--speculative-fly-entropy-threshold",
-            str(FLY_ENTROPY_THRESHOLD),
             "--cuda-graph-max-bs-decode",
             "256",
             "--max-running-requests",
@@ -101,6 +97,9 @@ class TestDeepseekV41FlashFlyEvalMI35x(CustomTestCase):
             info = requests.get(base_url + "/server_info", timeout=60).json()
             self.assertTrue(info["speculative_use_fly"])
             self.assertEqual(info["speculative_fly_window_size"], FLY_WINDOW_SIZE)
+            self.assertEqual(
+                info["speculative_fly_entropy_threshold"], FLY_ENTROPY_THRESHOLD
+            )
 
             requests.get(base_url + "/flush_cache", timeout=60)
             metrics = run_sgl_eval(

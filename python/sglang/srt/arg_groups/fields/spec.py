@@ -137,13 +137,13 @@ class Spec(msgspec.Struct):
         Optional[int],
         "FLy only. Number of following drafts that must pass native verification "
         "before a rejected draft is accepted; in [1, gamma - 1]. Defaults to "
-        "min(6, gamma - 1).",
+        "min(2, gamma - 1).",
     ] = None
     speculative_fly_entropy_threshold: A[
         float,
         "FLy only. Minimum target top-k entropy, normalized to [0, 1], at a rejected "
         "position for FLy to accept it.",
-    ] = 0.3
+    ] = 0.5
     speculative_fly_entropy_top_k: A[
         int,
         "FLy only. Number of largest target probabilities in the entropy gate, "
