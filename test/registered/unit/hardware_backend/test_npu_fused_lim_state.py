@@ -365,7 +365,7 @@ class TestLIMState(CustomTestCase):
             ),
         ):
             manager = fused_manager.FusedSparseKVCacheManager(
-                req_pool, None, 2048, paged_kv_cache=pool
+                req_pool, 2048, paged_kv_cache=pool
             )
         self.assertIs(manager.budget, plan)
         plan.validate_buffers(manager, plan.manager_buffers)

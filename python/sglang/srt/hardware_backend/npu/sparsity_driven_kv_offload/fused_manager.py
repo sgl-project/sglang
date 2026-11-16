@@ -12,16 +12,13 @@ from sglang.kernels.ops.attention.npu_copy_sfa import (
     fused_scatter_copy_sparse_flash_attention,
     load_copy_sfa_operator,
 )
-from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.prefill_kv_plan import (
     make_fused_prefill_plan,
     prepare_prefill_gather_rows,
 )
-from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool, ReqToTokenPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
     from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.memfabric_pool import (
@@ -34,47 +31,29 @@ logger = logging.getLogger(__name__)
 
 
 class FusedSparseKVCacheManager:
-    host_pool: Optional[MemFabricKVPool] = None
+    host_pool: MemFabricKVPool
 
     def __init__(
         self,
         req_to_token_pool: ReqToTokenPool,
-        token_to_kv_pool_allocator: BaseTokenToKVPoolAllocator,
         sparse_topk: int,
-        paged_kv_cache: Optional[MLATokenToKVPool] = None,
-        budget_plan=None,
+        *,
+        paged_kv_cache: MLATokenToKVPool,
     ) -> None:
-        enable_memory_saver = False
-        memory_saver_adapter = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
-        )
-
         self.actual_request_rows = int(req_to_token_pool.req_to_token.shape[0])
         self.logical_max_context_len = int(req_to_token_pool.req_to_token.shape[1])
         self.req_to_token_pool = req_to_token_pool
         self.sparse_topk = int(sparse_topk)
         self.device = req_to_token_pool.device
-        # EAGLE shares the target allocator's token IDs while owning a
-        # separate draft KV pool. The allocator's pool is not the draft pool.
-        if paged_kv_cache is None:
-            paged_kv_cache = token_to_kv_pool_allocator.get_kvcache()
         self.paged_kv_cache = paged_kv_cache
         self.start_layer = paged_kv_cache.start_layer
         # MLA params
         self.head_num = 1
         self.kv_lora_rank = self.paged_kv_cache.kv_lora_rank
         self.qk_rope_head_dim = self.paged_kv_cache.qk_rope_head_dim
-        # kv_cache_dim = kv_lora_rank + qk_rope_head_dim
-        self.head_dim = (
-            self.paged_kv_cache.kv_lora_rank + self.paged_kv_cache.qk_rope_head_dim
-        )
         self.store_dtype = self.paged_kv_cache.store_dtype
         self.layer_num = self.paged_kv_cache.layer_num
-        self.budget = budget_plan or getattr(
-            paged_kv_cache, "sparse_kv_budget_plan", None
-        )
-        if self.budget is None:
-            raise ValueError("Native KV pool has no sparse KV budget plan.")
+        self.budget = paged_kv_cache.sparse_kv_budget_plan
         self.size = self.budget.request_rows
         self.batch_capacity = self.budget.batch_capacity
         self.max_context_len = self.budget.context_len
@@ -99,23 +78,19 @@ class FusedSparseKVCacheManager:
 
         # Allocate exactly the persistent shapes reserved by the plan.
         try:
-            with memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
-                for name, spec in self.budget.manager_buffers.items():
-                    fill_value = (
-                        -1
-                        if name in ("device_slot_map", "resident_begin", "resident_end")
-                        else None
-                    )
-                    value = (
-                        [
-                            spec.allocate(self.device, fill_value)
-                            for _ in range(spec.count)
-                        ]
-                        if name
-                        in ("device_kv_buffer", "device_rope_buffer", "device_slot_map")
-                        else spec.allocate(self.device, fill_value)
-                    )
-                    setattr(self, name, value)
+            for name, spec in self.budget.manager_buffers.items():
+                fill_value = (
+                    -1
+                    if name in ("device_slot_map", "resident_begin", "resident_end")
+                    else None
+                )
+                value = (
+                    [spec.allocate(self.device, fill_value) for _ in range(spec.count)]
+                    if name
+                    in ("device_kv_buffer", "device_rope_buffer", "device_slot_map")
+                    else spec.allocate(self.device, fill_value)
+                )
+                setattr(self, name, value)
         except Exception as e:
             self._raise_buffer_allocation_error(name, e)
 
@@ -146,23 +121,6 @@ class FusedSparseKVCacheManager:
             tuple(self.host_v_buffer[0].shape),
             type(self.host_pool).__name__,
         )
-        for component, width in zip(
-            self.host_pool.buffers, (self.kv_lora_rank, self.qk_rope_head_dim)
-        ):
-            if len(component) != self.layer_num or any(
-                t.ndim != 4
-                or t.shape[0] * t.shape[1] != self.host_token_capacity
-                or tuple(t.shape[2:]) != (self.head_num, width)
-                or t.dtype != self.store_dtype
-                or not t.is_contiguous()
-                for t in component
-            ):
-                raise ValueError("Sparse split host KV does not match its budget.")
-        if (
-            sum(t.nbytes for component in self.host_pool.buffers for t in component)
-            != self.budget.host_kv_bytes
-        ):
-            raise ValueError("Sparse split host KV bytes do not match its budget.")
         # Log allocation metadata once, before any graph capture or forward.
         logger.info(
             "Sparse split C allocation: capacity=%d layers=%d bytes=%d "
@@ -176,8 +134,6 @@ class FusedSparseKVCacheManager:
         for layer_idx in range(self.layer_num):
             ckv = self.device_kv_buffer[layer_idx]
             rope = self.device_rope_buffer[layer_idx]
-            if ckv.untyped_storage().data_ptr() == rope.untyped_storage().data_ptr():
-                raise ValueError("Split HBM components must have independent storage.")
             host_ckv = self.host_k_buffer[layer_idx]
             host_rope = self.host_v_buffer[layer_idx]
             logger.debug(
@@ -202,8 +158,7 @@ class FusedSparseKVCacheManager:
                 ckv.nbytes + rope.nbytes,
             )
         logger.info(
-            "Sparse split HBM verified: start_layer=%d layers=%d C=%d "
-            "CKV=%d RoPE=%d independent_storage=True",
+            "Sparse split HBM layout: start_layer=%d layers=%d C=%d CKV=%d RoPE=%d",
             self.start_layer,
             self.layer_num,
             self.device_cache_size,

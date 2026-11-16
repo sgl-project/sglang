@@ -177,7 +177,6 @@ def test_real_manager_mtp_owner_share_lifecycle(graph, heads, query_width, capac
             )
             manager = FusedSparseKVCacheManager(
                 pool,
-                SimpleNamespace(get_kvcache=lambda: index_pool),
                 K,
                 paged_kv_cache=index_pool,
             )

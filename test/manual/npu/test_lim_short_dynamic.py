@@ -104,7 +104,6 @@ def test_prefill_attention_and_short_residency():
         try:
             manager = FusedSparseKVCacheManager(
                 pool,
-                SimpleNamespace(get_kvcache=lambda: index_pool),
                 2048,
                 paged_kv_cache=index_pool,
             )
@@ -260,7 +259,6 @@ def test_short_sparse_graph_lifecycle(
         try:
             manager = FusedSparseKVCacheManager(
                 pool,
-                SimpleNamespace(get_kvcache=lambda: index_pool),
                 2048,
                 paged_kv_cache=index_pool,
             )

@@ -426,7 +426,6 @@ class AscendAttnBackend(AttentionBackend):
 
                     self.sparse_kv_manager = FusedSparseKVCacheManager(
                         model_runner.req_to_token_pool,
-                        model_runner.token_to_kv_pool_allocator,
                         sparse_topk,
                         paged_kv_cache=self.token_to_kv_pool,
                     )
