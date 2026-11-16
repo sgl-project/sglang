@@ -24,7 +24,12 @@ from sglang.test.nightly_utils import NightlyBenchmarkRunner
 from sglang.test.test_utils import DEFAULT_URL_FOR_TEST, _parse_int_list_env
 
 # Register for AMD CI - Kimi K2.6 perf benchmark (~90 min)
-register_amd_ci(est_time=5400, suite="nightly-perf-8-gpu-kimi-k26", nightly=True)
+register_amd_ci(
+    est_time=5400,
+    suite="nightly-perf-8-gpu-kimi-k26",
+    nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
+)
 
 
 def generate_simple_markdown_report(results: List[BenchmarkResult]) -> str:

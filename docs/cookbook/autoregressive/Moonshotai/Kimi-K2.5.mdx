@@ -571,7 +571,7 @@ sglang serve \
 - **Benchmark Command:**
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model moonshotai/Kimi-K2.5 \
   --dataset-name random \
@@ -627,7 +627,7 @@ Max ITL (ms):                            29.38
 - Medium Concurrency (Balanced)
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model moonshotai/Kimi-K2.5 \
   --dataset-name random \
@@ -681,7 +681,7 @@ Max ITL (ms):                            655.61
 - High Concurrency (Throughput-Optimized)
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model moonshotai/Kimi-K2.5 \
   --dataset-name random \
@@ -739,7 +739,7 @@ Max ITL (ms):                            3118.59
 - Low Concurrency
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model moonshotai/Kimi-K2.5 \
   --dataset-name random \
@@ -793,7 +793,7 @@ Max ITL (ms):                            45.22
 - Medium Concurrency
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model moonshotai/Kimi-K2.5 \
   --dataset-name random \
@@ -847,7 +847,7 @@ Max ITL (ms):                            272.05
 - High Concurrency
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model moonshotai/Kimi-K2.5 \
   --dataset-name random \
@@ -867,7 +867,7 @@ Waiting for completion...
 - Low Concurrency
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model moonshotai/Kimi-K2.5 \
   --dataset-name random \
@@ -921,7 +921,7 @@ Max ITL (ms):                            62.70
 - Medium Concurrency
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model moonshotai/Kimi-K2.5 \
   --dataset-name random \
@@ -975,7 +975,7 @@ Max ITL (ms):                            6540.24
 - High Concurrency
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model moonshotai/Kimi-K2.5 \
   --dataset-name random \
@@ -1049,7 +1049,7 @@ sglang serve \
 - **Benchmark Command:**
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model moonshotai/Kimi-K2.5 \
   --dataset-name random \
@@ -1069,7 +1069,7 @@ Pending update...
 - Medium Concurrency (Balanced)
 
 ```bash Command
-python -m sglang.bench_serving \
+python -m sglang.benchmark.serving \
   --backend sglang \
   --model moonshotai/Kimi-K2.5 \
   --dataset-name random \
@@ -1087,7 +1087,7 @@ Pending update...
 - High Concurrency (Throughput-Optimized)
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model moonshotai/Kimi-K2.5 \
   --dataset-name random \
@@ -1138,7 +1138,7 @@ sglang serve \
 - **Benchmark Command:**
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model moonshotai/Kimi-K2.5 \
   --dataset-name random \
@@ -1194,7 +1194,7 @@ Max ITL (ms):                            36.92
 - Medium Concurrency (Balanced)
 
 ```bash Command
-python3 -m sglang.bench_serving \
+python3 -m sglang.benchmark.serving \
   --backend sglang \
   --model moonshotai/Kimi-K2.5 \
   --dataset-name random \

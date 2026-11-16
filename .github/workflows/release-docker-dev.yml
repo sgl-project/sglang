@@ -141,7 +141,6 @@ jobs:
     if: ${{ !inputs.build_only }}
     uses: ./.github/workflows/_docker-build-and-publish.yml
     with:
-      docker_target: framework_final
       checkout_ref: ${{ needs.prepare.outputs.checkout_ref }}
       extra_build_args: ${{ needs.prepare.outputs.extra_build_args }}
       tag_config: ${{ needs.prepare.outputs.tag_config }}

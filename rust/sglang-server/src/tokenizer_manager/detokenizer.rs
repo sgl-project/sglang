@@ -35,11 +35,6 @@ use crate::utils::{
     fsm::{Event, RequestState},
 };
 
-/// Default for `skip_special_tokens` (SGLang's SamplingParams default). The
-/// per-request value isn't available on the response yet; see the note in
-/// `DetokenizerBackend::new_decoder`.
-const SKIP_SPECIAL_TOKENS: bool = true;
-
 /// Per-request incremental decoder. `step` feeds the new token ids for one chunk
 /// and returns the newly decoded text delta (empty if the ids only produced a
 /// partial/incomplete multi-byte sequence that needs more tokens). `finish` marks
@@ -50,7 +45,7 @@ pub trait StreamDecoder: Send {
 
 /// Real decoder wrapping a dynamo-tokenizers `DecodeStream`.
 struct DynamoDecoder {
-    stream: dynamo_tokenizers::DecodeStream,
+    stream: sglang_processor::dynamo_tokenizers::DecodeStream,
 }
 
 impl StreamDecoder for DynamoDecoder {
@@ -81,7 +76,7 @@ impl StreamDecoder for DynamoDecoder {
 /// on each `Register`.
 #[derive(Clone)]
 pub enum DetokenizerBackend {
-    Dynamo(dynamo_tokenizers::Tokenizer),
+    Dynamo(sglang_processor::dynamo_tokenizers::Tokenizer),
     /// No decoding at all — the shard emits each chunk's raw output token ids as
     /// `output_ids` (no `DecodeStream`, no accumulation). Used for
     /// `skip_tokenizer_init` and when no tokenizer is configured.
@@ -91,14 +86,14 @@ pub enum DetokenizerBackend {
 impl DetokenizerBackend {
     /// Mint a per-request decoder, or `None` in skip mode (the shard passes the
     /// token ids through untouched instead of decoding text).
-    fn new_decoder(&self) -> Option<Box<dyn StreamDecoder>> {
+    fn new_decoder(&self, skip_special_tokens: bool) -> Option<Box<dyn StreamDecoder>> {
         match self {
             // NOTE: the stream is seeded with an empty prompt context, which is
             // correct for the common case. Seeding with the prompt's trailing
             // tokens (for perfect first-token spacing) would require Register to
             // carry input_ids — deferred.
             DetokenizerBackend::Dynamo(t) => Some(Box::new(DynamoDecoder {
-                stream: t.decode_stream(&[], SKIP_SPECIAL_TOKENS),
+                stream: t.decode_stream(&[], skip_special_tokens),
             })),
             DetokenizerBackend::Skip => None,
         }
@@ -201,6 +196,7 @@ impl Runnable for DetokenizerWorker {
                     sink,
                     decode_logprob_text,
                     no_stop_trim,
+                    skip_special_tokens,
                 } => {
                     table.insert(
                         rid.clone(),
@@ -208,7 +204,7 @@ impl Runnable for DetokenizerWorker {
                             sink,
                             decode_logprob_text,
                             no_stop_trim,
-                            decoder: self.backend.new_decoder(),
+                            decoder: self.backend.new_decoder(skip_special_tokens),
                             // Registered == handed to the scheduler == Queued.
                             fsm: RequestState::Queued,
                         },
@@ -682,6 +678,76 @@ mod tests {
                 assert_eq!(output.stop_token_trimmed, !no_stop_trim);
             }
         }
+    }
+
+    /// Each request decodes with its own `skip_special_tokens`, across chunk
+    /// boundaries, and a matched stop token is still trimmed from the text when
+    /// special tokens are kept (Python decodes `decode_ids` less the matched
+    /// stop with the request's flag). Three co-located requests stream the
+    /// same ids, `<eot>` (3) being special and the matched stop.
+    #[test]
+    fn special_tokens_follow_each_requests_flag_while_streaming() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/testdata/special_token_tokenizer.json"
+        );
+        let backend = DetokenizerBackend::Dynamo(
+            sglang_processor::dynamo_tokenizers::Tokenizer::from_file(path).unwrap(),
+        );
+        let (tm_tx, _tm_rx) = flume::unbounded::<AbortSource>();
+        let mut table = HashMap::new();
+        let mut sinks = Vec::new();
+        // (rid, skip_special_tokens, no_stop_trim, expected text deltas)
+        let cases = [
+            ("keep", false, false, ["a", "<eot>b", "c"]),
+            ("skip", true, false, ["a", "b", "c"]),
+            ("keep-stop", false, true, ["a", "<eot>b", "c<eot>"]),
+        ];
+        for (rid, skip_special_tokens, no_stop_trim, _) in cases {
+            let (tx, rx) = mpsc::channel::<ResponseItem>(4);
+            table.insert(
+                Rid::from(rid),
+                DetokState {
+                    sink: ResponseSink::Local(tx),
+                    decode_logprob_text: false,
+                    no_stop_trim,
+                    decoder: backend.new_decoder(skip_special_tokens),
+                    fsm: RequestState::Queued,
+                },
+            );
+            sinks.push(rx);
+        }
+
+        let stop = serde_json::json!({ "type": "stop", "matched": 3 });
+        let chunks: [(TokenIds, Option<serde_json::Value>); 3] = [
+            (vec![0], None),
+            (vec![3, 1], None),
+            (vec![2, 3], Some(stop)),
+        ];
+        for (ids, finish_reason) in chunks {
+            for (rid, ..) in cases {
+                let ev = ChunkEvent {
+                    rid: Rid::from(rid),
+                    token_ids: ids.clone(),
+                    finish_reason: finish_reason
+                        .clone()
+                        .map(|fr| serde_json::from_value(fr).unwrap()),
+                    ..Default::default()
+                };
+                handle_chunk(&mut table, ev, &backend, &tm_tx);
+            }
+        }
+
+        for ((rid, _, _, expected), rx) in cases.iter().zip(&mut sinks) {
+            let deltas: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok())
+                .map(|item| match item {
+                    ResponseItem::Frame(ev) | ResponseItem::Done(ev) => ev.text,
+                    other => panic!("{rid}: expected a text frame, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(deltas, expected, "{rid}");
+        }
+        assert!(table.is_empty(), "every request finished");
     }
 
     /// A non-stop finish (`length`, no `matched`) never trims.

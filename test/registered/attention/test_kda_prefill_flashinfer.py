@@ -41,7 +41,7 @@ from sglang.srt.layers.attention.linear.utils import (  # noqa: E402
 from sglang.srt.layers.attention.mamba.prefill_track_metadata import (  # noqa: E402
     build_prefill_track_plan,
 )
-from sglang.srt.model_executor.forward_batch_info import ForwardMode  # noqa: E402
+from sglang.srt.model_executor.forward_mode import ForwardMode  # noqa: E402
 from sglang.srt.runtime_context import get_parallel  # noqa: E402
 from sglang.test.kits.attention_unittest.attention_methods.kda_attention import (  # noqa: E402
     KDAAttentionCase,
@@ -224,7 +224,7 @@ def test_kda_backend_prefill_dispatch_and_tracked_state(extend_lens):
         batch.mamba_prefill_track_mask_cpu = tracked
         batch.mamba_track_seqlens_cpu = list(extend_lens)
         fixture.actual_module.attn.lower_bound = -5.0
-        cache = fixture.runner.req_to_token_pool.mamba2_layer_cache(0)
+        cache = fixture.runner.req_to_token_pool.mamba_pool.mamba2_layer_cache(0)
         initial_conv, initial_ssm = cache.conv[0].clone(), cache.temporal.clone()
 
         triton_output = run_kda_fixture_eager(fixture)

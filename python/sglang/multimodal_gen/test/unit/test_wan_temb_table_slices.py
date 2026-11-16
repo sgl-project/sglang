@@ -146,7 +146,10 @@ class TestWanStepHostOverhead(unittest.TestCase):
     @torch.no_grad()
     def test_blocks_receive_fp32_modulation(self):
         forward_batch = SimpleNamespace(
-            enable_sequence_shard=False, enable_teacache=False, enable_spectrum=False
+            enable_sequence_shard=False,
+            enable_teacache=False,
+            enable_spectrum=False,
+            extra={},
         )
         with (
             tiny_dit_runtime(torch.bfloat16),
