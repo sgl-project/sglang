@@ -1498,6 +1498,99 @@ mod tests {
         }
     }
 
+    /// A unary P/D prefill request the scheduler admitted is aborted when its
+    /// client's connection closes before any response byte: the server drops
+    /// the handler, and the generation's guard tells the scheduler. A router
+    /// whose prefill connection is lost before headers needs no abort of its own.
+    #[tokio::test]
+    async fn closed_connection_aborts_admitted_unary_prefill() {
+        use crate::tokenizer_manager::wiring::AbortSource;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (intake_tx, intake_rx) = flume::unbounded();
+        let (abort_tx, abort_rx) = flume::unbounded();
+        let core = crate::api_server::handlers::CoreHandle::new(
+            intake_tx,
+            abort_tx,
+            crate::api_server::handlers::CoreConfig {
+                response_capacity: 8,
+                response_activity: Default::default(),
+                startup_ready: true,
+                is_disaggregation: true,
+                mm_limits: Default::default(),
+                multimodal: false,
+                peer_endpoints: Vec::new(),
+                metadata: crate::api_server::handlers::CoreMetadata::default(),
+                metrics: None,
+                request_log: None,
+                generate_validator: None,
+                abort_hook: None,
+            },
+        );
+        let state = Arc::new(AppState {
+            core,
+            server_args: Arc::new(crate::message::config::ServerArgs::default()),
+            generation_policy: GenerationPolicy::default(),
+            chat_formatter: None,
+            generate_hook: None,
+            openai_chat: None,
+        });
+        // Served like the API listener: axum over hyper's default HTTP/1 settings.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(
+                listener,
+                routes()
+                    .with_state(state)
+                    .into_make_service_with_connect_info::<std::net::SocketAddr>(),
+            )
+            .await
+            .unwrap()
+        });
+
+        let body = serde_json::to_vec(&serde_json::json!({
+            "rid": "prefill-rid",
+            "input_ids": [1, 2],
+            "sampling_params": {"max_new_tokens": 1},
+            "bootstrap_host": "127.0.0.1",
+            "bootstrap_port": 8998,
+            "bootstrap_room": 7,
+        }))
+        .unwrap();
+        let mut socket = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let head = format!(
+            "POST /generate HTTP/1.1\r\nhost: {addr}\r\ncontent-type: application/json\r\n\
+             content-length: {}\r\n\r\n",
+            body.len()
+        );
+        socket.write_all(head.as_bytes()).await.unwrap();
+        socket.write_all(&body).await.unwrap();
+
+        let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
+            panic!("HTTP generation must enter through core intake");
+        };
+        assert!(admission.try_accept());
+        let mut byte = [0u8; 1];
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), socket.read(&mut byte))
+                .await
+                .is_err(),
+            "no response byte while the request is admitted"
+        );
+        drop(socket);
+
+        let aborted = tokio::time::timeout(Duration::from_secs(5), abort_rx.recv_async())
+            .await
+            .expect("the closed connection must abort the admitted request")
+            .unwrap();
+        assert!(
+            matches!(&aborted, AbortSource::Guard(rid) if *rid == request.rid),
+            "{aborted:?}"
+        );
+        assert!(abort_rx.try_recv().is_err());
+    }
+
     /// Each item `body` submits under `server_args`: its `max_new_tokens`, and
     /// whether that value is marked defaulted.
     async fn submitted_max_new_tokens(
