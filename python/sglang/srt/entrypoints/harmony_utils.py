@@ -368,11 +368,15 @@ def recover_harmony_header(parser: StreamableParser) -> StreamableParser | None:
         return None
     if parts[-1] not in ("code", "json"):
         return None
-    if any(
-        part not in ("analysis", "commentary", "final", recipients[0])
-        and re.fullmatch(r"to=[A-Za-z0-9_.-]+", part) is None
-        for part in parts[:-1]
-    ):
+    allowed_metadata = (
+        "analysis",
+        "commentary",
+        "final",
+        recipients[0],
+        f"to={recipients[0]}",
+        "to=assistant",
+    )
+    if any(part not in allowed_metadata for part in parts[:-1]):
         return None
     corrected = (
         prefix

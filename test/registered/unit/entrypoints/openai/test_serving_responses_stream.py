@@ -861,9 +861,8 @@ class HarmonyStreamLifecycleTestCase(CustomTestCase):
 
                 async def collect():
                     stream = await serving.create_responses(request)
-                    self.assertNotIsInstance(
-                        stream, ORJSONResponse, getattr(stream, "body", None)
-                    )
+                    if isinstance(stream, ORJSONResponse):
+                        self.fail(stream.body.decode())
                     return await collect_stream_events(stream)
 
                 events = asyncio.run(collect())

@@ -1853,9 +1853,9 @@ class HarmonyHeaderRecoveryTestCase(CustomTestCase):
                     + encoding.encode("<|call|>", allowed_special="all")
                 )
                 response = self._response_from_tokens(tokens)
-                self.assertIsInstance(
-                    response, ResponsesResponse, getattr(response, "body", None)
-                )
+                if isinstance(response, ORJSONResponse):
+                    self.fail(response.body.decode())
+                self.assertIsInstance(response, ResponsesResponse)
                 self.assertEqual(
                     [item.type for item in response.output],
                     ["reasoning", "function_call"],
@@ -1905,6 +1905,15 @@ class HarmonyHeaderRecoveryTestCase(CustomTestCase):
                 "echo",
                 True,
             ),
+            (
+                "conflicting_recipient",
+                header + "functions.echo <|constrain|>commentary "
+                "to=functions.delete_all json<|message|>",
+                '{"x":1}',
+                "<|call|>",
+                "echo",
+                True,
+            ),
         )
         for name, prefix, body, ending, declared_tool, expect_error in cases:
             with self.subTest(name=name):
@@ -1918,9 +1927,9 @@ class HarmonyHeaderRecoveryTestCase(CustomTestCase):
                     self.assertIsInstance(response, ORJSONResponse)
                     self.assertEqual(response.status_code, 400)
                 else:
-                    self.assertIsInstance(
-                        response, ResponsesResponse, getattr(response, "body", None)
-                    )
+                    if isinstance(response, ORJSONResponse):
+                        self.fail(response.body.decode())
+                    self.assertIsInstance(response, ResponsesResponse)
                     self.assertEqual(response.output, [])
 
     def test_terminal_partial_content_is_not_finalized(self):
