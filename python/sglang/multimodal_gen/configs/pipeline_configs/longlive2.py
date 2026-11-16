@@ -26,6 +26,7 @@ class LongLive2T2VConfig(Wan2_2_TI2V_5B_Config):
     dmd_denoising_steps: list[int] | None = field(
         default_factory=lambda: [1000, 750, 500, 250]
     )
+    expand_timesteps: bool = False
 
     dit_config: DiTConfig = field(default_factory=LongLive2VideoConfig)
 
