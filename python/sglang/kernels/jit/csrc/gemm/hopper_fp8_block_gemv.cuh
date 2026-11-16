@@ -299,23 +299,40 @@ struct HopperFp8BlockGemvKernel {
     auto K = SymbolicSize{"K"};
     auto KB = SymbolicSize{"K/128"};
     auto NB = SymbolicSize{"ceil(N/128)"};
-    TensorMatcher({M, K}).with_dtype<fp8_e4m3_t>().with_device(device).verify(xq);
-    TensorMatcher({M, KB}).with_dtype<fp32_t>().with_device(device).verify(xs);
-    TensorMatcher({N, K}).with_dtype<fp8_e4m3_t>().with_device(device).verify(wq);
-    TensorMatcher({NB, KB}).with_dtype<fp32_t>().with_device(device).verify(ws);
-    TensorMatcher({M, N}).with_dtype<bf16_t>().with_device(device).verify(out);
+    TensorMatcher({M, K})  //
+        .with_dtype<fp8_e4m3_t>()
+        .with_device(device)
+        .ensure_alignment(16)
+        .verify(xq);
+    TensorMatcher({M, KB})  //
+        .with_dtype<fp32_t>()
+        .with_device(device)
+        .verify(xs);
+    TensorMatcher({N, K})  //
+        .with_dtype<fp8_e4m3_t>()
+        .with_device(device)
+        .ensure_alignment(16)
+        .verify(wq);
+    TensorMatcher({NB, KB})  //
+        .with_dtype<fp32_t>()
+        .with_device(device)
+        .verify(ws);
+    TensorMatcher({M, N})  //
+        .with_dtype<bf16_t>()
+        .with_device(device)
+        .verify(out);
 
     const auto m = static_cast<uint32_t>(M.unwrap());
     const auto n = static_cast<uint32_t>(N.unwrap());
     const auto k = static_cast<uint32_t>(K.unwrap());
-    RuntimeCheck(m >= 1 && m <= kMaxM, "M must be in [1, kMaxM]");
-    RuntimeCheck(k % kFp8BlockK == 0, "K must be a multiple of 128");
+    CHECK_HOST(m >= 1 && m <= kMaxM) << "M must be in [1, " << kMaxM << "], got " << m;
+    CHECK_HOST(k % kFp8BlockK == 0) << "K must be a multiple of 128, got " << k;
     const uint32_t nkb = k / kFp8BlockK;
-    RuntimeCheck(nkb % (kKSplit * kUnroll) == 0, "K/128 must be a multiple of kKSplit * kUnroll");
-    RuntimeCheck(static_cast<uint32_t>(KB.unwrap()) == nkb, "activation scale must have K/128 groups");
-    RuntimeCheck(
-        static_cast<uint32_t>(NB.unwrap()) == (n + kFp8BlockK - 1) / kFp8BlockK,
-        "weight scale must have ceil(N/128) rows");
+    CHECK_HOST(nkb % (kKSplit * kUnroll) == 0)
+        << "K/128 must be a multiple of " << kKSplit * kUnroll << ", got " << nkb;
+    CHECK_HOST(static_cast<uint32_t>(KB.unwrap()) == nkb) << "activation scale must have K/128 groups";
+    CHECK_HOST(static_cast<uint32_t>(NB.unwrap()) == (n + kFp8BlockK - 1) / kFp8BlockK)
+        << "weight scale must have ceil(N/128) rows";
 
     const bf16_t* x_ptr = nullptr;
     const bf16_t* side_w_ptr = nullptr;
@@ -323,11 +340,22 @@ struct HopperFp8BlockGemvKernel {
     uint32_t side_n = 0;
     if (side_w != nullptr) {
       auto S = SymbolicSize{"S"};
-      TensorMatcher({M, K}).with_dtype<bf16_t>().with_device(device).verify(*x);
-      TensorMatcher({S, K}).with_dtype<bf16_t>().with_device(device).verify(*side_w);
-      TensorMatcher({M, S}).with_dtype<bf16_t>().with_device(device).verify(*side_out);
+      TensorMatcher({M, K})  //
+          .with_dtype<bf16_t>()
+          .with_device(device)
+          .ensure_alignment(16)
+          .verify(*x);
+      TensorMatcher({S, K})  //
+          .with_dtype<bf16_t>()
+          .with_device(device)
+          .ensure_alignment(16)
+          .verify(*side_w);
+      TensorMatcher({M, S})  //
+          .with_dtype<bf16_t>()
+          .with_device(device)
+          .verify(*side_out);
       side_n = static_cast<uint32_t>(S.unwrap());
-      RuntimeCheck(side_n >= 1 && side_n <= kMaxSideN, "side projection is at most kMaxSideN columns");
+      CHECK_HOST(side_n >= 1 && side_n <= kMaxSideN) << "side projection is at most " << kMaxSideN << " columns";
       x_ptr = static_cast<const bf16_t*>(x->data_ptr());
       side_w_ptr = static_cast<const bf16_t*>(side_w->data_ptr());
       side_out_ptr = static_cast<bf16_t*>(side_out->data_ptr());
@@ -338,10 +366,8 @@ struct HopperFp8BlockGemvKernel {
     auto* kernel = hopper_fp8_block_gemv_kernel<kMaxM, kRowTiles, kKSplit, kUnroll>;
     static size_t s_smem_opt_in = 48 * 1024;
     if (smem_bytes > s_smem_opt_in) {
-      RuntimeCheck(
-          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)) ==
-              cudaSuccess,
-          "cudaFuncSetAttribute(MaxDynamicSharedMemorySize) failed");
+      CHECK_CUDA(
+          cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes)));
       s_smem_opt_in = smem_bytes;
     }
 

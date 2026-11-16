@@ -49,8 +49,7 @@ __global__ void get_block_table_cuda_blockwise(
   int bs = token_to_bs[token_idx];
   int pos_in_bs = token_pos_in_bs[token_idx];
   int seqlen_q_bs = seqlen_q[bs];
-  int sparse_block_idx =
-      topk_idx[head_group_idx * token_num * kSparseTopK + token_idx * kSparseTopK + topk_idx_in_head];
+  int sparse_block_idx = topk_idx[(uint64_t(head_group_idx) * token_num + token_idx) * kSparseTopK + topk_idx_in_head];
 
   auto out_view = reinterpret_cast<int (*)[kHeadGroup][kSparseTopK][kSparseBlockSize]>(out_block_table);
   for (int i = 0; i < kSparseBlockSize; i++) {
@@ -83,23 +82,22 @@ __global__ void get_block_table_cuda_elementwise(
   const int bidx = blockIdx.x;
 
   if (threadIdx.x < kTopkPerBlock) {
-    topk_idx_share[tidx] = topk_idx[bidx * kTopkPerBlock + tidx];
+    topk_idx_share[tidx] = topk_idx[uint64_t(bidx) * kTopkPerBlock + tidx];
   }
 
   __syncthreads();
 
   const int head_group_idx = (bidx / kBlockPerTokenHead) / token_num;
   const int token_idx = (bidx / kBlockPerTokenHead) % token_num;
-  const int topk_idx_in_head = bidx % kBlockPerTokenHead * kTopkPerBlock + tidx / kSparseBlockSize;
-
   const int sparse_block_idx = topk_idx_share[tidx / kSparseBlockSize];
 
   const int token_idx_src = sparse_block_idx * kSparseBlockSize + tidx % kSparseBlockSize;
-  const int token_idx_dst = token_idx * kHeadGroup * kSparseTopK * kSparseBlockSize +
-                            head_group_idx * kSparseTopK * kSparseBlockSize + topk_idx_in_head * kSparseBlockSize +
-                            tidx % kSparseBlockSize;
+  // The CTA writes kTopkPerBlock * kSparseBlockSize consecutive outputs of one (token, head group) row.
+  const uint32_t out_row = token_idx * kHeadGroup + head_group_idx;
+  const auto out = out_block_table + uint64_t(out_row) * (kSparseTopK * kSparseBlockSize) +
+                   uint32_t(bidx % kBlockPerTokenHead * (kTopkPerBlock * kSparseBlockSize));
   if (sparse_block_idx < 0) {
-    out_block_table[token_idx_dst] = 0;
+    out[tidx] = 0;
     return;
   }
 
@@ -108,9 +106,9 @@ __global__ void get_block_table_cuda_elementwise(
   const int seqlen_q_bs = seqlen_q[bs];
 
   if (token_idx_src < seqlen_q_bs && token_idx_src < pos_in_bs) {
-    out_block_table[token_idx_dst] = kHeadGroup * block_table[bs * seqlen_q_max + token_idx_src] + head_group_idx;
+    out[tidx] = kHeadGroup * block_table[bs * seqlen_q_max + token_idx_src] + head_group_idx;
   } else {
-    out_block_table[token_idx_dst] = 0;
+    out[tidx] = 0;
   }
 }
 
@@ -196,6 +194,9 @@ void get_block_table(
         s_q_max,
         n_token);
   } else {
+    // One CTA expands kTopkPerBlock selected blocks with one thread per output element.
+    static_assert(kTopkPerBlock * kSparseBlockSize == kThreadsPerBlock);
+    static_assert(kSparseTopK % kTopkPerBlock == 0);
     LaunchKernel(num_blocks, kThreadsPerBlock, dev)(
         get_block_table_cuda_elementwise<kSparseTopK, kHeadGroup, kSparseBlockSize>,
         static_cast<const int*>(topk_idx.data_ptr()),

@@ -34,9 +34,10 @@ __global__ void per_token_quant_fp8_warp_kernel(
     return;
   }
 
-  const T* token_input = input + token_id * hidden_dim;
-  fp8_e4m3_t* token_output = output_q + token_id * hidden_dim;
-  const uint32_t num_vecs = hidden_dim / kVecSize;
+  const auto token_offset = static_cast<int64_t>(token_id) * hidden_dim;
+  const auto token_input = input + token_offset;
+  const auto token_output = output_q + token_offset;
+  const auto num_vecs = hidden_dim / kVecSize;
 
   float max_value = 0.0f;
   for (uint32_t i = lane_id; i < num_vecs; i += kPerTokenQuantWarpSize) {
@@ -75,10 +76,11 @@ __global__ void per_token_quant_fp8_cta_kernel(
   using input_vec_t = AlignedVector<T, kVecSize>;
   using output_vec_t = AlignedVector<fp8_e4m3_t, kVecSize>;
 
-  const uint32_t token_id = blockIdx.x;
-  const T* token_input = input + token_id * hidden_dim;
-  fp8_e4m3_t* token_output = output_q + token_id * hidden_dim;
-  const uint32_t num_vecs = hidden_dim / kVecSize;
+  const auto token_id = blockIdx.x;
+  const auto token_offset = static_cast<int64_t>(token_id) * hidden_dim;
+  const auto token_input = input + token_offset;
+  const auto token_output = output_q + token_offset;
+  const auto num_vecs = hidden_dim / kVecSize;
 
   float max_value = 0.0f;
   for (uint32_t i = threadIdx.x; i < num_vecs; i += blockDim.x) {
