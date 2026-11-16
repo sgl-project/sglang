@@ -1931,7 +1931,6 @@ def _fwd_kernel_dense_prefill(
         return
 
     offs_m = tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_DMODEL)
     offs_dv = tl.arange(0, BLOCK_DV)
 
