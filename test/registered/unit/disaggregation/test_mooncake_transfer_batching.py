@@ -1,5 +1,6 @@
 import concurrent.futures
 import ctypes
+import functools
 import unittest
 from collections import defaultdict
 from queue import SimpleQueue
@@ -222,9 +223,21 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
     def test_sliced_draft_stops_after_failed_batch(self):
         self._check_transfer(4, 8, False, 37, fail_draft=True)
 
+    def test_sliced_draft_addresses_with_bit_63_set(self):
+        # Intel XPU device pointers have bit 63 set; they must not overflow int64.
+        self._check_transfer(4, 8, False, 37, addr_base=0xFFFF800000000000)
+
     def _check_transfer(
-        self, src_tp, dst_tp, custom_pool, batch_size, fail_draft=False, pure_mla=False
+        self,
+        src_tp,
+        dst_tp,
+        custom_pool,
+        batch_size,
+        fail_draft=False,
+        pure_mla=False,
+        addr_base=0,
     ):
+        b = addr_base
         page_size, tokens, heads, head_bytes = 64, 249, 16, 4
         src_width, dst_width = (
             max(1, heads // src_tp) * head_bytes,
@@ -241,7 +254,7 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
         for dst_rank in range(dst_tp):
             dst_buffers = {
                 base: np.zeros(16384 * max(8, dst_width), dtype=np.uint8)
-                for base in (1000000, 2000000, 3000000, 4000000)
+                for base in (b + 1000000, b + 2000000, b + 3000000, b + 4000000)
             }
             source_ranks = (
                 range(dst_rank * src_tp // dst_tp, (dst_rank + 1) * src_tp // dst_tp)
@@ -260,14 +273,20 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
                 target.reshape(-1, 8)[src_rows] = (
                     np.arange(tokens * 8).reshape(tokens, 8).astype(np.uint8)
                 )
-                src_buffers = {10000: target, 100000: source, 200000: source}
+                src_buffers = {
+                    b + 10000: target,
+                    b + 100000: source,
+                    b + 200000: source,
+                }
 
                 failed_batches = []
 
                 def transfer(
                     session, blocks, src_buffers=src_buffers, dst_buffers=dst_buffers
                 ):
-                    draft_blocks = [block for block in blocks if block[1] >= 3000000]
+                    draft_blocks = [
+                        block for block in blocks if block[1] >= b + 3000000
+                    ]
                     if fail_draft and draft_blocks:
                         failed_batches.append(draft_blocks)
                         return 17
@@ -290,7 +309,7 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
                     kv_args=SimpleNamespace(
                         page_size=page_size,
                         kv_layer_ids=[47, 93, 93],
-                        kv_data_ptrs=[10000, 100000, 200000],
+                        kv_data_ptrs=[b + 10000, b + 100000, b + 200000],
                         num_draft_entries=2,
                         engine_rank=src_rank + 2 * src_tp,
                     ),
@@ -307,7 +326,7 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
                         manager,
                         "session",
                         src_pages,
-                        [1000000, 2000000, 3000000, 4000000],
+                        [b + 1000000, b + 2000000, b + 3000000, b + 4000000],
                         np.array([2], dtype=np.int32),
                         dcp_token_item_lens=[8, src_width, src_width],
                         dst_dcp_size=dst_tp,
@@ -334,7 +353,7 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
             dst_head_start = (dst_rank // max(1, dst_tp // heads)) * max(
                 1, heads // dst_tp
             )
-            for base in (3000000, 4000000):
+            for base in (b + 3000000, b + 4000000):
                 actual = dst_buffers[base].reshape(-1, dst_width)[
                     2 * page_size * dst_tp + logical
                 ]
@@ -346,14 +365,88 @@ class TestDcpDraftHeadTransfer(unittest.TestCase):
                     ].reshape(tokens, dst_width),
                 )
             owned = np.arange(dst_rank, tokens, dst_tp)
-            actual_target = dst_buffers[2000000].reshape(-1, 8)[
+            actual_target = dst_buffers[b + 2000000].reshape(-1, 8)[
                 2 * page_size + owned // dst_tp
             ]
             np.testing.assert_array_equal(
                 actual_target,
                 np.arange(tokens * 8).reshape(tokens, 8).astype(np.uint8)[owned],
             )
-            self.assertFalse(dst_buffers[1000000].any())
+            self.assertFalse(dst_buffers[b + 1000000].any())
+
+
+class TestHeadSlicedTransfer(unittest.TestCase):
+    def test_slice_addresses_with_bit_63_set(self):
+        """Intel XPU device pointers have bit 63 set. The head-sliced path (prefill
+        attention TP 1 to decode TP 2) computed their addresses in int64, so its
+        first transfer raised OverflowError and killed the transfer thread."""
+        base = 0xFFFF800000000000
+        page_size, head_bytes, total_heads = 4, 8, 2
+        src_item = page_size * total_heads * head_bytes  # prefill: both heads
+        dst_item = page_size * head_bytes  # decode TP 2: one head per rank
+        src_ptrs = [base + 0x1000, base + 0x9000]  # [K layer 0, V layer 0]
+        dst_ptrs = [base + 0x20000, base + 0x28000]
+        prefill_pages, decode_pages = [3, 5], [1, 2]
+        for dst_rank in range(2):
+            with self.subTest(dst_rank=dst_rank):
+                calls = []
+                engine = MagicMock()
+                engine.batch_transfer_sync.side_effect = (
+                    lambda session, src, dst, lengths, intent: (
+                        calls.append((src, dst, lengths)) or 0
+                    )
+                )
+                manager = SimpleNamespace(
+                    kv_args=SimpleNamespace(
+                        kv_item_lens=[src_item, src_item],
+                        page_size=page_size,
+                        total_kv_head_num=total_heads,
+                        kv_head_num=total_heads,
+                        engine_rank=0,
+                        kv_data_ptrs=src_ptrs,
+                        kv_layer_ids=[],
+                        prefill_start_layer=0,
+                    ),
+                    attn_tp_size=1,
+                    pp_size=1,
+                    engine=engine,
+                    _await_transfer_futures=lambda futures: max(
+                        f.result() for f in futures
+                    ),
+                )
+                manager.get_mha_kv_ptrs_with_pp = functools.partial(
+                    MooncakeKVManager.get_mha_kv_ptrs_with_pp, manager
+                )
+                with concurrent.futures.ThreadPoolExecutor() as executor:
+                    ret = MooncakeKVManager.send_kvcache_slice(
+                        manager,
+                        "session",
+                        np.array(prefill_pages, dtype=np.int32),
+                        dst_ptrs,
+                        np.array(decode_pages, dtype=np.int32),
+                        dst_rank,
+                        2,
+                        dst_item,
+                        executor,
+                    )
+                self.assertEqual(ret, 0)
+                expected = {
+                    (
+                        src
+                        + p * src_item
+                        + t * total_heads * head_bytes
+                        + dst_rank * head_bytes,
+                        dst + d * dst_item + t * head_bytes,
+                    )
+                    for src, dst in zip(src_ptrs, dst_ptrs)
+                    for p, d in zip(prefill_pages, decode_pages)
+                    for t in range(page_size)
+                }
+                sent = set()
+                for src, dst, lengths in calls:
+                    self.assertEqual(set(lengths), {head_bytes})
+                    sent.update(zip(src, dst))
+                self.assertEqual(sent, expected)
 
 
 class TestDcpDsaIndexKTransfer(unittest.TestCase):

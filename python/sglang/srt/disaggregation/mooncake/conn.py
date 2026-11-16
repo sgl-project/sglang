@@ -1903,12 +1903,17 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if batch_size <= 0:
                 batch_size = 4096
             for start in range(0, plan.draft_src_token_indices.size, batch_size):
-                src_indices = plan.draft_src_token_indices[start : start + batch_size]
-                dst_indices = plan.draft_dst_token_indices[start : start + batch_size]
+                # uint64: Intel XPU addresses have bit 63 set and overflow int64.
+                src_indices = plan.draft_src_token_indices[
+                    start : start + batch_size
+                ].astype(np.uint64)
+                dst_indices = plan.draft_dst_token_indices[
+                    start : start + batch_size
+                ].astype(np.uint64)
                 blocks = []
                 for src_ptr, dst_ptr, src_width, dst_width, copy_width in params:
-                    src_addrs = src_ptr + src_indices * src_width
-                    dst_addrs = dst_ptr + dst_indices * dst_width
+                    src_addrs = np.uint64(src_ptr) + src_indices * np.uint64(src_width)
+                    dst_addrs = np.uint64(dst_ptr) + dst_indices * np.uint64(dst_width)
                     blocks.extend(
                         (int(src), int(dst), copy_width)
                         for src, dst in zip(src_addrs, dst_addrs)
@@ -2059,21 +2064,28 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             )
             return -1
 
-        prefill_page_indices = prefill_kv_indices.reshape(-1, 1).astype(np.int64)
-        decode_page_indices = dst_kv_indices.reshape(-1, 1).astype(np.int64)
-        tokens_per_page = np.arange(page_size, dtype=np.int64).reshape(1, -1)
-        bytes_per_token_on_prefill = src_kv_item_len // page_size
-        bytes_per_token_on_decode = dst_kv_item_len // page_size
+        # uint64: Intel XPU addresses have bit 63 set and overflow int64.
+        prefill_page_indices = prefill_kv_indices.reshape(-1, 1).astype(np.uint64)
+        decode_page_indices = dst_kv_indices.reshape(-1, 1).astype(np.uint64)
+        tokens_per_page = np.arange(page_size, dtype=np.uint64).reshape(1, -1)
+        bytes_per_token_on_prefill = np.uint64(src_kv_item_len // page_size)
+        bytes_per_token_on_decode = np.uint64(dst_kv_item_len // page_size)
         src_token_slot_offsets = (
-            tokens_per_page * bytes_per_token_on_prefill + src_head_slice_offset
+            tokens_per_page * bytes_per_token_on_prefill
+            + np.uint64(src_head_slice_offset)
         )
         dst_token_slot_offsets = (
-            tokens_per_page * bytes_per_token_on_decode + dst_head_slice_offset
+            tokens_per_page * bytes_per_token_on_decode
+            + np.uint64(dst_head_slice_offset)
         )
 
         def process_layer_tp_aware(src_layer_ptr, dst_layer_ptr):
-            src_page_base_addrs = src_layer_ptr + prefill_page_indices * src_kv_item_len
-            dst_page_base_addrs = dst_layer_ptr + decode_page_indices * dst_kv_item_len
+            src_page_base_addrs = np.uint64(
+                src_layer_ptr
+            ) + prefill_page_indices * np.uint64(src_kv_item_len)
+            dst_page_base_addrs = np.uint64(
+                dst_layer_ptr
+            ) + decode_page_indices * np.uint64(dst_kv_item_len)
             src_slice_addrs = src_page_base_addrs + src_token_slot_offsets
             dst_slice_addrs = dst_page_base_addrs + dst_token_slot_offsets
 
