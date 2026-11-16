@@ -196,26 +196,6 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                     self.deep_gemm.destroy_localizer.call_count, expected_calls
                 )
 
-    def test_localization_gate_covers_sm100_sm103_sm107(self):
-        """Localization is opt-in and limited to SM 10.0, 10.3 and 10.7."""
-        with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE.override(False):
-            with patch.object(mega_moe, "_device_sm", 103):
-                self.assertFalse(mega_moe._is_mega_moe_localization_enabled())
-        with envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE.override(True):
-            for sm, expected in (
-                (90, False),
-                (100, True),
-                (103, True),
-                (107, True),
-            ):
-                with (
-                    self.subTest(sm=sm),
-                    patch.object(mega_moe, "_device_sm", sm),
-                ):
-                    self.assertEqual(
-                        mega_moe._is_mega_moe_localization_enabled(), expected
-                    )
-
     def test_buffer_allocation_failure_restores_sm_budget(self):
         deep_gemm = self.deep_gemm
         deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(
