@@ -1194,23 +1194,17 @@ class C4IndexerAscendBackendMixin:
 class LowRatioCompressAscendBackendMixin:
     """NPU implementation of the DeepSeek-V4.1 low-ratio (1 / 2) source path.
 
-    Mirrors ``DeepseekV4AttnBackend.forward_low_ratio_sources`` but keeps its
-    own orchestration: ``deepseek_v4_backend`` imports Triton kernels at module
-    scope, and the two generations differ in kernels and cache row formats.
-    The context-parallel and prefill-graph branches of the CUDA source are not
-    modeled on NPU.
+    Mirrors ``DeepseekV4AttnBackend.forward_low_ratio_sources`` but keeps its own
+    orchestration: ``deepseek_v4_backend`` imports Triton kernels at module scope,
+    and the two generations differ in kernels and cache row formats. The
+    context-parallel and prefill-graph branches are CUDA-only.
 
-    Deviation from CUDA: the compress step hands its pre-RoPE ``latent`` to the
-    index step, because ``indexer_prologue_k`` projects the index K from that
-    latent, while CUDA writes the index K inside its compress step.
+    Unlike CUDA, the compress step hands its pre-RoPE ``latent`` to the index
+    step, because ``indexer_prologue_k`` projects the index K from that latent.
     """
 
-    # Capability declaration for the shared model code, not a live switch on
-    # NPU: the prefill-graph contract is CUDA-only, and
-    # ``_low_ratio_sources_break`` short-circuits on
-    # ``is_in_breakable_cuda_graph()`` (never true here) before this attr is
-    # read. Declared so every backend answers the same question, and so NPU
-    # keeps selecting the single-call path if the breakable graph ever lands.
+    # The prefill-graph contract is CUDA-only; ``_low_ratio_sources_break``
+    # short-circuits on ``is_in_breakable_cuda_graph()`` before this attr is read.
     low_ratio_prefill_graph = False
     # Read by ``_low_ratio_compress`` below; still unset on NPU because the
     # replay-tail path that writes it is CUDA-only, so it stays None.
@@ -1397,9 +1391,8 @@ class LowRatioCompressAscendBackendMixin:
             cache_dtype=torch.float32,
         )
         ds41 = _ds41_ops()
-        # The FRACTAL_NZ cast deliberately stays inside the traced region, so
-        # the NZ tensor is never a graph input for aclgraph to clone back to
-        # ND. Do NOT hoist this cast into a cached attribute.
+        # Keep the NZ cast inside the traced region: hoisting it into a cached
+        # attribute makes aclgraph clone an NZ graph input back to ND.
         # Both storage modes share every argument but the destination.
         common = dict(
             latent=latent.reshape(-1, latent.shape[-1]),
@@ -2000,9 +1993,8 @@ class LowRatioCompressAscendBackendMixin:
             ),
             metadata=metadata,
             quant_mode=1,
-            # ``layer`` is the RadixAttention the model passes (it carries
-            # ``scaling``), not the MQALayer. Do not change this to
-            # ``layer.softmax_scale``: that attribute does not exist here.
+            # ``layer`` is the model's RadixAttention (it carries ``scaling``),
+            # not the MQALayer, which has no ``softmax_scale``.
             softmax_scale=layer.scaling,
             layout_q="TND",
             layout_kv="PA_BBND",
@@ -2075,10 +2067,9 @@ class LowRatioCompressAscendBackendMixin:
         counterpart). aclgraph allocates these buffers at capture and refreshes
         them in place on replay, so this runs eager-only.
 
-        Target verify included (same request-major row layout; start_pos/seqused
-        come from _build_seq_metadata_verify). draft_extend deliberately not:
-        its producers never run, so the locs would anchor on a stale chunk
-        start.
+        Target verify is included (same request-major row layout; start_pos and
+        seqused come from _build_seq_metadata_verify). draft_extend is excluded:
+        its producers never run, so the locs would anchor on a stale chunk start.
         """
         ratios = self._dsv41_low_ratios()
         if not ratios:
@@ -2622,22 +2613,17 @@ class DeepseekV4AscendAttnBackend(
         self._graph_table_high_water: dict[str, int] = {}
 
     def _validate_spec_support(self, spec_algorithm) -> None:
-        """The one gate for every speculative-decoding constraint of this backend.
+        """The gate for every speculative-decoding constraint of this backend.
 
-        DeepSeek-V4.1 (ratios 1/2) also pins the verify layout: its low-ratio
-        rows assume the STATIC request-major rectangle, so COMPACT's ragged
-        variable-length layout is rejected here, at startup, instead of at the
-        first verify step. The check stays on ``_dsv4_has_low_ratio`` (a draft
+        DeepSeek-V4.1 (ratios 1/2) pins the verify layout too: its low-ratio rows
+        assume the STATIC request-major rectangle, so COMPACT's ragged layout is
+        rejected at startup. That check stays on ``_dsv4_has_low_ratio`` (a draft
         worker empties its ratios and writes no compressed rows).
 
-        DSV4 (ratios 4/128) runs EAGLE / NGRAM / DSpark / DFLASH, following
-        upstream: a DFLASH verify batch's ``seq_lens`` already carry the draft
-        block, so the graph max_len skips the draft add for it
-        (``_is_dflash_verify``) while the eager verify and replay paths
-        consume the expanded lengths directly.
-        DeepSeek-V4.1 (ratios 1/2) supports DSpark only: its low-ratio verify
-        rows assume DSpark's layout, and no other algorithm has a verified
-        refresh path.
+        DSV4 (ratios 4/128) runs EAGLE / NGRAM / DSpark / DFLASH. A DFLASH verify
+        batch's ``seq_lens`` already carry the draft block, so the graph max_len
+        skips the draft add for it (``_is_dflash_verify``). DeepSeek-V4.1 supports
+        DSpark only.
         """
         if spec_algorithm is None or spec_algorithm.is_none():
             return
@@ -2659,35 +2645,29 @@ class DeepseekV4AscendAttnBackend(
             )
 
     def _validate_draft_window_rows(self) -> None:
-        """The draft pool and the V4 sparse-attention op must agree on the row.
+        """A draft worker's window rows must match the V4 sparse-attention op.
 
         The pool builder pins a draft worker to the V4 generation while the
-        dispatch above infers it from the emptied ratio list; if the two drift,
-        the op rejects the row width only at the first graph capture. Check it
-        at init so the failure names both sides.
+        dispatch above infers it from the emptied ratio list; a mismatch otherwise
+        surfaces inside the op at the first graph capture.
         """
         if not is_npu_arch35():
             return
         swa_pool = getattr(self.token_to_kv_pool, "swa_kv_pool", None)
         if swa_pool is None:
             return
-        from sgl_kernel_npu.operators.mem_cache import get_npu_kv_quant_path
-        from sglang.srt.hardware_backend.npu.dsv4.npu_kv_layout import (
+        from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import (
             NPUDSV4KVLayout,
         )
 
-        expected = get_npu_kv_quant_path().packed_dim(
-            self.token_to_kv_pool.qk_nope_head_dim,
-            self.token_to_kv_pool.qk_rope_head_dim,
-        )
+        expected = swa_pool.dsv4_arch35_packed_kv_dim
         layout = getattr(swa_pool, "layout", None)
         rows = getattr(swa_pool, "kv_cache_total_dim", None)
-        assert layout is NPUDSV4KVLayout.V4_FP8 and rows == expected, (
-            "the draft SWA pool must keep the V4 row format its forward reads "
-            f"(V4_FP8/{expected}B), got {layout} rows={rows}B: the pool "
-            "generation is pinned in _build_dsv4_kv_pool, so a mismatch means "
-            "it was tagged with the target's V4.1 row format"
-        )
+        if layout is not NPUDSV4KVLayout.V4_FP8 or rows != expected:
+            raise ValueError(
+                "draft SWA pool must use the V4 row format the V4 sparse-attention "
+                f"op reads (V4_FP8/{expected}B), got {layout} with {rows}B rows"
+            )
 
     def _is_dspark_draft_block(self, forward_batch: ForwardBatch) -> bool:
         spec_algorithm = forward_batch.spec_algorithm
@@ -2972,10 +2952,9 @@ class DeepseekV4AscendAttnBackend(
                     device=device,
                 )
 
-        # Allocation uses the V4 kernels' own ABI (upstream contract); do not
-        # execute metadata kernels on temporary synthetic inputs merely to
-        # discover their output shapes. c1a/c4a/c128a/li_quant serve the V4
-        # kernels only -- V4.1 sizes its own buffers through the ds41 probes.
+        # Sizes come from the V4 kernels' ABI rather than from probing synthetic
+        # inputs. c1a/c4a/c128a/li_quant serve the V4 kernels; V4.1 sizes its own
+        # buffers through the ds41 probes.
         attention_metadata_size = (
             npu_attention_ops.get_mixed_quant_sparse_flash_mla_metadata_size()
             if is_npu_arch35()
@@ -3476,8 +3455,8 @@ class DeepseekV4AscendAttnBackend(
                 )
             )
         else:
-            # CPU mirror of the kv buffer written below, from its CPU source — the
-            # host metadata op reads this instead of a D2H sync.
+            # CPU mirror of the kv buffer written below, so the host metadata op
+            # reads it instead of syncing D2H.
             fm.seq_lens_cpu_int = self._seq_lens_cpu_int_view(ctx.bs)
             fm.seq_lens_cpu_int.copy_(ctx.final_seq_lens_cpu[: ctx.bs].clamp(min=1))
         # Refresh the live-row mask the captured graphs read; this is the only
@@ -3733,8 +3712,8 @@ class DeepseekV4AscendAttnBackend(
             topk_dst.zero_()
             return
 
-        # ``out_cache_loc`` is deliberately left unpadded by the graph replay
-        # view; build metadata for real requests only.
+        # The graph replay view leaves ``out_cache_loc`` unpadded, so metadata is
+        # built for real requests only.
         src, src_len = self._build_dspark_sparse_metadata(
             seq_lens=ctx.live_seq_lens[: ctx.raw_bs],
             block_size=ctx.tokens_per_bs,
@@ -3988,8 +3967,7 @@ class DeepseekV4AscendAttnBackend(
         if getattr(fm, "kernel_metadata", None) is None:
             fm.kernel_metadata = {}
         if self._dsv4_has_low_ratio:
-            # V4.1 metadata comes from the ds41 operators only (MQSMLA + QLI);
-            # the V4 entries do not apply.
+            # V4.1 metadata comes from the ds41 operators only (MQSMLA + QLI).
             return self._dsv41_attention_kernel_metadata(
                 forward_batch
             ) | self._dsv41_index_kernel_metadata(forward_batch)
@@ -4222,8 +4200,8 @@ class DeepseekV4AscendAttnBackend(
                 f"metadata({'present' if metadata is not None else 'MISSING'}), "
                 f"cmp_kv({'present' if cmp_kv is not None else 'MISSING'}). "
                 f"Available kernel_metadata keys: {list(fm.kernel_metadata.keys())}. "
-                "This indicates a configuration / pool-init bug — silently "
-                "returning zeros would corrupt model output."
+                "This indicates a configuration / pool-init bug; returning "
+                "zeros would corrupt model output."
             )
 
         ori_kv = pool.get_swa_buffer(layer.layer_id)
@@ -4283,9 +4261,9 @@ class DeepseekV4AscendAttnBackend(
         """Return the SWA KV write locations used by DeepSeek-V4 draft layers.
 
         During NPU graph capture/replay, ``swa_loc`` is stable graph storage
-        whose contents are refreshed by ``_apply_dsv4_graph_metadata``. Eager
-        forwards do not necessarily build that metadata, so translate the
-        current full-pool locations on demand as a fallback.
+        refreshed by ``_apply_dsv4_graph_metadata``. Eager forwards may not build
+        that metadata, so fall back to translating the current full-pool
+        locations.
         """
         out_cache_loc = forward_batch.out_cache_loc
         metadata = self.forward_metadata

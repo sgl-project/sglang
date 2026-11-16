@@ -29,23 +29,24 @@ class NPUDSV4KVLayout(str, enum.Enum):
 
     @property
     def quant_group(self) -> int:
-        """Values sharing one quant scale; None rows are written unquantized."""
+        """Values sharing one quant scale; None = not used by this row."""
         return {
             NPUDSV4KVLayout.V4_BF16: None,
-            NPUDSV4KVLayout.V4_FP8: 64,
+            NPUDSV4KVLayout.V4_FP8: None,
             NPUDSV4KVLayout.V41_SWA_FP8: 32,
             NPUDSV4KVLayout.V41_CMP_FP4: 16,
         }[self]
 
     @property
     def quant_mode(self):
-        """Quant mode of the epilog write op: int for kv_compress_epilog
-        (arch35 window rows), str for kv_compress_epilog_v2 (V4.1 rows)."""
+        """``kv_compress_epilog_v2`` encoding; None = not written by that op.
+
+        The V4 rows go through ``kv_compress_epilog``, whose encoding comes from
+        the runtime quant path and changes with the CANN release.
+        """
         return {
             NPUDSV4KVLayout.V4_BF16: None,
-            # epilog v1 mode; the deployed wheel's encoding, not the one in
-            # the current ops-transformer source (which also dropped layout=1).
-            NPUDSV4KVLayout.V4_FP8: 2,
+            NPUDSV4KVLayout.V4_FP8: None,
             NPUDSV4KVLayout.V41_SWA_FP8: "mxfp8_bf16",
             NPUDSV4KVLayout.V41_CMP_FP4: "mxfp4_bf16",
         }[self]
@@ -57,9 +58,10 @@ class NPUDSV4KVLayout(str, enum.Enum):
 
     @property
     def row_alignment(self) -> int:
+        """Row-width alignment; None = not used by this row."""
         return {
             NPUDSV4KVLayout.V4_BF16: None,
-            NPUDSV4KVLayout.V4_FP8: 128,
+            NPUDSV4KVLayout.V4_FP8: None,
             NPUDSV4KVLayout.V41_SWA_FP8: 32,
             NPUDSV4KVLayout.V41_CMP_FP4: 32,
         }[self]
@@ -68,17 +70,21 @@ class NPUDSV4KVLayout(str, enum.Enum):
         """(kv_dim, kv_dtype) of the single-KV PA_ND buffer: last-dim size in
         store-dtype elements plus the store dtype.
 
-        Arch35 packs nope as fp8 with one scale per quant_group and keeps the rope
-        tail in bf16. V4.1 rows are fully quantized by kv_compress_epilog_v2
-        (no bf16 tail): dataCol = head_dim (mxfp8) or head_dim // 2 (packed
-        mxfp4, two e2m1 per byte), scales are G * bf16.
+        The arch35 V4 encoding belongs to the runtime quant path (608B on CANN
+        9.2, 640B on 9.1), so its width is not derived here. V4.1 rows are fully
+        quantized by kv_compress_epilog_v2 (no bf16 tail): dataCol = head_dim
+        (mxfp8) or head_dim // 2 (packed mxfp4, two e2m1 per byte), scales are
+        G * bf16.
         """
         if self is NPUDSV4KVLayout.V4_BF16:
             return nope_dim + rope_dim, torch.bfloat16
         if self is NPUDSV4KVLayout.V4_FP8:
-            raw = nope_dim + rope_dim * 2 + -(-nope_dim // self.quant_group)
-            align = self.row_alignment
-            return -(-raw // align) * align, torch.float8_e4m3fn
+            from sgl_kernel_npu.operators.mem_cache import get_npu_kv_quant_path
+
+            return (
+                get_npu_kv_quant_path().packed_dim(nope_dim, rope_dim),
+                torch.float8_e4m3fn,
+            )
         head = nope_dim + rope_dim
         assert head > 0, head
         data = head // 2 if self is NPUDSV4KVLayout.V41_CMP_FP4 else head

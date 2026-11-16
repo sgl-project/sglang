@@ -50,11 +50,11 @@ from sglang.srt.hardware_backend.npu.attention.ascend_dsv4_backend import (
     LowRatioCompressAscendBackendMixin,
 )
 from sglang.srt.hardware_backend.npu.dsv4 import dsv4_memory_pool
+from sglang.srt.hardware_backend.npu.dsv4.dsv4_kv_layout import NPUDSV4KVLayout
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
     DSV4NPUTokenToKVPool,
     DSV41NPUSingleKVPool,
 )
-from sglang.srt.hardware_backend.npu.dsv4.npu_kv_layout import NPUDSV4KVLayout
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DSV41_INDEX_PAGE_SIZE,
     get_dsv4_indexer_bytes_per_token,
@@ -275,29 +275,24 @@ class TestPoolFactory(unittest.TestCase):
         # One row per slot: the window page is the global page.
         self.assertEqual(calls["DSV41NPUSingleKVPool"]["kernel_page_size"], 128)
 
-    def test_ratio1_compressed_pool_is_fp4_despite_the_global_page(self):
-        out, calls = self._make(
-            page_size=128,
-            global_page_size=128,
-            kv_layout=NPUDSV4KVLayout.V41_CMP_FP4,
-        )
-        self.assertEqual(out, "DSV41NPUSingleKVPool")
-        self.assertIs(
-            calls["DSV41NPUSingleKVPool"]["layout"], NPUDSV4KVLayout.V41_CMP_FP4
-        )
-
-    def test_ratio2_compressed_pool_is_fp4(self):
-        out, calls = self._make(
-            page_size=64,
-            global_page_size=128,
-            kv_layout=NPUDSV4KVLayout.V41_CMP_FP4,
-        )
-        self.assertEqual(out, "DSV41NPUSingleKVPool")
-        self.assertIs(
-            calls["DSV41NPUSingleKVPool"]["layout"], NPUDSV4KVLayout.V41_CMP_FP4
-        )
-        # A ratio-2 compressed page holds global // 2 rows.
-        self.assertEqual(calls["DSV41NPUSingleKVPool"]["kernel_page_size"], 64)
+    def test_compressed_pools_are_fp4(self):
+        # A ratio-1 compressed page keeps the global page; a ratio-2 page holds
+        # global // 2 rows. Both take the compressed row format.
+        for page_size in (128, 64):
+            with self.subTest(page_size=page_size):
+                out, calls = self._make(
+                    page_size=page_size,
+                    global_page_size=128,
+                    kv_layout=NPUDSV4KVLayout.V41_CMP_FP4,
+                )
+                self.assertEqual(out, "DSV41NPUSingleKVPool")
+                self.assertIs(
+                    calls["DSV41NPUSingleKVPool"]["layout"],
+                    NPUDSV4KVLayout.V41_CMP_FP4,
+                )
+                self.assertEqual(
+                    calls["DSV41NPUSingleKVPool"]["kernel_page_size"], page_size
+                )
 
     def test_v4_window_pool_arrives_pre_tagged(self):
         out, calls = self._make(

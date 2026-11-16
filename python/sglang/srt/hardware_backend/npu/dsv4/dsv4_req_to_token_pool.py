@@ -3,7 +3,7 @@
 Subclass of ``ReqToTokenPool`` that adds the one auxiliary per-request table
 needed by the DSV4 attention backend:
 
-  * ``req_to_c128_sidecar`` — one page id per C128 physical page
+  * ``req_to_c128_sidecar``: one page id per C128 physical page
 
 C4 locations are derived from the base full-token table, and SWA locations use
 the existing full-to-SWA mapping. The sidecar is populated by the existing
@@ -127,19 +127,14 @@ class DSV4ReqToTokenTablesMixin:
         return indices
 
     def _dsv4_free(self, req) -> None:
-        """Release this request's DSV4 slot-scoped resources before the slot is
-        handed to the next request.
+        """Drop this request's slot-scoped DSV4 state before the slot is reused.
 
-        ``DSV4NPUTokenToKVPoolAllocator`` owns the C128 page allocator, so it
-        takes the req-aware ``free`` (which also clears the request-scoped
-        state). DeepSeek-V4.1 runs on the generic SWA allocator -- its compressed
-        slots are ``full_loc // ratio``, so there are no C128 pages to release --
-        but the request-scoped compressed state (the ratio-2 pending pair, one
-        ring per request slot) still has to be dropped, or the next owner of the
-        slot inherits this request's pending token.
+        The C128-owning allocator takes the req-aware ``free``. DeepSeek-V4.1 runs
+        on the generic SWA allocator: it has no C128 pages to release, but it
+        still keeps the ratio-2 pending pair per request slot.
 
-        May be None between ``__init__`` and ``register_dsv4_allocator`` --
-        defensive None check.
+        ``_dsv4_allocator`` stays None between ``__init__`` and
+        ``register_dsv4_allocator``.
         """
         allocator = self._dsv4_allocator
         if allocator is None:
@@ -150,9 +145,7 @@ class DSV4ReqToTokenTablesMixin:
         req_pool_idx = req.kv.req_pool_idx
         if req_pool_idx is None:
             return
-        clear = getattr(allocator.get_kvcache(), "clear_request_scoped_state", None)
-        if clear is not None:
-            clear(int(req_pool_idx))
+        allocator.get_kvcache().clear_request_scoped_state(int(req_pool_idx))
 
 
 class DSV4NPUReqToTokenPool(DSV4ReqToTokenTablesMixin, ReqToTokenPool):
