@@ -15,14 +15,14 @@ because the two paths have different lifecycle requirements.
 
 from __future__ import annotations
 
-import os
 from contextlib import contextmanager
 
 import torch
 
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.distributed.parallel_state import GroupCoordinator
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.environ import envs
+from sglang.srt.utils import is_hip
 from sglang.srt.utils.patch_torch import monkey_patch_torch_compile
 
 _is_hip = is_hip()
@@ -55,10 +55,8 @@ def patch_model(
             backup_ca_comm = tp_group.ca_comm
             yield torch.compile(
                 torch.no_grad()(model.forward),
-                mode=os.environ.get(
-                    "SGLANG_TORCH_COMPILE_MODE", "max-autotune-no-cudagraphs"
-                ),
-                dynamic=_is_hip and get_bool_env_var("SGLANG_TORCH_DYNAMIC_SHAPE"),
+                mode=envs.SGLANG_TORCH_COMPILE_MODE.get(),
+                dynamic=_is_hip and envs.SGLANG_TORCH_DYNAMIC_SHAPE.get(),
             )
         else:
             yield model.forward

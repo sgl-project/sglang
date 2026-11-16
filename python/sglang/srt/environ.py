@@ -322,6 +322,9 @@ class Envs:
     # Copy rank-local MoE slices into independent CPU storage before H2D when
     # they reference a larger mmap-backed checkpoint storage.
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
+    # Fallback for the expert_pack load format when --model-loader-extra-config
+    # carries no pack_path.
+    SGLANG_EXPERT_PACK_PATH = EnvStr(None)
     SGLANG_LOAD_SNAPSHOT_USE_ZMQ = EnvBool(False)
     SGLANG_ALLOW_OVERWRITE_LONGER_CONTEXT_LEN = EnvBool(False)
     HF_HUB_DISABLE_XET = EnvBool(False)
@@ -1472,6 +1475,7 @@ class Envs:
     # cached-prefix shapes. Validated at 98% GSM8K accuracy.
     SGLANG_TRITON_FP8_PREFILL_ATTN = EnvBool(True)
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
+    SGLANG_TORCH_COMPILE_MODE = EnvStr("max-autotune-no-cudagraphs")
     SGLANG_TORCH_DYNAMIC_SHAPE = EnvBool(False)
     # torch.compile backend for CPU graphs (defaults to "inductor"; "eager" or "aot_eager" for debugging)
     SGLANG_CPU_GRAPH_COMPILE_BACKEND = EnvStr("inductor")
@@ -1496,6 +1500,7 @@ class Envs:
     # DeepGEMM
     # ===================================================================
     SGLANG_ENABLE_JIT_DEEPGEMM = EnvBool(True)
+    SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_DEEPGEMM = EnvBool(True)
     SGLANG_BATCH_INVARIANT_OPS_ENABLE_MM_FALLBACK_VARIANT = EnvBool(False)
     SGLANG_DEEPGEMM_STANDARD_LAYOUT = EnvStr("auto")
     SGLANG_DEEPGEMM_MASKED_MEMORY_BUDGET_FRACTION = EnvFloat(0.25)
