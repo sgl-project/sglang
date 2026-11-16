@@ -3,6 +3,11 @@
 import contextlib
 import copy
 import json
+import os
+import shutil
+import ssl
+import subprocess
+import tempfile
 import threading
 import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -20,6 +25,7 @@ from sglang.lang.interpreter import StreamExecutor
 from sglang.lang.ir import SglSamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
+from sglang.utils import http_request
 
 register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
@@ -94,6 +100,37 @@ class TestRuntimeStartProfile(_StubServerTestCase):
             self.server.posts,
             [("/start_profile", {"num_steps": 3, "activities": ["CPU", "GPU"]})],
         )
+
+
+@unittest.skipUnless(shutil.which("openssl"), "needs the openssl CLI for a test CA")
+class TestHttpRequestCustomCA(_StubServerTestCase):
+    def setUp(self):
+        super().setUp()
+        cert_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(cert_dir.cleanup)
+        self.ca_path = os.path.join(cert_dir.name, "cert.pem")
+        key_path = os.path.join(cert_dir.name, "key.pem")
+        subprocess.run(
+            ["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "1"]
+            + ["-subj", "/CN=127.0.0.1", "-addext", "subjectAltName=IP:127.0.0.1"]
+            + ["-keyout", key_path, "-out", self.ca_path],
+            check=True,
+            capture_output=True,
+        )
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(self.ca_path, key_path)
+        self.server.socket = context.wrap_socket(self.server.socket, server_side=True)
+        self.url = f"https://127.0.0.1:{self.server.server_port}/generate"
+
+    def test_streaming_request_trusts_the_given_ca_bundle(self):
+        """A server whose certificate is signed by the CA passed as `verify` must be
+        reachable for streaming requests, as it is for plain ones."""
+        for stream in (False, True):
+            with self.subTest(stream=stream):
+                res = http_request(
+                    self.url, json={}, stream=stream, verify=self.ca_path
+                )
+                self.assertEqual(res.status_code, 200)
 
 
 _USAGE = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
@@ -189,7 +226,12 @@ class TestOpenAIBackendTokenLimit(CustomTestCase):
             with self.subTest(model_name=model_name):
                 backend = self._backend(model_name, is_chat_model=is_chat_model)
                 executor = StreamExecutor(
-                    backend, {}, SglSamplingParams(), None, stream=False, use_thread=False
+                    backend,
+                    {},
+                    SglSamplingParams(),
+                    None,
+                    stream=False,
+                    use_thread=False,
                 )
                 executor.submit(sgl.user("q"))
                 executor.submit(sgl.assistant_begin())
