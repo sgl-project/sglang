@@ -29,6 +29,7 @@ if _use_aiter:
 
 if TYPE_CHECKING:
     from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+    from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
     from sglang.srt.layers.quantization.base_config import QuantizationConfig
     from sglang.srt.layers.rotary_embedding import RotaryEmbedding
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -173,10 +174,33 @@ class Compressor(BaseFusedOp):
             self.wkv_gate.qweight_type.weight_type,
         )
 
-    def forward_native(self, *args, **kwargs):
-        # CUDA and HIP backends compress through compressor_v2.forward_unified;
-        # only NPU calls this module, through forward_npu.
-        raise NotImplementedError("Compressor has no native (pure-torch) path")
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        forward_batch: ForwardBatch,
+        attn_backend: Optional[AttentionBackend] = None,
+    ) -> torch.Tensor:
+        if forward_batch.forward_mode.is_idle():
+            assert x.shape[0] == 0
+            return x.new_empty(0, self.head_dim)
+
+        kv_score = self.compute_kv_score(x, forward_batch)
+
+        if TYPE_CHECKING:
+            assert isinstance(attn_backend, DeepseekV4AttnBackend)
+        kv_score_buffer = self.get_state_pool(attn_backend).kv_score_buffer.kv_score
+        return attn_backend.forward_compress(
+            kv_score_buffer=kv_score_buffer,
+            kv_score_input=kv_score,
+            ape=self.ape.view(-1, self.head_dim),
+            head_dim=self.head_dim,
+            norm=self.norm,
+            freqs_cis_cache=self.freqs_cis,
+            rotate=self.rotate,
+            compress_ratio=self.ratio,
+            forward_batch=forward_batch,
+            is_paged=True,
+        )
 
     def forward_npu(
         self,
