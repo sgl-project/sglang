@@ -11,7 +11,10 @@ from unittest.mock import patch
 
 import torch
 
-from sglang.srt.mem_cache.hicache_key_scheme import plan_unified_kv
+from sglang.srt.mem_cache.hicache_key_scheme import (
+    plan_unified_kv,
+    with_packed_draft,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     PoolName,
@@ -141,6 +144,8 @@ class _Rank:
         pp_rank=0,
         pp_size=1,
         unnamed_layers=0,
+        draft_layers=0,
+        draft_id="draft",
     ):
         local_heads = 1 if mla else TOTAL_KV_HEADS // tp_size
         groups = 1 if mla else local_heads // head_partition
@@ -148,8 +153,9 @@ class _Rank:
         self.end_layer = end_layer
         self.layout = PageUnifiedLayout(
             page_size=PAGE_SIZE,
-            # Layers of the page block that the plan does not name.
-            layer_num=end_layer - start_layer + unnamed_layers,
+            # Layers of the page block that the plan does not name, and packed
+            # draft layers, which follow the target's.
+            layer_num=end_layer - start_layer + unnamed_layers + draft_layers,
             head_num=local_heads,
             head_group_num=groups,
             head_dim=HEAD_DIM,
@@ -171,6 +177,20 @@ class _Rank:
             head_group=None if mla else head_partition,
             layer_partition=layer_partition,
         )
+        self.draft_layers = draft_layers
+        if draft_layers:
+            self.plan = with_packed_draft(
+                self.plan,
+                target_layer_num=end_layer - start_layer,
+                draft_layer_num=draft_layers,
+                algorithm="EAGLE",
+                draft_id=draft_id,
+                dtype="bfloat16",
+                row_width=HEAD_DIM,
+                attn_tp_rank=tp_rank,
+                attn_cp_size=1,
+                is_final_stage=pp_rank == pp_size - 1,
+            )
         self.first_head = tp_rank * local_heads
         self.pool = _UnifiedHostPool(self.layout)
         config = HiCacheStorageConfig(
@@ -208,7 +228,13 @@ class _Rank:
     def expected_page(self, page):
         """This rank's slice of one logical page in page_unified byte order."""
         layout = self.layout
-        page = page[self.start_layer : self.end_layer]
+        # Logical pages hold the draft layers after the model's LAYERS.
+        page = torch.cat(
+            [
+                page[self.start_layer : self.end_layer],
+                page[LAYERS : LAYERS + self.draft_layers],
+            ]
+        )
         if layout.is_mla:
             return page
         # page: (layer, 2, page_size, total_heads, dim) -> this rank's heads,
@@ -224,12 +250,13 @@ class _Rank:
         ).permute(3, 0, 1, 2, 4, 5)
 
 
-def _logical_pages(mla, count):
+def _logical_pages(mla, count, draft_layers=0):
     generator = torch.Generator().manual_seed(20261021)
+    layers = LAYERS + draft_layers
     shape = (
-        (LAYERS, PAGE_SIZE, HEAD_DIM)
+        (layers, PAGE_SIZE, HEAD_DIM)
         if mla
-        else (LAYERS, 2, PAGE_SIZE, TOTAL_KV_HEADS, HEAD_DIM)
+        else (layers, 2, PAGE_SIZE, TOTAL_KV_HEADS, HEAD_DIM)
     )
     return [
         torch.randn(shape, generator=generator).to(torch.bfloat16) for _ in range(count)
@@ -405,6 +432,141 @@ class TestMooncakeUnifiedKeys(CustomTestCase):
             )
 
             MooncakeStore(config)
+
+    # Packed draft layers: one more chunk per head group under the draft
+    # digest. The store treats it like any other chunk of the rank's list.
+
+    def test_tp2_writers_fill_a_tp1_readers_draft_rows(self):
+        cluster = _FakeCluster()
+        writers = [
+            _Rank(
+                cluster,
+                mla=False,
+                tp_rank=r,
+                tp_size=2,
+                head_partition=1,
+                draft_layers=1,
+            )
+            for r in range(2)
+        ]
+        reader = _Rank(
+            cluster, mla=False, tp_rank=0, tp_size=1, head_partition=1, draft_layers=1
+        )
+        logical = _logical_pages(mla=False, count=1, draft_layers=1)
+        for host_page, writer in zip([1, 2], writers):
+            writer.fill_from(logical, host_pages=[host_page])
+            self.assertEqual(
+                writer.store.batch_set_v1(["p"], _page_indices([host_page])), [True]
+            )
+        # Each object holds the draft rows of its GLOBAL head group, K then V:
+        # checked on the stored bytes, so a consistent swap cannot hide.
+        draft_keys = [key for key in _chunk_keys(cluster) if "_ukd1-" in key]
+        self.assertEqual(len(draft_keys), TOTAL_KV_HEADS)
+        for head in range(TOTAL_KV_HEADS):
+            (key,) = [k for k in draft_keys if k.endswith(f"_D0-1_H{head}")]
+            rows = logical[0][LAYERS:, :, :, head].contiguous()
+            self.assertEqual(
+                cluster.objects[key], rows.view(torch.uint8).numpy().tobytes()
+            )
+        self.assertEqual(reader.store.batch_exists(["p"]), 1)
+        self.assertEqual(reader.store.batch_get_v1(["p"], _page_indices([0])), [True])
+        self.assertTrue(
+            torch.equal(reader.pool.kv_buffer[0], reader.expected_page(logical[0]))
+        )
+
+    def test_mla_draft_rows_follow_the_final_pp_stage(self):
+        cluster = _FakeCluster()
+        stages = [
+            _Rank(
+                cluster,
+                mla=True,
+                tp_rank=0,
+                tp_size=2,
+                head_partition=None,
+                start_layer=start,
+                end_layer=end,
+                pp_rank=pp_rank,
+                pp_size=2,
+                draft_layers=draft_layers,
+            )
+            for pp_rank, (start, end, draft_layers) in enumerate(
+                [(0, 2, 0), (2, LAYERS, 1)]
+            )
+        ]
+        reader = _Rank(
+            cluster, mla=True, tp_rank=1, tp_size=4, head_partition=None, draft_layers=1
+        )
+        logical = _logical_pages(mla=True, count=1, draft_layers=1)
+        for host_page, stage in zip([1, 2], stages):
+            stage.fill_from(logical, host_pages=[host_page])
+            self.assertEqual(
+                stage.store.batch_set_v1(["p"], _page_indices([host_page])), [True]
+            )
+        self.assertFalse(any("ukd1-" in suffix for suffix in stages[0].plan.suffixes))
+        (draft_key,) = [key for key in _chunk_keys(cluster) if "_ukd1-" in key]
+        self.assertTrue(draft_key.endswith("_D0-1"))
+        self.assertEqual(
+            cluster.objects[draft_key],
+            logical[0][LAYERS:].contiguous().view(torch.uint8).numpy().tobytes(),
+        )
+        self.assertEqual(reader.store.batch_get_v1(["p"], _page_indices([0])), [True])
+        self.assertTrue(torch.equal(reader.pool.kv_buffer[0], logical[0]))
+
+    def test_readers_with_and_without_draft_kv_share_the_target_chunks(self):
+        cluster = _FakeCluster()
+        kwargs = dict(mla=False, tp_rank=0, tp_size=1, head_partition=2)
+        plain = _Rank(cluster, **kwargs)
+        ours = _Rank(cluster, draft_layers=1, **kwargs)
+        theirs = _Rank(cluster, draft_layers=1, draft_id="another-draft", **kwargs)
+        logical = _logical_pages(mla=False, count=1, draft_layers=1)
+
+        # A target-only page is a miss for a reader that stores draft KV.
+        plain.fill_from(logical, host_pages=[0])
+        self.assertEqual(plain.store.batch_set_v1(["p"], _page_indices([0])), [True])
+        target_objects = dict(cluster.objects)
+        self.assertEqual(ours.store.batch_exists(["p"]), 0)
+
+        # Its backup adds its draft chunks and leaves the target's alone.
+        ours.fill_from(logical, host_pages=[0])
+        self.assertEqual(ours.store.batch_set_v1(["p"], _page_indices([0])), [True])
+        added = set(cluster.objects) - set(target_objects)
+        self.assertEqual(len(added), 2)
+        self.assertTrue(all("_ukd1-" in key for key in added))
+        self.assertEqual(
+            {key: cluster.objects[key] for key in target_objects}, target_objects
+        )
+        self.assertEqual(ours.store.batch_exists(["p"]), 1)
+
+        # Another draft misses on the draft chunks alone; the reader without
+        # draft KV never needed them.
+        self.assertEqual(theirs.store.batch_exists(["p"]), 0)
+        for key in added:
+            del cluster.objects[key]
+        self.assertEqual(plain.store.batch_exists(["p"]), 1)
+        self.assertEqual(plain.store.batch_get_v1(["p"], _page_indices([1])), [True])
+        self.assertTrue(
+            torch.equal(plain.pool.kv_buffer[1], plain.expected_page(logical[0]))
+        )
+
+    def test_a_missing_or_short_draft_chunk_fails_its_page(self):
+        cluster = _FakeCluster()
+        rank = _Rank(
+            cluster, mla=False, tp_rank=0, tp_size=1, head_partition=2, draft_layers=1
+        )
+        keys = ["p0", "p1", "p2"]
+        rank.store.batch_set_v1(keys, _page_indices([0, 1, 2]))
+        draft_suffix = rank.plan.suffixes[-1]
+        self.assertIn("ukd1-", draft_suffix)
+        short_key = f"org-model_p0_{draft_suffix}"
+        cluster.objects[short_key] = cluster.objects[short_key][:-16]
+        del cluster.objects[f"org-model_p1_{draft_suffix}"]
+        self.assertEqual(
+            rank.store.batch_get_v1(keys, _page_indices([0, 1, 2])),
+            [False, False, True],
+        )
+        # Existence is by key: the short object counts, the missing one cuts
+        # the prefix.
+        self.assertEqual(rank.store.batch_exists(keys), 1)
 
     def test_page_bytes_without_a_chunk_are_refused_at_registration(self):
         """Reads are zero-copy into the host page: an unnamed byte stays stale."""

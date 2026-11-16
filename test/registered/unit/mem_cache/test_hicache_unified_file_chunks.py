@@ -10,7 +10,10 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.mem_cache.hicache_key_scheme import plan_unified_kv
+from sglang.srt.mem_cache.hicache_key_scheme import (
+    plan_unified_kv,
+    with_packed_draft,
+)
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
@@ -41,18 +44,32 @@ class _HostPool:
         self.page.copy_(page.reshape_as(self.page))
 
 
-def _rank(tp_size=1, pp_size=1, tp_rank=0, pp_rank=0):
-    # Every scalar identifies an absolute head/layer/component/token coordinate.
-    full = torch.arange(4 * 4 * 2 * 4 * 4, dtype=torch.int32).reshape(4, 4, 2, 4, 1, 4)
+def _logical_page(draft_layers=0):
+    """One page of the whole model: 4 heads x (4 target layers + drafts).
+
+    Every scalar identifies an absolute head/layer/component/token coordinate,
+    the same one whether or not draft layers follow.
+    """
+    full = torch.arange(4 * 6 * 2 * 4 * 4, dtype=torch.int32).reshape(4, 6, 2, 4, 1, 4)
+    return full[:, : 4 + draft_layers]
+
+
+def _rank(tp_size=1, pp_size=1, tp_rank=0, pp_rank=0, draft_layers=0, draft_id="x"):
+    """One rank's config, layout and page. ``draft_layers`` packed draft layers
+    follow the target layers on the final pipeline stage, as a host pool with
+    packed drafts lays them out."""
+    full = _logical_page(draft_layers)
     heads, layers = 4 // tp_size, 4 // pp_size
     start_layer = pp_rank * layers
-    page = full[
-        tp_rank * heads : (tp_rank + 1) * heads,
-        start_layer : start_layer + layers,
-    ].contiguous()
+    head_slice = slice(tp_rank * heads, (tp_rank + 1) * heads)
+    page = full[head_slice, start_layer : start_layer + layers]
+    is_final_stage = pp_rank == pp_size - 1
+    if not is_final_stage:
+        draft_layers = 0
+    page = torch.cat([page, full[head_slice, 4 : 4 + draft_layers]], dim=1).contiguous()
     layout = PageUnifiedLayout(
         page_size=4,
-        layer_num=layers,
+        layer_num=layers + draft_layers,
         head_num=heads,
         head_group_num=heads,
         head_dim=4,
@@ -73,6 +90,19 @@ def _rank(tp_size=1, pp_size=1, tp_rank=0, pp_rank=0):
         head_group=1,
         layer_partition=2,
     )
+    if draft_layers:
+        plan = with_packed_draft(
+            plan,
+            target_layer_num=layers,
+            draft_layer_num=draft_layers,
+            algorithm="EAGLE",
+            draft_id=draft_id,
+            dtype="int32",
+            row_width=layout.head_dim,
+            attn_tp_rank=tp_rank,
+            attn_cp_size=1,
+            is_final_stage=True,
+        )
     config = HiCacheStorageConfig(
         tp_rank=tp_rank,
         tp_size=tp_size,
@@ -157,6 +187,137 @@ class TestUnifiedFileChunks(unittest.TestCase):
                         torch.testing.assert_close(target, expected, rtol=0, atol=0)
                         reader_files.update(backend._get_component_keys(key))
                 self.assertEqual(reader_files, writer_files)
+
+    # Packed draft layers: one more chunk per head group, under the draft
+    # digest, appended to the rank's chunk list.
+
+    def _set(self, config, layout, page, key="page"):
+        backend = self._backend(config, layout, page)
+        transfer = PoolTransfer(
+            name=PoolName.KV, keys=[key], host_indices=torch.arange(layout.page_size)
+        )
+        self.assertEqual(backend.batch_set_v2([transfer]), {PoolName.KV: [True]})
+        return backend
+
+    def _get(self, config, layout, expected, key="page"):
+        """Read into a page of -1; the page, and whether it was restored."""
+        target = torch.full_like(expected, -1)
+        backend = self._backend(config, layout, target)
+        hit = backend.batch_exists_v2([key]).kv_hit_pages == 1
+        transfer = PoolTransfer(
+            name=PoolName.KV, keys=[key], host_indices=torch.arange(layout.page_size)
+        )
+        restored = backend.batch_get_v2([transfer]) == {PoolName.KV: [True]}
+        self.assertEqual(hit, restored)
+        return backend, target, restored
+
+    def _files(self, backend):
+        return {
+            path.name: path.read_bytes()
+            for path in sorted(Path(backend.file_path).iterdir())
+        }
+
+    def test_draft_chunks_reshard_with_the_target_across_tp_and_pp(self):
+        for writer, reader in (((2, 1), (1, 2)), ((1, 2), (2, 1)), ((2, 2), (1, 1))):
+            with self.subTest(writer=writer, reader=reader):
+                key = f"page-{writer}-{reader}"
+                for pp_rank in range(writer[1]):
+                    for tp_rank in range(writer[0]):
+                        rank = _rank(*writer, tp_rank, pp_rank, draft_layers=1)
+                        backend = self._set(*rank, key=key)
+                        draft_keys = [
+                            name
+                            for name in backend._get_component_keys(key)
+                            if "ukd1-" in name
+                        ]
+                        # Only the final stage owns draft chunks: one per head.
+                        final = pp_rank == writer[1] - 1
+                        self.assertEqual(
+                            len(draft_keys), 4 // writer[0] if final else 0
+                        )
+                for pp_rank in range(reader[1]):
+                    for tp_rank in range(reader[0]):
+                        config, layout, expected = _rank(
+                            *reader, tp_rank, pp_rank, draft_layers=1
+                        )
+                        _, target, restored = self._get(config, layout, expected, key)
+                        self.assertTrue(restored)
+                        torch.testing.assert_close(target, expected, rtol=0, atol=0)
+
+    def test_each_draft_object_holds_its_head_groups_draft_rows(self):
+        # Independently of any reader: a consistent swap of two head groups,
+        # or a chunk cut from target rows, would still round-trip.
+        logical = _logical_page(draft_layers=1)
+        for tp_rank in range(2):
+            backend = self._set(*_rank(2, 1, tp_rank, 0, draft_layers=1))
+        files = self._files(backend)
+        draft = {name: data for name, data in files.items() if "ukd1-" in name}
+        self.assertEqual(len(draft), 4)
+        self.assertEqual(len(files), 4 * 3)
+        for head in range(4):
+            (name,) = [n for n in draft if n.endswith(f"_D0-1_H{head}.bin")]
+            self.assertEqual(
+                draft[name], logical[head, 4:5].contiguous().numpy().tobytes()
+            )
+        for name, data in files.items():
+            if "_L2-4_H3" in name:
+                self.assertEqual(data, logical[3, 2:4].contiguous().numpy().tobytes())
+
+    def test_reader_without_draft_kv_reads_the_target_chunks_alone(self):
+        writer = self._set(*_rank(draft_layers=1))
+        for name in list(self._files(writer)):
+            if "ukd1-" in name:
+                # Not even present: the reader must not need them.
+                (Path(writer.file_path) / name).unlink()
+        config, layout, expected = _rank()
+        reader, target, restored = self._get(config, layout, expected)
+        self.assertTrue(restored)
+        torch.testing.assert_close(target, expected, rtol=0, atol=0)
+        self.assertFalse(any("ukd1-" in k for k in reader._get_component_keys("page")))
+
+    def test_target_only_page_misses_for_a_draft_reader_until_backfilled(self):
+        writer = self._set(*_rank())
+        before = self._files(writer)
+        config, layout, page = _rank(draft_layers=1)
+        _, target, restored = self._get(config, layout, page)
+        self.assertFalse(restored)
+        self.assertTrue(torch.all(target == -1))
+        # The draft reader's own backup adds draft objects and nothing else.
+        self._set(config, layout, page)
+        after = self._files(writer)
+        self.assertEqual({name: after[name] for name in before}, before)
+        self.assertEqual(len(after) - len(before), 4)
+        self.assertTrue(all("ukd1-" in name for name in set(after) - set(before)))
+        self.assertTrue(self._get(config, layout, page)[2])
+
+    def test_another_draft_misses_on_the_draft_chunk_alone(self):
+        ours = _rank(draft_layers=1, draft_id="draft-a")
+        theirs = _rank(draft_layers=1, draft_id="draft-b")
+        self.assertEqual(ours[0].unified_suffixes[:-4], theirs[0].unified_suffixes[:-4])
+        self.assertFalse(
+            set(ours[0].unified_suffixes[-4:]) & set(theirs[0].unified_suffixes[-4:])
+        )
+        self._set(*ours)
+        _, target, restored = self._get(*theirs)
+        self.assertFalse(restored)
+        self.assertTrue(torch.all(target == -1))
+        self.assertTrue(self._get(*ours)[2])
+
+    def test_missing_or_short_draft_chunk_fails_the_whole_page(self):
+        for damage in ("missing", "short"):
+            with self.subTest(damage=damage):
+                config, layout, page = _rank(draft_layers=1)
+                key = f"page-{damage}"
+                writer = self._set(config, layout, page, key=key)
+                path = self._path(writer, key, config.unified_suffixes[-1])
+                if damage == "missing":
+                    path.unlink()
+                else:
+                    path.write_bytes(path.read_bytes()[:-1])
+                _, target, restored = self._get(config, layout, page, key)
+                self.assertFalse(restored)
+                # Nothing of the page reaches the host, target rows included.
+                self.assertTrue(torch.all(target == -1))
 
     def test_key_order_does_not_define_byte_order(self):
         config, layout, page = _rank()
