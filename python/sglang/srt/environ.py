@@ -2224,7 +2224,7 @@ class Envs:
     SGLANG_OPT_USE_INKLING_FUSED_ATTN_PROLOGUE = EnvBool(True)
     # Override shared-expert selection: true uses grouped GEMM, false uses BMM.
     # When unset, selection follows model, quantization, and LoRA requirements.
-    SGLANG_OPT_USE_INKLING_SHARED_FUSED_MOE = EnvBool(True)
+    SGLANG_OPT_USE_INKLING_SHARED_FUSED_MOE = EnvBool(False)
     # Fold the conditional long-context log-scaling tau into its producers
     # instead of separate output-sized scale kernels: the fused attn
     # prologue's q path (bit-exact, before MXFP8 quantization there) and the
