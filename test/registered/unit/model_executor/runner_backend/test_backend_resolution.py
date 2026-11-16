@@ -6,6 +6,12 @@ from unittest import mock
 
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.runner_backend import utils as backend_utils
+from sglang.srt.model_executor.runner_backend.base_breakable_graph_backend import (
+    BaseBreakableGraphBackend,
+)
+from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
+    BreakableCudaGraphBackend,
+)
 from sglang.srt.platforms.device_mixin import PlatformEnum
 from sglang.srt.platforms.interface import SRTPlatform
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -44,6 +50,13 @@ def _make_platform(*, is_out_of_tree, full_backend_cls=None):
 
 class _OutOfTreePlatformWithoutFullGraphBackend(SRTPlatform):
     _enum = PlatformEnum.OOT
+
+
+class TestGraphBackendTypes(CustomTestCase):
+    def test_cuda_breakable_backend_implements_neutral_contract(self):
+        self.assertTrue(
+            issubclass(BreakableCudaGraphBackend, BaseBreakableGraphBackend)
+        )
 
 
 class TestResolveDecodeBackend(CustomTestCase):

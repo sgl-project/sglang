@@ -12,7 +12,10 @@ from sglang.kernels.ops.speculative.dspark.dspark_schedule import (
 )
 from sglang.srt.distributed.utils import all_gather_single
 from sglang.srt.environ import InvariantCheckLevel, envs
-from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+from sglang.srt.layers.dp_attention import (
+    is_dp_attention_enabled,
+    require_mlp_tp_gather,
+)
 from sglang.srt.managers.overlap_utils import (
     CONFIDENCE_RELAY_RING_LAG,
     FutureMap,
@@ -41,7 +44,6 @@ from sglang.srt.speculative.ragged_verify import (
     round_up_grid,
 )
 from sglang.srt.speculative.spec_tp_sync import SpecTpSync, SpecTpSyncSite
-from sglang.srt.utils.common import require_mlp_tp_gather
 from sglang.srt.utils.invariants import (
     Bucket,
     Invariant,
@@ -86,6 +88,7 @@ class DSparkVerifyPlanner:
         tp_rank: int,
         verify_num_draft_tokens: int,
         tp_sync: SpecTpSync,
+        online_confidence: bool = False,
     ) -> None:
         self.draft_model = draft_model
         self.gamma = gamma
@@ -98,6 +101,7 @@ class DSparkVerifyPlanner:
         )
 
         self._confidence_head = getattr(self.draft_model, "confidence_head", None)
+        self._online_confidence = online_confidence
 
         sts_path = get_spec().speculative_dspark_confidence_sts_path
         if sts_path and self._confidence_head is not None:
@@ -133,7 +137,8 @@ class DSparkVerifyPlanner:
             if tp_rank == 0:
                 logger.warning(
                     "DSpark STS calibration path given but no confidence head present "
-                    "(static mode / head-less checkpoint); ignoring %s.",
+                    "(static mode, or the online acceptance estimator, which "
+                    "calibrates itself); ignoring %s.",
                     sts_path,
                 )
 
@@ -145,15 +150,12 @@ class DSparkVerifyPlanner:
         self._is_verify_all = True
         self._uniform_layout_cache: dict = {}
         if self._ragged_verify_mode is not RaggedVerifyMode.STATIC:
-            if self._confidence_head is None:
+            if not self.carries_confidence:
                 raise ValueError(
                     f"DSpark ragged-verify mode {self._ragged_verify_mode.value!r} "
-                    f"schedules per-request verify lengths from the draft confidence "
-                    f"head, but this DSpark draft checkpoint has no confidence head -- "
-                    f"the checkpoint is wrong/incomplete (it ships no "
-                    f"enable_confidence_head + trained confidence_head weights). Use a "
-                    f"draft checkpoint that includes the confidence head, or run "
-                    f"SGLANG_RAGGED_VERIFY_MODE=static."
+                    f"schedules per-request verify lengths from draft confidences, but "
+                    f"the draft has neither a confidence head nor the online "
+                    f"acceptance estimator. Run SGLANG_RAGGED_VERIFY_MODE=static."
                 )
             sps_table = build_sps_cost_table(
                 verify_num_draft_tokens=self.verify_num_draft_tokens,
@@ -215,7 +217,7 @@ class DSparkVerifyPlanner:
 
     @property
     def carries_confidence(self) -> bool:
-        return self._confidence_head is not None
+        return self._confidence_head is not None or self._online_confidence
 
     @property
     def schedules_verify_budget(self) -> bool:

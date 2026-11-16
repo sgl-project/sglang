@@ -45,11 +45,6 @@ on:
         type: string
         description: image for pods
         default: "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:main-cann8.5.0-a3"
-      install_sglang_from_source:
-        required: false
-        type: boolean
-        default: true
-        description: use sglang from source code or from docker image
       prefill_decode_deployment:
         required: true
         type: string
@@ -64,6 +59,16 @@ on:
         type: string
         default: '{}'
         description: 'JSON run metadata {branch_label, workflow_name, create_time}, recorded once at workflow start'
+      accuracy_dataset:
+        required: false
+        type: string
+        default: ''
+        description: 'Accuracy dataset injected into pods as NPU_ACCURACY_DATASET (gsm8k on weekdays, gpqa_diamond on weekends)'
+      sgl_router_artifact:
+        required: false
+        type: string
+        default: ''
+        description: "sgl-router-build's aarch64 artifact for the router pod; empty uses the image's sgl-router."
 
 concurrency:
   group: ascend-nightly-multi-node-${{ github.workflow_ref }}-${{ github.ref }}-${{ inputs.test_config_name }}
@@ -98,8 +103,33 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      # continue-on-error: the artifact expires in a day, and the router pod falls
+      # back to the image's sgl-router.
+      - name: Download prebuilt sgl-router
+        if: inputs.sgl_router_artifact != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.sgl_router_artifact }}
+          path: sgl-router-bin
+
       - name: Prepare code for testing
+        timeout-minutes: 15
         run: |
+          # Sweep orphaned sglang-{run_id} dirs left by jobs killed before Post process.
+          # Backgrounded and capped: the shared PVC is slow, and a pre-existing backlog
+          # must not block the critical path. fds are redirected so the runner does not
+          # wait on the background job's stdout.
+          ( find /root/.cache/tests -regextype posix-extended -maxdepth 1 -type d \
+              -regex '.*/sglang-[0-9]+$' -mtime +7 -print 2>/dev/null \
+            | head -n 5 | xargs -r rm -rf ) >/dev/null 2>&1 </dev/null &
+
+          # The download drops the executable bit; cp keeps it for the pods.
+          chmod +x sgl-router-bin/sgl-router 2>/dev/null || true
+          if [ "${{ inputs.prefill_decode_deployment }}" = "separation" ] && [ ! -x sgl-router-bin/sgl-router ]; then
+            echo "::warning::No prebuilt sgl-router; the router pod falls back to sgl-router on the image's PATH."
+          fi
+
           # copy source code to shared-disk
           # Append run_id to isolate concurrent runs sharing the same PVC.
           current_path=$(pwd)
@@ -194,6 +224,15 @@ jobs:
             --kube-job-name-prefix ${KUBE_JOB_NAME} \
             --run-id ${{ github.run_id }}"
 
+          accuracy_dataset="${{ inputs.accuracy_dataset }}"
+          case "${accuracy_dataset}" in
+            ""|gsm8k|gpqa_diamond) ;;
+            *) echo "Unsupported accuracy dataset: ${accuracy_dataset}"; exit 1 ;;
+          esac
+          if [ -n "${accuracy_dataset}" ]; then
+            CMD="${CMD} --accuracy-dataset ${accuracy_dataset}"
+          fi
+
           if [ "$prefill_decode_deployment" = "separation" ];then
             CMD="${CMD} \
               --prefill-size ${{ inputs.prefill_size }} \
@@ -211,15 +250,7 @@ jobs:
             CMD="${CMD} --sglang-is-in-ci"
           fi
 
-          install_sglang_from_source="${{ inputs.install_sglang_from_source }}"
-          if [ "$install_sglang_from_source" = "true" ] || [ "$install_sglang_from_source" = "True" ];then
-            echo "Install sglang from source."
-            CMD="${CMD} --install-sglang-from-source"
-            commit_id=${{ github.sha }}
-            echo "commit id: ${commit_id}" > "$(dirname "${sglang_test_results_output_path}")/commit_id"
-          else
-            echo "Use sglang from image: ${{ inputs.image }}"
-          fi
+          echo "commit id: ${{ github.sha }}" > "$(dirname "${sglang_test_results_output_path}")/commit_id"
 
           if [ "$transformers_version" != "" ];then
             CMD="${CMD} --transformers-version ${transformers_version}"

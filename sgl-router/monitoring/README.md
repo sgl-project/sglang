@@ -155,7 +155,8 @@ panic-500) are logged too. Fields: `pod_id`, `request_id`, `method`, `path`,
 
 `worker` and `model` are empty when the request was rejected before dispatch or
 hit a route that does not dispatch — that is normal, not a gap. Successful infra
-polls (`/healthz`, `/readyz`, `/metrics`) log at DEBUG so they do not bury real
-traffic; a *failing* probe keeps the INFO line. For a stream the line is written
-when the response head is ready, so `status=200` there does not mean the stream
-finished — `sgl_router_stream_outcome_total` carries that.
+polls (`/healthz` and `/readyz`, their aliases `/health`, `/liveness`, and
+`/readiness`, `/health_generate`, and `/metrics`) log at DEBUG so they do not
+bury real traffic; a *failing* probe keeps the INFO line. For a stream the line
+is written when the response head is ready, so `status=200` there does not mean
+the stream finished — `sgl_router_stream_outcome_total` carries that.

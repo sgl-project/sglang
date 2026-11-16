@@ -15,6 +15,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionMessageContentVideoURL,
 )
 from sglang.srt.models.minimax_vl_common import _stack_pixel_values
+from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
 from sglang.srt.multimodal.processors.minimax_m3_vl import (
@@ -30,7 +31,6 @@ from sglang.srt.multimodal.processors.minimax_m31_media import (
     MiniMaxM31VideoProcessor,
 )
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
-from sglang.srt.utils import ImageData, VideoData
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
