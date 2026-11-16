@@ -156,7 +156,7 @@ def _encode_image_bytes(
 
     try:
         image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-    except (OSError, SyntaxError) as e:
+    except (OSError, SyntaxError, Image.DecompressionBombError) as e:
         raise ValueError(f"Could not decode image: {e}") from e
     scaled_size = _scaled_image_dimensions(
         *image.size,
