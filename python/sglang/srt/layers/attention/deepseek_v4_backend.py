@@ -1868,8 +1868,10 @@ class DeepseekV4AttnBackend(
         the full top-k layers score at eager breaks, and the consumers score the
         published candidate blocks in the graph. Otherwise the sources are one eager
         break."""
-        return bool(self.low_ratios) and isinstance(
-            self.prefill_candidates, SparseTableBackend
+        return (
+            bool(self.low_ratios)
+            and get_parallel().attn_cp_size == 1
+            and isinstance(self.prefill_candidates, SparseTableBackend)
         )
 
     def can_run_prefill_cuda_graph(self, forward_batch: ForwardBatch) -> bool:
@@ -2136,6 +2138,7 @@ class DeepseekV4AttnBackend(
                 req = torch.repeat_interleave(
                     forward_batch.req_pool_indices.to(torch.int64),
                     tail_lens.to(torch.int64),
+                    output_size=real_rows,
                 )
                 metadata.low_ratio_req_indices = torch.cat(
                     [req, req[-1:].expand(cap - real_rows)]
