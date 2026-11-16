@@ -96,7 +96,6 @@ class TestGPTQMarlinMoE(CustomTestCase):
             quant_config=None,
             use_padded_loading=False,
             use_presharded_weights=False,
-            use_triton_kernels=False,
             moe_tp_size=2,
             moe_tp_rank=1,
         )

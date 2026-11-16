@@ -16,7 +16,7 @@
 import dataclasses
 import json
 import logging
-from typing import Callable, Dict, List, Optional, Sequence, Tuple, Union
+from typing import Callable, Dict, List, Optional, Sequence, Union
 
 import torch
 from xgrammar import (
@@ -164,40 +164,6 @@ class XGrammarGrammar(BaseGrammarObject):
             self.key_string,
             grammar_stats,
         )
-
-    def try_jump_forward(self, tokenizer) -> Optional[Tuple[List[int], str]]:
-        s = self.matcher.find_jump_forward_string()
-        if s:
-            return [], s
-        return None
-
-    def jump_forward_str_state(self, helper: Tuple[List[int], str]) -> Tuple[str, int]:
-        _, data = helper
-        return data, -1
-
-    def jump_and_retokenize(
-        self, old_output_ids: List[int], new_output_ids: List[int], next_state: int
-    ):
-        k = 0
-        for i, old_id in enumerate(old_output_ids):
-            if old_id == new_output_ids[i]:
-                k = i + 1
-            else:
-                break
-
-        # rollback to the last token that is the same
-        if k < len(old_output_ids):
-            self.matcher.rollback(len(old_output_ids) - k)
-
-        for i in range(k, len(new_output_ids)):
-            if not self.matcher.accept_token(new_output_ids[i]):
-                raise ValueError(
-                    f"Token not accepted during retokenization: {new_output_ids[i]} "
-                    f"at position {i}\n"
-                    f"Old output IDs: {old_output_ids}\n"
-                    f"New output IDs: {new_output_ids}\n"
-                    f"Key string: {self.key_string}"
-                )
 
     def __repr__(self):
         return f"XGrammarGrammar({self.key_string=}, {self.accepted_tokens=}, {self.current_token=})"

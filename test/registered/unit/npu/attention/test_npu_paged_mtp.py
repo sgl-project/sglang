@@ -43,6 +43,7 @@ def source_method(path, cls, method, namespace):
 @pytest.fixture
 def backend():
     obj = mod.AscendAttnBackend.__new__(mod.AscendAttnBackend)
+    obj.use_quant_flash_attn = False
     obj.use_paged_mtp = True
     obj.paged_mtp_attention_decode = Mock()
     obj.use_flash_mla = obj.use_mla = False
@@ -268,7 +269,7 @@ def test_draft_preserves_cpu_lengths_unless_backend_opts_out(
         draft_model_runner=runner,
         _draft_block_spec_info=object(),
         _fill_dp_moe_sync_metadata=Mock(),
-        deferred_commit=None,
+        deferred_draft_kv=None,
     )
     proposer.draft_block_ids_view = lambda **kwargs: draft_block_ids_view(
         proposer, **kwargs

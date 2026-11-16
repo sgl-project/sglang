@@ -166,6 +166,10 @@ def _load(module_name: str, relative_path: str):
     )
     module = importlib.util.module_from_spec(spec)
     sys.modules[module_name] = module
+    # mock.patch on Python 3.10 resolves dotted targets with getattr from the
+    # package down, so every module must also be an attribute of its parent.
+    parent, _, name = module_name.rpartition(".")
+    setattr(sys.modules[parent], name, module)
     spec.loader.exec_module(module)
     return module
 
@@ -180,6 +184,7 @@ def _load_plugin():
     core = types.ModuleType(f"{PKG}.core")
     core.__path__ = [str(PLUGIN_DIR / "core")]
     sys.modules[f"{PKG}.core"] = core
+    package.core = core
 
     server_api = _load(f"{PKG}.core.server_api", "core/server_api.py")
     core.SGLDiffusionServerAPI = server_api.SGLDiffusionServerAPI

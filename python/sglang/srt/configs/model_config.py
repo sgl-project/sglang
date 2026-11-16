@@ -733,6 +733,15 @@ class ModelConfig:
                 **kwargs,
             )
         )
+        if (
+            get_platform().is_npu
+            and self.hf_config.model_type == "longcat_flash"
+            and not hasattr(self.hf_config, "indexer_rope_interleave")
+        ):
+            # Resolve LongCat's indexer layout after applying model overrides.
+            self.hf_config.indexer_rope_interleave = getattr(
+                self.hf_config, "rope_interleave", True
+            )
         self.pointer_head = None
         base = POINTER_ADAPTER_BASES.get((self.model_path, revision))
         if base is not None:
@@ -1790,9 +1799,6 @@ class ModelConfig:
         if rope_scaling:
             self.scaling = compute_mla_mscale_scaling(rope_scaling, self.scaling)
 
-    def get_total_num_attention_heads(self) -> int:
-        return self.num_attention_heads
-
     def get_num_attention_heads(self, tensor_parallel_size) -> int:
         # Pure-SSM (Mamba) models have no attention; num_attention_heads is None.
         total_num_attention_heads = self.num_attention_heads or 0
@@ -2181,6 +2187,7 @@ class ModelConfig:
         rocm_supported_quantization = [
             "awq",
             "fp8",
+            "gptq",
             "compressed_tensors",
             "compressed-tensors",
             "w8a8_fp8",
