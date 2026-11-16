@@ -155,11 +155,11 @@ export const AgentX = ({ data: input }) => {
     }
     return out;
   };
-  // The submissions record their router in the Python router's flags. Render the sgl-router
-  // equivalent, as the AgentX test harness launches it: one --worker-urls list (sgl-router reads
-  // each worker's PD role and bootstrap port from its /server_info), the workers' served model
-  // name, and the worker's tokenizer for cache-aware routing, --no-tokenizer otherwise. Flags
-  // whose behavior is sgl-router's default, or that it has no counterpart for, are dropped.
+  // Submissions record the Python router's flags; render the sgl-router command that
+  // python/sglang/test/agentx_common.py launches for them, and keep the two in step.
+  // sgl-router reads each worker's PD role from its /server_info, so one --worker-urls list
+  // replaces --prefill/--decode.
+  // Flags whose behavior is sgl-router's default, or that it has no counterpart for.
   const ROUTER_FLAGS_DROPPED = new Set(["--pd-disaggregation", "--request-id-headers",
     "--connect-timeout-secs", "--disable-health-check", "--disable-retries",
     "--balance-abs-threshold", "--retry-backoff-multiplier"]);

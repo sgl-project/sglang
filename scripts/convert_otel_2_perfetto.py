@@ -139,7 +139,6 @@ def extract_all_otel_spans(otel_data):
     engine_otel_spans = []
     for line_data in otel_data:
         for resource_spans in line_data["resourceSpans"]:
-            # filter: only keep spans which service.name is 'sglang'
             service_name = ""
             for attr in resource_spans["resource"]["attributes"]:
                 if attr["key"] == "service.name":

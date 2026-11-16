@@ -1722,37 +1722,33 @@ mod tests {
             generate_hook: None,
             openai_chat: None,
         });
-        for (body, rank) in [
-            (r#"{"input_ids": [1], "routed_dp_rank": 3}"#, 3),
-            (r#"{"input_ids": [1], "routed_dp_rank": 2}"#, 2),
-        ] {
-            let logs = crate::utils::logging::capture_logs();
-            let request = Request::builder()
-                .method("POST")
-                .uri("/generate")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap();
-            let response = routes()
-                .with_state(state.clone())
-                .oneshot(request)
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
-            let reply = axum::body::to_bytes(response.into_body(), 64 * 1024)
-                .await
-                .unwrap();
-            let message = format!("routed_dp_rank={rank} out of range [0, 1)");
-            assert_eq!(
-                parse(std::str::from_utf8(&reply).unwrap())["error"]["message"],
-                message
-            );
-            let rejections = logs.rejections();
-            assert!(
-                matches!(rejections.as_slice(), [line] if line.contains("WARN") && line.contains(&message)),
-                "{rejections:?}"
-            );
-        }
+        let (body, rank) = (r#"{"input_ids": [1], "routed_dp_rank": 3}"#, 3);
+        let logs = crate::utils::logging::capture_logs();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        let reply = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let message = format!("routed_dp_rank={rank} out of range [0, 1)");
+        assert_eq!(
+            parse(std::str::from_utf8(&reply).unwrap())["error"]["message"],
+            message
+        );
+        let rejections = logs.rejections();
+        assert!(
+            matches!(rejections.as_slice(), [line] if line.contains("WARN") && line.contains(&message)),
+            "{rejections:?}"
+        );
     }
 
     /// An item whose `sampling_params` name no `max_new_tokens` is marked

@@ -13,7 +13,8 @@ GPU_MEMORY_ALL_TYPES = [
 
 HEALTH_CHECK_RID_PREFIX = "HEALTH_CHECK"
 
-# Request header carrying the routing key that routers such as sgl-router route on.
+# Request header carrying the routing key; must equal ROUTING_KEY_HEADER in
+# rust/sglang-processor/src/openai/mod.rs, which sgl-router's sticky policy reads.
 ROUTING_KEY_HEADER = "x-sgl-routing-key"
 
 

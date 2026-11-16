@@ -168,7 +168,6 @@ export const config = {
           ],
           envWhen: { hw: ["gb200", "gb300"] } },
       ],
-      // Router fronting both roles.
       router: {
         port: 30080,
         command:

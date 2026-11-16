@@ -326,7 +326,7 @@ export const config = {
       ],
       routerOverrides: [
         {
-          // MI35x 1P1D: measured behind an earlier router; sgl-router ships in the ROCm image.
+          // MI35x 1P1D: its benchmark numbers were measured before the switch to sgl-router.
           when: { hw: ["mi350x", "mi355x"] },
           command:
 `sgl-router \\

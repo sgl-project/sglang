@@ -1,5 +1,4 @@
-"""Basic chat-completions correctness through sgl-router (not per-message
-validators).
+"""Basic chat-completions correctness through sgl-router.
 
 The shape:
   - single-worker regular-mode router

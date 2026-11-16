@@ -15,7 +15,7 @@ suppress_noisy_warnings()
 
 
 def run_server(server_args):
-    """Run the server based on server_args.encoder_only and --grpc-mode."""
+    """Start the server server_args selects: encoder (HTTP or gRPC), Ray, or HTTP."""
     # `prepare_server_args` returns raw input. Resolve it before any server
     # starts, so that its checks, among them that `--grpc-mode` requires
     # `--encoder-only`, run first.

@@ -5,7 +5,7 @@ This file pairs with `sgl-router/benches/`.
 ## Scope
 
 These are CPU-bound microbenches that don't need GPUs — they target
-routing-decision latency only. The full E2E throughput comparison
+routing-decision latency only. The full E2E throughput measurement
 (genai-bench at 4×H200 against a real SGLang fleet) is **not** part of
 this file; it requires a real GPU cluster and is tracked separately.
 
@@ -51,11 +51,3 @@ Both `random` and `power_of_two` are now O(1), ensuring consistent
 performance regardless of worker count.
 TODO: Add a regression guard for the O(n) shape. Although `policy_select`
 measures the metric, nothing currently runs or gates on these results.
-
-## Calibration
-
-Every routing-latency metric needs a real-cluster measurement. The
-bench-harness here is the small-scale, CPU-only complement; it catches
-algorithmic regressions in the routing primitives without burning GPU
-time. Pair both: this file in pre-commit / CI tier-2, and the
-real-cluster e2e.

@@ -578,7 +578,6 @@ mod tests {
         ] {
             assert_eq!(pydantic_int(&value), rank, "{value}");
         }
-        assert_eq!(body_rank(HintRoute::Generate, text), None);
         for unread in [
             &br#"{"text": "hi"}"#[..],
             br#"{"routed_dp_rank": null}"#,

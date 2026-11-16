@@ -922,26 +922,15 @@ sgl-eval run mmmu_pro \\
             "--enable-metrics",
           ] },
       ],
-      // MI355X fronts the 1P x 1D agentic pair with a cache-aware router rather
-      // than the default round-robin: cache_aware with --dp-aware keeps a
-      // conversation on the prefill DP rank that already holds its prefix
-      // (decode holds no reusable prefix and keeps power_of_two). cache_aware
-      // learns prefixes only from the prefill worker's KV events, so every
-      // MI355X prefill role above publishes them (--kv-events-config) with its
-      // load reports (--load-publish-endpoint auto); the router finds both
-      // through the worker's /server_info, one port per DP rank. cache_aware
-      // also needs a tokenizer, so this router loads the model's instead of
-      // running with --no-tokenizer.
+      // MI355X fronts the 1P x 1D agentic pair with cache_aware --dp-aware, which keeps a
+      // conversation on the prefill DP rank holding its prefix (decode keeps power_of_two);
+      // it learns prefixes from the prefill roles' KV events and needs a tokenizer.
       //
-      // The DP-attention arm additionally raises the router's timeouts to 4
-      // hours: sgl-router's defaults (300 s to the first response bytes, 600 s
-      // per request) abort requests still queued behind an overloaded prefill,
-      // and an abort landing mid-RDMA-write strands the MORI TransferStatus and
-      // wedges that prefill DP's transfers for good. They bound the whole
-      // request, NOT only its queueing, so raising them also delays the abort
-      // of a genuinely wedged worker to 4 hours. They therefore stay scoped to
-      // the pair that needs them instead of riding on every MI355X pair. First
-      // match wins, so the narrower entry goes first.
+      // The DP-attention arm raises the router's timeouts to 4 h: the defaults (300 s to the
+      // first response bytes, 600 s per request) abort requests queued behind an overloaded
+      // prefill, and an abort mid-RDMA-write wedges that prefill DP's MORI transfers. Raising
+      // them also delays the abort of a wedged worker, so only this pair gets them; first match
+      // wins, so it goes first.
       routerOverrides: [
         { when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["high-throughput"] },

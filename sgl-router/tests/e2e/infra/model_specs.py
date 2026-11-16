@@ -60,7 +60,6 @@ MODEL_SPECS: dict[str, dict] = {
         "features": ["chat", "streaming"],
         "worker_args": CI_WORKER_ARGS,
     },
-    # Standard small chat model.
     "llama-1b": {
         "model": _resolve_model_path("meta-llama/Llama-3.2-1B-Instruct"),
         "memory_gb": 4,
@@ -68,7 +67,6 @@ MODEL_SPECS: dict[str, dict] = {
         "features": ["chat", "streaming"],
         "worker_args": CI_WORKER_ARGS,
     },
-    # Primary 8B chat model.
     "llama-8b": {
         "model": _resolve_model_path("meta-llama/Llama-3.1-8B-Instruct"),
         "memory_gb": 16,

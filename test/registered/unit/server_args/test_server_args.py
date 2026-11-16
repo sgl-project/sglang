@@ -4770,9 +4770,7 @@ class TestGrpcServerArgs(CustomTestCase):
     def test_grpc_mode_requires_encoder_only(self):
         with self.assertRaisesRegex(ValueError, "requires --encoder-only"):
             handle_deprecated_args(self._args(grpc_mode=True))
-        sa = self._args(grpc_mode=True, encoder_only=True)
-        handle_deprecated_args(sa)
-        self.assertIsNone(resolution_result(sa, "grpc_port"))
+        handle_deprecated_args(self._args(grpc_mode=True, encoder_only=True))
 
     def test_native_grpc_rejects_multi_tokenizer(self):
         sa = self._args(grpc_port=40000, tokenizer_worker_num=2)

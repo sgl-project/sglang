@@ -192,12 +192,9 @@ def _engine_cli_args(config: dict) -> list:
     return args
 
 
-# A recipe's ``sglang-router`` frontend args become the sgl-router flags the
-# cookbook renders for the same submission (``toSglRouter`` in
-# docs/src/snippets/_agentx.jsx): ``_ROUTER_ARGS_DROPPED`` equals its
-# ``ROUTER_FLAGS_DROPPED``, and the policy, request-timeout-secs and
-# retry-max-retries branches match its branches. Unlike the page, an arg in
-# neither table raises here, so a flag sgl-router reads differently is caught.
+# Mirrors toSglRouter in docs/src/snippets/_agentx.jsx: the dropped set and the
+# policy, request-timeout-secs and retry-max-retries branches must match. Unlike
+# the page, an arg in neither set raises here.
 # Args whose behavior is sgl-router's default, or that it has no counterpart for.
 _ROUTER_ARGS_DROPPED = {
     "pd-disaggregation",
@@ -208,7 +205,6 @@ _ROUTER_ARGS_DROPPED = {
     "balance-abs-threshold",
     "retry-backoff-multiplier",
 }
-# Args sgl-router takes as they are.
 _ROUTER_ARGS_PASSED = {
     "dp-aware",
     "disable-circuit-breaker",
@@ -218,18 +214,11 @@ _ROUTER_ARGS_PASSED = {
 
 
 def _router_policy(frontend_args: dict) -> str | None:
-    """The sgl-router policy for a recipe's frontend args.
-
-    consistent_hashing pinned a routing key to a worker; cache_aware, which keeps
-    a conversation on the worker holding its prefix, stands in for it (sgl-router's
-    sticky is the exact counterpart, but needs clients to send the key).
-    """
     policy = frontend_args.get("policy")
     return "cache_aware" if policy == "consistent_hashing" else policy
 
 
 def _router_cli_args(config: dict) -> list:
-    """sgl-router flags for the args of a recipe's ``sglang-router`` frontend."""
     args = []
     for key, value in config.items():
         key = key.replace("_", "-")
@@ -243,8 +232,8 @@ def _router_cli_args(config: dict) -> list:
             elif value is not False:
                 args += [f"--{key}", str(value)]
         elif key == "request-timeout-secs":
-            # The recipe bounds the whole request; sgl-router bounds the time to
-            # response headers, the silence between chunks and the lifetime apart.
+            # The recipe bounds the whole request; sgl-router bounds the time to response
+            # headers, the silence between chunks and the request lifetime separately.
             for flag in (
                 "--request-timeout-secs",
                 "--stream-idle-timeout-secs",
@@ -308,8 +297,8 @@ def _launch_router(
         *_router_cli_args(frontend_args),
     ]
     print(f"router command={' '.join(command)}", flush=True)
-    # The worker's env: a router that renders chats reads the same render
-    # defaults (SGLANG_DEFAULT_THINKING, SGLANG_DSV41_REASONING_EFFORT).
+    # The worker's env: a router that renders chats reads the same render defaults
+    # (SGLANG_DEFAULT_THINKING, SGLANG_DSV4_REASONING_EFFORT, SGLANG_DSV41_REASONING_EFFORT).
     process = subprocess.Popen(command, env=env)
     url = f"http://127.0.0.1:{port}"
     try:
