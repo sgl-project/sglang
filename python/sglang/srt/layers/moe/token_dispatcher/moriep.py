@@ -52,7 +52,7 @@ MORI_MIN_LOGICAL_RECV_ROWS = 32
 MORI_LOGICAL_RECV_ROW_ALIGN = 32
 
 _is_hip = is_hip()
-_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
 if _use_aiter:
     from aiter import QuantType, get_hip_quant

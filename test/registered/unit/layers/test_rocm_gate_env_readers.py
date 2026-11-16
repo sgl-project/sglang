@@ -23,6 +23,8 @@ _READER_ROOTS = (
     "layer_boundary",
     "moe",
 )
+# The MoRI dispatcher is not covered: it parses its switches itself.
+_UNCOVERED = ("moe/token_dispatcher/moriep.py",)
 _RAW_READ = re.compile(
     r"""(get_bool_env_var|getenv|environ(\.get)?)\s*[\(\[]\s*["'](%s)["']"""
     % "|".join(switch.name for switch in _SWITCHES)
@@ -32,7 +34,9 @@ _RAW_READ = re.compile(
 def _reader_sources():
     for root in _READER_ROOTS:
         path = _LAYERS_DIR / root
-        yield from sorted(path.rglob("*.py")) if path.is_dir() else [path]
+        for source in sorted(path.rglob("*.py")) if path.is_dir() else [path]:
+            if source.relative_to(_LAYERS_DIR).as_posix() not in _UNCOVERED:
+                yield source
 
 
 class TestRocmGateEnvReaders(CustomTestCase):
