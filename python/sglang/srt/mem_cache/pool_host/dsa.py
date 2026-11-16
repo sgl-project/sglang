@@ -141,7 +141,6 @@ class DSAIndexerPoolHost(HostKVCache):
         self.indexer_layout_dim = self.indexer_page_stride_size * self.layer_num
         self.indexer_page_num = (self.size + self.page_size + 1) // self.page_size
         self.size_per_token = self.indexer_layout_dim // self.page_size
-        self.can_use_jit = False
         self.can_use_write_back_jit = False
         if self._is_dummy:
             self.index_k_with_scale_buffer = None

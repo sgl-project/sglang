@@ -125,7 +125,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         host_token_capacity: int | None = None,
     ):
         self._is_dummy = isinstance(buffer_info, MLAHostAllocation)
-        self.override_kv_cache_dim = override_kv_cache_dim
         if _is_xpu and not self._is_dummy:
             require_kvcacheio_ops(
                 pool=type(self).__name__, layout=layout, ops=self._kvcacheio_ops
