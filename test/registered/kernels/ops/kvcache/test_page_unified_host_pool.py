@@ -747,5 +747,249 @@ def test_packed_draft_pages_reach_another_tp_size_through_file_storage(
         ), f"V mismatch at {kind} layer {layer}"
 
 
+# A draft KV pool beside the target's (DFLASH without its ring): a host pool of
+# its own geometry, cut into the head groups of the unified grid, whose pages
+# are stored as chunks under the draft digest.
+
+DRAFT_LAYERS = 3
+DRAFT_HEADS = 4
+
+
+def _draft_sidecar_rank(reference_k, reference_v, tp_rank, tp_size, head_partition):
+    """One attention-TP rank's draft device pool and the host pool the
+    assembler builds for it under the unified key scheme."""
+    from types import SimpleNamespace
+    from unittest import mock
+
+    from sglang.srt import runtime_context
+    from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
+    from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+    from sglang.srt.mem_cache.pool_host.common import (
+        ALLOC_MEMORY_FUNCS,
+        alloc_with_pin_memory,
+    )
+
+    local_heads = DRAFT_HEADS // tp_size
+    heads = slice(tp_rank * local_heads, (tp_rank + 1) * local_heads)
+    pool = MHATokenToKVPool(
+        size=PAGE_SIZE * 8,
+        page_size=PAGE_SIZE,
+        dtype=torch.float16,
+        head_num=local_heads,
+        head_dim=HEAD_DIM,
+        layer_num=DRAFT_LAYERS,
+        device=DEVICE,
+        enable_memory_saver=False,
+        start_layer=0,
+        end_layer=DRAFT_LAYERS,
+    )
+    for layer in range(DRAFT_LAYERS):
+        pool.k_buffer[layer].copy_(reference_k[layer][:, heads])
+        pool.v_buffer[layer].copy_(reference_v[layer][:, heads])
+    # What prepare_hicache_staging() leaves on the pool before KV sizing.
+    pool.hicache_write_back_staging = _prepare_staging(
+        pool, head_group_num=local_heads // head_partition, layer_num=DRAFT_LAYERS
+    )
+    memory = SimpleNamespace(
+        hicache_storage_key_scheme="unified",
+        hicache_storage_head_partition=head_partition,
+    )
+    original = ALLOC_MEMORY_FUNCS[DEVICE]
+    ALLOC_MEMORY_FUNCS[DEVICE] = alloc_with_pin_memory
+    try:
+        with mock.patch.object(runtime_context, "get_memory", return_value=memory):
+            host_pool = hybrid_pool_assembler._build_mha_mla_host_pool(
+                pool=pool,
+                buffer_info=pool.get_device_pool_infos()[0].buffer_info,
+                host_to_device_ratio=2.0,
+                page_size=PAGE_SIZE,
+                layout="page_unified",
+                allocator_type="default",
+                pool_label="draft",
+            )
+    finally:
+        ALLOC_MEMORY_FUNCS[DEVICE] = original
+    return pool, host_pool
+
+
+def _file_backend_with_draft_sidecar(host_pool, tp_rank, tp_size, head_partition):
+    from types import SimpleNamespace
+
+    from sglang.srt.mem_cache.hicache_key_scheme import (
+        plan_unified_draft_sidecar,
+        plan_unified_kv,
+    )
+    from sglang.srt.mem_cache.hicache_storage import (
+        HiCacheFile,
+        HiCacheStorageConfig,
+        PoolName,
+        UnifiedPoolChunks,
+    )
+    from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
+
+    # The target: 8 kv heads in bfloat16. Only its names matter here.
+    target_heads = 8 // tp_size
+    target_layout = PageUnifiedLayout(
+        page_size=PAGE_SIZE,
+        layer_num=LAYERS,
+        head_num=target_heads,
+        head_group_num=target_heads // head_partition,
+        head_dim=HEAD_DIM,
+        itemsize=2,
+    )
+    target = plan_unified_kv(
+        model_id="test/model",
+        dtype="bfloat16",
+        page_size=PAGE_SIZE,
+        rank_replicated=False,
+        local_kv_heads=target_heads,
+        attn_tp_rank=tp_rank,
+        attn_tp_size=tp_size,
+        attn_cp_size=1,
+        start_layer=0,
+        end_layer=LAYERS,
+        is_final_stage=True,
+        head_group=head_partition,
+    )
+    layout = host_pool.page_unified_layout
+    plan = plan_unified_draft_sidecar(
+        target=target.namespace,
+        algorithm="DFLASH",
+        draft_id="org/dflash@main",
+        dtype="float16",
+        rank_replicated=False,
+        local_kv_heads=layout.head_num,
+        row_width=layout.head_dim,
+        layer_num=layout.layer_num,
+        attn_tp_rank=tp_rank,
+        attn_tp_size=tp_size,
+        attn_cp_size=1,
+        head_group=head_partition,
+    )
+    config = HiCacheStorageConfig(
+        tp_rank=tp_rank,
+        tp_size=tp_size,
+        pp_rank=0,
+        pp_size=1,
+        attn_cp_rank=0,
+        attn_cp_size=1,
+        is_mla_model=False,
+        enable_storage_metrics=False,
+        is_page_first_layout=False,
+        model_name="test/model",
+        unified_suffixes=target.suffixes,
+        unified_chunk_spans=target.chunk_spans(target_layout),
+        unified_pool_chunks={
+            PoolName.DRAFT: UnifiedPoolChunks(
+                suffixes=tuple(plan.suffixes),
+                spans=tuple(plan.chunk_spans(layout)),
+                is_writer=True,
+            )
+        },
+        extra_config={"max_size": 0, "min_free_space": 0},
+    )
+    backend = HiCacheFile(config)
+    backend.register_mem_pool_host(
+        SimpleNamespace(page_unified_layout=target_layout, page_size=PAGE_SIZE)
+    )
+    backend.register_mem_host_pool_v2(host_pool, PoolName.DRAFT)
+    return backend, plan
+
+
+@pytest.mark.parametrize("head_partition", [1, 2])
+@pytest.mark.parametrize("writer_tp_size,reader_tp_size", [(1, 2), (2, 1), (2, 2)])
+def test_draft_sidecar_pages_reach_another_tp_size_through_file_storage(
+    writer_tp_size, reader_tp_size, head_partition, tmp_path
+):
+    from sglang.srt.environ import envs
+    from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+
+    keys = ["page-a", "page-b", "page-c"]
+    generator = torch.Generator().manual_seed(20261119)
+    shape = (PAGE_SIZE * 8 + PAGE_SIZE, DRAFT_HEADS, HEAD_DIM)
+    reference_k = [torch.empty(shape, dtype=torch.float16) for _ in range(DRAFT_LAYERS)]
+    reference_v = [torch.empty(shape, dtype=torch.float16) for _ in range(DRAFT_LAYERS)]
+    for buffer in (*reference_k, *reference_v):
+        buffer.copy_(
+            torch.randint(0, 128, shape, generator=generator, dtype=torch.int32)
+        )
+    writer_pages, reader_pages = [5, 1, 3], [0, 4, 2]
+    source = _page_indices(writer_pages, PAGE_SIZE)
+
+    with envs.SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR.override(str(tmp_path)):
+        for tp_rank in range(writer_tp_size):
+            pool, host_pool = _draft_sidecar_rank(
+                reference_k, reference_v, tp_rank, writer_tp_size, head_partition
+            )
+            groups = DRAFT_HEADS // writer_tp_size // head_partition
+            assert host_pool.page_unified_layout.head_group_num == groups
+            host_indices = _page_indices([2, 6, 0], PAGE_SIZE)
+            host_pool.backup_from_device_all_layer(
+                pool,
+                host_indices,
+                _page_indices(writer_pages, PAGE_SIZE).to(DEVICE),
+                "kernel",
+            )
+            torch.cuda.synchronize()
+            backend, plan = _file_backend_with_draft_sidecar(
+                host_pool, tp_rank, writer_tp_size, head_partition
+            )
+            assert len(plan.suffixes) == groups
+            transfer = PoolTransfer(
+                name=PoolName.DRAFT, keys=keys, host_indices=host_indices
+            )
+            assert backend.batch_set_v2([transfer]) == {PoolName.DRAFT: [True] * 3}
+
+        # Each object is one head group's draft layers, K then V per layer,
+        # computed here from the reference rows and not from any layout code.
+        total_groups = DRAFT_HEADS // head_partition
+        for page, key in zip(writer_pages, keys):
+            rows = slice(page * PAGE_SIZE, (page + 1) * PAGE_SIZE)
+            for group in range(total_groups):
+                heads = slice(group * head_partition, (group + 1) * head_partition)
+                (path,) = tmp_path.glob(f"{key}_ukd1-*_D0-{DRAFT_LAYERS}_H{group}.bin")
+                expected = torch.stack(
+                    [
+                        torch.stack([k[rows, heads], v[rows, heads]])
+                        for k, v in zip(reference_k, reference_v)
+                    ]
+                )
+                assert path.read_bytes() == expected.numpy().tobytes(), (key, group)
+        assert len(list(tmp_path.glob("*.bin"))) == 3 * total_groups
+
+        # Readers of another TP size: empty pools, their own cut of the page.
+        zeros = [torch.zeros_like(buffer) for buffer in reference_k]
+        for tp_rank in range(reader_tp_size):
+            pool, host_pool = _draft_sidecar_rank(
+                zeros, zeros, tp_rank, reader_tp_size, head_partition
+            )
+            backend, _ = _file_backend_with_draft_sidecar(
+                host_pool, tp_rank, reader_tp_size, head_partition
+            )
+            host_indices = _page_indices([7, 3, 5], PAGE_SIZE)
+            transfer = PoolTransfer(
+                name=PoolName.DRAFT, keys=keys, host_indices=host_indices
+            )
+            assert backend.batch_exists_v2(keys[:0], [transfer]).kv_hit_pages == 0
+            assert backend.batch_get_v2([transfer]) == {PoolName.DRAFT: [True] * 3}
+            device_indices = _page_indices(reader_pages, PAGE_SIZE).to(DEVICE)
+            for layer in range(DRAFT_LAYERS):
+                host_pool.load_to_device_per_layer(
+                    pool, host_indices.to(DEVICE), device_indices, layer, "kernel"
+                )
+            torch.cuda.synchronize()
+            heads = DRAFT_HEADS // reader_tp_size
+            local = slice(tp_rank * heads, (tp_rank + 1) * heads)
+            for layer in range(DRAFT_LAYERS):
+                assert torch.equal(
+                    pool.k_buffer[layer][device_indices].cpu(),
+                    reference_k[layer][source][:, local],
+                ), f"K mismatch at draft layer {layer}, rank {tp_rank}"
+                assert torch.equal(
+                    pool.v_buffer[layer][device_indices].cpu(),
+                    reference_v[layer][source][:, local],
+                ), f"V mismatch at draft layer {layer}, rank {tp_rank}"
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))
