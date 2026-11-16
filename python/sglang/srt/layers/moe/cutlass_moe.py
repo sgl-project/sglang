@@ -125,15 +125,14 @@ def cutlass_fused_experts_fp8(
     assert a.shape[1] == w1_q.shape[1], "Hidden size mismatch w1"
     assert w1_q.shape[2] == w2_q.shape[1] * 2, "Hidden size mismatch w2"
     assert w1_q.shape[0] == w2_q.shape[0], "Expert number mismatch"
-    assert w1_q.shape[0] == w2_q.shape[0], "Weights expert number mismatch"
     assert w1_q.shape[0] == w1_scale.shape[0], "w1 scales expert number mismatch"
     assert w1_q.shape[0] == w2_scale.shape[0], "w2 scales expert number mismatch"
     assert a.dtype in [torch.half, torch.bfloat16], "Invalid output dtype"
 
-    if is_cuda:
-        from sglang.kernels.ops.quantization.fp8_kernel import (
-            sglang_per_token_group_quant_fp8,
-        )
+    from sglang.kernels.ops.quantization.fp8_kernel import (
+        sglang_per_token_group_quant_fp8,
+    )
+
     es_up, es_down = enable_es
     out_dtype = a.dtype
     num_experts = w1_q.size(0)
