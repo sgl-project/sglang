@@ -691,8 +691,7 @@ class ModelRunner:
             k3_kda_tp.state_shard_width() > 1
             and built_megakernel(self.model) is not None
         ):
-            # The lazy-slot admission and the cross-rank state mirrors skip the
-            # megakernel's own-state slot resets and its verify commit.
+            # Lazy-slot admission and the state mirrors bypass the megakernel's resets and commit.
             raise NotImplementedError(
                 "--enable-kda-tp does not support an installed megakernel"
             )
@@ -2146,8 +2145,7 @@ class ModelRunner:
             ):
                 from sglang.srt.layers.communication import k3_kda_tp
 
-                # K3 KDA TP PD decode: every rank writes its heads of the states the
-                # prefill sent before anything (graph replay included) reads them.
+                # KDA TP PD decode: import received states before anything reads them.
                 k3_kda_tp.run_pd_imports(self.req_to_token_pool, forward_batch)
 
             # Replay cuda graph if applicable

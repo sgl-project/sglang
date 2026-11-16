@@ -146,9 +146,6 @@ _TP_INITIALIZED = False
 
 
 def tp_group_state() -> Optional[_State]:
-    """The same collectives over the whole TP group, for layers that run tensor-parallel
-    across attention-DP ranks (--enable-kda-tp): the DP ranks' row blocks are the shards.
-    None (callers use NCCL) outside the tuned envelope."""
     global _TP_STATE, _TP_INITIALIZED
     if _TP_INITIALIZED:
         return _TP_STATE
@@ -224,9 +221,7 @@ def requires_symmetric_rs(
     state: Optional[_State] = None,
     fused: bool = True,
 ) -> bool:
-    """Whether standalone or fused RS reads o_proj through its NVLS alias. ``state``
-    defaults to the attention-TP collectives; ``fused=False`` ignores the fused
-    attention-residual RS."""
+    """Whether standalone or fused RS reads o_proj through its NVLS alias."""
     state = state or _init_state()
     if state is None:
         return False
@@ -441,9 +436,7 @@ def all_gather(
     state: Optional[_State] = None,
     buffer_name: str = _ALL_GATHER,
 ) -> Optional[torch.Tensor]:
-    """Return the reassembled full batch, or None for the NCCL fallback. The direct
-    strategy returns a persistent symmetric buffer (``buffer_name``), valid until the
-    next all-gather into it on the stream."""
+    """Return the reassembled full batch, or None for the NCCL fallback."""
     state = state or _init_state()
     if state is None:
         return None

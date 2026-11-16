@@ -2518,24 +2518,15 @@ class Envs:
     SGLANG_K3_KDA_WS_MOE_WAIT = EnvStr("always")
     # --kda-weight-shard-size, mover ce: build gather copy views and events once.
     SGLANG_K3_KDA_WS_LEAN_ISSUE = EnvBool(True)
-    # --shared-experts-tp-size == TP under attention DP: run the shared experts' row
-    # all-gather / reduce-scatter on K3's GB300 push collectives over the TP group; 0 keeps
-    # NCCL.
+    # --shared-experts-tp-size == TP under attention DP: K3 push collectives; 0 keeps NCCL.
     SGLANG_K3_SHARED_TP_SP_COMM = EnvBool(True)
-    # --enable-kda-tp on a PD decode worker: full-width staging slots per rank that receive
-    # prefill KDA state (0.43 GB each for K3) until every rank imports its heads. Bounds
-    # the requests a rank has in transfer at once.
+    # --enable-kda-tp PD decode: full-width staging slots per rank for received KDA state.
     SGLANG_K3_KDA_TP_PD_STAGING_SLOTS = EnvInt(4)
-    # --enable-kda-tp PD decode: a request in its handoff holds only its staging slot; its
-    # head-sharded state slot is allocated when it joins the running batch.
+    # --enable-kda-tp PD decode: allocate a request's state slot when it joins the batch.
     SGLANG_K3_KDA_TP_LAZY_MAMBA_SLOT = EnvBool(True)
-    # Mamba SSM commit with explicit scratch rows (--enable-kda-tp: every DP rank's padded
-    # request list): one program per (layer, block) looping over the requests instead of
-    # one per request, so padding rows cost nothing. Same copies (bitwise identical).
+    # Mamba SSM commit with explicit scratch rows: one program loops over the requests.
     SGLANG_MAMBA_SSM_COMMIT_ROW_LOOP = EnvBool(True)
-    # --enable-kda-tp PD decode: bind a staging slot when the prefill is about to send the
-    # state (its last chunk), not at prealloc, so handoff slots can outnumber staging slots;
-    # the prefill holds the state until a stage is bound. NIXL transfer backend only.
+    # --enable-kda-tp PD decode: bind a staging slot at the prefill's last chunk (NIXL only).
     SGLANG_K3_KDA_TP_LATE_STAGE = EnvBool(False)
     # Use the ROCm radix-4 router for covered K3 top-k workloads.
     SGLANG_K3_RADIX4_TOPK = EnvBool(False)

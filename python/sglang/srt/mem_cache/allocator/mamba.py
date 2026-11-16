@@ -34,8 +34,7 @@ class MambaSlotAllocator:
     def __init__(self, size: int, device: str, first_slot: int = 1):
         self.size = size
         self.device = device
-        # Slots [first_slot, first_slot + size). A head-sharded KDA pool (--enable-kda-tp)
-        # holds every DP rank's slots; each DP rank allocates only its own range.
+        # Slots [first_slot, first_slot + size): a DP rank's range of a KDA TP pool.
         self.first_slot = first_slot
         # Set by alloc_group_begin(); alloc(1) drains it until alloc_group_end().
         self._alloc_iter: Optional[Iterator] = None
@@ -104,8 +103,6 @@ class MambaSlotAllocator:
 
 
 def mamba_slot_capacity(req_to_token_pool) -> int:
-    """Slots this rank can allocate: its own range of a head-sharded KDA pool (--enable-kda-tp),
-    else the whole pool."""
     alloc = getattr(req_to_token_pool, "mamba_allocator", None)
     if isinstance(alloc, MambaSlotAllocator):
         return alloc.size

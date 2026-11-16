@@ -2070,11 +2070,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
     # === Config / flags crossing to ForwardBatch (by-value) ===
     forward_mode: ForwardMode = None
     global_forward_mode: Optional[ForwardMode] = None
-    # Every DP rank's forward mode value (ForwardMode.value; IDLE for ranks without a
-    # batch) from the MLP sync all-gather; None without attention DP.
+    # Every DP rank's ForwardMode.value from the MLP sync; None without attention DP.
     dp_forward_modes: Optional[List[int]] = None
-    # K3 KDA TP on a PD decode worker (k3_kda_tp.PdStateStaging): this rank's (stage, slot)
-    # state imports for this forward, and every DP rank's import count from the MLP sync.
+    # KDA TP PD decode: this rank's (stage, slot) imports and every DP rank's count.
     kda_tp_state_imports: Optional[List[Tuple[int, int]]] = None
     dp_kda_tp_state_imports: Optional[List[int]] = None
 

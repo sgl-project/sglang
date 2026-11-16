@@ -404,8 +404,7 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
         self.start_layer = start_layer if start_layer is not None else 0
         self._init_mamba_pool(
             mamba_size=effective_mamba_size,
-            # Verify scratch rows: one per running request; under KDA TP every DP rank's
-            # running requests (rank j's rows start at j * size), pre-allocated ones never verify.
+            # One verify row per running request; under KDA TP rank j's rows start at j * size.
             mamba_spec_state_size=(
                 size * kda_tp_width if kda_tp_width > 1 else size + pre_alloc_size
             ),
@@ -439,7 +438,6 @@ class HybridMambaDecodeReqToTokenPool(HybridReqToTokenPool):
 
 
 def _kda_tp_pd_staging(req_to_token_pool):
-    """The KDA TP PD-decode staging slots (k3_kda_tp.PdStateStaging), or None."""
     from sglang.srt.layers.communication import k3_kda_tp
 
     if k3_kda_tp.state_shard_width() <= 1:
@@ -448,9 +446,6 @@ def _kda_tp_pd_staging(req_to_token_pool):
 
 
 def _bind_late_stage(req_to_token_pool, req: Req) -> bool:
-    """KDA TP late staging: a request whose prefill never asked for a stage (the PD
-    warmup's fake transfer sends no state) binds one when it joins the running batch;
-    False (keep waiting) while every stage is taken."""
     key = getattr(req, "kda_tp_staged_slot", None)
     if key is None:
         return True
@@ -462,8 +457,6 @@ def _bind_late_stage(req_to_token_pool, req: Req) -> bool:
 
 
 def _admit_lazy_mamba_slot(req_to_token_pool, req: Req) -> bool:
-    """Give a KDA TP PD request that deferred its state slot (kda_tp_lazy_mamba) a slot as it
-    joins the running batch, re-keying its staged state onto it. False if none is free."""
     if not getattr(req, "kda_tp_lazy_mamba", False) or req.kv.holds_mamba:
         return True
     from sglang.srt.layers.communication import k3_kda_tp
@@ -2041,8 +2034,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 total_prefix_len,
             )
             if kda_tp_staging is not None and not k3_kda_tp.late_stage():
-                # The stage is assigned when the destination is published, possibly after
-                # more admissions (deferred publish): hold it so has_room counts it.
+                # Deferred publish assigns the stage later; hold it so has_room counts it.
                 kda_tp_staging.reserve()
                 decode_req.req.kda_tp_stage_reserved = True
             if self.draft_kv_ring is not None and _is_fake_transfer(decode_req.req):
@@ -3733,11 +3725,6 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             decode_req.kv_receiver.abort()
 
     def _serve_kda_stage_reqs(self) -> None:
-        """KDA TP late staging: bind a stage for every room whose prefill asked for one
-        (KDA_STAGE_REQ, queued by the decode listener thread) and answer each prefill
-        rank of the room with it. Rooms wait in arrival order while every stage is
-        taken; a room whose request left the queue is dropped (its prefill sees the
-        abort)."""
         if not self.queue:
             return
         kv_mgr = getattr(next(iter(self.queue.items())).kv_receiver, "kv_mgr", None)
@@ -3763,8 +3750,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             if key is None:
                 del waiting[room]
                 continue
-            # A later prefill rank of an already-bound room is answered even when the
-            # stages are full; new binds go in arrival order.
+            # Answer later prefill ranks of a bound room even when the stages are full.
             stage = staging.stage_of(key)
             if stage is None and not full:
                 stage = staging.bind(key)

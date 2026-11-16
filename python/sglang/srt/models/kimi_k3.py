@@ -700,8 +700,7 @@ class KimiK3MoE(nn.Module):
             self._ep_a2a and shared_tp is not None and shared_tp > 1
         )
         self._shared_experts_tp_group = None
-        # The shared-expert group spans DP ranks (attention TP 1): rows differ
-        # per rank, and idle ranks must still join the collectives.
+        # Spans DP ranks: rows differ per rank and idle ranks must join the collectives.
         self._shared_experts_tp_across_dp = (
             self._shared_experts_tp_comm
             and requested_shared_tp is not None
@@ -726,8 +725,6 @@ class KimiK3MoE(nn.Module):
             # The full TP group, which _reduce_shared sums over, whatever the
             # dense MLP's sharding.
             shared_experts_parallel_group = "tp"
-        # A shared-expert group spanning the whole TP group runs its AG/RS on K3's
-        # tuned GB300 push collectives (k3_sp_collective.tp_group_state) instead of NCCL.
         self._shared_experts_tp_sp_comm = (
             self._shared_experts_tp_across_dp
             and envs.SGLANG_K3_SHARED_TP_SP_COMM.get()
@@ -1230,9 +1227,6 @@ class KimiK3MoE(nn.Module):
         return self._latent_norm(tensor_model_parallel_all_reduce(latent))
 
     def _shared_tp_rows(self, hidden_states: torch.Tensor) -> int:
-        """Rows each rank contributes to the shared-expert all-gather: its own,
-        or under attention DP (the group spans DP ranks whose batches differ)
-        the largest DP rank's, with this rank's tail zero-padded."""
         rows = hidden_states.shape[0]
         if not self._shared_experts_tp_across_dp:
             return rows
@@ -1245,7 +1239,6 @@ class KimiK3MoE(nn.Module):
         return max_rows
 
     def _shared_tp_sp_state(self, rows: int):
-        """The TP-group push collectives' state, or None for NCCL."""
         if not self._shared_experts_tp_sp_comm or rows == 0:
             return None
         return k3_sp_collective.tp_group_state()
@@ -1254,8 +1247,7 @@ class KimiK3MoE(nn.Module):
         group = self._shared_experts_tp_group
         rows = self._shared_tp_rows(hidden_states)
         if self._shared_experts_tp_across_dp:
-            # The gather spans DP ranks: a prefill graph holding it replays only when
-            # every DP rank runs the bucket whose row count it recorded.
+            # A prefill graph holding this replays only when every DP rank runs its bucket.
             _note_dp_gather_in_prefill_graph()
         if rows != hidden_states.shape[0]:
             hidden_states = torch.nn.functional.pad(
@@ -1263,8 +1255,7 @@ class KimiK3MoE(nn.Module):
             )
         state = self._shared_tp_sp_state(rows)
         if state is not None:
-            # The direct strategy's persistent output stays valid until the next
-            # gather into it: the next layer's, after this layer's RS has joined.
+            # The direct strategy's output stays valid until the next layer's gather.
             gathered = k3_sp_collective.all_gather(
                 hidden_states.contiguous(),
                 state=state,
@@ -1287,8 +1278,7 @@ class KimiK3MoE(nn.Module):
         group = self._shared_experts_tp_group
         rows = shared_output.shape[0] // group.world_size
         state = self._shared_tp_sp_state(rows)
-        # The pull strategy (large prefill batches) reads its input through a
-        # multicast alias, which the shared down_proj output does not have.
+        # The pull strategy needs a multicast alias, which the down_proj output lacks.
         if state is not None and not k3_sp_collective.requires_symmetric_rs(
             shared_output.shape[0],
             shared_output.device,
@@ -2702,9 +2692,6 @@ class KimiK3DeltaAttention(nn.Module):
         return self.o_proj(core_attn_out)[0]
 
     def forward_kda_tp(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        """--enable-kda-tp: this rank's heads/W over every DP rank's rows
-        (k3_kda_tp.current() holds the gathered rows' metadata), then the row-parallel
-        o_proj partial reduce-scattered back to this rank's rows."""
         from sglang.srt.model_executor.forward_context import get_attn_backend
 
         ctx = k3_kda_tp.current()
@@ -2742,8 +2729,7 @@ class KimiK3DeltaAttention(nn.Module):
                 self.attn._k3_deferred_f_b = False
             core = core.reshape(-1, H, D)
         else:
-            # General path (eager, some DP rank in extend): one core call per source DP
-            # rank on its row block, with that rank's metadata.
+            # General path (eager, some DP rank in extend): one core call per source rank.
             fused_onorm = False
             mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
                 x, defer_f_b=False
@@ -2787,8 +2773,6 @@ class KimiK3DeltaAttention(nn.Module):
         *,
         fused_onorm: bool,
     ) -> torch.Tensor:
-        """Gated norm and row-parallel o_proj on this rank's heads of every DP rank's rows
-        [W*R, H, D], reduce-scattered back to this rank's rows."""
         H, D = self.local_num_heads, self.head_dim
         if not fused_onorm:
             core = self.o_norm(core, g_proj_states.unflatten(-1, (-1, D)))

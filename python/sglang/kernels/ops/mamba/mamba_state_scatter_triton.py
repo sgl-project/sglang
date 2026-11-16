@@ -434,8 +434,7 @@ def _ssm_scatter_rows_loop_kernel(
     dst_req_size,
     BLOCK_SIZE: tl.constexpr,
 ):
-    """One program per (layer, element block) looping over the requests: a padded
-    request list with few valid entries costs no per-request programs."""
+    # Loops over requests, so padding entries cost no per-request programs.
     pid_layer = tl.program_id(0).to(tl.int64)
     pid_block = tl.program_id(1).to(tl.int64)
     offsets = pid_block * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -475,9 +474,6 @@ def ssm_scatter_rows_loop(
     dst_indices2: torch.Tensor | None = None,
     step_indices2: torch.Tensor | None = None,
 ) -> None:
-    """``fused_mamba_state_scatter_with_mask`` over the accept set and the optional
-    track set (same scratch rows) in one launch whose grid does not grow with the
-    request count. Same copies, so bitwise identical results."""
     n = step_indices.shape[0]
     if n == 0:
         return
@@ -907,10 +903,7 @@ def scatter_mamba_states_after_mtp_verify(
     rows_loop: bool = False,
 ) -> None:
     """Scatter per-step verify states (ssm + all conv types) into the
-    persistent caches, plus the interval-crossing track slots. ``rows_loop``
-    (with explicit ``src_indices_raw``) commits the SSM states with one launch
-    whose grid does not grow with the request count, for request lists that are
-    mostly padding (KDA TP commits every DP rank's padded list)."""
+    persistent caches, plus the interval-crossing track slots."""
     ssm_states = mamba_caches.temporal
     intermediate_state_cache = mamba_caches.intermediate_ssm
 

@@ -698,9 +698,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     )
                     for _ in self.transfer_queues
                 ]
-            # KDA TP late staging (k3_kda_tp.late_stage): rooms whose last chunk asked
-            # the decode for a staging slot, their first ask time, and PUSH sockets to
-            # the decode listeners.
+            # KDA TP late staging: rooms that asked decode for a stage, and decode sockets.
             self._kda_stage_asked: Dict[Tuple[int, str], float] = {}
             self._kda_stage_socks: Dict[str, Any] = {}
             self._kda_stage_lock = threading.Lock()
@@ -733,8 +731,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             if self.enable_staging:
                 self._init_staging_decode_ctx()
-            # KDA TP late staging: (room, prefill session) asks, drained by
-            # DecodeTransferQueue._serve_kda_stage_reqs on the scheduler thread.
+            # KDA TP late staging asks, drained on the scheduler thread.
             self.kda_stage_reqs: deque = deque()
             self._start_decode_listener_thread()
             self._start_heartbeat_checker_thread()
@@ -1144,11 +1141,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         return self.request_status.get(bootstrap_room, KVPoll.WaitingForInput)
 
     def _kda_stage_pending(self, kv_chunk, room_transfer_infos) -> bool:
-        """KDA TP late staging, prefill side: True while a decode peer of this last
-        chunk has not bound a staging slot for the state yet (its MAMBA destination is
-        k3_kda_tp.LATE_STAGE_UNBOUND). Asks each such peer once (KDA_STAGE_REQ); the
-        caller re-enqueues the chunk, so the prefill holds the state until the decode
-        binds a stage (KDA_STAGE_RSP, _bind_kda_stage)."""
         if not kv_chunk.is_last_chunk or not kv_chunk.state_indices:
             return False
         import zmq
@@ -1192,8 +1184,6 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         return pending
 
     def _kda_stage_components(self) -> List[int]:
-        """State components a KDA TP stage replaces: the MAMBA ones. Other components
-        (e.g. sparse-attention index pages) keep their real page indices."""
         state_types = getattr(self.kv_args, "state_types", None) or []
         if not state_types:
             return [0]
@@ -1812,8 +1802,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
                     staging_strategy = self._try_create_staging_strategy(staging_buffer)
 
                 if self._kda_stage_pending(kv_chunk, room_transfer_infos):
-                    # No decode stage yet: retry after the other queued chunks. The
-                    # chunk stays counted in _staging_outstanding.
+                    # No decode stage yet: retry after the other queued chunks.
                     queue.put(kv_chunk)
                     time.sleep(STAGING_WATERMARK_WAIT_S)
                     continue

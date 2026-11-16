@@ -3320,8 +3320,7 @@ class KVCacheConfigurator:
         capped_by_mamba = False
         if self.mambaish_config is not None:
             ratio = self._calculate_mamba_ratio()
-            # Head-sharded KDA state (--enable-kda-tp): the pool holds every DP
-            # rank's slots, each DP rank allocates 1/W of them.
+            # KDA TP: the pool holds every DP rank's slots; each allocates 1/W of them.
             mamba_cap = (
                 get_schedule().max_mamba_cache_size // ratio // _kda_state_shard_width()
             )
@@ -3647,8 +3646,7 @@ class KVCacheConfigurator:
             assert get_schedule().max_running_requests is not None
 
         if get_schedule().max_mamba_cache_size is not None:
-            # Use explicitly set max_mamba_cache_size (head-sharded KDA state: the
-            # pool holds every DP rank's slots, so it is not split per DP shard).
+            # Use explicitly set max_mamba_cache_size (not split per DP shard under KDA TP).
             get_context().override(
                 "mamba_pool.per_dp_shard",
                 max_mamba_cache_size=get_schedule().max_mamba_cache_size
@@ -3661,8 +3659,7 @@ class KVCacheConfigurator:
             if reserves_spec_state:
                 ratio = self._calculate_mamba_ratio()
                 capped_reqs = min(
-                    # Head-sharded KDA state: verify scratch rows cover every
-                    # DP rank's batch.
+                    # KDA TP: verify scratch rows cover every DP rank's batch.
                     max(1, get_schedule().max_running_requests // self.attn_dp_size)
                     * _kda_state_shard_width(),
                     get_schedule().max_mamba_cache_size // ratio,
@@ -3723,8 +3720,7 @@ class KVCacheConfigurator:
                 # Intermediate memory is included in mamba_budget, subtract it
                 # so the return value only has main_state subtracted from total
                 capped_reqs = min(
-                    # Head-sharded KDA state: verify scratch rows cover every
-                    # DP rank's batch.
+                    # KDA TP: verify scratch rows cover every DP rank's batch.
                     max(1, get_schedule().max_running_requests // self.attn_dp_size)
                     * _kda_state_shard_width(),
                     get_schedule().max_mamba_cache_size // ratio,

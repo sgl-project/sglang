@@ -142,8 +142,7 @@ class StateStorage:
         hands out nothing."""
         assert len(rows) == len(reqs)
         tracking = table.enable_mamba_extra_buffer
-        # A KDA TP PD decode request in its handoff (kda_tp_lazy_mamba) takes
-        # its state slot at admission instead (_admit_lazy_mamba_slot).
+        # A KDA TP PD request in its handoff takes its state slot at admission instead.
         lazy = [
             getattr(req, "kda_tp_lazy_mamba", False) and not req.kv.holds_mamba
             for req in reqs
@@ -286,8 +285,7 @@ class StateStorage:
         the one kept for the radix cache. The request drops the slot tensors
         it frees here, so an open free group holds them without a copy."""
         mamba_index = req.kv.mamba_pool_idx
-        # Only a KDA TP PD-decode MambaPool has staging (a unified-memory StateView has
-        # no such attribute).
+        # A unified-memory StateView has no pd_staging attribute.
         staging = getattr(self.pool, "pd_staging", None)
         if staging is not None:
             staging.release_request(req)

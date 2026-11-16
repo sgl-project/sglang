@@ -1,38 +1,7 @@
 """Kimi-K3 tensor-parallel KDA under attention DP (``--enable-kda-tp``).
 
-Under attention DP with attention TP 1, every rank runs every KDA layer on its own
-requests with all heads: in decode each rank streams the layer's full projection weights
-every step (0.88 GB per layer, 61 GB per step over K3's 69 KDA layers). KDA TP keeps MLA
-attention-DP and the MoE expert-parallel, and runs only the KDA layers tensor-parallel
-over the whole TP group (W ranks):
-
-    owner rows [r, H] --all-gather (rows padded to the DP max R)--> [W*R, H]
-    in-proj / conv / KDA core / gated norm on this rank's heads/W for every DP rank's rows
-    o_proj row-parallel partial [W*R, H] --reduce-scatter--> owner rows [r, H]
-
-KDA state is head-sharded: every rank's state pool holds heads/W of every DP rank's
-requests. Slot ids are global: DP rank j's allocator hands out [j*S + 1, (j+1)*S] of a
-pool of W*S (+1 padding) slots (``slot_partition``), so a slot id names the same request on
-every rank and every per-request index (forward metadata, speculative commit, deferred
-copy-on-write / clear) only has to be gathered, never translated.
-
-Per forward (``begin_forward``, called at the model forward start on every rank, idle ones
-included) the KDA linear backend's local metadata becomes the metadata of the gathered
-rows:
-- fast path, every DP rank in decode or every one in target verify (always under decode
-  CUDA graphs): the per-rank slot and track indices are padded to the DP max batch and
-  all-gathered into persistent buffers (graph-safe), query_start_loc is the uniform global
-  stride, and one kernel launch per layer covers all ranks;
-- general path (eager, some rank in extend): each rank's whole metadata is all-gathered and
-  every KDA layer runs the core once per source DP rank on that rank's row block.
-
-On a PD decode worker each rank receives the prefill's full-width state of its own
-requests into full-width staging slots (``PdStateStaging``) and every rank imports its
-heads of every DP rank's staged states with one all-to-all before the forward that first
-reads them.
-
-The row collectives use K3's GB300 push collectives over the TP group when they apply
-(k3_sp_collective.tp_group_state), else NCCL.
+MLA stays attention-DP; each KDA layer all-gathers every DP rank's rows, runs on this
+rank's heads/W with a head-sharded state pool (global slot ids), and reduce-scatters o_proj.
 """
 
 from __future__ import annotations
@@ -63,13 +32,10 @@ def _is_kimi_k3() -> bool:
 
 
 def _applies() -> bool:
-    """Whether this server runs KDA TP (layout validated by handle_kda_tp). Safe to call
-    before the model is built."""
     return bool(get_parallel().enable_kda_tp) and _is_kimi_k3()
 
 
 def enabled() -> bool:
-    """KDA TP for this model's KDA layers; raises on features it does not support."""
     if not _applies():
         return False
     _check_supported()
@@ -77,8 +43,7 @@ def enabled() -> bool:
 
 
 def _check_supported() -> None:
-    """State operations that one DP scheduler issues on its own pool outside a forward
-    have no cross-rank mirror yet, and every collective here must run on every DP rank."""
+    # Every collective here must run on every DP rank.
     from sglang.srt.model_executor.cuda_graph_config import (
         Backend,
         Phase,
@@ -162,8 +127,6 @@ def _check_supported() -> None:
 
 
 def state_shard_width() -> int:
-    """W when KDA state is head-sharded over the TP group (KDA TP), else 1. Safe to call
-    before the model is built."""
     return get_parallel().tp_size if _applies() else 1
 
 
@@ -176,8 +139,6 @@ def group():
 
 
 def slot_partition(pool_slots: int) -> Tuple[int, int]:
-    """(first slot, slot count) this DP rank allocates from a head-sharded pool of
-    ``pool_slots`` slots (slot 0, the padding slot, excluded)."""
     W = width()
     per_rank = pool_slots // W
     if per_rank < 1:
@@ -187,11 +148,7 @@ def slot_partition(pool_slots: int) -> Tuple[int, int]:
     return get_parallel().attn_dp_rank * per_rank + 1, per_rank
 
 
-# ---- rows -----------------------------------------------------------------------------------
-
-
 def padded_rows(local_rows: int, counts: Optional[List[int]] = None) -> int:
-    """``counts``: every DP rank's rows this forward; default the DP context's."""
     if counts is None:
         counts = get_dp_global_num_tokens()
     if not counts:
@@ -205,19 +162,16 @@ def padded_rows(local_rows: int, counts: Optional[List[int]] = None) -> int:
 
 
 def _fast_collectives():
-    """K3's tuned MNNVL push / pull / multicast kernels over the TP group, or None (NCCL)."""
     from sglang.srt.layers.communication import k3_sp_collective
 
     return k3_sp_collective.tp_group_state()
 
 
 def all_gather_rows(x: torch.Tensor, rows: int) -> torch.Tensor:
-    """[local, D] -> [W * rows, D]; DP rank j's rows start at j * rows. May return a
-    persistent symmetric buffer that the next KDA TP all-gather overwrites."""
+    # May return a persistent buffer that the next KDA TP all-gather overwrites.
     from sglang.srt.layers.communication import k3_sp_collective
 
-    # A prefill graph that holds this exchange (captured or in an eager break) only replays
-    # when every DP rank runs the bucket whose row count it recorded.
+    # A prefill graph holding this replays only when every DP rank runs its recorded bucket.
     _note_dp_gather_in_prefill_graph()
     g = group()
     if x.shape[0] != rows:
@@ -238,8 +192,6 @@ def all_gather_rows(x: torch.Tensor, rows: int) -> torch.Tensor:
 def o_proj_output(
     total_rows: int, width: int, dtype: torch.dtype
 ) -> Optional[torch.Tensor]:
-    """Symmetric storage for the row-parallel o_proj partial when the reduce-scatter reads
-    it through its multicast alias (pull strategy), else None."""
     from sglang.srt.layers.communication import k3_sp_collective
 
     state = _fast_collectives()
@@ -259,7 +211,6 @@ def o_proj_output(
 
 
 def reduce_scatter_rows(y: torch.Tensor, local_rows: int) -> torch.Tensor:
-    """[W * rows, D] partial sums -> this rank's [local_rows, D] full sums."""
     from sglang.srt.layers.communication import k3_sp_collective
 
     g = group()
@@ -281,9 +232,6 @@ def all_gather_padded(
     name: Optional[str] = None,
     capacity: int = 0,
 ) -> torch.Tensor:
-    """1-D [k <= n] per rank -> [W * n], each rank's block padded with ``pad_value``. With
-    ``name``, the collective's input and output are views of persistent buffers (see
-    _static), so a captured graph keeps reading and writing the addresses it recorded."""
     g = group()
     if name is None:
         if t.shape[0] < n:
@@ -299,9 +247,7 @@ def all_gather_padded(
     return out
 
 
-# Persistent per-process buffers for the fast path's gathered metadata, never freed or
-# rebound: CUDA-graph captures record their addresses. Sized to the per-rank request
-# capacity, so they never grow after the first forward.
+# Never freed or rebound: CUDA-graph captures record their addresses.
 _STATIC: Dict[Tuple[str, torch.dtype], torch.Tensor] = {}
 
 
@@ -316,9 +262,6 @@ def _static(name: str, numel: int, dtype: torch.dtype) -> torch.Tensor:
     buf = torch.empty(numel, dtype=dtype, device=torch.cuda.current_device())
     _STATIC[(name, dtype)] = buf
     return buf
-
-
-# ---- per-forward context ----------------------------------------------------------------------
 
 
 @dataclasses.dataclass
@@ -341,8 +284,7 @@ class Context:
 
 
 _CTX: Optional[Context] = None
-# (gathered metadata the fast path installed on the linear backend, the per-rank metadata
-# it was built from).
+# (gathered metadata installed on the linear backend, the per-rank metadata it came from)
 _GATHERED: Optional[Tuple[Any, Any]] = None
 
 
@@ -353,8 +295,7 @@ def current() -> Context:
 
 
 def source_tokens(src: Source) -> int:
-    """The rows of ``src``'s block the KDA kernels consume: its real tokens. A breakable
-    prefill graph pads every rank's block to the replayed size."""
+    # A breakable prefill graph pads every rank's block to the replayed size.
     b = src.batch
     if b.forward_mode.is_target_verify():
         return b.batch_size * b.spec_info.draft_token_num
@@ -378,10 +319,7 @@ def _mode_kind(mode) -> str:
 def begin_forward(
     forward_batch, linear_backend, local_rows: int, counts: Optional[List[int]] = None
 ) -> None:
-    """Build this forward's KDA TP context on every rank (a collective: idle DP ranks call it
-    too). On the fast path the linear backend's forward_metadata becomes the gathered rows'
-    metadata; ``local_rows`` is this rank's row count entering the layers, ``counts`` every
-    rank's (default: the DP context's, which breakable-graph replay does not refresh)."""
+    # A collective: idle DP ranks call it too.
     global _CTX
     R = padded_rows(local_rows, counts)
     kinds = _global_kinds(forward_batch)
@@ -399,13 +337,11 @@ def _speculative() -> bool:
 
 
 def _global_kinds(forward_batch) -> List[str]:
-    """Every DP rank's forward kind: from the MLP-sync gather the scheduler already did
-    (ForwardBatch.dp_forward_modes); inside a CUDA graph capture every rank captures the
-    same graph, so the local kind is everyone's; otherwise gathered over the CPU group."""
     from sglang.srt.model_executor.forward_mode import ForwardMode
 
     # The rows' own mode: a decode batch relabeled as a 1-token extend for the MLP sync is decode.
     kind = _mode_kind(forward_batch.logical_forward_mode)
+    # Every rank captures the same graph, so the local kind is everyone's.
     if torch.cuda.is_current_stream_capturing():
         return [kind] * width()
     modes = getattr(forward_batch, "dp_forward_modes", None)
@@ -415,9 +351,7 @@ def _global_kinds(forward_batch) -> List[str]:
             for m in modes
         ]
         if _speculative():
-            # A speculative decode step is DECODE in the scheduler and TARGET_VERIFY in
-            # the target forward, on every DP rank that has requests (idle ranks too
-            # must agree on the verify row layout).
+            # Spec decode runs TARGET_VERIFY; idle ranks must agree on the verify row layout.
             if kind == "decode":
                 raise RuntimeError(
                     "KDA TP: plain decode target forward under speculative decoding"
@@ -430,9 +364,6 @@ def _global_kinds(forward_batch) -> List[str]:
 
 
 def _fast_context(forward_batch, backend, local_rows, R, active) -> Context:
-    """Every non-idle DP rank is in decode, or every one in target verify: one launch per
-    layer over the gathered rows, with the per-rank slot / track indices padded to the DP max
-    batch and all-gathered (graph-safe; idle ranks contribute padding)."""
     from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang.srt.runtime_context import get_spec
 
@@ -443,8 +374,7 @@ def _fast_context(forward_batch, backend, local_rows, R, active) -> Context:
             "KDA TP: the linear attention backend has no forward metadata"
         )
     if _GATHERED is not None and fm is _GATHERED[0]:
-        # A forward re-run on unchanged metadata (CUDA-graph capture right after its warmup
-        # forward) must gather the backend's own per-rank metadata, not the last gather.
+        # A capture right after its warmup forward must re-gather the per-rank metadata.
         fm = _GATHERED[1]
     W = width()
     kind = next(iter(active)) if active else "decode"
@@ -467,8 +397,7 @@ def _fast_context(forward_batch, backend, local_rows, R, active) -> Context:
         local_slots = torch.zeros(0, dtype=torch.int32, device=dev)
         local_track = None
     else:
-        # Graph metadata buffers are sized to the captured max batch: take this forward's
-        # requests (local rows / D).
+        # Graph metadata buffers are sized to the captured max batch.
         local_bs = local_rows // D
         local_slots = fm.mamba_cache_indices[:local_bs]
         local_track = (
@@ -480,13 +409,10 @@ def _fast_context(forward_batch, backend, local_rows, R, active) -> Context:
         raise RuntimeError(
             f"KDA TP: local batch {local_slots.shape[0]} exceeds the DP max batch {bs}"
         )
-    # Padding requests point at the reserved padding slot 0. With the mamba extra buffer
-    # (a server-wide setting) every rank gathers track indices, zeros where it has none,
-    # so the collectives and the tracking writes agree on every rank.
+    # Padding requests use slot 0; every rank gathers track indices so collectives agree.
     from sglang.srt.runtime_context import get_exec
 
-    # Every tensor the layers read is a view of a persistent buffer (_static): a captured
-    # graph reads them through recorded addresses, so they must outlive every capture.
+    # Persistent buffers (_static): captured graphs read them through recorded addresses.
     cap = _rank_capacity(backend)
     if bs > cap:
         raise RuntimeError(
@@ -532,8 +458,7 @@ def _fast_context(forward_batch, backend, local_rows, R, active) -> Context:
         torch.arange(0, W * bs * D + 1, D, dtype=torch.int32, device=slots.device)
     )
     if kind == "verify":
-        # Request i of DP rank j uses verify scratch row j * n + i (n: per-rank request
-        # capacity), the row commit_after_verify reads back.
+        # Request i of DP rank j uses verify scratch row j * n + i (n: per-rank capacity).
         pos = torch.arange(W * bs, dtype=torch.int64, device=slots.device)
         rows = _static("verify_rows", W * cap, torch.int32)[: W * bs]
         rows.copy_(_scratch_rows(backend, (pos // bs) * cap + pos % bs))
@@ -580,8 +505,6 @@ def _batch_fields(forward_batch) -> Dict[str, Any]:
 
 
 def _general_context(forward_batch, backend, local_rows, R) -> Context:
-    """Eager: gather every DP rank's whole KDA metadata (tensor fields through one padded
-    int64 all-gather, the rest over the CPU group)."""
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("KDA TP: mixed-mode forwards cannot run inside a CUDA graph")
     from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -661,12 +584,10 @@ def _general_context(forward_batch, backend, local_rows, R) -> Context:
 
 
 def _rank_capacity(backend) -> int:
-    """Per-DP-rank request capacity n: DP rank j owns verify scratch rows [j*n, (j+1)*n)."""
     return backend.req_to_token_pool.size
 
 
 def source_scratch_rows(backend, src: Source) -> torch.Tensor:
-    """Verify scratch rows of a general-path source's requests: src.rank * n + i."""
     dev = torch.device("cuda", torch.cuda.current_device())
     rows = src.rank * _rank_capacity(backend) + torch.arange(
         src.batch.batch_size, dtype=torch.int64, device=dev
@@ -675,16 +596,12 @@ def source_scratch_rows(backend, src: Source) -> torch.Tensor:
 
 
 def _scratch_rows(backend, rows: torch.Tensor) -> torch.Tensor:
-    """int32 verify scratch rows, out-of-range ones on the scratch's padding row (W * n)."""
     pad = width() * _rank_capacity(backend)
     return torch.where(rows < pad, rows, torch.full_like(rows, pad)).to(torch.int32)
 
 
 def _local_state_slots(model_runner, bs: int):
-    """This rank's first ``bs`` state / track slots as the verify forward resolved them:
-    its per-rank linear-backend metadata (the eager fast path installs the gathered
-    metadata on the backend; graph replay leaves the per-rank one). Not the request
-    table, which the scheduler may have rewritten since the forward."""
+    # Not the request table, which the scheduler may have rewritten since the forward.
     from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
 
     fm = model_runner.attn_backend.linear_attn_backend.forward_metadata
@@ -705,12 +622,7 @@ def commit_after_verify(
     mamba_steps_to_track,
     state_slots=None,
 ):
-    """Commit every DP rank's accepted verify states into this rank's head shard (a
-    collective: idle DP ranks call it with no requests). Each rank packs its requests'
-    (slot, last accepted step, track slot, track step, scratch row), padded to the per-rank
-    request capacity, and all-gathers them; the scatter then writes all ranks' requests.
-    ``state_slots``: the verify forward's resolved local slots (default: the linear
-    backend's, ``_local_state_slots``)."""
+    # A collective: idle DP ranks call it with no requests.
     from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
         scatter_mamba_states_after_mtp_verify,
     )
@@ -762,9 +674,7 @@ def commit_after_verify(
 
 
 def mirror_deferred_state_ops(model_runner, forward_batch) -> None:
-    """Run every DP rank's deferred state clears and copy-on-writes (prefix matches of
-    extend forwards) on this rank's head shard. Called on every rank at the start of every
-    target forward; a no-op unless some DP rank is in extend."""
+    # Runs on every rank at every target forward start; no-op unless a DP rank extends.
     modes = getattr(forward_batch, "dp_forward_modes", None)
     if modes is not None:
         from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -809,13 +719,8 @@ def mirror_deferred_state_ops(model_runner, forward_batch) -> None:
         )
 
 
-# ---- PD decode: receiving prefill state into the head shards ----------------------------------
-
-
 def lazy_mamba_slot(enable_mamba_extra_buffer: bool) -> bool:
-    """Whether a PD decode request defers its head-sharded state slot to admission (it
-    holds only a staging slot through its handoff). Not with ping-pong tracking slots,
-    which are allocated with the main slot."""
+    # Not with ping-pong tracking slots, which are allocated with the main slot.
     return (
         state_shard_width() > 1
         and not enable_mamba_extra_buffer
@@ -824,9 +729,6 @@ def lazy_mamba_slot(enable_mamba_extra_buffer: bool) -> bool:
 
 
 def late_stage() -> bool:
-    """Whether a PD decode request binds its staging slot when the prefill is about to
-    send the state (KDA_STAGE_REQ with its last chunk) rather than at prealloc, so handoff
-    slots can outnumber staging slots (SGLANG_K3_KDA_TP_LATE_STAGE)."""
     return state_shard_width() > 1 and envs.SGLANG_K3_KDA_TP_LATE_STAGE.get()
 
 
@@ -835,15 +737,12 @@ LATE_STAGE_UNBOUND = -1
 
 
 def lazy_stage_key(req_pool_idx: int) -> int:
-    """Staging key of a request with no state slot yet: its request row, negated, so it
-    never collides with a state slot id (>= 1)."""
+    # Negated, so it never collides with a state slot id (>= 1).
     return -int(req_pool_idx)
 
 
 class FullStateStaging:
-    """Full-width (all heads) KDA state slots on this rank, and the all-to-all over the TP
-    group that moves such states from their owner DP rank into every rank's head shard of
-    the requests' global slots (``scatter``)."""
+    """Full-width KDA state slots and the all-to-all into every rank's head shard."""
 
     def __init__(self, pool, cache_params, num_slots: int, device):
         from sglang.srt.configs.mamba_utils import KimiLinearStateShape
@@ -885,8 +784,7 @@ class FullStateStaging:
                 device=device,
             )
         self.conv_slice_axis = full.conv_slice_axis
-        # Full conv channels [g0 | g1 | ...] with every group head-sharded W ways, reordered
-        # rank-major so rank r's block is its local [g0_r | g1_r | ...] layout.
+        # Conv channels reordered rank-major so rank r's block is its local layout.
         groups = full.conv_shard_groups
         cols, off = [[] for _ in range(W)], 0
         for g in groups:
@@ -911,8 +809,7 @@ class FullStateStaging:
             yield "temporal", self.temporal[i], 0, layer_id
 
     def _rank_major(self, t: torch.Tensor, kind: str) -> torch.Tensor:
-        """[Lc, c, *full slot] -> [W, c, Lc, E]: rank r's heads of every (state, layer).
-        Sizes are explicit: a rank with nothing to send has c == 0."""
+        # Sizes are explicit: a rank with nothing to send has c == 0.
         W = width()
         Lc, c = t.shape[:2]
         per = math.prod(t.shape[2:]) // W
@@ -934,15 +831,13 @@ class FullStateStaging:
     chunk_bytes = 256 << 20
 
     def _layer_chunk(self, L: int, nbytes_per_layer: int) -> int:
-        """Layers per all-to-all; every rank must derive it from the same global sizes."""
+        # Every rank must derive it from the same global sizes.
         return max(1, min(L, self.chunk_bytes // max(1, nbytes_per_layer)))
 
     def scatter(
         self, mamba_pool, stages: List[int], counts: List[int], dst: torch.Tensor
     ) -> None:
-        """Collective over the TP group (every rank, ``counts`` agreed): write rank r's heads
-        of every DP rank's staged states (this rank's: ``stages``) into their global slots
-        ``dst`` (every rank's, in rank order)."""
+        # Collective over the TP group; every rank passes the same ``counts``.
         g = group()
         W = g.world_size
         dev = self.temporal.device
@@ -971,26 +866,7 @@ class FullStateStaging:
 
 
 class PdStateStaging(FullStateStaging):
-    """KDA TP on a PD decode worker: receive buffers for the prefill's full KDA state.
-
-    The prefill (attention TP 1, KDA weight-sharded or replicated) sends every request's full
-    state (all heads) to the one decode DP rank that owns the request, but under KDA TP each rank
-    keeps heads/W of every slot. So the decode rank advertises these full-width staging
-    slots as its transfer destination (the prefill sees matching layouts and sends as usual),
-    and once the request joins the running batch every rank runs ``import_states`` before
-    the forward that first reads the slot: an all-to-all hands rank r its heads of every
-    staged state, written into the request's global slot.
-
-    Lifecycle of a stage: ``assign`` (prealloc, keyed by the request's main slot) ->
-    ``queue_import`` (the request joins the running batch) -> ``take_pending`` (the batch's
-    MLP sync advertises the count) -> ``finish_import`` (the forward enqueued the copies; the
-    stage is reused once they complete). ``release_slot`` drops a request that leaves first.
-    A scheduler that publishes destinations after admitting several requests ``reserve``s a
-    stage at admission so ``has_room`` counts it, and passes ``reserved=True`` to ``assign``.
-    With SGLANG_K3_KDA_TP_LAZY_MAMBA_SLOT the request has no state slot until it joins the
-    running batch, so its stage is keyed by ``lazy_stage_key`` (its request row) and moved
-    onto the slot it is given there with ``rekey``.
-    """
+    """KDA TP on a PD decode worker: full-width receive slots for the prefill's KDA state."""
 
     def __init__(self, pool, cache_params, num_slots: int, device):
         super().__init__(pool, cache_params, num_slots, device)
@@ -1020,9 +896,7 @@ class PdStateStaging(FullStateStaging):
     def has_room(self, allocator, req_pool=None) -> bool:
         self._reclaim()
         if len(self._free) <= self._reserved and self._stage_of:
-            # Stages left behind by a request freed outside free_mamba_cache: reclaim those
-            # whose slot the allocator holds as free (one sync, only when stages run out),
-            # and those keyed by a request row (lazy_stage_key) the request pool holds as free.
+            # Reclaim stages leaked by requests freed outside free_mamba_cache (one sync).
             free_slots = set(allocator.free_slots.tolist())
             free_rows = set(req_pool.free_slots) if req_pool is not None else set()
             stale = [
@@ -1036,7 +910,6 @@ class PdStateStaging(FullStateStaging):
         return len(self._free) > self._reserved
 
     def reserve(self) -> None:
-        """Hold a stage for an admitted request (after ``has_room``) until its ``assign``."""
         if len(self._free) <= self._reserved:
             raise RuntimeError(
                 "KDA TP PD staging: no stage to reserve (check has_room first)"
@@ -1044,14 +917,11 @@ class PdStateStaging(FullStateStaging):
         self._reserved += 1
 
     def unreserve(self) -> None:
-        """Drop the reservation of a request that left before its ``assign``."""
         if self._reserved <= 0:
             raise RuntimeError("KDA TP PD staging: unreserve without a reservation")
         self._reserved -= 1
 
     def rekey(self, key: int, slot: int) -> None:
-        """Move a lazily keyed stage (lazy_stage_key) to the state slot its request was
-        given at admission; the import then writes into that slot."""
         if key not in self._stage_of:
             raise RuntimeError(f"KDA TP PD staging: key {key} has no staged state")
         if slot in self._stage_of:
@@ -1078,8 +948,6 @@ class PdStateStaging(FullStateStaging):
         return stage
 
     def bind(self, slot: int) -> Optional[int]:
-        """Late staging: the stage of ``slot``, binding a free one if it has none yet;
-        None when every stage is taken (the prefill keeps the state and asks again)."""
         stage = self._stage_of.get(slot)
         if stage is not None:
             return stage
@@ -1101,7 +969,6 @@ class PdStateStaging(FullStateStaging):
             self._pending.append(slot)
 
     def take_pending(self) -> List[Tuple[int, int]]:
-        """(stage, slot) of every request queued since the last call."""
         out = [(self._stage_of[s], s) for s in self._pending]
         self._pending = []
         return out
@@ -1116,10 +983,7 @@ class PdStateStaging(FullStateStaging):
             self._draining.append((event, stages))
 
     def release_request(self, req) -> None:
-        """Free the stages a finished or aborted request holds: under its staging key
-        (kda_tp_staged_slot, until queued for import), and under its state slot
-        (kda_tp_state_slot: a prebuilt completion can end it before a forward imports).
-        Both are host ints recorded at assign / admission, so this does not sync."""
+        # Both keys are host ints recorded at assign / admission, so this does not sync.
         for attr in ("kda_tp_staged_slot", "kda_tp_state_slot"):
             key = getattr(req, attr, None)
             if key is not None:
@@ -1137,8 +1001,7 @@ class PdStateStaging(FullStateStaging):
     def import_states(
         self, mamba_pool, local: List[Tuple[int, int]], counts: List[int]
     ) -> None:
-        """Collective over the TP group (every rank, counts from the MLP sync): write rank r's
-        heads of every DP rank's staged states into the requests' global slots."""
+        # Collective over the TP group (every rank, counts from the MLP sync).
         dev = self.temporal.device
         slots = torch.tensor([s for _, s in local], dtype=torch.int64, device=dev)
         gathered = all_gather_padded(slots, max(counts), -1).view(
@@ -1156,8 +1019,7 @@ class PdStateStaging(FullStateStaging):
 
 
 def run_pd_imports(pool, forward_batch) -> None:
-    """Import the PD-received states the MLP sync advertised for this forward (every rank,
-    before the KDA layers or a graph replay read them)."""
+    # Every rank, before the KDA layers or a graph replay read the states.
     counts = forward_batch.dp_kda_tp_state_imports
     local = forward_batch.kda_tp_state_imports or []
     forward_batch.kda_tp_state_imports = None

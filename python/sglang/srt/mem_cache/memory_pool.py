@@ -528,8 +528,7 @@ class MambaPool:
     # Slot-lifecycle side states (see ple_state_pool.SlotIndexedState);
     # class-level default for subclasses that skip MambaPool.__init__.
     _slot_siblings: Tuple = ()
-    # KDA TP PD decode (k3_kda_tp.PdStateStaging): full-width receive slots that replace
-    # this pool's head-sharded slots as the PD transfer destination.
+    # KDA TP PD decode: full-width slots that replace this pool's as the transfer target.
     pd_staging = None
 
     def register_slot_state(self, state) -> None:
@@ -1324,8 +1323,6 @@ class MambaPool:
     )
 
     def state_allocation_region(self):
-        """The context the state buffers are allocated in (memory-saver region, and the
-        disaggregation memory pool when enabled)."""
         stack = ExitStack()
         stack.enter_context(self.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE))
         if self.enable_custom_mem_pool:
@@ -1549,8 +1546,7 @@ class HybridReqToTokenPool(ReqToTokenPool):
         from sglang.srt.layers.communication import k3_kda_tp
 
         if k3_kda_tp.state_shard_width() > 1:
-            # Head-sharded KDA state: every rank's pool holds all DP ranks' slots; slot
-            # ids are global, this DP rank allocates its 1/W of them.
+            # KDA TP: global slot ids; this DP rank allocates its 1/W of them.
             first_slot, per_rank = k3_kda_tp.slot_partition(mamba_size)
             self.mamba_allocator = MambaSlotAllocator(
                 size=per_rank, device=device, first_slot=first_slot
