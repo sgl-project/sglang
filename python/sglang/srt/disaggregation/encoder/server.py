@@ -1921,11 +1921,9 @@ class MMEncoder:
         self,
         embedding: torch.Tensor,
         mm_data: EmbeddingData,
+        url: str,
         session_id=None,
         buffer_address=None,
-        prefill_host=None,
-        embedding_port=None,
-        url=None,
     ):
         if get_disagg().encoder_transfer_backend == "mooncake":
             # Encode is synchronous, so mm_data was staged before /encode returned.
@@ -1991,10 +1989,7 @@ class MMEncoder:
             # Sibling ranks re-read mm_data here; meta_registry owns the release.
 
         # Send ack/data
-        if url is not None:
-            endpoint = NetworkAddress.parse(url).to_tcp()
-        else:
-            endpoint = NetworkAddress(prefill_host, embedding_port).to_tcp()
+        endpoint = NetworkAddress.parse(url).to_tcp()
         logger.info(f"{endpoint = }")
 
         # Serialize data
