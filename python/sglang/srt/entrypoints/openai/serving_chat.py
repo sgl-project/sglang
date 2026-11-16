@@ -385,6 +385,11 @@ def _build_video_config(request: ChatCompletionRequest) -> dict[str, Any] | None
     return config or None
 
 
+def _token_head_matches(prompt_ids: List[int], head: List[int]) -> bool:
+    """Whether a request's prompt tokens start with the given token head."""
+    return len(prompt_ids) >= len(head) and prompt_ids[: len(head)] == list(head)
+
+
 class OpenAIServingChat(OpenAIServingBase):
     """Handler for /v1/chat/completions requests"""
 
@@ -485,6 +490,14 @@ class OpenAIServingChat(OpenAIServingBase):
         # disabled so the default path stays byte-identical too.
         system_text = resolve_system_prompt(self.tokenizer_manager.server_args)
         self._system_prefix = None
+        # Lazily-built seams for traffic whose chat_template_kwargs render a
+        # different system head than the default probe (a template may emit
+        # different system-block tokens per kwargs -- e.g. Qwen3.8 injects a
+        # reasoning-effort preamble unless thinking is disabled). Keyed by the
+        # sorted kwargs tuple; see _resolve_system_boundary.
+        self._system_prefix_variants: dict = {}
+        # One-shot seed-divergence diagnostic flag (see _resolve_system_boundary).
+        self._seed_divergence_logged = False
         if system_text is not None:
             self._system_prefix = SystemPrefix(
                 self.tokenizer_manager.tokenizer, system_text
@@ -544,6 +557,92 @@ class OpenAIServingChat(OpenAIServingBase):
         if template is None and self.tokenizer_manager.tokenizer is not None:
             template = self.tokenizer_manager.tokenizer.chat_template
         return jinja_template_reads_reasoning_content(template)
+
+    def _resolve_system_boundary(
+        self,
+        prompt_ids: List[int],
+        extra_template_kwargs: dict,
+        encode_kwargs: dict,
+        candidate: Optional[int],
+    ) -> Optional[int]:
+        """Validate the fixed-system-prompt boundary against the request's OWN
+        rendered tokens; None when they diverge from every known seam.
+
+        The boundary pre-computed from the message TEXT is only a candidate:
+        the same system text renders to different tokens under different
+        chat_template_kwargs, and a boundary attached to a request whose
+        tokens don't match the tree's boundary path mis-schedules it as
+        permanently cold (full cold slot count) and truncates at a wrong
+        length. So attach the boundary only when the request's token head
+        equals a seam's rendered system head:
+
+        * the default seam (startup probe, no kwargs) -- common no-kwargs
+          traffic; or
+        * a lazily-built VARIANT seam keyed by the request's
+          chat_template_kwargs (probed once per kwargs set). Its boundary
+          lets kwargs-divergent traffic warm up on its own token path: the
+          first request cold-seeds it, the rest classify warm (1 slot)
+          instead of running cold forever.
+
+        Divergence from all known seams logs one shot ([SeedHeadDiag]) and
+        detaches the boundary: the request behaves as ordinary radix traffic
+        (correct output, no system-prompt scheduling).
+        """
+        if candidate is None:
+            return None
+        seam = self._system_prefix
+        assert seam is not None and seam.enabled  # candidate implies a live seam
+        if _token_head_matches(prompt_ids, seam.seed_head_ids):
+            return seam.boundary_len
+        if not self._seed_divergence_logged:
+            self._log_seed_divergence(seam, prompt_ids)
+        if not extra_template_kwargs:
+            return None
+        key = tuple(sorted(extra_template_kwargs.items()))
+        variant = self._system_prefix_variants.get(key)
+        if variant is None:
+            variant = SystemPrefix(
+                self.tokenizer_manager.tokenizer, seam.system_text
+            )
+            variant.prepare(
+                mamba_cache_chunk_size(),
+                encode_kwargs,
+                template_kwargs=extra_template_kwargs,
+            )
+            self._system_prefix_variants[key] = variant
+            if variant.enabled:
+                logger.info(
+                    "SystemPrompt variant seam built for chat_template_kwargs "
+                    "%s: boundary=%d (default=%d)",
+                    dict(key),
+                    variant.boundary_len,
+                    seam.boundary_len,
+                )
+        if variant.enabled and _token_head_matches(prompt_ids, variant.seed_head_ids):
+            return variant.boundary_len
+        return None
+
+    def _log_seed_divergence(self, seam, prompt_ids: List[int]) -> None:
+        """One-shot log when a request's rendered head diverges from the
+        default seam (a mismatched boundary would silently run the whole
+        workload cold at the full cold slot count -- the 0-match
+        investigation)."""
+        self._seed_divergence_logged = True
+        seed_head = seam.seed_head_ids
+        common = 0
+        for a, b in zip(seed_head, prompt_ids):
+            if a != b:
+                break
+            common += 1
+        logger.info(
+            "[SeedHeadDiag] request head diverges from default seed: "
+            "common=%d seed_len=%d boundary=%d req_head=%s seed_head=%s",
+            common,
+            len(seed_head),
+            seam.boundary_len,
+            list(prompt_ids[:24]),
+            list(seed_head[:24]),
+        )
 
     def _handle_last_assistant_message(
         self,
@@ -2266,6 +2365,17 @@ class OpenAIServingChat(OpenAIServingBase):
                 )
                 # The cached decode corresponds to prompt_ids before the prefix.
                 decoded_prompt = None
+
+            # Fixed system prompt: the text-computed boundary is only a
+            # candidate -- attach it only when this request's rendered tokens
+            # actually head-match a known seam (default, or a lazily-built
+            # variant for its chat_template_kwargs); a boundary on a
+            # divergent token path would mis-schedule the request as
+            # permanently cold. See _resolve_system_boundary.
+            if _system_boundary is not None:
+                _system_boundary = self._resolve_system_boundary(
+                    prompt_ids, extra_template_kwargs, encode_kwargs, _system_boundary
+                )
 
             if is_multimodal:
                 prompt = (

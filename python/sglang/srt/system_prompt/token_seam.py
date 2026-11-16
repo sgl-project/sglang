@@ -47,6 +47,13 @@ class SystemPrefix:
         # block lands exactly on a boundary.
         self._suffix_ids: List[int] = []
         self._encode_kwargs: dict = {}
+        # Chat-template kwargs the probe validated against (e.g.
+        # ``{"enable_thinking": False}``). Rendering is only token-stable for
+        # a FIXED kwargs set -- a template may emit different system-block
+        # tokens per kwargs (Qwen3.8 injects a reasoning-effort preamble
+        # unless thinking is disabled) -- so each kwargs set gets its own seam
+        # (the serving layer keys variant seams by the request's kwargs).
+        self._template_kwargs: dict = {}
         self._enabled: bool = False
         self._boundary_len: int = 0
         # When a chat template auto-injects a default system message into any
@@ -93,7 +100,9 @@ class SystemPrefix:
         """
         return {"role": "system", "content": self.system_text}
 
-    def prepare(self, chunk: int, encode_kwargs: dict) -> None:
+    def prepare(
+        self, chunk: int, encode_kwargs: dict, template_kwargs: Optional[dict] = None
+    ) -> None:
         """Run the token-identity probe once and cache the system prefix.
 
         Three probe paths, selected by template capability; the first whose
@@ -108,8 +117,13 @@ class SystemPrefix:
         The recovered FULL system block is then truncated down to a chunk
         boundary. On any failure caching stays disabled (callers fall back to
         the full render), so output remains byte-identical.
+
+        ``template_kwargs`` pins the chat-template render arguments the probe
+        validates against (see ``self._template_kwargs``); the default None
+        probes the template's own default rendering.
         """
         self._encode_kwargs = encode_kwargs
+        self._template_kwargs = dict(template_kwargs) if template_kwargs else {}
         self._enabled = False
         self._prefix_ids = None
         self._suffix_ids = []
@@ -133,6 +147,17 @@ class SystemPrefix:
             )
 
     # -- request-time ---------------------------------------------------
+    @property
+    def seed_head_ids(self) -> List[int]:
+        """The seed request's full token head (shared prefix + system tail).
+
+        Used by the serving-chat one-shot head diagnostic to compare the
+        seed's token stream against a real request's rendered prompt and
+        locate the first divergence (a mismatched seed donates on a path no
+        request ever matches, so every request runs cold).
+        """
+        return list(self._prefix_ids) + list(self._suffix_ids)
+
     def split_request(
         self, messages_after_system: List[Dict[str, str]], encode_kwargs: dict
     ) -> Optional[List[int]]:
@@ -196,7 +221,10 @@ class SystemPrefix:
     def _render(self, msgs, add_generation_prompt: bool, encode_kwargs: dict) -> Optional[List[int]]:
         try:
             rendered = self.tokenizer.apply_chat_template(
-                msgs, tokenize=False, add_generation_prompt=add_generation_prompt
+                msgs,
+                tokenize=False,
+                add_generation_prompt=add_generation_prompt,
+                **self._template_kwargs,
             )
             return self.tokenizer.encode(rendered, **encode_kwargs)
         except Exception as e:  # pragma: no cover - defensive
