@@ -16,6 +16,11 @@ from sglang.srt.layers.quantization.compressed_tensors.schemes import (
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.utils import is_layer_skipped
 from sglang.srt.runtime_context import get_platform
+from sglang.srt.utils import is_hip
+
+_is_hip = is_hip()
+if _is_hip:
+    from sglang.srt.layers.quantization import minimax_m3_nvfp4_hip as _hip
 
 logger = logging.getLogger(__name__)
 
@@ -105,6 +110,8 @@ class MiniMaxM3Nvfp4Config(Fp8Config):
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
 
+        if _is_hip and _hip.uses_aiter_tuned_lm_head(layer):
+            return _hip.AiterTunedLmHeadMethod()
         if not isinstance(layer, FusedMoE) or is_layer_skipped(
             prefix, self.ignored_layers, fused_mapping=self.packed_modules_mapping
         ):
@@ -114,16 +121,19 @@ class MiniMaxM3Nvfp4Config(Fp8Config):
 
 
 class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
-    """MegaMoE and TRT-LLM experts on Blackwell, Marlin W4A16 elsewhere."""
+    """MegaMoE and TRT-LLM experts on Blackwell, requantized on gfx950, Marlin W4A16 elsewhere."""
 
     # Cleared because __init__ below supplies a non-Blackwell expert path.
     requires_blackwell = False
 
     def __init__(self):
         super().__init__()
+        # Marlin's kernels are CUDA-only; gfx950 requantizes the experts at load
+        platform = get_platform()
+        self.requantizes_experts = platform.is_hip and platform.is_gfx95
         # Marlin unpacks the packed NVFP4 weights in-register and multiplies on
         # bf16 tensor cores, keeping the 4-bit footprint without FP4 hardware.
-        self.use_marlin = not get_platform().is_blackwell
+        self.use_marlin = not platform.is_blackwell and not self.requantizes_experts
         self.use_flashinfer_trtllm = (
             not self.use_marlin
             and get_moe_runner_backend().is_flashinfer_trtllm_routed()
@@ -133,6 +143,7 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
         )
         if (
             not self.use_marlin
+            and not self.requantizes_experts
             and not self.use_flashinfer_trtllm
             and not get_moe_a2a_backend().is_megamoe()
         ):
@@ -153,6 +164,9 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
 
     def create_moe_runner(self, layer, moe_runner_config):
         self.moe_runner_config = moe_runner_config
+        if self.requantizes_experts:
+            self.runner = _hip.create_requantized_runner(moe_runner_config)
+            return
         if self.use_marlin:
             from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend
 
@@ -261,6 +275,9 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
             _alias_mega_moe_to_trtllm_weights(layer)
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.requantizes_experts:
+            _hip.process_requantized_weights(layer)
+            return
         if self.use_marlin:
             self._process_marlin_weights(layer)
             return
@@ -298,6 +315,8 @@ class MiniMaxM3Nvfp4MoE(CompressedTensorsW4A4Nvfp4MoE):
         layer._mega_moe_weights_built = True
 
     def apply_weights(self, layer, dispatch_output):
+        if self.requantizes_experts:
+            return _hip.apply_requantized_experts(self, layer, dispatch_output)
         if self.use_marlin:
             return self.runner.run(dispatch_output, self.get_marlin_quant_info(layer))
         if self.use_flashinfer_trtllm:

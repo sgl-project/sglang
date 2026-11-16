@@ -214,6 +214,7 @@ impl HarmonyStreamingProcessor {
         let mut matched_stops: HashMap<u32, Option<serde_json::Value>> = HashMap::new();
         let mut prompt_tokens: HashMap<u32, u32> = HashMap::new();
         let mut completion_tokens: HashMap<u32, u32> = HashMap::new();
+        let mut reasoning_tokens: HashMap<u32, u32> = HashMap::new();
 
         let stream_options = &original_request.stream_options;
 
@@ -296,6 +297,8 @@ impl HarmonyStreamingProcessor {
                         let final_output = parser
                             .finalize(complete.finish_reason.clone(), matched_stop.clone())
                             .map_err(|e| format!("Finalize error: {}", e))?;
+                        *reasoning_tokens.entry(index).or_insert(0) =
+                            final_output.reasoning_token_count;
 
                         Self::emit_final_chunk(
                             index,
@@ -323,6 +326,7 @@ impl HarmonyStreamingProcessor {
             Self::emit_usage_chunk(
                 total_prompt,
                 total_completion,
+                reasoning_tokens.values().sum(),
                 &dispatch,
                 &original_request,
                 tx,
@@ -377,6 +381,7 @@ impl HarmonyStreamingProcessor {
         let mut finish_reasons: HashMap<u32, Option<String>> = HashMap::new();
         let mut matched_stops: HashMap<u32, Option<serde_json::Value>> = HashMap::new();
         let mut completion_tokens: HashMap<u32, u32> = HashMap::new();
+        let mut reasoning_tokens: HashMap<u32, u32> = HashMap::new();
 
         let stream_options = &original_request.stream_options;
 
@@ -452,6 +457,8 @@ impl HarmonyStreamingProcessor {
                         let final_output = parser
                             .finalize(complete.finish_reason.clone(), matched_stop.clone())
                             .map_err(|e| format!("Finalize error: {}", e))?;
+                        *reasoning_tokens.entry(index).or_insert(0) =
+                            final_output.reasoning_token_count;
 
                         Self::emit_final_chunk(
                             index,
@@ -485,6 +492,7 @@ impl HarmonyStreamingProcessor {
             Self::emit_usage_chunk(
                 total_prompt,
                 total_completion,
+                reasoning_tokens.values().sum(),
                 &dispatch,
                 &original_request,
                 tx,
@@ -606,6 +614,7 @@ impl HarmonyStreamingProcessor {
     fn emit_usage_chunk(
         prompt_tokens: u32,
         completion_tokens: u32,
+        reasoning_tokens: u32,
         dispatch: &context::DispatchMetadata,
         original_request: &ChatCompletionRequest,
         tx: &mpsc::UnboundedSender<Result<Bytes, io::Error>>,
@@ -617,7 +626,9 @@ impl HarmonyStreamingProcessor {
                     prompt_tokens,
                     completion_tokens,
                     total_tokens: prompt_tokens + completion_tokens,
-                    completion_tokens_details: None,
+                    completion_tokens_details: Some(CompletionTokensDetails {
+                        reasoning_tokens: Some(reasoning_tokens),
+                    }),
                 })
                 .maybe_system_fingerprint(dispatch.weight_version.as_deref())
                 .build();
@@ -1142,13 +1153,9 @@ impl HarmonyStreamingProcessor {
                         prompt_tokens,
                         completion_tokens,
                         total_tokens: prompt_tokens + completion_tokens,
-                        completion_tokens_details: if reasoning_token_count > 0 {
-                            Some(CompletionTokensDetails {
-                                reasoning_tokens: Some(reasoning_token_count),
-                            })
-                        } else {
-                            None
-                        },
+                        completion_tokens_details: Some(CompletionTokensDetails {
+                            reasoning_tokens: Some(reasoning_token_count),
+                        }),
                     },
                     request_id: emitter.response_id.clone(),
                 });
@@ -1167,13 +1174,9 @@ impl HarmonyStreamingProcessor {
                         output_tokens: completion_tokens,
                         total_tokens: prompt_tokens + completion_tokens,
                         input_tokens_details: None,
-                        output_tokens_details: if reasoning_token_count > 0 {
-                            Some(OutputTokensDetails {
-                                reasoning_tokens: reasoning_token_count,
-                            })
-                        } else {
-                            None
-                        },
+                        output_tokens_details: Some(OutputTokensDetails {
+                            reasoning_tokens: reasoning_token_count,
+                        }),
                     }))
                     .build(),
             ),
@@ -1181,13 +1184,9 @@ impl HarmonyStreamingProcessor {
                 prompt_tokens,
                 completion_tokens,
                 total_tokens: prompt_tokens + completion_tokens,
-                completion_tokens_details: if reasoning_token_count > 0 {
-                    Some(CompletionTokensDetails {
-                        reasoning_tokens: Some(reasoning_token_count),
-                    })
-                } else {
-                    None
-                },
+                completion_tokens_details: Some(CompletionTokensDetails {
+                    reasoning_tokens: Some(reasoning_token_count),
+                }),
             },
         })
     }

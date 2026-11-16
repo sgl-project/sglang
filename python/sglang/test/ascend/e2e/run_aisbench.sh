@@ -167,49 +167,25 @@ install_aisbench() {
 
     # Checkpoints exported by transformers v5 declare
     # tokenizer_class=TokenizersBackend, a class the transformers 4.x pinned by
-    # ais_bench does not define, so AutoTokenizer fails with
-    # "Tokenizer class TokenizersBackend does not exist or is currently not
-    # imported". Upgrade transformers in the venv when the model asks for it and
-    # resolve the tokenizer here, so a broken venv fails right after the install
-    # step instead of ten minutes later during dataset generation.
+    # ais_bench does not define. Exit 1 only when the model needs transformers>=5
+    # but the venv has an older one; the caller then upgrades.
     ensure_tokenizer_compatible() {
-        local tokenizer_class transformers_major
-        tokenizer_class=$("${PYTHON_ENV_FOR_AISBENCH}/bin/python" - "${MODEL_PATH}" <<'PY'
-import json
-import os
-import sys
-
+        if "${PYTHON_ENV_FOR_AISBENCH}/bin/python" - "${MODEL_PATH}" <<'PY'
+import json, os, sys
 try:
     with open(os.path.join(sys.argv[1], "tokenizer_config.json")) as f:
-        print(json.load(f).get("tokenizer_class", ""))
+        need = json.load(f).get("tokenizer_class") == "TokenizersBackend"
 except Exception:
-    print("")
+    need = False
+if need:
+    import transformers
+    sys.exit(1 if int(transformers.__version__.split(".")[0]) < 5 else 0)
 PY
-)
-        if [ "${tokenizer_class}" != "TokenizersBackend" ]; then
+        then
             return 0
         fi
-        transformers_major=$("${PYTHON_ENV_FOR_AISBENCH}/bin/python" -c \
-            "import transformers; print(transformers.__version__.split('.')[0])" 2>/dev/null || echo 0)
-        if ! [ "${transformers_major}" -ge 5 ] 2>/dev/null; then
-            echo "Model tokenizer needs transformers>=5, upgrading in the aisbench venv."
-            ${PIP_FOR_AISBENCH} install "transformers>=5,<6" -i ${pip_mirror_source}
-        fi
-        "${PYTHON_ENV_FOR_AISBENCH}/bin/python" -c "
-from transformers import AutoTokenizer
-AutoTokenizer.from_pretrained('${MODEL_PATH}', trust_remote_code=True)
-print('tokenizer load OK')
-"
-    }
-
-    # The transformers upgrade must not break the rest of the aisbench stack.
-    check_aisbench_venv() {
-        if "${PYTHON_ENV_FOR_AISBENCH}/bin/python" -c "import ais_bench, datasets, pyarrow" >/dev/null 2>&1; then
-            echo "aisbench venv smoke test passed."
-        else
-            echo "aisbench venv is not importable after the tokenizer check; remove ${PYTHON_ENV_FOR_AISBENCH} and retry."
-            exit 1
-        fi
+        echo "Model tokenizer needs transformers>=5, upgrading in the aisbench venv."
+        ${PIP_FOR_AISBENCH} install "transformers>=5,<6" -i ${pip_mirror_source}
     }
 
     # Reuse the venv when it already imports cleanly; this keeps benchmark
@@ -218,7 +194,6 @@ print('tokenizer load OK')
        "${PYTHON_ENV_FOR_AISBENCH}/bin/python" -c "import ais_bench, datasets, pyarrow" >/dev/null 2>&1; then
         echo "aisbench venv already usable, skip installation."
         ensure_tokenizer_compatible
-        check_aisbench_venv
         echo "===== Install aisbench in virtual env - End ====="
         return
     fi
@@ -265,7 +240,6 @@ print('tokenizer load OK')
     # Cap pyarrow to a numpy-1.x-compatible release.
     ${PIP_FOR_AISBENCH} install "pyarrow<16" -i ${pip_mirror_source}
     ensure_tokenizer_compatible
-    check_aisbench_venv
     echo "===== Install aisbench in virtual env - End ====="
 }
 

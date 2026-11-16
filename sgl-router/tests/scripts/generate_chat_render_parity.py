@@ -15,11 +15,11 @@ from sglang.srt.entrypoints.openai.serving_chat import (
     normalize_assistant_tool_call_arguments,
     normalize_tool_content,
 )
+from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.parser.jinja_template_utils import (
     detect_jinja_template_content_format,
     process_content_for_template_format,
 )
-from sglang.srt.utils.hf_transformers import get_tokenizer
 
 ROOT = pathlib.Path(__file__).resolve().parents[1] / "fixtures" / "chat_render_parity"
 

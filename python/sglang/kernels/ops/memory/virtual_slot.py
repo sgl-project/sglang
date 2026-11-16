@@ -123,7 +123,8 @@ def free_unbind_inplace_kernel(
 
     tl.store(out_phys_ptr + offs, p, mask=mask)
     tl.store(v2p_ptr + v, -1, mask=mask)
-    tl.store(p2v_ptr + p, -1, mask=mask)
+    # An unbound page (-1) reaches the caller's double-free check, not p2v[-1].
+    tl.store(p2v_ptr + p, -1, mask=mask & (p >= 0))
 
 
 @triton.jit(do_not_specialize=["v_pages_ptr", "p_pages_ptr"])
@@ -165,7 +166,11 @@ def free_unbind_inplace(
         # Pure-torch CPU reference for the CUDA-only kernel.
         phys_pages = v2p[v].clone()
         v2p.index_fill_(0, v, -1)
-        p2v.index_fill_(0, phys_pages, -1)
+        # An unbound page (-1) adds 0 to row 0: a fixed-shape no-op, since a
+        # boolean mask would sync with the host.
+        bound = phys_pages >= 0
+        rows = phys_pages.clamp(min=0)
+        p2v.index_put_((rows,), torch.where(bound, -1 - p2v[rows], 0), accumulate=True)
         return phys_pages
     phys_pages = torch.empty(N, dtype=torch.int64, device=v_pages.device)
     grid = (triton.cdiv(N, ALLOC_BIND_BLOCK),)

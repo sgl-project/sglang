@@ -39,7 +39,6 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_COMMON_ENVS = {
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "USE_NPU_MOE_GATING_TOP_K": "1",
     "SGLANG_RAGGED_VERIFY_MODE": "static",
-    "SGLANG_DSPARK_FAST_KERNEL": "0",
     "SGLANG_DSPARK_FAST_SAMPLING": "0",
     "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
     "SGLANG_DSPARK_QUANT_AUDIT": "1",
@@ -222,7 +221,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG = {
     "decode_args": DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ARGS,
     "prefill_envs": DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ENVS,
     "decode_envs": DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ENVS,
-    "router_args": ["--policy", "cache_aware"],
+    "router_args": ["--policy", "round_robin"],
     "router_envs": {},
 }
 

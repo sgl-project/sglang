@@ -74,6 +74,9 @@ if TYPE_CHECKING:
     # distinct (n_local, n_peer, dtype) staging pairs kept; each is two
     # slots and is never freed, so multi-resolution serving needs a cap
     SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS: int = 16
+    # two-rank TP on one host: a row-parallel layer's epilogue kernel reads both
+    # ranks' partial sums instead of an all-reduced tensor. Set 0 to all-reduce.
+    SGLANG_DIFFUSION_TP_PEER_PARTIALS: bool = True
     SGLANG_CACHE_DIT_ENABLED: bool = False
     SGLANG_CACHE_DIT_FN: int = 1
     SGLANG_CACHE_DIT_BN: int = 0
@@ -119,7 +122,6 @@ if TYPE_CHECKING:
     SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND: str | None = None
     SGLANG_DIFFUSION_ENABLE_W8A8_FP8_GEMM: bool = False
     SGLANG_ENABLE_FUSED_QKNORM_ROPE: bool = True
-    MINIMAX_H3_VAE_DECODER_FUSED_NORM: bool = True
     MINIMAX_H3_VAE_DECODER_VIT_FP32_NORM: bool = True
     MINIMAX_H3_VAE_DECODER_STREAM_TEMPORAL_CAT: bool = True
     SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE: int = 4
@@ -412,6 +414,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS": _lazy_int(
         "SGLANG_DIFFUSION_IPC_A2A_MAX_BUFFERS", 16
     ),
+    "SGLANG_DIFFUSION_TP_PEER_PARTIALS": _lazy_bool(
+        "SGLANG_DIFFUSION_TP_PEER_PARTIALS", "true"
+    ),
     "SGLANG_CACHE_DIT_ENABLED": _lazy_bool("SGLANG_CACHE_DIT_ENABLED"),
     # Number of first blocks to always compute (DBCache F parameter)
     "SGLANG_CACHE_DIT_FN": _lazy_int("SGLANG_CACHE_DIT_FN", 1),
@@ -487,12 +492,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_ENABLE_FUSED_QKNORM_ROPE": lambda: (
         os.getenv("SGLANG_ENABLE_FUSED_QKNORM_ROPE", "1").lower()
         not in {"0", "false", "off", "no"}
-    ),
-    # MiniMax-H3 VAE decoder: fused RMSNorm / QK RMSNorm+RoPE kernels in the
-    # ViT blocks (NVIDIA only). Only 1/true/yes/on keep it enabled.
-    "MINIMAX_H3_VAE_DECODER_FUSED_NORM": lambda: (
-        os.getenv("MINIMAX_H3_VAE_DECODER_FUSED_NORM", "1").strip().lower()
-        in ("1", "true", "yes", "on")
     ),
     # MiniMax-H3 VAE decoder: run the ViT norms in FP32 (the released recipe).
     # Only 1/true/yes/on keep it enabled.

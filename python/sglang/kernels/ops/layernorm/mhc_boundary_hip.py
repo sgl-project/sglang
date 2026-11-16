@@ -17,8 +17,7 @@ from sglang.kernels.ops.quantization.mxfp8_amd_gfx95 import (
     Fp8GridActivation,
     Mxfp8Activation,
 )
-from sglang.srt.environ import envs
-from sglang.srt.utils.common import is_gfx95_supported, is_hip
+from sglang.srt.utils.device import is_gfx95_supported, is_hip
 
 _is_hip = is_hip()
 # CDNA has no tf32: the mixing dot runs in ieee fp32 (the CUDA kernel uses tf32x3)
@@ -673,7 +672,7 @@ def _hc_boundary_partials(
     wide = m >= 2 * _HC_BOUNDARY_WIDE_MIN_M or (
         m >= _HC_BOUNDARY_WIDE_MIN_M and m % 32 == 0
     )
-    if wide and envs.SGLANG_HIP_MHC_BOUNDARY_WIDE_TILE.get():
+    if wide:
         launch = dict(_HC_BOUNDARY_WIDE)
     else:
         launch = dict(

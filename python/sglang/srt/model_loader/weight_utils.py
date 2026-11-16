@@ -6,6 +6,7 @@
 
 import collections
 import concurrent.futures
+import contextlib
 import fnmatch
 import glob
 import hashlib
@@ -26,6 +27,7 @@ from typing import (
     Iterable,
     List,
     Optional,
+    Set,
     Tuple,
     Union,
 )
@@ -35,7 +37,12 @@ import huggingface_hub.constants
 import numpy as np
 import safetensors.torch
 import torch
-from huggingface_hub import HfFileSystem, hf_hub_download, snapshot_download
+from huggingface_hub import (
+    HfFileSystem,
+    hf_hub_download,
+    snapshot_download,
+    try_to_load_from_cache,
+)
 from huggingface_hub.errors import HfHubHTTPError
 from pydantic import BaseModel, ConfigDict, ValidationInfo, model_validator
 from tqdm.auto import tqdm
@@ -43,6 +50,7 @@ from tqdm.auto import tqdm
 from sglang.srt.configs.load_config import (
     _DEFAULT_LOAD_GROUP,
     LoadConfig,
+    LoadFormat,
     LoadGroup,
 )
 from sglang.srt.configs.model_config import (
@@ -50,11 +58,13 @@ from sglang.srt.configs.model_config import (
     ModelConfig,
     is_qwen3_5_mtp_draft,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization import QuantizationConfig, get_quantization_config
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.quantization.modelopt_quant import (
     ModelOptFp4Config,
     ModelOptFp8Config,
+    ModelOptMixedPrecisionConfig,
 )
 from sglang.srt.model_loader.checkpoint_quantization import (
     resolve_checkpoint_quant_spec,
@@ -64,7 +74,7 @@ from sglang.srt.model_loader.ci_weight_validation import (
     ci_validate_and_cleanup_local_snapshot,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.utils import (
     BAR_FORMAT,
     find_local_repo_dir,
@@ -73,8 +83,7 @@ from sglang.srt.utils import (
     log_info_on_rank0,
     print_warning_once,
 )
-from sglang.srt.utils.common import is_cuda_alike
-from sglang.utils import is_in_ci
+from sglang.srt.utils.device import is_cuda_alike
 
 try:
     from fastsafetensors import SafeTensorsFileLoader, SingleGroup
@@ -214,6 +223,14 @@ def _resolve_explicit_draft_quant_config(
             quant_config.packed_modules_mapping
         )
 
+    # MIXED_PRECISION exports can ship block-FP8 MTP experts; they resolve to
+    # modelopt_mixed, so read the requested draft quantization from the spec args.
+    if (
+        isinstance(quant_config, ModelOptMixedPrecisionConfig)
+        and get_spec().speculative_draft_model_quantization == "modelopt_fp4"
+    ):
+        quant_config.convert_block_fp8_experts_to_nvfp4()
+
     return quant_config
 
 
@@ -246,6 +263,151 @@ def _quark_draft_online_quant_config(
         "quantizing them online to MXFP4 (quark_mxfp4) for the draft model."
     )
     return QuarkConfig(online_scheme="quark_mxfp4", hf_config=model_config.hf_config)
+
+
+def _read_safetensors_header_keys(path: str) -> Set[str]:
+    with open(path, "rb") as f:
+        header_len_bytes = f.read(8)
+        if len(header_len_bytes) < 8:
+            return set()
+        (header_len,) = struct.unpack("<Q", header_len_bytes)
+        if header_len <= 0 or header_len > 100 * 1024 * 1024:
+            return set()
+        header = json.loads(f.read(header_len))
+    return {k for k in header if k != "__metadata__"}
+
+
+def inspect_safetensors_tensor_names(
+    model_path: str,
+    revision: Optional[str] = None,
+    cache_dir: Optional[str] = None,
+    local_files_only: bool = False,
+    local_folder: Optional[str] = None,
+) -> Optional[Set[str]]:
+    """Return tensor names listed in a safetensors checkpoint without loading weights."""
+    if not model_path or model_path == "dummy":
+        return None
+
+    try:
+        candidate_dirs = []
+        if os.path.isdir(model_path):
+            candidate_dirs.append(model_path)
+        if (
+            local_folder
+            and os.path.isdir(local_folder)
+            and local_folder not in candidate_dirs
+        ):
+            candidate_dirs.append(local_folder)
+
+        for folder in candidate_dirs:
+            index_path = os.path.join(folder, "model.safetensors.index.json")
+            if not os.path.isfile(index_path):
+                index_files = sorted(
+                    glob.glob(os.path.join(folder, "*.safetensors.index.json"))
+                )
+                index_path = index_files[0] if index_files else ""
+            if index_path and os.path.isfile(index_path):
+                with open(index_path) as f:
+                    weight_map = json.load(f).get("weight_map") or {}
+                if weight_map:
+                    return set(weight_map.keys())
+
+        if os.path.isdir(model_path):
+            shards = sorted(Path(model_path).glob("*.safetensors"))
+            if shards:
+                tensor_names: Set[str] = set()
+                for shard in shards:
+                    tensor_names.update(_read_safetensors_header_keys(str(shard)))
+                return tensor_names or None
+            return None
+
+        cached_index = try_to_load_from_cache(
+            repo_id=model_path,
+            filename="model.safetensors.index.json",
+            revision=revision,
+            cache_dir=cache_dir,
+        )
+        if isinstance(cached_index, str) and os.path.isfile(cached_index):
+            with open(cached_index) as f:
+                weight_map = json.load(f).get("weight_map") or {}
+            if weight_map:
+                return set(weight_map.keys())
+
+        cached_single = try_to_load_from_cache(
+            repo_id=model_path,
+            filename="model.safetensors",
+            revision=revision,
+            cache_dir=cache_dir,
+        )
+        if isinstance(cached_single, str) and os.path.isfile(cached_single):
+            tensor_names = _read_safetensors_header_keys(cached_single)
+            if tensor_names:
+                return tensor_names
+
+        if local_files_only:
+            return None
+
+        try:
+            with get_lock(model_path, cache_dir):
+                index_file = hf_hub_download(
+                    repo_id=model_path,
+                    filename="model.safetensors.index.json",
+                    revision=revision,
+                    cache_dir=cache_dir,
+                )
+            with open(index_file) as f:
+                weight_map = json.load(f).get("weight_map") or {}
+            if weight_map:
+                return set(weight_map.keys())
+        except Exception:
+            pass
+
+        fs = HfFileSystem()
+        remote_path = f"{model_path}/model.safetensors"
+        open_kwargs = {"revision": revision} if revision is not None else {}
+        if fs.exists(remote_path, **open_kwargs):
+            with fs.open(remote_path, "rb", **open_kwargs) as f:
+                header_len_bytes = f.read(8)
+                if len(header_len_bytes) == 8:
+                    (header_len,) = struct.unpack("<Q", header_len_bytes)
+                    if 0 < header_len <= 100 * 1024 * 1024:
+                        header = json.loads(f.read(header_len))
+                        tensor_names = {k for k in header if k != "__metadata__"}
+                        return tensor_names or None
+    except Exception as e:
+        logger.debug(
+            "Failed to inspect safetensors tensor names for %s: %s",
+            model_path,
+            e,
+        )
+    return None
+
+
+def _maybe_attach_checkpoint_tensor_names(
+    quant_config: Optional[QuantizationConfig],
+    model_config: ModelConfig,
+    load_config: LoadConfig,
+    local_folder: Optional[str] = None,
+) -> None:
+    if (
+        quant_config is None
+        or not hasattr(quant_config, "set_checkpoint_tensor_names")
+        or not getattr(quant_config, "uses_checkpoint_tensor_manifest", True)
+    ):
+        return
+    local_files_only = (
+        huggingface_hub.constants.HF_HUB_OFFLINE
+        or load_config.load_format == LoadFormat.DUMMY
+    )
+    tensor_names = inspect_safetensors_tensor_names(
+        model_config.model_path,
+        revision=model_config.revision,
+        cache_dir=load_config.download_dir,
+        local_files_only=local_files_only,
+        local_folder=local_folder,
+    )
+    if tensor_names is not None:
+        quant_config.set_checkpoint_tensor_names(tensor_names)
 
 
 def _modelopt_quant_section(config: dict) -> dict:
@@ -307,9 +469,13 @@ def get_quant_config(
             )
             if draft_online is not None:
                 return draft_online
-            return _resolve_explicit_draft_quant_config(
+            quant_config = _resolve_explicit_draft_quant_config(
                 model_config, quant_cls.from_config(hf_quant_config)
             )
+            _maybe_attach_checkpoint_tensor_names(
+                quant_config, model_config, load_config
+            )
+            return quant_config
 
     # In case of bitsandbytes/QLoRA, get quant config from the adapter model.
     if model_config.quantization == "bitsandbytes":
@@ -433,9 +599,13 @@ def get_quant_config(
                 return _resolve_explicit_draft_quant_config(
                     model_config, quant_cls.from_config(config)
                 )
-        return _resolve_explicit_draft_quant_config(
+        quant_config = _resolve_explicit_draft_quant_config(
             model_config, quant_cls.from_config(config)
         )
+        _maybe_attach_checkpoint_tensor_names(
+            quant_config, model_config, load_config, local_folder=hf_folder
+        )
+        return quant_config
 
 
 def _check_index_files_exist(
@@ -595,7 +765,7 @@ def _find_local_hf_snapshot_dir_unlocked(
 
     # Only perform cache validation and cleanup in CI to avoid
     # unnecessary overhead for regular users
-    if is_in_ci() and local_weight_files:
+    if envs.SGLANG_IS_IN_CI.get() and local_weight_files:
         is_valid = ci_validate_and_cleanup_local_snapshot(
             model_name_or_path, found_local_snapshot_dir, local_weight_files
         )
@@ -691,7 +861,7 @@ def download_weights_from_hf(
 
         log_info_on_rank0(logger, f"Using model weights format {allow_patterns}")
 
-        if not is_in_ci():
+        if not envs.SGLANG_IS_IN_CI.get():
             # Simple download without validation for non-CI environments
             hf_folder = snapshot_download(
                 model_name_or_path,
@@ -1244,9 +1414,42 @@ def instanttensor_weights_iterator(
         if load_group is not None and load_group.world_size > 1
         else None
     )
+    # InstantTensor all-gathers over the group's NCCL communicator. Nothing else uses
+    # the world device group's communicator, so the first collective would create it
+    # just for loading, and its buffers (0.5-2 GB per GPU; more with NVLS) would stay
+    # resident and shrink the KV cache. Load over a temporary communicator instead and
+    # destroy it afterwards. new_group must be called by every rank, so only do this
+    # when loading over the world group (the default).
+    load_comm_group = None
+    if process_group is not None and load_group is get_parallel().world_group:
+        load_comm_group = torch.distributed.new_group(backend="nccl")
+        process_group = load_comm_group
 
+    try:
+        yield from _instanttensor_tensors(
+            instanttensor, hf_weights_files, kwargs, process_group, distributed
+        )
+    finally:
+        if load_comm_group is not None:
+            torch.cuda.current_stream().synchronize()
+            torch.distributed.destroy_process_group(load_comm_group)
+
+
+def _instanttensor_tensors(
+    instanttensor, hf_weights_files, kwargs, process_group, distributed
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
     device = current_platform.get_device(torch.cuda.current_device())
     enable_tqdm = not distributed or torch.distributed.get_rank() == 0
+    # With copy=True every tensor is cloned, unsharded, out of InstantTensor's ring
+    # buffer. Allocate the clones from a private pool. In the shared allocator cache,
+    # long-lived allocations made while or after loading (e.g. post_load_weights'
+    # w_kc/w_vc) are carved out of the freed clones, pinning segments as large as the
+    # largest tensor (~1.8 GB for GLM-5's embedding) that empty_cache cannot return.
+    pool = (
+        torch.cuda.MemPool()
+        if hasattr(torch.cuda, "use_mem_pool") and torch.cuda.is_available()
+        else None
+    )
     with instanttensor.safe_open(
         hf_weights_files,
         framework="pt",
@@ -1255,15 +1458,29 @@ def instanttensor_weights_iterator(
         copy=True,
         **kwargs,
     ) as f:
-        yield from tqdm(
-            f.tensors(),
-            total=len(f.keys()),
-            desc="Loading safetensors using InstantTensor",
-            disable=not enable_tqdm,
-            mininterval=1,
-            bar_format=BAR_FORMAT,
-            position=tqdm._get_free_pos(),
+        tensors = iter(
+            tqdm(
+                f.tensors(),
+                total=len(f.keys()),
+                desc="Loading safetensors using InstantTensor",
+                disable=not enable_tqdm,
+                mininterval=1,
+                bar_format=BAR_FORMAT,
+                position=tqdm._get_free_pos(),
+            )
         )
+        while True:
+            # Route only InstantTensor's allocations to the pool, not the consumer's.
+            with (
+                torch.cuda.use_mem_pool(pool)
+                if pool is not None
+                else contextlib.nullcontext()
+            ):
+                item = next(tensors, None)
+            if item is None:
+                return
+            yield item
+            del item
 
 
 def fastsafetensors_weights_iterator(
@@ -1800,12 +2017,15 @@ def maybe_remap_kv_scale_name(name: str, params_dict: dict) -> Optional[str]:
              if no remapping is needed.
         None: If the remapped name is not found in params_dict.
     """
-    # ModelSlim: map fa_k.scale to attn_mqa.fa_k_scale; skip unused FA parameters.
+    # ModelSlim: map FA parameters to the installed MLA/GQA attention scheme.
     stem, _, parameter = name.rpartition(".")
     prefix, _, component = stem.rpartition(".")
     if parameter in ("scale", "offset") and component in ("fa_q", "fa_k", "fa_v"):
-        remapped_name = f"{prefix}.attn_mqa.{component}_{parameter}"
-        return remapped_name if remapped_name in params_dict else None
+        for attention in ("attn_mqa", "attn"):
+            remapped_name = f"{prefix}.{attention}.{component}_{parameter}"
+            if remapped_name in params_dict:
+                return remapped_name
+        return None
 
     if name.endswith(".kv_scale"):
         print_warning_once(

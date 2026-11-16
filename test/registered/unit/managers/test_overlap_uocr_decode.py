@@ -11,9 +11,11 @@ from sglang.srt.managers.overlap_utils import FutureMap, resolve_forward_inputs
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
@@ -152,6 +154,7 @@ class TestDeferredThenEagerDecode(CustomTestCase):
         graph_io.relay[indices] = published.to(torch.int64)
         result = SimpleNamespace(
             next_draft_input=None,
+            accept_lens=None,
             has_sampled_token_ids=True,
             next_token_ids=published,
             can_run_cuda_graph=True,
@@ -309,7 +312,7 @@ class TestFlushWithDocumentState(CustomTestCase):
         hooks._reuse.sources[1] = object()
         self.assertTrue(hooks.blocks_flush(ignore_waiting=True))
         hooks._reuse.sources.clear()
-        hooks._prefetch._parked.join([FakeReq(rid="w1")])
+        move([FakeReq(rid="w1")], hooks._prefetch._parked)
         self.assertTrue(hooks.blocks_flush(ignore_waiting=False))
         self.assertFalse(hooks.blocks_flush(ignore_waiting=True))
 
@@ -318,12 +321,12 @@ class TestFlushWithDocumentState(CustomTestCase):
         forgotten before the clear returns their KV to the pools."""
         hooks, _ = self._hooks()
         held = FakeReq(rid="w1")
-        hooks._prefetch._parked.join([held])
+        move([held], hooks._prefetch._parked)
         hooks._reuse.docs["doc"] = object()
         seen = []
         scheduler = object.__new__(Scheduler)
         scheduler.uocr_runtime = hooks
-        scheduler._engine_paused = False
+        scheduler.pause_state = PauseState()
         scheduler.is_fully_idle = lambda **kw: True
         scheduler.tree_cache = Mock()
         scheduler.tree_cache.reset.side_effect = lambda: seen.append(
@@ -334,6 +337,7 @@ class TestFlushWithDocumentState(CustomTestCase):
             "token_to_kv_pool_allocator",
             "grammar_manager",
             "metrics_reporter",
+            "invariant_checker",
         ):
             setattr(scheduler, name, Mock())
         scheduler.draft_worker = None
@@ -349,7 +353,12 @@ class TestFlushWithDocumentState(CustomTestCase):
         held = Req("w1", "", [1], SamplingParams())
         scheduler = object.__new__(Scheduler)
         scheduler.rust_server = Mock()
-        for name in ("tree_cache", "beam_coordinator", "uocr_runtime"):
+        for name in (
+            "tree_cache",
+            "beam_coordinator",
+            "uocr_runtime",
+            "output_streamer",
+        ):
             setattr(scheduler, name, Mock())
         scheduler.hisparse_coordinator = None
         scheduler.init_request_retirer()

@@ -20,11 +20,8 @@
 //     reduces, and restores the +0.0 markers before it exits;
 //   * +0.0 payload words are remapped to -0.0 (numerically identical) so a
 //     written word is never 0 and `word == 0` means "not arrived yet";
-//   * the generic push kernel owns one phase counter per block; this kernel
-//     uses one per row cluster (flipped by the cluster's leader block after a
-//     cluster barrier) plus a trailing "bumper" cluster that flips every
-//     remaining one, so the whole array keeps one parity and both kernel
-//     families can share the plane;
+//   * the phase is the plane's one EpochCounter; each row cluster's leader
+//     block commits once, so this kernel and the generic push kernels share it;
 //   * every rank must call with the same num_tokens / hidden / top_k / epilogue:
 //     slots are addressed by 16B vector index of the [T, hidden] row view.
 #include <sgl_kernel/ffi.h>
@@ -83,7 +80,6 @@ struct MoeFinalizeAllReduceParams {
   bool prefetch_metadata;
   uint32_t rank;
   uint32_t num_tokens;
-  uint32_t num_push_counters;  // full counter array size (bumper range end)
   PushWorkSpace<kWorldSize> ws;
   bf16_t* mhc_out = nullptr;
   const bf16_t* residual = nullptr;
@@ -301,9 +297,9 @@ plain_vec(const MoeFinalizeAllReduceParams<kWorldSize, WeightT>& params, uint32_
 
 // --- the kernel --------------------------------------------------------------
 // Grid dim3(num_tokens [+ 1], kClusterSize) with the cluster along y, so
-// blockIdx.x is the token row (and its phase counter) and blockIdx.y the rank
-// inside the cluster. The extra cluster (blockIdx.x == num_tokens) is the
-// bumper: it only flips the leftover counters [num_tokens, num_push_counters).
+// blockIdx.x is the token row and blockIdx.y the rank inside the cluster. The
+// extra cluster (kQuant only, blockIdx.x == num_tokens) zeros the scale padding
+// and takes no part in the epoch.
 //
 // kTwoShot: row t is owned by rank t % kWorldSize. Each rank
 // pushes its partial only to the owner (slot `src = r`), the owner reduces and
@@ -353,23 +349,16 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize, kVecs>::k
     PDLWaitPrimary<kUsePDL>();
     if constexpr (kQuant) {
       // The SF buffer is padded to 128 rows. Active rows are written by the
-      // norm epilogue; the existing bumper zeros only the disjoint padding.
+      // norm epilogue; this cluster zeros only the disjoint padding.
       for (uint32_t off = hvec; off < (kHiddenDim / 32) * 128; off += kRowVecs) {
         const uint32_t swizzled_row = (off % 512) / 4;
         const uint32_t row = swizzled_row / 4 + (swizzled_row % 4) * 32;
         if (row >= params.num_tokens) params.scales[off] = 0;
       }
     }
-    if (cluster_rank == 0) {
-      const auto epoch = distributed::PushEpoch<kWorldSize>{params.ws};
-      __syncthreads();
-      epoch.unsafe_flip_range(row_idx, params.num_push_counters);
-    }
     return PDLTriggerSecondary<kUsePDL>();
   }
 
-  // this cluster's epoch: the counter at blockIdx.x, one per row cluster
-  // (every block of the cluster reads the same one)
   const auto epoch = distributed::PushEpoch<kWorldSize>{params.ws};
   const auto r = params.rank;
   const auto owner = row_idx % kWorldSize;
@@ -414,7 +403,8 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize, kVecs>::k
     }
   }
 
-  // ensure epoch is consumed, so flipping it won't lead to error
+  // Every CTA of the cluster has read the epoch before the leader may commit; the
+  // norm path gets the same ordering from its cluster.sync.
   if constexpr (!kNorm) barrier_cluster_arrive_relaxed();
 
   // stage 2: poll own slots, reduce across ranks, [norm], write, reset markers
@@ -487,7 +477,6 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize, kVecs>::k
         mhc_post_vec<kHiddenDim>(params, red[0], row_idx, hvec);
       }
     }
-    // ensure epoch is consumed, so flipping it won't lead to error
     barrier_cluster_wait();
   } else {
     __shared__ float smem_sq[kClusterSize][kNumWarps];
@@ -569,7 +558,7 @@ __global__ __launch_bounds__(RowClusterTrait<kHiddenDim, kClusterSize, kVecs>::k
     }
   }
 
-  if (cluster_rank == 0) epoch.flip();
+  if (cluster_rank == 0) epoch.commit(row_idx, params.num_tokens);
 }
 
 // --- host --------------------------------------------------------------------
@@ -978,11 +967,8 @@ struct MoeFinalizeAllReduceKernel {
     CHECK_HOST(nbytes <= push.slot_bytes) << "num_tokens * hidden * 2 = " << nbytes << " bytes exceeds the "
                                           << push.slot_bytes << "-byte push slot (reduce the batch or enlarge "
                                           << "max_push_size)";
-    // one cluster (and phase counter) per row; the bumper cluster is launched
-    // only when counters are left over for it to flip
-    CHECK_HOST(num_tokens <= push.num_blocks)
-        << "num_tokens = " << num_tokens << " exceeds the " << push.num_blocks << " push phase counters of the plane";
-    const uint32_t num_clusters = num_tokens + (num_tokens < push.num_blocks ? 1 : 0);
+    // one cluster per row, plus the scale-padding cluster under kQuant
+    const uint32_t num_clusters = num_tokens + (kQuant ? 1 : 0);
 
     const auto params = Params{
         .out = static_cast<bf16_t*>(out.data_ptr()),
@@ -996,7 +982,6 @@ struct MoeFinalizeAllReduceKernel {
         .prefetch_metadata = prefetch_metadata,
         .rank = push.rank,
         .num_tokens = num_tokens,
-        .num_push_counters = push.num_blocks,
         .ws = push.get_workspace<kWorldSize>(nbytes),
         .mhc_out = mhc_out.has_value() ? static_cast<bf16_t*>(mhc_out.value().data_ptr()) : nullptr,
         .residual = residual.has_value() ? static_cast<const bf16_t*>(residual.value().data_ptr()) : nullptr,

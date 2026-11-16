@@ -13,6 +13,7 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=600, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 # Nightly is not redundant here: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1 to expand get_ci_test_range sweeps.
 register_cuda_ci(est_time=1500, stage="nightly", runner_config="1-gpu-small")
 register_amd_ci(est_time=600, suite="jit-kernel-unit-test-amd")
@@ -203,10 +204,12 @@ def test_rmsnorm_strided_rows() -> None:
     x = x_full[:, :4096]
     w = torch.randn(4096, device=DEVICE, dtype=torch.bfloat16)
     ref, _ = _reference(x.contiguous(), w, None, None, hf=False)
-    out = torch.empty_like(x_full)[:, :4096]
+    out_full = torch.randn_like(x_full)
+    padding = out_full[:, 4096:].clone()
+    out = out_full[:, :4096]
     jit_norm.rmsnorm(x, w, out, EPS)
     _assert_close_16(out, ref)
-    assert torch.equal(x_full[:, 4096:], x_full[:, 4096:])  # untouched padding
+    assert torch.equal(out_full[:, 4096:], padding)  # untouched padding
 
 
 def test_rmsnorm_empty() -> None:

@@ -75,8 +75,13 @@ _NEVER: int = 1 << 30
 # _simt_schedule.
 # K <= 512 leaves MMA little K to split, outside the cost model.
 _TUNED_MMA_MIN_M = {
-    (1536, 128): 8,
     (128, 512): _NEVER,
+    # Kimi-K3's KDA gate and router projections (kimi_k3_tiny_gemm) stay on SIMT at
+    # every m: a decode row and a speculative-verify row of the same token must round
+    # alike, or the drafts are verified against different gates.
+    (144, 7168): _NEVER,
+    (896, 7168): _NEVER,
+    (1536, 128): _NEVER,
 }
 # 128x512 never takes MMA, and its 128 KB weight is cheap to copy: 4 rows of x per CTA
 # beat the default 16 at every m (up to 2x at m = 16).
