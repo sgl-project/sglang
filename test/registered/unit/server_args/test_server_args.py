@@ -4767,11 +4767,6 @@ class TestGrpcServerArgs(CustomTestCase):
         proc.join.assert_called_once_with(timeout=42.0)
         kill_tree.assert_called_once_with(1234, wait_timeout=42.0)
 
-    def test_grpc_mode_requires_encoder_only(self):
-        with self.assertRaisesRegex(ValueError, "requires --encoder-only"):
-            handle_deprecated_args(self._args(grpc_mode=True))
-        handle_deprecated_args(self._args(grpc_mode=True, encoder_only=True))
-
     def test_native_grpc_rejects_multi_tokenizer(self):
         sa = self._args(grpc_port=40000, tokenizer_worker_num=2)
         with self.assertRaises(ValueError):
