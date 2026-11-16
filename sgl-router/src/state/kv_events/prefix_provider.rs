@@ -2,10 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use super::{BlockSizeOracle, CacheNamespace, HashTree};
+use crate::server::metrics::MetricsRegistry;
 use crate::tokenizer::MEDIA_TAG_LEN;
-use sgl_kv_indexer::{PrefixMatch, PrefixOutcome};
+use sgl_kv_indexer::{PrefixIndex, PrefixIndexError, PrefixMatch, PrefixOutcome};
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 /// Prefix lookup result from the local radix tree or remote KV indexer,
 /// consumed by cache-aware routing.
@@ -405,6 +406,49 @@ fn rendezvous_winner(depths: &BTreeMap<String, u32>, key: i64) -> Option<String>
         .filter(|(_, &d)| d == deepest)
         .max_by_key(|(name, _)| score(name))
         .map(|(name, _)| name.clone())
+}
+
+/// Counts external Indexer prefix queries by the outcome the router acted on,
+/// so losing cache affinity is visible on `/metrics` and not only in a WARN log.
+/// Wraps the client rather than the two policy trees that call it, so the legacy
+/// and reorg paths are counted from one place.
+pub struct MeteredPrefixIndex {
+    inner: Arc<dyn PrefixIndex>,
+    metrics: OnceLock<Arc<MetricsRegistry>>,
+}
+
+impl MeteredPrefixIndex {
+    pub fn new(inner: Arc<dyn PrefixIndex>) -> Self {
+        Self {
+            inner,
+            metrics: OnceLock::new(),
+        }
+    }
+
+    /// The registry is built after the client; startup attaches it before the
+    /// listener accepts requests.
+    pub fn attach_metrics(&self, metrics: Arc<MetricsRegistry>) {
+        let _ = self.metrics.set(metrics);
+    }
+}
+
+#[tonic::async_trait]
+impl PrefixIndex for MeteredPrefixIndex {
+    async fn match_prefix(&self, hashes: Vec<i64>) -> Result<PrefixOutcome, PrefixIndexError> {
+        let result = self.inner.match_prefix(hashes).await;
+        if let Some(metrics) = self.metrics.get() {
+            metrics.record_kv_indexer_query(match &result {
+                Ok(PrefixOutcome::Matched { .. }) => "matched",
+                Ok(PrefixOutcome::Empty) => "empty",
+                Err(PrefixIndexError::Unreachable) => "unreachable",
+                Err(PrefixIndexError::Timeout) => "timeout",
+                Err(PrefixIndexError::Overloaded) => "overloaded",
+                Err(PrefixIndexError::QueryTooLarge) => "query_too_large",
+                Err(PrefixIndexError::Rejected(_)) => "rejected",
+            });
+        }
+        result
+    }
 }
 
 fn merge_depth(depth_by_url: &mut BTreeMap<String, u32>, url: String, depth: usize) {
@@ -1086,5 +1130,30 @@ mod tests {
         }
         assert_eq!(provider.tree.pending().followed(), 0);
         assert_eq!(provider.tree.pending().capped(), 0);
+    }
+
+    /// A transport failure keeps the request serving by minimum load, so without
+    /// a counter the lost cache affinity is only a WARN line. Drives a real
+    /// connection refusal rather than a stubbed error.
+    #[tokio::test]
+    async fn unreachable_indexer_query_is_counted() {
+        let metrics = MetricsRegistry::new();
+        let metered = MeteredPrefixIndex::new(Arc::new(
+            sgl_kv_indexer::GrpcPrefixIndex::new(sgl_kv_indexer::PrefixIndexConfig {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                query_deadline: Duration::from_millis(500),
+                max_inflight: 4,
+            })
+            .unwrap(),
+        ));
+        metered.attach_metrics(Arc::clone(&metrics));
+
+        assert_eq!(
+            metered.match_prefix(vec![1, 2, 3]).await.unwrap_err(),
+            PrefixIndexError::Unreachable
+        );
+        assert!(metrics
+            .render()
+            .contains(r#"sgl_router_indexer_query_total{outcome="unreachable"} 1"#));
     }
 }
