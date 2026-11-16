@@ -180,7 +180,9 @@ class TestRequestLengthValidation(_ChatRequestLengthValidation, CustomTestCase):
 @unittest.skipUnless(is_rust_server_built(), "embedded rust server extension not built")
 class TestRustChatRequestLengthValidation(_ChatRequestLengthValidation, CustomTestCase):
     rust_frontend = True
-    max_tokens_error = "Requested token count exceeds the model's maximum context length"
+    max_tokens_error = (
+        "Requested token count exceeds the model's maximum context length"
+    )
 
 
 if __name__ == "__main__":
