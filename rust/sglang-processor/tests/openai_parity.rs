@@ -131,7 +131,7 @@ fn check_case(
 ) -> Result<bool, String> {
     let header = |name: &str| case["headers"][name].as_str();
     let headers = OpenAiHeaders {
-        routing_key: header("x-smg-routing-key"),
+        routing_key: header("x-sgl-routing-key"),
         custom_labels: None,
         sglext_ids: false,
     };
