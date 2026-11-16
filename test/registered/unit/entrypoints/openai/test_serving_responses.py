@@ -2522,9 +2522,27 @@ def _harmony_turn_chunks(output_ids, *, stream, prompt_tokens=5, cached_tokens=0
         yield chunk
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_harmony_context_usage_from_meta_info(stream):
+    """Harmony usage reports the prompt, cached and output token counts the
+    engine returns, for full and streamed output."""
+    output_ids = _harmony_turn_ids(
+        Message.from_role_and_content(Role.ASSISTANT, "ok").with_channel("final")
+    )
+    context = (StreamingHarmonyContext if stream else HarmonyContext)([], {})
+    for chunk in _harmony_turn_chunks(
+        output_ids, stream=stream, prompt_tokens=7, cached_tokens=3
+    ):
+        context.append_output(chunk)
+
+    assert context.num_prompt_tokens == 7
+    assert context.num_cached_tokens == 3
+    assert context.num_output_tokens == len(output_ids)
+
+
 def test_streaming_harmony_context_continues_after_tool_output():
     """A streamed turn that follows a builtin tool result is parsed from its
-    first token."""
+    first token, and usage sums the output tokens of both turns."""
     call_ids = _harmony_turn_ids(
         Message.from_role_and_content(Role.ASSISTANT, "print(1)")
         .with_channel("commentary")
@@ -2548,6 +2566,7 @@ def test_streaming_harmony_context_continues_after_tool_output():
     final = context.messages[-1]
     assert final.channel == "final"
     assert final.content[0].text == "ok"
+    assert context.num_output_tokens == len(call_ids) + len(final_ids)
 
 
 def test_pd_tool_continuation_stops_before_side_effect(response_serving):

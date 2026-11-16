@@ -89,7 +89,7 @@ class HarmonyContext(ConversationContext):
             meta_info = output["meta_info"]
 
             if isinstance(meta_info, dict):
-                if "prompt_token_ids" in meta_info:
+                if "prompt_tokens" in meta_info:
                     self.num_prompt_tokens = meta_info["prompt_tokens"]
                 if "cached_tokens" in meta_info:
                     self.num_cached_tokens = meta_info["cached_tokens"]
@@ -187,6 +187,8 @@ class StreamingHarmonyContext(HarmonyContext):
         self.encoding = get_encoding()
         self.last_tok = None
         self.num_processed_tokens = 0
+        # Output tokens of the generation turns before the current one.
+        self.num_prior_turns_output_tokens = 0
 
     @property
     def messages(self) -> list:
@@ -215,6 +217,15 @@ class StreamingHarmonyContext(HarmonyContext):
                 new_token_ids = output_token_ids
                 self.num_processed_tokens += len(output_token_ids)
 
+            if "prompt_tokens" in meta_info:
+                self.num_prompt_tokens = meta_info["prompt_tokens"]
+            if "cached_tokens" in meta_info:
+                self.num_cached_tokens = meta_info["cached_tokens"]
+            if completion_tokens is not None:
+                # completion_tokens is cumulative within one generation turn.
+                self.num_output_tokens = (
+                    self.num_prior_turns_output_tokens + completion_tokens
+                )
             self._record_finish_reason(meta_info)
 
             for token_id in new_token_ids:
@@ -225,6 +236,7 @@ class StreamingHarmonyContext(HarmonyContext):
             assert len(output) == 1, "Tool output should be a single message"
             # The next turn is a new request whose output_ids start over.
             self.num_processed_tokens = 0
+            self.num_prior_turns_output_tokens = self.num_output_tokens
             msg = output[0]
             # Sometimes the recipient is not set for tool messages,
             # so we set it to "assistant"
