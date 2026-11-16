@@ -3,6 +3,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.hash_topk import HashTopK
 
 torch.use_deterministic_algorithms(True)
@@ -21,7 +22,7 @@ from sglang.srt.layers.moe.topk import grouped_topk_gpu as native_grouped_topk
 from sglang.srt.layers.moe.topk import (
     grouped_topk_xpu,
 )
-from sglang.srt.runtime_context import get_context
+from sglang.srt.runtime_context import get_context, get_model
 from sglang.test.ci.ci_register import register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -380,14 +381,18 @@ class TestBiasedGroupedTopK(CustomTestCase):
                             device=device,
                         )
 
-                        hash_topk = HashTopK(
-                            topk=topk,
-                            num_experts=E_num,
-                            num_fused_shared_experts=num_fused_shared_experts,
-                            vocab_size=vocab_size,
-                            scoring_func="sqrtsoftplus",
-                            routed_scaling_factor=2.5,
-                        ).to(device)
+                        with get_model().override(
+                            shared_experts=SharedExpertsConfig(
+                                num_fused_shared_experts=num_fused_shared_experts
+                            )
+                        ):
+                            hash_topk = HashTopK(
+                                topk=topk - num_fused_shared_experts,
+                                num_experts=E_num,
+                                vocab_size=vocab_size,
+                                scoring_func="sqrtsoftplus",
+                                routed_scaling_factor=2.5,
+                            ).to(device)
                         topk_routed = hash_topk.tid2eid.shape[1]
                         with torch.no_grad():
                             hash_topk.tid2eid.copy_(

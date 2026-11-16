@@ -13,13 +13,19 @@ block-scale batched GEMM ``batched_gemm_a8w8_mxscale``:
   per-token-group fp8 codes and uint8 e8m0 scales that kernel expects, and
 * the load-time conversion of the checkpoint's fp32 block scales to e8m0.
 
-Shapes per attention-TP rank, with ``G`` local o-groups and 128-wide blocks::
+Shapes per attention-TP rank, with ``G`` local o-groups and ``B``-wide blocks, ``B`` the
+checkpoint's weight block (128 for DeepSeek-V4, 32 for V4.1)::
 
     activation  o       [T, G, D]         bf16 -> fp8 e4m3
-    act scale   o_s     [T, G, D/128]     uint8 e8m0 (per token-group)
+    act scale   o_s     [T, G, D/B]       uint8 e8m0 (per token-group)
     weight      wo_a    [G, R, D]         fp8 e4m3 (from the checkpoint)
-    wgt scale   wo_a_s  [G, R/128, D/128] uint8 e8m0
+    wgt scale   wo_a_s  [G, R/B, D/B]     uint8 e8m0
     output      z       [T, G, R]         bf16
+
+128-wide blocks keep the weight row-major for ``batched_gemm_a8w8_mxscale``; 32-wide
+blocks store it in the (16, 16) MFMA-fragment layout of
+``batched_gemm_a8w8_mxscale_bpreshuffle``, which reads it at about twice the rate.
+The block, read off the scale's shape, picks the GEMM.
 
 The e8m0 scale is a bare power-of-two exponent, so a block's scale must be
 rounded *up* to a power of two before its values are divided by it. The
@@ -42,8 +48,10 @@ from sglang.srt.utils import is_gfx95_supported, is_gfx1250_supported, is_hip
 
 logger = logging.getLogger(__name__)
 
-# Block size of the microscaling scales, on both operands and both axes.
+# Block size of the DeepSeek-V4 microscaling scales, on both operands and both axes.
 WO_A_MXFP8_GROUP_SIZE = 128
+# DeepSeek-V4.1's checkpoint block, served by the preshuffled-weight BMM.
+WO_A_MXFP8_BLOCK32 = 32
 _FP8_MAX = 448.0
 _ABSMAX_EPS = 1e-10
 
@@ -63,6 +71,23 @@ if _is_hip and _is_gfx95_supported:
         logger.warning(
             "aiter batched_gemm_a8w8_mxscale import failed; the DSV4 wo_a fp8 "
             "path is unavailable on this build: %s",
+            err,
+        )
+
+# The preshuffled-weight BMM the 32x32-block weight runs; 32x32 support and its tuned
+# rows arrived after the 128x128 BMM, so an older aiter keeps only the 128 path.
+_batched_gemm_a8w8_mxscale_bpreshuffle = None
+_shuffle_weight = None
+if _batched_gemm_a8w8_mxscale is not None:
+    try:
+        from aiter.ops.batched_gemm_op_a8w8 import (
+            batched_gemm_a8w8_mxscale_bpreshuffle as _batched_gemm_a8w8_mxscale_bpreshuffle,
+        )
+        from aiter.ops.shuffle import shuffle_weight as _shuffle_weight
+    except Exception as err:  # pragma: no cover - env-dependent
+        logger.warning(
+            "aiter batched_gemm_a8w8_mxscale_bpreshuffle import failed; the "
+            "32x32-block (DeepSeek-V4.1) wo_a fp8 path is unavailable: %s",
             err,
         )
 
@@ -86,15 +111,19 @@ if _batched_gemm_a8w8_mxscale is not None:
         )
 
 
-# gfx1250 (RDNA4 / MI455): FlyDSL WMMA a8w8 mxfp8 strided-batched GEMM with a
-# 16×16-preshuffled weight layout.  No scaled-MFMA on RDNA4, so the gfx950 path
-# above is unavailable; this path uses wave32 WMMA instead.
-_batched_gemm_a8w8_mxscale_bpreshuffle = None
-if _is_hip and _is_gfx1250_supported:
+# gfx1250 (RDNA4 / MI455) has no scaled-MFMA, so the 128-block absorb uses the
+# WMMA bpreshuffle GEMM on its own. gfx950 already imported that kernel above
+# for the 32-block weight; do not clear it.
+if (
+    _batched_gemm_a8w8_mxscale_bpreshuffle is None
+    and _is_hip
+    and _is_gfx1250_supported
+):
     try:
         from aiter.ops.batched_gemm_op_a8w8 import (
             batched_gemm_a8w8_mxscale_bpreshuffle as _batched_gemm_a8w8_mxscale_bpreshuffle,
         )
+        from aiter.ops.shuffle import shuffle_weight as _shuffle_weight
     except Exception as err:  # pragma: no cover - env-dependent
         logger.warning(
             "aiter batched_gemm_a8w8_mxscale_bpreshuffle import failed; the "
@@ -108,6 +137,19 @@ def is_wo_a_fp8_mxscale_supported() -> bool:
     return _batched_gemm_a8w8_mxscale is not None
 
 
+def is_wo_a_fp8_block32_supported() -> bool:
+    """True when the 32x32-block (DeepSeek-V4.1) fp8 ``wo_a`` path can run.
+
+    The same kernel also serves the gfx1250 128-block absorb, so this stays tied
+    to the gfx950 mxscale import and does not turn on just because gfx1250
+    loaded the preshuffle GEMM.
+    """
+    return (
+        _batched_gemm_a8w8_mxscale is not None
+        and _batched_gemm_a8w8_mxscale_bpreshuffle is not None
+    )
+
+
 def is_wo_a_fp8_fused_invrope_supported() -> bool:
     """True when the fused inverse-RoPE + quant ``wo_a`` path can run."""
     return (
@@ -117,7 +159,7 @@ def is_wo_a_fp8_fused_invrope_supported() -> bool:
 
 def is_wo_a_fp8_bpreshuffle_supported() -> bool:
     """True when the gfx1250 FlyDSL a8w8 bpreshuffle ``wo_a`` path can run."""
-    return _batched_gemm_a8w8_mxscale_bpreshuffle is not None
+    return _is_gfx1250_supported and _batched_gemm_a8w8_mxscale_bpreshuffle is not None
 
 
 def wo_a_weight_to_bpreshuffle(
@@ -129,18 +171,17 @@ def wo_a_weight_to_bpreshuffle(
     """Convert and preshuffle ``wo_a`` weight for the gfx1250 bpreshuffle GEMM.
 
     Reuses ``wo_a_weight_scale_to_e8m0`` (same e8m0 conversion as the gfx950
-    path) then applies the WMMA 16×16 tile shuffle offline.
+    path) then applies the WMMA 16×16 tile shuffle offline. A 128-block weight
+    is still row-major after the conversion, so this shuffle runs once.
 
-    Returns ``(weight_preshuffled [G, R, D] fp8, scale [G, R/128, D/128] uint8)``.
+    Returns ``(weight_preshuffled [G, R, D] fp8, scale [G, R/B, D/B] uint8)``.
     """
-    from aiter.ops.shuffle import shuffle_weight
-
     weight_fp8, scale_e8m0 = wo_a_weight_scale_to_e8m0(
         weight, weight_scale_inv, num_groups, o_lora_rank
     )
     # weight_fp8: [G, R, D]; shuffle_weight applies the 16×16 WMMA tile layout
     # in-place (same shape, rearranged bytes) for the FlyDSL kernel.
-    weight_shuf = shuffle_weight(weight_fp8)
+    weight_shuf = _shuffle_weight(weight_fp8, layout=(16, 16))
     return weight_shuf, scale_e8m0
 
 
@@ -152,11 +193,33 @@ def apply_wo_a_fp8_bpreshuffle(
     """fp8 ``wo_a`` for gfx1250: quantize [T, G, D] then bpreshuffle batched-GEMM.
 
     ``weight`` must already be preshuffled (``wo_a_weight_to_bpreshuffle`` at
-    load time).  ``weight_scale`` is the uint8 e8m0 [G, R/128, D/128] tensor.
+    load time).  ``weight_scale`` is the uint8 e8m0 scale from that conversion.
     Returns bf16 [T, G, R].
     """
-    o_fp8, o_scale = quant_wo_a_act_mxfp8(o)
+    o_fp8, o_scale = quant_wo_a_act_mxfp8(o, wo_a_fp8_block(weight, weight_scale))
     return _batched_gemm_a8w8_mxscale_bpreshuffle(
+        o_fp8, weight, o_scale, weight_scale, dtype=torch.bfloat16
+    )
+
+
+def wo_a_fp8_block(weight: torch.Tensor, weight_scale: torch.Tensor) -> int:
+    """The square block of an e8m0 ``wo_a`` scale: in-features per scale column."""
+    return weight.shape[-1] // weight_scale.shape[-1]
+
+
+def _wo_a_bmm(
+    o_fp8: torch.Tensor,
+    weight: torch.Tensor,
+    o_scale: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """[T, G, D] fp8 x [G, R, D] fp8 -> bf16 [T, G, R] on the GEMM the weight's layout
+    needs (see the module docstring)."""
+    if wo_a_fp8_block(weight, weight_scale) == WO_A_MXFP8_BLOCK32:
+        return _batched_gemm_a8w8_mxscale_bpreshuffle(
+            o_fp8, weight, o_scale, weight_scale, dtype=torch.bfloat16
+        )
+    return _batched_gemm_a8w8_mxscale(
         o_fp8, weight, o_scale, weight_scale, dtype=torch.bfloat16
     )
 
@@ -176,7 +239,7 @@ def _wo_a_quant_mxfp8_kernel(
     """One program per token-group row of the [T*G, D] view.
 
     The row is tiled as ``[NUM_GROUPS, GROUP_SIZE]`` so a single program reduces
-    every 128-wide block of the row at once. Splitting the row across programs
+    every GROUP_SIZE-wide block of the row at once. Splitting the row across programs
     instead leaves each one with a single 128-element load, which on a decode
     step is all launch latency and no work.
     """
@@ -202,20 +265,22 @@ def _wo_a_quant_mxfp8_kernel(
     tl.store(xs_ptr + row * NUM_GROUPS + grp, exp.to(tl.uint8), mask=grp < NUM_GROUPS)
 
 
-def quant_wo_a_act_mxfp8(o: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+def quant_wo_a_act_mxfp8(
+    o: torch.Tensor, group_size: int = WO_A_MXFP8_GROUP_SIZE
+) -> Tuple[torch.Tensor, torch.Tensor]:
     """Quantize the [T, G, D] attention output to fp8 + e8m0 block scales.
 
-    Returns ``(o_fp8 [T, G, D], o_scale [T, G, D/128] uint8)`` in the layout
-    ``batched_gemm_a8w8_mxscale`` consumes directly.
+    Returns ``(o_fp8 [T, G, D], o_scale [T, G, D/group_size] uint8)`` in the layout
+    both mxscale BMMs consume directly.
     """
     T, G, D = o.shape
-    assert D % WO_A_MXFP8_GROUP_SIZE == 0, (
-        f"wo_a in-features ({D}) must be divisible by {WO_A_MXFP8_GROUP_SIZE}"
+    assert D % group_size == 0, (
+        f"wo_a in-features ({D}) must be divisible by {group_size}"
     )
     if not o.is_contiguous():
         o = o.contiguous()
 
-    num_groups = D // WO_A_MXFP8_GROUP_SIZE
+    num_groups = D // group_size
     o_fp8 = torch.empty((T, G, D), device=o.device, dtype=torch.float8_e4m3fn)
     o_scale = torch.empty((T, G, num_groups), device=o.device, dtype=torch.uint8)
 
@@ -226,7 +291,7 @@ def quant_wo_a_act_mxfp8(o: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         D,
         num_groups,
         NUM_GROUPS_PADDED=triton.next_power_of_2(num_groups),
-        GROUP_SIZE=WO_A_MXFP8_GROUP_SIZE,
+        GROUP_SIZE=group_size,
         FP8_MAX=_FP8_MAX,
         EPS=_ABSMAX_EPS,
         num_warps=8,
@@ -241,13 +306,12 @@ def apply_wo_a_fp8_mxscale(
 ) -> torch.Tensor:
     """fp8 ``wo_a``: quantize [T, G, D] then batched-GEMM against [G, R, D].
 
-    ``weight_scale`` is the uint8 e8m0 [G, R/128, D/128] tensor produced at load
-    time by ``wo_a_weight_scale_to_e8m0``. Returns bf16 [T, G, R].
+    ``weight`` and the uint8 e8m0 [G, R/B, D/B] ``weight_scale`` come from
+    ``wo_a_weight_scale_to_e8m0`` at load time; the activation is quantized per
+    B-wide group to match. Returns bf16 [T, G, R].
     """
-    o_fp8, o_scale = quant_wo_a_act_mxfp8(o)
-    return _batched_gemm_a8w8_mxscale(
-        o_fp8, weight, o_scale, weight_scale, dtype=torch.bfloat16
-    )
+    o_fp8, o_scale = quant_wo_a_act_mxfp8(o, wo_a_fp8_block(weight, weight_scale))
+    return _wo_a_bmm(o_fp8, weight, o_scale, weight_scale)
 
 
 def apply_wo_a_fp8_mxscale_fused_invrope(
@@ -273,13 +337,13 @@ def apply_wo_a_fp8_mxscale_fused_invrope(
         cos_cache/sin_cache: ``[max_pos, rope_dim // 2]`` bf16 tables.
         num_groups: local o-groups ``G``.
         weight: ``[G, R, D]`` fp8 ``wo_a`` weight.
-        weight_scale: ``[G, R/128, D/128]`` uint8 e8m0 (from load-time convert).
+        weight_scale: ``[G, R/B, D/B]`` uint8 e8m0 (from load-time convert).
 
     Returns bf16 ``[T, G, R]``.
     """
     # Default scale layout is the unshuffled row layout on both the current
     # (``scale_shuffle=False``) and older (``scale_layout="row"``) aiter
-    # signatures, which is exactly what ``batched_gemm_a8w8_mxscale`` consumes,
+    # signatures, which is exactly what both mxscale BMMs consume,
     # so we omit the layout kwarg to stay compatible across aiter versions.
     o_fp8, o_scale = _inverse_rope_group_quant(
         o,
@@ -287,10 +351,28 @@ def apply_wo_a_fp8_mxscale_fused_invrope(
         cos_cache,
         sin_cache,
         num_groups=num_groups,
-        quant_group_size=WO_A_MXFP8_GROUP_SIZE,
+        quant_group_size=wo_a_fp8_block(weight, weight_scale),
     )
+    return _wo_a_bmm(o_fp8, weight, o_scale, weight_scale)
+
+
+def apply_wo_a_fp8_mxscale_prequant(
+    o_fp8: torch.Tensor,
+    o_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> torch.Tensor:
+    """fp8 ``wo_a`` on ``quant_wo_a_act_mxfp8``-layout operands flattened per
+    token (fp8 ``[T, G*D]``, e8m0 ``[T, G*D/128]``). Returns bf16 ``[T, G, R]``.
+    The paged decode that produces them quantizes per 128 only."""
+    T, G = o_fp8.shape[0], weight.shape[0]
+    assert wo_a_fp8_block(weight, weight_scale) == WO_A_MXFP8_GROUP_SIZE
     return _batched_gemm_a8w8_mxscale(
-        o_fp8, weight, o_scale, weight_scale, dtype=torch.bfloat16
+        o_fp8.view(T, G, -1),
+        weight,
+        o_scale.view(T, G, -1),
+        weight_scale,
+        dtype=torch.bfloat16,
     )
 
 
@@ -308,20 +390,37 @@ def wo_a_weight_scale_to_e8m0(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Convert checkpoint ``wo_a`` fp8 weight + fp32 block scales to e8m0.
 
-    Returns ``(weight [G, R, D] fp8, scale [G, R/128, D/128] uint8)``.
+    Returns ``(weight [G, R, D] fp8, scale [G, R/B, D/B] uint8)`` for the checkpoint's
+    B x B blocks; a 32x32-block weight comes back preshuffled for its BMM.
 
     DeepSeek-V4 checkpoints that carry fp4 experts already store their linear
     block scales as powers of two, so the conversion is exact and the weight
-    passes through untouched. Otherwise the weight is dequantized and requantized
-    against power-of-two scales, because rounding the exponent up on its own
-    would rescale every value in the block.
+    passes through untouched. Otherwise a 128x128-block weight is dequantized and
+    requantized against power-of-two scales, because rounding the exponent up on
+    its own would rescale every value in the block; the ue8m0 requantizer is
+    128x128-only, so a 32x32-block weight must already carry power-of-two scales.
     """
     G, R = num_groups, o_lora_rank
     D = weight.shape[-1]
-    block = WO_A_MXFP8_GROUP_SIZE
+    block = wo_a_fp8_block(weight, weight_scale_inv)
+    assert block in (WO_A_MXFP8_GROUP_SIZE, WO_A_MXFP8_BLOCK32), (
+        weight.shape,
+        weight_scale_inv.shape,
+    )
+    assert weight_scale_inv.shape[-2] * block == G * R, (
+        "wo_a weight scales must be square blocks",
+        weight.shape,
+        weight_scale_inv.shape,
+    )
 
     scale = weight_scale_inv.detach().float()
     if not _is_power_of_two(scale):
+        if block != WO_A_MXFP8_GROUP_SIZE:
+            raise ValueError(
+                f"DSV4 wo_a {block}x{block} block scales are not power-of-two; the "
+                "aiter mxscale GEMM needs ue8m0 scales for this block. Rerun with "
+                "SGLANG_OPT_FP8_WO_A_GEMM=0."
+            )
         from sglang.srt.layers.quantization.fp8_utils import (
             block_quant_dequant,
             quant_weight_ue8m0,
@@ -342,19 +441,23 @@ def wo_a_weight_scale_to_e8m0(
         )
 
     exponent = (scale.contiguous().view(torch.int32) >> 23).to(torch.uint8)
-    return (
-        weight.contiguous().view(G, R, D),
-        exponent.contiguous().view(G, R // block, D // block),
-    )
+    weight = weight.contiguous().view(G, R, D)
+    if block == WO_A_MXFP8_BLOCK32:
+        weight = _shuffle_weight(weight, layout=(16, 16))
+    return weight, exponent.contiguous().view(G, R // block, D // block)
 
 
 __all__ = [
+    "WO_A_MXFP8_BLOCK32",
     "WO_A_MXFP8_GROUP_SIZE",
     "apply_wo_a_fp8_bpreshuffle",
     "apply_wo_a_fp8_mxscale",
+    "apply_wo_a_fp8_mxscale_prequant",
+    "is_wo_a_fp8_block32_supported",
     "is_wo_a_fp8_bpreshuffle_supported",
     "is_wo_a_fp8_mxscale_supported",
     "quant_wo_a_act_mxfp8",
+    "wo_a_fp8_block",
     "wo_a_weight_scale_to_e8m0",
     "wo_a_weight_to_bpreshuffle",
 ]

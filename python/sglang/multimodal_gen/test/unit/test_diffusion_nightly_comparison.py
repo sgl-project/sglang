@@ -2,6 +2,7 @@ import importlib.util
 import io
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parents[5]
@@ -224,13 +225,15 @@ def test_dashboard_uses_historical_median_and_shows_server_breakdown():
     }
     history = [
         {
+            "methodology": "client-e2e-v1",
+            "warmup_requests": 1,
             "results": [
                 {
                     "case_id": "example",
                     "framework": "sglang",
                     "latency_s": value,
                 }
-            ]
+            ],
         }
         for value in (10.0, 30.0, 9.8)
     ]
@@ -249,3 +252,89 @@ def test_dashboard_uses_historical_median_and_shows_server_breakdown():
     assert "Methodology `client-e2e-v1`" in markdown
     assert "## SGLang Server-Side Breakdown" in markdown
     assert "| model | 10.00 | 0.10 | 9.80 | 0.10 | 196.00 |" in markdown
+
+
+@pytest.mark.parametrize(
+    "current_metadata,history_metadata,comparable",
+    [
+        ({}, {}, True),
+        ({"methodology": "client-e2e-v1", "warmup_requests": 1}, {}, False),
+        ({}, {"methodology": "client-e2e-v1", "warmup_requests": 1}, False),
+        (
+            {"methodology": "client-e2e-v1", "warmup_requests": 1},
+            {"methodology": "client-e2e-v2", "warmup_requests": 1},
+            False,
+        ),
+        (
+            {"methodology": "client-e2e-v1", "warmup_requests": 1},
+            {"methodology": "client-e2e-v1", "warmup_requests": 0},
+            False,
+        ),
+        (
+            {"methodology": "client-e2e-v1", "warmup_requests": 1},
+            {"methodology": "client-e2e-v1", "warmup_requests": 1},
+            True,
+        ),
+    ],
+)
+def test_dashboard_compares_only_matching_measurements(
+    current_metadata, history_metadata, comparable, tmp_path
+):
+    current = {
+        **current_metadata,
+        "results": [
+            {
+                "case_id": "example",
+                "framework": "sglang",
+                "model": "example/model",
+                "latency_s": 12.0,
+            }
+        ],
+    }
+    history = [
+        {
+            **history_metadata,
+            "results": [
+                {"case_id": "example", "framework": "sglang", "latency_s": 10.0}
+            ],
+        }
+    ]
+    charts_dir = tmp_path / "charts"
+
+    markdown, alerts = dashboard.generate_dashboard(
+        current, history, str(charts_dir) if not comparable else None
+    )
+
+    assert bool(alerts) == comparable
+    assert ("Performance Regression Detected" in markdown) == comparable
+    assert ("Excluded 1 historical run(s)" in markdown) != comparable
+    assert not charts_dir.exists()
+
+
+def test_dashboard_filters_before_limiting_baseline_window():
+    metadata = {"methodology": "client-e2e-v1", "warmup_requests": 1}
+    current = {
+        **metadata,
+        "results": [
+            {
+                "case_id": "example",
+                "framework": "sglang",
+                "model": "example/model",
+                "latency_s": 12.0,
+            }
+        ],
+    }
+    incompatible = {
+        "results": [{"case_id": "example", "framework": "sglang", "latency_s": 30.0}]
+    }
+    comparable = {
+        **metadata,
+        "results": [{"case_id": "example", "framework": "sglang", "latency_s": 10.0}],
+    }
+    history = [incompatible] * dashboard.HISTORICAL_BASELINE_RUNS + [comparable]
+
+    markdown, alerts = dashboard.generate_dashboard(current, history)
+
+    assert len(alerts) == 1
+    assert "+20.0% vs 1-run median" in alerts[0]
+    assert "1-run median 10.00s" in markdown

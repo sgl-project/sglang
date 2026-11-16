@@ -27,8 +27,13 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     set_graph_pool_id,
 )
-from sglang.srt.model_executor.runner_backend.base_cuda_graph_backend import (
-    BaseCudaGraphBackend,
+from sglang.srt.model_executor.runner_backend.base_graph_backend import (
+    BaseGraphBackend,
+)
+from sglang.srt.model_executor.runner_backend_utils.replay_hooks import (
+    has_replay_hooks,
+    replay_until_settled,
+    save_recurrent_state,
 )
 from sglang.srt.model_executor.runner_utils.pool import (
     GraphPoolPrecarve,
@@ -48,15 +53,22 @@ if TYPE_CHECKING:
     from sglang.srt.model_executor.runner.shape_key import ShapeKey
 
 
-def _allocate_output_buffer(output: Any) -> Optional[torch.Tensor]:
-    if not torch.is_tensor(output) or output.ndim == 0:
-        return None
-    return torch.empty_like(output)
+def _allocate_output_buffer(output: Any) -> Optional[Any]:
+    """Same-structure buffer for a tensor or a (nested) list/tuple of
+    row-major tensors; None when any leaf is something else."""
+    if torch.is_tensor(output):
+        return None if output.ndim == 0 else torch.empty_like(output)
+    if isinstance(output, (list, tuple)) and output:
+        buffers = [_allocate_output_buffer(item) for item in output]
+        if any(buffer is None for buffer in buffers):
+            return None
+        return tuple(buffers) if isinstance(output, tuple) else buffers
+    return None
 
 
-def _output_fits_buffer(output: Any, output_buffer: torch.Tensor) -> bool:
+def _output_fits_buffer(output: torch.Tensor, output_buffer: Any) -> bool:
     return (
-        torch.is_tensor(output)
+        torch.is_tensor(output_buffer)
         and output.ndim == output_buffer.ndim
         and output.shape[1:] == output_buffer.shape[1:]
         and output.shape[0] <= output_buffer.shape[0]
@@ -65,17 +77,31 @@ def _output_fits_buffer(output: Any, output_buffer: torch.Tensor) -> bool:
     )
 
 
-def _copy_output_to_buffer(
-    output: Any, output_buffer: torch.Tensor
-) -> Optional[torch.Tensor]:
-    if not _output_fits_buffer(output, output_buffer):
-        return None
-    shared_output = output_buffer[: output.shape[0]]
-    shared_output.copy_(output)
-    return shared_output
+def _copy_output_to_buffer(output: Any, output_buffer: Any) -> Optional[Any]:
+    """Copy ``output`` leaf-wise into the leading rows of ``output_buffer`` and
+    return the same structure of buffer views; None when it does not fit."""
+    if torch.is_tensor(output):
+        if not _output_fits_buffer(output, output_buffer):
+            return None
+        shared_output = output_buffer[: output.shape[0]]
+        shared_output.copy_(output)
+        return shared_output
+    if isinstance(output, (list, tuple)):
+        if not isinstance(output_buffer, (list, tuple)) or len(output) != len(
+            output_buffer
+        ):
+            return None
+        shared = [
+            _copy_output_to_buffer(item, buffer)
+            for item, buffer in zip(output, output_buffer)
+        ]
+        if any(item is None for item in shared):
+            return None
+        return tuple(shared) if isinstance(output, tuple) else shared
+    return None
 
 
-class FullCudaGraphBackend(BaseCudaGraphBackend):
+class FullCudaGraphBackend(BaseGraphBackend):
     """One torch.cuda.CUDAGraph per shape; attention metadata is
     captured inside the graph. Memory-saver-aware.
     """
@@ -89,6 +115,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
     ) -> None:
         self._graphs: Dict[Any, torch.cuda.CUDAGraph] = {}
         self._outputs: Dict[Any, Any] = {}
+        self._capture_inputs: Dict[Any, Any] = {}
         self._pool = None
         self._cuda_graph_runner = cuda_graph_runner
         self._device_module = cuda_graph_runner.device_module
@@ -96,7 +123,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         self._capture_stream: Optional[torch.cuda.Stream] = None
         self._precarve = GraphPoolPrecarve()
         self._reuse_output_buffer = reuse_output_buffer
-        self._output_buffer: Optional[torch.Tensor] = None
+        self._output_buffer: Optional[Any] = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
             enable=enable_memory_saver
             and get_bool_env_var("SGLANG_MEMORY_SAVER_CUDA_GRAPH")
@@ -124,7 +151,7 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         # SGLANG_GRAPH_BATCH_CAPTURE), the runner created a scheduled
         # torch profiler (wait=2, active=1) and exposed it as _profiler. We step()
         # past the two warmup runs so only the capture run is recorded, and each
-        # batch size produces its own trace via the profiler's on_trace_ready.
+        # captured shape produces its own trace via the profiler's on_trace_ready.
         # With --enable-profile-cuda-graph alone the runner leaves _profiler None
         # (its unscheduled profiler records the whole capture in one pass), so no
         # stepping happens here.
@@ -193,6 +220,8 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
 
         self._graphs[shape_key] = graph
         self._outputs[shape_key] = out
+        # Captured kernels can read tensors owned only by the dummy batch.
+        self._capture_inputs[shape_key] = capture_inputs
 
     def can_run(self, forward_batch: ForwardBatch, shape_key: ShapeKey) -> bool:
         return shape_key in self._graphs
@@ -208,7 +237,15 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
         **kwargs,
     ) -> Any:
         with graph_pool_replay_scope():
-            self._graphs[shape_key].replay()
+            if not has_replay_hooks():
+                self._graphs[shape_key].replay()
+            else:  # a step may need replaying (paged experts' disk tier)
+                restore = save_recurrent_state(
+                    self._cuda_graph_runner.model_runner.req_to_token_pool,
+                    static_forward_batch.req_pool_indices,
+                )
+                self._graphs[shape_key].replay()
+                replay_until_settled(self._graphs[shape_key].replay, restore)
         return self._outputs[shape_key]
 
     def cleanup(self) -> None:
@@ -216,5 +253,6 @@ class FullCudaGraphBackend(BaseCudaGraphBackend):
             graph.reset()
         self._graphs.clear()
         self._outputs.clear()
+        self._capture_inputs.clear()
         self._output_buffer = None
         self._pool = None

@@ -47,8 +47,7 @@ def make_tp1_column_parallel_linear(
         params_dtype=torch.bfloat16,
         quant_config=quant_config,
         prefix=prefix,
-        tp_rank=0,
-        tp_size=1,
+        parallel_group="replicated",
         **kwargs,
     ).cuda()
 

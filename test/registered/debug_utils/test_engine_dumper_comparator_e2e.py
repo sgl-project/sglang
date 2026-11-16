@@ -30,8 +30,10 @@ pytestmark = pytest.mark.filterwarnings(
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import (
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
+    admin_post,
     popen_launch_server,
 )
 
@@ -71,8 +73,8 @@ patches:
           hidden_states = self.attn_boundary.prepare(
               hidden_states,
               forward_batch,
-              captured_last_layer_outputs=captured_last_layer_outputs,
-              capture_output=capture_output,
+              capture_gathered=captured_last_layer_outputs,
+              capture=capture_output,
               **kwargs,
           )
         append: "dumper.dump('layer_input', hidden_states, dims='t h # tp:replicated')"
@@ -123,8 +125,8 @@ patches:
           hidden_states = self.attn_boundary.prepare(
               hidden_states,
               forward_batch,
-              captured_last_layer_outputs=captured_last_layer_outputs,
-              capture_output=capture_output,
+              capture_gathered=captured_last_layer_outputs,
+              capture=capture_output,
               **kwargs,
           )
         append: "dumper.dump('layer_input', hidden_states, dims='t h # tp:replicated dp:=attn_dp')"
@@ -311,6 +313,7 @@ def _run_server_and_generate(
         "--disable-cuda-graph",
         "--cuda-graph-backend-prefill=disabled",
         "--disable-radix-cache",
+        *ADMIN_LAUNCH_ARGS_FOR_TEST,
     ]
     if extra_server_args:
         server_args.extend(extra_server_args)
@@ -323,7 +326,7 @@ def _run_server_and_generate(
         env=env,
     )
     try:
-        requests.post(
+        admin_post(
             f"{base_url}/dumper/configure",
             json={
                 "enable": True,

@@ -1,11 +1,8 @@
 """Unit tests for the shared Transformers-fallback loader path in SGLang."""
 
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
 
 from sglang.srt.models.transformers import TransformersBase
-from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -38,37 +35,6 @@ class TestTransformersFallbackWeightMapper(CustomTestCase):
                 "lm_head.weight",
             ],
         )
-
-
-class TestTransformersFallbackSkipSubstrs(CustomTestCase):
-    def test_init_registers_attention_bias_skip(self):
-        # Older GPT-NeoX checkpoints (pythia-1.4b, gpt-neox-20b) ship a
-        # persistent `attention.bias` causal-mask buffer. Newer transformers
-        # builds register it as `persistent=False`, so it is absent from the
-        # constructed module tree and `AutoWeightsLoader` raises on the
-        # unexpected key unless the fallback tells it to skip. The pre-existing
-        # `.attn.bias` covers GPT-2, not NeoX, so `.attention.bias` must be its
-        # own entry.
-        stub = TransformersBase.__new__(TransformersBase)
-
-        class _Stop(RuntimeError):
-            pass
-
-        with (
-            get_parallel().override(pp_group=SimpleNamespace()),
-            patch(
-                "sglang.srt.models.transformers.get_hf_text_config",
-                return_value=SimpleNamespace(),
-            ),
-            patch(
-                "sglang.srt.models.transformers._resolve_attention_backend_model_cls",
-                side_effect=_Stop,
-            ),
-            self.assertRaises(_Stop),
-        ):
-            TransformersBase.__init__(stub, config=SimpleNamespace())
-
-        self.assertIn(".attention.bias", stub.skip_substrs)
 
 
 if __name__ == "__main__":

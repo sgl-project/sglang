@@ -306,6 +306,7 @@ class TestRunaiModelStreamerLoader(CustomTestCase):
                 DeepseekV4ForCausalLMDSpark._remap_dspark_weight_name(remapper, name)
             ),
             _assert_confidence_head_loaded=lambda **_kwargs: None,
+            post_load_weights=lambda: None,
         )
 
         def weights():

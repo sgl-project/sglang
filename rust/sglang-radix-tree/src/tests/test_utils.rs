@@ -5,7 +5,16 @@ use std::collections::HashMap;
 use tch::Tensor;
 
 use crate::components::ComponentType;
-use crate::unified_tree_core::{CacheAction, EvictionStepResult};
+use crate::node::ChildKeyType;
+use crate::unified_tree_core::{CacheAction, EvictionStepResult, MatchResult, UnifiedTreeCore};
+
+pub(crate) fn matched_device_indices<K: ChildKeyType>(
+    tc: &UnifiedTreeCore<K>,
+    result: &MatchResult,
+) -> Tensor {
+    tc.collect_full_device_indices(result.last_device_node_id, tc.root_node_handle(None))
+        .expect("live match node")
+}
 
 /// Fold an eviction step into a caller's running accumulators (the Controller
 /// consumption contract: deltas add, freed tensors append).
@@ -26,21 +35,14 @@ pub(crate) fn accumulate_step(
     }
 }
 
-/// Short variant names for diagnosing an action sequence's shape.
-pub(crate) fn action_kinds(actions: &[CacheAction]) -> Vec<&'static str> {
-    actions
-        .iter()
-        .map(|action| match action {
-            CacheAction::FreeDeviceKV(_) => "FreeDeviceKV",
-            CacheAction::FreeDeviceKVFullOnly(_) => "FreeDeviceKVFullOnly",
-            CacheAction::BackupKV(_) => "BackupKV",
-            CacheAction::ReplaceWriteThroughOnNodeSplit { .. } => "ReplaceWriteThroughOnNodeSplit",
-            CacheAction::MambaEvictExcessPathStates { .. } => "MambaEvictExcessPathStates",
-            CacheAction::FreeComponentDeviceSlot { .. } => "FreeComponentDeviceSlot",
-            CacheAction::FreeComponentHostSlot { .. } => "FreeComponentHostSlot",
-            CacheAction::RebuildFullToSwaMapping { .. } => "RebuildFullToSwaMapping",
-            CacheAction::RecoverSwaWithLockedFull { .. } => "RecoverSwaWithLockedFull",
-            CacheAction::SwaRebuild { .. } => "SwaRebuild",
-        })
-        .collect()
+/// Tags for diagnosing an action sequence's shape.
+pub(crate) fn action_kinds(actions: &[Box<dyn CacheAction>]) -> Vec<&'static str> {
+    actions.iter().map(|action| action.tag()).collect()
+}
+
+pub(crate) fn expect_action<T: std::any::Any>(action: &dyn CacheAction) -> &T {
+    action
+        .as_any()
+        .downcast_ref::<T>()
+        .unwrap_or_else(|| panic!("expected {}, got {:?}", std::any::type_name::<T>(), action))
 }

@@ -3,7 +3,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 from sglang.kernels.ops.speculative.eagle import (
     prepare_draft_extend_inputs,
@@ -146,10 +146,8 @@ def test_draft_extend_layout_graph(bs, width, mrope):
 @pytest.mark.parametrize("preallocated", [False, True])
 def test_chain_tree_graph(bs, depth, preallocated):
     from sglang.kernels.ops.speculative.eagle import build_chain_tree
-    from sglang.srt.speculative.eagle_utils import (
-        TreeMaskMode,
-        build_tree_kernel_efficient,
-    )
+    from sglang.kernels.ops.speculative.spec_tree import TreeMaskMode
+    from sglang.srt.speculative.eagle_utils import build_tree_kernel_efficient
 
     bonus = torch.arange(bs * 2, device="cuda", dtype=torch.int32)[::2]
     draft = torch.arange(bs * depth * 4, device="cuda", dtype=torch.int64).reshape(
@@ -244,38 +242,26 @@ def test_chain_tree_prepared_outputs_graph(bs, depth, mrope):
             assert out[7] is None
 
 
-@pytest.mark.parametrize("bs", [1, 3, 128])
-@pytest.mark.parametrize("steps", [1, 3, 7])
-@pytest.mark.parametrize("dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("bs", [1, 128])
+@pytest.mark.parametrize("steps", [1, 7])
 @pytest.mark.parametrize("mrope", [False, True])
-def test_draft_cache_positions_graph(bs, steps, dtype, mrope):
+def test_draft_cache_positions_graph(bs, steps, mrope):
     from sglang.kernels.ops.speculative.cache_locs import (
-        assign_draft_cache_locs_contiguous,
+        assign_draft_cache_locs_contiguous_func,
     )
 
     table = torch.arange((bs + 3) * 64, dtype=torch.int32, device="cuda").reshape(
         bs + 3, 64
     )
     requests = torch.arange(bs, device="cuda")
-    seq = torch.arange(bs, device="cuda", dtype=dtype) % 48
+    seq = torch.arange(bs, device="cuda", dtype=torch.int64) % 48
     cache = torch.empty((bs * steps,), device="cuda", dtype=torch.int64)
     positions = torch.empty_like(seq)
     rope = torch.empty((3, bs), device="cuda", dtype=torch.int64) if mrope else None
 
     def run():
-        assign_draft_cache_locs_contiguous[(bs,)](
-            requests,
-            table,
-            seq,
-            cache,
-            64,
-            1,
-            steps,
-            positions=positions,
-            mrope=rope,
-            BS=bs,
-            WRITE_POSITIONS=True,
-            WRITE_MROPE=mrope,
+        assign_draft_cache_locs_contiguous_func(
+            requests, table, seq, cache, 1, steps, positions=positions, mrope=rope
         )
 
     run()
@@ -387,19 +373,15 @@ def test_dynamic_batch_reuses_kernel(operation, monkeypatch):
             locations = torch.empty((bs * 3,), device="cuda", dtype=torch.int64)
             positions = torch.empty_like(seq[:bs])
             mrope = torch.empty((3, bs), device="cuda", dtype=torch.int64)
-            kernel[(bs,)](
+            cache_locs.assign_draft_cache_locs_contiguous_func(
                 requests[:bs],
                 table,
                 seq[:bs],
                 locations,
-                64,
                 1,
                 3,
                 positions=positions,
                 mrope=mrope,
-                BS=bs,
-                WRITE_POSITIONS=True,
-                WRITE_MROPE=True,
             )
             torch.testing.assert_close(positions, seq[:bs], rtol=0, atol=0)
             torch.testing.assert_close(

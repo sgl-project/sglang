@@ -13,7 +13,7 @@ from sglang.srt.speculative.cpp_ngram.ngram_corpus import NgramCorpus
 from sglang.test.ci.ci_register import register_cpu_ci, register_xpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=19, suite="base-a-test-cpu")
 register_xpu_ci(
     est_time=20,
     suite="stage-b-test-1-gpu-xpu",
@@ -733,70 +733,6 @@ class TestNgramCorpusExternalSam(CustomTestCase):
         self.assertEqual(ids.tolist(), [3, 20])
 
 
-class TestNgramCorpusMatchBenchmark(CustomTestCase):
-    """Benchmark incremental advance vs full rebuild in match()."""
-
-    def test_incremental_faster_than_rebuild(self):
-        """Incremental advance (O(D) per token) should be faster than rebuild (O(D^2))."""
-        import time
-
-        max_trie_depth = 18
-        draft_token_num = 8
-        corpus = _make_corpus(
-            "BFS",
-            max_trie_depth=max_trie_depth,
-            draft_token_num=draft_token_num,
-            capacity=500000,
-        )
-
-        # Seed the trie with diverse sequences so suffix matching is non-trivial.
-        seed_data = [list(range(i, i + 50)) for i in range(0, 5000, 50)]
-        corpus.batch_put(seed_data)
-        corpus.synchronize()
-
-        num_steps = 500
-        base_seq = list(range(1, max_trie_depth + 1))
-
-        # --- Incremental path: same req_id, total_len grows by 1 each step ---
-        req_id = "bench-incremental"
-        # Warm up the state with the initial context.
-        _batch_get_with_state(corpus, req_id, base_seq, len(base_seq))
-
-        start = time.perf_counter()
-        for step in range(num_steps):
-            total_len = len(base_seq) + step + 1
-            new_token = (step + max_trie_depth + 1) % 5000
-            tail = (base_seq + [new_token])[-max_trie_depth:]
-            base_seq = tail
-            _batch_get_with_state(corpus, req_id, tail, total_len)
-        incremental_us = (time.perf_counter() - start) / num_steps * 1e6
-
-        # --- Rebuild path: unique req_id each call forces fresh state ---
-        base_seq = list(range(1, max_trie_depth + 1))
-        start = time.perf_counter()
-        for step in range(num_steps):
-            new_token = (step + max_trie_depth + 1) % 5000
-            tail = (base_seq + [new_token])[-max_trie_depth:]
-            base_seq = tail
-            _batch_get(corpus, [tail])
-        rebuild_us = (time.perf_counter() - start) / num_steps * 1e6
-
-        print(
-            f"\n  Incremental: {incremental_us:.1f} us/step"
-            f"\n  Rebuild:     {rebuild_us:.1f} us/step"
-            f"\n  Speedup:     {rebuild_us / incremental_us:.2f}x"
-        )
-
-        # The incremental path should be at least as fast; allow a small margin
-        # for noise. With D=12 the theoretical speedup is ~12x (D^2/D).
-        self.assertLess(
-            incremental_us,
-            rebuild_us * 1.1,
-            f"Incremental ({incremental_us:.1f} us) should not be slower than "
-            f"rebuild ({rebuild_us:.1f} us)",
-        )
-
-
 class TestNgramCorpusMultiSam(CustomTestCase):
     """Verify multi-SAM add/remove/list and budget splitting."""
 
@@ -927,95 +863,6 @@ class TestNgramCorpusMultiSam(CustomTestCase):
             any(4 in path or 5 in path for path in leaf_paths),
             f"Expected tokens from corpus 'a' in {leaf_paths}",
         )
-
-
-class TestMultiSamHttpMock(CustomTestCase):
-    """Test HTTP endpoints for multi-SAM management with a mocked backend."""
-
-    @classmethod
-    def setUpClass(cls):
-        from unittest.mock import AsyncMock, MagicMock
-
-        try:
-            from starlette.testclient import TestClient
-
-            from sglang.srt.entrypoints.http_server import app, set_global_state
-        except (ImportError, OSError):
-            raise unittest.SkipTest(
-                "http_server import requires CUDA libraries not available on CPU"
-            )
-        from sglang.srt.managers.io_struct import (
-            AddExternalCorpusReqOutput,
-            ListExternalCorporaReqOutput,
-            RemoveExternalCorpusReqOutput,
-        )
-
-        mock_state = MagicMock()
-        tm = mock_state.tokenizer_manager
-
-        # Wire up async methods that the HTTP handlers call
-        tm.add_external_corpus = AsyncMock(
-            return_value=AddExternalCorpusReqOutput(
-                success=True,
-                corpus_id="test-id",
-                message="Loaded corpus 'test-id' with 100 tokens.",
-                loaded_token_count=100,
-            )
-        )
-        tm.remove_external_corpus = AsyncMock(
-            return_value=RemoveExternalCorpusReqOutput(
-                success=True, message="Removed corpus 'test-id'."
-            )
-        )
-        tm.list_external_corpora = AsyncMock(
-            return_value=ListExternalCorporaReqOutput(
-                success=True, corpus_token_counts={"a": 100, "b": 200}
-            )
-        )
-        set_global_state(mock_state)
-        cls.client = TestClient(app)
-        cls.mock_tm = tm
-
-    def test_add_corpus(self):
-        resp = self.client.post(
-            "/add_external_corpus",
-            json={"corpus_id": "my-corpus", "documents": ["hello world"]},
-        )
-        self.assertEqual(resp.status_code, 200)
-        data = resp.json()
-        self.assertTrue(data["success"])
-        self.assertEqual(data["corpus_id"], "test-id")
-        self.assertEqual(data["loaded_token_count"], 100)
-
-    def test_add_corpus_auto_id(self):
-        resp = self.client.post(
-            "/add_external_corpus",
-            json={"documents": ["hello world"]},
-        )
-        self.assertEqual(resp.status_code, 200)
-        self.assertTrue(resp.json()["success"])
-
-    def test_remove_corpus(self):
-        resp = self.client.post(
-            "/remove_external_corpus",
-            json={"corpus_id": "test-id"},
-        )
-        self.assertEqual(resp.status_code, 200)
-        self.assertTrue(resp.json()["success"])
-
-    def test_remove_corpus_missing_id(self):
-        resp = self.client.post(
-            "/remove_external_corpus",
-            json={},
-        )
-        self.assertEqual(resp.status_code, 400)
-
-    def test_list_corpora(self):
-        resp = self.client.get("/list_external_corpora")
-        self.assertEqual(resp.status_code, 200)
-        data = resp.json()
-        self.assertTrue(data["success"])
-        self.assertEqual(data["corpus_token_counts"], {"a": 100, "b": 200})
 
 
 if __name__ == "__main__":

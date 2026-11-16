@@ -220,11 +220,16 @@ def gemm_nt_f8f8bf16(
     lhs: Tuple[torch.Tensor, torch.Tensor],
     rhs: Tuple[torch.Tensor, torch.Tensor],
     out: torch.Tensor,
+    recipe: Optional[Tuple[int, int, int]] = None,
 ):
     m, k = lhs[0].shape
     n, _ = rhs[0].shape
     num_groups = 1
-    kernel_type = compile_utils.DeepGemmKernelType.GEMM_NT_F8F8BF16
+    kernel_type = (
+        compile_utils.DeepGemmKernelType.GEMM_NT_F8F8BF16_BLOCK32
+        if recipe == (1, 32, 32)
+        else compile_utils.DeepGemmKernelType.GEMM_NT_F8F8BF16
+    )
 
     _sanity_check_input(lhs)
     _sanity_check_input(rhs)
@@ -234,6 +239,7 @@ def gemm_nt_f8f8bf16(
             lhs,
             rhs,
             out,
+            **({"recipe": recipe} if recipe is not None else {}),
         )
 
 
@@ -287,6 +293,22 @@ def tf32_hc_prenorm_gemm(
     if x.shape[0] == 0:
         return
     deep_gemm.tf32_hc_prenorm_gemm(x, fn, out, sqrsum, num_splits=num_splits)
+
+
+def tf32_hc_prenorm_gemm_dual(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    fn2: torch.Tensor,
+    out: torch.Tensor,
+    out2: torch.Tensor,
+    sqrsum: torch.Tensor,
+    num_splits: Optional[int],
+):
+    if x.shape[0] == 0:
+        return
+    deep_gemm.tf32_hc_prenorm_gemm_dual(
+        x, fn, fn2, out, out2, sqrsum, num_splits=num_splits
+    )
 
 
 def update_deep_gemm_config(gpu_id: int):

@@ -10,23 +10,43 @@ import random
 import socket
 from typing import Any
 
-from sglang.srt.arg_groups.overrides import (
-    declare_resolution,
-    model_config_of,
-    resolving_view,
-)
+from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
+from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.cuda_graph_config import Backend, Phase, with_phase
+from sglang.srt.multimodal.media_io import configure_media_url_security
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import (
-    configure_media_url_security,
+from sglang.srt.sampling.watermarking.config import load_watermark_config
+from sglang.srt.utils.device import (
     get_device,
     is_gfx95_supported,
     is_mnnvl_fabric_device,
 )
-from sglang.utils import is_in_ci
 
 logger = logging.getLogger(__name__)
+
+
+def handle_admin_api_key_env(server_args: Any) -> None:
+    """`--admin-api-key` wins; without it the server takes `SGLANG_ADMIN_API_KEY`."""
+    env_key = envs.SGLANG_ADMIN_API_KEY.get()
+    if resolving_view(server_args).admin_api_key is None and env_key:
+        declare_resolution(
+            server_args, "_handle_admin_api_key_env", admin_api_key=env_key
+        )
+
+
+def handle_watermark_config(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if cfg.watermark_config is None:
+        return
+    config = load_watermark_config(cfg.watermark_config)
+    resolved = {
+        f"watermark_{field}": getattr(config, field)
+        for field in config.__struct_fields__
+        if getattr(config, field) is not None
+    }
+    if resolved:
+        declare_resolution(server_args, "handle_watermark_config", **resolved)
 
 
 def handle_ssl_validation(server_args: Any):
@@ -70,6 +90,13 @@ def handle_ssl_validation(server_args: Any):
             "--enable-ssl-refresh requires --ssl-certfile and --ssl-keyfile "
             "to be specified."
         )
+    if cfg.enable_http_worker_reuseport and (
+        cfg.tokenizer_worker_num == 1 or cfg.enable_http2
+    ):
+        raise ValueError(
+            "--enable-http-worker-reuseport requires --tokenizer-worker-num > 1 "
+            "and has no effect with --enable-http2."
+        )
 
     if cfg.enable_http2:
         if not 0 < cfg.http2_max_concurrent_streams < 2**32:
@@ -82,13 +109,16 @@ def handle_ssl_validation(server_args: Any):
                 "1024 and 2147483647."
             )
 
-        try:
-            import granian  # noqa: F401
-        except ImportError:
-            raise ValueError(
-                "--enable-http2 requires the 'granian' package. "
-                'Install it with: pip install "sglang[http2]"'
-            )
+        # The Rust listener serves HTTP/2 itself; only the Python frontend
+        # runs on Granian.
+        if not envs.SGLANG_RUST_SERVER.get():
+            try:
+                import granian  # noqa: F401
+            except ImportError:
+                raise ValueError(
+                    "--enable-http2 requires the 'granian' package. "
+                    'Install it with: pip install "sglang[http2]"'
+                )
 
         if cfg.enable_ssl_refresh:
             raise ValueError(
@@ -188,6 +218,8 @@ def handle_media_url_security(server_args: Any):
         allowed_media_domains=configure_media_url_security(
             cfg.allowed_media_domains,
             cfg.media_url_max_file_size_mb,
+            cfg.media_url_timeout,
+            cfg.allow_local_media_files,
         ),
     )
 
@@ -224,7 +256,7 @@ def handle_grammar_backend(server_args: Any):
 
 def handle_debug_utils(server_args: Any):
     cfg = resolving_view(server_args)
-    if is_in_ci() and cfg.soft_watchdog_timeout is None:
+    if envs.SGLANG_IS_IN_CI.get() and cfg.soft_watchdog_timeout is None:
         logger.info("Set soft_watchdog_timeout since in CI")
         declare_resolution(
             server_args, "_handle_debug_utils", soft_watchdog_timeout=300
@@ -278,7 +310,8 @@ def handle_deprecated_args(server_args: Any):
         "_handle_deprecated_args",
         enable_flashinfer_allreduce_fusion=False,
     )
-    # Deprecated attention-backend alias: "compressed" -> "dsv4".
+    # Deprecated attention-backend aliases.
+    aliases = {"tokenspeed_mla": "cutedsl_mla"}
     renamed = {}
     for attr in (
         "attention_backend",
@@ -286,27 +319,48 @@ def handle_deprecated_args(server_args: Any):
         "prefill_attention_backend",
         "speculative_draft_attention_backend",
     ):
-        if getattr(server_args, attr, None) == "compressed":
+        old = getattr(server_args, attr, None)
+        if old in aliases:
             logger.warning(
-                "--%s=compressed is deprecated; use 'dsv4' instead.",
+                "--%s=%s is deprecated; use '%s' instead.",
                 attr.replace("_", "-"),
+                old,
+                aliases[old],
             )
-            renamed[attr] = "dsv4"
+            renamed[attr] = aliases[old]
+    if renamed.get("prefill_attention_backend") == "cutedsl_mla":
+        # cutedsl_mla is decode-only.
+        renamed["prefill_attention_backend"] = "trtllm_mla"
+    if "tokenspeed_mla" in (cfg.attention_backend, cfg.decode_attention_backend):
+        # Keep what tokenspeed_mla implied: FP8 KV, verify on the decode kernel.
+        if cfg.kv_cache_dtype != "fp8_e4m3":
+            logger.warning(
+                "tokenspeed_mla required FP8 KV; setting --kv-cache-dtype=fp8_e4m3."
+            )
+            renamed["kv_cache_dtype"] = "fp8_e4m3"
+        if (
+            cfg.speculative_algorithm is not None
+            and cfg.speculative_attention_mode == "prefill"
+        ):
+            renamed["speculative_attention_mode"] = "decode"
     if renamed:
         declare_resolution(server_args, "_handle_deprecated_args", **renamed)
 
-    # --grpc-mode is a deprecated alias for --smg-grpc-mode.
-    if cfg.grpc_mode and not cfg.smg_grpc_mode:
-        logger.warning(
-            "--grpc-mode is deprecated and will be removed in a future "
-            "version. Use --smg-grpc-mode for the legacy SMG gRPC server, "
-            "or --grpc-port for the native gRPC server."
-        )
-        declare_resolution(
-            server_args,
-            "_handle_deprecated_args",
-            smg_grpc_mode=True,
-        )
+    # Deprecated MoE A2A backend alias.
+    renamed = {}
+    for attr, value in (
+        ("moe_a2a_backend", cfg.moe_a2a_backend),
+        ("speculative_moe_a2a_backend", cfg.speculative_moe_a2a_backend),
+    ):
+        if value == "flashinfer":
+            logger.warning(
+                "--%s=flashinfer is deprecated; use 'flashinfer_nvlink_one_sided' "
+                "instead.",
+                attr.replace("_", "-"),
+            )
+            renamed[attr] = "flashinfer_nvlink_one_sided"
+    if renamed:
+        declare_resolution(server_args, "_handle_deprecated_args", **renamed)
 
     # Native gRPC tuning knob is env-only; --grpc-port (CLI) enables the
     # native server, falling back to SGLANG_GRPC_PORT.
@@ -324,14 +378,10 @@ def handle_deprecated_args(server_args: Any):
             grpc_port=grpc_port_env,
         )
 
-    # Legacy SMG defaults its port to --port + 10000. Derive/validate only
-    # when gRPC is in use, so HTTP-only high ports don't fail validation.
-    legacy_grpc = cfg.smg_grpc_mode or cfg.grpc_mode
-    if legacy_grpc and cfg.grpc_port is None:
-        declare_resolution(
-            server_args,
-            "_handle_deprecated_args",
-            grpc_port=cfg.port + 10000,
+    if cfg.grpc_mode and not cfg.encoder_only:
+        raise ValueError(
+            "--grpc-mode serves the encoder over gRPC and requires "
+            "--encoder-only; use --grpc-port for the native gRPC server."
         )
 
     if cfg.grpc_response_timeout_secs <= 0:
@@ -348,9 +398,6 @@ def handle_deprecated_args(server_args: Any):
                 f"SGLANG_GRPC_WORKER_THREADS ({cfg.grpc_worker_threads}) must be >= 1"
             )
 
-    # Native gRPC is incompatible with launch paths it doesn't wire into.
-    # Legacy takes precedence over grpc_port, keeping re-runs idempotent.
-    native_grpc = cfg.grpc_port is not None and not legacy_grpc
     if cfg.sidecar_args is not None:
         if cfg.sidecar is None:
             raise ValueError("--sidecar-args requires --sidecar.")
@@ -361,19 +408,10 @@ def handle_deprecated_args(server_args: Any):
     if cfg.sidecar is not None:
         if not cfg.sidecar.strip():
             raise ValueError("--sidecar must not be empty.")
-        if legacy_grpc:
-            raise ValueError(
-                "--sidecar requires SGLang's native gRPC server; "
-                "it cannot be combined with --smg-grpc-mode/--grpc-mode."
-            )
         if cfg.grpc_port is None:
             raise ValueError("--sidecar requires --grpc-port or SGLANG_GRPC_PORT.")
-        if envs.SGLANG_RUST_SERVER.get():
-            raise ValueError(
-                "--sidecar is not yet supported with SGLANG_RUST_SERVER: "
-                "Rust-server mode does not run the Python sidecar lifecycle."
-            )
-    if native_grpc:
+    # Native gRPC is incompatible with launch paths it doesn't wire into.
+    if cfg.grpc_port is not None:
         if cfg.use_ray:
             raise ValueError(
                 "--grpc-port is not supported with --use-ray: the Ray "
@@ -391,7 +429,8 @@ def handle_deprecated_args(server_args: Any):
             )
         if cfg.api_key or cfg.admin_api_key:
             raise ValueError(
-                "--grpc-port is incompatible with --api-key/--admin-api-key: "
+                "--grpc-port is incompatible with --api-key/--admin-api-key "
+                "(or SGLANG_ADMIN_API_KEY): "
                 "the native gRPC listener bypasses HTTP auth middleware."
             )
 
@@ -402,9 +441,6 @@ def handle_environment_variables(server_args: Any):
     envs.SGLANG_ENABLE_TORCH_COMPILE.set("1" if cfg.enable_torch_compile else "0")
     if cfg.mamba_ssm_dtype is not None:
         envs.SGLANG_MAMBA_SSM_DTYPE.set(cfg.mamba_ssm_dtype)
-    envs.SGLANG_DISABLE_OUTLINES_DISK_CACHE.set(
-        "1" if cfg.disable_outlines_disk_cache else "0"
-    )
     envs.SGLANG_ENABLE_DETERMINISTIC_INFERENCE.set(
         "1" if cfg.enable_deterministic_inference else "0"
     )
@@ -420,7 +456,6 @@ def handle_environment_variables(server_args: Any):
                 server_args, "_handle_environment_variables", debug_cuda_graph=False
             )
         else:
-            envs.SGLANG_USE_BREAKABLE_CUDA_GRAPH.set("1")
             logger.warning(
                 "Debug mode for CUDA graph is enabled via breakable CUDA graph. "
                 "All operations will run eagerly through the graph capture/replay path."
@@ -431,6 +466,10 @@ def handle_environment_variables(server_args: Any):
         raise ValueError(
             "--enable-deepseek-v4-fp4-indexer requires SM100, SM120, or gfx95 GPUs "
             "with FP4 indexer support."
+        )
+    if cfg.enable_fp4_indexer and not get_platform().is_sm100:
+        raise ValueError(
+            "--enable-fp4-indexer requires SM100 GPUs with FP4 indexer support."
         )
     # FP8 W_o GEMM needs DeepGEMM JIT. Enable exactly where the runtime can
     # run it, mirroring the forward scale split: the default sm100 UE8M0
@@ -493,6 +532,16 @@ def handle_other_validations(server_args: Any):
                 "_handle_other_validations",
                 optimistic_prefill_attempts=0,
             )
+
+    if (
+        cfg.disaggregation_decode_allocation_policy == "prefill_complete"
+        and cfg.disaggregation_mode == "prefill"
+        and resolving_view(server_args).optimistic_prefill_attempts <= 0
+    ):
+        raise ValueError(
+            "prefill_complete requires optimistic prefill, but the resolved "
+            "model/cache configuration disabled it."
+        )
 
     # Handle model inference tensor dump.
     if cfg.debug_tensor_dump_output_folder is not None:
@@ -560,19 +609,25 @@ def handle_other_validations(server_args: Any):
                     )
 
     # Validate preferred_sampling_params
-    if cfg.preferred_sampling_params:
-        if isinstance(cfg.preferred_sampling_params, str):
+    preferred_sampling_params = cfg.preferred_sampling_params
+    if preferred_sampling_params:
+        if isinstance(preferred_sampling_params, str):
+            preferred_sampling_params = json.loads(preferred_sampling_params)
             declare_resolution(
                 server_args,
                 "_handle_other_validations",
-                preferred_sampling_params=json.loads(cfg.preferred_sampling_params),
+                preferred_sampling_params=preferred_sampling_params,
+            )
+        if "watermark" in preferred_sampling_params:
+            raise ValueError(
+                "watermark is not supported in --preferred-sampling-params"
             )
 
         # Validate preferred_sampling_params doesn't use tokenizer-dependent features
         if cfg.skip_tokenizer_init:
             from sglang.srt.sampling.sampling_params import SamplingParams
 
-            test_params = SamplingParams(**cfg.preferred_sampling_params)
+            test_params = SamplingParams(**preferred_sampling_params)
             # raises if tokenizer-dependent features used
             test_params.normalize(None)
 
@@ -664,7 +719,7 @@ def handle_return_hidden_states_mode(server_args: Any):
             "return_hidden_states_mode must be one of: None, 'last', or 'full'."
         )
     if cfg.return_hidden_states_mode is None:
-        if cfg.enable_return_hidden_states:
+        if cfg.enable_return_hidden_states or cfg.enable_return_aux_hidden_states:
             declare_resolution(
                 server_args,
                 "_handle_return_hidden_states_mode",

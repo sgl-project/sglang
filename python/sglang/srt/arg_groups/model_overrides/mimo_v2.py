@@ -9,8 +9,8 @@ from sglang.srt.arg_groups.model_override_base import (
     model_config_of,
     resolving_view,
 )
+from sglang.srt.configs.quant_utils import get_quantization_config
 from sglang.srt.runtime_context import get_platform
-from sglang.srt.utils.common import get_quantization_config
 
 logger = logging.getLogger(__name__)
 
@@ -35,14 +35,13 @@ def _mimo_v2_overrides(server_args: Any, hf_config: Any) -> dict:
         and cfg.moe_runner_backend == "auto"
         and get_quantization_config(hf_config) == "fp8"
     ):
-        if model_config_of(server_args).is_fp4_experts:
-            # Let the all-to-all backend choose its compatible runner.
-            if cfg.moe_a2a_backend == "none":
+        # Let the all-to-all backend choose its compatible runner.
+        if cfg.moe_a2a_backend == "none":
+            if model_config_of(server_args).is_fp4_experts:
                 overrides["moe_runner_backend"] = "flashinfer_mxfp4"
-        else:
-            # Avoid the slower Triton default for ordinary FP8 checkpoints.
-            overrides["moe_runner_backend"] = "flashinfer_trtllm"
-        if "moe_runner_backend" in overrides:
+            else:
+                # Avoid the slower Triton default for ordinary FP8 checkpoints.
+                overrides["moe_runner_backend"] = "flashinfer_trtllm"
             logger.info(
                 "MiMoV2 on SM100: moe_runner_backend=%s.",
                 overrides["moe_runner_backend"],
