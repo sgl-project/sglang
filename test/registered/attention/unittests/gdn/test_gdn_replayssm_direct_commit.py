@@ -114,7 +114,9 @@ class _Arm:
         ring_len=RING,
         lazy=False,
         window_only=False,
+        cursor_stride=1,
     ):
+        self.cursor_storage = []
         conv = template["conv"].clone()
         temporal = template["temporal"].clone()
         if replayssm:
@@ -144,7 +146,11 @@ class _Arm:
             )
 
             def cursor(dtype):
-                return torch.zeros(NUM_ROWS, device="cuda", dtype=dtype)
+                storage = torch.full(
+                    (NUM_ROWS, cursor_stride), -73, device="cuda", dtype=dtype
+                )
+                self.cursor_storage.append(storage)
+                return storage[:, 0].zero_()
 
             self.pool = SimpleNamespace(
                 replayssm_is_kda=False,
@@ -330,13 +336,14 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
     def _replayssm(self, template):
         return _Arm(template, replayssm=True, dispatcher=self.dispatcher)
 
-    def _window_arm(self, template):
+    def _window_arm(self, template, cursor_stride=1):
         return _Arm(
             template,
             replayssm=True,
             dispatcher=self.dispatcher,
             ring_len=WIDTH,
             window_only=True,
+            cursor_stride=cursor_stride,
         )
 
     def test_window_factors_match_ring_with_track_and_padding(self):
@@ -360,7 +367,7 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
                         dtype=torch.int32,
                     )
                     old = self._replayssm(template)
-                    new = self._window_arm(template)
+                    new = self._window_arm(template, cursor_stride=3)
                     # Ignored metadata must not participate in either kernel.
                     new.pool.replayssm_spec_write_pos.fill_(11)
                     new.pool.replayssm_cache_base.fill_(7)
@@ -503,7 +510,15 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
         the outputs stay as close to the reference as the snapshot path's."""
         self._check_chain(torch.float32, num_steps=128, lazy=True)
 
-    def _check_chain(self, ssm_dtype, num_steps, lazy=False):
+    def test_entry_cursor_views_preserve_verify_and_commit(self):
+        """Replay and flush strided cursors without touching adjacent fields."""
+        for dtype in (torch.bfloat16, torch.float32):
+            with self.subTest(dtype=dtype):
+                self._check_chain(
+                    dtype, num_steps=128, lazy=dtype == torch.float32, cursor_stride=3
+                )
+
+    def _check_chain(self, ssm_dtype, num_steps, lazy=False, cursor_stride=1):
         torch.manual_seed(7)
         layers = _make_layers()
         template = _template(ssm_dtype)
@@ -519,6 +534,7 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
                 dispatcher=self.dispatcher,
                 ring_len=4 * WIDTH if lazy else RING,
                 lazy=lazy,
+                cursor_stride=cursor_stride,
             ),
             # The Triton recurrent verify writes a snapshot per draft on every
             # GPU.
@@ -658,6 +674,8 @@ class TestGDNReplaySSMDirectCommit(CustomTestCase):
             # (fp32 state), as the snapshot kernels do.
             baseline = summary["snapshot"][key][0]
             self.assertLessEqual(chain_mean, 1.25 * baseline, f"{ssm_dtype} {key}")
+        for storage in replayssm.cursor_storage:
+            self.assertTrue(torch.all(storage[:, 1:] == -73))
 
     def test_track_slot_holds_tracked_step(self):
         """A track slot receives the state and conv window of its tracked step
