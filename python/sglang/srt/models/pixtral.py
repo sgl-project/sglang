@@ -414,11 +414,7 @@ class VisionTransformer(nn.Module):
         freqs_cis = self.freqs_cis[positions[:, 0], positions[:, 1]]
 
         # pass through Transformer with a block diagonal mask delimiting images
-        from transformers.models.pixtral.modeling_pixtral import (
-            generate_block_attention_mask,
-        )
-
-        mask = generate_block_attention_mask(
+        mask = _get_pixtral_attention_mask(
             [p.shape[-2] * p.shape[-1] for p in patch_embeds_list], patch_embeds
         )
         return self.transformer(patch_embeds, mask=mask, freqs_cis=freqs_cis)
@@ -792,47 +788,6 @@ class PixtralHFTransformer(nn.Module):
         return hidden_states
 
 
-def resolve_visual_encoder_outputs(
-    outputs: Union[torch.Tensor, List[torch.Tensor]],
-    feature_sample_layers: Optional[List[int]],
-    post_norm: Optional[nn.Module],
-    num_hidden_layers: int,
-) -> torch.Tensor:
-    """Resolve outputs from visual encoder based on feature_sample_layers."""
-    if feature_sample_layers is None:
-        # Just use the last layer's output
-        if isinstance(outputs, list):
-            outputs = outputs[-1]
-        if post_norm is not None:
-            outputs = post_norm(outputs)
-        return outputs
-
-    # Handle the case where we want to use specific layers
-    if not isinstance(outputs, list):
-        raise ValueError(
-            "Expected outputs to be a list when feature_sample_layers is provided"
-        )
-
-    # Validate layer indices
-    for layer_idx in feature_sample_layers:
-        if layer_idx < 0 or layer_idx > num_hidden_layers:
-            raise ValueError(
-                f"Feature sample layer index {layer_idx} is out of range "
-                f"[0, {num_hidden_layers}]"
-            )
-
-    # Collect outputs from specified layers
-    selected_outputs = [outputs[layer_idx] for layer_idx in feature_sample_layers]
-
-    # Combine the outputs
-    combined_outputs = torch.cat(selected_outputs, dim=-1)
-
-    if post_norm is not None:
-        combined_outputs = post_norm(combined_outputs)
-
-    return combined_outputs
-
-
 class PixtralHFVisionModel(nn.Module):
     """Hugging Face Pixtral Vision Model implemented using SGLang components."""
 
@@ -898,20 +853,16 @@ class PixtralHFVisionModel(nn.Module):
         pixel_values: torch.Tensor,
         image_sizes: list[tuple[int, int]],
         output_hidden_states: bool = False,
-        feature_sample_layers: Optional[list[int]] = None,
     ) -> Union[torch.Tensor, tuple]:
         """
         Args:
             pixel_values: [batch_size, C, H, W], padded if multiple images
             image_sizes: list of (H, W) for each image in the batch
             output_hidden_states: Whether to return all hidden states.
-            feature_sample_layers: Layer indices whose features should be
-                concatenated and used as the visual encoder output. If none
-                are provided, the last layer is used.
 
         Returns:
             A tuple containing:
-              - hidden_states: Final model outputs (or selected layers if feature_sample_layers given)
+              - hidden_states: Final model outputs
               - hidden_states tuple (optional): All hidden states if output_hidden_states=True
         """
         # batch patch images
@@ -939,32 +890,18 @@ class PixtralHFVisionModel(nn.Module):
             [p.shape[-2] * p.shape[-1] for p in embeds_2d], embeds_featurized
         )
 
-        return_all_hidden_states = (
-            output_hidden_states or feature_sample_layers is not None
-        )
-
         transformer_outputs = self.transformer(
             embeds_featurized,  # add batch dimension
             attention_mask,
             position_embedding,
-            return_all_hidden_states=return_all_hidden_states,
+            return_all_hidden_states=output_hidden_states,
         )
 
         # Store all hidden states if requested
         all_hidden_states = None
         if isinstance(transformer_outputs, list):
             all_hidden_states = transformer_outputs
-            # Use the last layer by default if feature_sample_layers is not specified
-            if feature_sample_layers is None:
-                out = transformer_outputs[-1]
-            else:
-                # Resolve outputs based on feature sample layers
-                out = resolve_visual_encoder_outputs(
-                    transformer_outputs,
-                    feature_sample_layers,
-                    None,
-                    self.config.num_hidden_layers,
-                )
+            out = transformer_outputs[-1]
         else:
             out = transformer_outputs
 
