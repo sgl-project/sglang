@@ -46,6 +46,7 @@ class LingBotVideoMoEPipelineConfig(PipelineConfig):
     postprocess_text_funcs: tuple[Callable[[BaseEncoderOutput], torch.Tensor], ...] = (
         field(default_factory=lambda: (_qwen3vl_postprocess_text,))
     )
+    precision: str = "bf16"
     vae_precision: str = "bf16"
     should_use_guidance: bool = True
     embedded_cfg_scale: float = 6.0

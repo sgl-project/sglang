@@ -49,6 +49,7 @@ class JoyImageEditPipelineConfig(ImagePipelineConfig):
     )
 
     # Precision for each component
+    precision: str = "bf16"
     vae_precision: str = "bf16"
     text_encoder_precisions: tuple[str, ...] = field(default_factory=lambda: ("bf16",))
     postprocess_text_funcs: tuple[Callable, ...] = field(
