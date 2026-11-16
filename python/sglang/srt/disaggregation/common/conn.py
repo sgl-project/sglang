@@ -3191,6 +3191,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.host = host
         self.port = port
         self.app = web.Application()
+        self.store = dict()
         self.lock = asyncio.Lock()
         # The event loop only keeps weak references to tasks, so a long-lived
         # task needs a strong reference to survive garbage collection.
@@ -3571,3 +3572,5 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         if self.thread.is_alive():
             self.thread.join(timeout=2)
             logger.info("Server thread stopped")
+
+    def poll(self) -> KVPoll: ...
