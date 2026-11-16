@@ -2,11 +2,13 @@
 dtype) serves every layer, and it is only ever allocated up front.  A counting
 double stands in for _Workspace, so only the bookkeeping is under test."""
 
+import os
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
 from sglang.srt.layers.attention.dsa import gfx950_fused_indexer as fd
+from sglang.srt.layers.attention.dsa import utils as dsa_utils
 from sglang.test.ci.ci_register import register_cpu_ci
 
 # GLM-5.2: 78 target layers + 1 draft layer, each with its own Indexer.
@@ -43,6 +45,28 @@ class TestFusedIndexerHardwareGate(unittest.TestCase):
 
     def test_not_hip(self):
         self.assertFalse(self._supported(None))
+
+
+class TestAiterPreshuffleGate(unittest.TestCase):
+    """SGLANG_USE_AITER is one switch for every ROCm path: the preshuffle gate
+    accepts each spelling the declared variable accepts."""
+
+    def test_use_aiter_spellings(self):
+        gate = dsa_utils.aiter_can_use_preshuffle_paged_mqa
+        self.addCleanup(gate.cache_clear)
+        for value in ("1", "yes"):
+            gate.cache_clear()
+            env = {
+                "SGLANG_USE_AITER": value,
+                "SGLANG_DSA_HIP_DISABLE_PRESHUFFLE": "0",
+                "AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS": "1",
+            }
+            with (
+                self.subTest(value=value),
+                mock.patch.object(dsa_utils, "is_hip", return_value=True),
+                mock.patch.dict(os.environ, env),
+            ):
+                self.assertTrue(gate())
 
 
 class TestFusedIndexerWorkspace(unittest.TestCase):

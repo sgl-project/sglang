@@ -92,7 +92,6 @@ from sglang.srt.state_capturer.indexer_topk import (
 )
 from sglang.srt.utils import (
     ceil_align,
-    get_bool_env_var,
     is_cuda,
     is_gfx95_supported,
     is_gfx1250_supported,
@@ -143,7 +142,7 @@ if _is_cuda:
 else:
     pick_dsl_expand = None
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
