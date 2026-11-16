@@ -254,7 +254,7 @@ class DsaView:
 
     @property
     def dcp_size(self) -> int:
-        return self._backend.dcp_size
+        return self._backend.attn_dcp_size
 
     @property
     def index_kpool(self) -> int:
