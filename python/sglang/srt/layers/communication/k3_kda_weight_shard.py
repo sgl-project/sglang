@@ -44,19 +44,6 @@ class ParamSpec:
         return n
 
 
-def parse_moe_wait(value: str) -> Optional[int]:
-    v = value.strip().lower()
-    if v == "always":
-        return 0
-    if v == "never":
-        return None
-    if v.isdigit():
-        return int(v)
-    raise ValueError(
-        f"SGLANG_K3_KDA_WS_MOE_WAIT must be 'always', 'never' or a token count, got {value!r}"
-    )
-
-
 def layer_layout(shapes: Sequence[tuple]):
     specs, off = [], 0
     for name, shape, split, blocks in shapes:
@@ -136,16 +123,8 @@ class LayerWeightShard:
         peer_shards: Callable[[torch.Tensor], List[torch.Tensor]],
         mover: str = "ce",
         prefetch_depth: int = 1,
-        issue_at: str = "layer",
-        moe_wait_min_tokens: Optional[int] = 0,
         group_barrier: Optional[Callable[[], None]] = None,
     ):
-        if moe_wait_min_tokens is not None and moe_wait_min_tokens < 0:
-            raise ValueError(
-                f"moe_wait_min_tokens must be >= 0 or None, got {moe_wait_min_tokens}"
-            )
-        if issue_at not in ("layer", "core"):
-            raise ValueError(f"issue_at must be 'layer' or 'core', got {issue_at!r}")
         if prefetch_depth < 1:
             raise ValueError(f"prefetch depth must be >= 1, got {prefetch_depth}")
         if group_size < 2:
@@ -201,8 +180,6 @@ class LayerWeightShard:
                 f"peer_shards returned {len(self.peers)} buffers, want {group_size}"
             )
         self.prefetch_depth = prefetch_depth
-        self.issue_at = issue_at
-        self.moe_wait_min_tokens = moe_wait_min_tokens
         self.num_slots = prefetch_depth + 1
         self.slots = torch.empty(
             (self.num_slots, max(self.e_size)), dtype=dtype, device=device
@@ -228,20 +205,6 @@ class LayerWeightShard:
         self._running: Optional[int] = None
         # Units whose gather this layer's start issued (the MoE stage waits for them).
         self._issued_this_layer: List[int] = []
-        # (unit, start ev, copies-done ev, ready ev) per gather.
-        self.trace: Optional[list] = None
-        self.stats = False
-        self._stall_evs: List[tuple] = []  # (kind, layer, start ev, end ev)
-        self.moe_wait_ms_total = 0.0
-        self.moe_wait_max_ms = 0.0
-        self.moe_wait_count = 0
-        self.layer_wait_ms_total = 0.0
-        self.layer_wait_max_ms = 0.0
-        self.layer_wait_count = 0
-        self._last_hooked_layer = num_layers
-        self.lean_issue = (
-            cuda and mover == "ce" and envs.SGLANG_K3_KDA_WS_LEAN_ISSUE.get()
-        )
         self._pull_ops: Optional[List[list]] = None
         self._ready_events: Optional[List[torch.cuda.Event]] = None
         self._join_event = torch.cuda.Event() if cuda else None
@@ -394,10 +357,9 @@ class LayerWeightShard:
 
     def _move(self, u: int) -> None:
         ops = self._copy_ops(u)
-        if self.mover == "ce" or self._copy_stream is None:
-            cur = torch.cuda.current_stream(self.device) if self._copy_stream else None
+        if self._copy_stream is None:
             for op in ops:
-                self._run_op(op, cur)
+                self._run_op(op, None)
             return
         cur = torch.cuda.current_stream(self.device)
         streams = [cur] + self._peer_streams
@@ -431,24 +393,16 @@ class LayerWeightShard:
             self._move(k)
             self._pending[k] = None
             return
-        if self.lean_issue and self.trace is None:
+        if self.mover == "ce":
             self._pending[k] = self._issue_lean(k)
             return
         cur = torch.cuda.current_stream(self.device)
         # Everything enqueued so far, including the last reader of this slot, precedes the copies.
         self._copy_stream.wait_stream(cur)
         with torch.cuda.stream(self._copy_stream):
-            tr = None
-            if self.trace is not None:
-                tr = [k] + [torch.cuda.Event(enable_timing=True) for _ in range(3)]
-                tr[1].record(self._copy_stream)
             self._move(k)
             ev = torch.cuda.Event()
             ev.record(self._copy_stream)
-            if tr is not None:
-                tr[2].record(self._copy_stream)
-                tr[3].record(self._copy_stream)
-                self.trace.append(tuple(tr))
         self._pending[k] = ev
 
     def _issue_lean(self, k: int) -> torch.cuda.Event:
@@ -484,28 +438,13 @@ class LayerWeightShard:
     def on_layer_start(self, layer_idx: int) -> None:
         # The previous sharded layer's kernels are all enqueued, so its slot is free.
         self._release_running()
-        if self.stats and layer_idx <= self._last_hooked_layer:
-            self._log_forward_stalls()  # first hooked layer of a new forward
-        self._last_hooked_layer = layer_idx
         self._issued_this_layer = []
         k = self.unit_index.get(layer_idx)
         if k is not None:
-            if self.stats:
-                e0 = self._stall_start()
-                self.wait(k)
-                self._stall_end("layer", layer_idx, e0)
-            else:
-                self.wait(k)
-            if self.issue_at == "layer":
-                self._issue_ahead(k + 1)
+            self.wait(k)
+            self._issue_ahead(k + 1)
         else:
             self._issue_ahead(self.next_unit[layer_idx])
-
-    def on_core_start(self, layer_idx: int) -> None:
-        k = self.unit_index.get(layer_idx)
-        if self.issue_at != "core" or k is None:
-            return
-        self._issue_ahead(k + 1)
 
     def _issue_ahead(self, first: int) -> None:
         for j in range(first, first + self.prefetch_depth):
@@ -520,103 +459,18 @@ class LayerWeightShard:
             self._issued_this_layer.append(u)
 
     def needs_layer_hook(self, layer_idx: int) -> bool:
-        if self.issue_at == "core":
-            return True  # non-sharded layers' starts issue the next unit's gather
         return layer_idx in self.unit_index or layer_idx > self.unit_layers[-1]
 
-    def moe_wait_needs_tokens(self) -> bool:
-        return self.moe_wait_min_tokens not in (0, None)
-
-    def moe_wait_units(self, num_tokens: Optional[int] = None) -> List[int]:
-        issued, self._issued_this_layer = self._issued_this_layer, []
-        if not issued or self.moe_wait_min_tokens is None:
-            return []
-        if self.moe_wait_min_tokens:
-            if num_tokens is None:
-                raise ValueError(
-                    "SGLANG_K3_KDA_WS_MOE_WAIT is a token threshold, but on_moe_start got no "
-                    "token count"
-                )
-            if num_tokens < self.moe_wait_min_tokens:
-                return []
-        return [u for u in issued if u in self._pending]
-
-    def on_moe_start(self, layer_idx: int, num_tokens: Optional[int] = None) -> None:
+    def on_moe_start(self) -> None:
         # Keeps gather NVLink traffic off the MoE all-to-all.
-        units = self.moe_wait_units(num_tokens)
-        if self._copy_stream is None or not units:
+        issued, self._issued_this_layer = self._issued_this_layer, []
+        if self._copy_stream is None:
             return
         cur = torch.cuda.current_stream(self.device)
-        e0 = self._stall_start()
-        for u in units:
-            ev = self._pending[u]
+        for u in issued:
+            ev = self._pending.get(u)
             if ev is not None:
                 cur.wait_event(ev)
-        self._stall_end("moe", layer_idx, e0)
-
-    def _stall_start(self) -> Optional[torch.cuda.Event]:
-        if not self.stats or self._copy_stream is None:
-            return None
-        self._fold_stalls()
-        e0 = torch.cuda.Event(enable_timing=True)
-        e0.record(torch.cuda.current_stream(self.device))
-        return e0
-
-    def _stall_end(
-        self, kind: str, layer_idx: int, e0: Optional[torch.cuda.Event]
-    ) -> None:
-        if e0 is None:
-            return
-        e1 = torch.cuda.Event(enable_timing=True)
-        e1.record(torch.cuda.current_stream(self.device))
-        self._stall_evs.append((kind, layer_idx, e0, e1))
-
-    def _log_forward_stalls(self) -> None:
-        before = (
-            self.moe_wait_ms_total,
-            self.moe_wait_count,
-            self.layer_wait_ms_total,
-            self.layer_wait_count,
-        )
-        self._fold_stalls()
-        n_moe = self.moe_wait_count - before[1]
-        n_layer = self.layer_wait_count - before[3]
-        if n_moe or n_layer:
-            logger.info(
-                "K3 weight shard (%d units): MoE-wait stall %.3f ms over %d layers, "
-                "layer-start wait stall %.3f ms over %d layers; aggregate MoE %.1f ms / %d "
-                "(max %.3f), layer-start %.1f ms / %d (max %.3f)",
-                self.num_units,
-                self.moe_wait_ms_total - before[0],
-                n_moe,
-                self.layer_wait_ms_total - before[2],
-                n_layer,
-                self.moe_wait_ms_total,
-                self.moe_wait_count,
-                self.moe_wait_max_ms,
-                self.layer_wait_ms_total,
-                self.layer_wait_count,
-                self.layer_wait_max_ms,
-            )
-
-    def _fold_stalls(self) -> None:
-        keep = []
-        for kind, layer, e0, e1 in self._stall_evs:
-            if not e1.query():
-                keep.append((kind, layer, e0, e1))
-                continue
-            ms = e0.elapsed_time(e1)
-            if kind == "moe":
-                self.moe_wait_ms_total += ms
-                self.moe_wait_max_ms = max(self.moe_wait_max_ms, ms)
-                self.moe_wait_count += 1
-            elif kind == "layer":
-                self.layer_wait_ms_total += ms
-                self.layer_wait_max_ms = max(self.layer_wait_max_ms, ms)
-                self.layer_wait_count += 1
-            else:
-                raise AssertionError(f"unknown stall kind {kind!r}")
-        self._stall_evs = keep
 
     @property
     def pending(self) -> List[int]:
@@ -967,14 +821,10 @@ def on_layer_start(layer_idx: int) -> None:
             s.on_layer_start(layer_idx)
 
 
-def moe_wait_needs_tokens() -> bool:
-    return any(s.moe_wait_needs_tokens() for s in _stores())
-
-
-def on_moe_start(layer_idx: int, num_tokens: Optional[int] = None) -> None:
+def on_moe_start(layer_idx: int) -> None:
     for s in _stores():
         if s.needs_layer_hook(layer_idx):
-            s.on_moe_start(layer_idx, num_tokens)
+            s.on_moe_start()
 
 
 def check_all_loaded() -> None:
@@ -1176,7 +1026,6 @@ def init_for_model(
         * config.linear_attn_config["head_dim"]
         // attn_tp
     )
-    moe_wait_min_tokens = parse_moe_wait(envs.SGLANG_K3_KDA_WS_MOE_WAIT.get())
     group_barrier = functools.partial(
         torch.distributed.barrier, group=cpu_groups[my_group]
     )
@@ -1197,12 +1046,9 @@ def init_for_model(
             peer_shards=s_peers,
             mover=mover,
             prefetch_depth=envs.SGLANG_K3_KDA_WS_PREFETCH_DEPTH.get(),
-            issue_at="layer",
-            moe_wait_min_tokens=moe_wait_min_tokens,
             group_barrier=group_barrier,
         )
         _ACTIVE_SHARED.dummy_load = dummy_load
-        _ACTIVE_SHARED.stats = envs.SGLANG_K3_KDA_WS_STATS.get()
         s_shard_b, s_slot_b = _ACTIVE_SHARED.bytes_per_rank()
         logger.info(
             "K3 shared-expert weight sharding: %d MoE layers: shard %.2f GB + %d slots %.2f GB "
@@ -1225,24 +1071,20 @@ def init_for_model(
         peer_shards=peers,
         mover=mover,
         prefetch_depth=envs.SGLANG_K3_KDA_WS_PREFETCH_DEPTH.get(),
-        issue_at=envs.SGLANG_K3_KDA_WS_ISSUE_AT.get(),
-        moe_wait_min_tokens=moe_wait_min_tokens,
         group_barrier=group_barrier,
     )
     _ACTIVE.dummy_load = dummy_load
-    _ACTIVE.stats = envs.SGLANG_K3_KDA_WS_STATS.get()
     shard_b, slot_b = _ACTIVE.bytes_per_rank()
     replicated = len(kda_ids) * (4 * P * H + H * P) * 2
     logger.info(
         "K3 KDA weight sharding: shard group %d (%d ranks, this is rank %d), mover=%s, "
-        "prefetch depth %d, MoE-stage wait %s, %d KDA layers: head-aligned shard %.2f GB + %d slots "
+        "prefetch depth %d, %d KDA layers: head-aligned shard %.2f GB + %d slots "
         "%.2f GB per rank instead of %.2f GB replicated",
         my_group,
         group_size,
         group_rank,
         mover,
         _ACTIVE.prefetch_depth,
-        envs.SGLANG_K3_KDA_WS_MOE_WAIT.get(),
         len(kda_ids),
         shard_b / 1e9,
         _ACTIVE.num_slots,
