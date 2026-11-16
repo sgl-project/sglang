@@ -202,9 +202,7 @@ impl ChatFormatter {
                     .and_then(super::content_format::takes_content_parts),
             }
         } else {
-            let developer_error = config["chat_template"]
-                .as_str()
-                .and_then(|source| developer_error(source, config, &formatter));
+            let developer_error = developer_error(config, &formatter);
             Self::HuggingFace {
                 formatter,
                 thinking,
@@ -214,57 +212,46 @@ impl ChatFormatter {
     }
 }
 
-/// The error a template raises on a leading developer turn it accepts as a
-/// system turn. Python's template raises it; Dynamo renders the turn as system.
-fn developer_error(source: &str, config: &Value, formatter: &PromptFormatter) -> Option<String> {
-    let mut env = minijinja::Environment::new();
-    env.set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-    env.add_function("raise_exception", |message: String| {
-        Err::<String, _>(minijinja::Error::new(
-            minijinja::ErrorKind::InvalidOperation,
-            message,
-        ))
-    });
-    env.add_function("strftime_now", |_format: String| String::new());
-    let template = env.template_from_str(source).ok()?;
-    let token = |key: &str| {
-        let token = &config[key];
-        token
-            .as_str()
-            .or_else(|| token["content"].as_str())
-            .map(str::to_owned)
+/// The error a template raises on a leading developer turn, when Dynamo would
+/// render that turn as a system turn instead. Python's template raises it.
+fn developer_error(config: &Value, formatter: &PromptFormatter) -> Option<String> {
+    let source = config["chat_template"].as_str()?;
+    let request = |role: &str| {
+        serde_json::from_value::<CreateChatCompletionRequest>(serde_json::json!({
+            "model": "probe",
+            "messages": [{"role": role, "content": "s"}, {"role": "user", "content": "u"}]
+        }))
+        .ok()
     };
-    let messages = |role: &str| {
-        serde_json::json!([
-            {"role": role, "content": "s"},
-            {"role": "user", "content": "u"}
-        ])
-    };
-    let raw = |role: &str| {
-        template.render(minijinja::context! {
-            messages => messages(role),
-            add_generation_prompt => false,
-            bos_token => token("bos_token"),
-            eos_token => token("eos_token"),
-        })
-    };
-    raw("system").ok()?;
-    let error = raw("developer").err()?;
-    // Only a turn Dynamo folds renders exactly as the system turn.
-    let folded = |role: &str| {
-        let request: CreateChatCompletionRequest = serde_json::from_value(
-            serde_json::json!({"model": "probe", "messages": messages(role)}),
+    // Dynamo rewrites a developer turn before the template sees it, so the probe
+    // sends a system turn and renames it inside the template, past that rewrite.
+    // The probe keeps Dynamo's template syntax and content handling.
+    let render_as = |role: &str| {
+        let mut config = config.clone();
+        config["chat_template"] = Value::String(format!(
+            "{{%- set sglang_probe = namespace(messages=[]) -%}}\
+             {{%- for m in messages -%}}\
+             {{%- set sglang_probe.messages = sglang_probe.messages + [\
+             {{'role': '{role}' if m.role == 'system' else m.role, 'content': m.content}}] -%}}\
+             {{%- endfor -%}}\
+             {{%- set messages = sglang_probe.messages -%}}{source}"
+        ));
+        let template = serde_json::from_value::<ChatTemplate>(config).ok()?;
+        let probe = PromptFormatter::from_parts(
+            template,
+            ContextMixins::new(&[PromptContextMixin::OaiChat]),
+            true,
         )
         .ok()?;
-        super::render_oai(formatter, &request)
-            .ok()
-            .map(|prompt| prompt.into_text())
+        Some(super::render_oai(&probe, &request("system")?))
     };
-    (folded("developer")? == folded("system")?).then(|| {
-        error
-            .detail()
-            .map_or_else(|| error.to_string(), str::to_owned)
-    })
+    render_as("system")?.ok()?;
+    let Err(TemplateError::Renderer { message }) = render_as("developer")? else {
+        return None;
+    };
+    // Dynamo renders the developer turn only when it folds it into a system turn.
+    super::render_oai(formatter, &request("developer")?).ok()?;
+    Some(message)
 }
 
 #[cfg(test)]
@@ -348,22 +335,48 @@ mod tests {
         let render = |formatter: &ChatFormatter, role: &str| {
             let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
                 "model": "test",
-                "messages": [{"role": role, "content": "Be brief."}, {"role": "user", "content": "Hi"}]
+                "messages": [
+                    {"role": role, "content": "Be brief."},
+                    {"role": "user", "content": "Hi"},
+                    {"role": "assistant", "content": "Hello"}
+                ]
             }))
             .unwrap();
             formatter.render(&request)
         };
-        let strict = formatter(
-            "{% for m in messages %}{% if m.role not in ['system', 'user', 'assistant'] %}\
-             {{ raise_exception('Unexpected message role.') }}{% endif %}\
-             <|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}",
-        );
-        assert!(render(&strict, "system").is_ok());
-        match render(&strict, "developer") {
-            Err(TemplateError::Renderer { message }) => {
-                assert_eq!(message, "Unexpected message role.")
+        let check = "{% if m.role not in ['system', 'user', 'assistant'] %}\
+                     {{ raise_exception('Unexpected message role.') }}{% endif %}";
+        let strict = [
+            // Plain text content.
+            format!(
+                "{{% for m in messages %}}{check}<|im_start|>{{{{ m.role }}}}\n\
+                 {{{{ m.content }}}}<|im_end|>\n{{% endfor %}}"
+            ),
+            // HF's assistant-mask tags, which Dynamo renders.
+            format!(
+                "{{% for m in messages %}}{check}<|im_start|>{{{{ m.role }}}}\n\
+                 {{% if m.role == 'assistant' %}}{{% generation %}}{{{{ m.content }}}}\
+                 {{% endgeneration %}}{{% else %}}{{{{ m.content }}}}{{% endif %}}\
+                 <|im_end|>\n{{% endfor %}}"
+            ),
+            // Content parts only, which Dynamo hands over as arrays.
+            format!(
+                "{{% for m in messages %}}{check}\
+                 {{% if m.content is string %}}{{{{ raise_exception('Content must be a list.') }}}}\
+                 {{% endif %}}<|im_start|>{{{{ m.role }}}}\n\
+                 {{% for part in m.content %}}{{{{ part.text }}}}{{% endfor %}}<|im_end|>\n\
+                 {{% endfor %}}"
+            ),
+        ];
+        for template in &strict {
+            let strict = formatter(template);
+            assert!(render(&strict, "system").is_ok(), "{template}");
+            match render(&strict, "developer") {
+                Err(TemplateError::Renderer { message }) => {
+                    assert!(message.contains("Unexpected message role."), "{message}")
+                }
+                other => panic!("{template}: {other:?}"),
             }
-            other => panic!("{other:?}"),
         }
 
         let lenient = formatter(
