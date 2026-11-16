@@ -309,6 +309,15 @@ def _prepare_src_rows(src: torch.Tensor | None, steps: torch.Tensor) -> torch.Te
     return src.to(torch.int32).contiguous()
 
 
+def _conv_dst_entry_contiguous(dst: torch.Tensor) -> bool:
+    expected = 1
+    for axis in range(dst.ndim - 1, 1, -1):
+        if dst.shape[axis] != 1 and dst.stride(axis) != expected:
+            return False
+        expected *= dst.shape[axis]
+    return True
+
+
 def fused_mamba_state_scatter_with_mask(
     dst: torch.Tensor,  # [num_layers, cache_size, *state_shape]
     src: torch.Tensor,  # [num_layers, spec_size, draft_tokens, *state_shape]
@@ -433,6 +442,7 @@ def _fused_conv_window_scatter_with_mask_kernel(
     src_req_size,
     src_step_size,
     dst_req_size,
+    DST_ENTRY_CONTIGUOUS: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     """Scatter accepted conv windows from the deduplicated sliding-window source.
@@ -479,12 +489,11 @@ def _fused_conv_window_scatter_with_mask_kernel(
         + d * src_dim_stride
         + w * src_win_stride
     )
-    dst_off = (
-        pid_layer * dst_layer_stride
-        + dst_idx * dst_req_stride
-        + d * dst_dim_stride
-        + w * dst_win_stride
-    )
+    dst_base = pid_layer * dst_layer_stride + dst_idx * dst_req_stride
+    if DST_ENTRY_CONTIGUOUS:
+        dst_off = dst_base + e
+    else:
+        dst_off = dst_base + d * dst_dim_stride + w * dst_win_stride
 
     data = tl.load(src_ptr + src_off, mask=mask, other=0.0)
     tl.store(dst_ptr + dst_off, data, mask=mask)
@@ -566,6 +575,7 @@ def fused_conv_window_scatter_with_mask(
         src_req_size,
         src_step_size,
         dst_req_size,
+        DST_ENTRY_CONTIGUOUS=_conv_dst_entry_contiguous(dst),
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
@@ -588,6 +598,7 @@ def _fused_conv_window_scatter_multi_kernel(
     dst_req_size,
     NUM_TYPES: tl.constexpr,
     META_COLS: tl.constexpr,
+    DST_ENTRY_CONTIGUOUS_MASK: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     pid_req = tl.program_id(0)
@@ -616,6 +627,7 @@ def _fused_conv_window_scatter_multi_kernel(
     ):
         return
 
+    # One bit per type lets the static loop fold each destination-layout branch.
     for t in tl.static_range(NUM_TYPES):
         block_start = tl.load(meta_ptr + t * META_COLS + 10)
         block_end = tl.load(
@@ -639,8 +651,6 @@ def _fused_conv_window_scatter_multi_kernel(
             dst_layer_stride = tl.load(meta_ptr + t * META_COLS + 8)
             dst_req_stride = tl.load(meta_ptr + t * META_COLS + 9)
             last_axis = tl.load(meta_ptr + t * META_COLS + 11)
-            dst_dim_stride = tl.load(meta_ptr + t * META_COLS + 12)
-            dst_win_stride = tl.load(meta_ptr + t * META_COLS + 13)
 
             start = (pid_block - block_start) * BLOCK_SIZE
             e = start + tl.arange(0, BLOCK_SIZE)
@@ -654,12 +664,13 @@ def _fused_conv_window_scatter_multi_kernel(
                 + d * src_dim_stride
                 + w * src_win_stride
             )
-            dst_off = (
-                pid_layer * dst_layer_stride
-                + dst_idx * dst_req_stride
-                + d * dst_dim_stride
-                + w * dst_win_stride
-            )
+            dst_base = pid_layer * dst_layer_stride + dst_idx * dst_req_stride
+            if ((DST_ENTRY_CONTIGUOUS_MASK >> t) & 1) != 0:
+                dst_off = dst_base + e
+            else:
+                dst_dim_stride = tl.load(meta_ptr + t * META_COLS + 12)
+                dst_win_stride = tl.load(meta_ptr + t * META_COLS + 13)
+                dst_off = dst_base + d * dst_dim_stride + w * dst_win_stride
             data = tl.load(src_ptr + src_off, mask=mask, other=0.0)
             tl.store(dst_ptr + dst_off, data, mask=mask)
 
@@ -768,6 +779,9 @@ def fused_conv_window_scatter_multi(
 
     dst0, src0 = pairs[0]
     grid = (n1 + n2, dst0.shape[0], total_blocks)
+    dst_entry_contiguous_mask = sum(
+        int(_conv_dst_entry_contiguous(dst)) << i for i, (dst, _) in enumerate(pairs)
+    )
     _fused_conv_window_scatter_multi_kernel[grid](
         meta,
         idx1,
@@ -780,6 +794,7 @@ def fused_conv_window_scatter_multi(
         dst0.shape[1],
         NUM_TYPES=len(pairs),
         META_COLS=_CONV_MULTI_META_COLS,
+        DST_ENTRY_CONTIGUOUS_MASK=dst_entry_contiguous_mask,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
