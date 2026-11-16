@@ -424,9 +424,6 @@ class IntelAMXAttnBackend(AttentionBackend):
             self._attn_logits_buffers[key] = buffer
         return buffer[:num_seqs]
 
-    def support_triton(self):
-        return False
-
 
 class IntelAMXMultiStepDraftBackend:
     """
