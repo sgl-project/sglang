@@ -1483,6 +1483,9 @@ class HiSparseCoordinator:
         unchanged ``req_pool_idx`` row, so the request can be resumed later by
         re-allocating logical slots and swap-in from host on demand.
         """
+        assert req.inflight_steps == 0, (
+            "HiSparse retraction must settle pending results"
+        )
         # release resources only after the execution of a potential overlapped batch
         if self.decode_producer_stream is not None:
             device_module.current_stream().wait_stream(self.decode_producer_stream)

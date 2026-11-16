@@ -141,7 +141,10 @@ class DSV4RetractionSnapshot:
 
     def restore(self, allocator, full_locs):
         if full_locs.numel() != self.committed_len:
-            raise ValueError("HiSparse retraction committed length changed")
+            raise ValueError(
+                "HiSparse retraction committed length changed: "
+                f"{self.committed_len} saved vs {full_locs.numel()} allocated"
+            )
         regions = _regions(allocator.get_kvcache())
         if regions.keys() != self.regions.keys():
             raise ValueError("HiSparse retraction region inventory changed")

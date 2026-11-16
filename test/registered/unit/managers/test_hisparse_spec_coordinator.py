@@ -73,6 +73,7 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
             kv=ReqKvInfo(req_pool_idx=0, kv_allocated_len=3, kv_committed_len=3),
             hisparse_staging=False,
             hisparse_retraction_pending=False,
+            inflight_steps=0,
         )
         return coordinator, req, freed_device, freed_host
 

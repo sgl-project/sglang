@@ -5146,6 +5146,17 @@ class Scheduler(
         if kv_full_retract_flag or (
             TEST_RETRACT and self.forward_ct % TEST_RETRACT_INTERVAL == 0
         ):
+            if (
+                self.disaggregation_mode == DisaggregationMode.DECODE
+                and self.hisparse_coordinator is not None
+                and self.hisparse_coordinator.is_dsv4_hisparse
+                and any(req.inflight_steps > 0 for req in batch.reqs)
+            ):
+                # KV and compressor state already include the in-flight step.
+                # Let the event loop commit its CPU outputs before snapshotting:
+                # retracting now drops that result and resumes a shorter prefix.
+                batch.batch_is_full = False
+                return None
             if self.decode_offload_manager is not None:
                 # Pending offload copies may still read the device KV that retraction frees.
                 self.decode_offload_manager.drain_before_retraction()

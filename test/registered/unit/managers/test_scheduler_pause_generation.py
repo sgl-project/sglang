@@ -300,6 +300,67 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.output_streamer = MagicMock()
         scheduler.update_running_batch(batch)
 
+    def test_hisparse_retraction_waits_for_pending_output_commit(self):
+        """Retraction must not discard an overlap result whose KV already exists."""
+        scheduler = self._new_scheduler()
+        scheduler.disaggregation_mode = DisaggregationMode.DECODE
+        scheduler.hisparse_coordinator = SimpleNamespace(is_dsv4_hisparse=True)
+        scheduler.uocr_runtime = None
+        reqs = [self._make_req(name) for name in ("a", "b")]
+        for i, req in enumerate(reqs):
+            req.kv.req_pool_idx = i
+            req.kv.set_row_len(4)
+            req.output_ids.append(4)  # CPU result trails the four written KV tokens.
+        move(reqs, scheduler.running_reqs)
+        batch = self._make_batch(scheduler, reqs, ForwardMode.DECODE, with_tensors=True)
+        batch.spec_algorithm = SpeculativeAlgorithm.NONE
+        batch.add_inflight_step()
+        scheduler.token_to_kv_pool_allocator.page_size = 1
+        scheduler.token_to_kv_pool_allocator.pools_share_memory = False
+        scheduler.token_to_kv_pool_allocator.check_decode_capacity.side_effect = (
+            lambda *, requests, **kwargs: len(requests) < 2
+        )
+        scheduler.tree_cache.token_to_kv_pool_allocator.state_slots = None
+        scheduler.new_token_ratio_tracker = SimpleNamespace(current=1.0)
+        released = []
+
+        def release(req, **kwargs):
+            released.append(
+                (
+                    req.kv.kv_committed_len,
+                    len(req.origin_input_ids) + len(req.output_ids) - 1,
+                )
+            )
+            req.kv.mark_kv_released()
+            req.kv.req_pool_idx = None
+            return True
+
+        scheduler.request_retirer = SimpleNamespace(retract=release)
+        requeued = self._spy_requeue(scheduler)
+        # The model's allocation/forward is outside this scheduling test.
+        batch.prepare_for_decode = lambda: None
+        scheduler.scheduler_stage_metrics = None
+        scheduler.get_new_prebuilt_batch = lambda running: None
+        scheduler.dp_attn_adapter = SimpleNamespace(
+            maybe_prepare_mlp_sync_batch=lambda b: b
+        )
+        plan = scheduler.get_next_disagg_decode_batch_to_run(batch)
+        self.assertIsNone(plan.batch_to_run)
+        self.assertIs(plan.running_batch, batch)
+        self.assertEqual(released, [])
+        self.assertEqual(batch.reqs, reqs)
+        self.assertTrue(all(req.inflight_steps == 1 for req in reqs))
+        # The ordinary event-loop result stage commits the pending token and
+        # drops its in-flight lease before the next scheduling iteration.
+        for req in reqs:
+            req.output_ids.append(5)
+        batch.drop_inflight_step()
+        plan = scheduler.get_next_disagg_decode_batch_to_run(batch)
+        self.assertIs(plan.batch_to_run, batch)
+        self.assertIs(plan.running_batch, batch)
+        self.assertEqual(released, [(4, 4)])
+        self.assertEqual(len(requeued), 1)
+
     def paused_time_seen_while_draining(self, scheduler, mode, now):
         # Records the pause time busy accounting sees, up to `now`, while the held
         # result drains.
