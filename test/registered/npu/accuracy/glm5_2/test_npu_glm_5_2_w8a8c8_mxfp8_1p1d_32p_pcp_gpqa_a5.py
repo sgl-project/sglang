@@ -16,10 +16,10 @@ register_npu_ci(
 # 临时手动指定模型路径 (wiki 配置)
 GLM_5_2_W8A8C8_MXFP8_MODEL_PATH = "/mnt/share/w00936111/GLM-5.2-W8A8C8-mxfp8"
 
-# A5 wiki: GLM-5.2-四机PD分离-DCP-A5
-# prefill: 2 nodes, tp4 x dp4 x pp4 (16 NPU), L2 HiCache (device_urma)
-# decode : 2 nodes, tp16 x dp4 x dcp4 (16 NPU)
-GLM_5_2_A5_DCP_PD_SEP_PREFILL_ENVS = {
+# A5 wiki: GLM-5.2-四机PD分离-PCP-A5
+# prefill: 2 nodes, tp4 x cp4 (interleave) x pp4 (16 NPU)
+# decode : 2 nodes, tp16 x dp16 (16 NPU)
+GLM_5_2_A5_PCP_PD_SEP_PREFILL_ENVS = {
     "ASCEND_MF_TRANSFER_PROTOCOL": "device_urma",
     "ASCEND_MF_LOG_LEVEL": "2",
     "HCCL_CONNECT_TIMEOUT": "300",
@@ -27,19 +27,21 @@ GLM_5_2_A5_DCP_PD_SEP_PREFILL_ENVS = {
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
     "ACL_DEVICE_SYNC_TIMEOUT": "60",
-    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True,pin_memory_expandable_segments:True",
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "MF_HYBM_USE_VMM_SEGMENT": "1",
     "STREAMS_PER_DEVICE": "32",
     "ASCEND_USE_FIA": "1",
     "SGLANG_NPU_USE_MLAPO": "1",
     "TRANSFORMERS_VERBOSITY": "error",
+    # PCP 必需: prefill 有 CP、decode 无 CP, 否则 P->D KV 传输失败
+    "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER": "1",
     "DEEPEP_HCCL_BUFFSIZE": "2500",
     "SGLANG_PP_OUTPUT_VIA_CPU": "1",
     "HCCL_SOCKET_IFNAME": NIC_NAME,
     "GLOO_SOCKET_IFNAME": NIC_NAME,
 }
 
-GLM_5_2_A5_DCP_PD_SEP_DECODE_ENVS = {
+GLM_5_2_A5_PCP_PD_SEP_DECODE_ENVS = {
     "ASCEND_MF_TRANSFER_PROTOCOL": "device_urma",
     "ASCEND_MF_LOG_LEVEL": "2",
     "HCCL_CONNECT_TIMEOUT": "300",
@@ -47,21 +49,22 @@ GLM_5_2_A5_DCP_PD_SEP_DECODE_ENVS = {
     "HCCL_OP_EXPANSION_MODE": "AIV",
     "HCCL_HOST_SOCKET_PORT_RANGE": "auto",
     "ACL_DEVICE_SYNC_TIMEOUT": "60",
-    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True,pin_memory_expandable_segments:True",
+    "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
     "MF_HYBM_USE_VMM_SEGMENT": "1",
     "STREAMS_PER_DEVICE": "32",
     "ASCEND_USE_FIA": "1",
     "SGLANG_NPU_USE_MLAPO": "1",
     "TRANSFORMERS_VERBOSITY": "error",
+    "SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER": "1",
     "DEEPEP_HCCL_BUFFSIZE": "400",
     "SGLANG_ENABLE_SPEC_V2": "1",
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
-    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "16",
+    "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "32",
     "HCCL_SOCKET_IFNAME": NIC_NAME,
     "GLOO_SOCKET_IFNAME": NIC_NAME,
 }
 
-GLM_5_2_A5_DCP_PD_SEP_PREFILL_ARGS = [
+GLM_5_2_A5_PCP_PD_SEP_PREFILL_ARGS = [
     "--served-model-name",
     "glm52",
     "--reasoning-parser",
@@ -72,12 +75,13 @@ GLM_5_2_A5_DCP_PD_SEP_PREFILL_ARGS = [
     2,
     "--tp-size",
     4,
-    "--dp-size",
+    "--attn-cp-size",
     4,
-    "--enable-dp-attention",
+    "--enable-prefill-cp",
+    "--cp-strategy",
+    "interleave",
     "--pp-size",
     4,
-    "--enable-dp-lm-head",
     "--load-balance-method",
     "round_robin",
     "--disaggregation-mode",
@@ -92,9 +96,9 @@ GLM_5_2_A5_DCP_PD_SEP_PREFILL_ARGS = [
     "--watchdog-timeout",
     9000,
     "--max-running-requests",
-    16,
+    64,
     "--mem-fraction-static",
-    0.85,
+    0.88,
     "--quantization",
     "modelslim",
     "--max-prefill-tokens",
@@ -114,23 +118,15 @@ GLM_5_2_A5_DCP_PD_SEP_PREFILL_ARGS = [
     "--speculative-algorithm",
     "NEXTN",
     "--speculative-num-steps",
-    3,
+    1,
     "--speculative-eagle-topk",
     1,
     "--speculative-num-draft-tokens",
-    4,
-    "--enable-metrics",
-    "--enable-hierarchical-cache",
-    "--hicache-io-backend",
-    "kernel_ascend",
-    "--enable-cache-report",
-    "--hicache-ratio",
     2,
-    "--hicache-write-policy",
-    "write_through",
+    "--enable-metrics",
 ]
 
-GLM_5_2_A5_DCP_PD_SEP_DECODE_ARGS = [
+GLM_5_2_A5_PCP_PD_SEP_DECODE_ARGS = [
     "--served-model-name",
     "glm52",
     "--reasoning-parser",
@@ -142,9 +138,7 @@ GLM_5_2_A5_DCP_PD_SEP_DECODE_ARGS = [
     "--tp-size",
     16,
     "--dp-size",
-    4,
-    "--dcp-size",
-    4,
+    16,
     "--enable-dp-attention",
     "--enable-dp-lm-head",
     "--load-balance-method",
@@ -161,9 +155,9 @@ GLM_5_2_A5_DCP_PD_SEP_DECODE_ARGS = [
     "--watchdog-timeout",
     9000,
     "--max-running-requests",
-    16,
+    128,
     "--mem-fraction-static",
-    0.86,
+    0.88,
     "--quantization",
     "modelslim",
     "--moe-a2a-backend",
@@ -171,7 +165,9 @@ GLM_5_2_A5_DCP_PD_SEP_DECODE_ARGS = [
     "--deepep-mode",
     "low_latency",
     "--cuda-graph-max-bs-decode",
-    4,
+    8,
+    "--tokenizer-worker-num",
+    16,
     "--speculative-algorithm",
     "NEXTN",
     "--speculative-num-steps",
@@ -188,12 +184,12 @@ GLM_5_2_A5_DCP_PD_SEP_DECODE_ARGS = [
     "--enable-metrics",
 ]
 
-GLM_5_2_A5_DCP_PD_SEP_MODEL_CONFIG = {
+GLM_5_2_A5_PCP_PD_SEP_MODEL_CONFIG = {
     "model_path": GLM_5_2_W8A8C8_MXFP8_MODEL_PATH,
-    "prefill_args": GLM_5_2_A5_DCP_PD_SEP_PREFILL_ARGS,
-    "decode_args": GLM_5_2_A5_DCP_PD_SEP_DECODE_ARGS,
-    "prefill_envs": GLM_5_2_A5_DCP_PD_SEP_PREFILL_ENVS,
-    "decode_envs": GLM_5_2_A5_DCP_PD_SEP_DECODE_ENVS,
+    "prefill_args": GLM_5_2_A5_PCP_PD_SEP_PREFILL_ARGS,
+    "decode_args": GLM_5_2_A5_PCP_PD_SEP_DECODE_ARGS,
+    "prefill_envs": GLM_5_2_A5_PCP_PD_SEP_PREFILL_ENVS,
+    "decode_envs": GLM_5_2_A5_PCP_PD_SEP_DECODE_ENVS,
     "router_args": [
         "--policy",
         "cache_aware",
@@ -205,12 +201,12 @@ GLM_5_2_A5_DCP_PD_SEP_MODEL_CONFIG = {
 }
 
 
-class TestNPUGLM5_2_W8A8C8_MXFP8_2P2D_DCP_GPQA_A5(
+class TestNPUGLM5_2_W8A8C8_MXFP8_1P1D_PCP_GPQA_A5(
     TestNpuAccuracyMultiNodePdSepTestCaseBase
 ):
-    """Test A5 accuracy for GLM-5.2-W8A8C8-mxfp8 PD separation 2p2d with DCP on gpqa_diamond"""
+    """Test A5 accuracy for GLM-5.2-W8A8C8-mxfp8 PD separation 1p1d with PCP on gpqa_diamond"""
 
-    model_config = GLM_5_2_A5_DCP_PD_SEP_MODEL_CONFIG
+    model_config = GLM_5_2_A5_PCP_PD_SEP_MODEL_CONFIG
     # Run evalscope only once (no retry on accuracy miss)
     max_retries = 1
     accuracy = 0.912
@@ -228,8 +224,8 @@ class TestNPUGLM5_2_W8A8C8_MXFP8_2P2D_DCP_GPQA_A5(
         "top_p": 0.95,
     }
 
-    def test_npu_glm_5_2_w8a8c8_mxfp8_2p2d_dcp_gpqa_a5(self):
-        """Run A5 accuracy test for GLM-5.2-W8A8C8-mxfp8 PD separation 2p2d with DCP on gpqa_diamond"""
+    def test_npu_glm_5_2_w8a8c8_mxfp8_1p1d_pcp_gpqa_a5(self):
+        """Run A5 accuracy test for GLM-5.2-W8A8C8-mxfp8 PD separation 1p1d with PCP on gpqa_diamond"""
         self.run_accuracy()
 
 
