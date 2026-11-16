@@ -189,7 +189,7 @@ def build_attention(
         module = SDARMoeAttention(
             config, 0, quant_config=quant_config, reduce_results=variant
         )
-        names = ("o_proj",)
+        names = ("qkv_proj", "o_proj")
     elif model == "step3":
         from sglang.srt.models.step3_vl import Step3TextAttention
 
