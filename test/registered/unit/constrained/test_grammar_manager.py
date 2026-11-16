@@ -37,6 +37,11 @@ from sglang.srt.constrained.reasoner_grammar_backend import (
 from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.managers.io_struct import AbortReq
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+    move,
+)
 from sglang.srt.parser.inkling_tokenizer import (
     CONTENT_MODEL_END_SAMPLING,
     CONTENT_THINKING,
@@ -108,9 +113,7 @@ def _make_req(
     custom_params=None,
 ):
     """Create a mock request with sampling params."""
-    req = MagicMock()
-    req.rid = rid
-    req.owner_list = None
+    req = MagicMock(rid=rid, owner_list=None)
     req.sampling_params.json_schema = json_schema
     req.sampling_params.regex = regex
     req.sampling_params.ebnf = ebnf
@@ -488,7 +491,7 @@ class TestAbortRequests(unittest.TestCase):
         req = _make_req(rid="req-123")
         future = MagicMock(spec=Future)
         req.grammar = future
-        mgr.grammar_queue.join([req])
+        move([req], mgr.grammar_queue)
 
         abort_req = AbortReq(rid="req-123", abort_all=False)
 
@@ -500,7 +503,7 @@ class TestAbortRequests(unittest.TestCase):
         mgr = self._make_mgr_with_queue()
         req = _make_req(rid="req-999")
         req.grammar = MagicMock(spec=Future)
-        mgr.grammar_queue.join([req])
+        move([req], mgr.grammar_queue)
 
         abort_req = AbortReq(rid="req-123", abort_all=False)
 
@@ -513,7 +516,7 @@ class TestAbortRequests(unittest.TestCase):
         for i in range(3):
             req = _make_req(rid=f"req-{i}")
             req.grammar = MagicMock(spec=Future)
-            mgr.grammar_queue.join([req])
+            move([req], mgr.grammar_queue)
             reqs.append(req)
 
         abort_req = AbortReq(rid="", abort_all=True)
@@ -533,7 +536,7 @@ class TestAbortRequests(unittest.TestCase):
         mgr = self._make_mgr_with_queue()
         req = _make_req(rid="req-123-suffix")
         req.grammar = MagicMock(spec=Future)
-        mgr.grammar_queue.join([req])
+        move([req], mgr.grammar_queue)
 
         abort_req = AbortReq(rid="req-123", abort_all=False)
 
@@ -571,7 +574,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         req = _make_req(json_schema="schema")
         req.grammar = future
         req.grammar_key = ("json", "schema")
-        mgr.grammar_queue.join([req])
+        move([req], mgr.grammar_queue)
 
         result = mgr.get_ready_grammar_requests()
         self.assertEqual(len(result), 1)
@@ -594,7 +597,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         req = _make_req(json_schema="bad")
         req.grammar = future
         req.grammar_key = ("json", "bad")
-        mgr.grammar_queue.join([req])
+        move([req], mgr.grammar_queue)
 
         result = mgr.get_ready_grammar_requests()
         self.assertEqual(len(result), 1)
@@ -610,7 +613,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         req = _make_req(json_schema="schema")
         req.finished.return_value = True  # Already aborted
         req.grammar = None
-        mgr.grammar_queue.join([req])
+        move([req], mgr.grammar_queue)
 
         result = mgr.get_ready_grammar_requests()
         self.assertEqual(result, [req])
@@ -624,7 +627,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         req.grammar = future
         req.grammar_key = ("json", "slow")
         req.grammar_wait_ct = 0
-        mgr.grammar_queue.join([req])
+        move([req], mgr.grammar_queue)
 
         # First call: not ready, increments wait_ct to 1 (== max_poll)
         result = mgr.get_ready_grammar_requests()
@@ -663,7 +666,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         req.grammar = future
         req.grammar_key = ("json", "pending")
         req.grammar_wait_ct = 0
-        mgr.grammar_queue.join([req])
+        move([req], mgr.grammar_queue)
 
         result = mgr.get_ready_grammar_requests()
         self.assertEqual(len(result), 0)
@@ -690,7 +693,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         pending_req.grammar_key = ("json", "pending")
         pending_req.grammar_wait_ct = 0
 
-        mgr.grammar_queue.join([ready_req, pending_req])
+        move([ready_req, pending_req], mgr.grammar_queue)
 
         result = mgr.get_ready_grammar_requests()
         self.assertEqual(len(result), 1)
@@ -714,7 +717,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         req.grammar = future
         req.grammar_key = ("json", "slow")
         req.grammar_wait_ct = 2  # Already waited 2 iterations
-        mgr.grammar_queue.join([req])
+        move([req], mgr.grammar_queue)
 
         # wait_ct increments to 3 (== max), should timeout
         result = mgr.get_ready_grammar_requests()
@@ -734,7 +737,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         req = _make_req(json_schema="schema", custom_params={"thinking_budget": 4})
         req.grammar = future
         req.grammar_key = ("json", "schema")
-        mgr.grammar_queue.join([req])
+        move([req], mgr.grammar_queue)
 
         result = mgr.get_ready_grammar_requests()
 
@@ -766,7 +769,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         req1.grammar_key = ("json", "s1")
         req1.grammar_wait_ct = 0
 
-        mgr.grammar_queue.join([req0, req1])
+        move([req0, req1], mgr.grammar_queue)
         mgr.SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = 100
 
         # Simulate all_gather: rank 0 has {0} ready, rank 1 has {0,1} ready
@@ -795,7 +798,7 @@ class TestGetReadyGrammarRequests(unittest.TestCase):
         req.grammar_key = ("json", "slow")
         req.grammar_wait_ct = 0
 
-        mgr.grammar_queue.join([req])
+        move([req], mgr.grammar_queue)
 
         # Simulate: rank 0 has no ready and idx 0 failed, rank 1 has no ready/failed
         def fake_all_gather(output_list, _obj, group=None):  # noqa: ARG001
@@ -825,6 +828,7 @@ class _FakePPGroup:
         self.recv_data = recv_data
         self.recv_calls = []
         self.send_calls = []
+        self.sent_works = []
 
     def recv_object(self, *, src, tag):
         self.recv_calls.append((src, tag))
@@ -832,7 +836,9 @@ class _FakePPGroup:
 
     def send_object(self, data, *, dst, async_send, tag):
         self.send_calls.append((data, dst, async_send, tag))
-        return [_FakePPSendWork()]
+        work = _FakePPSendWork()
+        self.sent_works.append(work)
+        return [work]
 
 
 class TestGrammarManagerPPSync(unittest.TestCase):
@@ -842,13 +848,20 @@ class TestGrammarManagerPPSync(unittest.TestCase):
 
     """Test PP synchronization of grammar ready/failed indexes."""
 
-    def _make_mgr_for_pp(self, pp_rank, pp_size, pp_group):
+    def _make_mgr_for_pp(self, pp_rank, pp_size, pp_group, pp_async_batch_depth=0):
         scheduler = _make_scheduler()
         enter_override(
             self, get_context().override_server_args(skip_tokenizer_init=True)
         )
         # Override ranks after the server-args override rebuilds the config bags.
-        enter_scope(self, get_parallel().override(pp_size=pp_size, pp_rank=pp_rank))
+        enter_scope(
+            self,
+            get_parallel().override(
+                pp_size=pp_size,
+                pp_rank=pp_rank,
+                pp_async_batch_depth=pp_async_batch_depth,
+            ),
+        )
         scheduler.pp_group = pp_group
         mgr = GrammarManager(scheduler)
         mgr.grammar_backend = MagicMock(spec=BaseGrammarBackend)
@@ -892,15 +905,22 @@ class TestGrammarManagerPPSync(unittest.TestCase):
         self.assertEqual(pp_group.recv_calls, [(1, P2PTag.GRAMMAR_PP_SYNC)])
         self.assertEqual(pp_group.send_calls, [])
 
-    def test_pp_sync_drains_previous_async_send_work(self):
+    def test_pp_sync_waits_sends_only_behind_the_pipeline_depth(self):
+        """The forwards of a sync stay un-waited for pp_size + pp_async_batch_depth
+        syncs; waiting at every sync tied each rank's round to the next rank's
+        (the lock-step of #45351)."""
         pp_group = _FakePPGroup()
-        mgr = self._make_mgr_for_pp(pp_rank=0, pp_size=2, pp_group=pp_group)
-        work = _FakePPSendWork()
-        mgr.grammar_pp_sync_work_list = [work]
+        mgr = self._make_mgr_for_pp(
+            pp_rank=0, pp_size=2, pp_group=pp_group, pp_async_batch_depth=1
+        )
+        for _ in range(3):
+            mgr._pp_sync_ready_failed({1}, set())
+        self.assertEqual([w.waited for w in pp_group.sent_works], [False] * 3)
 
         mgr._pp_sync_ready_failed({1}, set())
-
-        self.assertTrue(work.waited)
+        self.assertEqual(
+            [w.waited for w in pp_group.sent_works], [True, False, False, False]
+        )
 
 
 class TestStrictReasoningPaths(unittest.TestCase):
@@ -965,8 +985,8 @@ class TestStrictReasoningPaths(unittest.TestCase):
         req.origin_input_ids = []
         compiled = mgr.process_req_with_grammar(req)
         if compiled:
-            # As the scheduler does, which moves the ready requests on.
-            mgr.grammar_queue.leave(mgr.get_ready_grammar_requests())
+            # As the scheduler does, which moves the ready requests to waiting.
+            move(mgr.get_ready_grammar_requests(), IndexedReqList(ListKind.WAITING))
         return compiled, req.grammar
 
     def _thinking_tokens_allowed(self, grammar, limit=16):
@@ -1049,7 +1069,7 @@ class TestStrictReasoningPaths(unittest.TestCase):
         req.require_reasoning = True
         req.grammar = future
         req.grammar_key = ("json", '{"type": "object"}')
-        mgr.grammar_queue.join([req])
+        move([req], mgr.grammar_queue)
 
         mgr.SGLANG_GRAMMAR_POLL_INTERVAL = 0.001
         result = mgr.get_ready_grammar_requests()

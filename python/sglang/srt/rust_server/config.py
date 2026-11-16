@@ -47,6 +47,7 @@ from sglang.srt.runtime_context import (
     get_serving,
     get_spec,
 )
+from sglang.srt.rust_server.warmups import rust_server_warmup_names
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.sampling.watermarking.core import redact_watermark_secrets
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
@@ -149,6 +150,16 @@ def _build_server_args(
         hicache_write_policy=get_memory().hicache_write_policy,
         host=get_serving().host,
         port=get_serving().port,
+        http2=(
+            ext.Http2Config(
+                max_concurrent_streams=get_serving().http2_max_concurrent_streams,
+                initial_connection_window_size=(
+                    get_serving().http2_initial_connection_window_size
+                ),
+            )
+            if get_serving().enable_http2
+            else None
+        ),
         # The shared field is also populated for legacy SMG mode; only forward
         # it when it selects SGLang's native gRPC transport.
         grpc_port=grpc_port,
@@ -170,6 +181,7 @@ def _build_server_args(
         skip_tokenizer_init=get_serving().skip_tokenizer_init,
         skip_server_warmup=get_serving().skip_server_warmup,
         gc_threshold=get_device().gc_threshold,
+        custom_warmups_pending=bool(rust_server_warmup_names(get_serving().warmups)),
         health_generate_headers=dict(health_generate_headers or {}),
         default_priority_value=(
             get_schedule().default_priority_value
@@ -483,9 +495,6 @@ def _launch_server_info(scheduler: Scheduler) -> str:
             build_server_info(scheduler.server_args, scheduler_info)
         )
     )
-    # The Rust listener speaks HTTP/1 only, whatever `--enable-http2` says; a
-    # router reads this key to pick its protocol.
-    info["enable_http2"] = False
     _redact_api_keys(info, scheduler.server_args)
     return json.dumps(info, default=str)
 
