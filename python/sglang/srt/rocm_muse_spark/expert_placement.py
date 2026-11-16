@@ -27,7 +27,6 @@ import numpy as np
 import torch
 import torch.distributed as dist
 
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.rocm_muse_spark import router_pooler
@@ -35,6 +34,7 @@ from sglang.srt.rocm_muse_spark.sequence_parallel import (
     SP_MIN_TOKENS,
     VERIFY_SP_MIN_ROWS,
 )
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.getLogger(__name__)
 
@@ -233,7 +233,7 @@ class ExpertPlacement:
     @torch.no_grad()
     def rebalance(self, joint: bool = False) -> None:
         start = time.perf_counter()
-        group = get_tp_group()
+        group = get_parallel().tp_group
         verify = [m.expert_load_verify if m.expert_load_verify is not None else torch.zeros_like(m.expert_load)
                   for m in self.moes]  # fmt: skip
         loads = torch.stack(

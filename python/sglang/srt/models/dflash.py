@@ -518,18 +518,13 @@ class DFlashAttention(nn.Module):
             q, k = self.rotary_emb(positions, q, k)
         if self.v_scale is not None:
             v = v * self.v_scale
+        # save_kv_cache is passed only when off, so the default call stays as before.
+        kwargs = {} if self.save_kv_cache else {"save_kv_cache": False}
         if self.attention_sink_bias is None:
-            attn_output = self.attn(
-                q, k, v, forward_batch, save_kv_cache=self.save_kv_cache
-            )
+            attn_output = self.attn(q, k, v, forward_batch, **kwargs)
         else:
             attn_output = self.attn(
-                q,
-                k,
-                v,
-                forward_batch,
-                save_kv_cache=self.save_kv_cache,
-                sinks=self.attention_sink_bias,
+                q, k, v, forward_batch, sinks=self.attention_sink_bias, **kwargs
             )
         attn_output = self.apply_attention_output(attn_output, hidden_states)
         output, _ = self.o_proj(attn_output)
