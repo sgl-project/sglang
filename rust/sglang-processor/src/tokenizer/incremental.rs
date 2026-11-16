@@ -366,9 +366,10 @@ fn common_prefix_len(a: &[u8], b: &[u8]) -> usize {
 
 /// The space-crossing patterns of an admitted `tokenizer.json`, or why it is not
 /// admitted. Admitted: a BPE model whose only normalization is `" "` -> `"▁"`,
-/// with no pre-tokenizer split left after it, no post-processor tokens, and no
-/// added token containing a space. A merge can then join the two sides of a cut
-/// only through a vocabulary entry with `"▁"` after a non-space.
+/// with no pre-tokenizer split left after it, and no added token containing a
+/// space. A merge can then join the two sides of a cut only through a vocabulary
+/// entry with `"▁"` after a non-space. A template post-processor is admitted
+/// whatever it adds: the encoder runs without added specials.
 fn admission(spec: &Value) -> Result<Vec<CrossingPattern>, String> {
     if spec["model"]["type"] != "BPE" {
         return Err("model is not BPE".into());
@@ -385,11 +386,8 @@ fn admission(spec: &Value) -> Result<Vec<CrossingPattern>, String> {
         return Err("pre-tokenizer splits the normalized text".into());
     }
     let post = &spec["post_processor"];
-    let adds_tokens = post["single"]
-        .as_array()
-        .is_some_and(|items| items.iter().any(|item| item.get("Sequence").is_none()));
-    if !(post.is_null() || post["type"] == "TemplateProcessing") || adds_tokens {
-        return Err("post-processor adds tokens".into());
+    if !(post.is_null() || post["type"] == "TemplateProcessing") {
+        return Err("post-processor is not a template".into());
     }
     let added = spec["added_tokens"].as_array().cloned().unwrap_or_default();
     if added
@@ -462,8 +460,9 @@ mod tests {
         assert_eq!(cutter.cut_point(text, text.len()), 3);
     }
 
-    /// Gemma 4's shape is admitted with its crossing entries; a byte-level
-    /// pre-tokenizer is not.
+    /// Gemma 4's shape is admitted with its crossing entries, also when its
+    /// template adds a BOS (the base checkpoints); a byte-level pre-tokenizer
+    /// is not.
     #[test]
     fn admits_space_replace_bpe() {
         let spec = gemma_like_spec();
@@ -480,6 +479,14 @@ mod tests {
                 (b">".to_vec(), b"<".to_vec())
             ]
         );
+        let mut with_bos = spec.clone();
+        with_bos["post_processor"]["single"] = serde_json::json!([
+            {"SpecialToken": {"id": "<bos>", "type_id": 0}},
+            {"Sequence": {"id": "A", "type_id": 0}}
+        ]);
+        with_bos["post_processor"]["special_tokens"] =
+            serde_json::json!({"<bos>": {"id": "<bos>", "ids": [0], "tokens": ["<bos>"]}});
+        assert_eq!(admission(&with_bos).unwrap().len(), 2);
         let mut byte_level = spec.clone();
         byte_level["pre_tokenizer"] = serde_json::json!({"type": "ByteLevel"});
         assert!(admission(&byte_level).is_err());
