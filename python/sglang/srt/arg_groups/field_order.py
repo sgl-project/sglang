@@ -573,5 +573,6 @@ POSITIONAL_FIELD_ORDER = (
     "shortest_prefill_aging_factor",
     "enable_token_space_processor",
     "indexer_kv_cache_dtype",
+    "eplb_first_rebalance_num_iterations",
 )
 # fmt: on

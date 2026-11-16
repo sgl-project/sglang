@@ -763,6 +763,15 @@ def handle_elastic_ep(server_args: Any):
 
 def handle_eplb_and_dispatch(server_args: Any):
     cfg = resolving_view(server_args)
+    if (
+        cfg.eplb_first_rebalance_num_iterations is not None
+        and cfg.eplb_first_rebalance_num_iterations < 1
+    ):
+        raise ValueError(
+            "--eplb-first-rebalance-num-iterations must be >= 1, "
+            f"got {cfg.eplb_first_rebalance_num_iterations}."
+        )
+
     if cfg.enable_eplb and (cfg.expert_distribution_recorder_mode is None):
         declare_resolution(
             server_args,
