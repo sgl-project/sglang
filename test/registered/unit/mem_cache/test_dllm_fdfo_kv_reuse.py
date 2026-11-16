@@ -17,8 +17,9 @@ from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
-from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.request_list import move
+from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
