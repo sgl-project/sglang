@@ -24,7 +24,6 @@ import torch.nn.functional as F
 from torch import nn
 from transformers import PretrainedConfig
 
-from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.distributed import (
@@ -91,10 +90,7 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2ForCausalLM
 from sglang.srt.models.utils import WeightsMapper, apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import (
-    cpu_has_amx_support,
     get_bool_env_var,
-    get_device_sm,
-    is_cpu,
     is_cuda,
     is_hip,
     is_npu,
@@ -103,12 +99,8 @@ from sglang.srt.utils import (
 
 _is_hip = is_hip()
 _is_cuda = is_cuda()
-_is_fp8_fnuz = is_fp8_fnuz()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
-_is_cpu_amx_available = cpu_has_amx_support()
-_is_cpu = is_cpu()
 _is_npu = is_npu()
-_device_sm = get_device_sm()
 
 logger = logging.getLogger(__name__)
 
@@ -467,7 +459,6 @@ class Glm4MoeSparseMoeBlock(nn.Module):
             routing_method_type=self.experts.routing_method_type,
         )
 
-        self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
         if config.n_shared_experts is not None and self.num_fused_shared_experts == 0:
@@ -501,10 +492,6 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                     "moe_wna16",
                 }
             )
-            self.shared_experts_is_int8 = (
-                not is_packed_weight
-                and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
-            )
             self.shared_experts_is_fp8 = (
                 not is_packed_weight
                 and self.shared_experts.gate_up_proj.weight.dtype == torch.float8_e4m3fn
@@ -523,8 +510,6 @@ class Glm4MoeSparseMoeBlock(nn.Module):
                         == self.shared_experts.down_proj.quant_method.quant_config.weight_block_size
                     )
                     self.shared_experts_weight_block_size = self.shared_experts.gate_up_proj.quant_method.quant_config.weight_block_size
-
-        self.top_k = config.num_experts_per_tok
 
         if (
             get_moe_a2a_backend().is_deepep()
@@ -1144,10 +1129,7 @@ class Glm4MoeForCausalLM(nn.Module):
         if params_dict is None:
             params_dict = dict(self.named_parameters())
 
-        weight_names = []
         for name, loaded_weight in weights:
-            weight_names.append(name)
-
             if not is_nextn:
                 if hasattr(self.config, "num_nextn_predict_layers"):
                     num_nextn_layers = self.config.num_nextn_predict_layers
@@ -1242,14 +1224,11 @@ class Glm4MoeForCausalLM(nn.Module):
                     if name not in params_dict:
                         continue
 
-                    if name in params_dict.keys():
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-                    else:
-                        logger.warning(f"Parameter {name} not found in params_dict")
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
