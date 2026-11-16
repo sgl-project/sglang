@@ -64,6 +64,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 from sglang.srt.model_executor.weight_checker import overall_checksum
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_model, get_parallel
+from sglang.srt.weight_sync.refusal import weight_update_request
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner
@@ -169,6 +170,7 @@ class SchedulerWeightUpdaterManager:
     def record_weight_version_after_update(self, weight_version: Optional[str]) -> None:
         self.scheduler.record_weight_version_change(new_version=weight_version)
 
+    @weight_update_request()
     def update_weights_from_disk(self, recv_req: UpdateWeightFromDiskReqInput):
         """In-place update of the weights from disk."""
         with self._observe_weight_load("disk"):
@@ -239,6 +241,7 @@ class SchedulerWeightUpdaterManager:
                 return error
         return None
 
+    @weight_update_request()
     def update_weights_from_distributed(
         self,
         recv_req: UpdateWeightsFromDistributedReqInput,
@@ -297,6 +300,7 @@ class SchedulerWeightUpdaterManager:
                 break
         return success, message
 
+    @weight_update_request()
     def update_weights_from_tensor(self, recv_req: UpdateWeightsFromTensorReqInput):
         """Update the online model parameter from tensors on the selected runners."""
         if self._session is None:
@@ -334,6 +338,7 @@ class SchedulerWeightUpdaterManager:
             torch.distributed.barrier(group=self.tp_cpu_group)
             return UpdateWeightsFromTensorReqOutput(success=success, message=message)
 
+    @weight_update_request()
     def update_weights_from_ipc(self, recv_req: UpdateWeightsFromIPCReqInput):
         """Update the online model parameter from IPC for checkpoint-engine integration."""
         with self._observe_weight_load("ipc"):
@@ -390,20 +395,13 @@ class SchedulerWeightUpdaterManager:
                 message="a weight-update session is already open; "
                 "call end_weight_update() first",
             )
-        from sglang.srt.model_executor.model_runner_components.weight_updater import (
-            _unsupported_derived_weight_cache_error,
-        )
-
         runners = self._select_runners(recv_req.selector)
         # Restoring packed weights already mutates storage. Check every runner
         # before touching any of them, including sessions used by P2P/RDMA
         # writers which bypass update_weights_from_tensor/distributed.
-        for _, runner in runners:
-            error = _unsupported_derived_weight_cache_error(
-                runner.weight_updater.get_model()
-            )
-            if error is not None:
-                return BeginWeightUpdateReqOutput(success=False, message=error)
+        error = self._weight_update_unsupported_reason(runners)
+        if error is not None:
+            return BeginWeightUpdateReqOutput(success=False, message=error)
         for _, runner in runners:
             runner.weight_updater.begin_weight_update()
         self._session = _WeightUpdateSession(selector=recv_req.selector)
@@ -424,6 +422,7 @@ class SchedulerWeightUpdaterManager:
         torch.distributed.barrier(group=self.tp_cpu_group)
         return EndWeightUpdateReqOutput(success=True, message="Success")
 
+    @weight_update_request()
     def plugin_weight_update(self, recv_req: PluginWeightUpdateReqInput):
         """Receive weights through a platform transport, then load them as update_weights_from_distributed does."""
         if self._session is None:

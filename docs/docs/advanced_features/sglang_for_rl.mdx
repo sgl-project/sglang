@@ -113,12 +113,19 @@ After training completes each step, rollout engines must be refit with new weigh
 - **From tensor** is best for co-located training/rollout when you can pass in-memory tensors.
 - **From distributed** is best for disaggregated training/rollout with dedicated communication groups (NCCL/IB).
 
-If your model or plugin cannot accept in-place weight updates, set
-`weight_update_unsupported_reason: Optional[str]` to an explanatory string on
-the model or any of its modules before serving starts. Keep this declaration
-identical on all ranks and unchanged while serving; leave it unset or `None` to
-preserve the default behavior. The private `_derived_weight_cache_error`
-attribute remains a compatible alias when the public attribute is `None`.
+If your model or plugin cannot accept in-place weight updates, declare the
+reason on the model or any nested module before serving starts:
+
+```python
+from sglang.srt.weight_sync.refusal import declare_weight_update_unsupported
+
+declare_weight_update_unsupported(module, "restart to replace offloaded weights")
+```
+
+Use the same declaration on all ranks and keep it unchanged while serving.
+A string, including an empty string, blocks updates. Passing `None` clears
+only this declaration. Other types raise `TypeError`. Native restrictions,
+including a model's existing `_derived_weight_cache_error`, still apply.
 SGLang checks all selected runners before writing weights or opening a
 `begin_weight_update` session and returns `success: false` with the reason,
 leaving the server available for inference. This also applies to

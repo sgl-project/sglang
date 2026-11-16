@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import logging
 from dataclasses import dataclass, field
+from itertools import tee
 from typing import TYPE_CHECKING, Any, Callable, List, Optional, Tuple, Union
 
 import torch
@@ -28,6 +29,10 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.network import NetworkAddress
 from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+from sglang.srt.weight_sync.refusal import (
+    cache_weight_update_check,
+    plugin_weight_update_reason,
+)
 from sglang.srt.weight_sync.tensor_bucket import (
     FlattenedTensorBucket,
     FlattenedTensorMetadata,
@@ -40,26 +45,28 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+@cache_weight_update_check
 def _unsupported_derived_weight_cache_error(
     model: Optional[torch.nn.Module] = None,
 ) -> Optional[str]:
     """Reject online weight updates that derived-weight caches cannot survive.
 
     Compensated mHC projections and HPC-Ops bf16xfp32 GEMM retain derived
-    weight splits that in-place loader writes do not refresh. Models and plugins
-    can declare this constraint on any module via
-    ``weight_update_unsupported_reason``; ``_derived_weight_cache_error``
-    remains a backwards-compatible alias.
+    weight splits that in-place loader writes do not refresh. Model-owned
+    caches can also declare this constraint via ``_derived_weight_cache_error``.
+    Plugins declare it through ``declare_weight_update_unsupported``.
     Reject before writing weights to avoid serving stale cached values,
     including references retained by captured CUDA graphs. These constraints
     must be startup-determined and rank-uniform so all workers reject together.
     """
-    if model is not None and any(
+    # Share one traversal while allowing an early mHC refusal to stop enumeration.
+    mhc_modules, cache_modules = tee(model.modules()) if model is not None else ((), ())
+    if any(
         getattr(module, "_hc_attn_tf32_parts", None) is not None
         or getattr(module, "_hc_ffn_tf32_parts", None) is not None
         or getattr(module, "_hc_attn_bf16_parts", None) is not None
         or getattr(module, "_hc_ffn_bf16_parts", None) is not None
-        for module in model.modules()
+        for module in mhc_modules
     ):
         return (
             "Online weight updates are not supported while compensated mHC "
@@ -71,10 +78,11 @@ def _unsupported_derived_weight_cache_error(
     if model is not None:
         # Model-owned caches can publish the same rank-uniform constraint
         # without importing individual model implementations in the updater.
-        for module in model.modules():
-            reason = getattr(module, "weight_update_unsupported_reason", None)
-            if reason is None:
-                reason = getattr(module, "_derived_weight_cache_error", None)
+        for module in cache_modules:
+            reason = plugin_weight_update_reason(module)
+            if reason is not None:
+                return reason
+            reason = getattr(module, "_derived_weight_cache_error", None)
             if reason is not None:
                 return reason
     from sglang.kernels.ops.gemm.bf16_fp32 import hpc_bf16xfp32_gemm_enabled

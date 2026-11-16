@@ -17,6 +17,7 @@ from sglang.srt.model_executor.model_runner_components.weight_updater import (
     _unsupported_derived_weight_cache_error,
 )
 from sglang.srt.runtime_context import get_parallel
+from sglang.srt.weight_sync.refusal import declare_weight_update_unsupported
 
 
 class TestDerivedWeightCache(CustomTestCase):
@@ -67,7 +68,7 @@ class TestDerivedWeightCache(CustomTestCase):
             self.assertTrue(update(stub, [], load_format=None)[0])
         self.assertEqual(loaded, [[]])
 
-    def test_public_declaration_and_legacy_alias(self):
+    def test_clearing_a_public_reason_preserves_a_native_refusal(self):
         model = torch.nn.Sequential(torch.nn.Module())
         for public, legacy, expected in (
             (None, None, None),
@@ -75,6 +76,7 @@ class TestDerivedWeightCache(CustomTestCase):
             (None, "legacy reason", "legacy reason"),
             ("public reason", "legacy reason", "public reason"),
             ("", "legacy reason", ""),
+            (None, "legacy reason", "legacy reason"),
         ):
             with (
                 self.subTest(public=public, legacy=legacy),
@@ -83,16 +85,27 @@ class TestDerivedWeightCache(CustomTestCase):
                     return_value=False,
                 ),
             ):
-                model[0].weight_update_unsupported_reason = public
+                declare_weight_update_unsupported(model[0], public)
                 model[0]._derived_weight_cache_error = legacy
                 self.assertEqual(
                     _unsupported_derived_weight_cache_error(model), expected
                 )
 
+    def test_invalid_declaration_preserves_the_existing_reason(self):
+        model = torch.nn.Module()
+        declare_weight_update_unsupported(model, "already refused")
+        for invalid in (True, 42, ValueError("wrong type")):
+            with self.subTest(reason=invalid):
+                with self.assertRaises(TypeError):
+                    declare_weight_update_unsupported(model, invalid)
+                self.assertEqual(
+                    _unsupported_derived_weight_cache_error(model), "already refused"
+                )
+
     def test_public_declaration_rejects_each_load_path_before_writing(self):
         model = torch.nn.Sequential(torch.nn.Linear(2, 2, bias=False))
         reason = "plugin owns relocated weights"
-        model[0].weight_update_unsupported_reason = reason
+        declare_weight_update_unsupported(model[0], reason)
         original = model[0].weight.detach().clone()
         updater = WeightUpdater(
             tp_rank=0,

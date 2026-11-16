@@ -7,6 +7,7 @@ import torch
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.io_struct import (
     BeginWeightUpdateReqInput,
+    CheckWeightsReqInput,
     EndWeightUpdateReqInput,
     PluginWeightUpdateReqInput,
     PluginWeightUpdateReqOutput,
@@ -35,8 +36,12 @@ from sglang.srt.mem_cache.kv_weight_version_tracker import (
 )
 from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.model_runner_components.weight_updater import (
+    WeightUpdater,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.weight_sync.refusal import declare_weight_update_unsupported
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.scheduler_test_utils import release_only_retirer
 from sglang.test.test_utils import CustomTestCase
@@ -267,13 +272,14 @@ class TestSchedulerBatchWeightVersion(CustomTestCase):
 def _runner(result=(True, "ok")):
     runner = Mock()
     runner.weight_updater.get_model.return_value = torch.nn.Module()
-    for method in (
-        "update_weights_from_disk",
-        "update_weights_from_tensor",
-        "update_weights_from_ipc",
-        "load_weights_from_distributed",
+    updater = runner.weight_updater
+    for update in (
+        updater.update_weights_from_disk,
+        updater.update_weights_from_tensor,
+        updater.update_weights_from_ipc,
+        updater.load_weights_from_distributed,
     ):
-        getattr(runner.weight_updater, method).return_value = result
+        update.return_value = result
     runner.weight_updater.receive_weights_from_distributed.return_value = [
         ("weight", torch.tensor([1.0]))
     ]
@@ -423,6 +429,76 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 
 
 class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
+    def test_draft_refusal_precedes_disk_and_ipc_writes(self):
+        target, draft = _runner(), _runner()
+        declare_weight_update_unsupported(draft.weight_updater.get_model(), "draft")
+        manager = self._manager(target, draft)
+        for update, write in (
+            (
+                manager.update_weights_from_disk,
+                target.weight_updater.update_weights_from_disk,
+            ),
+            (
+                manager.update_weights_from_ipc,
+                target.weight_updater.update_weights_from_ipc,
+            ),
+        ):
+            with self.subTest(update=update.__name__):
+                output = update(_request())
+                self.assertFalse(output.success)
+                self.assertEqual(output.message, "draft")
+                write.assert_not_called()
+                self.assertEqual(self.recorded, [])
+
+    def test_wider_bucket_selector_checks_draft_before_target_write(self):
+        target, draft = _runner(), _runner()
+        declare_weight_update_unsupported(draft.weight_updater.get_model(), "draft")
+        manager = self._manager(target, draft, session=False)
+        self.assertTrue(
+            manager.begin_weight_update(
+                BeginWeightUpdateReqInput(selector="target")
+            ).success
+        )
+        for update, write in (
+            (
+                manager.update_weights_from_tensor,
+                target.weight_updater.update_weights_from_tensor,
+            ),
+            (
+                manager.update_weights_from_distributed,
+                target.weight_updater.load_weights_from_distributed,
+            ),
+        ):
+            with self.subTest(update=update.__name__):
+                output = update(_request(selector="all"))
+                self.assertFalse(output.success)
+                self.assertEqual(output.message, "draft")
+                write.assert_not_called()
+                self.assertFalse(manager._session.loaded_weights)
+        # The sender may already be broadcasting. Drain the receive before rejecting.
+        target.weight_updater.receive_weights_from_distributed.assert_called_once()
+
+    def test_draft_refusal_blocks_reset_but_permits_read_only_checks(self):
+        target, draft = _runner(), _runner()
+        target.check_weights.return_value = draft.check_weights.return_value = None
+        manager = self._manager(target, draft)
+        declare_weight_update_unsupported(draft.weight_updater.get_model(), "draft")
+        output = manager.check_weights(CheckWeightsReqInput(action="reset_tensors"))
+        self.assertFalse(output.success)
+        self.assertEqual(output.message, "draft")
+        target.check_weights.assert_not_called()
+        draft.check_weights.assert_not_called()
+        with patch("torch.distributed.get_world_size", return_value=1):
+            self.assertTrue(manager.check_weights(CheckWeightsReqInput()).success)
+            declare_weight_update_unsupported(draft.weight_updater.get_model(), None)
+            self.assertTrue(
+                manager.check_weights(
+                    CheckWeightsReqInput(action="reset_tensors")
+                ).success
+            )
+        self.assertEqual(target.check_weights.call_count, 2)
+        self.assertEqual(draft.check_weights.call_count, 2)
+
     def test_rejects_all_runners_before_restoring_any_derived_weights(self):
         target, draft = _runner(), _runner()
         draft.weight_updater.get_model.return_value._derived_weight_cache_error = (
@@ -598,6 +674,32 @@ class TestPluginWeightUpdate(_WeightUpdaterManagerTestBase):
         )
         self.assertEqual(self.recorded, ["3"])
         self.assertEqual(len(self.flushes), 1)
+
+    def test_plugin_load_scans_the_model_once_per_request(self):
+        """Preflight and loading share one scan; a later request sees a new refusal."""
+        target = _runner()
+        updater = target.weight_updater
+        model = updater.get_model()
+        model.load_weights = Mock()
+        updater.load_rejection.side_effect = lambda op: WeightUpdater.load_rejection(
+            updater, op
+        )
+        updater.load_weights_from_distributed.side_effect = lambda weights: (
+            WeightUpdater.load_weights_from_distributed(updater, weights)
+        )
+        transport = Mock(return_value=[("w", torch.ones(1))])
+        manager = self._manager_serving({"ici": transport}, target=target)
+        req = PluginWeightUpdateReqInput(handler="ici")
+        with patch.object(model, "modules", wraps=model.modules) as scan:
+            self.assertTrue(manager.plugin_weight_update(req).success)
+            self.assertEqual(scan.call_count, 1)
+            declare_weight_update_unsupported(model, "plugin owns these weights")
+            self.assertEqual(
+                manager.plugin_weight_update(req).message, "plugin owns these weights"
+            )
+            self.assertEqual(scan.call_count, 2)
+        transport.assert_called_once()
+        model.load_weights.assert_called_once()
 
     def test_end_runs_post_load_only_after_writes_that_bypassed_load_weights(self):
         """A transport that writes parameters itself returns no tensors, like p2p peer writes."""
