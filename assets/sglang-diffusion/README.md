@@ -1,4 +1,4 @@
-# SGLang-Diffusion adoption assets
+# SGLang-Diffusion README assets
 
 The diffusion README uses `adoption.png`, following the single-image layout of
 SGLang's main README. Edit `adoption.html` and the individual files in `logos/`,
@@ -37,3 +37,22 @@ Keep this list specific to SGLang-Diffusion adoption or implementation reuse.
 Model support alone does not establish adoption. In particular, the fal caption
 describes a port to Falcon, not deployment of the SGLang-Diffusion runtime.
 Logo ownership remains with the respective organizations and projects.
+
+## SGLang-Diffusion logo
+
+`logo.svg` and `logo-dark.svg` head the diffusion README on light and dark
+themes. They differ only in the colors of the dots and how strong their glow is.
+
+- The SGL mark is `assets/logo.svg`, unchanged.
+- The word DIFFUSION is set in Open Sans ExtraBold Italic
+  ([SIL Open Font License 1.1](https://github.com/googlefonts/opensans)) and
+  stored as outlines, so no font is loaded.
+- Each dot is a piece of a letter with noise added to it, more the further
+  right it sits. Most stay with their letter; the rest drift off to the right
+  and leave a hole behind.
+- The dots past the last letter have a soft glow: one blurred layer under the
+  word.
+- The drifting dots move slowly on a 12 second loop. The motion is CSS inside
+  the SVG, with no script, and it stops under `prefers-reduced-motion`.
+
+The two files are generated. The generator is not in this repository.
