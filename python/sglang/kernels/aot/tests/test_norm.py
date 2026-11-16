@@ -206,6 +206,7 @@ def test_bench_rmsnorm_verify_reports_match():
     spec = importlib.util.spec_from_file_location("bench_rmsnorm", bench_path)
     bench_rmsnorm = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(bench_rmsnorm)
+    torch.manual_seed(0)
     assert bench_rmsnorm.calculate_diff(4, 128, 4096, use_residual=False) is True
 
 
