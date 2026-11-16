@@ -2604,6 +2604,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
             self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
+            self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, cap_trim_lens)
             out_tokens, commit_lens = _commit_accept(candidates, accept_len, bonus)
         elif target_predict is None and (
             not _is_all_greedy(sampling_info) and is_dflash_sampling_verify_available()
