@@ -190,6 +190,46 @@ class TestNativeMoeRoutingPolicy(CustomTestCase):
         ):
             self._implicit_bailing_policy("llada2", block_routing=True)
 
+    def test_model_top_k_reaches_the_expert_runner(self):
+        """Expert dispatch must use the same per-token expert count as the router."""
+        from sglang.srt.models.hunyuan import HunYuanSparseMoeBlock
+        from sglang.srt.models.llama4 import Llama4MoE
+        from sglang.srt.models.olmoe import OlmoeMoE
+
+        for top_k in (1, 3):
+            config = SimpleNamespace(
+                num_experts=8,
+                num_local_experts=8,
+                num_experts_per_tok=top_k,
+                hidden_size=128,
+                intermediate_size=128,
+                moe_intermediate_size=128,
+                moe_topk=[2, top_k],
+                use_mixed_mlp_moe=0,
+            )
+            factories = {
+                "olmoe": lambda: OlmoeMoE(
+                    num_experts=8,
+                    top_k=top_k,
+                    hidden_size=128,
+                    intermediate_size=128,
+                    quant_config=self.quant_config,
+                    layer_id=1,
+                ),
+                "hunyuan": lambda: HunYuanSparseMoeBlock(
+                    config=config, quant_config=self.quant_config, layer_id=1
+                ),
+                "llama4": lambda: Llama4MoE(
+                    config=config, layer_id=1, quant_config=self.quant_config
+                ),
+            }
+            for name, factory in factories.items():
+                with self.subTest(model=name, top_k=top_k):
+                    block = factory()
+                    self.assertEqual(block.topk.topk_config.top_k, top_k)
+                    self.assertEqual(block.experts.top_k, top_k)
+                    self.assertEqual(block.experts.moe_runner_config.top_k, top_k)
+
     @staticmethod
     def _weighted_experts(ids, weights, hidden_states):
         values = ids.float() + 1

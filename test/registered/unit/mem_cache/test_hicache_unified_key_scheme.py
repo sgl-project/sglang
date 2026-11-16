@@ -418,7 +418,7 @@ class TestControllerUnifiedKeys(CustomTestCase):
                     config = controller._generate_storage_config("org/model")
 
                 namespace = derive_namespace(
-                    model_id="org/model",
+                    model_id="org/model-dtype_float8_e4m3fn",
                     dtype="float8_e4m3fn",
                     page_size=16,
                     rank_replicated=mla,
