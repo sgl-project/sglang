@@ -1190,6 +1190,27 @@ class TestGenerateReqInputNormalization(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, "should be a string"):
                     req.normalize_batch_and_arguments()
 
+    def test_single_request_rejects_list_rid(self):
+        """A list rid on one prompt used to reach the request-state map
+        unhashed and return a 500."""
+        req = GenerateReqInput(text="Hello", rid=["a", "b"])
+        with self.assertRaisesRegex(ValueError, "rid should be a string"):
+            req.normalize_batch_and_arguments()
+
+        # A string rid on one prompt, also when n expands it, and a list rid on a
+        # batch are still accepted.
+        single = GenerateReqInput(text="Hello", rid="a")
+        single.normalize_batch_and_arguments()
+        self.assertEqual(single.rid, "a")
+        expanded = GenerateReqInput(text="Hello", rid="a", sampling_params={"n": 2})
+        expanded.normalize_batch_and_arguments()
+        self.assertEqual(expanded.rid, ["a_0", "a_1"])
+        batch = GenerateReqInput(
+            text=["Hello", "World"], rid=["a", "b"], sampling_params=[{}, {}]
+        )
+        batch.normalize_batch_and_arguments()
+        self.assertEqual(batch.rid, ["a", "b"])
+
     def test_logprob_parameters_normalization(self):
         """Test normalization of logprob-related parameters."""
         # Test single example
@@ -1596,6 +1617,20 @@ class TestEmbeddingReqInputGetItem(CustomTestCase):
         self.assertEqual(
             [cross_encoder_req[0].priority, cross_encoder_req[1].priority], [3, 3]
         )
+
+    def test_single_request_rejects_list_rid(self):
+        """A list rid on one input used to reach the request-state map unhashed
+        and return a 500."""
+        req = EmbeddingReqInput(text="Hello", rid=["a", "b"])
+        with self.assertRaisesRegex(ValueError, "rid should be a string"):
+            req.normalize_batch_and_arguments()
+
+        single = EmbeddingReqInput(text="Hello", rid="a")
+        single.normalize_batch_and_arguments()
+        self.assertEqual(single.rid, "a")
+        batch = EmbeddingReqInput(text=["Hello", "World"], rid=["a", "b"])
+        batch.normalize_batch_and_arguments()
+        self.assertEqual([batch[0].rid, batch[1].rid], ["a", "b"])
 
     def test_lora_identity_survives_batch_split(self):
         """Each embedding subrequest must retain its adapter path and resolved ID."""
