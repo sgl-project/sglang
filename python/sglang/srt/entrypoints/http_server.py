@@ -22,7 +22,6 @@ import dataclasses
 import errno
 import inspect
 import logging
-import math
 import os
 import signal
 import socket
@@ -70,11 +69,7 @@ from fastapi import (
 from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import (
-    ORJSONResponse,
-    Response,
-    StreamingResponse,
-)
+from fastapi.responses import ORJSONResponse, Response, StreamingResponse
 from fastapi.routing import APIRoute
 from pydantic import ValidationError
 from uvicorn.supervisors.multiprocess import Multiprocess
@@ -93,10 +88,10 @@ from sglang.srt.entrypoints.cohere.protocol import (
     CohereEmbedResponse,
     CohereErrorResponse,
 )
-from sglang.srt.entrypoints.cohere.protocol import (
-    create_error_response as create_cohere_error_response,
+from sglang.srt.entrypoints.cohere.serving_embedding import (
+    CohereServingEmbedding,
+    render_request_errors,
 )
-from sglang.srt.entrypoints.cohere.serving_embedding import CohereServingEmbedding
 from sglang.srt.entrypoints.engine import (
     Engine,
     init_tokenizer_manager,
@@ -603,12 +598,6 @@ def _anthropic_error_response(*, status_code: int, error_type: str, message: str
     )
 
 
-def _is_cohere_embed_request(request: Request) -> bool:
-    # root_path is the deployment prefix, not part of the endpoint's API path.
-    route_path = request.url.path.removeprefix(request.scope.get("root_path", ""))
-    return route_path == "/v2/embed"
-
-
 def _chat_route_error_response(
     request: Request, message: str, err_type: str, status_code: int
 ) -> Optional[ORJSONResponse]:
@@ -638,21 +627,6 @@ async def validation_exception_handler(request: Request, exc: HTTPException):
     {"error": {"message": "...", "type": "...", "param": null, "code": <status>}}
     For /v1/messages, emit Anthropic-style envelope so SDK clients can parse it.
     """
-    if _is_cohere_embed_request(request):
-        return create_cohere_error_response(
-            message="Internal server error"
-            if exc.status_code >= 500
-            else str(exc.detail),
-            status_code=exc.status_code,
-            error_type=(
-                "InternalServerError"
-                if exc.status_code >= 500
-                else "NotFoundError"
-                if exc.status_code == 404
-                else "BadRequestError"
-            ),
-        )
-
     if request.url.path.startswith("/v1/messages"):
         # Map HTTP status to Anthropic error.type; fall back to api_error.
         anthropic_type = {
@@ -718,15 +692,6 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     /v1/systemone, keep the 422 detail list that the System One API documents.
     Otherwise use the legacy ErrorResponse shape.
     """
-    if _is_cohere_embed_request(request):
-        # Field validation happens before cohere_v2_embed runs. Render only the
-        # location/message, avoiding input data and non-JSON exception context.
-        message = "; ".join(
-            f"{'.'.join(str(part) for part in item['loc'])}: {item['msg']}"
-            for item in exc.errors()
-        )
-        return create_cohere_error_response(message)
-
     if request.url.path.startswith("/v1/messages"):
         return _anthropic_error_response(
             status_code=HTTPStatus.BAD_REQUEST.value,
@@ -1943,8 +1908,26 @@ async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
     )
 
 
-@app.post(
+class CohereRoute(ORJSONRoute):
+    """Keeps /v2/embed failures in the Cohere error envelope at the route itself,
+    so the app-wide exception handlers need no knowledge of this endpoint."""
+
+    def get_route_handler(self):
+        return render_request_errors(super().get_route_handler())
+
+
+async def cohere_v2_embed(request: CohereEmbedRequest, raw_request: Request):
+    """Cohere-compatible embeddings endpoint."""
+    return await raw_request.app.state.cohere_serving_embedding.handle_request(
+        request, raw_request
+    )
+
+
+app.router.add_api_route(
     "/v2/embed",
+    cohere_v2_embed,
+    methods=["POST"],
+    route_class_override=CohereRoute,
     dependencies=[Depends(validate_json_request)],
     response_model=CohereEmbedResponse,
     response_model_exclude_none=True,
@@ -1954,31 +1937,6 @@ async def openai_v1_embeddings(request: EmbeddingRequest, raw_request: Request):
         500: {"model": CohereErrorResponse},
     },
 )
-async def cohere_v2_embed(request: CohereEmbedRequest, raw_request: Request):
-    """Cohere-compatible embeddings endpoint."""
-    try:
-        response = await raw_request.app.state.cohere_serving_embedding.handle_request(
-            request, raw_request
-        )
-        if isinstance(response, Response):
-            return response
-        for row in response.embeddings.float or []:
-            if not all(map(math.isfinite, row)):
-                raise ValueError("Out of range float values are not JSON compliant")
-        return Response(
-            content=response.model_dump_json(exclude_none=True),
-            media_type="application/json",
-        )
-    except HTTPException:
-        raise  # The global handler preserves the HTTP status and Cohere format.
-    except Exception:
-        # Request validation is handled globally, before this function runs.
-        # Catch execution/serialization failures here so their responses still
-        # pass through the app's CORS and request metrics middleware.
-        logger.exception("Error handling Cohere embedding request")
-        return create_cohere_error_response(
-            "Internal server error", status_code=500, error_type="InternalServerError"
-        )
 
 
 @app.post(

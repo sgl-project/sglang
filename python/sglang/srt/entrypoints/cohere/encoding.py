@@ -14,6 +14,7 @@
 """Serialize a single inference result into the requested embedding formats."""
 
 import base64
+import math
 import struct
 from collections.abc import Sequence
 from typing import Optional
@@ -37,6 +38,9 @@ def build_typed_embeddings(
     packed = None
     for embedding_type in embedding_types:
         if embedding_type == "float":
+            # JSON has no NaN/Infinity and pydantic would emit null instead.
+            if not all(all(map(math.isfinite, row)) for row in float_embeddings):
+                raise FloatingPointError("Embedding contains non-finite values")
             result.float = float_embeddings
         elif embedding_type == "base64":
             result.base64 = [

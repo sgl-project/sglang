@@ -14,6 +14,7 @@
 """Cohere-style /v2/embed protocol, matching vLLM v0.32.0's wire format."""
 
 import builtins
+from collections.abc import Mapping
 from typing import Literal, Optional
 from uuid import uuid4
 
@@ -129,13 +130,23 @@ class CohereErrorResponse(BaseModel):
 def create_error_response(
     message: str,
     status_code: int = 400,
-    error_type: str = "BadRequestError",
     param: Optional[str] = None,
+    headers: Optional[Mapping[str, str]] = None,
 ) -> JSONResponse:
+    """Build the error envelope shared by every /v2/embed failure."""
+    if status_code >= 500:
+        # Internal detail goes to the server log, never to the client.
+        message, error_type = "Internal server error", "InternalServerError"
+    elif status_code == 404:
+        error_type = "NotFoundError"
+    else:
+        error_type = "BadRequestError"
     error = CohereErrorResponse(
         error=CohereErrorDetail(
             message=message, type=error_type, param=param, code=status_code
         )
     )
     # Keep param: null in errors; successful responses instead omit unused types.
-    return JSONResponse(content=error.model_dump(), status_code=status_code)
+    return JSONResponse(
+        content=error.model_dump(), status_code=status_code, headers=headers
+    )

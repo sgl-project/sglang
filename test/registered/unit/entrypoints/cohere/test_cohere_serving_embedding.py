@@ -13,10 +13,12 @@ from unittest.mock import patch
 from fastapi import FastAPI, HTTPException
 from fastapi.routing import APIRoute
 from fastapi.testclient import TestClient
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from tokenizers import Tokenizer, models, pre_tokenizers, processors
 from transformers import PretrainedConfig, PreTrainedTokenizerFast
 
 from sglang.srt.entrypoints import http_server
+from sglang.srt.entrypoints.cohere import serving_embedding
 from sglang.srt.entrypoints.cohere.serving_embedding import (
     CohereServingEmbedding,
     _load_sentence_transformer_prompts,
@@ -74,6 +76,10 @@ class _InferenceDouble:
             ),
         )
         self.tokenizer = make_tokenizer()
+        self.text_tokenization = TokenizerManager.__new__(TokenizerManager)
+        self.text_tokenization.tokenizer = self.tokenizer
+        self.text_tokenization.async_dynamic_batch_tokenizer = None
+        self.text_tokenization.model_config = SimpleNamespace(is_embedding_gemma=False)
         self.requests = []
         self.token_ids = []
         self.failure = None
@@ -88,17 +94,15 @@ class _InferenceDouble:
         for index in range(request.batch_size):
             item = request[index]
             TokenizerManager._validate_for_matryoshka_dim(self, item)
-            kwargs = (
-                {"add_special_tokens": item.embedding_add_special_tokens}
-                if item.embedding_add_special_tokens is not None
-                else {}
+            ids, _, mask = await self.text_tokenization._tokenize_texts(
+                item.text, **TokenizerManager._embedding_tokenizer_kwargs(item)
             )
-            ids = self.tokenizer.encode(item.text, **kwargs)
             ids, _, _ = truncate_embedding_input(
                 ids,
                 truncate=item.embedding_truncate,
                 max_tokens=item.embedding_max_tokens,
                 input_token_limit=32,
+                special_tokens_mask=mask,
             )
             if not ids:
                 raise ValueError("Embedding input cannot be empty after truncation.")
@@ -322,7 +326,7 @@ class TestCohereEmbeddingHTTP(unittest.TestCase):
         self.assert_error(self.post(texts=["hello"], output_dimension=8))
 
     def test_truncation_is_token_based_and_none_rejects(self):
-        for policy, expected in (("END", [1, 2]), ("START", [2, 3])):
+        for policy, expected in (("END", [1, 2]), ("START", [1, 3])):
             with self.subTest(policy=policy):
                 response = self.post(
                     texts=["hello world"], truncate=policy, max_tokens=2
@@ -392,15 +396,23 @@ class TestCohereEmbeddingHTTP(unittest.TestCase):
         self.manager.failure = ValueError("model rejected input")
         self.assert_error(self.post(texts=["hello"]))
         self.manager.failure = RuntimeError("test internal error")
-        self.assert_error(self.post(texts=["hello"]), 500)
+        error = self.assert_error(self.post(texts=["hello"]), 500)
+        self.assertEqual(error["type"], "InternalServerError")
+        self.assertEqual(error["message"], "Internal server error")
 
-    def test_serialization_errors_keep_json_envelope(self):
+    def test_nonfinite_float_output_is_an_error_but_base64_carries_it(self):
         async def nonfinite_result(request, raw_request):
             yield [{"embedding": [float("nan")], "meta_info": {"prompt_tokens": 1}}]
 
         self.manager.generate_request = nonfinite_result
-        error = self.assert_error(self.post(texts=["hello"]), 500)
-        self.assertEqual(error["type"], "InternalServerError")
+        for embedding_types in (["float"], ["float", "base64"]):
+            error = self.assert_error(
+                self.post(texts=["hello"], embedding_types=embedding_types), 500
+            )
+            self.assertEqual(error["type"], "InternalServerError")
+        response = self.post(texts=["hello"], embedding_types=["base64"])
+        self.assertEqual(response.status_code, 200, response.text)
+        self.assertEqual(response.json()["embeddings"], {"base64": ["AADAfw=="]})
 
     def test_direct_route_uses_shared_orjson_parser(self):
         route = next(
@@ -408,7 +420,7 @@ class TestCohereEmbeddingHTTP(unittest.TestCase):
             for route in http_server.app.routes
             if isinstance(route, APIRoute) and route.path == "/v2/embed"
         )
-        self.assertIs(type(route), http_server.ORJSONRoute)
+        self.assertIsInstance(route, http_server.ORJSONRoute)
         payload = b'{"texts":["hello"]}'
         with patch.object(
             http_server.orjson, "loads", wraps=http_server.orjson.loads
@@ -435,32 +447,104 @@ class TestCohereEmbeddingHTTP(unittest.TestCase):
                 )
         self.assertFalse(self.manager.requests)
 
-    def test_global_errors_respect_deployment_prefix(self):
-        self.app.root_path = "/gateway"
-        self.assert_error(self.client.post("/gateway/v2/embed", json={"texts": []}))
-        self.assert_error(
-            self.client.post(
-                "/gateway/v2/embed",
-                content="{",
-                headers={"content-type": "application/json"},
-            )
-        )
-        self.assertFalse(self.manager.requests)
-
-    def test_global_http_exception_keeps_cohere_envelope(self):
-        for status in (400, 404, 503):
+    def test_failures_outside_the_serving_lifecycle_keep_cohere_envelope(self):
+        for failure, status in (
+            (HTTPException(status_code=400, detail="test detail"), 400),
+            (HTTPException(status_code=404, detail="test detail"), 404),
+            (HTTPException(status_code=503, detail="test detail"), 503),
+            (RuntimeError("test detail"), 500),
+        ):
             with (
-                self.subTest(status=status),
-                patch.object(
-                    self.serving,
-                    "handle_request",
-                    side_effect=HTTPException(status_code=status, detail="test detail"),
-                ),
+                self.subTest(failure=failure),
+                patch.object(self.serving, "handle_request", side_effect=failure),
+                patch.object(serving_embedding.logger, "error"),
+                patch.object(serving_embedding.logger, "exception"),
             ):
                 error = self.assert_error(self.post(texts=["hello"]), status)
                 if status >= 500:
                     self.assertEqual(error["message"], "Internal server error")
                     self.assertEqual(error["type"], "InternalServerError")
+
+    def test_dependency_http_errors_keep_status_headers_and_envelope(self):
+        """An HTTP error raised by a route dependency keeps its status and headers;
+        Starlette's base class must not be reported as a 500."""
+        # The copied route resolves dependency overrides on the production app.
+        overrides = http_server.app.dependency_overrides
+        self.addCleanup(overrides.pop, http_server.validate_json_request, None)
+        for failure, error_type, message in (
+            (StarletteHTTPException(400, "client detail"), "BadRequestError", None),
+            (HTTPException(400, "client detail"), "BadRequestError", None),
+            (
+                StarletteHTTPException(
+                    503, "backend detail", headers={"Retry-After": "7"}
+                ),
+                "InternalServerError",
+                "Internal server error",
+            ),
+        ):
+
+            async def dependency(failure=failure):
+                raise failure
+
+            overrides[http_server.validate_json_request] = dependency
+            with (
+                self.subTest(failure=failure),
+                patch.object(serving_embedding.logger, "error") as log_error,
+            ):
+                response = self.client.post(
+                    "/v2/embed",
+                    json={"texts": ["hello"]},
+                    headers={"origin": "https://example.com"},
+                )
+                error = self.assert_error(response, failure.status_code)
+                self.assertEqual(error["type"], error_type)
+                self.assertEqual(error["message"], message or "client detail")
+                self.assertEqual(
+                    response.headers.get("retry-after"),
+                    (failure.headers or {}).get("Retry-After"),
+                )
+                self.assertIn(
+                    response.headers["access-control-allow-origin"],
+                    ("*", "https://example.com"),
+                )
+                self.assertEqual(log_error.call_count, failure.status_code >= 500)
+                if log_error.called:
+                    self.assertIn("backend detail", log_error.call_args.args[0])
+        self.assertFalse(self.manager.requests)
+
+    def test_body_read_failure_is_a_client_error(self):
+        """FastAPI turns a failed body read into a Starlette 400, not a 500."""
+        with patch.object(
+            http_server.ORJSONRequest, "body", side_effect=OSError("read failed")
+        ):
+            response = self.client.post(
+                "/v2/embed",
+                json={"texts": ["hello"]},
+                headers={"origin": "https://example.com"},
+            )
+        error = self.assert_error(response, 400)
+        self.assertEqual(error["type"], "BadRequestError")
+        self.assertIn(
+            response.headers["access-control-allow-origin"],
+            ("*", "https://example.com"),
+        )
+        self.assertFalse(self.manager.requests)
+
+    def test_engine_503_keeps_status_and_headers_and_logs_the_hidden_detail(self):
+        """A 503 raised by the engine stays a 503 with its Retry-After; the detail
+        is withheld from the client and must reach the server log instead."""
+        self.manager.failure = HTTPException(
+            status_code=503, detail="scheduler detail", headers={"Retry-After": "3"}
+        )
+        with patch.object(serving_embedding.logger, "error") as log_error:
+            response = self.post(texts=["hello"])
+        error = self.assert_error(response, 503)
+        self.assertEqual(error["type"], "InternalServerError")
+        self.assertEqual(error["message"], "Internal server error")
+        self.assertEqual(response.headers["retry-after"], "3")
+        log_error.assert_called_once()
+        self.assertIn("scheduler detail", log_error.call_args.args[0])
+        self.assertIn("503", log_error.call_args.args[0])
 
     def test_other_api_validation_formats_are_preserved(self):
         response = self.client.post("/v1/embeddings", json={})
@@ -471,14 +555,6 @@ class TestCohereEmbeddingHTTP(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json()["type"], "error")
         self.assertEqual(response.json()["error"]["type"], "invalid_request_error")
-        # Matching must be exact, not a broad startswith('/v2/embed').
-        self.app.add_api_route(
-            "/v2/embed-extra", http_server.cohere_v2_embed, methods=["POST"]
-        )
-        response = self.client.post("/v2/embed-extra", json={})
-        self.assertEqual(response.status_code, 400)
-        self.assertEqual(response.json()["object"], "error")
-        self.assertNotIn("error", response.json())
 
     def test_app_cors_applies_to_success_validation_and_internal_errors(self):
         headers = {"origin": "https://example.com"}

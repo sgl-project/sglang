@@ -245,7 +245,9 @@ For example, requesting an unknown task key on a model with no configured instru
 | --- | --- | --- |
 | 400 | `BadRequestError` | Invalid request fields, unsupported task or model capability, invalid output dimension, missing template, or token-limit violation. |
 | 404 | `NotFoundError` | The requested model is not served by this process. |
-| 500 | `InternalServerError` | Internal execution or response-serialization failure. |
+| 500 and other 5xx | `InternalServerError` | Internal execution or response-serialization failure, or a temporarily unavailable server. |
+
+Every 5xx response uses the generic message `Internal server error`; the detail is written to the server log. The response keeps its status code, such as 503, and headers such as `Retry-After`.
 
 Server authentication and scheduling also apply their existing checks.
 

@@ -1,6 +1,9 @@
 import asyncio
 import copy
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -17,6 +20,10 @@ from sglang.srt.managers.req_types import (
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_context
+from sglang.srt.tokenizer.tiktoken_tokenizer import (
+    DEFAULT_SPECIAL_TOKENS,
+    TiktokenTokenizer,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
@@ -229,9 +236,9 @@ class TestEmbeddingTruncationManager(unittest.IsolatedAsyncioTestCase):
                 text=texts, embedding_truncate="END", embedding_add_special_tokens=False
             )
             self.manager._tokenize_texts = AsyncMock(
-                return_value=([1, 2], None)
+                return_value=([1, 2], None, None)
                 if isinstance(texts, str)
-                else ([[1, 2], [3, 4]], None)
+                else ([[1, 2], [3, 4]], None, None)
             )
             if isinstance(texts, str):
                 await self.manager._tokenize_one_request(req)
@@ -405,38 +412,134 @@ class TestEmbeddingTruncationManager(unittest.IsolatedAsyncioTestCase):
                     )
                     self.assertEqual(result.input_ids, expected)
 
-    async def test_fast_slow_and_async_tokenization_propagate_special_masks(self):
-        for mode in ("fast", "slow", "async"):
-            with self.subTest(mode=mode):
-                tokenizer = Mock(
-                    spec=(
-                        PreTrainedTokenizer
-                        if mode == "slow"
-                        else PreTrainedTokenizerFast
-                    )
-                )
-                tokenizer.return_value = {
-                    "input_ids": [[1, 2, 99]],
-                    "special_tokens_mask": [[0, 0, 1]],
+    async def test_slow_tokenizer_special_tokens_survive_truncation(self):
+        """A slow tokenizer's BOS/EOS must be kept when its content is truncated."""
+
+        class SlowTokenizer(PreTrainedTokenizer):
+            def __init__(self):
+                self.vocab = {
+                    token: index
+                    for index, token in enumerate(["[UNK]", "[BOS]", "[EOS]", *"abcde"])
                 }
-                self.manager.tokenizer = tokenizer
-                self.manager.async_dynamic_batch_tokenizer = (
-                    SimpleNamespace(
-                        encode=AsyncMock(
-                            return_value={
-                                "input_ids": [1, 2, 99],
-                                "special_tokens_mask": [0, 0, 1],
-                            }
+                super().__init__(
+                    unk_token="[UNK]", bos_token="[BOS]", eos_token="[EOS]"
+                )
+
+            @property
+            def vocab_size(self):
+                return len(self.vocab)
+
+            def get_vocab(self):
+                return dict(self.vocab)
+
+            def _tokenize(self, text):
+                return text.split()
+
+            def _convert_token_to_id(self, token):
+                return self.vocab.get(token, 0)
+
+            def build_inputs_with_special_tokens(self, ids, pair_ids=None):
+                return [1, *ids, 2]
+
+            def get_special_tokens_mask(
+                self, ids, pair_ids=None, already_has_special_tokens=False
+            ):
+                return [1, *([0] * len(ids)), 1]
+
+        self.manager.tokenizer = SlowTokenizer()
+        texts = ["a b c d e", "e d c b a"]
+        for policy, expected in (
+            ("END", [[1, 3, 4, 2], [1, 7, 6, 2]]),
+            ("START", [[1, 6, 7, 2], [1, 4, 3, 2]]),
+        ):
+            with self.subTest(policy=policy):
+                single = [
+                    await self.manager._tokenize_one_request(
+                        self.request(
+                            text=text, embedding_truncate=policy, embedding_max_tokens=4
                         )
                     )
-                    if mode == "async"
-                    else None
+                    for text in texts
+                ]
+                batch = await self.manager._batch_tokenize_and_process(
+                    2,
+                    self.request(
+                        text=texts, embedding_truncate=policy, embedding_max_tokens=4
+                    ),
                 )
-                result = await self.manager._tokenize_texts(
-                    "text", return_special_tokens_mask=True
-                )
-                self.assertEqual(result, ([1, 2, 99], None, [0, 0, 1]))
-                tokenizer.encode.assert_not_called()
+                self.assertEqual([r.input_ids for r in single], expected)
+                self.assertEqual([r.input_ids for r in batch], expected)
+
+    async def test_tiktoken_text_is_tokenized_under_every_truncation_policy(self):
+        """The tiktoken wrapper adds no special tokens; END (the /v2/embed default)
+        and START must still tokenize plain text in the sync, batch, and async paths."""
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        path = Path(directory.name) / "tokenizer.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "regular_tokens": [
+                        {"bytes": [byte], "token": byte} for byte in range(256)
+                    ],
+                    "special_tokens": [
+                        {"bytes": list(text.encode()), "token": 256 + index}
+                        for index, text in enumerate(DEFAULT_SPECIAL_TOKENS)
+                    ],
+                    "word_split": "V1",
+                }
+            )
+        )
+        tokenizer = TiktokenTokenizer(str(path))
+        self.manager.tokenizer = tokenizer
+        texts = ["hello world", "world hello"]
+        for policy, budget, kept in (
+            (None, None, slice(None)),
+            ("NONE", None, slice(None)),
+            ("END", None, slice(None)),
+            ("END", 5, slice(0, 5)),
+            ("START", 5, slice(-5, None)),
+        ):
+            expected = [list(text.encode())[kept] for text in texts]
+            for mode in ("single", "batch", "async"):
+                with self.subTest(policy=policy, budget=budget, mode=mode):
+                    async_tokenizer = (
+                        AsyncDynamicbatchTokenizer(tokenizer)
+                        if mode == "async"
+                        else None
+                    )
+                    self.manager.async_dynamic_batch_tokenizer = async_tokenizer
+                    try:
+                        if mode == "batch":
+                            results = await self.manager._batch_tokenize_and_process(
+                                2,
+                                self.request(
+                                    text=texts,
+                                    embedding_truncate=policy,
+                                    embedding_max_tokens=budget,
+                                ),
+                            )
+                        else:
+                            # Sequential awaits keep each async call a lone string.
+                            results = [
+                                await self.manager._tokenize_one_request(
+                                    self.request(
+                                        text=text,
+                                        embedding_truncate=policy,
+                                        embedding_max_tokens=budget,
+                                    )
+                                )
+                                for text in texts
+                            ]
+                        self.assertEqual([r.input_ids for r in results], expected)
+                    finally:
+                        if async_tokenizer is not None:
+                            async_tokenizer._batcher_task.cancel()
+                            await asyncio.gather(
+                                async_tokenizer._batcher_task, return_exceptions=True
+                            )
+                            async_tokenizer._executor.shutdown()
+                        self.manager.async_dynamic_batch_tokenizer = None
 
     async def test_embedding_gemma_eos_is_included_in_special_mask(self):
         self.manager.model_config.is_embedding_gemma = True

@@ -97,6 +97,7 @@
   "/v1/score": "normal",
   "/v1/systemone": "normal",
   "/v1/tokenize": "normal",
+  "/v2/embed": "normal",
   "/vertex_generate": "normal",
   "/weights_checker": "admin_force"
 }

@@ -16,11 +16,14 @@
 from __future__ import annotations
 
 import json
+import logging
 from functools import lru_cache
 from typing import TYPE_CHECKING, Optional
 
 import jinja2
-from fastapi import HTTPException, Request
+from fastapi import HTTPException, Request, Response
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from transformers.utils import cached_file
 
 from sglang.srt.entrypoints.cohere.encoding import build_embed_response
@@ -37,6 +40,8 @@ from sglang.srt.parser.jinja_template_utils import process_content_for_template_
 if TYPE_CHECKING:
     from sglang.srt.managers.tokenizer_manager import TokenizerManager
     from sglang.srt.parser.template_manager import TemplateManager
+
+logger = logging.getLogger(__name__)
 
 
 def _string_instructions(value) -> dict[str, str]:
@@ -72,6 +77,48 @@ def _load_sentence_transformer_prompts(
         return {}
 
 
+def _http_error_response(
+    error: StarletteHTTPException, rid: Optional[str] = None
+) -> Response:
+    """Render an HTTP exception, keeping its status and headers (e.g. Retry-After)."""
+    if error.status_code >= 500:
+        # The client only sees a generic message, so the detail is kept here.
+        logger.error(
+            f"Cohere embedding request failed with HTTP {error.status_code}: "
+            f"{error.detail}, {rid=}"
+        )
+    return create_error_response(
+        str(error.detail), error.status_code, headers=error.headers
+    )
+
+
+def render_request_errors(handler):
+    """Wrap a route handler so failures raised around the endpoint function,
+    such as body validation and dependencies, also use the Cohere envelope."""
+
+    async def wrapped(request: Request):
+        try:
+            return await handler(request)
+        except RequestValidationError as error:
+            # Render only location and message; the offending input and the
+            # exception context are not guaranteed to be JSON-serializable.
+            return create_error_response(
+                "; ".join(
+                    f"{'.'.join(str(part) for part in item['loc'])}: {item['msg']}"
+                    for item in error.errors()
+                )
+            )
+        # The Starlette base class also covers FastAPI's subclass and the 400
+        # FastAPI raises itself when the request body cannot be read.
+        except StarletteHTTPException as error:
+            return _http_error_response(error)
+        except Exception:
+            logger.exception("Error handling Cohere embedding request")
+            return create_error_response("Internal server error", 500)
+
+    return wrapped
+
+
 class CohereServingEmbedding(OpenAIServingBase):
     """Use the common request lifecycle with a separate Cohere wire protocol."""
 
@@ -96,12 +143,9 @@ class CohereServingEmbedding(OpenAIServingBase):
         status_code: int = 400,
         param: Optional[str] = None,
     ):
-        # The shared lifecycle uses legacy OpenAI error names in some branches.
-        if status_code == 400:
-            err_type = "BadRequestError"
-        elif status_code == 404:
-            err_type = "NotFoundError"
-        return create_error_response(message, status_code, err_type, param)
+        # The status alone selects the Cohere type; the shared lifecycle
+        # passes legacy OpenAI names in err_type.
+        return create_error_response(message, status_code, param)
 
     def _validate_request(self, request: CohereEmbedRequest) -> Optional[str]:
         if self.tokenizer_manager.is_generation:
@@ -270,9 +314,19 @@ class CohereServingEmbedding(OpenAIServingBase):
         request: CohereEmbedRequest,
         raw_request: Request,
     ):
-        result = await self.tokenizer_manager.generate_request(
-            adapted_request, raw_request
-        ).__anext__()
+        try:
+            result = await self.tokenizer_manager.generate_request(
+                adapted_request, raw_request
+            ).__anext__()
+        except StarletteHTTPException as error:
+            # The shared lifecycle would drop the headers and log nothing.
+            return _http_error_response(error, adapted_request.rid)
         if not isinstance(result, list):
             result = [result]
-        return build_embed_response(request, result)
+        # Serialize once here; unrequested embedding types are omitted.
+        return Response(
+            content=build_embed_response(request, result).model_dump_json(
+                exclude_none=True
+            ),
+            media_type="application/json",
+        )

@@ -16,6 +16,9 @@ from sglang.srt.multimodal.processors.qwen_vl import (
     QwenVLImagePreprocessArtifact,
     QwenVLImageProcessor,
 )
+from sglang.srt.multimodal.transport.feature_transport import (
+    MultimodalFeatureTransport,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -69,7 +72,9 @@ def _processor(cls):
     processor.mm_processor_executor = None
     processor.image_config = None
     processor.FEATURE_NAMES = ()
-    processor.mm_feature_transport = "cpu"
+    processor._feature_transport = MultimodalFeatureTransport(
+        "cpu", base_gpu_id=0, skip_mm_pool=True
+    )
     processor.precompute_hash_before_cpu_transfer = False
     processor.IM_TOKEN_ID = 11
     processor.mm_tokens = MultimodalSpecialTokens(

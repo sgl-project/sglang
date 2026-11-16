@@ -181,23 +181,27 @@ class TestCohereErrorResponse(unittest.TestCase):
             },
         )
 
-    def test_explicit_status_type_and_param(self):
-        response = create_error_response(
-            "model unavailable",
-            status_code=404,
-            error_type="NotFoundError",
-            param="model",
-        )
-        self.assertEqual(response.status_code, 404)
-        self.assertEqual(
-            json.loads(response.body)["error"],
-            {
-                "message": "model unavailable",
-                "type": "NotFoundError",
-                "param": "model",
-                "code": 404,
-            },
-        )
+    def test_status_selects_type_and_server_errors_hide_detail(self):
+        for status, expected_type, expected_message in (
+            (404, "NotFoundError", "detail"),
+            (429, "BadRequestError", "detail"),
+            (500, "InternalServerError", "Internal server error"),
+            (503, "InternalServerError", "Internal server error"),
+        ):
+            with self.subTest(status=status):
+                response = create_error_response(
+                    "detail", status_code=status, param="model"
+                )
+                self.assertEqual(response.status_code, status)
+                self.assertEqual(
+                    json.loads(response.body)["error"],
+                    {
+                        "message": expected_message,
+                        "type": expected_type,
+                        "param": "model",
+                        "code": status,
+                    },
+                )
 
 
 if __name__ == "__main__":
