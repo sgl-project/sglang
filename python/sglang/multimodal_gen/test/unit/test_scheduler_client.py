@@ -157,6 +157,7 @@ def test_scheduler_isolates_invalid_messages_and_replies(invalid, reply_blocked)
     scheduler.receiver = receiver
     scheduler._socket_lock = threading.Lock()
     scheduler.server_args = SimpleNamespace(
+        causal_pipeline_mode="off",
         comfyui_mode=False,
         sp_degree=1,
         enable_cfg_parallel=False,

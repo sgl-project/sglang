@@ -85,6 +85,18 @@ def test_decode_mode_uses_released_tiled_recipe(mode):
     assert kwargs["decoder_parallel"] is False
 
 
+def test_physis_vae_uses_released_tiles_on_its_decoder_rank():
+    """The published H3 frames use overlapping 256px tiles, even on one GPU."""
+    from sglang.multimodal_gen.configs.pipeline_configs.physis_h3 import (
+        PhysisH3PipelineConfig,
+    )
+
+    _, kwargs = _init_kwargs(PhysisH3PipelineConfig().vae_config)
+    assert kwargs["decoder_tiling"] is True
+    assert (kwargs["tile_size"], kwargs["tile_overlap_min"]) == (256, 64)
+    assert kwargs["parallel_tiling"] is False
+
+
 @pytest.mark.parametrize("mode", ["spatial", "spatial_shard", "patch"])
 def test_unvalidated_decode_modes_are_rejected(mode):
     config = MiniMaxH3VideoVAEConfig(parallel_decode_mode=mode)
@@ -377,3 +389,73 @@ def test_fused_decoder_is_disabled_off_nvidia():
     ):
         decoder(latent)
     scale_add.assert_not_called()
+
+
+def test_diffusers_vae_checkpoint_preserves_attention_and_swiglu():
+    """Separate Q/K/V and value-first SwiGLU weights retain their projections."""
+    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3 import (
+        _convert_diffusers_video_vae_weights,
+    )
+    from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.base_module import (
+        FeedForward,
+    )
+
+    torch.manual_seed(13)
+    heads, head_dim, dim = 2, 16, 32
+    prefix = "decoder.transformer_blocks.0."
+    state = {"decoder.proj_in.weight": torch.randn(dim, 4)}
+    for part in ("q", "k", "v"):
+        state[f"{prefix}attn.to_{part}.weight"] = torch.randn(dim, dim)
+        state[f"{prefix}attn.to_{part}.bias"] = torch.randn(dim)
+    state[f"{prefix}ff.net.0.proj.weight"] = torch.randn(8 * dim, dim)
+    state[f"{prefix}ff.net.0.proj.bias"] = torch.randn(8 * dim)
+    state[f"{prefix}ff.net.2.weight"] = torch.randn(dim, 4 * dim)
+    state[f"{prefix}ff.net.2.bias"] = torch.randn(dim)
+    decoder = SimpleNamespace(
+        transformer_blocks=[
+            SimpleNamespace(attn=SimpleNamespace(heads=heads, dim_head=head_dim))
+        ],
+        mask_token=torch.zeros(1, 1, dim),
+    )
+    converted = _convert_diffusers_video_vae_weights(state, decoder)
+    hidden = torch.randn(2, 5, dim)
+    packed = torch.nn.functional.linear(
+        hidden,
+        converted[f"{prefix}attn.to_qkv.weight"],
+        converted[f"{prefix}attn.to_qkv.bias"],
+    ).view(2, 5, heads, 3 * head_dim)
+    for actual, part in zip(packed.chunk(3, dim=-1), ("q", "k", "v")):
+        expected = torch.nn.functional.linear(
+            hidden,
+            state[f"{prefix}attn.to_{part}.weight"],
+            state[f"{prefix}attn.to_{part}.bias"],
+        ).view(2, 5, heads, head_dim)
+        torch.testing.assert_close(actual, expected)
+
+    ff = FeedForward(dim, activation_fn="silu", use_gated=True)
+    ff.load_state_dict(
+        {
+            key.removeprefix(prefix + "ff."): value
+            for key, value in converted.items()
+            if key.startswith(prefix + "ff.")
+        }
+    )
+    value, gate = torch.nn.functional.linear(
+        hidden,
+        state[f"{prefix}ff.net.0.proj.weight"],
+        state[f"{prefix}ff.net.0.proj.bias"],
+    ).chunk(2, dim=-1)
+    expected = torch.nn.functional.linear(
+        value * torch.nn.functional.silu(gate),
+        state[f"{prefix}ff.net.2.weight"],
+        state[f"{prefix}ff.net.2.bias"],
+    )
+    torch.testing.assert_close(ff(hidden), expected)
+
+
+def test_diffusers_h3_vae_resolves_to_the_native_implementation():
+    """The published checkpoint loads without Diffusers exporting an H3 VAE."""
+    from sglang.multimodal_gen.runtime.models.registry import ModelRegistry
+
+    model_cls, _ = ModelRegistry.resolve_model_cls("AutoencoderKLMiniMaxH3")
+    assert model_cls is MiniMaxH3VideoVAE

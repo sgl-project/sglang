@@ -6,6 +6,7 @@ import json
 import multiprocessing as mp
 import os
 import pathlib
+import pickle
 import shutil
 import subprocess
 import sys
@@ -13,6 +14,8 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 from sglang.multimodal_gen.runtime.managers import worker_bootstrap
 
@@ -41,6 +44,46 @@ RUNTIME_IMPORT_SCRIPT = FIXTURES_DIR / "offline_script_runtime_import.py"
 PYTHON_ROOT = pathlib.Path(__file__).parents[4]
 EARLY_IMPORT_WARNING = "imported before this worker initialized its platform"
 SCRIPT_TIMEOUT_S = 300
+
+
+@pytest.mark.parametrize(
+    "mode,degree,explicit",
+    [
+        pytest.param("off", 1, False, id="defaults"),
+        pytest.param("off", 1, True, id="explicit-defaults"),
+        pytest.param("timestep", 4, True, id="timestep"),
+        pytest.param("block", 7, True, id="block"),
+        pytest.param("block", 1, True, id="single-denoising-rank"),
+    ],
+)
+def test_causal_snapshot_preserves_materialized_configuration(mode, degree, explicit):
+    """Omitting disabled defaults must preserve values, provenance and the caller."""
+    from sglang.multimodal_gen.runtime.server_args import ServerArgs
+
+    causal_fields = {"causal_pipeline_mode", "causal_pipeline_parallel_size"}
+    with patch.object(ServerArgs, "__post_init__"):
+        args = ServerArgs(
+            model_path="test",
+            causal_pipeline_mode=mode,
+            causal_pipeline_parallel_size=degree,
+            _explicit_arg_names=causal_fields if explicit else set(),
+        )
+    original = vars(args).copy()
+
+    payload = worker_bootstrap.ServerArgsPayload.capture(args)
+    snapshot = pickle.loads(payload._pickle)
+    if mode == "off":
+        assert causal_fields.isdisjoint(vars(snapshot))
+    else:
+        assert vars(snapshot) == original
+    assert vars(args) == original
+
+    restored = payload.materialize()
+    assert vars(restored) == original
+    assert restored.causal_pipeline_mode == mode
+    assert restored.causal_pipeline_parallel_size == degree
+    for name in causal_fields:
+        assert restored.is_arg_explicitly_set(name) == explicit
 
 
 def _install_fake_plugin_dist(root: pathlib.Path) -> None:
@@ -374,4 +417,4 @@ class TestOfflineScriptImportContract(unittest.TestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(pytest.main([__file__]))

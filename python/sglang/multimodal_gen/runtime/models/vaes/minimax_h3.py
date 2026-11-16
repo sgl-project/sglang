@@ -26,7 +26,54 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae.klvae import
 )
 
 
+def _convert_diffusers_video_vae_weights(state_dict, decoder):
+    """Restore the released H3 layout from a Diffusers-format checkpoint."""
+    converted = {}
+    for name, tensor in state_dict.items():
+        if name.startswith("encoder."):
+            name = (
+                name.replace(".down_blocks.", ".down.")
+                .replace(".resnets.", ".block.")
+                .replace(".downsamplers.0.", ".downsample.")
+                .replace(".conv_shortcut.", ".nin_shortcut.")
+            )
+        name = name.replace("decoder.proj_in.", "decoder.x_embedder.")
+        name = name.replace(".attn.to_out.0.", ".attn.to_out.")
+        if any(f".attn.to_{part}." in name for part in ("q", "k", "v")):
+            continue
+        if ".ff.net.0.proj." in name:
+            # Diffusers stores [value, gate]; the native SiLU uses [gate, value].
+            value, gate = tensor.chunk(2, dim=0)
+            tensor = torch.cat((gate, value), dim=0)
+            name = name.replace(".ff.net.0.proj.", ".ff.w1.")
+        name = name.replace(".ff.net.2.", ".ff.w2.")
+        converted[name] = tensor
+
+    for layer, block in enumerate(decoder.transformer_blocks):
+        prefix = f"decoder.transformer_blocks.{layer}.attn."
+        for suffix in ("weight", "bias"):
+            parts = [
+                state_dict[f"{prefix}to_{part}.{suffix}"] for part in ("q", "k", "v")
+            ]
+            # Native attention reads [head, qkv, head_dim], not [qkv, head, head_dim].
+            packed = torch.stack(
+                [
+                    part.unflatten(0, (block.attn.heads, block.attn.dim_head))
+                    for part in parts
+                ],
+                dim=1,
+            ).flatten(0, 2)
+            converted[f"{prefix}to_qkv.{suffix}"] = packed
+
+    # Diffusers omits this non-learned buffer; inference never applies masking.
+    converted["decoder.mask_token"] = state_dict["decoder.proj_in.weight"].new_zeros(
+        decoder.mask_token.shape
+    )
+    return converted
+
+
 class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
+    _aliases = ["AutoencoderKLMiniMaxH3"]
     layerwise_offload_dit_group_enabled = False
     # EncoderFCN3D indexes its down containers instead of calling them, so they
     # cannot host layerwise hooks. Keep the small encoder resident.
@@ -86,6 +133,11 @@ class MiniMaxH3VideoVAE(AutoencoderKLLegacy, LayerwiseOffloadableModuleMixin):
         # it for use_vae_fast_path and adds its attention fusion, so other
         # platforms keep the one-tile-per-forward decode.
         self._sgl_gate = VaeFastPathGate()
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        if "decoder.proj_in.weight" in state_dict:
+            state_dict = _convert_diffusers_video_vae_weights(state_dict, self.decoder)
+        return super().load_state_dict(state_dict, strict=strict, assign=assign)
 
     def prepare_decoder_autocast_weights(self, dtype) -> int:
         return self.decoder.prepare_autocast_linear_weights(dtype)

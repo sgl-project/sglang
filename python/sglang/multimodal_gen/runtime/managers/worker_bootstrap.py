@@ -19,6 +19,7 @@ Keep module scope limited to the standard library and import-neutral types.
 
 from __future__ import annotations
 
+import copy
 import logging
 import pickle
 import sys
@@ -86,6 +87,14 @@ class ServerArgsPayload:
 
     @classmethod
     def capture(cls, server_args: ServerArgs) -> ServerArgsPayload:
+        state = vars(server_args)
+        if (
+            state.get("causal_pipeline_mode") == "off"
+            and state.get("causal_pipeline_parallel_size") == 1
+        ):
+            server_args = copy.copy(server_args)
+            del server_args.causal_pipeline_mode
+            del server_args.causal_pipeline_parallel_size
         return cls(pickle.dumps(server_args, protocol=pickle.HIGHEST_PROTOCOL))
 
     def materialize(self) -> ServerArgs:
@@ -96,6 +105,11 @@ class ServerArgsPayload:
         server_args = pickle.loads(self._pickle)
         if not isinstance(server_args, ServerArgs):
             raise TypeError("Bootstrap payload did not contain diffusion ServerArgs")
+        state = vars(server_args)
+        state.setdefault("causal_pipeline_mode", ServerArgs.causal_pipeline_mode)
+        state.setdefault(
+            "causal_pipeline_parallel_size", ServerArgs.causal_pipeline_parallel_size
+        )
         return server_args
 
 
