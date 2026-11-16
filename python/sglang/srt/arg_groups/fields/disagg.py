@@ -134,10 +134,10 @@ class Disagg(msgspec.Struct):
     disaggregation_decode_tail_tokens: A[
         int,
         "Opt-in decode-side tail computation for PD disaggregation. The prefill "
-        "worker transfers KV for [0, N - W) of an N-token prompt and skips the "
-        "handoff-token sampling; the decode worker runs a real extend over the "
-        "last W prompt tokens and samples the first token itself, so grammar, "
-        "penalties, logprobs and a speculative drafter live entirely on decode. "
+        "worker transfers KV for [0, max(0, N - W)) and skips LM-head computation "
+        "and sampling; decode extends the remaining prompt and samples the "
+        "first token. Set the same W on both roles. Initially supports dense "
+        "full attention, without speculative decoding or logprob returns. "
         "0 keeps the current prefill-samples-the-first-token behavior.",
     ] = 0
 

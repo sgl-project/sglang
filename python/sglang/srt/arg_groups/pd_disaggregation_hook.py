@@ -105,8 +105,27 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
                 "--disaggregation-mode prefill or decode"
             )
         unsupported = []
-        if tail == 0:
-            unsupported.append("a tail of zero (drop the flag instead)")
+        if cfg.disaggregation_transfer_backend != "mooncake":
+            unsupported.append("transfer backends other than Mooncake")
+        from sglang.srt.configs.model_config import AttentionArch
+
+        model_config = model_config_of(server_args)
+        layer_types = getattr(model_config.hf_text_config, "layer_types", None)
+        if (
+            model_config.attention_arch != AttentionArch.MHA
+            or model_config.is_hybrid_swa
+            or (layer_types and any(layer != "full_attention" for layer in layer_types))
+        ):
+            unsupported.append(
+                "attention or recurrent state beyond dense full attention"
+            )
+        budget = cfg.max_prefill_tokens
+        if cfg.chunked_prefill_size is not None and cfg.chunked_prefill_size > 0:
+            budget = min(budget, cfg.chunked_prefill_size)
+        if tail > budget:
+            raise ValueError(
+                "--disaggregation-decode-tail-tokens must fit the prefill token budget"
+            )
         if resolved_view(server_args).speculative_algorithm is not None:
             unsupported.append(
                 "speculative decoding "
@@ -117,6 +136,8 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             unsupported.append("pipeline parallelism")
         if cfg.dp_size != 1:
             unsupported.append("data parallelism")
+        if cfg.ep_size != 1:
+            unsupported.append("expert parallelism")
         if cfg.attn_cp_size != 1 or cfg.dcp_size != 1:
             unsupported.append("context parallelism")
         if cfg.enable_two_batch_overlap:
@@ -127,6 +148,12 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             unsupported.append("LoRA")
         if cfg.enable_hisparse:
             unsupported.append("HiSparse")
+        if cfg.enable_pd_role_switch:
+            unsupported.append("dynamic PD role switching")
+        if cfg.disaggregation_decode_enable_radix_cache:
+            unsupported.append("decode radix caching")
+        if cfg.disaggregation_decode_host_receive_threshold < 1:
+            unsupported.append("host KV receive")
         if getattr(cfg, "dsv41_encoder_only_prefill", False):
             # #40874's field: only checked when that branch's arg exists.
             unsupported.append(

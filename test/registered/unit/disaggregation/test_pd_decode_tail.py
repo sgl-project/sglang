@@ -4,45 +4,45 @@ extend admission surface.
 With `--disaggregation-decode-tail-tokens W`, the prefill transfers KV for
 `[0, N - W)` of an N-token prompt and drops the handoff token at commit; the
 decode worker admits the request through a real extend over the last W prompt
-tokens (`prepare_for_tail_extend`) and samples the first token itself, so
-grammar, penalties, logprobs and a speculative drafter live entirely on
-decode. These tests pin the pure pieces of that contract; the end-to-end
-paired-worker behavior is covered by the PD disaggregation E2E suite.
+tokens (`prepare_for_tail_extend`) and samples the first token itself.
+Short prompts use a metadata-only handoff. Speculative decoding and logprob
+requests are outside this initial mode.
 """
 
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import sglang.srt.disaggregation.decode_schedule_batch_mixin as mixin_module
 import torch
-
 from sglang.srt.disaggregation import decode as decode_module
 from sglang.srt.disaggregation import prefill as prefill_module
-import sglang.srt.disaggregation.decode_schedule_batch_mixin as mixin_module
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
 from sglang.srt.disaggregation.utils import FAKE_BOOTSTRAP_HOST, pre_alloc_fill_len
+from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
-class TailTransferInputLenTest(unittest.TestCase):
+class TailTransferInputLenTest(CustomTestCase):
     def test_cap_stops_at_n_minus_w(self):
         self.assertEqual(prefill_module.tail_transfer_input_len(1000, 10), 990)
 
-    def test_short_prompt_falls_back_to_full_transfer(self):
-        # N <= W + 1 cannot leave both a non-empty transfer and a non-empty
-        # tail: the request falls back to the full transfer and the decode
-        # takes the prebuilt path (the handoff token stays authoritative).
-        self.assertEqual(prefill_module.tail_transfer_input_len(5, 10), 5)
-        self.assertEqual(prefill_module.tail_transfer_input_len(1, 10), 1)
-        self.assertEqual(prefill_module.tail_transfer_input_len(2, 10), 2)
-        self.assertEqual(prefill_module.tail_transfer_input_len(11, 10), 11)
+    def test_short_prompt_sends_only_metadata(self):
+        self.assertEqual(prefill_module.tail_transfer_input_len(5, 10), 0)
+        self.assertEqual(prefill_module.tail_transfer_input_len(1, 10), 0)
+        self.assertEqual(prefill_module.tail_transfer_input_len(2, 10), 0)
+        self.assertEqual(prefill_module.tail_transfer_input_len(11, 10), 1)
 
     def test_cap_is_identity_without_tail(self):
         self.assertEqual(prefill_module.tail_transfer_input_len(1000, 0), 1000)
 
 
-class IsTailTransferTest(unittest.TestCase):
+class IsTailTransferTest(CustomTestCase):
     """The commit gate: tail mode on, and the transfer is not fake warmup."""
 
     def _assert_gate(self, tail_tokens, req, expected):
@@ -76,12 +76,11 @@ class IsTailTransferTest(unittest.TestCase):
     def test_gate_closed_without_tail_mode(self):
         self._assert_gate(0, self._req(), False)
 
-    def test_handoff_token_marks_the_prebuilt_fallback(self):
-        # N <= W + 1: the prefill handoff token survives -> prebuilt path.
+    def test_resumed_output_keeps_the_prebuilt_path(self):
         self._assert_gate(8, self._req(with_handoff=True), False)
 
 
-class PrepareForTailExtendTest(unittest.TestCase):
+class PrepareForTailExtendTest(CustomTestCase):
     """The batch construction: the transferred rows are the attention prefix,
     the tail W tokens are the extend, and nothing is re-allocated."""
 
@@ -91,9 +90,12 @@ class PrepareForTailExtendTest(unittest.TestCase):
     def _make_req(self, index):
         return SimpleNamespace(
             rid=f"r{index}",
-            kv=SimpleNamespace(req_pool_idx=index, kv_committed_len=self.COMMITTED),
+            kv=ReqKvInfo(
+                req_pool_idx=index,
+                kv_committed_len=self.COMMITTED,
+                kv_allocated_len=self.PROMPT_LEN,
+            ),
             extend_end=self.PROMPT_LEN,
-            fill_ids=list(range(self.PROMPT_LEN)),
             origin_input_ids=list(range(self.PROMPT_LEN)),
             output_ids=[],
             is_retracted=False,
@@ -142,6 +144,18 @@ class PrepareForTailExtendTest(unittest.TestCase):
             (torch.arange(56, 64) + 100).tolist(),
         )
         self.assertEqual(batch.seq_lens_cpu.tolist(), [self.PROMPT_LEN])
+        self.assertEqual(req.kv.kv_committed_len, self.PROMPT_LEN)
+
+    def test_metadata_only_handoff_extends_one_token(self):
+        req = self._make_req(0)
+        req.kv.truncate_committed(0)
+        req.extend_end = 1
+        req.origin_input_ids = [42]
+        batch = self._prepare([req])
+        self.assertEqual(batch.prefix_lens, [0])
+        self.assertEqual(batch.input_ids.tolist(), [42])
+        self.assertEqual(batch.extend_lens, [1])
+        self.assertEqual(req.kv.kv_committed_len, 1)
 
     def test_two_requests_flatten_in_order(self):
         reqs = [self._make_req(0), self._make_req(1)]

@@ -28,8 +28,8 @@ class ScheduleBatchDisaggregationDecodeMixin:
 
         The transferred KV covers [0, committed) and lives in the request's
         preallocated req_to_token rows; the last W prompt tokens run through
-        the ordinary extend forward, so sampling, grammar, logprobs and
-        penalties are decode's own. The req's tree view stays root-bound
+        the ordinary extend forward, so sampling, grammar and penalties
+        use decode's own state. The req's tree view stays root-bound
         (prefix_len untouched) — the transferred prefix becomes reusable when
         the request finishes and the tree inserts it from the root.
 
@@ -48,7 +48,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
             )
         reqs = self.reqs
         seq_lens = []
-        pre_lens = []
         req_pool_indices = []
         input_ids: List[int] = []
 
@@ -60,14 +59,11 @@ class ScheduleBatchDisaggregationDecodeMixin:
         for i, req in enumerate(reqs):
             req_pool_indices.append(req.kv.req_pool_idx)
             committed = req.kv.kv_committed_len
-            assert committed is not None and 0 < committed <= req.extend_end, (
+            assert committed is not None and 0 <= committed < req.extend_end, (
                 f"rid={req.rid} committed={committed} extend_end={req.extend_end}"
             )
             pre_len = committed
             attention_prefix_lens.append(pre_len)
-            chunk = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx][
-                pre_len : req.extend_end
-            ]
             extend_len = req.extend_end - pre_len
             extend_lens.append(extend_len)
             total_size += extend_len
@@ -80,8 +76,10 @@ class ScheduleBatchDisaggregationDecodeMixin:
                 f"seq_len={seq_len}, pre_len={pre_len}, extend_len={extend_len}"
             )
             req.is_retracted = False
-            pre_lens.append(pre_len)
-            input_ids.extend(req.fill_ids[pre_len : req.extend_end])
+            input_ids.extend(req.origin_input_ids[pre_len : req.extend_end])
+            # The tail writes the already allocated slots in this forward,
+            # matching the normal extend path's commitment at allocation.
+            req.kv.commit_prealloc(req.extend_end)
 
         out_cache_loc = torch.empty(total_size, dtype=torch.int64, device=self.device)
         offset = 0
@@ -104,10 +102,6 @@ class ScheduleBatchDisaggregationDecodeMixin:
         self.orig_seq_lens = async_h2d(seq_lens, dtype=torch.int32, device=self.device)
         self.out_cache_loc = out_cache_loc
         self.seq_lens_sum = sum(seq_lens)
-
-        if self.return_logprob:
-            self.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
-            self.token_ids_logprobs = [r.logprob.token_ids_logprob for r in reqs]
 
         self.extend_num_tokens = total_size
         # The attention prefix is the transferred range, not the tree view.

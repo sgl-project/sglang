@@ -29,7 +29,6 @@ from typing import TYPE_CHECKING, Dict, List, Optional
 
 import numpy as np
 import torch
-
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.base.conn import StateType
 from sglang.srt.disaggregation.checksum import (
@@ -69,6 +68,7 @@ from sglang.srt.disaggregation.utils import (
     record_network_transfer,
     setup_state_kv_args,
     state_indices_per_entry,
+    tail_transfer_input_len,
 )
 from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
 from sglang.srt.environ import envs
@@ -189,20 +189,6 @@ class _DeviceRows:
 
     def __init__(self, ids: torch.Tensor):
         self.ids = ids
-
-
-def tail_transfer_input_len(prompt_len: int, tail_tokens: int) -> int:
-    """KV transfer length for decode-tail mode.
-
-    The decode worker recomputes the last W prompt tokens from a real extend,
-    so the transfer stops at N - W. For N <= W + 1 the split cannot leave both
-    a non-empty transfer and a non-empty tail, so the request falls back to
-    the full transfer (the decode side then takes the prebuilt path and the
-    handoff token stays authoritative).
-    """
-    if tail_tokens <= 0 or prompt_len <= tail_tokens + 1:
-        return prompt_len
-    return prompt_len - tail_tokens
 
 
 def _rows_on_host(payload):
@@ -1215,7 +1201,10 @@ class SchedulerDisaggregationPrefillMixin:
                     continue
 
                 req.output_ids.append(next_token_id)
-                if req.grammar is not None:
+                if (
+                    req.grammar is not None
+                    and not get_disagg().disaggregation_decode_tail_tokens
+                ):
                     try:
                         req.grammar.accept_token(next_token_id)
                     except ValueError as e:
@@ -1691,6 +1680,12 @@ class SchedulerDisaggregationPrefillMixin:
         end_idx: Optional[int] = None,
     ) -> None:
         computer: Optional[KvChecksumComputer] = self.kv_checksum_computer
+        tail = get_disagg().disaggregation_decode_tail_tokens
+        if tail:
+            end_idx = min(
+                req.extend_end if end_idx is None else end_idx,
+                tail_transfer_input_len(len(req.origin_input_ids), tail),
+            )
         if last_chunk and computer is not None:
             if is_health_check_req(req):
                 digest = signature = 0
@@ -1724,22 +1719,25 @@ class SchedulerDisaggregationPrefillMixin:
         start_idx = req.start_send_idx
         transfer_input_len = len(req.origin_input_ids)
         # Tail mode: the decode worker computes the last W prompt tokens from
-        # a real extend, so only [0, N - W) transfers. At least one token
-        # always transfers so the receiver's completion machinery sees a real
-        # KV chunk; the metadata buffer still describes the handoff.
+        # a real extend, so only [0, N - W) transfers. The common sender also
+        # supports an empty final chunk carrying only the metadata.
         tail = get_disagg().disaggregation_decode_tail_tokens
         if tail:
-            transfer_input_len = max(
-                1, transfer_input_len - min(tail, transfer_input_len - 1)
-            )
-        end_idx = (
-            end_idx if end_idx is not None else min(req.extend_end, transfer_input_len)
+            transfer_input_len = tail_transfer_input_len(transfer_input_len, tail)
+        end_idx = min(
+            req.extend_end if end_idx is None else end_idx, transfer_input_len
         )
 
         if not last_chunk:
+            # The common sender recognizes the final chunk by its cumulative
+            # page count. Keep the last prefix page until the final forward has
+            # published metadata, even when an early cache hit covers it.
+            send_limit = transfer_input_len
+            if tail and send_limit > 0:
+                send_limit = (send_limit - 1) // page_size * page_size
             end_idx = min(
                 clamp_kv_send_end(req, self.tree_cache, end_idx=end_idx),
-                transfer_input_len,
+                send_limit,
             )
             # if not the last chunk and the last page is partial, delay the last partial page to the next send
             end_idx = end_idx - end_idx % page_size

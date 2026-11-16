@@ -74,6 +74,37 @@ destination registration. Older decode workers do not enforce this check. Keep
 `early` on both sides until every worker has been upgraded, then enable the new
 policy on both sides.
 
+## Decode-owned first-token sampling
+
+To keep first-token sampling on decode, set the same positive window on **both roles**:
+
+```bash
+--disaggregation-decode-tail-tokens 4
+```
+
+For an N-token prompt and window W, prefill sends KV for `[0, max(0, N-W))`.
+Decode reuses its preallocated prompt slots to run a real extend over the remaining
+`min(W, N)` tokens, then samples the first output token. Prefill skips LM-head
+computation and sampling. For `N <= W`, only readiness metadata transfers and decode
+computes the whole prompt. The existing handoff-token field carries an unused
+placeholder; clients should consume the decode response, as in ordinary HTTP PD.
+The default value zero preserves prefill-owned sampling.
+
+This initial mode supports dense full attention and Mooncake, with tensor
+parallelism and PP/DP/CP/EP sizes of one. Both pools must use the same W and compatible
+model/KV layouts. W must fit the prefill token budget; tail batches obey both the
+chunked-prefill and maximum-prefill token budgets.
+
+Speculative decoding, hybrid/recurrent attention, LoRA, HiSparse, mixed chunking,
+two-batch overlap, decode radix caching, host KV receive and dynamic PD role
+switching are rejected in this mode. Requests returning logprobs, hidden states or
+sampling masks are rejected before admission. Further attention/state families and
+checkpoint-loading changes for engines without an LM-head module are follow-up work;
+the standard model loader still loads the usual checkpoint weights.
+
+The tail adds computation to decode and removes the same tail from the KV transfer.
+Compare TTFT and throughput for your workload when enabling it.
+
 ## Profiling in PD Disaggregation Mode
 
 When you need to profile prefill or decode workers in PD disaggregation mode, please refer to the [Profile In PD Disaggregation Mode](../developer_guide/benchmark_and_profiling#profile-in-pd-disaggregation-mode) section in the Benchmark and Profiling guide. Due to torch profiler limitations, prefill and decode workers must be profiled separately using dedicated command-line options.

@@ -27,7 +27,6 @@ import msgspec
 import numpy as np
 import torch
 import torch.distributed as dist
-
 from sglang.srt.configs.model_config import get_dsa_mtp_topk_width, is_deepseek_dsa
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
@@ -35,10 +34,7 @@ from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import GroupCoordinator
 from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import (
-    get_disagg,
-    get_spec,
-)
+from sglang.srt.runtime_context import get_disagg, get_spec
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.msgpack_utils import enc_hook, ext_hook
 
@@ -329,6 +325,11 @@ def _is_fake_transfer(req: Req) -> bool:
         req.bootstrap_host is None
         and get_disagg().disaggregation_transfer_backend == "fake"
     )
+
+
+def tail_transfer_input_len(prompt_len: int, tail_tokens: int) -> int:
+    """Prompt prefix sent by a decode-tail prefill; short prompts send metadata only."""
+    return max(0, prompt_len - tail_tokens)
 
 
 def pre_alloc_fill_len(req: Req) -> int:

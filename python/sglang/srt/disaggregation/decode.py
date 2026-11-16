@@ -29,22 +29,12 @@ from collections import deque
 from concurrent.futures import Future
 from dataclasses import dataclass
 from http import HTTPStatus
-from typing import (
-    TYPE_CHECKING,
-    Any,
-    Callable,
-    Dict,
-    List,
-    Optional,
-    Sequence,
-    Tuple,
-)
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import msgspec
 import numpy as np
 import torch
 import torch.distributed as dist
-
 from sglang.srt.configs.mamba_utils import Mamba2CacheParams
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.disaggregation.base import KVPoll
@@ -92,12 +82,12 @@ from sglang.srt.disaggregation.utils import (
     record_network_transfer,
     setup_state_kv_args,
     state_indices_per_entry,
+    tail_transfer_input_len,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import dsa_index_k_page_tokens
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import NextBatchPlan, ScheduleBatch
-from sglang.srt.runtime_context import get_schedule
 from sglang.srt.managers.scheduler_components.pool_stats_observer import (
     kv_private_tokens,
     kv_private_window_tokens,
@@ -109,10 +99,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     move,
 )
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
-from sglang.srt.managers.utils import (
-    GenerationBatchResult,
-    is_war_barrier_enabled,
-)
+from sglang.srt.managers.utils import GenerationBatchResult, is_war_barrier_enabled
 from sglang.srt.mem_cache.allocation import ensure_mamba_capacity
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
 from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
@@ -169,6 +156,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
     get_parallel,
+    get_schedule,
 )
 from sglang.srt.utils import ceil_align, is_npu, rank_consensus_checker
 from sglang.srt.utils.device import async_h2d
@@ -210,9 +198,6 @@ def _is_tail_transfer(req: Req) -> bool:
     are dropped at commit. Module-level: the transfer queue, the prebuilt
     admission and the tail-extend admission all gate on it.
     """
-    # Requests whose prompt was too short for the split (N <= W + 1) transfer
-    # everything and carry the prefill handoff token — they take the prebuilt
-    # path instead of the tail extend.
     return (
         get_disagg().disaggregation_decode_tail_tokens > 0
         and not _is_fake_transfer(req)
@@ -3497,7 +3482,13 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             # tokens from a real extend and samples the first token itself,
             # so the prefill's handoff token is dropped here (grammar,
             # penalties and logprobs apply on decode's own sample).
-            pass
+            req = decode_req.req
+            req.kv.truncate_committed(
+                tail_transfer_input_len(
+                    len(req.origin_input_ids),
+                    get_disagg().disaggregation_decode_tail_tokens,
+                )
+            )
         else:
             if _is_fake_transfer(decode_req.req):
                 committed_output_id = _generate_fake_prefill_handoff_output_id(
@@ -4223,6 +4214,8 @@ class SchedulerDisaggregationDecodeMixin:
         # A tail-extend batch ran last iteration: merge its requests into the
         # running decode batch (the standard prefill->decode transition).
         last = self.last_batch
+        if last is not None and getattr(last, "pd_tail_extend", False):
+            last.filter_batch()
         if (
             last is not None
             and last is not running_batch
@@ -4352,7 +4345,7 @@ class SchedulerDisaggregationDecodeMixin:
             # range, not the full prompt the request will eventually hold.
             seq_len = (
                 req.kv.kv_committed_len
-                if req.kv.kv_committed_len
+                if _is_tail_transfer(req)
                 else len(req.origin_input_ids)
             )
             # The tree cache owns [0, cache_protected_len): the prefix this
@@ -4429,7 +4422,7 @@ class SchedulerDisaggregationDecodeMixin:
 
         The transferred KV covers [0, N - W) and lives in the request's
         preallocated rows; the tail W tokens run through the ordinary extend
-        forward so sampling, grammar, logprobs and penalties are decode's own.
+        forward so sampling, grammar and penalties use decode's own state.
         """
         if get_disagg().disaggregation_decode_tail_tokens <= 0:
             return None
@@ -4442,8 +4435,14 @@ class SchedulerDisaggregationDecodeMixin:
         # The tail forward is W tokens per request; keep the batch inside the
         # chunked-prefill budget the same way a local prefill would be.
         tail = get_disagg().disaggregation_decode_tail_tokens
-        chunk_budget = max(1, get_schedule().chunked_prefill_size // max(tail, 1))
-        max_admit = min(num_not_used_batch, chunk_budget)
+        schedule = get_schedule()
+        token_budget = schedule.max_prefill_tokens
+        if (
+            schedule.chunked_prefill_size is not None
+            and schedule.chunked_prefill_size > 0
+        ):
+            token_budget = min(token_budget, schedule.chunked_prefill_size)
+        max_admit = min(num_not_used_batch, token_budget // tail)
 
         can_run_list: List[Req] = []
         for req in self.waiting_queue:
