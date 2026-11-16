@@ -2146,6 +2146,31 @@ class TestEstimatedPerfConstants(CustomTestCase):
             self.reporter._linear_flops_per_token, 6.0 * 256 * 1024 * 2
         )
 
+    def test_pure_ssm_has_zero_mlp_cost(self):
+        # FalconMamba/Mamba/Mamba2 layers are a Mamba mixer only -- no MLP
+        # sublayer at all (see PURE_SSM_ARCHITECTURES in model_config.py).
+        # hf_text_config.intermediate_size on these configs is the SSM
+        # mixer's own inner/expand dimension (d_inner), not an FFN size, and
+        # must not be charged as fake FFN FLOPs/bytes. Confirmed against
+        # falcon-mamba-7b, whose real intermediate_size is the mixer's
+        # d_inner (~2x hidden_size with the default expand factor) -- before
+        # this fix, charging it as an FFN size on every layer was inflating
+        # MFU/MBU past 100%.
+        config = _fake_model_config(
+            hidden_size=256,
+            num_attention_layers=2,
+            head_dim=0,
+            num_attn_heads=0,
+            num_kv_heads=0,
+            attention_arch=AttentionArch.SSM,
+            full_attention_layer_ids=[],
+            hf_text_config_overrides={"intermediate_size": 512},
+        )
+        self._init(config)
+        self.assertEqual(self.reporter._linear_flops_per_token, 0.0)
+        self.assertEqual(self.reporter._weight_read_bytes_per_token, 0.0)
+        self.assertEqual(self.reporter._ffn_act_bytes_per_token, 0.0)
+
 
 if __name__ == "__main__":
     unittest.main()

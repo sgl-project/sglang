@@ -618,6 +618,21 @@ class SchedulerMetricsReporter:
                 else num_layers
             )
             num_mlp_layers = num_layers
+
+        # Pure Mamba/SSM stacks (FalconMamba, Mamba, Mamba2 -- see
+        # PURE_SSM_ARCHITECTURES in model_config.py) have no MLP sublayer at
+        # all: every layer is just a Mamba mixer. Neither convention above
+        # expresses "zero MLP layers", so without this they fall through to
+        # `num_mlp_layers = num_layers` and get charged a fake FFN cost built
+        # from `hf_text_config.intermediate_size` -- on these configs that
+        # field is the SSM mixer's own inner/expand dimension (d_inner), not
+        # an FFN size, so the fabricated cost has no basis in the real model.
+        # This was inflating FLOPs/weight-bytes enough to push MFU/MBU over
+        # 100% on falcon-mamba-7b(-instruct). The real Mamba-mixer FLOPs/bytes
+        # aren't estimated here (follow-up); zeroing is the honest fallback.
+        if getattr(model_config, "attention_arch", None) == AttentionArch.SSM:
+            num_mlp_layers = 0.0
+
         head_dim = float(getattr(model_config, "head_dim", 0))
         num_attn_heads = float(
             model_config.get_num_attention_heads(get_parallel().tp_size)
