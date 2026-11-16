@@ -573,6 +573,7 @@ POSITIONAL_FIELD_ORDER = (
     "hybrid_cache_checkpoints_level",
     "disaggregation_max_top_logprobs_num",
     "shortest_prefill_aging_factor",
+    "enable_token_space_processor",
     "speculative_use_fly",
     "speculative_fly_window_size",
     "speculative_fly_entropy_threshold",

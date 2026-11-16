@@ -25,6 +25,8 @@ import argparse
 
 import requests
 
+from sglang.srt.environ import envs
+
 
 def _parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -35,6 +37,13 @@ def _parse_args(argv=None) -> argparse.Namespace:
         default=None,
         choices=["debug", "info", "warning", "error", "critical"],
         help="Set runtime log level",
+    )
+    parser.add_argument(
+        "--admin-api-key",
+        type=str,
+        default=envs.SGLANG_ADMIN_API_KEY.get(),
+        help="The server's --admin-api-key, which /configure_logging requires "
+        "(default: SGLANG_ADMIN_API_KEY).",
     )
     parser.add_argument(
         "--log-requests", action=argparse.BooleanOptionalAction, default=None
@@ -74,5 +83,13 @@ def _build_payload(args: argparse.Namespace) -> dict:
 
 if __name__ == "__main__":
     args = _parse_args()
-    response = requests.post(args.url + "/configure_logging", json=_build_payload(args))
+    response = requests.post(
+        args.url + "/configure_logging",
+        json=_build_payload(args),
+        headers=(
+            {"Authorization": f"Bearer {args.admin_api_key}"}
+            if args.admin_api_key
+            else {}
+        ),
+    )
     assert response.status_code == 200
