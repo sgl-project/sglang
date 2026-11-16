@@ -570,6 +570,7 @@ class GlmImageAttention(torch.nn.Module):
             dropout_rate=0,
             softmax_scale=None,
             causal=False,
+            supported_attention_backends=supported_attention_backends,
         )
 
     def forward(

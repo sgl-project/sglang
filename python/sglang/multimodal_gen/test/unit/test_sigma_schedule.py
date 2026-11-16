@@ -5,6 +5,9 @@ import pytest
 import torch
 from diffusers import EulerDiscreteScheduler
 
+from sglang.multimodal_gen.runtime.models.schedulers.scheduling_dpm_solver_multistep import (
+    DPMSolverMultistepScheduler,
+)
 from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler_discrete import (
     FlowMatchEulerDiscreteScheduler,
 )
@@ -52,3 +55,24 @@ def test_sigma_schedule_conversion_and_steps(cls, schedule, bounds):
         assert torch.isfinite(sample).all()
         outputs.append(sample)
     torch.testing.assert_close(*outputs, rtol=0, atol=0)
+
+
+def test_dpm_solver_set_shift_reaches_the_flow_sigma_schedule():
+    """set_shift changes the flow sigmas the next set_timesteps builds, exactly
+    as constructing the scheduler with that flow_shift does."""
+    flow = {"use_flow_sigmas": True, "prediction_type": "flow_prediction"}
+    shifted = DPMSolverMultistepScheduler(flow_shift=1.0, **flow)
+    shifted.set_shift(3.0)
+    shifted.set_timesteps(8)
+    built = DPMSolverMultistepScheduler(flow_shift=3.0, **flow)
+    built.set_timesteps(8)
+    assert torch.equal(shifted.sigmas, built.sigmas)
+    assert torch.equal(shifted.timesteps, built.timesteps)
+
+
+def test_flow_match_euler_scheduler_is_truthy():
+    """A scheduler instance is never falsy: `batch.scheduler or default` would
+    otherwise drop the request's own scheduler."""
+    scheduler = FlowMatchEulerDiscreteScheduler()
+    assert scheduler
+    assert len(scheduler) == scheduler.config.num_train_timesteps

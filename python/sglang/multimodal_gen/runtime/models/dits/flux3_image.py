@@ -62,6 +62,7 @@ from sglang.multimodal_gen.runtime.layers.quantization.configs.base_config impor
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
     get_forward_context,
+    get_forward_context_or_none,
     set_forward_context,
 )
 from sglang.multimodal_gen.runtime.models.dits.flux3 import (
@@ -690,16 +691,19 @@ class Flux3ImageDiT(Flux3Transformer):
         # Native attention resolves its impl from a runtime ForwardContext; keep
         # an outer timestep (set by the denoise loop) so Sol-Attn can keep its
         # first N steps dense.
-        try:
-            ctx = get_forward_context()
-            timestep = int(ctx.current_timestep)
-            attn_metadata = ctx.attn_metadata
-        except AssertionError:
-            timestep = 0
-            attn_metadata = None
-        with set_forward_context(
-            current_timestep=timestep, attn_metadata=attn_metadata
-        ):
+        outer = get_forward_context_or_none()
+        if outer is None:
+            context = set_forward_context(current_timestep=0, attn_metadata=None)
+        else:
+            # The layers inside the blocks read the request and its quality
+            # tier from the context entered here.
+            context = set_forward_context(
+                current_timestep=int(outer.current_timestep),
+                attn_metadata=outer.attn_metadata,
+                forward_batch=outer.forward_batch,
+                quality=outer.quality,
+            )
+        with context:
             self._prepare_trtllm_gen_sage_metadata(packed)
             return self._forward_packed(packed)
 

@@ -18,6 +18,7 @@ from sglang.kernels.spec import KernelBackend, PlatformInfo
 from sglang.multimodal_gen.configs.pipeline_configs.flux3_image import (
     flux3_image_dit_config,
 )
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.layers import flux3_fused_ops, linear
 from sglang.multimodal_gen.runtime.layers.flux3_fused_ops import (
     flux3_gated_mlp,
@@ -38,6 +39,7 @@ from sglang.multimodal_gen.runtime.loader.utils import (
     hf_to_custom_state_dict,
 )
 from sglang.multimodal_gen.runtime.managers.forward_context import (
+    get_forward_context,
     set_forward_context,
 )
 from sglang.multimodal_gen.runtime.models.dits import flux3_image
@@ -56,6 +58,7 @@ from sglang.multimodal_gen.runtime.models.dits.flux3_image import (
 from sglang.multimodal_gen.runtime.pipelines.flux3_image_weights import (
     resolve_flux3_image_dit_quant_config,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 
 _TINY = dict(
     hidden_size=256,
@@ -243,6 +246,43 @@ def test_packed_cfg_forward_matches_flux3_transformer_per_sample(
         packed.static = None
         uncached = native(packed)["image"]
         torch.testing.assert_close(reused, uncached, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA kernels")
+def test_blocks_see_the_request_of_the_denoise_loop(request):
+    """The context the DiT enters for its blocks keeps the request, quality tier
+    and timestep of the denoise loop's context, so request-gated layers inside
+    the blocks are not switched off."""
+    request.getfixturevalue("single_process_model_parallel")
+    model = _tiny_native_dit()
+    seen = []
+
+    class FirstBlockReached(Exception):
+        pass
+
+    def capture_context(_module, _inputs):
+        seen.append(get_forward_context())
+        # the context is all this test reads; skip the attention kernels
+        raise FirstBlockReached
+
+    model.content_mode_blocks["image"][0].register_forward_pre_hook(capture_context)
+    forward_batch = Req(sampling_params=SamplingParams(prompt="test"))
+    packed = _pack([_sample(3, image_cond=False)])
+    with (
+        torch.inference_mode(),
+        set_forward_context(
+            current_timestep=3,
+            attn_metadata=None,
+            forward_batch=forward_batch,
+            quality="lossless",
+        ),
+        pytest.raises(FirstBlockReached),
+    ):
+        model(packed)
+    (context,) = seen
+    assert context.forward_batch is forward_batch
+    assert context.quality == "lossless"
+    assert context.current_timestep == 3
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="needs CUDA kernels")
