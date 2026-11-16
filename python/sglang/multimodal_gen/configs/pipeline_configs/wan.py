@@ -275,7 +275,6 @@ class FastWan2_1_T2V_480P_Config(WanT2V480PConfig):
 class Wan2_2_TI2V_5B_Config(WanT2V480PConfig, WanI2VCommonConfig):
     flow_shift: float | None = 5.0
     task_type: ModelTaskType = ModelTaskType.TI2V
-    expand_timesteps: bool = True
     vae_decode_precision: str = "fp32"
     # ti2v, 5B
     vae_stride = (4, 16, 16)
@@ -292,7 +291,6 @@ class Wan2_2_TI2V_5B_Config(WanT2V480PConfig, WanI2VCommonConfig):
     def __post_init__(self) -> None:
         self.vae_config.load_encoder = True
         self.vae_config.load_decoder = True
-        self.dit_config.expand_timesteps = self.expand_timesteps
 
 
 @dataclass
