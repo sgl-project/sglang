@@ -460,6 +460,8 @@ class NixlEPDispatcher(BaseDispatcher):
         async_finish: bool = False,
         return_recv_hook: bool = False,
     ):
+        super().__init__()
+
         self.deepep_mode = deepep_mode
 
         common_kwargs = dict(

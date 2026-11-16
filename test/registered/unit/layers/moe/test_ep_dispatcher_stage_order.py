@@ -1,6 +1,7 @@
-"""CPU tests for the dispatch/combine stage order of the EP token dispatchers."""
+"""CPU tests for the staged wrapper classes of the EP token dispatchers."""
 
 import unittest
+from unittest.mock import patch
 
 from sglang.srt.layers.moe.token_dispatcher import deepep, mooncake, nixl, pplx
 from sglang.srt.layers.moe.token_dispatcher.base import BaseDispatcher
@@ -86,6 +87,27 @@ class TestEPDispatcherStageOrder(CustomTestCase):
                     dispatcher._low_latency_dispatcher.calls,
                     ["dispatch_a", "dispatch_b", "combine_a", "combine_b"] * 2,
                 )
+
+
+class TestNixlDispatcherBaseState(CustomTestCase):
+    def test_hooks_register_on_a_constructed_dispatcher(self):
+        """A constructed NIXL dispatcher must carry the BaseDispatcher state, so
+        a post-dispatch hook registered on it sees the dispatch output."""
+        with patch.object(
+            nixl, "_NixlEPDispatcherImpl", lambda **kwargs: _RecordingImpl()
+        ):
+            dispatcher = nixl.NixlEPDispatcher(group=None, router_topk=8)
+        self.assertEqual(dispatcher.quant_config, {})
+        self.assertIsNone(dispatcher.overlap_args)
+
+        seen = []
+        dispatcher.register_post_dispatch_hook(
+            lambda _dispatcher, dispatch_output: seen.append(dispatch_output)
+        )
+        output = dispatcher.dispatch(hidden_states=None, topk_output=None)
+
+        self.assertEqual(output, "dispatch_output")
+        self.assertEqual(seen, ["dispatch_output"])
 
 
 if __name__ == "__main__":
