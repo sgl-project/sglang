@@ -76,6 +76,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
             req_to_host_pool=torch.full((2, 16), -1, dtype=torch.int64),
             req_to_host_pool_allocated_len=torch.tensor([0, 3]),
             host_token_len=lambda n: n,
+            padded_buffer_size=8,
+            spec_swap=SimpleNamespace(scratch_capacity=2),
         )
         coordinator.req_to_host_pool[row, :3] = torch.tensor([20, 21, 22])
         fenced = []
@@ -91,12 +93,18 @@ class TestDecodeQueueCleanup(CustomTestCase):
         move([needs_row, req], queue.retracted_queue)
         queue.draft_kv_ring = None
         queue.req_to_token_pool = rows
+        # One in-flight transfer already reserves a padded cache plus scratch.
+        queue.transfer_queue = SimpleNamespace(queue=[object()])
+        device_tokens = [19]
         queue.token_to_kv_pool_allocator = SimpleNamespace(
             page_size=1,
             device="cpu",
             state=None,
             pools_share_memory=False,
             alloc_logical_only=lambda **kw: torch.tensor([5, 6, 7]),
+            hisparse_attn_allocator=SimpleNamespace(
+                available_size=lambda: device_tokens[0]
+            ),
         )
         queue.tree_cache = SimpleNamespace(maybe_hand_to_session=lambda req: None)
         queue.scheduler = SimpleNamespace(
@@ -115,6 +123,14 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._prealloc_demand = lambda *args, **kw: None
         queue._admit_preallocation = lambda *args, **kw: True
         ready = IndexedReqList(ListKind.WAITING)
+        # Logical room alone cannot serve recovery: only nine physical slots
+        # remain after the transfer's reservation, while recovery needs ten.
+        self.assertEqual(queue.move_resumed(ready), [])
+        self.assertEqual(list(queue.retracted_queue), [needs_row, req])
+        self.assertTrue(req.hisparse_retraction_pending)
+        self.assertTrue(req.is_retracted)
+        self.assertEqual(req.kv.req_pool_idx, row)
+        device_tokens[0] = 20
         self.assertEqual(queue.move_resumed(ready), [req])
         self.assertEqual(list(ready), [req])
         self.assertEqual(list(queue.retracted_queue), [needs_row])

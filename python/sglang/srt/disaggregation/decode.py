@@ -1363,6 +1363,8 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             if not hisparse_resume and self.req_to_token_pool.available_size() <= 0:
                 # A later HiSparse request may already own its row.
                 continue
+            if hisparse_resume and self._hisparse_request_budget() <= 0:
+                break
 
             if not ensure_mamba_capacity(
                 self.req_to_token_pool,
@@ -1432,6 +1434,22 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         move(resumed_reqs, dst)
 
         return resumed_reqs
+
+    def _hisparse_request_budget(self) -> int:
+        """Physical cache slots left after pending transfers' reservations.
+
+        Logical preallocation does not charge the HiSparse cache. Both fresh
+        admissions and retained resumes need a padded buffer plus spec scratch.
+        Waiting requests already own theirs; transfer requests do not yet.
+        """
+        coordinator = self.scheduler.hisparse_coordinator
+        per_req = (
+            coordinator.padded_buffer_size + coordinator.spec_swap.scratch_capacity
+        )
+        available = (
+            self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
+        )
+        return max(0, available // per_req - len(self.transfer_queue.queue))
 
     def _init_receiver(self, decode_req: DecodeRequest, prefill_dp_rank: int) -> None:
         decode_req.awaiting_prefill_dp_rank = False
@@ -1733,24 +1751,11 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 failed_reqs.append(decode_req)
                 indices_to_remove.add(i)
 
-        # HiSparse physical constraint: max requests by device buffer capacity.
-        # Each admitted req needs a padded buffer plus its speculative scratch.
-        # waiting_queue reqs already have device buffers (allocated in admit_request_direct),
-        # only transfer_queue reqs are pending device buffer allocation.
-        hisparse_req_budget = float("inf")
-        if self.scheduler.enable_hisparse:
-            coordinator = self.scheduler.hisparse_coordinator
-            per_req_device_tokens = (
-                coordinator.padded_buffer_size + coordinator.spec_swap.scratch_capacity
-            )
-            hisparse_avail = (
-                self.token_to_kv_pool_allocator.hisparse_attn_allocator.available_size()
-            )
-            hisparse_req_budget = max(
-                0,
-                hisparse_avail // per_req_device_tokens
-                - len(self.transfer_queue.queue),
-            )
+        hisparse_req_budget = (
+            self._hisparse_request_budget()
+            if self.scheduler.enable_hisparse
+            else float("inf")
+        )
 
         if self.scheduler.enable_lora:
             running_batches = (
