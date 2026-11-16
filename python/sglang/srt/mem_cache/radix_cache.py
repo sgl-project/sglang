@@ -366,6 +366,29 @@ class RadixCache(BasePrefixCache):
         )
         self.kv_events.record_all_cleared()
 
+    def peek_prefix_length(self, params: MatchPrefixParams) -> int:
+        """Count resident GPU-prefix slots without changing tree/LRU/locks.
+
+        Unlike match_prefix this never splits a node, concatenates tensors or
+        refreshes access times. It is for load observation, not admission.
+        """
+        key, _ = params.key.maybe_to_bigram_view(self.is_eagle)
+        if self.disable or not len(key):
+            return 0
+        key = key.page_aligned(self.page_size)
+        node, matched = self.root_node, 0
+        while len(key):
+            child = node.children.get(key.child_key(self.page_size))
+            if child is None:
+                break
+            length = child.key.match(key, page_size=self.page_size)
+            matched += length
+            if length < len(child.key):
+                break
+            node = child
+            key = key[length:]
+        return matched
+
     def match_prefix(self, params: MatchPrefixParams) -> MatchResult:
         """Find the longest cached prefix of ``key`` in the radix tree.
 

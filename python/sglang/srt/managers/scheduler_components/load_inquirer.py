@@ -86,7 +86,14 @@ class SchedulerLoadInquirer:
         cache_miss_rate = 1.0 - self.get_recent_cache_hit_rate()
         num_tokens = 0
         for req in self.get_waiting_queue():
-            if waiting_queue_prefix_matched:
+            observed = getattr(req, "_pending_prefix_observed_tokens", None)
+            if (
+                not waiting_queue_prefix_matched
+                and getattr(req, "_pending_prefix_probe_valid", False)
+                and observed is not None
+            ):
+                uncached = max(0, req.seqlen - observed)
+            elif waiting_queue_prefix_matched:
                 matched = req.num_matched_prefix_tokens
                 uncached = max(0, req.seqlen - matched)
                 if self.get_waiting_storage_span is not None:
