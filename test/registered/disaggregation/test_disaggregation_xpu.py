@@ -9,7 +9,7 @@ Level Zero transport; device addresses there have bit 63 set, which exercises
 the np.uint64 pointer arithmetic in disaggregation/nixl/conn.py.
 
 Requirements:
-    The ``sglang-router`` package, a mooncake-transfer-engine built with
+    The ``sgl-router`` binary, a mooncake-transfer-engine built with
     -DUSE_XPU=ON -DUSE_TENT=ON, and NIXL on a UCX built --with-ze (all installed
     by docker/xpu.Dockerfile).
 

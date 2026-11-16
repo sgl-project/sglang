@@ -19,20 +19,27 @@ class DllmReqPhase(str, enum.Enum):
 
 class ReqDllmMixin:
     def init_diffusion_llm(self: Req, dllm_config: DllmConfig):
-        self.dllm_phase: Optional[DllmReqPhase] = None
+        self.dllm_config = dllm_config
+        self.dllm_block_offset = 0
+        self.dllm_has_literal_mask = False
+        self.reset_dllm_progress()
+
+    def reset_dllm_progress(self: Req):
+        self.dllm_initialized = False
         self.dllm_incomplete_ids = array("q")
         self.dllm_algo_state = None
-        self.dllm_block_offset = 0
-        self.dllm_config = dllm_config
-        self.dllm_has_literal_mask = False
-
-        if self.dllm_config is not None:
-            if self.dllm_config.requires_separate_context_encoding:
-                self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
-            elif len(self.origin_input_ids) < self.dllm_config.block_size:
-                self.dllm_phase = DllmReqPhase.INCOMING_DECODE
-            else:
-                self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
+        self.dllm_phase: Optional[DllmReqPhase] = None
+        if self.dllm_config is None:
+            return
+        # A retracted request re-encodes its output too.
+        committed_len = len(self.origin_input_ids) + len(self.output_ids)
+        if (
+            self.dllm_config.requires_separate_context_encoding
+            or committed_len >= self.dllm_config.block_size
+        ):
+            self.dllm_phase = DllmReqPhase.INCOMING_PREFILL
+        else:
+            self.dllm_phase = DllmReqPhase.INCOMING_DECODE
 
     def is_dllm(self: Req) -> bool:
         return self.dllm_config is not None
