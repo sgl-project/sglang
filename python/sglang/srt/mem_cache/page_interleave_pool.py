@@ -1003,9 +1003,6 @@ class PageInterleaveDSATokenToKVPool(PageInterleaveMLATokenToKVPool, DSATokenToK
     just as consumers of ``get_key_buffer`` do. Outside an extend, raw getters
     expose owner-local storage; ``index_key_cache.get_local_buffer`` always
     exposes that storage.
-
-    This is a pool-level implementation. Model-runner selection still
-    requires separate integration.
     """
 
     def __init__(
