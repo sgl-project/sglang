@@ -99,8 +99,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseBreakableGraphBackend
         self._shared_output_buffer: Optional[Any] = None
         self._precarve = GraphPoolPrecarve()
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
-            and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+            enable=enable_memory_saver and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
         )
         if (
             self._memory_saver_adapter is not None

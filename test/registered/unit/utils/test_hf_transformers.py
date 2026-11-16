@@ -306,7 +306,11 @@ class TestGetTokenizerRevision(CustomTestCase):
             _resolve_local_or_cached_file=fake_cache_lookup,
         ):
             tokenizer_utils.get_tokenizer("org/model", **revision_kwargs)
-        return auto_tokenizer.from_pretrained.call_args.kwargs, tekken_probe, cache_lookups
+        return (
+            auto_tokenizer.from_pretrained.call_args.kwargs,
+            tekken_probe,
+            cache_lookups,
+        )
 
     def test_revision_selects_the_branch_of_every_tokenizer_file(self):
         """With `revision=`, the tekken probe and the post-load fix-ups must read

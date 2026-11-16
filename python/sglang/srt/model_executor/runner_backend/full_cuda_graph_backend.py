@@ -125,8 +125,7 @@ class FullCudaGraphBackend(BaseGraphBackend):
         self._reuse_output_buffer = reuse_output_buffer
         self._output_buffer: Optional[Any] = None
         self._memory_saver_adapter: Optional[Any] = TorchMemorySaverAdapter.create(
-            enable=enable_memory_saver
-            and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
+            enable=enable_memory_saver and envs.SGLANG_MEMORY_SAVER_CUDA_GRAPH.get()
         )
 
     @contextmanager

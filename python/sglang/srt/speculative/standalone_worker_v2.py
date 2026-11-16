@@ -1,8 +1,6 @@
 import logging
 from typing import Optional
 
-import torch
-
 from sglang.srt.configs.draft_parallel import DraftParallelSpec, DraftTPExecution
 from sglang.srt.layers.moe.utils import draft_model_build_scope
 from sglang.srt.managers.tp_worker import TpModelWorker

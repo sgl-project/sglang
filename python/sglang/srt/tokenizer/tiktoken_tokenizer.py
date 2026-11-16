@@ -2,7 +2,6 @@ import functools
 import json
 from typing import AbstractSet, Collection, List, Literal, Union
 
-
 RESERVED_TOKEN_TEXTS = [f"<|reserved_{i}|>" for i in range(3, 128)]
 CONTROL_TOKEN_TEXTS = [f"<|control{i}|>" for i in range(1, 705)]
 
