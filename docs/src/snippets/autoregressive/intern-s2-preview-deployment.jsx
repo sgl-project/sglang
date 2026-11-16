@@ -65,41 +65,28 @@ export const InternS2PreviewDeployment = () => {
   }, []);
 
   const handleRadioChange = (optionName, value) => {
-    setValues((prev) => {
-      if (prev.hardware === 'xeon' && optionName !== 'hardware') return prev;
-      const next = { ...prev, [optionName]: value };
-      if (optionName === 'hardware' && value === 'xeon') {
-        next.reasoning = 'disabled';
-        next.toolcall = 'disabled';
-        next.mtp = 'disabled';
-      }
-      return next;
-    });
+    setValues((prev) => ({ ...prev, [optionName]: value }));
   };
 
   const generateCommand = () => {
-    if (values.hardware === 'xeon') {
-      return `sglang serve \\
-  --model internLM/Intern-S2-Preview \\
-  --device cpu \\
-  --disable-overlap-schedule \\
-  --tp 4 \\
-  --host 0.0.0.0`;
-    }
     const { reasoning, toolcall, mtp } = values;
-    const tpValue = 8;
+    const tpValue = values.hardware !== 'xeon' ? 8 : 4;
 
     const flags = [];
     flags.push('  --model-path internLM/Intern-S2-Preview');
     flags.push(`  --tp ${tpValue}`);
     if (reasoning === 'enabled') flags.push('  --reasoning-parser qwen3');
     if (toolcall === 'enabled') flags.push('  --tool-call-parser qwen3_coder');
-    if (mtp === 'enabled') {
+    if (mtp === 'enabled' && values.hardware !== 'xeon') {
       flags.push('  --mamba-radix-cache-strategy extra_buffer');
       flags.push("  --speculative-algo 'NEXTN'");
       flags.push('  --speculative-eagle-topk 1');
       flags.push('  --speculative-num-steps 3');
       flags.push('  --speculative-num-draft-tokens 4');
+    }
+    if (values.hardware === 'xeon') {
+      flags.push('  --device cpu');
+      flags.push('  --disable-overlap-schedule')
     }
     flags.push('  --mem-fraction-static 0.8');
     flags.push('  --host 0.0.0.0');
@@ -159,9 +146,6 @@ export const InternS2PreviewDeployment = () => {
 
   return (
     <div style={containerStyle} className="not-prose">
-      {values.hardware === 'xeon' && (
-        <p>Before serving on CPU, export <code>SGLANG_USE_CPU_ENGINE=1</code> in your shell.</p>
-      )}
       {Object.entries(options).map(([key, option]) => (
         <div key={key} style={cardStyle}>
           <div style={titleStyle}>{option.title}</div>
@@ -170,11 +154,7 @@ export const InternS2PreviewDeployment = () => {
               const isChecked = values[option.name] === item.id;
               const isDisabled = values.hardware === 'xeon' && key !== 'hardware';
               return (
-                <label
-                  key={item.id}
-                  title={isDisabled ? 'Only basic text generation has been validated on Intel Xeon CPUs; parsers and MTP are not enabled.' : undefined}
-                  style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}), ...(isDisabled ? { opacity: 0.5, cursor: 'not-allowed' } : {}) }}
-                >
+                  <label key={item.id} style={{ ...labelBaseStyle, ...(isChecked ? checkedStyle : {}) }}>
                   <input
                     type="radio"
                     name={option.name}

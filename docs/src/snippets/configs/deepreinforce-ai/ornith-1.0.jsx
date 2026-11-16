@@ -2,7 +2,7 @@
 // The launch flags follow the SGLang quickstarts published on the model cards; the 9B recipe makes the single-GPU default explicit with --tp 1.
 // FP8 quantization cells use their FP8 repo ids from the collection with the same flags; their README quickstarts currently point to the non-FP8 repos.
 // Reasoning / tool-call parsers are exposed as a Playground toggle (qwen3 / qwen3_coder), not baked into the deploy cells.
-// GPU cells remain unverified until exact recipes are run and signed off.
+// Cells remain unverified until exact recipes are run and signed off.
 
 export const config = {
   modelName: "Ornith-1.0",
@@ -78,7 +78,6 @@ export const config = {
   playgroundFeatures: {
     normalizeDeltas: (deltas, derived, base) => base.hw === "xeon" ? {} : deltas,
     parsers: {
-      showWhen: (base) => base.hw !== "xeon",
       items: [
         { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser qwen3" },
         { id: "toolCall",  label: "Tool Call Parser", flag: "--tool-call-parser qwen3_coder" },
@@ -87,36 +86,6 @@ export const config = {
   },
 
   cells: [
-    {
-      match: { hw: "xeon", variant: "9b", quant: "bf16", strategy: "balanced", nodes: "single" },
-      verified: true,
-      warn: "Before serving on CPU, export SGLANG_USE_CPU_ENGINE=1 in your shell. Only basic text generation has been checked; full context, Playground overrides, dataset accuracy, and performance are unverified.",
-      env: [],
-      omitDefaultServerAddress: true,
-      flags: [
-        "--model deepreinforce-ai/Ornith-1.0-9B",
-        "--device cpu",
-        "--disable-overlap-schedule",
-        "--tp 6",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
-      match: { hw: "xeon", variant: "35b", quant: "bf16", strategy: "balanced", nodes: "single" },
-      verified: true,
-      warn: "Before serving on CPU, export SGLANG_USE_CPU_ENGINE=1 in your shell. Only basic text generation has been checked; full context, Playground overrides, dataset accuracy, and performance are unverified.",
-      env: [],
-      omitDefaultServerAddress: true,
-      flags: [
-        "--model deepreinforce-ai/Ornith-1.0-35B",
-        "--device cpu",
-        "--disable-overlap-schedule",
-        "--tp 6",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
     {
       match: { hw: "h200", variant: "397b", quant: "bf16", strategy: "balanced", nodes: "single" },
       env: [],
@@ -229,6 +198,34 @@ export const config = {
         "--served-model-name {{MODEL_NAME}}",
         "--tp 1",
         "--context-length 262144",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "xeon", variant: "9b", quant: "bf16", strategy: "balanced", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path deepreinforce-ai/Ornith-1.0-9B",
+        "--served-model-name {{MODEL_NAME}}",
+        "--device cpu",
+        "--disable-overlap-schedule",
+        "--tp 6",
+        "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "xeon", variant: "35b", quant: "bf16", strategy: "balanced", nodes: "single" },
+      env: [],
+      flags: [
+        "--model-path deepreinforce-ai/Ornith-1.0-35B",
+        "--served-model-name {{MODEL_NAME}}",
+        "--device cpu",
+        "--disable-overlap-schedule",
+        "--tp 6",
         "--mem-fraction-static 0.85",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",

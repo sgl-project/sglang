@@ -175,7 +175,6 @@ sgl-eval run aime25 \\
     // (`Auto-detected template features: reasoning_parser=poolside_v1, tool_call_parser=poolside_v1`),
     // so these are explicit-but-redundant on transformers ≥ 5.10.
     parsers: {
-      showWhen: (base) => base.hw !== "xeon",
       items: [
         { id: "reasoning", label: "Reasoning Parser", flag: "--reasoning-parser poolside_v1" },
         { id: "toolCall",  label: "Tool Call Parser", flag: "--tool-call-parser poolside_v1" },
@@ -186,21 +185,6 @@ sgl-eval run aime25 \\
   // Cells: (h200 × {bf16,fp8,int4} + b300/gb300 × {bf16,fp8,nvfp4,int4}) × {low-latency, high-throughput}.
   // Draft model precision always matches the target's.
   cells: [
-    {
-      match: { hw: "xeon", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
-      verified: true,
-      warn: "Before serving on CPU, export SGLANG_USE_CPU_ENGINE=1 in your shell. Only basic text generation has been checked; full context, Playground overrides, dataset accuracy, and performance are unverified.",
-      env: [],
-      omitDefaultServerAddress: true,
-      flags: [
-        "--model {{MODEL_NAME}}",
-        "--device cpu",
-        "--disable-overlap-schedule",
-        "--tp 4",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
 
     // ══════════════ NVIDIA Hopper H200 (8-GPU HGX) — BF16 / FP8 / INT4 — VERIFIED ══════════════
     // All 6 cells ran on 8×H200 with full-GSM8K accuracy (laguna-xs21-benchmarks.jsx).
@@ -614,6 +598,23 @@ sgl-eval run aime25 \\
         "--speculative-draft-model-path poolside/Laguna-XS-2.1-DFlash-INT4",
         "--page-size 1",
         "--mem-fraction-static 0.7",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+
+    {
+      match: { hw: "xeon", variant: "default", quant: "bf16", strategy: "high-throughput", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model {{MODEL_NAME}}",
+        "--device cpu",
+        "--trust-remote-code",
+        "--disable-overlap-schedule",
+        "--reasoning-parser poolside_v1",
+        "--tool-call-parser poolside_v1",
+        "--tp 4",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
