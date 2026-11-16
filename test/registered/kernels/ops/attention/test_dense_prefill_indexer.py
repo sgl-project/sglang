@@ -199,8 +199,9 @@ class TestFp4ToFp8(CustomTestCase):
                 )
 
     def test_exact_at_the_smallest_and_largest_block_exponents(self):
-        # ue8m0 exponents start at 1 (the quantizer's amax floor, which a zero block
-        # takes), so the fp32 scale 2**(top - 133) is subnormal below top = 7.
+        # Exponent bytes down to 1, the smallest the format holds (the quantizers
+        # floor block amax well above that), so the fp32 scale 2**(top - 133) is
+        # subnormal below top = 7.
         gen = torch.Generator(device="cuda").manual_seed(1)
         payload = torch.randint(
             -128, 128, (64, 64), dtype=torch.int8, device="cuda", generator=gen
