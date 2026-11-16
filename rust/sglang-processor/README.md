@@ -181,9 +181,8 @@ SGLang's Python gate resolves its spec, and a parity fixture checks it.
 
 ### prepared structural contract
 
-[Prepared multimodal inputs](PREPARED_INPUTS.md) describes the boundary between
-transport-level tensor checks and model-semantic import. The structural half is
-in `mm::prepared` (re-exported as `sglang_processor::prepared`):
+`mm::prepared` (re-exported as `sglang_processor::prepared`) provides
+transport-independent structural validation and native tensor decoding:
 
 ```rust
 PreparedInput::check(expected_profile, expected_fingerprint, &PreparedLimits)
