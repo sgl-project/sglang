@@ -155,7 +155,7 @@ export const AgentX = ({ data: input }) => {
     }
     return out;
   };
-  // Submissions record the Python router's flags; render the sgl-router command that
+  // Submissions record router flags that sgl-router does not all take; render the sgl-router command that
   // python/sglang/test/agentx_common.py launches for them, and keep the two in step.
   // sgl-router reads each worker's PD role from its /server_info, so one --worker-urls list
   // replaces --prefill/--decode.
@@ -292,7 +292,7 @@ export const AgentX = ({ data: input }) => {
     "nixl-libfabric": <><code style={S.code}>SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC</code> reflects SemiAnalysis's AWS-EFA B300 cluster. On InfiniBand, leave it unset to use NIXL's default UCX backend.</>,
     "ib-devices": <>Set <code style={S.code}>IB_DEVICES</code> to your node's RDMA NICs (comma-separated, e.g. <code style={S.code}>mlx5_0,mlx5_1</code>).</>,
     "mooncake-segment": <><code style={S.code}>MOONCAKE_GLOBAL_SEGMENT_SIZE</code> is the host DRAM each worker process contributes to the Mooncake store. Size it to your host memory.</>,
-    "sgl-router": <>The router flags were recorded for SGLang's earlier Python router; the router command here is their <code style={S.code}>sgl-router</code> equivalent, as the AgentX test harness launches it. Its <code style={S.code}>cache_aware</code> policy learns prefixes only from the workers' KV events, so the workers that hold the cache add <code style={S.code}>--kv-events-config</code> and <code style={S.code}>--load-publish-endpoint auto</code>.</>,
+    "sgl-router": <>The router command here is the recorded router flags translated to <code style={S.code}>sgl-router</code>, as the AgentX test harness launches it. Its <code style={S.code}>cache_aware</code> policy learns prefixes only from the workers' KV events, so the workers that hold the cache add <code style={S.code}>--kv-events-config</code> and <code style={S.code}>--load-publish-endpoint auto</code>.</>,
   });
   const notesFor = (blocks) => {
     const names = new Set(blocks.flatMap((b) => (b.args || []).map((a) => a[0])));

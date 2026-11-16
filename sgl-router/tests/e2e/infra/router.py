@@ -1,8 +1,8 @@
-"""Minimal sgl-router Gateway class for e2e tests.
+"""Minimal sgl-router launcher class for e2e tests.
 
 sgl-router is a Rust binary
 (`sgl-router/target/release/sgl-router`) configured entirely
-through CLI flags. This Gateway execs the binary with `--worker-urls <...>`
+through CLI flags. This Router execs the binary with `--worker-urls <...>`
 (static discovery) plus the model + policy flags.
 
 Supported lifecycles:
@@ -15,11 +15,9 @@ Supported lifecycles:
 
 Use as a context manager:
 
-    with Gateway() as gw:
-        gw.start_regular(model_id="...", tokenizer_path="...", worker_urls=[...])
-        resp = httpx.post(f"{gw.base_url}/v1/chat/completions", json=...)
-
-or pytest fixture style (see e2e_test/conftest.py).
+    with Router() as router:
+        router.start_regular(model_id="...", tokenizer_path="...", worker_urls=[...])
+        resp = httpx.post(f"{router.base_url}/v1/chat/completions", json=...)
 """
 
 from __future__ import annotations
@@ -30,9 +28,7 @@ import signal
 import socket
 import subprocess
 import time
-from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
 
 import httpx
 
@@ -52,21 +48,10 @@ def router_binary_path() -> Path:
 
 
 def _get_open_port() -> int:
-    """Reserve an ephemeral TCP port in [20000, 55535].
-
-    The router itself doesn't have the ``port + 10000`` gRPC-derivation
-    constraint that SGLang's launch_server does, but we cap the range
-    anyway so the e2e helpers behave consistently across components.
-    """
-    for _ in range(50):
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(("127.0.0.1", 0))
-            port = s.getsockname()[1]
-        if 20000 <= port <= 55535:
-            return port
-    raise RuntimeError(
-        "could not allocate an ephemeral port in [20000, 55535] after 50 tries"
-    )
+    """Reserve an ephemeral TCP port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 
 def _resolve_tokenizer_path(tokenizer_path: str) -> str:
@@ -95,26 +80,10 @@ def _resolve_tokenizer_path(tokenizer_path: str) -> str:
     return tokenizer_path
 
 
-@dataclass
-class WorkerInfo:
-    """Worker visible to the gateway via ``/v1/models``-style introspection.
-
-    sgl-router does not currently surface a `/v1/workers` admin API — this is a
-    placeholder for a future admin surface; current tests scrape
-    `/metrics` for per-worker observability instead.
-    """
-
-    id: str
-    url: str
-    model: str | None = None
-    status: str = "unknown"
-    metadata: dict[str, Any] = field(default_factory=dict)
-
-
-class Gateway:
+class Router:
     """Lifecycle-managed sgl-router instance for e2e tests.
 
-    Not thread-safe; assume one Gateway per test (or per fixture scope).
+    Not thread-safe; assume one Router per test (or per fixture scope).
     """
 
     def __init__(
@@ -145,7 +114,7 @@ class Gateway:
 
     # ----- context manager -------------------------------------------------
 
-    def __enter__(self) -> "Gateway":
+    def __enter__(self) -> "Router":
         return self
 
     def __exit__(self, *exc) -> None:

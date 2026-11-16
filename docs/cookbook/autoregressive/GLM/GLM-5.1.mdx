@@ -64,11 +64,11 @@ GLM-5.1 also runs on **Atlas 800I A3** with the msModelSlim W4A8 checkpoint. One
 - **Front the PD roles with a router.** Once both roles are up, start the router and send requests to its port, `30000`. Only each role's head node serves HTTP, so run the router on a node that is not the prefill head — otherwise give it a free port instead, since the prefill role already listens on `30000` there:
 
   ```bash Command
-  python3 -m sglang_router.launch_router \
-      --pd-disaggregation \
+  sgl-router \
+      --model-id Eco-Tech/GLM-5.1-w4a8 \
+      --no-tokenizer \
       --policy round_robin \
-      --prefill http://<prefill-node0-ip>:30000 8998 \
-      --decode http://<decode-node0-ip>:30100 \
+      --worker-urls http://<prefill-node0-ip>:30000 http://<decode-node0-ip>:30100 \
       --host 0.0.0.0 \
       --port 30000
   ```
