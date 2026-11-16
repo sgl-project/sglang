@@ -1,4 +1,4 @@
-"""TP4 synchronous batched MTP-first controller with per-request state."""
+"""Tensor-parallel synchronous batched MTP-first controller with per-request state."""
 
 import os
 from dataclasses import dataclass
@@ -48,13 +48,12 @@ class MTPFirstController:
     def __init__(self, worker):
         args = worker.server_args
         if (
-            args.tp_size != 4
-            or not 1 <= args.max_running_requests <= 32
+            not 1 <= args.max_running_requests <= 32
             or args.quantization is not None
             or worker.use_compact_draft_cache
         ):
             raise ValueError(
-                "MTP-first requires TP4, 1..32 requests, "
+                "MTP-first requires 1..32 requests, "
                 "no quantization; compact draft KV parity is not yet validated"
             )
         if args.speculative_draft_attention_backend != "fa3":
