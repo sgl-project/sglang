@@ -190,7 +190,6 @@ class GraniteMoeHybridAttention(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        self.causal = True
         self.hidden_size = config.hidden_size
         self.attention_bias = config.attention_bias
         self.attention_multiplier = config.attention_multiplier

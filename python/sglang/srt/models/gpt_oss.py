@@ -24,7 +24,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 
 import torch
 from torch import nn
-from transformers import PretrainedConfig
+from transformers import GptOssConfig, PretrainedConfig
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.distributed.utils import get_group_rank_size
@@ -118,13 +118,6 @@ else:
     _is_tinygemm_supported = False
 
 
-class GptOssConfig(PretrainedConfig):
-    model_type = "gpt_oss"
-
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-
-
 logger = logging.getLogger(__name__)
 
 
@@ -185,8 +178,6 @@ def _resolve_moe_input_pad_multiple(
     GptOssDecoderLayer for the safety preconditions."""
     if quant_config is None:
         return 0
-    from sglang.srt.environ import envs
-
     if not envs.SGLANG_AITER_FUSE_RMSNORM_PAD.get():
         return 0
     if not (_is_hip and envs.SGLANG_USE_AITER.get()):

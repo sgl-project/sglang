@@ -201,8 +201,7 @@ class GPTBigCodeModel(nn.Module):
         assert not config.add_cross_attention
 
         self.embed_dim = config.hidden_size
-        lora_vocab = 0
-        self.vocab_size = config.vocab_size + lora_vocab
+        self.vocab_size = config.vocab_size
         self.wte = VocabParallelEmbedding(
             self.vocab_size,
             self.embed_dim,
@@ -258,7 +257,6 @@ class GPTBigCodeForCausalLM(nn.Module):
             config, quant_config, prefix=add_prefix("transformer", prefix)
         )
         self.lm_head = self.transformer.wte
-        self.unpadded_vocab_size = config.vocab_size
         self.logits_processor = LogitsProcessor(config)
 
     @torch.no_grad()
