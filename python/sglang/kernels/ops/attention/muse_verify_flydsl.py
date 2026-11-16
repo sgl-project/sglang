@@ -23,7 +23,7 @@ import functools
 import flydsl.compiler as flyc
 import flydsl.expr as fx
 from aiter.ops.flydsl.kernels import buffer_ops
-from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, _to_raw
+from aiter.ops.flydsl.kernels.tensor_shim import _run_compiled, _to_raw, buf_base_i64
 from flydsl._mlir import ir
 from flydsl._mlir.dialects import llvm
 from flydsl._mlir.dialects import rocdl as _rocdl
@@ -31,13 +31,6 @@ from flydsl.expr import arith
 from flydsl.expr import math as fmath
 from flydsl.expr import range_constexpr
 from flydsl.expr.typing import T
-
-# The 64-bit address path needs aiter FlyDSL helpers newer than some pinned aiter builds; without
-# them the module is unavailable and the backend keeps its Triton verify kernels.
-if not all(hasattr(buffer_ops, n) for n in ("extract_base_index", "create_llvm_ptr")):
-    raise ImportError(
-        "aiter.ops.flydsl.kernels.buffer_ops lacks extract_base_index / create_llvm_ptr"
-    )
 
 QL = 8
 GQA = 8
@@ -101,7 +94,7 @@ def _cvt8(lo_word, hi_word):
 
 def _global_load16(addr):
     """16 bytes (vector<4 x i32>) at the 64-bit global byte address ``addr``."""
-    ptr = buffer_ops.create_llvm_ptr(addr, address_space=1)
+    ptr = llvm.IntToPtrOp(ir.Type.parse("!llvm.ptr<1>"), _to_raw(addr)).result
     return llvm.LoadOp(T.vec(4, T.i32), _to_raw(ptr), alignment=16).result
 
 
@@ -174,8 +167,17 @@ def _launcher(
     fence_vmem,
     wg_per_cu,
     addr64,
+    balanced=False,
+    spw=1,
+    window=0,
+    physical_page=PAGE,
 ):
-    W = hpg
+    # physical pages of 32-128 tokens: the kernel keeps its 16-token pages and maps each to its physical page and
+    # the 16-row block inside it (kv_s0 becomes the stride of one 16-row block)
+    pages_per_block = physical_page // PAGE
+    kv_s0 = kv_s0 // pages_per_block
+    # balanced: spw segments per workgroup (waves hpg * j .. of segment j), so a 2-KV-head rank still fills 4 SIMDs
+    W = hpg * spw
     groups = kvh // hpg
     lds_wave = 2 * CHUNK * HD  # two V stages of 32 rows x 64 bytes per wave
     exp_scale = float(scale) * LOG2E
@@ -207,6 +209,7 @@ def _launcher(
         part: fx.Tensor,
         maxi: fx.Tensor,
         den: fx.Tensor,
+        plan: fx.Tensor,
         splits: fx.Int32,
         work_splits: fx.Int32,
         t_stride: fx.Int32,
@@ -221,18 +224,39 @@ def _launcher(
         # head groups of the same (request, split) are adjacent programs: they share page-table and KV lines; only
         # the work_splits busy splits get programs (dispatch spreads them evenly over XCDs / CUs), and split j also
         # writes the empty padding slot j + work_splits of the partials
-        work = pid // groups
-        h = (pid % groups) * W + wave
-        seq = work // work_splits
-        split = work % work_splits
+        work = (pid // groups) * spw + wave // hpg
+        h = (pid % groups) * hpg + wave % hpg
+        if fx.const_expr(balanced):
+            # length-balanced work list (muse_verify_plan): program work runs plan row work = (request, first
+            # chunk, end chunk) and writes partials slot work
+            pl_r = buffer_ops.create_buffer_resource(plan, max_size=True)
+            seq = fx.Int32(
+                buffer_ops.buffer_load(
+                    pl_r, work * 4, vec_width=1, dtype=T.i32, is_scalar=True
+                )
+            )
+            seg_begin = fx.Int32(
+                buffer_ops.buffer_load(
+                    pl_r, work * 4 + 1, vec_width=1, dtype=T.i32, is_scalar=True
+                )
+            )
+            seg_end = fx.Int32(
+                buffer_ops.buffer_load(
+                    pl_r, work * 4 + 2, vec_width=1, dtype=T.i32, is_scalar=True
+                )
+            )
+            split = work
+        else:
+            seq = work // work_splits
+            split = work % work_splits
 
         sl_r = buffer_ops.create_buffer_resource(seqlens, max_size=True)
         tb_r = buffer_ops.create_buffer_resource(table, max_size=True)
         kd_r = buffer_ops.create_buffer_resource(kd, max_size=True)
         q_r = buffer_ops.create_buffer_resource(q, max_size=True)
         if fx.const_expr(addr64):
-            k_addr = fx.Int64(arith.index_cast(T.i64, buffer_ops.extract_base_index(k)))
-            v_addr = fx.Int64(arith.index_cast(T.i64, buffer_ops.extract_base_index(v)))
+            k_addr = buf_base_i64(k)
+            v_addr = buf_base_i64(v)
         else:
             k_r = buffer_ops.create_buffer_resource(k, max_size=True)
             v_r = buffer_ops.create_buffer_resource(v, max_size=True)
@@ -255,12 +279,32 @@ def _launcher(
         last_chunk = nchunks - 1
         # chunks per split rounded up to whole slot groups, so only the last busy split runs dummy chunks; splits
         # >= work_splits (padding up to the power-of-two partials layout) stay empty
-        cps = ((nchunks + work_splits - 1) // work_splits + NS - 1) // NS * NS
-        begin = split * cps
-        end = (begin + cps < nchunks).select(begin + cps, nchunks)
-        begin = (begin < end).select(begin, end)
+        if fx.const_expr(balanced):
+            # segment bounds are whole slot groups except at the request's end (the plan rounds them to NS)
+            end = (seg_end < nchunks).select(seg_end, nchunks)
+            begin = (seg_begin < end).select(seg_begin, end)
+        elif fx.const_expr(window):
+            # sliding, fixed splits over the window (every request's window has the same length): from the chunk
+            # of the first key any query sees
+            first = ctx + 1 - window
+            first = (first > 0).select(first, fx.Int32(0)) // CHUNK
+            cps = (
+                ((nchunks - first + work_splits - 1) // work_splits + NS - 1) // NS * NS
+            )
+            begin = first + split * cps
+            end = (begin + cps < nchunks).select(begin + cps, nchunks)
+            begin = (begin < end).select(begin, end)
+        else:
+            cps = ((nchunks + work_splits - 1) // work_splits + NS - 1) // NS * NS
+            begin = split * cps
+            end = (begin + cps < nchunks).select(begin + cps, nchunks)
+            begin = (begin < end).select(begin, end)
         # chunks below `interior` are visible to every query position: no masks
         interior = (ctx + 1) // CHUNK
+        if fx.const_expr(window):
+            # sliding layers (key visible when qpos - window < key <= qpos): all chunks masked, the window is short
+            interior = begin
+            win_lo = ctx + 1 - window
         interior = (interior < end).select(interior, end)
         interior = (interior > begin).select(interior, begin)
         row_base = seq * t_stride
@@ -341,26 +385,64 @@ def _launcher(
             p1 = (p1 < last_page).select(p1, last_page)
             if fx.const_expr(vec_ids):
                 # vector loads, in order with the K / V loads: the vmcnt wait for an older chunk covers them
-                a = fx.Int32(
-                    buffer_ops.buffer_load(
-                        tb_r, row_base + p0, vec_width=1, dtype=T.i32
+                if fx.const_expr(pages_per_block == 1):
+                    a = fx.Int32(
+                        buffer_ops.buffer_load(
+                            tb_r, row_base + p0, vec_width=1, dtype=T.i32
+                        )
                     )
-                )
-                b = fx.Int32(
-                    buffer_ops.buffer_load(
-                        tb_r, row_base + p1, vec_width=1, dtype=T.i32
+                    b = fx.Int32(
+                        buffer_ops.buffer_load(
+                            tb_r, row_base + p1, vec_width=1, dtype=T.i32
+                        )
                     )
-                )
+                else:
+                    # a chunk's two 16-row blocks share one physical page (32 | physical page)
+                    a = fx.Int32(
+                        buffer_ops.buffer_load(
+                            tb_r,
+                            row_base + p0 // pages_per_block,
+                            vec_width=1,
+                            dtype=T.i32,
+                        )
+                    )
+                    b = a
             else:
-                a = fx.Int32(
-                    buffer_ops.buffer_load(
-                        tb_r, row_base + p0, vec_width=1, dtype=T.i32, is_scalar=True
+                if fx.const_expr(pages_per_block == 1):
+                    a = fx.Int32(
+                        buffer_ops.buffer_load(
+                            tb_r,
+                            row_base + p0,
+                            vec_width=1,
+                            dtype=T.i32,
+                            is_scalar=True,
+                        )
                     )
-                )
-                b = fx.Int32(
-                    buffer_ops.buffer_load(
-                        tb_r, row_base + p1, vec_width=1, dtype=T.i32, is_scalar=True
+                    b = fx.Int32(
+                        buffer_ops.buffer_load(
+                            tb_r,
+                            row_base + p1,
+                            vec_width=1,
+                            dtype=T.i32,
+                            is_scalar=True,
+                        )
                     )
+                else:
+                    a = fx.Int32(
+                        buffer_ops.buffer_load(
+                            tb_r,
+                            row_base + p0 // pages_per_block,
+                            vec_width=1,
+                            dtype=T.i32,
+                            is_scalar=True,
+                        )
+                    )
+                    b = a
+            if fx.const_expr(pages_per_block > 1):
+                # 16-row block index in units of the reduced kv_s0
+                return (
+                    a * pages_per_block + p0 % pages_per_block,
+                    b * pages_per_block + p1 % pages_per_block,
                 )
             return a, b
 
@@ -420,9 +502,12 @@ def _launcher(
                 zero = fx.full(4, 0, fx.Int32)
                 vraw = [
                     _to_raw(
-                        (chunk * CHUNK + v_keys[u] < kvlen).select(
-                            fx.Vector(vraw[u], shape=4, dtype=fx.Int32), zero
-                        )
+                        (
+                            (chunk * CHUNK + v_keys[u] < kvlen)
+                            & (chunk * CHUNK + v_keys[u] >= win_lo)
+                            if fx.const_expr(window)
+                            else (chunk * CHUNK + v_keys[u] < kvlen)
+                        ).select(fx.Vector(vraw[u], shape=4, dtype=fx.Int32), zero)
                     )
                     for u in range_constexpr(2)
                 ]
@@ -471,6 +556,8 @@ def _launcher(
                         for j in range_constexpr(4):
                             key = chunk * CHUNK + mt * 16 + g * 4 + j
                             ok = (key <= qpos) & (chunk < end)
+                            if fx.const_expr(window):
+                                ok = ok & (key + window > qpos)
                             elems.append(ok.select(sv[j], ninf))
                         sv = fx.Vector.from_elements(elems, fx.Float32)
                     s.append(sv)
@@ -633,7 +720,11 @@ def _launcher(
             n = li + 16 * nt
             t = n // GQA
             qh = n % GQA
-            state = ((seq * QL + t) * heads + h * GQA + qh) * splits + split
+            if fx.const_expr(balanced):
+                # segmented layout [segments, QL, heads]: the reduce reads each request's own segments
+                state = (split * QL + t) * heads + h * GQA + qh
+            else:
+                state = ((seq * QL + t) * heads + h * GQA + qh) * splits + split
             l2 = fx.Vector(l_run[nt], shape=2, dtype=fx.Float32)
             l_tot = _allreduce_groups(arith.addf(_to_raw(l2[0]), _to_raw(l2[1])), False)
             m_fin = arith.subf(
@@ -646,7 +737,7 @@ def _launcher(
                 buffer_ops.buffer_store(
                     o_acc[mt * 4 + nt], p_r, state * HD + mt * 16 + g * 4
                 )
-            if split + work_splits < splits:
+            if fx.const_expr(not balanced) and split + work_splits < splits:
                 pad = state + work_splits
                 buffer_ops.buffer_store(_f32(M_INIT), m_r, pad)
                 buffer_ops.buffer_store(_f32(0.0), d_r, pad)
@@ -668,6 +759,7 @@ def _launcher(
         part: fx.Tensor,
         maxi: fx.Tensor,
         den: fx.Tensor,
+        plan: fx.Tensor,
         splits: fx.Int32,
         work_splits: fx.Int32,
         t_stride: fx.Int32,
@@ -685,6 +777,7 @@ def _launcher(
             part,
             maxi,
             den,
+            plan,
             splits,
             work_splits,
             t_stride,
@@ -714,6 +807,7 @@ def verify_fly_partials(
     fence_vmem=False,
     work_splits=None,
     wg_per_cu=0,
+    window=0,
 ):
     """FP32 split-KV partials [T, H, S, 64] + max / denom [T, H, S] (log2 domain) of the full-layer verify.
 
@@ -733,12 +827,8 @@ def verify_fly_partials(
         and heads == GQA * kvh
         and q.shape[0] == n * QL
     )
-    assert (
-        k.shape[1] == PAGE
-        and k.stride() == v.stride()
-        and k.stride(2) == HD
-        and k.stride(3) == 1
-    )
+    assert k.shape[1] in (16, 32, 64, 128) and k.shape[1] == v.shape[1]
+    assert k.stride() == v.stride() and k.stride(2) == HD and k.stride(3) == 1
     assert q.stride(2) == 1 and q.stride(1) == HD
     assert work_splits is None or splits <= 2 * work_splits <= 2 * splits
     # buffer offsets are 32-bit byte offsets: a pool past them takes the 64-bit loads
@@ -769,6 +859,10 @@ def verify_fly_partials(
             fence_vmem,
             wg_per_cu,
             addr64,
+            False,
+            1,
+            window,
+            k.shape[1],
         ),
         q,
         k.view(torch.uint8),
@@ -779,6 +873,7 @@ def verify_fly_partials(
         part,
         maxi,
         den,
+        kd,
         int(splits),
         int(work_splits or splits),
         int(block_table.stride(0)),

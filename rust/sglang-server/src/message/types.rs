@@ -221,6 +221,9 @@ macro_rules! control_messages {
         }
 
         impl ControlRequest {
+            #[cfg(test)]
+            pub(crate) const TAGS: &'static [&'static str] = &[$(stringify!($name)),+];
+
             /// The rid this message carries; `submit` reuses it as the request's
             /// rid, so the two cannot disagree.
             pub(crate) fn rid(&self) -> &str {
@@ -247,7 +250,7 @@ pub(super) use {control_messages, wire_struct};
 
 /// A control message encoded by another listener (`wire_struct`'s positional
 /// `[tag, rid, http_worker_ipc, ...]`), carried as those bytes. Only the rid
-/// is read here, to route the scheduler's reply; the tag and fields are the
+/// is read here, to route the scheduler's reply; the fields are the
 /// scheduler's to validate, as for a message this process encoded itself.
 #[derive(Debug)]
 pub struct ForwardedControlReq {

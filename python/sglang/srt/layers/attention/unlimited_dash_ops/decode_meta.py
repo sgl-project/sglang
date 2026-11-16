@@ -8,10 +8,10 @@ from __future__ import annotations
 
 import torch
 
-from sglang.kernels.ops.attention.unlimited_ocr_dash.decode_meta import (
+from sglang.kernels.ops.attention.unlimited_ocr_dash.decode_meta import page2d_cos_sin
+from sglang.kernels.ops.attention.unlimited_ocr_dash.dispatch import (
     dash_decode_allow,
     dash_decode_meta,
-    page2d_cos_sin,
 )
 from sglang.srt.layers.attention.unlimited_dash_ops.page2d_rope import (
     PageCoordState,

@@ -50,6 +50,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager im
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import (
     use_vae_fast_path,
 )
+from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
+    expand_request_outputs,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     PipelineStage,
@@ -449,6 +452,15 @@ class Cosmos3ImagePreprocessStage(PipelineStage):
         raise ValueError(
             "control_path must be a string or list of strings, got "
             f"{type(control_path).__name__}"
+        )
+
+    def iter_sequential_requests(
+        self, batch: Req, server_args: ServerArgs
+    ) -> Iterator[Req]:
+        return iter(
+            expand_request_outputs(
+                batch, reuse_parent_trace_ctx=True, preserve_parent_metrics=True
+            )
         )
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:

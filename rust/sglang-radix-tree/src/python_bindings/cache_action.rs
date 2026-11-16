@@ -19,7 +19,7 @@ impl FreeDeviceKVFullOnly {
     pub(crate) fn into_py_tagged(self, py: Python<'_>) -> PyResult<Py<PyAny>> {
         let tag = self.tag();
         let indices = PyList::new(py, self.indices.into_iter().map(PyTensor))?;
-        (tag, indices).into_py_any(py)
+        (tag, indices, self.tree_owned).into_py_any(py)
     }
 }
 

@@ -65,6 +65,9 @@ class TestMambaLazyFullPoolKL(MambaCacheKLMixin, DefaultServerBase):
         "SGLANG_TEST_MAMBA_LAZY_POOL_FULL": "0",
     }
     other_args = [
+        # This regression requires the intermediate 192-token checkpoint.
+        "--hybrid-cache-checkpoints-level",
+        "3",
         "--skip-tokenizer-init",
         "--mamba-radix-cache-strategy",
         "extra_buffer_lazy",
@@ -151,6 +154,9 @@ class TestMambaSpecTruncationKL(MambaCacheKLMixin, DefaultServerBase):
     model = "Qwen/Qwen3.5-0.8B"
     revision = "2fc06364715b967f1860aea9cf38778875588b17"
     other_args = [
+        # Retain a reusable checkpoint when truncation prevents final-state caching.
+        "--hybrid-cache-checkpoints-level",
+        "3",
         "--revision",
         revision,
         "--mamba-radix-cache-strategy",

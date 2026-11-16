@@ -25,7 +25,7 @@ import subprocess
 from collections import defaultdict
 from contextlib import contextmanager
 from ctypes import byref
-from functools import lru_cache, partial
+from functools import lru_cache
 from importlib.util import find_spec
 from typing import Any, Iterator, List, Optional, Tuple
 
@@ -80,6 +80,7 @@ __all__ = [
     "is_pin_memory_available",
     "async_h2d",
     "async_h2d_stack",
+    "async_h2d_tensor",
     "async_d2h",
     "get_dispatch_device_backend",
     "get_device_module",
@@ -290,66 +291,65 @@ def _check_cuda_device_version(
     )
 
 
-is_hopper_with_cuda_12_3 = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
+@lru_cache(maxsize=1)
+def is_hopper_with_cuda_12_3() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[9], cuda_version=(12, 3)
     )
-)
 
 
-is_blackwell_supported = is_blackwell = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version,
-        device_capability_majors=[10, 11, 12],
-        cuda_version=(12, 8),
+@lru_cache(maxsize=1)
+def is_blackwell_supported() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[10, 11, 12], cuda_version=(12, 8)
     )
-)
 
 
-is_sm120_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[12], cuda_version=(12, 8)
+is_blackwell = is_blackwell_supported
+
+
+@lru_cache(maxsize=1)
+def is_sm120_supported() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[12], cuda_version=(12, 8)
     )
-)
 
 
-is_sm100_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[10], cuda_version=(12, 8)
+@lru_cache(maxsize=1)
+def is_sm100_supported() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[10], cuda_version=(12, 8)
     )
-)
 
 
 # Datacenter Blackwell (SM100) plus SM110; excludes consumer Blackwell (SM120).
 # This is the arch set flash_attn.cute accepts for the absorbed-MLA qv argument.
-is_sm100_or_sm110_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version,
-        device_capability_majors=[10, 11],
-        cuda_version=(12, 8),
+@lru_cache(maxsize=1)
+def is_sm100_or_sm110_supported() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[10, 11], cuda_version=(12, 8)
     )
-)
 
 
-is_sm110_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[11], cuda_version=(12, 8)
+@lru_cache(maxsize=1)
+def is_sm110_supported() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[11], cuda_version=(12, 8)
     )
-)
 
 
-is_sm80_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[8], cuda_version=(11, 0)
+@lru_cache(maxsize=1)
+def is_sm80_supported() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[8], cuda_version=(11, 0)
     )
-)
 
 
-is_sm90_supported = lru_cache(maxsize=1)(
-    partial(
-        _check_cuda_device_version, device_capability_majors=[9], cuda_version=(12, 3)
+@lru_cache(maxsize=1)
+def is_sm90_supported() -> bool:
+    return _check_cuda_device_version(
+        device_capability_majors=[9], cuda_version=(12, 3)
     )
-)
 
 
 # RTX Blackwell. Unlike is_sm120_supported(), this excludes SM121/GB10.
@@ -634,6 +634,18 @@ def async_h2d_stack(
         (len(tensors), *tensors[0].shape), dtype=tensors[0].dtype, pin_memory=pin
     )
     return torch.stack(tensors, out=out).to(device, non_blocking=pin)
+
+
+def async_h2d_tensor(tensor: torch.Tensor, device: torch.device | str) -> torch.Tensor:
+    """Copy ``tensor`` to ``device``, staging host tensors in pinned memory."""
+    if not tensor.is_cpu:
+        return tensor.to(device)
+    # Pinned memory is off under Confidential Computing and for CPU targets.
+    if not is_pin_memory_available(device):
+        return tensor.to(device, non_blocking=True)
+    if not tensor.is_pinned():
+        tensor = tensor.pin_memory()
+    return tensor.to(device, non_blocking=True)
 
 
 def async_d2h(tensor: torch.Tensor) -> torch.Tensor:
