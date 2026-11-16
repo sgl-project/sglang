@@ -798,24 +798,24 @@ class QuarkConfig(QuantizationConfig):
         }
 
     def _check_scheme_supported(self, min_capability: int, error: bool = True) -> bool:
-        capability_tuple = get_device_capability()
-
-        if capability_tuple is not None:
-            assert 0 <= capability_tuple[1] < 10
-            capability = capability_tuple[0] * 10 + capability_tuple[1]
-
-            supported = capability >= min_capability
-            if error and not supported:
-                # Pass a single joined message; RuntimeError stringifies
-                # multiple positional args as a tuple repr.
-                raise RuntimeError(
-                    "Quantization scheme is not supported for "
-                    f"the current GPU. Min capability: {min_capability}. "
-                    f"Current capability: {capability}."
-                )
-            return supported
-        else:
+        major, minor = get_device_capability()
+        # (None, None): the device reports no compute capability.
+        if major is None:
             return False
+
+        assert 0 <= minor < 10
+        capability = major * 10 + minor
+
+        supported = capability >= min_capability
+        if error and not supported:
+            # Pass a single joined message; RuntimeError stringifies
+            # multiple positional args as a tuple repr.
+            raise RuntimeError(
+                "Quantization scheme is not supported for "
+                f"the current GPU. Min capability: {min_capability}. "
+                f"Current capability: {capability}."
+            )
+        return supported
 
     def _is_fp8_w8a8(
         self,
