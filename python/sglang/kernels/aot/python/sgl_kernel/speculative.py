@@ -123,6 +123,23 @@ def reconstruct_indices_from_tree_mask(
         )
 
 
+def segment_packbits(
+    x: torch.Tensor,
+    input_indptr: torch.Tensor,
+    output_indptr: torch.Tensor,
+    y: torch.Tensor,
+    batch_size: int,
+) -> None:
+    torch.ops.sgl_kernel.segment_packbits.default(
+        x,
+        input_indptr,
+        output_indptr,
+        y,
+        batch_size,
+        torch.cuda.current_stream().cuda_stream,
+    )
+
+
 def verify_tree_greedy_cpu(
     predicts: torch.Tensor,  # mutable
     accept_index: torch.Tensor,  # mutable

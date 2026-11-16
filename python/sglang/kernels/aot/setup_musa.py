@@ -94,6 +94,7 @@ sources = [
     "csrc/quantization/gguf/gguf_kernel.cu",
     "csrc/speculative/eagle_utils.cu",
     "csrc/speculative/ngram_utils.cu",
+    "csrc/speculative/packbit.cu",
     "csrc/speculative/speculative_sampling.cu",
     "csrc/kvcacheio/transfer.cu",
     "csrc/gemm/per_token_quant_fp8.cu",
