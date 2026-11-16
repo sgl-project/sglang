@@ -801,7 +801,6 @@ def capture_decode_graph(
         {
             "cuda": "CUDA graph",
             "musa": "CUDA graph",
-            "cpu": "CPU graph",
             "npu": "NPU graph",
             "xpu": "XPU graph",
         },
@@ -830,7 +829,6 @@ def capture_decode_graph(
         graph_runners = defaultdict(
             model_runner._decode_cuda_graph_runner_cls,
             {
-                "cpu": CPUGraphRunner,
                 "xpu": XPUGraphRunner,
             },
         )

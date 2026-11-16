@@ -1476,11 +1476,7 @@ class ModelRunner:
             dumper.register_non_intrusive_dumper(self.model)
 
         # Pre-expand RoPE cache before CUDA Graph capture
-        reserve_rope_cache_for_long_sequences(
-            self.model,
-            self.model_config,
-            logger,
-        )
+        reserve_rope_cache_for_long_sequences(self.model, self.model_config)
 
         if self.startup_weight_load is None:
             dist_barrier_after_load(
