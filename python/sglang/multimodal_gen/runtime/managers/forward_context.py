@@ -8,6 +8,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.multimodal_gen.configs.sample.sampling_params import quality_allows
+
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.attention import AttentionMetadata
     from sglang.multimodal_gen.runtime.pipelines_core import Req
@@ -66,6 +68,16 @@ def get_forward_context() -> "ForwardContext":
 
 def get_forward_context_or_none() -> "ForwardContext | None":
     return _forward_context
+
+
+def request_allows_lossless() -> bool:
+    """Whether the request of this forward pass allows ``lossless`` fast paths."""
+    # only a request that allows it: many stages set the forward context
+    # without forward_batch, and an exact request must still get exact bytes
+    forward_batch = None if _forward_context is None else _forward_context.forward_batch
+    sampling_params = getattr(forward_batch, "sampling_params", None)
+    quality = getattr(sampling_params, "quality", None)
+    return quality is not None and quality_allows(quality, "lossless")
 
 
 @contextmanager

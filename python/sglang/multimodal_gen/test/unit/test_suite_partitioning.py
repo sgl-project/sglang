@@ -6,6 +6,7 @@ who runs what without talking to each other.
 """
 
 import json
+import runpy
 import subprocess
 import sys
 import textwrap
@@ -30,6 +31,7 @@ from sglang.multimodal_gen.test.server.gpu_cases import (
 _H100_BASELINE_PATH = (
     Path(__file__).resolve().parents[1] / "server/perf_baselines/h100.json"
 )
+_PLANNER_DIR = Path(__file__).resolve().parents[5] / "scripts/ci/utils/diffusion"
 
 
 def _items(*est_times: float) -> list[PartitionItem]:
@@ -263,6 +265,13 @@ def test_parent_progress_precedes_child_output():
         [sys.executable, "-E", "-c", script], capture_output=True, text=True, check=True
     )
     assert result.stdout.index("PARENT_PROGRESS") < result.stdout.index("CHILD_OUTPUT")
+
+
+def test_observed_suite_prefers_thirty_minutes_over_extra_short_shard(monkeypatch):
+    """The 154-minute CI suite should use five shards, rather than six at 26m."""
+    monkeypatch.syspath_prepend(str(_PLANNER_DIR))
+    namespace = runpy.run_path(str(_PLANNER_DIR / "compute_diffusion_partitions.py"))
+    assert namespace["compute_partition_count"](9255.4, 1200, 1800, 2400, 10) == 5
 
 
 def test_two_gpu_cases_have_h100_full_test_time_estimates():

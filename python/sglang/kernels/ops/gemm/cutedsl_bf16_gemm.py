@@ -26,6 +26,7 @@ Warp specialization (8 warps, 256 threads/CTA; warp 3 idle):
 
 from __future__ import annotations
 
+import bisect
 from typing import List, NamedTuple, Optional, Tuple, Type
 
 import cuda.bindings.driver as cuda
@@ -34,6 +35,7 @@ import cutlass.cute as cute
 import cutlass.utils as utils
 import cutlass.utils.blackwell_helpers as sm100_utils
 import torch
+from cutlass._mlir.dialects import llvm
 from cutlass.cute import experimental as cute_ext
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
@@ -41,7 +43,7 @@ from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from sglang.kernels.arch import current_arch
 from sglang.kernels.kernel_api_logging import debug_kernel_api
 from sglang.srt.utils import is_sm100_supported
-from sglang.srt.utils.common import direct_register_custom_op
+from sglang.srt.utils.custom_op import direct_register_custom_op
 
 # Tuple format: (cta_m, cta_n, num_ab_stage, use_2cta); cta_k is fixed at
 # 128. Sorted within each use_2cta block by (cta_m, cta_n, num_ab_stage).
@@ -91,6 +93,20 @@ class WorkTileInfo(NamedTuple):
     L_idx: cutlass.Int32
     K_idx_start: cutlass.Int32
     K_idx_end: cutlass.Int32
+
+
+def _tcgen05_fence(*, before: bool) -> None:
+    """``tcgen05.fence::{before,after}_thread_sync`` around an mbarrier hand-off of
+    tcgen05 work (PTX ISA canonical tcgen05 synchronization patterns)."""
+    llvm.inline_asm(
+        None,
+        [],
+        f"tcgen05.fence::{'before' if before else 'after'}_thread_sync;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
 
 
 class TgvGemmCuteExtKernel:
@@ -335,6 +351,14 @@ class TgvGemmCuteExtKernel:
         bar_tmem_alloc_arr = cute_ext.allocate(
             cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
         )
+        # 2-CTA only: rendezvous of the two MMA warps before the collective
+        # TMEM dealloc. 1-CTA passes None and never touches it.
+        bar_tmem_dealloc = None
+        if cutlass.const_expr(self.use_2cta):
+            bar_tmem_dealloc_arr = cute_ext.allocate(
+                cutlass.Int64, cute.AddressSpace.smem, cute.make_layout(1), alignment=8
+            )
+            bar_tmem_dealloc = bar_tmem_dealloc_arr.iterator  # Pointer[Int64]
         # alloc_tmem writes the TMEM base address to this slot; both MMA and
         # EPILOG read it back via retrieve_tmem_ptr.
         tmem_base_arr = cute_ext.allocate(
@@ -364,6 +388,8 @@ class TgvGemmCuteExtKernel:
                 cute.arch.mbarrier_init(
                     bar_tmem_alloc, 32 + 128
                 )  # MMA + 4 EPILOG warps
+                if cutlass.const_expr(self.use_2cta):
+                    cute.arch.mbarrier_init(bar_tmem_dealloc, 32)  # peer CTA's MMA warp
 
         cute.arch.mbarrier_init_fence()
         if cutlass.const_expr(self.use_2cta):
@@ -462,6 +488,8 @@ class TgvGemmCuteExtKernel:
                 bar_empty,
                 bar_mma_epilog,
                 bar_tmem_alloc,
+                bar_tmem_dealloc,
+                cta_rank_in_cluster,
                 tiled_mma,
                 sA,
                 sB,
@@ -670,6 +698,8 @@ class TgvGemmCuteExtKernel:
         bar_empty,  # Pointer[Int64], DMA_Stage entries
         bar_mma_epilog,  # Pointer[Int64], 1 entry
         bar_tmem_alloc,  # Pointer[Int64], 1 entry, 160-arrival
+        bar_tmem_dealloc,  # Pointer[Int64], 1 entry, 32-arrival (2-CTA only, else None)
+        cta_rank_in_cluster: cutlass.Int32,
         tiled_mma: cute.TiledMma,
         sA: cute.Tensor,  # ((Mma_M, Mma_K), NumMma_M, NumMma_K, DMA_Stage)
         sB: cute.Tensor,  # ((Mma_N, Mma_K), NumMma_N, NumMma_K, DMA_Stage)
@@ -765,12 +795,23 @@ class TgvGemmCuteExtKernel:
                 tcgen05.commit(bar_mma_epilog, commit_mask, self.cta_group)
 
         # ---- TMEM dealloc: wait for own EPILOG's tcgen05.ld to retire, free.
-        # bar_tmem_alloc phase 1 fires after EPILOG's tcgen05.ld is observable
-        # (post fence_view_async_tmem_load). 2-CTA dealloc is per-CTA (no
-        # cross-CTA handshake) because each CTA owns its own physical TMEM
-        # half; the cluster-shared accumulator is just a logical view.
+        # The release arrival must land in phase 1. Made while phase 0 is still
+        # open (an EPILOG warp has not arrived yet), it counts toward phase 0 and
+        # the parity-1 wait passes before the EPILOG's tcgen05.ld. Phase-0 wait
+        # and tcgen05 fences as in flashinfer PR 7443 for the split-K kernel.
+        cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)  # phase 1: 32 of 160
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
+        if cutlass.const_expr(self.use_2cta):
+            # tcgen05.dealloc.cta_group::2 is collective: the PTX ISA requires the
+            # issuing warp and the peer CTA's warp to synchronize their TMEM
+            # accesses first. Rendezvous with the peer MMA warp, as
+            # cutlass.utils.TmemAllocator.free does.
+            cute.arch.mbarrier_arrive(bar_tmem_dealloc, cta_rank_in_cluster ^ 1)
+            cute.arch.mbarrier_wait(bar_tmem_dealloc, 0)
+        # tcgen05.fence::after_thread_sync: order the dealloc after the tcgen05
+        # work handed off through the waits above.
+        _tcgen05_fence(before=False)
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=self.use_2cta)
 
     # ====================================================================
@@ -921,6 +962,9 @@ class TgvGemmCuteExtKernel:
         # rAcc.load() below and (b) MMA's dealloc_tmem after we arrive
         # on bar_tmem_alloc phase 1.
         cute.arch.fence_view_async_tmem_load()
+        # tcgen05.fence::before_thread_sync: publish the retired tcgen05.ld to
+        # MMA's dealloc across the mbarrier hand-off.
+        _tcgen05_fence(before=True)
 
         # Phase 1 of bar_tmem_alloc: 128 from this warp + 32 from MMA = 160.
         # MMA's mbarrier_wait(bar_tmem_alloc, 1) clears and it dealloc's.
@@ -1314,7 +1358,11 @@ def _grid_ctas(m: int, n: int, cta_m: int, cta_n: int, num_mma_ctas: int) -> int
 
 
 def _pick_tactic(m: int, n: int, k: int) -> int:
-    """Pick the first ladder tactic whose grid fits one wave of the SMs."""
+    """The tactic a model registered for this m (register_tgv_m_ranges), else
+    the first ladder tactic whose grid fits one wave of the SMs."""
+    tactic = _model_tgv_tactic(m, n, k)
+    if tactic is not None:
+        return tactic
     num_sms = current_arch().num_sms
     best, best_ctas = None, None
     for tactic, cta_m, cta_n, num_mma_ctas in _TGV_TACTIC_LADDER:
@@ -1353,6 +1401,80 @@ _K3_FRONT_WARP_SPLITK = {
     16: (16, 9),
     32: (32, 6),
 }
+
+
+class TGVMRanges:
+    """Sorted, disjoint m ranges of one dense-GEMM shape that take TGV, each
+    with a tactic (None: the ladder pick). ``m in ranges`` says whether m takes
+    TGV; ``ranges(m)`` returns its tactic."""
+
+    def __init__(self) -> None:
+        self._m_lo: list[int] = []
+        self._m_hi: list[int] = []
+        self._tactic: list[Optional[int]] = []
+
+    def append(self, m_lo: int, m_hi: int, tactic: Optional[int]) -> None:
+        """Insert in m order; re-adding an existing range is a no-op, any other
+        overlap raises."""
+        i = bisect.bisect_left(self._m_lo, m_lo)
+        n = len(self._m_lo)
+        if i < n and (self._m_lo[i], self._m_hi[i], self._tactic[i]) == (
+            m_lo,
+            m_hi,
+            tactic,
+        ):
+            return
+        if (
+            not 0 < m_lo <= m_hi
+            or (i > 0 and self._m_hi[i - 1] >= m_lo)
+            or (i < n and self._m_lo[i] <= m_hi)
+        ):
+            raise ValueError(
+                f"TGV m range [{m_lo}, {m_hi}] overlaps "
+                f"{list(zip(self._m_lo, self._m_hi))}"
+            )
+        if tactic is not None:
+            _resolve_tactic(tactic)
+        self._m_lo.insert(i, m_lo)
+        self._m_hi.insert(i, m_hi)
+        self._tactic.insert(i, tactic)
+
+    def _index(self, m: int) -> int:
+        """The index of the range holding m, or -1."""
+        i = bisect.bisect_right(self._m_lo, m) - 1
+        return i if i >= 0 and m <= self._m_hi[i] else -1
+
+    def __contains__(self, m: int) -> bool:
+        return self._index(m) >= 0
+
+    def __call__(self, m: int) -> Optional[int]:
+        i = self._index(m)
+        return self._tactic[i] if i >= 0 else None
+
+
+# (n, k) -> the m ranges a model measured; filled by register_tgv_m_ranges.
+_MODEL_TGV_M_RANGES: dict[tuple[int, int], TGVMRanges] = {}
+
+
+def register_tgv_m_ranges(
+    shapes: dict[tuple[int, int], tuple[tuple[int, int, Optional[int]], ...]],
+) -> None:
+    """Route a model's dense-GEMM shapes ``(n, k)`` to TGV for the given
+    ``(m_lo, m_hi, tactic)`` ranges, for every caller of the shape."""
+    for shape, ranges in shapes.items():
+        m_ranges = _MODEL_TGV_M_RANGES.setdefault(shape, TGVMRanges())
+        for m_lo, m_hi, tactic in ranges:
+            m_ranges.append(m_lo=m_lo, m_hi=m_hi, tactic=tactic)
+
+
+def _model_takes_tgv(m: int, n: int, k: int) -> bool:
+    m_ranges = _MODEL_TGV_M_RANGES.get((n, k))
+    return m_ranges is not None and m in m_ranges
+
+
+def _model_tgv_tactic(m: int, n: int, k: int) -> Optional[int]:
+    m_ranges = _MODEL_TGV_M_RANGES.get((n, k))
+    return None if m_ranges is None else m_ranges(m)
 
 
 # MuseSpark TP4/TP8 projections using TGV on GB300; other M use cuBLAS.
@@ -1399,6 +1521,8 @@ def use_cutedsl_bf16_gemm(m: int, n: int, k: int) -> bool:
         return True
     if m <= 8 and (n, k) in _K3_TGV_WIN_SHAPES:
         return True
+    if _model_takes_tgv(m, n, k):
+        return True
     if n < 1024 or k < 2048 or k > 6144:
         return False
     ragged = m % 16 != 0
@@ -1423,6 +1547,7 @@ def _tgv_bf16_gemm_run(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
+    tactic: Optional[int] = None,
 ) -> torch.Tensor:
     if not is_sm100_supported():
         raise RuntimeError("cutedsl_bf16_gemm requires an SM10x GPU")
@@ -1436,14 +1561,9 @@ def _tgv_bf16_gemm_run(
         # Match cuBLAS/F.linear semantics for empty batches; a 0-CTA launch
         # would fail with CUDA_ERROR_INVALID_VALUE.
         return out
-    return _run_tgv(
-        x,
-        weight.t(),
-        bias,
-        out,
-        pdl=True,
-        tactic=_pick_tactic(x.shape[0], weight.shape[0], weight.shape[1]),
-    )
+    if tactic is None:
+        tactic = _pick_tactic(x.shape[0], weight.shape[0], weight.shape[1])
+    return _run_tgv(x, weight.t(), bias, out, pdl=True, tactic=tactic)
 
 
 def _tgv_bf16_gemm_out_run(
@@ -1507,6 +1627,7 @@ def _tgv_bf16_gemm_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: Optional[torch.Tensor],
+    tactic: Optional[int] = None,
 ) -> torch.Tensor:
     return x.new_empty((x.shape[0], weight.shape[0]))
 
@@ -1540,9 +1661,11 @@ def cutedsl_bf16_gemm(
     x: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor | None = None,
+    tactic: int | None = None,
 ) -> torch.Tensor:
-    """out[M, N] = x[M, K] @ weight[N, K].T (+ bias[N]), all bf16, fp32 accum."""
-    return torch.ops.sglang.cutedsl_tgv_bf16_gemm(x, weight, bias)
+    """out[M, N] = x[M, K] @ weight[N, K].T (+ bias[N]), all bf16, fp32 accum;
+    ``tactic`` (an index into _TGV_CUTE_EXT_TACTIC_CONFIGS) overrides _pick_tactic."""
+    return torch.ops.sglang.cutedsl_tgv_bf16_gemm(x, weight, bias, tactic)
 
 
 @debug_kernel_api

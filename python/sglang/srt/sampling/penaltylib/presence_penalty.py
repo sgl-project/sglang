@@ -1,7 +1,7 @@
 import torch
 
 from sglang.srt.sampling.penaltylib.orchestrator import _BatchedPenalizer
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.utils.device import is_pin_memory_available
 
 
 class BatchedPresencePenalizer(_BatchedPenalizer):

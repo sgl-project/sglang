@@ -1109,13 +1109,11 @@ class ImageVAEEncodingStage(PipelineStage):
             if image.mode == "RGB":
                 return preprocess_image(image, device=get_local_torch_device())
             image = numpy_to_pt(pil_to_numpy(image))
+            return image if image.min() < 0 else normalize(image)
 
-        do_normalize = True
-        if image.min() < 0:
-            do_normalize = False
-        if do_normalize:
-            image = normalize(image)
-
+        # Tensors come from the pipeline config's preprocessing, already in
+        # [-1, 1]. Their range cannot be inferred from the values: a bright
+        # image has no negative pixel and would be normalized a second time.
         return image
 
     def verify_input(self, batch: Req, server_args: ServerArgs) -> VerificationResult:

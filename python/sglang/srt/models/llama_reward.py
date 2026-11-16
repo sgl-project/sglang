@@ -25,9 +25,9 @@ from sglang.srt.layers.pooler import (
     pool_hidden_states,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.models.llama import LlamaForCausalLM, LlamaModel
-from sglang.srt.utils import add_prefix
 
 
 class LlamaForSequenceClassification(nn.Module):
