@@ -140,7 +140,7 @@ class TestRustServerCrashDumpBoundary(CustomTestCase):
                     http.post,
                     f"http://127.0.0.1:{port}/generate",
                     json=payload,
-                    headers={"x-smg-routing-key": "k"},
+                    headers={"x-sgl-routing-key": "k"},
                     timeout=20,
                 )
                 self.assertTrue(server.wait_request(timeout_ms=15000))

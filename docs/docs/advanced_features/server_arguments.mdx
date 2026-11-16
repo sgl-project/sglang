@@ -34,10 +34,10 @@ You can find all arguments by `python3 -m sglang.launch_server --help`
   python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --tp 2
   ```
 
-- To enable multi-GPU data parallelism, add `--dp 2`. Data parallelism is better for throughput if there is enough memory. It can also be used together with tensor parallelism. The following command uses 4 GPUs in total. We recommend [SGLang Model Gateway (former Router)](../advanced_features/sgl_model_gateway) for data parallelism.
+- To enable multi-GPU data parallelism, add `--dp 2`. Data parallelism is better for throughput if there is enough memory. It can also be used together with tensor parallelism. The following command uses 4 GPUs in total. To run data-parallel replicas as separate servers behind a router, see [DP, DPA and sgl-router](../advanced_features/dp_dpa_router_guide).
 
   ```bash Command
-  python -m sglang_router.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --dp 2 --tp 2
+  python -m sglang.launch_server --model-path meta-llama/Meta-Llama-3-8B-Instruct --dp 2 --tp 2
   ```
 
 - If you see out-of-memory errors during serving, try to reduce the memory usage of the KV cache pool by setting a smaller value of `--mem-fraction-static`.
@@ -254,7 +254,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--grpc-mode`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>If set, use gRPC server instead of HTTP server.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Serve the encoder over gRPC on --port instead of HTTP. Requires --encoder-only.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
@@ -373,6 +373,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Data type for kv cache storage. "auto" will use model data type. "bf16" or "bfloat16" for BF16 KV cache. "fp8_e5m2" and "fp8_e4m3" are supported for CUDA 11.8+. "mxfp8" is supported by the FA4 backend. "nvfp4" selects the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" selects the MX-style block-size-16 FP4 E2M1 KV cache recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. Out-of-tree platform plugins can register further values for KV cache formats that only their KV pool implements; in-tree platforms reject them.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>auto</code>, <code>fp8_e5m2</code>, <code>fp8_e4m3</code>, <code>mxfp8</code>, <code>bf16</code>, <code>bfloat16</code>, <code>nvfp4</code>, <code>fp4_mx_block16</code>, and values registered by platform plugins</td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--indexer-kv-cache-dtype`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Quantization recipe for the DSA lightning-indexer KV cache (Ascend NPU only). None disables the quantized indexer cache and keeps the default indexer behavior. "int8" stores the indexer keys in INT8 with FP16 scales to speed up the lightning indexer.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>int8</code></td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-fp32-lm-head`</td>
@@ -1027,12 +1033,6 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Config opentelemetry collector endpoint if --enable-trace is set. format: &lt;ip&gt;:&lt;port&gt;</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`localhost:4317`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--grpc-http-sidecar-port`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Port for the HTTP sidecar server in gRPC mode (--grpc-mode). Serves Prometheus metrics and profiling endpoints. Defaults to --port + 1. Not used in HTTP mode.</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--extra-metric-labels`</td>

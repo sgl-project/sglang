@@ -99,11 +99,8 @@ impl Drop for DpRankGuard {
     }
 }
 
-/// Parse a host from a worker URL. Matches SMG's `worker_builder.rs`
-/// fallback chain: parse as-is, retry with `http://` prefix if missing,
-/// fall back to `"localhost"` if both fail. The fallback is defensive —
-/// discovery code should never emit an unparsable URL — but a panic
-/// here would crash the whole router on a single bad config entry.
+/// Falls back to `"localhost"` rather than panicking: one bad config entry must
+/// not crash the router.
 fn parse_bootstrap_host(url: &str) -> String {
     if let Ok(parsed) = url::Url::parse(url) {
         if let Some(h) = parsed.host_str() {

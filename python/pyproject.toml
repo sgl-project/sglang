@@ -40,6 +40,9 @@ dependencies = [
   "fastapi",
   "flashinfer_python[cu13]==0.7.4", # keep it aligned with jit-cache version in Dockerfile
   "gguf",
+  "grpcio>=1.81.1",
+  "grpcio-health-checking>=1.81.1",
+  "grpcio-reflection>=1.81.1",
   "humming-kernels[cu13]==0.1.18",
   "interegular",
   "IPython",
@@ -64,6 +67,7 @@ dependencies = [
   # The Rust image pipeline (dynamo-multimodal) reproduces Pillow 12.x bicubic.
   "pillow<13",
   "prometheus-client>=0.20.0",
+  "protobuf>=6.33.5",
   "psutil",
   "py-spy",
   "pybase64",
@@ -82,12 +86,11 @@ dependencies = [
   "sgl-fa3==0.1.0 ; sys_platform == 'linux' and platform_machine == 'x86_64'",  # Only an x86_64 wheel is published.
   "sgl-flash-mla==1.0.5",
   "sglang-kernel==0.4.11",
-  "smg-grpc-servicer>=0.9.0",
   "soundfile==0.13.1",
   "tiktoken",
   "tilelang==0.1.12",
   "timm==1.0.25",
-  "tml-renderers==0.1.0 ; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or (sys_platform == 'darwin' and platform_machine == 'arm64')",
+  "tml-renderers==0.4.1 ; (sys_platform == 'linux' and (platform_machine == 'x86_64' or platform_machine == 'aarch64')) or (sys_platform == 'darwin' and platform_machine == 'arm64')",
   "tokenizers==0.23.2",
   "torch==2.14.1",
   "torch_memory_saver>=0.0.9.post1",

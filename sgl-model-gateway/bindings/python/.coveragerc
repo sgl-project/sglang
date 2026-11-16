@@ -1,9 +1,0 @@
-[run]
-source = sglang_router
-omit =
-    */mini_lb.py
-    */cli.py
-    */__main__.py
-
-[report]
-fail_under = 80
