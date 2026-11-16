@@ -38,6 +38,10 @@ for mod in (
     "sgl_kernel_npu.operators.attention",
     "sgl_kernel_npu.operators.indexer",
     "sgl_kernel_npu.operators.mem_cache",
+    # pool_host/{mha,mamba}.py import this under ``if _is_npu``, so only a
+    # real-NPU environment reaches the import; a mock parent without
+    # ``__path__`` would fail the from-import before the names resolve.
+    "sgl_kernel_npu.kvcacheio",
     "sgl_kernel_npu.attention",
     "sgl_kernel_npu.attention.sinks_attention",
     "sgl_kernel_npu.norm",
@@ -337,13 +341,22 @@ class TestPoolFactory(unittest.TestCase):
         with self.assertRaises(AssertionError):
             self._make(page_size=128, global_page_size=128, kv_layout=KVLayout.V4)
 
+    def _pool(self, compression_ratios, **extra):
+        """A bare pool instance: ``_is_v41_model`` is a method, so the fake
+        self must be of the real class (a plain namespace cannot carry it)."""
+        pool = DSV4NPUTokenToKVPool.__new__(DSV4NPUTokenToKVPool)
+        pool.compression_ratios = tuple(compression_ratios)
+        for key, value in extra.items():
+            setattr(pool, key, value)
+        return pool
+
     def test_window_layout_resolves_the_row_format(self):
-        fake = SimpleNamespace(compression_ratios=(0, 1, 2))
+        fake = self._pool((0, 1, 2))
         self.assertIs(
             DSV4NPUTokenToKVPool._window_kv_layout(fake),
             NPUDSV4KVLayout.V41_SWA_FP8,
         )
-        fake_v4 = SimpleNamespace(compression_ratios=(0, 4, 128))
+        fake_v4 = self._pool((0, 4, 128))
         with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
             self.assertIs(
                 DSV4NPUTokenToKVPool._window_kv_layout(fake_v4),
@@ -358,10 +371,7 @@ class TestPoolFactory(unittest.TestCase):
     def test_pinned_generation_overrides_the_ratio_list(self):
         # A draft worker pins the V4 generation while its ratio list is empty:
         # its forward still runs the V4 sparse-attention op.
-        draft = SimpleNamespace(
-            compression_ratios=(0,),
-            _npu_window_generation="v4",
-        )
+        draft = self._pool((0,), _npu_window_generation="v4")
         with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
             self.assertIs(
                 DSV4NPUTokenToKVPool._window_kv_layout(draft),
@@ -371,30 +381,19 @@ class TestPoolFactory(unittest.TestCase):
                 DSV4NPUTokenToKVPool.compressed_kv_layout(draft, 1),
                 NPUDSV4KVLayout.V4_FP8,
             )
-        pinned_v41 = SimpleNamespace(
-            compression_ratios=(0,),
-            _npu_window_generation="v41",
-        )
+        pinned_v41 = self._pool((0,), _npu_window_generation="v41")
         self.assertIs(
             DSV4NPUTokenToKVPool._window_kv_layout(pinned_v41),
             NPUDSV4KVLayout.V41_SWA_FP8,
         )
 
     def test_compressed_kv_layout_tags_every_ratio(self):
-        fake = SimpleNamespace(
-            compression_ratios=(0, 1, 2),
-            kv_layout=KVLayout.V4,
-            compressed_kv_layout_option=None,
-        )
+        fake = self._pool((0, 1, 2))
         self.assertIs(
             DSV4NPUTokenToKVPool.compressed_kv_layout(fake, 1),
             NPUDSV4KVLayout.V41_CMP_FP4,
         )
-        fake_v4 = SimpleNamespace(
-            compression_ratios=(0, 4, 128),
-            kv_layout=KVLayout.V4,
-            compressed_kv_layout_option=None,
-        )
+        fake_v4 = self._pool((0, 4, 128))
         with patch.object(dsv4_memory_pool, "is_npu_arch35", return_value=True):
             self.assertIs(
                 DSV4NPUTokenToKVPool.compressed_kv_layout(fake_v4, 4),
