@@ -18,6 +18,7 @@ from transformers import (
 )
 from transformers.image_utils import to_numpy_array
 
+from sglang.srt.configs.deepseekvl2 import DictOutput
 from sglang.srt.configs.utils import register_image_processor, register_processor
 from sglang.srt.multimodal.mm_utils import expand2square
 
@@ -271,23 +272,6 @@ class VLMImageProcessor(BaseImageProcessor):
     @property
     def default_shape(self):
         return [3, self.image_size, self.image_size]
-
-
-class DictOutput(object):
-    def items(self):
-        return self.__dict__.items()
-
-    def keys(self):
-        return self.__dict__.keys()
-
-    def __getitem__(self, item):
-        return self.__dict__[item]
-
-    def __contains__(self, key):
-        return key in self.__dict__
-
-    def __setitem__(self, key, value):
-        self.__dict__[key] = value
 
 
 @dataclass
