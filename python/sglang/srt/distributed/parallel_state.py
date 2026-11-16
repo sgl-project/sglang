@@ -133,6 +133,10 @@ class P2PWork:
     work: Optional[torch.distributed.Work]
     payload: Optional[torch.Tensor]
 
+    def wait(self) -> None:
+        if self.work is not None:
+            self.work.wait()
+
 
 def _split_tensor_dict(
     tensor_dict: Dict[str, Union[torch.Tensor, Any]],
@@ -3555,7 +3559,7 @@ def _warn_if_called_from_outside(name: str, replacement: str):
     def decorate(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
-            if name not in _ALREADY_WARNED:
+            if not torch.compiler.is_compiling() and name not in _ALREADY_WARNED:
                 caller = sys._getframe(1).f_globals.get("__name__", "")
                 if not caller.startswith(_EXEMPT_CALLERS):
                     _ALREADY_WARNED.add(name)

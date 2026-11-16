@@ -35,6 +35,11 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     is_sparsity_driven_kv_offload_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+    dsa_token_shard_cumulative_query_lens,
+    dsa_token_shard_key_lens,
+    get_dsa_token_shard_plan,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
@@ -114,8 +119,7 @@ class ForwardMetadata:
     cu_seqlens_q: Optional[torch.Tensor] = None  # Query offsets, including leading 0.
     actual_seq_lengths_q: Optional[torch.Tensor] = None
     actual_seq_lengths_q_pa: Optional[torch.Tensor] = None
-    # CPU mirror of actual_seq_lengths_q_pa for the host metadata op
-    # (torch.ops.npu.sparse_attn_sharedkv_metadata_host reads CPU int32 inputs).
+    # CPU mirror of actual_seq_lengths_q_pa for host-side padding trims.
     actual_seq_lengths_q_pa_cpu: Optional[torch.Tensor] = None
     actual_seq_lengths_kv: Optional[torch.Tensor] = None
     seqused_q: Optional[torch.Tensor] = None  # Valid query counts; padding is 0.
@@ -2034,8 +2038,18 @@ class AscendAttnBackend(AttentionBackend):
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
+        # The token shard replaces the query lengths, built once per forward.
+        dsa_token_shard_plan = get_dsa_token_shard_plan(forward_batch)
+        dsa_token_shard_qlen = None
+        if dsa_token_shard_plan is not None:
+            dsa_token_shard_qlen = dsa_token_shard_cumulative_query_lens(
+                forward_batch, dsa_token_shard_plan, q.device
+            )
+
         if is_prefill:
-            if self.forward_metadata.actual_seq_lengths_q is not None:
+            if dsa_token_shard_qlen is not None:
+                actual_seq_qlen = dsa_token_shard_qlen
+            elif self.forward_metadata.actual_seq_lengths_q is not None:
                 actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
             else:
                 actual_seq_qlen = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
@@ -2068,6 +2082,12 @@ class AscendAttnBackend(AttentionBackend):
             actual_seq_lengths_kv = self.forward_metadata.seq_lens_cpu_int
         else:
             actual_seq_lengths_kv = self.forward_metadata.seq_lens
+
+        # The plan is refused under prefill CP, so this never meets its layout.
+        if dsa_token_shard_plan is not None and is_prefill:
+            actual_seq_lengths_kv = dsa_token_shard_key_lens(
+                forward_batch, dsa_token_shard_plan, q.device
+            )
 
         if (
             is_prefill
