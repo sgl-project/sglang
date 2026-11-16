@@ -438,7 +438,6 @@ async def lifespan(fast_api_app: FastAPI):
         if (
             getattr(fast_api_app, "is_single_tokenizer_mode", False)
             and get_serving().grpc_port is not None
-            and not (get_serving().smg_grpc_mode or get_serving().grpc_mode)
         ):
             grpc_handle = _start_native_grpc_server_for_runtime(
                 server_args=server_args,

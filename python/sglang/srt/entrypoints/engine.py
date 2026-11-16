@@ -419,19 +419,7 @@ class Engine(EngineScoreMixin, EngineBase):
     def _resolve_routed_dp_rank(
         self,
         routed_dp_rank: Optional[int],
-        data_parallel_rank: Optional[int],
     ) -> Optional[int]:
-        if data_parallel_rank is not None:
-            import warnings
-
-            warnings.warn(
-                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
-                DeprecationWarning,
-                stacklevel=3,
-            )
-            if routed_dp_rank is None:
-                routed_dp_rank = data_parallel_rank
-
         if routed_dp_rank is not None:
             num_dp_ranks = get_parallel().num_dp_ranks
             if num_dp_ranks <= 1 and routed_dp_rank == 0:
@@ -493,8 +481,6 @@ class Engine(EngineScoreMixin, EngineBase):
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
         kv_hints: Optional[Dict] = None,
-        # Deprecated: use routed_dp_rank instead
-        data_parallel_rank: Optional[int] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
@@ -507,9 +493,7 @@ class Engine(EngineScoreMixin, EngineBase):
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
-        routed_dp_rank = self._resolve_routed_dp_rank(
-            routed_dp_rank, data_parallel_rank
-        )
+        routed_dp_rank = self._resolve_routed_dp_rank(routed_dp_rank)
 
         obj = GenerateReqInput(
             text=prompt,
@@ -608,8 +592,6 @@ class Engine(EngineScoreMixin, EngineBase):
         routed_dp_rank: Optional[int] = None,
         disagg_prefill_dp_rank: Optional[int] = None,
         kv_hints: Optional[Dict] = None,
-        # Deprecated: use routed_dp_rank instead
-        data_parallel_rank: Optional[int] = None,
         external_trace_header: Optional[Dict] = None,
         rid: Optional[Union[List[str], str]] = None,
         session_params: Optional[Dict] = None,
@@ -622,9 +604,7 @@ class Engine(EngineScoreMixin, EngineBase):
         The arguments of this function is the same as `sglang/srt/managers/io_struct.py::GenerateReqInput`.
         Please refer to `GenerateReqInput` for the documentation.
         """
-        routed_dp_rank = self._resolve_routed_dp_rank(
-            routed_dp_rank, data_parallel_rank
-        )
+        routed_dp_rank = self._resolve_routed_dp_rank(routed_dp_rank)
 
         obj = GenerateReqInput(
             text=prompt,
