@@ -81,6 +81,14 @@ def _move_unregistered_tensors(module: torch.nn.Module, device: str) -> None:
             attrs[attr_name] = moved_value
 
 
+def _release_cuda_graphs(module: torch.nn.Module) -> None:
+    # Graph pools and captured outputs stay on the GPU after the weights move.
+    for submodule in module.modules():
+        release = getattr(submodule, "release_cuda_graphs", None)
+        if callable(release):
+            release()
+
+
 def _is_layerwise_offload_managed(module: torch.nn.Module) -> bool:
     return is_layerwise_offloaded_module(module)
 
@@ -158,6 +166,8 @@ class MemoryOccupationController:
     def _offload_active_modules_to_cpu(self) -> dict[str, str]:
         restore_map: dict[str, str] = {}
         for name, module in get_updatable_modules(self.pipeline).items():
+            # also for modules already offloaded between uses
+            _release_cuda_graphs(module)
             if _is_layerwise_offload_managed(module):
                 continue
             device = _get_module_device(module)

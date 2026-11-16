@@ -295,6 +295,62 @@
             "runtime_peak_vram_mb": 34903.58,
             "load_peak_allocated_mb": 13661.57,
             "runtime_peak_allocated_mb": 31120.37
+        },
+        "minimax_h3_image_t2i": {
+            "stages_ms": {
+                "MiniMaxH3PartitionAdmissionStage": 0.01,
+                "MiniMaxH3TextEncodingStage": 0.54,
+                "MiniMaxH3VisualEncodingStage": 0.01,
+                "MiniMaxH3LatentPreparationStage": 1.84,
+                "MiniMaxH3TimestepPreparationStage": 0.09,
+                "MiniMaxH3DenoisingStage": 903.57,
+                "MiniMaxH3DecodingStage": 874.98
+            },
+            "denoise_step_ms": {
+                "0": 19.61,
+                "1": 75.53,
+                "2": 148.58,
+                "3": 147.61,
+                "4": 153.34,
+                "5": 152.23
+            },
+            "expected_e2e_ms": 1788.26,
+            "expected_load_ms": 235750.66,
+            "expected_avg_denoise_ms": 116.15,
+            "expected_median_denoise_ms": 148.09,
+            "load_peak_vram_mb": 115964.0,
+            "runtime_peak_vram_mb": 116498.0,
+            "load_peak_allocated_mb": 115514.33,
+            "runtime_peak_allocated_mb": 114358.96,
+            "estimated_full_test_time_s": 281.1
+        },
+        "minimax_h3_image_edit": {
+            "stages_ms": {
+                "MiniMaxH3PartitionAdmissionStage": 0.01,
+                "MiniMaxH3TextEncodingStage": 16.25,
+                "MiniMaxH3VisualEncodingStage": 43.95,
+                "MiniMaxH3LatentPreparationStage": 0.04,
+                "MiniMaxH3TimestepPreparationStage": 0.08,
+                "MiniMaxH3DenoisingStage": 1658.58,
+                "MiniMaxH3DecodingStage": 907.8
+            },
+            "denoise_step_ms": {
+                "0": 18.99,
+                "1": 135.22,
+                "2": 272.4,
+                "3": 281.78,
+                "4": 275.84,
+                "5": 276.59
+            },
+            "expected_e2e_ms": 2635.42,
+            "expected_load_ms": 48000.89,
+            "expected_avg_denoise_ms": 210.13,
+            "expected_median_denoise_ms": 274.12,
+            "load_peak_vram_mb": 115964.0,
+            "runtime_peak_vram_mb": 116962.0,
+            "load_peak_allocated_mb": 115514.33,
+            "runtime_peak_allocated_mb": 114641.36,
+            "estimated_full_test_time_s": 66.8
         }
     }
 }

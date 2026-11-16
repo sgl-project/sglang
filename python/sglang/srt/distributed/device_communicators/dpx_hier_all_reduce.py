@@ -20,6 +20,7 @@ from .configs.custom_all_reduce_v2 import (
     Range,
     two_shot_push_slot_bytes,
 )
+from .symm_workspace import SymmetricBuffer
 
 logger = logging.getLogger(__name__)
 
@@ -100,7 +101,8 @@ class DpxHierAllReduce:
 
     Each SoC's two partitions reduce-scatter between themselves (the pair plane),
     every partition all-reduces its half with its peers on the other SoCs (a
-    2shot_push on the cross plane), and the pair all-gathers the result.
+    2shot_push on the cross plane), and the pair all-gathers the result. Both planes
+    live on a symmetric buffer of their own.
     """
 
     @staticmethod
@@ -127,15 +129,10 @@ class DpxHierAllReduce:
         max_bytes = max_bytes if pairs else 0
         return _fit_hier(config, max_bytes), pairs, max_bytes
 
-    @staticmethod
-    def workspace_bytes(*, world_size: int, max_bytes: int) -> int:
-        return _layout(world_size, max_bytes).total_bytes
-
     def __init__(
         self,
         *,
-        slabs: List[torch.Tensor],
-        offset: int,
+        group: ProcessGroup,
         device: torch.device,
         rank: int,
         world_size: int,
@@ -143,8 +140,9 @@ class DpxHierAllReduce:
         max_bytes: int,
         push_blocks: int,
     ) -> None:
-        """Both planes live in ``[offset, offset + workspace_bytes)`` of ``slabs``."""
         layout = _layout(world_size, max_bytes)
+        self._buffer = SymmetricBuffer(group, device, layout.total_bytes)
+        slabs = self._buffer.slabs
         # partition p of a pair reduces half p, which the cross plane of every SoC's
         # partition p then all-reduces
         pair = next(ranks for ranks in pairs if rank in ranks)
@@ -153,14 +151,13 @@ class DpxHierAllReduce:
         self._counters = torch.zeros((2,), dtype=torch.int64, device=device)
 
         def plane(
-            ranks: List[int], start: int, slot_bytes: int, counter
+            ranks: List[int], offset: int, slot_bytes: int, counter
         ) -> Communicator:
             # 2 phases x len(ranks) peers, like the full push plane
             nbytes = 2 * len(ranks) * slot_bytes
-            assert start + nbytes <= layout.total_bytes
-            begin = offset + start
+            assert offset + nbytes <= layout.total_bytes
             workspaces = [
-                slabs[r][begin : begin + nbytes].view(-1, slot_bytes) for r in ranks
+                slabs[r][offset : offset + nbytes].view(-1, slot_bytes) for r in ranks
             ]
             return Communicator(
                 push=PushPlane(
@@ -178,6 +175,12 @@ class DpxHierAllReduce:
         self._cross: Optional[Communicator] = plane(
             cross, layout.pair_bytes, layout.cross_slot, self._counters[1:2]
         )
+        if rank == 0:
+            logger.info(
+                "Custom all-reduce v2 hier_2shot_push: %.2f MB, pairs = %s",
+                layout.total_bytes / (1 << 20),
+                pairs,
+            )
 
     def all_reduce(self, input: torch.Tensor) -> torch.Tensor:
         half = custom_pair_stage(self._pair, input.view(-1), all_gather=False)
@@ -186,5 +189,5 @@ class DpxHierAllReduce:
         return out.view(input.shape)
 
     def close(self) -> None:
-        # drop the views; the slabs belong to the caller
-        self._pair = self._cross = None
+        self._pair = self._cross = None  # the views go before the memory
+        self._buffer.close()

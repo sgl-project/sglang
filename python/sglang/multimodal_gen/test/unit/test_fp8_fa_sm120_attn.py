@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """fp8_fa_sm120 attention backend against cuDNN SDPA on MiniMax-H3 style inputs.
 
-Needs an SM120 GPU; skipped elsewhere. Shapes are kept small (8 heads) so the
+Needs an SM120/SM121 GPU; skipped elsewhere. Shapes are kept small (8 heads) so the
 CuTe-DSL compile and the runs stay in seconds.
 """
 
@@ -9,8 +9,9 @@ import pytest
 import torch
 
 pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability() != (12, 0),
-    reason="fp8_fa_sm120 attention needs an SM120 GPU",
+    not torch.cuda.is_available()
+    or torch.cuda.get_device_capability() not in ((12, 0), (12, 1)),
+    reason="fp8_fa_sm120 attention needs SM120/SM121",
 )
 
 HEADS = 8
@@ -63,8 +64,9 @@ def _error_metrics(candidate, reference):
 
 
 @pytest.mark.parametrize("sequence", [4096, 5980])
-def test_forward_matches_cudnn(sequence):
+def test_forward_matches_cudnn(sequence, monkeypatch):
     ours, reference = _make_impls()
+    monkeypatch.setattr(ours, "_report_fallback", pytest.fail)
     q, k, v = _fused_qkv_views(sequence)
 
     output = ours.forward(q.unsqueeze(0), k.unsqueeze(0), v.unsqueeze(0), None)
@@ -108,8 +110,9 @@ def test_kernel_is_reused_across_calls():
     assert not torch.equal(first, second)
 
 
-def test_varlen_trailing_padding_keeps_tail_zero():
+def test_varlen_trailing_padding_keeps_tail_zero(monkeypatch):
     ours, _ = _make_impls()
+    monkeypatch.setattr(ours, "_report_fallback", pytest.fail)
     used = 5980
     total = 6016  # 64-aligned tail padding, as MiniMax-H3 packs it
     q, k, v = _fused_qkv_views(total)

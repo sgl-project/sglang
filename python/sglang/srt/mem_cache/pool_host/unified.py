@@ -9,6 +9,7 @@ from sglang.srt.mem_cache.device_pool_info import MHABufferInfo, PageEnvelopeBuf
 from sglang.srt.mem_cache.kv.memory.host_backing import _SharedPageEnvelopeHostBacking
 from sglang.srt.mem_cache.pool_host.base import HostKVCache
 from sglang.srt.utils import is_cuda, is_hip
+from sglang.srt.utils.device import async_h2d_tensor
 
 _is_cuda = is_cuda()
 _is_hip = is_hip()
@@ -226,13 +227,8 @@ class UnifiedPageEnvelopeHostPool(HostKVCache):
         )
         if io_backend == "kernel":
             if not host_indices.is_cuda:
-                if self._device_page_buffer.is_cuda:
-                    # The upload runs on the transfer stream; from pageable memory
-                    # it would block the caller until that stream's earlier copies
-                    # finish, so stage it through pinned memory.
-                    host_indices = host_indices.pin_memory()
-                host_indices = host_indices.to(
-                    self._device_page_buffer.device, non_blocking=True
+                host_indices = async_h2d_tensor(
+                    host_indices, device=self._device_page_buffer.device
                 )
             return host_indices, device_indices
         if io_backend == "direct":

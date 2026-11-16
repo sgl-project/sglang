@@ -3,7 +3,7 @@ that reused its rows after its shared reads ended."""
 
 import unittest
 from types import ModuleType, SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import torch
 from test_declared_parts import _build
@@ -300,7 +300,7 @@ class TestLateReadsUseTheForwardSlots(CustomTestCase):
         return SimpleNamespace(
             model_runner=SimpleNamespace(
                 model_config=None,
-                model=None,
+                model=torch.nn.Module(),
                 attn_backend=f.hybrid,
                 req_to_token_pool=f.req,
                 runner_ids=f.reader,
@@ -355,6 +355,10 @@ class TestLateReadsUseTheForwardSlots(CustomTestCase):
             for name, (flags, kernel) in branches.items():
                 with self.subTest(branch=name):
                     f = _Forward(mode=ForwardMode.TARGET_VERIFY, graph=graph)
+                    # The ring rows the forward resolved: what a request-scoped
+                    # ring is indexed by, never the live request table.
+                    ring_rows = torch.tensor([5, 6], dtype=torch.int32)
+                    f.backend.forward_metadata.replayssm_ring_indices = ring_rows
                     mamba_pool = SimpleNamespace(
                         replayssm_cache_base=torch.zeros(8, dtype=torch.int32),
                         replayssm_spec_write_pos=torch.zeros(8, dtype=torch.int32),
@@ -390,6 +394,10 @@ class TestLateReadsUseTheForwardSlots(CustomTestCase):
                         kwargs["state_batch_indices"].tolist(),
                         f.working_physical.tolist(),
                     )
+                    if name == "circular":
+                        self.assertEqual(
+                            kwargs["replay_indices"].tolist(), ring_rows.tolist()
+                        )
                     self.assertEqual(
                         kwargs["mamba_track_indices"].tolist(),
                         f.track_physical.tolist(),
@@ -399,6 +407,44 @@ class TestLateReadsUseTheForwardSlots(CustomTestCase):
                             call.args[2].tolist(),
                             (f.working_physical.tolist(), f.track_physical.tolist()),
                         )
+
+    def test_megakernel_recurrent_commit(self):
+        accept_lens = torch.tensor([2, 1])
+        accept_index = torch.tensor([[0, 1], [2, -1]])
+        for graph in self._cases():
+            for taken in (True, False):
+                with self.subTest(taken=taken):
+                    f = _Forward(mode=ForwardMode.TARGET_VERIFY, graph=graph)
+                    commit = MagicMock(return_value=taken)
+                    built = SimpleNamespace(commit_recurrent_state=commit)
+                    f.reuse_rows()
+                    with (
+                        patch.object(spec_utils, "mambaish_config", return_value=True),
+                        patch.object(spec_utils, "mamba_track_grid", return_value=8),
+                        patch.object(
+                            spec_utils, "built_megakernel", return_value=built
+                        ),
+                        patch.object(
+                            HybridLinearAttnBackend,
+                            "update_mamba_state_after_mtp_verify",
+                        ) as stock,
+                        patch(_HLA + ".commit_ple_states_after_verify") as ple,
+                    ):
+                        spec_utils.commit_mamba_states_after_verify(
+                            self._target_worker(f, None),
+                            self._verify_batch(f),
+                            accept_lens,
+                            accept_index,
+                            _DRAFT_TOKENS,
+                        )
+                    (io,) = commit.call_args.args
+                    # the verify's resolved slots, not what the reused rows name now
+                    self.assertEqual(
+                        io.state_slots.tolist(), f.working_physical.tolist()
+                    )
+                    self.assertEqual(io.track_slots.tolist(), f.track_physical.tolist())
+                    self.assertEqual(stock.called, not taken)
+                    self.assertEqual(ple.called, taken)
 
     def test_post_verify_graph_commit(self):
         """The post-verify graphs' side-stream commit writes the slots staged
@@ -525,6 +571,84 @@ class TestRelayedCommitSlots(CustomTestCase):
         self.assertIsInstance(slots, ForwardStateSlots)
         self.assertEqual(slots.working.tolist(), f.live_working().tolist())
         self.assertEqual(slots.track.tolist(), f.translate(f.track).tolist())
+
+
+class TestMegakernelOwnState(CustomTestCase):
+    def tearDown(self):
+        reset_context()
+
+    @staticmethod
+    def _own(**capabilities):
+        flags = {"tracks_decode_state": True, "backs_up_state": True, **capabilities}
+        return SimpleNamespace(reset_state_slots=MagicMock(), **flags)
+
+    def test_it_restarts_where_a_checkpoint_is_written_or_bound(self):
+        from sglang.srt.mem_cache.kv.state_storage import StateStorage
+        from sglang.srt.model_executor.model_runner import ModelRunner
+
+        f = _Forward(mode=ForwardMode.DECODE, graph=False)
+        own = f.alloc.state.own_state = self._own()
+        runner = SimpleNamespace(
+            req_to_token_pool=f.req,
+            is_draft_worker=False,
+            token_to_kv_pool_allocator=f.alloc,
+            runner_ids=f.reader,
+        )
+        extend = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            req_pool_indices=f.rows,
+            mamba_clear_indices=None,
+            mamba_cow_src_indices=None,
+            mamba_cow_dst_indices=None,
+        )
+        ModelRunner._maybe_execute_deferred_mamba_cow_and_clear(runner, extend)
+        slots, rows = own.reset_state_slots.call_args.args
+        self.assertEqual(slots.tolist(), f.working_physical.tolist())
+        self.assertIs(rows, f.rows)
+        # a newly bound slot (a PD decode slot runs no extend first)
+        storage = StateStorage(
+            sub_pool="state",
+            pool=SimpleNamespace(replayssm_write_pos=None, size=8),
+            slots=SimpleNamespace(
+                alloc=lambda n: torch.tensor([3, 4][:n]), translate=lambda m: m + 10
+            ),
+            layer_map={},
+            short_conv_pool=None,
+            ngram_pool=None,
+        )
+        own = storage.own_state = self._own()
+        table = SimpleNamespace(
+            enable_mamba_extra_buffer=False,
+            device="cpu",
+            req_index_to_mamba_index_mapping=torch.zeros(8, dtype=torch.int32),
+        )
+        holding = SimpleNamespace(kv=SimpleNamespace(mamba_pool_idx=torch.tensor(5)))
+        fresh = SimpleNamespace(kv=SimpleNamespace(mamba_pool_idx=None))
+        for req in (holding, fresh):
+            req.kv.holds_mamba = req.kv.mamba_pool_idx is not None
+        storage.acquire(table, [holding, fresh], [1, 2])
+        slots, rows = own.reset_state_slots.call_args.args
+        self.assertEqual((slots.tolist(), rows.tolist()), ([13], [2]))
+
+    def test_its_capabilities_limit_tracking_and_backups(self):
+        from sglang.srt.mem_cache.common import backup_kv_cache
+        from sglang.srt.mem_cache.kv.state_storage import StateStorage
+
+        state = StateStorage.empty("state")
+        state.own_state = self._own(tracks_decode_state=False, backs_up_state=False)
+        allocator = SimpleNamespace(state=state)
+        batch = SimpleNamespace(
+            token_to_kv_pool_allocator=allocator,
+            mamba_track_indices=torch.tensor([7]),
+            mamba_track_mask=torch.tensor([True]),
+        )
+        mamba = SimpleNamespace(enable_mamba_extra_buffer=True)
+        with patch.object(
+            spec_utils, "get_exec", return_value=SimpleNamespace(mamba=mamba)
+        ):
+            spec_utils.prepare_mamba_track_for_verify(batch)
+        self.assertIsNone(batch.mamba_track_indices)
+        self.assertFalse(backup_kv_cache(MagicMock(), None, None, allocator, "cpu"))
 
 
 if __name__ == "__main__":

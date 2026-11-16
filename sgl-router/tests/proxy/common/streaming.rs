@@ -26,7 +26,6 @@ pub async fn collect_body(body: axum::body::Body) -> Bytes {
 mod tests {
     use super::*;
 
-    /// Ported from SMG tests/api/streaming_tests.rs::test_sse_format_parsing.
     /// Verifies that parse_sse_data:
     ///   1. Extracts standard `data: …` lines.
     ///   2. Silently ignores SSE `event: …` type fields (not data lines).
