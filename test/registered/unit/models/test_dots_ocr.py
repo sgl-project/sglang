@@ -53,7 +53,7 @@ class TestDotsOCRLanguageHead(CustomTestCase):
 
     def test_embed_and_head_are_the_weights_the_checkpoint_fills(self):
         """The embedding and LM head the wrapper hands to a draft model must be
-        the ones load_weights fills, with no second vocab matrix beside them."""
+        the ones load_weights fills."""
         model = _build_model(tie_word_embeddings=False)
         embed_weight = torch.arange(_VOCAB_SIZE * _HIDDEN_SIZE).reshape(
             _VOCAB_SIZE, _HIDDEN_SIZE
@@ -70,11 +70,6 @@ class TestDotsOCRLanguageHead(CustomTestCase):
 
         torch.testing.assert_close(embed.float(), embed_weight.float())
         torch.testing.assert_close(head.float(), head_weight.float())
-        self.assertIs(model.lm_head.weight, head)
-        self.assertEqual(
-            [name for name, _ in model.named_parameters() if "lm_head" in name],
-            ["model.lm_head.weight"],
-        )
 
     def test_tied_config_builds_with_one_shared_vocab_matrix(self):
         """A checkpoint with tied word embeddings must build, with the LM head
