@@ -770,7 +770,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--grammar-cache-limit-bytes`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Host-memory budget in bytes for the compiled-grammar cache (json_schema / regex / EBNF / structural tags). Least recently used grammars are evicted past it; the xgrammar backend applies the same limit to its own compiler cache. 0 or a negative value disables the bound. The entry count is only a backstop (<code>SGLANG_GRAMMAR_CACHE_MAX_ENTRIES</code>, default 64).</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Host-memory budget in bytes for the compiled-grammar cache (json_schema / regex / EBNF / structural tags). Least recently used grammars are evicted past it; the xgrammar backend applies the same limit to its own compiler cache. 0 or a negative value disables the bound. A fixed entry count (64) remains as a backstop.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`1073741824` (1 GiB)</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>

@@ -23,7 +23,6 @@ from typing import Callable, Dict, List, NamedTuple, Optional, Sequence, Tuple
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.runtime_context import (
     get_context,
@@ -200,10 +199,11 @@ class BaseGrammarBackend:
     # EBNF per request. The byte budget (--grammar-cache-limit-bytes) is the
     # operator-facing bound: it is known before startup, whereas what an entry
     # count costs depends on the schemas clients happen to send. The entry count
-    # (SGLANG_GRAMMAR_CACHE_MAX_ENTRIES) stays only as a backstop, mainly for
-    # backends that cannot report sizes. In-flight requests keep their own
-    # ``copy()`` of a grammar, so evicting an entry is safe.
+    # stays only as a fixed backstop, mainly for backends that cannot report
+    # sizes. In-flight requests keep their own ``copy()`` of a grammar, so
+    # evicting an entry is safe.
     DEFAULT_CACHE_LIMIT_BYTES = 1 << 30
+    DEFAULT_CACHE_MAX_ENTRIES = 64
     # Charged per entry when the backend has no size API (outlines, llguidance).
     NOMINAL_GRAMMAR_BYTES = 1 << 20
 
@@ -216,7 +216,7 @@ class BaseGrammarBackend:
         if cache_limit_bytes is None:
             cache_limit_bytes = self.DEFAULT_CACHE_LIMIT_BYTES
         if cache_max_entries is None:
-            cache_max_entries = envs.SGLANG_GRAMMAR_CACHE_MAX_ENTRIES.get()
+            cache_max_entries = self.DEFAULT_CACHE_MAX_ENTRIES
         # <= 0 disables the respective bound.
         self.cache_limit_bytes = int(cache_limit_bytes)
         self.cache_max_entries = int(cache_max_entries)

@@ -11,7 +11,6 @@ maybe_stub_sgl_kernel()  # must precede any import that may pull in sgl_kernel
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
-import os
 import unittest
 from types import SimpleNamespace
 from typing import Optional
@@ -29,7 +28,6 @@ from sglang.srt.constrained.reasoner_grammar_backend import (
     ReasonerGrammarObject,
 )
 from sglang.srt.constrained.xgrammar_backend import XGrammarGrammarBackend
-from sglang.srt.environ import envs
 from sglang.test.test_utils import CustomTestCase
 
 NOMINAL = BaseGrammarBackend.NOMINAL_GRAMMAR_BYTES
@@ -87,25 +85,17 @@ class TestGrammarCacheEntryBound(CustomTestCase):
     """The entry-count bound is a backstop behind the byte budget."""
 
     def test_default_bounds(self):
-        with mock.patch.dict(os.environ, {}, clear=False):
-            os.environ.pop("SGLANG_GRAMMAR_CACHE_MAX_ENTRIES", None)
-            b = _StubBackend()
+        b = _StubBackend()
         self.assertEqual(
             b.cache_limit_bytes, BaseGrammarBackend.DEFAULT_CACHE_LIMIT_BYTES
         )
         self.assertEqual(
-            b.cache_max_entries, envs.SGLANG_GRAMMAR_CACHE_MAX_ENTRIES.default
+            b.cache_max_entries, BaseGrammarBackend.DEFAULT_CACHE_MAX_ENTRIES
         )
         self.assertEqual(b.cache_size_bytes, 0)
 
-    def test_env_var_overrides_entry_bound(self):
-        with mock.patch.dict(os.environ, {"SGLANG_GRAMMAR_CACHE_MAX_ENTRIES": "3"}):
-            b = _StubBackend()
-        self.assertEqual(b.cache_max_entries, 3)
-
-    def test_constructor_argument_wins_over_env(self):
-        with mock.patch.dict(os.environ, {"SGLANG_GRAMMAR_CACHE_MAX_ENTRIES": "3"}):
-            b = _StubBackend(cache_max_entries=7)
+    def test_constructor_argument_overrides_entry_bound(self):
+        b = _StubBackend(cache_max_entries=7)
         self.assertEqual(b.cache_max_entries, 7)
 
     def test_evicts_oldest_when_full(self):

@@ -431,9 +431,6 @@ class Envs:
     # ===================================================================
     SGLANG_GRAMMAR_POLL_INTERVAL = EnvFloat(0.005)
     SGLANG_GRAMMAR_MAX_POLL_ITERATIONS = EnvInt(10000)
-    # Entry-count backstop for the compiled-grammar LRU cache; the primary bound
-    # is --grammar-cache-limit-bytes. <= 0 disables the count bound.
-    SGLANG_GRAMMAR_CACHE_MAX_ENTRIES = EnvInt(64)
 
     # ===================================================================
     # Fault injection and regression tests
