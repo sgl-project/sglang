@@ -316,6 +316,7 @@ torch::Tensor ggml_moe_a8(
             padded,
             row,
             top_k,
+            W.size(0),
             sorted_token_ids.sizes()[0],
             stream);
         break;
@@ -334,6 +335,7 @@ torch::Tensor ggml_moe_a8(
             padded,
             row,
             top_k,
+            W.size(0),
             sorted_token_ids.sizes()[0],
             stream);
         break;
@@ -352,6 +354,7 @@ torch::Tensor ggml_moe_a8(
             padded,
             row,
             top_k,
+            W.size(0),
             sorted_token_ids.sizes()[0],
             stream);
         break;
@@ -370,6 +373,7 @@ torch::Tensor ggml_moe_a8(
             padded,
             row,
             top_k,
+            W.size(0),
             sorted_token_ids.sizes()[0],
             stream);
         break;
@@ -388,6 +392,7 @@ torch::Tensor ggml_moe_a8(
             padded,
             row,
             top_k,
+            W.size(0),
             sorted_token_ids.sizes()[0],
             stream);
         break;
@@ -406,6 +411,7 @@ torch::Tensor ggml_moe_a8(
             padded,
             row,
             top_k,
+            W.size(0),
             sorted_token_ids.sizes()[0],
             stream);
         break;
@@ -424,6 +430,7 @@ torch::Tensor ggml_moe_a8(
             padded,
             row,
             top_k,
+            W.size(0),
             sorted_token_ids.sizes()[0],
             stream);
         break;
@@ -442,6 +449,7 @@ torch::Tensor ggml_moe_a8(
             padded,
             row,
             top_k,
+            W.size(0),
             sorted_token_ids.sizes()[0],
             stream);
         break;
@@ -460,6 +468,7 @@ torch::Tensor ggml_moe_a8(
             padded,
             row,
             top_k,
+            W.size(0),
             sorted_token_ids.sizes()[0],
             stream);
         break;
@@ -478,6 +487,7 @@ torch::Tensor ggml_moe_a8(
             padded,
             row,
             top_k,
+            W.size(0),
             sorted_token_ids.sizes()[0],
             stream);
         break;
