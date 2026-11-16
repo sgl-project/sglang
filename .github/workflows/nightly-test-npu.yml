@@ -491,7 +491,6 @@ jobs:
       router_size: ${{ matrix.test_config.router_size }}
       test_case: ${{ matrix.test_config.test_case }}
       image: ${{ needs.set-image-config.outputs.image_a3 }}
-      install_sglang_from_source: false
       prefill_decode_deployment: ${{ matrix.test_config.prefill_decode_deployment }}
       transformers_version: ''
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
@@ -554,7 +553,6 @@ jobs:
       node_size: ${{ matrix.test_config.node_size }}
       test_case: ${{ matrix.test_config.test_case }}
       image: ${{ needs.set-image-config.outputs.image_a3 }}
-      install_sglang_from_source: false
       prefill_decode_deployment: 'mix'
       transformers_version: ''
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
