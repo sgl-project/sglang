@@ -309,7 +309,7 @@ def _routed_rows_module(hidden, dtype, scaled, owned):
         str(dtype).split(".")[-1],
         str(scaled),
         str(owned),
-        cuda_files=["moe/inkling2_routed_rows.cuh"],
+        cuda_files=["inkling2/routed_rows.cuh"],
         cuda_wrappers=[
             ("run", f"inkling2_routed_rows::run<{hidden}, {cuda_type}, {flags}>")
         ],

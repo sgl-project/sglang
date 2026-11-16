@@ -157,7 +157,7 @@ def nvfp4_quantize(x: torch.Tensor):
 def _matmul_module():
     return load_jit(
         "inkling2_nvfp4",
-        cuda_files=["gemm/inkling2_nvfp4.cuh"],
+        cuda_files=["inkling2/nvfp4.cuh"],
         cuda_wrappers=[
             ("run", "inkling2_nvfp4::run"),
             ("run_swap", "inkling2_nvfp4::run_swap"),
@@ -178,7 +178,7 @@ def routed_quant_module(width: int):
     return load_jit(
         "inkling2_routed_quant",
         str(width),
-        cuda_files=["moe/inkling2_routed_quant.cuh"],
+        cuda_files=["inkling2/routed_quant.cuh"],
         cuda_wrappers=[
             ("quantize", f"inkling2_routed_quant::quantize<{width}>"),
             ("swiglu_quantize", f"inkling2_routed_quant::swiglu_quantize<{width}>"),
