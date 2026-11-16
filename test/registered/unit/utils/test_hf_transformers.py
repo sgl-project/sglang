@@ -325,8 +325,8 @@ class TestGetTokenizerRevision(CustomTestCase):
         )
 
     def test_tokenizer_revision_is_loaded_as_the_revision(self):
-        """`tokenizer_revision=` must load that revision; AutoTokenizer only
-        reads `revision`, so the processor reload used the default branch."""
+        """`tokenizer_revision=`, the spelling the processor reload passes, must
+        load that revision: AutoTokenizer only reads `revision`."""
         load_kwargs, _, cache_lookups = self._load(tokenizer_revision="rev-a")
 
         self.assertEqual(load_kwargs["revision"], "rev-a")
