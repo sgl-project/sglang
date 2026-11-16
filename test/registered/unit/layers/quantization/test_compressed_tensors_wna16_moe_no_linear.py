@@ -74,6 +74,22 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
         config = _make_wna16_moe_config(PER_LAYER_EXPERT_TARGETS, num_bits=4)
         self._assert_wna16_moe(config, expected_bits=4)
 
+    def test_unsupported_bits_error_is_one_message(self):
+        """The unsupported-bits error reads as a sentence, not a tuple repr."""
+        quant_config = CompressedTensorsConfig.from_config(
+            _make_wna16_moe_config(["re:.*mlp.experts.*"], num_bits=2)
+        )
+        with (
+            mock.patch.object(
+                compressed_tensors,
+                "get_moe_runner_backend",
+                return_value=MoeRunnerBackend.MARLIN,
+            ),
+            self.assertRaises(ValueError) as ctx,
+        ):
+            quant_config.get_moe_scheme(torch.nn.Module(), layer_name=EXPERTS_LAYER)
+        self.assertEqual(len(ctx.exception.args), 1, ctx.exception.args)
+
     def test_blackwell_int4_auto_uses_triton(self):
         for group_size in (32, 128):
             with self.subTest(group_size=group_size):
