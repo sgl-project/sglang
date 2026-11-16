@@ -94,6 +94,14 @@ export SGLANG_SET_CPU_AFFINITY=1
 export HCCL_HOST_SOCKET_PORT_RANGE="auto"
 export HCCL_NPU_SOCKET_PORT_RANGE="auto"
 
+# Isolate transformers' dynamic-module cache per run and per pod. Containers
+# restart in place (restartPolicy: OnFailure) and keep their writable layer, so
+# drop the directory to avoid reusing a partially written transformers_modules
+# snapshot from a previous attempt.
+export HF_MODULES_CACHE="/tmp/hf_modules/${RUN_LABEL:-unknown}/${HOSTNAME}"
+rm -rf "${HF_MODULES_CACHE}"
+mkdir -p "${HF_MODULES_CACHE}"
+
 visibe_devices=$ASCEND_VISIBLE_DEVICES
 echo "ASCEND_VISIBLE_DEVICES=$ASCEND_VISIBLE_DEVICES"
 if [ "${visibe_devices}" != "" ];then

@@ -20,6 +20,7 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     launch_pd_mix_node,
     launch_pd_separation_node,
     start_router_thread,
+    stop_router_process,
     wait_server_ready,
 )
 from sglang.test.test_utils import (
@@ -686,13 +687,12 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
         cls.port = SERVICE_PORT
         cls.base_url = f"http://{cls.host}:{cls.port}"
         cls.hostname = os.getenv("HOSTNAME")
-        cls.role = (
-            "router"
-            if "router" in cls.hostname
-            else "prefill"
-            if "prefill" in cls.hostname
-            else "decode"
-        )
+        if "router" in cls.hostname:
+            cls.role = "router"
+        elif "prefill" in cls.hostname:
+            cls.role = "prefill"
+        else:
+            cls.role = "decode"
         logger.info(f"Init {cls.host} {cls.role=}!")
 
         cls.start_pd_server()
@@ -700,6 +700,7 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        stop_router_process()
         if cls.process:
             try:
                 kill_process_tree(cls.process.pid)
