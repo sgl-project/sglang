@@ -2854,7 +2854,7 @@ class LayerwiseOffloadableModuleMixin:
         host = parameter.detach().to("cpu", copy=True)
         if not self._should_pin_parked_weights():
             return host
-        if host.is_pinned:
+        if host.is_pinned():
             return host
         try:
             return host.pin_memory()
@@ -2915,7 +2915,7 @@ class LayerwiseOffloadableModuleMixin:
                     continue
                 # Pinned host copies DMA directly. Pageable copies still stage
                 # through the driver's bounce buffer and stay synchronous.
-                if host_tensor.is_pinned:
+                if host_tensor.is_pinned():
                     parameter.data = host_tensor.to(device, non_blocking=True)
                     issued_async = True
                 else:
