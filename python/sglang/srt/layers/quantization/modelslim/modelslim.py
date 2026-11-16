@@ -31,7 +31,10 @@ from sglang.srt.layers.quantization.modelslim.schemes import (
     ModelSlimW8A8Int8,
     ModelSlimW8A8Int8MoE,
 )
-from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.unquant import (
+    UnquantizedFusedMoEMethod,
+    UnquantizedLinearMethod,
+)
 from sglang.srt.utils import apply_module_patch
 
 if TYPE_CHECKING:
@@ -412,7 +415,11 @@ class ModelSlimConfig(QuantizationConfig):
         elif isinstance(layer, FusedMoE):
             moe_schemes = self.get_moe_scheme(layer, prefix)
             if moe_schemes is None:
-                raise ValueError(f"No ModelSlim MoE scheme found for layer {prefix}")
+                return UnquantizedFusedMoEMethod(
+                    layer.use_triton_kernels,
+                    layer.use_flashinfer_trtllm_moe,
+                    layer.use_deep_gemm,
+                )
             layer.w13_scheme, layer.w2_scheme = moe_schemes
             layer.w13_kernel, layer.w2_kernel = (
                 layer.w13_scheme.kernel,
@@ -528,6 +535,13 @@ class ModelSlimConfig(QuantizationConfig):
                 f"Missing ModelSlim MoE quantization description for layer {prefix}: "
                 + "; ".join(all_attempted)
             )
+
+        # ModelSlim may leave entire MoE layers unquantized, e.g. DSpark MTP
+        # experts in an otherwise W4A8 checkpoint. Only FLOAT/FLOAT selects the
+        # unquantized method; missing/unknown schemes and partially FLOAT MoE
+        # layers still error.
+        if w13_scheme_name == "FLOAT" and w2_scheme_name == "FLOAT":
+            return None
 
         # Map scheme names to classes
         scheme_map = dict(
