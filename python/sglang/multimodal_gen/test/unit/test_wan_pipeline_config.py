@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from sglang.multimodal_gen.configs.models.dits.wanvideo import WanVideoConfig
 from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     WanT2V480PConfig,
     t5_postprocess_text,
@@ -60,3 +61,12 @@ def test_wan_postprocess_keeps_embeds_512_and_mask_matches():
     assert result.prompt_embeds_mask.shape == (2, 512)
     assert result.prompt_embeds_mask.sum(dim=1).tolist() == [3, 2]
     assert result.prompt_seq_lens == [3, 2]
+
+
+def test_wan_arch_text_len_follows_the_checkpoint_config():
+    """A text_len in transformer/config.json must be the value the Wan model and
+    tokenizer read, not the class default."""
+    config = WanVideoConfig()
+    config.update_model_arch({"text_len": 226})
+    assert config.arch_config.text_len == 226
+
