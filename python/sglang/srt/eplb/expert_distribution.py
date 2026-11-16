@@ -933,12 +933,6 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
         super().__init__(*args, **kwargs)
         self._records = []
 
-    def get_single_pass_gatherer_keys(self):
-        return super().get_single_pass_gatherer_keys()
-
-    def get_single_pass_gatherer_key(self, debug_name: Optional[str]):
-        return super().get_single_pass_gatherer_key(debug_name)
-
     def append(
         self,
         forward_pass_id: int,
