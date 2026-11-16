@@ -47,6 +47,9 @@ def stop_worker(rank, root, failure):
         result = {"error": None, "continued": False}
         with (
             patch.object(profiler_module.current_platform, "is_npu", return_value=True),
+            patch.object(
+                profiler_module.current_platform, "is_cuda_alike", return_value=False
+            ),
             patch.object(torch.cuda, "is_available", return_value=False),
             patch.object(
                 torch, "npu", SimpleNamespace(synchronize=Mock()), create=True

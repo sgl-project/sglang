@@ -10,6 +10,7 @@
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
 
+#include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
 #include <sgl_kernel/ptx/barrier.cuh>
 
 #include <tvm/ffi/container/tensor.h>
@@ -52,9 +53,13 @@ struct MhcPostCombineNormDecodeParams {
   uint8_t *q, *sf;
   int64_t rows;
   float eps;
+  // MegaMoE input (fp8 rows + UE8M0 scales), written as mega_moe_pre_dispatch writes them.
+  uint8_t *moe_x, *moe_sf, *moe_shared_sf;
+  uint64_t moe_sf_stride_bytes, moe_shared_col_stride;
+  uint32_t moe_shared_block_m;
 };
 
-template <int Threads, int Split, bool Quant>
+template <int Threads, int Split, bool Quant, bool MoeQuant = false>
 __global__ __launch_bounds__(Threads) void mhc_post_combine_norm_decode_kernel(
     const __grid_constant__ MhcPostCombineNormDecodeParams p) {
   using namespace device;
@@ -97,6 +102,7 @@ __global__ __launch_bounds__(Threads) void mhc_post_combine_norm_decode_kernel(
   __builtin_assume(__isGlobal(post_ptr));
   __builtin_assume(__isGlobal(pre_ptr));
 
+  PDLWaitPrimary<true>();
   float comb[16], post[4], pre[4];
 #pragma unroll
   for (int i = 0; i < 16; ++i)
@@ -231,6 +237,41 @@ __global__ __launch_bounds__(Threads) void mhc_post_combine_norm_decode_kernel(
         p.sf[off] = static_cast<uint8_t>(sf);
       }
     }
+    if constexpr (MoeQuant) {
+      using deepseek_v4::fp8::cast_to_ue8m0;
+      using deepseek_v4::fp8::pack_fp8;
+      float y[8];
+      float local_max = 0.0f;
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        const auto v = cast<fp32x2_t>(out[k]);
+        y[2 * k] = v.x;
+        y[2 * k + 1] = v.y;
+        local_max = fmaxf(local_max, fmaxf(fabsf(v.x), fabsf(v.y)));
+      }
+      local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffff, local_max, 1));
+      local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffff, local_max, 2));
+      const float absmax = fmaxf(local_max, 1e-10f);
+      const float raw_scale = absmax / math::FP8_E4M3_MAX;
+      const uint32_t ue8m0_exp = cast_to_ue8m0(raw_scale);
+      const float inv_scale = __uint_as_float((127u + 127u - ue8m0_exp) << 23);
+      AlignedVector<fp8x2_e4m3_t, 4> qv;
+#pragma unroll
+      for (int k = 0; k < 4; ++k)
+        qv[k] = pack_fp8(y[2 * k] * inv_scale, y[2 * k + 1] * inv_scale);
+      qv.store(reinterpret_cast<fp8_e4m3_t*>(p.moe_x + row * 5120), vid);
+      if (vid % 4 == 0) {
+        const int g = vid / 4;
+        p.moe_sf[static_cast<uint64_t>(row) * p.moe_sf_stride_bytes + g] = static_cast<uint8_t>(ue8m0_exp);
+        const uint32_t bm = p.moe_shared_block_m;
+        const uint32_t t = static_cast<uint32_t>(row);
+        const uint32_t m = t % bm;
+        const uint64_t shared_row =
+            t / bm * ((bm + 127u) / 128u * 128u) + m / 128u * 128u + m % 32u * 4u + m % 128u / 32u;
+        const uint64_t off = shared_row + static_cast<uint64_t>(g / 4) * p.moe_shared_col_stride;
+        p.moe_shared_sf[off * sizeof(int32_t) + g % 4] = static_cast<uint8_t>(ue8m0_exp);
+      }
+    }
   }
 
   if constexpr (Quant) {
@@ -269,7 +310,11 @@ struct MhcPostCombineNormDecode {
       tvm::ffi::TensorView q,
       tvm::ffi::TensorView sf,
       float eps,
-      bool quant) {
+      bool quant,
+      tvm::ffi::Optional<tvm::ffi::TensorView> moe_x,
+      tvm::ffi::Optional<tvm::ffi::TensorView> moe_sf,
+      tvm::ffi::Optional<tvm::ffi::TensorView> moe_shared_sf,
+      int64_t moe_shared_block_m) {
     using namespace host;
     auto m = SymbolicSize{"num_tokens"};
     auto dev = SymbolicDevice{};
@@ -291,7 +336,7 @@ struct MhcPostCombineNormDecode {
     }
     if (rows == 0) return;
     CHECK_HOST(Split == 1 || rows <= 65535) << "rows go in grid.y";
-    const MhcPostCombineNormDecodeParams params{
+    MhcPostCombineNormDecodeParams params{
         static_cast<const bf16_t*>(x.data_ptr()),
         static_cast<const bf16_t*>(residual.data_ptr()),
         static_cast<const bf16_t*>(weight.data_ptr()),
@@ -303,9 +348,37 @@ struct MhcPostCombineNormDecode {
         quant ? static_cast<uint8_t*>(q.data_ptr()) : nullptr,
         quant ? static_cast<uint8_t*>(sf.data_ptr()) : nullptr,
         rows,
-        eps};
+        eps,
+        nullptr,
+        nullptr,
+        nullptr,
+        0,
+        0,
+        0};
     LaunchKernel launch(Split > 1 ? dim3(Split, rows) : dim3(rows), Threads, dev.unwrap());
     if (Split > 1) launch.enable_cluster(dim3(Split, 1, 1));
+    launch.enable_pdl(true);
+    if (moe_x.has_value()) {
+      RuntimeCheck(!quant, "MegaMoE input and the swizzled MXFP8 output are exclusive");
+      RuntimeCheck(moe_sf.has_value() && moe_shared_sf.has_value(), "MegaMoE input needs both scale buffers");
+      const auto mx = moe_x.value();
+      const auto ms = moe_sf.value();
+      const auto ss = moe_shared_sf.value();
+      RuntimeCheck(
+          mx.size(0) >= rows && mx.size(1) == 5120 && mx.stride(1) == 1 && mx.stride(0) == 5120,
+          "MegaMoE x must be [>= rows, 5120] row-major");
+      RuntimeCheck(ms.size(0) >= rows && ms.size(1) * 4 >= 160 && ms.stride(1) == 1, "MegaMoE x_sf layout");
+      RuntimeCheck((ms.stride(0) * 4) % 16 == 0, "MegaMoE x_sf row stride must be 16B-aligned");
+      RuntimeCheck(moe_shared_block_m > 0 && ss.stride(0) == 1, "MegaMoE shared scales are column-major");
+      params.moe_x = static_cast<uint8_t*>(mx.data_ptr());
+      params.moe_sf = static_cast<uint8_t*>(ms.data_ptr());
+      params.moe_sf_stride_bytes = static_cast<uint64_t>(ms.stride(0)) * 4;
+      params.moe_shared_sf = static_cast<uint8_t*>(ss.data_ptr());
+      params.moe_shared_col_stride = static_cast<uint64_t>(ss.stride(1));
+      params.moe_shared_block_m = static_cast<uint32_t>(moe_shared_block_m);
+      launch.launch(mhc_post_combine_norm_decode_kernel<Threads, Split, false, true>, params);
+      return;
+    }
     if (quant)
       launch.launch(mhc_post_combine_norm_decode_kernel<Threads, Split, true>, params);
     else

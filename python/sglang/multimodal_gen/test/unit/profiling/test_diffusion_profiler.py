@@ -51,6 +51,11 @@ class TestDiffusionProfiler(unittest.TestCase):
         self.npu_platform = self.enterContext(
             patch.object(profiler_module.current_platform, "is_npu", return_value=True)
         )
+        self.enterContext(
+            patch.object(
+                profiler_module.current_platform, "is_cuda_alike", return_value=False
+            )
+        )
         self.enterContext(patch.object(torch.cuda, "is_available", return_value=False))
         if hasattr(torch, "xpu"):
             self.enterContext(
@@ -141,13 +146,15 @@ class TestDiffusionProfiler(unittest.TestCase):
             spec.loader.exec_module(module)
         return module
 
-    def make_profiler(self, full=False, steps=5, rank=0):
+    def make_profiler(self, full=False, steps=5, rank=0, **profile_kwargs):
         wrapper = self.profiler_utils.SGLDiffusionProfiler(
+            request_id=f"request-{full}",
             full_profile=full,
             num_steps=steps,
             num_inference_steps=40,
             log_dir=self.directory,
             rank=rank,
+            **profile_kwargs,
         )
         self.addCleanup(wrapper.stop, export_trace=False)
         return wrapper
@@ -300,7 +307,15 @@ class TestDiffusionProfiler(unittest.TestCase):
         self.profiler_utils = self.load_profiler_module(npu=False)
         for full in (False, True):
             with self.subTest(full=full):
-                wrapper = self.make_profiler(full=full)
+                wrapper = self.make_profiler(
+                    full=full,
+                    activities=["CPU"],
+                    with_stack=False,
+                    record_shapes=False,
+                    is_host=full,
+                )
+                self.assertFalse(wrapper.with_stack)
+                self.assertFalse(wrapper.record_shapes)
                 if not full:
                     wrapper.step_denoising_step()
                 torch.ones(1).add_(1)
@@ -314,7 +329,10 @@ class TestDiffusionProfiler(unittest.TestCase):
         self.npu_api.schedule.assert_not_called()
         self.npu_api.tensorboard_trace_handler.assert_not_called()
         traces = list(Path(self.directory).glob("*.trace.json.gz"))
-        self.assertEqual(len(traces), 2)
+        self.assertEqual(
+            {path.name for path in traces},
+            {"request-False-rank-0.trace.json.gz", "request-True-host.trace.json.gz"},
+        )
         self.assertTrue(all(path.stat().st_size > 0 for path in traces))
 
 

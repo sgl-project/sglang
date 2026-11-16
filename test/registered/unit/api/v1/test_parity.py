@@ -51,7 +51,6 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
     {
         "background",
         "conversation_id",
-        "data_parallel_rank",
         "encoder_urls",
         "external_trace_header",
         "http_worker_ipc",
@@ -63,6 +62,7 @@ PYTHON_ONLY_REQUEST_FIELDS = frozenset(
         "min_dynamic_patch",
         "mm_content_hashes",
         "mm_processor_kwargs",
+        "mm_routing_labels",
         "multi_item_delimiter_indices",
         "need_wait_for_mm_inputs",
         "no_logs",
