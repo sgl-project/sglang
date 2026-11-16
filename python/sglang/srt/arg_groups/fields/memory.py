@@ -229,7 +229,8 @@ class Memory(msgspec.Struct):
                 "so any topology whose shards tile the same grid shares one "
                 "cache. Implies --hicache-mem-layout page_unified and "
                 "--hicache-io-backend kernel. Currently supported by the file "
-                "backend for one chunk per page."
+                "backend for a single MHA/MLA pool, optionally with GDN/KDA "
+                "state (e.g. Kimi-K3, Qwen3.8)."
             ),
             choices=["rank-suffix", "unified"],
         ),
@@ -246,6 +247,16 @@ class Memory(msgspec.Struct):
                 "count is a whole number of chunks. Unset, each deployment keys "
                 "to its own head count and shares only with its own TP size. "
                 "MLA-family models replicate KV across ranks and ignore it."
+            ),
+        ),
+    ] = None
+    hicache_storage_state_partition: A[
+        Optional[int],
+        Arg(
+            help=(
+                "GDN/KDA linear-attention state heads per L3 chunk under "
+                "--hicache-storage-key-scheme unified; the state counterpart "
+                "of --hicache-storage-head-partition, equally fleet-wide."
             ),
         ),
     ] = None

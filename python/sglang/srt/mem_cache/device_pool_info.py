@@ -29,6 +29,10 @@ class MambaStateBufferInfo(msgspec.Struct, frozen=True, kw_only=True):
     temporal: torch.Tensor
     conv: tuple[torch.Tensor, ...]
     extra_checkpoint_buffers: tuple[torch.Tensor, ...] = ()
+    # Full (unsharded) conv sub-block widths, each TP-sharded independently
+    # along conv_slice_axis of one slot (GDN: key_dim, key_dim, value_dim).
+    conv_shard_groups: tuple[int, ...] = ()
+    conv_slice_axis: int = 0
 
     def validate(self, *, layer_ids: tuple[int, ...] | None = None) -> None:
         shape = tuple(self.temporal.shape)

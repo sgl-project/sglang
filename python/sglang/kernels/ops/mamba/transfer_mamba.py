@@ -1,7 +1,8 @@
 """JIT-compiled Mamba KV cache transfer kernel.
 
-Provides ``transfer_kv_mamba_pf_lf`` (load: page_first -> layer_first)
-and ``transfer_kv_mamba_lf_pf`` (backup: layer_first -> page_first).
+Provides ``transfer_kv_mamba_pf_lf`` (load: page_first -> layer_first),
+``transfer_kv_mamba_lf_pf`` (backup: layer_first -> page_first) and
+``transfer_mamba_pieces`` (page_unified, both directions, by piece table).
 
 Uses the shared ``load_jit`` + ``cache_once`` infrastructure from
 ``sglang.kernels.jit.utils`` — the same mechanism used by ``hicache.py``
@@ -33,6 +34,7 @@ def _jit_transfer_mamba_module() -> Module:
         cuda_wrappers=[
             ("transfer_kv_mamba_pf_lf", "&TransferMambaKernel::run_pf_lf"),
             ("transfer_kv_mamba_lf_pf", "&TransferMambaKernel::run_lf_pf"),
+            ("transfer_mamba_pieces", "&TransferMambaKernel::run_pieces"),
         ],
     )
 
@@ -80,4 +82,30 @@ def transfer_kv_mamba_lf_pf(
         item_size,
         dst_layout_dim,
         num_layers,
+    )
+
+
+@debug_kernel_api
+def transfer_mamba_pieces(
+    device_ptrs: torch.Tensor,
+    device_strides: torch.Tensor,
+    pieces: torch.Tensor,
+    host: torch.Tensor,
+    host_indices: torch.Tensor,
+    device_indices: torch.Tensor,
+    to_host: bool,
+):
+    """Copy ``pieces`` rows ``(source, device offset, host offset, length)``
+    between device slot ``device_ptrs[source] + index * device_strides[source]``
+    and host slot ``host[index]``, for every index pair."""
+    module = _jit_transfer_mamba_module()
+    module.transfer_mamba_pieces(
+        device_ptrs,
+        device_strides,
+        pieces,
+        host,
+        host_indices,
+        device_indices,
+        host.stride(0) * host.element_size(),
+        int(to_host),
     )

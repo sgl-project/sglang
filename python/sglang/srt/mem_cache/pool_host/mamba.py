@@ -20,6 +20,10 @@ from sglang.srt.mem_cache.pool_host.common import (
     ALLOC_MEMORY_FUNCS,
     get_allocator_from_storage,
 )
+from sglang.srt.mem_cache.pool_host.page_unified import (
+    MambaPageUnifiedLayout,
+    build_mamba_page_unified_layout,
+)
 from sglang.srt.utils import is_cuda, is_hip, is_npu, is_xpu
 
 _is_cuda = is_cuda()
@@ -31,6 +35,7 @@ _use_xpu_mamba_ops = _is_xpu and not (_is_cuda or _is_hip)
 transfer_state_per_layer_direct_pf_lf = None
 transfer_state_all_layer_direct_lf_pf = None
 transfer_mamba_state = None
+transfer_mamba_pieces = None
 if _is_cuda or _is_hip:
     from sgl_kernel.kvcacheio import (
         transfer_kv_all_layer_direct_lf_pf,
@@ -40,6 +45,7 @@ if _is_cuda or _is_hip:
     from sglang.kernels.ops.mamba.transfer_mamba import (
         transfer_kv_mamba_lf_pf,
         transfer_kv_mamba_pf_lf,
+        transfer_mamba_pieces,
     )
 elif _is_xpu:
     from sglang.srt.mem_cache.pool_host._kvcacheio import (
@@ -106,6 +112,7 @@ class MambaPoolHost(HostKVCache):
     # skip __init__, still read an empty pair rather than raising.
     slot_state_device_tensors: tuple = ()
     slot_state_buffers: tuple = ()
+    page_unified_layout: Optional[MambaPageUnifiedLayout] = None
 
     def __init__(
         self,
@@ -119,6 +126,7 @@ class MambaPoolHost(HostKVCache):
         allocator_type: str = "default",
         layout: str = "layer_first",
         mtp_draft_buffer_infos: Sequence[MambaStateBufferInfo] = (),
+        page_unified_layout: Optional[MambaPageUnifiedLayout] = None,
     ):
         buffer_info.validate()
         self.buffer_info = buffer_info
@@ -130,6 +138,7 @@ class MambaPoolHost(HostKVCache):
         assert layout in [
             "page_first",
             "page_first_direct",
+            "page_unified",
         ], f"Unsupported layout: {layout}"
         if _is_xpu:
             require_kvcacheio_ops(
@@ -184,6 +193,8 @@ class MambaPoolHost(HostKVCache):
         ]
         self.slot_state_buffers = []
         self.size_per_token = self.get_size_per_token()
+        if layout == "page_unified":
+            self._init_page_unified(page_unified_layout)
 
         if host_size > 0:
             self.size = sync_fixed_hicache_size(
@@ -268,6 +279,75 @@ class MambaPoolHost(HostKVCache):
 
         logger.info("NPU HiCache Mamba state transfer mode: native async.")
 
+    def _init_page_unified(self, layout: Optional[MambaPageUnifiedLayout]) -> None:
+        """Resolve the layout and its piece table, rows sorted by layer so a
+        per-layer load is one slice."""
+        if (
+            transfer_mamba_pieces is None
+            or self.mtp_draft_buffer_infos
+            or self.slot_state_device_tensors
+        ):
+            raise NotImplementedError(
+                "page_unified Mamba state needs the CUDA/ROCm transfer kernel "
+                "and does not carry draft layers or side states."
+            )
+        num_layers = self.num_mamba_layers
+        states = [self.buffer_info.temporal] if self.temporal_state_elem_size else []
+        states += list(self.buffer_info.conv)
+        if layout is None:
+            from sglang.srt.mem_cache.hicache_key_scheme import resolve_head_group_num
+            from sglang.srt.runtime_context import get_parallel
+
+            heads = states[0].shape[2] if self.temporal_state_elem_size else 0
+            layout = build_mamba_page_unified_layout(
+                self.buffer_info,
+                layer_num=num_layers,
+                attn_tp_size=get_parallel().attn_tp_size,
+                group_num=resolve_head_group_num(heads, axis="state"),
+            )
+        if layout.bytes_per_page != self.size_per_token:
+            raise ValueError(f"{layout} does not hold {self.size_per_token} bytes.")
+        sources = [state[layer] for state in states for layer in range(num_layers)]
+        strides = [source.stride(0) * source.element_size() for source in sources]
+        if any(
+            not s[0].is_contiguous() or s.data_ptr() % 16 or stride % 16
+            for s, stride in zip(sources, strides)
+        ):
+            raise ValueError("page_unified Mamba state slots must be 16-byte aligned.")
+        pieces = sorted(layout.pieces(), key=lambda piece: piece[1])
+        table = [(p * num_layers + l, d, h, n) for p, l, d, h, n in pieces]
+        device = self._buffer_device
+        self.page_unified_layout = layout
+        self._piece_table = torch.tensor(table, dtype=torch.int64, device=device)
+        self._pieces_per_layer = len(pieces) // num_layers
+        ptrs = [source.data_ptr() for source in sources]
+        self._piece_device_ptrs = torch.tensor(ptrs, dtype=torch.uint64, device=device)
+        self._piece_device_strides = torch.tensor(strides, device=device)
+
+    def _transfer_pieces(
+        self, host_indices, device_indices, *, layer_id, to_host, io_backend
+    ) -> None:
+        if io_backend != "kernel":
+            raise NotImplementedError(
+                f"page_unified Mamba state needs io_backend kernel, not {io_backend}."
+            )
+        if device_indices.numel() == 0:
+            return
+        pieces = self._piece_table
+        if layer_id is not None:
+            step = self._pieces_per_layer
+            pieces = pieces[layer_id * step : (layer_id + 1) * step]
+        device = self._piece_table.device
+        transfer_mamba_pieces(
+            device_ptrs=self._piece_device_ptrs,
+            device_strides=self._piece_device_strides,
+            pieces=pieces,
+            host=self.unified_buffer,
+            host_indices=host_indices.to(device, torch.int64, non_blocking=True),
+            device_indices=device_indices.to(device, torch.int64, non_blocking=True),
+            to_host=to_host,
+        )
+
     def init_kv_buffer(self):
         _host_alloc = ALLOC_MEMORY_FUNCS[self._buffer_device.type]
 
@@ -287,6 +367,18 @@ class MambaPoolHost(HostKVCache):
                 ),
             )
 
+        if self.layout == "page_unified":
+            # One byte row per slot, in MambaPageUnifiedLayout order.
+            self.unified_buffer = alloc_func(
+                (self.size, self.page_unified_layout.bytes_per_page),
+                dtype=torch.uint8,
+                device=self.device,
+                pin_memory=self.pin_memory,
+                allocator=self.allocator,
+            )
+            self.temporal_buffer = None
+            self.conv_buffer = []
+            return [self.unified_buffer]
         if self.layout in ["page_first", "page_first_direct"]:
             # page-first: (page_num, num_layers, 1, *shape) — per-page data is contiguous
             temporal_dims = (
@@ -376,9 +468,14 @@ class MambaPoolHost(HostKVCache):
 
     def get_hybrid_pool_buffer(self):
         # Expose all mamba host tensors that need Mooncake buffer registration.
+        if self.layout == "page_unified":
+            return [self.unified_buffer]
         return [self.temporal_buffer, *self.conv_buffer, *self.slot_state_buffers]
 
     def _iter_page_tensors(self, index: int):
+        if self.layout == "page_unified":
+            yield self.unified_buffer[index]
+            return
         if self.layout in ["page_first", "page_first_direct"]:
             yield self.temporal_buffer[index]
             for conv_buf in self.conv_buffer:
@@ -449,6 +546,8 @@ class MambaPoolHost(HostKVCache):
         return self.get_size_per_token()
 
     def get_mapping_lengths(self) -> list[int]:
+        if self.page_unified_layout is not None:
+            return [self.size * self.page_unified_layout.bytes_per_page]
         token_layer_bytes = self.size * self.num_mamba_layers
         return [
             token_layer_bytes
@@ -723,6 +822,15 @@ class MambaPoolHost(HostKVCache):
         *,
         is_draft: bool = False,
     ):
+        if self.page_unified_layout is not None:
+            self._transfer_pieces(
+                host_indices,
+                device_indices,
+                layer_id=layer_id,
+                to_host=False,
+                io_backend=io_backend,
+            )
+            return
         temporal_layers = (
             self.temporal_device_layers
             if self.mtp_draft_buffer_infos
@@ -791,6 +899,15 @@ class MambaPoolHost(HostKVCache):
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend="kernel"
     ):
+        if self.page_unified_layout is not None:
+            self._transfer_pieces(
+                host_indices,
+                device_indices,
+                layer_id=None,
+                to_host=True,
+                io_backend=io_backend,
+            )
+            return
         temporal_layers = (
             self.temporal_device_layers
             if self.mtp_draft_buffer_infos
@@ -857,6 +974,8 @@ class MambaPoolHost(HostKVCache):
                 host_buf.index_copy_(0, host_idx, values.to(host_buf.device))
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
+        if self.layout == "page_unified":
+            return self.unified_buffer[index]
         data_page = torch.cat(
             [
                 self._flatten_tensor_bytes(tensor)

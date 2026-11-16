@@ -1135,6 +1135,8 @@ class MambaPool:
                         for sibling in self._slot_siblings
                         for _, buffer, _, _ in sibling.iter_transfer_state_entries()
                     ),
+                    conv_shard_groups=tuple(self.conv_shard_groups or ()),
+                    conv_slice_axis=self.conv_slice_axis,
                 ),
             ),
         )
@@ -4386,7 +4388,7 @@ class HybridLinearKVPool(KVCache):
                 enable_memory_saver=enable_memory_saver,
                 **({"use_combined_kv_buffer": True} if use_combined_kv_buffer else {}),
             )
-        if isinstance(self.full_kv_pool, MHATokenToKVPool):
+        if isinstance(self.full_kv_pool, (MHATokenToKVPool, MLATokenToKVPool)):
             # Only the hybrid root knows the model IDs of its compact child.
             self.full_kv_pool.model_layer_ids = tuple(full_attention_layer_ids)
         self.full_attention_layer_id_mapping = {

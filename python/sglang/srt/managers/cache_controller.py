@@ -46,11 +46,12 @@ from sglang.srt.mem_cache.hicache_key_scheme import (
     namespace_digest,
     normalize_dtype,
     plan_unified_kv,
+    plan_unified_state,
 )
 from sglang.srt.mem_cache.kv.memory.views import KVLayoutView, MLAKVView
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.utils import get_storage_hash_str
-from sglang.srt.runtime_context import get_memory, get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel, process_model_config
 from sglang.srt.utils import get_device_module
 from sglang.srt.utils.device import async_h2d_tensor
 
@@ -76,6 +77,14 @@ def storage_model_name(
         f"dtype_{normalize_dtype(kv_cache_dtype)}",
     ]
     return "-".join(part for part in parts if part)
+
+
+def _state_dtypes(entry) -> tuple[str, ...]:
+    """Mamba state part dtypes, in host layout order."""
+    host_pool = entry.host_pool
+    dtypes = [host_pool.temporal_dtype] if host_pool.temporal_state_elem_size else []
+    dtypes += [host_pool.conv_dtype] * len(host_pool.conv_state_shapes)
+    return tuple(normalize_dtype(dtype) for dtype in dtypes)
 
 
 class LayerLoadingEvent:
@@ -941,8 +950,11 @@ class HiCacheController:
             model_name, self.storage_host_pool, getattr(anchor, "dtype", None)
         )
         unified_plan = self._build_unified_plan(model_name, attn_cp_size)
-        unified_chunk_spans = None
+        unified_chunk_spans = unified_sidecar_chunks = None
         if unified_plan is not None:
+            unified_sidecar_chunks = self._build_unified_state_chunks(
+                model_name, unified_plan
+            )
             # Keys are layer-major/head-minor; the physical page is head-major.
             # Keep each key paired with its byte span instead of slicing pages
             # consecutively in key order.
@@ -971,6 +983,8 @@ class HiCacheController:
             extra_config=storage_backend_extra_config,
             unified_suffixes=(unified_plan.suffixes if unified_plan else None),
             unified_chunk_spans=unified_chunk_spans,
+            unified_sidecar_chunks=unified_sidecar_chunks,
+            unified_kv_writer=unified_plan.kv_writer if unified_plan else True,
             dcp_size=dcp_size,
             dcp_rank=get_parallel().attn_dcp_rank,
             logical_page_size=self.page_size if dcp_size > 1 else None,
@@ -985,18 +999,17 @@ class HiCacheController:
             return None
         parallel = get_parallel()
         host_pool = self.storage_host_pool
-        if (
-            len(getattr(self.mem_pool_host, "entries", [])) > 1
-            or getattr(host_pool, "page_unified_layout", None) is None
-        ):
+        entries = getattr(self.mem_pool_host, "entries", [])
+        with_state = set(getattr(self.mem_pool_host, "entry_map", ())) == {
+            PoolName.KV,
+            PoolName.MAMBA,
+        }
+        if (len(entries) > 1 and not with_state) or getattr(
+            host_pool, "page_unified_layout", None
+        ) is None:
             raise NotImplementedError(
-                "The unified key scheme requires a single page_unified KV pool; "
-                "composite and sidecar pools are not supported."
-            )
-        if host_pool.layer_num != host_pool.end_layer - host_pool.start_layer:
-            raise NotImplementedError(
-                "The unified key scheme requires contiguous model layers "
-                "without packed draft layers."
+                "The unified key scheme requires a page_unified KV pool, alone "
+                "or with Mamba state; other composite pools are not supported."
             )
         # Host pools retain physical buffer descriptors, not the device pool.
         # A hybrid controller can wrap a different pool than its storage anchor.
@@ -1006,27 +1019,54 @@ class HiCacheController:
             if anchor_entry is not None
             else self.mem_pool_device
         )
+        layer_ids = None
+        state_dtypes = ()
+        if with_state:
+            state_dtypes = _state_dtypes(self.mem_pool_host.entry_map[PoolName.MAMBA])
+            # Hybrid KV holds only the stage's full-attention layers.
+            router = getattr(device_pool, "layer_router", None)
+            device_pool = (router and router.wrapped_view()) or device_pool
+            layer_ids = device_pool.get_device_pool_infos()[0].layer_ids
+            if attn_cp_size > 1 or host_pool.layer_num != len(layer_ids):
+                raise NotImplementedError(
+                    "The unified key scheme supports Mamba state without context "
+                    "parallelism or packed draft layers."
+                )
+        elif host_pool.layer_num != host_pool.end_layer - host_pool.start_layer:
+            raise NotImplementedError(
+                "The unified key scheme requires contiguous model layers "
+                "without packed draft layers."
+            )
         if getattr(host_pool, "dcp_size", 1) > 1:
             raise NotImplementedError(
                 "The unified key scheme does not support decode context "
                 "parallelism: storage objects must contain full pages."
             )
+        rank_replicated = isinstance(device_pool, MLAKVView)
         plan = plan_unified_kv(
             model_id=model_name or "",
             # Logical KV dtype, not the storage view: fp8 variants all store as
             # uint8 but must land in distinct keyspaces.
             dtype=normalize_dtype(device_pool.dtype),
             page_size=self.page_size,
-            rank_replicated=isinstance(device_pool, MLAKVView),
+            rank_replicated=rank_replicated,
             local_kv_heads=getattr(host_pool, "head_num", 0),
+            # Attention TP may exceed the model's KV heads and replicate them.
+            total_kv_heads=(
+                None
+                if rank_replicated
+                else process_model_config().get_total_num_kv_heads()
+            ),
             attn_tp_rank=parallel.attn_tp_rank,
             attn_tp_size=parallel.attn_tp_size,
             attn_cp_size=attn_cp_size,
-            start_layer=host_pool.start_layer,
-            end_layer=host_pool.end_layer,
+            start_layer=layer_ids[0] if layer_ids else host_pool.start_layer,
+            end_layer=layer_ids[-1] + 1 if layer_ids else host_pool.end_layer,
             is_final_stage=parallel.pp_rank == parallel.pp_size - 1,
             head_group=memory.hicache_storage_head_partition,
             layer_partition=memory.hicache_storage_layer_partition,
+            layer_ids=layer_ids,
+            state_dtypes=state_dtypes,
         )
         # The pool was sized from the same server arg before any backend
         # attached; if the two disagree the objects would not match their keys.
@@ -1042,6 +1082,46 @@ class HiCacheController:
             plan.suffixes,
         )
         return plan
+
+    def _build_unified_state_chunks(
+        self, model_name: Optional[str], kv_plan: UnifiedKVPlan
+    ) -> Optional[dict[str, tuple[list[str], list[tuple[int, int]]]]]:
+        entry = getattr(self.mem_pool_host, "entry_map", {}).get(PoolName.MAMBA)
+        if entry is None:
+            return None
+        (info,) = entry.device_pool.get_device_pool_infos()
+        parallel, memory = get_parallel(), get_memory()
+        layout = entry.host_pool.page_unified_layout
+        plan = plan_unified_state(
+            model_id=model_name or "",
+            parts=layout.parts,
+            dtypes=_state_dtypes(entry),
+            kv_dtype=kv_plan.namespace.dtype,
+            layer_ids=info.layer_ids,
+            local_state_heads=info.buffer_info.temporal.shape[2],
+            attn_tp_rank=parallel.attn_tp_rank,
+            attn_tp_size=parallel.attn_tp_size,
+            state_partition=memory.hicache_storage_state_partition,
+            layer_partition=memory.hicache_storage_layer_partition,
+        )
+        # The layout was cut from the same server arg at allocation; if the
+        # two disagree the objects would not match their keys.
+        if plan.group_num != layout.group_num:
+            raise ValueError(
+                f"the unified state plan cuts {plan.group_num} groups but the "
+                f"host pool was allocated with {layout.group_num}."
+            )
+        logger.info(
+            "HiCache unified L3 Mamba state keys: namespace=%s chunks=%s",
+            namespace_digest(plan.namespace, prefix="ust"),
+            plan.suffixes,
+        )
+        spans = [
+            layout.chunk_span(layer_range, group)
+            for layer_range in plan.layer_ranges
+            for group in range(plan.group_num)
+        ]
+        return {PoolName.MAMBA: (plan.suffixes, spans)}
 
     def reset(self):
         # Reuse detach's queue wakeups and bounded joins, and fail if any

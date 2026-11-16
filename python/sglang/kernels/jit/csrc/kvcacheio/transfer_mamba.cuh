@@ -86,6 +86,52 @@ __launch_bounds__(kBlockSize, 1) void transfer_mamba_backup_kernel(const __grid_
   }
 }
 
+// One row of the piece table: device source, offset in the device slot,
+// offset in the host slot, byte length.
+constexpr int kPieceFields = 4;
+constexpr int kWarpSize = 32;
+
+struct MambaPieceParams {
+  const uint64_t* __restrict__ device_ptrs;
+  const int64_t* __restrict__ device_strides;
+  const int64_t* __restrict__ pieces;
+  char* __restrict__ host_base;
+  const int64_t* __restrict__ host_indices;
+  const int64_t* __restrict__ device_indices;
+  int64_t host_stride;
+  int64_t num_items;
+  int64_t num_pieces;
+};
+
+// A warp moves one (slot, piece) pair; pieces are too small for a block each.
+template <bool kToHost>
+__global__
+__launch_bounds__(kBlockSize, 1) void transfer_mamba_pieces_kernel(const __grid_constant__ MambaPieceParams params) {
+  const int lane = threadIdx.x % kWarpSize;
+  const int64_t warps_per_block = blockDim.x / kWarpSize;
+  const int64_t total_work = params.num_items * params.num_pieces;
+
+  for (int64_t work_id = static_cast<int64_t>(blockIdx.x) * warps_per_block + threadIdx.x / kWarpSize;
+       work_id < total_work;
+       work_id += gridDim.x * warps_per_block) {
+    const int64_t item_id = work_id / params.num_pieces;
+    const int64_t* piece = params.pieces + (work_id % params.num_pieces) * kPieceFields;
+    const int64_t source = piece[0];
+
+    char* device_ptr = reinterpret_cast<char*>(params.device_ptrs[source]) +
+                       params.device_indices[item_id] * params.device_strides[source] + piece[1];
+    char* host_ptr = params.host_base + params.host_indices[item_id] * params.host_stride + piece[2];
+    const char* src = kToHost ? device_ptr : host_ptr;
+    char* dst = kToHost ? host_ptr : device_ptr;
+
+    for (int64_t off = static_cast<int64_t>(lane) * kBytesPerThreadPerStep; off < piece[3];
+         off += kWarpSize * kBytesPerThreadPerStep) {
+      device::details::store_nc(
+          reinterpret_cast<uint4*>(dst + off), device::details::load_nc(reinterpret_cast<const uint4*>(src + off)));
+    }
+  }
+}
+
 struct TransferMambaKernel {
   // Load: page_first -> layer_first (single layer at a time)
   static void run_pf_lf(
@@ -184,6 +230,63 @@ struct TransferMambaKernel {
     };
 
     LaunchKernel(grid, kBlockSize, device)(transfer_mamba_backup_kernel, params);
+  }
+
+  // page_unified: copy every piece of each (host slot, device slot) pair.
+  static void run_pieces(
+      const tvm::ffi::TensorView device_ptrs,
+      const tvm::ffi::TensorView device_strides,
+      const tvm::ffi::TensorView pieces,
+      const tvm::ffi::TensorView host_buffer,
+      const tvm::ffi::TensorView host_indices,
+      const tvm::ffi::TensorView device_indices,
+      const int64_t host_stride,
+      const int64_t to_host) {
+    using namespace host;
+
+    auto L = SymbolicSize{"num_indices"};
+    auto S = SymbolicSize{"num_sources"};
+    auto P = SymbolicSize{"num_pieces"};
+    auto device_ = SymbolicDevice{};
+
+    TensorMatcher({L})  //
+        .with_dtype<int64_t>()
+        .with_device<kDLGPU>(device_)
+        .verify(host_indices)
+        .verify(device_indices);
+    TensorMatcher({S}).with_dtype<uint64_t>().with_device<kDLGPU>(device_).verify(device_ptrs);
+    TensorMatcher({S}).with_dtype<int64_t>().with_device<kDLGPU>(device_).verify(device_strides);
+    TensorMatcher({P, kPieceFields})  //
+        .with_dtype<int64_t>()
+        .with_device<kDLGPU>(device_)
+        .with_strides({kPieceFields, 1})
+        .verify(pieces);
+
+    RuntimeCheck(host_stride > 0 && host_stride % 16 == 0, "transfer_mamba: host slots must be 16-byte aligned");
+    const auto num_items = L.unwrap();
+    const auto num_pieces = P.unwrap();
+    if (num_items == 0 || num_pieces == 0) return;
+
+    const auto device = device_.unwrap();
+    const int64_t warps = num_items * num_pieces;
+    const int64_t warps_per_block = kBlockSize / kWarpSize;
+    const int grid_x = static_cast<int>(
+        std::min(static_cast<int64_t>(kBlockQuotaBackup), (warps + warps_per_block - 1) / warps_per_block));
+
+    const auto params = MambaPieceParams{
+        .device_ptrs = static_cast<const uint64_t*>(device_ptrs.data_ptr()),
+        .device_strides = static_cast<const int64_t*>(device_strides.data_ptr()),
+        .pieces = static_cast<const int64_t*>(pieces.data_ptr()),
+        .host_base = static_cast<char*>(runtime::get_device_accessible_ptr(host_buffer)),
+        .host_indices = static_cast<const int64_t*>(host_indices.data_ptr()),
+        .device_indices = static_cast<const int64_t*>(device_indices.data_ptr()),
+        .host_stride = host_stride,
+        .num_items = num_items,
+        .num_pieces = num_pieces,
+    };
+
+    const auto kernel = to_host ? transfer_mamba_pieces_kernel<true> : transfer_mamba_pieces_kernel<false>;
+    LaunchKernel(dim3(grid_x), kBlockSize, device)(kernel, params);
   }
 };
 

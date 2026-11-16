@@ -10,6 +10,7 @@ import unittest
 import torch
 
 from sglang.srt.mem_cache.hicache_key_scheme import (
+    KVCacheNamespace,
     derive_namespace,
     namespace_digest,
     normalize_dtype,
@@ -305,6 +306,23 @@ class TestNamespaceIdentity(CustomTestCase):
         )
         self.assertEqual(plan.suffixes, other.suffixes)
 
+    def test_hybrid_state_dtypes_reach_only_hybrid_keyspaces(self):
+        base = dict(
+            model_id="m",
+            dtype="bfloat16",
+            page_size=64,
+            rank_replicated=False,
+            total_kv_heads=8,
+            head_group=2,
+        )
+        digests = {
+            namespace_digest(derive_namespace(**base, state_dtypes=dtypes))
+            for dtypes in ((), ("float32",), ("bfloat16",))
+        }
+        self.assertEqual(len(digests), 3)
+        # A pure-KV keyspace keeps its encoding.
+        self.assertIs(type(derive_namespace(**base)), KVCacheNamespace)
+
     def test_normalize_dtype_strips_the_torch_prefix(self):
         self.assertEqual(normalize_dtype(torch.bfloat16), "bfloat16")
 
@@ -348,6 +366,16 @@ class TestUnifiedKeySchemeRejections(CustomTestCase):
         """
         with self.assertRaises(NotImplementedError):
             _plan(local_kv_heads=1, attn_tp_rank=0, attn_tp_size=8)
+
+    def test_kv_heads_must_tile_attention_tp(self):
+        for local, total in ((1, 3), (2, 4)):
+            with self.subTest(local=local, total=total), self.assertRaises(ValueError):
+                _plan(
+                    local_kv_heads=local,
+                    total_kv_heads=total,
+                    attn_tp_rank=0,
+                    attn_tp_size=4,
+                )
 
     def test_empty_model_id_is_refused(self):
         with self.assertRaisesRegex(ValueError, "non-empty model_id"):

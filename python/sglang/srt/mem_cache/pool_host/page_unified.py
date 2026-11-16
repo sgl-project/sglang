@@ -32,10 +32,19 @@ a chunk is two objects whose runs interleave at token granularity.
 The same order is what the write-back kernel produces and the load-back kernel
 reads, so a page is byte-identical whether it arrived from the device or from
 L3, and neither side has to ask which.
+
+Mamba state follows the same rules with a one-slot page::
+
+    Mamba: (group, layer, part, outer, block, width_in_group, inner)
+
+A part is one state tensor (temporal, then conv). TP shards each sub-block
+(GDN conv is cat(q, k, v)) separately, so a group is the same fraction of
+every sub-block: one host run, several device runs.
 """
 
 from __future__ import annotations
 
+import math
 from typing import Any, NamedTuple
 
 import msgspec
@@ -43,6 +52,7 @@ import msgspec
 # Byte order identity, recorded in the L3 namespace digest. Bump when the axis
 # order changes, so old objects miss instead of deserializing permuted.
 PAGE_UNIFIED_OBJECT_LAYOUT = "page-unified-v1"
+MAMBA_PAGE_UNIFIED_OBJECT_LAYOUT = "mamba-page-unified-v1"
 
 
 class PageUnifiedLayout(msgspec.Struct, frozen=True, kw_only=True):
@@ -152,6 +162,120 @@ class PageUnifiedLayout(msgspec.Struct, frozen=True, kw_only=True):
             )
         offset = head_group * self.head_group_bytes + start * self.layer_bytes
         return offset, (end - start) * self.layer_bytes
+
+
+class StatePart(msgspec.Struct, frozen=True, kw_only=True):
+    """One layer's per-slot state tensor; ``widths`` are its local sub-block
+    widths along ``slice_axis``, each sharded by attention TP separately."""
+
+    shape: tuple[int, ...]
+    itemsize: int
+    slice_axis: int = 0
+    widths: tuple[int, ...]
+
+
+class MambaPageUnifiedLayout(msgspec.Struct, frozen=True, kw_only=True):
+    """Byte layout of one ``page_unified`` Mamba state slot. Group ``g`` of
+    ``group_num`` holds rows ``[g * w / G, (g + 1) * w / G)`` of every
+    sub-block of width ``w``, so a group names the same bytes at any TP size."""
+
+    layer_num: int
+    group_num: int
+    parts: tuple[StatePart, ...]
+
+    def __post_init__(self) -> None:
+        for part in self.parts:
+            if sum(part.widths) != part.shape[part.slice_axis] or any(
+                width % self.group_num for width in part.widths
+            ):
+                raise ValueError(f"{self.group_num} groups do not tile {part}.")
+        # The piece-table kernel moves 16-byte vectors.
+        if any(
+            o % 16 or n % 16
+            for i, _ in enumerate(self.parts)
+            for o, n in self.part_runs(i, 0)
+        ):
+            raise ValueError(f"Mamba state group runs are not 16-byte aligned: {self}")
+
+    def part_runs(self, index: int, group: int) -> list[tuple[int, int]]:
+        """``(device slot offset, length)`` of one group of one part."""
+        part = self.parts[index]
+        axis = part.slice_axis
+        inner = math.prod(part.shape[axis + 1 :]) * part.itemsize
+        runs: list[tuple[int, int]] = []
+        for outer in range(math.prod(part.shape[:axis])):
+            start = outer * part.shape[axis]
+            for width in part.widths:
+                step = width // self.group_num
+                offset, length = (start + group * step) * inner, step * inner
+                if runs and sum(runs[-1]) == offset:
+                    runs[-1] = (runs[-1][0], runs[-1][1] + length)
+                else:
+                    runs.append((offset, length))
+                start += width
+        return runs
+
+    @property
+    def layer_bytes(self) -> int:
+        nbytes = sum(math.prod(part.shape) * part.itemsize for part in self.parts)
+        return nbytes // self.group_num
+
+    @property
+    def bytes_per_page(self) -> int:
+        return self.group_num * self.layer_num * self.layer_bytes
+
+    def chunk_span(self, layer_range: tuple[int, int], group: int) -> tuple[int, int]:
+        start, end = layer_range
+        if not (0 <= start < end <= self.layer_num and 0 <= group < self.group_num):
+            raise ValueError(f"no chunk {layer_range} x group {group} in {self}")
+        offset = (group * self.layer_num + start) * self.layer_bytes
+        return offset, (end - start) * self.layer_bytes
+
+    def pieces(self) -> list[tuple[int, int, int, int, int]]:
+        """``(part, layer, device offset, page offset, length)`` in page order."""
+        pieces, page_offset = [], 0
+        for group in range(self.group_num):
+            runs = [self.part_runs(i, group) for i in range(len(self.parts))]
+            for layer in range(self.layer_num):
+                for index, part_runs in enumerate(runs):
+                    for offset, length in part_runs:
+                        pieces.append((index, layer, offset, page_offset, length))
+                        page_offset += length
+        return pieces
+
+
+def build_mamba_page_unified_layout(
+    buffer_info: Any, *, layer_num: int, attn_tp_size: int, group_num: int
+) -> MambaPageUnifiedLayout:
+    """Lay out a ``MambaStateBufferInfo``: temporal (sharded by its leading
+    heads axis) first, then each conv tensor."""
+    temporal = buffer_info.temporal
+    shape = tuple(temporal.shape[2:])
+    parts = []
+    if math.prod(shape):
+        parts.append(
+            StatePart(shape=shape, itemsize=temporal.element_size(), widths=shape[:1])
+        )
+    full_widths = tuple(buffer_info.conv_shard_groups)
+    axis = buffer_info.conv_slice_axis
+    for conv in buffer_info.conv:
+        shape = tuple(conv.shape[2:])
+        if sum(full_widths) != shape[axis] * attn_tp_size or any(
+            w % attn_tp_size for w in full_widths
+        ):
+            # Standard Mamba2 conv is [x | B | C], B/C replicated past n_groups.
+            raise NotImplementedError(
+                "page_unified Mamba state supports GDN/KDA, whose conv state "
+                f"declares its TP sub-blocks; {shape} declares {full_widths}."
+            )
+        widths = tuple(w // attn_tp_size for w in full_widths)
+        itemsize = conv.element_size()
+        parts.append(
+            StatePart(shape=shape, itemsize=itemsize, slice_axis=axis, widths=widths)
+        )
+    return MambaPageUnifiedLayout(
+        layer_num=layer_num, group_num=group_num, parts=tuple(parts)
+    )
 
 
 class KVHostGeometry(NamedTuple):

@@ -598,6 +598,29 @@ class TestHiCacheHostRegister(unittest.TestCase):
                 self.assertEqual((ptr - base) % two_mib, 0)
                 self.assertEqual(size % two_mib, 0)
 
+    def test_single_registration_needs_no_internal_alignment(self):
+        # lcm(1 GiB, 3 MiB) = 3 GiB exceeds the chunk limit, but a mapping that
+        # fits in one call has no internal boundary to align.
+        mib = 1024**2
+        gib = 1024**3
+        base = 0x40000000
+        cudart = _FakeCudart()
+        with (
+            mock.patch.object(host_common, "tensor_uses_hugepage", return_value=True),
+            envs.SGLANG_HUGEPAGE_SIZE.override("1GB"),
+            mock.patch.object(
+                envs.SGLANG_HICACHE_HOST_REGISTER_CHUNK_GB,
+                "get",
+                return_value=2,
+            ),
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+        ):
+            _cuda_host_register(
+                _FakeBuffer(base, 1536 * mib),
+                registration_granularity_bytes=3 * mib,
+            )
+        self.assertEqual(cudart.registrations, [(base, 2 * gib, 0)])
+
     def test_null_pinned_allocation_raises(self):
         """On XPU a null pinned buffer must fail at allocation, not at first transfer."""
         gib = 1024**3

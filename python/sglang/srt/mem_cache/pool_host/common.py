@@ -229,6 +229,7 @@ def _cuda_host_register(
                 "registration_granularity_bytes must be positive, got "
                 f"{registration_granularity_bytes}"
             )
+    if registration_granularity_bytes is not None and total > chunk_limit_bytes:
         # Every internal boundary must align to both a complete copy unit and
         # a hugepage. Rounding to either grid separately can break the other.
         alignment_bytes = math.lcm(registration_granularity_bytes, hugepage_size or 1)

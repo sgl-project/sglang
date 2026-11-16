@@ -176,10 +176,12 @@ def resolve_hicache_key_scheme(server_args: Any):
     """Validate --hicache-storage-key-scheme and resolve what it implies."""
     cfg = resolving_view(server_args)
     unified = cfg.hicache_storage_key_scheme == "unified"
-    partition_configs = (
-        cfg.hicache_storage_head_partition is not None
-        or cfg.hicache_storage_layer_partition is not None
+    partition_names = (
+        "hicache_storage_head_partition",
+        "hicache_storage_layer_partition",
+        "hicache_storage_state_partition",
     )
+    partition_configs = any(getattr(cfg, name) is not None for name in partition_names)
     if not unified:
         if (
             cfg.hicache_mem_layout == "page_unified"
@@ -191,12 +193,11 @@ def resolve_hicache_key_scheme(server_args: Any):
             )
         if partition_configs:
             raise ValueError(
-                "--hicache-storage-head-partition / --hicache-storage-layer-partition "
-                "require --hicache-storage-key-scheme unified."
+                "--hicache-storage-*-partition require --hicache-storage-key-scheme unified."
             )
         return
 
-    for name in ("hicache_storage_head_partition", "hicache_storage_layer_partition"):
+    for name in partition_names:
         value = getattr(cfg, name)
         if value is not None and value <= 0:
             raise ValueError(

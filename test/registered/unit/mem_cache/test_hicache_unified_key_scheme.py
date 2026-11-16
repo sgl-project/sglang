@@ -28,6 +28,13 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 
+def _model_config(total_kv_heads=8):
+    return patch(
+        "sglang.srt.managers.cache_controller.process_model_config",
+        return_value=SimpleNamespace(get_total_num_kv_heads=lambda: total_kv_heads),
+    )
+
+
 def _resolve(**overrides):
     """Run the real hicache resolution; the rewrites land in the resolution record."""
     fields = dict(
@@ -85,6 +92,7 @@ class TestUnifiedKeySchemeArgs(CustomTestCase):
     def test_non_positive_partition_config_is_refused(self):
         for field in (
             "hicache_storage_head_partition",
+            "hicache_storage_state_partition",
             "hicache_storage_layer_partition",
         ):
             with (
@@ -182,6 +190,7 @@ class TestControllerUnifiedKeys(CustomTestCase):
                 "sglang.srt.managers.cache_controller.get_parallel",
                 return_value=parallel,
             ),
+            _model_config(),
         ):
             return controller._build_unified_plan(
                 "org/model", attn_cp_size=attn_cp_size
@@ -346,7 +355,10 @@ class TestControllerUnifiedKeys(CustomTestCase):
                 controller,
                 "_build_unified_plan",
                 return_value=SimpleNamespace(
-                    suffixes=["shared"], layer_ranges=[(0, 4)], head_group_num=1
+                    suffixes=["shared"],
+                    layer_ranges=[(0, 4)],
+                    head_group_num=1,
+                    kv_writer=True,
                 ),
             ),
         ):
@@ -414,6 +426,7 @@ class TestControllerUnifiedKeys(CustomTestCase):
                     patch.object(
                         controller, "get_attn_cp_rank_and_size", return_value=(0, 1)
                     ),
+                    _model_config(),
                 ):
                     config = controller._generate_storage_config("org/model")
 
