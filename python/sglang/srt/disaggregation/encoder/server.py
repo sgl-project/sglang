@@ -2264,9 +2264,8 @@ class MMEncoder:
             )
             mm_embedding = await self._compute_embedding(ctx, keep_on_gpu=keep_on_gpu)
 
-            if self.profiler is not None:
-                for _ in requests:
-                    self.profiler.step()
+            for _ in requests:
+                self.profiler.step()
 
             return self._stage_embeddings(
                 ctx, requests, mm_embedding, keep_on_gpu=keep_on_gpu
@@ -2502,8 +2501,6 @@ async def run_encoder(
 async def _handle_encoder_worker_request(encoder: MMEncoder, request):
     if isinstance(request, ProfileReq):
         if request.req_type == ProfileReqType.START_PROFILE:
-            if encoder.profiler is None:
-                encoder.profiler = EncoderProfiler(encoder.rank)
             encoder.profiler.start(request)
         else:
             encoder.profiler.stop()

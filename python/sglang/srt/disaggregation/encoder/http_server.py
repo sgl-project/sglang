@@ -36,7 +36,6 @@ from sglang.srt.disaggregation.encoder.runtime import (
     validate_encode_request,
 )
 from sglang.srt.disaggregation.encoder.server import (
-    EncoderProfiler,
     MMEncoder,
     MMError,
 )
@@ -660,8 +659,6 @@ async def start_profile_async(obj: Annotated[Optional[ProfileReq], Body()] = Non
     req.req_type = ProfileReqType.START_PROFILE
     for socket in send_sockets:
         sock_send(socket, req)
-    if encoder.profiler is None:
-        encoder.profiler = EncoderProfiler(encoder.rank)
     ok, msg = encoder.profiler.start(req)
     if ok:
         detail = (
@@ -684,10 +681,6 @@ async def stop_profile_async():
         return _summarise_dp_broadcast(results)
     if encoder is None:
         return Response(content="encoder not ready\n", status_code=503)
-    if encoder.profiler is None:
-        return Response(
-            content="profiling not initialized\n", status_code=HTTPStatus.BAD_REQUEST
-        )
     req = ProfileReq(req_type=ProfileReqType.STOP_PROFILE)
     for socket in send_sockets:
         sock_send(socket, req)
