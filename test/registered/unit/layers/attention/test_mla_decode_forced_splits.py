@@ -33,8 +33,8 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-# The gfx95 runner: stage-b-test-1-gpu-large-amd is MI300, where every case below skips.
-register_amd_ci(est_time=6, suite="stage-b-test-1-gpu-small-amd-mi35x")
+# The gfx95 runner: base-b-test-1-gpu-large-mi30x is MI300, where every case below skips.
+register_amd_ci(est_time=6, stage="base-b", runner_config="1-gpu-small-mi35x")
 
 LK, LV = 576, 512
 

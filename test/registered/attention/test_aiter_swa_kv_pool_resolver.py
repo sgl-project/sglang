@@ -18,7 +18,7 @@ from sglang.srt.layers.attention.base_attn_backend import resolve_window_kv_pool
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=10, stage="base-b", runner_config="1-gpu-small-mi35x")
 
 
 def _pool(*, window: bool):

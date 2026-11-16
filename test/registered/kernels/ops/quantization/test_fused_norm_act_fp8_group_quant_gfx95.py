@@ -14,7 +14,7 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=30, stage="base-b", runner_config="1-gpu-small-mi35x")
 
 M_VALUES = (1, 8, 32, 64, 256, 512)
 # Qwen3-14B and Qwen3-1.7B hidden / intermediate sizes, and their per-rank

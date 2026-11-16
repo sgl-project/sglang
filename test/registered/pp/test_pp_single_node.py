@@ -32,7 +32,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=312, stage="base-c", runner_config="4-gpu-h100")
-register_amd_ci(est_time=500, suite="stage-c-test-4-gpu-amd")
+register_amd_ci(est_time=500, stage="base-c", runner_config="4-gpu-mi30x")
 
 
 class TestPPAccuracy(unittest.TestCase):

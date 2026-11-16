@@ -16,8 +16,8 @@ from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=30, suite="stage-c-test-4-gpu-amd")
-register_amd_ci(est_time=120, suite="stage-c-test-large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=30, stage="base-c", runner_config="4-gpu-mi30x")
+register_amd_ci(est_time=120, stage="base-c", runner_config="8-gpu-mi35x")
 
 
 def _get_open_port() -> int:

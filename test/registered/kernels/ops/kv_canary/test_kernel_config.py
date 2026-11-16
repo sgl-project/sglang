@@ -36,7 +36,9 @@ from sglang.test.kernels.kv_canary._fixtures import (
 )
 
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-small")
-register_amd_ci(est_time=60, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(
+    est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-large-mi30x"
+)
 
 _DEVICE = torch.device("cuda")
 

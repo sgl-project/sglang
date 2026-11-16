@@ -71,10 +71,10 @@ Defined in `python/sglang/test/test_utils.py`:
 A per-commit suite name is **generated** from registration metadata as `{stage}-test-{runner_config}` — you don't hand-write it:
 
 - **`stage`** — the CI stage (e.g. `base-b`, `base-b-kernel-unit`, `base-c`).
-- **`runner_config`** — a runner-pool key from `scripts/ci/runner_configs.yml`, which maps it to the physical runner label (so `1-gpu-large` runs on `1-gpu-h100`). AMD/NPU use their own keys (e.g. `amd`).
+- **`runner_config`** — a runner-pool key from `scripts/ci/runner_configs.yml`, which maps it to the physical runner label (so `1-gpu-large` runs on `1-gpu-h100`). AMD keys are the GPU count and size plus the GPU family, `-mi30x` (MI300/MI325) or `-mi35x` (MI355), e.g. `stage="base-b", runner_config="1-gpu-small-mi30x"` → `base-b-test-1-gpu-small-mi30x`; the suite must be one that `pr-test-amd.yml` or `pr-test-amd-extra.yml` runs. NPU uses its own keys.
 - **Suite** — `register_cuda_ci(stage="base-b", runner_config="1-gpu-small")` → `base-b-test-1-gpu-small`, the name you pass to `run_suite.py --suite`. The `-test-` is just the connector; never put it in `register_*_ci`.
 
-> CUDA nightly uses the same shape with `stage="nightly"` (e.g. `stage="nightly", runner_config="1-gpu-large"` → `nightly-test-1-gpu-large`) and **no** `nightly=True` — the stage name carries the cadence, and setting the flag makes the test silently never run. Legacy single-string `suite=` is left only for `stress` and some AMD/CPU/NPU pools.
+> CUDA nightly uses the same shape with `stage="nightly"` (e.g. `stage="nightly", runner_config="1-gpu-large"` → `nightly-test-1-gpu-large`) and **no** `nightly=True` — the stage name carries the cadence, and setting the flag makes the test silently never run. Legacy single-string `suite=` is left only for `stress`, AMD nightly, and some CPU/NPU pools.
 
 ### All CI Suites
 
@@ -328,7 +328,7 @@ register_cuda_ci(est_time=200, stage="nightly", runner_config="1-gpu-large")
 
 # Multi-backend test (only when testing backend-specific code paths)
 register_cuda_ci(est_time=80, stage="base-a", runner_config="1-gpu-small")
-register_amd_ci(est_time=120, suite="stage-a-test-1-gpu-small-amd")
+register_amd_ci(est_time=120, stage="base-a", runner_config="1-gpu-small-mi30x")
 register_npu_ci(est_time=400, suite="nightly-8-npu-a3", nightly=True)
 
 # Temporarily disabled test
@@ -340,7 +340,7 @@ register_cuda_ci(
 Parameters:
 - `est_time`: estimated runtime in seconds (used for CI partitioning)
 - `stage` + `runner_config`: the canonical pair for CUDA; the suite name is generated from them (see Naming Conventions)
-- `suite`: legacy single-string form. Only `stress` and some AMD/CPU/NPU pools still take it; `register_cpu_ci(suite="base-a-test-cpu")` is correct and is not being migrated
+- `suite`: legacy single-string form. Only `stress`, AMD nightly, and some CPU/NPU pools still take it; `register_cpu_ci(suite="base-a-test-cpu")` is correct and is not being migrated
 - `nightly=True`: legacy cadence flag, for non-CUDA nightly suites only. CUDA nightly uses `stage="nightly"` and must leave this unset
 - `disabled="reason"`: temporarily disable with explanation
 

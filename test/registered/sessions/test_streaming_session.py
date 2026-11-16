@@ -24,7 +24,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=328, stage="extra-a", runner_config="1-gpu-small")
-register_amd_ci(est_time=691, suite="extra-a-test-1-gpu-large-amd")
+register_amd_ci(est_time=691, stage="extra-a", runner_config="1-gpu-large-mi30x")
 
 
 class TestStreamingSession(StreamingSessionServerBase, StreamingSessionKitMixin):

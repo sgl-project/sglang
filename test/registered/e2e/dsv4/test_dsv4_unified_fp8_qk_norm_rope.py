@@ -26,7 +26,7 @@ from sglang.test.test_utils import CustomTestCase
 
 # aiter's group-quant path is gfx95-only, so on the default mi300 runner every case
 # here would skip
-register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=20, stage="base-b", runner_config="1-gpu-small-mi35x")
 
 DEVICE = torch.device("cuda")
 

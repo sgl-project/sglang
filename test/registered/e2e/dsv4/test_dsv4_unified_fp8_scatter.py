@@ -18,7 +18,7 @@ from sglang.test.test_utils import CustomTestCase
 
 # the scatter itself is a plain row move, but the layout it pins is gfx95-only, so
 # run it where the feature lives rather than on the default mi300 runner
-register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=10, stage="base-b", runner_config="1-gpu-small-mi35x")
 
 DEVICE = torch.device("cuda")
 

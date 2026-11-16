@@ -61,7 +61,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang.test.tree_slots import window_evictable
 
 register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=11, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=11, stage="base-b", runner_config="1-gpu-small-mi30x")
 
 
 class TestUnifiedTreeCoreLoadBackPending(

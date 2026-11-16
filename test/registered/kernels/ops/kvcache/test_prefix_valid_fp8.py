@@ -12,7 +12,9 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 # backend-specific: ROCm's E4M3FNUZ pointer inference and conversion differ from CUDA.
-register_amd_ci(est_time=25, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(
+    est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-large-mi30x"
+)
 
 DEVICE = "cuda"
 SOURCE_DTYPES = (torch.bfloat16, torch.float16, torch.float32)

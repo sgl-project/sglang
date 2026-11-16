@@ -35,7 +35,9 @@ from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 register_cuda_ci(
     est_time=29, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
 )
-register_amd_ci(est_time=29, stage="jit-kernel-benchmark", runner_config="amd")
+register_amd_ci(
+    est_time=29, stage="base-b-kernel-benchmark", runner_config="1-gpu-large-mi30x"
+)
 
 DISABLE_TORCH = os.environ.get("DISABLE_TORCH", "0") == "1"
 PAGE_SIZE = int(os.environ.get("PAGE_SIZE", "1"))

@@ -8,7 +8,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=180, suite="stage-c-test-large-8-gpu-amd")
+register_amd_ci(est_time=180, stage="base-c", runner_config="8-gpu-mi30x")
 
 
 class TestAiterAllGatherAmd(unittest.TestCase):

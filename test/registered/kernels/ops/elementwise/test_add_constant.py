@@ -7,7 +7,9 @@ from sglang.kernels.ops.elementwise.add_constant import add_constant
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=45, stage="base-b-kernel-unit", runner_config="1-gpu-small")
-register_amd_ci(est_time=8, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(
+    est_time=8, stage="base-b-kernel-unit", runner_config="1-gpu-large-mi30x"
+)
 
 
 @pytest.mark.parametrize("size", [1, 2, 127, 128, 1024, 1025, 4096, 4097])

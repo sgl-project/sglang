@@ -56,7 +56,7 @@ def _snr_db(ref: torch.Tensor, got: torch.Tensor) -> float:
 # linux-{mi300,mi325}-1gpu-sglang -- gfx942, where _skip_reason() below would
 # skip the whole class. stage-b runs on linux-mi35x-gpu-1, which is the hardware
 # these kernels are written for.
-register_amd_ci(est_time=120, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=120, stage="base-b", runner_config="1-gpu-small-mi35x")
 
 
 @unittest.skipIf(SKIP is not None, SKIP or "")

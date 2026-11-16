@@ -40,9 +40,11 @@ from sglang.srt.layers.quantization.fp8_utils import (  # noqa: E402
 )
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=20, stage="jit-kernel-unit", runner_config="amd")
+register_amd_ci(
+    est_time=20, stage="base-b-kernel-unit", runner_config="1-gpu-large-mi30x"
+)
 # backend-specific: the native dot_scaled tests need gfx95x.
-register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=20, stage="base-b", runner_config="1-gpu-small-mi35x")
 
 DEVICE = "cuda"
 

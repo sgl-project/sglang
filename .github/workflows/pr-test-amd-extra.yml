@@ -12,7 +12,7 @@ name: PR Test Extra (AMD)
 #
 # Stages: extra-a and extra-b. Each job mirrors the container bring-up of
 # pr-test-amd.yml and dispatches `run_suite.py --hw amd --suite
-# {stage}-test-{config}-amd`:
+# {stage}-test-{runner_config}`, e.g. extra-a-test-1-gpu-small-mi30x:
 #   - extra-a 1-gpu-small: mock-model / kv_canary unit + single-GPU canary e2e
 #                          tests, plus LoRA eviction/drainer, priority
 #                          scheduling, torch-native attention
@@ -156,7 +156,7 @@ jobs:
       - name: Run test
         timeout-minutes: 75
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-small-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-small-mi30x --auto-partition-id ${{ matrix.part }} --auto-partition-size 4 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
 
   # =============================================== extra-a (1-gpu-large) ===============================================
   # Single-GPU lora / spec / quant / perf model e2e tests. Runs on the same
@@ -184,7 +184,7 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-1-gpu-large-mi30x --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
 
   # =============================================== extra-a (2-gpu-large) ===============================================
   # Multi-GPU TP / PP / PD mock-model + kv_canary e2e tests and PP/MoE
@@ -213,7 +213,7 @@ jobs:
       - name: Run test
         timeout-minutes: 60
         run: |
-          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-2-gpu-large-amd --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+          bash scripts/ci/amd/amd_ci_exec.sh -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite extra-a-test-2-gpu-large-mi30x --auto-partition-id ${{ matrix.part }} --auto-partition-size 2 --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
 
   # =============================================== extra-b (4-gpu) ===============================================
   # 4-GPU tests that CUDA runs in extra-b. Same container env as the
@@ -242,7 +242,7 @@ jobs:
             -e RCCL_MSCCL_ENABLE=0 \
             -e SGLANG_USE_ROCM700A=1 \
             -w "/sglang-checkout/test" \
-            python3 run_suite.py --hw amd --suite extra-b-test-4-gpu-amd --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
+            python3 run_suite.py --hw amd --suite extra-b-test-4-gpu-mi30x --timeout-per-file 1800 ${{ inputs.continue_on_error == true && '--continue-on-error' || '' }}
 
   # =============================================== aggregator ====================================================
   # Single fan-in job so branch protection / notifications depend on one job

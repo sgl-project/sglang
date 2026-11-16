@@ -23,7 +23,7 @@ from sglang.srt.layers.quantization.quark.schemes.quark_w4a4_mxfp4_moe import (
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=40, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(est_time=40, stage="base-b", runner_config="1-gpu-small-mi30x")
 
 try:
     import triton_kernels  # noqa: F401

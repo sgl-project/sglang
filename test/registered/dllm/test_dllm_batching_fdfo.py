@@ -1,7 +1,7 @@
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(est_time=127, stage="extra-a", runner_config="1-gpu-large")
-register_amd_ci(est_time=330, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=330, stage="base-b", runner_config="1-gpu-small-mi30x")
 
 import unittest
 from types import SimpleNamespace

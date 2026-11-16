@@ -35,7 +35,7 @@ from sglang.srt.utils.device import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=90, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=90, stage="base-b", runner_config="1-gpu-small-mi35x")
 
 # N, K chosen off the tuned-Triton list so aiter_w8a8_block_fp8_linear takes the
 # CK bpreshuffle GEMM path (use_triton == False) -- the path this PR optimizes.

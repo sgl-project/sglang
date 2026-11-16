@@ -14,7 +14,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
 # gfx950 only: DeepSeek-V4.1 fuses this all-reduce on MI35x
-register_amd_ci(est_time=60, stage="stage-c", runner_config="large-8-gpu-amd-mi35x")
+register_amd_ci(est_time=60, stage="base-c", runner_config="8-gpu-mi35x")
 
 WORLD_SIZE = 4
 HIDDEN = 5120

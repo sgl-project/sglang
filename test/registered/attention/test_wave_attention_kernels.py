@@ -27,7 +27,8 @@ from sglang.test.kernels.extend_attention import redundant_attention
 # Wave attention kernel unit tests (AMD only - requires wave_lang)
 register_amd_ci(
     est_time=60,
-    suite="stage-a-test-1-gpu-small-amd",
+    stage="base-a",
+    runner_config="1-gpu-small-mi30x",
     disabled="Wave prefill corrupts the native heap on ROCm 10",
 )
 

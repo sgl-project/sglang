@@ -28,7 +28,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(est_time=128, stage="extra-a", runner_config="1-gpu-small")
-register_amd_ci(est_time=100, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=100, stage="base-b", runner_config="1-gpu-small-mi30x")
 
 
 _SEQCLS_MODEL = "Qwen/Qwen3-0.6B"

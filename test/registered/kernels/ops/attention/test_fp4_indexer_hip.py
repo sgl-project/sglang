@@ -92,7 +92,7 @@ from sglang.test.kernels.deepseek_v4.fp4_index_k_reference import (
     read_fp4_index_k_split,
 )
 
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, stage="base-b", runner_config="1-gpu-small-mi35x")
 
 pytestmark = pytest.mark.skipif(
     not (is_hip() and is_gfx95_supported()),

@@ -38,7 +38,7 @@ from sglang.test.test_utils import CustomTestCase
 # Lean lives in the ROCm/AMD Triton backend and is tuned for gfx950 (MI35x),
 # so gate it on the per-commit MI35x single-GPU suite. Correctness (not perf) is
 # what this test asserts, which holds regardless of the triton build.
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, stage="base-b", runner_config="1-gpu-small-mi35x")
 
 # (name, H_Q, H_KV, head_dim) — the two GQA shapes validated in the PR benchmarks.
 GQA_SHAPES = [

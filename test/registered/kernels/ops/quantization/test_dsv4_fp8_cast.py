@@ -26,7 +26,7 @@ from sglang.test.test_utils import CustomTestCase
 
 # the default amd runner is mi300, where pack_fp8 still takes the software path this
 # does not cover
-register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=60, stage="base-b", runner_config="1-gpu-small-mi35x")
 
 DEVICE = torch.device("cuda")
 
