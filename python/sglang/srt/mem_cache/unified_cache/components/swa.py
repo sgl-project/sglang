@@ -1035,8 +1035,6 @@ class SWAComponent(TreeComponent):
         return effective_cache_len
 
     def _free_out_of_window_slots(self, req: Req, pre_len: int) -> None:
-        if self.sliding_window_size is None:
-            return
         self.cache.kv_storage().advance(
             req,
             pre_len,
