@@ -82,11 +82,24 @@ if HAS_CUTEDSL:
 
         return (
             tuple(uint32_ptr() for _ in range(ar_world_size)),  # peer inboxes
-            uint32_ptr(),  # worker epoch controllers
+            uint32_ptr(),  # push plane phase word (EpochCounter, u64 as two u32)
             Int32(0),  # TP rank
             Int32(1),  # slot size in uint32 elements
             uint32_ptr(),  # local inbox
             uint32_ptr(),  # multicast inbox mapping
+        )
+
+    @dsl_user_op
+    def _commit_epoch(ptr, value, *, loc=None, ip=None):
+        # EpochCounter::commit: participants add 2^32 in total on the u64 phase word.
+        llvm.inline_asm(
+            None,
+            [ptr.toint(loc=loc, ip=ip).ir_value(), value.ir_value(loc=loc, ip=ip)],
+            "red.relaxed.gpu.global.add.u64 [$0], $1;",
+            "l,l,~{memory}",
+            has_side_effects=True,
+            is_align_stack=False,
+            asm_dialect=llvm.AsmDialect.AD_ATT,
         )
 
     @dsl_user_op
@@ -949,12 +962,11 @@ if HAS_CUTEDSL:
             cute.copy(atom, cute.make_tensor(mW.iterator + offset, layout), norm)
             if cutlass.const_expr(self.ar_world_size > 0):
                 # Read the borrowed epoch after the PDL dependency completes.
-                controllers = cute.make_tensor(
-                    ar[1], cute.make_layout((self.ar_controller_count,))
-                )
+                # u64 phase word as two u32 halves; the phase is bit 0 of the high one
+                phase_word = cute.make_tensor(ar[1], cute.make_layout((2,)))
                 if cutlass.const_expr(self.use_pdl):
                     cute.arch.griddepcontrol_wait()
-                epoch = controllers[worker]
+                epoch = phase_word[1] & cutlass.Uint32(1)
             for token_iteration in cutlass.range(token_iterations):
                 token_idx = token_start + token_iteration * token_stride
                 # ---- PDL: wait for prior kernel to complete ----
@@ -1229,22 +1241,19 @@ if HAS_CUTEDSL:
                 cute.arch.cluster_arrive_relaxed()
                 cute.arch.cluster_wait()
             if cutlass.const_expr(self.ar_world_size > 0):
-                # One writer per active worker; all CTAs share unused controllers.
-                next_epoch = epoch ^ cutlass.Uint32(1)
-                # Every thread must have read `epoch` before it flips: two rows sync only per row,
-                # and a token with no local expert skips the RMSNorm barriers.
+                # Every thread has read `epoch` before the commit: two rows sync only per
+                # row, and a token with no local expert skips the RMSNorm barriers. With
+                # cluster_size > 1 the cluster barrier above already orders the peer CTAs.
                 cute.arch.barrier()
+                # One participant per worker (the cluster's first CTA).
                 if cta_rank == 0 and tidx == 0:
-                    controllers[worker] = next_epoch
-                block_threads = threads_per_row * self.rows
-                global_thread = cute.arch.block_idx()[0] * block_threads + tidx
-                # Advance unused controllers to match ordinary push AR.
-                for controller in range(
-                    cute.arch.grid_dim()[0] // self.cluster_size + global_thread,
-                    self.ar_controller_count,
-                    cute.arch.grid_dim()[0] * block_threads,
-                ):
-                    controllers[controller] = next_epoch
+                    num_workers = cute.arch.grid_dim()[0] // self.cluster_size
+                    increment = cutlass.Uint64(1)
+                    if worker == 0:
+                        increment = cutlass.Uint64(1 << 32) - cutlass.Uint64(
+                            num_workers - 1
+                        )
+                    _commit_epoch(ar[1], increment)
 
     # =================================================================
     # Compilation cache

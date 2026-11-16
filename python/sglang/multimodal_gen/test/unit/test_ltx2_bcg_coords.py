@@ -1,6 +1,7 @@
 import unittest
 from collections import OrderedDict
 from contextlib import ExitStack, nullcontext
+from itertools import product
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
@@ -15,7 +16,10 @@ from sglang.multimodal_gen.runtime.breakable_cuda_graph.runner import (
     BaseBreakableCudaGraphRunner,
 )
 from sglang.multimodal_gen.runtime.layers.attention import layer
-from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import SDPABackend
+from sglang.multimodal_gen.runtime.layers.attention.backends.sdpa import (
+    CudnnSDPABackend,
+    SDPABackend,
+)
 from sglang.multimodal_gen.runtime.managers.forward_context import set_forward_context
 from sglang.multimodal_gen.runtime.models.dits.ltx_2 import (
     LTX2AudioVideoRotaryPosEmbed,
@@ -431,7 +435,6 @@ class TestLTX2DenseAttentionBCG(CustomTestCase):
     def test_capture_and_eager_break_replay_changed_masks(self):
         with ExitStack() as stack:
             for name, value in (
-                ("get_attn_backend", SDPABackend),
                 ("get_compute_dtype", torch.bfloat16),
                 ("get_sequence_parallel_world_size", 1),
                 ("get_ring_parallel_world_size", 1),
@@ -440,9 +443,19 @@ class TestLTX2DenseAttentionBCG(CustomTestCase):
             ):
                 stack.enter_context(patch.object(layer, name, return_value=value))
             stack.enter_context(set_forward_context(0, None))
-            for cls in (layer.LocalAttention, layer.USPAttention):
+            for backend, cls in product(
+                (SDPABackend, CudnnSDPABackend),
+                (layer.LocalAttention, layer.USPAttention),
+            ):
                 for capture_dense in (False, True):
-                    with self.subTest(layer=cls.__name__, capture_dense=capture_dense):
+                    with (
+                        self.subTest(
+                            backend=backend.__name__,
+                            layer=cls.__name__,
+                            capture_dense=capture_dense,
+                        ),
+                        patch.object(layer, "get_attn_backend", return_value=backend),
+                    ):
                         attention = cls(
                             num_heads=4,
                             head_size=64,

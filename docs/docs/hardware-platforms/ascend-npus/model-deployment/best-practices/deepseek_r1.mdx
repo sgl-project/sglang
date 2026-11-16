@@ -199,15 +199,15 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
 #   <your decode ip>: decode node IP address
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip>:8001 \
     --host 127.0.0.1 \
-    --port 6688 \
+    --port 6688
 ```
 
 #### Benchmark
@@ -504,18 +504,18 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
 #   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-export SGLANG_DP_ROUND_ROBIN=1
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<your prefill ip1>:8000 8998 \
-    --prefill http://<your prefill ip2>:8000 8999 \
-    --decode http://<your decode ip1>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls \
+        http://<your prefill ip1>:8000 \
+        http://<your prefill ip2>:8000 \
+        http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
-    --port 6688 \
-    --mini-lb
+    --port 6688
 ```
 
 #### Benchmark
@@ -708,18 +708,18 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
 #   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-export SGLANG_DP_ROUND_ROBIN=1
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<your prefill ip1>:8000 8998 \
-    --prefill http://<your prefill ip2>:8000 8999 \
-    --decode http://<your decode ip1>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls \
+        http://<your prefill ip1>:8000 \
+        http://<your prefill ip2>:8000 \
+        http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
-    --port 6688 \
-    --mini-lb
+    --port 6688
 ```
 
 #### Benchmark
@@ -908,18 +908,18 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
 #   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-export SGLANG_DP_ROUND_ROBIN=1
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<your prefill ip1>:8000 8998 \
-    --prefill http://<your prefill ip2>:8000 8999 \
-    --decode http://<your decode ip1>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls \
+        http://<your prefill ip1>:8000 \
+        http://<your prefill ip2>:8000 \
+        http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
-    --port 6688 \
-    --mini-lb
+    --port 6688
 ```
 
 #### Benchmark
@@ -1108,18 +1108,18 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
 #   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-export SGLANG_DP_ROUND_ROBIN=1
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<your prefill ip1>:8000 8998 \
-    --prefill http://<your prefill ip2>:8000 8999 \
-    --decode http://<your decode ip1>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls \
+        http://<your prefill ip1>:8000 \
+        http://<your prefill ip2>:8000 \
+        http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
-    --port 6688 \
-    --mini-lb
+    --port 6688
 ```
 
 #### Benchmark
@@ -1306,18 +1306,18 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip1>, <your prefill ip2>: prefill node IP addresses
 #   <your decode ip1>: first decode node IP address (decode may have distributed nodes)
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-export SGLANG_DP_ROUND_ROBIN=1
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<your prefill ip1>:8000 8998 \
-    --prefill http://<your prefill ip2>:8000 8999 \
-    --decode http://<your decode ip1>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls \
+        http://<your prefill ip1>:8000 \
+        http://<your prefill ip2>:8000 \
+        http://<your decode ip1>:8001 \
     --host 127.0.0.1 \
-    --port 6688 \
-    --mini-lb
+    --port 6688
 ```
 
 #### Benchmark

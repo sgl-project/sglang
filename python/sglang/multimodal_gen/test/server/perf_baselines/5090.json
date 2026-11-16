@@ -61,10 +61,10 @@
             "expected_e2e_ms": 18255.39,
             "expected_avg_denoise_ms": 338.78,
             "expected_median_denoise_ms": 345.95,
-            "load_peak_vram_mb": 1126.0,
-            "runtime_peak_vram_mb": 13180.0,
-            "load_peak_allocated_mb": 1019.0,
-            "runtime_peak_allocated_mb": 8912.0,
+            "load_peak_vram_mb": 15294.0,
+            "runtime_peak_vram_mb": 20238.0,
+            "load_peak_allocated_mb": 15290.36,
+            "runtime_peak_allocated_mb": 17798.0,
             "estimated_full_test_time_s": 94.0
         },
         "wan2_1_t2v_1.3b": {
@@ -118,8 +118,8 @@
             "runtime_peak_vram_mb": 14216.0,
             "load_peak_allocated_mb": 903.0,
             "runtime_peak_allocated_mb": 6925.0,
-            "load_peak_host_anon_mb": 6759.33,
-            "runtime_peak_host_anon_mb": 6759.33,
+            "load_peak_host_anon_mb": 7071.05,
+            "runtime_peak_host_anon_mb": 7071.05,
             "estimated_full_test_time_s": 200.3
         },
         "zimage_image_t2i": {
@@ -148,33 +148,6 @@
             "load_peak_allocated_mb": 12852.0,
             "runtime_peak_allocated_mb": 15133.0,
             "estimated_full_test_time_s": 329.8
-        },
-        "flux_image_t2i_layerwise_cpu_offload_5090": {
-            "expected_load_ms": 47725.91,
-            "stages_ms": {
-                "InputValidationStage": 0.11,
-                "TextEncodingStage": 204.63,
-                "LatentPreparationStage": 0.72,
-                "TimestepPreparationStage": 71.6,
-                "DenoisingStage": 3603.59,
-                "DecodingStage": 37.95
-            },
-            "denoise_step_ms": {
-                "0": 400.73,
-                "1": 682.43,
-                "2": 876.57,
-                "3": 877.12
-            },
-            "expected_e2e_ms": 4604.15,
-            "expected_avg_denoise_ms": 709.21,
-            "expected_median_denoise_ms": 779.5,
-            "load_peak_vram_mb": 4916.0,
-            "runtime_peak_vram_mb": 19146.0,
-            "load_peak_allocated_mb": 4880.0,
-            "runtime_peak_allocated_mb": 14216.0,
-            "load_peak_host_anon_mb": 10559.66,
-            "runtime_peak_host_anon_mb": 10559.66,
-            "estimated_full_test_time_s": 172.8
         },
         "lingbot_video_moe_t2v": {
             "stages_ms": {
