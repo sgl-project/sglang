@@ -12,19 +12,21 @@ from typing import Tuple
 
 import torch
 
-from sglang.kernels.ops.attention.deepseek_v4_rope import set_batched_rope
 from sglang.kernels.ops.attention.dsv4.attn import fused_store_cache
 from sglang.kernels.ops.attention.dsv4.compress import (
     CompressorDecodePlan,
     compress_norm_rope_store,
 )
-from sglang.kernels.ops.attention.dsv4.dequant_k_cache import dequantize_k_cache_paged
-from sglang.kernels.ops.attention.dsv4.elementwise import (
+from sglang.kernels.ops.attention.dsv4.dequant_k_cache import (
+    dequantize_k_cache_paged_dsv4,
+)
+from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
+from sglang.kernels.ops.attention.dsv4.norm_rope import (
     fused_k_norm_rope_flashmla,
     fused_rope_inplace,
 )
-from sglang.kernels.ops.attention.dsv4.kv_layout import KVLayout
-from sglang.kernels.ops.attention.dsv4.torch_quant import fake_quant_compressed_kv
+from sglang.kernels.ops.attention.dsv4.rope import set_batched_rope
+from sglang.kernels.ops.quantization.fp4_fake_quant import fake_quant_compressed_kv
 from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.deepseek_v4 import dsv41_kv_quant_reference as tq
@@ -37,16 +39,51 @@ register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b
 # canonicalization and the query rope in the K launch exist only on HIP
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
-REFERENCE = {
-    KVLayout.V41: tq.quantize_k_cache_v41,
-    KVLayout.V41_FP4: tq.quantize_k_cache_v41_fp4,
+V41_LAYOUTS = (
+    KVLayout.V41,
+    KVLayout.V41_FP4,
+    KVLayout.V41_NEW,
+    KVLayout.V41_FP4_NEW,
+)
+_QUANT = {
+    KVLayout.V41: (tq.quantize_k_cache_v41, tq.dequantize_k_cache_v41),
+    KVLayout.V41_FP4: (tq.quantize_k_cache_v41_fp4, tq.dequantize_k_cache_v41_fp4),
 }
-DEQUANT = {
-    KVLayout.V41: tq.dequantize_k_cache_v41,
-    KVLayout.V41_FP4: tq.dequantize_k_cache_v41_fp4,
+
+
+def _interleaved(layout, quant, dequant):
+    """The block-split oracle pair, moved to the interleaved arrangement."""
+    shape = (layout.data_bytes, layout.scale_bytes)
+
+    def quant_new(k, page_bytes=None):
+        pages = tq.interleave_pages(quant(k), k.shape[1], *shape)
+        out = torch.zeros(
+            pages.shape[0],
+            page_bytes or layout.page_bytes(k.shape[1]),
+            dtype=torch.uint8,
+            device=pages.device,
+        )
+        out[:, : pages.shape[1]] = pages
+        return out
+
+    def dequant_new(pages, page_size):
+        return dequant(tq.deinterleave_pages(pages, page_size, *shape), page_size)
+
+    return quant_new, dequant_new
+
+
+CASES = {
+    layout: (
+        _interleaved(layout, *_QUANT[layout.encoding])
+        if layout.is_interleaved
+        else _QUANT[layout]
+    )
+    for layout in V41_LAYOUTS
 }
+REFERENCE = {layout: quant for layout, (quant, _) in CASES.items()}
+DEQUANT = {layout: dequant for layout, (_, dequant) in CASES.items()}
 # One quantization step, relative: e4m3 has 3 mantissa bits, e2m1 one.
-ONE_CODE_RTOL = {KVLayout.V41: 0.13, KVLayout.V41_FP4: 0.51}
+ONE_CODE_RTOL = {layout: 0.51 if layout.is_fp4 else 0.13 for layout in V41_LAYOUTS}
 
 
 def rope_tail(
@@ -67,14 +104,13 @@ def token_rows(
     """The (data row, scale row) bytes of the tokens at locs."""
     locs = locs.long()
     page, offset = locs // page_size, locs % page_size
+    data_stride, scale_base, scale_stride = layout.row_addressing(page_size)
     data_cols = torch.arange(layout.data_bytes, device=pages.device)
     scale_cols = torch.arange(layout.scale_bytes, device=pages.device)
-    data = pages[page[:, None], offset[:, None] * layout.data_bytes + data_cols]
+    data = pages[page[:, None], offset[:, None] * data_stride + data_cols]
     scale = pages[
         page[:, None],
-        layout.scale_offset(page_size)
-        + offset[:, None] * layout.scale_bytes
-        + scale_cols,
+        scale_base + offset[:, None] * scale_stride + scale_cols,
     ]
     return data, scale
 
@@ -155,7 +191,7 @@ class TestV41KVStore(CustomTestCase):
         """Ragged page fills: a random subset of slots is written, the rest stays zero."""
 
         g = torch.Generator(device="cuda").manual_seed(0)
-        for layout in (KVLayout.V41, KVLayout.V41_FP4):
+        for layout in V41_LAYOUTS:
             # A full page and a padded 2-token page, each with one index dtype
             # (the layout, the pad and the dtype are the three template axes).
             for page_size, num_pages, n, idx_dtype in (
@@ -195,7 +231,7 @@ class TestV41KVStore(CustomTestCase):
 
         g = torch.Generator(device="cuda").manual_seed(1)
         page_size, num_pages, n = 64, 5, 200
-        for layout in (KVLayout.V41, KVLayout.V41_FP4):
+        for layout in V41_LAYOUTS:
             with self.subTest(layout=layout.name):
                 x = random_rows(n, g)
                 angles = torch.randn(n, 32, generator=g, device="cuda")
@@ -223,10 +259,8 @@ class TestV41KVStore(CustomTestCase):
                     layout, page_size, num_pages, locs, rotated, cache.shape[1]
                 )
                 self.assert_tokens_equal(cache, ref, layout, page_size, locs)
-                if layout is KVLayout.V41_FP4:
-                    deq = tq.dequantize_k_cache_v41_fp4(cache, page_size).view(-1, 512)[
-                        locs
-                    ]
+                if layout.is_fp4:
+                    deq = DEQUANT[layout](cache, page_size).view(-1, 512)[locs]
                     self.assertTrue(torch.equal(deq, fake_quant_compressed_kv(rotated)))
 
     def test_boundary_tiles(self):
@@ -258,7 +292,7 @@ class TestV41KVStore(CustomTestCase):
         n = x.shape[0]
         page_size = 16
         locs = torch.arange(n, device="cuda", dtype=torch.int32)
-        for layout in (KVLayout.V41, KVLayout.V41_FP4):
+        for layout in V41_LAYOUTS:
             with self.subTest(layout=layout.name):
                 cache = torch.zeros(
                     1, layout.page_bytes(page_size), dtype=torch.uint8, device="cuda"
@@ -275,8 +309,15 @@ class TestV41KVStore(CustomTestCase):
         fused_store_cache: exact-norm rows bitwise against the torch quantizer, and
         general rows bitwise against the unfused kernel chain."""
 
+        # 300 tokens take the block-per-token kernel, 4097 the warp-per-token one; an odd
+        # count leaves half of the last wave64 idle on HIP.
+        for n, num_pages in ((300, 3), (4097, 20)):
+            with self.subTest(tokens=n):
+                self._check_fused_k_norm_rope_store(n, num_pages)
+
+    def _check_fused_k_norm_rope_store(self, n, num_pages):
         g = torch.Generator(device="cuda").manual_seed(2)
-        page_size, num_pages, n = 256, 3, 300
+        page_size = 256
         angles = torch.randn(1024, 32, generator=g, device="cuda")
         freqs_table = torch.polar(torch.ones_like(angles), angles)
         pos = torch.randint(
@@ -287,7 +328,7 @@ class TestV41KVStore(CustomTestCase):
         )
         locs[7] = -1  # a row without a write target is skipped
         valid = locs >= 0
-        for layout in (KVLayout.V41, KVLayout.V41_FP4):
+        for layout in V41_LAYOUTS:
             with self.subTest(layout=layout.name, rows="exact-norm"):
                 # x = +-2^k per row with eps = 0 normalizes to +-1 exactly, so the
                 # normed row is sign * weight and the reference is exact.
@@ -368,7 +409,7 @@ class TestV41KVStore(CustomTestCase):
         angles = torch.randn(4096, 32, generator=g, device="cuda")
         freqs = torch.polar(torch.ones_like(angles), angles)
         n, page_size, num_pages = 150, 64, 8
-        for layout in (KVLayout.V41, KVLayout.V41_FP4):
+        for layout in V41_LAYOUTS:
             seq_lens = (
                 torch.randint(
                     1, 1000, (n,), generator=g, device="cuda", dtype=torch.int64
@@ -471,18 +512,14 @@ class TestV41KVStore(CustomTestCase):
                 self.assert_rows_close(cache, ref, layout, page_size, out_loc[valid])
 
 
-CASES = {
-    KVLayout.V41: (tq.quantize_k_cache_v41, tq.dequantize_k_cache_v41),
-    KVLayout.V41_FP4: (tq.quantize_k_cache_v41_fp4, tq.dequantize_k_cache_v41_fp4),
-}
-
-
 def bits(t: torch.Tensor) -> torch.Tensor:
     """bf16 as int16, so that -0.0 and NaN payloads compare exactly."""
     return t.contiguous().view(torch.int16)
 
 
-@unittest.skipUnless(is_hip() and is_gfx95_supported(), "requires gfx950")
+@unittest.skipUnless(
+    _v41_store_kernels_available(), "the V4.1 dequant kernels need gfx950 or SM100"
+)
 class TestV41KVDequant(CustomTestCase):
     def _gather_ref(self, dequant, pages, page_size, ids):
         return dequant(pages, page_size).view(-1, 512)[ids.long()].unsqueeze(1)
@@ -523,7 +560,9 @@ class TestV41KVDequant(CustomTestCase):
                         device="cuda",
                         dtype=torch.int32,
                     )
-                    got = dequantize_k_cache_paged(pages, ids, page_size, layout=layout)
+                    got = dequantize_k_cache_paged_dsv4(
+                        pages, ids, page_size, layout=layout
+                    )
                     self.assertTrue(
                         torch.equal(
                             bits(got),
@@ -532,7 +571,7 @@ class TestV41KVDequant(CustomTestCase):
                     )
                     # The fp4 cache dequantizes to the model's fake-quantized value
                     # (compared by value: the fake quant maps an exact -0.0 to +0.0).
-                    if layout is KVLayout.V41_FP4:
+                    if layout.is_fp4:
                         expect = fake_quant_compressed_kv(
                             k.view(-1, 512)[ids.long()]
                         ).unsqueeze(1)
@@ -553,13 +592,14 @@ class TestV41KVDequant(CustomTestCase):
                     dtype=torch.uint8,
                     device="cuda",
                 )
-                if layout is KVLayout.V41:
-                    lo = layout.scale_offset(page_size)
-                    hi = lo + page_size * layout.scale_bytes
-                    pages[:, lo:hi] = torch.randint(
+                if not layout.is_fp4:
+                    _, scale_base, scale_stride = layout.row_addressing(page_size)
+                    cols = scale_base + torch.arange(page_size)[:, None] * scale_stride
+                    cols = (cols + torch.arange(layout.scale_bytes)).flatten().cuda()
+                    pages[:, cols] = torch.randint(
                         100,
                         140,
-                        (num_pages, hi - lo),
+                        (num_pages, cols.numel()),
                         generator=g,
                         dtype=torch.uint8,
                         device="cuda",
@@ -576,7 +616,7 @@ class TestV41KVDequant(CustomTestCase):
                 workspace = torch.zeros(
                     305, 1, 512, dtype=torch.bfloat16, device="cuda"
                 )
-                out = dequantize_k_cache_paged(
+                out = dequantize_k_cache_paged_dsv4(
                     pages, ids, page_size, out=workspace[5:], layout=layout
                 )
                 # NaN payloads (fp8 0x7F / e4m3 NaN scales) compare through their bits.

@@ -18,7 +18,7 @@ import msgspec
 import numpy as np
 import torch
 
-from sglang.srt.utils.common import get_video_bytes
+from sglang.srt.multimodal.media_io import get_video_bytes
 
 __all__ = [
     "LetterboxInfo",
@@ -296,7 +296,7 @@ def write_reference_video(path: str, frames: np.ndarray, fps: int) -> None:
     """Write ``[N, H, W, 3]`` uint8 RGB frames to ``path`` as an mp4 at ``fps`` through the
     runtime's video writer (the one request outputs go through), so the synthetic warmup
     video is encoded exactly like a request output and decodes with the readers above."""
-    from sglang.multimodal_gen.configs.sample.sampling_params import DataType
+    from sglang.multimodal_gen.configs.task_type import DataType
     from sglang.multimodal_gen.runtime.entrypoints.utils import post_process_sample
 
     try:

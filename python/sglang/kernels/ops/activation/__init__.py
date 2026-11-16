@@ -112,7 +112,7 @@ def situ_and_mul(
     beta: float,
     linear_beta: Optional[float],
 ) -> torch.Tensor:
-    from ._jit_situ_and_mul import situ_and_mul as impl
+    from .kimi_k3_situ_and_mul import situ_and_mul as impl
 
     return impl(input, out, beta, linear_beta)
 
@@ -143,6 +143,24 @@ register_kernel(
         capabilities=CUDA_ONLY,
     )
 )
+register_kernel(
+    KernelSpec(
+        op="activation.cast_to_float32_logits",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.activation.softcap:cast_to_float32_logits",
+        capabilities=CUDA_ONLY,
+    )
+)
+
+
+register_kernel(
+    KernelSpec(
+        op="activation.multimax",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.activation.multimax:multimax",
+        capabilities=CUDA_ONLY,
+    )
+)
 
 
 # Kernels introduced with Kimi-K3, inventoried by logical operator group.
@@ -150,7 +168,48 @@ register_kernel(
     KernelSpec(
         op="activation.situ_and_mul",
         backend=KernelBackend.JIT,
-        target="sglang.kernels.ops.activation._jit_situ_and_mul:situ_and_mul",
+        target="sglang.kernels.ops.activation.kimi_k3_situ_and_mul:situ_and_mul",
         capabilities=CUDA_ONLY,
+    )
+)
+
+
+# MXFP8-quantizing SwiGLU producers; registered for inventory.
+register_kernel(
+    KernelSpec(
+        op="activation.silu_mul_mxfp8",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.activation.swiglu_mxfp8_swizzled:silu_mul_mxfp8",
+        capabilities=CUDA_ONLY,
+    )
+)
+for _fn in ("swiglu_oai_mxfp8", "swiglu_oai_mxfp8_deepgemm"):
+    register_kernel(
+        KernelSpec(
+            op=f"activation.{_fn}",
+            backend=KernelBackend.TRITON,
+            target=f"sglang.kernels.ops.activation.swiglu_mxfp8_swizzled:{_fn}",
+        )
+    )
+del _fn
+for _fn in ("silu_and_mul_clamp", "silu_and_mul_contig_post_quant"):
+    register_kernel(
+        KernelSpec(
+            op=f"activation.{_fn}",
+            backend=KernelBackend.JIT,
+            target=f"sglang.kernels.ops.activation.silu_and_mul_clamp:{_fn}",
+            capabilities=frozenset(
+                {CapabilityRequirement.CUDA, CapabilityRequirement.HIP}
+            ),
+        )
+    )
+del _fn
+
+register_kernel(
+    KernelSpec(
+        op="activation.silu_and_mul_block_quant_two_group",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.activation.silu_and_mul_block_quant:silu_and_mul_block_quant_two_group",
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
     )
 )

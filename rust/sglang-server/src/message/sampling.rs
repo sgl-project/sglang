@@ -319,6 +319,19 @@ impl SamplingParams {
         self.verify(vocab_size)
     }
 
+    /// `temperature` and `top_k` as the scheduler samples with them, which
+    /// [`normalize`](Self::normalize) settles: a greedy temperature samples at
+    /// 1.0 from the top token, and `top_k = -1` is the whole vocabulary.
+    pub fn sampled_temperature_top_k(&self) -> (f64, i64) {
+        if (0.0..SAMPLING_EPS).contains(&self.temperature) {
+            (1.0, 1)
+        } else if self.top_k == -1 {
+            (self.temperature, TOP_K_ALL)
+        } else {
+            (self.temperature, self.top_k)
+        }
+    }
+
     /// Python `__post_init__` (minus the null-to-default coercions, which the
     /// null-tolerant deserializers above already did): copy the API aliases into
     /// the internal fields and apply the greedy / `top_k` special cases.
@@ -337,14 +350,7 @@ impl SamplingParams {
         if self.stop_token_ids.as_ref().is_some_and(|v| v.is_empty()) {
             self.stop_token_ids = None;
         }
-        if (0.0..SAMPLING_EPS).contains(&self.temperature) {
-            // Greedy: temperature ~0 → temperature=1.0, top_k=1.
-            self.temperature = 1.0;
-            self.top_k = 1;
-        }
-        if self.top_k == -1 {
-            self.top_k = TOP_K_ALL; // -1 disables top_k → whole vocabulary
-        }
+        (self.temperature, self.top_k) = self.sampled_temperature_top_k();
         for constraint in [
             &mut self.json_schema,
             &mut self.regex,

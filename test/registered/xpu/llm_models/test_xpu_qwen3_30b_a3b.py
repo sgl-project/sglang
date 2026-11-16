@@ -1,6 +1,6 @@
 """Qwen3-30B-A3B GSM8K accuracy on Intel XPU (TP=4).
 
-Scored by ``simple_eval_gsm8k.GSM8KEval``.
+Scored by sgl-eval's ``gsm8k`` benchmark.
 """
 
 import unittest

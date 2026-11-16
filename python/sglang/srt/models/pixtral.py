@@ -41,12 +41,11 @@ from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
 )
-from sglang.srt.managers.schedule_batch import MultimodalDataItem, MultimodalInputs
+from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.mistral import MistralForCausalLMMistralFormat
 from sglang.srt.models.mistral_large_3 import MistralLarge3ForCausalLM
 
-USE_XFORMERS_OPS = False
 PATCH_MERGE = "patch_merge"
 
 
@@ -68,18 +67,32 @@ class VisionEncoderArgs:
     mm_projector_id: str = ""
 
 
+def _fused_moe_text_config(hf_config):
+    """Return the nested fusable MoE config, or None for other branches."""
+    text_config = hf_config.text_config
+    if getattr(text_config, "model_type", "") != "deepseek_v3":
+        return None
+    return text_config
+
+
 class PixtralForConditionalGeneration(nn.Module):
     merge_by_field_config = True
 
     @staticmethod
     def shared_experts_fusion_disable_reason(hf_config, quant_config):
-        text_config = hf_config.text_config
-        if getattr(text_config, "model_type", "") != "deepseek_v3":
-            # The GQA text config builds the dense Mistral backbone.
+        text_config = _fused_moe_text_config(hf_config)
+        if text_config is None:
             return None
         return MistralLarge3ForCausalLM.shared_experts_fusion_disable_reason(
             text_config, quant_config
         )
+
+    @staticmethod
+    def num_fusable_shared_experts(hf_config) -> int:
+        text_config = _fused_moe_text_config(hf_config)
+        if text_config is None:
+            return 0
+        return MistralLarge3ForCausalLM.num_fusable_shared_experts(text_config)
 
     @classmethod
     def get_placeholder_str(cls, modality: str, i: int) -> str | None:
@@ -419,20 +432,13 @@ class VisionTransformer(nn.Module):
         freqs_cis = self.freqs_cis[positions[:, 0], positions[:, 1]]
 
         # pass through Transformer with a block diagonal mask delimiting images
-        if USE_XFORMERS_OPS:
-            from xformers import ops as xops
+        from transformers.models.pixtral.modeling_pixtral import (
+            generate_block_attention_mask,
+        )
 
-            mask = xops.fmha.attn_bias.BlockDiagonalMask.from_seqlens(
-                [p.shape[-2] * p.shape[-1] for p in patch_embeds_list],
-            )
-        else:
-            from transformers.models.pixtral.modeling_pixtral import (
-                generate_block_attention_mask,
-            )
-
-            mask = generate_block_attention_mask(
-                [p.shape[-2] * p.shape[-1] for p in patch_embeds_list], patch_embeds
-            )
+        mask = generate_block_attention_mask(
+            [p.shape[-2] * p.shape[-1] for p in patch_embeds_list], patch_embeds
+        )
         return self.transformer(patch_embeds, mask=mask, freqs_cis=freqs_cis)
 
 
@@ -689,16 +695,11 @@ class Attention(nn.Module):
 
         q, k = apply_rotary_emb_vit(q, k, freqs_cis=freqs_cis)
 
-        if USE_XFORMERS_OPS:
-            from xformers import ops as xops
-
-            out = xops.memory_efficient_attention(q, k, v, attn_bias=mask)
-        else:
-            q = q.transpose(1, 2)
-            k = k.transpose(1, 2)
-            v = v.transpose(1, 2)
-            out = nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
-            out = out.transpose(1, 2)
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
+        v = v.transpose(1, 2)
+        out = nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask)
+        out = out.transpose(1, 2)
 
         out = out.reshape(batch, patches, self.n_heads * self.head_dim)
         return self.wo(out)

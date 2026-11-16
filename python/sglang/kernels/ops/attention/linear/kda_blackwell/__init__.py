@@ -7,6 +7,8 @@
 #   prologue -> kkt_inv_uw (U,W) -> h (V_new, per-chunk state, final state) -> o
 import torch
 
+from sglang.kernels.arch import current_arch
+
 from .kernel_h import kda_h_cutedsl
 from .kernel_kkt_inv_uw import kkt_inv_uw_cutedsl
 from .kernel_o import kda_o_cutedsl
@@ -138,7 +140,7 @@ def chunk_kda_cutedsl(
     if scale is None:
         scale = K**-0.5
     if num_sms is None:
-        num_sms = torch.cuda.get_device_properties(q.device).multi_processor_count
+        num_sms = current_arch().num_sms
 
     # Gate activation (standard KDA gate). Fused into the prologue is a B2 TODO;
     # for now a small PyTorch pass, matching chunk_kda's kda_gate_chunk_cumsum.

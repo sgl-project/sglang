@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 import asyncio
 import json
+import math
 import time
 from collections import deque
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 import torch
@@ -13,13 +15,13 @@ from transformers.cache_utils import DynamicCache
 from sglang.multimodal_gen.configs.pipeline_configs.sensenova_u1 import (
     SenseNovaU1PipelineConfig,
 )
-from sglang.multimodal_gen.configs.sample.sampling_params import DataType
 from sglang.multimodal_gen.configs.sample.sensenova_u1 import (
     SenseNovaU1SamplingParams,
 )
 from sglang.multimodal_gen.configs.sensenova_u1 import (
     SENSENOVA_U1_REQUEST_EXTRA_KEY,
 )
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.registry import (
     _get_config_info,
     get_model_info,
@@ -31,6 +33,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import (
 )
 from sglang.multimodal_gen.runtime.managers.gpu_worker import GPUWorker
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify import (
+    modeling_fm_modules,
+)
 from sglang.multimodal_gen.runtime.models.sensenova_u1.neo_unify.configuration_neo_chat import (
     NEOLLMConfig,
 )
@@ -1349,3 +1354,21 @@ def test_sensenova_u1_multi_output_entrypoint_mixed_failure_fails_parent(
     assert trace_ctx.started_slices == [("gpu_forward", 2)]
     assert trace_ctx.finished_slices == [("gpu_forward", 2)]
     assert trace_ctx.finish_count == 1
+
+
+def test_sensenova_u1_timestep_frequencies_are_built_once():
+    """The host-built frequencies are uploaded once per device, not on each
+    denoising step (a pageable upload blocks the host)."""
+    modeling_fm_modules._timestep_freqs.cache_clear()
+    t = torch.tensor([0.25, 0.75])
+    half = 128
+    freqs = torch.exp(
+        -math.log(10000.0) * torch.arange(start=0, end=half, dtype=torch.float32) / half
+    )
+    args = t[:, None].float() * freqs[None]
+    expected = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
+    embed = modeling_fm_modules.TimestepEmbedder.timestep_embedding
+    with patch.object(modeling_fm_modules.torch, "exp", wraps=torch.exp) as exp:
+        for _ in range(3):
+            torch.testing.assert_close(embed(t, 2 * half), expected, atol=0, rtol=0)
+    assert exp.call_count == 1

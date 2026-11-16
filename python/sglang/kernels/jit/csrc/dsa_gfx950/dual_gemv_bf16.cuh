@@ -300,7 +300,7 @@ struct DualGemvBf16Kernel {
     auto Kk_ = SymbolicSize{"k_k"};
     auto Nk_ = SymbolicSize{"n_k"};
     auto device_ = SymbolicDevice{};
-    device_.set_options<kDLCUDA>();
+    device_.set_options<kDLGPU>();
 
     // Q reads x at row * K, so a padded Xq or Wq would silently read wrong rows.
     TensorMatcher({M_, Kq_}).with_dtype<bf16_t>().with_device(device_).with_strides({Kq_, 1}).verify(Xq);

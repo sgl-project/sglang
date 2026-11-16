@@ -187,6 +187,7 @@ class GraphExecGroup:
     graph_exec: int
     current_raw_graph: int
     graphs: list[DedupedCudaGraph] = field(default_factory=list)
+    uploaded: bool = False
 
 
 @dataclass(eq=False, slots=True)
@@ -206,6 +207,8 @@ class DedupedCudaGraphRegistry:
     def __init__(self):
         self.groups: dict[tuple, GraphExecGroup] = {}
         self.sealed = False
+        self.upload_stream: int | None = None
+        self.upload_event: int | None = None
 
     def instantiate(self, raw_graph: int) -> int:
         assert cuda_rt is not None
@@ -213,6 +216,23 @@ class DedupedCudaGraphRegistry:
             cuda_rt.cudaGraphInstantiateWithFlags(raw_graph, 0)
         )
         return graph_exec
+
+    def upload(self, group: GraphExecGroup, stream: int) -> None:
+        assert cuda_rt is not None
+        # A first launch would upload through `stream`, and that upload can
+        # block the host behind the stream's running work. A private idle
+        # stream uploads at once; `stream` waits on it.
+        if self.upload_stream is None:
+            self.upload_stream = checkCudaErrors(
+                cuda_rt.cudaStreamCreateWithFlags(cuda_rt.cudaStreamNonBlocking)
+            )
+            self.upload_event = checkCudaErrors(
+                cuda_rt.cudaEventCreateWithFlags(cuda_rt.cudaEventDisableTiming)
+            )
+        checkCudaErrors(cuda_rt.cudaGraphUpload(group.graph_exec, self.upload_stream))
+        checkCudaErrors(cuda_rt.cudaEventRecord(self.upload_event, self.upload_stream))
+        checkCudaErrors(cuda_rt.cudaStreamWaitEvent(stream, self.upload_event, 0))
+        group.uploaded = True
 
     def destroy_exec(self, graph_exec: int) -> None:
         assert cuda_rt is not None
@@ -268,6 +288,8 @@ class DedupedCudaGraphRegistry:
             )
             group.current_raw_graph = raw_graph
 
+        if not group.uploaded:
+            self.upload(group, stream)
         checkCudaErrors(cuda_rt.cudaGraphLaunch(graph_exec, stream))
 
     def close(self) -> None:
@@ -283,6 +305,10 @@ class DedupedCudaGraphRegistry:
             group.graphs.clear()
 
         self.groups.clear()
+        if self.upload_stream is not None:
+            checkCudaErrors(cuda_rt.cudaEventDestroy(self.upload_event))
+            checkCudaErrors(cuda_rt.cudaStreamDestroy(self.upload_stream))
+            self.upload_stream = self.upload_event = None
 
 
 class DedupedCudaGraphMixin:

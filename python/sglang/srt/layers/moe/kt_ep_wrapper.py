@@ -12,7 +12,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.arg_groups.overrides import model_config_of
+from sglang.srt.arg_groups.model_override_base import model_config_of
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
 from sglang.srt.runtime_context import (
     get_exec,
@@ -246,7 +246,7 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             torch.cuda.synchronize()
 
             # Get expert location metadata for CPU expert mapping
-            from sglang.srt.eplb.expert_location_dispatch import (
+            from sglang.srt.eplb.expert_location import (
                 get_global_expert_location_metadata,
             )
 
@@ -271,6 +271,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             moe_runner_config.num_local_experts = self.num_gpu_experts
         # Delegate to GPU method to create its runner
         self.gpu_method.create_moe_runner(layer, moe_runner_config)
+
+    def get_moe_runner_backend(self, layer):
+        return self.gpu_method.get_moe_runner_backend(layer)
+
+    def get_moe_routing_method_type(self, layer, requested_method):
+        return self.gpu_method.get_moe_routing_method_type(layer, requested_method)
 
     def submit(
         self,
@@ -341,6 +347,12 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
             Combined computation results from CPU and GPU experts
         """
         from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+        from sglang.srt.layers.moe.topk import TopKOutputChecker
+
+        if TopKOutputChecker.format_is_bypassed(dispatch_output.topk_output):
+            dispatch_output = dispatch_output._replace(
+                topk_output=dispatch_output.topk_output.to_standard()
+            )
 
         x = dispatch_output.hidden_states
         topk_output = dispatch_output.topk_output

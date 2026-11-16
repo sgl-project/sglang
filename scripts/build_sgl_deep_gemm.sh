@@ -2,7 +2,7 @@
 # Build sgl-deep-gemm wheel inside a CUDA-versioned container.
 #
 # Usage: build_sgl_deep_gemm.sh <PYTHON_VERSION> <CUDA_VERSION> <DEEPGEMM_SRC> [ARCH]
-#   PYTHON_VERSION: e.g. 3.10
+#   PYTHON_VERSION: e.g. 3.12
 #   CUDA_VERSION:   e.g. 13.0
 #   DEEPGEMM_SRC:   path to a checkout of sgl-project/DeepGEMM
 #   ARCH:           x86_64 (default) or aarch64

@@ -223,9 +223,8 @@ def flash_attn_varlen_func(
 ):
     if _flash_attn_varlen_func is None:  # pragma: no cover
         raise ImportError(
-            "FlashAttention-4 CUTE is not available. Install flash-attn-4 with "
-            "its CUDA/CUTE dependencies, or run from a source tree where the "
-            "vendored FA4 package is importable."
+            "The vendored FlashAttention-4 CuTe kernels failed to import; check "
+            "that nvidia-cutlass-dsl and its CUDA dependencies are installed."
         ) from _flash_attn_import_error
 
     q, k, v, qv = [_maybe_contiguous(t) for t in (q, k, v, qv)]

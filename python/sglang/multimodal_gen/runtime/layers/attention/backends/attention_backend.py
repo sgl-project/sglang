@@ -37,11 +37,6 @@ def trailing_padding_used_len(
 class AttentionBackend(ABC):
     """Abstract class for attention backends."""
 
-    # For some attention backends, we allocate an output tensor before
-    # calling the custom op. When piecewise cudagraph is enabled, this
-    # makes sure the output tensor is allocated inside the cudagraph.
-    accept_output_buffer: bool = False
-
     @staticmethod
     @abstractmethod
     def get_enum() -> AttentionBackendEnum:
@@ -156,6 +151,19 @@ class AttentionImpl(ABC, Generic[T]):
         attn_metadata: T,
     ) -> torch.Tensor:
         raise NotImplementedError
+
+    def forward_into(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        out: torch.Tensor | None,
+        attn_metadata: T,
+    ) -> bool:
+        """Write what ``forward`` returns into ``out`` (any token stride), or with
+        ``out=None`` only answer; False, having written nothing, when this
+        backend cannot serve these inputs that way."""
+        return False
 
     def forward_varlen(
         self,
