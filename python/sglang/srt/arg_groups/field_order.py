@@ -593,5 +593,6 @@ POSITIONAL_FIELD_ORDER = (
     "inkling2_loop_num_passes",
     "inkling2_loop_share_cache",
     "inkling2_tool_call_author_name_mode",
+    "paged_experts_fused_host_copy",
 )
 # fmt: on

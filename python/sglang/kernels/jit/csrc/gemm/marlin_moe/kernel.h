@@ -13,6 +13,12 @@
       bool mul_topk_weights, bool is_ep, int num_groups, int prob_m, int prob_n, int prob_k, int *locks,             \
       bool has_bias, bool use_atomic_add, bool use_fp32_reduce, int max_shared_mem
 
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+// Paged experts, fused host copy: the kernel also takes the host tables and the step's plan.
+#define MARLIN_HOST_COPY_PARAMS                                                              \
+  int64_t B_host_delta, int64_t scales_host_delta, const uint16_t *__restrict__ scale2_host, \
+      const int32_t *__restrict__ expert_slot_ptr, int host_slots, const int32_t *__restrict__ host_count_ptr
+#endif
 namespace sglang {
 
 namespace device::marlin_moe {
@@ -39,7 +45,11 @@ template <
     const bool kZeroInactiveOutput,      // zero rows in inactive routing blocks
     const bool kHasInactivePrefixCount   // producer-published padded-token/prefix pair
     >
+#ifdef SGL_MARLIN_MOE_HOST_COPY
+__global__ void Marlin(MARLIN_KERNEL_PARAMS, MARLIN_HOST_COPY_PARAMS);
+#else
 __global__ void Marlin(MARLIN_KERNEL_PARAMS);
+#endif
 
 }  // namespace device::marlin_moe
 
