@@ -255,7 +255,6 @@ def _resolve_deferred_qkv_scale_inv(
 
         weight_rows = weight_data.shape[0]
         rows_per_ckpt_shard = weight_rows // shards_per_rank
-        block_k = ckpt_scale.shape[1]
 
         device = weight_data.device
         dequant_shards = []
@@ -1140,12 +1139,6 @@ class MiMoV2Model(nn.Module):
                 include_shared_expert=False,
             )
 
-    def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
-        if hasattr(self.config, "scale_emb"):
-            return self.get_input_embeddings()(input_ids) * self.config.scale_emb
-        else:
-            return self.get_input_embeddings()(input_ids)
-
     def get_input_embeddings(self) -> nn.Embedding:
         return self.embed_tokens
 
@@ -1349,12 +1342,6 @@ class MiMoV2ForCausalLM(nn.Module, AudioEncoderMixin):
     @property
     def routed_experts_weights_of_layer(self):
         return self._routed_experts_weights_of_layer.value
-
-    def get_input_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
-        assert self.model is not None, (
-            "get_input_embedding() is not available in encoder_only mode"
-        )
-        return self.model.get_input_embedding(input_ids)
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return pad_mm_tokens(input_ids, mm_inputs)
