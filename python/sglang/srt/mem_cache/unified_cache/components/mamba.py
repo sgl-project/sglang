@@ -246,7 +246,7 @@ class MambaComponent(TreeComponent):
         # A deferred slot is bound with the row (`StateStorage.acquire`); the
         # staged copy still runs, as it does into a slot taken here.
         if not req.kv.holds_mamba and not params.defer_cow_slot:
-            storage, sub_pool = self._state()
+            storage, sub_pool = self.storage_and_sub_pool()
             dst_index = storage.take_state_slots(sub_pool, 1)
             if dst_index is None:
                 # Pin the window via inc/dec_lock_ref so evict's SWA release
@@ -843,7 +843,7 @@ class MambaComponent(TreeComponent):
         self, req: Optional[Req] = None
     ) -> Optional[torch.Tensor]:
         """Allocate a slot after eviction, or return None if all states are locked."""
-        storage, sub_pool = self._state()
+        storage, sub_pool = self.storage_and_sub_pool()
         slot = storage.take_state_slots(sub_pool, 1)
         if slot is None:
             if req is not None and get_exec().mamba.enable_mamba_extra_buffer_lazy:
@@ -889,7 +889,7 @@ class MambaComponent(TreeComponent):
         """Lease in one take the slots checkpointing ``reqs`` takes one by
         one (`_try_alloc_mamba_slot`). A count off by a request costs only a
         slot given back or a take of its own, never a different decision."""
-        storage, sub_pool = self._state()
+        storage, sub_pool = self.storage_and_sub_pool()
         count = sum(1 for req in reqs if self.checkpoint_takes_state_slot(req))
         return storage.lease_state_slots(sub_pool, count)
 
@@ -899,21 +899,13 @@ class MambaComponent(TreeComponent):
         assert slot is not None, "Can not alloc mamba cache"
         return slot
 
-    def _state(self):
-        """The storage whose state this component's values are, and the
-        sub-pool they are slots of."""
-        storage = self.cache.kv_storage()
-        return storage, storage.tree_sub_pool(
-            self.component_type.name, family=self.family
-        )
-
     @property
     def quantizes_checkpoints(self) -> bool:
-        storage, sub_pool = self._state()
+        storage, sub_pool = self.storage_and_sub_pool()
         return storage.quantizes_checkpoints(sub_pool)
 
     def _alloc_int8_ckpt_slot(self) -> torch.Tensor:
-        storage, sub_pool = self._state()
+        storage, sub_pool = self.storage_and_sub_pool()
         slot = storage.take_checkpoint_slot(sub_pool)
         if slot is None:
             # The tree's states live in the checkpoint pool, which no
@@ -925,12 +917,12 @@ class MambaComponent(TreeComponent):
 
     def _commit_int8_checkpoint(self, active_slots: torch.Tensor) -> torch.Tensor:
         ckpt_slot = self._alloc_int8_ckpt_slot()
-        storage, sub_pool = self._state()
+        storage, sub_pool = self.storage_and_sub_pool()
         storage.store_checkpoint(sub_pool, active_slots, ckpt_slot)
         return ckpt_slot
 
     def _free_mamba_value(self, mamba_value: torch.Tensor) -> None:
-        storage, sub_pool = self._state()
+        storage, sub_pool = self.storage_and_sub_pool()
         if storage.quantizes_checkpoints(sub_pool):
             storage.free_checkpoints(sub_pool, mamba_value)
         else:
@@ -995,7 +987,7 @@ class MambaComponent(TreeComponent):
             # and reset the cursor, keeping the donated checkpoint consistent with
             # its key length. page_size is asserted == 1, so no realign.
             if is_finished:
-                storage, sub_pool = self._state()
+                storage, sub_pool = self.storage_and_sub_pool()
                 cache_len -= storage.settle_replay(sub_pool, req.kv.mamba_pool_idx)
 
         if is_finished:
@@ -1045,7 +1037,7 @@ class MambaComponent(TreeComponent):
                     new_slot = self._try_alloc_mamba_slot(req)
                     if new_slot is None:
                         return 0
-                    storage, sub_pool = self._state()
+                    storage, sub_pool = self.storage_and_sub_pool()
                     src_active = storage.donate_tracking_slot(sub_pool, req, new_slot)
                     mamba_value_donated = self._commit_int8_checkpoint(src_active)
                     storage.free_state_slots(sub_pool, src_active)
@@ -1057,7 +1049,7 @@ class MambaComponent(TreeComponent):
                 new_slot = self._try_alloc_mamba_slot(req)
                 if new_slot is None:
                     return 0
-                storage, sub_pool = self._state()
+                storage, sub_pool = self.storage_and_sub_pool()
                 mamba_value_donated = storage.donate_tracking_slot(
                     sub_pool, req, new_slot
                 )
@@ -1065,7 +1057,7 @@ class MambaComponent(TreeComponent):
                 mamba_value_donated = self._try_alloc_mamba_slot(req)
                 if mamba_value_donated is None:
                     return 0
-                storage, sub_pool = self._state()
+                storage, sub_pool = self.storage_and_sub_pool()
                 storage.copy_state(
                     sub_pool, req.kv.mamba_pool_idx.unsqueeze(0), mamba_value_donated
                 )
@@ -1094,7 +1086,7 @@ class MambaComponent(TreeComponent):
                 )
                 if insert_value_unused:
                     self._free_mamba_value(insert_params.mamba_value)
-                storage, sub_pool = self._state()
+                storage, sub_pool = self.storage_and_sub_pool()
                 storage.release_state(sub_pool, req)
                 return
 
@@ -1104,7 +1096,7 @@ class MambaComponent(TreeComponent):
                     insert_params.mamba_keep_idx if insert_params is not None else None
                 )
                 keep_idx = prepared_keep_idx if mamba_value_inserted else None
-                storage, sub_pool = self._state()
+                storage, sub_pool = self.storage_and_sub_pool()
                 storage.release_state(sub_pool, req, keep=keep_idx)
                 return
 
@@ -1114,7 +1106,7 @@ class MambaComponent(TreeComponent):
                 and (insert_params is None or insert_params.mamba_value is None)
             )
             if request_slot_still_owned:
-                storage, sub_pool = self._state()
+                storage, sub_pool = self.storage_and_sub_pool()
                 storage.release_state(sub_pool, req)
         else:
             if insert_params.mamba_checkpoint_deferred:
@@ -1166,7 +1158,7 @@ class MambaComponent(TreeComponent):
         transfer: PoolTransfer,
         prefix_len: int,
     ) -> Optional[PoolTransfer]:
-        storage, sub_pool = self._state()
+        storage, sub_pool = self.storage_and_sub_pool()
         if phase == ExternalLinkerLoadPhase.ABORT:
             storage.free_state_slots(sub_pool, transfer.device_indices)
             return None
@@ -1181,7 +1173,7 @@ class MambaComponent(TreeComponent):
 
     def _adopt_loaded_state(self, req: Req) -> None:
         # A loaded state supersedes the replay cursor and the deferred CoW/clear.
-        storage, sub_pool = self._state()
+        storage, sub_pool = self.storage_and_sub_pool()
         storage.restart_replay(sub_pool, req.kv.mamba_pool_idx.unsqueeze(0))
         req.kv.mamba_cow_src_index = None
         req.kv.mamba_needs_clear = False
@@ -1207,7 +1199,7 @@ class MambaComponent(TreeComponent):
         return PrepareLoadBackResult(allocated_mamba_slot=dst)
 
     def _alloc_request_state_slot(self, req: Req) -> Optional[torch.Tensor]:
-        storage, sub_pool = self._state()
+        storage, sub_pool = self.storage_and_sub_pool()
         dst = storage.take_state_slots(sub_pool, 1)
         if dst is None:
             self.cache.evict_for_alloc(KVDemand(state_slots=1))
@@ -1221,7 +1213,7 @@ class MambaComponent(TreeComponent):
     ) -> None:
         # A called-off load-back returns the slot prepare allocated and clears req (the H->D copy never ran).
         if not success and prep.allocated_mamba_slot is not None:
-            storage, sub_pool = self._state()
+            storage, sub_pool = self.storage_and_sub_pool()
             storage.free_state_slots(sub_pool, prep.allocated_mamba_slot)
             req.kv.mamba_pool_idx = None
 
