@@ -759,9 +759,7 @@ class Glm4MoeDecoderLayer(nn.Module):
 
     def _detect_fp8_per_token_quant(self, linear_layer, label: str) -> str:
         """Check if a linear layer uses aiter FP8 per-token quantization."""
-        from sglang.srt.utils import get_bool_env_var, is_hip
-
-        if not (get_bool_env_var("SGLANG_USE_AITER") and is_hip()):
+        if not _use_aiter:
             return ""
         if not hasattr(linear_layer, "quant_method"):
             return ""
