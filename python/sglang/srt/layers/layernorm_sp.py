@@ -43,6 +43,7 @@ import torch.distributed as dist
 from sglang.srt.runtime_context import get_flags, get_forward, get_parallel
 from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import ceil_align
+from sglang.srt.utils.device import get_device
 
 # Architectures whose decoder layers route attention/MLP through
 # layer boundaries with the standard participant linears, and for which SP
@@ -307,7 +308,7 @@ if is_npu():
 def _npu_hccl_comm_name() -> str:
     """HCCL handle (``hcom``) of the TP group, consumed by the MC2 fused ops."""
     tp_group = get_parallel().tp_group
-    backend = tp_group.device_group._get_backend(torch.device("npu"))
+    backend = tp_group.device_group._get_backend(torch.device(get_device()))
     return backend.get_hccl_comm_name(tp_group.rank)
 
 

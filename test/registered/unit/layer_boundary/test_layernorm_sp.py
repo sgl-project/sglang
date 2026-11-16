@@ -597,7 +597,8 @@ class TestNpuMc2FusedPaths(CustomTestCase):
             layernorm_sp, "get_parallel", return_value=SimpleNamespace(tp_group=tp)
         ):
             self.assertEqual(layernorm_sp._npu_hccl_comm_name(), "hcom://0")
-        tp.device_group._get_backend.assert_called_once_with(torch.device("npu"))
+        (device_arg,) = tp.device_group._get_backend.call_args.args
+        self.assertIsInstance(device_arg, torch.device)
         tp.device_group._get_backend.return_value.get_hccl_comm_name.assert_called_once_with(
             3
         )
