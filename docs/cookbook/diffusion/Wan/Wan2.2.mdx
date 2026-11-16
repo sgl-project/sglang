@@ -55,6 +55,11 @@ See [Performance Optimization](/docs/sglang-diffusion/performance-optimization) 
 - `--ulysses-degree {ULYSSES_DEGREE}`: The degree of DeepSpeed-Ulysses-style SP in USP
 - `--ring-degree {RING_DEGREE}`: The degree of ring attention-style SP in USP
 
+Wan2.2 also supports the optional [UMT5 padding trim](/cookbook/diffusion/Wan/Wan2.1#optional-umt5-padding-trim).
+`SGLANG_DIFFUSION_WAN_TEXT_PADDING=max` remains the default; `longest` and
+`bucket` change encoder shapes and can change the generated video for the
+same seed. They do not shorten the DiT's input or denoising work.
+
 ## 4. Model Invocation
 
 ### 4.1 Basic Usage
@@ -64,21 +69,13 @@ For more API usage and request examples, please refer to:
 
 #### 4.1.1 Launch a server and then send requests
 
-```shell Command
-sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --port 3000
-
-curl http://127.0.0.1:3000/v1/images/generations \
-  -o >(jq -r '.data[0].b64_json' | base64 --decode > example.png) \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $OPENAI_API_KEY" \
-  -d '{
-    "model": "Wan-AI/Wan2.2-T2V-A14B-Diffusers",
-    "prompt": "A cute baby sea otter",
-    "n": 1,
-    "size": "1024x1024",
-    "response_format": "b64_json"
-  }'
-```
+Use the Server and Request commands in the [command builder](#1-quick-start)
+for the selected checkpoint and T2V, I2V or TI2V mode. The request submits an
+asynchronous job to `POST /v1/videos`; it does not return base64 image data.
+Poll `GET /v1/videos/{video_id}` until `status` is `completed`, then download
+`GET /v1/videos/{video_id}/content` to an MP4 file. If the job is `failed`,
+inspect its error instead. See [Video generation](/docs/sglang-diffusion/api/openai_api#video-generation)
+for polling and download examples.
 
 #### 4.1.2 Generate a video without launching a server
 
