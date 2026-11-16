@@ -217,6 +217,8 @@ def lower(case, settings, model):
         model_path=model.path,
         model_config=SimpleNamespace(
             hf_config=model.hf_config,
+            # `_top_logprobs_error` bounds `top_logprobs` by it.
+            vocab_size=model.text_config.vocab_size,
             is_multimodal=False,
             get_default_sampling_params=lambda: model.sampling_defaults,
         ),
