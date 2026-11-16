@@ -14,7 +14,7 @@ from sglang.srt.layers.engram import Engram, EngramPrefetcher, EngramPrefetchFen
 from sglang.srt.layers.moe import MoeA2ABackend
 from sglang.srt.layers.quantization.fp8_utils import Mxfp8DenseGemmBackend
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models.deepseek_v4 import DeepseekV4Model
 from sglang.srt.runtime_context import get_context, get_flags
 from sglang.test.ci.ci_register import register_cpu_ci

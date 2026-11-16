@@ -28,7 +28,7 @@ from sglang.srt.layers.engram import (
 )
 from sglang.srt.layers.moe.mega_moe import _wait_for_moe_prefetch
 from sglang.srt.layers.quantization.fp8 import Fp8Config
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import (
     get_forward,
     get_parallel,
@@ -133,9 +133,13 @@ def _check_graph(rank, quantized, mode):
                 layer = by_id.get(layer_id)
                 if layer is not None:
                     if prefetched:
-                        x = prefetch.consume(layer_id, layer, x, prepared, input_ids=ids)
+                        x = prefetch.consume(
+                            layer_id, layer, x, prepared, input_ids=ids
+                        )
                     else:
-                        x = layer(x, hashes[:, layer.layer_hash_index], batch, input_ids=ids)
+                        x = layer(
+                            x, hashes[:, layer.layer_hash_index], batch, input_ids=ids
+                        )
                 if prefetched and layer_id + 1 in by_id:
                     prepared.update(
                         prefetch.start(

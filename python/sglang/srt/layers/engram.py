@@ -1581,15 +1581,25 @@ class Engram(nn.Module):
         return kv
 
     def apply_prepared(
-        self, x: torch.Tensor, kv: Optional[torch.Tensor], *, input_ids: Optional[torch.Tensor] = None
+        self,
+        x: torch.Tensor,
+        kv: Optional[torch.Tensor],
+        *,
+        input_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """The only residual-dependent part stays on the consumer stream."""
         if x.shape[0] == 0:
             return x
         assert kv is not None and kv.shape[0] == x.shape[0]
         return engram_gate(
-            x, kv, self.q_weight, self.k_weight, self.eps, self.clamp_value,
-            input_ids if self.image_token_id is not None else None, self.image_token_id,
+            x,
+            kv,
+            self.q_weight,
+            self.k_weight,
+            self.eps,
+            self.clamp_value,
+            input_ids if self.image_token_id is not None else None,
+            self.image_token_id,
         )
 
     def forward(

@@ -30,8 +30,8 @@ from sglang.srt.runtime_context import (
     get_context,
     get_exec,
     get_flags,
-    get_model,
     get_forward,
+    get_model,
     get_parallel,
 )
 
