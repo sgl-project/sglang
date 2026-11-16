@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.kv.alloc.demand import WindowRetirement
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import build_test_unified_pools
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -28,7 +29,7 @@ def setUpModule():
     unittest.addModuleCleanup(patcher.stop)
 
 
-class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
+class TestSchedulerInitReqMaxNewTokens(CustomTestCase):
     """Property tests for Scheduler.init_req_max_new_tokens.
 
     Rules enforced when clipping a request's max_new_tokens:
@@ -97,15 +98,26 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         scheduler.token_to_kv_pool_allocator.page_size = page_size
         return scheduler
 
-    def _new_req(self, max_new_tokens, input_len: int = 8, min_new_tokens: int = 0):
-        return SimpleNamespace(
+    def _new_req(
+        self,
+        max_new_tokens,
+        input_len: int = 8,
+        min_new_tokens: int = 0,
+        *,
+        defaulted: bool = True,
+    ):
+        req = SimpleNamespace(
             rid="test-req",
-            kv_cache_limited_output=False,
+            error=None,
             origin_input_ids=[0] * input_len,
             sampling_params=SimpleNamespace(
-                max_new_tokens=max_new_tokens, min_new_tokens=min_new_tokens
+                max_new_tokens=max_new_tokens,
+                min_new_tokens=min_new_tokens,
+                max_new_tokens_defaulted=defaulted,
             ),
         )
+        req.set_finish_with_abort = lambda message: setattr(req, "error", message)
+        return req
 
     def _init_and_check(self, scheduler, req) -> int:
         """Run init_req_max_new_tokens, then assert all admission rules hold
@@ -186,23 +198,36 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                 max_total_num_tokens - paged_input_len - page_size - 1,
             )
 
-    def test_only_kv_budget_clip_marks_finite_output_limit(self):
+    def test_kv_budget_rejects_only_explicit_finite_output_limit(self):
         scheduler = self._new_scheduler(max_total_num_tokens=24, page_size=4)
         scheduler.max_new_tokens_limit = None
-        for requested, expected in ((12, True), (11, False), (None, False)):
-            with self.subTest(requested=requested):
-                req = self._new_req(max_new_tokens=requested)
-                self.assertEqual(self._init_and_check(scheduler, req), 11)
-                self.assertIs(req.kv_cache_limited_output, expected)
+        for requested, defaulted, rejected in (
+            (12, False, True),
+            (11, False, False),
+            (None, False, False),
+            (128, True, False),
+            (128, False, True),
+        ):
+            with self.subTest(requested=requested, defaulted=defaulted):
+                req = self._new_req(max_new_tokens=requested, defaulted=defaulted)
+                scheduler.init_req_max_new_tokens(req)
+                if rejected:
+                    self.assertIn(f"max_new_tokens={requested}", req.error)
+                    self.assertIn("Maximum supported max_new_tokens is 11", req.error)
+                    self.assertEqual(req.sampling_params.max_new_tokens, 0)
+                else:
+                    self.assertIsNone(req.error)
+                    self.assertEqual(req.sampling_params.max_new_tokens, 11)
 
     def test_kv_capacity_already_folded_into_request_length(self):
-        """A KV-derived request-length cap must still identify the KV limit."""
+        """Reject explicit budgets even when KV capacity already caps request length."""
         scheduler = self._new_scheduler(max_req_len=511, max_total_num_tokens=512)
         scheduler.max_new_tokens_limit = None
         scheduler.model_config.context_len = 4096
-        req = self._new_req(max_new_tokens=1024, input_len=1)
-        self.assertEqual(self._init_and_check(scheduler, req), 509)
-        self.assertTrue(req.kv_cache_limited_output)
+        req = self._new_req(max_new_tokens=1024, input_len=1, defaulted=False)
+        scheduler.init_req_max_new_tokens(req)
+        self.assertIn("max_new_tokens=1024", req.error)
+        self.assertIn("Maximum supported max_new_tokens is 509", req.error)
 
     def test_context_and_environment_caps_are_not_kv_limits(self):
         for context_len, limit, expected in ((512, None, 509), (4096, 16, 16)):
@@ -212,9 +237,9 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                 )
                 scheduler.model_config.context_len = context_len
                 scheduler.max_new_tokens_limit = limit
-                req = self._new_req(max_new_tokens=1024, input_len=1)
+                req = self._new_req(max_new_tokens=1024, input_len=1, defaulted=False)
                 self.assertEqual(self._init_and_check(scheduler, req), expected)
-                self.assertFalse(req.kv_cache_limited_output)
+                self.assertIsNone(req.error)
 
     def test_dcp_budget_is_already_in_logical_tokens(self):
         with get_parallel().override(attn_dcp_size=4):

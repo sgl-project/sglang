@@ -279,6 +279,12 @@ class OpenAIServingCompletion(OpenAIServingBase):
 
                 finish_reason = content["meta_info"].get("finish_reason", None)
                 finish_reason_type = finish_reason["type"] if finish_reason else None
+                if (
+                    not stream_started
+                    and finish_reason_type == "abort"
+                    and finish_reason.get("status_code") == 400
+                ):
+                    raise ValueError(finish_reason["message"])
 
                 is_first_chunk = index not in stream_offsets
                 offset = stream_offsets.get(index, 0)

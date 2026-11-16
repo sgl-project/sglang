@@ -122,17 +122,6 @@ class TestFinishLengthSpeculative(CustomTestCase):
         self.assertEqual(req.finished_len, 4)
         self.assertEqual(list(req.output_ids_through_stop), [10, 11, 12, 20])
 
-    def test_length_finish_reports_kv_cache_limit(self):
-        for output_ids in ([10, 11], [10, 11, EOS_ID]):
-            with self.subTest(output_ids=output_ids):
-                req = _make_req(output_ids, max_new_tokens=2)
-                req.kv_cache_limited_output = True
-                req.update_finish_state(new_accepted_len=len(output_ids))
-                self.assertEqual(
-                    req.finished_reason.to_json(),
-                    {"type": "length", "length": 2, "limit": "kv_cache"},
-                )
-
     def test_missing_vocab_size_still_finishes_by_length(self):
         # Prefill-only embedding and scoring requests do not set vocab_size.
         # They must reach the length check without attempting an upper-bound

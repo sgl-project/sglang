@@ -555,19 +555,15 @@ class FINISHED_MATCHED_REGEX(BaseFinishReason):
 
 
 class FINISH_LENGTH(BaseFinishReason):
-    def __init__(self, length: int, *, kv_cache_limited: bool = False):
+    def __init__(self, length: int):
         super().__init__()
         self.length = length
-        self.kv_cache_limited = kv_cache_limited
 
     def to_json(self):
-        reason = {
+        return {
             "type": "length",  # to match OpenAI API's return value
             "length": self.length,
         }
-        if self.kv_cache_limited:
-            reason["limit"] = "kv_cache"
-        return reason
 
 
 class FINISH_ABORT(BaseFinishReason):

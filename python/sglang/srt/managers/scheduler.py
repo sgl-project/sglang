@@ -3083,9 +3083,15 @@ class Scheduler(
 
         elif (
             req.sampling_params.max_new_tokens is not None
+            and not req.sampling_params.max_new_tokens_defaulted
             and max_new_tokens < max_new_tokens_before_kv
         ):
-            req.kv_cache_limited_output = True
+            req.set_finish_with_abort(
+                f"max_new_tokens={req.sampling_params.max_new_tokens} exceeds the "
+                f"KV cache capacity for input_len={input_len}. "
+                f"Maximum supported max_new_tokens is {max_new_tokens}."
+            )
+            max_new_tokens = 0
 
         req.sampling_params.max_new_tokens = max(0, max_new_tokens)
         # Clipping above can push max_new_tokens below min_new_tokens, which

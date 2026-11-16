@@ -151,6 +151,7 @@ pub(super) fn check_total_tokens(g: &mut GenerateRequest, limits: &Limits) -> Re
     let input_len =
         g.input_ids.as_ref().map_or(0, |ids| ids.len()) as u64 + limits.num_reserved_tokens;
 
+    g.sampling_params.max_new_tokens_defaulted = g.max_new_tokens_defaulted;
     if g.max_new_tokens_defaulted {
         return Ok(()); // not the client's value → the scheduler clamps it
     }

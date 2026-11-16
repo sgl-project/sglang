@@ -830,6 +830,9 @@ async fn generate_single(
     let incremental = state.server_args.incremental_streaming_output;
 
     if stream {
+        if let Err(error) = call.preflight().await {
+            return native_core_error(error, false);
+        }
         // A single request is a 1-element batch without the `index` field — reuse
         // the same stream so the frame/abort/truncation logic lives in one place.
         use futures::StreamExt;

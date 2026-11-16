@@ -17,13 +17,6 @@ pub enum Matched {
     Tokens(Vec<i64>),
 }
 
-/// The resource that reduced the request's output budget.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LengthLimit {
-    KvCache,
-}
-
 /// The finish reasons this build knows, keyed by the `type` tag Python writes.
 /// Every field is optional so a reason missing one still classifies (and keeps its
 /// tag) instead of falling through to [`FinishReason::Unknown`].
@@ -40,8 +33,6 @@ pub enum FinishKind {
     Length {
         #[serde(default)]
         length: Option<u64>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        limit: Option<LengthLimit>,
     },
     /// `FINISH_ABORT` — a scheduler-side termination. Boxed because it is by far
     /// the widest variant and the rarest: unboxed it would set the size of every
@@ -213,7 +204,6 @@ mod tests {
             serde_json::json!({"type": "stop", "matched": "</s>"}),
             serde_json::json!({"type": "stop", "matched": [9, 10]}),
             serde_json::json!({"type": "length", "length": 8}),
-            serde_json::json!({"type": "length", "length": 8, "limit": "kv_cache"}),
             serde_json::json!({
                 "type": "abort", "message": "Aborted",
                 "status_code": null, "err_type": null

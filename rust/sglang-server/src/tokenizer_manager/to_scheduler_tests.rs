@@ -296,6 +296,7 @@ fn omitted_max_new_tokens_under_a_context_length_passes_a_near_limit_prompt() {
         };
         assert!(check_total_tokens(&mut g, &limits).is_ok());
         assert_eq!(g.sampling_params.max_new_tokens, max_new_tokens);
+        assert!(g.sampling_params.max_new_tokens_defaulted);
     }
 }
 

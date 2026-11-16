@@ -173,6 +173,15 @@ mod tests {
             ),
             (
                 CoreError::RuntimeRejected {
+                    kind: CoreErrorKind::InvalidArgument,
+                    message: "max_new_tokens=1024 exceeds the KV cache capacity".into(),
+                    legacy_http_status: 400,
+                    output: Box::default(),
+                },
+                Code::InvalidArgument,
+            ),
+            (
+                CoreError::RuntimeRejected {
                     kind: CoreErrorKind::NotFound,
                     message: "missing".into(),
                     legacy_http_status: 404,

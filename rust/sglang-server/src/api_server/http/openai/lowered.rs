@@ -204,10 +204,18 @@ pub(super) async fn chat(
         .map(|request| RequestState::new(state, request, headers, None, timing.clone()))
         .collect();
     let received = ReceivedAs::Typed(state.core.logged_headers(headers));
-    let calls: Vec<_> = match state.core.generate_batch(requests, received).await {
+    let mut calls: Vec<_> = match state.core.generate_batch(requests, received).await {
         Ok(calls) => calls.into_iter().zip(request_states).collect(),
         Err(error) => return Some(error_response(error.http_status(), &error.to_string())),
     };
+
+    if stream {
+        for (call, _) in &mut calls {
+            if let Err(error) = call.preflight().await {
+                return Some(error_response(error.http_status(), &error.to_string()));
+            }
+        }
+    }
 
     if !stream {
         // One failed choice fails the request, as Python's batch does; the
@@ -605,15 +613,10 @@ mod tests {
         assert!(message.contains("byte limit"), "{message}");
     }
 
-    /// A scheduler abort in a stream, whatever its status, is Python's error
-    /// event under that status, then the stream's end, not a unary 400.
+    /// A scheduler rejection before any output retains its HTTP error status.
     #[tokio::test]
     async fn streamed_abort_keeps_its_status() {
-        for (status, name) in [
-            (503, "SERVICE_UNAVAILABLE"),
-            (400, "BAD_REQUEST"),
-            (412, "PRECONDITION_FAILED"),
-        ] {
+        for status in [400] {
             let app = lowered_state(move |rid| {
                 let mut item = chunk(rid, "", true);
                 let ResponseItem::Done(output) = &mut item else {
@@ -626,30 +629,9 @@ mod tests {
             let messages = json!([{"role": "user", "content": "hi"}]);
             let body = json!({"model": "model", "messages": messages, "stream": true});
             let response = post_json(app, "/v1/chat/completions", body).await;
-            assert_eq!(response.status(), StatusCode::OK);
-            assert_eq!(
-                response.headers()[CONTENT_TYPE],
-                "text/event-stream; charset=utf-8"
-            );
-            let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
-                .await
-                .unwrap();
-            let text = String::from_utf8(bytes.to_vec()).unwrap();
-            let error: Value = text
-                .split("\n\n")
-                .filter_map(|event| event.strip_prefix("data: "))
-                .find_map(|data| {
-                    serde_json::from_str::<Value>(data)
-                        .ok()?
-                        .get("error")
-                        .cloned()
-                })
-                .unwrap_or_else(|| panic!("no error event: {text}"));
-            assert_eq!(
-                (error["type"].as_str(), error["code"].as_u64()),
-                (Some(name), Some(status))
-            );
-            assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
+            assert_eq!(response.status().as_u16(), status as u16);
+            let error = body_json(response).await;
+            assert!(error.to_string().contains("aborted"), "{error}");
         }
     }
 

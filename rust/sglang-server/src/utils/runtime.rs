@@ -1567,7 +1567,11 @@ mod tests {
                 let mut response = String::new();
                 conn.read_to_string(&mut response).unwrap();
                 let http_status = response.split(' ').nth(1).unwrap_or_default();
-                let expected = if stream { "200" } else { &status.to_string() };
+                let expected = if stream && status != 400 {
+                    "200".to_owned()
+                } else {
+                    status.to_string()
+                };
                 assert_eq!(http_status, expected, "{response}");
                 assert!(
                     response.contains(&format!(r#""message":"{message}""#))
