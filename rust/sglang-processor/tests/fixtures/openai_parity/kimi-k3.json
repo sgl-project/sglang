@@ -1226,7 +1226,9 @@
           3900, 44322, 5795, 2390, 1178, 7697, 306, 276, 2897, 3996, 13, 163588, 2778, 163589,
           163586, 163587, 2778, 6244, 878, 69702, 1, 163589, 163587, 39964, 163589
         ],
-        "sampling_params": {},
+        "sampling_params": {
+          "structural_tag": "{\"type\": \"structural_tag\", \"format\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"or\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>response<|sep|>\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^ \\\\t\\\\r\\\\n<]|<[^|<]\"}, {\"type\": \"any_text\", \"excludes\": [\"<|open|>\", \"<|close|>\"], \"max_tokens\": null, \"max_chars\": null}]}, \"end\": \"<|close|>response<|sep|>\"}, {\"type\": \"tag\", \"begin\": \"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^ \\\\t\\\\r\\\\n<]|<[^|<]\"}, {\"type\": \"any_text\", \"excludes\": [\"<|open|>\", \"<|close|>\"], \"max_tokens\": null, \"max_chars\": null}]}, \"end\": \"<|close|>response<|sep|>\"}]}, {\"type\": \"optional\", \"content\": {\"type\": \"const_string\", \"value\": \"<|close|>message<|sep|>\"}}]}}"
+        },
         "return_logprob": false,
         "logprob_start_len": -1,
         "top_logprobs_num": 0,
@@ -1851,7 +1853,7 @@
     {
       "name": "tools_required",
       "endpoint": "chat",
-      "synthetic": true,
+      "lower_only": true,
       "request": {
         "model": "moonshotai/Kimi-K3",
         "messages": [{"role": "user", "content": "weather?"}],
@@ -1866,7 +1868,248 @@
         ],
         "tool_choice": "required"
       },
-      "unsupported": true
+      "generate": {
+        "input_ids": [
+          163587, 2778, 6244, 878, 14062, 1, 1798, 878, 20960, 120083, 677, 1, 163589, 2, 30391,
+          198, 12214, 554, 276, 2878, 7697, 11, 11880, 306, 11419, 11438, 1481, 3251, 5534, 198,
+          81103, 3879, 22849, 1152, 7471, 618, 21055, 2800, 3923, 24453, 22849, 27129, 22849, 37666,
+          22849, 2217, 7471, 2033, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721,
+          60336, 2020, 2217, 7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587,
+          2778, 6244, 878, 14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074,
+          470, 63, 28560, 418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276,
+          4503, 8491, 904, 9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421, 5713,
+          316, 1268, 5354, 16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074, 470,
+          105281, 11369, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1, 163589,
+          50171, 30, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 14062, 1, 1798, 878,
+          20960, 135230, 1, 163589, 1008, 2403, 387, 42070, 472, 1268, 20960, 79535, 28, 20331,
+          16518, 3900, 44322, 2390, 7697, 306, 276, 2897, 3996, 13, 163588, 2778, 163589, 163586,
+          163587, 2778, 6244, 878, 69702, 1, 163589, 163587, 39964, 163589
+        ],
+        "sampling_params": {
+          "stop": ["<|close|>tools<|sep|>"],
+          "structural_tag": "{\"type\": \"structural_tag\", \"format\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"optional\", \"content\": {\"type\": \"or\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>response<|sep|>\", \"content\": {\"type\": \"any_text\", \"excludes\": [\"<|open|>\", \"<|close|>\"], \"max_tokens\": null, \"max_chars\": null}, \"end\": \"<|close|>response<|sep|>\"}, {\"type\": \"tag\", \"begin\": \"\", \"content\": {\"type\": \"any_text\", \"excludes\": [\"<|open|>\", \"<|close|>\"], \"max_tokens\": null, \"max_chars\": null}, \"end\": \"<|close|>response<|sep|>\"}]}}, {\"type\": \"tag\", \"begin\": \"<|open|>tools<|sep|>\", \"content\": {\"type\": \"tags_with_separator\", \"tags\": [{\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"get_weather\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"star\", \"content\": {\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"\", \"content\": {\"type\": \"or\", \"elements\": [{\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"string\\\"<|sep|>\"}, {\"type\": \"any_text\", \"excludes\": [], \"max_tokens\": null, \"max_chars\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"number\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"number\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"number\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"integer\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"boolean\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"boolean\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"array\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"array\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"object\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"object\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"null\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"null\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}]}, \"end\": \"<|close|>argument<|sep|>\"}}]}, \"end\": \"<|close|>call<|sep|>\"}], \"separator\": \"\", \"at_least_one\": true, \"stop_after_first\": false}, \"end\": \"<|close|>tools<|sep|>\"}, {\"type\": \"optional\", \"content\": {\"type\": \"const_string\", \"value\": \"<|close|>message<|sep|>\"}}]}}"
+        },
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": [],
+        "require_reasoning": true
+      }
+    },
+    {
+      "name": "tools_required_serial",
+      "endpoint": "chat",
+      "lower_only": true,
+      "request": {
+        "model": "moonshotai/Kimi-K3",
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+            }
+          },
+          {"type": "function", "function": {"name": "get_time"}}
+        ],
+        "tool_choice": "required",
+        "parallel_tool_calls": false
+      },
+      "generate": {
+        "input_ids": [
+          163587, 2778, 6244, 878, 14062, 1, 1798, 878, 20960, 120083, 677, 1, 163589, 2, 30391,
+          198, 12214, 554, 276, 2878, 7697, 11, 11880, 306, 11419, 11438, 1481, 3251, 5534, 198,
+          81103, 3879, 22849, 1152, 7471, 618, 21055, 2800, 3923, 24453, 22849, 27129, 22849, 37666,
+          22849, 2217, 7471, 2033, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721,
+          60336, 2020, 2217, 7471, 3879, 69622, 3879, 22849, 1152, 7471, 618, 6618, 60027, 2217,
+          7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878,
+          14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074, 470, 63, 28560,
+          418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276, 4503, 8491, 904,
+          9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421, 5713, 316, 1268, 5354,
+          16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074, 470, 105281, 11369,
+          163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1, 163589, 50171, 30, 163588,
+          2778, 163589, 163586, 163587, 2778, 6244, 878, 14062, 1, 1798, 878, 20960, 135230, 1,
+          163589, 1008, 2403, 387, 42070, 472, 1268, 20960, 79535, 28, 20331, 16518, 3900, 44322,
+          2390, 7697, 306, 276, 2897, 3996, 13, 163588, 2778, 163589, 163586, 163587, 2778, 6244,
+          878, 69702, 1, 163589, 163587, 39964, 163589
+        ],
+        "sampling_params": {
+          "stop": ["<|close|>tools<|sep|>"],
+          "structural_tag": "{\"type\": \"structural_tag\", \"format\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"optional\", \"content\": {\"type\": \"or\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>response<|sep|>\", \"content\": {\"type\": \"any_text\", \"excludes\": [\"<|open|>\", \"<|close|>\"], \"max_tokens\": null, \"max_chars\": null}, \"end\": \"<|close|>response<|sep|>\"}, {\"type\": \"tag\", \"begin\": \"\", \"content\": {\"type\": \"any_text\", \"excludes\": [\"<|open|>\", \"<|close|>\"], \"max_tokens\": null, \"max_chars\": null}, \"end\": \"<|close|>response<|sep|>\"}]}}, {\"type\": \"tag\", \"begin\": \"<|open|>tools<|sep|>\", \"content\": {\"type\": \"or\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"get_weather\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"star\", \"content\": {\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"\", \"content\": {\"type\": \"or\", \"elements\": [{\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"string\\\"<|sep|>\"}, {\"type\": \"any_text\", \"excludes\": [], \"max_tokens\": null, \"max_chars\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"number\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"number\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"number\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"integer\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"boolean\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"boolean\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"array\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"array\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"object\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"object\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"null\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"null\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}]}, \"end\": \"<|close|>argument<|sep|>\"}}]}, \"end\": \"<|close|>call<|sep|>\"}, {\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"get_time\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"star\", \"content\": {\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"\", \"content\": {\"type\": \"or\", \"elements\": [{\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"string\\\"<|sep|>\"}, {\"type\": \"any_text\", \"excludes\": [], \"max_tokens\": null, \"max_chars\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"number\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"number\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"number\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"integer\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"boolean\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"boolean\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"array\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"array\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"object\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"object\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"null\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"null\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}]}, \"end\": \"<|close|>argument<|sep|>\"}}]}, \"end\": \"<|close|>call<|sep|>\"}]}, \"end\": \"<|close|>tools<|sep|>\"}, {\"type\": \"optional\", \"content\": {\"type\": \"const_string\", \"value\": \"<|close|>message<|sep|>\"}}]}}"
+        },
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": [],
+        "require_reasoning": true
+      }
+    },
+    {
+      "name": "tools_named",
+      "endpoint": "chat",
+      "lower_only": true,
+      "request": {
+        "model": "moonshotai/Kimi-K3",
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+            }
+          },
+          {"type": "function", "function": {"name": "get_time"}}
+        ],
+        "tool_choice": {"type": "function", "function": {"name": "get_time"}}
+      },
+      "generate": {
+        "input_ids": [
+          163587, 2778, 6244, 878, 14062, 1, 1798, 878, 20960, 120083, 677, 1, 163589, 2, 30391,
+          198, 12214, 554, 276, 2878, 7697, 11, 11880, 306, 11419, 11438, 1481, 3251, 5534, 198,
+          81103, 3879, 22849, 1152, 7471, 618, 21055, 2800, 3923, 24453, 22849, 27129, 22849, 37666,
+          22849, 2217, 7471, 2033, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721,
+          60336, 2020, 2217, 7471, 3879, 69622, 3879, 22849, 1152, 7471, 618, 6618, 60027, 2217,
+          7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878,
+          14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074, 470, 63, 28560,
+          418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276, 4503, 8491, 904,
+          9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421, 5713, 316, 1268, 5354,
+          16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074, 470, 105281, 11369,
+          163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1, 163589, 50171, 30, 163588,
+          2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589, 163587, 39964, 163589
+        ],
+        "sampling_params": {
+          "stop": ["<|close|>tools<|sep|>"],
+          "structural_tag": "{\"type\": \"structural_tag\", \"format\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"optional\", \"content\": {\"type\": \"or\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>response<|sep|>\", \"content\": {\"type\": \"any_text\", \"excludes\": [\"<|open|>\", \"<|close|>\"], \"max_tokens\": null, \"max_chars\": null}, \"end\": \"<|close|>response<|sep|>\"}, {\"type\": \"tag\", \"begin\": \"\", \"content\": {\"type\": \"any_text\", \"excludes\": [\"<|open|>\", \"<|close|>\"], \"max_tokens\": null, \"max_chars\": null}, \"end\": \"<|close|>response<|sep|>\"}]}}, {\"type\": \"tag\", \"begin\": \"<|open|>tools<|sep|>\", \"content\": {\"type\": \"tags_with_separator\", \"tags\": [{\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"get_time\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"star\", \"content\": {\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"\", \"content\": {\"type\": \"or\", \"elements\": [{\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"string\\\"<|sep|>\"}, {\"type\": \"any_text\", \"excludes\": [], \"max_tokens\": null, \"max_chars\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"number\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"number\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"number\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"integer\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"boolean\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"boolean\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"array\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"array\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"object\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"object\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"null\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"null\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}]}, \"end\": \"<|close|>argument<|sep|>\"}}]}, \"end\": \"<|close|>call<|sep|>\"}], \"separator\": \"\", \"at_least_one\": true, \"stop_after_first\": false}, \"end\": \"<|close|>tools<|sep|>\"}, {\"type\": \"optional\", \"content\": {\"type\": \"const_string\", \"value\": \"<|close|>message<|sep|>\"}}]}}"
+        },
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": [],
+        "require_reasoning": true
+      }
+    },
+    {
+      "name": "tools_named_serial",
+      "endpoint": "chat",
+      "lower_only": true,
+      "request": {
+        "model": "moonshotai/Kimi-K3",
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+            }
+          },
+          {"type": "function", "function": {"name": "get_time"}}
+        ],
+        "tool_choice": {"type": "function", "function": {"name": "get_time"}},
+        "parallel_tool_calls": false
+      },
+      "generate": {
+        "input_ids": [
+          163587, 2778, 6244, 878, 14062, 1, 1798, 878, 20960, 120083, 677, 1, 163589, 2, 30391,
+          198, 12214, 554, 276, 2878, 7697, 11, 11880, 306, 11419, 11438, 1481, 3251, 5534, 198,
+          81103, 3879, 22849, 1152, 7471, 618, 21055, 2800, 3923, 24453, 22849, 27129, 22849, 37666,
+          22849, 2217, 7471, 2033, 60336, 2020, 20331, 46890, 37666, 131917, 2217, 7471, 3721,
+          60336, 2020, 2217, 7471, 3879, 69622, 3879, 22849, 1152, 7471, 618, 6618, 60027, 2217,
+          7471, 3879, 16934, 1641, 3251, 163588, 2778, 163589, 163586, 163587, 2778, 6244, 878,
+          14062, 1, 1798, 878, 130400, 59991, 470, 1, 163589, 63, 130400, 123074, 470, 63, 28560,
+          418, 1632, 2455, 308, 2704, 306, 651, 9545, 8491, 347, 2976, 3411, 276, 4503, 8491, 904,
+          9141, 4661, 3867, 1268, 1332, 5713, 1268, 50004, 5713, 1268, 19421, 5713, 316, 1268, 5354,
+          16518, 10048, 276, 2403, 387, 42070, 472, 1268, 130400, 123074, 470, 105281, 11369,
+          163588, 2778, 163589, 163586, 163587, 2778, 6244, 878, 2482, 1, 163589, 50171, 30, 163588,
+          2778, 163589, 163586, 163587, 2778, 6244, 878, 69702, 1, 163589, 163587, 39964, 163589
+        ],
+        "sampling_params": {
+          "stop": ["<|close|>tools<|sep|>"],
+          "structural_tag": "{\"type\": \"structural_tag\", \"format\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"optional\", \"content\": {\"type\": \"or\", \"elements\": [{\"type\": \"tag\", \"begin\": \"<|open|>response<|sep|>\", \"content\": {\"type\": \"any_text\", \"excludes\": [\"<|open|>\", \"<|close|>\"], \"max_tokens\": null, \"max_chars\": null}, \"end\": \"<|close|>response<|sep|>\"}, {\"type\": \"tag\", \"begin\": \"\", \"content\": {\"type\": \"any_text\", \"excludes\": [\"<|open|>\", \"<|close|>\"], \"max_tokens\": null, \"max_chars\": null}, \"end\": \"<|close|>response<|sep|>\"}]}}, {\"type\": \"tag\", \"begin\": \"<|open|>tools<|sep|>\", \"content\": {\"type\": \"tag\", \"begin\": \"<|open|>call tool=\\\"get_time\\\" index=\\\"\", \"content\": {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[1-9][0-9]*\"}, {\"type\": \"const_string\", \"value\": \"\\\"<|sep|>\"}, {\"type\": \"star\", \"content\": {\"type\": \"tag\", \"begin\": \"<|open|>argument key=\\\"\", \"content\": {\"type\": \"or\", \"elements\": [{\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"string\\\"<|sep|>\"}, {\"type\": \"any_text\", \"excludes\": [], \"max_tokens\": null, \"max_chars\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"number\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"number\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"number\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"integer\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"boolean\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"boolean\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"array\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"array\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"object\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"object\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}, {\"type\": \"sequence\", \"elements\": [{\"type\": \"regex\", \"pattern\": \"[^\\\"& \\\\t\\\\r\\\\n\\\\f\\\\v=<>]+\"}, {\"type\": \"const_string\", \"value\": \"\\\" type=\\\"null\\\"<|sep|>\"}, {\"type\": \"json_schema\", \"json_schema\": {\"type\": \"null\"}, \"style\": \"json\", \"any_order\": false, \"max_whitespace_cnt\": null}]}]}, \"end\": \"<|close|>argument<|sep|>\"}}]}, \"end\": \"<|close|>call<|sep|>\"}, \"end\": \"<|close|>tools<|sep|>\"}, {\"type\": \"optional\", \"content\": {\"type\": \"const_string\", \"value\": \"<|close|>message<|sep|>\"}}]}}"
+        },
+        "return_logprob": false,
+        "logprob_start_len": -1,
+        "top_logprobs_num": 0,
+        "return_sampling_mask": false,
+        "return_text_in_logprobs": true,
+        "modalities": [],
+        "require_reasoning": true
+      }
+    },
+    {
+      "name": "tools_named_missing",
+      "endpoint": "chat",
+      "synthetic": true,
+      "unsupported": true,
+      "request": {
+        "model": "moonshotai/Kimi-K3",
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+            }
+          }
+        ],
+        "tool_choice": {"type": "function", "function": {"name": "get_news"}}
+      }
+    },
+    {
+      "name": "tools_required_regex",
+      "endpoint": "chat",
+      "synthetic": true,
+      "unsupported": true,
+      "request": {
+        "model": "moonshotai/Kimi-K3",
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "parameters": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}
+            }
+          }
+        ],
+        "tool_choice": "required",
+        "regex": "[a-z]+"
+      }
+    },
+    {
+      "name": "tools_required_strict",
+      "endpoint": "chat",
+      "synthetic": true,
+      "unsupported": true,
+      "request": {
+        "model": "moonshotai/Kimi-K3",
+        "messages": [{"role": "user", "content": "weather?"}],
+        "tools": [
+          {
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "strict": true,
+              "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+                "additionalProperties": false
+              }
+            }
+          }
+        ],
+        "tool_choice": "required"
+      }
     },
     {
       "name": "system_tools",

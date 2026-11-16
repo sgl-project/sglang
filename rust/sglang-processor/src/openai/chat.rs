@@ -13,7 +13,9 @@ use sglang_api_types::api::v1::{
     token_ids_or_list,
 };
 
-use super::kimi_k3_tag::auto_tool_call_tag;
+use super::kimi_k3_tag::{
+    ForcedChoice, auto_tool_call_tag, forced_tool_call_tag, none_tool_call_tag,
+};
 use super::request::{
     OneOrList, ResponseFormat, StreamOptions, custom_labels, default_model, format_json_schema,
     lora_path, one, usage_flags, yes,
@@ -439,8 +441,15 @@ pub fn lower_chat(
     }
     let reasoning_parser = settings.reasoning_parser.as_deref();
     let tool_call_parser = settings.tool_call_parser.as_deref();
+    // Only K3's tool parser has its forced-call structural tag here.
+    let tools = request_tools(&raw, tool_call_parser == Some("kimi_k3"))?;
+    // `tool_choice: "none"` keeps the tools out of parsing and the prompt's
+    // tool framing (`_process_messages` skips both for it).
+    let parses_tools = tools
+        .as_ref()
+        .is_some_and(|choice| *choice != ToolChoice::None);
     // recipe parses DeepSeek output from its token ids in place of both parsers.
-    let deepseek = deepseek::parsing(model, settings, &original, request_tools(&raw)?.is_some())?;
+    let deepseek = deepseek::parsing(model, settings, &original, parses_tools)?;
     let parser = match reasoning_parser {
         Some(name) if deepseek.is_none() => {
             Some(think_config(name).ok_or(Unsupported("reasoning_parser"))?)
@@ -458,11 +467,10 @@ pub fn lower_chat(
     {
         return Err(Unsupported("tool_grammar"));
     }
-    let tools = request_tools(&raw)?;
     let tool_definitions = raw.get("tools").and_then(Value::as_array).cloned();
     let parallel_tool_calls = raw.get("parallel_tool_calls") != Some(&Value::Bool(false));
-    let tool_parsing = match (tool_call_parser, &tools, &tool_definitions) {
-        (Some(parser), Some(_), Some(definitions)) if deepseek.is_none() => {
+    let tool_parsing = match (tool_call_parser, parses_tools, &tool_definitions) {
+        (Some(parser), true, Some(definitions)) if deepseek.is_none() => {
             tool_detector(parser, definitions).ok_or(Unsupported("tool_parser"))?;
             Some((parser.to_owned(), definitions.clone()))
         }
@@ -502,7 +510,7 @@ pub fn lower_chat(
         request.skip_special_tokens = false;
     }
     // `_process_messages`: tool output keeps the parser's special tokens.
-    if tools.is_some() {
+    if parses_tools {
         request.skip_special_tokens = false;
     }
     // K3 also stops on its tool parser's `eot_token`.
@@ -534,9 +542,9 @@ pub fn lower_chat(
         &request, &kwargs, model, prompt_ids, thinking, headers, settings,
     )?;
     lowered.custom_labels = labels;
-    // `get_structure_constraint`: K3's tool parser constrains `auto` calls by
-    // its structural tag, unless the request is already constrained; Python
-    // tests the constraints by truthiness, so empty strings are unset.
+    // `get_structure_constraint`: K3's tool parser constrains tool calls by its
+    // structural tag, unless the request is already constrained; Python tests
+    // the constraints by truthiness, so empty strings are unset.
     let Some(sampling_params_or_list::Value::One(sampling)) = lowered
         .sampling_params
         .as_mut()
@@ -544,11 +552,26 @@ pub fn lower_chat(
     else {
         unreachable!("one sampling configuration")
     };
-    if let (Some((tool_parser, _)), Some(definitions)) = (&tool_parsing, &tool_definitions)
+    let constrained = [&sampling.regex, &sampling.ebnf, &sampling.json_schema]
+        .iter()
+        .any(|value| value.as_deref().is_some_and(|v| !v.is_empty()));
+    let forced = tools.as_ref().and_then(ToolChoice::forced);
+    if let (Some(forced), Some((tool_parser, _)), Some(definitions)) =
+        (forced, &tool_parsing, &tool_definitions)
         && tool_parser == "kimi_k3"
-        && [&sampling.regex, &sampling.ebnf, &sampling.json_schema]
-            .iter()
-            .all(|value| value.as_deref().is_none_or(str::is_empty))
+    {
+        // `to_sampling_params` refuses a forced call under another output
+        // constraint, except a JSON `response_format` a renderer states in the
+        // prompt, which it drops; the engine's layer serves both.
+        if constrained {
+            return Err(Unsupported("tool_choice"));
+        }
+        let tag = forced_tool_call_tag(definitions, forced, parallel_tool_calls)
+            .ok_or(Unsupported("invalid_request"))?;
+        sampling.structural_tag = Some(python_json(&tag, true));
+    } else if let (Some((tool_parser, _)), Some(definitions)) = (&tool_parsing, &tool_definitions)
+        && tool_parser == "kimi_k3"
+        && !constrained
     {
         // `strip_structural_tag_excludes`: the reasoning parser owns the think tokens.
         let strip = parser
@@ -558,6 +581,14 @@ pub fn lower_chat(
         if let Some(tag) = auto_tool_call_tag(definitions, parallel_tool_calls, &strip)? {
             sampling.structural_tag = Some(python_json(&tag, true));
         }
+    } else if tools == Some(ToolChoice::None)
+        && tool_call_parser == Some("kimi_k3")
+        && model.is_kimi_k3()
+        && !constrained
+    {
+        // `_process_messages`: the K3 prompt still lists the tools, so the
+        // output is held to a nonempty response with no tools section.
+        sampling.structural_tag = Some(python_json(&none_tool_call_tag(), true));
     }
     if let Some(stop) = tool_call_stop {
         let mut stops = match sampling.stop.take().and_then(|s| s.value) {
@@ -623,19 +654,72 @@ pub fn lower_chat(
     Ok((lowered, responder))
 }
 
-/// The names of the tools a request lets the model call, or `None` when
-/// `tool_choice` turns them off. Only `auto` without strict tools is served:
-/// it adds no constraint, while the others depend on the engine's xgrammar.
-fn request_tools(raw: &Map<String, Value>) -> Result<Option<Vec<String>>, Unsupported> {
-    let choice = raw.get("tool_choice").filter(|c| !c.is_null());
-    if choice.is_some_and(|c| c != "auto" && c != "none")
-        || raw
-            .get("parallel_tool_calls")
-            .is_some_and(|p| !p.is_boolean())
+/// A request's `tool_choice`, among the values the lowered path serves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToolChoice {
+    Auto,
+    None,
+    Required,
+    /// `{"type": "function", "function": {"name": ...}}`.
+    Named(String),
+}
+
+impl ToolChoice {
+    /// The choice as Pydantic reads it; `None` for a value it types otherwise
+    /// or rejects, which the engine's OpenAI layer answers.
+    fn parse(raw: &Map<String, Value>) -> Option<Self> {
+        match raw.get("tool_choice") {
+            None | Some(Value::Null) => Some(Self::Auto),
+            Some(Value::String(choice)) => match choice.as_str() {
+                "auto" => Some(Self::Auto),
+                "none" => Some(Self::None),
+                "required" => Some(Self::Required),
+                _ => None,
+            },
+            Some(Value::Object(choice)) if choice.get("type").is_none_or(|t| t == "function") => {
+                let name = choice.get("function")?.get("name")?.as_str()?;
+                Some(Self::Named(name.to_owned()))
+            }
+            Some(_) => None,
+        }
+    }
+
+    /// `"required"` or a named tool: the output must call a tool.
+    fn forced(&self) -> Option<ForcedChoice<'_>> {
+        match self {
+            Self::Required => Some(ForcedChoice::Required),
+            Self::Named(name) => Some(ForcedChoice::Named(name)),
+            Self::Auto | Self::None => None,
+        }
+    }
+}
+
+/// The `tool_choice` of a request that declares tools, or `None` without any.
+/// `ToolChoice::None` turns the tools off for parsing and the prompt, but K3
+/// still constrains its output.
+///
+/// `auto` over non-strict tools adds no constraint beyond the tool parser's.
+/// A choice that forces a call is served only with `forced_tag`, for a tool
+/// parser whose structural tag for it this layer builds; for the others it
+/// depends on the engine's own grammars.
+fn request_tools(
+    raw: &Map<String, Value>,
+    forced_tag: bool,
+) -> Result<Option<ToolChoice>, Unsupported> {
+    let choice = ToolChoice::parse(raw)
+        .filter(|choice| forced_tag || choice.forced().is_none())
+        .ok_or(Unsupported("tool_choice"))?;
+    if raw
+        .get("parallel_tool_calls")
+        .is_some_and(|p| !p.is_boolean())
     {
         return Err(Unsupported("tool_choice"));
     }
     let tools = match raw.get("tools") {
+        // `_validate_request`: a forced choice needs a tool to call.
+        None | Some(Value::Null) if choice.forced().is_some() => {
+            return Err(Unsupported("invalid_request"));
+        }
         None | Some(Value::Null) => return Ok(None),
         Some(Value::Array(tools)) => tools,
         Some(_) => return Err(Unsupported("invalid_request")),
@@ -654,10 +738,18 @@ fn request_tools(raw: &Map<String, Value>) -> Result<Option<Vec<String>>, Unsupp
         let (true, Some(name)) = (well_formed, function["name"].as_str()) else {
             return Err(Unsupported("tool_definition"));
         };
-        names.push(name.to_owned());
+        names.push(name);
     }
-    let parse = !tools.is_empty() && choice.is_none_or(|c| c == "auto");
-    Ok(parse.then_some(names))
+    // `_validate_request`: a forced choice needs a tool to call, and a named
+    // one a tool of its name.
+    match choice.forced() {
+        Some(_) if tools.is_empty() => return Err(Unsupported("invalid_request")),
+        Some(ForcedChoice::Named(name)) if !names.contains(&name) => {
+            return Err(Unsupported("invalid_request"));
+        }
+        _ => {}
+    }
+    Ok((!tools.is_empty()).then_some(choice))
 }
 
 const SCHEMA_TYPES: &[&str] = &[
@@ -1699,6 +1791,174 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A K3 request whose `tool_choice` forces a call is lowered with the
+    /// forced-call tag and the tools close as a stop, and its output's calls
+    /// are parsed as under `auto`. Another tool parser has no such tag here.
+    #[test]
+    fn forced_tool_choice_lowers_and_parses_kimi_k3_calls() {
+        let k3 = ChatModel {
+            chat_encoding_spec: Some("kimi_k3".into()),
+            ..ChatModel::default()
+        };
+        let settings = OpenAiSettings {
+            reasoning_parser: Some("kimi_k3".into()),
+            tool_call_parser: Some("kimi_k3".into()),
+            ..OpenAiSettings::default()
+        };
+        let tools = json!([
+            {"type": "function", "function": {"name": "get_weather", "parameters": {
+                "type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]}}},
+            {"type": "function", "function": {"name": "get_time"}},
+        ]);
+        let output = "I need the weather.<|close|>think<|sep|><|open|>tools<|sep|>\
+            <|open|>call tool=\"get_weather\" index=\"1\"<|sep|>\
+            <|open|>argument key=\"city\" type=\"string\"<|sep|>Paris<|close|>argument<|sep|>\
+            <|close|>call<|sep|>";
+        for (choice, callable) in [
+            (json!("required"), vec!["get_weather", "get_time"]),
+            (
+                json!({"type": "function", "function": {"name": "get_weather"}}),
+                vec!["get_weather"],
+            ),
+        ] {
+            let body = json!({
+                "model": "m",
+                "messages": [{"role": "user", "content": "weather?"}],
+                "tools": tools,
+                "tool_choice": choice,
+            });
+            let lower = |settings: &OpenAiSettings| {
+                lower_chat(
+                    &serde_json::to_vec(&body).unwrap(),
+                    &OpenAiHeaders::default(),
+                    settings,
+                    &k3,
+                    |_: &Value| Some(vec![1]),
+                    None,
+                )
+            };
+            let (generate, responder) = lower(&settings).unwrap();
+            let sampling = serde_json::to_value(&generate).unwrap()["sampling_params"].clone();
+            let tag: Value =
+                serde_json::from_str(sampling["structural_tag"].as_str().unwrap()).unwrap();
+            let calls = &tag["format"]["elements"][1]["content"]["tags"];
+            let names: Vec<&str> = calls
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|call| call["begin"].as_str().unwrap())
+                .map(|begin| begin.split('"').nth(1).unwrap())
+                .collect();
+            assert_eq!(names, callable, "{choice}");
+            assert_eq!(sampling["stop"], json!([KIMI_K3_TOOLS_CLOSE]), "{choice}");
+
+            let frame: GenerateResponse = serde_json::from_value(json!({
+                "text": output,
+                "output_ids": [2],
+                "meta_info": {
+                    "id": "r",
+                    "finish_reason": {"type": "stop", "matched": KIMI_K3_TOOLS_CLOSE},
+                    "prompt_tokens": 1,
+                    "completion_tokens": 1,
+                },
+            }))
+            .unwrap();
+            let reply = responder.unary(vec![frame]).expect("unary reply");
+            let choice_out = &serde_json::from_str::<Value>(&reply.body).unwrap()["choices"][0];
+            assert_eq!(choice_out["finish_reason"], "tool_calls", "{choice}");
+            let message = &choice_out["message"];
+            assert_eq!(message["reasoning_content"], "I need the weather.");
+            assert_eq!(message["tool_calls"][0]["function"]["name"], "get_weather");
+            assert_eq!(
+                message["tool_calls"][0]["function"]["arguments"],
+                "{\"city\": \"Paris\"}"
+            );
+
+            let qwen = OpenAiSettings {
+                tool_call_parser: Some("qwen3_coder".into()),
+                ..settings.clone()
+            };
+            assert_eq!(lower(&qwen).err(), Some(Unsupported("tool_choice")));
+        }
+    }
+
+    /// A K3 request with tools and `tool_choice: "none"` is lowered with the
+    /// nonempty-response tag, no tools-close stop, and its output as content.
+    /// Another constraint or another tool parser leaves the request untagged.
+    #[test]
+    fn none_tool_choice_constrains_kimi_k3_to_a_response() {
+        let k3 = ChatModel {
+            chat_encoding_spec: Some("kimi_k3".into()),
+            ..ChatModel::default()
+        };
+        let settings = OpenAiSettings {
+            reasoning_parser: Some("kimi_k3".into()),
+            tool_call_parser: Some("kimi_k3".into()),
+            ..OpenAiSettings::default()
+        };
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hello"}],
+            "tools": [{"type": "function", "function": {"name": "get_time"}}],
+            "tool_choice": "none",
+        });
+        let lower = |body: &Value, settings: &OpenAiSettings| {
+            lower_chat(
+                &serde_json::to_vec(body).unwrap(),
+                &OpenAiHeaders::default(),
+                settings,
+                &k3,
+                |_: &Value| Some(vec![1]),
+                None,
+            )
+        };
+        let (generate, responder) = lower(&body, &settings).unwrap();
+        let sampling = serde_json::to_value(&generate).unwrap()["sampling_params"].clone();
+        let tag: Value =
+            serde_json::from_str(sampling["structural_tag"].as_str().unwrap()).unwrap();
+        let response = &tag["format"]["elements"][0]["elements"];
+        assert_eq!(response[0]["begin"], "<|open|>response<|sep|>");
+        assert_eq!(response[1]["begin"], "");
+        assert!(
+            sampling.get("stop").is_none_or(Value::is_null),
+            "{sampling}"
+        );
+
+        let output = "Greet back.<|close|>think<|sep|>\
+            <|open|>response<|sep|>Hello!<|close|>response<|sep|><|close|>message<|sep|>";
+        let frame: GenerateResponse = serde_json::from_value(json!({
+            "text": output,
+            "output_ids": [2],
+            "meta_info": {
+                "id": "r",
+                "finish_reason": {"type": "stop"},
+                "prompt_tokens": 1,
+                "completion_tokens": 1,
+            },
+        }))
+        .unwrap();
+        let reply = responder.unary(vec![frame]).expect("unary reply");
+        let choice = &serde_json::from_str::<Value>(&reply.body).unwrap()["choices"][0];
+        assert_eq!(choice["message"]["reasoning_content"], "Greet back.");
+        assert_eq!(choice["message"]["content"], "Hello!");
+        assert_eq!(choice["message"]["tool_calls"], Value::Null);
+
+        // `to_sampling_params` only warns: another constraint wins, unserved.
+        let mut constrained = body.clone();
+        constrained["regex"] = json!("[a-z]+");
+        let (generate, _) = lower(&constrained, &settings).unwrap();
+        let sampling = serde_json::to_value(&generate).unwrap()["sampling_params"].clone();
+        assert!(sampling.get("structural_tag").is_none_or(Value::is_null));
+
+        let qwen = OpenAiSettings {
+            tool_call_parser: Some("qwen3_coder".into()),
+            ..settings.clone()
+        };
+        let (generate, _) = lower(&body, &qwen).unwrap();
+        let sampling = serde_json::to_value(&generate).unwrap()["sampling_params"].clone();
+        assert!(sampling.get("structural_tag").is_none_or(Value::is_null));
     }
 
     /// The usage of a one-frame chat reply with cache reporting on: unary
