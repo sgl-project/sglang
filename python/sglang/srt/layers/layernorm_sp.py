@@ -323,10 +323,9 @@ def _npu_hccl_comm_name() -> str:
 def sp_fused_matmul_eligible(linear) -> bool:
     """Whether the selected fused matmul+collective path applies.
 
-    Muse Spark selects CUTLASS; NPU/Ascend uses the CANN MC2 fused ops; other
-    models keep the Torch symmetric-memory path. All paths require an
-    unquantized, bias-free bf16/fp16 linear. The decision depends only on
-    static layer properties and is identical across TP ranks.
+    Muse Spark selects CUTLASS; other models keep the Torch symmetric-memory
+    path. Both require an unquantized, bias-free bf16/fp16 linear. The decision
+    depends only on static layer properties and is identical across TP ranks.
     """
     if linear.bias is not None:
         return False

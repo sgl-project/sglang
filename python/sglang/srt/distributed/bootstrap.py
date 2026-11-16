@@ -218,7 +218,6 @@ def measure_pre_model_load_memory(*, device: str, is_draft_worker: bool) -> floa
         distributed=get_world_group().world_size > 1 and not is_draft_worker,
         cpu_group=get_world_group().cpu_group,
     )
-    # Check memory for tensor parallelism
     local_gpu_memory = get_available_gpu_memory(device, get_device().gpu_id)
     if get_parallel().tp_size > 1 and not is_draft_worker:
         _check_tp_memory_balance(
