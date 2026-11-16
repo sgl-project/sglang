@@ -8,8 +8,9 @@ from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.rust_tree_core.adapter import RustUnifiedTreeCore
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.tree_slots import tree_slots_of
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 @pytest.fixture(params=["production", "inspection"])
@@ -29,20 +30,20 @@ def _params(**overrides):
         req_to_token_pool=None,
         token_to_kv_pool_allocator=None,
         page_size=1,
-        tree_components=(ComponentType.FULL,),
+        tree_slots=tree_slots_of((ComponentType.FULL,)),
     )
     params.update(overrides)
     return CacheInitParams(**params)
 
 
-def _raw_binding(core_class, is_eagle=False, component_types=(0,), **overrides):
+def _raw_binding(core_class, is_eagle=False, slots=((0, "token"),), **overrides):
     native = core_class._bindings
     binding_class = (
         native.RustBigramUnifiedTreeCoreBinding
         if is_eagle
         else native.RustUnifiedTreeCoreBinding
     )
-    return binding_class(native.TreeCoreInitParamsBinding(**overrides), component_types)
+    return binding_class(native.TreeCoreInitParamsBinding(**overrides), list(slots))
 
 
 @pytest.mark.parametrize("is_eagle", [False, True])
@@ -94,7 +95,10 @@ def test_actual_native_constructor_panic_is_runtime_error(core_class, is_eagle):
     # asserts positivity. Exercise that actual panic without a Python mock.
     with pytest.raises(RuntimeError, match="swa_sliding_window_size must be positive"):
         _raw_binding(
-            core_class, is_eagle, component_types=(0, 1), swa_sliding_window_size=0
+            core_class,
+            is_eagle,
+            slots=((0, "token"), (1, "window")),
+            swa_sliding_window_size=0,
         )
     assert _raw_binding(core_class, is_eagle).root_node_handle() == 0
 

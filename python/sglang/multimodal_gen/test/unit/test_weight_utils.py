@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for multimodal weight-loading utilities."""
 
+import json
 import os
 import shutil
 import tempfile
@@ -11,6 +12,7 @@ from unittest.mock import Mock, patch
 
 import torch
 from huggingface_hub.errors import LocalEntryNotFoundError
+from safetensors import safe_open
 from safetensors.torch import save_file as safetensors_save_file
 
 from sglang.multimodal_gen.runtime.loader.utils import (
@@ -22,6 +24,10 @@ from sglang.multimodal_gen.runtime.loader.utils import (
 from sglang.multimodal_gen.runtime.loader.weight_utils import (
     _disable_runai_streamer_rank_discovery_collective,
     get_lock,
+    safetensors_weights_iterator,
+)
+from sglang.multimodal_gen.runtime.post_training.tensor_update_checker import (
+    compute_tensor_sha256,
 )
 from sglang.multimodal_gen.runtime.weights.source import (
     filter_duplicate_precision_variant_safetensors,
@@ -289,6 +295,26 @@ def _write_pipeline(root: Path) -> None:
 class TestCheckpointComponentSizes(CustomTestCase):
     SIZES = {"transformer": (17, 58), "text_encoder": (4, 16)}
 
+    def test_batchnorm_step_counter_does_not_unsize_the_checkpoint(self):
+        # FLUX.2's VAE stores a BatchNorm, whose num_batches_tracked is int64
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            _write_pipeline(root)
+            (root / "vae").mkdir()
+            bn = torch.nn.BatchNorm2d(8)
+            safetensors_save_file(
+                {f"bn.{k}": v for k, v in bn.state_dict().items()},
+                root / "vae" / "diffusion_pytorch_model.safetensors",
+            )
+            index = json.loads((root / "model_index.json").read_text())
+            index["vae"] = ["diffusers", "V"]
+            (root / "model_index.json").write_text(json.dumps(index))
+
+            self.assertEqual(
+                checkpoint_component_sizes(tmpdir, subfolder=None, revision=None),
+                {**self.SIZES, "vae": (32, 128)},
+            )
+
     def test_sizes_every_weighted_component(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             _write_pipeline(Path(tmpdir) / "sub")
@@ -431,6 +457,67 @@ class TestDiffusionWeightLock(unittest.TestCase):
             self.assertLessEqual(len(os.fsencode(lock_filename)), 255)
             with lock:
                 self.assertTrue(os.path.exists(lock.lock_file))
+
+
+class TestCheckpointReadFailure(unittest.TestCase):
+    def test_failed_read_never_removes_checkpoint_or_shared_blob(self):
+        for symlink in (False, True):
+            for error in (None, PermissionError("denied"), OSError("I/O error")):
+                with (
+                    self.subTest(symlink=symlink, error=error),
+                    tempfile.TemporaryDirectory() as tmpdir,
+                ):
+                    root = Path(tmpdir)
+                    blob = root / "blob"
+                    if error is None:
+                        blob.write_bytes(b"incomplete safetensors")
+                    else:
+                        safetensors_save_file({"weight": torch.ones(2)}, blob)
+                    original = blob.read_bytes()
+                    path = root / "model.safetensors"
+                    if symlink:
+                        path.symlink_to(blob)
+                    else:
+                        blob.rename(path)
+                        blob = path
+                    other_snapshot = root / "other.safetensors"
+                    other_snapshot.symlink_to(blob)
+
+                    with patch(
+                        "sglang.multimodal_gen.runtime.loader.weight_utils.safe_open",
+                        side_effect=error,
+                        wraps=safe_open,
+                    ):
+                        with self.assertRaises(RuntimeError):
+                            next(
+                                safetensors_weights_iterator(
+                                    [str(path)], use_runai_model_streamer=False
+                                )
+                            )
+
+                    self.assertTrue(
+                        path.exists(), "loader removed the requested checkpoint"
+                    )
+                    self.assertEqual(path.is_symlink(), symlink)
+                    self.assertEqual(blob.read_bytes(), original)
+                    self.assertEqual(other_snapshot.read_bytes(), original)
+                    if error is not None:
+                        loaded = dict(
+                            safetensors_weights_iterator(
+                                [str(path)], use_runai_model_streamer=False
+                            )
+                        )
+                        torch.testing.assert_close(loaded["weight"], torch.ones(2))
+
+
+class TestPostTrainingTensorChecksum(unittest.TestCase):
+    def test_scalar_bfloat16_tensor_has_sha256_checksum(self):
+        scalar = torch.tensor(1.0, dtype=torch.bfloat16)
+
+        digest = compute_tensor_sha256(scalar)
+
+        self.assertEqual(len(digest), 64)
+        self.assertEqual(digest, compute_tensor_sha256(scalar))
 
 
 if __name__ == "__main__":

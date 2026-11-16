@@ -21,11 +21,12 @@ from sglang.srt.environ import envs
 from sglang.srt.platforms.cpu import CpuSRTPlatform
 from sglang.srt.platforms.cuda import CudaSRTPlatform
 from sglang.srt.platforms.interface import SRTPlatform
+from sglang.srt.platforms.mlu import MluSRTPlatform
 from sglang.srt.platforms.mps import MpsSRTPlatform
 from sglang.srt.platforms.musa import MusaSRTPlatform
 from sglang.srt.platforms.npu import NPUSRTPlatform
 from sglang.srt.platforms.rocm import RocmSRTPlatform
-from sglang.srt.platforms.sail import SailSRTPlatform
+from sglang.srt.platforms.sail import SailSRTPlatform, is_sail_available
 from sglang.srt.platforms.xpu import XpuSRTPlatform
 from sglang.srt.plugins import PLATFORM_PLUGINS_GROUP, load_plugins_by_group
 
@@ -40,10 +41,6 @@ def _is_cuda_available() -> bool:
 
 def _is_rocm_available() -> bool:
     return bool(torch.cuda.is_available() and torch.version.hip is not None)
-
-
-def _is_sail_available() -> bool:
-    return bool(torch.cuda.is_available() and "ZW" in torch.cuda.get_device_name())
 
 
 def _is_cpu_available() -> bool:
@@ -70,6 +67,10 @@ def _is_musa_available() -> bool:
 
 def _is_mps_available() -> bool:
     return bool(getattr(torch, "mps", None) is not None and torch.mps.is_available())
+
+
+def _is_mlu_available() -> bool:
+    return hasattr(torch, "mlu") and torch.mlu.is_available()
 
 
 def _resolve_platform() -> SRTPlatform:
@@ -99,6 +100,7 @@ def _resolve_platform() -> SRTPlatform:
          - 0 activated + XPU available  → fallback XpuSRTPlatform
          - 0 activated + MUSA available → fallback MusaSRTPlatform
          - 0 activated + MPS available  → fallback MpsSRTPlatform
+         - 0 activated + MLU available  → fallback MluSRTPlatform
          - 0 activated + none of the above → fallback base SRTPlatform
          - 1 activated → use it
          - N activated → RuntimeError (must set SGLANG_PLATFORM)
@@ -153,7 +155,7 @@ def _resolve_platform() -> SRTPlatform:
         if _is_cpu_available():
             logger.debug("SGLANG_USE_CPU_ENGINE=1. Using CPU SRTPlatform defaults.")
             return CpuSRTPlatform()
-        if _is_sail_available():
+        if is_sail_available():
             logger.debug(
                 "No platform plugin detected. Using SAIL SRTPlatform defaults."
             )
@@ -182,6 +184,9 @@ def _resolve_platform() -> SRTPlatform:
         if _is_mps_available():
             logger.debug("No platform plugin detected. Using MPS SRTPlatform defaults.")
             return MpsSRTPlatform()
+        if _is_mlu_available():
+            logger.debug("No platform plugin detected. Using MLU SRTPlatform defaults.")
+            return MluSRTPlatform()
         logger.debug("No platform detected. Using base SRTPlatform.")
         return SRTPlatform()
 

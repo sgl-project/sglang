@@ -8,7 +8,7 @@ from contextlib import contextmanager
 from contextvars import ContextVar
 from functools import cache
 from pkgutil import resolve_name
-from typing import NamedTuple, cast
+from typing import Any, NamedTuple, cast
 
 import torch
 
@@ -265,6 +265,7 @@ def get_attn_backend(
     attention_requirements: AttentionRequirements | None = None,
     default_attention_backend: AttentionBackendEnum | None = None,
     is_cross_attention: bool = False,
+    quant_config: Any = None,
 ) -> type[AttentionBackend]:
     """Resolve an attention backend for one layer.
 
@@ -316,6 +317,16 @@ def get_attn_backend(
 
     if selected_backend is None:
         selected_backend = default_attention_backend
+
+    if selected_backend is None and quant_config is not None and not is_cross_attention:
+        # Reuse the backend's opt-in and capability checks without overriding
+        # an explicit backend or a layer's declared default.
+        from sglang.multimodal_gen.runtime.layers.attention.backends.ascend_fa import (
+            resolve_mx_fa_scheme,
+        )
+
+        if resolve_mx_fa_scheme(quant_config) is not None:
+            selected_backend = AttentionBackendEnum.FA
 
     allowed_fallback_reason = None
     if selected_backend is None:

@@ -376,6 +376,11 @@ class Cosmos3SimAutoTransformer(Cosmos3OmniTransformer):
         # A checkpoint without the rig table would run on random rows and no
         # error; the loader turns the missing tensor into a hard failure.
         self.rig_view_embed.weight.missing_param_init = "error"
+        # per-chunk memos keyed by the chunk's items: steps reuse the uploads
+        self._rope_inputs_key = None
+        self._rope_inputs = None
+        self._generated_masks_key = None
+        self._generated_masks = None
 
     def _validate_causal_arch(self, hf_config: dict[str, Any]) -> None:
         expected_flags = {
@@ -506,8 +511,26 @@ class Cosmos3SimAutoTransformer(Cosmos3OmniTransformer):
             rig_view_ids.to(self.rig_view_embed.weight.device)
         ]
         lidar_row = self.rig_view_embed.weight[self.rig_lidar_id].unsqueeze(0)
+        if time_embed is not None:
+            masks_key = (tuple(items), camera_rows.device, dtype)
+            if masks_key != self._generated_masks_key:
+                self._generated_masks = [
+                    None
+                    if item.is_control
+                    else torch.tensor(
+                        [frame not in item.condition_frames for frame in item.frames],
+                        dtype=torch.bool,
+                        device=camera_rows.device,
+                    )
+                    .repeat(len(item.view_ids))
+                    .repeat_interleave(item.tokens_per_frame)
+                    .view(1, -1, 1)
+                    .to(dtype)
+                    for item in items
+                ]
+                self._generated_masks_key = masks_key
         embeddings = []
-        for item, latent in zip(items, latents, strict=True):
+        for index, (item, latent) in enumerate(zip(items, latents, strict=True)):
             expected_frames = len(item.view_ids) * len(item.frames)
             if (
                 latent.ndim != 5
@@ -538,15 +561,7 @@ class Cosmos3SimAutoTransformer(Cosmos3OmniTransformer):
                 )
             hidden = add_rig_view_rows(hidden, rows, len(item.view_ids))
             if time_embed is not None and not item.is_control:
-                generated = torch.tensor(
-                    [frame not in item.condition_frames for frame in item.frames],
-                    dtype=torch.bool,
-                    device=hidden.device,
-                )
-                mask = generated.repeat(len(item.view_ids)).repeat_interleave(
-                    item.tokens_per_frame
-                )
-                hidden = hidden + time_embed * mask.view(1, -1, 1).to(dtype)
+                hidden = hidden + time_embed * self._generated_masks[index]
             embeddings.append(hidden)
         return torch.cat(embeddings, dim=1)
 
@@ -588,14 +603,16 @@ class Cosmos3SimAutoTransformer(Cosmos3OmniTransformer):
         hidden = self.embed_items(
             items, latents, timestep=timestep, rig_view_ids=rig_view_ids
         )
-        position_ids = self.chunk_position_ids(
-            items, text_extent=text_extent, device=hidden.device
-        )
-        cos_sin_cache, rope_positions = (
-            self.language_model.rotary_emb.build_rope_cache_inputs(
+        rope_key = (tuple(items), text_extent, hidden.device, hidden.dtype)
+        if rope_key != self._rope_inputs_key:
+            position_ids = self.chunk_position_ids(
+                items, text_extent=text_extent, device=hidden.device
+            )
+            self._rope_inputs = self.language_model.rotary_emb.build_rope_cache_inputs(
                 position_ids.unsqueeze(1), cache_dtype=hidden.dtype
             )
-        )
+            self._rope_inputs_key = rope_key
+        cos_sin_cache, rope_positions = self._rope_inputs
         shard = None if self.ulysses is None else self.ulysses.shard(hidden.shape[1])
         sp_check = None
         if shard is not None:

@@ -29,11 +29,12 @@ from sglang.multimodal_gen.configs.pipeline_configs.qwen_image21 import (
 )
 from sglang.multimodal_gen.configs.sample.qwenimage import QwenImage2512SamplingParams
 from sglang.multimodal_gen.configs.sample.qwenimage21 import QwenImage21SamplingParams
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.registry import _get_config_info
+from sglang.multimodal_gen.runtime.breakable_cuda_graph.replay_token import (
+    replay_token_scope,
+)
 from sglang.multimodal_gen.runtime.cache.conditioning import ConditioningCache
 from sglang.multimodal_gen.runtime.entrypoints.openai import utils as openai_utils
 from sglang.multimodal_gen.runtime.entrypoints.openai.image_api import (
@@ -49,6 +50,7 @@ from sglang.multimodal_gen.runtime.managers.memory_managers.component_residency_
 )
 from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
 from sglang.multimodal_gen.runtime.models.dits.qwen_image21 import (
+    PrefixPad,
     QwenImage21Attention,
     QwenImage21TransformerBlock,
     build_layout,
@@ -87,6 +89,9 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.timestep_preparation im
 from sglang.multimodal_gen.runtime.platforms.rocm import RocmPlatform
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.warmup_request_builder import build_warmup_reqs
+from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import (
+    breakable_cuda_graph as bcg,
+)
 
 
 @pytest.fixture
@@ -175,6 +180,42 @@ def test_cli_720p_shortcut_preserves_alignment(qwen21_server_args):
     assert (sampling.width, sampling.height) == (1280, 704)
 
 
+@pytest.mark.parametrize(
+    "image_size,fields,expected",
+    [
+        # Diffusers QwenImage21Pipeline: 1024x1024 area at the last image's aspect
+        ((1280, 720), {}, (1376, 768)),
+        ((720, 1280), {}, (768, 1376)),
+        ((1024, 1024), {}, (1024, 1024)),
+        ((1280, 720), {"size": "1024x1024"}, (1024, 1024)),
+        ((1280, 720), {"size": "1280x720"}, (1280, 704)),
+    ],
+)
+def test_edit_output_size_follows_last_reference(
+    qwen21_server_args, tmp_path, image_size, fields, expected
+):
+    image_path = tmp_path / "reference.png"
+    Image.new("RGB", image_size, (200, 120, 40)).save(image_path)
+    with (
+        patch.object(
+            openai_utils, "get_global_server_args", return_value=qwen21_server_args
+        ),
+        patch.object(
+            SamplingParams, "from_pretrained", return_value=QwenImage21SamplingParams()
+        ),
+    ):
+        sampling = openai_utils.build_sampling_params(
+            "edit-size",
+            prompt="make the sky purple",
+            image_path=[str(image_path)],
+            request_data_type=DataType.IMAGE,
+            **fields,
+        )
+    batch = prepare_request(qwen21_server_args, sampling)
+    QwenImage21InputValidationStage().forward(batch, qwen21_server_args)
+    assert (batch.width, batch.height) == expected
+
+
 @pytest.mark.parametrize("dimension", ["width", "height"])
 @pytest.mark.parametrize("value", [0, -1])
 def test_alignment_does_not_make_invalid_dimensions_positive(
@@ -207,7 +248,30 @@ def test_synthetic_warmup_uses_the_same_grid_as_serving(
     assert len(reqs) == 1
     assert (reqs[0].width, reqs[0].height) == (1280, 704)
     QwenImage21InputValidationStage().forward(reqs[0], qwen21_server_args)
+    assert (reqs[0].width, reqs[0].height) == (1280, 704)
     assert (defaults.width, defaults.height) == (1024, 1024)
+
+
+def test_torch_compile_prewarm_keeps_the_warmup_size(qwen21_server_args, tmp_path):
+    image_path = tmp_path / "warmup.png"
+    Image.new("RGB", (64, 64)).save(image_path)
+    qwen21_server_args.enable_torch_compile = True
+    qwen21_server_args.is_arg_explicitly_set = lambda name: False
+    with patch(
+        "sglang.multimodal_gen.runtime.warmup_request_builder.get_model_sampling_defaults",
+        return_value=QwenImage21SamplingParams(),
+    ):
+        reqs = build_warmup_reqs(
+            qwen21_server_args,
+            warmup_resolutions=["1280x720"],
+            warmup_input_path=str(image_path),
+            server_based_warmup=True,
+        )
+    assert len(reqs) > 1
+    for req in reqs:
+        assert req.image_path is not None
+        QwenImage21InputValidationStage().forward(req, qwen21_server_args)
+        assert (req.width, req.height) == (1280, 704)
 
 
 def test_legacy_qwen_keeps_its_720p_resolution():
@@ -400,6 +464,9 @@ def test_prompt_cache_skips_processor_and_weight_preparation(device):
             data={
                 "input_ids": torch.tensor([[1, len(text[0]), 99, 99, image_value, 0]]),
                 "attention_mask": torch.tensor([[1, 1, 1, 1, 1, 0]]),
+                "pixel_values": torch.tensor(
+                    list(kwargs["images"][0].getdata()), dtype=torch.float32
+                ),
             }
         )
 
@@ -486,6 +553,44 @@ def test_encoder_component_offload_preserves_loaded_dtypes(monkeypatch):
         assert encoder.embedding.device.type == "cpu"
 
 
+class _StopBeforePrompt(Exception):
+    pass
+
+
+@pytest.mark.parametrize("output_size", [(1376, 768), (512, 512)])
+def test_reference_sizes_do_not_follow_the_output_size(monkeypatch, output_size):
+    """Diffusers resizes every reference to a 1024x1024 area at its own aspect."""
+    module = "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image21"
+    monkeypatch.setattr(f"{module}.get_local_torch_device", lambda: torch.device("cpu"))
+    config = QwenImage21PipelineConfig()
+    z_dim = config.vae_config.arch_config.z_dim
+    vae = Mock()
+    vae.encode.side_effect = lambda pixels: SimpleNamespace(
+        mode=lambda: torch.zeros(1, z_dim, 1, *(s // 16 for s in pixels.shape[-2:]))
+    )
+    stage = object.__new__(QwenImage21EncodingStage)
+    stage.vae, stage.latent_stats = vae, {}
+    stage.use_declared_component = Mock(return_value=nullcontext(vae))
+    resized_sizes = []
+
+    def encode_prompt(prompt, resized, device):
+        resized_sizes.extend(image.size for image in resized)
+        raise _StopBeforePrompt
+
+    stage.encode_prompt = encode_prompt
+    batch = Req(
+        sampling_params=SamplingParams(prompt="edit", seed=0, num_frames=1),
+        condition_image=[
+            Image.new("RGBA", (528, 720), (10, 20, 30, 255)),
+            Image.new("RGBA", (1280, 720), (40, 50, 60, 255)),
+        ],
+    )
+    batch.width, batch.height = output_size
+    with pytest.raises(_StopBeforePrompt):
+        stage.forward(batch, SimpleNamespace(pipeline_config=config))
+    assert resized_sizes == [(864, 1184), (1376, 768)]
+
+
 def test_condition_slots_expand_to_actual_latent_grid():
     hidden = torch.randn(22, 8)
     ids = torch.tensor([1, 2] + [99] * 16 + [3, 4, 5, 6])
@@ -499,9 +604,16 @@ def test_condition_slots_expand_to_actual_latent_grid():
 
 
 class _RecordingAttention(torch.nn.Module):
-    def forward(self, x, ropes, prefixes, layouts, caches, prefix_pad):
+    def forward(
+        self, x, ropes, prefixes, layouts, caches, prefix_pad, project_out=True
+    ):
         self.seen = caches
         return torch.zeros_like(x), [None] * len(caches)
+
+
+class _IdentityFeedForward(torch.nn.Module):
+    def forward(self, x, use_packed_bf16=False):
+        return x
 
 
 def _block_recording_caches(layer_id, dim=4):
@@ -512,7 +624,7 @@ def _block_recording_caches(layer_id, dim=4):
     block.img_norm1 = torch.nn.LayerNorm(dim, elementwise_affine=False)
     block.img_norm2 = torch.nn.LayerNorm(dim, elementwise_affine=False)
     block.attn = _RecordingAttention()
-    block.img_mlp = torch.nn.Identity()
+    block.img_mlp = _IdentityFeedForward()
     return block
 
 
@@ -577,6 +689,25 @@ def test_latent_pack_decode_contract():
     torch.testing.assert_close(
         (decoded.float() - shift) * scale / scale + shift, decoded.float()
     )
+
+
+def test_decode_latent_stats_are_uploaded_once():
+    # decode normalizes with the first request's device tensors: a per-request
+    # upload would stall the host until the denoising loop drains
+    config = QwenImage21PipelineConfig()
+    ac = config.vae_config.arch_config
+    device = torch.device("cpu")
+    first = config.get_decode_scale_and_shift(device, torch.bfloat16, None)
+    second = config.get_decode_scale_and_shift(device, torch.bfloat16, None)
+    mean = torch.tensor(ac.latents_mean, dtype=torch.bfloat16)
+    std = torch.tensor(ac.latents_std, dtype=torch.bfloat16)
+    torch.testing.assert_close(
+        first[0], std.view(1, ac.z_dim, 1, 1, 1).reciprocal(), atol=0, rtol=0
+    )
+    torch.testing.assert_close(
+        first[1], mean.view(1, ac.z_dim, 1, 1, 1), atol=0, rtol=0
+    )
+    assert first[0] is second[0] and first[1] is second[1]
 
 
 @pytest.mark.parametrize("gfx1151", [False, True])
@@ -772,7 +903,11 @@ def test_condition_pixels_match_reference_preprocessing(monkeypatch, tiling):
         SimpleNamespace(pipeline_config=QwenImage21PipelineConfig(vae_tiling=tiling)),
     )
     assert vae.use_tiling is tiling
-    expected = VaeImageProcessor(vae_scale_factor=16).preprocess(image).unsqueeze(2)
+    # Diffusers resizes the reference to a 1024x1024 area whatever the output size
+    expected = VaeImageProcessor(vae_scale_factor=16).preprocess(
+        image, height=1024, width=1024
+    )
+    expected = expected.unsqueeze(2)
     actual = vae.encode.call_args.args[0]
     torch.testing.assert_close(actual, expected.bfloat16(), atol=0, rtol=0)
     assert actual.stride() == expected.stride()
@@ -873,3 +1008,33 @@ def test_packed_qkv_projection_is_skipped_under_compile():
     # plain projections instead of breaking in every attention.
     with patch.object(torch.compiler, "is_compiling", return_value=True):
         assert QwenImage21Attention._project_qkv_packed(object(), None, [], []) is None
+
+
+def test_prefix_pad_replay_writes_the_captured_output():
+    def attend(q, k, v, attn_metadata):
+        return q + k.shape[1]
+
+    attention = SimpleNamespace(
+        target_attn=SimpleNamespace(attn_impl=SimpleNamespace(forward=attend))
+    )
+    prefix_pad = PrefixPad(torch.tensor(2))
+    q, kv = torch.zeros(1, 3, 2, 4), torch.zeros(1, 6, 2, 4)
+    graph = bcg.BreakableCUDAGraph()
+    capture = SimpleNamespace(
+        cuda_graph=graph,
+        _end_current_segment=lambda: None,
+        _begin_new_segment=lambda: None,
+    )
+    with patch(
+        "sglang.multimodal_gen.runtime.models.dits.qwen_image21.get_forward_context",
+        return_value=SimpleNamespace(attn_metadata=None),
+    ):
+        token = bcg._current_capture_var.set(capture)
+        try:
+            out = QwenImage21Attention.attend_target(attention, q, kv, kv, prefix_pad)
+        finally:
+            bcg._current_capture_var.reset(token)
+        prefix_pad.rows.fill_(1)
+        with replay_token_scope():
+            assert graph._break_fns[0]() is None
+    assert torch.all(out == 5)

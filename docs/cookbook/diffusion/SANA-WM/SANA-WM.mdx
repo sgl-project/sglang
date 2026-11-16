@@ -218,7 +218,7 @@ Once up, the realtime WebSocket endpoint lives at `ws://127.0.0.1:30000/v1/realt
 
 ## 7. Realtime WebSocket API
 
-The realtime API is a single WebSocket at **`/v1/realtime_video/generate`**. All messages — client → server and server → client — are **msgpack** (`msgspec.msgpack.encode` / `decode`), not JSON.
+The realtime API is a single WebSocket at **`/v1/realtime_video/generate`**. Requests and control messages use **msgpack** (`msgspec.msgpack.encode` / `decode`), not JSON. Large frame batches use a msgpack header followed by a separate binary payload.
 
 The lifecycle is:
 
@@ -230,7 +230,7 @@ The client opens the WebSocket and sends exactly one **init** message (`type: "i
 While generation runs, the client may push **event** messages (`type: "event"`) to steer the camera — either `kind: "camera_actions"` (frame-by-frame lists or state transitions) or `kind: "action"` (an action-DSL string).
 </Step>
 <Step title="Receive frame batches">
-The server streams **frame batches** back. Each chunk arrives as one or more `frame_batch` messages (header fields + payload bytes); `is_final_frame_batch: true` marks the end of a chunk. The server also emits `chunk_stats` timing messages.
+The server streams **frame batches** back; `is_final_frame_batch: true` marks the end of a chunk. Clients must handle both output formats described below, as well as `chunk_stats` timing messages and `error` responses.
 </Step>
 </Steps>
 
@@ -322,13 +322,18 @@ If you omit both `intrinsics_path` and `intrinsics`, SGLang uses a centered heur
 
 ### Server frame output
 
-The server streams **frame batches**. Every batch arrives as a **single** msgpack message with `type: "frame_batch"` — the header fields below plus an inline `payload` bytes field (the wire `type` is always `"frame_batch"`; there is no separate header-then-bytes message).
+The server streams **frame batches** in two formats:
+
+- `frame_batch`: one msgpack message with header fields and an inline `payload` bytes field.
+- `frame_batch_header`: a msgpack header followed immediately by one binary WebSocket message containing the payload. Do not msgpack-decode that second message; check its length against `total_size`.
+
+The second format avoids copying large payloads into a msgpack envelope. Error and timing messages do not interrupt a header/payload pair. If the connection closes before the payload arrives, discard the incomplete batch.
 
 Header fields:
 
 | Field | Meaning |
 |---|---|
-| `type` | `"frame_batch"` (always) |
+| `type` | `"frame_batch"` or `"frame_batch_header"` |
 | `request_id` | Generation id |
 | `chunk_index` | Chunk index |
 | `content_type` | `application/x-raw-rgb`, `image/webp`, or `image/jpeg` |
@@ -342,9 +347,9 @@ Header fields:
 | `frame_batch_index`, `num_frame_batches` | Sequence multiple batches within a chunk |
 | `is_final_frame_batch` | `true` ends the chunk |
 
-```json Server output - frame_batch (msgpack dict)
+```json Server output - frame_batch_header (msgpack dict)
 {
-  "type": "frame_batch",
+  "type": "frame_batch_header",
   "request_id": "uuid-string",
   "chunk_index": 0,
   "content_type": "application/x-raw-rgb",
@@ -359,10 +364,11 @@ Header fields:
   "event_id": 1,
   "frame_batch_index": 0,
   "num_frame_batches": 1,
-  "is_final_frame_batch": true,
-  "payload": "<raw RGB24 bytes>"
+  "is_final_frame_batch": true
 }
 ```
+
+For this header, the next binary message contains 8,110,080 bytes of raw RGB24 data.
 
 **Encodings.** `application/x-raw-rgb` is uncompressed RGB24 (3 × uint8, `bytes_per_frame = width*height*3`), sent by default or with `realtime_output_format: "raw"`; `"webp"` / `"jpeg"` send preview-encoded frames.
 
@@ -407,10 +413,19 @@ async def run():
         # 3) receive frame batches (raw RGB24)
         async for message in ws:
             msg = msgspec.msgpack.decode(message)
-            if msg.get("type") != "frame_batch":
+            if msg["type"] == "frame_batch_header":
+                payload = await ws.recv()
+            elif msg["type"] == "frame_batch":
+                payload = msg["payload"]
+            elif msg["type"] == "error":
+                print("Server error:", msg["content"])
+                continue
+            else:
                 continue  # skip chunk_stats etc.
+            if not isinstance(payload, bytes) or len(payload) != msg["total_size"]:
+                raise ValueError("Invalid frame payload")
             n, h, w, c = msg["num_frames"], msg["height"], msg["width"], msg["channels"]
-            frames = np.frombuffer(msg["payload"], dtype=np.uint8).reshape(n, h, w, c)
+            frames = np.frombuffer(payload, dtype=np.uint8).reshape(n, h, w, c)
             # ... display/save frames ...
             if msg.get("is_final_frame_batch") and msg.get("chunk_index", 0) >= 9:
                 break

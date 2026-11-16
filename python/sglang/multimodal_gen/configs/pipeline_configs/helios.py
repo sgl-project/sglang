@@ -9,13 +9,11 @@ from sglang.multimodal_gen.configs.models.dits.helios import HeliosConfig
 from sglang.multimodal_gen.configs.models.encoders import BaseEncoderOutput, T5Config
 from sglang.multimodal_gen.configs.models.encoders.t5 import T5ArchConfig
 from sglang.multimodal_gen.configs.models.vaes import WanVAEConfig
-from sglang.multimodal_gen.configs.pipeline_configs.base import (
-    ModelTaskType,
-    PipelineConfig,
-)
+from sglang.multimodal_gen.configs.pipeline_configs.base import PipelineConfig
 from sglang.multimodal_gen.configs.pipeline_configs.model_deployment_config import (
     ModelDeploymentConfig,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)

@@ -318,12 +318,23 @@ class Ideogram4DenoisingStage(DenoisingStage):
         super()._manage_dit_use_site(current_model, current_phase, batch)
 
     def _run_ideogram_transformer(
-        self, current_model: torch.nn.Module, call_kwargs: dict
+        self,
+        current_model: torch.nn.Module,
+        call_kwargs: dict,
+        llm_cond_cache: dict,
+        branch: str,
     ) -> torch.Tensor:
         runner = self._maybe_get_bcg_runner(current_model)
         if runner is not None:
+            # the BCG prompt padder pads the raw LLM features with the sequence
             return self._bcg_run(runner, call_kwargs, current_model)
-        return current_model(**call_kwargs)
+        # project the request-constant LLM conditioning once per branch, then reuse it
+        llm_features = call_kwargs.pop("llm_features")
+        if branch not in llm_cond_cache:
+            llm_cond_cache[branch] = current_model.project_llm_features(
+                llm_features, call_kwargs["indicator"]
+            )
+        return current_model(llm_cond=llm_cond_cache[branch], **call_kwargs)
 
     def _preprocess_sp_latents(self, batch: Req, server_args: ServerArgs):
         batch.did_sp_shard_latents = False
@@ -445,6 +456,7 @@ class Ideogram4DenoisingStage(DenoisingStage):
                 "ideogram4_neg_attn_mask": neg_attn_mask,
                 "ideogram4_neg_attn_mask_meta": build_varlen_mask_meta(neg_attn_mask),
                 "ideogram4_neg_llm_features": neg_llm_features,
+                "ideogram4_llm_cond": {},
             }
         )
         return ctx
@@ -490,6 +502,8 @@ class Ideogram4DenoisingStage(DenoisingStage):
                         attn_mask=ctx.extra["ideogram4_attn_mask"],
                         attn_mask_meta=ctx.extra["ideogram4_attn_mask_meta"],
                     ),
+                    ctx.extra["ideogram4_llm_cond"],
+                    "positive",
                 )
                 pos_v = pos_out[:, max_text_tokens : max_text_tokens + num_image_tokens]
 
@@ -513,6 +527,8 @@ class Ideogram4DenoisingStage(DenoisingStage):
                             attn_mask=ctx.extra["ideogram4_neg_attn_mask"],
                             attn_mask_meta=ctx.extra["ideogram4_neg_attn_mask_meta"],
                         ),
+                        ctx.extra["ideogram4_llm_cond"],
+                        "negative",
                     )
 
         with maybe_nvtx_range("scheduler_step", use_nvtx):
@@ -534,6 +550,8 @@ class Ideogram4DecodingStage(PipelineStage):
     def __init__(self, vae) -> None:
         super().__init__()
         self.vae = vae
+        # (dtype, device) -> latent scale/shift, uploaded once
+        self.latent_stats = {}
 
     def component_uses(
         self, server_args: ServerArgs, stage_name: str | None = None
@@ -555,8 +573,13 @@ class Ideogram4DecodingStage(PipelineStage):
         latents = batch.latents.to(get_local_torch_device())
         cfg = server_args.pipeline_config
         patch = cfg.patch_size
-        shift = torch.tensor(LATENT_SHIFT, device=latents.device, dtype=latents.dtype)
-        scale = torch.tensor(LATENT_SCALE, device=latents.device, dtype=latents.dtype)
+        stats_key = (latents.dtype, latents.device)
+        if stats_key not in self.latent_stats:
+            self.latent_stats[stats_key] = tuple(
+                torch.tensor(values, device=latents.device, dtype=latents.dtype)
+                for values in (LATENT_SCALE, LATENT_SHIFT)
+            )
+        scale, shift = self.latent_stats[stats_key]
         z = latents * scale.to(latents.dtype) + shift.to(latents.dtype)
         batch_size = z.shape[0]
         grid_h = data["grid_h"]
