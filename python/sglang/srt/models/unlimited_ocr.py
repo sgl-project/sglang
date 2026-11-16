@@ -9,6 +9,7 @@ from torch import nn
 
 from sglang.srt.configs.unlimited_ocr import UnlimitedVLConfig
 from sglang.srt.layers.quantization import QuantizationConfig
+from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
@@ -23,7 +24,6 @@ from sglang.srt.models.deepseek_ocr import (
     build_sam_vit_b,
     clear_sam_rel_pos_cache,
 )
-from sglang.srt.models.transformers import maybe_prefix
 from sglang.srt.utils import cpu_has_amx_support, is_cpu
 
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -89,7 +89,7 @@ class UnlimitedOCRForCausalLM(nn.Module):
         return DeepseekForCausalLM(
             config=config.text_config,
             quant_config=quant_config,
-            prefix=maybe_prefix(prefix, "language"),
+            prefix=add_prefix("language", prefix),
         )
 
     def get_attention_sliding_window_size(self) -> Optional[int]:
