@@ -20,9 +20,6 @@ if not is_cpu():
     )
 
 if is_npu():
-    from sgl_kernel_npu.fla.fused_sigmoid_gating_recurrent_decode_optimized import (
-        fused_sigmoid_gating_delta_rule_update_decode_npu as fused_sigmoid_gating_delta_rule_update,
-    )
     from sgl_kernel_npu.operators.attention.gdn import (
         chunk_gated_delta_rule_npu,
         fused_gdn_decode,
@@ -265,6 +262,10 @@ class TritonGDNKernel(LinearAttnKernelBase):
         retrieve_parent_token: torch.Tensor,
         **kwargs,
     ) -> torch.Tensor:
+        if is_npu():
+            raise NotImplementedError(
+                "NPU GDN target verification uses AscendGDNAttnBackend."
+            )
         return fused_sigmoid_gating_delta_rule_update(
             A_log=A_log,
             dt_bias=dt_bias,
