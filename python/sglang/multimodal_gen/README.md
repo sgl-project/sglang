@@ -111,6 +111,12 @@ sglang generate \
 
 For more usage examples (e.g. OpenAI compatible API, server mode), check the [CLI reference](https://docs.sglang.io/docs/sglang-diffusion/api/cli).
 
+## SGLang-Diffusion Adoption & Integrations
+
+<img src="../../../assets/sglang-diffusion/adoption.png" alt="SGLang-Diffusion adopters and integrations: Modal, Black Forest Labs, Krea, Baseten, Ant Group, Skywork, Google, TikTok, Tencent Hunyuan, Infinigence, fal, MOSS-Image, and Sol-Engine" width="800">
+
+[fal](https://blog.fal.ai/h3-max-built-with-fal-inference-and-training/) ported SGLang-Diffusion's H3 implementation to its Falcon inference engine.
+
 ## Contributing
 
 All contributions are welcome. The contribution guide is available [here](https://docs.sglang.io/docs/sglang-diffusion/contributing).
