@@ -2043,19 +2043,15 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if tp_split is not None:
             if not need_chunk:
                 max_rows = row_hi - row_lo
-            # Per-row outputs: each rank writes its rows into its own slot of an
-            # equal-stride buffer, so the gather below is an in-place
-            # all_gather_into_tensor (aiter custom all-gather on ROCm) instead of
-            # PyNCCL all_gatherv.
-            group, _, _, sizes = tp_split
-            slot = max(sizes)
-            gather_buf = torch.empty(
-                (group.world_size * slot, self.index_topk),
-                device=device,
-                dtype=torch.int32,
-            )
-            mine = group.rank_in_group * slot
-            dst = gather_buf[mine : mine + row_hi - row_lo]
+            if _use_aiter:
+                gather_buf, dst = dsa_indexer_hip.tp_split_topk_rows(
+                    tp_split, row_hi - row_lo, self.index_topk, device
+                )
+            else:
+                # Per-row outputs, so the local rows go to a buffer gathered below.
+                dst = torch.empty(
+                    (row_hi - row_lo, self.index_topk), device=device, dtype=torch.int32
+                )
             dst_base = row_lo
 
         start = row_lo
@@ -2136,18 +2132,14 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             dcp_all_gather_rows_(topk_dst, row_per, row_slot)
             if topk_dst is not topk_result:
                 topk_result[:q_offset] = topk_dst[:q_offset]
-        if tp_split is not None:
-            # int32 rows travel as float32 bits (the custom all-gather is typed).
-            group.all_gather_into_tensor(
-                gather_buf.view(torch.float32),
-                gather_buf[mine : mine + slot].view(torch.float32),
+        if tp_split is not None and _use_aiter:
+            dsa_indexer_hip.tp_split_gather_topk(
+                tp_split, gather_buf, topk_result[:q_offset]
             )
-            # Rank order == row order: drop each slot's padding to rebuild
-            # rows [0, q_offset).
-            torch.cat(
-                [gather_buf[r * slot : r * slot + n] for r, n in enumerate(sizes)],
-                out=topk_result[:q_offset],
-            )
+        elif tp_split is not None:
+            # Rank order == row order, so the gather rebuilds rows [0, q_offset).
+            group, _, _, sizes = tp_split
+            group.all_gatherv(dst, sizes=sizes, output=topk_result[:q_offset])
         return topk_result
 
     def _prefill_lite_topk(
@@ -2229,7 +2221,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         group = get_parallel().attn_tp_group
         tp = group.world_size
         min_rows = max(tp, self.tp_split_min_rows)
-        if tp <= 1 or q_offset < min_rows:
+        if (
+            tp <= 1
+            or q_offset < min_rows
+            # the top-k gather is all_gatherv, which runs on PyNCCL only; aiter's
+            # (dsa_indexer_hip.tp_split_gather_topk) does not need it
+            or (
+                not _use_aiter
+                and (group.pynccl_comm is None or not group.pynccl_comm.available)
+            )
+        ):
             return None
         bounds = self._indexer_tp_split_bounds(
             seq_lens_cpu=forward_batch.seq_lens_cpu,

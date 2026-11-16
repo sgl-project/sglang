@@ -6,6 +6,8 @@
   row's keys, layer after layer and forward after forward.
 - NoPE prologue: quantized queries, head weights and stored keys match the generic path.
 - FP4 index-K: AITER's row-group logits read the keys and queries our kernels write.
+- TP-split prefill top-k: the in-place all-gather of equal slots rebuilds the rows in
+  order, without the shorter slices' padding.
 """
 
 import contextlib
@@ -411,6 +413,37 @@ class TestFp4IndexKHip(CustomTestCase):
             tol = dict(rtol=1e-5, atol=1e-5 * float(ref.abs().max()))
             torch.testing.assert_close(logits[r, :end], ref, **tol)
             torch.testing.assert_close(prefill[r, start : start + end], ref, **tol)
+
+
+class _TpGroup:
+    """One TP rank whose all-gather copies every rank's slot from ``bufs``."""
+
+    def __init__(self, rank, bufs):
+        self.rank_in_group, self.world_size, self.bufs = rank, len(bufs), bufs
+
+    def all_gather_into_tensor(self, output, input):
+        slot = output.shape[0] // self.world_size
+        # in place: the input is this rank's slot of the output
+        assert input.data_ptr() == output[self.rank_in_group * slot].data_ptr()
+        for r, buf in enumerate(self.bufs):
+            src = buf.view(output.dtype)[r * slot : (r + 1) * slot]
+            output[r * slot : (r + 1) * slot] = src
+
+
+class TestTpSplitGatherHip(CustomTestCase):
+    def test_unequal_slices_gather_back_in_row_order(self):
+        sizes, topk = [3, 1, 2], 4
+        rows = torch.arange(sum(sizes) * topk, dtype=torch.int32).view(-1, topk)
+        bufs = [None] * len(sizes)
+        for r, n in enumerate(sizes):
+            split = (_TpGroup(r, bufs), None, None, sizes)
+            bufs[r], dst = dsa_indexer_hip.tp_split_topk_rows(split, n, topk, "cpu")
+            bufs[r].fill_(-7)  # slot padding the gather must drop
+            dst.copy_(rows[sum(sizes[:r]) : sum(sizes[:r]) + n])
+        out = torch.full_like(rows, -1)
+        split = (_TpGroup(1, bufs), None, None, sizes)
+        dsa_indexer_hip.tp_split_gather_topk(split, bufs[1], out)
+        self.assertTrue(torch.equal(out, rows))
 
 
 if __name__ == "__main__":
