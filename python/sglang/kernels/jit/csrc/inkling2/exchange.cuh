@@ -30,14 +30,13 @@ __global__ void __launch_bounds__(threads(H)) combine_kernel(
     int rank,
     int num_local) {
   __shared__ __nv_bfloat16 const* rows[TOPK];
-  asm volatile("griddepcontrol.wait;" ::: "memory");
-  asm volatile("griddepcontrol.launch_dependents;");
-  int const block = blockIdx.x;
+  device::PDLWaitPrimary<true>();
+  device::PDLTriggerSecondary<true>();
   int64_t const call = calls[0];
   int64_t const slot = (call & 1) * slot_size;
   inkling_ar::grid_system_barrier<WORLD>(state, reinterpret_cast<void* const*>(flag_ptrs), rank, 0, false);
   bool const active = threadIdx.x < H / 16;
-  for (int token = block; token < tokens; token += gridDim.x) {
+  for (int token = blockIdx.x; token < tokens; token += gridDim.x) {
     if (threadIdx.x < TOPK) {
       int dst = src2dst[token * TOPK + threadIdx.x];
       int owner = sorted_ids[dst] / num_local;
@@ -52,10 +51,7 @@ __global__ void __launch_bounds__(threads(H)) combine_kernel(
         raw[k][0] = src[0];
         raw[k][1] = src[1];
       }
-      float total[16];
-#pragma unroll
-      for (int i = 0; i < 16; ++i)
-        total[i] = 0.0f;
+      float total[16] = {};
 #pragma unroll
       for (int k = 0; k < TOPK; ++k) {
         __nv_bfloat16 const* h = reinterpret_cast<__nv_bfloat16 const*>(raw[k]);

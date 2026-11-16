@@ -1,11 +1,9 @@
-from functools import cache
-
 import torch
 import torch.distributed._symmetric_memory as symm_mem
 import triton
 import triton.language as tl
 
-from sglang.kernels.jit.utils import load_jit
+from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.kernels.ops.communication import inkling_all_reduce as ar
 
 _RANK_ORDER_MAX_BYTES = {2: 1200 * 1024, 4: 512 * 1024, 8: 288 * 1024, 16: 64 * 1024}
@@ -40,7 +38,7 @@ def _ptrs(handle, device):
     return torch.tensor(handle.buffer_ptrs, device=device, dtype=torch.int64)
 
 
-@cache
+@cache_once
 def _multicast_buffer(group_name, device, dtype, capacity):
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("Warm up the collective size before CUDA graph capture")
@@ -224,7 +222,7 @@ def oneshot_all_reduce(x, group, acc_f32=False, tag=""):
     return _ONESHOT[(group.device_group.group_name, x.shape[1], tag)](x, acc_f32)
 
 
-@cache
+@cache_once
 def _exchange_module(hidden, top_k, world):
     return load_jit(
         "inkling2_exchange",
@@ -253,18 +251,18 @@ class RoutedExchange:
         self.max_blocks = (
             2 * torch.cuda.get_device_properties(device).multi_processor_count
         )
-        self.buffer, self.handle = _symm(
+        self.buffer, handle = _symm(
             group, 2 * max_rows * hidden, torch.bfloat16, device
         )
         self.flags, flags_handle = _symm(
             group, ar.flags_numel(self.world), torch.uint32, device, flags=True
         )
         self.state = torch.zeros(ar.STATE_SIZE, device=device, dtype=torch.uint32)
-        self.buffer_ptrs = _ptrs(self.handle, device)
+        self.buffer_ptrs = _ptrs(handle, device)
         self.flag_ptrs = _ptrs(flags_handle, device)
         # [call count, CTAs finished in the current call]
         self.calls = torch.zeros(2, device=device, dtype=torch.int64)
-        self.rank = self.handle.rank
+        self.rank = handle.rank
 
     def combine(self, src2dst, sorted_ids, num_local, top_k):
         tokens = src2dst.numel() // top_k
@@ -375,11 +373,9 @@ class PrefillExchange:
     buffer only after it reached the next call's first barrier, so one slot of
     each suffices."""
 
-    calls = None
-
     def __init__(self, group, max_tokens, top_k, hidden, device):
         self.world, self.hidden, self.top_k = group.world_size, hidden, top_k
-        self.max_tokens, self.max_rows = max_tokens, max_tokens * top_k
+        self.max_rows = max_tokens * top_k
         self.buffer, handle = _symm(
             group, self.max_rows * hidden, torch.bfloat16, device
         )
