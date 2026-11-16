@@ -8,16 +8,23 @@ cross-attends from noisy visual tokens to that cache at every denoising step.
 
 import math
 from collections.abc import Iterable, Iterator, Sequence
+from functools import cache
 from typing import Any
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from sglang.kernels.kernel_api_logging import wrap_method_with_debug_kernel_once
 from sglang.kernels.ops.activation.activation import relu2
 from sglang.kernels.ops.diffusion import (
     can_use_fused_inplace_qknorm_rope,
     fused_qknorm_rope_pack_kv,
+)
+from sglang.kernels.ops.gemm.sm120_bf16 import (
+    Sm120Bf16Linear,
+    linear_bf16_cublaslt,
+    linear_bf16_quack,
 )
 from sglang.multimodal_gen.configs.models.dits.cosmos3video import Cosmos3VideoConfig
 from sglang.multimodal_gen.configs.models.fsdp import is_module_list_entry_in
@@ -61,12 +68,16 @@ from sglang.multimodal_gen.runtime.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from sglang.multimodal_gen.runtime.loader.utils import get_param_names_mapping
+from sglang.multimodal_gen.runtime.managers.forward_context import (
+    request_allows_lossless,
+)
 from sglang.multimodal_gen.runtime.managers.memory_managers.layerwise_offload import (
     LayerwiseOffloadableModuleMixin,
 )
 from sglang.multimodal_gen.runtime.models.dits.base import CachableDiT
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.environ import envs
 from sglang.srt.layers.utils.common import add_prefix
 
 logger = init_logger(__name__)
@@ -1013,6 +1024,45 @@ class Cosmos3UndDecoderLayer(nn.Module):
 # -----------------------------------------------------------------------------
 
 
+@cache
+def _sm120_gemm_device_supported(index: int) -> bool:
+    prop = torch.cuda.get_device_properties(index)
+    return (prop.major, prop.minor, prop.multi_processor_count) == (12, 0, 188)
+
+
+class _Sm120LinearMethod(UnquantizedLinearMethod):
+    # Cosmos3 Bimanual measurements on 188-SM RTX PRO 6000, cuBLAS 13.1.1.3.
+    # Unmeasured shapes and the M224 down / M448 out ties keep native GEMM.
+    # M224 QKV gains are too small to justify runtime autotuning.
+    _backends = {
+        (224, 24576, 4096): linear_bf16_quack,
+        (448, 24576, 4096): linear_bf16_quack,
+        (448, 6144, 4096): linear_bf16_cublaslt,
+        (224, 4096, 4096): linear_bf16_cublaslt,
+        (448, 4096, 12288): linear_bf16_cublaslt,
+    }
+
+    def __init__(self):
+        self._gemm = Sm120Bf16Linear()
+
+    def apply(self, layer, x, bias=None):
+        if (
+            not torch.compiler.is_compiling()
+            and request_allows_lossless()
+            and x.device.type == "cuda"
+            and x.ndim >= 2
+            and x.shape[-1] > 0
+        ):
+            backend = self._backends.get(
+                (x.numel() // x.shape[-1], *layer.weight.shape)
+            )
+            if backend is not None and _sm120_gemm_device_supported(x.device.index):
+                out = self._gemm(x, layer.weight, bias, backend=backend)
+                if out is not None:
+                    return out
+        return super().apply(layer, x, bias)
+
+
 class Cosmos3GenDecoderLayer(nn.Module):
     """Generation pathway decoder layer: cross-attention + MLP."""
 
@@ -1052,6 +1102,20 @@ class Cosmos3GenDecoderLayer(nn.Module):
             prefix=add_prefix("mlp", prefix),
             quant_config=quant_config,
         )
+
+        if envs.SGLANG_OPT_COSMOS3_SM120_GEMM.get():
+            for projection in self.modules():
+                if (
+                    isinstance(projection, (ColumnParallelLinear, RowParallelLinear))
+                    and projection.tp_size == 1
+                    and type(projection.quant_method) is UnquantizedLinearMethod
+                ):
+                    projection.quant_method = _Sm120LinearMethod()
+                    wrap_method_with_debug_kernel_once(
+                        projection.quant_method,
+                        "apply",
+                        op_name="diffusion.quant_method._Sm120LinearMethod.apply",
+                    )
 
     def forward(
         self,
