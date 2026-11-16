@@ -449,38 +449,39 @@ class DFlashAttention(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
-        qkv, _ = self.qkv_proj(hidden_states)
         if _is_npu:
             q, k, v = self.forward_prepare_npu(positions, hidden_states)
-        elif self.use_table_qk_norm_rope and qkv.dtype == torch.bfloat16:
-            from sglang.kernels.ops.attention.table_qk_norm_rope import (
-                table_qk_norm_rope_,
-            )
-
-            table_qk_norm_rope_(
-                qkv,
-                positions,
-                self.q_norm.weight,
-                self.k_norm.weight,
-                self.rotary_emb.cos_sin_cache,
-                self.num_heads,
-                self.num_kv_heads,
-                self.head_dim,
-                self.q_norm.variance_epsilon,
-            )
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         else:
-            q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-            # In-place QK kernels use weight directly; Gemma requires 1 + weight.
-            q, k = apply_qk_norm(
-                q,
-                k,
-                self.q_norm,
-                self.k_norm,
-                self.head_dim,
-                allow_inplace=not self.use_gemma_norm,
-            )
-            q, k = self.rotary_emb(positions, q, k)
+            qkv, _ = self.qkv_proj(hidden_states)
+            if self.use_table_qk_norm_rope and qkv.dtype == torch.bfloat16:
+                from sglang.kernels.ops.attention.table_qk_norm_rope import (
+                    table_qk_norm_rope_,
+                )
+
+                table_qk_norm_rope_(
+                    qkv,
+                    positions,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    self.rotary_emb.cos_sin_cache,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.head_dim,
+                    self.q_norm.variance_epsilon,
+                )
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            else:
+                q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+                # In-place QK kernels use weight directly; Gemma requires 1 + weight.
+                q, k = apply_qk_norm(
+                    q,
+                    k,
+                    self.q_norm,
+                    self.k_norm,
+                    self.head_dim,
+                    allow_inplace=not self.use_gemma_norm,
+                )
+                q, k = self.rotary_emb(positions, q, k)
         if self.v_scale is not None:
             v = v * self.v_scale
         if self.attention_sink_bias is None:
