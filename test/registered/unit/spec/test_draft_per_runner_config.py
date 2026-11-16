@@ -22,7 +22,11 @@ from sglang.srt.model_executor.model_runner_components.attention_backend_setup i
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     build_load_config,
 )
-from sglang.srt.runtime_context import get_context, get_model
+from sglang.srt.runtime_context import (
+    get_context,
+    get_model,
+    remote_instance_transfer_engine_enabled,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -72,18 +76,14 @@ class TestDraftPerRunnerConfig(CustomTestCase):
     def test_the_transfer_engine_gate_answers_for_the_runner(self):
         """The engine is initialized at the top of initialize(), long before the
         weights load, so the gate has to see the draft's format."""
-        server_args = self._seed(
+        self._seed(
             load_format="auto",
             speculative_draft_load_format="remote_instance",
             remote_instance_weight_loader_backend="transfer_engine",
         )
-        self.assertFalse(
-            server_args.remote_instance_weight_loader_use_transfer_engine()
-        )
+        self.assertFalse(remote_instance_transfer_engine_enabled())
         self.assertTrue(
-            server_args.remote_instance_weight_loader_use_transfer_engine(
-                load_format="remote_instance"
-            )
+            remote_instance_transfer_engine_enabled(load_format="remote_instance")
         )
 
     def test_the_load_config_takes_the_per_runner_format_when_given(self):

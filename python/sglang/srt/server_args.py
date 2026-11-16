@@ -46,7 +46,6 @@ from sglang.srt.arg_groups.model_override_base import (
     resolving_view,
 )
 from sglang.srt.arg_groups.overrides import (
-    remote_instance_transfer_engine_of,
     resolution_result,
 )
 from sglang.srt.arg_groups.validation_hook import (
@@ -547,11 +546,6 @@ class ServerArgs:
         from sglang.srt.arg_groups.validation_hook import check_server_args
 
         check_server_args(self)
-
-    def remote_instance_weight_loader_use_transfer_engine(self, load_format=None):
-        """``load_format`` overrides the seed's: a draft runner loading under
-        ``--speculative-draft-load-format`` needs its own transfer engine."""
-        return remote_instance_transfer_engine_of(resolving_view(self), load_format)
 
 
 # Collect input fields only; field_order.py preserves positional argument order.
