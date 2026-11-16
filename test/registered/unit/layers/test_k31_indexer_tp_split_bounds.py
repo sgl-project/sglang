@@ -23,7 +23,7 @@ def _bounds(seq_lens, extend_lens, tp):
 
 class TestIndexerTpSplitBounds(CustomTestCase):
     def test_every_rank_owns_a_contiguous_nonempty_slice(self):
-        # all_gatherv rebuilds rows [0, q_offset) in rank order, so the bounds must
+        # The top-k gather rebuilds rows [0, q_offset) in rank order, so the bounds must
         # tile the rows exactly with no empty rank, down to q_offset == tp.
         rng = random.Random(0)
         cases = [([143424], [64]), ([100], [8]), ([200000, 40, 40], [6, 1, 1])]
