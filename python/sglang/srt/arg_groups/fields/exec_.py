@@ -524,6 +524,11 @@ class ExecMamba(msgspec.Struct):
         fn="sglang.srt.arg_groups.overrides.mamba_extra_buffer_lazy_of",
         doc="The lazy variant: the strategy is `extra_buffer_lazy` exactly.",
     )
+    mamba_path_state_cap = Derived(
+        fn="sglang.srt.arg_groups.overrides.mamba_path_state_cap_of",
+        doc="Mamba states kept per root-to-tail path (-1 is unlimited): an "
+        "explicit --mamba-max-states-per-path, else 1 below checkpoint level 3.",
+    )
     mamba_backend: A[
         str,
         Arg(
@@ -538,13 +543,31 @@ class ExecMamba(msgspec.Struct):
             choices=["float32", "bfloat16", "float16"],
         ),
     ] = None
+    # Deprecated spelling; `--hybrid-cache-checkpoints-level 2` replaces it.
+    # Its only command-line entry is the deprecated registration in server_args.
     mamba_max_states_per_path: A[
+        Optional[int],
+        Arg(
+            help="Maximum number of cached Mamba states retained per root-to-tail "
+            "path (-1 means unlimited). When enabled, after each insert the "
+            "shallowest eligible interior states beyond the cap are removed while "
+            "their full KV remains. Tail, fork, and locked nodes are preserved. "
+            "Must be -1 or a positive integer.",
+            no_cli=True,
+        ),
+    ] = None
+    hybrid_cache_checkpoints_level: A[
         int,
-        "Maximum number of cached Mamba states retained per root-to-tail path "
-        "(-1 means unlimited). When enabled, after each insert the shallowest eligible "
-        "interior states beyond the cap are removed while their full KV remains. "
-        "Tail, fork, and locked nodes are preserved. Must be -1 or a positive integer.",
-    ] = -1
+        Arg(
+            help="Where a hybrid model's prefix cache checkpoints recurrent "
+            "state. 2: branching points and request ends only (a PD prefill worker's "
+            "end is its complete prompt), with a soft cap of one state per path. "
+            "Host and storage tiers receive published states; models that also have "
+            "sliding-window layers still checkpoint every chunk. 3: every "
+            "prefill chunk and decode tracking boundary.",
+            choices=[2, 3],
+        ),
+    ] = 2
     enable_mamba_cache_stochastic_rounding: A[
         bool,
         "Enable stochastic rounding when writing FP16 Mamba SSM cache states. Requires --mamba-ssm-dtype float16 and CUDA. With --mamba-backend triton, requires SM100.",

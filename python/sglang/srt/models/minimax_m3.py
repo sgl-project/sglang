@@ -466,7 +466,9 @@ class MiniMaxM3MoE(nn.Module):
             # DeepEP all-gathers (not all-reduces) the layer output, so a TP-sharded
             # shared MLP would leave an unreduced partial; replicate (tp_size=1), like GLM4 / DSV2.
             shared_experts_tp1 = (
-                get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_megamoe()
+                get_moe_a2a_backend().is_deepep()
+                or get_moe_a2a_backend().is_ascend_ops()
+                or get_moe_a2a_backend().is_megamoe()
             )
             self.shared_experts = MiniMaxM3MLP(
                 config=config,
@@ -531,7 +533,7 @@ class MiniMaxM3MoE(nn.Module):
     ) -> torch.Tensor:
         if get_moe_a2a_backend().is_megamoe():
             return self.forward_mega_moe(hidden_states, forward_batch)
-        if get_moe_a2a_backend().is_deepep():
+        if get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_ascend_ops():
             return self.forward_deepep(hidden_states, forward_batch)
         else:
             return self.forward_normal(hidden_states)

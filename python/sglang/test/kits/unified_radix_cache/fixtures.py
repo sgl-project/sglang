@@ -132,6 +132,7 @@ def build_fixture(
         model_path="dummy",
         page_size=cfg.page_size,
         enable_int8_mamba_checkpoint=cfg.enable_int8_mamba_checkpoint,
+        hybrid_cache_checkpoints_level=cfg.hybrid_cache_checkpoints_level,
     )
     # The dummy HF config cannot supply mamba_cache_chunk_size, so preset
     # FLA_CHUNK_SIZE.

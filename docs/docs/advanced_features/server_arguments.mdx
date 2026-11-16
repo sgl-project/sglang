@@ -2106,6 +2106,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`256`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int</td>
     </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--hybrid-cache-checkpoints-level`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Where a hybrid model&apos;s prefix cache checkpoints recurrent (Mamba) state. <code>2</code>: branching points and request ends only, with a soft cap of one state per path (branching and locked nodes are preserved); suits multi-turn and agentic traffic, where each turn extends the previous one. Host and storage tiers receive published states. For ordinary requests, deferred KV joins the tree at a reusable checkpoint when the request finishes. Streaming sessions retain deferred KV privately and currently do not publish it at turn end. Models that also have sliding-window layers still checkpoint every chunk. <code>3</code>: every prefill chunk and decode tracking boundary, so a later request can resume from any chunk of an earlier one. Replaces the deprecated <code>--mamba-max-states-per-path</code>, which still applies when set.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`2`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>2</code>, <code>3</code></td>
+    </tr>
       <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-int8-mamba-checkpoint`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Store radix-cached linear-attn (mamba) states in int8 (separate checkpoint pool) for ~2x cached-prefix capacity at fixed memory.</td>
