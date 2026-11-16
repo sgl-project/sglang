@@ -97,4 +97,3 @@ class Hunyuan3DDiTConfig(DiTConfig):
     """DiT configuration for Hunyuan3D shape generation (Flux-style)."""
 
     arch_config: Hunyuan3DDiTArchConfig = field(default_factory=Hunyuan3DDiTArchConfig)
-    subfolder: str = "hunyuan3d-dit-v2-0"

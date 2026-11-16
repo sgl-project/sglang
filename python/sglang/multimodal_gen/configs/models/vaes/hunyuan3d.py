@@ -17,7 +17,6 @@ class Hunyuan3DVAEConfig(VAEConfig):
     """VAE configuration for Hunyuan3D."""
 
     arch_config: Hunyuan3DVAEArchConfig = field(default_factory=Hunyuan3DVAEArchConfig)
-    subfolder: str = "hunyuan3d-dit-v2-0"
     load_encoder: bool = False
     load_decoder: bool = True
     use_parallel_decode: bool = False
