@@ -2287,13 +2287,6 @@ class MQALayer(MqaAttentionBase):
         k_rope_out: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         x_linear = x_quant if x_quant is not None else x
-        if self.fuse_wqa_wkv:
-            qkv_a, _ = self.wqkv_a(x_linear)
-            q_lora = qkv_a[..., : self.q_lora_rank]
-        else:
-            q_lora, _ = self.wq_a(x_linear)
-            qkv_a = None
-
         use_cp = is_cp_active(forward_batch)
         kv: Optional[torch.Tensor]
 
@@ -2303,6 +2296,48 @@ class MQALayer(MqaAttentionBase):
         )
 
         unified = is_unified_kv_triton()
+        cp_x_global = None
+        cp_gather_stream = None
+        if (
+            _is_cuda
+            and get_platform().is_blackwell
+            and use_cp
+            and not unified
+            and forward_batch.forward_mode.is_extend()
+            and self.compress_ratio in (1, 2)
+            and self.compressor is not None
+            and not forward_batch.encoder_swa_replay
+            and attn_backend.forward_metadata.late_layer_tail is None
+            and attn_backend.tail_source_kv_layer_id != self.layer_id
+            and envs.SGLANG_OPT_USE_MULTI_STREAM_OVERLAP.get()
+            and self.alt_streams is not None
+            and not _low_ratio_sources_break(attn_backend, forward_batch)
+        ):
+            # Launch the hidden gather first, alongside the independent Q/KV
+            # projections. Join before issuing the next CP collective.
+            cp_gather_stream = self.alt_streams[0]
+            cp_gather_stream.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(cp_gather_stream):
+                cp_x_global = cp_materialize_global_token_order(
+                    x.contiguous(), forward_batch, cp_gather_stream
+                )
+        if self.fuse_wqa_wkv:
+            qkv_a, _ = self.wqkv_a(x_linear)
+            q_lora = qkv_a[..., : self.q_lora_rank]
+        else:
+            q_lora, _ = self.wq_a(x_linear)
+            qkv_a = None
+
+        def gather_swa_k(k: torch.Tensor) -> torch.Tensor:
+            stream = torch.cuda.current_stream()
+            if cp_gather_stream is not None:
+                stream.wait_stream(cp_gather_stream)
+                assert cp_x_global is not None
+                cp_x_global.record_stream(stream)
+            return cp_materialize_global_token_order(
+                k.contiguous(), forward_batch, stream
+            )
+
         fp8_2buff = is_unified_kv_fp8()
         is_decode = forward_batch.forward_mode.is_decode_or_idle()
         # The kernel is token-indexed (q, kv and positions are all length M), so
@@ -2470,11 +2505,7 @@ class MQALayer(MqaAttentionBase):
                 # after attention, verify's before it; both read this pair.
                 kv = k_nope_out
             elif not unified and use_cp:
-                kv = cp_materialize_global_token_order(
-                    kv.contiguous(),
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
+                kv = gather_swa_k(kv)
                 attn_backend.store_cache(
                     layer_id=self.layer_id,
                     swa_k=kv,
@@ -2557,11 +2588,7 @@ class MQALayer(MqaAttentionBase):
                     kv = qkv_a[..., self.q_lora_rank :]
                 else:
                     kv, _ = self.wkv(x_linear)
-                kv = cp_materialize_global_token_order(
-                    kv.contiguous(),
-                    forward_batch,
-                    torch.cuda.current_stream(),
-                )
+                kv = gather_swa_k(kv)
                 tail = attn_backend.forward_metadata.late_layer_tail
                 global_positions = (
                     tail.pos_global
@@ -2607,6 +2634,7 @@ class MQALayer(MqaAttentionBase):
                     q_lora=q_lora,
                     positions=positions,
                     forward_batch=forward_batch,
+                    cp_x_global=cp_x_global,
                 )
         else:
             use_npu_cp_full_metadata = use_cp and _is_npu

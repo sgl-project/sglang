@@ -3632,6 +3632,7 @@ class DeepseekV4AttnBackend(
         forward_batch: ForwardBatch,
         run_compressor: bool = True,
         run_indexer: bool = True,
+        cp_x_global=None,
     ) -> None:
         """Runs on every ratio 1/2 layer before its attention."""
         if forward_batch.forward_mode.is_idle():
@@ -3650,6 +3651,7 @@ class DeepseekV4AttnBackend(
                 forward_batch=forward_batch,
                 run_compressor=run_compressor,
                 run_indexer=run_indexer,
+                x_global=cp_x_global,
             )
             return
         hoisted_req = getattr(meta, "low_ratio_req_indices", None)
@@ -3726,7 +3728,16 @@ class DeepseekV4AttnBackend(
             self._low_ratio_index_topk(layer, x, q_lora, req, pos, forward_batch)
 
     def _forward_low_ratio_sources_cp(
-        self, *, layer, x, q_lora, positions, forward_batch, run_compressor, run_indexer
+        self,
+        *,
+        layer,
+        x,
+        q_lora,
+        positions,
+        forward_batch,
+        run_compressor,
+        run_indexer,
+        x_global=None,
     ) -> None:
         # Every rank writes the whole prompt's compressed state, scoring its own rows.
         tail = self.forward_metadata.late_layer_tail
@@ -3739,6 +3750,7 @@ class DeepseekV4AttnBackend(
                 forward_batch,
                 run_compressor=run_compressor,
                 run_indexer=run_indexer,
+                x_global=x_global,
             )
             return
         if tail is not None:
@@ -3758,10 +3770,13 @@ class DeepseekV4AttnBackend(
             pos_global = forward_batch.positions[:total].to(torch.int64)
         num_local = sum(q_lens_cpu)
         if run_compressor and layer.compressor is not None:
-            x_global = cp_materialize_global_token_order(
-                x.contiguous(), forward_batch, torch.cuda.current_stream()
-            )[:total]
-            self._low_ratio_compress_torch(layer, x_global, req_global, pos_global)
+            if x_global is None:
+                x_global = cp_materialize_global_token_order(
+                    x.contiguous(), forward_batch, torch.cuda.current_stream()
+                )
+            self._low_ratio_compress_torch(
+                layer, x_global[:total], req_global, pos_global
+            )
         if run_indexer and layer.indexer is not None:
             # A rank's local rows are not the batch's, so no req_rows to pass.
             self._low_ratio_index_topk(
@@ -3784,15 +3799,17 @@ class DeepseekV4AttnBackend(
         *,
         run_compressor,
         run_indexer,
+        x_global=None,
     ) -> None:
         ratio = layer.compress_ratio
         meta = self.forward_metadata
         layer_has_compressor = run_compressor and layer.compressor is not None
         if layer_has_compressor:
             req, pos = meta.low_ratio_req_indices, meta.low_ratio_pos_i64
-            x_global = cp_materialize_global_token_order(
-                x.contiguous(), forward_batch, torch.cuda.current_stream()
-            )
+            if x_global is None:
+                x_global = cp_materialize_global_token_order(
+                    x.contiguous(), forward_batch, torch.cuda.current_stream()
+                )
             x_global = x_global[: pos.shape[0]]
             bufs = self._source_projection_buffers(
                 pos.shape[0], ratio, part="compressor"
