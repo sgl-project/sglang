@@ -4983,6 +4983,23 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             return 1
         return get_parallel().attn_dcp_size
 
+    @property
+    def supports_external_mla_kv_write(self) -> bool:
+        """Whether an external kernel may write the rows this pool's MLA door writes."""
+        return (
+            type(self).set_mla_kv_buffer is MLATokenToKVPool.set_mla_kv_buffer
+            and type(self)._write_mla_kv_buffer is MLATokenToKVPool._write_mla_kv_buffer
+            and type(self)._scatter_mla_rows is MLATokenToKVPool._scatter_mla_rows
+            and not self.requires_physical_write_loc
+            and self._write_loc_dcp_span == get_parallel().attn_dcp_size
+        )
+
+    def owned_write_rows(self, loc: torch.Tensor) -> torch.Tensor:
+        """``loc`` as this rank's rows, -1 at the reserved slot 0 or another rank's."""
+        span = self._write_loc_dcp_span
+        owned = (loc % span == get_parallel().attn_dcp_rank) & (loc != 0)
+        return torch.where(owned, loc // span, -1)
+
     def _scatter_mla_rows(
         self,
         dst_buffer: torch.Tensor,

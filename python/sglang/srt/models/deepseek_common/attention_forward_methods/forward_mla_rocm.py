@@ -48,7 +48,7 @@ from sglang.srt.lora.deepseek_mla_correction import (
     is_kv_b_lora_active,
 )
 from sglang.srt.mem_cache.hisparse_memory_pool import HiSparseDSATokenToKVPool
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc, MLATokenToKVPool
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
     get_kv_layers,
@@ -495,22 +495,15 @@ def _fused_rope_cat_and_cache(
 
 
 def _dcp_fused_kv_write_matches_pool() -> bool:
-    """Whether the fused kernel's KV write is the pool's own: the plain MLA write
-    door storing fp8 DSA rows at DCP-widened locs."""
+    """Whether the fused kernel's KV write is the pool's own: fp8 DSA rows."""
     pool = get_token_to_kv_pool()
     return (
-        type(pool).set_mla_kv_buffer is MLATokenToKVPool.set_mla_kv_buffer
-        and type(pool)._write_mla_kv_buffer is MLATokenToKVPool._write_mla_kv_buffer
-        and not pool.requires_physical_write_loc
-        and pool.use_dsa
-        and pool.dtype == fp8_dtype
-        and pool._write_loc_dcp_span == get_parallel().attn_dcp_size
+        pool.supports_external_mla_kv_write and pool.use_dsa and pool.dtype == fp8_dtype
     )
 
 
 def _dcp_owned_cache_loc(forward_batch: ForwardBatch) -> torch.Tensor:
-    """``out_cache_loc`` as this rank's KV rows, -1 where another rank owns the
-    slot or at the reserved slot 0: the rule ``set_mla_kv_buffer`` applies.
+    """``out_cache_loc`` as this rank's KV rows, by the pool's own mapping.
 
     Computed once per batch. A memo from a warmup run is not reused under graph
     capture, where it would be a constant in the graph.
@@ -519,9 +512,7 @@ def _dcp_owned_cache_loc(forward_batch: ForwardBatch) -> torch.Tensor:
     capturing = torch.cuda.is_current_stream_capturing()
     memo = getattr(forward_batch, "_dcp_owned_cache_loc", None)
     if memo is None or memo[0] is not loc or memo[1] != capturing:
-        parallel = get_parallel()
-        owned = (loc % parallel.attn_dcp_size == parallel.attn_dcp_rank) & (loc != 0)
-        memo = (loc, capturing, torch.where(owned, loc // parallel.attn_dcp_size, -1))
+        memo = (loc, capturing, get_token_to_kv_pool().owned_write_rows(loc))
         forward_batch._dcp_owned_cache_loc = memo
     return memo[2]
 
