@@ -1182,7 +1182,7 @@ class PrefillAdder:
         """Slot-count admission for the STATIC hybrid mamba pool (0 elsewhere).
 
         The static pool has no shared-gap token coupling, so
-        `_state_slot_reserve_for_req` charges it nothing — without this slot
+        `_state_slots_for_req` charges it nothing -- without this slot
         budget a burst of cold requests (each allocating running + ping-pong =
         cold_factor slots) over-admits past the pool and dies in the fail-loud
         mamba allocator assert. Warm fixed-system-prompt requests hold a single

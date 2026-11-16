@@ -635,24 +635,19 @@ class TestStaticMambaSlotBudget(CustomTestCase):
 
 
 class TestMambaGapBudget(CustomTestCase):
-    """Shared-pool state-slot budget (`_state_slot_reserve_for_req`,
-    `memory_budget.state_slot_cost > 0` under --enable-unified-memory).
-    Regression for the crash class: the body referenced
-    is_system_prefix_warm/cold_factor without importing them, and no test
-    covered the shared-pool path until now. On main the request fields live on
-    req.kv (ReqKvInfo), the cost lives on the memory budget, and the cold
-    factor derives from the pool's mamba_initial_tracking_slots."""
+    """Shared-pool state-slot charging on this main: `_state_slots_for_req`
+    delegates to `memory_budget.request_state_slots`, whose single source of
+    truth for the warm/cold split is `StateStorage.pending_request_slots`
+    (a warm fixed-system-prompt request charges its running slot only --
+    sentinel ping-pong buffer; a cold one the full running + tracking cost).
+    Regression for the crash class: a cold request must never be admitted on
+    a single free slot and then crash-allocate its tracking slots."""
 
-    def _adder(self, lazy: bool = False):
+    def _table(self, lazy: bool = False):
         return SimpleNamespace(
-            memory_budget=SimpleNamespace(state_slot_cost=64),
-            _system_prompt_budget=True,
-            _static_mamba_slots=False,
-            tree_cache=SimpleNamespace(
-                req_to_token_pool=SimpleNamespace(
-                    mamba_initial_tracking_slots=1 if lazy else 2
-                )
-            ),
+            enable_mamba_extra_buffer=True,
+            enable_mamba_extra_buffer_lazy=lazy,
+            mamba_initial_tracking_slots=1 if lazy else 2,
         )
 
     def _req(self, boundary, prefix_len=0, branching=None, holds_mamba=False):
@@ -661,76 +656,63 @@ class TestMambaGapBudget(CustomTestCase):
             prefix_len=prefix_len,
             mamba_branching_seqlen=branching,
             mamba_host_hit_length=0,
-            kv=SimpleNamespace(holds_mamba=holds_mamba),
+            kv=SimpleNamespace(
+                holds_mamba=holds_mamba, mamba_ping_pong_track_buffer=None
+            ),
         )
 
-    def _budget(self, adder, req, fresh_cow=False):
-        from sglang.srt.managers.schedule_policy import PrefillAdder
+    def _pending(self, table, req):
+        from sglang.srt.mem_cache.kv.state_storage import StateStorage
 
-        return PrefillAdder._state_slot_reserve_for_req(
-            adder, req, fresh_cow=fresh_cow
-        )
+        storage = StateStorage.__new__(StateStorage)
+        return StateStorage.pending_request_slots(storage, table, req)
 
     def test_warm_charged_single_slot(self):
-        # Boundary covered, no branching: running slot only -> 1 x cost.
-        self.assertEqual(self._budget(self._adder(), self._req(64, 64, None)), 64)
+        # Boundary covered, no branching: running slot only (sentinel
+        # ping-pong, no tracking charge).
+        self.assertEqual(self._pending(self._table(), self._req(64, 64, None)), 1)
 
     def test_cold_charged_full_factor(self):
-        # No boundary coverage -> running + ping-pong (3, or 2 lazy) x cost.
-        self.assertEqual(self._budget(self._adder(), self._req(64, 0, None)), 192)
-        self.assertEqual(self._budget(self._adder(), self._req(None, 0, None)), 192)
-        self.assertEqual(self._budget(self._adder(lazy=True), self._req(64, 0, None)), 128)
+        # No boundary coverage -> running + initial tracking (3, or 2 lazy).
+        self.assertEqual(self._pending(self._table(), self._req(64, 0, None)), 3)
+        self.assertEqual(self._pending(self._table(), self._req(None, 0, None)), 3)
+        self.assertEqual(self._pending(self._table(lazy=True), self._req(64, 0, None)), 2)
 
     def test_zero_when_state_held(self):
-        # Already holds a slot and no fresh COW -> no new gap to reserve.
+        # Already holds a slot -> no new running charge (its tracking slots,
+        # if any, are still charged below).
         self.assertEqual(
-            self._budget(self._adder(), self._req(64, 0, None, holds_mamba=True)), 0
+            self._pending(self._table(), self._req(64, 0, None, holds_mamba=True)), 2
         )
 
-    def test_fresh_cow_charged_despite_state_held(self):
-        # The match COW binds the request's slot before the budget runs;
-        # fresh_cow must still charge (warm 1x, cold 3x) — the shared-pool
-        # twin of the fresh_cow budget fix.
-        self.assertEqual(
-            self._budget(
-                self._adder(), self._req(64, 64, None, holds_mamba=True), fresh_cow=True
-            ),
-            64,
-        )
-        self.assertEqual(
-            self._budget(
-                self._adder(), self._req(64, 100, 64, holds_mamba=True), fresh_cow=True
-            ),
-            192,
-        )
-
-    def test_zero_without_shared_pool(self):
-        adder = SimpleNamespace(
-            memory_budget=SimpleNamespace(state_slot_cost=0),
-            _system_prompt_budget=True,
-            _static_mamba_slots=True,
-            tree_cache=None,
-        )
-        self.assertEqual(self._budget(adder, self._req(None, 0, None)), 0)
+    def test_no_tracking_charge_once_buffer_held(self):
+        req = self._req(64, 0, None)
+        req.kv.mamba_ping_pong_track_buffer = "held"
+        self.assertEqual(self._pending(self._table(), req), 1)
 
     def test_feature_off_is_exact_baseline(self):
-        # H4 gating: with the flag off the gap budget must reproduce the
-        # unpatched baseline — flat cost for a slot-less request, 0 for one
-        # that already holds a slot (no fresh_cow extension, no cold factor).
-        adder = self._adder()
-        adder._system_prompt_budget = False
-        self.assertEqual(self._budget(adder, self._req(64, 0, None)), 64)
-        self.assertEqual(self._budget(adder, self._req(None, 0, None)), 64)
-        # Held slot: baseline guard returns 0 even with fresh_cow set.
-        self.assertEqual(
-            self._budget(adder, self._req(64, 0, None, holds_mamba=True)), 0
+        # Without --system-prompt every request is cold-charged: the plain
+        # running + tracking count (the unpatched acquire behavior).
+        self.assertEqual(self._pending(self._table(), self._req(None, 0, None)), 3)
+
+    def test_delegation_through_state_slots_for_req(self):
+        # `_state_slots_for_req` delegates to the memory budget and adds the
+        # host-hit length; 0 when the budget has no state slots at all.
+        from sglang.srt.managers.schedule_policy import PrefillAdder
+
+        adder = SimpleNamespace(
+            memory_budget=SimpleNamespace(
+                has_state_slots=True,
+                request_state_slots=lambda req: 3,
+            )
         )
+        req = self._req(64, 0, None)
+        req.mamba_host_hit_length = 5
         self.assertEqual(
-            self._budget(
-                adder, self._req(64, 0, None, holds_mamba=True), fresh_cow=True
-            ),
-            0,
+            PrefillAdder._state_slots_for_req(adder, req, include_host_hit=True), 8
         )
+        adder.memory_budget.has_state_slots = False
+        self.assertEqual(PrefillAdder._state_slots_for_req(adder, req), 0)
 
 
 class TestCappedCheckpointKeepsMatchedPages(CustomTestCase):
@@ -785,7 +767,7 @@ class TestCappedCheckpointKeepsMatchedPages(CustomTestCase):
         class _FakeKv:
             def __init__(self, protected):
                 self.req_pool_idx = 0
-                self.swa_evict_floor = 0
+                self.window_evict_floor = 0
                 self.cache_inserted_len = 0
                 self.cache_protected_len = protected
 
@@ -883,7 +865,7 @@ class TestMambaAuditWithBareTreeCache(CustomTestCase):
 
         fake_scheduler = SimpleNamespace(
             _mamba_audit_last_ts=0.0,
-            req_to_token_pool=SimpleNamespace(
+            token_to_kv_pool_allocator=SimpleNamespace(
                 mamba_allocator=SimpleNamespace(
                     debug_stats=lambda: {
                         "size": 9,

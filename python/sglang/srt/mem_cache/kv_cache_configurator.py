@@ -3241,8 +3241,8 @@ class KVCacheConfigurator:
         # state and only hold a single running mamba slot — no ping-pong, no
         # suffix tracking/donation (see is_system_prefix_warm). The rare cold
         # request (warm-up pass / post-eviction) still needs extra slots, but
-        # those are throttled per-request at admission (_state_slot_reserve_for_req
-        # and alloc_req_slots), so the global cap can use ratio 1 — matching
+        # those are throttled per-request at admission (_state_slots_for_req
+        # and ensure_mamba_capacity), so the global cap can use ratio 1 — matching
         # the no-radix case but retaining prefix reuse.
         if self.server_args.system_prompt:
             return 1  # AFTER: ratio 1 (warm holds 1 running slot)
