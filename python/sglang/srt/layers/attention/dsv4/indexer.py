@@ -520,7 +520,6 @@ def topk_transform_paged_from_metadata(
 class C4IndexerBackendMixin:
     def __init__(self):
         super().__init__()
-        self.debug_use_external_c4_sparse_indices: bool = False
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.SGL_KERNEL
         self.flashinfer_topk_transform: Callable[..., None] = (
             topk_transform_flashinfer_fused
@@ -922,8 +921,6 @@ class C4IndexerBackendMixin:
                 c4_seq_lens=c4_seq_lens,
                 query_rows=query_rows,
             )
-        if self.debug_use_external_c4_sparse_indices:
-            return
 
         indexer_capturer = get_global_indexer_capturer()
         capture_enabled = indexer_capturer is not None
