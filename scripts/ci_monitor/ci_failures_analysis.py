@@ -26,7 +26,6 @@ from typing import Dict, List, Optional, Tuple
 
 import requests
 
-
 _RETIRED_AMD_PR_JOBS = {
     "sgl-kernel-unit-test-amd",
     "sgl-kernel-unit-test-2-gpu-amd",
