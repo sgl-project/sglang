@@ -559,6 +559,9 @@ class Ernie5_5Moe(nn.Module):
             prefix=add_prefix("fc2_latent_proj", prefix),
         )
         self.latent_norm = RMSNorm(latent_size, eps=config.rms_norm_eps)
+        self.top_k = config.num_experts_per_tok
+        self.intermediate_size = config.moe_intermediate_size
+        self._use_mega_moe = get_moe_a2a_backend().is_megamoe()
 
     def _route(self, hidden_states, gating_output, topk, renormalize):
         # gating_output is the raw [T, 2E] gate|gate_1 GEMM output.
@@ -571,13 +574,60 @@ class Ernie5_5Moe(nn.Module):
             num_routers=2,
         )
 
+    def mega_moe_buffer(self):
+        from sglang.srt.layers.moe.mega_moe import (
+            _get_mega_moe_symm_buffer,
+            _mega_moe_mma_type,
+        )
+
+        return _get_mega_moe_symm_buffer(
+            get_parallel().moe_ep_group.device_group,
+            num_experts=self.experts.num_experts,
+            num_max_tokens_per_rank=(
+                envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK.get()
+            ),
+            num_topk=self.top_k,
+            hidden=self.latent_size,
+            intermediate_hidden=self.intermediate_size,
+            mma_type=_mega_moe_mma_type(self.experts),
+            activation="situ",
+        )
+
+    def _run_experts(self, latent: torch.Tensor, topk_output) -> torch.Tensor:
+        if not self._use_mega_moe:
+            return self.experts(latent, topk_output)
+        from sglang.srt.layers.moe.mega_moe import (
+            is_mega_moe_experts_ready,
+            run_mega_routed_experts,
+        )
+
+        if not is_mega_moe_experts_ready(self.experts):
+            raise RuntimeError(
+                "--moe-a2a-backend megamoe needs MXFP4 routed experts on an SM100 "
+                "GPU; load an FP4-expert checkpoint."
+            )
+        # The router weights already carry per_expert_scale: no routed scaling here.
+        return run_mega_routed_experts(
+            self.experts,
+            latent,
+            topk_output.topk_ids,
+            topk_output.topk_weights,
+            hidden_size=self.latent_size,
+            intermediate_size=self.intermediate_size,
+            top_k=self.top_k,
+            num_tokens=latent.shape[0],
+            # DeepGEMM MegaMoE bakes SiTU beta=4.0/linear_beta=25.0; the checkpoint must match.
+            activation="situ",
+            buf=self.mega_moe_buffer(),
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             if get_moe_a2a_backend().is_none():
                 # Every TP rank sees the same (DP-gathered) tokens: all skip together.
                 return hidden_states
             # An all-to-all dispatch still needs this rank, tokens or not.
-            self.experts(
+            self._run_experts(
                 hidden_states.new_empty((0, self.latent_size)),
                 self.topk.empty_topk_output(
                     hidden_states.device, layer_id=self.layer_id
@@ -607,7 +657,7 @@ class Ernie5_5Moe(nn.Module):
             hidden_states, linear_bf16_fp32(hidden_states, self.gate_weight)
         )
         latent, _ = self.fc1_latent_proj(hidden_states)
-        routed = self.experts(latent, topk_output)
+        routed = self._run_experts(latent, topk_output)
         # An all-to-all combine already returns the complete sum, so all-reducing
         # it again would multiply by tp_size.
         if get_parallel().tp_size > 1 and get_moe_a2a_backend().is_none():

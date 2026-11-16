@@ -28,6 +28,7 @@ from sglang.srt.arg_groups.model_overrides.deepseek_v4 import (
 )
 from sglang.srt.configs.ernie55 import ERNIE5_5_MOE_ARCH
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_sm100_supported
 
 logger = logging.getLogger(__name__)
 
@@ -35,8 +36,8 @@ logger = logging.getLogger(__name__)
 # and the memory budget follows the same choice, so no other KV dtype is servable.
 _SUPPORTED_KV_CACHE_DTYPES = ("auto", "fp8_e4m3", "bfloat16")
 
-# DSpark with DP attention is validated on DeepEP here; MegaMoE is rejected below.
-register_dspark_dp_a2a_backends(ERNIE5_5_MOE_ARCH, ("none", "deepep"))
+# DSpark with DP attention is validated on DeepEP and MegaMoE here.
+register_dspark_dp_a2a_backends(ERNIE5_5_MOE_ARCH, ("none", "deepep", "megamoe"))
 
 
 def _validate_features(cfg: Any) -> None:
@@ -68,15 +69,15 @@ def _validate_features(cfg: Any) -> None:
         # while the MLA layers keep none.
         if enabled:
             raise ValueError(f"ERNIE 5.5 Flash does not support {flag}")
+    if cfg.moe_a2a_backend == "megamoe" and not is_sm100_supported():
+        # The SM90 FP8 and ROCm MegaMoE kernels compute SwiGLU; these experts use
+        # SiTU, which only the SM100 DeepGEMM kernel implements.
+        raise ValueError(
+            "ERNIE 5.5 Flash runs --moe-a2a-backend megamoe on SM100 GPUs only"
+        )
     if cfg.enable_hisparse:
         # HiSparse knows the compressed-KV sub-pools, not the MLA layers' latent one.
         raise ValueError("ERNIE 5.5 Flash does not support --enable-hisparse")
-    if cfg.moe_a2a_backend == "megamoe":
-        # The MegaMoE kernel hardcodes SwiGLU; these experts use SiTU.
-        raise ValueError(
-            "ERNIE 5.5 Flash does not support --moe-a2a-backend megamoe; "
-            "use deepep or none"
-        )
     for flag, value in (
         ("--dsa-prefill-backend", cfg.dsa_prefill_backend),
         ("--dsa-decode-backend", cfg.dsa_decode_backend),

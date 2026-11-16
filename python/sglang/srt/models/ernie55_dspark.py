@@ -166,12 +166,12 @@ class Ernie5_5DSparkStage(Ernie5_5DecoderLayer):
     ):
         super().__init__(config, stage_id, quant_config, prefix, alt_streams)
         if stage_id == 0:
-            # Shipped in bf16, so it takes no quant config.
+            # An older export ships this in bf16; the weight loader quantizes it.
             self.main_proj = ReplicatedLinear(
                 config.hidden_size * num_target_layers,
                 config.hidden_size,
                 bias=False,
-                quant_config=None,
+                quant_config=quant_config,
                 prefix=add_prefix("main_proj", prefix),
             )
             self.main_norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -387,7 +387,9 @@ class _Ernie5_5DSparkWeightLoader(Ernie5_5WeightLoader):
     # The draft attention keeps wq_a and wkv apart, which _HCA_UNFUSED_QKV_A loads.
     _HCA_STACKED = {}
     _DRAFT_RENAMES = {
-        "model.mtp.feature_projection.weight": "stages.0.main_proj.weight",
+        "model.mtp.feature_projection.weight_scale_inv": (
+            "stages.0.main_proj.weight_scale_inv"
+        ),
         "model.mtp.feature_norm.weight": "stages.0.main_norm.weight",
         "model.mtp.norm.weight": "norm.weight",
         "model.mtp.mhc_contract.hc_head_fn": "hc_head.fn",
@@ -411,7 +413,25 @@ class _Ernie5_5DSparkWeightLoader(Ernie5_5WeightLoader):
             () if model.confidence_head is not None else ("confidence_head.",)
         )
 
+    def _load_main_proj(self, tensor: torch.Tensor) -> None:
+        name = "stages.0.main_proj.weight"
+        param = self.params[name]
+        if param.dtype != torch.float8_e4m3fn or tensor.dtype == torch.float8_e4m3fn:
+            self._load(name, tensor)
+            return
+        from sglang.srt.layers.quantization.fp8_utils import per_block_cast_to_fp8
+
+        # A bf16 export meets an fp8 module: quantize it as the fp8 export would.
+        quantized, scale = per_block_cast_to_fp8(
+            tensor.to(device=param.device, dtype=torch.bfloat16)
+        )
+        self._load(name, quantized)
+        self._load("stages.0.main_proj.weight_scale_inv", scale)
+
     def load(self, name: str, tensor: torch.Tensor) -> None:
+        if name == "model.mtp.feature_projection.weight":
+            self._load_main_proj(tensor)
+            return
         if name in self._DRAFT_TRANSPOSED:
             target = self._DRAFT_TRANSPOSED[name]
             self.params[target].data.copy_(tensor.t())
