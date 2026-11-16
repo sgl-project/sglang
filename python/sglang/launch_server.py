@@ -43,7 +43,7 @@ def run_server(server_args):
             launch_server(server_args)
     elif cfg.smg_grpc_mode:
         # Legacy SMG gRPC server (--smg-grpc-mode, or the deprecated --grpc-mode
-        # which __post_init__ folds into smg_grpc_mode). The native Rust gRPC
+        # which resolution folds into smg_grpc_mode). The native Rust gRPC
         # server is a separate path, enabled by --grpc-port, that starts
         # alongside the default HTTP server below.
         from sglang.srt.entrypoints.grpc_server import serve_grpc
