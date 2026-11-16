@@ -16,6 +16,12 @@ SERVED_ELSEWHERE = {
     "/metrics/",
     "/metrics/{path:path}",
     "/internal/peer",
+    # diffusion management routes are exercised by test/unit/test_http_auth.py
+    "/v1/set_lora",
+    "/v1/merge_lora_weights",
+    "/v1/unmerge_lora_weights",
+    "/update_weights_from_tensor_checker",
+    "/get_weights_checksum",
 }
 
 
