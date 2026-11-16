@@ -2463,17 +2463,6 @@ class DeepSeekV4TokenToKVPool(BaseSWAKVPool):
             compress_layer_id, loc, cache_k, freqs_cis
         )
 
-    def set_index_k_fused(
-        self,
-        layer_id: int,
-        loc: torch.Tensor,
-        cache_k: torch.Tensor,
-    ) -> None:
-        compress_ratio, compress_layer_id, _ = self.layer_mapping[layer_id]
-        return self._indexer_pool(compress_ratio).set_index_fused(
-            compress_layer_id, loc, cache_k
-        )
-
     def set_index_k_fp4(
         self,
         layer_id: int,
