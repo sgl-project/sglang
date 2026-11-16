@@ -140,7 +140,7 @@ def _populate_slo_ms_from_warmups(
     if base_time_ms is None:
         return requests_list
 
-    slo_scale = float(getattr(args, "slo_scale", 3.0))
+    slo_scale = float(args.slo_scale)
     if slo_scale <= 0:
         raise ValueError(f"slo_scale must be positive, got {slo_scale}.")
 
@@ -210,7 +210,6 @@ async def async_request_image_sglang(
             async with session.post(input.api_url, data=data) as response:
                 if response.status == 200:
                     resp_json = await response.json()
-                    output.response_body = resp_json
                     output.success = True
                     output.output_count = _get_response_output_count(resp_json)
                     if "peak_memory_mb" in resp_json:
@@ -242,7 +241,6 @@ async def async_request_image_sglang(
             async with session.post(input.api_url, json=payload) as response:
                 if response.status == 200:
                     resp_json = await response.json()
-                    output.response_body = resp_json
                     output.success = True
                     output.output_count = _get_response_output_count(resp_json)
                     if "peak_memory_mb" in resp_json:
@@ -395,7 +393,6 @@ async def async_request_video_sglang(
                     status = status_data.get("status")
                     if status == "completed":
                         output.success = True
-                        output.response_body = status_data
                         output.output_count = _get_response_output_count(status_data)
                         if "peak_memory_mb" in status_data:
                             output.peak_memory_mb = status_data["peak_memory_mb"]
@@ -488,7 +485,7 @@ def calculate_metrics(
             {
                 "slo_attainment_rate": slo_attain_all,
                 "slo_met_success": slo_met_success,
-                "slo_scale": getattr(args, "slo_scale", 3.0),
+                "slo_scale": args.slo_scale,
             }
         )
 

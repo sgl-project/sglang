@@ -68,7 +68,6 @@ class BatchOutput:
     """Container for batch generation results."""
 
     latency: float = 0.0
-    latency_per_sample: float = 0.0
     num_samples: int = 0
     total_frames: int = 0
     peak_memory_mb: float = 0.0
@@ -288,7 +287,6 @@ def initialize_engine(server_args: ServerArgs) -> DiffGenerator:
 
 def generate_batch(
     engine: DiffGenerator,
-    bench_args: BenchArgs,
     prompts: List[str],
     user_sampling_params: List[Dict[str, Any]],
     request_ids: Optional[List[str]] = None,
@@ -364,7 +362,6 @@ def generate_batch(
             )
 
     output.latency = time.perf_counter() - start_time
-    output.latency_per_sample = output.latency / len(prompts) if prompts else 0.0
     output.success = output.num_samples > 0
     output.peak_memory_mb = torch.get_device_module().max_memory_allocated() / (
         1024 * 1024
@@ -555,7 +552,6 @@ def throughput_test(
         ]
         generate_batch(
             engine,
-            bench_args,
             warmup_prompts,
             warmup_sampling_params,
             request_ids=[
@@ -583,7 +579,6 @@ def throughput_test(
 
         batch_output = generate_batch(
             engine,
-            bench_args,
             batch_prompts,
             batch_sampling_params,
             request_ids=batch_request_ids,

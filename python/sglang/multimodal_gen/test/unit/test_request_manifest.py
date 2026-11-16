@@ -185,7 +185,6 @@ def test_generate_batch_records_request_id_output_path_and_digest(
 
     output = generate_batch(
         FakeEngine(),
-        BenchArgs(),
         prompts=["A moving test pattern"],
         user_sampling_params=[{"num_frames": 17, "seed": 42}],
         request_ids=["video-1"],
