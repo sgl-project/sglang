@@ -1,11 +1,14 @@
 """StorageBackendFactory builds the hf3fs backend only for host layouts it can size a page for."""
 
+import json
+import tempfile
 import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.storage import StorageBackendFactory
 from sglang.srt.mem_cache.storage.hf3fs.storage_hf3fs import HiCacheHF3FS
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -47,6 +50,20 @@ class TestHf3fsBackendLayouts(CustomTestCase):
                         "hf3fs", None, _host_pool(layout)
                     )
             self.assertEqual(from_env_config.call_count, 3)
+
+
+class TestHf3fsEnvConfig(CustomTestCase):
+    def test_config_path_env_var_selects_the_json_config(self):
+        """SGLANG_HICACHE_HF3FS_CONFIG_PATH is the documented switch from the
+        single-machine default to a JSON config, which is then validated."""
+        with tempfile.NamedTemporaryFile("w", suffix=".json") as config_file:
+            json.dump({"file_size": 1 << 20}, config_file)
+            config_file.flush()
+            with (
+                envs.SGLANG_HICACHE_HF3FS_CONFIG_PATH.override(config_file.name),
+                self.assertRaisesRegex(ValueError, "Missing required keys"),
+            ):
+                HiCacheHF3FS.from_env_config(bytes_per_page=16, dtype=torch.uint8)
 
 
 if __name__ == "__main__":
