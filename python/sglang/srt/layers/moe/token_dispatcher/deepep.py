@@ -4,7 +4,6 @@ import inspect
 import logging
 import os
 from contextlib import nullcontext
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, NamedTuple, Optional, Tuple, Union
 
 from sglang.srt.environ import envs
@@ -30,7 +29,6 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import (
-    get_bool_env_var,
     get_cuda_version,
     is_blackwell,
     is_flashinfer_available,
@@ -72,7 +70,7 @@ import torch.distributed as dist
 
 from sglang.srt.runtime_context import get_resources
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and is_hip()
+_use_aiter = envs.SGLANG_USE_AITER.get() and is_hip()
 
 logger = logging.getLogger(__name__)
 
@@ -978,7 +976,6 @@ class _DeepEPDispatcherImplLowLatency(_DeepEPDispatcherImplBase):
         )
 
 
-@dataclass
 class _Stage(Enum):
     INITIAL = auto()
     AFTER_DISPATCH_A = auto()
