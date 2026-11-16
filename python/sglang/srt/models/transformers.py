@@ -83,8 +83,10 @@ def can_enable_torch_compile(config: PretrainedConfig) -> bool:
     rope_params = getattr(text_config, "rope_parameters", None)
     if isinstance(rope_params, dict):
         if isinstance(next(iter(rope_params.values()), None), dict):
+            # Layer types without RoPE (e.g. NoPE full attention) map to None.
             return not any(
-                rp.get("rope_type") == "dynamic" for rp in rope_params.values()
+                isinstance(rp, dict) and rp.get("rope_type") == "dynamic"
+                for rp in rope_params.values()
             )
         if rope_params.get("rope_type") == "dynamic":
             return False
