@@ -19,6 +19,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
@@ -254,6 +255,30 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
             self.assertEqual(len(loaded_conv), len(expected_conv))
             for actual_conv, expected_conv_buf in zip(loaded_conv, expected_conv):
                 self.assertTrue(torch.equal(actual_conv, expected_conv_buf))
+        cache.sanity_check()
+
+    @requires_hicache
+    def test_load_back_commits_once_through_commit_load_back(self):
+        cache, allocator, req_to_token_pool = self._build_hicache_fixture()
+        base = self._make_seq(1, 2)
+        self._insert(cache, allocator, req_to_token_pool, base)
+        node = match_prefix(cache, base).last_device_node
+        self._backup_node(cache, node)
+        cache.evict(EvictParams(num_tokens=len(base)))
+
+        with mock.patch.object(
+            cache, "_commit_load_back", wraps=cache._commit_load_back
+        ) as commit:
+            # An aborted load-back never reaches the commit.
+            self.assertFalse(cache.load_back(node, mem_quota=-(10**9)))
+            commit.assert_not_called()
+            self._load_back_node(cache, node)
+
+        commit.assert_called_once()
+        committed_node, committed_indices = commit.call_args.args[:2]
+        self.assertEqual(committed_node, node)
+        # The load refilled the whole evicted path, so the commit gets all its pages.
+        self.assertTrue(torch.equal(committed_indices, cache.path_device_indices(node)))
         cache.sanity_check()
 
     @requires(
@@ -1003,7 +1028,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
             ) as evict_for_alloc,
         ):
             prep = comp.prepare_load_back(leaf, req=req)
-        evict_for_alloc.assert_called_once_with(EvictParams(num_tokens=0, mamba_num=1))
+        evict_for_alloc.assert_called_once_with(KVDemand(state_slots=1))
         self.assertIs(prep.allocated_mamba_slot, retry_slot)
         self.assertEqual(int(req.kv.mamba_pool_idx), int(retry_slot[0]))
 
@@ -1183,6 +1208,8 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
             ComponentType.FULL, leaf, CacheTransferPhase.LOAD_BACK
         )[0]
         self.assertEqual(int(kv_xfer.host_indices.numel()), kv_tokens)
+        # Admission sizes a load-back by the rows this transfer copies.
+        self.assertEqual(cache.full_load_back_tokens(leaf), kv_tokens)
 
         swa_xfer = cache.tree_core.build_hicache_transfers(
             ComponentType.SWA, leaf, CacheTransferPhase.LOAD_BACK
@@ -1226,7 +1253,7 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         full_pre_evict_calls = [
             call
             for call in evict_for_alloc_mock.call_args_list
-            if call.args and call.args[0].num_tokens > 0
+            if call.args and call.args[0].full_tokens > 0
         ]
         self.assertEqual(full_pre_evict_calls, [])
 
@@ -1234,8 +1261,8 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
         self.assertTrue(
             any(
                 call.args
-                and call.args[0].num_tokens == 0
-                and sum(call.args[0].window_num_tokens.values()) > 0
+                and call.args[0].full_tokens == 0
+                and sum(call.args[0].window_tokens.values()) > 0
                 for call in evict_for_alloc_mock.call_args_list
             )
         )
@@ -1274,6 +1301,61 @@ class TestInflightAnchorStillLoads(CustomTestCase):
             InitLoadBackParams(best_match_node=7, host_hit_length=1, req=req),
         )
         self.assertEqual(loaded, (2, 7))
+
+
+class TestHostOnlyConcurrentFetch(CustomTestCase):
+    def _init_load_back(self, *, evicted, host_hit, window_hit):
+        from types import SimpleNamespace
+
+        from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+        loads = []
+        cache = SimpleNamespace(
+            buffer_pipeline=None,
+            linker=None,
+            _mamba_host_only_checkpoint=lambda: True,
+            ongoing_load_back={7: [object()]},
+            tree_core=SimpleNamespace(
+                is_full_device_evicted=lambda _node_id: evicted,
+                collect_full_device_indices=lambda *_a, **_k: torch.tensor([1, 2]),
+            ),
+            load_back=lambda *a, **k: loads.append(a) or True,
+        )
+        req = SimpleNamespace(
+            last_node=3,
+            rid="r",
+            mamba_host_hit_length=1,
+            window_host_hit_lengths={"swa": window_hit},
+        )
+        loaded = UnifiedRadixCache.init_load_back(
+            cache,
+            InitLoadBackParams(best_match_node=7, host_hit_length=host_hit, req=req),
+        )
+        return loaded, loads
+
+    def test_only_a_state_only_fetch_goes_beside_the_inflight_anchor(self):
+        from sglang.srt.environ import envs
+
+        cases = [
+            (dict(evicted=False, host_hit=0, window_hit=0), True),
+            (dict(evicted=True, host_hit=0, window_hit=0), False),
+            (dict(evicted=False, host_hit=1, window_hit=0), False),
+            (dict(evicted=False, host_hit=0, window_hit=1), False),
+        ]
+        for master, child in [(False, True), (True, True)]:
+            for kwargs, state_only in cases:
+                with (
+                    self.subTest(master=master, child=child, **kwargs),
+                    envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master),
+                    envs.SGLANG_OPT_MAMBA_HOST_ONLY_CONCURRENT_FETCH.override(child),
+                ):
+                    loaded, loads = self._init_load_back(**kwargs)
+                    if master and child and state_only:
+                        self.assertEqual(loaded, (2, 7))
+                        self.assertEqual(len(loads), 1)
+                    else:
+                        self.assertIsNone(loaded)
+                        self.assertEqual(loads, [])
 
 
 define_config_test_classes(UnifiedRadixCacheLoadBackSuite, globals())

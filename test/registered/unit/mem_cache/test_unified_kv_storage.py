@@ -88,11 +88,11 @@ class TestPlanNames(CustomTestCase):
 
     def test_sub_pools_and_wire_entries_per_chain(self):
         expected = {
-            "swa": (("full", "kv", "FULL"), ("window_32", "swa", "WINDOW_32")),
+            "swa": (("full", "kv", "FULL"), ("window_32", "window_32", "WINDOW_32")),
             "mamba": (("full", "kv", "FULL"), ("mamba", "mamba", "MAMBA")),
             "tri": (
                 ("full", "kv", "FULL"),
-                ("window_32", "swa", "WINDOW_32"),
+                ("window_32", "window_32", "WINDOW_32"),
                 ("mamba", "mamba", "MAMBA"),
             ),
         }
@@ -310,7 +310,7 @@ def _host_pool_recorders():
 
 
 class TestHostStack(CustomTestCase):
-    def _build(self, name, *, backend):
+    def _build(self, name, *, backend, hicache_size=0):
         bundle = _bundle(name)
         allocator = bundle.token_to_kv_pool_allocator
         # The tree's components, numbered as the storage's slots number them.
@@ -330,7 +330,7 @@ class TestHostStack(CustomTestCase):
         )
         memory = SimpleNamespace(
             hicache_ratio=2.0,
-            hicache_size=0,
+            hicache_size=hicache_size,
             hicache_mem_layout="page_first",
             hicache_storage_backend=backend,
             hicache_write_policy="write_through",
@@ -370,7 +370,7 @@ class TestHostStack(CustomTestCase):
         result, controller, cache = self._build("swa", backend=None)
         storage = cache.token_to_kv_pool_allocator.storage
         kv, swa = result.host_pool_group.entry_map.values()
-        self.assertEqual((kv.name, swa.name), (PoolName.KV, PoolName.SWA))
+        self.assertEqual((kv.name, swa.name), (PoolName.KV, "window_32"))
         for entry, sub_pool in ((kv, "full"), (swa, "window_32")):
             self.assertEqual(entry.host_pool.kind, "envelope")
             self.assertEqual(entry.host_pool.name, sub_pool)
@@ -386,7 +386,7 @@ class TestHostStack(CustomTestCase):
         swa.device_evict_fn(1 << 30)
         ((kind, params),) = cache.calls
         self.assertEqual(kind, "device")
-        self.assertGreater(sum(params.window_num_tokens.values()), 0)
+        self.assertGreater(sum(params.window_tokens.values()), 0)
         self.assertEqual(controller["transfer_layer_id_max"], 4)
 
     def test_host_transfers_translate_through_the_storage(self):
@@ -425,11 +425,33 @@ class TestHostStack(CustomTestCase):
                     self.assertEqual(entry.device_translate, storage.host_ids(sub_pool))
                 self.assertEqual(seen, set(storage.sub_pool_names()))
 
+    def _host_sizes(self, pinned, master=True):
+        from sglang.srt.environ import envs
+
+        with (
+            envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(master),
+            envs.SGLANG_HICACHE_MAMBA_SIZE_GB.override(pinned),
+        ):
+            result, _, _ = self._build("mamba", backend=None, hicache_size=10)
+        return {
+            name: entry.host_pool.host_size
+            for name, entry in result.host_pool_group.entry_map.items()
+        }
+
+    def test_pinned_state_host_share_takes_its_gb_and_the_rest_splits(self):
+        stock = self._host_sizes(None)
+        (kv, state) = stock
+        self.assertEqual(self._host_sizes(3, master=False), stock)
+        self.assertEqual(self._host_sizes(3), {kv: 7.0, state: 3.0})
+        for bad in (0, 10, 12):
+            with self.assertRaises(ValueError):
+                self._host_sizes(bad)
+
     def test_owner_host_pool_is_named_by_its_sub_pool(self):
         result, _, _ = self._build("swa", backend="file")
         self.assertEqual(
             [e.name for e in result.host_pool_group.entry_map.values()],
-            [PoolName.KV, PoolName.SWA],
+            [PoolName.KV, "window_32"],
         )
 
 

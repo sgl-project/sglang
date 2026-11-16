@@ -72,8 +72,10 @@ class TestMiniMaxIndexerCPGate(CustomTestCase):
         enabled = {
             (4, 4, 1, 1): True,
             (8, 8, 1, 1): True,  # head pairs replicated across ranks
+            (8, 4, 1, 2): True,  # attention DP2: CP over each replica's TP4 group
             (2, 2, 1, 1): False,  # two index heads per rank
-            (8, 4, 1, 2): False,  # DP attention not validated
+            (16, 8, 1, 2): False,  # not validated
+            (8, 2, 1, 4): False,  # two index heads per rank under DP
             (8, 4, 2, 1): False,
         }
         for (tp, attn_tp, attn_cp, attn_dp), expected in enabled.items():
