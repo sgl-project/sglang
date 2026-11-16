@@ -23,7 +23,7 @@ HISPARSE_ROCM_DSA_BACKENDS = {"tilelang", "triton", "aiter"}
 HISPARSE_XPU_DSA_BACKENDS_BY_DTYPE = {"bfloat16": {"intel_xpu"}}
 HISPARSE_KV_CACHE_DTYPES = ("bfloat16", "fp8_e4m3")
 
-HISPARSE_VALIDATED_SPEC_ALGORITHMS = ("EAGLE", "EAGLE3", "UNO")
+HISPARSE_VALIDATED_SPEC_ALGORITHMS = ("EAGLE", "EAGLE3", "UNO", "DFLASH")
 
 
 def _hisparse_default_backend(kv_cache_dtype: str) -> str:
