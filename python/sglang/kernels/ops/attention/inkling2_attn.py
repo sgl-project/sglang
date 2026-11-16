@@ -189,7 +189,7 @@ def _gate_sink_module(heads, head_dim, group, padded_group):
     return load_jit(
         "inkling2_gate_sink",
         *(str(v) for v in (heads, head_dim, group, padded_group)),
-        cuda_files=["attention/inkling2_gate_sink.cuh"],
+        cuda_files=["inkling2/gate_sink.cuh"],
         cuda_wrappers=[("run", f"inkling2_gate_sink::run<{args}>")],
     )
 

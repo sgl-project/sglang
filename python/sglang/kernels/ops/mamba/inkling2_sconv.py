@@ -277,7 +277,7 @@ def _sconv_module(
         "inkling2_sconv",
         *(str(v) for v in config),
         *(str(t).split(".")[-1] for t in dtypes),
-        cuda_files=["mamba/inkling2_sconv.cuh"],
+        cuda_files=["inkling2/sconv.cuh"],
         cuda_wrappers=[("run", f"inkling2_sconv::run<{args}>")],
     )
 
