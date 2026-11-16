@@ -576,31 +576,6 @@ class MossVLVisionModel(nn.Module):
         x = self.merger(x, deepstack_features)
         return x
 
-    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]) -> set:
-        stacked_params_mapping = [
-            ("attn.qkv.", "attn.q.", "q"),
-            ("attn.qkv.", "attn.k.", "k"),
-            ("attn.qkv.", "attn.v.", "v"),
-        ]
-        params_dict = dict(self.named_parameters(remove_duplicate=False))
-        loaded_params: set = set()
-
-        for name, loaded_weight in weights:
-            for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in name:
-                    continue
-                name = name.replace(weight_name, param_name)
-                param = params_dict[name]
-                weight_loader = param.weight_loader
-                weight_loader(param, loaded_weight, shard_id)
-                break
-            else:
-                param = params_dict[name]
-                weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                weight_loader(param, loaded_weight)
-            loaded_params.add(name)
-        return loaded_params
-
 
 # ==================== Cross-Attention Components ====================
 
@@ -801,10 +776,6 @@ class MossVLCrossAttentionDecoderLayer(nn.Module):
             hidden_act=config.hidden_act,
             quant_config=quant_config,
             prefix=add_prefix("mlp", prefix),
-        )
-        self.is_first_cross_attention_layer = (
-            bool(config.cross_attention_layers)
-            and layer_id == config.cross_attention_layers[0]
         )
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -1186,7 +1157,6 @@ class MossVLForConditionalGeneration(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
-        self.prefix = prefix
 
         vision_config = config.vision_config
         text_config = config.text_config
@@ -1312,7 +1282,7 @@ class MossVLForConditionalGeneration(nn.Module):
         pixel_values: torch.Tensor,
         grid_thw: torch.Tensor,
     ) -> torch.Tensor:
-        """Run ViT encoder and insert separator tokens."""
+        """Run the ViT encoder; _insert_separator_tokens adds the separators."""
         hidden_states = self.visual(pixel_values, grid_thw=grid_thw)
         # hidden_states is packed: (total_vision_tokens, hidden_size)
         return hidden_states
