@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::app::AppState;
+use super::auth::DeclaredRoute;
 use super::generate_hook::{
     GenerateFrameHook, GenerateFrameInfo, GenerateFrameKeys, GenerateHook, GenerateTerminal,
 };
@@ -489,7 +490,7 @@ impl serde::Serialize for NativeFrame {
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/generate", post(generate))
+        .declared_route("/generate", post(generate))
         .merge(health_routes())
 }
 
@@ -539,8 +540,8 @@ fn health_routes() -> Router<Arc<AppState>> {
     };
     let probe = get(move |state: State<Arc<AppState>>| health_generate(state, timeout, true));
     Router::new()
-        .route("/health", health)
-        .route("/health_generate", probe)
+        .declared_route("/health", health)
+        .declared_route("/health_generate", probe)
 }
 
 async fn health_without_generation(State(state): State<Arc<AppState>>) -> Response {
@@ -757,9 +758,6 @@ pub(super) fn generate_requests(
     // Read before the fills below: only a `max_new_tokens` the client sent is
     // checked against the context window.
     let client_max_new_tokens = ClientMaxNewTokens::of_json(&body);
-    if let Some(fields) = body.as_object_mut() {
-        crate::message::request::move_deprecated_dp_rank(fields);
-    }
     // Launch-time preferred sampling params fill in beneath the request's own
     // keys before decoding, so an explicit request value (even a default or
     // null) wins: Python TokenizerManager's precedence.
@@ -1695,9 +1693,8 @@ mod tests {
         assert!(logs.rejections().is_empty());
     }
 
-    /// `/generate` checks the DP rank a body names as Python does: the
-    /// deprecated `data_parallel_rank` when `routed_dp_rank` is unset, and a
-    /// rank outside the deployment is a 400 with Python's message, logged once.
+    /// `/generate` checks the DP rank a body names as Python does: a rank
+    /// outside the deployment is a 400 with Python's message, logged once.
     #[tokio::test]
     async fn generate_refuses_a_routed_dp_rank_out_of_range() {
         let state = Arc::new(AppState {
@@ -1725,40 +1722,33 @@ mod tests {
             generate_hook: None,
             openai_chat: None,
         });
-        for (body, rank) in [
-            (r#"{"input_ids": [1], "data_parallel_rank": 3}"#, 3),
-            (
-                r#"{"input_ids": [1], "routed_dp_rank": 2, "data_parallel_rank": 0}"#,
-                2,
-            ),
-        ] {
-            let logs = crate::utils::logging::capture_logs();
-            let request = Request::builder()
-                .method("POST")
-                .uri("/generate")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap();
-            let response = routes()
-                .with_state(state.clone())
-                .oneshot(request)
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
-            let reply = axum::body::to_bytes(response.into_body(), 64 * 1024)
-                .await
-                .unwrap();
-            let message = format!("routed_dp_rank={rank} out of range [0, 1)");
-            assert_eq!(
-                parse(std::str::from_utf8(&reply).unwrap())["error"]["message"],
-                message
-            );
-            let rejections = logs.rejections();
-            assert!(
-                matches!(rejections.as_slice(), [line] if line.contains("WARN") && line.contains(&message)),
-                "{rejections:?}"
-            );
-        }
+        let (body, rank) = (r#"{"input_ids": [1], "routed_dp_rank": 3}"#, 3);
+        let logs = crate::utils::logging::capture_logs();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        let reply = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let message = format!("routed_dp_rank={rank} out of range [0, 1)");
+        assert_eq!(
+            parse(std::str::from_utf8(&reply).unwrap())["error"]["message"],
+            message
+        );
+        let rejections = logs.rejections();
+        assert!(
+            matches!(rejections.as_slice(), [line] if line.contains("WARN") && line.contains(&message)),
+            "{rejections:?}"
+        );
     }
 
     /// An item whose `sampling_params` name no `max_new_tokens` is marked

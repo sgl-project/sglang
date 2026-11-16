@@ -15,6 +15,8 @@ from sglang.multimodal_gen.runtime.entrypoints.control_requests import (
     ReleaseRealtimeSessionReq,
     SetLoraReq,
     ShutdownReq,
+    StartProfileReq,
+    StopProfileReq,
 )
 from sglang.multimodal_gen.runtime.pipelines_core import Req
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
@@ -154,7 +156,17 @@ def test_fanout_stops_on_fatal_reply_without_deadline(client_type, prior_errors)
 
 @pytest.mark.parametrize("client_type", [SchedulerClient, AsyncSchedulerClient])
 @pytest.mark.parametrize("error", [None, "CUDA out of memory", "invalid request"])
-def test_nonfatal_control_fanout_reaches_every_replica(client_type, error):
+@pytest.mark.parametrize(
+    "control_request",
+    [
+        SetLoraReq(lora_nickname="x", lora_path="y"),
+        StartProfileReq(profile_id="test-profile"),
+        StopProfileReq(),
+    ],
+)
+def test_nonfatal_control_fanout_reaches_every_replica(
+    client_type, error, control_request
+):
     replies = [OutputBatch(error=error), OutputBatch(), OutputBatch()]
     endpoints = [f"tcp://replica-{i}" for i in range(len(replies))]
     client = client_type()
@@ -166,11 +178,10 @@ def test_nonfatal_control_fanout_reaches_every_replica(client_type, error):
     client.context = Mock()
     mock_type = AsyncMock if client_type is AsyncSchedulerClient else Mock
     client._forward_one = mock_type(side_effect=replies)
-    request = SetLoraReq(lora_nickname="x", lora_path="y")
     if client_type is AsyncSchedulerClient:
-        result = asyncio.run(client.forward(request))
+        result = asyncio.run(client.forward(control_request))
     else:
-        result = client.forward(request)
+        result = client.forward(control_request)
 
     assert result is replies[0]
     assert [call.args[0] for call in client._forward_one.call_args_list] == endpoints
