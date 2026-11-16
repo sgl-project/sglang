@@ -41,6 +41,9 @@ from sglang.srt.mem_cache.events import attach_mm_routing_labels
 from sglang.srt.multimodal.cache import media_preprocess_kwargs
 from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.multimodal.modality import Modality
+from sglang.srt.multimodal.token_space_mm_process.registry import (
+    register_token_space_models,
+)
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
 from sglang.srt.runtime_context import (
@@ -2005,6 +2008,7 @@ class MMReceiverBase(ABC):
         """Load processor and initialize mm_processor, shared by all backends."""
         transport_mode = determine_tensor_transport_mode()
         import_processors("sglang.srt.multimodal.processors")
+        register_token_space_models()
 
         extra_kwargs = {}
         if get_serving().tokenizer_backend is not None:

@@ -330,6 +330,7 @@ class TestNixlTransferWorker(CustomTestCase):
     def _make_manager(self, room):
         mgr = object.__new__(NixlKVManager)
         mgr.customized_info_enabled = False
+        mgr.exchange_aux_item_lens = False
         mgr.request_status = {room: KVPoll.WaitingForInput}
         mgr.transfer_infos = {
             room: {
@@ -434,6 +435,7 @@ class TestNixlTransferWorker(CustomTestCase):
         self.addCleanup(context.restore)
         mgr = self._make_manager(21)
         mgr.customized_info_enabled = True
+        mgr.exchange_aux_item_lens = True
         healthy = self._make_manager(22)
         mgr.kv_args.aux_data_ptrs = [0] * 8
         mgr.kv_args.aux_item_lens = [64] * 6 + [4096, 64]
@@ -995,6 +997,7 @@ class TestNixlStaging(CustomTestCase):
     def _make_manager(self, agent=None):
         mgr = object.__new__(NixlKVManager)
         mgr.customized_info_enabled = False
+        mgr.exchange_aux_item_lens = False
         mgr.agent = agent or StagingFakeAgent()
         mgr.attn_tp_size = 2
         mgr.is_mla_backend = False
@@ -1019,6 +1022,7 @@ class TestNixlStaging(CustomTestCase):
                 agent = StagingFakeAgent()
                 mgr = self._make_manager(agent)
                 mgr.customized_info_enabled = enabled
+                mgr.exchange_aux_item_lens = enabled
                 src_ptrs = [0x1000 + i * 0x10000 for i in range(8)]
                 dst_ptrs = [0x2000 + i * 0x10000 for i in range(8)]
                 mgr.kv_args.aux_data_ptrs = src_ptrs
@@ -1050,6 +1054,7 @@ class TestNixlStaging(CustomTestCase):
         agent = StagingFakeAgent()
         mgr = self._make_manager(agent)
         mgr.customized_info_enabled = True
+        mgr.exchange_aux_item_lens = True
         mgr.kv_args.aux_data_ptrs = [0x1000] * 8
         mgr.kv_args.aux_item_lens = [64] * 8
 
@@ -1292,6 +1297,7 @@ class TestNixlInvalidatedPeerReload(CustomTestCase):
     def _make_manager(self, peers):
         mgr = object.__new__(NixlKVManager)
         mgr.customized_info_enabled = False
+        mgr.exchange_aux_item_lens = False
         mgr.agent = ReloadFakeAgent()
         mgr.disaggregation_mode = DisaggregationMode.PREFILL
         mgr.is_mla_backend = False

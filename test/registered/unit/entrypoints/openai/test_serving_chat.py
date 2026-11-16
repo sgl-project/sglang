@@ -6258,7 +6258,7 @@ class TestUsageReasoningTokens(CustomTestCase):
         no_reasoning = UsageProcessor.calculate_token_usage(
             prompt_tokens=5, completion_tokens=7
         )
-        self.assertIsNone(no_reasoning.completion_tokens_details)
+        self.assertEqual(no_reasoning.completion_tokens_details.reasoning_tokens, 0)
 
 
 class TestShouldIncludeUsage(CustomTestCase):
