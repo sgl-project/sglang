@@ -1070,9 +1070,6 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
 
         self.config = config
 
-    def get_input_embeddings(self):
-        return self.model.embed_tokens
-
     @torch.no_grad()
     def forward(
         self,
@@ -1342,9 +1339,6 @@ class Qwen2_5_VLForConditionalGeneration(TextEncoder):
             weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params
-
-    def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
 
 
 EntryClass = Qwen2_5_VLForConditionalGeneration

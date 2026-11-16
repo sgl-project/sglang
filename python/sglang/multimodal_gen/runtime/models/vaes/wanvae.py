@@ -1862,26 +1862,5 @@ class AutoencoderKLWan(ParallelTiledVAE):
         dec = dec[:, :, start_frame_idx:]
         return dec
 
-    def forward(
-        self,
-        sample: torch.Tensor,
-        sample_posterior: bool = False,
-        generator: torch.Generator | None = None,
-    ) -> torch.Tensor:
-        """
-        Args:
-            sample (`torch.Tensor`): Input sample.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`DecoderOutput`] instead of a plain tuple.
-        """
-        x = sample
-        posterior = self.encode(x).latent_dist
-        if sample_posterior:
-            z = posterior.sample(generator=generator)
-        else:
-            z = posterior.mode()
-        dec = self.decode(z)
-        return dec
-
 
 EntryClass = AutoencoderKLWan

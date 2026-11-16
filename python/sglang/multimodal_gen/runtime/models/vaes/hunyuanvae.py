@@ -978,26 +978,5 @@ class AutoencoderKLHunyuanVideo(ParallelTiledVAE):
             dec = self.decoder(z)
         return dec
 
-    def forward(
-        self,
-        sample: torch.Tensor,
-        sample_posterior: bool = False,
-        generator: torch.Generator | None = None,
-    ) -> torch.Tensor:
-        r"""
-        Args:
-            sample (`torch.Tensor`): Input sample.
-            sample_posterior (`bool`, *optional*, defaults to `False`):
-                Whether to sample from the posterior.
-        """
-        x = sample
-        posterior = self.encode(x).latent_dist
-        if sample_posterior:
-            z = posterior.sample(generator=generator)
-        else:
-            z = posterior.mode()
-        dec = self.decode(z)
-        return dec
-
 
 EntryClass = AutoencoderKLHunyuanVideo

@@ -1308,27 +1308,5 @@ class AutoencoderKLQwenImage(ParallelTiledVAE):
             return (dec,)
         return DecoderOutput(sample=dec)
 
-    def forward(
-        self,
-        sample: torch.Tensor,
-        sample_posterior: bool = False,
-        return_dict: bool = True,
-        generator: Optional[torch.Generator] = None,
-    ) -> Union[DecoderOutput, torch.Tensor]:
-        """
-        Args:
-            sample (`torch.Tensor`): Input sample.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`DecoderOutput`] instead of a plain tuple.
-        """
-        x = sample
-        posterior = self.encode(x).latent_dist
-        if sample_posterior:
-            z = posterior.sample(generator=generator)
-        else:
-            z = posterior.mode()
-        dec = self.decode(z, return_dict=return_dict)
-        return dec
-
 
 EntryClass = AutoencoderKLQwenImage
