@@ -1,12 +1,10 @@
 import logging
-from functools import lru_cache
 from typing import Iterable, Optional, Tuple
 
 import torch
 import torch.nn as nn
 from transformers.models.glm4v_moe.configuration_glm4v_moe import Glm4vMoeConfig
 
-from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import get_moe_a2a_backend
@@ -27,8 +25,6 @@ _is_cuda = is_cuda()
 _device_sm = get_device_sm()
 
 logger = logging.getLogger(__name__)
-
-cached_get_processor = lru_cache(get_processor)
 
 
 class Glm4vMoeForConditionalGeneration(Glm4vForConditionalGeneration):

@@ -18,7 +18,6 @@
 """Inference-only GLM-OCR model compatible with HuggingFace weights."""
 
 import logging
-from functools import lru_cache
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -29,7 +28,6 @@ from transformers.models.glm_ocr.configuration_glm_ocr import (
     GlmOcrVisionConfig,
 )
 
-from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import (
     VisionAttention,
@@ -58,8 +56,6 @@ from sglang.srt.models.glm4v import (
 from sglang.srt.runtime_context import get_mm, get_parallel
 
 logger = logging.getLogger(__name__)
-
-cached_get_processor = lru_cache(get_processor)
 
 
 class GlmOcrRMSNorm(Glm4vRMSNorm):

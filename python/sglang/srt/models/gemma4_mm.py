@@ -16,7 +16,6 @@
 import logging
 import re
 from array import array
-from functools import lru_cache
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
@@ -30,7 +29,6 @@ from transformers import (
 )
 
 from sglang.srt.environ import envs
-from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.attention.triton_backend import TritonAttnBackend
 from sglang.srt.layers.layernorm import Gemma4RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
@@ -67,8 +65,6 @@ logger = logging.getLogger(__name__)
 
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
-
-cached_get_processor = lru_cache(get_processor)
 
 
 class Gemma4MultimodalEmbedder(nn.Module):

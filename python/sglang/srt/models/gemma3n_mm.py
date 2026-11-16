@@ -1,7 +1,6 @@
 import logging
 import re
 from array import array
-from functools import lru_cache
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
@@ -15,7 +14,6 @@ from transformers import (
 )
 from transformers.models.auto.modeling_auto import AutoModel
 
-from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -37,8 +35,6 @@ from sglang.srt.multimodal.modality import Modality
 from sglang.srt.utils import flatten_nested_list
 
 logger = logging.getLogger(__name__)
-
-cached_get_processor = lru_cache(get_processor)
 
 
 class Gemma3nMultimodalEmbedder(nn.Module):

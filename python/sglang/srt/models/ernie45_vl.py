@@ -14,7 +14,7 @@
 
 import logging
 from array import array
-from functools import lru_cache, partial
+from functools import partial
 from typing import Iterable, List, Optional, Tuple, Type
 
 import numpy as np
@@ -24,7 +24,6 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers import PretrainedConfig
 
-from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.activation import QuickGELU
 from sglang.srt.layers.attention.vision import (
     VisionAttention,
@@ -489,9 +488,6 @@ class Ernie4_5_VisionTransformer(nn.Module):
             final_output = final_output.squeeze(dim=1)
 
         return final_output
-
-
-cached_get_processor = lru_cache(get_processor)
 
 
 class Ernie4_5_VLMoeForConditionalGeneration(nn.Module):
