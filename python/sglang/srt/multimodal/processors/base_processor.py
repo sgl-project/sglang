@@ -633,6 +633,68 @@ class BaseMultimodalProcessor(MultimodalProcessorMixin, ABC):
             return self._processor, self._tokenizer
         return processor, _tokenizer_of(processor)
 
+    def render_transcription_prompt(self, prompt) -> str:
+        """Render a transcription adapter's ASR turn with this model's chat template.
+
+        ``prompt`` is a ``TranscriptionPrompt``. The result is sent as the request
+        text, so the processor then handles it like any chat prompt carrying
+        audio. Rendered once per distinct prompt.
+        """
+        cache = self.__dict__.setdefault("_transcription_prompt_cache", {})
+        if prompt not in cache:
+            cache[prompt] = self._render_transcription_prompt(prompt)
+        return cache[prompt]
+
+    def _render_transcription_prompt(self, prompt) -> str:
+        mm_tokens = getattr(self, "mm_tokens", None)
+        audio_token = getattr(mm_tokens, "audio_token", None)
+        system = [{"role": "system", "content": prompt.system}] if prompt.system else []
+
+        if prompt.content_format == "parts":
+            audio_part = {"type": "audio", "audio": ""}
+            text_part = {"type": "text", "text": prompt.instruction}
+            parts = (
+                [audio_part, text_part]
+                if prompt.audio_first
+                else [text_part, audio_part]
+            )
+            rendered = self._processor.apply_chat_template(
+                system + [{"role": "user", "content": parts}],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+            # A template that drops structured audio leaves no slot for the
+            # encoder features; fall back to the inline form below.
+            if not audio_token or rendered.count(audio_token) == 1:
+                return rendered
+            logger.warning(
+                "Chat template rendered %d audio placeholder(s) for the "
+                "transcription prompt; inlining %r instead.",
+                rendered.count(audio_token),
+                audio_token,
+            )
+
+        if not audio_token:
+            raise ValueError(
+                f"{type(self).__name__} defines no audio token, so it cannot "
+                "build a transcription prompt."
+            )
+        content = (
+            f"{audio_token}{prompt.instruction}"
+            if prompt.audio_first
+            else f"{prompt.instruction}{audio_token}"
+        )
+        tokenizer = getattr(self._processor, "tokenizer", self._tokenizer)
+        try:
+            return tokenizer.apply_chat_template(
+                system + [{"role": "user", "content": content}],
+                tokenize=False,
+                add_generation_prompt=True,
+            )
+        except (AttributeError, ValueError):
+            # No chat template: the bare turn is the prompt.
+            return content
+
     def _preprocessing_competes_with_the_scheduler(self) -> bool:
         return preprocessing_competes_with_the_scheduler(
             self._processor,

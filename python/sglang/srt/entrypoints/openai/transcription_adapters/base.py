@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import List, Optional
 
 from sglang.srt.entrypoints.openai.protocol import (
@@ -10,17 +11,47 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 
 
+@dataclass(frozen=True)
+class TranscriptionPrompt:
+    """The ASR chat turn the server renders and sends as the request text.
+
+    ``content_format`` picks how the audio placeholder gets into the turn:
+    ``"parts"`` passes ``[audio, text]`` content parts to the HF processor's chat
+    template, which emits the placeholder itself; ``"text"`` inlines the
+    processor's audio token into a string turn rendered by the tokenizer's chat
+    template, for templates that only take string content.
+    """
+
+    instruction: str
+    audio_first: bool = True
+    system: Optional[str] = None
+    content_format: str = "text"
+
+
 class TranscriptionAdapter(ABC):
     """Abstract base for model-specific transcription logic.
 
     Subclass this and decorate with ``@register_transcription_adapter("Key")``
-    to add support for a new ASR model.  See the sibling modules for
-    the built-in Whisper and Qwen3-ASR implementations.
+    to add support for a new ASR model. Decoder-only speech LMs that only need a
+    prompt, sampling settings and output cleanup subclass ``SpeechLMAdapter``
+    (``speech_lm.py``) and set data attributes; Whisper and Qwen3-ASR keep their
+    own modules.
     """
 
     @abstractmethod
     def build_sampling_params(self, request: TranscriptionRequest) -> dict:
         """Return the ``sampling_params`` dict for ``GenerateReqInput``."""
+
+    def build_prompt(
+        self, request: TranscriptionRequest
+    ) -> Optional[TranscriptionPrompt]:
+        """The ASR prompt the server renders and sends as the request text.
+
+        ``None`` (the default) keeps the request text empty and leaves the
+        prompt to the model's multimodal processor, as Whisper, Qwen3-ASR and
+        MiMo-V2-ASR need for their decoder prefixes.
+        """
+        return None
 
     @property
     def supports_language_detection(self) -> bool:
@@ -163,7 +194,10 @@ class TranscriptionAdapter(ABC):
 
 
 _ADAPTER_REGISTRY: dict[str, type[TranscriptionAdapter]] = {}
-_DEFAULT_ADAPTER_KEY = "Whisper"
+# ``SpeechLMAdapter`` is registered under this key, which no HF architecture name
+# contains, and serves every architecture without a matching adapter. Whisper's
+# adapter adds sampling keys only the Whisper processor consumes.
+_DEFAULT_ADAPTER_KEY = "__speech_lm_default__"
 
 
 def register_transcription_adapter(
