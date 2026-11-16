@@ -46,8 +46,8 @@ _FULL_FRAME_UPSCALE_MIN_FREE_BYTES = 12 * 1024**3
 _REALESRGAN_TILE_SIZE = 256
 _REALESRGAN_TILE_PAD = 32
 
-# Module-level cache: (resolved weight path, half precision) -> UpscalerModel instance
-_MODEL_CACHE: "OrderedDict[tuple[str, bool], UpscalerModel]" = OrderedDict()
+# Module-level cache: model_path -> UpscalerModel instance
+_MODEL_CACHE: "OrderedDict[str, UpscalerModel]" = OrderedDict()
 _RESOLVED_MODEL_PATH_CACHE: "OrderedDict[str, str]" = OrderedDict()
 # Arbitrary; paths are client-chosen, so both caches must be bounded.
 _MAX_CACHED_MODELS = 4
@@ -576,9 +576,7 @@ class ImageUpscaler:
         # Resolve: local .pth pass-through, or HF repo → download single file
         resolved_path = _resolve_model_path(model_path)
 
-        # The offline path loads fp32 and the realtime path fp16 from the same file.
-        cache_key = (resolved_path, self._half_precision)
-        cached_model = cache_get(_MODEL_CACHE, cache_key)
+        cached_model = cache_get(_MODEL_CACHE, resolved_path)
         if cached_model is not None:
             return cached_model
 
@@ -625,7 +623,7 @@ class ImageUpscaler:
             native_scale = net.scale
 
         model = UpscalerModel(net=net, scale=native_scale)
-        cache_put(_MODEL_CACHE, cache_key, model, max_size=_MAX_CACHED_MODELS)
+        cache_put(_MODEL_CACHE, resolved_path, model, max_size=_MAX_CACHED_MODELS)
         logger.info(
             "Real-ESRGAN model loaded on device: %s (native_scale=%dx, outscale=%s)",
             device,
