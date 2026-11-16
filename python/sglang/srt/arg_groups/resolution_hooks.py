@@ -15,6 +15,8 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
     {
         "handle_deprecated_dp_attention",
         "handle_mega_moe",
+        "validate_rust_server_unsupported_args",
+        "handle_admin_api_key_env",
         "handle_return_hidden_states_mode",
         "handle_media_url_security",
         "handle_watermark_config",
@@ -63,6 +65,8 @@ _OVERRIDABLE_HOOKS: FrozenSet[str] = frozenset(
         "handle_linear_attn_backend",
         "handle_kv4_compatibility",
         "handle_mxfp8_kv_cache_compatibility",
+        "handle_indexer_kv_cache_compatibility",
+        "handle_platform_kv_cache_dtype_compatibility",
         "handle_amd_specifics",
         "handle_nccl_pre_warm",
         "handle_grammar_backend",

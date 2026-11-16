@@ -75,13 +75,13 @@ jobs:
       - name: HF login + install run_suite extras
         timeout-minutes: 10
         run: |
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir tabulate
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "sgl-eval==0.1.3" "antlr4-python3-runtime==4.9.3"
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir pytest
+          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache tabulate
+          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache --no-deps xgrammar==0.1.33
+          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache "sgl-eval==0.1.3" "antlr4-python3-runtime==4.9.3"
+          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache pytest
           # Diffusion extras (needed by test_xpu_flux2_dev, test_xpu_zimage_turbo).
           # Pins mirror python/pyproject_xpu.toml [project.optional-dependencies.diffusion].
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "sglang[diffusion]"
+          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache "sglang[diffusion]"
           # HF /whoami-v2 is aggressively rate-limited and the three matrix
           # jobs (1/2/4-GPU) all hit it at the same second under a scheduled
           # run. Retry with linear backoff + jitter to desynchronize them.
@@ -100,7 +100,7 @@ jobs:
         run: |
           # PyMuPDF renders the bench PDFs to images; bench_sglang.py errors
           # every sample without it.
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir pymupdf
+          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache pymupdf
           docker exec ci_sglang_xpu /bin/bash -c '
             /opt/venv/bin/hf download --repo-type dataset allenai/olmOCR-bench \
               --local-dir /sglang-checkout/olmOCR-bench'
@@ -184,13 +184,13 @@ jobs:
       - name: HF login + install run_suite extras
         timeout-minutes: 10
         run: |
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir tabulate
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "sgl-eval==0.1.3" "antlr4-python3-runtime==4.9.3"
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir pytest
+          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache tabulate
+          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache --no-deps xgrammar==0.1.33
+          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache "sgl-eval==0.1.3" "antlr4-python3-runtime==4.9.3"
+          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache pytest
           # Diffusion extras (needed by test_xpu_flux2_dev, test_xpu_zimage_turbo).
           # Pins mirror python/pyproject_xpu.toml [project.optional-dependencies.diffusion].
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "sglang[diffusion]"
+          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache "sglang[diffusion]"
           # HF /whoami-v2 is aggressively rate-limited and the three matrix
           # jobs (1/2/4-GPU) all hit it at the same second under a scheduled
           # run. Retry with linear backoff + jitter to desynchronize them.
@@ -282,13 +282,13 @@ jobs:
       - name: HF login + install run_suite extras
         timeout-minutes: 10
         run: |
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir tabulate
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir --no-deps xgrammar==0.1.33
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "sgl-eval==0.1.3" "antlr4-python3-runtime==4.9.3"
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir pytest
+          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache tabulate
+          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache --no-deps xgrammar==0.1.33
+          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache "sgl-eval==0.1.3" "antlr4-python3-runtime==4.9.3"
+          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache pytest
           # Diffusion extras (needed by test_xpu_flux2_dev, test_xpu_zimage_turbo).
           # Pins mirror python/pyproject_xpu.toml [project.optional-dependencies.diffusion].
-          docker exec ci_sglang_xpu /opt/venv/bin/python3 -m pip install --no-cache-dir "sglang[diffusion]"
+          docker exec ci_sglang_xpu uv pip install --python /opt/venv/bin/python3 --no-cache "sglang[diffusion]"
           # HF /whoami-v2 is aggressively rate-limited and the three matrix
           # jobs (1/2/4-GPU) all hit it at the same second under a scheduled
           # run. Retry with linear backoff + jitter to desynchronize them.

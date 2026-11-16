@@ -67,7 +67,7 @@ from sglang.srt.layers.quantization.utils import (
     is_layer_skipped,
     requantize_with_max_scale,
 )
-from sglang.srt.utils.common import is_gfx1250_supported
+from sglang.srt.utils.device import is_gfx1250_supported
 
 if TYPE_CHECKING:
     from sglang.multimodal_gen.runtime.layers.quantization.rowwise_fp8 import (

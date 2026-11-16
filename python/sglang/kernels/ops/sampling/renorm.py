@@ -3,8 +3,8 @@
 A name is ``None`` where the platform has no kernel for it.
 """
 
+from sglang._lazy_import import LazyImport
 from sglang.srt.utils import is_cuda, is_hip, is_musa, is_npu, is_xpu
-from sglang.utils import LazyImport
 
 if is_cuda():
     # Resolved on first call: CUDA builds without FlashInfer must still import

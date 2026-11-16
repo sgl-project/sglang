@@ -54,9 +54,12 @@ def _kvc():
         layer_info=types.SimpleNamespace(
             start_layer=0, end_layer=NUM_LAYERS, num_effective_layers=NUM_LAYERS
         ),
-        server_args=types.SimpleNamespace(enable_hisparse=False),
+        server_args=types.SimpleNamespace(
+            enable_hisparse=False, indexer_kv_cache_dtype=None
+        ),
         mambaish_config=None,
         is_draft_worker=False,
+        use_combined_kv_buffer=False,
         kv_cache_dtype=torch.bfloat16,
         device="cpu",
     )

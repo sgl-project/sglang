@@ -1,13 +1,18 @@
+import importlib
 import os
 import unittest
-from types import SimpleNamespace
-from unittest.mock import patch
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
+
+import torch
 
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_cell_size,
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
 )
+from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")
@@ -186,6 +191,56 @@ class TestSparsityDrivenKVOffloadConfig(unittest.TestCase):
                     model_config=_make_glm51_model_config(),
                     use_mla_backend=True,
                 )
+
+
+def _import_manager_module():
+    # The manager imports the Ascend kernel package at module level.
+    vendor = ModuleType("sgl_kernel_npu.sparsity_driven_kv_offload")
+    for name in ("create_shm_tensor", "slot_map_lookup", "unidex_copy_inplace"):
+        setattr(vendor, name, Mock(side_effect=AssertionError(f"Unexpected {name}")))
+    with patch.dict(
+        "sys.modules",
+        {
+            "sgl_kernel_npu": ModuleType("sgl_kernel_npu"),
+            "sgl_kernel_npu.sparsity_driven_kv_offload": vendor,
+        },
+    ):
+        return importlib.import_module(
+            "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.manager"
+        )
+
+
+class TestSparseKVRequestAllocHook(unittest.TestCase):
+    def test_alloc_resets_slot_maps_of_newly_allocated_rows_only(self):
+        """Allocating request rows through the hooked pool must reset the sparse
+        slot map of each fresh row and keep the map of a request that keeps its row."""
+        manager_module = _import_manager_module()
+        pool = ReqToTokenPool(
+            size=3, max_context_len=8, device="cpu", enable_memory_saver=False
+        )
+        manager = manager_module.SparseKVCacheManager.__new__(
+            manager_module.SparseKVCacheManager
+        )
+        manager.device = "cpu"
+        manager.layer_num = 2
+        manager.device_slot_map = [
+            torch.full((pool.req_to_token.shape[0], 16), -1, dtype=torch.int32)
+            for _ in range(manager.layer_num)
+        ]
+        manager._install_req_alloc_hook(pool)
+
+        chunked = SimpleNamespace(kv=ReqKvInfo())
+        (chunked_row,) = pool.alloc([chunked])
+        chunked.kv.kv_allocated_len = 4
+        for slot_map in manager.device_slot_map:
+            slot_map.fill_(7)
+
+        rows = pool.alloc([chunked, SimpleNamespace(kv=ReqKvInfo())])
+
+        self.assertEqual(rows[0], chunked_row)
+        for slot_map in manager.device_slot_map:
+            self.assertTrue(torch.all(slot_map[rows[1]] == -1))
+            self.assertTrue(torch.all(slot_map[chunked_row] == 7))
 
 
 if __name__ == "__main__":

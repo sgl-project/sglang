@@ -4,7 +4,7 @@ import unittest
 from array import array
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from types import SimpleNamespace
+from types import MethodType, SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import msgspec
@@ -45,6 +45,25 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=18, suite="base-a-test-cpu")
 
+# The pool schema one rank holding only the KV host pool reduces a hit query
+# over: the host pools some rank registers.
+_SCHEMA = [str(PoolName.KV)]
+
+
+def _hit_query_controller(*, entry_map=(PoolName.KV,), **fields):
+    """A controller stand-in that reduces a hit query over the schema of one
+    rank whose host pools are ``entry_map``."""
+    controller = SimpleNamespace(
+        prefetch_hits_sync_groups=[],
+        mem_pool_host=SimpleNamespace(entry_map=dict.fromkeys(entry_map)),
+        _host_pool_schemas=[],
+        **fields,
+    )
+    controller._host_pool_schema = MethodType(
+        HybridCacheController._host_pool_schema, controller
+    )
+    return controller
+
 
 class TestBufferModeSidecar(unittest.TestCase):
     def test_cancelled_query_distinguishes_skipped_query_from_miss(self):
@@ -54,13 +73,12 @@ class TestBufferModeSidecar(unittest.TestCase):
                 def reduce(values, *_):
                     peer = torch.full_like(values, -1)
                     peer[0] = 0
-                    peer[1 + list(PoolName).index(PoolName.KV)] = peer_kv_pages
+                    peer[1 + _SCHEMA.index(PoolName.KV)] = peer_kv_pages
                     values.copy_(torch.minimum(values, peer))
 
-                controller = SimpleNamespace(
+                controller = _hit_query_controller(
                     page_size=2,
                     storage_backend=SimpleNamespace(batch_exists=lambda *_: 2),
-                    prefetch_hits_sync_groups=[],
                     _all_reduce=reduce,
                 )
                 operation = PrefetchOperation(
@@ -151,10 +169,9 @@ class TestBufferModeSidecar(unittest.TestCase):
                     operation = PrefetchOperation(
                         CacheRequestHandle("repair", 0), token_ids, pool_transfers=[swa]
                     )
-                    controller = SimpleNamespace(
+                    controller = _hit_query_controller(
                         storage_backend=backend,
                         page_size=2,
-                        prefetch_hits_sync_groups=[],
                         _all_reduce=capture,
                     )
                     _, hit_tokens = HybridCacheController._storage_hit_query(
@@ -232,10 +249,9 @@ class TestBufferModeSidecar(unittest.TestCase):
             pool_transfers=[swa],
             assume_stored=True,
         )
-        controller = SimpleNamespace(
+        controller = _hit_query_controller(
             storage_backend=None,
             page_size=2,
-            prefetch_hits_sync_groups=[],
             _all_reduce=lambda values, *_: None,
         )
         _, hit_tokens = HybridCacheController._storage_hit_query(controller, operation)
@@ -315,6 +331,57 @@ class TestBufferModeSidecar(unittest.TestCase):
                 for name, size in sizes.items()
             }
         )
+
+    def test_a_named_window_already_stored_writes_nothing(self):
+        """BUG REGRESSION. A named window keeps its own hit verdict through the
+        hit-query reduction, so pages it already stored are not written again."""
+        snapshot = self._backup_snapshot()
+        token_ids = list(snapshot.key.token_ids)
+        chain = get_storage_hash_str(token_ids, page_size=2)
+        snapshot = msgspec.structs.replace(snapshot, hash_values=chain)
+        stored, short = "window_128", "window_64"
+        transfers = [
+            PoolTransfer(
+                name=name, keys=chain[-1:], hit_policy=PoolHitPolicy.TRAILING_PAGES
+            )
+            for name in (stored, short)
+        ]
+        operation = PrefetchOperation(
+            CacheRequestHandle("windows", 0), token_ids, pool_transfers=transfers
+        )
+        operation.all_hash_values = chain
+        # The usable prefix is one page: the short window ends there.
+        operation.pool_storage_result = SimpleNamespace(restorable_prefix_pages=[1])
+        operation.query_pool_hit_pages = {PoolName.KV: 2, stored: 2, short: 1}
+        controller = _hit_query_controller(
+            page_size=2,
+            entry_map=(PoolName.KV, stored, short),
+            _all_reduce=lambda values, *_: None,
+        )
+        operation.storage_hit_count = HybridCacheController._sync_prefetch_hit_query(
+            controller, operation, 2
+        )
+        self.assertEqual(operation.storage_hit_count, 2)
+        self.assertEqual(
+            operation.query_pool_hit_pages, {PoolName.KV: 2, stored: 2, short: 1}
+        )
+
+        tree = MagicMock()
+        tree.build_hicache_transfers.return_value = transfers
+        tree.buffer_backup_pool_keys.return_value = {}
+        pipeline = self._launch_pipeline(tree, [])
+        cache = pipeline._cache
+        cache.host_memory_mode, cache.page_size = "buffer_only", 2
+        cache.components = {
+            ct: SimpleNamespace(buffer_belief_policy=lambda _: None)
+            for ct in (ComponentType.FULL, ComponentType.SWA)
+        }
+        cache._belief_policy = UnifiedRadixCache._belief_policy.__get__(cache)
+        for pool in (PoolName.KV, stored, short):
+            cache.storage_existence_cache.pool(pool).add(chain)
+        UnifiedRadixCache._invalidate_absent_from_hit_query(cache, operation)
+        self.assertTrue(cache.storage_existence_cache.pool(stored).contains_all(chain))
+        self.assertEqual(pipeline._write_intents(snapshot), [(short, chain[-1:])])
 
     def test_stack_accepts_dsv4_full_and_swa_sidecars(self):
         validate_buffer_only_stack(
@@ -454,7 +521,7 @@ class TestBufferModeSidecar(unittest.TestCase):
             component_type=ComponentType.SWA,
             full_window_pages=1,
         )
-        pipeline._auxiliary_swa_component = None
+        pipeline._further_window_components = ()
         pipeline.write_backlog_cap = 8
         pipeline.reset()
         pipeline._build_backup_transfers = lambda node_id, *, kv_only=False: (

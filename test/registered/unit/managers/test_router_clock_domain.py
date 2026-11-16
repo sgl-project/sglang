@@ -594,7 +594,6 @@ class TestEngineClockDomainCandidate(CustomTestCase):
                 "_set_envs_and_config",
                 "load_plugins",
                 "resolve_auto_parsers",
-                "snapshot_context",
                 "publish",
             ):
                 stack.enter_context(patch.object(engine_module, name))
@@ -620,6 +619,7 @@ class TestEngineClockDomainCandidate(CustomTestCase):
                     SimpleNamespace(
                         detokenizer_worker_num=settings["workers"],
                         skip_tokenizer_init=settings["skip"],
+                        warmups=None,
                     ),
                 ),
                 (

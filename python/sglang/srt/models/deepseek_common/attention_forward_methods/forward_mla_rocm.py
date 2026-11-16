@@ -26,6 +26,7 @@ from sglang.srt.layers.dcp import (
     cp_lse_ag_out_rs_mla,
     dcp_a2a_lse_reduce,
 )
+from sglang.srt.layers.dcp.layout import is_mla_dcp_lse_base_on_e
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 from sglang.srt.layers.quantization.fp8_utils import (
@@ -59,7 +60,6 @@ from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph impo
 )
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla import (
     _select_local_dcp_heads_for_autotune,
-    is_mla_dcp_lse_base_on_e,
 )
 from sglang.srt.models.deepseek_common.utils import (
     FORWARD_ABSORB_CORE_ATTENTION_BACKENDS,
@@ -91,10 +91,10 @@ if _use_aiter:
     # On gfx1250 the aiter `module_fused_qk_norm_rope_cache_quant_shuffle` kernel
     # fails to JIT-build (its `rope_common.h` / `ck_tile/vec_convert.h` are
     # incompatible with this image's composable_kernel), which crashes the very
-    # first MLA forward. This path is a pure RMSNorm (quant_type=No), so under the
-    # gfx1250 workaround flag (AITER_FORCE_A8W4) substitute a self-contained Triton
-    # RMSNorm that never touches the aiter fp4 kernel build.
-    if get_bool_env_var("AITER_FORCE_A8W4", "false"):
+    # first MLA forward. This path is a pure RMSNorm (quant_type=No), so on gfx1250
+    # substitute a self-contained Triton RMSNorm that never touches the aiter fp4
+    # kernel build.
+    if _is_gfx1250_supported:
         if get_bool_env_var("SGLANG_QK_RMSNORM_TORCH", "false"):
             from sglang.srt.models.deepseek_common.attention_forward_methods.triton_qk_rmsnorm import (
                 fused_qk_rmsnorm_torch as fused_qk_rmsnorm_bf16,

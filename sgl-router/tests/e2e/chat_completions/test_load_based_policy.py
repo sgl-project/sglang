@@ -11,9 +11,9 @@ import time
 
 import httpx
 import pytest
-from infra.gateway import Gateway
 from infra.model_pool import spawn_worker
 from infra.model_specs import get_model_spec
+from infra.router import Router
 
 _ACTIVE_RE = re.compile(
     r'^sgl_router_active_load\{worker_url="([^"]+)",kind="prefill_tokens"\}\s+(-?\d+)'
@@ -102,7 +102,7 @@ def test_load_based_routes_to_the_cooler_worker(
         with (
             spawn_worker("qwen3-0.6b", gpu_ids=[gpus[0]]) as worker_a,
             spawn_worker("qwen3-0.6b", gpu_ids=[gpus[1]]) as worker_b,
-            Gateway() as router,
+            Router() as router,
         ):
             worker_urls = [worker_a.url, worker_b.url]
             router.start_regular(

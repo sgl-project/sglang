@@ -1,4 +1,4 @@
-{"name": "state_slots_exhausted", "chain": "mamba", "page_size": 16, "lazy": true, "ops": [
+{"name": "state_slots_exhausted", "chain": "mamba", "page_size": 16, "ops": [
   {"op": "extend", "req": 0, "n": 96, "expect": "allocated"},
   {"op": "extend", "req": 1, "n": 96, "expect": "allocated"},
   {"op": "extend", "req": 2, "n": 96, "expect": "allocated"},

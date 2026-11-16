@@ -16,7 +16,11 @@ from sglang.srt.arg_groups.model_override_base import (
 from sglang.srt.arg_groups.overrides import declare_resolution, resolution_result
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
+from sglang.srt.mem_cache.platform_kv_cache_dtype import (
+    registered_kv_cache_storage_dtype,
+)
 from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform
 
 logger = logging.getLogger(__name__)
@@ -105,6 +109,45 @@ def handle_mxfp8_kv_cache_compatibility(server_args: Any) -> None:
         raise ValueError(
             "--kv-cache-dtype mxfp8 requires an SM100+ (Blackwell) GPU for the "
             "block-scaled operands used by the FA4 MXFP8 attention path."
+        )
+
+
+def handle_platform_kv_cache_dtype_compatibility(server_args: Any) -> None:
+    """A platform-registered KV cache dtype has no in-tree implementation."""
+    cfg = resolving_view(server_args)
+    kv_cache_dtype = cfg.kv_cache_dtype
+    if registered_kv_cache_storage_dtype(kv_cache_dtype) is None:
+        return
+    platform = (
+        f"{type(current_platform).__name__} (device {current_platform.device_name!r})"
+    )
+    if not (
+        current_platform.is_out_of_tree()
+        and current_platform.supports_kv_cache_dtype(kv_cache_dtype)
+    ):
+        raise ValueError(
+            f"--kv-cache-dtype {kv_cache_dtype} is not supported by {platform}: "
+            "it is registered by a platform plugin, has no in-tree implementation, "
+            "and this platform does not declare support for it. Choose another "
+            "--kv-cache-dtype, or use the platform that provides it."
+        )
+    # Core's KV transfer slices pages per head and its host pools copy the
+    # in-tree per-head layout; neither preserves a platform's packed pages.
+    unsupported = [
+        flag
+        for flag, enabled in (
+            ("--disaggregation-mode", cfg.disaggregation_mode != "null"),
+            ("--enable-hierarchical-cache", cfg.enable_hierarchical_cache),
+            ("--enable-lmcache", cfg.enable_lmcache),
+        )
+        if enabled
+    ]
+    if unsupported:
+        raise ValueError(
+            f"--kv-cache-dtype {kv_cache_dtype} on {platform} does not support "
+            f"{', '.join(unsupported)}: PD transfer and the host KV pools assume "
+            "the in-tree per-head KV layout. Disable them or choose another "
+            "--kv-cache-dtype."
         )
 
 
@@ -317,6 +360,39 @@ def handle_kv4_compatibility(server_args: Any) -> None:
         raise RuntimeError("KV4 is not tested on non-CUDA platforms.")
 
 
+def handle_indexer_kv_cache_compatibility(server_args: Any) -> None:
+    """Check the DSA lightning-indexer INT8 cache recipe.
+
+    npu_quant_lightning_indexer is a CANN op, so an explicitly requested
+    indexer recipe only makes sense on Ascend NPU and on a model that
+    actually has a DSA lightning indexer. The recipe itself is resolved
+    against the resolved KV cache dtype later, at pool-build time.
+    """
+    cfg = resolving_view(server_args)
+
+    if cfg.indexer_kv_cache_dtype is None:
+        return
+
+    if cfg.enable_hierarchical_cache:
+        raise ValueError(
+            f"--indexer-kv-cache-dtype={cfg.indexer_kv_cache_dtype} is not "
+            "supported with --enable-hierarchical-cache. Disable hierarchical "
+            "cache or use the default BF16 indexer cache."
+        )
+
+    if not get_platform().is_npu:
+        raise RuntimeError(
+            "--indexer-kv-cache-dtype is only supported on Ascend NPU "
+            "(npu_quant_lightning_indexer is a CANN op)."
+        )
+
+    if getattr(model_config_of(server_args), "index_head_dim", None) is None:
+        raise ValueError(
+            "--indexer-kv-cache-dtype requires a DSA model with a lightning "
+            "indexer; this model has none."
+        )
+
+
 def handle_prefill_only_disable_kv_cache(server_args: Any) -> None:
     """Validate --prefill-only-disable-kv-cache backend constraint.
 
@@ -389,6 +465,12 @@ def handle_cache_compatibility(server_args: Any) -> None:
                 "ever TEL-safe and T-LRU is exactly LRU."
             )
 
+    if cfg.radix_eviction_policy == "state_cost":
+        from sglang.srt.mem_cache.evict_policy import StateCostStrategy
+
+        # Building the strategy checks its cost coefficients.
+        StateCostStrategy(**(cfg.radix_eviction_policy_config or {}))
+
     if cfg.enable_hierarchical_cache and cfg.disable_radix_cache:
         raise ValueError(
             "The arguments enable-hierarchical-cache and disable-radix-cache are mutually exclusive "
@@ -460,6 +542,14 @@ def handle_cache_compatibility(server_args: Any) -> None:
             "_handle_cache_compatibility",
             _swa_full_tokens_ratio_explicitly_set=cfg.swa_full_tokens_ratio is not None,
         )
+    if cfg._max_running_requests_explicitly_set is None:
+        # The record, not the view: a model's default (DeepSeek-V4's) is declared earlier.
+        declare_resolution(
+            server_args,
+            "_handle_cache_compatibility",
+            _max_running_requests_explicitly_set=server_args.max_running_requests
+            is not None,
+        )
 
     # Validate the effective ratio: model branches may declare a reset
     # (e.g. Step3p forces 1.0 under hierarchical cache) that supersedes
@@ -521,6 +611,12 @@ def handle_unified_memory_pool(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if not cfg.enable_unified_memory:
         return
+    # The pool's ends compact lazily, behind the forwards and transfers that
+    # may still touch the pages they move; there is no eager compaction.
+    assert not envs.SGLANG_DISABLE_LAZY_COMPACTION.get(), (
+        "--enable-unified-memory requires lazy compaction; unset "
+        "SGLANG_DISABLE_LAZY_COMPACTION."
+    )
     if cfg.disaggregation_mode != "null":
         # Constraints of the whole-envelope transfer; see the unified MHA and
         # MLA pool get_contiguous_buf_infos implementations.
@@ -542,9 +638,12 @@ def handle_unified_memory_pool(server_args: Any) -> None:
             "--enable-unified-memory with PD disaggregation does not support "
             "speculative decoding with the Mooncake transfer backend."
         )
-        assert not envs.SGLANG_DISABLE_LAZY_COMPACTION.get(), (
-            "--enable-unified-memory with PD disaggregation requires lazy "
-            "compaction; unset SGLANG_DISABLE_LAZY_COMPACTION."
+        # This flag also selects decode's non-blocking metadata readback, which
+        # records a receive as in flight before its destination is published.
+        assert not envs.SGLANG_DISAGG_STAGING_BUFFER.get(), (
+            "--enable-unified-memory with PD disaggregation does not support "
+            "SGLANG_DISAGG_STAGING_BUFFER: heterogeneous-TP staging is not "
+            "supported with unified memory; unset SGLANG_DISAGG_STAGING_BUFFER."
         )
         assert not cfg.enable_hisparse, (
             "--enable-unified-memory with PD disaggregation is not compatible "
@@ -638,6 +737,25 @@ def handle_unified_memory_pool(server_args: Any) -> None:
         "--enable-hierarchical-cache: HiCache keeps the draft on a private "
         "pool, and would pack an MTP head's KV into the target's "
         "page-envelope host pool, which refuses per-layer draft loads."
+    )
+    assert not (
+        cfg.pp_size > 1
+        and cfg.enable_hierarchical_cache
+        and cfg.hicache_host_memory_mode == "buffer_only"
+    ), (
+        "--enable-unified-memory with --pp-size > 1 does not support "
+        "--hicache-host-memory-mode buffer_only: each pipeline stage drains its "
+        "own backup completions, so the stages' eviction credit, and with it "
+        "their capacity decisions, can differ."
+    )
+    assert not (
+        cfg.pp_size > 1
+        and (cfg.enable_streaming_session or cfg.enable_session_radix_cache)
+    ), (
+        "--enable-unified-memory with --pp-size > 1 does not support "
+        "--enable-streaming-session or --enable-session-radix-cache: each "
+        "pipeline stage closes timed-out sessions on its own clock, so the "
+        "memory the stages hold, and with it their capacity decisions, can differ."
     )
     if cfg.dcp_size > 1:
         _validate_unified_memory_dcp(server_args)
@@ -754,12 +872,56 @@ def draft_rows_refusal(
     )
 
 
+def _validate_unified_sparse_attention(cfg, model_config) -> bool:
+    """Whether the model attends sparsely (DSA); refuses what the unified pool
+    does not serve for it yet."""
+    from sglang.srt.configs.model_config import is_deepseek_dsa
+
+    if not is_deepseek_dsa(model_config.hf_config):
+        return False
+    # The unified pages hold FP8 latent rows with block scales, which the
+    # flashmla_kv kernels read; the trtllm kernels read raw rows.
+    backends = {cfg.dsa_prefill_backend, cfg.dsa_decode_backend}
+    if backends != {"flashmla_kv"}:
+        raise ValueError(
+            "--enable-unified-memory serves sparse attention with the flashmla_kv "
+            f"DSA backends only; got prefill {cfg.dsa_prefill_backend!r} and "
+            f"decode {cfg.dsa_decode_backend!r}."
+        )
+    unsupported = [
+        flag
+        for flag, on in (
+            ("speculative decoding", cfg.speculative_algorithm is not None),
+            ("--dcp-size > 1", cfg.dcp_size > 1),
+            ("PD disaggregation", cfg.disaggregation_mode != "null"),
+            ("--enable-hierarchical-cache", cfg.enable_hierarchical_cache),
+            ("--enable-return-indexer-topk", cfg.enable_return_indexer_topk),
+        )
+        if on
+    ]
+    if unsupported:
+        raise ValueError(
+            "--enable-unified-memory does not serve sparse attention with "
+            f"{', '.join(unsupported)} yet; drop it or --enable-unified-memory."
+        )
+    return True
+
+
 def handle_page_major_kv_layout(server_args: Any):
     # --enable-unified-memory implies --enable-page-major-kv-layout, so the
     # unified pool goes through this one gate (declared before the guard).
 
     cfg = resolving_view(server_args)
     if cfg.enable_unified_memory:
+        # Unified memory relies on the scheduler's write-after-read barrier, a device
+        # stream wait; on MPS (MLX included) the scheduler has no device streams.
+        if cfg.device == "mps":
+            raise ValueError(
+                "--enable-unified-memory is not supported on MPS: it orders the "
+                "scheduler's writes after the running forward's reads with "
+                "device stream waits, and the scheduler has no device streams "
+                "on MPS or MLX."
+            )
         declare_resolution(
             server_args,
             "_handle_page_major_kv_layout",
@@ -794,6 +956,8 @@ def handle_page_major_kv_layout(server_args: Any):
             "cutedsl_mla",
             "flashmla",
         }
+        if _validate_unified_sparse_attention(cfg, model_config):
+            allowed_full.add("dsa")
     elif model_config.has_asymmetric_kv:
         allowed_full = set(ASYMMETRIC_KV_BACKENDS)
     else:
@@ -883,6 +1047,13 @@ def validate_prefill_only_disable_kv_cache_args(server_args: Any):
             "--prefill-only-disable-kv-cache does not currently support "
             "--kv-cache-dtype=mxfp8 because the MXFP8 pool stores separate "
             "scale-factor buffers."
+        )
+    if registered_kv_cache_storage_dtype(cfg.kv_cache_dtype) is not None:
+        raise ValueError(
+            "--prefill-only-disable-kv-cache does not currently support "
+            f"--kv-cache-dtype={cfg.kv_cache_dtype} because a platform-registered "
+            "KV cache dtype needs the platform's KV pool, which the no-op pool "
+            "cannot replace."
         )
 
     # Structural preconditions for the FA backend's fa_skip_kv_cache path,
