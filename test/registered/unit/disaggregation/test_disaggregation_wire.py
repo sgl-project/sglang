@@ -46,9 +46,12 @@ from sglang.srt.disaggregation.utils import (
     poll_and_all_reduce,
     poll_and_all_reduce_attn_cp_tp_group,
     poll_and_all_reduce_with_staging,
+    pp_sync_polls,
     setup_state_kv_args,
     should_send_replicated_state,
 )
+from sglang.srt.distributed.communication_tags import P2PTag
+from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.utils import should_use_dsa_fused_topk
 from sglang.srt.managers.overlap_utils import FutureMap, RelayPayload
@@ -236,6 +239,7 @@ class TestDisaggregationWire(unittest.TestCase):
                 with self.subTest(layer_ids=layer_ids, outcome=outcome):
                     manager = object.__new__(MooncakeKVManager)
                     manager.customized_info_enabled = False
+                    manager.exchange_aux_item_lens = False
                     manager.kv_args = SimpleNamespace(
                         kv_data_ptrs=[],
                         state_types=[StateType.SWA, StateType.DSA],
@@ -925,6 +929,7 @@ class TestDisaggregationWire(unittest.TestCase):
         dst_ptrs, _, dst_lens = decode.get_buf_infos()
         manager = object.__new__(CommonKVManager)
         manager.customized_info_enabled = True
+        manager.exchange_aux_item_lens = True
         manager.kv_args = SimpleNamespace(
             aux_data_ptrs=src_ptrs, aux_item_lens=src_lens
         )
@@ -987,11 +992,47 @@ class TestDisaggregationWire(unittest.TestCase):
                     (src_ptrs, _, src_lens), (dst_ptrs, _, dst_lens) = layouts
                     manager = object.__new__(CommonKVManager)
                     manager.customized_info_enabled = prefill_enabled
+                    manager.exchange_aux_item_lens = prefill_enabled
                     manager.kv_args = SimpleNamespace(
                         aux_data_ptrs=src_ptrs, aux_item_lens=src_lens
                     )
                     peer_lens = dst_lens if decode_enabled else None
                     if prefill_enabled == decode_enabled:
+                        manager.validate_aux_buffers(dst_ptrs, peer_lens)
+                    else:
+                        with self.assertRaisesRegex(
+                            ValueError, "metadata buffer layout mismatch"
+                        ):
+                            manager.validate_aux_buffers(dst_ptrs, peer_lens)
+
+    def test_aux_buffer_validation_checks_top_logprobs_width(self):
+        default = MetadataBuffers.DEFAULT_TOP_LOGPROBS_NUM
+        with (
+            get_context().override_server_args(disaggregation_enable_kv_checksum=False),
+            envs.SGLANG_DISAGG_CUSTOMIZED_INFO_MAX_BYTES.override(0),
+        ):
+            for prefill_width, decode_width, accepted in (
+                (default, default, True),
+                (default, 2 * default, True),
+                (2 * default, 2 * default, True),
+                (2 * default, default, False),
+                (4 * default, 2 * default, False),
+            ):
+                with self.subTest(prefill=prefill_width, decode=decode_width):
+                    src_ptrs, _, src_lens = MetadataBuffers(
+                        1, 16, torch.float32, 0, prefill_width
+                    ).get_buf_infos()
+                    dst_ptrs, _, dst_lens = MetadataBuffers(
+                        1, 16, torch.float32, 0, decode_width
+                    ).get_buf_infos()
+                    manager = object.__new__(CommonKVManager)
+                    manager.customized_info_enabled = False
+                    manager.exchange_aux_item_lens = prefill_width != default
+                    manager.kv_args = SimpleNamespace(
+                        aux_data_ptrs=src_ptrs, aux_item_lens=src_lens
+                    )
+                    peer_lens = dst_lens if decode_width != default else None
+                    if accepted:
                         manager.validate_aux_buffers(dst_ptrs, peer_lens)
                     else:
                         with self.assertRaisesRegex(
@@ -1032,6 +1073,7 @@ class TestDisaggregationWire(unittest.TestCase):
     def test_mooncake_aux_mismatch_fails_request_and_worker_continues(self):
         manager = object.__new__(MooncakeKVManager)
         manager.customized_info_enabled = True
+        manager.exchange_aux_item_lens = True
         manager.kv_args = SimpleNamespace(
             aux_data_ptrs=[0x1000] * 8,
             aux_item_lens=[64] * 6 + [4096, 64],
@@ -1253,6 +1295,74 @@ class TestPollCollectives(CustomTestCase):
             result = poll_and_all_reduce([poller], object())
         self.assertEqual(result, [KVPoll.Failed])
         all_reduce.assert_not_called()
+
+
+class _FakePPSendWork:
+    def __init__(self):
+        self.waited = False
+
+    def wait(self):
+        self.waited = True
+
+
+class _FakePPGroup:
+    def __init__(self, recv_data=None):
+        self.recv_data = recv_data
+        self.recv_calls = []
+        self.send_calls = []
+        self.sent_works = []
+
+    def recv_object(self, *, src, tag):
+        self.recv_calls.append((src, tag))
+        return self.recv_data
+
+    def send_object(self, data, *, dst, async_send, tag):
+        self.send_calls.append((data, dst, async_send, tag))
+        work = _FakePPSendWork()
+        self.sent_works.append(work)
+        return [work]
+
+
+class TestPPSyncPolls(CustomTestCase):
+    def test_forwards_waited_only_behind_the_window(self):
+        """PP0's forwards of its poll states stay un-waited for the window's depth;
+        waiting on the previous call's forwards at every call tied each rank's
+        bootstrap round to the next rank's (the lock-step of #45351)."""
+        pp_group = _FakePPGroup()
+        window = PPSyncSendWindow(rounds=3)
+        rounds = [[KVPoll.Bootstrapping], [KVPoll.WaitingForInput], [KVPoll.Success]]
+        for polls in rounds:
+            self.assertEqual(pp_sync_polls(polls, pp_group, 0, 2, window), polls)
+        self.assertEqual([w.waited for w in pp_group.sent_works], [False] * 3)
+
+        pp_sync_polls([KVPoll.Success], pp_group, 0, 2, window)
+        self.assertEqual(
+            [w.waited for w in pp_group.sent_works], [True, False, False, False]
+        )
+        self.assertEqual(
+            pp_group.send_calls[0],
+            ([KVPoll.Bootstrapping], 1, True, P2PTag.DISAGG_BOOTSTRAP_PP_SYNC),
+        )
+
+    def test_later_ranks_relay_pp0_polls_down_the_pipeline(self):
+        """A middle rank adopts the polls received from the previous rank and
+        forwards them on the same tag; the last rank only receives."""
+        pp0_polls = [KVPoll.Success, KVPoll.Failed]
+        middle = _FakePPGroup(recv_data=pp0_polls)
+        self.assertEqual(
+            pp_sync_polls([], middle, 1, 3, PPSyncSendWindow(rounds=3)), pp0_polls
+        )
+        self.assertEqual(middle.recv_calls, [(0, P2PTag.DISAGG_BOOTSTRAP_PP_SYNC)])
+        self.assertEqual(
+            middle.send_calls, [(pp0_polls, 2, True, P2PTag.DISAGG_BOOTSTRAP_PP_SYNC)]
+        )
+
+        last = _FakePPGroup(recv_data=pp0_polls)
+        self.assertEqual(
+            pp_sync_polls([], last, 2, 3, PPSyncSendWindow(rounds=3)), pp0_polls
+        )
+        self.assertEqual(last.recv_calls, [(1, P2PTag.DISAGG_BOOTSTRAP_PP_SYNC)])
+        self.assertEqual(last.send_calls, [])
 
 
 class TestDsaIndexKTokenBytes(unittest.TestCase):

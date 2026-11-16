@@ -310,7 +310,7 @@ do not use it to generate consistency ground truth.
 
 The [ComfyUI plugin](/docs/sglang-diffusion/comfyui) can run H3 as a per-step
 DiT backend. ComfyUI keeps CLIP, VAE, and the sampler loop. SGLang loads only
-the transformer under `--comfyui-mode`.
+the transformer in ComfyUI integrated mode (the plugin sets `comfyui_mode`; there is no CLI flag).
 
 Copy `python/sglang/multimodal_gen/apps/ComfyUI_SGLDiffusion` into ComfyUI
 `custom_nodes/`. Load a shipped graph and set `SGLDOptions.model_type` to
@@ -420,7 +420,7 @@ rank), so mixed-schedule serving does not re-read the checkpoint. Plan sets
 that exceed the host budget are simply recomputed on their next occurrence.
 Expert escape hatches live in environment variables:
 `SGLANG_DIFFUSION_MINIMAX_H3_ADALN_GPU_PLANS` resizes the GPU slab (needed
-only beyond 65 inference steps) and `SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32`
+only above 64 inference steps) and `SGLANG_DIFFUSION_MINIMAX_H3_ADALN_FP32`
 computes the one-time projections in fp32 (experimental; not bit-comparable
 to resident weights, validate end-to-end before production). LoRA adapters
 that modify `adaln_proj` are rejected in both cache modes rather than
@@ -784,10 +784,13 @@ sglang serve \
   --port 30010
 ```
 
-`auto` merges an adapter into ordinary resident weights to avoid per-step LoRA
-matmuls. It keeps the dynamic path in two cases. One is FSDP-sharded weights,
-where a full gather can increase peak memory. The other is an adapter whose
-update would mostly round away in a BF16 merge. Distilled adapters such as the
+`auto` merges adapters into ordinary resident weights to avoid per-step LoRA
+matmuls. It keeps FSDP-sharded weights dynamic to avoid full-gather peaks, and
+uses dynamic execution for supported packed weights that cannot merge in place
+or adapter updates that would mostly round away in a BF16 merge. The same
+policy applies when activating multiple adapters through the
+[LoRA API](/docs/sglang-diffusion/api/openai_api#lora-management).
+Distilled adapters such as the
 Larry Turbo LoRA sit below a BF16 ulp of most weights, and a merge drops
 77–97% of their update in typical layers. Use `dynamic` when one resident
 server must switch repeatedly between base and LoRA output, and `merge` to

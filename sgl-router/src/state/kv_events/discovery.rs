@@ -29,17 +29,17 @@ use url::Url;
 use crate::workers::introspect::{resolve_event_config, KvEventsBlock};
 
 /// Per-worker KV-event publisher configuration, resolved to something the
-/// gateway can directly use to open ZMQ SUB sockets.
+/// router can directly use to open ZMQ SUB sockets.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventConfig {
-    /// The host the gateway should connect to. If the worker reports a
+    /// The host the router should connect to. If the worker reports a
     /// wildcard bind host (`*`, `0.0.0.0`, `::`) this is replaced by the
     /// host parsed out of the worker URL; otherwise the explicit
     /// `endpoint_host` is kept verbatim.
     pub host: String,
     /// Base port for rank 0. Per-rank port = `port_base + dp_rank`.
     pub port_base: u16,
-    /// ZMQ topic prefix the gateway should SUBSCRIBE to.
+    /// ZMQ topic prefix the router should SUBSCRIBE to.
     pub topic: String,
     /// Base port of the worker's dedicated load-snapshot socket range
     /// (per-rank load port = `load_port_base + dp_rank`). `None` when the
@@ -57,7 +57,7 @@ pub struct EventConfig {
     /// miscompute since [`super::hash::compute_block_hashes`] is keyed
     /// on the caller's value, not on this one.
     pub block_size: u32,
-    /// Number of attention-DP ranks publishing. The gateway opens this
+    /// Number of attention-DP ranks publishing. The router opens this
     /// many SUB connections (one per rank), skipping any rank whose
     /// `port_base + dp_rank` overflows `u16`.
     pub dp_size: u32,
@@ -72,8 +72,8 @@ pub struct EventConfig {
 }
 
 /// Default timeout for the `/server_info` introspection request. The
-/// worker is on the same network as the gateway in production; 2 seconds
-/// is generous and still bounds gateway-startup latency.
+/// worker is on the same network as the router in production; 2 seconds
+/// is generous and still bounds router-startup latency.
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Bounded retry for transient `/server_info` failures. A worker that just
@@ -275,7 +275,7 @@ mod tests {
             .unwrap()
     }
 
-    /// Happy path: worker advertises a ZMQ publisher; gateway substitutes
+    /// Happy path: worker advertises a ZMQ publisher; router substitutes
     /// `*` with the worker host.
     #[tokio::test]
     async fn fetch_returns_event_config_when_block_present() {
@@ -345,7 +345,7 @@ mod tests {
         }
     }
 
-    /// Worker reports a specific bind host (not wildcard): gateway must
+    /// Worker reports a specific bind host (not wildcard): router must
     /// honour it instead of overwriting from the URL.
     #[tokio::test]
     async fn fetch_keeps_explicit_bind_host() {

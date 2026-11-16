@@ -15,11 +15,18 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__file__)
 
 _warmup_registry = {}
+# Warmups that only send generate requests, which Rust-server mode runs through
+# its listener (`rust_server.warmups`); the others need the TokenizerManager.
+_rust_server_warmups = set()
 
 
-def warmup(name: str):
+def warmup(name: str, *, rust_server: bool = False):
     def decorator(fn):
         _warmup_registry[name] = fn
+        if rust_server:
+            _rust_server_warmups.add(name)
+        else:
+            _rust_server_warmups.discard(name)
         return fn
 
     return decorator
@@ -105,7 +112,7 @@ async def whisper_autodetect(
     logger.info("Whisper auto-detect regex FSMs compiled.")
 
 
-@warmup("voice_chat")
+@warmup("voice_chat", rust_server=True)
 async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
     # this warms up the fused_moe triton kernels and caches them
     # if we don't do this we break real time inference for voice chat
@@ -127,7 +134,7 @@ async def voice_chat(disaggregation_mode: str, tokenizer_manager: TokenizerManag
         await tokenizer_manager.generate_request(generate_req_input, None).__anext__()
 
 
-@warmup("prefill_shapes")
+@warmup("prefill_shapes", rust_server=True)
 async def prefill_shapes(disaggregation_mode: str, tokenizer_manager: TokenizerManager):
     """Warmup Triton kernels across a wide range of prefill seq_lens (up to 32K).
 
