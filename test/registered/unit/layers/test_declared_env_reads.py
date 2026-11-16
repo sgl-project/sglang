@@ -57,6 +57,10 @@ class TestDeclaredEnvReads(CustomTestCase):
         with (
             envs.SGLANG_USE_AITER.override("yes"),
             patch.object(fp8_activation, "is_hip", return_value=True),
+            # gfx950 and SM100 hosts go on to probe down_proj unless tp_size != 1.
+            patch.object(
+                fp8_activation, "get_parallel", return_value=SimpleNamespace(tp_size=2)
+            ),
         ):
             self.assertTrue(fp8_activation.DenseSiluAndMulQuant(down_proj).aiter)
 

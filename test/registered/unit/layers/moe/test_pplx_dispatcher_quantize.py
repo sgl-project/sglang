@@ -5,12 +5,14 @@ import unittest
 import torch
 
 from sglang.srt.layers.moe.token_dispatcher import pplx as pplx_module
+from sglang.srt.utils import is_cuda
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-large")
 
 
+@unittest.skipUnless(is_cuda(), "the pplx dispatcher runs on NVIDIA CUDA only")
 class TestPplxFp8Quantize(CustomTestCase):
     def test_fp8_dispatch_quantizes_into_fp8_with_float32_block_scales(self):
         """An FP8 dispatch must quantize the hidden states into an fp8 payload
