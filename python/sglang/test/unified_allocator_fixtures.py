@@ -833,7 +833,7 @@ def build_unified_bundle(geometry: UnifiedGeometry):
     )
 
 
-def build_mamba_pool(*, page_size=1, lazy=True, mla=False, ratio=(1, 1)):
+def build_mamba_pool(*, page_size=1, lazy=True, mla=False, ratio=(1, 1), state_slots=8):
     """Full + state composite over real CPU pools; returns the pool bundle and
     its allocator."""
     full_layers, state_layers = ratio
@@ -847,14 +847,17 @@ def build_mamba_pool(*, page_size=1, lazy=True, mla=False, ratio=(1, 1)):
             full_tokens=100 * page_size,
             context_len=256 * page_size,
             lazy=lazy,
+            state_slots=state_slots,
         )
     )
     return bundle, bundle.token_to_kv_pool_allocator
 
 
-def build_mamba_cache(*, page_size=1, lazy=True, mla=False, ratio=(1, 1)):
+def build_mamba_cache(
+    *, page_size=1, lazy=True, mla=False, ratio=(1, 1), state_slots=8
+):
     bundle, allocator = build_mamba_pool(
-        page_size=page_size, lazy=lazy, mla=mla, ratio=ratio
+        page_size=page_size, lazy=lazy, mla=mla, ratio=ratio, state_slots=state_slots
     )
     cache = UnifiedRadixCache(
         CacheInitParams(

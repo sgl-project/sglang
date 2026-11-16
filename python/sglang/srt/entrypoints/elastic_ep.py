@@ -7,13 +7,11 @@ from fastapi import APIRouter, Request
 from fastapi.responses import ORJSONResponse
 
 from sglang.srt.runtime_context import get_exec
-from sglang.srt.utils.auth import AuthLevel, auth_level
 
 router = APIRouter()
 
 
 @router.post("/scale_elastic_ep")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def scale_elastic_ep(raw_request: Request):
     """Request an asynchronous EP scale-up."""
     try:
@@ -74,7 +72,6 @@ async def scale_elastic_ep(raw_request: Request):
 
 
 @router.get("/is_scaling_elastic_ep")
-@auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def is_scaling_elastic_ep(raw_request: Request):
     """Return the tokenizer's mirrored Elastic EP scale state."""
     from sglang.srt.entrypoints.http_server import _global_state

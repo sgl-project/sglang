@@ -70,8 +70,11 @@ use `--height 512 --width 512` for the 512 buckets. Reference-image requests
 select the closest official bucket and restore the input aspect ratio in the
 returned PNGs. Multiple reference images are not supported.
 
-For a renamed local checkpoint directory, also provide
-`--model-id inclusionAI/Ming-Image-0.1-Design` or the corresponding Layer ID.
+For a local checkpoint, keep `Ming-Image-0.1-Design` (or
+`Ming-Image-0.1-Design-Layer`) in the directory name. If you rename it, pass
+`--pipeline-class-name MingImagePipeline --model-id Ming-Image-0.1-Design` (or
+`Ming-Image-0.1-Design-Layer`), using the repo name without the `inclusionAI/`
+prefix.
 
 ## 4. Runtime features
 

@@ -7,6 +7,9 @@ Usage:
 
     # T2V or T2I or any other multimodal generation model
     sglang serve --model-path Wan-AI/Wan2.2-T2V-A14B-Diffusers --num-gpus 1 --port 1231
+    # With profiling:
+    python3 -m sglang.multimodal_gen.benchmarks.bench_serving \
+         --backend sglang-image --dataset vbench --task image-to-image --num-prompts 5 --profile
 
     # benchmark it and make sure the port is the same as the server's port
     python3 -m sglang.multimodal_gen.benchmarks.bench_serving --dataset vbench --num-prompts 20 --port 1231
@@ -20,7 +23,7 @@ import asyncio
 import json
 import os
 import time
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any, Dict, List, Optional
 
 import aiohttp
@@ -176,8 +179,15 @@ async def async_request_image_sglang(
         if input.width and input.height:
             data.add_field("size", f"{input.width}x{input.height}")
 
-        # Merge extra parameters
-        for key, value in input.extra_body.items():
+        # Add inference parameters
+        if input.num_inference_steps is not None:
+            data.add_field("num_inference_steps", str(input.num_inference_steps))
+
+        # Add profiling and other extra parameters
+        extra_params = input.extra_body.copy()
+        if extra_params.pop("profile", None):
+            data.add_field("profile", "true")
+        for key, value in extra_params.items():
             data.add_field(key, str(value))
 
         # Add image file(s)
@@ -504,6 +514,46 @@ def wait_for_service(base_url: str, timeout: int = 1200) -> None:
         time.sleep(1)
 
 
+@dataclass
+class ProfileReqOutput:
+    """Output for profile request."""
+
+    success: bool = False
+    message: str = ""
+    error: str = ""
+
+
+async def async_request_profile(
+    api_url: str,
+    session: Optional[aiohttp.ClientSession] = None,
+) -> ProfileReqOutput:
+    """Send a profile start/stop request to the server."""
+    output = ProfileReqOutput()
+
+    close_session = False
+    if session is None:
+        session = aiohttp.ClientSession()
+        close_session = True
+
+    try:
+        async with session.post(api_url) as response:
+            response_text = await response.text()
+            if response.status == 200:
+                output.success = True
+                output.message = response_text.strip()
+            else:
+                output.success = False
+                output.error = f"HTTP {response.status}: {response_text}"
+    except Exception as e:
+        output.success = False
+        output.error = str(e)
+    finally:
+        if close_session:
+            await session.close()
+
+    return output
+
+
 async def benchmark(args):
     from huggingface_hub import model_info
 
@@ -514,6 +564,8 @@ async def benchmark(args):
     # Parsed before the service wait and the dataset download so a malformed
     # value fails immediately instead of after minutes of setup.
     extra_body = _parse_extra_body(args.extra_body)
+    if args.guidance_scale is not None:
+        extra_body.setdefault("guidance_scale", args.guidance_scale)
 
     # Wait for service
     wait_for_service(args.base_url)
@@ -641,6 +693,16 @@ async def benchmark(args):
                 requests_list=requests_list, warmup_pairs=warmup_pairs, args=args
             )
 
+        # Start profiler if --profile is enabled (after warmup)
+        if args.profile:
+            profile_output = await async_request_profile(
+                api_url=f"{args.base_url}/start_profile"
+            )
+            if profile_output.success:
+                logger.info(f"Profiler started: {profile_output.message}")
+            else:
+                logger.warning(f"Failed to start profiler: {profile_output.error}")
+
         # Run benchmark
         pbar = tqdm(total=len(requests_list), disable=args.disable_tqdm)
         start_time = time.perf_counter()
@@ -658,6 +720,17 @@ async def benchmark(args):
         total_duration = time.perf_counter() - start_time
 
         pbar.close()
+
+    # Stop profiler if it was started
+    if args.profile:
+        logger.info("Stopping profiler and saving traces...")
+        profile_output = await async_request_profile(
+            api_url=f"{args.base_url}/stop_profile"
+        )
+        if profile_output.success:
+            logger.info(f"Profiler stopped: {profile_output.message}")
+        else:
+            logger.warning(f"Failed to stop profiler: {profile_output.error}")
 
     # Calculate metrics
     metrics = calculate_metrics(outputs, total_duration, requests_list, args, args.slo)
@@ -819,10 +892,22 @@ if __name__ == "__main__":
     )
     parser.add_argument("--fps", type=int, default=None, help="FPS (for video).")
     parser.add_argument(
+        "--guidance-scale",
+        type=float,
+        default=None,
+        help="Classifier-free guidance scale",
+    )
+    parser.add_argument(
         "--output-file", type=str, default=None, help="Output JSON file for metrics."
     )
     parser.add_argument(
         "--disable-tqdm", action="store_true", help="Disable progress bar."
+    )
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="Enable full pipeline profiling. "
+        "Traces are saved to the server's SGLANG_TORCH_PROFILER_DIR.",
     )
     parser.add_argument(
         "--log-level",

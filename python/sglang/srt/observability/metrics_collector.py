@@ -2323,7 +2323,9 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "request's view at splice time, so the span beyond it was released; "
             "cache_admission_shortfall means an L3-loaded L2 span was no longer "
             "reusable when cache-mode admission ran; deadline means the "
-            "storage prefetch stop policy ended the read before it completed.",
+            "storage prefetch stop policy ended the read before it completed; "
+            "already_cached means another request cached the span while the "
+            "read was in flight, so the loaded copy was freed as a duplicate.",
             labelnames=list(labels.keys()) + ["reason"],
         )
         for reason in (
@@ -2338,6 +2340,7 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             "device_overlap",
             "cache_admission_shortfall",
             "dropped",
+            "already_cached",
         ):
             self.storage_prefetch_unfulfilled_tokens_total.labels(
                 **self.labels, reason=reason
