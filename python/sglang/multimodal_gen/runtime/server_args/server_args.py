@@ -3916,8 +3916,9 @@ class ServerArgs(DisaggServerArgsMixin):
             if arg.startswith("--"):
                 # For '--arg=value', this gets 'arg'; for '--arg', this also gets 'arg'.
                 arg_name = arg.split("=", 1)[0].replace("-", "_").lstrip("_")
-                if arg_name not in destinations:
-                    # argparse also accepts an unambiguous prefix of a flag.
+                if arg_name not in destinations and arg_name not in vars(args):
+                    # argparse also accepts an unambiguous prefix of a flag; a
+                    # flag spelled in full (also one registered later) wins.
                     abbreviated = {
                         dest
                         for name, dest in destinations.items()
