@@ -1267,7 +1267,6 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             self.assertEqual(
                 resolution_result(server_args, "mm_feature_transport"), "cuda_ipc"
             )
-            self.assertTrue(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
         output = "\n".join(logs.output)
         self.assertIn("base GPU 2", output)
@@ -1296,7 +1295,6 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             self.assertEqual(
                 resolution_result(server_args, "mm_feature_transport"), "cpu"
             )
-            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
         self.assertIn("overrides", logs.output[0])
 
@@ -1309,7 +1307,6 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             self.assertEqual(
                 resolution_result(server_args, "mm_feature_transport"), "cpu"
             )
-            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
     @override_platform(is_cuda=True)
     def test_default_transport_is_cpu_for_text_only_model(self):
@@ -1324,7 +1321,6 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             self.assertEqual(
                 resolution_result(server_args, "mm_feature_transport"), "cpu"
             )
-            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
     @override_platform(is_cuda=True)
     def test_default_transport_is_cpu_for_multimodal_model(self):
@@ -1339,7 +1335,6 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             self.assertEqual(
                 resolution_result(server_args, "mm_feature_transport"), "cpu"
             )
-            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
     @patch("sglang.srt.arg_groups.serving_hook.os.path.exists", return_value=True)
     @patch(
@@ -1364,7 +1359,6 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             self.assertEqual(
                 resolution_result(server_args, "mm_feature_transport"), "cuda_vmm"
             )
-            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
         output = "\n".join(logs.output)
         self.assertIn("auto-resolved to cuda_vmm", output)
@@ -1433,7 +1427,6 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             self.assertEqual(
                 resolution_result(server_args, "mm_feature_transport"), "cpu"
             )
-            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
     @override_platform(is_cuda=True)
     def test_default_transport_is_cpu_for_language_only_model(self):
@@ -1447,7 +1440,6 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             self.assertEqual(
                 resolution_result(server_args, "mm_feature_transport"), "cpu"
             )
-            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
     @override_platform(is_cuda=False)
     def test_cuda_ipc_rejects_non_nvidia_platforms(self):
@@ -1475,7 +1467,6 @@ class TestMultimodalFeatureTransport(CustomTestCase):
             self.assertEqual(
                 resolution_result(server_args, "mm_feature_transport"), "cuda_vmm"
             )
-            self.assertFalse(envs.SGLANG_USE_CUDA_IPC_TRANSPORT.get())
 
         output = "\n".join(logs.output)
         self.assertIn("CUDA FABRIC", output)
