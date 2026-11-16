@@ -54,10 +54,30 @@ on:
         description: 'Coverage-recommended test files for this suite (one repo-relative path per line, from recommend-tests-from-coverage). Empty = run the full suite.'
         type: string
         default: ''
+      collect_nightly_tests:
+        description: 'Pass run_suite.py --nightly (collects nightly-registered tests) and install the nightly eval deps, while keeping the PR install. is_nightly_pipeline_job implies both.'
+        type: boolean
+        default: false
+      sgl_router:
+        description: 'Fetch sgl-router for the PD disaggregation tests in this suite.'
+        type: boolean
+        default: false
+      sgl_router_artifact:
+        description: "sgl-router-build's artifact; empty builds sgl-router here."
+        type: string
+        default: ''
       github-token:
         description: 'GitHub token for API calls'
         type: string
         default: ${{ github.token }}
+      reply_comment_id:
+        description: '/rerun-test reply comment to mark running when a runner picks the job up; empty skips the mark. Needs issues: write.'
+        type: string
+        default: ''
+      reply_marker:
+        description: "The marker of this run's line in that reply comment."
+        type: string
+        default: ''
 
 env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check }}
@@ -80,12 +100,35 @@ jobs:
       matrix:
         partition: ${{ fromJson(inputs.partitions).arr }}
     steps:
+      # Before the PR checkout, which can take minutes on these runners. The
+      # script is fetched at github.sha, the caller's commit, so it is not a
+      # fork's.
+      - name: Mark runner picked up
+        if: inputs.reply_comment_id != '' && inputs.reply_marker != ''
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          script="${RUNNER_TEMP}/update_rerun_test_status.py"
+          curl -fsSL --retry 3 -o "${script}" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/${{ github.repository }}/contents/scripts/ci/utils/update_rerun_test_status.py?ref=${{ github.sha }}"
+          python3 "${script}" \
+            --comment-id "${{ inputs.reply_comment_id }}" \
+            --marker "${{ inputs.reply_marker }}" \
+            --status running \
+            --repo "${{ github.repository }}"
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           # Pin to the event SHA (not the branch name) so every job in this run
           # checks out the same commit even if the branch advances mid-run.
           ref: ${{ inputs.ref || github.sha }}
+          # /rerun-test passes a fork's commit as `ref`; the token would stay
+          # in .git/config, readable by its code.
+          persist-credentials: false
 
       - name: Mark repository safe
         run: |
@@ -198,6 +241,20 @@ jobs:
               core.notice('[health-check] PASS: no root cause failures detected');
             }
 
+      # Not download-sgl-router: these k8s container jobs cannot load a local action.
+      # continue-on-error: the artifact expires in a day, so a re-run builds instead.
+      - name: Download prebuilt sgl-router
+        if: inputs.sgl_router && inputs.sgl_router_artifact != ''
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.sgl_router_artifact }}
+          path: sgl-router-bin
+
+      - name: Build sgl-router if no artifact, and export its path
+        if: inputs.sgl_router
+        run: bash scripts/ci/utils/prepare_sgl_router.sh
+
       - name: Install dependencies
         env:
           GITHUB_PROXY_URL: "https://gh-proxy.test.osinfra.cn/"
@@ -209,24 +266,19 @@ jobs:
 
           if [[ "${{ inputs.is_nightly_pipeline_job }}" != "true" ]]; then
             bash scripts/ci/npu/npu_ci_install_dependency.sh ${{ inputs.npu_device_type }}
+            if [[ "${{ inputs.collect_nightly_tests }}" == "true" ]]; then
+              bash scripts/ci/npu/npu_nightly_eval_deps.sh
+            fi
 
           else
-            sglang_pkg_path=/sgl-workspace/sglang/python
-            ascend_test_util_path=${sglang_pkg_path}/sglang/test/ascend
-            mkdir -p ${ascend_test_util_path}
-            mv ${ascend_test_util_path} ${ascend_test_util_path}_bak
-            cp -r $(pwd)/python/sglang/test/ascend ${ascend_test_util_path}
+            # Run the checkout's sglang; the image only supplies the environment.
+            echo "PYTHONPATH=$(pwd)/python${PYTHONPATH:+:${PYTHONPATH}}" >> "$GITHUB_ENV"
 
-            pip install sentence_transformers zss "wandb>=0.16.0" tenacity==8.3.0 loguru openpyxl latex2sympy2 zstandard transformers-stream-generator tqdm-multiprocess pycocoevalcap
-            pip install yt-dlp sentencepiece==0.1.99 nltk av ftfy sqlitedict==2.1.0 "sacrebleu>=1.5.0" pytablewriter "peft>=0.2.0" "accelerate>=0.29.1"
-            pip install jsonlines "evaluate>=0.4.0" numexpr dotenv
-
-            hf download MMMU/MMMU --repo-type dataset
+            bash scripts/ci/npu/npu_nightly_eval_deps.sh
           fi
 
-          # install sglang_router
+          # The hicache_hash_cpp JIT build includes <openssl/sha.h>.
           apt-get install -y libssl-dev
-          pip install sglang_router
 
       - name: Run test
         timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
@@ -274,6 +326,8 @@ jobs:
           NIGHTLY_FLAG=""
           if [ "${{ inputs.is_nightly_pipeline_job }}" = "true" ]; then
             NIGHTLY_FLAG="--nightly --continue-on-error"
+          elif [ "${{ inputs.collect_nightly_tests }}" = "true" ]; then
+            NIGHTLY_FLAG="--nightly"
           fi
 
           # Precision-test mode: run only the coverage-recommended files for
@@ -311,3 +365,12 @@ jobs:
             --auto-partition-size ${{ fromJson(inputs.partitions).size }} \
             ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
             $ONLY_FILE_ARGS $NIGHTLY_FLAG $CONTINUE_ON_ERROR_FLAG 2>&1 | tee "${LOG_FILE}"
+
+      - name: Upload test logs for failure analysis
+        if: ${{ always() && !inputs.use_coverage_runner && !inputs.is_nightly_pipeline_job }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: selected-test-logs-${{ inputs.self_name }}-part${{ matrix.partition }}-${{ github.run_attempt }}
+          path: /tmp/test-logs/*.log
+          if-no-files-found: ignore
+          retention-days: 7
