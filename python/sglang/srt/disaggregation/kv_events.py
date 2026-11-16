@@ -769,6 +769,8 @@ class EventPublisherFactory:
         config_dict.pop("format")
 
         kind = config_dict.pop("publisher", "null")
+        if kind == "null":
+            return NullEventPublisher()
         try:
             constructor = cls._registry[kind]
         except KeyError as exc:
