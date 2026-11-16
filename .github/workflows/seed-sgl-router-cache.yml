@@ -10,7 +10,10 @@ on:
     paths:
       # What the key hashes.
       - 'sgl-router/**'
-      - 'rust/**'
+      - 'rust/Cargo.toml'
+      - 'rust/sglang-api-types/**'
+      - 'rust/sglang-processor/**'
+      - 'rust/sglang-runtime-v1-types/**'
       - '.github/workflows/_pr-test-sgl-router-build.yml'
       - 'scripts/ci/utils/build_sgl_router.sh'
       # Not hashed into the key, but they set its arch part: by the runner each job
