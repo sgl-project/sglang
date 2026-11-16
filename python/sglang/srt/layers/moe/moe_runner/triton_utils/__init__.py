@@ -11,19 +11,31 @@ from sglang.srt.layers.moe.moe_runner.triton_utils.moe_align_block_size import (
 )
 
 _config: Optional[Dict[str, Any]] = None
+_down_config: Optional[Dict[str, Any]] = None
 
 
 @contextmanager
-def override_config(config):
-    global _config
-    old_config = _config
-    _config = config
-    yield
-    _config = old_config
+def override_config(
+    config: Optional[Dict[str, Any]],
+    down_config: Optional[Dict[str, Any]] = None,
+):
+    """Run fused MoE with ``config`` instead of the tuned config files. The down
+    projection runs with ``down_config``, or with ``config`` when it is None."""
+    global _config, _down_config
+    old_configs = (_config, _down_config)
+    _config, _down_config = config, down_config
+    try:
+        yield
+    finally:
+        _config, _down_config = old_configs
 
 
 def get_config() -> Optional[Dict[str, Any]]:
     return _config
+
+
+def get_down_config() -> Optional[Dict[str, Any]]:
+    return _down_config
 
 
 _config_lookup: Optional[Tuple[int, int]] = None
@@ -50,6 +62,7 @@ def get_config_lookup() -> Optional[Tuple[int, int]]:
 __all__ = [
     "override_config",
     "get_config",
+    "get_down_config",
     "override_config_lookup",
     "get_config_lookup",
     "fused_experts",
