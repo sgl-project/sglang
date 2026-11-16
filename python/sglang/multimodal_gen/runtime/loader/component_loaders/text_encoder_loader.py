@@ -604,7 +604,7 @@ class TextEncoderLoader(OnlineQuantizationComponentLoader):
         component_name: str,
     ) -> EncoderConfig:
         diffusers_pretrained_config = AutoConfig.from_pretrained(
-            component_model_path, trust_remote_code=True
+            component_model_path, trust_remote_code=server_args.trust_remote_code
         )
         encoder_index = self._extract_encoder_index(
             self.structural_component_name(component_name)
