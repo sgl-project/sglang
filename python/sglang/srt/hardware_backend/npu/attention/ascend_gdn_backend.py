@@ -1,7 +1,9 @@
 from typing import Optional, Tuple, Union
 
 import torch
-from sgl_kernel_npu.fla.utils import prepare_chunk_indices
+from sgl_kernel_npu.implementation.triton.attention.gdn.gdn_utils import (
+    prepare_chunk_indices,
+)
 from sgl_kernel_npu.operators.attention.gdn import (
     chunk_gated_delta_rule,
     fused_gdn_gating,
