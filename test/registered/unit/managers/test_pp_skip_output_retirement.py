@@ -98,6 +98,7 @@ def _forward_result(unified_forward_done=None):
         fpm_timing=None,
         forward_launch=None,
         unified_forward_done=unified_forward_done,
+        routed_experts_output=None,
     )
 
 
