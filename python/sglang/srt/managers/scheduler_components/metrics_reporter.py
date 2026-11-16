@@ -243,9 +243,6 @@ class SchedulerMetricsReporter:
         self.current_scheduler_metrics_enabled = (
             self.metrics_collector_context.current_scheduler_metrics_enabled
         )
-        self.enable_kv_cache_events = (
-            self.metrics_collector_context.enable_kv_cache_events
-        )
         parallel = get_parallel()
         # The max/mean token ratio is engine-wide; one scheduler reports it.
         self.reports_dp_token_imbalance_ratio = (

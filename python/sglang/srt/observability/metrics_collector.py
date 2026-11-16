@@ -337,7 +337,6 @@ class SchedulerMetricsCollectorContext:
     enable_metrics: bool
     is_stats_logging_rank: bool
     current_scheduler_metrics_enabled: bool
-    enable_kv_cache_events: bool
     collector: Optional[SchedulerMetricsCollector]
 
 
@@ -1419,12 +1418,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             is_stats_logging_rank
             or get_observability().enable_metrics_for_all_schedulers
         )
-        enable_kv_cache_events = bool(
-            get_observability().kv_events_config
-            and get_parallel().pp_rank == 0
-            and parallel.attn_tp_rank == 0
-            and parallel.attn_cp_rank == 0
-        )
         collector: Optional[SchedulerMetricsCollector] = None
         if enable_metrics:
             # Keep one metric series across role flips.
@@ -1460,7 +1453,6 @@ class SchedulerMetricsCollector(_StatLoggerDIMixin):
             enable_metrics=enable_metrics,
             is_stats_logging_rank=is_stats_logging_rank,
             current_scheduler_metrics_enabled=current_scheduler_metrics_enabled,
-            enable_kv_cache_events=enable_kv_cache_events,
             collector=collector,
         )
 
