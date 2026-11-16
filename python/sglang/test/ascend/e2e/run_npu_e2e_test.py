@@ -506,11 +506,12 @@ def monitor_pod_logs(
 
 
 def print_pod_logs(kube_job_prefix_name, namespace, tail_lines=POD_LOG_TAIL_LINES):
-    """Dump every job pod's log into the runner output.
+    """Dump the prefill pods' log into the runner output.
 
     Container logs disappear with the pod/job, and the archived copies live
     on the shared PVC. Printing them here makes failures (e.g. a prefill
     node that never became healthy) visible directly in the CI log.
+    Jobs without a prefill pod (single node, PD mix) dump all their pods.
     ``tail_lines=None`` prints the complete log.
     """
     try:
@@ -519,10 +520,13 @@ def print_pod_logs(kube_job_prefix_name, namespace, tail_lines=POD_LOG_TAIL_LINE
         logger.error(f"Failed to list pods for log dump: {e}")
         return
 
-    for pod in pods.items:
+    job_pods = [
+        pod for pod in pods.items if kube_job_prefix_name in pod.metadata.name
+    ]
+    prefill_pods = [pod for pod in job_pods if "prefill" in pod.metadata.name]
+    # PD separation: decode and router logs are noise here, keep prefill only.
+    for pod in prefill_pods or job_pods:
         pod_name = pod.metadata.name
-        if kube_job_prefix_name not in pod_name:
-            continue
 
         label = "full" if tail_lines is None else f"last {tail_lines} lines"
         print(f"===== pod log ({label}): {pod_name} =====")
