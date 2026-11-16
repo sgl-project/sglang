@@ -1,5 +1,8 @@
 <div align="center"  style="display:block; margin:auto;">
-<img src=https://github.com/lm-sys/lm-sys.github.io/releases/download/test/sgl-diffusion-logo.png width="80%"/>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../../../assets/sglang-diffusion/logo-dark.svg">
+  <img src="../../../assets/sglang-diffusion/logo.svg" alt="SGLang Diffusion" width="80%">
+</picture>
 </div>
 
 **SGLang diffusion is an inference framework for accelerated image/video generation.**
@@ -110,6 +113,14 @@ sglang generate \
 ```
 
 For more usage examples (e.g. OpenAI compatible API, server mode), check the [CLI reference](https://docs.sglang.io/docs/sglang-diffusion/api/cli).
+
+## SGLang-Diffusion Adoption & Integrations
+
+<p align="center">
+  <img src="../../../assets/sglang-diffusion/adoption.png" alt="SGLang-Diffusion adopters and integrations: Ant Group, Baseten, Black Forest Labs, Boson AI, fal, Google, Infinigence, Krea, Modal, MOSS, Skywork, Sol-Engine, Tencent Hunyuan, and TikTok" width="800">
+</p>
+
+[fal](https://blog.fal.ai/h3-max-built-with-fal-inference-and-training/) ported SGLang-Diffusion's H3 implementation to its Falcon inference engine.
 
 ## Contributing
 

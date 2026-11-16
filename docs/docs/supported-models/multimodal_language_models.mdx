@@ -436,7 +436,7 @@ python -m sglang.launch_server \
   --model-path google/gemma-3-4b-it \
   --host 0.0.0.0 --port 30000 \
   --enable-multimodal \
-  --dtype bfloat16 --triton-attention-reduce-in-fp32 \
+  --dtype bfloat16 \
   --attention-backend triton \ # Use Triton attention backend
   --disable-cuda-graph \ # Disable Cuda Graph
   --chunked-prefill-size -1 # Disable Chunked Prefill

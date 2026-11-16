@@ -36,6 +36,10 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     _apply_qwen3_qk_norm_rope,
     compute_mrope_position_ids_text,
 )
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 KVPair = tuple[torch.Tensor, torch.Tensor]
@@ -240,6 +244,17 @@ def _joint_attention(
     return out, k, v
 
 
+class CosmosDreamsCrossAttention(Cosmos3CrossAttention):
+    def __init__(self, *args, **kwargs):
+        # Prefer FlashInfer FA2 on SM12x. Backend selection still
+        # honors explicit overrides and falls back if FlashInfer is absent.
+        if current_platform.is_cuda() and current_platform.is_sm120():
+            default_backend = AttentionBackendEnum.FLASHINFER_FA2
+        else:
+            default_backend = None
+        super().__init__(*args, default_attention_backend=default_backend, **kwargs)
+
+
 class CosmosDreamsGenDecoderLayer(Cosmos3GenDecoderLayer):
     def forward(
         self, hidden: torch.Tensor, **attention_kwargs: Any
@@ -296,6 +311,7 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
     """
 
     _gen_layer_cls = CosmosDreamsGenDecoderLayer
+    _cross_attention_cls = CosmosDreamsCrossAttention
 
     def __init__(
         self,
@@ -303,6 +319,10 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
         hf_config: dict[str, Any],
         quant_config: QuantizationConfig | None = None,
     ) -> None:
+        if current_platform.is_cuda() and current_platform.is_sm120():
+            self._supported_attention_backends = self._supported_attention_backends | {
+                AttentionBackendEnum.FLASHINFER_FA2
+            }
         super().__init__(config=config, hf_config=hf_config, quant_config=quant_config)
         self.manifest: CosmosDreamsManifest = load_cosmos_dreams_manifest(hf_config)
         self._validate_causal_arch(hf_config)

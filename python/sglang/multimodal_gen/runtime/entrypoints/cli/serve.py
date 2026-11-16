@@ -76,7 +76,3 @@ class ServeSubcommand(CLISubcommand):
         serve_parser = add_multimodal_gen_serve_args(serve_parser)
 
         return cast(FlexibleArgumentParser, serve_parser)
-
-
-def cmd_init() -> list[CLISubcommand]:
-    return [ServeSubcommand()]
