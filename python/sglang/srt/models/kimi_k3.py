@@ -105,6 +105,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
@@ -157,6 +158,7 @@ from sglang.srt.runtime_context import (
     get_exec,
     get_parallel,
     get_platform,
+    get_server_args,
     get_spec,
     linear_attn_parallel_group,
     linear_attn_tp_rank,
@@ -2202,6 +2204,11 @@ class KimiK3DeltaAttention(nn.Module):
                 f"attention TP (full_rank_gate={self.use_full_rank_gate}, "
                 f"group={self.head_group})"
             )
+        _check_weight_shard_unquantized(
+            f"KDA layer {self.layer_idx}",
+            (("qkvg", self.fused_qkvg_proj), ("o_proj", self.o_proj)),
+        )
+        self._derived_weight_cache_error = _WEIGHT_SHARD_UPDATE_ERROR
         k = ws.unit_index[self.layer_idx]
         # This rank's attention-TP slice of each projection: the shard group holds the
         # DP ranks that share it, and splits it further by rows.
@@ -3197,10 +3204,35 @@ def _stage_facts(
     )
 
 
+# Online updates re-run load_weights into the shards (or, for direct updates, write the
+# gather slots that the next gather overwrites); refuse them before any write.
+_WEIGHT_SHARD_UPDATE_ERROR = (
+    "Online weight updates are not supported with --kda-weight-shard-size: the sharded "
+    "KDA projections and shared experts live in per-rank shards that are loaded once at "
+    "startup and gathered into reused slots. Restart without --kda-weight-shard-size to "
+    "allow online updates."
+)
+
+
+def _check_weight_shard_unquantized(what: str, modules) -> None:
+    for name, module in modules:
+        method = getattr(module, "quant_method", None)
+        if not isinstance(method, UnquantizedLinearMethod):
+            raise ValueError(
+                f"--kda-weight-shard-size shards unquantized weights only: {what} {name} "
+                f"uses {type(method).__name__}"
+            )
+
+
 def _bind_shared_experts_weight_shard(mlp, ws, layer_idx: int) -> None:
     """--kda-weight-shard-size with replicated shared experts: make gate_up_proj and
     down_proj weights views of this layer's gather slot, and load the checkpoint into
     this rank's shard."""
+    _check_weight_shard_unquantized(
+        f"MoE layer {layer_idx} shared experts",
+        (("gate_up", mlp.gate_up_proj), ("down", mlp.down_proj)),
+    )
+    mlp._derived_weight_cache_error = _WEIGHT_SHARD_UPDATE_ERROR
     k = ws.unit_index[layer_idx]
     I = mlp.down_proj.weight.shape[1]
     for module, name in ((mlp.gate_up_proj, "gate_up"), (mlp.down_proj, "down")):
@@ -3634,6 +3666,7 @@ class KimiK3LinearModel(nn.Module):
                 ),
                 shared_intermediate_size=config.moe_intermediate_size
                 * (config.num_shared_experts or 0),
+                dummy_load=get_server_args().load_format == "dummy",
             )
         with (
             k3_kda_weight_shard.building_target_model()
@@ -4204,8 +4237,6 @@ class KimiK3LinearForCausalLM(nn.Module):
             loaded_params.add(name)
 
         self._check_dsa_indexer_loaded(loaded_params)
-        # --kda-weight-shard-size: every sharded parameter got exactly its slices.
-        k3_kda_weight_shard.check_all_loaded()
         self.post_load_weights()
         return loaded_params
 
@@ -4225,6 +4256,9 @@ class KimiK3LinearForCausalLM(nn.Module):
         # Also invoked by loader post-load hooks (DummyModelLoader,
         # ShardedStateLoader, remote-instance flows -- none of which call
         # load_weights), so e.g. dummy-weight benchmarks get the fused buffers.
+        # --kda-weight-shard-size: every shard slice loaded once (or dummy-filled), and
+        # visible to the shard group before any gather.
+        k3_kda_weight_shard.finish_load()
         # Post-load: absorb kv_b_proj into w_kc and w_vc for MLA layers
         for layer_id in self.config.full_attention_layer_ids:
             if layer_id >= len(self.model.layers):

@@ -342,9 +342,96 @@ class TestLoadGather(TestCase):
             r3.check_loaded()
         r3.load(1, "o_proj", w[1]["o_proj"])
         r3.check_loaded()
-        r3.load(1, "o_proj", w[1]["o_proj"])
+        with self.assertRaisesRegex(RuntimeError, "loaded twice"):
+            r3.load(1, "o_proj", w[1]["o_proj"])
+
+    def test_doubled_slice_plus_missing_slice_fails(self):
+        # Same element count as a full load: q loaded twice, k never.
+        rk = make_group(4, [0], 1)[1]
+        w = full_weights(1)[0]
+        rk.load(0, "qkvg", w["qkvg"][:P], row_offset=0)
+        with self.assertRaisesRegex(RuntimeError, "qkvg block 0 .* loaded twice"):
+            rk.load(0, "qkvg", w["qkvg"][:P], row_offset=0)
+        for sid in (2, 3):
+            rk.load(0, "qkvg", w["qkvg"][sid * P : (sid + 1) * P], row_offset=sid * P)
+        rk.load(0, "o_proj", w["o_proj"])
+        with self.assertRaisesRegex(RuntimeError, rf"\(0, 'qkvg', 1, 0, {P // 4}\)"):
+            rk.check_loaded()
+
+    def test_overlapping_partial_loads_fail(self):
+        rk = make_group(2, [0], 1)[0]
+        w = full_weights(1)[0]
+        rk.load(0, "o_proj", w["o_proj"][: H // 2], row_offset=0)
+        before = rk.own_view(0, "o_proj").clone()
+        with self.assertRaisesRegex(RuntimeError, "loaded twice"):
+            rk.load(0, "o_proj", w["o_proj"][H // 4 :] + 1, row_offset=H // 4)
+        # Rejected before the write.
+        self.assertTrue(torch.equal(rk.own_view(0, "o_proj"), before))
+        rk.load(0, "o_proj", w["o_proj"][H // 2 :], row_offset=H // 2)
+        rk.load(0, "qkvg", w["qkvg"], row_offset=0)
+        rk.check_loaded()
+
+
+class TestFinishLoad(TestCase):
+    def test_barrier_after_check(self):
+        calls = []
+        rk = make_group(2, [0], 1, group_barrier=lambda: calls.append(1))[0]
         with self.assertRaises(RuntimeError):
-            r3.check_loaded()
+            rk.finish_load()
+        self.assertEqual(calls, [])
+        load_all(rk, full_weights(1))
+        rk.finish_load()
+        self.assertEqual(calls, [1])
+
+    def test_dummy_fills_every_slice(self):
+        ranks = make_group(2, [0, 1], 2)
+        for rk in ranks:
+            rk.dummy_load = True
+            rk.finish_load()
+            self.assertTrue(rk.shard.abs().max() <= 1e-3)
+            self.assertGreater(rk.shard.abs().sum(), 0)
+            rk.finish_load()  # post_load_weights may run again: no refill
+        ranks[0].wait(0)
+        self.assertFalse(torch.equal(*ranks[0].param_view(0, "o_proj").chunk(2, dim=1)))
+
+    def test_dummy_after_checkpoint_slices_fails(self):
+        rk = make_group(2, [0], 1)[0]
+        rk.load(0, "o_proj", full_weights(1)[0]["o_proj"])
+        with self.assertRaises(RuntimeError):
+            rk.init_dummy()
+
+    def test_module_finish_load_runs_every_store(self):
+        saved = (ws._ACTIVE, ws._ACTIVE_SHARED)
+        try:
+            calls = []
+            ws._ACTIVE = make_group(
+                2, [0], 1, group_barrier=lambda: calls.append("kda")
+            )[0]
+            ws._ACTIVE_SHARED = make_group(
+                2,
+                [0],
+                1,
+                shapes=ws.shared_expert_unit_shapes(8, H),
+                group_barrier=lambda: calls.append("shared"),
+            )[0]
+            for s in ws._stores():
+                s.dummy_load = True
+            ws.finish_load()
+            self.assertEqual(sorted(calls), ["kda", "shared"])
+        finally:
+            ws._ACTIVE, ws._ACTIVE_SHARED = saved
+
+    def test_second_model_init_raises(self):
+        saved = (ws._ACTIVE, ws._ACTIVE_SHARED)
+        try:
+            for active, shared in ((object(), None), (None, object())):
+                ws._ACTIVE, ws._ACTIVE_SHARED = active, shared
+                with self.assertRaisesRegex(RuntimeError, "already built"):
+                    ws.init_for_model(
+                        config=None, group_size=2, mover="ce", dtype=torch.bfloat16
+                    )
+        finally:
+            ws._ACTIVE, ws._ACTIVE_SHARED = saved
 
     def test_bad_shapes_rejected(self):
         ranks = make_group(2, [0], 1)
@@ -992,6 +1079,114 @@ class TestCudaHeadAligned(TestCase):
         _, shard = ws.unit_pieces(specs, 8)
         self.assertAlmostEqual(69 * shard * 2 / 1e9, 7.60, places=2)
         self.assertAlmostEqual(2 * size * 2 / 1e9, 1.76, places=2)
+
+
+class TestServerArgGate(TestCase):
+    """handle_kda_weight_shard on a resolved K3 PD-prefill config (attention DP 8)."""
+
+    def _check(self, **over):
+        from sglang.srt.arg_groups import parallel_hook
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        graph = over.pop("graph", None) or {}
+        fields = dict(
+            kda_weight_shard_size=8,
+            disaggregation_mode="prefill",
+            tp_size=8,
+            attn_dp_size=8,
+            pp_size=1,
+            load_format="auto",
+            weight_cache_mode="off",
+            model_path="/m",
+            cuda_graph_config=types.SimpleNamespace(
+                prefill=types.SimpleNamespace(
+                    backend=graph.get("prefill", Backend.BREAKABLE)
+                ),
+                decode=types.SimpleNamespace(
+                    backend=graph.get("decode", Backend.DISABLED)
+                ),
+            ),
+        )
+        fields.update(over)
+        cfg = types.SimpleNamespace(**fields)
+        hf = types.SimpleNamespace(architectures=["KimiK3ForConditionalGeneration"])
+        with unittest.mock.patch.multiple(
+            parallel_hook,
+            resolving_view=lambda _: cfg,
+            resolved_view=lambda _: types.SimpleNamespace(attn_cp_size=1),
+            model_config_of=lambda _: types.SimpleNamespace(hf_config=hf),
+            parse_connector_type=lambda _: None,
+        ):
+            parallel_hook.handle_kda_weight_shard(object())
+
+    def test_accepts_prefill_config(self):
+        self._check()
+        self._check(load_format="dummy")
+        self._check(load_format="safetensors")
+
+    def test_refuses_pipeline_parallelism(self):
+        with self.assertRaisesRegex(ValueError, "pipeline parallelism"):
+            self._check(pp_size=2)
+
+    def test_refuses_loaders_that_skip_load_weights(self):
+        for fmt in ("sharded_state", "presharded", "remote", "remote_instance"):
+            with self.assertRaisesRegex(ValueError, f"--load-format {fmt}"):
+                self._check(load_format=fmt)
+        with self.assertRaisesRegex(ValueError, "--weight-cache-mode client"):
+            self._check(weight_cache_mode="client")
+
+    def test_refuses_full_cuda_graphs(self):
+        from sglang.srt.model_executor.cuda_graph_config import Backend
+
+        for phase in ("prefill", "decode"):
+            with self.assertRaisesRegex(ValueError, f"full {phase} CUDA graph"):
+                self._check(graph={phase: Backend.FULL})
+
+
+class TestModelBinding(TestCase):
+    """kimi_k3's shared-expert binding: unquantized weights only, and online weight
+    updates rejected before any write (weight_updater's derived-weight-cache hook)."""
+
+    I = 8
+
+    def _mlp(self, quant_method):
+        mlp = torch.nn.Module()
+        for name, shape in (
+            ("gate_up_proj", (2 * self.I, H)),
+            ("down_proj", (H, self.I)),
+        ):
+            lin = torch.nn.Module()
+            lin.weight = torch.nn.Parameter(torch.empty(shape), requires_grad=False)
+            lin.quant_method = quant_method
+            setattr(mlp, name, lin)
+        return mlp
+
+    def _store(self):
+        return make_group(2, [3], 4, shapes=ws.shared_expert_unit_shapes(self.I, H))[0]
+
+    def test_quantized_weights_refused(self):
+        from sglang.srt.models import kimi_k3
+
+        with self.assertRaisesRegex(ValueError, "unquantized weights only"):
+            kimi_k3._bind_shared_experts_weight_shard(
+                self._mlp(object()), self._store(), 3
+            )
+
+    def test_online_updates_rejected(self):
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+        from sglang.srt.model_executor.model_runner_components import weight_updater
+        from sglang.srt.models import kimi_k3
+
+        model = torch.nn.Module()
+        model.mlp = self._mlp(UnquantizedLinearMethod())
+        store = self._store()
+        kimi_k3._bind_shared_experts_weight_shard(model.mlp, store, 3)
+        self.assertEqual(
+            model.mlp.gate_up_proj.weight.data_ptr(),
+            store.param_view(0, "gate_up").data_ptr(),
+        )
+        error = weight_updater._unsupported_derived_weight_cache_error(model)
+        self.assertIn("--kda-weight-shard-size", error)
 
 
 if __name__ == "__main__":

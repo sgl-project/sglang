@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import contextlib
 import ctypes
+import functools
 import logging
 import os
 import weakref
@@ -195,6 +196,7 @@ class LayerWeightShard:
     ``mover``: "ce" (one copy stream) or "ce_ms" (one copy stream per peer).
     ``moe_wait_min_tokens``: ``on_moe_start`` waits for the layer's gathers only in forwards
     of at least this many tokens (``parse_moe_wait``); 0 always, None never.
+    ``group_barrier``: a barrier over the shard group (``finish_load``).
     """
 
     def __init__(
@@ -212,6 +214,7 @@ class LayerWeightShard:
         prefetch_depth: int = 1,
         issue_at: str = "layer",
         moe_wait_min_tokens: Optional[int] = 0,
+        group_barrier: Optional[Callable[[], None]] = None,
     ):
         if moe_wait_min_tokens is not None and moe_wait_min_tokens < 0:
             raise ValueError(
@@ -280,10 +283,13 @@ class LayerWeightShard:
         self.slots = torch.empty(
             (self.num_slots, max(self.e_size)), dtype=dtype, device=device
         )
-        self._expected = list(self.shard_size)  # minus the alignment padding, below
-        for u, pieces in enumerate(self.pieces):
-            self._expected[u] = sum(pc.rows * pc.cols for pc in pieces)
-        self._loaded = [0] * self.num_units
+        self._group_barrier = group_barrier
+        # --load-format dummy: finish_load fills the shard with random values.
+        self.dummy_load = False
+        # Per unit: piece index -> the disjoint row ranges [x, y) of the piece loaded so far.
+        self._loaded: List[Dict[int, List[Tuple[int, int]]]] = [
+            {} for _ in range(self.num_units)
+        ]
 
         cuda = device.type == "cuda"
         self._copy_stream = torch.cuda.Stream(device=device) if cuda else None
@@ -372,7 +378,7 @@ class LayerWeightShard:
         if row_offset < 0 or row_offset + n > R:
             raise ValueError(f"{name}: rows [{row_offset}, +{n}) outside {sp.shape}")
         r = self.group_rank
-        for pc in self.pieces[u]:
+        for i, pc in enumerate(self.pieces[u]):
             if pc.name != name:
                 continue
             piece = self.shard[
@@ -386,25 +392,68 @@ class LayerWeightShard:
                 ) * pc.rows  # first row of the piece
                 x, y = max(lo, row_offset), min(lo + pc.rows, row_offset + n)
                 if x < y:
+                    self._mark_loaded(u, i, x - lo, y - lo)
                     piece[x - lo : y - lo].copy_(
                         loaded[x - row_offset : y - row_offset]
                     )
-                    self._loaded[u] += (y - x) * pc.cols
             else:
+                self._mark_loaded(u, i, row_offset, row_offset + n)
                 piece[row_offset : row_offset + n].copy_(
                     loaded[:, r * pc.cols : (r + 1) * pc.cols]
                 )
-                self._loaded[u] += n * pc.cols
+
+    def _mark_loaded(self, u: int, i: int, x: int, y: int) -> None:
+        """Record rows [x, y) of piece ``i`` of unit ``u``; raises before the write if any
+        of them was already loaded."""
+        ranges = self._loaded[u].setdefault(i, [])
+        for a, b in ranges:
+            if a < y and x < b:
+                pc = self.pieces[u][i]
+                raise RuntimeError(
+                    f"weight shard: layer {self.unit_layers[u]} {pc.name} block {pc.block} "
+                    f"rows [{max(a, x)}, {min(b, y)}) of this rank's slice loaded twice"
+                )
+        ranges.append((x, y))
 
     def check_loaded(self) -> None:
-        bad = [u for u, n in enumerate(self._loaded) if n != self._expected[u]]
+        """Every piece of every unit was loaded exactly once (``_mark_loaded`` keeps the
+        loaded ranges disjoint, so full row counts mean full coverage)."""
+        bad = []
+        for u, pieces in enumerate(self.pieces):
+            for i, pc in enumerate(pieces):
+                got = sum(b - a for a, b in self._loaded[u].get(i, ()))
+                if got != pc.rows:
+                    bad.append((self.unit_layers[u], pc.name, pc.block, got, pc.rows))
         if bad:
             raise RuntimeError(
-                f"weight shard: layers {[self.unit_layers[u] for u in bad[:8]]} received "
-                f"{[self._loaded[u] for u in bad[:8]]} elements, expected "
-                f"{[self._expected[u] for u in bad[:8]]} (a projection was not loaded, or was "
-                "loaded twice)"
+                "weight shard: slices not fully loaded, as (layer, parameter, block, rows "
+                f"loaded, rows expected): {bad[:8]}"
             )
+
+    def init_dummy(self, low: float = -1e-3, high: float = 1e-3, seed: int = 1234):
+        """--load-format dummy: fill this rank's shard with random values, as
+        ``initialize_dummy_weights`` does for parameters, and mark every slice loaded."""
+        if any(self._loaded):
+            raise RuntimeError(
+                "weight shard: dummy init after checkpoint slices loaded"
+            )
+        g = torch.Generator(device=self.shard.device).manual_seed(
+            seed + self.group_rank
+        )
+        self.shard.uniform_(low, high, generator=g)
+        for u, pieces in enumerate(self.pieces):
+            self._loaded[u] = {i: [(0, pc.rows)] for i, pc in enumerate(pieces)}
+
+    def finish_load(self) -> None:
+        """Check the load, then make sure every group rank's shard has landed on its
+        device before any rank's first gather pulls it."""
+        if self.dummy_load and not any(self._loaded):
+            self.init_dummy()
+        self.check_loaded()
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        if self._group_barrier is not None:
+            self._group_barrier()
 
     # ---- gather + schedule ------------------------------------------------------------------
 
@@ -1099,9 +1148,17 @@ def on_moe_start(layer_idx: int, num_tokens: Optional[int] = None) -> None:
 
 
 def check_all_loaded() -> None:
-    """Every store received exactly its checkpoint slices (call after load_weights)."""
+    """Every store received exactly its checkpoint slices."""
     for s in _stores():
         s.check_loaded()
+
+
+def finish_load() -> None:
+    """Call from the model's post_load_weights, which every loader runs (load_weights or
+    not): checks each store's slices (random under --load-format dummy), then syncs the
+    shard group so no peer pulls a shard before its host-to-device copies land."""
+    for s in _stores():
+        s.finish_load()
 
 
 def _exchange_fds(fds: List[int], group, timeout_s: float = 120.0) -> List[List[int]]:
@@ -1264,11 +1321,19 @@ def init_for_model(
     dtype: torch.dtype,
     shared_expert_layers: Sequence[int] = (),
     shared_intermediate_size: int = 0,
+    dummy_load: bool = False,
 ) -> LayerWeightShard:
     """Build the process-wide shard stores for the K3 target model (call before its layers):
     the KDA projections and, for ``shared_expert_layers`` (the MoE layers whose shared
     experts would be replicated on every rank), the shared experts' gate_up and down."""
     global _ACTIVE, _ACTIVE_SHARED
+    if _ACTIVE is not None or _ACTIVE_SHARED is not None:
+        raise RuntimeError(
+            "--kda-weight-shard-size: the weight shard stores were already built for a "
+            "Kimi-K3 model in this process; a second K3-architecture model (e.g. a draft) "
+            "cannot be weight-sharded too. Use a draft of another architecture, or drop "
+            "--kda-weight-shard-size."
+        )
     from sglang.srt.runtime_context import get_parallel
 
     par = get_parallel()
@@ -1299,6 +1364,9 @@ def init_for_model(
         // attn_tp
     )
     moe_wait_min_tokens = parse_moe_wait(envs.SGLANG_K3_KDA_WS_MOE_WAIT.get())
+    group_barrier = functools.partial(
+        torch.distributed.barrier, group=cpu_groups[my_group]
+    )
     if shared_expert_layers:
         s_alloc, s_peers = _vmm_alloc_and_peers(cpu_groups[my_group], dtype, device)
         I = shared_intermediate_size
@@ -1318,7 +1386,9 @@ def init_for_model(
             prefetch_depth=envs.SGLANG_K3_KDA_WS_PREFETCH_DEPTH.get(),
             issue_at="layer",
             moe_wait_min_tokens=moe_wait_min_tokens,
+            group_barrier=group_barrier,
         )
+        _ACTIVE_SHARED.dummy_load = dummy_load
         _ACTIVE_SHARED.stats = envs.SGLANG_K3_KDA_WS_STATS.get()
         s_shard_b, s_slot_b = _ACTIVE_SHARED.bytes_per_rank()
         logger.info(
@@ -1344,7 +1414,9 @@ def init_for_model(
         prefetch_depth=envs.SGLANG_K3_KDA_WS_PREFETCH_DEPTH.get(),
         issue_at=envs.SGLANG_K3_KDA_WS_ISSUE_AT.get(),
         moe_wait_min_tokens=moe_wait_min_tokens,
+        group_barrier=group_barrier,
     )
+    _ACTIVE.dummy_load = dummy_load
     _ACTIVE.stats = envs.SGLANG_K3_KDA_WS_STATS.get()
     shard_b, slot_b = _ACTIVE.bytes_per_rank()
     replicated = len(kda_ids) * (4 * P * H + H * P) * 2
