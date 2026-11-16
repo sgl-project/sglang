@@ -81,6 +81,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     use_aiter_bpreshuffle_gemm,
 )
 from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+from sglang.srt.layers.quantization.kvfp4_tensor import E2M1_VALUES
 from sglang.srt.layers.quantization.marlin_utils_fp8 import prepare_fp8_layer_for_marlin
 from sglang.srt.layers.quantization.mxfp8_block_convert import (
     mxfp8_block_convert_required,
@@ -196,27 +197,7 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 logger = logging.getLogger(__name__)
 _DENSE_MXSCALE_LOGGED: set = set()
 
-DSV4_DEQUANT_FP4_TABLE = torch.tensor(
-    [
-        0.0,
-        0.5,
-        1.0,
-        1.5,
-        2.0,
-        3.0,
-        4.0,
-        6.0,
-        -0.0,
-        -0.5,
-        -1.0,
-        -1.5,
-        -2.0,
-        -3.0,
-        -4.0,
-        -6.0,
-    ],
-    dtype=torch.float32,
-)
+DSV4_DEQUANT_FP4_TABLE = torch.tensor(E2M1_VALUES, dtype=torch.float32)
 
 
 def cast_e2m1fn_to_e4m3fn(
