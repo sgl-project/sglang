@@ -3031,6 +3031,10 @@ class Scheduler(
                 )
             max_new_tokens = min(max_new_tokens, self.max_new_tokens_limit)
 
+        # TpModelWorker also folds KV capacity into max_req_len.
+        max_new_tokens_before_kv = max(
+            0, min(max_new_tokens, self.model_config.context_len - input_len - 2)
+        )
         # Keep this bound consistent with PrefillAdder's admission budget.
         max_new_tokens = max(
             0,
@@ -3058,7 +3062,6 @@ class Scheduler(
         retirement = window_retirement(
             shares_prefixes=self.tree_cache.supports_prefix_sharing()
         )
-        max_new_tokens_before_kv = max_new_tokens
         max_new_tokens = self.token_to_kv_pool_allocator.max_new_tokens_for_memory(
             input_len,
             max_new_tokens,

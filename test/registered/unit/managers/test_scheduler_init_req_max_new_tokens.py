@@ -75,6 +75,7 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
         scheduler = Scheduler.__new__(Scheduler)
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.max_req_len = max_req_len
+        scheduler.model_config = SimpleNamespace(context_len=max_req_len + 1)
         scheduler.max_total_num_tokens = max_total_num_tokens
         scheduler.page_size = page_size
         scheduler.kv_shard_widening = kv_shard_widening
@@ -193,6 +194,27 @@ class TestSchedulerInitReqMaxNewTokens(unittest.TestCase):
                 req = self._new_req(max_new_tokens=requested)
                 self.assertEqual(self._init_and_check(scheduler, req), 11)
                 self.assertIs(req.kv_cache_limited_output, expected)
+
+    def test_kv_capacity_already_folded_into_request_length(self):
+        """A KV-derived request-length cap must still identify the KV limit."""
+        scheduler = self._new_scheduler(max_req_len=511, max_total_num_tokens=512)
+        scheduler.max_new_tokens_limit = None
+        scheduler.model_config.context_len = 4096
+        req = self._new_req(max_new_tokens=1024, input_len=1)
+        self.assertEqual(self._init_and_check(scheduler, req), 509)
+        self.assertTrue(req.kv_cache_limited_output)
+
+    def test_context_and_environment_caps_are_not_kv_limits(self):
+        for context_len, limit, expected in ((512, None, 509), (4096, 16, 16)):
+            with self.subTest(context_len=context_len, limit=limit):
+                scheduler = self._new_scheduler(
+                    max_req_len=511, max_total_num_tokens=512
+                )
+                scheduler.model_config.context_len = context_len
+                scheduler.max_new_tokens_limit = limit
+                req = self._new_req(max_new_tokens=1024, input_len=1)
+                self.assertEqual(self._init_and_check(scheduler, req), expected)
+                self.assertFalse(req.kv_cache_limited_output)
 
     def test_dcp_budget_is_already_in_logical_tokens(self):
         with get_parallel().override(attn_dcp_size=4):
