@@ -17,6 +17,10 @@ from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(est_time=4, suite="base-a-test-npu")
 
+# The backend imports ragged_verify at module level, so load the REAL module
+# before the stub block below shadows its package parent.
+from sglang.srt.speculative.ragged_verify import RaggedVerifyMode  # noqa: F401
+
 for mod in (
     "torch_npu",
     "torch_npu.contrib",
