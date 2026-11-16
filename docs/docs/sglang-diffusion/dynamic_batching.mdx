@@ -150,7 +150,7 @@ for deployment settings and batching tradeoffs.
 - Use `--enable-batching-metrics` to inspect realized batches:
 
 ```text
-Dynamic batch dispatch: size=2/8, user_max=8, queue_wait=5.12ms, stop_reason=delay
-Dynamic batch dispatch: size=1/8, user_max=8, queue_wait=0.04ms, stop_reason=config_cap:1
-Dynamic batch stats (last 5 dispatches): avg_size=2.80, merged_rate=60.0%, full_rate=20.0%, utilization=35.0%, wait_avg=3.21ms, wait_p95=5.12ms, top_rejects=none
+Dynamic batch dispatch: requests=2, outputs=2/8, user_max_outputs=8, queue_wait=5.12ms, stop_reason=delay
+Dynamic batch dispatch: requests=1, outputs=1/1, user_max_outputs=8, queue_wait=0.04ms, stop_reason=config_cap:1
+Dynamic batch stats (last 5 dispatches): avg_requests=2.80, avg_outputs=2.80, merged_rate=60.0%, full_rate=20.0%, utilization=35.0%, wait_avg=3.21ms, wait_p95=5.12ms, top_rejects=none
 ```

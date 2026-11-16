@@ -66,7 +66,9 @@ def test_out_of_place_qknorm_rope_matches_inplace_and_keeps_inputs() -> None:
         (True, 96, False, False, True, torch.bfloat16, torch.float32, torch.int32),
     ],
 )
+@pytest.mark.parametrize("T", [1037, 24611])
 def test_two_rows_per_warp_match_one_row_per_warp(
+    T: int,
     out_of_place: bool,
     rope_dim: int,
     is_neox: bool,
@@ -77,12 +79,13 @@ def test_two_rows_per_warp_match_one_row_per_warp(
     pos_dtype: torch.dtype,
 ) -> None:
     """head_dim 128 runs two rows per warp; its bytes must equal the
-    one-row-per-warp kernel's on every arch, RoPE layout and rounding mode."""
+    one-row-per-warp kernel's on every arch, RoPE layout and rounding mode.
+    A token count above the resident warp count takes the token-major loop."""
     from sglang.kernels.ops.diffusion.rope.qknorm_rope_jit import (
         _jit_qknorm_rope_module,
     )
 
-    T, H, D = 1037, 7, 128  # an odd row count leaves the last warp one row
+    H, D = 7, 128
     g = torch.Generator(device="cpu").manual_seed(rope_dim)
     qkv = (3 * torch.randn(T, 3 * H * D, generator=g)).to("cuda", dtype)
     q = qkv[:, : H * D].view(T, H, D)
@@ -116,6 +119,57 @@ def test_two_rows_per_warp_match_one_row_per_warp(
         else:
             q2, k2 = q.clone(), k.clone()
             module.qknorm_rope(q2, k2, qw, kw, cache, pos, 1e-5)
+            outputs.append((q2, k2))
+    (q_ref, k_ref), (q_new, k_new) = outputs
+    assert torch.equal(q_ref, q_new) and torch.equal(k_ref, k_new)
+
+
+@pytest.mark.parametrize("T", [1037, 50316])
+@pytest.mark.parametrize("out_of_place", [False, True])
+@pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
+def test_four_rows_per_warp_match_one_row_per_warp(
+    T: int, out_of_place: bool, dtype: torch.dtype
+) -> None:
+    """head_dim 64 (H3's video VAE: 32 heads, rope 48, rounded NeoX) runs four
+    rows per warp; its bytes must equal the one-row-per-warp kernel's."""
+    from sglang.kernels.ops.diffusion.rope.qknorm_rope_jit import (
+        _jit_qknorm_rope_module,
+    )
+
+    H, D, rope_dim = 32, 64, 48
+    g = torch.Generator(device="cpu").manual_seed(T)
+    qkv = (3 * torch.randn(T, 3 * H * D, generator=g)).to("cuda", dtype)
+    q = qkv[:, : H * D].view(T, H, D)
+    k = qkv[:, H * D : 2 * H * D].view(T, H, D)
+    qw = (torch.rand(D, generator=g) + 0.5).to("cuda", dtype)
+    kw = (torch.rand(D, generator=g) + 0.5).to("cuda", dtype)
+    freqs = 50 * torch.randn(1797, rope_dim // 2, generator=g)
+    cache = torch.cat((freqs.cos(), freqs.sin()), -1).to("cuda", dtype)
+    pos = torch.randint(0, 1797, (T,), generator=g).to("cuda", torch.int64)
+    outputs = []
+    for four_rows in (False, True):
+        module = _jit_qknorm_rope_module(
+            D,
+            rope_dim,
+            True,
+            dtype,
+            dtype,
+            True,
+            False,
+            False,
+            out_of_place,
+            half_warp=four_rows,
+        )
+        if out_of_place:
+            q_out = torch.empty(T, H, D, device="cuda", dtype=dtype)
+            k_out = torch.empty_like(q_out)
+            module.qknorm_rope_out_of_place(
+                q, k, q_out, k_out, qw, kw, cache, pos, 1e-6
+            )
+            outputs.append((q_out, k_out))
+        else:
+            q2, k2 = q.clone(), k.clone()
+            module.qknorm_rope(q2, k2, qw, kw, cache, pos, 1e-6)
             outputs.append((q2, k2))
     (q_ref, k_ref), (q_new, k_new) = outputs
     assert torch.equal(q_ref, q_new) and torch.equal(k_ref, k_new)

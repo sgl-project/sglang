@@ -73,6 +73,26 @@ class TestSamplingMaskValidation(CustomTestCase):
                     with self.assertRaisesRegex(ValueError, "top_logprobs"):
                         self.manager._validate_one_request(req, req.input_ids)
 
+    def test_token_indices_to_pool_must_be_prompt_positions(self):
+        prompt_only = {"max_new_tokens": 0}
+        for indices, sampling_params, accepted in (
+            ([0, 2], prompt_only, True),
+            ([], prompt_only, False),
+            ([3], prompt_only, False),
+            ([0], {}, False),
+        ):
+            with self.subTest(indices=indices, sampling_params=sampling_params):
+                req = GenerateReqInput(
+                    input_ids=[1, 2, 3],
+                    sampling_params=sampling_params,
+                    token_indices_to_pool=indices,
+                )
+                if accepted:
+                    self.manager._validate_one_request(req, req.input_ids)
+                else:
+                    with self.assertRaisesRegex(ValueError, "token_indices_to_pool"):
+                        self.manager._validate_one_request(req, req.input_ids)
+
     def test_logprob_start_len_must_be_at_least_minus_one(self):
         for logprob_start_len, return_logprob, accepted in (
             (None, True, True),

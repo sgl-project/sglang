@@ -1275,6 +1275,7 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         dit_parameter_count=None,
         checkpoint_sizes=None,
         is_cuda=True,
+        device_name="Test CUDA",
         kwargs=None,
     ):
         def get_available_gpu_memory(device_id=0, **_kwargs):
@@ -1314,7 +1315,7 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
                 "sglang.multimodal_gen.runtime.platforms.current_platform.enable_dit_layerwise_offload_by_default",
                 return_value=True,
             ),
-            patch.object(current_platform, "get_device_name", return_value="Test CUDA"),
+            patch.object(current_platform, "get_device_name", return_value=device_name),
             patch(
                 "sglang.multimodal_gen.runtime.platforms.current_platform.get_device_total_memory",
                 return_value=memory_gb * 1024**3,
@@ -2894,17 +2895,25 @@ class TestOffloadDefaults(_CudaPlatformTestCase):
         self.assertIsNone(args.layerwise_offload_components)
 
     def test_auto_ltx2_two_stage_device_mode_follows_device_memory(self):
-        for memory_gb, mode in ((140, "resident"), (80, "original")):
-            args = self._from_dict_with_pipeline_config(
-                LTX2PipelineConfig(),
-                memory_gb=memory_gb,
-                kwargs={
-                    "model_path": "Lightricks/LTX-2",
-                    "num_gpus": 2,
-                    "pipeline_class_name": "LTX2TwoStagePipeline",
-                },
-            )
-            self.assertEqual(args.ltx2_two_stage_device_mode, mode)
+        """The default follows total memory only. A 96 GiB GH200 has "H200" in
+        its device name and used to get both stage DiTs resident."""
+        for device_name, memory_gb, mode in (
+            ("NVIDIA H200", 140, "resident"),
+            ("Test CUDA", 80, "original"),
+            ("NVIDIA GH200 480GB", 96, "original"),
+        ):
+            with self.subTest(device_name=device_name, memory_gb=memory_gb):
+                args = self._from_dict_with_pipeline_config(
+                    LTX2PipelineConfig(),
+                    memory_gb=memory_gb,
+                    device_name=device_name,
+                    kwargs={
+                        "model_path": "Lightricks/LTX-2",
+                        "num_gpus": 2,
+                        "pipeline_class_name": "LTX2TwoStagePipeline",
+                    },
+                )
+                self.assertEqual(args.ltx2_two_stage_device_mode, mode)
 
     def test_auto_high_memory_ltx23_original_keeps_default_layerwise_components(self):
         args = self._from_dict_with_pipeline_config(

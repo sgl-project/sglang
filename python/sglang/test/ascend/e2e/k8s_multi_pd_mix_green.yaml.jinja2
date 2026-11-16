@@ -41,8 +41,6 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.hostIP
-        - name: INSTALL_SGLANG_FROM_SOURCE
-          value: "{{ install_sglang_from_source }}"
         - name: KUBECONFIG
           value: "{{ kube_config }}"
         - name: NAMESPACE

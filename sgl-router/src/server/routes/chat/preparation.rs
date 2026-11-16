@@ -116,6 +116,10 @@ pub(super) struct PreparedRequest {
     sampling_defaults: Vec<(SamplingField, Number)>,
     /// Turns the engine's `/generate` response back into the OpenAI one.
     pub(super) responder: Option<Responder>,
+    /// A non-streaming, single-sample native `/generate` asking for logprobs:
+    /// under PD only prefill computes the prompt, so its input logprobs go into
+    /// decode's response.
+    pub(super) merges_input_logprobs: bool,
 }
 
 impl PreparedRequest {
@@ -266,6 +270,7 @@ impl PreparedRequest {
             parsed_body,
             sampling_defaults,
             responder: None,
+            merges_input_logprobs: false,
         })
     }
 
@@ -325,6 +330,7 @@ impl PreparedRequest {
             input_ids_forwarding: None,
             forwarding_booked: false,
             responder: None,
+            merges_input_logprobs: false,
             cache_namespace: cache_namespace(COMPLETIONS_PATH, &value),
             parsed_body: Some(value),
             sampling_defaults,
@@ -339,7 +345,10 @@ impl PreparedRequest {
         body: Bytes,
     ) -> Result<Self, ApiError> {
         let value = Value::Object(serde_json::from_slice(&body).map_err(|_| invalid_request())?);
-        Self::generate_value(ctx, model, value, Some(body))
+        let return_logprob = value["return_logprob"] == true;
+        let mut request = Self::generate_value(ctx, model, value, Some(body))?;
+        request.merges_input_logprobs = return_logprob && !request.streaming && !request.fans_out;
+        Ok(request)
     }
 
     /// [`Self::generate`] over a parsed body: the client's `body` gets the
@@ -422,6 +431,7 @@ impl PreparedRequest {
             parsed_body: Some(value),
             sampling_defaults: Vec::new(),
             responder: None,
+            merges_input_logprobs: false,
         })
     }
 
@@ -544,6 +554,7 @@ impl PreparedRequest {
             input_ids_forwarding: None,
             forwarding_booked: false,
             responder: None,
+            merges_input_logprobs: false,
             parsed_body: None,
             cache_namespace: CacheNamespace::default(),
             sampling_defaults,
@@ -581,6 +592,7 @@ impl PreparedRequest {
             parsed_body: None,
             sampling_defaults: Vec::new(),
             responder: None,
+            merges_input_logprobs: false,
         }
     }
 

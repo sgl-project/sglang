@@ -1887,7 +1887,7 @@ class PlatformContext:
             raise AttributeError(
                 f"unknown platform fact {name!r}; known: {', '.join(known)}"
             )
-        overrides = object.__getattribute__(self, "_overrides")
+        overrides = self._overrides
         if name in overrides:
             return overrides[name]
         from sglang.srt.utils import device as _device

@@ -43,6 +43,10 @@ from sglang.test.test_utils import (
 
 INFERENCEX_REPO = "https://github.com/SemiAnalysisAI/InferenceX.git"
 INFERENCEX_COMMIT = "4538f1bc9784426ae92da31b7e8daae4ba637b84"
+# srt-slurm fronts a recipe whose frontend is ``sglang-router`` with
+# ``python3 -m sglang_router.launch_router`` from this PyPI package, which the
+# image does not ship, so the harness installs it before launching the router.
+SGLANG_ROUTER_VERSION = "0.3.2"
 # What InferenceX's benchmark workflow sets for every AgentX point.
 THINKING_MODE = "thinking_on"
 
@@ -223,6 +227,16 @@ def _server_launch(recipe: dict) -> tuple:
 
 def _launch_router(worker_url: str, frontend_args: dict) -> tuple:
     """Start sglang-router in front of ``worker_url`` as srt-slurm does; ``(process, url)``."""
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pip",
+            "install",
+            f"sglang-router=={SGLANG_ROUTER_VERSION}",
+        ],
+        check=True,
+    )
     port = find_available_port(int(worker_url.rsplit(":", 1)[1]))
     command = [
         sys.executable,

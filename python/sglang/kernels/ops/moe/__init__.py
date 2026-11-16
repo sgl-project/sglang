@@ -359,6 +359,35 @@ for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
         )
     )
 del _mod, _fn, _desc
+
+# Muse Spark on gfx950 (MI355X): FlyDSL expert GEMMs and finalize (builders return the compiled launch).
+_MUSE_SPARK_GFX950_FLYDSL_KERNELS = [
+    (
+        "muse_moe_gemm",
+        "launch_muse_moe_gemm",
+        "grouped expert GEMM, BF16 or row-major packed MXFP4 weights (gate/up and down)",
+    ),
+    (
+        "muse_moe_finalize",
+        "build_finalize",
+        "per-expert RMSNorm (with gain) + routing-weight reduction",
+    ),
+    (
+        "muse_moe_finalize",
+        "build_splitk_silu",
+        "split-K partial sum + SiLU-and-mul of the gate/up output",
+    ),
+]
+for _mod, _fn, _desc in _MUSE_SPARK_GFX950_FLYDSL_KERNELS:
+    register_kernel(
+        KernelSpec(
+            op=f"moe.{_fn}",
+            backend=KernelBackend.FLYDSL,
+            target=f"sglang.kernels.ops.moe.{_mod}:{_fn}",
+            capabilities=frozenset({CapabilityRequirement.HIP}),
+        )
+    )
+del _mod, _fn, _desc
 register_kernel(
     KernelSpec(
         op="moe.multi_router_topk",

@@ -43,7 +43,7 @@ Document orthogonal controls as feature overlays instead:
 For memory placement, prefer the unified
 [`--component-residency`](/docs/sglang-diffusion/api/cli#component-residency)
 selector. Each component resolves to exactly one of `resident`,
-`component-offload`, or `layerwise-offload`. Existing options such as
+`component-offload`, `snapshot-offload`, or `layerwise-offload`. Existing options such as
 `--dit-cpu-offload`, `--text-encoder-cpu-offload`,
 `--image-encoder-cpu-offload`, and `--vae-cpu-offload` remain supported by all
 recipes that already use them.

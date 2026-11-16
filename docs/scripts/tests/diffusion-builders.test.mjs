@@ -467,6 +467,41 @@ test("H3-Image PNG compression stays request-scoped and preserves the default pa
   }
 });
 
+test("H3-Image AMD recipes use AITER Auto placement and their measured 4K scope", () => {
+  const config = get("/MiniMax/MiniMax-H3-Image.mdx");
+  const resource = config.commandBuilder.resource;
+  for (const hw of ["mi355x", "mi350x", "mi325x", "mi300x"]) {
+    assert.ok(config.supportedHardware.includes(hw), hw);
+    assert.equal(config.hardware.find((entry) => entry.id === hw).vendor, "amd");
+    for (const [gpus_per_node, tp_size, ulysses_degree] of [[1, 1, 1], [2, 2, 1], [2, 1, 2], [4, 4, 1], [4, 1, 4], [8, 1, 8], [8, 8, 1]]) {
+      const base = { hw, gpus_per_node, topology_mode: "manual", tp_size, ulysses_degree, ring_degree: 1 };
+      for (const task of [
+        { size: "4736x3552" }, { size: "6272x2688" }, { mode: "edit", size: "4096x4096" },
+        { size: "2048x2048" }, { mode: "edit", size: "2048x2048" },
+      ]) {
+        const result = resolve(config, { ...base, ...task });
+        assert.deepEqual(result.builder.errors, []);
+        assert.equal(result.verified, true, JSON.stringify({ ...base, ...task }));
+        assert.equal(result.builder.resolvedSettings.attention, "AITER (auto)");
+        assert.equal(result.builder.resolvedSettings.adaln, "Keep weights");
+        assert.ok(!result.flags.some((flag) => flag.startsWith("--attention-backend")));
+      }
+      for (const override of [
+        { size: "5472x3072" }, { quality: "exact" }, { placement: "resident" }, { adaln: "online" },
+        { warmup: "off" }, { quantization: "fp8-all" }, { mode: "edit", size: "4096x4096", references: "two" },
+      ]) assert.equal(resolve(config, { ...base, size: "4736x3552", ...override }).verified, false);
+    }
+    for (const gpus_per_node of [1, 2, 4, 8]) {
+      const recipe = resource.recommendedRecipe(selection(config, { hw, gpus_per_node }));
+      assert.equal(recipe.ulysses_degree, gpus_per_node);
+      assert.equal(recipe.unverified, undefined);
+    }
+    const ring = resolve(config, { hw, gpus_per_node: 2, topology_mode: "manual", tp_size: 1, ulysses_degree: 1, ring_degree: 2 });
+    assert.match(ring.builder.errors.join(" "), /Ring parallelism requires FlashAttention/);
+  }
+  assert.equal(resolve(config, { hw: "h200", size: "4736x3552" }).builder.resolvedSettings.attention, undefined);
+});
+
 test("Wan preserves standard, multi-GPU, Ascend and LoRA recipes", () => {
   for (const version of ["1", "2"]) {
     const config = get(`/Wan/Wan2.${version}.mdx`);

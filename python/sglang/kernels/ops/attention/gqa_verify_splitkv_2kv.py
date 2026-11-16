@@ -57,7 +57,7 @@ def _vv2_tile(
     if MASKED:
         valid = positions < kvlen
     # 64-bit page offsets: a layer's pool can exceed 2^31 bytes
-    kb = blocks.to(tl.int64) * kv_s0 + (nr % PAGE) * kv_s1
+    kb = blocks.to(tl.int64) * kv_s0 + (positions % PAGE) * kv_s1
     if MASKED:
         k0 = tl.load(K + kb[None, :] + d[:, None], mask=valid[None, :], other=0.0)
         k1 = tl.load(K + kb[None, :] + 64 + d[:, None], mask=valid[None, :], other=0.0)
@@ -341,7 +341,7 @@ def gqa_verify_splitkv_2kv(
     pairs = kv_heads // 2
     assert q.dtype == torch.bfloat16 and k.dtype == v.dtype
     assert q.shape[-1] == HD and kv_heads in (2, 4) and heads == GQA * kv_heads
-    assert k.shape[1] == 16
+    assert k.shape[1] == v.shape[1] and k.shape[1] in (16, 32, 64, 128)
     assert (
         q.shape[0] == num_seqs * QL
         and k.stride() == v.stride()

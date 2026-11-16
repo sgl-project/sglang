@@ -568,6 +568,39 @@ FLUX3_ACTION_CI_sampling_params = DiffusionSamplingParams(
 )
 
 
+# Praxis-1 first call of an episode: one frame per view and one pose8 row per arm, so
+# the server returns 21 command rows. The video guidance is the checkpoint default.
+PRAXIS_DROID_CI_sampling_params = DiffusionSamplingParams(
+    prompt="Put the red block in the bowl.",
+    extras={
+        "action_horizon": 21,
+        "action_dim": 13,
+        "state_dim": 8,
+        "image_height": 234,
+        "image_width": 416,
+        "camera_order": ("exterior", "wrist"),
+        "observation_rows": 1,
+        "state_row": [0.4, 0.0, 0.4, 1.0, 0.0, 0.0, 0.0, 0.0],
+        "seed": 0,
+    },
+)
+
+PRAXIS_YAM_CI_sampling_params = DiffusionSamplingParams(
+    prompt="Pick up the pen from the center of the table, then place the pen in the bag",
+    extras={
+        "action_horizon": 21,
+        "action_dim": 26,
+        "state_dim": 16,
+        "image_height": 260,
+        "image_width": 416,
+        "camera_order": ("exterior", "wrist_left", "wrist_right"),
+        "observation_rows": 1,
+        "state_row": [0.4, 0.2, 0.35, 1.0, 0.0, 0.0, 0.0, 0.0] * 2,
+        "seed": 0,
+    },
+)
+
+
 def sample_step_indices(
     step_map: dict[int, float], fractions: Sequence[float]
 ) -> list[int]:

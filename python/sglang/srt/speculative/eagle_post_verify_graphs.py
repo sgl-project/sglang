@@ -31,11 +31,47 @@ logger = logging.getLogger(__name__)
 
 # Eager rounds per post-verify key before its graphs are captured.
 _NUM_WARMUP = 2
-# Arbitrary bound on post-verify graph sets (key x verify logits buffer); a batch
-# past it runs SGLang's eager path.
-_MAX_POST_VERIFY_STATES = 64
+
+
+def _max_graph_keys() -> int:
+    """Arbitrary bound on post-verify graph sets (key x verify logits buffer); a batch
+    past it runs SGLang's eager path."""
+    if not envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get():
+        return 64
+    return envs.SGLANG_POST_VERIFY_MAX_GRAPH_KEYS.get()
+
+
+_MAX_POST_VERIFY_STATES = _max_graph_keys()
 # SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD: a round's inputs and its forced length staged in one launch.
 _ONE_LAUNCH_LOAD = envs.SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD.get()
+
+
+# Arbitrary headroom for the body's large temporaries besides its two sampling buffers.
+_PRESIZE_MARGIN = 64 << 20
+
+
+def pool_presize_bytes(
+    *, max_requests: int, tokens_per_request: int, vocab: int, free_bytes: int
+) -> int:
+    """Two fp32 [requests * tokens, vocab] sampling buffers plus a margin; 0 (the pool
+    grows per key) without 1 GiB to spare."""
+    nbytes = 2 * max_requests * tokens_per_request * vocab * 4 + _PRESIZE_MARGIN
+    if free_bytes < nbytes + (1 << 30):
+        logger.warning(
+            "The post-verify graph pool is not presized: %.2f GiB free for %.2f GiB",
+            free_bytes / 2**30,
+            nbytes / 2**30,
+        )
+        return 0
+    logger.info(
+        "The post-verify graph pool is presized to %.2f GiB (%d requests x %d tokens, "
+        "vocab %d)",
+        nbytes / 2**30,
+        max_requests,
+        tokens_per_request,
+        vocab,
+    )
+    return nbytes
 
 
 class EaglePostVerifyGraphs:
@@ -115,6 +151,21 @@ class EaglePostVerifyGraphs:
         """Order the current stream after the last side-stream mamba state commit; the
         worker calls it once the draft extend is enqueued."""
         self._graphs.join()
+
+    def enable_pool_presize(self) -> None:
+        """The pool's first capture takes and frees the largest key's scratch, so later
+        keys split that segment: a private pool never returns segments."""
+        self._graphs.presize = self._pool_presize_bytes
+
+    def _pool_presize_bytes(self, slot: SimpleNamespace) -> int:
+        torch.cuda.empty_cache()  # so the free reading counts cached blocks
+        graph_sizes = self._target_worker.model_runner.decode_cuda_graph_capture_bs
+        return pool_presize_bytes(
+            max_requests=max([slot.num_requests, *graph_sizes]),
+            tokens_per_request=slot.tokens_per_request,
+            vocab=slot.logits.shape[-1],
+            free_bytes=torch.cuda.mem_get_info()[0],
+        )
 
     def _key(
         self,
@@ -241,7 +292,9 @@ class EaglePostVerifyGraphs:
         state_slots = None
         if "state_slots" in staged:
             state_slots = ForwardStateSlots(
-                staged["state_slots"], staged.get("track_state_slots")
+                staged["state_slots"],
+                staged.get("track_state_slots"),
+                staged.get("ring_rows"),
             )
         commit_mamba_states_after_verify(
             self._target_worker,
@@ -332,6 +385,8 @@ class _PostVerifyGraphs:
         self._sim_rng = sim_rng
         self._states: dict[tuple, SimpleNamespace] = {}
         self._pool = None
+        # slot -> bytes the pool's first capture takes and frees (enable_pool_presize)
+        self.presize: Optional[Callable] = None
         self._side_stream = self._main_done = self._commit_done = None
         self._commit_pending = False
         # The host runs up to ~2 rounds ahead; a pinned slot is rewritten only after
@@ -455,10 +510,13 @@ class _PostVerifyGraphs:
     def _capture(self, slot: SimpleNamespace) -> None:
         from sglang.srt.distributed.parallel_state import graph_capture
 
+        presize = 0
         if self._pool is None:
             self._pool = torch.cuda.graph_pool_handle()
             self._side_stream = torch.cuda.Stream()
             self._main_done, self._commit_done = torch.cuda.Event(), torch.cuda.Event()
+            if self.presize is not None:
+                presize = self.presize(slot)
         graph = torch.cuda.CUDAGraph()
         with graph_capture(stream=torch.cuda.current_stream()) as ctx:
             with torch.cuda.graph(
@@ -467,6 +525,11 @@ class _PostVerifyGraphs:
                 stream=ctx.stream,
                 capture_error_mode="thread_local",
             ):
+                if presize:  # size the private pool's first segment for the largest key
+                    scratch = torch.empty(
+                        presize, dtype=torch.uint8, device=slot.device
+                    )
+                    del scratch
                 outputs = self._body(slot)
         # Captured after the main graph in the same pool and replayed after it.
         commit_graph = torch.cuda.CUDAGraph()
@@ -512,4 +575,6 @@ def _post_verify_inputs(
         inputs["state_slots"] = state_slots.working
         if state_slots.track is not None:
             inputs["track_state_slots"] = state_slots.track
+        if state_slots.ring is not None:
+            inputs["ring_rows"] = state_slots.ring
     return inputs

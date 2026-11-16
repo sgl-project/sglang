@@ -116,9 +116,11 @@ def bootstrap_scheduler_process(spec: SchedulerProcessSpec) -> None:
     from sglang.multimodal_gen.runtime.utils.process import (
         defer_full_gc_for_imports,
         kill_itself_when_parent_died,
+        use_thread_lock_for_tqdm,
     )
 
     kill_itself_when_parent_died()
+    use_thread_lock_for_tqdm()
 
     # Every rank re-executes the same script, so one rank reporting is enough.
     if spec.rank == 0:

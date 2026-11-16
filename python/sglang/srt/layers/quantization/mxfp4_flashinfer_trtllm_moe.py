@@ -610,52 +610,39 @@ def maybe_fuse_routed_scale_and_shared_add(
     return routed
 
 
-# Fused finalize + shared add + TP all-reduce, staged through a CustomAllReduceV2
-# push plane: the TP group's own, or a dedicated push-only one.
+# Fused finalize + shared add + TP all-reduce, staged through the push slots of
+# the TP group's symmetric workspace.
 
-_fused_all_reduce_comm = None
+_fused_all_reduce_lease = None
+_fused_all_reduce_registered = False
 
 
-def register_fused_all_reduce_comm(
-    *, max_push_size: Optional[int] = None, max_push_blocks: Optional[int] = None
-) -> None:
-    """Hand a push plane to the fusion kernels, once per process: the TP group's
-    own, or with ``max_push_size`` a dedicated push-only plane of that slot size
-    and ``max_push_blocks`` default launch width. Must run before graph capture;
+def register_fused_all_reduce_comm(*, max_push_size: Optional[int] = None) -> None:
+    """Declare the push slots the fusion kernels stage through on the TP group's
+    symmetric workspace, once per process: ``max_push_size`` bytes per slot, or
+    the TP custom all-reduce's slot. Must run before the workspace is finalized;
     unregistered means everything runs unfused."""
-    global _fused_all_reduce_comm
-    if _fused_all_reduce_comm is not None:
+    global _fused_all_reduce_lease
+    if _fused_all_reduce_lease is not None:
         return
-    from sglang.kernels.ops.communication import all_reduce_fusion
-    from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-        CustomAllReduceV2,
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        V2_PUSH_SLOT,
+        WorkspaceRequest,
+        request_group_workspace,
     )
 
-    comm = get_parallel().tp_group.ca_comm
-    if (
-        isinstance(comm, CustomAllReduceV2)
-        and not comm.disabled
-        and max_push_size is not None
-    ):
-        from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
-
-        comm = CustomAllReduceV2(
-            comm.group,
-            comm.device,
-            max_pull_size=0,
-            max_pull_blocks=0,
-            max_push_size=max_push_size,
-            max_push_blocks=max_push_blocks,
-        )
-        register_comm_cleanup(comm)
-    if isinstance(comm, CustomAllReduceV2) and not comm.disabled:
-        all_reduce_fusion.register_comm(comm.obj)
-        _fused_all_reduce_comm = comm
-    else:
+    _fused_all_reduce_lease = request_group_workspace(
+        get_parallel().tp_group,
+        WorkspaceRequest(
+            owner="moe_finalize_all_reduce",
+            push_slot_bytes=max_push_size or V2_PUSH_SLOT,
+        ),
+    )
+    if _fused_all_reduce_lease is None:
         log_info_on_rank0(
             logger,
-            "Fused MoE finalize: TP group has no "
-            "CustomAllReduceV2 push plane; keeping the unfused finalize path",
+            "Fused MoE finalize: TP group cannot host a symmetric workspace; "
+            "keeping the unfused finalize path",
         )
 
 
@@ -666,11 +653,17 @@ def can_fuse_all_reduce(num_tokens: int, hidden_dim: int) -> bool:
 
     The deferred-finalize handle type carries its own numeric contract (every
     producer folds the routed scaling; no consumer rescales)."""
+    global _fused_all_reduce_registered
     from sglang.kernels.ops.communication import all_reduce_fusion
 
-    comm = _fused_all_reduce_comm
-    if comm is None or comm.world_size != get_parallel().tp_size:
+    lease = _fused_all_reduce_lease
+    if lease is None or lease.world_size != get_parallel().tp_size:
         return False
+    if not _fused_all_reduce_registered:
+        all_reduce_fusion.register_comm(
+            lease.get_communicator, world_size=lease.world_size
+        )
+        _fused_all_reduce_registered = True
     return num_tokens <= 384 and all_reduce_fusion.fits_push_slot(
-        comm.max_push_size, num_tokens, hidden_dim
+        lease.request.push_slot_bytes, num_tokens, hidden_dim
     )

@@ -783,7 +783,6 @@ def test_dense_silu_graph_replay():
         {"fuse_silu_and_mul": False},
         {"out_dtype": torch.int8},
         {"group_size": 64},
-        {"masked_m": torch.tensor([1], dtype=torch.int32)},
     ],
 )
 def test_dense_silu_invalid_mode(overrides):
@@ -792,6 +791,36 @@ def test_dense_silu_invalid_mode(overrides):
     kwargs.update(overrides)
     with pytest.raises(ValueError, match="mode"):
         per_token_group_quant(x, **kwargs)
+
+
+@pytest.mark.parametrize("scale_ue8m0,hidden", [(False, 1408), (True, 1536)])
+def test_dense_silu_masked_bitexact(scale_ue8m0, hidden):
+    """Masked dense fusion quantizes each expert's first masked_m[e] rows exactly
+    as the flat dense mode does; an empty, a one-row, a partial and a full expert
+    exercise the masked counts."""
+    torch.manual_seed(7)
+    tokens_pad = 384
+    counts = [0, 1, 200, tokens_pad]
+    x = torch.randn(len(counts), tokens_pad, 2 * hidden, device="cuda") * 3
+    x = x.to(torch.bfloat16)
+    kwargs = dict(
+        fuse_silu_and_mul=True,
+        silu_and_mul_mode="dense",
+        column_major_scales=True,
+        scale_ue8m0=scale_ue8m0,
+    )
+    masked_m = torch.tensor(counts, device="cuda", dtype=torch.int32)
+    q, s = per_token_group_quant(x, masked_m=masked_m, expected_m=64, **kwargs)
+    for expert, count in enumerate(counts):
+        if count == 0:
+            continue
+        expected_q, expected_s = per_token_group_quant(
+            x[expert, :count].contiguous(), **kwargs
+        )
+        assert torch.equal(
+            q[expert, :count].view(torch.uint8), expected_q.view(torch.uint8)
+        )
+        assert torch.equal(s[expert, :count], expected_s)
 
 
 # --------------------------------------------------------------------------- #

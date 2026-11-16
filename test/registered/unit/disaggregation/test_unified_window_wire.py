@@ -244,6 +244,23 @@ class TestStateEntryAgreement(CustomTestCase):
             with self.assertRaisesRegex(RuntimeError, "mixed pool kinds"):
                 check_state_wire(prefill, decode)
 
+    def test_a_draft_ring_on_one_side_names_the_ring(self):
+        storage = _wire({"window_16": 16})
+        with_ring = storage + [["draft_ring", None], ["request_row", None]]
+        for prefill, decode, role in (
+            (with_ring, storage, "prefill"),
+            (storage, with_ring, "decode"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                f"only the {role} server registers a DFLASH draft KV ring.*"
+                f"SGLANG_ENABLE_DFLASH_DRAFT_KV_RING=0 on the {role} server",
+            ):
+                check_state_wire(prefill, decode)
+        # Any other difference keeps the generic message.
+        with self.assertRaisesRegex(RuntimeError, "Both servers must hold"):
+            check_state_wire(with_ring, _wire({"window_8": 8}))
+
     def test_prefill_sends_the_tail_its_decode_keeps(self):
         kv_args = SimpleNamespace(
             state_types=[StateType.SWA, StateType.SWA, StateType.SWA],

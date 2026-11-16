@@ -293,6 +293,11 @@ These techniques can change the denoising path, numerical representation, or gen
       <td style={{padding: "9px 12px"}}><a href="/docs/sglang-diffusion/teacache">TeaCache</a></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500}}>Spectrum</td>
+      <td style={{padding: "9px 12px"}}>Forecasts DiT features to skip selected denoising steps on supported native pipelines.</td>
+      <td style={{padding: "9px 12px"}}><a href="/docs/sglang-diffusion/spectrum">Spectrum Acceleration</a></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500}}>Progressive resolution</td>
       <td style={{padding: "9px 12px"}}>Runs early denoising at lower latent resolution for supported pipelines.</td>
       <td style={{padding: "9px 12px"}}><a href="/docs/sglang-diffusion/progressive_resolution">Progressive Resolution Generation</a></td>
@@ -309,8 +314,8 @@ These techniques can change the denoising path, numerical representation, or gen
 
 1. Establish a baseline with the target model, resolution, frame count, step count, and GPU type.
 2. Select `--performance-mode` and explicit residency or parallelism flags.
-3. Compare `quality=lossless` with `quality=lossless` to isolate the request-gated fusion set.
-4. Compare breakable CUDA graph against eager execution for supported fixed-shape pipelines. Pass every served resolution to `--warmup-resolutions` and confirm capture in the server log. Models with request-gated DiT fusions cannot combine those fusions with a graph captured from the lossless branches.
+3. Compare `quality=exact` with `quality=lossless` to isolate the request-gated fusion set.
+4. Compare breakable CUDA graph against eager execution for supported fixed-shape pipelines. Pass every served resolution to `--warmup-resolutions` and confirm capture in the server log. Warmup captures graphs only at the warmup request's quality level (`lossless` unless `--warmup-sampling-params` sets `quality`); requests at another level run eager.
 5. Tune attention backend and batching for the deployment pattern.
 6. Profile if the bottleneck is unclear.
 7. Add `quality=high`, caching, progressive resolution, or quantization only after comparing output quality against your acceptance target.

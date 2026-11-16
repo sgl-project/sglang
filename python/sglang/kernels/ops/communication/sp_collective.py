@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import os
-from typing import TYPE_CHECKING, NamedTuple, Optional
+from typing import TYPE_CHECKING, Callable, NamedTuple, Optional
 
 import torch
 
@@ -14,6 +14,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
+from sglang.kernels.ops.communication.comm_registry import CommRegistry
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -162,20 +163,14 @@ def _jit_module(world_size: int) -> Module:
     )
 
 
-_COMM_MAP: dict[int, Communicator] = {}
+_COMMS = CommRegistry("sp_collective")
 
 
-def register_comm(comm: Communicator) -> None:
-    # One communicator per world_size per process -- see the note in
-    # communication/all_reduce_residual.py::register_comm. The ops key only on world_size, so an
-    # overwrite here would hand the old group's callers the new group's peer
-    # pointers.
-    prev = _COMM_MAP.get(comm.world_size)
-    assert prev is None or prev is comm, (
-        f"a different communicator is already registered for world_size="
-        f"{comm.world_size}"
-    )
-    _COMM_MAP[comm.world_size] = comm
+def register_comm(provider: Callable[[], Communicator], *, world_size: int) -> None:
+    """Register the provider of the communicator these ops launch over; it runs on
+    first launch (see ``CommRegistry``).
+    """
+    _COMMS.register(provider, world_size=world_size)
 
 
 @register_custom_op(mutates_args=["output"])
@@ -189,7 +184,7 @@ def _reduce_scatter_res_op(
     block_size: int,
 ) -> None:
     _jit_module(world_size).reduce_scatter_res(
-        _COMM_MAP[world_size],
+        _COMMS.get(world_size),
         input.view(-1),
         output.view(-1),
         None if residual is None else residual.view(-1),
@@ -211,7 +206,7 @@ def _reduce_scatter_pull_op(
     block_size: int,
 ) -> None:
     _jit_module(world_size).reduce_scatter_pull(
-        _COMM_MAP[world_size],
+        _COMMS.get(world_size),
         input.view(-1),
         output.view(-1),
         None if residual is None else residual.view(-1),
@@ -231,7 +226,7 @@ def _all_gather_op(
     block_size: int,
 ) -> None:
     _jit_module(world_size).all_gather(
-        _COMM_MAP[world_size],
+        _COMMS.get(world_size),
         input.view(-1),
         output.view(-1),
         num_blocks,
@@ -249,7 +244,7 @@ def _all_gather_direct_op(
     block_size: int,
 ) -> None:
     _jit_module(world_size).all_gather_direct(
-        _COMM_MAP[world_size],
+        _COMMS.get(world_size),
         input.view(-1),
         output.view(-1),
         output_mc_ptr,

@@ -51,6 +51,7 @@ from sglang.srt.layers.attention.dsa.paged_mqa_logits_backend import (
 )
 from sglang.srt.layers.attention.dsa.utils import (
     aiter_can_use_preshuffle_paged_mqa,
+    fp8_mqa_logits_bf16,
     gfx950_fused_indexer_runtime_ok,
     gfx950_model_shape_supported,
     hadamard_preserved,
@@ -60,6 +61,7 @@ from sglang.srt.layers.attention.dsa.utils import (
     resolve_fp8_paged_mqa_logits_fn,
     resolve_num_sms,
     resolve_paged_mqa_logits_metadata_fn,
+    use_bf16_indexer_logits,
 )
 from sglang.srt.layers.attention.graph_variants import DSA_DENSE
 from sglang.srt.layers.attention.mqa_logits_utils import (
@@ -1338,6 +1340,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         ke: torch.Tensor,
     ) -> torch.Tensor:
         q_padded, w_padded, _ = self._pad_heads_for_deep_gemm(q_fp8, weights)
+        if use_bf16_indexer_logits():
+            return fp8_mqa_logits_bf16(q_padded, kv_fp8, w_padded, ks, ke)
         return resolve_fp8_mqa_logits_fn()(
             q_padded,
             kv_fp8,
@@ -1761,6 +1765,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         k_scale = k_scale.view(torch.float32).squeeze(-1)
         kv_fp8 = (k_fp8, k_scale)
+        bf16_logits = use_bf16_indexer_logits()
 
         # Check if we need to chunk to avoid OOM
         seq_lens_expanded = metadata.get_seqlens_expanded()
@@ -1805,7 +1810,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         need_chunk, logits_budget_bytes = mqa_logits_should_chunk(
             num_rows=row_hi - row_lo,
             num_cols=k_offset,
-            get_budget_bytes=lambda: self._get_mqa_logits_budget_bytes(device_index),
+            get_budget_bytes=lambda: (
+                self._get_mqa_logits_budget_bytes(device_index)
+                * (2 if bf16_logits else 1)
+            ),
             rocm=_is_hip,
         )
 

@@ -6,6 +6,8 @@ rows straight from a host pointer. Two backends provide that pointer:
 
 ``pinned`` (default)
     ``torch.empty(..., pin_memory=True)``. On a discrete GPU this frees VRAM.
+    With ``SGLANG_OPT_PLE_PINNED_HUGEPAGE`` the table is an anonymous mapping on
+    transparent huge pages, page-locked with ``cudaHostRegister`` instead.
 
 ``file``
     A file-backed, shared ``mmap`` of a sparse file under
@@ -46,6 +48,7 @@ from sglang.srt.environ import envs
 logger = logging.getLogger(__name__)
 
 _LIBC: Optional[ctypes.CDLL] = None
+_WILLNEED_FAILED = False
 _SMAPS_HEADER = re.compile(r"^([0-9a-f]+)-([0-9a-f]+) ")
 _SMAPS_RSS = re.compile(r"^Rss:\s+(\d+) kB")
 
@@ -53,9 +56,13 @@ PLE_OFFLOAD_BACKENDS = ("pinned", "file")
 
 # cudaDeviceAttr enum values (cuda_runtime_api.h).
 _CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS = 88
+_CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES = 100
 _MADV_RANDOM = 1
 _MADV_DONTNEED = 4
+_MADV_HUGEPAGE = 14
 _PAGE_SHIFT = 12
+# A PMD huge page with 64 KiB base pages; the pinned huge-page mapping starts aligned to it.
+_HUGEPAGE_ALIGN = 512 << 20
 # One MADV_DONTNEED call takes mmap_lock for its whole range; over the full
 # 47.7 GiB table that is ~3.5 s during which every fault in the process --
 # including the ones the gather kernel takes -- stalls. Trim in slices.
@@ -242,6 +249,10 @@ def allocate_ple_host_table(
             f"unknown PLE offload backend {backend!r}; choose from {PLE_OFFLOAD_BACKENDS}"
         )
     if backend == "pinned":
+        if envs.SGLANG_OPT_PLE_PINNED_HUGEPAGE.get():
+            table = _pinned_hugepage_table(shape, dtype)
+            if table is not None:
+                return table
         return torch.empty(tuple(shape), dtype=dtype, device="cpu", pin_memory=True)
 
     numel = 1
@@ -372,6 +383,24 @@ def device_reads_pageable_memory(device_index: int = 0) -> Optional[bool]:
 
     Returns None when the CUDA runtime library cannot be queried.
     """
+    value = _device_attribute(_CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS, device_index)
+    return None if value is None else bool(value)
+
+
+def device_faults_pageable_pages(device_index: int = 0) -> bool:
+    """Whether the GPU reaches pageable host memory through page faults the driver
+    serves (HMM on a discrete GPU), rather than through the host's page tables (ATS, as
+    on GB10). False when either attribute cannot be queried."""
+    reads = _device_attribute(_CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS, device_index)
+    host_tables = _device_attribute(
+        _CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS_USES_HOST_PAGE_TABLES, device_index
+    )
+    return reads == 1 and host_tables == 0
+
+
+def _device_attribute(attribute: int, device_index: int) -> Optional[int]:
+    """``cudaDeviceGetAttribute`` through the CUDA runtime library; None when it
+    cannot be queried."""
     candidates = [ctypes.util.find_library("cudart")]
     torch_lib = os.path.join(os.path.dirname(torch.__file__), "lib")
     if os.path.isdir(torch_lib):
@@ -398,14 +427,55 @@ def device_reads_pageable_memory(device_index: int = 0) -> Optional[bool]:
             value = ctypes.c_int()
             rc = cudart.cudaDeviceGetAttribute(
                 ctypes.byref(value),
-                ctypes.c_int(_CUDA_DEV_ATTR_PAGEABLE_MEMORY_ACCESS),
+                ctypes.c_int(attribute),
                 ctypes.c_int(device_index),
             )
             if rc == 0:
-                return bool(value.value)
+                return value.value
         except OSError:
             continue
     return None
+
+
+def advise_rows_willneed(fd: int, rows: torch.Tensor, row_bytes: int) -> int:
+    """Queue the page-cache reads of ``rows`` of the file-backed table open as ``fd``
+    and return once they are queued: ``posix_fadvise(WILLNEED)``, one call per run
+    of adjacent pages.
+
+    The host gather copies its rows on one thread (the server runs torch with one
+    thread) from a ``MADV_RANDOM`` mapping, so without this each cold row is its own
+    4 KiB read from storage, one after another. Advised first, the reads are in flight
+    together and the copy finds the rows in the page cache. Advisory: returns the number
+    of pages advised, and stops at the first call that fails.
+    """
+    global _WILLNEED_FAILED
+    if rows.numel() == 0:
+        return 0
+    first = rows.to(torch.int64) * row_bytes
+    pages = torch.cat(
+        [first >> _PAGE_SHIFT, (first + row_bytes - 1) >> _PAGE_SHIFT]
+    ).unique(sorted=True)
+    run_starts = torch.ones_like(pages, dtype=torch.bool)
+    run_starts[1:] = pages[1:] != pages[:-1] + 1
+    starts = torch.nonzero(run_starts).flatten()
+    lengths = torch.diff(starts, append=starts.new_tensor([pages.numel()]))
+    advised = 0
+    for page, count in zip(pages[starts].tolist(), lengths.tolist()):
+        try:
+            os.posix_fadvise(
+                fd, page << _PAGE_SHIFT, count << _PAGE_SHIFT, os.POSIX_FADV_WILLNEED
+            )
+        except OSError as exc:
+            if not _WILLNEED_FAILED:
+                _WILLNEED_FAILED = True
+                logger.warning(
+                    "PLE table: posix_fadvise(WILLNEED) failed (%s); host gathers "
+                    "read cold rows one at a time",
+                    exc,
+                )
+            break
+        advised += count
+    return advised
 
 
 def _madvise_random(storage: torch.Tensor, nbytes: int) -> None:
@@ -418,6 +488,76 @@ def _madvise_random(storage: torch.Tensor, nbytes: int) -> None:
     exists for."""
     if not _madvise(storage.data_ptr(), nbytes, _MADV_RANDOM):
         logger.warning("PLE table: madvise(MADV_RANDOM) not applied")
+
+
+def _pinned_hugepage_table(
+    shape: Sequence[int], dtype: torch.dtype
+) -> Optional[torch.Tensor]:
+    """A page-locked, huge-page-backed host tensor of ``shape``/``dtype``; None (with a warning)
+    when the mapping, the advice or the registration fails, so the caller takes cudaHostAlloc."""
+    import mmap
+
+    numel = 1
+    for d in shape:
+        numel *= int(d)
+    nbytes = numel * torch.empty(0, dtype=dtype).element_size()
+    try:
+        mapping = mmap.mmap(
+            -1, nbytes + _HUGEPAGE_ALIGN, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS
+        )
+        raw = (ctypes.c_char * (nbytes + _HUGEPAGE_ALIGN)).from_buffer(mapping)
+        base = ctypes.addressof(raw)
+        offset = -base % _HUGEPAGE_ALIGN
+        if not _madvise(base + offset, nbytes, _MADV_HUGEPAGE):
+            raise OSError("madvise(MADV_HUGEPAGE) failed")
+        storage = torch.frombuffer(raw, dtype=torch.uint8, count=nbytes, offset=offset)
+        rc = int(torch.cuda.cudart().cudaHostRegister(base + offset, nbytes, 0))
+        if rc != 0:
+            _clear_cuda_last_error()
+            raise OSError(f"cudaHostRegister returned {rc}")
+    except Exception as exc:  # noqa: BLE001 - fall back to cudaHostAlloc
+        logger.warning(
+            "SGLANG_OPT_PLE_PINNED_HUGEPAGE: kept cudaHostAlloc for the PLE table (%s)",
+            exc,
+        )
+        return None
+    table = storage.view(dtype).view(*[int(d) for d in shape])
+    # The mapping must outlive the tensor; it is never unregistered (one per process).
+    table._sglang_ple_mapping = (mapping, raw)
+    logger.info(
+        "SGLANG_OPT_PLE_PINNED_HUGEPAGE: PLE table on transparent huge pages, page-locked "
+        "(%.1f GiB, %s; process AnonHugePages %s)",
+        nbytes / 2**30,
+        dtype,
+        _anon_huge_pages(),
+    )
+    return table
+
+
+def _clear_cuda_last_error() -> None:
+    """A failed cudaHostRegister leaves the runtime's last error set, and torch's next launch
+    check would raise it; clear it in every libcudart this process loaded."""
+    try:
+        with open("/proc/self/maps") as f:
+            paths = sorted({ln.split()[-1] for ln in f if "libcudart.so" in ln})
+    except OSError:
+        paths = []
+    for path in paths:
+        try:
+            ctypes.CDLL(path).cudaGetLastError()
+        except (OSError, AttributeError):
+            continue
+
+
+def _anon_huge_pages() -> str:
+    try:
+        with open("/proc/self/smaps_rollup") as f:
+            for line in f:
+                if line.startswith("AnonHugePages:"):
+                    return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    return "unknown"
 
 
 def _libc() -> Optional[ctypes.CDLL]:

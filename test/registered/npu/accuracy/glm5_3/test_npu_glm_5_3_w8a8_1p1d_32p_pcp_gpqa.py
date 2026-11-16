@@ -216,7 +216,6 @@ GLM_5_3_PCP_PD_SEP_MODEL_CONFIG = {
         "round_robin",
         "--request-timeout-secs",
         7200,
-        "--disable-health-check",
         "--disable-circuit-breaker",
     ],
     "router_envs": {},

@@ -146,6 +146,14 @@ message GetServerInfoResponse {
 
   // Distributed deployment metadata required by out-of-process orchestrators.
   DeploymentInfo deployment_info = 12;
+
+  // Opaque owning-runtime boot identity (UUIDv4). Minted once when the
+  // embedded Rust serving runtime (`CoreHandle`) is constructed; stable for
+  // that runtime across transport reconnects and out-of-process sidecar
+  // restarts. Empty means the peer does not advertise identity. Distinct from
+  // `PortArgs.instance_id` (shared IPC/load snapshot namespace). Not a
+  // cluster-wide epoch, health check, or request-cleanup proof.
+  string instance_id = 16;
 }
 
 message DeploymentInfo {

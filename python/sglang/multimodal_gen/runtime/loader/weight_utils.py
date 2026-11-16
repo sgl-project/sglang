@@ -113,12 +113,6 @@ if HAS_RUNAI_MODEL_STREAMER:
 temp_dir = tempfile.gettempdir()
 
 
-class DisabledTqdm(tqdm):
-    def __init__(self, *args, **kwargs):
-        kwargs["disable"] = True
-        super().__init__(*args, **kwargs)
-
-
 def get_lock(model_name_or_path: str | Path, cache_dir: str | None = None):
     lock_dir = cache_dir or temp_dir
     model_name_or_path = str(model_name_or_path)

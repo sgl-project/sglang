@@ -167,7 +167,7 @@ python -m sglang.launch_server --model-path <MODEL> --sampling-defaults openai
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>stop_regex</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>`Optional[Union[str, List[str]]] = None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Stop when hitting any of the regex patterns in this list</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Stop when hitting any of the regex patterns in this list. Patterns are checked before generation: compounding repetitions, repeated alternatives, excessive repeat counts or nesting, look-around, backreferences, and conditional groups are rejected. Ordinary patterns such as `[.!?]\s*$`, `and|or`, and `\d+` are supported. These checks apply to `stop_regex`; the structured-output `regex` parameter has a separate grammar engine.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>temperature</td>

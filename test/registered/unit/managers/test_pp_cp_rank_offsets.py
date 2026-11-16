@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import torch
 
@@ -14,6 +14,10 @@ from sglang.test.test_utils import (
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.managers.io_struct import (  # noqa: E402
+    ReleaseMemoryOccupationReqInput,
+    ReleaseMemoryOccupationReqOutput,
+)
 from sglang.srt.managers.scheduler_components.request_receiver import (  # noqa: E402
     SchedulerRequestReceiver,
 )
@@ -241,6 +245,7 @@ class TestDSparkPPOutput(CustomTestCase):
                     bonus_tokens=tokens, new_seq_lens=batch.seq_lens
                 ),
                 logits_output=None,
+                routed_experts_output=None,
             ),
             batch,
         )
@@ -257,6 +262,78 @@ class TestDSparkPPOutput(CustomTestCase):
         torch.testing.assert_close(batch.spec_info.new_seq_lens, batch.seq_lens)
         torch.testing.assert_close(payloads[0].bonus_tokens, tokens)
         self.assertEqual(payloads[0].hidden_states.numel(), 0)
+
+
+class TestReleaseVerdictRing(CustomTestCase):
+    REQUEST = ReleaseMemoryOccupationReqInput()
+    RELEASED = ReleaseMemoryOccupationReqOutput(success=True, message="Success")
+    REFUSED = ReleaseMemoryOccupationReqOutput(success=False, message="busy")
+
+    def _stage(self, *, is_first_rank, is_last_rank=False, from_prev_stage=None):
+        return SimpleNamespace(
+            pp_group=SimpleNamespace(
+                is_first_rank=is_first_rank, is_last_rank=is_last_rank
+            ),
+            _pp_release_reqs_awaiting_verdict=(),
+            _pp_release_verdict_send_work=[],
+            _pp_commit_comm_work=Mock(),
+            _pp_send_pyobj_to_next_stage=Mock(return_value=["send"]),
+            _pp_recv_pyobj_from_prev_stage=Mock(return_value=from_prev_stage),
+            send_control_output=Mock(),
+        )
+
+    def test_the_first_stage_answers_with_the_verdict_that_came_round(self):
+        """Answering at dispatch tells the caller memory is free while later stages hold it."""
+        stage = self._stage(is_first_rank=True, from_prev_stage=[self.REFUSED])
+
+        SchedulerPPMixin._pp_pass_release_verdict(stage, self.RELEASED, self.REQUEST)
+        stage.send_control_output.assert_not_called()
+
+        SchedulerPPMixin._pp_answer_release_requests(stage)
+        stage.send_control_output.assert_called_once_with(self.REFUSED, self.REQUEST)
+
+    def test_a_busy_first_stage_answers_without_waiting_for_later_stages(self):
+        """Later stages need the first stage's next iterations to reach the request."""
+        stage = self._stage(is_first_rank=True)
+
+        SchedulerPPMixin._pp_pass_release_verdict(stage, self.REFUSED, self.REQUEST)
+
+        stage.send_control_output.assert_called_once_with(self.REFUSED, self.REQUEST)
+        self.assertEqual(stage._pp_release_reqs_awaiting_verdict, ())
+
+    def test_a_later_stage_passes_on_an_earlier_refusal(self):
+        stage = self._stage(is_first_rank=False, from_prev_stage=[True, self.REFUSED])
+
+        SchedulerPPMixin._pp_pass_release_verdict(stage, self.RELEASED, self.REQUEST)
+
+        (sent,), _ = stage._pp_send_pyobj_to_next_stage.call_args
+        self.assertEqual(sent, [True, self.REFUSED])
+
+    def test_verdict_sends_wait_until_the_requests_are_relayed(self):
+        """The next stage receives a verdict only after the request list, so waiting
+        on a send between two requests of one poll never returns."""
+        stage = self._stage(is_first_rank=True)
+
+        for _ in range(2):
+            SchedulerPPMixin._pp_pass_release_verdict(
+                stage, self.RELEASED, self.REQUEST
+            )
+        stage._pp_commit_comm_work.assert_not_called()
+
+        relayed = SchedulerPPMixin._pp_send_reqs_to_next_stage(stage, [])
+        self.assertEqual(relayed, ["send", "send", "send"])
+        self.assertEqual(stage._pp_release_verdict_send_work, [])
+
+    def test_the_last_stage_replies_only_to_a_first_stage_that_waits(self):
+        stage = self._stage(
+            is_first_rank=False,
+            is_last_rank=True,
+            from_prev_stage=[False, self.REFUSED],
+        )
+
+        SchedulerPPMixin._pp_pass_release_verdict(stage, self.RELEASED, self.REQUEST)
+
+        stage._pp_send_pyobj_to_next_stage.assert_not_called()
 
 
 if __name__ == "__main__":

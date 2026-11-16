@@ -68,6 +68,7 @@ fn router(
             dp_ranks,
             openai: None,
             grpc_port: None,
+            supports_inline_system: false,
         };
         registry.add_with_cb(spec, None, profile).unwrap();
     }

@@ -191,6 +191,8 @@ Don't silently flip a default during a rename. If the new default disagrees with
 
 Don't add a CLI flag that just forwards to an env var, and don't add an env var that duplicates an existing CLI flag. Pick one surface.
 
+The exception is a secret, such as an API key: it may have both a flag and an env var (`--admin-api-key` and `SGLANG_ADMIN_API_KEY`, the flag wins), because a flag value is visible to anyone who can read the process's argv (`ps`, `/proc/<pid>/cmdline`), and the bundled clients read the same env var so the key is set once. Define it with `secret=True`.
+
 ## Out of scope
 
 - **External / vendor env vars consumed raw** (`HF_HUB_*`, `CUDA_*`, `NCCL_*`, `TORCH_*`, `OMP_*`, `RANK`, `MASTER_ADDR`, etc.): see the decision table in Rule 1 — `os.getenv` is correct, don't pull them into `Envs`.

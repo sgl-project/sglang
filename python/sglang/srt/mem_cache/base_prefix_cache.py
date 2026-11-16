@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import time
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from enum import Enum, auto
 from types import MappingProxyType
 from typing import (
@@ -97,10 +98,20 @@ class InsertParams:
     # waits until the insert key is known, so a leaf that already has mamba
     # never pays the D2H.
     mamba_host_src: Optional[torch.Tensor] = None
+    # The request frees mamba_host_src right after the insert (finished), so
+    # the host waits for the copy; otherwise later forwards and loads wait on it.
+    mamba_host_src_freed: bool = False
+    # Finished request's tracking-slot index for mamba_host_src: the slot is parked
+    # (kept out of the free list) until its copy lands, instead of a host wait.
+    mamba_host_src_keep_idx: Optional[int] = None
+    mamba_host_parked: bool = False
     # Both mamba values stay empty and the leaf already holds the checkpoint.
     allow_missing_mamba: bool = False
     # The ping-pong slot prepare picked; cleanup keeps that same slot.
     mamba_keep_idx: Optional[int] = None
+    # Prepare held the running request's state back from the tree; the request
+    # keeps its tracked checkpoint for a later insert.
+    mamba_checkpoint_deferred: bool = False
 
     # DSV4 NPU C128 sidecar pages, one page id per physical C128 page group.
     c128_value: Optional[torch.Tensor] = None
@@ -577,6 +588,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         slot: ``release_kv_cache`` frees ``[cache_protected_len, up_to)`` and
         everything after, and unpins."""
 
+    def lease_checkpoint_state_slots(self, reqs: Sequence[Req]):
+        """A context in which checkpointing the unfinished ``reqs`` takes the
+        state slots it needs from one take made ahead; nothing here."""
+        return nullcontext()
+
     def free_kv_row(self, kv: Any, ranges: list[tuple[int, int]]) -> None:
         """Give back ascending, disjoint, half-open row-position ranges
         of the ``kv`` record's row; one call keeps a shared page freed once.
@@ -801,6 +817,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     ) -> tuple[int, Optional[int]]:
         """Pop L3-loaded tokens and their absolute prefix start, if known."""
         return self.pop_prefetch_loaded_tokens(handle), None
+
+    def staged_storage_prefix_end(self, handle: CacheRequestHandle) -> int:
+        """Absolute end of a completed storage prefetch held outside the tree
+        until admission, or 0 when nothing is staged."""
+        return 0
+
+    def can_poll_prefetch_progress(self) -> bool:
+        """Whether poll_prefetch_progress may run before admission without
+        cutting a storage prefetch short."""
+        return False
 
     def ready_to_load_host_cache(self) -> Any:
         """

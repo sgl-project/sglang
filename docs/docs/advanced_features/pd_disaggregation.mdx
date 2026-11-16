@@ -739,14 +739,12 @@ python3 -m sglang.launch_server \
 #### router
 
 ```bash
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://127.0.0.1:10000 \
-    --decode  http://127.0.0.1:10001 \
+sgl-router \
+    --model-id /path/to/MiMo-V2-Flash-w8a8-all-0512 \
+    --no-tokenizer \
+    --worker-urls http://127.0.0.1:10000 http://127.0.0.1:10001 \
     --host 127.0.0.1 \
-    --port 9903 \
-    --health-check-interval-secs 3600 \
-    --mini-lb \
+    --port 9903
 ```
 
 ### DeepSeek Multi-Node
@@ -853,9 +851,9 @@ done
 #### router
 
 ```bash
-python -m  sglang_router.launch_router --prefill ${P_IP}:8000 \
---decode ${D_IP}:8001 \
---host ${D_IP} --port 6688 \
---pd-disaggregation \
---health-check-interval-secs 3600 \
+sgl-router \
+--model-id /path/to/deepseekr1_w4a8_pertoken \
+--no-tokenizer \
+--worker-urls http://${P_IP}:8000 http://${D_IP}:8001 \
+--host ${D_IP} --port 6688
 ```

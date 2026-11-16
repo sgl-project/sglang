@@ -10,7 +10,9 @@ use crate::multi_modality::worker::MediaError;
 #[allow(dead_code)]
 #[derive(Debug, Clone, Error)]
 pub enum Error {
-    #[error("validation failed: {0}")]
+    /// A request the client got wrong. The message is the client-facing text,
+    /// worded as Python's `ValueError` for the same check, so it is shown as is.
+    #[error("{0}")]
     Validation(String),
 
     #[error("tokenize failed: {0}")]
@@ -52,6 +54,18 @@ impl Error {
                 | Error::Codec(_)
                 | Error::Internal(_)
         )
+    }
+
+    /// Why the client's request is at fault, as the client reads it, or `None`
+    /// when it is not: the server answers 400 and, like Python's
+    /// `[http_server] Error:` line, logs this reason.
+    pub fn client_fault_reason(&self) -> Option<&str> {
+        match self {
+            Error::Validation(message) | Error::Encode(MediaError::Client(message)) => {
+                Some(message)
+            }
+            _ => None,
+        }
     }
 }
 

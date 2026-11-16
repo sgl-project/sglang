@@ -19,7 +19,7 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     kill_process_group,
     launch_pd_mix_node,
     launch_pd_separation_node,
-    launch_router,
+    start_router_thread,
     wait_server_ready,
 )
 from sglang.test.test_utils import (
@@ -709,14 +709,7 @@ class TestNpuAccuracyMultiNodePdSepTestCaseBase(CustomTestCase):
     @classmethod
     @check_role(allowed_roles=["router"])
     def start_router_server(cls):
-        logger.info(f"Starting router in thread...")
-        sglang_thread = threading.Thread(target=launch_router, args=(cls.model_config,))
-        sglang_thread.daemon = True
-        sglang_thread.start()
-
-        health_check_url = f"{cls.base_url}/health"
-        logger.info(f"Waiting for router to be ready at {health_check_url}")
-        wait_server_ready(health_check_url)
+        start_router_thread(cls.model_config, cls.base_url)
 
         logger.info(
             f"Waiting {SERVER_INITIALIZATION_DELAY} seconds for the server to fully initialize..."

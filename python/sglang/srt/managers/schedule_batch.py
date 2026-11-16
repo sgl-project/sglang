@@ -104,7 +104,6 @@ from sglang.srt.managers.req_types import (
     MultimodalInputs,
     ReturnHiddenStatesMode,
     SamplingLogprobsMode,
-    get_request_return_hidden_states_mode,
     get_return_hidden_states_mode,
 )
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
@@ -178,12 +177,6 @@ def get_batch_return_hidden_states_mode(reqs: List[Req]) -> CaptureHiddenMode:
     for req in reqs:
         mode = max(mode, req.return_hidden_states_mode)
     return mode
-
-
-def need_return_hidden_states(
-    return_hidden_states: Union[List[ReturnHiddenStatesMode], ReturnHiddenStatesMode],
-) -> bool:
-    return get_request_return_hidden_states_mode(return_hidden_states).need_capture()
 
 
 @lru_cache(maxsize=1)
@@ -484,6 +477,7 @@ class Req(ReqDllmMixin):
         decision_layout: Optional[List[int]] = None,
         session_id: Optional[str] = None,
         cache_salt: Optional[str] = None,
+        parent_session_id: Optional[str] = None,
     ):
         # Input and output info
         self.rid = rid
@@ -511,6 +505,8 @@ class Req(ReqDllmMixin):
         # media added by this turn, excluding the session's borrowed history
         self._session_mm_items: List[MultimodalDataItem] = []
         self.session_id = session_id
+        # The session that spawned this one; cache residency hints only.
+        self.parent_session_id = parent_session_id
         # Used by the session radix cache to reject registration after a close/reopen.
         self.session_generation: Optional[int] = None
         self.input_embeds = input_embeds
@@ -3421,6 +3417,9 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         self.return_hidden_states = self.return_hidden_states_mode.need_capture()
 
         self.sampling_info.filter_batch(keep_indices, keep_indices_device)
+        self.sampling_info.refresh_top_k_flags(
+            [req.sampling_params.top_k for req in self.reqs]
+        )
         if self.spec_info:
             self.spec_info.filter_batch(
                 new_indices=keep_indices_device,

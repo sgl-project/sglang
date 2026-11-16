@@ -1,7 +1,7 @@
 ---
 title: GLM-5.1
 metatags:
-    description: "Deploy GLM-5.1 with SGLang on NVIDIA H100/H200/B300/GB300 and AMD MI300X/MI325X/MI355X."
+    description: "Deploy GLM-5.1 with SGLang on NVIDIA H100/H200/B300/GB300, AMD MI300X/MI325X/MI355X, and Ascend Atlas 800I A3 NPUs."
 ---
 
 ## 1. Model Introduction
@@ -24,9 +24,11 @@ This section provides deployment configurations optimized for different hardware
 
 ### 3.1 Basic Configuration
 
-**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, quantization method, and capabilities. SGLang supports serving GLM-5.1 on NVIDIA H100, H200, B300, GB300, and AMD MI300X/MI325X/MI355X GPUs.
+**Interactive Command Generator**: Use the configuration selector below to automatically generate the appropriate deployment command for your hardware platform, quantization method, and capabilities. SGLang supports serving GLM-5.1 on NVIDIA H100, H200, B300, GB300, and AMD MI300X/MI325X/MI355X GPUs. For Ascend Atlas 800I A3 NPUs, see [Ascend NPU Deployment](#ascend-npu-deployment) below.
 
 import { GLM51Deployment } from '/src/snippets/autoregressive/glm-51-deployment.jsx'
+import { Deployment } from '/src/snippets/_deployment.jsx'
+import { config as ascendConfig } from '/src/snippets/configs/zai-org/glm-5.1-ascend.jsx'
 
 <GLM51Deployment />
 
@@ -34,7 +36,47 @@ import { GLM51Deployment } from '/src/snippets/autoregressive/glm-51-deployment.
   All recipes here run the DSA indexer top-k on the default `--dsa-topk-backend sgl-kernel`. Other top-k backend choices have not been fully validated on GLM-5.1.
 </Warning>
 
-### 3.2 Configuration Tips
+<a id="ascend-npu-deployment" title="Referenced by the command generator note above and by the PD role banners. Verify before removing."></a>
+
+### 3.2 Ascend NPU Deployment
+
+GLM-5.1 also runs on **Atlas 800I A3** with the msModelSlim W4A8 checkpoint. One A3 node is 8 cards × 2 dies = 16 devices, and every recipe below spans two nodes per server, so each command runs `--tp-size 32` with `--nnodes 2`:
+
+| Deployment | Hardware | What it starts | Best-practice entry |
+| --- | --- | --- | --- |
+| **PD Mixed** | 2 × A3 (32 dies) | one server that both prefills and decodes | [W4A8 16P 3.5k+1.5k, TPOT 50 ms](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/glm_5_1#glm-5-1-w4a8-16p-in3k5-out1k5-50ms) |
+| **PD Disagg · Prefill** + **PD Disagg · Decode** | 4 × A3 (64 dies) | a 1P1D pair — one two-node server per role — fronted by a router | [W4A8 1P1D 32P 16k+1k, TPOT 50 ms](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/glm_5_1#glm-5-1-w4a8-1p1d-32p-in16k-out1k-50ms) |
+
+<Deployment config={ascendConfig} />
+
+- **Environment.** Use the CANN image shown in the Docker tab, or follow the [Ascend NPU quickstart](/docs/hardware-platforms/ascend-npus/getting-started/quick_start) / [installation guide](/docs/hardware-platforms/ascend-npus/getting-started/installation). Inside the container, source CANN first: `source /usr/local/Ascend/ascend-toolkit/set_env.sh` and `source /usr/local/Ascend/nnal/atb/set_env.sh`.
+- **Weights.** The recipes serve [`Eco-Tech/GLM-5.1-w4a8`](https://www.modelscope.cn/models/Eco-Tech/GLM-5.1-w4a8) (420 GB). The cells set `SGLANG_USE_MODELSCOPE=1` so `--model-path` resolves against ModelScope; for a multi-node deployment, download the weights once to shared storage and point `--model-path` at that directory instead. Quantization covers the main model only — the MTP (nextn) layer stays BF16, which is why the recipes pass `--speculative-draft-model-quantization unquant`.
+- **Prepare every host.** The recipes assume the CPU governor and kernel scheduler settings from the Ascend best practice:
+
+  ```bash Command
+  echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+  sysctl -w vm.swappiness=0
+  sysctl -w kernel.numa_balancing=0
+  sysctl -w kernel.sched_migration_cost_ns=50000
+  ```
+
+- **Wire up the nodes.** Set `HCCL_SOCKET_IFNAME` and `GLOO_SOCKET_IFNAME` to the interface that carries each node's own IP. Each two-node server has its own head node: run the command on both of its nodes with `--node-rank 0` on the head and `1` on the other, and point `--dist-init-addr` at that server's head. In PD disaggregation, all four nodes share one `ASCEND_MF_STORE_URL` that points at the prefill head node — it is the rendezvous for the KV transfer. Start the prefill role first, then the decode role.
+- **Front the PD roles with a router.** Once both roles are up, start the router and send requests to its port, `30000`. Only each role's head node serves HTTP, so run the router on a node that is not the prefill head — otherwise give it a free port instead, since the prefill role already listens on `30000` there:
+
+  ```bash Command
+  python3 -m sglang_router.launch_router \
+      --pd-disaggregation \
+      --policy round_robin \
+      --prefill http://<prefill-node0-ip>:30000 8998 \
+      --decode http://<decode-node0-ip>:30100 \
+      --host 0.0.0.0 \
+      --port 30000
+  ```
+
+- **Differences from the Ascend best practice.** The recipes follow the best-practice scripts, including the prefill role's context parallelism (`--enable-prefill-cp --cp-strategy interleave --attn-cp-size 32`), which spans all 32 prefill ranks and therefore runs without attention DP. Flags whose spelling the scripts predate are replaced by their current equivalents: `--attn-dp-size` for `--dp-size N --enable-dp-attention`, `--cuda-graph-backend-{decode,prefill} disabled` for `--disable-cuda-graph`, and `--moe-dense-tp-size` for `--moe-dense-tp`. Three things the scripts set are left out: `SGLANG_ENABLE_SPEC_V2` and `SGLANG_SPEC_ENABLE_OVERLAP_REFLOW`, which current SGLang no longer reads, and `--served-model-name glm-5`, so that requests use the checkpoint name the cURL example shows.
+- **Verification status.** These recipes are transcribed from the best-practice entries linked above and have **not been run on A3 hardware for this page**, so both deployments are marked **In progress** and the benchmark card carries no numbers. For measured configurations, tuning and accuracy methods, see the [GLM-5.1 Ascend best practice](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/glm_5_1), [parameter tuning](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning) and [accuracy evaluation](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation); for startup failures, the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/faq).
+
+### 3.3 Configuration Tips
 
 - Speculative decoding (MTP) can significantly reduce latency for interactive use cases.
 - **DP Attention**: Enables data parallel attention for higher throughput under high concurrency. Note that DP attention trades off low-concurrency latency for high-concurrency throughput — disable it if your workload is latency-sensitive with few concurrent requests.

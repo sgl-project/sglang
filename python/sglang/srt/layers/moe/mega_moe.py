@@ -166,6 +166,10 @@ def _get_mega_moe_symm_buffer(
                 activation=activation,
             )
             _MEGA_MOE_SYMM_BUFFER[key] = buf
+            # Only the SM100 kernels read the SM locality map.
+            # Cache it and stop the MLOPart MPS helper, which blocks cuda-checkpoint.
+            if is_sm100_supported():
+                deep_gemm.destroy_localizer()
     return buf
 
 

@@ -62,6 +62,7 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
 
+
 # The fused all-reduce epilogues have world-size-templated kernels for TP2 and TP4.
 _FUSED_MHC_TP_SIZES = (2, 4)
 FUSED_MXFP8_PRODUCER_MAX_ROWS = 2048
