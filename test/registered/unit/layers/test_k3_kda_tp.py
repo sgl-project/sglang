@@ -85,30 +85,37 @@ class TestEnable(unittest.TestCase):
         unified=False,
         decode_radix=False,
         spec="NEXTN",
+        topk=None,
+        skip_gather=False,
     ):
         from sglang.srt import runtime_context
         from sglang.srt.layers.communication import k3_kda_tp
 
         NS = types.SimpleNamespace
-        with unittest.mock.patch.multiple(
-            runtime_context,
-            get_exec=lambda: NS(
-                mamba=NS(
-                    enable_linear_replayssm_spec=replayssm,
-                    enable_linear_replayssm=False,
-                    enable_mamba_extra_buffer=True,
-                )
+        with (
+            unittest.mock.patch.multiple(
+                runtime_context,
+                get_exec=lambda: NS(
+                    mamba=NS(
+                        enable_linear_replayssm_spec=replayssm,
+                        enable_linear_replayssm=False,
+                        enable_mamba_extra_buffer=True,
+                    )
+                ),
+                get_memory=lambda: NS(
+                    enable_hierarchical_cache=hicache,
+                    enable_unified_memory=unified,
+                    disable_radix_cache=not radix,
+                ),
+                get_spec=lambda: NS(
+                    speculative_algorithm=spec, speculative_eagle_topk=topk
+                ),
+                get_disagg=lambda: NS(
+                    disaggregation_mode=mode,
+                    disaggregation_decode_enable_radix_cache=decode_radix,
+                ),
             ),
-            get_memory=lambda: NS(
-                enable_hierarchical_cache=hicache,
-                enable_unified_memory=unified,
-                disable_radix_cache=not radix,
-            ),
-            get_spec=lambda: NS(speculative_algorithm=spec),
-            get_disagg=lambda: NS(
-                disaggregation_mode=mode,
-                disaggregation_decode_enable_radix_cache=decode_radix,
-            ),
+            k3_kda_tp.envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.override(skip_gather),
         ):
             k3_kda_tp._check_supported()
 
@@ -116,6 +123,7 @@ class TestEnable(unittest.TestCase):
         self._check(mode="decode")
         self._check(mode="decode", spec=None)
         self._check(mode="decode", spec="EAGLE")
+        self._check(mode="decode", spec="EAGLE", topk=1)
 
     def test_unsupported_features_raise(self):
         for kw, msg in (
@@ -126,6 +134,8 @@ class TestEnable(unittest.TestCase):
             (dict(mode="decode", spec="DSPARK"), "speculative algorithm DSPARK"),
             (dict(mode="decode", unified=True), "unified-memory"),
             (dict(mode="decode", decode_radix=True), "PD decode radix"),
+            (dict(mode="decode", spec="EAGLE", topk=4), "speculative-eagle-topk 4"),
+            (dict(mode="decode", skip_gather=True), "SKIP_ALL_GATHER"),
         ):
             with self.subTest(kw=kw), self.assertRaisesRegex(NotImplementedError, msg):
                 self._check(**kw)
@@ -783,9 +793,9 @@ class TestVerifyStandInBatch(unittest.TestCase):
 
 
 def _commit_worker(rank, world, port, backend, counts, q):
-    """DP rank j commits counts[j] verify requests (request rows reversed, so the slots come
-    from the request table); every rank scatters every rank's requests from its own state
-    pool's speculative state."""
+    """DP rank j commits counts[j] verify requests (slots from its per-rank forward
+    metadata, request rows reversed); every rank scatters every rank's requests from its own
+    state pool's speculative state."""
     os.environ.update(MASTER_ADDR="127.0.0.1", MASTER_PORT=str(port))
     dist.init_process_group(backend, rank=rank, world_size=world)
     try:
@@ -806,6 +816,22 @@ def _commit_worker(rank, world, port, backend, counts, q):
             mamba_pool, req_pool=_req_pool(mamba_pool, size=CAP, mapping=mapping)
         )
         n = counts[rank]
+        # The forward resolved these slots; the request table has since been zeroed (rows
+        # reused), so a table lookup would commit into the padding slot.
+        local = types.SimpleNamespace(
+            mamba_cache_indices=torch.cat(
+                [
+                    mapping[torch.arange(n).flip(0)],
+                    torch.zeros(CAP - n, dtype=torch.int32),
+                ]
+            ),
+            mamba_track_indices=None,
+        )
+        runner.req_to_token_pool.req_index_to_mamba_index_mapping.zero_()
+        gathered = types.SimpleNamespace(mamba_cache_indices=None)
+        runner.attn_backend = types.SimpleNamespace(
+            linear_attn_backend=types.SimpleNamespace(forward_metadata=gathered)
+        )
         batch = types.SimpleNamespace(
             req_pool_indices=torch.arange(n).flip(0), mamba_track_indices=None
         )
@@ -823,6 +849,8 @@ def _commit_worker(rank, world, port, backend, counts, q):
             unittest.mock.patch.object(
                 scatter_mod, "scatter_mamba_states_after_mtp_verify", scatter
             ),
+            # Eager fast path: the backend holds the gathered metadata.
+            unittest.mock.patch.object(k3_kda_tp, "_GATHERED", (gathered, local)),
         ):
             try:
                 k3_kda_tp.commit_after_verify(runner, batch, last, None)
@@ -855,6 +883,31 @@ class TestCommitAfterVerify(unittest.TestCase):
             rows += [j * CAP + i for i in range(CAP)]
         for rank, out, _ in res:
             self.assertEqual(out, [True, slots, last, rows], f"rank {rank}")
+
+
+class TestLocalStateSlots(unittest.TestCase):
+    def test_per_rank_metadata_on_eager_and_replay(self):
+        from sglang.srt.layers.communication import k3_kda_tp
+
+        NS = types.SimpleNamespace
+        local = NS(
+            mamba_cache_indices=torch.tensor([5, 6, 0]),
+            mamba_track_indices=torch.tensor([7, 8, 0]),
+        )
+        gathered = NS(mamba_cache_indices=torch.arange(6), mamba_track_indices=None)
+        backend = NS(forward_metadata=gathered)
+        runner = NS(attn_backend=NS(linear_attn_backend=backend))
+        with unittest.mock.patch.object(k3_kda_tp, "_GATHERED", (gathered, local)):
+            got = k3_kda_tp._local_state_slots(runner, 2)
+            self.assertEqual(got.working.tolist(), [5, 6])
+            self.assertEqual(got.track.tolist(), [7, 8])
+            backend.forward_metadata = local  # graph replay: per-rank metadata
+            self.assertEqual(
+                k3_kda_tp._local_state_slots(runner, 2).working.tolist(), [5, 6]
+            )
+            backend.forward_metadata = None
+            with self.assertRaisesRegex(RuntimeError, "no verify forward metadata"):
+                k3_kda_tp._local_state_slots(runner, 2)
 
 
 class TestRows(unittest.TestCase):

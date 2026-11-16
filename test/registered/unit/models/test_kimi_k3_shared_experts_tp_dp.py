@@ -6,6 +6,7 @@ CPU, W simulated ranks as gloo processes:
   TP-sharded shared MLP over the gathered rows, reduce-scattered back, equals each rank's
   replicated shared MLP on its own rows (up to fp32 summation order).
 - A rank whose rows exceed the DP maximum raises.
+- The all-gather marks a capturing prefill graph as holding a DP gather.
 - --shared-experts-tp-size accepts divisors of TP under attention DP with attention TP 1 and
   still rejects other widths (server-arg hook).
 """
@@ -86,8 +87,14 @@ def _worker(rank, world, port, rows, q):
         moe._shared_tp_sp_state = types.MethodType(
             kimi_k3.KimiK3MoE._shared_tp_sp_state, moe
         )
-        with unittest.mock.patch.object(
-            kimi_k3, "get_dp_global_num_tokens", lambda: list(rows)
+        notes = []
+        with (
+            unittest.mock.patch.object(
+                kimi_k3, "get_dp_global_num_tokens", lambda: list(rows)
+            ),
+            unittest.mock.patch.object(
+                kimi_k3, "_note_dp_gather_in_prefill_graph", lambda: notes.append(1)
+            ),
         ):
             gathered = kimi_k3.KimiK3MoE._gather_shared_expert_inputs(moe, x)
             out = kimi_k3.KimiK3MoE._reduce_scatter_shared_experts(
@@ -105,6 +112,7 @@ def _worker(rank, world, port, rows, q):
                 tuple(out.shape),
                 (out - ref).abs().max().item() if out.numel() else 0.0,
                 too_many,
+                len(notes),
             )
         )
     finally:
@@ -133,14 +141,16 @@ class TestSharedExpertsTpAcrossDp(unittest.TestCase):
 
     def test_uneven_and_idle_ranks(self):
         rows = [3, 0, 5, 1]
-        for rank, gshape, oshape, err, too_many in self._run(rows):
+        for rank, gshape, oshape, err, too_many, notes in self._run(rows):
+            # The gather spans DP ranks: a prefill graph holding it must be DP-uniform.
+            self.assertEqual(notes, 1)
             self.assertEqual(gshape, (max(rows) * len(rows), H))
             self.assertEqual(oshape, (rows[rank], H))
             self.assertLess(err, 1e-9)
             self.assertIn("exceed the DP maximum", too_many)
 
     def test_equal_rows(self):
-        for rank, gshape, oshape, err, _ in self._run([2, 2]):
+        for rank, gshape, oshape, err, *_ in self._run([2, 2]):
             self.assertEqual(gshape, (4, H))
             self.assertEqual(oshape, (2, H))
             self.assertLess(err, 1e-9)

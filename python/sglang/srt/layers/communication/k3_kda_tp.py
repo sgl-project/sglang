@@ -139,6 +139,17 @@ def _check_supported() -> None:
             f"speculative algorithm {algo} (its verify state commit is not the "
             "collective one)"
         )
+    topk = get_spec().speculative_eagle_topk
+    if topk not in (None, 1):
+        problems.append(
+            f"--speculative-eagle-topk {topk} (the gathered verify metadata keeps each "
+            "rank's own draft-tree fields)"
+        )
+    if envs.SGLANG_SCHEDULER_SKIP_ALL_GATHER.get():
+        problems.append(
+            "SGLANG_SCHEDULER_SKIP_ALL_GATHER (the state imports and forward kinds "
+            "come from the scheduler's DP all-gather)"
+        )
     if envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get():
         problems.append(
             "SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH (the state commit is a "
@@ -669,6 +680,24 @@ def _scratch_rows(backend, rows: torch.Tensor) -> torch.Tensor:
     return torch.where(rows < pad, rows, torch.full_like(rows, pad)).to(torch.int32)
 
 
+def _local_state_slots(model_runner, bs: int):
+    """This rank's first ``bs`` state / track slots as the verify forward resolved them:
+    its per-rank linear-backend metadata (the eager fast path installs the gathered
+    metadata on the backend; graph replay leaves the per-rank one). Not the request
+    table, which the scheduler may have rewritten since the forward."""
+    from sglang.srt.layers.attention.mamba.mamba2_metadata import ForwardStateSlots
+
+    fm = model_runner.attn_backend.linear_attn_backend.forward_metadata
+    if fm is None:
+        raise RuntimeError("KDA TP commit: no verify forward metadata")
+    if _GATHERED is not None and fm is _GATHERED[0]:
+        fm = _GATHERED[1]
+    track = fm.mamba_track_indices
+    return ForwardStateSlots(
+        fm.mamba_cache_indices[:bs], None if track is None else track[:bs]
+    )
+
+
 def commit_after_verify(
     model_runner,
     batch,
@@ -680,8 +709,8 @@ def commit_after_verify(
     collective: idle DP ranks call it with no requests). Each rank packs its requests'
     (slot, last accepted step, track slot, track step, scratch row), padded to the per-rank
     request capacity, and all-gathers them; the scatter then writes all ranks' requests.
-    ``state_slots``: the verify forward's resolved local slots (default: the request
-    table's current slots)."""
+    ``state_slots``: the verify forward's resolved local slots (default: the linear
+    backend's, ``_local_state_slots``)."""
     from sglang.kernels.ops.mamba.mamba_state_scatter_triton import (
         scatter_mamba_states_after_mtp_verify,
     )
@@ -701,12 +730,10 @@ def commit_after_verify(
     pack[1].fill_(-1)
     pack[3].fill_(-1)  # no track step
     if bs:
-        if state_slots is not None:
-            slots = state_slots.working[:bs]
-            track = state_slots.track
-        else:
-            slots = req_pool.get_mamba_indices(batch.req_pool_indices[:bs])
-            track = batch.mamba_track_indices
+        if state_slots is None:
+            state_slots = _local_state_slots(model_runner, bs)
+        slots = state_slots.working[:bs]
+        track = state_slots.track
         pack[0, :bs] = slots.to(torch.int64)
         pack[1, :bs] = last_correct_step_indices.to(torch.int64)
         if (
@@ -782,11 +809,6 @@ def mirror_deferred_state_ops(model_runner, forward_batch) -> None:
         )
 
 
-def end_forward() -> None:
-    global _CTX
-    _CTX = None
-
-
 # ---- PD decode: receiving prefill state into the head shards ----------------------------------
 
 
@@ -819,9 +841,9 @@ def lazy_stage_key(req_pool_idx: int) -> int:
 
 
 class FullStateStaging:
-    """Full-width (all heads) KDA state slots on this rank, and the all-to-alls over the TP
-    group that move such states between their owner DP rank and every rank's head shard of
-    the requests' global slots (``scatter``: owner -> shards, ``gather``: shards -> owner)."""
+    """Full-width (all heads) KDA state slots on this rank, and the all-to-all over the TP
+    group that moves such states from their owner DP rank into every rank's head shard of
+    the requests' global slots (``scatter``)."""
 
     def __init__(self, pool, cache_params, num_slots: int, device):
         from sglang.srt.configs.mamba_utils import KimiLinearStateShape
@@ -902,15 +924,6 @@ class FullStateStaging:
         t = t.index_select(3, self._conv_rank_major).reshape(Lc, c, k1, W, d // W)
         return t.permute(3, 1, 0, 2, 4).reshape(W, c, Lc, per).contiguous()
 
-    def _from_rank_major(self, t: torch.Tensor, kind: str, full_shape) -> torch.Tensor:
-        """Inverse of ``_rank_major``: [W, c, Lc, E] -> [Lc, c, *full slot]."""
-        W, c, Lc = t.shape[:3]
-        if kind == "temporal":
-            return t.permute(2, 1, 0, 3).reshape(Lc, c, *full_shape)
-        k1, d = full_shape
-        t = t.view(W, c, Lc, k1, d // W).permute(2, 1, 3, 0, 4).reshape(Lc, c, k1, d)
-        return torch.empty_like(t).index_copy_(3, self._conv_rank_major, t)
-
     def _state_pairs(self, mamba_pool):
         cache = mamba_pool.mamba_cache
         pairs = [(stage, shard, "conv") for stage, shard in zip(self.conv, cache.conv)]
@@ -955,43 +968,6 @@ class FullStateStaging:
                 dst_t[l0:l1, dst] = recv.view(n_total, l1 - l0, *slot_shape).transpose(
                     0, 1
                 )
-
-    def gather(
-        self, mamba_pool, stages: List[int], counts: List[int], src: torch.Tensor
-    ) -> None:
-        """Collective over the TP group, the inverse of ``scatter``: every rank sends its
-        heads of each DP rank's global slots ``src`` (every rank's, in rank order) to that
-        rank, which assembles the full states into its staging slots ``stages``."""
-        g = group()
-        W = g.world_size
-        dev = self.temporal.device
-        n_total = sum(counts)
-        c = len(stages)
-        stage_idx = torch.tensor(stages, dtype=torch.int64, device=dev)
-        L = len(self.layer_ids)
-        for stage_t, shard_t, kind in self._state_pairs(mamba_pool):
-            full_shape = stage_t.shape[2:]
-            per = shard_t[0, 0].numel()
-            Lc = self._layer_chunk(
-                L, max(n_total, W * max(counts)) * shard_t[0, 0].nbytes
-            )
-            for l0 in range(0, L, Lc):
-                l1 = min(L, l0 + Lc)
-                send = shard_t[l0:l1].index_select(1, src).transpose(0, 1).contiguous()
-                recv = torch.empty(
-                    (W, c, l1 - l0, per), dtype=shard_t.dtype, device=dev
-                )
-                torch.distributed.all_to_all_single(
-                    recv.view(-1),
-                    send.view(-1),
-                    output_split_sizes=[c * (l1 - l0) * per] * W,
-                    input_split_sizes=[n * (l1 - l0) * per for n in counts],
-                    group=g.device_group,
-                )
-                if c:
-                    stage_t[l0:l1].index_copy_(
-                        1, stage_idx, self._from_rank_major(recv, kind, full_shape)
-                    )
 
 
 class PdStateStaging(FullStateStaging):
@@ -1138,6 +1114,17 @@ class PdStateStaging(FullStateStaging):
                 stages.append(stage)
         if stages:
             self._draining.append((event, stages))
+
+    def release_request(self, req) -> None:
+        """Free the stages a finished or aborted request holds: under its staging key
+        (kda_tp_staged_slot, until queued for import), and under its state slot
+        (kda_tp_state_slot: a prebuilt completion can end it before a forward imports).
+        Both are host ints recorded at assign / admission, so this does not sync."""
+        for attr in ("kda_tp_staged_slot", "kda_tp_state_slot"):
+            key = getattr(req, attr, None)
+            if key is not None:
+                self.release_slot(key)
+                setattr(req, attr, None)
 
     def release_slot(self, slot: int) -> None:
         stage = self._stage_of.pop(slot, None)

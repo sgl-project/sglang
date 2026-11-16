@@ -136,6 +136,7 @@ class TestLifecycle(unittest.TestCase):
         self.assertFalse(req.kda_tp_lazy_mamba)
         self.assertEqual(int(pool.req_index_to_mamba_index_mapping[3]), slot)
         self.assertEqual(req.kda_tp_staged_slot, slot)
+        self.assertEqual(req.kda_tp_state_slot, slot)
         st.queue_import(req.kda_tp_staged_slot)  # _get_new_prebuilt_batch
         pairs = st.take_pending()
         self.assertEqual(pairs, [(stage, slot)])
@@ -264,6 +265,38 @@ class TestLeave(unittest.TestCase):
         self.assertEqual(pool.mamba_allocator.available_size(), 2)
         self.assertEqual(st._free, [0])
         self.assertIsNone(req.kv.mamba_pool_idx)
+
+    def test_prebuilt_completion_frees_stage_by_state_slot(self):
+        # Queued for import (staged key cleared), then finished before the import ran.
+        st = _staging(4, 1)
+        pool = _pool(st)
+        pool.enable_mamba_extra_buffer = False
+        req = _req(row=2, lazy=False, slot=5)
+        req.kda_tp_state_slot = 5
+        st.assign(5)
+        st.queue_import(5)
+        req.kda_tp_staged_slot = None
+        self._free(pool, req)
+        self.assertEqual(st._free, [0])
+        self.assertEqual(st._stage_of, {})
+        self.assertEqual(st.take_pending(), [])
+        self.assertIsNone(req.kda_tp_state_slot)
+
+    def test_release_without_pd_staging(self):
+        # Under --enable-unified-memory the state pool is a StateView, which has no
+        # pd_staging attribute at all.
+        from sglang.srt.mem_cache.kv.layout.state import StateView
+
+        pool = _pool(None)
+        pool.enable_mamba_extra_buffer = False
+        view = StateView.__new__(StateView)
+        self.assertFalse(hasattr(view, "pd_staging"))
+        pool.state.pool = view
+        req = _req(row=2, lazy=False, slot=1)
+        pool.mamba_allocator.alloc(1)
+        self._free(pool, req)
+        self.assertIsNone(req.kv.mamba_pool_idx)
+        self.assertEqual(pool.mamba_allocator.available_size(), 2)
 
 
 class TestSizingAndCapacity(unittest.TestCase):

@@ -81,6 +81,7 @@ from sglang.srt.kernel_plugins.amd.binding import (
     install_monokernel_forward,
 )
 from sglang.srt.kernel_plugins.nvidia.binding import (
+    built_megakernel,
     install_megakernel,
     megakernel_state,
 )
@@ -684,6 +685,17 @@ class ModelRunner:
     def init_kv_cache_configurator(
         self, draft_parallel_layout: DraftParallelLayout | None = None
     ):
+        from sglang.srt.layers.communication import k3_kda_tp
+
+        if (
+            k3_kda_tp.state_shard_width() > 1
+            and built_megakernel(self.model) is not None
+        ):
+            # The lazy-slot admission and the cross-rank state mirrors skip the
+            # megakernel's own-state slot resets and its verify commit.
+            raise NotImplementedError(
+                "--enable-kda-tp does not support an installed megakernel"
+            )
         # The replica count that shares this KV budget is the deployment's, not
         # the one a draft scope reports; the pool is allocated outside any scope,
         # so the PP width comes from the runner's own group.
@@ -2120,6 +2132,14 @@ class ModelRunner:
                     decode_graph_runner=self.decode_cuda_graph_runner,
                 )
 
+            if (
+                forward_batch.kda_tp_state_imports
+                and forward_batch.dp_kda_tp_state_imports is None
+            ):
+                raise RuntimeError(
+                    "KDA TP: this rank has PD state imports but no DP import counts "
+                    "(the scheduler's DP all-gather did not run)"
+                )
             if (
                 forward_batch.dp_kda_tp_state_imports is not None
                 and not self.is_draft_worker

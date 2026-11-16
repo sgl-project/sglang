@@ -53,6 +53,7 @@ from sglang.srt.layers.cp.interleave import (
 from sglang.srt.layers.dcp.layout import set_dsa_shards_index_k
 from sglang.srt.layers.dcp.planner import prepare_decode_context_parallel_metadata
 from sglang.srt.layers.dp_attention import (
+    _note_dp_gather_in_prefill_graph,
     get_dp_global_num_tokens,
     is_allocation_symmetric,
     is_dp_attention_enabled,
@@ -1252,6 +1253,10 @@ class KimiK3MoE(nn.Module):
     def _gather_shared_expert_inputs(self, hidden_states: torch.Tensor) -> torch.Tensor:
         group = self._shared_experts_tp_group
         rows = self._shared_tp_rows(hidden_states)
+        if self._shared_experts_tp_across_dp:
+            # The gather spans DP ranks: a prefill graph holding it replays only when
+            # every DP rank runs the bucket whose row count it recorded.
+            _note_dp_gather_in_prefill_graph()
         if rows != hidden_states.shape[0]:
             hidden_states = torch.nn.functional.pad(
                 hidden_states, (0, 0, 0, rows - hidden_states.shape[0])

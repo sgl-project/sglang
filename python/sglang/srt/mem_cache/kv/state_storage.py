@@ -286,13 +286,11 @@ class StateStorage:
         the one kept for the radix cache. The request drops the slot tensors
         it frees here, so an open free group holds them without a copy."""
         mamba_index = req.kv.mamba_pool_idx
-        staged_slot = getattr(req, "kda_tp_staged_slot", None)
-        if staged_slot is not None:
-            self.pool.pd_staging.release_slot(staged_slot)
-            req.kda_tp_staged_slot = None
-        elif mamba_index is not None and self.pool.pd_staging is not None:
-            # Prebuilt completion can return the slot before a forward imports it.
-            self.pool.pd_staging.release_slot(int(mamba_index))
+        # Only a KDA TP PD-decode MambaPool has staging (a unified-memory StateView has
+        # no such attribute).
+        staging = getattr(self.pool, "pd_staging", None)
+        if staging is not None:
+            staging.release_request(req)
         if mamba_index is None and getattr(req, "kda_tp_lazy_mamba", False):
             req.kda_tp_lazy_mamba = False
             return

@@ -476,10 +476,13 @@ def _admit_lazy_mamba_slot(req_to_token_pool, req: Req) -> bool:
     req_to_token_pool.req_index_to_mamba_index_mapping[req.kv.req_pool_idx] = mid[0].to(
         torch.int32
     )
+    # The one host read of the new slot; release keys the stage by it.
+    slot = int(mid[0])
+    req.kda_tp_state_slot = slot
     key = k3_kda_tp.lazy_stage_key(req.kv.req_pool_idx)
     if getattr(req, "kda_tp_staged_slot", None) == key:
-        req_to_token_pool.mamba_pool.pd_staging.rekey(key, int(mid[0]))
-        req.kda_tp_staged_slot = int(mid[0])
+        req_to_token_pool.mamba_pool.pd_staging.rekey(key, slot)
+        req.kda_tp_staged_slot = slot
     req.kda_tp_lazy_mamba = False
     return True
 
@@ -2249,12 +2252,10 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 slots = indices.cpu().numpy()
                 slot = int(slots.reshape(-1)[0])
                 if getattr(decode_req.req, "kda_tp_lazy_mamba", False):
-                    from sglang.srt.layers.communication import k3_kda_tp
-
                     slot = k3_kda_tp.lazy_stage_key(decode_req.req.kv.req_pool_idx)
+                else:
+                    decode_req.req.kda_tp_state_slot = slot
                 decode_req.req.kda_tp_staged_slot = slot
-                from sglang.srt.layers.communication import k3_kda_tp
-
                 if k3_kda_tp.late_stage():
                     stage = k3_kda_tp.LATE_STAGE_UNBOUND
                 else:
