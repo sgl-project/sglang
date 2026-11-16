@@ -29,11 +29,11 @@ def forward_fused_sparse_kv_offload(
     if q.shape[0] == 0:
         return q.new_empty((0, layer.tp_q_head_num * backend.kv_lora_rank))
     is_prefill = forward_batch.forward_mode.is_extend_without_speculative()
-    plan = None if is_prefill else backend.forward_metadata.sparse_kv_lim_plan
     k_nope = k.view(-1, layer.tp_k_head_num, backend.kv_lora_rank).contiguous()
     k_pe = k_rope.view(-1, layer.tp_k_head_num, backend.qk_rope_head_dim).contiguous()
     current_inputs = manager.offload_v2(k_nope, k_pe, layer, forward_batch)
     if not is_prefill:
+        plan = backend.forward_metadata.sparse_kv_lim_plan
         rows = forward_batch.batch_size * plan.query_width
         result = manager.copy_sfa_attention(
             layer,

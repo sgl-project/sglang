@@ -118,7 +118,6 @@ class MemFabricKVPool:
         for width, size in zip(widths, sizes):
             component = []
             for _ in range(layers):
-                tensor = None
                 if self.rank == 0:
                     chunks = (size + self.alignment - 1) // self.alignment
                     raw = offload.empty(
@@ -133,10 +132,9 @@ class MemFabricKVPool:
                         .view(dtype)
                         .view(-1, page_size, head_num, width)
                     )
-                address = self.group.broadcast_object(
-                    tensor.data_ptr() if tensor is not None else None
-                )
-                if tensor is None:
+                    self.group.broadcast_object(tensor.data_ptr())
+                else:
+                    address = self.group.broadcast_object(None)
                     # MF SHARED provides the same GVA on every participant.
                     storage = (ctypes.c_uint8 * size).from_address(address)
                     tensor = torch.frombuffer(storage, dtype=dtype).view(

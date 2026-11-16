@@ -1175,11 +1175,7 @@ class AscendAttnBackend(AttentionBackend):
                 # Update SWA mask: True = masked out (don't attend), False = attend.
                 # DFlash verify seq_lens is prefix-only, so use seq_lens_cpu
                 # (= prefix + block_size) to keep draft KV inside the mask window.
-                if (
-                    forward_mode.is_target_verify()
-                    and _is_dflash_verify(spec_info)
-                    and seq_lens_cpu is not None
-                ):
+                if forward_mode.is_target_verify() and _is_dflash_verify(spec_info):
                     # seq_lens_cpu may be a CPU tensor; swa_indices is on-device.
                     seq_lens_int = seq_lens_cpu[:bs].int().to(self.device)
                 else:

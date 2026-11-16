@@ -69,7 +69,7 @@ def _prepare_kernel(
         prefix = length
         sparse = valid & (prefix >= CAPACITY)
         previous = tl.load(last_ptr + safe_slot).to(tl.int32)
-        warm = sparse & (previous >= 0) & (prefix >= previous)
+        warm = (previous >= 0) & (prefix >= previous)
         state = tl.where(sparse, tl.where(warm, -1, -2), -3).to(tl.int32)
         next_prefix = tl.where(sparse, prefix, -1).to(tl.int32)
         cache_size = tl.where(sparse, CAPACITY, 0).to(tl.int32)
