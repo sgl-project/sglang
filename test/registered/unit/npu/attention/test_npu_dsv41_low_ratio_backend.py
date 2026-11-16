@@ -67,6 +67,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_memory_pool import (
     DSV4NPUTokenToKVPool,
     DSV41NPUSingleKVPool,
 )
+from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DSV41_INDEX_PAGE_SIZE,
     get_dsv4_indexer_bytes_per_token,
@@ -1371,10 +1372,15 @@ class TestC128ComponentGating(unittest.TestCase):
             if sidecar
             else SimpleNamespace()
         )
-        params = SimpleNamespace(
+        # The registry writes the slots onto ``params.tree_slots`` and the cache
+        # reads ``params.tree_components``, which is a derived property of that
+        # field -- so params must be the real dataclass, not a plain namespace.
+        params = CacheInitParams(
+            disable=False,
             req_to_token_pool=req_to_token_pool,
-            component_registry_override=None,
-            tree_components=(),
+            token_to_kv_pool_allocator=SimpleNamespace(storage=None, size=1024),
+            page_size=1,
+            sliding_window_size=128,
         )
         ctx = SimpleNamespace(
             server_args=None,
