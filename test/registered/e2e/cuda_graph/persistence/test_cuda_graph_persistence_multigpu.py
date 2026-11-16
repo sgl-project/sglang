@@ -10,7 +10,7 @@ outputs' agreement between the engines are exercised, model quality is not.
   sequential outputs are compared (DP attention composes batches per rank).
 - TP2 + EP2: tensor-parallel attention with expert parallel on the same GPUs.
 
-Needs the optional dependency sglang[foundry]. The EP rows need DeepEP and a
+Needs Foundry as test_cuda_graph_persistence.py describes. The EP rows need DeepEP and a
 usable NVSHMEM transport: without deep_ep they are skipped, and a native
 engine that does not start on the runner skips the row instead of failing it.
 

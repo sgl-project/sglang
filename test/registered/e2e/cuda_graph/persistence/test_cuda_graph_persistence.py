@@ -20,18 +20,27 @@ SGLang's startup timings and LOAD its per-set capture-loop numbers.
 test_cuda_graph_persistence_nightly.py runs the second configuration without
 the pins, as the comparison.
 
-Needs the optional dependency sglang[foundry] (the CUDA CI installs it).
+Needs Foundry: the optional dependency sglang[foundry], else the tests skip.
+In CI the tests install foundry-core into a scratch dir on the servers'
+PYTHONPATH (not into the shared site-packages) and skip when its torch pin
+differs from the runner's torch.
 
 Run:  python3 test/registered/e2e/cuda_graph/persistence/test_cuda_graph_persistence.py
 """
 
+import atexit
 import glob
+import importlib.util
 import os
 import re
 import shutil
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
+from importlib import metadata
+from typing import Optional
 
 import requests
 
@@ -41,6 +50,7 @@ from sglang.test.test_utils import (
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    is_in_ci,
     popen_launch_server,
     terminate_and_kill_process_tree,
 )
@@ -101,6 +111,51 @@ _PREFILL_PASSES = re.compile(
 )
 
 
+# Keep in sync with the foundry extra in python/pyproject.toml.
+_FOUNDRY_REQUIREMENT = "foundry-core>=0.1.0rc4,<0.2"
+_HAS_FOUNDRY = is_in_ci() or importlib.util.find_spec("foundry") is not None
+_foundry_pythonpath: Optional[str] = None
+
+
+def _foundry_env() -> dict:
+    """Environment under which the launched servers import Foundry. CI runners
+    share site-packages between jobs, so there foundry-core goes into a scratch
+    --target dir (once per process) that the servers get on PYTHONPATH."""
+    global _foundry_pythonpath
+    if not is_in_ci():
+        return {}
+    if _foundry_pythonpath is None:
+        target = tempfile.mkdtemp(prefix="foundry_core_")
+        atexit.register(shutil.rmtree, target, ignore_errors=True)
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "--no-deps", "--target"]
+            + [target, _FOUNDRY_REQUIREMENT],
+            check=True,
+        )
+        _skip_unless_built_for_this_torch(target)
+        _foundry_pythonpath = target
+    return {
+        "PYTHONPATH": os.pathsep.join(
+            filter(None, [_foundry_pythonpath, os.environ.get("PYTHONPATH")])
+        )
+    }
+
+
+def _skip_unless_built_for_this_torch(target: str) -> None:
+    # A foundry-core wheel requires torch==<its build torch>; --no-deps skips that check.
+    import torch
+    from packaging.requirements import Requirement
+
+    (dist,) = metadata.distributions(name="foundry-core", path=[target])
+    runner = torch.__version__.split("+")[0]
+    for req in map(Requirement, dist.requires or []):
+        if req.name == "torch" and not req.specifier.contains(runner):
+            raise unittest.SkipTest(
+                f"foundry-core {dist.version} requires {req}, this runner has "
+                f"torch {runner}"
+            )
+
+
 def _write_toml(path: str, workspace: str) -> str:
     # The region is virtual address space for everything allocated after setup,
     # the KV pool included; 256GB covers an 80-192 GB GPU at this memory fraction.
@@ -138,6 +193,9 @@ def _generate(base_url: str, text):
     return response.json()
 
 
+@unittest.skipUnless(
+    _HAS_FOUNDRY, "Foundry is not installed (pip install 'sglang[foundry]')"
+)
 class TestFoundryGraphPersistence(CustomTestCase):
     model = "Qwen/Qwen3.5-2B"
     # Every decode batch size up to 128; EP / attention-TP layouts clamp or align it.
@@ -173,6 +231,8 @@ class TestFoundryGraphPersistence(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
+        # Every engine, native included, so the three see the same environment.
+        cls.foundry_env = _foundry_env()
         cls.tmp = tempfile.mkdtemp(prefix="foundry_e2e_")
         cls.workspace = os.path.join(cls.tmp, "archive")
         cls.toml = _write_toml(os.path.join(cls.tmp, "foundry.toml"), cls.workspace)
@@ -245,7 +305,7 @@ class TestFoundryGraphPersistence(CustomTestCase):
                 cls.base_url,
                 timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
                 other_args=cls.server_args + cls._persistence_args(mode),
-                env={**cls.engine_env, **cls.extra_env},
+                env={**cls.engine_env, **cls.extra_env, **cls.foundry_env},
                 return_stdout_stderr=(out, err),
             )
             result["ready_s"] = time.perf_counter() - t_launch

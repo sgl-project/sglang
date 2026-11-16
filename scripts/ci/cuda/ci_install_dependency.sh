@@ -615,10 +615,9 @@ require_prebuilt_rust_exts() {
 }
 
 install_sglang() {
-    # foundry: the --cuda-graph-persistence e2e tests (base-b 1-gpu-large).
-    EXTRAS="dev,runai,tracing,foundry"
+    EXTRAS="dev,runai,tracing"
     if [ -n "$OPTIONAL_DEPS" ]; then
-        EXTRAS="dev,runai,tracing,foundry,${OPTIONAL_DEPS}"
+        EXTRAS="dev,runai,tracing,${OPTIONAL_DEPS}"
     fi
     echo "Installing python extras: [${EXTRAS}]"
     # editable checkout paths are identical across runner containers; keep

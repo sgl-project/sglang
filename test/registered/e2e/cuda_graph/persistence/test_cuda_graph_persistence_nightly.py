@@ -4,8 +4,8 @@ the environment pins of Foundry's recipes. Same assertions; the printed
 `[Foundry e2e]` startup-timing and `LOAD capture loop` lines of the two
 files give the with / without comparison (the pins cut SGLang's per-shape
 capture-loop prep by a quarter to 40 % on the FlashInfer backend; see
-recipe/sglang/set_env.sh in Foundry). Needs the optional dependency
-sglang[foundry].
+recipe/sglang/set_env.sh in Foundry). Needs Foundry as
+test_cuda_graph_persistence.py describes.
 
 Run:  python3 test/registered/e2e/cuda_graph/persistence/test_cuda_graph_persistence_nightly.py
 """
