@@ -543,10 +543,10 @@ class VisionTritonAttention(nn.Module):
         elif isinstance(cu_seqlens, list):
             # ViT CUDA graph runners pass [cu_seqlens, seq_lens, max_seqlen]; models
             # without a runner keep passing tensors even when the graph env var is set.
-            if "output_ws" not in kwargs:
+            output = kwargs.get("output_ws")
+            if output is None:
                 raise RuntimeError("output_ws should be prepared for cuda-graph mode")
 
-            output = kwargs["output_ws"]
             cu_seqlens_gpu = cu_seqlens[0]
             seq_lens = cu_seqlens[1]
             max_seqlen = cu_seqlens[2]
@@ -730,17 +730,17 @@ class VisionFlashInferAttention(nn.Module):
             packed_cu_seqlens = forward_metadata.packed_indptrs
             max_seqlen = forward_metadata.flashinfer_max_seqlen
         else:
-            if "sequence_lengths" not in kwargs:
+            sequence_lengths = kwargs.get("sequence_lengths")
+            if sequence_lengths is None:
                 raise RuntimeError(
                     "sequence_lengths should be prepared for vision flashinfer_cudnn attention backend"
                 )
-            if "max_seqlen" not in kwargs:
+            max_seqlen = kwargs.get("max_seqlen")
+            if max_seqlen is None:
                 raise RuntimeError(
                     "max_seqlen should be prepared for vision flashinfer_cudnn attention backend"
                 )
-            sequence_lengths = kwargs["sequence_lengths"]
             packed_cu_seqlens = cu_seqlens
-            max_seqlen = kwargs["max_seqlen"]
 
         # max_seqlen must be python int
         if isinstance(max_seqlen, torch.Tensor):

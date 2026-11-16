@@ -168,6 +168,50 @@ def test_triton_tensor_seqlens_with_vit_cuda_graph_env(monkeypatch):
         assert max_seqlen == 4
 
 
+def test_triton_graph_list_requires_output_workspace(monkeypatch):
+    # VisionAttention forwards output_ws=None when its caller has no workspace;
+    # the graph form must reject that instead of handing None to the kernel.
+    monkeypatch.setenv("SGLANG_VIT_ENABLE_CUDA_GRAPH", "1")
+    monkeypatch.setattr(vision, "context_attention_fwd", lambda *args, **kwargs: None)
+    q = torch.randn(6, 2, 8)
+    cu_seqlens = torch.tensor([0, 4, 6], dtype=torch.int32)
+    seq_lens = torch.tensor([4, 2], dtype=torch.int32)
+    backend = vision.VisionTritonAttention()
+
+    with pytest.raises(RuntimeError, match="output_ws should be prepared"):
+        backend(
+            q,
+            q,
+            q,
+            cu_seqlens=[cu_seqlens, seq_lens, 4],
+            bsz=1,
+            seq_len=6,
+            output_ws=None,
+        )
+
+
+@pytest.mark.parametrize("missing", ["sequence_lengths", "max_seqlen"])
+def test_flashinfer_rejects_seqlen_inputs_forwarded_as_none(monkeypatch, missing):
+    # Same contract for the FlashInfer backend: VisionAttention forwards both
+    # values as None when the encoder did not prepare them.
+    monkeypatch.setattr(vision, "_is_cuda", True)
+    q = torch.randn(6, 2, 8)
+    inputs = dict(sequence_lengths=torch.tensor([4, 2]), max_seqlen=4)
+    inputs[missing] = None
+    backend = vision.VisionFlashInferAttention()
+
+    with pytest.raises(RuntimeError, match=f"{missing} should be prepared"):
+        backend(
+            q,
+            q,
+            q,
+            cu_seqlens=torch.tensor([0, 4, 6], dtype=torch.int32),
+            bsz=1,
+            seq_len=6,
+            **inputs,
+        )
+
+
 def test_explicit_backend_without_published_mm_context(monkeypatch, npu_platform):
     monkeypatch.setattr(
         vision,
