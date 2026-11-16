@@ -5,6 +5,7 @@ from typing import Callable, List, Optional
 
 import torch
 
+from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_argmax_only,
     draft_topk1_postprocess,
@@ -846,6 +847,27 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             )
             draft_tokens_topk1[:, :1].copy_(topk_index)
 
+        # A megakernel's top-1 fold, on a greedy chain without logprobs.
+        captured_fold = fold = forward_batch.draft_step_fold
+        if (
+            draft_tokens_topk1 is None
+            or forward_batch.mm_input_embeds is not None
+            or forward_batch.return_logprob
+        ):
+            fold = None
+        forward_batch.draft_step_fold = fold
+        mrope = None
+        if fold is not None and self.draft_runner.model_config.model_is_mrope:
+            mrope = forward_batch.mrope_positions
+            positions = forward_batch.positions
+            if (
+                mrope.shape != (3, positions.numel())
+                or mrope.dtype != positions.dtype
+                or mrope.untyped_storage().data_ptr()
+                == positions.untyped_storage().data_ptr()
+            ):
+                mrope = None  # aliased operands keep the sequential updates
+
         # Forward multiple steps
         scores = None
         with IndexTopKShareState.mtp_iteration(
@@ -906,7 +928,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     draft_probs_list.append(probs)
                     forward_batch.positions.add_(1)
                 elif self.topk == 1:
-                    if _is_cuda or _is_hip:
+                    if fold is not None:
+                        topk_p, topk_index = fold.finalize(
+                            logits_output.next_token_logits,
+                            forward_batch.positions,
+                            draft_tokens_topk1,
+                            i + 1,
+                            mrope,
+                        )
+                    elif _is_cuda or _is_hip:
                         topk_p, topk_index = draft_topk1_postprocess(
                             logits_output.next_token_logits,
                             forward_batch.positions,
@@ -927,7 +957,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                     )
                     topk_p, topk_index = fast_topk(probs, self.topk, dim=-1)
                     forward_batch.positions.add_(1)
-                if self.draft_runner.model_config.model_is_mrope:
+                if self.draft_runner.model_config.model_is_mrope and mrope is None:
                     forward_batch.mrope_positions.add_(1)
                 maybe_detect_oob(
                     topk_index,
@@ -938,6 +968,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 if self.hot_token_id is not None:
                     topk_index = self.hot_token_id[topk_index]
                 hidden_states = logits_output.hidden_states
+        forward_batch.draft_step_fold = captured_fold
 
         # Organize the results
         if topk1_chain_fits:
@@ -1329,9 +1360,14 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             elif self.topk == 1:
                 # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
                 # MTP draft selection on FP8 logits.
-                ret_topk_index = torch.argmax(
-                    draft_logits_output.next_token_logits, dim=-1, keepdim=True
-                )
+                if envs.SGLANG_OPT_SPEC_DRAFT_TOP1_ARGMAX.get():
+                    ret_topk_index = sampling_argmax(
+                        draft_logits_output.next_token_logits
+                    ).unsqueeze(-1)
+                else:
+                    ret_topk_index = torch.argmax(
+                        draft_logits_output.next_token_logits, dim=-1, keepdim=True
+                    )
                 ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             else:
                 probs = renorm_draft_probs(
@@ -1498,6 +1534,8 @@ class EAGLEWorkerV2(BaseSpecWorker):
             simulated_acc_len_rng=self._simulated_acc_len_rng,
             speculative_runtime_hooks=self._speculative_runtime_hooks,
         )
+        if envs.SGLANG_OPT_POST_VERIFY_POOL_PRESIZE.get():
+            self._post_verify_graphs.enable_pool_presize()
 
     def init_cuda_graphs(self):
         super().init_cuda_graphs()
