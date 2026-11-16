@@ -331,9 +331,11 @@ def _attention_prologue(
     VERIFY: tl.constexpr = False,
     dyn_rows=0,
     DYN_GROUPS: tl.constexpr = 0,
+    USE_PDL: tl.constexpr = False,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0).to(tl.int64)
     part = tl.program_id(1)
     tau = 1.0
@@ -954,6 +956,6 @@ def attention_prologue(
             k_dynamic.shape[0] if dynamic and k_dynamic.ndim == 3 else 0,
             num_warps=4,
             enable_fp_fusion=False,
-            launch_pdl=is_arch_support_pdl(),
+            **({"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
         )
     return q, k, v, rel

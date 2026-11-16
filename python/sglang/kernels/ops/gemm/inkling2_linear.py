@@ -70,11 +70,13 @@ def _linear_k_group_partials(
     BLOCK_M: tl.constexpr = 16,
     X2=None,
     W2=None,
+    USE_PDL: tl.constexpr = False,
 ):
     """With X2 and W2, groups past the first cdiv(K, 1024) compute X2 @ W2.T
     into the next (groups, M, N) block of P."""
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
     group = tl.program_id(2)
@@ -109,10 +111,18 @@ def _linear_k_group_partials(
 
 @triton.jit
 def _linear_k_group_sum(
-    P, B, Y, M, N: tl.constexpr, GROUPS: tl.constexpr, HAS_BIAS: tl.constexpr
+    P,
+    B,
+    Y,
+    M,
+    N: tl.constexpr,
+    GROUPS: tl.constexpr,
+    HAS_BIAS: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     offsets = tl.program_id(0) * 256 + tl.arange(0, 256)
     mask = offsets < M * N
     total = tl.load(P + offsets, mask, other=0)
@@ -163,7 +173,7 @@ def linear_k_group_partials(flat, weight, block_k=256, num_stages=3):
         num_warps=8 if wide else 4,
         num_stages=min(num_stages, 2) if wide else num_stages,
         enable_fp_fusion=False,
-        launch_pdl=is_arch_support_pdl(),
+        **({"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
     )
     return partials
 
@@ -197,7 +207,7 @@ def linear_k_group_partials_pair(x, weight, x2, weight2):
         num_warps=8 if wide else 4,
         num_stages=2 if wide else 3,
         enable_fp_fusion=False,
-        launch_pdl=is_arch_support_pdl(),
+        **({"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
     )
     return partials
 
@@ -215,7 +225,7 @@ def _linear_k_groups_split(flat, weight, bias, out):
         groups,
         bias is not None,
         enable_fp_fusion=False,
-        launch_pdl=is_arch_support_pdl(),
+        **({"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
     )
 
 

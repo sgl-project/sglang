@@ -48,9 +48,11 @@ def _gate_sink_kernel(
     GROUP: tl.constexpr,
     PADDED_GROUP: tl.constexpr,
     BLOCK: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     mask = col < H * D
@@ -99,9 +101,11 @@ def _combine_gate_sink_kernel(
     D: tl.constexpr,
     SPLITS_P: tl.constexpr,
     HAS_L: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0)
     head = tl.program_id(1)
     cols = tl.arange(0, D)
@@ -177,7 +181,7 @@ def combine_gate_sink(o_partial, m_partial, l_partial, *, gate, sinks):
             triton.next_power_of_2(splits),
             l_partial is not None,
             enable_fp_fusion=False,
-            launch_pdl=is_arch_support_pdl(),
+            **({"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
         )
     return out
 
@@ -252,7 +256,7 @@ def gate_sink(output, gate, lse, sinks, *, output_dtype, head_groups=None):
             padded_group,
             256,
             enable_fp_fusion=False,
-            launch_pdl=is_arch_support_pdl(),
+            **({"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
         )
     return result
 
@@ -265,9 +269,11 @@ def _tau_kernel(
     ALPHA: tl.constexpr,
     N: tl.constexpr,
     BLOCK: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     i = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     pos = tl.load(Pos + i, i < N, other=0)
     ratio = tl.maximum((pos + 1).to(tl.float32) * (1.0 / FLOOR), 1.0)
@@ -290,7 +296,7 @@ def compute_log_scaling_tau(positions, n_floor, alpha):
             positions.numel(),
             256,
             enable_fp_fusion=False,
-            launch_pdl=is_arch_support_pdl(),
+            **({"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
         )
     return output
 
@@ -305,9 +311,11 @@ def _pad_head_groups(
     PADDED: tl.constexpr,
     D: tl.constexpr,
     BLOCK: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     padded_heads: tl.constexpr = HEADS // GROUP * PADDED
@@ -334,6 +342,6 @@ def pad_head_groups(x, group, padded_group):
             padded_group,
             width,
             1024,
-            launch_pdl=is_arch_support_pdl(),
+            **({"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
         )
     return out

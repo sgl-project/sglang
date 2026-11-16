@@ -6,9 +6,12 @@ from sglang.kernels.jit.utils import is_arch_support_pdl
 
 
 @triton.jit
-def _residual_add_kernel(output, inputs, size, BLOCK: tl.constexpr):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+def _residual_add_kernel(
+    output, inputs, size, BLOCK: tl.constexpr, USE_PDL: tl.constexpr = False
+):
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     offsets = tl.program_id(0).to(tl.int64) * BLOCK + tl.arange(0, BLOCK)
     result = tl.zeros((BLOCK,), dtype=tl.float32)
     for index in tl.static_range(len(inputs)):
@@ -30,6 +33,6 @@ def residual_add(*inputs: torch.Tensor) -> torch.Tensor:
             inputs,
             result.numel(),
             BLOCK=1024,
-            launch_pdl=is_arch_support_pdl(),
+            **({"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
         )
     return result

@@ -59,9 +59,11 @@ def _sconv_kernel(
     SWW: tl.constexpr = 0,
     WINDOW: tl.constexpr = False,
     ROUND_BF16: tl.constexpr = False,
+    USE_PDL: tl.constexpr = False,
 ):
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     row = tl.program_id(0)
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     valid = col < D
@@ -203,10 +205,12 @@ def _sconv_prefill_kernel(
     SCALE: tl.constexpr,
     BM: tl.constexpr,
     BN: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
 ):
     """_sconv_kernel for extend batches over (BM rows, BN columns) tiles."""
-    tl.extra.cuda.gdc_wait()
-    tl.extra.cuda.gdc_launch_dependents()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
     rows = tl.program_id(0) * BM + tl.arange(0, BM)
     col = tl.program_id(1) * BN + tl.arange(0, BN)
     valid = (rows < n_rows)[:, None] & (col < D)[None, :]
@@ -453,7 +457,11 @@ def short_convolution(
                 16,
                 128,
                 enable_fp_fusion=False,
-                launch_pdl=is_arch_support_pdl(),
+                **(
+                    {"USE_PDL": True, "launch_pdl": True}
+                    if is_arch_support_pdl()
+                    else {}
+                ),
             )
             return output
         if _cuda_sconv(
@@ -507,7 +515,7 @@ def short_convolution(
             SWW=window.stride(2) if window is not None else 0,
             WINDOW=window is not None,
             enable_fp_fusion=False,
-            launch_pdl=is_arch_support_pdl(),
+            **({"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
         )
     return output
 
@@ -599,6 +607,6 @@ def routed_sconv_epilogue(
             SWW=window.stride(2) if window is not None else 0,
             WINDOW=window is not None,
             enable_fp_fusion=False,
-            launch_pdl=is_arch_support_pdl(),
+            **({"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}),
         )
     return out
