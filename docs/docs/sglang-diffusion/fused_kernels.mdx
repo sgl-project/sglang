@@ -174,6 +174,7 @@ architectures, gradient-enabled calls, and compilation retain the native path.
 | `helios_qk_rope` | JIT CUDA | bit-exact | paired in-place Helios Q/K RoPE with transposed frequency layout |
 | `ltx2_qknorm_split_rope` | KDA (JIT CUDA) | close (validated on B200) | LTX-2 QK-norm + split RoPE |
 | `ltx25_decoder_rope` | JIT CUDA | bit-exact | paired LTX-2.5 decoder 3D RoPE from cached compact axis tables |
+| `fused_nomas_qk_norm_mrope` | Triton | bit-exact against the compiled parameter graph, verified per signature | Nomas PixelUMM VAE BF16 Q/K normalization and 64/32/32-axis RoPE on SM100+, retaining ATen mean squares and the compiled fallback |
 | `hunyuan_qkv_rope_pack` | Triton | bit-exact | QKV pack and RoPE in one pass |
 
 The Klein strided path preserves the BF16 rounding between RMSNorm and RoPE,
@@ -228,10 +229,11 @@ unsupported layouts, gradient-bearing inputs, and unverified signatures
 during graph capture use the native path. This does not enable model-level
 BCG support.
 
-For large Hopper BF16 image Q/K with 32 heads of width 128, Joy also uses
-the existing out-of-place QK-Norm + RoPE kernel to read the packed projection
-directly. This removes two input copies while retaining the original CUDA
-arithmetic and contiguous outputs. Each new signature is checked bitwise;
+On SM90 and SM103, Joy uses the existing out-of-place QK-Norm + RoPE
+kernel for packed BF16 image Q/K tensors with 32 heads of width 128 and
+at least 16,777,216 elements. It reads the packed projection directly,
+removing two input copies while retaining the original CUDA arithmetic
+and contiguous outputs. Each new signature is checked bitwise;
 inputs remain intact if the operation fails. Other shapes and platforms,
 compilation, unverified capture, and `SGLANG_ENABLE_FUSED_QKNORM_ROPE=0`
 retain the original helper.

@@ -56,7 +56,11 @@ from sglang.srt.model_loader.weight_utils import (
     sharded_weight_loader,
 )
 from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
-from sglang.srt.models.utils import apply_qk_norm, bind_or_assign
+from sglang.srt.models.utils import (
+    apply_qk_norm,
+    bind_or_assign,
+    keeps_no_quant_config,
+)
 from sglang.srt.runtime_context import get_parallel, get_spec
 from sglang.srt.speculative.dflash_utils import (
     can_dflash_slice_qkv_weight,
@@ -178,8 +182,9 @@ def _probe_candidate_ag(group) -> bool:
     ):
         return False
 
+    lease = k3_ar_fusion._get_state().lease
     try:
-        sp_collective.register_comm(group.ca_comm.obj)
+        sp_collective.register_comm(lease.get_communicator, world_size=lease.world_size)
     except AssertionError:
         logger.warning(
             "DFLASH fused candidate all-gather: another communicator owns "
@@ -1104,6 +1109,7 @@ class DFlashDraftModel(nn.Module):
     supports_fused_context_kv = True
     # Layer prefixes and a quant_config-aware `fc`, for quantized checkpoints.
     supports_quantization = False
+    own_quant_config = staticmethod(keeps_no_quant_config)
     # `project_target_hidden` gathers a TP-split `fc` (SGLANG_OPT_DFLASH_TP_AUX_FC).
     supports_fc_tp_split = True
 

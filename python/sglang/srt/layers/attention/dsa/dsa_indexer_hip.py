@@ -6,7 +6,10 @@ from typing import Any, Callable, Optional, Tuple
 
 import torch
 
-from sglang.kernels.ops.attention.dsa import aiter_paged_mqa_logits_verify
+from sglang.kernels.ops.attention.dsa import (
+    aiter_paged_mqa_logits_persistent_schedule,
+    aiter_paged_mqa_logits_verify,
+)
 from sglang.kernels.ops.attention.fla.layernorm_gated import rms_norm_gated
 from sglang.srt.layers.dcp.layout import get_dcp_lens
 from sglang.srt.layers.layernorm import LayerNorm
@@ -45,6 +48,8 @@ _verify_request_block_tables = _PerForwardMemo()
 # FP4 index-K logits: each request's page-table row and its first query row
 _fp4_request_block_tables = _PerForwardMemo()
 _fp4_query_starts = _PerForwardMemo()
+# Generic paged-logits path: per-row work table balanced over the real lengths.
+_paged_logits_schedule = _PerForwardMemo()
 
 
 def _localize_store_loc(
@@ -79,6 +84,18 @@ def store_fp4_index_k(
         )
     fp4_index_hip.store_fp4_index_k(
         key, *pool.get_index_k_fp4_buffers(layer_id), out_loc.contiguous()
+    )
+
+
+def paged_logits_persistent_schedule(
+    forward_batch, layer_id: int, lens: torch.Tensor, max_seq_len: int
+) -> torch.Tensor:
+    """The aiter persistent schedule for one query row per entry of lens, shared by the
+    forward's layers."""
+    return _paged_logits_schedule.get(
+        key=(id(forward_batch), lens.data_ptr(), lens.shape, max_seq_len),
+        layer_id=layer_id,
+        compute=lambda: aiter_paged_mqa_logits_persistent_schedule(lens, max_seq_len),
     )
 
 
@@ -521,6 +538,32 @@ def fp4_prefill(
         act_quant=act_quant,
     )
     return fp4_prefill_q(indexer, query, x)
+
+
+def tp_split_topk_rows(
+    tp_split, rows: int, topk: int, device
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """An equal-stride ``[world * max(sizes), topk]`` top-k buffer and this rank's
+    ``rows`` of its slot, so the TP-split gather is aiter's in-place all-gather instead
+    of PyNCCL ``all_gatherv``."""
+    group, _, _, sizes = tp_split
+    slot = max(sizes)
+    buf = torch.empty((group.world_size * slot, topk), device=device, dtype=torch.int32)
+    mine = group.rank_in_group * slot
+    return buf, buf[mine : mine + rows]
+
+
+def tp_split_gather_topk(tp_split, buf: torch.Tensor, out: torch.Tensor) -> None:
+    """Gather ``tp_split_topk_rows``'s slots and write every rank's rows to ``out``
+    in rank order, which is row order, without the slots' padding."""
+    group, _, _, sizes = tp_split
+    slot = buf.shape[0] // group.world_size
+    mine = group.rank_in_group * slot
+    # int32 rows travel as float32 bits (the custom all-gather is typed)
+    group.all_gather_into_tensor(
+        buf.view(torch.float32), buf[mine : mine + slot].view(torch.float32)
+    )
+    torch.cat([buf[r * slot : r * slot + n] for r, n in enumerate(sizes)], out=out)
 
 
 class Fp32LayerNormHip(LayerNorm):

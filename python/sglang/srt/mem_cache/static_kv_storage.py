@@ -256,7 +256,8 @@ class StaticKVStorage:
         )
 
     def reset_new_rows(self) -> None:
-        """See `KVStorage.reset_new_rows`."""
+        """Reset the request-scoped state of the rows handed out since the last
+        call, on the current stream (`RowResets`)."""
         self._row_resets.apply()
 
     def _reset_request_rows(self, rows: List[int]) -> None:

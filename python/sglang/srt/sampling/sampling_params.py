@@ -20,6 +20,7 @@ from typing import Any, Dict, List, Optional, Sequence, Set, Union
 import msgspec
 
 from sglang.srt.environ import envs
+from sglang.srt.sampling.stop_regex import validate_stop_regex
 from sglang.srt.sampling.watermarking.core import (
     WatermarkRequestConfig,
     normalize_watermark_request,
@@ -398,8 +399,9 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
                         f"stop_regex is {stop_regex_len} bytes, over the "
                         f"{MAX_STOP_REGEX_LEN}-byte limit"
                     )
+                parsed_stop_regex = validate_stop_regex(stop_regex)
                 stop_regex_max_len = max(
-                    stop_regex_max_len, get_max_seq_length(stop_regex)
+                    stop_regex_max_len, _max_length_from_subpattern(parsed_stop_regex)
                 )
 
             self.stop_regex_max_len = stop_regex_max_len

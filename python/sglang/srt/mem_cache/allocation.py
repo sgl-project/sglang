@@ -265,14 +265,25 @@ def ensure_mamba_capacity(
         return True
 
     needed = sum(state.pending_request_slots(req_to_token_pool, req) for req in reqs)
+    supports_mamba = tree_cache is not None and tree_cache.supports_mamba()
+    if req_to_token_pool.binds_row_units and supports_mamba:
+        # The rows these requests bind take request units from the same bytes,
+        # before the state slots: reclaim for both at once.
+        rows = sum(req.kv.req_pool_idx is None for req in reqs)
+        chain = tree_cache.token_to_kv_pool_allocator
+        demand = KVDemand(state_slots=needed, request_rows=rows).completed(
+            chain.window_pool_names()
+        )
+        if chain.ensure_capacity(demand):
+            return True
+        tree_cache.evict_for_alloc(demand)
+        return chain.ensure_capacity(demand)
 
     # Byte-coordinated for the shared allocator; plain free slots otherwise.
     allocator = state.slots
     # Only a tree that holds Mamba states can give slots back.
-    tree_holds_mamba = (
-        tree_cache is not None
-        and tree_cache.supports_mamba()
-        and not getattr(tree_cache, "request_mamba_only", False)
+    tree_holds_mamba = supports_mamba and not getattr(
+        tree_cache, "request_mamba_only", False
     )
     if allocator.slots_fit(needed):
         return True

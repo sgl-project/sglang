@@ -82,12 +82,19 @@ def _hybrid_backend(mamba_pool, spec_state, cache_indices, track_slots=None):
         track = None
         if track_ids is not None:
             track = track_slots[:num_requests]
-        return ForwardStateSlots(cache_indices[:num_requests], track)
+        ring = hybrid.linear_attn_backend.ring_rows
+        return ForwardStateSlots(
+            cache_indices[:num_requests],
+            track,
+            None if ring is None else ring[:num_requests],
+        )
 
     hybrid = HybridLinearAttnBackend.__new__(HybridLinearAttnBackend)
     hybrid.linear_attn_backend = SimpleNamespace(
         state_pool=mamba_pool,
         forward_state_slots=forward_state_slots,
+        # The ring rows the verify resolved; on static pools, the request rows.
+        ring_rows=None,
         accept_lens_pool=None,
         token_to_kv_pool=SimpleNamespace(
             layer_router=SimpleNamespace(part_view=lambda part: None)
@@ -136,6 +143,7 @@ class TestGDNReplaySSMRingLength(CustomTestCase):
 
 class TestGDNReplaySSMBackendCommit(CustomTestCase):
     def _commit(self, hybrid, last_correct, req_rows, **kwargs):
+        hybrid.linear_attn_backend.ring_rows = req_rows
         hybrid.update_mamba_state_after_mtp_verify(
             last_correct_step_indices=last_correct,
             mamba_track_indices=kwargs.get("track_indices"),
@@ -164,6 +172,26 @@ class TestGDNReplaySSMBackendCommit(CustomTestCase):
         self.assertEqual(kwargs["accept_lens"].tolist(), [3, 1, 8])
         # Every accepted window folds, so `temporal` is the committed state.
         self.assertIs(kwargs["fold_every_commit"], True)
+
+    def test_gdn_ring_commit_takes_the_resolved_ring_rows(self):
+        """Under unified memory the ring rows are units of the request sub-pool
+        the verify resolved, not the request rows: the commit writes those."""
+        pool, state = _gdn_pool(), _spec_state()
+        hybrid = _hybrid_backend(pool, state, torch.tensor([5, 9]))
+        req_rows = torch.tensor([17, 23])
+        with (
+            patch(_GDN_COMMIT) as commit,
+            patch(f"{_BACKEND}.scatter_mamba_states_after_mtp_verify"),
+        ):
+            hybrid.linear_attn_backend.ring_rows = torch.tensor([3, 8])
+            hybrid.update_mamba_state_after_mtp_verify(
+                last_correct_step_indices=torch.tensor([1, 0]),
+                mamba_track_indices=None,
+                mamba_steps_to_track=None,
+                model=None,
+                req_pool_indices=req_rows,
+            )
+        self.assertEqual(commit.call_args.kwargs["replay_indices"].tolist(), [3, 8])
 
     def test_pp_rows_and_forward_track_slots(self):
         pool, state = _gdn_pool(), _spec_state()
@@ -272,7 +300,7 @@ class TestGDNReplaySSMGenericCommit(CustomTestCase):
                 accept_lens,
                 accept_index,
                 draft_token_num=3,
-                state_slots=ForwardStateSlots(slots),
+                state_slots=ForwardStateSlots(slots, None, batch.req_pool_indices),
             )
 
         for kernel in (advance, fold):

@@ -32,7 +32,7 @@ The examples use W8A8 weights on A3 series and W8A8_MXFP8 weights on 950PR/DT se
 <Note>
 The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
 mode, and workload. For parameter details, see
-[Feature descriptions](/docs/hardware-platforms/ascend-npus/ascend_npu_optimization#feature-descriptions); for
+[Parameter Reference](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#parameter-reference); for
 recommended configurations for each deployment scenario, see [Best practices](#best-practices).
 </Note>
 
