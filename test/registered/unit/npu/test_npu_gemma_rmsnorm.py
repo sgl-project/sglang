@@ -60,6 +60,28 @@ def test_srt_gemma_residual_reuses_precomputed_weight(
         assert gamma is layer.gemma_weight
 
 
+def test_srt_gemma_native_fallback_keeps_post_residual_addition():
+    """The env-selected native fallback must add post_residual_addition to the
+    residual stream, as the torch_npu path does."""
+    from sglang.srt.environ import envs
+    from sglang.srt.layers import layernorm as layernorm_module
+
+    hidden_size = 64
+    layer = layernorm_module.GemmaRMSNorm(hidden_size)
+    weight = torch.linspace(-0.5, 0.5, hidden_size)
+    layer.weight.weight_loader(layer.weight, weight)
+    x = torch.randn(2, hidden_size)
+    residual = torch.randn_like(x)
+    post_residual = torch.randn_like(x)
+
+    with envs.SGLANG_NPU_FORWARD_NATIVE_GEMMA_RMS_NORM.override(True):
+        output, residual_sum = layer.forward_npu(x, residual, post_residual)
+
+    torch.testing.assert_close(residual_sum, x + residual + post_residual)
+    expected_output, _ = layer.forward_native(x, residual, post_residual)
+    torch.testing.assert_close(output, expected_output)
+
+
 def test_srt_falls_back_to_torch_npu_on_wheels_without_the_provider():
     """The srt-layer provider import must stay guarded, with a torch_npu fallback.
 
