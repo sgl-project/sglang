@@ -77,10 +77,18 @@ test('A3 server commands carry the best-practice flags and environment, apart fr
   }
 });
 
-test('the router command matches the best practice and targets the node-0 servers', () => {
+test('the router command matches the CI contract and targets the node-0 servers', () => {
   const router = node('router');
   assert.ok(router.includes('python -m sglang_router.launch_router'));
-  assert.deepEqual(flags(router), flags(localize(routerScript, 0)));
+  assert.deepEqual(flags(router), [
+    '--model-id /path/to/model-weights',
+    '--no-tokenizer',
+    '--worker-urls http://<prefill-node0-ip>:30000 http://<decode-node0-ip>:30000',
+    '--host 127.0.0.1',
+    '--port 6688',
+    '--request-timeout-secs 1800',
+    '--stale-request-timeout-secs 1800'
+  ]);
   assert.doesNotMatch(router, /--model-path|sglang\.launch_server/);
 });
 
@@ -96,8 +104,7 @@ test('every node agrees on head-node addresses, the MemFabric store and the rout
     }
     assert.doesNotMatch(command, /--port 800[01]\b/);
   }
-  assert.ok(router.includes(`--prefill http://<prefill-node0-ip>:30000 ${bootstrap}`));
-  assert.ok(router.includes('--decode http://<decode-node0-ip>:30000'));
+  assert.ok(router.includes(`--worker-urls http://<prefill-node0-ip>:30000 http://<decode-node0-ip>:30000`));
   assert.match(router, /--port 6688(?:\s|$)/);
 });
 

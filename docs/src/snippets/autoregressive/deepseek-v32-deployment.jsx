@@ -139,8 +139,7 @@ export const DeepSeekV32Deployment = () => {
     return next;
   };
 
-  // Ascend A3 4-node PD reference recipe derived from the upstream
-  // "DeepSeek-V3.2 W8A8 1P1D 32P IN128K OUT1K" configuration.
+  // Ascend A3 4-node PD reference
   const npuServerPort = 30000;
   const generateAscendCommand = (values) => {
     const { npuDeployment, npuRole, npuNodeRank } = values;
@@ -158,13 +157,13 @@ export const DeepSeekV32Deployment = () => {
         '# Run on any host that can reach prefill node 0 and decode node 0.',
         '# Replace <prefill-node0-ip> and <decode-node0-ip> before running.',
         'python -m sglang_router.launch_router \\',
-        '  --pd-disaggregation \\',
-        '  --policy cache_aware \\',
-        `  --prefill http://<prefill-node0-ip>:${npuServerPort} 8998 \\`,
-        `  --decode http://<decode-node0-ip>:${npuServerPort} \\`,
+        '  --model-id /path/to/model-weights \\',
+        '  --no-tokenizer \\',
+        `  --worker-urls http://<prefill-node0-ip>:${npuServerPort} http://<decode-node0-ip>:${npuServerPort} \\`,
         '  --host 127.0.0.1 \\',
         '  --port 6688 \\',
-        '  --mini-lb'
+        '  --request-timeout-secs 1800 \\',
+        '  --stale-request-timeout-secs 1800'
       ].join('\n');
     }
 
