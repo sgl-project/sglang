@@ -165,6 +165,21 @@ def _minimax_m3_overrides(server_args: Any, hf_config: Any) -> dict:
             or envs.SGLANG_M3_ALLOW_CUSTOM_AR.get()
         ):
             overrides["disable_custom_all_reduce"] = True
+        page_resolved = cfg.page_size
+        # MiniMax-M3's sparse block is 128 tokens. With page_size == 128 a
+        # selected block is exactly one allocator page, so the index-score and
+        # sparse-attention kernels derive a block's slots from one base slot
+        # per block instead of gathering req_to_token per token
+        # (``PER_PAGE_SLOTS`` / ``paged_contig``). Mirrors the SM100/SM90
+        # branches below; the Triton backend used here allows any page size.
+        if page_resolved is None:
+            overrides["page_size"] = 128
+            page_resolved = 128
+        logger.info(
+            "MiniMax-M3 on ROCm: attention_backend="
+            f"{overrides.get('attention_backend', cfg.attention_backend)}, "
+            f"page_size={page_resolved}."
+        )
     elif get_platform().is_sm100:
         if is_attention_backend_not_set(cfg):
             if (

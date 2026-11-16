@@ -3835,6 +3835,44 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             self.assertEqual(ov["attention_backend"], "fa4")
             self.assertEqual(ov["page_size"], 128)
 
+    def test_m3_rocm_page_size_defaults_to_sparse_block(self):
+        from sglang.srt.arg_groups.model_overrides.minimax_m3 import (
+            _minimax_m3_overrides,
+        )
+
+        def _args(**kw):
+            defaults = dict(
+                quantization="mxfp8",
+                _quantization_explicitly_unset=False,
+                attention_backend=None,
+                prefill_attention_backend=None,
+                decode_attention_backend=None,
+                page_size=None,
+                moe_runner_backend="auto",
+                kv_cache_dtype="auto",
+                enable_aiter_allreduce_fusion=False,
+                ep_size=1,
+                moe_a2a_backend="none",
+                tp_size=8,
+            )
+            defaults.update(kw)
+            return SimpleNamespace(**defaults)
+
+        hf = SimpleNamespace()
+        with (
+            override_platform(
+                is_cuda=False, is_hip=True, is_sm90=False, is_sm100=False
+            ),
+            envs.USE_ROCM_AITER_ROPE_BACKEND.override("0"),
+        ):
+            # unset: one 128-token sparse block per allocator page
+            ov = _minimax_m3_overrides(_args(), hf)
+            self.assertEqual(ov["attention_backend"], "triton")
+            self.assertEqual(ov["page_size"], 128)
+            # an explicit page size is kept
+            ov = _minimax_m3_overrides(_args(page_size=64), hf)
+            self.assertNotIn("page_size", ov)
+
     def test_page_constraint_passes_at_callable_level(self):
         from sglang.srt.arg_groups.model_override_base import ResolvedView
         from sglang.srt.arg_groups.overrides import (
