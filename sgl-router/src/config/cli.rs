@@ -1900,7 +1900,7 @@ mod tests {
     }
 
     /// Multiple `--selector` terms AND-join into one comma-separated
-    /// label selector (matches the Python router's space-separated form).
+    /// label selector.
     #[test]
     fn k8s_plain_selector_joins_multiple_terms() {
         let c = into_config_owned(with_model(&[

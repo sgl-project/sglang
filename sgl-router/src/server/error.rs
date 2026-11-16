@@ -187,7 +187,7 @@ pub enum ApiError {
     },
 
     /// An endpoint of a feature this router does not provide yet
-    /// (`/v1/responses`, `/workers`, ...); `path` is the request path.
+    /// (`/v1/responses`, `/v1/loads`, ...); `path` is the request path.
     #[error("{path} is not supported by sgl-router yet")]
     UnsupportedEndpoint { path: String },
 
