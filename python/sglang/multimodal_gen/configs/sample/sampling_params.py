@@ -21,6 +21,7 @@ from sglang.multimodal_gen.configs.task_type import DataType, ModelTaskType
 from sglang.multimodal_gen.configs.utils import expand_path_fields
 from sglang.multimodal_gen.runtime.utils.argparse import StoreBoolean
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+from sglang.srt.arg_groups.argparse_actions import DeprecatedAction
 
 logger = init_logger(__name__)
 
@@ -1538,9 +1539,10 @@ class SamplingParams:
         )
         add_argument(
             "--sr-num-steps",
+            action=DeprecatedAction,
+            nargs=None,
             type=int,
-            help="Kandinsky6 SR Euler grid points (>= 2, default: 5); ignored by "
-            "pi-Flow checkpoints.",
+            help="(Deprecated) No effect: Kandinsky6 SR reads --num-inference-steps.",
         )
         add_argument(
             "--sr-tiles-batch-size",
@@ -1609,8 +1611,10 @@ class SamplingParams:
         )
         add_argument(
             "--moba-config-path",
+            action=DeprecatedAction,
+            nargs=None,
             type=str,
-            help="Path to a JSON file containing V-MoBA specific configurations.",
+            help="(Deprecated) No effect: no sampling parameter reads this path.",
         )
         add_argument(
             "--return-trajectory-latents",
