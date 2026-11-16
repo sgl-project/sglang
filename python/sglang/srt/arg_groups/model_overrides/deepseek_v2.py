@@ -7,7 +7,6 @@ from sglang.srt.arg_groups.model_override_base import (
     _register_for,
     context_parallel_attn_dp_size,
     is_attention_backend_not_set,
-    model_config_of,
     resolving_view,
     use_mla_backend,
 )
@@ -42,16 +41,17 @@ def _dsa_dcp_overrides(cfg: Any) -> dict:
     return overrides
 
 
-# The top-k merge takes rows of at most 2^20 scores, minus 1024 for headroom.
-_GLM_SPLIT_INDEX_K_DCP_MAX_CONTEXT_LEN = (1 << 20) - 1024
+def _glm_split_index_k_dcp_overrides(cfg: Any) -> dict:
+    from sglang.srt.configs.model_config import GLM_SPLIT_INDEX_K_DCP_MAX_CONTEXT_LEN
 
-
-def _glm_split_index_k_dcp_overrides(cfg: Any, context_len: int) -> dict:
-    if context_len > _GLM_SPLIT_INDEX_K_DCP_MAX_CONTEXT_LEN:
+    if (
+        cfg.context_length is not None
+        and cfg.context_length > GLM_SPLIT_INDEX_K_DCP_MAX_CONTEXT_LEN
+    ):
         raise ValueError(
-            "GLM-5 DSA DCP on SM90 needs --context-length "
-            f"{_GLM_SPLIT_INDEX_K_DCP_MAX_CONTEXT_LEN} or less; the resolved "
-            f"context length is {context_len}."
+            "GLM-5 DSA DCP on SM90 supports --context-length "
+            f"{GLM_SPLIT_INDEX_K_DCP_MAX_CONTEXT_LEN} or less; "
+            f"got {cfg.context_length}."
         )
     if cfg.dsa_prefill_backend not in (None, "flashmla_sparse_q8", "flashmla_kv"):
         raise ValueError(
@@ -146,11 +146,7 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
             overrides.update(_dsa_dcp_overrides(cfg))
         if glm_dsa_shards_index_k(hf_config, cfg.dcp_size):
             # Replaces the trtllm defaults above, which need SM100.
-            overrides.update(
-                _glm_split_index_k_dcp_overrides(
-                    cfg, model_config_of(server_args).context_len
-                )
-            )
+            overrides.update(_glm_split_index_k_dcp_overrides(cfg))
         # Set attention backend for DeepSeek
         if is_attention_backend_not_set(cfg):
             overrides["attention_backend"] = "dsa"

@@ -1,10 +1,14 @@
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
 import torch
+from transformers import LlamaConfig
 
 from sglang.srt.configs.model_config import (
+    GLM_SPLIT_INDEX_K_DCP_MAX_CONTEXT_LEN,
+    ModelConfig,
     dsa_draft_shards_under_dcp,
     glm_dsa_shards_index_k,
 )
@@ -14,6 +18,7 @@ from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mla imp
     DeepseekMLAForwardMixin,
 )
 from sglang.srt.runtime_context import override_platform
+from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
@@ -56,6 +61,37 @@ def test_glm_shards_index_k_only_under_dcp_on_sm90(arch, is_sm90, dcp_size, expe
         assert glm_dsa_shards_index_k(_config(arch), dcp_size) is expected
         # The draft must shard exactly when its target does.
         assert dsa_draft_shards_under_dcp(_config(arch), dcp_size) is expected
+
+
+def test_unset_context_length_is_capped_only_under_split_index_k():
+    """The top-k merge cannot take a row as long as GLM-5.3's own context, so
+    a server started without --context-length must come up under the limit."""
+    model_context_len = 1 << 20
+    with TemporaryDirectory() as checkpoint:
+        LlamaConfig(
+            architectures=["GlmMoeDsaForCausalLM"],
+            max_position_embeddings=model_context_len,
+            hidden_size=16,
+            intermediate_size=32,
+            num_attention_heads=2,
+            num_hidden_layers=2,
+            vocab_size=128,
+            kv_lora_rank=8,
+            qk_nope_head_dim=4,
+            qk_rope_head_dim=4,
+            v_head_dim=4,
+        ).save_pretrained(checkpoint)
+
+        def context_len(*, is_sm90=True, **server_args):
+            with override_platform(is_sm90=is_sm90, is_sm100=not is_sm90):
+                return ModelConfig.from_server_args(
+                    ServerArgs(model_path=checkpoint, **server_args)
+                ).context_len
+
+        assert context_len(dcp_size=4) == GLM_SPLIT_INDEX_K_DCP_MAX_CONTEXT_LEN
+        assert context_len() == model_context_len
+        assert context_len(is_sm90=False, dcp_size=4) == model_context_len
+        assert context_len(dcp_size=4, context_length=4096) == 4096
 
 
 def test_prefix_rows_index_the_ragged_gathered_kv_under_split_index_k():

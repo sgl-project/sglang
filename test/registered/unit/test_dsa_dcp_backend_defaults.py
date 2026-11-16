@@ -43,16 +43,14 @@ _SPLIT_INDEX_K_FIELDS = ("dsa_prefill_backend", "dsa_decode_backend", "kv_cache_
 _SPLIT_INDEX_K_MAX_CONTEXT_LEN = 1047552
 
 
-def _glm_overrides(
-    *, is_sm90=True, context_len=_SPLIT_INDEX_K_MAX_CONTEXT_LEN, **fields
-):
+def _glm_overrides(*, is_sm90=True, **fields):
     args = dict(
         attention_backend=None,
         prefill_attention_backend=None,
         decode_attention_backend=None,
         enable_prefill_cp=False,
         kv_cache_dtype="auto",
-        _model_config=SimpleNamespace(context_len=context_len),
+        context_length=None,
     )
     args.update(fields)
     with override_platform(is_npu=False, is_xpu=False, is_hip=False, is_sm90=is_sm90):
@@ -107,7 +105,7 @@ class TestGlmSplitIndexKDcpStartup(CustomTestCase):
         self.assertEqual(
             _glm_overrides(
                 is_sm90=False,
-                context_len=_SPLIT_INDEX_K_MAX_CONTEXT_LEN + 1,
+                context_length=_SPLIT_INDEX_K_MAX_CONTEXT_LEN + 1,
                 kv_cache_dtype="bfloat16",
             ),
             {"dsa_prefill_backend": "trtllm", "dsa_decode_backend": "trtllm"},
@@ -115,7 +113,7 @@ class TestGlmSplitIndexKDcpStartup(CustomTestCase):
         self.assertEqual(
             _glm_overrides(
                 dcp_size=1,
-                context_len=_SPLIT_INDEX_K_MAX_CONTEXT_LEN + 1,
+                context_length=_SPLIT_INDEX_K_MAX_CONTEXT_LEN + 1,
                 dsa_decode_backend="fa3",
             ),
             {},
@@ -141,9 +139,10 @@ class TestGlmSplitIndexKDcpStartup(CustomTestCase):
                 with self.assertRaisesRegex(ValueError, field.replace("_", "-")):
                     _glm_overrides(**{field: value})
 
-    def test_context_length_over_the_top_k_row_limit_is_rejected(self):
+    def test_explicit_context_length_over_the_top_k_row_limit_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "--context-length 1047552"):
-            _glm_overrides(context_len=_SPLIT_INDEX_K_MAX_CONTEXT_LEN + 1)
+            _glm_overrides(context_length=_SPLIT_INDEX_K_MAX_CONTEXT_LEN + 1)
+        _glm_overrides(context_length=_SPLIT_INDEX_K_MAX_CONTEXT_LEN)
 
 
 class TestDsaDcpBackendConstraints(CustomTestCase):

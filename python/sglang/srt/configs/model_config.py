@@ -222,6 +222,10 @@ def is_deepseek_dsa(config) -> bool:
     ) or is_kimi_k31(config)
 
 
+# The top-k merge takes rows of at most 2^20 scores, minus 1024 for headroom.
+GLM_SPLIT_INDEX_K_DCP_MAX_CONTEXT_LEN = (1 << 20) - 1024
+
+
 def glm_dsa_shards_index_k(config, dcp_size: int) -> bool:
     # The replicated index-K DCP path needs the trtllm DSA kernels, which SM90 lacks.
     return dcp_size > 1 and is_glm_moe_dsa(config) and get_platform().is_sm90
@@ -704,6 +708,7 @@ class ModelConfig:
         speculative_algorithm: Optional[str] = None,
         is_draft_quantization_explicit: bool = False,
         uocr_v2_default_context_len: int = FALLBACK_CONTEXT_LENGTH,
+        dcp_size: int = 1,
     ) -> None:
         # Parse args
         self.model_path = model_path
@@ -713,6 +718,7 @@ class ModelConfig:
         self.is_draft_quantization_explicit = is_draft_quantization_explicit
         self.speculative_algorithm = speculative_algorithm
         self.uocr_v2_default_context_len = uocr_v2_default_context_len
+        self.dcp_size = dcp_size
         self.model_impl = model_impl
         self.sampling_defaults = sampling_defaults
         self.quantize_and_serve = quantize_and_serve
@@ -1122,6 +1128,7 @@ class ModelConfig:
             uocr_v2_default_context_len=UocrDocumentConfig.from_args(
                 cfg
             ).default_context_length(),
+            dcp_size=cfg.dcp_size,
             **kwargs,
         )
 
@@ -1483,6 +1490,10 @@ class ModelConfig:
                 and self.hf_config.architectures[0] == "EmbeddingGemma2Model"
             ):
                 self.context_len = min(derived_context_len, 8192)
+            elif glm_dsa_shards_index_k(self.hf_config, self.dcp_size):
+                self.context_len = min(
+                    derived_context_len, GLM_SPLIT_INDEX_K_DCP_MAX_CONTEXT_LEN
+                )
             else:
                 self.context_len = derived_context_len
 
