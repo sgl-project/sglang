@@ -37,7 +37,10 @@ import time
 import urllib.error
 import urllib.request
 
-RETRY_DELAYS_SEC = [0, 5, 15]
+# /rerun-test's handler writes the markers in one edit after dispatching every
+# batch, 5 to 35 seconds each, so an early batch's runner or a fast-failing run
+# can get here minutes before its marker exists. 300 seconds in all.
+RETRY_DELAYS_SEC = [0, 5, 10, 15] + [30] * 9
 
 STATUS_ICONS = {
     "running": "🔄",
