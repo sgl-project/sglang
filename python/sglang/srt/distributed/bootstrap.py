@@ -173,7 +173,7 @@ def init_parallel_runtime(
     ):
         _prewarm_tp_lm_head_all_to_all()
 
-    # EPLB uses the default process group, not the TP/EP coordinators.
+    # CUDA EPLB uses the default process group, not the TP/EP coordinators.
     # Limit warmup to static full-EP layouts for now.
     if (
         device == "cuda"
@@ -184,6 +184,16 @@ def init_parallel_runtime(
         and parallel.moe_ep_size == parallel.tp_size > 1
     ):
         _prewarm_eplb_p2p()
+
+    # Account for NPU EPLB's TP transports before sizing the KV cache.
+    if (
+        device == "npu"
+        and get_exec().moe.enable_eplb
+        and get_exec().moe.elastic_ep_backend is None
+    ):
+        from sglang.srt.hardware_backend.npu.eplb import prewarm_eplb_communication
+
+        prewarm_eplb_communication()
 
     logger.info(f"Init parallel ends. elapsed={time.perf_counter() - tic:.2f} s")
 

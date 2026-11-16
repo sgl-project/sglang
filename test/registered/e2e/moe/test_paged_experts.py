@@ -26,7 +26,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=490, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=580, stage="extra-a", runner_config="1-gpu-large")
 
 PROMPTS = [
     "Natalia sold clips to 48 of her friends in April, and then she sold half as many "
@@ -186,6 +186,46 @@ class TestPagedExpertsDisk(_PagedMatchesUnpaged, CustomTestCase):
 
     def test_the_writing_start_matches_too(self):
         self.assertEqual(self.starts[0]["scores"], self.reference)
+
+
+class TestPagedExpertsDiskTier(_PagedMatchesUnpaged, CustomTestCase):
+    """The disk tier: a host budget that holds about half of each layer's experts, the rest
+    read from the expert cache's files (built at this start), with breakable prefill graphs
+    and captured decode that waits at a layer for its disk reads."""
+
+    model = DEFAULT_SMALL_MOE_MODEL_NAME_FOR_TEST_BASE
+
+    @classmethod
+    def setUpClass(cls):
+        cls.reference = _reference(cls.model)
+        config = AutoConfig.from_pretrained(cls.model)
+        per_expert = 3 * config.hidden_size * config.moe_intermediate_size * 2  # bf16
+        rows = (int(PAGED_ARGS[-1]) + config.num_experts) // 2
+        budget_gb = config.num_hidden_layers * rows * per_expert / (1 << 30)
+        log = io.StringIO()
+        with tempfile.TemporaryDirectory() as folder:
+            cls.paged = _serve_and_score(
+                cls.model,
+                PAGED_URL,
+                [
+                    *PAGED_ARGS,
+                    "--paged-experts-enable-disk",
+                    "--paged-experts-host-memory-gb",
+                    f"{budget_gb:.3f}",
+                ],
+                log=log,
+                env=_cache_env(folder),
+            )
+        cls.log = log.getvalue()
+
+    def test_the_tier_keeps_part_of_each_layer_on_disk(self):
+        found = re.search(
+            r"Paged experts: (\d+) of (\d+) experts per layer in host memory", self.log
+        )
+        self.assertIsNotNone(found, "the disk tier logged no host rows")
+        rows, num_experts = map(int, found.groups())
+        self.assertLess(int(PAGED_ARGS[-1]), rows)
+        self.assertLess(rows, num_experts)
 
 
 def _serve_twice_with_cache(model, folder, paged_args, server_args=()):
