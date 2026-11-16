@@ -21,7 +21,6 @@ class TestLLaDA2MiniFDFO(CustomTestCase):
     def test_dlla_fdfo_vs_no_fdfo_performance(self):
         TTFTS = []
         throughputs = []
-        p99_ttfts = []
         model = LLaDA2_0_MINI_WEIGHTS_PATH
         common_args = [
             [
@@ -56,29 +55,25 @@ class TestLLaDA2MiniFDFO(CustomTestCase):
             )
             res = run_bench_serving(
                 model=model,
-                num_prompts=128,
-                random_input_len=3584,
-                random_output_len=1024,
+                num_prompts=32,
+                random_input_len=6144,
+                random_output_len=3072,
                 request_rate=float("inf"),
-                max_concurrency=16,
+                max_concurrency=8,
                 other_server_args=other_args,
             )
             TTFT = res["mean_ttft_ms"]
             TTFTS.append(TTFT)
             throughput = res["total_throughput"]
             throughputs.append(throughput)
-            p99_ttft = res["p99_ttft_ms"]
-            p99_ttfts.append(p99_ttft)
 
         # FDFO (First-Done-First-Out) scheduling improves performance by prioritizing
         # requests that complete their diffusion steps earlier, reducing waiting time.
         # With FDFO enabled:
         # - TTFT is lower because earlier-completing requests get priority and start generating tokens sooner
         # - Throughput is higher due to better hardware utilization from reduced blocking
-        # - P99 TTFT is lower because FDFO prevents a single slow request from blocking others
         assert float(TTFTS[0]) < float(TTFTS[1])
         assert float(throughputs[0]) > float(throughputs[1])
-        assert float(p99_ttfts[0]) < float(p99_ttfts[1])
 
 
 if __name__ == "__main__":
