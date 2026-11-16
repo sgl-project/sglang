@@ -19,7 +19,6 @@
 
 import logging
 from array import array
-from functools import lru_cache
 from typing import Iterable, List, Optional, Tuple
 
 import torch
@@ -28,7 +27,6 @@ import torch.nn.functional as F
 from einops import rearrange
 from transformers.models.glm4v.configuration_glm4v import Glm4vConfig, Glm4vVisionConfig
 
-from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import (
@@ -64,8 +62,6 @@ from sglang.srt.runtime_context import get_mm, get_parallel
 from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
-
-cached_get_processor = lru_cache(get_processor)
 
 
 class Glm4vRMSNorm(RMSNorm):
@@ -830,18 +826,14 @@ class Glm4vForConditionalGeneration(nn.Module):
                     # adapt to VisionAttention
                     name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
 
-                try:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
 
-                    if name not in params_dict:
-                        continue
+                if name not in params_dict:
+                    continue
 
-                    param = params_dict[name]
-                except KeyError:
-                    print(params_dict.keys())
-                    raise
+                param = params_dict[name]
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 if "visual" in name:

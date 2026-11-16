@@ -89,8 +89,6 @@ class Ernie4_5_VLMoeAttention(nn.Module):
         self.head_dim = getattr(
             config, "head_dim", self.hidden_size // self.total_num_heads
         )
-        partial_rotary_factor = getattr(config, "partial_rotary_factor", 1)
-        self.rotary_dim = int(partial_rotary_factor * self.head_dim)
         self.q_size = self.num_heads * self.head_dim
         self.kv_size = self.num_kv_heads * self.head_dim
         self.scaling = self.head_dim**-0.5
@@ -397,7 +395,6 @@ class Ernie4_5_VLMoeDecoderLayer(nn.Module):
         rope_theta, rope_scaling = get_rope_config(config)
         rope_is_neox_style = getattr(config, "rope_is_neox_style", False)
         freq_allocation = getattr(config, "freq_allocation", 20)
-        max_position_embeddings = getattr(config, "max_position_embeddings", 131072)
         # Self attention.
         self.self_attn = Ernie4_5_VLMoeAttention(
             config=config,
