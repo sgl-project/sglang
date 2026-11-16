@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import time
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from enum import Enum, auto
 from types import MappingProxyType
 from typing import (
@@ -75,6 +76,9 @@ class MatchPrefixParams:
 
     # Mamba specific
     cow_mamba: bool = False
+    # With cow_mamba, take no working state slot: the copy is staged from the
+    # matched state, and the slot is bound with the request's row.
+    defer_cow_slot: bool = False
     req: Optional[Req] = None
 
 
@@ -98,6 +102,9 @@ class InsertParams:
     allow_missing_mamba: bool = False
     # The ping-pong slot prepare picked; cleanup keeps that same slot.
     mamba_keep_idx: Optional[int] = None
+    # Prepare held the running request's state back from the tree; the request
+    # keeps its tracked checkpoint for a later insert.
+    mamba_checkpoint_deferred: bool = False
 
     # DSV4 NPU C128 sidecar pages, one page id per physical C128 page group.
     c128_value: Optional[torch.Tensor] = None
@@ -574,6 +581,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         slot: ``release_kv_cache`` frees ``[cache_protected_len, up_to)`` and
         everything after, and unpins."""
 
+    def lease_checkpoint_state_slots(self, reqs: Sequence[Req]):
+        """A context in which checkpointing the unfinished ``reqs`` takes the
+        state slots it needs from one take made ahead; nothing here."""
+        return nullcontext()
+
     def free_kv_row(self, kv: Any, ranges: list[tuple[int, int]]) -> None:
         """Give back ascending, disjoint, half-open row-position ranges
         of the ``kv`` record's row; one call keeps a shared page freed once.
@@ -610,8 +622,26 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     ) -> EvictResult:
         """Evict until the allocator can take all of ``demand`` at once from
         its shared memory, window entries before token entries when
-        ``windows_first``."""
-        return self.evict_pool_shortfalls(demand)
+        ``windows_first``. A cache keeping no window slots evicts token entries,
+        which hold rows in every sub-pool, until the demand fits."""
+        allocator = self.token_to_kv_pool_allocator
+        demands = {
+            name: pages
+            for name, pages in allocator.page_demands(
+                demand.completed(allocator.window_pool_names())
+            ).items()
+            if pages > 0
+        }
+        result = EvictResult()
+        # Doubling bounds the walks at the cost of evicting up to twice the need.
+        tokens = allocator.page_size
+        while not allocator.fits_after_frees(demands):
+            evicted = self.evict(EvictParams(num_tokens=tokens))
+            if not evicted.num_tokens_evicted:
+                break
+            result.add(evicted)
+            tokens *= 2
+        return result
 
     def evict_pool_shortfalls(self, demand: KVDemand) -> EvictResult:
         """Evict each pool's shortfall for ``demand``, as counts. A cache that
@@ -780,6 +810,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     ) -> tuple[int, Optional[int]]:
         """Pop L3-loaded tokens and their absolute prefix start, if known."""
         return self.pop_prefetch_loaded_tokens(handle), None
+
+    def staged_storage_prefix_end(self, handle: CacheRequestHandle) -> int:
+        """Absolute end of a completed storage prefetch held outside the tree
+        until admission, or 0 when nothing is staged."""
+        return 0
+
+    def can_poll_prefetch_progress(self) -> bool:
+        """Whether poll_prefetch_progress may run before admission without
+        cutting a storage prefetch short."""
+        return False
 
     def ready_to_load_host_cache(self) -> Any:
         """
