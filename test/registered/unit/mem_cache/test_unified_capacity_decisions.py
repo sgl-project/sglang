@@ -14,10 +14,12 @@ from test_prefill_memory_budget import (
 )
 
 from sglang.srt.environ import InvariantCheckLevel, envs
+from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache.allocation_sizing import add_spec_decode_headroom_pages
 from sglang.srt.mem_cache.base_prefix_cache import (
     InsertParams,
+    MatchPrefixParams,
 )
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.capacity import (
@@ -25,12 +27,18 @@ from sglang.srt.mem_cache.capacity import (
     create_prefill_budget,
     evict_to_free_tokens,
 )
+from sglang.srt.mem_cache.common import release_kv_cache
 from sglang.srt.mem_cache.kv.alloc.demand import KVDemand, WindowRetirement
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.runtime_context import reset_context
+from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.kits.unified_radix_cache.fixtures import node_device_value
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import storage_tree_slots
 from sglang.test.unified_allocator_fixtures import (
     build_swa_pool,
     build_tri_pool,
@@ -283,6 +291,243 @@ class TestSpeculativeHeadroomAsksADemand(CustomTestCase):
             lens, needed = self._headroom(allocator, 8)
         # The mandatory allocation only, though the estimate says it fits.
         self.assertEqual((lens, needed), ([8], page))
+
+
+class TestNoBufferCheckpointWindowProgress(CustomTestCase):
+    def test_failed_checkpoint_retires_only_request_owned_window(self):
+        """A missing state slot must not pin the whole uncached SWA tail.
+
+        Existing tree-owned prefixes remain usable; once pressure lifts, a
+        later checkpoint must match with intact recurrent state and window KV.
+        """
+        for prefix in (0, 16):
+            for retirement_enabled in (False, True):
+                with self.subTest(prefix=prefix, retirement_enabled=retirement_enabled):
+                    with (
+                        envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(
+                            retirement_enabled
+                        )
+                    ):
+                        self._exercise(
+                            prefix=prefix, retirement_enabled=retirement_enabled
+                        )
+
+    def test_repeated_failure_then_release(self):
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            _, allocator, cache, request, _ = self._make_request()
+            held = []
+            while (slot := allocator.state_slots.alloc(1)) is not None:
+                held.append(slot)
+            counts = []
+            for frontier in (16, 32, 48, 64, 80, 96):
+                while (slot := allocator.state_slots.alloc(1)) is not None:
+                    held.append(slot)
+                request.extend_end = frontier
+                request.kv.kv_committed_len = frontier
+                cache.checkpoint(request, up_to=frontier)
+                self.assertEqual(request.kv.cache_protected_len, 0)
+                counts.append(allocator.swa_attn_allocator.allocated_count())
+                self.assertFalse(allocator.verify_byte_accounting())
+            self.assertGreater(counts[0], counts[-1])
+            release_kv_cache(request, cache, checkpoint=False)
+            for slot in held:
+                allocator.state_slots.free(slot)
+            self.assertEqual(allocator.full_attn_allocator.allocated_count(), 0)
+            self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
+            self.assertEqual(allocator.mamba_allocator.allocated_count(), 0)
+            self.assertFalse(allocator.verify_byte_accounting())
+
+    def test_failed_checkpoint_makes_room_for_next_chunk(self):
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            bundle, allocator, cache, request, ids = self._make_request(
+                initial_tokens=64
+            )
+            held = []
+            while (slot := allocator.state_slots.alloc(1)) is not None:
+                held.append(slot)
+            self.assertIsNone(allocator.alloc(8))
+            request.extend_end = 64
+            request.kv.kv_committed_len = 64
+            cache.checkpoint(request, up_to=64)
+            self.assertEqual(request.kv.cache_protected_len, 0)
+            next_chunk = allocator.alloc(8)
+            self.assertIsNotNone(next_chunk)
+            self.assertFalse(allocator.verify_byte_accounting())
+            pool = bundle.token_to_kv_pool
+            for layer, member in enumerate(
+                (allocator.full_attn_allocator, allocator.swa_attn_allocator)
+            ):
+                new_physical = member.ids.translate(next_chunk)
+                pool.get_key_buffer(layer)[new_physical] = 999
+                pool.get_value_buffer(layer)[new_physical] = 998
+                physical = member.ids.translate(ids[32:64])
+                marker = torch.arange(32, 64, dtype=torch.float16).reshape(-1, 1, 1)
+                marker = marker + layer * 100
+                torch.testing.assert_close(
+                    pool.get_key_buffer(layer)[physical],
+                    marker.expand_as(pool.get_key_buffer(layer)[physical]),
+                )
+                torch.testing.assert_close(
+                    pool.get_value_buffer(layer)[physical],
+                    (marker + 500).expand_as(pool.get_value_buffer(layer)[physical]),
+                )
+            bundle.req_to_token_pool.write(
+                (request.kv.req_pool_idx, slice(64, 72)), next_chunk
+            )
+            request.kv.kv_allocated_len = 72
+            request.kv.kv_committed_len = 72
+            request.extend_end = 72
+            release_kv_cache(request, cache, checkpoint=False)
+            for slot in held:
+                allocator.state_slots.free(slot)
+            self.assertEqual(allocator.full_attn_allocator.allocated_count(), 0)
+            self.assertEqual(allocator.swa_attn_allocator.allocated_count(), 0)
+            self.assertEqual(allocator.mamba_allocator.allocated_count(), 0)
+            self.assertFalse(allocator.verify_byte_accounting())
+
+    def _make_request(self, initial_tokens=96):
+        page = 1  # no_buffer rejects larger pages and overlap at startup.
+        setup_allocator_context()
+        self.addCleanup(reset_context)
+        bundle, allocator = build_tri_pool(page_size=page)
+        cache = UnifiedRadixCache(
+            CacheInitParams(
+                disable=False,
+                req_to_token_pool=bundle.req_to_token_pool,
+                token_to_kv_pool_allocator=allocator,
+                page_size=page,
+                sliding_window_size=32,
+                tree_slots=storage_tree_slots(
+                    allocator.storage,
+                    window=32,
+                    components=(
+                        ComponentType.FULL,
+                        ComponentType.SWA,
+                        ComponentType.MAMBA,
+                    ),
+                ),
+            )
+        )
+        request = Req(
+            rid="stall",
+            origin_input_text="",
+            origin_input_ids=array("q", range(96)),
+            sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        )
+        allocator.storage.acquire([request])
+        ids = allocator.alloc(initial_tokens)
+        assert ids is not None
+        bundle.req_to_token_pool.write(
+            (request.kv.req_pool_idx, slice(0, initial_tokens)), ids
+        )
+        request.kv.kv_allocated_len = initial_tokens
+        request.full_untruncated_fill_ids = array("q", range(96))
+        request.last_node = cache.root_node_handle()
+        pool = bundle.token_to_kv_pool
+        for layer, member in enumerate(
+            (allocator.full_attn_allocator, allocator.swa_attn_allocator)
+        ):
+            physical = member.ids.translate(ids)
+            marker = (
+                torch.arange(initial_tokens, dtype=torch.float16).reshape(-1, 1, 1)
+                + layer * 100
+            )
+            pool.get_key_buffer(layer)[physical] = marker
+            pool.get_value_buffer(layer)[physical] = marker + 500
+        state = allocator.state.pool.mamba_cache
+        live_phys = allocator.mamba_allocator.ids.translate(
+            request.kv.mamba_pool_idx.reshape(-1)
+        )
+        for view in (*state.conv, state.temporal):
+            if view.numel():
+                view[:, live_phys] = 17
+        return bundle, allocator, cache, request, ids
+
+    def _exercise(self, *, prefix, retirement_enabled):
+        bundle, allocator, cache, request, ids = self._make_request()
+        pool = bundle.token_to_kv_pool
+        state = allocator.state.pool.mamba_cache
+        if prefix:
+            request.extend_end = prefix
+            request.kv.kv_committed_len = prefix
+            cache.checkpoint(request, up_to=prefix)
+            assert request.kv.cache_protected_len == prefix
+        live = allocator.mamba_allocator.ids.translate(
+            request.kv.mamba_pool_idx.reshape(-1)
+        )
+        for view in (*state.conv, state.temporal):
+            if view.numel():
+                view[:, live] = 23
+        held = []
+        for _ in range(1000):
+            slot = allocator.state_slots.alloc(1)
+            if slot is None:
+                break
+            held.append(slot)
+        else:
+            raise AssertionError("no finite pressure boundary")
+        before = allocator.swa_attn_allocator.allocated_count()
+        request.extend_end = 80
+        request.kv.kv_committed_len = 80
+        cache.checkpoint(request, up_to=80)
+        assert request.kv.cache_protected_len == prefix, "failure must not publish"
+        self.assertEqual(
+            allocator.swa_attn_allocator.allocated_count() < before,
+            retirement_enabled,
+            "failed checkpoint must honor request-local window retirement",
+        )
+        if prefix:
+            assert torch.all(
+                allocator.swa_attn_allocator.ids.translate(ids[:prefix]) >= 0
+            ), "tree-owned prefix must stay valid"
+            old_match = cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", range(prefix))))
+            )
+            self.assertEqual(old_match.device_prefix_len, prefix)
+            old_state = node_device_value(
+                cache, old_match.best_match_node, ComponentType.MAMBA
+            )
+            old_physical = allocator.mamba_allocator.ids.translate(old_state)
+            for view in (*state.conv, state.temporal):
+                if view.numel():
+                    self.assertTrue(torch.all(view[:, old_physical] == 17))
+        # Pressure recovery: release one competing slot, publish a later checkpoint.
+        allocator.state_slots.free(held.pop())
+        request.extend_end = 96
+        request.kv.kv_committed_len = 96
+        cache.checkpoint(request, up_to=96)
+        assert request.kv.cache_protected_len == 96
+        match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", range(96))))
+        )
+        assert match.device_prefix_len == 96, match
+        # Only published checkpoints are reusable, not tombstone boundaries.
+        for length in range(17, 96):
+            partial = cache.match_prefix(
+                MatchPrefixParams(key=RadixKey(array("q", range(length))))
+            )
+            self.assertEqual(partial.device_prefix_len, prefix)
+        mids = node_device_value(cache, match.best_match_node, ComponentType.MAMBA)
+        physical = allocator.mamba_allocator.ids.translate(mids)
+        for view in (*state.conv, state.temporal):
+            if view.numel():
+                assert torch.all(view[:, physical] == 23)
+        for layer, member in enumerate(
+            (allocator.full_attn_allocator, allocator.swa_attn_allocator)
+        ):
+            positions = torch.arange(64, 96)
+            physical = member.ids.translate(ids[64:96])
+            marker = positions.to(torch.float16).reshape(-1, 1, 1) + layer * 100
+            torch.testing.assert_close(
+                pool.get_key_buffer(layer)[physical],
+                marker.expand_as(pool.get_key_buffer(layer)[physical]),
+            )
+            torch.testing.assert_close(
+                pool.get_value_buffer(layer)[physical],
+                (marker + 500).expand_as(pool.get_value_buffer(layer)[physical]),
+            )
+        assert not allocator.verify_byte_accounting()
+        reset_context()
 
 
 if __name__ == "__main__":

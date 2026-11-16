@@ -398,6 +398,9 @@ class TestMambaDonatedAllocRatio(CustomTestCase):
                     )
 
                 self.assertIsNone(params.mamba_value)
+                self.assertEqual(
+                    params.mamba_no_buffer_checkpoint_failed, not extra_buffer
+                )
                 self.assertEqual(req.kv.mamba_last_track_seqlen, 8)
                 self.assertTrue(torch.equal(req.kv.mamba_pool_idx, owned[0]))
                 self.assertEqual(len(cache.prefix_nodes), N)

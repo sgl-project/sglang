@@ -1649,8 +1649,13 @@ class UnifiedRadixCache(BasePrefixCache):
             # sliding window of live SWA and the match after the insert rejects it.
             # The insert stops at page_floor(len(radix_key)), and a bigram key is
             # one shorter than the tokens it spans, so measure the key.
+            retirement_len = len(radix_key)
+            if insert_params.mamba_no_buffer_checkpoint_failed:
+                # No tree insert will use the old window. A later checkpoint
+                # carries the retired prefix as SWA tombstones.
+                retirement_len = len(token_ids) - int(self.tree_core.is_eagle)
             for comp in self._components_tuple:
-                comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
+                comp.free_out_of_window_slots(req, retirement_len - 1, insert_params)
 
         if effective_cache_len <= 0:
             for comp in self._components_tuple:

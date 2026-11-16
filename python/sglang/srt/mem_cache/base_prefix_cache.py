@@ -105,6 +105,9 @@ class InsertParams:
     # Prepare held the running request's state back from the tree; the request
     # keeps its tracked checkpoint for a later insert.
     mamba_checkpoint_deferred: bool = False
+    # No-buffer donation failed; the request retains current live state, not
+    # an older tracked snapshot whose window must remain available.
+    mamba_no_buffer_checkpoint_failed: bool = False
 
     # DSV4 NPU C128 sidecar pages, one page id per physical C128 page group.
     c128_value: Optional[torch.Tensor] = None
