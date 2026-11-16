@@ -332,6 +332,8 @@ class ExpertLocationMetadata:
         ]:
             assert getattr(self, field) == getattr(other, field)
 
+        layers = [i for i in range(self.num_layers) if i in update_layer_ids]
+        regions = [slice(None)] if len(layers) == self.num_layers else layers
         for field in [
             "physical_to_logical_map",
             "physical_to_logical_map_cpu",
@@ -344,21 +346,24 @@ class ExpertLocationMetadata:
             self_field = getattr(self, field)
             assert (other_field is not None) == (self_field is not None)
             if self_field is not None:
-                mask_update = torch.tensor(
-                    [i in update_layer_ids for i in range(self.num_layers)]
-                )
-                mask_update = mask_update.view(*([-1] + [1] * (self_field.dim() - 1)))
-                mask_update = mask_update.to(self_field.device, non_blocking=True)
-                self_field[...] = torch.where(mask_update, other_field, self_field)
+                # A one-layer commit must not scan/copy every layer on CPU and
+                # device. Keep the same allocation for captured graph readers.
+                for region in regions:
+                    self_field[region].copy_(other_field[region])
 
         for algorithm, (to_physical_map, logical_count) in self._mega_gate_maps.items():
-            if algorithm == "static":
-                to_physical_map[..., 0].copy_(
-                    self.logical_to_rank_dispatch_physical_map
-                )
-            else:
-                to_physical_map.copy_(self.logical_to_all_physical_map)
-                logical_count.copy_(self.logical_to_all_physical_map_num_valid)
+            for region in regions:
+                if algorithm == "static":
+                    to_physical_map[region, ..., 0].copy_(
+                        self.logical_to_rank_dispatch_physical_map[region]
+                    )
+                else:
+                    to_physical_map[region].copy_(
+                        self.logical_to_all_physical_map[region]
+                    )
+                    logical_count[region].copy_(
+                        self.logical_to_all_physical_map_num_valid[region]
+                    )
 
     # -------------------------------- usage ------------------------------------
 
