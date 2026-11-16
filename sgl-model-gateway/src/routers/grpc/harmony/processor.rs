@@ -129,11 +129,9 @@ impl HarmonyResponseProcessor {
         let mut usage = response_formatting::build_usage(&all_responses);
 
         // Add reasoning token count from parsed analysis/commentary channels
-        if total_reasoning_tokens > 0 {
-            usage.completion_tokens_details = Some(CompletionTokensDetails {
-                reasoning_tokens: Some(total_reasoning_tokens),
-            });
-        }
+        usage.completion_tokens_details = Some(CompletionTokensDetails {
+            reasoning_tokens: Some(total_reasoning_tokens),
+        });
 
         // Final ChatCompletionResponse
         Ok(
@@ -270,11 +268,9 @@ impl HarmonyResponseProcessor {
         let mut usage = response_formatting::build_usage(std::slice::from_ref(complete));
 
         // Add reasoning token count from parsed analysis/commentary channels
-        if parsed.reasoning_token_count > 0 {
-            usage.completion_tokens_details = Some(CompletionTokensDetails {
-                reasoning_tokens: Some(parsed.reasoning_token_count),
-            });
-        }
+        usage.completion_tokens_details = Some(CompletionTokensDetails {
+            reasoning_tokens: Some(parsed.reasoning_token_count),
+        });
 
         // Check for tool calls in commentary channel
         if let Some(tool_calls) = parsed.commentary {
