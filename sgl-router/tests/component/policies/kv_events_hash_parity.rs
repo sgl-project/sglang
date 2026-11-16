@@ -3,8 +3,8 @@
 
 //! Cross-implementation parity test for the KV-event block-hash algorithm.
 //!
-//! The Rust implementation at `src/policies/kv_events/hash.rs` must produce
-//! the same i64 block hashes as SGLang's `radix_cache::RadixKey.hash_page`
+//! The Rust implementation at `src/state/kv_events/hash.rs` must produce
+//! the same i64 block hashes as SGLang's `mem_cache/utils.py::get_hash_str`
 //! followed by `hash_str_to_int64`.  Hard-coded `cross_language_golden_*`
 //! values inside `hash.rs` are correct but brittle: if either side's
 //! algorithm changes, the comments don't get regenerated and the tests

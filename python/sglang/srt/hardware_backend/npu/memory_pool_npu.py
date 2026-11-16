@@ -1,3 +1,4 @@
+import logging
 from typing import TYPE_CHECKING, Optional, Sequence
 
 import torch
@@ -5,6 +6,7 @@ import torch
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
+from sglang.srt.mem_cache.kv_cache_dtype import QUANT_MODE_TOKEN_INT8
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
@@ -13,10 +15,12 @@ from sglang.srt.mem_cache.memory_pool import (
     get_tensor_size_bytes,
     unwrap_write_loc,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_bool_env_var
 from sglang.srt.utils.async_probe import maybe_detect_oob
 from sglang.srt.utils.device import is_npu
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
@@ -104,9 +108,19 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         end_layer: Optional[int] = None,
         enable_alt_stream: bool = True,
         enable_kv_cache_copy: bool = False,
+        modelslim_cache_layout=None,
+        is_draft_worker: bool = False,
         **kwargs,
     ):
+        self.is_modelslim_mxfp8 = (
+            modelslim_cache_layout is not None
+            and modelslim_cache_layout.layout == "gqa_mxfp8"
+        )
         self.use_fia = get_bool_env_var("ASCEND_USE_FIA", "False")
+        if self.is_modelslim_mxfp8:
+            head_num = modelslim_cache_layout.local_kv_heads
+            head_dim = modelslim_cache_layout.key_head_dim
+            v_head_dim = modelslim_cache_layout.value_head_dim
         self.use_scatter_pa_kv_cache = envs.SGLANG_NPU_USE_SCATTER_PA_KV_CACHE.get()
         self.use_triton_prefix_kv_cache_store = (
             envs.SGLANG_NPU_USE_TRITON_PREFIX_KV_CACHE_STORE.get()
@@ -188,6 +202,37 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                     for i in range(self.layer_num)
                 ]
 
+            if self.is_modelslim_mxfp8:
+                self._mxfp8_scales_initialized = False
+                if not self.use_fia:
+                    self.k_buffer = list(self.k_buffer.unbind(0))
+                    self.v_buffer = list(self.v_buffer.unbind(0))
+                pages = self.size // self.page_size + 1
+                shape = (self.layer_num, pages, self.page_size, self.head_num)
+                # QFA uses PA_BBND, with pairs of per-32 UE8M0 scales.
+                self.k_scale_buffer = list(
+                    torch.full(
+                        (*shape, self.head_dim // 64, 2),
+                        127,
+                        dtype=torch.uint8,
+                        device=self.device,
+                    ).unbind(0)
+                )
+                self.v_scale_buffer = list(
+                    torch.empty(
+                        (
+                            self.layer_num,
+                            pages,
+                            self.page_size // 64,
+                            self.head_num,
+                            self.v_head_dim,
+                            2,
+                        ),
+                        dtype=torch.uint8,
+                        device=self.device,
+                    ).unbind(0)
+                )
+
     def get_hicache_transfer_buffers(self):
         """Return contiguous all-layer KV tensors for NPU HiCache IO."""
         return self._hicache_k_buffer, self._hicache_v_buffer
@@ -223,6 +268,10 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
         # implementation relies on self.data_strides / self.data_ptrs, which the
         # NPU paged buffer layout never builds.
         self._kv_copy_config = None
+
+    def get_kv_scale_buffer(self, layer_id: int):
+        local_layer = layer_id - self.start_layer
+        return self.k_scale_buffer[local_layer], self.v_scale_buffer[local_layer]
 
     # for disagg
     def get_contiguous_buf_infos(self):
@@ -260,6 +309,15 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             ]
         return kv_data_ptrs, kv_data_lens, kv_item_lens
 
+    def get_kv_scale_buf_infos(self):
+        """Expose dynamic K scales for PD; V scales are initialized from weights."""
+        buffers = self.k_scale_buffer
+        return (
+            [buffer.data_ptr() for buffer in buffers],
+            [buffer.nbytes for buffer in buffers],
+            [buffer[0].nbytes for buffer in buffers],
+        )
+
     def set_kv_buffer(
         self,
         layer: "RadixAttention",
@@ -276,7 +334,9 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             layer_id = layer_id_override
         else:
             layer_id = layer.layer_id
-        if cache_k.dtype != self.dtype:
+        if self.is_modelslim_mxfp8:
+            cache_k, cache_v, k_scale = layer.scheme.quantize_cache(cache_k, cache_v)
+        elif cache_k.dtype != self.dtype:
             if k_scale is not None:
                 cache_k.div_(k_scale)
             if v_scale is not None:
@@ -296,7 +356,7 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
             and hasattr(torch_npu, "npu_scatter_pa_kv_cache")
             and self.store_dtype in (torch.float16, torch.bfloat16, torch.int8)
         )
-        if self.use_fia or use_scatter_pa:
+        if self.use_fia or use_scatter_pa or self.is_modelslim_mxfp8:
             k_buffer_layer = self.k_buffer[layer_id - self.start_layer]
             v_buffer_layer = self.v_buffer[layer_id - self.start_layer]
             num_rows = loc.numel()
@@ -344,6 +404,16 @@ class NPUMHATokenToKVPool(MHATokenToKVPool):
                     loc_indices,
                     cache_v.contiguous().view(num_rows, self.head_num, self.v_head_dim),
                 )
+                if self.is_modelslim_mxfp8:
+                    torch_npu.npu_scatter_nd_update_(
+                        self.k_scale_buffer[layer_id - self.start_layer].view(
+                            -1, self.head_num, self.head_dim // 32
+                        ),
+                        loc_indices,
+                        k_scale.contiguous().view(
+                            num_rows, self.head_num, self.head_dim // 32
+                        ),
+                    )
         else:
             loc = loc.to(torch.int32)
             torch_npu._npu_reshape_and_cache(
@@ -630,6 +700,8 @@ class NPUMiniMaxSparseKVPool(MiniMaxSparseKVPool):
 
 
 class NPUMLATokenToKVPool(MLATokenToKVPool):
+    rows_are_dcp_collapsed = False
+
     def __init__(
         self,
         size: int,
@@ -648,6 +720,7 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         indexer_layer_ids: Optional[Sequence[int]] = None,
         kv_cache_dim: Optional[int] = None,
         is_draft_worker: bool = False,
+        indexer_quant_mode: Optional[int] = None,
         use_combined_kv_buffer: bool = False,
         modelslim_cache_layout=None,
     ):
@@ -715,6 +788,33 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             requested_kv_cache_dim if self.dsa_kv_cache_store_fp8 else kv_lora_rank
         )
         self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
+
+        # --indexer-kv-cache-dtype=int8 opts into the INT8 indexer K cache
+        if (
+            indexer_quant_mode == QUANT_MODE_TOKEN_INT8
+            and get_memory().enable_hierarchical_cache
+        ):
+            raise ValueError(
+                "--indexer-kv-cache-dtype=int8 is not supported with "
+                "--enable-hierarchical-cache"
+            )
+        self.indexer_kv_store_int8 = (
+            indexer_quant_mode == QUANT_MODE_TOKEN_INT8
+            and not self.dsa_kv_cache_store_fp8
+            and index_head_dim is not None
+        )
+        if self.indexer_kv_store_int8:
+            self.index_k_store_dtype = torch.int8
+            self.index_k_scale_dtype = torch.float16
+        else:
+            self.index_k_store_dtype = self.store_dtype
+            self.index_k_scale_dtype = (
+                torch.float32 if self.dsa_kv_cache_store_fp8 else None
+            )
+        logger.info(
+            f"Indexer K Cache type {self.index_k_store_dtype} scale type {self.index_k_scale_dtype}"
+        )
+
         self.index_k_scale_buffer = None
         self.indexer_hadamard_128 = None
         self.index_page_size = page_size if index_page_size is None else index_page_size
@@ -793,17 +893,19 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                         1,
                         self.index_head_dim,
                     ),
-                    dtype=self.store_dtype,
+                    dtype=self.index_k_store_dtype,
                     device=self.device,
                 )
-                if self.dsa_kv_cache_store_fp8 and self.num_indexer_layers > 0:
+                if (
+                    self.dsa_kv_cache_store_fp8 or self.indexer_kv_store_int8
+                ) and self.num_indexer_layers > 0:
                     from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
                         create_npu_hadamard_128,
                     )
 
                     self.index_k_scale_buffer = torch.zeros(
                         (*self.index_k_buffer.shape[:-2], 1),
-                        dtype=torch.float32,
+                        dtype=self.index_k_scale_dtype,
                         device=self.device,
                     )
                     self.indexer_hadamard_128 = create_npu_hadamard_128(
@@ -968,6 +1070,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         return self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
 
     def set_index_k_scale_buffer(self, layer_id: int, loc, scale):
+        assert scale.dtype == self.index_k_scale_dtype, (
+            f"input scale has to be {scale.dtype=} but it is {self.index_k_scale_dtype=}"
+        )
         torch_npu.npu_scatter_nd_update_(
             self.index_k_scale_buffer[self._get_indexer_slot(layer_id)].view(-1, 1),
             loc.view(-1, 1),
@@ -1156,11 +1261,16 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             "set_index_k_buffer (NPU MLA, raw virtual loc)",
         )
 
-        if index_k.dtype != self.dtype:
-            index_k = index_k.to(self.dtype)
+        if self.indexer_kv_store_int8:
+            assert index_k.dtype == self.index_k_store_dtype, (
+                f"index_k.dtype has to be {self.index_k_store_dtype=} but it is {index_k.dtype=}"
+            )
+        else:
+            if index_k.dtype != self.dtype:
+                index_k = index_k.to(self.dtype)
 
-        if self.store_dtype != self.dtype:
-            index_k = index_k.view(self.store_dtype)
+            if self.store_dtype != self.dtype:
+                index_k = index_k.view(self.store_dtype)
 
         torch_npu.npu_scatter_nd_update_(
             self.index_k_buffer[self._get_indexer_slot(layer_id)].view(

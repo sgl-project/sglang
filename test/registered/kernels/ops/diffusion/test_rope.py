@@ -9,11 +9,7 @@ Two families with different oracles:
   ``round_norm_before_rope=True`` the fused kernel reproduces the split
   rounding exactly and ``torch.equal`` applies. Full-width interleaved caches
   use the Diffusers float32 RoPE chain as their oracle.
-The LTX-2 split-RoPE kernel lives in ``test_rope_ltx2.py``: it is validated on
-B200 and registered on that lane alone, which the cases here cannot share --
-their oracle is the *split* baseline (a separate qknorm kernel plus sgl_kernel
-or FlashInfer RoPE), whose dispatch differs on Blackwell, so the bit-exact
-assertions below do not hold there.
+The LTX-2 split-RoPE kernel lives in ``test_rope_ltx2.py``.
 
 Anima split-half RoPE is compared against its FP32 eager expression, with
 exact equality after the final FP16/BF16 cast.
@@ -37,6 +33,7 @@ from sglang.kernels.ops.diffusion import (
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=18, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=18, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 # Nightly is not redundant: it sets SGLANG_JIT_KERNEL_RUN_FULL_TESTS=1, which
 # expands the get_ci_test_range sweeps below.
 register_cuda_ci(est_time=220, stage="nightly", runner_config="1-gpu-large")

@@ -13,10 +13,9 @@
 # ==============================================================================
 """Shared helpers used by config, tokenizer, and processor modules."""
 
-import json
 import os
 from pathlib import Path
-from typing import Any, Dict, Optional, Type, Union
+from typing import Dict, Optional, Type, Union
 
 import torch
 from huggingface_hub import snapshot_download
@@ -736,24 +735,6 @@ def get_generation_config(
             e,
         )
         return None
-
-
-# Qwen-1M related
-def get_sparse_attention_config(
-    model: str,
-    sparse_attention_config_filename: str = "sparse_attention_config.json",
-) -> Dict[str, Any]:
-    is_local = os.path.isdir(model)
-    if not is_local:
-        model = download_from_hf(model, allow_patterns=["*.json"])
-
-    config_file = os.path.join(model, sparse_attention_config_filename)
-    if not os.path.exists(config_file):
-        return {}
-
-    with open(config_file) as f:
-        config = json.load(f)
-    return config
 
 
 # ---------------------------------------------------------------------------

@@ -20,12 +20,12 @@ import torch
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
-    EvictParams,
     IncLockRefResult,
     InsertParams,
     MatchPrefixParams,
     TreeLock,
 )
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_TOKEN, TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import acquire_rows, kv_storage_of
@@ -79,9 +79,9 @@ class _RatioCache:
         # Static pools: the component's slot takes reach the bounded allocator.
         return kv_storage_of(None, self.token_to_kv_pool_allocator)
 
-    def evict_for_alloc(self, params: EvictParams):
+    def evict_for_alloc(self, params: KVDemand):
         self.alloc_evict_params.append(params)
-        need = params.mamba_num
+        need = params.state_slots
         for node in list(self.prefix_nodes):
             if need <= 0:
                 break
@@ -105,6 +105,7 @@ def _build_peak(pool_size: int, lock_prefixes: bool):
     component.tree_core = cache
     component.component_type = ComponentType.MAMBA
     component.host_only_checkpoint = False
+    component.checkpoints_level = 3
 
     owned = [cache.allocator.alloc(1) for _ in range(N)]
     assert all(s is not None for s in owned)
@@ -249,7 +250,7 @@ class TestMambaRatioEnvGate(CustomTestCase):
             def quantizes_checkpoints(self, sub_pool):
                 return False
 
-            def tree_sub_pool(self, name, family=None):
+            def tree_sub_pool(self, name, *, family=None):
                 return name
 
             def release_state(self, sub_pool, req, keep=None):
@@ -358,10 +359,7 @@ class TestMambaDonatedAllocRatio(CustomTestCase):
         self.assertIsNone(component._try_alloc_mamba_slot())
         with self.assertRaisesRegex(AssertionError, "Can not alloc mamba cache"):
             component._alloc_mamba_slot()
-        self.assertEqual(
-            cache.alloc_evict_params,
-            [EvictParams(num_tokens=0, mamba_num=1)] * 2,
-        )
+        self.assertEqual(cache.alloc_evict_params, [KVDemand(state_slots=1)] * 2)
 
     def test_unfinished_checkpoint_skips_donation_when_all_states_locked(self):
         for extra_buffer, quantized in ((True, False), (True, True), (False, False)):
@@ -404,9 +402,7 @@ class TestMambaDonatedAllocRatio(CustomTestCase):
                 self.assertTrue(torch.equal(req.kv.mamba_pool_idx, owned[0]))
                 self.assertEqual(len(cache.prefix_nodes), N)
                 self.assertEqual(cache.allocator.free_ids, [])
-                self.assertEqual(
-                    cache.alloc_evict_params, [EvictParams(num_tokens=0, mamba_num=1)]
-                )
+                self.assertEqual(cache.alloc_evict_params, [KVDemand(state_slots=1)])
 
     def test_prefill_peak_ratio3_has_headroom(self):
         # pool = 3N: N free slots remain after own + locked prefix.
@@ -422,9 +418,7 @@ class TestMambaDonatedAllocRatio(CustomTestCase):
         slot = component._try_alloc_mamba_slot()
         self.assertIsNotNone(slot)
         self.assertEqual(len(cache.prefix_nodes), N - 1)
-        self.assertEqual(
-            cache.alloc_evict_params, [EvictParams(num_tokens=0, mamba_num=1)]
-        )
+        self.assertEqual(cache.alloc_evict_params, [KVDemand(state_slots=1)])
 
 
 class TestMambaDonationCheckpointIntegration(CustomTestCase):
@@ -580,6 +574,7 @@ class TestPPMambaPoolSizing(CustomTestCase):
         fake = SimpleNamespace(
             mambaish_config=SimpleNamespace(mamba2_cache_params=params),
             extra_mamba_cache_bytes_per_req=0,
+            extra_mamba_cache_bytes_per_request_row=0,
             fused_entry_bytes=lambda name: (
                 fused_state_entry if name == "mamba" else None
             ),
@@ -641,7 +636,9 @@ class TestPPMambaPoolSizing(CustomTestCase):
 
 class TestExtraMambaCacheSizing(CustomTestCase):
     @staticmethod
-    def _size(extra_bytes, *, pp_size=1, dp_size=1, draft_tokens=None, **schedule):
+    def _size(
+        extra_bytes, *, row_bytes=0, pp_size=1, dp_size=1, draft_tokens=None, **schedule
+    ):
         from sglang.srt import runtime_context as rc
         from sglang.srt.mem_cache.kv_cache_configurator import KVCacheConfigurator
         from sglang.srt.runtime_context import get_schedule
@@ -653,6 +650,9 @@ class TestExtraMambaCacheSizing(CustomTestCase):
                 )
             ),
             extra_mamba_cache_bytes_per_req=extra_bytes,
+            extra_mamba_cache_bytes_per_request_row=row_bytes,
+            _req_pool_pre_alloc_size=lambda: 3,
+            allocate_intermediate_ssm=True,
             fused_entry_bytes=lambda name: None,
             spec_algorithm=SimpleNamespace(is_none=lambda: draft_tokens is None),
             attn_dp_size=dp_size,
@@ -676,6 +676,18 @@ class TestExtraMambaCacheSizing(CustomTestCase):
     def test_auto_capacity_reserves_backend_state(self):
         self.assertEqual(self._size(0), (9, 80 << 20))
         self.assertEqual(self._size(4 << 20), (4, 80 << 20))
+
+    def test_request_row_state_is_charged_once_per_request_row(self):
+        # live requests, the padding row and a PD decode's 3 pre-allocated rows
+        mib = 1 << 20
+        for dp_size in (1, 2):
+            with self.subTest(dp=dp_size):
+                rows = 8 // dp_size + 1 + 3
+                slots, remaining = self._size(
+                    0, row_bytes=mib, dp_size=dp_size, max_running_requests=8
+                )
+                self.assertEqual(slots, (40 - rows - 4) // 4)
+                self.assertEqual(remaining, (120 - rows - 4 * (slots + 1)) * mib)
 
     def test_fixed_capacity_charges_padding_and_partitioned_state(self):
         for pp_size in (1, 2):
