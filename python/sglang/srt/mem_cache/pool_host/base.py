@@ -787,6 +787,10 @@ class HostKVCache(abc.ABC):
 
     @synchronized
     def clear(self):
+        # Initialize memory states and tracking structures.
+        self.mem_state = torch.zeros(
+            (self.logical_size,), dtype=torch.uint8, device=self.device
+        )
         self.free_slots = torch.arange(self.logical_size, dtype=torch.int64)
         # Keep freed chunks aside and consume them lazily from alloc() to avoid
         # concatenating a large free-list on every host-pool free.
