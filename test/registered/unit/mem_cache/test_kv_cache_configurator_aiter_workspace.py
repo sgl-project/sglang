@@ -122,6 +122,8 @@ class TestAiterDecodeWorkspaceReserve(CustomTestCase):
         kvc,
         *,
         budget_gb=140,
+        budget_bytes=None,
+        page_size=1,
         mem_fraction_static=0.816,
         max_running_requests=None,
         backends=("aiter", "aiter"),
@@ -130,16 +132,22 @@ class TestAiterDecodeWorkspaceReserve(CustomTestCase):
         is_hip=True,
         two_batch_overlap=False,
         other_pp_rank=None,
+        budgets=None,
+        sent_flags=None,
     ):
         """Run _resolve_memory_pool_config with a KV pool of KV_BYTES_PER_TOKEN
         per token; returns the config and the KV budgets it was sized from.
 
         other_pp_rank: (request_cap or None, does_not_fit, needs_reserve) of a
-        second PP rank, merged into this rank's all-reduce."""
-        budgets = []
+        second PP rank, merged into this rank's all-reduce. budgets /
+        sent_flags: lists that collect the KV budgets and the flags this rank
+        sent to the all-reduce, still filled when the run raises."""
+        budgets = [] if budgets is None else budgets
+        sent_flags = [] if sent_flags is None else sent_flags
 
         def all_reduce(tensor, op, group):
             self.assertEqual(op, kcc.torch.distributed.ReduceOp.MAX)
+            sent_flags.append(tensor.tolist())
             cap, does_not_fit, needs_reserve = other_pp_rank
             other = kcc.torch.tensor(
                 [-(cap or 1 << 62), int(does_not_fit), int(needs_reserve)]
@@ -156,7 +164,15 @@ class TestAiterDecodeWorkspaceReserve(CustomTestCase):
         schedule = SimpleNamespace(
             mem_fraction_static=mem_fraction_static,
             max_running_requests=max_running_requests,
+            page_size=page_size,
         )
+
+        def calculate_pool_sizes(budget_bytes, page_size):
+            tokens = max(budget_bytes, 0) // KV_BYTES_PER_TOKEN
+            return pool_configurator.MemoryPoolConfig(
+                max_total_num_tokens=tokens // page_size * page_size
+            )
+
         with ExitStack() as stack:
             stack.enter_context(patch.object(kcc, "_is_hip", is_hip))
             stack.enter_context(
@@ -207,7 +223,9 @@ class TestAiterDecodeWorkspaceReserve(CustomTestCase):
                 patch.object(
                     kcc.KVCacheConfigurator,
                     "_profile_available_bytes",
-                    lambda self, pre: budget_gb * GB,
+                    lambda self, pre: (
+                        budget_gb * GB if budget_bytes is None else budget_bytes
+                    ),
                 )
             )
             stack.enter_context(
@@ -220,7 +238,8 @@ class TestAiterDecodeWorkspaceReserve(CustomTestCase):
                     pool_configurator,
                     "create_memory_pool_configurator",
                     lambda kvc: SimpleNamespace(
-                        finalize_with_max_running_requests=lambda config: config
+                        calculate_pool_sizes=calculate_pool_sizes,
+                        finalize_with_max_running_requests=lambda config: config,
                     ),
                 )
             )
@@ -492,10 +511,11 @@ class TestAiterDecodeWorkspaceReserve(CustomTestCase):
             self._per_row_total(kvc, spec=_spec(num_steps=3, multi_layer=True)),
         )
 
-    def test_explicit_max_running_requests_is_kept_and_reserved_in_full(self):
+    def test_explicit_max_running_requests_is_not_capped(self):
         # 10M context: ~620 MB per request, no slack above the activation
         # reserve at 0.95. 80 requests (~48 GB) are more than half of a 60 GB
-        # budget: capped without the flag; kept and reserved in full with it.
+        # budget: capped without the flag; kept uncapped with it (with no
+        # headroom, the whole workspace is then taken from the KV budget).
         model = _llama_8b(context_len=10_000_000)
         self.assertLessEqual(self._headroom(0.95), 0)
         workspace = 80 * _per_row(model)
@@ -530,6 +550,59 @@ class TestAiterDecodeWorkspaceReserve(CustomTestCase):
         # Another rank cannot fit one request: every rank raises.
         with self.assertRaisesRegex(RuntimeError, "another pipeline-parallel rank"):
             self._run(kvc, other_pp_rank=(1, True, True))
+
+    def test_reserve_must_leave_a_minimal_kv_pool(self):
+        # 10M context, no slack above the activation reserve at 0.95, 16-token
+        # pages. The reserve leaves the KV pool exactly one page, or one byte
+        # less: the latter must raise the targeted error up front instead of
+        # "Not enough memory" from the re-derived pool.
+        model = _llama_8b(context_len=10_000_000)
+        per_row = _per_row(model)
+        page = 16 * KV_BYTES_PER_TOKEN
+        cases = {
+            "explicit max_running_requests": (
+                dict(max_running_requests=80),
+                dict(explicit_max_running_requests=80),
+                80 * per_row,
+                "smaller --max-running-requests",
+            ),
+            "cap of one request": ({}, {}, per_row, "single request"),
+        }
+        for name, (run_kw, kvc_kw, workspace, error) in cases.items():
+            run = dict(mem_fraction_static=0.95, page_size=16, **run_kw)
+            with self.subTest(name):
+                config, budgets = self._run(
+                    self._configurator(model, **kvc_kw),
+                    budget_bytes=workspace + page,
+                    **run,
+                )
+                self.assertEqual(budgets[1], page)
+                with self.assertRaisesRegex(RuntimeError, error):
+                    self._run(
+                        self._configurator(model, **kvc_kw),
+                        budget_bytes=workspace + page - 1,
+                        **run,
+                    )
+            with self.subTest(name, pp=True):
+                # With a second PP rank that fits, this rank still reports the
+                # failure to the all-reduce, and raises after it without
+                # re-deriving its pool (so it never reaches the token
+                # all-reduce in config_from_budget alone).
+                budgets, sent_flags = [], []
+                with self.assertRaisesRegex(
+                    RuntimeError, "another pipeline-parallel rank"
+                ):
+                    self._run(
+                        self._configurator(model, **kvc_kw),
+                        budget_bytes=workspace + page - 1,
+                        other_pp_rank=(None, False, True),
+                        budgets=budgets,
+                        sent_flags=sent_flags,
+                        **run,
+                    )
+                self.assertEqual(len(sent_flags), 1)
+                self.assertEqual(sent_flags[0][1:], [1, 1])
+                self.assertEqual(budgets, [workspace + page - 1])
 
 
 if __name__ == "__main__":

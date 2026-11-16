@@ -3418,6 +3418,11 @@ class KVCacheConfigurator:
         prefill_backend, decode_backend = attention_backends()
         adaptive_steps = self._adaptive_extra_steps()
         total = 0
+        # Under PP only the last rank hosts the draft worker, yet the draft and
+        # adaptive backends below are counted on every rank on purpose: the
+        # early return in _reserve_aiter_decode_workspace and its PP
+        # all-reduce need the same per_row on all ranks. Do not make this
+        # per-rank; the other ranks just over-reserve a little.
         # MLA and the sliding-window pool decode without paged_attention_ragged,
         # so their backends allocate no workspace.
         if (
@@ -3540,7 +3545,8 @@ class KVCacheConfigurator:
         Long-context models with many heads per rank can need more than that
         (Llama-3.1-8B at TP1 with 4096 requests: ~33 GB). An explicit
         --mem-fraction-static skips this reserve; an explicit
-        --max-running-requests is kept and its workspace reserved in full.
+        --max-running-requests is not capped (its workspace beyond the slack
+        is reserved, however much of the KV budget that takes).
         """
         per_row = self._aiter_decode_workspace_bytes_per_row()
         raw_input = getattr(self.server_args, "_raw_input", None) or {}
@@ -3573,9 +3579,14 @@ class KVCacheConfigurator:
         # with them) instead of starving the KV cache.
         if not explicit_max_running_requests and reserved > budget_bytes // 2:
             request_cap = max(1, (budget_bytes // 2 + headroom) // per_request)
-        does_not_fit = (
-            charge(config.max_running_requests if request_cap is None else request_cap)
-            > budget_bytes
+        local_reserved = charge(
+            config.max_running_requests
+            if request_cap is None
+            else min(request_cap, config.max_running_requests)
+        )
+        does_not_fit = local_reserved > budget_bytes or (
+            local_reserved > 0
+            and not self._budget_holds_min_kv_pool(budget_bytes - local_reserved)
         )
         needs_reserve = reserved > 0
 
@@ -3620,9 +3631,10 @@ class KVCacheConfigurator:
             )
             raise RuntimeError(
                 f"The aiter decode workspace for {what}, sized by "
-                f"context_len={self.model_config.context_len}, does not fit in "
-                f"the KV cache budget plus the runtime slack above the "
-                f"activation reserve{where} (this rank: "
+                f"context_len={self.model_config.context_len}, does not fit, "
+                f"with room left for a minimal KV cache, in the KV cache "
+                f"budget plus the runtime slack above the activation "
+                f"reserve{where} (this rank: "
                 f"{budget_bytes / (1 << 30):.2f} GB + "
                 f"{headroom / (1 << 30):.2f} GB). Try {fix}a smaller "
                 f"--context-length, a larger --tp-size (fewer heads per rank), "
@@ -3639,7 +3651,7 @@ class KVCacheConfigurator:
                 "max_running_requests is capped to %d (per dp worker) so the aiter "
                 "decode workspace (%.2f MB per request) takes at most half of the "
                 "KV budget. Pass --max-running-requests to keep a larger count "
-                "(its workspace is then reserved in full), or use a smaller "
+                "(an explicit count is not capped), or use a smaller "
                 "--context-length.",
                 request_cap,
                 per_request / (1 << 20),
@@ -3661,6 +3673,26 @@ class KVCacheConfigurator:
             reserved / (1 << 30),
         )
         return config
+
+    def _budget_holds_min_kv_pool(self, budget_bytes: int) -> bool:
+        """Whether a KV budget left after the workspace reserve still sizes a
+        pool of at least one page and two tokens (resolve_max_num_reqs keeps
+        token_capacity // 2 requests). Checked before the PP all-reduce: a
+        smaller budget would make config_from_budget raise "Not enough
+        memory" on this rank alone, before its PP token all-reduce, and hang
+        the other ranks."""
+        from sglang.srt.model_executor.pool_configurator import (
+            create_memory_pool_configurator,
+        )
+
+        page_size = get_schedule().page_size
+        try:
+            config = create_memory_pool_configurator(self).calculate_pool_sizes(
+                budget_bytes, page_size
+            )
+        except (RuntimeError, ValueError):
+            return False
+        return config.max_total_num_tokens >= max(page_size, 2)
 
     def config_from_budget(
         self, budget_bytes: int, *, cap_tokens: Optional[int] = None
