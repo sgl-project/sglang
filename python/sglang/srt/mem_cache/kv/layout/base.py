@@ -67,6 +67,9 @@ class SubPoolSpec(ABC):
     # whole pages give rows past the sequence a zero weight, so a NaN left there
     # by another band's bytes would still reach the output.
     zero_units_on_handout: ClassVar[bool] = False
+    # Whether a unit's bytes are laid out per unit rather than as one entry per
+    # token, so that copying a request's tokens must take their whole units.
+    copies_whole_units: ClassVar[bool] = False
 
     name: str
     layer_num: int
