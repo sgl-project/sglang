@@ -199,7 +199,6 @@ _MERGED_K_GATE_MAX_M = 16
 
 
 class _IndexerTpSplit(NamedTuple):
-    # this rank scores prefill rows [row_lo, row_hi) and all-gathers the top-k
     group: Any  # attn-TP GroupCoordinator
     row_lo: int
     row_hi: int
@@ -485,8 +484,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # [wk | weights_proj] rows for the merged GEMM
         self._wk_gate_weight: Optional[torch.Tensor] = None
         self.num_init_tokens = self.num_local_tokens = 0
-        # Set by the model: prefill extends with at least this many rows split the
-        # indexer (logits and top-k) across the attention-TP ranks; None never splits.
+        # Prefill extends with at least this many rows split the indexer (logits and
+        # top-k) across the attention-TP ranks; None never splits.
         self.tp_split_min_rows: Optional[int] = None
         if config is not None:
             self.num_init_tokens = getattr(config, "index_init_tokens", 0)
@@ -2017,7 +2016,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 topk_indices_offset_override=topk_offset_chunk,
             )
             dst[start - dst_base : end - dst_base] = raw_topk_chunk
-            # Release scratch before allocating the next chunk or gathering top-k.
             del logits_chunk
             start = end
 
@@ -2096,8 +2094,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     def _indexer_tp_split(
         self, forward_batch: ForwardBatch, q_offset: int
     ) -> Optional[_IndexerTpSplit]:
-        # None for the replicated path. Every input is identical across the group, so
-        # all ranks take the same branch and the all-gather cannot diverge.
+        # Every input is identical across the group, so all ranks take the same
+        # branch and the all-gather cannot diverge.
         if not _is_cuda or self.tp_split_min_rows is None:
             return None
         if self.dsa_enable_prefill_cp or is_cp_active(forward_batch):
@@ -2501,7 +2499,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             and not in_piecewise_or_breakable_cuda_graph
             and forward_batch.attn_cp_metadata is None
         ) or (
-            # Kimi-K3.1 NoPE indexer: the post-load [wk | weights_proj] GEMM
             self._wk_gate_weight is not None
             and (
                 forward_batch.forward_mode.is_decode_or_idle()
@@ -2516,10 +2513,8 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 x, q_lora, positions, forward_batch, layer_id, act_quant
             )
         elif is_graph_dsa_split_op_surface(forward_batch):
-            # Prefill under PCG/BCG (including CP): run the whole indexer
-            # (q/k proj, head gate, k-cache store, topk) as a single eager split op
-            # instead of capturing it piecemeal in the graph. The split op is
-            # fusion-aware, so this also covers the fused path here.
+            # Prefill under PCG/BCG (including CP) runs the whole indexer as one eager,
+            # fusion-aware split op instead of capturing it piecemeal.
             if weights_proj_lora:
                 raise RuntimeError(GRAPH_WEIGHTS_PROJ_LORA_ERROR)
             if return_indices:

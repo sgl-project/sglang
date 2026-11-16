@@ -256,8 +256,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Runtime parameters
         if backend == "trtllm-gen" and 64 < self.num_decode_q_heads < 128:
-            # flashinfer has no trtllm-gen MLA decode for this head count (e.g. a TP1
-            # pipeline stage of a 96-head model) and rejects the multi-CTA counter buffer.
             logger.info(
                 "trtllm_mla: %d decode q heads per rank has no trtllm-gen MLA "
                 "decode kernel; using the cute-dsl runner for decode.",

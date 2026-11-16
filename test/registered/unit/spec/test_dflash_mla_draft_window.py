@@ -1,6 +1,4 @@
-"""--speculative-draft-window-size on the MLA-only DFLASH draft backends; expected
-verdicts come from a brute-force coverage check, not the resolver's own inequality.
-"""
+"""MLA DFLASH draft window resolution, checked against a brute-force coverage oracle."""
 
 import unittest
 

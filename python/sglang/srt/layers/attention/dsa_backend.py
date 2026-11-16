@@ -786,8 +786,6 @@ class DeepseekSparseAttnBackend(
         self.kv_scale_ue8m0 = model_runner.token_to_kv_pool.kv_scale_ue8m0
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         kimi_k31 = is_kimi_k31(hf_config)
-        # Extend metadata pads the per-token seqlens to the MLP-sync padded rows
-        # (pad_dsa_cache_seqlens), so the queries keep those rows too.
         self.plans_padded_extend_rows = kimi_k31
         # Every model's PAGED extend takes the packed v2 top-k for an unsharded
         # batch; this flag also sends prefill-CP shards to it (DSATopKBackend).
@@ -882,8 +880,6 @@ class DeepseekSparseAttnBackend(
         )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.flashmla_kv_num_q_heads = _flashmla_kv_padded_heads(self.num_q_heads)
-        # trtllm (Kimi-K3.1): fp8 q from one fused concat-cast, pad heads zero;
-        # sharded DCP decode attends gathered heads over local KV for a partial.
         self._trtllm_fused_q = (
             _is_cuda
             and kimi_k31
@@ -918,8 +914,7 @@ class DeepseekSparseAttnBackend(
             self.local_num_q_heads
         )
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
-        # flashmla_kv q padded to flashmla_kv_num_q_heads, concat-written in place into
-        # a _zero_padded_q buffer; shared across layers, so not under two-batch overlap.
+        # The padded q buffer is shared across layers, hence no two-batch overlap below.
         self._flashmla_kv_q_pad_graph: Optional[torch.Tensor] = None
         # eager buffers by padded head count (DCP prefill and decode differ)
         self._flashmla_kv_q_pad_eager: dict[int, torch.Tensor] = {}
@@ -1007,8 +1002,6 @@ class DeepseekSparseAttnBackend(
                 "Disabling fused DSA top-k for IndexShare under PD disaggregation."
             )
         if self.dsa_shards_index_k:
-            # decode merges top-k candidates of every request row; target
-            # verify of every draft-token row.
             max_rows = max(model_runner.max_running_requests, 1) * (
                 self.speculative_num_draft_tokens or 1
             )
@@ -4625,8 +4618,7 @@ class DeepseekSparseAttnBackend(
             and q_rope is not None
         )
         if q_prebuilt:
-            # One fused concat-cast into the (head-padded) fp8 q. The pool casts
-            # k on write, the same values as casting it here.
+            # The pool casts k on write, the same values as casting it here.
             q_all = self._trtllm_q_fp8(
                 q, q_rope, layer.tp_q_head_num, pad_heads=not use_prims_ts
             )

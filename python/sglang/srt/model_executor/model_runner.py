@@ -1350,13 +1350,8 @@ class ModelRunner:
         self.pp_group = get_parallel().pp_group
 
     def maybe_warmup_bf16_gemms(self):
-        """Run every unquantized bf16 linear shape once over a spread of M.
-
-        cuBLASLt loads its kernel libraries on first use, which
-        CUDA_MODULE_LOADING=EAGER does not cover; a first load during a PP
-        prefill, while the neighbour stage spins in an NCCL send, can hang in
-        cuLibraryLoadData.
-        """
+        """Load cuBLASLt's kernel libraries, which CUDA_MODULE_LOADING=EAGER does not
+        cover; a first load during a PP prefill can hang in cuLibraryLoadData."""
         max_m = envs.SGLANG_WARMUP_BF16_GEMM_MAX_M.get()
         if max_m is None:
             max_m = 16384 if is_kimi_k31(self.model_config.hf_config) else 0

@@ -277,8 +277,7 @@ class EagerRunner(BaseRunner):
                     model_runner.model, "prepare_context_parallel_metadata_for_dcp"
                 )
                 and forward_batch.extend_prefix_lens is not None
-                # MLA target verify uses rank-local decode KV and LSE merge,
-                # not the prefill KV gather layout (or its prefix lengths).
+                # MLA target verify reads rank-local decode KV, not the gathered layout.
                 and not (
                     forward_batch.forward_mode.is_target_verify()
                     and model_runner.model_config.attention_arch == AttentionArch.MLA

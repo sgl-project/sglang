@@ -865,8 +865,7 @@ class MambaPool:
                             raise ValueError(
                                 f"spec-verify ring length must be a power of two, got {L}"
                             )
-                        # Fold-every-commit rewrites from offset zero; only
-                        # one verify window is live. Other modes need headroom.
+                        # Fold-every-commit restarts at offset zero, so needs one window.
                         min_ring_len = (speculative_num_draft_tokens or 0) * (
                             1 if self.replayssm_spec_fold else 2
                         )
@@ -4862,7 +4861,6 @@ def _prefix_valid_mla_write_loc(loc_2d, commit_lens, cache_k_nope):
 class MLATokenToKVPool(KVCache, MLAKVView):
     # fp8_ds_mla tile scales rounded up to powers of two (Kimi-K3.1)
     kv_scale_ue8m0 = False
-    # raw fp8 rows cast inside the scatter kernel
     fp8_cast_on_write = False
 
     def __init__(

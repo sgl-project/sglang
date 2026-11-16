@@ -278,12 +278,10 @@ def startup_weight_load_overlap_of(cfg: Any) -> bool:
 
 
 def decode_state_free_radix_of(cfg: Any) -> bool:
-    """Whether a PD decode server's radix cache holds FULL KV only (no Mamba
-    state), see SGLANG_DECODE_STATE_FREE_RADIX. Read by hybrid-SSM paths only."""
+    """Whether a PD decode radix tree keeps FULL KV only; hybrid-SSM models only."""
     from sglang.srt.environ import envs
 
-    # getattr: model overrides also run on partial configs (e.g. golden tests)
-    # that carry no PD fields; those are not PD decode servers.
+    # Partial configs (e.g. golden tests) carry no PD fields.
     if not (
         getattr(cfg, "disaggregation_mode", None) == "decode"
         and bool(cfg.disaggregation_decode_enable_radix_cache)

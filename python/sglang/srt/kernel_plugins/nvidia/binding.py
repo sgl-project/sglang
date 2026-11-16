@@ -1400,7 +1400,6 @@ def _refuse(reasons: list[str]) -> None:
 def megakernel_tensor_graph_variants(
     model: torch.nn.Module, existing: Optional[AttentionGraphVariants]
 ) -> Optional[AttentionGraphVariants]:
-    """The tensor entry's decode graph variants when the runner has none of its own."""
     installed = _installed(model)
     entry = None if installed is None else installed.tensor_entry
     return (
@@ -1411,7 +1410,6 @@ def megakernel_tensor_graph_variants(
 def megakernel_can_run_graph(
     model: torch.nn.Module, forward_batch: ForwardBatch
 ) -> bool:
-    """False when a tensor-entry decode build cannot run this batch's graph."""
     installed = _installed(model)
     if installed is None or not _decode_entry_kind(installed.built):
         return True

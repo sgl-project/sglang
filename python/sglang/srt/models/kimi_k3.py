@@ -1395,8 +1395,7 @@ class KimiK3MoE(nn.Module):
         if routed_input is not None:
             topk_output, routed_input = routed_input
         elif hidden_states.shape[0] == 0:
-            # An idle DP-attention rank routes nothing but still enters the EP
-            # dispatch; like DeepseekV2MoE, skip the gate and TopK kernels.
+            # An idle DP-attention rank routes nothing but still enters the EP dispatch.
             topk_output = self.topk.empty_topk_output(hidden_states.device)
         else:
             # MoEGate produces fp32 router logits on CUDA (via linear_bf16_fp32

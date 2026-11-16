@@ -1,7 +1,4 @@
-"""Simulated DFLASH acceptance lengths (SGLANG_SIMULATE_ACC_LEN) for a device reader.
-
-Draws stay on the host CPU RNG, so the device and eager paths see one sequence.
-"""
+"""Host-drawn SGLANG_SIMULATE_ACC_LEN draws, so device and eager paths agree."""
 
 from __future__ import annotations
 
@@ -9,8 +6,6 @@ import torch
 
 
 class SimAccLenRing:
-    """A pinned slot is rewritten only after its previous non-blocking copy completes."""
-
     SLOTS = 4
 
     def __init__(self, device: torch.device):

@@ -328,8 +328,6 @@ def _handle_dflash(server_args: ServerArgs) -> None:
             )
 
     if cfg.pp_size != 1 and cfg.disaggregation_mode != "prefill":
-        # A pipelined PD prefill keeps the draft on its last stage, which
-        # materializes the prompt's draft KV for the decode.
         raise ValueError(
             "DFLASH pipeline parallelism requires PD prefill; decode and "
             "non-disaggregated serving require pp_size == 1."

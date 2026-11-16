@@ -1291,7 +1291,6 @@ class LogitsProcessor(nn.Module):
         return self.defer_verify_gather and logits.shape[-1] < self.vocab_size
 
     def finish_deferred_gather(self, logits: torch.Tensor) -> torch.Tensor:
-        """Full fp32 (optionally softcapped) logits from a target-verify vocab shard."""
         if self.final_logit_softcapping:
             return self._gather_softcap_fused(logits, None, use_buffer=False)
         # The undeferred gather; its symmetric buffer is sized by the first eager
@@ -1299,9 +1298,8 @@ class LogitsProcessor(nn.Module):
         return self._logits_gatherer(logits)[:, : self.vocab_size].float()
 
     def deferred_argmax(self, logits: torch.Tensor) -> torch.Tensor:
-        """``argmax`` of the full (softcapped) logits from a target-verify vocab
-        shard, gathering only each rank's row maxima. Ties resolve to the lowest
-        vocab index, as ``torch.argmax`` over the gathered row does."""
+        """Full-logits ``argmax`` from a target-verify vocab shard; ties resolve to
+        the lowest vocab index, as ``torch.argmax`` over the gathered row does."""
         group = get_parallel().tp_group
         num_tokens = logits.shape[0]
         local = self.deferred_local_argmax(logits)

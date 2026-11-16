@@ -36,8 +36,7 @@ class K31SparseVerifyGraphVariants:
     def __init__(self, query_width, split_min=0, context_length=None):
         self.query_width = query_width
         dcp = _attn_dcp()[0] > 1
-        # Split from this longest length (0: never); not under DCP (replicated index-K)
-        # or past the context length.
+        # Split from this longest length (0: never); not under DCP (replicated index-K).
         short = context_length is not None and context_length < split_min
         self.split_min = 0 if dcp or short else split_min
         if dcp:  # the dense core reads the whole latent cache

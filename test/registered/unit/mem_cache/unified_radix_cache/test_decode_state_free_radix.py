@@ -1,5 +1,4 @@
-"""State-free PD decode radix tree (SGLANG_DECODE_STATE_FREE_RADIX): the tree
-keeps FULL KV only, and each request's Mamba state slot goes back to the pool."""
+"""SGLANG_DECODE_STATE_FREE_RADIX: FULL KV only; each request's Mamba slot is freed."""
 
 import unittest
 from array import array
@@ -20,8 +19,7 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 
-# The fixture builds the hybrid pools through a no-buffer Mamba tree first,
-# which needs page 1; the FULL-only tree itself is page-agnostic.
+# The fixture's no-buffer Mamba tree needs page 1; the FULL-only tree does not.
 PAGE = 1
 
 
@@ -70,7 +68,6 @@ class TestDecodeStateFreeRadix(CustomTestCase):
         cache.unlock(req.lock)
         self.assertFalse(req.kv.holds_mamba)
         self.assertEqual(req_to_token_pool.mamba_allocator.available_size(), mamba_free)
-        # Every page of the prompt is cached; no checkpoint caps the insert.
         self.assertEqual(match_prefix(cache, tokens).device_prefix_len, len(tokens))
         cache.sanity_check()
 
@@ -83,7 +80,6 @@ class TestDecodeStateFreeRadix(CustomTestCase):
             origin_input_ids=array("q", [1, 2, 3]),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
-        # the decode pool hands out a state slot before any KV
         req.kv.mamba_pool_idx = req_to_token_pool.mamba_allocator.alloc(1)[0]
         self.assertFalse(req.kv.holds_kv)
         release_kv_cache(req, cache, checkpoint=False)

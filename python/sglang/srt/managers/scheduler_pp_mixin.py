@@ -1344,7 +1344,6 @@ class SchedulerPPMixin:
                 make_draft_input_v2,
             )
 
-            # Same as the PD decode's first draft input: the bonus token only.
             next_draft_input = make_draft_input_v2(
                 bonus_tokens=next_token_ids,
                 new_seq_lens=batch.seq_lens,

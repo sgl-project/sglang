@@ -1,8 +1,5 @@
-"""B300 CI coverage for the Kimi-K3.1 Low-Latency recipe.
-
-Diverges from the cookbook's B300 Low-Latency (TP8) cell: adds DCP8, and runs
-mem fraction 0.92 and 72 running requests instead of 0.85 and 64.
-"""
+"""B300 CI for the Kimi-K3.1 Low-Latency recipe; unlike the cookbook's TP8 cell, it
+adds DCP8 and runs mem fraction 0.92 and 72 running requests, not 0.85 and 64."""
 
 import unittest
 

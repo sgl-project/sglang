@@ -1,6 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""The CUDA and PyTorch env vars of SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION,
-set during server argument resolution so every spawned process inherits them."""
+"""The process env vars SGLANG_ENABLE_NV_MEGA_RUNTIME_K31_GB_OPTIMIZATION sets."""
 
 from __future__ import annotations
 

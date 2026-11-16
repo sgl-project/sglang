@@ -621,13 +621,7 @@ def resolve_mla_draft_compact_window(
     megakernel: bool = False,
 ) -> Optional[int]:
     """The ``--speculative-draft-window-size`` an MLA draft keeps on trtllm_mla
-    or cutedsl_mla, or None to serve the draft without the compact table.
-
-    These backends index the draft's ``req_to_token`` rows by absolute position (a
-    sliding_attention layer's window in ``mla_window_sparse_indices``, the DCP page
-    table in ``create_mla_kv_page_table_for_dcp``), while the compact table stores
-    the window starting at row 0.
-    """
+    or cutedsl_mla, or None to serve the draft without the compact table."""
     layer_types = get_dflash_layer_types(draft_hf_config)
     if layer_types is not None and "sliding_attention" in layer_types:
         if any(layer_type != "sliding_attention" for layer_type in layer_types):

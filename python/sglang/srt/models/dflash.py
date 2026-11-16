@@ -200,7 +200,6 @@ def _fused_candidate_all_gather(
         return None
     payload = torch.empty((rows, 2 * k), dtype=torch.int32, device=vals.device)
     payload[:, :k].view(torch.float32).copy_(vals)
-    # Global ids stay below the vocabulary size, so int32 carries them exactly.
     payload[:, k:].copy_(global_ids)
     sp_collective.all_gather_direct(
         tp,

@@ -20,8 +20,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Default object reprs (``<Foo object at 0x7f...>``) carry rank-local
-# addresses, e.g. a request's grammar object; mask them before comparing.
+# Default reprs carry rank-local addresses (e.g. a request's grammar object).
 _ADDR_RE = re.compile(r" at 0x[0-9a-fA-F]+")
 
 _sync_groups: List[dist.ProcessGroup] = []  # Dedicated gloo groups (one per rank-set).

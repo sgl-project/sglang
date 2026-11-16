@@ -1,5 +1,4 @@
-"""SGLANG_OPT_DFLASH_DRAFT_L2_PREFETCH: a branch forked at the draft CUDA graph's head
-prefetches the draft's small non-Linear tensors into L2; the graph's tail joins it."""
+"""Prefetch the draft's small non-Linear tensors into L2 beside its CUDA graph."""
 
 from itertools import chain
 from typing import List

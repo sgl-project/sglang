@@ -657,9 +657,8 @@ class KVCacheConfigurator:
 
     @property
     def draft_mla_rows_are_physical(self) -> bool:
-        """Whether the draft's MLA rows are DCP-collapsed like the target's: under
-        DCP the plain MLA draft pool addresses owner rows at ``loc // dcp_size``
-        (MLATokenToKVPool._scatter_mla_rows); an MHA draft keeps widened locs."""
+        """True when the plain MLA draft pool stores owner rows at ``loc // dcp_size``
+        under DCP (MLATokenToKVPool._scatter_mla_rows), unlike an MHA draft."""
         return (
             self.is_draft_worker
             and get_parallel().attn_dcp_size > 1
@@ -841,8 +840,7 @@ class KVCacheConfigurator:
                     (draft_virtual_id_space + page - 1) // page * page
                 )
                 if self.draft_mla_rows_are_physical:
-                    # A rank stores one row per dcp_size widened ids, so the pool
-                    # keeps a dcp_size-th of the space, in whole widened pages.
+                    # A rank stores one row per dcp_size widened ids.
                     dcp_size = get_parallel().attn_dcp_size
                     widened_page = page * dcp_size
                     widened = (
@@ -3266,7 +3264,6 @@ class KVCacheConfigurator:
         return int(rest_memory * (1 << 30))  # return in bytes
 
     def _calculate_mamba_ratio(self) -> int:
-        # No tree-held state: one Mamba slot per request.
         if get_memory().disable_radix_cache or get_exec().mamba.decode_state_free_radix:
             return 1
 
@@ -3701,7 +3698,6 @@ class KVCacheConfigurator:
         elif (
             get_memory().disable_radix_cache or get_exec().mamba.decode_state_free_radix
         ) and get_schedule().max_running_requests is not None:
-            # Use explicitly set max_running_requests when no tree holds states
             get_context().override(
                 "mamba_pool.from_max_running_requests",
                 max_mamba_cache_size=max(

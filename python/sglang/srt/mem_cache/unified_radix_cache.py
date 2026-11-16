@@ -286,8 +286,7 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         # Whether a slot keeps a prefix's recurrent state checkpoints.
         self.is_mamba_enabled = TREE_STATE in families
-        # The tree holds no Mamba state but requests do: the cache only frees each
-        # request's own state slot when it leaves (SGLANG_DECODE_STATE_FREE_RADIX).
+        # The tree holds no Mamba state; the cache only frees each request's own slot.
         self.request_mamba_only = params.request_mamba_only
         assert not (self.request_mamba_only and self.is_mamba_enabled)
         # Whether the mamba extra (ping-pong) buffer is enabled.

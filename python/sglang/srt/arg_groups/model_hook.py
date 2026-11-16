@@ -1070,8 +1070,7 @@ def handle_mamba_radix_cache(server_args: Any, hf_config: Any):
             mamba_cache_chunk_size_of=lambda: mamba_cache_chunk_size(server_args),
         )
     elif not decode_state_free_radix_of(view):
-        # A state-free decode tree caches no state, so neither the extra buffer
-        # nor no_buffer's page-1 / non-overlap requirements apply.
+        # A state-free decode tree caches no state, so no_buffer's limits do not apply.
         validate_mamba_no_buffer(view, hf_config.architectures[0])
 
 

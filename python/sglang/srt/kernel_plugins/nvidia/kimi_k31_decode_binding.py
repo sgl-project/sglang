@@ -76,7 +76,6 @@ class K31DecodeHostBinding:
         rows = step.rows
         full = backend.full_attn_backend.forward_metadata
         linear = backend.linear_attn_backend.forward_metadata
-        # Captured graphs bake in their label; eager steps select from current lengths.
         label = get_capture_attention_variant()
         if label is None:
             label = K31DecodeGraphVariants().select(forward_batch)
