@@ -267,7 +267,7 @@ def _tau_kernel(
     Out,
     FLOOR: tl.constexpr,
     ALPHA: tl.constexpr,
-    N: tl.constexpr,
+    N,
     BLOCK: tl.constexpr,
     USE_PDL: tl.constexpr = False,
 ):

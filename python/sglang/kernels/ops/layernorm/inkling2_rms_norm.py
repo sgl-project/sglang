@@ -7,6 +7,7 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, const_expr
 
+from sglang.kernels.ops.attention.flash_attn.cute.utils import predicate_k
 from sglang.kernels.ops.layernorm.inkling2_cute_utils import (
     BASE_ALIGN,
     as_norm_rows,
@@ -19,7 +20,7 @@ from sglang.kernels.ops.layernorm.inkling2_cute_utils import (
     make_tiled_copy_2d,
     norm_num_rows,
     norm_row_alignment,
-    predicate_n,
+    reduction_buffer_layout,
     rmsnorm_fwd_layout,
     rmsnorm_row_rstd,
     torch_to_cute_dtype,
@@ -40,7 +41,7 @@ class RMSNormFwd:
         self.has_pre_affine = has_pre_affine
         self.preload_weight = preload_weight
         self.use_x_g2r_load = N <= 128
-        self.reload_x_from_smem = N > 8192 and (not self.use_x_g2r_load)
+        self.reload_x_from_smem = N > 8192
         assert N > 0, f"N={N!r} must be positive"
 
     def _num_threads(self, dtype: Type[cutlass.Numeric]) -> int:
@@ -68,17 +69,6 @@ class RMSNormFwd:
             vecsize=vecsize,
         )
         return (tiled_copy, tile_mn, threads_per_row)
-
-    def _reduction_buffer_layout(self, tv_layout: cute.Layout) -> cute.Layout:
-        num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
-        warps_per_row = (
-            num_warps
-            if cute.rank(tv_layout.shape[0]) == 1
-            else max(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
-        )
-        return cute.make_ordered_layout(
-            (num_warps // warps_per_row, warps_per_row), order=(1, 0)
-        )
 
     @cute.jit
     def __call__(
@@ -157,7 +147,7 @@ class RMSNormFwd:
             byte_alignment=BASE_ALIGN,
         )
         reduction_buffer = smem.allocate_tensor(
-            cute.Float32, self._reduction_buffer_layout(tv_layout), byte_alignment=8
+            cute.Float32, reduction_buffer_layout(tv_layout), byte_alignment=8
         )
         shape = (norm_num_rows(mX), self.N)
         cX_full = cute.make_identity_tensor(shape)
@@ -183,7 +173,7 @@ class RMSNormFwd:
         tXrY = cute.make_rmem_tensor_like(tXgY)
         is_even_n = const_expr(shape[1] == tile_mn[1])
         pred_n = (
-            None if is_even_n else predicate_n(thr_copy.partition_S(cX), limit=shape[1])
+            None if is_even_n else predicate_k(thr_copy.partition_S(cX), limit=shape[1])
         )
         copy_n = partial(copy_partition, pred=pred_n)
         if const_expr(self.has_pre_affine):
@@ -218,7 +208,6 @@ class RMSNormFwd:
                         is_async=True,
                     )
             cute.arch.cp_async_commit_group()
-        if const_expr(not self.use_x_g2r_load):
             cute.arch.cp_async_wait_group(0)
             cute.autovec_copy(tXsX, tXrX)
         x = tXrX.load().to(cute.Float32)

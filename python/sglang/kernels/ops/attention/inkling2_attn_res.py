@@ -75,7 +75,6 @@ class AttnResFwdKernel:
         self.X_load_bytes = D_local * self.dtype.width // 8
         self.NORMALIZE_VALUES = normalize_values
         self.HAS_PARTIAL_ADDEND = has_partial_addend
-        self.VECTORIZE_PARTIAL_ADDEND = has_partial_addend
         self.reload_X = reload_X
         self.MAX_N = max_N
         self.xchg_floats = self.MAX_N * (self.N_Q + 1)
@@ -177,7 +176,7 @@ class AttnResFwdKernel:
             pipeline.consumer_wait(addend_consumer_state)
         for chunk in range_constexpr(self.vec_chunks):
             cute.autovec_copy(sX_vec[None, tidx, chunk, consumer_state.index], rXVec)
-            if const_expr(self.VECTORIZE_PARTIAL_ADDEND and use_addend):
+            if const_expr(use_addend):
                 cute.autovec_copy(
                     sX_vec[None, tidx, chunk, addend_consumer_state.index],
                     rPartialAddendVec,
@@ -185,15 +184,7 @@ class AttnResFwdKernel:
             for v in range_constexpr(self.vec_size):
                 x = Float32(rXVec[v])
                 if const_expr(use_addend):
-                    if const_expr(self.VECTORIZE_PARTIAL_ADDEND):
-                        x = fadd_rn_f32(x, Float32(rPartialAddendVec[v]))
-                    else:
-                        x = fadd_rn_f32(
-                            x,
-                            Float32(
-                                sX_vec[v, tidx, chunk, addend_consumer_state.index]
-                            ),
-                        )
+                    x = fadd_rn_f32(x, Float32(rPartialAddendVec[v]))
                 rSumSq = fma_rn_f32(x, x, rSumSq)
                 for q in range_constexpr(self.N_Q):
                     q_val = rQ_vec[v, chunk, q]
@@ -254,7 +245,7 @@ class AttnResFwdKernel:
                 pipeline.consumer_wait(addend_consumer_state)
         for chunk in range_constexpr(self.vec_chunks):
             cute.autovec_copy(sX_vec[None, tidx, chunk, consumer_state.index], rXVec)
-            if const_expr(self.VECTORIZE_PARTIAL_ADDEND and use_addend):
+            if const_expr(use_addend):
                 cute.autovec_copy(
                     sX_vec[None, tidx, chunk, addend_consumer_state.index],
                     rPartialAddendVec,
@@ -263,12 +254,7 @@ class AttnResFwdKernel:
                 idx = chunk * self.vec_size + v
                 x = Float32(rXVec[v])
                 if const_expr(use_addend):
-                    if const_expr(self.VECTORIZE_PARTIAL_ADDEND):
-                        x = fadd_rn_f32(x, Float32(rPartialAddendVec[v]))
-                    else:
-                        x = fadd_rn_f32(
-                            x, sX_vec[v, tidx, chunk, addend_consumer_state.index]
-                        )
+                    x = fadd_rn_f32(x, Float32(rPartialAddendVec[v]))
                 for q in range_constexpr(self.N_Q):
                     prob = sExp[n, q]
                     if const_expr(self.NORMALIZE_VALUES):
@@ -277,7 +263,7 @@ class AttnResFwdKernel:
         for t in range_constexpr(self.tail_elems):
             idx = self.tail_base + t
             x = Float32(sX_unvec[tidx, self.tail_base + t, consumer_state.index])
-            if const_expr(self.HAS_PARTIAL_ADDEND and use_addend):
+            if const_expr(use_addend):
                 x = fadd_rn_f32(
                     x, sX_unvec[tidx, self.tail_base + t, addend_consumer_state.index]
                 )
@@ -383,8 +369,8 @@ class AttnResFwdKernel:
         mBlockBase: cute.Tensor,
         mBlockOffs: tuple,
         mPartialAddend: Optional[cute.Tensor],
-        mPseudoQuery: cute.Tensor | tuple[cute.Tensor, ...],
-        mMergedOutput: Optional[cute.Tensor],
+        mPseudoQuery: cute.Tensor,
+        mMergedOutput: cute.Tensor,
         X_smem_layout_staged: cute.Layout,
         reduction_smem_layout: cute.Layout,
         stat_smem_layout: cute.Layout,
@@ -415,8 +401,7 @@ class AttnResFwdKernel:
                     half_off, mPartialAddend, 16
                 )
             mPseudoQueryL = domain_offset_raw_aligned(half_off, mPseudoQuery, 16)
-            if const_expr(mMergedOutput is not None):
-                mMergedOutputL = domain_offset_raw_aligned(half_off, mMergedOutput, 16)
+            mMergedOutputL = domain_offset_raw_aligned(half_off, mMergedOutput, 16)
         if const_expr(self.HAS_PARTIAL_ADDEND):
             assert mPartialAddend is not None
         else:
@@ -524,10 +509,7 @@ class AttnResFwdKernel:
                 cutlass.pipeline.PipelineUserType.Consumer, self.num_g2s_stages
             )
             for q in range_constexpr(self.N_Q):
-                if const_expr(isinstance(mPseudoQueryL, tuple)):
-                    gQ_query = self.local_row(mPseudoQueryL[q])
-                else:
-                    gQ_query = self.local_row(mPseudoQueryL[q, None])
+                gQ_query = self.local_row(mPseudoQueryL[q, None])
                 gQ_chunks = cute.flat_divide(
                     gQ_query, (self.num_compute_threads * self.vec_size,)
                 )
@@ -639,7 +621,6 @@ class AttnResFwdKernel:
                     exp = cute.math.exp(logit - max_logit, fastmath=False)
                     sExp[n, q] = exp
                     exp_sum = fadd_rn_f32(exp_sum, exp)
-                inv_sum = Float32(0.0)
                 inv_sum = Float32(1.0) / exp_sum
                 sInvSum[q] = inv_sum
             cute.arch.barrier(barrier_id=1, number_of_threads=self.num_compute_threads)
@@ -671,25 +652,22 @@ class AttnResFwdKernel:
                 )
             for q in range_constexpr(self.N_Q):
                 inv_sum = sInvSum[q]
-                if const_expr(mMergedOutput is not None):
-                    gOut_row = self.local_row(mMergedOutputL[q, bid, None])
-                    gOut_chunks = cute.flat_divide(
-                        gOut_row, (self.vec_size * self.num_compute_threads,)
-                    )
-                    gOut_vec = cute.flat_divide(gOut_chunks, (self.vec_size,))
-                    gOut_unvec = cute.flat_divide(gOut_row, (self.num_compute_threads,))
+                gOut_row = self.local_row(mMergedOutputL[q, bid, None])
+                gOut_chunks = cute.flat_divide(
+                    gOut_row, (self.vec_size * self.num_compute_threads,)
+                )
+                gOut_vec = cute.flat_divide(gOut_chunks, (self.vec_size,))
+                gOut_unvec = cute.flat_divide(gOut_row, (self.num_compute_threads,))
                 for chunk in range_constexpr(self.vec_chunks):
                     for v in range_constexpr(self.vec_size):
                         idx = chunk * self.vec_size + v
                         out = fmul_rn_f32(rOut[q, idx], inv_sum)
                         rMergedVec[v] = out
-                    if const_expr(mMergedOutput is not None):
-                        cute.autovec_copy(rMergedVec, gOut_vec[None, tidx, chunk])
+                    cute.autovec_copy(rMergedVec, gOut_vec[None, tidx, chunk])
                 for t in range_constexpr(self.tail_elems):
                     idx = self.tail_base + t
                     out = fmul_rn_f32(rOut[q, idx], inv_sum)
-                    if const_expr(mMergedOutput is not None):
-                        gOut_unvec[tidx, self.tail_base + t] = out
+                    gOut_unvec[tidx, self.tail_base + t] = out
 
 
 _FWD_TUNED = {

@@ -7,6 +7,7 @@ import cutlass
 import torch
 from cutlass import Float32, Int32, const_expr, cute, range_constexpr
 
+from sglang.kernels.ops.attention.flash_attn.cute.utils import predicate_k
 from sglang.kernels.ops.layernorm.inkling2_cute_utils import (
     BASE_ALIGN,
     ceil_div,
@@ -17,9 +18,9 @@ from sglang.kernels.ops.layernorm.inkling2_cute_utils import (
     make_tiled_copy_2d,
     norm_num_rows,
     norm_row_alignment,
-    predicate_n,
     qk_l2_clip_fwd_layout,
     qk_l2_clip_row_stats,
+    reduction_buffer_layout,
     torch_to_cute_dtype,
 )
 
@@ -56,17 +57,6 @@ class QKL2ClipFwd:
             vecsize=vecsize,
         )
         return tiled_copy, tile_mn, threads_per_row
-
-    def _reduction_buffer_layout(self, tv_layout: cute.Layout) -> cute.Layout:
-        num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
-        warps_per_row = (
-            num_warps
-            if cute.rank(tv_layout.shape[0]) == 1
-            else max(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
-        )
-        return cute.make_ordered_layout(
-            (num_warps // warps_per_row, warps_per_row), order=(1, 0)
-        )
 
     @cute.jit
     def __call__(
@@ -122,7 +112,7 @@ class QKL2ClipFwd:
         smem = cutlass.utils.SmemAllocator()
         reduction_buffer = smem.allocate_tensor(
             cute.Float32,
-            self._reduction_buffer_layout(tv_layout),
+            reduction_buffer_layout(tv_layout),
             byte_alignment=8,
         )
 
@@ -141,7 +131,7 @@ class QKL2ClipFwd:
 
         is_even_n = const_expr(shape[1] == tile_mn[1])
         pred_n = (
-            None if is_even_n else predicate_n(thr_copy.partition_S(cX), limit=shape[1])
+            None if is_even_n else predicate_k(thr_copy.partition_S(cX), limit=shape[1])
         )
         copy_n = partial(copy_partition, pred=pred_n)
 
@@ -175,7 +165,7 @@ class QKL2ClipFwd:
                                 ]
             x = x * tXrScale.load().to(cute.Float32)
 
-        coeff, _ = qk_l2_clip_row_stats(
+        coeff = qk_l2_clip_row_stats(
             x, threshold, eps, threads_per_row, reduction_buffer
         )
 

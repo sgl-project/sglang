@@ -177,29 +177,10 @@ def copy_partition(
 
 
 @cute.jit
-def predicate_n(tAcA: cute.Tensor, limit) -> cute.Tensor:
-    vecsize = cute.size(tAcA, mode=[0, 1])
-    num_rows = cute.size(tAcA, mode=[1])
-    num_tiles_n = cute.size(tAcA, mode=[2])
-    pred = cute.make_rmem_tensor(
-        cute.make_layout((vecsize, num_rows, num_tiles_n), stride=(num_tiles_n, 0, 1)),
-        Boolean,
-    )
-    for rest_v in cutlass.range_constexpr(pred.shape[0]):
-        for rest_n in cutlass.range_constexpr(pred.shape[2]):
-            pred[rest_v, 0, rest_n] = cute.elem_less(
-                tAcA[(0, rest_v), 0, rest_n][1], limit
-            )
-    return pred
-
-
-@cute.jit
 def row_sum(
     x: cute.TensorSSA,
     threads_per_row: cutlass.Constexpr[int],
     reduction_buffer: cute.Tensor,
-    barrier_id: cutlass.Constexpr[int | None] = None,
-    barrier_threads: cutlass.Constexpr[int | None] = None,
 ) -> Float32:
     val = x.reduce(cute.ReductionOp.ADD, init_val=0.0, reduction_profile=0)
     val = cute.arch.warp_reduction(
@@ -208,7 +189,7 @@ def row_sum(
         threads_in_group=min(threads_per_row, cute.arch.WARP_SIZE),
     )
     if const_expr(cute.size(reduction_buffer.shape[1]) > 1):
-        val = block_row_sum(val, reduction_buffer, barrier_id, barrier_threads)
+        val = block_row_sum(val, reduction_buffer)
     return val
 
 
@@ -216,8 +197,6 @@ def row_sum(
 def block_row_sum(
     val: Float32,
     reduction_buffer: cute.Tensor,
-    barrier_id: cutlass.Constexpr[int | None] = None,
-    barrier_threads: cutlass.Constexpr[int | None] = None,
 ) -> Float32:
     lane_idx = cute.arch.lane_idx()
     warp_idx = cute.arch.warp_idx()
@@ -225,21 +204,27 @@ def block_row_sum(
     row_idx = warp_idx // warps_per_row
     col_idx = warp_idx % warps_per_row
 
-    if const_expr(barrier_id is None):
-        cute.arch.barrier()
-    else:
-        cute.arch.barrier(barrier_id=barrier_id, number_of_threads=barrier_threads)
+    cute.arch.barrier()
     if lane_idx == 0:
         reduction_buffer[row_idx, col_idx] = val
-    if const_expr(barrier_id is None):
-        cute.arch.barrier()
-    else:
-        cute.arch.barrier(barrier_id=barrier_id, number_of_threads=barrier_threads)
+    cute.arch.barrier()
 
     reduced = Float32(0.0)
     if lane_idx < warps_per_row:
         reduced = reduction_buffer[row_idx, lane_idx]
     return cute.arch.warp_reduction(reduced, operator.add)
+
+
+def reduction_buffer_layout(tv_layout: cute.Layout) -> cute.Layout:
+    num_warps = cute.size(tv_layout, mode=[0]) // cute.arch.WARP_SIZE
+    warps_per_row = (
+        num_warps
+        if cute.rank(tv_layout.shape[0]) == 1
+        else max(tv_layout.shape[0][0] // cute.arch.WARP_SIZE, 1)
+    )
+    return cute.make_ordered_layout(
+        (num_warps // warps_per_row, warps_per_row), order=(1, 0)
+    )
 
 
 def ceil_div(a: int, b: int) -> int:
@@ -308,15 +293,12 @@ def qk_l2_clip_row_stats(
     eps: Float32,
     threads_per_row: cutlass.Constexpr[int],
     reduction_buffer: cute.Tensor,
-) -> tuple[Float32, Float32]:
+) -> Float32:
     sum_sq = row_sum(x * x, threads_per_row, reduction_buffer)
-    inv_norm = Float32(0.0)
     norm = Float32(0.0)
     if sum_sq > Float32(0.0):
-        inv_norm = cute.math.rsqrt(sum_sq)
-        norm = sum_sq * inv_norm
-    coeff = min_f32(Float32(1.0), threshold / (norm + eps))
-    return coeff, inv_norm
+        norm = sum_sq * cute.math.rsqrt(sum_sq)
+    return min_f32(Float32(1.0), threshold / (norm + eps))
 
 
 def _norm_rows_overlap(x: torch.Tensor) -> bool:
@@ -374,7 +356,6 @@ def load_norm_rows(
     alignment: cutlass.Constexpr[int],
     *,
     is_async: cutlass.Constexpr[bool] = False,
-    valid_rows=None,
 ):
     vec = const_expr(cute.size(dst.shape[0]))
     bits = const_expr(min(128, alignment * 8, vec * src.element_type.width))
@@ -407,8 +388,7 @@ def load_norm_rows(
             )
             g = cute.make_tensor(ptr, layout)
             d = cute.make_tensor(dst[(None, 0), m, n].iterator, layout)
-            rows = norm_num_rows(src) if const_expr(valid_rows is None) else valid_rows
-            valid = row < rows and col < src.shape[-1]
+            valid = row < norm_num_rows(src) and col < src.shape[-1]
             pred[0] = valid
             if const_expr(not use_async):
                 d.fill(0)
