@@ -576,16 +576,20 @@ def _npu_combine_premix(
         # one-hot (stream 0 on its own).
         apply_pre = x.new_zeros((x.shape[0], cfg.mult), dtype=torch.float32)
         apply_pre[:, 0] = 1.0
-    y, post_mix, comb, pre = torch.ops.custom.npu_hc_pre_v2(
-        x=x,
-        hc_fn=hc.fn,
-        hc_scale=hc.scale,
-        hc_base=hc.base,
+    from sgl_kernel_npu.operators.hyper_conn import mhc_pre_dpskv4
+
+    y, post_mix, comb, pre = mhc_pre_dpskv4(
+        x,
+        hc.fn,
+        hc.scale,
+        hc.base,
+        cfg.mult,
+        cfg.sinkhorn_iters,
+        cfg.eps,
+        cfg.rms_eps,
         pre_mix=apply_pre,
-        hc_mult=cfg.mult,
-        hc_sinkhorn_iters=cfg.sinkhorn_iters,
-        norm_eps=cfg.rms_eps,
-        hc_eps=cfg.eps,
+        return_pre=True,
+        impl="cann_recipes_infer_cann920",
     )
     state.stats = (pre, post_mix, comb)
     return hc.norm(y)
