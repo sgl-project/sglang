@@ -89,7 +89,7 @@ _CASES = [
             },
             "stream": True,
         },
-        "headers": {"x-smg-routing-key": "conv'1"},
+        "headers": {"x-sgl-routing-key": "conv'1"},
         "out": {"text": " world", "output_ids": [1, 2], "meta_info": _META_INFO},
     },
     {
@@ -109,8 +109,7 @@ _CASES = [
             "bootstrap_room": 12345678901234,
             "routing_key": "rk",
             "custom_labels": {"tenant": "a'b"},
-            # Deprecated: Python moves it to `routed_dp_rank`.
-            "data_parallel_rank": 1,
+            "routed_dp_rank": 1,
         },
         "headers": {},
         "out": {
@@ -157,10 +156,9 @@ _CASES = [
             # One room for the batch counts up per item.
             "bootstrap_host": "10.0.0.2",
             "bootstrap_room": 100,
-            # Deprecated: the batch's normalization moves it to `routed_dp_rank`.
-            "data_parallel_rank": 0,
+            "routed_dp_rank": 0,
         },
-        "headers": {"x-smg-routing-key": "k"},
+        "headers": {"x-sgl-routing-key": "k"},
         "out": {"text": "y", "output_ids": [3], "meta_info": {"id": "b1"}},
     },
     {
@@ -265,7 +263,7 @@ _CASES = [
             "text": "ab'" * 690 + "é" * 50,
             "sampling_params": {"stop_token_ids": list(range(2050))},
         },
-        "headers": {"x-smg-routing-key": "k"},
+        "headers": {"x-sgl-routing-key": "k"},
         "out": {
             "text": "x" * 2049,
             "output_ids": list(range(2050)),
@@ -287,12 +285,11 @@ _OPENAI_CASES = [
             "messages": [{"role": "user", "content": "hi 'there'"}],
             "temperature": 0.5,
             "stop": _TRICKY,
-            # Deprecated: the validator copies it to `routed_dp_rank`.
-            "data_parallel_rank": 1,
+            "routed_dp_rank": 1,
             # Not a field: dropped.
             "not_a_field": 1,
         },
-        "headers": {"x-smg-routing-key": "conv'1"},
+        "headers": {"x-sgl-routing-key": "conv'1"},
     },
     {
         # Level 2 cuts the long prompt list and, in the JSON format, the

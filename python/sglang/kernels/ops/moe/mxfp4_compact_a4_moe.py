@@ -3,8 +3,8 @@
 Muse Spark EP8 / EP4 layout: 32 or 64 local experts, top-8 routing, hidden 4096, intermediate 4096, Quark MXFP4
 checkpoint weights (per-32 E8M0 scales) used as stored. For M (a multiple of 8, up to MAX_ROWS) rows:
 
-1. ``_prepare_a4``: per-row MXFP4 quantization of the input (or the caller passes it, ``quantized``);
-2. ``_scatter_a4``: per local expert, place its 16-row blocks after the lower experts' and rank its routes in
+1-2. ``_route_quant_a4``, one launch: per-row MXFP4 quantization of the input (unless the caller passes it,
+   ``quantized``) and, per local expert, its 16-row blocks placed after the lower experts' and its routes ranked in
    token order into them;
 3. ``_expert_a4`` (ACT): gate/up ``dot_scaled`` GEMMs, SiLU-and-mul rounded to BF16, MXFP4 re-quantization;
 4. ``_expert_a4``: down GEMM into unweighted per-(token, slot) BF16 rows.
@@ -23,13 +23,47 @@ import triton.language as tl
 from aiter.ops.triton._triton_kernels.quant.quant import _mxfp4_quant_op
 
 MAX_ROWS = 512
-BLOCK_M = 16  # BM 32 / 64 give wrong rows and are no faster
+BLOCK_M = 16
+# From 384 rows, 32-slot blocks: an expert with 17-32 routes reads its weights once instead of twice (MI355X per
+# layer at M 512: 199.7 -> 180.1 us at 32 local experts, 358.1 -> 328.6 at 64); below, 16 is as fast or faster.
+BLOCK_M_LARGE, LARGE_ROWS = 32, 384
+
+
+@triton.jit
+def _route_quant_a4(
+    IDS,
+    SORTED,
+    EXPERT,
+    X,
+    Q,
+    QS,
+    M: tl.constexpr,
+    START: tl.constexpr,
+    E: tl.constexpr,
+    S: tl.constexpr,
+    PER_E: tl.constexpr,
+    BM: tl.constexpr,
+    NB: tl.constexpr,
+    NBB: tl.constexpr,
+    QUANT: tl.constexpr,
+):
+    # One launch for both: programs [0, E) place the local experts' routes (_scatter_a4), programs E.. quantize the
+    # input rows (_prepare_a4, four 1024-column tiles a row).
+    pid = tl.program_id(0)
+    if pid < E:
+        _scatter_body(IDS, SORTED, EXPERT, pid, M, START, E, S, PER_E, BM, NB, NBB)
+    elif QUANT:
+        _prepare_body(X, Q, QS, pid - E)
 
 
 @triton.jit
 def _prepare_a4(X, Q, QS):
-    # Per-row MXFP4 quantization of the input, four 1024-column tiles per row.
-    pid = tl.program_id(0)
+    # Per-row MXFP4 quantization of the input on its own (the router / pooler tests' reference).
+    _prepare_body(X, Q, QS, tl.program_id(0))
+
+
+@triton.jit
+def _prepare_body(X, Q, QS, pid):
     row = pid // 4
     tile = pid % 4
     col = tile * 1024 + tl.arange(0, 1024)
@@ -42,37 +76,38 @@ def _prepare_a4(X, Q, QS):
 
 
 @triton.jit
-def _scatter_a4(
+def _scatter_body(
     IDS,
     SORTED,
     EXPERT,
+    e,
     M: tl.constexpr,
     START: tl.constexpr,
     E: tl.constexpr,
     S: tl.constexpr,
-    CH: tl.constexpr,
     PER_E: tl.constexpr,
     BM: tl.constexpr,
     NB: tl.constexpr,
     NBB: tl.constexpr,
 ):
-    # One program per local expert. Each counts every local expert's routes and places its blocks after the
-    # lower experts' (fixed block order, nothing to clear between calls); the last also marks the unused tail
-    # blocks (-1). Its routes are ranked in token order into its blocks (sentinel M*8).
-    e = tl.program_id(0)
+    # Local expert e (one program each). Counts every local expert's routes and places its blocks after the lower
+    # experts' (fixed block order, nothing to clear between calls); the last also marks the unused tail blocks (-1).
+    # Its routes are ranked in token order into its blocks (sentinel M*8).
     ee = tl.arange(0, E)
-    counts = tl.zeros((E,), tl.int32)
-    for c0 in tl.static_range(0, S, CH):
-        sc = c0 + tl.arange(0, CH)
-        idc = tl.load(IDS + sc, sc < M * 8, other=-1)
-        counts += tl.sum(((idc[:, None] - START) == ee[None, :]).to(tl.int32), axis=0)
+    s = tl.arange(0, S)
+    ids = tl.load(IDS + s, s < M * 8, other=-1)
+    rel = ids - START
+    # bin E takes the other ranks' experts and the padding (MI355X, 512 rows: 16.1 -> 8.5 us per launch)
+    counts = tl.histogram(tl.where((rel >= 0) & (rel < E), rel, E), 2 * E)
+    counts = tl.sum(
+        tl.where(tl.arange(0, 2 * E)[:, None] == ee[None, :], counts[:, None], 0),
+        axis=0,
+    )
     blocks_all = (counts + BM - 1) // BM
     first = tl.sum(tl.where(ee < e, blocks_all, 0), axis=0)
     if e == E - 1:
         b = tl.arange(0, NBB)
         tl.store(EXPERT + b, -1, (b >= tl.sum(blocks_all, axis=0)) & (b < NB))
-    s = tl.arange(0, S)
-    ids = tl.load(IDS + s, s < M * 8, other=-1)
     hit = (ids == START + e) & (s < M * 8)
     count = tl.sum(hit.to(tl.int32), axis=0)
     blocks = tl.cdiv(count, BM)
@@ -91,7 +126,8 @@ def _scatter_a4(
 def _load_w(W, n0, k0, BN: tl.constexpr, KB: tl.constexpr, SHUF: tl.constexpr):
     """[KB bytes, BN rows] tile of one expert's [N, 2048] packed E2M1 rows from row n0, byte k0. Preshuffled layout:
     [N/16, 2048/16, 16 rows, 16 bytes] (aiter shuffle_weight (16, 16) and shuffle_weight_a16w4 (16) agree on it for
-    K 2048), loaded as whole contiguous 16-row groups and permuted in registers."""
+    K 2048), loaded as whole contiguous 16-row groups and permuted in registers. Streamed past the caches (.cs): each
+    expert's weights are read once per call (MI355X, 32 local experts: 171.5 -> 156.4 us at M 512)."""
     if SHUF:
         g = tl.arange(0, BN // 16)
         kc = tl.arange(0, KB // 16)
@@ -103,11 +139,11 @@ def _load_w(W, n0, k0, BN: tl.constexpr, KB: tl.constexpr, SHUF: tl.constexpr):
             + (r * 16)[None, None, :, None]
             + b[None, None, None, :]
         )
-        x = tl.permute(tl.load(W + offset), (1, 3, 0, 2))
+        x = tl.permute(tl.load(W + offset, cache_modifier=".cs"), (1, 3, 0, 2))
         return tl.reshape(x, (KB, BN))
     n = n0 + tl.arange(0, BN)
     k = k0 + tl.arange(0, KB)
-    return tl.load(W + n[None, :] * 2048 + k[:, None])
+    return tl.load(W + n[None, :] * 2048 + k[:, None], cache_modifier=".cs")
 
 
 @triton.jit
@@ -222,7 +258,17 @@ def compact_a4_applies(m: int, h: int, w13, w2, s13, s2) -> bool:
 
 
 def compact_a4_experts(
-    x, ids, w13, w2, s13, s2, *, local_start, shuffled=False, quantized=None
+    x,
+    ids,
+    w13,
+    w2,
+    s13,
+    s2,
+    *,
+    local_start,
+    shuffled=False,
+    quantized=None,
+    block_m=None,
 ):
     """Per-(token, slot) expert outputs BF16 [M * 8, 4096] for the 32 or 64 local experts starting at ``local_start``.
 
@@ -238,7 +284,10 @@ def compact_a4_experts(
             f"A4 requires M a multiple of 8 up to {MAX_ROWS}, local32 / local64 MXFP4 expert weights"
         )
     dev = ids.device
-    bm, e_local = BLOCK_M, w13.shape[0]
+    bm, e_local = (
+        block_m or (BLOCK_M_LARGE if m >= LARGE_ROWS else BLOCK_M),
+        w13.shape[0],
+    )
     rows, cap = m * 8, m * 8 + e_local * (bm - 1)
     nb = triton.cdiv(cap, bm)
     sid = torch.empty(cap, device=dev, dtype=torch.int32)
@@ -253,26 +302,30 @@ def compact_a4_experts(
     if quantized is None:
         q = torch.empty((m, 2048), device=dev, dtype=torch.uint8)
         qs = torch.empty((m, 128), device=dev, dtype=torch.uint8)
-        _prepare_a4[(m * 4,)](x, q, qs, num_warps=4)
     else:
         q, qs = quantized
-    _scatter_a4[(e_local,)](
+    _route_quant_a4[(e_local + (m * 4 if quantized is None else 0),)](
         ids,
         sid,
         eid,
+        x,
+        q,
+        qs,
         m,
         local_start,
         e_local,
         s_pow2,
-        min(s_pow2, 256),
         per_e,
         bm,
         nb,
         triton.next_power_of_2(nb),
+        quantized is None,
         num_warps=4,
     )
-    grid = (4096 // 64, nb)
-    options = dict(num_warps=4, num_stages=2, matrix_instr_nonkdim=16)
+    # one request's verify (8 rows): narrower programs, twice as many over the few touched experts
+    bn = 32 if m <= 8 else 64
+    grid = (4096 // bn, nb)
+    options = dict(num_warps=2 if m <= 8 else 4, num_stages=2, matrix_instr_nonkdim=16)
     _expert_a4[grid](
         q,
         qs,
@@ -283,7 +336,7 @@ def compact_a4_experts(
         inter,
         inter_scale,
         rows,
-        64,
+        bn,
         512,
         True,
         bm,
@@ -300,7 +353,7 @@ def compact_a4_experts(
         y,
         y,
         rows,
-        64,
+        bn,
         512,
         False,
         bm,

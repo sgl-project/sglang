@@ -47,8 +47,6 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: status.hostIP
-          - name: INSTALL_SGLANG_FROM_SOURCE
-            value: "{{ install_sglang_from_source }}"
           - name: KUBECONFIG
             value: "{{ kube_config }}"
           - name: NAMESPACE
@@ -172,8 +170,6 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: status.hostIP
-          - name: INSTALL_SGLANG_FROM_SOURCE
-            value: "{{ install_sglang_from_source }}"
           - name: KUBECONFIG
             value: "{{ kube_config }}"
           - name: NAMESPACE
@@ -272,7 +268,7 @@ spec:
           accelerator-type: module-a3-16
           {% endif %}
         restartPolicy: OnFailure
-  - name: "sglang-router"
+  - name: "sgl-router"
     replicas: {{ router_size }}
     template:
       metadata:
@@ -297,8 +293,6 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: status.hostIP
-          - name: INSTALL_SGLANG_FROM_SOURCE
-            value: "{{ install_sglang_from_source }}"
           - name: METRICS_DATA_FILE
             value: "{{ metrics_data_file }}"
           - name: NPU_ACCURACY_DATASET

@@ -62,9 +62,9 @@ import time
 
 import httpx
 import pytest
-from infra.gateway import Gateway
 from infra.model_pool import spawn_worker
 from infra.model_specs import get_model_spec
+from infra.router import Router
 
 # Device KV pool, in tokens. Small enough that the filler prompts below evict
 # the primed prefix within seconds, large enough to hold several requests at
@@ -370,7 +370,7 @@ def test_repeat_returns_to_the_host_tier_owner(
                 enable_kv_events=True,
                 extra_args=worker_args(write_policy),
             ) as worker_b,
-            Gateway() as router,
+            Router() as router,
         ):
             worker_urls = [worker_a.url, worker_b.url]
             router.start_regular(
