@@ -8,6 +8,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.environ import InvariantCheckLevel, envs
 from sglang.srt.mem_cache.kv.alloc import band as band_module
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -49,7 +50,8 @@ def _cuda(values):
 
 class _Step:
     """One scheduling step's allocator calls on a two-request batch: extend,
-    decode, a window's tail-only extend, window retirement and release."""
+    decode, a window's tail-only extend, window retirement, a fresh request's
+    state clear and release."""
 
     def __init__(self, allocator):
         self.allocator = allocator
@@ -71,6 +73,10 @@ class _Step:
         self.tail_prefix = torch.zeros(1, dtype=torch.int64)
         self.tail_prefix_d = _cuda([0])
         self.tail_last = _cuda([-1])
+        if self.has_state:
+            name = allocator.mamba_allocator.sub_pool_name
+            first = allocator.arena.first_entry(name)
+            self.state_entries = _cuda([first, first + 1])
 
     def extend(self):
         self.out = self.allocator.alloc_extend(
@@ -99,7 +105,9 @@ class _Step:
             self.tail_seq,
             self.tail_last,
             tokens,
-            swa_tail_len=PAGE_SIZE + 1,
+            window_tail_lens=dict.fromkeys(
+                self.allocator.window_pool_names(), PAGE_SIZE + 1
+            ),
         )
 
     def retire_window(self):
@@ -123,6 +131,9 @@ class _Step:
         slots = self.allocator.alloc_state_slots(2)
         assert slots is not None
         self.allocator.mamba_allocator.free(slots)
+
+    def clear_state(self):
+        self.allocator.state.pool.clear_slots(self.state_entries)
 
 
 class TestUnifiedSchedulingNoHostSync(CustomTestCase):
@@ -150,6 +161,7 @@ class TestUnifiedSchedulingNoHostSync(CustomTestCase):
             errors["decode"] = check(lambda: decoded.append(decode()))
             if step.has_state:
                 errors["state slots"] = check(step.state_slots)
+                errors["state clear"] = check(step.clear_state)
             if step.has_window:
                 tail = []
                 errors["window tail extend"] = check(
@@ -167,6 +179,33 @@ class TestUnifiedSchedulingNoHostSync(CustomTestCase):
             with self.subTest(chain=chain):
                 errors = self._run(_Step(self._allocator(chain)))
                 self.assertEqual(errors, {}, f"{chain} synchronized: {errors}")
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_a_checked_state_copy_does_not_synchronize(self):
+        """A prefill's copy-on-write of prefix-hit states with invariant checks
+        on: 32 pairs, several of them copying one cached source."""
+        setup_allocator_context()
+        allocator = build_unified_bundle(
+            UnifiedGeometry(
+                **CHAINS["full+state"],
+                page_size=PAGE_SIZE,
+                full_tokens=64 * PAGE_SIZE,
+                swa_tokens=64 * PAGE_SIZE,
+                state_slots=40,
+                device="cuda",
+            )
+        ).token_to_kv_pool_allocator
+        name = allocator.mamba_allocator.sub_pool_name
+        self.assertGreaterEqual(allocator.arena.num_entries(name), 36)
+        first = allocator.arena.first_entry(name)
+        src = torch.tensor(
+            [first + i % 4 for i in range(32)], dtype=torch.int32, device="cuda"
+        )
+        dst = torch.arange(first + 4, first + 36, dtype=torch.int32, device="cuda")
+        pool = allocator.state.pool
+        with envs.SGLANG_INVARIANT_CHECK.override(int(InvariantCheckLevel.WARN)):
+            pool.copy_from(src, dst)
+            self.assertIsNone(_sync_error(lambda: pool.copy_from(src, dst)))
 
 
 class TestNoHostReadAfterAStreamWait(CustomTestCase):
@@ -291,6 +330,152 @@ class TestNoHostReadAfterAStreamWait(CustomTestCase):
         self.assertIsNone(self._step(0, armed=False))
         error = self._step(2_000_000_000, armed=True)
         self.assertIsNone(error, f"a host read followed a stream wait: {error}")
+
+
+class TestAStateTakeLeavesAFencedOwnerUnread(CustomTestCase):
+    """A state-slot take that reuses slots freed under the running forward
+    waits that forward on the stream. A fence in the owner's span orders only
+    the owner's takes: the state take must not read the owner's free or
+    pending pages on the host, which would park the scheduler until the
+    forward ends."""
+
+    def _take(self, sleep_cycles: int, armed: bool):
+        """Free two state slots and some owner rows under a forward running
+        ``sleep_cycles`` late, fence a page of the owner's span, then take two
+        slots again. Returns the error a host sync raised (with ``armed``),
+        and whether the forward was still running after the take."""
+        setup_allocator_context()
+        allocator = build_unified_bundle(
+            UnifiedGeometry(
+                **CHAINS["full+state"],
+                page_size=PAGE_SIZE,
+                full_tokens=16 * PAGE_SIZE,
+                device="cuda",
+            )
+        ).token_to_kv_pool_allocator
+        owner, state = allocator.full_attn_allocator, allocator.mamba_allocator
+        rows = allocator.alloc(8 * PAGE_SIZE)
+        slots = allocator.alloc_state_slots(2)
+        self.assertIsNotNone(rows)
+        self.assertIsNotNone(slots)
+        done = torch.cuda.Event()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(sleep_cycles)
+            done.record(stream)
+        steps = allocator.forward_steps
+        steps.forward_launched()
+        steps.forward_recorded(done)
+        allocator.set_latest_forward_done_event(done)
+        allocator.set_inflight_forward(done, rows, slots)
+        allocator.free(rows[4 * PAGE_SIZE :])
+        state.free(slots)
+        self.assertTrue(owner._pending_until_retire)
+        self.assertTrue(state._pending_until_retire)
+        page = owner._span_range()[0]
+        owner.usage.vacate(
+            done, [(page, page + 1)], page_bytes=owner.entry_bytes_per_page
+        )
+        self.assertTrue(owner._fence_may_order_takes())
+        self.assertFalse(state._fence_may_order_takes())
+        error = None
+        if armed:
+            torch.cuda.set_sync_debug_mode("error")
+        try:
+            taken = allocator.alloc_state_slots(2)
+        except RuntimeError as exc:
+            error = exc
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        running = not done.query()
+        torch.cuda.synchronize()
+        if error is None:
+            self.assertIsNotNone(taken)
+        return error, running
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_the_take_reads_nothing_of_the_owner(self):
+        # Load every kernel and pinned buffer the path uses first.
+        self.assertIsNone(self._take(0, armed=False)[0])
+        error, running = self._take(2_000_000_000, armed=True)
+        self.assertIsNone(error, f"the state take read the host: {error}")
+        # Sync debug does not see an event wait on the host; this does.
+        self.assertTrue(running, "the state take waited for the forward")
+
+
+class TestAReliefReadsNothing(CustomTestCase):
+    """A state slot that needs the owner packed first, with the owner's freed
+    rows still pending under the running forward: the owner is packed on the
+    device behind that forward, so the relief neither reads a page id on the
+    host nor waits for the forward there."""
+
+    def _relieve(self, sleep_cycles: int, armed: bool):
+        """Fill the owner up to the state end, free its rows but the first
+        and last page under a forward running ``sleep_cycles`` late, then take
+        one state slot. Returns the error a host sync raised (with
+        ``armed``), whether the forward was still running after the take, and
+        the bands packed on the device."""
+        setup_allocator_context()
+        allocator = build_unified_bundle(
+            UnifiedGeometry(
+                **CHAINS["full+state"],
+                page_size=PAGE_SIZE,
+                full_tokens=64 * PAGE_SIZE,
+                device="cuda",
+            )
+        ).token_to_kv_pool_allocator
+        owner, state = allocator.full_attn_allocator, allocator.mamba_allocator
+        rows = allocator.alloc(owner.available_size())
+        self.assertIsNotNone(rows)
+        self.assertFalse(allocator.state_slots_fit(1))
+        done = torch.cuda.Event()
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            torch.cuda._sleep(sleep_cycles)
+            done.record(stream)
+        steps = allocator.forward_steps
+        steps.forward_launched()
+        steps.forward_recorded(done)
+        allocator.set_latest_forward_done_event(done)
+        allocator.set_inflight_forward(done, rows, None)
+        allocator.free(rows[PAGE_SIZE:-PAGE_SIZE])
+        self.assertTrue(owner._pending_until_retire)
+        packed = []
+        real = band_module.Band.pack_on_device
+
+        def counting(band):
+            packed.append(band.sub_pool_name)
+            real(band)
+
+        error = None
+        if armed:
+            torch.cuda.set_sync_debug_mode("error")
+        try:
+            with mock.patch.object(band_module.Band, "pack_on_device", counting):
+                slot = allocator.alloc_state_slots(1)
+        except RuntimeError as exc:
+            error = exc
+        finally:
+            torch.cuda.set_sync_debug_mode("default")
+        running = not done.query()
+        torch.cuda.synchronize()
+        if error is None:
+            self.assertIsNotNone(slot)
+            self.assertEqual(allocator.verify_byte_accounting(), [])
+        return error, running, packed, owner.sub_pool_name
+
+    @unittest.skipUnless(torch.cuda.is_available(), "CUDA required")
+    def test_the_owner_packs_on_the_device(self):
+        # Load every kernel and pinned buffer the path uses first.
+        error, _, packed, owner = self._relieve(0, armed=False)
+        self.assertIsNone(error)
+        self.assertEqual(packed, [owner])
+        error, running, _, _ = self._relieve(2_000_000_000, armed=True)
+        self.assertIsNone(error, f"the relief read the host: {error}")
+        # Sync debug does not see an event wait on the host; this does.
+        self.assertTrue(running, "the relief waited for the forward")
 
 
 if __name__ == "__main__":

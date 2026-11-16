@@ -456,5 +456,68 @@ class TestWeightOnlyFp4BackendSelection(CustomTestCase):
             )
 
 
+class TestW4A4Fp4ApplyWeights(CustomTestCase):
+    """CompressedTensorsW4A4Fp4.apply_weights with the FP4 quant and GEMM faked
+    by shape: the activation it quantizes, the pre-quantized input it takes
+    from the fused SiLU-and-mul + NVFP4 quant, and the output shape."""
+
+    W_N, K = 24, 64
+
+    def _layer(self, accepts_prequantized=False):
+        return SimpleNamespace(
+            weight_packed=torch.zeros(self.W_N, self.K // 2, dtype=torch.uint8),
+            weight_scale=torch.zeros(self.W_N, self.K // 16, dtype=torch.float8_e4m3fn),
+            alpha=torch.ones(1, dtype=torch.float32),
+            input_global_scale=torch.ones(1),
+            params_dtype=torch.bfloat16,
+            _accepts_prequantized_fp4=accepts_prequantized,
+        )
+
+    def _apply(self, layer, x):
+        from sglang.srt.layers.quantization.compressed_tensors.schemes import (
+            compressed_tensors_w4a4_nvfp4 as scheme_module,
+        )
+
+        self.quantized, self.gemm_inputs = [], []
+
+        def fp4_quantize(x, global_scale):
+            self.quantized.append(tuple(x.shape))
+            return (
+                torch.zeros(x.shape[0], x.shape[1] // 2, dtype=torch.uint8),
+                torch.zeros(x.shape[0], x.shape[1] // 16, dtype=torch.uint8),
+            )
+
+        def fp4_gemm(x_fp4, w, x_sf, w_sf, alpha, out_dtype, n):
+            self.gemm_inputs.append(x_fp4)
+            return torch.zeros(x_fp4.shape[0], n, dtype=out_dtype)
+
+        with (
+            mock.patch.object(scheme_module, "fp4_quantize", fp4_quantize),
+            mock.patch.object(scheme_module, "fp4_gemm", fp4_gemm),
+            mock.patch.object(scheme_module, "enable_flashinfer_fp4_gemm", False),
+        ):
+            return CompressedTensorsW4A4Fp4().apply_weights(layer, x)
+
+    def test_activation_is_quantized(self):
+        out = self._apply(self._layer(), torch.zeros(5, self.K, dtype=torch.float16))
+        self.assertEqual(self.quantized, [(5, self.K)])
+        self.assertEqual((out.shape, out.dtype), ((5, self.W_N), torch.float16))
+
+    def test_leading_dims_are_flattened_then_restored(self):
+        out = self._apply(
+            self._layer(), torch.zeros(2, 3, self.K, dtype=torch.bfloat16)
+        )
+        self.assertEqual(self.quantized, [(6, self.K)])
+        self.assertEqual(out.shape, (2, 3, self.W_N))
+
+    def test_prequantized_input_skips_the_quant(self):
+        x_fp4 = torch.zeros(7, self.K // 2, dtype=torch.uint8)
+        x_sf = torch.zeros(128, self.K // 16, dtype=torch.uint8)
+        out = self._apply(self._layer(accepts_prequantized=True), (x_fp4, x_sf))
+        self.assertEqual(self.quantized, [])
+        self.assertIs(self.gemm_inputs[0], x_fp4)
+        self.assertEqual((out.shape, out.dtype), ((7, self.W_N), torch.bfloat16))
+
+
 if __name__ == "__main__":
     unittest.main()

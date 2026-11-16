@@ -4,13 +4,14 @@
 
 #pragma once
 
-#include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
-#include <sgl_kernel/utils.h>   // For RuntimeCheck, div_ceil
+#include <sgl_kernel/tensor.h>
+#include <sgl_kernel/utils.h>
 
-#include <sgl_kernel/type.cuh>   // For dtype_trait, bf16_t, fp32_t, cast
-#include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE, PDL helpers
-#include <sgl_kernel/vec.cuh>    // For AlignedVector
-#include <sgl_kernel/warp.cuh>   // For warp::inclusive_sum, reduce_sum
+#include <sgl_kernel/activation.cuh>
+#include <sgl_kernel/type.cuh>
+#include <sgl_kernel/utils.cuh>
+#include <sgl_kernel/vec.cuh>
+#include <sgl_kernel/warp.cuh>
 
 #include <tvm/ffi/container/tensor.h>
 
@@ -40,12 +41,6 @@ SGL_DEVICE uint32_t biased_to_key(float biased) {
   if (biased == 0.0f) biased = 0.0f;
   uint32_t u = __float_as_uint(biased);
   return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
-}
-
-// tl.sigmoid(x) = 1/(1+exp(-x)). Must stay instruction-identical to v1's
-// sigmoid_match so both kernels rank (and weight) identically.
-SGL_DEVICE float sigmoid_match(float x) {
-  return __fdividef(1.0f, 1.0f + __expf(-x));
 }
 
 SGL_DEVICE float nan_floor(float x) {
@@ -157,7 +152,7 @@ SGL_DEVICE void route_radix_block(const RouteRadixParams& params, typename Large
         xy = cast<fp32x2_t>(scores_vec[i]);
       }
       const auto [x, y] = xy;
-      const auto sx = moe::radix::sigmoid_match(x), sy = moe::radix::sigmoid_match(y);
+      const auto sx = activation::sigmoid(x), sy = activation::sigmoid(y);
       keys[2 * i + 0] = moe::radix::biased_to_key(moe::radix::nan_floor(sx + bias_vec[i].x));
       keys[2 * i + 1] = moe::radix::biased_to_key(moe::radix::nan_floor(sy + bias_vec[i].y));
       act[2 * i + 0] = sx;
@@ -413,8 +408,8 @@ SGL_DEVICE void fgt_select_topk(
     }
 #pragma unroll
     for (uint32_t i = 0; i < kVecSize / 2; ++i) {
-      const float sx = moe::radix::sigmoid_match(logit[2 * i + 0]);
-      const float sy = moe::radix::sigmoid_match(logit[2 * i + 1]);
+      const float sx = device::activation::sigmoid(logit[2 * i + 0]);
+      const float sy = device::activation::sigmoid(logit[2 * i + 1]);
       act[2 * i + 0] = sx;
       act[2 * i + 1] = sy;
       keys[2 * i + 0] = moe::radix::biased_to_key(moe::radix::nan_floor(sx + bias_vec[i].x));

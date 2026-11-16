@@ -524,7 +524,7 @@ sgl-eval run gsm8k \\
       commands: { python: command } };
   },
 
-  npuRouterCommand: "python3 -m sglang_router.launch_router \\\n  --pd-disaggregation \\\n  --prefill http://<prefill-head-ip>:30000 8998 \\\n  --decode http://<decode-head-ip>:30100 \\\n  --host {{HOST_IP}} --port {{PORT}} \\\n  --policy round_robin \\\n  --worker-startup-timeout-secs 3600 \\\n  --request-timeout-secs 7200 \\\n  --disable-retries",
+  npuRouterCommand: "sgl-router \\\n  --model-id GLM-5.3-Flash \\\n  --no-tokenizer \\\n  --worker-urls http://<prefill-head-ip>:30000 http://<decode-head-ip>:30100 \\\n  --host {{HOST_IP}} --port {{PORT}} \\\n  --policy round_robin \\\n  --request-timeout-secs 7200 \\\n  --stale-request-timeout-secs 7200",
 
   npuPdRecipes: [
     {
@@ -905,6 +905,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend flashinfer_trtllm",
+        "--mamba-full-memory-ratio 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -985,6 +986,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend flashinfer_trtllm",
+        "--mamba-full-memory-ratio 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1155,6 +1157,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend flashinfer_trtllm",
+        "--mamba-full-memory-ratio 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1296,6 +1299,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
+        "--mamba-full-memory-ratio 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1345,6 +1349,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend tilelang",
         "--kv-cache-dtype bfloat16",
         "--moe-runner-backend deep_gemm",
+        "--mamba-full-memory-ratio 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
@@ -1441,6 +1446,7 @@ sgl-eval run gsm8k \\
         "--dsa-decode-backend trtllm",
         "--kv-cache-dtype fp8_e4m3",
         "--moe-runner-backend flashinfer_trtllm",
+        "--mamba-full-memory-ratio 0.9",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
