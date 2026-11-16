@@ -62,20 +62,18 @@ A pragmatic workaround is to guard the metadata access in Inductor's Triton heur
 
 ### Resolving Dependencies for Distributed Inference
 
-#### sgl-model-gateway
+#### sgl-router
 
-Install sgl-model-gateway as follows:
+PD disaggregation puts the `sgl-router` binary in front of the prefill and decode servers. Build it from the sglang checkout with the Rust toolchain it pins:
 
 ```
-$ apt install openssl libssl-dev protobuf
-$ export PATH="/$HOME/.cargo/bin:${PATH}" \
-  && curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
-  && rustc --version && cargo --version # Prepare for a rust toolchain
-$ python3 -m pip install --no-cache-dir setuptools-rust \
-  && cd /sgl-workspace/sglang/sgl-model-gateway/bindings/python \
-  && cargo build --release \
-  && python3 -m pip install --no-cache-dir . \
-  && rm -rf /root/.cache # Build and install sgl-model-gateway
+$ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y \
+  && export PATH="$HOME/.cargo/bin:${PATH}" # Prepare for a rust toolchain
+$ cd /sgl-workspace/sglang/sgl-router \
+  && rustup toolchain install \
+  && cargo build --locked --release --bin sgl-router \
+  && install -m 0755 target/release/sgl-router /usr/local/bin/sgl-router
+$ sgl-router --model-id <served model name> --worker-urls <prefill url> <decode url> --no-tokenizer
 ```
 
 #### [Mori](https://github.com/sgl-project/sglang/blob/main/docker/rocm.Dockerfile#L381)

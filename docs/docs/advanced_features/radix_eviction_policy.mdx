@@ -16,7 +16,7 @@ A policy only scores. It does not decide how much to free, and it cannot pin KV 
 
 ## Available policies
 
-Select one with `--radix-eviction-policy`. All of them fall back to least-recently-used order within a tie.
+Select one with `--radix-eviction-policy`; the default is `lru`. All of them fall back to least-recently-used order within a tie, except the recurrent-state order of `state_cost`, which breaks ties by node.
 
 | Policy | Evicts first | Use when |
 |---|---|---|
@@ -25,6 +25,7 @@ Select one with `--radix-eviction-policy`. All of them fall back to least-recent
 | `slru` | Prefixes still in the probationary segment, then the least recent within a segment. | Like `lfu`, but you want a hard floor on how much a one-off prefix can displace a proven one. See [`slru` parameters](#slru-parameters). |
 | `priority` | The prefix belonging to the lowest-priority request, then the least recent. | You run [priority scheduling](/docs/advanced_features/server_arguments) and want cache retention to follow the same ranking as admission. |
 | `tlru` | The tail of a conversation beyond what its next prefill needs to meet the TTFT budget ("TEL-safe" tokens), then the least recent. | Agentic / multi-turn workloads where tail TTFT matters more than raw hit rate. See [`tlru` parameters](#tlru-parameters). Requires the unified radix cache (the default tree). |
+| `state_cost` | On hybrid recurrent models (linear attention or Mamba layers), the cached recurrent-state checkpoint with the lowest priority: last use plus the prefill it would take to rebuild it. | Agentic workloads on hybrid models, where checkpoints leave the state pool while their KV stays cached. See [`state_cost` parameters](#state_cost-parameters). Full KV stays in recency order; on other models it acts as `lru`. Rejects `--enable-session-radix-cache` on hybrid models. |
 | `joint_lru` | The least recent of the full-attention and SWA KV, ranked in one shared order. | Full/SWA hybrid models with `--enable-unified-memory` on the unified radix cache (the default tree), where both kinds of KV share one byte buffer; there it rejects `--enable-session-radix-cache` and tree cores without the joint walk. Elsewhere it acts as `lru`. |
 
 Notes on the scoring inputs:
@@ -53,7 +54,7 @@ TypeError: SLRUStrategy.__init__() got an unexpected keyword argument 'protected
 
 ### Policy parameters
 
-`slru` and `tlru` take parameters. `lru`, `joint_lru`, `lfu`, and `priority` take none, so `--radix-eviction-policy-config` has no effect with them and any key is an error.
+`slru`, `tlru`, and `state_cost` take parameters. `lru`, `joint_lru`, `lfu`, and `priority` take none, so `--radix-eviction-policy-config` has no effect with them and any key is an error.
 
 #### `slru` parameters
 
@@ -64,6 +65,17 @@ TypeError: SLRUStrategy.__init__() got an unexpected keyword argument 'protected
 | `protected_threshold` | int | `2` | Hit count at which a prefix is promoted to the protected segment. |
 
 Raising it makes promotion harder, so the protected set stays small and closer to your genuinely hot prefixes; a prefix hit three times stays probationary at `4` but is protected at the default `2`. Lowering it to `1` promotes any prefix that is reused even once, which approaches `lru` with a one-hit grace period.
+
+#### `state_cost` parameters
+
+`state_cost` is a state-only, cost-based eviction order for recurrent-state checkpoints, inspired by FlashStates ([paper](https://www.alphaxiv.org/abs/2611.flashstate), [code](https://github.com/FutureMLS-Lab/FlashStates), [project page](https://flashstates.ai)). Full KV stays in recency order. A checkpoint's priority is the eviction watermark at its last use plus the prefill it saves: the cost of rebuilding it from the nearest shallower checkpoint, or from the start of the prompt when there is none. The lowest priority goes first, and the watermark rises to each victim's priority, so a checkpoint nobody resumes ages out.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `d` | `1.862e-5` | Prefill seconds per token, the linear term of the cost from token `a` to `b`: `d * (b - a) + e * (b^2 - a^2) / 2e5`. |
+| `e` | `3.33e-6` | Prefill seconds per token per 100,000 tokens of context, the context-length term. |
+
+Only the ratio of `d` to `e` affects the order. The defaults are the GLM-5.3-Flash prefill-time fit published by FlashStates ([paper](https://www.alphaxiv.org/abs/2611.flashstate), [code](https://github.com/FutureMLS-Lab/FlashStates), [project page](https://flashstates.ai)); fit your own for other models.
 
 #### `tlru` parameters
 

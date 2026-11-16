@@ -147,18 +147,11 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        # `inputs` is empty on pull_request events, so fall back explicitly to
-        # the ROCm 10 PR default. Reusable callers can request another variant.
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ inputs.rocm_version || 'rocm10' }}
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+      # `inputs` is empty on pull_request events, so fall back explicitly to
+      # the ROCm 10 PR default. Reusable callers can request another variant.
+      - uses: ./.github/actions/setup-amd-ci
+        with:
+          rocm_version: ${{ inputs.rocm_version || 'rocm10' }}
 
       - name: Run test
         timeout-minutes: 75
@@ -184,16 +177,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ inputs.rocm_version || 'rocm10' }}
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+      - uses: ./.github/actions/setup-amd-ci
+        with:
+          rocm_version: ${{ inputs.rocm_version || 'rocm10' }}
 
       - name: Run test
         timeout-minutes: 60
@@ -219,19 +205,10 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
-      # Cache-only: no sgl-router-build here. amd_ci_exec.sh maps the path into the container.
-      - uses: ./.github/actions/download-sgl-router
-
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ inputs.rocm_version || 'rocm10' }}
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+      - uses: ./.github/actions/setup-amd-ci
+        with:
+          rocm_version: ${{ inputs.rocm_version || 'rocm10' }}
+          sgl_router: true
 
       - name: Run test
         timeout-minutes: 60
@@ -252,16 +229,9 @@ jobs:
         with:
           ref: ${{ inputs.ref || github.sha }}
 
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version ${{ inputs.rocm_version || 'rocm10' }}
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+      - uses: ./.github/actions/setup-amd-ci
+        with:
+          rocm_version: ${{ inputs.rocm_version || 'rocm10' }}
 
       - name: Run test
         timeout-minutes: 60
