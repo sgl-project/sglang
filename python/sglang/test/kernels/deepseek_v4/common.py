@@ -10,14 +10,18 @@ from sglang.kernels.ops.attention.dsv4 import (
     CompressorPrefillPlan,
     compress_forward,
 )
-from sglang.srt.utils import get_device
+from sglang.srt.utils import get_device, is_xpu
+
+_is_xpu = is_xpu()
 
 
 @dataclass
 class LegacyContext:
     """Per-request ring buffer (no req_to_token / full_to_swa).
 
-    `req_pool_indices[i]` directly maps to the request's ring base slot.
+    `req_pool_indices[i]` directly maps to the request's ring base slot: the ring
+    is one compress window wide (8 slots for c4, 128 for c128), so the plans come
+    from the production planner's request-ring mode with `ring_size` = window.
     """
 
     bs: int
@@ -39,26 +43,69 @@ class LegacyContext:
             page = rid
         return page * self.compress_ratio + position % self.compress_ratio
 
+    @property
+    def ring_size(self) -> int:
+        return self.pages_per_req * self.compress_ratio
+
+    def _ring_plan_kwargs(self) -> dict:
+        # The request-ring planner never reads req_to_token / full_to_state, and
+        # `swa_page_size` only has to be a multiple of `ring_size`.
+        device = self.req_pool_indices.device
+        return dict(
+            compress_ratio=self.compress_ratio,
+            req_pool_indices=self.req_pool_indices,
+            req_to_token=torch.zeros((1, 1), dtype=torch.int32, device=device),
+            full_to_state=torch.zeros((1,), dtype=torch.int64, device=device),
+            swa_page_size=self.ring_size,
+            ring_size=self.ring_size,
+            # c128 always uses the request ring; the flag is c4-only.
+            use_req_ring=self.compress_ratio == 4,
+        )
+
     def make_prefill_plan(
         self,
         seq_lens_cpu: torch.Tensor,
         extend_lens_cpu: torch.Tensor,
         num_q_tokens: int,
     ) -> CompressorPrefillPlan:
-        return CompressorPrefillPlan.generate_legacy(
-            compress_ratio=self.compress_ratio,  # type: ignore
-            req_pool_indices=self.req_pool_indices,
+        if _is_xpu:
+            # The XPU plan builder has no request-ring mode; its legacy planner
+            # builds the per-request ring plan directly.
+            from sgl_kernel import plan_compress_prefill_legacy
+
+            # One 16-byte CompressPlan and one 8-byte WritePlan per query token.
+            pin_buffer = torch.empty(
+                num_q_tokens * (16 + 8), dtype=torch.uint8, pin_memory=True
+            )
+            plan_c, plan_w = plan_compress_prefill_legacy(
+                self.req_pool_indices,
+                seq_lens_cpu,
+                extend_lens_cpu,
+                pin_buffer,
+                int(num_q_tokens),
+                int(self.compress_ratio),
+                False,
+            )
+            return CompressorPrefillPlan(
+                self.compress_ratio, plan_c, plan_w, pin_buffer
+            )
+        return CompressorPrefillPlan.generate(
             seq_lens=seq_lens_cpu,
             extend_lens=extend_lens_cpu,
             num_q_tokens=num_q_tokens,
-            device=torch.device(get_device()),
+            **self._ring_plan_kwargs(),
         )
 
     def make_decode_plan(self, seq_lens_gpu: torch.Tensor) -> CompressorDecodePlan:
-        return CompressorDecodePlan.generate_legacy(
-            compress_ratio=self.compress_ratio,  # type: ignore
-            req_pool_indices=self.req_pool_indices,
-            seq_lens=seq_lens_gpu,
+        if _is_xpu:
+            from sgl_kernel import plan_compress_decode_legacy
+
+            plan_d = plan_compress_decode_legacy(
+                self.req_pool_indices, seq_lens_gpu, self.compress_ratio
+            )
+            return CompressorDecodePlan(self.compress_ratio, torch.from_dlpack(plan_d))
+        return CompressorDecodePlan.generate(
+            seq_lens=seq_lens_gpu, **self._ring_plan_kwargs()
         )
 
 

@@ -554,11 +554,41 @@ struct MoeAlignBlockSizeKernel {
       bool pad_sorted_token_ids) {
     using namespace host;
 
-    auto device = topk_ids.device();
-    if constexpr (kWriteInactivePrefixCount) {
-      TensorMatcher({2}).with_dtype<int32_t>().with_device(device).ensure_alignment(8).verify(num_tokens_post_pad);
+    auto device = SymbolicDevice{};
+    device.set_options<kDLGPU>();
+    // topk_ids is read flat, as [num_tokens, topk] or already flattened.
+    if (topk_ids.dim() == 2) {
+      TensorMatcher({-1, -1})  // topk_ids
+          .with_dtype<scalar_t>()
+          .with_device(device)
+          .verify(topk_ids);
+    } else {
+      TensorMatcher({-1})  // topk_ids
+          .with_dtype<scalar_t>()
+          .with_device(device)
+          .verify(topk_ids);
     }
-    const cudaStream_t stream = LaunchKernel::resolve_device(device);
+    TensorMatcher({-1})  // sorted_token_ids, padded with int4 stores
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .ensure_alignment(16)
+        .verify(sorted_token_ids);
+    TensorMatcher({-1})  // expert_ids
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(expert_ids);
+    TensorMatcher({kWriteInactivePrefixCount ? 2 : 1})  // num_tokens_post_pad, the pair is one int2 store
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .ensure_alignment(kWriteInactivePrefixCount ? 8 : 4)
+        .verify(num_tokens_post_pad);
+    TensorMatcher({-1})  // cumsum_buffer
+        .with_dtype<int32_t>()
+        .with_device(device)
+        .verify(cumsum_buffer);
+    CHECK_HOST(cumsum_buffer.size(0) > num_experts)
+        << "moe_align_block_size: cumsum_buffer needs num_experts + 1 entries, got " << cumsum_buffer.size(0);
+    const cudaStream_t stream = LaunchKernel::resolve_device(device.unwrap());
 
     int threads = 1024;
     threads = ((threads + WARP_SIZE - 1) / WARP_SIZE) * WARP_SIZE;

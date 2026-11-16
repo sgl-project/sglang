@@ -31,7 +31,6 @@ def _moe_permute_prepare_out(
     src2dst: torch.Tensor,
     num_experts: int,
     use_int64_offset: bool,
-    is_ep: bool,
 ) -> None:
     module = _jit_moe_permute_prepare_module()
     module.moe_permute_prepare(
@@ -41,7 +40,6 @@ def _moe_permute_prepare_out(
         src2dst,
         num_experts,
         use_int64_offset,
-        is_ep,
     )
 
 
@@ -49,7 +47,6 @@ def moe_permute_prepare(
     topk_ids: torch.Tensor,
     num_experts: int,
     use_int64_offset: bool = False,
-    is_ep: bool = False,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     if topk_ids.dtype != torch.int32:
         raise TypeError(f"topk_ids must be int32, got {topk_ids.dtype}")
@@ -72,6 +69,5 @@ def moe_permute_prepare(
         src2dst,
         num_experts,
         use_int64_offset,
-        is_ep,
     )
     return expert_offsets, src2dst

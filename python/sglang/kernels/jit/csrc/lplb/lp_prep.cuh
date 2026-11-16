@@ -18,9 +18,12 @@
 //
 // Single-block launch. All intermediate state lives in shared memory.
 
+#pragma once
+
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <dlpack/dlpack.h>
@@ -146,27 +149,49 @@ void lp_prep(
     tvm::ffi::TensorView A_base_row_sum) {
   using namespace host;
 
-  SymbolicDevice device_;
-  TensorMatcher({NC, NV}).with_dtype<float>().with_device<kDLGPU>(device_).verify(A_full);
-  TensorMatcher({NC}).with_dtype<float>().with_device<kDLGPU>(device_).verify(b);
-  TensorMatcher({NUM_SINGLE}).with_dtype<float>().with_device<kDLGPU>(device_).verify(t1);
-  TensorMatcher({NUM_SINGLE}).with_dtype<int64_t>().with_device<kDLGPU>(device_).verify(log_single);
-  TensorMatcher({NUM_RED_LOG}).with_dtype<int64_t>().with_device<kDLGPU>(device_).verify(log_replicated);
-  TensorMatcher({NUM_GPUS, NUM_SINGLE}).with_dtype<float>().with_device<kDLGPU>(device_).verify(B1);
-  TensorMatcher({NC}).with_dtype<float>().with_device<kDLGPU>(device_).verify(A_base_row_sum);
+  auto device_ = SymbolicDevice{};
+  device_.set_options<kDLGPU>();
+  TensorMatcher({NC, NV})  // A_full
+      .with_dtype<float>()
+      .with_device(device_)
+      .verify(A_full);
+  TensorMatcher({NC})  // b
+      .with_dtype<float>()
+      .with_device(device_)
+      .verify(b);
+  TensorMatcher({NUM_SINGLE})  // t1
+      .with_dtype<float>()
+      .with_device(device_)
+      .verify(t1);
+  TensorMatcher({-1})  // global_counts, gathered through log_single / log_replicated
+      .with_dtype<float>()
+      .with_device(device_)
+      .verify(global_counts);
+  TensorMatcher({NUM_SINGLE})  // log_single
+      .with_dtype<int64_t>()
+      .with_device(device_)
+      .verify(log_single);
+  TensorMatcher({NUM_RED_LOG})  // log_replicated
+      .with_dtype<int64_t>()
+      .with_device(device_)
+      .verify(log_replicated);
+  TensorMatcher({NUM_GPUS, NUM_SINGLE})  // B1
+      .with_dtype<float>()
+      .with_device(device_)
+      .verify(B1);
+  TensorMatcher({NC})  // A_base_row_sum
+      .with_dtype<float>()
+      .with_device(device_)
+      .verify(A_base_row_sum);
 
   constexpr int WARPS_PER_BLOCK = BLOCK_DIM / 32;
   const size_t smem_bytes = (NUM_SINGLE + NUM_RED_LOG + WARPS_PER_BLOCK + 1) * sizeof(float);
 
-  using KernelT =
-      void (*)(float*, float*, float*, const float*, const int64_t*, const int64_t*, const float*, const float*);
-  KernelT kernel = lp_prep_kernel<NC, NV, NUM_SINGLE, NUM_RED_LOG, NUM_GPUS, BLOCK_DIM>;
-
+  constexpr auto kernel = lp_prep_kernel<NC, NV, NUM_SINGLE, NUM_RED_LOG, NUM_GPUS, BLOCK_DIM>;
+  const auto device = device_.unwrap();
   if (smem_bytes > 48 * 1024) {
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
+    runtime::set_max_dynamic_smem_per_device<kernel>(device, smem_bytes);
   }
-
-  const DLDevice device = device_.unwrap();
   LaunchKernel(/*grid=*/1, /*block=*/BLOCK_DIM, device, smem_bytes)(
       kernel,
       static_cast<float*>(A_full.data_ptr()),

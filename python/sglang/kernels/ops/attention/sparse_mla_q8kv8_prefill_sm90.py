@@ -100,30 +100,6 @@ def _get_entries() -> tuple:
 # Public API
 # ---------------------------------------------------------------------------
 
-# torch._C._cuda_getCurrentRawStream returns the cudaStream_t pointer expected
-# by the JIT wrapper. torch._C._cuda_getCurrentStream returns a packed stream
-# id and must not be used here.
-_get_current_stream_raw = torch._C._cuda_getCurrentRawStream
-
-
-# Module-level cache for kernel-write-only output tensors. The active s_q rows
-# are overwritten every call; buffers grow monotonically by device/head shape.
-def _check_out_buffer(
-    t: torch.Tensor,
-    name: str,
-    shape: tuple,
-    dtype: torch.dtype,
-    device: torch.device,
-) -> None:
-    if tuple(t.shape) != tuple(shape):
-        raise ValueError(f"{name} must have shape {tuple(shape)}, got {tuple(t.shape)}")
-    if t.dtype != dtype:
-        raise ValueError(f"{name} must have dtype {dtype}, got {t.dtype}")
-    if t.device != device:
-        raise ValueError(f"{name} must be on device {device}, got {t.device}")
-    if not t.is_contiguous():
-        raise ValueError(f"{name} must be contiguous")
-
 
 # Internal custom-op wrappers so the JIT kernel calls participate in
 # torch.library / torch.compile tracing and kernel-API debug logging.
@@ -142,15 +118,7 @@ def _sparse_mla_q8kv8_prefill_op(
     out: torch.Tensor,
     max_logits: torch.Tensor,
     lse: torch.Tensor,
-    s_q: int,
-    s_kv: int,
-    h_q: int,
-    h_kv: int,
-    d_qk: int,
-    d_v: int,
-    topk: int,
     sm_scale: float,
-    cuda_stream: int,
 ) -> None:
     dispatch_fn, _, _ = _get_entries()
     dispatch_fn(
@@ -162,15 +130,7 @@ def _sparse_mla_q8kv8_prefill_op(
         out,
         max_logits,
         lse,
-        s_q,
-        s_kv,
-        h_q,
-        h_kv,
-        d_qk,
-        d_v,
-        topk,
         sm_scale,
-        cuda_stream,
     )
 
 
@@ -189,15 +149,7 @@ def _sparse_mla_q8kv8_prefill_full_op(
     out: torch.Tensor,
     max_logits: torch.Tensor,
     lse: torch.Tensor,
-    s_q: int,
-    s_kv: int,
-    h_q: int,
-    h_kv: int,
-    d_qk: int,
-    d_v: int,
-    topk: int,
     sm_scale: float,
-    cuda_stream: int,
 ) -> None:
     _, dispatch_full_fn, _ = _get_entries()
     dispatch_full_fn(
@@ -211,15 +163,7 @@ def _sparse_mla_q8kv8_prefill_full_op(
         out,
         max_logits,
         lse,
-        s_q,
-        s_kv,
-        h_q,
-        h_kv,
-        d_qk,
-        d_v,
-        topk,
         sm_scale,
-        cuda_stream,
     )
 
 
@@ -237,15 +181,7 @@ def _sparse_mla_q8kv8_prefill_topk_length_op(
     out: torch.Tensor,
     max_logits: torch.Tensor,
     lse: torch.Tensor,
-    s_q: int,
-    s_kv: int,
-    h_q: int,
-    h_kv: int,
-    d_qk: int,
-    d_v: int,
-    topk: int,
     sm_scale: float,
-    cuda_stream: int,
 ) -> None:
     _, _, dispatch_topk_length_fn = _get_entries()
     dispatch_topk_length_fn(
@@ -258,15 +194,7 @@ def _sparse_mla_q8kv8_prefill_topk_length_op(
         out,
         max_logits,
         lse,
-        s_q,
-        s_kv,
-        h_q,
-        h_kv,
-        d_qk,
-        d_v,
-        topk,
         sm_scale,
-        cuda_stream,
     )
 
 
@@ -298,161 +226,31 @@ def sparse_mla_q8kv8_prefill_fwd(
         max_logits: [s_q, h_q], float32
         lse:        [s_q, h_q], float32
     """
-    # Validate ranks before unpacking shapes so malformed callers fail with a
-    # clear error instead of a Python unpacking/indexing exception.
-    if q.ndim != 3:
-        raise ValueError(f"q must have shape (s_q, h_q, d_qk), got {tuple(q.shape)}")
-    if kv.ndim != 3:
-        raise ValueError(
-            f"kv must have shape (s_kv, h_kv, d_qk), got {tuple(kv.shape)}"
-        )
-    if indices.ndim != 3:
-        raise ValueError(
-            f"indices must have shape (s_q, h_kv, topk), got {tuple(indices.shape)}"
-        )
-
-    s_q, h_q, d_qk = q.shape
-    s_kv, h_kv, kv_d_qk = kv.shape
-    topk = indices.shape[2]
+    # Shapes, dtypes, devices and contiguity are checked by the C++ launcher (entry.cuh).
+    s_q, h_q = q.shape[0], q.shape[1]
     device = q.device
-
-    # entry.cuh interprets q/kv as contiguous FP8 buffers and launches all
-    # accesses on q's CUDA device. Reject contract violations before launch.
-    if not q.is_cuda:
-        raise ValueError("q must be a CUDA tensor")
-    if not kv.is_cuda:
-        raise ValueError("kv must be a CUDA tensor")
-    if not indices.is_cuda:
-        raise ValueError("indices must be a CUDA tensor")
-
-    if kv.device != device:
-        raise ValueError(f"kv must be on q's device {device}, got {kv.device}")
-    if indices.device != device:
+    # d_v only sizes a freshly allocated out; the launcher checks a caller's out against 512.
+    if d_v != 512:
         raise ValueError(
-            f"indices must be on q's device {device}, got {indices.device}"
+            f"sparse_mla_q8kv8_prefill_fwd only supports d_v=512, got {d_v}"
         )
-
-    if q.dtype != torch.float8_e4m3fn:
-        raise ValueError(f"q must be torch.float8_e4m3fn, got {q.dtype}")
-    if kv.dtype != torch.float8_e4m3fn:
-        raise ValueError(f"kv must be torch.float8_e4m3fn, got {kv.dtype}")
-
-    if not q.is_contiguous():
-        raise ValueError("q must be contiguous")
-    if not kv.is_contiguous():
-        raise ValueError("kv must be contiguous")
-    if not indices.is_contiguous():
-        raise ValueError("indices must be contiguous")
-
-    if kv_d_qk != d_qk:
-        raise ValueError(f"kv d_qk must match q d_qk={d_qk}, got {kv_d_qk}")
-
-    # The CUDA implementation uses B_H=64 and launches h_q / B_H CTAs.
-    # Reject unpadded TP-local head counts instead of launching zero CTAs and
-    # returning uninitialized outputs, which can appear to callers as a hang or
-    # a later collective failure.
-    if h_q == 0 or h_q % 64 != 0:
-        raise ValueError(
-            "sparse_mla_q8kv8_prefill_fwd requires h_q padded to a positive "
-            f"multiple of 64, got {h_q}"
-        )
-
-    if h_kv != 1:
-        raise ValueError(f"sparse_mla_q8kv8_prefill_fwd requires h_kv=1, got {h_kv}")
-
-    if d_qk not in (512, 576):
-        raise ValueError(
-            f"sparse_mla_q8kv8_prefill_fwd supports d_qk=512/576, got {d_qk}"
-        )
-
-    if indices.shape[:2] != (s_q, h_kv):
-        raise ValueError(
-            f"indices must have shape ({s_q}, {h_kv}, topk), got {tuple(indices.shape)}"
-        )
-
-    if indices.dtype != torch.int32:
-        raise ValueError(f"indices must be int32, got {indices.dtype}")
-
-    if topk == 0 or topk % 128 != 0:
-        raise ValueError(
-            "Q8KV8 sparse-prefill topk width must be a positive multiple of 128, "
-            f"got {topk}"
-        )
-
+    if attn_sink is not None and topk_length is None:
+        raise ValueError("attn_sink requires topk_length to be provided as well")
     if topk_length is not None:
-        if topk_length.shape != (s_q,) or topk_length.dtype != torch.int32:
-            raise ValueError(
-                f"topk_length must be int32 with shape ({s_q},), got "
-                f"{tuple(topk_length.shape)}/{topk_length.dtype}"
-            )
-        if not topk_length.is_cuda:
-            raise ValueError("topk_length must be a CUDA tensor")
-        if topk_length.device != device:
-            raise ValueError(
-                f"topk_length must be on q's device {device}, got {topk_length.device}"
-            )
-        if not topk_length.is_contiguous():
-            raise ValueError("topk_length must be contiguous")
+        topk = indices.shape[-1]
         if torch.any(topk_length < 0).item() or torch.any(topk_length > topk).item():
             raise ValueError(
                 f"topk_length values must satisfy 0 <= topk_length <= topk ({topk})"
             )
 
-    if d_v != 512:
-        raise ValueError(
-            f"sparse_mla_q8kv8_prefill_fwd only supports d_v=512, got {d_v}"
-        )
-
-    if attn_sink is not None and topk_length is None:
-        raise ValueError("attn_sink requires topk_length to be provided as well")
-
-    if attn_sink is not None:
-        if attn_sink.shape != (h_q,) or attn_sink.dtype != torch.float32:
-            raise ValueError(
-                f"attn_sink must be float32 with shape ({h_q},), got "
-                f"{tuple(attn_sink.shape)}/{attn_sink.dtype}"
-            )
-        if not attn_sink.is_cuda:
-            raise ValueError("attn_sink must be a CUDA tensor")
-        if attn_sink.device != device:
-            raise ValueError(
-                f"attn_sink must be on q's device {device}, got {attn_sink.device}"
-            )
-        if not attn_sink.is_contiguous():
-            raise ValueError("attn_sink must be contiguous")
-
-    for name, scale in (("q_scale", q_scale), ("kv_scale", kv_scale)):
-        if not isinstance(scale, torch.Tensor):
-            raise ValueError(f"{name} must be a torch.Tensor")
-        if not scale.is_cuda:
-            raise ValueError(f"{name} must be a CUDA tensor")
-        if scale.device != device:
-            raise ValueError(
-                f"{name} must be on q's device {device}, got {scale.device}"
-            )
-        if scale.dtype != torch.float32:
-            raise ValueError(f"{name} must be float32, got {scale.dtype}")
-        if scale.numel() != 1:
-            raise ValueError(
-                f"{name} must be a scalar tensor, got shape {tuple(scale.shape)}"
-            )
-        if not scale.is_contiguous():
-            raise ValueError(f"{name} must be contiguous")
-
     if out is None:
         out = torch.empty(s_q, h_q, d_v, dtype=torch.bfloat16, device=device)
-    else:
-        _check_out_buffer(out, "out", (s_q, h_q, d_v), torch.bfloat16, device)
 
     if max_logits is None:
         max_logits = torch.empty(s_q, h_q, dtype=torch.float32, device=device)
-    else:
-        _check_out_buffer(max_logits, "max_logits", (s_q, h_q), torch.float32, device)
 
     if lse is None:
         lse = torch.empty(s_q, h_q, dtype=torch.float32, device=device)
-    else:
-        _check_out_buffer(lse, "lse", (s_q, h_q), torch.float32, device)
 
     # The three output tensors are written independently by the kernel; any
     # aliasing among them would corrupt results, so reject it explicitly.
@@ -461,8 +259,6 @@ def sparse_mla_q8kv8_prefill_fwd(
     lse_ptr = lse.data_ptr()
     if out_ptr == ml_ptr or out_ptr == lse_ptr or ml_ptr == lse_ptr:
         raise ValueError("out, max_logits and lse must not alias each other")
-
-    cuda_stream = _get_current_stream_raw(q.device.index)
 
     if attn_sink is not None and topk_length is not None:
         _sparse_mla_q8kv8_prefill_full_op(
@@ -476,15 +272,7 @@ def sparse_mla_q8kv8_prefill_fwd(
             out,
             max_logits,
             lse,
-            s_q,
-            s_kv,
-            h_q,
-            h_kv,
-            d_qk,
-            d_v,
-            topk,
             sm_scale,
-            cuda_stream,
         )
     elif topk_length is not None:
         _sparse_mla_q8kv8_prefill_topk_length_op(
@@ -497,15 +285,7 @@ def sparse_mla_q8kv8_prefill_fwd(
             out,
             max_logits,
             lse,
-            s_q,
-            s_kv,
-            h_q,
-            h_kv,
-            d_qk,
-            d_v,
-            topk,
             sm_scale,
-            cuda_stream,
         )
     else:
         _sparse_mla_q8kv8_prefill_op(
@@ -517,15 +297,7 @@ def sparse_mla_q8kv8_prefill_fwd(
             out,
             max_logits,
             lse,
-            s_q,
-            s_kv,
-            h_q,
-            h_kv,
-            d_qk,
-            d_v,
-            topk,
             sm_scale,
-            cuda_stream,
         )
 
     return out, max_logits, lse

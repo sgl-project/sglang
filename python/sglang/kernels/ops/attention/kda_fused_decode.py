@@ -11,8 +11,9 @@ Kernel body vendored from the NVIDIA x Moonshot Kimi K3 optimization package
 (see csrc/attention/kda_fused_decode.cuh for provenance and the list of
 integration patches). Specialized for the K3 KDA decode regime:
 K = V = 128, kernel width 4, T = 1 per request, with or without the gate
-lower bound. The JIT instantiates local head counts H = HV in {12, 6, 3}
-(K3 at TP8, TP16, TP32) and {16, 8} (GLM-5.3-Flash at TP4, TP8).
+lower bound. Local head counts H = HV in {12, 6, 3} (K3 at TP8, TP16, TP32)
+and {16, 8} (GLM-5.3-Flash at TP4, TP8) are supported; each JIT module
+compiles one head count and gate form.
 
 The model must hand off the output-norm gate (attempt-and-verify stash on the
 attention layer, see kimi_k3.py), and a covered() check gates supported inputs.
@@ -25,6 +26,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import (
     cache_once,
     is_arch_support_pdl,
@@ -40,8 +42,15 @@ _CONV_STATE_W = 3  # kernel width 4 -> 3 cached tokens
 
 
 @cache_once
-def _jit_kda_fused_decode_module() -> Module:
-    args = make_cpp_args(is_arch_support_pdl())
+def precompile_kda_fused_decode(num_heads: int, use_lower_bound: bool) -> Module:
+    """The module for one local head count and forget-gate form."""
+    # Measured on H200 at 8/16 heads: evict-first state traffic is 1-9% faster up
+    # to 1024 (token, head) blocks and 1-2% slower from 1600. Blackwell was not
+    # measured with it, so it keeps the default policy.
+    stream_state = num_heads in (8, 16) and current_arch().is_sm(9)
+    args = make_cpp_args(
+        num_heads, use_lower_bound, stream_state, is_arch_support_pdl()
+    )
     return load_jit(
         "kda_fused_decode",
         *args,
@@ -62,7 +71,7 @@ def covered(
 ) -> bool:
     """The kernel is compiled for the K3 KDA decode regime: H heads of 128,
     packed [T, 3*H*128] qkv rows, transposed [slots, 3, 3*H*128] conv pool, fp32
-    [slots, H, 128, 128] ssm pool (inner-contiguous, any slot pitch — the
+    [slots, H, 128, 128] ssm pool (inner-contiguous, any 16B-aligned slot pitch — the
     kernel reads the real slot stride), one token per request."""
     if ssm_states.ndim < 4:
         return False
@@ -97,16 +106,17 @@ def covered(
         and onorm_g.stride(-1) == 1
         and conv_states.stride(-1) == 1
         # Inner [HV, V, K] must be contiguous (the kernel float4-loads V*K
-        # chunks); the slot pitch (stride(-4)) is arbitrary — a locally
+        # chunks); the slot pitch (stride(-4)) is free up to 16B alignment — a locally
         # allocated pool packs it at HV*V*K, the unified / page-major pools at
         # the multi-layer envelope. The kernel reads ssm_states.stride(0), so
-        # any slot pitch is fine. (Do NOT use .view(-1, HV, V, K): that fails /
+        # any such slot pitch is fine. (Do NOT use .view(-1, HV, V, K): that fails /
         # copies on an envelope-strided view.)
         and ssm_states.stride(-1) == 1
         and ssm_states.stride(-2) == K
         and ssm_states.stride(-3) == V * K
-        # The state is staged with 16B copies, so the slot pitch must be 16B-aligned.
-        and ssm_states.stride(-4) % 4 == 0
+        # The state is staged with 1D TMA, which needs every slot 16B-aligned
+        # (the dense and the K3 envelope pitches both are).
+        and ssm_states.stride(0) % 4 == 0
         and cache_indices.is_contiguous()
     )
 
@@ -139,7 +149,8 @@ def kda_fused_decode(
     H = ssm_states.shape[-3]
     seg = H * 128
     out = torch.empty((B, seg), dtype=torch.bfloat16, device=mixed_qkv.device)
-    _jit_kda_fused_decode_module().run(
+    module = precompile_kda_fused_decode(H, lower_bound is not None)
+    module.run(
         mixed_qkv,
         a,
         b,
@@ -163,6 +174,5 @@ def kda_fused_decode(
         float(scale),
         float(onorm_eps),
         float(lower_bound) if lower_bound is not None else 0.0,
-        lower_bound is not None,
     )
     return out.view(1, B, H, 128)

@@ -2742,7 +2742,6 @@ def moe_permute(
     topk_ids: torch.Tensor,
     num_experts: int,
     use_int64_offset: bool = False,
-    is_ep: bool = False,
     outputs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     from sglang.kernels.ops.moe.moe_permute_prepare import moe_permute_prepare
@@ -2751,7 +2750,6 @@ def moe_permute(
         topk_ids=topk_ids,
         num_experts=num_experts,
         use_int64_offset=use_int64_offset,
-        is_ep=is_ep,
     )
     outputs = _moe_permute_rows(inputs, topk_ids, src2dst, outputs)
 
@@ -2764,7 +2762,6 @@ def moe_permute_with_scale(
     topk_ids: torch.Tensor,
     num_experts: int,
     use_int64_offset: bool = False,
-    is_ep: bool = False,
     outputs: torch.Tensor | None = None,
     scale_outputs: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -2776,7 +2773,6 @@ def moe_permute_with_scale(
         topk_ids=topk_ids,
         num_experts=num_experts,
         use_int64_offset=use_int64_offset,
-        is_ep=is_ep,
         outputs=outputs,
     )
     scale_outputs = _moe_permute_rows(input_scale, topk_ids, src2dst, scale_outputs)

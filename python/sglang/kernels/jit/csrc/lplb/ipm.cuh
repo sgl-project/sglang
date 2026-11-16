@@ -20,6 +20,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <dlpack/dlpack.h>
@@ -261,7 +262,7 @@ void ipm_solve(tvm::ffi::TensorView A, tvm::ffi::TensorView b, tvm::ffi::TensorV
   // Opt in to >48 KB dynamic shared memory if needed (Hopper supports up to
   // 228 KB per block).
   if (smem_bytes > 48 * 1024) {
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
+    runtime::set_max_dynamic_smem(kernel, smem_bytes);
   }
 
   LaunchKernel(/*grid_dim=*/1, /*block_dim=*/BLOCK_DIM, device, smem_bytes)(

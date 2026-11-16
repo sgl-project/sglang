@@ -649,8 +649,14 @@ struct RouteRadixKernel {
   }
 };
 
-template <bool kUsePDL>
+// One module per tuned (block_size, cast_vec, cast_first); the JSON config table
+// and its fallback live in kernels/ops/moe/moe_front.py.
+template <bool kUsePDL, uint32_t kBlockSize, uint32_t kCastVec, bool kCastFirst>
 struct FusedFrontEpilogueKernel {
+  static_assert(kBlockSize == 224 || kBlockSize == 448, "fused_front_epilogue: block_size must be 224 or 448");
+  // cast_vec * 4 bytes per thread must stay inside the 32B vector-load limit.
+  static_assert(kCastVec == 2 || kCastVec == 4 || kCastVec == 8, "fused_front_epilogue: cast_vec must be 2, 4 or 8");
+
   static void
   run(const tvm::ffi::TensorView merged,  // [M, E + latent] fp32, row-dense
       const tvm::ffi::TensorView bias,    // [E] fp32
@@ -660,10 +666,7 @@ struct FusedFrontEpilogueKernel {
       int64_t topk,
       double routed_scaling_factor,
       bool renormalize,
-      bool apply_scale,
-      int64_t block_size,
-      int64_t cast_vec,
-      bool cast_first) {
+      bool apply_scale) {
     using namespace host;
 
     auto M_ = SymbolicSize{"num_tokens"};
@@ -674,24 +677,20 @@ struct FusedFrontEpilogueKernel {
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
 
-    // Tunables come from the JSON config table; see kernels/ops/moe/moe_front.py.
-    // cast_vec * 4 bytes per thread must stay inside the 32B vector-load limit.
-    CHECK_HOST(block_size == 224 || block_size == 448) << block_size;
-    CHECK_HOST(cast_vec == 2 || cast_vec == 4 || cast_vec == 8) << cast_vec;
-    // Per thread: kNumExperts / block_size logits and bias values, then cast_vec latent
+    // Per thread: kFGTNumExperts / kBlockSize logits and bias values, then kCastVec latent
     // values (fp32 in, bf16 out); the latent slice starts 896 * 4 B = 112 * 32 B in.
-    const auto expert_bytes = static_cast<int64_t>(kFGTNumExperts / block_size * sizeof(fp32_t));
-    const auto cast_bytes = static_cast<int64_t>(cast_vec * sizeof(fp32_t));
+    constexpr int64_t kExpertBytes = kFGTNumExperts / kBlockSize * sizeof(fp32_t);
+    constexpr int64_t kCastBytes = kCastVec * sizeof(fp32_t);
     TensorMatcher({M_, W_})  //
         .with_dtype<fp32_t>()
         .with_device(device)
         .with_strides({-1, 1})
-        .ensure_alignment(std::max(expert_bytes, cast_bytes))
+        .ensure_alignment(std::max(kExpertBytes, kCastBytes))
         .verify(merged);
     TensorMatcher({E_})  //
         .with_dtype<fp32_t>()
         .with_device(device)
-        .ensure_alignment(expert_bytes)
+        .ensure_alignment(kExpertBytes)
         .verify(bias);
     TensorMatcher({M_, K_})  //
         .with_dtype<fp32_t>()
@@ -705,14 +704,14 @@ struct FusedFrontEpilogueKernel {
         .with_dtype<bf16_t>()
         .with_device(device)
         .with_strides({-1, 1})
-        .ensure_alignment(cast_vec * sizeof(bf16_t))
+        .ensure_alignment(kCastVec * sizeof(bf16_t))
         .verify(routed);
 
     const auto M = static_cast<int>(M_.unwrap());
     const auto latent = static_cast<int>(L_.unwrap());
     CHECK_HOST(E_.unwrap() == kFGTNumExperts && K_.unwrap() == kFGTTopK && topk == kFGTTopK);
     CHECK_HOST(static_cast<int>(W_.unwrap()) == static_cast<int>(kFGTNumExperts) + latent);
-    CHECK_HOST(latent % 4 == 0 && latent % cast_vec == 0) << latent;
+    CHECK_HOST(latent % 4 == 0 && latent % kCastVec == 0) << latent;
     if (M == 0) return;
 
     auto params = MoEFrontParams{};
@@ -731,35 +730,8 @@ struct FusedFrontEpilogueKernel {
     params.latent = latent;
     params.routed_stride = static_cast<long long>(routed.stride(0));
 
-#define SGL_FRONT_LAUNCH(BS, CV, CF) \
-  LaunchKernel(M, BS, device.unwrap()).enable_pdl(kUsePDL)(fused_front_epilogue_kernel<kUsePDL, BS, CV, CF>, params)
-#define SGL_FRONT_DISPATCH_CV(BS, CF) \
-  do {                                \
-    if (cast_vec == 2) {              \
-      SGL_FRONT_LAUNCH(BS, 2, CF);    \
-    } else if (cast_vec == 4) {       \
-      SGL_FRONT_LAUNCH(BS, 4, CF);    \
-    } else {                          \
-      SGL_FRONT_LAUNCH(BS, 8, CF);    \
-    }                                 \
-  } while (0)
-#define SGL_FRONT_DISPATCH_BS(CF)     \
-  do {                                \
-    if (block_size == 448) {          \
-      SGL_FRONT_DISPATCH_CV(448, CF); \
-    } else {                          \
-      SGL_FRONT_DISPATCH_CV(224, CF); \
-    }                                 \
-  } while (0)
-
-    if (cast_first) {
-      SGL_FRONT_DISPATCH_BS(true);
-    } else {
-      SGL_FRONT_DISPATCH_BS(false);
-    }
-#undef SGL_FRONT_DISPATCH_BS
-#undef SGL_FRONT_DISPATCH_CV
-#undef SGL_FRONT_LAUNCH
+    LaunchKernel(M, kBlockSize, device.unwrap())
+        .enable_pdl(kUsePDL)(fused_front_epilogue_kernel<kUsePDL, kBlockSize, kCastVec, kCastFirst>, params);
   }
 };
 

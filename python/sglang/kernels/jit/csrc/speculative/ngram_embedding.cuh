@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
+#pragma once
+
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
@@ -148,55 +150,51 @@ struct NgramEmbeddingKernel {
       const int64_t eos_token_id) {
     using namespace host;
 
+    CHECK_HOST(ne_n > 1 && ne_k > 0) << "compute_n_gram_ids: bad ne_n " << ne_n << " / ne_k " << ne_k;
+    const int64_t num_n_grams = (ne_n - 1) * ne_k;
+    auto batch = SymbolicSize{"batch_size"};
+    auto token_num = SymbolicSize{"token_num"};
     auto device_ = SymbolicDevice{};
+    device_.set_options<kDLGPU>();
 
-    // Verify tensor shapes and types using -1 (kAnySize) for dynamic dimensions
-    TensorMatcher({-1, -1, -1})  // [ne_n-1, ne_k, ne_n]
+    TensorMatcher({ne_n - 1, ne_k, ne_n})  // ne_weights
         .with_dtype<int32_t>()
-        .with_device<kDLGPU>(device_)
+        .with_device(device_)
         .verify(ne_weights);
-
-    TensorMatcher({-1, -1})  // [ne_n-1, ne_k]
+    TensorMatcher({ne_n - 1, ne_k})  // ne_mods
         .with_dtype<int32_t>()
-        .with_device<kDLGPU>()
+        .with_device(device_)
         .verify(ne_mods);
-
-    TensorMatcher({-1})  // [(ne_n-1)*ne_k + 1]
+    TensorMatcher({num_n_grams + 1})  // exclusive_ne_embeder_size_sums
         .with_dtype<int32_t>()
-        .with_device<kDLGPU>()
+        .with_device(device_)
         .verify(exclusive_ne_embeder_size_sums);
-
-    TensorMatcher({-1})  // [token_num]
+    TensorMatcher({token_num})  // tokens
         .with_dtype<int32_t>()
-        .with_device<kDLGPU>()
+        .with_device(device_)
         .verify(tokens);
-
-    TensorMatcher({-1})  // [batch_size+1]
-        .with_dtype<int32_t>()
-        .with_device<kDLGPU>()
-        .verify(exclusive_req_len_sums);
-
     TensorMatcher({-1, -1})  // [max_running_reqs, max_context_len]
         .with_dtype<int32_t>()
-        .with_device<kDLGPU>()
+        .with_device(device_)
         .verify(ne_token_table);
-
-    TensorMatcher({-1})  // [batch_size]
+    TensorMatcher({batch})  // row_indices
         .with_dtype<int64_t>()
-        .with_device<kDLGPU>()
+        .with_device(device_)
         .verify(row_indices);
-
-    TensorMatcher({-1})  // [batch_size]
+    TensorMatcher({batch})  // column_starts
         .with_dtype<int32_t>()
-        .with_device<kDLGPU>()
+        .with_device(device_)
         .verify(column_starts);
-
-    TensorMatcher({-1, -1})  // [token_num, (ne_n-1)*ne_k]
+    TensorMatcher({batch.unwrap() + 1})  // exclusive_req_len_sums
         .with_dtype<int32_t>()
-        .with_device<kDLGPU>()
+        .with_device(device_)
+        .verify(exclusive_req_len_sums);
+    TensorMatcher({token_num, num_n_grams})  // n_gram_ids
+        .with_dtype<int32_t>()
+        .with_device(device_)
         .verify(n_gram_ids);
 
-    const int batch_size = static_cast<int>(exclusive_req_len_sums.size(0) - 1);
+    const int batch_size = static_cast<int>(batch.unwrap());
     const int max_context_len = static_cast<int>(ne_token_table.size(1));
     const auto stream = LaunchKernel::resolve_device(device_.unwrap());
 
@@ -232,42 +230,38 @@ struct NgramEmbeddingKernel {
     using namespace host;
 
     auto device_ = SymbolicDevice{};
+    device_.set_options<kDLGPU>();
 
-    // Verify tensor shapes and types using -1 (kAnySize) for dynamic dimensions
-    TensorMatcher({-1})  // [token_num]
+    TensorMatcher({-1})  // tokens
         .with_dtype<int32_t>()
-        .with_device<kDLGPU>(device_)
+        .with_device(device_)
         .verify(tokens);
-
     TensorMatcher({-1, -1})  // [max_running_reqs, max_context_len]
         .with_dtype<int32_t>()
-        .with_device<kDLGPU>()
+        .with_device(device_)
         .verify(ne_token_table);
-
-    TensorMatcher({-1})  // [batch_size]
-        .with_dtype<int64_t>()
-        .with_device<kDLGPU>()
-        .verify(row_indices);
-
-    TensorMatcher({-1})  // [batch_size]
+    TensorMatcher({-1})  // req_lens, one per request
         .with_dtype<int32_t>()
-        .with_device<kDLGPU>()
-        .verify(column_starts);
-
-    TensorMatcher({-1})  // [batch_size]
-        .with_dtype<int32_t>()
-        .with_device<kDLGPU>()
+        .with_device(device_)
         .verify(req_lens);
-
-    // ignore_tokens can be empty or have values
+    TensorMatcher({-1})  // row_indices
+        .with_dtype<int64_t>()
+        .with_device(device_)
+        .verify(row_indices);
+    TensorMatcher({-1})  // column_starts
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(column_starts);
+    TensorMatcher({-1})  // ignore_tokens, may be empty
+        .with_dtype<int32_t>()
+        .with_device(device_)
+        .verify(ignore_tokens);
+    // Callers may pass per-request arrays longer than req_lens; only the first req_lens.size(0) are read.
+    CHECK_HOST(row_indices.size(0) >= req_lens.size(0) && column_starts.size(0) >= req_lens.size(0))
+        << "update_token_table: " << req_lens.size(0) << " requests but " << row_indices.size(0) << " row indices and "
+        << column_starts.size(0) << " column starts";
     void* ignore_tokens_ptr = ignore_tokens.data_ptr();
     const bool has_ignore_tokens = ignore_tokens_ptr != nullptr && ignore_tokens.numel() > 0;
-    if (has_ignore_tokens) {
-      TensorMatcher({-1})  // [ignore_token_num]
-          .with_dtype<int32_t>()
-          .with_device<kDLGPU>()
-          .verify(ignore_tokens);
-    }
 
     const int batch_size = static_cast<int>(req_lens.size(0));
     if (batch_size <= 0) {
