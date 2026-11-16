@@ -50,13 +50,7 @@ async def update_weights_from_disk(request: Request):
         )
 
     if response.output is None:
-        return orjson_response(
-            {
-                "success": False,
-                "message": response.error or "Unknown status",
-            },
-            status_code=500,
-        )
+        return _failed_scheduler_reply(response)
 
     result = response.output
     return orjson_response(
@@ -185,13 +179,7 @@ async def release_memory_occupation():
         return orjson_response({"success": False, "message": str(e)}, status_code=500)
 
     if response.output is None:
-        return orjson_response(
-            {
-                "success": False,
-                "message": response.error or "Unknown status",
-            },
-            status_code=500,
-        )
+        return _failed_scheduler_reply(response)
 
     payload = response.output
     success = bool(payload["success"])
@@ -209,13 +197,7 @@ async def resume_memory_occupation():
         return orjson_response({"success": False, "message": str(e)}, status_code=500)
 
     if response.output is None:
-        return orjson_response(
-            {
-                "success": False,
-                "message": response.error or "Unknown status",
-            },
-            status_code=500,
-        )
+        return _failed_scheduler_reply(response)
 
     payload = response.output
     success = bool(payload["success"])
