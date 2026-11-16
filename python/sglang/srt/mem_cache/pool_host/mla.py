@@ -1023,7 +1023,12 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         device_indices = maybe_dcp_kernel_indices(
             device_indices, self.dcp_size, self.dcp_rank
         )
-        if self._layer_shard_enabled:
+        # Page-first layouts have no all-layer H2D kernel. Share the sharded
+        # fallback so both paths restore owned target layers and draft slots.
+        if self._layer_shard_enabled or (io_backend, self.layout) in (
+            ("kernel", "page_first"),
+            ("direct", "page_first_direct"),
+        ):
             for layer_id in self._target_layer_indices:
                 self._load_to_device_per_layer(
                     device_pool, host_indices, device_indices, layer_id, io_backend
@@ -1068,14 +1073,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                         item_size=self.token_stride_size,
                         num_layers=self.layer_num,
                     )
-            elif self.layout == "page_first":
-                # The all-layer kernels are directionally baked lf->pf (device->host
-                # for backup); no pf->lf all-layer counterpart exists. Fall back to
-                # the per-layer H2D loop (transfer_kv_per_layer_mla_pf_lf).
-                for layer_id in self._target_layer_indices:
-                    self._load_to_device_per_layer(
-                        device_pool, host_indices, device_indices, layer_id, io_backend
-                    )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "direct":
@@ -1087,13 +1084,6 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
                     dst_indices=device_indices,
                     page_size=self.page_size,
                 )
-            elif self.layout == "page_first_direct":
-                # transfer_kv_all_layer_direct_lf_pf is lf->pf (device->host) only;
-                # no all-layer pf->lf counterpart. Per-layer H2D fallback.
-                for layer_id in self._target_layer_indices:
-                    self._load_to_device_per_layer(
-                        device_pool, host_indices, device_indices, layer_id, io_backend
-                    )
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
