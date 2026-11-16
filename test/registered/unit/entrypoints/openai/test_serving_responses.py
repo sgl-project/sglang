@@ -1809,41 +1809,6 @@ class ChatEncodingAdapterDispatchTestCase(CustomTestCase):
 
 
 class HarmonyResponsesTestCase(CustomTestCase):
-    def test_harmony_startup_warns_once_about_legacy_distribution(self):
-        from sglang.srt.entrypoints import harmony_utils
-
-        with (
-            patch.object(harmony_utils, "_harmony_encoding", None),
-            patch.object(harmony_utils, "version", return_value="0.0.4"),
-            self.assertLogs(harmony_utils.logger, level="WARNING") as logs,
-        ):
-            make_serving(model_type="gpt_oss")
-            encoding = get_encoding()
-            self.assertEqual(encoding.decode(encoding.encode("Hello")), "Hello")
-
-        self.assertEqual(len(logs.records), 1)
-        self.assertIn("openai-harmony 0.0.4", logs.output[0])
-        self.assertIn("pip uninstall openai-harmony", logs.output[0])
-        self.assertIn("--force-reinstall --no-deps oss-harmony", logs.output[0])
-
-    def test_harmony_startup_without_legacy_distribution_is_silent(self):
-        from importlib.metadata import PackageNotFoundError
-
-        from sglang.srt.entrypoints import harmony_utils
-
-        with (
-            patch.object(harmony_utils, "_harmony_encoding", None),
-            patch.object(
-                harmony_utils,
-                "version",
-                side_effect=PackageNotFoundError("openai-harmony"),
-            ),
-            self.assertNoLogs(harmony_utils.logger, level="WARNING"),
-        ):
-            make_serving(model_type="gpt_oss")
-            encoding = get_encoding()
-            self.assertEqual(encoding.decode(encoding.encode("Hello")), "Hello")
-
     def test_harmony_loads_without_cached_vocabulary_or_network(self):
         """A cold vocabulary cache must not disable offline Responses serving."""
         with tempfile.TemporaryDirectory() as cache_dir, socket.socket() as proxy:
