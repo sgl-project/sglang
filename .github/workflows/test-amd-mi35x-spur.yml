@@ -7,7 +7,7 @@ name: Test AMD MI35x (Spur)
 # launcher's header).
 #
 # Manual runs only: pr-test-amd.yml's scheduled runs now send their
-# stage-b-test-1-gpu-small-amd-mi35x job to these runners themselves.
+# base-b-test-1-gpu-small-mi35x job to these runners themselves.
 on:
   workflow_dispatch:
     inputs:

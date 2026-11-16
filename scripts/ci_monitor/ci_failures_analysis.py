@@ -27,6 +27,30 @@ from typing import Dict, List, Optional, Tuple
 import requests
 
 
+_RETIRED_AMD_PR_JOBS = {
+    "sgl-kernel-unit-test-amd",
+    "sgl-kernel-unit-test-2-gpu-amd",
+    "stage-a-test-1-gpu-small-amd",
+    "jit-kernel-unit-test-amd",
+    "jit-kernel-benchmark-test-amd",
+    "stage-b-test-1-gpu-small-amd",
+    "stage-b-test-1-gpu-small-amd-nondeterministic",
+    "stage-b-test-1-gpu-small-amd-mi35x",
+    "stage-b-test-1-gpu-large-amd",
+    "stage-b-test-2-gpu-large-amd",
+    "stage-b-test-large-8-gpu-mi35x-disaggregation-amd",
+    "multimodal-gen-test-1-gpu-amd",
+    "multimodal-gen-test-2-gpu-amd",
+    "stage-c-test-4-gpu-amd",
+    "stage-c-test-large-8-gpu-amd",
+    "stage-c-test-large-8-gpu-amd-mi35x",
+    "extra-a-test-1-gpu-small-amd",
+    "extra-a-test-1-gpu-large-amd",
+    "extra-a-test-2-gpu-large-amd",
+    "extra-b-test-4-gpu-amd",
+}
+
+
 def _filter_legacy_amd_job_rows(job_data: Dict[str, Dict]) -> Dict[str, Dict]:
     """Drop pre-cutover AMD names without changing the shared analyzer."""
 
@@ -45,7 +69,17 @@ def _filter_legacy_amd_job_rows(job_data: Dict[str, Dict]) -> Dict[str, Dict]:
             continue
 
         leaf_name = name_parts[-1]
-        if leaf_name.startswith(("wait-for-stage-a-amd", "wait-for-stage-b-amd")):
+        if leaf_name.startswith(
+            (
+                "wait-for-base-a-amd",
+                "wait-for-base-b-amd",
+                "wait-for-stage-a-amd",
+                "wait-for-stage-b-amd",
+            )
+        ):
+            continue
+        # PR-test jobs renamed after their suites; old rows would keep stale streaks.
+        if leaf_name.split(" (", 1)[0] in _RETIRED_AMD_PR_JOBS:
             continue
         if leaf_name in {
             "call-gate",

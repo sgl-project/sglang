@@ -132,8 +132,8 @@ jobs:
 
   # =============================================== extra-a (1-gpu-small) ===============================================
   # ~1.5h of tests in total; four shards keep each well under the step timeout.
-  extra-a-test-1-gpu-small-amd:
-    name: ${{ format('extra-a-test-1-gpu-small-amd ({0}, linux-{1}-1gpu-sglang, {2})', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300', matrix.part) }}
+  extra-a-test-1-gpu-small-mi30x:
+    name: ${{ format('extra-a-test-1-gpu-small-mi30x ({0}, linux-{1}-1gpu-sglang, {2})', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300', matrix.part) }}
     needs: [call-gate]
     if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
     strategy:
@@ -162,8 +162,8 @@ jobs:
   # Single-GPU lora / spec / quant / perf model e2e tests. Runs on the same
   # 1-gpu pool as small (AMD GPUs carry enough VRAM that "large" here is a
   # CUDA memory-tier label, not a separate AMD runner pool). ~50 min in total.
-  extra-a-test-1-gpu-large-amd:
-    name: ${{ format('extra-a-test-1-gpu-large-amd ({0}, linux-{1}-1gpu-sglang, {2})', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300', matrix.part) }}
+  extra-a-test-1-gpu-large-mi30x:
+    name: ${{ format('extra-a-test-1-gpu-large-mi30x ({0}, linux-{1}-1gpu-sglang, {2})', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300', matrix.part) }}
     needs: [call-gate]
     if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
     strategy:
@@ -190,8 +190,8 @@ jobs:
   # Multi-GPU TP / PP / PD mock-model + kv_canary e2e tests and PP/MoE
   # throughput. Mirrors CUDA's extra-a 2-gpu-large stage; runs on the 2-GPU
   # AMD pool.
-  extra-a-test-2-gpu-large-amd:
-    name: ${{ format('extra-a-test-2-gpu-large-amd ({0}, linux-{1}-2gpu-sglang, {2})', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300', matrix.part) }}
+  extra-a-test-2-gpu-large-mi30x:
+    name: ${{ format('extra-a-test-2-gpu-large-mi30x ({0}, linux-{1}-2gpu-sglang, {2})', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300', matrix.part) }}
     needs: [call-gate]
     if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
     strategy:
@@ -217,9 +217,9 @@ jobs:
 
   # =============================================== extra-b (4-gpu) ===============================================
   # 4-GPU tests that CUDA runs in extra-b. Same container env as the
-  # stage-c-test-4-gpu-amd job in pr-test-amd.yml.
-  extra-b-test-4-gpu-amd:
-    name: ${{ format('extra-b-test-4-gpu-amd ({0}, linux-{1}-4gpu-sglang)', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300') }}
+  # base-c-test-4-gpu-mi30x job in pr-test-amd.yml.
+  extra-b-test-4-gpu-mi30x:
+    name: ${{ format('extra-b-test-4-gpu-mi30x ({0}, linux-{1}-4gpu-sglang)', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300') }}
     needs: [call-gate]
     if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
     runs-on: ${{ format('linux-{0}-4gpu-sglang', inputs.runner_arch || 'mi300') }}
@@ -252,10 +252,10 @@ jobs:
     needs:
       [
         call-gate,
-        extra-a-test-1-gpu-small-amd,
-        extra-a-test-1-gpu-large-amd,
-        extra-a-test-2-gpu-large-amd,
-        extra-b-test-4-gpu-amd,
+        extra-a-test-1-gpu-small-mi30x,
+        extra-a-test-1-gpu-large-mi30x,
+        extra-a-test-2-gpu-large-mi30x,
+        extra-b-test-4-gpu-mi30x,
       ]
     if: always()
     runs-on: ubuntu-latest
