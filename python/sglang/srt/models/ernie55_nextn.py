@@ -54,7 +54,6 @@ from sglang.srt.models.ernie55 import (
     logits_rows,
     scatter_rows,
 )
-from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import BumpAllocator
 
