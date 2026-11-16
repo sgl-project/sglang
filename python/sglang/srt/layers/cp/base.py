@@ -108,7 +108,6 @@ class ContextParallelStrategy(ABC):
 
     @property
     def cp_rank(self) -> int:
-
         return get_parallel().attn_cp_rank
 
     @property
@@ -217,7 +216,11 @@ class ContextParallelStrategy(ABC):
         attn_fn: Callable[..., Any],
         attention_backend: CPAttentionBackendKind = CPAttentionBackendKind.FLASH_ATTENTION,
     ) -> Any:
-        """Dispatch CP attention using the selected backend convention."""
+        """Run attention over the rank-local query rows in one launch.
+
+        ``attn_fn`` gets the combined geometry and must read the backend's
+        duplicated (zigzag) page table.
+        """
 
     @abstractmethod
     def materialize_full_kv(
