@@ -1,11 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import fnmatch
 import os
 from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
 from sglang.srt.connector import BaseConnector
+
+
+def filter_allow(paths: list[str], patterns: list[str]) -> list[str]:
+    return [
+        path
+        for path in paths
+        if any(fnmatch.fnmatch(path, pattern) for pattern in patterns)
+    ]
+
+
+def filter_ignore(paths: list[str], patterns: list[str]) -> list[str]:
+    return [
+        path
+        for path in paths
+        if not any(fnmatch.fnmatch(path, pattern) for pattern in patterns)
+    ]
 
 
 def parse_model_name(url: str) -> str:
