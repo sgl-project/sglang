@@ -9,6 +9,7 @@ from sglang.kernels.ops.layernorm.mhc import mhc_fused_post_pre, mhc_post, mhc_p
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=15, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b", runner_config="4-gpu-b200")
 
 
 @pytest.fixture
@@ -236,6 +237,30 @@ def _hopper_mhc_layer(norm, w, scale, base):
     return layer
 
 
+def _mhc_mix_inputs(num_tokens):
+    torch.manual_seed(192 + num_tokens)
+    x = torch.randn(num_tokens, 4, 5120, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(24, 20480, device="cuda") * 0.01
+    scale = torch.tensor([0.5, 0.25, 0.25], device="cuda")
+    base = torch.randn(24, device="cuda")
+    return x, w, scale, base
+
+
+def _mhc_mix_reference(x, w, scale, base):
+    xd = x.flatten(1).double()
+    z = (xd @ w.double().T) * torch.rsqrt(xd.square().mean(-1, keepdim=True) + 1e-6)
+    pre = torch.sigmoid(z[:, :4] * scale[0] + base[:4]) + 1e-6
+    post = 2 * torch.sigmoid(z[:, 4:8] * scale[1] + base[4:8])
+    comb = (z[:, 8:] * scale[2] + base[8:]).reshape(-1, 4, 4)
+    comb = (comb - comb.amax(-1, keepdim=True)).exp()
+    comb = comb / comb.sum(-1, keepdim=True) + 1e-6
+    comb = comb / (comb.sum(-2, keepdim=True) + 1e-6)
+    for _ in range(19):
+        comb = comb / (comb.sum(-1, keepdim=True) + 1e-6)
+        comb = comb / (comb.sum(-2, keepdim=True) + 1e-6)
+    return pre, post, comb
+
+
 @pytest.mark.parametrize("num_tokens", [32, 33, 64, 128, 257, 4096, 4097, 8192])
 def test_hopper_compensated_mhc(num_tokens):
     from sglang.srt.environ import envs
@@ -245,11 +270,7 @@ def test_hopper_compensated_mhc(num_tokens):
 
     if not is_sm90_supported():
         pytest.skip("Hopper compensated mHC dispatch")
-    torch.manual_seed(192 + num_tokens)
-    x = torch.randn(num_tokens, 4, 5120, device="cuda", dtype=torch.bfloat16)
-    w = torch.randn(24, 20480, device="cuda") * 0.01
-    scale = torch.tensor([0.5, 0.25, 0.25], device="cuda")
-    base = torch.randn(24, device="cuda")
+    x, w, scale, base = _mhc_mix_inputs(num_tokens)
     norm = SimpleNamespace(weight=torch.ones(5120, device="cuda", dtype=torch.bfloat16))
     layer = _hopper_mhc_layer(norm, w, scale, base)
     with envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(True):
@@ -257,22 +278,12 @@ def test_hopper_compensated_mhc(num_tokens):
         assert layer._hc_attn_bf16_parts is not None
         assert layer._hc_attn_tf32_parts is None
         actual = model_mhc.mix_stats(layer.attn_hc, x)
-    xd = x.flatten(1).double()
-    z = (xd @ w.double().T) * torch.rsqrt(xd.square().mean(-1, keepdim=True) + 1e-6)
-    expected_pre = torch.sigmoid(z[:, :4] * scale[0] + base[:4]) + 1e-6
-    expected_post = 2 * torch.sigmoid(z[:, 4:8] * scale[1] + base[4:8])
-    comb = (z[:, 8:] * scale[2] + base[8:]).reshape(-1, 4, 4)
-    comb = (comb - comb.amax(-1, keepdim=True)).exp()
-    comb = comb / comb.sum(-1, keepdim=True) + 1e-6
-    comb = comb / (comb.sum(-2, keepdim=True) + 1e-6)
-    for _ in range(19):
-        comb = comb / (comb.sum(-1, keepdim=True) + 1e-6)
-        comb = comb / (comb.sum(-2, keepdim=True) + 1e-6)
-    for result, expected in zip(actual, (expected_pre, expected_post, comb)):
+    reference = _mhc_mix_reference(x, w, scale, base)
+    for result, expected in zip(actual, reference):
         torch.testing.assert_close(result.double(), expected, rtol=1e-5, atol=2e-6)
     with envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(False):
         fallback = model_mhc.mix_stats(layer.attn_hc, x)
-        for result, expected in zip(fallback, (expected_pre, expected_post, comb)):
+        for result, expected in zip(fallback, reference):
             torch.testing.assert_close(result.double(), expected, rtol=1e-5, atol=2e-6)
         DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache(layer)
         assert layer._hc_attn_bf16_parts is None
@@ -280,7 +291,6 @@ def test_hopper_compensated_mhc(num_tokens):
 
 @pytest.mark.parametrize("num_tokens", [32, 100, 256, 512, 1024])
 def test_deepgemm_prenorm_dual_matches_two_calls(num_tokens):
-    from types import SimpleNamespace
     from unittest.mock import patch
 
     if not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10):
@@ -301,6 +311,37 @@ def test_deepgemm_prenorm_dual_matches_two_calls(num_tokens):
         two_calls = mhc.hc_mix_stats_sinkhorn_deepgemm(*args)
     for a, b in zip(dual, two_calls):
         assert torch.equal(a, b)
+
+
+@pytest.mark.parametrize("num_tokens", [32, 33, 256, 257, 4095, 4096])
+def test_blackwell_compensated_mhc(num_tokens):
+    """Blackwell takes the BF16x3 projection up to 256 rows (not on SM107) and
+    for 4096-65536 rows, and the DeepGEMM projection in between."""
+    from unittest.mock import patch
+
+    from sglang.srt.environ import envs
+    from sglang.srt.models import deepseek_v4_mhc as model_mhc
+    from sglang.srt.models.deepseek_v4 import DeepseekV4DecoderLayer
+    from sglang.srt.utils import get_device_sm, is_sm100_supported
+
+    if not is_sm100_supported():
+        pytest.skip("Blackwell compensated mHC dispatch")
+    bf16x3 = num_tokens >= 4096 or (num_tokens <= 256 and get_device_sm() != 107)
+    unused = (
+        "hc_mix_stats_sinkhorn_deepgemm" if bf16x3 else "hc_mix_stats_sinkhorn_bf16x3"
+    )
+    x, w, scale, base = _mhc_mix_inputs(num_tokens)
+    norm = SimpleNamespace(weight=torch.ones(5120, device="cuda", dtype=torch.bfloat16))
+    layer = _hopper_mhc_layer(norm, w, scale, base)
+    with envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.override(True):
+        DeepseekV4DecoderLayer.refresh_mhc_norm_weight_cache(layer)
+        if layer._hc_attn_bf16_parts is None:
+            pytest.skip("DeepGEMM tf32_hc_prenorm_gemm is unavailable")
+        with patch.object(mhc, unused, side_effect=AssertionError(unused)):
+            actual = model_mhc.mix_stats(layer.attn_hc, x)
+    if bf16x3:
+        for result, expected in zip(actual, _mhc_mix_reference(x, w, scale, base)):
+            torch.testing.assert_close(result.double(), expected, rtol=1e-5, atol=2e-6)
 
 
 @pytest.mark.parametrize("num_tokens", [1, 4, 64, 4096])

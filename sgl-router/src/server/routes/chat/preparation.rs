@@ -21,6 +21,7 @@ use serde::Deserialize;
 use serde_json::{json, Number, Value};
 use sglang_processor::openai::{
     lower_chat, lower_completion, GenerateRequest, OpenAiHeaders, OpenAiSettings, Responder,
+    ROUTING_KEY_HEADER,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -116,6 +117,10 @@ pub(super) struct PreparedRequest {
     sampling_defaults: Vec<(SamplingField, Number)>,
     /// Turns the engine's `/generate` response back into the OpenAI one.
     pub(super) responder: Option<Responder>,
+    /// A non-streaming, single-sample native `/generate` asking for logprobs:
+    /// under PD only prefill computes the prompt, so its input logprobs go into
+    /// decode's response.
+    pub(super) merges_input_logprobs: bool,
 }
 
 impl PreparedRequest {
@@ -266,6 +271,7 @@ impl PreparedRequest {
             parsed_body,
             sampling_defaults,
             responder: None,
+            merges_input_logprobs: false,
         })
     }
 
@@ -325,6 +331,7 @@ impl PreparedRequest {
             input_ids_forwarding: None,
             forwarding_booked: false,
             responder: None,
+            merges_input_logprobs: false,
             cache_namespace: cache_namespace(COMPLETIONS_PATH, &value),
             parsed_body: Some(value),
             sampling_defaults,
@@ -339,7 +346,10 @@ impl PreparedRequest {
         body: Bytes,
     ) -> Result<Self, ApiError> {
         let value = Value::Object(serde_json::from_slice(&body).map_err(|_| invalid_request())?);
-        Self::generate_value(ctx, model, value, Some(body))
+        let return_logprob = value["return_logprob"] == true;
+        let mut request = Self::generate_value(ctx, model, value, Some(body))?;
+        request.merges_input_logprobs = return_logprob && !request.streaming && !request.fans_out;
+        Ok(request)
     }
 
     /// [`Self::generate`] over a parsed body: the client's `body` gets the
@@ -422,6 +432,7 @@ impl PreparedRequest {
             parsed_body: Some(value),
             sampling_defaults: Vec::new(),
             responder: None,
+            merges_input_logprobs: false,
         })
     }
 
@@ -544,6 +555,7 @@ impl PreparedRequest {
             input_ids_forwarding: None,
             forwarding_booked: false,
             responder: None,
+            merges_input_logprobs: false,
             parsed_body: None,
             cache_namespace: CacheNamespace::default(),
             sampling_defaults,
@@ -581,6 +593,7 @@ impl PreparedRequest {
             parsed_body: None,
             sampling_defaults: Vec::new(),
             responder: None,
+            merges_input_logprobs: false,
         }
     }
 
@@ -657,7 +670,7 @@ fn lower_openai(
     let settings = model_openai_settings(ctx, model).ok_or("engine_settings_unknown")?;
     let headers = OpenAiHeaders {
         // The router owns DP ranks; a client's header is never forwarded.
-        routing_key: header_str(headers, "x-smg-routing-key"),
+        routing_key: header_str(headers, ROUTING_KEY_HEADER),
         custom_labels: settings
             .tokenizer_metrics_custom_labels_header
             .as_deref()
@@ -728,17 +741,20 @@ pub(super) fn forwarded_prompt_ids(
 
 /// `text` as the engine's `input_ids`, of the same shape; `None` when the caller sent ids.
 fn tokenize_text(ctx: &AppContext, model: &ModelId, value: &Value) -> Option<Value> {
-    if has_caller_input_ids(value) {
+    if has_caller_input_ids(value) || !ctx.tokenizers.can_encode_prompt(&model.0) {
         return None;
     }
     let encode = |text: &Value| ctx.tokenizers.encode_prompt(&model.0, text.as_str()?);
     match &value["text"] {
         // An empty batch stays text; as `input_ids: []` it would read as one empty prompt.
-        Value::Array(texts) if !texts.is_empty() => texts
-            .iter()
-            .map(encode)
-            .collect::<Option<Vec<_>>>()
-            .map(Value::from),
+        // One handoff for the whole batch: each `encode_prompt` inside runs inline.
+        Value::Array(texts) if !texts.is_empty() => crate::off_worker::run(|| {
+            texts
+                .iter()
+                .map(encode)
+                .collect::<Option<Vec<_>>>()
+                .map(Value::from)
+        }),
         text => encode(text).map(Value::from),
     }
 }
@@ -851,13 +867,16 @@ fn tokenize_input_text(ctx: &AppContext, model: &ModelId, input: &Value) -> Opti
         text.trim_matches(|c: char| c.is_whitespace() || ('\u{1c}'..='\u{1f}').contains(&c))
             .is_empty()
     };
-    if texts.iter().any(blank) {
+    if texts.iter().any(blank) || !ctx.tokenizers.can_encode_prompt(&model.0) {
         return None;
     }
-    texts
-        .into_iter()
-        .map(|text| ctx.tokenizers.encode_prompt(&model.0, text))
-        .collect()
+    // One handoff for the whole batch: each `encode_prompt` inside runs inline.
+    crate::off_worker::run(|| {
+        texts
+            .into_iter()
+            .map(|text| ctx.tokenizers.encode_prompt(&model.0, text))
+            .collect()
+    })
 }
 
 /// Prompt text bytes of a string, a multimodal item or a list of content parts;
