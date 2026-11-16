@@ -406,7 +406,7 @@ def prepare_inputs_for_correctness_test(bench_args, tokenizer, custom_prompts):
     input_ids = [tokenizer.encode(p) for p in prompts]
     sampling_params = SamplingParams(
         temperature=0,
-        max_new_tokens=BenchArgs.output_len,
+        max_new_tokens=bench_args.output_len[0],
     )
 
     reqs = []
@@ -444,7 +444,7 @@ def prepare_extend_inputs_for_correctness_test(
 
 
 def prepare_synthetic_inputs_for_latency_test(
-    batch_size, input_len, custom_inputs=None
+    batch_size, input_len, custom_inputs=None, output_len=BenchArgs.output_len[0]
 ):
     input_ids = (
         custom_inputs
@@ -453,7 +453,7 @@ def prepare_synthetic_inputs_for_latency_test(
     )
     sampling_params = SamplingParams(
         temperature=0,
-        max_new_tokens=BenchArgs.output_len,
+        max_new_tokens=output_len,
     )
 
     reqs = []
@@ -919,8 +919,12 @@ def latency_test(
     model_runner, tokenizer = load_model(server_args, port_args, gpu_id, tp_rank)
 
     # Prepare inputs for warm up
+    # Shorter decoding to speed up the warmup.
+    warmup_output_len = min(32, bench_args.output_len[0])
     reqs = prepare_synthetic_inputs_for_latency_test(
-        bench_args.batch_size[0], bench_args.input_len[0]
+        bench_args.batch_size[0],
+        bench_args.input_len[0],
+        output_len=warmup_output_len,
     )
 
     # Warm up
@@ -932,7 +936,7 @@ def latency_test(
         reqs,
         bench_args.batch_size[0],
         bench_args.input_len[0],
-        min(32, bench_args.output_len[0]),  # shorter decoding to speed up the warmup
+        warmup_output_len,
         log_decode_step=0,
         profile=False,
         profile_record_shapes=False,
@@ -975,7 +979,9 @@ def latency_test(
                     [bs_aligned_inputs[-1]] * (bs - custom_input_len)
                 )
 
-        reqs = prepare_synthetic_inputs_for_latency_test(bs, il, bs_aligned_inputs)
+        reqs = prepare_synthetic_inputs_for_latency_test(
+            bs, il, bs_aligned_inputs, output_len=ol
+        )
         ret = latency_test_run_once(
             bench_args.run_name,
             model_runner,
