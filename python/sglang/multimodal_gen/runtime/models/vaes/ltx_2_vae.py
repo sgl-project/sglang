@@ -1869,7 +1869,7 @@ class AutoencoderKLLTX2Video(ParallelTiledVAE):
 
         batch_size, num_channels, num_frames, height, width = x.shape
 
-        if self.use_framewise_decoding and num_frames > self.tile_sample_min_num_frames:
+        if self.use_framewise_encoding and num_frames > self.tile_sample_min_num_frames:
             return self._temporal_tiled_encode(x, causal=causal)
 
         if self.use_tiling and (
