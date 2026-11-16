@@ -297,9 +297,8 @@ class ConfidenceRelay(msgspec.Struct):
         if self.ring_pos < CONFIDENCE_RELAY_RING_LAG:
             return None
         slot = (self.ring_pos - CONFIDENCE_RELAY_RING_LAG) % CONFIDENCE_RELAY_RING_DEPTH
-        # Wait instead of skipping an unfinished copy: readiness is rank-local,
-        # and TP ranks must all derive the same verify budget from this.
-        self.copy_done[slot].synchronize()
+        if not self.copy_done[slot].query():
+            return None
 
         idx_cpu = batch.req_pool_indices_cpu
         return ResolvedConfidence(
