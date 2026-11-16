@@ -358,6 +358,29 @@ test("H3-Image file URLs couple persistent output with a separate image download
   assert.equal(JSON.parse(curl(config).match(/-d '([\s\S]+)' \|/)[1]).response_format, "b64_json");
 });
 
+test("H3-Image FP8 attention is explicit and scoped to measured Spark workloads", () => {
+  const config = get("/MiniMax/MiniMax-H3-Image.mdx");
+  const dim = config.overlayDims.find((item) => item.id === "attention");
+  assert.equal(dim.default, "native");
+  const fp8 = dim.options.find((option) => option.id === "fp8");
+  assert.deepEqual(fp8.flags, ["--component-attention-backends.transformer fp8_fa_sm120"]);
+  const server = { hw: "dgx-spark", quantization: "mxfp8-all", attention: "fp8" };
+  for (const task of [
+    { size: "2048x2048" }, { size: "4736x3552" },
+    { mode: "edit", size: "4096x4096" },
+  ]) assert.equal(resolve(config, { ...server, ...task }).verified, true);
+  for (const task of [
+    { size: "6272x2688" }, { quality: "exact" }, { mode: "edit", size: "2048x2048" },
+    { mode: "edit", size: "4096x4096", references: "two" },
+  ]) assert.deepEqual(resolve(config, { ...server, ...task }).builder.verification,
+    { serve: "verified", request: "unverified" });
+  assert.equal(resolve(config, { ...server, quantization: "native" }).verified, false);
+  assert.equal(resolve(config, { ...server, hw: "rtxpro6000", placement: "resident" }).verified, false);
+  assert.match(resolve(config, { ...server, hw: "h200" }).builder.errors.join(" "), /SM120\/SM121/);
+  assert.match(resolve(config, { ...server, topology_mode: "manual", ring_degree: 2 }).builder.errors.join(" "), /Ring parallelism/);
+  assert.doesNotMatch(curl(config, server), /attention-backends/);
+});
+
 test("H3-Image request coverage does not change measured server coverage", () => {
   const config = get("/MiniMax/MiniMax-H3-Image.mdx");
   const server = { hw: "h200", gpus_per_node: 2, encoder: "fold" };
