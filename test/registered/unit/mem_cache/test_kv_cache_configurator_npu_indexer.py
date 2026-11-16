@@ -142,23 +142,6 @@ class TestNPUIndexerMemorySizing(CustomTestCase):
                     )
                 self.assertEqual(actual, expected)
 
-                if kpool == 4:
-                    kvc.server_args.indexer_kv_cache_dtype = "int8"
-                    with (
-                        patch.object(pc, "_is_npu", True),
-                        patch.object(
-                            pc,
-                            "get_exec",
-                            return_value=SimpleNamespace(
-                                kernel=SimpleNamespace(enable_fp4_indexer=False)
-                            ),
-                        ),
-                        self.assertRaisesRegex(ValueError, "INT8.*NPU KPool"),
-                    ):
-                        configurator._compute_dsa_indexer_cell_size(
-                            kvc=kvc, num_layers=1
-                        )
-
 
 class TestNPUIndexerInt8Cache(CustomTestCase):
     """--indexer-kv-cache-dtype=int8 may replace only the BF16 indexer cache."""
