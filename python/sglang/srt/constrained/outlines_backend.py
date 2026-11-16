@@ -106,6 +106,20 @@ class OutlinesGrammarBackend(BaseGrammarBackend):
             )
         self.whitespace_pattern = whitespace_pattern
 
+    # ReasonerGrammarBackend hands these hooks to every wrapper it builds; a
+    # wrapper without an inner grammar (strict thinking only) uses them.
+    @staticmethod
+    def allocate_vocab_mask(vocab_size: int, batch_size: int, device) -> torch.Tensor:
+        return torch.zeros(batch_size, vocab_size, dtype=torch.bool, device=device)
+
+    @staticmethod
+    def move_vocab_mask(vocab_mask: torch.Tensor, device) -> torch.Tensor:
+        return OutlinesGrammar.move_vocab_mask(vocab_mask, device)
+
+    @staticmethod
+    def apply_vocab_mask(logits: torch.Tensor, vocab_mask: torch.Tensor) -> None:
+        OutlinesGrammar.apply_vocab_mask(logits, vocab_mask)
+
     def _compile_regex(self, regex: str) -> BaseGrammarObject:
         try:
             if hasattr(RegexGuide, "from_regex"):
