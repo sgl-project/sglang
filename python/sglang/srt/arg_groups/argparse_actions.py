@@ -54,8 +54,9 @@ def print_deprecated_warning(message: str):
 #       -> `DeprecatedAliasStoreAction`.
 #
 # `DeprecatedAction` without `error_message=` (flags that became no-ops, e.g.
-# `--show-time-cost`), the second and the fourth have registrations today
-# (`--disable-cuda-graph`, `--enable-dp-attention`; `--monokernel-backend`).
+# `--show-time-cost`), the second, the fourth and the fifth have registrations
+# today (`--disable-cuda-graph`, `--enable-dp-attention`;
+# `--monokernel-backend`; `--mamba-max-states-per-path`).
 # The other shapes are kept because they recur -- this package has retired
 # flags of every one of them -- and the fiddly parts (`nargs=0` on a boolean,
 # where the const goes, warn-and-continue versus `parser.error`) are what a

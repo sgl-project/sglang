@@ -295,15 +295,16 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
                 self.assertEqual(getattr(args, flag[2:].replace("-", "_")), "dsv4")
 
     def test_each_deprecation_shape_does_its_job(self):
-        """The four `Deprecated*Action` shapes, on a throwaway parser.
+        """Four `Deprecated*Action` shapes, on a throwaway parser.
 
         `ServerArgs` registers `DeprecatedStoreTrueAction`
-        (`--disable-cuda-graph`, covered above, and `--enable-dp-attention`)
-        and the no-op form of `DeprecatedAction` (covered above). The other
-        two, and `DeprecatedAction` with `error_message=`, are kept for the
-        next flag that needs them, which makes this the only thing standing
-        between them and silent rot -- and it doubles as the worked example of
-        which shape to reach for.
+        (`--disable-cuda-graph`, covered above, and `--enable-dp-attention`),
+        `DeprecatedAliasStoreAction` (`--mamba-max-states-per-path`) and the
+        no-op form of `DeprecatedAction` (covered above).
+        `DeprecatedStoreConstAction` and `DeprecatedAction` with
+        `error_message=` are kept for the next flag that needs them, which
+        makes this the only thing standing between them and silent rot -- and
+        it doubles as the worked example of which shape to reach for.
         """
         from sglang.srt.arg_groups.argparse_actions import (
             DeprecatedAction,

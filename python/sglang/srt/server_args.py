@@ -351,8 +351,8 @@ class ServerArgs:
 
     # The attention-backend allow-list is enforced via
     # --enable-page-major-kv-layout (implied by the unified pool in
-    # _handle_page_major_kv_layout); the model-family gate is enforced at pool
-    # construction in model_runner_kv_cache_mixin._init_pools.
+    # handle_page_major_kv_layout); the model-family gate is enforced at pool
+    # construction in mem_cache/kv_cache_configurator.py (_init_pools).
 
     def _unified_memory_pd_transfer_backends(self) -> set[str]:
         return {"mooncake"}
