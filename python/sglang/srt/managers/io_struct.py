@@ -64,6 +64,9 @@ from sglang.srt.managers.req_types import (
     SamplingLogprobsMode,
     get_return_hidden_states_mode,
 )
+from sglang.srt.managers.scheduler_components.reasoning_effort_budget import (
+    validate_effort_hint,
+)
 from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.multimodal.mm_utils import batch_single_media_input, has_valid_data
 from sglang.srt.multimodal.modality import Modality
@@ -359,6 +362,11 @@ class GenerateReqInput:
     disagg_prefill_dp_rank: Optional[int] = None
     # Routing key for routing-key schedule policy
     routing_key: Optional[str] = None
+    # Scheduling metadata only: does not render a prompt or enable thinking.
+    # A scalar hint applies to every member of a native batched request.
+    reasoning_effort_hint: Annotated[
+        Optional[Union[str, int, float]], PlainValidator(validate_effort_hint)
+    ] = field(default=None, kw_only=True)
     # Conversation id used for tracking requests
     conversation_id: Optional[str] = None
     # Internal IPC endpoint of the HTTP/tokenizer worker that owns this request.
@@ -488,6 +496,10 @@ class GenerateReqInput:
                        text, input_ids, input_embeds are provided)
         """
         self._validate_inputs()
+        if self.reasoning_effort_hint is not None:
+            self.reasoning_effort_hint = validate_effort_hint(
+                self.reasoning_effort_hint
+            )
         self._determine_batch_size()
         if self.session_id is not None and self.session_params is not None:
             raise ValueError("session_id and session_params cannot both be set.")
@@ -1175,6 +1187,7 @@ class GenerateReqInput:
             conversation_id=self.conversation_id,
             http_worker_ipc=self.http_worker_ipc,
             require_reasoning=self.require_reasoning,
+            reasoning_effort_hint=self.reasoning_effort_hint,
             max_thinking_tokens=self.max_thinking_tokens,
             priority=self.priority,
             extra_key=self.extra_key[i] if self.extra_key is not None else None,
@@ -1324,6 +1337,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     mm_routing_labels: Optional[Dict[str, List[str]]] = None
     # See GenerateReqInput.token_ids_logprob_rows.
     token_ids_logprob_rows: Optional[List[List[int]]] = None
+
+    # Defaulted tail field: preserve positional IPC compatibility.
+    reasoning_effort_hint: Optional[str] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)

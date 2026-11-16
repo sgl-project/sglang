@@ -574,6 +574,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`1.0`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: float</td>
     </tr>
+    <tr>
+      <td>`--reasoning-effort-kv-budget`</td>
+      <td>Experimental effort-aware KV admission budget: off preserves existing behavior; scaled adjusts reservation and decay by effort; adaptive uses recent completed output lengths per effort tier. Colocated Python serving only. See [budget tuning](/docs/advanced_features/hyperparameter_tuning#adjust-kv-admission-budgets-by-reasoning-effort).</td>
+      <td>`off`</td>
+      <td><code>off</code>, <code>scaled</code>, <code>adaptive</code></td>
+    </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--retraction-policy`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>The decode retraction policy to use when the KV cache is full. 'length' preserves the existing behavior and retracts short-output, long-input requests first. 'priority' retracts lower-priority requests first, using the same priority direction as priority scheduling.</td>

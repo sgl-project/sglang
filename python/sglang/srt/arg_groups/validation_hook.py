@@ -463,6 +463,11 @@ def check_server_args(server_args: Any):
     assert cfg.schedule_conservativeness >= 0, (
         "schedule_conservativeness must be non-negative"
     )
+    if cfg.reasoning_effort_kv_budget != "off":
+        if cfg.disaggregation_mode != "null" or envs.SGLANG_RUST_SERVER.get():
+            raise ValueError(
+                "--reasoning-effort-kv-budget requires colocated Python serving"
+            )
 
     if cfg.model_impl == "mindspore":
         assert get_platform().is_npu, (

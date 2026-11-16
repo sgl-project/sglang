@@ -1544,6 +1544,70 @@ class TestKvHintsTransport(CustomTestCase):
         self.assertEqual(decoded.kv_hints, tokenized.kv_hints)
 
 
+class TestReasoningEffortTransport(CustomTestCase):
+    def test_hint_survives_parallel_sampling_tokenization_and_scheduler_creation(self):
+        from types import SimpleNamespace
+        from unittest.mock import MagicMock
+
+        from sglang.srt.managers.scheduler import Scheduler
+        from sglang.srt.managers.scheduler_components.reasoning_effort_budget import (
+            ReasoningEffortBudget,
+        )
+        from sglang.srt.managers.tokenizer_manager import TokenizerManager
+        from sglang.test.test_utils import published_topology
+
+        with published_topology(
+            reasoning_effort_kv_budget="adaptive", weight_version="v2"
+        ):
+            request = GenerateReqInput(
+                input_ids=[[1, 2], [3, 4]],
+                sampling_params={"n": 2, "max_new_tokens": 100},
+                reasoning_effort_hint=75,
+            )
+            request.normalize_batch_and_arguments()
+            manager = TokenizerManager.__new__(TokenizerManager)
+            manager.preferred_sampling_params = {}
+            manager.sampling_params_class = SamplingParams
+            manager.tokenizer = None
+            manager.model_config = SimpleNamespace(token_id_vocab_size=32)
+            manager.rid_to_state = {}
+            scheduler = Scheduler.__new__(Scheduler)
+            scheduler.reasoning_effort_budget = ReasoningEffortBudget(
+                "adaptive", initial=0.7, minimum=0.098
+            )
+            for index in range(4):
+                item = request[index]
+                manager.rid_to_state[item.rid] = SimpleNamespace(time_stats=MagicMock())
+                tokenized = manager._create_tokenized_object(item, None, item.input_ids)
+                tokenized.time_stats = None
+                tokenized.wrap_pickle_fields()
+                received = msgpack_decode(msgpack_encode(tokenized))
+                received.unwrap_pickle_fields()
+                req = scheduler._create_generation_req(
+                    received,
+                    received.rid,
+                    received.input_text,
+                    received.input_ids,
+                    received.sampling_params,
+                )
+                self.assertEqual(req.reasoning_effort_hint, "high")
+                self.assertEqual(req.reasoning_budget_weight_version, "v2")
+                self.assertEqual(req.sampling_params.max_new_tokens, 100)
+
+    def test_invalid_hint_is_rejected_before_batch_expansion(self):
+        from pydantic import TypeAdapter
+
+        for hint in (True, -1, 101, "unknown"):
+            with self.subTest(hint=hint):
+                req = GenerateReqInput(text=["a", "b"], reasoning_effort_hint=hint)
+                with self.assertRaisesRegex(ValueError, "reasoning_effort_hint"):
+                    req.normalize_batch_and_arguments()
+                with self.assertRaisesRegex(ValueError, "reasoning_effort_hint"):
+                    TypeAdapter(GenerateReqInput).validate_python(
+                        {"text": "hi", "reasoning_effort_hint": hint}
+                    )
+
+
 class TestEmbeddingReqInputGetItem(CustomTestCase):
     """Test EmbeddingReqInput.__getitem__."""
 

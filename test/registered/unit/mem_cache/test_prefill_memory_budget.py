@@ -899,6 +899,106 @@ class TestPassPricingReuse(unittest.TestCase):
 
 
 class TestRunningDecodeReservation(CustomTestCase):
+    def test_effort_budget_preserves_beam_decode_reservation(self):
+        from sglang.srt.managers.scheduler_components.reasoning_effort_budget import (
+            ReasoningEffortBudget,
+        )
+
+        adder = object.__new__(PrefillAdder)
+        adder.new_token_ratio = 0.1
+        for mode in ("off", "scaled", "adaptive"):
+            for ignore_eos in (False, True):
+                for beam_budget in (None, 0, 1200):
+                    with self.subTest(
+                        mode=mode, ignore_eos=ignore_eos, beam=beam_budget
+                    ):
+                        adder.reasoning_effort_budget = (
+                            ReasoningEffortBudget(mode, initial=0.7, minimum=0.098)
+                            if mode != "off"
+                            else None
+                        )
+                        req = Req(
+                            "running",
+                            None,
+                            array("q", [1]),
+                            SamplingParams(max_new_tokens=400, ignore_eos=ignore_eos),
+                        )
+                        req.output_ids.extend([1] * 100)
+                        req.reasoning_effort_hint = "high"
+                        req.beam_group = SimpleNamespace(
+                            decode_slot_budget=lambda: beam_budget
+                        )
+                        expected = (
+                            beam_budget
+                            if beam_budget is not None
+                            else 300 * adder._get_new_token_ratio(req)
+                        )
+                        self.assertEqual(
+                            adder._get_running_request_total_token_offset(req), expected
+                        )
+
+    def test_effort_budget_changes_admission_without_changing_the_output_limit(self):
+        from sglang.srt.managers.req_types import FINISH_LENGTH
+        from sglang.srt.managers.scheduler_components.reasoning_effort_budget import (
+            ReasoningEffortBudget,
+        )
+
+        for mode, effort, decoded, admit in (
+            ("off", "high", 100, True),
+            ("scaled", "low", 100, True),
+            ("scaled", "high", 100, False),
+            ("adaptive", "high", 100, True),
+            ("adaptive", "high", 250, False),
+        ):
+            with (
+                self.subTest(mode=mode, effort=effort, decoded=decoded),
+                published_topology(),
+            ):
+                allocator = TokenToKVPoolAllocator(
+                    2048, torch.bfloat16, "cpu", None, False
+                )
+                allocator.alloc(1248)
+                cache = RadixCache.create_simulated(mock_allocator=allocator)
+                policy = ReasoningEffortBudget(mode, initial=0.7, minimum=0.098)
+                for i in range(8):
+                    finished = Req(
+                        str(i),
+                        None,
+                        array("q", [1]),
+                        SamplingParams(max_new_tokens=400),
+                    )
+                    finished.reasoning_effort_hint = "high"
+                    finished.output_ids.extend([1] * 200)
+                    finished.finished_reason = FINISH_LENGTH(200)
+                    policy.observe(finished)
+                running = Req(
+                    "running", None, array("q", [1]), SamplingParams(max_new_tokens=400)
+                )
+                running.reasoning_effort_hint = effort
+                running.output_ids.extend([1] * decoded)
+                waiting = Req(
+                    "waiting",
+                    None,
+                    array("q", [2] * 600),
+                    SamplingParams(max_new_tokens=100),
+                )
+                waiting.init_next_round_input(cache)
+                adder = PrefillAdder(
+                    page_size=1,
+                    tree_cache=cache,
+                    token_to_kv_pool_allocator=allocator,
+                    running_batch=SimpleNamespace(reqs=[running]),
+                    new_token_ratio=0.1,
+                    rem_input_tokens=8192,
+                    rem_chunk_tokens=8192,
+                    reasoning_effort_budget=policy if mode != "off" else None,
+                )
+                adder.add_one_req(
+                    waiting, has_chunked_req=False, truncation_align_size=None
+                )
+                self.assertEqual(bool(adder.can_run_list), admit)
+                self.assertEqual(running.sampling_params.max_new_tokens, 400)
+
     def test_cached_admission_reserves_fixed_length_decode(self):
         # 900 tokens remain free. A new 600-token prompt with 100 output tokens
         # fits only if the running request can stop before its remaining 300.

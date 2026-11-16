@@ -1863,6 +1863,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 session_params=session_params,
                 custom_logit_processor=obj.custom_logit_processor,
                 require_reasoning=obj.require_reasoning,
+                reasoning_effort_hint=obj.reasoning_effort_hint,
                 return_hidden_states=obj.return_hidden_states,
                 return_routed_experts=obj.return_routed_experts,
                 routed_experts_start_len=obj.routed_experts_start_len,
