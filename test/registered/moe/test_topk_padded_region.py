@@ -8,6 +8,7 @@ import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
 import sglang.kernels.ops.moe.fill_padded_rows as fill_mod
+import sglang.kernels.ops.moe.moe_fused_gate as gate_mod
 import sglang.srt.layers.moe.topk as topk_mod
 from sglang.kernels.ops.moe.fill_padded_rows import (
     _can_fuse_padded_region,
@@ -31,8 +32,7 @@ from sglang.srt.model_executor.forward_context import (
     forward_context,
     set_forward_context,
 )
-from sglang.srt.runtime_context import get_parallel
-from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -460,6 +460,13 @@ class TestDpPadRows(CustomTestCase):
 
     DEVICE = "cuda"
 
+    def _publish_dummy_config(self):
+        # select_experts reads the published config; put the previous context
+        # back so a later test file in the same process does not inherit it.
+        override = get_context().override_server_args()
+        override.install()
+        self.addCleanup(override.restore)
+
     def test_matches_eager_across_layouts(self):
         # (DP ranks, rows per rank, cols): one row per rank, a padded graph
         # bucket, and rows wider than one block of columns.
@@ -543,8 +550,52 @@ class TestDpPadRows(CustomTestCase):
                 self.assertTrue(torch.all(weights[~live] == 0))
 
     @unittest.skipIf(_IS_HIP, "DP padding suppression requires CUDA routing")
+    def test_glm_router_masks_in_its_launch(self):
+        # GLM-5.3-Flash's router (288 experts, top-8 plus one fused shared slot,
+        # sigmoid) takes the warp router with or without DP counts: real rows
+        # match the call without counts bit for bit, and no mask runs outside
+        # the router launch.
+        self._publish_dummy_config()
+        num_experts = 288
+        counts = torch.tensor([1, 0, 3, 2], device=self.DEVICE, dtype=torch.int64)
+        num_rows = 3 * counts.numel()
+        live = _dp_live_rows(num_rows, counts)
+        x = torch.randn(num_rows, 256, device=self.DEVICE, dtype=torch.bfloat16)
+        logits = torch.randn(num_rows, num_experts, device=self.DEVICE)
+        config = TopKConfig(
+            top_k=8 + 1,
+            use_grouped_topk=True,
+            num_expert_group=1,
+            topk_group=1,
+            shared_experts=SharedExpertsConfig(num_fused_shared_experts=1),
+            correction_bias=0.1 * torch.randn(num_experts, device=self.DEVICE),
+            scoring_func="sigmoid",
+            renormalize=True,
+            routed_scaling_factor=2.5,
+            allow_routed_experts_capture=False,
+        )
+        ref = select_experts(hidden_states=x, router_logits=logits, topk_config=config)
+        extra_mask = AssertionError("DP mask launched outside the router")
+        with (
+            forward_context(
+                ForwardContext(attn_backend=None, moe_dp_real_rows=lambda: counts)
+            ),
+            patch.object(
+                topk_mod, "_mask_topk_ids_dp_pad_rows", side_effect=extra_mask
+            ),
+            patch.object(gate_mod, "_mask_dp_pad_routes", side_effect=extra_mask),
+        ):
+            got = select_experts(
+                hidden_states=x, router_logits=logits, topk_config=config
+            )
+        self.assertTrue(torch.equal(got.topk_ids[live], ref.topk_ids[live]))
+        self.assertTrue(torch.equal(got.topk_weights[live], ref.topk_weights[live]))
+        self.assertTrue(torch.all(got.topk_ids[~live] == -1))
+        self.assertTrue(torch.all(got.topk_weights[~live] == 0))
+
+    @unittest.skipIf(_IS_HIP, "DP padding suppression requires CUDA routing")
     def test_recorded_load_excludes_dp_padding(self):
-        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        self._publish_dummy_config()
         counts = torch.tensor([1, 0, 3, 2], device=self.DEVICE)
         logits = torch.randn(12, 16, device=self.DEVICE)
         x = torch.randn(12, 256, device=self.DEVICE, dtype=torch.bfloat16)
@@ -586,7 +637,7 @@ class TestDpPadRows(CustomTestCase):
 
     @unittest.skipIf(_IS_HIP, "DP padding suppression requires CUDA routing")
     def test_k3_dp_padding_uses_masked_routes_at_handoff(self):
-        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        self._publish_dummy_config()
         x = torch.randn(8, 3584, device=self.DEVICE, dtype=torch.bfloat16)
         logits = torch.randn(8, 896, device=self.DEVICE, dtype=torch.bfloat16)
         bias = torch.randn(896, device=self.DEVICE)
@@ -622,7 +673,7 @@ class TestDpPadRows(CustomTestCase):
         # GLM-5.3-Flash configures it, with a fused shared expert) or after it
         # (softmax); the TP fused MoE then returns zeros there and real rows
         # unchanged.
-        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy"))
+        self._publish_dummy_config()
         num_experts, hidden, inter = 16, 256, 128
         counts = torch.tensor([1, 0, 3, 2], device=self.DEVICE, dtype=torch.int64)
         num_rows = 3 * counts.numel()

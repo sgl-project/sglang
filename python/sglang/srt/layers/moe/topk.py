@@ -2099,6 +2099,7 @@ def biased_grouped_topk_gpu(
                 ),
                 num_expert_group=num_expert_group,
                 topk_group=topk_group,
+                **_dp_pad_rows_gate_kwargs(dp_pad_rows),
             )
     if (
         _is_cuda
@@ -2892,10 +2893,13 @@ def _post_process_topk_ids(
         # with all expert weights zeroed.
         _zero_topk_weights_padded_region(topk_weights, num_token_non_padded)
 
+    # Rows the router already sent to -1 stay -1 through the identity remap and
+    # the shared-column concat; an EPLB remap or the per-rank shared-slot remap
+    # would rewrite them.
     if dp_real_rows is not None and not (
         dp_rows_masked
         and expert_location_dispatch_info is None
-        and num_shared_topk_slots == 0
+        and not use_per_rank_shared_slots
     ):
         _mask_topk_ids_dp_pad_rows(topk_ids, dp_real_rows)
         if recorder_topk_ids is not None and recorder_topk_ids is not topk_ids:

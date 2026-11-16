@@ -273,8 +273,8 @@ def _dummy_i32(device: torch.device) -> torch.Tensor:
 def _mask_dp_pad_routes(
     routes: Tuple[torch.Tensor, torch.Tensor], dp_real_rows: Optional[torch.Tensor]
 ) -> Tuple[torch.Tensor, torch.Tensor]:
-    # The fast paths below have no padding mask; give them the Triton kernel's
-    # DP padding-row contract afterwards.
+    # The radix fast path below has no DP padding-row mask; give it the Triton
+    # kernel's contract afterwards.
     if dp_real_rows is not None:
         _fill_dp_pad_rows(routes[0], dp_real_rows, 0.0)
         _fill_dp_pad_rows(routes[1], dp_real_rows, -1)
@@ -393,10 +393,9 @@ def moe_fused_gate(
             )
 
     # One-warp-per-token CUDA router: same selection, order and padding contract
-    # as the Triton kernel below.
+    # (num_token_non_padded and DP rows) as the Triton kernel below.
     if (
         moe_softcapping == 0.0
-        and dp_real_rows is None
         and moe_route_warp.covered(
             scores.dtype,
             scores.shape[1],
@@ -425,6 +424,7 @@ def moe_fused_gate(
             input_ids=input_ids,
             bias_alt=bias_alt,
             bias_alt_token_id=bias_alt_token_id,
+            dp_real_rows=dp_real_rows,
         )
 
     M, N = scores.shape
