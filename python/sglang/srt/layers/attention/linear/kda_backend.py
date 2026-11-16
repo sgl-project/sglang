@@ -1289,8 +1289,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
         (update_mamba_state_after_mtp_verify) can commit the accepted-length state.
         """
         if mixed_qkv.shape[0] == 0:
-            # An eager attention-DP rank with no requests joins the verify step with no
-            # rows; the verify kernels require 1 + num_spec tokens per request.
+            # Idle attention-DP rank; verify kernels need 1 + num_spec tokens per req.
             return mixed_qkv.new_empty((1, 0, layer.num_v_heads, layer.head_v_dim))
         fm = self.forward_metadata
         seq_len = mixed_qkv.shape[0]
