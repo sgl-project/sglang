@@ -3,7 +3,7 @@
 import threading
 import unittest
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 
 import torch
 
@@ -758,7 +758,8 @@ class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):
         runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
         runner._is_full_backend = is_full_backend
         runner.model_runner = SimpleNamespace(
-            token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter)
+            token_to_kv_pool=SimpleNamespace(layer_transfer_counter=counter),
+            model=torch.nn.Module(),
         )
         return runner
 
@@ -794,6 +795,45 @@ class TestPrefillCudaGraphRunnerLayerLoads(CustomTestCase):
         waiter.start()
         waiter.join(timeout=5)
         self.assertFalse(waiter.is_alive())
+
+    def test_breakable_replay_of_an_external_body_waits_for_every_layer(self):
+        counter = LayerWiseLoadCounter(num_layers=3)
+        counter.set_consumer(counter.update_producer())
+        runner = self._runner(counter, is_full_backend=False)
+        runner_module.set_external_prefill_body(runner.model_runner.model, object())
+        waiter = threading.Thread(target=runner._wait_for_layer_loads, daemon=True)
+        waiter.start()
+        waiter.join(timeout=0.2)
+        self.assertTrue(waiter.is_alive())
+        for layer in range(3):
+            counter.complete(0, layer)
+        waiter.join(timeout=5)
+        self.assertFalse(waiter.is_alive())
+
+
+class TestPrefillCudaGraphRunnerBodyTables(CustomTestCase):
+    def test_an_external_body_refills_its_tables_at_capture_and_replay(self):
+        backend = MagicMock()
+        backend.init_forward_metadata_for_breakable_cuda_graph_capture.return_value = (
+            "meta"
+        )
+        runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
+        runner._dcp_extend_active = runner._is_full_backend = False
+        runner.use_captured_attn_metadata = True
+        runner.attn_metadata_buffers = {}
+        runner.model_runner = SimpleNamespace(
+            attn_backend=backend, model=torch.nn.Module()
+        )
+        body = MagicMock()
+        runner_module.set_external_prefill_body(runner.model_runner.model, body)
+        forward_batch = SimpleNamespace(moe_num_token_non_padded=None)
+        runner._init_forward_metadata_for_capture(forward_batch, "bucket")
+        runner._prepare_forward_metadata_for_replay(
+            forward_batch, SimpleNamespace(), "bucket"
+        )
+        self.assertEqual(
+            body.refill_prefill_graph.call_args_list, [call("meta", forward_batch)] * 2
+        )
 
 
 if __name__ == "__main__":

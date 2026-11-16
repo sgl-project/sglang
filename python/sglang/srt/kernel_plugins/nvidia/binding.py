@@ -18,6 +18,7 @@ import logging
 import time
 from dataclasses import dataclass
 from importlib.metadata import entry_points
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Callable, Collection, Mapping, Optional
 
 import msgspec
@@ -41,6 +42,7 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
     SupportsDraftEmbed,
     SupportsDraftSelectorHead,
     SupportsKdaCommit,
+    SupportsPrefillBody,
     SupportsRank0Broadcast,
     SupportsSampledAccept,
     find_spec,
@@ -270,8 +272,12 @@ class ForwardView:
 
     def __init__(self, backend: Any, seal_cache: Optional[Callable] = None):
         self._backend = backend
-        self.metadata = backend.forward_metadata
         self.kv_pool = KvPoolView(backend.token_to_kv_pool, seal_cache)
+
+    @property
+    def metadata(self) -> Any:
+        # Read on use: a composite backend keeps it in its children.
+        return self._backend.forward_metadata
 
     @property
     def use_fused_topk(self) -> bool:
@@ -747,7 +753,7 @@ def install_megakernel(
         reasons += _model_disable_reasons(spec=spec, model=model, hf_config=hf_config)
     _refuse(_gather_reasons(reasons))
 
-    binding = _binding_class(hf_config.architectures)(model=model)
+    binding = _binding_class(hf_config.architectures, kind=spec.binding)(model=model)
     context = BuildContext(
         widths=_kimi_build_widths(
             spec.max_rows, tokens, hf_config.architectures, is_draft=is_draft
@@ -821,12 +827,16 @@ def install_megakernel(
         binding.create_tensor_entry(built.tensor_binding_kind)
     dispatch = _Dispatch(built=built, original=model.forward, binding=binding)
     model.forward = dispatch.wrapped()
+    if spec.prefill_graph:
+        _install_prefill_body(model, spec=spec, dispatch=dispatch)
     if _decode_graphs_enabled():
         capture_tail_hooks.append(_CaptureCheck(spec=spec, dispatch=dispatch))
 
 
-def built_megakernel(model: torch.nn.Module) -> Optional[BuiltMegakernel]:
+def built_megakernel(model: Optional[torch.nn.Module]) -> Optional[BuiltMegakernel]:
     """The object the spec built for this model, or None."""
+    if model is None:
+        return None
     return model.__dict__.get("_megakernel")
 
 
@@ -1025,6 +1035,7 @@ def _entries(built: BuiltMegakernel) -> Mapping[str, Optional[Callable]]:
         "draft_loop": built.draft_loop,
         "draft_extend": built.draft_extend,
         "begin_draft_round": built.begin_draft_round,
+        "draft_step_fold": getattr(built, "draft_step_fold", None),  # optional
     }
 
 
@@ -1038,8 +1049,16 @@ def _offered_graph_variants(
     return {} if built is None or built.graph_variants is None else built.graph_variants
 
 
-def _binding_class(architectures: Optional[list[str]]) -> type:
-    """Return the binding for the first registered model architecture."""
+# MegakernelSpec.binding -> the binding SGLang builds for that spec.
+BINDING_KINDS: Mapping[str, type] = MappingProxyType(
+    {"default": MegakernelBinding, "eagle_hybrid": EagleBinding}
+)
+
+
+def _binding_class(architectures: Optional[list[str]], kind: str = "") -> type:
+    """Return the binding the spec names, else that of the first known architecture."""
+    if kind:
+        return BINDING_KINDS[kind]
     for arch in architectures or ():
         if arch in _BINDINGS:
             return _BINDINGS[arch]
@@ -1095,6 +1114,10 @@ def _requirement_reasons(
     """The spec's requirements this runner can check without the server arguments."""
     req, tp_size = spec.requires, get_parallel().tp_size
     reasons = []
+    if spec.binding and spec.binding not in BINDING_KINDS:
+        reasons.append(
+            f"binding {spec.binding!r} is not one of {sorted(BINDING_KINDS)}"
+        )
     # an empty set accepts any TP size, as at argument resolution
     if req.tp_sizes and tp_size not in req.tp_sizes:
         reasons.append(f"tp_size {tp_size} is not one of {sorted(req.tp_sizes)}")
@@ -1213,6 +1236,42 @@ class _Dispatch:
             return out
 
         return forward
+
+    def wrapped_body(self, original: Callable) -> Callable:
+        # The prefill graph runner inspects the layer module's forward signature.
+        @functools.wraps(original)
+        def forward(input_ids, positions, forward_batch, *args, **kwargs):
+            step = self.built.plan_body(input_ids, forward_batch, *args, **kwargs)
+            if step is None:
+                return original(input_ids, positions, forward_batch, *args, **kwargs)
+            return self.built.forward_body(
+                msgspec.structs.replace(step, view=self.binding.prefill_view()),
+                original,
+                input_ids,
+                positions,
+                forward_batch,
+                *args,
+                **kwargs,
+            )
+
+        return forward
+
+
+def _install_prefill_body(
+    model: torch.nn.Module, *, spec: MegakernelSpec, dispatch: _Dispatch
+) -> None:
+    """Route the layer module's forward, as the prefill graph runner resolves it."""
+    from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+        _resolve_transformer_layer_model,
+        set_external_prefill_body,
+    )
+
+    if not isinstance(dispatch.built, SupportsPrefillBody):
+        _refuse([f"{spec.name} sets prefill_graph without SupportsPrefillBody"])
+    layer_model = _resolve_transformer_layer_model(model)
+    layer_model.forward = dispatch.wrapped_body(layer_model.forward)
+    set_external_prefill_body(model, dispatch.built)
+    logger.info("NVIDIA megakernel: %s plans the prefill body", spec.name)
 
 
 class _CaptureCheck:
