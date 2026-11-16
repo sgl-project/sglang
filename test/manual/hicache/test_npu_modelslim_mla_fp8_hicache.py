@@ -1,4 +1,4 @@
-"""DeepSeek-V3.1-Terminus MLA FP8 KV, local pinned-memory L2, TP8 without MTP.
+"""DeepSeek-V3.1-Terminus MLA FP8 KV on TP8 without MTP, using ACL-registered host L2.
 
 Set DS_V3_MODELSLIM_FP8KV_MODEL_PATH to the local ModelSlim FP8 KV checkpoint.
 GSM8K_DATA_PATH optionally selects a local JSONL dataset.
@@ -37,7 +37,11 @@ class TestDeepSeekMLAFP8HiCache(ModelSlimHiCacheMixin, CustomTestCase):
         "--chunked-prefill-size",
         "1024",
     ]
-    model_env = {"SGLANG_USE_FIA_NZ": "1", "SGLANG_NPU_USE_MLAPO": "1"}
+    model_env = {
+        "SGLANG_USE_FIA_NZ": "1",
+        "SGLANG_NPU_USE_MLAPO": "1",
+        "SGLANG_HICACHE_HOST_MEM_BACKEND": "acl",
+    }
 
     def test_gsm8k(self):
         for hicache in self.accuracy_modes():
