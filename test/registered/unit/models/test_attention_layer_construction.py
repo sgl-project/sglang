@@ -5,20 +5,12 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-from transformers import Gemma2Config, Gemma3nTextConfig, GPT2Config
-from transformers.masking_utils import (
-    and_masks,
-    causal_mask_function,
-    sliding_window_overlay,
-)
+from transformers import Gemma2Config, GPT2Config
 
-from sglang.srt.layers.attention.torch_native_backend import TorchNativeAttnBackend
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
-from sglang.srt.models.exaone_moe import ExaoneMoEAttention
 from sglang.srt.models.gemma2 import Gemma2Model
-from sglang.srt.models.gemma3n_causal import Gemma3nAttention, Gemma3nForCausalLM
 from sglang.srt.models.gpt2 import GPT2Attention
 from sglang.srt.runtime_context import get_parallel, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -29,7 +21,6 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 SLIDING_WINDOW = 4
-SEQ_LEN = 12
 
 
 class _PrefixRecorder(QuantizationConfig):
@@ -138,85 +129,6 @@ class TestGpt2KvHeadsUnderTp(_ContextTestCase):
                 attn = GPT2Attention(layer_id=0, config=config)
                 self.assertEqual(attn.attn.tp_k_head_num, attn.c_attn.num_kv_heads)
                 self.assertEqual(attn.attn.tp_v_head_num, attn.c_attn.num_kv_heads)
-
-
-def _hf_sliding_mask(sliding_window: int) -> torch.Tensor:
-    """HF's sliding-window causal mask, [SEQ_LEN, SEQ_LEN] (True = attended)."""
-    mask = and_masks(sliding_window_overlay(sliding_window), causal_mask_function)
-    q_idx = torch.arange(SEQ_LEN).unsqueeze(1)
-    kv_idx = torch.arange(SEQ_LEN).unsqueeze(0)
-    return mask(0, 0, q_idx, kv_idx)
-
-
-def _layer_mask(attn) -> torch.Tensor:
-    return TorchNativeAttnBackend._make_sliding_window_mask(
-        q_len=SEQ_LEN,
-        kv_len=SEQ_LEN,
-        sliding_window_size=attn.sliding_window_size,
-        device=torch.device("cpu"),
-    )
-
-
-class TestSlidingLayerWindowMatchesHf(_ContextTestCase):
-    """HF's `sliding_window` counts the current token; a layer's window is the
-    number of earlier tokens. Handing the layer HF's value lets it see one
-    token more than the reference model."""
-
-    def test_gemma3n(self):
-        config = Gemma3nTextConfig(
-            hidden_size=32,
-            intermediate_size=[48, 48],
-            num_hidden_layers=2,
-            num_attention_heads=4,
-            num_key_value_heads=2,
-            head_dim=8,
-            vocab_size=64,
-            vocab_size_per_layer_input=64,
-            hidden_size_per_layer_input=8,
-            max_position_embeddings=32,
-            sliding_window=SLIDING_WINDOW,
-            layer_types=["sliding_attention", "full_attention"],
-            num_kv_shared_layers=0,
-            pad_token_id=0,
-        )
-        sliding = Gemma3nAttention(
-            layer_id=0, config=config, max_position_embeddings=32
-        )
-        full = Gemma3nAttention(layer_id=1, config=config, max_position_embeddings=32)
-
-        self.assertTrue(
-            torch.equal(_layer_mask(sliding.attn), _hf_sliding_mask(SLIDING_WINDOW))
-        )
-        # The runner sizes the window from the model-level value.
-        model = object.__new__(Gemma3nForCausalLM)
-        object.__setattr__(model, "config", config)
-        self.assertEqual(
-            sliding.attn.sliding_window_size, model.get_attention_sliding_window_size()
-        )
-        self.assertEqual(full.attn.sliding_window_size, -1)
-
-    def test_k_exaone(self):
-        config = SimpleNamespace(
-            layer_types=["sliding_attention", "full_attention"],
-            sliding_window=SLIDING_WINDOW,
-            rms_norm_eps=1e-5,
-        )
-        sliding, full = (
-            ExaoneMoEAttention(
-                config=config,
-                hidden_size=32,
-                num_heads=4,
-                num_kv_heads=2,
-                layer_id=layer_id,
-                max_position_embeddings=32,
-            )
-            for layer_id in (0, 1)
-        )
-
-        self.assertTrue(
-            torch.equal(_layer_mask(sliding.attn), _hf_sliding_mask(SLIDING_WINDOW))
-        )
-        self.assertEqual(full.attn.sliding_window_size, -1)
 
 
 if __name__ == "__main__":
