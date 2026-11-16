@@ -385,7 +385,15 @@ def _layer_norm_fwd(
 
 
 if _is_npu:
+    from sgl_kernel_npu.fla import layernorm_gated as _npu_layernorm_gated
     from sgl_kernel_npu.fla.layernorm_gated import layer_norm_fwd_npu as _layer_norm_fwd
+
+    # The NPU kernels only started honoring the gate activation in
+    # sgl-project/sgl-kernel-npu#1042; older packages accept the argument and
+    # silently apply swish, so fall back to allowing swish alone.
+    _NPU_GATE_ACTIVATIONS = getattr(
+        _npu_layernorm_gated, "SUPPORTED_GATE_ACTIVATIONS", ("swish",)
+    )
 
 
 def rms_norm_gated(
@@ -422,7 +430,10 @@ def rms_norm_gated(
     if bias is not None:
         bias = bias.contiguous()
     if _is_npu:
-        assert activation == "swish", "NPU only supports swish activation"
+        assert activation in _NPU_GATE_ACTIVATIONS, (
+            f"NPU gated RMSNorm supports {_NPU_GATE_ACTIVATIONS}, got {activation!r}; "
+            "a newer sgl-kernel-npu is required for this activation"
+        )
     y, mean, rstd = _layer_norm_fwd(
         x,
         weight,
