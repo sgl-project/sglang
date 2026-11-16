@@ -96,6 +96,7 @@ from sglang.srt.arg_groups.speculative_hook import handle_speculative_decoding
 from sglang.srt.arg_groups.validation_hook import (
     check_pipeline_parallel_compat,
     check_two_batch_overlap,
+    warn_multi_node_kv_events,
 )
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.entrypoints.sidecar import (
@@ -5270,6 +5271,45 @@ class TestDcpKvEventContract(CustomTestCase):
 
         args = ServerArgs(model_path="dummy", tp_size=8, dcp_size=8, page_size=1)
         self.assertEqual(kv_event_block_size_of(resolving_view(args)), 8)
+
+
+class TestMultiNodeKvEventsWarning(CustomTestCase):
+    KV_EVENTS = '{"publisher":"zmq","topic":"kv","endpoint":"tcp://*:5557"}'
+
+    def _args(self, kv_events_config=KV_EVENTS, **kwargs):
+        return ServerArgs(
+            model_path="dummy",
+            page_size=64,
+            kv_events_config=kv_events_config,
+            **kwargs,
+        )
+
+    def test_warns_when_publishing_ranks_span_nodes(self):
+        args = self._args(tp_size=16, attn_dp_size=2, nnodes=2)
+        with self.assertLogs(validation_hook.logger, level="WARNING") as logs:
+            warn_multi_node_kv_events(args)
+        self.assertIn("Only the ranks on the head node", logs.output[0])
+
+    def test_stays_silent(self):
+        cases = (
+            # Pure TP: one publishing rank.
+            dict(tp_size=16, nnodes=2),
+            # PP stages take whole nodes, so pp_rank 0's publishers stay on node 0.
+            dict(tp_size=8, pp_size=2, attn_dp_size=2, nnodes=2),
+            # Connect-style endpoint: every rank dials the collector.
+            dict(
+                tp_size=16,
+                attn_dp_size=2,
+                nnodes=2,
+                kv_events_config='{"publisher":"zmq","endpoint":"tcp://10.0.0.1:5557"}',
+            ),
+            # A non-head node serves no /server_info.
+            dict(tp_size=16, attn_dp_size=2, nnodes=2, node_rank=1),
+        )
+        for kwargs in cases:
+            with self.subTest(**kwargs):
+                with self.assertNoLogs(validation_hook.logger, level="WARNING"):
+                    warn_multi_node_kv_events(self._args(**kwargs))
 
 
 class TestTheInputIsSealedDuringResolution(CustomTestCase):
