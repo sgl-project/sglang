@@ -316,17 +316,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ matrix.rocm_version }}"
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh
+      - uses: ./.github/actions/setup-amd-ci
+        with:
+          rocm_version: ${{ matrix.rocm_version }}
 
       - name: Run test
         timeout-minutes: 30
@@ -378,17 +370,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ matrix.rocm_version }}"
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh
+      - uses: ./.github/actions/setup-amd-ci
+        with:
+          rocm_version: ${{ matrix.rocm_version }}
 
       - name: Run test
         timeout-minutes: 30
@@ -423,17 +407,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ matrix.rocm_version }}"
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh
+      - uses: ./.github/actions/setup-amd-ci
+        with:
+          rocm_version: ${{ matrix.rocm_version }}
 
       - name: Run test
         timeout-minutes: 30
@@ -464,17 +440,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ matrix.rocm_version }}"
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh
+      - uses: ./.github/actions/setup-amd-ci
+        with:
+          rocm_version: ${{ matrix.rocm_version }}
 
       - name: Run JIT kernel unit tests
         timeout-minutes: 30
@@ -505,17 +473,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ matrix.rocm_version }}"
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: |
-          bash scripts/ci/amd/amd_ci_install_dependency.sh
+      - uses: ./.github/actions/setup-amd-ci
+        with:
+          rocm_version: ${{ matrix.rocm_version }}
 
       - name: Run JIT kernel benchmarks
         timeout-minutes: 30
@@ -575,16 +535,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ matrix.rocm_version }}"
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+      - uses: ./.github/actions/setup-amd-ci
+        with:
+          rocm_version: ${{ matrix.rocm_version }}
 
       - name: Run test
         timeout-minutes: ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 90 || 75 }}
@@ -615,16 +568,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ matrix.rocm_version }}"
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+      - uses: ./.github/actions/setup-amd-ci
+        with:
+          rocm_version: ${{ matrix.rocm_version }}
 
       - name: Run test
         timeout-minutes: 75
@@ -668,19 +614,10 @@ jobs:
           # The Spur runners keep their work directory on shared storage.
           persist-credentials: ${{ matrix.runner != 'linux-sglang-mi35x-spur' }}
 
-      - name: Ensure VRAM is clear
+      - uses: ./.github/actions/setup-amd-ci
         if: matrix.runner != 'linux-sglang-mi35x-spur'
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        if: matrix.runner != 'linux-sglang-mi35x-spur'
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ matrix.rocm_version }}"
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        if: matrix.runner != 'linux-sglang-mi35x-spur'
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+        with:
+          rocm_version: ${{ matrix.rocm_version }}
 
       - name: Run test
         if: matrix.runner != 'linux-sglang-mi35x-spur'
@@ -742,16 +679,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ matrix.rocm_version }}"
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+      - uses: ./.github/actions/setup-amd-ci
+        with:
+          rocm_version: ${{ matrix.rocm_version }}
 
       - name: Run test
         timeout-minutes: ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 60 || 45 }}
@@ -784,16 +714,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ matrix.rocm_version }}"
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+      - uses: ./.github/actions/setup-amd-ci
+        with:
+          rocm_version: ${{ matrix.rocm_version }}
 
       - name: Run test
         timeout-minutes: ${{ (inputs.runner_arch || 'mi300') == 'mi300' && 120 || 45 }}
@@ -1150,16 +1073,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ matrix.rocm_version }}"
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+      - uses: ./.github/actions/setup-amd-ci
+        with:
+          rocm_version: ${{ matrix.rocm_version }}
 
       - name: Run test
         timeout-minutes: 90
@@ -1211,16 +1127,9 @@ jobs:
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
 
-      - name: Ensure VRAM is clear
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ matrix.rocm_version }}"
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+      - uses: ./.github/actions/setup-amd-ci
+        with:
+          rocm_version: ${{ matrix.rocm_version }}
 
       - name: Test RCCL multi-GPU communication
         timeout-minutes: 5
@@ -1266,19 +1175,10 @@ jobs:
           # The Spur runners keep their work directory on shared storage.
           persist-credentials: ${{ matrix.runner != 'linux-sglang-mi35x-spur' }}
 
-      - name: Ensure VRAM is clear
+      - uses: ./.github/actions/setup-amd-ci
         if: matrix.runner != 'linux-sglang-mi35x-spur'
-        run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
-
-      - name: Start CI container
-        if: matrix.runner != 'linux-sglang-mi35x-spur'
-        run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ matrix.rocm_version }}"
-        env:
-          GITHUB_WORKSPACE: ${{ github.workspace }}
-
-      - name: Install dependencies
-        if: matrix.runner != 'linux-sglang-mi35x-spur'
-        run: bash scripts/ci/amd/amd_ci_install_dependency.sh
+        with:
+          rocm_version: ${{ matrix.rocm_version }}
 
       - name: Run test
         if: matrix.runner != 'linux-sglang-mi35x-spur'
@@ -1343,6 +1243,9 @@ jobs:
         uses: actions/checkout@v4
         with:
           ref: ${{ inputs.pr_head_sha || inputs.ref || github.sha }}
+
+      # Cache-only: no sgl-router-build here. amd_ci_exec.sh maps the path into the container.
+      - uses: ./.github/actions/download-sgl-router
 
       - name: Ensure VRAM is clear
         run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
@@ -1449,10 +1352,13 @@ jobs:
           # With Mooncake v0.3.14-rc1, registering the KV cache through HIP dmabuf
           # leaves the server's next HIP stream creation failing (out of memory on
           # rocm10, segfault on rocm720). Register through ibv_reg_mr instead.
+          # UCX >= 1.24 (NIXL backend) registers ROCm memory through dmabuf by default
+          # and fails the same way; UCX_ROCM_COPY_DMABUF=no switches it to ibv_reg_mr.
           bash scripts/ci/amd/amd_ci_exec.sh \
             -e SGLANG_TEST_RDMA_DEVICE="${{ env.SGLANG_TEST_RDMA_DEVICE }}" \
             -e MC_LOG_LEVEL=TRACE \
             -e MOONCAKE_DISABLE_HIP_DMABUF=1 \
+            -e UCX_ROCM_COPY_DMABUF=no \
             -e GLOG_logtostderr=1 \
             -w "/sglang-checkout/test" python3 run_suite.py --hw amd --suite stage-b-test-large-8-gpu-mi35x-disaggregation-amd --timeout-per-file 1800 ${{ needs.check-changes.outputs.continue_on_error == 'true' && '--continue-on-error' || '' }}
 

@@ -6,7 +6,7 @@ metatags:
 
 Decode context parallelism (DCP) stripes a request's MLA KV cache across ranks in an existing tensor-parallel group. With DCP size `c`, rank `r` owns position `p` when `p mod c = r`, so each rank stores and reads roughly `1/c` of the cache.
 
-Local attention then sees only part of the context. The MLA path returns a partial output and log-sum-exp (LSE), exchanges both in one packed all-to-all, and merges them exactly. DCP complements TP and [attention data parallelism (DPA)](/docs/advanced_features/dp_dpa_smg_guide) rather than replacing them. The primary path is absorbed MLA decode and static target verification. `dcp_size=1` retains existing non-DCP behavior.
+Local attention then sees only part of the context. The MLA path returns a partial output and log-sum-exp (LSE), exchanges both in one packed all-to-all, and merges them exactly. DCP complements TP and [attention data parallelism (DPA)](/docs/advanced_features/dp_dpa_router_guide) rather than replacing them. The primary path is absorbed MLA decode and static target verification. `dcp_size=1` retains existing non-DCP behavior.
 
 On Kimi K3, DCP applies only to MLA layers. Request-indexed KDA state is unchanged, so DCP grows long-context KV capacity but does not raise the KDA concurrency ceiling.
 
