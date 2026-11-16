@@ -43,7 +43,7 @@ from sglang.srt.layers.parameter import (
 from sglang.srt.layers.utils import pad_or_narrow_weight
 from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.runtime_context import get_exec, get_forward, get_parallel
-from sglang.srt.utils import get_bool_env_var, is_cpu, is_hip, is_npu
+from sglang.srt.utils import is_cpu, is_hip, is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state import GroupCoordinator
@@ -53,9 +53,7 @@ if TYPE_CHECKING:
     )
 
 _is_hip = is_hip()
-_disable_hip_linear_quant = _is_hip and get_bool_env_var(
-    "SGLANG_ROCM_DISABLE_LINEARQUANT"
-)
+_disable_hip_linear_quant = _is_hip and envs.SGLANG_ROCM_DISABLE_LINEARQUANT.get()
 
 logger = logging.getLogger(__name__)
 
