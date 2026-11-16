@@ -456,8 +456,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             routed_experts=routed_experts,
             indexer_topk=indexer_topk,
             customized_info=recv_obj.customized_info,
-            placeholder_tokens_idx=None,
-            placeholder_tokens_val=None,
             weight_versions=recv_obj.weight_versions,
             prefill_weight_versions=recv_obj.prefill_weight_versions,
             token_steps=recv_obj.token_steps,

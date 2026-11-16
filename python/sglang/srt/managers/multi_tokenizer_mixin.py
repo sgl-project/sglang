@@ -252,8 +252,6 @@ _NOT_SPLIT_FIELDS = frozenset(
     {
         "rids",
         "http_worker_ipcs",
-        "placeholder_tokens_idx",
-        "placeholder_tokens_val",
         "output_ids_flat",
         "output_ids_offsets",
         "pooled_hidden_states",
@@ -283,12 +281,7 @@ def _handle_output_by_index(output, i):
         )
     else:
         split_fields.update(_extract_output_ids_by_indices(output, [i]))
-    return type(output)(
-        rids=[output.rids[i]],
-        placeholder_tokens_idx=None,
-        placeholder_tokens_val=None,
-        **split_fields,
-    )
+    return type(output)(rids=[output.rids[i]], **split_fields)
 
 
 def _handle_output_by_indices(output: Any, indices: List[int]) -> Any:
@@ -309,8 +302,6 @@ def _handle_output_by_indices(output: Any, indices: List[int]) -> Any:
     }
     return type(output)(
         rids=[output.rids[index] for index in indices],
-        placeholder_tokens_idx=None,
-        placeholder_tokens_val=None,
         **_extract_output_ids_by_indices(output, indices),
         **split_fields,
     )

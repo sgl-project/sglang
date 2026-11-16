@@ -105,8 +105,6 @@ def _make_batch_str_output() -> BatchStrOutput:
         output_hidden_states=[None, None],
         routed_experts=[None, None],
         indexer_topk=[None, None],
-        placeholder_tokens_idx=[None, None],
-        placeholder_tokens_val=[None, None],
         weight_versions=[
             [
                 WeightVersionSpan(version="v1", start=0, end=3),
@@ -166,8 +164,6 @@ def _make_batch_token_id_output() -> BatchTokenIDOutput:
         output_hidden_states=[None, None],
         routed_experts=[None, None],
         indexer_topk=[None, None],
-        placeholder_tokens_idx=[None, None],
-        placeholder_tokens_val=[None, None],
     )
 
 
@@ -177,8 +173,6 @@ def _make_batch_embedding_output() -> BatchEmbeddingOutput:
         finished_reasons=[None, None],
         embeddings=[[0.1, 0.2], [0.3, 0.4]],
         request_stats=[_request_stats(10, 3), _request_stats(20, 4)],
-        placeholder_tokens_idx=[None, None],
-        placeholder_tokens_val=[None, None],
     )
 
 

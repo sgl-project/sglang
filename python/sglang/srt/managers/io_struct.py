@@ -1862,12 +1862,6 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
 
     indexer_topk: Optional[List[Optional[torch.Tensor]]]
 
-    # The information of placeholder tokens (e.g., image token)
-    # idx is the index of the token in the prompt after expansion.
-    # val is the length of padded tokens after expansion.
-    placeholder_tokens_idx: Optional[List[Optional[List[int]]]]
-    placeholder_tokens_val: Optional[List[Optional[List[int]]]]
-
     # Per-item beam carrier; None entries are non-beam items in a mixed
     # batch (the whole field is None when the batch has no beam item).
     beam_search_output: Optional[List[Optional[BeamSearchOutput]]] = None
@@ -1959,12 +1953,6 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
 
     indexer_topk: Optional[List[Optional[str]]]
 
-    # The information of placeholder tokens (e.g., image token)
-    # idx is the index of the token in the prompt after expansion.
-    # val is the length of padded tokens after expansion.
-    placeholder_tokens_idx: Optional[List[Optional[List[int]]]]
-    placeholder_tokens_val: Optional[List[Optional[List[int]]]]
-
     # Per-item beam carrier; None entries are non-beam items in a mixed
     # batch (the whole field is None when the batch has no beam item).
     beam_search_output: Optional[List[Optional[BeamSearchOutput]]] = None
@@ -2026,9 +2014,6 @@ class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):
     tensor_embeddings: Optional[List[Optional[torch.Tensor]]] = None
     # Each request is output once, so every row carries its stats.
     request_stats: List[RequestOutputStats]
-    # Placeholder token info
-    placeholder_tokens_idx: Optional[List[Optional[List[int]]]]
-    placeholder_tokens_val: Optional[List[Optional[List[int]]]]
 
     # Optional pooled hidden states (pre-head transformer output).
     # Two IPC formats, disambiguated by len vs len(rids):

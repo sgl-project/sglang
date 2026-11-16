@@ -439,8 +439,6 @@ class SchedulerOutputStreamer:
                 finished_reasons=finished_reasons,
                 embeddings=embeddings,
                 request_stats=request_stats,
-                placeholder_tokens_idx=None,
-                placeholder_tokens_val=None,
                 tensor_embeddings=(
                     tensor_embeddings if has_tensor_embeddings else None
                 ),
@@ -958,8 +956,6 @@ class _GenerationStreamAccumulator:
                 if customized_info
                 else None
             ),
-            placeholder_tokens_idx=None,
-            placeholder_tokens_val=None,
             # All-None means no beam item in this batch; drop the list so
             # non-beam traffic pays no carrier cost.
             beam_search_output=(
