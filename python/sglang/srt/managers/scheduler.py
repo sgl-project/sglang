@@ -865,16 +865,6 @@ class Scheduler(
 
     def init_model_config(self):
         self.model_config = ModelConfig.from_server_args(self.server_args)
-        if _is_npu:
-            # make sure the page size is not larger than block_size and chunked_prefill_size on NPU backend
-            # the npu backend request the defined page size to be no larger than block_size and chunked_prefill_size
-            from sglang.srt.dllm.config import DllmConfig
-
-            self.dllm_config = (  # For diffusion LLM
-                DllmConfig.from_server_args(self.server_args)
-                if get_exec().dllm.dllm_algorithm is not None
-                else None
-            )
 
     def init_metrics_collector(self) -> None:
         self.metrics_collector_context = SchedulerMetricsCollector.init_new(
