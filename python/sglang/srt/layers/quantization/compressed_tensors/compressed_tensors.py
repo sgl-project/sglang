@@ -1060,6 +1060,18 @@ class CompressedTensorsConfig(QuantizationConfig):
                     return CompressedTensorsWNA16TritonMoE(
                         self, weight_quant=weight_quant
                     )
+                elif _is_xpu:
+                    # Marlin has no XPU kernel, so Triton is the only WNA16 MoE runner.
+                    if not self._is_wna16_triton_moe_supported(weight_quant):
+                        raise ValueError(
+                            "WNA16 MoE on XPU needs the Triton backend, which supports "
+                            "only symmetric INT4 group quantization with group_size=32 "
+                            "or 128 and no actorder."
+                        )
+                    logger.info_once("Using CompressedTensorsWNA16TritonMoE (XPU)")
+                    return CompressedTensorsWNA16TritonMoE(
+                        self, weight_quant=weight_quant
+                    )
                 else:
                     moe_backend = get_moe_runner_backend()
                     triton_supported = self._is_wna16_triton_moe_supported(weight_quant)
