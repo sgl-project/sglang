@@ -100,7 +100,7 @@ Agentic workloads, such as coding agents and other multi-turn, tool-using assist
   These commands are a **status snapshot** (2026-11-03) of a GB300 tuning campaign that is still running. They are not an InferenceX submission. Each was measured with the DFlash acceptance length fixed to the draft's expected value (see the note under each configuration). The aggregated deployment at concurrency 1 missed its time-to-first-token target; the other seven points met theirs.
 </Note>
 
-- **Router.** Every configuration was measured behind Dynamo (`dynamo.frontend` with `dynamo.sglang` workers and the KV-aware router with session affinity). The SGLang router (`sglang_router` in front of `sglang.launch_server` workers) is derived from the same engine settings and was not measured.
+- **Router.** Every configuration was measured behind Dynamo (`dynamo.frontend` with `dynamo.sglang` workers and the KV-aware router with session affinity). The SGLang router (`sgl-router` in front of `sglang.launch_server` workers) is derived from the same engine settings and was not measured.
 - **KV offload.** The disaggregated prefill workers were measured with HiCache in host DRAM; the aggregated workers without KV offload. The other tiers (none, HiCache, or a Mooncake store attached through the external linker) are derived and were not measured.
 - **Container image.** The commands show `<K31_IMAGE>`. The measured image was built with `docker/k31.Dockerfile` from SGLang commit `9ab3c28176` plus one unmerged change, and bundles FlashInfer 0.7.2, `sgl-deep-gemm` and a Dynamo 1.6.0 build with Kimi K3.1 Pro and session-affinity patches. `lmsysorg/sglang:dev-kimi-k31-pro` has not been checked against these commands.
 - **Draft.** The commands load the [Kimi-K3.1-Dflash2-Preview](https://huggingface.co/RadixArk/Kimi-K3.1-Dflash2-Preview) draft by its Hugging Face id; the measured runs read a local copy of it.
@@ -260,24 +260,21 @@ Pending update...
 
 ### 3.3 PD Disaggregation
 
-- **Transfer**: Mooncake (DCP rejects other backends on either role). Prefill listens on `30000`, decode on `30100`; the `8998` after `--prefill` must match `--disaggregation-bootstrap-port`.
+- **Transfer**: Mooncake (DCP rejects other backends on either role). Prefill listens on `30000`, decode on `30100`.
 - **When using DFLASH, run it on both roles**: the prefill writes the draft KV ring that decode reads.
 - **Restart the prefill role whenever the decode role restarts**: prefill keeps the old decode's Mooncake mapping.
 
 <Accordion title="Router">
 
-Use the Kimi K3.1 Pro build of `sgl-router` (the stock `sglang-router` 0.3.2 lacks the K3 chat rendering).
-
 ```bash Command
-SGLANG_ROUTER_STREAM_IDLE_TIMEOUT_SECS=3600 \
 sgl-router \
-  --pd-disaggregation \
-  --prefill http://<prefill-host>:30000 8998 \
-  --decode http://<decode-host>:30100 \
+  --model-id moonshotai/Kimi-K3.1-Pro \
+  --no-tokenizer \
+  --worker-urls http://<prefill-host>:30000 http://<decode-host>:30100 \
   --host 0.0.0.0 --port 8000 \
   --policy power_of_two \
-  --model-id moonshotai/Kimi-K3.1-Pro \
-  --tokenizer-path <Kimi-K3.1-Pro tokenizer.json> \
+  --stream-idle-timeout-secs 3600 \
+  --stale-request-timeout-secs 3600 \
   --request-timeout-secs 540
 ```
 
@@ -322,7 +319,7 @@ sgl-router \
 
 - **Container**: add `--device=/dev/infiniband --cap-add=IPC_LOCK --ulimit memlock=-1 --network=host`. On Pollara (Ionic) NICs also mount the host's `libionic-rdmav34.so` and `/etc/libibverbs.d/ionic.driver`, as the panel's commands do; without them Mooncake moves KV over TCP.
 - **Prefill host tier**: HiCache's host pools are pinned and count against the node's GTT limit, so a tier larger than that fails at startup. If yours does, lower `--hicache-ratio` or `SGLANG_HICACHE_MAMBA_HOST_RATIO`.
-- **Router**: the panel's MI355X router (`sglang_router` from the ROCm image) is the one measured.
+- **Router**: the MI355X numbers were measured behind an earlier router; the panel's MI355X command now runs `sgl-router`, which the ROCm image ships.
 
 <a id="tpu" />
 

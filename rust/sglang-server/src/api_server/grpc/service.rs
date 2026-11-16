@@ -202,7 +202,13 @@ impl SglangService for GrpcService {
         &self,
         _request: Request<api::GetHiCacheStorageRequest>,
     ) -> Result<Response<api::HiCacheStatus>, Status> {
-        Ok(Response::new(self.hicache_manager.status().await))
+        // Unlike the admin-only HTTP route, this RPC takes no key, so the
+        // backend config (it can carry S3 keys) is not returned.
+        let mut status = self.hicache_manager.status().await;
+        if status.hicache_storage_backend_extra_config.is_some() {
+            status.hicache_storage_backend_extra_config = Some("<redacted>".into());
+        }
+        Ok(Response::new(status))
     }
 
     async fn attach_hi_cache_storage(
@@ -1089,6 +1095,7 @@ mod tests {
                 success,
                 service.attach_hi_cache_storage(Request::new(api::AttachHiCacheStorageRequest {
                     hicache_storage_backend: Some("file".into()),
+                    hicache_storage_backend_extra_config_json: Some(r#"{"secret_key":"s"}"#.into()),
                     hicache_write_policy: Some("write_through".into()),
                     ..Default::default()
                 })),
@@ -1097,6 +1104,15 @@ mod tests {
             assert_eq!(response.success, success);
             assert_eq!(response.message, "backend detail");
         }
+        let status = service
+            .get_hi_cache_storage(Request::new(api::GetHiCacheStorageRequest {}))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(
+            status.hicache_storage_backend_extra_config.as_deref(),
+            Some("<redacted>")
+        );
         for success in [false, true] {
             let response = hicache_reply(
                 &h,
