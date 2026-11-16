@@ -84,7 +84,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 Agentic workloads, such as coding agents and other multi-turn, tool-using assistants, send long prompts whose prefixes grow and repeat from turn to turn. Serving them well depends on reusing the KV cache across turns, offloading it beyond GPU memory, and keeping each session on the workers that already hold its prefix. This section gives complete launch commands for such deployments, each benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) and linked to the run that measured it. Pick a hardware platform, checkpoint, deployment shape, concurrency, KV cache offloading mechanism and router to get every process of the deployment as a raw command, one tab per process in launch order.
 
-- **Router.** Each configuration was submitted behind one front door: Dynamo (`dynamo.frontend` with `dynamo.sglang` workers) or SGLang (`sglang.launch_server`, behind `sglang_router` when there are several workers or DP-attention ranks).
+- **Router.** Each configuration was submitted behind one front door: Dynamo (`dynamo.frontend` with `dynamo.sglang` workers) or SGLang (`sglang.launch_server`, behind a router when there are several workers or DP-attention ranks).
 - **KV offload.** Choose among these KV cache offloading mechanisms: none (GPU KV only), HiCache (host DRAM), or a Mooncake store attached through the external linker. The Mooncake option needs an image whose SGLang build includes `--enable-unified-cache-external-linker`.
 - **Container image.** Run the commands inside the image listed for each configuration; flag names follow that image.
 
@@ -141,7 +141,7 @@ The B300 **Low-Latency** recipe serves batch-size-1 decode through the MSA-V1 Mo
 - Requires ROCm 7.2 (Triton 3.7); earlier ROCm images are not supported.
 - **NVFP4 on MI355X:** the same `MiniMaxAI/MiniMax-M3.1-Flash` checkpoint as on NVIDIA; the routed experts are requantized to MXFP4 while loading.
 - **MXFP4 on MI350X / MI355X:** `amd/MiniMax-M3.1-Flash-Quark-MXFP4` (Quark-quantized), same command as NVFP4 Low-Latency on both; select **MI350X / MXFP4** or **MI355X / MXFP4** in the panel. Only the Low-Latency recipe has been run with this checkpoint.
-- **One server per four GPUs.** M3.1 NVFP4 on ROCm runs at `--tp 4` or less, and the server refuses a larger TP. On an 8-GPU node, start two servers with `HIP_VISIBLE_DEVICES=0,1,2,3` and `HIP_VISIBLE_DEVICES=4,5,6,7` on different ports, and put the router in front with `--policy cache_aware`.
+- **One server per four GPUs.** M3.1 NVFP4 on ROCm runs at `--tp 4` or less, and the server refuses a larger TP. On an 8-GPU node, start two servers with `HIP_VISIBLE_DEVICES=0,1,2,3` and `HIP_VISIBLE_DEVICES=4,5,6,7` on different ports, and put the router in front with `--policy cache_aware`. Start each server with `--kv-events-config` on its own port (for example `tcp://*:5557` and `tcp://*:5567`), because the router learns cached prefixes only from those events.
 - **Pick the recipe by concurrency.** Low-Latency is for up to about 32 concurrent requests. High-Throughput is for 48 or more concurrent long multi-turn sessions, such as coding agents, and adds two things to Low-Latency:
   - **Hierarchical KV cache** (`--enable-hierarchical-cache`). At the default ratio of 2, the host pools (main KV, index K and draft KV) take about 350 GB per rank, so one TP4 server needs about 1.4 TB of host memory. On a host with less free memory, the server lowers the ratio until the pools fit in 80% of it. When two servers share a host, lower `--hicache-host-memory-fraction` on each.
   - **FP8 DSpark draft KV cache** (`--speculative-draft-kv-cache-dtype fp8_e4m3`). The same memory holds 9% more tokens. The draft cache only affects which draft tokens get accepted; the target model still verifies every token.
@@ -454,19 +454,16 @@ sglang serve \
 ```
 
 ```bash Router
-python3 -m sglang_router.launch_router \
-  --pd-disaggregation \
-  --prefill http://<node-A>:30000 8998 \
-  --decode http://<node-B>:30100 \
+sgl-router \
+  --model-id MiniMaxAI/MiniMax-M3.1-Flash \
+  --no-tokenizer \
+  --worker-urls http://<node-A>:30000 http://<node-B>:30100 \
   --policy round_robin \
   --host 0.0.0.0 --port 8000
 ```
 
-The `8998` after the prefill URL is the prefill bootstrap port. It must match the prefill server's `--disaggregation-bootstrap-port`.
-
 - **HiCache host memory.** `--hicache-size` is per rank, so at DP8 the prefill node reserves 8 × 192 GB of host memory for the host pools. Lower it on nodes with less memory.
 - **MegaMoE token budget.** `SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK` must cover each rank's share of a prefill chunk (65536 / 8 here) and its largest decode or verify batch.
-- **Media options through the router.** The PD router forwards only the standard OpenAI request fields. Per-request media options such as `max_long_side_pixel` and video `fps` do not reach the servers; this was observed with sglang-router 0.3.2.
 
 <Note>
 Correctness was validated on 1P1D with TP4 on each role (8×B300, Mooncake, DSpark on both roles, HiCache on prefill). GSM8K matched colocated serving, and `--disaggregation-enable-kv-checksum` reported no mismatch. The DP8 / TP1 / EP8 layout has not been benchmarked yet.

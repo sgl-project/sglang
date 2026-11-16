@@ -25,7 +25,12 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
     parse_ib_device_config,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
+from sglang.srt.runtime_context import (
+    attn_dp_enabled_of,
+    describe_kv_events_publisher,
+    get_platform,
+    num_dp_ranks_of,
+)
 from sglang.srt.sampling.watermarking.config import (
     MAX_WATERMARK_CONTEXT_WINDOW,
     parse_watermark_key,
@@ -125,7 +130,6 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     # The Rust media fetcher caps a download at this field's default, 64 MiB.
     "media_url_max_file_size_mb",
     "enable_trace",
-    "warmups",
     "completion_template",
     "hf_chat_template_name",
     "enable_custom_logit_processor",
@@ -134,11 +138,7 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     "lora_paths",
     "tokenizer_mode",
     "tokenizer_backend",
-    # Python warns on long GCs only when this is positive.
-    "gc_warning_threshold_secs",
     "tokenizer_metrics_allowed_custom_labels",
-    # The Rust listener speaks HTTP/1 only.
-    "enable_http2",
     # The Rust multimodal pipelines keep no preprocessing-artifact cache, and
     # Python's changes the pad values of the items it serves. A model package
     # whose Rust server caches honors it (`rust_server_unsupported_args`).
@@ -162,7 +162,6 @@ def rust_server_unsupported_args(
 
     An argument counts as set when it differs from its default; where the
     default is off (``None``, ``False`` or empty), any falsy value is off too.
-    A threshold Python disables when not positive is set only when positive.
     """
     cfg = resolving_view(server_args)
     defaults = {
@@ -173,9 +172,7 @@ def rust_server_unsupported_args(
         if name in honored:
             continue
         value, default = getattr(cfg, name), defaults[name]
-        if name == "gc_warning_threshold_secs":
-            is_set = value > 0
-        elif default is None or default is False or default == []:
+        if default is None or default is False or default == []:
             is_set = bool(value)
         else:
             is_set = value != default
@@ -263,6 +260,10 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
             assert not attn_dp_enabled_of(cfg), (
                 "SGLANG_ENABLE_PP_SPEC is not compatible with attention DP "
                 "(--attn-dp-size)"
+            )
+            assert not cfg.enable_return_routed_experts, (
+                "SGLANG_ENABLE_PP_SPEC is not compatible with "
+                "--enable-return-routed-experts"
             )
         else:
             assert cfg.disaggregation_mode == "prefill", (
@@ -481,7 +482,7 @@ def check_server_args(server_args: Any):
 
     # grpc_port is None for HTTP-only launches, so the == comparison is
     # already False there; no explicit None check needed.
-    if not (cfg.smg_grpc_mode or cfg.grpc_mode) and cfg.grpc_port == cfg.port:
+    if cfg.grpc_port == cfg.port:
         raise ValueError(
             f"--grpc-port ({cfg.grpc_port}) must differ from --port ({cfg.port})"
         )
@@ -504,6 +505,7 @@ def check_server_args(server_args: Any):
     check_watermark_server_args(server_args)
 
     check_load_publish_args(server_args)
+    warn_multi_node_kv_events(server_args)
 
 
 def validate_buckets_rule(arg_name: str, buckets_rule: List[str]):
@@ -597,6 +599,57 @@ def check_load_publish_args(server_args: Any):
     )
     if reason:
         raise ValueError(reason)
+
+
+def warn_multi_node_kv_events(server_args: Any) -> None:
+    """Warn when /server_info's kv_events block cannot reach every
+    publishing rank: it advertises one host and one port base, while rank
+    ``r`` binds ``base + r`` on the node it runs on. Not an error, since
+    serving is unaffected; a subscriber just misses the remote ranks."""
+    descriptor = describe_kv_events_publisher(server_args)
+    if descriptor is None or descriptor["dp_size"] < 2:
+        return
+    cfg = resolving_view(server_args)
+    # Publishers are pp_rank 0 schedulers. PP stages take whole nodes first
+    # (`_calculate_rank_ranges` in engine.py), so pp_rank 0's TP group, and
+    # its attention-DP publishers with it, spans nnodes // pp_size nodes.
+    # Only the head node serves /server_info, so only its launcher warns.
+    if cfg.node_rank != 0 or cfg.nnodes // cfg.pp_size < 2:
+        return
+    from sglang.srt.disaggregation.kv_events import (
+        KVEventsConfig,
+        parse_bindable_tcp,
+    )
+
+    kv_config = KVEventsConfig.from_cli(cfg.kv_events_config)
+    # The publisher's own default: bind a wildcard host, connect to a
+    # concrete one. A connecting rank dials that host from any node.
+    kv_binds = kv_config.bind
+    if kv_binds is None:
+        kv_binds = parse_bindable_tcp(kv_config.endpoint) is not None
+    published = [
+        name
+        for name, binds in (
+            ("KV events", kv_binds),
+            # The load range always binds a wildcard host.
+            (
+                "load reports (--load-publish-endpoint)",
+                "load_endpoint_port_base" in descriptor,
+            ),
+        )
+        if binds
+    ]
+    if not published:
+        return
+    logger.warning(
+        f"{' and '.join(published)} are published per DP rank, and the "
+        f"{descriptor['dp_size']} publishing ranks span several of the "
+        f"{cfg.nnodes} nodes, but /server_info advertises one host and one "
+        f"port base for all of them. Only the ranks on the head node are "
+        f"reachable at the advertised address, so a router subscribing "
+        f"through /server_info (e.g. sgl-router's cache_aware policy) sees "
+        f"only part of the KV cache. Serving is unaffected."
+    )
 
 
 def validate_device_sampling_backend(

@@ -5,10 +5,30 @@ This module is intentionally lightweight (no torch import) so it can be used in 
 
 from __future__ import annotations
 
+import json
 import secrets
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Optional
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+from sglang.srt.environ import envs
+
+# The Rust server answers with the same text (`ADMIN_KEY_MISSING`).
+ADMIN_API_KEY_MISSING_MESSAGE = (
+    "This endpoint requires admin API key, but this server was started "
+    "without one (admin-api-key). Restart with --admin-api-key to enable."
+)
+
+
+def bearer_auth_headers(key: Optional[str]) -> dict:
+    """`Authorization: Bearer <key>`, or no header when there is no key."""
+    return {"Authorization": f"Bearer {key}"} if key else {}
+
+
+def admin_auth_headers(admin_api_key: Optional[str] = None) -> dict:
+    """Bearer headers for the admin endpoints: `admin_api_key`, else `SGLANG_ADMIN_API_KEY`."""
+    return bearer_auth_headers(admin_api_key or envs.SGLANG_ADMIN_API_KEY.get())
 
 
 @dataclass(frozen=True)
@@ -18,70 +38,80 @@ class AuthDecision:
 
 
 class AuthLevel(str, Enum):
-    """Per-endpoint auth level (attached to endpoint function via `@auth_level`)."""
+    """An endpoint's auth level, as `auth_levels.json` declares it."""
 
     NORMAL = "normal"
     ADMIN_OPTIONAL = "admin_optional"
     ADMIN_FORCE = "admin_force"
 
 
-def auth_level(level: AuthLevel):
-    """Mark endpoint with auth level (stored in endpoint metadata)."""
-
-    def decorator(func):
-        func._auth_level = level
-        return func
-
-    return decorator
+def _unique_keys(pairs: list) -> dict:
+    keys = [key for key, _ in pairs]
+    duplicates = sorted({key for key in keys if keys.count(key) > 1})
+    if duplicates:
+        raise ValueError(f"auth_levels.json declares {duplicates} twice")
+    return dict(pairs)
 
 
-def _iter_effective_routes(app: Any):
-    """Iterate effective routes across supported FastAPI versions."""
-    routes = getattr(getattr(app, "router", None), "routes", None) or getattr(
-        app, "routes", []
+# Every HTTP route sglang serves, by the Python and the Rust server alike, and
+# its auth level; the Rust server compiles the same file in. A route it does not
+# declare (an extension's, or one whose path an env var sets) is NORMAL.
+AUTH_LEVELS: dict[str, AuthLevel] = {
+    path: AuthLevel(level)
+    for path, level in json.loads(
+        Path(__file__).with_name("auth_levels.json").read_text(),
+        object_pairs_hook=_unique_keys,
+    ).items()
+}
+
+
+def _iter_leaf_routes(routes, prefix: str = ""):
+    """Yield `(prefix, route)`, descending into the routers FastAPI keeps nested on include."""
+    for route in routes:
+        included = getattr(route, "original_router", None)
+        if included is None:
+            yield prefix, route
+            continue
+        context = getattr(route, "include_context", None)
+        yield from _iter_leaf_routes(
+            included.routes, prefix + (getattr(context, "prefix", "") or "")
+        )
+
+
+def undeclared_routes(app: Any) -> list[str]:
+    """The routes of `app` that `auth_levels.json` does not declare."""
+    return sorted(
+        prefix + route.path
+        for prefix, route in _iter_leaf_routes(app.router.routes)
+        if prefix + route.path not in AUTH_LEVELS
     )
-    try:
-        from fastapi.routing import iter_route_contexts
-    except ImportError:
-        # FastAPI 0.137 preserves included routers without iter_route_contexts.
-        for route in routes:
-            contexts = getattr(route, "effective_route_contexts", None)
-            if contexts is not None:
-                for context in contexts():
-                    yield getattr(context, "starlette_route", None) or context
-            else:
-                yield route
-    else:
-        for context in iter_route_contexts(routes):
-            yield getattr(context, "starlette_route", None) or context
 
 
 def _get_auth_level_from_app_and_scope(app: Any, scope: dict) -> AuthLevel:
-    """Best-effort resolve auth level by matching the request to a route."""
+    """Best-effort resolve the auth level of the route Starlette's router picks,
+    a wrong method included, so it is refused at that route's level before 405."""
     # Import lazily to keep this module unit-test friendly (FastAPI/Starlette are not
     # required unless you actually use the middleware / route matching).
     from starlette.routing import Match
 
-    for route in _iter_effective_routes(app):
+    partial = None
+    for prefix, route in _iter_leaf_routes(app.router.routes):
+        if not scope["path"].startswith(prefix):
+            continue
         try:
-            match, child_scope = route.matches(scope)
+            match, _ = route.matches(
+                {**scope, "path": scope["path"][len(prefix) :]} if prefix else scope
+            )
         except Exception:
             continue
         if match == Match.FULL:
-            endpoint = child_scope.get("endpoint") or getattr(route, "endpoint", None)
-            level = getattr(endpoint, "_auth_level", None)
-            return level if isinstance(level, AuthLevel) else AuthLevel.NORMAL
+            return AUTH_LEVELS.get(prefix + route.path, AuthLevel.NORMAL)
+        if match == Match.PARTIAL and partial is None:
+            partial = prefix + route.path
 
-    return AuthLevel.NORMAL
-
-
-def app_has_admin_force_endpoints(app: Any) -> bool:
-    """Return True if any route endpoint is marked as ADMIN_FORCE."""
-    for route in _iter_effective_routes(app):
-        endpoint = getattr(route, "endpoint", None)
-        if getattr(endpoint, "_auth_level", None) == AuthLevel.ADMIN_FORCE:
-            return True
-    return False
+    if partial is None:
+        return AuthLevel.NORMAL
+    return AUTH_LEVELS.get(partial, AuthLevel.NORMAL)
 
 
 def decide_request_auth(
@@ -166,24 +196,17 @@ def decide_request_auth(
     return AuthDecision(allowed=True)
 
 
-def add_api_key_middleware(
-    app,
-    *,
-    api_key: Optional[str],
-    admin_api_key: Optional[str],
-):
-    """Add middleware for three endpoint auth levels: normal/admin_optional/admin_force."""
+def add_api_key_middleware(app, *, get_keys: Callable[[], tuple]):
+    """Enforce the endpoint auth levels; `get_keys` returns `(api_key, admin_api_key)` per request."""
     # Import lazily so `decide_request_auth()` can be unit-tested without FastAPI installed.
     from fastapi.responses import ORJSONResponse
-    from starlette.requests import HTTPConnection
+    from starlette.datastructures import Headers
 
     class _ApiKeyASGIMiddleware:
         """ASGI-native middleware to preserve client disconnect events."""
 
-        def __init__(self, app, *, api_key, admin_api_key, fastapi_app):
+        def __init__(self, app, *, fastapi_app):
             self.app = app
-            self.api_key = api_key
-            self.admin_api_key = admin_api_key
             self.fastapi_app = fastapi_app
 
         async def __call__(self, scope, receive, send):
@@ -191,41 +214,35 @@ def add_api_key_middleware(
                 await self.app(scope, receive, send)
                 return
 
-            request = HTTPConnection(scope)
-            path = request.url.path
-            authz = request.headers.get("Authorization")
-            level = _get_auth_level_from_app_and_scope(self.fastapi_app, scope)
+            api_key, admin_api_key = get_keys()
             decision = decide_request_auth(
                 method=scope.get("method", "GET"),
-                path=path,
-                authorization_header=authz,
-                api_key=self.api_key,
-                admin_api_key=self.admin_api_key,
-                auth_level=level,
+                path=scope["path"],
+                authorization_header=Headers(scope=scope).get("Authorization"),
+                api_key=api_key,
+                admin_api_key=admin_api_key,
+                auth_level=_get_auth_level_from_app_and_scope(self.fastapi_app, scope),
             )
 
-            if not decision.allowed:
-                if scope["type"] == "websocket":
-                    await send({"type": "websocket.close", "code": 1008})
-                    return
-                response = ORJSONResponse(
-                    content={
-                        "error": (
-                            "Unauthorized"
-                            if decision.error_status_code == 401
-                            else "Forbidden"
-                        )
-                    },
-                    status_code=decision.error_status_code,
-                )
-                await response(scope, receive, send)
+            if decision.allowed:
+                await self.app(scope, receive, send)
                 return
 
-            await self.app(scope, receive, send)
+            if scope["type"] == "websocket":
+                # Closing before accept makes the server answer the handshake with 403.
+                await send({"type": "websocket.close", "code": 1008})
+                return
 
-    app.add_middleware(
-        _ApiKeyASGIMiddleware,
-        api_key=api_key,
-        admin_api_key=admin_api_key,
-        fastapi_app=app,
-    )
+            response = ORJSONResponse(
+                content={
+                    "error": (
+                        "Unauthorized"
+                        if decision.error_status_code == 401
+                        else ADMIN_API_KEY_MISSING_MESSAGE
+                    )
+                },
+                status_code=decision.error_status_code,
+            )
+            await response(scope, receive, send)
+
+    app.add_middleware(_ApiKeyASGIMiddleware, fastapi_app=app)

@@ -67,7 +67,7 @@ pub struct ModelArgs {
     #[arg(long)]
     pub model_id: String,
 
-    /// Extra `model` value served as --model-id (repeatable); forwarded as --model-id,
+    /// Extra `model` value rewritten to --model-id in the forwarded body (repeatable),
     /// preserving a LoRA suffix. /v1/models lists only --model-id.
     #[arg(long = "model-alias", value_name = "MODEL")]
     pub model_alias: Vec<String>,
@@ -174,7 +174,7 @@ pub struct ServerArgs {
     /// Upper bound on the backoff between retries, in milliseconds.
     #[arg(long, default_value_t = ProxyConfig::default().max_backoff_ms)]
     pub retry_max_backoff_ms: u64,
-    /// PD: return decode's stream only once prefill completes, as sgl-model-gateway does.
+    /// PD: return decode's stream only once prefill completes.
     #[arg(long)]
     pub pd_stream_after_prefill: bool,
 
@@ -1900,7 +1900,7 @@ mod tests {
     }
 
     /// Multiple `--selector` terms AND-join into one comma-separated
-    /// label selector (matches the Python router's space-separated form).
+    /// label selector.
     #[test]
     fn k8s_plain_selector_joins_multiple_terms() {
         let c = into_config_owned(with_model(&[

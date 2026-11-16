@@ -356,7 +356,7 @@ _USE_AITER_DENSE = (
 _tgemm = None
 
 # MI355X AgentX fast paths (switches in sglang.srt.environ, all on by default).
-# Pooler / unpooler at the verify widths aiter patch 06 tunes go through aiter's
+# Pooler / unpooler at the verify widths aiter's Muse table tunes go through aiter's
 # tuned BF16 GEMM (searched hipBLASLt solutions); the FP32 router runs a tuned
 # split-K GEMM (configs in kernels/ops/gemm/configs).
 _DENSE_TUNED = envs.SGLANG_ROCM_MUSE_DENSE_TUNED.get()
@@ -394,7 +394,7 @@ def _get_tgemm():
 
 @functools.lru_cache(maxsize=1)
 def _aiter_tuned_moe_projections() -> frozenset:
-    """(N, K, M) of the pooler / unpooler GEMMs that aiter patch 06 tunes for this GPU.
+    """(N, K, M) of the pooler / unpooler GEMMs that aiter's Muse table tunes for this GPU.
 
     Read from aiter's own table (model_configs/muse_spark_bf16_tuned_gemm.csv), so it
     is the single source of the solutions; only these exact M leave nn.Linear (any
@@ -412,6 +412,10 @@ def _aiter_tuned_moe_projections() -> frozenset:
         "muse_spark_bf16_tuned_gemm.csv",
     )
     if not os.path.exists(path):
+        logger.warning(
+            "aiter has no %s (ROCm/aiter#7785); Muse pooler / unpooler GEMMs stay on nn.Linear",
+            os.path.basename(path),
+        )
         return frozenset()
     gfx, cu_num = get_gfx(), get_cu_num()
     shapes = set()
@@ -1045,8 +1049,8 @@ class MuseSpark1xMoE(nn.Module):
             and _is_rocm()
             and mxfp4_moe.COMPACT_A4_ENABLED
             and self.mxfp4_checkpoint
-            and self.tp_size == self.ep_size == 4
-            and self.num_local_experts == 64
+            and self.tp_size == self.ep_size
+            and (self.tp_size, self.num_local_experts) in ((4, 64), (8, 32))
             and self.top_k == 8
             and self.expert_hidden_size == 4096
             else None
@@ -1415,7 +1419,7 @@ class MuseSpark1xDecoderLayer(nn.Module):
             and (
                 (
                     sp is None
-                    and 0 < attn_output.shape[0] <= _FP8_MAX_ROWS
+                    and 0 < attn_output.shape[0] <= router_pooler.FP8_JOINT_MAX_M
                     and (forward_batch.forward_mode.is_decode() or target_verify)
                 )
                 or (

@@ -707,6 +707,59 @@ class TestCheckedGroups(CustomTestCase):
         )
 
 
+class TestPostLoadLogs(CustomTestCase):
+    def test_a_step_logs_once_per_layer_not_per_run(self):
+        """A repack runs again for every chunk of K experts (DeepSeek-V4: ~31 per layer):
+        its info logs appear for the first run only, and logging is restored after.
+        Control: without the quieting every run logs."""
+        import logging
+
+        class _Logging(_Repacking):
+            def process_weights_after_loading(self, layer):
+                logging.getLogger("sglang.test.postload").info("preparing")
+                super().process_weights_after_loading(layer)
+
+        for quiet, expected in ((True, 1), (False, None)):
+            layer = _w13_layer(K, 0.0)
+            loads, _ = _loads(
+                layer, E + 1, wait=True, skip=(), count=lambda e: None, num_slots=K
+            )
+            step = PostLoad(layer, _Logging(), loads, True, ())
+            patches = [patch.object(formats, "HostExpertStore", _CpuStore)]
+            if not quiet:
+                patches.append(patch.object(formats, "_quiet", contextlib.nullcontext))
+            with (
+                self.subTest(quiet=quiet),
+                contextlib.ExitStack() as stack,
+                self.assertLogs("sglang.test.postload", "INFO") as logs,
+            ):
+                for p in patches:
+                    stack.enter_context(p)
+                fill_store(step, None, K)
+            runs = step._runs
+            self.assertGreater(runs, 1)
+            self.assertEqual(len(logs.records), expected or runs)
+            self.assertEqual(logging.root.manager.disable, logging.NOTSET)
+
+    def test_other_threads_log_while_a_step_is_quiet(self):
+        """Only the repacking thread is quieted: another thread (the cache's writer) logs at
+        info meanwhile, and the quiet thread's warnings pass. Control: the quiet thread's own
+        info record is dropped."""
+        import logging
+        import threading
+
+        log = logging.getLogger("sglang.test.quiet")
+        with self.assertLogs(log, "INFO") as logs, formats._quiet():
+            log.info("mine")
+            log.warning("my warning")
+            other = threading.Thread(target=log.info, args=("other thread",))
+            other.start()
+            other.join()
+        self.assertEqual(
+            [r.getMessage() for r in logs.records], ["my warning", "other thread"]
+        )
+
+
 class TestThroughTheMethod(_CacheCase):
     def test_a_layer_that_fits_its_slots_has_no_entry(self):
         method, layer, _ = _paged_layer(load=False)
@@ -714,7 +767,9 @@ class TestThroughTheMethod(_CacheCase):
         with patch(
             _METHOD + "get_exec",
             return_value=SimpleNamespace(
-                moe=SimpleNamespace(paged_experts_enable_disk=True)
+                moe=SimpleNamespace(
+                    paged_experts_enable_disk=True, paged_experts_host_memory_gb=None
+                )
             ),
         ):
             self.assertIsNone(method._expert_cache(layer))

@@ -42,8 +42,6 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.hostIP
-        - name: INSTALL_SGLANG_FROM_SOURCE
-          value: "{{ install_sglang_from_source }}"
         - name: KUBECONFIG
           value: "{{ kube_config }}"
         - name: NAMESPACE
@@ -154,8 +152,6 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.hostIP
-        - name: INSTALL_SGLANG_FROM_SOURCE
-          value: "{{ install_sglang_from_source }}"
         - name: KUBECONFIG
           value: "{{ kube_config }}"
         - name: NAMESPACE
@@ -233,11 +229,11 @@ spec:
 apiVersion: apps/v1
 kind: StatefulSet
 metadata:
-  name: {{ kube_job_name }}-sglang-router
+  name: {{ kube_job_name }}-sgl-router
   namespace: {{ name_space }}
 spec:
   replicas: {{ router_size }}
-  serviceName: {{ kube_job_name }}-sglang-router-headless
+  serviceName: {{ kube_job_name }}-sgl-router-headless
   selector:
     matchLabels:
       app: sgl-ascend
@@ -265,8 +261,6 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: status.hostIP
-        - name: INSTALL_SGLANG_FROM_SOURCE
-          value: "{{ install_sglang_from_source }}"
         - name: KUBECONFIG
           value: "{{ kube_config }}"
         - name: NAMESPACE
@@ -328,7 +322,7 @@ spec:
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ kube_job_name }}-sglang-router-headless
+  name: {{ kube_job_name }}-sgl-router-headless
   namespace: {{ name_space }}
 spec:
   clusterIP: None

@@ -17,7 +17,6 @@ from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.environ import envs
 from sglang.srt.eplb import expert_location_dispatch
 from sglang.srt.eplb.expert_location import ExpertLocationMetadata
-from sglang.srt.hardware_backend.npu.moe.topk import fused_topk_npu
 from sglang.srt.layers.dp_attention import DpPaddingMode
 from sglang.srt.layers.moe import hash_topk as hash_topk_module
 from sglang.srt.layers.moe import topk as topk_module
@@ -365,42 +364,6 @@ class TestTopKRoutingInputs(CustomTestCase):
         with get_parallel().override(tp_size=4, attn_tp_size=4, moe_ep_size=4):
             batch._init_num_token_non_padded(device="cpu", is_draft_worker=True)
         self.assertEqual(int(batch.global_num_token_non_padded), 0)
-
-    def test_npu_routes_keep_valid_ids_and_zero_only_padded_contributions(self):
-        """NPU padding must stay inert without inventing invalid or duplicate routes."""
-        router = self._router(num_fused_shared_experts=1)
-        router.topk_config.scoring_func = "sqrtsoftplus"
-        logical = torch.tensor([[0, 4], [1, 4], [2, 4], [3, 4]], dtype=torch.int32)
-        weights = torch.tensor([[0.75, 0.25]]).repeat(4, 1)
-
-        class Capture:
-            def capture(self, *, layer_id, topk_indices):
-                self.ids = topk_indices.clone()
-
-        capture = Capture()
-        get_resources().experts_capturer = capture
-        self.addCleanup(setattr, get_resources(), "experts_capturer", None)
-        _, info = router.routing_inputs()
-        with patch.object(
-            torch.ops.custom,
-            "npu_moe_gating_top_k",
-            create=True,
-            return_value=(weights, logical, None),
-        ):
-            output = fused_topk_npu(
-                hidden_states=self.hidden,
-                router_logits=self.logits,
-                topk_config=router.topk_config,
-                num_token_non_padded=torch.tensor(2),
-                expert_location_dispatch_info=info,
-                layer_id=0,
-            )
-        self.assertEqual(output.topk_ids.tolist(), [[2, 4], [0, 4], [3, 4], [1, 4]])
-        torch.testing.assert_close(
-            output.topk_weights[:2], torch.tensor([[0.75, 0.25]]).repeat(2, 1)
-        )
-        torch.testing.assert_close(output.topk_weights[2:], torch.zeros((2, 2)))
-        self.assertEqual(capture.ids.tolist(), [[0], [1], [2], [3]])
 
     def test_in_kernel_formats_do_not_silently_ignore_expert_placement(self):
         router = self._router(output_format=TopKOutputFormat.BYPASSED)

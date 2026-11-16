@@ -17,11 +17,11 @@ from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_clien
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.argparse import FlexibleArgumentParser
 from sglang.srt.utils.auth import (
+    ADMIN_API_KEY_MISSING_MESSAGE,
+    AUTH_LEVELS,
     AuthLevel,
-    _iter_effective_routes,
+    _iter_leaf_routes,
     add_api_key_middleware,
-    app_has_admin_force_endpoints,
-    auth_level,
 )
 
 
@@ -39,12 +39,12 @@ def _server_args(api_key=None, admin_api_key=None):
 
 
 def _route_auth_level(app, path):
-    route = next(
+    next(
         route
-        for route in _iter_effective_routes(app)
-        if getattr(route, "path", None) == path
+        for prefix, route in _iter_leaf_routes(app.router.routes)
+        if prefix + route.path == path
     )
-    return getattr(route.endpoint, "_auth_level", AuthLevel.NORMAL)
+    return AUTH_LEVELS.get(path, AuthLevel.NORMAL)
 
 
 @pytest.mark.parametrize("transport", ["http", "websocket"])
@@ -71,15 +71,13 @@ def _route_auth_level(app, path):
     ],
 )
 def test_nested_routes_preserve_management_auth_level(
-    level, api_key, admin_api_key, statuses, transport
+    monkeypatch, level, api_key, admin_api_key, statuses, transport
 ):
     router = APIRouter()
 
-    @auth_level(level)
     async def management():
         return {"success": True}
 
-    @auth_level(level)
     async def management_ws(websocket: WebSocket):
         await websocket.accept()
         await websocket.send_json({"success": True})
@@ -94,9 +92,9 @@ def test_nested_routes_preserve_management_auth_level(
     app = FastAPI()
     app.include_router(outer, prefix="/api")
 
+    monkeypatch.setitem(AUTH_LEVELS, "/api/v1/management", level)
     assert _route_auth_level(app, "/api/v1/management") == level
-    assert app_has_admin_force_endpoints(app) == (level == AuthLevel.ADMIN_FORCE)
-    add_api_key_middleware(app, api_key=api_key, admin_api_key=admin_api_key)
+    add_api_key_middleware(app, get_keys=lambda: (api_key, admin_api_key))
     client = TestClient(app)
     for token, status in zip(
         (None, "wrong-secret", "user-secret", "admin-secret"), statuses
@@ -133,7 +131,7 @@ def test_websocket_auth_handshake_on_the_wire(token, status):
         await websocket.accept()
         await websocket.close()
 
-    add_api_key_middleware(app, api_key="user-secret", admin_api_key=None)
+    add_api_key_middleware(app, get_keys=lambda: ("user-secret", None))
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         listener.listen()
@@ -286,7 +284,20 @@ def test_management_routes_follow_srt_auth_policy(
         return_value=SimpleNamespace(error=None, output={"success": True})
     )
     monkeypatch.setattr(async_scheduler_client, "forward", forward)
-    client = TestClient(create_app(_server_args(api_key, admin_api_key)))
+    app = create_app(_server_args(api_key, admin_api_key))
+    forced_paths = {
+        "/update_weights_from_disk",
+        "/update_weights_from_tensor",
+        "/release_memory_occupation",
+        "/resume_memory_occupation",
+    }
+    expected_level = (
+        AuthLevel.ADMIN_FORCE if path in forced_paths else AuthLevel.ADMIN_OPTIONAL
+    )
+    assert _route_auth_level(app, path) == expected_level
+    if path in forced_paths and not admin_api_key:
+        status = 403
+    client = TestClient(app)
 
     headers = {} if token is None else {"Authorization": f"Bearer {token}"}
     assert client.post(path, json=payload, headers=headers).status_code == status
@@ -359,14 +370,14 @@ def test_cors_preflight_does_not_require_authentication():
         ("/forced", "user-secret", 403),
     ],
 )
-def test_cors_headers_on_authentication_responses(path, token, status):
+def test_cors_headers_on_authentication_responses(monkeypatch, path, token, status):
     app = create_app(_server_args(api_key="user-secret"))
 
     @app.get("/forced")
-    @auth_level(AuthLevel.ADMIN_FORCE)
     async def forced():
         return {"success": True}
 
+    monkeypatch.setitem(AUTH_LEVELS, "/forced", AuthLevel.ADMIN_FORCE)
     headers = {"Origin": "https://example.com"}
     if token is not None:
         headers["Authorization"] = f"Bearer {token}"
@@ -380,5 +391,5 @@ def test_cors_headers_on_authentication_responses(path, token, status):
     assert response.headers["access-control-allow-credentials"] == "true"
     if status in (401, 403):
         assert response.json() == {
-            "error": "Unauthorized" if status == 401 else "Forbidden"
+            "error": "Unauthorized" if status == 401 else ADMIN_API_KEY_MISSING_MESSAGE
         }
