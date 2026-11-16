@@ -70,6 +70,7 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
     state_indices_per_entry,
 )
+from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import get_cp_sharded_padded_cache_transfer_indices
@@ -310,7 +311,11 @@ class PrefillBootstrapQueue:
             shard_size=self.scheduler.kv_shard_widening,
         )
         self.transfer_backend = transfer_backend
-        self.pp_poll_sync_work_list: List = []
+        # The PP loop runs pp_size + pp_async_batch_depth rounds deep; the poll
+        # forwards must stay un-waited that long or they lock the ranks together.
+        self.pp_poll_send_window = PPSyncSendWindow(
+            parallel.pp_size + parallel.pp_async_batch_depth
+        )
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
             if self.is_mla_backend:
                 raise RuntimeError(
@@ -608,7 +613,7 @@ class PrefillBootstrapQueue:
                 self.scheduler.pp_group,
                 self.pp_rank,
                 self.pp_size,
-                self.pp_poll_sync_work_list,
+                self.pp_poll_send_window,
             )
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(

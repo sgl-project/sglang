@@ -32,8 +32,8 @@ pub mod test_support {
     pub use crate::utils::runtime::test_support::*;
 }
 pub use message::config::{
-    DefaultSamplingParams, DisaggregationMode, MetricsConfig, MmFamily, MmResample, MmSpec,
-    ModelConfig, RequestLogConfig, RustServerServerArgs, ServerArgs,
+    DefaultSamplingParams, DisaggregationMode, Http2Config, MetricsConfig, MmFamily, MmResample,
+    MmSpec, ModelConfig, RequestLogConfig, RustServerServerArgs, ServerArgs,
 };
 pub use message::multimodal::{MediaHints, MmItem};
 pub use message::request::{GenerateRequest, MediaAdmission, MmData, ProcessorFetch};
@@ -505,6 +505,7 @@ pub fn register_boundary_types(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DefaultSamplingParams>()?;
     m.add_class::<ModelConfig>()?;
     m.add_class::<MetricsConfig>()?;
+    m.add_class::<Http2Config>()?;
     m.add_class::<RequestLogConfig>()?;
     m.add_class::<ServerArgs>()?;
     m.add_class::<MmFamily>()?;

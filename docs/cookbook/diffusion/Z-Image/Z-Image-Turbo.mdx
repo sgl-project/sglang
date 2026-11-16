@@ -57,6 +57,12 @@ For complete API documentation, please refer to the [official API usage guide](/
 
 ### 4.1 Generate an Image
 
+Choose a width and height divisible by 16 for the native Z-Image pipeline.
+Other positive dimensions are rounded down to the nearest multiple of 16,
+with a minimum of 16 pixels per side: `size="1000x1000"` produces `992x992`.
+Startup warmup resolutions use the same alignment. This applies to Z-Image
+and Z-Image-Turbo; the diffusers backend keeps its own size handling.
+
 ```python Example
 import base64
 from openai import OpenAI
