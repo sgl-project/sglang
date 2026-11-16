@@ -166,6 +166,9 @@ pub(super) struct CoreInner {
     /// multimodal model's admission.
     pub(super) mm_processor: SetOnce<Arc<dyn MmProcessor>>,
     pub(super) metadata: CoreMetadata,
+    /// Opaque owning-runtime boot identity for api.v1 `/server_info`. Minted
+    /// once here; shared by every `CoreHandle` clone and protocol adapter.
+    pub(super) instance_id: String,
     pub(super) generations: Generations,
     pub(super) metrics: Option<Arc<FrontendMetrics>>,
     pub(super) request_log: Option<Arc<RequestLog>>,
@@ -220,6 +223,7 @@ impl CoreHandle {
                 multimodal: config.multimodal,
                 mm_processor: SetOnce::new(),
                 metadata: config.metadata,
+                instance_id: uuid::Uuid::new_v4().to_string(),
                 generations: Generations::default(),
                 metrics: config.metrics,
                 request_log: config.request_log,

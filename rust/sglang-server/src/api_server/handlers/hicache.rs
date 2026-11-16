@@ -13,8 +13,8 @@ use crate::message::io_struct::{
     DetachHiCacheStorageReqInput,
 };
 
-/// Python refuses storage-backend changes when the server has no admin key,
-/// even to a request the API key authenticates.
+/// Python's refusal of an `admin_force` operation when the server has no admin
+/// key, even to a request the API key authenticates.
 pub(crate) const ADMIN_KEY_MISSING: &str = "This endpoint requires admin API key, but this \
     server was started without one (admin-api-key). Restart with --admin-api-key to enable.";
 
@@ -47,10 +47,6 @@ impl HiCacheManager {
             }),
             admin_key_configured: args.api_keys.admin_api_key.is_some(),
         }
-    }
-
-    pub(crate) fn admin_key_configured(&self) -> bool {
-        self.admin_key_configured
     }
 
     /// Checked before the fan-out: every rank shares the server's keys, so a
