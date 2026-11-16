@@ -330,6 +330,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         self._metadata_prep_fork_resolved = False
 
         # --- core state ------------------------------------------------
+        self.flashinfer_graph_autotune: Optional[FlashInferGraphAutotune] = None
         self.enable_torch_compile = get_flags().capture.enable_torch_compile
         self.disable_padding = get_exec().graph.disable_cuda_graph_padding
         self.is_encoder_decoder = model_runner.model_config.is_encoder_decoder

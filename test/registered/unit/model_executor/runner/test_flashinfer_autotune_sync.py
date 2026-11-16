@@ -18,7 +18,7 @@ import sys
 import tempfile
 import traceback
 import unittest
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -28,11 +28,12 @@ import torch.distributed as dist
 
 from sglang.srt.model_executor.runner import flashinfer_autotune as autotune
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
+    FlashInferGraphAutotune,
     _autotune_cache_digest,
     _autotune_tactic_sync_group,
     _drop_diverged_autotune_cache,
 )
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.test_utils import CustomTestCase, find_available_port
 
 ENV = {"flashinfer_version": "0.6.17", "gpu": "NVIDIA GB300"}
@@ -67,6 +68,125 @@ class TestAutotuneTacticSyncGroup(CustomTestCase):
         # A 1-rank group would add a collective per tactic for no agreement.
         tp_group = SimpleNamespace(world_size=1, cpu_group=object())
         self.assertIsNone(_autotune_tactic_sync_group(tp_group))
+
+
+class TestFlashInferGraphAutotune(CustomTestCase):
+    def test_scope_requires_opt_in_cache_reuse_and_single_rank(self):
+        """Disabled or distributed deployments must keep the legacy cache path."""
+        from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+        config = get_context().override_server_args(
+            cuda_graph_config=CudaGraphConfig(),
+            moe_runner_backend="flashinfer_cutlass",
+            disable_flashinfer_autotune=False,
+            enable_torch_compile=False,
+            enable_two_batch_overlap=False,
+            enable_lora=False,
+            flashinfer_autotune_skip_ops=["fp4_gemm"],
+        )
+        config.install()
+        self.addCleanup(config.restore)
+        mr = SimpleNamespace(
+            device="cuda",
+            is_generation=True,
+            is_draft_worker=False,
+            spec_algorithm=SpeculativeAlgorithm.NONE,
+            model_config=SimpleNamespace(quantization=None),
+            model=SimpleNamespace(modules=lambda: ()),
+        )
+        sizes = dict(
+            tp_size=1,
+            pp_size=1,
+            attn_tp_size=1,
+            attn_dp_size=1,
+            attn_cp_size=1,
+            moe_tp_size=1,
+            moe_ep_size=1,
+            moe_dp_size=1,
+        )
+        cases = [
+            (True, True, {}),
+            (False, True, {}),
+            (True, False, {}),
+            (True, True, dict(tp_size=2, attn_tp_size=2, moe_tp_size=2)),
+            (True, True, dict(pp_size=2)),
+        ]
+        for enabled, reuse, topology in cases:
+            with (
+                self.subTest(enabled=enabled, reuse=reuse, topology=topology),
+                autotune.envs.SGLANG_ENABLE_FLASHINFER_GRAPH_AUTOTUNE.override(enabled),
+                autotune.envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.override(reuse),
+                get_parallel().override(**(sizes | topology)),
+                patch.object(torch.cuda, "get_device_capability", return_value=(9, 0)),
+                patch.object(dist, "is_initialized", return_value=False),
+                patch.object(
+                    autotune,
+                    "flashinfer_autotune_cache_path",
+                    return_value=Path("target.json"),
+                ),
+            ):
+                scope = FlashInferGraphAutotune.for_model(mr)
+                if enabled and reuse and not topology:
+                    self.assertIsInstance(scope, FlashInferGraphAutotune)
+                    self.assertEqual(scope.cache_root, Path("target.decode_graph"))
+                    self.assertEqual(scope.skip_ops, frozenset({"fp4_gemm"}))
+                else:
+                    self.assertIsNone(scope)
+
+    def test_capture_restores_warmup_state_and_legacy_scope(self):
+        """Capture sees cleaned inputs and strict replay; errors restore legacy lookup."""
+        scope = FlashInferGraphAutotune(Path("graph-cache"), {"fp4_gemm"})
+        for failure in (None, "tune", "capture"):
+            active = [("legacy", False)]
+            scratch = []
+
+            @contextmanager
+            def autotune_v2(
+                *, mode, cache_root, cache_scope, skip_ops, strict_replay=False
+            ):
+                self.assertEqual(cache_root, scope.cache_root)
+                self.assertEqual(cache_scope, "context")
+                self.assertEqual(skip_ops, scope.skip_ops)
+                active.append((mode, strict_replay))
+                try:
+                    yield
+                finally:
+                    active.pop()
+
+            def forward():
+                self.assertEqual(active[-1], ("tune", False))
+                scratch.append("warmup")
+                if failure == "tune":
+                    raise ValueError("injected")
+
+            def cleanup():
+                self.assertEqual(active, [("legacy", False)])
+                self.assertEqual(scratch, ["warmup"])
+                scratch.clear()
+
+            with (
+                self.subTest(failure=failure),
+                patch.dict(
+                    sys.modules,
+                    {"flashinfer": SimpleNamespace(autotune_v2=autotune_v2)},
+                ),
+                patch.object(
+                    torch.cuda, "is_current_stream_capturing", return_value=False
+                ),
+            ):
+                expected = (
+                    self.assertRaisesRegex(ValueError, "injected")
+                    if failure
+                    else nullcontext()
+                )
+                with expected, scope.capture_context(forward, cleanup):
+                    self.assertFalse(scratch)
+                    self.assertEqual(active[-1], ("replay", True))
+                    if failure == "capture":
+                        raise ValueError("injected")
+                self.assertEqual(active, [("legacy", False)])
+                self.assertFalse(scratch)
 
 
 class TestMegaMoEAutotuneStartup(CustomTestCase):

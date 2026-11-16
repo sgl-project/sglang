@@ -486,17 +486,15 @@ class FlashInferGraphAutotune:
             return None
         # TP=1 alone does not exclude pipeline, data or expert parallelism.
         parallel = get_parallel()
-        if any(
-            getattr(parallel, size) != 1
-            for size in (
-                "tp_size",
-                "pp_size",
-                "attn_dp_size",
-                "attn_cp_size",
-                "moe_ep_size",
-                "moe_dp_size",
-            )
-        ) or (
+        sizes = (
+            parallel.tp_size,
+            parallel.pp_size,
+            parallel.attn_dp_size,
+            parallel.attn_cp_size,
+            parallel.moe_ep_size,
+            parallel.moe_dp_size,
+        )
+        if any(size != 1 for size in sizes) or (
             torch.distributed.is_initialized()
             and torch.distributed.get_world_size() != 1
         ):

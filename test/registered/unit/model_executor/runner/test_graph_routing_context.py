@@ -173,6 +173,7 @@ class TestGraphRoutingContext(CustomTestCase):
         model_runner = self._model_runner(device="cuda", model=model)
         runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
         runner.model_runner = model_runner
+        runner.flashinfer_graph_autotune = None
         runner.captured_req_width = 1
         runner.ragged_verify_mode = False
         runner.pp_size = 1
