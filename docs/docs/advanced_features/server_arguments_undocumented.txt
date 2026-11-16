@@ -69,7 +69,6 @@
 --shared-experts-tp-size
 --sidecar
 --sidecar-args
---smg-grpc-mode
 --spec-trace-dir
 --speculative-domino-candidate-pool-size
 --speculative-draft-kv-cache-dtype
