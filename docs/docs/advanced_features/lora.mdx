@@ -149,11 +149,15 @@ terminate_process(server_process)
 
 Instead of specifying all adapters during server startup via `--lora-paths`. You can also load & unload LoRA adapters dynamically via the `/load_lora_adapter` and `/unload_lora_adapter` API.
 
+Both are admin endpoints: launch the server with `SGLANG_ADMIN_API_KEY=<key>` set (or pass `--admin-api-key <key>`) and send `Authorization: Bearer <key>` with each call. Without an admin key configured, the server answers HTTP 403 (`--api-key` does not unlock them).
+
 When using dynamic LoRA loading, it's recommended to explicitly specify both `--max-lora-rank` and `--lora-target-modules` at startup. For backward compatibility, SGLang will infer these values from `--lora-paths` if they are not explicitly provided. However, in that case, you would have to ensure that all dynamically loaded adapters share the same shape (rank and target modules) as those in the initial `--lora-paths` or are strictly "smaller".
 
 
 
 ```python Example
+import os
+
 lora0 = "Nutanix/Meta-Llama-3.1-8B-Instruct_SFT_lora_4_alpha_16_humaneval_raw_json"  # rank - 4, target modules - q_proj, k_proj, v_proj, o_proj, gate_proj
 lora1 = "algoprog/fact-generation-llama-3.1-8b-instruct-lora"  # rank - 64, target modules - q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
 lora0_new = "philschmid/code-llama-3-1-8b-text-to-sql-lora"  # rank - 256, target modules - q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj
@@ -161,6 +165,7 @@ lora0_new = "philschmid/code-llama-3-1-8b-text-to-sql-lora"  # rank - 256, targe
 
 # The `--lora-target-modules` param below is technically not needed, as the server will infer it from lora0 which already has all the target modules specified.
 # We are adding it here just to demonstrate usage.
+os.environ["SGLANG_ADMIN_API_KEY"] = "your-admin-api-key"
 server_process, port = launch_server_cmd(
     """
     python3 -m sglang.launch_server --model-path meta-llama/Meta-Llama-3.1-8B-Instruct \
@@ -175,6 +180,8 @@ server_process, port = launch_server_cmd(
 
 url = f"http://127.0.0.1:{port}"
 wait_for_server(url)
+
+admin_headers = {"Authorization": f"Bearer {os.environ['SGLANG_ADMIN_API_KEY']}"}
 ```
 
 Load adapter lora0
@@ -184,6 +191,7 @@ Load adapter lora0
 ```python Example
 response = requests.post(
     url + "/load_lora_adapter",
+    headers=admin_headers,
     json={
         "lora_name": "lora0",
         "lora_path": lora0,
@@ -203,6 +211,7 @@ Load adapter lora1:
 ```python Example
 response = requests.post(
     url + "/load_lora_adapter",
+    headers=admin_headers,
     json={
         "lora_name": "lora1",
         "lora_path": lora1,
@@ -245,6 +254,7 @@ Unload lora0 and replace it with a different adapter:
 ```python Example
 response = requests.post(
     url + "/unload_lora_adapter",
+    headers=admin_headers,
     json={
         "lora_name": "lora0",
     },
@@ -252,6 +262,7 @@ response = requests.post(
 
 response = requests.post(
     url + "/load_lora_adapter",
+    headers=admin_headers,
     json={
         "lora_name": "lora0",
         "lora_path": lora0_new,
@@ -338,6 +349,7 @@ You can also specify adapter as pinned during dynamic adapter loading. In the ex
 ```python Example
 response = requests.post(
     url + "/unload_lora_adapter",
+    headers=admin_headers,
     json={
         "lora_name": "lora1",
     },
@@ -345,6 +357,7 @@ response = requests.post(
 
 response = requests.post(
     url + "/load_lora_adapter",
+    headers=admin_headers,
     json={
         "lora_name": "lora1",
         "lora_path": "algoprog/fact-generation-llama-3.1-8b-instruct-lora",
