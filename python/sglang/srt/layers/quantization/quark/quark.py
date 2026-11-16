@@ -394,9 +394,6 @@ class QuarkConfig(QuantizationConfig):
         )
         return layer_types, len(self._online_quantized_layers)
 
-    def get_linear_method(self) -> "QuarkLinearMethod":
-        return QuarkLinearMethod(self)
-
     @classmethod
     def get_supported_act_dtypes(cls) -> list[torch.dtype]:
         return [torch.float16, torch.bfloat16]

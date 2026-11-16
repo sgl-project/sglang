@@ -364,9 +364,6 @@ class ModelSlimConfig(QuantizationConfig):
                 return candidate
         return prefix
 
-    def get_linear_method(self) -> ModelSlimLinearMethod:
-        return ModelSlimLinearMethod(self)
-
     @classmethod
     def get_supported_act_dtypes(cls) -> List[torch.dtype]:
         return [torch.int8, torch.float16, torch.bfloat16]
