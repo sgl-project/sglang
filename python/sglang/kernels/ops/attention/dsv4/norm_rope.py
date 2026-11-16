@@ -179,15 +179,7 @@ def fused_norm_rope_inplace(
 ) -> None:
     freq_cis = torch.view_as_real(freq_cis).flatten(-2)
     module = _jit_fused_norm_rope_module(kv.dtype, kv.shape[-1], freq_cis.shape[-1])
-    module.forward(
-        kv,
-        weight,
-        positions,
-        freq_cis,
-        2,
-        eps,
-        0,
-    )
+    module.forward(kv, weight, positions, freq_cis, eps)
 
 
 def fused_q_norm_rope(

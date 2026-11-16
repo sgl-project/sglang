@@ -395,10 +395,7 @@ struct ActivationKernel {
           << "too many items for 32-bit indexing: " << num_items;
       constexpr auto kernel = silu_and_mul_rounded_table_kernel<T, kUsePDL, kReuseInput>;
       constexpr std::size_t kSmemBytes = kSiluTableSize * sizeof(T);
-      [[maybe_unused]] static const bool smem_set = [&] {
-        RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
-        return true;
-      }();
+      runtime::set_max_dynamic_smem_per_device<kernel>(device, kSmemBytes);
       const auto num_sm = runtime::get_sm_count(device.device_id);
       const auto per_sm = runtime::get_blocks_per_sm(kernel, kSiluTableThreads, kSmemBytes);
       const auto num_blocks = std::min<uint64_t>(

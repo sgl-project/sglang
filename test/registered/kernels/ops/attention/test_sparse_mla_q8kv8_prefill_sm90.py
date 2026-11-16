@@ -451,7 +451,7 @@ def test_sparse_mla_q8kv8_prefill_caller_owned_buffers():
     not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
 )
 def test_sparse_mla_q8kv8_prefill_rejects_bad_buffers():
-    """Validation: wrong shape/dtype and aliasing must raise ValueError."""
+    """Validation: wrong shape/dtype (C++ launcher) and aliasing (Python) must raise."""
     from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
         sparse_mla_q8kv8_prefill_fwd,
     )
@@ -478,12 +478,12 @@ def test_sparse_mla_q8kv8_prefill_rejects_bad_buffers():
 
     # Wrong dtype.
     bad_out = torch.empty((s_q, H_Q, D_V), dtype=torch.float16, device="cuda")
-    with pytest.raises(ValueError):
+    with pytest.raises(RuntimeError):
         _call(out=bad_out)
 
     # Wrong shape.
     bad_ml = torch.empty((s_q + 1, H_Q), dtype=torch.float32, device="cuda")
-    with pytest.raises(ValueError):
+    with pytest.raises(RuntimeError):
         _call(max_logits=bad_ml)
 
     # Aliased max_logits / lse.
@@ -491,9 +491,12 @@ def test_sparse_mla_q8kv8_prefill_rejects_bad_buffers():
     with pytest.raises(ValueError):
         _call(max_logits=shared, lse=shared)
 
-    # d_v != 512.
+    # d_v != 512, with and without a caller-owned out.
     with pytest.raises(ValueError):
         _call(d_v=256)
+    good_out = torch.empty((s_q, H_Q, D_V), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError):
+        _call(d_v=256, out=good_out)
 
 
 # ---------------------------------------------------------------------------

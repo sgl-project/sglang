@@ -23,6 +23,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <cstdint>
@@ -105,8 +106,9 @@ SGL_DEVICE void prepare(float2 (&t)[8][4], Smem& sm, int kt1, int ti, int tj, in
       if (!band) t[r][CP] = make_float2(0.f, 0.f);
     }
 #pragma unroll
-    for (int q = 0; q < 4; ++q)
+    for (int q = 0; q < 4; ++q) {
       st4(dst + 4 * q, g[2 * q], g[2 * q + 1]);
+    }
   }
   if (ti == kt1) {
     const float det = fmaf(pa, pd, -pb * pc);
@@ -262,17 +264,20 @@ __global__ void __launch_bounds__(kBlockSize, kMinBlocksPerSm) vdn_delta_factors
 
   // injection = B X  (register-tiled GEMM; B rows from global through L1, X from smem)
 #pragma unroll
-  for (int r = 0; r < 8; ++r)
+  for (int r = 0; r < 8; ++r) {
 #pragma unroll
-    for (int cp = 0; cp < 4; ++cp)
+    for (int cp = 0; cp < 4; ++cp) {
       t[r][cp] = make_float2(0.f, 0.f);
+    }
+  }
   const float* Bp = Bn + i0 * kDim;
 #pragma unroll 1
   for (int k = 0; k < kDim; k += 4) {
     float4 b[8];
 #pragma unroll
-    for (int r = 0; r < 8; ++r)
+    for (int r = 0; r < 8; ++r) {
       b[r] = __ldg(reinterpret_cast<const float4*>(Bp + r * kDim + k));
+    }
 #pragma unroll
     for (int kk = 0; kk < 4; ++kk) {
       const float* xr = Xs + (k + kk) * kDim;
@@ -283,8 +288,9 @@ __global__ void __launch_bounds__(kBlockSize, kMinBlocksPerSm) vdn_delta_factors
       for (int r = 0; r < 8; ++r) {
         const float2 bv = f2(get(b[r], kk));
 #pragma unroll
-        for (int cp = 0; cp < 4; ++cp)
+        for (int cp = 0; cp < 4; ++cp) {
           t[r][cp] = fma2(bv, xv[cp], t[r][cp]);
+        }
       }
     }
   }
@@ -318,27 +324,29 @@ struct VdnDeltaFactorsKernel {
       tvm::ffi::TensorView B,
       tvm::ffi::TensorView alpha) {
     using namespace host;
-    CHECK_HOST(A.ndim() >= 2 && A.size(-2) == kDim && A.size(-1) == kDim)
-        << "vdn_delta_factors expects [..., 128, 128] matrices";
-    auto dtype = SymbolicDType{};
-    dtype.set_options<fp32_t>();
+    // [..., 128, 128] with any leading dimensions, so the rank check is by hand.
+    const int64_t rank = A.ndim();
+    CHECK_HOST(rank >= 2) << "vdn_delta_factors expects [..., 128, 128] matrices";
     auto device = SymbolicDevice{};
     device.set_options<kDLCUDA>();
-    for (const auto tensor : {A, B, transition, injection, alpha}) {
-      dtype.verify(tensor.dtype());
-      device.verify(tensor.device());
-      CHECK_HOST(tensor.is_contiguous()) << "vdn_delta_factors expects contiguous tensors";
-    }
-    for (const auto tensor : {B, transition, injection}) {
-      CHECK_HOST(tensor.ndim() == A.ndim()) << "vdn_delta_factors matrix ranks must match";
-      for (int64_t dim = 0; dim < A.ndim(); ++dim) {
-        CHECK_HOST(tensor.size(dim) == A.size(dim)) << "vdn_delta_factors matrix shapes must match";
+    const auto verify = [&](const tvm::ffi::TensorView t, int64_t t_rank) {
+      CHECK_HOST(t.ndim() == t_rank && is_type<fp32_t>(t.dtype()) && t.is_contiguous())
+          << "vdn_delta_factors expects contiguous fp32 [..., 128, 128] matrices and [..., 128] alpha";
+      for (int64_t dim = 0; dim < rank - 2; ++dim) {
+        CHECK_HOST(t.size(dim) == A.size(dim)) << "vdn_delta_factors: leading dimensions must match A";
       }
+      for (int64_t dim = rank - 2; dim < t_rank; ++dim) {
+        CHECK_HOST(t.size(dim) == kDim) << "vdn_delta_factors: trailing dimensions must be 128";
+      }
+      device.verify(t.device());
+      // Every tensor is read or written as float4: a storage offset breaks this.
+      CHECK_HOST(reinterpret_cast<uintptr_t>(t.data_ptr()) % 16 == 0)
+          << "vdn_delta_factors needs 16-byte aligned tensors";
+    };
+    for (const auto t : {A, B, transition, injection}) {
+      verify(t, rank);
     }
-    CHECK_HOST(alpha.ndim() == A.ndim() - 1) << "alpha must have shape A.shape[:-1]";
-    for (int64_t dim = 0; dim < alpha.ndim(); ++dim) {
-      CHECK_HOST(alpha.size(dim) == A.size(dim)) << "alpha must have shape A.shape[:-1]";
-    }
+    verify(alpha, rank - 1);
     const int64_t num = A.numel() / (kDim * kDim);
     if (num == 0) return;
     CHECK_HOST(
@@ -346,22 +354,9 @@ struct VdnDeltaFactorsKernel {
         injection.data_ptr() != A.data_ptr() && injection.data_ptr() != B.data_ptr() &&
         transition.data_ptr() != injection.data_ptr())
         << "vdn_delta_factors outputs must not alias inputs";
-    // every tensor is read or written as float4; a storage offset breaks this
-    const auto aligned16 = [](const void* p) { return reinterpret_cast<uintptr_t>(p) % 16 == 0; };
-    CHECK_HOST(
-        aligned16(A.data_ptr()) && aligned16(B.data_ptr()) && aligned16(alpha.data_ptr()) &&
-        aligned16(transition.data_ptr()) && aligned16(injection.data_ptr()))
-        << "vdn_delta_factors needs 16-byte aligned tensors";
     const DLDevice dev = device.unwrap();
     // 64 KB of dynamic shared memory needs the opt-in, once per device.
-    static bool attr_set[64] = {};
-    const int dev_id = dev.device_id;
-    CHECK_HOST(dev_id >= 0 && dev_id < 64) << "vdn_delta_factors: unexpected device id " << dev_id;
-    if (!attr_set[dev_id]) {
-      CHECK_CUDA(cudaFuncSetAttribute(vdn_delta_factors_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kXsBytes))
-          << "vdn_delta_factors: cannot reserve " << kXsBytes << " bytes of dynamic shared memory";
-      attr_set[dev_id] = true;
-    }
+    runtime::set_max_dynamic_smem_per_device<vdn_delta_factors_kernel>(dev, kXsBytes);
     LaunchKernel(static_cast<uint32_t>(num), kBlockSize, dev, kXsBytes)(
         vdn_delta_factors_kernel,
         static_cast<const float*>(A.data_ptr()),

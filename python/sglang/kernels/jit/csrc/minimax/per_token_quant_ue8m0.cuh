@@ -140,20 +140,37 @@ void per_token_quant_ue8m0_scatter(
   auto MM = SymbolicSize{"m_max"};
   auto G4 = SymbolicSize{"num_groups_div_4"};
   device.set_options<kDLGPU>();
-  TensorMatcher({M, H}).with_dtype<bf16_t>().with_device(device).verify(x);
-  TensorMatcher({E, MM, H}).with_dtype<fp8_e4m3_t>().with_device(device).verify(gateup_input);
-  TensorMatcher({E, G4, MM}).with_dtype<int32_t>().with_device(device).verify(gateup_input_scale);
+  TensorMatcher({M, H})  // x
+      .with_dtype<bf16_t>()
+      .with_device(device)
+      .verify(x);
+  TensorMatcher({E, MM, H})  // gateup_input
+      .with_dtype<fp8_e4m3_t>()
+      .with_device(device)
+      .verify(gateup_input);
+  TensorMatcher({E, G4, MM})  // gateup_input_scale
+      .with_dtype<int32_t>()
+      .with_device(device)
+      .verify(gateup_input_scale);
+  TensorMatcher({M.unwrap() * kTopK})  // src2dst, flat [num_tokens, topk]
+      .with_dtype<int32_t>()
+      .with_device(device)
+      .verify(src2dst);
+  TensorMatcher({M, kTopK})  // topk_ids, not read by the kernel
+      .with_dtype<int32_t, int64_t>()
+      .with_device(device)
+      .verify(topk_ids);
 
   const uint32_t num_tokens = static_cast<uint32_t>(M.unwrap());
   const uint32_t hidden = static_cast<uint32_t>(H.unwrap());
-  RuntimeCheck(hidden % kGroupSize == 0, "hidden ", hidden, " not divisible by group_size ", kGroupSize);
+  CHECK_HOST(hidden % kGroupSize == 0) << "hidden " << hidden << " not divisible by group_size " << kGroupSize;
   const uint32_t num_groups = hidden / static_cast<uint32_t>(kGroupSize);
-  RuntimeCheck(num_groups % 4 == 0, "num_groups must be a multiple of 4 for int32 packing");
-  RuntimeCheck(static_cast<uint32_t>(G4.unwrap()) * 4 == num_groups, "scale G/4 mismatch");
-  RuntimeCheck(static_cast<uint32_t>(MM.unwrap()) == static_cast<uint32_t>(m_max), "m_max mismatch");
+  CHECK_HOST(num_groups % 4 == 0) << "num_groups must be a multiple of 4 for int32 packing";
+  CHECK_HOST(static_cast<uint32_t>(G4.unwrap()) * 4 == num_groups) << "scale G/4 mismatch";
+  CHECK_HOST(MM.unwrap() == m_max) << "m_max mismatch";
   const uint32_t threads = hidden / 8;  // kVecElems
-  RuntimeCheck(threads <= 1024, "hidden/8 must be <= 1024, got ", threads);
-  RuntimeCheck(topk == kTopK, "topk does not match compiled template");
+  CHECK_HOST(threads <= 1024) << "hidden/8 must be <= 1024, got " << threads;
+  CHECK_HOST(topk == kTopK) << "topk does not match compiled template";
 
   const auto params = PerTokenQuantUe8m0ScatterParams{
       .x = static_cast<const bf16_t*>(x.data_ptr()),

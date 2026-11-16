@@ -41,6 +41,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/math.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
@@ -290,8 +291,7 @@ SGL_DEVICE float inv_temperature(float t) {
 
 // Argmax key (order-preserving fp32 << 32) | (0xFFFFFFFF - row): the max is the best score, ties take the smallest row
 SGL_DEVICE uint64_t pack_key(float score, uint32_t row) {
-  const auto bits = __float_as_uint(score);
-  const auto ordered = (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
+  const auto ordered = device::math::to_ordered(score);
   return (static_cast<uint64_t>(ordered) << 32) | static_cast<uint64_t>(0xFFFFFFFFu - row);
 }
 

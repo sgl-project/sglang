@@ -8,7 +8,6 @@ import pytest
 import torch
 
 from sglang.kernels.ops.attention.dsv4 import (
-    CompressorDecodePlan,
     compress_norm_rope_store,
     fused_q_indexer_rope_hadamard_fp4_quant,
 )
@@ -25,6 +24,7 @@ from sglang.kernels.ops.kvcache.dsv4_fp4_index_k_cache import store_fp4_index_k_
 from sglang.srt.utils import get_device, is_xpu
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.deepseek_v4.common import (
+    make_legacy_context,
     quantize_fp4_indexer_ref,
     store_fp4_index_cache_ref,
 )
@@ -55,10 +55,7 @@ def test_fp4_fused_norm_rope_store_layout(num_tokens: int) -> None:
         torch.arange(1, num_tokens + 1, device=get_device(), dtype=torch.int64)
         * compress_ratio
     )
-    req_pool_indices = torch.arange(num_tokens, device=get_device(), dtype=torch.int64)
-    plan = CompressorDecodePlan.generate_legacy(
-        compress_ratio, req_pool_indices, seq_lens
-    )
+    plan = make_legacy_context(num_tokens, compress_ratio).make_decode_plan(seq_lens)
     loc = torch.arange(num_tokens, device=get_device(), dtype=torch.int64)
     freqs_cis = precompute_freqs_cis(
         64, int(seq_lens.max().item()) + 1, 0, 10000, 1, 32, 1

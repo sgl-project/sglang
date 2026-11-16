@@ -4,9 +4,11 @@
 
 #pragma once
 
+#include <sgl_kernel/bits.h>
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <tvm/ffi/container/tensor.h>
@@ -14,24 +16,14 @@
 #include "fast_hadamard_transform.h"
 #include "fast_hadamard_transform_common.h"
 #include "fast_hadamard_transform_special.h"
-#include "static_switch.h"
 #include <algorithm>
 #include <cstdint>
-#include <cstring>
+#include <tuple>
+#include <type_traits>
 
 namespace sglang {
 
 using ::HadamardParamsBase;
-
-constexpr inline int ceil_log2(int val) {
-  int log = 0;
-  int p = 1;
-  while (p < val) {
-    p <<= 1;
-    ++log;
-  }
-  return log;
-}
 
 template <int kNThreads_, int kLogN_, typename input_t_>
 struct FastHadamardKernelTraits {
@@ -70,18 +62,6 @@ struct FastHadamardMNKernelTraits {
   static_assert(kNExchangeRounds * kSmemExchangeSize == N * 4);
   static constexpr int kSmemSize = kSmemExchangeSize;
 };
-
-template <int kNThreads_, int kLogN_, typename input_t_>
-using FastHadamard12NTraits = FastHadamardMNKernelTraits<kNThreads_, kLogN_, 12, 12 * 1024, 24 * 1024, input_t_>;
-
-template <int kNThreads_, int kLogN_, typename input_t_>
-using FastHadamard20NTraits = FastHadamardMNKernelTraits<kNThreads_, kLogN_, 20, 20 * 1024, 40 * 1024, input_t_>;
-
-template <int kNThreads_, int kLogN_, typename input_t_>
-using FastHadamard28NTraits = FastHadamardMNKernelTraits<kNThreads_, kLogN_, 28, 28 * 1024, 28 * 1024, input_t_>;
-
-template <int kNThreads_, int kLogN_, typename input_t_>
-using FastHadamard40NTraits = FastHadamardMNKernelTraits<kNThreads_, kLogN_, 40, 40 * 1024, 40 * 1024, input_t_>;
 
 template <int kNChunks>
 SGL_DEVICE void hadamard_mult_thread_chunk_12(float x[kNChunks][12]) {
@@ -195,285 +175,82 @@ __global__ __launch_bounds__(Ktraits::kNThreads) void fast_hadamard_transform_ke
   store_output<kNChunks, kNElts, input_t>(out, x_vals, params.dim, params.scale);
 }
 
-template <typename Ktraits>
-inline void set_max_dynamic_smem() {
-  constexpr int kSmemSize = Ktraits::kSmemSize;
-  if constexpr (kSmemSize >= 48 * 1024) {
-    auto kernel = &fast_hadamard_transform_kernel<Ktraits>;
-    host::RuntimeDeviceCheck(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemSize));
+// Upstream's launch shapes as compile-time tables.
+// Threads per row of the power-of-two sizes, indexed by kLogN (3..15).
+inline constexpr int kPow2NumThreads[] = {0, 0, 0, 1, 2, 4, 8, 16, 32, 32, 128, 256, 256, 256, 256, 256};
+// (multiple, max dim, max exchange smem bytes) of the multiple x 2^kLogN sizes.
+inline constexpr std::tuple<int, int, int> kMNConfigs[] = {
+    {12, 12 * 1024, 24 * 1024},
+    {20, 20 * 1024, 40 * 1024},
+    {28, 28 * 1024, 28 * 1024},
+    {40, 40 * 1024, 40 * 1024},
+};
+
+constexpr auto find_mn_config(int multiple) -> std::tuple<int, int, int> {
+  for (const auto& config : kMNConfigs) {
+    if (std::get<0>(config) == multiple) return config;
   }
+  return {0, 0, 0};
 }
 
-template <typename Ktraits>
-inline void launch_kernel(HadamardParamsBase& params, DLDevice device) {
-  constexpr int kSmemSize = Ktraits::kSmemSize;
-  set_max_dynamic_smem<Ktraits>();
-  auto kernel = &fast_hadamard_transform_kernel<Ktraits>;
-  host::LaunchKernel(dim3(params.batch), dim3(Ktraits::kNThreads), device, kSmemSize)(kernel, params);
-  host::RuntimeDeviceCheck();
-}
-
-template <int kNThreads, int kLogN, typename input_t>
-inline void fast_hadamard_transform_launch(HadamardParamsBase& params, DLDevice device) {
-  using Ktraits = FastHadamardKernelTraits<kNThreads, kLogN, input_t>;
-  launch_kernel<Ktraits>(params, device);
-}
-
-template <typename input_t>
-inline void fast_hadamard_transform_cuda(HadamardParamsBase& params, DLDevice device) {
-  if (params.log_N == 3) {
-    fast_hadamard_transform_launch<1, 3, input_t>(params, device);
-  } else if (params.log_N == 4) {
-    fast_hadamard_transform_launch<2, 4, input_t>(params, device);
-  } else if (params.log_N == 5) {
-    fast_hadamard_transform_launch<4, 5, input_t>(params, device);
-  } else if (params.log_N == 6) {
-    fast_hadamard_transform_launch<8, 6, input_t>(params, device);
-  } else if (params.log_N == 7) {
-    fast_hadamard_transform_launch<16, 7, input_t>(params, device);
-  } else if (params.log_N == 8) {
-    fast_hadamard_transform_launch<32, 8, input_t>(params, device);
-  } else if (params.log_N == 9) {
-    fast_hadamard_transform_launch<32, 9, input_t>(params, device);
-  } else if (params.log_N == 10) {
-    fast_hadamard_transform_launch<128, 10, input_t>(params, device);
-  } else if (params.log_N == 11) {
-    fast_hadamard_transform_launch<256, 11, input_t>(params, device);
-  } else if (params.log_N == 12) {
-    fast_hadamard_transform_launch<256, 12, input_t>(params, device);
-  } else if (params.log_N == 13) {
-    fast_hadamard_transform_launch<256, 13, input_t>(params, device);
-  } else if (params.log_N == 14) {
-    fast_hadamard_transform_launch<256, 14, input_t>(params, device);
-  } else if (params.log_N == 15) {
-    fast_hadamard_transform_launch<256, 15, input_t>(params, device);
-  } else {
-    host::Panic("fast_hadamard_transform: unsupported log_N=", params.log_N);
-  }
-}
-
-template <int kNThreads, int kLogN, typename input_t>
-inline void fast_hadamard_transform_12N_launch(HadamardParamsBase& params, DLDevice device) {
-  using Ktraits = FastHadamard12NTraits<kNThreads, kLogN, input_t>;
-  launch_kernel<Ktraits>(params, device);
-}
-
-template <typename input_t>
-inline void fast_hadamard_transform_12N_cuda(HadamardParamsBase& params, DLDevice device) {
-  if (params.log_N == 2) {
-    fast_hadamard_transform_12N_launch<1, 2, input_t>(params, device);
-  } else if (params.log_N == 3) {
-    fast_hadamard_transform_12N_launch<2, 3, input_t>(params, device);
-  } else if (params.log_N == 4) {
-    fast_hadamard_transform_12N_launch<4, 4, input_t>(params, device);
-  } else if (params.log_N == 5) {
-    fast_hadamard_transform_12N_launch<8, 5, input_t>(params, device);
-  } else if (params.log_N == 6) {
-    fast_hadamard_transform_12N_launch<16, 6, input_t>(params, device);
-  } else if (params.log_N == 7) {
-    fast_hadamard_transform_12N_launch<32, 7, input_t>(params, device);
-  } else if (params.log_N == 8) {
-    fast_hadamard_transform_12N_launch<64, 8, input_t>(params, device);
-  } else if (params.log_N == 9) {
-    fast_hadamard_transform_12N_launch<128, 9, input_t>(params, device);
-  } else if (params.log_N == 10) {
-    fast_hadamard_transform_12N_launch<256, 10, input_t>(params, device);
-  } else {
-    host::Panic("fast_hadamard_transform_12N: unsupported log_N=", params.log_N);
-  }
-}
-
-template <int kNThreads, int kLogN, typename input_t>
-inline void fast_hadamard_transform_20N_launch(HadamardParamsBase& params, DLDevice device) {
-  using Ktraits = FastHadamard20NTraits<kNThreads, kLogN, input_t>;
-  launch_kernel<Ktraits>(params, device);
-}
-
-template <typename input_t>
-inline void fast_hadamard_transform_20N_cuda(HadamardParamsBase& params, DLDevice device) {
-  if (params.log_N == 2) {
-    fast_hadamard_transform_20N_launch<1, 2, input_t>(params, device);
-  } else if (params.log_N == 3) {
-    fast_hadamard_transform_20N_launch<2, 3, input_t>(params, device);
-  } else if (params.log_N == 4) {
-    fast_hadamard_transform_20N_launch<4, 4, input_t>(params, device);
-  } else if (params.log_N == 5) {
-    fast_hadamard_transform_20N_launch<8, 5, input_t>(params, device);
-  } else if (params.log_N == 6) {
-    fast_hadamard_transform_20N_launch<16, 6, input_t>(params, device);
-  } else if (params.log_N == 7) {
-    fast_hadamard_transform_20N_launch<32, 7, input_t>(params, device);
-  } else if (params.log_N == 8) {
-    fast_hadamard_transform_20N_launch<64, 8, input_t>(params, device);
-  } else if (params.log_N == 9) {
-    fast_hadamard_transform_20N_launch<128, 9, input_t>(params, device);
-  } else if (params.log_N == 10) {
-    fast_hadamard_transform_20N_launch<256, 10, input_t>(params, device);
-  } else {
-    host::Panic("fast_hadamard_transform_20N: unsupported log_N=", params.log_N);
-  }
-}
-
-template <int kNThreads, int kLogN, typename input_t>
-inline void fast_hadamard_transform_28N_launch(HadamardParamsBase& params, DLDevice device) {
-  using Ktraits = FastHadamard28NTraits<kNThreads, kLogN, input_t>;
-  launch_kernel<Ktraits>(params, device);
-}
-
-template <typename input_t>
-inline void fast_hadamard_transform_28N_cuda(HadamardParamsBase& params, DLDevice device) {
-  if (params.log_N == 2) {
-    fast_hadamard_transform_28N_launch<1, 2, input_t>(params, device);
-  } else if (params.log_N == 3) {
-    fast_hadamard_transform_28N_launch<2, 3, input_t>(params, device);
-  } else if (params.log_N == 4) {
-    fast_hadamard_transform_28N_launch<4, 4, input_t>(params, device);
-  } else if (params.log_N == 5) {
-    fast_hadamard_transform_28N_launch<8, 5, input_t>(params, device);
-  } else if (params.log_N == 6) {
-    fast_hadamard_transform_28N_launch<16, 6, input_t>(params, device);
-  } else if (params.log_N == 7) {
-    fast_hadamard_transform_28N_launch<32, 7, input_t>(params, device);
-  } else if (params.log_N == 8) {
-    fast_hadamard_transform_28N_launch<64, 8, input_t>(params, device);
-  } else if (params.log_N == 9) {
-    fast_hadamard_transform_28N_launch<128, 9, input_t>(params, device);
-  } else if (params.log_N == 10) {
-    fast_hadamard_transform_28N_launch<256, 10, input_t>(params, device);
-  } else {
-    host::Panic("fast_hadamard_transform_28N: unsupported log_N=", params.log_N);
-  }
-}
-
-template <int kNThreads, int kLogN, typename input_t>
-inline void fast_hadamard_transform_40N_launch(HadamardParamsBase& params, DLDevice device) {
-  using Ktraits = FastHadamard40NTraits<kNThreads, kLogN, input_t>;
-  launch_kernel<Ktraits>(params, device);
-}
-
-template <typename input_t>
-inline void fast_hadamard_transform_40N_cuda(HadamardParamsBase& params, DLDevice device) {
-  if (params.log_N == 2) {
-    fast_hadamard_transform_40N_launch<1, 2, input_t>(params, device);
-  } else if (params.log_N == 3) {
-    fast_hadamard_transform_40N_launch<2, 3, input_t>(params, device);
-  } else if (params.log_N == 4) {
-    fast_hadamard_transform_40N_launch<4, 4, input_t>(params, device);
-  } else if (params.log_N == 5) {
-    fast_hadamard_transform_40N_launch<8, 5, input_t>(params, device);
-  } else if (params.log_N == 6) {
-    fast_hadamard_transform_40N_launch<16, 6, input_t>(params, device);
-  } else if (params.log_N == 7) {
-    fast_hadamard_transform_40N_launch<32, 7, input_t>(params, device);
-  } else if (params.log_N == 8) {
-    fast_hadamard_transform_40N_launch<64, 8, input_t>(params, device);
-  } else if (params.log_N == 9) {
-    fast_hadamard_transform_40N_launch<128, 9, input_t>(params, device);
-  } else if (params.log_N == 10) {
-    fast_hadamard_transform_40N_launch<256, 10, input_t>(params, device);
-  } else {
-    host::Panic("fast_hadamard_transform_40N: unsupported log_N=", params.log_N);
-  }
-}
-
-inline void set_hadamard_params(
-    HadamardParamsBase& params,
-    int64_t batch,
-    int64_t dim,
-    int64_t multiple,
-    const tvm::ffi::TensorView x,
-    const tvm::ffi::TensorView out,
-    float scale) {
-  std::memset(&params, 0, sizeof(params));
-  params.batch = static_cast<int>(batch);
-  params.dim = static_cast<int>(dim);
-  params.log_N = ceil_log2(static_cast<int>(dim / multiple));
-  params.x_ptr = const_cast<void*>(x.data_ptr());
-  params.out_ptr = const_cast<void*>(out.data_ptr());
-  params.x_batch_stride = x.stride(0);
-  params.out_batch_stride = out.stride(0);
-  params.scale = scale;
-}
-
-template <int kMultiple, typename DType>
-inline void run_hadamard(const tvm::ffi::TensorView x, const tvm::ffi::TensorView out, float scale) {
-  using namespace host;
-
-  auto N = SymbolicSize{"batch"};
-  auto D = SymbolicSize{"dim"};
-  auto SX = SymbolicSize{"x_batch_stride"};
-  auto SO = SymbolicSize{"out_batch_stride"};
-  auto device = SymbolicDevice{};
-  device.set_options<kDLGPU>();
-
-  TensorMatcher({N, D}).with_strides({SX, 1}).with_dtype<DType>().with_device(device).verify(x);
-  TensorMatcher({N, D}).with_strides({SO, 1}).with_dtype<DType>().with_device(device).verify(out);
-
-  const int64_t batch = N.unwrap();
-  const int64_t dim = D.unwrap();
-
-  RuntimeCheck(dim % kMultiple == 0, "hadamard: dim must be divisible by ", kMultiple);
-
-  HadamardParamsBase params;
-  set_hadamard_params(params, batch, dim, kMultiple, x, out, scale);
-
-  if constexpr (kMultiple == 1) {
-    RuntimeCheck(dim % 8 == 0, "fast_hadamard_transform only supports hidden dim divisible by 8");
-    RuntimeCheck(dim <= 32768, "fast_hadamard_transform only supports hidden dim <= 32768");
-    fast_hadamard_transform_cuda<DType>(params, device.unwrap());
-  } else if constexpr (kMultiple == 12) {
-    RuntimeCheck(dim % (4 * 12) == 0, "fast_hadamard_transform_12N only supports hidden dim divisible by 48");
-    RuntimeCheck(dim <= 12 * 1024, "fast_hadamard_transform_12N only supports hidden dim <= 12288");
-    fast_hadamard_transform_12N_cuda<DType>(params, device.unwrap());
-  } else if constexpr (kMultiple == 20) {
-    RuntimeCheck(dim % (4 * 20) == 0, "fast_hadamard_transform_20N only supports hidden dim divisible by 80");
-    RuntimeCheck(dim <= 20 * 1024, "fast_hadamard_transform_20N only supports hidden dim <= 20480");
-    fast_hadamard_transform_20N_cuda<DType>(params, device.unwrap());
-  } else if constexpr (kMultiple == 28) {
-    RuntimeCheck(dim % (4 * 28) == 0, "fast_hadamard_transform_28N only supports hidden dim divisible by 112");
-    RuntimeCheck(dim <= 28 * 1024, "fast_hadamard_transform_28N only supports hidden dim <= 28672");
-    fast_hadamard_transform_28N_cuda<DType>(params, device.unwrap());
-  } else if constexpr (kMultiple == 40) {
-    RuntimeCheck(dim % (4 * 40) == 0, "fast_hadamard_transform_40N only supports hidden dim divisible by 160");
-    RuntimeCheck(dim <= 40 * 1024, "fast_hadamard_transform_40N only supports hidden dim <= 40960");
-    fast_hadamard_transform_40N_cuda<DType>(params, device.unwrap());
-  } else {
-    Panic("Unsupported multiple");
-  }
-}
-
-template <typename DType>
+// One module per (multiple, log_N, dtype), chosen in kernels/ops/quantization/hadamard.py:
+// a row of dim elements is transformed as kMultiple x 2^kLogN, dim <= kMultiple << kLogN.
+template <int kMultiple, int kLogN, typename DType>
 struct HadamardKernel {
-  static void run(const tvm::ffi::TensorView x, const tvm::ffi::TensorView out, float scale) {
-    run_hadamard<1, DType>(x, out, scale);
-  }
-};
+  static constexpr bool kPow2 = kMultiple == 1;
+  static constexpr auto kMN = find_mn_config(kMultiple);
+  static_assert(kPow2 || std::get<0>(kMN) == kMultiple, "hadamard: unsupported multiple");
+  static_assert(
+      kPow2 ? (3 <= kLogN && kLogN <= 15) : (2 <= kLogN && kLogN <= 10),
+      "hadamard: dim not supported, at most 2^15 (power of two) or multiple x 2^10");
 
-template <typename DType>
-struct Hadamard12NKernel {
-  static void run(const tvm::ffi::TensorView x, const tvm::ffi::TensorView out, float scale) {
-    run_hadamard<12, DType>(x, out, scale);
-  }
-};
+  static constexpr int kNumThreads = kPow2 ? kPow2NumThreads[kLogN] : 1 << (kLogN - 2);
+  using Ktraits = std::conditional_t<
+      kPow2,
+      FastHadamardKernelTraits<kNumThreads, kLogN, DType>,
+      FastHadamardMNKernelTraits<kNumThreads, kLogN, kMultiple, std::get<1>(kMN), std::get<2>(kMN), DType>>;
+  static constexpr auto kernel = fast_hadamard_transform_kernel<Ktraits>;
+  // Row granularity; the Python side pads to it (pad_multiple in hadamard.py).
+  static constexpr int64_t kDimAlign = kPow2 ? 8 : 4 * kMultiple;
 
-template <typename DType>
-struct Hadamard20NKernel {
   static void run(const tvm::ffi::TensorView x, const tvm::ffi::TensorView out, float scale) {
-    run_hadamard<20, DType>(x, out, scale);
-  }
-};
+    using namespace host;
 
-template <typename DType>
-struct Hadamard28NKernel {
-  static void run(const tvm::ffi::TensorView x, const tvm::ffi::TensorView out, float scale) {
-    run_hadamard<28, DType>(x, out, scale);
-  }
-};
+    auto N = SymbolicSize{"batch"};
+    auto D = SymbolicSize{"dim"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLGPU>();
 
-template <typename DType>
-struct Hadamard40NKernel {
-  static void run(const tvm::ffi::TensorView x, const tvm::ffi::TensorView out, float scale) {
-    run_hadamard<40, DType>(x, out, scale);
+    TensorMatcher({N, D})  //
+        .with_strides({-1, 1})
+        .with_dtype<DType>()
+        .with_device(device)
+        .verify(x);
+    TensorMatcher({N, D})  //
+        .with_strides({-1, 1})
+        .with_dtype<DType>()
+        .with_device(device)
+        .verify(out);
+
+    const auto batch = N.unwrap();
+    const auto dim = D.unwrap();
+    CHECK_HOST(dim % kDimAlign == 0 && log2_ceil(static_cast<uint64_t>(dim / kMultiple)) == kLogN)
+        << "hadamard: dim " << dim << " does not fit the " << kMultiple << " x 2^" << kLogN << " module";
+
+    if constexpr (Ktraits::kSmemSize >= 48 * 1024) {
+      runtime::set_max_dynamic_smem_per_device<kernel>(device.unwrap(), Ktraits::kSmemSize);
+    }
+    const auto params = HadamardParamsBase{
+        .batch = static_cast<int>(batch),
+        .dim = static_cast<int>(dim),
+        .log_N = kLogN,
+        .x_batch_stride = x.stride(0),
+        .out_batch_stride = out.stride(0),
+        .scale = scale,
+        .x_ptr = const_cast<void*>(x.data_ptr()),
+        .out_ptr = const_cast<void*>(out.data_ptr()),
+    };
+    LaunchKernel(static_cast<uint32_t>(batch), kNumThreads, device.unwrap(), Ktraits::kSmemSize)(kernel, params);
   }
 };
 

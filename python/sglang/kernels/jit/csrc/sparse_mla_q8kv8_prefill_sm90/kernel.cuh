@@ -27,6 +27,11 @@ limitations under the License.
 
 #pragma once
 
+#include <sgl_kernel/utils.h>
+
+#include <sgl_kernel/runtime.cuh>
+#include <sgl_kernel/utils.cuh>
+
 #include "config.h"
 #include "helpers.h"
 #include <cuda_fp8.h>
@@ -1012,12 +1017,9 @@ struct SparseMlaQ8Kv8PrefillKernel {
   // ========================================================================
   // run() -- host-side launch
   // ========================================================================
-  static void run(const SparseMlaQ8Kv8PrefillParams& params) {
-    KU_ASSERT(params.h_kv == 1);
-    KU_ASSERT(params.topk % (2 * B_TOPK) == 0);
-    KU_ASSERT(params.topk > 0);
-    KU_ASSERT(params.h_q % B_H == 0);
-
+  // The caller (entry.cuh) validates the shapes: h_kv == 1, topk a positive multiple of 2 * B_TOPK, h_q a positive
+  // multiple of B_H.
+  static void run(const SparseMlaQ8Kv8PrefillParams& params, cudaStream_t stream) {
     CUtensorMap tensor_map_O;
     {
       uint64_t size[3] = {(uint64_t)D_V, (uint64_t)params.h_q, (uint64_t)params.s_q};
@@ -1037,7 +1039,7 @@ struct SparseMlaQ8Kv8PrefillKernel {
           CUtensorMapSwizzle::CU_TENSOR_MAP_SWIZZLE_128B,
           CUtensorMapL2promotion::CU_TENSOR_MAP_L2_PROMOTION_NONE,
           CUtensorMapFloatOOBfill::CU_TENSOR_MAP_FLOAT_OOB_FILL_NONE);
-      KU_ASSERT(res == CUresult::CUDA_SUCCESS);
+      CHECK_HOST(res == CUresult::CUDA_SUCCESS) << "cuTensorMapEncodeTiled failed with error " << res;
     }
 
     TmaParams_t tma_p = {tensor_map_O};
@@ -1047,12 +1049,11 @@ struct SparseMlaQ8Kv8PrefillKernel {
         TmaParams_t>;
 
     constexpr size_t smem_size = sizeof(SharedMemoryPlan);
-    KU_CUDA_CHECK(cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, smem_size));
+    sglang::host::runtime::set_max_dynamic_smem(kernel, smem_size);
 
-    cutlass::ClusterLaunchParams launch_params = {
-        dim3((params.h_q / B_H) * params.s_q, 1, 1), dim3(NUM_THREADS, 1, 1), dim3(1, 1, 1), smem_size, params.stream};
-    cutlass::launch_kernel_on_cluster(launch_params, (void*)kernel, params, tma_p);
-    KU_CHECK_KERNEL_LAUNCH();
+    const auto num_blocks = static_cast<uint32_t>((params.h_q / B_H) * params.s_q);
+    sglang::host::LaunchKernel(num_blocks, NUM_THREADS, stream, smem_size)
+        .config({.cluster_dim = dim3(1, 1, 1)})(kernel, params, tma_p);
   }
 };
 
@@ -1069,8 +1070,8 @@ __global__ void __launch_bounds__(Kernel::NUM_THREADS, 1, 1) sparse_mla_q8kv8_pr
 // External dispatch function
 // ============================================================================
 template <int D_QK, bool HAVE_TOPK_LENGTH, bool HAVE_ATTN_SINK>
-void run_sparse_mla_q8kv8_prefill_kernel(const SparseMlaQ8Kv8PrefillParams& params) {
-  SparseMlaQ8Kv8PrefillKernel<D_QK, HAVE_TOPK_LENGTH, HAVE_ATTN_SINK>::run(params);
+void run_sparse_mla_q8kv8_prefill_kernel(const SparseMlaQ8Kv8PrefillParams& params, cudaStream_t stream) {
+  SparseMlaQ8Kv8PrefillKernel<D_QK, HAVE_TOPK_LENGTH, HAVE_ATTN_SINK>::run(params, stream);
 }
 
 }  // namespace fwd

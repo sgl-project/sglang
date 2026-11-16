@@ -16,11 +16,7 @@ import unittest
 
 import torch
 
-from sglang.kernels.ops.attention.dsv4 import (
-    CompressorDecodePlan,
-    CompressorPrefillPlan,
-    compress_norm_rope_store,
-)
+from sglang.kernels.ops.attention.dsv4 import compress_norm_rope_store
 from sglang.kernels.ops.attention.dsv4.rope import precompute_freqs_cis
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
     DSV4_FP8_NOPE_ROW_BYTES,
@@ -28,6 +24,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 )
 from sglang.srt.utils import is_gfx95_supported
 from sglang.test.ci.ci_register import register_amd_ci
+from sglang.test.kernels.deepseek_v4.common import make_legacy_context
 from sglang.test.test_utils import CustomTestCase
 
 # the kernel takes E4M3FN vs E4M3FNUZ from the arch and the two-pool layout is only
@@ -59,11 +56,7 @@ def _inputs(compress_ratio, seq_lens=None):
             torch.arange(1, NUM_TOKENS + 1, device=DEVICE, dtype=torch.int64)
             * compress_ratio
         )
-    plan = CompressorDecodePlan.generate_legacy(
-        compress_ratio,
-        torch.arange(NUM_TOKENS, device=DEVICE, dtype=torch.int64),
-        seq_lens,
-    )
+    plan = make_legacy_context(NUM_TOKENS, compress_ratio).make_decode_plan(seq_lens)
     # every other row, so a row that gets written always has an untouched neighbour
     out_loc = torch.arange(1, 2 * NUM_TOKENS + 1, 2, device=DEVICE, dtype=torch.int64)
     freqs_cis = precompute_freqs_cis(
@@ -77,13 +70,9 @@ def _extend_inputs(compress_ratio):
     torch.manual_seed(compress_ratio + 1)
     total = compress_ratio * NUM_TOKENS
     seq_lens = torch.tensor([total], dtype=torch.int64)
-    plan = CompressorPrefillPlan.generate_legacy(
-        compress_ratio,
-        torch.zeros(1, dtype=torch.int64, device=DEVICE),
-        seq_lens,
-        seq_lens.clone(),  # the whole sequence is the extend
-        total,
-        DEVICE,
+    # The whole sequence is the extend.
+    plan = make_legacy_context(1, compress_ratio).make_prefill_plan(
+        seq_lens, seq_lens.clone(), total
     )
     # the kernel binds its token count off the input and then requires the plan to
     # have that many rows, so the fixture has to follow whatever the planner emitted

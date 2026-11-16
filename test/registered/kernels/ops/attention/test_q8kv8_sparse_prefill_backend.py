@@ -557,25 +557,29 @@ def test_q8kv8_sparse_prefill_helper_builds_fp8_workspace_matching_bf16_path(
     assert q8_call["kv_scale"].item() == pytest.approx(1.0)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(
+    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+)
 def test_q8kv8_sparse_prefill_rejects_topk_64_before_cuda_launch():
     args = _make_q8kv8_kernel_args(device=torch.device("cuda"), topk=64)
 
-    with pytest.raises(ValueError, match="positive multiple of 128"):
+    with pytest.raises(RuntimeError, match="positive multiple of 128"):
         sparse_mla_q8kv8_prefill_fwd(**args)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is not available")
+@pytest.mark.skipif(
+    not _sm90_available(), reason="Q8KV8 sparse prefill requires SM90 CUDA"
+)
 @pytest.mark.parametrize(
     ("mutate", "error_match"),
     [
         (
             lambda args: args.update(q=args["q"].float()),
-            "q must be torch.float8_e4m3fn",
+            "DType mismatch",
         ),
         (
             lambda args: args.update(kv=args["kv"].float()),
-            "kv must be torch.float8_e4m3fn",
+            "DType mismatch",
         ),
         (
             lambda args: args.update(
@@ -587,19 +591,19 @@ def test_q8kv8_sparse_prefill_rejects_topk_64_before_cuda_launch():
                     device=args["q"].device,
                 )[:, :, : args["q"].shape[2]]
             ),
-            "q must be contiguous",
+            "not contiguous",
         ),
         (
             lambda args: args.update(
                 q_scale=torch.ones(2, dtype=torch.float32, device=args["q"].device)
             ),
-            "q_scale must be a scalar tensor",
+            "must be one fp32 element",
         ),
         (
             lambda args: args.update(
                 kv_scale=torch.ones((), dtype=torch.float16, device=args["q"].device)
             ),
-            "kv_scale must be float32",
+            "must be one fp32 element",
         ),
     ],
 )
@@ -610,7 +614,7 @@ def test_q8kv8_sparse_prefill_rejects_invalid_tensor_contracts(
     args = _make_q8kv8_kernel_args(device=torch.device("cuda"), topk=128)
     mutate(args)
 
-    with pytest.raises(ValueError, match=error_match):
+    with pytest.raises(RuntimeError, match=error_match):
         sparse_mla_q8kv8_prefill_fwd(**args)
 
 

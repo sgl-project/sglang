@@ -587,12 +587,11 @@ struct AttnResFusedTmaKernel {
 
     if (num_tokens == 0) return;
 
-    [[maybe_unused]] static const bool attrs_set = [] {
+    runtime::init_per_device(device.unwrap(), [] {
       for (uint32_t i = 1; i <= kMaxBankRows; ++i) {
-        CHECK_CUDA(cudaFuncSetAttribute(kTable[i], cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+        runtime::set_max_dynamic_smem(kTable[i], kSmemBytes);
       }
-      return true;
-    }();
+    });
 
     const auto num_sm = runtime::get_sm_count(device.unwrap().device_id);
     const auto grid = std::min<int64_t>(static_cast<int64_t>(num_sm) * kOccupancy, num_tokens);

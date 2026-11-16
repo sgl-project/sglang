@@ -692,13 +692,11 @@ class HummingRunnerCore(MoeRunnerCore):
             gemm_type=HummingGemmType.GROUPED_CONTIGUOUS,
         )
 
-        is_ep = self.num_experts != self.global_num_experts
         if hidden_states_scale is None:
             hidden_states, src2dst, expert_first_token_offset = moe_permute(
                 inputs=hidden_states,
                 topk_ids=topk_ids,
                 num_experts=self.num_experts,
-                is_ep=is_ep,
             )
         else:
             hidden_states_scale = hidden_states_scale.reshape(
@@ -714,7 +712,6 @@ class HummingRunnerCore(MoeRunnerCore):
                 input_scale=hidden_states_scale,
                 topk_ids=topk_ids,
                 num_experts=self.num_experts,
-                is_ep=is_ep,
                 outputs=buffers["quanted_gate_up_input"],
             )
 

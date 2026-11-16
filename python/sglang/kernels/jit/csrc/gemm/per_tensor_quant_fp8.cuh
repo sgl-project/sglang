@@ -53,12 +53,6 @@ per_tensor_absmax_kernel(const T* __restrict__ input, float* __restrict__ output
   }
 }
 
-[[maybe_unused]]
-SGL_DEVICE float fp8_e4m3_clip(float val) {
-  namespace math = device::math;
-  return math::max(math::min(val, math::FP8_E4M3_MAX), -math::FP8_E4M3_MAX);
-}
-
 template <typename T, typename DST_DTYPE>
 __global__ void per_tensor_quant_fp8_kernel(
     const T* __restrict__ input,
@@ -80,16 +74,17 @@ __global__ void per_tensor_quant_fp8_kernel(
     output_vec_t output_vec;
 #pragma unroll
     for (uint32_t i = 0; i < VEC_SIZE; ++i) {
-      const float value = fp8_e4m3_clip(static_cast<float>(input_vec[i]) * scale_val);
-      output_vec[i] = static_cast<DST_DTYPE>(value);
+      const auto value = static_cast<float>(input_vec[i]) * scale_val;
+      // The fp8 cast saturates (SATFINITE); the min only maps NaN to +448.
+      output_vec[i] = static_cast<DST_DTYPE>(fminf(value, math::FP8_E4M3_MAX));
     }
     gmem_out.store(output, output_vec, gid);
   } else if (gid * VEC_SIZE < num_elements) {
     [[unlikely]];  // poorly aligned case, do not optimize
     const auto remainder = num_elements - gid * VEC_SIZE;
     for (uint32_t i = 0; i < remainder; ++i) {
-      const float value = fp8_e4m3_clip(static_cast<float>(input[gid * VEC_SIZE + i]) * scale_val);
-      output[gid * VEC_SIZE + i] = static_cast<DST_DTYPE>(value);
+      const auto value = static_cast<float>(input[gid * VEC_SIZE + i]) * scale_val;
+      output[gid * VEC_SIZE + i] = static_cast<DST_DTYPE>(fminf(value, math::FP8_E4M3_MAX));
     }
   }
 }

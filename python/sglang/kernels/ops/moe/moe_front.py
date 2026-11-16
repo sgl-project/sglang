@@ -129,8 +129,8 @@ def get_front_strategy(num_tokens: int, device) -> str:
 
 
 @cache_once
-def _jit_module() -> Module:
-    args = make_cpp_args(is_arch_support_pdl())
+def _jit_module(block_size: int, cast_vec: int, cast_first: bool) -> Module:
+    args = make_cpp_args(is_arch_support_pdl(), block_size, cast_vec, cast_first)
     return load_jit(
         "moe_front",
         *args,
@@ -138,8 +138,6 @@ def _jit_module() -> Module:
         cuda_wrappers=[
             ("front_epilogue", f"FusedFrontEpilogueKernel<{args}>::run"),
         ],
-        # No fast-math: scoring and expert-id selection must stay comparable to
-        # route_radix / the Triton router under ties and NaN.
         extra_cuda_cflags=["-O3"],
     )
 
@@ -149,7 +147,8 @@ def available() -> bool:
     import logging
 
     try:
-        _jit_module()
+        cfg = DEFAULT_EPILOGUE_CONFIG
+        _jit_module(cfg["block_size"], cfg["cast_vec"], cfg["cast_first"])
         return True
     except Exception as e:  # pragma: no cover - toolchain dependent
         logging.getLogger(__name__).warning(
@@ -218,7 +217,10 @@ def fused_front(
     ids = torch.empty((M, topk), dtype=torch.int32, device=device)
     routed = torch.empty((M, latent), dtype=torch.bfloat16, device=device)
 
-    _jit_module().front_epilogue(
+    module = _jit_module(
+        int(config["block_size"]), int(config["cast_vec"]), bool(config["cast_first"])
+    )
+    module.front_epilogue(
         merged,
         correction_bias,
         weights,
@@ -228,8 +230,5 @@ def fused_front(
         float(routed_scaling_factor if routed_scaling_factor is not None else 1.0),
         bool(renormalize),
         bool(apply_routed_scaling_factor_on_output),
-        int(config["block_size"]),
-        int(config["cast_vec"]),
-        bool(config["cast_first"]),
     )
     return weights, ids, routed

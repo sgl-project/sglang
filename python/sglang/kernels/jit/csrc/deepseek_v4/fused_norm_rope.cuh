@@ -7,16 +7,11 @@
 #include <sgl_kernel/vec.cuh>
 #include <sgl_kernel/warp.cuh>
 
-#include <sgl_kernel/deepseek_v4/compress.cuh>
-
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
-#include <type_traits>
 
 namespace sglang {
-
-using Plan = device::compress::PrefillPlan;
 
 /// \brief common block size for memory-bound kernel
 constexpr uint32_t kBlockSize = 128;
@@ -29,19 +24,11 @@ struct FusedNormRopeParams {
   uint32_t num_works;
   const void* __restrict__ handle;
   const float* __restrict__ freqs_cis;
-  uint32_t compress_ratio;
 };
 
-enum class ForwardMode {
-  CompressExtend = 0,
-  CompressDecode = 1,
-  DefaultForward = 2,
-};
-
-template <typename DType, int64_t kHeadDim, int64_t kRopeDim, ForwardMode kMode, bool kUsePDL>
+template <typename DType, int64_t kHeadDim, int64_t kRopeDim, bool kUsePDL>
 __global__ void fused_norm_rope(const __grid_constant__ FusedNormRopeParams params) {
   using namespace device;
-  using enum ForwardMode;
 
   constexpr int64_t kMaxVecSize = 16 / sizeof(DType);
   constexpr int64_t kVecSize = std::min(kMaxVecSize, kHeadDim / kWarpThreads);
@@ -57,7 +44,7 @@ __global__ void fused_norm_rope(const __grid_constant__ FusedNormRopeParams para
 
   const auto& [
     _input, _weight, eps, num_works, // norm
-    handle, freqs_cis, compress_ratio // rope
+    handle, freqs_cis // rope
   ] = params;
 
   const auto warp_id = threadIdx.x / kWarpThreads;
@@ -66,25 +53,8 @@ __global__ void fused_norm_rope(const __grid_constant__ FusedNormRopeParams para
 
   if (work_id >= num_works) return;
 
-  DType* input;
-  int32_t position;
-  if constexpr (kMode == CompressExtend) {
-    const auto plan = static_cast<const Plan*>(handle)[work_id];
-    input = static_cast<DType*>(_input) + plan.ragged_id * kHeadDim;
-    position = plan.position + 1 - compress_ratio;
-    if (plan.ragged_id == 0xFFFFFFFF) [[unlikely]]
-      return;
-  } else if constexpr (kMode == CompressDecode) {
-    input = static_cast<DType*>(_input) + work_id * kHeadDim;
-    const auto seq_len = static_cast<const int32_t*>(handle)[work_id];
-    if (seq_len % compress_ratio != 0) return;
-    position = seq_len - compress_ratio;
-  } else if constexpr (kMode == DefaultForward) {
-    input = static_cast<DType*>(_input) + work_id * kHeadDim;
-    position = static_cast<const int64_t*>(handle)[work_id];
-  } else {
-    static_assert(host::dependent_false_v<DType>, "Unsupported Mode");
-  }
+  DType* const input = static_cast<DType*>(_input) + work_id * kHeadDim;
+  const int32_t position = static_cast<const int64_t*>(handle)[work_id];
 
   using Storage = AlignedVector<DType, kVecSize>;
   __shared__ Storage s_rope_input[kNumWarps][kRopeSize];
@@ -168,21 +138,15 @@ __global__ void fused_norm_rope(const __grid_constant__ FusedNormRopeParams para
 
 template <typename DType, int64_t kHeadDim, int64_t kRopeDim, bool kUsePDL>
 struct FusedNormRopeKernel {
-  template <ForwardMode kMode>
-  static constexpr auto fused_kernel = fused_norm_rope<DType, kHeadDim, kRopeDim, kMode, kUsePDL>;
+  static constexpr auto kernel = fused_norm_rope<DType, kHeadDim, kRopeDim, kUsePDL>;
 
   static void forward(
       const tvm::ffi::TensorView input,
       const tvm::ffi::TensorView weight,
       const tvm::ffi::TensorView handle,
       const tvm::ffi::TensorView freqs_cis,
-      int32_t _mode,
-      float eps,
-      uint32_t compress_ratio) {
+      float eps) {
     using namespace host;
-    using enum ForwardMode;
-
-    const auto mode = static_cast<ForwardMode>(_mode);
 
     auto B = SymbolicSize{"num_q_tokens"};
     auto N = SymbolicSize{"num_compress_tokens"};
@@ -201,31 +165,11 @@ struct FusedNormRopeKernel {
         .with_dtype<float>()
         .with_device(device_)
         .verify(freqs_cis);
-    switch (mode) {
-      case CompressExtend:
-        TensorMatcher({N, compress::kPrefillPlanDim})  // plan
-            .with_dtype<compress::PrefillPlanTensorDtype>()
-            .with_device(device_)
-            .verify(handle);
-        RuntimeCheck(compress_ratio > 0);
-        break;
-      case CompressDecode:
-        TensorMatcher({N})  // seq_len
-            .with_dtype<int32_t>()
-            .with_device(device_)
-            .verify(handle);
-        RuntimeCheck(compress_ratio > 0);
-        break;
-      case DefaultForward:
-        TensorMatcher({N})  // position
-            .with_dtype<int64_t>()
-            .with_device(device_)
-            .verify(handle);
-        RuntimeCheck(compress_ratio == 0);
-        break;
-      default:
-        Panic("unsupported forward mode: ", static_cast<int>(mode));
-    }
+    TensorMatcher({N})  // position
+        .with_dtype<int64_t>()
+        .with_device(device_)
+        .verify(handle);
+    CHECK_HOST(N.unwrap() <= B.unwrap()) << "positions (" << N.unwrap() << ") longer than input (" << B.unwrap() << ")";
 
     // launch kernel
     const auto num_compress_tokens = static_cast<uint32_t>(N.unwrap());
@@ -237,16 +181,8 @@ struct FusedNormRopeKernel {
         .num_works = num_compress_tokens,
         .handle = handle.data_ptr(),
         .freqs_cis = static_cast<const float*>(freqs_cis.data_ptr()),
-        .compress_ratio = compress_ratio,
     };
     const auto num_blocks = div_ceil(num_compress_tokens, kNumWarps);
-    using KernelType = std::decay_t<decltype(fused_norm_rope<DType, kHeadDim, kRopeDim, CompressExtend, kUsePDL>)>;
-    static constexpr KernelType kernel_table[3] = {
-        [static_cast<int>(CompressExtend)] = fused_kernel<CompressExtend>,
-        [static_cast<int>(CompressDecode)] = fused_kernel<CompressDecode>,
-        [static_cast<int>(DefaultForward)] = fused_kernel<DefaultForward>,
-    };
-    const auto kernel = kernel_table[static_cast<int>(mode)];
     LaunchKernel(num_blocks, kBlockSize, device_.unwrap()).enable_pdl(kUsePDL)(kernel, params);
   }
 };
