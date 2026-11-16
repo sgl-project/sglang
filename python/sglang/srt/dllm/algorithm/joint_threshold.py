@@ -103,8 +103,6 @@ def joint_threshold_update_step_vectorized(
     # apply update
     input_ids.copy_(torch.where(transfer, x, input_ids))
 
-    return any_transfer_row.any()
-
 
 class JointThreshold(DllmAlgorithm):
     """Joint-threshold denoising: mask-to-token (M2T) unmasking plus token-to-token
