@@ -16,6 +16,7 @@ class AbortAllMixin:
     abort_all_num_requests: int = 32
     abort_all_max_new_tokens: int = 16000
     abort_all_sleep: float = 2
+    abort_request_headers = None
 
     def test_abort_all(self):
         num_requests = self.abort_all_num_requests
@@ -42,6 +43,7 @@ class AbortAllMixin:
 
             requests.post(
                 self.base_url + "/abort_request",
+                headers=self.abort_request_headers,
                 json={"abort_all": True},
                 timeout=10,
             ).raise_for_status()

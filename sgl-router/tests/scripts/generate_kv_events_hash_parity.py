@@ -82,7 +82,7 @@ def hash_page_chain(
     tokens: list[int], block_size: int, prior_digest: bytes | None = None
 ) -> list[int]:
     """Compute the i64-truncated block hashes for `tokens` using SGLang's
-    `RadixKey.hash_page` algorithm + `hash_str_to_int64`.
+    `get_hash_str` algorithm + `hash_str_to_int64`.
 
     Returns one i64 per full or partial block.  A partial last block (when
     `len(tokens) % block_size != 0`) chains against the previous block's
