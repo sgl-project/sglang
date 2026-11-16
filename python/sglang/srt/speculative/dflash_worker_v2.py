@@ -675,6 +675,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         if (
             sampling_info.has_custom_logit_processor
             or getattr(sampling_info, "acc_linear_penalties", None) is not None
+            or getattr(sampling_info, "acc_additive_penalties", None) is not None
+            or getattr(sampling_info, "acc_scaling_penalties", None) is not None
             or (penalizer is not None and penalizer.is_required)
             or getattr(sampling_info, "grammar_mask", None) is not None
             or getattr(sampling_info, "logit_bias", None) is not None

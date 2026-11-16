@@ -95,6 +95,12 @@ def verify_logits_adjustments_are_noop(sampling_info) -> bool:
         return False
     if getattr(sampling_info, "acc_linear_penalties", None) is not None:
         return False
+    # Under overlap scheduling the penalty state lives in these two buffers
+    # instead of the orchestrator, which is None in the worker's copy.
+    if getattr(sampling_info, "acc_additive_penalties", None) is not None:
+        return False
+    if getattr(sampling_info, "acc_scaling_penalties", None) is not None:
+        return False
     penalizer = getattr(sampling_info, "penalizer_orchestrator", None)
     if penalizer is not None and penalizer.is_required:
         return False
