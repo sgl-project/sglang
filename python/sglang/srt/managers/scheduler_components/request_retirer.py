@@ -117,9 +117,10 @@ class RequestRetirer:
             if (
                 get_disagg().disaggregation_mode == "decode"
                 and offload_kv
-                # Native recovery-state coverage is implemented for DSV4.
+                # Retained recovery is validated for non-speculative DSV4.
                 # Other HiSparse models must keep their existing backup path.
                 and self.hisparse_coordinator.is_dsv4_hisparse
+                and not self.hisparse_coordinator.spec_swap.enabled
                 and not getattr(req, "hisparse_retraction_pending", False)
             ):
                 # HiSparse state-preserving retraction: the host pool already

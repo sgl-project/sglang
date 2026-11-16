@@ -304,7 +304,9 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         """Retraction must not discard an overlap result whose KV already exists."""
         scheduler = self._new_scheduler()
         scheduler.disaggregation_mode = DisaggregationMode.DECODE
-        scheduler.hisparse_coordinator = SimpleNamespace(is_dsv4_hisparse=True)
+        scheduler.hisparse_coordinator = SimpleNamespace(
+            is_dsv4_hisparse=True, spec_swap=SimpleNamespace(enabled=False)
+        )
         scheduler.uocr_runtime = None
         reqs = [self._make_req(name) for name in ("a", "b")]
         for i, req in enumerate(reqs):

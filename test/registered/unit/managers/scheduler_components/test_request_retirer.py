@@ -82,13 +82,19 @@ def _req(finished_reason, calls):
 
 
 class TestRelease(CustomTestCase):
-    def test_state_preserving_retraction_is_limited_to_dsv4(self):
-        """Models without supported sidecars must retain their normal backup."""
+    def test_state_preserving_retraction_is_limited_to_non_spec_dsv4(self):
+        """Other model families and speculation retain the existing recovery path."""
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="scheduler")
-        for is_dsv4 in (False, True):
-            with self.subTest(dsv4=is_dsv4):
+        for is_dsv4, speculative in (
+            (False, False),
+            (False, True),
+            (True, False),
+            (True, True),
+        ):
+            with self.subTest(dsv4=is_dsv4, speculative=speculative):
+                retained = is_dsv4 and not speculative
                 req = FakeReq(
                     kv=ReqKvInfo(req_pool_idx=1, kv_allocated_len=3),
                     hisparse_retraction_pending=False,
@@ -99,6 +105,7 @@ class TestRelease(CustomTestCase):
 
                 coordinator = SimpleNamespace(
                     is_dsv4_hisparse=is_dsv4,
+                    spec_swap=SimpleNamespace(enabled=speculative),
                     release_request=lambda req: None,
                     retract_req_state_preserving=preserve,
                 )
@@ -128,11 +135,11 @@ class TestRelease(CustomTestCase):
                     ),
                 ):
                     self.assertTrue(retirer.retract(req, offload_kv=True))
-                self.assertEqual(req.hisparse_retraction_pending, is_dsv4)
+                self.assertEqual(req.hisparse_retraction_pending, retained)
                 self.assertIs(
-                    req.kv.retraction_backup, None if is_dsv4 else backup_state
+                    req.kv.retraction_backup, None if retained else backup_state
                 )
-                self.assertEqual(req.kv.req_pool_idx, 1 if is_dsv4 else None)
+                self.assertEqual(req.kv.req_pool_idx, 1 if retained else None)
 
     def _release(self, req, calls, checkpoint=False, verb="release"):
         tree_cache = MagicMock()
