@@ -90,9 +90,10 @@ class RuntimeEndpoint(BaseBackend):
         )
         self._assert_success(res)
 
-    def start_profile(self):
+    def start_profile(self, **kwargs):
         res = http_request(
             self.base_url + "/start_profile",
+            json=kwargs or None,
             api_key=self.admin_api_key or self.api_key,
             verify=self.verify,
         )
@@ -457,8 +458,8 @@ class Runtime:
             kill_process_tree(self.pid, wait_timeout=None)
             self.pid = None
 
-    def start_profile(self):
-        self.endpoint.start_profile()
+    def start_profile(self, **kwargs):
+        self.endpoint.start_profile(**kwargs)
 
     def stop_profile(self):
         self.endpoint.stop_profile()

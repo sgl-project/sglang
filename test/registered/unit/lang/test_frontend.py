@@ -14,7 +14,7 @@ import httpx
 import sglang as sgl
 from sglang.lang.backend import openai as openai_backend
 from sglang.lang.backend.anthropic import Anthropic
-from sglang.lang.backend.runtime_endpoint import RuntimeEndpoint
+from sglang.lang.backend.runtime_endpoint import Runtime, RuntimeEndpoint
 from sglang.lang.chat_template import chat_template_registry
 from sglang.lang.interpreter import StreamExecutor
 from sglang.lang.ir import SglSamplingParams
@@ -43,7 +43,7 @@ class _SglangServerHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = json.loads(self.rfile.read(length)) if length else None
         self.server.posts.append((self.path, body))
-        if self.path == "/generate":
+        if self.path in ("/generate", "/start_profile"):
             self._reply(200, {"text": "", "meta_info": {}})
         else:
             self._reply(404)
@@ -78,6 +78,22 @@ class TestRuntimeEndpointJoin(_StubServerTestCase):
 
         self.assertIsNone(state.error())
         self.assertEqual(state.text(), "A[0][1]")
+
+
+class TestRuntimeStartProfile(_StubServerTestCase):
+    def test_profile_options_reach_the_server(self):
+        """Runtime.start_profile must take the options Engine.start_profile takes
+        (offline_throughput passes them to either backend) and send them on."""
+        runtime = Runtime.__new__(Runtime)
+        runtime.pid = None
+        runtime.endpoint = RuntimeEndpoint(self.base_url)
+
+        runtime.start_profile(num_steps=3, activities=["CPU", "GPU"])
+
+        self.assertEqual(
+            self.server.posts,
+            [("/start_profile", {"num_steps": 3, "activities": ["CPU", "GPU"]})],
+        )
 
 
 _USAGE = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
