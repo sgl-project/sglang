@@ -6,6 +6,7 @@ LMCache owns external storage; retrieved KV is published after reaching GPU.
 from __future__ import annotations
 
 import atexit
+import dataclasses
 import logging
 from array import array
 from typing import TYPE_CHECKING, Any, Optional
@@ -27,6 +28,8 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
+from sglang.srt.mem_cache.capacity import reclaim_for_load_back, shares_memory
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
@@ -111,14 +114,12 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             and flow.load is None
         ):
             # Use the shortest cross-rank L1 prefix for consistent admission.
-            params = MatchPrefixParams(
-                key=params.key[: flow.local_hit_tokens],
-                cow_mamba=params.cow_mamba,
-                req=req,
+            params = dataclasses.replace(
+                params, key=params.key[: flow.local_hit_tokens]
             )
         elif flow is not None and flow.load is not None and params.cow_mamba:
             # Re-arm Mamba COW from the retrieved checkpoint on retry.
-            self._arm_external_mamba_cow(flow, req)
+            self._arm_external_mamba_cow(flow, req, take_slot=not params.defer_cow_slot)
             params = MatchPrefixParams(key=params.key, cow_mamba=False, req=req)
         result = super().match_prefix(params)
         if req is None:
@@ -458,12 +459,18 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
             self.lmcache_connector.reset_mamba_checkpoint_metadata(physical)
         return slot
 
-    def _arm_external_mamba_cow(self, flow: LMCacheExternalFlow, req: Req) -> None:
-        """Give a request a mutable state slot and COW from the loaded checkpoint."""
+    def _arm_external_mamba_cow(
+        self, flow: LMCacheExternalFlow, req: Req, *, take_slot: bool = True
+    ) -> None:
+        """Give a request a mutable state slot and COW from the loaded checkpoint.
+        Without ``take_slot``, a request holding none gets its own with its row."""
         checkpoint = flow.mamba_value
         if checkpoint is None:
             return
-        if req.kv.mamba_pool_idx is None:
+        if req.kv.mamba_pool_idx is None and not take_slot:
+            flow.request_mamba_value = None
+            flow.allocated_request_mamba_for_load = False
+        elif req.kv.mamba_pool_idx is None:
             active = self._allocate_external_mamba_slot()
             assert active is not None, "Cannot allocate Mamba request state for LMCache"
             req.kv.mamba_pool_idx = active[0]
@@ -478,25 +485,43 @@ class LMCacheUnifiedRadixCache(UnifiedRadixCache):
 
     def _allocate_external_slots(self, num_tokens: int) -> Optional[torch.Tensor]:
         allocator = self.token_to_kv_pool_allocator
-        if not self.is_swa_enabled:
+        # Allocate SWA only for the trailing window; older pages use dummy page 0.
+        swa_tail_tokens = 0
+        if self.is_swa_enabled:
+            assert self.sliding_window_size is not None
+            swa_tail_tokens = min(
+                num_tokens,
+                self.lmcache_connector.aligned_swa_window_size(),
+            )
+        # Only the tree's window slot is allocated here.
+        window = (
+            self.window_sub_pool_of_slot(self.slot_id(TREE_WINDOW))
+            if swa_tail_tokens
+            else None
+        )
+        if shares_memory(allocator):
+            # Sub-pools share one memory: reclaim the load's whole demand.
+            reclaim_for_load_back(
+                self,
+                allocator,
+                KVDemand(
+                    full_tokens=num_tokens,
+                    window_tokens={window: swa_tail_tokens} if window else {},
+                ),
+            )
+        elif not self.is_swa_enabled:
             if allocator.available_size() < num_tokens:
                 self.evict(EvictParams(num_tokens=num_tokens))
+        else:
+            if allocator.full_attn_allocator.available_size() < num_tokens:
+                self.evict(EvictParams(num_tokens=num_tokens))
+            if allocator.swa_attn_allocator.available_size() < swa_tail_tokens:
+                self.evict(EvictParams(window_num_tokens={window: swa_tail_tokens}))
+        if not self.is_swa_enabled:
             return allocator.alloc(num_tokens)
 
-        # Allocate SWA only for the trailing window; older pages use dummy page 0.
-        assert self.sliding_window_size is not None
-        swa_tail_tokens = min(
-            num_tokens,
-            self.lmcache_connector.aligned_swa_window_size(),
-        )
         full_allocator = allocator.full_attn_allocator
         swa_allocator = allocator.swa_attn_allocator
-        if full_allocator.available_size() < num_tokens:
-            self.evict(EvictParams(num_tokens=num_tokens))
-        if swa_allocator.available_size() < swa_tail_tokens:
-            # Only the tree's window slot is allocated here: evict from it alone.
-            target = self.window_sub_pool_of_slot(self.slot_id(TREE_WINDOW))
-            self.evict(EvictParams(window_num_tokens={target: swa_tail_tokens}))
 
         full_indices = full_allocator.alloc(num_tokens)
         if full_indices is None:

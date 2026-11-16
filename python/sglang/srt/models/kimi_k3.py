@@ -132,7 +132,7 @@ from sglang.srt.models.kimi_k3_vl import (
     KimiK3VisionTower,
 )
 from sglang.srt.models.transformers import maybe_prefix
-from sglang.srt.models.utils import WeightsMapper
+from sglang.srt.models.utils import WeightsMapper, bind_or_assign
 from sglang.srt.multimodal.encoder_preprocessing import EncoderMediaProcessorConfig
 from sglang.srt.multimodal.kimi_k3_image_processing import (
     DEFERRED_PREPROCESSING_KEY,
@@ -154,7 +154,10 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_hip, is_npu
 from sglang.srt.utils.common import BumpAllocator, get_bool_env_var
-from sglang.srt.utils.log_utils import rank0_log
+from sglang.srt.utils.log_utils import print_warning_once, rank0_log
+
+if TYPE_CHECKING:
+    from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import TGVMRanges
 
 logger = logging.getLogger(__name__)
 
@@ -164,6 +167,35 @@ _EXPERT_WEIGHT_NAME = re.compile(r"experts\.\d+\.w[123]\.")
 _is_hip = is_hip()
 _is_npu = is_npu()
 _aiter_k3_opt = get_bool_env_var("SGLANG_AITER_K3_OPT")
+
+# (n, k) -> ((m_lo, m_hi, tactic), ...); tactic None = the ladder pick.
+_K3_TGV_M_RANGES = {
+    (6144, 7168): ((1, 64, None),),  # KDA fused qkvg
+    (6016, 7168): ((1, 64, None),),  # merged MoE front
+    (1536, 7168): ((1, 64, None),),  # MLA q_a / shared gate_up / output gate
+    (2112, 7168): ((1, 64, None),),  # MLA fused q_a + kv_a
+}
+
+# Fixed TGV tactics measured on GB300 at TP8 verify rows.
+_K3_GB300_TGV_M_RANGES = {
+    (6144, 7168): ((72, 96, 24),),  # KDA fused qkvg
+    (2112, 7168): ((72, 120, 21), (132, 132, 23), (156, 240, 23), (264, 288, 24)),
+    (1536, 7168): ((72, 192, 21), (240, 288, 23)),  # MLA output gate
+    (7168, 1536): ((72, 84, 24),),  # KDA / MLA o_proj
+    (896, 3584): ((84, 156, 21),),  # TP-sharded latent-up slice
+}
+
+# KDA [f_a | b] on the attention side stream only; run alone these tactics lose.
+_K3_GB300_BFA_SIDE_TGV_M_RANGES = {
+    (144, 7168): ((72, 128, 21), (129, 256, 23), (257, 288, 24)),
+}
+
+
+def _k3_side_stream_max_tokens() -> int:
+    """Largest graphed batch whose attention side-stream GEMMs overlap."""
+    if not get_platform().is_blackwell:
+        return 64
+    return 288 if get_platform().device_sm == 103 else 128
 
 
 def _cdiv(a: int, b: int) -> int:
@@ -175,6 +207,13 @@ def _uses_modelopt_fp8_pb_wo(
 ) -> bool:
     resolver = getattr(quant_config, "_resolve_quant_algo", None)
     return resolver is not None and resolver(prefix) == "FP8_PB_WO"
+
+
+def _uses_modelopt_mxfp8(
+    quant_config: Optional[QuantizationConfig], prefix: str
+) -> bool:
+    resolver = getattr(quant_config, "_resolve_quant_algo", None)
+    return resolver is not None and resolver(prefix) == "MXFP8"
 
 
 def _uses_split_gguf_kv_b(
@@ -194,13 +233,18 @@ def _maybe_map_fp8_pb_scale_name(name: str, params_dict: dict) -> str:
 
 
 def _get_k3_dense_weight(module: nn.Module) -> torch.Tensor:
-    """Return a dense weight with serialized block-FP8 scales applied."""
+    """Return a dense weight with serialized block-FP8 or MXFP8 scales applied."""
     weight = module.weight.data
     if not hasattr(module, "weight_scale_inv"):
         return weight
+    scale = module.weight_scale_inv.data
+    if scale.dtype == torch.uint8:
+        # MXFP8 UE8M0 exponents, still in checkpoint layout: the model's
+        # post-load runs before process_weights_after_loading reorders them.
+        scale = torch.exp2(scale.to(torch.float32) - 127.0)
     return block_quant_dequant(
         weight,
-        module.weight_scale_inv,
+        scale,
         module.quant_method.weight_block_size,
         module.params_dtype,
     )
@@ -263,20 +307,21 @@ def _is_unquantized_mergeable(weights: list[torch.Tensor]) -> bool:
 
 
 def _merge_weights_as_views(
-    mods: list, pad_rows_to: int = 1
+    mods: list, pad_rows_to: int = 1, target: Optional[torch.Tensor] = None
 ) -> tuple[torch.Tensor, list[int]]:
     """Cat module weights along dim 0; re-point each module's weight to a view
     of the merged buffer so the original storage is freed (net extra memory ~0).
 
     With pad_rows_to > 1 the merged buffer gets zero rows appended up to the
     next multiple, so every row of the fused GEMM output stays 16-byte aligned
-    for vectorized consumers."""
+    for vectorized consumers. Reuse target storage on reload so captured
+    graphs and parameter views keep pointing to the updated weights."""
     ws = [m.weight.data for m in mods]
     sizes = [w.shape[0] for w in ws]
     pad = (-sum(sizes)) % pad_rows_to
     if pad:
         ws = ws + [ws[0].new_zeros((pad, ws[0].shape[1]))]
-    merged = torch.cat(ws, dim=0).contiguous()
+    merged = bind_or_assign(target, torch.cat(ws, dim=0).contiguous())
     off = 0
     for m, n in zip(mods, sizes):
         m.weight.data = merged[off : off + n]
@@ -467,6 +512,7 @@ def _uses_ep_a2a() -> bool:
         _a2a_backend.is_megamoe()
         or _a2a_backend.is_flashinfer_megamoe()
         or _a2a_backend.is_deepep()
+        or _a2a_backend.is_ascend_ops()
         or _a2a_backend.is_mooncake()
         or _a2a_backend.is_ascend_fuseep()
         or _a2a_backend.is_mori()
@@ -784,7 +830,9 @@ class KimiK3MoE(nn.Module):
         dtypes = {m.weight.dtype for m in mods}
         if len(dtypes) != 1 or dtypes.pop() not in (torch.bfloat16, torch.float16):
             return
-        self._front_w, self._front_sizes = _merge_weights_as_views(mods)
+        self._front_w, self._front_sizes = _merge_weights_as_views(
+            mods, target=self._front_w
+        )
         self._front_is_ep_pair = len(mods) == 2
         # Invalidate the cached properties.
         for prop in (
@@ -1751,10 +1799,9 @@ class KimiK3DeltaAttention(nn.Module):
         # stream (graphed decode/verify only; SM bound as the MLA gate stream).
         self._bfa_alt_stream = bfa_alt_stream
         self._bfa_bs_limit = (
-            (128 if get_platform().is_blackwell else 64)
-            if bfa_alt_stream is not None
-            else 0
+            _k3_side_stream_max_tokens() if bfa_alt_stream is not None else 0
         )
+        self._bfa_side_tgv_m_ranges: Optional[TGVMRanges] = None
         self.tp_size = get_parallel().tp_size
         # KDA is an attention layer: head-sharded params follow the
         # attention-TP group, matching the mamba state cache sizing. Under
@@ -1781,6 +1828,9 @@ class KimiK3DeltaAttention(nn.Module):
             "use_full_rank_gate", False
         )
         self._bfa_uses_block_fp8 = self.use_full_rank_gate and _uses_modelopt_fp8_pb_wo(
+            quant_config, f"{prefix}.b_proj"
+        )
+        self._bfa_uses_mxfp8 = self.use_full_rank_gate and _uses_modelopt_mxfp8(
             quant_config, f"{prefix}.b_proj"
         )
 
@@ -2030,6 +2080,7 @@ class KimiK3DeltaAttention(nn.Module):
         # KDA safe gate: checkpoint trained with gate_lower_bound=-5.0
         self.attn.lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
         # Set by _prepare_fused_decode() once weights are loaded.
+        self.attn._k3_fused_decode_args = None
         self._kda_fused_decode_ready = False
         self._kda_hip_fused_decode_ready = False
         if sp_moe:
@@ -2066,14 +2117,18 @@ class KimiK3DeltaAttention(nn.Module):
             self._bfa_f_b_w = self.f_b_proj.weight
             return
         mods = [self.f_a_proj, self.b_proj]
-        if self._bfa_uses_block_fp8:
+        if self._bfa_uses_block_fp8 or self._bfa_uses_mxfp8:
             weights = [_get_k3_dense_weight(mod) for mod in mods]
             sizes = [weight.shape[0] for weight in weights]
             pad = (-sum(sizes)) % 8
             if pad:
                 weights.append(weights[0].new_zeros((pad, weights[0].shape[1])))
-            self._bfa_w = torch.cat(weights, dim=0).contiguous()
-            self._bfa_f_b_w = _get_k3_dense_weight(self.f_b_proj).contiguous()
+            self._bfa_w = bind_or_assign(
+                self._bfa_w, torch.cat(weights, dim=0).contiguous()
+            )
+            self._bfa_f_b_w = bind_or_assign(
+                self._bfa_f_b_w, _get_k3_dense_weight(self.f_b_proj).contiguous()
+            )
         else:
             if any(getattr(mod, "weight", None) is None for mod in mods):
                 return
@@ -2082,9 +2137,22 @@ class KimiK3DeltaAttention(nn.Module):
             # their scales.
             if _is_hip and not _is_unquantized_mergeable([mod.weight for mod in mods]):
                 return
-            self._bfa_w, sizes = _merge_weights_as_views(mods, pad_rows_to=8)
+            self._bfa_w, sizes = _merge_weights_as_views(
+                mods, pad_rows_to=8, target=self._bfa_w
+            )
             self._bfa_f_b_w = self.f_b_proj.weight
         self._bfa_fa_size, self._bfa_b_size = sizes
+        from sglang.srt.layers.quantization.unquant import get_bf16_gemm_backend
+
+        if get_platform().device_sm == 103 and get_bf16_gemm_backend().is_cutedsl():
+            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import TGVMRanges
+
+            m_ranges = TGVMRanges()
+            for m_lo, m_hi, tactic in _K3_GB300_BFA_SIDE_TGV_M_RANGES.get(
+                tuple(self._bfa_w.shape), ()
+            ):
+                m_ranges.append(m_lo=m_lo, m_hi=m_hi, tactic=tactic)
+            self._bfa_side_tgv_m_ranges = m_ranges
 
     def _merge_kda_inproj_weights_hip(self) -> bool:
         """ROCm only: append the [f_a | b] tail to the wide [q,k,v,g] buffer so
@@ -2100,8 +2168,11 @@ class KimiK3DeltaAttention(nn.Module):
         # [q,k,v,g | f_a | b | pad]; f_a/b keep the same relative order and the
         # same pad (both widths are 4 short of a multiple of 8), so the tail
         # view is byte-identical to the wide-only merge.
+        previous = self._qkvgbfa_layer
         merged, sizes = _merge_weights_as_views(
-            [self.fused_qkvg_proj, self.f_a_proj, self.b_proj], pad_rows_to=8
+            [self.fused_qkvg_proj, self.f_a_proj, self.b_proj],
+            pad_rows_to=8,
+            target=None if previous is None else previous.weight,
         )
         self._bfa_fa_size, self._bfa_b_size = sizes[-2:]
         self._bfa_w = merged[sizes[0] :]
@@ -2132,9 +2203,9 @@ class KimiK3DeltaAttention(nn.Module):
             return False
         if not (self.do_fuse_qkvbfg or get_exec().kernel.enable_amd_monokernel):
             return False
-        # Block-FP8 in-proj needs dequantized BF16 buffers; a raw row-cat
+        # Block-FP8 / MXFP8 in-proj needs dequantized BF16 buffers; a raw row-cat
         # would drop the scales. Leave fusion to the split [f_a|b] path.
-        if self._bfa_uses_block_fp8:
+        if self._bfa_uses_block_fp8 or self._bfa_uses_mxfp8:
             return False
         ws = [m.weight for m in (self.fused_qkvg_proj, self.f_a_proj, self.b_proj)]
         if not all(type(w.data) is torch.Tensor and w.dim() == 2 for w in ws):
@@ -2145,6 +2216,27 @@ class KimiK3DeltaAttention(nn.Module):
         if not _is_unquantized_mergeable(ws):
             return False
         return len({(w.dtype, w.shape[1]) for w in ws}) == 1
+
+    def _fused_decode_f_b_weight(self) -> Optional[torch.Tensor]:
+        """Dense BF16 f_b for the HIP fused KDA decode, which takes no weight scale."""
+        from sglang.srt.models.kimi_k3_rocm_quant import k3_fused_decode_f_b_weight
+
+        # _merge_bfa_weights() leaves the BF16 f_b here, dequantized for block-FP8.
+        merged = self._bfa_f_b_w if self.use_full_rank_gate else None
+        if (
+            merged is not None
+            and merged.dtype == torch.bfloat16
+            and merged.shape == (12 * 128, 128)
+        ):
+            return merged
+        f_b_weight = k3_fused_decode_f_b_weight(self.f_b_proj)
+        if f_b_weight is not None and f_b_weight.dtype != torch.bfloat16:
+            print_warning_once(
+                "Kimi-K3 fused KDA decode not armed: no BF16 f_b for the kernel "
+                f"(f_b_proj holds {f_b_weight.dtype}); decode runs the unfused chain"
+            )
+            return None
+        return f_b_weight
 
     def _prepare_fused_decode(self) -> None:
         """Static inputs for the fused KDA decode kernel
@@ -2161,21 +2253,28 @@ class KimiK3DeltaAttention(nn.Module):
             )
 
             layer = self.attn
+            # A re-run that fails to arm must not leave the previous f_b serving decode.
+            self._kda_hip_fused_decode_ready = False
+            layer._k3_hip_fused_decode_args = None
+            layer._k3_hip_fused_decode_backend = ""
+            layer._k3_hip_fused_decode_ops = None
             w = layer.conv_weights
-            f_b_weight = self.f_b_proj.weight
-            backend = envs.SGLANG_ROCM_K3_KDA_FUSED_BACKEND.get().lower()
+            backend = envs.SGLANG_USE_HIP_K3_KDA_FUSED_BACKEND.get().lower()
             fused_ops = {
                 "aiter": kda_fused_decode_aiter_hip,
                 "gfx950": kda_fused_decode_gfx950,
             }.get(backend)
+            state_dtype = self.config.mamba2_cache_params.dtype.temporal
             backend_available = fused_ops is not None and fused_ops.available(
-                f_b_weight.device
+                device=self.f_b_proj.weight.device, state_dtype=state_dtype
             )
+            f_b_weight = self._fused_decode_f_b_weight() if backend_available else None
             if (
                 backend_available
                 and w is not None
                 and tuple(w.shape) == (3 * 12 * 128, 4)
                 and w.dtype == torch.float32
+                and f_b_weight is not None
                 and f_b_weight.shape == (12 * 128, 128)
                 and f_b_weight.dtype == torch.bfloat16
                 and layer.A_log is not None
@@ -2203,10 +2302,17 @@ class KimiK3DeltaAttention(nn.Module):
                     lower_bound=float(layer.lower_bound),
                     norm_weight=norm_weight,
                     norm_eps=float(self.o_norm.eps),
+                    state_dtype=state_dtype,
                 )
                 layer._k3_hip_fused_decode_backend = backend
                 layer._k3_hip_fused_decode_ops = fused_ops
-                self._kda_hip_fused_decode_ready = True
+                # Either ReplaySSM flag allocates the ring (kv_cache_configurator.py),
+                # whose decode skips the fused kernel and needs f_b already applied.
+                mamba = get_exec().mamba
+                replayssm_ring = (
+                    mamba.enable_linear_replayssm or mamba.enable_linear_replayssm_spec
+                )
+                self._kda_hip_fused_decode_ready = not replayssm_ring
             return
         layer = self.attn
         w = layer.conv_weights
@@ -2247,7 +2353,7 @@ class KimiK3DeltaAttention(nn.Module):
             if bias is not None
             else torch.zeros(3 * seg, dtype=torch.float32, device=w.device)
         )
-        layer._k3_fused_decode_args = (
+        fused_decode_args = (
             wt[:, :seg].contiguous(),
             wt[:, seg : 2 * seg].contiguous(),
             wt[:, 2 * seg :].contiguous(),
@@ -2256,6 +2362,13 @@ class KimiK3DeltaAttention(nn.Module):
             self.o_norm.weight.data.float().contiguous(),
             float(self.o_norm.eps),
         )
+        if layer._k3_fused_decode_args is not None:
+            for target, source in zip(
+                layer._k3_fused_decode_args[:-1], fused_decode_args[:-1]
+            ):
+                target.copy_(source)
+        else:
+            layer._k3_fused_decode_args = fused_decode_args
         self._kda_fused_decode_ready = True
 
     def forward_qkvbfg_fused(
@@ -2296,8 +2409,19 @@ class KimiK3DeltaAttention(nn.Module):
                     cur = torch.cuda.current_stream()
                     alt.wait_stream(cur)
                     fused_states, _ = self.fused_qkvg_proj(hidden_states)
+                    m_ranges = self._bfa_side_tgv_m_ranges
+                    tgv_tactic = (
+                        None if m_ranges is None else m_ranges(hidden_states.shape[0])
+                    )
                     with torch.cuda.stream(alt):
-                        bfa = gemm(hidden_states, w)
+                        if tgv_tactic is None:
+                            bfa = gemm(hidden_states, w)
+                        else:
+                            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
+                                cutedsl_bf16_gemm,
+                            )
+
+                            bfa = cutedsl_bf16_gemm(hidden_states, w, tactic=tgv_tactic)
                         forget_gate = (
                             bfa[..., :n_fa]
                             if defer_f_b
@@ -2554,13 +2678,8 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             self._gate_hidden_states = None
             self._gate_pending_stream = None
             self._gate_alt_stream = gate_alt_stream
-            # Above this token count the attention-core kernels fill the SMs
-            # on their own and the overlap only adds sync overhead (same
-            # bound as deepseek_v4).
             self._gate_bs_limit = (
-                (128 if get_platform().is_blackwell else 64)
-                if self._gate_alt_stream is not None
-                else 0
+                _k3_side_stream_max_tokens() if self._gate_alt_stream is not None else 0
             )
             self._pre_o_proj_out: Optional[torch.Tensor] = None
             self._return_pre_o_proj = False
@@ -3353,6 +3472,16 @@ class KimiK3LinearForCausalLM(nn.Module):
         super().__init__()
         self.config = config
         self.quant_config = quant_config
+        if not (_is_hip or _is_npu):
+            # The CuTe DSL GEMM module imports cuda.bindings and cutlass at
+            # module level; neither ships on ROCm or Ascend NPU.
+            from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import (
+                register_tgv_m_ranges,
+            )
+
+            register_tgv_m_ranges(_K3_TGV_M_RANGES)
+            if get_platform().device_sm == 103:
+                register_tgv_m_ranges(_K3_GB300_TGV_M_RANGES)
         if quant_config is not None:
             if isinstance(quant_config, ModelSlimConfig):
                 model_mapping = {
@@ -3672,8 +3801,12 @@ class KimiK3LinearForCausalLM(nn.Module):
                     if name not in params_dict:
                         continue
                     param = params_dict[name]
-                    if name.endswith(".b_proj.weight_scale_inv"):
-                        # All TP ranks share K3's single beta output-scale block.
+                    if (
+                        name.endswith(".b_proj.weight_scale_inv")
+                        and param.data.shape == loaded_weight.shape
+                    ):
+                        # FP8_PB_WO: all TP ranks share K3's single beta
+                        # output-scale block. MXFP8 per-row scales shard below.
                         param.data.copy_(loaded_weight)
                     else:
                         weight_loader = getattr(
@@ -3738,8 +3871,13 @@ class KimiK3LinearForCausalLM(nn.Module):
             w_kc, w_vc = kv_b_weight.unflatten(
                 0, (-1, self_attn.qk_nope_head_dim + self_attn.v_head_dim)
             ).split([self_attn.qk_nope_head_dim, self_attn.v_head_dim], dim=1)
-            self_attn.w_kc = w_kc.transpose(1, 2).contiguous().transpose(1, 2)
-            self_attn.w_vc = w_vc.contiguous().transpose(1, 2)
+            # CUDA graphs retain the absorbed weight storage across reloads.
+            self_attn.w_kc = bind_or_assign(
+                self_attn.w_kc, w_kc.transpose(1, 2).contiguous().transpose(1, 2)
+            )
+            self_attn.w_vc = bind_or_assign(
+                self_attn.w_vc, w_vc.contiguous().transpose(1, 2)
+            )
             if self_attn._dcp_v_weights is not None:
                 self_attn._prepare_dcp_v_weights(get_parallel().dcp_group)
             kv_b_scale = getattr(self_attn.kv_b_proj, "weight_scale", None)
@@ -3765,8 +3903,8 @@ class KimiK3LinearForCausalLM(nn.Module):
         # multiply into every replay). Warm both dtypes (bf16 fast kernel,
         # fp32 triton fallback).
         def _warm_cw(proj, norm):
-            get_cw(proj, norm, dtype=torch.bfloat16)
-            get_cw(proj, norm)
+            get_cw(proj, norm, dtype=torch.bfloat16, refresh=True)
+            get_cw(proj, norm, refresh=True)
 
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer):

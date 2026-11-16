@@ -306,6 +306,21 @@ def _get_quantization_config(
     return None
 
 
+def built_quant_config(
+    model_config: ModelConfig,
+    load_config: LoadConfig,
+) -> Optional[QuantizationConfig]:
+    """The quant config the built model keeps: the loader's, unless its class
+    narrows it with ``own_quant_config(hf_config, quant_config)``, which the
+    constructor must apply too."""
+    quant_config = _get_quantization_config(model_config, load_config)
+    model_class, _ = get_model_architecture(model_config)
+    own_quant_config = getattr(model_class, "own_quant_config", None)
+    if own_quant_config is None:
+        return quant_config
+    return own_quant_config(model_config.hf_config, quant_config)
+
+
 def _initialize_model(
     model_config: ModelConfig,
     load_config: LoadConfig,
@@ -900,11 +915,6 @@ class DefaultModelLoader(BaseModelLoader):
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is None:
-                    continue
-                if (
-                    hasattr(module, "is_weights_quantized")
-                    and module.is_weights_quantized()
-                ):
                     continue
                 quant_method.process_weights_after_loading(module)
         return model.eval()
@@ -1550,12 +1560,6 @@ class DummyModelLoader(BaseModelLoader):
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
-                    # Skip FusedMoE layers already quantized during init (FP8 or FP4)
-                    if (
-                        hasattr(module, "is_weights_quantized")
-                        and module.is_weights_quantized()
-                    ):
-                        continue
                     quant_method.process_weights_after_loading(module)
 
         return model.eval()
@@ -1792,7 +1796,9 @@ class PreshardedModelLoader(DefaultModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-        shard_config = self._collect_shard_config(model_config)
+        shard_config = self._collect_shard_config(
+            model_config, torch.device(device_config.device)
+        )
         presharded_dir = self._presharded_dir(model_config, shard_config)
         if self._presharded_ready(presharded_dir) and self._shard_config_matches(
             presharded_dir, shard_config
@@ -1829,7 +1835,9 @@ class PreshardedModelLoader(DefaultModelLoader):
             root = os.path.join(model_config.model_path, self.DEFAULT_SUBDIR)
         return os.path.join(root, subfolder)
 
-    def _collect_shard_config(self, model_config: ModelConfig) -> Dict[str, Any]:
+    def _collect_shard_config(
+        self, model_config: ModelConfig, target_device: Optional[torch.device] = None
+    ) -> Dict[str, Any]:
         def _safe(fn) -> int:
             try:
                 return fn()
@@ -1837,9 +1845,13 @@ class PreshardedModelLoader(DefaultModelLoader):
                 return 1
 
         from sglang.srt.layers.dp_attention import get_moe_cp_size
+        from sglang.srt.layers.moe.utils import (
+            get_moe_a2a_backend,
+            get_moe_runner_backend,
+        )
 
         parallel = get_parallel()
-        return {
+        shard_config = {
             "tp": _safe(lambda: parallel.tp_size),
             "dp": _safe(get_moe_cp_size),
             "ep": _safe(lambda: parallel.moe_ep_size),
@@ -1857,6 +1869,20 @@ class PreshardedModelLoader(DefaultModelLoader):
             ),
             "structural_signature": self._compute_structural_signature(model_config),
         }
+        a2a_backend = get_moe_a2a_backend()
+        if get_moe_runner_backend().is_flashinfer_cutedsl() and (
+            a2a_backend.is_none() or a2a_backend.is_flashinfer()
+        ):
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
+                use_cutedsl_moe_swap_ab,
+            )
+
+            # Presharded files contain processed rows; equal shapes do not
+            # distinguish old up64/gate64 weights from swap-AB up16/gate16.
+            shard_config["flashinfer_cutedsl_swap_ab"] = use_cutedsl_moe_swap_ab(
+                target_device or torch.device(current_platform.device_type)
+            )
+        return shard_config
 
     @staticmethod
     def _normalize_init_expert_location(value: Optional[str]) -> Optional[str]:
@@ -4234,23 +4260,6 @@ def get_model_loader(
         in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed", "modelopt"]
     ):
         logger.info("Using ModelOptModelLoader due to ModelOpt quantization config.")
-        return ModelOptModelLoader(load_config)
-
-    # Use ModelOptModelLoader for unified quantization flags
-    if (
-        model_optloader_allowed
-        and hasattr(model_config, "quantization")
-        and model_config.quantization
-        in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]
-    ):
-        if model_config._is_already_quantized():
-            logger.info(
-                f"Using ModelOptModelLoader for pre-quantized model: {model_config.quantization}"
-            )
-        else:
-            logger.info(
-                f"Using ModelOptModelLoader for quantization: {model_config.quantization}"
-            )
         return ModelOptModelLoader(load_config)
 
     if load_config.load_format == LoadFormat.SHARDED_STATE:

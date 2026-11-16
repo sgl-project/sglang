@@ -105,7 +105,21 @@ class TestNvFp4MoeBackends(CustomTestCase):
                             param, loaded, name, shard_id=shard_id, expert_id=e
                         )
                     refs[shard_id][e] = w_dequant
+            if backend == "flashinfer_cutedsl":
+                canonical_w13 = layer.w13_weight.clone()
+                swap_ab = get_device_sm() in (100, 103)
+                group_size = 16 if swap_ab else 64
+                expected_w13 = torch.cat(
+                    [
+                        canonical_w13[:, offset + start : offset + start + group_size]
+                        for start in range(0, intermediate_size, group_size)
+                        for offset in (0, intermediate_size)
+                    ],
+                    dim=1,
+                )
             layer.quant_method.process_weights_after_loading(layer)
+            if backend == "flashinfer_cutedsl":
+                torch.testing.assert_close(layer.w13_weight, expected_w13)
             if backend == "flashinfer_trtllm":
                 expected_intermediate = round_up(intermediate_size, 64)
                 self.assertEqual(
@@ -133,6 +147,8 @@ class TestNvFp4MoeBackends(CustomTestCase):
             topk_weights, topk_ids = topk_output.topk_weights, topk_output.topk_ids
 
             out = layer.forward(x, topk_output)
+            if backend == "flashinfer_cutedsl":
+                self.assertEqual(layer._cutedsl_wrapper.swap_ab, swap_ab)
             if not isinstance(out, torch.Tensor):
                 out = out[0] if isinstance(out, tuple) else out.hidden_states
 
