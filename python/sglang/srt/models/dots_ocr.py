@@ -9,10 +9,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.configs.dots_ocr import DotsOCRConfig
-from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.utils.common import add_prefix
-from sglang.srt.layers.vocab_parallel_embedding import ParallelLMHead
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
     pad_mm_tokens,
@@ -44,18 +41,13 @@ class DotsOCRForCausalLM(nn.Module):
         # Initialize language model
         self.model = Qwen2ForCausalLM(config, quant_config)
 
-        # Initialize LM head
-        if config.tie_word_embeddings:
-            self.lm_head = self.model.embed_tokens
-        else:
-            self.lm_head = ParallelLMHead(
-                config.vocab_size,
-                config.hidden_size,
-                quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
-            )
+    @property
+    def lm_head(self):
+        return self.model.lm_head
 
-        self.logits_processor = LogitsProcessor(config)
+    @property
+    def logits_processor(self):
+        return self.model.logits_processor
 
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return pad_mm_tokens(input_ids, mm_inputs)
@@ -165,7 +157,7 @@ class DotsOCRForCausalLM(nn.Module):
             self.model.load_weights(language_weights)
 
     def get_embed_and_head(self):
-        return self.model.embed_tokens.weight, self.lm_head.weight
+        return self.model.get_embed_and_head()
 
 
 EntryClass = [DotsOCRForCausalLM]
