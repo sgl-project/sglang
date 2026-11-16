@@ -24,7 +24,7 @@ use self::legacy::LegacyFormatter;
 pub use self::loader::load_chat_formatter;
 pub use self::media::extract_images;
 pub(crate) use self::models::deepseek_v4_thinking;
-pub use self::models::{DeepSeekTokenizer, continues_final_message};
+pub use self::models::{DeepSeekTokenizer, continues_final_message, pydantic_bool};
 use self::models::{
     deep_sort, encode_tools_to_typescript, is_glm53, is_minimax_m3, is_qwen38, is_step3p5,
     preserve_messages, prints_arguments_as_xml, render_deepseek_v4, render_glm53, render_kimi_k3,
@@ -33,9 +33,9 @@ use self::models::{
 #[cfg(feature = "openai")]
 pub(crate) use self::models::{
     deepseek_v4_continued_message, deepseek_v4_parse_start, deepseek_v4_special_tokens,
-    deepseek_v4_task, pydantic_bool,
+    deepseek_v4_task,
 };
-pub use self::reasoning::{requested_effort, requested_thinking};
+pub use self::reasoning::{prepare_reasoning, requested_effort, requested_thinking};
 pub use self::selection::{ChatFormatterOptions, select_chat_formatter};
 pub use self::template::TemplateArgs;
 use self::thinking::ThinkingPolicy;
@@ -55,10 +55,14 @@ pub enum ChatFormatter {
     HuggingFace {
         formatter: PromptFormatter,
         thinking: ThinkingTemplates,
+        /// Python content format for loaded Jinja templates; native fallbacks keep None.
+        content_parts: Option<bool>,
+        message_context: String,
     },
     KimiK25 {
         formatter: PromptFormatter,
         thinking: ThinkingTemplates,
+        message_context: String,
     },
     /// DeepSeek-V4 through deepseek-recipe, with the checkpoint tokenizer when known.
     DeepSeekV4(Option<Arc<DeepSeekTokenizer>>),
@@ -113,13 +117,44 @@ impl ChatFormatter {
         request: &dyn OAIChatLikeRequest,
     ) -> Result<RenderedPrompt, TemplateError> {
         match self {
-            ChatFormatter::HuggingFace { formatter, .. }
-            | ChatFormatter::Glm53(formatter)
+            ChatFormatter::HuggingFace {
+                formatter,
+                message_context,
+                ..
+            } => {
+                let Some(mut args) = request
+                    .chat_template_args()
+                    .filter(|args| {
+                        !message_context.is_empty() && args.contains_key(message_context)
+                    })
+                    .cloned()
+                else {
+                    return render_oai(formatter, request);
+                };
+                args.remove(message_context);
+                render_oai(
+                    formatter,
+                    &TemplateArgsRequest {
+                        request,
+                        args,
+                        messages: None,
+                        tools: None,
+                    },
+                )
+            }
+            ChatFormatter::Glm53(formatter)
             | ChatFormatter::MiniMaxM3 { formatter, .. }
             | ChatFormatter::Qwen38 { formatter, .. }
             | ChatFormatter::Step3p5 { formatter, .. } => render_oai(formatter, request),
-            ChatFormatter::KimiK25 { formatter, .. } => {
+            ChatFormatter::KimiK25 {
+                formatter,
+                message_context,
+                ..
+            } => {
                 let mut args = request.chat_template_args().cloned().unwrap_or_default();
+                if !message_context.is_empty() {
+                    args.remove(message_context);
+                }
                 if let Some(tools) = request.tools() {
                     let mut tools =
                         serde_json::to_value(tools).map_err(|error| TemplateError::Renderer {

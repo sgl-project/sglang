@@ -120,6 +120,10 @@ pub struct ServerArgs {
     /// [`Self::public_tokenizer_path`] instead. Empty only in standalone (test)
     /// configs — then boot requires `skip_tokenizer_init`.
     pub tokenizer_path: String,
+    /// Python's resolved BOS, including a known absence. False only for the
+    /// standalone metadata fallback (or skipped tokenizer initialization).
+    pub tokenizer_bos_token_id_resolved: bool,
+    pub tokenizer_bos_token_id: Option<i32>,
     /// `--tokenizer-path` as launched, reported by `/get_model_info` and
     /// `/server_info`.
     pub public_tokenizer_path: String,
@@ -286,6 +290,8 @@ impl ServerArgs {
         model_path,
         served_model_name,
         tokenizer_path,
+        tokenizer_bos_token_id_resolved,
+        tokenizer_bos_token_id,
         public_tokenizer_path,
         revision,
         load_format,
@@ -352,6 +358,8 @@ impl ServerArgs {
         model_path: String,
         served_model_name: String,
         tokenizer_path: String,
+        tokenizer_bos_token_id_resolved: bool,
+        tokenizer_bos_token_id: Option<i32>,
         public_tokenizer_path: String,
         revision: Option<String>,
         load_format: Option<String>,
@@ -416,6 +424,8 @@ impl ServerArgs {
             model_path,
             served_model_name,
             tokenizer_path,
+            tokenizer_bos_token_id_resolved,
+            tokenizer_bos_token_id,
             public_tokenizer_path,
             revision,
             load_format,
@@ -488,6 +498,8 @@ impl Default for ServerArgs {
             model_path: String::new(),
             served_model_name: String::new(),
             tokenizer_path: String::new(),
+            tokenizer_bos_token_id_resolved: false,
+            tokenizer_bos_token_id: None,
             public_tokenizer_path: String::new(),
             revision: None,
             load_format: None,

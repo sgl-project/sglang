@@ -33,7 +33,7 @@ pub(crate) fn split_continuation(messages: &mut Vec<Value>, continuing: bool) ->
 
 /// The pydantic dump SGLang renders: roles lowercased, unknown and null fields
 /// dropped, `user` reduced to role and content, null content blanked.
-pub(super) fn engine_message(message: Value) -> Value {
+pub(crate) fn engine_message(message: Value) -> Value {
     let mut message = match message {
         Value::Object(message) => message,
         _ => Map::new(),
@@ -102,7 +102,7 @@ pub(super) fn normalize_tools(tools: &[Value]) -> Result<Vec<Value>, String> {
 /// `normalize_assistant_tool_call_arguments(strict=True)`: string arguments must
 /// parse to a JSON object. Nesting beyond serde_json's recursion limit, which
 /// orjson parses, is left to the engine.
-pub(super) fn parse_tool_arguments(message: &mut Value) -> Result<(), RenderError> {
+pub(crate) fn parse_tool_arguments(message: &mut Value) -> Result<(), RenderError> {
     if message["role"] != "assistant" {
         return Ok(());
     }
@@ -169,7 +169,7 @@ pub(crate) fn function_dump(tool: &Value) -> Result<Map<String, Value>, String> 
 }
 
 /// pydantic's lax `bool`: booleans, 0 and 1, and the yes/no words in any case.
-pub(crate) fn pydantic_bool(value: &Value) -> Result<bool, String> {
+pub fn pydantic_bool(value: &Value) -> Result<bool, String> {
     let parsed = match value {
         Value::Bool(value) => Some(*value),
         Value::Number(number) => match number.as_f64() {
