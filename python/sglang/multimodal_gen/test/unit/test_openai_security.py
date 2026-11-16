@@ -362,8 +362,12 @@ def test_mesh_upload_is_temporary_when_input_saving_is_disabled(monkeypatch, tmp
                 files={"image": ("input.png", b"image", "image/png")},
             )
             assert response.status_code == 200, response.text
-            while (await store.get("request"))["status"] == "queued":
-                await asyncio.sleep(0.01)
+
+            async def job_left_the_queue():
+                while (await store.get("request"))["status"] == "queued":
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(job_left_the_queue(), 5)
         assert (await store.get("request"))["status"] == "completed"
 
     asyncio.run(run_test())
