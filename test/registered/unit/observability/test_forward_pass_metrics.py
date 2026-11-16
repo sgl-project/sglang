@@ -2173,6 +2173,75 @@ class TestEstimatedPerfConstants(CustomTestCase):
             tp1._weight_read_bytes_per_token / 4.0, tp4._weight_read_bytes_per_token
         )
 
+    def test_global_compression_ratio_shrinks_weight_bytes_not_activation_bytes(self):
+        # Weight-only quantization (W4A16/W8A16-style) stores weights narrower
+        # than the activation dtype, so weight-read bytes must shrink by the
+        # quant config's own global_compression_ratio (compressed-tensors) --
+        # but KV-cache/activation bytes, which stay at full precision for a
+        # weight-only scheme, must NOT shrink.
+        baseline = _fake_model_config(
+            hidden_size=256, num_attention_layers=2, head_dim=0
+        )
+        quantized = _fake_model_config(
+            hidden_size=256,
+            num_attention_layers=2,
+            head_dim=0,
+            hf_quant_config={"global_compression_ratio": 4.0},
+        )
+        self._init(baseline)
+        baseline_weight_bytes = self.reporter._weight_read_bytes_per_token
+        self._init(quantized)
+        self.assertAlmostEqual(
+            baseline_weight_bytes / 4.0, self.reporter._weight_read_bytes_per_token
+        )
+
+    def test_bits_fallback_used_when_no_global_compression_ratio(self):
+        # GPTQ/AWQ-style flat configs publish bits (or num_bits/w_bit) but no
+        # pre-computed ratio -- fall back to deriving it from the activation
+        # dtype width vs the published bit width.
+        baseline = _fake_model_config(
+            hidden_size=256, num_attention_layers=2, head_dim=0, dtype_itemsize=2
+        )
+        gptq_style = _fake_model_config(
+            hidden_size=256,
+            num_attention_layers=2,
+            head_dim=0,
+            dtype_itemsize=2,
+            hf_quant_config={"bits": 4},
+        )
+        self._init(baseline)
+        baseline_weight_bytes = self.reporter._weight_read_bytes_per_token
+        self._init(gptq_style)
+        # 2 bytes (bf16) * 8 bits/byte / 4 bits = 4x compression ratio.
+        self.assertAlmostEqual(
+            baseline_weight_bytes / 4.0, self.reporter._weight_read_bytes_per_token
+        )
+
+    def test_compressed_tensors_nested_config_groups_bits_fallback(self):
+        # compressed-tensors configs without a top-level global_compression_ratio
+        # (e.g. some float-quantized FP8 exports) nest bits per config group --
+        # confirmed against RedHatAI/Apertus-8B-Instruct-2509-FP8-dynamic and
+        # ibm-granite/granite-3.3-8b-instruct-FP8's real published configs.
+        baseline = _fake_model_config(
+            hidden_size=256, num_attention_layers=2, head_dim=0, dtype_itemsize=2
+        )
+        fp8_dynamic = _fake_model_config(
+            hidden_size=256,
+            num_attention_layers=2,
+            head_dim=0,
+            dtype_itemsize=2,
+            hf_quant_config={
+                "config_groups": {"group_0": {"weights": {"num_bits": 8}}}
+            },
+        )
+        self._init(baseline)
+        baseline_weight_bytes = self.reporter._weight_read_bytes_per_token
+        self._init(fp8_dynamic)
+        # 2 bytes (bf16) * 8 bits/byte / 8 bits = 2x compression ratio.
+        self.assertAlmostEqual(
+            baseline_weight_bytes / 2.0, self.reporter._weight_read_bytes_per_token
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
