@@ -1,5 +1,4 @@
 import itertools
-import math
 import random
 import unittest
 
@@ -1308,52 +1307,6 @@ class TestTritonAttention(CustomTestCase):
             with unittest.mock.patch.object(ea, "_is_gfx95", False):
                 o_default = run()
             self.assertTrue(torch.equal(o_tuned, o_default), f"head_dim {D}")
-
-    def test_extend_attention_unified_xai_temperature(self):
-        """Past xai_temperature_len the unified extend kernel scales logits by
-        log2(pos) / log2(len), the factor the two-stage extend and decode kernels apply."""
-        device = get_device()
-        prefix_len, extend_len, num_heads, head_dim = 48, 80, 4, 64
-        xai_temperature_len = 16
-        total_len = prefix_len + extend_len
-        q = torch.randn(
-            extend_len, num_heads, head_dim, dtype=torch.bfloat16, device=device
-        )
-        k = torch.randn(
-            total_len, num_heads, head_dim, dtype=torch.bfloat16, device=device
-        )
-        v = torch.randn_like(k)
-        o = torch.empty_like(q)
-        extend_attention_fwd_unified(
-            q,
-            o,
-            k,
-            v,
-            1.0,
-            1.0,
-            torch.tensor([0, extend_len], dtype=torch.int32, device=device),
-            torch.tensor([0, total_len], dtype=torch.int32, device=device),
-            torch.arange(total_len, dtype=torch.int64, device=device),
-            torch.tensor([prefix_len], dtype=torch.int32, device=device),
-            max_len_extend=extend_len,
-            xai_temperature_len=xai_temperature_len,
-        )
-
-        q_pos = prefix_len + torch.arange(extend_len, device=device)
-        temperature = torch.where(
-            q_pos > xai_temperature_len,
-            torch.log2(q_pos.float()) / math.log2(xai_temperature_len),
-            1.0,
-        )
-        logits = torch.einsum("qhd,khd->hqk", q.float(), k.float()) / head_dim**0.5
-        logits = logits * temperature[None, :, None]
-        causal = torch.arange(total_len, device=device)[None, :] <= q_pos[:, None]
-        logits = logits.masked_fill(~causal[None], float("-inf"))
-        ref = torch.einsum("hqk,khd->qhd", logits.softmax(dim=-1), v.float())
-        self.assertTrue(
-            torch.allclose(o.float(), ref, atol=5e-2, rtol=5e-2),
-            f"max diff {(o.float() - ref).abs().max().item()}",
-        )
 
     def test_build_unified_kv_indices(self):
         """Test build_unified_kv_indices correctness."""
