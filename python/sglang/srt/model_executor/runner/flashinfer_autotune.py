@@ -456,7 +456,6 @@ class FlashInferGraphAutotune:
             not isinstance(runner.backend, FullCudaGraphBackend)
             or runner.capture_forward_mode != ForwardMode.DECODE
             or runner.enable_torch_compile
-            or runner.enable_two_batch_overlap
         ):
             return None
         return cls.for_model(runner.model_runner)

@@ -71,6 +71,37 @@ class TestAutotuneTacticSyncGroup(CustomTestCase):
 
 
 class TestFlashInferGraphAutotune(CustomTestCase):
+    def test_draft_runner_does_not_need_decode_only_overlap_state(self):
+        from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
+        from sglang.srt.model_executor.forward_mode import ForwardMode
+        from sglang.srt.model_executor.runner_backend.full_cuda_graph_backend import (
+            FullCudaGraphBackend,
+        )
+
+        config = get_context().override_server_args(
+            cuda_graph_config=CudaGraphConfig(),
+            enable_torch_compile=False,
+            enable_two_batch_overlap=False,
+            enable_lora=False,
+        )
+        config.install()
+        self.addCleanup(config.restore)
+        # EAGLE draft runners capture DECODE graphs but do not own the
+        # ordinary decode runner's enable_two_batch_overlap field.
+        runner = SimpleNamespace(
+            backend=FullCudaGraphBackend.__new__(FullCudaGraphBackend),
+            capture_forward_mode=ForwardMode.DECODE,
+            enable_torch_compile=False,
+            model_runner=SimpleNamespace(is_generation=True, is_draft_worker=True),
+        )
+        for enabled in (False, True):
+            with (
+                self.subTest(enabled=enabled),
+                autotune.envs.SGLANG_ENABLE_FLASHINFER_GRAPH_AUTOTUNE.override(enabled),
+                autotune.envs.SGLANG_FLASHINFER_AUTOTUNE_CACHE.override(True),
+            ):
+                self.assertIsNone(FlashInferGraphAutotune.create(runner))
+
     def test_scope_requires_opt_in_cache_reuse_and_single_rank(self):
         """Disabled or distributed deployments must keep the legacy cache path."""
         from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig
