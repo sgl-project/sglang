@@ -42,7 +42,6 @@ from transformers import PretrainedConfig
 from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz
 from sglang.srt.batch_overlap.two_batch_overlap import (
-    MaybeTboDeepEPDispatcher,
     model_forward_stages,
 )
 from sglang.srt.configs.dots3 import Dots3Config
@@ -73,7 +72,6 @@ from sglang.srt.layers.linear import (
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
-    get_deepep_mode,
     get_moe_a2a_backend,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
@@ -269,7 +267,6 @@ class Dots3MoE(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
-        is_nextn: bool = False,
     ):
         super().__init__()
         self.tp_size = get_parallel().tp_size
@@ -356,34 +353,6 @@ class Dots3MoE(nn.Module):
                 )
 
         self.top_k = config.num_experts_per_tok
-
-        if get_moe_a2a_backend().is_deepep():
-            # TODO: we will support tp < ep in the future
-            self.ep_size = get_parallel().moe_ep_size
-            self.num_experts = (
-                config.n_routed_experts + get_exec().moe.ep_num_redundant_experts
-            )
-            self.renormalize = config.norm_topk_prob
-            self.topk_group = config.topk_group
-            self.num_expert_group = config.n_group
-            self.correction_bias = (
-                self.gate.e_score_correction_bias.data
-                if self.gate.e_score_correction_bias is not None
-                else None
-            )
-
-            self.deepep_dispatcher = MaybeTboDeepEPDispatcher(
-                group=get_parallel().tp_group.device_group,
-                router_topk=self.top_k,
-                permute_fusion=True,
-                num_experts=self.num_experts,
-                num_local_experts=config.n_routed_experts // self.tp_size,
-                hidden_size=config.hidden_size,
-                params_dtype=config.torch_dtype,
-                deepep_mode=get_deepep_mode(),
-                async_finish=True,
-                return_recv_hook=True,
-            )
 
         self._enable_deepep_moe = (
             get_moe_a2a_backend().is_deepep() or get_moe_a2a_backend().is_ascend_ops()
@@ -1385,7 +1354,6 @@ class Dots3DecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
-                is_nextn=is_nextn,
             )
         else:
             mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
