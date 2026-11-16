@@ -1853,16 +1853,15 @@ class MiniMaxH3TokenRefinerBlock(nn.Module):
         cu_seqlens_host: tuple[int, ...] | None = None,
         max_seqlen: int,
     ) -> torch.Tensor:
-        h = self.attn(
+        x = x + self.attn(
             self.norm1(x),
             rope_cache=None,
             cu_seqlens=cu_seqlens,
             cu_seqlens_host=cu_seqlens_host,
             max_seqlen=max_seqlen,
         )
-        # Round the residual sum before normalization, as in the reference.
-        x = x + h
-        return x + self.mlp(self.norm2(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
 
 
 class MiniMaxH3TokenRefiner(nn.Module):
