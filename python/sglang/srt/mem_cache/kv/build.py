@@ -56,6 +56,7 @@ from sglang.srt.mem_cache.layout.fused_draft import FusedDraftPlacement
 from sglang.srt.mem_cache.unified_memory_pool import (
     _wire_mamba_slot_allocator,
 )
+from sglang.srt.utils.device import is_cuda
 
 logger = logging.getLogger(__name__)
 
@@ -371,6 +372,11 @@ def build_kv_storage(
         lazy_compaction=ctx.lazy_compaction,
         full_cap_tokens=sized.full_cap_tokens,
         request_rows=sized.request_rows,
+        window_share_rows=(
+            sized.window_tokens
+            if window is not None and state is None and is_cuda()
+            else None
+        ),
         **legacy_capacities,
     )
     if window is None:

@@ -135,7 +135,7 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
 from sglang.srt.utils.common import ceil_align
-from sglang.srt.utils.device import get_device_module
+from sglang.srt.utils.device import get_device_module, is_cuda
 from sglang.srt.utils.poll_timer import PollTimer
 
 if TYPE_CHECKING:
@@ -181,6 +181,7 @@ COMPONENT_REGISTRY: dict[str, type[TreeComponent]] = {
 
 
 logger = logging.getLogger(__name__)
+_is_cuda = is_cuda()
 device_module = get_device_module()
 
 
@@ -859,8 +860,10 @@ class UnifiedRadixCache(BasePrefixCache):
         Evicts nothing for a demand that fits now, or that would not fit with
         every evictable entry gone; admission credits the same evictable entries.
         Every walk stops at the first victim after which the demand fits, so the
-        victim order is a heuristic. Frees queued in the caller's free group go
-        back first: neither the allocator nor the cache sees them as room."""
+        victim order is a heuristic; a trim of cached windows past their sized
+        share runs on to its low mark instead. Frees queued in the caller's free
+        group go back first: neither the allocator nor the cache sees them as
+        room."""
         allocator = self.token_to_kv_pool_allocator
         result = EvictResult()
         demands = {n: d for n, d in units.items() if d > 0}
@@ -872,14 +875,18 @@ class UnifiedRadixCache(BasePrefixCache):
             return result
         owner, windows, state = self._sub_pool_roles()
         if self.evicts_by_joint_lru and allocator.compaction_can_run():
-            # joint_lru: one walk over token and window entries by access
-            # time, every victim's bytes serving either side, stopping at the
-            # first victim after which the demand fits.
+            # Joint LRU ignores window shares and evicts by recency.
             reclaimable = self._reclaimable_units()
             self._evict_units(
                 {n: reclaimable.get(n, 0) for n in (owner, *windows)}, demands, result
             )
             return result
+        if demands.get(owner, 0):
+            # Trim cached windows past their share before evicting FULL entries;
+            # a demand on windows alone evicts its own windows first.
+            self._trim_windows_past_share(result)
+            if allocator.fits_after_frees(demands):
+                return result
         short = {n for n, d in demands.items() if not allocator.units_fit({n: d})}
         spent_first, kept = ({owner}, set(windows))
         if windows_first:
@@ -895,6 +902,21 @@ class UnifiedRadixCache(BasePrefixCache):
                 {n: reclaimable.get(n, 0) for n in names}, demands, result
             )
         return result
+
+    def _trim_windows_past_share(self, result: EvictResult) -> None:
+        allocator = self.token_to_kv_pool_allocator
+        page = allocator.page_size
+        trims = {}
+        for name in allocator.window_pool_names():
+            share = allocator.window_share_tokens(name)
+            if share is None:
+                return
+            cached = self.window_evictable_size(name)
+            # Arbitrary 1/16 hysteresis avoids repeated per-victim write-back waits.
+            if cached > share + share // 16:
+                trims[name] = -(-(cached - share + share // 16) // page) * page
+        if trims:
+            result.add(self.evict_until(EvictParams(window_num_tokens=trims)))
 
     def _units_demand(self, units: dict[str, int]) -> KVDemand:
         """A demand in the allocator's units (pages, slots for state, units for
@@ -941,6 +963,18 @@ class UnifiedRadixCache(BasePrefixCache):
             mamba_num=0 if state is None else units.get(state, 0),
         )
         if not (params.num_tokens or params.window_num_tokens or params.mamba_num):
+            return
+        if params.num_tokens and windows and _is_cuda and self.is_write_back:
+            # FULL victims also free window bytes;
+            # batch write-back until admission credits enough of both.
+            demand = self._units_demand(demands)
+            result.add(
+                self.evict_until(
+                    params,
+                    satisfied=lambda: allocator.fits_after_frees(demands),
+                    queued_fits=lambda frees: allocator.admits(demand, evictable=frees),
+                )
+            )
             return
         if params.num_tokens and not windows and self.is_write_back:
             # Evicted as one token target so write-back victims share one copy
@@ -990,14 +1024,19 @@ class UnifiedRadixCache(BasePrefixCache):
 
     @rank_consensus(same_params=["params"], same_results=True)
     def evict_until(
-        self, params: EvictParams, satisfied: Optional[Callable[[], bool]] = None
+        self,
+        params: EvictParams,
+        satisfied: Optional[Callable[[], bool]] = None,
+        queued_fits: Optional[Callable[[dict[str, int]], bool]] = None,
     ) -> EvictResult:
         """Evict up to ``params`` per component, stopping at the first victim
         after which ``satisfied`` holds; without ``satisfied``, write-back
-        victims are batched behind one copy wait."""
+        victims are batched behind one copy wait. With ``queued_fits``, a walk
+        queues its write-back victims until it holds for what they will free
+        (tokens per sub-pool, slots for state), then demotes them."""
         if self.disable:
             return EvictResult()
-        return self._evict(params, satisfied=satisfied)
+        return self._evict(params, satisfied=satisfied, queued_fits=queued_fits)
 
     def _evict_request_by_type(self, params: EvictParams) -> dict[ComponentType, int]:
         """Per tree component, what ``params`` asks of it."""
@@ -1031,6 +1070,7 @@ class UnifiedRadixCache(BasePrefixCache):
         *,
         demand: Optional[dict[ComponentType, int]] = None,
         satisfied: Optional[Callable[[], bool]] = None,
+        queued_fits: Optional[Callable[[dict[str, int]], bool]] = None,
     ) -> EvictResult:
         if self.disable:
             return EvictResult()
@@ -1048,7 +1088,11 @@ class UnifiedRadixCache(BasePrefixCache):
         else:
             request_by_type = self._evict_request_by_type(params)
             self._evict_components(
-                request_by_type, tracker, demand=demand, satisfied=satisfied
+                request_by_type,
+                tracker,
+                demand=demand,
+                satisfied=satisfied,
+                queued_fits=queued_fits,
             )
 
         if (
@@ -1189,6 +1233,7 @@ class UnifiedRadixCache(BasePrefixCache):
         *,
         demand: Optional[dict[ComponentType, int]] = None,
         satisfied: Optional[Callable[[], bool]] = None,
+        queued_fits: Optional[Callable[[dict[str, int]], bool]] = None,
     ) -> None:
         # Buffer mode: eviction always wins over queued backup intents — a
         # destroyed victim's intent is stale-swept and the content rewrites
@@ -1233,6 +1278,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 target_reached,
                 demand,
                 satisfied,
+                queued_fits if ct == BASE_COMPONENT_TYPE else None,
             )
 
     def _write_back_batch_tokens(
@@ -1261,6 +1307,7 @@ class UnifiedRadixCache(BasePrefixCache):
         target_reached: Callable[[ComponentType], bool],
         demand: Optional[dict[ComponentType, int]],
         satisfied: Optional[Callable[[], bool]],
+        queued_fits: Optional[Callable[[dict[str, int]], bool]] = None,
     ) -> None:
         """One device-eviction walk: write-back victims queue their copies and
         demotes, then one wait lands the batch. Queued victims count as
@@ -1270,6 +1317,20 @@ class UnifiedRadixCache(BasePrefixCache):
         takes another entry."""
         pending: list[NodeId] = []
         pending_tokens = 0
+        pending_frees: dict[str, int] = {}
+
+        def queue(node_id: NodeId, copied: Sequence[NodeId] = ()) -> None:
+            nonlocal pending_tokens
+            full_tokens = self.tree_core.mark_write_back_queued(node_id, copied)
+            if queued_fits is not None:
+                self._add_queued_frees(node_id, full_tokens, pending_frees)
+            pending.append(node_id)
+            pending_tokens += full_tokens
+
+        def batch_full() -> bool:
+            if queued_fits is not None:
+                return queued_fits(pending_frees)
+            return pending_tokens >= batch_need()
 
         def batch_need() -> int:
             return self._write_back_batch_tokens(
@@ -1284,6 +1345,7 @@ class UnifiedRadixCache(BasePrefixCache):
             nonlocal pending_tokens
             self._demote_backed_up(pending, tracker)
             pending_tokens = 0
+            pending_frees.clear()
 
         self.tree_core.evict_device_start(ct, walk_quota)
         try:
@@ -1296,8 +1358,7 @@ class UnifiedRadixCache(BasePrefixCache):
                     if not made_progress:
                         break
                 elif pending and self.tree_core.is_backuped(node_id):
-                    pending.append(node_id)
-                    pending_tokens += self.tree_core.mark_write_back_queued(node_id)
+                    queue(node_id)
                 else:
                     backup_kv = self._evict_device_leaf(node_id, tracker)
                     if backup_kv is not None:
@@ -1312,8 +1373,7 @@ class UnifiedRadixCache(BasePrefixCache):
                                 backup_kv, write_back=True
                             )
                         if written > 0:
-                            pending.append(node_id)
-                            pending_tokens += self.tree_core.mark_write_back_queued(
+                            queue(
                                 node_id,
                                 self.ongoing_write_through[node_id].publish_node_ids,
                             )
@@ -1331,7 +1391,7 @@ class UnifiedRadixCache(BasePrefixCache):
                                 "until host space frees",
                                 node_id,
                             )
-                if pending and pending_tokens >= batch_need():
+                if pending and batch_full():
                     demote_queued()
                 if not pending and target_reached(ct):
                     break
@@ -1340,6 +1400,20 @@ class UnifiedRadixCache(BasePrefixCache):
                 self._demote_backed_up(pending, tracker)
             finally:
                 self.tree_core.evict_device_end(ct)
+
+    def _add_queued_frees(
+        self, node_id: NodeId, full_tokens: int, frees: dict[str, int]
+    ) -> None:
+        # Owner demotion also releases window and state values.
+        owner, _, state = self._sub_pool_roles()
+        frees[owner] = frees.get(owner, 0) + full_tokens
+        names = dict(self._window_sub_pools_by_slot())
+        if state is not None:
+            names[self.slot_id(TREE_STATE)] = state
+        for ct, name in names.items():
+            value = self.tree_core.get_component_device_value(node_id, ct)
+            if value is not None:
+                frees[name] = frees.get(name, 0) + len(value)
 
     def _demote_backed_up(
         self, node_ids: list[NodeId], tracker: dict[ComponentType, int]
