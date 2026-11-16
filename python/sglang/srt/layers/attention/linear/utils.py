@@ -1,16 +1,13 @@
 from __future__ import annotations
 
 from enum import Enum
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 import msgspec
 
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import get_exec
 from sglang.srt.utils.log_utils import rank0_log
-
-if TYPE_CHECKING:
-    pass
 
 
 def pp_spec_stable_rows_enabled() -> bool:

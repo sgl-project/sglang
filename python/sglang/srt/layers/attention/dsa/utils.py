@@ -54,7 +54,7 @@ def aiter_can_use_preshuffle_paged_mqa() -> bool:
     """
     if not is_hip():
         return False
-    if not get_bool_env_var("SGLANG_USE_AITER"):
+    if not envs.SGLANG_USE_AITER.get():
         return False
     if envs.SGLANG_DSA_HIP_DISABLE_PRESHUFFLE.get():
         return False
@@ -94,7 +94,7 @@ def gfx950_fused_indexer_runtime_ok() -> bool:
     # No hardware term here: gfx950_fused_indexer.supported_hardware() is the
     # hardware half of the gate and runs first, so anything reaching this point
     # is already on gfx950. What is left is what a deployment can get wrong.
-    if not get_bool_env_var("SGLANG_USE_AITER"):
+    if not envs.SGLANG_USE_AITER.get():
         return _refuse("SGLANG_USE_AITER is not set")
     if not aiter_can_use_preshuffle_paged_mqa():
         return _refuse("aiter cannot use preshuffled paged MQA logits")
