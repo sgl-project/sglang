@@ -1170,6 +1170,35 @@ def test_hunyuan_quality_qknorm_matches_rmsnorm():
     assert torch.equal(k_unmounted, k_ref)
 
 
+@pytest.mark.skipif(not is_cuda(), reason="FlashInfer CuTe QK RMSNorm is CUDA-only")
+@pytest.mark.parametrize("supports_pdl", [False, True])
+def test_hunyuan_quality_qknorm_requests_pdl_only_where_supported(supports_pdl):
+    # griddepcontrol needs SM90+; below that the CuTe kernel fails to compile with PDL on
+    site = torch.nn.Module()
+    HUNYUAN_QKNORM.mark(site)
+    q_norm = RMSNorm(128, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
+    k_norm = RMSNorm(128, eps=1e-6).to(device="cuda", dtype=torch.bfloat16)
+    packed = torch.randn(1, 17, 3, 2, 128, device="cuda", dtype=torch.bfloat16)
+    q, k = packed[:, :, 0], packed[:, :, 1]
+    calls = []
+
+    def fake_qk_rmsnorm_cute(x, weight, out, eps, enable_pdl):
+        calls.append(enable_pdl)
+        out.copy_(x)
+
+    arch = SimpleNamespace(supports_pdl=supports_pdl)
+    with (
+        patch.object(
+            hunyuan_qknorm, "_get_qk_rmsnorm_cute", return_value=fake_qk_rmsnorm_cute
+        ),
+        patch.object(hunyuan_qknorm, "current_arch", return_value=arch),
+    ):
+        assert HUNYUAN_QKNORM.mount(site)
+        _hunyuan_qknorm(site, q, k, q_norm, k_norm)
+
+    assert calls == [supports_pdl, supports_pdl]
+
+
 def test_hunyuan_quality_qknorm_stays_unmounted_without_cute_kernel():
     site = torch.nn.Module()
     HUNYUAN_QKNORM.mark(site)
