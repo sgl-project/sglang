@@ -389,7 +389,9 @@ def dispatch_custom_allreduce(
     """Return the CustomAllreduce class to use (aiter on ROCm if enabled).
 
     On AMD with 1-stage AR enabled, use sglang's CustomAllreduce.
-    Otherwise use AiterCustomAllreduce if available.
+    Otherwise use AiterCustomAllreduce if available. Either is built for copy-in
+    graph capture when DP lanes may replay different graphs
+    (see _enable_register_for_capturing).
 
     On CUDA, the JIT-compiled v2 implementation is used by default.
     Set SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2=0 to fall back to the legacy CustomAllreduce.
