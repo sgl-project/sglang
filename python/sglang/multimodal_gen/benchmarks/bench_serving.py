@@ -294,6 +294,8 @@ async def async_request_video_sglang(
         # Explicitly add fps/num_frames if they are not in extra_body (bench_serving logic overrides)
         if input.num_frames:
             data.add_field("num_frames", str(input.num_frames))
+        if input.num_inference_steps is not None:
+            data.add_field("num_inference_steps", str(input.num_inference_steps))
         if input.fps:
             data.add_field("fps", str(input.fps))
 
