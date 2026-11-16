@@ -323,6 +323,19 @@ def test_import_stays_metadata_only():
     assert "CLEAN" in r.stdout
 
 
+def test_minicpm_sala_package_exports_the_function_after_its_submodule():
+    """Importing get_block_table from the minicpm_sala package must give the function
+    even when the same-named submodule was imported first."""
+    code = (
+        "import sglang.kernels.ops.attention.minicpm_sala.get_block_table; "
+        "from sglang.kernels.ops.attention.minicpm_sala import get_block_table; "
+        "print(type(get_block_table).__name__)"
+    )
+    r = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "function"
+
+
 @pytest.mark.parametrize(
     "op, backend, device",
     [
