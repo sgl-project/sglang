@@ -27,7 +27,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
 # Where test_collectives.py runs: the K3 fused collectives are SM100-only.
-register_cuda_ci(est_time=60, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=44, stage="base-c", runner_config="4-gpu-b200")
 register_cuda_ci(est_time=120, stage="nightly", runner_config="8-gpu-b200")
 
 N = 896 + 3584  # K3 [router | latent] rows

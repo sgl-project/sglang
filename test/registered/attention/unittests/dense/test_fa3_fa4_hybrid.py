@@ -27,7 +27,7 @@ from sglang.test.kits.attention_unittest.attention_methods.dense_attention impor
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=33, stage="base-b", runner_config="1-gpu-large")
 
 # Gemma-4 head widths: global layers run FA4, sliding-window layers stay on FA3.
 WIDE_HEAD_DIM = 512

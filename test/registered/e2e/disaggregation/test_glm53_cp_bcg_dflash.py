@@ -12,7 +12,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import try_cached_model
 
-register_cuda_ci(est_time=1800, stage="extra-b", runner_config="8-gpu-b300")
+register_cuda_ci(est_time=715, stage="extra-b", runner_config="8-gpu-b300")
 
 COMMON_ARGS = [
     "--dsa-prefill-backend",

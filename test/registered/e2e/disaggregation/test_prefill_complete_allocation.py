@@ -15,7 +15,7 @@ from sglang.test.server_fixtures.disaggregation_fixture import (
 )
 from sglang.test.test_utils import ADMIN_LAUNCH_ARGS_FOR_TEST, admin_post
 
-register_cuda_ci(est_time=168, stage="extra-a", runner_config="2-gpu-large")
+register_cuda_ci(est_time=165, stage="extra-a", runner_config="2-gpu-large")
 
 
 class _PrefillCompleteServer(PDDisaggregationServerBase):

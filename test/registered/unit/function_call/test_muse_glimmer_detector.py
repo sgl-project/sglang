@@ -16,7 +16,7 @@ from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(1.0, "base-a-test-cpu")
+register_cpu_ci(2, "base-a-test-cpu")
 
 DOUBLED = "get_weather.get_weather"
 

@@ -38,7 +38,7 @@ from sglang.test.unified_allocator_fixtures import (
     setup_allocator_context,
 )
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 BRP = "sglang.srt.managers.scheduler_components.batch_result_processor"
 RETIRER = "sglang.srt.managers.scheduler_components.request_retirer"

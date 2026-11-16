@@ -12,10 +12,10 @@ from sglang.srt.utils.watchdog import WatchdogRaw
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 # The NVIDIA runner containers are where watchdog py-spy dumps are refused, so
 # check there too.
-register_cuda_ci(est_time=5, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
 
 
 def _yama_ptrace_scope():

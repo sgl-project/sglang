@@ -27,7 +27,7 @@ from sglang.srt.mem_cache.kv.alloc.pricing import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 def _band(name, grow, e, *, num_pages, min_page, low, high, live, fixed=None):

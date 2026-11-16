@@ -37,7 +37,7 @@ from sglang.test.test_utils import CustomTestCase
 from sglang.test.token_demand import demand_windows
 from sglang.test.unified_allocator_fixtures import largest_take
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 def _build(lazy: bool):

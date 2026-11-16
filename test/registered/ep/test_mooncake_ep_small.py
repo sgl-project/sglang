@@ -18,7 +18,7 @@ from sglang.test.test_utils import (
 )
 
 register_cuda_ci(
-    est_time=189,
+    est_time=285,
     stage="base-c",
     runner_config="4-gpu-h100",
     disabled="Temporarily disabled: Mooncake 0.3.14 EP JIT intermittently fails to spawn nvcc (exit_code=127, kvcache-ai/Mooncake#5316); re-enable once CI bumps to a Mooncake release that includes kvcache-ai/Mooncake#5356.",

@@ -24,7 +24,7 @@ GPU parity of the read/write kernels (set_mla_kv_buffer TMA path etc.) lives in
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.unified_allocator_fixtures import FakeKVCache, arena_of
 
-register_cpu_ci(est_time=9, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 import unittest
 from unittest import mock

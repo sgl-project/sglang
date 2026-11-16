@@ -27,7 +27,7 @@ from sglang.test.unified_allocator_fixtures import (
 # test takes rows for one.
 _NO_ROW_REQ = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=None))
 
-register_cpu_ci(est_time=8, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 def _build(*, state, lazy, draft_dim, device="cpu"):

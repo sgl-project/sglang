@@ -10,7 +10,7 @@ from sglang.srt.utils import is_cuda
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.fp8 import TestFP8Base
 
-register_cuda_ci(est_time=11, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
 
 _is_cuda = is_cuda()

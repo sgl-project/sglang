@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
 )
 from sglang.utils import download_and_cache_file, read_jsonl
 
-register_cuda_ci(est_time=200, stage="extra-a", runner_config="1-gpu-large")
+register_cuda_ci(est_time=157, stage="extra-a", runner_config="1-gpu-large")
 
 TARGET_MODEL = "Qwen/Qwen3-4B"
 DRAFT_MODEL = "deepseek-ai/dspark_qwen3_4b_block7"

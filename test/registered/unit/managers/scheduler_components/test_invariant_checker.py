@@ -42,7 +42,7 @@ from sglang.srt.session.streaming_session import SessionSlot
 from sglang.test.scheduler_test_utils import FakeReq
 from sglang.test.tree_slots import tree_slots_of
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=3, suite="base-a-test-cpu")
 
 
 class TestCheckTreeCacheGate(CustomTestCase):

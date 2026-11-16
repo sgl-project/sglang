@@ -18,7 +18,7 @@ from sglang.test.unified_allocator_fixtures import (
     setup_allocator_context,
 )
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=18, stage="base-b", runner_config="1-gpu-small")
 
 PAGE_SIZE = 4
 CHAINS = {

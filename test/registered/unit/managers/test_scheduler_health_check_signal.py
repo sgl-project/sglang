@@ -36,7 +36,7 @@ from sglang.test.scheduler_test_utils import (  # noqa: E402
     release_only_retirer,
 )
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 class TestHealthCheckSignal(CustomTestCase):

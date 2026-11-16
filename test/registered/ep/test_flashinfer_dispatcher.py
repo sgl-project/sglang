@@ -30,7 +30,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 from sglang.test.test_utils import CustomTestCase, publish_build_topology
 
-register_cuda_ci(est_time=240, stage="base-c", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=41, stage="base-c", runner_config="4-gpu-b200")
 
 IS_BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10
 

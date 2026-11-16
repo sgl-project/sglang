@@ -43,7 +43,7 @@ from sglang.test.unified_allocator_fixtures import (
     tri_sub_pool_specs,
 )
 
-register_cpu_ci(est_time=6, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 _ROLES = ChainRoles(owner="full", window="swa", state="mamba")
 

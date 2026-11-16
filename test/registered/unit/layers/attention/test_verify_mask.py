@@ -18,7 +18,7 @@ from sglang.srt.speculative.eagle_utils import default_tree_mask_mode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 _MAX_BS = 4
 _DRAFT = 3

@@ -46,7 +46,7 @@ finally:
         else:
             sys.modules[name] = module
 
-register_cpu_ci(est_time=26, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
 def _compression_layout():

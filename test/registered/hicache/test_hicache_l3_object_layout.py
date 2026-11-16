@@ -55,7 +55,7 @@ from sglang.srt.runtime_context import (
     get_server_args,
 )
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 
 def _sidecar(pool_name: PoolName, hit_policy: PoolHitPolicy) -> SidecarPoolSpec:

@@ -12,7 +12,7 @@ from sglang.multimodal_gen.runtime.layers.attention.backends.flashinfer_fa2 impo
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=30, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=37, stage="base-b", runner_config="1-gpu-small")
 
 
 @unittest.skipUnless(

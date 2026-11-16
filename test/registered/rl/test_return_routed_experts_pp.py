@@ -8,7 +8,7 @@ import test_return_routed_experts as single_stage
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=600, stage="extra-b", runner_config="4-gpu-h100")
+register_cuda_ci(est_time=281, stage="extra-b", runner_config="4-gpu-h100")
 
 
 class TestReturnRoutedExpertsPipelineParallel(single_stage.TestReturnRoutedExperts):

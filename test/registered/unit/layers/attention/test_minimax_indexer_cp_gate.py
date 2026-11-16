@@ -9,7 +9,7 @@ from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 # The run shape MiniMax-M3 CP was validated on; only the draft layout varies below.
 SUPPORTED = dict(

@@ -32,7 +32,7 @@ from sglang.test.kits.unified_radix_cache.unified_tree_core_inspection_interface
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.tree_slots import CUSTOM_WINDOW_COMPONENT, FAMILY_OF, tree_slots_of
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 def _cache_init_params(**kwargs) -> CacheInitParams:

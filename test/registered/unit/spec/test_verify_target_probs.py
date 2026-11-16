@@ -22,7 +22,7 @@ from sglang.srt.speculative.dflash_utils import (
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=45, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=29, stage="base-b", runner_config="1-gpu-small")
 
 _DEVICES = ["cpu"] + (["cuda"] if torch.cuda.is_available() else [])
 _DRAFT_TOKEN_NUM = 8

@@ -28,7 +28,7 @@ from sglang.srt.managers.utils import EmbeddingBatchResult
 from sglang.srt.mem_cache.kv.storage import KVStorage
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 
 class _Event:

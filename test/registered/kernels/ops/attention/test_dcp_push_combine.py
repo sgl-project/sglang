@@ -33,7 +33,7 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 from sglang.test.parallel_groups import publish
 
-register_cuda_ci(est_time=60, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=30, stage="extra-b", runner_config="8-gpu-h200")
 
 H = 96  # Kimi-K3.1 MLA heads, all held by every DCP rank
 MAX_ROWS = 1024

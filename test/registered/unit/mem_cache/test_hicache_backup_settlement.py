@@ -39,7 +39,7 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
     node_host_lock_ref,
 )
 
-register_cpu_ci(est_time=60, suite="base-a-test-cpu")
+register_cpu_ci(est_time=44, suite="base-a-test-cpu")
 
 # Three write batches (128, 128, 44 pages); the failing one is the second.
 _PAGES = 2 * STORAGE_BATCH_SIZE + 44

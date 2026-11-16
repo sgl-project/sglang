@@ -18,7 +18,7 @@ from sglang.srt.speculative.dflash_draft_ring import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 HOOK_MODULE = "sglang.srt.arg_groups.speculative_hook"
 SWITCH = envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING

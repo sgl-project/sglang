@@ -43,7 +43,7 @@ from sglang.srt.mem_cache.unified_radix_cache import (
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=18, suite="base-a-test-cpu")
+register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 # The pool schema one rank holding only the KV host pool reduces a hit query
 # over: the host pools some rank registers.
