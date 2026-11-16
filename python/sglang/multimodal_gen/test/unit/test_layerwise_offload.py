@@ -314,12 +314,14 @@ def shared_store_manager(monkeypatch, tmp_path):
     managers = []
     pool = f"test-isolation-{uuid.uuid4().hex}"
 
-    def create():
+    def create(before_offload=None):
         model = torch.nn.Module()
         model.blocks = torch.nn.ModuleList([torch.nn.Linear(4, 3)])
         with torch.no_grad():
             model.blocks[0].weight.copy_(torch.arange(12).reshape(3, 4))
             model.blocks[0].bias.copy_(torch.arange(3))
+        if before_offload is not None:
+            before_offload(model)
         budget = host_memory_budget.HostPinBudget(available_bytes=1 << 30)
         budget.reserve_bytes = 0
         manager = LayerwiseOffloadManager(
@@ -449,6 +451,66 @@ def test_lora_writeback_refreshes_detached_view(shared_store_manager):
         layerwise_offload_mod.write_dense_weight(layer, original)
     assert torch.equal(layer._packed_weight_cpu, original)
     assert torch.equal(owner.get_cpu_weight("blocks.0.weight"), original)
+
+
+@pytest.mark.parametrize("startup_merged", [False, True])
+def test_startup_lora_can_write_back_after_offload(
+    shared_store_manager, monkeypatch, startup_merged
+):
+    from sglang.multimodal_gen.runtime.layers.lora import linear as lora_linear
+    from sglang.multimodal_gen.runtime.pipelines_core.lora.pipeline import LoRAPipeline
+
+    class Pipeline(LoRAPipeline):
+        def create_pipeline_stages(self, server_args):
+            pass
+
+    monkeypatch.setattr(lora_linear, "get_local_torch_device", lambda: "cpu")
+
+    def apply_startup_lora(model):
+        pipeline = object.__new__(Pipeline)
+        pipeline.modules = {"transformer": model}
+        pipeline.exclude_lora_layers = []
+        pipeline.lora_rank = pipeline.lora_alpha = 1
+        layers = {}
+        assert pipeline.convert_module_lora_layers(model, "transformer", layers) == 1
+        layers["blocks.0"].set_lora_weights(
+            torch.ones(1, 4), torch.ones(3, 1), merge_weights=startup_merged
+        )
+        # A back-reference to the root must not become a child module: startup
+        # offload still calls model.to(device) after wrapping the layers.
+        assert "_offload_root" not in model.blocks[0].base_layer._modules
+        model.to("cpu")
+
+    create, _ = shared_store_manager
+    owner = create(before_offload=apply_startup_lora)
+    peer = create(before_offload=apply_startup_lora)
+    owner.model.layerwise_offload_managers = [owner]
+    peer.model.layerwise_offload_managers = [peer]
+    layer = owner.model.blocks[0]
+    name = "blocks.0.base_layer.weight"
+    original = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    shared_weight = original + int(startup_merged)
+    assert layer.base_layer.weight.numel() == 1
+    source, _ = layer._materialized_weight_src()
+    torch.testing.assert_close(source, shared_weight, rtol=0, atol=0)
+
+    if startup_merged:
+        layer.unmerge_lora_weights()
+        torch.testing.assert_close(owner.get_cpu_weight(name), original, rtol=0, atol=0)
+    # set_lora reloads the adapter factors before merging; the parameters from
+    # startup belong to the offload manager and may themselves be placeholders.
+    layer.set_lora_weights(
+        torch.ones(1, 4), torch.ones(3, 1), clear_existing=True, merge_weights=False
+    )
+    source, _ = layer._materialized_weight_src()
+    # clone() models the CPU-to-accelerator copy used by merge_lora_weights.
+    # The CPU-only test must not merge directly into the shared source view.
+    layer._merge_from_device_data(source.clone())
+    torch.testing.assert_close(owner.get_cpu_weight(name), original + 1, rtol=0, atol=0)
+    torch.testing.assert_close(peer.get_cpu_weight(name), shared_weight, rtol=0, atol=0)
+    layer.unmerge_lora_weights()
+    torch.testing.assert_close(owner.get_cpu_weight(name), original, rtol=0, atol=0)
+    torch.testing.assert_close(peer.get_cpu_weight(name), shared_weight, rtol=0, atol=0)
 
 
 def test_layerwise_offload_preserves_non_contiguous_stride(monkeypatch):

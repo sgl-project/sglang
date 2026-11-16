@@ -482,7 +482,14 @@ class LoRAPipeline(ComposedPipelineBase):
         materialized: dict[str, torch.Tensor],
         snapshot_base: bool = True,
     ) -> None:
-        """Bind LoRA to the manager CPU view, not the (1,) GPU placeholder."""
+        """Bind LoRA writes even when offload is configured after wrapping."""
+        base = lora_layer.base_layer
+        # Keep this back-reference out of the module tree: startup offload
+        # still calls module.to(device), which must not recurse into its root.
+        object.__setattr__(base, "_offload_root", module)
+        # Managers configured after startup LoRA see the wrapped parameter
+        # name. The CPU view is resolved lazily once those managers exist.
+        base._offload_param_prefix = f"{name}.base_layer"
         if not materialized:
             return
         weight = materialized.get(f"{name}.weight")
@@ -491,8 +498,6 @@ class LoRAPipeline(ComposedPipelineBase):
         data = weight.detach()
         lora_layer.cpu_weight = data.clone() if snapshot_base else data
         lora_layer._base_is_view = not snapshot_base
-        base = lora_layer.base_layer
-        base._offload_root = module
         base._offload_param_prefix = name
         base._packed_weight_cpu = data
 
