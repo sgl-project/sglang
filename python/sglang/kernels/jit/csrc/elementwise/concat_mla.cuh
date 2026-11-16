@@ -122,70 +122,49 @@ struct ConcatMlaKKernel {
   static void run(tvm::ffi::TensorView k, tvm::ffi::TensorView k_nope, tvm::ffi::TensorView k_rope) {
     using namespace host;
 
-    auto N = SymbolicSize{"num_tokens"};
-    auto H = SymbolicSize{"num_heads"};
-    auto D = SymbolicSize{"k_head_dim"};
-    auto D_nope = SymbolicSize{"nope_head_dim"};
-    auto D_rope = SymbolicSize{"rope_head_dim"};
-    auto S0_k = SymbolicSize{"k_stride_0"};
-    auto S1_k = SymbolicSize{"k_stride_1"};
-    auto S0_k_nope = SymbolicSize{"k_nope_stride_0"};
-    auto S1_k_nope = SymbolicSize{"k_nope_stride_1"};
-    auto S0_k_rope = SymbolicSize{"k_rope_stride_0"};
-    auto device = SymbolicDevice{};
-
-    // Set known fixed values
-    H.set_value(NUM_LOCAL_HEADS);
-    D.set_value(K_HEAD_DIM);
-    D_nope.set_value(QK_NOPE_HEAD_DIM);
-    D_rope.set_value(QK_ROPE_HEAD_DIM);
-
     // The widest access is `v2.s32` (8B), and the `>> 2` stride stepping needs
     // each row stride to be a whole number of int2's -- which is the same 8B.
     constexpr int64_t kAlignNope = 8;
     constexpr int64_t kAlignRope = 4;  // rope is read with `v1.s32`
 
-    // Verify k: [num_tokens, num_heads, k_head_dim]
-    TensorMatcher({N, H, D})
-        .with_strides({S0_k, S1_k, 1})
+    auto N = SymbolicSize{"num_tokens"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({N, NUM_LOCAL_HEADS, K_HEAD_DIM})  //
+        .with_strides({-1, -1, 1})
         .with_dtype<bf16_t>()
-        .with_device<kDLCUDA>(device)
+        .with_device(device)
         .ensure_alignment(kAlignNope)
         .verify(k);
-
-    // Verify k_nope: [num_tokens, num_heads, nope_head_dim]
-    TensorMatcher({N, H, D_nope})
-        .with_strides({S0_k_nope, S1_k_nope, 1})
+    TensorMatcher({N, NUM_LOCAL_HEADS, QK_NOPE_HEAD_DIM})  //
+        .with_strides({-1, -1, 1})
         .with_dtype<bf16_t>()
-        .with_device<kDLCUDA>(device)
+        .with_device(device)
         .ensure_alignment(kAlignNope)
         .verify(k_nope);
-
-    // Verify k_rope: [num_tokens, 1, rope_head_dim]
-    TensorMatcher({N, 1, D_rope})
-        .with_strides({S0_k_rope, -1, 1})
+    TensorMatcher({N, 1, QK_ROPE_HEAD_DIM})  //
+        .with_strides({-1, -1, 1})
         .with_dtype<bf16_t>()
-        .with_device<kDLCUDA>(device)
+        .with_device(device)
         .ensure_alignment(kAlignRope)
         .verify(k_rope);
 
-    const int num_tokens = static_cast<int>(N.unwrap());
+    const auto num_tokens = static_cast<int>(N.unwrap());
+    constexpr uint32_t kNumWarpsPerBlock = 32;
+    const auto grid_size = div_ceil(static_cast<uint32_t>(num_tokens * NUM_HEAD_CHUNKS), kNumWarpsPerBlock);
 
-    constexpr int num_warps_per_block = 32;
-    const int grid_size = div_ceil(num_tokens * NUM_HEAD_CHUNKS, num_warps_per_block);
-    const int block_size = num_warps_per_block * 32;
-
-    LaunchKernel(grid_size, block_size, device.unwrap())(
+    LaunchKernel(grid_size, kNumWarpsPerBlock * 32, device.unwrap())(
         concat_mla_k_kernel,
         static_cast<bf16_t*>(k.data_ptr()),
         static_cast<const bf16_t*>(k_nope.data_ptr()),
         static_cast<const bf16_t*>(k_rope.data_ptr()),
         num_tokens,
-        S0_k.unwrap(),
-        static_cast<int>(S1_k.unwrap()),
-        S0_k_nope.unwrap(),
-        static_cast<int>(S1_k_nope.unwrap()),
-        S0_k_rope.unwrap());
+        k.stride(0),
+        static_cast<int>(k.stride(1)),
+        k_nope.stride(0),
+        static_cast<int>(k_nope.stride(1)),
+        k_rope.stride(0));
   }
 };
 
@@ -235,31 +214,9 @@ template <bool kUsePDL>
 struct ConcatMlaAbsorbQKernel {
   static void run(tvm::ffi::TensorView a, tvm::ffi::TensorView b, tvm::ffi::TensorView out) {
     using namespace host;
-
-    auto N0_a = SymbolicSize{"a_dim_0"};
-    auto N1_a = SymbolicSize{"a_dim_1"};
-    auto D_a = SymbolicSize{"a_last_dim"};
-    auto N0_b = SymbolicSize{"b_dim_0"};
-    auto N1_b = SymbolicSize{"b_dim_1"};
-    auto D_b = SymbolicSize{"b_last_dim"};
-    auto N0_out = SymbolicSize{"out_dim_0"};
-    auto N1_out = SymbolicSize{"out_dim_1"};
-    auto D_out = SymbolicSize{"out_last_dim"};
-    auto S0_a = SymbolicSize{"a_stride_0"};
-    auto S1_a = SymbolicSize{"a_stride_1"};
-    auto S0_b = SymbolicSize{"b_stride_0"};
-    auto S1_b = SymbolicSize{"b_stride_1"};
-    auto S0_out = SymbolicSize{"out_stride_0"};
-    auto S1_out = SymbolicSize{"out_stride_1"};
-    auto device = SymbolicDevice{};
-
-    // Set known fixed values
-    D_a.set_value(A_LAST_DIM);
-    D_b.set_value(B_LAST_DIM);
-    D_out.set_value(OUT_LAST_DIM);
-
     using device::warp::LoadStorePattern;
     using enum LoadStorePattern::type;
+
     constexpr int64_t kAlignA = LoadStorePattern::get_vec_bytes<A_LAST_DIM * sizeof(bf16_t), WARP_UNIFORM_16B>();
     constexpr int64_t kAlignB = LoadStorePattern::get_vec_bytes<B_LAST_DIM * sizeof(bf16_t), WARP_UNIFORM_16B>();
     // `out` carries both halves, so it must satisfy the wider one; the B half
@@ -267,44 +224,37 @@ struct ConcatMlaAbsorbQKernel {
     constexpr int64_t kAlignOut = std::max(kAlignA, kAlignB);
     static_assert(A_LAST_DIM * sizeof(bf16_t) % kAlignB == 0, "A width must not misalign the B half");
 
-    // Verify a: [dim_0, dim_1, A_LAST_DIM]
-    TensorMatcher({N0_a, N1_a, D_a})
-        .with_strides({S0_a, S1_a, 1})
+    // a, b and out share the leading [dim_0, dim_1]: the kernel indexes all three with one (idx_0, idx_1).
+    auto N0 = SymbolicSize{"dim_0"};
+    auto N1 = SymbolicSize{"dim_1"};
+    auto device = SymbolicDevice{};
+    device.set_options<kDLCUDA>();
+
+    TensorMatcher({N0, N1, A_LAST_DIM})  //
+        .with_strides({-1, -1, 1})
         .with_dtype<bf16_t>()
-        .with_device<kDLCUDA>(device)
+        .with_device(device)
         .ensure_alignment(kAlignA)
         .verify(a);
-
-    // Verify b: [dim_0, dim_1, B_LAST_DIM]
-    TensorMatcher({N0_b, N1_b, D_b})
-        .with_strides({S0_b, S1_b, 1})
+    TensorMatcher({N0, N1, B_LAST_DIM})  //
+        .with_strides({-1, -1, 1})
         .with_dtype<bf16_t>()
-        .with_device<kDLCUDA>(device)
+        .with_device(device)
         .ensure_alignment(kAlignB)
         .verify(b);
-
-    // Verify out: [dim_0, dim_1, OUT_LAST_DIM]
-    TensorMatcher({N0_out, N1_out, D_out})
-        .with_strides({S0_out, S1_out, 1})
+    TensorMatcher({N0, N1, OUT_LAST_DIM})  //
+        .with_strides({-1, -1, 1})
         .with_dtype<bf16_t>()
-        .with_device<kDLCUDA>(device)
+        .with_device(device)
         .ensure_alignment(kAlignOut)
         .verify(out);
 
-    // Verify dimensions match: a.size(0) * a.size(1) == b.size(0) * b.size(1)
-    RuntimeCheck(
-        N0_a.unwrap() * N1_a.unwrap() == N0_b.unwrap() * N1_b.unwrap(),
-        "Dimension mismatch: a.size(0) * a.size(1) must equal b.size(0) * b.size(1)");
-    RuntimeCheck(N1_a.unwrap() == N1_b.unwrap(), "Dimension mismatch: a.size(1) must equal b.size(1)");
+    const auto num_items = static_cast<int>(N0.unwrap() * N1.unwrap());
+    const auto dim_1 = static_cast<int>(N1.unwrap());
+    constexpr uint32_t kNumWarpsPerBlock = 32;
+    const auto grid_size = div_ceil(static_cast<uint32_t>(num_items), kNumWarpsPerBlock);
 
-    const int num_items = static_cast<int>(N0_a.unwrap() * N1_a.unwrap());
-    const int dim_1 = static_cast<int>(N1_a.unwrap());
-
-    constexpr int num_warps_per_block = 32;
-    const int grid_size = div_ceil(num_items, num_warps_per_block);
-    const int block_size = num_warps_per_block * 32;
-
-    LaunchKernel(grid_size, block_size, device.unwrap())
+    LaunchKernel(grid_size, kNumWarpsPerBlock * 32, device.unwrap())
         .enable_pdl(kUsePDL)(
             concat_mla_absorb_q_kernel<kUsePDL>,
             static_cast<const bf16_t*>(a.data_ptr()),
@@ -312,12 +262,12 @@ struct ConcatMlaAbsorbQKernel {
             static_cast<bf16_t*>(out.data_ptr()),
             num_items,
             dim_1,
-            S0_a.unwrap(),
-            static_cast<int>(S1_a.unwrap()),
-            S0_b.unwrap(),
-            static_cast<int>(S1_b.unwrap()),
-            S0_out.unwrap(),
-            static_cast<int>(S1_out.unwrap()));
+            a.stride(0),
+            static_cast<int>(a.stride(1)),
+            b.stride(0),
+            static_cast<int>(b.stride(1)),
+            out.stride(0),
+            static_cast<int>(out.stride(1)));
   }
 };
 

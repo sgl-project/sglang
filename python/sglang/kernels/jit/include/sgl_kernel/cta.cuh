@@ -6,6 +6,8 @@
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/warp.cuh>
 
+#include <cmath>
+
 namespace sglang {
 
 namespace device::cta {
@@ -48,12 +50,12 @@ SGL_DEVICE T reduce_sum(T value, T* smem) {
  * \param value Per-thread input value.
  * \param smem Shared memory buffer (must have at least `blockDim.x / 32`
  *             elements).
- * \param min_value Identity element for max (default 0.0f).
+ * \param min_value Identity element for max (default -inf).
  * \note This function does NOT issue a trailing `__syncthreads()`.
  *       Callers must synchronize before reading `smem[0]`.
  */
 template <typename T>
-SGL_DEVICE void reduce_max(T value, float* smem, float min_value = 0.0f) {
+SGL_DEVICE void reduce_max(T value, float* smem, float min_value = -INFINITY) {
   const uint32_t warp_id = threadIdx.x / kWarpThreads;
   smem[warp_id] = warp::reduce_max(value);
   __syncthreads();

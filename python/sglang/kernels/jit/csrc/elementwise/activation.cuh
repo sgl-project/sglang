@@ -288,9 +288,10 @@ struct ActivationKernel {
     if constexpr (kReuseInput) {
       RuntimeCheck(input.data_ptr() == out.data_ptr(), "in-place activation output must alias input");
     }
-    // only get once to avoid overhead
-    const auto num_total_items = num_tokens * (hidden_size / kVecSize);
-    RuntimeCheck(num_total_items <= std::numeric_limits<uint32_t>::max(), "too many items for 32-bit indexing");
+    // the kernel indexes input vectors in uint32, and there are two per item
+    const auto num_total_items = static_cast<uint64_t>(num_tokens) * (hidden_size / kVecSize);
+    CHECK_HOST(num_total_items * 2 <= std::numeric_limits<uint32_t>::max())
+        << "too many items for 32-bit indexing: " << num_total_items;
     const auto num_blocks = div_ceil(static_cast<uint32_t>(num_total_items), kBlockSize);
     const auto params = ActivationParams{
         .input = input.data_ptr(),
@@ -388,8 +389,10 @@ struct ActivationKernel {
       if constexpr (kReuseInput) {
         RuntimeCheck(input.data_ptr() == out.data_ptr(), "in-place activation output must alias input");
       }
+      // the kernel indexes input vectors in uint32, and there are two per item
       const auto num_items = static_cast<uint64_t>(num_tokens) * (hidden_size / kVecSize);
-      RuntimeCheck(num_items <= std::numeric_limits<uint32_t>::max(), "too many items for 32-bit indexing");
+      CHECK_HOST(num_items * 2 <= std::numeric_limits<uint32_t>::max())
+          << "too many items for 32-bit indexing: " << num_items;
       constexpr auto kernel = silu_and_mul_rounded_table_kernel<T, kUsePDL, kReuseInput>;
       constexpr std::size_t kSmemBytes = kSiluTableSize * sizeof(T);
       [[maybe_unused]] static const bool smem_set = [&] {

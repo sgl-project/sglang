@@ -135,9 +135,10 @@ struct LoadStoreBytes {
   };  // namespace device
 };
 
-/// Sum `M` vectors element-wise into one, accumulating in fp32 regardless of
-/// the packed element type. Used by every collective that reduces peer
-/// contributions in registers.
+/// Sum `M` vectors element-wise into one. With `kFP32Acc` (the default) the
+/// sum accumulates in fp32; otherwise it accumulates in the packed element
+/// type `T2`. Used by every collective that reduces peer contributions in
+/// registers.
 template <bool kFP32Acc = true, typename T2, size_t N, size_t M>
 SGL_DEVICE auto reduce_vec(device::AlignedVector<T2, N> (&vec)[M]) -> device::AlignedVector<T2, N> {
   static_assert(DTypeTrait<T2>::kVecSize == 2, "reduce_vec only supports 2-element vectors for now");
@@ -166,7 +167,7 @@ SGL_DEVICE auto reduce_vec(device::AlignedVector<T2, N> (&vec)[M]) -> device::Al
     for (size_t i = 1; i < M; ++i) {
 #pragma unroll
       for (size_t j = 0; j < N; ++j) {
-        out_vec[j] = SumOp::apply(out_vec[j], vec[i][j]);
+        out_vec[j] = SumOp::reduce(out_vec[j], vec[i][j]);
       }
     }
     return out_vec;

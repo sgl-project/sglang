@@ -62,7 +62,7 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
       reinterpret_cast<SamplingTempStorage<BLOCK_THREADS, SCAN_ALGORITHM, REDUCE_ALGORITHM>&>(smem_sampling);
 
   DType prob_acc = 0.0;
-  uint32_t cur_prob_offset = bx * num_draft_tokens * d;
+  int64_t cur_prob_offset = int64_t(bx) * num_draft_tokens * d;
   DType coin = uniform_samples[bx * num_draft_tokens];
   IdType2 last_accepted_retrive_idx = retrive_index[bx * num_draft_tokens];
   accept_index[bx * num_speculative_tokens] = last_accepted_retrive_idx;
@@ -81,7 +81,7 @@ __global__ void TreeSpeculativeSamplingTargetOnly(
       if (has_target_mass && (coin < prob_acc / threshold_acc || target_prob_single >= threshold_single)) {
         // accept token
         prob_acc = 0.;
-        cur_prob_offset = (bx * num_draft_tokens + cur_index) * d;
+        cur_prob_offset = (int64_t(bx) * num_draft_tokens + cur_index) * d;
         coin = uniform_samples[bx * num_draft_tokens + cur_index];
         predicts[last_accepted_retrive_idx] = draft_token_id;
         ++num_accepted_tokens;
