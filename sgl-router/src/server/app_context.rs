@@ -10,6 +10,7 @@ use crate::policies::PolicyRegistry;
 use crate::proxy::Proxy;
 use crate::server::inflight::InflightHttp;
 use crate::server::metrics::MetricsRegistry;
+use crate::server::routes::chat::Preprocessor;
 use crate::state::kv_events::{
     BlockSizeOracle, KvEventIndex, KvIndexMetrics, RadixTreePrefixProvider,
 };
@@ -51,7 +52,7 @@ impl ChatRouting {
 
 pub struct AppContext {
     pub config: Config,
-    pub tokenizers: Arc<TokenizerRegistry>,
+    pub preprocessor: Preprocessor,
     pub proxy: Arc<Proxy>,
     pub registry: Arc<WorkerRegistry>,
     pub policies: Arc<PolicyRegistry>,
@@ -132,8 +133,8 @@ impl AppContext {
         let bucket_selector = Arc::new(BucketSelector::new(config.model.bucket_config.clone()));
         let decode_gate = DecodeGate::new(config.proxy.decode_dispatch_limit);
         Self {
+            preprocessor: Preprocessor::new(&config.model, tokenizers, Arc::clone(&metrics)),
             config,
-            tokenizers,
             proxy,
             registry,
             policies,
@@ -204,45 +205,51 @@ impl AppContext {
 
     #[cfg(test)]
     pub fn stub() -> Self {
-        Self {
-            config: Config {
-                server: crate::config::ServerConfig {
-                    host: "x".into(),
-                    port: 0,
-                    ..Default::default()
-                },
-                observability: Default::default(),
-                model: crate::config::ModelConfig {
-                    aliases: Vec::new(),
-                    id: "stub-model".into(),
-                    tokenizer_path: Some("stub".into()),
-                    disable_input_ids_forwarding: false,
-                    tokenizer: Default::default(),
-                    policy: crate::config::PolicyKind::RoundRobin,
-                    decode_policy: Default::default(),
-                    dp_aware: false,
-                    dp_rank_policy: Default::default(),
-                    bucket_config: None,
-                    reorg_buckets: None,
-                    reorg_admission: Default::default(),
-                    circuit_breaker: None,
-                    cache_aware: None,
-                    sticky: None,
-                    affinity: None,
-                    fused: None,
-                    eligibility: None,
-                    sampling_overrides: Default::default(),
-                    default_chat_template_kwargs: Default::default(),
-                },
-                discovery: crate::config::DiscoveryBackend::StaticUrls(
-                    crate::config::StaticUrlsDiscoveryConfig {
-                        urls: vec!["http://placeholder:0".into()],
-                    },
-                ),
-                proxy: crate::config::ProxyConfig::default(),
-                router_inflight_load: crate::config::InflightLoadConfig::default(),
+        let config = Config {
+            server: crate::config::ServerConfig {
+                host: "x".into(),
+                port: 0,
+                ..Default::default()
             },
-            tokenizers: Arc::new(TokenizerRegistry::default()),
+            observability: Default::default(),
+            model: crate::config::ModelConfig {
+                aliases: Vec::new(),
+                id: "stub-model".into(),
+                tokenizer_path: Some("stub".into()),
+                disable_input_ids_forwarding: false,
+                tokenizer: Default::default(),
+                policy: crate::config::PolicyKind::RoundRobin,
+                decode_policy: Default::default(),
+                dp_aware: false,
+                dp_rank_policy: Default::default(),
+                bucket_config: None,
+                reorg_buckets: None,
+                reorg_admission: Default::default(),
+                circuit_breaker: None,
+                cache_aware: None,
+                sticky: None,
+                affinity: None,
+                fused: None,
+                eligibility: None,
+                sampling_overrides: Default::default(),
+                default_chat_template_kwargs: Default::default(),
+            },
+            discovery: crate::config::DiscoveryBackend::StaticUrls(
+                crate::config::StaticUrlsDiscoveryConfig {
+                    urls: vec!["http://placeholder:0".into()],
+                },
+            ),
+            proxy: crate::config::ProxyConfig::default(),
+            router_inflight_load: crate::config::InflightLoadConfig::default(),
+        };
+        let metrics = MetricsRegistry::new();
+        Self {
+            preprocessor: Preprocessor::new(
+                &config.model,
+                Arc::new(TokenizerRegistry::default()),
+                Arc::clone(&metrics),
+            ),
+            config,
             proxy: Arc::new(Proxy::new(std::time::Duration::from_secs(60)).expect("stub proxy")),
             registry: Arc::new(WorkerRegistry::default()),
             policies: Arc::new(PolicyRegistry::default()),
@@ -250,7 +257,7 @@ impl AppContext {
             chat_routing: ChatRouting::Legacy,
             router_inflight_load: RouterInflightLoadRegistry::with_defaults(),
             decode_gate: DecodeGate::new(None),
-            metrics: MetricsRegistry::new(),
+            metrics,
             prefix_index: None,
             radix_tree_prefix_provider: None,
             dp_rank_prefix_provider: None,

@@ -229,7 +229,11 @@ async fn forwarding_opt_out_keeps_ingress_tokens_for_routing() {
     let cfg = without_forwarding(config(), PolicyKind::RoundRobin);
     let ctx = build_ctx_with_config(mock.url.clone(), cfg);
     let request = json!({"model": MODEL, "messages": [{"role": "user", "content": "hello"}]});
-    let expected = ctx.tokenizers.encode_chat(MODEL, &request).unwrap();
+    let expected = ctx
+        .preprocessor
+        .tokenizers()
+        .encode_chat(MODEL, &request)
+        .unwrap();
     ctx.policies
         .insert(ModelId(MODEL.into()), Arc::new(ExpectTokens(expected)));
     assert_forwarded_unchanged(&ctx, &mock, &request).await;
@@ -248,7 +252,8 @@ async fn array_only_template_opt_out_preserves_engine_processing() {
     );
     let request = json!({"model": MODEL, "messages": [{"role": "user", "content": "hello"}]});
     assert!(!ctx
-        .tokenizers
+        .preprocessor
+        .tokenizers()
         .encode_chat(MODEL, &request)
         .unwrap()
         .is_empty());
@@ -264,7 +269,11 @@ async fn template_with_date_helper_forwards_input_ids() {
     let mock = MockWorker::start(vec![]).await;
     let ctx = build_ctx_with_config(mock.url.clone(), cfg);
     let request = json!({"model": MODEL, "messages": [{"role": "user", "content": "hello"}]});
-    let expected = ctx.tokenizers.encode_chat(MODEL, &request).unwrap();
+    let expected = ctx
+        .preprocessor
+        .tokenizers()
+        .encode_chat(MODEL, &request)
+        .unwrap();
     assert_eq!(send(ctx, request.clone()).await, StatusCode::OK);
     let body = captured(&mock);
     assert_eq!(body["input_ids"], json!(expected));
@@ -281,7 +290,11 @@ async fn disabled_forwarding_does_not_count_routing_render_failures_as_offload_e
         without_forwarding(cfg, PolicyKind::CacheAware),
     );
     let request = json!({"model": MODEL, "messages": [{"role": "user", "content": "hello"}]});
-    assert!(ctx.tokenizers.encode_chat(MODEL, &request).is_none());
+    assert!(ctx
+        .preprocessor
+        .tokenizers()
+        .encode_chat(MODEL, &request)
+        .is_none());
     assert_forwarded_unchanged(&ctx, &mock, &request).await;
 }
 
@@ -377,7 +390,8 @@ async fn reasoning_history_preserves_messages_without_forwarding_ids() {
         {"role":"user", "content":"next"}
     ]});
     assert!(!ctx
-        .tokenizers
+        .preprocessor
+        .tokenizers()
         .encode_chat(MODEL, &request)
         .unwrap()
         .is_empty());
@@ -423,7 +437,8 @@ async fn role_rewrites_preserve_messages_without_forwarding_ids() {
             .collect();
         let request = json!({"model": MODEL, "messages": messages});
         assert!(!ctx
-            .tokenizers
+            .preprocessor
+            .tokenizers()
             .encode_chat(MODEL, &request)
             .unwrap()
             .is_empty());
@@ -458,13 +473,17 @@ async fn generate_kimi_ids_preserve_engine_chunk_boundaries_on(backend: Tokenize
     cfg.model.tokenizer.backend = backend;
     let ctx = build_ctx_with_config(mock.url.clone(), cfg);
     assert!(
-        ctx.tokenizers.stats().backend().is_tiktoken(),
+        ctx.preprocessor
+            .tokenizers()
+            .stats()
+            .backend()
+            .is_tiktoken(),
         "{backend:?}"
     );
     // Kimi's engine tokenizer splits a non-whitespace run after 25,000 chars,
     // cutting through a BPE merge here. Encoding the whole prompt changes its IDs.
     let text = "message".repeat(4_000);
-    let tokenizer = ctx.tokenizers.get(MODEL).unwrap();
+    let tokenizer = ctx.preprocessor.tokenizers().get(MODEL).unwrap();
     let encode = |text| sgl_router::tokenizer::adapter::encode(&tokenizer, text).unwrap();
     let expected = [encode(&text[..25_000]), encode(&text[25_000..])].concat();
     assert_ne!(encode(&text), expected);
@@ -498,7 +517,7 @@ async fn kimi_ids_forward_with_engine_rendering_fallback() {
         if let Some(kwargs) = kwargs {
             request["chat_template_kwargs"] = kwargs;
         }
-        let ids = ctx.tokenizers.encode_chat(MODEL, &request);
+        let ids = ctx.preprocessor.tokenizers().encode_chat(MODEL, &request);
         assert_eq!(send(ctx.clone(), request.clone()).await, StatusCode::OK);
         if forward {
             request["input_ids"] = json!(ids.unwrap());
@@ -537,7 +556,11 @@ async fn kimi_chat_lowers_to_generate() {
         "stop": "END",
         "max_tokens": 8,
     });
-    let ids = ctx.tokenizers.encode_chat(MODEL, &request).unwrap();
+    let ids = ctx
+        .preprocessor
+        .tokenizers()
+        .encode_chat(MODEL, &request)
+        .unwrap();
     send(ctx.clone(), request).await;
     let body = captured(&mock);
     assert_eq!(body["input_ids"], json!(ids));
@@ -586,7 +609,11 @@ async fn qwen38_chat_lowers_to_generate() {
             "chat_template_kwargs": kwargs,
             "max_tokens": 8,
         });
-        let ids = ctx.tokenizers.encode_chat(MODEL, &request).unwrap();
+        let ids = ctx
+            .preprocessor
+            .tokenizers()
+            .encode_chat(MODEL, &request)
+            .unwrap();
         send(ctx.clone(), request).await;
         let body = captured(&mock);
         assert!(
