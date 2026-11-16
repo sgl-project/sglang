@@ -40,7 +40,6 @@ class _GroupInfo:
 
     base_key: str
     mtime: float = 0.0
-    size: int = 0
     paths: set[str] = field(default_factory=set)
     # Physical files in one logical group can hash to different base dirs
     # because TP-rank and zero-copy K/V suffixes are part of the routed key.
@@ -269,7 +268,6 @@ class HiCacheL3Cleaner:
             group = groups.setdefault(group_key, _GroupInfo(group_key))
             group.paths.add(entry.path)
             group.base_dirs.add(base_dir)
-            group.size += stat.st_size
             group.mtime = max(group.mtime, stat.st_mtime)
 
     def _iter_group_paths(self, groups: Iterable[_GroupInfo]) -> Iterable[str]:
