@@ -996,6 +996,10 @@ class ExecMoe(msgspec.Struct):
     eplb_rebalance_num_iterations: A[
         int, "Number of iterations to automatically trigger a EPLB re-balance."
     ] = 1000
+    eplb_first_rebalance_num_iterations: A[
+        Optional[int],
+        "Number of iterations before the first EPLB re-balance; later re-balances use --eplb-rebalance-num-iterations. Default: the same as --eplb-rebalance-num-iterations.",
+    ] = None
     eplb_rebalance_layers_per_chunk: A[
         Optional[int],
         "Number of layers to rebalance per forward pass.",
