@@ -3392,6 +3392,21 @@ class Scheduler(
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
                 if (
+                    self.disaggregation_mode == DisaggregationMode.PREFILL
+                    and get_disagg().disaggregation_decode_tail_tokens
+                    and recv_req.return_logprob
+                ):
+                    # Phase 1 of the decode-tail mode: the tail extend runs on
+                    # decode and does not yet wire input-logprob metadata.
+                    error_msg = (
+                        "Invalid request: decode-tail mode does not support "
+                        "return_logprob yet. {req.rid=}"
+                    )
+                    logger.error(error_msg)
+                    prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+                    self.request_retirer.retire_unadmitted(req)
+                    return
+                if (
                     recv_req.bootstrap_room is None
                     and self.transfer_backend != TransferBackend.FAKE
                 ):

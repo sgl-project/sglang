@@ -127,7 +127,8 @@ def handle_pd_disaggregation(server_args: ServerArgs) -> None:
             unsupported.append("LoRA")
         if cfg.enable_hisparse:
             unsupported.append("HiSparse")
-        if cfg.dsv41_encoder_only_prefill:
+        if getattr(cfg, "dsv41_encoder_only_prefill", False):
+            # #40874's field: only checked when that branch's arg exists.
             unsupported.append(
                 "--dsv41-encoder-only-prefill (the model-specific form of the "
                 "same mode; use one)"

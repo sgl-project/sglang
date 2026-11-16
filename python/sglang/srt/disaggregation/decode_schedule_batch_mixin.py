@@ -21,6 +21,108 @@ if TYPE_CHECKING:
 
 
 class ScheduleBatchDisaggregationDecodeMixin:
+    def prepare_for_tail_extend(self: ScheduleBatch):
+        """
+        Prepare a real extend over the transferred tail (decode-tail mode,
+        RFC #50547).
+
+        The transferred KV covers [0, committed) and lives in the request's
+        preallocated req_to_token rows; the last W prompt tokens run through
+        the ordinary extend forward, so sampling, grammar, logprobs and
+        penalties are decode's own. The req's tree view stays root-bound
+        (prefix_len untouched) — the transferred prefix becomes reusable when
+        the request finishes and the tree inserts it from the root.
+
+        Adapted from prepare_for_prebuilt().
+        """
+        # The scheduler merges this batch into the running decode batch after
+        # its forward (the standard prefill->decode transition); the marker
+        # lets the PD decode loop recognize it.
+        self.pd_tail_extend = True
+        self.forward_mode = ForwardMode.EXTEND
+        if self.return_logprob:
+            # Phase 1 rejects input-logprob requests at the prefill intake;
+            # this line is the defense in depth.
+            raise ValueError(
+                "decode-tail mode does not support return_logprob yet (Phase 1)"
+            )
+        reqs = self.reqs
+        seq_lens = []
+        pre_lens = []
+        req_pool_indices = []
+        input_ids: List[int] = []
+
+        # The extend covers [committed, extend_end): the tail W prompt tokens
+        # whose rows were preallocated with the rest of the prompt grid.
+        total_size = 0
+        extend_lens = []
+        attention_prefix_lens = []
+        for i, req in enumerate(reqs):
+            req_pool_indices.append(req.kv.req_pool_idx)
+            committed = req.kv.kv_committed_len
+            assert committed is not None and 0 < committed <= req.extend_end, (
+                f"rid={req.rid} committed={committed} extend_end={req.extend_end}"
+            )
+            pre_len = committed
+            attention_prefix_lens.append(pre_len)
+            chunk = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx][
+                pre_len : req.extend_end
+            ]
+            extend_len = req.extend_end - pre_len
+            extend_lens.append(extend_len)
+            total_size += extend_len
+
+            seq_len = pre_alloc_fill_len(req)
+            seq_lens.append(seq_len)
+            # pre_alloc_fill_len counts the full prompt while output_ids is
+            # empty; the extend covers exactly the tail.
+            assert seq_len - pre_len == extend_len, (
+                f"seq_len={seq_len}, pre_len={pre_len}, extend_len={extend_len}"
+            )
+            req.is_retracted = False
+            pre_lens.append(pre_len)
+            input_ids.extend(req.fill_ids[pre_len : req.extend_end])
+
+        out_cache_loc = torch.empty(total_size, dtype=torch.int64, device=self.device)
+        offset = 0
+        for i, req in enumerate(reqs):
+            pre_len = attention_prefix_lens[i]
+            chunk = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx][
+                pre_len : req.extend_end
+            ]
+            out_cache_loc[offset : offset + extend_lens[i]] = chunk
+            offset += extend_lens[i]
+
+        # Set fields
+        self.input_ids = torch.tensor(input_ids, dtype=torch.int64, device=self.device)
+        self.req_pool_indices = async_h2d(
+            req_pool_indices, dtype=torch.int64, device=self.device
+        )
+        self.req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
+        self.seq_lens = async_h2d(seq_lens, dtype=torch.int64, device=self.device)
+        self.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        self.orig_seq_lens = async_h2d(seq_lens, dtype=torch.int32, device=self.device)
+        self.out_cache_loc = out_cache_loc
+        self.seq_lens_sum = sum(seq_lens)
+
+        if self.return_logprob:
+            self.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
+            self.token_ids_logprobs = [r.logprob.token_ids_logprob for r in reqs]
+
+        self.extend_num_tokens = total_size
+        # The attention prefix is the transferred range, not the tree view.
+        self.prefix_lens = attention_prefix_lens
+        self.extend_lens = extend_lens
+        self.extend_logprob_start_lens = None
+        self.extend_input_logprob_token_ids = None
+        self.multimodal_inputs = [r.multimodal_inputs for r in reqs]
+
+        # Build sampling info
+        self.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            self,
+            self.model_config.vocab_size,
+        )
+
     def prepare_for_prebuilt(self: ScheduleBatch):
         """
         Prepare a prebuilt extend by populate metadata

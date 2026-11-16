@@ -191,6 +191,20 @@ class _DeviceRows:
         self.ids = ids
 
 
+def tail_transfer_input_len(prompt_len: int, tail_tokens: int) -> int:
+    """KV transfer length for decode-tail mode.
+
+    The decode worker recomputes the last W prompt tokens from a real extend,
+    so the transfer stops at N - W. For N <= W + 1 the split cannot leave both
+    a non-empty transfer and a non-empty tail, so the request falls back to
+    the full transfer (the decode side then takes the prebuilt path and the
+    handoff token stays authoritative).
+    """
+    if tail_tokens <= 0 or prompt_len <= tail_tokens + 1:
+        return prompt_len
+    return prompt_len - tail_tokens
+
+
 def _rows_on_host(payload):
     if isinstance(payload, list):
         return [_rows_on_host(part) for part in payload]
@@ -543,8 +557,14 @@ class PrefillBootstrapQueue:
         return True
 
     def _num_pages_to_send(self, req: Req, decode_prefix_len: int) -> int:
+        # Register exactly the range _send_kv_chunk sends: in decode-tail mode
+        # the transfer stops at N - W, and the sender's completion signal is
+        # derived from this registered length.
+        n = len(req.origin_input_ids)
+        tail = get_disagg().disaggregation_decode_tail_tokens
+        transfer_input_len = tail_transfer_input_len(n, tail) if tail else n
         return kv_to_page_num(
-            len(req.origin_input_ids) - decode_prefix_len,
+            transfer_input_len - decode_prefix_len,
             self.scheduler.token_to_kv_pool_allocator.page_size,
         )
 
