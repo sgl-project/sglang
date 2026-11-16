@@ -5,26 +5,36 @@ import triton
 import triton.language as tl
 
 
-@triton.jit
+# num_requests and num_tokens follow the live batch; as constexpr each pair
+# would compile its own variant on the serving path.
+@triton.jit(
+    do_not_specialize=[
+        "seq_lens_stride",
+        "req_pool_stride",
+        "qo_stride",
+        "num_requests",
+        "num_tokens",
+    ]
+)
 def _dsa_ragged_query_rows_kernel(
     seq_lens,
     req_pool_indices,
     qo_indptr,
     query_seq_lens,
     query_req_pool_indices,
-    seq_lens_stride: tl.constexpr,
-    req_pool_stride: tl.constexpr,
-    qo_stride: tl.constexpr,
-    num_requests: tl.constexpr,
-    num_tokens: tl.constexpr,
+    seq_lens_stride,
+    req_pool_stride,
+    qo_stride,
+    num_requests,
+    num_tokens,
     BLOCK: tl.constexpr,
 ):
     tokens = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
     # upper_bound(qo_indptr[1:], token), including repeated boundaries from
     # zero-length graph request slots. The final result can be num_requests:
     # capped token tiers need not be fully covered by request slots.
-    lo = tl.full((BLOCK,), 0, tl.int32)
-    hi = tl.full((BLOCK,), num_requests, tl.int32)
+    lo = tl.zeros((BLOCK,), tl.int32)
+    hi = lo + num_requests
     while tl.sum((lo < hi).to(tl.int32), 0) > 0:
         mid = (lo + hi) // 2
         end = tl.load(

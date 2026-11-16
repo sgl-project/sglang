@@ -257,6 +257,11 @@ class BaseSpecWorker(ABC):
         Default returns target only; subclasses extend with draft backends."""
         return (self.target_worker.model_runner.attn_backend,)
 
+    def dump_info_records(self) -> Optional[dict]:
+        """Per-step verify records for the internal-state readback; None when
+        the worker keeps none."""
+        return None
+
     def clear_cache_pool(self):
         """Default no-op: the allocator and kv cache pool are shared with the
         target worker and cleared by the scheduler."""

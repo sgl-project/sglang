@@ -416,6 +416,24 @@ def test_forced_budget_frac_trims_a_compact_plan_without_a_table(monkeypatch):
             validate(controller, "dspark_force_budget_frac", 0.5)
 
 
+def test_internal_state_reads_no_records_from_a_worker_that_keeps_none():
+    """A DFLASH-family worker with only the BaseSpecWorker interface, as an
+    out-of-tree worker may have, must not break the internal-state readback."""
+    from sglang.srt.managers.scheduler_components import internal_state
+    from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
+
+    controller = types.SimpleNamespace(
+        scheduler=types.SimpleNamespace(
+            spec_algorithm=worker_mod.SpeculativeAlgorithm.DFLASH,
+            draft_worker=BaseSpecWorker(),
+        ),
+        _average_accept_length=lambda: None,
+    )
+    state = {}
+    internal_state.SchedulerInternalStateController._add_speculative(controller, state)
+    assert state == {}
+
+
 def test_compact_is_refused_on_a_target_backend_without_ragged_verify(monkeypatch):
     import contextlib
 
@@ -473,12 +491,15 @@ def test_spec_mrope_mixed_batch_preserves_request_and_padding_deltas(
     over ragged query rows, with no delta applied to graph-padding rows."""
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.forward_mode import ForwardMode
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyLayout
 
     positions = torch.arange(10, 10 + num_tokens, dtype=torch.int64)
     layout = (
         None
         if verify_lens is None
-        else types.SimpleNamespace(verify_lens=torch.tensor(verify_lens))
+        else RaggedVerifyLayout.from_verify_lens_device(
+            verify_lens=torch.tensor(verify_lens), graph_num_tokens=num_tokens
+        )
     )
     batch = types.SimpleNamespace(
         multimodal_inputs=[
@@ -486,9 +507,7 @@ def test_spec_mrope_mixed_batch_preserves_request_and_padding_deltas(
             types.SimpleNamespace(mrope_position_delta=torch.tensor([[20]])),
             types.SimpleNamespace(mrope_position_delta=torch.tensor([[-3]])),
         ],
-        spec_info=types.SimpleNamespace(
-            positions=positions, ragged_verify_layout=layout
-        ),
+        spec_info=types.SimpleNamespace(positions=positions),
     )
     forward = ForwardBatch(
         forward_mode=ForwardMode.TARGET_VERIFY,
@@ -498,6 +517,7 @@ def test_spec_mrope_mixed_batch_preserves_request_and_padding_deltas(
         seq_lens=torch.tensor([4, 5, 6]),
         out_cache_loc=torch.arange(num_tokens),
         seq_lens_sum=15,
+        ragged_verify_layout=layout,
     )
     forward.compute_spec_mrope_positions(
         types.SimpleNamespace(device=torch.device("cpu")), batch

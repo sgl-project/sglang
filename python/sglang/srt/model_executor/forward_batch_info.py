@@ -62,6 +62,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     mamba_cache_chunk_size,
 )
+from sglang.srt.speculative.ragged_verify import ragged_verify_token_rows
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils import (
     is_cpu,
@@ -405,24 +406,6 @@ class NgramEmbeddingInfo:
                 else None
             ),
         )
-
-
-def spec_mrope_token_deltas(
-    *,
-    deltas: torch.Tensor,
-    num_tokens: int,
-    verify_lens: Optional[torch.Tensor] = None,
-) -> torch.Tensor:
-    """Each spec-forward token's mRoPE delta: the tokens split evenly over the
-    requests, or verify_lens[i] tokens for request i under a ragged verify,
-    then graph-padding tokens with delta 0."""
-    if verify_lens is None:
-        return deltas.repeat_interleave(num_tokens // deltas.numel())
-    ends = torch.cumsum(verify_lens.to(device=deltas.device, dtype=torch.int64), 0)
-    req = torch.searchsorted(
-        ends, torch.arange(num_tokens, device=deltas.device), right=True
-    )
-    return torch.cat((deltas, deltas.new_zeros(1)))[req]
 
 
 @dataclass
@@ -1521,10 +1504,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # target_verify / draft_decode read spec_info.positions; draft_extend
         # passes its own positions (uniform num_draft_tokens per request). A
         # ragged target verify packs verify_lens[i] positions per request.
-        ragged_layout = None
         if seq_positions is None:
             seq_positions = batch.spec_info.positions
-            ragged_layout = getattr(batch.spec_info, "ragged_verify_layout", None)
         seq_positions = seq_positions.reshape(-1)
         # Split text-only and mixed batches here because SpecV2 text-only batches can avoid an extra D2H.
         if all(mm_input is None for mm_input in mm_inputs):
@@ -1540,11 +1521,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
             for i in range(batch_size)
         ]
-        token_deltas = spec_mrope_token_deltas(
-            deltas=async_h2d_stack(mrope_deltas, device=device).reshape(-1),
-            num_tokens=seq_positions.numel(),
-            verify_lens=None if ragged_layout is None else ragged_layout.verify_lens,
-        )
+        deltas = async_h2d_stack(mrope_deltas, device=device).reshape(-1)
+        num_tokens = seq_positions.numel()
+        layout = self.ragged_verify_layout
+        if layout is None:
+            token_deltas = deltas.repeat_interleave(num_tokens // batch_size)
+        else:
+            # Graph-padding tokens map to row batch_size, which carries delta 0.
+            rows = ragged_verify_token_rows(layout, num_tokens)
+            token_deltas = torch.cat((deltas, deltas.new_zeros(1)))[rows]
         self.mrope_positions = (seq_positions + token_deltas).unsqueeze(0).repeat(3, 1)
 
     def _expand_mrope_from_input(

@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.kernels.ops.attention.dsa import metadata as dsa_metadata
 from sglang.kernels.ops.attention.dsa.paged_mqa_logits import (
     cutedsl_paged_mqa_logits,
     deepgemm_paged_mqa_logits_split,
@@ -43,6 +44,14 @@ register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="4-gpu-b
 
 # TOPK: FlashMLA's SM100 128-head sparse kernel walks top-k in blocks of 128.
 SLOTS, TIER, WIDTH, TOPK = 8, 16, 256, 128
+
+
+def _strided_cuda(values, step, dtype):
+    # The elements a larger step skips are poison: a wrong stride reads them.
+    backing = torch.full((len(values) * step,), 1000000, device="cuda", dtype=dtype)
+    view = backing[::step]
+    view.copy_(torch.tensor(values, dtype=dtype))
+    return view
 
 
 def _paged_index_cache_view(packed):
@@ -236,6 +245,51 @@ class TestDSARaggedVerifyCUDA(CustomTestCase):
         update_ragged_dsa_query_rows(prefix, requests, layout, lengths, owners)
         self.assertEqual(lengths.tolist(), [63, 128, 129, 130, 0, 0, 0, 0])
         self.assertEqual(owners.tolist(), [7, 3, 3, 3, 0, 0, 0, 0])
+
+    def test_token_tiers_spanning_several_kernel_programs(self):
+        """Token tiers that cross or end inside a 128-token kernel program keep each
+        token's owner and length, and new sizes or strides compile no new variant."""
+        kernel = dsa_metadata._dsa_ragged_query_rows_kernel
+        kernel_cache = kernel.device_caches[torch.cuda.current_device()][0]
+        num_variants = None
+        # (token tier, request slots, live requests, input stride)
+        for tier, num_slots, num_requests, step in (
+            (127, 8, 8, 1),
+            (128, 8, 5, 2),
+            (129, 16, 16, 1),
+            (512, 64, 64, 2),
+            (1000, 96, 80, 1),
+            (300, 8, 0, 1),
+        ):
+            with self.subTest(tier=tier, num_requests=num_requests, step=step):
+                verify = [(5 * i) % 13 for i in range(num_requests)]
+                prefix = [61 * i + 3 for i in range(num_slots)]
+                requests = [(37 * i) % 1009 for i in range(num_slots)]
+                layout = SimpleNamespace(
+                    graph_num_tokens=tier,
+                    qo_indptr_device=_strided_cuda(
+                        [0, *accumulate(verify)], step, torch.int32
+                    ),
+                )
+                lengths = torch.full((tier,), -100, device="cuda", dtype=torch.int32)
+                owners = torch.full((tier,), -100, device="cuda", dtype=torch.int64)
+                update_ragged_dsa_query_rows(
+                    _strided_cuda(prefix, step, torch.int64),
+                    _strided_cuda(requests, step, torch.int64),
+                    layout,
+                    lengths,
+                    owners,
+                )
+                expected_lengths, expected_owners = [], []
+                for row, count in enumerate(verify):
+                    expected_lengths.extend(prefix[row] + j + 1 for j in range(count))
+                    expected_owners.extend([requests[row]] * count)
+                ghosts = [0] * (tier - len(expected_lengths))
+                self.assertEqual(lengths.tolist(), expected_lengths + ghosts)
+                self.assertEqual(owners.tolist(), expected_owners + ghosts)
+            if num_variants is None:
+                num_variants = len(kernel_cache)
+        self.assertEqual(len(kernel_cache), num_variants)
 
     def test_native_indexer_sparse_attention_and_graph_replay(self):
         if torch.cuda.get_device_capability()[0] < 9:
