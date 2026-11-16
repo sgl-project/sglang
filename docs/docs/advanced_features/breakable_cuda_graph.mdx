@@ -18,11 +18,12 @@ Standard CUDA graphs capture an entire forward pass as a single, opaque graph. T
 
 ### Debug Mode: Run Everything Eagerly
 
-The simplest use case is debugging. The `--debug-cuda-graph` flag wraps the entire decode forward pass in a graph break, so every operation runs eagerly while still going through the full CUDA graph capture/replay code path. This lets you debug CUDA graph issues without changing model code.
+The simplest use case is debugging. The `--debug-cuda-graph` flag wraps the entire decode forward pass in a graph break, so every operation runs eagerly while still going through the full CUDA graph capture/replay code path. This lets you debug CUDA graph issues without changing model code. It requires the breakable backend for decode.
 
 ```bash
 python -m sglang.launch_server \
     --model meta-llama/Llama-3.1-8B-Instruct \
+    --cuda-graph-backend-decode breakable \
     --debug-cuda-graph
 ```
 
@@ -84,12 +85,12 @@ def forward(self, x):
     return x
 ```
 
-To enable breakable CUDA graph at the environment level (without debug mode), set the environment variable:
+Breakable CUDA graph is selected per phase. Prefill uses it by default on CUDA; to use it for decode (without debug mode), pass `--cuda-graph-backend-decode breakable`:
 
 ```bash
-export SGLANG_USE_BREAKABLE_CUDA_GRAPH=1
 python -m sglang.launch_server \
-    --model meta-llama/Llama-3.1-8B-Instruct
+    --model meta-llama/Llama-3.1-8B-Instruct \
+    --cuda-graph-backend-decode breakable
 ```
 
 ### Server Args
@@ -114,9 +115,14 @@ python -m sglang.launch_server \
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Enable debug/eager mode. Wraps the entire forward pass in a graph break so every op runs eagerly through the capture/replay path.</td>
     </tr>
     <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_BREAKABLE_CUDA_GRAPH</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>0</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Environment variable. Enables breakable CUDA graph without debug mode. Required for <code>@eager_on_graph</code> decorators to take effect.</td>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--cuda-graph-backend-decode</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>full</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Set to <code>breakable</code> to capture decode with breakable CUDA graph. Required for <code>--debug-cuda-graph</code> and for <code>@eager_on_graph</code> breaks to take effect in decode.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>--cuda-graph-backend-prefill</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>breakable</code> on CUDA</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Prefill capture backend; <code>breakable</code> is the CUDA default.</td>
     </tr>
   </tbody>
 </table>
@@ -209,11 +215,7 @@ For typical use cases with a small number of graph breaks, the overhead is negli
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>python/sglang/srt/server_args.py</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--debug-cuda-graph</code> flag and environment variable handling</td>
-    </tr>
-    <tr>
-      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>python/sglang/srt/environ.py</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>SGLANG_USE_BREAKABLE_CUDA_GRAPH</code> environment variable definition</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>--debug-cuda-graph</code> flag handling</td>
     </tr>
   </tbody>
 </table>

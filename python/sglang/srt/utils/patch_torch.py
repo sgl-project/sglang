@@ -16,7 +16,8 @@ from typing import Callable, Union
 import torch
 from torch.multiprocessing import reductions
 
-from sglang.srt.utils.common import is_musa, is_npu, torch_release
+from sglang.srt.utils.common import torch_release
+from sglang.srt.utils.device import is_musa, is_npu
 
 _is_npu = is_npu()
 _is_musa = is_musa()

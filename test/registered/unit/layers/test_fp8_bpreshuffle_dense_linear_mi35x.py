@@ -31,7 +31,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale,
     view_aiter_fused_rms_transposed_fp8_scale,
 )
-from sglang.srt.utils.common import is_gfx95_supported, is_hip
+from sglang.srt.utils.device import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -182,6 +182,45 @@ class TestDenseBpreshuffleScaleNoCopy(CustomTestCase):
                     torch.equal(out_new, out_old),
                     f"dense linear output differs between scale-layout paths (M={m})",
                 )
+
+    def test_a_fused_producers_fp8_tuple_matches_the_bf16_input(self):
+        # a fused producer's (fp8, scale) must reach the GEMM the bf16 input takes: the
+        # rowwise one with per-token scales up to its bound, the block one with 1 x 128 above
+        from aiter.ops.shuffle import shuffle_weight
+
+        weight, weight_scale = self._make_weight()
+        rowwise = (torch.rand(_N, _K, device=self.device) - 0.5).to(torch.float8_e4m3fn)
+        weight._ptpc_weight = shuffle_weight(rowwise, (16, 16))
+        weight._ptpc_scale = torch.rand(_N, 1, device=self.device) * 1e-2 + 1e-3
+        fp8 = fp8_utils.aiter.dtypes.fp8
+        bound = fp8_utils.MXFP8_DENSE_PTPC_DECODE_MAX_M
+
+        def per_token(x):
+            return fp8_utils.aiter.per_token_quant_hip(x, quant_dtype=fp8)
+
+        def per_1x128(x):
+            q, scale = fp8_utils.aiter_per1x128_quant(
+                x, quant_dtype=fp8, transpose_scale=True
+            )
+            return q, view_aiter_fused_rms_transposed_fp8_scale(scale)
+
+        for m, fmt, quant in (
+            (1, "fp8_per_token", per_token),
+            (bound, "fp8_per_token", per_token),
+            (bound + 1, "fp8", per_1x128),
+            (1000, "fp8", per_1x128),
+        ):
+            with self.subTest(m=m):
+                x = self._rand_input(m)
+                self.assertEqual(fp8_utils.fp8_input_quant_format(weight, m), fmt)
+                q, scale = quant(x)
+                out_bf16 = fp8_utils.aiter_w8a8_block_fp8_linear(
+                    x, weight, _BLOCK, weight_scale
+                )
+                out_tuple = fp8_utils.aiter_w8a8_block_fp8_linear(
+                    q, weight, _BLOCK, weight_scale, input_scale=scale
+                )
+                self.assertTrue(torch.equal(out_tuple, out_bf16))
 
 
 if __name__ == "__main__":

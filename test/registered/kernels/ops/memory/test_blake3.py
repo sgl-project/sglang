@@ -9,7 +9,7 @@ from sglang.kernels.ops.memory.gpu_tensor_hash_blake3 import gpu_tensor_blake3
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 # BLAKE3-team/BLAKE3/test_vectors/test_vectors.json, unkeyed 32-byte outputs.
 # Input byte i is i % 251. These answers are independent of our implementation.

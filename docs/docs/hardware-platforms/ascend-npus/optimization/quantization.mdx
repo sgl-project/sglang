@@ -603,11 +603,11 @@ msModelSlim saves quantized Wan2.2 weights in the original Wan format. Convert t
 
 ```bash Command
 python python/sglang/multimodal_gen/tools/wan_repack.py \
-  --input-path /path/to/wan2_2_mxfp8_weights \
+  --model-type Wan2.2-T2V-A14B \
+  --original-model-path /path/to/Wan2.2-T2V-A14B-Diffusers \
+  --quant-path /path/to/wan2_2_mxfp8_weights \
   --output-path /path/to/wan2_2_mxfp8_diffusers
 ```
-
-Then copy all files from the original Diffusers checkpoint (except the `transformer`/`transformer_2` folders) into the output directory.
 
 **Step 3: Run inference**
 

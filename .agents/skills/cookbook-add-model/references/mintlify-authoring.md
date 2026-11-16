@@ -99,7 +99,7 @@ table is a live reference.
 
 - **Deploy/launch** commands use `sglang serve --model-path …` — never
   `python -m sglang.launch_server` / `python3 -m sglang.launch_server` (deprecated).
-- **Benchmark workload** commands use `python3 -m sglang.bench_serving …` (never bare
+- **Benchmark workload** commands use `python3 -m sglang.benchmark.serving …` (never bare
   `python -m`); built-in accuracy scripts use `python3 benchmark/...`.
 - Port **30000** everywhere on a page — launch, curl, client `base_url`, and bench must
   agree. Keep one canonical deploy command (the Deploy widget) and don't re-paste launch

@@ -35,16 +35,8 @@ try:
 except ImportError:  # pragma: no cover
     scipy_wavfile = None
 
-from sglang.multimodal_gen.configs.sample.sampling_params import (
-    DataType,
-    SamplingParams,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
-    expand_request_outputs as expand_request_outputs,
-)
-from sglang.multimodal_gen.runtime.pipelines_core.request_utils import (
-    normalize_output_seeds as normalize_output_seeds,
-)
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
+from sglang.multimodal_gen.configs.task_type import DataType
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import CYAN, RESET, init_logger

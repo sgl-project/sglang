@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.diffusion import (
     BitExactFusionGate,
     can_use_minimax_h3_vae_denorm_clamp,
@@ -21,7 +22,6 @@ from sglang.kernels.ops.diffusion import (
     minimax_h3_vae_denorm_clamp,
     minimax_h3_vae_temporal_blend_write,
 )
-from sglang.kernels.ops.diffusion.common.platform import is_cuda_sm_at_least
 from sglang.multimodal_gen.runtime.models.vaes.fast_path_gate import use_vae_fast_path
 from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
     attention as h3_attention,
@@ -35,7 +35,7 @@ from sglang.multimodal_gen.runtime.models.vaes.minimax_h3_video_vae import (
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.kernels.minimax_h3_vae import _h3_install_gate, _h3_tiny_vae
 
-register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 register_cuda_ci(est_time=70, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 # backend-specific: preserve ROCm SDPA/autocast batching parity coverage.
 register_amd_ci(est_time=2, suite="nightly-amd-kernel-1-gpu", nightly=True)
@@ -43,7 +43,7 @@ register_amd_ci(est_time=2, suite="nightly-amd-kernel-1-gpu", nightly=True)
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
 requires_h3_kernels = pytest.mark.skipif(
-    not is_cuda_sm_at_least((10, 0)),
+    not current_arch().is_sm_at_least(10, 0),
     reason="MiniMax-H3 VAE output kernels are gated to SM100+",
 )
 

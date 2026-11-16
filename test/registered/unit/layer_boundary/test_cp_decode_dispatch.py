@@ -21,7 +21,7 @@ from sglang.srt.layers.cp.cp_decode_attn_tp import (
 from sglang.srt.layers.layer_boundary import SumGroup, declare_attn, declare_ffn
 from sglang.srt.layers.layer_boundary.contracts import BatchVariant
 from sglang.srt.layers.layer_boundary.residual import batch
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context, get_parallel
 from sglang.test.boundary_fixtures import build_stages
 from sglang.test.ci.ci_register import register_cpu_ci

@@ -78,6 +78,8 @@ from sglang.srt.layers.quantization.unquant import UnquantizedFusedMoEMethod
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
+from sglang.srt.layers.utils.common import add_prefix, set_weight_attrs
+from sglang.srt.layers.utils.layer_list import make_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -86,13 +88,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTe
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.utils import apply_qk_norm
 from sglang.srt.runtime_context import get_exec, get_forward, get_lora, get_parallel
-from sglang.srt.utils import (
-    add_prefix,
-    is_cuda,
-    make_layers,
-    print_warning_once,
-    set_weight_attrs,
-)
+from sglang.srt.utils import is_cuda, print_warning_once
 
 _is_cuda = is_cuda()
 
@@ -176,6 +172,30 @@ class BeamUnquantizedFusedMoEMethod(UnquantizedFusedMoEMethod):
 # CustomAllReduceV2 algorithm with the same norm, measured on GB300 TP4 between
 # real-shape GEMMs. Other GPUs and TP sizes are unmeasured.
 _FLASHINFER_AR_TOKEN_BAND = {((10, 3), 4): (96, 640)}
+
+# Most rows a fused TP boundary stages (`_all_reduce_limits` caps every arch at 64).
+_BEAM_AR_MAX_TOKENS = 64
+
+
+def _request_beam_workspace(hidden_size: int):
+    """Declare the push slots of the fused TP boundaries on the TP group's workspace."""
+    if not _is_cuda or hidden_size != 5120 or not torch.cuda.is_available():
+        return None
+    if get_parallel().tp_size not in (2, 4, 8):
+        return None
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        WorkspaceRequest,
+        request_group_workspace,
+    )
+
+    return request_group_workspace(
+        get_parallel().tp_group,
+        WorkspaceRequest(
+            owner="beam_all_reduce_norm",
+            push_slot_bytes=_BEAM_AR_MAX_TOKENS * hidden_size * 2,
+        ),
+    )
+
 
 logger = logging.getLogger(__name__)
 
@@ -514,9 +534,12 @@ class BeamAttention(nn.Module):
         self.sliding_window = config.sliding_window - 1 if self.apply_rope else -1
         # MergedColumnParallelLinear shards each projection independently, but
         # does not replicate KV heads. Keep the existing quantized/replicated
-        # paths until their loading and backend contracts are validated.
+        # paths until their loading and backend contracts are validated. LoRA
+        # wraps qkv_proj and gate_proj separately.
         self.use_packed_projection = (
-            quant_config is None and config.num_key_value_heads >= self.tp_size
+            quant_config is None
+            and config.num_key_value_heads >= self.tp_size
+            and not (get_lora().enable_lora or get_lora().lora_paths)
         )
         if self.use_packed_projection:
             self.qkv_gate_proj = MergedColumnParallelLinear(
@@ -944,11 +967,13 @@ class BeamModel(nn.Module):
         )
         # Decoder layers whose outputs feed a speculative drafter (DFlash).
         self.layers_to_capture = ()
-        # Deferred expert sums need the BF16 Triton runner's per-expert outputs.
+        # Deferred expert sums read base weights directly, bypassing LoRA.
         self.fuse_moe_all_reduce = (
-            quant_config is None and config.num_experts_per_tok == 8
+            quant_config is None
+            and config.num_experts_per_tok == 8
+            and not (get_lora().enable_lora or get_lora().lora_paths)
         )
-        self._beam_all_reduce_comm = None
+        self._beam_all_reduce_lease = _request_beam_workspace(config.hidden_size)
         # Offload wrappers load weights through each layer's regular forward.
         # Fusing across layer boundaries would bypass those wrappers.
         # A custom PP partition can leave a stage with no layer to fuse from.
@@ -1058,7 +1083,7 @@ class BeamModel(nn.Module):
             or not hidden_states.is_contiguous()
             or hidden_states.data_ptr() % 16 != 0
             or hidden_states.shape[1] != 5120
-            or not 0 < hidden_states.shape[0] <= 64
+            or not 0 < hidden_states.shape[0] <= _BEAM_AR_MAX_TOKENS
         ):
             return None
         # Attention owns a TP reduction independently of the expert layout.
@@ -1098,46 +1123,16 @@ class BeamModel(nn.Module):
             return None
         return attention_max_tokens, topk_max_tokens
 
-    def _prepare_all_reduce_comm(self, hidden_states, max_tokens: int):
-        """Reuse or initialize the shared push workspace during eager warmup.
-
-        The caller supplies the capacity selected by `_all_reduce_limits`.
-        Capture may reuse an initialized communicator, but never allocates one.
-        """
-        from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
-            CustomAllReduceV2,
-        )
-
-        comm = get_parallel().tp_group.ca_comm
-        if not isinstance(comm, CustomAllReduceV2) or comm.disabled:
-            return None
-        if self._beam_all_reduce_comm is None:
-            # Initialize once in eager warmup, before any CUDA graph capture.
-            # Hopper's native push plane is tuned for much smaller messages.
-            # Share one bounded plane across all attention and MoE boundaries.
-            if torch.cuda.is_current_stream_capturing():
-                return None
-            required_bytes = max_tokens * hidden_states.shape[1] * 2
-            if not comm.supports_push(nbytes=required_bytes, num_blocks=max_tokens):
-                from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
-
-                comm = CustomAllReduceV2(
-                    comm.group,
-                    comm.device,
-                    max_pull_size=0,
-                    max_pull_blocks=0,
-                    max_push_size=required_bytes,
-                    max_push_blocks=max_tokens,
-                )
-                register_comm_cleanup(comm)
-            self._beam_all_reduce_comm = comm
-        comm = self._beam_all_reduce_comm
-        if not comm.supports_push(
-            nbytes=hidden_states.numel() * hidden_states.element_size(),
-            num_blocks=hidden_states.shape[0],
+    def _prepare_all_reduce_comm(self, hidden_states):
+        """The fused boundaries' planes, when one push slot can stage this batch."""
+        lease = self._beam_all_reduce_lease
+        if (
+            lease is None
+            or hidden_states.numel() * hidden_states.element_size()
+            > lease.request.push_slot_bytes
         ):
             return None
-        return comm.obj
+        return lease.get_communicator()
 
     def forward(
         self,
@@ -1188,7 +1183,7 @@ class BeamModel(nn.Module):
         limits = self._all_reduce_limits(hidden_states)
         if limits is not None:
             attention_max_tokens, topk_max_tokens = limits
-            comm = self._prepare_all_reduce_comm(hidden_states, max(limits))
+            comm = self._prepare_all_reduce_comm(hidden_states)
             if hidden_states.shape[0] <= topk_max_tokens:
                 mlp_beam_ar_topk_comm = comm
             if hidden_states.shape[0] <= attention_max_tokens:
@@ -1286,6 +1281,18 @@ class BeamForCausalLM(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
 
+    # The attention output gate keeps its qualified name to distinguish it
+    # from the MLP gate, which is fused into gate_up_proj.
+    supported_lora_modules = [
+        "qkv_proj",
+        "o_proj",
+        "self_attn.gate_proj",
+        "gate_up_proj",
+        "down_proj",
+        "embed_tokens",
+        "lm_head",
+    ]
+
     def __init__(
         self,
         config: BeamConfig,
@@ -1293,7 +1300,8 @@ class BeamForCausalLM(nn.Module):
         prefix: str = "",
     ):
         super().__init__()
-        if get_beam_quantization(quant_config) is None:
+        quant_scheme = get_beam_quantization(quant_config)
+        if quant_scheme is None:
             raise NotImplementedError(
                 "Beam supports BF16, compressed-tensors FP8 (per-channel "
                 "weights and dynamic per-token activations), or ModelOpt "
@@ -1313,8 +1321,14 @@ class BeamForCausalLM(nn.Module):
                 "Beam has not been validated with expert relocation or "
                 "redundant experts; use trivial expert placement"
             )
-        if get_lora().enable_lora or get_lora().lora_paths:
-            raise NotImplementedError("LoRA adapters are not supported for Beam")
+        if (get_lora().enable_lora or get_lora().lora_paths) and (
+            quant_scheme == "nvfp4"
+            or get_lora().lora_backend not in ("csgmv", "triton")
+        ):
+            raise NotImplementedError(
+                "Beam LoRA supports BF16 or compressed-tensors FP8 with "
+                "--lora-backend csgmv or triton and --moe-runner-backend triton"
+            )
         self.config = config
         self.model = BeamModel(config, quant_config, prefix=add_prefix("model", prefix))
         self.start_layer = self.model.start_layer
