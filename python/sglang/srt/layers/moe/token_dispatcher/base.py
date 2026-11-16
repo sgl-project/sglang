@@ -445,9 +445,8 @@ class BaseDispatcher(ABC):
 
     @property
     def implements_prebuild(self) -> bool:
-        """Whether this class overrides ``prebuild``. One that does not builds its
-        state lazily at the first dispatch (the default, fine natively); CUDA
-        graph persistence then falls back to native capture."""
+        """Without a ``prebuild`` override, CUDA graph persistence falls back to
+        native capture."""
         return type(self).prebuild is not BaseDispatcher.prebuild
 
 

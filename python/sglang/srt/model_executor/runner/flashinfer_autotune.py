@@ -182,10 +182,8 @@ def _kernels_take_flashinfer_tactics(
 def flashinfer_tactics_cache_for_persistence(
     model_runner: ModelRunner,
 ) -> Optional[str]:
-    """CUDA graph persistence pins autotune off and installs the tactics of
-    this file (a plain start of the same model writes it) on SAVE and LOAD
-    instead; None without persistence or when the runner's kernels take no
-    FlashInfer tactics."""
+    """Tactics file CUDA graph persistence installs in place of autotune, which
+    it pins off; None without persistence or FlashInfer-tuned kernels."""
     mr = model_runner
     if (
         not get_foundry_adapter().enabled
