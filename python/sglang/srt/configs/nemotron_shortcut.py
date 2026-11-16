@@ -43,6 +43,7 @@ from sglang.srt.configs.mamba_utils import (
 
 # The checkpoint's text-config model_type.
 TEXT_MODEL_TYPE = "nemotron4_text"
+MTP_ARCH = "NemotronShortcutForCausalLMMTP"
 
 GDP_LAYER_TYPES = ("linear_attention", "shortcut_moe_gdp")
 ATTENTION_LAYER_TYPES = ("full_attention", "shortcut_moe_attn")
@@ -121,7 +122,10 @@ class NemotronShortcutLayout:
 
 
 def sdsa_index_head_dim(hf_config: PretrainedConfig) -> Optional[int]:
-    """Index-key width when SDSA serves this model's attention, else None."""
+    """Index-key width when SDSA serves this model's attention, else None. The
+    MTP draft's attention is dense, so its KV pool has no index cache."""
+    if hf_config.architectures[0] == MTP_ARCH:
+        return None
     text_config = hf_config.get_text_config()
     if is_nemotron_shortcut_text_config(text_config) and text_config.index_topk:
         return text_config.index_head_dim
@@ -136,7 +140,7 @@ register_linear_attn_model(
         backend_class_name=(
             "sglang.srt.layers.attention.linear.gdp_backend.GDPAttnBackend"
         ),
-        arch_names=["Nemotron4ForConditionalGeneration"],
+        arch_names=["Nemotron4ForConditionalGeneration", MTP_ARCH],
         uses_mamba_radix_cache=True,
         support_mamba_cache=True,
         support_mamba_cache_extra_buffer=True,

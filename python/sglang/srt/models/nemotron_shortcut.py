@@ -131,6 +131,17 @@ class NemotronShortcutWideResidualConnection(nn.Module):
         return out.view(streams.shape)
 
 
+class NemotronShortcutPlainResidual(nn.Module):
+    """Ordinary additive residual behind the wide-residual read/write interface
+    (the MTP block has no wide residual)."""
+
+    def read(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states
+
+    def write(self, hidden_states: torch.Tensor, update: torch.Tensor) -> torch.Tensor:
+        return hidden_states + update.to(hidden_states.dtype)
+
+
 # ---------------------------------------------------------------------------
 # Branches
 # ---------------------------------------------------------------------------
@@ -257,6 +268,7 @@ class NemotronShortcutAttention(nn.Module):
         layer_id: int,
         quant_config: Optional[QuantizationConfig],
         prefix: str,
+        use_sdsa: bool = True,
     ):
         super().__init__()
         self.head_dim = config.head_dim
@@ -286,7 +298,7 @@ class NemotronShortcutAttention(nn.Module):
             NemotronShortcutIndexer(
                 config, quant_config=quant_config, prefix=add_prefix("indexer", prefix)
             )
-            if config.index_topk is not None
+            if use_sdsa and config.index_topk is not None
             else None
         )
         self.attn = RadixAttention(
@@ -340,10 +352,10 @@ class NemotronShortcutIndexer(nn.Module):
 
 
 def _check_clamped_relu2_backend() -> None:
-    """The experts' soft-clamped squared ReLU runs only on Marlin (W4A16) and on
-    FlashInfer's CuTe-DSL NVFP4 MoE (FlashInfer >= 0.7.4)."""
+    """The experts' soft-clamped squared ReLU runs on Marlin (W4A16), Triton (the
+    BF16 MTP experts) and FlashInfer's CuTe-DSL NVFP4 MoE (FlashInfer >= 0.7.4)."""
     backend = get_moe_runner_backend()
-    if backend.is_marlin():
+    if backend.is_marlin() or backend.is_triton():
         return
     if backend.is_flashinfer_cutedsl():
         from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
@@ -359,7 +371,8 @@ def _check_clamped_relu2_backend() -> None:
         )
     raise ValueError(
         "Nemotron Shortcut experts use a soft-clamped squared ReLU; launch with "
-        "--moe-runner-backend marlin or flashinfer_cutedsl."
+        "--moe-runner-backend marlin or flashinfer_cutedsl "
+        "(and --speculative-moe-runner-backend triton for MTP)."
     )
 
 
@@ -475,13 +488,19 @@ class NemotronShortcutMoE(nn.Module):
 # ---------------------------------------------------------------------------
 
 
-def _build_mixer(config, layer_type, layer_id, quant_config, prefix) -> nn.Module:
+def _build_mixer(
+    config, layer_type, layer_id, quant_config, prefix, use_sdsa: bool = True
+) -> nn.Module:
     if layer_type in GDP_LAYER_TYPES:
         return NemotronShortcutGDPMixer(
             config, layer_id, quant_config, prefix=add_prefix("mixer", prefix)
         )
     return NemotronShortcutAttention(
-        config, layer_id, quant_config, prefix=add_prefix("self_attn", prefix)
+        config,
+        layer_id,
+        quant_config,
+        prefix=add_prefix("self_attn", prefix),
+        use_sdsa=use_sdsa,
     )
 
 
@@ -526,14 +545,32 @@ class ShortcutMoELayer(nn.Module):
     """Mixer + latent MoE. The routed branch reads the block input (before the
     mixer); the shared branch reads the post-mixer streams."""
 
-    def __init__(self, config, layer_type, layer_id, quant_config, prefix):
+    def __init__(
+        self,
+        config,
+        layer_type,
+        layer_id,
+        quant_config,
+        prefix,
+        *,
+        wide_residual: bool = True,
+        use_sdsa: bool = True,
+    ):
         super().__init__()
-        self.shortcut_read = NemotronShortcutWideResidualRead(config)
+
+        def residual():
+            if wide_residual:
+                return NemotronShortcutWideResidualConnection(config)
+            return NemotronShortcutPlainResidual()
+
+        self.shortcut_read = (
+            NemotronShortcutWideResidualRead(config) if wide_residual else None
+        )
         self.shortcut_input_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.mixer_residual_connection = NemotronShortcutWideResidualConnection(config)
+        self.mixer_residual_connection = residual()
         self.pre_moe_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.moe = NemotronShortcutMoE(
             config, layer_id, quant_config, prefix=add_prefix("moe", prefix)
@@ -543,9 +580,11 @@ class ShortcutMoELayer(nn.Module):
             if config.moe_shortcut_post_norm
             else None
         )
-        self.moe_residual_connection = NemotronShortcutWideResidualConnection(config)
+        self.moe_residual_connection = residual()
         self.uses_gdp = layer_type == "shortcut_moe_gdp"
-        mixer = _build_mixer(config, layer_type, layer_id, quant_config, prefix)
+        mixer = _build_mixer(
+            config, layer_type, layer_id, quant_config, prefix, use_sdsa=use_sdsa
+        )
         if self.uses_gdp:
             self.mixer = mixer
         else:
@@ -554,7 +593,10 @@ class ShortcutMoELayer(nn.Module):
     def forward(
         self, streams: torch.Tensor, forward_batch: ForwardBatch
     ) -> torch.Tensor:
-        routed_input = self.shortcut_input_layernorm(self.shortcut_read(streams))
+        routed_read = (
+            streams if self.shortcut_read is None else self.shortcut_read(streams)
+        )
+        routed_input = self.shortcut_input_layernorm(routed_read)
         mixer_input = self.input_layernorm(self.mixer_residual_connection.read(streams))
         mixer = self.mixer if self.uses_gdp else self.self_attn
         streams = self.mixer_residual_connection.write(
@@ -680,6 +722,9 @@ class NemotronShortcutForConditionalGeneration(nn.Module):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.language_model.embed_tokens
 
+    def get_embed_and_head(self):
+        return self.model.language_model.embed_tokens.weight, self.lm_head.weight
+
     def pad_input_ids(self, input_ids: array, mm_inputs: MultimodalInputs) -> array:
         return pad_mm_tokens(input_ids, mm_inputs)
 
@@ -727,17 +772,8 @@ class NemotronShortcutForConditionalGeneration(nn.Module):
         )
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
-        stacked_params_mapping = [
-            ("qkv_proj", "q_proj", "q"),
-            ("qkv_proj", "k_proj", "k"),
-            ("qkv_proj", "v_proj", "v"),
-        ]
-        # Non-gated experts: the checkpoint's up_proj is FusedMoE's w1.
-        expert_params_mapping = FusedMoE.make_expert_params_mapping(
-            ckpt_gate_proj_name="up_proj",
-            ckpt_down_proj_name="down_proj",
-            ckpt_up_proj_name="",
-            num_experts=self.text_config.n_routed_experts,
+        expert_params_mapping = nemotron_shortcut_expert_params_mapping(
+            self.text_config.n_routed_experts
         )
         params_dict = dict(self.named_parameters())
         loaded: set[str] = set()
@@ -750,64 +786,75 @@ class NemotronShortcutForConditionalGeneration(nn.Module):
                     (name.removeprefix("model.vision_tower."), loaded_weight)
                 )
                 continue
-            if ".self_attn." in name and ".indexer." not in name:
-                for param_name, weight_name, shard_id in stacked_params_mapping:
-                    if f".{weight_name}." not in name:
-                        continue
-                    mapped = name.replace(weight_name, param_name)
-                    param = params_dict[mapped]
-                    param.weight_loader(param, loaded_weight, shard_id)
-                    loaded.add(mapped)
-                    break
-                else:
-                    self._load_plain(params_dict, name, loaded_weight, loaded)
-                continue
-            if ".moe.experts." in name:
-                for (
-                    param_name,
-                    weight_name,
-                    expert_id,
-                    shard_id,
-                ) in expert_params_mapping:
-                    if weight_name not in name:
-                        continue
-                    mapped = name.replace(weight_name, param_name)
-                    param = params_dict[mapped]
-                    param.weight_loader(
-                        param,
-                        loaded_weight,
-                        mapped,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
-                    loaded.add(mapped)
-                    break
-                else:
-                    raise KeyError(f"Unmapped Nemotron Shortcut expert weight: {name}")
-                continue
-            self._load_plain(params_dict, name, loaded_weight, loaded)
+            load_nemotron_shortcut_weight(
+                params_dict, name, loaded_weight, loaded, expert_params_mapping
+            )
 
         if vision_tower_weights:
             self.model.vision_tower.load_weights(vision_tower_weights)
             loaded.update(
                 name for name in params_dict if name.startswith("model.vision_tower.")
             )
-        missing = sorted(set(params_dict) - loaded)
-        if missing:
-            logger.warning(
-                "Nemotron Shortcut: %d parameters not loaded from the checkpoint, e.g. %s",
-                len(missing),
-                missing[:8],
-            )
+        warn_unloaded_params(params_dict, loaded)
 
-    @staticmethod
-    def _load_plain(params_dict, name, loaded_weight, loaded) -> None:
-        if name not in params_dict:
-            raise KeyError(f"Unexpected Nemotron Shortcut checkpoint weight: {name}")
-        param = params_dict[name]
-        weight_loader = getattr(param, "weight_loader", default_weight_loader)
-        weight_loader(param, loaded_weight)
-        loaded.add(name)
+
+_STACKED_QKV = (
+    ("qkv_proj", "q_proj", "q"),
+    ("qkv_proj", "k_proj", "k"),
+    ("qkv_proj", "v_proj", "v"),
+)
+
+
+def nemotron_shortcut_expert_params_mapping(num_experts: int):
+    # Non-gated experts: the checkpoint's up_proj is FusedMoE's w1.
+    return FusedMoE.make_expert_params_mapping(
+        ckpt_gate_proj_name="up_proj",
+        ckpt_down_proj_name="down_proj",
+        ckpt_up_proj_name="",
+        num_experts=num_experts,
+    )
+
+
+def load_nemotron_shortcut_weight(
+    params_dict, name, loaded_weight, loaded, expert_params_mapping
+) -> None:
+    """Load one checkpoint tensor whose name already matches the module tree,
+    stacking q/k/v into qkv_proj and routing per-expert tensors into FusedMoE."""
+    if ".self_attn." in name and ".indexer." not in name:
+        for param_name, weight_name, shard_id in _STACKED_QKV:
+            if f".{weight_name}." in name:
+                mapped = name.replace(weight_name, param_name)
+                param = params_dict[mapped]
+                param.weight_loader(param, loaded_weight, shard_id)
+                loaded.add(mapped)
+                return
+    if ".moe.experts." in name:
+        for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
+            if weight_name in name:
+                mapped = name.replace(weight_name, param_name)
+                param = params_dict[mapped]
+                param.weight_loader(
+                    param, loaded_weight, mapped, shard_id=shard_id, expert_id=expert_id
+                )
+                loaded.add(mapped)
+                return
+        raise KeyError(f"Unmapped Nemotron Shortcut expert weight: {name}")
+    if name not in params_dict:
+        raise KeyError(f"Unexpected Nemotron Shortcut checkpoint weight: {name}")
+    param = params_dict[name]
+    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+    weight_loader(param, loaded_weight)
+    loaded.add(name)
+
+
+def warn_unloaded_params(params_dict, loaded) -> None:
+    missing = sorted(set(params_dict) - loaded)
+    if missing:
+        logger.warning(
+            "Nemotron Shortcut: %d parameters not loaded from the checkpoint, e.g. %s",
+            len(missing),
+            missing[:8],
+        )
 
 
 class Nemotron4ForConditionalGeneration(NemotronShortcutForConditionalGeneration):

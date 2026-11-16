@@ -31,6 +31,10 @@ from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
 from sglang.srt.layers.attention.hybrid_linear_attn_backend import MambaAttnBackendBase
+from sglang.srt.layers.attention.linear.utils import (
+    build_verify_intermediate_state_indices,
+    select_verify_intermediate_state_indices,
+)
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
@@ -140,6 +144,52 @@ def gdp_decode_flashinfer(
         use_qk_l2norm=True,
     )
     return out.squeeze(1)
+
+
+def gdp_verify_flashinfer(
+    *,
+    layer: RadixLinearAttention,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    ssm_states: torch.Tensor,
+    cache_indices: torch.Tensor,
+    scratch: torch.Tensor,
+    scratch_rows: torch.Tensor,
+    num_draft_tokens: int,
+) -> torch.Tensor:
+    """Target verify of ``T`` chained draft tokens per row. The state after
+    token ``t`` lands in ``scratch[scratch_rows[b], t]``; the live pool slot is
+    left for the post-verify commit of the accepted step."""
+    from flashinfer import cake_gated_delta_product_mtp
+
+    num_tokens, n, num_heads, head_k_dim = key.shape
+    batch = num_tokens // num_draft_tokens
+    head_v_dim = value.shape[-1]
+    flat = scratch.view(-1, *scratch.shape[2:])
+    base = scratch_rows[:batch].to(torch.int64) * num_draft_tokens
+    slots = cache_indices[:batch]
+    # Seed step 0 with the live state: the kernel reads a row's state before it
+    # writes that row's token-0 state over it.
+    flat[base] = ssm_states[slots.clamp(min=0).long()]
+    steps = torch.arange(num_draft_tokens, device=base.device)
+    out, _ = cake_gated_delta_product_mtp(
+        q=query.view(batch, num_draft_tokens, num_heads, head_k_dim),
+        k=key.view(batch, num_draft_tokens, n, num_heads, head_k_dim),
+        v=value.view(batch, num_draft_tokens, n, num_heads, head_v_dim),
+        initial_state=flat,
+        initial_state_indices=torch.where(slots >= 0, base, -1).to(torch.int32),
+        A_log=layer.A_log,
+        a=a.view(batch, num_draft_tokens, num_heads),
+        dt_bias=layer.dt_bias,
+        b=b.view(batch, num_draft_tokens, n, num_heads),
+        ssm_state_indices=(base[:, None] + steps).to(torch.int32),
+        disable_state_update=False,
+        use_qk_l2norm=True,
+    )
+    return out.view(num_tokens, num_heads, head_v_dim)
 
 
 def _gdp_prefill_backend(device: torch.device) -> str:
@@ -257,6 +307,12 @@ class GDPAttnBackend(MambaAttnBackendBase):
         self.num_householder = text_config.gdp_num_householder
         self.conv_states_shape = self.state_pool.mamba_cache.conv[0].shape
         self.prefill_backend = _gdp_prefill_backend(torch.device(self.device))
+        # Scratch row of each verify batch row (request slot i owns row i).
+        self.verify_intermediate_state_indices = (
+            build_verify_intermediate_state_indices(
+                self.req_to_token_pool.size, model_runner.device
+            )
+        )
         self.track_plan: Optional[GDPTrackPlan] = None
 
     def init_forward_metadata_out_graph(
@@ -269,8 +325,12 @@ class GDPAttnBackend(MambaAttnBackendBase):
         super().init_forward_metadata(forward_batch)
         self.track_plan = None
         metadata = self.forward_metadata
-        if not (
-            metadata.has_mamba_track_mask and forward_batch.forward_mode.is_extend()
+        mode = forward_batch.forward_mode
+        if (
+            self.is_draft_worker
+            or not metadata.has_mamba_track_mask
+            or not mode.is_extend()
+            or mode.is_target_verify()
         ):
             return
         if forward_batch.mamba_prefill_track_mask_cpu is not None:
@@ -347,7 +407,9 @@ class GDPAttnBackend(MambaAttnBackendBase):
         **kwargs,
     ) -> torch.Tensor:
         if forward_batch.forward_mode.is_target_verify():
-            raise NotImplementedError("GDP does not support speculative verify yet.")
+            return self._forward_target_verify(
+                layer, forward_batch, mixed_qkv, a, b
+            ).unsqueeze(0)
         metadata = self.forward_metadata
         plan = self.track_plan
         layer_cache = self.state_layer_cache(layer.layer_id)
@@ -404,6 +466,46 @@ class GDPAttnBackend(MambaAttnBackendBase):
         if plan is not None and plan.post_src is not None:
             ssm_states[plan.post_dst] = ssm_states[plan.post_src]
         return out.unsqueeze(0)
+
+    def _forward_target_verify(self, layer, forward_batch, mixed_qkv, a, b):
+        metadata = self.forward_metadata
+        if metadata.retrieve_parent_token is not None:
+            raise NotImplementedError("GDP verify supports chain drafts (topk=1) only.")
+        layer_cache = self.state_layer_cache(layer.layer_id)
+        cache_indices = metadata.mamba_cache_indices
+        num_draft_tokens = forward_batch.spec_info.draft_token_num
+        batch = mixed_qkv.shape[0] // num_draft_tokens
+        scratch_rows = select_verify_intermediate_state_indices(
+            self.verify_intermediate_state_indices,
+            forward_batch.req_pool_indices,
+            cache_indices[:batch] >= 0,
+            self.req_to_token_pool.size,
+        )
+        mixed = causal_conv1d_update(
+            mixed_qkv.view(batch, num_draft_tokens, -1).transpose(1, 2),
+            layer_cache.conv[0],
+            layer.conv_weights,
+            layer.bias,
+            layer.activation,
+            conv_state_indices=cache_indices[:batch],
+            intermediate_conv_window=layer_cache.intermediate_conv_window[0],
+            intermediate_state_indices=scratch_rows[:batch],
+        )
+        mixed = mixed.transpose(1, 2).reshape(mixed_qkv.shape[0], -1)
+        query, key, value = gdp_split_conv_output(mixed, **self._layer_dims(layer))
+        return gdp_verify_flashinfer(
+            layer=layer,
+            query=query,
+            key=key,
+            value=value,
+            a=a,
+            b=b,
+            ssm_states=layer_cache.temporal,
+            cache_indices=cache_indices,
+            scratch=layer_cache.intermediate_ssm,
+            scratch_rows=scratch_rows,
+            num_draft_tokens=num_draft_tokens,
+        )
 
     def _prefill(
         self, query, key, value, alpha, beta, ssm_states, cache_indices, cu_seqlens

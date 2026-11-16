@@ -58,6 +58,9 @@ class TestExpertActivation(CustomTestCase):
         with self.assertRaises(ValueError):
             _check_backend(MoeRunnerBackend.FLASHINFER_TRTLLM)
 
+    def test_triton_serves_the_bf16_mtp_experts(self):
+        _check_backend(MoeRunnerBackend.TRITON)
+
 
 if __name__ == "__main__":
     unittest.main()

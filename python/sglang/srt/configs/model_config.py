@@ -1317,6 +1317,15 @@ class ModelConfig:
         ):
             self.hf_config.architectures[0] = "Ernie4_5_MoeForCausalLMMTP"
 
+        if (
+            is_draft_model
+            and self.hf_config.architectures[0] == "Nemotron4ForConditionalGeneration"
+        ):
+            # Deep-copy: the target's ModelConfig may share this hf_config object.
+            self.hf_config = copy.deepcopy(self.hf_config)
+            self.hf_text_config = get_hf_text_config(self.hf_config)
+            self.hf_config.architectures[0] = "NemotronShortcutForCausalLMMTP"
+
         if is_draft_model and self.hf_config.architectures[0] == "Qwen3NextForCausalLM":
             self.hf_config.architectures[0] = "Qwen3NextForCausalLMMTP"
             self.hf_config.num_nextn_predict_layers = 1

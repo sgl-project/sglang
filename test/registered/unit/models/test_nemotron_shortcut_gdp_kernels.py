@@ -148,6 +148,44 @@ class TestGDPKernels(CustomTestCase):
             self.assertLess(_rel(pool[slot], ref_state), TOL)
         self.assertEqual(out[rows].abs().max().item(), 0.0)
 
+    def test_verify_writes_every_draft_state_to_scratch_only(self):
+        rows, steps = self.slots.numel(), 3
+        q, k, v, a, b = _inputs(rows * steps)
+        scratch = torch.zeros(POOL + 1, steps, H, V, K, device="cuda")
+        scratch_rows = torch.tensor([2, 0, 6, 4], device="cuda", dtype=torch.int32)
+        pool = self.pool.clone()
+        out = self.gdp.gdp_verify_flashinfer(
+            layer=self.layer,
+            query=q,
+            key=k,
+            value=v,
+            a=a,
+            b=b,
+            ssm_states=pool,
+            cache_indices=self.slots,
+            scratch=scratch,
+            scratch_rows=scratch_rows,
+            num_draft_tokens=steps,
+        )
+        alpha, beta = self._gates(a, b)
+        beta = beta.view(rows * steps, N, H)
+        for i, slot in enumerate(self.slots.tolist()):
+            state = self.pool[slot]
+            for t in range(steps):
+                j = i * steps + t
+                ref_out, state = _reference(
+                    q[j : j + 1],
+                    k[j : j + 1],
+                    v[j : j + 1],
+                    alpha[j : j + 1],
+                    beta[j : j + 1],
+                    state,
+                )
+                self.assertLess(_rel(out[j], ref_out[0]), TOL)
+                self.assertLess(_rel(scratch[scratch_rows[i], t], state), TOL)
+        # The accepted prefix is committed after verify, not by the kernel.
+        self.assertTrue(torch.equal(pool, self.pool))
+
 
 if __name__ == "__main__":
     unittest.main()

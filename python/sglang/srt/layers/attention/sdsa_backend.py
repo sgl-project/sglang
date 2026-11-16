@@ -141,6 +141,19 @@ class SdsaAttnBackend(TRTLLMHAAttnBackend):
         return SdsaRows(requests=requests, context_lens=context_lens)
 
     @staticmethod
+    def _verify_rows(forward_batch: ForwardBatch, num_rows: int) -> SdsaRows:
+        # Chain drafts: each request's draft_token_num rows are contiguous; the
+        # integer division keeps this free of host syncs for CUDA graphs.
+        draft_tokens = forward_batch.spec_info.draft_token_num
+        rows = torch.arange(
+            num_rows, dtype=torch.int32, device=forward_batch.positions.device
+        )
+        return SdsaRows(
+            requests=rows // draft_tokens,
+            context_lens=(forward_batch.positions[:num_rows] + 1).to(torch.int32),
+        )
+
+    @staticmethod
     def _decode_rows(forward_batch: ForwardBatch) -> SdsaRows:
         seq_lens = forward_batch.seq_lens
         return SdsaRows(
@@ -186,7 +199,17 @@ class SdsaAttnBackend(TRTLLMHAAttnBackend):
         **kwargs,
     ) -> torch.Tensor:
         if forward_batch.forward_mode.is_target_verify():
-            raise NotImplementedError("SDSA does not support speculative verify yet.")
+            # Always sparse: verify runs under a captured graph, and the sparse
+            # path is exact for short contexts too.
+            if save_kv_cache:
+                self._store(layer, forward_batch, k, v, sdsa_index_k)
+            return self._sparse_attention(
+                q,
+                layer,
+                forward_batch,
+                sdsa_index_q,
+                self._verify_rows(forward_batch, q.shape[0]),
+            )
         if not self.extend_is_sparse:
             # Every row sees at most index_topk keys: dense attention is exact.
             if save_kv_cache:

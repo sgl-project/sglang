@@ -109,6 +109,12 @@ class TestSdsaGating(CustomTestCase):
         self.assertEqual(sdsa_index_head_dim(_config()), 128)
         self.assertIsNone(sdsa_index_head_dim(_config(_text_config(index_topk=None))))
 
+    def test_mtp_draft_has_no_index_cache(self):
+        # The draft's attention is dense; its KV pool and memory budget must agree.
+        draft = _config(arch="NemotronShortcutForCausalLMMTP")
+        self.assertIsNone(sdsa_index_head_dim(draft))
+        self.assertIsInstance(get_linear_attn_config(draft)[1], NemotronShortcutLayout)
+
 
 if __name__ == "__main__":
     unittest.main()
