@@ -246,9 +246,7 @@ class Exaone4DecoderLayer(nn.Module):
             config=config,
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
-            num_kv_heads=getattr(
-                config, "num_key_value_heads", config.num_key_value_heads
-            ),
+            num_kv_heads=config.num_key_value_heads,
             layer_id=layer_id,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
@@ -394,11 +392,6 @@ class Exaone4Model(nn.Module):
 
 
 class Exaone4ForCausalLM(nn.Module):
-    _tied_weights_keys = ["lm_head.weight"]
-    _tp_plan = {"lm_head": "colwise_rep"}
-    _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
-    base_model_prefix = "language_model"
-
     # BitandBytes specific attributes
     default_bitsandbytes_target_modules = [
         ".gate_proj.",
@@ -524,13 +517,8 @@ class Exaone4ForCausalLM(nn.Module):
 
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
-            if (
-                layer_id is not None
-                and hasattr(self.model, "start_layer")
-                and (
-                    layer_id < self.model.start_layer
-                    or layer_id >= self.model.end_layer
-                )
+            if layer_id is not None and (
+                layer_id < self.model.start_layer or layer_id >= self.model.end_layer
             ):
                 continue
             if "rotary_emb.inv_freq" in name or "projector" in name:
@@ -670,9 +658,6 @@ class Exaone4ForCausalLM(nn.Module):
         self.lm_head.weight = head
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
-
-    def get_embed(self):
-        return self.model.embed_tokens.weight
 
     def set_embed(self, embed):
         # NOTE: If draft hidden size != target hidden size, the embed weight cannot be shared for EAGLE3
