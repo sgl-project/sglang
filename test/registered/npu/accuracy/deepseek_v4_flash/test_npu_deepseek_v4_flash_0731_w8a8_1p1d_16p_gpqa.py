@@ -95,6 +95,23 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ENVS = {
     "SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX": "1",
 }
 
+# DSpark speculative decoding. Both nodes must run the same draft model: the PD
+# state wire check compares the registered state sub-pools by position, and a
+# draft model only on decode adds a second SWA pool there (prefill 4 entries vs
+# decode 5), which the mooncake transfer backend rejects.
+DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_SPEC_ARGS = [
+    "--speculative-algorithm",
+    "DSPARK",
+    "--speculative-draft-model-path",
+    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
+    "--speculative-draft-model-quantization",
+    "modelslim",
+    "--speculative-draft-attention-backend",
+    "ascend",
+    "--speculative-num-draft-tokens",
+    6,
+]
+
 # Prefill node launch arguments.
 DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--page-size",
@@ -155,6 +172,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_PREFILL_ARGS = [
     "--enable-cache-report",
     "--max-total-tokens",
     140000,
+    *DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_SPEC_ARGS,
 ]
 
 # Decode node launch arguments.
@@ -201,16 +219,7 @@ DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_DECODE_ARGS = [
     4,
     5,
     6,
-    "--speculative-algorithm",
-    "DSPARK",
-    "--speculative-draft-model-path",
-    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
-    "--speculative-draft-model-quantization",
-    "modelslim",
-    "--speculative-draft-attention-backend",
-    "ascend",
-    "--speculative-num-draft-tokens",
-    6,
+    *DEEPSEEK_V4_FLASH_0731_W8A8_PD_SEP_SPEC_ARGS,
 ]
 
 # Generation config for Think High mode (thinking=true, reasoning_effort=high).
