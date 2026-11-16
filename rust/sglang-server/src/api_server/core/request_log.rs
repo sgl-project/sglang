@@ -1999,7 +1999,7 @@ impl RecorderState {
         let body = &record.request.body;
         let refs = self.finished_body_refs.entry(body.id).or_insert(0);
         if *refs == 0 {
-            self.finished_bytes += body.json.bytes.len();
+            self.finished_bytes += body.held_bytes;
         }
         *refs += 1;
         self.finished_bytes += record.out.len();
@@ -2015,7 +2015,7 @@ impl RecorderState {
             *refs -= 1;
             if *refs == 0 {
                 self.finished_body_refs.remove(&body.id);
-                self.finished_bytes -= body.json.bytes.len();
+                self.finished_bytes -= body.held_bytes;
             }
         }
         Some(record)
@@ -2027,6 +2027,9 @@ impl RecorderState {
 pub(crate) struct DumpBody {
     id: u64,
     json: RawBody,
+    /// What the finished window's byte budget charges for this body: the raw
+    /// bytes and the header overrides held beside them, as serialized.
+    held_bytes: usize,
 }
 
 impl DumpBody {
@@ -2086,8 +2089,18 @@ impl CrashRecorder {
     }
 
     fn body(&self, json: RawBody) -> Arc<DumpBody> {
+        let overrides_bytes = json
+            .overrides
+            .as_ref()
+            .filter(|overrides| !overrides.is_empty())
+            .map_or(0, |overrides| {
+                serde_json::to_vec(overrides)
+                    .expect("a JSON map serializes")
+                    .len()
+            });
         Arc::new(DumpBody {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            held_bytes: json.bytes.len() + overrides_bytes,
             json,
         })
     }

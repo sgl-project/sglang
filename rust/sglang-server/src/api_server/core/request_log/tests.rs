@@ -591,6 +591,22 @@ fn recorder_drops_the_oldest_finished_past_its_byte_budget() {
     }
     assert_eq!(recorded(&recorder_items).0, ["first", "second"]);
 
+    // Header overrides held with a body count too: 2 + 1022 + 21 bytes.
+    let overridden = CrashRecorder::omitting(Vec::new(), 1000);
+    let mut overrides = Map::new();
+    overrides.insert("conversation_id".into(), "z".repeat(1000).into());
+    let request = DumpRequest {
+        body: overridden.body(RawBody {
+            bytes: Bytes::from_static(b"{}"),
+            overrides: Some(overrides),
+        }),
+        batch_index: None,
+        rid: "overridden".into(),
+    };
+    let id = overridden.register(request, 1.0, output());
+    overridden.finish(id, true, &out(10), 2.0);
+    assert!(recorded(&overridden).0.is_empty());
+
     // A budget of 0 keeps the whole window.
     let unbounded = CrashRecorder::default();
     for rid in ["a", "b", "c"] {
