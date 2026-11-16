@@ -503,7 +503,6 @@ class SDARMoeForCausalLM(nn.Module):
             "Please set pp_size=1."
         )
 
-        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         alt_stream = get_stream("alt") if _is_cuda else None
