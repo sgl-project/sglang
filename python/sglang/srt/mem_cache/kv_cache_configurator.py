@@ -2542,7 +2542,17 @@ class KVCacheConfigurator:
             },
         )
 
+    @staticmethod
+    def _reject_nvfp4_scale_search(pool_name: str) -> None:
+        # Only NVFP4KVCacheMethod's store path implements the scale search;
+        # pools that quantize on their own would silently ignore the flag.
+        if get_exec().kernel.nvfp4_kv_scale_search != "default":
+            raise NotImplementedError(
+                f"--nvfp4-kv-scale-search is not supported with the {pool_name} yet."
+            )
+
     def _build_mla_fp4_kv_pool(self, *, max_total_num_tokens: int) -> KVCache:
+        self._reject_nvfp4_scale_search("MLA FP4 KV cache")
         token_to_kv_pool = MLATokenToKVPoolFP4(
             max_total_num_tokens,
             page_size=self.pool_page_size,
@@ -2665,6 +2675,7 @@ class KVCacheConfigurator:
         ):
             from sglang.srt.mem_cache.minimax_m3_nvfp4_pool import MiniMaxM3Nvfp4KVPool
 
+            self._reject_nvfp4_scale_search("MiniMax-M3 packed NVFP4 KV cache")
             pool_cls = MiniMaxM3Nvfp4KVPool
         token_to_kv_pool = pool_cls(
             size=max_total_num_tokens,

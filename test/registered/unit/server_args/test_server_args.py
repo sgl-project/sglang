@@ -1658,6 +1658,31 @@ class TestKV4Compatibility(unittest.TestCase):
             handle_nvfp4_prefill_kv_dequant_dtype(args)
 
     @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_nvfp4_kv_scale_search_accepts_nvfp4_storage(self):
+        args = self._make_unrouted_nvfp4_args(nvfp4_kv_scale_search="4over6")
+        handle_nvfp4_prefill_kv_dequant_dtype(args)
+        self.assertEqual(args.nvfp4_kv_scale_search, "4over6")
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
+    def test_nvfp4_kv_scale_search_rejects_non_nvfp4_storage(self):
+        args = ServerArgs(
+            model_path="dummy",
+            kv_cache_dtype="fp8_e4m3",
+            nvfp4_kv_scale_search="4over6",
+        )
+        with self.assertRaisesRegex(ValueError, "applies only"):
+            handle_nvfp4_prefill_kv_dequant_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=False, is_sm120=False)
+    def test_nvfp4_kv_scale_search_requires_sm100_or_sm120(self):
+        args = self._make_unrouted_nvfp4_args(
+            prefill_kv_cache_dequant_dtype="fp8_e4m3",
+            nvfp4_kv_scale_search="4over6",
+        )
+        with self.assertRaisesRegex(ValueError, "requires SM100 or SM120"):
+            handle_nvfp4_prefill_kv_dequant_dtype(args)
+
+    @override_platform(is_cuda=True, is_sm100=True, is_sm120=False)
     def test_sm100_native_nvfp4_allows_topk_one_speculative_decoding(self):
         for algorithm in ("EAGLE", "EAGLE3", "NEXTN"):
             for prefill_backend, decode_backend in (

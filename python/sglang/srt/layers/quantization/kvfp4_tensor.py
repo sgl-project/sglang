@@ -151,16 +151,18 @@ class NVFP4KVQuantizeUtil:
 
     @staticmethod
     def quantize(
-        tensor: torch.Tensor, global_scale: torch.Tensor
+        tensor: torch.Tensor, global_scale: torch.Tensor, four_over_six: bool = False
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Quantize BF16/FP16 tensor to NVFP4 format.
 
         Requires SM90+.  Uses ``nvfp4_kv_quantize`` on SM100+ (native PTX),
-        falls back to ``fp4_quantize`` on SM90.
+        falls back to ``fp4_quantize`` on SM90.  With ``four_over_six``, a
+        Triton kernel picks max/6 or max/4 block scales per 16-value block.
 
         Args:
             tensor: Input tensor of shape [B, M, N]
             global_scale: Global scale factor (float32 scalar or 1-element tensor)
+            four_over_six: Use the 4-over-6 block-scale search (SM100/SM120).
 
         Returns:
             (fp4_data, block_scales, global_scale):
@@ -190,7 +192,15 @@ class NVFP4KVQuantizeUtil:
                 "NVFP4 global scale tensor must already be on the KV tensor device."
             )
 
-        if get_platform().is_sm100 or get_platform().is_sm120:
+        if four_over_six:
+            if not (get_platform().is_sm100 or get_platform().is_sm120):
+                raise ValueError("NVFP4 4-over-6 KV quantization requires SM100/SM120.")
+            from sglang.kernels.ops.quantization.nvfp4_kv_4over6 import (
+                nvfp4_kv_quantize_triton,
+            )
+
+            fp4_2d, scales_2d = nvfp4_kv_quantize_triton(tensor_2d, global_scale)
+        elif get_platform().is_sm100 or get_platform().is_sm120:
             from flashinfer import nvfp4_kv_quantize
 
             # nvfp4_kv_quantize takes global_scale directly (not inverted)

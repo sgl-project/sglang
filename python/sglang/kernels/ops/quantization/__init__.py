@@ -172,6 +172,20 @@ register_kernel(
     )
 )
 
+# NVFP4 KV-cache store-time quantizer with the per-block 4-over-6 scale search.
+# The kernel's FP8 E4M3 block-scale cast needs SM89+; the NVFP4 KV cache that
+# calls it is SM100/SM120-only and checks that itself.
+register_kernel(
+    KernelSpec(
+        op="quantization.nvfp4_kv_quantize_triton",
+        backend=KernelBackend.TRITON,
+        target=(
+            "sglang.kernels.ops.quantization.nvfp4_kv_4over6:nvfp4_kv_quantize_triton"
+        ),
+        capabilities=frozenset({CapabilityRequirement.cuda(min_sm=(8, 9))}),
+    )
+)
+
 # act_quant also has a TileLang implementation (act_quant_tilelang, used on HIP);
 # KernelBackend has no TileLang provenance, so only the Triton one is inventoried.
 register_kernel(

@@ -99,6 +99,19 @@ python3 -m sglang.launch_server \
 Native NVFP4 prefill requires SM100, a page size divisible by 4, and an attention head dimension divisible by 64. TRT-LLM GenMHA uses FP8 query and output buffers internally; SGLang converts the result back to the model activation dtype. Top-k-1 EAGLE/EAGLE3/NEXTN and breadth-1 NGRAM speculative decoding are supported: an EAGLE-family draft worker uses `trtllm_mha`, and target verification consumes the physical NVFP4 cache directly in eager execution and CUDA Graphs. Set `--speculative-ngram-max-bfs-breadth=1` for NGRAM. With the mixed FlashInfer-prefill/TRT-LLM-decode recipe, SGLang resolves `--speculative-attention-mode` to `decode` so verification does not depend on FlashInfer's transient dequantization workspace. Other speculative algorithms, PD disaggregation, hierarchical KV cache, and LMCache are not currently supported by the SM100 native NVFP4 path. SM120 XQA continues to use its architecture-specific linear scale layout and BF16 query/output path.
 </Note>
 
+### NVFP4 block-scale search
+
+By default each 16-value NVFP4 block maps its largest magnitude to the largest FP4 value, 6. With `--nvfp4-kv-scale-search 4over6`, the store kernel also tries mapping it to 4, which gives a finer grid near the top of the block, and keeps whichever choice reconstructs the block with lower squared error. Only the stored block scales and FP4 codes change; the cache layout, capacity, and attention kernels are the same. It applies to the MHA NVFP4 KV cache on SM100 and SM120; MLA models and MiniMax-M3's packed NVFP4 cache are not supported yet.
+
+Lower reconstruction error does not raise accuracy on every model. On gpt-oss-20b, 4over6 lowered GSM8K by about 1.7 points, so check accuracy on your own model and workload before turning it on.
+
+```bash Command
+python3 -m sglang.launch_server \
+    --model-path Qwen/Qwen3-8B \
+    --kv-cache-dtype nvfp4 \
+    --nvfp4-kv-scale-search 4over6
+```
+
 ### Scaling Factors
 
 FP8 quantization requires scaling factors to properly quantize and dequantize the KV cache.

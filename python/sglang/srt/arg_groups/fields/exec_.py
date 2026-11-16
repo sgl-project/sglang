@@ -288,6 +288,19 @@ class ExecKernel(msgspec.Struct):
             resolvable=True,
         ),
     ] = "auto"
+    nvfp4_kv_scale_search: A[
+        str,
+        Arg(
+            help=(
+                "Block-scale choice when writing an NVFP4 KV cache "
+                "(--kv-cache-dtype=nvfp4). 'default' maps each 16-value block's "
+                "max to 6. '4over6' also tries mapping it to 4 and keeps the "
+                "candidate with lower squared reconstruction error. The cache "
+                "layout and attention kernels are the same either way."
+            ),
+            choices=["default", "4over6"],
+        ),
+    ] = "default"
     sampling_backend: A[
         Optional[str],
         Arg(

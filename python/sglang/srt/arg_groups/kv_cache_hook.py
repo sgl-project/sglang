@@ -45,7 +45,16 @@ def handle_nvfp4_prefill_kv_dequant_dtype(server_args: Any) -> None:
                 "--prefill-kv-cache-dequant-dtype applies only with "
                 "--kv-cache-dtype=nvfp4."
             )
+        if cfg.nvfp4_kv_scale_search != "default":
+            raise ValueError(
+                "--nvfp4-kv-scale-search applies only with --kv-cache-dtype=nvfp4."
+            )
         return
+
+    if cfg.nvfp4_kv_scale_search == "4over6" and not (
+        get_platform().is_sm100 or get_platform().is_sm120
+    ):
+        raise ValueError("--nvfp4-kv-scale-search=4over6 requires SM100 or SM120.")
 
     if requested_dtype == "auto":
         explicit_backend = cfg.prefill_attention_backend or cfg.attention_backend

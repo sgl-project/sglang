@@ -455,10 +455,14 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         device: str,
         page_size: int = 16,
         native_scale_layout: Optional[bool] = None,
+        scale_search: str = "default",
     ):
         self.num_layers = num_layers
         self.device = device
         self.page_size = page_size
+        # "4over6" picks max/6 or max/4 block scales per block at store time;
+        # the cache layout and every read path are unchanged.
+        self.scale_search = scale_search
         self.use_trtllm_gen_native_scale_layout = (
             get_platform().is_sm100
             if native_scale_layout is None
@@ -469,6 +473,14 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
         self.v_scales_gpu = torch.ones(num_layers, dtype=torch.float32, device=device)
         self.k_scales_float = [1.0] * num_layers
         self.v_scales_float = [1.0] * num_layers
+
+    def configure_attention_backends_from_server_args(self, server_args) -> None:
+        super().configure_attention_backends_from_server_args(server_args)
+        from sglang.srt.arg_groups.model_override_base import resolved_view
+
+        self.scale_search = getattr(
+            resolved_view(server_args), "nvfp4_kv_scale_search", "default"
+        )
 
     def needs_global_scale(self) -> bool:
         return True
@@ -693,11 +705,12 @@ class NVFP4KVCacheMethod(KVCacheQuantMethodBase):
             store_nvfp4_kv_cache,
         )
 
+        four_over_six = self.scale_search == "4over6"
         cache_k, cache_k_fp4_sf, _ = NVFP4KVQuantizeUtil.quantize(
-            cache_k.contiguous(), k_scale
+            cache_k.contiguous(), k_scale, four_over_six
         )
         cache_v, cache_v_fp4_sf, _ = NVFP4KVQuantizeUtil.quantize(
-            cache_v.contiguous(), v_scale
+            cache_v.contiguous(), v_scale, four_over_six
         )
 
         cache_k = cache_k.view(torch.uint8)
