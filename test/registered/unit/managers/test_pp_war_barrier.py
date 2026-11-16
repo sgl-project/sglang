@@ -21,7 +21,7 @@ from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, enter_scope, published_topology
 
 register_cpu_ci(est_time=3, suite="base-a-test-cpu")
-register_cuda_ci(est_time=8, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
 # Ids of the aborted request (A) and of the request that reuses its row (B).
 OLD_OWNER, NEW_OWNER = 1, 2

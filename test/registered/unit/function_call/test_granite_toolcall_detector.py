@@ -10,7 +10,7 @@ from sglang.srt.function_call.qwen3_coder_detector import Qwen3CoderDetector
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(1.0, "base-a-test-cpu")
+register_cpu_ci(9, "base-a-test-cpu")
 
 
 def _call(name, params):

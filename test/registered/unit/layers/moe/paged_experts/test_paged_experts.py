@@ -68,7 +68,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph import 
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=40, suite="base-a-test-cpu")
+register_cpu_ci(est_time=19, suite="base-a-test-cpu")
 # The captured cases (disk reads waited for or replayed inside a CUDA graph) need a GPU.
 register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 

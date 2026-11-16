@@ -20,7 +20,7 @@ from sglang.test.kernels.utils import multigpu_pytest_main
 from sglang.test.test_utils import published_topology
 
 register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
-register_cuda_ci(est_time=90, stage="extra-b", runner_config="8-gpu-h200")
+register_cuda_ci(est_time=50, stage="extra-b", runner_config="8-gpu-h200")
 
 
 def inputs(batch, rank, dim=512):

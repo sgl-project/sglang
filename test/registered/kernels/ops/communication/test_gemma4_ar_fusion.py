@@ -33,7 +33,7 @@ from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
 
-register_cuda_ci(est_time=90, stage="extra-b", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=57, stage="extra-b", runner_config="4-gpu-b200")
 
 HIDDENS = [5376, 4096]  # Gemma-4 31B, and one more block width
 EPS = 1e-6

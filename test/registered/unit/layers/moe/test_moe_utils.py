@@ -24,7 +24,7 @@ from sglang.srt.layers.quantization import fp8 as fp8_module  # noqa: E402
 from sglang.srt.layers.quantization import mxfp4 as mxfp4_module  # noqa: E402
 from sglang.srt.layers.quantization import unquant as unquant_module  # noqa: E402
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=2, suite="base-a-test-cpu")
 
 NUM_EXPERTS, HIDDEN_SIZE, INTERMEDIATE_SIZE, NUM_TOKENS = 8, 16, 12, 4
 

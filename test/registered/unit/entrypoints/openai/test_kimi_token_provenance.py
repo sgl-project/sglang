@@ -7,7 +7,7 @@ from sglang.srt.entrypoints.openai.kimi_token_provenance import KimiTokenProvena
 from sglang.srt.function_call.kimik3_format import RESPONSE_OPEN, THINK_CLOSE
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=2, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 
 def ledger(pieces):

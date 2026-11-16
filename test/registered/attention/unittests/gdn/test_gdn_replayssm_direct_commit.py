@@ -40,7 +40,7 @@ from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=37, stage="base-b", runner_config="1-gpu-large")
 
 # Qwen3.5/3.8 GDN head shape (HV / H = 3); DFlash block 8 and the default
 # --linear-replayssm-cache-len.
