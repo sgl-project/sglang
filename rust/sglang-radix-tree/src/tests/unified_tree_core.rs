@@ -3152,6 +3152,57 @@ fn write_back_defers_swa_window_backup_until_eviction() {
 }
 
 #[test]
+fn buffer_only_insert_lists_each_unbacked_ancestor_once() {
+    for (buffer_only, inserted_len) in [(false, 0), (true, 0), (false, 2), (true, 2)] {
+        let mut tc = core();
+        // One node per token, so the path holds four unbacked nodes.
+        for n in 1..=4 {
+            let key: Vec<i64> = (0..n).collect();
+            tc.insert(&insert_params(&key, &key));
+        }
+        tc.set_hicache_enabled();
+        if buffer_only {
+            tc.set_host_memory_buffer_only();
+        }
+        tc.set_write_through_threshold(1);
+        let key: Vec<i64> = (0..5).collect();
+        let result = tc.insert(&InsertParams {
+            inserted_len,
+            ..insert_params(&key, &key)
+        });
+        let chains: Vec<Vec<NodeId>> = result
+            .cache_actions
+            .iter()
+            .filter_map(|action| action.as_any().downcast_ref::<BackupKV>())
+            .map(|backup| backup.node_ids.clone())
+            .collect();
+        let path: Vec<NodeId> = tc
+            .collect_path_info(&[result.last_device_node_id.unwrap()])
+            .unwrap()
+            .remove(0)
+            .iter()
+            .map(|node| node.node_id)
+            .collect();
+        // Nodes the request already inserted are not counted, so the first backup carries them.
+        let first = inserted_len + 1;
+        let expected: Vec<Vec<NodeId>> = if buffer_only {
+            // Later chains stop at the node the walk's previous backup ended on.
+            std::iter::once(path[..first].to_vec())
+                .chain(path[first..].iter().map(|&node| vec![node]))
+                .collect()
+        } else {
+            (first..=path.len())
+                .map(|len| path[..len].to_vec())
+                .collect()
+        };
+        assert_eq!(
+            chains, expected,
+            "buffer_only={buffer_only} inserted_len={inserted_len}"
+        );
+    }
+}
+
+#[test]
 fn backup_kv_action_stops_at_an_externally_stored_or_pending_ancestor() {
     let mut tc = core();
     tc.set_enable_external_cache_linker(true).unwrap();

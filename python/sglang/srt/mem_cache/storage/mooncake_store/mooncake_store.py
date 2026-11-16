@@ -617,6 +617,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     self.config.client_server_address,
                 )
             else:
+                from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import (
+                    MooncakeTransferEngine,
+                )
+
                 try:
                     from sglang.srt.distributed.parallel_state import (
                         get_mooncake_transfer_engine,
@@ -633,9 +637,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 # configuration matches the one used by MooncakeStore.
                 # PD may already have created an NVLink engine even when
                 # storage opted out of sharing in order to use RDMA.
+                # A TENT engine has no classic engine object for the store to drive.
                 if (
                     envs.SGLANG_HICACHE_MOONCAKE_REUSE_TE.get()
-                    and self._shared_mooncake_transfer_engine is not None
+                    and isinstance(
+                        self._shared_mooncake_transfer_engine, MooncakeTransferEngine
+                    )
                     and device_name
                     == self._shared_mooncake_transfer_engine.get_ib_device()
                     and self.config.metadata_server == "P2PHANDSHAKE"
@@ -962,7 +969,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
             return layout
 
-        if self.mem_pool_host.kv_buffer is not None:
+        # A HiCache host pool describes KV here; the direct linker's device pool
+        # group has no kv_buffer, and its KV entry is described with the others.
+        kv_described = self.mem_pool_host.kv_buffer is not None
+        if kv_described:
             suffixes, _, _ = self._batch_preprocess(
                 [""],
                 torch.arange(
@@ -980,7 +990,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         specs = {spec.pool_name: spec for spec in sidecar_pool_specs}
         trailing_pages = {PoolName.MAMBA: 1, **window_trailing_pages}
         for pool_name in self.registered_pools:
-            if pool_name == PoolName.KV:
+            if pool_name == PoolName.KV and kv_described:
                 continue
             spec = specs.get(pool_name)
             policy = (
@@ -1235,6 +1245,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 except ValueError:
                     boundary = kv_pages
                 pool_restorable = list(range(1, boundary + 1))
+            elif transfer.hit_policy == PoolHitPolicy.BLOCK_GROUPS:
+                # Compressed-block pools (DeepSeek-V4 C128) keep one key per
+                # block. Only endpoints of leading complete blocks are valid
+                # restore boundaries; the query span starts on a block boundary.
+                block = max(1, int(transfer.block_pages))
+                complete = 0
+                for idx in range(block - 1, kv_pages, block):
+                    if not page_exists[idx]:
+                        break
+                    complete += 1
+                boundary = complete * block
+                pool_restorable = list(range(block, boundary + 1, block))
             elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                 # A stop point works when the window ending there is complete,
                 # so scan every one instead of stopping at the longest.

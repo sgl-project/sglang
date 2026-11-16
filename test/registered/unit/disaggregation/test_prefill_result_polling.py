@@ -144,6 +144,7 @@ class _Scheduler(SchedulerDisaggregationPrefillMixin):
     continue_generation = Scheduler.continue_generation
     increment_scheduler_iterations = Scheduler.increment_scheduler_iterations
     _on_step_processed = Scheduler._on_step_processed
+    _release_mm_inputs = Scheduler._release_mm_inputs
 
     def __init__(
         self,
