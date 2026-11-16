@@ -61,7 +61,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import log_info_on_rank0
 
 logger = logging.getLogger(__name__)
 
@@ -291,12 +290,6 @@ class Step3TextDecoderLayer(nn.Module):
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
         # TODO: support shared experts fusion
-        # self.n_shared_experts = 1
-        # self.num_fused_shared_experts = (
-        #     0
-        #     if global_server_args.disable_shared_experts_fusion
-        #     else self.n_shared_experts
-        # )
         self.num_fused_shared_experts = 0
         rms_norm_eps = config.rms_norm_eps
         self.self_attn = Step3TextAttention(
@@ -566,15 +559,6 @@ class Step3VisionAttention(nn.Module):
 
         super().__init__()
         self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.out_proj = RowParallelLinear(
-            dim,
-            dim,
-            bias=True,
-            quant_config=quant_config,
-            prefix=add_prefix("out_proj", prefix),
-        )
-        self.scale = self.head_dim**-0.5
 
         self.attn = VisionAttention(
             embed_dim=dim,
@@ -645,7 +629,7 @@ class Step3VisionEmbeddings(nn.Module):
 
 
 class Step3VisionEncoderLayer(nn.Module):
-    def __init__(self, config, attn_implementation: str = "sdpa") -> None:
+    def __init__(self, config) -> None:
         super().__init__()
         self.embed_dim = config.hidden_size
         self.layer_norm1 = LayerNorm(self.embed_dim, eps=1e-6)
@@ -753,23 +737,14 @@ class Step3VLForConditionalGeneration(nn.Module):
         )
 
         # TODO: support shared experts fusion
-        # self.n_shared_experts = 1
-        # self.num_fused_shared_experts = (
-        #     0
-        #     if global_server_args.disable_shared_experts_fusion
-        #     else self.n_shared_experts
-        # )
         self.num_fused_shared_experts = 0
         self.config.tie_word_embeddings = False
-        if getattr(self.config, "tie_word_embeddings", False):
-            self.lm_head = self.model.embed_tokens
-        else:
-            self.lm_head = ParallelLMHead(
-                config.text_config.vocab_size,
-                config.text_config.hidden_size,
-                quant_config=quant_config,
-                prefix=add_prefix("lm_head", prefix),
-            )
+        self.lm_head = ParallelLMHead(
+            config.text_config.vocab_size,
+            config.text_config.hidden_size,
+            quant_config=quant_config,
+            prefix=add_prefix("lm_head", prefix),
+        )
         self.logits_processor = LogitsProcessor(config.text_config)
 
     def _get_vision_model_output(self, input_tensor: torch.Tensor) -> torch.Tensor:
@@ -923,10 +898,6 @@ class Step3VLForConditionalGeneration(nn.Module):
             (".gate_up_proj", ".up_proj", 1),
         ]
 
-        if self.num_fused_shared_experts > 0:
-            assert self.num_fused_shared_experts == 1
-            log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
-
         expert_params_mapping = FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
@@ -948,33 +919,6 @@ class Step3VLForConditionalGeneration(nn.Module):
             if "vision_model" in name:
                 name = name.replace("self_attn", "self_attn.attn")
                 name = name.replace("out_proj", "proj")
-
-            # TODO: support vision model
-            if self.num_fused_shared_experts > 0 and "share" in name:
-                # assert False
-                name = name.replace("share_expert", "moe")
-                for mapping in expert_params_mapping:
-                    param_name, weight_name, expert_id, shard_id = mapping
-                    if (
-                        expert_id != self.config.text_config.moe_num_experts
-                        or not match_expert_and_shard_ids(name, weight_name)
-                    ):
-                        continue
-
-                    part_name = weight_name.split(".")[-2]
-                    fake_weight_name = name.replace(part_name, weight_name[:-1])
-                    actual_param_name = name.replace(part_name + ".", param_name)
-                    param = params_dict[actual_param_name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
-                    break
-                continue
 
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -1011,7 +955,6 @@ class Step3VLForConditionalGeneration(nn.Module):
                         if not match_expert_and_shard_ids(name, weight_name):
                             continue
                         part_name = weight_name.split(".")[-2]
-                        fake_weight_name = name.replace(part_name, weight_name[:-1])
                         actual_param_name = name.replace(part_name + ".", param_name)
                         param = params_dict[actual_param_name]
                         weight_loader = param.weight_loader
