@@ -487,9 +487,6 @@ class GlmImageAttention(torch.nn.Module):
     ):
         super().__init__()
 
-        self.k_cache = None
-        self.v_cache = None
-
         self.heads = out_dim // dim_head if out_dim is not None else heads
         self.dim_head = dim_head
         self.inner_dim = out_dim if out_dim is not None else dim_head * heads

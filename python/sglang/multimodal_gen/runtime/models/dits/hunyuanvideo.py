@@ -212,7 +212,6 @@ class MMDoubleStreamBlock(nn.Module):
     ):
         super().__init__()
 
-        self.deterministic = False
         self.num_attention_heads = num_attention_heads
         tp_size = get_tp_world_size()
         self.local_num_attention_heads = divide(num_attention_heads, tp_size)
@@ -462,7 +461,6 @@ class MMSingleStreamBlock(nn.Module):
     ):
         super().__init__()
 
-        self.deterministic = False
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         tp_size = get_tp_world_size()

@@ -182,7 +182,6 @@ class MultiheadCrossAttention(nn.Module):
         data_width: Optional[int] = None,
         norm_layer=nn.LayerNorm,
         qk_norm: bool = False,
-        kv_cache: bool = False,
     ):
         super().__init__()
         self.width = width
@@ -198,20 +197,10 @@ class MultiheadCrossAttention(nn.Module):
             norm_layer=norm_layer,
             qk_norm=qk_norm,
         )
-        self.kv_cache = kv_cache
-        self.data = None
 
     def forward(self, x, data):
         x = self.c_q(x)
-        if self.kv_cache:
-            if self.data is None:
-                self.data = self.c_kv(data)
-                logger.info(
-                    "Save kv cache,this should be called only once for one mesh"
-                )
-            data = self.data
-        else:
-            data = self.c_kv(data)
+        data = self.c_kv(data)
         x = self.attention(x, data)
         x = self.c_proj(x)
         return x
