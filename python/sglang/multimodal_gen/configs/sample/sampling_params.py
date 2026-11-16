@@ -726,7 +726,7 @@ class SamplingParams:
                 f"got {self.x264_preset!r}"
             )
 
-        # Used by seconds() and video writer; fps <= 0 is always invalid.
+        # Used by the video writer; fps <= 0 is always invalid.
         if not isinstance(self.fps, int) or self.fps <= 0:
             raise ValueError(f"fps must be a positive int, got {self.fps!r}")
 
@@ -1114,12 +1114,6 @@ class SamplingParams:
         sampling_params._validate_with_pipeline_config(server_args.pipeline_config)
 
         return sampling_params
-
-    def output_size_str(self) -> str:
-        return f"{self.width}x{self.height}"
-
-    def seconds(self) -> float:
-        return self.num_frames / self.fps
 
     @staticmethod
     def add_cli_args(parser: Any) -> Any:
@@ -1835,20 +1829,6 @@ class SamplingParams:
         if explicit_fields is not None:
             self._explicit_fields = set(explicit_fields)
         self.__post_init__()
-
-    @property
-    def n_tokens(self) -> int:
-        # Calculate latent sizes
-        if self.height and self.width:
-            latents_size = [
-                (self.num_frames - 1) // 4 + 1,
-                self.height // 8,
-                self.width // 8,
-            ]
-            n_tokens = latents_size[0] * latents_size[1] * latents_size[2]
-        else:
-            n_tokens = -1
-        return n_tokens
 
 
 @dataclass

@@ -262,9 +262,3 @@ class ActionSamplingParams:
         if isinstance(cli_args.get("seed"), list) and len(cli_args["seed"]) == 1:
             cli_args["seed"] = cli_args["seed"][0]
         return cli_args
-
-    def output_size_str(self) -> str:
-        return "action"
-
-    def seconds(self) -> float:
-        return 0.0
