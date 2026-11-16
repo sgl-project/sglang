@@ -18,6 +18,7 @@ from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import PrefillAdder
 from sglang.srt.mem_cache.allocation_sizing import add_spec_decode_headroom_pages
 from sglang.srt.mem_cache.base_prefix_cache import (
+    EvictParams,
     InsertParams,
     MatchPrefixParams,
 )
@@ -311,6 +312,98 @@ class TestNoBufferCheckpointWindowProgress(CustomTestCase):
                         self._exercise(
                             prefix=prefix, retirement_enabled=retirement_enabled
                         )
+
+    def test_shared_prefix_survives_skips_and_owner_abort(self):
+        with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
+            bundle, allocator, cache, request, _ = self._make_request()
+            request.extend_end = request.kv.kv_committed_len = 16
+            cache.checkpoint(request, up_to=16)
+            peer = Req(
+                rid="peer",
+                origin_input_text="",
+                origin_input_ids=array("q", range(16)),
+                sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+            )
+            match = cache.match_prefix(
+                MatchPrefixParams(
+                    key=RadixKey(array("q", range(16))), cow_mamba=True, req=peer
+                )
+            )
+            self.assertEqual(match.device_prefix_len, 16)
+            self.assertIsNotNone(allocator.storage.acquire([peer]))
+            peer.last_node = match.last_device_node
+            peer.lock = cache.lock(peer.last_node)
+            peer.kv.protect_prefix(16)
+            peer.kv.kv_allocated_len = peer.kv.kv_committed_len = 16
+            shared_ids = cache.path_device_indices(peer.last_node)[:16]
+            bundle.req_to_token_pool.write(
+                (peer.kv.req_pool_idx, slice(0, 16)), shared_ids
+            )
+            state = allocator.state.pool.mamba_cache
+            owner_live = allocator.mamba_allocator.ids.translate(
+                request.kv.mamba_pool_idx.reshape(-1)
+            )
+            for view in (*state.conv, state.temporal):
+                if view.numel():
+                    view[:, owner_live] = 23
+            held = []
+            for frontier in (32, 48, 64, 80, 96):
+                while (slot := allocator.state_slots.alloc(1)) is not None:
+                    held.append(slot)
+                request.extend_end = request.kv.kv_committed_len = frontier
+                cache.checkpoint(request, up_to=frontier)
+                self.assertEqual(request.kv.cache_protected_len, 16)
+                self.assertFalse(allocator.verify_byte_accounting())
+            self.assertLess(allocator.swa_attn_allocator.allocated_count(), 96)
+            release_kv_cache(request, cache, checkpoint=False)
+            cache.evict(EvictParams(num_tokens=1000))
+            self.assertEqual(
+                cache.match_prefix(
+                    MatchPrefixParams(key=RadixKey(array("q", range(16))))
+                ).device_prefix_len,
+                16,
+            )
+            for layer, member in enumerate(
+                (allocator.full_attn_allocator, allocator.swa_attn_allocator)
+            ):
+                physical = member.ids.translate(shared_ids)
+                self.assertTrue(torch.all(physical >= 0))
+                marker = (
+                    torch.arange(16, dtype=torch.float16).reshape(-1, 1, 1)
+                    + layer * 100
+                )
+                torch.testing.assert_close(
+                    bundle.token_to_kv_pool.get_key_buffer(layer)[physical],
+                    marker.expand_as(
+                        bundle.token_to_kv_pool.get_key_buffer(layer)[physical]
+                    ),
+                )
+                torch.testing.assert_close(
+                    bundle.token_to_kv_pool.get_value_buffer(layer)[physical],
+                    (marker + 500).expand_as(
+                        bundle.token_to_kv_pool.get_value_buffer(layer)[physical]
+                    ),
+                )
+            state = allocator.state.pool.mamba_cache
+            # The peer has staged COW, but has not run its forward yet.
+            source = allocator.mamba_allocator.ids.translate(
+                peer.kv.mamba_cow_src_index.reshape(-1)
+            )
+            self.assertTrue(torch.all(source >= 0))
+            for view in (*state.conv, state.temporal):
+                if view.numel():
+                    self.assertTrue(torch.all(view[:, source] == 17))
+            release_kv_cache(peer, cache, checkpoint=False)
+            for slot in held:
+                allocator.state_slots.free(slot)
+            cache.evict(EvictParams(num_tokens=1000, mamba_num=1000))
+            for member in (
+                allocator.full_attn_allocator,
+                allocator.swa_attn_allocator,
+                allocator.mamba_allocator,
+            ):
+                self.assertEqual(member.allocated_count(), 0)
+            self.assertFalse(allocator.verify_byte_accounting())
 
     def test_repeated_failure_then_release(self):
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
