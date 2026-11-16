@@ -4,7 +4,7 @@ import triton.language as tl
 from triton.language.extra import libdevice
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
-from sglang.kernels.ops.inkling2.cute_grouped_nvfp4 import routed_swap_matmul
+from sglang.kernels.ops.gemm.inkling2_cute_grouped_nvfp4 import routed_swap_matmul
 
 PDL = is_arch_support_pdl()
 SWAP_AB_MAX_ROWS = 20480
@@ -157,7 +157,7 @@ def nvfp4_quantize(x: torch.Tensor):
 def _matmul_module():
     return load_jit(
         "inkling2_nvfp4",
-        cuda_files=["inkling2/nvfp4.cuh"],
+        cuda_files=["gemm/inkling2_nvfp4.cuh"],
         cuda_wrappers=[
             ("run", "inkling2_nvfp4::run"),
             ("run_swap", "inkling2_nvfp4::run_swap"),
@@ -178,7 +178,7 @@ def routed_quant_module(width: int):
     return load_jit(
         "inkling2_routed_quant",
         str(width),
-        cuda_files=["inkling2/routed_quant.cuh"],
+        cuda_files=["moe/inkling2_routed_quant.cuh"],
         cuda_wrappers=[
             ("quantize", f"inkling2_routed_quant::quantize<{width}>"),
             ("swiglu_quantize", f"inkling2_routed_quant::swiglu_quantize<{width}>"),

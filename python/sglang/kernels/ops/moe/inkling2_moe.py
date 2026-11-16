@@ -56,7 +56,7 @@ def mxfp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         and x.dtype == torch.bfloat16
         and x.shape[-1] % (32 * 3 * 16) == 0
     ):
-        from sglang.kernels.ops.inkling2.nvfp4 import routed_quant_module
+        from sglang.kernels.ops.gemm.inkling2_nvfp4 import routed_quant_module
 
         routed_quant_module(x.shape[-1]).mxfp8_quantize(
             x, values.view(torch.uint8), scales, _sm_count(x.device)
@@ -309,7 +309,7 @@ def _routed_rows_module(hidden, dtype, scaled, owned):
         str(dtype).split(".")[-1],
         str(scaled),
         str(owned),
-        cuda_files=["inkling2/routed_rows.cuh"],
+        cuda_files=["moe/inkling2_routed_rows.cuh"],
         cuda_wrappers=[
             ("run", f"inkling2_routed_rows::run<{hidden}, {cuda_type}, {flags}>")
         ],

@@ -10,7 +10,7 @@ PDL = is_arch_support_pdl()
 
 ROUTE_MAX_ROWS = 512
 ROUTE_MAX_IDS = 4096
-# Larger id counts sort with the CUDA kernel (route.cuh); the Triton bitonic sort
+# Larger id counts sort with the CUDA kernel (inkling2_route.cuh); the Triton bitonic sort
 # is faster below.
 ROUTE_CUDA_MIN_IDS = 512
 
@@ -203,7 +203,7 @@ def _route_metadata(
 def _route_module():
     return load_jit(
         "inkling2_route",
-        cuda_files=["inkling2/route.cuh"],
+        cuda_files=["moe/inkling2_route.cuh"],
         cuda_wrappers=[("route_metadata", "inkling2_route::route_metadata")],
     )
 

@@ -4,8 +4,8 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
-from sglang.kernels.ops.inkling2.moe import _row_expert, mxfp8_quantize
-from sglang.kernels.ops.inkling2.nvfp4 import routed_quant_module
+from sglang.kernels.ops.gemm.inkling2_nvfp4 import routed_quant_module
+from sglang.kernels.ops.moe.inkling2_moe import _row_expert, mxfp8_quantize
 
 PDL = is_arch_support_pdl()
 
@@ -276,7 +276,7 @@ def _sf_offsets(local, group, K: tl.constexpr):
 
 @triton.jit
 def _sf_base(Offsets, expert, K: tl.constexpr):
-    """Each expert's scales start on a 128-row boundary (mxfp8.cuh prepare)."""
+    """Each expert's scales start on a 128-row boundary (inkling2_mxfp8.cuh prepare)."""
     SCALE_K: tl.constexpr = (K + 127) // 128 * 4
     start = tl.load(Offsets + expert)
     return (start - tl.load(Offsets) + expert * 127) // 128 * 128 * SCALE_K, start
@@ -348,7 +348,7 @@ def _gather_routed_rows(
 def _cutlass_module():
     return load_jit(
         "inkling2_mxfp8",
-        cuda_files=["inkling2/mxfp8.cuh"],
+        cuda_files=["gemm/inkling2_mxfp8.cuh"],
         cuda_wrappers=[
             ("run", "inkling2_mxfp8::run"),
             ("workspace_size", "inkling2_mxfp8::workspace_size"),
