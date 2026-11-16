@@ -167,8 +167,11 @@ def validate_tactic(
         )
 
 
-def default_tactic(m: int, n: int, k: int, *, max_m: int = _MAX_M) -> SplitKTactic:
-    """Choose the default occupancy-oriented tactic."""
+def default_tactic(m: int, n: int, k: int) -> SplitKTactic:
+    """Choose the default occupancy-oriented tactic.
+
+    The rules are tuned for M <= 32; a larger-M caller passes its own tactic.
+    """
     if n <= 512:
         mma_m = 64
         mma_n = 16 if n == 512 and m > 24 else 8
@@ -204,7 +207,7 @@ def default_tactic(m: int, n: int, k: int, *, max_m: int = _MAX_M) -> SplitKTact
             else max_stages
         ),
     )
-    validate_tactic(tactic, m, n, k, max_m=max_m)
+    validate_tactic(tactic, m, n, k)
     return tactic
 
 
