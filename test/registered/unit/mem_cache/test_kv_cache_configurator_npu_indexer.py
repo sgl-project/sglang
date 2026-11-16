@@ -68,6 +68,7 @@ class TestNPUIndexerLayerLayout(CustomTestCase):
         ):
             result = configurator._build_ascend_mla_kv_pool(
                 max_total_num_tokens=64,
+                max_running_requests=4,
                 is_dsa_model=True,
             )
 
