@@ -1210,9 +1210,7 @@ class SchedulerMetricsReporter:
         if not self.scheduler.enable_hierarchical_cache:
             return
 
-        host_pool = getattr(
-            self.scheduler.tree_cache, "token_to_kv_pool_host", None
-        ) or getattr(self.scheduler.tree_cache, "full_kv_pool_host", None)
+        host_pool = getattr(self.scheduler.tree_cache, "full_kv_pool_host", None)
         assert host_pool is not None, "Host pool not found"
         host_total = host_pool.logical_size
         self.stats.hicache_host_used_tokens = host_total - host_pool.available_size()
