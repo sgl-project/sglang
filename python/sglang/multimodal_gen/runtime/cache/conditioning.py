@@ -473,14 +473,6 @@ class ConditioningCache:
         finally:
             self._group_entries.reset(token)
 
-    def reuses_results(self) -> bool:
-        """Whether ``run`` can return or keep a result here: across requests when
-        the cache has capacity, or within an open request group."""
-        return (
-            bool(self.max_bytes and _cross_request_cache.get())
-            or self._group_entries.get() is not None
-        )
-
     def _remember_group(self, key, output, owner, share_in_group):
         entries = self._group_entries.get()
         if entries is None:
@@ -767,8 +759,12 @@ def cached_vae_encode(fn):
 
     @wraps(fn)
     def wrapped(self, *args, **kwargs):
-        cache = _vae_encode_cache(self)
-        if cache is None:
+        cache = _inference_cache(self)
+        if cache is None or (
+            model_parallel_is_initialized()
+            and get_world_size() > 1
+            and not getattr(self, "conditioning_encode_is_rank_local", False)
+        ):
             return fn(self, *args, **kwargs)
         return cache.run(
             self,
@@ -779,24 +775,6 @@ def cached_vae_encode(fn):
         )
 
     return wrapped
-
-
-def _vae_encode_cache(vae):
-    cache = _inference_cache(vae)
-    if cache is None or (
-        model_parallel_is_initialized()
-        and get_world_size() > 1
-        and not getattr(vae, "conditioning_encode_is_rank_local", False)
-    ):
-        return None
-    return cache
-
-
-def vae_encode_is_cached(vae) -> bool:
-    """Whether a ``cached_vae_encode`` method of ``vae`` could reuse or keep a
-    result if called here. A disabled cache stays active with no capacity."""
-    cache = _vae_encode_cache(vae)
-    return cache is not None and cache.reuses_results()
 
 
 def _vae_numeric_settings(vae):

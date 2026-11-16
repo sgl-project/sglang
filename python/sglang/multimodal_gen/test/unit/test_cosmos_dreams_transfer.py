@@ -58,6 +58,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.cosmos3_simulation.transfer import (
     CONTROL_EMPHASIS_TEMPLATE,
     TRANSFER_SYSTEM_PROMPT,
+    CosmosDreamsTransferDecodingStage,
     align_pixel_frames_to_chunks,
     can_encode_while_decoding,
     check_direct_distortion,
@@ -400,20 +401,17 @@ class TestTransferFramesAndHistory(unittest.TestCase):
                 decode.wait(2)
             decode.close()
 
-    def test_only_a_cache_that_can_hit_holds_the_control_encode_back(self):
-        """``--disable-conditioning-cache`` leaves a cache without capacity
-        active; it must not make the encode wait for the whole clip."""
+    def test_a_conditioning_cache_does_not_hold_the_control_encode_back(self):
+        """A lookup would wait for the clip's last frame, so the encode of a
+        decoding clip starts whether or not the cache could hit."""
         vae = SimpleNamespace(training=False, use_feature_cache=True)
-        disabled, enabled = ConditioningCache(0), ConditioningCache(1 << 20)
-        with disabled.scope():
+        cache = ConditioningCache(1 << 20)
+        with cache.scope():
             self.assertTrue(can_encode_while_decoding(vae))
-            with disabled.group_scope():
-                self.assertFalse(can_encode_while_decoding(vae))
-        with enabled.scope():
-            self.assertFalse(can_encode_while_decoding(vae))
+            with cache.group_scope():
+                self.assertTrue(can_encode_while_decoding(vae))
         vae.use_feature_cache = False
-        with disabled.scope():
-            self.assertFalse(can_encode_while_decoding(vae))
+        self.assertFalse(can_encode_while_decoding(vae))
 
     def test_encode_of_a_decoding_clip_matches_the_finished_clip(self):
         """Encoding a clip group by group as it decodes gives the latent of the
@@ -803,6 +801,47 @@ class TestTransferDirectResize(unittest.TestCase):
             restore_transfer_output_size(
                 video, original_hw=(216, 384), model_hw=(480, 800)
             )
+
+    def test_only_a_composed_display_keeps_the_mp4_until_after_the_decode(self):
+        """The rollout's frames are the output, so the MP4 is encoded while they
+        decode unless the request shows the control or restores its size."""
+        stage = CosmosDreamsTransferDecodingStage.__new__(
+            CosmosDreamsTransferDecodingStage
+        )
+        stage.vae = SimpleNamespace(supports_decode_on_frames=True)
+        stage.sound_tokenizer = None
+        stage._guardrails = False
+
+        def batch(**display):
+            options = dict(show_control_condition=False, transfer_output_size="model")
+            return SimpleNamespace(
+                latents=torch.zeros(1, 4, 5, 6, 8),
+                extra={"transfer_plan": {"total_frames": 17}},
+                sampling_params=SimpleNamespace(**options | display),
+                action_latents=None,
+                audio_latents=None,
+                use_guardrails=None,
+            )
+
+        stages = (
+            "sglang.multimodal_gen.runtime.pipelines_core.stages."
+            "model_specific_stages.cosmos3"
+        )
+        with mock.patch(
+            f"{stages}.streamed_video_output_path", return_value="/tmp/transfer.mp4"
+        ):
+            stream = stage._encode_while_decoding(batch(), SimpleNamespace())
+            self.assertEqual(stream.save_file_path, "/tmp/transfer.mp4")
+            for display in (
+                dict(show_control_condition=True),
+                dict(transfer_output_size="original"),
+            ):
+                with self.subTest(display):
+                    self.assertIsNone(
+                        stage._encode_while_decoding(
+                            batch(**display), SimpleNamespace()
+                        )
+                    )
 
     def test_config_mode_and_control_sentence_default(self):
         config = CosmosDreamsTransferConfig()

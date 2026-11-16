@@ -2596,7 +2596,7 @@ class Cosmos3DecodingStage(PipelineStage):
             or (self._guardrails and batch.use_guardrails is not False)
             or (self.sound_tokenizer is not None and batch.audio_latents is not None)
             or batch.action_latents is not None
-            or batch.extra.get("transfer_plan") is not None
+            or self._transfer_display_is_composed(batch)
         ):
             return None
         save_file_path = streamed_video_output_path(
@@ -2613,6 +2613,11 @@ class Cosmos3DecodingStage(PipelineStage):
         if is_image_gen:
             return video.squeeze(2).permute(0, 2, 3, 1).cpu().numpy()
         return video.permute(0, 2, 3, 4, 1).cpu().numpy()
+
+    @staticmethod
+    def _transfer_display_is_composed(batch: Req) -> bool:
+        """Whether ``_compose_transfer_display`` may change the decoded frames."""
+        return batch.extra.get("transfer_plan") is not None
 
     @staticmethod
     def _compose_transfer_display(output: torch.Tensor, batch: Req) -> torch.Tensor:

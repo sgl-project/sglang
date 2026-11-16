@@ -181,14 +181,18 @@ Use `--component-residency` for memory-constrained deployments. Joint checkpoint
 register `lidar_encoder` and `lidar_decoder` separately from the camera `vae`.
 Bimanual overlaps causal VAE decode only when the VAE is resident; offloaded VAEs
 use the final serial decode stage. While it overlaps, a request that only saves its
-video also encodes the MP4 during the rollout. Set
+video also encodes the MP4 during the rollout. On an H200, set
 `SGLANG_DIFFUSION_COSMOS_DREAMS_ROLLOUT_STREAM_PRIORITY=1` to run the rollout on a
-higher-priority CUDA stream than the decode; measure it on your GPU first, since it
-only pays when the rollout leaves the GPU idle between kernels.
-Sim-Transfer encodes its control clip while the clip is still decoding when the
-server runs with `--disable-conditioning-cache`. With the cache on, the clip is
-decoded first, so that a repeated clip can skip the encode; prefer the flag when
-most requests bring a new clip.
+higher-priority CUDA stream than the decode: a 901-frame request finished 1.4 %
+faster with the full history and at least as much with a sliding window, for about
+1 GB more GPU memory. It is off by default because it only pays when the rollout
+leaves the GPU idle between kernels; an RTX 5880 Ada ran 3 % slower with it, so
+measure it first on other GPUs.
+Sim-Transfer encodes its control clip while the clip is still decoding, so the
+conditioning cache does not keep control latents: a lookup would wait for the
+clip's last frame. A request that only saves its video also encodes the MP4 during
+the VAE decode, unless it sets `show_control_condition` or
+`transfer_output_size="original"`.
 The causal pipelines default to `history_mode: auto`,
 which follows the export's training K/V window: a sliding cache over the artifact's
 `window_frames` and `sink_frames` when the export records `kv_cache_inference_size`, the

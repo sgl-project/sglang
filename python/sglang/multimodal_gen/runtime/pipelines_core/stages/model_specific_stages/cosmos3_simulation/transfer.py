@@ -34,7 +34,6 @@ from sglang.multimodal_gen.configs.models.dits.cosmos_dreams import (
     CosmosDreamsManifest,
     CosmosDreamsTransferHistoryProfile,
 )
-from sglang.multimodal_gen.runtime.cache.conditioning import vae_encode_is_cached
 from sglang.multimodal_gen.runtime.distributed import get_local_torch_device
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentUse,
@@ -451,12 +450,11 @@ def encode_control_latent(
 def can_encode_while_decoding(vae: Any) -> bool:
     """Whether the control encode may start before the clip has fully decoded.
 
-    Needs the VAE's cached causal encode, and no conditioning cache for it: the
-    cache looks the whole clip up first, and a hit skips the encode.
+    Needs the VAE's cached causal encode. Such a clip skips the conditioning
+    cache: a lookup hashes the whole clip, so even a hit waits for the last
+    frame, which takes longer than an encode that keeps up with the decode.
     """
-    # Asked in the state encode_control_latent calls the VAE in.
-    with torch.no_grad():
-        return vae.use_feature_cache and not vae_encode_is_cached(vae)
+    return vae.use_feature_cache
 
 
 def encode_decoding_control_latent(
@@ -1020,6 +1018,15 @@ class CosmosDreamsTransferRolloutStage(CosmosDreamsRolloutStage):
 class CosmosDreamsTransferDecodingStage(Cosmos3DecodingStage):
     """Cosmos3 decoding plus the optional restore of a directly resized clip to the
     control video's own size (``transfer_output_size="original"``)."""
+
+    @staticmethod
+    def _transfer_display_is_composed(batch: Req) -> bool:
+        # The rollout decodes exactly the plan's frames and no source video is
+        # kept for ``show_input``, so only these two options touch the output.
+        return (
+            batch.sampling_params.show_control_condition
+            or batch.sampling_params.transfer_output_size == TRANSFER_OUTPUT_ORIGINAL
+        )
 
     @staticmethod
     def _compose_transfer_display(output: torch.Tensor, batch: Req) -> torch.Tensor:
