@@ -20,11 +20,15 @@ from sglang.srt.system_prompt import (
     SystemPrefix,
     aligned_prefix_len_down,
     cap_mamba_donate_len,
+    is_system_prefix_cold_seeder,
     is_system_prefix_warm,
     probe_system_prefix_or_disable,
     resolve_system_prompt,
     reseed_mamba_boundary_after_match,
     seed_mamba_boundary,
+    should_pin_boundary_store,
+    skip_unfinished_donate_below_boundary,
+    suppress_branching_for_system_prefix,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -39,7 +43,7 @@ _MARKERS = {"<s>": 1, "「": 10, "」": 11, "』": 12}
 class _StubTokenizer:
     """Minimal chat-template tokenizer for exercising SystemPrefix."""
 
-    def __init__(self, top_bos: bool, stateful: bool = False, require_user: bool = False, noisy: bool = False):
+    def __init__(self, top_bos: bool, stateful: bool = False, require_user: bool = False, noisy: bool = False, effort_preamble: str = ""):
         self._id = {c: i + 20 for i, c in enumerate("abcdefghijklmnopqrstuvwxyz")}
         for d in "0123456789":
             self._id[d] = 30 + int(d)
@@ -51,6 +55,9 @@ class _StubTokenizer:
         self._require_user = require_user
         self._noisy = noisy
         self._noise = 0
+        # Qwen3.8-style reasoning preamble: injected into the system block
+        # unless enable_thinking=False is passed as a template kwarg.
+        self._effort_preamble = effort_preamble
 
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=False, **kw):
         if self._require_user and not any(m["role"] == "user" for m in messages):
@@ -64,8 +71,16 @@ class _StubTokenizer:
             out += f"<{len(messages)}>"
         if self._top_bos:
             out += "<s>"
+        inject = (
+            self._effort_preamble
+            and kw.get("enable_thinking") is not False
+            and any(m["role"] == "system" for m in messages)
+        )
         for m in messages:
-            out += f"<|{m['role']}|>{m['content']}"
+            content = m["content"]
+            if inject and m["role"] == "system":
+                content = self._effort_preamble + content
+            out += f"<|{m['role']}|>{content}"
         if add_generation_prompt:
             out += "」"
         return out
@@ -898,13 +913,360 @@ class _FakeArgs:
         trust_remote_code=True,
         mamba_cache_chunk_size=64,
         skip_tokenizer_init=False,
+        dp_size=1,
     ):
         self.system_prompt = system_prompt
         self.model_path = model_path
         self.tokenizer_path = tokenizer_path
         self.trust_remote_code = trust_remote_code
         self.mamba_cache_chunk_size = mamba_cache_chunk_size
+        self.dp_size = dp_size
         self.skip_tokenizer_init = skip_tokenizer_init
+
+
+class TestSuppressBranching(CustomTestCase):
+    """The branching re-track is dropped on fixed-system-prompt requests.
+
+    Regression: a KV hit extending >= one mamba chunk past the boundary state
+    (same-image retries, shared user-turn heads) used to set a branching
+    point, which classifies the request cold at the full slot factor. The
+    re-track only lays states whose donate keys cap_mamba_donate_len caps
+    back to the boundary -- they can never enter the tree, so the extra
+    slots per request bought nothing and exhausted the ratio-1-sized pool
+    ("Can not alloc mamba cache" / "need 15 slots for 5 reqs").
+    """
+
+    def test_boundary_set_drops_branching(self):
+        self.assertIsNone(suppress_branching_for_system_prefix(1472, 1408))
+        self.assertIsNone(suppress_branching_for_system_prefix(999999, 64))
+
+    def test_feature_off_keeps_branching(self):
+        # boundary unset (feature off) or falsy: the general hybrid re-track
+        # path stays intact.
+        self.assertEqual(suppress_branching_for_system_prefix(1472, None), 1472)
+        self.assertEqual(suppress_branching_for_system_prefix(1472, 0), 1472)
+
+    def test_no_branching_is_passthrough(self):
+        self.assertIsNone(suppress_branching_for_system_prefix(None, 1408))
+        self.assertIsNone(suppress_branching_for_system_prefix(None, None))
+
+
+class TestSkipIntermediateDonate(CustomTestCase):
+    """Sub-boundary unfinished donations are skipped under a fixed system prompt.
+
+    Regression (cold-start crash): during the cold-start wave every
+    chunked-prefill round donated an intermediate mamba state at its latest
+    64-token track boundary (512, 640, ... up to 1408) -- each holding a
+    pool slot while the request was in flight. Audits showed tens of
+    evictable intermediate states with ~a dozen running requests,
+    multiplying the cold slot cost and exhausting the pool before the first
+    request could finish and donate the real boundary ("Can not alloc mamba
+    cache"). No future request can resume from a shallower checkpoint
+    (every request covers the whole system block), so the intermediate
+    states buy nothing.
+    """
+
+    def test_below_boundary_skipped(self):
+        self.assertTrue(skip_unfinished_donate_below_boundary(512, 1408))
+        self.assertTrue(skip_unfinished_donate_below_boundary(1407, 1408))
+
+    def test_at_or_above_boundary_donates(self):
+        # cache_len == boundary (capped) is the one meaningful donation;
+        # > boundary cannot occur post-cap but must never be skipped.
+        self.assertFalse(skip_unfinished_donate_below_boundary(1408, 1408))
+        self.assertFalse(skip_unfinished_donate_below_boundary(2000, 1408))
+
+    def test_feature_off_keeps_default(self):
+        # No boundary (feature off / probe-disabled): the default
+        # donate-at-every-chunk-boundary behavior must stay intact.
+        self.assertFalse(skip_unfinished_donate_below_boundary(512, None))
+        self.assertFalse(skip_unfinished_donate_below_boundary(512, 0))
+
+    def test_none_cache_len_not_skipped(self):
+        # Callers handle None (no tracking) before reaching this check; the
+        # helper must not silently convert it into a skip.
+        self.assertFalse(skip_unfinished_donate_below_boundary(None, 1408))
+
+
+class TestColdSeeder(CustomTestCase):
+    """Cold-seeder classification drives the cold-start admission gate.
+
+    Regression (cold-start death spiral): the first wave of requests all
+    classified cold and were admitted together -- each held the full cold
+    slot count and the wave exhausted the ratio-1-sized pool before any
+    request finished donating the boundary state. The gate serializes cold
+    seeders to one in flight, so the classification must flag exactly the
+    boundary-carrying requests whose match did not reach a cached boundary
+    state. Boundary-less traffic must NEVER be classified a cold seeder or
+    the gate would serialize unrelated workloads.
+    """
+
+    def test_boundary_carrying_cold(self):
+        # First pass on an empty tree, and a match that stopped below the
+        # boundary (reseed keeps the seed).
+        self.assertTrue(is_system_prefix_cold_seeder(1408, 0, None))
+        self.assertTrue(is_system_prefix_cold_seeder(1408, 512, 1408))
+
+    def test_warm_not_seeder(self):
+        self.assertFalse(is_system_prefix_cold_seeder(1408, 1408, None))
+
+    def test_boundaryless_never_seeder(self):
+        self.assertFalse(is_system_prefix_cold_seeder(None, 0, None))
+        self.assertFalse(is_system_prefix_cold_seeder(0, 0, None))
+
+
+class TestPinBoundaryStore(CustomTestCase):
+    """Per-store boundary pinning decision.
+
+    Regression: the pin used to be one-shot and was consumed by the warmup
+    seed's donation -- the real traffic path's boundary state (stored later
+    by the first cold-serialized request) stayed evictable, so pressure
+    could drop the tree back to all-cold. Pinning on each NEW
+    boundary-length store fixes that; the key-length check must also
+    exclude sub-boundary rounds and warm no-op inserts (key 0 -- pinning
+    the root would lock the whole tree).
+    """
+
+    def test_new_boundary_store_pins(self):
+        self.assertTrue(should_pin_boundary_store(1408, 1408, False, 0))
+
+    def test_preexisting_store_not_pinned(self):
+        # mamba_exist: the store that created the pre-existing state pinned it.
+        self.assertFalse(should_pin_boundary_store(1408, 1408, True, 1))
+
+    def test_sub_boundary_or_empty_key_never_pins(self):
+        self.assertFalse(should_pin_boundary_store(1408, 512, False, 0))
+        self.assertFalse(should_pin_boundary_store(1408, 0, False, 0))
+
+    def test_feature_off_never_pins(self):
+        self.assertFalse(should_pin_boundary_store(None, 1408, False, 0))
+        self.assertFalse(should_pin_boundary_store(0, 1408, False, 0))
+
+    def test_cap_bounds_pinning(self):
+        self.assertFalse(should_pin_boundary_store(1408, 1408, False, 8))
+
+
+class _FakeTokenizerManager:
+    """Captures generate_request calls; enough of TokenizerManager for the
+    system_prefix_seed warmup (server_args + tokenizer + async request sink)."""
+
+    def __init__(self, server_args, tokenizer):
+        self.server_args = server_args
+        self.tokenizer = tokenizer
+        self.captured = []
+
+    async def generate_request(self, req, _):
+        self.captured.append(req)
+        yield {"text": "ok"}
+
+
+class TestSystemPrefixSeedWarmup(CustomTestCase):
+    """The opt-in warmup must seed a request that real traffic can match.
+
+    Guards the cold-start death spiral: without a seeded boundary state the
+    first wave of requests is all-cold on a pool sized for warm, and the
+    pool can die before any request finishes to donate the state. The seed
+    must carry the seam token stream (so the system block matches real
+    requests) and the boundary (so the donate is capped and the boundary
+    node gets pinned).
+    """
+
+    def _run_seed(self, server_args, tokenizer):
+        import asyncio
+
+        from sglang.srt.entrypoints.warmup import system_prefix_seed
+
+        tm = _FakeTokenizerManager(server_args, tokenizer)
+        asyncio.run(system_prefix_seed("null", tm))
+        return tm
+
+    def test_seed_carries_seam_stream_and_boundary(self):
+        tok = _StubTokenizer(top_bos=False)
+        tm = self._run_seed(_FakeArgs("SYS", mamba_cache_chunk_size=4), tok)
+        self.assertEqual(len(tm.captured), 1)
+        req = tm.captured[0]
+        sp = SystemPrefix(tok, "SYS")
+        sp.prepare(4, encode_kwargs={})
+        expected = sp.split_request(
+            [{"role": "system", "content": "SYS"}, {"role": "user", "content": "hi"}],
+            encode_kwargs={},
+        )
+        # The seed's token stream IS the seam stream: real chat requests match
+        # it along the whole system block.
+        self.assertEqual(req.input_ids, expected)
+        self.assertEqual(req.system_prefix_boundary, sp.boundary_len)
+
+    def test_seed_fans_out_per_dp_rank(self):
+        tok = _StubTokenizer(top_bos=False)
+        tm = self._run_seed(
+            _FakeArgs("SYS", mamba_cache_chunk_size=4, dp_size=4), tok
+        )
+        req = tm.captured[0]
+        # A batch of dp_size copies so every rank's tree can get seeded.
+        self.assertEqual(len(req.input_ids), 4)
+        for ids in req.input_ids:
+            self.assertEqual(ids, req.input_ids[0])
+
+    def test_feature_off_sends_nothing(self):
+        # --system-prompt unset (or cleared by the startup probe): the warmup
+        # must be a no-op, never a bare request without the boundary.
+        tm = self._run_seed(_FakeArgs(None), _StubTokenizer(top_bos=False))
+        self.assertEqual(tm.captured, [])
+
+    def test_probe_rejected_sends_nothing(self):
+        # Seam probe rejects (non-deterministic template): no seed; the first
+        # requests cold-start the boundary state.
+        tok = _StubTokenizer(top_bos=False, noisy=True)
+        tm = self._run_seed(_FakeArgs("SYS", mamba_cache_chunk_size=4), tok)
+        self.assertEqual(tm.captured, [])
+
+
+class TestColdStartGateDisengage(CustomTestCase):
+    """The cold-start gate disengages on real warm HITS, not on bare boundary
+    stores.
+
+    A stored-but-never-hit boundary state proves nothing about the tree
+    serving current traffic: a seed (or an earlier traffic pattern) whose
+    tokens diverge from the current requests' renders -- template
+    kwargs-dependent, e.g. Qwen3.8's thinking preamble -- stores a state
+    nothing matches. Disengaging on the store (the old behavior) released a
+    whole cold flood at the full cold slot count each (the 0-match OOM).
+    Escape hatch: after the stores cap with zero hits the workload
+    demonstrably doesn't reuse shared states, so the slot budget governs
+    instead of serializing it forever."""
+
+    def setUp(self):
+        from sglang.srt.managers.schedule_policy import PrefillAdder
+
+        PrefillAdder._cold_head_diag_logged = 0
+        self.PrefillAdder = PrefillAdder
+
+    def _adder(self, warm_hits: int, stores: int, in_flight_cold: int = 0):
+        # A bare instance (no __init__: it needs live pools) carrying just
+        # the fields the gate reads; methods stay properly bound.
+        adder = self.PrefillAdder.__new__(self.PrefillAdder)
+        adder.tree_cache = SimpleNamespace(
+            system_prefix_warm_hits=warm_hits,
+            system_prefix_boundary_stores=stores,
+        )
+        adder._running_cold_seeder_count = 0
+        adder.running_batch = None
+        adder.can_run_list = [self._req()] * in_flight_cold
+        return adder
+
+    def _req(self, boundary=64, prefix_len=0, branching=None):
+        return SimpleNamespace(
+            system_prefix_boundary=boundary,
+            prefix_len=prefix_len,
+            mamba_branching_seqlen=branching,
+            extra_key=None,
+            origin_input_ids=[1, 2, 3],
+        )
+
+    def _defers(self, adder, req):
+        # The real _cold_start_gate_active isinstance-checks against
+        # UnifiedRadixCache; the fake tree here is a namespace, so patch it.
+        with patch.object(
+            self.PrefillAdder, "_cold_start_gate_active", return_value=True
+        ):
+            return adder.cold_start_gate_defers(req)
+
+    def test_first_cold_seeder_admitted(self):
+        # The gate serializes: the FIRST cold seeder (none in flight) runs --
+        # it is the request that will donate the shared boundary state.
+        adder = self._adder(warm_hits=0, stores=0)
+        self.assertFalse(self._defers(adder, self._req()))
+
+    def test_store_without_hit_still_gates(self):
+        # The 0-match regression: an unmatched seed stored a boundary state
+        # and the old store-based disengage released the cold flood -- here
+        # a second cold seeder must stay deferred despite the store.
+        adder = self._adder(warm_hits=0, stores=1, in_flight_cold=1)
+        self.assertTrue(self._defers(adder, self._req()))
+
+    def test_warm_hit_disengages(self):
+        adder = self._adder(warm_hits=1, stores=1, in_flight_cold=1)
+        self.assertFalse(self._defers(adder, self._req()))
+
+    def test_stores_cap_escape_hatch(self):
+        # Distinct-head workload: many stores, zero hits -- stop serializing.
+        adder = self._adder(warm_hits=0, stores=8, in_flight_cold=1)
+        self.assertFalse(self._defers(adder, self._req()))
+        adder = self._adder(warm_hits=0, stores=7, in_flight_cold=1)
+        self.assertTrue(self._defers(adder, self._req()))
+
+    def test_warm_and_boundaryless_requests_pass(self):
+        adder = self._adder(warm_hits=0, stores=0)
+        self.assertFalse(self._defers(adder, self._req(prefix_len=64)))
+        self.assertFalse(self._defers(adder, self._req(boundary=None)))
+
+    def test_second_cold_seeder_deferred(self):
+        adder = self._adder(warm_hits=0, stores=0, in_flight_cold=1)
+        self.assertTrue(self._defers(adder, self._req()))
+
+    def test_diag_counter_survives_adder_rebuilds(self):
+        # The adder is rebuilt every scheduling pass; an instance counter
+        # reset each pass and spammed one line per pass (observed: 3299
+        # lines in one production run). The class-level counter caps at 5
+        # across ALL adder instances.
+        req = self._req()
+        for _ in range(8):
+            adder = self._adder(warm_hits=1, stores=1)
+            adder._log_cold_head_diag(req)
+        self.assertEqual(self.PrefillAdder._cold_head_diag_logged, 5)
+
+
+class TestTemplateKwargsVariantSeam(CustomTestCase):
+    """chat_template_kwargs can change the rendered system head -- Qwen3.8
+    injects a reasoning-effort preamble into the system block unless
+    ``enable_thinking=False`` is passed. Each kwargs set therefore needs its
+    own seam (SystemPrefix probed with those kwargs) so kwargs traffic warms
+    up on its own token path instead of never matching the default seed."""
+
+    def _tokenizer(self):
+        return _StubTokenizer(
+            top_bos=False,
+            require_user=True,
+            effort_preamble="Reasoning effort is set to xhigh.",
+        )
+
+    def test_kwargs_change_system_head(self):
+        tok = self._tokenizer()
+        default = SystemPrefix(tok, "SYS")
+        default.prepare(4, encode_kwargs={})
+        variant = SystemPrefix(tok, "SYS")
+        variant.prepare(4, encode_kwargs={}, template_kwargs={"enable_thinking": False})
+        self.assertTrue(default.enabled)
+        self.assertTrue(variant.enabled)
+        # Same system text, different rendered heads: the default carries
+        # the preamble (longer head), the variant does not.
+        self.assertNotEqual(default.seed_head_ids, variant.seed_head_ids)
+        self.assertGreater(
+            len(default.seed_head_ids), len(variant.seed_head_ids)
+        )
+        # Both boundaries stay chunk-aligned and shareable.
+        for seam in (default, variant):
+            self.assertGreaterEqual(seam.boundary_len, 4)
+            self.assertEqual(seam.boundary_len % 4, 0)
+
+    def test_variant_split_renders_with_its_kwargs(self):
+        tok = self._tokenizer()
+        variant = SystemPrefix(tok, "SYS")
+        variant.prepare(4, encode_kwargs={}, template_kwargs={"enable_thinking": False})
+        ids = variant.split_request(
+            [{"role": "system", "content": "SYS"}, {"role": "user", "content": "hi"}],
+            encode_kwargs={},
+        )
+        self.assertIsNotNone(ids)
+        self.assertEqual(ids, variant.seed_head_ids + tok.encode("<|user|>hi」"))
+
+    def test_token_head_matches_helper(self):
+        from sglang.srt.entrypoints.openai.serving_chat import _token_head_matches
+
+        self.assertTrue(_token_head_matches([1, 2, 3, 4], [1, 2, 3]))
+        self.assertTrue(_token_head_matches([1, 2, 3], [1, 2, 3]))
+        self.assertFalse(_token_head_matches([1, 2], [1, 2, 3]))
+        self.assertFalse(_token_head_matches([1, 3, 4], [1, 2, 3]))
 
 
 if __name__ == "__main__":
