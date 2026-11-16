@@ -199,9 +199,9 @@ class KvPoolView:
         """Tokens per page of the index-K buffer; None for a pool without one."""
         return getattr(self.pool, "index_page_size", None)
 
-    @property
-    def set_mla_kv_buffer(self) -> Callable[..., None]:
-        return self.pool.set_mla_kv_buffer
+    def set_mla_kv_buffer(self, *args: Any, **kwargs: Any) -> None:
+        # Forwards the loc argument untouched, as a pool write door must.
+        return self.pool.set_mla_kv_buffer(*args, **kwargs)
 
 
 class DsaView:
