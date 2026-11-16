@@ -871,6 +871,43 @@ def validate_prefill_decode_interval(server_args: Any):
         raise ValueError("--prefill-decode-interval must be non-negative.")
     if cfg.prefill_decode_interval_min_bs < 0:
         raise ValueError("--prefill-decode-interval-min-bs must be non-negative.")
+    if cfg.adaptive_prefill:
+        import math
+
+        if not all(
+            math.isfinite(value) and value > 0
+            for value in (cfg.adaptive_prefill_target_ms, cfg.adaptive_prefill_token_ms)
+        ):
+            raise ValueError("Adaptive prefill costs must be finite and positive")
+        if cfg.adaptive_prefill_max_decode_rounds < max(
+            1, cfg.prefill_decode_interval or 1
+        ):
+            raise ValueError(
+                "Adaptive maximum decode rounds must cover the cadence floor"
+            )
+        if (
+            not cfg.disable_overlap_schedule
+            or cfg.tp_size != 1
+            or cfg.pp_size != 1
+            or cfg.dp_size != 1
+            or cfg.attn_cp_size != 1
+            or cfg.dcp_size != 1
+            or cfg.nnodes != 1
+            or cfg.enable_dp_attention
+            or cfg.speculative_algorithm is not None
+            or cfg.enable_mixed_chunk
+            or cfg.enable_dynamic_chunking
+            or cfg.dllm_algorithm is not None
+            or cfg.num_continuous_decode_steps != 1
+            or cfg.schedule_policy != "fcfs"
+            or cfg.prefill_decode_interval_min_bs != 0
+            or cfg.disaggregation_mode != "null"
+        ):
+            raise ValueError(
+                "Adaptive prefill requires synchronous single-worker FCFS non-speculative "
+                "generation with min-bs=0, without mixed chunks, dynamic chunking "
+                "or disaggregation"
+            )
 
 
 def default_unset_prefill_decode_interval(server_args: Any):
