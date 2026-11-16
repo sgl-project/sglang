@@ -16,7 +16,7 @@ from openai.types.responses import (
     ResponseReasoningItem,
 )
 from openai.types.responses.response_function_tool_call import ResponseFunctionToolCall
-from openai_harmony import Conversation, Message, Role, ToolNamespaceConfig
+from openai_harmony import Author, Conversation, Message, Role, ToolNamespaceConfig
 from utils import (
     MockTemplateManager,
     MockTokenizerManager,
@@ -31,6 +31,7 @@ from xgrammar.testing import _is_grammar_accept_string
 from sglang.srt.entrypoints.context import (
     HarmonyContext,
     SimpleContext,
+    StreamingHarmonyContext,
 )
 from sglang.srt.entrypoints.harmony_utils import get_encoding
 from sglang.srt.entrypoints.openai.protocol import (
@@ -2500,6 +2501,53 @@ def test_standalone_builtin_tools_without_storage(response_serving):
     continuation = serving.tokenizer_manager.generate_request.call_args_list[1].args[0]
     assert "Search result: 42" in get_encoding().decode(continuation.input_ids)
     assert not serving.msg_store and not serving.response_store
+
+
+def _harmony_turn_ids(message):
+    # The parser starts inside the prompt's open assistant header.
+    return get_encoding().render_conversation(Conversation.from_messages([message]))[
+        2:
+    ]
+
+
+def _harmony_turn_chunks(output_ids, *, stream, prompt_tokens=5, cached_tokens=0):
+    # A stream delivers cumulative output_ids; a full response delivers one chunk.
+    sizes = range(1, len(output_ids) + 1) if stream else [len(output_ids)]
+    for size in sizes:
+        chunk = engine_chunk(None, size, finish=size == len(output_ids))
+        chunk["output_ids"] = output_ids[:size]
+        chunk["meta_info"].update(
+            prompt_tokens=prompt_tokens, cached_tokens=cached_tokens
+        )
+        yield chunk
+
+
+def test_streaming_harmony_context_continues_after_tool_output():
+    """A streamed turn that follows a builtin tool result is parsed from its
+    first token."""
+    call_ids = _harmony_turn_ids(
+        Message.from_role_and_content(Role.ASSISTANT, "print(1)")
+        .with_channel("commentary")
+        .with_recipient("python")
+    )
+    final_ids = _harmony_turn_ids(
+        Message.from_role_and_content(Role.ASSISTANT, "ok").with_channel("final")
+    )
+    tool_output = Message.from_author_and_content(
+        Author.new(Role.TOOL, "python"), "1"
+    ).with_recipient("assistant")
+
+    context = StreamingHarmonyContext([], {})
+    for chunk in _harmony_turn_chunks(call_ids, stream=True):
+        context.append_output(chunk)
+    context.append_output([tool_output])
+    context.render_for_completion()
+    for chunk in _harmony_turn_chunks(final_ids, stream=True):
+        context.append_output(chunk)
+
+    final = context.messages[-1]
+    assert final.channel == "final"
+    assert final.content[0].text == "ok"
 
 
 def test_pd_tool_continuation_stops_before_side_effect(response_serving):

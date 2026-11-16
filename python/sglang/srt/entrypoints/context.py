@@ -223,6 +223,8 @@ class StreamingHarmonyContext(HarmonyContext):
         else:
             # Handle the case of tool output in direct message format
             assert len(output) == 1, "Tool output should be a single message"
+            # The next turn is a new request whose output_ids start over.
+            self.num_processed_tokens = 0
             msg = output[0]
             # Sometimes the recipient is not set for tool messages,
             # so we set it to "assistant"
