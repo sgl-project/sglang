@@ -418,9 +418,10 @@ python -m sglang.launch_server \
 **Router command:**
 
 ```bash Command
-python -m sglang_router.launch_router --pd-disaggregation \
-  --prefill $PREFILL_ADDR 8998 \
-  --decode $DECODE_ADDR \
+sgl-router \
+  --model-id deepseek-ai/DeepSeek-V3.2-Exp \
+  --no-tokenizer \
+  --worker-urls $PREFILL_ADDR $DECODE_ADDR \
   --host 127.0.0.1 \
   --port 30000
 ```
