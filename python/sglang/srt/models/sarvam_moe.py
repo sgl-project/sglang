@@ -3,7 +3,6 @@
 - SarvamMoEForCausalLM (30B)
 """
 
-import math
 from enum import IntEnum, auto
 from functools import partial
 from typing import Any, Dict, Iterable, Optional, Tuple
@@ -43,7 +42,10 @@ from sglang.srt.layers.moe.utils import RoutingMethodType
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope
+from sglang.srt.layers.rotary_embedding.yarn import yarn_get_mscale
 from sglang.srt.layers.utils import get_layer_id
+from sglang.srt.layers.utils.common import add_prefix
+from sglang.srt.layers.utils.layer_list import make_pp_layers
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -61,6 +63,7 @@ from sglang.srt.models.bailing_moe import BailingMoEForCausalLM
 from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (
     DeepseekMHAForwardMixin,
 )
+from sglang.srt.models.utils import bind_or_assign
 from sglang.srt.runtime_context import (
     attention_backends,
     get_exec,
@@ -71,11 +74,8 @@ from sglang.srt.runtime_context import (
 )
 from sglang.srt.utils import (
     BumpAllocator,
-    add_prefix,
-    bind_or_assign,
     is_cuda,
     is_nvidia_cublas_version_ge_12_9,
-    make_pp_layers,
     next_power_of_2,
 )
 
@@ -521,7 +521,7 @@ class SarvamMoEMLAAttention(nn.Module):
         if rope_scaling and rope_scaling["type"] == "deepseek_yarn":
             mscale_all_dim = rope_scaling.get("mscale_all_dim", 1.0)
             scaling_factor = rope_scaling.get("factor", 1.0)
-            mscale = self.yarn_get_mscale(scaling_factor, float(mscale_all_dim))
+            mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
 
         self.attn_mqa = RadixAttention(
@@ -549,11 +549,6 @@ class SarvamMoEMLAAttention(nn.Module):
         self.w_kc = None
         self.w_vc = None
         self.w_scale = None
-
-    def yarn_get_mscale(self, scale: float = 1, mscale: float = 1) -> float:
-        if scale <= 1:
-            return 1.0
-        return 0.1 * mscale * math.log(scale) + 1.0
 
     def _concat_and_cast_mha_k(
         self,

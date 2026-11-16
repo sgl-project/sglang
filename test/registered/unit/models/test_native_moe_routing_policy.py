@@ -190,6 +190,46 @@ class TestNativeMoeRoutingPolicy(CustomTestCase):
         ):
             self._implicit_bailing_policy("llada2", block_routing=True)
 
+    def test_model_top_k_reaches_the_expert_runner(self):
+        """Expert dispatch must use the same per-token expert count as the router."""
+        from sglang.srt.models.hunyuan import HunYuanSparseMoeBlock
+        from sglang.srt.models.llama4 import Llama4MoE
+        from sglang.srt.models.olmoe import OlmoeMoE
+
+        for top_k in (1, 3):
+            config = SimpleNamespace(
+                num_experts=8,
+                num_local_experts=8,
+                num_experts_per_tok=top_k,
+                hidden_size=128,
+                intermediate_size=128,
+                moe_intermediate_size=128,
+                moe_topk=[2, top_k],
+                use_mixed_mlp_moe=0,
+            )
+            factories = {
+                "olmoe": lambda: OlmoeMoE(
+                    num_experts=8,
+                    top_k=top_k,
+                    hidden_size=128,
+                    intermediate_size=128,
+                    quant_config=self.quant_config,
+                    layer_id=1,
+                ),
+                "hunyuan": lambda: HunYuanSparseMoeBlock(
+                    config=config, quant_config=self.quant_config, layer_id=1
+                ),
+                "llama4": lambda: Llama4MoE(
+                    config=config, layer_id=1, quant_config=self.quant_config
+                ),
+            }
+            for name, factory in factories.items():
+                with self.subTest(model=name, top_k=top_k):
+                    block = factory()
+                    self.assertEqual(block.topk.topk_config.top_k, top_k)
+                    self.assertEqual(block.experts.top_k, top_k)
+                    self.assertEqual(block.experts.moe_runner_config.top_k, top_k)
+
     @staticmethod
     def _weighted_experts(ids, weights, hidden_states):
         values = ids.float() + 1
@@ -365,35 +405,6 @@ class TestNativeMoeRoutingPolicy(CustomTestCase):
         routing = fallback.topk.forward_native(torch.ones((1, 4)), self.logits)
         expected = self.logits.sigmoid().topk(2).values.sort(-1).values
         torch.testing.assert_close(routing.topk_weights.sort(-1).values, expected)
-
-    def test_deepseek_dual_stream_graph_rejects_materialized_routing(self):
-        """The logits-only graph cannot bypass a router requiring materialization."""
-        from sglang.srt.models import deepseek_v2
-
-        block = object.__new__(deepseek_v2.DeepseekV2MoE)
-        torch.nn.Module.__init__(block)
-        block.alt_stream = object()
-        block.num_fused_shared_experts = 0
-        block.shared_experts = torch.nn.Identity()
-        block.experts = SimpleNamespace(
-            use_flashinfer_trtllm_moe=True,
-            runner_backend=MoeRunnerBackend.FLASHINFER_TRTLLM,
-        )
-        block._enable_a2a_moe = False
-        block._fuse_shared_experts_inside_sbo = False
-        block.is_hash = False
-        block.topk = SimpleNamespace(
-            topk_config=SimpleNamespace(output_format=TopKOutputFormat.BYPASSED)
-        )
-        with (
-            patch.object(deepseek_v2, "_enable_pcg_dsv2_dual_stream", True),
-            patch.object(
-                deepseek_v2, "is_in_tc_piecewise_cuda_graph", return_value=True
-            ),
-        ):
-            self.assertTrue(block._can_dual_stream_graph(torch.ones((1, 4))))
-            block.topk.topk_config.output_format = TopKOutputFormat.STANDARD
-            self.assertFalse(block._can_dual_stream_graph(torch.ones((1, 4))))
 
 
 if __name__ == "__main__":

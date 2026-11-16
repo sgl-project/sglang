@@ -264,34 +264,6 @@ class RequestWindowSpec(msgspec.Struct, frozen=True, kw_only=True):
             raise ValueError("request-window extents must contain whole pages")
 
     @property
-    def request_parts(self):
-        from sglang.srt.mem_cache.kv.decl import RequestPartDecl, TensorPartDecl
-
-        layers = tuple(range(self.layers))
-        return (
-            RequestPartDecl(
-                part=TensorPartDecl(
-                    name="pages",
-                    shape=(
-                        self.capacity // self.page_size,
-                        self.kv_layout.page_bytes(self.page_size),
-                    ),
-                    dtype=torch.uint8,
-                    layer_ids=layers,
-                )
-            ),
-            RequestPartDecl(
-                part=TensorPartDecl(
-                    name="tags",
-                    shape=(self.capacity,),
-                    dtype=torch.int64,
-                    layer_ids=layers,
-                    reset_value=-1,
-                )
-            ),
-        )
-
-    @property
     def state_pages(self):
         # The historical state pool reserves a dummy page in its requested size
         # and another in the backing. PD page numbering includes both.
@@ -329,9 +301,9 @@ class RequestWindowSpec(msgspec.Struct, frozen=True, kw_only=True):
 def request_window_workspace_rows(
     num_slots: int, window: int, draft_tokens: int
 ) -> int:
+    from sglang.srt.layers.dp_attention import get_cuda_graph_max_batch_size
     from sglang.srt.model_executor.cuda_graph_config import Backend
     from sglang.srt.runtime_context import get_exec, get_schedule
-    from sglang.srt.utils.common import get_cuda_graph_max_batch_size
 
     graph_config = get_exec().graph.cuda_graph_config
     prefill = graph_config.prefill if graph_config is not None else None

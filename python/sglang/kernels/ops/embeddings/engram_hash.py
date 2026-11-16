@@ -418,6 +418,7 @@ def engram_hash_ids(
     block: int = 1,
     row: Optional[torch.Tensor] = None,
     starts: Optional[torch.Tensor] = None,
+    extend_bs: int = 0,
     image_token_id: Optional[int] = None,
     mm_pad_shift: int = 0,
     block_t: int = 32,
@@ -427,8 +428,10 @@ def engram_hash_ids(
 
     ``mode``: MODE_DECODE (row = t, offset 0), MODE_VERIFY (row = t // block),
     MODE_EXTEND (``row`` [num_real] and ``starts`` [bs] give each token's request and
-    the run's first token). ``history`` is [rows, n - 1] oldest first; with
-    ``req_slots`` given it is indexed by ``req_slots[row]``, else by ``row``.
+    the run's first token; with ``extend_bs`` the request is instead the last of the
+    ``extend_bs`` runs starting at or before the token). ``history`` is
+    [rows, n - 1] oldest first; with ``req_slots`` given it is indexed by
+    ``req_slots[row]``, else by ``row``.
     Tokens at or past ``num_real`` are padding: PAD ids, zero predecessors.
     """
     out, tokens = _launch_hash_kernel(
@@ -451,6 +454,7 @@ def engram_hash_ids(
         out_cache_loc=None,
         write_tokens=True,
         block_t=block_t,
+        extend_bs=extend_bs,
     )
     return out, tokens
 
