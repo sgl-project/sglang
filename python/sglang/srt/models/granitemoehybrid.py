@@ -482,10 +482,6 @@ class GraniteMoeHybridForCausalLM(
         "in_proj": ["in_proj"],
         "input_linear": ["input_linear"],
     }
-    embedding_modules = {
-        "embed_tokens": "input_embeddings",
-        "lm_head": "output_embeddings",
-    }
 
     def __init__(
         self,

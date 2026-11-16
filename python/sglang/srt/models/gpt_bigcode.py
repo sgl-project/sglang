@@ -243,13 +243,6 @@ class GPTBigCodeForCausalLM(nn.Module):
 
     supported_lora_modules = ["c_fc", "c_proj", "wte", "c_attn"]
 
-    embedding_modules = {
-        "wte": "input_embeddings",
-        "lm_head": "output_embeddings",
-    }
-
-    embedding_padding_modules = []
-
     def __init__(
         self,
         config: GPTBigCodeConfig,

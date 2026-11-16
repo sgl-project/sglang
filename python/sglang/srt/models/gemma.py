@@ -290,9 +290,6 @@ class GemmaForCausalLM(nn.Module):
         "gate_up_proj",
         "down_proj",
     ]
-    # Gemma does not apply LoRA to the embedding layer.
-    embedding_modules = {}
-    embedding_padding_modules = []
 
     def __init__(
         self,

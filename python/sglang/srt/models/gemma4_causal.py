@@ -1315,11 +1315,6 @@ class Gemma4ForCausalLM(PreTrainedModel):
         ],
     }
 
-    # Gemma does not apply LoRA to the embedding layer.
-    embedding_modules = {}
-    embedding_padding_modules = []
-    supports_lora = False
-
     def __init__(
         self,
         config: Gemma4TextConfig,

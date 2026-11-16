@@ -149,10 +149,6 @@ class Gemma3ForConditionalGeneration(PreTrainedModel):
         "gate_up_proj",
         "down_proj",
     ]
-    # Gemma does not apply LoRA to the embedding layer.
-    embedding_modules = {}
-    embedding_padding_modules = []
-    supports_lora = True
     # Pattern to match language model layers only (skip vision_tower and multi_modal_projector)
     lora_pattern = re.compile(
         r"^language_model\.model\.layers\.(\d+)\.(?:self_attn|mlp)\.(?:qkv_proj|o_proj|down_proj|gate_up_proj)"
