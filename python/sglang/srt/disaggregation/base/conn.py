@@ -68,6 +68,8 @@ class KVArgs:
     kv_cache_dtype_str: str
     # KV byte layout both PD roles must share; None for pools with only one.
     kv_layout: Optional[str] = None
+    # The pools this server's linker reads, so a PD decode skips writing the rest.
+    linker_pools: Optional[List[str]] = None
     host_kv_data_ptrs: Optional[List[int]] = None
     host_kv_data_lens: Optional[List[int]] = None
     host_kv_item_lens: Optional[List[int]] = None

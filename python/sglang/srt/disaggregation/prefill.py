@@ -369,6 +369,9 @@ class PrefillBootstrapQueue:
             self.scheduler.tp_worker.model_runner.kv_cache_dtype_str
         )
         kv_args.kv_layout = get_pd_kv_layout(self.token_to_kv_pool)
+        linker = getattr(self.scheduler.tree_cache, "linker", None)
+        if linker is not None:
+            kv_args.linker_pools = sorted(linker.cache_linker.pools)
         layer_shard_enabled = getattr(
             self.token_to_kv_pool, "layer_shard_enabled", False
         )

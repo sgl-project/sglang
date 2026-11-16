@@ -56,6 +56,9 @@ struct PrefillServerInfo {
     follow_bootstrap_room: bool,
     enable_dsa_cache_layer_split: bool,
     stores_to_linker: bool,
+    /// The linker pools prefill reads; absent when it does not report them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    linker_pools: Option<Vec<String>>,
     prefill_http_port: Option<i64>,
 }
 
@@ -129,6 +132,7 @@ struct Topology {
     follow_bootstrap_room: Option<bool>,
     enable_dsa_cache_layer_split: Option<bool>,
     stores_to_linker: Option<bool>,
+    linker_pools: Option<Vec<String>>,
     prefill_http_port: Option<i64>,
     /// Keyed `(dp_group, attn_cp_rank, attn_tp_rank, pp_rank)` — the flat form
     /// of Python's nested `prefill_port_table` dicts.
@@ -231,6 +235,8 @@ struct Route {
     enable_dsa_cache_layer_split: Option<bool>,
     #[serde(default)]
     stores_to_linker: Option<bool>,
+    #[serde(default)]
+    linker_pools: Option<Vec<String>>,
     /// The rank's PD state entries (Python `state_wire(kv_args)`); absent from
     /// a rank that registers none.
     #[serde(default)]
@@ -299,6 +305,9 @@ async fn route_put(State(state): State<Arc<Registry>>, Json(body): Json<Route>) 
             .get_or_insert(body.enable_dsa_cache_layer_split.unwrap_or(false));
         topo.stores_to_linker
             .get_or_insert(body.stores_to_linker.unwrap_or(false));
+        if topo.linker_pools.is_none() {
+            topo.linker_pools = body.linker_pools.clone();
+        }
         topo.prefill_ranks.insert(
             (dp_group, body.attn_cp_rank, body.attn_tp_rank, body.pp_rank),
             PrefillRankInfo {
@@ -393,6 +402,7 @@ async fn route_get(
             follow_bootstrap_room: topo.follow_bootstrap_room.unwrap_or(true),
             enable_dsa_cache_layer_split: topo.enable_dsa_cache_layer_split.unwrap_or(false),
             stores_to_linker: topo.stores_to_linker.unwrap_or(false),
+            linker_pools: topo.linker_pools.clone(),
             prefill_http_port: topo.prefill_http_port,
         })
         .into_response();
@@ -775,6 +785,23 @@ mod tests {
             assert!(info.get("state_wire").is_none(), "{info}");
             assert!(info.get("state_wires").is_none(), "{info}");
         }
+    }
+
+    #[test]
+    fn linker_pools_round_trip_through_the_sentinel() {
+        let (_rt, addr) = start_on_free_port();
+        let body = put_route(serde_json::json!({"linker_pools": ["kv", "mamba"]}));
+        assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
+        assert_eq!(
+            sentinel_info(addr)["linker_pools"],
+            serde_json::json!(["kv", "mamba"])
+        );
+
+        let (_rt, addr) = start_on_free_port();
+        let body = put_route(serde_json::json!({}));
+        assert_eq!(request(addr, "PUT", "/route", Some(&body)).0, 200);
+        let info = sentinel_info(addr);
+        assert!(info.get("linker_pools").is_none(), "{info}");
     }
 
     /// Every rank of one pipeline stage must register the same state entries:

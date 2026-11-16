@@ -798,6 +798,8 @@ class Req(ReqDllmMixin):
         self.bootstrap_room: Optional[int] = bootstrap_room
         # Prefix excluded from linker offload, in raw tokens before bigram/page alignment.
         self.linker_offload_skip_prefix_len = 0
+        # Pools a later reader loads; linker offload skips the others when set.
+        self.linker_offload_pools: Optional[List[str]] = None
         # Override embeds give KV that the token ids alone do not determine.
         self.skip_radix_cache_insert = (
             bootstrap_host == FAKE_BOOTSTRAP_HOST

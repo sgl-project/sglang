@@ -145,6 +145,8 @@ class PrefillServerInfo:
     # Each prefill shard-group rank owns a subset of logical KV pages.
     enable_kv_cache_sharding: bool = False
     stores_to_linker: bool = False
+    # The linker pools prefill reads; None when it does not report them.
+    linker_pools: Optional[List[str]] = None
 
     # PD true-retraction rebootstrap: the prefill's HTTP API port. The decode
     # already knows the prefill host (the bootstrap_addr host), so it can POST
@@ -1755,6 +1757,7 @@ class CommonKVManager(BaseKVManager):
             "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
             "enable_kv_cache_sharding": get_parallel().enable_kv_cache_sharding,
             "stores_to_linker": get_memory().enable_unified_cache_external_linker,
+            "linker_pools": getattr(self.kv_args, "linker_pools", None),
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
@@ -3211,6 +3214,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.enable_kv_cache_sharding: Optional[bool] = None
         self.stores_to_linker: Optional[bool] = None
+        self.linker_pools: Optional[List[str]] = None
         self.prefill_http_port: Optional[int] = None
         self.decode_allocation_policy = "early"
         self.prefill_port_table: Dict[
@@ -3379,6 +3383,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         if self.stores_to_linker is None:
             self.stores_to_linker = bool(data.get("stores_to_linker", False))
 
+        if self.linker_pools is None:
+            self.linker_pools = data.get("linker_pools")
+
         if system_dp_size == 1:
             dp_group = attn_dp_rank
         else:
@@ -3450,6 +3457,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 enable_kv_cache_sharding=bool(self.enable_kv_cache_sharding),
                 stores_to_linker=bool(self.stores_to_linker),
+                linker_pools=self.linker_pools,
                 prefill_http_port=self.prefill_http_port,
                 decode_allocation_policy=self.decode_allocation_policy,
             )
