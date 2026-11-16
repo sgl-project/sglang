@@ -18,6 +18,7 @@ import torch
 import torch.nn as nn
 
 from sglang.srt.configs.load_config import LoadConfig
+from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
 from sglang.srt.model_loader.loader import (
     BaseModelLoader,
     _initialize_model,
@@ -429,6 +430,13 @@ class IpcModelLoader(BaseModelLoader):
                 f"  buffers: {still_on_meta_buffers[:10]}"
                 f"{'...' if len(still_on_meta_buffers) > 10 else ''}"
             )
+
+        # The daemon exported the post-load scale tensors. Recover their
+        # process-local scalar copies without preparing the shared scales again.
+        for module in model.modules():
+            if isinstance(getattr(module, "quant_method", None), BaseKVCacheMethod):
+                module.k_scale_float = module.k_scale.item()
+                module.v_scale_float = module.v_scale.item()
 
         map_elapsed = time.perf_counter() - map_tic
 

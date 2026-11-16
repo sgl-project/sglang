@@ -516,5 +516,53 @@ class TestDaemonModeRefusesDiskLoad(CustomTestCase):
         self.assertIsNone(result)  # no real daemon at that socket -> absent
 
 
+class TestIpcKVScales(CustomTestCase):
+    def test_import_restores_scalars_without_reapplying_checkpoint_scaling(self):
+        from unittest.mock import patch
+
+        from sglang.srt.configs.load_config import LoadConfig, LoadFormat
+        from sglang.srt.layers.quantization.kv_cache import BaseKVCacheMethod
+        from sglang.srt.weight_cache.ipc_loader import IpcModelLoader
+
+        def build_model(*args):
+            model = torch.nn.Module()
+            model.quant_method = BaseKVCacheMethod(None)
+            model.quant_method.create_weights(model)
+            return model
+
+        owner = build_model()
+        owner.k_scale.fill_(0.5)
+        owner.v_scale.fill_(0.25)
+        with patch(
+            "sglang.srt.layers.quantization.kv_cache.is_fp8_fnuz", return_value=True
+        ):
+            owner.quant_method.process_weights_after_loading(owner)
+            versions = owner.k_scale._version, owner.v_scale._version
+            loader = IpcModelLoader(LoadConfig(load_format=LoadFormat.IPC_CACHE))
+            with (
+                patch(
+                    "sglang.srt.weight_cache.ipc_loader._initialize_model",
+                    side_effect=build_model,
+                ),
+                patch.object(
+                    loader._transport_backend,
+                    "import_tensor",
+                    side_effect=lambda entry: entry["tensor"],
+                ),
+            ):
+                client = loader._load_zero_copy_mode(
+                    SimpleNamespace(dtype=torch.float32),
+                    device_config=None,
+                    entries={
+                        name: {"tensor": getattr(owner, name)}
+                        for name in ("k_scale", "v_scale")
+                    },
+                    quant_config=None,
+                )
+        self.assertEqual((client.k_scale_float, client.v_scale_float), (1.0, 0.5))
+        self.assertEqual((owner.k_scale.item(), owner.v_scale.item()), (1.0, 0.5))
+        self.assertEqual((owner.k_scale._version, owner.v_scale._version), versions)
+
+
 if __name__ == "__main__":
     unittest.main()
