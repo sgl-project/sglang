@@ -355,6 +355,7 @@ This example uses Linux with NVIDIA CUDA, a local Hugging Face checkpoint for `Q
 
 ```bash
 export MX_GENERATOR_SOURCE_ORDER=OBJECT_STORAGE
+export SGLANG_ADMIN_API_KEY="<admin-key>"
 
 python -m sglang.launch_server \
   --model-path /models/Qwen3-30B-A3B \
@@ -379,19 +380,24 @@ For an S3-compatible service, also set `object_storage_endpoint_url` in this JSO
 | `flush_cache` | Flush serving caches after a successful update. | `true` |
 | `torch_empty_cache` | Also release unused CUDA allocator memory when flushing caches. | `false` |
 
-After the trainer publishes a READY version, pause generation, flush caches, refit, and resume. Replace `v1` with the published version ID:
+After the trainer publishes a READY version, pause generation, flush caches, refit, and resume. These are admin endpoints, so each call sends the admin key. Replace `v1` with the published version ID:
 
 ```python
+import os
+
 import requests
 
 server_url = "http://127.0.0.1:30000"
+headers = {"Authorization": f"Bearer {os.environ['SGLANG_ADMIN_API_KEY']}"}
 for endpoint, payload in (
     ("pause_generation", {"mode": "abort"}),
     ("flush_cache", {}),
     ("update_weights_from_modelexpress", {"weight_version": "v1", "flush_cache": False}),
     ("continue_generation", {}),
 ):
-    response = requests.post(f"{server_url}/{endpoint}", json=payload, timeout=900)
+    response = requests.post(
+        f"{server_url}/{endpoint}", json=payload, headers=headers, timeout=900
+    )
     response.raise_for_status()
 ```
 

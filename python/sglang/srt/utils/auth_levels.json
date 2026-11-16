@@ -76,6 +76,7 @@
   "/update_weights_from_disk": "admin_force",
   "/update_weights_from_distributed": "admin_force",
   "/update_weights_from_ipc": "admin_force",
+  "/update_weights_from_modelexpress": "admin_force",
   "/update_weights_from_tensor": "admin_force",
   "/v1/audio/transcriptions": "normal",
   "/v1/chat/completions": "normal",
