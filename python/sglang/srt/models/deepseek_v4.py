@@ -2113,9 +2113,7 @@ class MQALayer(MqaAttentionBase):
             stream_q.wait_event(q_lora_ready)
             q, _ = self.wq_b(q_lora)
             q = q.view(-1, self.n_local_heads, self.head_dim)
-            # V4 only (see _forward_prepare); V4.1 keeps Q un-normed.
-            if self.q_head_norm:
-                q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
+            q = torch_npu.npu_rms_norm(q, self.q_rms_norm_ones, self.eps)[0]
             cos4_q, sin4_q = self._get_npu_rope_position_cache(
                 forward_batch, positions, q.dtype, inverse=False
             )
