@@ -107,16 +107,18 @@ def test_hc_mix_splitk_matches_reference_and_repeats_bitwise(num_tokens):
 def test_splitk_dense_silu_serves_a_raised_max_m():
     """Above the default M bound only with a caller's ``max_m``."""
     from sglang.kernels.ops.gemm.dense_bf16_gemm_sm100_splitk_epilogue import (
-        default_tactic,
+        SplitKTactic,
         run_splitk_dense_silu,
+        validate_tactic,
     )
 
     m, n, k, scale = 64, LOWRANK, HC_COUNT * HIDDEN_SIZE, 1.0 / HC_COUNT
     x, w_down, _ = _make_inputs(m, torch.bfloat16)
     out = torch.empty((m, n), dtype=torch.bfloat16, device="cuda")
+    tactic = SplitKTactic(mma_m=64, mma_n=16, split_k=8, ab_stages=8)
     with pytest.raises(ValueError, match="M <= 32"):
-        default_tactic(m, n, k)
-    tactic = default_tactic(m, n, k, max_m=m)
+        validate_tactic(tactic, m, n, k)
+    validate_tactic(tactic, m, n, k, max_m=m)
     with pytest.raises(ValueError, match="M <= 32"):
         run_splitk_dense_silu(x, w_down.T, out, True, tactic, scale)
     run_splitk_dense_silu(x, w_down.T, out, True, tactic, scale, max_m=m)
