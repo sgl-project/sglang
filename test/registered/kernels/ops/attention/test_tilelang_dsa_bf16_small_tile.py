@@ -9,13 +9,14 @@ from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-small")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 
 @unittest.skipUnless(
     torch.cuda.is_available()
     and torch.version.hip is None
-    and torch.cuda.get_device_capability()[0] == 12,
-    "CUDA SM12x required",
+    and torch.cuda.get_device_capability()[0] in (9, 10, 12),
+    "CUDA SM90, SM10x or SM12x required",
 )
 class TestTileLangDSABF16SmallTile(CustomTestCase):
     def _check_attention(self, heads, direct_factory):
@@ -60,6 +61,8 @@ class TestTileLangDSABF16SmallTile(CustomTestCase):
 
     def test_public_dispatch_matches_torch(self):
         """BF16 512+64 attention must fit SM12x shared memory and match torch."""
+        # On SM12x this exercises the resource-safe tile; on Hopper/SM10x
+        # the original 64-row selection must retain the same semantics.
         for heads in (8, 16):
             with self.subTest(heads=heads):
                 self._check_attention(heads, direct_factory=False)
