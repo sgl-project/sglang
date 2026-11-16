@@ -12,6 +12,7 @@ from sglang.srt.managers.io_struct import (
     PluginWeightUpdateReqInput,
     PluginWeightUpdateReqOutput,
     ReleaseMemoryOccupationReqInput,
+    ResumeMemoryOccupationReqInput,
 )
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
@@ -734,6 +735,30 @@ class TestReleaseMemoryRefusal(_WeightUpdaterManagerTestBase):
 
         self.assertFalse(output.success)
         manager.memory_saver_adapter.pause.assert_not_called()
+
+
+class TestResumeMemoryOccupation(_WeightUpdaterManagerTestBase):
+    def test_kv_resume_restores_padding(self):
+        with torch.inference_mode():
+            req_to_token = torch.tensor([[0, 0], [11, 11]], dtype=torch.int32)
+
+        def resume(tag):
+            # Simulate remapping without preserving the padding row.
+            with torch.inference_mode():
+                req_to_token[0].fill_(123)
+
+        target = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(req_to_token=req_to_token)
+        )
+        manager = self._manager(target, session=False)
+        manager.scheduler = None
+        manager.memory_saver_adapter = SimpleNamespace(enabled=True, resume=resume)
+        manager.offload_tags.add("kv_cache")
+        manager.resume_memory_occupation(
+            ResumeMemoryOccupationReqInput(tags=["kv_cache"])
+        )
+
+        self.assertEqual(req_to_token.tolist(), [[0, 0], [11, 11]])
 
 
 class TestPluginWeightUpdateReply(CustomTestCase):
