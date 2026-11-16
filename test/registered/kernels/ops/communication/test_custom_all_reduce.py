@@ -74,6 +74,8 @@ TEST_ALGOS = [
     AllReduceAlgo.TWO_SHOT_PUSH,
     AllReduceAlgo.TWO_SHOT_PULL,
 ]
+# 2 KB slices per ring channel: every size streams through many FIFO loops
+RING_SMALL_FIFO_BYTES = 4 * 1024
 USE_GRAPH_OPTIONS = [False, True]
 TEST_LAYERS = 4
 TEST_LOOP = 16
@@ -159,11 +161,18 @@ def _init_nccl_group_once() -> dist.ProcessGroup:
 
 
 @cache_once
-def _init_comm_once(max_push_blocks: int | None = None) -> CustomAllReduceV2:
+def _init_comm_once(
+    max_push_blocks: int | None = None, ring_simple_buffer_size: int | None = None
+) -> CustomAllReduceV2:
     cpu_group = _init_cpu_group_once()
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     max_size = max(TEST_SIZES) * max(
         torch.tensor([], dtype=d).element_size() for d in TEST_DTYPES
+    )
+    ring_kwargs = (
+        {}
+        if ring_simple_buffer_size is None
+        else {"ring_simple_buffer_size": ring_simple_buffer_size}
     )
     comm = CustomAllReduceV2(
         cpu_group,
@@ -171,6 +180,7 @@ def _init_comm_once(max_push_blocks: int | None = None) -> CustomAllReduceV2:
         max_pull_size=max_size,
         max_push_size=max_size,
         max_push_blocks=max_push_blocks,
+        **ring_kwargs,
     )
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
@@ -212,16 +222,41 @@ def test_two_shot_push_single_block(
     )
 
 
+@pytest.mark.parametrize("use_graph", USE_GRAPH_OPTIONS)
+@pytest.mark.parametrize("dtype", TEST_DTYPES)
+@pytest.mark.parametrize("size", TEST_SIZES)
+@torch.inference_mode()
+def test_ring_simple(size: int, dtype: torch.dtype, use_graph: bool) -> None:
+    _check_custom_all_reduce(size, dtype, None, use_graph, _init_comm_once())
+
+
+@pytest.mark.parametrize("use_graph", USE_GRAPH_OPTIONS)
+@pytest.mark.parametrize("dtype", TEST_DTYPES)
+@pytest.mark.parametrize("size", TEST_SIZES)
+@torch.inference_mode()
+def test_ring_small_fifo(size: int, dtype: torch.dtype, use_graph: bool) -> None:
+    comm = _init_comm_once(ring_simple_buffer_size=RING_SMALL_FIFO_BYTES)
+    _check_custom_all_reduce(size, dtype, None, use_graph, comm)
+
+
 def _check_custom_all_reduce(
     size: int,
     dtype: torch.dtype,
-    algo: AllReduceAlgo,
+    algo: AllReduceAlgo | None,
     use_graph: bool,
     comm: CustomAllReduceV2,
 ) -> None:
+    """``algo`` None runs the ring all-reduce, which is not a forced-algo choice."""
+    if algo is None:
+        if comm._ring is None:
+            pytest.skip("the ring all-reduce is only enabled on ROCm gfx1250")
+        comm.forced_algo = None
+        reduce = comm._ring.all_reduce
+    else:
+        comm.forced_algo = algo
+        reduce = comm.custom_all_reduce
     nccl_group = _init_nccl_group_once()
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
-    comm.forced_algo = algo
 
     if use_graph:
         graph = torch.cuda.CUDAGraph()
@@ -231,7 +266,7 @@ def _check_custom_all_reduce(
             # the reference NCCL group's watchdog thread queries events meanwhile
             with torch.cuda.graph(graph, capture_error_mode="thread_local"):
                 for i in range(TEST_LAYERS):
-                    outs.append(comm.custom_all_reduce(graph_inp[i]))
+                    outs.append(reduce(graph_inp[i]))
                 out_jit_stack = torch.stack(outs)
         torch.cuda.synchronize()
 
@@ -246,14 +281,14 @@ def _check_custom_all_reduce(
             eager_inp = x.clone()
             outs = []
             for i in range(TEST_LAYERS):
-                outs.append(comm.custom_all_reduce(eager_inp[i]))
+                outs.append(reduce(eager_inp[i]))
                 torch.cuda.synchronize()
             return torch.stack(outs)
 
     for _ in range(TEST_LOOP):
         # NOTE: 15 * 8 < 128, which is the precision limit for bf16
         inp = torch.randint(0, 16, (TEST_LAYERS, size), dtype=dtype, device=device)
-        assert comm.should_custom_ar(inp[0])
+        assert algo is None or comm.should_custom_ar(inp[0])
         out_ref = inp.clone()
         dist.all_reduce(out_ref, group=nccl_group)
         out_jit = run(inp)
@@ -293,6 +328,28 @@ def test_custom_all_reduce_tuned_eager(size: int, dtype: torch.dtype) -> None:
         torch.testing.assert_close(
             out_ref, _eager_all_reduce(comm, inp), atol=0, rtol=0
         )
+
+
+@torch.inference_mode()
+def test_custom_all_reduce_tuned_ring() -> None:
+    """Where the tuned table picks ring_simple, eager calls launch it."""
+    comm = _init_comm_once()
+    comm.forced_algo = None
+    nbytes = 64 * 1024 * 1024
+    config = choose_algo(comm.config, nbytes, can_use_graph=False)
+    if config is None or not config.use_ring:
+        pytest.skip("the tuned table does not pick ring_simple on this system")
+    device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
+
+    def rank_input(rank: int) -> torch.Tensor:
+        gen = torch.Generator(device=device).manual_seed(rank)
+        shape = (2, nbytes // 2)
+        return torch.randint(0, 16, shape, generator=gen, device=device).bfloat16()
+
+    inp = rank_input(comm.rank)
+    assert comm.should_custom_ar(inp[0])
+    expected = sum(rank_input(r).float() for r in range(comm.world_size)).bfloat16()
+    torch.testing.assert_close(expected, _eager_all_reduce(comm, inp), atol=0, rtol=0)
 
 
 @torch.inference_mode()

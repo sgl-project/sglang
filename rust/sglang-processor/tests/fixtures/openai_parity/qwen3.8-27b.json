@@ -240,7 +240,7 @@
             "completion_tokens": 2,
             "prompt_tokens_details": null,
             "reasoning_tokens": 0,
-            "completion_tokens_details": null
+            "completion_tokens_details": {"reasoning_tokens": 0}
           },
           "metadata": {
             "weight_version": "default",
@@ -312,7 +312,7 @@
             "completion_tokens": 2,
             "prompt_tokens_details": null,
             "reasoning_tokens": 0,
-            "completion_tokens_details": null
+            "completion_tokens_details": {"reasoning_tokens": 0}
           },
           "metadata": {
             "weight_version": "default",
@@ -548,7 +548,7 @@
             "completion_tokens": 4,
             "prompt_tokens_details": null,
             "reasoning_tokens": 0,
-            "completion_tokens_details": null
+            "completion_tokens_details": {"reasoning_tokens": 0}
           },
           "metadata": {
             "weight_version": "default",
@@ -665,7 +665,7 @@
             "completion_tokens": 26,
             "prompt_tokens_details": null,
             "reasoning_tokens": 0,
-            "completion_tokens_details": null
+            "completion_tokens_details": {"reasoning_tokens": 0}
           },
           "metadata": {
             "weight_version": "default",
@@ -1029,7 +1029,7 @@
             "completion_tokens": 103,
             "prompt_tokens_details": null,
             "reasoning_tokens": 0,
-            "completion_tokens_details": null
+            "completion_tokens_details": {"reasoning_tokens": 0}
           },
           "metadata": {
             "weight_version": "default",
@@ -1123,7 +1123,7 @@
             "completion_tokens": 30,
             "prompt_tokens_details": null,
             "reasoning_tokens": 0,
-            "completion_tokens_details": null
+            "completion_tokens_details": {"reasoning_tokens": 0}
           },
           "metadata": {
             "weight_version": "default",
