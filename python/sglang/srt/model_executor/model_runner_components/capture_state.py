@@ -46,8 +46,8 @@ def prepare_capture_state(
 
 
 def _probe_flashinfer_norm_cluster_size() -> None:
-    # FlashInfer >= 0.7.4 loads and unloads a module on its first norm kernel,
-    # which breaks a capture; restored graphs run no warmup forward that does it first.
+    # FlashInfer >= 0.7.4 loads a module on its first norm kernel, which breaks SAVE's
+    # capture (no eager forward before it); drop once FlashInfer probes outside capture.
     try:
         from flashinfer.norm.utils import get_sm_version, max_cluster_n
     except ImportError:
