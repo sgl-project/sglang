@@ -6,6 +6,7 @@ import os
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
+from sglang.multimodal_gen import envs
 from sglang.multimodal_gen.configs.sample.sampling_params import (
     SamplingParams,
     _sanitize_filename,
@@ -61,9 +62,9 @@ class ActionSamplingParams:
         self.data_type = DataType.ACTION
         self._validate()
 
-        env_steps = os.environ.get("SGLANG_TEST_NUM_INFERENCE_STEPS")
+        env_steps = envs.SGLANG_TEST_NUM_INFERENCE_STEPS
         if env_steps is not None and self.num_inference_steps is not None:
-            self.num_inference_steps = int(env_steps)
+            self.num_inference_steps = env_steps
 
     build_request_extra = SamplingParams.build_request_extra
 
@@ -261,9 +262,3 @@ class ActionSamplingParams:
         if isinstance(cli_args.get("seed"), list) and len(cli_args["seed"]) == 1:
             cli_args["seed"] = cli_args["seed"][0]
         return cli_args
-
-    def output_size_str(self) -> str:
-        return "action"
-
-    def seconds(self) -> float:
-        return 0.0

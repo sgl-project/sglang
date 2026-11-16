@@ -48,8 +48,6 @@ class JoyImageEditPipelineConfig(ImagePipelineConfig):
         default_factory=lambda: (Qwen3VLConfig(),)
     )
 
-    enable_torch_compile: bool = False
-
     # Precision for each component
     precision: str = "bf16"
     vae_precision: str = "bf16"

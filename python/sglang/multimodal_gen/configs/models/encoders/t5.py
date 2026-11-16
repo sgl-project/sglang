@@ -1,7 +1,6 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-import argparse
 from dataclasses import dataclass, field
 
 from sglang.multimodal_gen.configs.models.encoders.base import (
@@ -78,9 +77,3 @@ class T5Config(TextEncoderConfig):
     arch_config: TextEncoderArchConfig = field(default_factory=T5ArchConfig)
 
     prefix: str = "t5"
-
-    @staticmethod
-    def add_cli_args(
-        parser: argparse.ArgumentParser, prefix: str = "t5-config"
-    ) -> argparse.ArgumentParser:
-        return parser
