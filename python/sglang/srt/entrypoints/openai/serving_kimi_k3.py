@@ -21,6 +21,10 @@ if TYPE_CHECKING:
 KIMI_K3_IMAGE_PLACEHOLDER = "<|kimi_image_placeholder|>"
 KIMI_K3_IMAGE_PLACEHOLDER_ESCAPED = "<| kimi_image_placeholder |>"
 
+KIMI_K3_IMAGE_SLOT = "<|media_pad|>"
+# Kimi has no dedicated video padding token, so we use "<|media_content|>" instead.
+KIMI_K3_VIDEO_SLOT = "<|media_content|>"
+
 
 # OpenAI effort tiers mapped onto the nearest K3 level; K3.1 adds "medium".
 _KIMI_K3_LEVEL_BY_TIER = {
@@ -147,7 +151,7 @@ class KimiK3ChatEncodingAdapter:
     ) -> list[int]:
         # The encoder renders tools from the request and thinking from the
         # template kwargs; the handler collects the media.
-        messages, image_count, assistant_prefix = self._prepare_messages(
+        messages, image_prompts, assistant_prefix = self._prepare_messages(
             messages, request
         )
         template_kwargs = dict(request.chat_template_kwargs or {})
@@ -162,8 +166,8 @@ class KimiK3ChatEncodingAdapter:
                     f"chat_template_kwargs cannot set {key!r}; "
                     "use the request fields instead."
                 )
-        if image_count:
-            template_kwargs["image_prompts"] = ["<|media_pad|>"] * image_count
+        if image_prompts:
+            template_kwargs["image_prompts"] = image_prompts
 
         ctk_effort = template_kwargs.get("thinking_effort")
         if ctk_effort is not None and ctk_effort not in self._level_by_tier.values():
@@ -223,8 +227,8 @@ class KimiK3ChatEncodingAdapter:
         self,
         messages: list[dict[str, Any]],
         request: ChatCompletionRequest,
-    ) -> tuple[list[dict[str, Any]], int, str | None]:
-        image_count = 0
+    ) -> tuple[list[dict[str, Any]], list[str], str | None]:
+        image_prompts = []
         for index, message in enumerate(messages):
             content = message.get("content")
             if isinstance(content, list):
@@ -247,7 +251,11 @@ class KimiK3ChatEncodingAdapter:
                         if isinstance(image, str):
                             image = {"url": image, "detail": part.get("detail")}
                         parts.append({"type": "image_url", "image_url": image})
-                        image_count += 1
+                        image_prompts.append(KIMI_K3_IMAGE_SLOT)
+                    elif part_type == "video_url":
+                        # The encoder renders each media part as an image slot.
+                        parts.append({"type": "image_url", "image_url": {"url": ""}})
+                        image_prompts.append(KIMI_K3_VIDEO_SLOT)
                 message["content"] = parts
             elif isinstance(content, str):
                 message["content"] = neutralize_kimi_k3_image_placeholder(content)
@@ -291,4 +299,4 @@ class KimiK3ChatEncodingAdapter:
             messages, assistant_prefix = self._hooks.split_assistant_prefix(
                 messages, request
             )
-        return messages, image_count, assistant_prefix
+        return messages, image_prompts, assistant_prefix

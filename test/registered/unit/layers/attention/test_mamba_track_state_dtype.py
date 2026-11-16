@@ -189,6 +189,8 @@ class TestTrackMambaStateDtype(CustomTestCase):
             head_q_dim=2,
             head_k_dim=2,
             head_v_dim=2,
+            A_log=torch.zeros(1),
+            dt_bias=torch.zeros(1),
         )
         batch = SimpleNamespace(
             forward_mode=ForwardMode.EXTEND,
@@ -232,9 +234,13 @@ class TestTrackMambaStateDtype(CustomTestCase):
 
                     def extend(q, k, v, g, beta, **kwargs):
                         self.assertEqual(kwargs["layer_id"], layer.layer_id)
+                        self.assertIs(kwargs["A_log"], layer.A_log)
+                        self.assertIs(kwargs["dt_bias"], layer.dt_bias)
+                        self.assertTrue(kwargs["needs_track_state"])
                         self.assertIs(
                             kwargs["extend_prefix_lens"], batch.extend_prefix_lens
                         )
+                        self.assertNotIn("has_initial_state", kwargs)
                         torch.testing.assert_close(
                             kwargs["cache_indices"], expected_indices
                         )
@@ -262,7 +268,9 @@ class TestTrackMambaStateDtype(CustomTestCase):
                     backend._prefill_gates = Mock(return_value=(None, None))
                     backend.kernel_dispatcher = object.__new__(GDNKernelDispatcher)
                     backend.kernel_dispatcher.extend_kernel = SimpleNamespace(
-                        supports_track_state_snapshot=snapshot, extend=extend
+                        supports_track_state_snapshot=snapshot,
+                        defers_prefill_gates=False,
+                        extend=extend,
                     )
                     # Exercise the GPU gather policy with CPU tensors and fake kernels.
                     with (

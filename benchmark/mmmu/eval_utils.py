@@ -35,6 +35,7 @@ class EvalArgs:
     extra_request_body: Optional[str] = None
     profile: bool = False
     profile_number: int = 5
+    admin_api_key: Optional[str] = None
     concurrency: int = 1
     max_new_tokens: Optional[int] = None
     temperature: Optional[float] = None
@@ -90,6 +91,12 @@ class EvalArgs:
             type=int,
             default=EvalArgs.profile_number,
             help="Number of samples to profile. If not set, will profile all samples.",
+        )
+        parser.add_argument(
+            "--admin-api-key",
+            type=str,
+            default=EvalArgs.admin_api_key,
+            help="The server's --admin-api-key, which --profile requires (default: SGLANG_ADMIN_API_KEY).",
         )
         parser.add_argument(
             "--concurrency",
