@@ -15,6 +15,7 @@ from sglang.kernels.ops.quantization.hadamard import (
     hadamard_transform_20n,
     hadamard_transform_28n,
     hadamard_transform_40n,
+    precompile_hadamard,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -357,7 +358,7 @@ def test_hadamard_transform_scale_one(dtype):
 
 # Test dimensions for M×N variants: dim = M * N where N = 2^k.
 # M = 12/20/28/40 are the non-power-of-2 Hadamard sizes registered in
-# python/sglang/kernels/ops/attention/hadamard.py (Hadamard12NKernel, ..., Hadamard40NKernel).
+# python/sglang/kernels/ops/quantization/hadamard.py (hadamard_transform_12n, ..., _40n).
 # range(2,9) gives N = 4,8,...,256 so dims cover a practical range.
 _12N_DIMS = [12 * (2**k) for k in range(2, 9)]  # 48, 96, ... , 3072
 _20N_DIMS = [20 * (2**k) for k in range(2, 9)]  # 80, 160, ... , 5120
@@ -373,6 +374,24 @@ def _mn_cases(dims):
             (dims[len(dims) // 2], torch.float16),
             (dims[-1], torch.bfloat16),
         ],
+    )
+
+
+@pytest.fixture(scope="module", autouse=True)
+def _prebuild_modules() -> None:
+    """Build every (dtype, variant, size) module the cases reach at once; one at a
+    time they take minutes."""
+    from functools import partial
+
+    from sglang.kernels.jit.utils import parallel_compile
+
+    cases = {(d, t, 1) for d, t in _POWER_OF_TWO_CASES + _NON_POWER_OF_TWO_CASES}
+    cases |= {(d, t, 1) for d in (64, 256) for t in (torch.float16, torch.bfloat16)}
+    for m, dims in ((12, _12N_DIMS), (20, _20N_DIMS), (28, _28N_DIMS), (40, _40N_DIMS)):
+        cases |= {(d, t, m) for d, t in _mn_cases(dims)}
+    parallel_compile(
+        partial(precompile_hadamard, t, d, m, 8 if m == 1 else 4 * m)
+        for d, t, m in sorted(cases, key=str)
     )
 
 

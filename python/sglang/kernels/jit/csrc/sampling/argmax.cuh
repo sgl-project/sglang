@@ -4,6 +4,7 @@
 #include <sgl_kernel/once.h>
 #include <sgl_kernel/tensor.h>
 
+#include <sgl_kernel/math.cuh>
 #include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/type.cuh>
 #include <sgl_kernel/utils.cuh>
@@ -24,12 +25,6 @@ using ArgMaxHandle = unsigned long long;
 
 /// Balanced config on both B200 and H200
 inline constexpr uint32_t kArgMaxThreads = 512;
-
-/// \brief Map a float onto an unsigned key whose integer order matches the float order.
-SGL_DEVICE uint32_t to_ordered(float val) {
-  const auto bits = __float_as_uint(val);
-  return (bits & 0x80000000u) ? ~bits : (bits ^ 0x80000000u);
-}
 
 struct alignas(8) ArgMaxPair {
   float val;
@@ -110,10 +105,10 @@ __global__ void argmax_kernel(const ArgMaxParams params) {
       if (gridDim.x == 1) {
         static_cast<IdxType*>(params.output)[token_id] = static_cast<IdxType>(max_idx);
       } else {
-        // -0.0 and +0.0 tie under `>` but not under `to_ordered`; key both as +0.0 so the
+        // -0.0 and +0.0 tie under `>` but not under `math::to_ordered`; key both as +0.0 so the
         // lowest-index rule also holds across CTAs.
         const auto key_val = (__float_as_uint(max_val) << 1) == 0 ? 0.0f : max_val;
-        const auto payload = static_cast<ArgMaxHandle>(to_ordered(key_val)) << 32 | ~max_idx;
+        const auto payload = static_cast<ArgMaxHandle>(device::math::to_ordered(key_val)) << 32 | ~max_idx;
         atomicMax(params.handle + token_id, payload);
       }
     }

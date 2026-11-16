@@ -481,9 +481,12 @@ def test_sparse_mla_q8kv8_prefill_rejects_bad_buffers():
     with pytest.raises(ValueError):
         _call(max_logits=shared, lse=shared)
 
-    # d_v != 512.
+    # d_v != 512, with and without a caller-owned out.
     with pytest.raises(ValueError):
         _call(d_v=256)
+    good_out = torch.empty((s_q, H_Q, D_V), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError):
+        _call(d_v=256, out=good_out)
 
 
 # ---------------------------------------------------------------------------

@@ -87,6 +87,7 @@ from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.kernels.deepseek_v4.common import (
     ceil_ue8m0_exp_ref,
     fp4_e2m1_code_ref,
+    make_legacy_context,
 )
 from sglang.test.kernels.deepseek_v4.fp4_index_k_reference import (
     read_fp4_index_k_split,
@@ -524,10 +525,7 @@ def test_fp4_fused_norm_rope_store_layout(num_tokens: int) -> None:
         torch.arange(1, num_tokens + 1, device=get_device(), dtype=torch.int64)
         * compress_ratio
     )
-    req_pool_indices = torch.arange(num_tokens, device=get_device(), dtype=torch.int64)
-    plan = CompressorDecodePlan.generate_legacy(
-        compress_ratio, req_pool_indices, seq_lens
-    )
+    plan = make_legacy_context(num_tokens, compress_ratio).make_decode_plan(seq_lens)
     loc = torch.arange(num_tokens, device=get_device(), dtype=torch.int64)
     rope_len = int(seq_lens.max().item()) + 1
     cos, sin, freqs_cis = _rope_tables(rope_len)

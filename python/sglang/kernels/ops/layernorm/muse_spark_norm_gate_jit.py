@@ -18,8 +18,27 @@ if TYPE_CHECKING:
 
 
 @cache_once
-def _jit_module(dtype: torch.dtype, head_dim: int) -> Module:
-    args = make_cpp_args(dtype, head_dim, is_arch_support_pdl())
+def precompile_rms_norm_gate(
+    dtype: torch.dtype,
+    head_dim: int,
+    num_heads: int,
+    has_norm: bool,
+    has_weight: bool,
+    has_gate: bool,
+    single_group: bool,
+) -> Module:
+    """One module per layer shape and flags; it holds every (vector width, block)
+    variant the kernel may pick per call, so no token count compiles at runtime."""
+    args = make_cpp_args(
+        dtype,
+        head_dim,
+        num_heads,
+        has_norm,
+        has_weight,
+        has_gate,
+        single_group,
+        is_arch_support_pdl(),
+    )
     return load_jit(
         "muse_spark_norm_gate",
         *args,
@@ -28,24 +47,11 @@ def _jit_module(dtype: torch.dtype, head_dim: int) -> Module:
     )
 
 
-def _grouped_gate_view(
-    x: torch.Tensor, gate: torch.Tensor, head_dim: int
-) -> torch.Tensor:
-    """Zero-copy ``[tokens, groups, group_width]`` view of a flat or grouped gate."""
+def _grouped_gate_view(gate: torch.Tensor) -> torch.Tensor:
+    """Zero-copy ``[tokens, groups, group_width]`` view of a flat or grouped gate;
+    the launcher checks its sizes and strides."""
     assert gate.ndim in (2, 3), "gate must be 2D or 3D"
-    if gate.ndim == 2:
-        assert gate.shape == x.shape, "flat gate shape must match x"
-        gate = gate.unsqueeze(1)
-    else:
-        assert gate.shape[0] == x.shape[0], "gate token dimension must match x"
-    assert gate.stride(-1) == 1, "gate's innermost dimension must be contiguous"
-    assert gate.shape[-1] % head_dim == 0, (
-        "gate group width must be divisible by head_dim"
-    )
-    assert gate.shape[1] * gate.shape[2] == x.shape[-1], (
-        "grouped gate width must match x"
-    )
-    return gate
+    return gate.unsqueeze(1) if gate.ndim == 2 else gate
 
 
 def rms_norm_gate(
@@ -57,7 +63,6 @@ def rms_norm_gate(
     eps: float = 0.0,
     has_norm: bool = True,
     out: torch.Tensor | None = None,
-    config: int = -1,
 ) -> torch.Tensor:
     """``rms_norm(x) * weight * sigmoid(gate)``, per head, with all parts optional.
 
@@ -68,8 +73,6 @@ def rms_norm_gate(
     :param weight: ``[head_dim]`` effective weight (zero-centered gamma resolved
                    by the caller), same dtype as ``x``. Ignored when
                    ``has_norm`` is False.
-    :param config: index into the kernel's (vector width, warps per block) table;
-                   -1 selects it from the shape. Only for tuning sweeps.
     """
     assert x.is_contiguous(), "x must be contiguous"
     assert x.shape[-1] % head_dim == 0
@@ -80,18 +83,21 @@ def rms_norm_gate(
     x_rows = x.reshape(-1, head_dim)
     out_rows = out.reshape(-1, head_dim)
 
+    single_group = True
     if gate is not None:
-        gate = _grouped_gate_view(x, gate, head_dim)
+        gate = _grouped_gate_view(gate)
+        single_group = gate.shape[1] == 1
+    if not has_norm:
+        weight = None
 
-    module = _jit_module(x.dtype, head_dim)
-    module.rms_norm_gate(
-        x_rows,
-        gate,
-        weight if has_norm else None,
-        out_rows,
+    module = precompile_rms_norm_gate(
+        x.dtype,
+        head_dim,
         num_heads,
-        float(eps),
-        bool(has_norm),
-        int(config),
+        has_norm,
+        weight is not None,
+        gate is not None,
+        single_group,
     )
+    module.rms_norm_gate(x_rows, gate, weight, out_rows, float(eps))
     return out

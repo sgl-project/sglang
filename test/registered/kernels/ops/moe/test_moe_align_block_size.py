@@ -41,9 +41,10 @@ MOE_ALIGN_CASES = get_ci_test_range(
 def test_moe_align_block_size_compare_implementations(
     block_size, num_tokens, topk, num_experts, pad_sorted_token_ids
 ):
+    # The kernel reads topk_ids flat, so it must be contiguous.
     topk_ids = torch.argsort(torch.rand(num_tokens, num_experts, device="cuda"), dim=1)[
         :, :topk
-    ]
+    ].contiguous()
 
     max_num_tokens_padded = topk_ids.numel() + (num_experts + 1) * (block_size - 1)
     if topk_ids.numel() < num_experts + 1:

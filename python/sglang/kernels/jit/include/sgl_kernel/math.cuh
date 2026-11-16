@@ -139,6 +139,17 @@ SGL_DEVICE float2 add_f32x2(float2 a, float2 b) {
 }
 
 /**
+ * \brief Maps a float onto an unsigned key whose integer order matches the float order.
+ *
+ * A negative value has every bit flipped, any other only its sign bit, so -0.0 keys just
+ * below +0.0 and a NaN keys beyond the infinity of its sign.
+ */
+SGL_DEVICE uint32_t to_ordered(float val) {
+  const auto bits = __float_as_uint(val);
+  return bits ^ (static_cast<uint32_t>(static_cast<int32_t>(bits) >> 31) | 0x80000000u);
+}
+
+/**
  * \brief Fast uint32 division and modulo by a compile-time constant divisor.
  *
  * This struct is only exact when the divisor is less than `2^31`. Larger dividends

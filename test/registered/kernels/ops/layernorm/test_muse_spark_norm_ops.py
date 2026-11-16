@@ -27,12 +27,39 @@ def _bf16_module(module):
     return module.to(device="cuda", dtype=torch.bfloat16)
 
 
+@pytest.fixture(scope="module")
+def _prebuild_norm_gate() -> None:
+    """Build every JIT signature the norm-gate cases reach at once."""
+    from functools import partial
+
+    from sglang.kernels.jit.utils import parallel_compile
+    from sglang.kernels.ops.layernorm.muse_spark_norm_gate_jit import (
+        precompile_rms_norm_gate,
+    )
+
+    parallel_compile(
+        partial(
+            precompile_rms_norm_gate,
+            torch.bfloat16,
+            64,
+            16,
+            has_norm,
+            has_weight,
+            gate_groups is not None,
+            gate_groups in (None, 1),
+        )
+        for has_norm, has_weight in ((True, False), (True, True), (False, False))
+        for gate_groups in (None, 1, 4)
+    )
+
+
 @pytest.mark.parametrize("backend", _BACKENDS)
 @pytest.mark.parametrize("num_tokens", [1, 9, 300])
 @pytest.mark.parametrize(
     "has_norm, has_weight", [(True, False), (True, True), (False, False)]
 )
 @pytest.mark.parametrize("gate_groups", [None, 1, 4])
+@pytest.mark.usefixtures("_prebuild_norm_gate")
 def test_rms_norm_gate_matches_native(
     backend, num_tokens, has_norm, has_weight, gate_groups
 ):

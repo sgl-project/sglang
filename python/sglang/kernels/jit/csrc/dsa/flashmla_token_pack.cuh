@@ -3,6 +3,7 @@
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <cub/block/block_scan.cuh>
@@ -238,8 +239,7 @@ inline void flashmla_token_pack_prepare(
   constexpr uint32_t kSmemBytes = kTable * sizeof(int32_t);
   const DLDevice dl_device = device.unwrap();
   const DeviceGuard device_guard{dl_device.device_id};
-  // Set on every call: the attribute is per device, and a launch may target another device than the last.
-  CHECK_CUDA(cudaFuncSetAttribute(prepare_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, kSmemBytes));
+  runtime::set_max_dynamic_smem_per_device<prepare_kernel>(dl_device, kSmemBytes);
   LaunchKernel(static_cast<uint32_t>(groups), kThreads, dl_device, kSmemBytes)(prepare_kernel, params);
 }
 

@@ -15,9 +15,12 @@
 //
 // Single-block launch. `phy_prob` lives in shared memory.
 
+#pragma once
+
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
 
+#include <sgl_kernel/runtime.cuh>
 #include <sgl_kernel/utils.cuh>
 
 #include <dlpack/dlpack.h>
@@ -85,25 +88,42 @@ void lp_post(
     tvm::ffi::TensorView log2phy) {
   using namespace host;
 
-  SymbolicDevice device_;
-  TensorMatcher({NUM_LOGICAL, MAX_COPIES}).with_dtype<float>().with_device<kDLGPU>(device_).verify(log2phy_prob);
-  TensorMatcher({NUM_SINGLE}).with_dtype<float>().with_device<kDLGPU>(device_).verify(t1);
-  TensorMatcher({NUM_SINGLE}).with_dtype<int64_t>().with_device<kDLGPU>(device_).verify(phy_single);
-  TensorMatcher({NUM_RED_PHY}).with_dtype<int64_t>().with_device<kDLGPU>(device_).verify(phy_replicated);
-  TensorMatcher({NUM_LOGICAL, MAX_COPIES}).with_dtype<int64_t>().with_device<kDLGPU>(device_).verify(log2phy);
-  // x has shape (NV,) which we don't constrain at this layer.
+  auto device_ = SymbolicDevice{};
+  device_.set_options<kDLGPU>();
+  TensorMatcher({NUM_LOGICAL, MAX_COPIES})  // log2phy_prob
+      .with_dtype<float>()
+      .with_device(device_)
+      .verify(log2phy_prob);
+  TensorMatcher({-1})  // x, (NV,): only x[:NUM_RED_PHY] is read
+      .with_dtype<float>()
+      .with_device(device_)
+      .verify(x);
+  TensorMatcher({NUM_SINGLE})  // t1
+      .with_dtype<float>()
+      .with_device(device_)
+      .verify(t1);
+  TensorMatcher({NUM_SINGLE})  // phy_single
+      .with_dtype<int64_t>()
+      .with_device(device_)
+      .verify(phy_single);
+  TensorMatcher({NUM_RED_PHY})  // phy_replicated
+      .with_dtype<int64_t>()
+      .with_device(device_)
+      .verify(phy_replicated);
+  TensorMatcher({NUM_LOGICAL, MAX_COPIES})  // log2phy
+      .with_dtype<int64_t>()
+      .with_device(device_)
+      .verify(log2phy);
+  CHECK_HOST(x.size(0) >= NUM_RED_PHY) << "lp_post: x has " << x.size(0) << " entries, needs " << NUM_RED_PHY;
 
   constexpr int PHY_PROB_SIZE = NUM_SINGLE + NUM_RED_PHY + 1;
   const size_t smem_bytes = PHY_PROB_SIZE * sizeof(float);
 
-  using KernelT = void (*)(float*, const float*, const float*, const int64_t*, const int64_t*, const int64_t*);
-  KernelT kernel = lp_post_kernel<NUM_LOGICAL, MAX_COPIES, NUM_SINGLE, NUM_RED_PHY, BLOCK_DIM>;
-
+  constexpr auto kernel = lp_post_kernel<NUM_LOGICAL, MAX_COPIES, NUM_SINGLE, NUM_RED_PHY, BLOCK_DIM>;
+  const auto device = device_.unwrap();
   if (smem_bytes > 48 * 1024) {
-    cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
+    runtime::set_max_dynamic_smem_per_device<kernel>(device, smem_bytes);
   }
-
-  const DLDevice device = device_.unwrap();
   LaunchKernel(/*grid=*/1, /*block=*/BLOCK_DIM, device, smem_bytes)(
       kernel,
       static_cast<float*>(log2phy_prob.data_ptr()),
