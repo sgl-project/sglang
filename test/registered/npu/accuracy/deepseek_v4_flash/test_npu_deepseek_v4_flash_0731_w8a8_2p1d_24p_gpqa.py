@@ -30,7 +30,7 @@ register_npu_ci(
 # contribution (all 16 ranks live on the prefill node, so the node donates
 # 16 x 4GB = 64GB).
 HICACHE_STORAGE_EXTRA_CONFIG = build_hicache_storage_extra_config(
-    world_size=16,
+    world_size=32,
     protocol="device_sdma",
     dram_size="4GB",
 )
