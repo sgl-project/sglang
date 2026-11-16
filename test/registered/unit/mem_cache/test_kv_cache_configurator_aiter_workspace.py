@@ -46,22 +46,36 @@ def _gemma_3_12b(**overrides):
     return _llama_8b(num_attention_heads=16, head_dim=256, **overrides)
 
 
-def _per_row(model):
+def _per_row(model, context_len=None):
     return kcc.aiter_decode_workspace_bytes_per_row(
         num_heads=model.num_attention_heads,
         head_dim=model.head_dim,
-        context_len=model.context_len,
+        context_len=context_len or model.context_len,
     )
 
 
 def _spec(
-    draft_backend=None, num_steps=None, attention_mode="prefill", multi_layer=False
+    draft_backend=None,
+    num_steps=None,
+    attention_mode="prefill",
+    multi_layer=False,
+    adaptive=False,
 ):
     return SimpleNamespace(
         speculative_draft_attention_backend=draft_backend,
         speculative_num_steps=num_steps,
         speculative_attention_mode=attention_mode,
         enable_multi_layer_eagle=multi_layer,
+        speculative_adaptive=adaptive,
+        speculative_adaptive_config=None,
+    )
+
+
+def _parallel(pp_size=1):
+    return SimpleNamespace(
+        attn_tp_size=1,
+        pp_size=pp_size,
+        world_group=SimpleNamespace(cpu_group=None),
     )
 
 
@@ -81,6 +95,7 @@ class TestAiterDecodeWorkspaceReserve(CustomTestCase):
         is_hybrid_swa=False,
         use_mla_backend=False,
         explicit_mem_fraction=None,
+        explicit_max_running_requests=None,
     ):
         kvc = kcc.KVCacheConfigurator.__new__(kcc.KVCacheConfigurator)
         kvc.model_config = model or _llama_8b()
@@ -95,7 +110,10 @@ class TestAiterDecodeWorkspaceReserve(CustomTestCase):
         kvc.spec_aux_config = SimpleNamespace(draft_model_config=draft_model)
         kvc.draft_parallel_layout = SimpleNamespace(attn_tp_size=1)
         kvc.server_args = SimpleNamespace(
-            _raw_input={"mem_fraction_static": explicit_mem_fraction}
+            _raw_input={
+                "mem_fraction_static": explicit_mem_fraction,
+                "max_running_requests": explicit_max_running_requests,
+            }
         )
         return kvc
 
@@ -111,10 +129,22 @@ class TestAiterDecodeWorkspaceReserve(CustomTestCase):
         num_steps=None,
         is_hip=True,
         two_batch_overlap=False,
+        other_pp_rank=None,
     ):
         """Run _resolve_memory_pool_config with a KV pool of KV_BYTES_PER_TOKEN
-        per token; returns the config and the KV budgets it was sized from."""
+        per token; returns the config and the KV budgets it was sized from.
+
+        other_pp_rank: (request_cap or None, does_not_fit, needs_reserve) of a
+        second PP rank, merged into this rank's all-reduce."""
         budgets = []
+
+        def all_reduce(tensor, op, group):
+            self.assertEqual(op, kcc.torch.distributed.ReduceOp.MAX)
+            cap, does_not_fit, needs_reserve = other_pp_rank
+            other = kcc.torch.tensor(
+                [-(cap or 1 << 62), int(does_not_fit), int(needs_reserve)]
+            )
+            tensor.copy_(kcc.torch.maximum(tensor, other))
 
         def config_from_budget(self, budget_bytes, *, cap_tokens=None):
             budgets.append(budget_bytes)
@@ -143,8 +173,11 @@ class TestAiterDecodeWorkspaceReserve(CustomTestCase):
                 patch.object(
                     kcc,
                     "get_parallel",
-                    return_value=SimpleNamespace(attn_tp_size=1),
+                    return_value=_parallel(2 if other_pp_rank else 1),
                 )
+            )
+            stack.enter_context(
+                patch.object(kcc.torch.distributed, "all_reduce", all_reduce)
             )
             stack.enter_context(
                 patch.object(
@@ -203,9 +236,7 @@ class TestAiterDecodeWorkspaceReserve(CustomTestCase):
             patch.object(kcc, "attention_backends", return_value=backends),
             patch.object(kcc, "get_spec", return_value=spec or _spec()),
             patch.object(kcc, "get_exec", return_value=_exec(two_batch_overlap)),
-            patch.object(
-                kcc, "get_parallel", return_value=SimpleNamespace(attn_tp_size=1)
-            ),
+            patch.object(kcc, "get_parallel", return_value=_parallel()),
         ):
             return kvc._aiter_decode_workspace_bytes_per_row()
 
@@ -223,33 +254,53 @@ class TestAiterDecodeWorkspaceReserve(CustomTestCase):
         self.assertEqual(config.max_running_requests, 4096)
 
     def test_uses_the_resolved_request_count(self):
-        # 40 GB of KV resolves to 2048 requests, not 4096.
+        # 40 GB of KV resolves to 2048 requests, not 4096. Their workspace
+        # (~16 GB) fits in the slack; 4096 requests' (~33 GB) would not.
         kvc = self._configurator()
         config, budgets = self._run(kvc, budget_gb=40)
         self.assertEqual(config.max_running_requests, 2048)
-        workspace = 2048 * _per_row(_llama_8b())
-        self.assertEqual(budgets[1], 40 * GB - max(0, workspace - self._headroom()))
+        self.assertLess(2048 * _per_row(_llama_8b()), self._headroom())
+        self.assertGreater(4096 * _per_row(_llama_8b()), self._headroom())
+        # Nothing reserved: the pool is not re-derived.
+        self.assertEqual(budgets, [40 * GB])
 
     def test_short_context_is_unchanged(self):
         kvc = self._configurator(_llama_8b(context_len=8192))
         config, budgets = self._run(kvc)
-        self.assertEqual(budgets, [140 * GB, 140 * GB])
+        self.assertEqual(budgets, [140 * GB])
 
     def test_speculative_request_cap_and_draft_backends(self):
         # EAGLE3 sets max_running_requests=48. The draft runner builds its own
         # backend, then two multi-step decode backends (3 steps) and one
-        # draft-extend backend: 4 draft workspaces plus the target's.
-        draft = _llama_8b()
+        # draft-extend backend: 4 draft workspaces plus the target's. The
+        # Llama-3.1-8B EAGLE3 draft checkpoint says 2048 tokens, but its runner
+        # is built with the target's 131072, which sizes its workspaces.
+        draft = _llama_8b(context_len=2048)
         kvc = self._configurator(
             spec_algorithm=SpeculativeAlgorithm.EAGLE3, draft_model=draft
         )
         config, budgets = self._run(kvc, max_running_requests=48, num_steps=3)
         self.assertEqual(config.max_running_requests, 48)
-        # 5 x 48 x 8.1 MB fits in the slack: the KV budget is untouched.
-        self.assertEqual(budgets, [140 * GB, 140 * GB])
-        self.assertEqual(
-            self._per_row_total(kvc, spec=_spec(num_steps=3)), 5 * _per_row(draft)
-        )
+        per_row = self._per_row_total(kvc, spec=_spec(num_steps=3))
+        self.assertEqual(per_row, 5 * _per_row(_llama_8b()))
+        # 5 x 48 x 8.1 MB (~1.9 GB) fits in the slack: the KV budget is untouched.
+        self.assertAlmostEqual(48 * per_row / GB, 1.904, places=3)
+        self.assertEqual(budgets, [140 * GB])
+
+    def test_draft_workspaces_use_the_target_context_length(self):
+        # Heads come from the draft config, the context length from the target,
+        # whether the draft checkpoint's own length is smaller or larger.
+        target = _llama_8b()
+        for draft_context_len in (2048, 1_048_576):
+            draft = _llama_8b(num_attention_heads=16, context_len=draft_context_len)
+            kvc = self._configurator(
+                target, spec_algorithm=SpeculativeAlgorithm.EAGLE, draft_model=draft
+            )
+            with self.subTest(draft_context_len=draft_context_len):
+                self.assertEqual(
+                    self._per_row_total(kvc, spec=_spec(num_steps=3)),
+                    _per_row(target) + 4 * _per_row(draft, target.context_len),
+                )
 
     def test_eagle_and_standalone_draft_backend_counts(self):
         draft = _llama_8b()
@@ -321,7 +372,7 @@ class TestAiterDecodeWorkspaceReserve(CustomTestCase):
         )
         # 4096 requests: one workspace (~10.9 GB) fits in the slack, three do not.
         _, budgets = self._run(kvc)
-        self.assertEqual(budgets, [140 * GB, 140 * GB])
+        self.assertEqual(budgets, [140 * GB])
         config, budgets = self._run(kvc, two_batch_overlap=True)
         self.assertEqual(config.max_running_requests, 4096)
         workspace = 4096 * 3 * _per_row(model)
@@ -377,7 +428,7 @@ class TestAiterDecodeWorkspaceReserve(CustomTestCase):
         _, budgets = self._run(self._configurator(), backends=("triton", "triton"))
         self.assertEqual(budgets, [140 * GB])
 
-    def test_explicit_mem_fraction_is_used_as_is(self):
+    def test_explicit_mem_fraction_skips_the_reserve(self):
         kvc = self._configurator(explicit_mem_fraction=0.8)
         config, budgets = self._run(kvc, mem_fraction_static=0.8)
         self.assertEqual(budgets, [140 * GB])
@@ -412,6 +463,73 @@ class TestAiterDecodeWorkspaceReserve(CustomTestCase):
         kvc = self._configurator(_llama_8b(context_len=100_000_000))
         with self.assertRaisesRegex(RuntimeError, "single request"):
             self._run(kvc, budget_gb=2, mem_fraction_static=0.95)
+
+    def test_adaptive_counts_the_backends_of_every_candidate_step(self):
+        # The default adaptive config's candidate steps are 0, 1, 3, 5 and 7.
+        # Starting at 3, init_states builds the other four states, each with a
+        # target backend, a draft-extend backend and steps - 1 decode backends.
+        from sglang.srt.speculative.adaptive_spec_params import (
+            resolve_candidate_steps_from_config,
+        )
+
+        self.assertEqual(resolve_candidate_steps_from_config(None), [0, 1, 3, 5, 7])
+        draft = _llama_8b(context_len=2048)
+        kvc = self._configurator(
+            spec_algorithm=SpeculativeAlgorithm.EAGLE3, draft_model=draft
+        )
+        target_backends = 1 + 4
+        # Runner, then (draft-extend + decode) for steps 3, 0, 1, 5 and 7.
+        draft_backends = 1 + (1 + 2) + (1 + 0) + (1 + 0) + (1 + 4) + (1 + 6)
+        self.assertEqual(
+            self._per_row_total(kvc, spec=_spec(num_steps=3, adaptive=True)),
+            (target_backends + draft_backends) * _per_row(_llama_8b()),
+        )
+        # Multi-layer EAGLE never runs adaptive.
+        self.assertEqual(
+            self._per_row_total(
+                kvc, spec=_spec(num_steps=3, multi_layer=True, adaptive=True)
+            ),
+            self._per_row_total(kvc, spec=_spec(num_steps=3, multi_layer=True)),
+        )
+
+    def test_explicit_max_running_requests_is_kept_and_reserved_in_full(self):
+        # 10M context: ~620 MB per request, no slack above the activation
+        # reserve at 0.95. 80 requests (~48 GB) are more than half of a 60 GB
+        # budget: capped without the flag; kept and reserved in full with it.
+        model = _llama_8b(context_len=10_000_000)
+        self.assertLessEqual(self._headroom(0.95), 0)
+        workspace = 80 * _per_row(model)
+        self.assertGreater(workspace, 30 * GB)
+        run = dict(budget_gb=60, mem_fraction_static=0.95, max_running_requests=80)
+        config, _ = self._run(self._configurator(model), **run)
+        self.assertLess(config.max_running_requests, 80)
+        config, budgets = self._run(
+            self._configurator(model, explicit_max_running_requests=80), **run
+        )
+        self.assertEqual(config.max_running_requests, 80)
+        self.assertEqual(budgets, [60 * GB, 60 * GB - workspace])
+        # 120 requests (~73 GB) do not fit in 60 GB.
+        run["max_running_requests"] = 120
+        with self.assertRaisesRegex(RuntimeError, "smaller --max-running-requests"):
+            self._run(
+                self._configurator(model, explicit_max_running_requests=120), **run
+            )
+
+    def test_pp_ranks_agree_on_the_cap_the_error_and_the_rederive(self):
+        model = _llama_8b(context_len=40960)
+        kvc = self._configurator(model)
+        # Alone, this rank reserves nothing (one workspace fits in the slack).
+        self.assertEqual(self._run(kvc)[1], [140 * GB])
+        # Another rank reserves: this one re-derives too (config_from_budget
+        # all-reduces), from its unchanged budget.
+        _, budgets = self._run(kvc, other_pp_rank=(None, False, True))
+        self.assertEqual(budgets, [140 * GB, 140 * GB])
+        # Another rank caps the requests: this one takes the same cap.
+        config, _ = self._run(kvc, other_pp_rank=(100, False, True))
+        self.assertEqual(config.max_running_requests, 100)
+        # Another rank cannot fit one request: every rank raises.
+        with self.assertRaisesRegex(RuntimeError, "another pipeline-parallel rank"):
+            self._run(kvc, other_pp_rank=(1, True, True))
 
 
 if __name__ == "__main__":

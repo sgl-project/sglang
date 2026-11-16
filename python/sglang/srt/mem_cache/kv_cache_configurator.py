@@ -3402,8 +3402,10 @@ class KVCacheConfigurator:
 
     def _aiter_decode_workspace_bytes_per_row(self) -> int:
         """Bytes per request-pool row of all the aiter decode workspaces this
-        rank allocates after the KV pool: the target runner's backends plus the
-        draft runners' under EAGLE/standalone. 0 when there are none."""
+        rank allocates after the KV pool: the target runner's backends, the
+        draft runners' under EAGLE/standalone, and the extra ones
+        --speculative-adaptive builds for each candidate step. 0 when there
+        are none."""
         if (
             not _is_hip
             or self.is_draft_worker
@@ -3414,6 +3416,7 @@ class KVCacheConfigurator:
         ):
             return 0
         prefill_backend, decode_backend = attention_backends()
+        adaptive_steps = self._adaptive_extra_steps()
         total = 0
         # MLA and the sliding-window pool decode without paged_attention_ragged,
         # so their backends allocate no workspace.
@@ -3422,10 +3425,12 @@ class KVCacheConfigurator:
             and not self.use_mla_backend
             and not self.is_hybrid_swa
         ):
-            # Two-batch overlap builds a primary backend and two children.
+            # Two-batch overlap builds a primary backend and two children (it
+            # turns --speculative-adaptive off). Each adaptive runtime state
+            # builds one more target backend.
             num_target_backends = (
                 3 if get_exec().overlap.enable_two_batch_overlap else 1
-            )
+            ) + len(adaptive_steps)
             total += num_target_backends * aiter_decode_workspace_bytes_per_row(
                 num_heads=self.model_config.num_attention_heads
                 // get_parallel().attn_tp_size,
@@ -3433,7 +3438,7 @@ class KVCacheConfigurator:
                 context_len=self.model_config.context_len,
             )
         num_draft_backends = self._num_aiter_draft_backends(
-            prefill_backend, decode_backend
+            prefill_backend, decode_backend, adaptive_steps
         )
         draft_config = self.spec_aux_config.draft_model_config or self.model_config
         if (
@@ -3444,12 +3449,45 @@ class KVCacheConfigurator:
             total += num_draft_backends * aiter_decode_workspace_bytes_per_row(
                 num_heads=draft_config.num_attention_heads // self.draft_attn_tp_size,
                 head_dim=draft_config.head_dim,
-                context_len=draft_config.context_len,
+                # The spec workers build every draft runner with the target's
+                # context length, and AiterAttnBackend sizes its partitions
+                # from the runner's context_len, not the draft checkpoint's.
+                context_len=self.model_config.context_len,
             )
         return total
 
+    def _adaptive_extra_steps(self) -> Tuple[int, ...]:
+        """Candidate step counts --speculative-adaptive builds a runtime state
+        for besides the startup one (AdaptiveController.init_states). Each such
+        state keeps a new target backend, steps - 1 multi-step draft decode
+        backends and a draft-extend backend for the server's life. Adaptive
+        runs only on single-layer EAGLE/EAGLE3; server-args resolution turns
+        it off otherwise."""
+        spec = get_spec()
+        if (
+            not spec.speculative_adaptive
+            or not self.spec_algorithm.is_eagle()
+            or self.spec_algorithm.is_frozen_kv_mtp()
+            or spec.enable_multi_layer_eagle
+        ):
+            return ()
+        from sglang.srt.speculative.adaptive_spec_params import (
+            resolve_candidate_steps_from_config,
+        )
+
+        return tuple(
+            steps
+            for steps in resolve_candidate_steps_from_config(
+                spec.speculative_adaptive_config
+            )
+            if steps != spec.speculative_num_steps
+        )
+
     def _num_aiter_draft_backends(
-        self, prefill_backend: str, decode_backend: str
+        self,
+        prefill_backend: str,
+        decode_backend: str,
+        adaptive_steps: Tuple[int, ...] = (),
     ) -> int:
         """AiterAttnBackends the EAGLE/standalone draft runners build on the
         shared request pool. Each draft runner first builds its own backend
@@ -3457,7 +3495,8 @@ class KVCacheConfigurator:
         then DraftBackendFactory adds steps - 1 multi-step decode backends and
         a draft-extend backend (multi-layer EAGLE: one draft-extend backend per
         step runner, no multi-step decode backend). Frozen-KV MTP reuses its
-        runner's backend or builds a non-aiter one."""
+        runner's backend or builds a non-aiter one. Each extra adaptive step
+        count runs DraftBackendFactory again for that count."""
         spec = get_spec()
         if not (self.spec_algorithm.is_eagle() or self.spec_algorithm.is_standalone()):
             return 0
@@ -3477,9 +3516,12 @@ class KVCacheConfigurator:
         extend_is_aiter = extend_backend == "aiter"
         if spec.enable_multi_layer_eagle and self.spec_algorithm.is_eagle():
             return num_steps * (int(runner_is_aiter) + int(extend_is_aiter))
-        count = int(runner_is_aiter) + int(extend_is_aiter)
-        if num_steps > 1 and (draft_backend or decode_backend) == "aiter":
-            count += num_steps - 1
+        multi_step_is_aiter = (draft_backend or decode_backend) == "aiter"
+        count = int(runner_is_aiter)
+        for steps in (num_steps, *adaptive_steps):
+            count += int(extend_is_aiter)
+            if steps > 1 and multi_step_is_aiter:
+                count += steps - 1
         return count
 
     def _reserve_aiter_decode_workspace(
@@ -3497,14 +3539,19 @@ class KVCacheConfigurator:
         slack, which must still hold the pre-capture activation reserve.
         Long-context models with many heads per rank can need more than that
         (Llama-3.1-8B at TP1 with 4096 requests: ~33 GB). An explicit
-        --mem-fraction-static is taken as-is.
+        --mem-fraction-static skips this reserve; an explicit
+        --max-running-requests is kept and its workspace reserved in full.
         """
         per_row = self._aiter_decode_workspace_bytes_per_row()
-        explicit_mem_fraction = (
-            getattr(self.server_args, "_raw_input", None) or {}
-        ).get("mem_fraction_static") is not None
+        raw_input = getattr(self.server_args, "_raw_input", None) or {}
+        explicit_mem_fraction = raw_input.get("mem_fraction_static") is not None
+        # The same on every PP rank: per_row depends only on the model, the
+        # parallel layout and the server args.
         if not per_row or explicit_mem_fraction or self.post_capture_kv_active:
             return config
+        explicit_max_running_requests = (
+            raw_input.get("max_running_requests") is not None
+        )
 
         gpu_mem = get_device_memory_capacity(self.device)
         slack_bytes = (
@@ -3513,43 +3560,91 @@ class KVCacheConfigurator:
         headroom = max(
             0, int(slack_bytes - pre_capture_activation_reserve_mb(gpu_mem) * (1 << 20))
         )
-        rows_per_request = self._req_pool_rows(1)
+        per_request = per_row * self._req_pool_rows(1)
 
         def charge(max_running_requests: int) -> int:
             workspace = per_row * self._req_pool_rows(max_running_requests)
             return max(0, workspace - headroom)
 
         reserved = charge(config.max_running_requests)
-        # Keep at least half of the KV budget; past that, cap the request slots
-        # (the workspace scales with them) instead of starving the KV cache.
         request_cap = None
-        if reserved and reserved > budget_bytes // 2:
-            request_cap = max(
-                1, (budget_bytes // 2 + headroom) // (per_row * rows_per_request)
+        # Unless --max-running-requests is explicit, keep at least half of the
+        # KV budget; past that, cap the request slots (the workspace scales
+        # with them) instead of starving the KV cache.
+        if not explicit_max_running_requests and reserved > budget_bytes // 2:
+            request_cap = max(1, (budget_bytes // 2 + headroom) // per_request)
+        does_not_fit = (
+            charge(config.max_running_requests if request_cap is None else request_cap)
+            > budget_bytes
+        )
+        needs_reserve = reserved > 0
+
+        # PP ranks profile different budgets but must agree on the cap, on
+        # failing, and on re-deriving (config_from_budget all-reduces): take
+        # the smallest cap, and fail or re-derive if any rank needs to.
+        if get_parallel().pp_size > 1:
+            no_cap = 1 << 62
+            flags = torch.tensor(
+                [
+                    -(no_cap if request_cap is None else request_cap),
+                    int(does_not_fit),
+                    int(needs_reserve),
+                ],
+                dtype=torch.int64,
             )
-            reserved = charge(request_cap)
-            if reserved > budget_bytes:
-                raise RuntimeError(
-                    f"The aiter decode workspace for a single request "
-                    f"({per_row * rows_per_request / (1 << 30):.2f} GB, sized by "
-                    f"context_len={self.model_config.context_len}) does not fit in "
-                    f"the KV cache budget ({budget_bytes / (1 << 30):.2f} GB) plus "
-                    f"the runtime slack. Try: (1) a smaller --context-length, "
-                    f"(2) a larger --tp-size (fewer heads per rank), or (3) an "
-                    f"explicit --mem-fraction-static that leaves room for it (an "
-                    f"explicit value is used as-is, with no workspace reserve)."
+            torch.distributed.all_reduce(
+                flags,
+                op=torch.distributed.ReduceOp.MAX,
+                group=get_parallel().world_group.cpu_group,
+            )
+            synced_cap = -int(flags[0].item())
+            request_cap = None if synced_cap == no_cap else synced_cap
+            does_not_fit = bool(flags[1].item())
+            needs_reserve = bool(flags[2].item())
+
+        if does_not_fit:
+            if explicit_max_running_requests:
+                what = (
+                    f"--max-running-requests={get_schedule().max_running_requests} "
+                    f"({config.max_running_requests} per dp worker, "
+                    f"{per_request * config.max_running_requests / (1 << 30):.2f} GB)"
                 )
+                fix = "a smaller --max-running-requests, "
+            else:
+                what = f"a single request ({per_request / (1 << 30):.2f} GB)"
+                fix = ""
+            where = (
+                " on this or another pipeline-parallel rank"
+                if get_parallel().pp_size > 1
+                else ""
+            )
+            raise RuntimeError(
+                f"The aiter decode workspace for {what}, sized by "
+                f"context_len={self.model_config.context_len}, does not fit in "
+                f"the KV cache budget plus the runtime slack above the "
+                f"activation reserve{where} (this rank: "
+                f"{budget_bytes / (1 << 30):.2f} GB + "
+                f"{headroom / (1 << 30):.2f} GB). Try {fix}a smaller "
+                f"--context-length, a larger --tp-size (fewer heads per rank), "
+                f"or an explicit --mem-fraction-static, which skips this "
+                f"workspace reserve."
+            )
+        if not needs_reserve:
+            return config
+
+        if request_cap is not None:
+            request_cap = min(request_cap, config.max_running_requests)
+            reserved = charge(request_cap)
             logger.warning(
                 "max_running_requests is capped to %d (per dp worker) so the aiter "
-                "decode workspace (%.2f MB per request) leaves half of the KV "
-                "budget. Set --max-running-requests or a smaller --context-length "
-                "to choose the trade-off.",
+                "decode workspace (%.2f MB per request) takes at most half of the "
+                "KV budget. Pass --max-running-requests to keep a larger count "
+                "(its workspace is then reserved in full), or use a smaller "
+                "--context-length.",
                 request_cap,
-                per_row * rows_per_request / (1 << 20),
+                per_request / (1 << 20),
             )
 
-        # Re-derive unconditionally: config_from_budget all-reduces the token
-        # capacity across PP ranks, so every rank must make the same calls.
         config = self.config_from_budget(budget_bytes - reserved)
         # A smaller budget never yields more requests, so `reserved` still
         # covers the workspace of the final pool.
@@ -3558,14 +3653,13 @@ class KVCacheConfigurator:
         )
         if request_cap is not None:
             config.max_running_requests = min(config.max_running_requests, request_cap)
-        if reserved:
-            logger.info(
-                "aiter decode workspace: %.2f GB for %d requests, %.2f GB of it "
-                "taken from the KV budget.",
-                per_row * self._req_pool_rows(config.max_running_requests) / (1 << 30),
-                config.max_running_requests,
-                reserved / (1 << 30),
-            )
+        logger.info(
+            "aiter decode workspace: %.2f GB for %d requests, %.2f GB of it "
+            "taken from the KV budget.",
+            per_row * self._req_pool_rows(config.max_running_requests) / (1 << 30),
+            config.max_running_requests,
+            reserved / (1 << 30),
+        )
         return config
 
     def config_from_budget(
