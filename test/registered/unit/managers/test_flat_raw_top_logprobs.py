@@ -751,6 +751,8 @@ def _make_batch_token_id_output(**overrides) -> BatchTokenIDOutput:
         output_hidden_states=None,
         routed_experts=None,
         indexer_topk=None,
+        placeholder_tokens_idx=None,
+        placeholder_tokens_val=None,
     )
     fields.update(overrides)
     return BatchTokenIDOutput(**fields)

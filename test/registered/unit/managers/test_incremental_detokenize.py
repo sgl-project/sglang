@@ -97,6 +97,8 @@ def _output(sent, rows, *, ipc="worker-a"):
         output_hidden_states=None,
         routed_experts=None,
         indexer_topk=None,
+        placeholder_tokens_idx=None,
+        placeholder_tokens_val=None,
     )
 
 

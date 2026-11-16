@@ -143,6 +143,8 @@ _PER_REQUEST_OPTIONAL_FIELDS = frozenset(
         "output_hidden_states",
         "routed_experts",
         "indexer_topk",
+        "placeholder_tokens_idx",
+        "placeholder_tokens_val",
     }
 )
 
