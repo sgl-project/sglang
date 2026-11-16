@@ -371,6 +371,9 @@ class FusedMoE(torch.nn.Module):
             layer may expose FlashInfer's block-FP8 deferred MoE output.
     """
 
+    # Models whose checkpoint interleaves the gate and up rows of w13 set this.
+    inference_moe_w13_interleaved: bool = False
+
     # True on shared-expert FusedMoE subclasses (e.g. Inkling's sink); lets
     # backend resolution distinguish them from routed experts.
     is_shared_fused_moe = False

@@ -77,6 +77,7 @@ def _layer(raw):
     layer.intermediate_size_per_partition = INTERMEDIATE
     layer.dispatcher = SimpleNamespace(set_quant_config=lambda config: None)
     layer._fp4_moe_repack = modelopt_quant.Fp4MoeRepack.CHECKPOINT  # create_weights
+    layer._w13_deinterleaved = False  # create_weights
     params = {name: t.clone() for name, t in raw.items()}
     params.update(
         w13_weight_scale_2=torch.full((NUM_EXPERTS, 2), 0.01, device="cuda"),
@@ -88,8 +89,7 @@ def _layer(raw):
         layer.register_parameter(name, torch.nn.Parameter(data, requires_grad=False))
     if not method.enable_flashinfer_trtllm_moe:
         for name in ("w13", "w2"):
-            setattr(
-                layer,
+            layer.register_parameter(
                 f"{name}_blockscale_swizzled",
                 torch.nn.Parameter(
                     modelopt_quant.swizzle_blockscale(params[f"{name}_weight_scale"]),
@@ -100,7 +100,7 @@ def _layer(raw):
 
 
 def _bytes(layer, name):
-    return getattr(layer, name).data.view(torch.uint8).clone()
+    return layer.get_parameter(name).data.view(torch.uint8).clone()
 
 
 @unittest.skipIf(
@@ -133,14 +133,14 @@ class TestNvFp4MoeRestore(CustomTestCase):
                         raw["w13_weight_scale"].view(torch.uint8),
                     )
                 )
-                storage = {n: getattr(layer, n).data_ptr() for n in REPACKED}
+                storage = {n: layer.get_parameter(n).data_ptr() for n in REPACKED}
                 layer.quant_method.restore_weights_before_loading(layer)
                 for name in REPACKED:
                     self.assertTrue(
                         torch.equal(_bytes(layer, name), raw[name].view(torch.uint8)),
                         name,
                     )
-                    self.assertEqual(getattr(layer, name).data_ptr(), storage[name])
+                    self.assertEqual(layer.get_parameter(name).data_ptr(), storage[name])
 
     def test_layers_share_one_scale_interleave_map(self):
         # One copy per scale shape for all MoE layers, none in a layer's cache.
@@ -173,7 +173,7 @@ class TestNvFp4MoeRestore(CustomTestCase):
 
                 layer.quant_method.restore_weights_before_loading(layer)
                 for name in REPACKED:
-                    getattr(layer, name).data[1] = update[name][1]
+                    layer.get_parameter(name).data[1] = update[name][1]
                 self._process(layer)
 
                 for name in REPACKED:
@@ -220,22 +220,21 @@ class TestNvFp4MoeRestore(CustomTestCase):
             self.assertIs(layer._fp4_moe_repack, modelopt_quant.Fp4MoeRepack.TRTLLM)
 
     def test_padded_scale_layouts(self):
+        # TRT-LLM pads hidden up to the cubins' alignment; restore cannot undo
+        # the padding, so it must stay off.
+        with self._backend(MoeRunnerBackend.FLASHINFER_TRTLLM), mock.patch.object(
+            flashinfer_trtllm, "trtllm_nvfp4_hidden_alignment", return_value=2 * HIDDEN
+        ):
+            layer = _layer(_raw_tensors(seed=5))
+            self._process(layer)
+            self.assertIs(
+                layer._fp4_moe_repack, modelopt_quant.Fp4MoeRepack.NOT_RESTORABLE
+            )
+
         # hidden 192: w2 block-scale rows are not a multiple of 128, so the
         # scale interleave/swizzle pads them.
         raw = _raw_tensors(seed=5, hidden=192)
         update = _raw_tensors(seed=6, hidden=192)
-
-        with self._backend(MoeRunnerBackend.FLASHINFER_TRTLLM):
-            layer = _layer(raw)
-            try:
-                self._process(layer)
-            except AssertionError:
-                # FlashInfer's TRT-LLM row shuffle needs 128-row multiples, so
-                # this layout fails at load today; restore must stay off if not.
-                pass
-            self.assertIs(
-                layer._fp4_moe_repack, modelopt_quant.Fp4MoeRepack.NOT_RESTORABLE
-            )
 
         # CUTLASS keeps the padded w2 swizzle in a separate buffer, so the
         # source scale stays in checkpoint layout and a partial update works.
@@ -249,7 +248,7 @@ class TestNvFp4MoeRestore(CustomTestCase):
             self._process(expected)
             layer.quant_method.restore_weights_before_loading(layer)
             for name in REPACKED:
-                getattr(layer, name).data[1] = update[name][1]
+                layer.get_parameter(name).data[1] = update[name][1]
             self._process(layer)
             for name in REPACKED + ("w2_blockscale_swizzled",):
                 self.assertTrue(

@@ -114,6 +114,7 @@ class MuseSparkNvFp4FusedMoEMethod(ModelOptNvFp4FusedMoEMethod):
                 ),
             )
         layer._fp4_moe_repack = Fp4MoeRepack.CHECKPOINT
+        layer._w13_deinterleaved = False
 
     # The base method's Marlin branch, and prepare_moe_nvfp4_layer_for_marlin
     # underneath it, address the experts by their pre-rename names.

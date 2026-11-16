@@ -2497,6 +2497,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         params_dtype: torch.dtype,
         **extra_weight_attrs,
     ):
+        layer._w13_deinterleaved = False
         if self.enable_flashinfer_trtllm_moe:
             alignment = (
                 64
@@ -2740,8 +2741,8 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
         # The restorable layouts below overwrite this; an interleaved w13
         # checkpoint layout cannot be restored.
         layer._fp4_moe_repack = Fp4MoeRepack.NOT_RESTORABLE
-        w13_interleaved = getattr(layer, "inference_moe_w13_interleaved", False)
-        if w13_interleaved and not getattr(layer, "_w13_deinterleaved", False):
+        w13_interleaved = layer.inference_moe_w13_interleaved
+        if w13_interleaved and not layer._w13_deinterleaved:
             up_first = self.use_flashinfer_trtllm_weight_layout
             layer.w13_weight.data = deinterleave_w13(
                 layer.w13_weight.data, up_first=up_first
