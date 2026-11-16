@@ -18,7 +18,6 @@ import enum
 from typing import Union
 
 from transformers.configuration_utils import PretrainedConfig
-from transformers.utils import logging
 
 from sglang.srt.configs.mamba_utils import (
     KimiLinearCacheParams,
@@ -28,8 +27,6 @@ from sglang.srt.configs.mamba_utils import (
 )
 from sglang.srt.configs.qwen3_vl import Qwen3VLMoeVisionConfig
 from sglang.srt.runtime_context import get_parallel
-
-logger = logging.get_logger(__name__)
 
 
 def is_bailing_multi_gate_enabled(config: PretrainedConfig) -> bool:

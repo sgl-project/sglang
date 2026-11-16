@@ -513,7 +513,6 @@ class DeepseekOCRProcessor(ProcessorMixin):
     ):
         """Tokenize text with <image> tags."""
 
-        conversation = conversation
         assert conversation.count(self.image_token) == len(images)
         text_splits = conversation.split(self.image_token)
         images_list, images_crop_list, images_seq_mask, images_spatial_crop = (
@@ -643,14 +642,11 @@ class DeepseekOCRProcessor(ProcessorMixin):
         )
         input_ids[input_ids < 0] = self.pad_id
 
-        inference_mode = True
-
-        if inference_mode:
-            # Remove the ending eos token
-            assert input_ids[-1] == self.eos_id
-            input_ids = input_ids[:-1]
-            target_ids = target_ids[:-1]
-            images_seq_mask = images_seq_mask[:-1]
+        # Remove the ending eos token
+        assert input_ids[-1] == self.eos_id
+        input_ids = input_ids[:-1]
+        target_ids = target_ids[:-1]
+        images_seq_mask = images_seq_mask[:-1]
 
         if len(images_list) == 0:
             pixel_values = torch.zeros((1, 3, self.base_size, self.base_size))
