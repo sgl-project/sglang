@@ -987,9 +987,7 @@ class ServingChatTestCase(CustomTestCase):
                     result = self.chat._apply_conversation_template(
                         request, is_multimodal=False
                     )
-                    self.assertEqual(
-                        result.stop, template_stop + list(request_stop)
-                    )
+                    self.assertEqual(result.stop, template_stop + list(request_stop))
 
     # ------------- conversion tests -------------
     def test_convert_to_internal_request_single(self):

@@ -2505,9 +2505,7 @@ def test_standalone_builtin_tools_without_storage(response_serving):
 
 def _harmony_turn_ids(message):
     # The parser starts inside the prompt's open assistant header.
-    return get_encoding().render_conversation(Conversation.from_messages([message]))[
-        2:
-    ]
+    return get_encoding().render_conversation(Conversation.from_messages([message]))[2:]
 
 
 def _harmony_turn_chunks(output_ids, *, stream, prompt_tokens=5, cached_tokens=0):
