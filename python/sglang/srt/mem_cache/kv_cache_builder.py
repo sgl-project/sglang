@@ -186,6 +186,17 @@ def check_unified_hicache_draft(
     if mode == HiCacheDraftMode.NONE:
         # No draft KV reaches the host tier: pages hold the target KV alone.
         return
+    if mode == HiCacheDraftMode.PACKED and spec_algorithm.name == "EAGLE":
+        # NEXTN-style MTP. is_eagle() would also admit EAGLE3 and
+        # FROZEN_KV_MTP, which never pack.
+        if len(draft_plan.device_pools) == 1:
+            return
+        raise NotImplementedError(
+            f"The unified key scheme stores one packed draft layer; "
+            f"{len(draft_plan.device_pools)} layers would need page keys that "
+            f"cover {len(draft_plan.device_pools)} lookahead tokens. Use "
+            f"--hicache-storage-key-scheme rank-suffix."
+        )
     raise NotImplementedError(
         f"The unified key scheme does not support HiCache draft mode "
         f"'{mode.value}' for {spec_algorithm.name}: its draft KV has no unified "
@@ -193,11 +204,51 @@ def check_unified_hicache_draft(
     )
 
 
+def check_unified_hicache_draft_stored(
+    tree_cache, draft_plan: Optional[HiCacheDraftPlan]
+) -> None:
+    """Tie the draft mode that was accepted to what the cache really stores.
+
+    Draft chunks are named from the host pool, the mode from the draft plan.
+    If the two disagreed, pages would be stored and hit without draft KV
+    that the device then lacks.
+    """
+    memory = get_memory()
+    if (
+        memory.hicache_storage_key_scheme != "unified"
+        or memory.enable_unified_cache_external_linker
+        or draft_plan is None
+        or draft_plan.mode != HiCacheDraftMode.PACKED
+    ):
+        return
+    # The draft row of slot i is computed from token i + 1, which only a
+    # page key over token pairs covers.
+    if not getattr(getattr(tree_cache, "tree_core", None), "is_eagle", False):
+        raise NotImplementedError(
+            "The unified key scheme stores NEXTN draft KV only under bigram "
+            "page hashes; this cache tree does not use them."
+        )
+    controller = getattr(tree_cache, "cache_controller", None)
+    host_pool = getattr(controller, "storage_host_pool", None)
+    packed = (
+        None
+        if host_pool is None
+        else host_pool.layer_num
+        - getattr(host_pool, "target_layer_num", host_pool.layer_num)
+    )
+    if packed != len(draft_plan.device_pools):
+        raise NotImplementedError(
+            f"The unified key scheme expected {len(draft_plan.device_pools)} "
+            f"packed draft layer(s) in the host pool, found {packed}."
+        )
+
+
 def maybe_register_hicache_draft(
     *,
     tree_cache,
     draft_plan: HiCacheDraftPlan,
 ) -> None:
+    check_unified_hicache_draft_stored(tree_cache, draft_plan)
     if draft_plan.mode == HiCacheDraftMode.FUSED:
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
             validate_fused_hicache_draft,

@@ -44,15 +44,17 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.hicache_key_scheme import (
     UnifiedKVPlan,
+    draft_namespace_digest,
     namespace_digest,
     normalize_dtype,
     plan_unified_kv,
     validate_unified_chunk_tiling,
+    with_packed_draft,
 )
 from sglang.srt.mem_cache.kv.memory.views import KVLayoutView, MLAKVView
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.utils import get_storage_hash_str
-from sglang.srt.runtime_context import get_memory, get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel, get_spec
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -984,11 +986,13 @@ class HiCacheController:
                 "The unified key scheme requires a single page_unified KV pool; "
                 "composite and sidecar pools are not supported."
             )
-        if host_pool.layer_num != host_pool.end_layer - host_pool.start_layer:
+        # Packed draft pools follow the target's layers on the host layer axis.
+        target_layer_num = getattr(host_pool, "target_layer_num", host_pool.layer_num)
+        if target_layer_num != host_pool.end_layer - host_pool.start_layer:
             raise NotImplementedError(
-                "The unified key scheme requires contiguous model layers "
-                "without packed draft layers."
+                "The unified key scheme requires contiguous model layers."
             )
+        draft_layer_num = host_pool.layer_num - target_layer_num
         # Host pools retain physical buffer descriptors, not the device pool.
         # A hybrid controller can wrap a different pool than its storage anchor.
         anchor_entry = getattr(self.mem_pool_host, "anchor_entry", None)
@@ -1019,10 +1023,90 @@ class HiCacheController:
             head_group=memory.hicache_storage_head_partition,
             layer_partition=memory.hicache_storage_layer_partition,
         )
+        if draft_layer_num:
+            plan = self._plan_unified_packed_draft(
+                plan,
+                anchor_entry=anchor_entry,
+                target_layer_num=target_layer_num,
+                draft_layer_num=draft_layer_num,
+                attn_cp_size=attn_cp_size,
+            )
         logger.info(
             "HiCache unified L3 keys: namespace=%s chunks=%s",
             namespace_digest(plan.namespace),
             plan.suffixes,
+        )
+        return plan
+
+    def _plan_unified_packed_draft(
+        self,
+        plan: UnifiedKVPlan,
+        *,
+        anchor_entry,
+        target_layer_num: int,
+        draft_layer_num: int,
+        attn_cp_size: int,
+    ) -> UnifiedKVPlan:
+        """Name the packed draft rows of the page block as chunks of their own.
+
+        The last line of defence: whatever put draft layers into this host
+        pool, they are stored only if every byte of them can be named, by a
+        draft whose rows are a function of the tokens the page key covers.
+        """
+        algorithm = get_spec().speculative_algorithm
+        if algorithm != "EAGLE":
+            # Name what was found: no algorithm at all would read "None".
+            what = (
+                f"--speculative-algorithm {algorithm}"
+                if algorithm
+                else f"a host pool with {draft_layer_num} packed draft layer(s) "
+                f"and no speculative algorithm"
+            )
+            raise NotImplementedError(
+                f"The unified key scheme stores packed draft KV only for "
+                f"NEXTN-style MTP; {what} is not supported."
+            )
+        if draft_layer_num != 1:
+            # A deeper draft layer's row for slot i depends on token i + depth
+            # + 1; the page key covers one token past the page.
+            raise NotImplementedError(
+                f"The unified key scheme stores one packed draft layer; "
+                f"{draft_layer_num} layers would need page keys that cover "
+                f"{draft_layer_num} lookahead tokens."
+            )
+        draft_pools = getattr(anchor_entry, "packed_draft_device_pools", ())
+        # Logical dtypes: fp8 variants pack together (both store as uint8)
+        # but are different draft KV.
+        dtypes = {normalize_dtype(pool.dtype) for pool in draft_pools}
+        if len(draft_pools) != draft_layer_num or len(dtypes) != 1:
+            raise NotImplementedError(
+                f"The unified key scheme cannot name {draft_layer_num} packed "
+                f"draft layer(s) from {len(draft_pools)} draft pool(s) of KV "
+                f"dtype(s) {sorted(dtypes)}."
+            )
+        draft_id = get_memory().hicache_storage_draft_id
+        if not draft_id:
+            raise NotImplementedError(
+                "The unified key scheme needs a draft id to store packed draft "
+                "KV; it is resolved at startup (--hicache-storage-draft-id)."
+            )
+        parallel = get_parallel()
+        plan = with_packed_draft(
+            plan,
+            target_layer_num=target_layer_num,
+            draft_layer_num=draft_layer_num,
+            algorithm=algorithm,
+            draft_id=draft_id,
+            dtype=dtypes.pop(),
+            row_width=self.storage_host_pool.page_unified_layout.head_dim,
+            attn_tp_rank=parallel.attn_tp_rank,
+            attn_cp_size=attn_cp_size,
+            is_final_stage=parallel.pp_rank == parallel.pp_size - 1,
+        )
+        logger.info(
+            "HiCache unified L3 keys: packed draft id=%r namespace=%s",
+            draft_id,
+            draft_namespace_digest(plan.draft_namespace),
         )
         return plan
 

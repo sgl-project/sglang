@@ -21,7 +21,9 @@ from sglang.srt.arg_groups.speculative_hook import (
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation, HiCacheController
 from sglang.srt.mem_cache.hicache_key_scheme import (
+    DraftKVNamespace,
     derive_namespace,
+    draft_namespace_digest,
     namespace_digest,
     validate_unified_chunk_tiling,
 )
@@ -33,6 +35,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import HostPoolGrou
 from sglang.srt.mem_cache.kv_cache_builder import (
     build_kv_cache,
     check_unified_hicache_draft,
+    maybe_register_hicache_draft,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
@@ -215,8 +218,11 @@ class TestUnifiedKeySchemeSpeculative(CustomTestCase):
         self.assertEqual(
             resolution_result(args, "speculative_algorithm"), "FROZEN_KV_MTP"
         )
-        with self.assertRaisesRegex(NotImplementedError, "speculative-algorithm EAGLE"):
-            _resolve_through_speculative(speculative_algorithm="NEXTN")
+        # Unpromoted, NEXTN is EAGLE, whose draft KV is stored.
+        args = _resolve_through_speculative(
+            speculative_algorithm="NEXTN", hicache_storage_draft_id="org/draft"
+        )
+        self.assertEqual(resolution_result(args, "speculative_algorithm"), "EAGLE")
 
     def test_dflash_is_accepted_only_with_the_draft_kv_ring(self):
         args = _resolve_through_speculative(
@@ -236,7 +242,7 @@ class TestUnifiedKeySchemeSpeculative(CustomTestCase):
             "NGRAM": (patch(f"{_SPEC_HOOK}._handle_ngram"),),
             "UNO": (patch(f"{_SPEC_HOOK}._handle_uno"),),
         }
-        for algorithm in ("EAGLE", "EAGLE3", "STANDALONE", "DSPARK", "NGRAM", "UNO"):
+        for algorithm in ("EAGLE3", "STANDALONE", "DSPARK", "NGRAM", "UNO"):
             with (
                 self.subTest(algorithm=algorithm),
                 self.assertRaisesRegex(
@@ -250,7 +256,7 @@ class TestUnifiedKeySchemeSpeculative(CustomTestCase):
 
     def test_rank_suffix_scheme_is_not_restricted(self):
         _resolve_through_speculative(
-            speculative_algorithm="EAGLE", hicache_storage_key_scheme="rank-suffix"
+            speculative_algorithm="EAGLE3", hicache_storage_key_scheme="rank-suffix"
         )
 
     def test_decode_context_parallelism_is_still_refused_first(self):
@@ -277,14 +283,110 @@ class TestUnifiedKeySchemeSpeculative(CustomTestCase):
         # Nothing builds a HiCache host pool: the flag has no effect today,
         # with or without speculative decoding.
         _resolve_through_speculative(
-            speculative_algorithm="EAGLE", enable_hierarchical_cache=False
+            speculative_algorithm="EAGLE3", enable_hierarchical_cache=False
         )
         # The external linker has no L3 key scheme at all.
         _resolve_through_speculative(
-            speculative_algorithm="EAGLE",
+            speculative_algorithm="EAGLE3",
             enable_hierarchical_cache=False,
             hicache_storage_backend=None,
             enable_unified_cache_external_linker=True,
+        )
+
+
+class TestUnifiedKeySchemeDraftKV(CustomTestCase):
+    """NEXTN-style MTP: the static requirements and the draft id."""
+
+    def _resolve(self, **overrides):
+        fields = dict(
+            speculative_algorithm="NEXTN", speculative_draft_model_path="dummy"
+        )
+        fields.update(overrides)
+        # The alias resolution reads the draft checkpoint's config.
+        algorithm = fields["speculative_algorithm"]
+        resolved = patch(
+            f"{_SPEC_HOOK}._resolve_speculative_algorithm_alias",
+            return_value="EAGLE" if algorithm == "NEXTN" else algorithm,
+        )
+        return _resolve_through_speculative(patches=(resolved,), **fields)
+
+    def _draft_id(self, **overrides):
+        return resolution_result(self._resolve(**overrides), "hicache_storage_draft_id")
+
+    def test_draft_id_is_resolved_once_at_startup(self):
+        # Part of the target checkpoint: the target namespace names it.
+        self.assertEqual(self._draft_id(), "bundled")
+        # No draft path at all: the draft loads from the target checkpoint.
+        self.assertEqual(self._draft_id(speculative_draft_model_path=None), "bundled")
+        self.assertEqual(
+            self._draft_id(speculative_draft_model_path=None, revision="abc"), "bundled"
+        )
+        # The same path under another target revision is another checkpoint.
+        self.assertEqual(self._draft_id(revision="abc"), "dummy@main")
+        self.assertEqual(
+            self._draft_id(speculative_draft_model_path="org/draft"), "org/draft@main"
+        )
+        self.assertEqual(
+            self._draft_id(
+                speculative_draft_model_path="org/draft",
+                speculative_draft_model_revision="abc",
+            ),
+            "org/draft@abc",
+        )
+        # The same checkpoint quantized for the draft alone is another draft.
+        self.assertEqual(
+            self._draft_id(speculative_draft_model_quantization="fp8"), "bundled+fp8"
+        )
+        # A declared id wins: local mount paths differ between hosts.
+        self.assertEqual(
+            self._draft_id(
+                speculative_draft_model_path="/mnt/a/draft",
+                hicache_storage_draft_id="org/draft@abc",
+            ),
+            "org/draft@abc",
+        )
+
+    def test_draft_id_without_a_stored_draft_is_refused(self):
+        cases = {
+            "rank_suffix": dict(hicache_storage_key_scheme="rank-suffix"),
+            "no_algorithm": dict(speculative_algorithm=None),
+            "no_draft_kv": dict(speculative_algorithm="FROZEN_KV_MTP"),
+            "empty": dict(hicache_storage_draft_id=""),
+        }
+        for name, overrides in cases.items():
+            with self.subTest(name), self.assertRaises(ValueError):
+                self._resolve(**{"hicache_storage_draft_id": "x", **overrides})
+
+    def test_paths_where_draft_kv_is_not_safe_to_store_are_refused(self):
+        cases = {
+            "multi-layer EAGLE": dict(enable_multi_layer_eagle=True),
+            "buffer_only": dict(hicache_host_memory_mode="buffer_only"),
+            "random weights": dict(speculative_draft_load_format="dummy"),
+            "random weights ": dict(load_format="dummy"),
+            "prefill context parallelism": dict(attn_cp_size=2, enable_prefill_cp=True),
+            "PD disaggregation": dict(disaggregation_mode="prefill"),
+            "--enable-streaming-session": dict(enable_streaming_session=True),
+            "--enable-session-radix-cache": dict(enable_session_radix_cache=True),
+        }
+        for message, overrides in cases.items():
+            with (
+                self.subTest(message),
+                self.assertRaisesRegex(NotImplementedError, message.strip()),
+            ):
+                self._resolve(**overrides)
+        with (
+            envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.override(True),
+            self.assertRaisesRegex(NotImplementedError, "draft rows unwritten"),
+        ):
+            self._resolve()
+        # None of this concerns an algorithm that stores no draft KV.
+        self._resolve(speculative_algorithm="FROZEN_KV_MTP", load_format="dummy")
+        self._resolve(
+            speculative_algorithm="FROZEN_KV_MTP", enable_streaming_session=True
+        )
+        # Nor the rank-suffix scheme, which keeps streaming sessions.
+        self._resolve(
+            hicache_storage_key_scheme="rank-suffix", enable_streaming_session=True
         )
 
 
@@ -311,12 +413,47 @@ class TestUnifiedDraftModeGate(CustomTestCase):
         self._check(None, algorithm=SpeculativeAlgorithm.NONE)
         self._check(HiCacheDraftMode.NONE, algorithm=SpeculativeAlgorithm.FROZEN_KV_MTP)
 
-    def test_modes_with_draft_kv_are_refused_by_name(self):
-        for mode in (
-            HiCacheDraftMode.PACKED,
-            HiCacheDraftMode.SIDECAR,
-            HiCacheDraftMode.FUSED,
+    def _check_packed(self, algorithm, draft_layers):
+        plan = HiCacheDraftPlan(
+            mode=HiCacheDraftMode.PACKED, device_pools=(object(),) * draft_layers
+        )
+        memory = SimpleNamespace(
+            hicache_storage_key_scheme="unified",
+            enable_unified_cache_external_linker=False,
+        )
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_builder.get_memory", return_value=memory
         ):
+            check_unified_hicache_draft(algorithm, plan)
+
+    def test_one_packed_nextn_layer_passes(self):
+        self._check_packed(SpeculativeAlgorithm.EAGLE, 1)
+
+    def test_deeper_packed_drafts_are_refused(self):
+        # A deeper layer's rows depend on tokens the page key does not cover.
+        for layers in (2, 3):
+            with (
+                self.subTest(layers=layers),
+                self.assertRaisesRegex(
+                    NotImplementedError, f"one packed draft layer; {layers}"
+                ),
+            ):
+                self._check_packed(SpeculativeAlgorithm.EAGLE, layers)
+
+    def test_packed_drafts_of_other_algorithms_are_refused(self):
+        # DSPARK compressed-KV packs too; EAGLE3 and FROZEN_KV_MTP are in
+        # the EAGLE family but never pack.
+        for algorithm in ("DSPARK", "EAGLE3", "FROZEN_KV_MTP"):
+            with (
+                self.subTest(algorithm=algorithm),
+                self.assertRaisesRegex(
+                    NotImplementedError, f"draft mode 'packed' for {algorithm}"
+                ),
+            ):
+                self._check_packed(SpeculativeAlgorithm[algorithm], 1)
+
+    def test_sidecar_and_fused_drafts_are_refused_by_name(self):
+        for mode in (HiCacheDraftMode.SIDECAR, HiCacheDraftMode.FUSED):
             with (
                 self.subTest(mode=mode),
                 self.assertRaisesRegex(
@@ -324,6 +461,38 @@ class TestUnifiedDraftModeGate(CustomTestCase):
                 ),
             ):
                 self._check(mode)
+
+    def _stored(self, *, is_eagle=True, host_layers=5, target_layers=4, pools=1):
+        tree_cache = SimpleNamespace(
+            tree_core=SimpleNamespace(is_eagle=is_eagle),
+            cache_controller=SimpleNamespace(
+                storage_host_pool=SimpleNamespace(
+                    layer_num=host_layers, target_layer_num=target_layers
+                )
+            ),
+        )
+        plan = HiCacheDraftPlan(
+            mode=HiCacheDraftMode.PACKED, device_pools=(object(),) * pools
+        )
+        memory = SimpleNamespace(
+            hicache_storage_key_scheme="unified",
+            enable_unified_cache_external_linker=False,
+        )
+        # Through the function build_kv_cache() calls once the tree exists.
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_builder.get_memory", return_value=memory
+        ):
+            maybe_register_hicache_draft(tree_cache=tree_cache, draft_plan=plan)
+
+    def test_accepted_packed_draft_must_be_what_the_cache_stores(self):
+        self._stored()
+        # The draft row of slot i needs token i + 1 in the page key.
+        with self.assertRaisesRegex(NotImplementedError, "bigram page hashes"):
+            self._stored(is_eagle=False)
+        # A host pool that did not pack the draft would store target-only
+        # pages, and readers would hit them without draft KV.
+        with self.assertRaisesRegex(NotImplementedError, "expected 1 packed.*found 0"):
+            self._stored(host_layers=4)
 
     def test_rank_suffix_scheme_is_not_restricted(self):
         for mode in HiCacheDraftMode:
@@ -399,7 +568,7 @@ class TestControllerUnifiedKeys(CustomTestCase):
             controller.mem_pool_device = device_pool
         return controller
 
-    def _suffixes(self, controller, *, attn_cp_size=1):
+    def _suffixes(self, controller, *, attn_cp_size=1, pp_rank=1, **draft):
         memory = SimpleNamespace(
             hicache_storage_key_scheme="unified",
             hicache_storage_head_partition=4,
@@ -410,10 +579,10 @@ class TestControllerUnifiedKeys(CustomTestCase):
             tp_size=8,
             attn_tp_rank=1,
             attn_tp_size=2,
-            pp_rank=1,
+            pp_rank=pp_rank,
             pp_size=2,
         )
-        with (
+        patches = [
             patch(
                 "sglang.srt.managers.cache_controller.get_memory", return_value=memory
             ),
@@ -421,10 +590,179 @@ class TestControllerUnifiedKeys(CustomTestCase):
                 "sglang.srt.managers.cache_controller.get_parallel",
                 return_value=parallel,
             ),
-        ):
+        ]
+        if draft:
+            # Only a pool with packed draft layers reads these.
+            memory.hicache_storage_draft_id = draft["draft_id"]
+            patches.append(
+                patch(
+                    "sglang.srt.managers.cache_controller.get_spec",
+                    return_value=SimpleNamespace(
+                        speculative_algorithm=draft["algorithm"]
+                    ),
+                )
+            )
+        with ExitStack() as stack:
+            for context in patches:
+                stack.enter_context(context)
             return controller._build_unified_plan(
                 "org/model", attn_cp_size=attn_cp_size
             ).suffixes
+
+    def _packed_controller(self, *, mla=False, draft_dtypes=(torch.float8_e4m3fn,)):
+        """The fake pool with one-layer draft pools packed behind its 4 layers."""
+        controller = self._controller(mla=mla)
+        host_pool = controller.storage_host_pool
+        host_pool.target_layer_num = 4
+        host_pool.layer_num = 4 + len(draft_dtypes)
+        host_pool.page_unified_layout = PageUnifiedLayout(
+            page_size=16,
+            layer_num=host_pool.layer_num,
+            head_num=1 if mla else 4,
+            head_group_num=1,
+            head_dim=128,
+            itemsize=1,
+            is_mla=mla,
+        )
+        # Like the target: a logical dtype over a uint8 storage view.
+        controller.mem_pool_host.anchor_entry.packed_draft_device_pools = tuple(
+            SimpleNamespace(dtype=dtype, store_dtype=torch.uint8)
+            for dtype in draft_dtypes
+        )
+        return controller
+
+    def _draft_suffix(self, target_suffix, **overrides):
+        fields = dict(
+            target=target_suffix.split("_")[0],
+            algorithm="EAGLE",
+            draft_id="bundled",
+            placement="packed",
+            dtype="float8_e4m3fn",
+            rank_replicated=False,
+            total_kv_heads=8,
+            head_group=4,
+            row_width=128,
+            layer_num=1,
+            object_layout="page-unified-v1",
+        )
+        fields.update(overrides)
+        return draft_namespace_digest(DraftKVNamespace(**fields)) + "_D0-1"
+
+    def test_packed_draft_layer_is_named_after_the_target_chunks(self):
+        target = self._suffixes(self._controller())
+        suffixes = self._suffixes(
+            self._packed_controller(), algorithm="EAGLE", draft_id="bundled"
+        )
+        self.assertEqual(suffixes, [*target, self._draft_suffix(target[0]) + "_H1"])
+
+        # MLA: replicated across ranks, so no head coordinate.
+        target = self._suffixes(self._controller(mla=True))
+        suffixes = self._suffixes(
+            self._packed_controller(mla=True), algorithm="EAGLE", draft_id="org/d@main"
+        )
+        draft = self._draft_suffix(
+            target[0],
+            draft_id="org/d@main",
+            rank_replicated=True,
+            total_kv_heads=0,
+            head_group=0,
+        )
+        self.assertEqual(suffixes, [*target, draft])
+
+    def test_packed_draft_identity_is_the_drafts_own_logical_dtype(self):
+        # The pools pack together because both store as uint8; the target
+        # chunks are shared, the draft chunks must not be.
+        target = self._suffixes(self._controller())
+        e5m2 = self._suffixes(
+            self._packed_controller(draft_dtypes=(torch.float8_e5m2,)),
+            algorithm="EAGLE",
+            draft_id="bundled",
+        )
+        self.assertEqual(
+            e5m2, [*target, self._draft_suffix(target[0], dtype="float8_e5m2") + "_H1"]
+        )
+        self.assertNotEqual(e5m2[-1], self._draft_suffix(target[0]) + "_H1")
+
+    def test_packed_draft_spans_tile_the_page_block(self):
+        controller = self._packed_controller()
+        controller.storage_host_pool.layout = "page_unified"
+        controller.storage_host_pool.storage_format_tag = None
+        controller.mem_pool_host.layout = "page_unified"
+        controller.enable_storage_metrics = False
+        memory = SimpleNamespace(
+            hicache_storage_key_scheme="unified",
+            hicache_storage_head_partition=4,
+            hicache_storage_layer_partition=4,
+            hicache_storage_draft_id="bundled",
+        )
+        parallel = SimpleNamespace(
+            tp_rank=1,
+            tp_size=2,
+            attn_tp_rank=1,
+            attn_tp_size=2,
+            attn_dcp_size=1,
+            attn_dcp_rank=0,
+            pp_rank=1,
+            pp_size=2,
+        )
+        module = "sglang.srt.managers.cache_controller"
+        with (
+            patch(f"{module}.get_memory", return_value=memory),
+            patch(f"{module}.get_parallel", return_value=parallel),
+            patch(
+                f"{module}.get_spec",
+                return_value=SimpleNamespace(speculative_algorithm="EAGLE"),
+            ),
+            patch(f"{module}.is_dp_attention_enabled", return_value=False),
+            patch.object(controller, "get_attn_cp_rank_and_size", return_value=(0, 1)),
+        ):
+            config = controller._generate_storage_config("org/model")
+        # 4 target layers then the draft layer, 16 tokens x (K + V) x 4 x 128.
+        self.assertEqual(config.unified_chunk_spans, [(0, 65536), (65536, 16384)])
+        self.assertTrue(config.unified_suffixes[-1].endswith("_D0-1_H1"))
+
+    def test_packed_drafts_that_cannot_be_named_are_refused(self):
+        two = (torch.float8_e4m3fn, torch.float8_e4m3fn)
+        mixed = (torch.float8_e4m3fn, torch.float8_e5m2)
+        cases = {
+            # DSPARK compressed-KV packs too.
+            "not_nextn": (
+                dict(algorithm="DSPARK"),
+                {},
+                "only for NEXTN-style MTP; --speculative-algorithm DSPARK is not",
+            ),
+            # The refusal names what it found, not "None".
+            "no_algorithm": (
+                dict(algorithm=None),
+                {},
+                "a host pool with 1 packed draft layer.s. and no speculative "
+                "algorithm is not supported",
+            ),
+            "deeper_draft": ({}, dict(draft_dtypes=two), "one packed draft layer"),
+            "mixed_dtypes": ({}, dict(draft_dtypes=mixed), "one packed draft layer"),
+            "no_draft_id": (dict(draft_id=None), {}, "needs a draft id"),
+            "prefill_cp": (dict(attn_cp_size=2), {}, "prefill context parallelism"),
+        }
+        for name, (call, pool, message) in cases.items():
+            with (
+                self.subTest(name),
+                self.assertRaisesRegex(NotImplementedError, message),
+            ):
+                self._suffixes(
+                    self._packed_controller(**pool),
+                    **{"algorithm": "EAGLE", "draft_id": "bundled", **call},
+                )
+        # The host pool says one draft layer, the pool group holds none.
+        controller = self._packed_controller()
+        controller.mem_pool_host.anchor_entry.packed_draft_device_pools = ()
+        with self.assertRaisesRegex(NotImplementedError, "from 0 draft pool"):
+            self._suffixes(controller, algorithm="EAGLE", draft_id="bundled")
+        # Only the last pipeline stage hosts a draft.
+        controller = self._packed_controller()
+        controller.storage_host_pool.start_layer = 0
+        controller.storage_host_pool.end_layer = 4
+        with self.assertRaisesRegex(ValueError, "final pipeline stage"):
+            self._suffixes(controller, pp_rank=0, algorithm="EAGLE", draft_id="bundled")
 
     def test_anchor_dtype_and_attention_topology_define_mha_keys(self):
         namespace = derive_namespace(

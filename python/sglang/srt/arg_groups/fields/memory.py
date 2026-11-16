@@ -222,8 +222,10 @@ class Memory(msgspec.Struct):
                 "--hicache-io-backend kernel. Supported by the file and "
                 "mooncake backends, which store one object per chunk and "
                 "serve head- and layer-partitioned grids. Speculative decoding "
-                "is supported only where no draft KV enters the host cache "
-                "(DFLASH with its draft KV ring, FROZEN_KV_MTP)."
+                "is supported with NEXTN-style MTP, whose packed draft layer "
+                "is stored as a chunk of its own, and where no draft KV "
+                "enters the host cache (DFLASH with its draft KV ring, "
+                "FROZEN_KV_MTP)."
             ),
             choices=["rank-suffix", "unified"],
         ),
@@ -254,6 +256,23 @@ class Memory(msgspec.Struct):
                 "end short, and that remainder forms the last chunk. Unset, "
                 "each stage stores its own layer range and shares only with an "
                 "identical split."
+            ),
+        ),
+    ] = None
+    hicache_storage_draft_id: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Identity of the speculative draft's weights in L3 keys under "
+                "--hicache-storage-key-scheme unified, for algorithms whose "
+                "draft KV is stored. Like the served model name for the "
+                "target, it is declared, not measured: instances share draft "
+                "KV exactly when it matches, so give every instance that "
+                "serves the same draft weights the same id, and different "
+                "weights different ids. Unset, it is 'bundled' for a draft "
+                "that is part of the target checkpoint, otherwise the draft "
+                "model path and revision as given, which differ between hosts "
+                "that mount the same draft at different paths."
             ),
         ),
     ] = None

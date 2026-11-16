@@ -8,6 +8,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.model_override_base import resolving_view, use_mla_backend
 from sglang.srt.arg_groups.overrides import declare_resolution
+from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
 
@@ -257,6 +258,10 @@ def resolve_hicache_key_scheme(server_args: Any):
 # hold the target KV alone, so the unified keys of a deployment without
 # speculative decoding name every byte.
 _UNIFIED_KEY_SCHEME_DRAFT_FREE_ALGORITHMS = ("FROZEN_KV_MTP",)
+# Algorithms whose draft KV is stored under unified keys. EAGLE covers
+# NEXTN-style MTP, whose one-layer draft is packed onto the target's page
+# block; an EAGLE draft that does not pack is refused once it is loaded.
+_UNIFIED_KEY_SCHEME_DRAFT_KV_ALGORITHMS = ("EAGLE",)
 
 
 def validate_unified_key_scheme_speculative(server_args: Any) -> None:
@@ -273,8 +278,21 @@ def validate_unified_key_scheme_speculative(server_args: Any) -> None:
         or cfg.enable_unified_cache_external_linker
         or not _hicache_resolution_active(cfg)
     ):
+        if cfg.hicache_storage_draft_id is not None:
+            raise ValueError(
+                "--hicache-storage-draft-id names draft KV in unified L3 keys; it "
+                "needs --hicache-storage-key-scheme unified on the hierarchical "
+                "cache."
+            )
         return
     algorithm = cfg.speculative_algorithm
+    if algorithm not in _UNIFIED_KEY_SCHEME_DRAFT_KV_ALGORITHMS:
+        if cfg.hicache_storage_draft_id is not None:
+            raise ValueError(
+                "--hicache-storage-draft-id is set, but "
+                f"--speculative-algorithm {algorithm} stores no draft KV under "
+                "unified L3 keys."
+            )
     if algorithm is None:
         return
     if (
@@ -290,6 +308,9 @@ def validate_unified_key_scheme_speculative(server_args: Any) -> None:
         )
     if algorithm in _UNIFIED_KEY_SCHEME_DRAFT_FREE_ALGORITHMS:
         return
+    if algorithm in _UNIFIED_KEY_SCHEME_DRAFT_KV_ALGORITHMS:
+        _validate_unified_draft_kv(server_args)
+        return
     if algorithm == "DFLASH":
         if cfg.speculative_dflash_draft_kv_ring:
             # A ring holds no prefix, so no draft KV follows a page to L3.
@@ -302,9 +323,84 @@ def validate_unified_key_scheme_speculative(server_args: Any) -> None:
         )
     raise NotImplementedError(
         f"--hicache-storage-key-scheme unified does not support "
-        f"--speculative-algorithm {algorithm} (supported: FROZEN_KV_MTP, DFLASH "
-        f"with the draft KV ring). Use --hicache-storage-key-scheme rank-suffix."
+        f"--speculative-algorithm {algorithm} (supported: NEXTN-style MTP, "
+        f"FROZEN_KV_MTP, DFLASH with the draft KV ring). Use "
+        f"--hicache-storage-key-scheme rank-suffix."
     )
+
+
+def _validate_unified_draft_kv(server_args: Any) -> None:
+    """Requirements of an algorithm whose draft KV is stored under unified keys.
+
+    Draft chunks are required for a hit and, once written, never rewritten,
+    so a deployment must not be able to publish draft rows that are missing,
+    random, or produced on a path whose draft KV was not verified.
+    """
+    cfg = resolving_view(server_args)
+    scheme = "--hicache-storage-key-scheme unified"
+    algorithm = cfg.speculative_algorithm
+    draft_load_format = cfg.speculative_draft_load_format or cfg.load_format
+    refusals = (
+        (
+            cfg.enable_multi_layer_eagle,
+            "multi-layer EAGLE: the rows of a deeper draft layer depend on "
+            "tokens that the page's key does not cover",
+        ),
+        (
+            cfg.hicache_host_memory_mode == "buffer_only",
+            "--hicache-host-memory-mode buffer_only",
+        ),
+        (
+            draft_load_format == "dummy",
+            "a draft with random weights (load format 'dummy'): its KV differs "
+            "from process to process",
+        ),
+        (cfg.attn_cp_size > 1, "prefill context parallelism (--attn-cp-size > 1)"),
+        (
+            cfg.disaggregation_mode != "null",
+            f"PD disaggregation (--disaggregation-mode {cfg.disaggregation_mode})",
+        ),
+        (cfg.enable_streaming_session, "--enable-streaming-session"),
+        (cfg.enable_session_radix_cache, "--enable-session-radix-cache"),
+        (
+            envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get(),
+            "SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND=1: skipped steps leave draft "
+            "rows unwritten",
+        ),
+    )
+    for refused, what in refusals:
+        if refused:
+            raise NotImplementedError(
+                f"{scheme} stores the draft KV of --speculative-algorithm "
+                f"{algorithm} and does not support {what}. Use "
+                f"--hicache-storage-key-scheme rank-suffix."
+            )
+
+    draft_id = cfg.hicache_storage_draft_id
+    if draft_id is None:
+        # Without a draft path the draft loads from the target checkpoint, at
+        # the target's revision (ModelConfig.from_server_args).
+        target_revision = cfg.revision or "main"
+        draft_path = cfg.speculative_draft_model_path or cfg.model_path
+        draft_revision = cfg.speculative_draft_model_revision or (
+            target_revision if cfg.speculative_draft_model_path is None else "main"
+        )
+        if draft_path == cfg.model_path and draft_revision == target_revision:
+            # Part of the target checkpoint, which the target namespace names.
+            draft_id = "bundled"
+        else:
+            draft_id = f"{draft_path}@{draft_revision}"
+        if cfg.speculative_draft_model_quantization:
+            # The same checkpoint quantized is another draft.
+            draft_id += f"+{cfg.speculative_draft_model_quantization}"
+        declare_resolution(
+            server_args,
+            "validate_unified_key_scheme_speculative",
+            hicache_storage_draft_id=draft_id,
+        )
+    elif not draft_id:
+        raise ValueError("--hicache-storage-draft-id must not be empty.")
+    logger.info("HiCache unified L3 keys: draft id %r for %s.", draft_id, algorithm)
 
 
 def resolve_layout_io_compatibility(server_args: Any):

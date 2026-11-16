@@ -83,13 +83,31 @@ that every local shard tiles the shared chunk grid. The scheme pins
 page is a hit only when all of its chunks are present. It supports a single
 MHA or MLA KV pool; composite caches and DCP are not supported.
 
-Speculative decoding is supported only where no draft KV enters the host
-cache: DFLASH with its draft KV ring, and FROZEN_KV_MTP (whose Gemma 4 targets
-are composite caches and stay unsupported for that reason). Their objects are
-exactly those of a deployment without speculative decoding. Other algorithms
-are refused at startup. EAGLE-family algorithms, FROZEN_KV_MTP included, hash
-pages over token pairs, so they never share objects with deployments that
-hash single tokens.
+Speculative decoding:
+
+- NEXTN-style MTP (one draft layer packed onto the target's pages): the draft
+  rows of a page are stored as one more chunk per head group,
+  `{page}_{draft digest}_D0-1[_H{g}]`, next to the unchanged target chunks.
+  The draft digest (prefix `ukd1`) names the target namespace, the draft's KV
+  dtype and geometry, and a draft id: `bundled` for a draft that is part of
+  the target checkpoint, otherwise the draft path and revision, or
+  `--hicache-storage-draft-id` when instances mount the same draft at
+  different paths. A page is a hit only with its draft chunk; a reader with
+  another draft misses on that chunk alone and adds its own. Refused at
+  startup with prefill context parallelism, PD disaggregation, streaming
+  sessions, the session radix cache, `buffer_only` host memory, multi-layer
+  EAGLE, a draft loaded with random weights, or
+  `SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND=1`.
+- Algorithms that keep no draft KV in the host cache (DFLASH with its draft KV
+  ring; FROZEN_KV_MTP, whose Gemma 4 targets are composite caches and stay
+  unsupported for that reason) store exactly the objects of a deployment
+  without speculative decoding.
+- Other algorithms are refused at startup; an EAGLE draft that does not pack
+  onto the target's pages is refused when the cache is built.
+
+EAGLE-family algorithms, NEXTN and FROZEN_KV_MTP included, hash pages over
+token pairs, so they never share objects with deployments that hash single
+tokens.
 
 ### GPU staging capacity
 
