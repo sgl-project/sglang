@@ -429,8 +429,11 @@ the image\n<|vision_start|><|image_pad|><|vision_end|><|im_end|>\n<|im_start|>as
         generator = batch.generator
 
         assert batch.image_path is not None
-        image = load_image(_resolve_layered_image_path(batch.image_path))
-        image = image.convert("RGBA")
+        # the layered VAE encodes RGBA, so the input's alpha must survive loading
+        image = load_image(
+            _resolve_layered_image_path(batch.image_path),
+            convert_method=lambda image: image.convert("RGBA"),
+        )
         image_size = image.size
         resolution = server_args.pipeline_config.resolution
         calculated_width, calculated_height = calculate_dimensions(
