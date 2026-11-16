@@ -128,7 +128,7 @@ jobs:
   # stays at the default so the two workflows share one cache entry.
   rust-ext-build:
     needs: [check-changes, call-gate]
-    if: |
+    if: &build-gate |
       !cancelled() &&
       needs.check-changes.result == 'success' &&
       (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
@@ -137,7 +137,28 @@ jobs:
       runs_on: ubuntu-22.04
       artifact_name: rust-ext-x86_64-extra
       git_ref: ${{ inputs.git_ref || '' }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true }}
+    secrets: inherit
+
+  # Own build job for the same reason as rust-ext-build above.
+  sgl-router-build:
+    needs: [check-changes, call-gate]
+    if: *build-gate
+    uses: ./.github/workflows/_pr-test-sgl-router-build.yml
+    with:
+      runs_on: ubuntu-22.04
+      artifact_name: sgl-router-x86_64-extra
+      git_ref: ${{ inputs.git_ref || '' }}
+    secrets: inherit
+
+  # For the GB300 rows.
+  sgl-router-build-aarch64:
+    needs: [check-changes, call-gate]
+    if: *build-gate
+    uses: ./.github/workflows/_pr-test-sgl-router-build.yml
+    with:
+      runs_on: ubuntu-22.04-arm
+      artifact_name: sgl-router-aarch64-extra
+      git_ref: ${{ inputs.git_ref || '' }}
     secrets: inherit
 
   simulator-test-cpu:
@@ -163,7 +184,7 @@ jobs:
   # `name:` keeps the job names wait-for-jobs and check-pr-test-health match on.
   extra-test:
     name: ${{ matrix.stage }}-test-${{ matrix.runner_config }}
-    needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build]
+    needs: [check-changes, call-gate, sgl-kernel-build-wheels, rust-ext-build, sgl-router-build, sgl-router-build-aarch64]
     if: ${{ !failure() && !cancelled() && needs.check-changes.result == 'success' && (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped') }}
     strategy:
       fail-fast: false
@@ -206,6 +227,8 @@ jobs:
       # The artifact is built for x86_64. An aarch64 row passes none, so it
       # restores the aarch64 cache that pr-test.yml's aarch64 build seeds.
       rust_ext_artifact: ${{ matrix.arch != 'aarch64' && needs.rust-ext-build.outputs.artifact_name || '' }}
+      # Each row takes its own arch's build; an empty name restores that arch's cache.
+      sgl_router_artifact: ${{ matrix.arch == 'aarch64' && needs.sgl-router-build-aarch64.outputs.artifact_name || matrix.arch != 'aarch64' && needs.sgl-router-build.outputs.artifact_name || '' }}
     secrets: inherit
 
   xeon-extra:
@@ -229,6 +252,8 @@ jobs:
         call-gate,
         sgl-kernel-build-wheels,
         rust-ext-build,
+        sgl-router-build,
+        sgl-router-build-aarch64,
         simulator-test-cpu,
         simulator-test-gpu,
         extra-test,

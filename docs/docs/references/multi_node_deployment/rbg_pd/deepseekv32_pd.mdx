@@ -488,24 +488,59 @@ spec:
               - sh
               - -c
               - >
-                python3 -m sglang_router.launch_router
+                sgl-router
+                --model-id /work/models
+                --no-tokenizer
                 --host 0.0.0.0
                 --port 8080
-                --pd-disaggregation
                 --policy random
                 --service-discovery
                 --service-discovery-namespace ${NAMESPACE}
-                --service-discovery-port 30000
                 --prefill-selector pd_role=prefill
                 --decode-selector pd_role=decode
-                --max-payload-size 2147483648
-                --worker-startup-timeout-secs 1200
               env:
               - name: NAMESPACE
                 valueFrom:
                   fieldRef:
                     apiVersion: v1
                     fieldPath: metadata.namespace
+              - name: SGLANG_ROUTER_MAX_BODY_BYTES
+                value: "2147483648"
+***
+# sgl-router discovers workers through EndpointSlices, which carry their Service's labels
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    pd_role: prefill
+  name: deepseek-rbg-32exp-prefill-http
+  namespace: default
+spec:
+  ports:
+    - name: http
+      port: 30000
+      protocol: TCP
+      targetPort: 30000
+  selector:
+    rolebasedgroup.workloads.x-k8s.io/name: deepseek-rbg-32exp
+    pd_role: prefill
+***
+apiVersion: v1
+kind: Service
+metadata:
+  labels:
+    pd_role: decode
+  name: deepseek-rbg-32exp-decode-http
+  namespace: default
+spec:
+  ports:
+    - name: http
+      port: 30000
+      protocol: TCP
+      targetPort: 30000
+  selector:
+    rolebasedgroup.workloads.x-k8s.io/name: deepseek-rbg-32exp
+    pd_role: decode
 ***
 apiVersion: v1
 kind: Service

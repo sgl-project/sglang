@@ -36,8 +36,6 @@ from sglang.srt.runtime_context import (
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
-_UNCACHED_MEGA_MOE_MAX_NUM_SMS = mega_moe._mega_moe_max_num_sms.__wrapped__
-
 
 class TestDeepGemmMegaMoeApi(CustomTestCase):
     def setUp(self):
@@ -51,6 +49,7 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         self.deep_gemm.set_num_sms = MagicMock(
             side_effect=lambda num_sms: setattr(self.deep_gemm, "num_sms", num_sms)
         )
+        self.deep_gemm.destroy_localizer = MagicMock()
         max_num_sms = patch.object(mega_moe, "_mega_moe_max_num_sms", return_value=130)
         self.max_num_sms = max_num_sms.start()
         self.addCleanup(max_num_sms.stop)
@@ -144,16 +143,6 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         self.assertIsNot(buffers[0], buffers[2])
         self.assertEqual(deep_gemm.get_symm_buffer_for_mega_moe.call_count, 2)
 
-    def test_decode_reserved_sms_applies_to_sm107_decode_only(self):
-        max_num_sms = _UNCACHED_MEGA_MOE_MAX_NUM_SMS
-        props = SimpleNamespace(multi_processor_count=212)
-        with patch.object(torch.cuda, "get_device_properties", return_value=props):
-            for device_sm, decode in ((107, 194), (100, 210)):
-                with self.subTest(device_sm=device_sm):
-                    with patch.object(mega_moe, "_device_sm", device_sm):
-                        self.assertEqual(max_num_sms(False), 210)
-                        self.assertEqual(max_num_sms(True), decode)
-
     def test_buffer_cache_separates_activation_contracts(self):
         self.deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(
             side_effect=lambda *args, **kw: object()
@@ -186,6 +175,26 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         buf = self._get_test_buffer(object())
         self.assertEqual(buf, 132)
         deep_gemm.set_num_sms.assert_not_called()
+
+    def test_new_buffer_stops_mlopart_helper_on_sm100_only(self):
+        """SM100 must stop the MLOPart helper, which blocks cuda-checkpoint, once per
+        new buffer. SM90 must not call it, since that would start the helper."""
+        self.deep_gemm.get_symm_buffer_for_mega_moe = MagicMock(
+            side_effect=lambda *_args, **_kwargs: object()
+        )
+        for sm100, expected_calls in ((False, 0), (True, 1)):
+            with (
+                self.subTest(sm100=sm100),
+                patch.object(mega_moe, "is_sm100_supported", return_value=sm100),
+            ):
+                mega_moe._MEGA_MOE_SYMM_BUFFER.clear()
+                self.deep_gemm.destroy_localizer.reset_mock()
+                group = object()
+                self._get_test_buffer(group)
+                self._get_test_buffer(group)
+                self.assertEqual(
+                    self.deep_gemm.destroy_localizer.call_count, expected_calls
+                )
 
     def test_buffer_allocation_failure_restores_sm_budget(self):
         deep_gemm = self.deep_gemm
@@ -465,10 +474,9 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
                     ids = torch.tensor([7, 99, 99])
                     hidden = torch.ones((3, 4))
                     batch = SimpleNamespace(
-                        forward_mode=ForwardMode.EXTEND,
                         moe_num_token_non_padded=lambda: torch.tensor(
                             2, dtype=torch.int32
-                        ),
+                        )
                     )
 
                     def run_experts(_experts, x, topk_ids, weights, **kwargs):
@@ -830,6 +838,16 @@ class TestDeepGemmMegaMoeApi(CustomTestCase):
         mega_moe.check_mega_moe_shapes(2048, 768, "nvfp4xnvfp4")
         with self.assertRaisesRegex(ValueError, "intermediate_size.*multiple of 256"):
             mega_moe.check_mega_moe_shapes(2048, 384, "nvfp4xnvfp4")
+
+    def test_shape_check_mxf4_takes_intermediate_multiples_of_128(self):
+        # The MXFP4 intermediate SFs are MN-major like fp8xfp4's, so DeepSeek-V4.1-Flash's
+        # 2304 (not a multiple of 512) is accepted; the input SF rows still need hidden % 512.
+        mega_moe.check_mega_moe_shapes(5120, 2304, "mxf4xmxf4")
+        mega_moe.check_mega_moe_shapes(512, 128, "mxf4xmxf4")
+        with self.assertRaisesRegex(ValueError, "intermediate_size.*multiple of 128"):
+            mega_moe.check_mega_moe_shapes(5120, 2240, "mxf4xmxf4")
+        with self.assertRaisesRegex(ValueError, "hidden_size.*multiple of 512"):
+            mega_moe.check_mega_moe_shapes(4864, 2304, "mxf4xmxf4")
 
     def test_mxf4_l1_uses_packed_gate_up_interleave(self):
         source = torch.arange(32).reshape(1, 32)

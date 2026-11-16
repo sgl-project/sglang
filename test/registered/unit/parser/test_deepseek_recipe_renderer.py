@@ -261,6 +261,25 @@ class TestDeepSeekRecipe(CustomTestCase):
                 }
             )
 
+    def test_fastokens_preserves_prompt_ids(self):
+        try:
+            from fastokens import Tokenizer, _ConfiguredTokenizerShim
+        except ImportError:
+            self.skipTest("fastokens is not installed")
+        if not hasattr(Tokenizer, "encode_segments"):
+            self.skipTest("fastokens has no segmented encoder")
+        candidate = renderer.DeepSeekRecipe(
+            "dsv41", _ConfiguredTokenizerShim(self.tokenizer)
+        )
+        self.assertIsNotNone(candidate._fast_prompt_tokenizer)
+        message = {"role": "user", "content": "中文 👩🏽‍💻 <think>x</think>"}
+        for thinking in (False, True):
+            body = {"messages": [message], "thinking": thinking}
+            with self.subTest(thinking=thinking):
+                self.assertEqual(
+                    candidate.encode(body), self.deepseek_recipe.encode(body)
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

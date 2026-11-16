@@ -1,0 +1,124 @@
+name: PR Test (Megakernel)
+run-name: "Megakernel: sgl-nvidia-mega#${{ inputs.mega_pr }} ${{ inputs.mega_sha }} (${{ inputs.dispatch_id }})"
+
+# Runs an sgl-nvidia-mega PR's end-to-end tests against SGLang main on GB300.
+# A maintainer starts it by adding the run-ci-sglang label to the PR in
+# sgl-project/sgl-nvidia-mega, whose run-ci-sglang.yml dispatches this workflow,
+# waits for this run and reports its outcome on the PR. This workflow uses no
+# secrets; the run name carries dispatch_id so the caller can find this run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      mega_repo:
+        description: "Repository holding the sgl-nvidia-mega PR's head (owner/name)"
+        type: string
+        required: true
+      mega_sha:
+        description: "Full commit SHA of the PR's head"
+        type: string
+        required: true
+      mega_pr:
+        description: "sgl-nvidia-mega PR number"
+        type: string
+        required: true
+      dispatch_id:
+        description: "Caller's ID for this dispatch, shown in the run name"
+        type: string
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-test-megakernel-${{ inputs.mega_pr }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: 4-gpu-gb300
+    timeout-minutes: 210
+    steps:
+      - name: Validate inputs
+        env:
+          MEGA_REPO: ${{ inputs.mega_repo }}
+          MEGA_SHA: ${{ inputs.mega_sha }}
+          MEGA_PR: ${{ inputs.mega_pr }}
+        run: |
+          [[ "$MEGA_REPO" =~ ^[A-Za-z0-9-]+/[A-Za-z0-9._-]+$ ]] || { echo "bad mega_repo: $MEGA_REPO"; exit 1; }
+          [[ "$MEGA_SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "bad mega_sha: $MEGA_SHA"; exit 1; }
+          [[ "$MEGA_PR" =~ ^[0-9]+$ ]] || { echo "bad mega_pr: $MEGA_PR"; exit 1; }
+
+      - uses: actions/checkout@v4
+
+      - uses: ./.github/actions/check-maintenance
+
+      - name: Install dependencies
+        timeout-minutes: 20
+        run: |
+          bash scripts/ci/cuda/ci_install_dependency.sh
+
+      - name: Check out the sgl-nvidia-mega PR
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ inputs.mega_repo }}
+          ref: ${{ inputs.mega_sha }}
+          path: sgl-nvidia-mega
+          persist-credentials: false
+
+      - name: Install sgl-nvidia-mega
+        run: |
+          python3 -m pip install --no-deps -e ./sgl-nvidia-mega
+
+      # End-to-end tests only; sgl-nvidia-mega runs its unit tests in its own CI.
+      # Its test/e2e/ci_models.yaml lists each model's tests and the GPUs on one
+      # host they need. Models this runner cannot hold are skipped with a notice.
+      # A Mega commit without that file runs the DeepSeek-V4.1-Flash tests.
+      - name: Select end-to-end tests
+        id: select
+        working-directory: sgl-nvidia-mega
+        env:
+          RUNNER_GPU: GB300
+          RUNNER_GPUS: "4"
+        run: |
+          python3 - <<'EOF'
+          import os, pathlib, re, sys
+          import yaml
+
+          gpu, gpus = os.environ["RUNNER_GPU"], int(os.environ["RUNNER_GPUS"])
+          e2e = pathlib.Path("test/e2e")
+          manifest = e2e / "ci_models.yaml"
+          if manifest.is_file():
+              models = yaml.safe_load(manifest.read_text())
+          else:
+              print(f"::notice::No {manifest}: running the DeepSeek-V4.1-Flash tests")
+              models = {"deepseek_v41": {"gpu": "GB300", "gpus": 4, "tests": [
+                  "test_deepseek_v41_server.py", "test_deepseek_v41_switch.py"]}}
+          tests = []
+          for name, model in models.items():
+              need = f"{model['gpus']} {model['gpu']} GPUs"
+              if model["gpu"] != gpu or model["gpus"] > gpus:
+                  print(f"::notice::Skipping {name}: needs {need}, runner has {gpus} {gpu}")
+              else:
+                  print(f"Selected {name} ({need}): {' '.join(model['tests'])}")
+                  tests += model["tests"]
+          listed = {t for model in models.values() for t in model["tests"]}
+          for path in sorted(e2e.glob("test_*.py")):
+              if path.name not in listed:
+                  print(f"::warning::{path} is in no model's tests, so it does not run")
+          bad = [t for t in tests if not re.fullmatch(r"test_\w+\.py", t) or not (e2e / t).is_file()]
+          if bad or not tests:
+              print(f"::error::Not test files in {e2e}: {bad}" if bad else "::error::No model fits this runner")
+              sys.exit(1)
+          with open(os.environ["GITHUB_OUTPUT"], "a") as f:
+              print("tests=" + " ".join(str(e2e / t) for t in tests), file=f)
+          EOF
+
+      - name: Run end-to-end tests
+        timeout-minutes: 180
+        working-directory: sgl-nvidia-mega
+        env:
+          TESTS: ${{ steps.select.outputs.tests }}
+        run: |
+          read -ra paths <<< "$TESTS"
+          python3 -m pytest -v -rfE "${paths[@]}"

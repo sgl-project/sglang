@@ -157,7 +157,7 @@ class TestEnableMetrics(CustomTestCase):
                         "text": "Hello, " * 100,
                         "sampling_params": {"temperature": 0, "max_new_tokens": 5},
                     },
-                    headers={"x-smg-routing-key": "test-key"},
+                    headers={"x-sgl-routing-key": "test-key"},
                 )
                 self.assertEqual(response.status_code, 200)
 

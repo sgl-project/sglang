@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import sys
 from array import array
-from typing import TYPE_CHECKING, Callable, Optional, Sequence
+from typing import TYPE_CHECKING, Callable, Mapping, Optional, Sequence
 
 import torch
 
@@ -27,7 +27,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     MatchPrefixParams,
     MatchResult,
 )
-from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.events import (
+    KvEventLoraNames,
+    enable_mm_routing_labels,
+    mm_routing_spans,
+)
+from sglang.srt.mem_cache.evict_policy import StateCostStrategy
 from sglang.srt.mem_cache.hicache_storage import PoolHitPolicy, PoolName, PoolTransfer
 from sglang.srt.mem_cache.kv.plan import TREE_STATE, TREE_WINDOW
 from sglang.srt.mem_cache.radix_cache import RadixKey
@@ -57,7 +62,6 @@ from sglang.srt.mem_cache.unified_cache.tree_core_registry import (
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core import StorageBackupSpec
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
-    JOINT_LRU_EVICTION_POLICY,
     BufferBackupSnapshot,
     BufferBackupState,
     DecSwaLockOnlyResult,
@@ -71,6 +75,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     RadixCacheWalkResult,
     TreePathNodeInfo,
     UnifiedTreeCoreInterface,
+    uses_joint_lru,
 )
 from sglang.srt.mem_cache.utils import (
     get_eviction_strategy,
@@ -146,6 +151,11 @@ def _kv_event_from_tagged(
             cache_salt=event[6],
             session_id=event[7],
             lora_name=lora_name,
+            mm_routing_spans=(
+                mm_routing_spans(event[3], event[4], len(event[1]))
+                if dynamo_format
+                else None
+            ),
         )
     if tag == "block_removed":
         seed = (
@@ -196,7 +206,7 @@ def _cache_action_from_tagged(action: tuple, ids: _CoreIds) -> CacheAction:
     if tag == "free_device_kv":
         return FreeDeviceKV(indices=list(action[1]))
     if tag == "free_device_kv_full_only":
-        return FreeDeviceKVFullOnly(indices=list(action[1]))
+        return FreeDeviceKVFullOnly(indices=list(action[1]), tree_owned=action[2])
     if tag == "backup_kv":
         return BackupKV(node_ids=list(action[1]))
     if tag == "mamba_evict_excess_path_states":
@@ -275,11 +285,14 @@ def _dec_lock_ref_params_to_binding(
     )
 
 
-def _transfer_to_binding(transfer: PoolTransfer) -> tuple:
+def _transfer_to_binding(
+    transfer: PoolTransfer, names: Mapping[str, str] = {}
+) -> tuple:
     """The binding's (name, host_indices, device_indices, nodes_to_load, keys,
-    hit_policy) tuple."""
+    hit_policy) tuple; ``names`` renames host pools to the core's names."""
+    name = str(transfer.name)
     return (
-        transfer.name.value,
+        names.get(name, name),
         transfer.host_indices,
         transfer.device_indices,
         transfer.nodes_to_load,
@@ -288,11 +301,14 @@ def _transfer_to_binding(transfer: PoolTransfer) -> tuple:
     )
 
 
-def _transfer_from_binding(transfer: tuple) -> PoolTransfer:
-    """Build the Python PoolTransfer for one of the binding's transfer tuples."""
+def _transfer_from_binding(
+    transfer: tuple, names: Mapping[str, str] = {}
+) -> PoolTransfer:
+    """Build the Python PoolTransfer for one of the binding's transfer tuples;
+    ``names`` renames the core's host pools to the cache's."""
     name, host_indices, device_indices, nodes_to_load, keys, hit_policy = transfer
     return PoolTransfer(
-        name=PoolName(name),
+        name=names.get(name) or name,
         host_indices=host_indices,
         device_indices=device_indices,
         keys=keys,
@@ -301,23 +317,41 @@ def _transfer_from_binding(transfer: tuple) -> PoolTransfer:
     )
 
 
+def _pool_hits_to_core(
+    hits: Mapping[str, int], names: Mapping[str, str]
+) -> dict[str, int]:
+    """Rekey per-pool hit pages by the core's pool names; a renamed pool's count
+    wins over any entry already under its core name, in either order."""
+    out: dict[str, int] = {}
+    renamed: set[str] = set()
+    for name, pages in hits.items():
+        core = names.get(str(name))
+        if core is not None:
+            out[core] = pages
+            renamed.add(core)
+        elif str(name) not in renamed:
+            out[str(name)] = pages
+    return out
+
+
 def _comp_xfers_to_binding(
     comp_xfers: dict[ComponentType, list[PoolTransfer]],
     ids: _CoreIds,
+    names: Mapping[str, str] = {},
 ) -> dict[int, list[tuple]]:
     """Rekey per-component transfers by the core's ids."""
     return {
-        ids.core(ct): [_transfer_to_binding(x) for x in xfers]
+        ids.core(ct): [_transfer_to_binding(x, names) for x in xfers]
         for ct, xfers in comp_xfers.items()
     }
 
 
 def _comp_xfers_from_binding(
-    comp_xfers: dict[int, list[tuple]], ids: _CoreIds
+    comp_xfers: dict[int, list[tuple]], ids: _CoreIds, names: Mapping[str, str] = {}
 ) -> dict[ComponentType, list[PoolTransfer]]:
     """Rekey the binding's per-component transfer tuples by the tree's ids."""
     return {
-        ids.tree(ct): [_transfer_from_binding(x) for x in xfers]
+        ids.tree(ct): [_transfer_from_binding(x, names) for x in xfers]
         for ct, xfers in comp_xfers.items()
     }
 
@@ -341,6 +375,8 @@ class _RustKVCacheEventRecorder:
     ):
         self._binding = binding
         self.enabled = enabled
+        if enabled and dynamo_format:
+            enable_mm_routing_labels()
         self._lora_names = lora_names
         self._dynamo_format = dynamo_format
 
@@ -360,6 +396,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
 
     _bindings = bindings
     supports_rotation_base = True
+    supports_joint_eviction = True
 
     def _cache_action_from_tagged(self, action: tuple) -> CacheAction | ComponentAction:
         return _cache_action_from_tagged(action, self._ids)
@@ -471,6 +508,12 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         # The core keeps each family's slot by its own id; translate at the
         # binding, so the tree's ids never reach it.
         self._ids = _CoreIds(params.tree_slots)
+        # The window slot the joint order covers (the tree's one window).
+        self.joint_window_type: Optional[ComponentType] = (
+            self.slot_id(TREE_WINDOW)
+            if uses_joint_lru(params, self.tree_components)
+            else None
+        )
         # Validate the same constructor options as Python before passing the
         # configured eviction parameters to the native strategy.
         eviction_strategy = get_eviction_strategy(
@@ -492,6 +535,19 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 )
         numbers = {slot.family: slot for slot in params.tree_slots}
         window = numbers[TREE_WINDOW].window if TREE_WINDOW in families else None
+        # The core names its window host pool `swa`; the cache's may go by the
+        # window sub-pool's name.
+        window_pool = (
+            numbers[TREE_WINDOW].host_pool if TREE_WINDOW in families else None
+        )
+        self._pool_names_to_core: dict[str, str] = (
+            {window_pool: str(PoolName.SWA)}
+            if window_pool is not None and window_pool != PoolName.SWA
+            else {}
+        )
+        self._pool_names_from_core = {
+            core: name for name, core in self._pool_names_to_core.items()
+        }
         if TREE_WINDOW in families and (window is None or window <= 0):
             raise ValueError("the SWA tree component requires a positive window")
 
@@ -526,23 +582,22 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
 
         mamba_max_states_per_path = (
-            get_exec().mamba.mamba_max_states_per_path if has_mamba else -1
+            get_exec().mamba.mamba_path_state_cap if has_mamba else -1
         )
 
         self._binding = self._binding_class()(
             self._bindings.TreeCoreInitParamsBinding(
-                # This core keeps no joint order; joint_lru evicts each
-                # component as lru here.
-                eviction_policy=(
-                    "lru"
-                    if params.eviction_policy.lower() == JOINT_LRU_EVICTION_POLICY
-                    else params.eviction_policy
-                ),
+                eviction_policy=params.eviction_policy,
                 slru_protected_threshold=getattr(
                     eviction_strategy, "protected_threshold", 2
                 ),
                 tlru_tail_budget=tlru_tail_budget,
                 tlru_float_config=tlru_float_config,
+                state_cost=(
+                    (eviction_strategy.d, eviction_strategy.e)
+                    if isinstance(eviction_strategy, StateCostStrategy)
+                    else None
+                ),
                 page_size=params.page_size,
                 is_write_back=False,
                 enable_hicache=False,
@@ -565,6 +620,8 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 mamba_host_only_checkpoint=(
                     host_only_mamba_checkpoint() if has_mamba else False
                 ),
+                # The joint Full/SWA LRU, kept only where uses_joint_lru holds.
+                joint_lru=uses_joint_lru(params, self.tree_components),
             ),
             # Each slot's id and family: the native core picks a slot's driver
             # by its family.
@@ -713,6 +770,16 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         return result
 
     # ==== Device eviction (driven step-wise by the Controller's evict()) ====
+
+    def start_joint_eviction(self) -> None:
+        self._binding.start_joint_eviction()
+
+    def next_joint_eviction_victim(self) -> Optional[tuple[ComponentType, NodeId]]:
+        victim = self._binding.next_joint_eviction_victim()
+        return None if victim is None else (self._ids.tree(victim[0]), victim[1])
+
+    def end_joint_eviction(self) -> None:
+        self._binding.end_joint_eviction()
 
     def evict_device_start(
         self, component_type: ComponentType, request_cnt: int
@@ -1053,7 +1120,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node_id: NodeId
     ) -> tuple[torch.Tensor, dict[ComponentType, list[PoolTransfer]]]:
         device_value, comp_xfers = self._binding.build_backup_spec(node_id)
-        comp_xfers = _comp_xfers_from_binding(comp_xfers, self._ids)
+        comp_xfers = _comp_xfers_from_binding(
+            comp_xfers, self._ids, self._pool_names_from_core
+        )
         self._refresh_swa_backup_indices(comp_xfers.get(self.slot_id(TREE_WINDOW), ()))
         return device_value, comp_xfers
 
@@ -1063,7 +1132,11 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         if self._swa_backup_index_mapper is None:
             return
         for transfer in transfers:
-            if transfer.name != PoolName.SWA or not transfer.nodes_to_load:
+            if (
+                self._pool_names_to_core.get(str(transfer.name), transfer.name)
+                != PoolName.SWA
+                or not transfer.nodes_to_load
+            ):
                 continue
             # Compaction can relocate SWA rows after the tree records them.
             # FULL virtual IDs retain their meaning across that relocation.
@@ -1089,7 +1162,9 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
             token_ids=token_ids,
             hash_value=spec.hash_value,
             prefix_keys=spec.prefix_keys,
-            comp_xfers=_comp_xfers_from_binding(spec.comp_xfers, self._ids),
+            comp_xfers=_comp_xfers_from_binding(
+                spec.comp_xfers, self._ids, self._pool_names_from_core
+            ),
         )
 
     def build_hicache_transfers(
@@ -1117,7 +1192,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         )
         if transfers is None:
             return None
-        transfers = [_transfer_from_binding(transfer) for transfer in transfers]
+        transfers = [
+            _transfer_from_binding(transfer, self._pool_names_from_core)
+            for transfer in transfers
+        ]
         if phase == CacheTransferPhase.BACKUP_HOST:
             self._refresh_swa_backup_indices(transfers)
         return transfers
@@ -1130,8 +1208,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         kv_xfer, comp_xfers = self._binding.build_load_back_spec(
             node_id, mamba_pool_idx
         )
-        kv_xfer = _transfer_from_binding(kv_xfer)
-        comp_xfers = _comp_xfers_from_binding(comp_xfers, self._ids)
+        kv_xfer = _transfer_from_binding(kv_xfer, self._pool_names_from_core)
+        comp_xfers = _comp_xfers_from_binding(
+            comp_xfers, self._ids, self._pool_names_from_core
+        )
         return kv_xfer, comp_xfers
 
     def prefetch_anchor_info(
@@ -1217,7 +1297,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         actions, mamba_exist = self._binding.commit_hicache_transfers(
             node_id,
             phase.value,
-            _comp_xfers_to_binding(comp_xfers, self._ids),
+            _comp_xfers_to_binding(comp_xfers, self._ids, self._pool_names_to_core),
             (
                 None
                 if insert_result is None
@@ -1232,7 +1312,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
                 if pool_storage_result is None
                 else (
                     pool_storage_result.kv_hit_pages,
-                    dict(pool_storage_result.extra_pool_hit_pages),
+                    _pool_hits_to_core(
+                        pool_storage_result.extra_pool_hit_pages,
+                        self._pool_names_to_core,
+                    ),
                 )
             ),
         )
@@ -1249,7 +1332,7 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         self._binding.commit_backup(
             node_id,
             host_indices,
-            _comp_xfers_to_binding(comp_xfers, self._ids),
+            _comp_xfers_to_binding(comp_xfers, self._ids, self._pool_names_to_core),
         )
 
     def commit_load_back(
@@ -1262,8 +1345,8 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         actions = self._binding.commit_load_back(
             node_id,
             device_indices,
-            _transfer_to_binding(kv_xfer),
-            _comp_xfers_to_binding(comp_xfers, self._ids),
+            _transfer_to_binding(kv_xfer, self._pool_names_to_core),
+            _comp_xfers_to_binding(comp_xfers, self._ids, self._pool_names_to_core),
         )
         return self._cache_actions_from_tagged(actions)
 
@@ -1289,7 +1372,10 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         transfers = self._binding.build_external_linker_offload_transfers(node_id)
         if transfers is None:
             return None
-        return [_transfer_from_binding(transfer) for transfer in transfers]
+        return [
+            _transfer_from_binding(transfer, self._pool_names_from_core)
+            for transfer in transfers
+        ]
 
     def mark_external_cache_stored_path(
         self, from_node_id: NodeId, until_node_id: NodeId

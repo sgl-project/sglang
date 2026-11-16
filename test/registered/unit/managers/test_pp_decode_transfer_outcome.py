@@ -20,7 +20,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 )
 from sglang.srt.managers.scheduler_pp_mixin import SchedulerPPMixin
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import FakeReq, decode_queue
+from sglang.test.scheduler_test_utils import FakeReq, decode_queue, leaving_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -116,7 +116,7 @@ def _transfer_queue(decode_reqs):
     queue._commit_transfer_to_req = MagicMock()
     queue._record_transfer_failure = MagicMock()
     queue.scheduler = SimpleNamespace(
-        request_retirer=MagicMock(),
+        request_retirer=leaving_retirer(),
         enable_decode_hicache=False,
         enable_hisparse=False,
         metrics_reporter=SimpleNamespace(enable_metrics=False),
@@ -151,7 +151,9 @@ class TestPopTransferredFollowsConsensusOutcome(CustomTestCase):
         not_yet_agreed = _decode_req("h", KVPoll.Success)
         queue = _transfer_queue([admitted, failed_elsewhere, not_yet_agreed])
 
-        reqs, outcomes = queue.pop_transferred_with_outcomes({"s": False, "f": True})
+        reqs, outcomes = queue.move_transferred_with_outcomes(
+            IndexedReqList(ListKind.WAITING), {"s": False, "f": True}
+        )
 
         self.assertEqual(reqs, [admitted.req])
         self.assertEqual(outcomes, {"s": False, "f": True})
@@ -168,7 +170,9 @@ class TestPopTransferredFollowsConsensusOutcome(CustomTestCase):
         failed_here = _decode_req("f", KVPoll.Failed)
         queue = _transfer_queue([failed_here])
 
-        reqs, outcomes = queue.pop_transferred_with_outcomes({"f": False})
+        reqs, outcomes = queue.move_transferred_with_outcomes(
+            IndexedReqList(ListKind.WAITING), {"f": False}
+        )
 
         self.assertEqual(reqs, [])
         self.assertEqual(outcomes, {"f": True})
@@ -177,7 +181,9 @@ class TestPopTransferredFollowsConsensusOutcome(CustomTestCase):
     def test_non_pp_path_keeps_the_request_list(self):
         admitted = _decode_req("s", KVPoll.Success)
         queue = _transfer_queue([admitted])
-        self.assertEqual(queue.pop_transferred(), [admitted.req])
+        self.assertEqual(
+            queue.move_transferred(IndexedReqList(ListKind.WAITING)), [admitted.req]
+        )
 
 
 class TestProcessDecodeTransferQueueForwardsOutcomes(CustomTestCase):
@@ -186,7 +192,7 @@ class TestProcessDecodeTransferQueueForwardsOutcomes(CustomTestCase):
         scheduler = SimpleNamespace(
             disagg_decode_transfer_queue=SimpleNamespace(
                 resolve_deferred_releases=MagicMock(),
-                pop_transferred_with_outcomes=MagicMock(
+                move_transferred_with_outcomes=MagicMock(
                     return_value=([admitted], {"s": False, "f": True})
                 ),
             ),
@@ -197,13 +203,15 @@ class TestProcessDecodeTransferQueueForwardsOutcomes(CustomTestCase):
             scheduler, {"s": False, "f": True, "h": False}
         )
         self.assertEqual(forwarded, {"s": False, "f": True})
-        self.assertEqual(list(scheduler.waiting_queue), [admitted])
+        scheduler.disagg_decode_transfer_queue.move_transferred_with_outcomes.assert_called_once_with(
+            scheduler.waiting_queue, {"s": False, "f": True, "h": False}
+        )
 
     def test_no_consensus_means_nothing_to_forward(self):
         scheduler = SimpleNamespace(
             disagg_decode_transfer_queue=SimpleNamespace(
                 resolve_deferred_releases=MagicMock(),
-                pop_transferred_with_outcomes=MagicMock(),
+                move_transferred_with_outcomes=MagicMock(),
             ),
             enable_hisparse=False,
             waiting_queue=[],
@@ -211,7 +219,7 @@ class TestProcessDecodeTransferQueueForwardsOutcomes(CustomTestCase):
         self.assertIsNone(
             SchedulerPPMixin.process_decode_transfer_queue(scheduler, None)
         )
-        scheduler.disagg_decode_transfer_queue.pop_transferred_with_outcomes.assert_not_called()
+        scheduler.disagg_decode_transfer_queue.move_transferred_with_outcomes.assert_not_called()
 
 
 if __name__ == "__main__":

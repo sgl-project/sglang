@@ -68,6 +68,7 @@ fn router(
             dp_ranks,
             openai: None,
             grpc_port: None,
+            supports_inline_system: false,
         };
         registry.add_with_cb(spec, None, profile).unwrap();
     }
@@ -357,12 +358,8 @@ async fn pd_fan_out_leaves_the_prefill_rank_to_the_engine() {
     ] {
         // A caller's rank is replaced too.
         body["routed_dp_rank"] = 3.into();
-        body["data_parallel_rank"] = 3.into();
         let (p, d) = send_pd(path, body).await;
-        assert!(
-            p["routed_dp_rank"].is_null() && p["data_parallel_rank"].is_null(),
-            "{path}"
-        );
+        assert!(p["routed_dp_rank"].is_null(), "{path}");
         assert!(
             d["routed_dp_rank"].as_u64().is_some_and(|rank| rank < 2)
                 && d.get("disagg_prefill_dp_rank").is_none(),

@@ -20,6 +20,7 @@ from sglang.srt.arg_groups.arg_utils import (
     nullable_str,
 )
 from sglang.srt.arg_groups.choices import (
+    KV_CACHE_DTYPE_CHOICES,
     LOAD_FORMAT_CHOICES,
     QUANTIZATION_CHOICES,
 )
@@ -117,6 +118,13 @@ class Model(msgspec.Struct):
         bool,
         "Whether to use a CausalLM as an embedding model.",
     ] = False
+    disable_normalize_embedding: A[
+        bool,
+        "Disable the L2 normalization the embedding Pooler applies after pooling, "
+        "returning the raw pooled vector. Only affects models whose Pooler is built "
+        "with normalize=True; custom poolers (cross-encoder, BERT pooler, vision "
+        "pooler) are unaffected.",
+    ] = False
     revision: A[
         Optional[str],
         "The specific model version to use. It can be a branch name, a tag name, or a commit id. If unspecified, will use the default version.",
@@ -202,21 +210,27 @@ class Model(msgspec.Struct):
                 'by the FA4 backend. "nvfp4" selects '
                 'the NVFP4 FP4 E2M1 KV cache recipe; "fp4_mx_block16" '
                 "selects the MX-style block-size-16 FP4 E2M1 KV cache "
-                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+"
+                "recipe. Both require CUDA 12.8+ and PyTorch 2.8.0+. Out-of-tree "
+                "platform plugins can register further values for KV cache formats "
+                "that only their KV pool implements; in-tree platforms reject them."
             ),
-            choices=[
-                "auto",
-                "fp8_e5m2",
-                "fp8_e4m3",
-                "mxfp8",
-                "bf16",
-                "bfloat16",
-                "nvfp4",
-                "fp4_mx_block16",
-            ],
+            choices=KV_CACHE_DTYPE_CHOICES,
             resolvable=True,
         ),
     ] = "auto"
+    indexer_kv_cache_dtype: A[
+        Optional[str],
+        Arg(
+            help=(
+                "Quantization recipe for the DSA lightning-indexer KV cache "
+                "(Ascend NPU only). None disables the quantized indexer cache "
+                'and keeps the default indexer behavior. "int8" stores the '
+                "indexer keys in INT8 with FP16 scales to speed up the "
+                "lightning indexer."
+            ),
+            choices=["int8"],
+        ),
+    ] = None
     qsa_indexer_dtype: A[
         str,
         Arg(

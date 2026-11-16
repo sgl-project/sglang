@@ -37,9 +37,13 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
 )
 from sglang.srt.managers.multimodal_processor import get_mm_processor, import_processors
+from sglang.srt.mem_cache.events import attach_mm_routing_labels
 from sglang.srt.multimodal.cache import media_preprocess_kwargs
 from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.multimodal.modality import Modality
+from sglang.srt.multimodal.token_space_mm_process.registry import (
+    register_token_space_models,
+)
 from sglang.srt.multimodal.transport import determine_tensor_transport_mode
 from sglang.srt.observability.trace import fastapi_telemetry_disabled_kwargs
 from sglang.srt.runtime_context import (
@@ -120,7 +124,6 @@ class EncoderBootstrapServer:
         health_check_timeout: Optional[float] = None,
         evicted_ttl: Optional[float] = None,
     ):
-
         self.host = host
         self.port = port
         self._urls: List[str] = urls if urls is not None else []
@@ -331,7 +334,6 @@ class EncoderBootstrapServer:
     # Lifecycle                                                          #
     # ------------------------------------------------------------------ #
     def _run_server(self):
-
         config = uvicorn.Config(
             self.app,
             host=self.host,
@@ -379,14 +381,15 @@ def _normalize_embedding_ports(embedding_port):
 
 async def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count):
     import grpc
-    from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
+
+    from sglang.encoder.v1 import encoder_pb2, encoder_pb2_grpc
 
     timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
     channel = grpc.aio.insecure_channel(target)
-    stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
+    stub = encoder_pb2_grpc.SglangEncoderStub(channel)
     try:
         await stub.SchedulerReceiveUrl(
-            sglang_encoder_pb2.SchedulerReceiveUrlRequest(
+            encoder_pb2.SchedulerReceiveUrlRequest(
                 req_id=req_id,
                 receive_url=receive_url,
                 receive_count=receive_count,
@@ -399,14 +402,15 @@ async def _grpc_scheduler_receive_url(target, req_id, receive_url, receive_count
 
 def _grpc_encode_request(target, encode_request):
     import grpc
-    from smg_grpc_proto import sglang_encoder_pb2, sglang_encoder_pb2_grpc
+
+    from sglang.encoder.v1 import encoder_pb2, encoder_pb2_grpc
 
     timeout_secs = envs.SGLANG_ENCODER_GRPC_TIMEOUT_SECS.get()
     channel = grpc.insecure_channel(target)
-    stub = sglang_encoder_pb2_grpc.SglangEncoderStub(channel)
+    stub = encoder_pb2_grpc.SglangEncoderStub(channel)
     try:
         response = stub.Encode(
-            sglang_encoder_pb2.EncodeRequest(
+            encoder_pb2.EncodeRequest(
                 mm_items=encode_request["mm_items"],
                 req_id=encode_request["req_id"],
                 num_parts=encode_request["num_parts"],
@@ -1076,6 +1080,10 @@ class WaitingMMRequestBase(ABC):
             _select_mm_processor_prompt(self.recv_req, self.mm_processor),
             recv_embedding,
             **self.recv_embedding_data.get_mm_extra_meta(),
+        )
+        attach_mm_routing_labels(
+            mm_inputs.mm_items,
+            self.recv_req.mm_routing_labels,
         )
         self._bind_pool_slot_to_mm_inputs(mm_inputs)
         self.recv_req.mm_inputs = mm_inputs
@@ -2002,6 +2010,7 @@ class MMReceiverBase(ABC):
         """Load processor and initialize mm_processor, shared by all backends."""
         transport_mode = determine_tensor_transport_mode()
         import_processors("sglang.srt.multimodal.processors")
+        register_token_space_models()
 
         extra_kwargs = {}
         if get_serving().tokenizer_backend is not None:

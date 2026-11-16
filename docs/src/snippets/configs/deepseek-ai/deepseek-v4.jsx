@@ -97,19 +97,12 @@ export const config = {
     const tp = dp || !prefill ? 8 : 4;
     const image = "lmsysorg/sglang-rocm:v0.5.22-rocm720-mi35x-20261019";
     const router = [
-      ...(official && dp ? ["env SGLANG_ROUTER_P2C_LOAD_METRIC=least_requests"] : []),
-      "python3 -m sglang_router.launch_router",
-      "  --pd-disaggregation",
-      "  --prefill http://<prefill-host>:30000",
-      "  --decode http://<decode-host>:30100",
+      "sgl-router",
+      "  --model-id {{MODEL_NAME}}",
+      "  --worker-urls http://<prefill-host>:30000 http://<decode-host>:30100",
       "  --host 0.0.0.0 --port 8000",
-      "  --policy consistent_hashing --dp-aware",
-      `  --decode-policy ${official && dp ? "power_of_two" : "round_robin"}`,
-      ...(official && dp ? ["  --worker-startup-check-interval 1"] : []),
-      "  --cache-threshold 0.3",
-      "  --balance-abs-threshold 2 --balance-rel-threshold 1.1",
-      "  --disable-circuit-breaker --health-failure-threshold 100",
-      "  --health-check-timeout-secs 600 --health-check-interval-secs 30",
+      "  --policy cache_aware --dp-aware",
+      "  --disable-circuit-breaker",
     ].join(" \\\n");
     const common = { ...cell, nnodes: 1, dockerImage: image, pdMode: role,
       router: { port: 8000, command: router } };
@@ -173,6 +166,9 @@ export const config = {
         `--chunked-prefill-size ${dp ? 65536 : 16384}`, "--disable-cuda-graph",
         "--enable-cache-report", "--optimistic-prefill-attempts 2",
         "--enable-unified-cache-external-linker", "--unified-cache-external-linker-backend mori",
+        // The cache_aware router learns prefixes only from these KV events.
+        `--kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}'`,
+        "--load-publish-endpoint auto",
       ] : [`--cuda-graph-bs-decode ${Array.from({ length: conc * 2 / (dp ? 8 : 1) }, (_, i) => i + 1).join(" ")}`]),
       `--disaggregation-mode ${role}`, "--disaggregation-transfer-backend mori",
       "--host {{HOST_IP}}", `--port ${prefill ? 30000 : 30100}`,
@@ -603,6 +599,8 @@ sgl-eval run mmmu_pro \\
             "--context-length 1048576",
             "--watchdog-timeout 3600",
             "--enable-metrics",
+            `--kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}'`,
+            "--load-publish-endpoint auto",
           ] },
         { id: "decode",  label: "Decode role",
           when: { hw: ["mi355x"], strategy: ["low-latency"] },
@@ -674,13 +672,12 @@ sgl-eval run mmmu_pro \\
       router: {
         port: 8000,
         command:
-`python3 -m sglang_router.launch_router \\
-  --pd-disaggregation \\
-  --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
-  --decode http://<decode-host>:{{DECODE_PORT}} \\
+`sgl-router \\
+  --model-id {{MODEL_NAME}} \\
+  --no-tokenizer \\
+  --worker-urls http://<prefill-host>:{{PREFILL_PORT}} http://<decode-host>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}} \\
-  --disable-circuit-breaker \\
-  --health-check-interval-secs 999999`,
+  --disable-circuit-breaker`,
       },
       // The MI355X roles above size for low latency: TP-only, a running-request
       // ceiling in the single digits, and a MORI dispatch budget per role. The
@@ -730,6 +727,8 @@ sgl-eval run mmmu_pro \\
             "--watchdog-timeout 3600",
             "--enable-metrics",
             "--enable-cache-report",
+            `--kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}'`,
+            "--load-publish-endpoint auto",
           ] },
         { mode: "decode",
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
@@ -770,6 +769,8 @@ sgl-eval run mmmu_pro \\
             "--watchdog-timeout 3600",
             "--enable-metrics",
             "--enable-cache-report",
+            `--kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}'`,
+            "--load-publish-endpoint auto",
           ] },
         { mode: "decode",
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
@@ -797,6 +798,8 @@ sgl-eval run mmmu_pro \\
             "--context-length 1048576",
             "--watchdog-timeout 3600",
             "--enable-metrics",
+            `--kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}'`,
+            "--load-publish-endpoint auto",
           ] },
         // TP-only, so the server-wide ceiling is also the per-rank batch and
         // the graph ladder runs all the way to 96.
@@ -871,6 +874,8 @@ sgl-eval run mmmu_pro \\
             "--watchdog-timeout 3600",
             "--enable-metrics",
             "--enable-cache-report",
+            `--kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}'`,
+            "--load-publish-endpoint auto",
           ] },
         { mode: "decode",
           when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
@@ -902,6 +907,8 @@ sgl-eval run mmmu_pro \\
             "--watchdog-timeout 3600",
             "--enable-metrics",
             "--enable-cache-report",
+            `--kv-events-config '{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:5557"}'`,
+            "--load-publish-endpoint auto",
           ] },
         { mode: "decode",
           when: { hw: ["mi355x"], strategy: ["high-throughput"] },
@@ -915,55 +922,36 @@ sgl-eval run mmmu_pro \\
             "--enable-metrics",
           ] },
       ],
-      // MI355X fronts the 1P x 1D agentic pair with a cache-aware router rather
-      // than the default round-robin: consistent_hashing keeps a conversation on
-      // the prefill worker that already holds its prefix (decode holds no
-      // reusable prefix, so Pro Official DP uses power-of-two; other presets
-      // keep round-robin). The tight balance thresholds stop that affinity
-      // from starving the peer at the small running-request ceiling above. Health checking stays
-      // enabled here (unlike the default's 999999s interval) because a long
-      // agentic run should notice a wedged worker, but it is slack enough that
-      // a multi-minute prefill is not mistaken for a failure.
+      // MI355X fronts the 1P x 1D agentic pair with cache_aware --dp-aware, which keeps a
+      // conversation on the prefill DP rank holding its prefix (decode keeps power_of_two);
+      // it learns prefixes from the prefill roles' KV events and needs a tokenizer.
       //
-      // The DP-attention arm additionally needs --request-timeout-secs raised:
-      // the 1800 s default aborts every request still queued behind an
-      // overloaded prefill at once, and an abort landing mid-RDMA-write strands
-      // the MORI TransferStatus and wedges that prefill DP's transfers for good.
-      // That value is the router's per-request HTTP deadline, NOT a queue-only
-      // limit, so raising it also delays the abort of a genuinely wedged worker
-      // from 30 minutes to 4 hours. It therefore stays scoped to the pair that
-      // needs it instead of riding on every MI355X pair. First match wins, so
-      // the narrower entry goes first.
+      // The DP-attention arm raises the router's timeouts to 4 h: the defaults (300 s to the
+      // first response bytes, 600 s per request) abort requests queued behind an overloaded
+      // prefill, and an abort mid-RDMA-write wedges that prefill DP's MORI transfers. Raising
+      // them also delays the abort of a wedged worker, so only this pair gets them; first match
+      // wins, so it goes first.
       routerOverrides: [
         { when: { hw: ["mi355x"], variant: ["pro-official"], quant: ["fp4"],
                   strategy: ["high-throughput"] },
           command:
-`env SGLANG_ROUTER_P2C_LOAD_METRIC=least_requests python3 -m sglang_router.launch_router \\
-  --pd-disaggregation \\
-  --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
-  --decode http://<decode-host>:{{DECODE_PORT}} \\
+`sgl-router \\
+  --model-id {{MODEL_NAME}} \\
+  --worker-urls http://<prefill-host>:{{PREFILL_PORT}} http://<decode-host>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}} \\
-  --policy consistent_hashing --dp-aware \\
-  --decode-policy power_of_two \\
-  --worker-startup-check-interval 1 \\
-  --cache-threshold 0.3 \\
-  --balance-abs-threshold 2 --balance-rel-threshold 1.1 \\
-  --disable-circuit-breaker --health-failure-threshold 100 \\
-  --health-check-timeout-secs 600 --health-check-interval-secs 30 \\
-  --request-timeout-secs 14400` },
+  --policy cache_aware --dp-aware \\
+  --disable-circuit-breaker \\
+  --request-timeout-secs 14400 \\
+  --stream-idle-timeout-secs 14400 \\
+  --stale-request-timeout-secs 14400` },
         { when: { hw: ["mi355x"] },
           command:
-`python3 -m sglang_router.launch_router \\
-  --pd-disaggregation \\
-  --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
-  --decode http://<decode-host>:{{DECODE_PORT}} \\
+`sgl-router \\
+  --model-id {{MODEL_NAME}} \\
+  --worker-urls http://<prefill-host>:{{PREFILL_PORT}} http://<decode-host>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}} \\
-  --policy consistent_hashing --dp-aware \\
-  --decode-policy round_robin \\
-  --cache-threshold 0.3 \\
-  --balance-abs-threshold 2 --balance-rel-threshold 1.1 \\
-  --disable-circuit-breaker --health-failure-threshold 100 \\
-  --health-check-timeout-secs 600 --health-check-interval-secs 30` },
+  --policy cache_aware --dp-aware \\
+  --disable-circuit-breaker` },
       ],
     },
 

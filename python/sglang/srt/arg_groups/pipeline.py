@@ -56,6 +56,7 @@ def run_resolution_pipeline(server_args: Any) -> None:
     # others from them (e.g. `--lora-paths` turning on `enable_lora`).
     run_hook(validate_rust_server_unsupported_args, server_args)
     from sglang.srt.arg_groups.serving_hook import (
+        handle_admin_api_key_env,
         handle_asr_validation,
         handle_crash_dump_env,
         handle_debug_utils,
@@ -74,6 +75,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
         handle_watermark_config,
     )
 
+    # Before any hook reads admin_api_key (the gRPC check in handle_deprecated_args).
+    run_hook(handle_admin_api_key_env, server_args)
     run_hook(handle_return_hidden_states_mode, server_args)
     run_hook(handle_media_url_security, server_args)
     run_hook(handle_watermark_config, server_args)
@@ -158,10 +161,12 @@ def run_resolution_pipeline(server_args: Any) -> None:
 
     from sglang.srt.arg_groups.kv_cache_hook import (
         handle_cache_compatibility,
+        handle_indexer_kv_cache_compatibility,
         handle_kv4_compatibility,
         handle_mxfp8_kv_cache_compatibility,
         handle_nvfp4_prefill_kv_dequant_dtype,
         handle_page_major_kv_layout,
+        handle_platform_kv_cache_dtype_compatibility,
         handle_prefill_only_disable_kv_cache,
         handle_unified_memory_pool,
         validate_prefill_only_disable_kv_cache_args,
@@ -267,6 +272,8 @@ def run_resolution_pipeline(server_args: Any) -> None:
     run_hook(handle_linear_attn_backend, server_args)
     run_hook(handle_kv4_compatibility, server_args)
     run_hook(handle_mxfp8_kv_cache_compatibility, server_args)
+    run_hook(handle_indexer_kv_cache_compatibility, server_args)
+    run_hook(handle_platform_kv_cache_dtype_compatibility, server_args)
     run_post_process_pass(server_args, _page_size_default)
     run_hook(handle_amd_specifics, server_args)
     run_hook(handle_nccl_pre_warm, server_args)

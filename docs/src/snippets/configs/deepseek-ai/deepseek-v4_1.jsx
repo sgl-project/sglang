@@ -58,7 +58,7 @@ export const config = {
     b200:  "lmsysorg/sglang:dev-dsv41",
     b300:  "lmsysorg/sglang:dev-dsv41",
     gb300: "lmsysorg/sglang:dev-dsv41",
-    mi355x: "lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261021",
+    mi355x: "lmsysorg/sglang-rocm:v0.5.23-rocm10-mi35x-20261111",
   },
 
   github: {
@@ -116,10 +116,10 @@ export const config = {
       router: {
         port: 8000,
         command:
-`sglang-router launch \\
-  --pd-disaggregation \\
-  --prefill http://<prefill-host>:{{PREFILL_PORT}} 8998 \\
-  --decode http://<decode-host>:{{DECODE_PORT}} \\
+`sgl-router \\
+  --model-id {{MODEL_NAME}} \\
+  --no-tokenizer \\
+  --worker-urls http://<prefill-host>:{{PREFILL_PORT}} http://<decode-host>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}}`,
       },
     },

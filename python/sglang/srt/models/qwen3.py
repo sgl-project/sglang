@@ -280,6 +280,12 @@ class Qwen3Attention(nn.Module):
             layer_id=layer_id,
             prefix=add_prefix("attn", prefix),
         )
+        if (
+            _is_npu
+            and quant_config is not None
+            and quant_config.get_name() == "modelslim"
+        ):
+            quant_config.init_kv_cache(self.attn, prefix, qkv_proj=self.qkv_proj)
         self.alt_stream = alt_stream
 
         # Qwen3 guarantees matching norm eps and full-head NeoX RoPE; these
@@ -908,7 +914,7 @@ class Qwen3ForCausalLM(nn.Module):
                 continue
             if name.startswith("model.vision_tower") and name not in params_dict:
                 continue
-            if "scale" in name:
+            if "scale" in name or (_is_npu and ".fa_" in name):
                 name = maybe_remap_kv_scale_name(name, params_dict)
                 if name is None:
                     continue

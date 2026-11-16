@@ -155,11 +155,71 @@ export const AgentX = ({ data: input }) => {
     }
     return out;
   };
+  // Submissions record router flags that sgl-router does not all take; render the sgl-router command that
+  // python/sglang/test/agentx_common.py launches for them, and keep the two in step.
+  // sgl-router reads each worker's PD role from its /server_info, so one --worker-urls list
+  // replaces --prefill/--decode.
+  // Flags whose behavior is sgl-router's default, or that it has no counterpart for.
+  const ROUTER_FLAGS_DROPPED = new Set(["--pd-disaggregation", "--request-id-headers",
+    "--connect-timeout-secs", "--disable-health-check", "--disable-retries",
+    "--balance-abs-threshold", "--retry-backoff-multiplier"]);
+  // cache_aware learns prefixes only from the cache-owning workers' KV events. sgl-router finds
+  // them through each worker's /server_info: one port per DP rank from the advertised base, and
+  // with --load-publish-endpoint auto as many again for load reports. Workers sharing a node
+  // offset that base by LOCAL_WORKER_RANK.
+  const KV_EVENTS_PORT = 5557;
+  const kvEventsConfig = (port) => `{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:${port}"}`;
+  // The router renders chats itself, so it needs the workers' render defaults.
+  const RENDER_ENV = ["SGLANG_DEFAULT_THINKING", "SGLANG_DSV4_REASONING_EFFORT", "SGLANG_DSV41_REASONING_EFFORT"];
+  const flag = (blk, name) => (((blk && blk.args) || []).find((a) => a[0] === name) || [])[1];
+  const withKvEvents = (w) => {
+    if (w.kind !== "worker" || !CACHE_ROLES.includes(w.role) || flag(w, "--kv-events-config")) return w;
+    const ranks = Number(flag(w, "--data-parallel-size") || flag(w, "--dp-size") || flag(w, "--dp") || 1)
+      * Number(flag(w, "--attn-dp-size") || 1);
+    const shared = w.local_ranks
+      ? `KV_EVENTS_CONFIG=${JSON.stringify(kvEventsConfig(`$((${KV_EVENTS_PORT} + ${2 * ranks} * LOCAL_WORKER_RANK))`))}`
+      : null;
+    const args = [...w.args, ["--kv-events-config", shared ? "$KV_EVENTS_CONFIG" : kvEventsConfig(KV_EVENTS_PORT)],
+      ["--load-publish-endpoint", "auto"]].sort(cmpArgs);
+    return { ...w, ...(shared ? { preamble: [...(w.preamble || []), shared] } : {}), args };
+  };
+  const toSglRouter = (blocks) => {
+    const b = blocks.find((x) => x.kind === "sgl-router");
+    const worker = blocks.find((w) => w.kind === "worker");
+    const model = flag(worker, "--model-path");
+    const served = flag(worker, "--served-model-name") || model;
+    const urls = [];
+    const rest = [];
+    for (const a of b.args || []) {
+      if (a[0] === "--prefill" || a[0] === "--decode") urls.push(a[1]);
+      else if (a[0] === "--worker-urls") urls.push(...a.slice(1));
+      // consistent_hashing pinned a routing key to a worker; cache_aware, which keeps a
+      // conversation on the worker holding its prefix, stands in for it (sgl-router's sticky
+      // is the exact counterpart, but needs clients to send the key).
+      else if (a[0] === "--policy") rest.push(["--policy", a[1] === "consistent_hashing" ? "cache_aware" : a[1]]);
+      // The recipe bounds the whole request; sgl-router bounds the time to response headers,
+      // the silence between chunks and the request lifetime separately.
+      else if (a[0] === "--request-timeout-secs") rest.push(a, ["--stream-idle-timeout-secs", a[1]], ["--stale-request-timeout-secs", a[1]]);
+      else if (a[0] === "--retry-max-retries") rest.push(["--retry-max-attempts", String(Number(a[1]) + 1)]);
+      else if (!ROUTER_FLAGS_DROPPED.has(a[0])) rest.push(a);
+    }
+    const cacheAware = rest.some((a) => a[0] === "--policy" && a[1] === "cache_aware");
+    if (!cacheAware) {
+      const router = { ...b, cmd: "sgl-router", args: [["--model-id", served], ["--no-tokenizer"], ["--worker-urls", ...urls], ...rest] };
+      return blocks.map((x) => (x === b ? router : x));
+    }
+    const cacheWorker = blocks.find((w) => w.kind === "worker" && CACHE_ROLES.includes(w.role));
+    const env = Object.fromEntries(Object.entries((cacheWorker && cacheWorker.env) || {}).filter(([k]) => RENDER_ENV.includes(k)));
+    const router = { ...b, cmd: "sgl-router", env: sortedObj({ ...(b.env || {}), ...env }),
+      args: [["--model-id", served], ["--tokenizer-path", model], ["--worker-urls", ...urls], ...rest] };
+    return blocks.map((x) => (x === b ? router : withKvEvents(x)));
+  };
   const blocksFor = (ci, pi, router, kv) => {
     const cell = data.cells[ci];
     const base = materialize(ci, router);
     const measured = pi === 0 ? base : applyPatch(base, ((cell.points[pi] || {}).patch || {})[router]);
-    return kvTransform(measured, cell.points[pi].kv, kv || cell.points[pi].kv, cell.kv, router);
+    const blocks = kvTransform(measured, cell.points[pi].kv, kv || cell.points[pi].kv, cell.kv, router);
+    return blocks.some((b) => b.kind === "sgl-router") ? toSglRouter(blocks) : blocks;
   };
 
   // ==== 2. Shell formatting ====
@@ -195,7 +255,7 @@ export const AgentX = ({ data: input }) => {
     "mooncake-master": "Mooncake master",
     "mooncake-store": "Mooncake store",
     "dynamo-frontend": "Dynamo frontend (OpenAI API)",
-    "sglang-router": "SGLang router (OpenAI API)",
+    "sgl-router": "SGLang router (OpenAI API)",
     nginx: "nginx — optional frontend load balancer",
   };
   const where = (b, router, workerCount) => {
@@ -221,7 +281,7 @@ export const AgentX = ({ data: input }) => {
     }
     if (b.kind === "dynamo-frontend") return (b.count > 1 ? `SA ran ${b.count} frontends on separate nodes behind nginx (previous tab; port 8180 each, nginx on 8000). One frontend on port 8000 also works.` : "Start once; clients connect to port 8000.") + " It finds the workers through etcd, so it can start before them.";
     if (b.kind === "nginx") return "Optional scale-out in front of the frontends (next tab): hashes each session onto one frontend and listens on port 8000, with nginx.conf (below) in the working directory.";
-    if (b.kind === "sglang-router") return "Start once after the workers; clients connect to port 8000.";
+    if (b.kind === "sgl-router") return "Start once after the workers; clients connect to port 8000.";
     return "";
   };
   const noteText = (S) => ({
@@ -232,6 +292,7 @@ export const AgentX = ({ data: input }) => {
     "nixl-libfabric": <><code style={S.code}>SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC</code> reflects SemiAnalysis's AWS-EFA B300 cluster. On InfiniBand, leave it unset to use NIXL's default UCX backend.</>,
     "ib-devices": <>Set <code style={S.code}>IB_DEVICES</code> to your node's RDMA NICs (comma-separated, e.g. <code style={S.code}>mlx5_0,mlx5_1</code>).</>,
     "mooncake-segment": <><code style={S.code}>MOONCAKE_GLOBAL_SEGMENT_SIZE</code> is the host DRAM each worker process contributes to the Mooncake store. Size it to your host memory.</>,
+    "sgl-router": <>The router command here is the recorded router flags translated to <code style={S.code}>sgl-router</code>, as the AgentX test harness launches it. Its <code style={S.code}>cache_aware</code> policy learns prefixes only from the workers' KV events, so the workers that hold the cache add <code style={S.code}>--kv-events-config</code> and <code style={S.code}>--load-publish-endpoint auto</code>.</>,
   });
   const notesFor = (blocks) => {
     const names = new Set(blocks.flatMap((b) => (b.args || []).map((a) => a[0])));
@@ -245,6 +306,7 @@ export const AgentX = ({ data: input }) => {
       env.SGLANG_DISAGGREGATION_NIXL_BACKEND === "LIBFABRIC" && "nixl-libfabric",
       env.MOONCAKE_GLOBAL_SEGMENT_SIZE !== undefined && "mooncake-segment",
       text.includes("$IB_DEVICES") && "ib-devices",
+      blocks.some((b) => b.kind === "sgl-router") && "sgl-router",
     ].filter(Boolean);
   };
   const PLACEHOLDERS = {
@@ -259,6 +321,7 @@ export const AgentX = ({ data: input }) => {
     DECODE_HEAD_IP: "first node of this decode worker",
     IB_DEVICES: "the node's RDMA NICs",
     EFA_DEVICES: "EFA device filter (AWS EFA fabrics only)",
+    DRAFT_MODEL_DIR: "local snapshot directory of the draft checkpoint (see the setup note)",
   };
   const placeholderText = (name) =>
     PLACEHOLDERS[name] ||
@@ -300,7 +363,7 @@ export const AgentX = ({ data: input }) => {
   const tabSlug = (t) => (t.id === "exports" ? "env"
     : t.file ? t.file.name
     : t.block.kind === "worker" ? (t.block.role === "agg" ? "worker" : t.block.role)
-    : { "dynamo-frontend": "frontend", "sglang-router": "router" }[t.block.kind] || t.block.kind);
+    : { "dynamo-frontend": "frontend", "sgl-router": "router" }[t.block.kind] || t.block.kind);
 
   // Provenance: values shared by every point of a deployment live once in cell.prov, and GitHub
   // URLs are stored as ids (mirrors expand_point() in emit.py, which checks the round trip).
@@ -405,7 +468,7 @@ export const AgentX = ({ data: input }) => {
 
   const shortTitle = (b) => {
     const base = b.kind === "worker" ? { agg: "Worker", prefill: "Prefill", decode: "Decode" }[b.role]
-      : { etcd: "etcd", nats: "NATS", "mooncake-master": "Mooncake master", "mooncake-store": "Mooncake store", "dynamo-frontend": "Frontend", "sglang-router": "Router", nginx: "nginx (optional)" }[b.kind] || b.kind;
+      : { etcd: "etcd", nats: "NATS", "mooncake-master": "Mooncake master", "mooncake-store": "Mooncake store", "dynamo-frontend": "Frontend", "sgl-router": "Router", nginx: "nginx (optional)" }[b.kind] || b.kind;
     const n = b.kind === "worker" ? b.workers : b.count;
     return n > 1 ? `${base} ×${n}` : base;
   };
@@ -607,7 +670,7 @@ export const AgentX = ({ data: input }) => {
           <ul style={S.list}>
             <li>Derived from the verified launch ({routerLabel[cell.submitted]}, {KV_LABEL[point.kv].toLowerCase()}); {T.notRun || "SemiAnalysis did not run this combination"}.</li>
             {router !== cell.submitted && (
-              <li>Router: re-rendered with srt-slurm's {router === "dynamo" ? "Dynamo" : "SGLang router"} frontend. Engine flags are unchanged; only the launcher, routing and router-specific flags differ.</li>
+              <li>Router: re-rendered with {router === "dynamo" ? "srt-slurm's Dynamo frontend" : "sgl-router"}. Engine flags are unchanged; only the launcher, routing and router-specific flags differ.</li>
             )}
             {kv !== point.kv && kv === "none" && <li>KV offload: removed; only the GPU KV cache is used.</li>}
             {kv !== point.kv && kv === "hicache" && (

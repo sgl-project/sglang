@@ -33,7 +33,10 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=7200, suite="nightly-amd-8-gpu-mi35x-kimi-k25-aiter-mla", nightly=True
+    est_time=7200,
+    suite="nightly-amd-8-gpu-mi35x-kimi-k25-aiter-mla",
+    nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 

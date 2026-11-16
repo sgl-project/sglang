@@ -6,6 +6,7 @@
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.h>   // For RuntimeCheck, div_ceil
 
+#include <sgl_kernel/activation.cuh>
 #include <sgl_kernel/math.cuh>
 #include <sgl_kernel/tile.cuh>
 #include <sgl_kernel/type.cuh>   // For dtype_trait, bf16_t, fp32_t, cast
@@ -28,11 +29,10 @@ namespace sglang {
 
 namespace kimi_k3 {
 
-/// One SiTU element. `sigmoid_fast` is `1/(1+expf(-x))` (math.cuh), i.e. the
-/// same expression both call sites used before they were folded together.
+/// One SiTU element.
 template <bool kHasLinearBeta>
 SGL_DEVICE float situ_activate(float g, float u, float beta, float inv_beta, float linear_beta, float inv_linear_beta) {
-  const float gate_out = beta * tanhf(g * inv_beta) * device::math::sigmoid_fast(g);
+  const float gate_out = beta * tanhf(g * inv_beta) * device::activation::sigmoid(g);
   float up_out;
   if constexpr (kHasLinearBeta) {
     up_out = linear_beta * tanhf(u * inv_linear_beta);
@@ -86,8 +86,10 @@ __global__ void situ_and_mul_kernel(const __grid_constant__ SituAndMulParams par
 
   PDLWaitPrimary<kUsePDL>();
 
-  const auto gate = load_as<vec_t>(params.input, input_offset);
-  const auto up = load_as<vec_t>(params.input, input_offset + num_vecs);
+  const auto input = assume_global(params.input);
+  vec_t gate, up;
+  gate.load(input, input_offset);
+  up.load(input, input_offset + num_vecs);
 
   PDLTriggerSecondary<kUsePDL>();
 

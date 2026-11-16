@@ -446,7 +446,6 @@
     "bootstrap_pair_key": null,
     "decode_tp_size": null,
     "routed_dp_rank": null,
-    "data_parallel_rank": null,
     "disagg_prefill_dp_rank": null,
     "routing_key": null,
     "conversation_id": null,

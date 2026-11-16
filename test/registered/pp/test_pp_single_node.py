@@ -38,7 +38,7 @@ register_amd_ci(est_time=500, suite="stage-c-test-4-gpu-amd")
 class TestPPAccuracy(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.base_url = "http://127.0.0.1:23333"
+        cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             DEFAULT_MODEL_NAME_FOR_TEST,
             cls.base_url,
@@ -144,7 +144,7 @@ class TestPPMixedChunk(CustomTestCase):
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_MODEL_NAME_FOR_TEST
-        cls.base_url = "http://127.0.0.1:23338"
+        cls.base_url = DEFAULT_URL_FOR_TEST
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,

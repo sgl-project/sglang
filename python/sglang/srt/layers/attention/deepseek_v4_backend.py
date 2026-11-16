@@ -278,7 +278,18 @@ def _num_sms(device_index: int) -> int:
 
 
 def _fast_flashmla_sched_shape(q: torch.Tensor) -> bool:
-    return q.is_cuda and get_platform().is_blackwell and q.shape[-2] == 64
+    # These layouts use the head64 kernel's schedule constants. Native heads
+    # require the newer kernel; V4's specialized head128 kernel stays excluded.
+    num_heads, head_dim = q.shape[-2], q.shape[-1]
+    if not (q.is_cuda and get_platform().is_blackwell):
+        return False
+    if num_heads == 64 or (num_heads == 128 and head_dim == 576):
+        return True
+    if not (1 <= num_heads < 128 and get_platform().is_sm100):
+        return False
+    from sglang.kernels.ops.attention import flash_mla_interface
+
+    return flash_mla_interface.supports_native_heads()
 
 
 def _maybe_precompute_flashmla_sched_meta(
@@ -289,23 +300,33 @@ def _maybe_precompute_flashmla_sched_meta(
     topk_length: Optional[torch.Tensor],
     extra_indices: Optional[torch.Tensor],
     extra_topk_length: Optional[torch.Tensor],
+    schedule: Literal["serial", "parallel", "windowed"] = "serial",
 ) -> None:
     """Fill the split-KV schedule buffers so `sparse_decode_fwd` skips its own
     `<<<1, 32>>>` scheduling kernel on the decode critical path;
-    `flashmla_sched_meta` produces the same schedule bit for bit."""
+    `flashmla_sched_meta` produces the same schedule bit for bit, or with
+    `schedule="windowed"` an equally balanced one in a fraction of the time."""
     if flashmla_metadata is None:
         return
     if getattr(flashmla_metadata, "tile_scheduler_metadata", None) is not None:
         return
     if not _fast_flashmla_sched_shape(q):
         return
+    from sglang.kernels.ops.attention import flash_mla_interface
     from sglang.kernels.ops.attention.dsv4.flashmla_sched_meta import (
         META_INTS,
         flashmla_sched_meta,
     )
 
     b, s_q = q.shape[0], q.shape[1]
-    num_sm_parts = max(_num_sms(q.device.index) // s_q, 1)
+    if flash_mla_interface.supports_native_heads():
+        # The native-head kernel divides the SMs across head blocks at small
+        # batch sizes. The schedule must use the same partition count.
+        num_sm_parts = flash_mla_interface.sparse_decode_num_sm_parts(
+            b, s_q, q.shape[2]
+        )
+    else:
+        num_sm_parts = max(_num_sms(q.device.index) // s_q, 1)
     if 4 * (5 * b + 1 + num_sm_parts * META_INTS) > 48 * 1024:
         return
     meta = torch.empty((num_sm_parts, META_INTS), dtype=torch.int32, device=q.device)
@@ -319,6 +340,7 @@ def _maybe_precompute_flashmla_sched_meta(
         fixed_overhead_num_blocks=_FLASHMLA_SCHED_FIXED_OVERHEAD,
         topk=indices.shape[-1],
         extra_topk=0 if extra_indices is None else extra_indices.shape[-1],
+        schedule=schedule,
     )
     flashmla_metadata.tile_scheduler_metadata = meta
     flashmla_metadata.num_splits = num_splits
@@ -788,7 +810,14 @@ class DSV4AttnMetadata:
             if src_val is None and dst_val is None:
                 continue
             assert dst_val is not None, f"{field_name=} {src_val=} {dst_val=}"
-            dst_val.copy_(src_val)
+            shape_mismatch = dst_val.shape != src_val.shape
+            assert not shape_mismatch or field_name in self._CP_GLOBAL_FIELDS, (
+                f"Only CP-global replay metadata may use a shorter live prefix, "
+                f"got {field_name=} {src_val.shape=} {dst_val.shape=}"
+            )
+            _copy_tensor_allowing_storage_alias(
+                dst_val, src_val, pad_value=0 if shape_mismatch else None
+            )
 
         # Safe to replace: captured kernels read only the per-replay objects, or
         # the field is produced in-graph before the attention graph break reads it.
@@ -1101,6 +1130,27 @@ def _prefill_graph_max_seq_len() -> Optional[int]:
     return get_exec().graph.cuda_graph_config.prefill.max_seq_len
 
 
+def _copy_tensor_allowing_storage_alias(
+    dst: torch.Tensor, src: torch.Tensor, *, pad_value: Optional[int] = None
+) -> None:
+    """Copy replay metadata while preserving capture-stable destination addresses."""
+    if dst is src:
+        return
+    if dst.untyped_storage().data_ptr() == src.untyped_storage().data_ptr():
+        src = src.clone()
+    if dst.shape == src.shape:
+        dst.copy_(src)
+        return
+    assert (
+        pad_value is not None
+        and dst.ndim == src.ndim
+        and dst.shape[0] >= src.shape[0]
+        and dst.shape[1:] == src.shape[1:]
+    ), f"Cannot copy replay metadata from {src.shape=} to {dst.shape=}"
+    dst.fill_(pad_value)
+    dst[: src.shape[0]].copy_(src)
+
+
 @dataclass
 class DSV4Metadata:
     core_attn_metadata: DSV4AttnMetadata
@@ -1300,7 +1350,7 @@ class DeepseekV4AttnBackend(
     ):
         super().__init__()
         self.model_runner = model_runner
-        # Run at every KV store-location read; the DSpark deferred context-KV commit
+        # Run at every KV store-location read; the DSpark deferred draft KV store
         # joins its forked write there (SGLANG_DSPARK_DEFER_CONTEXT_KV).
         self.pre_kv_store_hook: Optional[Callable[[], None]] = None
         self.encoder_replay = False
@@ -1352,15 +1402,16 @@ class DeepseekV4AttnBackend(
             candidate_topk_blocks=getattr(cfg, "candidate_topk_blocks", 0),
             candidate_block_size=getattr(cfg, "candidate_block_size", 0),
         )
+        self.index_topk = getattr(cfg, "index_topk", DEFAULT_INDEX_TOPK)
         self.full_topk_indexer = make_full_topk_indexer(
-            token_to_kv_pool=self.token_to_kv_pool, req_to_token=self.req_to_token
+            token_to_kv_pool=self.token_to_kv_pool,
+            req_to_token=self.req_to_token,
+            index_heads=int(cfg.index_n_heads),
+            index_topk=self.index_topk,
         )
         self.MAX_SEQ_LEN_FOR_CAPTURE = self.req_to_token.shape[1]
 
         assert isinstance(self.token_to_kv_pool, DeepSeekV4TokenToKVPool)
-        self.index_topk = getattr(
-            model_runner.model_config.hf_text_config, "index_topk", DEFAULT_INDEX_TOPK
-        )
 
         kernel = get_exec().kernel
         self.enable_deepseek_v4_fp4_indexer = kernel.enable_deepseek_v4_fp4_indexer
@@ -3654,8 +3705,11 @@ class DeepseekV4AttnBackend(
             q_lens_cpu = tail.local_lens_cpu
             req_global, pos_global = tail.req_global, tail.pos_global
         else:
+            extend_lens_cpu = _as_int_list(forward_batch.extend_seq_lens_cpu)
+            # BCG gathers the capture bucket; compressed state belongs to live rows.
+            total = sum(extend_lens_cpu)
             q_lens_cpu = interleave_rows_per_request(
-                _as_int_list(forward_batch.extend_seq_lens_cpu),
+                extend_lens_cpu,
                 get_parallel().attn_cp_rank,
                 get_parallel().attn_cp_size,
             )

@@ -259,6 +259,12 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
         pool = SimpleNamespace(
             state_sub_pool="mamba", get_mamba_indices=lambda indices: indices
         )
+        # Each replay's resolved slots: the identity map of its request rows.
+        linear_backend = SimpleNamespace(
+            forward_state_slots=lambda n, track_ids: SimpleNamespace(
+                working=context.forward_batch.req_pool_indices[:n], track=None
+            )
+        )
         backend = SimpleNamespace(
             req_to_token_pool=pool,
             runner_ids=RunnerIds(
@@ -268,8 +274,23 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                 page_size=1,
                 device="cpu",
             ),
+            linear_attn_backend=linear_backend,
+            forward_state_slots=linear_backend.forward_state_slots,
         )
-        cases = [([8], [0] * 8), ([4, 4], [0] * 4 + [1] * 4)]
+        cases = [
+            (
+                [8],
+                [0] * 8,
+                list(range(8)),
+                [0, 8],
+            ),
+            (
+                [3, 0, 2, 3],
+                [0, 0, 0, 2, 2, 3, 3, 3],
+                [0, 1, 2, 0, 1, 0, 1, 2],
+                [0, 3, 3, 5, 8],
+            ),
+        ]
         with (
             forward_context(ForwardContext(attn_backend=backend)),
             patch.object(bcg, "_current_capture_var") as active,
@@ -278,7 +299,7 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
             ),
         ):
             active.get.return_value = capture
-            for lengths, expected in cases:
+            for lengths, expected_reqs, expected_offsets, expected_starts in cases:
                 context.forward_batch = batch = SimpleNamespace(**vars(batch))
                 batch.extend_seq_lens = torch.tensor(lengths)
                 batch.extend_seq_lens_cpu = lengths
@@ -294,10 +315,17 @@ class TestPrefillCudaGraphRunnerHelpers(CustomTestCase):
                     self.assertIsNone(holder.batch)
                 for replay in capture.cuda_graph._break_fns:
                     replay()
-                self.assertEqual(holder.batch.req_indices.tolist(), expected)
+                self.assertEqual(holder.batch.lengths.tolist(), lengths)
+                self.assertEqual(holder.batch.processed_tokens, sum(lengths))
+                self.assertEqual(holder.batch.req_indices.tolist(), expected_reqs)
+                self.assertEqual(holder.batch.token_offsets.tolist(), expected_offsets)
+                self.assertEqual(holder.batch.query_start_loc.tolist(), expected_starts)
                 self.assertEqual(
                     holder.batch.state_indices.tolist(),
-                    list(range(1, len(lengths) + 1)),
+                    [
+                        index if length else 0
+                        for index, length in enumerate(lengths, start=1)
+                    ],
                 )
 
     def test_dspark_proxy_width_requires_receiving_stage_and_model_support(self):

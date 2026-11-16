@@ -17,10 +17,7 @@ use std::sync::OnceLock;
 pub fn pool() -> &'static rayon::ThreadPool {
     static POOL: OnceLock<rayon::ThreadPool> = OnceLock::new();
     POOL.get_or_init(|| {
-        let n = std::env::var("SGL_MM_RS_THREADS")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n > 0)
+        let n = pool_threads_override(|key| std::env::var(key).ok())
             .unwrap_or_else(|| std::thread::available_parallelism().map_or(8, |c| c.get().min(8)));
         rayon::ThreadPoolBuilder::new()
             .num_threads(n)
@@ -28,6 +25,17 @@ pub fn pool() -> &'static rayon::ThreadPool {
             .build()
             .expect("failed to build rayon pool")
     })
+}
+
+/// `SGLANG_MM_RS_THREADS`, else the legacy `SGL_MM_RS_THREADS`: the first one
+/// set decides, and anything but a positive integer leaves the default.
+#[cfg(feature = "parallel")]
+fn pool_threads_override(var: impl Fn(&str) -> Option<String>) -> Option<usize> {
+    ["SGLANG_MM_RS_THREADS", "SGL_MM_RS_THREADS"]
+        .iter()
+        .find_map(|key| var(key))
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&n| n > 0)
 }
 
 /// Content hash for cache/dedup identity: blake3 truncated to its first 8
@@ -224,5 +232,35 @@ mod tests {
         ));
         let err = decode_rgb(&encode(&img, ImageFormat::Png)).err().unwrap();
         assert!(err.contains("unsupported color"), "{err}");
+    }
+}
+
+#[cfg(all(test, feature = "parallel"))]
+mod pool_tests {
+    use super::pool_threads_override;
+
+    fn read(vars: &[(&str, &str)]) -> Option<usize> {
+        pool_threads_override(|key| {
+            vars.iter()
+                .find(|(name, _)| *name == key)
+                .map(|(_, value)| value.to_string())
+        })
+    }
+
+    /// The Python side warns `SGL_MM_RS_THREADS` users to switch to
+    /// `SGLANG_MM_RS_THREADS`; the new name must size the pool.
+    #[test]
+    fn sglang_name_wins_over_legacy_name() {
+        assert_eq!(read(&[("SGLANG_MM_RS_THREADS", "3")]), Some(3));
+        assert_eq!(
+            read(&[("SGLANG_MM_RS_THREADS", "3"), ("SGL_MM_RS_THREADS", "2")]),
+            Some(3)
+        );
+    }
+
+    #[test]
+    fn legacy_name_still_applies() {
+        assert_eq!(read(&[("SGL_MM_RS_THREADS", "2")]), Some(2));
+        assert_eq!(read(&[]), None);
     }
 }

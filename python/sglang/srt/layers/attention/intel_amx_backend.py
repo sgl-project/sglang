@@ -7,7 +7,7 @@ import torch
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
-from sglang.srt.mem_cache.memory_pool import KVWriteLoc
+from sglang.srt.mem_cache.memory_pool import KVWriteLoc, window_write_locs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_parallel, get_spec
 
@@ -253,7 +253,9 @@ class IntelAMXAttnBackend(AttentionBackend):
             # Cross-attention never writes to the SWA pool, so only thread the
             # full->SWA location for non-cross-attention layers.
             swa_loc = None if layer.is_cross_attention else self.swa_out_cache_loc
-            write_loc = KVWriteLoc(cache_loc, swa_loc)
+            write_loc = KVWriteLoc(
+                cache_loc, window_locs=window_write_locs(self.runner_ids, swa_loc)
+            )
             if not self.use_mla and key_buffer.dtype == torch.float8_e4m3fn:
                 self.kv_layers.layer(layer.layer_id).store(
                     layer,
@@ -366,7 +368,9 @@ class IntelAMXAttnBackend(AttentionBackend):
             swa_loc = None if layer.is_cross_attention else self.swa_out_cache_loc
             self.kv_layers.layer(layer.layer_id).store(
                 layer,
-                KVWriteLoc(cache_loc, swa_loc),
+                KVWriteLoc(
+                    cache_loc, window_locs=window_write_locs(self.runner_ids, swa_loc)
+                ),
                 k,
                 v,
                 k_scale=layer.k_scale_float,

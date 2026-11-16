@@ -799,18 +799,14 @@ export const config = {
         port: 8000,
         // Ports come from the engine's PD_PORTS, the same source the role
         // commands rewrite `--port` from, so the router always targets the
-        // ports the two roles actually bind. The positional after --prefill is
-        // the bootstrap port; it must match the prefill server's
-        // --disaggregation-bootstrap-port (default 8998) or only the decode
-        // worker registers.
+        // ports the two roles actually bind.
         command:
-`python3 -m sglang_router.launch_router \\
-  --pd-disaggregation \\
-  --prefill http://<prefill-host>:{{PREFILL_PORT}} 8998 \\
-  --decode http://<decode-host>:{{DECODE_PORT}} \\
+`sgl-router \\
+  --model-id {{MODEL_NAME}} \\
+  --no-tokenizer \\
+  --worker-urls http://<prefill-host>:{{PREFILL_PORT}} http://<decode-host>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}} \\
-  --disable-circuit-breaker \\
-  --health-check-interval-secs 999999`,
+  --disable-circuit-breaker`,
       },
     },
 

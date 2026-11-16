@@ -17,6 +17,7 @@ import dataclasses
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
+from sglang.srt.constants import ROUTING_KEY_HEADER
 from sglang.srt.environ import envs
 from sglang.srt.multimodal.media_io import ImageData, VideoData
 from sglang.srt.runtime_context import get_context, get_exec
@@ -34,7 +35,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_WHITELISTED_HEADERS = ["x-smg-routing-key"]
+_DEFAULT_WHITELISTED_HEADERS = [ROUTING_KEY_HEADER]
 WHITELISTED_HEADERS = _DEFAULT_WHITELISTED_HEADERS + [
     h.lower() for h in envs.SGLANG_LOG_REQUEST_HEADERS.get()
 ]

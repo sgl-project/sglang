@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 import requests
 
@@ -9,7 +10,6 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
 )
 from sglang.test.ascend.npu_eval_accuracy_kit import NPUGSM8KMixin
 from sglang.test.ascend.test_ascend_utils import (
-    IMAGES_EXAMPLE_PATH,
     KIMI_VL_A3B_INSTRUCT_WEIGHTS_PATH,
     QWEN3_32B_WEIGHTS_PATH,
 )
@@ -156,7 +156,9 @@ class TestDPAttentionDP2TP2VLM(CustomTestCase):
     def setUpClass(cls):
         cls.model = KIMI_VL_A3B_INSTRUCT_WEIGHTS_PATH
         cls.base_url = DEFAULT_URL_FOR_TEST
-        cls.image_url = IMAGES_EXAMPLE_PATH
+        cls.image_url = str(
+            Path(__file__).resolve().parents[5] / "examples/assets/example_image.png"
+        )
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,

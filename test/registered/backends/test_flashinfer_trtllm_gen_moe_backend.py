@@ -175,7 +175,7 @@ class FlashinferTrtllmGenMoeBackendMXFP8A2ABase:
                 "--tp-size",
                 "4",
                 "--moe-a2a-backend",
-                "flashinfer",
+                "flashinfer_nvlink_one_sided",
                 "--moe-runner-backend",
                 cls.backend,
                 "--flashinfer-a2a-dispatch-type",

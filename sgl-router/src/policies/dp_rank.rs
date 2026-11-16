@@ -73,6 +73,7 @@ mod tests {
             dp_ranks,
             openai: None,
             grpc_port: None,
+            supports_inline_system: false,
         };
         Worker::with_cb_config(spec, None, profile)
     }

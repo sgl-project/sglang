@@ -10,8 +10,8 @@ use super::legacy::{
 };
 use super::thinking::ThinkingTemplates;
 use super::{
-    ChatFormatter, TemplateError, is_glm53, is_minimax_m3, is_qwen38, prints_arguments_as_xml,
-    takes_content_parts,
+    ChatFormatter, TemplateError, is_glm53, is_minimax_m3, is_qwen38, is_step3p5,
+    preserve_messages, prints_arguments_as_xml, takes_content_parts,
 };
 
 pub fn load_chat_formatter(
@@ -119,9 +119,10 @@ fn set_chat_template(config: &mut Value, chat_template: Value) -> Result<(), Tem
 
 impl ChatFormatter {
     /// Build the HuggingFace formatter from parsed `tokenizer_config.json`
-    /// contents, which must carry a `chat_template`; GLM-5.3's, MiniMax-M3's and
-    /// Qwen3.8's templates build [`ChatFormatter::Glm53`], [`ChatFormatter::MiniMaxM3`]
-    /// and [`ChatFormatter::Qwen38`].
+    /// contents, which must carry a `chat_template`; GLM-5.3's, MiniMax-M3's,
+    /// Qwen3.8's and StepFun's templates build [`ChatFormatter::Glm53`],
+    /// [`ChatFormatter::MiniMaxM3`], [`ChatFormatter::Qwen38`] and
+    /// [`ChatFormatter::Step3p5`].
     pub fn from_tokenizer_config(config: &Value) -> Result<Self, TemplateError> {
         Self::from_tokenizer_config_with_type(config, None)
     }
@@ -143,10 +144,15 @@ impl ChatFormatter {
             |model_type| model_type == "minimax_m3_vl",
         );
         let qwen38 = config["chat_template"].as_str().filter(|t| is_qwen38(t));
+        let step3p5 = config["chat_template"].as_str().is_some_and(is_step3p5);
         let thinking = ThinkingTemplates::from_config(config);
         let mut render_config = config.clone();
-        let message_context = if minimax_m3 && !glm53 {
-            super::models::preserve_minimax_messages(&mut render_config)
+        let message_context = if glm53 {
+            String::new()
+        } else if minimax_m3 {
+            preserve_messages(&mut render_config, "__sglang_minimax_m3_messages")
+        } else if qwen38.is_none() && step3p5 {
+            preserve_messages(&mut render_config, "__sglang_step3p5_messages")
         } else {
             String::new()
         };
@@ -181,6 +187,15 @@ impl ChatFormatter {
                 formatter,
                 thinking,
                 content_parts: takes_content_parts(template),
+            }
+        } else if step3p5 {
+            Self::Step3p5 {
+                formatter,
+                thinking,
+                message_context,
+                content_parts: config["chat_template"]
+                    .as_str()
+                    .and_then(super::content_format::takes_content_parts),
             }
         } else {
             Self::HuggingFace {

@@ -17,6 +17,7 @@ register_amd_ci(
     est_time=1800,
     suite="nightly-amd-8-gpu-mi35x-glm47-fp8",
     nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 GLM_4_7_FP8_MODEL_PATH = "zai-org/GLM-4.7-FP8"

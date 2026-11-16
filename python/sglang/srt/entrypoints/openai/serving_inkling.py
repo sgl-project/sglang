@@ -7,6 +7,7 @@ import math
 from typing import TYPE_CHECKING, Any, Optional
 
 from sglang.srt.entrypoints.openai.chat_encoding_adapters import (
+    OPENAI_CHAT_WIRE,
     select_new_output_ids,
     token_output_sse_chunks,
 )
@@ -36,7 +37,10 @@ if TYPE_CHECKING:
 
 class InklingChatEncodingAdapter:
     collects_openai_media = True
-    strict_tool_call_arguments = True
+    history_tool_call_arguments = "strict"
+    renders_response_format = False
+    uncounted_prompt_tokens = 0
+    wire = OPENAI_CHAT_WIRE
 
     def __init__(
         self,
@@ -68,6 +72,9 @@ class InklingChatEncodingAdapter:
     @property
     def output(self) -> Optional[InklingChatEncodingAdapter]:
         return self if self._token_output else None
+
+    def validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
+        return None
 
     def encode_messages(
         self,

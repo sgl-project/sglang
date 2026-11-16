@@ -27,7 +27,7 @@ from mori.io import (
     StatusCode,
 )
 
-from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
+from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll, StateType
 from sglang.srt.disaggregation.common.conn import (
     ABORT_TAG,
     AbortNotification,
@@ -49,6 +49,7 @@ from sglang.srt.disaggregation.common.utils import (
 )
 from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.utils import (
+    align_window_tails,
     build_transfer_entry_pairs,
     compute_mamba_state_slice_byte_blocks,
     is_elided_entry,
@@ -1650,6 +1651,9 @@ class MoriKVManager(CommonKVManager):
                 f"remote={len(peer_info.dst_state_mem_descs)})"
             )
 
+        src_state_indices = align_window_tails(
+            self.kv_args, src_state_indices, dst_state_indices
+        )
         src_state_item_lens = self.kv_args.state_item_lens
         src_state_dim_per_tensor = self.kv_args.state_dim_per_tensor
 
@@ -1943,13 +1947,38 @@ class MoriKVManager(CommonKVManager):
         )
 
         statuses: List[TransferStatus] = []
-        pairs = build_transfer_entry_pairs(
-            src_layer_ids,
-            dst_layer_ids,
-            len(src_state_mem_descs),
-            len(dst_state_mem_descs),
-            allow_positional_fallback=self.pp_size == 1,
-        )
+        n_src, n_dst = len(src_state_mem_descs), len(dst_state_mem_descs)
+        if (
+            state_type == StateType.DSA
+            and self.pp_size is not None
+            and self.pp_size > 1
+            and not src_layer_ids
+            and not dst_layer_ids
+            and n_src != n_dst
+            # A hybrid linear+DSA pool lists only its full-attention layers, so a
+            # model-layer slice would mispair them; it still needs layer ids.
+            and not self.is_hybrid_mla_backend
+        ):
+            # DSA state is registered without layer ids; slice the decode entries for
+            # this PP stage the same way Mooncake's no-layer-id path does.
+            src_entries, dst_entries, n_stage = self.get_mla_kv_ptrs_with_pp(
+                list(range(n_src)), list(range(n_dst)), StateType.DSA
+            )
+            if len(dst_entries) < n_stage:
+                raise RuntimeError(
+                    "Destination DSA state descriptors do not match prefill pp "
+                    f"configuration: start={self.kv_args.prefill_start_layer} "
+                    f"src={n_src} dst={n_dst}"
+                )
+            pairs = list(zip(src_entries[:n_stage], dst_entries[:n_stage]))
+        else:
+            pairs = build_transfer_entry_pairs(
+                src_layer_ids,
+                dst_layer_ids,
+                n_src,
+                n_dst,
+                allow_positional_fallback=self.pp_size == 1,
+            )
         for i, j in pairs:
             src_desc = src_state_mem_descs[i]
             dst_desc = dst_state_mem_descs[j]

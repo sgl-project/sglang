@@ -210,10 +210,9 @@ template <uint32_t kHidden, uint32_t kThreads, bool kUsePDL, bool kFinal>
 __global__ void __launch_bounds__(kThreads) gemma4_ar_fusion_kernel(const __grid_constant__ Params p) {
   using E = RowEpilogue<kHidden, kThreads>;
   __shared__ float smem[E::kNumWarps];
-  // Reserve the window before the PDL wait, signal after it (see McBarrier).
-  const auto barrier = McBarrier(p.sem_local, p.sem_mc, p.world_size, /*num_arrives=*/2);
+  const auto barrier = McBarrier(p.sem_local, p.sem_mc, p.world_size);
   device::PDLWaitPrimary<kUsePDL>();
-  barrier.arrive_relaxed(/*n=*/0);  // every rank's partials are written
+  barrier.arrive_relaxed();  // every rank's partials are written
   __syncthreads();
   uint4 raw[E::kPerThread];
   for (uint32_t lr = blockIdx.x; lr < p.rows; lr += gridDim.x) {
@@ -222,7 +221,7 @@ __global__ void __launch_bounds__(kThreads) gemma4_ar_fusion_kernel(const __grid
   }
   device::PDLTriggerSecondary<kUsePDL>();
   __syncthreads();
-  barrier.arrive_rel_acq(/*n=*/1);  // every rank's multicast stores have landed
+  barrier.arrive_rel_acq();  // every rank's multicast stores have landed
 }
 
 template <uint32_t kHidden, uint32_t kThreads, bool kUsePDL>

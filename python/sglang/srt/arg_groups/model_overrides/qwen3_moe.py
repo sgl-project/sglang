@@ -57,7 +57,7 @@ def _qwen3_moe_family_overrides(server_args: Any, hf_config: Any) -> dict:
             # CuTe DSL v2 also supports W4A16 with BF16 activations when opted in.
             use_cutedsl_w4a16 = (
                 cfg.moe_runner_backend == "flashinfer_cutedsl"
-                and cfg.moe_a2a_backend in ("none", "flashinfer")
+                and cfg.moe_a2a_backend in ("none", "flashinfer_nvlink_one_sided")
                 and envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get()
             )
             if (
@@ -66,7 +66,7 @@ def _qwen3_moe_family_overrides(server_args: Any, hf_config: Any) -> dict:
             ):
                 raise ValueError(
                     "W4A16_NVFP4 MoE layers require --moe-runner-backend=marlin, "
-                    "or flashinfer_cutedsl with --moe-a2a-backend=none/flashinfer "
+                    "or flashinfer_cutedsl with --moe-a2a-backend=none/flashinfer_nvlink_one_sided "
                     "and SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16=1."
                 )
             if cfg.moe_runner_backend == "auto":
