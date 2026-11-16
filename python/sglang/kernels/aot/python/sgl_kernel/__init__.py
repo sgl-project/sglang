@@ -112,8 +112,7 @@ else:
         verify_tree_greedy_cpu,
     )
 
-    # CUDA and ROCm route these through sglang.kernels.ops.speculative (JIT); of the
-    # other builds, only the MUSA extension registers these ops.
+    # CUDA and ROCm route these through sglang.kernels.ops.speculative (JIT).
     if torch.version.cuda is None:
         from sgl_kernel.speculative import (
             build_tree_kernel_efficient,
