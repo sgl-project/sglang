@@ -231,6 +231,22 @@ class CompressedTensorsW8A8Fp8(CompressedTensorsLinearScheme):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if (
+            isinstance(x, tuple)
+            and _use_aiter
+            and self.strategy == QuantizationStrategy.CHANNEL
+        ):
+            # GLM's fused RMSNorm + FP8 quant (quant_format="fp8_per_token") emits
+            # per-token scales [M, 1], which apply_fp8_linear's pre-quantized path
+            # rejects; the aiter ptpc GEMM consumes them directly.
+            return apply_fp8_ptpc_linear(
+                input=(x[0], x[1]),
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                bias=bias,
+                use_per_token_if_dynamic=True,
+                compressed_tensor_quant=True,
+            )
         if isinstance(x, tuple):
             # Pre-quantized activation from a fused RMSNorm+FP8 quant kernel:
             # x = (fp8_input, per_tensor_input_scale[, orig_dtype]).
