@@ -140,7 +140,9 @@ class TestNvFp4MoeRestore(CustomTestCase):
                         torch.equal(_bytes(layer, name), raw[name].view(torch.uint8)),
                         name,
                     )
-                    self.assertEqual(layer.get_parameter(name).data_ptr(), storage[name])
+                    self.assertEqual(
+                        layer.get_parameter(name).data_ptr(), storage[name]
+                    )
 
     def test_layers_share_one_scale_interleave_map(self):
         # One copy per scale shape for all MoE layers, none in a layer's cache.
@@ -222,8 +224,13 @@ class TestNvFp4MoeRestore(CustomTestCase):
     def test_padded_scale_layouts(self):
         # TRT-LLM pads hidden up to the cubins' alignment; restore cannot undo
         # the padding, so it must stay off.
-        with self._backend(MoeRunnerBackend.FLASHINFER_TRTLLM), mock.patch.object(
-            flashinfer_trtllm, "trtllm_nvfp4_hidden_alignment", return_value=2 * HIDDEN
+        with (
+            self._backend(MoeRunnerBackend.FLASHINFER_TRTLLM),
+            mock.patch.object(
+                flashinfer_trtllm,
+                "trtllm_nvfp4_hidden_alignment",
+                return_value=2 * HIDDEN,
+            ),
         ):
             layer = _layer(_raw_tensors(seed=5))
             self._process(layer)
