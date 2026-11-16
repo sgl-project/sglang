@@ -229,6 +229,14 @@ def _int64_view(t: torch.Tensor) -> Optional[torch.Tensor]:
     return t.view(torch.int64)
 
 
+def _p2p_tensor_view(tensor: torch.Tensor) -> torch.Tensor:
+    # ProcessGroupNCCL has no E8M0 dtype mapping. Move its bytes without
+    # changing the scale values or the storage used by the receive buffer.
+    if tensor.dtype == torch.float8_e8m0fnu:
+        return tensor.view(torch.uint8)
+    return tensor
+
+
 def update_expert_weights_single_layer(
     routed_experts_weights: List[torch.Tensor],
     temp_buffers: List[torch.Tensor],
@@ -416,7 +424,9 @@ def update_expert_weights_single_layer(
                 [
                     P2POp(
                         op=torch.distributed.irecv,
-                        tensor=_get_tensor(temp_buffers, i, dst_expert_location),
+                        tensor=_p2p_tensor_view(
+                            _get_tensor(temp_buffers, i, dst_expert_location)
+                        ),
                         peer=src_rank,
                         group=group,
                     )
@@ -465,7 +475,9 @@ def update_expert_weights_single_layer(
                 [
                     P2POp(
                         op=torch.distributed.isend,
-                        tensor=_get_tensor(send_weights, i, src_expert_location),
+                        tensor=_p2p_tensor_view(
+                            _get_tensor(send_weights, i, src_expert_location)
+                        ),
                         peer=dst_rank,
                         group=group,
                     )
