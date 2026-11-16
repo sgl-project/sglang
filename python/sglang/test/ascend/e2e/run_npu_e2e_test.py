@@ -250,6 +250,13 @@ def check_pods_ready(namespace, pod_name_key_str, timeout=300):
             status = pod.status
             phase = status.phase
             logger.info(f"Pod: {pod_name}, status: {phase}")
+            if phase in ("Succeeded", "Failed"):
+                raise RuntimeError(
+                    f"Pod {pod_name} entered terminal state {phase!r} before "
+                    "becoming Ready; this usually means the container exited "
+                    "early (import error, crash, missing binary, ...). Check "
+                    "the pod logs above for the root cause."
+                )
             if phase != "Running":
                 all_running = False
                 break
