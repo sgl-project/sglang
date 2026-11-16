@@ -132,3 +132,7 @@ def test_asm_sparse_mla_matches_triton(T):
     )
     torch.testing.assert_close(out_c, out[lo:hi], rtol=0, atol=0)
     torch.testing.assert_close(lse_c, lse[lo:hi], rtol=0, atol=0)
+
+
+if __name__ == "__main__":
+    raise SystemExit(pytest.main([__file__, "-v"]))
