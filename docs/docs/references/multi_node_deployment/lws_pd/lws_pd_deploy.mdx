@@ -639,9 +639,9 @@ kubectl apply -f d.yaml
 
 At this point, we have completed the deployment of the 1P1D SGLang engine part.
 
-To allow our users to directly experience the model API, we still need a load balancer to handle sequential calls between prefill and decode. Different companies implement LBs differently, and the community will also officially release a new LB component written in Rust in the near future.
+To allow our users to directly experience the model API, we still need a load balancer to handle sequential calls between prefill and decode. Different companies implement LBs differently.
 
-Currently, we use a static K8S service + minilb approach to implement model API calls.
+Currently, we use a static K8S service + `sgl-router` approach to implement model API calls.
 
 ### Creating Service for Prefill and Decode
 
@@ -681,7 +681,7 @@ spec:
 ```
 Execute `kubectl apply -f d-svc.yaml`
 
-#### Deploy minilb and lb service
+#### Deploy sgl-router and lb service
 [lb.yaml](https://github.com/sgl-project/sglang/blob/main/docs/references/multi_node_deployment/lws_pd/lws-examples/lb.yaml)
 ```yaml Config
 apiVersion: apps/v1
@@ -708,16 +708,15 @@ spec:
         - key: node-role
           operator: Exists
       containers:
-        - name: sgl-minilb
-          image: lmsysorg/sglang:deepep
+        - name: sgl-router
+          image: lmsysorg/sglang:latest
           command:
-          - python
-          - -m
-          - sglang_router.launch_router
-          - --pd-disaggregation
-          - --prefill
+          - sgl-router
+          - --model-id
+          - /work/models
+          - --no-tokenizer
+          - --worker-urls
           - http://deepseekr10528-prefill-main:30000
-          - --decode
           - http://deepseekr10528-decode-main:30000
           - --host
           - 0.0.0.0

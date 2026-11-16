@@ -367,6 +367,9 @@ from sglang.srt.models.unlimited_ocr_v2_support.decode_graph_io import (
 from sglang.srt.models.unlimited_ocr_v2_support.scheduler_runtime import (
     UocrSchedulerRuntime,
 )
+from sglang.srt.multimodal.token_space_mm_process.registry import (
+    register_token_space_models,
+)
 from sglang.srt.multimodal.transport.receive_budget import ReceiveFeatureBudget
 from sglang.srt.observability.metrics_collector import SchedulerMetricsCollector
 from sglang.srt.observability.req_time_stats import (
@@ -991,6 +994,7 @@ class Scheduler(
         ):
             try:
                 import_processors("sglang.srt.multimodal.processors")
+                register_token_space_models()
                 self._mm_processor = get_mm_processor(
                     self.model_config.hf_config,
                     server_args,
@@ -1499,6 +1503,19 @@ class Scheduler(
         self._prefill_decode_interval_remaining -= 1
         return True
 
+    def _negotiate_prefill_delayer_while_deferring(self) -> None:
+        # A DP peer below prefill_decode_interval_min_bs does not defer and runs
+        # the delayer's all-gather; join it with nothing to prefill.
+        if (
+            not self.require_mlp_sync
+            or self.prefill_decode_interval_min_bs == 0
+            or self.prefill_delayer is None
+        ):
+            return
+        PrefillDelayerSinglePassExecutor(
+            self.prefill_delayer, token_usage=0.0
+        ).finalize(actual_prefill_bs=0)
+
     def _arm_prefill_decode_interval(self, batch: Optional[ScheduleBatch]) -> None:
         if self.prefill_decode_interval == 0 or batch is None:
             return
@@ -1531,6 +1548,12 @@ class Scheduler(
             self.enable_priority_scheduling,
             self.schedule_low_priority_values_first,
             shortest_prefill_aging_factor=get_schedule().shortest_prefill_aging_factor,
+            bounded_lpm_enabled=self.dllm_config is None,
+        )
+        self.policy._on_bounded_state_change = lambda active: (
+            self.waiting_queue.set_on_leave(
+                self.policy.retire_waiting_members if active else None
+            )
         )
         self.prefill_delayer: Optional[PrefillDelayer] = None
         self.prefill_bs_tracker = RecentPrefillBatchSizeTracker(
@@ -2077,9 +2100,7 @@ class Scheduler(
             result_dict["rust_server_pid"] = os.getpid()
         result_dict["hicache_object_layout"] = self._hicache_l3_layout()
 
-        if get_serving().grpc_port is not None and not (
-            get_serving().smg_grpc_mode or get_serving().grpc_mode
-        ):
+        if get_serving().grpc_port is not None:
             result_dict["kv_event_sources"] = (
                 self.kv_events_publisher.local_kv_event_sources(
                     self.page_size * get_parallel().dcp_size
@@ -3263,16 +3284,20 @@ class Scheduler(
 
     def _maybe_clear_mm_inputs(self, batch: ScheduleBatch) -> None:
         for req in batch.reqs:
-            if not req.finished() or not (mm_inputs := req.multimodal_inputs):
-                continue
-            # For session requests, keep mm_inputs for the next request
-            if req.session:
-                if isinstance(req.finished_reason, FINISH_ABORT):
-                    req.release_mm_inputs_on_abort()
-                continue
-            # For non-session requests, clear features and mm_inputs
-            mm_inputs.release_features()
-            req.multimodal_inputs = None
+            if req.finished():
+                self._release_mm_inputs(req)
+
+    def _release_mm_inputs(self, req: Req) -> None:
+        if not (mm_inputs := req.multimodal_inputs):
+            return
+        # For session requests, keep mm_inputs for the next request
+        if req.session:
+            if isinstance(req.finished_reason, FINISH_ABORT):
+                req.release_mm_inputs_on_abort()
+            return
+        # For non-session requests, clear features and mm_inputs
+        mm_inputs.release_features()
+        req.multimodal_inputs = None
 
     def _create_generation_req(
         self, recv_req: TokenizedGenerateReqInput, *args, **kwargs
@@ -4336,6 +4361,7 @@ class Scheduler(
             new_batch = self.get_new_batch_dllm(running_batch, staged)
         elif self._should_defer_prefill(running_batch):
             new_batch = None
+            self._negotiate_prefill_delayer_while_deferring()
         else:
             prefill_plan = self.get_new_batch_prefill(running_batch)
             new_batch = prefill_plan.batch_to_run
@@ -4669,12 +4695,22 @@ class Scheduler(
         # Requests no memory will ever come back for; aborted after the loop.
         unschedulable: List[Req] = []
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        bounded_active = self.policy._bounded_active
+        candidates = (
+            self.policy.admission_candidates(self.waiting_queue)
+            if bounded_active
+            else self.waiting_queue
+        )
+        for req in candidates:
+            if bounded_active and not self.policy.allows_admission(req):
+                break
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
             if chunk_parked or adder.budget_state() == AddReqResult.OTHER:
                 break
             if self.enable_lora and not self.can_schedule_lora_req(req, running_loras):
+                if bounded_active:
+                    self.policy.mark_admission_skipped(req)
                 continue
 
             # A forward batch runs one pooling mode, so setwise readout requests
@@ -4684,6 +4720,8 @@ class Scheduler(
                 (req.token_indices_to_pool is not None)
                 != (adder.can_run_list[0].token_indices_to_pool is not None)
             ):
+                if bounded_active:
+                    self.policy.mark_admission_skipped(req)
                 continue
 
             running_bs = len(running_batch.reqs)
@@ -4717,6 +4755,8 @@ class Scheduler(
                 req.time_stats.observe_storage_prefetch_ready(prefetch_done)
                 if not prefetch_done:
                     # skip staging requests that are ongoing prefetch
+                    if bounded_active:
+                        self.policy.mark_admission_skipped(req)
                     continue
                 # Pop the L3-loaded span. Unified cache exposes its absolute
                 # start so cache-mode L2/L3 attribution survives L3-tail eviction.
@@ -4744,6 +4784,8 @@ class Scheduler(
             ):
                 if defer_cow_slot:
                     self._drop_unadmitted_match(req)
+                if bounded_active:
+                    self.policy.mark_admission_skipped(req)
                 continue
             if self.enable_hicache_storage and buffer_pipeline is not None:
                 staging_ready = buffer_pipeline.prepare_staged_prefetch(req)
@@ -4751,6 +4793,8 @@ class Scheduler(
                 if not staging_ready:
                     if defer_cow_slot:
                         self._drop_unadmitted_match(req)
+                    if bounded_active:
+                        self.policy.mark_admission_skipped(req)
                     continue
             res = adder.add_one_req(
                 req,

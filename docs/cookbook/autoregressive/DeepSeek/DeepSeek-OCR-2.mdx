@@ -42,12 +42,12 @@ The DeepSeek-OCR-2 series offers models in various sizes and architectures, opti
 
 <DeepSeekOCR2Deployment />
 
-**Note**: DeepSeek-OCR-2 has ~3B parameters and easily fits on a single modern GPU. For low-latency serving, no model parallelism is needed. For high-throughput requirements, consider using data parallelism with the SGLang Model Gateway — see [DP, DPA and SGLang DP Router](../../../docs/advanced_features/sgl_model_gateway) for more details.
+**Note**: DeepSeek-OCR-2 has ~3B parameters and easily fits on a single modern GPU. For low-latency serving, no model parallelism is needed. For high-throughput requirements, add data-parallel replicas with `--dp-size`.
 
 ### 3.2 Configuration Tips
 
 - **Single GPU Deployment:** DeepSeek-OCR-2 (~3B parameters) fits on a single modern GPU — no tensor parallelism required for low-latency serving.
-- **High Throughput:** For high-throughput scenarios, use data parallelism with the SGLang Model Gateway. See [DP, DPA and SGLang DP Router](../../../docs/advanced_features/sgl_model_gateway).
+- **High Throughput:** For high-throughput scenarios, add data-parallel replicas with `--dp-size`.
 - **NCCL timeout:** If model loading is slow, increase `--dist-timeout 3600`.
 - **Xeon CPU service configuration:** Please refer to the `Notes` part in the serving engine launching section in [the SGLang CPU server document](../../../docs/hardware-platforms/cpu_server#launch-of-the-serving-engine) to better understand how to configure the arguments, especially for NUMA binding settings.
 

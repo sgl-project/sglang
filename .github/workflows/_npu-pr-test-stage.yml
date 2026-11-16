@@ -70,6 +70,14 @@ on:
         description: 'GitHub token for API calls'
         type: string
         default: ${{ github.token }}
+      reply_comment_id:
+        description: '/rerun-test reply comment to mark running when a runner picks the job up; empty skips the mark. Needs issues: write.'
+        type: string
+        default: ''
+      reply_marker:
+        description: "The marker of this run's line in that reply comment."
+        type: string
+        default: ''
 
 env:
   SKIP_PR_TEST_HEALTH_CHECK: ${{ inputs.skip_pr_test_health_check }}
@@ -92,12 +100,35 @@ jobs:
       matrix:
         partition: ${{ fromJson(inputs.partitions).arr }}
     steps:
+      # Before the PR checkout, which can take minutes on these runners. The
+      # script is fetched at github.sha, the caller's commit, so it is not a
+      # fork's.
+      - name: Mark runner picked up
+        if: inputs.reply_comment_id != '' && inputs.reply_marker != ''
+        continue-on-error: true
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          script="${RUNNER_TEMP}/update_rerun_test_status.py"
+          curl -fsSL --retry 3 -o "${script}" \
+            -H "Authorization: Bearer ${GITHUB_TOKEN}" \
+            -H "Accept: application/vnd.github.raw" \
+            "https://api.github.com/repos/${{ github.repository }}/contents/scripts/ci/utils/update_rerun_test_status.py?ref=${{ github.sha }}"
+          python3 "${script}" \
+            --comment-id "${{ inputs.reply_comment_id }}" \
+            --marker "${{ inputs.reply_marker }}" \
+            --status running \
+            --repo "${{ github.repository }}"
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           # Pin to the event SHA (not the branch name) so every job in this run
           # checks out the same commit even if the branch advances mid-run.
           ref: ${{ inputs.ref || github.sha }}
+          # /rerun-test passes a fork's commit as `ref`; the token would stay
+          # in .git/config, readable by its code.
+          persist-credentials: false
 
       - name: Mark repository safe
         run: |
@@ -246,9 +277,8 @@ jobs:
             bash scripts/ci/npu/npu_nightly_eval_deps.sh
           fi
 
-          # install sglang_router
+          # The hicache_hash_cpp JIT build includes <openssl/sha.h>.
           apt-get install -y libssl-dev
-          pip install sglang_router
 
       - name: Run test
         timeout-minutes: ${{ fromJson(inputs.run_timeout_minutes) }}
@@ -335,3 +365,12 @@ jobs:
             --auto-partition-size ${{ fromJson(inputs.partitions).size }} \
             ${{ inputs.timeout_per_file && format('--timeout-per-file {0}', inputs.timeout_per_file) || '' }} \
             $ONLY_FILE_ARGS $NIGHTLY_FLAG $CONTINUE_ON_ERROR_FLAG 2>&1 | tee "${LOG_FILE}"
+
+      - name: Upload test logs for failure analysis
+        if: ${{ always() && !inputs.use_coverage_runner && !inputs.is_nightly_pipeline_job }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: selected-test-logs-${{ inputs.self_name }}-part${{ matrix.partition }}-${{ github.run_attempt }}
+          path: /tmp/test-logs/*.log
+          if-no-files-found: ignore
+          retention-days: 7

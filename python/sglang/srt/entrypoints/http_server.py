@@ -438,7 +438,6 @@ async def lifespan(fast_api_app: FastAPI):
         if (
             getattr(fast_api_app, "is_single_tokenizer_mode", False)
             and get_serving().grpc_port is not None
-            and not (get_serving().smg_grpc_mode or get_serving().grpc_mode)
         ):
             grpc_handle = _start_native_grpc_server_for_runtime(
                 server_args=server_args,
@@ -886,17 +885,17 @@ async def model_info():
 
 
 @app.get("/get_server_info")
-async def get_server_info():
+async def get_server_info(request: Request):
     """Get the server information (deprecated - use /server_info instead)."""
     logger.warning(
         "Endpoint '/get_server_info' is deprecated and will be removed in a future version. "
         "Please use '/server_info' instead."
     )
-    return await server_info()
+    return await server_info(request)
 
 
 @app.get("/server_info")
-async def server_info():
+async def server_info(request: Request):
     """The startup configuration, plus live scheduler state.
 
     Two surfaces, deliberately both: the field values are the resolution
@@ -922,6 +921,8 @@ async def server_info():
                 "internal_states": internal_states,
                 "version": __version__,
                 "frontend": "python",
+                # sgl-router's /v1/messages reads it to place inline system turns.
+                "supports_inline_system": request.app.state.openai_serving_chat.supports_inline_system,
             }
         )
     )

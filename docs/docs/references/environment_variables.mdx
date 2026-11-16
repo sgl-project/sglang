@@ -45,7 +45,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_LOG_REQUEST_HEADERS</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Comma-separated list of additional HTTP headers to log when <code>--log-requests</code> is enabled. Appends to the default <code>x-smg-routing-key</code>.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Comma-separated list of additional HTTP headers to log when <code>--log-requests</code> is enabled. Appends to the default <code>x-sgl-routing-key</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Not set</td>
     </tr>
     <tr>
