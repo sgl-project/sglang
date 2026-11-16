@@ -4,8 +4,12 @@ import triton.language as tl
 from triton.tools.tensor_descriptor import TensorDescriptor
 
 from sglang.kernels.jit.utils import cache_once, is_arch_support_pdl, load_jit
-from sglang.kernels.ops.gemm.inkling2_nvfp4 import routed_quant_module
-from sglang.kernels.ops.moe.inkling2_moe import _row_expert, mxfp8_quantize
+from sglang.kernels.ops.moe.inkling2_moe import (
+    _row_expert,
+    _sm_count,
+    mxfp8_quantize,
+    routed_quant_module,
+)
 
 PDL = is_arch_support_pdl()
 
@@ -122,13 +126,9 @@ def routed_expert_matmul(x, dst2src, top_k, weight, scales, metadata):
     )
 
 
-def routed_swiglu_expert_matmul(
-    gate_up, gammas, gate_cap, up_cap, weight, scales, metadata, tokens
-):
-    """Grouped MXFP8 GEMM over the capped swiglu of the gate_up rows, with the
-    swiglu fused into the activation quantization."""
+def _swiglu_quantize(gate_up, gammas, gate_cap, up_cap, offsets):
+    """MXFP8 values and row-major scales of the capped swiglu of the gate_up rows."""
     rows, width = gate_up.shape[0], gate_up.shape[1] // 2
-    counts, offsets, _ = metadata
     values = torch.empty(
         (rows, width), dtype=torch.float8_e4m3fn, device=gate_up.device
     )
@@ -144,10 +144,19 @@ def routed_swiglu_expert_matmul(
             offsets,
             gate_cap,
             up_cap,
-            torch.cuda.get_device_properties(gate_up.device).multi_processor_count,
+            _sm_count(gate_up.device),
         )
+    return values, x_scales
+
+
+def routed_swiglu_expert_matmul(
+    gate_up, gammas, gate_cap, up_cap, weight, scales, metadata, tokens
+):
+    """Grouped MXFP8 GEMM over the capped swiglu of the gate_up rows, with the
+    swiglu fused into the activation quantization."""
+    values, x_scales = _swiglu_quantize(gate_up, gammas, gate_cap, up_cap, metadata[1])
     return _routed_matmul(
-        values, x_scales, rows, tokens, weight, scales, metadata, None, 1
+        values, x_scales, gate_up.shape[0], tokens, weight, scales, metadata, None, 1
     )
 
 
@@ -261,11 +270,27 @@ def cutlass_weight_scales(scales: torch.Tensor, out: torch.Tensor | None = None)
     return out
 
 
-def _cutlass_grouped(values, weight, weight_scales, counts, offsets, workspace, out):
-    sm_count = torch.cuda.get_device_properties(values.device).multi_processor_count
+def _cutlass_workspace(device, experts, rows, n, k, sm_count):
+    module = _cutlass_module()
+    workspace = torch.empty(
+        module.workspace_size(experts, rows, n, k, sm_count),
+        dtype=torch.uint8,
+        device=device,
+    )
+    return workspace, workspace[module.x_scales_offset(experts, rows, k) :]
+
+
+def _cutlass_grouped(
+    values, x_scales, weight, weight_scales, counts, offsets, workspace, sm_count, dtype
+):
+    """x_scales None: the activation scales are already in the GEMM layout, in
+    the workspace view _cutlass_workspace returns."""
+    out = torch.empty(
+        (values.shape[0], weight.shape[1]), dtype=dtype, device=values.device
+    )
     _cutlass_module().run(
         values,
-        workspace.new_empty(0),
+        workspace.new_empty(0) if x_scales is None else x_scales,
         weight,
         weight_scales,
         counts,
@@ -277,28 +302,17 @@ def _cutlass_grouped(values, weight, weight_scales, counts, offsets, workspace, 
     return out
 
 
-def _cutlass_workspace(device, experts, rows, n, k):
-    module = _cutlass_module()
-    sm_count = torch.cuda.get_device_properties(device).multi_processor_count
-    workspace = torch.empty(
-        module.workspace_size(experts, rows, n, k, sm_count),
-        dtype=torch.uint8,
-        device=device,
-    )
-    return workspace, workspace[module.x_scales_offset(experts, rows, k) :]
-
-
 def prefill_expert_matmul(x, dst2src, top_k, weight, weight_scales, counts, offsets):
     """routed_expert_matmul for this rank's experts on the CUTLASS grouped GEMM:
     token rows are quantized once and gathered in expert order."""
     experts, output_size, width = weight.shape
     rows = dst2src.numel()
+    sm_count = _sm_count(x.device)
     values, scales = mxfp8_quantize(x.contiguous())
     workspace, x_scales = _cutlass_workspace(
-        x.device, experts, rows, output_size, width
+        x.device, experts, rows, output_size, width, sm_count
     )
     gathered = torch.empty((rows, width), dtype=torch.float8_e4m3fn, device=x.device)
-    sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count
     _gather_routed_rows[(min(rows + experts, 8 * sm_count),)](
         values.view(torch.uint8),
         scales,
@@ -314,9 +328,16 @@ def prefill_expert_matmul(x, dst2src, top_k, weight, weight_scales, counts, offs
         triton.next_power_of_2(width // 32),
         launch_pdl=PDL,
     )
-    out = torch.empty((rows, output_size), dtype=x.dtype, device=x.device)
     return _cutlass_grouped(
-        gathered, weight, weight_scales, counts, offsets, workspace, out
+        gathered,
+        None,
+        weight,
+        weight_scales,
+        counts,
+        offsets,
+        workspace,
+        sm_count,
+        x.dtype,
     )
 
 
@@ -325,35 +346,19 @@ def prefill_swiglu_expert_matmul(
 ):
     """routed_swiglu_expert_matmul on the CUTLASS grouped GEMM."""
     experts, output_size, width = weight.shape
-    rows = gate_up.shape[0]
-    workspace, _ = _cutlass_workspace(gate_up.device, experts, rows, output_size, width)
-    values = torch.empty(
-        (rows, width), dtype=torch.float8_e4m3fn, device=gate_up.device
+    sm_count = _sm_count(gate_up.device)
+    workspace, _ = _cutlass_workspace(
+        gate_up.device, experts, gate_up.shape[0], output_size, width, sm_count
     )
-    x_scales = torch.empty(
-        (rows, width // 32), dtype=torch.uint8, device=gate_up.device
-    )
-    sm_count = torch.cuda.get_device_properties(gate_up.device).multi_processor_count
-    routed_quant_module(width).mxfp8_swiglu_quantize(
-        gate_up,
-        gammas,
-        values.view(torch.uint8),
-        x_scales,
-        offsets,
-        gate_cap,
-        up_cap,
-        sm_count,
-    )
-    out = torch.empty((rows, output_size), dtype=gate_up.dtype, device=gate_up.device)
-    _cutlass_module().run(
+    values, x_scales = _swiglu_quantize(gate_up, gammas, gate_cap, up_cap, offsets)
+    return _cutlass_grouped(
         values,
         x_scales,
         weight,
         weight_scales,
         counts,
         offsets,
-        out,
         workspace,
         sm_count,
+        gate_up.dtype,
     )
-    return out

@@ -116,7 +116,7 @@ def route_topk(partials, bias, topk, route_scale=None, global_scale=None):
             groups,
             bias is not None,
             topk,
-            triton.next_power_of_2(topk) if not fuse_renorm else 8,
+            triton.next_power_of_2(topk),
             triton.next_power_of_2(n),
             fuse_renorm,
             enable_fp_fusion=False,
@@ -215,7 +215,9 @@ def route_metadata(ids, weights, start, num_local, num_experts, block_size_m=128
     plus dst2src, the inverse of src2dst, and the globally sorted expert ids."""
     n = ids.numel()
     if n > ROUTE_MAX_IDS or start + num_local > num_experts:
-        raise ValueError("route_metadata sorts at most 4096 ids of local experts")
+        raise ValueError(
+            f"route_metadata sorts at most {ROUTE_MAX_IDS} ids of local experts"
+        )
     ids, weights = ids.to(torch.int32), weights.to(torch.float32)
     device = ids.device
     max_blocks = triton.cdiv(n, block_size_m) + num_local - 1

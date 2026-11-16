@@ -3,6 +3,7 @@ import triton
 
 from sglang.kernels.jit.utils import cache_once, load_jit
 from sglang.kernels.ops.gemm.inkling2_cute_grouped_nvfp4 import routed_swap_matmul
+from sglang.kernels.ops.moe.inkling2_moe import _sm_count, routed_quant_module
 
 SWAP_AB_MAX_ROWS = 20480
 
@@ -20,24 +21,6 @@ def _matmul_module():
         ],
         extra_cuda_cflags=["-DCUTLASS_ENABLE_GDC_FOR_SM100=1"],
         extra_dependencies=["cutlass"],
-    )
-
-
-@cache_once
-def routed_quant_module(width: int):
-    return load_jit(
-        "inkling2_routed_quant",
-        str(width),
-        cuda_files=["inkling2/routed_quant.cuh"],
-        cuda_wrappers=[
-            ("quantize", f"inkling2_routed_quant::quantize<{width}>"),
-            ("swiglu_quantize", f"inkling2_routed_quant::swiglu_quantize<{width}>"),
-            (
-                "mxfp8_swiglu_quantize",
-                f"inkling2_routed_quant::mxfp8_swiglu_quantize<{width}>",
-            ),
-            ("mxfp8_quantize", f"inkling2_routed_quant::mxfp8_quantize<{width}>"),
-        ],
     )
 
 
@@ -68,50 +51,55 @@ def swizzle_weight_scales(scales: torch.Tensor) -> torch.Tensor:
     return out
 
 
-def _routed_buffers(module, device, wide, experts, rows, n, k, sm_count):
-    """Workspace (wide CUTLASS GEMM only) and the activation scale buffer, laid
-    out as one 128-row scale block run per expert."""
-    if not wide:
-        scale_rows = (rows + 127 * experts + 127) // 128 * 128
-        return None, torch.empty(
-            scale_rows * (k // 16), dtype=torch.uint8, device=device
+def _routed_gemm(device, rows, weight, scales, counts, offsets, schedule, quantize):
+    """Grouped NVFP4 GEMM of rows that quantize(module, values, x_scales, amax,
+    sm_count) writes, with the activation scales laid out as one 128-row scale
+    block run per expert. Returns the FP32 accumulator and the per-row amax."""
+    experts, output_size, packed_width = weight.shape
+    width = packed_width * 2
+    module = _matmul_module()
+    sm_count = _sm_count(device)
+    wide = rows > SWAP_AB_MAX_ROWS
+    if wide:
+        workspace = torch.empty(
+            module.wide_workspace_size(experts, rows, output_size, width, sm_count),
+            dtype=torch.uint8,
+            device=device,
         )
-    workspace = torch.empty(
-        module.wide_workspace_size(experts, rows, n, k, sm_count),
-        dtype=torch.uint8,
-        device=device,
-    )
-    return workspace, workspace[module.wide_x_scales_offset(experts, rows, n, k) :]
+        x_scales = workspace[
+            module.wide_x_scales_offset(experts, rows, output_size, width) :
+        ]
+    else:
+        scale_rows = (rows + 127 * experts + 127) // 128 * 128
+        x_scales = torch.empty(
+            scale_rows * (width // 16), dtype=torch.uint8, device=device
+        )
+    values = torch.empty((rows, packed_width), dtype=torch.uint8, device=device)
+    amax = torch.empty(rows, dtype=torch.float32, device=device)
+    quantize(routed_quant_module(width), values, x_scales, amax, sm_count)
+    out = torch.empty((rows, output_size), dtype=torch.float32, device=device)
+    if wide:
+        module.run_wide_preswizzled(
+            values, weight, scales, counts, offsets, out, workspace, sm_count
+        )
+    else:
+        routed_swap_matmul(
+            values, x_scales, weight, scales, counts, offsets, schedule, out
+        )
+    return out, amax
 
 
 def routed_expert_matmul(x, dst2src, top_k, weight, scales, counts, offsets, schedule):
     """Grouped NVFP4 GEMM of the routed token rows of x (row r reads token
     dst2src[r] // top_k). Returns the unscaled FP32 accumulator and per-row amax;
     rows outside offsets[0]..offsets[-1] are left unset."""
-    experts, output_size, packed_width = weight.shape
-    width = packed_width * 2
-    rows = dst2src.numel()
-    module = _matmul_module()
-    sm_count = torch.cuda.get_device_properties(x.device).multi_processor_count
-    wide = rows > SWAP_AB_MAX_ROWS
-    workspace, x_scales = _routed_buffers(
-        module, x.device, wide, experts, rows, output_size, width, sm_count
+
+    def quantize(module, values, x_scales, amax, sm_count):
+        module.quantize(x, dst2src, values, x_scales, amax, offsets, top_k, sm_count)
+
+    return _routed_gemm(
+        x.device, dst2src.numel(), weight, scales, counts, offsets, schedule, quantize
     )
-    values = x.new_empty((rows, packed_width), dtype=torch.uint8)
-    amax = torch.empty(rows, dtype=torch.float32, device=x.device)
-    routed_quant_module(width).quantize(
-        x, dst2src, values, x_scales, amax, offsets, top_k, sm_count
-    )
-    accumulator = torch.empty((rows, output_size), dtype=torch.float32, device=x.device)
-    if wide:
-        module.run_wide_preswizzled(
-            values, weight, scales, counts, offsets, accumulator, workspace, sm_count
-        )
-    else:
-        routed_swap_matmul(
-            values, x_scales, weight, scales, counts, offsets, schedule, accumulator
-        )
-    return accumulator, amax
 
 
 def routed_swiglu_expert_matmul(
@@ -133,42 +121,30 @@ def routed_swiglu_expert_matmul(
     run the next grouped NVFP4 GEMM, for rows in offsets[0]..offsets[-1]."""
     if out_dtype != torch.bfloat16:
         raise ValueError("Routed NVFP4 swiglu rounds activations to bfloat16")
-    experts, output_size, packed_width = weight.shape
-    width = packed_width * 2
-    rows = accumulator.shape[0]
-    module = _matmul_module()
-    sm_count = torch.cuda.get_device_properties(
-        accumulator.device
-    ).multi_processor_count
-    wide = rows > SWAP_AB_MAX_ROWS
-    workspace, x_scales = _routed_buffers(
-        module, accumulator.device, wide, experts, rows, output_size, width, sm_count
-    )
-    values = accumulator.new_empty((rows, packed_width), dtype=torch.uint8)
-    amax = torch.empty(rows, dtype=torch.float32, device=accumulator.device)
-    routed_quant_module(width).swiglu_quantize(
-        accumulator,
-        accumulator_amax,
-        accumulator_weight_amax,
-        accumulator_weight_denominator,
-        gammas,
-        values,
-        x_scales,
-        amax,
+
+    def quantize(module, values, x_scales, amax, sm_count):
+        module.swiglu_quantize(
+            accumulator,
+            accumulator_amax,
+            accumulator_weight_amax,
+            accumulator_weight_denominator,
+            gammas,
+            values,
+            x_scales,
+            amax,
+            offsets,
+            gate_cap,
+            up_cap,
+            sm_count,
+        )
+
+    return _routed_gemm(
+        accumulator.device,
+        accumulator.shape[0],
+        weight,
+        scales,
+        counts,
         offsets,
-        gate_cap,
-        up_cap,
-        sm_count,
+        schedule,
+        quantize,
     )
-    out = torch.empty(
-        (rows, output_size), dtype=torch.float32, device=accumulator.device
-    )
-    if wide:
-        module.run_wide_preswizzled(
-            values, weight, scales, counts, offsets, out, workspace, sm_count
-        )
-    else:
-        routed_swap_matmul(
-            values, x_scales, weight, scales, counts, offsets, schedule, out
-        )
-    return out, amax

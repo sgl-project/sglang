@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Stable sort of routed expert ids by expert, and the grouped GEMM metadata of
-// one rank's experts, in one CTA. Equal to the Triton _route_metadata in route.py.
+// one rank's experts, in one CTA. Equal to the Triton _route_metadata in inkling2_route.py.
 
 #include <sgl_kernel/utils.cuh>
 

@@ -10,6 +10,24 @@ PDL = is_arch_support_pdl()
 MXFP8_CUDA_MIN_ROWS = 64
 
 
+@cache_once
+def routed_quant_module(width: int):
+    return load_jit(
+        "inkling2_routed_quant",
+        str(width),
+        cuda_files=["inkling2/routed_quant.cuh"],
+        cuda_wrappers=[
+            ("quantize", f"inkling2_routed_quant::quantize<{width}>"),
+            ("swiglu_quantize", f"inkling2_routed_quant::swiglu_quantize<{width}>"),
+            (
+                "mxfp8_swiglu_quantize",
+                f"inkling2_routed_quant::mxfp8_swiglu_quantize<{width}>",
+            ),
+            ("mxfp8_quantize", f"inkling2_routed_quant::mxfp8_quantize<{width}>"),
+        ],
+    )
+
+
 @triton.jit
 def _mxfp8_block(groups):
     amax = tl.max(tl.abs(groups), 1)
@@ -56,8 +74,6 @@ def mxfp8_quantize(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         and x.dtype == torch.bfloat16
         and x.shape[-1] % (32 * 3 * 16) == 0
     ):
-        from sglang.kernels.ops.gemm.inkling2_nvfp4 import routed_quant_module
-
         routed_quant_module(x.shape[-1]).mxfp8_quantize(
             x, values.view(torch.uint8), scales, _sm_count(x.device)
         )

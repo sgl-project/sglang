@@ -17,19 +17,14 @@ using Problems = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
 using FP4 = cutlass::float_e2m1_t;
 using FP8 = cutlass::float_ue4m3_t;
 
-template <
-    class Arch,
-    class Tile,
-    class Schedule,
-    class Cluster = Shape<_1, _1, _1>,
-    class EpilogueSchedule = cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm>
+template <class Arch, class Tile, class Schedule>
 struct Config {
   using LayoutD = cutlass::layout::RowMajor;
   using Epilogue = typename cutlass::epilogue::collective::CollectiveBuilder<
       Arch,
       cutlass::arch::OpClassTensorOp,
       Tile,
-      Cluster,
+      Shape<_1, _1, _1>,
       cutlass::epilogue::collective::EpilogueTileAuto,
       float,
       float,
@@ -39,7 +34,7 @@ struct Config {
       float,
       LayoutD*,
       4,
-      EpilogueSchedule>::CollectiveOp;
+      cutlass::epilogue::PtrArrayTmaWarpSpecialized1Sm>::CollectiveOp;
   using Mainloop = typename cutlass::gemm::collective::CollectiveBuilder<
       Arch,
       cutlass::arch::OpClassBlockScaledTensorOp,
@@ -51,7 +46,7 @@ struct Config {
       32,
       float,
       Tile,
-      Cluster,
+      Shape<_1, _1, _1>,
       cutlass::gemm::collective::StageCountAutoCarveout<sizeof(typename Epilogue::SharedStorage)>,
       Schedule>::CollectiveOp;
   using Kernel = cutlass::gemm::kernel::GemmUniversal<Problems, Mainloop, Epilogue>;
@@ -79,7 +74,6 @@ using Wide = Config<
 #endif
 using ScaleConfig = Wide::ScaleConfig;
 
-template <class C>
 struct Buffers {
   Shape<int, int, int>* problems;
   FP4 const** a;
@@ -87,11 +81,11 @@ struct Buffers {
   FP8 const** sa;
   FP8 const** sb;
   float** d;
-  typename C::StrideA* stride_a;
-  typename C::StrideB* stride_b;
-  typename C::StrideD* stride_d;
-  typename C::LayoutSFA* layout_a;
-  typename C::LayoutSFB* layout_b;
+  Wide::StrideA* stride_a;
+  Wide::StrideB* stride_b;
+  Wide::StrideD* stride_d;
+  Wide::LayoutSFA* layout_a;
+  Wide::LayoutSFB* layout_b;
   FP8* x_scales;
 };
 
@@ -102,8 +96,7 @@ void reserve(T*& pointer, size_t count, char* base, size_t& offset) {
   offset += count * sizeof(T);
 }
 
-template <class C>
-size_t buffers(Buffers<C>& b, char* base, int experts, int rows, int n, int k) {
+size_t buffers(Buffers& b, char* base, int experts, int rows, int n, int k) {
   size_t offset = 0;
   reserve(b.problems, experts, base, offset);
   reserve(b.a, experts, base, offset);
@@ -125,11 +118,10 @@ __host__ __device__ inline int64_t weight_scale_size(int64_t n, int64_t k) {
   return (n + 127) / 128 * 128 * ((k + 63) / 64 * 4);
 }
 
-template <class C>
-typename C::Gemm::Arguments arguments(Buffers<C> b, int experts, int sm_count) {
+Wide::Gemm::Arguments arguments(Buffers b, int experts, int sm_count) {
   cutlass::KernelHardwareInfo hardware;
   hardware.sm_count = sm_count;
-  typename C::Gemm::Arguments args{
+  Wide::Gemm::Arguments args{
       cutlass::gemm::GemmUniversalMode::kGrouped,
       {experts, b.problems, nullptr},
       {b.a, b.stride_a, b.b, b.stride_b, b.sa, b.layout_a, b.sb, b.layout_b},
@@ -140,20 +132,14 @@ typename C::Gemm::Arguments arguments(Buffers<C> b, int experts, int sm_count) {
   return args;
 }
 
-template <class C>
-int64_t workspace_size_impl(int64_t experts, int64_t rows, int64_t n, int64_t k, int64_t sm_count) {
-  Buffers<C> b;
-  auto bytes = buffers(b, nullptr, experts, rows, n, k);
-  return bytes + C::Gemm::get_workspace_size(arguments(b, experts, sm_count));
-}
-
 int64_t wide_workspace_size(int64_t experts, int64_t rows, int64_t n, int64_t k, int64_t sm_count) {
-  return workspace_size_impl<Wide>(experts, rows, n, k, sm_count);
+  Buffers b;
+  auto bytes = buffers(b, nullptr, experts, rows, n, k);
+  return bytes + Wide::Gemm::get_workspace_size(arguments(b, experts, sm_count));
 }
 
-template <class C>
 __device__ void prepare_expert(
-    Buffers<C> b,
+    Buffers b,
     FP4 const* x,
     FP4 const* w,
     FP8 const* w_scales,
@@ -177,18 +163,17 @@ __device__ void prepare_expert(
   b.b[e] = we;
   b.sa[e] = xse;
   b.sb[e] = wse;
-  b.stride_a[e] = cutlass::make_cute_packed_stride(typename C::StrideA{}, make_shape(m, k, 1));
-  b.stride_b[e] = cutlass::make_cute_packed_stride(typename C::StrideB{}, make_shape(n, k, 1));
-  b.stride_d[e] = cutlass::make_cute_packed_stride(typename C::StrideD{}, make_shape(m, n, 1));
-  b.layout_a[e] = C::ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
-  b.layout_b[e] = C::ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
+  b.stride_a[e] = cutlass::make_cute_packed_stride(Wide::StrideA{}, make_shape(m, k, 1));
+  b.stride_b[e] = cutlass::make_cute_packed_stride(Wide::StrideB{}, make_shape(n, k, 1));
+  b.stride_d[e] = cutlass::make_cute_packed_stride(Wide::StrideD{}, make_shape(m, n, 1));
+  b.layout_a[e] = Wide::ScaleConfig::tile_atom_to_shape_SFA(make_shape(m, n, k, 1));
+  b.layout_b[e] = Wide::ScaleConfig::tile_atom_to_shape_SFB(make_shape(m, n, k, 1));
 }
 
 // Launched with PDL: it reads only routing metadata that is complete before the
 // previous kernel lets it launch, and waits for that kernel before exiting.
-template <class C>
 __global__ void prepare(
-    Buffers<C> b,
+    Buffers b,
     FP4 const* x,
     FP4 const* w,
     FP8 const* w_scales,
@@ -226,38 +211,14 @@ void swizzle_weight_scales(tvm::ffi::TensorView scales, tvm::ffi::TensorView out
   RuntimeCheck(cudaGetLastError() == cudaSuccess, "Cannot swizzle NVFP4 weight scales");
 }
 
-template <class C>
-void run_impl(
-    tvm::ffi::TensorView x,
-    tvm::ffi::TensorView w,
-    tvm::ffi::TensorView ws,
-    tvm::ffi::TensorView counts,
-    tvm::ffi::TensorView offsets,
-    tvm::ffi::TensorView y,
-    tvm::ffi::TensorView workspace,
-    int64_t sm_count);
-
-// Activation scales already written in the GEMM layout at wide_x_scales_offset.
-void run_wide_preswizzled(
-    tvm::ffi::TensorView x,
-    tvm::ffi::TensorView w,
-    tvm::ffi::TensorView ws,
-    tvm::ffi::TensorView counts,
-    tvm::ffi::TensorView offsets,
-    tvm::ffi::TensorView y,
-    tvm::ffi::TensorView workspace,
-    int64_t sm_count) {
-  run_impl<Wide>(x, w, ws, counts, offsets, y, workspace, sm_count);
-}
-
 int64_t wide_x_scales_offset(int64_t experts, int64_t rows, int64_t n, int64_t k) {
-  Buffers<Wide> b;
+  Buffers b;
   buffers(b, nullptr, experts, rows, n, k);
   return reinterpret_cast<int64_t>(b.x_scales);
 }
 
-template <class C>
-void run_impl(
+// Activation scales already written in the GEMM layout at wide_x_scales_offset.
+void run_wide_preswizzled(
     tvm::ffi::TensorView x,
     tvm::ffi::TensorView w,
     tvm::ffi::TensorView ws,
@@ -270,10 +231,10 @@ void run_impl(
   int experts = w.size(0), n = w.size(1), k = w.size(2) * 2;
   int rows = x.size(0);
   auto stream = host::LaunchKernel::resolve_device(x.device());
-  Buffers<C> b;
+  Buffers b;
   size_t bytes = buffers(b, static_cast<char*>(workspace.data_ptr()), experts, rows, n, k);
   auto args = arguments(b, experts, sm_count);
-  RuntimeCheck(workspace.numel() >= bytes + C::Gemm::get_workspace_size(args), "NVFP4 workspace is too small");
+  RuntimeCheck(workspace.numel() >= bytes + Wide::Gemm::get_workspace_size(args), "NVFP4 workspace is too small");
   RuntimeCheck(ws.numel() == experts * weight_scale_size(n, k), "NVFP4 weight scales must be pre-swizzled");
   auto* count_ptr = static_cast<int const*>(counts.data_ptr());
   auto* offset_ptr = static_cast<int const*>(offsets.data_ptr());
@@ -289,7 +250,7 @@ void run_impl(
   RuntimeCheck(
       cudaLaunchKernelEx(
           &config,
-          prepare<C>,
+          prepare,
           b,
           static_cast<FP4 const*>(x.data_ptr()),
           static_cast<FP4 const*>(w.data_ptr()),
@@ -302,7 +263,7 @@ void run_impl(
           k) == cudaSuccess,
       "Cannot launch NVFP4 GEMM prepare");
   RuntimeCheck(cudaGetLastError() == cudaSuccess, "Cannot prepare NVFP4 GEMM");
-  typename C::Gemm gemm;
+  Wide::Gemm gemm;
   RuntimeCheck(gemm.can_implement(args) == cutlass::Status::kSuccess, "Unsupported NVFP4 GEMM shape");
   auto status = gemm.initialize(args, static_cast<char*>(workspace.data_ptr()) + bytes, stream);
   RuntimeCheck(status == cutlass::Status::kSuccess, "Cannot initialize NVFP4 GEMM: ", int(status));
