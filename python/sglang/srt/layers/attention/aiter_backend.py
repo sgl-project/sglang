@@ -5921,7 +5921,7 @@ class AiterMlaIndicesUpdaterPrefill:
 
 class AiterMultiStepDraftBackend:
     """
-    Wrap multiple triton attention backends as one for multiple consecutive
+    Wrap multiple aiter attention backends as one for multiple consecutive
     draft decoding steps.
     """
 
