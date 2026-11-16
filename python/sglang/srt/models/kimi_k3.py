@@ -1013,8 +1013,6 @@ class KimiK3MoE(nn.Module):
                 recipe=(1, 1, 32),
                 activation="situ",
                 fast_math=True,
-                # DeepGEMM picks BLOCK_M from y's rows unless given the EP-wide
-                # count; EP ranks that pick different BLOCK_M hang in combine.
                 global_num_tokens=_mega_moe_global_tokens_hint(buf),
             )
         y = y[:num_tokens]
