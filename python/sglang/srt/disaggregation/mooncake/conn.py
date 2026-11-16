@@ -1082,8 +1082,6 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             # Use the manager's captured target layout, not scoped CP flags.
             and self.state_tp_size != self.attn_tp_size
             and registration_info.dst_attn_tp_size != self.state_tp_size
-            # A DCP-collapsed MLA draft (Kimi-K3.1) is replicated like the
-            # target and goes through the DCP send path.
             and not registration_info.dst_draft_rows_dcp_collapsed
             # A DFLASH draft KV ring has no draft KV entries to reslice: it
             # sends its replicated window rows as a DRAFT_RING state instead.

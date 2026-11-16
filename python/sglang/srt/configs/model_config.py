@@ -215,9 +215,6 @@ def is_deepseek_dsa(config) -> bool:
             "Dots3NoteForCausalLMNextN",
             "HYV4ForCausalLM",
             "HYV4ForCausalLMNextN",
-            "KimiK31ForConditionalGeneration",
-            "KimiLinearForCausalLM",
-            "KimiK3LinearForCausalLM",
             "Ernie5_5_MoeForCausalLM",
             "Ernie5_5_MoeForCausalLMNextN",
         )

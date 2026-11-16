@@ -67,7 +67,6 @@ from sglang.srt.layers.layer_boundary.residual.attn_bank import (
     AttnBank,
     AttnBankOutputRead,
     AttnBankState,
-    _bank_rows,
 )
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
@@ -2871,10 +2870,10 @@ def _carries_bank_slices(config: KimiLinearConfig) -> bool:
     """Whether consecutive SP-MoE layers keep the stream and the
     attention-residual bank on each rank's attention-TP shard of the rows
     (SGLANG_K3_SP_ATTN_RES): each layer reads its attention input there, then
-    gathers what it read. DSpark gathers the pre-norm mixture at its capture
-    layers, but other aux-capture and pipeline paths need the whole bank;
-    this is decided at construction. Nor can a dense layer after an SP-MoE
-    one, whose FFN reads every row of the bank:
+    gathers what it read. A rank then holds only its own rows of the bank, so
+    neither a later pipeline rank nor a draft model's capture of the target's
+    hidden states can take them; it is decided at construction. Nor can a
+    dense layer after an SP-MoE one, whose FFN reads every row of the bank:
     every layer from the first MoE layer on must be one. This layout also
     works with NCCL: custom collective kernels only fuse the local bank
     read with the gather, and are not required to keep the bank sharded."""
@@ -2889,7 +2888,7 @@ def _carries_bank_slices(config: KimiLinearConfig) -> bool:
     if True not in moe or not all(moe[moe.index(True) :]):
         return False
     spec = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
-    return spec.is_dspark() or not (spec.is_eagle3() or spec.is_dflash_family())
+    return not (spec.is_eagle3() or spec.is_dflash_family())
 
 
 def _latent_moe_writes_stream(config: KimiLinearConfig, layer_idx: int) -> bool:
@@ -3471,20 +3470,13 @@ class KimiK3LinearModel(nn.Module):
             score_proj = self.output_attn_res_proj
             score_norm = self.output_attn_res_norm
             nvb = _cdiv(self.end_layer, self.config.attn_res_block_size)
-        bank = self.attn_bank.require()
-        rows = _bank_rows(bank, hidden_states)
-        mixed = aggregate_stream(
+        return aggregate_stream(
             hidden_states,
-            bank.block_residual if rows is None else bank.block_residual[rows],
+            self.attn_bank.require().block_residual,
             nvb,
             score_proj,
             score_norm,
         )
-        # Only the mixture is needed by the draft. Keep the bank sharded and
-        # return owned storage so a later layer's gather cannot overwrite it.
-        if rows is not None:
-            return get_parallel().attn_tp_group.all_gather(mixed, dim=0)
-        return mixed
 
 
 class KimiK3LinearForCausalLM(nn.Module):
@@ -3580,6 +3572,12 @@ class KimiK3LinearForCausalLM(nn.Module):
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        if self.model.carries_bank_slices:
+            raise RuntimeError(
+                "the model keeps each rank's shard of the rows across SP-MoE "
+                "layers (SGLANG_K3_SP_ATTN_RES), which leaves no layer output "
+                "to capture whole"
             )
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)

@@ -1919,18 +1919,6 @@ def setup_state_kv_args(
     kv_args.is_hybrid_mla_backend = (
         is_mla_backend(owner_view) and StateType.MAMBA in kv_args.state_types
     )
-    # Per-token bytes of a hybrid DSA pool's index-K page: the fp8 keys of
-    # every token, then their scales. A PD DCP relayout moves the two parts
-    # separately.
-    if (
-        kv_args.is_hybrid_mla_backend
-        and StateType.DSA in kv_args.state_types
-        and isinstance(owner_view, DSATokenToKVPool)
-        and owner_view.index_kpool == 1
-    ):
-        value_bytes = owner_view.index_head_dim
-        scale_bytes = owner_view.index_head_dim // owner_view.quant_block_size * 4
-        kv_args.dsa_index_k_token_bytes = (value_bytes, scale_bytes)
     if isinstance(owner_view, NPUMLATokenToKVPool):
         kv_args.kv_buf_groups = 3 if owner_view.index_head_dim is not None else 2
         kv_args.hidden_kv_layers = total_kv_layers
