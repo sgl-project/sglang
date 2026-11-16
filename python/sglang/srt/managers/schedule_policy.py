@@ -41,6 +41,7 @@ logger = logging.getLogger(__name__)
 
 import os
 import random
+import time
 from collections import Counter
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -48,6 +49,7 @@ from enum import Enum, auto
 from functools import lru_cache
 from typing import TYPE_CHECKING, Dict, Iterable, List, Mapping, Optional, Set, Union
 
+import msgspec
 import torch
 
 from sglang.srt.dllm.config import DllmConfig
@@ -66,7 +68,11 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     zero_match_result,
 )
 from sglang.srt.mem_cache.capacity import capacity_decision, create_prefill_budget
-from sglang.srt.mem_cache.common import match_kv_cache, touch_waiting_prefix
+from sglang.srt.mem_cache.common import (
+    evict_from_tree_cache,
+    match_kv_cache,
+    touch_waiting_prefix,
+)
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey, TreeNode
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.model_executor import encoder_swa_replay
@@ -806,6 +812,50 @@ class AddReqResult(Enum):
     UNSCHEDULABLE = auto()
 
 
+# Logged at most this often; arbitrary.
+_PREFILL_KV_BACKOFF_LOG_INTERVAL_S = 10.0
+
+
+class PrefillKvBackoffStats(msgspec.Struct):
+    """Process-wide counters behind the rate-limited back-off log line."""
+
+    deferred: int = 0
+    shrunk_chunks: int = 0
+    skipped_chunks: int = 0
+    last_log_time: float = 0.0
+
+
+_prefill_kv_backoff_stats = PrefillKvBackoffStats()
+
+
+def prefill_kv_backoff_stats() -> PrefillKvBackoffStats:
+    return _prefill_kv_backoff_stats
+
+
+def _prefill_kv_backoff_supported(adder: PrefillAdder) -> bool:
+    """Single-pool allocators whose extend demand is the stock conservative
+    count, on a prefix cache; other pools keep their own admission rules."""
+    from sglang.srt.mem_cache.allocator.base import BaseTokenToKVPoolAllocator
+    from sglang.srt.mem_cache.prefill_budget import PrefillBudget
+
+    allocator = adder.token_to_kv_pool_allocator
+    if not isinstance(allocator, BaseTokenToKVPoolAllocator):
+        return False
+    cls = type(allocator)
+    return (
+        adder.dllm_config is None
+        and adder.kv_shard_size <= 1
+        and not is_cp_sharded_padded()
+        and not adder.is_hybrid_swa
+        and not adder.is_hybrid_ssm_cache
+        and type(adder.memory_budget) is PrefillBudget
+        and cls.evict_to_free_tokens is BaseTokenToKVPoolAllocator.evict_to_free_tokens
+        and cls.get_extend_allocation_demand
+        is BaseTokenToKVPoolAllocator.get_extend_allocation_demand
+        and adder.tree_cache.supports_prefix_sharing()
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class _PrefillAdmission:
     prefix_len: int
@@ -987,6 +1037,19 @@ class PrefillAdder:
         # prefill pass. Used by PrefillDelayer's queue-based trigger.
         self.waiting_queue_len = waiting_queue_len
 
+        # `evictable_size()` counts unlocked device tokens, not what eviction
+        # can free: under HiCache write_back with a full host pool, a chain
+        # behind a leaf whose backup fails and whose drop is declined stays
+        # counted. Admission frees each request's KV before committing it.
+        self._kv_backoff = (
+            envs.SGLANG_ENABLE_PREFILL_KV_BACKOFF.get()
+            and _prefill_kv_backoff_supported(self)
+        )
+        # The extend demand of alloc_paged_token_slots_extend for this pass's
+        # admissions: their extend plus one page each.
+        self._kv_committed_tokens = 0
+        self._kv_reclaim_exhausted = False
+
     def _admitted_extend_lens(self) -> List[int]:
         return [int(getattr(req, "extend_input_len", 0)) for req in self.can_run_list]
 
@@ -1153,6 +1216,98 @@ class PrefillAdder:
         return max(limit // grid * grid, min(grid, remaining))
 
     @capacity_decision
+    def _obtainable_kv_tokens(self, need: int, *, extend_len: int) -> int:
+        """Free KV tokens after reclaiming toward ``need``; a deterministic
+        function of the tree and pool, so PP stages agree on it."""
+        allocator = self.token_to_kv_pool_allocator
+        available = allocator.available_size()
+        if available >= need or self._kv_reclaim_exhausted:
+            return available
+        # Reclaim for the rest of the pass too, so a pass walks the tree once;
+        # the four pages of per-request rounding are arbitrary.
+        rem = (
+            self.rem_chunk_tokens
+            if self.rem_chunk_tokens is not None
+            else self.rem_input_tokens
+        )
+        target = need + max(0, rem - extend_len) + 4 * allocator.page_size
+        # The eviction alloc_paged_token_slots_extend would run, run earlier.
+        evict_from_tree_cache(self.tree_cache, target)
+        available = allocator.available_size()
+        if available < target:
+            self._kv_reclaim_exhausted = True
+        return available
+
+    def _realize_prefill_kv(self, extend_len: int, *, load_tokens: int = 0) -> bool:
+        """Whether this admission's extend (and host load-back) fits in KV
+        that is free now, after reclaim."""
+        if not self._kv_backoff:
+            return True
+        need = (
+            self._kv_committed_tokens
+            + extend_len
+            + self.token_to_kv_pool_allocator.page_size
+            + load_tokens
+        )
+        if self._obtainable_kv_tokens(need, extend_len=extend_len) >= need:
+            return True
+        _prefill_kv_backoff_stats.deferred += 1
+        self._log_kv_backoff("deferred", need=need)
+        return False
+
+    def _realize_admission_kv(self, req: Req, admission: _PrefillAdmission) -> bool:
+        if not self._kv_backoff or not req.needs_host_load_back():
+            return self._realize_prefill_kv(admission.extend_len)
+        # Reclaim can write back device victims and evict host leaves: pin
+        # the host match as the load-back does, so reclaim cannot take it.
+        with (
+            self._lock_node(req.best_match_node, lock_host=True)
+            if isinstance(self.tree_cache, UnifiedRadixCache)
+            else nullcontext()
+        ):
+            return self._realize_prefill_kv(
+                admission.extend_len, load_tokens=req.host_hit_length
+            )
+
+    def _realize_chunk_kv(self, new_len: int) -> int:
+        """The continuing chunk length whose KV is free now, page-floored when
+        cut; 0 when not one page is."""
+        if not self._kv_backoff:
+            return new_len
+        page = self.token_to_kv_pool_allocator.page_size
+        base = self._kv_committed_tokens + page
+        need = base + new_len
+        available = self._obtainable_kv_tokens(need, extend_len=new_len)
+        if available >= need:
+            return new_len
+        fit = max(0, (available - base) // page * page)
+        if fit > 0:
+            _prefill_kv_backoff_stats.shrunk_chunks += 1
+            self._log_kv_backoff("chunk shrunk", need=need)
+        else:
+            _prefill_kv_backoff_stats.skipped_chunks += 1
+            self._log_kv_backoff("chunk skipped", need=need)
+        return fit
+
+    def _log_kv_backoff(self, event: str, *, need: int) -> None:
+        stats = _prefill_kv_backoff_stats
+        now = time.monotonic()
+        if now - stats.last_log_time < _PREFILL_KV_BACKOFF_LOG_INTERVAL_S:
+            return
+        stats.last_log_time = now
+        logger.warning(
+            "Prefill KV back-off: %s; need=%d available=%d evictable=%d "
+            "admitted=%d; totals deferred=%d shrunk_chunks=%d skipped_chunks=%d",
+            event,
+            need,
+            self.token_to_kv_pool_allocator.available_size(),
+            self.tree_cache.evictable_size(),
+            len(self.can_run_list),
+            stats.deferred,
+            stats.shrunk_chunks,
+            stats.skipped_chunks,
+        )
+
     def budget_state(self):
         no_token = self.chunked_req_waits or not self.memory_budget.admits_more()
         if no_token:
@@ -1585,6 +1740,13 @@ class PrefillAdder:
         if new_len <= 0:
             # No progress this pass: wait rather than run an empty chunk.
             return req
+        kv_fit = self._realize_chunk_kv(new_len)
+        if kv_fit < new_len:
+            # Its rows stay held either way; a shorter chunk still progresses.
+            new_len = self.floor_chunked_tokens(kv_fit, cand_extend_input_len)
+            truncated = True
+            if new_len <= 0:
+                return req
         request_slot_reserve = self._request_slot_reserve_for_req(
             req, extend_input_len=new_len
         )
@@ -1613,6 +1775,7 @@ class PrefillAdder:
             raise RuntimeError("chunked request exceeds the sharded assembly scratch")
         req.extend_end = req.prefix_len + new_len
         self.can_run_list.append(req)
+        self._kv_committed_tokens += new_len + self.token_to_kv_pool_allocator.page_size
         self._update_prefill_budget(
             prefix_tokens,
             req.extend_len,
@@ -1910,6 +2073,10 @@ class PrefillAdder:
                     self._defer_staged_for_capacity_if_idle(req, pool="prefill_budget")
                 return admission
 
+            if not self._realize_admission_kv(req, admission):
+                self._defer_staged_for_capacity_if_idle(req, pool="prefill_kv")
+                return AddReqResult.NO_TOKEN
+
             # A rejected candidate must not report prefillable or queue H2D.
             if (self.prefill_delayer_single_pass is not None) and (
                 not self.prefill_delayer_single_pass.negotiate_should_allow_prefill(
@@ -1935,6 +2102,7 @@ class PrefillAdder:
                 ):
                     return AddReqResult.OTHER
 
+            h2d_queued = False
             if req.needs_host_load_back():
                 load_max_new = min(max_new, admission.max_new_tokens)
                 # Reclaim can write back device victims and evict host leaves.
@@ -1988,6 +2156,7 @@ class PrefillAdder:
                 if loaded is None:
                     return AddReqResult.OTHER
                 req.host_loaded_length, req.last_node = loaded
+                h2d_queued = req.host_loaded_length > 0
                 state_slots = self._state_slots_for_req(req)
                 if 0 < req.host_loaded_length < promised_host_hit:
                     raise RuntimeError(
@@ -2050,6 +2219,12 @@ class PrefillAdder:
                     prefix_len=admission.prefix_len, extend_len=admission.extend_len
                 ):
                     return AddReqResult.OTHER
+
+            # A load-back that loaded nothing can grow the extend past what was
+            # freed above; no H2D is queued then, so deferring is safe.
+            if not h2d_queued and not self._realize_prefill_kv(admission.extend_len):
+                self._defer_staged_for_capacity_if_idle(req, pool="prefill_kv")
+                return AddReqResult.NO_TOKEN
 
             self._commit_prefill_admission(req, admission, state_slots)
 
@@ -2204,6 +2379,9 @@ class PrefillAdder:
         req.extend_end = admission.prefix_len + admission.extend_len
         req.lock = self.tree_cache.lock(req.last_node)
         self.can_run_list.append(req)
+        self._kv_committed_tokens += (
+            admission.extend_len + self.token_to_kv_pool_allocator.page_size
+        )
         if admission.is_chunked:
             self.new_chunked_req = req
         self._update_prefill_budget(
