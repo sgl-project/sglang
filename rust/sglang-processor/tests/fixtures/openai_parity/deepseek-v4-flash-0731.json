@@ -1178,7 +1178,7 @@
     {
       "name": "headers",
       "endpoint": "completions",
-      "headers": {"x-smg-routing-key": "user-7"},
+      "headers": {"x-sgl-routing-key": "user-7"},
       "request": {
         "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
         "prompt": "Hello",
@@ -4486,7 +4486,6 @@
     "bootstrap_pair_key": null,
     "decode_tp_size": null,
     "routed_dp_rank": null,
-    "data_parallel_rank": null,
     "disagg_prefill_dp_rank": null,
     "routing_key": null,
     "conversation_id": null,
