@@ -219,6 +219,17 @@
       "buckets": null
     },
     {
+      "name": "sglang:num_good_requests_total",
+      "kind": "counter",
+      "documentation": "Number of requests that finished normally and met every SLO in --goodput-slo.",
+      "labelnames": [
+        "model_name",
+        "engine_type",
+        "is_streaming"
+      ],
+      "buckets": null
+    },
+    {
       "name": "sglang:get_loads_duration_seconds",
       "kind": "histogram",
       "documentation": "Time spent serving /v1/loads requests (seconds).",

@@ -14,7 +14,9 @@
 """Utilities for Prometheus Metrics."""
 
 import math
-from typing import List
+from typing import Dict, List
+
+GOODPUT_SLO_METRICS = ("ttft", "tpot", "e2el")
 
 
 def two_sides_exponential_buckets(
@@ -54,3 +56,11 @@ def exponential_buckets(start: float, width: float, length: int) -> List[float]:
     for i in range(length):
         buckets.append(start * (width**i))
     return buckets
+
+
+def meets_goodput_slo(
+    goodput_slo: Dict[str, float], *, ttft: float, tpot: float, e2el: float
+) -> bool:
+    # SLOs are in milliseconds, observed latencies in seconds.
+    observed_ms = {"ttft": ttft * 1000, "tpot": tpot * 1000, "e2el": e2el * 1000}
+    return all(observed_ms[name] <= slo_ms for name, slo_ms in goodput_slo.items())
