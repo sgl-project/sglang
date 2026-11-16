@@ -260,6 +260,11 @@ class TestSamplingParamsSubclass(unittest.TestCase):
 
         mock_warning.assert_not_called()
 
+    def test_glm_image_defaults_to_an_empty_negative_prompt(self):
+        """A GLM-Image request without a negative prompt must not carry the video
+        default of the base class in its batching key and saved request."""
+        self.assertEqual(GlmImageSamplingParams().negative_prompt, "")
+
     def test_flux_defaults_resolution_when_not_provided(self):
         params = FluxSamplingParams()
 
