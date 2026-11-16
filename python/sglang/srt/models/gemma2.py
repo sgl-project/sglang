@@ -293,6 +293,7 @@ class Gemma2Model(nn.Module):
                 layer_id=idx,
                 config=config,
                 quant_config=quant_config,
+                prefix=prefix,
             ),
             prefix=add_prefix("layers", prefix),
         )
