@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from sglang.srt.utils import log_info_on_rank0
+from sglang.srt.utils.foundry_adapter import get_foundry_adapter
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +35,8 @@ def prepare_capture_state(
     num_gatherers = (
         0 if is_draft_worker else prebuild_logits_gatherers(model, dtype=dtype)
     )
-    _probe_flashinfer_norm_cluster_size()
+    if get_foundry_adapter().enabled:
+        _probe_flashinfer_norm_cluster_size()
     if num_dispatchers or num_gatherers:
         log_info_on_rank0(
             logger,
@@ -44,9 +46,8 @@ def prepare_capture_state(
 
 
 def _probe_flashinfer_norm_cluster_size() -> None:
-    # FlashInfer >= 0.7.4 asks the driver for the launchable cluster size when it
-    # builds its first norm kernel (module load + unload, cached per device);
-    # inside a capture that invalidates the capturing stream.
+    # FlashInfer >= 0.7.4 loads and unloads a module on its first norm kernel,
+    # which breaks a capture; restored graphs run no warmup forward that does it first.
     try:
         from flashinfer.norm.utils import get_sm_version, max_cluster_n
     except ImportError:
