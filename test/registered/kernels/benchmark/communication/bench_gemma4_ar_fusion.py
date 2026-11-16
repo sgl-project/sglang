@@ -23,11 +23,12 @@ from torch._C._distributed_c10d import _SymmetricMemory
 
 import sglang.srt.distributed.parallel_state as ps
 from sglang.kernels.jit.benchmark import marker
+from sglang.kernels.jit.benchmark.marker import _calculate_rotation_count
 from sglang.kernels.jit.benchmark.utils import get_benchmark_range, multigpu_bench_main
 from sglang.kernels.jit.utils import cache_once
 from sglang.kernels.ops.communication import gemma4_ar_fusion
 from sglang.kernels.ops.layernorm.gemma4_fused_ops import gemma_rmsnorm_residual_scalar
-from sglang.kernels.ops.quantization.fp8_kernel import per_token_group_quant_fp8
+from sglang.kernels.ops.quantization.fp8_kernel import sglang_per_token_group_quant_fp8
 from sglang.srt.distributed.comm_cleanup import register_comm_cleanup
 from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
@@ -49,6 +50,14 @@ NUM_TOKENS = get_benchmark_range(
     [1, 4, 8, 16, 32, 64, 128, 160, 256, 512, 1024, 2048, 4096, 8192], [32, 512, 4096]
 )
 MAX_TOKENS = max(NUM_TOKENS)
+
+
+def _rotations(num_tokens: int) -> int:
+    # as many partials as do_bench rotates the stock input through, so both
+    # providers read a cold partial (do_bench caps the rotation at 100)
+    return min(_calculate_rotation_count(num_tokens * HIDDEN * 2), 100)
+
+
 PROVIDERS = ["stock", "fused", "fused-nocopy"]
 
 
@@ -94,7 +103,10 @@ def _symm(shape, dtype, group_name):
 def _buffers():
     name = _init()[0].cpu_group.group_name
     return (
-        _symm((MAX_TOKENS, HIDDEN), torch.bfloat16, name),
+        # the fused provider rotates through slices of this one
+        _symm(
+            (max(_rotations(n) * n for n in NUM_TOKENS), HIDDEN), torch.bfloat16, name
+        ),
         _symm((MAX_TOKENS, HIDDEN), torch.float8_e4m3fn, name),
         _symm((MAX_TOKENS, HIDDEN // GROUP), torch.float32, name),
     )
@@ -117,7 +129,10 @@ def benchmark(num_tokens: int, provider: str):
             x = _stock_all_reduce(comm, coord.device_group, x)
             r = gemma_rmsnorm_residual_scalar(x, w_a, residual, scalar, EPS)
             y = rmsnorm(r, w_b, EPS)  # what RMSNorm.forward_cuda runs on SM90
-            return per_token_group_quant_fp8(y, GROUP)
+            # the block-FP8 linear's input quant before DeepGEMM on SM90
+            return sglang_per_token_group_quant_fp8(
+                y, GROUP, column_major_scales=True, scale_tma_aligned=True
+            )
 
     else:
         (p_t, p_mc), (o_t, o_mc), (s_t, s_mc) = _buffers()
@@ -130,12 +145,19 @@ def benchmark(num_tokens: int, provider: str):
         groups, ld = HIDDEN // GROUP, (num_tokens + 3) // 4 * 4
         scales = s_t.view(-1)[: groups * ld].view(groups, ld).t()[:num_tokens]
 
+        rotations, step = _rotations(num_tokens), [0]
+
         def fn(x):
+            # do_bench rotates x through cold copies; the fused site reads its own
+            # rotation of symmetric slices instead (x stands in for the GEMM output)
+            i = step[0] % rotations
+            step[0] += 1
+            partial_i = p_t[i * num_tokens : (i + 1) * num_tokens]
             if copy:
-                p_t[:num_tokens].copy_(x)  # the staging copy the model path pays
+                partial_i.copy_(x)  # the staging copy the model path pays
             gemma4_ar_fusion.site(
-                p_t[:num_tokens],
-                p_mc,
+                partial_i,
+                p_mc + partial_i.data_ptr() - p_t.data_ptr(),
                 o_t[:num_tokens],
                 o_mc,
                 scales,
