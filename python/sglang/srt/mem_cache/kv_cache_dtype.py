@@ -4,6 +4,9 @@ from typing import TYPE_CHECKING, Optional
 import torch
 
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype
+from sglang.srt.mem_cache.platform_kv_cache_dtype import (
+    registered_kv_cache_storage_dtype,
+)
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_hip
 
@@ -76,6 +79,10 @@ def configure_kv_cache_dtype(
                 "torch.float4_e2m1fn_x2 support. Please use PyTorch 2.8.0+ "
                 "with CUDA 12.8+."
             )
+    elif (
+        storage_dtype := registered_kv_cache_storage_dtype(server_args_kv_cache_dtype)
+    ) is not None:
+        kv_cache_dtype = storage_dtype
     else:
         raise ValueError(f"Unsupported kv_cache_dtype: {server_args_kv_cache_dtype}.")
 

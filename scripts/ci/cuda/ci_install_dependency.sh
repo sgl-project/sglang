@@ -737,12 +737,6 @@ install_sglang_kernel() {
     mark_step_done "${FUNCNAME[0]}"
 }
 
-install_sglang_router() {
-    $PIP_CMD install sglang-router $PIP_INSTALL_SUFFIX
-
-    mark_step_done "${FUNCNAME[0]}"
-}
-
 install_flashinfer_cubin() {
     if [ "$UNINSTALL_CUBIN" = false ]; then
         echo "flashinfer-cubin==${FLASHINFER_CUBIN_REQUIRED} already installed, skipping install"
@@ -1014,7 +1008,6 @@ main() {
     install_sglang
     release_cargo_cache_lock
     install_sglang_kernel
-    install_sglang_router
     install_flashinfer_cubin
     download_flashinfer_cache
     stabilize_flashinfer_jit_paths
