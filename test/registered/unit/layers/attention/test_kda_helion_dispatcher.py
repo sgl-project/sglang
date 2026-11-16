@@ -276,6 +276,7 @@ class TestKDACuteDslVerifySelection(unittest.TestCase):
             replayssm_rawv=None,
         )
         for capability, capturing, admitted in (
+            (None, True, False),
             ((9, 0), True, True),
             ((9, 0), False, False),
             ((10, 0), True, True),
@@ -298,7 +299,11 @@ class TestKDACuteDslVerifySelection(unittest.TestCase):
                 patch(
                     "sglang.srt.layers.attention.linear.kda_backend.current_arch",
                     return_value=SimpleNamespace(
-                        cuda=SimpleNamespace(major=capability[0])
+                        cuda=(
+                            SimpleNamespace(major=capability[0])
+                            if capability is not None
+                            else None
+                        )
                     ),
                 ),
             ):

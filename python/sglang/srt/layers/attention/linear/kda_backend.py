@@ -1794,12 +1794,12 @@ class KDAAttnBackend(MambaAttnBackendBase):
         """Return whether the fixed Kimi-K3/DSpARK CuTe contract is satisfied."""
         if not self.kernel_dispatcher.verify_backend.is_nv_cutedsl() or not is_cuda():
             return False
-        major = current_arch().cuda.major
-        if major not in (9, 10):
+        cuda_arch = current_arch().cuda
+        if cuda_arch is None or cuda_arch.major not in (9, 10):
             return False
         # SM90 runs it only in CUDA graphs: an eager verify is bound by the
         # launcher's host time, and Triton's kernels launch faster.
-        if major == 9 and not get_is_capture_mode():
+        if cuda_arch.major == 9 and not get_is_capture_mode():
             return False
         if importlib.util.find_spec("cutlass") is None:
             return False
