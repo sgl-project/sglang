@@ -275,6 +275,7 @@ def sparse_attention_fwd_kernel_v2(
     sm_scale: Optional[float] = None,
     block_I: int = 64,
 ):
+    assert block_I % 16 == 0, "the cooperative KV loader processes 16 rows per step"
     assert dim == tilelang.math.next_power_of_2(dim), (
         f"haven't check padding correctness yet, dim={dim}"
     )
@@ -538,7 +539,7 @@ def sparse_attention_fwd_kernel_v2(
                     T.barrier_arrive(bar_2_128)
                     T.barrier_wait(bar_2_128, 0)
 
-                    for r in T.serial(4):
+                    for r in T.serial(BI // 16):
                         indices_tmp[0] = Indices[
                             b_i, s_i, g_i, (i_i * 2) * BI + r * 16 + (tx - 256) // 8
                         ]
@@ -585,7 +586,7 @@ def sparse_attention_fwd_kernel_v2(
                     T.barrier_arrive(bar_2_128)
                     T.barrier_wait(bar_2_128, 1)
 
-                    for r in T.serial(4):
+                    for r in T.serial(BI // 16):
                         indices_tmp[0] = Indices[
                             b_i, s_i, g_i, (i_i * 2 + 1) * BI + r * 16 + (tx - 256) // 8
                         ]
@@ -1252,7 +1253,21 @@ def tilelang_sparse_fwd(
             if tail_dim == 0
             else sparse_attention_fwd_kernel_v2
         )
-        kernel = kernel_factory(num_heads, d_v, tail_dim, topk, sm_scale=sm_scale)
+        # The v2 double-buffered 64-row KV tile alone needs 144 KiB for
+        # 512+64 BF16 rows, exceeding SM12x's 99 KiB per-block limit. A
+        # 32-row tile fits for up to 16 padded heads; larger head tiles and
+        # other geometries still need a separate resource-aware strategy.
+        block_i = (
+            32
+            if current_arch().is_sm(12)
+            and d_v == 512
+            and tail_dim == 64
+            and num_heads <= 16
+            else 64
+        )
+        kernel = kernel_factory(
+            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, block_I=block_i
+        )
         out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
     return out
 
