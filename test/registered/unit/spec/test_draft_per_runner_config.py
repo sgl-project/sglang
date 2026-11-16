@@ -11,6 +11,7 @@ one constructor each — so they travel as arguments to the runner that owns the
 import unittest
 from types import SimpleNamespace
 
+from sglang.srt.configs.load_config import LoadFormat
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.model_executor.model_runner import (
     ModelRunner,
@@ -21,6 +22,7 @@ from sglang.srt.model_executor.model_runner_components.attention_backend_setup i
 )
 from sglang.srt.model_executor.model_runner_components.load_model_utils import (
     build_load_config,
+    maybe_enable_ipc_weight_cache,
 )
 from sglang.srt.runtime_context import get_context, get_model
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -101,6 +103,48 @@ class TestDraftPerRunnerConfig(CustomTestCase):
         self.assertEqual(
             build_load_config(load_format="dummy", **common).load_format, "dummy"
         )
+
+    def test_weight_cache_routes_only_the_target_to_ipc(self):
+        server_args = self._seed(load_format="auto", weight_cache_mode="client")
+        common = dict(
+            server_args=server_args,
+            tp_rank=0,
+            remote_instance_weight_transporter_engine=None,
+            remote_instance_weight_transporter_session_id=None,
+        )
+        for mode in ("off", "client", "daemon"):
+            with self.subTest(mode=mode):
+                target = build_load_config(
+                    **common,
+                    draft_model_idx=None,
+                    weight_cache_mode=mode,
+                    weight_cache_socket="/tmp/target-cache.sock",
+                )
+                maybe_enable_ipc_weight_cache(load_config=target)
+                maybe_enable_ipc_weight_cache(load_config=target)
+                self.assertEqual(target.weight_cache_mode, mode)
+                self.assertEqual(target.weight_cache_socket, "/tmp/target-cache.sock")
+                if mode == "off":
+                    self.assertEqual(target.load_format, LoadFormat.AUTO)
+                else:
+                    self.assertEqual(target.load_format, LoadFormat.IPC_CACHE)
+                    self.assertEqual(target.fallback_load_format, LoadFormat.AUTO)
+
+                for layer in (None, 0, 1, 2):
+                    with self.subTest(draft_model_idx=layer):
+                        draft = build_load_config(
+                            **common,
+                            load_format="safetensors",
+                            draft_model_idx=layer,
+                            weight_cache_mode=mode,
+                            weight_cache_socket="/tmp/target-cache.sock",
+                            is_draft_worker=True,
+                        )
+                        maybe_enable_ipc_weight_cache(load_config=draft)
+                        self.assertEqual(draft.load_format, LoadFormat.SAFETENSORS)
+                        self.assertEqual(draft.draft_model_idx, layer)
+                        self.assertEqual(draft.weight_cache_mode, "off")
+                        self.assertIsNone(draft.weight_cache_socket)
 
     # -- the attention backend is per-runner, not a config variant -------------
 

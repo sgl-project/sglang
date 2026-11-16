@@ -537,6 +537,21 @@ class TestPrepareServerArgs(CustomTestCase):
         # daemon to build the same static EPLB layout as the engine.
         handle_load_format(args)
 
+    def test_weight_cache_speculative_decoding_scope(self):
+        for mode in ("off", "client", "daemon"):
+            for algorithm in (None, "EAGLE", "EAGLE3", "DFLASH", "DSPARK"):
+                with self.subTest(mode=mode, algorithm=algorithm):
+                    args = ServerArgs(
+                        model_path="dummy",
+                        weight_cache_mode=mode,
+                        speculative_algorithm=algorithm,
+                    )
+                    if mode != "off" and algorithm in ("DFLASH", "DSPARK"):
+                        with self.assertRaisesRegex(ValueError, "EAGLE and EAGLE3"):
+                            handle_load_format(args)
+                    else:
+                        handle_load_format(args)
+
     def test_eplb_recorder_mode_compatibility(self):
         def make_args(mode):
             return ServerArgs(
