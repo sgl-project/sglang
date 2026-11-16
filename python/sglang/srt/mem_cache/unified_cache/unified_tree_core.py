@@ -166,9 +166,6 @@ class UnifiedTreeNode:
         # req.last_node at alloc time. None when sharding is off.
         self.rotation_base: Optional[int] = None
 
-    def component(self, component_type: ComponentType) -> ComponentData:
-        return self.component_data[component_type]
-
     @property
     def backuped(self) -> bool:
         """Tree-level: the token slot's KV present on host."""
@@ -1002,7 +999,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return self._match_prefix_helper(key, params)
 
     def _create_match_validators(
-        self, params: MatchPrefixParams, match_device_only: bool
+        self, match_device_only: bool
     ) -> tuple[Callable[[UnifiedTreeNode], bool], ...]:
         return tuple(
             comp.create_match_validator(match_device_only=match_device_only)
@@ -1027,10 +1024,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         action: Optional[CacheAction | ComponentAction] = None
         separate_device_match = self.enable_hicache
         validators = self._create_match_validators(
-            params, match_device_only=not separate_device_match
+            match_device_only=not separate_device_match
         )
         device_validators = (
-            self._create_match_validators(params, match_device_only=True)
+            self._create_match_validators(match_device_only=True)
             if separate_device_match
             else validators
         )
@@ -1087,7 +1084,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             full_kv_hit_length,
             action,
             last_visited_node_id=node.id if node is not self.root_node else None,
-            device_validators=device_validators,
         )
 
     def _device_prefix_covered_by_match(
@@ -1167,7 +1163,6 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         full_kv_hit_length: int,
         action: Optional[CacheAction | ComponentAction],
         last_visited_node_id: Optional[NodeId],
-        device_validators: tuple[Callable[[UnifiedTreeNode], bool], ...],
     ) -> MatchResult:
         node_update = best_match_node
         for comp in self.components:
