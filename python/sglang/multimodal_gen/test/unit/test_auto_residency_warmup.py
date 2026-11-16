@@ -402,11 +402,13 @@ class TestAutoResidencyWarmup(unittest.TestCase):
         ):
             asyncio.run(
                 server_warmup.run_async_client_warmup(
-                    SimpleNamespace(), forward, fail_open=True
+                    SimpleNamespace(scheduler_endpoints=["replica-0"]),
+                    forward,
+                    fail_open=True,
                 )
             )
 
-        forward.assert_awaited_once_with(req)
+        forward.assert_awaited_once_with(req, replica=0)
         degrade.assert_not_called()
 
     def test_non_auto_warmup_keeps_oom_probe_degradation(self):
@@ -438,7 +440,9 @@ class TestAutoResidencyWarmup(unittest.TestCase):
             ) as degrade,
         ):
             asyncio.run(
-                server_warmup.run_async_client_warmup(SimpleNamespace(), forward)
+                server_warmup.run_async_client_warmup(
+                    SimpleNamespace(scheduler_endpoints=["replica-0"]), forward
+                )
             )
 
         self.assertEqual(
