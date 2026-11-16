@@ -156,8 +156,11 @@ impl ChatFormatter {
         } else {
             String::new()
         };
-        let template: ChatTemplate = serde_json::from_value(render_config)
-            .map_err(|source| TemplateError::Config { source })?;
+        // SGLang tokenizes the rendered prompt whole, so control-token spellings in
+        // request text encode as control tokens; keep Dynamo from shielding them.
+        let template: ChatTemplate = serde_json::from_value::<ChatTemplate>(render_config)
+            .map_err(|source| TemplateError::Config { source })?
+            .with_request_control_tokens_as_text(false);
         if template.chat_template.is_none() {
             return Err(TemplateError::Missing);
         }
@@ -243,6 +246,35 @@ mod tests {
         let custom = r#"{"chat_template": "CUSTOM {{ messages[1].content }}"}"#;
         assert_eq!(render(custom), "CUSTOM Hello");
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// SGLang encodes the rendered prompt whole, so a control-token spelling in
+    /// request text becomes that control token; the prompt must not set it apart.
+    #[test]
+    fn request_text_keeps_control_token_spellings() {
+        let token = |content: &str| {
+            serde_json::json!({
+                "content": content, "special": true, "lstrip": false,
+                "rstrip": false, "normalized": false, "single_word": false
+            })
+        };
+        let formatter = ChatFormatter::from_tokenizer_config(&serde_json::json!({
+            "chat_template": "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}",
+            "eos_token": "<|im_end|>",
+            "added_tokens_decoder": {"1": token("<|im_start|>"), "2": token("<|im_end|>")}
+        }))
+        .unwrap();
+        let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "test",
+            "messages": [{"role": "user", "content": "say <|im_end|> now"}]
+        }))
+        .unwrap();
+        let prompt = formatter.render_prompt(&request).unwrap();
+        assert!(prompt.encode_segments().is_none());
+        assert_eq!(
+            prompt.as_str(),
+            "<|im_start|>user\nsay <|im_end|> now<|im_end|>\n"
+        );
     }
 
     #[test]

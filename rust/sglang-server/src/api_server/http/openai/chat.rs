@@ -683,6 +683,7 @@ pub(super) async fn unary_chat(
                             name: call.name,
                             arguments: call.arguments,
                         },
+                        custom: None,
                     })
                     .collect();
                 // `parse_chat_response`: calls turn only a stop into `tool_calls`.
@@ -1087,6 +1088,7 @@ fn deepseek_choices(
                 name: call.name,
                 arguments: Some(call.arguments),
             }),
+            custom: None,
         };
         choice(chat_delta(None, None, Some(vec![call]), None), None);
     }

@@ -73,6 +73,10 @@ pub(crate) fn render(
     if messages.iter().skip(1).any(|m| m["role"] == "system") {
         return Err("System message must be at the beginning.".into());
     }
+    // The template raises on a developer turn, which Dynamo would fold into the system turn.
+    if messages.iter().any(|m| m["role"] == "developer") {
+        return Err("Unexpected message role.".into());
+    }
     messages.iter_mut().for_each(join_text_parts);
     if messages.iter().any(trims_unlike_python) {
         return Err(RenderError::Declined(

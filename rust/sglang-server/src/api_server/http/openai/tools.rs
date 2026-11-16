@@ -98,6 +98,7 @@ pub(super) async fn parse_chat_tool_calls(
                                 name: call.function.name,
                                 arguments: call.function.arguments,
                             },
+                            custom: None,
                         })
                         .collect(),
                 ),
@@ -446,6 +447,7 @@ mod tests {
                     name: Some("get_weather".into()),
                     arguments: Some("{}".into()),
                 }),
+                custom: None,
             }]),
             Some("thinking".into()),
         );
