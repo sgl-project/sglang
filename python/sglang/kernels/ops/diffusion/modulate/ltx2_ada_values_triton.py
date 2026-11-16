@@ -6,10 +6,6 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.multimodal_gen.runtime.platforms import (
-    current_platform,
-)
-
 
 @triton.jit
 def _ltx2_ada_values9_kernel(
@@ -142,6 +138,8 @@ def ltx2_ada_values9(
     scale_shift_table: torch.Tensor,
     timestep: torch.Tensor,
 ) -> tuple[torch.Tensor, ...]:
+    from sglang.multimodal_gen.runtime.platforms import current_platform
+
     if timestep.ndim != 3:
         raise ValueError("timestep must have shape [B, S, 9 * D]")
     if (
