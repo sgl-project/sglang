@@ -6,7 +6,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from sglang.kernels.ops.gemm.hc_mix import fused_hc_mix, fused_hc_mix_supported
+from sglang.kernels.ops.gemm.hc_mix import (
+    _deterministic_inference,
+    fused_hc_mix,
+    fused_hc_mix_supported,
+)
+from sglang.srt.environ import envs
+from sglang.srt.layers.hc_mix_flydsl import _MAX_ROWS as _FLYDSL_MAX_ROWS
 from sglang.srt.layers.hc_mix_flydsl import (
     flydsl_hc_mix_supported,
     flydsl_hc_mix_weights_supported,
@@ -204,6 +210,34 @@ class GatedResidual(HyperConnectionBase):
                 # Create before graph capture; all layers on a device share it.
                 self._gate_stream = _hc_gate_stream(torch.cuda.current_device())
 
+        self._hc_prefill_ok = False
+        if (
+            use_mix
+            and use_combine
+            and self.config.hc_per_branch_norm
+            and envs.SGLANG_USE_HIP_HC_PREFILL_TRITON.get()
+        ):
+            from sglang.kernels.ops.gemm.hc_prefill_triton import (
+                hc_prefill_weights_supported,
+            )
+
+            self._hc_prefill_ok = hc_prefill_weights_supported(
+                self.input_mix_weight_down.weight,
+                self.input_mix_weight_up.weight,
+                self.hc_count,
+            )
+        self._hc_prefill_folded_weight = None
+        self._hc_prefill_weight_key = None
+        # Loaders write through param.data, which leaves weight_cache_key unchanged.
+        self._derived_weight_cache_error = (
+            "Online weight updates are not supported while "
+            "SGLANG_USE_HIP_HC_PREFILL_TRITON is enabled: its folded HC weights would "
+            "keep serving the old weights. Restart with "
+            "SGLANG_USE_HIP_HC_PREFILL_TRITON=0 to use online weight updates."
+            if self._hc_prefill_ok
+            else None
+        )
+
         def _mix_compute(
             hyper_input_normed: torch.Tensor,
             input_mix_weight_down: torch.Tensor,
@@ -251,17 +285,70 @@ class GatedResidual(HyperConnectionBase):
             )
         return self._mix_flydsl_ok
 
+    def _mix_prefill(
+        self, hyper_input: torch.Tensor
+    ) -> Optional[tuple[torch.Tensor, tuple[torch.Tensor, None, torch.Tensor]]]:
+        """The mix on the raw residual, or None when the kernels do not take it."""
+        from sglang.kernels.ops.gemm.hc_prefill_triton import (
+            fold_hc_prefill_weights,
+            hc_prefill_mix,
+            hc_prefill_supported,
+        )
+
+        if not hc_prefill_supported(hyper_input):
+            return None
+        down = self.input_mix_weight_down.weight
+        up = self.input_mix_weight_up.weight
+        inject = self.block_inject_weight.weight
+        norm_weight = self.hc_norm.weight
+        # The folded copy derives from the down, inject and norm weights.
+        key = weight_cache_key(down, inject) + weight_cache_key(
+            norm_weight, norm_weight
+        )
+        if self._hc_prefill_weight_key != key:
+            # The eager warm-up before a graph capture builds it, never the capture.
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            self._hc_prefill_folded_weight = fold_hc_prefill_weights(
+                down, inject, norm_weight
+            )
+            self._hc_prefill_weight_key = key
+        mixed_input, inject_logits = hc_prefill_mix(
+            hyper_input,
+            folded_weight=self._hc_prefill_folded_weight,
+            up=up,
+            norm_weight=norm_weight,
+            eps=self.config.rms_norm_eps,
+            hc=self.hc_count,
+        )
+        # No normed residual exists; the inject logits take the gate partials' slot.
+        return mixed_input, (hyper_input, None, inject_logits)
+
     def mix(
         self,
         hyper_input: torch.Tensor,
         normalized_input: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor, tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]]:
+    ) -> tuple[
+        torch.Tensor,
+        tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]],
+    ]:
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if hyper_input.shape[0] == 0:
             mixed_input = hyper_input.new_empty(
                 (*hyper_input.shape[:-1], self.hidden_size), dtype=self.params_dtype
             )
             return mixed_input, (hyper_input, hyper_input, None)
+
+        if (
+            self._hc_prefill_ok
+            and normalized_input is None
+            and hyper_input.shape[0] > _FLYDSL_MAX_ROWS
+            and not torch.compiler.is_compiling()
+            and not _deterministic_inference()
+        ):
+            prefill = self._mix_prefill(hyper_input)
+            if prefill is not None:
+                return prefill
 
         if normalized_input is not None:
             assert self.config.hc_per_branch_norm
@@ -348,7 +435,7 @@ class GatedResidual(HyperConnectionBase):
     def combine_and_normalize(
         self,
         block_output: torch.Tensor,
-        residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+        residuals: tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]],
         next_norm: Optional[GroupedGemmaRMSNorm],
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Return the residual and its next HC normalization explicitly.
@@ -356,7 +443,11 @@ class GatedResidual(HyperConnectionBase):
         The BF16 combine result is retained before calculating the next norm.
         Callers must only pass the norm when no PLE or other update intervenes.
         """
-        hyper_input, _, partials = residuals
+        hyper_input, hyper_input_normed, partials = residuals
+        if hyper_input_normed is None:
+            # The prefill mix's residuals: its partials are inject logits, and it
+            # prepares no next norm.
+            return self.combine(block_output, residuals), None
         if (
             partials is not None
             and next_norm is not None
@@ -383,9 +474,15 @@ class GatedResidual(HyperConnectionBase):
     def combine(
         self,
         block_output: torch.Tensor,
-        residuals: tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]],
+        residuals: tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]],
     ) -> torch.Tensor:
         hyper_input, hyper_input_normed, partials = residuals
+        if hyper_input_normed is None:
+            from sglang.kernels.ops.gemm.hc_prefill_triton import hc_prefill_combine
+
+            return hc_prefill_combine(
+                hyper_input, block_output, partials, self.hc_count
+            )
         if partials is not None:
             from sglang.kernels.ops.elementwise.hc_combine_decode import (
                 hc_combine_apply,

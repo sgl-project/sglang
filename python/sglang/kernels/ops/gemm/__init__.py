@@ -498,6 +498,22 @@ register_kernel(
 )
 register_kernel(
     KernelSpec(
+        op="gemm.hc_prefill_mix",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.hc_prefill_triton:hc_prefill_mix",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
+        op="gemm.hc_prefill_combine",
+        backend=KernelBackend.TRITON,
+        target="sglang.kernels.ops.gemm.hc_prefill_triton:hc_prefill_combine",
+        capabilities=frozenset({CapabilityRequirement.HIP}),
+    )
+)
+register_kernel(
+    KernelSpec(
         op="gemm.w8a8_block_fp8_matmul_triton",
         backend=KernelBackend.TRITON,
         target="sglang.kernels.ops.gemm.fp8_kernel:w8a8_block_fp8_matmul_triton",
