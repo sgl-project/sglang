@@ -50,6 +50,7 @@ from sglang.multimodal_gen.runtime.entrypoints.utils import (
     save_outputs,
 )
 from sglang.multimodal_gen.runtime.observability.metrics import configure_metrics
+from sglang.multimodal_gen.runtime.request_watchdog import start_request_watchdog
 from sglang.multimodal_gen.runtime.scheduler_client import (
     async_scheduler_client,
     run_zeromq_broker,
@@ -158,6 +159,9 @@ async def lifespan(app: FastAPI):
     broker_task = asyncio.create_task(run_zeromq_broker(server_args))
     app.state.broker_task = broker_task
     backend_monitor = asyncio.create_task(_monitor_backend(app))
+    request_watchdog = start_request_watchdog(
+        server_args, app.state.worker_processes, async_scheduler_client.mark_failed
+    )
     # 3. Receive per-step progress of video jobs from the replica drivers
     progress_task = None
     if server_args.progress_endpoint is not None:
@@ -186,6 +190,10 @@ async def lifespan(app: FastAPI):
         backend_monitor.cancel()
         with suppress(asyncio.CancelledError):
             await backend_monitor
+        if request_watchdog is not None:
+            request_watchdog.cancel()
+            with suppress(asyncio.CancelledError):
+                await request_watchdog
         if warmup_task is not None and not warmup_task.done():
             warmup_task.cancel()
             with suppress(asyncio.CancelledError):
