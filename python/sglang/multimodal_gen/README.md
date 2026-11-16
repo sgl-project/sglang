@@ -1,5 +1,8 @@
 <div align="center"  style="display:block; margin:auto;">
-<img src=https://github.com/lm-sys/lm-sys.github.io/releases/download/test/sgl-diffusion-logo.png width="80%"/>
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="../../../assets/sglang-diffusion/logo-dark.svg">
+  <img src="../../../assets/sglang-diffusion/logo.svg" alt="SGLang Diffusion" width="80%">
+</picture>
 </div>
 
 **SGLang diffusion is an inference framework for accelerated image/video generation.**
