@@ -1,6 +1,6 @@
 """Unit tests for the bounded (LRU) compiled-grammar cache in BaseGrammarBackend.
 
-Target path upstream: test/registered/unit/srt/constrained/test_grammar_cache.py
+Target path upstream: test/registered/unit/constrained/test_grammar_cache.py
 (mirrors python/sglang/srt/constrained/base_grammar_backend.py)
 """
 
