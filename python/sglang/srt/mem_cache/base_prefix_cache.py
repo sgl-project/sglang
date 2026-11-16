@@ -80,9 +80,6 @@ class MatchPrefixParams:
     # matched state, and the slot is bound with the request's row.
     defer_cow_slot: bool = False
     req: Optional[Req] = None
-    # Hit the deepest FULL-KV prefix even past the last cached Mamba state, for
-    # a caller that receives the request's Mamba state elsewhere (PD decode).
-    full_kv_only: bool = False
 
 
 @dataclasses.dataclass
@@ -911,10 +908,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return 0
 
     def supports_mamba(self) -> bool:
-        return False
-
-    def supports_full_kv_only_match(self) -> bool:
-        """Whether `MatchPrefixParams.full_kv_only` is honored."""
         return False
 
     def release_session(self, session_id: str) -> None:

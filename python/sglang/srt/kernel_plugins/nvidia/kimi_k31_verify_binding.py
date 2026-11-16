@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+from typing import TYPE_CHECKING
+
 import torch
 
 from sglang.kernels.plugin_kernels.nvidia.spec import Step
@@ -11,6 +13,9 @@ from sglang.srt.layers.attention.linear.utils import (
 )
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.runtime_context import get_parallel
+
+if TYPE_CHECKING:
+    from sglang.srt.kernel_plugins.nvidia.binding import MegakernelBinding
 
 # Packed MXFP4 routed-expert shards (w13, w2) per TP size.
 _EXPERT_SHARDS = {
@@ -28,10 +33,8 @@ def covers_short_verify(forward_batch, query_width):
 
 
 class K31VerifyHostBinding:
-    capture_stock_fallback = True
-
-    def __init__(self, model):
-        self.model = model
+    def __init__(self, binding: MegakernelBinding):
+        self.model = binding.model
         self.aux = None
         self.capture_layers = ()
 
@@ -54,10 +57,11 @@ class K31VerifyHostBinding:
         records = []
         full_ids = []
         linear_ids = []
+        cfg = lm.config
         for layer in layers:
             m = layer.self_attn
             idx = int(layer.layer_idx)
-            is_mla = hasattr(m, "q_b_proj")
+            is_mla = not cfg.is_kda_layer(idx)
             if is_mla:
                 if (
                     m.indexer is None
@@ -114,16 +118,8 @@ class K31VerifyHostBinding:
                     float(m.kv_a_layernorm.variance_epsilon),
                     scalar(m.scaling),
                     scalar(m.w_scale),
-                    scalar(
-                        1.0
-                        if getattr(qm, "q_scale_float", None) is None
-                        else qm.q_scale_float
-                    ),
-                    scalar(
-                        1.0
-                        if getattr(qm, "k_scale_float", None) is None
-                        else qm.k_scale_float
-                    ),
+                    scalar(1.0 if qm.q_scale_float is None else qm.q_scale_float),
+                    scalar(1.0 if qm.k_scale_float is None else qm.k_scale_float),
                     float(indexer.k_norm.variance_epsilon),
                 )
             else:
@@ -200,7 +196,6 @@ class K31VerifyHostBinding:
             )
         if (len(full_ids), len(linear_ids)) != (24, 69):
             raise ValueError("K31 verify requires 24 MLA and 69 KDA layers")
-        cfg = lm.config
         return VerifyWeights(
             tuple(records),
             backbone.embed_tokens.weight,
@@ -251,7 +246,6 @@ class K31VerifyHostBinding:
         built.configure_aux(ids)
 
     def pool_view(self, pool, req_pool):
-        # optional plugin: imported only when the megakernel is installed
         from sgl_nvidia_mega.kimi_k31.verify_binding import (
             KdaVerifyPools,
             VerifyLayerPools,
@@ -320,7 +314,6 @@ class K31VerifyHostBinding:
     def forward(
         self, built, step, input_ids, positions, forward_batch, *args, **kwargs
     ):
-        # optional plugin: imported only when the megakernel is installed
         from sgl_nvidia_mega.kimi_k31.verify_binding import (
             KdaVerifyStep,
             VerifyStepView,

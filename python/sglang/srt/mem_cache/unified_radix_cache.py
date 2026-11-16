@@ -286,8 +286,8 @@ class UnifiedRadixCache(BasePrefixCache):
             )
         # Whether a slot keeps a prefix's recurrent state checkpoints.
         self.is_mamba_enabled = TREE_STATE in families
-        # The tree holds no Mamba state but requests do: the cache only frees
-        # each request's own state slot when it leaves (state-free PD decode).
+        # The tree holds no Mamba state but requests do: the cache only frees each
+        # request's own state slot when it leaves (SGLANG_DECODE_STATE_FREE_RADIX).
         self.request_mamba_only = params.request_mamba_only
         assert not (self.request_mamba_only and self.is_mamba_enabled)
         # Whether the mamba extra (ping-pong) buffer is enabled.
@@ -704,9 +704,6 @@ class UnifiedRadixCache(BasePrefixCache):
     def _match_tree(self, params: MatchPrefixParams) -> MatchResult:
         if self.disable:
             return self.tree_core.empty_match_result
-        if params.full_kv_only:
-            assert self.supports_full_kv_only_match()
-            return self._match_full_kv_only(params)
         result = self.tree_core.match_prefix(params)
         # Apply the walk's actions (e.g. a pending write-through relocation on
         # a split) before the finalizers, which can evict or raise.
@@ -730,34 +727,6 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             result = self.linker.match(params.key, params.req, result)
         return result
-
-    def supports_full_kv_only_match(self) -> bool:
-        # Host or external-store hits carry Mamba-gated load plans.
-        return (
-            (self.is_mamba_enabled or self.request_mamba_only)
-            and not self.disable
-            and self.cache_controller is None
-            and self.linker is None
-        )
-
-    def _match_full_kv_only(self, params: MatchPrefixParams) -> MatchResult:
-        """The deepest FULL-KV device hit, past the last cached Mamba state. The
-        caller supplies the request's Mamba state, so nothing is copied from the
-        tree. The regular walk still splits the matched node and refreshes LRU."""
-        assert not params.cow_mamba, "a FULL-KV-only hit has no Mamba state to copy"
-        result = self.tree_core.match_prefix(params)
-        self._apply_cache_actions(result.cache_actions)
-        matched_len, node, _ = self.tree_core.match_full_device_prefix(params.key)
-        result = result._replace(cache_actions=())
-        if matched_len <= result.device_prefix_len:
-            return result
-        return result._replace(
-            device_prefix_len=matched_len,
-            last_device_node=node,
-            last_host_node=node,
-            best_match_node=node,
-            mamba_branching_seqlen=None,
-        )
 
     def _linker_offload_skip_prefix(self, req: Req, token_ids):
         # Skip uploads delegated to another writer (e.g. PD prefill), keeping local tree inserts.
@@ -1609,8 +1578,6 @@ class UnifiedRadixCache(BasePrefixCache):
         self._release_request_mamba(req)
 
     def _release_request_mamba(self, req: Req) -> None:
-        """Free the request's own Mamba state slot when no tree component takes
-        it over (``request_mamba_only``)."""
         if self.request_mamba_only and req.kv.holds_mamba:
             self.token_to_kv_pool_allocator.state.release(self.req_to_token_pool, req)
 

@@ -139,6 +139,8 @@ def _init_state() -> Optional[_State]:
 
 
 def _create_sp_symm_buffers(state: _State) -> None:
+    # Rendezvous (a collective) runs here on every rank, not on a buffer's first
+    # use inside a forward or CUDA graph capture.
     names = [_O_PROJ, _ALL_GATHER]
     if envs.SGLANG_K3_SP_ATTN_RES.get():
         names.append(_ATTN_RES_AG)

@@ -9,9 +9,7 @@ import torch
 
 
 class SimAccLenRing:
-    """Stages host-drawn commit lengths into ``device_len`` (int32 [1]).
-
-    A pinned slot is rewritten only after its previous non-blocking copy completes."""
+    """A pinned slot is rewritten only after its previous non-blocking copy completes."""
 
     SLOTS = 4
 
@@ -20,14 +18,11 @@ class SimAccLenRing:
         cuda = self.device.type == "cuda"
         self.host = torch.zeros(self.SLOTS, dtype=torch.int32, pin_memory=cuda)
         self.device_len = torch.zeros(1, dtype=torch.int32, device=self.device)
-        self._copied: list = [
-            None
-        ] * self.SLOTS  # each slot's last copy-done event (CUDA)
-        self.staged = 0
+        self._copied: list = [None] * self.SLOTS
+        self._staged = 0
 
     def stage(self, length: int) -> torch.Tensor:
-        """Queue ``length`` into ``device_len`` on the current stream and return it."""
-        slot = self.staged % self.SLOTS
+        slot = self._staged % self.SLOTS
         done = self._copied[slot]
         if done is not None:
             done.synchronize()  # issued SLOTS rounds ago: complete in practice
@@ -37,5 +32,5 @@ class SimAccLenRing:
             event = torch.cuda.Event()
             event.record()
             self._copied[slot] = event
-        self.staged += 1
+        self._staged += 1
         return self.device_len

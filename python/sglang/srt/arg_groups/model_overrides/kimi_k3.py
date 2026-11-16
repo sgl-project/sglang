@@ -238,19 +238,12 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
         ):
             logger.info("Kimi-K3.1 DCP enables replicated Q projection by default.")
             overrides["dcp_replicate_q_proj"] = True
-    overrides.update(_kimi_k31_lossless_defaults(cfg))
-    return overrides
-
-
-def _kimi_k31_lossless_defaults(cfg: Any) -> dict:
-    """Turn on Kimi-K3.1 optimizations that keep model precision unless set:
-    FlashMLA prefill token packing only reorders the sparse-key sum, is
-    self-gated to the layouts it supports and stays off in deterministic mode."""
-    overrides = {}
     if cfg.enable_flashmla_prefill_token_packing is None:
+        # Lossless: packing only reorders the sparse-key sum, is self-gated to the
+        # layouts it supports, and stays off in deterministic mode.
+        logger.info("Kimi-K3.1 enables FlashMLA prefill token packing by default.")
         overrides["enable_flashmla_prefill_token_packing"] = True
-    if overrides:
-        logger.info(f"Kimi-K3.1 enables lossless defaults: {overrides}")
+    overrides["decode_state_free_radix_default"] = True
     return overrides
 
 

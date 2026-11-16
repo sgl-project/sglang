@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 from einops import rearrange
@@ -26,7 +26,6 @@ from sglang.kernels.ops.kvcache.dsa_fused_store_index_cache import (
 )
 from sglang.kernels.ops.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
 from sglang.srt.compilation.compilation_config import register_split_op
-from sglang.srt.configs.model_config import is_kimi_k31
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.dsa.dsa_dcp import (
     dcp_all_gather_rows_,
@@ -88,6 +87,7 @@ from sglang.srt.runtime_context import (
     get_device,
     get_exec,
     get_parallel,
+    get_platform,
 )
 from sglang.srt.state_capturer.indexer_topk import (
     maybe_capture_indexer_topk,
@@ -196,9 +196,14 @@ DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 # decode rows up to which the merged [wk | weights_proj] GEMM uses tiny_gemm
 # (cuBLAS beyond: same at 32 rows, faster at 48+ on B300)
 _MERGED_K_GATE_MAX_M = 16
-# Kimi-K3.1 prefill extends with at least this many rows split the indexer
-# (logits and top-k) across the attention-TP ranks and all-gather the top-k
-_INDEXER_TP_SPLIT_MIN_ROWS = 1024
+
+
+class _IndexerTpSplit(NamedTuple):
+    # this rank scores prefill rows [row_lo, row_hi) and all-gathers the top-k
+    group: Any  # attn-TP GroupCoordinator
+    row_lo: int
+    row_hi: int
+    rows_per_rank: List[int]
 
 
 if _is_cuda or _is_hip:
@@ -477,12 +482,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             self._fused_fp8_cos_cache = None
             self._fused_fp8_sin_cache = None
         self.softmax_scale = self.head_dim**-0.5
-        # [wk | weights_proj] rows for the merged GEMM, see prepare_merged_k_gate
+        # [wk | weights_proj] rows for the merged GEMM
         self._wk_gate_weight: Optional[torch.Tensor] = None
         self.num_init_tokens = self.num_local_tokens = 0
+        # Set by the model: prefill extends with at least this many rows split the
+        # indexer (logits and top-k) across the attention-TP ranks; None never splits.
         self.tp_split_min_rows: Optional[int] = None
-        if config is not None and is_kimi_k31(config):
-            self.tp_split_min_rows = _INDEXER_TP_SPLIT_MIN_ROWS
         if config is not None:
             self.num_init_tokens = getattr(config, "index_init_tokens", 0)
             self.num_local_tokens = getattr(config, "index_local_tokens", 0)
@@ -742,19 +747,16 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         return weights.unsqueeze(-1) * q_scale * self.softmax_scale
 
     def _fused_k_weights(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        return self._split_k_weights(self._k_gate_gemm(x))
-
-    def _k_gate_gemm(self, x: torch.Tensor) -> torch.Tensor:
-        if self.use_dsa_indexer_fusion:
-            return self.wk_weights_proj(x)[0]
-        from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
-
-        if x.shape[0] <= _MERGED_K_GATE_MAX_M:
-            return tiny_gemm_bf16(x, self._wk_gate_weight)
-        return torch.mm(x, self._wk_gate_weight.t())
-
-    def _split_k_weights(self, kw: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         # [key | head gate] output of a merged wk / weights_proj GEMM
+        if self.use_dsa_indexer_fusion:
+            kw = self.wk_weights_proj(x)[0]
+        else:
+            from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
+
+            if x.shape[0] <= _MERGED_K_GATE_MAX_M:
+                kw = tiny_gemm_bf16(x, self._wk_gate_weight)
+            else:
+                kw = torch.mm(x, self._wk_gate_weight.t())
         return kw.split([self.head_dim, self.n_heads], dim=-1)
 
     def _aiter_fused_fp8_active(self, forward_batch: ForwardBatch) -> bool:
@@ -1562,10 +1564,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         assert len(weights.shape) == 3
         weights = weights.squeeze(2)
 
-        # Full batches need the newer DeepGEMM scheduler. Keep chunking as the
-        # default for older libraries and for layouts outside the tested bound
-        # (DeepGEMM 0.2.3 on GB300: up to 1024 requests x 8 query rows, logits
-        # bitwise equal to the chunked path).
+        # SM100 DeepGEMM paged MQA requires batch_size <= num_sms; chunk larger batches.
+        # Exception: with DCP-sharded index K, the unchunked call is bitwise equal to
+        # the chunked path up to 1024 reqs x next_n 8 (DeepGEMM 0.2.3 on GB300).
         def _chunked_fp8_paged_mqa_logits(
             q: torch.Tensor,
             kv_cache: torch.Tensor,
@@ -1583,7 +1584,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 dcp_size > 1
                 and chunk_next_n <= 8
                 and batch_size <= 1024
-                and torch.cuda.get_device_capability(q.device)[0] == 10
+                and get_platform().is_sm100
             ):
                 return self._paged_mqa_logits(
                     q,
@@ -1870,11 +1871,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     (row_per * metadata.dcp_size, topk_result.shape[1])
                 )
         else:
-            # TP row split: this rank computes rows [row_lo, row_hi) only.
             tp_split = self._indexer_tp_split(
                 forward_batch=forward_batch, q_offset=q_offset
             )
-            row_lo, row_hi = (0, q_offset) if tp_split is None else tp_split[1:3]
+            if tp_split is None:
+                row_lo, row_hi = 0, q_offset
+            else:
+                row_lo, row_hi = tp_split.row_lo, tp_split.row_hi
         need_chunk, logits_budget_bytes = mqa_logits_should_chunk(
             num_rows=row_hi - row_lo,
             num_cols=k_offset,
@@ -1947,9 +1950,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         dst, dst_base = topk_dst, 0
         if tp_split is not None:
-            if not need_chunk:
-                max_rows = row_hi - row_lo
-            # Per-row outputs, so the local rows go to a buffer gathered below.
             dst = torch.empty(
                 (row_hi - row_lo, self.index_topk), device=device, dtype=torch.int32
             )
@@ -2027,8 +2027,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 topk_result[:q_offset] = topk_dst[:q_offset]
         if tp_split is not None:
             # Rank order == row order, so the gather rebuilds rows [0, q_offset).
-            group, _, _, sizes = tp_split
-            group.all_gatherv(dst, sizes=sizes, output=topk_result[:q_offset])
+            tp_split.group.all_gatherv(
+                dst, sizes=tp_split.rows_per_rank, output=topk_result[:q_offset]
+            )
         return topk_result
 
     def _prefill_lite_topk(
@@ -2094,10 +2095,9 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
     def _indexer_tp_split(
         self, forward_batch: ForwardBatch, q_offset: int
-    ) -> Optional[Tuple[Any, int, int, List[int]]]:
-        # (attn-TP group, lo, hi, rows per rank), or None for the replicated path.
-        # Every input here is identical on all ranks of the group (same batch and
-        # mode), so all ranks take the same branch and the all-gather cannot diverge.
+    ) -> Optional[_IndexerTpSplit]:
+        # None for the replicated path. Every input is identical across the group, so
+        # all ranks take the same branch and the all-gather cannot diverge.
         if not _is_cuda or self.tp_split_min_rows is None:
             return None
         if self.dsa_enable_prefill_cp or is_cp_active(forward_batch):
@@ -2127,7 +2127,7 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
             f"(tp={tp}) for extends of at least {min_rows} rows"
         )
         sizes = [hi - lo for lo, hi in zip(bounds[:-1], bounds[1:])]
-        return group, bounds[rank], bounds[rank + 1], sizes
+        return _IndexerTpSplit(group, bounds[rank], bounds[rank + 1], sizes)
 
     @staticmethod
     def _indexer_tp_split_bounds(

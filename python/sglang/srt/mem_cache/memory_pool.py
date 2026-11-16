@@ -4280,6 +4280,7 @@ class HybridLinearKVPool(KVCache):
         max_running_requests: Optional[int] = None,
         skip_topk_layers: Optional[List[bool]] = None,
         kv_scale_ue8m0: bool = False,
+        fp8_cast_on_write: bool = False,
         start_layer: Optional[int] = None,
         full_kv_pool_class: Optional[type] = None,
         quant_method=None,
@@ -4368,6 +4369,7 @@ class HybridLinearKVPool(KVCache):
                 max_running_requests=max_running_requests,
                 skip_topk_layers=skip_topk_layers,
                 kv_scale_ue8m0=kv_scale_ue8m0,
+                fp8_cast_on_write=fp8_cast_on_write,
                 **hisparse_kwargs,
                 use_fp4_indexer=use_fp4_indexer,
             )
@@ -4860,6 +4862,8 @@ def _prefix_valid_mla_write_loc(loc_2d, commit_lens, cache_k_nope):
 class MLATokenToKVPool(KVCache, MLAKVView):
     # fp8_ds_mla tile scales rounded up to powers of two (Kimi-K3.1)
     kv_scale_ue8m0 = False
+    # raw fp8 rows cast inside the scatter kernel
+    fp8_cast_on_write = False
 
     def __init__(
         self,
@@ -4892,10 +4896,6 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         self.qk_rope_head_dim = qk_rope_head_dim
         self.use_dsa = use_dsa
         self.dcp_replicated = dcp_replicated
-        # fp8_ds_mla tile scales rounded up to powers of two (Kimi-K3.1)
-        self.kv_scale_ue8m0 = False
-        # raw fp8 rows written by a cast-on-store scatter (Kimi-K3.1 trtllm)
-        self.fp8_cast_on_write = False
         self.dsa_kv_cache_store_fp8 = (
             use_dsa
             and dtype == torch.float8_e4m3fn
@@ -5146,11 +5146,8 @@ class MLATokenToKVPool(KVCache, MLAKVView):
             and cache_k_rope.dtype == torch.bfloat16
             and cache_k_rope.numel() > 0
         ):
-            if self.write_loc_is_dcp_resolved or self.dcp_replicated:
-                world, rank = 1, 0
-            else:
-                world = get_parallel().attn_dcp_size
-                rank = get_parallel().attn_dcp_rank
+            world = self._write_loc_dcp_span
+            rank = get_parallel().attn_dcp_rank if world > 1 else 0
             set_mla_kv_buffer_cast_triton(
                 dst_buffer.view(self.dtype),
                 loc,
@@ -5206,11 +5203,6 @@ class MLATokenToKVPool(KVCache, MLAKVView):
         cache_k_nope: torch.Tensor,
         cache_k_rope: torch.Tensor,
     ):
-        """Write the first commit_lens[i] rows of each loc_2d [bs, n] row.
-
-        The other rows go to the reserved padding slot 0, which keeps shapes
-        static and avoids a host sync on commit_lens.
-        """
         self.set_mla_kv_buffer(
             layer,
             _prefix_valid_mla_write_loc(loc_2d, commit_lens, cache_k_nope),
@@ -5504,6 +5496,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
         skip_topk_layers: Optional[List[bool]] = None,
         dcp_replicated: bool = False,
         kv_scale_ue8m0: bool = False,
+        fp8_cast_on_write: bool = False,
         use_fp4_indexer: bool = False,
     ):
         override_dim = (
@@ -5526,10 +5519,9 @@ class DSATokenToKVPool(MLATokenToKVPool):
             dcp_replicated=dcp_replicated,
         )
         self.kv_scale_ue8m0 = kv_scale_ue8m0
-        # kv_scale_ue8m0 marks Kimi-K3.1; its raw fp8 layout (trtllm) casts the
-        # bf16 rows inside the scatter kernel.
+        # Only the raw fp8 layout (no fp8_ds_mla tiles) casts on write.
         self.fp8_cast_on_write = (
-            kv_scale_ue8m0
+            fp8_cast_on_write
             and _is_cuda
             and dtype == torch.float8_e4m3fn
             and not self.dsa_kv_cache_store_fp8

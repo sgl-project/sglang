@@ -1632,7 +1632,7 @@ class SchedulerBatchResultProcessor:
             or req.kv.mamba_ping_pong_track_buffer is not None
             or not self.tree_cache.supports_mamba()
             # a state-free tree takes no state from the request
-            or getattr(self.tree_cache, "request_mamba_only", False)
+            or self.tree_cache.request_mamba_only
         ):
             return True
 

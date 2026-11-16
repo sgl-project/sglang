@@ -265,7 +265,7 @@ export const config = {
     numPromptsByConc: { 1: 16, 16: 80, 64: 320, 256: 1280 },
   },
 
-  // The K3.1 image is built from docker/k31.Dockerfile at commit 37794659f6; it verifies the Rust radix TreeCore
+  // The K3.1 image is built from docker/k31.Dockerfile; it verifies the Rust radix TreeCore
   // and the 1024-expert FlashInfer DynBlock at build time (a Python-only install falls back to
   // slower paths silently).
   dockerImages: {

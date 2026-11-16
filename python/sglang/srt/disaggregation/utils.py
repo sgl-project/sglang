@@ -1904,10 +1904,7 @@ def setup_state_kv_args(
         append_state_component(
             kv_args, StateType.REQUEST_ROW, *draft_kv_ring.floor_buf_infos()
         )
-    elif (
-        str(get_spec().speculative_algorithm).upper() == "DFLASH"
-        and get_spec().speculative_dflash_draft_kv_ring
-    ):
+    elif get_spec().speculative_dflash_draft_kv_ring:
         # A PP stage without the draft keeps empty slots and sends nothing for them.
         append_state_component(kv_args, StateType.DRAFT_RING, [], [], [])
         append_state_component(kv_args, StateType.REQUEST_ROW, [], [], [])

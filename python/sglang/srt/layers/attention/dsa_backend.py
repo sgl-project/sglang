@@ -313,8 +313,6 @@ def _restore_live_rows(output: torch.Tensor, plan: Optional[_RowPlan]) -> torch.
 def _adjacent_absorbed_q(
     q_nope: torch.Tensor, q_rope: torch.Tensor
 ) -> Optional[torch.Tensor]:
-    """The contiguous [T, H, nope + rope] buffer whose two halves q_nope and
-    q_rope are (the absorb wrote them in place), or None when they are apart."""
     if q_nope.dim() != 3 or q_rope.dim() != 3 or q_nope.dtype != q_rope.dtype:
         return None
     num_tokens, num_heads, nope_dim = q_nope.shape
@@ -728,9 +726,6 @@ class DeepseekSparseAttnBackend(
     # kv_indptr/qo_indptr are preallocated at (req pool + 1); an extend batch
     # can never carry more seqs than the pool.
     extend_dummy_seqs_capped_by_req_pool: bool = True
-    # Extend metadata pads the per-token seqlens to the MLP-sync padded rows
-    # (pad_dsa_cache_seqlens), so the queries must keep those rows too.
-    plans_padded_extend_rows: bool = True
     # Decode/verify/draft graph replay rebuilds metadata from static buffers
     # (page-table width) and never reads seq_lens_cpu / seq_lens_sum; opt out of
     # the D2H sync. The eager fallback derives lengths from GPU seq_lens, and the
@@ -791,6 +786,9 @@ class DeepseekSparseAttnBackend(
         self.kv_scale_ue8m0 = model_runner.token_to_kv_pool.kv_scale_ue8m0
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         kimi_k31 = is_kimi_k31(hf_config)
+        # Extend metadata pads the per-token seqlens to the MLP-sync padded rows
+        # (pad_dsa_cache_seqlens), so the queries keep those rows too.
+        self.plans_padded_extend_rows = kimi_k31
         # Every model's PAGED extend takes the packed v2 top-k for an unsharded
         # batch; this flag also sends prefill-CP shards to it (DSATopKBackend).
         self.dsa_packed_extend_topk = _is_hip or kimi_k31
@@ -861,9 +859,8 @@ class DeepseekSparseAttnBackend(
             get_exec().kernel.enable_flashmla_prefill_token_packing
             and _is_cuda
             and get_platform().is_sm100
-            # DCP prefill keeps the local TP heads and packs only after
-            # dcp_gather_kv_cache has restored request-ordered FP8 rows.
-            # Separate prefill-CP layouts have not been validated here.
+            # DCP prefill packs after dcp_gather_kv_cache restores request-ordered
+            # FP8 rows; its combination with prefill CP is unvalidated.
             and (not self.dsa_shards_index_k or not is_dsa_enable_prefill_cp())
             and self.dsa_index_kpool == 1
             and self.dsa_kv_cache_store_fp8
@@ -885,10 +882,8 @@ class DeepseekSparseAttnBackend(
         )
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
         self.flashmla_kv_num_q_heads = _flashmla_kv_padded_heads(self.num_q_heads)
-        # trtllm (Kimi-K3.1): fp8 q built by one fused concat-cast into a buffer
-        # whose pad heads stay zero; under sharded DCP decode attends with the
-        # gathered heads over this rank's KV and returns a partial for the merge.
-        self.trtllm_num_q_heads = trtllm_padded_heads(self.num_q_heads)
+        # trtllm (Kimi-K3.1): fp8 q from one fused concat-cast, pad heads zero;
+        # sharded DCP decode attends gathered heads over local KV for a partial.
         self._trtllm_fused_q = (
             _is_cuda
             and kimi_k31
@@ -899,7 +894,7 @@ class DeepseekSparseAttnBackend(
             and self.kv_lora_rank == 512
             and self.qk_rope_head_dim == 64
         )
-        self._trtllm_q_bufs: dict[int, torch.Tensor] = {}
+        self._trtllm_q_pad_eager: dict[int, torch.Tensor] = {}
         # prims_ts: the trtllm route with Prims-TS as the kernel
         self._prims_ts: Optional[PrimsTSSparseMLA] = None
         if "prims_ts" in (self.dsa_prefill_impl, self.dsa_decode_impl):
@@ -923,12 +918,9 @@ class DeepseekSparseAttnBackend(
             self.local_num_q_heads
         )
         self.enable_auto_select_prefill_impl = self.dsa_prefill_impl == "flashmla_auto"
-        # flashmla_kv q with heads padded to flashmla_kv_num_q_heads: pad heads are
-        # zeroed at allocation and never written, so the absorbed-q concat writes
-        # the real heads in place (no per-call fill + copy). The graph buffer keeps
-        # a fixed address; the eager one grows. Shared across layers, so not
-        # under two-batch overlap.
-        self._flashmla_kv_q_pad: Optional[torch.Tensor] = None
+        # flashmla_kv q padded to flashmla_kv_num_q_heads, concat-written in place into
+        # a _zero_padded_q buffer; shared across layers, so not under two-batch overlap.
+        self._flashmla_kv_q_pad_graph: Optional[torch.Tensor] = None
         # eager buffers by padded head count (DCP prefill and decode differ)
         self._flashmla_kv_q_pad_eager: dict[int, torch.Tensor] = {}
         self._flashmla_kv_pad_q_in_place = (
@@ -2030,23 +2022,23 @@ class DeepseekSparseAttnBackend(
         max_ctx_len = self.req_to_token.shape[1]
         # rewritten in full before every replay; the init-once metadata below would resume zeroed
         with self._memory_saver_adapter.region(tag=GPU_MEMORY_TYPE_CUDA_GRAPH):
-            # getattr: tests build the backend without __init__
+            trtllm_num_q_heads = trtllm_padded_heads(self.num_q_heads)
             if (
-                getattr(self, "_trtllm_fused_q", False)
-                and self.trtllm_num_q_heads != self.num_q_heads
+                self._trtllm_fused_q
+                and trtllm_num_q_heads != self.num_q_heads
                 and self.dsa_decode_impl == "trtllm"
             ):
                 self._trtllm_q_pad_graph = torch.zeros(
                     (
                         max_num_tokens,
-                        self.trtllm_num_q_heads,
+                        trtllm_num_q_heads,
                         self.kv_lora_rank + self.qk_rope_head_dim,
                     ),
                     dtype=torch.float8_e4m3fn,
                     device=self.device,
                 )
             if self._flashmla_kv_pad_q_in_place:
-                self._flashmla_kv_q_pad = torch.zeros(
+                self._flashmla_kv_q_pad_graph = torch.zeros(
                     (
                         max_num_tokens,
                         self.flashmla_kv_num_q_heads,
@@ -3894,7 +3886,6 @@ class DeepseekSparseAttnBackend(
     def _flashmla_kv_q(
         self, q_nope: torch.Tensor, q_rope: torch.Tensor
     ) -> torch.Tensor:
-        # absorbed q, in a zero-padded head buffer when padding applies
         num_tokens, num_heads, _ = q_nope.shape
         target = _flashmla_kv_padded_heads(num_heads)
         if target == num_heads:
@@ -3907,24 +3898,36 @@ class DeepseekSparseAttnBackend(
             and q_nope.dtype == torch.bfloat16
         ):
             return concat_mla_absorb_q_general(q_nope, q_rope)
-        buf = self._flashmla_kv_q_pad
-        if buf is None or buf.shape[0] < num_tokens or buf.shape[1] != target:
-            if torch.cuda.is_current_stream_capturing():
-                return concat_mla_absorb_q_general(q_nope, q_rope)
-            # Eager forwards beyond the graph buffer (prefill chunks, DCP prefill
-            # with the local heads) grow their own buffer: the unpadded fallback
-            # allocates as much per call.
-            buf = self._flashmla_kv_q_pad_eager.get(target)
-            if buf is None or buf.shape[0] < num_tokens:
-                buf = torch.zeros(
-                    (num_tokens, target, self.kv_lora_rank + self.qk_rope_head_dim),
-                    dtype=q_nope.dtype,
-                    device=q_nope.device,
-                )
-                self._flashmla_kv_q_pad_eager[target] = buf
-        out = buf[:num_tokens]
+        out = self._zero_padded_q(
+            self._flashmla_kv_q_pad_graph,
+            self._flashmla_kv_q_pad_eager,
+            (num_tokens, target, self.kv_lora_rank + self.qk_rope_head_dim),
+            q_nope.dtype,
+            q_nope.device,
+        )
         concat_mla_absorb_q_general(q_nope, q_rope, out=out[:, :num_heads])
         return out
+
+    @staticmethod
+    def _zero_padded_q(
+        graph_buf: Optional[torch.Tensor],
+        eager_bufs: dict[int, torch.Tensor],
+        shape: Tuple[int, int, int],
+        dtype: torch.dtype,
+        device: torch.device,
+    ) -> torch.Tensor:
+        # Pad heads are zeroed at allocation and never written. Rows beyond the graph
+        # buffer use a growing per-head-count eager buffer, which no capture bakes in.
+        rows, target, _ = shape
+        buf = graph_buf
+        if buf is None or buf.shape[0] < rows or buf.shape[1] != target:
+            if torch.cuda.is_current_stream_capturing():
+                return torch.zeros(shape, dtype=dtype, device=device)
+            buf = eager_bufs.get(target)
+            if buf is None or buf.shape[0] < rows:
+                buf = torch.zeros(shape, dtype=dtype, device=device)
+                eager_bufs[target] = buf
+        return buf[:rows]
 
     def _forward_flashmla_kv(
         self,
@@ -4104,12 +4107,14 @@ class DeepseekSparseAttnBackend(
                 return_lse=False,
                 skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_PREFILL_THRESHOLD_SCALE_FACTOR.get(),
             )
-            # This backend plans padded extend rows itself (plans_padded_extend_rows),
-            # but the one-shot MHA metadata covers only the real rows: zero the
-            # padded rows (MLP-sync padding, e.g. MegaMoE) instead of leaving them
-            # uninitialized for the layers that follow.
+            # Planned padded extend rows: the one-shot MHA metadata covers only
+            # the real rows, so zero the MLP-sync padding for the layers after.
             real = forward_batch.global_num_token_non_padded_cpu
-            if real is not None and 0 < real < out.shape[0]:
+            if (
+                self.plans_padded_extend_rows
+                and real is not None
+                and 0 < real < out.shape[0]
+            ):
                 out[real:].zero_()
             return out
 
@@ -4951,20 +4956,13 @@ class DeepseekSparseAttnBackend(
         if target == num_heads:
             out = torch.empty(shape, dtype=torch.float8_e4m3fn, device=q_nope.device)
         else:
-            # Pad heads are zeroed at allocation and never written. The graph
-            # buffer keeps its address; larger eager batches use their own.
-            buf = self._trtllm_q_pad_graph
-            if buf is None or buf.shape[0] < rows or buf.shape[1] != target:
-                assert not torch.cuda.is_current_stream_capturing(), (
-                    "trtllm q pad buffer is smaller than the captured batch"
-                )
-                buf = self._trtllm_q_bufs.get(target)
-                if buf is None or buf.shape[0] < rows:
-                    buf = torch.zeros(
-                        shape, dtype=torch.float8_e4m3fn, device=q_nope.device
-                    )
-                    self._trtllm_q_bufs[target] = buf
-            out = buf[:rows]
+            out = self._zero_padded_q(
+                self._trtllm_q_pad_graph,
+                self._trtllm_q_pad_eager,
+                shape,
+                torch.float8_e4m3fn,
+                q_nope.device,
+            )
         return concat_and_cast_q_fp8_heads(out, q_nope, q_rope)
 
     def _pad_topk_indices(

@@ -94,7 +94,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Constants
-# Memory workspace size in MB
 DEFAULT_WORKSPACE_SIZE_MB = envs.SGLANG_TRTLLM_MLA_WORKSPACE_MB.get()
 
 # Block constraint from flashinfer requirements
@@ -257,9 +256,8 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Runtime parameters
         if backend == "trtllm-gen" and 64 < self.num_decode_q_heads < 128:
-            # flashinfer has no trtllm-gen MLA decode variant for this head
-            # count (e.g. a TP1 pipeline stage of a 96-head model) and would
-            # reject the multi-CTA counter buffer; run decode on cute-dsl.
+            # flashinfer has no trtllm-gen MLA decode for this head count (e.g. a TP1
+            # pipeline stage of a 96-head model) and rejects the multi-CTA counter buffer.
             logger.info(
                 "trtllm_mla: %d decode q heads per rank has no trtllm-gen MLA "
                 "decode kernel; using the cute-dsl runner for decode.",
@@ -1634,10 +1632,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
         if (
             self.data_type == torch.float8_e4m3fn
-            and (
-                forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend_v2()
-            )
+            and forward_batch.forward_mode.is_target_verify()
             and not prebuilt_fp8_query
         ):
             assert q_rope is not None and k_rope is not None

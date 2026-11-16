@@ -35,6 +35,7 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
     ModelImpl,
+    is_kimi_k31,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
@@ -83,7 +84,6 @@ from sglang.srt.kernel_plugins.amd.binding import (
 from sglang.srt.kernel_plugins.nvidia.binding import (
     install_megakernel,
     megakernel_state,
-    prepare_megakernel,
 )
 from sglang.srt.kv_canary.api import install_canary
 from sglang.srt.kv_canary.runner.canary_manager import CanaryManager, context_tuple
@@ -1059,7 +1059,6 @@ class ModelRunner:
         """Post-pool component wiring, split out of alloc_memory_pool so forks
         that build bespoke memory pools can reuse it after allocating them."""
         self.init_runner_ids()
-        prepare_megakernel(self.model, self.token_to_kv_pool, self.req_to_token_pool)
 
         # Must be called AFTER init_memory_pool so the pool object exists for
         # canary to monkey-patch, and BEFORE init_decode_cuda_graph so warmup
@@ -1354,60 +1353,18 @@ class ModelRunner:
         """Run every unquantized bf16 linear shape once over a spread of M.
 
         cuBLASLt loads its kernel libraries on first use, which
-        CUDA_MODULE_LOADING=EAGER does not cover. A first load in the middle
-        of a PP prefill, while the neighbour stage spins in an NCCL send to
-        this rank, never returned from cuLibraryLoadData; load them here,
-        before any traffic.
+        CUDA_MODULE_LOADING=EAGER does not cover; a first load during a PP
+        prefill, while the neighbour stage spins in an NCCL send, can hang in
+        cuLibraryLoadData.
         """
         max_m = envs.SGLANG_WARMUP_BF16_GEMM_MAX_M.get()
+        if max_m is None:
+            max_m = 16384 if is_kimi_k31(self.model_config.hf_config) else 0
         if max_m <= 0 or self.device != "cuda":
             return
-        from sglang.srt.layers.linear import LinearBase
-        from sglang.srt.layers.quantization.unquant import (
-            UnquantizedLinearMethod,
-            _bf16_gemm_dispatch_impl,
-        )
+        from sglang.srt.layers.quantization.unquant import warmup_bf16_gemms
 
-        weights = {}
-        for module in self.model.modules():
-            if not isinstance(module, LinearBase) or not isinstance(
-                getattr(module, "quant_method", None), UnquantizedLinearMethod
-            ):
-                continue
-            w = getattr(module, "weight", None)
-            if (
-                isinstance(w, torch.Tensor)
-                and w.dim() == 2
-                and w.dtype == torch.bfloat16
-            ):
-                weights.setdefault((tuple(w.shape), w.stride()), w)
-        ms = set()
-        p = 1
-        while p <= max_m:
-            # cuBLASLt picks kernels per M, including by M alignment.
-            ms.update((p, p + 1, p * 3 // 2, p * 3 // 2 + 7))
-            p *= 2
-        ms = sorted(m for m in ms if m <= max_m)
-        tic = time.perf_counter()
-        with torch.inference_mode():
-            for w in weights.values():
-                n, k = w.shape
-                x = torch.zeros((max_m, k), dtype=torch.bfloat16, device=w.device)
-                for m in ms:
-                    _bf16_gemm_dispatch_impl(x[:m], w, None)
-                    _bf16_gemm_dispatch_impl(
-                        x[:m],
-                        w,
-                        None,
-                        addend=torch.zeros((m, n), dtype=w.dtype, device=w.device),
-                    )
-                del x
-            torch.cuda.synchronize()
-        torch.cuda.empty_cache()
-        logger.info(
-            f"bf16 GEMM warmup: {len(weights)} weight shapes x {len(ms)} M values "
-            f"(max {max_m}) in {time.perf_counter() - tic:.1f}s"
-        )
+        warmup_bf16_gemms(self.model, max_m)
 
     def load_model(self):
         tic_total = time.perf_counter()

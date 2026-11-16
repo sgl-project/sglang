@@ -1,8 +1,4 @@
-"""B300 per-commit CI coverage for the Kimi-K3.1 Balanced serving recipe.
-
-Runs TP8/DCP8/EP2 with DFLASH linear ReplaySSM speculation and hierarchical
-cache on eight B300 GPUs, gated on full-set GSM8K accuracy.
-"""
+"""B300 CI coverage for the Kimi-K3.1 High-Concurrency serving recipe."""
 
 import unittest
 
@@ -16,7 +12,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=1800, stage="base-c", runner_config="8-gpu-b300")
+register_cuda_ci(est_time=1800, stage="extra-b", runner_config="8-gpu-b300")
 
 MODEL_PATH = "moonshotai/Kimi-K3.1-Pro"
 DFLASH_DRAFT_MODEL = "RadixArk/Kimi-K3.1-Dflash2-Preview"
@@ -30,8 +26,6 @@ GPU_IDLE_TIMEOUT = 120
 
 
 class TestKimiK31B300(GSM8KMixin, CustomTestCase):
-    """TP8/DCP8/EP2 recipe with DFLASH speculation and hierarchical cache."""
-
     gsm8k_backend = "sgl_eval"
     gsm8k_score_threshold = 0.935
     gsm8k_num_examples = 1319  # full GSM8K test split

@@ -284,18 +284,19 @@ def decode_state_free_radix_of(cfg: Any) -> bool:
 
     # getattr: model overrides also run on partial configs (e.g. golden tests)
     # that carry no PD fields; those are not PD decode servers.
-    return (
+    if not (
         getattr(cfg, "disaggregation_mode", None) == "decode"
         and bool(cfg.disaggregation_decode_enable_radix_cache)
         and cfg.disable_radix_cache is False
-        and envs.SGLANG_DECODE_STATE_FREE_RADIX.get()
-    )
+    ):
+        return False
+    forced = envs.SGLANG_DECODE_STATE_FREE_RADIX.get()
+    return cfg.decode_state_free_radix_default if forced is None else forced
 
 
 def mamba_extra_buffer_of(cfg: Any) -> bool:
     """Return whether the resolved Mamba cache strategy requires an extra buffer."""
     if decode_state_free_radix_of(cfg):
-        # The tree caches no state, so there is nothing to track checkpoints for.
         return False
     return cfg.disable_radix_cache is False and cfg.mamba_radix_cache_strategy in (
         "extra_buffer",

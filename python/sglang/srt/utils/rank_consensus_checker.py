@@ -217,13 +217,16 @@ def _build_payload(
         if tag == "call":
             if skip_name is not None:
                 scope = {k: v for k, v in scope.items() if k != skip_name}
-            return _ADDR_RE.sub(" at 0x?", repr(scope))
-        return _ADDR_RE.sub(" at 0x?", repr(scope["result"]))
-    parts: list[str] = []
-    for expr in selector:
-        value = _eval_selector(expr, scope)
-        parts.append(f"{expr}={value!r}")
-    return _ADDR_RE.sub(" at 0x?", " | ".join(parts))
+            payload = repr(scope)
+        else:
+            payload = repr(scope["result"])
+    else:
+        parts: list[str] = []
+        for expr in selector:
+            value = _eval_selector(expr, scope)
+            parts.append(f"{expr}={value!r}")
+        payload = " | ".join(parts)
+    return _ADDR_RE.sub(" at 0x?", payload)
 
 
 def _eval_selector(expr: str, scope: dict[str, Any]) -> Any:

@@ -1171,16 +1171,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self._window_tails(fill_len).values(), default=fill_len
             )
         # Match and lock only reusable FULL KV. The entire SWA tail must be
-        # freshly allocated, including when the prefix comes from L2/L3. Prefill
-        # always sends the final Mamba state, so a Mamba tree needs no cached
-        # state at the hit: match FULL KV past the last one.
-        full_kv_only = self.tree_cache.supports_full_kv_only_match()
+        # freshly allocated, including when the prefix comes from L2/L3.
         result = match_kv_cache(
             req,
             self.tree_cache,
             req.origin_input_ids,
-            cow_mamba=self.tree_cache.supports_mamba() and not full_kv_only,
-            full_kv_only=full_kv_only,
+            cow_mamba=self.tree_cache.supports_mamba(),
             max_prefix_len=max_prefix_len,
         )
         req.lock = self.tree_cache.lock(result.last_device_node)

@@ -209,11 +209,9 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
         )
 
     prefill_tokens = cfg.chunked_prefill_size
-    kimi = model_label in (
-        "KimiK3ForConditionalGeneration",
-        "KimiK31ForConditionalGeneration",
-        "KimiK3LinearForCausalLM",
-    )
+    from sglang.srt.configs.model_config import KIMI_K3_ARCHS
+
+    kimi = model_label in KIMI_K3_ARCHS
     if kimi:
         prefill_tokens = max(prefill_tokens, getattr(cfg, "max_prefill_tokens", 0) or 0)
         graph = cfg.cuda_graph_config.prefill if cfg.cuda_graph_config else None
@@ -251,7 +249,6 @@ def validate_mega_moe_token_budget(server_args: ServerArgs, model_label: str) ->
         )
         local_chunked_prefill_size = cfg.chunked_prefill_size
     elif kimi and cfg.tp_size // cfg.attn_cp_size > 1:
-        # Kimi SP-MoE: each rank feeds MegaMoE its attention-TP shard of the rows.
         token_partition_size = cfg.tp_size // cfg.attn_cp_size
         token_partition_name = "attn_tp_size (SP-MoE rows)"
         token_alignment = 1

@@ -37,7 +37,6 @@ from sglang.srt.layers.dcp.layout import (
 )
 from sglang.srt.layers.layer_boundary import get_attn_tp_context
 from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
-from sglang.srt.layers.quantization.unquant import bf16_gemm_dispatch
 from sglang.srt.lora.utils import kv_b_lora_correction
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import (
@@ -195,9 +194,8 @@ class DeepseekMLAForwardMixin:
             mode.is_decode()
             or mode.is_target_verify()
             or mode.is_draft_extend_v2()
-            # K3.1's sharded DSA prefill attends over the gathered KV instead.
-            # The draft-extend clause also covers ROCm's DSA draft, which shards
-            # its KV like the target and merges per-rank partials the same way.
+            # K3.1's sharded DSA prefill attends over the gathered KV instead; draft
+            # extend covers ROCm's DSA draft, which shards KV like the target.
             or (self.use_dsa and mode.is_extend() and not dsa_shards_index_k())
         )
 
@@ -269,22 +267,6 @@ class DeepseekMLAForwardMixin:
         if self.current_attention_backend not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
             return False
         return True
-
-    def _q_b_proj_maybe_replicated(
-        self: DeepseekV2AttentionMLA, q: torch.Tensor, replicated: bool
-    ) -> torch.Tensor:
-        if not replicated:
-            return self.q_b_proj_forward(q)
-        if self.q_b_proj_qrep is not None:
-            # quantized replicated q_b_proj (--dcp-replicate-q-proj on block FP8)
-            return self.q_b_proj_replicated_forward(q)
-        # full-head Q from the gathered weight (skips Q all-gather), through
-        # the same bf16 GEMM dispatch as the sharded q_b_proj
-        return bf16_gemm_dispatch(q, self.q_b_proj_qrep_weight, None).view(
-            -1,
-            self.num_local_heads * self.dcp_size,
-            self.qk_head_dim,
-        )
 
     def _decode_absorb_on_alt_stream(self: DeepseekV2AttentionMLA) -> bool:
         # Only the default bf16 absorb, which nothing downstream replaces: the
@@ -519,8 +501,7 @@ class DeepseekMLAForwardMixin:
                 if q_lora is None:
                     q_lora = q
 
-            # Q projection/absorb is independent of the indexer during
-            # both decode and speculative verification.
+            # Q projection/absorb is independent of the indexer in decode and verify.
             if (
                 self.alt_stream is not None
                 and get_is_capture_mode()
@@ -549,13 +530,16 @@ class DeepseekMLAForwardMixin:
                         self.layer_id, prev_topk_indices
                     )
                 if self.dsa_decode_absorb_under_indexer:
-                    # Captured after the indexer: graph replay continues after
-                    # the join on the stream of the first-captured parent, so
-                    # capturing alt first moves the rest of every DSA layer onto
-                    # a new stream.
+                    # Captured after the indexer: replay continues on the stream of
+                    # the first-captured parent, so capturing alt first would move
+                    # the rest of every DSA layer onto a new stream.
                     with torch.cuda.stream(self.alt_stream):
                         k_nope = k_nope.unsqueeze(1)
-                        q = self._q_b_proj_maybe_replicated(q, q_replicate_active)
+                        q = (
+                            self.q_b_proj_replicated_forward(q)
+                            if q_replicate_active
+                            else self.q_b_proj_forward(q)
+                        )
                         # Neither the absorbed q nor the KV write needs the
                         # top-k: keep them under the indexer, not after it.
                         if self._decode_absorb_on_alt_stream():
@@ -564,16 +548,14 @@ class DeepseekMLAForwardMixin:
                             if uses_raw_fp8_dsa_kv_layout(
                                 get_exec().kernel.dsa_decode_backend
                             ):
-                                # The raw-FP8 DSA route concatenates and casts q
-                                # to fp8 itself: an adjacent bf16 [nope | rope]
-                                # buffer would only add a strided copy of q_pe.
+                                # The raw-FP8 DSA route concats and casts q itself;
+                                # a bf16 [nope | rope] buffer adds a q_pe copy.
                                 q_nope_out_alt = torch.bmm(
                                     q_nope.transpose(0, 1), w_kc
                                 ).transpose(0, 1)
                             else:
-                                # Absorb straight into the [nope | rope] layout the
-                                # attention reads, here under the indexer, so no
-                                # concat runs on the critical path after the top-k.
+                                # Absorb into the attention's [nope | rope] layout,
+                                # so no concat runs after the top-k.
                                 q_all = q_nope.new_empty(
                                     q_nope.shape[:2]
                                     + (self.kv_lora_rank + self.qk_rope_head_dim,)
@@ -601,7 +583,11 @@ class DeepseekMLAForwardMixin:
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
-                q = self._q_b_proj_maybe_replicated(q, q_replicate_active)
+                if q_replicate_active:
+                    # full-head Q from the gathered weight (skips Q all-gather)
+                    q = self.q_b_proj_replicated_forward(q)
+                else:
+                    q = self.q_b_proj_forward(q)
 
                 # Hoist these above the DSA indexer split op so the indexer
                 # and the composite bmm+attention split op are adjacent in FX.

@@ -14,6 +14,7 @@ replaces, SGLang's kernel ops, and the reads listed below.
 from __future__ import annotations
 
 import functools
+import importlib
 import logging
 import time
 from dataclasses import dataclass
@@ -37,6 +38,7 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
     PostVerifyStrategy,
     SpeculativeRuntimeHooks,
     Step,
+    SupportsDecodeTensorEntry,
     SupportsDraftAccept,
     SupportsDraftAux,
     SupportsDraftEmbed,
@@ -53,18 +55,9 @@ from sglang.kernels.plugin_kernels.nvidia.spec import (
 from sglang.srt.arg_groups.model_override_base import model_config_of, resolving_view
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.amd.binding import msa_serves
-
-# a module import: kimi_k31_decode_binding imports this module back
-from sglang.srt.kernel_plugins.nvidia import kimi_k31_decode_binding
 from sglang.srt.kernel_plugins.nvidia.eagle_binding import EagleBinding
-from sglang.srt.kernel_plugins.nvidia.kimi_k31_verify_dsa_binding import (
-    K31SparseVerifyHostBinding,
-)
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.model_executor.runner_utils.capture_mode import (
-    get_capture_attention_variant,
-)
 from sglang.srt.plugins import GENERAL_PLUGINS_GROUP
 from sglang.srt.runtime_context import (
     get_context,
@@ -83,6 +76,7 @@ if TYPE_CHECKING:
 
     from sglang.srt.layers.attention.graph_variants import AttentionGraphVariants
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.model_runner import ModelRunner
     from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
         DecodeCudaGraphRunner,
     )
@@ -315,33 +309,30 @@ class MegakernelBinding:
     decode graphs are captured) raises once one was reallocated."""
 
     def __init__(self, *, model: torch.nn.Module):
-        self._model = model
+        self.model = model
         self._sealed: dict[str, tuple] = {}
         self._cache_sources: dict[int, tuple] = {}
-
-    def create_tensor_entry(self, kind: int):
-        if kind == 32:
-            self.tensor_entry = kimi_k31_decode_binding.K31DecodeHostBinding(
-                self._model
-            )
-            return self.tensor_entry
-        if kind != 31:
-            raise ValueError(f"unknown megakernel tensor binding {kind}")
-        self.tensor_entry = K31SparseVerifyHostBinding(self._model)
-        return self.tensor_entry
+        # (pool, req_pool) and their tensor identities
+        self._hybrid_sources: Optional[tuple] = None
+        self._hybrid_identity: Optional[tuple] = None
 
     def forward_view(
         self, forward_batch: Any = None
     ) -> ForwardView | HybridForwardView:
         """The view of the forward running now (a target step or a draft step)."""
-        from sglang.srt.model_executor.forward_context import get_attn_backend
+        # imported here: hybrid_linear_attn_backend imports model_runner, which
+        # imports this module
+        from sglang.srt.layers.attention.dsa_backend import DSAMetadata
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
 
         backend = get_attn_backend()
         self._seal("kv_pool", backend.token_to_kv_pool)
-        if forward_batch is not None and hasattr(backend, "linear_attn_backend"):
+        if forward_batch is not None and isinstance(backend, HybridLinearAttnBackend):
             full = backend.full_attn_backend.forward_metadata
             linear = backend.linear_attn_backend.forward_metadata
-            if hasattr(full, "real_page_table"):
+            if isinstance(full, DSAMetadata):
                 block_table = full.real_page_table
                 lengths = full.cache_seqlens_int32
             else:
@@ -363,8 +354,15 @@ class MegakernelBinding:
         """The view for an eager prefill step, without graph-static decode metadata."""
         return self.forward_view(forward_batch=None)
 
-    def preparation_view(self, pool: Any, req_pool: Any) -> PreparationView:
-        if not getattr(pool, "use_mla", False) or not hasattr(pool, "mamba_pool"):
+    def preparation_view(self, model_runner: ModelRunner) -> PreparationView:
+        return self.pool_view(
+            model_runner.token_to_kv_pool, model_runner.req_to_token_pool
+        )
+
+    def pool_view(self, pool: Any, req_pool: Any) -> PreparationView:
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        if not (isinstance(pool, HybridLinearKVPool) and pool.use_mla):
             return PreparationView()
         full = pool.full_kv_pool
         mapping = dict(pool.full_attention_layer_id_mapping)
@@ -380,7 +378,7 @@ class MegakernelBinding:
                 conv=tuple(state.conv), temporal=state.temporal
             )
         indexer = None
-        if getattr(pool, "use_dsa", False):
+        if pool.use_dsa:
             indexer = IndexerPoolView(
                 page_size=full.index_page_size,
                 caches={
@@ -420,7 +418,7 @@ class MegakernelBinding:
     def _pool_identity(pool: Any, req_pool: Any) -> tuple:
         full = pool.full_kv_pool
         tensors = list(full.kv_buffer)
-        if getattr(pool, "use_dsa", False):
+        if pool.use_dsa:
             tensors.extend(full.index_k_with_scale_buffer)
         for layer in req_pool.mamba_map:
             state = req_pool.mamba_pool.mamba2_layer_cache(req_pool.mamba_map[layer])
@@ -429,9 +427,12 @@ class MegakernelBinding:
 
     def finish_step(self, forward_batch: Any) -> None:
         # Prefix-cache snapshot; runs once every layer's state is final.
+        from sglang.srt.layers.attention.hybrid_linear_attn_backend import (
+            HybridLinearAttnBackend,
+        )
 
         backend = get_attn_backend()
-        if not hasattr(backend, "linear_attn_backend"):
+        if not isinstance(backend, HybridLinearAttnBackend):
             return
         linear = backend.linear_attn_backend
         req_pool = linear.req_to_token_pool
@@ -459,7 +460,7 @@ class MegakernelBinding:
 
     def assert_live(self) -> None:
         if (
-            hasattr(self, "_hybrid_sources")
+            self._hybrid_sources is not None
             and self._pool_identity(*self._hybrid_sources) != self._hybrid_identity
         ):
             raise RuntimeError("megakernel hybrid buffers changed after preparation")
@@ -490,13 +491,11 @@ class MegakernelBinding:
         self._sealed.setdefault(name, _identity(value))
 
     def _current_pool(self) -> Any:
-        from sglang.srt.model_executor.forward_context import get_attn_backend
-
         return get_attn_backend().token_to_kv_pool
 
     def _history(self) -> Optional[torch.Tensor]:
         # only models with Engram layers have a hasher
-        hasher = getattr(self._model, "engram_hasher", None)
+        hasher = getattr(self.model, "engram_hasher", None)
         return None if hasher is None else hasher.history
 
 
@@ -680,6 +679,14 @@ def handle_nvidia_megakernel(server_args: Any) -> None:
     logger.info("%s: %s on %s", FLAG, spec.name, device_isa())
 
 
+class _InstalledMegakernel(msgspec.Struct, frozen=True):
+    built: BuiltMegakernel
+    binding: Any
+    prepare: Optional[Callable[[BuiltMegakernel, PreparationView], None]]
+    # the TENSOR_ENTRY_KINDS adapter the build runs through, else None
+    tensor_entry: Any = None
+
+
 def megakernel_enabled() -> bool:
     """Whether this server runs with --enable-nvidia-megakernel."""
     # the model loader also runs without a server's config (tools, unit tests)
@@ -764,16 +771,21 @@ def install_megakernel(
         binding=None if tokens > 1 and spec.tensor_verify_binding_kind else binding,
     )
     start, free_before = time.perf_counter(), torch.cuda.mem_get_info()[0]
+    tensor_entry = None
     if tensor_verify:
-        entry = binding.create_tensor_entry(spec.tensor_verify_binding_kind)
-        weights = entry.weights_view(
+        tensor_entry = _tensor_entry(spec.tensor_verify_binding_kind, binding)
+        weights = tensor_entry.weights_view(
             int(get_model().context_length), query_width=tokens
         )
         built = spec.tensor_verify_build(weights, float(context.deadline_s))
     else:
         built = spec.build(model, hf_config, context)
-    # not setattr: a built object that is an nn.Module must not join the state dict
-    model.__dict__["_megakernel"] = built
+    if tensor_entry is None and _decode_entry_kind(built):
+        tensor_entry = _tensor_entry(built.tensor_binding_kind, binding)
+    # Keep plugin resources outside the model's module/state tree.
+    model.__dict__["_megakernel"] = _InstalledMegakernel(
+        built=built, binding=binding, prepare=spec.prepare, tensor_entry=tensor_entry
+    )
     # Different widths would leave ranks waiting in different collectives, and
     # different entries would run different code around them.
     megakernel_agree(tuple(built.widths), what=f"widths {spec.name} built")
@@ -821,12 +833,12 @@ def install_megakernel(
         used_mib,
         context.deadline_s,
     )
-    model.__dict__["_megakernel_prepare"] = spec.prepare, binding
-    if getattr(built, "tensor_binding_kind", 0) and not hasattr(
-        binding, "tensor_entry"
-    ):
-        binding.create_tensor_entry(built.tensor_binding_kind)
-    dispatch = _Dispatch(built=built, original=model.forward, binding=binding)
+    dispatch = _Dispatch(
+        built=built,
+        original=model.forward,
+        binding=binding,
+        tensor_entry=tensor_entry,
+    )
     model.forward = dispatch.wrapped()
     if spec.prefill_graph:
         _install_prefill_body(model, spec=spec, dispatch=dispatch)
@@ -834,11 +846,32 @@ def install_megakernel(
         capture_tail_hooks.append(_CaptureCheck(spec=spec, dispatch=dispatch))
 
 
+def _installed(model: Optional[torch.nn.Module]) -> Optional[_InstalledMegakernel]:
+    return None if model is None else model.__dict__.get("_megakernel")
+
+
 def built_megakernel(model: Optional[torch.nn.Module]) -> Optional[BuiltMegakernel]:
     """The object the spec built for this model, or None."""
-    if model is None:
-        return None
-    return model.__dict__.get("_megakernel")
+    installed = _installed(model)
+    return None if installed is None else installed.built
+
+
+def prepare_megakernel(model_runner: ModelRunner) -> None:
+    """Prepare installed plugin resources after model preparation, before capture."""
+    installed = _installed(model_runner.model)
+    if installed is not None and installed.prepare is not None:
+        entry = installed.tensor_entry
+        view = (
+            installed.binding.preparation_view(model_runner)
+            if entry is None
+            else entry.pool_view(
+                model_runner.token_to_kv_pool, model_runner.req_to_token_pool
+            )
+        )
+        installed.prepare(installed.built, view)
+    own_state = megakernel_state(model_runner.model)
+    if own_state is not None:
+        model_runner.token_to_kv_pool_allocator.state.own_state = own_state
 
 
 def megakernel_state(model: torch.nn.Module) -> Optional[SupportsStateSlotReset]:
@@ -901,100 +934,84 @@ def megakernel_draft_sampler(draft_model: torch.nn.Module) -> Optional[Callable]
     return None if built is None else built.draft_sampler
 
 
-def megakernel_draft_aux(draft_model: torch.nn.Module) -> Optional[SupportsDraftAux]:
-    """Draft spec that writes the DFlash context KV, else None; call on all TP ranks."""
+def _offered(model: torch.nn.Module, protocol: type) -> Any:
+    if not megakernel_enabled():
+        return None
+    built = built_megakernel(model)
+    return built if isinstance(built, protocol) else None
+
+
+def _offered_draft(
+    draft_model: torch.nn.Module, protocol: type, sizes: str, *, what: str
+) -> Any:
     if not megakernel_enabled():
         return None
     built = built_megakernel(draft_model)
-    aux = (
-        built if isinstance(built, SupportsDraftAux) and built.draft_aux_rows else None
+    offered = built if isinstance(built, protocol) and getattr(built, sizes) else None
+    megakernel_agree(() if offered is None else getattr(offered, sizes), what=what)
+    return offered
+
+
+def megakernel_draft_aux(draft_model: torch.nn.Module) -> Optional[SupportsDraftAux]:
+    """Draft spec that writes the DFlash context KV, else None; call on all TP ranks."""
+    return _offered_draft(
+        draft_model, SupportsDraftAux, "draft_aux_rows", what="draft aux rows"
     )
-    megakernel_agree(() if aux is None else aux.draft_aux_rows, what="draft aux rows")
-    return aux
 
 
 def megakernel_draft_selector_head(
     draft_model: torch.nn.Module,
 ) -> Optional[SupportsDraftSelectorHead]:
     """Draft spec whose forward proposes the block, else None; call on all TP ranks."""
-    if not megakernel_enabled():
-        return None
-    built = built_megakernel(draft_model)
-    head = (
-        built
-        if isinstance(built, SupportsDraftSelectorHead) and built.draft_head_requests
-        else None
+    return _offered_draft(
+        draft_model,
+        SupportsDraftSelectorHead,
+        "draft_head_requests",
+        what="draft head requests",
     )
-    megakernel_agree(
-        () if head is None else head.draft_head_requests, what="draft head requests"
-    )
-    return head
 
 
 def megakernel_draft_accept(
     draft_model: torch.nn.Module,
 ) -> Optional[SupportsDraftAccept]:
     """Draft spec running the greedy verify accept, else None; call on all TP ranks."""
-    if not megakernel_enabled():
-        return None
-    built = built_megakernel(draft_model)
-    accept = (
-        built
-        if isinstance(built, SupportsDraftAccept) and built.draft_accept_requests
-        else None
-    )
-    megakernel_agree(
-        () if accept is None else accept.draft_accept_requests,
+    return _offered_draft(
+        draft_model,
+        SupportsDraftAccept,
+        "draft_accept_requests",
         what="draft accept requests",
     )
-    return accept
 
 
 def megakernel_draft_embed(
     draft_model: torch.nn.Module,
 ) -> Optional[SupportsDraftEmbed]:
     """Draft spec that embeds the draft block, else None; call on all TP ranks."""
-    if not megakernel_enabled():
-        return None
-    built = built_megakernel(draft_model)
-    embed = (
-        built
-        if isinstance(built, SupportsDraftEmbed) and built.draft_embed_requests
-        else None
-    )
-    megakernel_agree(
-        () if embed is None else embed.draft_embed_requests,
+    return _offered_draft(
+        draft_model,
+        SupportsDraftEmbed,
+        "draft_embed_requests",
         what="draft embed requests",
     )
-    return embed
 
 
 def megakernel_kda_commit(target_model: torch.nn.Module) -> Optional[SupportsKdaCommit]:
     """Target spec that commits the KDA state after a verify (rank-local), else None."""
-    if not megakernel_enabled():
-        return None
-    built = built_megakernel(target_model)
-    return built if isinstance(built, SupportsKdaCommit) else None
+    return _offered(target_model, SupportsKdaCommit)
 
 
 def megakernel_rank0_broadcast(
     target_model: torch.nn.Module,
 ) -> Optional[SupportsRank0Broadcast]:
     """Target spec broadcasting rank 0's sampled-accept decision on device, else None."""
-    if not megakernel_enabled():
-        return None
-    built = built_megakernel(target_model)
-    return built if isinstance(built, SupportsRank0Broadcast) else None
+    return _offered(target_model, SupportsRank0Broadcast)
 
 
 def megakernel_sampled_accept(
     target_model: torch.nn.Module,
 ) -> Optional[SupportsSampledAccept]:
     """Target spec that runs the DFLASH sampled accept on vocab shards, else None."""
-    if not megakernel_enabled():
-        return None
-    built = built_megakernel(target_model)
-    return built if isinstance(built, SupportsSampledAccept) else None
+    return _offered(target_model, SupportsSampledAccept)
 
 
 def megakernel_entry(model: torch.nn.Module, name: str) -> Optional[Callable]:
@@ -1060,6 +1077,30 @@ def _offered_graph_variants(
 BINDING_KINDS: Mapping[str, type] = MappingProxyType(
     {"default": MegakernelBinding, "eagle_hybrid": EagleBinding}
 )
+
+# Tensor-entry kind (a spec's tensor_verify_binding_kind or a build's
+# tensor_binding_kind) -> "module:class" of its host adapter, imported lazily.
+TENSOR_ENTRY_KINDS: Mapping[int, str] = MappingProxyType(
+    {
+        31: "sglang.srt.kernel_plugins.nvidia.kimi_k31_verify_dsa_binding"
+        ":K31SparseVerifyHostBinding",
+        32: "sglang.srt.kernel_plugins.nvidia.kimi_k31_decode_binding"
+        ":K31DecodeHostBinding",
+    }
+)
+
+
+def _decode_entry_kind(built: BuiltMegakernel) -> int:
+    return (
+        built.tensor_binding_kind if isinstance(built, SupportsDecodeTensorEntry) else 0
+    )
+
+
+def _tensor_entry(kind: int, binding: MegakernelBinding) -> Any:
+    if kind not in TENSOR_ENTRY_KINDS:
+        raise ValueError(f"unknown megakernel tensor binding {kind}")
+    module, name = TENSOR_ENTRY_KINDS[kind].split(":")
+    return getattr(importlib.import_module(module), name)(binding)
 
 
 def _binding_class(architectures: Optional[list[str]], kind: str = "") -> type:
@@ -1185,28 +1226,31 @@ def _model_disable_reasons(
 class _Dispatch:
     """The installed forward: covered steps run the built megakernel."""
 
-    def __init__(self, *, built: BuiltMegakernel, original: Callable, binding: Any):
+    def __init__(
+        self,
+        *,
+        built: BuiltMegakernel,
+        original: Callable,
+        binding: Any,
+        tensor_entry: Any = None,
+    ):
         # MegakernelBinding, or the model-specific binding in _BINDINGS.
         self.built, self.original, self.binding = built, original, binding
-        # Batch size -> plugin step; stock fallback captures leave it untouched.
+        self.tensor_entry = tensor_entry
+        # batch size -> the step planned while capturing its decode graphs; plan reads
+        # only the mode and rows, so every graph variant of a batch size plans alike
         self.captured: dict[int, Optional[Step]] = {}
 
     def wrapped(self) -> Callable:
         # Graph runners and supports_pp inspect the original forward's signature.
         @functools.wraps(self.original)
         def forward(input_ids, positions, forward_batch, *args, **kwargs):
-            entry = getattr(self.binding, "tensor_entry", None)
-            stock_graph = entry is not None and _capturing_stock_fallback()
-            step = (
-                None
-                if stock_graph
-                else (
-                    entry.plan(self.built, input_ids, forward_batch, *args, **kwargs)
-                    if entry is not None
-                    else self.built.plan(input_ids, forward_batch, *args, **kwargs)
-                )
-            )
-            if torch.cuda.is_current_stream_capturing() and not stock_graph:
+            entry = self.tensor_entry
+            if entry is None:
+                step = self.built.plan(input_ids, forward_batch, *args, **kwargs)
+            else:
+                step = entry.plan(self.built, input_ids, forward_batch, *args, **kwargs)
+            if torch.cuda.is_current_stream_capturing():
                 self.captured[int(forward_batch.batch_size)] = step
             if step is None:
                 return self.original(
@@ -1222,13 +1266,11 @@ class _Dispatch:
                     *args,
                     **kwargs,
                 )
-            hybrid = isinstance(self.binding, MegakernelBinding)
-            if hybrid:
-                view = self.binding.forward_view(forward_batch)
-            elif step.mode == "prefill":
-                view = self.binding.prefill_view()
-            else:
-                view = self.binding.forward_view()
+            view = (
+                self.binding.prefill_view()
+                if step.mode == "prefill"
+                else self.binding.forward_view(forward_batch)
+            )
             out = self.built.forward(
                 msgspec.structs.replace(step, view=view),
                 self.original,
@@ -1238,7 +1280,7 @@ class _Dispatch:
                 *args,
                 **kwargs,
             )
-            if hybrid:
+            if step.mode == "decode" and isinstance(self.binding, MegakernelBinding):
                 self.binding.finish_step(forward_batch)
             return out
 
@@ -1355,82 +1397,28 @@ def _refuse(reasons: list[str]) -> None:
         )
 
 
-# Tensor-entry host adapter.
-
-
-def prepare_megakernel(model: torch.nn.Module, pool: Any, req_pool: Any) -> None:
-    preparation = model.__dict__.get("_megakernel_prepare")
-    if preparation is None:
-        return
-    prepare, binding = preparation
-    if prepare is not None:
-        entry = getattr(binding, "tensor_entry", None)
-        view = (
-            entry.pool_view(pool, req_pool)
-            if entry is not None
-            else binding.preparation_view(pool, req_pool)
-        )
-        prepare(built_megakernel(model), view)
-
-
-# The stock fallback graph serves steps outside the tensor entry's coverage.
-_MEGAKERNEL_GRAPH = "nvidia_megakernel"
-_STOCK_GRAPH = "nvidia_megakernel_stock_fallback"
-
-
-def _capturing_stock_fallback():
-    return get_capture_attention_variant() == _STOCK_GRAPH
-
-
-class _StockFallbackGraphVariants:
-    capture_labels = (_MEGAKERNEL_GRAPH, _STOCK_GRAPH)
-
-    def __init__(self, entry, built):
-        self.entry, self.built = entry, built
-
-    def select(self, forward_batch):
-        return (
-            _MEGAKERNEL_GRAPH
-            if self.entry.can_run_graph(self.built, forward_batch)
-            else _STOCK_GRAPH
-        )
-
-
-def megakernel_tensor_graph_variants(model, existing):
-    preparation = model.__dict__.get("_megakernel_prepare")
-    entry = getattr(preparation[1], "tensor_entry", None) if preparation else None
-    if existing is None and entry is not None:
-        factory = getattr(entry, "graph_variants", None)
-        if factory is not None:
-            model.__dict__["_megakernel_has_stock_graph"] = False
-            return factory()
-    enabled = (
-        existing is None
-        and entry is not None
-        and getattr(entry, "capture_stock_fallback", False)
+def megakernel_tensor_graph_variants(
+    model: torch.nn.Module, existing: Optional[AttentionGraphVariants]
+) -> Optional[AttentionGraphVariants]:
+    """The tensor entry's decode graph variants when the runner has none of its own."""
+    installed = _installed(model)
+    entry = None if installed is None else installed.tensor_entry
+    return (
+        entry.graph_variants() if existing is None and entry is not None else existing
     )
-    model.__dict__["_megakernel_has_stock_graph"] = enabled
-    if enabled:
-        return _StockFallbackGraphVariants(entry, built_megakernel(model))
-    return existing
 
 
-def megakernel_can_run_graph(model, forward_batch):
-    if model.__dict__.get("_megakernel_has_stock_graph", False):
+def megakernel_can_run_graph(
+    model: torch.nn.Module, forward_batch: ForwardBatch
+) -> bool:
+    """False when a tensor-entry decode build cannot run this batch's graph."""
+    installed = _installed(model)
+    if installed is None or not _decode_entry_kind(installed.built):
         return True
-    built = built_megakernel(model)
-    if built is None or not getattr(built, "tensor_binding_kind", 0):
-        return True
-    preparation = model.__dict__.get("_megakernel_prepare")
-    entry = getattr(preparation[1], "tensor_entry", None) if preparation else None
-    return entry is not None and entry.can_run_graph(built, forward_batch)
+    return installed.tensor_entry.can_run_graph(installed.built, forward_batch)
 
 
-def configure_megakernel_aux(model, layer_ids):
-    preparation = model.__dict__.get("_megakernel_prepare")
-    if preparation is None:
-        return
-    _, binding = preparation
-    entry = getattr(binding, "tensor_entry", None)
-    if entry is not None:
-        entry.configure_aux(built_megakernel(model), layer_ids)
+def configure_megakernel_aux(model: torch.nn.Module, layer_ids: Any) -> None:
+    installed = _installed(model)
+    if installed is not None and installed.tensor_entry is not None:
+        installed.tensor_entry.configure_aux(installed.built, layer_ids)

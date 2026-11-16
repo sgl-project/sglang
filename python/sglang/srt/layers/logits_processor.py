@@ -508,7 +508,7 @@ class LogitsProcessor(nn.Module):
         # Set before graph capture by a speculative worker that finishes the TP
         # gather itself (see finish_deferred_gather / deferred_argmax).
         self.defer_verify_gather = False
-        self.defer_plain_gather = envs.SGLANG_DFLASH_DEFER_PLAIN_GATHER.get()
+        self.defer_plain_gather = envs.SGLANG_OPT_DFLASH_DEFER_PLAIN_GATHER.get()
         self._sharded_verify_eligible = (
             _runtime_optimized_vocab_shards_enabled()
             and self.do_tensor_parallel_all_gather
@@ -1271,7 +1271,6 @@ class LogitsProcessor(nn.Module):
         lm_head: VocabParallelEmbedding,
         logits_metadata: LogitsMetadata,
     ) -> bool:
-        """Whether to leave a target-verify vocab shard for the worker to gather."""
         return (
             self.defer_plain_gather
             and not self.final_logit_softcapping

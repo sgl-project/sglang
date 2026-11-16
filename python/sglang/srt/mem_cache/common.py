@@ -187,7 +187,6 @@ def match_kv_cache(
     token_ids: Optional[array] = None,
     *,
     cow_mamba: bool = False,
-    full_kv_only: bool = False,
     defer_cow_slot: bool = False,
     max_prefix_len: Optional[int] = None,
 ) -> MatchResult:
@@ -201,7 +200,6 @@ def match_kv_cache(
             cow_mamba=cow_mamba,
             defer_cow_slot=defer_cow_slot,
             req=req,
-            full_kv_only=full_kv_only,
         )
     )
     if envs.SGLANG_RADIX_FORCE_MISS.get():

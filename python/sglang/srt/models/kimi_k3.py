@@ -3188,9 +3188,8 @@ class KimiK3DecoderLayer(nn.Module):
                     forward_batch
                 )
             else:
-                # Padded rows (a graph bucket, or SP rows rounded up to the
-                # attention-TP size) would otherwise be routed: their stale
-                # contents pile onto a few experts that every rank then waits on.
+                # Padded rows (a graph bucket, or SP rows rounded up to attention TP)
+                # would route stale contents onto a few experts every rank waits on.
                 valid_token_count = forward_batch.moe_num_token_non_padded()
             hidden_states = self.mlp(
                 hidden_states,
@@ -3858,18 +3857,22 @@ class KimiK3LinearForCausalLM(nn.Module):
     def _check_dsa_indexer_loaded(self, loaded_params: set[str]) -> None:
         if self.config.dsa_config is None:
             return
+        start, end = self.model.start_layer, self.model.end_layer
+        num_dsa_layers = sum(
+            start <= i < end for i in self.config.full_attention_layer_ids
+        )
+        num_indexers = sum(
+            isinstance(layer.self_attn, KimiK3MLAAttention)
+            and layer.self_attn.indexer is not None
+            for layer in self.model.layers[start:end]
+        )
+        assert num_indexers == num_dsa_layers, (
+            f"Kimi-K3.1: built {num_indexers} DSA indexers for {num_dsa_layers} "
+            "DSA layers."
+        )
         expected = {
             name for name, _ in self.named_parameters() if ".self_attn.indexer." in name
         }
-        num_dsa_layers = sum(
-            self.config.is_dsa_layer(i)
-            for i in range(self.model.start_layer, self.model.end_layer)
-        )
-        assert num_dsa_layers > 0 or not expected
-        assert len(expected) == 5 * num_dsa_layers, (
-            f"Kimi-K3.1: built {len(expected)} DSA indexer params, expected "
-            f"5 per DSA layer x {num_dsa_layers} layers."
-        )
         missing = sorted(expected - loaded_params)
         assert not missing, (
             f"Kimi-K3.1: {len(missing)} DSA indexer params were not loaded, "
@@ -3987,6 +3990,7 @@ class KimiK3LinearForCausalLM(nn.Module):
                 and layer.self_attn.indexer is not None
             ):
                 layer.self_attn.indexer.prepare_merged_k_gate()
+                layer.self_attn.indexer.tp_split_min_rows = 1024
 
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer) or not isinstance(

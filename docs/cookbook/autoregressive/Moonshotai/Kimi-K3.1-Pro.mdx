@@ -10,7 +10,7 @@ tag: NEW
 
 <Accordion title="Install SGLang">
 
-Install [SGLang](https://github.com/sgl-project/sglang) from `main`. The Kimi K3.1 Pro image recipe, with every dependency in place, is [`docker/k31.Dockerfile`](https://github.com/sgl-project/sglang/blob/37794659f6732c59288acc83d21cad481a6c2cd2/docker/k31.Dockerfile); build it from a checkout of commit `37794659f6` with `docker buildx build -f docker/k31.Dockerfile .`.
+Install [SGLang](https://github.com/sgl-project/sglang) from source on `main`. The Kimi K3.1 Pro image recipe, with every dependency in place, is [`docker/k31.Dockerfile`](https://github.com/sgl-project/sglang/blob/37794659f6732c59288acc83d21cad481a6c2cd2/docker/k31.Dockerfile); it packages the SGLang source of commit `37794659f6` on the Kimi K3.1 branch, not `main`. Build it from a checkout of that commit with `docker buildx build -f docker/k31.Dockerfile .`.
 
 <Tabs>
 

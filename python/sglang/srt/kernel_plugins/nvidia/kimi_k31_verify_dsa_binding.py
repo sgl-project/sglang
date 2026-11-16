@@ -22,7 +22,6 @@ from sglang.srt.runtime_context import get_parallel
 
 
 def _attn_dcp():
-    """(size, rank) of the attention DCP group, or (1, 0) when none is published."""
     parallel = get_parallel()
     try:
         return parallel.attn_dcp_size, parallel.attn_dcp_rank
@@ -66,8 +65,6 @@ class K31SparseVerifyGraphVariants:
 
 
 class K31SparseVerifyHostBinding(K31VerifyHostBinding):
-    capture_stock_fallback = False
-
     def weights_view(self, context_length, *, query_width=8):
         base = super().weights_view(context_length, query_width=query_width)
         self.request_batches = base.request_batches
@@ -108,7 +105,6 @@ class K31SparseVerifyHostBinding(K31VerifyHostBinding):
         return self.graph_policy
 
     def can_run_graph(self, built, forward_batch):
-        # optional plugin: imported only when the megakernel is installed
         from sgl_nvidia_mega.kimi_k31.verify_contract import request_capacity
 
         return (
@@ -135,7 +131,6 @@ class K31SparseVerifyHostBinding(K31VerifyHostBinding):
     def forward(
         self, built, step, input_ids, positions, forward_batch, *args, **kwargs
     ):
-        # optional plugin: imported only when the megakernel is installed
         from sgl_nvidia_mega.kimi_k31.dsa.verify import SparseVerifyStep
         from sgl_nvidia_mega.kimi_k31.verify_binding import KdaVerifyStep
 

@@ -577,6 +577,16 @@ class SupportsKdaCommit(Protocol):
 
 
 @runtime_checkable
+class SupportsDecodeTensorEntry(Protocol):
+    """A build whose decode steps SGLang runs through a tensor entry.
+
+    tensor_binding_kind names the host adapter (binding.TENSOR_ENTRY_KINDS); 0 is none.
+    """
+
+    tensor_binding_kind: int
+
+
+@runtime_checkable
 class SupportsDraftAccept(Protocol):
     """A DFlash draft spec that runs the greedy verify accept itself.
 

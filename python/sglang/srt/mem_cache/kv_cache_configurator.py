@@ -356,29 +356,6 @@ class _PoolSizes(msgspec.Struct, frozen=True, kw_only=True):
     unified_total_bytes: Optional[int] = None
 
 
-def mla_draft_rows_are_dcp_collapsed(
-    *,
-    model_config: ModelConfig,
-    use_mla_backend: bool,
-    has_mambaish_state: bool,
-    is_hybrid_swa: bool,
-    kv_cache_dtype: torch.dtype,
-) -> bool:
-    """Whether a draft with this geometry keeps DCP-collapsed (physical) MLA rows;
-    see KVCacheConfigurator.draft_mla_rows_are_physical."""
-    return (
-        get_parallel().attn_dcp_size > 1
-        and use_mla_backend
-        and not has_mambaish_state
-        and not is_hybrid_swa
-        and not is_deepseek_dsa(model_config.hf_config)
-        and not is_deepseek_v4(model_config.hf_config)
-        and not is_float4_e2m1fn_x2(kv_cache_dtype)
-        and not current_platform.is_out_of_tree()
-        and get_exec().kernel.attention_backend != "ascend"
-    )
-
-
 def host_only_mamba_checkpoint() -> bool:
     """Radix mamba checkpoints stay in the hicache host pool.
 
@@ -680,24 +657,20 @@ class KVCacheConfigurator:
 
     @property
     def draft_mla_rows_are_physical(self) -> bool:
-        """Whether the draft's MLA rows are DCP-collapsed like the target's.
-
-        True only for the plain MLA draft pool built by ``_build_mla_kv_pool``:
-        under DCP it writes and reads owner rows at ``loc // dcp_size``
-        (MLATokenToKVPool._scatter_mla_rows, the DCP page table), so it spans
-        and pages the same physical row space as the target. An MHA draft keeps
-        raw widened locs (masked_set_kv_buffer_kernel) and stays logical.
-        """
+        """Whether the draft's MLA rows are DCP-collapsed like the target's: under
+        DCP the plain MLA draft pool addresses owner rows at ``loc // dcp_size``
+        (MLATokenToKVPool._scatter_mla_rows); an MHA draft keeps widened locs."""
         return (
             self.is_draft_worker
             and get_parallel().attn_dcp_size > 1
-            and mla_draft_rows_are_dcp_collapsed(
-                model_config=self.model_config,
-                use_mla_backend=self.use_mla_backend,
-                has_mambaish_state=self.mambaish_config is not None,
-                is_hybrid_swa=self.is_hybrid_swa,
-                kv_cache_dtype=self.kv_cache_dtype,
-            )
+            and self.use_mla_backend
+            and self.mambaish_config is None
+            and not self.is_hybrid_swa
+            and not is_deepseek_dsa(self.model_config.hf_config)
+            and not is_deepseek_v4(self.model_config.hf_config)
+            and not is_float4_e2m1fn_x2(self.kv_cache_dtype)
+            and not current_platform.is_out_of_tree()
+            and get_exec().kernel.attention_backend != "ascend"
         )
 
     # Note(kpham-sgl):
@@ -730,9 +703,7 @@ class KVCacheConfigurator:
             swa_max_total_num_tokens = config.swa_max_total_num_tokens
 
         # Only drafts that execute without DCP need the full logical token
-        # domain; DCP drafts retain the target's per-rank capacity. A
-        # DCP-collapsed draft only ever addresses the owner rows, so its sizes
-        # stay physical too.
+        # domain; DCP drafts retain the target's per-rank capacity.
         loc_scale = self.loc_space_scale
         max_total_num_tokens *= loc_scale
         if full_max_total_num_tokens is not None:
@@ -870,8 +841,8 @@ class KVCacheConfigurator:
                     (draft_virtual_id_space + page - 1) // page * page
                 )
                 if self.draft_mla_rows_are_physical:
-                    # Owner rows carry one widened id each, so the pool keeps a
-                    # dcp_size-th of the space it is addressed in.
+                    # A rank stores one row per dcp_size widened ids, so the pool
+                    # keeps a dcp_size-th of the space, in whole widened pages.
                     dcp_size = get_parallel().attn_dcp_size
                     widened_page = page * dcp_size
                     widened = (
@@ -909,7 +880,6 @@ class KVCacheConfigurator:
                 # HiSparse's target allocator hands out logical IDs from its
                 # host-expanded address space. Draft KV is direct-indexed by
                 # those shared IDs, so its GPU pool must span the same space.
-                # A DFLASH draft KV ring is addressed by ring rows instead.
                 draft_virtual_id_space = token_to_kv_pool_allocator.size_full
                 page = max(int(self.pool_page_size or 1), 1)
                 draft_virtual_id_space = (
@@ -2549,6 +2519,7 @@ class KVCacheConfigurator:
             tail_extra_slots=(max_speculative_num_draft_tokens() or 0),
             max_running_requests=max_running_requests,
             kv_scale_ue8m0=is_kimi_k31(self.model_config.hf_config),
+            fp8_cast_on_write=is_kimi_k31(self.model_config.hf_config),
             use_fp4_indexer=get_exec().kernel.enable_fp4_indexer,
             **pool_kwargs,
         )
@@ -2828,6 +2799,7 @@ class KVCacheConfigurator:
                         self.model_config.hf_config
                     ),
                     kv_scale_ue8m0=is_kimi_k31(self.model_config.hf_config),
+                    fp8_cast_on_write=is_kimi_k31(self.model_config.hf_config),
                     skip_topk_layers=(
                         None
                         if self.is_draft_worker
@@ -3294,8 +3266,7 @@ class KVCacheConfigurator:
         return int(rest_memory * (1 << 30))  # return in bytes
 
     def _calculate_mamba_ratio(self) -> int:
-        # A state-free decode tree holds no state: one slot per request, as
-        # without a radix cache.
+        # No tree-held state: one Mamba slot per request.
         if get_memory().disable_radix_cache or get_exec().mamba.decode_state_free_radix:
             return 1
 
@@ -3728,9 +3699,7 @@ class KVCacheConfigurator:
                 )
                 total_rest_memory = total_rest_memory - (intermediate_size / (1 << 30))
         elif (
-            get_memory().disable_radix_cache
-            # a state-free decode tree caches no Mamba state either
-            or get_exec().mamba.decode_state_free_radix
+            get_memory().disable_radix_cache or get_exec().mamba.decode_state_free_radix
         ) and get_schedule().max_running_requests is not None:
             # Use explicitly set max_running_requests when no tree holds states
             get_context().override(

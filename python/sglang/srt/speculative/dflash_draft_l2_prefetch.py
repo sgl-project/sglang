@@ -46,6 +46,7 @@ def draft_l2_prefetch_tensors(draft_model) -> List[torch.Tensor]:
 
 class DraftL2Prefetch:
     def __init__(self, tensors: List[torch.Tensor]):
+        # The table holds raw addresses; this keeps the tensors behind them alive.
         self.tensors = tensors
         self.table = build_l2_prefetch_table(tensors)
         self._stream = torch.cuda.Stream(device=self.table.device)

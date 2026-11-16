@@ -4773,11 +4773,12 @@ class Scheduler(
             # On a shared memory the match takes no state slot: admission prices
             # it, and the slot is bound with the row. A request this pass leaves
             # queued drops the copy its match staged.
-            defer_cow_slot = shares_memory(self.token_to_kv_pool_allocator)
-            req.init_next_round_input(self.tree_cache, defer_cow_slot=defer_cow_slot)
+            req.init_next_round_input(
+                self.tree_cache,
+                defer_cow_slot=shares_memory(self.token_to_kv_pool_allocator),
+            )
             if adder.should_defer(req):
-                if defer_cow_slot:
-                    self._drop_unadmitted_match(req)
+                self._drop_unadmitted_match(req)
                 break
             if self.enable_hicache_storage and (
                 self._prefetch_after_device_hit_loss(req)

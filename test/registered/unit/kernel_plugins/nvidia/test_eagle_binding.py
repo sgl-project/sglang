@@ -174,7 +174,9 @@ def _model(**entries):
         "speculative_runtime_hooks": None,
         **entries,
     }
-    model.__dict__["_megakernel"] = SimpleNamespace(widths=(), **offered)
+    model.__dict__["_megakernel"] = runtime._InstalledMegakernel(
+        built=SimpleNamespace(widths=(), **offered), binding=None, prepare=None
+    )
     return model
 
 
@@ -643,6 +645,8 @@ class TestEagleEntries(CustomTestCase):
                     numerics=SimpleNamespace(kind=SimpleNamespace(value="exact")),
                     binding="",
                     prefill_graph=False,
+                    tensor_verify_build=None,
+                    tensor_verify_binding_kind=0,
                 )
                 hooks = []
                 refused = (
