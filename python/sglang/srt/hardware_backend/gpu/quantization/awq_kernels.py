@@ -15,7 +15,7 @@ from sglang.srt.layers.quantization.marlin_utils import (
     marlin_permute_scales,
     moe_awq_to_marlin_zero_points,
 )
-from sglang.srt.layers.quantization.utils import get_scalar_types, replace_parameter
+from sglang.srt.layers.quantization.utils import replace_parameter
 from sglang.srt.utils import is_hip, is_xpu
 
 if TYPE_CHECKING:
@@ -69,8 +69,6 @@ else:
             )
         except ImportError:
             pass
-
-_, scalar_types = get_scalar_types()
 
 
 class AWQLinearKernel:
