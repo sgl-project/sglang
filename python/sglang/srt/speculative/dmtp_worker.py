@@ -15,11 +15,10 @@ class DMTPWorkerV2(DFlashWorkerV2):
         parallel = get_parallel()
         if (
             parallel.pp_size != 1
-            or parallel.tp_size != 4
             or parallel.attn_dp_enabled
             or parallel.attn_cp_size != 1
         ):
-            raise ValueError("DMTP currently requires PP1/TP4 without attention DP/CP")
+            raise ValueError("DMTP currently requires PP1 without attention DP/CP")
         validate_recipe()
         super().__init__(*args, **kwargs)
         self._dflash2_selector = self.selector is not None
