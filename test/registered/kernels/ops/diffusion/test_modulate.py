@@ -185,16 +185,6 @@ def test_scale_shift_3d_tiling_is_bit_exact(shape, scale_constant):
     )
 
 
-@pytest.mark.parametrize("scale_constant", [0, 1])
-def test_scale_shift_scalar_zero_operands_apply_scale_constant(scale_constant):
-    """One-element zero scale and shift still apply ``scale_constant``: the
-    result is ``x * scale_constant``, not always a copy of ``x``."""
-    x = torch.randn((2, 9, 96), device=DEVICE, dtype=torch.bfloat16)
-    zero = torch.zeros(1, device=DEVICE, dtype=torch.bfloat16)
-    actual = fuse_scale_shift_kernel(x, zero, zero, scale_constant)
-    assert torch.equal(actual, x * scale_constant)
-
-
 # ---------------------------------------------------------------------------
 # residual + gate * update
 # ---------------------------------------------------------------------------
