@@ -38,7 +38,7 @@ Logo ownership remains with the respective organizations and projects.
 ## SGLang-Diffusion logo
 
 `logo.svg` and `logo-dark.svg` head the diffusion README on light and dark
-themes. They differ only in the colors of the dots.
+themes. They differ only in the colors of the dots and how strong their glow is.
 
 - The SGL mark is `assets/logo.svg`, unchanged.
 - The word DIFFUSION is set in Open Sans ExtraBold Italic
@@ -47,6 +47,8 @@ themes. They differ only in the colors of the dots.
 - Each dot is a piece of a letter with noise added to it, more the further
   right it sits. Most stay with their letter; the rest drift off to the right
   and leave a hole behind.
+- The dots past the last letter have a soft glow: one blurred layer under the
+  word.
 - The drifting dots move slowly on a 12 second loop. The motion is CSS inside
   the SVG, with no script, and it stops under `prefers-reduced-motion`.
 
