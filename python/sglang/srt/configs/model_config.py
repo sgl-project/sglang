@@ -590,6 +590,39 @@ def get_dsa_index_topk(config: PretrainedConfig) -> int:
     return config.index_topk
 
 
+# Different MoE architectures expose the per-token routed-expert count under
+# different attribute names (e.g. Gemma4 uses ``top_k_experts``,
+# LongCat-2.0 uses ``moe_topk``). Single source of truth for every call site
+# that reads it (scheduler MoE GEMM init, routed-experts capturer, ...).
+MOE_TOPK_ATTRS = (
+    "num_experts_per_tok",
+    "num_experts_per_token",
+    "top_k_experts",
+    "moe_top_k",
+    "moe_topk",
+)
+
+
+def get_moe_topk_size(config: PretrainedConfig) -> int:
+    """Per-token routed-expert count for an MoE text config.
+
+    A spelling present but set to ``None`` (e.g. a default-constructed
+    ``Gemma4TextConfig``) is treated as absent. Raises AttributeError naming
+    the searched attributes when the config exposes none of them, instead of
+    failing in a caller with a bare ``'<Config>' object has no attribute
+    'num_experts_per_tok'``.
+    """
+    for attr in MOE_TOPK_ATTRS:
+        if hasattr(config, attr):
+            value = getattr(config, attr)
+            if value is not None:
+                return value
+    raise AttributeError(
+        f"{type(config).__name__} exposes no per-token routed-expert count "
+        f"(looked for {', '.join(MOE_TOPK_ATTRS)})"
+    )
+
+
 def dsa_layer_skips_topk(config: PretrainedConfig, layer_id: int) -> bool:
     """Return whether a DSA layer reuses the previous layer's top-k indices."""
     assert is_deepseek_dsa(config)
