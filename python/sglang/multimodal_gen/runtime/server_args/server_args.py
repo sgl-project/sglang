@@ -106,7 +106,7 @@ LORA_MERGE_MODES = ("auto", "merge", "dynamic")
 MAX_SCHEDULER_RPC_TIMEOUT_S = 2_147_483
 # Mirrors AttentionBackend.supports_ring_rotation; the name-level check
 # runs before backend classes are importable on every platform.
-RING_CAPABLE_ATTENTION_BACKENDS = ("fa", "sage_attn")
+RING_CAPABLE_ATTENTION_BACKENDS = ("fa", "sage_attn", "aiter")
 
 
 def _normalize_ltx2_two_stage_device_mode(mode: str | None) -> str | None:
@@ -200,8 +200,10 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "comfy-org/ideogram-4",
         "efficient-large-model/sana1.5_1.6b_1024px_diffusers",
         "efficient-large-model/sana-video_2b_480p_diffusers",
+        "efficient-large-model/sana-video_2.0_5b_720p",
         "sana1.5_1.6b_1024px_diffusers",
         "sana-video_2b_480p_diffusers",
+        "sana-video_2.0_5b_720p",
         "fal/ideogram-v4-fast",
         "fal/ideogram-v4-instant",
         "flux.1-dev",
@@ -224,7 +226,9 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_MODEL_IDS = frozenset(
         "ltx-2.3",
         "ltx-2.5-diffusers",
         "minimax-h3",
+        "minimax-h3-image",
         "minimaxai/minimax-h3",
+        "minimaxai/minimax-h3-image",
         "inclusionai/ming-image-0.1-design",
         "inclusionai/ming-image-0.1-design-layer",
         "ming-image-0.1-design",
@@ -260,12 +264,14 @@ BREAKABLE_CUDA_GRAPH_SUPPORTED_PIPELINE_CONFIGS = frozenset(
         "LongCatImagePipelineConfig",
         "LongCatImageEditPipelineConfig",
         "MiniMaxH3PipelineConfig",
+        "MiniMaxH3ImagePipelineConfig",
         "MingImagePipelineConfig",
         "MingImageLayerPipelineConfig",
         "QwenImagePipelineConfig",
         "QwenImage21PipelineConfig",
         "SanaPipelineConfig",
         "SanaVideoPipelineConfig",
+        "SanaVideo2PipelineConfig",
         "ZImagePipelineConfig",
         "Flux2KleinPipelineConfig",
     }
@@ -426,16 +432,15 @@ class ServerArgs(DisaggServerArgsMixin):
     transformer_weights_path: str | None = None
     # path to precomputed MiniMax H3 AdaLN outputs for inference-only serving.
     minimax_h3_adaln_cache_path: str | None = None
-    # Rebuild AdaLN outputs per request from the checkpoint, no sidecar needed.
-    minimax_h3_adaln_online: bool = False
-    # Widest timestep plan the rebuild slab is sized for; see
-    # MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
-    minimax_h3_adaln_plan_width: int = 4
+    # None lets the model choose; False explicitly keeps resident projections.
+    minimax_h3_adaln_online: bool | None = None
+    # None chooses 2 for image releases, otherwise MINIMAX_H3_ADALN_MAX_PLAN_WIDTH.
+    minimax_h3_adaln_plan_width: int | None = None
     # Pinned-host cache for built AdaLN plans (decimal GB, 0 disables). Plans
     # evicted from the GPU slab swap back in from here instead of re-reading
     # the 24.2 GiB checkpoint. Expert knobs (GPU slot count, fp32 rebuild)
     # live in envs.py as SGLANG_DIFFUSION_MINIMAX_H3_ADALN_*.
-    minimax_h3_adaln_host_cache_gb: float = 8.0
+    minimax_h3_adaln_host_cache_gb: float | None = None
     # Explicit quantization method override (e.g. "mxfp8", "fp8", "modelslim").
     # When set, the transformer loader uses it instead of auto-detection.
     quantization: str | None = None
@@ -854,7 +859,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 "FLUX.1-dev, FLUX.2-Klein, FLUX.3 Image Klein, "
                 "Ideogram-4, jdopensource/JoyAI-Echo, Lightricks/LTX-2, "
                 "LongCat-Image, MiniMax-H3, Qwen/Qwen-Image, Qwen/Qwen-Image-2512, "
-                "Qwen/Qwen-Image-2.1, SANA1.5, SANA-Video, "
+                "Qwen/Qwen-Image-2.1, SANA1.5, SANA-Video, SANA-Video 2.0, "
                 "Tongyi-MAI/Z-Image/Z-Image-Turbo, and zai-org/GLM-Image.",
                 pipeline_config_name,
                 self.model_path,
@@ -1163,10 +1168,7 @@ class ServerArgs(DisaggServerArgsMixin):
         device_total_memory_gb = (
             current_platform.get_device_total_memory() / BYTES_PER_GB
         )
-        if (
-            "H200" in device_name
-            or device_total_memory_gb >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB
-        ):
+        if device_total_memory_gb >= LTX2_RESIDENT_AUTO_ENABLE_MEM_GB:
             logger.info(
                 "Automatically set ltx2_two_stage_device_mode=resident for high-memory CUDA GPU (%s, %.2f GiB total)",
                 device_name,
@@ -2323,7 +2325,8 @@ class ServerArgs(DisaggServerArgsMixin):
                 "from the GPU slab swaps back in over PCIe instead of "
                 "re-reading the 24.2 GiB checkpoint (measured 5.8-6.7 s). One "
                 "50-step schedule needs ~0.9 (t2va) / 1.33 (fl2va) / 1.77 "
-                "(ref2va) GB; the default 8 holds several. Groups are evicted "
+                "(ref2va) GB. Auto uses 8 GB, or 0 for image releases whose "
+                "fixed timestep plans all fit on the GPU. Groups are evicted "
                 "LRU and over-cap groups just recompute. 0 disables the tier."
             ),
         )
@@ -2565,8 +2568,9 @@ class ServerArgs(DisaggServerArgsMixin):
                 "instead of Ulysses all-to-all. Non-causal attention only; "
                 "does not compose with --ulysses-degree/--ring-degree yet. "
                 "When no SP degree is set explicitly, sp_degree=2 defaults to "
-                "kv_gather_degree=2 (its measured-win zone) and higher "
-                "degrees default to Ulysses."
+                "kv_gather_degree=2 (its measured-win zone); higher degrees "
+                "default to Ulysses when the DiT's attention heads divide by "
+                "sp_degree, and to K/V gather otherwise."
             ),
         )
         parser.add_argument(
@@ -2966,7 +2970,7 @@ class ServerArgs(DisaggServerArgsMixin):
                 "'original' keeps official two-stage semantics without premerged stage2, "
                 "'resident' keeps both transformers resident on GPU and runs stage 2 "
                 "on the one with the distilled LoRA merged in. "
-                "Default is auto: resident on H200/high-memory CUDA GPUs, otherwise original."
+                "Default is auto: resident on CUDA GPUs with at least 130 GiB, otherwise original."
             ),
         )
         parser.add_argument(
@@ -4202,15 +4206,6 @@ class ServerArgs(DisaggServerArgsMixin):
                 f"sp_degree ({self.sp_degree}) must equal ring_degree * ulysses_degree "
                 f"({self.ring_degree} * {self.ulysses_degree} = {self.ring_degree * self.ulysses_degree})"
             )
-
-        if os.getenv("SGLANG_CACHE_DIT_ENABLED", "").lower() == "true":
-            has_sp = self.sp_degree > 1
-            has_tp = self.tp_size > 1
-            if has_sp and has_tp:
-                logger.warning(
-                    "cache-dit is enabled with hybrid parallelism (SP + TP). "
-                    "Proceeding anyway (SGLang integration may support this mode)."
-                )
 
     def _validate_cfg_parallel(self):
         if not self.enable_cfg_parallel:

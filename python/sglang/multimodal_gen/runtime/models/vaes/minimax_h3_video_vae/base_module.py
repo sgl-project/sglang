@@ -9,6 +9,7 @@ import torch
 import torch.nn as nn
 from diffusers.utils.torch_utils import maybe_allow_in_graph
 
+from sglang.kernels.ops import diffusion as diffusion_ops
 from sglang.kernels.ops.activation.activation import (
     silu_and_mul_with_activation_rounding,
 )
@@ -233,7 +234,38 @@ class TransformerBlock(nn.Module):
         self,
         hidden_states: torch.FloatTensor,
         rotary_pos_emb: Optional[torch.FloatTensor] = None,
+        *,
+        fused_norm: bool = False,
+        pending: torch.Tensor | None = None,
+        pending_scale: torch.Tensor | None = None,
     ):
+        if fused_norm:
+            if pending is None:
+                normed = diffusion_ops.h3_vae_rmsnorm(
+                    hidden_states, self.norm1.weight, self.norm1.eps
+                )
+            else:
+                hidden_states, normed = diffusion_ops.h3_vae_scale_add_rmsnorm(
+                    hidden_states,
+                    pending,
+                    pending_scale,
+                    self.norm1.weight,
+                    self.norm1.eps,
+                )
+            attn_output = self.attn(normed, rotary_pos_emb)
+            hidden_states, normed = diffusion_ops.h3_vae_scale_add_rmsnorm(
+                hidden_states,
+                attn_output,
+                self.scale1,
+                self.norm2.weight,
+                self.norm2.eps,
+            )
+            pending = self.ff(normed)
+            # the next block consumes this scale after offload post-hooks release
+            # this block's storage, so keep an independent copy across that boundary
+            scale = self.scale2.clone() if self._forward_hooks else self.scale2
+            return hidden_states, pending, scale
+
         norm_hidden_states = self.norm1(_vit_norm_input(self.norm1, hidden_states)).to(
             hidden_states.dtype
         )

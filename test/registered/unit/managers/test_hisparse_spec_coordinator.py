@@ -12,10 +12,12 @@ from sglang.srt.managers.hisparse_coordinator import (
     HiSparseSpecSwapManager,
 )
 from sglang.srt.managers.schedule_batch import ReqKvInfo
+from sglang.srt.managers.scheduler_components.request_retirer import RequestRetirer
 from sglang.srt.mem_cache import allocation
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import FakeReq
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=11, suite="base-a-test-cpu")
@@ -257,6 +259,34 @@ class TestHiSparseSpecCoordinator(CustomTestCase):
                     torch.testing.assert_close(buf[torch.tensor([6, 8])], expected)
                 self.assertIsNone(req.hisparse_indexer_backup)
                 self.assertIsNone(req.hisparse_swa_backup)
+
+    def test_retirement_discards_retained_host_state_and_row(self):
+        """An ended retracted request releases its backup through normal retirement."""
+        coordinator, original, _, freed_host = self._retraction_fixture()
+        req = FakeReq(**vars(original), finished_reason=None)
+        coordinator._skip_first_backup[0] = True
+        coordinator.retract_req_state_preserving(req)
+        req.kv.mark_kv_released()
+        req.hisparse_indexer_backup = [torch.ones(1)]
+        req.hisparse_swa_backup = [torch.ones(1)]
+        freed_rows = []
+
+        def free_row(request):
+            freed_rows.append(request.kv.req_pool_idx)
+            request.kv.req_pool_idx = None
+
+        coordinator.req_to_token_pool.free = free_row
+        retirer = object.__new__(RequestRetirer)
+        retirer.tree_cache = SimpleNamespace()
+        retirer.hisparse_coordinator = coordinator
+        retirer.release(req, checkpoint=False)
+        self.assertEqual(freed_host, {20, 21, 22})
+        self.assertEqual(freed_rows, [0])
+        self.assertFalse(req.kv.holds_kv)
+        self.assertFalse(req.hisparse_retraction_pending)
+        self.assertIsNone(req.hisparse_indexer_backup)
+        self.assertIsNone(req.hisparse_swa_backup)
+        self.assertTrue(torch.all(coordinator.req_to_host_pool == -1))
 
     def test_spec_decode_reserve_allocates_logical_pages_only(self):
         logical_locs = torch.tensor([64, 65, 66, 67], dtype=torch.int64)

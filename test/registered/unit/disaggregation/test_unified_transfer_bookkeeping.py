@@ -30,7 +30,7 @@ from sglang.srt.mem_cache.kv.alloc import signals as signals_mod
 from sglang.srt.mem_cache.kv.alloc.page_usage import Consumer
 from sglang.srt.mem_cache.kv.alloc.signals import TransferRelease, signals_of
 from sglang.test.ci.ci_register import register_cpu_ci
-from sglang.test.scheduler_test_utils import FakeReq
+from sglang.test.scheduler_test_utils import FakeReq, decode_queue
 from sglang.test.test_utils import CustomTestCase
 from sglang.test.unified_allocator_fixtures import (
     UnifiedGeometry,
@@ -542,6 +542,7 @@ class TestReceiveCompletion(CustomTestCase):
         queue = self._queue(timeout=10.0)
         decode_req = self._decode_req(n_peers=2)
         decode_req.kv_receiver.status = KVPoll.Failed
+        queue.queue = decode_queue(ListKind.PD_RECEIVING, [decode_req])
         now = [100.0]
         with mock.patch.object(decode_mod.time, "monotonic", lambda: now[0]):
             self.assertFalse(queue._receive_done(decode_req))

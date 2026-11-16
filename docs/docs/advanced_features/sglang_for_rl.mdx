@@ -21,6 +21,10 @@ This philosophy empowers innovation by providing SGLang as flexible tools, not r
 
 The following sections cover these aspects in detail.
 
+<Note>
+The memory release/resume, weight update and pause/resume endpoints below (`/release_memory_occupation`, `/resume_memory_occupation`, `/update_weights_from_*`, `/begin_weight_update`, `/end_weight_update`, `/init_weights_update_group`, `/destroy_weights_update_group`, `/update_weight_version`, `/pause_generation`, `/continue_generation`) are admin endpoints. Launch the server with `SGLANG_ADMIN_API_KEY=<key>` set (or pass `--admin-api-key <key>`) and send `Authorization: Bearer <key>` with each call; without an admin key configured, the server answers HTTP 403 (`--api-key` does not unlock them).
+</Note>
+
 ## Fine-Grained Engine Sleep and Wake Up
 
 Rollout and training are both memory-intensive, and co-locating them on the same GPUs often leads to memory pressure and slow handoffs. SGLang provides a memory-aware sleep/wake mechanism that releases KV cache and weights while keeping the server process alive, then resumes them for rollout without a full restart. This avoids repeated disk I/O and CUDA graph recapture during each RL step.
