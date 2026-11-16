@@ -17,6 +17,7 @@ from typing import (
 import msgspec
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.dsv4 import (
     fused_k_norm_rope_flashmla,
     fused_store_cache,
@@ -222,11 +223,7 @@ def select_dsv4_kv_layout() -> Tuple[KVLayout, Optional[str]]:
     if mode == "v4":
         return KVLayout.V4, None if option == "auto" else option
     assert mode in ("v41", "v41_new", "auto"), f"unknown SGLANG_DSV4_KV_LAYOUT={mode!r}"
-    is_sm100 = (
-        torch.cuda.is_available()
-        and torch.version.cuda is not None
-        and torch.cuda.get_device_capability()[0] == 10
-    )
+    is_sm100 = current_arch().is_sm(10)
     if _is_hip:
         supported = (
             is_gfx95_supported() and resolve_hip_flashmla_backend() == "aiter_sparse"
