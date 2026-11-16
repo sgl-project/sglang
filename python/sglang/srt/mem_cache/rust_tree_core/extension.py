@@ -31,10 +31,3 @@ def load_tree_core_extension(*, inspection: bool = False):
 
 
 bindings = load_tree_core_extension()
-
-DecLockRefParamsBinding = bindings.DecLockRefParamsBinding
-InsertParamsBinding = bindings.InsertParamsBinding
-MatchParamsBinding = bindings.MatchParamsBinding
-RustBigramUnifiedTreeCoreBinding = bindings.RustBigramUnifiedTreeCoreBinding
-RustUnifiedTreeCoreBinding = bindings.RustUnifiedTreeCoreBinding
-TreeCoreInitParamsBinding = bindings.TreeCoreInitParamsBinding

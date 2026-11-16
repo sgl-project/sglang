@@ -246,13 +246,6 @@ def _cache_action_from_tagged(action: tuple, ids: _CoreIds) -> CacheAction:
     raise ValueError(f"unknown cache action tag: {tag}")
 
 
-def _cache_actions_from_tagged(
-    actions: Sequence[tuple], ids: _CoreIds
-) -> list[CacheAction]:
-    """Build the Python CacheActions for the binding's tagged tuples, in order."""
-    return [_cache_action_from_tagged(action, ids) for action in actions]
-
-
 def _inc_lock_ref_result_from_binding(result, ids: _CoreIds) -> IncLockRefResult:
     return IncLockRefResult(
         delta=result.delta,
@@ -575,7 +568,6 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         else:
             self.device = torch.device("cpu")
 
-        self.enable_kv_cache_events = params.enable_kv_cache_events
         has_mamba = TREE_STATE in families
         from sglang.srt.mem_cache.kv_cache_configurator import (
             host_only_mamba_checkpoint,
