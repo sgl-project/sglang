@@ -26,6 +26,10 @@ for mod in (
     "torch_npu",
     "torch_npu.contrib",
     "sgl_kernel_npu",
+    "sgl_kernel_npu.operators",
+    "sgl_kernel_npu.operators.attention",
+    "sgl_kernel_npu.operators.indexer",
+    "sgl_kernel_npu.operators.mem_cache",
     "sgl_kernel_npu.attention",
     "sgl_kernel_npu.attention.sinks_attention",
     "sgl_kernel_npu.norm",
@@ -66,30 +70,32 @@ from sglang.srt.mem_cache.unified_cache.components import ComponentType
 class _Ds41Stub(ModuleType):
     """Stand-in for the entry points ``_ds41_ops`` returns.
 
-    Only the two metadata entry points are exercised by these tests; both return
+    Only the metadata entry points are exercised by these tests; each returns
     a real int32 tensor so the graph-buffer ``torch.zeros_like`` probe works.
     """
 
     def __init__(self):
         super().__init__("ds41_stub")
-        self.mixed_quant_sparse_flash_mla = MagicMock(return_value=(None, None))
-        self.quant_lightning_indexer = MagicMock(return_value=(None, None, None, None))
-        self.quant_sparse_lightning_indexer = MagicMock(return_value=(None, None))
+        self.mixed_quant_sparse_flash_mla_dsl = MagicMock(return_value=(None, None))
+        self.quant_lightning_indexer_dsl = MagicMock(
+            return_value=(None, None, None, None)
+        )
+        self.quant_sparse_lightning_indexer_dsl = MagicMock(return_value=(None, None))
         self.compressor = MagicMock()
-        self.indexer_prologue_k = MagicMock()
+        self.indexer_prologue_k_dsl = MagicMock()
 
     @staticmethod
-    def mixed_quant_sparse_flash_mla_metadata(*args, **kwargs):
+    def mixed_quant_sparse_flash_mla_metadata_dsl(*args, **kwargs):
         # The operator returns (2 * cube_core_num,) int32.
         return torch.zeros(48, dtype=torch.int32)
 
     @staticmethod
-    def quant_lightning_indexer_metadata(*args, **kwargs):
+    def quant_lightning_indexer_metadata_dsl(*args, **kwargs):
         # QLI metadata is a fixed 1024 int32.
         return torch.zeros(1024, dtype=torch.int32)
 
     @staticmethod
-    def quant_sparse_lightning_indexer_metadata(*args, **kwargs):
+    def quant_sparse_lightning_indexer_metadata_dsl(*args, **kwargs):
         # QSLI metadata is a fixed 1024 int32.
         return torch.zeros(1024, dtype=torch.int32)
 
@@ -897,7 +903,9 @@ class TestGraphBuffers(unittest.TestCase):
             self.assertEqual(candidate_block_length.numel(), int(cu_seqlens_q[-1]))
             return torch.zeros(1024, dtype=torch.int32)
 
-        with patch.object(DS41, "quant_sparse_lightning_indexer_metadata", schedule):
+        with patch.object(
+            DS41, "quant_sparse_lightning_indexer_metadata_dsl", schedule
+        ):
             for bs, width in ((1, 1), (1, 2), (2, 6)):
                 with self.subTest(bs=bs, width=width):
                     metadata = SimpleNamespace(
@@ -1072,7 +1080,7 @@ class TestIndexerRopeSource(unittest.TestCase):
                 ),
             ),
             patch.object(rope_mod, "Dsv4NpuRoPE", _RopeStub),
-            patch.object(DS41, "quant_lightning_indexer", _QLI()),
+            patch.object(DS41, "quant_lightning_indexer_dsl", _QLI()),
         ):
             out = backend._dsv41_index_full_topk(
                 layer,
@@ -1163,7 +1171,7 @@ class TestLowRatioAttentionBody(unittest.TestCase):
             seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
             batch_size=1,
         )
-        with patch.object(DS41, "mixed_quant_sparse_flash_mla", _MQSMLA()):
+        with patch.object(DS41, "mixed_quant_sparse_flash_mla_dsl", _MQSMLA()):
             out = backend._forward_low_ratio_attention(
                 torch.zeros(1, 64, 512), layer, batch, None, ratio
             )
@@ -1831,7 +1839,7 @@ class TestKernelMetadataBuilders(unittest.TestCase):
     def test_mqsmla_metadata_is_one_table_per_ratio_from_the_config(self):
         backend, fm = self._backend()
         recorder, calls = _metadata_recorder((48,))
-        with patch.object(DS41, "mixed_quant_sparse_flash_mla_metadata", recorder):
+        with patch.object(DS41, "mixed_quant_sparse_flash_mla_metadata_dsl", recorder):
             out = backend._dsv41_attention_kernel_metadata(self._batch())
 
         self.assertEqual(set(out), {"win_metadata", "c1a_metadata", "c2a_metadata"})
@@ -1873,7 +1881,7 @@ class TestKernelMetadataBuilders(unittest.TestCase):
         backend._dsv4_head_dim = 384  # a value only the backend config carries
         backend.token_to_kv_pool = SimpleNamespace()  # exactly the real pool's API
         recorder, calls = _metadata_recorder((48,))
-        with patch.object(DS41, "mixed_quant_sparse_flash_mla_metadata", recorder):
+        with patch.object(DS41, "mixed_quant_sparse_flash_mla_metadata_dsl", recorder):
             backend._dsv41_attention_kernel_metadata(self._batch())
         for _, kwargs in calls:
             self.assertEqual(kwargs["head_dim"], 384)
@@ -1881,7 +1889,7 @@ class TestKernelMetadataBuilders(unittest.TestCase):
     def test_qli_metadata_derives_the_lengths_and_the_residual_per_ratio(self):
         backend, fm = self._backend()
         recorder, calls = _metadata_recorder((1024,))
-        with patch.object(DS41, "quant_lightning_indexer_metadata", recorder):
+        with patch.object(DS41, "quant_lightning_indexer_metadata_dsl", recorder):
             out = backend._dsv41_index_kernel_metadata(self._batch())
 
         self.assertEqual(set(out), {"c1a_qli_metadata", "c2a_qli_metadata"})
@@ -1918,7 +1926,7 @@ class TestKernelMetadataBuilders(unittest.TestCase):
         backend, fm = self._backend()
         fm.actual_seq_lengths_q_pa = None
         recorder, calls = _metadata_recorder((1024,))
-        with patch.object(DS41, "quant_lightning_indexer_metadata", recorder):
+        with patch.object(DS41, "quant_lightning_indexer_metadata_dsl", recorder):
             self.assertEqual(backend._dsv41_index_kernel_metadata(self._batch()), {})
         self.assertEqual(calls, [])
 
@@ -2062,7 +2070,7 @@ class TestQliKvLens(unittest.TestCase):
     def test_verify_dispatch_tables_use_the_final_length(self):
         backend = _low_ratio_backend()
         seen = []
-        real = DS41.quant_lightning_indexer_metadata
+        real = DS41.quant_lightning_indexer_metadata_dsl
 
         def spy(**kwargs):
             seen.append(kwargs)
@@ -2080,7 +2088,8 @@ class TestQliKvLens(unittest.TestCase):
             batch_size=2,
             draft_token_num=3,
         )
-        backend._dsv41_index_kernel_metadata(batch)
+        with patch.object(DS41, "quant_lightning_indexer_metadata_dsl", spy):
+            backend._dsv41_index_kernel_metadata(batch)
         # ratio 1 first, then ratio 2; the bound is the final length:
         # 9//2 == 4 covers the group pos 7 closes.
         self.assertIsNone(seen[0]["cmp_residual_k"])
@@ -2091,7 +2100,7 @@ class TestQliKvLens(unittest.TestCase):
     def test_decode_dispatch_tables_keep_reading_seq_lens(self):
         backend = _low_ratio_backend()
         seen = []
-        real = DS41.quant_lightning_indexer_metadata
+        real = DS41.quant_lightning_indexer_metadata_dsl
 
         def spy(**kwargs):
             seen.append(kwargs)
@@ -2106,7 +2115,8 @@ class TestQliKvLens(unittest.TestCase):
             positions=[6, 5], out_cache_loc=[0, 0], seq_lens=[6, 5], batch_size=2
         )
         batch.forward_mode = _Mode("decode")
-        backend._dsv41_index_kernel_metadata(batch)
+        with patch.object(DS41, "quant_lightning_indexer_metadata_dsl", spy):
+            backend._dsv41_index_kernel_metadata(batch)
         # Decode ignores the final mirror.
         self.assertEqual(seen[1]["seqused_k"].tolist(), [3, 2])
 

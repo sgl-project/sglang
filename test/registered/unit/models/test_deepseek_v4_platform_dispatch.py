@@ -1,8 +1,9 @@
 """Non-CUDA platforms keep decoder, draft and operation contracts."""
 
+import sys
 import unittest
 from contextlib import nullcontext
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
 import torch
@@ -402,31 +403,31 @@ class TestNpuMhcSeam(unittest.TestCase):
         self.assertEqual(seen["args"], (residual, comb, x, post_mix))
         torch.testing.assert_close(out, residual + 1.0)
 
-    def test_npu_v4_post_keeps_the_legacy_kernel(self):
+    def test_npu_v4_post_delegates_the_kernel_choice_to_sgl_kernel_npu(self):
+        # The pre-950 / Ascend 950 (batched) npu_hc_post choice moved into the
+        # sgl_kernel_npu wrapper, so sglang owns only the delegation: assert the
+        # four operands pass through in order and the result is forwarded.
         cfg = self._sub_layer(pre_from_prev=False).cfg
         x = torch.zeros(2, self.HIDDEN)
         residual = self._residual()
         post_mix = torch.ones(2, self.MULT)
         comb = torch.ones(2, self.MULT, self.MULT)
-        shapes = []
+        seen = {}
 
-        def fake_hc_post(a, b, c, d):
-            shapes.append(a.shape)
-            return residual
+        def fake_mhc_post_dpskv4(a, b, c, d):
+            seen["args"] = (a, b, c, d)
+            return residual + 1.0
 
+        stub = ModuleType("sgl_kernel_npu.operators.hyper_conn")
+        stub.mhc_post_dpskv4 = fake_mhc_post_dpskv4
         with (
             patch.object(mhc, "_is_npu", True),
-            patch.object(mhc, "is_npu_arch35", return_value=True),
-            patch.object(
-                torch,
-                "ops",
-                SimpleNamespace(custom=SimpleNamespace(npu_hc_post=fake_hc_post)),
-            ),
+            patch.dict(sys.modules, {"sgl_kernel_npu.operators.hyper_conn": stub}),
         ):
-            mhc.post(cfg, x, residual, post_mix, comb)
+            out = mhc.post(cfg, x, residual, post_mix, comb)
 
-        # arch35's npu_hc_post is batched: a leading batch axis on every operand.
-        self.assertEqual(shapes, [(1, 2, self.HIDDEN)])
+        self.assertEqual(seen["args"], (x, residual, post_mix, comb))
+        torch.testing.assert_close(out, residual + 1.0)
 
 
 if __name__ == "__main__":
