@@ -1,8 +1,8 @@
 """fused_decode_sconv_metadata must be bit-identical to the unfused prep.
 
 The unfused reference is the exact op sequence the decode metadata prep
-used to launch: two arange calls + ones + precompute_helion_decode_metadata
-(!= PAD, &, clamp, long, arange x2).
+used to launch: two arange calls + ones, then != PAD, &, clamp, long and two
+more arange calls.
 """
 
 import pytest
@@ -11,7 +11,6 @@ import torch
 from sglang.srt.models.inkling_common.kernels.sconv import (
     PAD_SLOT_ID,
     fused_decode_sconv_metadata,
-    precompute_helion_decode_metadata,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
 
@@ -27,8 +26,13 @@ def _reference(B: int, cache_indices: torch.Tensor):
     device = cache_indices.device
     query_start_loc = torch.arange(B + 1, dtype=torch.int32, device=device)
     has_initial_state = torch.ones(B, dtype=torch.bool, device=device)
-    precomputed = precompute_helion_decode_metadata(
-        B=B, W=4, cache_indices=cache_indices, has_initial_state=has_initial_state
+    valid = cache_indices != PAD_SLOT_ID
+    precomputed = dict(
+        cache_mask=(has_initial_state & valid)[:, None, None],  # [B, 1, 1]
+        safe_idx=cache_indices.clamp(min=0).long(),
+        # Each sequence has exactly 1 token in the packed [1, B, D] layout
+        cu=torch.arange(B + 1, dtype=torch.int64, device=device),
+        si=torch.arange(B, dtype=torch.int32, device=device),
     )
     return query_start_loc, has_initial_state, precomputed
 
