@@ -708,7 +708,10 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                 probs, topk_p, topk_index = sample_draft_proposal(
                     output.logits_output.next_token_logits,
                     forward_batch.sampling_info.temperatures,
-                    forward_batch.sampling_info.top_ks,
+                    # Greedy argmax is free in the fused kernel; the stock chain would add a full-vocab one.
+                    forward_batch.sampling_info.top_ks
+                    if self.use_fused_draft_sample
+                    else None,
                     sampling_seed=forward_batch.sampling_info.sampling_seed,
                     positions=forward_batch.seq_lens,
                     draft_step=step,
@@ -920,7 +923,10 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                         probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                             step_logits,
                             forward_batch.sampling_info.temperatures,
-                            forward_batch.sampling_info.top_ks,
+                            # Greedy argmax is free in the fused kernel; the stock chain would add a full-vocab one.
+                            forward_batch.sampling_info.top_ks
+                            if self.use_fused_draft_sample
+                            else None,
                             sampling_seed=forward_batch.sampling_info.sampling_seed,
                             positions=forward_batch.seq_lens,
                             draft_step=step,
@@ -1000,7 +1006,10 @@ class MultiLayerEagleDraftWorker(EagleDraftWorkerBase):
                     probs, ret_topk_p, ret_topk_index = sample_draft_proposal(
                         logits_sel,
                         forward_batch.sampling_info.temperatures,
-                        forward_batch.sampling_info.top_ks,
+                        # Greedy argmax is free in the fused kernel; the stock chain would add a full-vocab one.
+                        forward_batch.sampling_info.top_ks
+                        if self.use_fused_draft_sample
+                        else None,
                         sampling_seed=forward_batch.sampling_info.sampling_seed,
                         positions=forward_batch.seq_lens,
                         draft_step=step,
