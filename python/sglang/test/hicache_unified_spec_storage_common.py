@@ -44,9 +44,11 @@ class HiCacheUnifiedSpecStorageMixin:
     model: str = None
     storage_backend = "file"
     expected_storage_backend = "HiCacheFile"
-    # Pages of the shared prompt; one token more is sent, so both a device
-    # hit and a storage hit reuse exactly this many full pages.
+    # Pages of the shared prompt. A few tokens more are sent, so that both a
+    # device hit and a storage hit reuse exactly this many full pages: one
+    # more, or two when the tree keys on token pairs (EAGLE family).
     prompt_pages = 12
+    prompt_extra_tokens = 1
     max_new_tokens = 32
     # Server arguments shared by every launch of the class.
     base_server_args: List[str] = [
@@ -128,9 +130,28 @@ class HiCacheUnifiedSpecStorageMixin:
 
     def random_prompt(self, seed: int) -> List[int]:
         rng = random.Random(seed)
-        return [
-            rng.randint(1000, 30000) for _ in range(self.prompt_pages * PAGE_SIZE + 1)
-        ]
+        length = self.prompt_pages * PAGE_SIZE + self.prompt_extra_tokens
+        return [rng.randint(1000, 30000) for _ in range(length)]
+
+    def scrub_prompt(self, seed: int) -> List[int]:
+        """A prompt of the same length that overwrites device slots."""
+        return self.random_prompt(seed)
+
+    def text_prompt(self, paragraph: str) -> List[int]:
+        """Natural text, cut to the prompt length: a draft has to be right
+        about some tokens for its KV to show in the accept length."""
+        from sglang.benchmark.utils import get_tokenizer
+
+        length = self.prompt_pages * PAGE_SIZE + self.prompt_extra_tokens
+        tokenizer = get_tokenizer(self.model)
+        input_ids = tokenizer.encode(paragraph * 60)[:length]
+        self.assertEqual(len(input_ids), length)
+        return input_ids
+
+    @staticmethod
+    def spec_stats(result: Dict) -> tuple:
+        meta = result["meta_info"]
+        return meta["spec_verify_ct"], meta["spec_accept_length"]
 
     def generate(self, input_ids: List[int], cache_salt: Optional[str] = None) -> Dict:
         body = {
@@ -225,9 +246,9 @@ class HiCacheUnifiedSpecStorageMixin:
     def reload_in_process(self, input_ids: List[int], salt: str, seed: int) -> Dict:
         """Compute, hit on device, drop the upper tiers, hit from L3.
 
-        Returns the device-cache hit, which the L3 hit has to reproduce bit
-        for bit. Between the two, another prompt of the same length is
-        computed, so device slots no longer hold what the first run left.
+        Returns the device-cache hit and the L3 hit, which has to reproduce
+        it bit for bit. Between the two, another prompt of the same length
+        is computed, so device slots no longer hold what the first run left.
         """
         computed = self.generate(input_ids, salt)
         self.assertEqual(computed["meta_info"]["cached_tokens"], 0)
@@ -235,12 +256,12 @@ class HiCacheUnifiedSpecStorageMixin:
         details = device_hit["meta_info"]["cached_tokens_details"]
         self.assertEqual(details["device"], self.prompt_pages * PAGE_SIZE, details)
         self.flush_cache()
-        self.generate(self.random_prompt(seed + 1), uuid.uuid4().hex)
+        self.generate(self.scrub_prompt(seed + 1), uuid.uuid4().hex)
         self.flush_cache()
         storage_hit = self.generate(input_ids, salt)
         self.assert_storage_hit(storage_hit)
         self.assert_same_output(storage_hit, device_hit)
-        return device_hit
+        return device_hit, storage_hit
 
     def l3_objects(self) -> Dict[str, tuple]:
         """name -> (size, sha256) of every object of the file backend."""
