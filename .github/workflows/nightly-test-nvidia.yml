@@ -59,6 +59,8 @@ permissions:
   pull-requests: read
 
 env:
+  # Trial branch: each job installs into its own /tmp venv, removed by the cleanup step.
+  USE_VENV: "1"
   # PyTorch stack for scripts/ci/cuda/ci_install_dependency.sh. Set here because
   # some self-hosted runners export an older CU_VERSION into the job environment.
   CU_VERSION: cu134
@@ -181,6 +183,9 @@ jobs:
 
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
+      - name: Clean up per-job venv
+        if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
 
   # Consolidate performance metrics from all jobs
   consolidate-metrics:

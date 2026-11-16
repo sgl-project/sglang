@@ -37,6 +37,8 @@ on:
 # Workflow-level env is NOT inherited from the caller in reusable workflows (verified by CI test).
 # The github context (including github.event_name) IS inherited from the caller.
 env:
+  # Trial branch: each job installs into its own /tmp venv, removed by the cleanup step.
+  USE_VENV: "1"
   # PyTorch stack for scripts/ci/cuda/ci_install_dependency.sh. Set here because
   # some self-hosted runners export an older CU_VERSION into the job environment.
   CU_VERSION: cu134
@@ -125,3 +127,6 @@ jobs:
         run: |
           cd test/
           python3 run_suite.py --hw cuda --suite base-b-kernel-${{ matrix.suite }} ${{ matrix.suite_args }} $CONTINUE_ON_ERROR_FLAG
+      - name: Clean up per-job venv
+        if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh

@@ -35,6 +35,8 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  # Trial branch: each job installs into its own /tmp venv, removed by the cleanup step.
+  USE_VENV: "1"
   # PyTorch stack for scripts/ci/cuda/ci_install_dependency.sh. Set here because
   # some self-hosted runners export an older CU_VERSION into the job environment.
   CU_VERSION: cu134
@@ -129,3 +131,6 @@ jobs:
         run: |
           read -ra paths <<< "$TESTS"
           python3 -m pytest -v -rfE "${paths[@]}"
+      - name: Clean up per-job venv
+        if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh

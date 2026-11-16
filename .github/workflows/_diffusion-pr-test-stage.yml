@@ -46,6 +46,8 @@ on:
 
 # Workflow-level env is NOT inherited from the caller in reusable workflows.
 env:
+  # Trial branch: each job installs into its own /tmp venv, removed by the cleanup step.
+  USE_VENV: "1"
   # PyTorch stack for scripts/ci/cuda/ci_install_dependency.sh. Set here because
   # some self-hosted runners export an older CU_VERSION into the job environment.
   CU_VERSION: cu134
@@ -159,3 +161,7 @@ jobs:
         if: failure()
         with:
           artifact-suffix: ${{ inputs.runner_config }}-${{ matrix.part }}
+
+      - name: Clean up per-job venv
+        if: always()
+        run: bash scripts/ci/cuda/ci_cleanup_venv.sh
