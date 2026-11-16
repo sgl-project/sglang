@@ -417,7 +417,6 @@ class _Dumper:
     def register_non_intrusive_dumper(
         self,
         model: "torch.nn.Module",
-        *,
         spec_role: Optional[str] = None,
     ) -> Optional["_NonIntrusiveDumper"]:
         """Hook *model* for non-intrusive dumping.
