@@ -18,6 +18,10 @@ from unittest.mock import Mock, patch
 import numpy as np
 import torch
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=8, stage="base-a", runner_config="cpu")
+
 ROOT = Path(__file__).resolve().parents[5]
 POOL_FILE = ROOT / "python/sglang/srt/hardware_backend/npu/dsv4/dsv4_memory_pool.py"
 BUDGET_FILE = ROOT / "python/sglang/srt/model_executor/pool_configurator.py"

@@ -16,6 +16,10 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, stage="base-a", runner_config="cpu")
+
 
 _support_spec = importlib.util.spec_from_file_location(
     "_dsv41_a3_cache_test_support",
