@@ -14,10 +14,10 @@ from cutlass.cute.runtime import make_fake_compact_tensor
 from sglang.kernels.ops.attention.flash_attn.cute.copy_utils import (
     store_shared_remote_fp32x4,
 )
-from sglang.kernels.ops.inkling2.cute_utils import (
+from sglang.kernels.ops.layernorm.inkling2_cute_utils import (
     domain_offset_raw_aligned,
 )
-from sglang.kernels.ops.inkling2.primitives import (
+from sglang.kernels.ops.layernorm.inkling2_primitives import (
     fadd_rn_f32,
     fma_rn_f32,
     fmul_rn_f32,

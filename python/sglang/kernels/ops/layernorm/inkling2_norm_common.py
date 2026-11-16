@@ -10,8 +10,8 @@ import torch
 from cutlass import Boolean, Float32, Int64, const_expr, range_constexpr
 from cutlass.cutlass_dsl import dsl_user_op
 
-from sglang.kernels.ops.inkling2.cute_utils import make_fake_dense_mn
-from sglang.kernels.ops.inkling2.primitives import min_f32
+from sglang.kernels.ops.layernorm.inkling2_cute_utils import make_fake_dense_mn
+from sglang.kernels.ops.layernorm.inkling2_primitives import min_f32
 
 
 @dsl_user_op

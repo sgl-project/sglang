@@ -7,11 +7,11 @@ import cutlass.cute as cute
 import torch
 from cutlass import Float32, const_expr
 
-from sglang.kernels.ops.inkling2.cute_utils import (
+from sglang.kernels.ops.layernorm.inkling2_cute_utils import (
     make_fake_2d_row_major,
     torch_to_cute_dtype,
 )
-from sglang.kernels.ops.inkling2.norm_common import (
+from sglang.kernels.ops.layernorm.inkling2_norm_common import (
     as_norm_rows,
     ceil_div,
     copy_partition,
