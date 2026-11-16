@@ -8,7 +8,8 @@ use serde_json::{Map, Value, json};
 
 use super::glm53::valid_documents;
 use super::pydantic_dump::{
-    continues_final_message, engine_message, parse_tool_arguments, split_continuation,
+    continues_final_message, engine_message, fold_thinking_parts, parse_tool_arguments,
+    split_continuation,
 };
 use super::qwen38::{prints_unlike_python, template_tools};
 use super::template_context::PreservedRequest;
@@ -384,6 +385,7 @@ fn template_message(mut message: Value, content_parts: Option<bool>) -> Result<V
         // M3's templates read only the request's tools.
         fields.remove("tools");
     }
+    fold_thinking_parts(&mut message)?;
     let Some(parts) = message["content"].as_array() else {
         return Ok(message);
     };
