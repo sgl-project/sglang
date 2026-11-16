@@ -207,11 +207,8 @@ else:
 
 
 def _eager_max_seqlen_k(forward_batch, draft_token_num: int, static_width: int) -> int:
-    """Page-table width of an eager forward: the longest KV length in the batch."""
     if forward_batch.seq_lens.numel() == 0:
-        # An attention-DP rank with no requests runs target verify with 0 rows (a
-        # hybrid-SSM IDLE batch relabeled under SUM_LEN padding); the width only sizes
-        # its empty page table.
+        # Idle attention-DP rank (0-row verify): width only sizes an empty table.
         return 1 + draft_token_num
     if forward_batch.seq_lens_cpu is not None:
         return int(forward_batch.seq_lens_cpu.max().item()) + draft_token_num

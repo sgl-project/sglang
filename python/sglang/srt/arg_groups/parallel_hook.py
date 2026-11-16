@@ -303,8 +303,6 @@ def handle_kda_weight_shard(server_args: Any):
         raise ValueError(
             "--kda-weight-shard-size does not support pipeline parallelism."
         )
-    # These loaders bypass the model's load_weights (or, for the weight cache, also
-    # post_load_weights), which is what fills each rank's shard.
     if cfg.load_format in _KDA_WEIGHT_SHARD_LOAD_FORMATS_REFUSED:
         raise ValueError(
             f"--kda-weight-shard-size does not support --load-format {cfg.load_format}: "

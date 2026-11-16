@@ -2505,26 +2505,18 @@ class Envs:
     # and the latent up_proj tail above the fused-GEMV range (k3_ar_fusion
     # gemm_ag_up_fits). Online weight updates are rejected while on.
     SGLANG_K3_SHARDED_MOE = EnvBool(True)
-    # --kda-weight-shard-size gather mover: "ce" (copy-engine peer pulls from the shard
-    # buffers mapped on every group rank, on one stream, no collective) or "ce_ms" (one copy
-    # stream per peer).
+    # --kda-weight-shard-size gather mover: "ce" (one copy stream) or "ce_ms" (one per peer).
     SGLANG_K3_KDA_WS_MOVER = EnvStr("ce")
     # --kda-weight-shard-size: KDA layers gathered ahead of the running one (slots = depth + 1).
     SGLANG_K3_KDA_WS_PREFETCH_DEPTH = EnvInt(1)
-    # --kda-weight-shard-size: where a KDA layer issues the next layer's gather: "layer"
-    # (its start) or "core" (after its in-projection GEMM, at the KDA core).
+    # --kda-weight-shard-size: issue the next gather at layer start ("layer") or KDA core ("core").
     SGLANG_K3_KDA_WS_ISSUE_AT = EnvStr("layer")
-    # --kda-weight-shard-size: time the MoE-stage wait for the layer's gather (CUDA events;
-    # debug log per forward, aggregate counters on the store).
+    # --kda-weight-shard-size: log the gather wait stalls per forward.
     SGLANG_K3_KDA_WS_STATS = EnvBool(False)
-    # --kda-weight-shard-size: when the MoE stage waits for the gathers its layer issued
-    # (keeps gather NVLink traffic off the MoE all-to-all): "always", "never" (the gather
-    # runs through the MoE stage; the consuming layer's start still waits), or a token
-    # count N (wait only in forwards whose largest per-DP-rank token count is >= N).
+    # --kda-weight-shard-size: MoE stage waits for the layer's gathers: "always", "never",
+    # or N (only when the largest per-DP-rank token count is >= N).
     SGLANG_K3_KDA_WS_MOE_WAIT = EnvStr("always")
-    # --kda-weight-shard-size, mover ce: issue a gather from per-unit copy views and reused
-    # CUDA events built once (host cost only; the copies are unchanged). 0 restores the
-    # per-issue slicing and event creation.
+    # --kda-weight-shard-size, mover ce: build gather copy views and events once.
     SGLANG_K3_KDA_WS_LEAN_ISSUE = EnvBool(True)
     # --shared-experts-tp-size == TP under attention DP: run the shared experts' row
     # all-gather / reduce-scatter on K3's GB300 push collectives over the TP group; 0 keeps

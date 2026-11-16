@@ -2200,8 +2200,6 @@ class KimiK3DeltaAttention(nn.Module):
             self._bind_weight_shard()
 
     def _bind_weight_shard(self) -> None:
-        """--kda-weight-shard-size: make the in-projection and o_proj weights views of
-        this layer's gather slot, and load the checkpoint into this rank's shard."""
         ws = self._weight_shard
         if not self.use_full_rank_gate or self.head_group != "attn_tp":
             raise ValueError(
@@ -2215,8 +2213,7 @@ class KimiK3DeltaAttention(nn.Module):
         )
         self._derived_weight_cache_error = _WEIGHT_SHARD_UPDATE_ERROR
         k = ws.unit_index[self.layer_idx]
-        # This rank's attention-TP slice of each projection: the shard group holds the
-        # DP ranks that share it, and splits it further by rows.
+        # The shard group splits this rank's attention-TP slice further by rows.
         P = self.local_num_heads * self.head_dim
         a = self.head_tp_rank
         for module, name in ((self.fused_qkvg_proj, "qkvg"), (self.o_proj, "o_proj")):
@@ -3209,8 +3206,6 @@ def _stage_facts(
     )
 
 
-# Online updates re-run load_weights into the shards (or, for direct updates, write the
-# gather slots that the next gather overwrites); refuse them before any write.
 _WEIGHT_SHARD_UPDATE_ERROR = (
     "Online weight updates are not supported with --kda-weight-shard-size: the sharded "
     "KDA projections and shared experts live in per-rank shards that are loaded once at "
@@ -3230,9 +3225,6 @@ def _check_weight_shard_unquantized(what: str, modules) -> None:
 
 
 def _bind_shared_experts_weight_shard(mlp, ws, layer_idx: int) -> None:
-    """--kda-weight-shard-size with replicated shared experts: make gate_up_proj and
-    down_proj weights views of this layer's gather slot, and load the checkpoint into
-    this rank's shard."""
     _check_weight_shard_unquantized(
         f"MoE layer {layer_idx} shared experts",
         (("gate_up", mlp.gate_up_proj), ("down", mlp.down_proj)),
@@ -3261,28 +3253,19 @@ def _bind_shared_experts_weight_shard(mlp, ws, layer_idx: int) -> None:
     mlp.down_proj.weight.weight_loader = load_down
 
 
+# Eager breaks, so a gather may stay in flight across captured prefill graph segments.
 @eager_on_graph
 def _k3_weight_shard_layer_start(layer_idx: int) -> None:
-    """--kda-weight-shard-size schedule step at a layer start. Eager under a breakable
-    prefill CUDA graph: the copy-engine gathers are issued and waited on between captured
-    segments, in the same stream order as eager prefill, so a gather may stay in flight
-    across segments (a capture would have to join it at every segment end)."""
     k3_kda_weight_shard.on_layer_start(layer_idx)
 
 
 @eager_on_graph
 def _k3_weight_shard_core_start(layer_idx: int) -> None:
-    """--kda-weight-shard-size, SGLANG_K3_KDA_WS_ISSUE_AT=core: issue the next KDA layers'
-    gathers at this layer's KDA core, after its in-projection GEMM."""
     k3_kda_weight_shard.active().on_core_start(layer_idx)
 
 
 @eager_on_graph
 def _k3_weight_shard_moe_start(layer_idx: int, forward_batch: ForwardBatch) -> None:
-    """--kda-weight-shard-size: before the MoE stage (and its DEP dispatch), wait for the
-    gathers this layer's start issued, so no gather traffic overlaps the all-to-all
-    (SGLANG_K3_KDA_WS_MOE_WAIT may exempt small forwards). Eager under a breakable prefill
-    CUDA graph (the gather events are recorded outside capture)."""
     num_tokens = None
     if k3_kda_weight_shard.moe_wait_needs_tokens():
         num_tokens = _k3_weight_shard_forward_tokens(forward_batch)
@@ -3290,9 +3273,7 @@ def _k3_weight_shard_moe_start(layer_idx: int, forward_batch: ForwardBatch) -> N
 
 
 def _k3_weight_shard_forward_tokens(forward_batch: ForwardBatch) -> int:
-    """Largest per-DP-rank token count of the running forward. On breakable-graph replay
-    the argument is the capture-time batch, so the runner's published (static) batch wins;
-    its counts are the replayed graph's padded size."""
+    # On breakable-graph replay ``forward_batch`` is the capture-time batch.
     try:
         live = get_forward_batch()
     except RuntimeError:  # eager forward: the argument is the running batch
@@ -3408,9 +3389,6 @@ class KimiK3DecoderLayer(nn.Module):
             )
 
         self._ffn_writes_stream = _latent_moe_writes_stream(config, layer_idx)
-        # --kda-weight-shard-size: the target model's layers drive the weight-gather
-        # schedules (KDA projections, replicated shared experts): after the previous
-        # MoE, before this attention, and before this layer's MoE stage.
         self._weight_shard_hook = (
             k3_kda_weight_shard.get_for_construction() is not None
             and k3_kda_weight_shard.needs_layer_hook(layer_idx)
@@ -3646,8 +3624,7 @@ class KimiK3LinearModel(nn.Module):
                 raise ValueError(
                     "--kda-weight-shard-size does not support pipeline parallelism"
                 )
-            # Shared experts are replicated on every rank under an EP a2a backend
-            # with shared-expert TP 1 (KimiK3MoE._shared_experts_tp1): shard them too.
+            # Shared experts are replicated under EP a2a with shared-expert TP 1.
             shared_tp = get_parallel().shared_experts_tp_size
             shard_shared = (
                 _uses_ep_a2a()
@@ -4261,8 +4238,6 @@ class KimiK3LinearForCausalLM(nn.Module):
         # Also invoked by loader post-load hooks (DummyModelLoader,
         # ShardedStateLoader, remote-instance flows -- none of which call
         # load_weights), so e.g. dummy-weight benchmarks get the fused buffers.
-        # --kda-weight-shard-size: every shard slice loaded once (or dummy-filled), and
-        # visible to the shard group before any gather.
         k3_kda_weight_shard.finish_load()
         # Post-load: absorb kv_b_proj into w_kc and w_vc for MLA layers
         for layer_id in self.config.full_attention_layer_ids:

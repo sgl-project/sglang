@@ -366,10 +366,7 @@ def kda_extend_in_graph(
         )
     )
     if meta.num_tokens < KDA_CHUNK_SIZE:
-        # The conv returns early for pad blocks, so rows past the batch are
-        # whatever the graph pool held. FlashInfer's small-sequence prefill
-        # route does not isolate rows outside cu_seqlens: a NaN or Inf there
-        # contaminates the real rows and the batch's SSM states.
+        # FlashInfer's short-seq prefill lets NaN in stale pad rows reach real rows.
         pad_rows = meta.token_index >= meta.num_logical_tokens
         for x in (q, k, v):
             x.masked_fill_(pad_rows.view(-1, 1), 0)

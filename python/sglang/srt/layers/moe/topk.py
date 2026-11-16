@@ -1914,8 +1914,7 @@ def _mask_topk_ids_padded_region(
     if num_token_non_padded is None:
         return
     if topk_ids.shape[0] == 0:
-        # An attention-DP rank with no tokens (idle forward): nothing to mask, and the
-        # CUDA mask kernel rejects a zero-row grid.
+        # Idle attention-DP rank; the CUDA mask kernel rejects a zero-row grid.
         return
     if not topk_ids.is_cuda:
         if _is_npu:
