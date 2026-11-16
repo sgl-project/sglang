@@ -7,8 +7,9 @@ prefill chunks. ``fused-nocopy`` leaves out the staging copy into the
 symmetric buffer, which the model path avoids by having the GEMM write it.
 Multi-GPU only; relaunches under torchrun.
 
-The per-TP-size defaults of DEFAULT_MIN_TOKENS and DEFAULT_DECODE_MIN_TOKENS
-(srt/layers/communication/gemma4_ar_fusion.py) come from this sweep.
+Both providers read a cold partial and end in the FP8 layout DeepGEMM takes.
+Gemma4ArFusion.applies (srt/layers/communication/gemma4_ar_fusion.py) rests on
+this sweep.
 """
 
 from __future__ import annotations

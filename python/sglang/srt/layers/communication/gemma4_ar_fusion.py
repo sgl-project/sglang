@@ -1,11 +1,8 @@
 """Gemma-4 fused all-reduce sites: glue between ``models/gemma4_causal.py`` and
 ``kernels.ops.communication.gemma4_ar_fusion``.
 
-Opt-in with ``SGLANG_GEMMA4_AR_FUSION=1``. Extend batches of
-``SGLANG_GEMMA4_AR_FUSION_MIN_TOKENS`` (default per TP size, see
-``DEFAULT_MIN_TOKENS``) .. ``_MAX_TOKENS`` tokens, and decode batches of
-``SGLANG_GEMMA4_AR_FUSION_DECODE_MIN_TOKENS`` (``DEFAULT_DECODE_MIN_TOKENS``)
-.. ``_MAX_TOKENS`` tokens, run every
+Opt-in with ``SGLANG_GEMMA4_AR_FUSION=1``. Extend, mixed and decode batches
+of up to ``SGLANG_GEMMA4_AR_FUSION_MAX_TOKENS`` tokens run every
 TP all-reduce + RMSNorm -> residual add (x layer_scalar) -> RMSNorm -> per-128
 FP8 quant of the dense layer stack as one NVLS kernel each; everything else
 takes the regular path. A decode batch inside a CUDA graph has the graph's
@@ -27,35 +24,6 @@ from sglang.kernels.jit.utils import cache_once
 from sglang.srt.environ import envs
 
 logger = logging.getLogger(__name__)
-
-# Smallest extend batch that takes the fused path, per TP size, unless
-# SGLANG_GEMMA4_AR_FUSION_MIN_TOKENS says otherwise. At TP4 / TP8 the fused
-# site is 1.5-2.1x faster from 128 tokens up; at TP2 it is 9-13 % faster from
-# 2048 tokens and within 3-5 % below, so TP2 keeps the stock path there.
-DEFAULT_MIN_TOKENS = {2: 2048, 4: 128, 8: 128}
-
-
-# Smallest decode batch that takes the fused path, per TP size, unless
-# SGLANG_GEMMA4_AR_FUSION_DECODE_MIN_TOKENS says otherwise; a TP size not listed
-# keeps decode on the stock path. On H200 the fused site writes its scales in
-# DeepGEMM's layout and makes the decode step 1-7 % faster at TP4 and 0-3 %
-# faster at TP2 for 1-160 tokens; TP8 is not measured.
-DEFAULT_DECODE_MIN_TOKENS = {2: 1, 4: 1}
-
-
-def default_min_tokens(world_size: int) -> int:
-    # the entry of the nearest TP size at or below world_size
-    return DEFAULT_MIN_TOKENS[max(n for n in DEFAULT_MIN_TOKENS if n <= world_size)]
-
-
-def decode_min_tokens(world_size: int) -> Optional[int]:
-    """Smallest fused decode batch: the env value, else the TP size's default;
-    None keeps decode on the stock path."""
-    n = int(envs.SGLANG_GEMMA4_AR_FUSION_DECODE_MIN_TOKENS.get())
-    if n < 0:
-        return None
-    return n or DEFAULT_DECODE_MIN_TOKENS.get(world_size)
-
 
 GROUP = 128
 
@@ -161,11 +129,6 @@ class Gemma4ArFusion:
         self.eps = float(eps)
         self.hidden = hidden_size
         self.max_tokens = int(envs.SGLANG_GEMMA4_AR_FUSION_MAX_TOKENS.get())
-        min_tokens = int(envs.SGLANG_GEMMA4_AR_FUSION_MIN_TOKENS.get()) or (
-            default_min_tokens(self.world_size)
-        )
-        self.min_tokens = max(min_tokens, self.world_size)
-        self.decode_min_tokens = decode_min_tokens(self.world_size)
         T, H = self.max_tokens, hidden_size
         # partial sums in (bf16); the last layer multicasts the bf16 residual into it
         self.partial = _symm_buffer((T, H), torch.bfloat16, state.group_name)
@@ -181,16 +144,9 @@ class Gemma4ArFusion:
         torch.cuda.synchronize()
         torch.distributed.barrier(state.group)
         logger.info(
-            "gemma4 all-reduce fusion: tp=%d, extend %d..%d tokens, decode %s, "
-            "%.0f MB symmetric memory",
+            "gemma4 all-reduce fusion: tp=%d, up to %d tokens, %.0f MB symmetric memory",
             self.world_size,
-            self.min_tokens,
             self.max_tokens,
-            (
-                "off"
-                if self.decode_min_tokens is None
-                else f"{self.decode_min_tokens}..{self.max_tokens} tokens"
-            ),
             sum(b.tensor.nbytes for b in (self.partial, self.out, self.scales)) / 2**20,
         )
 
@@ -205,9 +161,11 @@ class Gemma4ArFusion:
             logger.warning("SGLANG_GEMMA4_AR_FUSION=1 ignored: %s", e)
             return None
 
-    def applies(self, num_tokens: int, decode: bool = False) -> bool:
-        low = self.decode_min_tokens if decode else self.min_tokens
-        return low is not None and low <= num_tokens <= self.max_tokens
+    def applies(self, num_tokens: int) -> bool:
+        # Every size: on H200 the fused site beats the stock chain from 2 tokens
+        # at TP4 and outside 160..768 tokens at TP2; where it does not, it is
+        # within ~1.5 us per site, under 2 % of a decode or prefill step.
+        return 0 < num_tokens <= self.max_tokens
 
     def rows(self, num_tokens: int) -> Tuple[int, int]:
         """(first row, row count) this rank owns out of ``num_tokens``."""

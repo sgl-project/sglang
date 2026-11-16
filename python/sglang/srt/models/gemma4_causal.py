@@ -1049,10 +1049,9 @@ class Gemma4TextModel(PreTrainedModel):
         self, forward_batch, num_tokens, per_layer_inputs, pp_proxy_tensors
     ) -> bool:
         mode = forward_batch.forward_mode
-        decode = mode == ForwardMode.DECODE
         return (
-            (decode or mode == ForwardMode.EXTEND or mode.is_mixed())
-            and self._ar_fusion.applies(num_tokens, decode)
+            (mode in (ForwardMode.DECODE, ForwardMode.EXTEND) or mode.is_mixed())
+            and self._ar_fusion.applies(num_tokens)
             and per_layer_inputs is None
             and pp_proxy_tensors is None
             and not self.layers_to_capture
