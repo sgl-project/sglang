@@ -35,11 +35,20 @@ from sglang.test.test_utils import (
 
 register_xpu_ci(est_time=400, suite="nightly-kernel-main-test-2-gpu-xpu", nightly=True)
 
-_XPU_DEVICE_COUNT = torch.xpu.device_count() if torch.xpu.is_available() else 0
-_SKIP_REASON = f"R-Fork needs 2 XPUs, found {_XPU_DEVICE_COUNT}"
-# In CI the class runs and fails, so a runner missing a card is not silently green.
-_requires_two_xpus = unittest.skipUnless(
-    _XPU_DEVICE_COUNT >= 2 or is_in_ci(), _SKIP_REASON
+XPU_DEVICE_COUNT = torch.xpu.device_count() if torch.xpu.is_available() else 0
+
+
+def requires_xpus(count):
+    # In CI the class runs and fails, so a runner missing a card is not silently green.
+    return unittest.skipUnless(
+        XPU_DEVICE_COUNT >= count or is_in_ci(),
+        f"R-Fork needs {count} XPUs, found {XPU_DEVICE_COUNT}",
+    )
+
+
+requires_mooncake = unittest.skipUnless(
+    is_in_ci() or importlib.util.find_spec("mooncake") is not None,
+    "Mooncake is required for the transfer_engine backend",
 )
 
 # Both servers share the admin key: the client sends it to the seed's weight-send endpoints.
@@ -51,7 +60,15 @@ _XPU_ARGS = (
     *ADMIN_LAUNCH_ARGS_FOR_TEST,
 )
 # XPU support in Mooncake lives in its TENT engine.
-_MOONCAKE_XPU_ENV = {"MC_USE_TENT": "1"}
+MOONCAKE_XPU_ENV = {"MC_USE_TENT": "1"}
+TRANSFER_ENGINE_SEED_ARGS = (
+    "--remote-instance-weight-loader-start-seed-via-transfer-engine",
+)
+TRANSFER_ENGINE_CLIENT_ARGS = (
+    "--remote-instance-weight-loader-start-seed-via-transfer-engine",
+    "--engine-info-bootstrap-port",
+    "6790",
+)
 _CHECKED_PARAMS = (
     "model.embed_tokens.weight",
     "model.layers.0.input_layernorm.weight",
@@ -89,16 +106,19 @@ def _greedy(url):
     return response.json()["text"]
 
 
-class _RemoteInstanceXpuTestMixin:
+class RemoteInstanceXpuTestMixin:
     loader_backend: str
+    tp_size: int = 1
+    # The client's cards follow the seed's: seed on [0, tp), client on [tp, 2 * tp).
     seed_args: tuple = ()
     client_args: tuple = ()
     server_env: dict = {}
 
     @classmethod
     def setUpClass(cls):
-        if _XPU_DEVICE_COUNT < 2:
-            raise RuntimeError(_SKIP_REASON)
+        needed = 2 * cls.tp_size
+        if XPU_DEVICE_COUNT < needed:
+            raise RuntimeError(f"R-Fork needs {needed} XPUs, found {XPU_DEVICE_COUNT}")
         cls.seed_process = cls.client_process = None
         seed = urlparse(DEFAULT_URL_FOR_TEST)
         cls.seed_url = DEFAULT_URL_FOR_TEST
@@ -108,7 +128,14 @@ class _RemoteInstanceXpuTestMixin:
             DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
             cls.seed_url,
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
-            other_args=(*_XPU_ARGS, "--base-gpu-id", "0", *cls.seed_args),
+            other_args=(
+                *_XPU_ARGS,
+                "--tp",
+                str(cls.tp_size),
+                "--base-gpu-id",
+                "0",
+                *cls.seed_args,
+            ),
             env=env,
         )
         cls.client_process = popen_launch_server(
@@ -117,8 +144,10 @@ class _RemoteInstanceXpuTestMixin:
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=(
                 *_XPU_ARGS,
+                "--tp",
+                str(cls.tp_size),
                 "--base-gpu-id",
-                "1",
+                str(cls.tp_size),
                 "--load-format",
                 "remote_instance",
                 "--remote-instance-weight-loader-backend",
@@ -138,6 +167,15 @@ class _RemoteInstanceXpuTestMixin:
             if process is not None:
                 terminate_and_kill_process_tree(process)
 
+    def test_client_loaded_from_the_seed(self):
+        """A client that falls back to a disk load holds the same weights and
+        output, so the checks below would pass even if R-Fork never ran."""
+        info = requests.get(f"{self.client_url}/server_info", timeout=60).json()
+        self.assertEqual(info["load_format"], "remote_instance")
+        self.assertEqual(
+            info["remote_instance_weight_loader_backend"], self.loader_backend
+        )
+
     def test_client_holds_the_seed_weights(self):
         for name, seed, client in zip(
             _CHECKED_PARAMS, _weights(self.seed_url), _weights(self.client_url)
@@ -150,8 +188,8 @@ class _RemoteInstanceXpuTestMixin:
         self.assertEqual(_greedy(self.client_url), _greedy(self.seed_url))
 
 
-@_requires_two_xpus
-class TestRemoteInstanceXccl(_RemoteInstanceXpuTestMixin, CustomTestCase):
+@requires_xpus(2)
+class TestRemoteInstanceXccl(RemoteInstanceXpuTestMixin, CustomTestCase):
     """Backend ``nccl``: seed and client build an XCCL group on XPU."""
 
     loader_backend = "nccl"
@@ -161,22 +199,15 @@ class TestRemoteInstanceXccl(_RemoteInstanceXpuTestMixin, CustomTestCase):
     )
 
 
-@unittest.skipUnless(
-    is_in_ci() or importlib.util.find_spec("mooncake") is not None,
-    "Mooncake is required for the transfer_engine backend",
-)
-@_requires_two_xpus
-class TestRemoteInstanceTransferEngine(_RemoteInstanceXpuTestMixin, CustomTestCase):
+@requires_mooncake
+@requires_xpus(2)
+class TestRemoteInstanceTransferEngine(RemoteInstanceXpuTestMixin, CustomTestCase):
     """Backend ``transfer_engine``: the client reads the seed's registered weights."""
 
     loader_backend = "transfer_engine"
-    seed_args = ("--remote-instance-weight-loader-start-seed-via-transfer-engine",)
-    client_args = (
-        "--remote-instance-weight-loader-start-seed-via-transfer-engine",
-        "--engine-info-bootstrap-port",
-        "6790",
-    )
-    server_env = _MOONCAKE_XPU_ENV
+    seed_args = TRANSFER_ENGINE_SEED_ARGS
+    client_args = TRANSFER_ENGINE_CLIENT_ARGS
+    server_env = MOONCAKE_XPU_ENV
 
 
 if __name__ == "__main__":
