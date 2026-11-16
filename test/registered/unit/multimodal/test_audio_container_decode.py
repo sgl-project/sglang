@@ -13,14 +13,14 @@ import av
 import numpy as np
 import soundfile
 
-from sglang.srt.managers.schedule_batch import Modality
 from sglang.srt.multimodal.audio_from_video import (
     decode_audio_container,
     extract_audio_from_video_bytes,
     is_audio_container,
 )
+from sglang.srt.multimodal.media_io import load_audio
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.base_processor import BaseMultimodalProcessor
-from sglang.srt.utils.common import load_audio
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -172,14 +172,14 @@ class TestAudioContainerDecode(CustomTestCase):
 
     def test_mp4_bypasses_torchcodec_backend(self):
         """Recognized containers must use PyAV regardless of video backend."""
-        with patch("sglang.srt.utils.common._BACKEND", "torchcodec"):
+        with patch("sglang.srt.multimodal.media_io._BACKEND", "torchcodec"):
             waveform = load_audio(self.mp4, sr=16000)
         self.assertGreater(len(waveform), 0)
 
     def test_wav_keeps_existing_decoder_path(self):
         """Ordinary WAV must not be redirected to the container decoder."""
         with (
-            patch("sglang.srt.utils.common._BACKEND", "decord"),
+            patch("sglang.srt.multimodal.media_io._BACKEND", "decord"),
             patch(
                 "sglang.srt.multimodal.audio_from_video.decode_audio_container"
             ) as decoder,

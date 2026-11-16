@@ -230,7 +230,7 @@ class TestXPUGemma4ImageBlockIds(CustomTestCase):
         from unittest import mock
 
         from sglang.srt.layers.attention.xpu_backend import XPUAttentionBackend
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.models import gemma4_mm
 
         backend = XPUAttentionBackend.__new__(XPUAttentionBackend)

@@ -165,6 +165,7 @@ class TestKvProvenanceForwardPaths(CustomTestCase):
         ):
             result = eagle_worker_common.run_eagle_verify(
                 batch=batch,
+                speculative_runtime_hooks=eagle_worker_common.STOCK_SPECULATIVE_RUNTIME_HOOKS,
                 target_worker=target_worker,
                 req_to_token_pool=None,
                 token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: None),

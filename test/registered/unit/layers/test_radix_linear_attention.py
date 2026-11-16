@@ -6,7 +6,7 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.layers.radix_linear_attention as radix_linear_attention
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner_utils.prefill_graph import prefill_graph_scope
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase

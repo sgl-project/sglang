@@ -381,6 +381,9 @@ impl Default for ObservabilityConfig {
 #[derive(Debug, Clone)]
 pub struct ModelConfig {
     pub id: String,
+    /// Extra `model` values rewritten to `id` in the forwarded body (`--model-alias`);
+    /// only `id` is advertised.
+    pub aliases: Vec<String>,
     /// Local tokenizer.json or HuggingFace repo id; defaults to `id`.
     /// Resolved by [`crate::tokenizer::adapter::load`]; `None` (`--no-tokenizer`) disables it.
     pub tokenizer_path: Option<String>,
@@ -419,6 +422,30 @@ pub struct ModelConfig {
     pub sampling_overrides: SamplingOverrides,
     /// Worker `--default-chat-template-kwargs`, applied when rendering.
     pub default_chat_template_kwargs: crate::tokenizer::chat_formatter::ChatTemplateKwargs,
+}
+
+impl ModelConfig {
+    /// Canonicalize an alias, preserving an optional LoRA suffix. Match whole
+    /// names before suffixes, then the longest name, so URI colons and aliases
+    /// that extend another alias are not mistaken for adapter separators.
+    pub fn canonical_alias(&self, model: &str) -> Option<String> {
+        if model == self.id {
+            return None;
+        }
+        if self.aliases.iter().any(|alias| alias == model) {
+            return Some(self.id.clone());
+        }
+        let (name, adapter) = std::iter::once(&self.id)
+            .chain(&self.aliases)
+            .filter_map(|name| {
+                model
+                    .strip_prefix(name.as_str())?
+                    .strip_prefix(':')
+                    .map(|adapter| (name, adapter))
+            })
+            .max_by_key(|(name, _)| name.len())?;
+        (name != &self.id).then(|| format!("{}:{adapter}", self.id))
+    }
 }
 
 /// External KV Indexer client settings.

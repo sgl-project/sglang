@@ -221,7 +221,14 @@ class HcReadCall(HcRead):
                 if mhc.use_stats_stream(layer.hc_cfg, self.batch, streams)
                 else None
             )
-            mhc.fork_stats_stream(stream)
+            if (
+                self.attention
+                and stream is not None
+                and layer.self_attn.use_mega_attention
+            ):
+                mhc.defer_attn_stats_fork(stream)
+            else:
+                mhc.fork_stats_stream(stream)
             quantized = (
                 []
                 if self.attention and layer.self_attn.accepts_mxfp8_swizzled_input()
@@ -412,10 +419,10 @@ def stages(config, layer_id, *, layer=None):
                 None if ep else SumGroup.MOE_OUTPUT,
             )
     if layer is None:
-        from sglang.srt.models.deepseek_v4 import (
-            _is_fused_mhc_post_pre_enabled_xpu,
+        from sglang.srt.models.deepseek_common.amd.deepseek_v4_fused_mhc import (
             is_cross_layer_mhc_fusion_enabled,
         )
+        from sglang.srt.models.deepseek_v4 import _is_fused_mhc_post_pre_enabled_xpu
 
         lagged = config.hc_pre_from_prev_sublayer
         fused = (

@@ -88,14 +88,12 @@ class TestMoeFront(CustomTestCase):
     def test_kimi_front_applies_placement_and_batch_padding(self):
         from sglang.srt.eplb.expert_location import ExpertLocationMetadata
         from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
-        from sglang.srt.model_executor.forward_batch_info import (
-            ForwardBatch,
-            ForwardMode,
-        )
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
         from sglang.srt.model_executor.forward_context import (
             ForwardContext,
             forward_context,
         )
+        from sglang.srt.model_executor.forward_mode import ForwardMode
         from sglang.srt.models.kimi_k3 import KimiK3MoE
         from sglang.srt.runtime_context import get_context, get_exec, get_resources
 

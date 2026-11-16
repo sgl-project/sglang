@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.modality import Modality
 
 MULTI_GATE_BLOCK_M = 64
 TEXT_MODALITY = 0

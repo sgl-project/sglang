@@ -57,7 +57,6 @@ DEEPSEEK_V4_FLASH_FP8_4P_ENVS = {
     "ASCEND_LAUNCH_BLOCKING": "1",
     # Dspark
     "SGLANG_RAGGED_VERIFY_MODE": "static",
-    "SGLANG_DSPARK_FAST_KERNEL": "0",
     "SGLANG_DSPARK_FAST_SAMPLING": "0",
 }
 
@@ -141,9 +140,9 @@ class TestNPUDeepSeekV4FlashFP84PGPQA(TestNpuAccuracyTestCaseBase):
     timeout = 6000
     seed = 1
 
-    # def test_npu_deepseek_v4_flash_fp8_4p_gpqa(self):
-    #     """Run NPU accuracy test for DeepSeek-V4-Flash FP8 4p DSPARK GPQA."""
-    #     self.run_accuracy()
+    def test_npu_deepseek_v4_flash_fp8_4p_gpqa(self):
+        """Run NPU accuracy test for DeepSeek-V4-Flash FP8 4p DSPARK GPQA."""
+        self.run_accuracy()
 
 
 class TestNPUDeepSeekV4FlashDSPARK(TestNpuPerformanceTestCaseBase):

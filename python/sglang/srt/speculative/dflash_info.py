@@ -9,11 +9,8 @@ from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind, WindowRead
 from sglang.srt.mem_cache.kv.alloc.iteration_ids import Cols, IterationIds
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput, SpecInputType
 from sglang.srt.utils import is_npu
 

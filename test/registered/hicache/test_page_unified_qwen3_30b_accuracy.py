@@ -60,7 +60,7 @@ class TestPageUnifiedQwen330BAccuracy(CustomTestCase):
     chunk_bytes = 24 * 2 * 64 * 128 * 2 * 2  # layers, heads, tokens, dim, K/V, BF16
 
     def _load_questions(self):
-        from sglang.srt.utils.hf_transformers_utils import get_tokenizer
+        from sglang.srt.hf_transformers import get_tokenizer
 
         data_dir = os.environ.get("SGLANG_TEST_GSM8K_DATA_DIR")
 

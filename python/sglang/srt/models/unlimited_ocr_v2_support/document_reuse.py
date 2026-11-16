@@ -835,7 +835,14 @@ class DocReuse:
         if not holder.mark_released() or not holder.kv.holds_kv:
             return
         self._cache.free_kv_row(holder.kv, _kept_ranges(entry))
-        self._cache.req_to_token_pool.free(holder)
+        self._storage().release_row(holder)
+
+    def _storage(self):
+        from sglang.srt.mem_cache.static_kv_storage import kv_storage_of
+
+        return kv_storage_of(
+            self._cache.req_to_token_pool, self._cache.token_to_kv_pool_allocator
+        )
 
     def _release_source(self, req) -> None:
         st = req.uocr_doc
@@ -866,7 +873,9 @@ class DocReuse:
         )
 
     def on_req_dropped(self, req: Req) -> None:
-        """Release reuse state for a request dropped before it ever ran a batch."""
+        """Release reuse state of a dropped or aborted request, before its row is
+        freed. For one that ran a batch, `_free_pending` finds its slots in that
+        row, and the source and pins go as on the finished-window path."""
         # Its queued copies write slots freed below and read the source window.
         self._cancel(req.rid)
         self._free_pending(req)
@@ -1073,7 +1082,7 @@ class DocReuse:
         return retained
 
     def _retain_finished(self, req) -> bool:
-        from sglang.srt.managers.schedule_batch import (
+        from sglang.srt.managers.req_types import (
             FINISH_MATCHED_STR,
             FINISH_MATCHED_TOKEN,
         )
@@ -1125,6 +1134,8 @@ class DocReuse:
         committed = req.kv.kv_committed_len
         holder = RetainedWindow()
         holder.kv = req.detach_kv()
+        # The window, no request, holds the row from here on.
+        self._storage().hold_row(holder)
         # release_kv_cache stops once the row is claimed, so the request's tree
         # lock (taken on the match's root anchor at admission) is dropped here.
         cache.unlock(req.lock)

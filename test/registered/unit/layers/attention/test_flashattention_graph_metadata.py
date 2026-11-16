@@ -12,7 +12,8 @@ from sglang.srt.layers.attention import flashattention_backend as flashattention
 from sglang.srt.layers.attention.flashattention_backend import FlashAttentionBackend
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpace, IdSpaceKind
 from sglang.srt.mem_cache.kv.alloc.runner_ids import RunnerIds
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -107,9 +108,7 @@ class TestFlashAttentionDraftWidth(CustomTestCase):
         )
         memory = SimpleNamespace(disable_radix_cache=False)
         modules = {
-            "sgl_kernel.flash_attn": _fake_attention_module(
-                "sgl_kernel.flash_attn", with_scheduler_metadata=True
-            ),
+            "sgl_fa3": _fake_attention_module("sgl_fa3", with_scheduler_metadata=True),
             "sglang.kernels.ops.attention.flash_attention_v4": _fake_attention_module(
                 "sglang.kernels.ops.attention.flash_attention_v4"
             ),
@@ -366,6 +365,7 @@ class TestUnifiedVerifyGraphMetadata(CustomTestCase):
         swa = torch.arange(24, device=device, dtype=torch.int32)
         swa[7] = -1
         runner_ids = RunnerIds.__new__(RunnerIds)
+        runner_ids._role_sub_pools = {}
         runner_ids._spaces = {
             IdSpaceKind.FULL: IdSpace(key="full", read_v2p=full),
         }

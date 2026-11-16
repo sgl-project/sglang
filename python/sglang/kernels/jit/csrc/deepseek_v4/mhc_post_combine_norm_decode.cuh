@@ -1,5 +1,6 @@
 // Decode/verify mHC post + next combine + RMSNorm (+ optional MXFP8 of the normed row).
-// One CTA per row; each thread owns kVPT 8-element vectors of the 5120 hidden columns.
+// A row is split over a cluster of Split CTAs (blockIdx.x is the rank, blockIdx.y the row; Split 1 uses blockIdx.x);
+// each thread owns kVPT 8-element vectors of the 5120 hidden columns.
 #pragma once
 #include <sgl_kernel/tensor.h>
 #include <sgl_kernel/utils.h>
@@ -9,12 +10,42 @@
 #include <sgl_kernel/utils.cuh>
 #include <sgl_kernel/vec.cuh>
 
+#include <sgl_kernel/deepseek_v4/fp8_utils.cuh>
+#include <sgl_kernel/ptx/barrier.cuh>
+
 #include <tvm/ffi/container/tensor.h>
 
 #include <cstdint>
 #include <cuda_fp8.h>
 
 namespace sglang {
+
+namespace device::ptx {
+
+SGL_DEVICE uint32_t mapa_shared(uint32_t addr, uint32_t rank) {
+  uint32_t result;
+  asm volatile("mapa.shared::cluster.u32 %0, %1, %2;" : "=r"(result) : "r"(addr), "r"(rank));
+  return result;
+}
+
+SGL_DEVICE void st_async_f32(uint32_t remote_addr, float x, uint32_t remote_bar) {
+  asm volatile("st.async.shared::cluster.mbarrier::complete_tx::bytes.f32 [%0], %1, [%2];" ::"r"(remote_addr),
+               "f"(x),
+               "r"(remote_bar)
+               : "memory");
+}
+
+SGL_DEVICE void mbar_wait_parity_acquire_cta(uint64_t* bar, uint32_t parity) {
+  asm volatile(
+      "{\n\t.reg .pred p;\n\t"
+      "WAIT_%=: mbarrier.try_wait.parity.acquire.cta.shared::cta.b64 p, [%0], %1;\n\t"
+      "@!p bra WAIT_%=;\n\t}\n" ::"r"(to_shared(bar)),
+      "r"(parity)
+      : "memory");
+}
+
+}  // namespace device::ptx
+
 struct MhcPostCombineNormDecodeParams {
   const bf16_t *x, *residual, *weight;
   bf16_t *residual_out, *output;
@@ -22,46 +53,83 @@ struct MhcPostCombineNormDecodeParams {
   uint8_t *q, *sf;
   int64_t rows;
   float eps;
+  // MegaMoE input (fp8 rows + UE8M0 scales), written as mega_moe_pre_dispatch writes them.
+  uint8_t *moe_x, *moe_sf, *moe_shared_sf;
+  uint64_t moe_sf_stride_bytes, moe_shared_col_stride;
+  uint32_t moe_shared_block_m;
 };
 
-template <int Threads, bool Quant>
+template <int Threads, int Split, bool Quant, bool MoeQuant = false>
 __global__ __launch_bounds__(Threads) void mhc_post_combine_norm_decode_kernel(
     const __grid_constant__ MhcPostCombineNormDecodeParams p) {
   using namespace device;
   using V = AlignedVector<bf16x2_t, 4>;
-  constexpr int kVectors = 640;
+  constexpr int kVectors = 640 / Split;
   constexpr int kVPT = kVectors / Threads;
   constexpr int kWarps = Threads / 32;
-  static_assert(kVPT * Threads == kVectors && Threads % 32 == 0);
+  constexpr int kPool = Split * kWarps;
+  constexpr bool kPrefetchWeight = Split > 1 || kVPT == 1;
+  static_assert(kVPT * Threads * Split == 640 && Threads % 32 == 0 && kPool <= 32);
   constexpr int kGroups = 5120 / 32;
   constexpr int64_t kTileBytes = ((kGroups + 3) / 4) * 512;
-  __shared__ float warp_sums[kWarps];
-  __shared__ float inv_rms_shared;
+  __shared__ float pool[kPool];
+  __shared__ uint64_t bar;
 
   const int tid = threadIdx.x;
   const int lane = tid % 32;
-  const int64_t row = blockIdx.x;
+  const int warp = tid / 32;
+  const int rank = Split > 1 ? blockIdx.x : 0;
+  const int64_t row = Split > 1 ? blockIdx.y : blockIdx.x;
 
+  if constexpr (Split > 1) {
+    if (tid == 0) {
+      ptx::mbar_init(&bar, 1);
+      ptx::mbar_arrive_expect_tx(&bar, kPool * sizeof(float));
+      asm volatile("fence.mbarrier_init.release.cluster;" ::: "memory");
+    }
+    asm volatile("barrier.cluster.arrive.relaxed.aligned;" ::: "memory");
+  }
+  const bf16_t* x_ptr = p.x;
+  const bf16_t* residual_ptr = p.residual;
+  const bf16_t* weight_ptr = p.weight;
+  const float* comb_ptr = p.comb;
+  const float* post_ptr = p.post;
+  const float* pre_ptr = p.pre;
+  __builtin_assume(__isGlobal(x_ptr));
+  __builtin_assume(__isGlobal(residual_ptr));
+  __builtin_assume(__isGlobal(weight_ptr));
+  __builtin_assume(__isGlobal(comb_ptr));
+  __builtin_assume(__isGlobal(post_ptr));
+  __builtin_assume(__isGlobal(pre_ptr));
+
+  PDLWaitPrimary<true>();
   float comb[16], post[4], pre[4];
 #pragma unroll
   for (int i = 0; i < 16; ++i)
-    comb[i] = __ldg(p.comb + row * 16 + i);
+    comb[i] = __ldg(comb_ptr + row * 16 + i);
 #pragma unroll
   for (int i = 0; i < 4; ++i) {
-    post[i] = __ldg(p.post + row * 4 + i);
-    pre[i] = __ldg(p.pre + row * 4 + i);
+    post[i] = __ldg(post_ptr + row * 4 + i);
+    pre[i] = __ldg(pre_ptr + row * 4 + i);
+  }
+
+  V w[kVPT];
+  if constexpr (kPrefetchWeight) {
+#pragma unroll
+    for (int j = 0; j < kVPT; ++j)
+      w[j].load(weight_ptr, rank * kVectors + tid + j * Threads);
   }
 
   float value[kVPT][8];
   float sum = 0.f;
 #pragma unroll
   for (int j = 0; j < kVPT; ++j) {
-    const int vid = tid + j * Threads;
+    const int vid = rank * kVectors + tid + j * Threads;
     V x, residual[4];
-    x.load(p.x + row * 5120, vid);
+    x.load(x_ptr + row * 5120, vid);
 #pragma unroll
     for (int r = 0; r < 4; ++r)
-      residual[r].load(p.residual + row * 20480 + r * 5120, vid);
+      residual[r].load(residual_ptr + row * 20480 + r * 5120, vid);
     float combined[8] = {};
 #pragma unroll
     for (int i = 0; i < 4; ++i) {
@@ -101,32 +169,34 @@ __global__ __launch_bounds__(Threads) void mhc_post_combine_norm_decode_kernel(
 #pragma unroll
   for (int offset = 16; offset; offset >>= 1)
     sum = __fadd_rn(sum, __shfl_xor_sync(0xffffffff, sum, offset));
-  if (lane == 0) warp_sums[tid / 32] = sum;
-  __syncthreads();
-  if (tid < 32) {
-    float total = lane < kWarps ? warp_sums[lane] : 0.f;
-#pragma unroll
-    for (int offset = 16; offset; offset >>= 1)
-      total = __fadd_rn(total, __shfl_xor_sync(0xffffffff, total, offset));
-    if (lane == 0) {
-      float mean, inverse;
-      asm("div.full.f32 %0, %1, %2;" : "=f"(mean) : "f"(total), "f"(5120.f));
-      asm("add.f32 %0, %1, %2;" : "=f"(mean) : "f"(mean), "f"(p.eps));
-      asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(inverse) : "f"(mean));
-      inv_rms_shared = inverse;
+  if constexpr (Split > 1) {
+    asm volatile("barrier.cluster.wait.aligned;" ::: "memory");
+    if (lane < Split) {
+      const uint32_t slot = ptx::to_shared(&pool[rank * kWarps + warp]);
+      ptx::st_async_f32(ptx::mapa_shared(slot, lane), sum, ptx::mapa_shared(ptx::to_shared(&bar), lane));
     }
+    ptx::mbar_wait_parity_acquire_cta(&bar, 0);
+  } else {
+    if (lane == 0) pool[warp] = sum;
+    __syncthreads();
   }
-  __syncthreads();
-  const float inv_rms = inv_rms_shared;
+  float total = lane < kPool ? pool[lane] : 0.f;
+#pragma unroll
+  for (int offset = 16; offset; offset >>= 1)
+    total = __fadd_rn(total, __shfl_xor_sync(0xffffffff, total, offset));
+  float mean, inv_rms;
+  asm("div.full.f32 %0, %1, %2;" : "=f"(mean) : "f"(total), "f"(5120.f));
+  asm("add.f32 %0, %1, %2;" : "=f"(mean) : "f"(mean), "f"(p.eps));
+  asm("rsqrt.approx.ftz.f32 %0, %1;" : "=f"(inv_rms) : "f"(mean));
 
 #pragma unroll
   for (int j = 0; j < kVPT; ++j) {
-    const int vid = tid + j * Threads;
-    V w, out;
-    w.load(p.weight, vid);
+    const int vid = rank * kVectors + tid + j * Threads;
+    if constexpr (!kPrefetchWeight) w[j].load(weight_ptr, vid);
+    V out;
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
-      const auto weight = cast<fp32x2_t>(w[k]);
+      const auto weight = cast<fp32x2_t>(w[j][k]);
       out[k] = cast<bf16x2_t>(fp32x2_t{
           __fmul_rn(__fmul_rn(value[j][2 * k], inv_rms), weight.x),
           __fmul_rn(__fmul_rn(value[j][2 * k + 1], inv_rms), weight.y)});
@@ -167,29 +237,64 @@ __global__ __launch_bounds__(Threads) void mhc_post_combine_norm_decode_kernel(
         p.sf[off] = static_cast<uint8_t>(sf);
       }
     }
+    if constexpr (MoeQuant) {
+      using deepseek_v4::fp8::cast_to_ue8m0;
+      using deepseek_v4::fp8::pack_fp8;
+      float y[8];
+      float local_max = 0.0f;
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        const auto v = cast<fp32x2_t>(out[k]);
+        y[2 * k] = v.x;
+        y[2 * k + 1] = v.y;
+        local_max = fmaxf(local_max, fmaxf(fabsf(v.x), fabsf(v.y)));
+      }
+      local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffff, local_max, 1));
+      local_max = fmaxf(local_max, __shfl_xor_sync(0xffffffff, local_max, 2));
+      const float absmax = fmaxf(local_max, 1e-10f);
+      const float raw_scale = absmax / math::FP8_E4M3_MAX;
+      const uint32_t ue8m0_exp = cast_to_ue8m0(raw_scale);
+      const float inv_scale = __uint_as_float((127u + 127u - ue8m0_exp) << 23);
+      AlignedVector<fp8x2_e4m3_t, 4> qv;
+#pragma unroll
+      for (int k = 0; k < 4; ++k)
+        qv[k] = pack_fp8(y[2 * k] * inv_scale, y[2 * k + 1] * inv_scale);
+      qv.store(reinterpret_cast<fp8_e4m3_t*>(p.moe_x + row * 5120), vid);
+      if (vid % 4 == 0) {
+        const int g = vid / 4;
+        p.moe_sf[static_cast<uint64_t>(row) * p.moe_sf_stride_bytes + g] = static_cast<uint8_t>(ue8m0_exp);
+        const uint32_t bm = p.moe_shared_block_m;
+        const uint32_t t = static_cast<uint32_t>(row);
+        const uint32_t m = t % bm;
+        const uint64_t shared_row =
+            t / bm * ((bm + 127u) / 128u * 128u) + m / 128u * 128u + m % 32u * 4u + m % 128u / 32u;
+        const uint64_t off = shared_row + static_cast<uint64_t>(g / 4) * p.moe_shared_col_stride;
+        p.moe_shared_sf[off * sizeof(int32_t) + g % 4] = static_cast<uint8_t>(ue8m0_exp);
+      }
+    }
   }
 
   if constexpr (Quant) {
     // Word i of the last 128-row tile holds tile row (i % 4) * 32 + (i % 128) / 4.
     const int first_pad = static_cast<int>(p.rows % 128);
+    const int stride = static_cast<int>(p.rows) * Split * Threads;
     auto* tile = reinterpret_cast<uint32_t*>(p.sf + (p.rows / 128) * kTileBytes);
-    for (int i = static_cast<int>(row) * Threads + tid; first_pad && i < kTileBytes / 4;
-         i += static_cast<int>(p.rows) * Threads) {
+    for (int i = (static_cast<int>(row) * Split + rank) * Threads + tid; first_pad && i < kTileBytes / 4; i += stride) {
       if ((i % 4) * 32 + (i % 128) / 4 >= first_pad) tile[i] = 0;
     }
   }
 }
 
-template <int Threads>
+template <int Threads, int Split>
 struct MhcPostCombineNormDecode {
   static int64_t max_active_ctas(bool quant) {
     int ctas = 0;
     if (quant)
       CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          &ctas, mhc_post_combine_norm_decode_kernel<Threads, true>, Threads, 0));
+          &ctas, mhc_post_combine_norm_decode_kernel<Threads, Split, true>, Threads, 0));
     else
       CHECK_CUDA(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-          &ctas, mhc_post_combine_norm_decode_kernel<Threads, false>, Threads, 0));
+          &ctas, mhc_post_combine_norm_decode_kernel<Threads, Split, false>, Threads, 0));
     return ctas;
   }
 
@@ -205,7 +310,11 @@ struct MhcPostCombineNormDecode {
       tvm::ffi::TensorView q,
       tvm::ffi::TensorView sf,
       float eps,
-      bool quant) {
+      bool quant,
+      tvm::ffi::Optional<tvm::ffi::TensorView> moe_x,
+      tvm::ffi::Optional<tvm::ffi::TensorView> moe_sf,
+      tvm::ffi::Optional<tvm::ffi::TensorView> moe_shared_sf,
+      int64_t moe_shared_block_m) {
     using namespace host;
     auto m = SymbolicSize{"num_tokens"};
     auto dev = SymbolicDevice{};
@@ -226,7 +335,8 @@ struct MhcPostCombineNormDecode {
       CHECK_HOST(reinterpret_cast<uintptr_t>(ptr) % 16 == 0) << "BF16 pointers must be 16-byte aligned";
     }
     if (rows == 0) return;
-    const MhcPostCombineNormDecodeParams params{
+    CHECK_HOST(Split == 1 || rows <= 65535) << "rows go in grid.y";
+    MhcPostCombineNormDecodeParams params{
         static_cast<const bf16_t*>(x.data_ptr()),
         static_cast<const bf16_t*>(residual.data_ptr()),
         static_cast<const bf16_t*>(weight.data_ptr()),
@@ -238,13 +348,41 @@ struct MhcPostCombineNormDecode {
         quant ? static_cast<uint8_t*>(q.data_ptr()) : nullptr,
         quant ? static_cast<uint8_t*>(sf.data_ptr()) : nullptr,
         rows,
-        eps};
+        eps,
+        nullptr,
+        nullptr,
+        nullptr,
+        0,
+        0,
+        0};
+    LaunchKernel launch(Split > 1 ? dim3(Split, rows) : dim3(rows), Threads, dev.unwrap());
+    if (Split > 1) launch.enable_cluster(dim3(Split, 1, 1));
+    launch.enable_pdl(true);
+    if (moe_x.has_value()) {
+      RuntimeCheck(!quant, "MegaMoE input and the swizzled MXFP8 output are exclusive");
+      RuntimeCheck(moe_sf.has_value() && moe_shared_sf.has_value(), "MegaMoE input needs both scale buffers");
+      const auto mx = moe_x.value();
+      const auto ms = moe_sf.value();
+      const auto ss = moe_shared_sf.value();
+      RuntimeCheck(
+          mx.size(0) >= rows && mx.size(1) == 5120 && mx.stride(1) == 1 && mx.stride(0) == 5120,
+          "MegaMoE x must be [>= rows, 5120] row-major");
+      RuntimeCheck(ms.size(0) >= rows && ms.size(1) * 4 >= 160 && ms.stride(1) == 1, "MegaMoE x_sf layout");
+      RuntimeCheck((ms.stride(0) * 4) % 16 == 0, "MegaMoE x_sf row stride must be 16B-aligned");
+      RuntimeCheck(moe_shared_block_m > 0 && ss.stride(0) == 1, "MegaMoE shared scales are column-major");
+      params.moe_x = static_cast<uint8_t*>(mx.data_ptr());
+      params.moe_sf = static_cast<uint8_t*>(ms.data_ptr());
+      params.moe_sf_stride_bytes = static_cast<uint64_t>(ms.stride(0)) * 4;
+      params.moe_shared_sf = static_cast<uint8_t*>(ss.data_ptr());
+      params.moe_shared_col_stride = static_cast<uint64_t>(ss.stride(1));
+      params.moe_shared_block_m = static_cast<uint32_t>(moe_shared_block_m);
+      launch.launch(mhc_post_combine_norm_decode_kernel<Threads, Split, false, true>, params);
+      return;
+    }
     if (quant)
-      LaunchKernel(dim3(rows), Threads, dev.unwrap())
-          .launch(mhc_post_combine_norm_decode_kernel<Threads, true>, params);
+      launch.launch(mhc_post_combine_norm_decode_kernel<Threads, Split, true>, params);
     else
-      LaunchKernel(dim3(rows), Threads, dev.unwrap())
-          .launch(mhc_post_combine_norm_decode_kernel<Threads, false>, params);
+      launch.launch(mhc_post_combine_norm_decode_kernel<Threads, Split, false>, params);
   }
 };
 }  // namespace sglang

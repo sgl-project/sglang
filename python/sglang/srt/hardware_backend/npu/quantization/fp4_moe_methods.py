@@ -1,8 +1,8 @@
-"""MXFP4 routed-expert MoE method for Ascend A5 (Ascend 950).
+"""MXFP4 routed-expert MoE method for Ascend 950.
 
 DeepSeek-V4's FP4 expert checkpoint stores block-32 MXFP4 weights with E8M0
 scales. This module adapts those checkpoint weights to the shared Ascend MoE
-runner and A5 grouped-matmul kernels.
+runner and Ascend 950 grouped-matmul kernels.
 """
 
 from typing import TYPE_CHECKING
@@ -18,7 +18,7 @@ from sglang.srt.hardware_backend.npu.quantization.moe_utils import (
     process_npu_fp4_expert_weights,
 )
 from sglang.srt.layers.quantization.base_config import FusedMoEMethodBase
-from sglang.srt.utils import set_weight_attrs
+from sglang.srt.layers.utils.common import set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
@@ -37,7 +37,7 @@ def _wrap_mxfp4_scale_weight_loader(weight_loader):
 
 
 class NPUW4A8MXFP4FusedMoEMethod(FusedMoEMethodBase):
-    """DeepSeek-V4 routed experts on Ascend A5: W4A8 MXFP weights.
+    """DeepSeek-V4 routed experts on Ascend 950: W4A8 MXFP weights.
 
     The checkpoint-specific loading remains here while execution is delegated
     to the shared Ascend MoE runner.
@@ -52,8 +52,12 @@ class NPUW4A8MXFP4FusedMoEMethod(FusedMoEMethodBase):
         # npu_grouped_matmul_swiglu_quant_v2 once it accepts swiglu_limit.
         # V4 sets swiglu_limit=10.0; the current fused op implements only
         # standard SwiGLU and would skip the required gate/up clamps.
-        self.w13_kernel = NPUW4A8MXFP4MoEMethod(dynamic_quant_kwargs=None)
-        self.w2_kernel = NPUW4A8MXFP4MoEMethod(dynamic_quant_kwargs=None)
+        self.w13_kernel = NPUW4A8MXFP4MoEMethod(
+            dynamic_quant_kwargs=None, weight_prefix="w13"
+        )
+        self.w2_kernel = NPUW4A8MXFP4MoEMethod(
+            dynamic_quant_kwargs=None, weight_prefix="w2"
+        )
         self.runner = None
 
     def create_weights(

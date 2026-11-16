@@ -1,4 +1,4 @@
-"""Causal verify metadata and routing with no ordinary prefill metadata."""
+"""ROCm MiniMax sparse attention: verify metadata and routing."""
 
 import unittest
 from types import SimpleNamespace
@@ -16,7 +16,7 @@ class TestMiniMaxROCmVerify(unittest.TestCase):
         from sglang.srt.layers.attention.minimax_sparse_backend import (
             MiniMaxSparseAttnBackend,
         )
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
 
         self.backend = MiniMaxSparseAttnBackend.__new__(MiniMaxSparseAttnBackend)
         self.backend._linear_verify = True

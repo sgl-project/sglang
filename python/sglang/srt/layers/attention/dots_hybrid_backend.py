@@ -18,7 +18,8 @@ from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
 
 if TYPE_CHECKING:
     from sglang.srt.layers.radix_attention import RadixAttention
-    from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+    from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang.srt.speculative.spec_info import SpecInput
 
 

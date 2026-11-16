@@ -14,14 +14,19 @@ import torch
 
 from sglang.srt.dllm.algorithm.low_confidence import LowConfidence
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
-from sglang.srt.managers.overlap_utils import FutureMap
-from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.overlap_utils import FutureMap, resolve_forward_inputs
+from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+)
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=15, suite="base-a-test-cpu")
@@ -77,8 +82,9 @@ def _get_empty_dllm_batch(manager):
     scheduler = SimpleNamespace(
         enable_priority_preemption=False,
         _should_skip_prefill=lambda **kwargs: False,
-        policy=SimpleNamespace(calc_priority=lambda reqs: None),
-        waiting_queue=[],
+        policy=SimpleNamespace(calc_priority=lambda reqs: reqs),
+        waiting_queue=IndexedReqList(ListKind.WAITING),
+        _ack_waiting_health_checks=lambda: None,
         _create_dllm_prefill_adder=lambda *args, **kwargs: SimpleNamespace(
             can_run_list=[]
         ),
@@ -90,6 +96,17 @@ def _get_empty_dllm_batch(manager):
 
 
 class TestDllmResultSnapshot(CustomTestCase):
+    def test_standalone_prefill_resolves_without_future_map(self):
+        batch = SimpleNamespace(
+            input_ids=None,
+            prefill_input_ids_cpu=torch.tensor([2, 3, 4, 5]),
+            mix_running_indices=None,
+            device="cpu",
+        )
+        self.assertFalse(resolve_forward_inputs(batch, None))
+        self.assertEqual(batch.input_ids.tolist(), [2, 3, 4, 5])
+        self.assertIsNone(batch.prefill_input_ids_cpu)
+
     def test_queue_snapshot_preserves_dllm_dispatch(self):
         config = SimpleNamespace(
             first_done_first_out_mode=True, requires_separate_context_encoding=False
@@ -221,7 +238,7 @@ class TestFdfoLowConfidenceOverlap(CustomTestCase):
     def test_future_map_overwrites_only_rows_with_a_block(self):
         future_map = FutureMap(
             device=torch.device("cpu"),
-            spec_algo=SimpleNamespace(),
+            spec_algo=None,
             req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros((4, 8))),
             needs_cpu_seq_lens=False,
         )
@@ -289,35 +306,27 @@ class TestFdfoLowConfidenceOverlap(CustomTestCase):
         self.assertEqual(req.dllm_block_id, 2)
         self.assertFalse(req.dllm_block_done)
 
-    def test_pending_result_keeps_block_input(self):
-        req = _req(True)
-        req.init_next_round_input()
-        req.dllm_block_id = 1
-        block_offset = req.dllm_block_offset
-        fill = list(req.full_untruncated_fill_ids)
-        manager = DllmManager(req.dllm_config)
-        manager.staging_queue = [req]
-        self.assertIsNone(_get_empty_dllm_batch(manager))
-        self.assertEqual(req.dllm_block_id, 1)
-        self.assertFalse(req.dllm_block_done)
-        self.assertEqual(req.dllm_block_offset, block_offset)
-        self.assertEqual(list(req.full_untruncated_fill_ids), fill)
-        self.assertEqual(manager.staging_queue, [])
-
-    def test_incomplete_round_keeps_block_id_and_geometry(self):
-        req = _req()
-        req.init_next_round_input()
-        block_id = req.dllm_block_id
-        fill = list(req.full_untruncated_fill_ids)
-        req.dllm_incomplete_ids = array("q", [2, 3, 4, 0])
-        manager = DllmManager(req.dllm_config)
-        manager.staging_queue = [req]
-        self.assertIsNone(_get_empty_dllm_batch(manager))
-        self.assertEqual(req.dllm_block_id, block_id)
-        self.assertEqual(list(req.full_untruncated_fill_ids), fill)
-        req.init_next_round_input()
-        self.assertEqual(req.dllm_block_id, block_id)
-        self.assertFalse(req.dllm_block_done)
+    def test_unfinished_round_keeps_block_id_and_geometry(self):
+        for state, tokens in (("pending", []), ("incomplete", [2, 3, 4, 0])):
+            with self.subTest(state=state):
+                req = _req()
+                req.init_next_round_input()
+                req.dllm_block_id = 1
+                req.dllm_incomplete_ids = array("q", tokens)
+                block_offset = req.dllm_block_offset
+                fill = list(req.full_untruncated_fill_ids)
+                manager = DllmManager(req.dllm_config, abort=None)
+                manager.add_waiting_reqs([req])
+                self.assertIsNone(_get_empty_dllm_batch(manager))
+                self.assertEqual(req.dllm_block_id, 1)
+                self.assertFalse(req.dllm_block_done)
+                self.assertEqual(req.dllm_block_offset, block_offset)
+                self.assertEqual(list(req.full_untruncated_fill_ids), fill)
+                self.assertEqual(list(manager.waiting_queue), [req])
+                if tokens:
+                    req.init_next_round_input()
+                    self.assertEqual(req.dllm_block_id, 1)
+                    self.assertFalse(req.dllm_block_done)
 
     def test_result_keeps_block_ids_captured_before_forward(self):
         req = _req(fdfo=True)
@@ -365,10 +374,10 @@ class TestDllmResultProcessing(CustomTestCase):
     def _process(
         self,
         *,
-        fdfo,
-        prompt,
-        end,
-        fill,
+        fdfo=True,
+        prompt=(2, 3),
+        end=4,
+        fill=(2, 3, 0, 0),
         tokens,
         done=None,
         req=None,
@@ -388,7 +397,9 @@ class TestDllmResultProcessing(CustomTestCase):
                 dllm_incomplete_ids=array("q"),
                 dllm_algo_state=None,
                 finished=lambda: finished and bool(req.accepted),
-                kv=SimpleNamespace(req_pool_idx=1),
+                kv=ReqKvInfo(req_pool_idx=1, kv_allocated_len=4, kv_committed_len=4),
+                owner_list=None,
+                finished_reason=None,
                 time_stats=SimpleNamespace(set_completion_time=lambda: None),
             )
             req.init_next_round_input = lambda: None
@@ -430,6 +441,9 @@ class TestDllmResultProcessing(CustomTestCase):
         scheduler._clear_dllm_future = lambda req: Scheduler._clear_dllm_future(
             scheduler, req
         )
+        scheduler.request_retirer = release_only_retirer(
+            before_kv_release=scheduler._clear_dllm_future if fdfo else None,
+        )
         batch = SimpleNamespace(
             reqs=[req],
             return_logprob=False,
@@ -449,9 +463,6 @@ class TestDllmResultProcessing(CustomTestCase):
 
     def test_fdfo_crops_prompt_and_respect_truncated_extend_range(self):
         req, streamed, count = self._process(
-            fdfo=True,
-            prompt=[2, 3],
-            end=4,
             fill=[2, 3, 0, 0, 0, 0],
             tokens=[2, 3, 4, 5],
             done=True,
@@ -465,7 +476,7 @@ class TestDllmResultProcessing(CustomTestCase):
     def test_finished_request_clears_future_before_slot_reuse(self):
         future_map = FutureMap(
             device=torch.device("cpu"),
-            spec_algo=SimpleNamespace(),
+            spec_algo=None,
             req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros((4, 8))),
             needs_cpu_seq_lens=False,
         )
@@ -477,17 +488,14 @@ class TestDllmResultProcessing(CustomTestCase):
             req.kv.req_pool_idx = None
 
         with patch(
-            "sglang.srt.dllm.mixin.scheduler.release_kv_cache", side_effect=release
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
+            side_effect=release,
         ):
             self._process(
-                fdfo=True,
-                prompt=[2, 3],
-                end=4,
-                fill=[2, 3, 0, 0],
                 tokens=[2, 3, 4, 5],
                 done=True,
                 finished=True,
-                future_map=future_map or SimpleNamespace(dllm_block_tokens_buf=None),
+                future_map=future_map,
             )
         batch = SimpleNamespace(
             is_dllm=lambda: True,
@@ -502,10 +510,8 @@ class TestDllmResultProcessing(CustomTestCase):
 
     def test_fdfo_prefill_commits_no_output(self):
         req, streamed, count = self._process(
-            fdfo=True,
             done=True,
             prompt=[2, 3, 4, 5, 6],
-            end=4,
             fill=[2, 3, 4, 5, 6, 0],
             tokens=[2, 3, 4, 5],
         )
@@ -515,28 +521,30 @@ class TestDllmResultProcessing(CustomTestCase):
         self.assertEqual(count, 0)
 
     def test_fdfo_retains_unfinished_then_commits_only_once(self):
-        args = dict(fdfo=True, prompt=[2, 3], end=4, fill=[2, 3, 0, 0])
-        req, _, count = self._process(**args, tokens=[2, 3, 4, 0], done=False)
+        req, _, count = self._process(tokens=[2, 3, 4, 0], done=False)
         self.assertEqual(req.output_ids, [])
         self.assertEqual(list(req.dllm_incomplete_ids), [2, 3, 4, 0])
         self.assertEqual(req.dllm_algo_state, {"round": 1})
         self.assertEqual(count, 0)
-        req, _, count = self._process(**args, tokens=[2, 3, 4, 5], done=True, req=req)
+        req, _, count = self._process(tokens=[2, 3, 4, 5], done=True, req=req)
         self.assertEqual(req.output_ids, [4, 5])
         self.assertTrue(req.dllm_block_done)
         self.assertEqual(list(req.dllm_incomplete_ids), [])
         self.assertIsNone(req.dllm_algo_state)
         self.assertEqual(count, 2)
-        req, _, count = self._process(**args, tokens=[2, 3, 4, 5], done=True, req=req)
-        self.assertEqual(req.output_ids, [4, 5])
-        self.assertTrue(req.dllm_block_done)
-        self.assertEqual(count, 0)
+        for done in (False, True, True):
+            with self.subTest(late_done=done):
+                req, _, count = self._process(tokens=[7, 7, 7, 7], done=done, req=req)
+                self.assertEqual(req.output_ids, [4, 5])
+                self.assertTrue(req.dllm_block_done)
+                self.assertEqual(list(req.dllm_incomplete_ids), [])
+                self.assertIsNone(req.dllm_algo_state)
+                self.assertEqual(count, 0)
 
     def test_old_block_cannot_overwrite_or_complete_new_block(self):
         for old_done in (False, True):
             with self.subTest(fdfo=True, old_done=old_done):
-                args = dict(fdfo=True, prompt=[2, 3], end=4, fill=[2, 3, 0, 0])
-                req, _, _ = self._process(**args, tokens=[2, 3, 4, 5], done=True)
+                req, _, _ = self._process(tokens=[2, 3, 4, 5], done=True)
                 req.dllm_block_id += 1
                 req.dllm_block_done = False
                 req.extend_end = 8
@@ -545,7 +553,6 @@ class TestDllmResultProcessing(CustomTestCase):
                 state = {"current_block": 2}
                 req.dllm_algo_state = state
                 req, _, count = self._process(
-                    **args,
                     tokens=[7, 7, 7, 7],
                     done=old_done,
                     req=req,
@@ -560,7 +567,6 @@ class TestDllmResultProcessing(CustomTestCase):
                 self.assertFalse(req.dllm_block_done)
                 self.assertEqual(count, 0)
                 req, _, count = self._process(
-                    **args,
                     tokens=[6, 6, 6, 6],
                     done=True,
                     req=req,
@@ -568,18 +574,6 @@ class TestDllmResultProcessing(CustomTestCase):
                 self.assertEqual(req.output_ids, [4, 5, 6, 6, 6, 6])
                 self.assertTrue(req.dllm_block_done)
                 self.assertEqual(count, 4)
-
-    def test_duplicate_results_never_reopen_completed_block(self):
-        args = dict(fdfo=True, prompt=[2, 3], end=4, fill=[2, 3, 0, 0])
-        req, _, _ = self._process(**args, tokens=[2, 3, 4, 5], done=True)
-        for done in (False, True, True):
-            req, _, count = self._process(
-                **args, tokens=[7, 7, 7, 7], done=done, req=req
-            )
-            self.assertEqual(req.output_ids, [4, 5])
-            self.assertTrue(req.dllm_block_done)
-            self.assertEqual(list(req.dllm_incomplete_ids), [])
-            self.assertEqual(count, 0)
 
 
 if __name__ == "__main__":

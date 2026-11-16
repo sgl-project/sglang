@@ -95,9 +95,10 @@ def create_attention_graph_variants(hf_config) -> Optional[AttentionGraphVariant
 
 DSV41_CANDIDATE_FILTERED = "candidate_filtered"
 DSV41_CANDIDATE_UNFILTERED = "candidate_unfiltered"
-# SGLANG_OPT_DSV41_TARGET_METADATA_EARLY serves these target verify variants (requests
-# up to the candidate span); longer ones keep the in-graph metadata upgrade.
-DSV41_EARLY_VERIFY_VARIANTS = frozenset({DSV41_CANDIDATE_UNFILTERED})
+# SGLANG_OPT_DSV41_TARGET_METADATA_EARLY serves these target verify variants.
+DSV41_EARLY_VERIFY_VARIANTS = frozenset(
+    {DSV41_CANDIDATE_UNFILTERED, DSV41_CANDIDATE_FILTERED}
+)
 
 
 @dataclass(frozen=True)
@@ -140,7 +141,7 @@ def create_dsv41_candidate_graph_variants(
 ) -> Optional[Dsv41CandidateGraphVariants]:
     import torch
 
-    from sglang.srt.model_executor.forward_batch_info import ForwardMode
+    from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang.srt.utils import is_gfx95_supported, is_hip
 
     text_config = model_runner.model_config.hf_text_config

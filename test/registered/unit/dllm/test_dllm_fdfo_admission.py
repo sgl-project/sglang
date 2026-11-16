@@ -38,10 +38,12 @@ class TestDllmFdfoAdmission(CustomTestCase):
                         requires_separate_context_encoding=False,
                         block_size=32,
                     ),
-                    _get_dllm_remain_tokens=lambda req: 32,
+                    _get_dllm_remain_tokens=lambda req, **_: 32,
                     can_run_list=[],
                     _update_prefill_budget=lambda *args, **kwargs: None,
-                    _state_slot_reserve_for_req=lambda req: 0,
+                    memory_budget=SimpleNamespace(prices_by_demand=False),
+                    _state_slots_for_req=lambda req: 0,
+                    _request_rows_for_req=lambda req: int(not req.kv.holds_kv),
                 )
                 result = PrefillAdder.add_dllm_staging_req(adder, req)
                 self.assertEqual(result, AddReqResult.CONTINUE)
@@ -49,7 +51,7 @@ class TestDllmFdfoAdmission(CustomTestCase):
                 self.assertEqual(req.extend_end, 32)
 
                 adder.can_run_list.clear()
-                adder._get_dllm_remain_tokens = lambda req: 16
+                adder._get_dllm_remain_tokens = lambda req, **_: 16
                 result = PrefillAdder.add_dllm_staging_req(adder, req)
                 self.assertEqual(result, AddReqResult.NO_TOKEN)
                 self.assertEqual(adder.can_run_list, [])
@@ -75,19 +77,20 @@ class TestDllmFdfoAdmission(CustomTestCase):
             dllm_config=SimpleNamespace(
                 block_size=4, requires_separate_context_encoding=False
             ),
-            _get_dllm_remain_tokens=lambda req: budget[0],
+            _get_dllm_remain_tokens=lambda req, **_: budget[0],
             can_run_list=[],
             _update_prefill_budget=lambda *args, **kwargs: budget.__setitem__(
                 0, budget[0] - args[1]
             ),
-            _state_slot_reserve_for_req=lambda req: 0,
+            memory_budget=SimpleNamespace(prices_by_demand=False),
+            _state_slots_for_req=lambda req: 0,
+            _request_rows_for_req=lambda req: int(not req.kv.holds_kv),
         )
-        for _ in range(2):
-            result = PrefillAdder.add_dllm_staging_req(adder, req)
-            self.assertEqual(result, AddReqResult.NO_TOKEN)
-            self.assertEqual(adder.can_run_list, [])
-            self.assertEqual(budget[0], 0)
-            self.assertEqual((req.prefix_len, req.extend_end), (4, 4))
+        result = PrefillAdder.add_dllm_staging_req(adder, req)
+        self.assertEqual(result, AddReqResult.NO_TOKEN)
+        self.assertEqual(adder.can_run_list, [])
+        self.assertEqual(budget[0], 0)
+        self.assertEqual((req.prefix_len, req.extend_end), (4, 4))
         budget[0] = 4
         result = PrefillAdder.add_dllm_staging_req(adder, req)
         self.assertEqual(result, AddReqResult.NO_TOKEN)

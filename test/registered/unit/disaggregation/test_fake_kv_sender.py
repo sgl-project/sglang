@@ -6,7 +6,7 @@ import numpy as np
 
 from sglang.srt.disaggregation.base.conn import KVArgs, KVPoll
 from sglang.srt.disaggregation.fake.conn import FakeKVManager, FakeKVSender
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=9, suite="base-a-test-cpu")

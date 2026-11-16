@@ -65,6 +65,9 @@ class PageInterleavePoolAllocator(PagedTokenToKVPoolAllocator):
     physical slots; per-rank HBM is unchanged.
     """
 
+    # Its per-owner free lists bypass the paged allocator's staged-page guard.
+    supports_reuse_guard = False
+
     def __init__(
         self,
         size: int,

@@ -16,7 +16,6 @@ from types import SimpleNamespace
 import pytest
 
 import sglang.multimodal_gen.runtime.entrypoints.openai.storage as storage_mod
-from sglang.multimodal_gen.runtime.entrypoints.openai import image_api, video_api
 from sglang.multimodal_gen.runtime.entrypoints.openai.storage import CloudStorage
 
 
@@ -237,7 +236,7 @@ def test_env_configured_storage_uploads_and_cleans_up(tmp_path, monkeypatch):
     ]
 
 
-@pytest.mark.parametrize("kind", ["single", "images", "videos"])
+@pytest.mark.parametrize("kind", ["single", "many"])
 @pytest.mark.parametrize("upload_fails", [False, True])
 def test_cancelled_upload_finishes_reading_before_request_cleanup(
     tmp_path, monkeypatch, kind, upload_fails
@@ -249,8 +248,6 @@ def test_cancelled_upload_finishes_reading_before_request_cleanup(
     storage.bucket_name = "test"
     storage.endpoint_url = "https://s3.example.com"
     storage.region_name = None
-    monkeypatch.setattr(image_api, "cloud_storage", storage)
-    monkeypatch.setattr(video_api, "cloud_storage", storage)
     count = 1 if kind == "single" else 2
     release = [threading.Event() for _ in range(count)]
     read = []
@@ -281,10 +278,8 @@ def test_cancelled_upload_finishes_reading_before_request_cleanup(
                 paths = [str(path) for path in paths]
                 if kind == "single":
                     await storage.upload_and_cleanup(paths[0])
-                elif kind == "images":
-                    await image_api._upload_and_cleanup_images(paths)
                 else:
-                    await video_api._upload_and_cleanup_videos(paths)
+                    await storage.upload_all_and_cleanup(paths)
 
         task = asyncio.create_task(request())
         try:

@@ -9,22 +9,26 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.dllm.algorithm.joint_threshold import JointThreshold
 from sglang.srt.dllm.algorithm.low_confidence import LowConfidence
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
+from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import GenerationBatchResult, Scheduler
+from sglang.srt.managers.scheduler_components.request_list import move
 from sglang.srt.mem_cache.allocation import alloc_for_extend
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixCache, RadixKey
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import leaving_retirer
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -233,10 +237,18 @@ class TestDllmFdfoKvReuse(CustomTestCase):
         scheduler._process_hicache_events = lambda: None
         scheduler.enable_fpm = False
         scheduler.enable_hisparse = False
-        scheduler.chunked_req = None
-        scheduler.dllm_manager = DllmManager(req.dllm_config)
-        scheduler.dllm_manager.waiting_queue = [req]
-        scheduler.dllm_manager.staging_queue = [req] if previously_staged else []
+        scheduler.chunked_reqs = []
+        scheduler.dllm_manager = DllmManager(req.dllm_config, abort=None)
+        scheduler.dllm_manager.add_waiting_reqs([req])
+        last_batch = (
+            ScheduleBatch(
+                reqs=[req],
+                dllm_config=req.dllm_config,
+                forward_mode=ForwardMode.DLLM_EXTEND,
+            )
+            if previously_staged
+            else None
+        )
         selected = []
 
         class SelectionComplete(Exception):
@@ -251,9 +263,23 @@ class TestDllmFdfoKvReuse(CustomTestCase):
             self.assertRaises(SelectionComplete),
         ):
             unwrap(Scheduler.get_next_batch_to_run)(
-                scheduler, ScheduleBatch(reqs=[], dllm_config=req.dllm_config), None
+                scheduler,
+                ScheduleBatch(reqs=[], dllm_config=req.dllm_config),
+                last_batch,
             )
         return selected[0]
+
+    def _prepare_block(self, req, allocator):
+        batch = _make_batch(self.pool, allocator, [req], [4])
+        batch.dllm_config = req.dllm_config
+        batch.return_logprob = False
+        batch.model_config = SimpleNamespace(is_encoder_decoder=False, vocab_size=32)
+        with patch(
+            "sglang.srt.managers.schedule_batch.SamplingBatchInfo.from_schedule_batch",
+            return_value=None,
+        ):
+            ScheduleBatch.prepare_for_extend(batch)
+        return batch
 
     def _check_waiting_then_next_block(self, scheduler, req, batch, result, allocator):
         self.assertEqual(req.prefix_len, 0)
@@ -271,11 +297,13 @@ class TestDllmFdfoKvReuse(CustomTestCase):
         adder = SimpleNamespace(
             dllm_config=req.dllm_config,
             can_run_list=[],
-            _get_dllm_remain_tokens=lambda req: budget[0],
+            _get_dllm_remain_tokens=lambda req, **_: budget[0],
             _update_prefill_budget=lambda *args, **kwargs: budget.__setitem__(
                 0, budget[0] - args[1]
             ),
-            _state_slot_reserve_for_req=lambda req: 0,
+            memory_budget=SimpleNamespace(prices_by_demand=False),
+            _state_slots_for_req=lambda req: 0,
+            _request_rows_for_req=lambda req: int(not req.kv.holds_kv),
         )
         adder.add_dllm_staging_req = lambda item: PrefillAdder.add_dllm_staging_req(
             adder, item
@@ -308,35 +336,8 @@ class TestDllmFdfoKvReuse(CustomTestCase):
             scheduler.future_map.dllm_block_tokens_buf[1].tolist(), [-1] * 4
         )
 
-        class AllocationComplete(Exception):
-            pass
-
-        outputs = []
-
-        def allocate(batch):
-            outputs.append(alloc_for_extend(batch))
-            raise AllocationComplete
-
         for _ in range(2):
-            new_batch = _make_batch(self.pool, allocator, [req], [4])
-            new_batch.dllm_config = req.dllm_config
-            new_batch.prepare_for_extend = lambda: ScheduleBatch.prepare_for_extend(
-                new_batch
-            )
-            with (
-                patch(
-                    "sglang.srt.managers.schedule_batch.ScheduleBatch.init_new",
-                    return_value=new_batch,
-                ),
-                patch(
-                    "sglang.srt.managers.schedule_batch.alloc_for_extend",
-                    side_effect=allocate,
-                ),
-                self.assertRaises(AllocationComplete),
-            ):
-                scheduler._create_dllm_batch(
-                    adder.can_run_list, None, adder, SimpleNamespace(reqs=[])
-                )
+            new_batch = self._prepare_block(req, allocator)
             fill = list(req.full_untruncated_fill_ids)
             self.assertEqual(req.dllm_block_id, 8)
             self.assertFalse(req.dllm_block_done)
@@ -354,8 +355,7 @@ class TestDllmFdfoKvReuse(CustomTestCase):
                 self.pool.req_to_token[1, :8].tolist(),
                 [100, 101, 102, 103, 500, 501, 502, 503],
             )
-        self.assertEqual(outputs[0][0].tolist(), [500, 501, 502, 503])
-        self.assertEqual(outputs[1][0].tolist(), [500, 501, 502, 503])
+            self.assertEqual(new_batch.out_cache_loc.tolist(), [500, 501, 502, 503])
         self.assertEqual(len(allocator.alloc_calls) + len(allocator.extend_calls), 1)
 
     def test_completed_block_checkpoints_before_admission_and_opens_once(self):
@@ -374,13 +374,41 @@ class TestDllmFdfoKvReuse(CustomTestCase):
                 )
 
     def test_prompt_done_waits_for_admission_and_filters_late_result(self):
-        for prompt in ([2, 3, 4, 5], list(range(2, 12))):
-            with self.subTest(prompt=prompt):
-                scheduler, req, batch, result, allocator = self._lifecycle_case(prompt)
-                req.dllm_block_done = True
-                self._check_waiting_then_next_block(
-                    scheduler, req, batch, result, allocator
-                )
+        scheduler, req, batch, result, allocator = self._lifecycle_case([2, 3, 4, 5])
+        req.dllm_block_done = True
+        self._check_waiting_then_next_block(scheduler, req, batch, result, allocator)
+
+    def test_long_prompt_preserves_suffix_until_next_block_preparation(self):
+        scheduler, req, _, _, allocator = self._lifecycle_case(list(range(2, 12)))
+        req.dllm_block_done = True
+        fill = list(req.full_untruncated_fill_ids)
+        adder = SimpleNamespace(
+            dllm_config=req.dllm_config,
+            can_run_list=[],
+            _get_dllm_remain_tokens=lambda req, **_: 4,
+            _update_prefill_budget=lambda *args, **kwargs: None,
+            memory_budget=SimpleNamespace(prices_by_demand=False),
+            _state_slots_for_req=lambda req: 0,
+            _request_rows_for_req=lambda req: int(not req.kv.holds_kv),
+        )
+        adder.add_dllm_staging_req = lambda req: PrefillAdder.add_dllm_staging_req(
+            adder, req
+        )
+        self._schedule_staging(scheduler, req, adder)
+        self.assertEqual(adder.can_run_list, [req])
+        self.assertEqual((req.prefix_len, req.extend_end), (4, 8))
+        self.assertEqual(list(req.full_untruncated_fill_ids), fill)
+        self.assertEqual(req.dllm_block_offset, 0)
+        self.assertEqual(req.dllm_block_id, 7)
+        self.assertTrue(req.dllm_block_done)
+
+        batch = self._prepare_block(req, allocator)
+        self.assertEqual(batch.prefill_input_ids_cpu.tolist(), [6, 7, 8, 9])
+        self.assertEqual(list(req.full_untruncated_fill_ids), fill)
+        self.assertEqual(req.dllm_block_offset, 4)
+        self.assertEqual(req.dllm_block_id, 8)
+        self.assertTrue(req.dllm_block_done)
+        self.assertEqual(list(req.output_ids), [])
 
     def test_waiting_completed_block_is_checkpointed_without_previous_staging(self):
         scheduler, req, _, _, _ = self._lifecycle_case([2, 3, 4, 5])
@@ -400,17 +428,7 @@ class TestDllmFdfoKvReuse(CustomTestCase):
         for prompt in ([2, 3], [2, 3, 4, 5], list(range(2, 12))):
             with self.subTest(prompt=prompt):
                 scheduler, req, _, _, allocator = self._lifecycle_case(prompt)
-                batch = _make_batch(self.pool, allocator, [req], [4])
-                batch.dllm_config = req.dllm_config
-                batch.return_logprob = False
-                batch.model_config = SimpleNamespace(
-                    is_encoder_decoder=False, vocab_size=32
-                )
-                with patch(
-                    "sglang.srt.managers.schedule_batch.SamplingBatchInfo.from_schedule_batch",
-                    return_value=None,
-                ):
-                    ScheduleBatch.prepare_for_extend(batch)
+                batch = self._prepare_block(req, allocator)
                 self.assertEqual(req.dllm_block_done, len(prompt) >= 4)
                 self.assertEqual(req.dllm_block_id, 7)
                 self.assertEqual(req.prefix_len, 0)
@@ -510,21 +528,36 @@ class TestDllmFdfoKvReuse(CustomTestCase):
         with self.assertRaisesRegex(RuntimeError, "full block"):
             alloc_for_extend(batch)
 
-    def test_dllm_manager_pop_aborted_reqs_removes_waiting_and_staging(self):
-        manager = DllmManager(SimpleNamespace(max_running_requests=4))
-        waiting = _make_req("abort-waiting", [1], self.block_size)
-        staging = _make_req("abort-staging", [2], self.block_size)
-        keep = _make_req("keep", [3], self.block_size)
-        manager.waiting_queue = [waiting, keep]
-        manager.staging_queue = [staging, waiting]
+    def test_dllm_abort_removes_waiting(self):
+        retirer = leaving_retirer()
+        manager = DllmManager(
+            SimpleNamespace(max_running_requests=4), abort=retirer.abort
+        )
+        first, second, keep = (
+            Mock(rid=rid, owner_list=None) for rid in ("abort-1", "abort-2", "keep")
+        )
+        move([first, second, keep], manager.waiting_queue)
 
-        aborted = manager.pop_aborted_reqs(False, "abort")
+        manager.waiting_queue.abort(AbortReq(rid="abort"))
 
         self.assertEqual(
-            [req.rid for req in aborted], ["abort-waiting", "abort-staging"]
+            [c.args[0] for c in retirer.abort.call_args_list], [first, second]
         )
-        self.assertEqual(manager.waiting_queue, [keep])
-        self.assertEqual(manager.staging_queue, [])
+        self.assertEqual(list(manager.waiting_queue), [keep])
+
+    def test_staged_are_the_last_rounds_requests_still_waiting(self):
+        manager = DllmManager(SimpleNamespace(max_running_requests=4), abort=None)
+        first, second, aborted, unrun = (
+            Mock(rid=rid, owner_list=None)
+            for rid in ("first", "second", "aborted", "unrun")
+        )
+        move([first, second, aborted, unrun], manager.waiting_queue)
+        leaving_retirer().release(aborted)
+
+        # In the round's order, not the queue's.
+        last_batch = SimpleNamespace(reqs=[aborted, second, first])
+        self.assertEqual(manager.staged_reqs(last_batch), [second, first])
+        self.assertEqual(manager.staged_reqs(None), [])
 
 
 class TestDllmFdfoResolvedBlockKeepsRow(CustomTestCase):

@@ -9,6 +9,11 @@ from sglang.srt.dllm.mixin.req import DllmReqPhase
 from sglang.srt.dllm.mixin.scheduler import DllmManager, SchedulerDllmMixin
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import AddReqResult
+from sglang.srt.managers.scheduler_components.request_list import (
+    IndexedReqList,
+    ListKind,
+    move,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -37,13 +42,17 @@ class _Scheduler(SchedulerDllmMixin):
         self.enable_overlap = False
         self.result_queue = deque()
         self.dllm_config = config
-        self.dllm_manager = DllmManager(config)
+        self.dllm_manager = DllmManager(config, abort=None)
         self.dllm_manager.add_waiting_reqs(waiting)
-        self.waiting_queue = list(incoming)
+        self.waiting_queue = IndexedReqList(ListKind.WAITING)
+        move(incoming, self.waiting_queue)
         self.enable_priority_preemption = False
-        self.policy = SimpleNamespace(calc_priority=lambda reqs: None)
+        self.policy = SimpleNamespace(calc_priority=lambda reqs: reqs)
         self.tree_cache = None
         self.truncation_align_size = config.block_size
+
+    def _ack_waiting_health_checks(self):
+        pass
 
     def get_num_allocatable_reqs(self, running_bs, num_held_rows=0):
         return 16
@@ -227,15 +236,10 @@ class TestDllmFinalForwardScheduling(CustomTestCase):
         self.enqueue(scheduler, req)
 
         self.assertIsNone(scheduler.schedule())
-        self.assertEqual(scheduler.dllm_manager.waiting_queue, [req])
-        self.assertEqual(scheduler.dllm_manager.staging_queue, [])
+        self.assertEqual(list(scheduler.dllm_manager.waiting_queue), [req])
         self.assertFalse(req.dllm_block_done)
         self.assertEqual(req.dllm_block_id, 3)
         self.assertEqual(list(req.output_ids), [])
-
-    def test_unsubmitted_final_forward_still_runs(self):
-        scheduler, req = self.make_scheduler()
-        self.assertEqual(scheduler.schedule(), [req])
 
     def test_other_requests_continue_while_final_forward_is_inflight(self):
         scheduler, req = self.make_scheduler()
@@ -243,11 +247,11 @@ class TestDllmFinalForwardScheduling(CustomTestCase):
         peer.init_next_round_input()
         peer.prefix_len = 128
         peer.dllm_incomplete_ids = array("q", [1] * 32)
-        scheduler.dllm_manager.add_waiting_reqs(peer)
+        scheduler.dllm_manager.add_waiting_reqs([peer])
         self.enqueue(scheduler, req)
 
         self.assertEqual(scheduler.schedule(), [peer])
-        self.assertEqual(scheduler.dllm_manager.waiting_queue, [req, peer])
+        self.assertEqual(list(scheduler.dllm_manager.waiting_queue), [req, peer])
 
     def test_old_request_with_same_rid_does_not_block_new_request(self):
         scheduler, req = self.make_scheduler()
@@ -255,25 +259,23 @@ class TestDllmFinalForwardScheduling(CustomTestCase):
         self.enqueue(scheduler, old_req)
         self.assertEqual(scheduler.schedule(), [req])
 
-    def test_masked_or_unprocessed_block_still_runs(self):
-        for tokens in ([1] * 31 + [0], []):
-            with self.subTest(tokens=tokens):
+    def test_requests_not_waiting_for_final_forward_still_run(self):
+        complete = [1] * 32
+        for case, tokens, inflight, overlap, algorithm in (
+            ("unsubmitted", complete, False, True, "LowConfidence"),
+            ("masked", [1] * 31 + [0], True, True, "LowConfidence"),
+            ("unprocessed", [], True, True, "LowConfidence"),
+            ("overlap_off", complete, True, False, "LowConfidence"),
+            ("joint_threshold", complete, True, True, "JointThreshold"),
+            ("gemma4_renoise", complete, True, True, "Gemma4Renoise"),
+        ):
+            with self.subTest(case=case):
                 scheduler, req = self.make_scheduler()
                 req.dllm_incomplete_ids = array("q", tokens)
-                self.enqueue(scheduler, req)
-                self.assertEqual(scheduler.schedule(), [req])
-
-    def test_skip_requires_overlap_and_low_confidence(self):
-        for overlap, algorithm in (
-            (False, "LowConfidence"),
-            (True, "JointThreshold"),
-            (True, "Gemma4Renoise"),
-        ):
-            with self.subTest(overlap=overlap, algorithm=algorithm):
-                scheduler, req = self.make_scheduler()
                 scheduler.enable_overlap = overlap
                 scheduler.dllm_config.algorithm = algorithm
-                self.enqueue(scheduler, req)
+                if inflight:
+                    self.enqueue(scheduler, req)
                 self.assertEqual(scheduler.schedule(), [req])
 
     def test_filtered_last_batch_does_not_hide_inflight_forward(self):

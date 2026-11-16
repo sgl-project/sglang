@@ -6,7 +6,7 @@ from unittest.mock import Mock, patch
 
 import torch
 
-from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.dllm.mixin.scheduler import DllmManager
 from sglang.srt.managers.io_struct import AbortReq
 from sglang.srt.managers.overlap_utils import FutureMap
@@ -18,6 +18,7 @@ from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.runtime_context import get_context
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.scheduler_test_utils import empty_request_lists
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -51,20 +52,14 @@ class TestFdfoAbort(CustomTestCase):
         if holds_kv:
             req.kv = ReqKvInfo(req_pool_idx=1, kv_allocated_len=4, kv_committed_len=4)
         scheduler = Scheduler.__new__(Scheduler)
+        empty_request_lists(scheduler)
         scheduler.enable_continuous_input_polling = False
-        scheduler.deferred_responses = SimpleNamespace(abort=Mock())
-        scheduler.uocr_runtime = None
         scheduler.rust_server = None
-        scheduler.chunked_req = None
         scheduler.mm_receiver = None
-        scheduler.waiting_queue = []
         scheduler.dllm_config = config
-        scheduler.dllm_manager = DllmManager(config)
-        scheduler.dllm_manager.waiting_queue = [req]
-        scheduler.dllm_manager.staging_queue = [req]
-        scheduler.grammar_manager = SimpleNamespace(abort_requests=Mock())
+        scheduler.dllm_manager = DllmManager(config, abort=scheduler._abort_dllm_req)
+        scheduler.dllm_manager.add_waiting_reqs([req])
         scheduler.disaggregation_mode = DisaggregationMode.NULL
-        scheduler.ps = SimpleNamespace(pp_size=1)
         scheduler.running_batch = SimpleNamespace(reqs=[])
         scheduler.last_batch = SimpleNamespace(reqs=[req]) if holds_kv else None
         scheduler.tree_cache = SimpleNamespace(finish=Mock())
@@ -75,7 +70,7 @@ class TestFdfoAbort(CustomTestCase):
         scheduler.enable_overlap = True
         scheduler.future_map = FutureMap(
             device=torch.device("cpu"),
-            spec_algo=SimpleNamespace(),
+            spec_algo=None,
             req_to_token_pool=SimpleNamespace(req_to_token=torch.zeros((4, 8))),
             needs_cpu_seq_lens=False,
         )
@@ -91,6 +86,8 @@ class TestFdfoAbort(CustomTestCase):
         scheduler.output_streamer = SimpleNamespace(
             stream_output=Mock(), release_detokenize_state=Mock()
         )
+        scheduler.beam_coordinator = SimpleNamespace(retire_group=Mock())
+        scheduler.init_request_retirer()
         return scheduler, req
 
     def test_abort_invalidates_future_before_slot_release(self):
@@ -111,7 +108,7 @@ class TestFdfoAbort(CustomTestCase):
                     req.kv.mark_kv_released()
 
                 with patch(
-                    "sglang.srt.managers.scheduler.release_kv_cache",
+                    "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
                     side_effect=release,
                 ):
                     scheduler.abort_request(AbortReq(rid=req.rid))
@@ -123,8 +120,7 @@ class TestFdfoAbort(CustomTestCase):
                 self.assertTrue(req.finished_output)
                 self.assertFalse(req.dllm_block_done)
                 self.assertIsNone(req.to_finish)
-                self.assertEqual(scheduler.dllm_manager.waiting_queue, [])
-                self.assertEqual(scheduler.dllm_manager.staging_queue, [])
+                self.assertFalse(scheduler.dllm_manager.waiting_queue)
                 batch = SimpleNamespace(
                     is_dllm=lambda: True,
                     dllm_config=scheduler.dllm_config,
@@ -136,7 +132,9 @@ class TestFdfoAbort(CustomTestCase):
 
     def test_aborted_request_rejects_incomplete_and_complete_pending_results(self):
         scheduler, req = self.make_scheduler()
-        with patch("sglang.srt.managers.scheduler.release_kv_cache"):
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+        ):
             scheduler.abort_request(AbortReq(rid=req.rid))
         original_fill = list(req.full_untruncated_fill_ids)
         req.dllm_incomplete_ids = array("q", [2, 3, 4, 0])
@@ -155,7 +153,7 @@ class TestFdfoAbort(CustomTestCase):
                     dp_cooperation_info=None,
                 )
                 with patch(
-                    "sglang.srt.dllm.mixin.scheduler.release_kv_cache"
+                    "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
                 ) as release:
                     scheduler.process_batch_result_dllm(batch, result)
                 release.assert_not_called()
@@ -177,6 +175,7 @@ class TestFdfoAbort(CustomTestCase):
                 page_size=4,
             )
         )
+        scheduler.init_request_retirer()
         batch = SimpleNamespace(
             reqs=[req],
             return_logprob=False,
@@ -205,7 +204,8 @@ class TestFdfoAbort(CustomTestCase):
             req.kv.mark_kv_released()
 
         with patch(
-            "sglang.srt.managers.scheduler.release_kv_cache", side_effect=release
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
+            side_effect=release,
         ) as release_cache:
             scheduler.abort_request(AbortReq(rid=req.rid))
             scheduler.abort_request(AbortReq(rid=req.rid))
@@ -216,9 +216,52 @@ class TestFdfoAbort(CustomTestCase):
         self.assertEqual(req.output_ids.tolist(), [4, 5])
         self.assertEqual(req.dllm_block_offset, 0)
 
+    def test_retract_clears_future_and_invalidates_the_submitted_block(self):
+        scheduler, req = self.make_scheduler()
+        submitted_id = req.dllm_block_id
+        req.output_ids.extend([4, 5])
+        req.dllm_incomplete_ids = array("q", [4, 5, 0, 0])
+
+        def release(req, tree_cache, checkpoint):
+            self.assertFalse(checkpoint)
+            self.assertEqual(
+                scheduler.future_map.dllm_block_tokens_buf[1].tolist(), [-1] * 4
+            )
+            req.kv.req_pool_idx = None
+            req.kv.mark_kv_released()
+
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache",
+            side_effect=release,
+        ):
+            self.assertTrue(scheduler.request_retirer.retract(req, offload_kv=False))
+        req.reset_for_retract()
+        req.init_next_round_input()
+        self.assertGreater(req.dllm_block_id, submitted_id)
+        self.assertFalse(req.dllm_block_done)
+
+        scheduler.process_batch_result_dllm(
+            SimpleNamespace(
+                reqs=[req],
+                return_logprob=False,
+                prefill_stats=None,
+                dp_cooperation_info=None,
+            ),
+            GenerationBatchResult(
+                dllm_block_ids=(submitted_id,),
+                next_token_ids=torch.tensor([[7, 7, 7, 7]]),
+                dllm_block_done=torch.tensor([False]),
+            ),
+        )
+        self.assertEqual(req.output_ids.tolist(), [4, 5])
+        self.assertFalse(req.dllm_incomplete_ids)
+        self.assertEqual(req.full_untruncated_fill_ids[:4].tolist(), [2, 3, 4, 5])
+
     def test_abort_before_first_forward_does_not_clear_another_slot(self):
         scheduler, req = self.make_scheduler(holds_kv=False)
-        with patch("sglang.srt.managers.scheduler.release_kv_cache") as release:
+        with patch(
+            "sglang.srt.managers.scheduler_components.request_retirer.release_kv_cache"
+        ) as release:
             scheduler.abort_request(AbortReq(rid=req.rid))
         release.assert_not_called()
         self.assertTrue(req.finished())
