@@ -1658,23 +1658,6 @@ class TestVerifyGraphGuards(unittest.TestCase):
         self._gate(is_v41=False, mode=RaggedVerifyMode.COMPACT)
 
 
-class _FakeTorchOps:
-    """``torch`` proxy that redirects ``torch.ops.custom`` to a recorder.
-
-    Only ``ops`` is replaced; every other attribute falls through to the real
-    torch, so the production writer's ``torch.bfloat16`` / ``torch.uint8`` keep
-    working on a CPU-only box.
-    """
-
-    def __init__(self, custom):
-        self._custom = custom
-
-    def __getattr__(self, name):
-        if name == "ops":
-            return SimpleNamespace(custom=self._custom)
-        return getattr(torch, name)
-
-
 def _dsv41_llm_pool(row_dim, dtype, layout):
     """A ``DSV41NPUSingleKVPool`` with just the ``kv_buffer`` the writers read."""
     pool = object.__new__(DSV41NPUSingleKVPool)
@@ -1694,9 +1677,11 @@ class TestV41PoolWritePath(unittest.TestCase):
     _SELF = SimpleNamespace(qk_nope_head_dim=448, qk_rope_head_dim=64)
 
     def _write(self, *, buf, loc, cache, layout):
+        # The writer calls the ``sgl_kernel_npu`` wrapper directly (imported at
+        # module level), not ``torch.ops.custom``, so the recorder has to
+        # replace that name.
         recorder = MagicMock(name="kv_compress_epilog_v2")
-        custom = SimpleNamespace(kv_compress_epilog_v2=recorder)
-        with patch.object(dsv4_memory_pool, "torch", _FakeTorchOps(custom)):
+        with patch.object(dsv4_memory_pool, "kv_compress_epilog_v2", recorder):
             DSV4NPUTokenToKVPool._write_dsv41_packed_kv(
                 self._SELF, buf=buf, loc=loc, cache=cache, layout=layout
             )
