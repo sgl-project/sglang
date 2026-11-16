@@ -261,6 +261,7 @@ _UNIFIED_KEY_SCHEME_DRAFT_FREE_ALGORITHMS = ("FROZEN_KV_MTP",)
 # Algorithms whose draft KV is stored under unified keys. EAGLE covers
 # NEXTN-style MTP, whose one-layer draft is packed onto the target's page
 # block; an EAGLE draft that does not pack is refused once it is loaded.
+# DFLASH joins them when it runs without its draft KV ring.
 _UNIFIED_KEY_SCHEME_DRAFT_KV_ALGORITHMS = ("EAGLE",)
 
 
@@ -286,7 +287,12 @@ def validate_unified_key_scheme_speculative(server_args: Any) -> None:
             )
         return
     algorithm = cfg.speculative_algorithm
-    if algorithm not in _UNIFIED_KEY_SCHEME_DRAFT_KV_ALGORITHMS:
+    stores_draft_kv = algorithm in _UNIFIED_KEY_SCHEME_DRAFT_KV_ALGORITHMS or (
+        # A ring holds no prefix, so no draft KV follows a page to L3. Without
+        # it the draft KV lives in a host pool of its own, beside the target's.
+        algorithm == "DFLASH" and not cfg.speculative_dflash_draft_kv_ring
+    )
+    if not stores_draft_kv:
         if cfg.hicache_storage_draft_id is not None:
             raise ValueError(
                 "--hicache-storage-draft-id is set, but "
@@ -308,24 +314,15 @@ def validate_unified_key_scheme_speculative(server_args: Any) -> None:
         )
     if algorithm in _UNIFIED_KEY_SCHEME_DRAFT_FREE_ALGORITHMS:
         return
-    if algorithm in _UNIFIED_KEY_SCHEME_DRAFT_KV_ALGORITHMS:
+    if stores_draft_kv:
         _validate_unified_draft_kv(server_args)
         return
     if algorithm == "DFLASH":
-        if cfg.speculative_dflash_draft_kv_ring:
-            # A ring holds no prefix, so no draft KV follows a page to L3.
-            return
-        raise NotImplementedError(
-            "--hicache-storage-key-scheme unified supports DFLASH only with the "
-            "draft KV ring: without it the draft KV lives in a sidecar pool that "
-            "has no unified L3 keys (the 'DFLASH draft KV ring' log line says "
-            "why the ring is off). Use --hicache-storage-key-scheme rank-suffix."
-        )
+        return
     raise NotImplementedError(
         f"--hicache-storage-key-scheme unified does not support "
         f"--speculative-algorithm {algorithm} (supported: NEXTN-style MTP, "
-        f"FROZEN_KV_MTP, DFLASH with the draft KV ring). Use "
-        f"--hicache-storage-key-scheme rank-suffix."
+        f"FROZEN_KV_MTP, DFLASH). Use --hicache-storage-key-scheme rank-suffix."
     )
 
 
@@ -357,15 +354,28 @@ def _validate_unified_draft_kv(server_args: Any) -> None:
         ),
         (cfg.attn_cp_size > 1, "prefill context parallelism (--attn-cp-size > 1)"),
         (
+            # Decided by the server arguments, so not left to the controller,
+            # which refuses the draft KV pool only once the weights are loaded.
+            algorithm == "DFLASH" and cfg.pp_size > 1,
+            "pipeline parallelism (--pp-size > 1): the draft KV pool needs a "
+            "single pipeline stage",
+        ),
+        (
             cfg.disaggregation_mode != "null",
             f"PD disaggregation (--disaggregation-mode {cfg.disaggregation_mode})",
         ),
         (cfg.enable_streaming_session, "--enable-streaming-session"),
         (cfg.enable_session_radix_cache, "--enable-session-radix-cache"),
         (
-            envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get(),
+            algorithm == "EAGLE" and envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get(),
             "SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND=1: skipped steps leave draft "
             "rows unwritten",
+        ),
+        (
+            algorithm == "DFLASH" and cfg.hicache_storage_backend == "mooncake",
+            "the Mooncake backend, which has no unified keys for the draft KV "
+            "pool of DFLASH without its draft KV ring (the 'DFLASH draft KV "
+            "ring' log line says why the ring is off)",
         ),
     )
     for refused, what in refusals:

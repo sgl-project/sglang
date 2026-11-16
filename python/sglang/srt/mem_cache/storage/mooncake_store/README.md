@@ -98,12 +98,22 @@ Speculative decoding:
   sessions, the session radix cache, `buffer_only` host memory, multi-layer
   EAGLE, a draft loaded with random weights, or
   `SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND=1`.
+- DFLASH without its draft KV ring keeps the draft KV in a host pool of its
+  own. Mooncake has no unified keys for that pool yet and refuses it at
+  startup; the file backend stores its pages as `{page}_{draft digest}_D0-{n}[_H{g}]`,
+  cut by `--hicache-storage-head-partition` applied to the draft's kv heads.
+  The draft digest names the draft as for NEXTN-style MTP: by its path and
+  revision, or by `--hicache-storage-draft-id`. Refused at startup with
+  pipeline parallelism, prefill context parallelism, PD disaggregation,
+  streaming sessions, the session radix cache, `buffer_only` host memory, or
+  a draft loaded with random weights.
 - Algorithms that keep no draft KV in the host cache (DFLASH with its draft KV
   ring; FROZEN_KV_MTP, whose Gemma 4 targets are composite caches and stay
   unsupported for that reason) store exactly the objects of a deployment
   without speculative decoding.
 - Other algorithms are refused at startup; an EAGLE draft that does not pack
-  onto the target's pages is refused when the cache is built.
+  onto the target's pages, and any other draft pool, is refused when the
+  cache is built.
 
 EAGLE-family algorithms, NEXTN and FROZEN_KV_MTP included, hash pages over
 token pairs, so they never share objects with deployments that hash single

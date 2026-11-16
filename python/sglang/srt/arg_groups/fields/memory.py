@@ -223,9 +223,10 @@ class Memory(msgspec.Struct):
                 "mooncake backends, which store one object per chunk and "
                 "serve head- and layer-partitioned grids. Speculative decoding "
                 "is supported with NEXTN-style MTP, whose packed draft layer "
-                "is stored as a chunk of its own, and where no draft KV "
-                "enters the host cache (DFLASH with its draft KV ring, "
-                "FROZEN_KV_MTP)."
+                "is stored as a chunk of its own; with DFLASH, whose draft KV "
+                "pool is stored as chunks of its own on the file backend, or "
+                "not at all with its draft KV ring; and with FROZEN_KV_MTP, "
+                "which keeps no draft KV in the host cache."
             ),
             choices=["rank-suffix", "unified"],
         ),
@@ -241,7 +242,9 @@ class Memory(msgspec.Struct):
                 "attention-TP sizes in the fleet, so every member's local head "
                 "count is a whole number of chunks. Unset, each deployment keys "
                 "to its own head count and shares only with its own TP size. "
-                "MLA-family models replicate KV across ranks and ignore it."
+                "MLA-family models replicate KV across ranks and ignore it. A "
+                "draft KV pool stored beside the target's (DFLASH) is cut by "
+                "the same number, which must divide its local head count too."
             ),
         ),
     ] = None
@@ -272,7 +275,8 @@ class Memory(msgspec.Struct):
                 "weights different ids. Unset, it is 'bundled' for a draft "
                 "that is part of the target checkpoint, otherwise the draft "
                 "model path and revision as given, which differ between hosts "
-                "that mount the same draft at different paths."
+                "that mount the same draft at different paths, followed by "
+                "the draft's quantization if it has one."
             ),
         ),
     ] = None

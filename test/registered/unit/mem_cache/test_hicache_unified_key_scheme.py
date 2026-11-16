@@ -188,6 +188,11 @@ _SPEC_HOOK = "sglang.srt.arg_groups.speculative_hook"
 def _dflash_with_ring(ring_unsupported_reason):
     """DFLASH without a draft checkpoint: only the ring resolution runs for real."""
     return (
+        # The alias resolution would read the draft checkpoint's config.
+        patch(
+            f"{_SPEC_HOOK}._resolve_speculative_algorithm_alias",
+            return_value="DFLASH",
+        ),
         patch(
             f"{_SPEC_HOOK}._handle_dflash", side_effect=_resolve_dflash_draft_kv_ring
         ),
@@ -224,15 +229,79 @@ class TestUnifiedKeySchemeSpeculative(CustomTestCase):
         )
         self.assertEqual(resolution_result(args, "speculative_algorithm"), "EAGLE")
 
-    def test_dflash_is_accepted_only_with_the_draft_kv_ring(self):
-        args = _resolve_through_speculative(
-            patches=_dflash_with_ring(None), speculative_algorithm="DFLASH"
+    def test_dflash_stores_draft_kv_only_without_its_ring(self):
+        dflash = dict(
+            speculative_algorithm="DFLASH", speculative_draft_model_path="org/dflash"
         )
+        no_ring = _dflash_with_ring("the draft is not MLA")
+        # With the ring no draft KV follows a page: nothing to name.
+        args = _resolve_through_speculative(patches=_dflash_with_ring(None), **dflash)
         self.assertTrue(resolution_result(args, "speculative_dflash_draft_kv_ring"))
-        with self.assertRaisesRegex(NotImplementedError, "only with the draft KV ring"):
+        self.assertIsNone(resolution_result(args, "hicache_storage_draft_id"))
+        with self.assertRaisesRegex(ValueError, "stores no draft KV"):
             _resolve_through_speculative(
-                patches=_dflash_with_ring("the draft is not MLA"),
-                speculative_algorithm="DFLASH",
+                patches=_dflash_with_ring(None),
+                hicache_storage_draft_id="org/dflash",
+                **dflash,
+            )
+        # Without it the draft KV pool is stored, under the draft's id.
+        args = _resolve_through_speculative(patches=no_ring, **dflash)
+        self.assertFalse(resolution_result(args, "speculative_dflash_draft_kv_ring"))
+        self.assertEqual(
+            resolution_result(args, "hicache_storage_draft_id"), "org/dflash@main"
+        )
+        args = _resolve_through_speculative(
+            patches=no_ring, hicache_storage_draft_id="fleet-draft", **dflash
+        )
+        self.assertEqual(
+            resolution_result(args, "hicache_storage_draft_id"), "fleet-draft"
+        )
+
+    def test_stored_dflash_draft_kv_has_the_requirements_of_any_stored_draft(self):
+        dflash = dict(
+            speculative_algorithm="DFLASH", speculative_draft_model_path="org/dflash"
+        )
+        cases = {
+            "the Mooncake backend": dict(hicache_storage_backend="mooncake"),
+            "buffer_only": dict(hicache_host_memory_mode="buffer_only"),
+            "random weights": dict(speculative_draft_load_format="dummy"),
+            "--enable-streaming-session": dict(enable_streaming_session=True),
+            "--enable-session-radix-cache": dict(enable_session_radix_cache=True),
+            # Server arguments decide it: not left to the draft pool's
+            # registration, which comes after the weights are loaded.
+            "--pp-size > 1": dict(pp_size=2),
+            "prefill context parallelism": dict(attn_cp_size=2, enable_prefill_cp=True),
+            "PD disaggregation": dict(disaggregation_mode="prefill"),
+        }
+        for message, overrides in cases.items():
+            for ring_off_reason in ("the draft is not MLA", None):
+                with self.subTest(message, ring=ring_off_reason is None):
+                    resolve = lambda: _resolve_through_speculative(  # noqa: E731
+                        patches=_dflash_with_ring(ring_off_reason),
+                        **dflash,
+                        **overrides,
+                    )
+                    if ring_off_reason is None:
+                        # The ring stores no draft KV: none of this applies.
+                        resolve()
+                    else:
+                        with self.assertRaisesRegex(NotImplementedError, message):
+                            resolve()
+        # The single stage does not concern a packed draft layer, which
+        # follows the target's layers on the final stage.
+        nextn = patch(
+            f"{_SPEC_HOOK}._resolve_speculative_algorithm_alias", return_value="EAGLE"
+        )
+        _resolve_through_speculative(
+            patches=(nextn,),
+            speculative_algorithm="NEXTN",
+            speculative_draft_model_path="dummy",
+            pp_size=2,
+        )
+        # An EAGLE-only switch does not concern the DFLASH draft.
+        with envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.override(True):
+            _resolve_through_speculative(
+                patches=_dflash_with_ring("the draft is not MLA"), **dflash
             )
 
     def test_every_other_algorithm_is_refused_by_name(self):
@@ -336,6 +405,21 @@ class TestUnifiedKeySchemeDraftKV(CustomTestCase):
         # The same checkpoint quantized for the draft alone is another draft.
         self.assertEqual(
             self._draft_id(speculative_draft_model_quantization="fp8"), "bundled+fp8"
+        )
+        self.assertEqual(
+            self._draft_id(
+                speculative_draft_model_path="org/draft",
+                speculative_draft_model_quantization="fp8",
+            ),
+            "org/draft@main+fp8",
+        )
+        # A declared id is taken as it is.
+        self.assertEqual(
+            self._draft_id(
+                hicache_storage_draft_id="fleet-draft",
+                speculative_draft_model_quantization="fp8",
+            ),
+            "fleet-draft",
         )
         # A declared id wins: local mount paths differ between hosts.
         self.assertEqual(
@@ -461,6 +545,42 @@ class TestUnifiedDraftModeGate(CustomTestCase):
                 ),
             ):
                 self._check(mode)
+
+    def _check_sidecar(self, algorithm, pools, mode=HiCacheDraftMode.SIDECAR):
+        plan = HiCacheDraftPlan(mode=mode, device_pools=(object(),) * pools)
+        memory = SimpleNamespace(
+            hicache_storage_key_scheme="unified",
+            enable_unified_cache_external_linker=False,
+        )
+        with patch(
+            "sglang.srt.mem_cache.kv_cache_builder.get_memory", return_value=memory
+        ):
+            check_unified_hicache_draft(algorithm, plan)
+
+    def test_one_dflash_sidecar_pool_passes(self):
+        self._check_sidecar(SpeculativeAlgorithm.DFLASH, 1)
+
+    def test_other_sidecar_drafts_are_refused(self):
+        # The sidecar path is the same for EAGLE3 and DSPARK drafts, but only
+        # the DFLASH draft pool has unified keys.
+        cases = (("DFLASH", 2), ("DFLASH", 0), ("EAGLE3", 1), ("DSPARK", 1))
+        for algorithm, pools in cases:
+            with (
+                self.subTest(algorithm=algorithm, pools=pools),
+                self.assertRaisesRegex(
+                    NotImplementedError, f"draft mode 'sidecar' for {algorithm}"
+                ),
+            ):
+                self._check_sidecar(SpeculativeAlgorithm[algorithm], pools)
+        # One DFLASH draft pool in another mode is not a sidecar.
+        for mode in (HiCacheDraftMode.FUSED, HiCacheDraftMode.PACKED):
+            with (
+                self.subTest(mode=mode),
+                self.assertRaisesRegex(
+                    NotImplementedError, f"draft mode '{mode.value}' for DFLASH"
+                ),
+            ):
+                self._check_sidecar(SpeculativeAlgorithm.DFLASH, 1, mode=mode)
 
     def _stored(self, *, is_eagle=True, host_layers=5, target_layers=4, pools=1):
         tree_cache = SimpleNamespace(

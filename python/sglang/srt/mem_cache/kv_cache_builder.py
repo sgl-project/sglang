@@ -206,6 +206,14 @@ def check_unified_hicache_draft(
             f"cover {len(draft_plan.device_pools)} lookahead tokens. Use "
             f"--hicache-storage-key-scheme rank-suffix."
         )
+    if (
+        mode == HiCacheDraftMode.SIDECAR
+        and spec_algorithm.is_dflash()
+        and len(draft_plan.device_pools) == 1
+    ):
+        # DFLASH without its ring: the draft KV pool is named when it
+        # registers, and any other pool the draft brings is refused there.
+        return
     raise NotImplementedError(
         f"The unified key scheme does not support HiCache draft mode "
         f"'{mode.value}' for {spec_algorithm.name}: its draft KV has no unified "
