@@ -244,6 +244,7 @@ fn router_ctx_with(
             protocol: WireProtocol::default(),
             dp_ranks: 1,
             grpc_port,
+            supports_inline_system: false,
         };
         registry
             .add_with_cb(spec, Some(Default::default()), profile)

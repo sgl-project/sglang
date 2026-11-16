@@ -31,7 +31,7 @@ multi-node deployment, prefill-decode disaggregation, feature configuration, and
 <Note>
 The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
 mode, and workload. For parameter details, see
-[Feature descriptions](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#feature-descriptions); for
+[Parameter Reference](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#parameter-reference); for
 recommended configurations for each deployment scenario, see [Best practices](#best-practices).
 </Note>
 
@@ -482,11 +482,11 @@ P_MASTER_IP="<your prefill ip>"
 D_MASTER_IP="<your decode ip>"
 ROUTER_HOST_IP="<your router ip>"
 
-python3 -m sglang_router.launch_router \
---pd-disaggregation \
+sgl-router \
+--model-id glm-5 \
+--no-tokenizer \
 --policy round_robin \
---prefill http://${P_MASTER_IP}:8000 8998 \
---decode http://${D_MASTER_IP}:8003 \
+--worker-urls http://${P_MASTER_IP}:8000 http://${D_MASTER_IP}:8003 \
 --host ${ROUTER_HOST_IP} \
 --port 6688
 ```

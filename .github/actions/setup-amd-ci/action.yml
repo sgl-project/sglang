@@ -1,0 +1,36 @@
+name: 'Set up the AMD CI container'
+description: >
+  Free the GPUs, start the ci_sglang container from the ROCm image, and install
+  the checkout into it, after an optional sgl-router fetch. Run it after
+  checking out the code; run test commands with scripts/ci/amd/amd_ci_exec.sh.
+  The scripts read DOCKERHUB_AMD_USERNAME/TOKEN (optional Docker Hub login),
+  AMD_CI_IMAGE, and AITER_COMMIT_OVERRIDE from the caller's env.
+
+inputs:
+  rocm_version:
+    description: "ROCm image variant, passed to amd_ci_start_container.sh --rocm-version (e.g. rocm10)."
+    required: true
+  sgl_router:
+    description: "Fetch sgl-router from the cache first, for PD tests; amd_ci_exec.sh maps its path into the container."
+    required: false
+    default: 'false'
+
+runs:
+  using: composite
+  steps:
+    - if: inputs.sgl_router == 'true'
+      uses: ./.github/actions/download-sgl-router
+
+    - name: Ensure VRAM is clear
+      shell: bash
+      run: bash scripts/ci/amd/ensure_vram_clear.sh rocm
+
+    - name: Start CI container
+      shell: bash
+      run: bash scripts/ci/amd/amd_ci_start_container.sh --rocm-version "${{ inputs.rocm_version }}"
+      env:
+        GITHUB_WORKSPACE: ${{ github.workspace }}
+
+    - name: Install dependencies
+      shell: bash
+      run: bash scripts/ci/amd/amd_ci_install_dependency.sh

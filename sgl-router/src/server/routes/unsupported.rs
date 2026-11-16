@@ -1,33 +1,21 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 The SGLang Authors
 // SPDX-License-Identifier: Apache-2.0
 
-//! Paths sgl-model-gateway serves for features this router does not provide
-//! yet. They answer 501 rather than a bare 404, so a client moved from the
-//! gateway learns the endpoint is not supported yet rather than mistyped.
+//! Paths of features this router does not provide yet. They answer 501 rather
+//! than a bare 404, so a client learns the endpoint is not supported yet rather
+//! than mistyped.
 
 use crate::server::error::ApiError;
 use axum::http::Uri;
 use axum::response::{IntoResponse, Response};
 
-/// Responses and conversations API, parser endpoints, the worker and tokenizer
-/// management APIs, WASM modules, mesh HA, and the aggregated load and engine
-/// metrics endpoints.
+/// The OpenAI Responses and Conversations APIs, and the engine's `/v1/loads`.
 pub(crate) const UNSUPPORTED_PATHS: &[&str] = &[
     "/v1/responses",
     "/v1/responses/{*rest}",
     "/v1/conversations",
     "/v1/conversations/{*rest}",
-    "/parse/{*rest}",
-    "/workers",
-    "/workers/{*rest}",
-    "/v1/tokenizers",
-    "/v1/tokenizers/{*rest}",
-    "/wasm",
-    "/wasm/{*rest}",
-    "/ha/{*rest}",
     "/v1/loads",
-    "/get_loads",
-    "/engine_metrics",
 ];
 
 pub async fn unsupported(uri: Uri) -> Response {
