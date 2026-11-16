@@ -398,7 +398,6 @@ from sglang.srt.rust_server.server import (
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
-from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import (
     get_draft_recurrent_hidden_state_spec_from_config,
@@ -2665,13 +2664,7 @@ class Scheduler(
         return get_serving().tokenizer_path
 
     def _target_model_runner(self) -> "ModelRunner":
-        # Spec workers have no .model_runner of their own.
-        target_worker = (
-            self.tp_worker.target_worker
-            if isinstance(self.tp_worker, BaseSpecWorker)
-            else self.tp_worker
-        )
-        return target_worker.model_runner
+        return self.tp_worker.model_runner
 
     def maybe_init_uocr_runtime(self) -> None:
         """Initialize Unlimited-OCR v2 split-document KV reuse and prefetch."""
@@ -2720,15 +2713,8 @@ class Scheduler(
         )
 
     def init_dp_attn_adapter(self) -> None:
-        # Spec workers have no .model_runner of their own; the prefill graph
-        # runner that votes belongs to the target model.
-        target_worker = (
-            self.tp_worker.target_worker
-            if isinstance(self.tp_worker, BaseSpecWorker)
-            else self.tp_worker
-        )
         self.dp_attn_adapter = SchedulerDPAttnAdapter(
-            model_runner=target_worker.model_runner,
+            model_runner=self.tp_worker.model_runner,
             req_to_token_pool=self.req_to_token_pool,
             token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
             tree_cache=self.tree_cache,
