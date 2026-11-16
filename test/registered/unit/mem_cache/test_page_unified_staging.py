@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.hybrid_cache import hybrid_pool_assembler
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, MLATokenToKVPool
 from sglang.srt.mem_cache.pool_host import base, common, mha, mla
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
+from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode, HiCacheDraftPlan
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -21,7 +22,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 PAGE_SIZE = 16
 
 
-def _device_pool(is_mla, *, layer_num=4, dtype=torch.bfloat16):
+def _device_pool(is_mla, *, layer_num=4, dtype=torch.bfloat16, head_num=4):
     kwargs = dict(
         size=PAGE_SIZE * 8,
         page_size=PAGE_SIZE,
@@ -32,7 +33,9 @@ def _device_pool(is_mla, *, layer_num=4, dtype=torch.bfloat16):
     )
     if is_mla:
         return MLATokenToKVPool(kv_lora_rank=16, qk_rope_head_dim=16, **kwargs)
-    return MHATokenToKVPool(head_num=4, head_dim=16, enable_alt_stream=False, **kwargs)
+    return MHATokenToKVPool(
+        head_num=head_num, head_dim=16, enable_alt_stream=False, **kwargs
+    )
 
 
 def _geometry(is_mla, *, layer_num=4, head_group_num=2, itemsize=2):
@@ -302,6 +305,114 @@ class TestPageUnifiedStaging(CustomTestCase):
                     )
                 self.assertEqual(host.page_unified_layout, geometry)
                 self.assertEqual(host.staging_buffer.data_ptr(), prepared.data_ptr())
+
+    def _draft_host_pool(self, draft):
+        return hybrid_pool_assembler._build_mha_mla_host_pool(
+            pool=draft,
+            buffer_info=draft.get_device_pool_infos()[0].buffer_info,
+            host_to_device_ratio=2.0,
+            page_size=PAGE_SIZE,
+            layout="page_unified",
+            allocator_type="default",
+            pool_label="draft",
+        )
+
+    def test_draft_sidecar_host_pool_is_cut_into_the_staged_head_groups(self):
+        """The unified grid cuts the draft pool's own kv heads; a host pool
+        built with one head group would hold another byte order than the
+        chunks name."""
+        for key_scheme, head_partition, head_group_num in (
+            ("rank-suffix", 2, 1),
+            ("unified", None, 1),
+            ("unified", 1, 2),
+            ("unified", 2, 1),
+        ):
+            with (
+                self.subTest(key_scheme=key_scheme, head_partition=head_partition),
+                _cpu_staging_environment(
+                    hicache_storage_key_scheme=key_scheme,
+                    hicache_storage_head_partition=head_partition,
+                ),
+            ):
+                target = _device_pool(is_mla=False)
+                draft = _device_pool(is_mla=False, layer_num=3, head_num=2)
+                kv_cache_builder.prepare_hicache_staging(
+                    tp_worker=_worker(target),
+                    draft_plan=HiCacheDraftPlan(
+                        mode=HiCacheDraftMode.SIDECAR, device_pools=(draft,)
+                    ),
+                )
+                geometry = PageUnifiedLayout(
+                    page_size=PAGE_SIZE,
+                    layer_num=3,
+                    head_num=2,
+                    head_group_num=head_group_num,
+                    head_dim=16,
+                    itemsize=2,
+                )
+                prepared = draft.hicache_write_back_staging
+                self.assertEqual(tuple(prepared.shape[1:]), geometry.page_dims(1)[1:])
+                host = self._draft_host_pool(draft)
+                self.assertEqual(host.page_unified_layout, geometry)
+                self.assertEqual(host.staging_buffer.data_ptr(), prepared.data_ptr())
+
+    def test_head_partition_must_divide_the_draft_pools_heads_too(self):
+        with _cpu_staging_environment(hicache_storage_head_partition=4):
+            target = _device_pool(is_mla=False)
+            draft = _device_pool(is_mla=False, layer_num=3, head_num=2)
+            # The target's own message does not change.
+            with (
+                self.assertRaisesRegex(
+                    ValueError, "^--hicache-storage-head-partition 3 must divide"
+                ),
+                _cpu_staging_environment(hicache_storage_head_partition=3),
+            ):
+                kv_cache_builder.prepare_hicache_staging(tp_worker=_worker(target))
+            with self.assertRaisesRegex(
+                ValueError,
+                "draft KV pool cannot be cut.*--hicache-storage-head-partition 4 "
+                "must divide this rank's 2 kv heads",
+            ):
+                kv_cache_builder.prepare_hicache_staging(
+                    tp_worker=_worker(target),
+                    draft_plan=HiCacheDraftPlan(
+                        mode=HiCacheDraftMode.SIDECAR, device_pools=(draft,)
+                    ),
+                )
+
+    def test_only_the_unified_scheme_renames_a_draft_pools_geometry_error(self):
+        """Elsewhere no L3 chunks are cut: the error is passed on as it is."""
+        resolve = kv_cache_builder.resolve_kv_host_geometry
+
+        def refuse_three_layers(pool, **kwargs):
+            if pool.layer_num == 3:
+                raise ValueError("why")
+            return resolve(pool, **kwargs)
+
+        for key_scheme, sidecar, message in (
+            ("rank-suffix", True, "^why$"),
+            ("rank-suffix", False, "^why$"),
+            ("unified", False, "^why$"),
+            ("unified", True, "^The draft KV pool cannot be cut.*: why$"),
+        ):
+            with (
+                self.subTest(key_scheme=key_scheme, sidecar=sidecar),
+                _cpu_staging_environment(hicache_storage_key_scheme=key_scheme),
+                mock.patch.object(
+                    kv_cache_builder, "resolve_kv_host_geometry", refuse_three_layers
+                ),
+                self.assertRaisesRegex(ValueError, message),
+            ):
+                pool = _device_pool(is_mla=False, layer_num=3, head_num=2)
+                if sidecar:
+                    kv_cache_builder.prepare_hicache_staging(
+                        tp_worker=_worker(_device_pool(is_mla=False)),
+                        draft_plan=HiCacheDraftPlan(
+                            mode=HiCacheDraftMode.SIDECAR, device_pools=(pool,)
+                        ),
+                    )
+                else:
+                    kv_cache_builder.prepare_hicache_staging(tp_worker=_worker(pool))
 
     def test_uneven_mla_layer_shards_reserve_equal_host_geometry(self):
         """The shorter shard retains the reserved target row before draft layers."""

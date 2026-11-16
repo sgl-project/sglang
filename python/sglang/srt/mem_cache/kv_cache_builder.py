@@ -118,13 +118,22 @@ def prepare_hicache_staging(
                 )
             info = pool.get_device_pool_infos()[0].buffer_info
             if memory.hicache_mem_layout == "page_unified":
-                geometry = resolve_kv_host_geometry(
-                    pool,
-                    page_size=page_size,
-                    layout=memory.hicache_mem_layout,
-                    use_mla=is_mla,
-                    draft_layer_num=len(packed_drafts),
-                ).page_unified_layout
+                try:
+                    geometry = resolve_kv_host_geometry(
+                        pool,
+                        page_size=page_size,
+                        layout=memory.hicache_mem_layout,
+                        use_mla=is_mla,
+                        draft_layer_num=len(packed_drafts),
+                    ).page_unified_layout
+                except ValueError as error:
+                    if not sidecar or memory.hicache_storage_key_scheme != "unified":
+                        raise
+                    # The one flag cuts the target's kv heads and the draft's.
+                    raise ValueError(
+                        f"The draft KV pool cannot be cut into unified L3 "
+                        f"chunks: {error}"
+                    ) from error
                 assert geometry is not None
                 layer_num = geometry.layer_num
                 staging = prepare_page_unified_write_back_staging(

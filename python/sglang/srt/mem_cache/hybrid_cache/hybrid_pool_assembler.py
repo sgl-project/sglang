@@ -12,6 +12,7 @@ from sglang.srt.mem_cache.device_pool_info import (
     MLABufferInfo,
     PageRowBufferInfo,
 )
+from sglang.srt.mem_cache.hicache_key_scheme import resolve_head_group_num
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -1722,6 +1723,10 @@ def _build_mha_mla_host_pool(
     )
     if is_mha:
         host_cls, host_kwargs = _mha_host_inputs(pool, buffer_info)
+        if layout == "page_unified":
+            # The head groups the write-back staging was prepared with: the
+            # unified key grid cuts this pool's own kv heads.
+            host_kwargs["head_group_num"] = resolve_head_group_num(buffer_info.head_num)
         return host_cls(buffer_info, **host_kwargs, **kwargs)
     return MLATokenToKVPoolHost(
         buffer_info,
