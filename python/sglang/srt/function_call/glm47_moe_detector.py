@@ -357,7 +357,7 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         :param text: The complete text to parse.
         :param tools: List of available tools.
-        :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
+        :return: StreamingParseResult with normal text and parsed tool calls.
         """
         if self.bot_token not in text:
             return StreamingParseResult(normal_text=text, calls=[])

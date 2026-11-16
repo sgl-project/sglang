@@ -53,7 +53,7 @@ class MistralDetector(BaseFormatDetector):
 
         :param text: The complete text to parse.
         :param tools: List of available tools.
-        :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
+        :return: StreamingParseResult with normal text and parsed tool calls.
         """
         marker_idx = text.find(self._tool_calls_marker)
         if marker_idx == -1:
