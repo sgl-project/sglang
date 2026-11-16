@@ -50,7 +50,7 @@ nohup python3 -m sglang.launch_server \
 # 3. Startup router
 ```bash
 rm -rf router.out && \
-nohup python -m sglang_router.launch_router --worker-urls http://node1:10000 http://node2:10000 > router.out &
+nohup sgl-router --model-id /code/models/Qwen3-32B/ --no-tokenizer --worker-urls http://node1:10000 http://node2:10000 > router.out &
 ```
 
 # 4. Startup multiturn benchmark

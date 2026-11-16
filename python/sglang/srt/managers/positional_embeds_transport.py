@@ -24,8 +24,9 @@ logger = logging.getLogger(__name__)
 class PositionalEmbedsTransport:
     def __init__(self, base_gpu_id: int, mm_processor) -> None:
         parallel = get_parallel()
-        # By value otherwise: IPC needs one node, every pipeline stage would ack the
-        # slot, and the msgpack IPC encoder cannot encode the proxy.
+        # By value otherwise: IPC needs one node, and every pipeline stage would ack
+        # the slot. Msgpack IPC can carry the proxy but stays by value until the
+        # pooled path is verified under it.
         self.enabled = (
             is_cuda()
             and parallel.nnodes == 1

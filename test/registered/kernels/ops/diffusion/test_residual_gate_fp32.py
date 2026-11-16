@@ -7,7 +7,7 @@ import torch
 from sglang.kernels.ops.diffusion import residual_gate_fp32
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 requires_cuda = pytest.mark.skipif(
     not torch.cuda.is_available() or torch.version.hip is not None,

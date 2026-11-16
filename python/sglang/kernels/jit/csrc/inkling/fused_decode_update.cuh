@@ -15,6 +15,7 @@
 #include <sgl_kernel/tensor.h>  // For TensorMatcher, SymbolicSize, SymbolicDevice
 #include <sgl_kernel/utils.h>   // For RuntimeCheck, div_ceil
 
+#include <sgl_kernel/activation.cuh>
 #include <sgl_kernel/utils.cuh>  // For LaunchKernel, SGL_DEVICE
 
 #include <dlpack/dlpack.h>
@@ -92,8 +93,8 @@ __global__ void fused_decode_update_kernel(const __grid_constant__ DecodeUpdateP
   acc0 += xf.x * wv[W1].x;
   acc1 += xf.y * wv[W1].y;
   if constexpr (USE_SILU) {
-    acc0 = __fdividef(acc0, 1.0f + __expf(-acc0));
-    acc1 = __fdividef(acc1, 1.0f + __expf(-acc1));
+    acc0 = device::activation::silu(acc0);
+    acc1 = device::activation::silu(acc1);
   }
   if constexpr (USE_RESIDUAL) {
     acc0 += xf.x;
@@ -144,7 +145,7 @@ struct FusedDecodeUpdateKernel {
     auto Wd = SymbolicSize{"W"};
     auto W1s = SymbolicSize{"W_minus_1"};
     auto dev = SymbolicDevice{};
-    dev.set_options<kDLCUDA>();
+    dev.set_options<kDLGPU>();
     Wd.set_value(W);
     W1s.set_value(W - 1);
 

@@ -71,7 +71,7 @@ const valid = [
   'Revert "A legacy title without tags or scope"',
   'Revert "Revert "[Fix] attention: Fix output""',
   'Revert "x"',
-  ...['Feat', 'Fix', 'Refactor', 'Perf', 'Doc', 'Test', 'CI', 'Chore']
+  ...['Feat', 'Fix', 'Refactor', 'Perf', 'Doc', 'Test', 'CI', 'Chore', 'Misc']
     .map(type => `[${type}] attention: Update implementation`),
   '[Feat] qwen3: Add model support',
   '[Perf] [AMD] flash-attn: Optimize decode performance',
@@ -184,6 +184,12 @@ for (const versionType of ['SGLang', 'sgl-kernel', 'flashinfer', 'docs install']
 test('kernel sync helper title', async () => {
   const title = expand(titleTemplate('scripts/release/commit_and_pr_kernel_to_sglang.sh'), {
     KERNEL_VERSION: '1.2.3',
+  });
+  assert.deepEqual(await validate(title), []);
+});
+test('sgl-amd-mono pin helper title', async () => {
+  const title = expand(titleTemplate('scripts/release/commit_and_pr_sgl_amd_mono.sh'), {
+    NEW_SHORT_SHA: 'abcdef12',
   });
   assert.deepEqual(await validate(title), []);
 });

@@ -191,7 +191,7 @@ def read_video_fps(path: str) -> float | None:
 
 def load_control_frames(path: str, *, max_frames: int) -> torch.Tensor:
     """First ``max_frames`` frames of the control clip as ``uint8 [3, T, H, W]``."""
-    frames = load_video(path)
+    frames = load_video(path, max_frames=max_frames)
     if not frames:
         raise ValueError(f"No frames decoded from control video {path!r}.")
     arrays = [
@@ -502,7 +502,6 @@ class CosmosDreamsControlVideoStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         manifest = self.manifest
-        sampling_params = batch.sampling_params
         frames, hint, fps, control_path = self._load_control(batch)
         source_hw = (int(frames.shape[2]), int(frames.shape[3]))
         frames = self._fit_control(batch, frames, hint=hint, source_hw=source_hw)
@@ -599,7 +598,6 @@ class CosmosDreamsTransferPrepareStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         device = get_local_torch_device()
-        manifest = self.manifest
         geometry: CosmosDreamsGeometry = batch.extra[EXTRA_GEOMETRY]
         target_frame: int = batch.extra[EXTRA_TARGET_LATENT_FRAMES]
 

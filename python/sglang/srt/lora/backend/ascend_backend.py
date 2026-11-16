@@ -131,7 +131,6 @@ class AscendLoRABackend(BaseLoRABackend):
         total_seq_len, _ = x.shape
         _, weight_intermediate_dim, _ = qkv_lora_a.shape
         _, weight_out_dim, _ = qkv_lora_b.shape
-        max_rank = weight_intermediate_dim // n_slices
 
         if base_output is None:
             output_tensor = torch.zeros(
@@ -219,7 +218,7 @@ class AscendLoRABackend(BaseLoRABackend):
 
         return output_tensor
 
-    def init_cuda_graph_batch_info(
+    def init_decode_cuda_graph_batch_info(
         self,
         max_bs_in_cuda_graph: int,
         num_tokens_per_req: int,

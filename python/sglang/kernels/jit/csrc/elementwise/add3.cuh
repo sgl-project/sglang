@@ -65,7 +65,7 @@ struct Add3Kernel {
 
     auto N = SymbolicSize{"numel"};
     auto device = SymbolicDevice{};
-    device.set_options<kDLCUDA>();
+    device.set_options<kDLGPU>();
 
     TensorMatcher({N}).with_dtype<bf16_t>().with_device(device).verify(a).verify(b).verify(c).verify(out);
     const auto numel = N.unwrap();

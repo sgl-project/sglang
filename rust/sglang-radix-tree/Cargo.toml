@@ -5,6 +5,7 @@ edition = "2024"
 description = "Rust tree core for the Unified Radix Cache"
 license = "Apache-2.0"
 repository = "https://github.com/sgl-project/sglang"
+publish = false
 
 [package.metadata.sglang]
 python-module = "sglang.srt.mem_cache.rust_tree_core.mem_cache"
@@ -38,3 +39,7 @@ sha2 = { version = "0.10", features = ["asm"] }
 default = []
 python-extension = ["dep:pyo3", "pyo3/extension-module", "tch/python-extension"]
 inspection = []
+
+# Outside the rust/ workspace, so the workspace's ci profile does not apply here.
+[profile.ci]
+inherits = "release"

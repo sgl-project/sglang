@@ -10,8 +10,9 @@ from sglang.test.ci.ci_register import (
 )
 from sglang.test.few_shot_gsm8k import run_eval
 from sglang.test.server_fixtures.default_fixture import DefaultServerBase
+from sglang.test.test_utils import auto_config_device
 
-register_cuda_ci(est_time=66, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=65, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=48, suite="stage-b-test-1-gpu-small-amd")
 register_cpu_ci(est_time=206, suite="stage-b-test-cpu-intel")
 
@@ -29,6 +30,11 @@ class TestTransformersBackendEval(DefaultServerBase):
         "4",
         "--disable-cuda-graph",
     ]
+    if auto_config_device() == "cpu":
+        other_args += [
+            "--mem-fraction-static",
+            "0.3",
+        ]
 
     def test_gsm8k(self):
         args = SimpleNamespace(

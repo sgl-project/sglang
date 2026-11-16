@@ -52,9 +52,13 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
     sampling_params_cls = Flux3ImageSamplingParams
     _required_config_modules: list[str] = []
 
+    def validate_disagg_role(self, role: RoleType) -> None:
+        if role not in (RoleType.PROMPT_ENCODER, RoleType.IMAGE_ENCODER):
+            super().validate_disagg_role(role)
+
     def _reject_lora_on_packed_weights(self) -> None:
         super()._reject_lora_on_packed_weights()
-        if flux3_prims_ts_supports_lora():
+        if "transformer" not in self.modules or flux3_prims_ts_supports_lora():
             return
         for layer in self.get_module("transformer").modules():
             if (
@@ -68,13 +72,6 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
                     "Start with --lora-path to load the generic quantized layout."
                 )
 
-    def validate_disagg_role(self, role: RoleType) -> None:
-        if role != RoleType.MONOLITHIC:
-            raise ValueError(
-                "Flux3ImagePipeline supports same-process execution only; "
-                "disaggregated roles are not supported."
-            )
-
     def load_modules(self, server_args: ServerArgs, loaded_modules=None) -> dict:
         package = server_args.pipeline_config.flux3_package
         if loaded_modules is not None:
@@ -86,9 +83,39 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 "do not also set --quantization"
             )
 
-        pipeline_config: Flux3ImagePipelineConfig = server_args.pipeline_config
         device = get_local_torch_device()
-        cpu = torch.device("cpu")
+        role = server_args.disagg_role
+        modules = {}
+        if role.includes_stage(RoleType.DENOISER):
+            modules["transformer"] = self._load_transformer(
+                server_args, package, device
+            )
+        if role.includes_stage(RoleType.IMAGE_ENCODER) or role.includes_stage(
+            RoleType.DECODER
+        ):
+            vae_device = (
+                torch.device("cpu")
+                if server_args.should_start_component_on_cpu("vae")
+                else device
+            )
+            with torch.device("meta"):
+                vae = Flux3ImageVAE(Flux3ImageVAEConfig()).to(
+                    dtype=precision_to_dtype(package.config.vae.dtype)
+                )
+            load_model_state_dict(
+                vae, load_file(str(package.vae), device=str(vae_device)), assign=True
+            )
+            modules["vae"] = vae
+        if role.includes_stage(RoleType.PROMPT_ENCODER):
+            modules["text_encoder"] = self._load_text_encoder(
+                server_args, package, device
+            )
+        for name, module in modules.items():
+            module.requires_grad_(False).eval()
+            self.memory_usages[name] = get_memory_usage_of_component(module)
+        return modules
+
+    def _load_transformer(self, server_args, package, device):
         quant_config = resolve_flux3_image_package_quant_config(package)
         enable_prims_ts = (
             server_args.lora_path is None or flux3_prims_ts_supports_lora()
@@ -98,7 +125,7 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
                 "FLUX.3 PrimsTS is disabled because the installed FlashInfer "
                 "cannot add a dynamic LoRA delta in its GEMM epilogue."
             )
-        dit = load_flux3_image_dit(
+        return load_flux3_image_dit(
             str(package.weights),
             flux3_image_dit_config_from_package(package),
             device,
@@ -107,19 +134,15 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
             server_args=server_args,
         )
 
-        vae_device = cpu if server_args.should_start_component_on_cpu("vae") else device
-        vae_dtype = precision_to_dtype(package.config.vae.dtype)
-        with torch.device("meta"):
-            vae = Flux3ImageVAE(Flux3ImageVAEConfig()).to(dtype=vae_dtype)
-        load_model_state_dict(
-            vae, load_file(str(package.vae), device=str(vae_device)), assign=True
-        )
-
+    def _load_text_encoder(self, server_args, package, device):
+        pipeline_config: Flux3ImagePipelineConfig = server_args.pipeline_config
         text_config = package.config.text_encoder
         text_device = (
-            cpu if server_args.should_start_component_on_cpu("text_encoder") else device
+            torch.device("cpu")
+            if server_args.should_start_component_on_cpu("text_encoder")
+            else device
         )
-        text_encoder = Flux3TextEncoder(
+        return Flux3TextEncoder(
             str(package.text_encoder),
             output_layers=tuple(text_config.layers),
             pad_multiple=text_config.pad_multiple,
@@ -129,41 +152,36 @@ class Flux3ImagePipeline(LoRAPipeline, ComposedPipelineBase):
             weight_only_fp8=pipeline_config.flux3_text_encoder_fp8,
             compile_language_model=pipeline_config.flux3_compile_text_encoder,
         ).to(text_device)
-        modules = {
-            "transformer": dit,
-            "vae": vae,
-            "text_encoder": text_encoder,
-        }
-        for name, module in modules.items():
-            module.requires_grad_(False).eval()
-            self.memory_usages[name] = get_memory_usage_of_component(module)
-        return modules
 
     def create_pipeline_stages(self, server_args: ServerArgs) -> None:
         package_config = server_args.pipeline_config.flux3_package.config
-        self.add_stage(
-            Flux3ImageTextEncodeStage(
+        self.add_stage_factory(
+            RoleType.PROMPT_ENCODER,
+            lambda: Flux3ImageTextEncodeStage(
                 text_encoder=self.get_module("text_encoder"),
                 package_config=package_config,
             ),
             "flux3_text_encode",
         )
-        self.add_stage(
-            Flux3ImageConditionEncodeStage(
+        self.add_stage_factory(
+            RoleType.IMAGE_ENCODER,
+            lambda: Flux3ImageConditionEncodeStage(
                 vae=self.get_module("vae"),
                 package_config=package_config,
             ),
             "flux3_condition_encode",
         )
-        self.add_stage(
-            Flux3ImageDenoiseStage(
+        self.add_stage_factory(
+            RoleType.DENOISER,
+            lambda: Flux3ImageDenoiseStage(
                 transformer=self.get_module("transformer"),
                 package_config=package_config,
             ),
             "flux3_denoise",
         )
-        self.add_stage(
-            Flux3ImageDecodeStage(
+        self.add_stage_factory(
+            RoleType.DECODER,
+            lambda: Flux3ImageDecodeStage(
                 vae=self.get_module("vae"),
                 package_config=package_config,
             ),

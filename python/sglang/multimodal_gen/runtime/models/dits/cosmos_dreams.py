@@ -36,6 +36,10 @@ from sglang.multimodal_gen.runtime.models.dits.cosmos3video import (
     _apply_qwen3_qk_norm_rope,
     compute_mrope_position_ids_text,
 )
+from sglang.multimodal_gen.runtime.platforms import (
+    AttentionBackendEnum,
+    current_platform,
+)
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 KVPair = tuple[torch.Tensor, torch.Tensor]
@@ -94,23 +98,27 @@ def split_interleaved_action_vision_tokens(
     ]
 
 
-def null_action_token_positions(
+def null_action_token_slices(
     null_frame_indexes: Sequence[int],
     *,
     num_frames: int,
     tokens_per_frame: int,
     action_tokens_per_frame: int,
-) -> list[int]:
-    """Flat token positions of the action slots of null-action frames."""
-    positions: list[int] = []
+) -> list[slice]:
+    """Flat token slices of the action slots of null-action frames.
+
+    Slices, not a position list: indexing a device tensor with a list uploads the
+    list with a blocking copy, and the slots are zeroed in every layer.
+    """
+    slices: list[slice] = []
     for frame in null_frame_indexes:
         if frame < 0 or frame >= num_frames:
             raise ValueError(
                 f"Cosmos-Dreams null action frame {frame} is outside [0, {num_frames})"
             )
         start = frame * tokens_per_frame
-        positions.extend(range(start, start + action_tokens_per_frame))
-    return positions
+        slices.append(slice(start, start + action_tokens_per_frame))
+    return slices
 
 
 def build_cosmos_dreams_position_ids(
@@ -199,7 +207,7 @@ def _joint_attention(
     prefix_v: torch.Tensor,
     cos_sin_cache: torch.Tensor,
     rope_positions: torch.Tensor,
-    null_token_positions: list[int],
+    null_token_slices: list[slice],
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """One softmax over ``[prefix (text + history) | current chunk]``.
 
@@ -227,13 +235,24 @@ def _joint_attention(
     )
     k = k.contiguous()
     v = v.contiguous()
-    if null_token_positions:
-        v[:, null_token_positions] = 0.0
+    for null_slice in null_token_slices:
+        v[:, null_slice] = 0.0
     out = attention.attn(
         q, torch.cat([prefix_k, k], dim=1), torch.cat([prefix_v, v], dim=1)
     )
     out, _ = attention.to_out(out.reshape(batch_size, seq_len, -1))
     return out, k, v
+
+
+class CosmosDreamsCrossAttention(Cosmos3CrossAttention):
+    def __init__(self, *args, **kwargs):
+        # Prefer FlashInfer FA2 on SM12x. Backend selection still
+        # honors explicit overrides and falls back if FlashInfer is absent.
+        if current_platform.is_cuda() and current_platform.is_sm120():
+            default_backend = AttentionBackendEnum.FLASHINFER_FA2
+        else:
+            default_backend = None
+        super().__init__(*args, default_attention_backend=default_backend, **kwargs)
 
 
 class CosmosDreamsGenDecoderLayer(Cosmos3GenDecoderLayer):
@@ -292,6 +311,7 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
     """
 
     _gen_layer_cls = CosmosDreamsGenDecoderLayer
+    _cross_attention_cls = CosmosDreamsCrossAttention
 
     def __init__(
         self,
@@ -299,6 +319,10 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
         hf_config: dict[str, Any],
         quant_config: QuantizationConfig | None = None,
     ) -> None:
+        if current_platform.is_cuda() and current_platform.is_sm120():
+            self._supported_attention_backends = self._supported_attention_backends | {
+                AttentionBackendEnum.FLASHINFER_FA2
+            }
         super().__init__(config=config, hf_config=hf_config, quant_config=quant_config)
         self.manifest: CosmosDreamsManifest = load_cosmos_dreams_manifest(hf_config)
         self._validate_causal_arch(hf_config)
@@ -455,7 +479,7 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
                 position_ids.unsqueeze(1), cache_dtype=hidden.dtype
             )
         )
-        null_positions = null_action_token_positions(
+        null_slices = null_action_token_slices(
             null_action_frame_indexes,
             num_frames=num_frames,
             tokens_per_frame=action_count + patch_count,
@@ -474,7 +498,7 @@ class CosmosDreamsTransformer(Cosmos3OmniTransformer):
                 prefix_v=prefix_v,
                 cos_sin_cache=cos_sin_cache,
                 rope_positions=rope_positions,
-                null_token_positions=null_positions,
+                null_token_slices=null_slices,
             )
             current_kv.append((k, v))
 
