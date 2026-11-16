@@ -28,7 +28,7 @@ from sglang.test.test_utils import (
     popen_launch_server,
 )
 
-register_cuda_ci(est_time=144, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=146, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=32, suite="stage-b-test-1-gpu-small-amd")
 
 _MODEL_NAME = "Qwen/Qwen3-0.6B"
@@ -157,7 +157,7 @@ class TestEnableMetrics(CustomTestCase):
                         "text": "Hello, " * 100,
                         "sampling_params": {"temperature": 0, "max_new_tokens": 5},
                     },
-                    headers={"x-smg-routing-key": "test-key"},
+                    headers={"x-sgl-routing-key": "test-key"},
                 )
                 self.assertEqual(response.status_code, 200)
 

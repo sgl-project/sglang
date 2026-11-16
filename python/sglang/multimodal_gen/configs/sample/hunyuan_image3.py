@@ -6,8 +6,6 @@ from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
 
-HUNYUAN_IMAGE3_RESOLUTION_ALIGNMENT = 16
-
 VALID_BOT_TASKS = {
     "auto",
     "image",
@@ -16,16 +14,6 @@ VALID_BOT_TASKS = {
     "think_recaption",
     "img_ratio",
     "none",
-}
-
-SYSTEM_PROMPT_PRESETS = {
-    "none",
-    "en_unified",
-    "en_vanilla",
-    "en_recaption",
-    "en_think_recaption",
-    "dynamic",
-    "auto",
 }
 
 
@@ -40,7 +28,7 @@ class HunyuanImage3SamplingParams(SamplingParams):
     # no bot prefix in gen_image mode.
     bot_task: str = "image"
 
-    # Preset name (see SYSTEM_PROMPT_PRESETS) or raw custom text.
+    # Preset name (see hunyuan_image3/prompts.py) or raw custom text.
     system_prompt: str | None = "en_unified"
 
     # Pre-generated CoT text from AR stage (think/recaption output)
@@ -66,6 +54,10 @@ class HunyuanImage3SamplingParams(SamplingParams):
             (1280, 720),  # 16:9 landscape
         ]
     )
+
+    @classmethod
+    def image_request_extra_fields(cls) -> frozenset[str]:
+        return frozenset({"bot_task", "system_prompt", "cot_text"})
 
     def _adjust(self, server_args):
         # Pre-aligning each dimension to a 16-px grid here would distort the
@@ -103,18 +95,3 @@ class HunyuanImage3SamplingParams(SamplingParams):
             or not 0.0 <= (self.output_pad_value) <= 1.0
         ):
             raise ValueError("output_pad_value must be a finite value in [0, 1]")
-
-
-def align_hunyuan_image3_dimension(value: int) -> int:
-    """Round a HunyuanImage-3 dimension up to a supported multiple."""
-    return max(
-        HUNYUAN_IMAGE3_RESOLUTION_ALIGNMENT,
-        (value + HUNYUAN_IMAGE3_RESOLUTION_ALIGNMENT - 1)
-        // HUNYUAN_IMAGE3_RESOLUTION_ALIGNMENT
-        * HUNYUAN_IMAGE3_RESOLUTION_ALIGNMENT,
-    )
-
-
-def align_hunyuan_image3_resolution(width: int, height: int) -> tuple[int, int]:
-    """Align both width and height to supported multiples."""
-    return align_hunyuan_image3_dimension(width), align_hunyuan_image3_dimension(height)

@@ -24,6 +24,7 @@ import triton.language as tl
 
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.models.utils import bind_or_assign
 from sglang.srt.utils import is_cuda, is_hip, is_npu
 
 _BLOCK_H: int = 1024  # H = 7168 = 7 x 1024
@@ -67,6 +68,8 @@ def get_cw(
     proj: ReplicatedLinear,
     norm: RMSNorm,
     dtype: torch.dtype = torch.float32,
+    *,
+    refresh: bool = False,
 ) -> torch.Tensor:
     """Cached product norm_weight ⊙ proj_weight (both [H]) in `dtype`.
 
@@ -77,9 +80,10 @@ def get_cw(
         cache = {}
         proj._attn_res_cw_cache = cache
     cw = cache.get(dtype)
-    if cw is None:
-        cw = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
-        cw = cache[dtype] = cw.to(dtype)
+    if cw is None or refresh:
+        # Refresh in place: captured graphs retain the original cache storage.
+        updated = (norm.weight.float() * proj.weight.squeeze().float()).contiguous()
+        cw = cache[dtype] = bind_or_assign(cw, updated.to(dtype))
     return cw
 
 
@@ -133,7 +137,7 @@ def _score_kernel(
     BLOCK_H: tl.constexpr,
 ):
     """One CTA per (token, row): scan H, output one scalar score."""
-    pid_t = tl.program_id(0)
+    pid_t = tl.program_id(0).to(tl.int64)  # pid_t * stride_bm overflows int32
     j = tl.program_id(1)
     if j > NVB:
         return
@@ -174,7 +178,7 @@ def _combine_kernel(
     Softmax is redundantly computed by each H-chunk CTA (≤16 elements, trivial).
     This gives full H-parallelism: 7 CTAs for H=7168/1024.
     """
-    pid_t = tl.program_id(0)
+    pid_t = tl.program_id(0).to(tl.int64)  # pid_t * stride_bm overflows int32
     pid_h = tl.program_id(1)
     h0 = pid_h * BLOCK_H
 

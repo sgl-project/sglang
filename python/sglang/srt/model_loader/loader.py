@@ -41,6 +41,9 @@ import numpy as np
 import torch
 
 from sglang.srt.constants import GIB_BYTES
+from sglang.srt.kernel_plugins.amd.binding import (
+    monokernel_weights_iterator,
+)
 from sglang.srt.model_loader.post_load import stage_module_for_post_load
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     RemoteInstanceWeightLoaderBackend,
@@ -52,6 +55,7 @@ from sglang.srt.runtime_context import (
     get_model,
     get_parallel,
     get_server_args,
+    get_spec,
 )
 from sglang.srt.utils import get_available_gpu_memory
 
@@ -83,14 +87,17 @@ from sglang.srt.distributed import (
     model_parallel_is_initialized,
 )
 from sglang.srt.layers.layer_boundary.stage import check_stage_producers
+from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.modelopt_utils import QUANT_CFG_CHOICES
 from sglang.srt.layers.moe.utils import (
-    install_shared_experts_fusion_decision,
+    resolve_shared_experts_config,
 )
 from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from sglang.srt.layers.quantization.unquant import finalize_gfx115_weight_padding
+from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.model_loader.remote_instance_weight_loader_utils import (
     trigger_transferring_weights_request,
 )
@@ -98,13 +105,14 @@ from sglang.srt.model_loader.utils import (
     get_model_architecture,
     set_default_torch_dtype,
 )
-from sglang.srt.utils.common import is_cuda_alike
+from sglang.srt.utils.device import is_cuda_alike
 
 # Constants for memory management
 DEFAULT_GPU_MEMORY_FRACTION_FOR_CALIBRATION = (
     0.8  # Reserve 20% GPU memory headroom for ModelOpt calibration
 )
 from sglang.srt.environ import envs
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.model_loader.weight_utils import (
     CheckpointFilePrefetchHandle,
     _prefetch_all_checkpoints,
@@ -134,9 +142,7 @@ from sglang.srt.utils import (
     is_npu,
     is_pin_memory_available,
     rank0_log,
-    set_weight_attrs,
 )
-from sglang.srt.utils.common import temp_set_env
 
 if TYPE_CHECKING:
     from sglang.srt.configs.device_config import DeviceConfig
@@ -165,6 +171,20 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
 
 
 logger = logging.getLogger(__name__)
+
+# The checkpoint files the default loader read, as (folder, files), by the weight source's
+# (model id or path, revision): state derived from the loaded weights (Paged Experts' expert
+# cache) keys on the files this start read, wherever they were found (a hub cache,
+# --download-dir, ModelScope).
+_checkpoint_files: Dict[Tuple[str, Optional[str]], Tuple[str, Tuple[str, ...]]] = {}
+
+
+def loaded_checkpoint_files(
+    model_or_path: str, revision: Optional[str]
+) -> Optional[Tuple[str, Tuple[str, ...]]]:
+    """The folder and the files the default loader read the weights of ``model_or_path`` at
+    ``revision`` from in this process, or None if it did not load them."""
+    return _checkpoint_files.get((model_or_path, revision))
 
 
 def _get_quantization_config(
@@ -214,6 +234,14 @@ def _get_quantization_config(
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
             return None
+        if _is_npu and model_config.quantization == "modelslim":
+            draft_kv_cache_dtype = get_spec().speculative_draft_kv_cache_dtype
+            requested_dtype = (
+                draft_kv_cache_dtype
+                if model_config.is_draft_model and draft_kv_cache_dtype is not None
+                else get_model().kv_cache_dtype
+            )
+            quant_config.configure_kv_cache_quantization(requested_dtype)
         from sglang.srt.layers.quantization.fp8 import Fp8Config
 
         if isinstance(quant_config, Fp8Config):
@@ -278,6 +306,21 @@ def _get_quantization_config(
     return None
 
 
+def built_quant_config(
+    model_config: ModelConfig,
+    load_config: LoadConfig,
+) -> Optional[QuantizationConfig]:
+    """The quant config the built model keeps: the loader's, unless its class
+    narrows it with ``own_quant_config(hf_config, quant_config)``, which the
+    constructor must apply too."""
+    quant_config = _get_quantization_config(model_config, load_config)
+    model_class, _ = get_model_architecture(model_config)
+    own_quant_config = getattr(model_class, "own_quant_config", None)
+    if own_quant_config is None:
+        return quant_config
+    return own_quant_config(model_config.hf_config, quant_config)
+
+
 def _initialize_model(
     model_config: ModelConfig,
     load_config: LoadConfig,
@@ -285,11 +328,7 @@ def _initialize_model(
 ) -> nn.Module:
     """Initialize a model with the given configurations."""
     model_class, _ = get_model_architecture(model_config)
-    # Decide the shared-experts-fusion question here, once per runner, before any
-    # layer exists: this is the only place a model class is instantiated, and it
-    # is the last point that still knows both the checkpoint's quantization and
-    # (through the build scope) whether this runner is a draft.
-    install_shared_experts_fusion_decision(
+    shared_experts = resolve_shared_experts_config(
         model_class, model_config.hf_config, quant_config
     )
     kwargs = {
@@ -305,8 +344,10 @@ def _initialize_model(
     if load_config.draft_model_idx is not None:
         kwargs["draft_model_idx"] = load_config.draft_model_idx
 
-    model = model_class(**kwargs)
-    check_stage_producers(model)
+    with get_model().override(shared_experts=shared_experts):
+        model = model_class(**kwargs)
+        check_stage_producers(model)
+    model.shared_experts_config = shared_experts
     return model
 
 
@@ -628,6 +669,10 @@ class DefaultModelLoader(BaseModelLoader):
             hf_folder = resolved_source.hf_folder
             hf_weights_files = list(resolved_source.weight_files)
             use_safetensors = resolved_source.use_safetensors
+        _checkpoint_files[(source.model_or_path, source.revision)] = (
+            hf_folder,
+            tuple(hf_weights_files),
+        )
 
         if self.load_config.load_format == LoadFormat.NPCACHE:
             # Currently np_cache only support *.bin checkpoints
@@ -871,11 +916,6 @@ class DefaultModelLoader(BaseModelLoader):
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is None:
                     continue
-                if (
-                    hasattr(module, "is_weights_quantized")
-                    and module.is_weights_quantized()
-                ):
-                    continue
                 quant_method.process_weights_after_loading(module)
         return model.eval()
 
@@ -931,7 +971,7 @@ class DefaultModelLoader(BaseModelLoader):
                 local_files_only=huggingface_hub.constants.HF_HUB_OFFLINE,
             )
         except (KeyError, ValueError):
-            from sglang.srt.utils.hf_transformers_utils import get_config
+            from sglang.srt.hf_transformers import get_config
 
             hf_config = get_config(
                 model_config.model_path,
@@ -1057,22 +1097,11 @@ class DefaultModelLoader(BaseModelLoader):
                 for name, loaded_weight in weights
             )
 
-        if is_nvfp4_online or is_modelopt_fp4_online:
-            # Scope exact FP4 quantization math to load-time conversion only;
-            # restore the original environment before serving starts.
-            with temp_set_env(
-                FLASHINFER_DISABLE_FP4_QUANT_FAST_MATH="1",
-                FLASHINFER_NVFP4_4OVER6="1",
-                FLASHINFER_NVFP4_4OVER6_E4M3_USE_256="0",
-                FLASHINFER_NVFP4_4OVER6_ERR_MODE="MSE",
-                FLASHINFER_NVFP4_4OVER6_ERR_USE_FAST_MATH="1",
-            ):
-                model.load_weights(weights)
-            if target_device.type == "cuda":
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-        else:
-            model.load_weights(weights)
+        weights = monokernel_weights_iterator(model=model, weights=weights)
+        model.load_weights(weights)
+        if (is_nvfp4_online or is_modelopt_fp4_online) and target_device.type == "cuda":
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
         # Used in tests to verify memory savings when using online quantization.
         if is_cuda_alike():
@@ -1096,6 +1125,7 @@ class DefaultModelLoader(BaseModelLoader):
             # parameters onto device for processing and back off after.
             with device_loading_context(module, target_device):
                 quant_method.process_weights_after_loading(module)
+        finalize_gfx115_weight_padding(model)
 
     @staticmethod
     def restore_weights_before_loading(model, target_device):
@@ -1506,7 +1536,7 @@ class DummyModelLoader(BaseModelLoader):
         device_config: DeviceConfig,
     ) -> nn.Module:
 
-        if get_bool_env_var("SGL_CPU_QUANTIZATION"):
+        if envs.SGLANG_CPU_QUANTIZATION.get():
             return load_model_with_cpu_quantization(
                 self, model_config=model_config, device_config=device_config
             )
@@ -1530,12 +1560,6 @@ class DummyModelLoader(BaseModelLoader):
             for _, module in model.named_modules():
                 quant_method = getattr(module, "quant_method", None)
                 if quant_method is not None:
-                    # Skip FusedMoE layers already quantized during init (FP8 or FP4)
-                    if (
-                        hasattr(module, "is_weights_quantized")
-                        and module.is_weights_quantized()
-                    ):
-                        continue
                     quant_method.process_weights_after_loading(module)
 
         return model.eval()
@@ -1772,7 +1796,9 @@ class PreshardedModelLoader(DefaultModelLoader):
         model_config: ModelConfig,
         device_config: DeviceConfig,
     ) -> nn.Module:
-        shard_config = self._collect_shard_config(model_config)
+        shard_config = self._collect_shard_config(
+            model_config, torch.device(device_config.device)
+        )
         presharded_dir = self._presharded_dir(model_config, shard_config)
         if self._presharded_ready(presharded_dir) and self._shard_config_matches(
             presharded_dir, shard_config
@@ -1809,7 +1835,9 @@ class PreshardedModelLoader(DefaultModelLoader):
             root = os.path.join(model_config.model_path, self.DEFAULT_SUBDIR)
         return os.path.join(root, subfolder)
 
-    def _collect_shard_config(self, model_config: ModelConfig) -> Dict[str, Any]:
+    def _collect_shard_config(
+        self, model_config: ModelConfig, target_device: Optional[torch.device] = None
+    ) -> Dict[str, Any]:
         def _safe(fn) -> int:
             try:
                 return fn()
@@ -1817,9 +1845,13 @@ class PreshardedModelLoader(DefaultModelLoader):
                 return 1
 
         from sglang.srt.layers.dp_attention import get_moe_cp_size
+        from sglang.srt.layers.moe.utils import (
+            get_moe_a2a_backend,
+            get_moe_runner_backend,
+        )
 
         parallel = get_parallel()
-        return {
+        shard_config = {
             "tp": _safe(lambda: parallel.tp_size),
             "dp": _safe(get_moe_cp_size),
             "ep": _safe(lambda: parallel.moe_ep_size),
@@ -1837,6 +1869,20 @@ class PreshardedModelLoader(DefaultModelLoader):
             ),
             "structural_signature": self._compute_structural_signature(model_config),
         }
+        a2a_backend = get_moe_a2a_backend()
+        if get_moe_runner_backend().is_flashinfer_cutedsl() and (
+            a2a_backend.is_none() or a2a_backend.is_flashinfer()
+        ):
+            from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (
+                use_cutedsl_moe_swap_ab,
+            )
+
+            # Presharded files contain processed rows; equal shapes do not
+            # distinguish old up64/gate64 weights from swap-AB up16/gate16.
+            shard_config["flashinfer_cutedsl_swap_ab"] = use_cutedsl_moe_swap_ab(
+                target_device or torch.device(current_platform.device_type)
+            )
+        return shard_config
 
     @staticmethod
     def _normalize_init_expert_location(value: Optional[str]) -> Optional[str]:
@@ -2060,14 +2106,8 @@ class PreshardedModelLoader(DefaultModelLoader):
     @staticmethod
     def _rebind_parameter_aliases(model: nn.Module) -> None:
         for _, module in model.named_modules():
-            gemma_w = getattr(module, "gemma_weight", None)
-            weight = getattr(module, "weight", None)
-            if (
-                isinstance(gemma_w, torch.Tensor)
-                and isinstance(weight, torch.nn.Parameter)
-                and gemma_w.shape == weight.shape
-            ):
-                torch.add(weight.data, 1.0, out=gemma_w)
+            if isinstance(module, GemmaRMSNorm):
+                module.refresh_gemma_weight()
 
             attn = getattr(module, "attn", None)
             conv1d = getattr(module, "conv1d", None)
@@ -2080,13 +2120,8 @@ class PreshardedModelLoader(DefaultModelLoader):
             if conv1d is None:
                 continue
             cweight = getattr(conv1d, "weight", None)
-            if cweight is not None and hasattr(attn, "conv_weights"):
-                if cweight.dim() == 3 and cweight.size(1) == 1:
-                    attn.conv_weights = cweight.view(cweight.size(0), cweight.size(2))
-                else:
-                    attn.conv_weights = (
-                        cweight.squeeze() if cweight.dim() > 2 else cweight
-                    )
+            if cweight is not None and isinstance(attn, RadixLinearAttention):
+                attn.refresh_conv_weights(cweight)
             if hasattr(conv1d, "bias") and hasattr(attn, "bias"):
                 attn.bias = conv1d.bias
 
@@ -4225,23 +4260,6 @@ def get_model_loader(
         in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed", "modelopt"]
     ):
         logger.info("Using ModelOptModelLoader due to ModelOpt quantization config.")
-        return ModelOptModelLoader(load_config)
-
-    # Use ModelOptModelLoader for unified quantization flags
-    if (
-        model_optloader_allowed
-        and hasattr(model_config, "quantization")
-        and model_config.quantization
-        in ["modelopt_fp8", "modelopt_fp4", "modelopt_mixed"]
-    ):
-        if model_config._is_already_quantized():
-            logger.info(
-                f"Using ModelOptModelLoader for pre-quantized model: {model_config.quantization}"
-            )
-        else:
-            logger.info(
-                f"Using ModelOptModelLoader for quantization: {model_config.quantization}"
-            )
         return ModelOptModelLoader(load_config)
 
     if load_config.load_format == LoadFormat.SHARDED_STATE:

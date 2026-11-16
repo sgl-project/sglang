@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import operator
+from functools import cache
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import torch
@@ -12,11 +14,17 @@ from sglang.srt.constrained.base_grammar_backend import (
     GrammarMask,
     GrammarRow,
 )
-from sglang.srt.runtime_context import get_exec
-from sglang.srt.sampling.custom_logit_processor import CustomLogitProcessor
+from sglang.srt.environ import envs
+from sglang.srt.platforms import current_platform
+from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule, get_spec
+from sglang.srt.sampling.custom_logit_processor import (
+    UOCR_PAGE_GUARD_PROCESSOR,
+    CustomLogitProcessor,
+)
 from sglang.srt.sampling.penaltylib.repetition_penalty import apply_scaling_penalties
 from sglang.srt.sampling.sampling_params import TOP_K_ALL
-from sglang.srt.utils.common import is_pin_memory_available
+from sglang.srt.sampling.watermarking.core import build_watermark_batch_config
+from sglang.srt.utils.device import is_pin_memory_available
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -101,6 +109,12 @@ class SamplingBatchInfo:
     # Per-row top_k of mask requests (1 elsewhere); bounds the capture width.
     sampling_mask_top_ks: Optional[List[int]] = None
 
+    watermark_keys: Optional[torch.Tensor] = None
+    watermark_context_windows: Optional[torch.Tensor] = None
+    watermark_enabled: Optional[torch.Tensor] = None
+    watermark_candidates_host: Optional[List[bool]] = None
+    has_watermark_candidates: bool = False
+
     # Device
     device: str = "cuda"
 
@@ -113,7 +127,8 @@ class SamplingBatchInfo:
 
     # Host-side upper bound on every row's top_k, or None when some row samples
     # from the whole vocabulary. Any value >= the true max stays exact, so
-    # filter_batch keeps it unchanged.
+    # filter_batch keeps it unchanged (ScheduleBatch tightens it with
+    # refresh_top_k_flags).
     max_top_k: Optional[int] = None
 
     @classmethod
@@ -189,10 +204,15 @@ class SamplingBatchInfo:
                 )
 
         # Check if any request has custom logit processor
-        has_custom_logit_processor = (
-            get_exec().features.enable_custom_logit_processor
-            and any(r.custom_logit_processor for r in reqs)  # check the flag first.
-        )  # then check the requests.
+        enable_custom_processor = get_exec().features.enable_custom_logit_processor
+        has_custom_logit_processor = any(
+            r.custom_logit_processor
+            and (
+                enable_custom_processor
+                or r.custom_logit_processor == UOCR_PAGE_GUARD_PROCESSOR
+            )
+            for r in reqs
+        )
         return_sampling_masks = [r.return_sampling_mask for r in reqs]
         return_sampling_support_logprobs = [
             r.return_sampling_mask and r.sampling_logprobs_mode == "support"
@@ -201,6 +221,29 @@ class SamplingBatchInfo:
         sampling_mask_batch_indices = cls._make_sampling_mask_batch_indices(
             return_sampling_masks, device
         )
+        from sglang.srt.managers.schedule_batch import ScheduleBatch
+
+        features = get_exec().features
+        if isinstance(batch, ScheduleBatch) and features.enable_watermark:
+            watermark_config = build_watermark_batch_config(
+                reqs,
+                default_key=features.watermark_key,
+                default_context_window=features.watermark_context_window,
+                default_enabled=features.watermark_default_enabled,
+                enforce_all=features.watermark_enforce_all,
+                device=device,
+            )
+            watermark_keys = watermark_config.keys
+            watermark_context_windows = watermark_config.context_windows
+            watermark_enabled = watermark_config.enabled
+            watermark_candidates_host = watermark_config.candidates_host
+            has_watermark_candidates = watermark_config.has_candidates
+        else:
+            watermark_keys = None
+            watermark_context_windows = None
+            watermark_enabled = None
+            watermark_candidates_host = None
+            has_watermark_candidates = False
         sampling_support_logprobs_capture_indices = (
             cls._make_sampling_support_logprobs_capture_indices(
                 return_sampling_masks,
@@ -260,19 +303,9 @@ class SamplingBatchInfo:
             top_ks=top_ks,
             min_ps=min_ps,
             sampling_seed=sampling_seed,
-            is_all_greedy=all(r.sampling_params.top_k <= 1 for r in reqs),
-            is_any_greedy=any(r.sampling_params.top_k <= 1 for r in reqs),
             need_top_p_sampling=any(r.sampling_params.top_p != 1.0 for r in reqs),
-            need_top_k_sampling=any(r.sampling_params.top_k != TOP_K_ALL for r in reqs),
             need_min_p_sampling=any(r.sampling_params.min_p > 0 for r in reqs),
-            npu_top_k_top_p_eligible=all(
-                1 <= r.sampling_params.top_k <= 1024 for r in reqs
-            ),
-            max_top_k=(
-                max(r.sampling_params.top_k for r in reqs)
-                if reqs and all(1 <= r.sampling_params.top_k < TOP_K_ALL for r in reqs)
-                else None
-            ),
+            **_top_k_flags([r.sampling_params.top_k for r in reqs]),
             vocab_size=vocab_size,
             penalizer_orchestrator=penalizer_orchestrator,
             has_custom_logit_processor=has_custom_logit_processor,
@@ -283,6 +316,11 @@ class SamplingBatchInfo:
             return_sampling_masks=return_sampling_masks,
             return_sampling_support_logprobs=return_sampling_support_logprobs,
             sampling_mask_batch_indices=sampling_mask_batch_indices,
+            watermark_keys=watermark_keys,
+            watermark_context_windows=watermark_context_windows,
+            watermark_enabled=watermark_enabled,
+            watermark_candidates_host=watermark_candidates_host,
+            has_watermark_candidates=has_watermark_candidates,
             sampling_support_logprobs_capture_indices=(
                 sampling_support_logprobs_capture_indices
             ),
@@ -440,10 +478,19 @@ class SamplingBatchInfo:
             "top_ks",
             "min_ps",
             "sampling_seed",
+            "watermark_keys",
+            "watermark_context_windows",
+            "watermark_enabled",
         ]:
             value = getattr(self, item, None)
             if value is not None:
                 setattr(self, item, value[keep_indices_device])
+
+        if self.watermark_candidates_host is not None:
+            self.watermark_candidates_host = [
+                self.watermark_candidates_host[index] for index in keep_indices
+            ]
+            self.has_watermark_candidates = any(self.watermark_candidates_host)
 
         if self.logit_bias is not None:
             self.logit_bias = self.logit_bias[keep_indices_device]
@@ -570,11 +617,21 @@ class SamplingBatchInfo:
             "top_ks",
             "min_ps",
             "sampling_seed",
+            "watermark_keys",
+            "watermark_context_windows",
+            "watermark_enabled",
         ]:
             self_val = getattr(self, item, None)
             other_val = getattr(other, item, None)
             if self_val is not None and other_val is not None:
                 setattr(self, item, torch.cat([self_val, other_val]))
+
+        if (
+            self.watermark_candidates_host is not None
+            and other.watermark_candidates_host is not None
+        ):
+            self.watermark_candidates_host.extend(other.watermark_candidates_host)
+            self.has_watermark_candidates = any(self.watermark_candidates_host)
 
         self.is_all_greedy &= other.is_all_greedy
         self.is_any_greedy |= other.is_any_greedy
@@ -589,6 +646,17 @@ class SamplingBatchInfo:
         )
 
         self.adjusted_merge_batch(other)
+
+    def refresh_top_k_flags(self, top_ks: List[int]) -> None:
+        """Set the top-k flags from the rows' top_k, as from_schedule_batch does.
+
+        filter_batch leaves them as they were, which is safe but sticky: one
+        finished greedy row (top_k=1) keeps need_top_k_sampling on and max_top_k
+        None for the rest of the running batch. ScheduleBatch.filter_batch calls
+        this with its kept requests' top_k.
+        """
+        for name, value in _top_k_flags(top_ks).items():
+            setattr(self, name, value)
 
     def _merge_processor_entries(
         self, other: SamplingBatchInfo
@@ -625,7 +693,43 @@ class SamplingBatchInfo:
     def copy_for_forward(self):
         # Accumulate the penalty into a pre-allocated buffer to get rid of the dependency of `penalizer_orchestrator` later
         self.update_penalties()
+        if _fast_copy_enabled() and type(self) is SamplingBatchInfo:
+            new = object.__new__(SamplingBatchInfo)
+            new.__dict__.update(zip(_FIELD_NAMES, _FIELD_GETTER(self.__dict__)))
+            new.penalizer_orchestrator = None
+            return new
         return dataclasses.replace(self, penalizer_orchestrator=None)
+
+
+@cache
+def _fast_copy_enabled() -> bool:
+    # Preserve the original EAGLE runtime policy without the resource-pool dependency.
+    return (
+        current_platform.is_cuda()
+        and envs.SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH.get()
+        and (get_spec().speculative_algorithm or "").upper() == "EAGLE"
+        and (get_spec().speculative_eagle_topk or 1) == 1
+        and not get_schedule().disable_overlap_schedule
+        and get_parallel().moe_ep_size == 1
+    )
+
+
+_FIELD_NAMES = tuple(f.name for f in dataclasses.fields(SamplingBatchInfo))
+_FIELD_GETTER = operator.itemgetter(*_FIELD_NAMES)
+
+
+def _top_k_flags(top_ks: List[int]) -> Dict[str, Any]:
+    """The SamplingBatchInfo flags that follow from the rows' top_k values."""
+    return {
+        "is_all_greedy": all(k <= 1 for k in top_ks),
+        "is_any_greedy": any(k <= 1 for k in top_ks),
+        "need_top_k_sampling": any(k != TOP_K_ALL for k in top_ks),
+        "npu_top_k_top_p_eligible": all(1 <= k <= 1024 for k in top_ks),
+        # None when any row samples the whole vocabulary.
+        "max_top_k": (
+            max(top_ks) if top_ks and all(1 <= k < TOP_K_ALL for k in top_ks) else None
+        ),
+    }
 
 
 def merge_bias_tensor(

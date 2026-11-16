@@ -264,14 +264,15 @@ def get_architecture_class_name(model_config: ModelConfig) -> str:
 
 
 def should_deepgemm_weight_requant_ue8m0(
-    weight_block_size, output_dtype=None, weight_shape=None
+    weight_block_size, output_dtype=None, weight_shape=None, *, grouped_moe=False
 ):
     """Should we requant fp8 weights into UE8M0 format when loading the model.
 
     When output_dtype or weight_shape are provided, also checks that DeepGEMM
-    can actually run this layer at runtime (bf16 output, N%64==0, K%128==0).
-    Without these checks, scales would be converted to UE8M0 but the GEMM would
-    fall back to triton which expects float32 scales, causing wrong results.
+    can actually run this layer at runtime (bf16 output, N%64==0, K%128==0, or
+    K a multiple of the block for grouped MoE). Without these checks, scales
+    would be converted to UE8M0 but the GEMM would fall back to triton which
+    expects float32 scales, causing wrong results.
     """
     if not (
         deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
@@ -281,12 +282,13 @@ def should_deepgemm_weight_requant_ue8m0(
         return False
     # SM120 routes dense block-FP8 GEMMs to CUTLASS/Triton (fp32 scales);
     # only the grouped MoE GEMM consumes DeepGEMM layouts there.
-    if get_device_sm() == 120:
+    if get_device_sm() == 120 and not grouped_moe:
         return False
     if output_dtype is not None and output_dtype != torch.bfloat16:
         return False
+    k_alignment = weight_block_size[1] if grouped_moe else 128
     if weight_shape is not None and (
-        weight_shape[0] % 64 != 0 or weight_shape[1] % 128 != 0
+        weight_shape[0] % 64 != 0 or weight_shape[1] % k_alignment != 0
     ):
         return False
     return True

@@ -2,7 +2,7 @@
 
 The public :func:`helion_fused_recurrent_kda_replayssm_decode` mirrors
 ``fused_recurrent_linear_replayssm_decode(..., is_kda=True)`` from
-``sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm``.  That
+``sglang.kernels.ops.attention.linear.fused_recurrent_linear_replayssm``.  That
 Triton kernel is gate-generic (GDN scalar gate / KDA per-K gate); this module
 implements the KDA path only, and additionally supports the bounded gate,
 which the Triton ReplaySSM kernel does not expose.

@@ -4,7 +4,12 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from sglang.kernels.jit.utils import cache_once, load_jit, make_cpp_args
+from sglang.kernels.jit.utils import (
+    cache_once,
+    is_arch_support_pdl,
+    load_jit,
+    make_cpp_args,
+)
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -22,8 +27,11 @@ _MAX_N = 32768  # very large N is served well by cuBLAS already
 
 
 def _config(n: int) -> tuple[int, int, int]:
-    """(rows_per_warp, k_unroll, num_warps)."""
-    if n >= 8192:
+    """(rows_per_warp, k_unroll, num_warps); tuned DRAM-cold on RTX PRO 6000."""
+    if n > 8192:
+        return (4, 1, 8)
+    if n == 8192:
+        # Four rows measured slower than two at (8192, 5120) DRAM-cold.
         return (2, 1, 8)
     return (1, 1, 8)
 
@@ -31,7 +39,7 @@ def _config(n: int) -> tuple[int, int, int]:
 @cache_once
 def _jit_sm120_fp8_gemv_module(n: int, k: int) -> Module:
     rows, unroll, warps = _config(n)
-    args = make_cpp_args(n, k, rows, unroll, warps)
+    args = make_cpp_args(n, k, rows, unroll, warps, is_arch_support_pdl())
     return load_jit(
         "sm120_fp8_gemv",
         *args,
@@ -42,9 +50,11 @@ def _jit_sm120_fp8_gemv_module(n: int, k: int) -> Module:
 
 
 def use_sm120_fp8_gemv(m: int, n: int, k: int) -> bool:
+    # kUnroll==1 guards k < K in-loop, so K needs only 16B alignment;
+    # 128 keeps margin and still admits K=5376.
     return (
         m == 1
-        and k % 512 == 0
+        and k % 128 == 0
         and 512 <= k <= _MAX_K
         and n % 16 == 0
         and 256 <= n <= _MAX_N

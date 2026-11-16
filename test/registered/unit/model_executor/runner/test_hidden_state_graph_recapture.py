@@ -5,10 +5,9 @@ from unittest.mock import Mock
 from sglang.srt.model_executor.cpu_graph_runner import CPUGraphRunner
 from sglang.srt.model_executor.cuda_graph_config import Backend
 from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardMode,
     get_server_return_hidden_states_mode,
 )
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
     DecodeCudaGraphRunner,
 )
@@ -74,6 +73,7 @@ class TestHiddenStateGraphRecapture(CustomTestCase):
         runner.capture_hidden_mode = capture_hidden_mode
         runner.capture_num_tokens = [4]
         runner.max_context_size = None
+        runner.max_seq_len = None
         runner.max_num_tokens = 4
         return runner
 

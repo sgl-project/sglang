@@ -17,6 +17,9 @@ from dateutil.tz import UTC
 
 import sglang
 import sglang.multimodal_gen.envs as envs
+from sglang.multimodal_gen.runtime.managers.request_cancel_error import (
+    RequestCancelledError,
+)
 from sglang.multimodal_gen.runtime.observability.metrics import get_metrics
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.utils.logging_utils import (
@@ -51,7 +54,7 @@ class MemorySnapshot:
         }
 
 
-@dataclasses.dataclass
+@dataclasses.dataclass(eq=False)
 class RequestMetrics:
     """Performance metrics for a single request, including timings and memory snapshots."""
 
@@ -60,9 +63,6 @@ class RequestMetrics:
         self.stages: Dict[str, float] = {}
         self.denoising_stages: set[str] = set()
         self.steps: list[float] = []
-        self.steps_by_stage: Dict[str, list[float]] = {}
-        self.stage_iterations: Dict[str, tuple[int, int]] = {}
-        self.active_stage_name: str | None = None
         self.total_duration_ms: float = 0.0
         self.suppress_stage_breakdown: bool = False
         # Set on the first request after a failed request-based warmup: its
@@ -85,26 +85,7 @@ class RequestMetrics:
         """Records the duration of a denoising step in execution order."""
         if self.suppress_stage_breakdown:
             return
-        duration_ms = duration_s * 1000
-        self.steps.append(duration_ms)
-        if self.active_stage_name is not None:
-            self.steps_by_stage.setdefault(self.active_stage_name, []).append(
-                duration_ms
-            )
-
-    def record_stage_iterations(
-        self, measured_iterations: int, target_iterations: int
-    ) -> None:
-        """Record calibration and default-workload iterations for this stage."""
-        if self.suppress_stage_breakdown or self.active_stage_name is None:
-            return
-        measured = max(1, int(measured_iterations))
-        target = max(1, int(target_iterations))
-        previous = self.stage_iterations.get(self.active_stage_name, (0, 0))
-        self.stage_iterations[self.active_stage_name] = (
-            previous[0] + measured,
-            previous[1] + target,
-        )
+        self.steps.append(duration_s * 1000)
 
     def record_memory_snapshot(self, checkpoint_name: str, snapshot: MemorySnapshot):
         if self.suppress_stage_breakdown:
@@ -148,7 +129,9 @@ def get_git_commit_hash() -> str:
         if not commit_hash:
             commit_hash = (
                 subprocess.check_output(
-                    ["git", "rev-parse", "HEAD"], stderr=subprocess.DEVNULL
+                    ["git", "rev-parse", "HEAD"],
+                    stderr=subprocess.DEVNULL,
+                    cwd=os.path.dirname(os.path.abspath(sglang.__file__)),
                 )
                 .strip()
                 .decode("utf-8")
@@ -365,6 +348,9 @@ class StageProfiler:
         execution_time_s = time.perf_counter() - self.start_time
 
         if exc_type:
+            # each rank stops a cancelled request; the worker logs it once
+            if issubclass(exc_type, RequestCancelledError):
+                return False
             self.logger.error(
                 "[%s] Error during execution after %.4f ms: %s",
                 self.stage_name,
@@ -462,7 +448,7 @@ class PerformanceLogger:
     def log_request_summary(
         cls,
         metrics: "RequestMetrics",
-        tag: str = "total_inference_time",
+        tag: str = "pipeline_stage_metrics",
     ):
         """logs the stage metrics and total duration for a completed request
         to the performance_log file.
@@ -486,7 +472,7 @@ class PerformanceLogger:
         record = RequestPerfRecord(
             metrics.request_id,
             commit_hash=get_git_commit_hash(),
-            tag="pipeline_stage_metrics",
+            tag=tag,
             stages=formatted_stages,
             steps=metrics.steps,
             total_duration_ms=metrics.total_duration_ms,

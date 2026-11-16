@@ -9,10 +9,10 @@ import torch
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_kda_packed_decode,
 )
-from sglang.kernels.ops.attention.fla.fused_recurrent_linear_replayssm import (
+from sglang.kernels.ops.attention.fla.kda import chunk_kda as triton_chunk_kda
+from sglang.kernels.ops.attention.linear.fused_recurrent_linear_replayssm import (
     fused_recurrent_linear_replayssm_decode,
 )
-from sglang.kernels.ops.attention.fla.kda import chunk_kda as triton_chunk_kda
 from sglang.test.ci.ci_register import register_cuda_ci
 
 try:
@@ -37,7 +37,7 @@ else:
         helion_fused_recurrent_kda_replayssm_decode,
     )
 
-register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=180, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 pytestmark = pytest.mark.skipif(
     not HELION_AVAILABLE,
