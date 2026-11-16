@@ -161,12 +161,19 @@ class TestDiffusionProfiler(unittest.TestCase):
         profiler.prof_if.analyse.assert_not_called()
         self.assertTrue(profiler.events())
 
-    def test_npu_scheduled_callback_at_seventh_step(self):
+    def test_npu_scheduled_callback_after_warmup_and_capture(self):
         wrapper = self.make_profiler()
         for step in range(7):
-            torch.ones(1).add_(1)
+            with torch.profiler.record_function(f"denoising_step_{step}"):
+                torch.ones(1).add_(1)
             wrapper.step_denoising_step()
-            self.assertEqual(len(self.callbacks), int(step == 6))
+            self.assertEqual(len(self.callbacks), int(step >= 5))
+        names = {
+            event.name
+            for event in wrapper.profiler.events()
+            if event.name.startswith("denoising_step_")
+        }
+        self.assertEqual(names, {f"denoising_step_{step}" for step in range(1, 6)})
         wrapper.step_denoising_step()
         wrapper.stop()  # Idempotent after the short window stops itself.
         self.assertTrue(wrapper.has_stopped)
@@ -175,9 +182,30 @@ class TestDiffusionProfiler(unittest.TestCase):
         self.apply_patches.assert_called_once()
         self.torch_npu._apply_all_patches.assert_not_called()
         self.npu_api.profile.assert_called_once()
-        self.npu_api.schedule.assert_called_once()
+        self.npu_api.schedule.assert_called_once_with(
+            skip_first=0, wait=0, warmup=1, active=5, repeat=1
+        )
         self.torch_profile.assert_not_called()
         self.torch_schedule.assert_not_called()
+
+    def test_npu_all_steps_capture_includes_first_step(self):
+        wrapper = self.make_profiler(steps=-1)
+        for step in range(40):
+            with torch.profiler.record_function(f"denoising_step_{step}"):
+                torch.ones(1).add_(1)
+            wrapper.step_denoising_step()
+            self.assertEqual(len(self.callbacks), int(step == 39))
+        wrapper.stop()
+        names = {
+            event.name
+            for event in wrapper.profiler.events()
+            if event.name.startswith("denoising_step_")
+        }
+        self.assertEqual(names, {f"denoising_step_{step}" for step in range(40)})
+        self.assertEqual(self.callbacks, [wrapper.profiler])
+        self.npu_api.schedule.assert_called_once_with(
+            skip_first=0, wait=0, warmup=0, active=40, repeat=1
+        )
 
     def test_npu_full_profile_records_both_steps_without_schedule_warmup(self):
         wrapper = self.make_profiler(full=True)
