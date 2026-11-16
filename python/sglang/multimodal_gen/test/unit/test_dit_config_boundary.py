@@ -36,6 +36,18 @@ def test_dit_runtime_keeps_architecture_and_component_config_separate():
     assert model._spectrum_supports_cfg_cache
 
 
+def test_teacache_and_spectrum_resolve_cfg_support_from_their_own_prefix_sets():
+    """A DiT inherits both cache mixins; each one must decide CFG branch
+    separation from its own model list, not from the other mixin's."""
+    zimage = _TestDiT(config=DiTConfig(prefix="zimage"), hf_config={})
+    sd3 = _TestDiT(config=DiTConfig(prefix="SD3"), hf_config={})
+
+    assert zimage._supports_cfg_cache
+    assert not zimage._spectrum_supports_cfg_cache
+    assert not sd3._supports_cfg_cache
+    assert sd3._spectrum_supports_cfg_cache
+
+
 def test_dit_arch_config_excludes_runtime_capabilities():
     field_names = {field.name for field in fields(DiTArchConfig)}
 
