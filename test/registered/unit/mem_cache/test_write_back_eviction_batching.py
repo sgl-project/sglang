@@ -490,6 +490,49 @@ class _WriteBackBatchingSuite:
         cache.tree_core.evict_device_end(ComponentType.FULL)
         cache.sanity_check()
 
+    def test_a_covered_backed_parent_takes_its_own_window_backup(self):
+        """A backed-up parent that a queued leaf's SWA window copy covers, and
+        whose own window still reaches device-only SWA, lands the batch first
+        and then takes its own backup instead of being demoted without it."""
+        cache, allocator, kv_host, swa_host = hybrid_write_back_cache(
+            self.tree_core_backend,
+            device_tokens=4 * BATCH_TOKENS,
+            swa_device_tokens=4 * BATCH_TOKENS,
+            host_tokens=4 * BATCH_TOKENS,
+            swa_host_tokens=4 * BATCH_TOKENS,
+            sliding_window=2 * PAGE,
+        )
+        seq = [70000 + t for t in range(4 * PAGE)]
+        for end in range(PAGE, len(seq) + 1, PAGE):
+            insert_hybrid_seq(cache, allocator, seq[:end])
+        grandparent, parent, leaf = (
+            match_seq(cache, seq[:end]).last_device_node
+            for end in (2 * PAGE, 3 * PAGE, 4 * PAGE)
+        )
+        # Only the parent's Full KV is on host.
+        host_indices = kv_host.alloc(PAGE)
+        self.assertIsNotNone(host_indices)
+        cache.tree_core.commit_backup(parent, host_indices, {})
+        cache.tree_core.mark_write_through_pending([parent], parent)
+        cache.tree_core.finish_write_through([parent], parent)
+        self.assertTrue(cache.tree_core.needs_incremental_component_backup(parent))
+
+        waits, patch = self._count_waits(cache)
+        with patch:
+            result = cache.evict(EvictParams(num_tokens=2 * PAGE))
+
+        self.assertEqual(result.num_tokens_evicted, 2 * PAGE)
+        # The leaf's copy covers the parent's SWA, so the batch lands before
+        # the parent's own window copy reaches the grandparent's SWA.
+        self.assertEqual(waits, [1, 1])
+        for node in (parent, leaf):
+            self.assertTrue(cache.tree_core.is_full_device_evicted(node))
+        self.assertFalse(cache.tree_core.is_full_device_evicted(grandparent))
+        # SWA host holds the leaf's, the parent's and the grandparent's pages.
+        self.assertEqual(swa_host.available_size(), 4 * BATCH_TOKENS - 3 * PAGE)
+        self.assertEqual(match_seq(cache, seq).host_hit_length, 2 * PAGE)
+        cache.sanity_check()
+
     def _evict_until_reclaimed(self, *, batched):
         """evict_until with an allocator's reclaim predicate, met three
         victims into a quota of a whole batch; returns the tokens evicted and

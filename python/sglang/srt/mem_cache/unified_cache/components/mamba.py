@@ -52,7 +52,6 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
 )
 from sglang.srt.runtime_context import get_disagg, get_exec
 
-
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams

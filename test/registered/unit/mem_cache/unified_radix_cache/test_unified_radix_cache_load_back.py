@@ -54,7 +54,6 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
     node_host_value,
     node_key_length,
     node_parent,
-    selected_tree_core_test_backend,
 )
 from sglang.test.kits.unified_radix_cache.load_back import (
     UnifiedRadixCacheLoadBackFixtures,
@@ -211,8 +210,6 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
     def test_hicache_write_back_split_mamba_checkpoint_roundtrip(self):
         if not self.cfg.has_mamba or self.cfg.has_swa:
             self.skipTest("requires Full+Mamba")
-        if selected_tree_core_test_backend() != "python":
-            self.skipTest("incremental write-back is Python-core only")
         for internal in (True, False):
             with self.subTest(internal=internal):
                 cache, allocator, pool = build_fixture(self.cfg)
@@ -224,9 +221,9 @@ class UnifiedRadixCacheLoadBackSuite(UnifiedRadixCacheLoadBackFixtures):
                 node = self._insert(cache, allocator, pool, prefix).last_device_node
                 self.assertTrue(cache.tree_core.is_backuped(node))
                 self.assertIsNone(node_host_value(cache, node, ComponentType.MAMBA))
-                child = cache.tree_core.node_by_id(leaf)
                 if internal:
-                    cache.tree_core.lru_lists[ComponentType.MAMBA].reset_node_mru(child)
+                    # Matching the leaf moves its state to the Mamba LRU head.
+                    match_prefix(cache, seq)
                 else:
                     cache._demote(leaf, defaultdict(int))
                     cache.evict_host(1, ComponentType.MAMBA)

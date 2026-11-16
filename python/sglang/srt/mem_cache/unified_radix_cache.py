@@ -1275,6 +1275,8 @@ class UnifiedRadixCache(BasePrefixCache):
         takes another entry."""
         pending: list[NodeId] = []
         pending_tokens = 0
+        # Nodes whose device slots the queued copies read.
+        copied: set[NodeId] = set()
 
         def batch_need() -> int:
             return self._write_back_batch_tokens(
@@ -1289,6 +1291,7 @@ class UnifiedRadixCache(BasePrefixCache):
             nonlocal pending_tokens
             self._demote_backed_up(pending, tracker)
             pending_tokens = 0
+            copied.clear()
 
         self.tree_core.evict_device_start(ct, walk_quota)
         try:
@@ -1308,6 +1311,11 @@ class UnifiedRadixCache(BasePrefixCache):
                     pending.append(node_id)
                     pending_tokens += self.tree_core.mark_write_back_queued(node_id)
                 else:
+                    if node_id in copied and self.tree_core.is_backuped(node_id):
+                        # A backed-up node a queued copy covers still needs its
+                        # own component backup; land the batch first, since a
+                        # demote would free slots that copy reads.
+                        demote_queued()
                     backup_kv = self._evict_device_leaf(node_id, tracker)
                     if backup_kv is not None:
                         written = self._execute_and_commit_kv_backup(
@@ -1323,11 +1331,13 @@ class UnifiedRadixCache(BasePrefixCache):
                         if written is not None:
                             pending.append(node_id)
                             receipt = self.ongoing_write_through.get(node_id)
-                            pending_tokens += self.tree_core.mark_write_back_queued(
-                                node_id,
-                                receipt.publish_node_ids if receipt is not None else (),
+                            publish = (
+                                receipt.publish_node_ids if receipt is not None else ()
                             )
-
+                            copied.update(publish)
+                            pending_tokens += self.tree_core.mark_write_back_queued(
+                                node_id, publish
+                            )
                         elif self.tree_core.is_backuped(node_id):
                             # Retain the existing host KV even if an auxiliary
                             # pool cannot preserve its new device checkpoint.
@@ -2229,7 +2239,9 @@ class UnifiedRadixCache(BasePrefixCache):
     def _execute_and_commit_kv_backup(
         self, action: BackupKV, write_back: bool = False
     ) -> Optional[int]:
-        """Return Full-KV tokens queued, or None if a backup could not be queued.
+        """Return Full-KV tokens queued, or None if no host copy was queued:
+        a host allocation failed, or buffer mode, which only enqueues backup
+        intents.
 
         Zero is successful for auxiliary-only transfers and already backed-up
         nodes; callers must still drain queued copies before device eviction.

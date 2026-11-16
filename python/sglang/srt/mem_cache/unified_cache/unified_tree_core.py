@@ -651,6 +651,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         return self._node_arena[node_id].backuped
 
     def needs_incremental_component_backup(self, node_id: NodeId) -> bool:
+        """Whether an auxiliary component has device data missing from host."""
         return self._needs_incremental_component_backup(self.node_by_id(node_id))
 
     def is_root(self, node_id: NodeId) -> bool:
@@ -2088,8 +2089,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self._begin_tracking_unbacked_tokens()
         try:
             if is_write_back and (
-                not node.backuped
-                or any(comp.needs_incremental_backup(node) for comp in self.components)
+                not node.backuped or self._needs_incremental_component_backup(node)
             ):
                 result.backup_kv = self._build_backup_kv_action(node, write_back=True)
                 return result
