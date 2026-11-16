@@ -62,9 +62,6 @@ _PREFILL_ULYSSES = envs.SGLANG_ROCM_MUSE_PREFILL_ULYSSES.get()
 _ULYSSES_LOCAL_GATE = envs.SGLANG_ROCM_MUSE_ULYSSES_LOCAL_GATE.get()
 _ULYSSES_PIPELINE = envs.SGLANG_ROCM_MUSE_ULYSSES_PIPELINE.get()
 _comm_stream = None
-# gfx1250: send the Ulysses q|k|v all-to-all as FP8 e4m3 with one scale per (row, q/k/v segment) and dequantize on
-# arrival (half the bytes of the largest prefill collective). Off by default; accuracy gate required.
-_ULYSSES_FP8_A2A = os.environ.get("SGLANG_ROCM_MUSE_ULYSSES_FP8_A2A", "0") == "1"
 _VERIFY_SP = os.environ.get("SGLANG_ROCM_MUSE_VERIFY_SP", "1") == "1"
 # From 128-row verify widths; narrower ones keep the all-reduce path.
 VERIFY_SP_MIN_ROWS = 128
@@ -136,26 +133,7 @@ def sp_gather(shard: torch.Tensor, rows: int, push: bool = False) -> torch.Tenso
     return out[:rows]
 
 
-def sp_gather_rows(shards: list[torch.Tensor], rows: int) -> list[torch.Tensor]:
-    """``sp_gather`` of several row-aligned shards in one collective: their row bytes travel side by side."""
-    n = shards[0].shape[0]
-    flat = [s.contiguous().view(torch.uint8).view(n, -1) for s in shards]
-    gathered = sp_gather(torch.cat(flat, dim=1), rows)
-    out, lo = [], 0
-    for s, f in zip(shards, flat):
-        width = f.shape[1]
-        out.append(
-            gathered[:, lo : lo + width]
-            .contiguous()
-            .view(s.dtype)
-            .view(rows, *s.shape[1:])
-        )
-        lo += width
-    return out
-
-
 _PUSH = None  # (sp_collective module, push slot bytes) when the TP group runs carv2 with a push plane, else False
-_SPC_RS = None
 
 
 @functools.cache
@@ -196,19 +174,6 @@ def _push_plane():
                 push.slot_bytes,
             )
     return _PUSH
-
-
-def _spc_rs():
-    """gfx1250: the carv2 push-memory reduce-scatter (sglang sp_collective) for prefill when the TP group runs carv2.
-    Same sums as RCCL up to bf16 summation order."""
-    global _SPC_RS
-    if _SPC_RS is None:
-        _SPC_RS = (
-            os.environ.get("SGLANG_ROCM_MUSE_GFX1250_SPC_RS", "0") == "1"
-            and "gfx1250" in torch.cuda.get_device_properties(0).gcnArchName
-            and _push_plane()
-        )
-    return _SPC_RS
 
 
 _PUSH_TARGET = None
@@ -277,15 +242,6 @@ def sp_reduce_scatter(
                 out,
                 tuning=spc.Tuning(*_push_tuning()),
             )
-        return out
-    spc = _spc_rs() if full.dtype == torch.bfloat16 and full.dim() == 2 else False
-    if spc and out.numel() * out.element_size() <= spc[1]:
-        spc[0].reduce_scatter_res(
-            group.world_size,
-            full.contiguous(),
-            out,
-            tuning=spc[0].Tuning(*_push_tuning()),
-        )
         return out
     group.reduce_scatter_tensor(out, full.contiguous())
     return out
@@ -905,33 +861,15 @@ def _pipelined_qkv_all_to_all(attention, x, x_fp8, group, qkv_chunks, o_chunks):
         qkv = qkv.view(hi - lo, world, -1)
         send = qkv.new_empty((world, hi - lo, qkv_width))
         _copy_rows(send, qkv[:, :, :qkv_width].transpose(0, 1))
-        if _ULYSSES_FP8_A2A:
-            segs = (attention.q_size, attention.kv_size, attention.kv_size)
-            sq, ss = _quantize_segments_fp8(send, segs)
-            rq = torch.empty_like(sq)
-            rs = torch.empty_like(ss)
         comm.wait_stream(main)
         with torch.cuda.stream(comm):
-            if _ULYSSES_FP8_A2A:
-                sq.record_stream(comm)
-                ss.record_stream(comm)
-                dist.all_to_all(
-                    list(rq.unbind(0)), list(sq.unbind(0)), group=group.device_group
-                )
-                dist.all_to_all(
-                    list(rs.unbind(0)), list(ss.unbind(0)), group=group.device_group
-                )
-            else:
-                send.record_stream(comm)
-                # Sender s's chunk rows land at recv[s, lo:hi], each a contiguous block.
-                dist.all_to_all(
-                    list(recv[:, lo:hi].unbind(0)),
-                    list(send.unbind(0)),
-                    group=group.device_group,
-                )
-        if _ULYSSES_FP8_A2A:
-            main.wait_stream(comm)
-            _dequantize_segments_fp8(rq, rs, segs, recv[:, lo:hi])
+            send.record_stream(comm)
+            # Sender s's chunk rows land at recv[s, lo:hi], each a contiguous block.
+            dist.all_to_all(
+                list(recv[:, lo:hi].unbind(0)),
+                list(send.unbind(0)),
+                group=group.device_group,
+            )
         for (a, b), gate in zip(o_chunks, gates):
             if a < hi and lo < b:
                 first, last = max(a, lo), min(b, hi)
@@ -941,28 +879,6 @@ def _pipelined_qkv_all_to_all(attention, x, x_fp8, group, qkv_chunks, o_chunks):
                 )
     main.wait_stream(comm)
     return recv, gates
-
-
-def _quantize_segments_fp8(x: torch.Tensor, segs) -> tuple[torch.Tensor, torch.Tensor]:
-    """x [..., sum(segs)] bf16 -> (e4m3 [..., sum(segs)], fp32 scales [..., len(segs)]), one scale per segment."""
-    parts, scales = [], []
-    for part in x.split(list(segs), dim=-1):
-        s = part.abs().amax(dim=-1, keepdim=True).float().clamp_min(1e-12) / 448.0
-        parts.append((part.float() / s).to(torch.float8_e4m3fn))
-        scales.append(s)
-    return torch.cat(parts, dim=-1).contiguous(), torch.cat(scales, dim=-1).contiguous()
-
-
-def _dequantize_segments_fp8(
-    q: torch.Tensor, s: torch.Tensor, segs, out: torch.Tensor
-) -> None:
-    """Inverse of ``_quantize_segments_fp8`` written into ``out`` (bf16, same leading shape)."""
-    lo = 0
-    for i, width in enumerate(segs):
-        out[..., lo : lo + width].copy_(
-            q[..., lo : lo + width].float() * s[..., i : i + 1]
-        )
-        lo += width
 
 
 def _pipelined_o_projection(attention, out, gates, group, o_chunks, hidden):

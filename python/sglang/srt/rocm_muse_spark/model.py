@@ -60,7 +60,7 @@ from sglang.srt.configs.muse_spark import (
     MuseSparkTextConfig,
     should_skip_weight_loading,
 )
-from sglang.srt.distributed import get_tp_group, tensor_model_parallel_all_reduce
+from sglang.srt.distributed import tensor_model_parallel_all_reduce
 from sglang.srt.environ import envs
 from sglang.srt.layers.linear import (
     MergedColumnParallelLinear,
@@ -84,7 +84,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.rocm_muse_spark import (
     finalize_allreduce,
-    mori_ep,
     mxfp4_moe,
     router_pooler,
 )
@@ -112,7 +111,6 @@ from sglang.srt.rocm_muse_spark.sequence_parallel import (
     sp_gather,
     sp_gather_routed,
     sp_gather_routed_mx,
-    sp_gather_rows,
     sp_push_target,
     sp_reduce_scatter,
     sp_reduce_scatter_pushed,
@@ -1189,8 +1187,6 @@ class MuseSpark1xMoE(nn.Module):
             and self.pre_expert_norm is not None
             and getattr(self.experts, "gfx1250_a8w4", None) is not None
             and self.uses_a4w4(sp.padded, target_verify)
-            and not mori_ep.ready()
-            and not mxfp4_moe.GFX1250_SP_FP8
             and mxfp4_moe.GFX1250_SP_MX_GATHER
         )
         topk_scores, topk_ids, expert_input, quantized = self.route(
@@ -1203,39 +1199,6 @@ class MuseSpark1xMoE(nn.Module):
         rows = topk_ids.shape[0] if sp is None else sp.padded
         use_a4w4 = self.uses_a4w4(rows, target_verify)
         routed_mx = None
-        if (
-            sp is not None
-            and use_a4w4
-            and getattr(self.experts, "gfx1250_a8w4", None) is not None
-            and mori_ep.ready()
-            and expert_input is not None
-            and expert_input.shape[0] <= mori_ep.MAX_TOKENS
-        ):
-            # gfx1250 EP exchange: tokens travel only to their experts' ranks (Mori dispatch/combine) instead of
-            # the SP all-gather of every rank's rows + reduce-scatter of the full sums.
-            local_rows = expert_input.shape[0]
-            w32 = topk_scores.to(torch.float32).contiguous()
-            ids32 = topk_ids.to(torch.int32).contiguous()
-            recv, rw, rids, n = mori_ep.dispatch(expert_input.contiguous(), w32, ids32)
-            # Rows past the received count are uninitialized: point them at a non-local expert with zero weight so
-            # the routing and the Muse finalize skip them (device-side, capture-safe; no host read of n).
-            valid = torch.arange(rids.shape[0], device=rids.device).unsqueeze(
-                1
-            ) < n.view(1, 1).to(torch.int64)
-            nonlocal_id = (self.local_expert_start + self.num_local_experts) % (
-                self.num_local_experts * self.tp_size
-            )
-            rids = torch.where(valid, rids, torch.full_like(rids, nonlocal_id))
-            rw = torch.where(valid, rw, torch.zeros_like(rw))
-            norm_weight, gain, _ = _post_expert_norm_args(self.post_expert_norm)
-            out = mxfp4_moe.run_gfx1250_a8w4(
-                recv, rw, rids, self.experts, self.local_expert_start, norm_weight,
-                self.post_expert_norm.eps, gain, num_local_tokens=n,
-            )  # fmt: skip
-            output = mori_ep.combine(out, w32, ids32, local_rows)
-            if skip_post_expert_proj:
-                return output
-            return self.unpool(output, prefill_fp8=prefill_fp8)
         if sp is not None and sp.verify:
             if (
                 use_a4w4
@@ -1256,21 +1219,6 @@ class MuseSpark1xMoE(nn.Module):
         elif sp is not None:
             counted = False
             if (
-                use_a4w4
-                and getattr(self.experts, "gfx1250_a8w4", None) is not None
-                and mxfp4_moe.GFX1250_SP_FP8
-            ):
-                # gfx1250 A8W4: gather the shards' MXFP8 rows (half the BF16 bytes) straight into the expert input,
-                # and their e8m0 scales with the routing in one small collective; aiter's grouped MoE takes the
-                # pre-quantized pair and skips its own quant.
-                xq, xs = mxfp4_moe.quantize_rows_mxfp8(expert_input)
-                xq = sp_gather(xq.view(torch.uint8), rows).view(xq.dtype)
-                xs, topk_ids, topk_scores = sp_gather_rows(
-                    [xs, topk_ids, topk_scores], rows
-                )
-                quantized = (xq, xs)
-                expert_input = None
-            elif (
                 use_a4w4
                 and getattr(self.experts, "gfx1250_a8w4", None) is not None
                 and mxfp4_moe.GFX1250_SP_MX_GATHER
@@ -2475,14 +2423,6 @@ class MuseSparkTextForCausalLM(nn.Module):
         if router_pooler.JOINT_ROUTER_POOLER:
             for moe in moe_layers:
                 router_pooler.prepare_joint_router_pooler(moe)
-        if mxfp4_moe.GFX1250_A8W4 and mori_ep.ENABLED and moe_layers:
-            moe0 = moe_layers[0]
-            mori_ep.init(
-                get_tp_group(),
-                moe0.expert_hidden_size,
-                moe0.num_local_experts,
-                moe0.top_k,
-            )
         if mxfp4_moe.GFX1250_A8W4:
             for moe in moe_layers:
                 if isinstance(moe.experts, MuseSpark1xMxfp4Experts):

@@ -529,21 +529,11 @@ def _local_expert_ids(ids, local_start, num_local):
     return out
 
 
-# SP prefill MoE dispatch as MXFP8 rows + one small [e8m0 | ids | scores] gather (experts bit-identical).
-# Off by default: suspected in a 'page not present' fault during an SP prefill, not yet cleared.
-GFX1250_SP_FP8 = os.environ.get("SGLANG_ROCM_MUSE_GFX1250_SP_FP8", "0") == "1"
 # SP prefill / verify MoE dispatch as MXFP8 rows (aiter's own input-quant rule) widened back to BF16 after the gather
 # (exact): half the bytes of the BF16 gather, while aiter keeps quantizing its own BF16 input (no pre-quantized handoff).
 GFX1250_SP_MX_GATHER = (
     os.environ.get("SGLANG_ROCM_MUSE_GFX1250_SP_MX_GATHER", "1") == "1"
 )
-
-
-def quantize_rows_mxfp8(x):
-    """Per-row MXFP8 (e4m3 + e8m0 per 32) of the MoE input, the pair aiter's gfx1250 A8W4 MoE takes pre-quantized."""
-    from aiter.ops.triton.quant.quant import dynamic_mxfp8_quant
-
-    return dynamic_mxfp8_quant(x.contiguous(), backend="triton")
 
 
 def run_gfx1250_a8w4(
