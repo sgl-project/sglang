@@ -373,9 +373,6 @@ class VoxtralForConditionalGeneration(nn.Module):
         )
         return hidden_states
 
-    def get_language_model(self) -> nn.Module:
-        return self.language_model
-
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         encoder_stacked = [
             ("qkv_proj", "q_proj", "q"),
