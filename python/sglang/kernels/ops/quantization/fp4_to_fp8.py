@@ -40,5 +40,7 @@ def widen_fp4_to_fp8(
     index = payload.view(torch.uint8).unflatten(-1, (4, 16)) + shifts[..., None] * 256
     pairs = _fp4_byte_to_fp8_pair(payload.device).index_select(0, index.flatten())
     fp8 = pairs.view(payload.shape).view(torch.float8_e4m3fn)
-    # fp32 bits of 2**(top - 127 - 6); quantizers floor block exponents far above 6.
-    return fp8, ((top.squeeze(-1) - 6) << 23).view(torch.float32)
+    # 2**(top - 127 - 6): subnormal for the smallest exponents, where shifting the
+    # exponent into the fp32 bits would wrap.
+    top = top.squeeze(-1)
+    return fp8, torch.ldexp(torch.ones_like(top, dtype=torch.float32), top - 133)
