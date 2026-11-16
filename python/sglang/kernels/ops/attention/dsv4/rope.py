@@ -1,4 +1,3 @@
-import logging
 import math
 from functools import lru_cache
 from typing import Optional
@@ -7,21 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
-logger = logging.getLogger(__name__)
-
 # This module is imported during model-registry discovery. Keep it free of
 # TileLang imports so discovery does not load TileLang's native CUDA stubs.
-
-FP8 = "float8_e4m3"
-BF16 = "bfloat16"
-FP32 = "float32"
-INT32 = "int32"
-
-
-def _yarn_get_mscale(scale: float = 1.0, mscale: float = 1.0) -> float:
-    if scale <= 1:
-        return 1.0
-    return 0.1 * mscale * math.log(scale) + 1.0
 
 
 @lru_cache(2)
