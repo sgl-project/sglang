@@ -76,13 +76,14 @@ def _validate_dsa_tbo_index_sharing(server_args: Any, hf_config: Any) -> None:
 
 
 def _rocm_fp8_wo_a_supported() -> bool:
-    """True when ROCm can run the DeepSeek-V4 fp8 wo_a GEMM (gfx950 + aiter)."""
+    """True when ROCm can run the DeepSeek-V4 fp8 wo_a GEMM (gfx950 or gfx1250)."""
     try:
         from sglang.srt.models.deepseek_common.amd.deepseek_v4_wo_a_fp8 import (
+            is_wo_a_fp8_bpreshuffle_supported,
             is_wo_a_fp8_mxscale_supported,
         )
 
-        return is_wo_a_fp8_mxscale_supported()
+        return is_wo_a_fp8_mxscale_supported() or is_wo_a_fp8_bpreshuffle_supported()
     except Exception:  # pragma: no cover - env-dependent
         return False
 
