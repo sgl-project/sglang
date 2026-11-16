@@ -92,6 +92,7 @@ from sglang.srt.utils import (
     LazyValue,
     get_current_device_stream_fast,
     is_cuda,
+    is_sm100_supported,
     is_sm120,
 )
 from sglang.srt.utils.custom_op import register_custom_op
@@ -850,7 +851,7 @@ class NemotronHModel(nn.Module):
 
     @property
     def supports_hybrid_prefill_graph(self) -> bool:
-        return is_sm120()
+        return is_sm120() or is_sm100_supported()
 
     def forward(
         self,

@@ -25,7 +25,7 @@ captured region needs no other owner.
 import functools
 import threading
 import warnings
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Callable, Iterator, Optional
 
@@ -422,6 +422,7 @@ class BreakableCUDAGraphCapture:
         pool=None,
         stream: torch.Stream | None = None,
         capture_error_mode: str = "global",
+        segment_capture: Optional[Callable[..., AbstractContextManager]] = None,
     ):
         assert isinstance(cuda_graph, BreakableCUDAGraph), (
             "cuda_graph must be a BreakableCUDAGraph"
@@ -430,6 +431,11 @@ class BreakableCUDAGraphCapture:
         self._pool = pool if pool is not None else (0, 0)
         self._stream = stream
         self._capture_error_mode = capture_error_mode
+        # A torch.cuda.graph-compatible context factory that captures each
+        # segment, such as the memory saver's pauseable capture; None calls
+        # capture_begin/capture_end directly.
+        self._segment_capture = segment_capture
+        self._segment_ctx: Optional[AbstractContextManager] = None
         self._stream_ctx = None
         self._capture_recorder_ctx = None
         self._stream_token = None
@@ -495,7 +501,16 @@ class BreakableCUDAGraphCapture:
         else:
             graph = graph_cls()
             self._current_graph_needs_instantiate = False
-        if _is_xpu:
+        if self._segment_capture is not None:
+            segment_ctx = self._segment_capture(
+                cuda_graph=graph,
+                pool=self._pool,
+                stream=get_current_stream(),
+                capture_error_mode=self._capture_error_mode,
+            )
+            segment_ctx.__enter__()
+            self._segment_ctx = segment_ctx
+        elif _is_xpu:
             # torch.xpu.XPUGraph.capture_begin takes only an optional pool.
             graph.capture_begin(pool=self._pool)
         else:
@@ -521,7 +536,11 @@ class BreakableCUDAGraphCapture:
         # no-op. Torch warns about it on every such capture_end; expected here.
         with warnings.catch_warnings():
             warnings.filterwarnings("ignore", message="The CUDA Graph is empty")
-            graph.capture_end()
+            if self._segment_ctx is not None:
+                segment_ctx, self._segment_ctx = self._segment_ctx, None
+                segment_ctx.__exit__(None, None, None)
+            else:
+                graph.capture_end()
         self.cuda_graph._append_segment(graph, self._current_graph_needs_instantiate)
         self._current_graph = None
         self._current_graph_needs_instantiate = False
