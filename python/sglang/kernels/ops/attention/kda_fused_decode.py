@@ -105,6 +105,8 @@ def covered(
         and ssm_states.stride(-1) == 1
         and ssm_states.stride(-2) == K
         and ssm_states.stride(-3) == V * K
+        # The state is staged with 16B copies, so the slot pitch must be 16B-aligned.
+        and ssm_states.stride(-4) % 4 == 0
         and cache_indices.is_contiguous()
     )
 
