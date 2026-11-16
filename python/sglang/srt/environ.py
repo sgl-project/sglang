@@ -1123,6 +1123,11 @@ class Envs:
     # gfx1250 Laguna router for 1 <= M <= 64: one FlyDSL launch (gemv + split-K reduce + sigmoid top-k)
     # instead of gemv + torch.sum + triton gate; same selection and tie rule as the triton gate.
     SGLANG_OPT_LAGUNA_ROUTER_FUSED = EnvBool(False)
+    # with ROUTER_FUSED: the fused kernel zeroes CUDA-graph padding rows itself (id 0, weight 0), so the HIP
+    # post-process (2 fill launches per layer) is skipped; only on HIP without EPLB / shared slots / MORI_NO_PAD_MASK
+    SGLANG_OPT_LAGUNA_ROUTER_FUSED_PADMASK = EnvBool(False)
+    # routed + shared expert add inside aiter's gfx1250 gather-reduce epilogue (bitwise equal; falls back when not fused)
+    SGLANG_OPT_LAGUNA_MOE_FUSED_SHARED_ADD = EnvBool(False)
     # Laguna decode: one Triton kernel for q/k RMSNorm + RoPE + fp8 KV store (triton backend, MHA pools).
     SGLANG_OPT_LAGUNA_FUSED_QK_NORM_ROPE_KV = EnvBool(False)
     # Laguna prefill sequence parallel (TP, any EP): for plain EXTEND batches of at least

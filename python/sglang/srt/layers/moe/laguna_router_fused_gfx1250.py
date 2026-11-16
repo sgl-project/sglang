@@ -201,6 +201,15 @@ def _p3_scan(bv, av, lane, topk):
     return sel_w, sel_i, total
 
 
+def _pad_mask(pm, load_i_dev, nv_ptr, t, wv, iv):
+    """pm = 1 (SGLANG_OPT_LAGUNA_ROUTER_FUSED_PADMASK): rows t >= *nv_ptr (CUDA-graph padding) get id 0 / weight 0, the
+    values the HIP post-process (_mask_topk_ids_padded_region fill 0 + _zero_topk_weights_padded_region) writes."""
+    if not pm:
+        return wv, iv
+    ok = t < fx.Int32(load_i_dev(nv_ptr, fx.Int32(0), 1)[0])
+    return ok.select(wv, fx.Float32(0.0)), ok.select(iv, fx.Int32(0))
+
+
 def nsub_of(flavour: str, et: int) -> int:
     return 1 if flavour in VALU_FLAVOURS else WAVES // (et // 16)
 
@@ -211,7 +220,7 @@ def ws_floats(m: int, et: int, ks: int, flavour: str) -> int:
 
 @functools.lru_cache(maxsize=128)
 def compile_router_fused(m: int, topk: int = 16, flavour: str = "valu", et: int = 32, ks: int = 16, vec: int = 8,
-                         stop: int = 0, wpe: int = 0, xs: int = 0, nw: int = WAVES, p3: int = 0):
+                         stop: int = 0, wpe: int = 0, xs: int = 0, nw: int = WAVES, p3: int = 0, pm: int = 0):
     """stop (attribution only, wrong results): 1 = phase 1 only, plain launch, no barrier; 2 = + cluster launch and
     one cluster barrier; 3 = + phase 2 and its barrier; 4 = + ticket / flag (no phase 3); 0 = full kernel.
     (Before 2026-11-13 11:30 UTC stop did not exit early: every stop variant ran the whole kernel.)"""
@@ -239,9 +248,9 @@ def compile_router_fused(m: int, topk: int = 16, flavour: str = "valu", et: int 
     p2_iters = (n_el + ks * BLOCK - 1) // (ks * BLOCK)
     p3_iters = (m + ks * WAVES - 1) // (ks * WAVES)
 
-    @flyc.kernel(name=f"laguna_router_fused_{flavour}_m{m}_t{topk}_e{et}_k{ks}" + (f"_v{vec}" if vec != 8 else "") + (f"_w{wpe}" if wpe else "") + ("_xs" if xs else "") + (f"_n{nw}" if nw != WAVES else "") + (f"_p{p3}" if p3 else "") + (f"_stop{stop}" if stop else ""), known_block_size=[nb, 1, 1])
+    @flyc.kernel(name=f"laguna_router_fused_{flavour}_m{m}_t{topk}_e{et}_k{ks}" + (f"_v{vec}" if vec != 8 else "") + (f"_w{wpe}" if wpe else "") + ("_xs" if xs else "") + (f"_n{nw}" if nw != WAVES else "") + (f"_p{p3}" if p3 else "") + ("_pm" if pm else "") + (f"_stop{stop}" if stop else ""), known_block_size=[nb, 1, 1])
     def router(x_ptr: fx.Int64, w_ptr: fx.Int64, b_ptr: fx.Int64, ws_ptr: fx.Int64, sa_ptr: fx.Int64, sb_ptr: fx.Int64,
-               flag_ptr: fx.Int64, cnt_ptr: fx.Int64, ow_ptr: fx.Int64, oi_ptr: fx.Int64):
+               flag_ptr: fx.Int64, cnt_ptr: fx.Int64, ow_ptr: fx.Int64, oi_ptr: fx.Int64, nv_ptr: fx.Int64):
         load_w, _ = _io(fx.Float32)
         load_x, _ = _io(fx.BFloat16)
         load_dev, store_dev = _io(fx.Float32, CPOL_DEV)
@@ -385,19 +394,21 @@ def compile_router_fused(m: int, topk: int = 16, flavour: str = "valu", et: int 
                                     # p3 = 0: lane-sorted heads (default); 1: the first version (TOPK rounds of a 16-slot scan + 3-value butterfly)
                                     sel_w, sel_i, total = (_p3_sorted_heads(bv, av, lane, topk) if p3 == 0 else _p3_scan(bv, av, lane, topk))
                                     norm = (total > fx.Float32(0.0)).select(total, fx.Float32(1.0))
+                                    out_w, out_i = _pad_mask(pm, load_i_dev, nv_ptr, t, sel_w / norm, sel_i)
                                     if lane < fx.Int32(topk):
-                                        store_out_f(ow_ptr, t * fx.Int32(topk) + lane, sel_w / norm)
-                                        store_out_i(oi_ptr, t * fx.Int32(topk) + lane, sel_i)
+                                        store_out_f(ow_ptr, t * fx.Int32(topk) + lane, out_w)
+                                        store_out_i(oi_ptr, t * fx.Int32(topk) + lane, out_i)
 
     @flyc.jit
     def launch(x_ptr: fx.Int64, w_ptr: fx.Int64, b_ptr: fx.Int64, ws_ptr: fx.Int64, sa_ptr: fx.Int64, sb_ptr: fx.Int64,
-               flag_ptr: fx.Int64, cnt_ptr: fx.Int64, ow_ptr: fx.Int64, oi_ptr: fx.Int64, stream: fx.Stream):
+               flag_ptr: fx.Int64, cnt_ptr: fx.Int64, ow_ptr: fx.Int64, oi_ptr: fx.Int64, nv_ptr: fx.Int64,
+               stream: fx.Stream):
         if use_cluster:
-            router(x_ptr, w_ptr, b_ptr, ws_ptr, sa_ptr, sb_ptr, flag_ptr, cnt_ptr, ow_ptr, oi_ptr,
+            router(x_ptr, w_ptr, b_ptr, ws_ptr, sa_ptr, sb_ptr, flag_ptr, cnt_ptr, ow_ptr, oi_ptr, nv_ptr,
                    value_attrs={"rocdl.cluster_dims": f"{ks},1,1"}).launch(
                 grid=(ks, net, 1), block=(nb, 1, 1), stream=stream, cluster=(ks, 1, 1))
         else:
-            router(x_ptr, w_ptr, b_ptr, ws_ptr, sa_ptr, sb_ptr, flag_ptr, cnt_ptr, ow_ptr, oi_ptr).launch(
+            router(x_ptr, w_ptr, b_ptr, ws_ptr, sa_ptr, sb_ptr, flag_ptr, cnt_ptr, ow_ptr, oi_ptr, nv_ptr).launch(
                 grid=(ks, net, 1), block=(nb, 1, 1), stream=stream)
 
     hints = {}
@@ -467,10 +478,11 @@ class _Scratch:
         return cls._by_dev[key]
 
 
-def laguna_router_fused(x, w, bias, topk: int = 16, cfg=None, out=None, stop: int = 0):
+def laguna_router_fused(x, w, bias, topk: int = 16, cfg=None, out=None, stop: int = 0, n_valid=None):
     """x [M, 16384] bf16, w [512, 16384] fp32, bias [512] fp32 -> (weights [M, topk] fp32, ids [M, topk] int32).
 
-    One launch; M <= 64. cfg = (flavour, et, ks) overrides the default table. Not reentrant across streams."""
+    One launch; M <= 64. cfg = (flavour, et, ks) overrides the default table. Not reentrant across streams.
+    n_valid: optional (1,) int32/int64 device tensor (num_token_non_padded); rows >= it get id 0 / weight 0."""
     import torch
 
     assert x.dim() == 2 and x.dtype == torch.bfloat16 and w.dtype == torch.float32 and tuple(w.shape) == (E, K)
@@ -490,8 +502,13 @@ def laguna_router_fused(x, w, bias, topk: int = 16, cfg=None, out=None, stop: in
         out = (torch.empty(m, topk, device=x.device, dtype=torch.float32),
                torch.empty(m, topk, device=x.device, dtype=torch.int32))
     stream = fx.Stream(torch.cuda.current_stream(x.device))
-    fn = compile_router_fused(m, topk, flavour, et, ks, vec, stop=stop, wpe=wpe, xs=xs, nw=nw, p3=p3)
+    pm = 0
+    if n_valid is not None:
+        assert n_valid.dtype in (torch.int32, torch.int64) and n_valid.numel() >= 1 and n_valid.is_contiguous()
+        pm = 1
+    fn = compile_router_fused(m, topk, flavour, et, ks, vec, stop=stop, wpe=wpe, xs=xs, nw=nw, p3=p3, pm=pm)
     fn(
         x.data_ptr(), w.data_ptr(), bias.contiguous().data_ptr(), sc.ws.data_ptr(), sc.s_act.data_ptr(),
-        sc.s_biased.data_ptr(), sc.flag.data_ptr(), sc.cnt.data_ptr(), out[0].data_ptr(), out[1].data_ptr(), stream)
+        sc.s_biased.data_ptr(), sc.flag.data_ptr(), sc.cnt.data_ptr(), out[0].data_ptr(), out[1].data_ptr(),
+        n_valid.data_ptr() if pm else 0, stream)
     return out

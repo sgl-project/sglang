@@ -246,6 +246,14 @@ class LagunaMoE(nn.Module):
         )
         self.topk.bind_runner_backend(self.experts.runner_backend)
         self._router_fused = _load_router_fused(config, self.topk, self.router_logit_softcapping)
+        from sglang.srt.layers.moe import topk as _topk_mod
+
+        self._router_padmask_ok = (
+            self._router_fused is not None
+            and envs.SGLANG_OPT_LAGUNA_ROUTER_FUSED_PADMASK.get()
+            and _topk_mod._is_hip
+            and not _topk_mod._skip_hip_pad_mask
+        )
 
         # HF safetensors key is singular `shared_expert.…`; mirror so the
         # default loader picks it up without remapping.
@@ -285,9 +293,22 @@ class LagunaMoE(nn.Module):
         if cfg.output_format != TopKOutputFormat.STANDARD:
             return None
         num_token_non_padded, dispatch_info = topk._resolve_routing_inputs(None, None)
+        # SGLANG_OPT_LAGUNA_ROUTER_FUSED_PADMASK: the kernel masks padded rows (id 0, weight 0) like the HIP
+        # post-process does when nothing else is active there (no EPLB remap, no shared slots, pad mask not skipped).
+        n_valid = None
+        if (
+            num_token_non_padded is not None
+            and self._router_padmask_ok
+            and cfg.num_shared_topk_slots == 0
+        ):
+            from sglang.srt.layers.moe.topk import is_expert_remapping_enabled as _remap
+
+            if not _remap():
+                n_valid, num_token_non_padded, dispatch_info = num_token_non_padded, None, None
         with _usm(_gp().tp_group, disabled=not _sym()):
             w, ids = self._router_fused(
-                hidden_states, self.gate.weight, self.gate.e_score_correction_bias, topk=cfg.top_k
+                hidden_states, self.gate.weight, self.gate.e_score_correction_bias, topk=cfg.top_k,
+                **({"n_valid": n_valid} if n_valid is not None else {}),
             )
             out = build_precomputed_topk_output(
                 w,
@@ -319,7 +340,29 @@ class LagunaMoE(nn.Module):
                 cap = self.router_logit_softcapping
                 router_logits = torch.tanh(router_logits / cap) * cap
             topk_output = self.topk(hidden_states, router_logits)
-        routed_out = self.experts(hidden_states, topk_output)
+        # SGLANG_OPT_LAGUNA_MOE_FUSED_SHARED_ADD: aiter's gather-reduce adds shared_out into routed_out (same rounding
+        # as the add below) and reports it via ctx["consumed"]; otherwise the add below runs as before.
+        add_ctx = None
+        if (
+            envs.SGLANG_OPT_LAGUNA_MOE_FUSED_SHARED_ADD.get()
+            and not self._shared_expert_tp1
+            and self.routed_scaling_factor == 1.0
+            and shared_out.is_contiguous()
+        ):
+            try:
+                from aiter.ops.flydsl.grouped_moe_gfx1250 import set_moe_output_addend
+            except ImportError:
+                set_moe_output_addend = None
+            if set_moe_output_addend is not None:
+                add_ctx = {"addend": shared_out, "consumed": False}
+                set_moe_output_addend(add_ctx)
+        try:
+            routed_out = self.experts(hidden_states, topk_output)
+        finally:
+            if add_ctx is not None:
+                set_moe_output_addend(None)
+        if add_ctx is not None and add_ctx["consumed"]:
+            return routed_out
 
         # Non-grouped TopK doesn't honor apply_routed_scaling_factor_on_output,
         # so scale routed manually before adding the unscaled shared expert.
