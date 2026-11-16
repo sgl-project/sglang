@@ -30,6 +30,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     ListKind,
     move,
 )
+from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.memory_pool import ReqToTokenPool
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
@@ -65,6 +66,8 @@ class TestDecodeQueueCleanup(CustomTestCase):
             kv=ReqKvInfo(),
             is_retracted=True,
             hisparse_retraction_pending=True,
+            bootstrap_host=FAKE_BOOTSTRAP_HOST,
+            time_stats=MagicMock(),
         )
         rows = ReqToTokenPool(
             size=1, max_context_len=16, device="cpu", enable_memory_saver=False
@@ -90,7 +93,7 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.retracted_queue = IndexedReqList(ListKind.PD_RETRACTED)
         needs_row = FakeReq(rid="needs-new-row", is_retracted=True)
-        move([needs_row, req], queue.retracted_queue)
+        move([needs_row], queue.retracted_queue)
         queue.draft_kv_ring = None
         queue.req_to_token_pool = rows
         # One in-flight transfer already reserves a padded cache plus scratch.
@@ -104,6 +107,10 @@ class TestDecodeQueueCleanup(CustomTestCase):
             alloc_logical_only=lambda **kw: torch.tensor([5, 6, 7]),
             hisparse_attn_allocator=SimpleNamespace(
                 available_size=lambda: device_tokens[0]
+            ),
+            # Use the actual rebootstrap predicate's DSV4 type contract.
+            get_kvcache=lambda: DeepSeekV4TokenToKVPool.__new__(
+                DeepSeekV4TokenToKVPool
             ),
         )
         queue.tree_cache = SimpleNamespace(maybe_hand_to_session=lambda req: None)
@@ -122,6 +129,14 @@ class TestDecodeQueueCleanup(CustomTestCase):
         queue._pending_state_slots = lambda req: 0
         queue._prealloc_demand = lambda *args, **kw: None
         queue._admit_preallocation = lambda *args, **kw: True
+        queue._check_if_req_exceed_kv_capacity = lambda request: False
+        queue._create_receiver_and_enqueue = MagicMock(
+            return_value=SimpleNamespace(
+                kv_receiver=SimpleNamespace(init=lambda rank: None)
+            )
+        )
+        queue.add(req, is_retracted=True)
+        self.assertEqual(list(queue.retracted_queue), [needs_row, req])
         ready = IndexedReqList(ListKind.WAITING)
         # Logical room alone cannot serve recovery: only nine physical slots
         # remain after the transfer's reservation, while recovery needs ten.
@@ -145,6 +160,20 @@ class TestDecodeQueueCleanup(CustomTestCase):
         )
         self.assertEqual(req.kv.kv_committed_len, 3)
         self.assertFalse(req.hisparse_retraction_pending)
+        # Ordinary DSV4 retractions still need the prefill recompute path.
+        ordinary = FakeReq(
+            rid="ordinary",
+            kv=ReqKvInfo(),
+            is_retracted=True,
+            hisparse_retraction_pending=False,
+            bootstrap_host=FAKE_BOOTSTRAP_HOST,
+            time_stats=MagicMock(),
+        )
+        queue.add(ordinary, is_retracted=True)
+        self.assertEqual(list(queue.retracted_queue), [needs_row])
+        queue._create_receiver_and_enqueue.assert_called_once_with(
+            ordinary, is_rebootstrap=True
+        )
 
     def test_a_request_stops_waiting_when_prefill_info_never_arrives(self):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)

@@ -1130,8 +1130,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         if not is_retracted and not is_rebootstrap and is_unadmitted_reject(req):
             self.scheduler.request_retirer.retire_unadmitted(req)
             return
-        if is_retracted and retraction_needs_rebootstrap(
-            self.token_to_kv_pool_allocator
+        # Retained HiSparse state already provides recovery. Rebootstrapping
+        # would try to acquire its still-held request row as a fresh admission.
+        if (
+            is_retracted
+            and not getattr(req, "hisparse_retraction_pending", False)
+            and retraction_needs_rebootstrap(self.token_to_kv_pool_allocator)
         ):
             req.time_stats.set_retract_time()
             is_retracted = False
