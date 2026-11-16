@@ -964,7 +964,7 @@ def extend_attention_fwd(
     ``skip_prefix`` / ``skip_extend`` skip the prefix-KV / current-chunk stage
     respectively so DCP can compute those two parts separately.
     ``score_mod`` / ``aux_tensors`` add a custom term to the attention logits;
-    see triton_ops/score_mod.py for the contract.
+    see score_mod.py for the contract.
     ``identity_kv_indices`` promises that the prefix buffer is densely packed,
     allowing direct addressing instead of loading an index for every token.
     """
