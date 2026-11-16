@@ -64,21 +64,9 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
                 )
 
     def test_unified_drains_when_prefill_is_deferred(self):
-        s = self.scheduler
-        s.enable_fpm = False
-        s._abort_on_waiting_timeout = Mock()
-        s._abort_on_running_timeout = Mock()
-        s.dllm_config = None
-        s.chunked_req = None
-        s.enable_hisparse = False
-        s.require_mlp_sync = False
-        s._should_defer_prefill = self.calls.defer
+        s = self._unified_scheduler()
         s._should_defer_prefill.return_value = True
         s.get_new_batch_prefill = Mock()
-        s.dp_attn_adapter.maybe_convert_decode_to_extend.return_value = None
-        s._arm_prefill_decode_interval = Mock()
-        s.ngram_embedding_manager = Mock()
-        s.ngram_embedding_manager.prepare_for_forward.return_value = None
 
         plan = s.get_next_batch_to_run(self.running_batch, None)
 
@@ -92,6 +80,40 @@ class TestSchedulerHiCacheEvents(unittest.TestCase):
                 call.defer(self.running_batch),
             ],
         )
+
+    def _unified_scheduler(self):
+        s = self.scheduler
+        s.enable_fpm = False
+        s._abort_on_waiting_timeout = Mock()
+        s._abort_on_running_timeout = Mock()
+        s.dllm_config = None
+        s.chunked_req = None
+        s.enable_hisparse = False
+        s.require_mlp_sync = False
+        s._should_defer_prefill = self.calls.defer
+        s.dp_attn_adapter.maybe_convert_decode_to_extend.return_value = None
+        s._arm_prefill_decode_interval = Mock()
+        s.ngram_embedding_manager = Mock()
+        s.ngram_embedding_manager.prepare_for_forward.return_value = None
+        return s
+
+    def test_write_ack_reopens_prefill_with_unchanged_decode_batch(self):
+        s = self._unified_scheduler()
+        s._should_defer_prefill.return_value = False
+        s.update_running_batch = Mock(return_value=None)
+        batch = self.running_batch
+        batch.batch_is_full = True
+        batch.is_empty = lambda: False
+        batch.batch_size = lambda: 1
+        s.get_new_batch_prefill = Mock(
+            return_value=NextBatchPlan(batch_to_run=None, running_batch=batch)
+        )
+        self.calls.drain.side_effect = (False, True)
+
+        s.get_next_batch_to_run(batch, None)
+        self.assertTrue(batch.batch_is_full)
+        s.get_next_batch_to_run(batch, None)
+        self.assertFalse(batch.batch_is_full)
 
     def test_pp_prefill_drains_before_admission(self):
         s = self.scheduler

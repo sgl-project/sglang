@@ -4017,7 +4017,7 @@ class Scheduler(
 
     def _process_hicache_events(
         self, should_retry_storage_prefetch: bool = True
-    ) -> None:
+    ) -> bool:
         # The HiCache drain is TP-wide consensus; run it before rank-local
         # decisions (_should_defer_prefill) or ranks enter different collectives.
         if (
@@ -4026,16 +4026,21 @@ class Scheduler(
             or self.enable_unified_cache_external_linker
             or self.enable_lmcache
         ):
-            self.tree_cache.check_hicache_events()
+            write_completed = self.tree_cache.check_hicache_events()
             if self.enable_hicache_storage and should_retry_storage_prefetch:
                 self._process_storage_prefetch_retries()
+            return bool(write_completed)
+        return False
 
     @scheduler_stage_method(SCHEDULER_STAGE_GET_NEXT_BATCH)
     def get_next_batch_to_run(
         self, running_batch: ScheduleBatch, last_batch: Optional[ScheduleBatch]
     ) -> NextBatchPlan:
         self.process_pending_chunked_abort()
-        self._process_hicache_events()
+        if self._process_hicache_events():
+            # A backup can unlock device KV after admission found no space,
+            # even though the decoding batch has not changed.
+            running_batch.batch_is_full = False
 
         if self.dllm_config is not None:
             self.dllm_manager.filter_finished_reqs()
