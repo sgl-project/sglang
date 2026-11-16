@@ -299,8 +299,8 @@ async def get_models(request: Request):
 async def server_info_endpoint(request: Request):
     """Get server information.
 
-    Returns fields compatible with the LLM engine's /server_info so that
-    the model gateway can discover diffusion workers.
+    Returns fields compatible with the LLM engine's /server_info, so a client
+    that discovers LLM workers through it discovers diffusion workers too.
     """
     server_args: ServerArgs = request.app.state.server_args
 
@@ -317,8 +317,8 @@ async def server_info_endpoint(request: Request):
 async def model_info_endpoint(request: Request):
     """Get model information.
 
-    Returns fields compatible with the LLM engine's /model_info so that
-    the model gateway can detect capabilities for diffusion workers.
+    Returns fields compatible with the LLM engine's /model_info, so a client
+    reads a diffusion worker's capabilities as it reads an LLM worker's.
     """
     from sglang.multimodal_gen.runtime.entrypoints.openai.common_api import (
         get_served_pipeline_class,
@@ -335,7 +335,7 @@ async def model_info_endpoint(request: Request):
         pipeline_cls = None
 
     return {
-        # Fields consumed by the model gateway for worker discovery
+        # Fields that identify the worker's model
         "model_path": server_args.model_path,
         "is_generation": True,
         "model_type": "diffusion",
