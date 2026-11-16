@@ -32,7 +32,6 @@ class AutoencoderKLFlux2(AutoencoderKLMixin, ParallelTiledVAE):
     Parameters:
     """
 
-    _supports_gradient_checkpointing = True
     _no_split_modules = ["BasicTransformerBlock", "ResnetBlock2D"]
 
     def __init__(
@@ -183,34 +182,6 @@ class AutoencoderKLFlux2(AutoencoderKLMixin, ParallelTiledVAE):
             decoded = self._decode(z).sample
 
         return decoded
-
-    def forward(
-        self,
-        sample: torch.Tensor,
-        sample_posterior: bool = False,
-        return_dict: bool = True,
-        generator: Optional[torch.Generator] = None,
-    ) -> Union[DecoderOutput, torch.Tensor]:
-        r"""
-        Args:
-            sample (`torch.Tensor`): Input sample.
-            sample_posterior (`bool`, *optional*, defaults to `False`):
-                Whether to sample from the posterior.
-            return_dict (`bool`, *optional*, defaults to `True`):
-                Whether or not to return a [`DecoderOutput`] instead of a plain tuple.
-        """
-        x = sample
-        posterior = self.encode(x).latent_dist
-        if sample_posterior:
-            z = posterior.sample(generator=generator)
-        else:
-            z = posterior.mode()
-        dec = self.decode(z).sample
-
-        if not return_dict:
-            return (dec,)
-
-        return DecoderOutput(sample=dec)
 
 
 EntryClass = AutoencoderKLFlux2
