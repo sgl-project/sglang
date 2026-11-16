@@ -1358,19 +1358,15 @@ class GDNAttnBackend(MambaAttnBackendBase):
         cache_indices: torch.Tensor,
     ) -> torch.Tensor:
         block_table = self.forward_metadata.conv_block_table
-        if block_table is not None:
-            # The block-table launch is Triton-only; the AITER conv never sees it.
-            conv_kwargs = {"block_table": block_table} if block_table is not None else {}
+        conv_kwargs = {"block_table": block_table} if block_table is not None else {}
+        if not conv_states.is_contiguous() and not is_cpu():
             # The compiled CUDA conv assumes packed slots; Triton follows the strides.
-            conv_fn = (
-                causal_conv1d_fn_triton
-                if not conv_states.is_contiguous() and not is_cpu()
-                else causal_conv1d_fn
-            )}
+            conv_fn = causal_conv1d_fn_triton
+        elif block_table is not None:
+            # The block-table launch is Triton-only; the AITER conv never sees it.
+            conv_fn = causal_conv1d_fn
         else:
             conv_fn = _prefill_causal_conv1d
-            conv_kwargs = {}
-
         return conv_fn(
             mixed_qkv.transpose(0, 1),
             layer.conv_weights,
