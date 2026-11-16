@@ -54,7 +54,6 @@ from sglang.srt.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
-from sglang.srt.layers.quantization.online_fp8_update import OnlineFP8Update
 from sglang.srt.layers.quantization.fp8_utils import (
     _deepgemm_block_fp8_supported,
     _use_aiter_bpreshuffle_gfx95,
@@ -90,6 +89,7 @@ from sglang.srt.layers.quantization.mxfp8_input import (
     Mxfp8SwizzledInput,
     batch_invariant_or_deterministic,
 )
+from sglang.srt.layers.quantization.online_fp8_update import OnlineFP8Update
 from sglang.srt.layers.quantization.unquant import (
     UnquantizedFusedMoEMethod,
     UnquantizedLinearMethod,

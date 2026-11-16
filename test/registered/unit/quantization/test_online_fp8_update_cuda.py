@@ -13,8 +13,8 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA requ
 
 def make_layer(kind):
     from sglang.srt.layers.moe.utils import (
-        initialize_moe_config,
         get_moe_runner_backend,
+        initialize_moe_config,
     )
     from sglang.srt.layers.quantization.fp8 import (
         Fp8Config,
