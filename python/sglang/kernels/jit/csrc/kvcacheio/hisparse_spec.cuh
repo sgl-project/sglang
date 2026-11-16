@@ -25,8 +25,6 @@ using BallotMask = unsigned int;
 constexpr BallotMask FULL_WARP_MASK = 0xFFFFFFFFu;
 #endif
 constexpr int64_t HASH_DELETED = -2;
-constexpr int32_t COMPACT_HASH_BITS = 13;
-constexpr int32_t COMPACT_HASH_MASK = (1 << COMPACT_HASH_BITS) - 1;
 constexpr int32_t COMPACT_APPROX_CLAIM_FLAG = int32_t{1} << 29;
 constexpr int32_t COMPACT_APPROX_ADMIT_FLAG = int32_t{1} << 30;
 constexpr int32_t APPROX_ADMISSION_STEPS = 1;
@@ -62,6 +60,14 @@ constexpr int32_t ceil_log2_constexpr(int32_t value) {
   }
   return bits;
 }
+
+// Compact miss entries keep the scratch-union hash position in the low bits,
+// below the approximate-admission flags; the table spans WORKSPACE_CAPACITY slots.
+template <int64_t TABLE_SLOTS>
+struct CompactHashPosition {
+  static constexpr int32_t MASK = (int32_t{1} << ceil_log2_constexpr(static_cast<int32_t>(TABLE_SLOTS))) - 1;
+  static_assert(MASK < COMPACT_APPROX_CLAIM_FLAG, "compact hash positions overlap the admission flags.");
+};
 
 template <int32_t HOT_BUFFER_SIZE>
 struct PackedRingState {
@@ -363,7 +369,9 @@ __device__ __forceinline__ void transfer_item_warp(int32_t lane_id, const void* 
 
 __device__ __forceinline__ int first_set_lane(BallotMask mask) {
 #ifdef USE_ROCM
-  return __ffsll(mask) - 1;
+  // uint64_t (unsigned long) converts equally to HIP's __ffsll overloads
+  // (unsigned long long) and (long long); pin the call to the unsigned one.
+  return __ffsll(static_cast<unsigned long long>(mask)) - 1;
 #else
   return __ffs(mask) - 1;
 #endif
@@ -787,7 +795,7 @@ __global__ void load_cache_to_device_buffer_spec_commit_kernel(
 
     if (compact_idx < miss_count) {
       const int32_t compact_entry = req_compact_hash_positions[compact_idx];
-      hash_pos = compact_entry & COMPACT_HASH_MASK;
+      hash_pos = compact_entry & CompactHashPosition<WORKSPACE_CAPACITY>::MASK;
       const auto packed = req_scratch_table[hash_pos];
       const auto index_entry = req_scratch_indices[hash_pos];
       if (static_cast<uint32_t>(packed >> 32) == static_cast<uint32_t>(scratch_epoch) &&
@@ -1001,11 +1009,11 @@ void load_cache_to_device_buffer_spec(
     tvm::ffi::TensorView host_binding) {
   using namespace host;
 
-  static_assert(NUM_STEPS >= 1 && NUM_STEPS <= 4, "HiSparse speculative swap requires 1-4 steps.");
+  static_assert(NUM_STEPS >= 1 && NUM_STEPS <= 8, "HiSparse speculative swap requires 1-8 steps.");
   static_assert(NUM_TOP_K >= 1024, "HiSparse speculative swap requires top_k >= 1024.");
-  static_assert(NUM_STEPS * NUM_TOP_K <= 8192, "HiSparse speculative swap supports at most 8192 occurrences.");
+  static_assert(NUM_STEPS * NUM_TOP_K <= 16384, "HiSparse speculative swap supports at most 16384 occurrences.");
   static_assert(
-      WORKSPACE_CAPACITY >= NUM_STEPS * NUM_TOP_K && WORKSPACE_CAPACITY <= 8192,
+      WORKSPACE_CAPACITY >= NUM_STEPS * NUM_TOP_K && WORKSPACE_CAPACITY <= 16384,
       "HiSparse speculative metadata must cover every occurrence and fit the compact hash index.");
 
   const auto* device_locs_ptr = PassThroughDeviceLocs ? static_cast<const int32_t*>(device_locs.data_ptr()) : nullptr;

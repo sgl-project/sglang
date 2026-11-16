@@ -75,7 +75,7 @@ class TestRustServerRequestLogAndCrashDump(CustomTestCase):
                             "temperature": 0,
                         },
                     },
-                    headers={"x-smg-routing-key": f"key-{rid}"},
+                    headers={"x-sgl-routing-key": f"key-{rid}"},
                     timeout=30,
                 )
             except requests.exceptions.RequestException:
@@ -110,7 +110,7 @@ class TestRustServerRequestLogAndCrashDump(CustomTestCase):
             receive = re.search(
                 rf"^\[[\d\- :]+\] Receive: obj=GenerateReqInput\(rid='{obj.rid}', "
                 r".*sampling_params=\{'max_new_tokens': 4, 'temperature': 0\}, .*\)"
-                rf", headers=\{{'x-smg-routing-key': 'key-{obj.rid}'\}}$",
+                rf", headers=\{{'x-sgl-routing-key': 'key-{obj.rid}'\}}$",
                 log,
                 re.MULTILINE,
             )

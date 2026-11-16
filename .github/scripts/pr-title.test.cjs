@@ -71,7 +71,7 @@ const valid = [
   'Revert "A legacy title without tags or scope"',
   'Revert "Revert "[Fix] attention: Fix output""',
   'Revert "x"',
-  ...['Feat', 'Fix', 'Refactor', 'Perf', 'Doc', 'Test', 'CI', 'Chore']
+  ...['Feat', 'Fix', 'Refactor', 'Perf', 'Doc', 'Test', 'CI', 'Chore', 'Misc']
     .map(type => `[${type}] attention: Update implementation`),
   '[Feat] qwen3: Add model support',
   '[Perf] [AMD] flash-attn: Optimize decode performance',

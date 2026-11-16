@@ -7,6 +7,7 @@ import math
 from typing import TYPE_CHECKING, Any, Optional
 
 from sglang.srt.entrypoints.openai.chat_encoding_adapters import (
+    OPENAI_CHAT_WIRE,
     select_new_output_ids,
     token_output_sse_chunks,
 )
@@ -15,6 +16,7 @@ from sglang.srt.entrypoints.openai.protocol import (
     FunctionResponse,
     ResponsesRequest,
     ToolCall,
+    ToolChoice,
 )
 from sglang.srt.function_call.core_types import ToolCallItem
 from sglang.srt.parser.inkling_output import (
@@ -36,7 +38,10 @@ if TYPE_CHECKING:
 
 class InklingChatEncodingAdapter:
     collects_openai_media = True
-    strict_tool_call_arguments = True
+    history_tool_call_arguments = "strict"
+    renders_response_format = False
+    uncounted_prompt_tokens = 0
+    wire = OPENAI_CHAT_WIRE
 
     def __init__(
         self,
@@ -69,6 +74,9 @@ class InklingChatEncodingAdapter:
     def output(self) -> Optional[InklingChatEncodingAdapter]:
         return self if self._token_output else None
 
+    def validate_request(self, request: ChatCompletionRequest) -> Optional[str]:
+        return None
+
     def encode_messages(
         self,
         *,
@@ -84,8 +92,15 @@ class InklingChatEncodingAdapter:
         if reasoning_effort is None:
             reasoning_effort = self._default_reasoning_effort
         assistant_prefix = _pop_assistant_prefix(messages, request)
+        tool_choice = request.tool_choice
+        if isinstance(tool_choice, ToolChoice):
+            tool_choice = tool_choice.model_dump()
         prompt_ids = render_inkling_messages(
-            messages, tools=tools, reasoning_effort=reasoning_effort
+            messages,
+            tools=tools,
+            tool_choice=tool_choice,
+            parallel_tool_calls=request.parallel_tool_calls,
+            reasoning_effort=reasoning_effort,
         )
         if assistant_prefix is not None:
             prompt_ids += render_inkling_assistant_prefix(assistant_prefix)
@@ -98,9 +113,10 @@ class InklingChatEncodingAdapter:
         output_ids: list[int],
         finish_reason: dict[str, Any],
     ) -> tuple[str | None, str, list[ToolCall] | None, dict[str, Any]]:
-        parsed = self._new_output_parser(request).finish(
-            output_ids,
-            matched_stop=finish_reason.get("matched"),
+        parsed = _finish(
+            parser=self._new_output_parser(request),
+            token_ids=output_ids,
+            finish_reason=finish_reason,
             keep_matched_stop=request.no_stop_trim,
         )
         if not parsed.tool_calls:
@@ -139,9 +155,10 @@ class InklingChatEncodingAdapter:
         if finish_reason_type is None:
             delta = parser.feed(new_output_ids)
         else:
-            delta = parser.finish(
-                new_output_ids,
-                matched_stop=content["meta_info"]["finish_reason"].get("matched"),
+            delta = _finish(
+                parser=parser,
+                token_ids=new_output_ids,
+                finish_reason=content["meta_info"]["finish_reason"],
                 keep_matched_stop=request.no_stop_trim,
             )
 
@@ -174,11 +191,13 @@ class InklingChatEncodingAdapter:
         parse_tool_calls: bool,
     ) -> tuple[str, str, list[ToolCallItem]]:
         parser = InklingOutputParser(
-            separate_reasoning=separate_reasoning, parse_tool_calls=parse_tool_calls
+            separate_reasoning=separate_reasoning,
+            parse_tool_calls=parse_tool_calls,
         )
-        delta = parser.finish(
-            output_ids,
-            matched_stop=(finish_reason or {}).get("matched"),
+        delta = _finish(
+            parser=parser,
+            token_ids=output_ids,
+            finish_reason=finish_reason,
             keep_matched_stop=False,
         )
         return delta.reasoning, delta.content, _tool_call_items(delta)
@@ -192,7 +211,8 @@ class InklingChatEncodingAdapter:
         parse_tool_calls: bool,
     ) -> InklingResponsesStream:
         return InklingResponsesStream(
-            separate_reasoning=separate_reasoning, parse_tool_calls=parse_tool_calls
+            separate_reasoning=separate_reasoning,
+            parse_tool_calls=parse_tool_calls,
         )
 
     def _new_output_parser(self, request: ChatCompletionRequest) -> InklingOutputParser:
@@ -221,9 +241,15 @@ class InklingChatEncodingAdapter:
 
 
 class InklingResponsesStream:
-    def __init__(self, *, separate_reasoning: bool, parse_tool_calls: bool):
+    def __init__(
+        self,
+        *,
+        separate_reasoning: bool,
+        parse_tool_calls: bool,
+    ):
         self._parser = InklingOutputParser(
-            separate_reasoning=separate_reasoning, parse_tool_calls=parse_tool_calls
+            separate_reasoning=separate_reasoning,
+            parse_tool_calls=parse_tool_calls,
         )
         self._incremental = get_serving().incremental_streaming_output
 
@@ -240,12 +266,30 @@ class InklingResponsesStream:
         if finish_reason is None:
             delta = self._parser.feed(new_output_ids)
         else:
-            delta = self._parser.finish(
-                new_output_ids,
-                matched_stop=finish_reason.get("matched"),
+            delta = _finish(
+                parser=self._parser,
+                token_ids=new_output_ids,
+                finish_reason=finish_reason,
                 keep_matched_stop=False,
             )
         return delta.reasoning, delta.content, _tool_call_items(delta)
+
+
+def _finish(
+    *,
+    parser: InklingOutputParser,
+    token_ids: list[int],
+    finish_reason: dict[str, Any] | None,
+    keep_matched_stop: bool,
+) -> InklingOutputDelta:
+    finish_reason = finish_reason or {}
+    if finish_reason.get("type") == "abort":
+        return parser.abort(token_ids)
+    return parser.finish(
+        token_ids,
+        matched_stop=finish_reason.get("matched"),
+        keep_matched_stop=keep_matched_stop,
+    )
 
 
 def _tool_call_items(delta: InklingOutputDelta) -> list[ToolCallItem]:

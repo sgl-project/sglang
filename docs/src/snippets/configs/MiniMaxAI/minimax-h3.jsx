@@ -324,7 +324,7 @@ return {
       docsHref: "/docs/sglang-diffusion/api/cli#component-residency",
       description: "Keep weights resident for latency; shard or offload only when capacity requires it.",
       quality: "Memory policy",
-      learnMore: "#7-feature-contracts-and-advanced-recipes",
+      learnMore: "#9-feature-contracts-and-advanced-recipes",
       default: "resident",
       options: [
         {
@@ -389,7 +389,7 @@ return {
       docsHref: "/docs/sglang-diffusion/attention_backends",
       description: "Select the packed-attention kernel used by H3 transformer modules.",
       quality: "Kernel policy",
-      learnMore: "#7-feature-contracts-and-advanced-recipes",
+      learnMore: "#9-feature-contracts-and-advanced-recipes",
       default: "platform",
       options: [
         {
@@ -425,7 +425,7 @@ return {
       docsHref: "/docs/sglang-diffusion/quantization",
       description: "Choose native mixed precision or a validated online weight quantization path.",
       quality: "Weight precision",
-      learnMore: "#7-feature-contracts-and-advanced-recipes",
+      learnMore: "#9-feature-contracts-and-advanced-recipes",
       default: "native",
       options: [
         {
@@ -453,7 +453,7 @@ return {
       docsHref: "/docs/sglang-diffusion/encoder_parallel",
       description: "Control text-encoder work placement independently from DiT topology.",
       quality: "Parallel policy",
-      learnMore: "#7-feature-contracts-and-advanced-recipes",
+      learnMore: "#9-feature-contracts-and-advanced-recipes",
       default: "auto",
       options: [
         {
@@ -500,7 +500,7 @@ return {
       scope: "serve",
       description: "Choose eager execution or the measured breakable CUDA graph path.",
       quality: "Graph policy",
-      learnMore: "#7-feature-contracts-and-advanced-recipes",
+      learnMore: "#9-feature-contracts-and-advanced-recipes",
       default: "eager",
       options: [
         {
@@ -551,8 +551,8 @@ return {
           disableReason: "BCG supersedes Cache-DiT, so the preset would have no effect — switch Execution to Eager to use it.",
           soft: (s) => !(s.hw === "h200" && s.nodes === 1 && s.gpus_per_node === 4
             && ["auto", "resident"].includes(s.placement)),
-          softReason: "The 1.40× / SSIM 0.931 audit covers the resident eager 4× H200 workload; elsewhere the preset runs but its quality figures are unaudited.",
-          description: "Measured 1.40× with SSIM 0.931 and PSNR 28.16 dB on the audited workload.",
+          softReason: "The 1.99× / SSIM 0.911 audit covers the resident eager 4× H200 workload; elsewhere the preset runs but its quality figures are unaudited.",
+          description: "Measured 1.99× with SSIM 0.911 and PSNR 29.09 dB against lossless on the audited workload.",
         },
       ],
     },
@@ -749,7 +749,7 @@ return {
       if (s.quality === "high" && s.execution !== "eager") {
         coverageWarnings.push("BCG supersedes Cache-DiT, so the high preset has no effect under this execution mode.");
       } else if (s.quality === "high" && !highAudited) {
-        coverageWarnings.push("The high preset's 1.40× / SSIM 0.931 figures were audited on resident eager 4× H200; this workload is unaudited.");
+        coverageWarnings.push("The high preset's 1.99× / SSIM 0.911 figures were audited on resident eager 4× H200; this workload is unaudited.");
       }
 
       const recipe = resource.verifiedRecipes.find((entry) => entry.hw === s.hw

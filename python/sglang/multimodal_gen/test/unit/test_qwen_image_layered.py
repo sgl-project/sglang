@@ -1,3 +1,5 @@
+import os
+import tempfile
 import unittest
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -5,6 +7,8 @@ from unittest.mock import Mock, patch
 
 import numpy as np
 import torch
+from diffusers.image_processor import VaeImageProcessor
+from PIL import Image
 
 from sglang.multimodal_gen.configs.pipeline_configs import qwen_image as qwen_config
 from sglang.multimodal_gen.configs.pipeline_configs.qwen_image import (
@@ -363,6 +367,49 @@ class TestQwenImageRequestConstants(unittest.TestCase):
                 stats.append(stage.latent_stats[(latent.dtype, latent.device)])
         # the second request normalizes with the first request's device tensors
         self.assertIs(stats[0], stats[1])
+
+
+class _StopAfterPreprocess(Exception):
+    pass
+
+
+class TestLayeredInputAlpha(unittest.TestCase):
+    def test_transparent_input_keeps_its_alpha_for_the_vae(self):
+        pixels = np.zeros((64, 96, 4), dtype=np.uint8)
+        pixels[..., :3] = (30, 140, 220)
+        pixels[:, 48:, 3] = 255  # left half fully transparent
+        stage = object.__new__(qwen_image_layered.QwenImageLayeredBeforeDenoisingStage)
+        stage.vae_scale_factor = 8
+        stage.image_processor = VaeImageProcessor(vae_scale_factor=16)
+        vae_inputs = []
+
+        def preprocess(image, height, width):
+            vae_inputs.append(
+                VaeImageProcessor.preprocess(
+                    stage.image_processor, image, height, width
+                )
+            )
+            raise _StopAfterPreprocess
+
+        stage.image_processor.preprocess = preprocess
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "sticker.png")
+            Image.fromarray(pixels, "RGBA").save(path)
+            batch = Req(
+                sampling_params=QwenImageLayeredSamplingParams(
+                    prompt="layers", image_path=path
+                )
+            )
+            server_args = SimpleNamespace(
+                pipeline_config=QwenImageLayeredPipelineConfig()
+            )
+            with self.assertRaises(_StopAfterPreprocess):
+                stage.forward(batch, server_args)
+
+        alpha = vae_inputs[0][0, 3]
+        self.assertEqual(tuple(alpha.shape), (512, 768))
+        self.assertTrue(torch.all(alpha[:, :360] == -1))
+        self.assertTrue(torch.all(alpha[:, 408:] == 1))
 
 
 if __name__ == "__main__":
