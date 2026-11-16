@@ -275,6 +275,8 @@ async fn run_manager(
     // sweeps below, or drained by a `Removed` / `Added` / reconcile for
     // the same id.
     let mut pending: HashMap<WorkerId, PendingRegistration> = HashMap::new();
+    let mut suppressed_discovery: HashMap<WorkerId, WorkerSpec> = HashMap::new();
+    let (restore_tx, mut restore_rx) = mpsc::channel(128);
 
     // Periodic reconcile. `interval_at` delays the first tick by one
     // interval (no point scanning an empty registry at t=0); `Skip` means
@@ -310,6 +312,7 @@ async fn run_manager(
                     &router_inflight_load,
                     &introspector,
                     &mut pending,
+                    &mut suppressed_discovery,
                 )
                 .await;
             }
@@ -329,8 +332,21 @@ async fn run_manager(
                     &router_inflight_load,
                     &introspector,
                     &mut pending,
+                    &mut suppressed_discovery,
+                    &restore_tx,
                 )
                 .await;
+            }
+            Some(url) = restore_rx.recv() => {
+                restore_suppressed_url(
+                    &url,
+                    &mut suppressed_discovery,
+                    &registry,
+                    &cfg,
+                    &kv_index,
+                    &introspector,
+                    &mut pending,
+                );
             }
             _ = reconcile.tick() => {
                 pending.retain(|_, registration| !registration.handle.is_finished());
@@ -383,6 +399,8 @@ async fn handle_control_command(
     router_inflight_load: &Option<Arc<RouterInflightLoadRegistry>>,
     introspector: &Arc<WorkerIntrospector>,
     pending: &mut HashMap<WorkerId, PendingRegistration>,
+    suppressed_discovery: &mut HashMap<WorkerId, WorkerSpec>,
+    restore_tx: &mpsc::Sender<String>,
 ) {
     let worker_id = command.worker_id();
     let kind = command.action.kind();
@@ -424,6 +442,8 @@ async fn handle_control_command(
             let metrics = metrics.clone();
             let operation_id = command.operation_id;
             let pending_url = spec.url.clone();
+            let failed_url = pending_url.clone();
+            let restore_tx = restore_tx.clone();
             let task = tokio::spawn(async move {
                 match register_one(spec, registry, cfg, kv_index, introspector).await {
                     Ok(()) => {
@@ -433,6 +453,9 @@ async fn handle_control_command(
                     Err(error) => {
                         control.mark_failed(&operation_id, error.to_string());
                         record_control_metric(&metrics, kind, false, submitted_at);
+                        if kind == crate::workers::control::WorkerControlKind::Create {
+                            let _ = restore_tx.send(failed_url).await;
+                        }
                     }
                 }
             });
@@ -445,6 +468,7 @@ async fn handle_control_command(
             );
         }
         WorkerControlAction::Remove { .. } => {
+            let removed_url = control.get(&worker_id).map(|worker| worker.url);
             remove_worker(
                 &worker_id,
                 registry,
@@ -455,7 +479,55 @@ async fn handle_control_command(
             .await;
             control.mark_succeeded(&command.operation_id);
             record_control_metric(metrics, kind, true, submitted_at);
+            if let Some(url) = removed_url {
+                restore_suppressed_url(
+                    &url,
+                    suppressed_discovery,
+                    registry,
+                    cfg,
+                    kv_index,
+                    introspector,
+                    pending,
+                );
+            }
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn restore_suppressed_url(
+    url: &str,
+    suppressed: &mut HashMap<WorkerId, WorkerSpec>,
+    registry: &Arc<WorkerRegistry>,
+    cfg: &Option<Arc<Config>>,
+    kv_index: &Option<Arc<KvEventIndex>>,
+    introspector: &Arc<WorkerIntrospector>,
+    pending: &mut HashMap<WorkerId, PendingRegistration>,
+) {
+    let ids: Vec<_> = suppressed
+        .iter()
+        .filter(|(_, spec)| worker_urls_equal(&spec.url, url))
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in ids {
+        let Some(spec) = suppressed.remove(&id) else {
+            continue;
+        };
+        let pending_url = spec.url.clone();
+        let registry = Arc::clone(registry);
+        let cfg = cfg.clone();
+        let kv_index = kv_index.clone();
+        let introspector = Arc::clone(introspector);
+        let handle = tokio::spawn(async move {
+            let _ = register_one(spec, registry, cfg, kv_index, introspector).await;
+        });
+        pending.insert(
+            id,
+            PendingRegistration {
+                url: pending_url,
+                handle,
+            },
+        );
     }
 }
 
@@ -486,6 +558,7 @@ async fn handle_discovery_event(
     router_inflight_load: &Option<Arc<RouterInflightLoadRegistry>>,
     introspector: &Arc<WorkerIntrospector>,
     pending: &mut HashMap<WorkerId, PendingRegistration>,
+    suppressed_discovery: &mut HashMap<WorkerId, WorkerSpec>,
 ) {
     match event {
         DiscoveryEvent::Added(spec) => {
@@ -507,6 +580,7 @@ async fn handle_discovery_event(
                     worker_url = %spec.url,
                     "discovery ignored an API-managed worker URL",
                 );
+                suppressed_discovery.insert(id, spec);
                 return;
             }
             let registry_t = registry.clone();
@@ -527,6 +601,7 @@ async fn handle_discovery_event(
         }
         DiscoveryEvent::Removed { id } => {
             tracing::info!("discovery: -worker {id}");
+            suppressed_discovery.remove(&id);
             if let Some(prev) = pending.remove(&id) {
                 // Wait for the matching Added (or in-flight reconcile) to
                 // finish its registry write so the Removed observes (and
@@ -537,6 +612,10 @@ async fn handle_discovery_event(
             remove_worker(&id, registry, kv_index, router_inflight_load, "discovery").await;
         }
         DiscoveryEvent::ServicesChanged { id, services } => {
+            if let Some(spec) = suppressed_discovery.get_mut(&id) {
+                spec.services = services;
+                return;
+            }
             if let Some(prev) = pending.remove(&id) {
                 let _ = prev.handle.await;
             }
@@ -545,6 +624,10 @@ async fn handle_discovery_event(
             }
         }
         DiscoveryEvent::ModeChanged { id, mode } => {
+            if let Some(spec) = suppressed_discovery.get_mut(&id) {
+                spec.mode = mode;
+                return;
+            }
             if let Some(prev) = pending.remove(&id) {
                 // Same rationale as Removed: wait for the registry
                 // write so the mode flip lands on the new entry.

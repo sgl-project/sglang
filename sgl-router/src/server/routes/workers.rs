@@ -10,7 +10,7 @@ use crate::workers::control::{
 };
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
-use axum::http::header::{IF_MATCH, LOCATION};
+use axum::http::header::{AUTHORIZATION, IF_MATCH, LOCATION};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -26,8 +26,12 @@ pub struct WorkerListQuery {
 
 pub async fn create_worker(
     State(context): State<Arc<AppContext>>,
+    headers: HeaderMap,
     input: Result<Json<WorkerInput>, JsonRejection>,
 ) -> Result<Response, ApiError> {
+    if let Err(response) = require_mutation_auth(&context, &headers) {
+        return Ok(response);
+    }
     let accepted = control(&context)?.create(worker_input(input)?)?;
     let location = HeaderValue::from_str(&format!("/workers/{}", accepted.worker_id))
         .map_err(|error| ApiError::Internal(error.into()))?;
@@ -65,6 +69,9 @@ pub async fn replace_worker(
     headers: HeaderMap,
     input: Result<Json<WorkerInput>, JsonRejection>,
 ) -> Result<Response, ApiError> {
+    if let Err(response) = require_mutation_auth(&context, &headers) {
+        return Ok(response);
+    }
     let accepted = control(&context)?.replace(
         &WorkerId(id),
         worker_input(input)?,
@@ -78,6 +85,9 @@ pub async fn remove_worker(
     Path(id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Response, ApiError> {
+    if let Err(response) = require_mutation_auth(&context, &headers) {
+        return Ok(response);
+    }
     let accepted = control(&context)?.remove(&WorkerId(id), expected_revision(&headers)?)?;
     Ok(accepted_response(accepted, None))
 }
@@ -87,6 +97,16 @@ fn control(context: &AppContext) -> Result<&Arc<WorkerControlService>, ApiError>
         .worker_control
         .as_ref()
         .ok_or_else(|| WorkerControlError::Unavailable.into())
+}
+
+fn require_mutation_auth(context: &AppContext, headers: &HeaderMap) -> Result<(), Response> {
+    let Some(expected) = context.config.server.worker_management_auth.as_ref() else {
+        return Err(ApiError::from(WorkerControlError::Unavailable).into_response());
+    };
+    if headers.get(AUTHORIZATION) != Some(expected) {
+        return Err(StatusCode::UNAUTHORIZED.into_response());
+    }
+    Ok(())
 }
 
 fn worker_input(
@@ -181,10 +201,17 @@ mod tests {
         tokio::sync::mpsc::Receiver<crate::workers::control::WorkerControlCommand>,
     ) {
         let mut context = AppContext::stub();
+        enable_worker_management(&mut context);
         let (control, rx) =
             WorkerControlService::new(Arc::clone(&context.registry), ExternalWorkerSource::Static);
         context.worker_control = Some(Arc::clone(&control));
         (Arc::new(context), control, rx)
+    }
+
+    fn enable_worker_management(context: &mut AppContext) {
+        context.config.server.worker_management_auth = Some(axum::http::HeaderValue::from_static(
+            "Bearer test-management-key",
+        ));
     }
 
     fn json_request(method: Method, uri: &str, body: Value) -> Request<Body> {
@@ -192,6 +219,7 @@ mod tests {
             .method(method)
             .uri(uri)
             .header("content-type", "application/json")
+            .header("authorization", "Bearer test-management-key")
             .body(Body::from(body.to_string()))
             .unwrap()
     }
@@ -239,6 +267,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_worker_accepts_discovery_id_with_slash() {
+        let (context, _control, _control_rx) = context_with_control();
+        context
+            .registry
+            .add(WorkerSpec {
+                id: WorkerId("default/uid".into()),
+                url: "http://worker-1:30000".into(),
+                mode: WorkerMode::Plain,
+                model_ids: vec![ModelId("m".into())],
+                ..Default::default()
+            })
+            .unwrap();
+
+        let response = build_router(context)
+            .oneshot(
+                Request::builder()
+                    .uri("/workers/default/uid")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["id"], "default/uid");
+    }
+
+    #[tokio::test]
+    async fn worker_mutations_are_unavailable_without_management_key() {
+        let mut context = AppContext::stub();
+        let registry = Arc::clone(&context.registry);
+        let (control, _control_rx) =
+            WorkerControlService::new(Arc::clone(&context.registry), ExternalWorkerSource::Static);
+        context.worker_control = Some(control);
+        registry
+            .add(WorkerSpec {
+                id: WorkerId("read-only-worker".into()),
+                url: "http://worker-1:30000".into(),
+                mode: WorkerMode::Plain,
+                model_ids: vec![ModelId("m".into())],
+                ..Default::default()
+            })
+            .unwrap();
+        let app = build_router(Arc::new(context));
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/workers",
+                json!({"url":"http://worker-1:30000","mode":"plain"}),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response.headers()["x-router-error-code"],
+            "worker_control_unavailable"
+        );
+
+        let get = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/workers/read-only-worker")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(get.status(), StatusCode::OK);
+        let list = app
+            .oneshot(
+                Request::builder()
+                    .uri("/workers")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(list.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn worker_mutations_require_configured_bearer_token() {
+        let (context, _control, _control_rx) = context_with_control();
+        let app = build_router(context);
+        let body = json!({"url":"http://worker-1:30000","mode":"plain"});
+
+        let missing = Request::builder()
+            .method(Method::POST)
+            .uri("/workers")
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(missing).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let wrong = Request::builder()
+            .method(Method::POST)
+            .uri("/workers")
+            .header("content-type", "application/json")
+            .header("authorization", "Bearer wrong-key")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(wrong).await.unwrap().status(),
+            StatusCode::UNAUTHORIZED
+        );
+
+        let authorized = app
+            .oneshot(json_request(Method::POST, "/workers", body))
+            .await
+            .unwrap();
+        assert_eq!(authorized.status(), StatusCode::ACCEPTED);
+    }
+
+    #[tokio::test]
     async fn replace_requires_current_if_match_revision() {
         let (context, control, _control_rx) = context_with_control();
         let created = control
@@ -273,6 +421,7 @@ mod tests {
             .method(Method::PUT)
             .uri(format!("/workers/{}", created.worker_id))
             .header("content-type", "application/json")
+            .header("authorization", "Bearer test-management-key")
             .header("if-match", "0")
             .body(Body::from(
                 json!({"url":"http://worker-1:30000","mode":"decode"}).to_string(),
@@ -280,6 +429,7 @@ mod tests {
             .unwrap();
         let response = build_router(Arc::new({
             let mut context = AppContext::stub();
+            enable_worker_management(&mut context);
             context.worker_control = Some(control);
             context
         }))
@@ -308,6 +458,7 @@ mod tests {
                 Request::builder()
                     .method(Method::DELETE)
                     .uri("/workers/discovered")
+                    .header("authorization", "Bearer test-management-key")
                     .header("if-match", "1")
                     .body(Body::empty())
                     .unwrap(),
@@ -381,6 +532,7 @@ mod tests {
     async fn public_router_create_and_remove_reach_worker_manager() {
         let worker_url = spawn_fake_worker().await;
         let mut context = AppContext::stub();
+        enable_worker_management(&mut context);
         let registry = Arc::clone(&context.registry);
         let (control, control_rx) =
             WorkerControlService::new(Arc::clone(&registry), ExternalWorkerSource::Static);
@@ -426,6 +578,7 @@ mod tests {
                 Request::builder()
                     .method(Method::DELETE)
                     .uri(format!("/workers/{worker_id}"))
+                    .header("authorization", "Bearer test-management-key")
                     .header("if-match", "1")
                     .body(Body::empty())
                     .unwrap(),
@@ -457,6 +610,7 @@ mod tests {
         let worker_url = spawn_fake_worker().await;
         let barrier_url = spawn_fake_worker().await;
         let mut context = AppContext::stub();
+        enable_worker_management(&mut context);
         let registry = Arc::clone(&context.registry);
         let (control, control_rx) =
             WorkerControlService::new(Arc::clone(&registry), ExternalWorkerSource::Kubernetes);
@@ -539,10 +693,195 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_removal_restores_suppressed_discovery_worker() {
+        let worker_url = spawn_fake_worker().await;
+        let barrier_url = spawn_fake_worker().await;
+        let mut context = AppContext::stub();
+        enable_worker_management(&mut context);
+        let registry = Arc::clone(&context.registry);
+        let (control, control_rx) =
+            WorkerControlService::new(Arc::clone(&registry), ExternalWorkerSource::Kubernetes);
+        context.worker_control = Some(Arc::clone(&control));
+        let (discovery_tx, discovery_rx) = tokio::sync::mpsc::channel(4);
+        let manager = tokio::spawn(crate::workers::manager::run_with_config_and_control(
+            discovery_rx,
+            control_rx,
+            Arc::clone(&control),
+            None,
+            None,
+            None,
+            None,
+        ));
+        let app = build_router(Arc::new(context));
+
+        let response = app
+            .clone()
+            .oneshot(json_request(
+                Method::POST,
+                "/workers",
+                json!({"url":worker_url,"mode":"plain"}),
+            ))
+            .await
+            .unwrap();
+        let accepted = body_json(response).await;
+        let api_id = WorkerId(accepted["worker_id"].as_str().unwrap().to_owned());
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while registry.get(&api_id).is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("API worker registration");
+
+        let discovered_id = WorkerId("suppressed-discovery".into());
+        discovery_tx
+            .send(DiscoveryEvent::Added(WorkerSpec {
+                id: discovered_id.clone(),
+                url: worker_url,
+                mode: WorkerMode::Plain,
+                model_ids: vec![ModelId("m".into())],
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        let barrier_id = WorkerId("suppression-barrier".into());
+        discovery_tx
+            .send(DiscoveryEvent::Added(WorkerSpec {
+                id: barrier_id.clone(),
+                url: barrier_url,
+                mode: WorkerMode::Plain,
+                model_ids: vec![ModelId("m".into())],
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while registry.get(&barrier_id).is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("discovery barrier registration");
+        assert!(registry.get(&discovered_id).is_none());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method(Method::DELETE)
+                    .uri(format!("/workers/{api_id}"))
+                    .header("authorization", "Bearer test-management-key")
+                    .header("if-match", "1")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while registry.get(&discovered_id).is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("suppressed discovery worker restoration");
+        manager.abort();
+    }
+
+    #[tokio::test]
+    async fn failed_api_create_restores_suppressed_discovery_worker() {
+        let existing_url = spawn_fake_worker().await;
+        let (worker_url, introspection_started) = spawn_slow_fake_worker().await;
+        let mut context = AppContext::stub();
+        enable_worker_management(&mut context);
+        let registry = Arc::clone(&context.registry);
+        let (control, control_rx) =
+            WorkerControlService::new(Arc::clone(&registry), ExternalWorkerSource::Kubernetes);
+        context.worker_control = Some(Arc::clone(&control));
+        let (discovery_tx, discovery_rx) = tokio::sync::mpsc::channel(4);
+        let manager = tokio::spawn(crate::workers::manager::run_with_config_and_control(
+            discovery_rx,
+            control_rx,
+            Arc::clone(&control),
+            None,
+            None,
+            None,
+            None,
+        ));
+        let app = build_router(Arc::new(context));
+
+        let existing_id = WorkerId("existing-prefill".into());
+        discovery_tx
+            .send(DiscoveryEvent::Added(WorkerSpec {
+                id: existing_id.clone(),
+                url: existing_url,
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("m".into())],
+                bootstrap_port: Some(8998),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while registry.get(&existing_id).is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("existing prefill registration");
+
+        let response = app
+            .oneshot(json_request(
+                Method::POST,
+                "/workers",
+                json!({"url":worker_url,"mode":"plain"}),
+            ))
+            .await
+            .unwrap();
+        let accepted = body_json(response).await;
+        let api_id = WorkerId(accepted["worker_id"].as_str().unwrap().to_owned());
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            introspection_started.notified(),
+        )
+        .await
+        .expect("API worker introspection start");
+
+        let discovered_id = WorkerId("suppressed-prefill".into());
+        discovery_tx
+            .send(DiscoveryEvent::Added(WorkerSpec {
+                id: discovered_id.clone(),
+                url: worker_url,
+                mode: WorkerMode::Prefill,
+                model_ids: vec![ModelId("m".into())],
+                bootstrap_port: Some(8998),
+                ..Default::default()
+            }))
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let failed = control.get(&api_id).is_some_and(|worker| {
+                    worker
+                        .operation
+                        .is_some_and(|operation| operation.state == OperationState::Failed)
+                });
+                if failed && registry.get(&discovered_id).is_some() {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("suppressed discovery worker restoration after API failure");
+        manager.abort();
+    }
+
+    #[tokio::test]
     async fn api_create_does_not_race_pending_discovery_for_the_same_url() {
         let (worker_url, introspection_started) = spawn_slow_fake_worker().await;
         let barrier_url = spawn_fake_worker().await;
         let mut context = AppContext::stub();
+        enable_worker_management(&mut context);
         let registry = Arc::clone(&context.registry);
         let (control, control_rx) =
             WorkerControlService::new(Arc::clone(&registry), ExternalWorkerSource::Kubernetes);

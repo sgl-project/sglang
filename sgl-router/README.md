@@ -126,9 +126,12 @@ Endpoints for features the router does not provide yet (the stored-response
 routes under `/v1/responses/`, the Conversations API, `/v1/loads`) answer
 `501` with error code `unsupported_endpoint`.
 
-Worker mutations return `202`. `GET /workers/{id}` exposes the operation and
-runtime state. `PUT` and `DELETE` require the current revision in `If-Match`;
-workers created by static or Kubernetes discovery are read-only.
+Worker mutations require `--worker-management-api-key` and a matching
+`Authorization: Bearer <key>` header; without the flag they are unavailable.
+They return `202`. `GET /workers/{id}` exposes the operation and runtime state,
+including discovery IDs that contain `/`. `PUT` and `DELETE` require the current
+revision in `If-Match`; workers created by static or Kubernetes discovery are
+read-only.
 
 Both edges speak cleartext HTTP/2 where the peer does; see
 [operations](#operations). With `--grpc-port`, the router also serves the
@@ -383,6 +386,9 @@ unset fields inherit the CLI flags. See
   [request body size](REFERENCE.md#request-body-size).
 - **Engine API key**: `--worker-api-key` for engines launched with `--api-key`;
   see [engines with `--api-key`](REFERENCE.md#engines-with---api-key).
+- **Worker management API key**: `--worker-management-api-key` enables and
+  authenticates `POST`, `PUT`, and `DELETE` under `/workers`; it is independent
+  from the engine API key.
 - **Sampling contract**: `--override-sampling-params '<json>'` pins sampling
   parameters fleet-wide; `--sampling-param-conflict reject|allow` decides what
   happens to requests that differ. See

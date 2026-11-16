@@ -234,7 +234,7 @@ pub fn build_router_with_body_limit(ctx: Arc<AppContext>, max_body_bytes: usize)
                 .post(crate::server::routes::workers::create_worker),
         )
         .route(
-            "/workers/{id}",
+            "/workers/{*id}",
             get(crate::server::routes::workers::get_worker)
                 .put(crate::server::routes::workers::replace_worker)
                 .delete(crate::server::routes::workers::remove_worker),
