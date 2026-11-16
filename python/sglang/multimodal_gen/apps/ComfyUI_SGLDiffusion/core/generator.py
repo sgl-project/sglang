@@ -624,7 +624,6 @@ class SGLDiffusionGenerator:
         """Get ComfyUI model from model path."""
         if model_options is None:
             model_options = {}
-        dtype = model_options.get("dtype", None)
         # Header-only read: H3 BF16 is ~66GB and we only need keys + shapes
         # for detect_unet_config. SGLD loads the real weights later.
         from comfy import model_detection, model_management
@@ -677,13 +676,10 @@ class SGLDiffusionGenerator:
                 for k in diffusers_keys:
                     if k in sd:
                         new_sd[diffusers_keys[k]] = sd.pop(k)
-        if dtype is None:
-            unet_dtype = model_management.unet_dtype(
-                model_params=parameters,
-                supported_dtypes=model_config.supported_inference_dtypes,
-            )
-        else:
-            unet_dtype = dtype
+        unet_dtype = model_management.unet_dtype(
+            model_params=parameters,
+            supported_dtypes=model_config.supported_inference_dtypes,
+        )
 
         manual_cast_dtype = model_management.unet_manual_cast(
             unet_dtype, load_device, model_config.supported_inference_dtypes
