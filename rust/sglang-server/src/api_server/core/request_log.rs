@@ -416,9 +416,6 @@ impl RequestLog {
     /// Python's single-request normalization of the fields the request
     /// carries.
     fn normalize(&self, item: &mut Map<String, Value>, request: &GenerateRequest) {
-        // The deprecated `data_parallel_rank` moves to `routed_dp_rank`, as
-        // `/generate` decodes it.
-        crate::message::request::move_deprecated_dp_rank(item);
         if item.get("sampling_params").is_none_or(Value::is_null) {
             item.insert("sampling_params".into(), Value::Object(Map::new()));
         }
@@ -927,10 +924,6 @@ fn unix_time() -> f64 {
 
 // --- the log lines ----------------------------------------------------------
 
-/// Kept with each batch item, whose normalization moves `data_parallel_rank`
-/// to `routed_dp_rank`.
-const DP_RANK_FIELDS: [&str; 2] = ["data_parallel_rank", "routed_dp_rank"];
-
 struct RequestLogger {
     config: RequestLogConfig,
     skip_names: HashSet<String>,
@@ -988,22 +981,18 @@ impl RequestLogger {
     }
 
     /// Item `i`'s own fields of a batch body, as Python's `obj[i]` takes
-    /// them: its entry of each per-item field, and the dp rank fields the
-    /// item's normalization reads.
+    /// them: its entry of each per-item field.
     fn batch_item(&self, fields: &Map<String, Value>, i: usize) -> Map<String, Value> {
         fields
             .iter()
             .filter_map(|(name, value)| {
-                let value = if self.batch_item_fields.contains(name) {
-                    match value {
-                        Value::Array(values) => values.get(i)?.clone(),
-                        // One value for every item.
-                        value => value.clone(),
-                    }
-                } else if DP_RANK_FIELDS.contains(&name.as_str()) {
-                    value.clone()
-                } else {
+                if !self.batch_item_fields.contains(name) {
                     return None;
+                }
+                let value = match value {
+                    Value::Array(values) => values.get(i)?.clone(),
+                    // One value for every item.
+                    value => value.clone(),
                 };
                 Some((name.clone(), value))
             })
@@ -1014,10 +1003,7 @@ impl RequestLogger {
     fn batch_shared(&self, fields: &Map<String, Value>) -> Map<String, Value> {
         fields
             .iter()
-            .filter(|(name, _)| {
-                self.batch_shared_fields.contains(name.as_str())
-                    && !DP_RANK_FIELDS.contains(&name.as_str())
-            })
+            .filter(|(name, _)| self.batch_shared_fields.contains(name.as_str()))
             .map(|(name, value)| (name.clone(), value.clone()))
             .collect()
     }
@@ -1085,11 +1071,6 @@ impl RequestLogger {
         mut body: Map<String, Value>,
     ) -> Map<String, Value> {
         let is_null = |value: Option<&Value>| value.is_none_or(Value::is_null);
-        // `_migrate_deprecated_dp_rank`.
-        if !is_null(body.get("data_parallel_rank")) && is_null(body.get("routed_dp_rank")) {
-            let rank = body["data_parallel_rank"].clone();
-            body.insert("routed_dp_rank".into(), rank);
-        }
         let fields = match request {
             OpenAiRequest::ChatCompletion => {
                 // `set_tool_choice_default`.

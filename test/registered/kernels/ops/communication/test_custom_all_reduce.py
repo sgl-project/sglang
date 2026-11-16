@@ -38,6 +38,12 @@ from sglang.srt.distributed.device_communicators.custom_all_reduce_v2 import (
     CustomAllReduceV2,
     choose_algo,
 )
+from sglang.srt.distributed.device_communicators.ring_simple_all_reduce import (
+    HIER_RING_SIMPLE_BUFFER_SIZE,
+    RING_SIMPLE_BUFFER_SIZE,
+    HierRingSimpleAllReduce,
+    RingSimpleAllReduce,
+)
 from sglang.srt.runtime_context import get_parallel
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.kernels.utils import multigpu_pytest_main
@@ -161,18 +167,11 @@ def _init_nccl_group_once() -> dist.ProcessGroup:
 
 
 @cache_once
-def _init_comm_once(
-    max_push_blocks: int | None = None, ring_simple_buffer_size: int | None = None
-) -> CustomAllReduceV2:
+def _init_comm_once(max_push_blocks: int | None = None) -> CustomAllReduceV2:
     cpu_group = _init_cpu_group_once()
     device = torch.device(f"cuda:{int(os.environ['LOCAL_RANK'])}")
     max_size = max(TEST_SIZES) * max(
         torch.tensor([], dtype=d).element_size() for d in TEST_DTYPES
-    )
-    ring_kwargs = (
-        {}
-        if ring_simple_buffer_size is None
-        else {"ring_simple_buffer_size": ring_simple_buffer_size}
     )
     comm = CustomAllReduceV2(
         cpu_group,
@@ -180,12 +179,61 @@ def _init_comm_once(
         max_pull_size=max_size,
         max_push_size=max_size,
         max_push_blocks=max_push_blocks,
-        **ring_kwargs,
     )
     if comm.disabled:
         raise RuntimeError("JIT CustomAllReduceV2 is disabled on this system")
     register_comm_cleanup(comm)
     return comm
+
+
+def _is_gfx1250() -> bool:
+    return bool(torch.version.hip) and torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).gcnArchName.startswith("gfx1250")
+
+
+@cache_once
+def _init_ring_once(buffer_size: int) -> RingSimpleAllReduce | None:
+    """A ring plane whatever the tuned table picks; None off ROCm gfx1250."""
+    comm = _init_comm_once()
+    if not _is_gfx1250():
+        return None
+    ring = RingSimpleAllReduce(
+        group=comm.group,
+        device=comm.device,
+        rank=comm.rank,
+        world_size=comm.world_size,
+        num_channels=comm.config.num_ring_simple_channels,
+        slot_bytes=buffer_size // 2,
+    )
+    register_comm_cleanup(ring)
+    return ring
+
+
+@cache_once
+def _init_hier_ring_once(buffer_size: int) -> HierRingSimpleAllReduce | None:
+    """A hier ring plane whatever the tuned table picks; None unless partition pairs."""
+    comm = _init_comm_once()
+    if not _is_gfx1250():
+        return None
+    from sglang.srt.distributed.device_communicators.gfx1250_fabric import (
+        probe_dpx_pairs,
+    )
+
+    pairs = probe_dpx_pairs(comm.group, comm.device)
+    if pairs is None or len(pairs) < 2:
+        return None
+    hier_ring = HierRingSimpleAllReduce(
+        group=comm.group,
+        device=comm.device,
+        rank=comm.rank,
+        world_size=comm.world_size,
+        pairs=pairs,
+        num_channels=comm.config.num_ring_simple_channels,
+        slot_bytes=buffer_size // 2,
+    )
+    register_comm_cleanup(hier_ring)
+    return hier_ring
 
 
 # ---------------------------------------------------------------------------
@@ -227,7 +275,7 @@ def test_two_shot_push_single_block(
 @pytest.mark.parametrize("size", TEST_SIZES)
 @torch.inference_mode()
 def test_ring_simple(size: int, dtype: torch.dtype, use_graph: bool) -> None:
-    _check_custom_all_reduce(size, dtype, None, use_graph, _init_comm_once())
+    _check_ring(size, dtype, use_graph, _init_ring_once(RING_SIMPLE_BUFFER_SIZE))
 
 
 @pytest.mark.parametrize("use_graph", USE_GRAPH_OPTIONS)
@@ -235,8 +283,35 @@ def test_ring_simple(size: int, dtype: torch.dtype, use_graph: bool) -> None:
 @pytest.mark.parametrize("size", TEST_SIZES)
 @torch.inference_mode()
 def test_ring_small_fifo(size: int, dtype: torch.dtype, use_graph: bool) -> None:
-    comm = _init_comm_once(ring_simple_buffer_size=RING_SMALL_FIFO_BYTES)
-    _check_custom_all_reduce(size, dtype, None, use_graph, comm)
+    _check_ring(size, dtype, use_graph, _init_ring_once(RING_SMALL_FIFO_BYTES))
+
+
+def _check_ring(size: int, dtype: torch.dtype, use_graph: bool, ring) -> None:
+    if ring is None:
+        pytest.skip("the ring all-reduce is only enabled on ROCm gfx1250")
+    _check_custom_all_reduce(
+        size, dtype, None, use_graph, _init_comm_once(), reduce=ring.all_reduce
+    )
+
+
+@pytest.mark.parametrize(
+    "buffer_size", [HIER_RING_SIMPLE_BUFFER_SIZE, RING_SMALL_FIFO_BYTES]
+)
+@pytest.mark.parametrize("use_graph", USE_GRAPH_OPTIONS)
+@pytest.mark.parametrize("dtype", TEST_DTYPES)
+@pytest.mark.parametrize("size", TEST_SIZES)
+@torch.inference_mode()
+def test_hier_ring_simple(
+    size: int, dtype: torch.dtype, use_graph: bool, buffer_size: int
+) -> None:
+    hier_ring = _init_hier_ring_once(buffer_size)
+    if hier_ring is None:
+        pytest.skip(
+            "hier_ring_simple needs ROCm gfx1250 partition pairs on at least two accelerators"
+        )
+    _check_custom_all_reduce(
+        size, dtype, None, use_graph, _init_comm_once(), reduce=hier_ring.all_reduce
+    )
 
 
 def _check_custom_all_reduce(
@@ -245,13 +320,11 @@ def _check_custom_all_reduce(
     algo: AllReduceAlgo | None,
     use_graph: bool,
     comm: CustomAllReduceV2,
+    reduce=None,
 ) -> None:
-    """``algo`` None runs the ring all-reduce, which is not a forced-algo choice."""
-    if algo is None:
-        if comm._ring is None:
-            pytest.skip("the ring all-reduce is only enabled on ROCm gfx1250")
+    """With ``reduce`` (a ring all-reduce, not a forced-algo choice), ``algo`` is None."""
+    if reduce is not None:
         comm.forced_algo = None
-        reduce = comm._ring.all_reduce
     else:
         comm.forced_algo = algo
         reduce = comm.custom_all_reduce
@@ -332,7 +405,7 @@ def test_custom_all_reduce_tuned_eager(size: int, dtype: torch.dtype) -> None:
 
 @torch.inference_mode()
 def test_custom_all_reduce_tuned_ring() -> None:
-    """Where the tuned table picks ring_simple, eager calls launch it."""
+    """Where the tuned table picks ring_simple (or hier_ring_simple), eager calls launch it."""
     comm = _init_comm_once()
     comm.forced_algo = None
     nbytes = 64 * 1024 * 1024
