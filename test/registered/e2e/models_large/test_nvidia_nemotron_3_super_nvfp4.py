@@ -36,7 +36,7 @@ DP_ATTENTION_EP_ARGS = [
     "--ep-size",
     "4",
     "--moe-a2a-backend",
-    "flashinfer",
+    "flashinfer_nvlink_one_sided",
     "--moe-runner-backend",
     "flashinfer_cutedsl",
     "--mamba-full-memory-ratio",

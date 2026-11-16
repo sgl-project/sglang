@@ -47,6 +47,8 @@ class TritonGDNKernel(LinearAttnKernelBase):
 
     supports_packed_decode: bool = not is_cpu() and not is_npu()
     supports_strided_target_verify_qkv: bool = True
+    # The chunk kernel steps slots by the pool's stride(0) in int64.
+    extend_honors_slot_pitch: bool = True
 
     def extend_reads_strided_qkv(self, q: torch.Tensor, k: torch.Tensor) -> bool:
         return is_cuda() and chunk_gated_delta_rule_reads_strided_qk(q=q, k=k)

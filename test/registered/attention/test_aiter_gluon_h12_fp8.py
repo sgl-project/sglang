@@ -254,6 +254,7 @@ class TestForwardMlaDecodeDispatch(CustomTestCase):
             reduce_final_map=None,
             reduce_partial_map=None,
             num_kv_splits=None,
+            triton_mla_block_tables=None,
         )
         be.token_to_kv_pool = mock.Mock(
             get_key_buffer=lambda _lid: torch.zeros(8, 576, dtype=fp8_dtype)

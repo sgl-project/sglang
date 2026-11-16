@@ -47,8 +47,6 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: status.hostIP
-          - name: INSTALL_SGLANG_FROM_SOURCE
-            value: "{{ install_sglang_from_source }}"
           - name: KUBECONFIG
             value: "{{ kube_config }}"
           - name: NAMESPACE
@@ -59,6 +57,8 @@ spec:
             value: "https://hf-mirror.com"
           - name: METRICS_DATA_FILE
             value: "{{ metrics_data_file }}"
+          - name: NPU_ACCURACY_DATASET
+            value: "{{ accuracy_dataset }}"
           - name: SGLANG_IS_IN_CI
             value: "{{ sglang_is_in_ci }}"
           - name: RUN_LABEL
@@ -170,8 +170,6 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: status.hostIP
-          - name: INSTALL_SGLANG_FROM_SOURCE
-            value: "{{ install_sglang_from_source }}"
           - name: KUBECONFIG
             value: "{{ kube_config }}"
           - name: NAMESPACE
@@ -182,6 +180,8 @@ spec:
             value: "https://hf-mirror.com"
           - name: METRICS_DATA_FILE
             value: "{{ metrics_data_file }}"
+          - name: NPU_ACCURACY_DATASET
+            value: "{{ accuracy_dataset }}"
           - name: SGLANG_IS_IN_CI
             value: "{{ sglang_is_in_ci }}"
           - name: RUN_LABEL
@@ -268,7 +268,7 @@ spec:
           accelerator-type: module-a3-16
           {% endif %}
         restartPolicy: OnFailure
-  - name: "sglang-router"
+  - name: "sgl-router"
     replicas: {{ router_size }}
     template:
       metadata:
@@ -293,10 +293,10 @@ spec:
             valueFrom:
               fieldRef:
                 fieldPath: status.hostIP
-          - name: INSTALL_SGLANG_FROM_SOURCE
-            value: "{{ install_sglang_from_source }}"
           - name: METRICS_DATA_FILE
             value: "{{ metrics_data_file }}"
+          - name: NPU_ACCURACY_DATASET
+            value: "{{ accuracy_dataset }}"
           - name: RUN_LABEL
             value: "{{ run_label }}"
           - name: KUBECONFIG
