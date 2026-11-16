@@ -18,7 +18,7 @@ By default, SGLang does not log any request contents. You can log them by using 
 You can control the verbosity by using `--log-requests-level`.
 See [Logging](./server_arguments#logging) for more details.
 
-You can change verbosity at runtime:
+You can change verbosity at runtime. `/configure_logging` is an admin endpoint, so the server must be launched with `SGLANG_ADMIN_API_KEY` set (or `--admin-api-key`), and the tool reads the same key from `SGLANG_ADMIN_API_KEY`:
 
 ```bash Command
 python3 -m sglang.srt.managers.configure_logging --url http://localhost:30000 --log-level=debug
