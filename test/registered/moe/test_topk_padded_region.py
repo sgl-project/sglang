@@ -1,7 +1,9 @@
+import sys
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
@@ -682,4 +684,4 @@ class TestDpPadRows(CustomTestCase):
 
 
 if __name__ == "__main__":
-    unittest.main()
+    sys.exit(pytest.main([__file__]))
