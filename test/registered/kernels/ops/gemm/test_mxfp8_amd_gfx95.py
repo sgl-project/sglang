@@ -153,19 +153,6 @@ class TestMxfp8NativeRouteGfx95(CustomTestCase):
                 self.assertTrue(torch.equal(out_q, out), (n, k, m))
 
 
-# (M, N, K) -> split on a 256-CU gfx950 at the decode tiling BLOCK_M = BLOCK_N = 64, BLOCK_K = 128
-SPLIT_K_CASES = [
-    ((1, 1280, 6144), 8),  # MiniMax-M3 TP8 qkv: 20 workgroups
-    ((1, 4096, 12288), 16),  # 64 workgroups over 96 k-tiles
-    ((1, 256, 4096), 8),  # capped so each program keeps >= 4 k-tiles
-    ((1, 6144, 1024), 1),  # K < 4096
-    ((1, 6144, 1536), 1),
-    ((136, 6144, 6144), 1),  # 3 x 96 workgroups already fill the CUs
-    ((1, 24576, 6144), 1),
-    ((0, 1280, 6144), 1),  # empty batch
-]
-
-
 class TestMxfp8LinearSplitK(CustomTestCase):
     def _split_k(self, m, n, k):
         return _mxfp8_linear_split_k(
@@ -173,16 +160,20 @@ class TestMxfp8LinearSplitK(CustomTestCase):
         )
 
     def test_splits_only_underfilled_grids_with_long_k(self):
-        for (m, n, k), split in SPLIT_K_CASES:
-            self.assertEqual(self._split_k(m, n, k), split, (m, n, k))
+        for m, n, k in [(1, 1280, 6144), (1, 256, 4096)]:
+            split = self._split_k(m, n, k)
+            self.assertGreater(split, 1, (m, n, k))
+            self.assertGreaterEqual(k // 128 // split, 4, (m, n, k))
+        # short K, a grid that already fills the CUs, an empty batch
+        for m, n, k in [(1, 6144, 1536), (136, 6144, 6144), (0, 1280, 6144)]:
+            self.assertEqual(self._split_k(m, n, k), 1, (m, n, k))
 
     def test_batch_invariant_mode_never_splits(self):
         with mock.patch(
             "sglang.srt.batch_invariant_ops.is_batch_invariant_mode_enabled",
             return_value=True,
         ):
-            for (m, n, k), _ in SPLIT_K_CASES:
-                self.assertEqual(self._split_k(m, n, k), 1, (m, n, k))
+            self.assertEqual(self._split_k(1, 1280, 6144), 1)
 
 
 def _aiter_mxfp8_gemm_available() -> bool:

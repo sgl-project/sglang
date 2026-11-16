@@ -159,10 +159,10 @@ def _mxfp8_linear_num_cu(device: torch.device) -> int:
 
 
 def _pow2_floor(value: int) -> int:
-    return 1 << (max(1, value).bit_length() - 1)
+    return 1 << (value.bit_length() - 1)
 
 
-# K < 4096 (32 k-tiles at BLOCK_K = 128) was not measured; it keeps the single-pass kernel.
+# shorter K (< 32 k-tiles) was not measured and keeps the single pass
 _SPLIT_K_MIN_K_TILES = 32
 _SPLIT_K_MAX = 32
 
