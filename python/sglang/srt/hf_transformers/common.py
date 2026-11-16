@@ -667,7 +667,7 @@ def _override_v_head_dim_if_zero(config: PretrainedConfig, patch: int = 128) -> 
 
 
 # ---------------------------------------------------------------------------
-# Context length / generation config / sparse attention
+# Context length / generation config
 # ---------------------------------------------------------------------------
 
 # Models don't use the same configuration key for determining the maximum

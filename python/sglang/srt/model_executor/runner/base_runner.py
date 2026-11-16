@@ -584,8 +584,8 @@ class BaseRunner(ABC):
                 )
                 get_flags().capture.enable_torch_compile = False
 
-        # NOTE: aux hidden state capture (eagle3/dflash) is already
-        # configured by init_aux_hidden_state_capture() in initialize().
+        # NOTE: aux hidden state capture (eagle3/dflash) is already configured
+        # by configure_aux_hidden_state_capture() in init_attention_backends().
 
         # Token-axis buffer views and counters.
         input_ids = buffers.input_ids[:num_tokens]
