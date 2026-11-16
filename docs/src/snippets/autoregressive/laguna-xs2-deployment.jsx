@@ -34,7 +34,6 @@ export const LagunaXS2Deployment = () => {
     reasoning: {
       name: 'reasoning',
       title: 'Reasoning Parser',
-      condition: (values) => values.hardware !== 'xeon',
       items: [
         { id: 'disabled', label: 'Disabled', default: false },
         { id: 'enabled',  label: 'Enabled',  default: true }
@@ -43,7 +42,6 @@ export const LagunaXS2Deployment = () => {
     toolcall: {
       name: 'toolcall',
       title: 'Tool Call Parser',
-      condition: (values) => values.hardware !== 'xeon',
       items: [
         { id: 'disabled', label: 'Disabled', default: false },
         { id: 'enabled',  label: 'Enabled',  default: true }
@@ -113,8 +111,6 @@ export const LagunaXS2Deployment = () => {
         }
       });
       if (next.hardware === 'xeon') {
-        next.reasoning = 'disabled';
-        next.toolcall = 'disabled';
         next.dpAttention = 'disabled';
       }
       return next;
@@ -124,18 +120,6 @@ export const LagunaXS2Deployment = () => {
   const generateCommand = () => {
     const { hardware, quantization, reasoning, toolcall, dpAttention } = values;
 
-    if (hardware === 'xeon') {
-      if (quantization !== 'bf16') return '# Error: No validated Xeon recipe for this checkpoint format.';
-      return [
-        'sglang serve \\',
-        '  --model poolside/Laguna-XS.2 \\',
-        '  --device cpu \\',
-        '  --disable-overlap-schedule \\',
-        '  --tp 4 \\',
-        '  --host 0.0.0.0'
-      ].join('\n');
-    }
-
     if (hardware === 'h200' && quantization === 'nvfp4') {
       return '# Error: NVFP4 is Blackwell-only. Select B200, or pick BF16/FP8 for H200.';
     }
@@ -143,7 +127,7 @@ export const LagunaXS2Deployment = () => {
     const modelId = modelByQuant[quantization];
     if (!modelId) return `# Error: Unknown quantization: ${quantization}`;
 
-    const tp = 8;
+    const tp = hardware !== 'xeon'? 8 : 4;
     const lines = [
       'sglang serve \\',
       `  --model-path ${modelId} \\`,
@@ -166,6 +150,13 @@ export const LagunaXS2Deployment = () => {
       lines.push('  --tool-call-parser poolside_v1');
     }
 
+    if (hardware === 'xeon') {
+      if (quantization !== 'bf16') return '# Error: No validated Xeon recipe for this checkpoint format.';
+      lines[lines.length - 1] += ' \\';
+      lines.push('  --disable-overlap-schedule \\');
+      lines.push('  --device cpu')
+    }
+
     lines[lines.length - 1] += ' \\';
     lines.push('  --host 0.0.0.0 \\');
     lines.push('  --port 30000');
@@ -185,9 +176,6 @@ export const LagunaXS2Deployment = () => {
 
   return (
     <div style={containerStyle} className="not-prose">
-      {values.hardware === 'xeon' && (
-        <p>Before serving on CPU, export <code>SGLANG_USE_CPU_ENGINE=1</code> in your shell.</p>
-      )}
       {Object.entries(options).map(([key, option]) => {
         if (option.condition && !option.condition(values)) return null;
         const items = resolveItems(option, values);

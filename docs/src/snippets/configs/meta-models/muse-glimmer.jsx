@@ -138,21 +138,6 @@ export const config = {
 
   cells: [
     {
-      match: { hw: "xeon", variant: "default", quant: "bf16", strategy: "standard", nodes: "single" },
-      verified: true,
-      warn: "Before serving on CPU, export SGLANG_USE_CPU_ENGINE=1 in your shell. Only basic text generation has been checked; full context, Playground overrides, dataset accuracy, and performance are unverified.",
-      env: [],
-      omitDefaultServerAddress: true,
-      flags: [
-        "--model {{MODEL_NAME}}",
-        "--device cpu",
-        "--disable-overlap-schedule",
-        "--tp 6",
-        "--host {{HOST_IP}}",
-        "--port {{PORT}}",
-      ],
-    },
-    {
       match: { hw: "rtx5090", variant: "default", quant: "gguf", strategy: "standard", nodes: "single" },
       verified: true,
       env: [],
@@ -523,6 +508,22 @@ export const config = {
         "--speculative-draft-model-quantization fp8",
         "--kv-cache-dtype fp8_e4m3",
         "--mem-fraction-static 0.85",
+        "--host {{HOST_IP}}",
+        "--port {{PORT}}",
+      ],
+    },
+    {
+      match: { hw: "xeon", variant: "default", quant: "bf16", strategy: "standard", nodes: "single" },
+      verified: true,
+      env: [],
+      flags: [
+        "--model-path {{MODEL_NAME}}",
+        "--device cpu",
+        "--disable-overlap-schedule",
+        "--reasoning-parser muse",
+        "--tool-call-parser muse",
+        "--mem-fraction-static 0.85",
+        "--tp 6",
         "--host {{HOST_IP}}",
         "--port {{PORT}}",
       ],
