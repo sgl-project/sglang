@@ -1851,7 +1851,6 @@ class FlashInferIndicesUpdaterDecode:
         plan: IterationIds,
         req_pool_indices: torch.Tensor,
     ):
-        decode_wrappers = decode_wrappers or self.decode_wrappers
         self.call_begin_forward(
             decode_wrappers[0],
             seq_lens,

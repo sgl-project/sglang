@@ -55,12 +55,8 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.srt.utils import is_flashinfer_available, next_power_of_2
 
 if TYPE_CHECKING:
-    from sglang.srt.layers.attention.flashinfer_mla_backend import (
-        FlashInferMlaAttnBackend,
-    )
     from sglang.srt.mem_cache.kv.alloc.iteration_ids import IterationIds
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.speculative.spec_info import SpecInput
 
 if envs.SGLANG_ENABLE_TORCH_COMPILE.get():
     import logging
@@ -91,7 +87,7 @@ class PrefillMetadata:
 
 class FlashInferMhaChunkKVRunner:
     def __init__(
-        self, model_runner: ModelRunner, attn_backend: FlashInferMlaAttnBackend
+        self, model_runner: ModelRunner, attn_backend: FlashInferMLAAttnBackend
     ):
         # Parse Constants
         self.num_local_heads = (
@@ -908,7 +904,6 @@ class FlashInferMLAIndicesUpdaterDecode:
         req_pool_indices: torch.Tensor,
         **fast_decode_kwargs,
     ):
-        decode_wrapper = decode_wrapper or self.decode_wrapper
         self.call_begin_forward(
             decode_wrapper,
             seq_lens,
