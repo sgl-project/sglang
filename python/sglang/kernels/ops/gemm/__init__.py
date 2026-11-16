@@ -119,9 +119,7 @@ def _prefer_torch_rowwise_fp8(
     return (
         4096 <= m < 8192
         and (k, n) in ((5376, 21504), (7168, 5376), (5376, 28672), (14336, 5376))
-        and any(
-            model in current_arch().name.split() for model in ("H100", "H200")
-        )
+        and any(model in current_arch().name.split() for model in ("H100", "H200"))
     )
 
 
