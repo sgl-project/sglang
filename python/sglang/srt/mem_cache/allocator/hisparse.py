@@ -123,10 +123,16 @@ class HiSparseTokenToKVPoolAllocator(BaseTokenToKVPoolAllocator):
         return self._kvcache
 
     def get_hisparse_kvcache(self) -> HiSparseDSATokenToKVPool | HiSparseMHAMainPool:
-        from sglang.srt.mem_cache.memory_pool import MiniMaxSparseKVPool
+        from sglang.srt.mem_cache.memory_pool import (
+            HybridLinearKVPool,
+            MiniMaxSparseKVPool,
+        )
 
         if isinstance(self._kvcache, MiniMaxSparseKVPool):
             return self._kvcache.main_pool
+        # A hybrid linear model keeps its DSA layers in a dense full pool.
+        if isinstance(self._kvcache, HybridLinearKVPool):
+            return self._kvcache.full_kv_pool
         return self._kvcache
 
     def alloc(self, need_size: int):

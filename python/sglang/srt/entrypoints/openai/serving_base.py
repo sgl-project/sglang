@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import uuid
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any, List, Optional, Tuple, Union
 
@@ -11,6 +10,7 @@ import orjson
 from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse, StreamingResponse
 
+from sglang.srt.constants import ROUTING_KEY_HEADER
 from sglang.srt.entrypoints.openai.encoding_dsv32 import DS32EncodingError
 from sglang.srt.entrypoints.openai.protocol import ErrorResponse, OpenAIServingRequest
 from sglang.srt.managers.io_struct import EmbeddingReqInput, GenerateReqInput
@@ -146,17 +146,6 @@ class OpenAIServingBase(ABC):
         """Generate request ID based on request type"""
         pass
 
-    def _generate_request_id_base(self, request: OpenAIServingRequest) -> Optional[str]:
-        """Generate request ID based on request type"""
-        return None
-
-        # TODO(chang): the rid is used in io_strcut check and often violates `The rid should be a list` AssertionError
-        # Temporarily return None in this function until the rid logic is clear.
-        if rid := getattr(request, "rid", None):
-            return rid
-
-        return f"{self._request_id_prefix()}{uuid.uuid4().hex}"
-
     @abstractmethod
     def _convert_to_internal_request(
         self,
@@ -272,7 +261,7 @@ class OpenAIServingBase(ABC):
     def extract_routing_key(self, raw_request):
         if raw_request is None:
             return None
-        return raw_request.headers.get("x-smg-routing-key")
+        return raw_request.headers.get(ROUTING_KEY_HEADER)
 
     def extract_routed_dp_rank_from_header(
         self, raw_request: Request, body_routed_dp_rank: Optional[int] = None
