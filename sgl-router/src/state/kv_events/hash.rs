@@ -1,8 +1,8 @@
 //! Block-hash compute matching SGLang's `radix_cache` worker.
 //!
-//! This is the gateway-side mirror of SGLang's per-page SHA256 chaining used
+//! This is the router-side mirror of SGLang's per-page SHA256 chaining used
 //! to derive `BlockStored.block_hashes` on workers (Python:
-//! `python/sglang/srt/mem_cache/radix_cache.py::hash_page` and
+//! `python/sglang/srt/mem_cache/utils.py::get_hash_str` and
 //! `python/sglang/srt/mem_cache/utils.py::hash_str_to_int64`).
 //!
 //! ### Algorithm
@@ -24,7 +24,7 @@
 //! "starting point" would silently produce hashes that disagree with the
 //! worker.
 //!
-//! In the gateway we only need to compute hashes for an entire request from
+//! In the router we only need to compute hashes for an entire request from
 //! scratch (i.e. starting with no parent). That matches the Python emission
 //! path where the first page of a freshly-stored node may have a parent block
 //! hash for the radix tree key, but the **page-hash computation itself**
@@ -162,10 +162,10 @@ pub fn sha256_to_i64(digest: &[u8; 32]) -> i64 {
     i64::from_be_bytes(top)
 }
 
-/// Bigram variant of [`compute_block_hashes`], matching SGLang's `radix_cache`
-/// worker when the model runs **EAGLE speculative decoding** (`is_bigram =
-/// is_eagle`). Mirrors `RadixKey.hash_page` (Python:
-/// `mem_cache/radix_cache.py`) on the bigram path:
+/// Bigram variant of [`compute_block_hashes`], matching the SGLang worker
+/// when the model runs **EAGLE speculative decoding** (`is_bigram =
+/// is_eagle`). Mirrors the bigram path of the engine's page hashing
+/// (`python/sglang/srt/mem_cache/cpp_utils/hash_binding.cpp`):
 ///
 /// - The logical sequence is the `N-1` overlapping bigrams of `N` raw tokens,
 ///   so the page count is `ceil((len-1) / block_size)`. Fewer than 2 tokens
@@ -209,8 +209,8 @@ fn chain_bigram(token_ids: &[u32], block_size: usize, mut prior: Option<[u8; 32]
 /// Hash a single bigram page: for each unit `j` in `[start, end)`, feed
 /// `tokens[j]` then `tokens[j + 1]` (4 little-endian bytes each), chained on the
 /// parent block's full 32-byte digest. The caller guarantees `end <= len - 1`,
-/// so `tokens[j + 1]` is always in bounds. Mirrors the engine's `hash_page`
-/// bigram branch.
+/// so `tokens[j + 1]` is always in bounds. Mirrors the bigram branch of the
+/// engine's page hashing.
 #[inline]
 fn chain_block_bigram(
     parent_digest: Option<&[u8; 32]>,
@@ -234,8 +234,8 @@ mod tests {
     use super::*;
 
     // ---- Bigram cross-language goldens ----
-    // Values produced by SGLang's REAL `RadixKey(..., is_bigram=True).hash_page`
-    // + `compute_node_hash_values` chunking + `hash_str_to_int64`, run against
+    // Values produced by SGLang's bigram page hashing + `compute_node_hash_values`
+    // chunking + `hash_str_to_int64`, run against
     // the deployed DeepSeek-V4-Flash engine. These lock byte-exact equivalence
     // with the worker's stored block hashes — the contract that makes
     // cache-aware routing actually match for EAGLE/bigram models.
@@ -401,7 +401,7 @@ mod tests {
     }
 
     /// Cross-language goldens: values produced by a Python script that
-    /// mirrors `radix_cache.hash_page` (non-bigram path) and
+    /// mirrors `mem_cache.utils.get_hash_str` (non-bigram path) and
     /// `mem_cache.utils.hash_str_to_int64`. These are the contract with the
     /// SGLang worker and lock down algorithmic equivalence regardless of
     /// changes to the Rust-internal helpers.

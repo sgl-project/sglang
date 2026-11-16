@@ -849,7 +849,11 @@ def build_mega_moe_shared_weights(
 
 
 def _is_mega_moe_localization_enabled() -> bool:
-    return envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE.get() and _device_sm == 107
+    return envs.SGLANG_OPT_DEEPGEMM_MEGA_MOE_LOCALIZE.get() and _device_sm in [
+        100,
+        103,
+        107,
+    ]
 
 
 def _transform_mega_moe_shared_sf(linear) -> torch.Tensor:

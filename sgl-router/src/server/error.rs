@@ -186,8 +186,8 @@ pub enum ApiError {
         source: anyhow::Error,
     },
 
-    /// An sgl-model-gateway endpoint this router does not provide yet
-    /// (`/v1/responses`, `/workers`, ...); `path` is the request path.
+    /// An endpoint of a feature this router does not provide yet
+    /// (`/v1/responses`, `/v1/loads`, ...); `path` is the request path.
     #[error("{path} is not supported by sgl-router yet")]
     UnsupportedEndpoint { path: String },
 

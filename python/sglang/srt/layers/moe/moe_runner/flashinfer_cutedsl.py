@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import TYPE_CHECKING, Any, Optional
 
 import torch
@@ -44,32 +45,21 @@ _cutedsl_logged_scalarize: set = set()
 # ---------------------------------------------------------------------------
 
 
-def interleave_w13_halves(
-    tensor: torch.Tensor, group_size: int = 64, dim: int = 1
-) -> torch.Tensor:
-    """Interleave the two logical W13 halves for CuteDSL's SwiGLU GEMM1 layout.
+def use_cutedsl_moe_swap_ab(device: torch.device) -> bool:
+    """Select the same weight and execution layout on Blackwell SM100/SM103."""
+    if device.type != "cuda":
+        return False
+    # Resolve the current device before caching so an unindexed "cuda" device
+    # cannot reuse another GPU's result after torch.cuda.set_device().
+    device_index = device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return _use_cutedsl_moe_swap_ab(device_index)
 
-    The caller is responsible for loading W13 in the expected two-half order.
-    This helper only rewrites the first and second halves into alternating
-    `group_size` chunks along `dim`.
-    """
-    if tensor.shape[dim] % 2 != 0:
-        raise ValueError(
-            "Expected even size on interleave dimension for W13 half split."
-        )
-    split = tensor.shape[dim] // 2
-    if split % group_size != 0:
-        raise ValueError(
-            f"Expected split dim divisible by group_size={group_size}, got {split}."
-        )
-    first_half = tensor.narrow(dim, 0, split)
-    second_half = tensor.narrow(dim, split, split)
-    first_half_groups = first_half.split(group_size, dim=dim)
-    second_half_groups = second_half.split(group_size, dim=dim)
-    interleaved = [
-        item for pair in zip(first_half_groups, second_half_groups) for item in pair
-    ]
-    return torch.cat(interleaved, dim=dim)
+
+@lru_cache(maxsize=None)
+def _use_cutedsl_moe_swap_ab(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in ((10, 0), (10, 3))
 
 
 def cutedsl_quant_scale_to_scalar(
@@ -374,6 +364,7 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
                 layer.moe_runner_config.activation, ActivationType
             ),
             quant_mode=quant_mode,
+            swap_ab=use_cutedsl_moe_swap_ab(layer.w13_weight.device),
             **situ_kwargs,
         )
 
