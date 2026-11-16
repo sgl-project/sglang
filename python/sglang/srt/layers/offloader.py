@@ -115,6 +115,16 @@ def set_offloader(instance: BaseOffloader):
     _live_offloaders[id(instance)] = instance
 
 
+def finalize_weight_placement(
+    *, offloader: BaseOffloader, model: torch.nn.Module
+) -> torch.nn.Module:
+    offloader.post_init()
+    placed_model = offloader.post_load_model(model)
+    if not isinstance(placed_model, torch.nn.Module):
+        raise TypeError("BaseOffloader.post_load_model must return a torch.nn.Module")
+    return placed_model
+
+
 def forbid_copy_engine_usage() -> bool:
     """Honor every live runner's restriction on the shared copy engine.
 

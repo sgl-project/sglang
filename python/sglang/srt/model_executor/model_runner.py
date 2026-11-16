@@ -97,6 +97,7 @@ from sglang.srt.layers.moe.mega_moe import allocate_mega_moe_buffers
 from sglang.srt.layers.offloader import (
     OffloaderContext,
     create_offloader,
+    finalize_weight_placement,
     set_offloader,
 )
 from sglang.srt.layers.sampler import create_sampler
@@ -503,17 +504,7 @@ class ModelRunner:
         # Set by the scheduler when every KV offload copy waits for forward_stream.
         self.kv_offload_fenced_on_forward_stream = False
 
-        # CPU offload
-        self.offloader = create_offloader(
-            OffloaderContext(
-                device=self.device,
-                gpu_id=self.gpu_id,
-                tp_rank=get_parallel().tp_rank,
-                model_config=self.model_config,
-                is_draft_worker=self.is_draft_worker,
-            )
-        )
-        set_offloader(self.offloader)
+        self.init_offloader()
 
         self._weight_checker = WeightChecker(get_model=lambda: self.model)
 
@@ -619,6 +610,18 @@ class ModelRunner:
 
     def init_msprobe(self):
         self.msprobe_debugger = misc_utils.create_msprobe_debugger()
+
+    def init_offloader(self) -> None:
+        self.offloader = create_offloader(
+            OffloaderContext(
+                device=self.device,
+                gpu_id=self.gpu_id,
+                tp_rank=get_parallel().tp_rank,
+                model_config=self.model_config,
+                is_draft_worker=self.is_draft_worker,
+            )
+        )
+        set_offloader(self.offloader)
 
     def init_weight_updater(self):
         self.weight_updater = WeightUpdater(
@@ -1416,13 +1419,9 @@ class ModelRunner:
         del loaded
 
         if not self.is_draft_worker:
-            self.offloader.post_init()
-            model = self.offloader.post_load_model(self.model)
-            if not isinstance(model, torch.nn.Module):
-                raise TypeError(
-                    "BaseOffloader.post_load_model must return a torch.nn.Module"
-                )
-            self.model = model
+            self.model = finalize_weight_placement(
+                offloader=self.offloader, model=self.model
+            )
 
         self.maybe_precompile_model_kernels_after_loading()
         install_monokernel_forward(

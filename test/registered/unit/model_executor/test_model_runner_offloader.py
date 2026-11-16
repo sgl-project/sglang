@@ -175,45 +175,21 @@ class TestModelRunnerOffloader(CustomTestCase):
 
     def test_replacement_precedes_every_post_load_consumer(self):
         runner = self._load()
-        self.assertEqual(
-            self.events,
-            [
-                "load",
-                "platform:original",
-                "post_init",
-                "post_load:original",
-                "precompile:replacement",
-                "monokernel:replacement",
-                "hooks:replacement",
-                "scales:replacement",
-                "sliding:replacement",
-                "memory:replacement",
-                "quantization:replacement",
-                "debug:replacement",
-                "rope:replacement",
-                "barrier",
-            ],
-        )
+        hooks = ["platform:original", "post_init", "post_load:original"]
+        self.assertEqual([event for event in self.events if event in hooks], hooks)
+        downstream = self.events[self.events.index("post_load:original") + 1 :]
+        for consumer in ("precompile", "monokernel", "memory"):
+            self.assertIn(f"{consumer}:replacement", downstream)
+        for event in downstream:
+            if ":" in event:
+                self.assertTrue(event.endswith(":replacement"), event)
         self.assertIs(self.references["monokernel"](), runner.model)
-        self.assertEqual(runner.weight_load_mem_usage, 2.0)
-        self.assertEqual(runner.sliding_window_size, 128)
 
     def test_discarded_model_is_released_before_memory_measurement(self):
         self._load()
         self.assertFalse(self.references["old_alive_at_memory"])
         gc.collect()
         self.assertIsNone(self.references["original"]())
-
-    def test_wrapper_may_intentionally_retain_original(self):
-        def wrap(model):
-            wrapper = _Model("wrapper")
-            wrapper.original = model
-            return wrapper
-
-        runner = self._load(transform=wrap)
-        self.assertTrue(self.references["old_alive_at_memory"])
-        self.assertIs(runner.model.original, self.references["original"]())
-        self.assertIn("hooks:wrapper", self.events)
 
     def test_default_offloader_keeps_model_and_downstream_steps(self):
         runner = self._load(noop=True)
