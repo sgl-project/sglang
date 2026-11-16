@@ -1999,7 +1999,7 @@ def _mhc_pre_dispatch(
             post_mix, comb_mix, layer_input = result
             return post_mix, comb_mix, layer_input, norm_weight is not None
 
-    if not _use_tilelang_mhc_pre():
+    if residual.device.type == "npu" or not _use_tilelang_mhc_pre():
         post_mix, comb_mix, layer_input = _mhc_pre_torch(
             residual=residual,
             fn=fn,
@@ -2049,7 +2049,7 @@ def _mhc_post_dispatch(
         if result is not None:
             return result
 
-    if not _use_tilelang_mhc_post():
+    if x.device.type == "npu" or not _use_tilelang_mhc_post():
         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
     return mhc_post(x, residual, post_layer_mix, comb_res_mix)
 
