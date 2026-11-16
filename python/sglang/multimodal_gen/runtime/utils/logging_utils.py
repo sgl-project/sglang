@@ -209,7 +209,7 @@ class _SGLDiffusionLogger(Logger):
         msg: object,
         *args: Any,
         main_process_only: bool = False,
-        local_main_process_only: bool = True,
+        local_main_process_only: bool = False,
         **kwargs: Any,
     ) -> None: ...
 
@@ -520,8 +520,6 @@ def suppress_stdout():
             # C library calls that would normally print to stdout
             torch.distributed.new_group(ranks, backend="gloo")
     """
-    # Don't suppress if logging level is DEBUG
-
     stdout_fd = sys.stdout.fileno()
     stdout_dup = os.dup(stdout_fd)
     devnull_fd = os.open(os.devnull, os.O_WRONLY)
@@ -548,17 +546,7 @@ class GenerationTimer:
 def log_generation_timer(
     logger: logging.Logger,
     prompt: str,
-    request_idx: int | None = None,
-    total_requests: int | None = None,
 ):
-    if request_idx is not None and total_requests is not None:
-        logger.info(
-            "Processing prompt %d/%d: %s",
-            request_idx,
-            total_requests,
-            _sanitize_for_logging(prompt, key_hint="prompt"),
-        )
-
     timer = GenerationTimer()
     timer.start_time = time.perf_counter()
     try:
@@ -572,13 +560,6 @@ def log_generation_timer(
     except Exception as e:
         if isinstance(e, RequestCancelledError):
             logger.info("Stopped generation: %s", e)
-        elif request_idx is not None:
-            logger.error(
-                "Failed to generate output for prompt %d: %s",
-                request_idx,
-                e,
-                exc_info=True,
-            )
         else:
             logger.error(
                 f"Failed to generate output for prompt: {e}",
