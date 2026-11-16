@@ -96,7 +96,11 @@ class TestStandardDispatcherPrebuild(CustomTestCase):
                 self.assertTrue(
                     torch.equal(out.topk_output.topk_ids, mapping[topk_ids.long()])
                 )
-        for field, value in (("moe_ep_size", 1), ("skip_local_expert_mapping", True)):
+        for field, value in (
+            ("moe_ep_size", 1),
+            ("skip_local_expert_mapping", True),
+            ("use_aiter_moe_runner", True),
+        ):
             with self.subTest(unbuilt_layout=field):
                 dispatcher = _ep_dispatcher(moe_ep_rank=0)
                 setattr(dispatcher, field, value)
