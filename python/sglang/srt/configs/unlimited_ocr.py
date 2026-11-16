@@ -201,7 +201,6 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
         image_size = image_size or self.image_size
         crop_mode = crop_mode if crop_mode is not None else self.crop_mode
 
-        tokenized_data = []
         masked_tokenized_data = []
         images_list = []
         images_seq_mask = []
@@ -377,14 +376,6 @@ class UnlimitedOCRHFProcessor(ProcessorMixin):
             v2_layout=v2_layout,
         )
         return prepare
-
-    def find_all_indices(self, messages, target_value):
-        """Return all indices where target_value appears in messages."""
-        indices = []
-        for index, item in enumerate(messages):
-            if item == target_value:
-                indices.append(index)
-        return indices
 
     def _preprocess_page(self, image, *, cropping, base_size, image_size, v2_layout):
         """Global view, local crops and tile grid of one page, memoised.

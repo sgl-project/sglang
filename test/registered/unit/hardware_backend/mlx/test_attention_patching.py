@@ -973,10 +973,11 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         req.kv.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
         req.kv.mamba_next_track_idx = 0
         req.kv.mamba_last_track_seqlen = 64
+        tree_slots = tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
-            SimpleNamespace(enable_mamba_extra_buffer=False),
-            tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)[0],
+            SimpleNamespace(enable_mamba_extra_buffer=False, tree_slots=tree_slots),
+            tree_slots[0],
         )
         insert_params = InsertParams()
 
@@ -1014,10 +1015,11 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         req.kv.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
         req.kv.mamba_next_track_idx = 0
         req.kv.mamba_last_track_seqlen = 64
+        tree_slots = tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
-            SimpleNamespace(enable_mamba_extra_buffer=False),
-            tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)[0],
+            SimpleNamespace(enable_mamba_extra_buffer=False, tree_slots=tree_slots),
+            tree_slots[0],
         )
         insert_params = InsertParams()
 
@@ -1055,10 +1057,11 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         pool.alloc([req])
         req.kv.mamba_ping_pong_track_buffer = pool.auxiliary_state_pool.alloc(1)
         req.kv.mamba_next_track_idx = 0
+        tree_slots = tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
-            SimpleNamespace(enable_mamba_extra_buffer=False),
-            tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)[0],
+            SimpleNamespace(enable_mamba_extra_buffer=False, tree_slots=tree_slots),
+            tree_slots[0],
         )
         insert_params = InsertParams()
 
@@ -1093,10 +1096,11 @@ class TestMlxAuxiliaryStateRunnerCache(unittest.TestCase):
         )
         req = FakeRequest()
         pool.alloc([req])
+        tree_slots = tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)
         component = MlxAuxiliaryStateComponent(
             SimpleNamespace(req_to_token_pool=pool),
-            SimpleNamespace(enable_mamba_extra_buffer=False),
-            tree_slots_of((ComponentType.MAMBA,), checkpoint_interval=64)[0],
+            SimpleNamespace(enable_mamba_extra_buffer=False, tree_slots=tree_slots),
+            tree_slots[0],
         )
         insert_params = InsertParams()
 
@@ -1230,6 +1234,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
             ),
             abort_request=lambda req: None,
             still_in_batch=lambda req: True,
+            prefill_launched_reqs=None,
         )
         # Stub out the methods _handle_finish_state_updated_req calls that
         # are not relevant to this test.  SchedulerBatchResultProcessor is
@@ -1248,6 +1253,7 @@ class TestMlxOverlapScheduler(unittest.TestCase):
         req = SimpleNamespace(
             rid="r0",
             exit_via=None,
+            owner_list=None,
             kv=SimpleNamespace(
                 holds_kv=True, holds_mamba=False, retraction_backup=None
             ),

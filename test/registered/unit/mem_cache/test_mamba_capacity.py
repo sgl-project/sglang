@@ -10,6 +10,7 @@ from sglang.srt.disaggregation.decode import (
 from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.mem_cache.allocation import alloc_req_slots, ensure_mamba_capacity
 from sglang.srt.mem_cache.allocation_sizing import get_mamba_tracking_slots
@@ -170,6 +171,29 @@ class TestMambaCapacity(unittest.TestCase):
                 else:
                     cache.evict_for_alloc.assert_not_called()
 
+    def test_reclaim_covers_the_request_rows_it_binds(self):
+        """Under unified memory a row binds a request sub-pool unit before the
+        request's state slots, from the same bytes: reclaiming for the state
+        slots alone let admitted requests fail to take their slots."""
+        from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
+
+        pool = SimpleNamespace(holds_state_slots=True, binds_row_units=True)
+        state = SimpleNamespace(pending_request_slots=lambda table, req: 2)
+        chain = MagicMock()
+        chain.window_pool_names.return_value = ()
+        chain.ensure_capacity.side_effect = [False, True]
+        cache = MagicMock()
+        cache.supports_mamba.return_value = True
+        cache.token_to_kv_pool_allocator = chain
+        bound = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=4))
+        fresh = SimpleNamespace(kv=SimpleNamespace(req_pool_idx=None))
+        self.assertTrue(ensure_mamba_capacity(pool, state, [bound, fresh], cache))
+        demand = KVDemand(
+            full_tokens=0, window_tokens={}, state_slots=4, request_rows=1
+        )
+        cache.evict_for_alloc.assert_called_once_with(demand)
+        self.assertEqual(chain.ensure_capacity.call_args.args[0], demand)
+
     def test_partial_eviction_defers_before_mutating_request(self):
         pool, held = make_pool(1)
         cache = make_cache(pool, held, 1)
@@ -247,9 +271,11 @@ class TestMambaCapacity(unittest.TestCase):
         queue = DecodePreallocQueue.__new__(DecodePreallocQueue)
         queue.pp_size = 1
         queue.queue = decode_queue(ListKind.PD_PREALLOC, [decode_req])
-        queue.pending_reqs = []
+        queue._num_published_destinations = 0
+        queue.transfer_queue = SimpleNamespace(
+            queue=decode_queue(ListKind.PD_RECEIVING)
+        )
         queue.retracted_queue = IndexedReqList(ListKind.PD_RETRACTED)
-        queue.retracted_queue.join([req])
         queue.req_to_token_pool = pool
         queue.token_to_kv_pool_allocator = SimpleNamespace(state=pool.state)
         queue.req_to_metadata_buffer_idx_allocator = SimpleNamespace(
@@ -277,12 +303,15 @@ class TestMambaCapacity(unittest.TestCase):
                 disaggregation_decode_host_receive_threshold=1
             ),
         ):
-            self.assertEqual(queue.pop_preallocated(), ([], []))
+            self.assertEqual(
+                queue.move_preallocated(queue.transfer_queue.queue), ([], [])
+            )
         self.assertEqual(list(queue.queue.items()), [decode_req])
         queue._match_prefix_and_lock.assert_not_called()
         queue._pre_alloc.assert_not_called()
         self.assertIsNone(req.kv.req_pool_idx)
 
+        move([req], queue.retracted_queue)
         queue._prealloc_required = MagicMock(return_value=(1, {}))
         queue._admit_preallocation = MagicMock(return_value=True)
         queue.token_to_kv_pool_allocator = SimpleNamespace(state=pool.state)
@@ -292,7 +321,7 @@ class TestMambaCapacity(unittest.TestCase):
                 disaggregation_decode_retraction_backup="cpu_tensor"
             ),
         ):
-            self.assertEqual(queue.resume_retracted_reqs(), [])
+            self.assertEqual(queue.move_resumed(IndexedReqList(ListKind.WAITING)), [])
         self.assertEqual(list(queue.retracted_queue), [req])
         self.assertTrue(req.is_retracted)
         queue._pre_alloc.assert_not_called()

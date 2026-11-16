@@ -23,6 +23,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
     IndexedReqList,
     KeyedReqList,
     ListKind,
+    move,
 )
 from sglang.srt.managers.scheduler_pp_mixin import PPBatchMetadata
 from sglang.srt.managers.utils import GenerationBatchResult, get_logprob_from_pp_outputs
@@ -562,7 +563,7 @@ def test_disaggregated_prefill_consumes_auxiliary_output_after_commit():
         maybe_send_health_check_signal=Mock(),
     )
 
-    scheduler.prefill_launched_reqs.join([req])
+    move([req], scheduler.prefill_launched_reqs)
     SchedulerDisaggregationPrefillMixin.process_batch_result_disagg_prefill(
         scheduler,
         batch,

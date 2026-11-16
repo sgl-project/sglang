@@ -502,7 +502,6 @@ class CosmosDreamsControlVideoStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         manifest = self.manifest
-        sampling_params = batch.sampling_params
         frames, hint, fps, control_path = self._load_control(batch)
         source_hw = (int(frames.shape[2]), int(frames.shape[3]))
         frames = self._fit_control(batch, frames, hint=hint, source_hw=source_hw)
@@ -599,7 +598,6 @@ class CosmosDreamsTransferPrepareStage(PipelineStage):
 
     def forward(self, batch: Req, server_args: ServerArgs) -> Req:
         device = get_local_torch_device()
-        manifest = self.manifest
         geometry: CosmosDreamsGeometry = batch.extra[EXTRA_GEOMETRY]
         target_frame: int = batch.extra[EXTRA_TARGET_LATENT_FRAMES]
 

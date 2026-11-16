@@ -228,6 +228,9 @@ fn install_signal_handlers() -> Result<(Signal, Signal)> {
 }
 
 fn log_startup(config: &Config) {
+    // Resolve (and log, or warn about) SGLANG_ROUTER_MAX_BODY_BYTES with the
+    // rest of the startup configuration, not when the router is first built.
+    sgl_router::server::routes::chat::max_chat_body_bytes();
     if let Some(advisory) = sgl_router::config::shutdown_drain_advisory(
         config.server.shutdown_drain_secs,
         config.server.termination_grace_secs,
