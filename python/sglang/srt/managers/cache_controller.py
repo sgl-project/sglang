@@ -60,14 +60,22 @@ device_module = get_device_module()
 
 
 def storage_model_name(
-    model_name: Optional[str], host_pool: HostKVCache | LogicalHostPool
-) -> Optional[str]:
-    """The model name storage backends key pages on, tagged with the host
-    pool's page format when it has one of its own."""
-    tag = host_pool.storage_format_tag
-    if tag is None:
-        return model_name
-    return f"{model_name}-{tag}" if model_name else tag
+    model_name: Optional[str],
+    host_pool: HostKVCache | LogicalHostPool,
+    kv_cache_dtype: torch.dtype,
+) -> str:
+    """Namespace storage keys by page format and the server's logical KV dtype."""
+    if not isinstance(kv_cache_dtype, torch.dtype):
+        raise ValueError(
+            "HiCache storage keys require a resolved logical KV cache dtype, "
+            f"got {kv_cache_dtype!r}."
+        )
+    parts = [
+        model_name,
+        host_pool.storage_format_tag,
+        f"dtype_{normalize_dtype(kv_cache_dtype)}",
+    ]
+    return "-".join(part for part in parts if part)
 
 
 class LayerLoadingEvent:
@@ -927,7 +935,11 @@ class HiCacheController:
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
         dcp_size = get_parallel().attn_dcp_size
-        model_name = storage_model_name(model_name, self.storage_host_pool)
+        # Token KV views carry the server's resolved logical dtype, including
+        # FP8 variants that share a uint8 backing buffer.
+        model_name = storage_model_name(
+            model_name, self.storage_host_pool, getattr(anchor, "dtype", None)
+        )
         unified_plan = self._build_unified_plan(model_name, attn_cp_size)
         unified_chunk_spans = None
         if unified_plan is not None:

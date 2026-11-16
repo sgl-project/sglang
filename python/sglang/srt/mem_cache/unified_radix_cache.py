@@ -7,6 +7,7 @@ import threading
 import time
 import zlib
 from array import array
+from collections import deque
 from contextlib import ExitStack, nullcontext
 from dataclasses import replace
 from http import HTTPStatus
@@ -274,6 +275,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 "--radix-eviction-policy joint_lru does not support "
                 "--enable-session-radix-cache"
             )
+        if (
+            params.eviction_policy.lower() == "state_cost"
+            and TREE_STATE in families
+            and params.enable_session_radix_cache
+        ):
+            raise ValueError(
+                "--radix-eviction-policy state_cost does not support "
+                "--enable-session-radix-cache on a model with recurrent states"
+            )
         # Whether a slot keeps a prefix's recurrent state checkpoints.
         self.is_mamba_enabled = TREE_STATE in families
         # Whether the mamba extra (ping-pong) buffer is enabled.
@@ -353,7 +363,10 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         self.pp_rank = params.pp_rank
         self.pp_size = params.pp_size
-        self.work_list: list[torch.distributed.Work] = []
+        # Rounds of PP-sync sends to keep un-waited: the PP loop's own run-ahead,
+        # since a gloo send only completes once the next rank posts its recv.
+        self.pp_sync_window = max(1, params.pp_size + params.pp_async_batch_depth)
+        self.work_rounds: deque[list[torch.distributed.Work]] = deque([[]])
 
         # HiCache D↔H defaults (overridden by init_hicache)
         self.cache_controller: Optional[HybridCacheController] = None
@@ -414,17 +427,13 @@ class UnifiedRadixCache(BasePrefixCache):
         if not reduced and self.tp_world_size > 1:
             torch.distributed.all_reduce(tensor, op=op, group=self.tp_group)
 
-    def _drain_async_work(self):
-        """
-        Block until all outstanding async sends are consumed, then clear.
-
-        Called at the start of each event round, so work_list holds the sends
-        accumulated since the last round. This bounds it and applies
-        backpressure when a downstream PP rank lags. Scheduler thread only.
-        """
-        for work in self.work_list:
-            work.wait()
-        self.work_list.clear()
+    def _bound_async_work(self) -> None:
+        self.work_rounds.append([])
+        # wait() returns when the receiver has posted its recv; waiting on anything
+        # younger than the window would tie this rank's round to the next rank's.
+        while len(self.work_rounds) > self.pp_sync_window:
+            for work in self.work_rounds.popleft():
+                work.wait()
 
     def _all_reduce(self, data: torch.Tensor, tp_reduce_op: torch.distributed.ReduceOp):
         """
@@ -460,7 +469,7 @@ class UnifiedRadixCache(BasePrefixCache):
                 group=self.pp_group,
                 tag=P2PTag.HICACHE_PP_SYNC,
             )
-            self.work_list.append(send_work)
+            self.work_rounds[-1].append(send_work)
 
     def init_cache_linker(self, cache_linker: UnifiedCacheLinker) -> None:
         """Attach an external KV store directly to the device pools."""
@@ -1568,6 +1577,21 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.session.try_checkpoint(req, up_to=up_to, **kwargs):
             return
         self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
+
+    def lease_checkpoint_state_slots(self, reqs: Sequence[Req]):
+        mamba = self.components.get(ComponentType.MAMBA)
+        if self.disable or mamba is None:
+            return nullcontext()
+        # Only checkpoints that insert into the tree take a state slot; a
+        # streaming turn past its first prompt checkpoints into its session.
+        return mamba.lease_checkpoint_state_slots(
+            [
+                req
+                for req in reqs
+                if not req.skip_radix_cache_insert
+                and self.session.checkpoints_into_tree(req)
+            ]
+        )
 
     def checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
         """Insert ``[cache_protected_len, up_to)`` of the request's record and
@@ -3098,7 +3122,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self._apply_cache_actions(insert_result.cache_actions)
 
         if insert_result.host_insert_dropped:
-            self._resolve_storage_prefetch_tokens(request, insert_result.prefix_len)
+            self._resolve_storage_prefetch_tokens(
+                request, insert_result.prefix_len, reason="already_cached"
+            )
             self._finish_storage_prefetch(request, fulfilled_tokens=0, reason="dropped")
             self.cache_controller.append_host_mem_release(
                 host_indices=host_indices[:completed_tokens],
@@ -3126,7 +3152,9 @@ class UnifiedRadixCache(BasePrefixCache):
             # Cache mode has only completed L3 -> L2 here. Keep the usable
             # storage span unresolved until admission proves that L2 -> L1
             # load-back actually materialized it for this request.
-            self._resolve_storage_prefetch_tokens(request, insert_result.prefix_len)
+            self._resolve_storage_prefetch_tokens(
+                request, insert_result.prefix_len, reason="already_cached"
+            )
 
         self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
         del self.ongoing_prefetch[request]
@@ -4480,8 +4508,7 @@ class UnifiedRadixCache(BasePrefixCache):
 
         if self.enable_storage:
             self._raise_if_storage_workers_died()
-        # Reap the previous round's PP-sync sends before issuing new ones.
-        self._drain_async_work()
+        self._bound_async_work()
         # Backups queued outside process_batch_result: the chunked-prefill stash
         # in get_next_batch_to_run, abort_request, and the PD prefill release.
         self.flush_pending_backups()
