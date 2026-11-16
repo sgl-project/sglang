@@ -486,6 +486,8 @@ async fn chat_completions_handler(
 ) -> Response {
     let config = config.read().await;
 
+    record_chat_payload(config.port, &payload);
+
     if should_fail(&config).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1472,6 +1474,31 @@ async fn responses_cancel_handler(
 // (the gateway deserializes/re-serializes the body, dropping unknown fields).
 
 static REQUEST_ARRIVALS: OnceLock<Mutex<HashMap<u16, Vec<std::time::Instant>>>> = OnceLock::new();
+
+// Last chat-completions payload received by each mock worker, keyed by port,
+// so tests can assert on the exact JSON the gateway forwarded (e.g. that
+// extension fields like `cache_salt` survive the gateway's
+// deserialize/re-serialize round trip). See
+// https://github.com/sgl-project/sglang/issues/48793
+static LAST_CHAT_PAYLOADS: OnceLock<Mutex<HashMap<u16, serde_json::Value>>> = OnceLock::new();
+
+fn record_chat_payload(port: u16, payload: &serde_json::Value) {
+    LAST_CHAT_PAYLOADS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .insert(port, payload.clone());
+}
+
+/// Take the last chat-completions payload received by the worker on `port`.
+/// Returns `None` if the worker received no chat request since the last take.
+pub fn take_last_chat_payload(port: u16) -> Option<serde_json::Value> {
+    LAST_CHAT_PAYLOADS
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap()
+        .remove(&port)
+}
 
 fn record_request_arrival(port: u16) {
     REQUEST_ARRIVALS

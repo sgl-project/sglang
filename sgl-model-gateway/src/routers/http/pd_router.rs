@@ -83,6 +83,10 @@ struct PDRequestContext<'a> {
     request_text: Option<String>,
     model_id: Option<&'a str>,
     headers: Option<HeaderMap>,
+    /// Top-level extension fields preserved from the client's original JSON
+    /// payload (e.g. `cache_salt` for chat completions). Empty for routes
+    /// that do not carry preserved extensions.
+    extensions: serde_json::Map<String, Value>,
 }
 
 /// Marker placed on a `Response` by paths inside
@@ -450,6 +454,16 @@ impl PDRouter {
                             Ok(v) => v,
                             Err(e) => return Self::handle_serialization_error(e),
                         };
+                        // Merge preserved top-level extension fields (e.g.
+                        // `cache_salt` for chat completions) back into the
+                        // body forwarded to the workers. See
+                        // https://github.com/sgl-project/sglang/issues/48793
+                        if !context.extensions.is_empty() {
+                            json_request = crate::routers::merge_unknown_request_fields(
+                                json_request,
+                                &context.extensions,
+                            );
+                        }
                         // ResponsesRequest serializes an absent stream as null, which SRT rejects.
                         if context.route == "/v1/responses" {
                             json_request["stream"] = Value::Bool(context.is_stream);
@@ -1690,6 +1704,7 @@ impl RouterTrait for PDRouter {
             request_text,
             model_id,
             headers: headers.cloned(),
+            extensions: serde_json::Map::new(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1721,6 +1736,44 @@ impl RouterTrait for PDRouter {
             request_text,
             model_id,
             headers: headers.cloned(),
+            extensions: serde_json::Map::new(),
+        };
+
+        self.execute_dual_dispatch(headers, body, context).await
+    }
+
+    async fn route_chat_with_extensions(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &ChatCompletionRequest,
+        model_id: Option<&str>,
+        extensions: &serde_json::Map<String, Value>,
+    ) -> Response {
+        // Same dispatch as `route_chat`, but carries the preserved extension
+        // fields (e.g. `cache_salt`) so they are merged back into the JSON
+        // forwarded to the prefill/decode workers. See
+        // https://github.com/sgl-project/sglang/issues/48793
+        let is_stream = body.stream;
+        let return_logprob = body.logprobs;
+
+        let request_text = if self.policies_need_request_text() {
+            Self::build_chat_request_text(body)
+        } else {
+            None
+        };
+
+        // Calculate batch size
+        let batch_size = Self::get_chat_batch_size(body);
+
+        let context = PDRequestContext {
+            route: "/v1/chat/completions",
+            batch_size,
+            is_stream,
+            return_logprob,
+            request_text,
+            model_id,
+            headers: headers.cloned(),
+            extensions: extensions.clone(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1755,6 +1808,7 @@ impl RouterTrait for PDRouter {
             request_text,
             model_id,
             headers: headers.cloned(),
+            extensions: serde_json::Map::new(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1799,6 +1853,7 @@ impl RouterTrait for PDRouter {
             request_text,
             model_id,
             headers: headers.cloned(),
+            extensions: serde_json::Map::new(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1825,6 +1880,7 @@ impl RouterTrait for PDRouter {
             request_text: req_text,
             model_id,
             headers: headers.cloned(),
+            extensions: serde_json::Map::new(),
         };
 
         self.execute_dual_dispatch(headers, body, context).await
@@ -1939,6 +1995,61 @@ mod tests {
         assert!(
             PDRouter::build_chat_request_text(&body).is_none(),
             "empty conversation text should produce None, not Some(\"\")"
+        );
+    }
+
+    #[test]
+    fn test_chat_request_preserves_cache_salt() {
+        // Regression test for https://github.com/sgl-project/sglang/issues/48793
+        // openai-protocol 1.0.0's `ChatCompletionRequest` drops unknown
+        // top-level fields such as `cache_salt` on deserialization, so the
+        // gateway preserves them from the raw payload and merges them back
+        // into the body forwarded to the worker (which would otherwise merge
+        // the request into the default cache namespace).
+        use validator::Validate;
+
+        use crate::{
+            protocols::validated::Normalizable,
+            routers::{extract_unknown_request_fields, merge_unknown_request_fields},
+        };
+
+        let raw = json!({
+            "model": "test-model",
+            "messages": [{"role": "user", "content": "hello"}],
+            "max_tokens": 1,
+            "cache_salt": "tenant-a",
+            "extra_key": "k",
+        });
+        let mut body: ChatCompletionRequest =
+            serde_json::from_value(raw.clone()).expect("valid chat request");
+        let pre_normalize = serde_json::to_value(&body).expect("request must serialize");
+        body.normalize();
+        body.validate().expect("request must validate");
+
+        let extensions = extract_unknown_request_fields(&raw, &pre_normalize);
+        let forwarded =
+            merge_unknown_request_fields(serde_json::to_value(&body).unwrap(), &extensions);
+
+        assert_eq!(
+            forwarded.get("cache_salt").and_then(Value::as_str),
+            Some("tenant-a"),
+            "cache_salt must be forwarded to the worker, got: {forwarded}"
+        );
+        assert_eq!(
+            forwarded.get("extra_key").and_then(Value::as_str),
+            Some("k"),
+            "other engine extension fields must also be preserved, got: {forwarded}"
+        );
+        assert_eq!(
+            forwarded
+                .get("max_completion_tokens")
+                .and_then(Value::as_u64),
+            Some(1),
+            "deprecated max_tokens must still migrate to max_completion_tokens, got: {forwarded}"
+        );
+        assert!(
+            !forwarded.as_object().unwrap().contains_key("max_tokens"),
+            "deprecated max_tokens must not be re-added after normalize() clears it, got: {forwarded}"
         );
     }
 
