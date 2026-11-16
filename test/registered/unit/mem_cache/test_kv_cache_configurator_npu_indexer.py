@@ -123,7 +123,9 @@ class TestNPUIndexerMemorySizing(CustomTestCase):
                         pc,
                         "get_exec",
                         return_value=SimpleNamespace(
-                            kernel=SimpleNamespace(enable_fp4_indexer=False)
+                            kernel=SimpleNamespace(
+                                enable_fp4_indexer=False, enable_dsa_fp4_indexer=False
+                            )
                         ),
                     ),
                     patch.object(
