@@ -43,6 +43,8 @@ workspace_root = "/data/foundry_archive/qwen3-1.7b"
 region_size = "256GB"
 ```
 
+`region_size` is the address range every device allocation of a scheduler lands in after Foundry's setup: weights, KV pool, graph memory and symmetric-memory workspaces. Only address space is reserved up front; memory is mapped per allocation. Sizing it is on the user: it must cover what one GPU allocates, which at the default `--mem-fraction-static` is about the GPU's memory. The default is 512GB (64GB in foundry-core 0.1.0rc4, which is smaller than an 80 GB GPU's weights and KV pool, so set it there).
+
 `save` and `load` must use the same model, flags, parallel layout and GPU type; remove the archive before a `save` of another configuration.
 
 The launcher and every scheduler log one activation line, and `load` logs the restore per runner:
@@ -57,12 +59,14 @@ Run engines with and without `--cuda-graph-persistence` in separate processes.
 ## What it changes
 
 - Decode graphs use the `full` backend; prefill graphs are `full` or `disabled` (default `disabled`). Other backends are not supported.
-- Flags and environment variables that select state a restored graph cannot replay (custom all-reduce IPC buffers, NCCL symmetric memory / NVLS / buffer registration, MSCCL++, two-batch overlap, the memory saver, graph-pool borrow / precarve, the metadata glue graph, the DCP push-combine all-reduce) are pinned; each pin prints a `[Foundry] pin:` line, and an explicit contrary value is not supported.
+- FlashInfer autotune is off (`--disable-flashinfer-autotune`): the tuning pass allocates timing-dependently, which `load` cannot repeat. `save` installs the tuned tactics from the autotune cache file that a plain start of the same model and flags writes (under `$SGLANG_CACHE_DIR/flashinfer/autotune/`) and keeps them in the archive; `load` installs them from there. Without that file the kernels use FlashInfer's default tactics and `save` logs a warning.
+- Flags and environment variables that select state a restored graph cannot replay (custom all-reduce IPC buffers, NCCL symmetric memory / NVLS / buffer registration, MSCCL++, two-batch overlap, the memory saver, graph-pool borrow / precarve, the metadata glue graph, the DCP push-combine all-reduce) are pinned, and an explicit contrary value is not supported.
+- Each pin prints a `[Foundry] pin:` line (the graph-backend, profiling and autotune pins with a foundry-core newer than 0.1.0rc4).
 - Speculative decoding is supported for EAGLE / EAGLE3 (target-verify, draft-decode and draft-extend graphs; not adaptive or multi-layer EAGLE) and, with a foundry-core newer than 0.1.0rc4, for the verify-only algorithms DFLASH, NGRAM and DSPARK (target-verify and draft-verify graphs; DSPARK with `SGLANG_DSPARK_USE_GREEDY_DRAFT=1`, since its sampling draft allocates inside the first capture; with 0.1.0rc4 they fall back natively); other speculative algorithms, LoRA, elastic-EP graph recapture, post-capture KV sizing and graph variants (attention variants, sharded-verify logits variants) are not supported.
 
 ## Unsupported configurations
 
-A configuration Foundry does not support still runs: Foundry logs the step and the reason, persistence is disabled and the server initialises natively (normal graph capture).
+A configuration Foundry does not support still runs: Foundry logs the step and the reason, persistence is disabled and the server initialises natively (normal graph capture). An allocation region too small for the engine (`region_size` above) is not detected up front and does not fall back: the first allocation past its end fails with a CUDA out-of-memory error and the scheduler exits (with a foundry-core newer than 0.1.0rc4 the log names it: `[HOOK] ERROR: Foundry allocation region exhausted (...); raise region_size in the Foundry TOML`).
 
 ```text
 [Foundry] unsupported at capture state: DeepEPv3Dispatcher has no prebuild; cuda-graph persistence disabled, continuing natively
