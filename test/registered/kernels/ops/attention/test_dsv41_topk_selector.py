@@ -1,9 +1,13 @@
 """The DeepSeek V4.1 index-layer top-k selections under every --dsa-topk-backend:
 each selects the reference picks on tie-free scores, the unfused ones also across row
-chunks, FlashInfer's index tie-break follows logical positions, and the FlashInfer
-paths replay under CUDA graphs."""
+chunks, FlashInfer's index tie-break follows logical positions, sgl-kernel's top-k v2
+in mode 2 keeps the same tied picks as FlashInfer's small tie-break, and the
+FlashInfer paths replay under CUDA graphs."""
 
 import itertools
+import os
+import subprocess
+import sys
 import unittest
 from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
@@ -22,7 +26,7 @@ from sglang.srt.layers.attention.dsv4.v41_indexer import selector as selector_mo
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=60, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
 
 DEV = "cuda"
 K = 512
@@ -43,6 +47,13 @@ FLASHINFER_TIES = [
     for fused in (True, False)
     for tie_break in ("small", "large")
 ]
+FLASHINFER_SMALL = [
+    ("flashinfer", fused, "small", deterministic)
+    for fused in (True, False)
+    for deterministic in (False, True)
+]
+# SGLANG_TOPK_V2_MODE is compiled into a process's top-k v2 module, so mode 2 gets its own.
+MODE2_PARITY_FLAG = "--mode2-parity"
 
 
 @contextmanager
@@ -181,6 +192,102 @@ def reference_blocks(scores, lens, topk_blocks):
     blocks = torch.arange(keys.shape[1], device=DEV)
     keys = keys.masked_fill((blocks[None, :] == newest[:, None]), torch.inf)
     return reference_columns(keys, (lens + BLOCK - 1) // BLOCK, topk_blocks)
+
+
+def tied_scores(lens, width, dtype, *, seed, stride=None):
+    """Rows of eight integer levels, so equal scores straddle every row's k-th pick,
+    and larger than all of them past ``lens``. No -0: mode 2 ranks it equal to +0,
+    FlashInfer below it."""
+    g = torch.Generator(device=DEV).manual_seed(seed)
+    rows = lens.shape[0]
+    levels = torch.randint(-4, 4, (rows, width), generator=g, device=DEV).to(dtype)
+    past = torch.arange(width, device=DEV)[None, :] >= lens[:, None]
+    storage = torch.zeros(rows, stride or width, dtype=dtype, device=DEV)
+    storage[:, :width] = levels.masked_fill(past, torch.finfo(dtype).max)
+    return storage[:, :width]
+
+
+def columns_from_slots(slots, table, page_size):
+    """The logical columns behind pool slots of a page table; ``-1`` stays ``-1``."""
+    inverse = torch.full(
+        (table.shape[0], int(table.max()) + 1), -1, dtype=torch.long, device=DEV
+    )
+    pages = torch.arange(table.shape[1], device=DEV).expand(table.shape).contiguous()
+    inverse.scatter_(1, table.long(), pages)
+    slots = slots.long()
+    page = inverse.gather(1, slots.clamp_min(0) // page_size)
+    return torch.where(slots >= 0, page * page_size + slots % page_size, -1)
+
+
+def logical_picks(columns):
+    return [sorted(c for c in row if c != -1) for row in columns.tolist()]
+
+
+def top_k_v2_selections(selector, lens, width, k, *, seed):
+    """Logical picks of each selection sgl-kernel serves with top-k v2: paged decode
+    of fp32 rows through a page table, positions, prefill positions plus offsets, and
+    block ids by block maximum (bf16 logits, fp32 keys)."""
+    rows, page_size = lens.shape[0], 64
+
+    def scores():
+        # top-k v2 may mask columns in place, so every selection gets its own rows
+        return tied_scores(lens, width, torch.float32, seed=seed, stride=width + 64)
+
+    out = torch.full((rows, k), -2, dtype=torch.int32, device=DEV)
+    picks = {}
+
+    page_table = random_page_table(rows, width // page_size, seed=seed + 1)
+    metadata = SimpleNamespace(
+        compressed_seq_lens=lens,
+        page_table=page_table,
+        compressed_page_size=page_size,
+        use_topk_v2=True,
+        topk_metadata=plan_topk_v2(lens),
+    )
+    selector.paged_from_metadata(scores(), metadata, out)
+    picks["paged"] = logical_picks(columns_from_slots(out, page_table, page_size))
+
+    selector.raw(scores(), lens, out=out, plan=plan_topk_v2(lens))
+    picks["raw"] = logical_picks(out)
+
+    offsets = (torch.arange(rows, device=DEV, dtype=torch.int32) * 10007) % 65536
+    selector.ragged(scores(), lens, out=out, offsets=offsets)
+    picks["ragged"] = logical_picks(torch.where(out >= 0, out - offsets[:, None], -1))
+
+    logits = tied_scores(lens, width, torch.bfloat16, seed=seed + 2)
+    nblocks = (lens + BLOCK - 1) // BLOCK
+    topk_blocks = min(2048, width // BLOCK // 2)
+    picks["blocks"] = logical_picks(
+        selector.amax_blocks(logits, lens, nblocks, topk_blocks)
+    )
+    return picks
+
+
+def mode2_parity():
+    """sgl-kernel's top-k v2 selections in mode 2 against FlashInfer's small tie-break;
+    run by test_sgl_kernel_mode2_matches_flashinfer_small_tie_break in a process built
+    with SGLANG_TOPK_V2_MODE=2. Shapes cover v2's one-block paths, its small-batch
+    cluster path and its persistent cluster pool."""
+    assert envs.SGLANG_TOPK_V2_MODE.get() == 2, "needs SGLANG_TOPK_V2_MODE=2"
+    for row_lens, width, k in (
+        ([0, 1, K - 1, K, K + 1, 3000, 8192], 8192, K),
+        ([65536, 40000], 65536, 2048),
+        ([131072] * 34, 131072, K),
+    ):
+        lens = torch.tensor(row_lens, dtype=torch.int32, device=DEV)
+        with torch.inference_mode():
+            with make_selector(*SGL_KERNEL) as selector:
+                want = top_k_v2_selections(selector, lens, width, k, seed=width)
+            for variant in FLASHINFER_SMALL:
+                with make_selector(*variant) as selector:
+                    got = top_k_v2_selections(selector, lens, width, k, seed=width)
+                for name, rows in want.items():
+                    differ = [b for b, (w, g) in enumerate(zip(rows, got[name])) if w != g]
+                    assert not differ, (
+                        f"{name}, width {width}, k {k}: {variant} picks differ from "
+                        f"sgl-kernel mode 2 in rows {differ}"
+                    )
+        print(f"width {width} k {k}: identical picks", flush=True)
 
 
 @unittest.skipUnless(
@@ -442,6 +549,20 @@ class TestDSV41TopKSelector(CustomTestCase):
                 )
                 self.assert_picks(picks.to(torch.int32), [want] * rows)
 
+    def test_sgl_kernel_mode2_matches_flashinfer_small_tie_break(self):
+        """On scores whose ties straddle the k-th pick, sgl-kernel's top-k v2 in mode 2
+        (exact, ties to the smaller index) and FlashInfer with the small tie-break,
+        fused or unfused, with or without determinism, select the same logical
+        positions, columns and block ids at every selection mode 2 reaches."""
+        proc = subprocess.run(
+            [sys.executable, os.path.abspath(__file__), MODE2_PARITY_FLAG],
+            env={**os.environ, "SGLANG_TOPK_V2_MODE": "2"},
+            capture_output=True,
+            text=True,
+            timeout=1800,
+        )
+        self.assertEqual(proc.returncode, 0, (proc.stdout + proc.stderr)[-8000:])
+
     def test_flashinfer_paths_replay_under_cuda_graphs(self):
         """A captured decode step (full top-k, consumer sparse top-k, source block
         top-k) replays with fresh scores and lengths and rewrites every output slot,
@@ -554,4 +675,7 @@ class TestDSV41TopKSelector(CustomTestCase):
 
 
 if __name__ == "__main__":
+    if MODE2_PARITY_FLAG in sys.argv:
+        mode2_parity()
+        sys.exit(0)
     unittest.main()
