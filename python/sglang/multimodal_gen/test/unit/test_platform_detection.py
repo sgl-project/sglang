@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import importlib
 import os
 import unittest
 from types import SimpleNamespace
@@ -279,3 +280,22 @@ class TestDiffusionPlatformPlugins(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_use_aiter_accepts_every_declared_boolean_spelling(monkeypatch):
+    """SGLANG_USE_AITER is a declared boolean: a spelling that turns AITER on in
+    the LLM layers ("yes") must turn it on in the diffusion layers too."""
+    import sglang.srt.utils as srt_utils
+    from sglang.multimodal_gen.runtime.platforms import aiter
+
+    with monkeypatch.context() as patched:
+        patched.setenv("SGLANG_USE_AITER", "yes")
+        patched.setattr(srt_utils, "is_hip", lambda: True)
+        patched.setattr(srt_utils, "is_gfx95_supported", lambda: True)
+        patched.setattr(srt_utils, "is_gfx1250_supported", lambda: False)
+        try:
+            assert importlib.reload(aiter).USE_AITER is True
+        finally:
+            patched.undo()
+            importlib.reload(aiter)
+
