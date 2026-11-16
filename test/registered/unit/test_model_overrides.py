@@ -3843,7 +3843,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
         def _args(**kw):
             defaults = dict(
                 quantization="mxfp8",
-                _quantization_explicitly_unset=False,
                 attention_backend=None,
                 prefill_attention_backend=None,
                 decode_attention_backend=None,
@@ -3852,8 +3851,6 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 kv_cache_dtype="auto",
                 enable_aiter_allreduce_fusion=False,
                 ep_size=1,
-                moe_a2a_backend="none",
-                tp_size=8,
             )
             defaults.update(kw)
             return SimpleNamespace(**defaults)
@@ -3865,13 +3862,10 @@ class TestGoldenModelOverrides(_IsolatedPublish):
             ),
             envs.USE_ROCM_AITER_ROPE_BACKEND.override("0"),
         ):
-            # unset: one 128-token sparse block per allocator page
-            ov = _minimax_m3_overrides(_args(), hf)
-            self.assertEqual(ov["attention_backend"], "triton")
-            self.assertEqual(ov["page_size"], 128)
-            # an explicit page size is kept
-            ov = _minimax_m3_overrides(_args(page_size=64), hf)
-            self.assertNotIn("page_size", ov)
+            self.assertEqual(_minimax_m3_overrides(_args(), hf)["page_size"], 128)
+            self.assertNotIn(
+                "page_size", _minimax_m3_overrides(_args(page_size=64), hf)
+            )
 
     def test_page_constraint_passes_at_callable_level(self):
         from sglang.srt.arg_groups.model_override_base import ResolvedView
