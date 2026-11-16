@@ -260,7 +260,7 @@ class UsageInfo(BaseModel):
     # Used to return cached tokens info when --enable-cache-report is set
     prompt_tokens_details: Optional[PromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
-    # The OpenAI location of reasoning_tokens; set only when there are some.
+    # The OpenAI location of reasoning_tokens; always set, so 0 means no reasoning.
     completion_tokens_details: Optional[CompletionTokensDetails] = None
 
 
