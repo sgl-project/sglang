@@ -11,6 +11,13 @@ from sglang.api.v1.api_types import GenerateRequest, JsonContractError
 
 def generate_contract_error(body: Any) -> Optional[str]:
     """The contract violation in a parsed `/generate` JSON body, or None."""
+    # The schema is shared, but this dataclass adapter has no prepared-input
+    # path. Never let a new known field be silently discarded by FastAPI.
+    if isinstance(body, dict) and body.get("prepared_multimodal") is not None:
+        return (
+            "prepared_multimodal requires the native Rust server "
+            "and a compatible advertised profile"
+        )
     try:
         GenerateRequest.from_json_value(body)
     except JsonContractError as e:

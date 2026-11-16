@@ -76,7 +76,14 @@ pub async fn prefetch_all(
             else {
                 continue;
             };
-            let count = items.len();
+            let count = items.len()
+                + mm.prepared.as_ref().map_or(0, |input| {
+                    input
+                        .items
+                        .iter()
+                        .filter(|item| item.modality == name)
+                        .count()
+                });
             if count > *limit {
                 let display = name[..1].to_uppercase() + &name[1..];
                 return Err(MediaError::Client(format!(
@@ -85,7 +92,21 @@ pub async fn prefetch_all(
             }
         }
         if let Some(processor) = processor {
+            if let Some(input) = &mm.prepared
+                && !processor
+                    .prepared_input_capabilities()
+                    .iter()
+                    .any(|cap| cap.profile == input.profile)
+            {
+                return Err(MediaError::Client(
+                    "unsupported prepared multimodal profile".into(),
+                ));
+            }
             processor.check_media(mm).map_err(MediaError::Client)?;
+        } else if mm.prepared.is_some() {
+            return Err(MediaError::Client(
+                "prepared multimodal inputs require a compatible multimodal processor".into(),
+            ));
         }
         Ok(modalities
             .iter()
@@ -408,6 +429,44 @@ mod tests {
 
     /// How long [`CustomScheme`] takes to fetch one of its URIs.
     const CUSTOM_FETCH_TIME: std::time::Duration = std::time::Duration::from_millis(10);
+
+    #[tokio::test]
+    async fn prepared_media_requires_explicit_processor_support_and_obeys_item_limits() {
+        use sglang_api_types::api::v1 as api;
+        let request = || GenerateRequest {
+            mm: Some(Box::new(MmData {
+                prepared: Some(api::PreparedMultimodalInput {
+                    profile: "qwen_vl_image_v1".into(),
+                    items: vec![
+                        api::PreparedMediaItem {
+                            modality: "image".into(),
+                            ..Default::default()
+                        };
+                        2
+                    ],
+                    ..Default::default()
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        let processor: Arc<dyn MmProcessor> = Arc::new(CustomScheme);
+        for processor in [None, Some(&processor)] {
+            let error = prefetch_all(&mut [request()], &[], processor)
+                .await
+                .err()
+                .unwrap();
+            assert!(matches!(error, MediaError::Client(_)));
+        }
+        let error = prefetch_all(&mut [request()], &[("image".into(), 1)], None)
+            .await
+            .err()
+            .unwrap();
+        assert_eq!(
+            error,
+            MediaError::Client("Image count 2 exceeds limit 1 per request.".into())
+        );
+    }
 
     /// A processor's URIs resolve in request order beside built-in sources;
     /// its failures keep their class, a scheme nobody serves is a client error

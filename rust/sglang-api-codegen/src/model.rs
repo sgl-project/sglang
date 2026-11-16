@@ -58,6 +58,7 @@ pub enum ScalarTy {
     U64,
     Bool,
     Str,
+    Bytes,
 }
 
 impl ScalarTy {
@@ -70,6 +71,7 @@ impl ScalarTy {
             ScalarTy::U64 => "u64",
             ScalarTy::Bool => "bool",
             ScalarTy::Str => "::prost::alloc::string::String",
+            ScalarTy::Bytes => "::prost::alloc::vec::Vec<u8>",
         }
     }
 }
@@ -418,6 +420,15 @@ fn field_model(f: &FieldDescriptor, ext: &Extensions) -> FieldModel {
     let (null_resets, null_is_none) = (null_policy == 1, null_policy == 2);
     let default = fopts.and_then(default_lit);
 
+    // Bytes currently occur only as plain object members. Refuse unsupported
+    // shapes rather than generating a different JSON representation there.
+    if matches!(f.kind(), Kind::Bytes) {
+        assert!(
+            !f.is_list() && !f.supports_presence() && !raw_json && default.is_none(),
+            "{}: bytes require a plain scalar field without JSON defaults",
+            f.full_name()
+        );
+    }
     let kind = if raw_json {
         if f.is_list() {
             FieldKind::RepeatedRawJson
@@ -502,6 +513,7 @@ fn scalar_ty(kind: &Kind) -> ScalarTy {
         Kind::Uint64 | Kind::Fixed64 => ScalarTy::U64,
         Kind::Bool => ScalarTy::Bool,
         Kind::String => ScalarTy::Str,
+        Kind::Bytes => ScalarTy::Bytes,
         other => panic!("unsupported scalar kind {other:?}"),
     }
 }

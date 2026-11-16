@@ -383,6 +383,18 @@ impl CoreHandle {
     }
 
     async fn prepare_generations(&self, requests: &mut [GenerateRequest]) -> Result<(), CoreError> {
+        if requests
+            .iter()
+            .any(|r| r.mm.as_ref().is_some_and(|mm| mm.prepared.is_some()))
+            && (self.inner.is_disaggregation
+                || !self.inner.multimodal
+                || self.inner.metadata.disaggregation_mode
+                    != crate::message::config::DisaggregationMode::Null)
+        {
+            return Err(CoreError::InvalidArgument(
+                "prepared multimodal inputs require a multimodal model in unified serving".into(),
+            ));
+        }
         // A multimodal model's requests wait here until the MM pool starts, so
         // none is admitted without the processor's media hooks. The wait has
         // no deadline: the pool starts during launch, and runtime shutdown

@@ -80,6 +80,17 @@ impl CoreHandle {
             num_reserved_tokens: metadata.num_reserved_tokens,
             version: metadata.version.clone(),
             instance_id: self.inner.instance_id.clone(),
+            prepared_input_capabilities: if self.inner.multimodal
+                && !self.inner.is_disaggregation
+                && metadata.disaggregation_mode == crate::message::config::DisaggregationMode::Null
+            {
+                self.inner
+                    .mm_processor
+                    .get()
+                    .map_or_else(Vec::new, |p| p.prepared_input_capabilities())
+            } else {
+                Vec::new()
+            },
             frontend: "rust",
             startup_time,
             internal_states,

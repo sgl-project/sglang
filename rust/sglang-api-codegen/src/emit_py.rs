@@ -34,6 +34,8 @@ options exactly as the Rust server does. Decode with
 
 from __future__ import annotations
 
+import base64
+import binascii
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import msgspec
@@ -105,6 +107,17 @@ def _expect_str(v: Any, expected: str) -> str:
     if isinstance(v, str):
         return v
     raise _invalid_type(v, expected=expected)
+
+
+def _expect_bytes(v: Any, expected: str) -> bytes:
+    text = _expect_str(v, expected)
+    try:
+        data = base64.b64decode(text, validate=True)
+    except (ValueError, binascii.Error):
+        raise JsonContractError("invalid base64 bytes") from None
+    if base64.b64encode(data).decode("ascii") != text:
+        raise JsonContractError("invalid base64 bytes")
+    return data
 
 
 def _expect_seq(v: Any, expected: str) -> List[Any]:
@@ -267,6 +280,7 @@ fn py_scalar(ty: &ScalarTy) -> &'static str {
         ScalarTy::I32 | ScalarTy::I64 | ScalarTy::U32 | ScalarTy::U64 => "int",
         ScalarTy::Bool => "bool",
         ScalarTy::Str => "str",
+        ScalarTy::Bytes => "bytes",
     }
 }
 
@@ -285,6 +299,7 @@ fn type_default(ty: &ScalarTy) -> &'static str {
         ScalarTy::I32 | ScalarTy::I64 | ScalarTy::U32 | ScalarTy::U64 => "0",
         ScalarTy::Bool => "False",
         ScalarTy::Str => "\"\"",
+        ScalarTy::Bytes => "b\"\"",
     }
 }
 
@@ -353,6 +368,7 @@ fn expect_call(ty: &ScalarTy, var: &str, expected: Option<&str>) -> String {
         ScalarTy::U64 => ("_expect_uint", "u64"),
         ScalarTy::Bool => ("_expect_bool", "a boolean"),
         ScalarTy::Str => ("_expect_str", "a string"),
+        ScalarTy::Bytes => ("_expect_bytes", "a base64 string"),
     };
     format!(
         "{func}({var}, expected={:?})",
@@ -365,6 +381,7 @@ fn expect_call(ty: &ScalarTy, var: &str, expected: Option<&str>) -> String {
 fn enc_scalar(ty: &ScalarTy, var: &str) -> String {
     match ty {
         ScalarTy::F64 => format!("float({var})"),
+        ScalarTy::Bytes => format!("base64.b64encode({var}).decode(\"ascii\")"),
         _ => var.to_string(),
     }
 }
@@ -870,7 +887,7 @@ enum PyShape {
 
 fn py_scalar_shapes(ty: &ScalarTy) -> Vec<PyShape> {
     match ty {
-        ScalarTy::Str => vec![PyShape::Str],
+        ScalarTy::Str | ScalarTy::Bytes => vec![PyShape::Str],
         ScalarTy::I32 | ScalarTy::I64 | ScalarTy::U32 | ScalarTy::U64 => vec![PyShape::Int],
         ScalarTy::F64 => vec![PyShape::Int, PyShape::Float],
         ScalarTy::Bool => vec![PyShape::Bool],

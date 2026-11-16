@@ -20,6 +20,7 @@ from sglang.api.v1.api_types import (
     GenerateMetaInfo,
     GenerateRequest,
     GenerateResponse,
+    InlineTensor,
     JsonContractError,
     LogprobEntry,
     MediaRef,
@@ -47,6 +48,25 @@ def compact(value) -> str:
 
 def sp(text: str) -> SamplingParams:
     return SamplingParams.from_json_value(json.loads(text))
+
+
+class TestInlineTensor(CustomTestCase):
+    def test_binary_data_roundtrips_through_base64_json(self):
+        body = {"dtype": "float32", "shape": [1], "data": "AACAPw=="}
+        tensor = InlineTensor.from_json_value(body)
+        self.assertEqual(tensor.data, b"\x00\x00\x80\x3f")
+        self.assertEqual(tensor.to_json_value(), body)
+
+    def test_rejects_invalid_base64_and_unknown_keys(self):
+        for body in (
+            {"data": [0, 0, 128, 63]},
+            {"data": None},
+            {"data": "not base64"},
+            {"data": "AB=="},
+            {"data": "", "private_handle": "x"},
+        ):
+            with self.subTest(body=body), self.assertRaises(JsonContractError):
+                InlineTensor.from_json_value(body)
 
 
 class TestSamplingParams(CustomTestCase):

@@ -374,7 +374,7 @@ enum JsonShape {
 
 fn scalar_shapes(ty: &ScalarTy) -> Vec<JsonShape> {
     match ty {
-        ScalarTy::Str => vec![JsonShape::Str],
+        ScalarTy::Str | ScalarTy::Bytes => vec![JsonShape::Str],
         ScalarTy::I32 | ScalarTy::I64 | ScalarTy::U32 | ScalarTy::U64 => vec![JsonShape::Int],
         ScalarTy::F64 => vec![JsonShape::Int, JsonShape::Float],
         ScalarTy::Bool => vec![JsonShape::Bool],
@@ -721,6 +721,12 @@ fn ser_field(f: &FieldModel, receiver: &str, always_emit_null: bool) -> String {
     let ident = &f.rust_ident;
     let get = format!("{receiver}{ident}");
     match &f.kind {
+        FieldKind::Scalar {
+            ty: ScalarTy::Bytes,
+            ..
+        } => format!(
+            "        ::serde::ser::SerializeMap::serialize_entry(&mut map, {key:?}, &crate::ext::encode_bytes(&{get}))?;\n"
+        ),
         FieldKind::Scalar { .. } => format!(
             "        ::serde::ser::SerializeMap::serialize_entry(&mut map, {key:?}, &{get})?;\n"
         ),
@@ -787,6 +793,12 @@ fn de_field_arm(f: &FieldModel) -> String {
         "                        if {slot}.is_some() {{\n                            return Err(::serde::de::Error::duplicate_field({key:?}));\n                        }}\n"
     );
     let read = match &f.kind {
+        FieldKind::Scalar {
+            ty: ScalarTy::Bytes,
+            ..
+        } => format!(
+            "                        {slot} = Some(map.next_value::<crate::ext::JsonBytes>()?.0);\n"
+        ),
         FieldKind::Scalar { ty, null_default } => match null_default {
             // Explicit null resets to the default (Python __post_init__
             // parity); the value type still errors on shape mismatch.

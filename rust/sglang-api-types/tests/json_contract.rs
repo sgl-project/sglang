@@ -6,6 +6,35 @@
 
 use sglang_api_types::api::v1::*;
 
+#[test]
+fn inline_tensor_preserves_binary_protobuf_and_base64_json() {
+    use prost::Message;
+    let json = r#"{"dtype":"float32","shape":[1],"data":"AACAPw=="}"#;
+    let tensor: InlineTensor = serde_json::from_str(json).unwrap();
+    assert_eq!(tensor.data, 1.0f32.to_le_bytes());
+    assert_eq!(serde_json::to_string(&tensor).unwrap(), json);
+    assert_eq!(
+        InlineTensor::decode(tensor.encode_to_vec().as_slice()).unwrap(),
+        tensor
+    );
+}
+
+#[test]
+fn inline_tensor_refuses_invalid_base64_and_unknown_keys() {
+    for json in [
+        r#"{"data":[0,0,128,63]}"#,
+        r#"{"data":null}"#,
+        r#"{"data":"not base64"}"#,
+        r#"{"data":"AB=="}"#,
+        r#"{"data":"","private_handle":"x"}"#,
+    ] {
+        assert!(
+            serde_json::from_str::<InlineTensor>(json).is_err(),
+            "{json}"
+        );
+    }
+}
+
 fn sp(json: &str) -> Result<SamplingParams, serde_json::Error> {
     serde_json::from_str(json)
 }

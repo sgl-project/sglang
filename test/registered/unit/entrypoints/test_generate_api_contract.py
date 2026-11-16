@@ -18,6 +18,15 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 
 class TestGenerateContract(CustomTestCase):
+    def test_prepared_inputs_are_refused_by_the_python_adapter(self):
+        error = generate_contract_error(
+            {"input_ids": [1], "prepared_multimodal": {"profile": "qwen_vl_image_v1"}}
+        )
+        self.assertIn("requires the native Rust server", error)
+        self.assertIsNone(
+            generate_contract_error({"input_ids": [1], "prepared_multimodal": None})
+        )
+
     def test_every_media_container_form_is_accepted(self):
         for image_data in (
             "u",
