@@ -928,7 +928,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     def _maybe_build_fused_select(self) -> Optional[FusedSelect]:
         """The fused selection (SM100), or None when it is off. Runs here: both models are loaded, and neither the
         KV cache sizing nor any graph capture has happened yet (it merges the head's weights)."""
-        if self.selector is None or not envs.SGLANG_ENABLE_DFLASH2_FUSED_SELECT.get():
+        if self.selector is None or envs.SGLANG_DISABLE_DFLASH2_FUSED_SELECT.get():
             return None
         target_model = self._target_worker.model_runner.model
         draft_config = self.draft_model.draft_config
@@ -938,7 +938,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             selector=self.selector,
             gamma=self.block_size - 1,
             # Larger eager batches take the unfused path; the batch size is the same on every rank.
-            max_bs=max(get_exec().graph.cuda_graph_config.decode.bs),
+            max_bs=max(get_exec().graph.cuda_graph_config.decode.bs, default=0),
             output_multiplier=draft_config.output_multiplier,
             final_logit_softcapping=draft_config.final_logit_softcapping,
             memory_saver_adapter=self._target_worker.model_runner.memory_saver_adapter,

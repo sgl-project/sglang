@@ -195,7 +195,8 @@ def _check(lease, gamma, bs, k, seed, ties=False):
 
 @pytest.mark.parametrize(
     "gamma,bs,k",
-    list(itertools.product([4, 7], [1, 8, 64], [16])) + [(4, 8, 32), (7, 2, 32)],
+    list(itertools.product([4, 7], [1, 8, 64], [16]))
+    + [(4, 8, 32), (7, 2, 32), (5, 8, 16), (5, 2, 32)],
 )
 def test_select_matches_reference(ws, gamma, bs, k):
     match = _check(ws, gamma, bs, k, seed=gamma * 100 + bs + k)
@@ -438,7 +439,9 @@ def _precompile(world_sizes):
         for mb in _K1_MIN_BLOCKS
     ]
     builders += [
-        lambda k=k, g=g: _jit_select_walk_module(k, g) for k in (32, 16) for g in (4, 7)
+        lambda k=k, g=g: _jit_select_walk_module(k, g)
+        for k in (32, 16)
+        for g in (4, 5, 7)
     ]
     parallel_compile(builders)
 
