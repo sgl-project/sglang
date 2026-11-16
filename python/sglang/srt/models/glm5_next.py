@@ -1081,8 +1081,6 @@ class Glm5NextDecoderLayer(nn.Module):
 
 
 class Glm5NextModel(nn.Module):
-    fall_back_to_pt_during_load = False
-
     def __init__(
         self,
         config: Glm5NextTextConfig,
