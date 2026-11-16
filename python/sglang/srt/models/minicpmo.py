@@ -44,13 +44,11 @@ from sglang.srt.managers.mm_utils import (
 )
 from sglang.srt.managers.req_types import MultimodalDataItem, MultimodalInputs
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
-from sglang.srt.model_loader.utils import set_default_torch_dtype
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.models.idefics2 import Idefics2VisionTransformer
-from sglang.srt.models.minicpmv import MiniCPMBaseModel, Resampler2_5
+from sglang.srt.models.minicpmv import MiniCPMBaseModel
 from sglang.srt.models.qwen2 import Qwen2ForCausalLM
-from sglang.srt.multimodal.modality import MultimodalInputFormat
-from sglang.srt.utils import flatten_nested_list, get_device, logger
+from sglang.srt.utils import flatten_nested_list, logger
 
 try:
     # `LogitsWarper` was removed in transformers v4.48 (merged into
@@ -1397,26 +1395,6 @@ class MiniCPMO(MiniCPMBaseModel):
 
         return model
 
-    def init_resampler(
-        self,
-        embed_dim: int,
-        vision_dim: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> nn.Module:
-        with set_default_torch_dtype(torch.float16):
-            # The resampler in 2.6 remains consistent with the one in 2.5.
-            resampler = Resampler2_5(
-                num_queries=self.config.query_num,
-                embed_dim=embed_dim,
-                num_heads=embed_dim // 128,
-                kv_dim=vision_dim,
-                quant_config=quant_config,
-                prefix=prefix,
-            )
-
-        return resampler.to(device=get_device(), dtype=torch.get_default_dtype())
-
     def pad_input_ids(self, input_ids: array, mm_input: MultimodalInputs) -> array:
         # Get all special token IDs
         im_start_id: int = mm_input.im_start_id
@@ -1705,49 +1683,6 @@ class MiniCPMO(MiniCPMBaseModel):
         audio_embs = torch.cat(flatten_nested_list(audio_embeddings), dim=0)
 
         return audio_embs
-
-    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        if items and items[0].format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
-            result = torch.cat([item.feature for item in items])
-            return result.reshape(-1, result.shape[-1])
-
-        # list of tensors
-        pixel_values = flatten_nested_list([item.feature for item in items])
-        tgt_sizes = torch.stack(
-            flatten_nested_list([item.tgt_size for item in items]), dim=0
-        )
-        assert len(pixel_values) == tgt_sizes.shape[0]
-
-        device = self.vpm.embeddings.position_embedding.weight.device
-        dtype = self.vpm.embeddings.position_embedding.weight.dtype
-        all_pixel_values_lst = [
-            i.flatten(end_dim=1).permute(1, 0) for i in pixel_values
-        ]
-
-        max_patches = (tgt_sizes[:, 0] * tgt_sizes[:, 1]).max().item()
-        assert isinstance(max_patches, int)
-        all_pixel_values = torch.nn.utils.rnn.pad_sequence(
-            all_pixel_values_lst, batch_first=True, padding_value=0.0
-        )
-
-        B, L, _ = all_pixel_values.shape
-        all_pixel_values = all_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
-        patch_attn_mask = torch.zeros(
-            (B, 1, max_patches), dtype=torch.bool, device=device
-        )
-
-        tgt_sizes_tensor = tgt_sizes.clone().to(device=patch_attn_mask.device)
-        mask_shapes = tgt_sizes_tensor[:, 0] * tgt_sizes_tensor[:, 1]
-        patch_attn_mask[:, 0, :] = torch.arange(
-            patch_attn_mask.size(2), device=patch_attn_mask.device
-        ).unsqueeze(0) < mask_shapes.unsqueeze(1)
-
-        vision_embedding = self.vpm(
-            all_pixel_values.type(dtype),
-            patch_attention_mask=patch_attn_mask,
-            tgt_sizes=tgt_sizes,
-        )
-        return self.resampler(vision_embedding, tgt_sizes)
 
     def forward(
         self,
