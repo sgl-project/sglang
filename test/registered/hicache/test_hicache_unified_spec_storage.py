@@ -464,16 +464,7 @@ class DFlashSidecarMixin(PackedNextnMixin):
         return self.ledger_prompt(seed + 1000)
 
 
-class TestUnifiedKeysDFlashSidecar(DFlashSidecarMixin, CustomTestCase):
-    """One rank owns all 8 heads of the target and of the draft. Measured on
-    B200: accept length 3.10, and 1.75 with the draft objects zeroed."""
-
-    min_accept_length = 2.4
-    target_chunks = {"L0-32_H0": 32 * 8 * LLAMA_LAYER_BYTES_PER_HEAD}
-    draft_chunks = {"D0-5_H0": 5 * 8 * LLAMA_LAYER_BYTES_PER_HEAD}
-    # The target digest is the one of a deployment without speculation.
-    target_digest = "ukv1-b440160febf92487"
-    draft_digest = "ukd1-00b6f6f02b29851b"
+class SameTopologyDFlashSidecar(DFlashSidecarMixin):
     longer_pages = 16
 
     def _assert_only_backfilled(self, before, now, draft, min_pages):
@@ -498,6 +489,8 @@ class TestUnifiedKeysDFlashSidecar(DFlashSidecarMixin, CustomTestCase):
         longer = self.ledger_prompt(seed=1, pages=self.longer_pages)
         self.assertEqual(longer[: len(prompt)], prompt)
         salt = uuid.uuid4().hex
+        on_files = self.storage_backend == "file"
+        continued_pages = self.longer_pages - self.prompt_pages
 
         # 1. In one process an L3 reload reproduces the device-cache hit, the
         # draft's work included.
@@ -506,8 +499,9 @@ class TestUnifiedKeysDFlashSidecar(DFlashSidecarMixin, CustomTestCase):
         device_hit, storage_hit = self.reload_in_process(prompt, salt, seed=1)
         self._assert_draft_at_work(device_hit, "device hit")
         self.assertEqual(self.spec_stats(storage_hit), self.spec_stats(device_hit))
-        written = self.wait_for_backups()
-        target, draft = self._audit_pages(written, 2 * self.prompt_pages)
+        if on_files:
+            written = self.wait_for_backups()
+            target, draft = self._audit_pages(written, 2 * self.prompt_pages)
 
         # 2. After a restart the pages come back with their draft KV, and
         # reading leaves every object as it was.
@@ -515,8 +509,9 @@ class TestUnifiedKeysDFlashSidecar(DFlashSidecarMixin, CustomTestCase):
         self._assert_reloaded_elsewhere(
             self.generate(prompt, salt), prompt, device_hit, "after restart"
         )
-        written = self._assert_untouched(written, self.wait_for_backups())
-        self._audit_pages(written, 2 * self.prompt_pages)
+        if on_files:
+            written = self._assert_untouched(written, self.wait_for_backups())
+            self._audit_pages(written, 2 * self.prompt_pages)
 
         # 3. A deployment without the draft reads the target chunks of these
         # pages, and continues the prompt with pages of target chunks alone.
@@ -525,13 +520,14 @@ class TestUnifiedKeysDFlashSidecar(DFlashSidecarMixin, CustomTestCase):
         self.assert_storage_hit(plain)
         self.assertNotIn("spec_verify_ct", plain["meta_info"])
         self.assert_kl_against_recompute(plain, longer)
-        with_plain = self._assert_untouched(written, self.wait_for_backups())
-        plain_pages = self._pages(
-            {name: with_plain[name] for name in with_plain if name not in written}
-        )
-        self.assertGreaterEqual(len(plain_pages), self.longer_pages - self.prompt_pages)
-        for page, chunks in plain_pages.items():
-            self.assertEqual(chunks, {target: self.target_chunks}, page)
+        if on_files:
+            with_plain = self._assert_untouched(written, self.wait_for_backups())
+            plain_pages = self._pages(
+                {name: with_plain[name] for name in with_plain if name not in written}
+            )
+            self.assertGreaterEqual(len(plain_pages), continued_pages)
+            for page, chunks in plain_pages.items():
+                self.assertEqual(chunks, {target: self.target_chunks}, page)
 
         # 4. The draft deployment takes from storage exactly the pages that
         # have draft chunks, computes the rest and adds their draft chunks.
@@ -539,13 +535,13 @@ class TestUnifiedKeysDFlashSidecar(DFlashSidecarMixin, CustomTestCase):
         partial = self.generate(longer, salt)
         self.assert_storage_hit(partial)
         self.assert_kl_against_recompute(partial, longer)
-        backfilled = self._assert_untouched(with_plain, self.wait_for_backups())
-        self._assert_only_backfilled(
-            with_plain, backfilled, draft, self.longer_pages - self.prompt_pages
-        )
+        if on_files:
+            backfilled = self._assert_untouched(with_plain, self.wait_for_backups())
+            self._assert_only_backfilled(with_plain, backfilled, draft, continued_pages)
         self.flush_cache()
         self.assert_storage_hit(self.generate(longer, salt), self.longer_pages)
-        written = self._assert_untouched(backfilled, self.wait_for_backups())
+        if on_files:
+            written = self._assert_untouched(backfilled, self.wait_for_backups())
 
         # 5. Another draft: a miss on the draft chunks alone. The reader
         # recomputes, adds its own draft chunks and leaves everything else.
@@ -555,6 +551,8 @@ class TestUnifiedKeysDFlashSidecar(DFlashSidecarMixin, CustomTestCase):
         self.assertEqual(missed["meta_info"]["cached_tokens"], 0)
         self.flush_cache()
         self.assert_storage_hit(self.generate(prompt, salt))
+        if not on_files:
+            return
         now = self._assert_untouched(written, self.wait_for_backups())
         others = {
             digest
@@ -587,6 +585,30 @@ class TestUnifiedKeysDFlashSidecar(DFlashSidecarMixin, CustomTestCase):
         self.assertLess(accept_length, self.min_accept_length)
 
 
+# Measured on B200: accept length 3.10 on the test prompt, and 1.75 with the
+# draft objects zeroed.
+DFLASH_MIN_ACCEPT_LENGTH = 2.4
+
+
+class TestUnifiedKeysDFlashSidecar(SameTopologyDFlashSidecar, CustomTestCase):
+    """One rank owns all 8 heads of the target and of the draft."""
+
+    min_accept_length = DFLASH_MIN_ACCEPT_LENGTH
+    target_chunks = {"L0-32_H0": 32 * 8 * LLAMA_LAYER_BYTES_PER_HEAD}
+    draft_chunks = {"D0-5_H0": 5 * 8 * LLAMA_LAYER_BYTES_PER_HEAD}
+    # The target digest is the one of a deployment without speculation.
+    target_digest = "ukv1-b440160febf92487"
+    draft_digest = "ukd1-00b6f6f02b29851b"
+
+
+class TestUnifiedKeysDFlashSidecarMooncake(SameTopologyDFlashSidecar, CustomTestCase):
+    """The same flow on Mooncake, where a test cannot list or alter objects."""
+
+    min_accept_length = DFLASH_MIN_ACCEPT_LENGTH
+    storage_backend = "mooncake"
+    expected_storage_backend = "MooncakeStore"
+
+
 @unittest.skipUnless(get_gpu_count() >= 2, "Requires 2 GPUs for the TP2 server")
 class TestUnifiedKeysDFlashSidecarCrossTP(DFlashSidecarMixin, CustomTestCase):
     """8 kv heads in 2-head chunks on both grids: a TP2 rank owns 2 chunks of
@@ -594,7 +616,7 @@ class TestUnifiedKeysDFlashSidecarCrossTP(DFlashSidecarMixin, CustomTestCase):
     B200: accept length 3.20 at TP2, 3.43 at TP1 on TP2's pages, 4.57 at TP2
     on TP1's pages of the second prompt."""
 
-    min_accept_length = 2.4
+    min_accept_length = DFLASH_MIN_ACCEPT_LENGTH
     unified_server_args = ["--hicache-storage-head-partition", "2"]
     target_chunks = {
         f"L0-32_H{g}": 32 * 2 * LLAMA_LAYER_BYTES_PER_HEAD for g in range(4)
