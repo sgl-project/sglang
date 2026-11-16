@@ -13,8 +13,6 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_budget imp
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_lim import (
     LIMDecodeAdapter,
-)
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
     sparse_query_width,
 )
 from sglang.srt.model_executor.forward_mode import ForwardMode
@@ -214,16 +212,14 @@ class TestLIMState(CustomTestCase):
                 64,
             )
             manager.budget.bind_native_pool(pool)
-            pre, post = ModuleType("pre"), ModuleType("post")
+            pre = ModuleType("pre")
             pre.fused_prepare_lim_metadata = Mock()
-            post.prepare_copy_sfa_metadata = Mock()
             with (
                 patch(prefix + "fused_lim.load_fused_lim_operator", return_value=None),
                 patch.dict(
                     "sys.modules",
                     {
                         prefix + "npu_lim_input_metadata": pre,
-                        prefix + "npu_lim_copy_sfa_metadata": post,
                     },
                 ),
             ):
@@ -324,11 +320,16 @@ class TestLIMState(CustomTestCase):
         pre.fused_prepare_lim_metadata = Mock()
         post.prepare_copy_sfa_metadata = Mock()
 
-        def host_pool(*, tokens, layers, widths, dtype, device, group):
+        def host_pool(
+            *, tokens, layers, page_size, head_num, widths, dtype, device, group
+        ):
             return SimpleNamespace(
                 buffers=[
                     [
-                        torch.empty((tokens // 128, 128, 1, width), dtype=dtype)
+                        torch.empty(
+                            (tokens // page_size, page_size, head_num, width),
+                            dtype=dtype,
+                        )
                         for _ in range(layers)
                     ]
                     for width in widths
@@ -373,8 +374,8 @@ class TestLIMState(CustomTestCase):
         self.assertEqual(
             [tuple(component[0].shape) for component in manager.host_pool.buffers],
             [
-                (plan.host_token_capacity // 128, 128, 1, 512),
-                (plan.host_token_capacity // 128, 128, 1, 64),
+                (plan.host_token_capacity // pool.page_size, pool.page_size, 1, 512),
+                (plan.host_token_capacity // pool.page_size, pool.page_size, 1, 64),
             ],
         )
         self.assertEqual(
@@ -451,6 +452,11 @@ class TestLIMState(CustomTestCase):
         self.assertEqual(
             selection.device_slots.data_ptr(), adapter.device_slots.data_ptr()
         )
+        selection.prefix_lens.copy_(torch.tensor([9000, 100], dtype=torch.int32))
+        expected_copy_lengths = torch.tensor(
+            [manager.cache_capacity + manager.max_query_width - 1, 100],
+            dtype=torch.int32,
+        )
 
         def native_copy_sfa(*tensors, **kwargs):
             self.assertEqual(tensors[2].shape[-1], 512)
@@ -464,6 +470,8 @@ class TestLIMState(CustomTestCase):
                 adapter.query_ends[manager.max_query_width - 1].data_ptr(),
             )
             self.assertEqual(tensors[6].data_ptr(), adapter._pre_cache_sizes.data_ptr())
+            self.assertEqual(tensors[5].data_ptr(), adapter._pre_lengths.data_ptr())
+            torch.testing.assert_close(tensors[5], expected_copy_lengths)
             torch.testing.assert_close(
                 tensors[6], torch.tensor([8192, 0], dtype=torch.int32)
             )
@@ -478,17 +486,27 @@ class TestLIMState(CustomTestCase):
             tensors[16].fill_(3)
 
         manager._copy_sfa_operator = native_copy_sfa
-        result = manager.copy_sfa_attention(
-            SimpleNamespace(layer_id=0, scaling=0.1),
-            torch.zeros(rows, 8, 512, dtype=torch.bfloat16),
-            torch.zeros(rows, 8, 64, dtype=torch.bfloat16),
-            selection,
-            (
-                torch.empty(rows, 1, 576, dtype=torch.bfloat16),
-                torch.arange(rows, dtype=torch.int32),
-                torch.ones(rows, dtype=torch.bool),
-            ),
-        )
+
+        def prepare_metadata(**kwargs):
+            kwargs["actual_seq_lengths_kv"].copy_(expected_copy_lengths)
+
+        post.prepare_copy_sfa_metadata.side_effect = prepare_metadata
+        prefix_before = selection.prefix_lens.clone()
+        with patch.dict(sys.modules, {prefix + "npu_lim_copy_sfa_metadata": post}):
+            for stale in (-10, -20):
+                adapter._pre_lengths[:2].fill_(stale)
+                result = manager.copy_sfa_attention(
+                    SimpleNamespace(layer_id=0, scaling=0.1),
+                    torch.zeros(rows, 8, 512, dtype=torch.bfloat16),
+                    torch.zeros(rows, 8, 64, dtype=torch.bfloat16),
+                    selection,
+                    (
+                        torch.empty(rows, 1, 576, dtype=torch.bfloat16),
+                        torch.arange(rows, dtype=torch.int32),
+                        torch.ones(rows, dtype=torch.bool),
+                    ),
+                )
+                torch.testing.assert_close(selection.prefix_lens, prefix_before)
         torch.testing.assert_close(
             result, torch.full((rows, 8 * 512), 3, dtype=result.dtype)
         )

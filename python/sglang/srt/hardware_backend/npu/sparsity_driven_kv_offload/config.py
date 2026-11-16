@@ -36,6 +36,10 @@ if TYPE_CHECKING:
     from sglang.srt.configs.model_config import ModelConfig
 
 
+# MLA stores one compressed latent KV head, independently of query-head count.
+MLA_KV_HEAD_NUM = 1
+
+
 def use_fused_sparse_kv_offload() -> bool:
     return envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.get()
 

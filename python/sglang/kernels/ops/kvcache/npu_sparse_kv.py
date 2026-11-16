@@ -1,4 +1,4 @@
-"""Fused sparse KV publication metadata and target KV layout on NPU."""
+"""Sparse KV offload row mappings and target KV layout on NPU."""
 
 import torch
 import triton
@@ -6,7 +6,7 @@ import triton.language as tl
 
 
 @triton.jit
-def _publication(
+def _prepare_sparse_kv_offload_kernel(
     reqs,
     seq,
     pos,
@@ -72,7 +72,7 @@ def _publication(
     tl.store(valid + t, live, in_bounds)
 
 
-def prepare_sparse_kv_publication(
+def prepare_sparse_kv_offload(
     k,
     k_rope,
     request_ids,
@@ -88,7 +88,7 @@ def prepare_sparse_kv_publication(
     extend_prefix_lens=None,
     compact_prefill=False,
 ):
-    """Prepare publication rows and, for target decode/verify, concatenate KV."""
+    """Prepare offload rows and, for target decode/verify, concatenate KV."""
     tokens, batch = k.shape[0], request_ids.numel()
     prefill = extend_seq_lens is not None
     source = torch.empty(tokens, dtype=torch.int64, device=k.device)
@@ -98,7 +98,7 @@ def prepare_sparse_kv_publication(
     current = (k, k_rope) if prefill else torch.cat((k, k_rope), dim=-1)
     if tokens:
         token_block = 32
-        _publication[(triton.cdiv(tokens, token_block),)](
+        _prepare_sparse_kv_offload_kernel[(triton.cdiv(tokens, token_block),)](
             request_ids,
             seq_lens,
             positions if positions is not None else request_ids,

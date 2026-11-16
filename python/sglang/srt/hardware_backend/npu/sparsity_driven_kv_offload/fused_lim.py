@@ -10,9 +10,13 @@ from sglang.kernels.ops.attention.npu_lim import (
     fused_lightning_indexer_manage,
     load_fused_lim_operator,
 )
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
-    sparse_query_width,
-)
+
+
+def sparse_query_width(forward_batch):
+    """Decode has one query per request; verify uses its chain width."""
+    if forward_batch.forward_mode.is_decode():
+        return 1
+    return forward_batch.spec_info.num_tokens_per_req
 
 
 @dataclass
@@ -32,9 +36,6 @@ class LIMSelection:
 
 class LIMDecodeAdapter:
     def __init__(self, manager):
-        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_copy_sfa_metadata import (
-            prepare_copy_sfa_metadata,
-        )
         from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_input_metadata import (
             fused_prepare_lim_metadata,
         )
@@ -45,7 +46,6 @@ class LIMDecodeAdapter:
         self.max_query_width = manager.max_query_width
         self.operator = load_fused_lim_operator()
         self._fused_prepare_lim_metadata = fused_prepare_lim_metadata
-        self._prepare_copy_sfa_metadata = prepare_copy_sfa_metadata
         device = manager.device
         for name, spec in manager.budget.adapter_buffers.items():
             if name == "query_ends":
@@ -72,14 +72,13 @@ class LIMDecodeAdapter:
         batch = forward_batch.batch_size
         width = sparse_query_width(forward_batch)
         rows = batch * width
-        columns = min(block_table.shape[1], self.block_table.shape[1])
         layer_index = layer_id - manager.start_layer
         self._fused_prepare_lim_metadata(
             seq_lens=forward_batch.seq_lens[:batch],
             positions=forward_batch.positions[:rows],
             request_slots=forward_batch.req_pool_indices,
             last_prefix=self.last_prefix[layer_index],
-            block_table=block_table[:, :columns],
+            block_table=block_table,
             out_block_table=self.block_table[:batch],
             safe_slots=self.request_safe_slots[:batch],
             lengths=self._pre_lengths[:batch],
@@ -131,18 +130,3 @@ class LIMDecodeAdapter:
             self.request_safe_slots[:batch],
             width,
         )
-
-    def prepare_copy_sfa_metadata(self, manager, plan) -> None:
-        batch = plan.request_safe_slots.numel()
-        self._prepare_copy_sfa_metadata(
-            source_ids=plan.source_ids,
-            valid_rows=plan.valid_rows,
-            sparse_rows=plan.sparse_rows,
-            request_slots=plan.request_safe_slots,
-            actual_seq_lengths_kv=manager.planner_actual_seq_lengths_kv[:batch],
-            hbm_block_table=manager.planner_hbm_block_table[:batch],
-            capacity=self.capacity,
-            query_width=plan.query_width,
-            seq_lens=plan.prefix_lens,
-        )
-        manager.planner_query_ends = self.query_ends[plan.query_width - 1, :batch]

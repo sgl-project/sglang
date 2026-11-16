@@ -88,19 +88,9 @@ register_kernel(
 
 register_kernel(
     KernelSpec(
-        op="kvcache.prepare_sparse_kv_publication",
+        op="kvcache.prepare_sparse_kv_offload",
         backend=KernelBackend.TRITON,
-        target="sglang.kernels.ops.kvcache.npu_sparse_kv:prepare_sparse_kv_publication",
+        target="sglang.kernels.ops.kvcache.npu_sparse_kv:prepare_sparse_kv_offload",
         capabilities=frozenset({CapabilityRequirement.NPU}),
     )
 )
-
-
-def prepare_sparse_kv_publication(*args, **kwargs):
-    """Prepare sparse KV publication metadata on NPU."""
-    return get_kernel("kvcache.prepare_sparse_kv_publication", KernelBackend.TRITON)(
-        *args, **kwargs
-    )
-
-
-__all__.append("prepare_sparse_kv_publication")

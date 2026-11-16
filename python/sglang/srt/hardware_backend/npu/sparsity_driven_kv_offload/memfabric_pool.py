@@ -78,9 +78,11 @@ class MemFabricKVPool:
 
     alignment = 2 * 1024 * 1024
 
-    def __init__(self, *, tokens, layers, widths, dtype, device, group):
-        if tokens <= 0 or tokens % 128 or layers <= 0 or tuple(widths) != (512, 64):
-            raise ValueError("MF split KV requires page-aligned 512/64 MLA geometry")
+    def __init__(
+        self, *, tokens, layers, page_size, head_num, widths, dtype, device, group
+    ):
+        if tokens <= 0 or tokens % page_size or layers <= 0:
+            raise ValueError("MF split KV requires page-aligned token capacity")
         if dtype not in (torch.float16, torch.bfloat16):
             raise ValueError("MF split KV requires FP16 or BF16 storage")
         from memfabric_hybrid import offload
@@ -89,7 +91,7 @@ class MemFabricKVPool:
         self.group = _host_group(group)
         self.rank = self.group.rank_in_group
         self._allocations = []
-        sizes = [tokens * width * dtype.itemsize for width in widths]
+        sizes = [tokens * head_num * width * dtype.itemsize for width in widths]
         reserved = layers * sum(
             ((size + self.alignment - 1) // self.alignment + 1) * self.alignment
             for size in sizes
@@ -127,16 +129,18 @@ class MemFabricKVPool:
                     self._allocations.append(raw)
                     offset = (-raw.data_ptr()) % self.alignment
                     tensor = (
-                        raw[offset : offset + size].view(dtype).view(-1, 128, 1, width)
+                        raw[offset : offset + size]
+                        .view(dtype)
+                        .view(-1, page_size, head_num, width)
                     )
                 address = self.group.broadcast_object(
                     tensor.data_ptr() if tensor is not None else None
                 )
                 if tensor is None:
                     # MF SHARED provides the same GVA on every participant.
-                    storage = (ctypes.c_uint16 * (size // 2)).from_address(address)
+                    storage = (ctypes.c_uint8 * size).from_address(address)
                     tensor = torch.frombuffer(storage, dtype=dtype).view(
-                        -1, 128, 1, width
+                        -1, page_size, head_num, width
                     )
                 component.append(tensor)
             self.buffers.append(component)

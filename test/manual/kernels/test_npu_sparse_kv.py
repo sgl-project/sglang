@@ -1,11 +1,11 @@
-"""NPU numerical checks for sparse KV publication, including graph replay."""
+"""NPU numerical checks for sparse KV offload preparation and graph replay."""
 
 import pytest
 import torch
 
 pytest.importorskip("torch_npu")
 
-from sglang.kernels.ops.kvcache import prepare_sparse_kv_publication
+from sglang.kernels.ops.kvcache.npu_sparse_kv import prepare_sparse_kv_offload
 
 pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="NPU required")
 
@@ -15,7 +15,7 @@ pytestmark = pytest.mark.skipif(not torch.npu.is_available(), reason="NPU requir
     [("decode", 1), ("verify", 4), ("verify", 14), ("compact", 1), ("padded", 1)],
 )
 @pytest.mark.parametrize("real_shape", [False, True])
-def test_publication(mode, q, real_shape):
+def test_offload_rows(mode, q, real_shape):
     prefill = mode in ("compact", "padded")
     lengths = [2, 0, 3] if mode == "compact" else [2, 0, 1]
     if real_shape:
@@ -55,7 +55,7 @@ def test_publication(mode, q, real_shape):
     prefix = torch.tensor([3, 4], device=device, dtype=torch.int32)
 
     def call():
-        return prepare_sparse_kv_publication(
+        return prepare_sparse_kv_offload(
             k,
             rope,
             req,

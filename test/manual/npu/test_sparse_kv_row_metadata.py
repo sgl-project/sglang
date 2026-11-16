@@ -495,6 +495,8 @@ def mf_case(args, results):
     pool = pool_module.MemFabricKVPool(
         tokens=128,
         layers=1,
+        page_size=128,
+        head_num=1,
         widths=(512, 64),
         dtype=torch.bfloat16,
         device=d,

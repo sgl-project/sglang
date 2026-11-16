@@ -177,8 +177,8 @@ class TestPDSplitKVPool(CustomTestCase):
         src, dst = torch.tensor([0]), torch.tensor([1])
         valid, positions = torch.tensor([True]), torch.tensor([7])
         current = ("payload", "rows", "valid")
-        kernels = ModuleType("sglang.kernels.ops.kvcache")
-        kernels.prepare_sparse_kv_publication = lambda *args, **kwargs: (
+        kernels = ModuleType("sglang.kernels.ops.kvcache.npu_sparse_kv")
+        kernels.prepare_sparse_kv_offload = lambda *args, **kwargs: (
             src,
             dst,
             positions,
@@ -186,7 +186,7 @@ class TestPDSplitKVPool(CustomTestCase):
             current,
         )
         mtp = ModuleType(
-            "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp"
+            "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_lim"
         )
         mtp.sparse_query_width = lambda batch: 1
         shared = [torch.zeros(2, 1, w) for w in (2, 1)]
@@ -276,9 +276,11 @@ class TestPDSplitKVPool(CustomTestCase):
 
         def sparse_copy(src, dst, lengths, count, device):
             for source, destination in zip(src, dst):
-                destination.reshape(-1, 1, destination.shape[-1])[
+                destination.reshape(-1, destination.shape[-2], destination.shape[-1])[
                     lengths[1][lengths[2]]
-                ] = source.reshape(-1, 1, source.shape[-1])[lengths[0][lengths[2]]]
+                ] = source.reshape(-1, source.shape[-2], source.shape[-1])[
+                    lengths[0][lengths[2]]
+                ]
             return 0
 
         offload = SimpleNamespace(
@@ -312,43 +314,57 @@ class TestPDSplitKVPool(CustomTestCase):
                 torch, "npu", SimpleNamespace(current_device=lambda: 0), create=True
             ),
         ):
-            kwargs = dict(
-                tokens=128,
-                layers=1,
-                widths=(512, 64),
-                dtype=torch.bfloat16,
-                device="cpu",
-            )
-            owner = MemFabricKVPool(group=Group(0), **kwargs)
-            peer = MemFabricKVPool(group=Group(1), **kwargs)
-            self.assertEqual(len(allocations), 2)
-            self.assertEqual(
-                [c[0].data_ptr() for c in owner.buffers],
-                [c[0].data_ptr() for c in peer.buffers],
-            )
-            payload = [
-                torch.full((1, 1, w), 17, dtype=torch.bfloat16) for w in (512, 64)
-            ]
-            owner.copy_rows(
-                payload,
-                [c[0] for c in owner.buffers],
-                torch.tensor([0]),
-                torch.tensor([3]),
-                torch.tensor([True]),
-            )
-            owner.publish()
-            peer.publish()
-            result = [torch.zeros((1, 1, w), dtype=torch.bfloat16) for w in (512, 64)]
-            peer.copy_rows(
-                [c[0] for c in peer.buffers],
-                result,
-                torch.tensor([3]),
-                torch.tensor([0]),
-                torch.tensor([True]),
-            )
-            self.assertEqual(events, [(0, 0), (1, 0)])
-            for tensor in result:
-                self.assertTrue(torch.all(tensor == 17))
+            for page_size, head_num, widths, dtype in (
+                (128, 1, (512, 64), torch.bfloat16),
+                (4, 2, (3, 5), torch.float16),
+            ):
+                messages.clear()
+                events.clear()
+                allocations.clear()
+                kwargs = dict(
+                    tokens=page_size * 2,
+                    layers=1,
+                    page_size=page_size,
+                    head_num=head_num,
+                    widths=widths,
+                    dtype=dtype,
+                    device="cpu",
+                )
+                owner = MemFabricKVPool(group=Group(0), **kwargs)
+                peer = MemFabricKVPool(group=Group(1), **kwargs)
+                self.assertEqual(len(allocations), len(widths))
+                self.assertEqual(
+                    [c[0].data_ptr() for c in owner.buffers],
+                    [c[0].data_ptr() for c in peer.buffers],
+                )
+                for component, width in zip(owner.buffers, widths):
+                    self.assertEqual(
+                        tuple(component[0].shape),
+                        (2, page_size, head_num, width),
+                    )
+                payload = [
+                    torch.full((1, head_num, w), 17, dtype=dtype) for w in widths
+                ]
+                owner.copy_rows(
+                    payload,
+                    [c[0] for c in owner.buffers],
+                    torch.tensor([0]),
+                    torch.tensor([3]),
+                    torch.tensor([True]),
+                )
+                owner.publish()
+                peer.publish()
+                result = [torch.zeros((1, head_num, w), dtype=dtype) for w in widths]
+                peer.copy_rows(
+                    [c[0] for c in peer.buffers],
+                    result,
+                    torch.tensor([3]),
+                    torch.tensor([0]),
+                    torch.tensor([True]),
+                )
+                self.assertEqual(events, [(0, 0), (1, 0)])
+                for tensor in result:
+                    self.assertTrue(torch.all(tensor == 17))
 
 
 if __name__ == "__main__":

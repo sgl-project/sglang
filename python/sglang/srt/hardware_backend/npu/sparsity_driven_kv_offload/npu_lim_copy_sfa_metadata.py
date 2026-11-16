@@ -71,7 +71,7 @@ def prepare_copy_sfa_metadata(
 ) -> None:
     """Prepare native scheduling lengths, HBM pages, and invalid source IDs."""
     batch = source_ids.shape[0] // query_width
-    hbm_pages = capacity // 128
+    hbm_pages = hbm_block_table.shape[1]
     _lim_copy_sfa_metadata_kernel[(batch,)](
         source_ids,
         valid_rows,
@@ -80,7 +80,7 @@ def prepare_copy_sfa_metadata(
         actual_seq_lengths_kv,
         hbm_block_table,
         seq_lens,
-        2048,
+        source_ids.shape[1],
         query_width,
         capacity,
         hbm_pages,

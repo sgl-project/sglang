@@ -12,6 +12,9 @@ from sglang.kernels.ops.attention.npu_copy_sfa import (
     fused_scatter_copy_sparse_flash_attention,
     load_copy_sfa_operator,
 )
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
+    MLA_KV_HEAD_NUM,
+)
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.prefill_kv_plan import (
     make_fused_prefill_plan,
     prepare_prefill_gather_rows,
@@ -48,7 +51,8 @@ class FusedSparseKVCacheManager:
         self.paged_kv_cache = paged_kv_cache
         self.start_layer = paged_kv_cache.start_layer
         # MLA params
-        self.head_num = 1
+        self.head_num = MLA_KV_HEAD_NUM
+        self.page_size = paged_kv_cache.page_size
         self.kv_lora_rank = self.paged_kv_cache.kv_lora_rank
         self.qk_rope_head_dim = self.paged_kv_cache.qk_rope_head_dim
         self.store_dtype = self.paged_kv_cache.store_dtype
@@ -94,7 +98,7 @@ class FusedSparseKVCacheManager:
         except Exception as e:
             self._raise_buffer_allocation_error(name, e)
 
-        # Shared host components use [physical_pages, 128, 1, width] per layer.
+        # Shared host components use [physical_pages, page_size, head_num, width].
         # The padded slot 0 is used for writing dummy outputs from padded tokens.
 
         # Radix prefixes use native physical token IDs. Keep host payloads in that
@@ -106,6 +110,8 @@ class FusedSparseKVCacheManager:
         self.host_pool = MemFabricKVPool(
             tokens=self.host_token_capacity,
             layers=self.layer_num,
+            page_size=self.page_size,
+            head_num=self.head_num,
             widths=(self.kv_lora_rank, self.qk_rope_head_dim),
             dtype=self.store_dtype,
             device=self.device,
@@ -216,9 +222,26 @@ class FusedSparseKVCacheManager:
         plan,
         current_inputs,
     ):
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.npu_lim_copy_sfa_metadata import (
+            prepare_copy_sfa_metadata,
+        )
+
         batch = plan.request_safe_slots.numel()
         rows = batch * plan.query_width
-        self.lim_adapter.prepare_copy_sfa_metadata(self, plan)
+        adapter = self.lim_adapter
+        # LIM has consumed these lengths on this stream; reuse the scratch for CopySFA.
+        actual_seq_lengths_kv = adapter._pre_lengths[:batch]
+        prepare_copy_sfa_metadata(
+            source_ids=plan.source_ids,
+            valid_rows=plan.valid_rows,
+            sparse_rows=plan.sparse_rows,
+            request_slots=plan.request_safe_slots,
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
+            hbm_block_table=self.planner_hbm_block_table[:batch],
+            capacity=adapter.capacity,
+            query_width=plan.query_width,
+            seq_lens=plan.prefix_lens,
+        )
         query_heads = query_nope.shape[1]
         current, positions, valid = current_inputs
         padded_heads = self.fused_attn_out.shape[1]
@@ -229,18 +252,18 @@ class FusedSparseKVCacheManager:
         output = self.fused_attn_out[:rows]
         layer_idx = layer.layer_id - self.start_layer
         cache = self.device_kv_buffer[layer_idx].view(
-            -1, 128, self.head_num, self.kv_lora_rank
+            -1, self.page_size, self.head_num, self.kv_lora_rank
         )
         rope_cache = self.device_rope_buffer[layer_idx].view(
-            -1, 128, self.head_num, self.qk_rope_head_dim
+            -1, self.page_size, self.head_num, self.qk_rope_head_dim
         )
         fused_scatter_copy_sparse_flash_attention(
             query=query_nope.contiguous(),
             query_rope=query_rope.contiguous(),
             hbm_ckv=cache,
             hbm_rope=rope_cache,
-            actual_seq_lengths_query=self.planner_query_ends,
-            actual_seq_lengths_kv=self.planner_actual_seq_lengths_kv[:batch],
+            actual_seq_lengths_query=adapter.query_ends[plan.query_width - 1, :batch],
+            actual_seq_lengths_kv=actual_seq_lengths_kv,
             num_cache_tokens=self.lim_adapter._pre_cache_sizes[:batch],
             topk_src_ids=plan.source_ids,
             topk_dst_slots=plan.device_slots,
@@ -295,8 +318,8 @@ class FusedSparseKVCacheManager:
         forward_batch: ForwardBatch,
     ):
         """Publish KV to paged host storage and return decode rows for CopySFA."""
-        from sglang.kernels.ops.kvcache import prepare_sparse_kv_publication
-        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
+        from sglang.kernels.ops.kvcache.npu_sparse_kv import prepare_sparse_kv_offload
+        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_lim import (
             sparse_query_width,
         )
 
@@ -306,7 +329,7 @@ class FusedSparseKVCacheManager:
             sum(forward_batch.extend_seq_lens_cpu[: forward_batch.batch_size])
             == k.shape[0]
         )
-        src, dst, positions, valid, current = prepare_sparse_kv_publication(
+        src, dst, positions, valid, current = prepare_sparse_kv_offload(
             k,
             k_rope,
             forward_batch.req_pool_indices,

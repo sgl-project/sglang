@@ -10,7 +10,7 @@ from sglang.kernels.ops.attention.npu_lim import (
     fused_lightning_indexer_manage,
     load_fused_lim_operator,
 )
-from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.mtp import (
+from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.fused_lim import (
     sparse_query_width,
 )
 from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.prefill_kv_plan import (

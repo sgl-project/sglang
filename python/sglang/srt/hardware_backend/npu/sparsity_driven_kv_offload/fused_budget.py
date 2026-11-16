@@ -99,9 +99,6 @@ class BudgetPlan:
             ),
             "resident_begin": BufferSpec((num_layers, request_rows), metadata_dtype),
             "resident_end": BufferSpec((num_layers, request_rows), metadata_dtype),
-            "planner_actual_seq_lengths_kv": BufferSpec(
-                (batch_capacity,), metadata_dtype
-            ),
             "planner_hbm_block_table": BufferSpec(
                 (batch_capacity, cache_tokens // page_size), metadata_dtype
             ),
