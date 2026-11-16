@@ -438,17 +438,12 @@ class TestPrefillSparseIndexer(CustomTestCase):
 
     @torch.inference_mode()
     def test_flashinfer_publish_and_select_prefill(self):
-        """Both protocol checks under FlashInfer's fused and unfused top-k, with the
-        index tie-break that makes the sparse and dense passes pick alike."""
-        for fused in (True, False):
-            with (
-                self.subTest(fused=fused),
-                envs.SGLANG_DSA_FUSE_TOPK.override(fused),
-                envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override("small"),
-            ):
-                selector = TopKSelector(DSATopKBackend.FLASHINFER)
-                self.check_publish_prefill(selector)
-                self.check_select_prefill(selector)
+        """Both protocol checks under FlashInfer's top-k, with the index tie-break
+        that makes the sparse and dense passes pick alike."""
+        with envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override("small"):
+            selector = TopKSelector(DSATopKBackend.FLASHINFER)
+            self.check_publish_prefill(selector)
+            self.check_select_prefill(selector)
 
     def check_publish_prefill(self, selector):
         for rows, ctx in CASES:

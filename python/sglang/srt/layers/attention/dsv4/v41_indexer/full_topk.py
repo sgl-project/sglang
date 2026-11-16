@@ -62,7 +62,7 @@ class FullTopKIndexer:
         self.use_prefill_lite_topk = use_prefill_lite_topk
         self.use_deep_gemm_decode = use_deep_gemm_decode
         self.selector = selector
-        # DeepSelect's paged decode top-k is an sgl-kernel selection.
+        # DeepSelect's paged decode fuses its own selection, so FlashInfer skips it.
         self.use_deep_select_decode = (
             selector.backend.is_sgl_kernel()
             and not use_deep_gemm_decode

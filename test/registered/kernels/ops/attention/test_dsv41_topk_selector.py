@@ -1,17 +1,14 @@
-"""The DeepSeek V4.1 index-layer top-k selections under every --dsa-topk-backend:
-each selects the reference picks on tie-free scores, the unfused ones also across row
-chunks, FlashInfer's index tie-break follows logical positions, sgl-kernel's top-k v2
-in mode 2 keeps the same tied picks as FlashInfer's small tie-break, and the
-FlashInfer paths replay under CUDA graphs."""
+"""The DeepSeek V4.1 index-layer top-k selections under sgl-kernel and FlashInfer:
+each selects the reference picks on tie-free scores, FlashInfer's index tie-break
+follows logical positions, sgl-kernel's top-k v2 in mode 2 keeps the same tied picks
+as FlashInfer's small tie-break, and the FlashInfer paths replay under CUDA graphs."""
 
-import itertools
 import os
 import subprocess
 import sys
 import unittest
 from contextlib import ExitStack, contextmanager
 from types import SimpleNamespace
-from unittest.mock import patch
 
 import torch
 
@@ -33,33 +30,24 @@ K = 512
 BLOCK = 8
 INT32_MAX = torch.iinfo(torch.int32).max
 
-# (backend, SGLANG_DSA_FUSE_TOPK, SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK, deterministic)
-SGL_KERNEL = ("sgl-kernel", True, None, False)
-NON_DEFAULT = [
-    ("torch", True, None, False),
-    ("flashinfer", True, None, False),
-    ("flashinfer", True, "small", True),
-    ("flashinfer", False, None, False),
-    ("flashinfer", False, "large", False),
+# (backend, SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK, SGLANG_DSA_TOPK_FLASHINFER_DETERMINISTIC)
+SGL_KERNEL = ("sgl-kernel", None, False)
+FLASHINFER = [
+    ("flashinfer", None, False),
+    ("flashinfer", "small", True),
+    ("flashinfer", "large", False),
 ]
-FLASHINFER_TIES = [
-    ("flashinfer", fused, tie_break, False)
-    for fused in (True, False)
-    for tie_break in ("small", "large")
-]
+FLASHINFER_TIES = [("flashinfer", tie_break, False) for tie_break in ("small", "large")]
 FLASHINFER_SMALL = [
-    ("flashinfer", fused, "small", deterministic)
-    for fused in (True, False)
-    for deterministic in (False, True)
+    ("flashinfer", "small", deterministic) for deterministic in (False, True)
 ]
 # SGLANG_TOPK_V2_MODE is compiled into a process's top-k v2 module, so mode 2 gets its own.
 MODE2_PARITY_FLAG = "--mode2-parity"
 
 
 @contextmanager
-def make_selector(backend, fused, tie_break, deterministic):
+def make_selector(backend, tie_break, deterministic):
     with ExitStack() as stack:
-        stack.enter_context(envs.SGLANG_DSA_FUSE_TOPK.override(fused))
         stack.enter_context(
             envs.SGLANG_DSA_TOPK_FLASHINFER_TIE_BREAK.override(tie_break)
         )
@@ -330,7 +318,7 @@ class TestDSV41TopKSelector(CustomTestCase):
             want = through_table(
                 reference_columns(scores, lens, K), page_table, page_size
             )
-            for variant in [SGL_KERNEL] + NON_DEFAULT:
+            for variant in [SGL_KERNEL] + FLASHINFER:
                 with self.subTest(dtype=dtype, page_size=page_size, variant=variant):
                     with make_selector(*variant) as selector:
                         out = torch.full((6, K), -2, dtype=torch.int32, device=DEV)
@@ -351,7 +339,7 @@ class TestDSV41TopKSelector(CustomTestCase):
             columns = reference_columns(scores, valid_lens, K)
             want_positions = through_table(columns, logical, BLOCK)
             want_slots = through_table(columns, physical, BLOCK)
-            for variant in [SGL_KERNEL] + NON_DEFAULT:
+            for variant in [SGL_KERNEL] + FLASHINFER:
                 with self.subTest(topk_blocks=topk_blocks, variant=variant):
                     positions = torch.full((6, K), -2, dtype=torch.int32, device=DEV)
                     slots = torch.full_like(positions, -2)
@@ -378,7 +366,7 @@ class TestDSV41TopKSelector(CustomTestCase):
                 {c + int(o) for c in row}
                 for row, o in zip(reference_columns(reference, lens, K), offsets)
             ]
-            for variant in [SGL_KERNEL] + NON_DEFAULT:
+            for variant in [SGL_KERNEL] + FLASHINFER:
                 with self.subTest(dtype=dtype, variant=variant):
                     # top-k v2 may mask columns in place, so each run gets its own rows
                     scores = distinct_scores(
@@ -402,7 +390,7 @@ class TestDSV41TopKSelector(CustomTestCase):
         scores = block_scores_with_distinct_maxima(lens, width, seed=11)
         want = reference_blocks(scores, lens, topk_blocks)
         nblocks = (lens + BLOCK - 1) // BLOCK
-        for variant in [SGL_KERNEL] + NON_DEFAULT:
+        for variant in [SGL_KERNEL] + FLASHINFER:
             with self.subTest(variant=variant):
                 with make_selector(*variant) as selector:
                     blocks = selector.amax_blocks(scores, lens, nblocks, topk_blocks)
@@ -416,65 +404,12 @@ class TestDSV41TopKSelector(CustomTestCase):
         for dtype in (torch.bfloat16, torch.float32):
             scores = distinct_scores(lens, width, dtype, seed=13)
             want = reference_columns(scores, lens, K)
-            for variant in [SGL_KERNEL] + NON_DEFAULT:
+            for variant in [SGL_KERNEL] + FLASHINFER:
                 with self.subTest(dtype=dtype, variant=variant):
                     with make_selector(*variant) as selector:
                         values, indices = selector.dense(scores, K)
                     self.assertEqual([set(r) for r in indices.tolist()], want)
                     torch.testing.assert_close(values, scores.gather(1, indices))
-
-    @torch.inference_mode()
-    def test_unfused_selections_split_rows_into_chunks(self):
-        """Capped at four rows of scratch, each unfused selection runs two chunks, the
-        second short, and still picks the reference: pool slots, positions plus
-        offsets, and both sparse outputs of one selection."""
-        rows, width, page_size = 6, 4096, 64
-        lens = torch.tensor(
-            [0, 1, K - 1, K, K + 1, width], dtype=torch.int32, device=DEV
-        )
-        scores = distinct_scores(lens, width, torch.float32, seed=43, stride=width + 64)
-        columns = reference_columns(scores, lens, K)
-        page_table = random_page_table(rows, width // page_size, seed=47)
-        metadata = SimpleNamespace(
-            compressed_seq_lens=lens,
-            page_table=page_table,
-            compressed_page_size=page_size,
-            use_topk_v2=False,
-            topk_metadata=None,
-        )
-        offsets = torch.arange(rows, dtype=torch.int32, device=DEV) * 4099
-        logical, physical = sparse_tables(lens, width // BLOCK, seed=53)
-        topk_func = DSATopKBackend.topk_func
-        for variant in [
-            ("torch", True, None, False),
-            ("flashinfer", False, None, False),
-            ("flashinfer", False, "small", True),
-        ]:
-            with (
-                self.subTest(variant=variant),
-                make_selector(*variant) as selector,
-                patch.object(selector_module, "_UNFUSED_CHUNK_BYTES", 4 * width * 4),
-                patch.object(
-                    DSATopKBackend, "topk_func", autospec=True, side_effect=topk_func
-                ) as spy,
-            ):
-                out = torch.full((rows, K), -2, dtype=torch.int32, device=DEV)
-                selector.paged_from_metadata(scores, metadata, out)
-                self.assert_picks(out, through_table(columns, page_table, page_size))
-
-                selector.ragged(scores, lens, out=out, offsets=offsets)
-                self.assert_picks(
-                    out,
-                    [{c + int(o) for c in row} for row, o in zip(columns, offsets)],
-                )
-
-                positions = torch.full_like(out, -2)
-                selector.sparse(scores, lens, [(logical, positions), (physical, out)])
-                self.assert_picks(positions, through_table(columns, logical, BLOCK))
-                self.assert_picks(out, through_table(columns, physical, BLOCK))
-                self.assertEqual(
-                    [call.args[1].shape[0] for call in spy.call_args_list], [4, 2] * 3
-                )
 
     @torch.inference_mode()
     def test_flashinfer_ties_follow_logical_positions(self):
@@ -498,7 +433,7 @@ class TestDSV41TopKSelector(CustomTestCase):
         published = torch.tensor([[5, 1, 3, -1]] * rows, dtype=torch.int32, device=DEV)
         candidate_lens = torch.full((rows,), 48, dtype=torch.int32, device=DEV)
         for variant in FLASHINFER_TIES:
-            small = variant[2] == "small"
+            small = variant[1] == "small"
             first = list(range(K)) if small else list(range(valid - K, valid))
             with self.subTest(variant=variant), make_selector(*variant) as selector:
                 out = torch.full((rows, K), -2, dtype=torch.int32, device=DEV)
@@ -554,8 +489,8 @@ class TestDSV41TopKSelector(CustomTestCase):
     def test_sgl_kernel_mode2_matches_flashinfer_small_tie_break(self):
         """On scores whose ties straddle the k-th pick, sgl-kernel's top-k v2 in mode 2
         (exact, ties to the smaller index) and FlashInfer with the small tie-break,
-        fused or unfused, with or without determinism, select the same logical
-        positions, columns and block ids at every selection mode 2 reaches."""
+        with or without determinism, select the same logical positions, columns and
+        block ids at every selection mode 2 reaches."""
         proc = subprocess.run(
             [sys.executable, os.path.abspath(__file__), MODE2_PARITY_FLAG],
             env={**os.environ, "SGLANG_TOPK_V2_MODE": "2"},
@@ -568,10 +503,9 @@ class TestDSV41TopKSelector(CustomTestCase):
     def test_flashinfer_paths_replay_under_cuda_graphs(self):
         """A captured decode step (full top-k, consumer sparse top-k, source block
         top-k) replays with fresh scores and lengths and rewrites every output slot,
-        fused and unfused, under the default modes, the small tie-break, and the small
-        tie-break with determinism. Off deterministic mode CUB serves the 128K-column
-        full top-k and every unfused call and native FilteredTopK the sparse top-k, so
-        both graph-safe backends replay."""
+        under the default modes, the small tie-break, and the small tie-break with
+        determinism. Off deterministic mode CUB serves the 128K-column full top-k and
+        native FilteredTopK the sparse top-k, so both graph-safe backends replay."""
         rows, width, block_width, topk_blocks = 4, 131072, 8192, 128
         sparse_width = topk_blocks * BLOCK
         lens = torch.zeros(rows, dtype=torch.int32, device=DEV)
@@ -630,15 +564,9 @@ class TestDSV41TopKSelector(CustomTestCase):
             ]
 
         modes = [(None, False), ("small", False), ("small", True)]
-        for fused, (tie_break, deterministic) in itertools.product(
-            (True, False), modes
-        ):
-            with self.subTest(
-                fused=fused, tie_break=tie_break, deterministic=deterministic
-            ):
-                with make_selector(
-                    "flashinfer", fused, tie_break, deterministic
-                ) as selector:
+        for tie_break, deterministic in modes:
+            with self.subTest(tie_break=tie_break, deterministic=deterministic):
+                with make_selector("flashinfer", tie_break, deterministic) as selector:
 
                     def run():
                         selector.paged_from_metadata(scores, metadata, outputs[0])

@@ -210,9 +210,10 @@ class TestV41IndexerArchGates(CustomTestCase):
                     self.assertIsInstance(prefill, DenseBlocksBackend)
                     self.assertIs(prefill, decode)
 
-    def test_fused_selectors_stay_sgl_kernel_only(self):
+    def test_flashinfer_skips_kernel_fused_selections(self):
         """LiteTopK prefill and DeepSelect decode select inside their own kernels,
-        which never see the FlashInfer modes, so only sgl-kernel takes them."""
+        which never see the FlashInfer modes, so FlashInfer skips them and every
+        other backend keeps them."""
         for backend in DSATopKBackend:
             with self.subTest(backend=backend):
                 with (
@@ -230,7 +231,9 @@ class TestV41IndexerArchGates(CustomTestCase):
                         index_topk=512,
                         selector=_selector(backend),
                     )
-                self.assertEqual(full.use_prefill_lite_topk, backend.is_sgl_kernel())
+                self.assertEqual(
+                    full.use_prefill_lite_topk, not backend.is_flashinfer()
+                )
                 with mock.patch.object(
                     full_topk, "is_deep_select_supported", return_value=True
                 ):
@@ -241,7 +244,9 @@ class TestV41IndexerArchGates(CustomTestCase):
                         use_deep_gemm_decode=False,
                         selector=_selector(backend),
                     )
-                self.assertEqual(hopper.use_deep_select_decode, backend.is_sgl_kernel())
+                self.assertEqual(
+                    hopper.use_deep_select_decode, not backend.is_flashinfer()
+                )
 
     def test_index_logits_dtype_stays_fp32_off_sm100(self):
         # The dtype gates stay strict: deep-gemm 0.2.6 asserts fp32 weights

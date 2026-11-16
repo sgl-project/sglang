@@ -100,7 +100,7 @@ def make_full_topk_indexer(
 ) -> FullTopKIndexer:
     # Prefill top-k from the sampled-threshold fp4 indexer (kernels/ops/attention/dsa/litetopk_prefill) where it
     # reproduces the DeepGEMM path: bf16 head weights, 32 or 64 index heads, a supported top-k.
-    # It fuses its own selection, so another top-k backend keeps the dense path.
+    # It fuses its own selection, so FlashInfer keeps the dense path.
     use_prefill_lite_topk = (
         selector.backend.is_sgl_kernel()
         and envs.SGLANG_OPT_USE_PREFILL_LITE_TOPK.get()
