@@ -31,14 +31,16 @@ def fused_topk_npu(
     # sqrtsoftplus (DSV4 noaux_tc): top-k over (scores + bias); weights from
     # un-biased scores. The custom op fuses softplus/sqrt/topk/gather/norm/cast.
     if topk_config.scoring_func == "sqrtsoftplus":
+        from sgl_kernel_npu.operators.moe import moe_gating_top_k
+
         routed_scaling_factor = (
             topk_config.routed_scaling_factor
             if topk_config.apply_routed_scaling_factor_on_output
             else 1.0
         )
-        topk_weights, topk_ids, _ = torch.ops.custom.npu_moe_gating_top_k(
-            x=router_logits.to(torch.float32),
-            k=topk_config.top_k,
+        topk_weights, topk_ids, _ = moe_gating_top_k(
+            router_logits.to(torch.float32),
+            topk_config.top_k,
             bias=(
                 correction_bias.to(torch.float32)
                 if correction_bias is not None
