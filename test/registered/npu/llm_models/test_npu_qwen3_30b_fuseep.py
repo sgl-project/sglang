@@ -9,7 +9,46 @@ from sglang.test.test_utils import CustomTestCase
 register_npu_ci(est_time=400, suite="per-commit-4-npu-a3")
 
 
-class TestQwen330Bw8a8FuseEP(GSM8KAscendMixin, CustomTestCase):
+class TestQwen330Bw8a8FuseEPMode1(GSM8KAscendMixin, CustomTestCase):
+    """Testcase: Verify that the inference accuracy of the Qwen/Qwen3-30B-A3B-w8a8 model on the GSM8K dataset is no less than 0.90.
+
+    [Test Category] Model
+    [Test Target] Qwen/Qwen3-30B-A3B-w8a8
+    """
+
+    model = QWEN3_30B_A3B_W8A8_WEIGHTS_PATH
+    accuracy = 0.90
+    other_args = [
+        "--trust-remote-code",
+        "--mem-fraction-static",
+        0.8,
+        "--attention-backend",
+        "ascend",
+        "--cuda-graph-max-bs-decode",
+        128,
+        "--tp-size",
+        8,
+        "--ep-size",
+        "8",
+        "--moe-a2a-backend",
+        "ascend_fuseep",
+        "--fuseep-mode",
+        1,
+        "--max-prefill-tokens",
+        2048,
+        "--chunked-prefill-size",
+        2048,
+    ]
+
+    env = {
+        **os.environ,
+        "SGLANG_PREFILL_DELAYER_MAX_DELAY_PASSES": "100",
+        "SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK": "128",
+        "HCCL_BUFFSIZE": "1024",
+    }
+
+
+class TestQwen330Bw8a8FuseEPMode2(GSM8KAscendMixin, CustomTestCase):
     """Testcase: Verify that the inference accuracy of the Qwen/Qwen3-30B-A3B-w8a8 model on the GSM8K dataset is no less than 0.90.
 
     [Test Category] Model
