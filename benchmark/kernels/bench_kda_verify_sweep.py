@@ -22,11 +22,11 @@ import argparse
 
 import torch
 
-import sglang.kernels.ops.attention.fla.fused_kda_conv_recurrent_verify as fused_mod
-from sglang.kernels.ops.attention.fla.fused_kda_conv_recurrent_verify import (
+import sglang.kernels.ops.attention.linear.fused_kda_conv_recurrent_verify as fused_mod
+from sglang.kernels.ops.attention.linear.fused_kda_conv_recurrent_verify import (
     fused_kda_conv_gating_verify,
 )
-from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update

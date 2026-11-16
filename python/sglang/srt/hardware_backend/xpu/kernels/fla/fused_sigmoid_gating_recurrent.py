@@ -3,7 +3,7 @@ from typing import Optional
 import torch
 import triton
 
-from sglang.kernels.ops.attention.fla.fused_sigmoid_gating_recurrent import (
+from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update_kernel,
 )
 

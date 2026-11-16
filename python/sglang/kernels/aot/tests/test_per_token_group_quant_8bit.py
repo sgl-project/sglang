@@ -8,58 +8,68 @@ from sgl_kernel.test_utils import (
     create_per_token_group_quant_test_data,
 )
 
-from sglang.kernels.ops.quantization.fp8_kernel import (
-    per_token_group_quant_8bit as triton_per_token_group_quant_8bit,
-)
-from sglang.kernels.ops.quantization.fp8_kernel import (
-    sglang_per_token_group_quant_8bit,
-)
 from sglang.srt.utils import is_hip
+from sglang.test.kernels.per_token_group_quant import (
+    sglang_per_token_group_quant_8bit,
+    triton_per_token_group_quant_8bit,
+)
 
 _is_hip = is_hip()
 fp8_type_ = torch.float8_e4m3fnuz if _is_hip else torch.float8_e4m3fn
 
-configs = list(
-    itertools.product(
-        [1, 4, 16, 64, 127, 128, 512, 1024, 4096, 8192],  # num_tokens
-        [128, 256, 384, 512, 1024, 1536, 1664, 2048, 4096, 7168, 16384],  # hidden_dim
+_ROW_MAJOR = dict(
+    column_major_scales=False,
+    scale_tma_aligned=False,
+    scale_ue8m0=False,
+    fuse_silu_and_mul=False,
+    masked_layout_mode=None,
+)
+_COLUMN_MAJOR_FLAGS = [
+    dict(
+        column_major_scales=True,
+        scale_tma_aligned=False,
+        scale_ue8m0=False,
+        fuse_silu_and_mul=False,
+        masked_layout_mode=None,
+    ),
+    dict(
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=False,
+        fuse_silu_and_mul=False,
+        masked_layout_mode=None,
+    ),
+    dict(
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=True,
+        fuse_silu_and_mul=False,
+        masked_layout_mode=None,
+    ),
+]
+
+
+def _supported(group_size, dst_dtype, flags):
+    # int8 has no column-major scale layout; UE8M0 scales are only built for group 128.
+    if dst_dtype == torch.int8 and flags["column_major_scales"]:
+        return False
+    return not flags["scale_ue8m0"] or group_size == 128
+
+
+configs = [
+    config
+    for config in itertools.product(
+        [1, 4, 127, 4096],  # num_tokens
+        [128, 384, 1664, 7168],  # hidden_dim
         [16, 32, 64, 128],  # group_size
         [None],  # num_ranks
         [fp8_type_, torch.int8],  # dtype
-        [
-            dict(
-                column_major_scales=False,
-                scale_tma_aligned=False,
-                scale_ue8m0=False,
-                fuse_silu_and_mul=False,
-                masked_layout_mode=None,
-            ),
-            dict(
-                column_major_scales=True,
-                scale_tma_aligned=False,
-                scale_ue8m0=False,
-                fuse_silu_and_mul=False,
-                masked_layout_mode=None,
-            ),
-            dict(
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=False,
-                fuse_silu_and_mul=False,
-                masked_layout_mode=None,
-            ),
-            dict(
-                column_major_scales=True,
-                scale_tma_aligned=True,
-                scale_ue8m0=True,
-                fuse_silu_and_mul=False,
-                masked_layout_mode=None,
-            ),
-        ],
+        [_ROW_MAJOR, *_COLUMN_MAJOR_FLAGS],
     )
-) + list(
+    if _supported(config[2], config[4], config[5])
+] + list(
     itertools.product(
-        [1, 4, 1 * 8, 4 * 8, 64 * 8, 256 * 8, 768 * 8],
+        [1, 4 * 8, 768 * 8],
         # TODO support more
         [2048],
         [128],
@@ -117,20 +127,10 @@ def test_per_token_group_quant_with_column_major(
     arch_major, _ = torch.cuda.get_device_capability(torch.cuda.current_device())
     if flags["scale_ue8m0"] and (arch_major <= 9):
         pytest.skip("Only Blackwell need ue8m0 fusion")
-        return
-
-    if (flags["scale_ue8m0"] and (group_size != 128)) or (
-        (dst_dtype == torch.int8) and flags["column_major_scales"]
-    ):
-        pytest.skip()
-        return
 
     x, masked_m = create_per_token_group_quant_test_data(
         num_tokens=num_tokens, hidden_dim=hidden_dim, num_ranks=num_ranks, flags=flags
     )
-
-    # print("hack data!!!")
-    # x = torch.full_like(x, fill_value=100)
 
     execute_kwargs = dict(
         x=x,

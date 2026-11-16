@@ -1,3 +1,4 @@
+import gc
 import io
 import sys
 import unittest
@@ -7,13 +8,18 @@ from unittest import mock
 import torch
 from PIL import Image
 
-from sglang.srt.utils.common import (
+from sglang.srt.multimodal.media_io import _load_image
+from sglang.srt.utils.common import flatten_arrays_to_int64_tensor
+from sglang.srt.utils.device import (
     _get_device_sm_via_nvml,
-    _load_image,
-    flatten_arrays_to_int64_tensor,
-    get_device_sm_nvidia_smi,
+    async_h2d_tensor,
     get_nvidia_driver_version_str,
+    is_gfx95_supported,
+    is_gfx942_supported,
+    is_gfx1250_supported,
+    is_hip,
 )
+from sglang.srt.utils.log_utils import freeze_gc
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,
@@ -21,8 +27,8 @@ from sglang.test.ci.ci_register import (
 )
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=1, suite="base-a-test-cpu")
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cuda_ci(est_time=12, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=5, stage="stage-b", runner_config="1-gpu-small-amd")
 
 
@@ -60,6 +66,36 @@ class TestFlattenArraysToInt64Tensor(CustomTestCase):
             array("q", [1000]),
         ]
         self._check(parts, [10, 20, 30, 100, 200, 1000])
+
+
+@unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+class TestAsyncH2dTensor(CustomTestCase):
+    """`async_h2d_tensor` moves host tensors to the device through pinned memory."""
+
+    def test_copies_values_from_pageable_and_pinned_hosts(self):
+        src = torch.arange(1024, dtype=torch.int64)
+        for host in (src, src.pin_memory()):
+            out = async_h2d_tensor(host, device=torch.device("cuda"))
+            self.assertEqual(out.device.type, "cuda")
+            self.assertTrue(torch.equal(out.cpu(), src))
+
+    def test_device_tensor_stays_on_device(self):
+        src = torch.arange(8, device="cuda")
+        out = async_h2d_tensor(src, device=torch.device("cuda"))
+        self.assertTrue(torch.equal(out, src))
+
+    def test_copies_without_pinned_memory(self):
+        src = torch.arange(16, dtype=torch.int64)
+        with (
+            mock.patch(
+                "sglang.srt.utils.device.is_pin_memory_available", return_value=False
+            ),
+            mock.patch.object(
+                torch.Tensor, "pin_memory", side_effect=AssertionError("pinned")
+            ),
+        ):
+            out = async_h2d_tensor(src, device=torch.device("cuda"))
+        self.assertTrue(torch.equal(out.cpu(), src))
 
 
 class TestNvidiaDriverVersionStr(CustomTestCase):
@@ -128,29 +164,6 @@ class TestNvidiaDriverVersionStr(CustomTestCase):
         subprocess.run = boom
         try:
             self.assertIsNone(get_nvidia_driver_version_str())
-        finally:
-            subprocess.run = original
-
-
-class TestGetDeviceSmNvidiaSmi(CustomTestCase):
-    """`get_device_sm_nvidia_smi` parses nvidia-smi output into a (major,
-    minor) tuple and falls back to (0, 0) -- logging via `logger.error` --
-    when nvidia-smi fails. The success path needs a GPU; the fallback path is
-    covered here by forcing a failure and asserting the (0, 0) return. The
-    fallback path needs no GPU, so this test runs on CPU.
-    """
-
-    def test_fallback_on_failure_returns_zero_zero(self):
-        import subprocess
-
-        original = subprocess.run
-
-        def boom(*a, **k):
-            raise subprocess.CalledProcessError(1, "nvidia-smi")
-
-        subprocess.run = boom
-        try:
-            self.assertEqual(get_device_sm_nvidia_smi(), (0, 0))
         finally:
             subprocess.run = original
 
@@ -249,6 +262,48 @@ class TestGetDeviceSmViaNvml(CustomTestCase):
         ):
             self.assertIsNone(_get_device_sm_via_nvml())
         self.assertFalse(fake.initialized, "must not query NVML without the mapping")
+
+
+class TestHipProbes(CustomTestCase):
+    """These probes run at import time; a ROCm build with no visible GPU
+    (CPU-only workers, routers) must get False instead of a CUDA init error."""
+
+    PROBES = (is_hip, is_gfx95_supported, is_gfx942_supported, is_gfx1250_supported)
+
+    def setUp(self):
+        for probe in self.PROBES:
+            probe.cache_clear()
+            self.addCleanup(probe.cache_clear)
+
+    def test_returns_false_without_querying_the_device(self):
+        def boom(device):
+            raise RuntimeError("No CUDA GPUs are available")
+
+        with (
+            mock.patch.object(torch.version, "hip", "7.2.0"),
+            mock.patch.object(torch.cuda, "is_available", lambda: False),
+            mock.patch.object(torch.cuda, "get_device_properties", boom),
+        ):
+            for probe in self.PROBES:
+                with self.subTest(probe=probe.__name__):
+                    self.assertFalse(probe())
+
+    def test_is_hip_with_a_visible_device(self):
+        with (
+            mock.patch.object(torch.version, "hip", "7.2.0"),
+            mock.patch.object(torch.cuda, "is_available", lambda: True),
+        ):
+            self.assertTrue(is_hip())
+
+
+class TestFreezeGc(CustomTestCase):
+    def setUp(self):
+        self.addCleanup(gc.set_threshold, *gc.get_threshold())
+        self.addCleanup(gc.unfreeze)
+
+    def test_applies_configured_threshold(self):
+        freeze_gc("test", [700, 10, 1000])
+        self.assertEqual(gc.get_threshold(), (700, 10, 1000))
 
 
 if __name__ == "__main__":

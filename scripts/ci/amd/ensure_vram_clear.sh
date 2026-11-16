@@ -3,6 +3,7 @@
 # Source the VRAM checking function
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/check_vram_clear.sh"
+CI_CONTAINER_NAME="${CI_CONTAINER_NAME:-ci_sglang}"
 
 # Stop and remove every container that holds any /dev/kfd or /dev/dri device.
 # Some failing CI runs leave behind containers other than `ci_sglang` (e.g.
@@ -170,9 +171,9 @@ ensure_vram_clear() {
     echo "Running in ROCm mode"
 
     # Always stop the well-known CI container first (best-effort).
-    echo "Stopping any existing ci_sglang container..."
-    docker stop ci_sglang 2>/dev/null || true
-    docker rm -f ci_sglang 2>/dev/null || true
+    echo "Stopping any existing $CI_CONTAINER_NAME container..."
+    docker stop "$CI_CONTAINER_NAME" 2>/dev/null || true
+    docker rm -f "$CI_CONTAINER_NAME" 2>/dev/null || true
 
     # Show initial GPU status
     echo "=== Initial GPU Memory Status ==="

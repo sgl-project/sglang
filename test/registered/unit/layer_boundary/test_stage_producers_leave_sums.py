@@ -14,7 +14,7 @@ from sglang.srt.layers.layer_boundary.stage import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 # Calls that complete a TP / EP sum of a stage output in compute. A fused
 # kernel that carries the sum inside it counts as well: every MoE finalize

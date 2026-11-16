@@ -141,7 +141,7 @@ def test_fused_moe_uses_explicit_quant_method_for_full_lifecycle(monkeypatch) ->
 
     def create_runner(layer, config) -> None:
         calls.append("runner")
-        method.runner = SimpleNamespace()
+        method.runner = SimpleNamespace(runner_backend=MoeRunnerBackend.TRITON)
 
     monkeypatch.setattr(method, "create_moe_runner", create_runner)
     monkeypatch.setattr(
@@ -203,7 +203,7 @@ def test_lora_uses_quant_method_contract_for_registered_backend(
     base_layer.moe_tp_rank = 0
     base_layer.intermediate_size_per_partition = 8
     base_layer.runner = SimpleNamespace(runner_backend=backend)
-    lora_backend = SimpleNamespace(is_moe_lora=False)
+    lora_backend = SimpleNamespace(name="triton", is_moe_lora=False)
     created_runners = []
     monkeypatch.setattr(
         runner_module,

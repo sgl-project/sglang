@@ -6,10 +6,8 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from sglang.srt.arg_groups.overrides import (
-    resolving_view,
-    supports_mamba_cache_extra_buffer,
-)
+from sglang.srt.arg_groups.model_override_base import resolving_view
+from sglang.srt.arg_groups.overrides import supports_mamba_cache_extra_buffer
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_platform
 
@@ -21,7 +19,8 @@ def handle_mamba_backend(server_args: Any):
     if cfg.mamba_cache_philox_rounds < 0:
         raise ValueError("--mamba-cache-philox-rounds must be non-negative.")
 
-    if cfg.mamba_max_states_per_path == 0 or cfg.mamba_max_states_per_path < -1:
+    cap = cfg.mamba_max_states_per_path
+    if cap is not None and (cap == 0 or cap < -1):
         raise ValueError(
             "--mamba-max-states-per-path must be -1 (unlimited) or a positive "
             f"integer, got {cfg.mamba_max_states_per_path}."
@@ -96,6 +95,12 @@ def handle_int8_mamba_checkpoint(server_args: Any):
         raise ValueError(
             "--enable-int8-mamba-checkpoint is not supported together with "
             "--enable-lmcache: LMCache is not int8-aware. Disable one of them."
+        )
+    if cfg.enable_unified_memory:
+        raise ValueError(
+            "--enable-int8-mamba-checkpoint is not supported together with "
+            "--enable-unified-memory: the unified pool keeps no int8 checkpoint "
+            "pool, so the flag would have no effect. Disable one of them."
         )
 
 

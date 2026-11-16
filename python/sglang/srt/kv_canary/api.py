@@ -12,7 +12,6 @@ from sglang.srt.kv_canary.perturb.config import PerturbConfig
 from sglang.srt.kv_canary.pool_patcher.api import attach_canary_buffers
 from sglang.srt.kv_canary.pool_patcher.utils import wrap_method
 from sglang.srt.kv_canary.runner.canary_manager import CanaryManager
-from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
     Phase,
@@ -29,7 +28,6 @@ from sglang.srt.runtime_context import (
 if TYPE_CHECKING:
     from sglang.srt.kv_canary.token_oracle.oracle_manager import TokenOracleManager
     from sglang.srt.model_executor.model_runner import ModelRunner
-    from sglang.srt.server_args import ServerArgs
 
 logger = logging.getLogger(__name__)
 
@@ -51,11 +49,10 @@ def torch_reference_conflicts_with_decode_graph(device: torch.device) -> bool:
 
 def install_canary(
     *,
-    server_args: ServerArgs,
     model_runner: ModelRunner,
     token_oracle_manager: Optional[TokenOracleManager] = None,
 ) -> Optional[CanaryManager]:
-    config = CanaryConfig.from_env(server_args)
+    config = CanaryConfig.from_env()
     if config.mode is CanaryMode.NONE:
         return None
 
@@ -83,9 +80,7 @@ def install_canary(
         kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
     )
     allocator = model_runner.token_to_kv_pool_allocator
-    swa_allocator = (
-        allocator if isinstance(allocator, SWATokenToKVPoolAllocator) else None
-    )
+    swa_allocator = allocator if allocator.has_window_pool else None
     launch_capacities = CanaryLaunchCapacities.from_args(
         req_to_token_pool_size=model_runner.req_to_token_pool.size,
         max_seq_len_per_req=model_runner.req_to_token_pool.req_to_token.shape[1],

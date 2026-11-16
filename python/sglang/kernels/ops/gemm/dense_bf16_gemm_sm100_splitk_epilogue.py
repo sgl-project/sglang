@@ -165,39 +165,6 @@ def validate_tactic(
         )
 
 
-def autotune_tactics(
-    m: int,
-    n: int,
-    k: int,
-    *,
-    smem_capacity: int = _SMEM_CAPACITY_BYTES,
-) -> list[SplitKTactic]:
-    """Return valid tactics in the shape-specific stage window."""
-    tactics: list[SplitKTactic] = []
-    for mma_m in _SUPPORTED_MMA_M:
-        for mma_n in _SUPPORTED_MMA_N:
-            for split_k in _SUPPORTED_SPLIT_K:
-                base = SplitKTactic(mma_m, mma_n, split_k, _MIN_AB_STAGES)
-                try:
-                    validate_tactic(base, m, n, k, smem_capacity=smem_capacity)
-                except ValueError:
-                    continue
-                max_stages = _max_ab_stages_for(base, smem_capacity)
-                # Short K favors shallow pipelines; long K stays near the cap.
-                tactics.extend(
-                    dataclasses.replace(base, ab_stages=ab_stages)
-                    for ab_stages in (
-                        range(_MIN_AB_STAGES, min(max_stages, 6) + 1)
-                        if k <= 4 * _CTA_K
-                        else range(
-                            min(max(5, max_stages - 2), max_stages),
-                            max_stages + 1,
-                        )
-                    )
-                )
-    return tactics
-
-
 def default_tactic(m: int, n: int, k: int) -> SplitKTactic:
     """Choose the default occupancy-oriented tactic."""
     if n <= 512:
@@ -241,7 +208,6 @@ def default_tactic(m: int, n: int, k: int) -> SplitKTactic:
 
 __all__ = [
     "SplitKTactic",
-    "autotune_tactics",
     "default_tactic",
     "run_splitk_dense",
     "run_splitk_dense_silu",
@@ -271,6 +237,20 @@ def _map_shared_rank(
             is_align_stack=False,
             asm_dialect=llvm.AsmDialect.AD_ATT,
         )
+    )
+
+
+def _tcgen05_fence(*, before: bool) -> None:
+    """``tcgen05.fence::{before,after}_thread_sync`` around an mbarrier hand-off of
+    tcgen05 work (PTX ISA canonical tcgen05 synchronization patterns)."""
+    llvm.inline_asm(
+        None,
+        [],
+        f"tcgen05.fence::{'before' if before else 'after'}_thread_sync;",
+        "",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
     )
 
 
@@ -734,8 +714,16 @@ class SplitKDenseGemmKernel:
 
         with cute.arch.elect_one():
             tcgen05.commit(bar_mma_epilog, None, self.cta_group)
+        # The release arrival must land in phase 1. Made while phase 0 is still
+        # open, it counts toward phase 0, and the parity-1 wait can then pass
+        # before the epilogue has read TMEM. Phase-0 wait and tcgen05 fences as
+        # in flashinfer PR 7443.
+        cute.arch.mbarrier_wait(bar_tmem_alloc, 0)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
         cute.arch.mbarrier_wait(bar_tmem_alloc, 1)
+        # tcgen05.fence::after_thread_sync: order the dealloc after the tcgen05
+        # work handed off through the waits above.
+        _tcgen05_fence(before=False)
         cute.arch.dealloc_tmem(tmem_ptr, num_tmem_cols, is_two_cta=False)
 
     @cute.experimental.jit
@@ -829,6 +817,9 @@ class SplitKDenseGemmKernel:
         cute_ext.partition_and_copy(thr_t2r, acc_view, rAcc)
         # Make tcgen05.ld visible before TMEM release and RMEM use.
         cute.arch.fence_view_async_tmem_load()
+        # tcgen05.fence::before_thread_sync: publish the retired tcgen05.ld to
+        # MMA's dealloc across the mbarrier hand-off.
+        _tcgen05_fence(before=True)
         cute.arch.mbarrier_arrive(bar_tmem_alloc)
 
         # Peers publish FP32 partials; only rank 0 reduces and stores.

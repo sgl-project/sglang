@@ -84,6 +84,9 @@ class ComfyUIPackedLayout:
     def __init__(
         self, text_len, latent_t, latent_h, latent_w, audio_t, keyframes=None, refs=None
     ):
+        # ComfyUI builds PackedLayout from its patch-padded latent dimensions.
+        latent_h = (latent_h + 1) // 2 * 2
+        latent_w = (latent_w + 1) // 2 * 2
         frame, w_grid = _frame_grid(latent_h, latent_w)
         frame_rows = frame.shape[0]
 
@@ -350,7 +353,10 @@ def test_vsa_h3_tiles_cover_comfyui_packed_rows(keyframes):
     server_args = SimpleNamespace(
         attention_backend_config={},
         pipeline_config=SimpleNamespace(
-            vsa_sparsity=0.8, dit_config=MiniMaxH3DiTConfig()
+            vsa_sparsity=0.8,
+            vsa_tile_size=64,
+            vsa_ref_keep_rate=None,
+            dit_config=MiniMaxH3DiTConfig(),
         ),
     )
     build = _maybe_prepare_vsa_h3_step_metadata(
@@ -369,6 +375,32 @@ def test_vsa_h3_tiles_cover_comfyui_packed_rows(keyframes):
     audio = packed["audio_pos"]
     assert torch.equal(audio, torch.arange(video_start - audio.numel(), video_start))
     assert torch.equal(packed["text_pos"], torch.arange(text_len))
+
+
+def test_vsa_h3_rejects_comfyui_serialized_ref2va_layout():
+    """ComfyUI-serialized Ref2VA layouts do not tell reference images from
+    reference videos, so VSA-H3 refuses them instead of mis-tiling."""
+    from types import SimpleNamespace
+
+    from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
+        _maybe_prepare_vsa_h3_step_metadata,
+    )
+    from sglang.multimodal_gen.runtime.platforms.interface import AttentionBackendEnum
+
+    model = SimpleNamespace(
+        _resolve_attention_backend_once=lambda: None,
+        _resolved_attention_backend=AttentionBackendEnum.VIDEO_SPARSE_ATTN_H3,
+    )
+    with pytest.raises(NotImplementedError, match="ComfyUI-serialized Ref2VA"):
+        _maybe_prepare_vsa_h3_step_metadata(
+            model=model,
+            packed={},
+            is_ref2va=True,
+            latent_shape=(4, 8, 12),
+            server_args=SimpleNamespace(),
+            device=torch.device("cpu"),
+            native_layout=False,
+        )
 
 
 def test_ref2va_image_plus_video_audio_used_prefix_matches_comfyui():
@@ -501,7 +533,6 @@ import torch
 
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.adapter import (
     get_adapter_class,
-    registered_model_types,
 )
 from sglang.multimodal_gen.apps.ComfyUI_SGLDiffusion.executors.base import (
     SGLDiffusionExecutor,
@@ -572,8 +603,6 @@ def test_worker_transformer_options_drop_comfy_objects() -> None:
 
 
 def test_minimax_h3_is_registered() -> None:
-    types = registered_model_types()
-    assert "minimax_h3" in types
     assert get_adapter_class("minimax_h3") is MiniMaxH3Adapter
     assert get_adapter_class("minimax_h3").pipeline_class_name == "MiniMaxH3Pipeline"
 
@@ -825,6 +854,35 @@ def test_keyframes_with_serialized_layout_build_kwargs():
     assert branch.video_target_start == 4
 
 
+def test_odd_latent_keyframes_keep_comfyui_layout():
+    video = torch.randn(1, 24, 2, 5, 7)
+    audio = torch.randn(1, 32, 2, 3)
+    context = torch.randn(1, 8, 16)
+    timestep = torch.tensor([500.0])
+    sample_sigmas = torch.tensor([1.0, 0.5, 0.0])
+    kf_latent = torch.randn(1, 24, 1, 5, 7)
+    keyframes = [{"resolved_frame_index": 0, "latent": kf_latent}]
+    layout = ComfyUIPackedLayout(8, 2, 5, 7, 3, keyframes=keyframes)
+
+    inputs = comfyui_payload_to_branch_inputs(
+        video,
+        audio,
+        context,
+        minimax_payload={
+            "keyframes": keyframes,
+            "cond_video_latents": [kf_latent],
+            "visual_cond_noise_aug": 1.0,
+        },
+        sample_sigmas=sample_sigmas,
+        timestep=timestep,
+        layout=serialize_comfyui_layout(layout),
+    )
+
+    assert tuple(layout.signature[2:4]) == (6, 8)
+    assert inputs["padded_video_shape"][-2:] == (6, 8)
+    assert inputs["video_rows"].shape[0] == 12 + 2 * 3 * 4
+
+
 def test_uniform_denoise_mask_scales_video_timestep():
     video, audio, context, timestep, sample_sigmas = _t2va_tensors()
     inputs = comfyui_payload_to_branch_inputs(
@@ -917,11 +975,6 @@ def test_ref2va_image_forward_kwargs_are_supported():
     out_video, out_audio = pack_comfy_output(v_video, v_audio, state)
     assert out_video.shape == video.shape
     assert out_audio.shape == audio.shape
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="optional GPU smoke")
-def test_optional_gpu_step_output_shapes():
-    pytest.skip("no tiny H3 checkpoint on this machine; do not download weights")
 
 
 # --- profile ---
@@ -1079,10 +1132,6 @@ from types import SimpleNamespace
 import torch
 
 from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTArchConfig
-from sglang.multimodal_gen.runtime.distributed.parallel_state import (
-    maybe_init_distributed_environment_and_model_parallel,
-    model_parallel_is_initialized,
-)
 from sglang.multimodal_gen.runtime.loader.comfyui_checkpoints import (
     get_comfyui_checkpoint_spec,
 )
@@ -1090,16 +1139,6 @@ from sglang.multimodal_gen.runtime.models.dits.minimax_h3 import (
     MiniMaxH3Attention,
     _reorder_grouped_qkv_to_qkv,
 )
-from sglang.multimodal_gen.test.single_test_file.component_accuracy.utils import (
-    ensure_distributed_env_defaults,
-)
-
-
-def _ensure_single_process_parallel_runtime() -> None:
-    if model_parallel_is_initialized():
-        return
-    ensure_distributed_env_defaults()
-    maybe_init_distributed_environment_and_model_parallel(tp_size=1, sp_size=1)
 
 
 def _concat_qkv_rows() -> torch.Tensor:
@@ -1131,8 +1170,8 @@ def test_comfyui_h3_spec_disables_grouped_qkv_reorder() -> None:
     assert MiniMaxH3DiTArchConfig().qkv_checkpoint_grouped is True
 
 
+@pytest.mark.usefixtures("single_process_model_parallel")
 def test_concat_qkv_attention_skips_grouped_weight_loader() -> None:
-    _ensure_single_process_parallel_runtime()
     concat_arch = MiniMaxH3DiTArchConfig(
         hidden_size=32,
         num_attention_heads=2,
@@ -1159,10 +1198,10 @@ def test_concat_qkv_attention_skips_grouped_weight_loader() -> None:
 @pytest.mark.parametrize("layout", [None, "native", "interleaved"])
 @pytest.mark.parametrize("grouped", [True, False])
 @pytest.mark.parametrize("diffusers", [True, False])
+@pytest.mark.usefixtures("single_process_model_parallel")
 def test_explicit_checkpoint_qkv_layout_overrides_inferred_layout(
     layout, grouped, diffusers
 ):
-    _ensure_single_process_parallel_runtime()
     arch = MiniMaxH3DiTArchConfig(
         hidden_size=32,
         num_attention_heads=2,
@@ -1190,10 +1229,10 @@ def test_explicit_checkpoint_qkv_layout_overrides_inferred_layout(
 
 
 @pytest.mark.parametrize("backend,out_features", [("comfy_kitchen", 12), ("jit", 16)])
+@pytest.mark.usefixtures("single_process_model_parallel")
 def test_integrated_h3_int8_loader_preserves_quantized_weights(
     tmp_path, monkeypatch, backend, out_features
 ):
-    _ensure_single_process_parallel_runtime()
     import json
     from types import SimpleNamespace
 
@@ -1293,7 +1332,7 @@ def test_integrated_h3_int8_loader_preserves_quantized_weights(
         arguments.pipeline_config.dit_config.arch_config.qkv_checkpoint_grouped is False
     )
     assert all(not parameter.requires_grad for parameter in loaded.parameters())
-    arguments.quantization = "kitchen_int8"
+    arguments.quantization = "convrot_int8"
     with pytest.raises(ValueError, match="per-layer metadata"):
         spec.load_comfyui_transformer(pipeline, arguments)
     arguments.quantization = None

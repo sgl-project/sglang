@@ -13,6 +13,7 @@
 # ==============================================================================
 """Complete pending output, update the residual, and read the consumer input."""
 
+from functools import partial
 from typing import Callable, Optional, Tuple, Union
 
 import torch
@@ -40,7 +41,7 @@ from sglang.srt.layers.layer_boundary.adapters.attention import (
     get_attn_tp_context,
     tp_gather,
 )
-from sglang.srt.layers.layer_boundary.contracts import ReadoutFusion
+from sglang.srt.layers.layer_boundary.contracts import EntryPath, ReadoutFusion
 from sglang.srt.layers.layer_boundary.layout import (
     SumGroup,
     _cp_shard_token_rows,
@@ -51,7 +52,11 @@ from sglang.srt.layers.layer_boundary.output import (
     UnreducedOutput,
     complete_owed,
 )
-from sglang.srt.layers.layer_boundary.residual import ResidualReadout, ResidualUpdate
+from sglang.srt.layers.layer_boundary.residual import (
+    ResidualReadout,
+    ResidualUpdate,
+    bind_read,
+)
 from sglang.srt.layers.layer_boundary.residual.add_norm import NORM_READOUT, PLAIN_ADD
 from sglang.srt.layers.layer_boundary.residual.stream import DeclaredSum
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
@@ -77,19 +82,38 @@ from sglang.srt.layers.layer_boundary.ops import (
 
 
 def _run_read_fusions(
-    read_fusions, hidden_states, residual, forward_batch, norm, *, read, **call
+    read_fusions,
+    hidden_states,
+    residual,
+    forward_batch,
+    norm,
+    *,
+    read,
+    read_fusion_indices: Tuple[int, ...] = (),
+    update=PLAIN_ADD,
+    **call,
 ):
     """The first of the read's own kernels (ReadoutFusion) that takes the
     batch: one that completes the sum with the residual add hands the written
     stream to ``read``; one that also reads returns the read. None when every
     kernel declines."""
+    if read_fusion_indices:
+        read_fusions = (read.completing_fusions[i] for i in read_fusion_indices)
     for fused in read_fusions:
+        args = {}
+        if fused.accepts_update is None:
+            if not update.is_plain_add:
+                continue
+        else:
+            if not fused.accepts_update(update):
+                continue
+            args["update"] = update
         if fused.reads:
-            result = fused.run(hidden_states, residual, forward_batch, norm)
+            result = fused.run(hidden_states, residual, forward_batch, norm, **args)
             if result is not None:
                 return result
             continue
-        stream = fused.run(hidden_states, residual, forward_batch)
+        stream = fused.run(hidden_states, residual, forward_batch, **args)
         if stream is not None:
             return read.read(stream, norm, **call)
     return None
@@ -105,6 +129,7 @@ def _reduce_update_read(
     gathers_residual: bool,
     fusions: Tuple[Callable, ...],
     read_fusions: Tuple[ReadoutFusion, ...] = (),
+    read_fusion_indices: Tuple[int, ...] = (),
     group: SumGroup = SumGroup.ATTN_TP,
     read: ResidualReadout = NORM_READOUT,
     update: ResidualUpdate = PLAIN_ADD,
@@ -125,6 +150,8 @@ def _reduce_update_read(
         forward_batch,
         norm,
         read=read,
+        read_fusion_indices=read_fusion_indices,
+        update=update,
         quant_format=quant_format,
         post_residual_addition=post_residual_addition,
     )
@@ -167,11 +194,13 @@ def _reduce_update_read_dp_gather(
     group: SumGroup = SumGroup.ATTN_TP,
     read: ResidualReadout = NORM_READOUT,
     update: ResidualUpdate = PLAIN_ADD,
+    quant_format: str = "",
 ):
     """Attention DP: complete the attention-TP sum if it is owed, write the
     output into the residual and read the FFN input locally, then gather. With
     ``places_cp_shards`` each CP rank puts its shard of the DP group's tokens
     beside the others' in the group's slot."""
+    _no_quantized_read(quant_format, "_reduce_update_read_dp_gather")
     if gathers_residual:
         residual = update.gather_residual_attn_tp(residual)
     if hidden_states.shape[0] != 0:
@@ -210,10 +239,12 @@ def _dp_gather_sum_read(
     places_cp_shards: bool = False,
     read: ResidualReadout = NORM_READOUT,
     update: ResidualUpdate = PLAIN_ADD,
+    quant_format: str = "",
 ):
     """Attention DP: one rank adds the residual, the gather sums it, then read
     the input from the sum. With ``places_cp_shards`` each CP rank puts its
     shard of the DP group's tokens beside the others' in the group's slot."""
+    _no_quantized_read(quant_format, "_dp_gather_sum_read")
     if gathers_residual:
         residual = attn_tp_gather(residual)
     if get_parallel().attn_tp_rank == 0:
@@ -271,12 +302,15 @@ def _run_entry(
     step: Callable,
     is_plain_add: bool,
     carried_fusions: Tuple[Callable, ...],
+    carried_read_fusions: Tuple[ReadoutFusion, ...] = (),
+    read: ResidualReadout = NORM_READOUT,
     expected_sum: Optional[SumGroup] = None,
     completed_step: Optional[Callable] = None,
     pending=None,
     written_step: Optional[Callable] = None,
     written: bool = False,
     update: ResidualUpdate = PLAIN_ADD,
+    read_context=None,
     **call,
 ):
     """A boundary's half into a stage: complete what the value carries, a sum
@@ -287,6 +321,17 @@ def _run_entry(
     whose declared sum is already completed uses ``completed_step`` instead;
     a pending declared sum must match ``expected_sum``. ``call`` is what the stage's read takes (the attention's
     ``quant_format`` and ``post_residual_addition``)."""
+    bind = read.bind
+    if bind is not None:
+        bound = bind_read(read, forward_batch, read_context)
+        declared = read.completing_fusions
+        actual = bound.completing_fusions
+        carried_read_fusions = tuple(
+            actual[i]
+            for i, spec in enumerate(declared)
+            if any(spec is selected for selected in carried_read_fusions)
+        )
+        read = bound
     if residual is not None and update.is_plain_add != is_plain_add:
         raise RuntimeError("producer update does not match the boundary's capability")
     if pending is not None:
@@ -297,9 +342,30 @@ def _run_entry(
             if pending.owed is not None:
                 raise RuntimeError("a declared input sum carried another completion")
             step = completed_step
+    if pending is not None and isinstance(pending.owed, DeclaredSum):
+        owed = pending.owed
+        if owed.complete_sum is not None:
+            result = _run_read_fusions(
+                tuple(
+                    f
+                    for f in read.completing_fusions
+                    if f.completes is owed.group and not f.scatters
+                ),
+                hidden_states,
+                residual,
+                forward_batch,
+                norm,
+                read=read,
+                update=update,
+                **call,
+            )
+            if result is not None:
+                return result
+            hidden_states = pending.complete()
+            step = completed_step
     if written and written_step is not None:
         step = written_step
-    if not isinstance(hidden_states, torch.Tensor):
+    if isinstance(hidden_states, (UnreducedOutput, DeferredFinalize)):
         owed = hidden_states
         if residual is None:
             raise RuntimeError(f"{type(owed).__name__} requires residual input")
@@ -311,6 +377,30 @@ def _run_entry(
         if isinstance(owed, UnreducedOutput) and owed.reduce_to_dp_local is not None:
             hidden_states = complete_owed(owed)
         else:
+            read_candidates = tuple(
+                fused
+                for fused in carried_read_fusions
+                if (
+                    isinstance(owed, DeferredFinalize)
+                    and fused.completes is owed.completion_group
+                )
+                or (
+                    isinstance(owed, UnreducedOutput)
+                    and _sum_group(fused.completes) is owed.group
+                )
+            )
+            result = _run_read_fusions(
+                read_candidates,
+                owed,
+                residual,
+                forward_batch,
+                norm,
+                read=read,
+                update=update,
+                **call,
+            )
+            if result is not None:
+                return result
             for fused in carried_fusions:
                 result = fused(
                     owed, residual, forward_batch, call.get("post_residual_addition")
@@ -321,6 +411,8 @@ def _run_entry(
                 hidden_states = complete_owed(owed)
             else:
                 hidden_states = owed.partial
+    if bind is not None:
+        call["read"] = read
     return step(hidden_states, residual, forward_batch, norm, update=update, **call)
 
 
@@ -335,6 +427,7 @@ def _update_read(
     enters_stack: bool,
     read: ResidualReadout,
     read_gathers: Tuple[Callable, ...] = (),
+    read_gather_indices: Tuple[int, ...] = (),
     update: ResidualUpdate = PLAIN_ADD,
     quant_format: str = "",
     post_residual_addition: Optional[torch.Tensor] = None,
@@ -350,6 +443,8 @@ def _update_read(
         hidden_states, residual = pre_move(hidden_states, residual)
     if enters:
         hidden_states, residual = read.init_residual(hidden_states), None
+    if read_gather_indices:
+        read_gathers = (read.gathering_reads[i] for i in read_gather_indices)
     for fused in read_gathers:
         result = fused(hidden_states, residual, norm)
         if result is not None:
@@ -377,15 +472,25 @@ def _attn_tp_reduce_scatter_update_read(
     cache=None,
     scatters_residual: bool,
     read_fusions: Tuple[ReadoutFusion, ...] = (),
+    read_fusion_indices: Tuple[int, ...] = (),
     read: ResidualReadout = NORM_READOUT,
     update: ResidualUpdate = PLAIN_ADD,
+    quant_format: str = "",
 ):
     """Complete the attention-TP sum onto this rank's slice, slice the residual
     the same way, then write the output into it and read the input; the first
     of the read's ``read_fusions`` that takes the batch does all of this
     instead."""
+    _no_quantized_read(quant_format, "_attn_tp_reduce_scatter_update_read")
     result = _run_read_fusions(
-        read_fusions, hidden_states, residual, forward_batch, norm, read=read
+        read_fusions,
+        hidden_states,
+        residual,
+        forward_batch,
+        norm,
+        read=read,
+        read_fusion_indices=read_fusion_indices,
+        update=update,
     )
     if result is not None:
         return result
@@ -405,7 +510,9 @@ def _attn_tp_slice_update_read(
     scatters_residual: bool,
     read: ResidualReadout = NORM_READOUT,
     update: ResidualUpdate = PLAIN_ADD,
+    quant_format: str = "",
 ):
+    _no_quantized_read(quant_format, "_attn_tp_slice_update_read")
     hidden_states = attn_tp_slice(hidden_states).clone()
     if scatters_residual and residual is not None:
         residual = update.slice_residual_attn_tp(residual)
@@ -422,11 +529,13 @@ def _tp_reduce_scatter_update_read_gather(
     reduces: bool = True,
     read: ResidualReadout,
     update: ResidualUpdate,
+    quant_format: str = "",
 ):
     """The residual stays on each rank's slice while the FFN takes the full
     rows: reduce-scatter the attention output onto the slice, which completes
     its sum, write it into the residual and read the FFN input there, then
     gather the input back into the attention output's rows."""
+    _no_quantized_read(quant_format, "_tp_reduce_scatter_update_read_gather")
     parallel = get_parallel()
     if hidden_states.shape[0] == 0:
         return hidden_states, hidden_states
@@ -449,7 +558,9 @@ def _tp_sum_with_residual_read(
     cache=None,
     read: ResidualReadout = NORM_READOUT,
     update: ResidualUpdate = PLAIN_ADD,
+    quant_format: str = "",
 ):
+    _no_quantized_read(quant_format, "_tp_sum_with_residual_read")
     return _tp_all_reduce_with_scattered_residual(hidden_states, residual, norm, read)
 
 
@@ -474,11 +585,11 @@ def _then_attn_cp_gather(
 
 
 def _move_before_read(
-    hidden_states, residual, forward_batch, norm, *, move, read, **call
+    hidden_states, residual, forward_batch, norm, *, move, read_step, **call
 ):
     """Complete and place a producer contribution before its residual update."""
     hidden_states, residual = move(hidden_states, residual, forward_batch)
-    return read(hidden_states, residual, forward_batch, norm, **call)
+    return read_step(hidden_states, residual, forward_batch, norm, **call)
 
 
 def _then_moe_cp_gather(
@@ -490,6 +601,7 @@ def _then_moe_cp_gather(
     cache=None,
     gather: Callable,
     update: ResidualUpdate = PLAIN_ADD,
+    **call,
 ):
     """Read each shard, then gather the MoE group's tokens on its CP path.
 
@@ -498,7 +610,7 @@ def _then_moe_cp_gather(
     ordinary path. The residual stays on this rank's attention rows.
     """
     hidden_states, residual = gather(
-        hidden_states, residual, forward_batch, norm, update=update, cache=cache
+        hidden_states, residual, forward_batch, norm, update=update, cache=cache, **call
     )
     hidden_states = moe_cp_gather(
         hidden_states,
@@ -522,3 +634,32 @@ def _tp_all_reduce_with_scattered_residual(
     scattered_states += residual
     residual = tensor_model_parallel_all_reduce(hidden_states)
     return read.read(residual, norm)
+
+
+def _no_quantized_read(quant_format: str, step: str) -> None:
+    # Only the steps in _QUANTIZED_READ_STEPS hand on a quantized read.
+    if quant_format:
+        raise NotImplementedError(
+            f"{step} cannot read a quantized input ({quant_format=})"
+        )
+
+
+# The steps whose read is the last thing they do, on the rows the stage
+# computes: only they may quantize the input for the stage's first projection.
+_QUANTIZED_READ_STEPS = (_reduce_update_read, _update_read)
+
+
+def reads_quantized(entry: EntryPath) -> bool:
+    """Whether every step ``entry`` may run takes ``quant_format``, with no
+    move of the input after it."""
+    if entry.input_move is not None or not isinstance(entry.prepare, partial):
+        return False
+    steps = (
+        entry.prepare.keywords.get(name)
+        for name in ("step", "completed_step", "written_step")
+    )
+    return all(
+        step is None
+        or (isinstance(step, partial) and step.func in _QUANTIZED_READ_STEPS)
+        for step in steps
+    )
