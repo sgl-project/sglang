@@ -16,18 +16,11 @@ from sglang.kernels.ops.attention.flash_attn.cute.copy_utils import (
 )
 from sglang.kernels.ops.layernorm.inkling2_cute_utils import (
     domain_offset_raw_aligned,
-)
-from sglang.kernels.ops.layernorm.inkling2_primitives import (
     fadd_rn_f32,
     fma_rn_f32,
     fmul_rn_f32,
+    torch_to_cute_dtype,
 )
-
-_TORCH_TO_CUTE = {
-    torch.bfloat16: cute.BFloat16,
-    torch.float32: cute.Float32,
-    torch.int64: cute.Int64,
-}
 
 
 class AttnResFwdKernel:
@@ -55,7 +48,7 @@ class AttnResFwdKernel:
             f"D/{cluster_size}={D_local} must be divisible by num_compute_threads={num_compute_threads!r}"
         )
         if cluster_size > 1:
-            assert D_local * _TORCH_TO_CUTE[dtype].width // 8 % 16 == 0, (
+            assert D_local * torch_to_cute_dtype[dtype].width // 8 % 16 == 0, (
                 f"D/{cluster_size}={D_local} rows of {dtype} must be 16-byte aligned"
             )
         assert 1 <= N_Q <= 3, f"N_Q={N_Q!r} must be in [1, 3]"
@@ -78,7 +71,7 @@ class AttnResFwdKernel:
         self.vec_chunks = D_local // (num_compute_threads * self.vec_size)
         self.tail_elems = self.elem_per_thread - self.vec_chunks * self.vec_size
         self.tail_base = self.vec_chunks * self.vec_size
-        self.dtype = _TORCH_TO_CUTE[dtype]
+        self.dtype = torch_to_cute_dtype[dtype]
         self.X_load_bytes = D_local * self.dtype.width // 8
         self.NORMALIZE_VALUES = normalize_values
         self.HAS_PARTIAL_ADDEND = has_partial_addend
@@ -806,7 +799,7 @@ def _compile_attn_res(width, queries, sources, dtype, normalize_values, has_adde
             assumed_align=16,
         )
 
-    x = tensor(_TORCH_TO_CUTE[dtype], (tokens, width))
+    x = tensor(torch_to_cute_dtype[dtype], (tokens, width))
     offsets = tuple(Int64(0) for _ in range(sources))
     q = tensor(Float32, (queries, width))
     y = tensor(Float32, (queries, tokens, width))

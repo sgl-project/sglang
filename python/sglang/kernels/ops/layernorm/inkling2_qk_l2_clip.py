@@ -9,14 +9,11 @@ from cutlass import Float32, Int32, const_expr, cute, range_constexpr
 
 from sglang.kernels.ops.layernorm.inkling2_cute_utils import (
     assert_cuda_contig,
-    empty_cuda,
-    make_fake_2d_row_major,
-    torch_to_cute_dtype,
-)
-from sglang.kernels.ops.layernorm.inkling2_norm_common import (
     ceil_div,
     copy_partition,
+    empty_cuda,
     load_norm_rows,
+    make_fake_2d_row_major,
     make_fake_norm_rows,
     make_tiled_copy_2d,
     norm_num_rows,
@@ -24,6 +21,7 @@ from sglang.kernels.ops.layernorm.inkling2_norm_common import (
     predicate_n,
     qk_l2_clip_fwd_layout,
     qk_l2_clip_row_stats,
+    torch_to_cute_dtype,
 )
 
 BASE_ALIGN = 16

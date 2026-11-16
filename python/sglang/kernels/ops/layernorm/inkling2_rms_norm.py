@@ -8,15 +8,12 @@ import torch
 from cutlass import Float32, const_expr
 
 from sglang.kernels.ops.layernorm.inkling2_cute_utils import (
-    make_fake_2d_row_major,
-    torch_to_cute_dtype,
-)
-from sglang.kernels.ops.layernorm.inkling2_norm_common import (
     as_norm_rows,
     ceil_div,
     copy_partition,
     expand_dim,
     load_norm_rows,
+    make_fake_2d_row_major,
     make_fake_norm_rows,
     make_tiled_copy_2d,
     norm_num_rows,
@@ -24,6 +21,7 @@ from sglang.kernels.ops.layernorm.inkling2_norm_common import (
     predicate_n,
     rmsnorm_fwd_layout,
     rmsnorm_row_rstd,
+    torch_to_cute_dtype,
 )
 
 
