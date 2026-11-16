@@ -10,10 +10,10 @@ logger = logging.getLogger(__name__)
 
 try:
     from mcp import ClientSession
-except ImportError as e:
-    mcp = e
+except ImportError:
+    pass
 
-from openai_harmony import Author, Message, Role, StreamState, TextContent
+from openai_harmony import Author, Message, Role, TextContent
 
 from sglang.srt.entrypoints.harmony_utils import (
     get_encoding,
@@ -246,12 +246,6 @@ class StreamingHarmonyContext(HarmonyContext):
             for tok in toks:
                 self.parser.process(tok)
             self.last_tok = toks[-1]
-
-    def is_expecting_start(self) -> bool:
-        return self.parser.state == StreamState.EXPECT_START
-
-    def is_assistant_action_turn(self) -> bool:
-        return self.last_tok in self.encoding.stop_tokens_for_assistant_actions()
 
     def render_for_completion(self) -> list[int]:
         # now this list of tokens as next turn's starting tokens
