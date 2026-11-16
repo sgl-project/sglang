@@ -2176,7 +2176,7 @@ class Scheduler(
             incoming = self.ingest_requests()
             if incoming and execution_fence is not None:
                 execution_fence(discard=True, reason="ingress")
-            if self._engine_paused:
+            if self.pause_state.paused:
                 self._record_scheduler_state_for_paused_engine()
                 continue
 

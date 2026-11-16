@@ -2595,6 +2595,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--mps-execution-backend`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Torch MPS execution backend. <code>mlx-compiled</code> uses <code>torch.export</code> and <code>mx.compile</code> for capability-checked dense models, with Metal radix attention and scheduler-managed greedy lookahead. Torch retains model loading, KV ownership and sampling. Native MLX is unchanged. See the <a href="../hardware-platforms/apple_metal#direct-compiled-mlx-decode">Apple Silicon guide</a> for setup and limitations.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`eager`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>eager</code>, <code>mlx-compiled</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--cuda-graph-config`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Canonical per-phase CUDA graph settings as JSON, e.g. <code>{`{"decode":{"backend":"full","max_bs":256},"prefill":{"backend":"breakable"}}`}</code>. JSON wins over the per-phase <code>--cuda-graph-*</code> convenience flags and over the legacy flags. Allowed backends: <code>full</code>, <code>breakable</code>, <code>disabled</code>.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>

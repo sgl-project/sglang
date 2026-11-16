@@ -160,6 +160,37 @@ class TestSchedulerPauseGeneration(CustomTestCase):
         scheduler.init_request_retirer()
         return scheduler
 
+    def test_normal_loop_honors_pause_state(self):
+        """The normal loop must honor pauses without reading retired state."""
+        for paused in (False, True):
+            with self.subTest(paused=paused):
+                scheduler = self._new_scheduler()
+                if paused:
+                    scheduler.pause_state.pause()
+                scheduler.gracefully_exit = False
+                scheduler._sched_idled = False
+                scheduler.tp_worker = SimpleNamespace(
+                    enable_execution_lookahead=lambda: None
+                )
+                scheduler.increment_scheduler_iterations = MagicMock()
+                scheduler._record_scheduler_state_for_paused_engine = MagicMock()
+                scheduler.on_idle = MagicMock()
+                scheduler.get_next_batch_to_run = MagicMock(
+                    return_value=SimpleNamespace(
+                        running_batch=scheduler.running_batch, batch_to_run=None
+                    )
+                )
+
+                def ingest():
+                    scheduler.gracefully_exit = True
+                    return []
+
+                scheduler.ingest_requests = ingest
+                scheduler.event_loop_normal()
+
+                self.assertEqual(scheduler._sched_idled, not paused)
+                self.assertEqual(scheduler.pause_state.paused, paused)
+
     def _make_req(self, rid: str, finished: bool = False) -> Req:
         req = Req(
             rid=rid,
