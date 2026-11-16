@@ -481,11 +481,11 @@ P_MASTER_IP="<prefill-node-0-ip>"
 D_MASTER_IP="<decode-node-0-ip>"
 ROUTER_HOST_IP="<router-host-ip>"
 
-python3 -m sglang_router.launch_router \
-    --pd-disaggregation \
+sgl-router \
+    --model-id glm-5 \
+    --no-tokenizer \
     --policy round_robin \
-    --prefill http://${P_MASTER_IP}:8000 8998 \
-    --decode http://${D_MASTER_IP}:8003 \
+    --worker-urls http://${P_MASTER_IP}:8000 http://${D_MASTER_IP}:8003 \
     --host "${ROUTER_HOST_IP}" \
     --port 6688
 ```

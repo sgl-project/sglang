@@ -2156,7 +2156,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || '["rocm10", "rocm724", "rocm720"]') }}
+        rocm_version: ${{ fromJson(inputs.rocm_version && inputs.rocm_version != 'all' && format('["{0}"]', inputs.rocm_version) || github.event.schedule == '0 16 * * *' && '["rocm10"]' || github.event.schedule == '0 21 2-30/2 * *' && '["rocm724"]' || github.event.schedule == '0 21 1-31/2 * *' && '["rocm720"]' || '["rocm10", "rocm724", "rocm720"]') }}
     if: (github.repository == 'sgl-project/sglang' || github.event_name == 'pull_request') && (!(inputs.job_filter || inputs.job_select) || (inputs.job_filter || inputs.job_select) == 'all' || contains(format(',{0},', inputs.job_filter || inputs.job_select), ',nightly-4-gpu-mi35x-minimax-m31-flash-mxfp4,'))
     runs-on: linux-mi35x-gpu-8
     steps:
