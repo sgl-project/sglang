@@ -3,6 +3,7 @@ import asyncio
 import base64
 import functools
 import io
+import itertools
 import json
 import pickle
 import random
@@ -1357,6 +1358,8 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
                 question_len=common["question_len"],
                 output_len=common["output_len"],
                 tokenizer=self.tokenizer,
+                ordered=common["ordered"],
+                fast_prepare=common["fast_prepare"],
             )
             zipf_path_a = get_gen_prefix_cache_path(
                 seed=common["seed"],
@@ -1368,6 +1371,8 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
                 tokenizer=self.tokenizer,
                 group_distribution="zipf",
                 zipf_alpha=1.5,
+                ordered=common["ordered"],
+                fast_prepare=common["fast_prepare"],
             )
             zipf_path_b = get_gen_prefix_cache_path(
                 seed=common["seed"],
@@ -1379,6 +1384,8 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
                 tokenizer=self.tokenizer,
                 group_distribution="zipf",
                 zipf_alpha=2.0,
+                ordered=common["ordered"],
+                fast_prepare=common["fast_prepare"],
             )
             self.assertNotEqual(uniform_path, zipf_path_a)
             self.assertNotEqual(zipf_path_a, zipf_path_b)
@@ -1407,6 +1414,26 @@ class TestBenchmarkDatasetsAPI(CustomTestCase):
                 pickle.dump(zipf_sentinel, f)
             reloaded = self._run_gsp(mode="zipf", alpha=1.5, **common)
             self.assertEqual(reloaded, zipf_sentinel)
+
+    def test_gsp_cache_is_keyed_by_ordered_and_fast_prepare(self):
+        """A cached run must not be served to a run that differs in --gsp-ordered
+        or --gsp-fast-prepare: the first decides whether rows are shuffled, the
+        second stores prompt_len=1 in every row."""
+        common = dict(num_groups=3, prompts_per_group=4, seed=11)
+
+        default_rows = self._run_gsp(ordered=False, fast_prepare=False, **common)
+        self.assertTrue(all(row.prompt_len > 1 for row in default_rows))
+
+        ordered_rows = self._run_gsp(ordered=True, fast_prepare=False, **common)
+        system_prompts = [row.prompt.split("\n\n")[0] for row in ordered_rows]
+        runs = [prompt for prompt, _ in itertools.groupby(system_prompts)]
+        self.assertEqual(len(runs), len(set(runs)))
+
+        fast_rows = self._run_gsp(ordered=False, fast_prepare=True, **common)
+        self.assertEqual({row.prompt_len for row in fast_rows}, {1})
+
+        cached_rows = self._run_gsp(ordered=False, fast_prepare=False, **common)
+        self.assertEqual(self._row_fields(cached_rows), self._row_fields(default_rows))
 
     def test_zipf_total_rows_and_unique_prompts(self):
         # Total returned row count under Zipf equals num_groups *

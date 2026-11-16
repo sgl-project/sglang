@@ -155,7 +155,11 @@ class SglFunction:
         assert all(key in self.arg_names for key in kwargs)
 
         new_bind_dict = {**self.bind_arguments, **kwargs}
-        return SglFunction(self.func, bind_arguments=new_bind_dict)
+        return SglFunction(
+            self.func,
+            num_api_spec_tokens=self.num_api_spec_tokens,
+            bind_arguments=new_bind_dict,
+        )
 
     def run(
         self,

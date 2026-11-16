@@ -32,6 +32,7 @@ from sglang.benchmark.utils import get_tokenizer, set_ulimit
 from sglang.lang.backend.runtime_endpoint import Runtime
 from sglang.srt.arg_groups.model_override_base import resolving_view
 from sglang.srt.entrypoints.engine import Engine
+from sglang.srt.environ import envs
 from sglang.srt.server_args import ServerArgs
 
 
@@ -259,17 +260,17 @@ def throughput_test_once(
     ]
 
     if profile:
-        assert "SGLANG_TORCH_PROFILER_DIR" in os.environ, (
+        assert envs.SGLANG_TORCH_PROFILER_DIR.is_set(), (
             "Please set SGLANG_TORCH_PROFILER_DIR."
         )
-        os.makedirs(os.environ["SGLANG_TORCH_PROFILER_DIR"], exist_ok=True)
+        os.makedirs(envs.SGLANG_TORCH_PROFILER_DIR.get(), exist_ok=True)
         known_files = None
         backend.start_profile(
             num_steps=profile_steps,
             activities=profile_activities,
         )
         if profile_steps:
-            dir = os.getenv("SGLANG_TORCH_PROFILER_DIR")
+            dir = envs.SGLANG_TORCH_PROFILER_DIR.get()
             known_files = set(os.listdir(dir))
 
     st = time.perf_counter()
@@ -282,7 +283,7 @@ def throughput_test_once(
     latency = time.perf_counter() - st
 
     if profile:
-        dir = os.getenv("SGLANG_TORCH_PROFILER_DIR")
+        dir = envs.SGLANG_TORCH_PROFILER_DIR.get()
         if not profile_steps:
             known_files = set(os.listdir(dir))
         # With --profile-steps the scheduler auto-stops mid-run after N steps, so
@@ -443,8 +444,6 @@ def throughput_test(
             backend = _create_ray_engine_backend(server_args)
         else:
             backend = Engine(server_args=server_args)
-        if not backend:
-            raise ValueError("Please provide valid engine arguments")
     elif bench_args.backend == "runtime":
         backend = Runtime(**dict(cfg._raw_input))
     else:
@@ -556,7 +555,7 @@ def cli_main():
     args = parser.parse_args()
 
     # handling ModelScope model downloads
-    if os.getenv("SGLANG_USE_MODELSCOPE", "false").lower() in ("true", "1"):
+    if envs.SGLANG_USE_MODELSCOPE.get():
         if os.path.exists(args.model_path):
             print(f"Using local model path: {args.model_path}")
         else:

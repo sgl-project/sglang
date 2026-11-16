@@ -37,11 +37,10 @@ def main():
     )
 
     # simple commands
-    version_parser = subparsers.add_parser(
+    subparsers.add_parser(
         "version",
         help="Show the version information.",
     )
-    version_parser.set_defaults(func=version)
 
     args, extra_argv = parser.parse_known_args()
 
