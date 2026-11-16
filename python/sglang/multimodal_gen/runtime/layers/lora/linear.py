@@ -905,9 +905,8 @@ class ColumnParallelLinearWithLoRA(BaseLayerWithLoRA):
         B = B[start_idx:end_idx, :]
         return B
 
-    @torch.compiler.disable
-    def _forward_with_delta(self, x: torch.Tensor) -> torch.Tensor:
-        return super()._forward_with_delta(x)
+    # disable the shared body itself, without re-entering its compile wrapper
+    _forward_with_delta = torch.compiler.disable(BaseLayerWithLoRA._forward_with_delta)
 
 
 class MergedColumnParallelLinearWithLoRA(ColumnParallelLinearWithLoRA):
