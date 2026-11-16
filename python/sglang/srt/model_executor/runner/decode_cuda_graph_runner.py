@@ -346,7 +346,6 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
         self.enable_two_batch_overlap = get_exec().overlap.enable_two_batch_overlap
         self.use_ngram_embedding = model_runner.ngram_embedding_manager.enabled
-        self.speculative_algorithm = get_spec().speculative_algorithm
         self.enable_profile_cuda_graph = get_exec().graph.enable_profile_cuda_graph
 
         # True if the DSA or MLA prefill-CP flavor is active. These flavors

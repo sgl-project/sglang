@@ -239,7 +239,6 @@ class BaseRunner(ABC):
             if model_runner.is_draft_worker
             else get_server_return_hidden_states_mode()
         )
-        self.enable_return_hidden_states = self.return_hidden_states_mode.need_capture()
         self.attn_tp_size = get_parallel().attn_tp_size
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
