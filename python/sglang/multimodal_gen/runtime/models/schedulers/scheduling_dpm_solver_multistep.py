@@ -88,13 +88,12 @@ class DPMSolverMultistepScheduler(SchedulerMixin, ConfigMixin, BaseScheduler):
         )
         self.timesteps = self._inner.timesteps
         self.order = solver_order
+        self._flow_shift = flow_shift
         self._begin_index: int | None = None
         BaseScheduler.__init__(self)
 
     def set_shift(self, shift: float) -> None:
-        self.config.flow_shift = shift
-        # the diffusers scheduler reads its own config when it builds flow sigmas
-        self._inner.config.flow_shift = shift
+        self._flow_shift = shift
 
     def set_begin_index(self, begin_index: int = 0) -> None:
         self._begin_index = begin_index
