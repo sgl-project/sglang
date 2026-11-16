@@ -1,8 +1,6 @@
 """Minimal SGLang worker spawner for sgl-router e2e tests.
 
-Adapted from SMG's e2e_test/infra/model_pool.py — the 1200-line original
-manages a pool of long-lived workers across many tests; here we only
-need a thin wrapper around ``sglang.launch_server`` that:
+A thin wrapper around ``sglang.launch_server`` that:
 
   - binds the worker to GPU(s) inside this process's own
     ``CUDA_VISIBLE_DEVICES`` allotment,

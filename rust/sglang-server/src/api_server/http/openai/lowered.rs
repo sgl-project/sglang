@@ -14,8 +14,8 @@ use serde_json::{Map, Value};
 use sglang_api_types::api::v1::{GenerateResponse, GenerateStreamError};
 use sglang_processor::dynamo_tokenizers::{DecodeResult, Tokenizer};
 use sglang_processor::openai::{
-    ChatModel, ChatResponder, OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Reply, TokenPieces,
-    lower_chat,
+    ChatModel, ChatResponder, OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, ROUTING_KEY_HEADER,
+    Reply, TokenPieces, lower_chat,
 };
 use sglang_processor::{DynamoTokenizer, TemplateArgs, TemplateError};
 
@@ -161,7 +161,7 @@ pub(super) async fn chat(
 ) -> Option<Response> {
     state.openai_chat.as_ref()?;
     let header = |name: &str| headers.get(name)?.to_str().ok().map(str::to_owned);
-    let routing_key = header("x-smg-routing-key");
+    let routing_key = header(ROUTING_KEY_HEADER);
     let sglext_ids = ["x-sglext-return-input-ids", "x-sglext-return-output-ids"]
         .into_iter()
         .any(|name| header(name).as_deref() == Some("1"));

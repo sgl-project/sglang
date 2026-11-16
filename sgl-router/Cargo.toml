@@ -140,9 +140,7 @@ tonic-prost = "0.14.6"
 # Low-level msgpack encoder used to hand-construct wire bytes in
 # kv_events golden-bytes tests (decode-only path uses rmp-serde).
 rmp = "0.8"
-# Criterion benches that mirror the SMG `radix_tree_benchmark` +
-# `manual_policy_benchmark` so routing-decision latency can be compared
-# apples-to-apples against the gateway being deprecated.
+# Criterion benches for routing-decision latency (benches/, BENCHMARKS.md).
 criterion = { version = "0.5", features = ["html_reports"] }
 rand = "0.8"
 

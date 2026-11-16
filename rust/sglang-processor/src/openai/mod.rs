@@ -106,6 +106,9 @@ pub struct OpenAiSettings {
     pub tool_call_parser: Option<String>,
 }
 
+/// The request header Python's OpenAI layer reads `routing_key` from.
+pub const ROUTING_KEY_HEADER: &str = "x-sgl-routing-key";
+
 /// The request headers Python's OpenAI layer reads.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct OpenAiHeaders<'a> {

@@ -758,9 +758,6 @@ pub(super) fn generate_requests(
     // Read before the fills below: only a `max_new_tokens` the client sent is
     // checked against the context window.
     let client_max_new_tokens = ClientMaxNewTokens::of_json(&body);
-    if let Some(fields) = body.as_object_mut() {
-        crate::message::request::move_deprecated_dp_rank(fields);
-    }
     // Launch-time preferred sampling params fill in beneath the request's own
     // keys before decoding, so an explicit request value (even a default or
     // null) wins: Python TokenizerManager's precedence.
@@ -1696,9 +1693,8 @@ mod tests {
         assert!(logs.rejections().is_empty());
     }
 
-    /// `/generate` checks the DP rank a body names as Python does: the
-    /// deprecated `data_parallel_rank` when `routed_dp_rank` is unset, and a
-    /// rank outside the deployment is a 400 with Python's message, logged once.
+    /// `/generate` checks the DP rank a body names as Python does: a rank
+    /// outside the deployment is a 400 with Python's message, logged once.
     #[tokio::test]
     async fn generate_refuses_a_routed_dp_rank_out_of_range() {
         let state = Arc::new(AppState {
@@ -1727,11 +1723,8 @@ mod tests {
             openai_chat: None,
         });
         for (body, rank) in [
-            (r#"{"input_ids": [1], "data_parallel_rank": 3}"#, 3),
-            (
-                r#"{"input_ids": [1], "routed_dp_rank": 2, "data_parallel_rank": 0}"#,
-                2,
-            ),
+            (r#"{"input_ids": [1], "routed_dp_rank": 3}"#, 3),
+            (r#"{"input_ids": [1], "routed_dp_rank": 2}"#, 2),
         ] {
             let logs = crate::utils::logging::capture_logs();
             let request = Request::builder()
