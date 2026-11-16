@@ -36,7 +36,7 @@ from sglang.srt.model_executor.runner_backend.base_graph_backend import (
     BaseGraphBackend,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import get_bool_env_var, get_compiler_backend
+from sglang.srt.utils import empty_context, get_bool_env_var, get_compiler_backend
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 
 if TYPE_CHECKING:
