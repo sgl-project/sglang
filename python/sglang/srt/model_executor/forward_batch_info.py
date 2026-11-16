@@ -62,7 +62,6 @@ from sglang.srt.runtime_context import (
     get_parallel,
     mamba_cache_chunk_size,
 )
-from sglang.srt.speculative.ragged_verify import ragged_verify_token_rows
 from sglang.srt.speculative.spec_info import SpecInputType
 from sglang.srt.utils import (
     is_cpu,
@@ -1527,6 +1526,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if layout is None:
             token_deltas = deltas.repeat_interleave(num_tokens // batch_size)
         else:
+            from sglang.srt.speculative.ragged_verify import ragged_verify_token_rows
+
             # Graph-padding tokens map to row batch_size, which carries delta 0.
             rows = ragged_verify_token_rows(layout, num_tokens)
             token_deltas = torch.cat((deltas, deltas.new_zeros(1)))[rows]
