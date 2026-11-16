@@ -43,8 +43,6 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import get_parallel
 
-LoraConfig = None
-
 
 class GLMAttention(nn.Module):
     def __init__(
@@ -152,8 +150,6 @@ class GLMMLP(nn.Module):
     ):
         super().__init__()
 
-        self.add_bias = config.add_bias_linear
-
         # Project to 4h.
         self.dense_h_to_4h = MergedColumnParallelLinear(
             config.hidden_size,
@@ -202,8 +198,6 @@ class GLMBlock(nn.Module):
             config.apply_residual_connection_post_layernorm
         )
 
-        self.fp32_residual_connection = config.fp32_residual_connection
-
         layer_norm_func = RMSNorm if config.rmsnorm else LayerNorm
         # Layernorm on the input data.
         self.input_layernorm = layer_norm_func(
@@ -214,7 +208,6 @@ class GLMBlock(nn.Module):
         self.self_attention = GLMAttention(
             config, layer_id, quant_config, prefix=add_prefix("self_attention", prefix)
         )
-        self.hidden_dropout = config.hidden_dropout
 
         # Layernorm on the attention output
         self.post_attention_layernorm = layer_norm_func(
@@ -332,9 +325,6 @@ class ChatGLMM(nn.Module):
             prefix=add_prefix("embedding", prefix),
         )
 
-        self.num_layers = config.num_layers
-        self.multi_query_group_num = config.multi_query_group_num
-        self.kv_channels = config.kv_channels
         self.encoder = GLMTransformer(
             config, quant_config, add_prefix("encoder", prefix)
         )
@@ -386,7 +376,6 @@ class ChatGLMForCausalLM(nn.Module):
         super().__init__()
         self.config: ChatGLMConfig = config
         self.quant_config = quant_config
-        self.max_position_embeddings = getattr(config, "max_sequence_length", 8192)
         self.transformer = ChatGLMM(
             config, quant_config, prefix=add_prefix("transformer", prefix)
         )

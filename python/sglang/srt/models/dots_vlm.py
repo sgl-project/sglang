@@ -24,6 +24,7 @@ import torch
 from torch import nn
 
 from sglang.srt.configs.dots_vlm import DotsVLMConfig
+from sglang.srt.layers.attention.vision_utils import pad_vit_attn_dummy_heads
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.mm_utils import (
     general_mm_embed_routine,
@@ -80,36 +81,6 @@ class DotsVLMForCausalLM(nn.Module):
         # Initialize vision tower (matching transformers naming for weight compatibility)
         self.vision_tower = DotsVisionTransformer(config.vision_config)
 
-    def _pad_vit_attn_dummy_heads(self, name: str, loaded_weight: torch.Tensor):
-        """pad attn qkv weights for dummy heads"""
-        num_dummy_heads = self.config.vision_config.num_dummy_heads
-        if num_dummy_heads == 0:
-            return loaded_weight
-        head_dim = self.config.vision_config.head_dim
-
-        if "attn.qkv_proj" in name:
-            wq, wk, wv = loaded_weight.chunk(3, dim=0)
-            if name.endswith(".weight"):
-                dummy_shape = [num_dummy_heads, head_dim, wq.shape[-1]]
-            elif name.endswith(".bias"):
-                dummy_shape = [num_dummy_heads, head_dim]
-            else:
-                raise RuntimeError(f"Unsupported weight with name={name}")
-            pad_func = lambda x: torch.cat(
-                [x.unflatten(0, (-1, head_dim)), x.new_zeros(dummy_shape)], dim=0
-            ).flatten(0, 1)
-            wq, wk, wv = pad_func(wq), pad_func(wk), pad_func(wv)
-            loaded_weight = torch.cat([wq, wk, wv], dim=0)
-        if "attn.proj.weight" in name:
-            padded_weight = loaded_weight.new_zeros(
-                loaded_weight.shape[0], head_dim * num_dummy_heads
-            )
-            loaded_weight = torch.cat([loaded_weight, padded_weight], dim=-1)
-        if "attn.q_norm.weight" in name or "attn.k_norm.weight" in name:
-            padded_weight = loaded_weight.new_zeros(head_dim * num_dummy_heads)
-            loaded_weight = torch.cat([loaded_weight, padded_weight], dim=0)
-        return loaded_weight
-
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         """Load weights for the model, separating vision and language weights"""
         weights = list(weights)
@@ -135,7 +106,9 @@ class DotsVLMForCausalLM(nn.Module):
                     raise ValueError(f"Weight {name} not found in params_dict")
                 param = params_dict[name]
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
-                loaded_weight = self._pad_vit_attn_dummy_heads(name, loaded_weight)
+                loaded_weight = pad_vit_attn_dummy_heads(
+                    self.config, name, loaded_weight
+                )
                 weight_loader(param, loaded_weight)
 
         # Load language model weights
