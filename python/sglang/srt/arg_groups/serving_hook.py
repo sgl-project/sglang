@@ -362,19 +362,6 @@ def handle_deprecated_args(server_args: Any):
     if renamed:
         declare_resolution(server_args, "_handle_deprecated_args", **renamed)
 
-    # --grpc-mode is a deprecated alias for --smg-grpc-mode.
-    if cfg.grpc_mode and not cfg.smg_grpc_mode:
-        logger.warning(
-            "--grpc-mode is deprecated and will be removed in a future "
-            "version. Use --smg-grpc-mode for the legacy SMG gRPC server, "
-            "or --grpc-port for the native gRPC server."
-        )
-        declare_resolution(
-            server_args,
-            "_handle_deprecated_args",
-            smg_grpc_mode=True,
-        )
-
     # Native gRPC tuning knob is env-only; --grpc-port (CLI) enables the
     # native server, falling back to SGLANG_GRPC_PORT.
     declare_resolution(
@@ -391,14 +378,10 @@ def handle_deprecated_args(server_args: Any):
             grpc_port=grpc_port_env,
         )
 
-    # Legacy SMG defaults its port to --port + 10000. Derive/validate only
-    # when gRPC is in use, so HTTP-only high ports don't fail validation.
-    legacy_grpc = cfg.smg_grpc_mode or cfg.grpc_mode
-    if legacy_grpc and cfg.grpc_port is None:
-        declare_resolution(
-            server_args,
-            "_handle_deprecated_args",
-            grpc_port=cfg.port + 10000,
+    if cfg.grpc_mode and not cfg.encoder_only:
+        raise ValueError(
+            "--grpc-mode serves the encoder over gRPC and requires "
+            "--encoder-only; use --grpc-port for the native gRPC server."
         )
 
     if cfg.grpc_response_timeout_secs <= 0:
@@ -415,9 +398,6 @@ def handle_deprecated_args(server_args: Any):
                 f"SGLANG_GRPC_WORKER_THREADS ({cfg.grpc_worker_threads}) must be >= 1"
             )
 
-    # Native gRPC is incompatible with launch paths it doesn't wire into.
-    # Legacy takes precedence over grpc_port, keeping re-runs idempotent.
-    native_grpc = cfg.grpc_port is not None and not legacy_grpc
     if cfg.sidecar_args is not None:
         if cfg.sidecar is None:
             raise ValueError("--sidecar-args requires --sidecar.")
@@ -428,14 +408,10 @@ def handle_deprecated_args(server_args: Any):
     if cfg.sidecar is not None:
         if not cfg.sidecar.strip():
             raise ValueError("--sidecar must not be empty.")
-        if legacy_grpc:
-            raise ValueError(
-                "--sidecar requires SGLang's native gRPC server; "
-                "it cannot be combined with --smg-grpc-mode/--grpc-mode."
-            )
         if cfg.grpc_port is None:
             raise ValueError("--sidecar requires --grpc-port or SGLANG_GRPC_PORT.")
-    if native_grpc:
+    # Native gRPC is incompatible with launch paths it doesn't wire into.
+    if cfg.grpc_port is not None:
         if cfg.use_ray:
             raise ValueError(
                 "--grpc-port is not supported with --use-ray: the Ray "
