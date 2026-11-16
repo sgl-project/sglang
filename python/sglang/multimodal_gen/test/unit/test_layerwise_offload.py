@@ -1,6 +1,7 @@
 import gc
 import os
 import pathlib
+import uuid
 from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -24,6 +25,9 @@ from sglang.multimodal_gen.runtime.managers.memory_managers import (
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
     layerwise_offload as layerwise_offload_mod,
+)
+from sglang.multimodal_gen.runtime.managers.memory_managers import (
+    shared_pinned_store,
 )
 from sglang.multimodal_gen.runtime.managers.memory_managers.component_manager import (
     ComponentResidencyManager,
@@ -271,6 +275,180 @@ def test_shared_store_key_separates_fold_shards(monkeypatch):
     assert key(0) == "text_encoder.model.layers:0:torch.bfloat16:1024"
     assert key(1) == "text_encoder.model.layers:0:torch.bfloat16:1024:s1"
     assert key(1) != key(0)
+
+
+@pytest.fixture
+def shared_store_manager(monkeypatch, tmp_path):
+    """Exercise actual store ownership on CPU, without requiring CUDA."""
+    monkeypatch.setattr(
+        layerwise_offload_mod.torch, "get_device_module", lambda: _FakeDeviceModule
+    )
+    monkeypatch.setattr(layerwise_offload_mod.current_platform, "device_type", "cpu")
+    monkeypatch.setattr(
+        layerwise_offload_mod.envs, "SGLANG_DIFFUSION_SHARE_PINNED_STORES", True
+    )
+    monkeypatch.setattr(shared_pinned_store, "MARKER_DIR", str(tmp_path))
+    monkeypatch.setattr(shared_pinned_store, "_note_leave", lambda pool: None)
+    registered = set()
+
+    def register(buf, nbytes):
+        import ctypes
+
+        registered.add(ctypes.addressof(ctypes.c_char.from_buffer(buf)))
+        return True
+
+    def unregister(buf):
+        import ctypes
+
+        registered.remove(ctypes.addressof(ctypes.c_char.from_buffer(buf)))
+
+    monkeypatch.setattr(shared_pinned_store, "_register", register)
+    monkeypatch.setattr(shared_pinned_store, "_unregister", unregister)
+    # The private path still transfers a real storage lease; only the device
+    # registration is replaced, so all assertions concern actual tensor bytes.
+    monkeypatch.setattr(
+        layerwise_offload_mod,
+        "_pinned_empty",
+        lambda *size, dtype: torch.empty(*size, dtype=dtype),
+    )
+    managers = []
+    pool = f"test-isolation-{uuid.uuid4().hex}"
+
+    def create():
+        model = torch.nn.Module()
+        model.blocks = torch.nn.ModuleList([torch.nn.Linear(4, 3)])
+        with torch.no_grad():
+            model.blocks[0].weight.copy_(torch.arange(12).reshape(3, 4))
+            model.blocks[0].bias.copy_(torch.arange(3))
+        budget = host_memory_budget.HostPinBudget(available_bytes=1 << 30)
+        budget.reserve_bytes = 0
+        manager = LayerwiseOffloadManager(
+            model=model,
+            layers_attr_str="blocks",
+            num_layers=1,
+            enabled=True,
+            pin_cpu_memory=True,
+            initialize=False,
+            pin_budget=budget,
+            pin_component_name=pool,
+        )
+        managers.append(manager)
+        manager._initialize_layer_weights()
+        return manager
+
+    yield create, registered
+    for manager in managers:
+        manager.enabled = False
+        manager.release_host_stores()
+    gc.collect()
+    assert not registered
+    assert pool not in shared_pinned_store._POOL_REFS
+    assert pool not in shared_pinned_store._LOCKS
+
+
+@pytest.mark.parametrize("writeback", ["update", "sync"])
+@pytest.mark.parametrize("pin_headroom", [True, False])
+def test_shared_store_writeback_preserves_peer_weights(
+    shared_store_manager, writeback, pin_headroom
+):
+    create, _ = shared_store_manager
+    owner, follower = create(), create()
+    expected = owner.get_cpu_weight("blocks.0.weight").clone()
+    before = follower._pin_budget.committed_bytes
+    if not pin_headroom:
+        follower._pin_budget.available_bytes = before
+    replacement = torch.full_like(expected, 17)
+    if writeback == "update":
+        assert follower.update_cpu_weights({"blocks.0.weight": replacement}) == {
+            "blocks.0.weight"
+        }
+    else:
+        with torch.no_grad():
+            follower.model.blocks[0].weight.data = replacement.clone()
+            follower.model.blocks[0].bias.data = torch.arange(3, dtype=torch.float32)
+        follower._gpu_layers.add(0)
+        follower.sync_layer_to_cpu(0)
+    assert torch.equal(owner.get_cpu_weight("blocks.0.weight"), expected)
+    assert torch.equal(follower.get_cpu_weight("blocks.0.weight"), replacement)
+    assert not follower._shared_cpu_weights
+    gc.collect()
+    assert follower._pin_budget.committed_bytes == (before if pin_headroom else 0)
+
+
+@pytest.mark.parametrize("attach", [False, True])
+def test_shared_registration_failure_restores_weights_and_tracks_private_lease(
+    shared_store_manager, monkeypatch, attach
+):
+    create, _ = shared_store_manager
+    if attach:
+        create()
+    monkeypatch.setattr(shared_pinned_store, "_register", lambda *_: False)
+    manager = create()
+    assert not manager._shared_cpu_weights
+    assert torch.equal(
+        manager.get_cpu_weight("blocks.0.weight"),
+        torch.arange(12, dtype=torch.float32).reshape(3, 4),
+    )
+    assert torch.equal(
+        manager.get_cpu_weight("blocks.0.bias"), torch.arange(3, dtype=torch.float32)
+    )
+    buffer = manager._consolidated_cpu_weights[0][torch.float32]
+    assert manager._pin_budget.committed_bytes == buffer.untyped_storage().nbytes()
+    manager.enabled = False
+    manager.release_host_stores()
+    assert manager._pin_budget.committed_bytes == buffer.untyped_storage().nbytes()
+    del buffer
+    gc.collect()
+    assert manager._pin_budget.committed_bytes == 0
+
+
+def test_shared_release_waits_for_last_view_and_preserves_other_manager(
+    shared_store_manager,
+):
+    create, registered = shared_store_manager
+    owner, follower = create(), create()
+    pool = owner._store_pool
+    assert len(registered) == 2
+    view = owner.get_cpu_weight("blocks.0.weight")
+    expected = view.clone()
+    booked = owner._pin_budget.committed_bytes
+    owner.enabled = False
+    owner.release_host_stores()
+    gc.collect()
+    assert owner._pin_budget.committed_bytes == booked
+    assert len(registered) == 2
+    assert torch.equal(view, expected)
+    del view
+    gc.collect()
+    assert owner._pin_budget.committed_bytes == 0
+    assert len(registered) == 1
+    assert pool in shared_pinned_store._LOCKS
+    assert torch.equal(follower.get_cpu_weight("blocks.0.weight"), expected)
+    follower.enabled = False
+    follower.release_host_stores()
+    gc.collect()
+    assert not registered
+    assert follower._pin_budget.committed_bytes == 0
+    assert pool not in shared_pinned_store._LOCKS
+
+
+def test_lora_writeback_refreshes_detached_view(shared_store_manager):
+    create, _ = shared_store_manager
+    owner, follower = create(), create()
+    model = follower.model
+    model.layerwise_offload_managers = [follower]
+    layer = model.blocks[0]
+    layer._offload_root = model
+    layer._offload_param_prefix = "blocks.0"
+    layer._packed_weight_cpu = follower.get_cpu_weight("blocks.0.weight")
+    original = owner.get_cpu_weight("blocks.0.weight").clone()
+    with torch.no_grad():
+        layerwise_offload_mod.write_dense_weight(layer, original + 7)
+        assert torch.equal(layer._packed_weight_cpu, original + 7)
+        assert torch.equal(owner.get_cpu_weight("blocks.0.weight"), original)
+        layerwise_offload_mod.write_dense_weight(layer, original)
+    assert torch.equal(layer._packed_weight_cpu, original)
+    assert torch.equal(owner.get_cpu_weight("blocks.0.weight"), original)
 
 
 def test_layerwise_offload_preserves_non_contiguous_stride(monkeypatch):

@@ -65,6 +65,7 @@ import logging
 import os
 import signal
 import time
+import weakref
 from multiprocessing import resource_tracker, shared_memory, util
 
 import torch
@@ -83,7 +84,8 @@ MAX_WAIT_S = 900.0
 # stuck here is a peer that will never finish.
 DECIDE_TIMEOUT_S = 120.0
 
-_LIVE: dict[str, shared_memory.SharedMemory] = {}
+_LIVE: dict[int, "SharedStore"] = {}
+_POOL_REFS: dict[str, int] = {}
 _LOCKS: dict[str, list[int]] = {}
 _ROLE: dict[str, bool | None] = {}
 _FILLED: dict[str, int] = {}
@@ -98,7 +100,7 @@ _PREV_SIGNAL: dict[int, object] = {}
 class SharedStore:
     """One acquired segment, not yet filled or registered."""
 
-    __slots__ = ("shm", "created", "key", "nbytes", "pool")
+    __slots__ = ("shm", "created", "key", "nbytes", "pool", "registered", "closed")
 
     def __init__(self, shm, created: bool, key: str, nbytes: int, pool: str) -> None:
         self.shm = shm
@@ -106,10 +108,19 @@ class SharedStore:
         self.key = key
         self.nbytes = nbytes
         self.pool = pool
+        self.registered = False
+        self.closed = False
+        _POOL_REFS[pool] = _POOL_REFS.get(pool, 0) + 1
 
     @property
     def buffer(self):
         return self.shm.buf
+
+    def tensor(self, dtype: torch.dtype) -> torch.Tensor:
+        """Give the last tensor view ownership of this acquired mapping."""
+        tensor = torch.frombuffer(self.buffer, dtype=dtype)
+        weakref.finalize(tensor.untyped_storage(), release, self)
+        return tensor
 
 
 def _digest(text: str) -> str:
@@ -398,6 +409,50 @@ def _register(buf, nbytes: int) -> bool:
         return False
 
 
+def _unregister(buf) -> None:
+    ptr = ctypes.addressof(ctypes.c_char.from_buffer(buf))
+    torch.cuda.cudart().cudaHostUnregister(ptr)
+
+
+def release(store: SharedStore) -> None:
+    """Release a mapping after its last tensor view, or an uncommitted store.
+
+    The storage finalizer owns the registration, mapping and pool seat together.
+    Keeping a tensor view therefore keeps all three alive, including when its
+    manager has already dropped its own tensors.
+    """
+    if store.closed:
+        return
+    if store.created and id(store) not in _LIVE:
+        # A failed registration was never published. Unlink it even if other
+        # layers keep the pool alive. Reopening balances the resource tracker
+        # registration, which begin() removed for the original handle.
+        try:
+            abandoned = shared_memory.SharedMemory(name=store.shm.name)
+        except FileNotFoundError:
+            pass
+        else:
+            abandoned.unlink()
+            abandoned.close()
+    if store.registered:
+        _unregister(store.buffer)
+        store.registered = False
+    store.shm.close()
+    store.closed = True
+    _LIVE.pop(id(store), None)
+    remaining = _POOL_REFS[store.pool] - 1
+    if remaining:
+        _POOL_REFS[store.pool] = remaining
+    else:
+        del _POOL_REFS[store.pool]
+        leave_pool(store.pool)
+
+
+def _leave_unused_pool(pool: str) -> None:
+    if not _POOL_REFS.get(pool):
+        leave_pool(pool)
+
+
 def _wait_for_marker(marker: str, pool: str) -> bool:
     """Wait for the creator to publish this store, while it keeps advancing."""
     _, _, _, progress, _ = _pool_paths(pool)
@@ -441,7 +496,10 @@ def begin(key: str, nbytes: int, verify, pool: str) -> SharedStore | None:
         stats["refused"] += 1
         return None
 
-    if creator:
+    # A published layer may still be read by another manager or process even
+    # after this process detached its own copy. Reuse it for this generation.
+    create = creator and not os.path.exists(marker)
+    if create:
         # Listed before it exists, so an interrupted creation still leaves the
         # name in the manifest for the next generation to unlink.
         _note_segment(pool, name)
@@ -459,11 +517,13 @@ def begin(key: str, nbytes: int, verify, pool: str) -> SharedStore | None:
         # wait, a second private copy costs the memory the pool exists to save.
         if not _wait_for_marker(marker, pool):
             stats["refused"] += 1
+            _leave_unused_pool(pool)
             return None
         try:
             shm = shared_memory.SharedMemory(name=name)
         except (FileNotFoundError, OSError):
             stats["refused"] += 1
+            _leave_unused_pool(pool)
             return None
 
     # Every SharedMemory construction registers the name with this process's
@@ -476,7 +536,7 @@ def begin(key: str, nbytes: int, verify, pool: str) -> SharedStore | None:
     except Exception:
         pass
 
-    if creator:
+    if create:
         if os.path.exists(marker):
             os.remove(marker)
         stats["created"] += 1
@@ -505,27 +565,35 @@ def begin(key: str, nbytes: int, verify, pool: str) -> SharedStore | None:
             )
             shm.close()
             stats["refused"] += 1
+            _leave_unused_pool(pool)
             return None
     except Exception as exc:
         logger.warning("shared pinned store %s could not be verified (%s)", pool, exc)
         shm.close()
         stats["refused"] += 1
+        _leave_unused_pool(pool)
         return None
     return SharedStore(shm, False, key, nbytes, pool)
 
 
-def commit(store: SharedStore) -> torch.Tensor | None:
-    """Register the store and, for its creator, publish it. None means fall back."""
+def commit(store: SharedStore) -> bool:
+    """Register and publish a store whose tensor already owns its lifetime.
+
+    On failure the caller drops its tensor before allocating privately. The
+    storage finalizer then closes the mapping and returns its pool seat.
+    """
     if not _register(store.buffer, store.nbytes):
-        store.shm.close()
-        if store.created:
-            store.shm.unlink()
-        return None
+        return False
+    store.registered = True
     name, marker = _names(store.key)
-    if store.created:
-        with open(marker, "w") as handle:
-            handle.write(name)
-        _FILLED[store.pool] = _FILLED.get(store.pool, 0) + 1
-        _publish_progress(store.pool)
-    _LIVE[name] = store.shm
-    return torch.frombuffer(store.buffer, dtype=torch.uint8, count=store.nbytes)
+    try:
+        if store.created:
+            with open(marker, "w") as handle:
+                handle.write(name)
+            _FILLED[store.pool] = _FILLED.get(store.pool, 0) + 1
+            _publish_progress(store.pool)
+    except OSError:
+        logger.warning("shared pinned store %s: could not publish %s", store.pool, name)
+        return False
+    _LIVE[id(store)] = store
+    return True

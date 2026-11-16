@@ -16,21 +16,24 @@ one arrangement at a time:
     left behind -- and the next creator reclaims it.
 """
 
+import gc
 import multiprocessing
 import os
 import sys
 import time
 import uuid
 from multiprocessing import shared_memory
+from unittest.mock import patch
 
 import pytest
+import torch
 
 from sglang.multimodal_gen.runtime.managers.memory_managers import (
     shared_pinned_store as store,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=60, suite="base-a-test-cpu")
 
 SEGMENT_BYTES = 1 << 20
 DEADLINE_S = 60.0
@@ -185,6 +188,160 @@ def _clear(pool: str) -> None:
             os.remove(path)
         except OSError:
             pass
+
+
+class _CpuDevice:
+    class Stream:
+        pass
+
+    @staticmethod
+    def is_available():
+        return True
+
+    @staticmethod
+    def current_device():
+        return 0
+
+
+def _mutable_server(pool: str, marker_dir: str, conn) -> None:
+    """Run the real manager in an independent process; fake only device calls."""
+    from sglang.multimodal_gen.runtime.managers.memory_managers import (
+        layerwise_offload as offload,
+    )
+    from sglang.multimodal_gen.runtime.managers.memory_managers.host_memory_budget import (
+        HostPinBudget,
+    )
+
+    try:
+        with (
+            patch.object(store, "MARKER_DIR", marker_dir),
+            patch.object(store, "_register", return_value=True),
+            patch.object(store, "_unregister"),
+            patch.object(torch, "get_device_module", return_value=_CpuDevice),
+            patch.object(offload.current_platform, "device_type", "cpu"),
+            patch.object(offload.envs, "SGLANG_DIFFUSION_SHARE_PINNED_STORES", True),
+            patch.object(
+                offload,
+                "_pinned_empty",
+                side_effect=lambda *size, dtype: torch.empty(*size, dtype=dtype),
+            ),
+        ):
+            model = torch.nn.Module()
+            model.blocks = torch.nn.ModuleList(
+                [torch.nn.Linear(4, 3, bias=False) for _ in range(2)]
+            )
+            with torch.no_grad():
+                for block in model.blocks:
+                    block.weight.fill_(1)
+            budget = HostPinBudget(available_bytes=1 << 30)
+            budget.reserve_bytes = 0
+            manager = offload.LayerwiseOffloadManager(
+                model=model,
+                layers_attr_str="blocks",
+                num_layers=2,
+                enabled=True,
+                pin_cpu_memory=True,
+                initialize=False,
+                pin_budget=budget,
+                pin_component_name=pool,
+            )
+            manager._initialize_layer_weights()
+            conn.send(bool(manager._shared_cpu_weights))
+            while True:
+                command = conn.recv()
+                if command == "update":
+                    manager.update_cpu_weights(
+                        {"blocks.0.weight": torch.full((3, 4), 17.0)}
+                    )
+                elif command == "rejoin":
+                    # The writer still owns the pool through layer 1, but may
+                    # have dropped its layer-0 mapping after detaching. Layer 0
+                    # must keep the same name and pages for the peer reading it.
+                    key = manager._shared_store_key(0, torch.float32, 12)
+                    held = store.begin(key, 48, lambda _: True, pool=pool)
+                    tensor = held.tensor(torch.float32)
+                    assert not held.created
+                    assert store.commit(held)
+                    conn.send(tensor.tolist())
+                    del tensor
+                    continue
+                elif command == "release":
+                    manager.enabled = False
+                    manager.release_host_stores()
+                    gc.collect()
+                    conn.send(budget.committed_bytes)
+                    break
+                conn.send(manager.get_cpu_weight("blocks.0.weight").tolist())
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("writer", [0, 1])
+def test_independent_servers_isolate_updates_and_release(tmp_path, writer):
+    pool = _pool_name()
+    children = []
+
+    def receive(conn):
+        assert conn.poll(DEADLINE_S), "server did not respond"
+        return conn.recv()
+
+    try:
+        for _ in range(2):
+            parent_conn, child_conn = multiprocessing.get_context("spawn").Pipe()
+            proc = multiprocessing.get_context("spawn").Process(
+                target=_mutable_server, args=(pool, str(tmp_path), child_conn)
+            )
+            proc.start()
+            child_conn.close()
+            children.append((proc, parent_conn))
+            assert receive(parent_conn), "server did not acquire shared weights"
+        children[writer][1].send("update")
+        assert receive(children[writer][1]) == [[17.0] * 4] * 3
+        children[writer][1].send("rejoin")
+        assert receive(children[writer][1]) == [1.0] * 12
+        reader = children[1 - writer][1]
+        reader.send("read")
+        assert receive(reader) == [[1.0] * 4] * 3
+        children[writer][1].send("release")
+        assert receive(children[writer][1]) == 0
+        reader.send("read")
+        assert receive(reader) == [[1.0] * 4] * 3
+        reader.send("release")
+        assert receive(reader) == 0
+    finally:
+        for proc, conn in children:
+            conn.close()
+            proc.join(timeout=10)
+            if proc.is_alive():
+                proc.kill()
+                proc.join()
+        assert all(proc.exitcode == 0 for proc, _ in children)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA registration")
+def test_registration_lives_until_the_last_tensor_view(tmp_path, monkeypatch):
+    monkeypatch.setattr(store, "MARKER_DIR", str(tmp_path))
+    monkeypatch.setattr(store, "_note_leave", lambda pool: None)
+    pool = _pool_name()
+    key = _keys(pool, count=1)[0]
+    held = store.begin(key, SEGMENT_BYTES, lambda _: True, pool=pool)
+    tensor = held.tensor(torch.float32)
+    tensor.fill_(3)
+    assert store.commit(held)
+    assert tensor.is_pinned()
+    assert torch.equal(tensor.cuda().cpu(), tensor)
+    view = tensor[:4]
+    del tensor
+    gc.collect()
+    assert not held.closed
+    assert torch.equal(view, torch.full((4,), 3.0))
+    del view
+    gc.collect()
+    assert held.closed
+    assert not held.registered
+    assert pool not in store._POOL_REFS
+    assert pool not in store._LOCKS
+    assert not os.path.exists(_segment_path(store._names(key)[0]))
 
 
 class TestSharedPinnedStoreLifetime:

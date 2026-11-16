@@ -13,15 +13,7 @@ import weakref
 from collections.abc import Iterator, Mapping, Sequence
 from contextlib import contextmanager, nullcontext
 from time import perf_counter
-from typing import (
-    Any,
-    Callable,
-    Dict,
-    List,
-    Optional,
-    Set,
-    Tuple,
-)
+from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
 from torch.distributed.tensor import DTensor
@@ -1154,6 +1146,7 @@ class LayerwiseOffloadManager:
         # layer_idx -> {dtype: consolidated_pinned_cpu_tensor}
         # stores the consolidated weight from a same layer, of same dtype
         self._consolidated_cpu_weights: Dict[int, Dict[torch.dtype, torch.Tensor]] = {}
+        self._shared_cpu_weights: set[tuple[int, torch.dtype]] = set()
         # layer_idx -> {name: pinned_cpu_tensor_with_original_stride}
         # stores tensors whose original non-contiguous stride/layout must be preserved
         self._strided_cpu_weights: Dict[int, Dict[str, torch.Tensor]] = {}
@@ -1649,11 +1642,22 @@ class LayerwiseOffloadManager:
                         pool=self._store_pool,
                     )
                 if shared is not None:
-                    cpu_buffer = torch.frombuffer(
-                        shared.buffer, dtype=dtype, count=total_numel
-                    )
-                    populated = not shared.created
-                else:
+                    cpu_buffer = shared.tensor(dtype)
+                    if shared.created:
+                        for name, _weight, local_weight in contiguous_weights:
+                            off = aligned_offsets[name]
+                            count = local_weight.numel()
+                            cpu_buffer[off : off + count].copy_(local_weight.flatten())
+                    if shared_pinned_store.commit(shared):
+                        self._shared_cpu_weights.add((layer_idx, dtype))
+                        populated = True
+                    else:
+                        # Parameters still hold the originals. Drop every view
+                        # before closing the failed mapping, then let the normal
+                        # private path create the allocation whose lease is yielded.
+                        del cpu_buffer
+                        shared = None
+                if shared is None:
                     cpu_buffer, populated = self._prepare_host_buffer(
                         contiguous_weights,
                         aligned_offsets,
@@ -1685,15 +1689,6 @@ class LayerwiseOffloadManager:
                     )
 
                     current_offset += numel
-
-                if shared is not None and shared_pinned_store.commit(shared) is None:
-                    # Registration failed after the bytes were already placed in
-                    # the segment: rebuild them in a private allocation.
-                    cpu_buffer = _pinned_empty(total_numel, dtype=dtype)
-                    for name, _weight, local_weight in contiguous_weights:
-                        off = aligned_offsets[name]
-                        count = local_weight.numel()
-                        cpu_buffer[off : off + count].copy_(local_weight.flatten())
 
                 self._consolidated_cpu_weights[layer_idx][dtype] = cpu_buffer
 
@@ -2513,6 +2508,7 @@ class LayerwiseOffloadManager:
             )
 
         self._consolidated_cpu_weights.clear()
+        self._shared_cpu_weights.clear()
         self._strided_cpu_weights.clear()
         self._mapped_cpu_weights.clear()
         self._mps_cpu_weights.clear()
@@ -2553,7 +2549,7 @@ class LayerwiseOffloadManager:
             gpu_weight = target_local.flatten().cpu()
 
             dtype = meta["dtype"]
-            cpu_buffer = self._consolidated_cpu_weights[layer_idx][dtype]
+            cpu_buffer = self._writable_cpu_buffer(layer_idx, dtype)
             offset = meta["offset"]
             numel = meta["numel"]
             cpu_buffer[offset : offset + numel].copy_(gpu_weight)
@@ -2575,6 +2571,34 @@ class LayerwiseOffloadManager:
         if src.device.type == "cuda" and not src.is_contiguous():
             src = src.contiguous()
         dest.copy_(src)
+
+    def _writable_cpu_buffer(self, layer_idx: int, dtype: torch.dtype) -> torch.Tensor:
+        """Detach shared weights before any refit, LoRA or device writeback."""
+        buffer = self._consolidated_cpu_weights[layer_idx][dtype]
+        key = (layer_idx, dtype)
+        if key not in self._shared_cpu_weights:
+            return buffer
+
+        # The shared lease still belongs to its last tensor view. Book a new
+        # allowance for the private copy; when there is no headroom, a pageable
+        # copy preserves isolation without overrunning the pin budget.
+        nbytes = buffer.numel() * buffer.element_size()
+        pin = self._pin_budget.request(
+            component_name=self._pin_component_name, weight_bytes=nbytes
+        )
+        if pin:
+            try:
+                private = _pinned_empty(buffer.numel(), dtype=dtype)
+            except Exception:
+                self._pin_budget.release(nbytes)
+                raise
+            self._pin_budget.track_storage(private.untyped_storage())
+        else:
+            private = torch.empty(buffer.numel(), dtype=dtype)
+        private.copy_(buffer)
+        self._consolidated_cpu_weights[layer_idx][dtype] = private
+        self._shared_cpu_weights.remove(key)
+        return private
 
     @torch.compiler.disable
     def update_cpu_weights(
@@ -2693,7 +2717,7 @@ class LayerwiseOffloadManager:
             else:
                 offset = meta["offset"]
                 numel = meta["numel"]
-                cpu_buffer = self._consolidated_cpu_weights[layer_idx][dtype]
+                cpu_buffer = self._writable_cpu_buffer(layer_idx, dtype)
                 self._issue_host_copy(
                     cpu_buffer[offset : offset + numel], src.flatten()
                 )
