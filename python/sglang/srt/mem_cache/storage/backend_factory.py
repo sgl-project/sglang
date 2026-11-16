@@ -3,16 +3,13 @@
 
 import importlib
 import logging
-from typing import TYPE_CHECKING, Any, Dict
+from typing import Any, Dict
 
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorage,
     HiCacheStorageConfig,
     _maybe_wrap_hicache_storage_failure_injector,
 )
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
