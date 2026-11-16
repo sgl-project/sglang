@@ -664,15 +664,21 @@ accessible from every node. The example below runs all three on a single machine
 
 3. Launch Router
 
-    The router command requires the `sglang-router` package. It is pre-installed in the Docker image; if you installed
-    SGLang from source and do not have it yet, run `pip install sglang-router` first.
+    The router is the `sgl-router` binary. It is pre-installed in the Docker image at `/usr/local/bin/sgl-router`; if you
+    installed SGLang from source, build it from the `sgl-router` directory of the SGLang repository (this needs a Rust
+    toolchain, e.g., from [rustup](https://rustup.rs)) and put it on your `PATH`:
 
     ```bash Command
-    python3 -m sglang_router.launch_router \
-        --pd-disaggregation \
-        --policy cache_aware \
-        --prefill http://127.0.0.1:30001 8995 \
-        --decode http://127.0.0.1:30002 \
+    cd sgl-router
+    cargo build --release --bin sgl-router
+    cp target/release/sgl-router /usr/local/bin/
+    ```
+
+    ```bash Command
+    sgl-router \
+        --model-id meta-llama/Llama-3.1-8B-Instruct \
+        --no-tokenizer \
+        --worker-urls http://127.0.0.1:30001 http://127.0.0.1:30002 \
         --host 127.0.0.1 \
         --port 30000
     ```
