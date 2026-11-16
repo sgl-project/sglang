@@ -32,13 +32,11 @@
 /python/sglang/srt/entrypoints/anthropic @JustinTong0323
 /python/sglang/srt/entrypoints/openai @JustinTong0323
 /python/sglang/srt/entrypoints/engine_score_mixin.py @sundar24295s @fortunecookiee
-/python/sglang/srt/entrypoints/grpc_server.py @CatherineSue @slin1237
 /python/sglang/srt/entrypoints/openai/serving_decisions.py @sundar24295s @fortunecookiee
 /python/sglang/srt/entrypoints/openai/serving_embedding.py @JustinTong0323 @sundar24295s @fortunecookiee
 /python/sglang/srt/entrypoints/openai/serving_score.py @sundar24295s @fortunecookiee
 /python/sglang/srt/eplb @fzyzcjy @ch-wan @xutizhou
 /python/sglang/srt/function_call @JustinTong0323
-/python/sglang/srt/grpc @CatherineSue @slin1237
 /python/sglang/srt/hardware_backend/mlx @yeahdongcn
 /python/sglang/srt/hardware_backend/musa @yeahdongcn
 /python/sglang/srt/hardware_backend/npu @ping1jing2 @iforgetmyname @whybeyoung
@@ -93,17 +91,6 @@
 /sgl-router/src/policies @sherlockwu @ShangmingCai @Bo-Vincent
 /sgl-router/src/workers @sherlockwu @AMD-yanfeiwang
 /sgl-router/src/protocol @sherlockwu @whybeyoung
-/sgl-model-gateway @slin1237 @CatherineSue
-/sgl-model-gateway/benches @slin1237
-/sgl-model-gateway/bindings/python @CatherineSue @key4ng @slin1237
-/sgl-model-gateway/e2e_test @CatherineSue @key4ng
-/sgl-model-gateway/examples/wasm @slin1237
-/sgl-model-gateway/src/config @slin1237
-/sgl-model-gateway/src/core @slin1237
-/sgl-model-gateway/src/policies @slin1237 @ByronHsu
-/sgl-model-gateway/src/routers @CatherineSue @key4ng @slin1237
-/sgl-model-gateway/src/wasm @slin1237
-/sgl-model-gateway/examples/wasm @slin1237
 /test/registered/prefill_only @sundar24295s @fortunecookiee
 /test/manual/prefill_only @sundar24295s @fortunecookiee
 /benchmark/prefill_only @sundar24295s @fortunecookiee

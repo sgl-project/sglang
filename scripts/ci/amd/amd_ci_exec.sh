@@ -36,6 +36,12 @@ if [[ "${GPU_FAMILY}" == "mi35x" ]]; then
   ENV_MAP[GPU_ARCHS]="gfx950"
 fi
 
+# The download-sgl-router action puts the binary in the workspace, which the
+# container mounts at /sglang-checkout.
+if [[ -n "${SGLANG_TEST_PD_ROUTER_BINARY:-}" && -n "${GITHUB_WORKSPACE:-}" ]]; then
+  ENV_MAP[SGLANG_TEST_PD_ROUTER_BINARY]="/sglang-checkout${SGLANG_TEST_PD_ROUTER_BINARY#"${GITHUB_WORKSPACE}"}"
+fi
+
 # Parse -w/--workdir and -e ENV=VAL
 while [[ $# -gt 0 ]]; do
   case "$1" in
