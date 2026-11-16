@@ -10,7 +10,7 @@ import torch
 
 import sglang.srt.model_loader.loader as loader_mod
 from sglang.srt.configs.load_config import LoadConfig
-from sglang.srt.model_loader.loader import DefaultModelLoader
+from sglang.srt.model_loader.loader import DefaultModelLoader, ModelOptModelLoader
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -256,6 +256,26 @@ class TestDefaultModelLoader(CustomTestCase):
                     resolved_source=resolved_source,
                     startup_prefetch_started=True,
                     startup_prefetch_active=True,
+                )
+
+
+class TestModelOptLoaderSelection(CustomTestCase):
+    def test_every_modelopt_quantization_selects_the_modelopt_loader(self):
+        """A pre-quantized checkpoint under any ModelOpt quantization value must
+        load through ModelOptModelLoader, not fall through to the default loader."""
+        for quantization in (
+            "modelopt",
+            "modelopt_fp8",
+            "modelopt_fp4",
+            "modelopt_mixed",
+        ):
+            with self.subTest(quantization=quantization):
+                model_config = SimpleNamespace(
+                    quantization=quantization, _is_already_quantized=lambda: True
+                )
+                self.assertIsInstance(
+                    loader_mod.get_model_loader(LoadConfig(), model_config),
+                    ModelOptModelLoader,
                 )
 
 

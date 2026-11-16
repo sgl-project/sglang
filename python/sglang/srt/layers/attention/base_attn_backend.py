@@ -110,6 +110,14 @@ class AttentionBackend(ABC):
     decode_attention_backend_str: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
+    # Bind-time cap on the window sub-pools one runner's layers attend through.
+    max_window_sub_pools: int = 1
+
+    def window_capacity_children(self) -> list:
+        """The backends a wrapper runs its layers' attention through, whose
+        window capacity binds in its place; none for a leaf."""
+        return []
+
     # Whether target verify runs correctly under decode context parallelism:
     # each rank reads its shard of the DCP-widened pages with the global causal
     # bound and returns its LSE for the cross-rank merge.

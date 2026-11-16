@@ -73,6 +73,24 @@ class TestRouteQuant(CustomTestCase):
         self.assertIs(moe_topk_sum(x, out), out)
         self.assertTrue(torch.equal(out, x.float().sum(1).to(torch.bfloat16)))
 
+    def test_moe_topk_sum_scale_and_block_width(self):
+        """Routed scaling lands before the bf16 store, and a narrower block (the decode width,
+        grid = ceil(K/8/threads) x M) sums in the same order."""
+        torch.manual_seed(0)
+        x = torch.randn(8, TOPK, 2560, device="cuda", dtype=torch.bfloat16)
+        ref = (x.float().sum(1) * 1.3).to(torch.bfloat16)
+        wide = moe_topk_sum(
+            x, torch.empty(8, 2560, device="cuda", dtype=torch.bfloat16), scale=1.3
+        )
+        narrow = moe_topk_sum(
+            x,
+            torch.empty(8, 2560, device="cuda", dtype=torch.bfloat16),
+            scale=1.3,
+            threads=64,
+        )
+        self.assertTrue(torch.equal(wide, ref))
+        self.assertTrue(torch.equal(narrow, wide))
+
     def test_moe_route_and_quant(self):
         torch.manual_seed(1)
         scores = torch.randn(8, NUM_EXPERTS, device="cuda", dtype=torch.bfloat16)
