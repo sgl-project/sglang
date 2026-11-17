@@ -361,8 +361,17 @@ def _validate_unified_draft_kv(server_args: Any) -> None:
             "single pipeline stage",
         ),
         (
-            cfg.disaggregation_mode != "null",
-            f"PD disaggregation (--disaggregation-mode {cfg.disaggregation_mode})",
+            # A prefill server stores and loads the draft rows as a server
+            # that also decodes does, and sends the decode server what it
+            # holds. A decode server's cache restores and writes pages on
+            # paths of its own, where the draft KV was not verified.
+            cfg.disaggregation_mode == "decode",
+            "HiCache on a PD decode server (--disaggregation-mode decode)",
+        ),
+        (
+            # A prefill server that may become a decode server.
+            cfg.enable_pd_role_switch,
+            "runtime PD role switching (--enable-pd-role-switch)",
         ),
         (cfg.enable_streaming_session, "--enable-streaming-session"),
         (cfg.enable_session_radix_cache, "--enable-session-radix-cache"),

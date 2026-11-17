@@ -32,13 +32,13 @@ from sglang.srt.mem_cache.hicache_storage import HiCacheFile, HiCacheStorageConf
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
-from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import HostPoolGroup
 from sglang.srt.mem_cache.kv_cache_builder import (
     build_kv_cache,
     check_unified_hicache_draft,
     maybe_register_hicache_draft,
 )
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
+from sglang.srt.mem_cache.pool_host import HostPoolGroup
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode, HiCacheDraftPlan
@@ -271,7 +271,10 @@ class TestUnifiedKeySchemeSpeculative(CustomTestCase):
             # registration, which comes after the weights are loaded.
             "--pp-size > 1": dict(pp_size=2),
             "prefill context parallelism": dict(attn_cp_size=2, enable_prefill_cp=True),
-            "PD disaggregation": dict(disaggregation_mode="prefill"),
+            "PD decode server": dict(disaggregation_mode="decode"),
+            "--enable-pd-role-switch": dict(
+                disaggregation_mode="prefill", enable_pd_role_switch=True
+            ),
         }
         for message, overrides in cases.items():
             for ring_off_reason in ("the draft is not MLA", None):
@@ -309,6 +312,21 @@ class TestUnifiedKeySchemeSpeculative(CustomTestCase):
             hicache_storage_backend="mooncake",
             **dflash,
         )
+        self.assertEqual(
+            resolution_result(args, "hicache_storage_draft_id"), "org/dflash@main"
+        )
+
+    def test_a_pd_prefill_server_stores_the_dflash_draft_pool(self):
+        # A prefill server fills, stores and loads the draft pool for the
+        # prompt as a server that also decodes does, and the KV transfer hands
+        # the decode server what the pool holds.
+        args = _resolve_through_speculative(
+            patches=_dflash_with_ring("the draft is not MLA"),
+            speculative_algorithm="DFLASH",
+            speculative_draft_model_path="org/dflash",
+            disaggregation_mode="prefill",
+        )
+        self.assertFalse(resolution_result(args, "speculative_dflash_draft_kv_ring"))
         self.assertEqual(
             resolution_result(args, "hicache_storage_draft_id"), "org/dflash@main"
         )
@@ -457,7 +475,10 @@ class TestUnifiedKeySchemeDraftKV(CustomTestCase):
             "random weights": dict(speculative_draft_load_format="dummy"),
             "random weights ": dict(load_format="dummy"),
             "prefill context parallelism": dict(attn_cp_size=2, enable_prefill_cp=True),
-            "PD disaggregation": dict(disaggregation_mode="prefill"),
+            "PD decode server": dict(disaggregation_mode="decode"),
+            "--enable-pd-role-switch": dict(
+                disaggregation_mode="prefill", enable_pd_role_switch=True
+            ),
             "--enable-streaming-session": dict(enable_streaming_session=True),
             "--enable-session-radix-cache": dict(enable_session_radix_cache=True),
         }
@@ -481,6 +502,15 @@ class TestUnifiedKeySchemeDraftKV(CustomTestCase):
         self._resolve(
             hicache_storage_key_scheme="rank-suffix", enable_streaming_session=True
         )
+
+    def test_a_pd_prefill_server_stores_draft_kv(self):
+        # The draft rows of the prompt are written by the prefill forward on a
+        # prefill server too; the decode server keeps no HiCache of its own.
+        args = self._resolve(disaggregation_mode="prefill")
+        self.assertEqual(resolution_result(args, "hicache_storage_draft_id"), "bundled")
+        # Also behind pipeline parallelism: the packed draft layer follows the
+        # target's layers on the final stage.
+        self._resolve(disaggregation_mode="prefill", pp_size=2)
 
 
 class TestUnifiedDraftModeGate(CustomTestCase):

@@ -94,10 +94,10 @@ Speculative decoding:
   `--hicache-storage-draft-id` when instances mount the same draft at
   different paths. A page is a hit only with its draft chunk; a reader with
   another draft misses on that chunk alone and adds its own. Refused at
-  startup with prefill context parallelism, PD disaggregation, streaming
-  sessions, the session radix cache, `buffer_only` host memory, multi-layer
-  EAGLE, a draft loaded with random weights, or
-  `SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND=1`.
+  startup with prefill context parallelism, HiCache on a PD decode server,
+  runtime PD role switching, streaming sessions, the session radix cache,
+  `buffer_only` host memory, multi-layer EAGLE, a draft loaded with random
+  weights, or `SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND=1`.
 - DFLASH without its draft KV ring keeps the draft KV in a host pool of its
   own. Its pages are stored as `{page}_{draft digest}_D0-{n}[_H{g}]`: all
   draft layers of a head group in one object, cut by
@@ -106,9 +106,14 @@ Speculative decoding:
   chunks; a deployment without the draft reads the target chunks alone.
   The draft digest names the draft as for NEXTN-style MTP: by its path and
   revision, or by `--hicache-storage-draft-id`. Refused at startup with
-  pipeline parallelism, prefill context parallelism, PD disaggregation,
-  streaming sessions, the session radix cache, `buffer_only` host memory, or
-  a draft loaded with random weights.
+  pipeline parallelism, prefill context parallelism, HiCache on a PD decode
+  server, runtime PD role switching, streaming sessions, the session radix
+  cache, `buffer_only` host memory, or a draft loaded with random weights.
+- Under PD disaggregation the store belongs to the prefill server: it writes
+  and reads the target and draft chunks of the prompt's pages as a server
+  that also decodes does, and the KV transfer hands the decode server the
+  draft rows together with the target's, whether they were computed or read
+  from L3. The decode server keeps no HiCache with these algorithms.
 - Algorithms that keep no draft KV in the host cache (DFLASH with its draft KV
   ring; FROZEN_KV_MTP, whose Gemma 4 targets are composite caches and stay
   unsupported for that reason) store exactly the objects of a deployment
