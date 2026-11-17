@@ -268,6 +268,15 @@ def _build_deepseek_v4_device_pool_group(
 
     if isinstance(kvcache.c4_kv_pool, HiSparseC4DevicePool):
         raise ValueError("The direct external linker does not support HiSparse.")
+    # TODO(alphabetc1): store these regions as HiCache does.
+    for pool in (kvcache, *mtp_draft_device_pools):
+        regions = pool.extra_host_regions()
+        if regions:
+            raise ValueError(
+                "The direct external linker does not store the pages a DeepSeek V4 "
+                "pool keeps beside its compressed-KV layout yet: "
+                f"{[region.pool_name for region in regions]}."
+            )
 
     infos = _dsv4_pool_infos(kvcache)
     # Encoder SWA replay keeps the target window per request; the draft SWA is
