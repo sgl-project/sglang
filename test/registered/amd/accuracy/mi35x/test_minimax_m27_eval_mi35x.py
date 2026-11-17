@@ -31,6 +31,7 @@ register_amd_ci(
     est_time=5400,
     suite="nightly-amd-8-gpu-mi35x-minimax-m27",
     nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 INVALID = -9999999

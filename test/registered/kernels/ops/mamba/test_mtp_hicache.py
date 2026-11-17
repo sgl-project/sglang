@@ -30,7 +30,7 @@ from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=30, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 
@@ -126,12 +126,14 @@ def test_hicache_restores_all_mtp_kv_and_conv_state(
     allocator = SimpleNamespace(alloc=lambda n: None, free=lambda ids: None)
     params = CacheInitParams(
         disable=False,
-        req_to_token_pool=cast(
-            ReqToTokenPool,
-            SimpleNamespace(mamba_pool=target_mamba, mamba_allocator=allocator),
-        ),
+        req_to_token_pool=cast(ReqToTokenPool, SimpleNamespace()),
         token_to_kv_pool_allocator=cast(
-            BaseTokenToKVPoolAllocator, SimpleNamespace(swa_attn_allocator=allocator)
+            BaseTokenToKVPoolAllocator,
+            SimpleNamespace(
+                swa_attn_allocator=allocator,
+                state=SimpleNamespace(pool=target_mamba, slots=allocator),
+                state_slots=allocator,
+            ),
         ),
         page_size=16,
         mtp_draft_device_pools=drafts,
@@ -162,8 +164,6 @@ def test_hicache_restores_all_mtp_kv_and_conv_state(
         full_layer_mapping={layer: i for i, layer in enumerate(full_layers)},
         swa_layer_mapping={layer: i for i, layer in enumerate(swa_layers)},
         start_layer=0,
-        page_size=16,
-        tp_group=None,
         load_cache_event=None,
         storage_backend=None,
     )

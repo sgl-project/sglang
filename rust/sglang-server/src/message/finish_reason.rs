@@ -109,6 +109,17 @@ impl FinishReason {
             _ => None,
         }
     }
+
+    /// Rewrite each `from` in an abort's message to `to`; any other reason is
+    /// left alone.
+    pub fn replace_in_abort_message(&mut self, from: &str, to: &str) {
+        if let FinishReason::Known(FinishKind::Abort(abort)) = self
+            && let Some(message) = &mut abort.message
+            && message.contains(from)
+        {
+            *message = message.replace(from, to);
+        }
+    }
 }
 
 #[cfg(test)]

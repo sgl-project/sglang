@@ -7,6 +7,7 @@ from functools import cache
 import torch
 import torch.nn as nn
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.diffusion.sites.quality_gate import QualityGatedFusion
 
 
@@ -61,6 +62,7 @@ def try_hunyuan_qknorm(
     if qk_rmsnorm_cute is None:
         return None
 
+    enable_pdl = current_arch().supports_pdl
     q_out = torch.empty_like(q)
     k_out = torch.empty_like(k)
     q_shape = q.shape
@@ -70,13 +72,13 @@ def try_hunyuan_qknorm(
         q_weight,
         q_out.reshape(-1, q_shape[-2], q_shape[-1]),
         eps,
-        enable_pdl=True,
+        enable_pdl=enable_pdl,
     )
     qk_rmsnorm_cute(
         k.reshape(-1, k_shape[-2], k_shape[-1]),
         k_weight,
         k_out.reshape(-1, k_shape[-2], k_shape[-1]),
         eps,
-        enable_pdl=True,
+        enable_pdl=enable_pdl,
     )
     return q_out, k_out

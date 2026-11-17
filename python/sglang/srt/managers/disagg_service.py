@@ -3,12 +3,8 @@
 import logging
 import os
 
-from sglang.srt.disaggregation.utils import (
-    DisaggregationMode,
-    KVClassType,
-    TransferBackend,
-    get_kv_class,
-)
+from sglang.srt.disaggregation.mode import DisaggregationMode
+from sglang.srt.disaggregation.utils import KVClassType, TransferBackend, get_kv_class
 from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
