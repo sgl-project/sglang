@@ -19,6 +19,12 @@ The key mechanisms of the implementation include:
 * **Decoupled Sync/Async Logic in the Event Loop:** The scheduler uses `async_send` in `_pp_send_pyobj_to_next_stage`. Instead of waiting for a transfer to complete, it returns a `P2PWork` handle. The actual synchronization (`P2PWork.work.wait()`) is deferred until `_pp_commit_comm_work` is called, allowing the CPU to perform other work—like scheduling the next batch or processing metadata—while data is in flight.
 * **Multi-Stream Execution:** In addition to the main `default_stream`, which serves as the synchronization stream, SGLang utilizes dedicated `forward_stream` and `copy_stream` to execute forward pass GPU computation and Data-to-Host (D2H) memory transfers separately for better overlapping. While `_pp_launch_batch` is executing the current micro-batch on the GPU for the current stage, the CPU processes the previous micro-batch's results using `_pp_process_batch_result`.
 
+## Balancing decode microbatches
+
+When requests finish at different lengths, a few microbatches can retain most of the active requests. Set `--enable-pp-auto-balance` to redistribute those requests across pipeline slots. The scheduler moves requests after their previous forward completes and keeps their KV cache in place. Each receiving slot respects `--pp-max-micro-batch-size`.
+
+This option is disabled by default. It supports colocated autoregressive generation with PP greater than one. LoRA, HiSparse, diffusion models, and speculative decoding require the default scheduler.
+
 ## Guidance about Dynamic Chunking
 
 ### Why Dynamic Chunking

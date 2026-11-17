@@ -18,6 +18,7 @@ from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.mm_utils import strip_mm_features_for_pp_relay
 from sglang.srt.managers.overlap_utils import RelayPayload
+from sglang.srt.managers.pp_balance import plan_decode_transfers
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
@@ -129,6 +130,59 @@ class PPBatchMetadata:
 
 
 class SchedulerPPMixin:
+    # Handed-off rows keep their KV until the destination retires its forward.
+    _pp_incoming: tuple | list[Optional[ScheduleBatch]] = ()
+    _pp_balance_slot: int = 0
+
+    def _pp_balance_decode(
+        self: Scheduler, slot: int, running: ScheduleBatch
+    ) -> ScheduleBatch:
+        incoming = self._pp_incoming[slot]
+        if incoming is not None:
+            if running.is_empty():
+                running = incoming
+            else:
+                running.merge_batch(incoming)
+            self._pp_incoming[slot] = None
+
+        if running.batch_size() < 2:
+            return running
+        loads = []
+        for resident, launched, pending in zip(
+            self.running_mbs, self.mbs, self._pp_incoming
+        ):
+            size = resident.batch_size()
+            # Reserve space for prefills launched but not yet merged on this slot.
+            if (
+                launched is not None
+                and launched is not resident
+                and launched.forward_mode.is_extend()
+            ):
+                size += launched.batch_size()
+            if pending is not None:
+                size += pending.batch_size()
+            loads.append(size)
+        loads[slot] = running.batch_size()
+        transfers = plan_decode_transfers(
+            loads, slot, get_parallel().pp_max_micro_batch_size
+        )
+        remaining = loads[slot]
+        for target, count in enumerate(transfers):
+            if count:
+                rows = running.select_decode_rows(
+                    list(range(remaining - count, remaining))
+                )
+                remaining -= count
+                pending = self._pp_incoming[target]
+                if pending is None:
+                    self._pp_incoming[target] = rows
+                else:
+                    pending.merge_batch(rows)
+        if remaining < loads[slot]:
+            running.filter_batch(keep_indices=list(range(remaining)))
+            running.batch_is_full = False
+        return running
+
     # Gated PP+spec relay flow. Class-level default so schedulers that never
     # ran init_pp_loop_state (plain TP, unit-test doubles) read False;
     # init_pp_loop_state overwrites it per instance.
@@ -167,9 +221,14 @@ class SchedulerPPMixin:
         ====================================================================
         """
         self.init_pp_loop_state()
+        if get_parallel().enable_pp_auto_balance:
+            if not self.is_generation:
+                raise ValueError("PP auto balance requires a generative model.")
+            self._pp_incoming = [None] * self.pp_loop_size
         while True:
             server_is_idle = True
             for mb_id in range(self.pp_loop_size):
+                self._pp_balance_slot = mb_id
                 self.increment_scheduler_iterations()
                 self.running_batch = self.running_mbs[mb_id]
                 self.last_batch = self.last_mbs[mb_id]
@@ -193,6 +252,10 @@ class SchedulerPPMixin:
                             running_batch=self.running_batch,
                             last_batch=self.last_batch,
                         )
+                        if self._pp_incoming:
+                            # The retired prefill may now belong to several slots.
+                            # Consume it once even if this slot goes idle.
+                            self.last_mbs[mb_id] = None
                         self.running_batch = plan.running_batch
                         batch = plan.batch_to_run
                     self.mbs[mb_id] = batch
@@ -654,7 +717,11 @@ class SchedulerPPMixin:
 
     def _pp_retract_microbatches(self: Scheduler) -> None:
         """Retract the requests of every micro-batch, none of them in flight."""
-        self._retract_batches(list(zip(self.running_mbs, self.last_mbs)))
+        batches = list(zip(self.running_mbs, self.last_mbs))
+        batches.extend((b, None) for b in self._pp_incoming if b is not None)
+        self._retract_batches(batches)
+        if self._pp_incoming:
+            self._pp_incoming = [None] * self.pp_loop_size
         for mb_id in range(self.pp_loop_size):
             self.last_mbs[mb_id] = None
         self.last_batch = None
