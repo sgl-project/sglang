@@ -19,7 +19,7 @@ from sglang.kernels.jit.utils import (
     load_jit,
     make_cpp_args,
 )
-from sglang.kernels.ops.communication.all_reduce_residual import _COMM_MAP
+from sglang.kernels.ops.communication.all_reduce_residual import get_comm
 from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
@@ -49,9 +49,7 @@ def _jit_module(n_local: int, world_size: int, block: int) -> Module:
 def _moe_front_all_gather_op(
     world_size: int, local: torch.Tensor, out: torch.Tensor, block: int
 ) -> None:
-    _jit_module(local.shape[1], world_size, block).run(
-        _COMM_MAP[world_size], local, out
-    )
+    _jit_module(local.shape[1], world_size, block).run(get_comm(world_size), local, out)
 
 
 def moe_front_all_gather(
