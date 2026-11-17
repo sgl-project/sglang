@@ -1575,6 +1575,7 @@ class TestKvShardedCpTpPrefillPairing(unittest.TestCase):
         prefill.state_tp_size = n
         prefill.kv_shard_state_peer_only = True
         prefill.customized_info_enabled = False
+        prefill.exchange_aux_item_lens = False
         prefill.is_mla_backend = prefill.is_hybrid_mla_backend = False
         prefill.kv_args = SimpleNamespace(engine_rank=rank)
         return prefill
@@ -1643,6 +1644,7 @@ class TestKvShardedCpTpPrefillPairing(unittest.TestCase):
         prefill.state_layout_rejections = {}
         prefill.state_strides_validated = set()
         prefill.failure_records = {}
+        prefill._deferred_ack_targets = {}
         prefill._staging_outstanding = defaultdict(int)
         prefill.request_status = {42: KVPoll.Transferring}
         prefill.req_to_decode_prefix_len = {42: 0}
