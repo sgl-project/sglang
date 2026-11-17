@@ -61,12 +61,12 @@ RUST_SERVER_IGNORED_BY_DESIGN: Dict[str, str] = {
     "SGLANG_RUST_SERVER": "The frontend selector itself.",
     # Python's own process, thread and event-loop plumbing.
     "rl_on_policy_target": "Puts Python's fast image processor on CPU and caps its workers; the Rust resize runs on CPU.",
-    "mm_feature_transport": "Python's feature transport; Rust pipelines pick their own.",
+    "mm_feature_transport": "CPU transport is honored; explicit GPU transports are refused (rust_server_unsupported_args).",
     "trust_remote_code": "Rust tokenizes with tokenizer.json; no tokenizer code is loaded.",
     "disable_radix_cache": "Python's precondition for input_embeds requests; Rust has no input_embeds field and drops it like any unknown field.",
     "enable_dp_attention_local_control_broadcast": "Fans Python's control requests out to DP ranks; each Rust listener serves its own rank.",
     # The Python HTTP server.
-    "grpc_worker_threads": "Python gRPC server thread pool.",
+    "grpc_worker_threads": "Native Rust uses its frontend worker pool; explicit SGLANG_GRPC_WORKER_THREADS is refused (rust_server_unsupported_args).",
     # Routes the Rust server does not serve: their clients get a 404.
     "enable_mis": "/v1/decisions is not served.",
     "dllm_algorithm": "/v1/decisions is not served.",
@@ -128,6 +128,7 @@ RUST_SERVER_HANDLED_ELSEWHERE: Dict[str, str] = {
     "SGLANG_OLLAMA_GENERATE_ROUTE": "Refused when explicitly configured (rust_server_unsupported_args).",
     "SGLANG_OLLAMA_TAGS_ROUTE": "Refused when explicitly configured (rust_server_unsupported_args).",
     "SGLANG_OLLAMA_SHOW_ROUTE": "Refused when explicitly configured (rust_server_unsupported_args).",
+    "SGLANG_GRPC_WORKER_THREADS": "Refused when explicitly configured (rust_server_unsupported_args).",
     "grammar_backend": "Per-turn Beam grammar is refused while scheduler grammar remains supported (rust_server_unsupported_args).",
     "context_length": "Passed as model_config.context_len (_build_server_args).",
     "language_model_only": "Passed as model_config.is_multimodal (_build_server_args).",

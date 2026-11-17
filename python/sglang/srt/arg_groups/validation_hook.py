@@ -193,6 +193,7 @@ RUST_SERVER_UNSUPPORTED_ENVS = (
     "SGLANG_OLLAMA_GENERATE_ROUTE",
     "SGLANG_OLLAMA_TAGS_ROUTE",
     "SGLANG_OLLAMA_SHOW_ROUTE",
+    "SGLANG_GRPC_WORKER_THREADS",
 )
 
 
@@ -220,6 +221,8 @@ def rust_server_unsupported_args(
             is_set = value != default
         if is_set:
             offending.append(_field_to_cli_name(name))
+    if cfg.mm_feature_transport in ("cuda_ipc", "cuda_vmm"):
+        offending.append(f"--mm-feature-transport {cfg.mm_feature_transport}")
     if cfg.tool_call_parser == "beam" and cfg.grammar_backend in (None, "xgrammar"):
         offending.append("--tool-call-parser beam with --grammar-backend xgrammar")
     # The Rust chat route applies only each tool's own `strict`.

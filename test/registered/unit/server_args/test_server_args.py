@@ -5945,6 +5945,18 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
                 self._resolve(args, rust_server=False)
         self._resolve(["--grammar-backend", "xgrammar"])
 
+    def test_gpu_feature_transport_is_not_silently_replaced(self):
+        for transport in ("cuda_ipc", "cuda_vmm"):
+            with self.subTest(transport=transport):
+                args = prepare_server_args(
+                    ["--model-path", "dummy", "--mm-feature-transport", transport]
+                )
+                self.assertIn(
+                    f"--mm-feature-transport {transport}",
+                    validation_hook.rust_server_unsupported_args(args),
+                )
+        self._resolve(["--mm-feature-transport", "cpu"])
+
     def test_supported_environment_is_not_refused(self):
         with envs.SGLANG_LOG_REQUEST_HEADERS.override(("x-request-id",)):
             self._resolve([])
