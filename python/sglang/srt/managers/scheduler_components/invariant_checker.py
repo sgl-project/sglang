@@ -82,8 +82,9 @@ class SchedulerInvariantChecker:
     # Whether the idle pool checks skip this idle iteration.
     get_skip_idle_pool_checks: Callable[[], bool] = field(default=lambda: False)
     reporter: FailureReporter = field(default_factory=FailureReporter)
-    # Requests awaiting their final output; a sent one leaves at the next idle check.
-    awaiting_output: Set[Req] = field(default_factory=set)
+    # Requests that have not both exited and sent their final output; an ended
+    # one leaves at the next idle check.
+    unended: Set[Req] = field(default_factory=set)
     recent_busy_msgs: Deque[str] = field(
         default_factory=lambda: deque(maxlen=BUSY_MEM_CHECK_LOG_RING_SIZE)
     )
@@ -115,7 +116,12 @@ class SchedulerInvariantChecker:
             StateCheck(
                 phase=CheckPhase.IDLE,
                 when=envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get,
-                fn=self._check_unsent_outputs,
+                fn=self._check_ended_requests,
+            ),
+            StateCheck(
+                phase=CheckPhase.IDLE,
+                when=envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get,
+                fn=self._check_listed_requests_unfinished,
             ),
             StateCheck(
                 phase=CheckPhase.IDLE,
@@ -633,7 +639,7 @@ class SchedulerInvariantChecker:
 
     def _check_request_lists(self, batch: ScheduleBatch) -> None:
         """At the launch of `batch`: each live request is in exactly one list,
-        one that matches its state."""
+        the one its `owner_list` names, and that list matches its state."""
         lists = self.get_request_lists()
         owners: Dict[Req, ListKind] = {}
         for kind, reqs in lists.items():
@@ -642,6 +648,13 @@ class SchedulerInvariantChecker:
                     self.reporter.report(
                         Severity.CORRUPTION,
                         f"Request {req.rid} is in both {owners[req].name} and {kind.name}",
+                    )
+                if req.owner_list is not reqs:
+                    owner = req.owner_list
+                    self.reporter.report(
+                        Severity.CORRUPTION,
+                        f"Request {req.rid} is in {kind.name} but owned by "
+                        f"{None if owner is None else owner.kind.name}",
                     )
                 owners[req] = kind
 
@@ -680,20 +693,41 @@ class SchedulerInvariantChecker:
         )
 
     def expect_output(self, req: Req) -> None:
-        """Record that `req`, now kept by the scheduler, owes a final output."""
+        """Record that `req`, now kept by the scheduler, owes a final output and
+        an exit through the retirer."""
         if envs.SGLANG_ENABLE_RUNNING_REQS_CHECK.get():
-            self.awaiting_output.add(req)
+            self.unended.add(req)
 
-    def _check_unsent_outputs(self) -> None:
-        """At idle, every request the scheduler kept has sent its final output or
-        is still in a list: idle leaves some lists full (held, parked, deferred)."""
-        self.awaiting_output = {
-            req for req in self.awaiting_output if req.send_via is None
+    def _check_ended_requests(self) -> None:
+        """At idle, every request the scheduler kept is in a list (held, parked,
+        deferred, offloading) or has sent its final output and exited through
+        the retirer."""
+        self.unended = {
+            req for req in self.unended if req.send_via is None or req.exit_via is None
         }
         listed = {req for reqs in self.get_request_lists().values() for req in reqs}
+        unlisted = self.unended - listed
         self._raise_if_any(
-            self.awaiting_output - listed,
+            {req for req in unlisted if req.send_via is None},
             "Requests in no list that never sent their final output",
+        )
+        self._raise_if_any(
+            {req for req in unlisted if req.exit_via is None},
+            "Requests in no list that never exited through the retirer",
+        )
+
+    def _check_listed_requests_unfinished(self) -> None:
+        """At idle, no list but DEFERRED holds a finished request; a nonempty
+        PD_RELEASING or PD_OFFLOADING keeps the scheduler from idling."""
+        self._raise_if_any(
+            {
+                req
+                for kind, reqs in self.get_request_lists().items()
+                if kind is not ListKind.DEFERRED
+                for req in reqs
+                if req.finished()
+            },
+            "Requests finished but still in a list at idle",
         )
 
     def _check_batch_consistency(self, batch: ScheduleBatch) -> None:

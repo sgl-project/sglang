@@ -47,6 +47,8 @@ class TritonGDNKernel(LinearAttnKernelBase):
     # The shared chunk kernel writes the fp32 track snapshot; without it, prefix-cache
     # checkpoints fall back to the per-chunk states, rounded to the activation dtype.
     supports_track_state_snapshot: bool = not is_cpu() and not is_npu() and not is_xpu()
+    # The chunk kernel steps slots by the pool's stride(0) in int64.
+    extend_honors_slot_pitch: bool = True
 
     def packed_decode(
         self,
