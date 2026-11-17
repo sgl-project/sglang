@@ -83,7 +83,7 @@ How loading works:
 - The server resolves the checkpoint via `maybe_download_model(model_path, force_diffusers_model=True)` and verifies it contains a `model_index.json` plus the required component subdirectories (`transformer/`, `vae/`).
 - If `text_encoder` / `tokenizer` are not provided as component paths, the pipeline falls back to the default Stage-1 text encoder **`Efficient-Large-Model/gemma-2-2b-it`** (`DEFAULT_SANA_WM_TEXT_ENCODER`).
 - **Pick the path with `--pipeline-class-name`.** The checkpoint's `model_index.json` `_class_name` selects the default pipeline (`SanaWMTwoStagePipeline`). Pin it explicitly to choose: `--pipeline-class-name SanaWMTwoStagePipeline` for the `/v1/videos` paths (§4–5) or `--pipeline-class-name SanaWMRealtimePipeline` for live realtime (§6). Pinning is also required if you point `--model-path` at a bare safetensors file instead of a Diffusers directory.
-- **The Stage-2 LTX-2 refiner** lives under `refiner/` in the checkpoint: `refiner/transformer` (`transformer_2`), `refiner/connectors` (`connectors`), and `refiner/text_encoder` (the Gemma-3 encoder for `text_encoder_2`, whose tokenizer also serves as `tokenizer_2`). The refiner is **optional**: it is skipped (Stage-1-only output) when the env flag `SGLANG_SANA_WM_SKIP_REFINER` (or a `skip_refiner` request extra) is set, or when no `refiner/` is present (`transformer_2` unloaded). On the batch path it runs chunk-wise with `--refiner-chunked` (the official streaming path, default on) or whole-clip without it; on the realtime path the pipeline builds a `SanaWMChunkedRefinerChainStage` only when a refiner is available, and otherwise streams Stage-1 frames.
+- **The Stage-2 LTX-2 refiner** lives under `refiner/` in the checkpoint: `refiner/transformer` (`transformer_2`), `refiner/connectors` (`connectors`), and `refiner/text_encoder` (the Gemma-3 encoder for `text_encoder_2`, whose tokenizer also serves as `tokenizer_2`). The refiner is **optional**: it is skipped (Stage-1-only output) when the env flag `SGLANG_SANA_WM_SKIP_REFINER` (or a `skip_refiner` request extra) is set, or when no `refiner/` is present (`transformer_2` unloaded). On the batch path, the streaming launch (`--streaming`) runs it chunk-wise by default (`--refiner-chunked`; pass `--refiner-chunked false` for whole-clip), and the dense launch without `--streaming` always runs it whole-clip; on the realtime path the pipeline builds a `SanaWMChunkedRefinerChainStage` only when a refiner is available, and otherwise streams Stage-1 frames.
 
 <Note>
 Throughout this cookbook, `<checkpoint>` stands for the appropriate SANA-WM repo id from the table above (or a local materialized Diffusers directory).
@@ -437,7 +437,7 @@ async def run():
 
 Camera trajectories are described by a compact string of comma-separated `<keys>-<frames>` segments, e.g. `"w-100,wd-50,d-30,none-10"`. This is the format accepted by `condition_inputs.action` at init and by `kind: "action"` events.
 
-Parsing rules (`parse_action_string`):
+Parsing rules (`parse_sana_wm_action_string`):
 
 - Each segment is `<keys>-<frames>`; `<frames>` must be a positive integer.
 - `none` means no motion for that span: `none-10` = 10 static frames.
@@ -450,7 +450,7 @@ Parsing rules (`parse_action_string`):
 | `i` / `k` | look (pitch) up / down |
 | `j` / `l` | look (yaw) left / right |
 
-Pose generation (`action_string_to_c2w`):
+Pose generation (`sana_wm_action_to_camera_to_world`):
 
 - **Translation** (`w`/`s`/`a`/`d`) moves at `translation_speed` (default `0.04` world-units/frame).
 - **Rotation** (`i`/`k` pitch, `j`/`l` yaw) turns at `rotation_speed_deg` (default `1.2`°/frame); pitch is clamped to ±85°.

@@ -260,7 +260,7 @@ class UsageInfo(BaseModel):
     # Used to return cached tokens info when --enable-cache-report is set
     prompt_tokens_details: Optional[PromptTokensDetails] = None
     reasoning_tokens: Optional[int] = 0
-    # The OpenAI location of reasoning_tokens; set only when there are some.
+    # The OpenAI location of reasoning_tokens; always set, so 0 means no reasoning.
     completion_tokens_details: Optional[CompletionTokensDetails] = None
 
 
@@ -369,20 +369,6 @@ class BatchResponse(BaseModel):
     metadata: Optional[dict] = None
 
 
-def _migrate_deprecated_dp_rank(values: dict) -> dict:
-    if isinstance(values, dict) and values.get("data_parallel_rank") is not None:
-        import warnings
-
-        warnings.warn(
-            "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        if values.get("routed_dp_rank") is None:
-            values["routed_dp_rank"] = values["data_parallel_rank"]
-    return values
-
-
 class PDRoutingFields(BaseModel):
     """PD and DP routing fields a router may inject into a request."""
 
@@ -464,9 +450,6 @@ class CompletionRequest(PDRoutingFields):
     # Unlimited-OCR v2 reads them as defaults under images_config.
     mm_processor_kwargs: Optional[Dict] = None
 
-    # Deprecated: use routed_dp_rank instead
-    data_parallel_rank: Optional[int] = None
-
     # For request id
     rid: Optional[Union[List[str], str]] = None
     # Extra key for caller-defined request classification
@@ -478,11 +461,6 @@ class CompletionRequest(PDRoutingFields):
 
     # For custom metric labels
     custom_labels: Optional[Dict[str, str]] = None
-
-    @model_validator(mode="before")
-    @classmethod
-    def _handle_deprecated_dp_rank(cls, values):
-        return _migrate_deprecated_dp_rank(values)
 
     @field_validator("max_tokens")
     @classmethod
@@ -626,20 +604,6 @@ class ChatCompletionMessageContentTextPart(BaseModel):
     text: str
 
 
-class ChatCompletionMessageContentThinkingPart(BaseModel):
-    type: Literal["thinking", "reasoning"]
-    thinking: Optional[str] = None
-    text: Optional[str] = None
-
-    @model_validator(mode="after")
-    def validate_payload(self):
-        if (self.thinking is None) == (self.text is None):
-            raise ValueError(
-                "thinking parts require exactly one of 'thinking' or 'text'"
-            )
-        return self
-
-
 class ChatCompletionMessageContentImageURL(BaseModel):
     url: str
     detail: Optional[Literal["auto", "low", "high"]] = "auto"
@@ -756,7 +720,6 @@ class ChatCompletionMessageContentToolReferenceBlock(BaseModel):
 
 ChatCompletionMessageContentPart = Union[
     ChatCompletionMessageContentTextPart,
-    ChatCompletionMessageContentThinkingPart,
     ChatCompletionMessageContentImagePart,
     ChatCompletionMessageContentVideoPart,
     ChatCompletionMessageContentAudioPart,
@@ -868,30 +831,10 @@ class ChatCompletionMessageGenericParam(BaseModel):
             return v_lower
         raise ValueError("'role' must be a string")
 
-    @model_validator(mode="after")
-    def validate_thinking_parts_role(self):
-        if self.role != "assistant" and isinstance(self.content, list):
-            for part in self.content:
-                if isinstance(part, ChatCompletionMessageContentThinkingPart):
-                    raise ValueError(
-                        "thinking content parts are only valid in assistant messages"
-                    )
-        return self
-
 
 class ChatCompletionMessageUserParam(BaseModel):
     role: Literal["user"]
     content: Union[str, List[ChatCompletionMessageContentPart]]
-
-    @model_validator(mode="after")
-    def validate_thinking_parts_role(self):
-        if isinstance(self.content, list):
-            for part in self.content:
-                if isinstance(part, ChatCompletionMessageContentThinkingPart):
-                    raise ValueError(
-                        "thinking content parts are only valid in assistant messages"
-                    )
-        return self
 
 
 ChatCompletionMessageParam = Union[
@@ -1194,9 +1137,6 @@ class ChatCompletionRequest(PDRoutingFields):
     # Priority for the request
     priority: Optional[int] = None
 
-    # Deprecated: use routed_dp_rank instead
-    data_parallel_rank: Optional[int] = None
-
     # OpenAI/SGLang default sampling parameters
     _DEFAULT_SAMPLING_PARAMS = {
         "temperature": 1.0,
@@ -1205,11 +1145,6 @@ class ChatCompletionRequest(PDRoutingFields):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
-
-    @model_validator(mode="before")
-    @classmethod
-    def _handle_deprecated_dp_rank(cls, values):
-        return _migrate_deprecated_dp_rank(values)
 
     @model_validator(mode="wrap")
     @classmethod
@@ -2185,9 +2120,6 @@ class ResponsesRequest(PDRoutingFields):
         default=None, description="Cache salt for request caching"
     )
 
-    # Deprecated: use routed_dp_rank instead
-    data_parallel_rank: Optional[int] = None
-
     # SGLang sampling extras. ``None`` defers to ``--preferred-sampling-params``.
     frequency_penalty: float = 0.0
     presence_penalty: float = 0.0
@@ -2204,11 +2136,6 @@ class ResponsesRequest(PDRoutingFields):
         "min_p": 0.0,
         "repetition_penalty": 1.0,
     }
-
-    @model_validator(mode="before")
-    @classmethod
-    def _handle_deprecated_dp_rank(cls, values):
-        return _migrate_deprecated_dp_rank(values)
 
     @model_validator(mode="before")
     @classmethod
