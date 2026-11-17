@@ -315,7 +315,13 @@ class MambaPoolHost(HostKVCache):
         ):
             raise ValueError("page_unified Mamba state slots must be 16-byte aligned.")
         pieces = sorted(layout.pieces(), key=lambda piece: piece[1])
-        table = [(p * num_layers + l, d, h, n) for p, l, d, h, n in pieces]
+        # 5th column is the cumulative 16 B vector start in this sorted order so
+        # a per-layer row slice is one contiguous range for the transfer kernel.
+        table = []
+        start = 0
+        for p, l, d, h, n in pieces:
+            table.append((p * num_layers + l, d, h, n, start))
+            start += n // 16
         device = self._buffer_device
         self.page_unified_layout = layout
         self._piece_table = torch.tensor(table, dtype=torch.int64, device=device)

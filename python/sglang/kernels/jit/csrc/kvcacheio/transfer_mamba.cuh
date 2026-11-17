@@ -86,10 +86,10 @@ __launch_bounds__(kBlockSize, 1) void transfer_mamba_backup_kernel(const __grid_
   }
 }
 
-// One row of the piece table: device source, offset in the device slot,
-// offset in the host slot, byte length.
-constexpr int kPieceFields = 4;
-constexpr int kWarpSize = 32;
+// One row of the piece table (host builds starts in the sorted-by-layer order
+// so a per-layer row slice is a contiguous range of 16 B vectors):
+//   source, device byte offset, host byte offset, byte length, start vector.
+constexpr int kPieceFields = 5;
 
 struct MambaPieceParams {
   const uint64_t* __restrict__ device_ptrs;
@@ -103,32 +103,56 @@ struct MambaPieceParams {
   int64_t num_pieces;
 };
 
-// A warp moves one (slot, piece) pair; pieces are too small for a block each.
+// Flat 16 B vector partition across the grid: every thread takes an equal share
+// of item * vecs_per_item, independent of piece boundaries. Piece sizes vary by
+// orders of magnitude (256 KiB temporal vs a few KiB conv); a warp-per-piece
+// schedule left the heavy pieces serialized inside one warp.
 template <bool kToHost>
 __global__
 __launch_bounds__(kBlockSize, 1) void transfer_mamba_pieces_kernel(const __grid_constant__ MambaPieceParams params) {
-  const int lane = threadIdx.x % kWarpSize;
-  const int64_t warps_per_block = blockDim.x / kWarpSize;
-  const int64_t total_work = params.num_items * params.num_pieces;
+  const int64_t* rows = params.pieces;
+  const int64_t base = rows[4];
+  const int64_t* last = rows + (params.num_pieces - 1) * kPieceFields;
+  const int64_t vecs_per_item = last[4] + last[3] / kBytesPerThreadPerStep - base;
+  const int64_t total = params.num_items * vecs_per_item;
+  const int64_t stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
 
-  for (int64_t work_id = static_cast<int64_t>(blockIdx.x) * warps_per_block + threadIdx.x / kWarpSize;
-       work_id < total_work;
-       work_id += gridDim.x * warps_per_block) {
-    const int64_t item_id = work_id / params.num_pieces;
-    const int64_t* piece = params.pieces + (work_id % params.num_pieces) * kPieceFields;
-    const int64_t source = piece[0];
+  int64_t item = -1;
+  int64_t piece_begin = 0;
+  int64_t piece_end = 0;
+  const char* src = nullptr;
+  char* dst = nullptr;
 
-    char* device_ptr = reinterpret_cast<char*>(params.device_ptrs[source]) +
-                       params.device_indices[item_id] * params.device_strides[source] + piece[1];
-    char* host_ptr = params.host_base + params.host_indices[item_id] * params.host_stride + piece[2];
-    const char* src = kToHost ? device_ptr : host_ptr;
-    char* dst = kToHost ? host_ptr : device_ptr;
-
-    for (int64_t off = static_cast<int64_t>(lane) * kBytesPerThreadPerStep; off < piece[3];
-         off += kWarpSize * kBytesPerThreadPerStep) {
-      device::details::store_nc(
-          reinterpret_cast<uint4*>(dst + off), device::details::load_nc(reinterpret_cast<const uint4*>(src + off)));
+  for (int64_t g = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x; g < total; g += stride) {
+    const int64_t new_item = g / vecs_per_item;
+    const int64_t vec = g - new_item * vecs_per_item;
+    if (new_item != item) {
+      item = new_item;
+      piece_end = 0;
     }
+    if (vec < piece_begin || vec >= piece_end) {
+      // Last row whose start-base is still <= vec; rows are monotonic in start.
+      int64_t lo = 0;
+      int64_t hi = params.num_pieces;
+      while (lo + 1 < hi) {
+        const int64_t mid = (lo + hi) >> 1;
+        if (rows[mid * kPieceFields + 4] - base <= vec)
+          lo = mid;
+        else
+          hi = mid;
+      }
+      const int64_t* piece = rows + lo * kPieceFields;
+      piece_begin = piece[4] - base;
+      piece_end = piece_begin + piece[3] / kBytesPerThreadPerStep;
+      char* device_ptr = reinterpret_cast<char*>(params.device_ptrs[piece[0]]) +
+                         params.device_indices[item] * params.device_strides[piece[0]] + piece[1];
+      char* host_ptr = params.host_base + params.host_indices[item] * params.host_stride + piece[2];
+      src = kToHost ? device_ptr : host_ptr;
+      dst = kToHost ? host_ptr : device_ptr;
+    }
+    const int64_t off = (vec - piece_begin) * kBytesPerThreadPerStep;
+    device::details::store_nc(
+        reinterpret_cast<uint4*>(dst + off), device::details::load_nc(reinterpret_cast<const uint4*>(src + off)));
   }
 }
 
@@ -262,16 +286,15 @@ struct TransferMambaKernel {
         .with_strides({kPieceFields, 1})
         .verify(pieces);
 
-    RuntimeCheck(host_stride > 0 && host_stride % 16 == 0, "transfer_mamba: host slots must be 16-byte aligned");
+    CHECK_HOST(host_stride > 0 && host_stride % 16 == 0) << "transfer_mamba: host slots must be 16-byte aligned";
     const auto num_items = L.unwrap();
     const auto num_pieces = P.unwrap();
     if (num_items == 0 || num_pieces == 0) return;
 
+    // Always fill the PCIe quota; idle threads exit on g >= total. Piece count
+    // no longer sizes the grid -- a single large piece still needs every lane.
     const auto device = device_.unwrap();
-    const int64_t warps = num_items * num_pieces;
-    const int64_t warps_per_block = kBlockSize / kWarpSize;
-    const int grid_x = static_cast<int>(
-        std::min(static_cast<int64_t>(kBlockQuotaBackup), (warps + warps_per_block - 1) / warps_per_block));
+    const int grid_x = to_host ? kBlockQuotaBackup : kBlockQuotaLoad;
 
     const auto params = MambaPieceParams{
         .device_ptrs = static_cast<const uint64_t*>(device_ptrs.data_ptr()),

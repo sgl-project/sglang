@@ -95,9 +95,15 @@ def transfer_mamba_pieces(
     device_indices: torch.Tensor,
     to_host: bool,
 ):
-    """Copy ``pieces`` rows ``(source, device offset, host offset, length)``
-    between device slot ``device_ptrs[source] + index * device_strides[source]``
-    and host slot ``host[index]``, for every index pair."""
+    """Copy ``pieces`` rows between device and host for every index pair.
+
+    Each row is ``(source, device_offset, host_offset, length, start)`` with
+    every offset/length 16-byte aligned. ``start`` is the cumulative 16 B
+    vector index of the row in the (layer-sorted) table, so a per-layer slice
+    is a contiguous vector range. Device address is
+    ``device_ptrs[source] + index * device_strides[source] + device_offset``;
+    host address is ``host[index] + host_offset``.
+    """
     module = _jit_transfer_mamba_module()
     module.transfer_mamba_pieces(
         device_ptrs,

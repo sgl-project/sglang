@@ -22,9 +22,12 @@ pytestmark = pytest.mark.skipif(
 LAYERS, SLOTS = 3, 8
 # (temporal shape, conv shape, conv widths, conv axis, groups). GDN conv is
 # cat(q, k, v) along axis 0; KDA conv is [K-1, cat(v, q, k)] along axis 1.
+# gdn_large pushes per-layer vectors past one CTA so the piece kernel's
+# multi-round and item-wrap paths run (tiny shapes stay under 2048 vectors).
 MODELS = {
     "gdn": ((4, 8, 16), (64, 4), (16, 16, 32), 0, 2),
     "kda": ((4, 8, 8), (3, 96), (32, 32, 32), 1, 4),
+    "gdn_large": ((4, 64, 64), (64, 4), (16, 16, 32), 0, 2),
 }
 
 
