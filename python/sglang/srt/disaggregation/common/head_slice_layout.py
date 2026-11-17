@@ -149,3 +149,15 @@ def paged_segment_addresses(
         dst.reshape(-1).tolist(),
         length.reshape(-1).tolist(),
     )
+
+
+def draft_window_chunk_start(
+    *, window_pages: int, chunk_page_start: int, total_pages: int
+) -> int:
+    """Index of the first page in a chunk whose draft KV decode can attend to.
+
+    `window_pages` trailing pages of the request are sent; 0 sends every page.
+    """
+    if window_pages == 0:
+        return 0
+    return max(0, total_pages - window_pages - chunk_page_start)

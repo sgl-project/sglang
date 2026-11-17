@@ -21,6 +21,7 @@ import unittest
 import numpy as np
 
 from sglang.srt.disaggregation.common.head_slice_layout import (
+    draft_window_chunk_start,
     page_row_head_segments,
     paged_segment_addresses,
     token_major_head_segments,
@@ -252,6 +253,41 @@ class TestTokenMajorHeadSlice(CustomTestCase):
     def test_gather_to_fewer_decode_ranks(self):
         self._check(src_tp=4, dst_tp=2)
 
+
+class TestDraftWindowChunkStart(CustomTestCase):
+    """A request of 10 pages with a 3-page draft window sends draft pages 7..9."""
+
+    def _sent_pages(self, chunks):
+        sent = []
+        for start, end in chunks:
+            first = draft_window_chunk_start(
+                window_pages=3, chunk_page_start=start, total_pages=10
+            )
+            sent += list(range(start, end))[first:]
+        return sent
+
+    def test_single_chunk(self):
+        self.assertEqual(self._sent_pages([(0, 10)]), [7, 8, 9])
+
+    def test_window_spans_chunks(self):
+        self.assertEqual(self._sent_pages([(0, 4), (4, 8), (8, 10)]), [7, 8, 9])
+
+    def test_chunk_before_window_sends_nothing(self):
+        self.assertEqual(self._sent_pages([(0, 6)]), [])
+
+    def test_request_shorter_than_window(self):
+        self.assertEqual(
+            draft_window_chunk_start(window_pages=3, chunk_page_start=0, total_pages=2),
+            0,
+        )
+
+    def test_zero_window_sends_all(self):
+        self.assertEqual(
+            draft_window_chunk_start(
+                window_pages=0, chunk_page_start=0, total_pages=10
+            ),
+            0,
+        )
 
 
 if __name__ == "__main__":

@@ -116,6 +116,9 @@ class KVArgs:
     main_kv_head_dim: int = 0
     # Per-rank KV heads of the draft entries appended after the target entries.
     draft_kv_head_num: int = 0
+    # Trailing pages of draft KV that decode reads when every draft layer is
+    # sliding-window; 0 sends all pages.
+    draft_window_pages: int = 0
     page_size: int
     draft_rows_dcp_collapsed: bool = False
     # for system dp

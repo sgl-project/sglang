@@ -25,6 +25,9 @@ from sglang.srt.disaggregation.common.conn import (
     CommonKVReceiver,
     CommonKVSender,
 )
+from sglang.srt.disaggregation.common.head_slice_layout import (
+    draft_window_chunk_start,
+)
 from sglang.srt.disaggregation.common.staging_handler import (
     STAGING_WATERMARK_WAIT_S,
     DecodeStagingContext,
@@ -80,6 +83,7 @@ from sglang.srt.observability.trace import (
 )
 from sglang.srt.runtime_context import (
     get_device,
+    get_disagg,
     get_memory,
     get_observability,
     get_parallel,
@@ -193,6 +197,9 @@ class KVArgsRegisterInfo:
     staging_total_size: int = 0
     dst_aux_item_lens: Optional[List[int]] = None
     staging: Optional[StagingRegisterInfo] = None
+    # Decode with a radix cache reuses draft KV beyond the sliding window;
+    # a decode that does not say otherwise gets every draft page.
+    dst_needs_full_draft_kv: bool = True
 
     @classmethod
     def from_zmq(cls, msg: List[bytes]):
@@ -246,6 +253,7 @@ class KVArgsRegisterInfo:
                 else []
             ),
             dst_draft_rows_dcp_collapsed=(len(msg) > 21 and msg[21] == b"1"),
+            dst_needs_full_draft_kv=len(msg) <= 22 or msg[22] != b"0",
             # Note: always put the staging field at the final
             staging=StagingRegisterInfo.from_zmq_fields(msg, 15, slot_ids_index=19),
         )
@@ -2118,19 +2126,25 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_kv_item_lens: list[int],
         dst_layer_ids: List[int],
         executor: concurrent.futures.ThreadPoolExecutor,
+        draft_start: int = 0,
     ) -> int:
-        """Head-sliced send for the MSA-v1 NVFP4 page-row main KV and its draft KV."""
+        """Head-sliced send for the MSA-v1 NVFP4 page-row main KV and its draft KV.
+
+        Draft KV is sent only for this chunk's pages from `draft_start` on.
+        """
         from sglang.srt.disaggregation.common.head_slice_layout import (
             paged_segment_addresses,
         )
 
         try:
-            segment_jobs, draft_jobs = self._plan_head_sliced_entries(
-                dst_kv_ptrs=dst_kv_ptrs,
-                dst_tp_rank=dst_tp_rank,
-                dst_attn_tp_size=dst_attn_tp_size,
-                dst_kv_item_lens=dst_kv_item_lens,
-                dst_layer_ids=dst_layer_ids,
+            segment_jobs, draft_segment_jobs, draft_jobs = (
+                self._plan_head_sliced_entries(
+                    dst_kv_ptrs=dst_kv_ptrs,
+                    dst_tp_rank=dst_tp_rank,
+                    dst_attn_tp_size=dst_attn_tp_size,
+                    dst_kv_item_lens=dst_kv_item_lens,
+                    dst_layer_ids=dst_layer_ids,
+                )
             )
         except (ValueError, RuntimeError) as e:
             logger.error(f"[{mooncake_session_id}] head-sliced KV send: {e}")
@@ -2143,26 +2157,38 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 mooncake_session_id, src, dst, lengths
             )
 
-        def transfer_segments(job) -> int:
+        def transfer_segments(job, src_pages, dst_pages) -> int:
             return transfer(
                 *paged_segment_addresses(
-                    src_page_indices=prefill_kv_indices,
-                    dst_page_indices=dst_kv_indices,
+                    src_page_indices=src_pages,
+                    dst_page_indices=dst_pages,
                     **job,
                 )
             )
 
-        futures = [executor.submit(transfer_segments, job) for job in segment_jobs]
-        if draft_jobs:
-            futures.append(
+        futures = [
+            executor.submit(transfer_segments, job, prefill_kv_indices, dst_kv_indices)
+            for job in segment_jobs
+        ]
+        draft_src_pages = prefill_kv_indices[draft_start:]
+        draft_dst_pages = dst_kv_indices[draft_start:]
+        if len(draft_src_pages) > 0:
+            futures += [
                 executor.submit(
-                    self._get_draft_head_packer().send,
-                    src_page_indices=prefill_kv_indices,
-                    dst_page_indices=dst_kv_indices,
-                    jobs=draft_jobs,
-                    transfer=transfer,
+                    transfer_segments, job, draft_src_pages, draft_dst_pages
                 )
-            )
+                for job in draft_segment_jobs
+            ]
+            if draft_jobs:
+                futures.append(
+                    executor.submit(
+                        self._get_draft_head_packer().send,
+                        src_page_indices=draft_src_pages,
+                        dst_page_indices=draft_dst_pages,
+                        jobs=draft_jobs,
+                        transfer=transfer,
+                    )
+                )
         return self._await_transfer_futures(futures)
 
     def _plan_head_sliced_entries(
@@ -2174,7 +2200,8 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         dst_kv_item_lens: list[int],
         dst_layer_ids: List[int],
     ):
-        """Byte segments for each target entry; GPU pack jobs for draft entries.
+        """Byte segments for target entries, and for draft entries either GPU pack
+        jobs or token-major byte segments.
 
         Draft entries are token-major. They are packed on GPU into one run per page
         when each decode page is a run of local heads; otherwise one run per token.
@@ -2208,7 +2235,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         pack_draft = (
             self.draft_kv_tensors is not None and dst_attn_tp_size >= self.attn_tp_size
         )
-        segment_jobs, draft_jobs = [], []
+        segment_jobs, draft_segment_jobs, draft_jobs = [], [], []
         for i, j in build_transfer_entry_pairs(
             self.kv_args.kv_layer_ids, dst_layer_ids, len(src_ptrs), len(dst_kv_ptrs)
         ):
@@ -2222,6 +2249,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                         f"{src_item_lens[i]} vs {src_row_bytes}, peer "
                         f"{dst_kv_item_lens[j]} vs {dst_row_bytes}"
                     )
+                jobs = segment_jobs
                 segments = main_segments
             elif pack_draft:
                 head_start, num_heads, _, _ = compute_head_slice_params(
@@ -2249,6 +2277,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 )
                 continue
             else:
+                jobs = draft_segment_jobs
                 segments = token_major_head_segments(
                     total_kv_heads=draft_total_heads,
                     src_item_len=src_item_lens[i],
@@ -2256,7 +2285,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     page_size=page_size,
                     **tp_args,
                 )
-            segment_jobs.append(
+            jobs.append(
                 dict(
                     src_base_ptr=src_ptrs[i],
                     dst_base_ptr=dst_kv_ptrs[j],
@@ -2265,7 +2294,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                     segments=segments,
                 )
             )
-        return segment_jobs, draft_jobs
+        return segment_jobs, draft_segment_jobs, draft_jobs
 
     def send_aux(
         self,
@@ -3263,6 +3292,15 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                                     target_rank_registration_info.dst_kv_layer_ids
                                 ),
                                 executor=executor,
+                                draft_start=draft_window_chunk_start(
+                                    window_pages=(
+                                        0
+                                        if target_rank_registration_info.dst_needs_full_draft_kv
+                                        else self.kv_args.draft_window_pages
+                                    ),
+                                    chunk_page_start=kv_chunk.index_slice.start,
+                                    total_pages=len(req.dst_kv_indices),
+                                ),
                             )
                         elif (
                             self.enable_staging
@@ -3874,6 +3912,7 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
                 *self.kv_args.kv_item_lens,
             ),
             b"1" if self.kv_args.draft_rows_dcp_collapsed else b"0",
+            b"1" if get_disagg().disaggregation_decode_enable_radix_cache else b"0",
         ]
 
     def build_receiver_metadata_message(
