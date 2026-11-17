@@ -6,19 +6,22 @@ hidden 2560, low-rank 320), any row count. The normed residual is never material
 
 * ``hc_prefill_mix``: the down and inject projections run as one batched GEMM over the
   HC branches of the raw residual ``h``, against weights with the Gemma norm's
-  ``(1 + w)`` folded in (``fold_hc_prefill_weights``). A finish kernel scales each
-  branch's partial by that branch's ``rstd``, applies SiLU(. / HC) and returns the
-  inject logits. The up kernel rebuilds the gate operand as ``h * rstd_b * (1 + w)``
-  and runs the up projection, the sigmoid and the branch mean.
+  ``(1 + w)`` folded in (``fold_hc_prefill_weights``): ``torch.bmm``, or at most
+  ``_SPLIT_K_MAX_ROWS`` rows a split-K Triton kernel that cuts K into
+  ``_SPLITS_PER_BRANCH`` slices per branch. A finish kernel sums a branch's partials,
+  scales them by that branch's ``rstd``, applies SiLU(. / HC) and returns the inject
+  logits. The up kernel rebuilds the gate operand as ``h * rstd_b * (1 + w)`` and runs
+  the up projection, the sigmoid and the branch mean.
 * ``hc_prefill_combine``: ``h + y * 2 sigmoid(g / HC)`` from the inject logits.
 
-M is a runtime argument that Triton does not specialize: a new row count compiles
-nothing, and every launch can be captured in a CUDA graph.
+The row count is never a compile-time constant (Triton does not specialize ``M``, and
+the combine's grid carries it): a new row count compiles nothing, and every launch can
+be captured in a CUDA graph.
 
 Numerics differ from the unfused path only by rounding points: ``(1 + w)`` is rounded
-into the BF16 down and inject weights, each branch's down partial is rounded to BF16
-before its ``rstd`` scaling, the normed residual is never rounded to BF16, and the up
-projection stays FP32 up to the sigmoid.
+into the BF16 down and inject weights, each branch's down partial (each K slice's, on
+the split-K path) is rounded to BF16 before its ``rstd`` scaling, the normed residual
+is never rounded to BF16, and the up projection stays FP32 up to the sigmoid.
 """
 
 import torch
@@ -35,6 +38,16 @@ def _sigmoid(v):
     # gfx950: v_exp_f32 + v_rcp_f32; 1 / (1 + tl.exp(-v)) lowers to the IEEE division
     # sequence (24 VALU instructions instead of 7).
     return libdevice.fast_dividef(1.0, 1.0 + libdevice.fast_expf(-v))
+
+
+@triton.jit
+def _xcd_order(program_id, num_tiles, NUM_XCDS: tl.constexpr):
+    """(group, tile) of ``program_id`` in a 1-D grid of num_groups * num_tiles programs,
+    num_groups % NUM_XCDS == 0. The programs of a group share program_id % NUM_XCDS:
+    workgroups go to the XCDs round-robin, so a group stays on one XCD and its L2."""
+    quotient = program_id // NUM_XCDS
+    group = program_id % NUM_XCDS + NUM_XCDS * (quotient // num_tiles)
+    return group, quotient % num_tiles
 
 
 @triton.jit(do_not_specialize=["M"])
@@ -71,6 +84,56 @@ def _hc_prefill_sumsq_kernel(
 
 
 @triton.jit(do_not_specialize=["M"])
+def _hc_prefill_down_kernel(
+    hidden_ptr,
+    weight_ptr,
+    partial_ptr,
+    M,
+    K: tl.constexpr,
+    PARTIAL_COLS: tl.constexpr,
+    SPLITS: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+):
+    """partial[s, m, n] = sum over K slice s of hidden[m, k] * weight[n, k], in BF16.
+
+    1-D grid of SPLITS * cdiv(M, BLOCK_M) * cdiv(PARTIAL_COLS, BLOCK_N) programs,
+    SPLITS % NUM_XCDS == 0; K % (SPLITS * BLOCK_K) == 0."""
+    SLICE_K: tl.constexpr = K // SPLITS
+    NUM_COL_TILES: tl.constexpr = (PARTIAL_COLS + BLOCK_N - 1) // BLOCK_N
+    num_row_tiles = tl.cdiv(M, BLOCK_M)
+    split, tile = _xcd_order(tl.program_id(0), num_row_tiles * NUM_COL_TILES, NUM_XCDS)
+    rows = tile % num_row_tiles * BLOCK_M + tl.arange(0, BLOCK_M)
+    row_mask = rows < M
+    rows64 = rows.to(tl.int64)
+    cols = tile // num_row_tiles * BLOCK_N + tl.arange(0, BLOCK_N)
+    col_mask = cols < PARTIAL_COLS
+    acc = tl.zeros([BLOCK_M, BLOCK_N], tl.float32)
+    for k0 in range(0, SLICE_K, BLOCK_K):
+        k = split * SLICE_K + k0 + tl.arange(0, BLOCK_K)
+        hidden = tl.load(
+            hidden_ptr + rows64[:, None] * K + k[None, :],
+            mask=row_mask[:, None],
+            other=0.0,
+        )
+        weight = tl.load(
+            weight_ptr + cols[:, None] * K + k[None, :],
+            mask=col_mask[:, None],
+            other=0.0,
+        )
+        acc = tl.dot(hidden, tl.trans(weight), acc)
+    tl.store(
+        partial_ptr
+        + (split.to(tl.int64) * M + rows64)[:, None] * PARTIAL_COLS
+        + cols[None, :],
+        acc.to(tl.bfloat16),
+        mask=row_mask[:, None] & col_mask[None, :],
+    )
+
+
+@triton.jit(do_not_specialize=["M"])
 def _hc_prefill_finish_kernel(
     partial_ptr,
     sumsq_ptr,
@@ -83,33 +146,47 @@ def _hc_prefill_finish_kernel(
     HC: tl.constexpr,
     LOWRANK: tl.constexpr,
     PARTIAL_COLS: tl.constexpr,
+    SPLITS_PER_BRANCH: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_C: tl.constexpr,
 ):
-    """Per-branch down and inject partials partial[HC, M, PARTIAL_COLS] and sums of
-    squares sumsq[M, HC] -> t = SiLU(sum_b rstd_b partial_b / HC) [M, LOWRANK] BF16,
-    inject logits sum_b rstd_b partial_b [M, HC] FP32 and rstd [M, HC] FP32.
+    """Down and inject partials partial[HC * SPLITS_PER_BRANCH, M, PARTIAL_COLS] (branch
+    b's slices start at b * SPLITS_PER_BRANCH) and sums of squares sumsq[M, HC]
+    -> t = SiLU(sum_b rstd_b partial_b / HC) [M, LOWRANK] BF16, inject logits
+    sum_b rstd_b partial_b [M, HC] FP32 and rstd [M, HC] FP32.
 
     Grid (cdiv(M, BLOCK_M), cdiv(LOWRANK + HC, BLOCK_C))."""
     rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
     row_mask = rows < M
     rows64 = rows.to(tl.int64)
     cols = tl.program_id(1) * BLOCK_C + tl.arange(0, BLOCK_C)
+    col_mask = row_mask[:, None] & (cols < LOWRANK + HC)[None, :]
+    branches = tl.arange(0, HC)
+    rstds = tl.zeros([BLOCK_M, HC], tl.float32)
     acc = tl.zeros([BLOCK_M, BLOCK_C], tl.float32)
     for branch in tl.static_range(HC):
         sumsq = tl.load(sumsq_ptr + rows64 * HC + branch, mask=row_mask, other=0.0)
         rstd = tl.math.rsqrt(sumsq / HS + eps)
-        if tl.program_id(1) == 0:
-            tl.store(rstd_ptr + rows64 * HC + branch, rstd, mask=row_mask)
-        partial = tl.load(
-            partial_ptr
-            + branch * M.to(tl.int64) * PARTIAL_COLS
-            + rows64[:, None] * PARTIAL_COLS
-            + cols[None, :],
-            mask=row_mask[:, None] & (cols < LOWRANK + HC)[None, :],
-            other=0.0,
-        ).to(tl.float32)
-        acc += partial * rstd[:, None]
+        rstds = tl.where(branches[None, :] == branch, rstd[:, None], rstds)
+        branch_sum = tl.zeros([BLOCK_M, BLOCK_C], tl.float32)
+        for split in tl.static_range(SPLITS_PER_BRANCH):
+            slice_index = branch * SPLITS_PER_BRANCH + split
+            branch_sum += tl.load(
+                partial_ptr
+                + (slice_index * M.to(tl.int64) + rows64)[:, None] * PARTIAL_COLS
+                + cols[None, :],
+                mask=col_mask,
+                other=0.0,
+            ).to(tl.float32)
+        acc += branch_sum * rstd[:, None]
+    # After the loop: a store inside it makes the compiled kernel wait for each
+    # branch's loads before it issues the next branch's.
+    if tl.program_id(1) == 0:
+        tl.store(
+            rstd_ptr + rows64[:, None] * HC + branches[None, :],
+            rstds,
+            mask=row_mask[:, None],
+        )
     v = acc / HC
     tl.store(
         t_ptr + rows64[:, None] * LOWRANK + cols[None, :],
@@ -135,6 +212,7 @@ def _hc_prefill_up_kernel(
     HS: tl.constexpr,
     HC: tl.constexpr,
     LOWRANK: tl.constexpr,
+    NUM_XCDS: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_J: tl.constexpr,
     BLOCK_R: tl.constexpr,
@@ -142,17 +220,22 @@ def _hc_prefill_up_kernel(
     """out[m, j] = mean_b sigmoid(t[m] . up[n]) * h[m, n] * rstd[m, b] * (1 + w[n]),
     n = b * HS + j.
 
-    Grid (cdiv(M, BLOCK_M), HS // BLOCK_J). One [BLOCK_M, HC * BLOCK_J] GEMM tile per
-    CTA whose columns are the HC branches' copies of hidden units j; the low-rank
-    dimension is the K loop in BLOCK_R chunks, and the branch mean reduces the tile's
-    HC column groups.
+    Grid (cdiv(M, BLOCK_M), HS // BLOCK_J), or with NUM_XCDS > 0 one dimension of
+    cdiv(M, BLOCK_M) * (HS // BLOCK_J) programs, (HS // BLOCK_J) % NUM_XCDS == 0, where
+    the row tiles of a column block share program_id % NUM_XCDS. One
+    [BLOCK_M, HC * BLOCK_J] GEMM tile per CTA whose columns are the HC branches' copies
+    of hidden units j; the low-rank dimension is the K loop in BLOCK_R chunks, and the
+    branch mean reduces the tile's HC column groups.
     """
     K: tl.constexpr = HC * HS
     TILE_N: tl.constexpr = HC * BLOCK_J
-    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    if NUM_XCDS == 0:
+        pid_m, pid_j = tl.program_id(0), tl.program_id(1)
+    else:
+        pid_j, pid_m = _xcd_order(tl.program_id(0), tl.cdiv(M, BLOCK_M), NUM_XCDS)
+    rows = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     row_mask = rows < M
     rows64 = rows.to(tl.int64)
-    pid_j = tl.program_id(1)
     c = tl.arange(0, TILE_N)
     branch = c // BLOCK_J
     n = branch * HS + pid_j * BLOCK_J + c % BLOCK_J
@@ -185,48 +268,52 @@ def _hc_prefill_up_kernel(
     )
 
 
-@triton.jit(do_not_specialize=["M"])
+@triton.jit
 def _hc_prefill_combine_kernel(
     h_ptr,
     y_ptr,
     logits_ptr,
     out_ptr,
-    M,
     HS: tl.constexpr,
     HC: tl.constexpr,
-    BLOCK_M: tl.constexpr,
     BLOCK_J: tl.constexpr,
 ):
     """out[m, b * HS + j] = h[m, b * HS + j] + 2 sigmoid(logits[m, b] / HC) * y[m, j].
 
-    Grid (cdiv(M, BLOCK_M), HS // BLOCK_J); each CTA reads its y tile once for all
-    branches."""
+    Grid (M, HS // BLOCK_J): a program takes one row and BLOCK_J hidden units for all
+    HC branches as one [HC, BLOCK_J] tile, reads y once, and loads everything before it
+    stores."""
     K: tl.constexpr = HC * HS
-    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
-    row_mask = rows < M
-    rows64 = rows.to(tl.int64)
+    row = tl.program_id(0).to(tl.int64)
     j = tl.program_id(1) * BLOCK_J + tl.arange(0, BLOCK_J)
-    y = tl.load(
-        y_ptr + rows64[:, None] * HS + j[None, :], mask=row_mask[:, None], other=0.0
-    ).to(tl.float32)
-    for branch in tl.static_range(HC):
-        logits = tl.load(logits_ptr + rows64 * HC + branch, mask=row_mask, other=0.0)
-        gate = 2.0 * _sigmoid(logits / HC)
-        offsets = rows64[:, None] * K + branch * HS + j[None, :]
-        h = tl.load(h_ptr + offsets, mask=row_mask[:, None], other=0.0).to(tl.float32)
-        tl.store(
-            out_ptr + offsets,
-            (h + gate[:, None] * y).to(tl.bfloat16),
-            mask=row_mask[:, None],
-        )
+    branches = tl.arange(0, HC)
+    y = tl.load(y_ptr + row * HS + j).to(tl.float32)
+    logits = tl.load(logits_ptr + row * HC + branches)
+    offsets = row * K + branches[:, None] * HS + j[None, :]
+    h = tl.load(h_ptr + offsets).to(tl.float32)
+    gate = 2.0 * _sigmoid(logits / HC)
+    tl.store(out_ptr + offsets, (h + gate[:, None] * y[None, :]).to(tl.bfloat16))
 
 
 # Launch configs from per-kernel sweeps on MI355X (gfx950) at HC 4, hidden 2560 and
 # low-rank 320.
 _SUMSQ_BLOCK_M, _SUMSQ_BLOCK_K = 4, 512
-_FINISH_BLOCK_M, _FINISH_BLOCK_C = 32, 64
 _UP_BLOCK_J, _UP_BLOCK_R = 32, 64
-_COMBINE_BLOCK_M, _COMBINE_BLOCK_J = 4, 512
+_COMBINE_BLOCK_J = 512
+# Split-K path: K splits into _SPLITS_PER_BRANCH slices per branch. The support check
+# (HC 4, hidden a multiple of 512) makes the 16 slices a multiple of _NUM_XCDS, a slice
+# a multiple of _DOWN_BLOCK_K and the up grid's column blocks a multiple of _NUM_XCDS.
+# _SPLIT_K_MAX_ROWS: the largest row count the path was measured against torch.bmm at.
+_SPLIT_K_MAX_ROWS = 512
+_SPLITS_PER_BRANCH = 4
+_NUM_XCDS = 8  # XCDs of an MI355X
+_DOWN_BLOCK_M, _DOWN_BLOCK_N, _DOWN_BLOCK_K = 64, 32, 128
+
+
+def _finish_config(split_k: bool) -> dict:
+    if split_k:
+        return dict(BLOCK_M=1, BLOCK_C=128, num_warps=2)
+    return dict(BLOCK_M=32, BLOCK_C=64, num_warps=4)
 
 
 def _up_config(rows: int) -> dict:
@@ -273,6 +360,72 @@ def hc_prefill_supported(hidden: torch.Tensor) -> bool:
     )
 
 
+def _split_k_down(
+    hidden: torch.Tensor, folded_weight: torch.Tensor, partial: torch.Tensor
+) -> None:
+    """Write ``partial`` [SPLITS, M, PARTIAL_COLS] BF16: slice s of K is
+    ``hidden[:, s * L : (s + 1) * L] @ folded_weight[:, s * L : (s + 1) * L].T``."""
+    splits, rows, partial_cols = partial.shape
+    _hc_prefill_down_kernel[
+        (
+            splits
+            * triton.cdiv(rows, _DOWN_BLOCK_M)
+            * triton.cdiv(partial_cols, _DOWN_BLOCK_N),
+        )
+    ](
+        hidden,
+        folded_weight,
+        partial,
+        rows,
+        K=hidden.shape[1],
+        PARTIAL_COLS=partial_cols,
+        SPLITS=splits,
+        NUM_XCDS=_NUM_XCDS,
+        BLOCK_M=_DOWN_BLOCK_M,
+        BLOCK_N=_DOWN_BLOCK_N,
+        BLOCK_K=_DOWN_BLOCK_K,
+        num_warps=4,
+        num_stages=2,
+        matrix_instr_nonkdim=16,
+    )
+
+
+def _launch_up(
+    t: torch.Tensor,
+    up: torch.Tensor,
+    hidden: torch.Tensor,
+    rstd: torch.Tensor,
+    norm_weight: torch.Tensor,
+    mixed: torch.Tensor,
+    hc: int,
+    xcd_order: bool,
+) -> None:
+    rows, k = hidden.shape
+    config = _up_config(rows)
+    row_tiles, column_blocks = (
+        triton.cdiv(rows, config["BLOCK_M"]),
+        k // hc // _UP_BLOCK_J,
+    )
+    _hc_prefill_up_kernel[
+        (row_tiles * column_blocks,) if xcd_order else (row_tiles, column_blocks)
+    ](
+        t,
+        up,
+        hidden,
+        rstd,
+        norm_weight,
+        mixed,
+        rows,
+        HS=k // hc,
+        HC=hc,
+        LOWRANK=up.shape[1],
+        NUM_XCDS=_NUM_XCDS if xcd_order else 0,
+        BLOCK_J=_UP_BLOCK_J,
+        BLOCK_R=_UP_BLOCK_R,
+        **config,
+    )
+
+
 def hc_prefill_mix(
     hidden: torch.Tensor,
     folded_weight: torch.Tensor,
@@ -303,18 +456,29 @@ def hc_prefill_mix(
         BLOCK_K=_SUMSQ_BLOCK_K,
         num_warps=4,
     )
-    # Branch-batched over strided views of the residual and the weights; no copies.
-    partial = torch.bmm(
-        hidden.view(rows, hc, hs).transpose(0, 1),
-        folded_weight.view(-1, hc, hs).permute(1, 2, 0),
-    )
+    split_k = rows <= _SPLIT_K_MAX_ROWS
+    splits_per_branch = _SPLITS_PER_BRANCH if split_k else 1
+    if split_k:
+        partial = torch.empty(
+            (hc * splits_per_branch, rows, folded_weight.shape[0]),
+            device=device,
+            dtype=torch.bfloat16,
+        )
+        _split_k_down(hidden=hidden, folded_weight=folded_weight, partial=partial)
+    else:
+        # Branch-batched over strided views of the residual and the weights; no copies.
+        partial = torch.bmm(
+            hidden.view(rows, hc, hs).transpose(0, 1),
+            folded_weight.view(-1, hc, hs).permute(1, 2, 0),
+        )
     t = torch.empty((rows, lowrank), device=device, dtype=torch.bfloat16)
     logits = torch.empty((rows, hc), device=device, dtype=torch.float32)
     rstd = torch.empty((rows, hc), device=device, dtype=torch.float32)
+    finish_config = _finish_config(split_k)
     _hc_prefill_finish_kernel[
         (
-            triton.cdiv(rows, _FINISH_BLOCK_M),
-            triton.cdiv(lowrank + hc, _FINISH_BLOCK_C),
+            triton.cdiv(rows, finish_config["BLOCK_M"]),
+            triton.cdiv(lowrank + hc, finish_config["BLOCK_C"]),
         )
     ](
         partial,
@@ -328,26 +492,19 @@ def hc_prefill_mix(
         HC=hc,
         LOWRANK=lowrank,
         PARTIAL_COLS=folded_weight.shape[0],
-        BLOCK_M=_FINISH_BLOCK_M,
-        BLOCK_C=_FINISH_BLOCK_C,
-        num_warps=4,
+        SPLITS_PER_BRANCH=splits_per_branch,
+        **finish_config,
     )
     mixed = torch.empty((rows, hs), device=device, dtype=torch.bfloat16)
-    config = _up_config(rows)
-    _hc_prefill_up_kernel[(triton.cdiv(rows, config["BLOCK_M"]), hs // _UP_BLOCK_J)](
-        t,
-        up,
-        hidden,
-        rstd,
-        norm_weight,
-        mixed,
-        rows,
-        HS=hs,
-        HC=hc,
-        LOWRANK=lowrank,
-        BLOCK_J=_UP_BLOCK_J,
-        BLOCK_R=_UP_BLOCK_R,
-        **config,
+    _launch_up(
+        t=t,
+        up=up,
+        hidden=hidden,
+        rstd=rstd,
+        norm_weight=norm_weight,
+        mixed=mixed,
+        hc=hc,
+        xcd_order=split_k,
     )
     return mixed, logits
 
@@ -377,18 +534,14 @@ def hc_prefill_combine(
     ):
         raise ValueError("unsupported HC prefill combine operands")
     out = torch.empty_like(hidden)
-    _hc_prefill_combine_kernel[
-        (triton.cdiv(rows, _COMBINE_BLOCK_M), hs // _COMBINE_BLOCK_J)
-    ](
+    _hc_prefill_combine_kernel[(rows, hs // _COMBINE_BLOCK_J)](
         hidden,
         block_output,
         inject_logits,
         out,
-        rows,
         HS=hs,
         HC=hc,
-        BLOCK_M=_COMBINE_BLOCK_M,
         BLOCK_J=_COMBINE_BLOCK_J,
-        num_warps=8,
+        num_warps=4,
     )
     return out

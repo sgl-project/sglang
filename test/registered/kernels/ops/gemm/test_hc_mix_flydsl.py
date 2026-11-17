@@ -186,11 +186,32 @@ def _assert_within_twice_unfused_error(actual, unfused, ref):
     assert rms_err <= 2 * unfused_rms, (rms_err, unfused_rms)
 
 
+def _spy_split_k_down(monkeypatch):
+    """The row counts of the split-K down launches from now on."""
+    from sglang.kernels.ops.gemm import hc_prefill_triton
+
+    launched = []
+    split_k_down = hc_prefill_triton._split_k_down
+
+    def spy(hidden, folded_weight, partial):
+        launched.append(hidden.shape[0])
+        return split_k_down(hidden, folded_weight, partial)
+
+    monkeypatch.setattr(hc_prefill_triton, "_split_k_down", spy)
+    return launched
+
+
 @requires_gfx950
-@pytest.mark.parametrize("rows", [_MAX_ROWS + 1, 1025, 16384])
-def test_prefill_mix_and_combine_match_reference(rows):
-    # The ends of both up-kernel launch configs, with a one-row tail after full blocks
-    # in each, and the served prefill chunk.
+@pytest.mark.parametrize(
+    "rows", [_MAX_ROWS + 1, 160, 176, 208, 255, 300, 511, 512, 513, 1025, 16384]
+)
+def test_prefill_mix_and_combine_match_reference(monkeypatch, rows):
+    # Up to 512 rows (a one-row tail after the 64-row tiles at 129, ragged at 255 and
+    # 511, full at 512, verify batches of 4 rows a request among them): the split-K down
+    # kernel. 513 is the first row of the bmm path; 1025 and 16384 are the ends of its
+    # two up-kernel launch configs (a one-row tail after full blocks) and the served
+    # prefill chunk.
+    launched = _spy_split_k_down(monkeypatch)
     site, unfused = _make_site(enabled=True), _make_site(enabled=False)
     h, y = _make_inputs(rows)
     with torch.no_grad():
@@ -209,11 +230,69 @@ def test_prefill_mix_and_combine_match_reference(rows):
         )
     # The prefill path leaves no normed residual behind.
     assert residuals[1] is None and unfused_residuals[1] is not None
+    assert launched == ([rows] if rows <= 512 else [])
     _assert_within_twice_unfused_error(mixed, unfused_mixed, want_mixed)
     _assert_within_twice_unfused_error(residuals[2], unfused_logits, want_logits)
     _assert_within_twice_unfused_error(combined, unfused_combined, want_combined)
     # The inject logits are not gate partials, and the path prepares no next norm.
     assert next_normed is None and torch.equal(also_combined, combined)
+
+
+@requires_gfx950
+@pytest.mark.parametrize("rows", [176, 300])
+def test_split_k_down_writes_each_slice_once(rows):
+    from sglang.kernels.ops.gemm import hc_prefill_triton
+
+    splits = HC * hc_prefill_triton._SPLITS_PER_BRANCH
+    partial_cols = (LOWRANK + HC + 15) // 16 * 16
+    gen = torch.Generator(device="cuda").manual_seed(6)
+    h = torch.randn((rows, K), generator=gen, device="cuda", dtype=torch.bfloat16)
+    weight = (
+        0.05 * torch.randn((partial_cols, K), generator=gen, device="cuda")
+    ).bfloat16()
+    # NaN marks what the kernel leaves unwritten.
+    partial = torch.full(
+        (splits, rows, partial_cols), float("nan"), device="cuda", dtype=torch.bfloat16
+    )
+    hc_prefill_triton._split_k_down(hidden=h, folded_weight=weight, partial=partial)
+    want = torch.einsum(
+        "msk,nsk->smn",
+        h.double().view(rows, splits, -1),
+        weight.double().view(partial_cols, splits, -1),
+    )
+    torch.testing.assert_close(partial.double(), want, rtol=2**-8, atol=1e-3)
+
+
+@requires_gfx950
+@pytest.mark.parametrize("rows", [176, 300])
+def test_up_kernel_is_bitwise_the_same_on_either_grid(rows):
+    from sglang.kernels.ops.gemm import hc_prefill_triton
+
+    gen = torch.Generator(device="cuda").manual_seed(5)
+
+    def randn(*shape, scale=1.0):
+        return scale * torch.randn(
+            shape, generator=gen, device="cuda", dtype=torch.bfloat16
+        )
+
+    t, h, up = randn(rows, LOWRANK), randn(rows, K), randn(K, LOWRANK, scale=0.05)
+    norm_weight = randn(K, scale=0.5)
+    rstd = 0.5 + torch.rand((rows, HC), generator=gen, device="cuda")
+    row_major, xcd_ordered = (
+        torch.empty((rows, HS), device="cuda", dtype=torch.bfloat16) for _ in range(2)
+    )
+    for out, xcd_order in ((row_major, False), (xcd_ordered, True)):
+        hc_prefill_triton._launch_up(
+            t=t,
+            up=up,
+            hidden=h,
+            rstd=rstd,
+            norm_weight=norm_weight,
+            mixed=out,
+            hc=HC,
+            xcd_order=xcd_order,
+        )
+    assert torch.equal(xcd_ordered, row_major)
 
 
 @requires_gfx950
@@ -278,8 +357,9 @@ def test_graph_replay_matches_eager_without_recompiling(monkeypatch):
         mixed, residuals = site.mix(h)
         return mixed, site.combine(y, residuals)
 
-    # One row count per up-kernel launch config.
-    capture_rows = (300, 4096)
+    # One row count per kernel variant: the split-K path and the bmm path's two up-kernel
+    # launch configs.
+    capture_rows = (300, 800, 4096)
     with torch.no_grad():
         for rows in capture_rows:
             # The eager warm-up that precedes a capture builds the folded weights.
@@ -302,8 +382,8 @@ def test_graph_replay_matches_eager_without_recompiling(monkeypatch):
             "jit_post_compile_hook",
             lambda **compile_info: compiled.append(compile_info["repr"]),
         )
-        # Each differs in M % 16 from its launch config's capture row count.
-        for rows in (784, 6001):
+        # Each differs in M % 16 from its variant's capture row count.
+        for rows in (208, 785, 6001):
             run(*_make_inputs(rows))
         torch.cuda.synchronize()
     assert not compiled, compiled

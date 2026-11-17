@@ -1221,7 +1221,8 @@ class Envs:
     # in_proj_qkvz and out_proj to MXFP4 after loading. 0 keeps them BF16.
     SGLANG_ROCM_GDN_ONLINE_MXFP4 = EnvBool(True)
     # gfx950 only: the gated hyper-connection mix and combine above the FlyDSL row limit
-    # run as torch.bmm plus Triton kernels, without the normed residual.
+    # run as Triton kernels (the down projection a split-K kernel up to 512 rows, torch.bmm
+    # above) without the normed residual.
     SGLANG_USE_HIP_HC_PREFILL_TRITON = EnvBool(False)
     # ROCm decode attention kernel: auto (aiter_sparse on gfx950, tilelang elsewhere) |
     # aiter_sparse | tilelang | triton | torch | comparison | unified_kv_triton
