@@ -15,7 +15,6 @@ register_npu_ci(
     est_time=4800,
     suite="",
     nightly=True,
-    disabled="accuracy testcase",
 )
 
 # Common environment variables shared by prefill/decode nodes
