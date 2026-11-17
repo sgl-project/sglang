@@ -122,7 +122,7 @@ import { Playground } from "/src/snippets/_playground.jsx";
 
 Agentic workloads, such as coding agents and other multi-turn, tool-using assistants, send long prompts whose prefixes grow and repeat from turn to turn. Serving them well depends on reusing the KV cache across turns, offloading it beyond GPU memory, and keeping each session on the workers that already hold its prefix. This section gives complete launch commands for such deployments, each benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) and linked to the run that measured it. Pick a hardware platform, checkpoint, deployment shape, concurrency, KV cache offloading mechanism and router to get every process of the deployment as a raw command, one tab per process in launch order.
 
-- **Router.** Each configuration was submitted behind one front door: Dynamo (`dynamo.frontend` with `dynamo.sglang` workers) or SGLang (`sglang.launch_server`, behind `sglang_router` when there are several workers or DP-attention ranks).
+- **Router.** Each configuration was submitted behind one front door: Dynamo (`dynamo.frontend` with `dynamo.sglang` workers) or SGLang (`sglang.launch_server`, behind a router when there are several workers or DP-attention ranks).
 - **KV offload.** Choose among these KV cache offloading mechanisms: none (GPU KV only), HiCache (host DRAM), or a Mooncake store attached through the external linker. The Mooncake option needs an image whose SGLang build includes `--enable-unified-cache-external-linker`.
 - **Container image.** Run the commands inside the image listed for each configuration. Several are SGLang nightly images, so flag names follow that image.
 
@@ -133,15 +133,18 @@ import { agentx } from "/src/snippets/agentx/zai-org/glm-5.3.jsx";
 
 ### MI355X deployment measured with SemiAnalysis InferenceX
 
-MXFP4 checkpoint with EAGLE MTP on MI355X, benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) ([InferenceX #4593](https://github.com/SemiAnalysisAI/InferenceX/pull/4593)): TP4·EP4 with HiCache at concurrency 4–16, and TP8·EP1 with GPU-resident KV at concurrency 1–4.
+MXFP4 checkpoint with EAGLE MTP on MI355X, benchmarked in [SemiAnalysis InferenceX](https://inferencex.semianalysis.com/) ([InferenceX #4593](https://github.com/SemiAnalysisAI/InferenceX/pull/4593)): TP4·EP4 with HiCache at concurrency 4–20, and TP8·EP1 with GPU-resident KV at concurrency 1–4.
 
 - **Container image.** `lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261025` (`sha256:bb3370918fb7fc4adce40d4192e61ad7dbccbc8159e2f6063318120d0bc0e949`, the image tested in InferenceX). This dated nightly is built from `main` on 2026-10-25 and includes [#40776](https://github.com/sgl-project/sglang/pull/40776), which the checkpoint needs to load; the `v0.5.22` release does not.
 - **Batch limits.** Set `--max-running-requests` and `--cuda-graph-max-bs-decode` to twice the concurrency. The commands below use concurrency 10 for TP4·EP4 and 4 for TP8·EP1.
-- **HiCache.** `--hicache-size` is the host tier in GB per rank, so 180 GB needs about 720 GB of host memory across the four ranks.
+- **HiCache.** `--hicache-size` is the host tier in GB per rank, so 180 GB needs about 720 GB of host memory across the four ranks. With `--hicache-write-policy write_back`, a page reaches the host tier when it leaves the GPU, so the host tier adds to the device KV capacity instead of mirroring it.
+- **TreeCore backend.** Set `SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python` with write-back. Each rank picks the Rust or the Python TreeCore on its own, and the two fold the write-back reclaim digest differently, so ranks that end up on different cores stop the scheduler with `write_back duplicate-reclaim victims diverged across PP/TP ranks` ([#48112](https://github.com/sgl-project/sglang/pull/48112)).
+- **Prefill CUDA graphs.** TP4·EP4 captures prefill with `--cuda-graph-backend-prefill breakable`. TP8·EP1 keeps eager prefill: in this image, aiter `gemm_afp4wfp4` returns non-finite rows for the TP8 dense `down_proj` shape, and the sampler's device assert then stops the server.
 
-```bash TP4·EP4 (concurrency 4–16)
+```bash TP4·EP4 (concurrency 4–20)
 SGLANG_OPT_USE_TOPK_V2=true \
 SGLANG_TIMEOUT_KEEP_ALIVE=900 \
+SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND=python \
 python -m sglang.launch_server \
   --model-path amd/GLM-5.3-Quark-MXFP4-AttnFP8 \
   --tp-size 4 \
@@ -160,9 +163,10 @@ python -m sglang.launch_server \
   --speculative-num-steps 5 \
   --speculative-eagle-topk 1 \
   --speculative-num-draft-tokens 6 \
+  --cuda-graph-backend-prefill breakable \
   --enable-hierarchical-cache \
   --hicache-size 180 \
-  --hicache-write-policy write_through \
+  --hicache-write-policy write_back \
   --watchdog-timeout 1800 \
   --host 0.0.0.0 \
   --port 30000
@@ -192,6 +196,61 @@ python -m sglang.launch_server \
   --watchdog-timeout 1800 \
   --host 0.0.0.0 \
   --port 30000
+```
+
+### MI355X FP8 deployment with the AMD monokernel
+
+Official FP8 checkpoint `zai-org/GLM-5.3` with EAGLE MTP, an FP8 E4M3 KV cache, and the AMD monokernel on MI355X, measured with the InferenceX AgentX harness ([InferenceX #4829](https://github.com/SemiAnalysisAI/InferenceX/pull/4829)): TP8·EP1 with GPU-resident KV at concurrency 1–10. Concurrency counts live sessions, not requests, because subagent branches fan out within one session.
+
+- **Checkpoint.** The monokernel accepts only FP8 block-128 weights. With the MXFP4 checkpoint of the [recipe above](#mi355x-deployment-measured-with-semianalysis-inferencex), `--enable-amd-monokernel` stops the server at startup.
+- **Monokernel.** `--enable-amd-monokernel` runs the target model's verify step on the gfx950 monokernel when one or two requests are running (4 or 8 tokens a step). Larger steps take the normal forward, so the kernel serves fewer steps as concurrency grows.
+- **KV cache.** Keep `--kv-cache-dtype fp8_e4m3`. The monokernel also accepts the BF16 cache, but BF16 KV slows the DSA prefill and raises TTFT on long agentic prompts.
+- **Container image.** Use `lmsysorg/sglang-rocm:v0.5.23-rocm720-mi35x-20261105` or a later MI35x image. Its SGLang pins sgl-amd-mono [`e52803f9`](https://github.com/sgl-project/sgl-amd-mono/commit/e52803f9d2b7dabff4bfd2f53ec25c03d56af947), which contains the FP8 KV support of [sgl-amd-mono#60](https://github.com/sgl-project/sgl-amd-mono/pull/60) and the GLM-5.3 kernels of [sgl-amd-mono#85](https://github.com/sgl-project/sgl-amd-mono/pull/85) and [#86](https://github.com/sgl-project/sgl-amd-mono/pull/86). With a pin that predates sgl-amd-mono#60, the monokernel does not accept the FP8 KV cache, and the server exits at startup.
+
+The braced value `{max-running-requests}` follows concurrency and sets both `--max-running-requests` and `--cuda-graph-max-bs-decode`:
+
+<table style={{width: "100%", borderCollapse: "collapse", tableLayout: "fixed"}}>
+  <thead>
+    <tr style={{borderBottom: "2px solid #d55816"}}>
+      <th style={{textAlign: "left",  padding: "10px 12px", fontWeight: 700, width: "40%"}}>Concurrency</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>1</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>2</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>4</th>
+      <th style={{textAlign: "right", padding: "10px 12px", fontWeight: 700}}>10</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td style={{padding: "9px 12px"}}>max-running-requests</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>2</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>4</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>8</td>
+      <td style={{padding: "9px 12px", textAlign: "right"}}>20</td>
+    </tr>
+  </tbody>
+</table>
+
+```bash TP8·EP1 (concurrency 1–10)
+sglang serve \
+  --model-path zai-org/GLM-5.3 \
+  --trust-remote-code \
+  --tp 8 \
+  --ep-size 1 \
+  --dsa-prefill-backend tilelang \
+  --dsa-decode-backend tilelang \
+  --kv-cache-dtype fp8_e4m3 \
+  --speculative-algorithm EAGLE \
+  --speculative-num-steps 3 \
+  --speculative-eagle-topk 1 \
+  --speculative-num-draft-tokens 4 \
+  --enable-amd-monokernel \
+  --mem-fraction-static 0.85 \
+  --chunked-prefill-size 32768 \
+  --max-running-requests {max-running-requests} \
+  --cuda-graph-max-bs-decode {max-running-requests} \
+  --reasoning-parser auto \
+  --tool-call-parser auto \
+  --watchdog-timeout 1800
 ```
 
 ## 1. Model Introduction
@@ -237,11 +296,11 @@ python -m sglang.launch_server \
 - **Memory.** The FP8 weights are large (MoE total, not active params). Start around `--mem-fraction-static 0.8` on H200 (TP8) and tune up; raise it for the 4-GPU GB300 single-node layout (TP4).
 - **DP-Attention + DeepEP** for the balanced/high-throughput strategies spreads attention across data-parallel ranks and routes MoE through DeepEP.
 - **BF16 weights need more GPUs.** The full-precision build (`zai-org/GLM-5.3-BF16`, ~1.5 TB) does not fit a single 8×H200 / 8×B200 / 4×GB300 node. It fits single-node on **8×B300** (TP8, ~2.1 TB HBM); on the smaller GPUs it needs a **multi-node** layout (e.g. 2×8×H200 or 2×8×B200 at TP16, 2×4×GB300 at TP8). FP8 is the recommended deployment. Use the same DSA / MTP / chunked-prefill guidance as FP8.
-- **PD Disaggregation (prefill/decode).** GLM-5.3 is a DSA model and runs under prefill/decode disaggregation — toggle the **PD Disagg** card in the [Playground above](#playground) (pick a Prefill/Decode role + transfer backend, then front the roles with `sglang_router.launch_router --pd-disaggregation`). The Mooncake backend **auto-detects the InfiniBand HCA**, so no device flag is needed by default; only add `--disaggregation-ib-device mlx5_0` (your NIC) if auto-detection picks the wrong device or KV transfer fails to connect. On H200 Docker, expose the IB HCAs to the container (`--privileged --ulimit memlock=-1`, or `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK`) — without IB exposure Mooncake silently falls back to TCP.
+- **PD Disaggregation (prefill/decode).** GLM-5.3 is a DSA model and runs under prefill/decode disaggregation — toggle the **PD Disagg** card in the [Playground above](#playground) (pick a Prefill/Decode role + transfer backend, then front the roles with the `sgl-router` command the card prints). The Mooncake backend **auto-detects the InfiniBand HCA**, so no device flag is needed by default; only add `--disaggregation-ib-device mlx5_0` (your NIC) if auto-detection picks the wrong device or KV transfer fails to connect. On H200 Docker, expose the IB HCAs to the container (`--privileged --ulimit memlock=-1`, or `--device /dev/infiniband:/dev/infiniband --cap-add IPC_LOCK`) — without IB exposure Mooncake silently falls back to TCP.
 - **Chunked-prefill size is regime-dependent.** For long-input balanced workloads, start with `--chunked-prefill-size 32768` and tune it together with `--max-running-requests` for your input length and KV capacity. Keep the default chunked-prefill size for the high-throughput recipe unless profiling shows that prefill is the bottleneck.
 
 - **AMD GPUs (MI300X / MI325X / MI355X).** FP8 (`zai-org/GLM-5.3`) runs single-node at `tp=8` on all three. BF16 (`zai-org/GLM-5.3-BF16`, ~1.51 TB) only fits single-node on **MI325X** (2 TB HBM) and **MI355X** (2.3 TB); **MI300X** (1.5 TB) cannot hold the BF16 weights plus KV cache on one node, so use FP8 there. Use the DSA tilelang backend (`--dsa-prefill-backend tilelang --dsa-decode-backend tilelang`) and add `--chunked-prefill-size 131072` plus `--watchdog-timeout 1200` (20 min for weight loading). GLM-5.3 and DeepSeek-V3.2 share the same model structure; for other DSA / HiSparse tips see the [DeepSeek-V3.2 cookbook](../DeepSeek/DeepSeek-V3_2).
-- **MTP / EAGLE speculative decoding** is disabled for AMD in the Deploy panel because the gfx950 spec-decode draft kernel is not yet validated on this hardware (and at `--speculative-num-steps > 3` hits a separate build issue). Until MTP is validated on gfx950, omit the `--speculative-*` flags and serve without MTP. This applies to the Deploy panel's FP8 and BF16 commands; the [MI355X AgentX commands](#mi355x-deployment-measured-with-semianalysis-inferencex) run EAGLE MTP with `--speculative-num-steps 5` on the MXFP4 checkpoint and `lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261025`.
+- **MTP / EAGLE speculative decoding on AMD.** On MI355X, the FP8 low-latency Deploy cell serves EAGLE with 3 steps, top-k 1, and 4 draft tokens, as the [MI355X FP8 agentic recipe](#mi355x-fp8-deployment-with-the-amd-monokernel) does. The Playground's 1-1-2 and 5-1-6 presets also run on the MI355X FP8 cells, except 5-1-6 on the high-throughput cell, which runs out of memory at startup. The [MI355X AgentX commands](#mi355x-deployment-measured-with-semianalysis-inferencex) run EAGLE with `--speculative-num-steps 5` on the MXFP4 checkpoint and `lmsysorg/sglang-rocm:v0.5.22-rocm10-mi35x-20261025`. The other AMD Deploy cells serve without MTP, and MTP is not validated with the BF16 checkpoint or on MI300X / MI325X.
 
 ## 3. Advanced Usage
 

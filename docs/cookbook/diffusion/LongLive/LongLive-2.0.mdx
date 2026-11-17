@@ -79,9 +79,9 @@ sglang generate \
 Multi-shot prompts are sampling parameters, so pass them through the Python API:
 
 ```python Python
-from sglang import DiffGenerator
+from sglang.multimodal_gen import DiffGenerator
 
-gen = DiffGenerator.from_pretrained("Rabinovich/LongLive-2.0-5B-Diffusers")
+gen = DiffGenerator.from_pretrained(model_path="Rabinovich/LongLive-2.0-5B-Diffusers")
 result = gen.generate(sampling_params_kwargs={
     "shot_prompts": [
         "A husky walks down a sunlit hallway.",

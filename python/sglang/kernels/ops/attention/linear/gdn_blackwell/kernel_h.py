@@ -731,6 +731,3 @@ def h_cutedsl(
         chunk_offsets,
         state_indices,
     )
-
-
-h_v2b_cutedsl = h_cutedsl

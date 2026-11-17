@@ -32,6 +32,39 @@ EXPERTS_LAYER = "model.language_model.layers.0.mlp.experts"
 GATE_PROJ = f"{EXPERTS_LAYER}.0.gate_proj"
 MLP_LAYER = "model.language_model.layers.0.mlp.gate_proj"
 
+# A vision tower whose ignore list is spelled against the CompressedLinear
+# wrapper. The names below are the prefixes the matcher actually receives:
+# ClippableQKVParallelLinear and ClippableGateUpParallelLinear hand their own
+# prefix to the inner fused linear, while ClippableRowParallelLinear nests its
+# inner linear at ".linear".
+VISION_PREFIX = "model.vision_tower.encoder.layers"
+VISION_QKV_LAYER = f"{VISION_PREFIX}.0.self_attn.qkv_proj"
+VISION_GATE_UP_LAYER = f"{VISION_PREFIX}.0.mlp.gate_up_proj"
+VISION_O_PROJ_LAYER = f"{VISION_PREFIX}.0.self_attn.o_proj.linear"
+VISION_DOWN_PROJ_LAYER = f"{VISION_PREFIX}.0.mlp.down_proj.linear"
+VISION_FUSED_MAPPING = {
+    "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+    "gate_up_proj": ["gate_proj", "up_proj"],
+}
+VISION_NUM_LAYERS = 27
+TEXT_PREFIX = "model.language_model.layers.0"
+
+
+def _wrapped_tower_ignore_list():
+    """27 layers x 7 projections, every entry spelled ``<module>.linear``.
+
+    135 name fused shards (q/k/v, gate/up) and 54 name unfused layers
+    (o_proj, down_proj).
+    """
+    entries = []
+    for idx in range(VISION_NUM_LAYERS):
+        for proj in ("q_proj", "k_proj", "v_proj", "o_proj"):
+            entries.append(f"{VISION_PREFIX}.{idx}.self_attn.{proj}.linear")
+        for proj in ("gate_proj", "up_proj", "down_proj"):
+            entries.append(f"{VISION_PREFIX}.{idx}.mlp.{proj}.linear")
+    return entries
+
+
 FP8_TARGET = "re:.*self_attn\\.(q|k|v|o)_proj$"
 NVFP4_TARGET = "re:.*mlp\\.experts\\.\\d+\\.(gate|up|down)_proj$"
 WNA16_TARGET = "re:.*mlp\\.(gate|up|down)_proj$"
@@ -148,6 +181,189 @@ class TestIgnoreListPrefixMatching(CustomTestCase):
         self.assertTrue(check_equal_or_regex_match(GATE_PROJ, [GATE_PROJ]))
         self.assertTrue(check_equal_or_regex_match(GATE_PROJ, ["re:.*gate_proj$"]))
         self.assertFalse(check_equal_or_regex_match(GATE_PROJ, ["re:.*down_proj$"]))
+
+
+class TestFusedIgnoreLinearWrapper(CustomTestCase):
+    """Fused shard names must honor ignores written for the CT wrapper."""
+
+    def test_all_wrapped_shards_are_ignored(self):
+        ignore = [
+            f"{VISION_PREFIX}.0.self_attn.{proj}.linear"
+            for proj in ("q_proj", "k_proj", "v_proj")
+        ]
+
+        self.assertTrue(
+            should_ignore_layer(
+                VISION_QKV_LAYER,
+                ignore=ignore,
+                fused_mapping=VISION_FUSED_MAPPING,
+            )
+        )
+
+    def test_partial_wrapped_shards_extend_inconsistent_scheme_error(self):
+        """Wrapped shards join the consistency check, so a partial list now raises.
+
+        Before this change the wrapped entry matched nothing, every shard agreed
+        on "not ignored", and the layer loaded quantized. The error boundary is
+        extended to the wrapper spelling, not preserved unchanged.
+        """
+        ignore = [f"{VISION_PREFIX}.0.mlp.gate_proj.linear"]
+
+        with self.assertRaisesRegex(ValueError, "different quantization schemes"):
+            should_ignore_layer(
+                VISION_GATE_UP_LAYER,
+                ignore=ignore,
+                fused_mapping=VISION_FUSED_MAPPING,
+            )
+
+    def test_mixed_spelling_shards_resolve_to_ignored(self):
+        """A list mixing plain and wrapped shard spellings is now consistent.
+
+        Before this change the plain entry matched and the wrapped ones did not,
+        which raised the inconsistent-scheme error. Both spellings now match, so
+        the layer is ignored instead of aborting the load.
+        """
+        ignore = [f"{VISION_PREFIX}.0.self_attn.q_proj"] + [
+            f"{VISION_PREFIX}.0.self_attn.{proj}.linear"
+            for proj in ("k_proj", "v_proj")
+        ]
+
+        self.assertTrue(
+            should_ignore_layer(
+                VISION_QKV_LAYER,
+                ignore=ignore,
+                fused_mapping=VISION_FUSED_MAPPING,
+            )
+        )
+
+    def test_wrapped_tower_list_is_honored_at_runtime_names(self):
+        """The whole wrapped list, queried at the names the tower really has.
+
+        The two fused names need the retry; the two unfused ones are already
+        nested at ".linear" by ClippableRowParallelLinear and match directly.
+        """
+        ignore = _wrapped_tower_ignore_list()
+        self.assertEqual(len(ignore), VISION_NUM_LAYERS * 7)
+
+        for idx in range(VISION_NUM_LAYERS):
+            for layer_name in (
+                f"{VISION_PREFIX}.{idx}.self_attn.qkv_proj",
+                f"{VISION_PREFIX}.{idx}.mlp.gate_up_proj",
+                f"{VISION_PREFIX}.{idx}.self_attn.o_proj.linear",
+                f"{VISION_PREFIX}.{idx}.mlp.down_proj.linear",
+            ):
+                self.assertTrue(
+                    should_ignore_layer(
+                        layer_name,
+                        ignore=ignore,
+                        fused_mapping=VISION_FUSED_MAPPING,
+                    ),
+                    layer_name,
+                )
+
+    def test_wrapped_tower_list_leaves_the_text_model_quantized(self):
+        """A tower-only ignore list must not reach the language model."""
+        ignore = _wrapped_tower_ignore_list()
+
+        for layer_name in (
+            f"{TEXT_PREFIX}.self_attn.qkv_proj",
+            f"{TEXT_PREFIX}.mlp.gate_up_proj",
+            f"{TEXT_PREFIX}.self_attn.o_proj.linear",
+            f"{TEXT_PREFIX}.mlp.down_proj.linear",
+            "lm_head",
+        ):
+            self.assertFalse(
+                should_ignore_layer(
+                    layer_name,
+                    ignore=ignore,
+                    fused_mapping=VISION_FUSED_MAPPING,
+                ),
+                layer_name,
+            )
+
+    def test_intentionally_quantized_tower_keeps_its_scheme(self):
+        config = CompressedTensorsConfig.from_config(
+            {
+                "quant_method": "compressed-tensors",
+                "format": "pack-quantized",
+                "config_groups": {"group_0": WNA16_GROUP},
+                "ignore": [],
+            }
+        )
+        config.update_packed_modules_mapping(VISION_FUSED_MAPPING)
+
+        scheme = config.get_scheme_dict(torch.nn.Linear(1, 1), VISION_GATE_UP_LAYER)
+
+        self.assertIsNotNone(
+            scheme, "an empty ignore list must not force the tower to bf16"
+        )
+
+    def test_parent_ignore_does_not_swallow_fused_children(self):
+        """The no-prefix invariant, in both spellings of the parent entry."""
+        for entry in (f"{VISION_PREFIX}.0.mlp", f"{VISION_PREFIX}.0.mlp.linear"):
+            self.assertFalse(
+                should_ignore_layer(
+                    VISION_GATE_UP_LAYER,
+                    ignore=[entry],
+                    fused_mapping=VISION_FUSED_MAPPING,
+                ),
+                entry,
+            )
+
+    def test_retry_stays_keyed_on_the_ignore_list(self):
+        """Only the wrapper suffix, only one level, only listed modules."""
+        for entry in (
+            "some.other.module.linear",
+            f"{VISION_PREFIX}.0.self_attn.q_proj.linear.linear",
+            f"{VISION_PREFIX}.0.self_attn.q_proj.weight",
+        ):
+            self.assertFalse(
+                should_ignore_layer(
+                    VISION_QKV_LAYER,
+                    ignore=[entry],
+                    fused_mapping=VISION_FUSED_MAPPING,
+                ),
+                entry,
+            )
+
+    def test_class_name_target_spelling_stays_inert(self):
+        """Configs name the class as "Linear", and matching is case-sensitive."""
+        for layer_name in (
+            VISION_QKV_LAYER,
+            VISION_O_PROJ_LAYER,
+            VISION_DOWN_PROJ_LAYER,
+        ):
+            self.assertFalse(
+                should_ignore_layer(
+                    layer_name,
+                    ignore=["Linear"],
+                    fused_mapping=VISION_FUSED_MAPPING,
+                ),
+                layer_name,
+            )
+
+    def test_bare_linear_token_reaches_fused_names_only(self):
+        """A bare "linear" entry is a suffix target, so it now reaches fused names.
+
+        It cannot reach further than that: unfused names that are not already
+        nested at ".linear" are matched exactly as before.
+        """
+        self.assertTrue(
+            should_ignore_layer(
+                VISION_QKV_LAYER,
+                ignore=["linear"],
+                fused_mapping=VISION_FUSED_MAPPING,
+            )
+        )
+        for layer_name in (f"{VISION_PREFIX}.0.self_attn.o_proj", "lm_head"):
+            self.assertFalse(
+                should_ignore_layer(
+                    layer_name,
+                    ignore=["linear"],
+                    fused_mapping=VISION_FUSED_MAPPING,
+                ),
+                layer_name,
+            )
 
 
 class TestMixedPrecisionFormat(CustomTestCase):

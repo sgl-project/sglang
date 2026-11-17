@@ -49,7 +49,7 @@ def fused_experts_fp8_sgl(
         sgl_trtllm_fp8_block_scale_routed_moe_wrapper as trtllm_fp8_block_scale_routed_moe_wrapper,
     )
     from sglang.srt.runtime_context import get_parallel
-    from sglang.srt.utils.common import next_power_of_2
+    from sglang.srt.utils.triton_utils import next_power_of_2
 
     _SUPPORTED_FP8_ACTIVATIONS = {"silu", "relu2"}
     assert runner_config.activation in _SUPPORTED_FP8_ACTIVATIONS, (

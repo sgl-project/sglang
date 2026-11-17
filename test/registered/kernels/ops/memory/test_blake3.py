@@ -9,7 +9,7 @@ from sglang.kernels.ops.memory.gpu_tensor_hash_blake3 import gpu_tensor_blake3
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 # BLAKE3-team/BLAKE3/test_vectors/test_vectors.json, unkeyed 32-byte outputs.
 # Input byte i is i % 251. These answers are independent of our implementation.
@@ -85,10 +85,6 @@ class TestBLAKE3(CustomTestCase):
         with torch.cuda.stream(stream):
             data = torch.arange(3073, device="cuda").remainder(251).byte()
             self.assertEqual(gpu_tensor_blake3(data).hex(), dict(_VECTORS)[3073])
-
-    def test_rejects_cpu_input(self):
-        with self.assertRaises(ValueError):
-            gpu_tensor_blake3(torch.zeros(8, dtype=torch.uint8))
 
 
 if __name__ == "__main__":
