@@ -3,8 +3,9 @@ Conv2d/Conv3d layers with unfold+linear optimization for patch embeddings.
 
 When kernel_size == stride, padding == 0, dilation == 1, groups == 1, the conv
 is equivalent to unfold + F.linear, which is significantly faster on CUDA and
-also avoids the PyTorch 2.9.1 + CuDNN < 9.15 Conv3d bug
-(https://github.com/pytorch/pytorch/issues/168167).
+also avoids known PyTorch 2.9.x Conv3d performance regressions
+(https://github.com/pytorch/pytorch/issues/166122 and
+https://github.com/pytorch/pytorch/issues/168167).
 """
 
 import math
@@ -16,7 +17,15 @@ import torch.nn.functional as F
 
 from sglang.kernels.fused_op import BaseFusedOp
 from sglang.srt.layers.amx_utils import PackWeightMethod
-from sglang.srt.utils import cpu_has_amx_support, is_cpu, use_intel_amx_backend
+from sglang.srt.utils import (
+    cpu_has_amx_support,
+    is_cpu,
+    is_cuda,
+    is_hip,
+    print_warning_once,
+    torch_release,
+    use_intel_amx_backend,
+)
 
 _is_cpu = is_cpu()
 _is_cpu_amx_available = cpu_has_amx_support()
@@ -25,6 +34,26 @@ if _is_cpu and _is_cpu_amx_available:
 
 _VALID_PADDING_STRINGS = {"same", "valid"}
 _VALID_PADDING_MODES = {"zeros", "reflect", "replicate", "circular"}
+
+
+def _is_conv3d_linear_fallback_required() -> bool:
+    """Return whether this CUDA runtime has a known Conv3d regression."""
+    if not is_cuda() or is_hip():
+        return False
+
+    # PyTorch 2.9.0 disabled cuDNN Conv3d because of correctness issues,
+    # causing a significant AMP performance regression.
+    if torch_release[:3] == (2, 9, 0):
+        return True
+    if torch_release[:3] != (2, 9, 1):
+        return False
+
+    try:
+        cudnn_version = torch.backends.cudnn.version()
+    except Exception:
+        cudnn_version = None
+
+    return cudnn_version is None or cudnn_version < 91500
 
 
 def _tuplify(val, n: int) -> tuple:
@@ -246,9 +275,21 @@ class Conv3dLayer(BaseFusedOp):
             self._reversed_padding_repeated_twice = _reverse_repeat_tuple(self.padding)
 
         padding_tuple = self.padding if isinstance(self.padding, tuple) else (1, 1, 1)
-        self.enable_linear = not disable_linear and _check_enable_linear(
+        self._linear_fallback_available = _check_enable_linear(
             self.kernel_size, self.stride, padding_tuple, self.dilation, groups
         )
+        self.enable_linear = not disable_linear and self._linear_fallback_available
+        self._force_linear_on_cuda = (
+            disable_linear
+            and self._linear_fallback_available
+            and _is_conv3d_linear_fallback_required()
+        )
+        if self._force_linear_on_cuda:
+            print_warning_once(
+                "Conv3dLayer uses unfold + linear instead of Conv3d despite "
+                "disable_linear=True, because this PyTorch/cuDNN runtime has "
+                "a severe Conv3d performance regression."
+            )
 
         self.weight = nn.Parameter(
             torch.empty(out_channels, in_channels // groups, *self.kernel_size)
@@ -309,11 +350,12 @@ class Conv3dLayer(BaseFusedOp):
         return self.forward_native(x)
 
     def forward_native(self, x: torch.Tensor) -> torch.Tensor:
-        if self.enable_linear:
+        # BaseFusedOp routes torch.compile here, so this must match forward_cuda.
+        if self.enable_linear or self._force_linear_on_cuda:
             return self._forward_mulmat(x)
         return self._forward_conv(x)
 
     def forward_cuda(self, x: torch.Tensor) -> torch.Tensor:
-        if self.enable_linear:
+        if self.enable_linear or self._force_linear_on_cuda:
             return self._forward_mulmat(x)
         return self._forward_conv(x)
