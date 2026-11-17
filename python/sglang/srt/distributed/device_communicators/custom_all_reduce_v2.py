@@ -557,11 +557,21 @@ class CustomAllReduceV2:
             return None
         # 1shot sizes stay unfused: on gfx1250 TP8 the fused 1shot trailed
         # all-reduce + a separate norm
-        if not self.uses_two_shot_push(num_rows * row_bytes):
+        nbytes = num_rows * row_bytes
+        if not self.uses_two_shot_push(nbytes):
+            return None
+        # hier_2shot_push also reports TWO_SHOT_PUSH; on partition pairs its
+        # pair + cross stages beat the flat 2shot_push this kernel runs
+        if (
+            self.forced_algo is None
+            and choose_algo(
+                self.config, nbytes, can_use_graph=self._can_use_graph()
+            ).use_hier
+        ):
             return None
         # a slot holds the partial and the reduced copy of each rank's rows
         rows_per_rank = -(-num_rows // self.world_size)
-        if 2 * rows_per_rank * row_bytes > self.max_push_size:
+        if 2 * rows_per_rank * row_bytes > self._max_push_size:
             return None
         return custom_all_reduce_rmsnorm(self.obj, input, residual, weight, eps)
 
