@@ -153,6 +153,7 @@ from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
     drop_elastic_cuda_graph_state,
     finalize_cuda_graph_capture,
     recapture_elastic_cuda_graph,
+    release_decode_cuda_graph,
     resolve_elastic_cuda_graph_config,
     sync_elastic_cuda_graph_config,
     validate_elastic_cuda_graph_recapture,
@@ -1721,6 +1722,9 @@ class ModelRunner:
             self.capture_tail_hooks.append(self.uocr_greedy_graph.capture_tail_hook)
 
     def init_decode_cuda_graph(self):
+        release_decode_cuda_graph(
+            decode_runner=self.decode_cuda_graph_runner, eager_runner=self.eager_runner
+        )
         self.decode_cuda_graph_runner = None
         capture = capture_decode_graph(model_runner=self)
         self.decode_cuda_graph_runner = capture.runner

@@ -368,14 +368,14 @@ def _decode_reference(qn, qr, idx, kd, sm, mxfp8_q=True):
 
 
 @pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
-def test_dcp_partial_reads_the_indexer_local_slots():
-    """Sharded index-K hands the backend this rank's compact slots and their counts
-    (dcp_local_topk); localizing them again reads other requests' KV. DCP8 decode
-    attends with the group's 96 gathered heads on the gfx950 split-K kernel."""
-    kv, kd = _scaled_fp8_ds_mla_kv(_N, seed=0)
+@pytest.mark.parametrize("num_splits", [1, 8])
+def test_sparse_mla_decode_gfx950_reads_counted_slots(num_splits):
+    """Row r attends to its first topk_length[r] slots, whole or split over the KV and
+    merged; a row with no key returns -inf LSE."""
+    kv, kd = _scaled_fp8_ds_mla_kv(_N, seed=1)
     kv = kv.view(torch.float8_e4m3fn)
-    lens = [256, 0, 1, 255]  # this rank's share of a 2048 top-k under DCP8
-    R, H = len(lens) + 2, 96  # two graph-padding rows select nothing
+    lens = [_TOPK, 1, 0, 1000]
+    R, H = len(lens), 16
     qkv = torch.randn(R, H, _DV + _DR, device=_DEVICE).bfloat16()
     qn, qr = qkv[..., :_DV], qkv[..., _DV:]
     idx = torch.full((R, _TOPK), -1, dtype=torch.int32, device=_DEVICE)
@@ -383,21 +383,15 @@ def test_dcp_partial_reads_the_indexer_local_slots():
         idx[r, :n] = torch.randperm(_N, device=_DEVICE)[:n].int()
     lengths = torch.tensor(lens, dtype=torch.int32, device=_DEVICE)
     sm = (_DV + _DR) ** -0.5
-    backend = SimpleNamespace(
-        _triton_sparse_mla_workspaces={},
-        attn_dcp_size=8,
-        forward_metadata=SimpleNamespace(dcp_topk_length=lengths),
+    assert mla_gfx950.supports_sparse_mla_decode_gfx950(qn, kv, _DV)
+    o, lse = mla_gfx950.sparse_mla_decode_gfx950(
+        qn, qr, kv, idx.unsqueeze(1), sm, lengths, num_splits=num_splits
     )
-    layer = SimpleNamespace(scaling=sm, v_head_dim=_DV)
-    o, lse = dsa_backend_hip.forward_triton_dcp_partial(backend, qn, qr, kv, idx, layer)
-    # the slots past each row's count hold -1, so the reference reads only its keys
-    o_ref, lse_ref = _decode_reference(
-        qn, qr, idx, kd, sm, mxfp8_q=dsa_backend_hip._gfx950_decode_enabled()
-    )
+    o_ref, lse_ref = _decode_reference(qn, qr, idx, kd, sm)
     finite = torch.isfinite(lse_ref)
     assert torch.equal(torch.isfinite(lse), finite)
     torch.testing.assert_close(lse[finite], lse_ref[finite], rtol=0, atol=1e-3)
-    torch.testing.assert_close(o.float(), o_ref, rtol=0, atol=3e-2)
+    torch.testing.assert_close(o[0].float(), o_ref, rtol=0, atol=3e-2)
 
 
 @pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 only")
@@ -433,6 +427,39 @@ def test_sparse_mla_prefill_gfx950():
     o, r = out[0, keep].float(), ref_out[keep]
     assert ((o - r).norm() / r.norm()).item() < 4e-3
     torch.testing.assert_close(lse[keep], ref_lse[keep], rtol=0, atol=1e-4)
+
+
+@pytest.mark.skipif(not is_gfx95_supported(), reason="gfx950 kernel")
+def test_dcp_partial_reads_the_indexer_local_slots():
+    """Sharded index-K hands the backend this rank's compact slots and their counts
+    (dcp_local_topk); localizing them again reads other requests' KV. DCP8 decode
+    attends with the group's 96 gathered heads on the gfx950 split-K kernel."""
+    kv, kd = _scaled_fp8_ds_mla_kv(_N, seed=0)
+    kv = kv.view(torch.float8_e4m3fn)
+    lens = [256, 0, 1, 255]  # this rank's share of a 2048 top-k under DCP8
+    R, H = len(lens) + 2, 96  # two graph-padding rows select nothing
+    qkv = torch.randn(R, H, _DV + _DR, device=_DEVICE).bfloat16()
+    qn, qr = qkv[..., :_DV], qkv[..., _DV:]
+    idx = torch.full((R, _TOPK), -1, dtype=torch.int32, device=_DEVICE)
+    for r, n in enumerate(lens):
+        idx[r, :n] = torch.randperm(_N, device=_DEVICE)[:n].int()
+    lengths = torch.tensor(lens, dtype=torch.int32, device=_DEVICE)
+    sm = (_DV + _DR) ** -0.5
+    backend = SimpleNamespace(
+        _triton_sparse_mla_workspaces={},
+        attn_dcp_size=8,
+        forward_metadata=SimpleNamespace(dcp_topk_length=lengths),
+    )
+    layer = SimpleNamespace(scaling=sm, v_head_dim=_DV)
+    o, lse = dsa_backend_hip.forward_triton_dcp_partial(backend, qn, qr, kv, idx, layer)
+    # the slots past each row's count hold -1, so the reference reads only its keys
+    o_ref, lse_ref = _decode_reference(
+        qn, qr, idx, kd, sm, mxfp8_q=dsa_backend_hip._gfx950_decode_enabled()
+    )
+    finite = torch.isfinite(lse_ref)
+    assert torch.equal(torch.isfinite(lse), finite)
+    torch.testing.assert_close(lse[finite], lse_ref[finite], rtol=0, atol=1e-3)
+    torch.testing.assert_close(o.float(), o_ref, rtol=0, atol=3e-2)
 
 
 if __name__ == "__main__":

@@ -1315,7 +1315,6 @@ class HybridLinearAttnBackend(AttentionBackend):
         self.token_to_kv_pool = full_attn_backend.token_to_kv_pool
         self.req_to_token_pool = full_attn_backend.req_to_token_pool
         self.runner_ids = full_attn_backend.runner_ids
-        self.plans_padded_extend_rows = full_attn_backend.plans_padded_extend_rows
         self.max_context_len = getattr(full_attn_backend, "max_context_len", None)
         self.needs_cpu_seq_lens = (
             full_attn_backend.needs_cpu_seq_lens
@@ -1347,6 +1346,10 @@ class HybridLinearAttnBackend(AttentionBackend):
         # wrapper since split backends are wrapped once (#31439); the full-attn
         # side owns the KV cache, so its dtype is authoritative.
         return self.full_attn_backend.data_type
+
+    @property
+    def plans_padded_extend_rows(self) -> bool:
+        return self.full_attn_backend.plans_padded_extend_rows
 
     @property
     def supports_ragged_verify_graph(self) -> bool:

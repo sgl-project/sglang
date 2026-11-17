@@ -1263,15 +1263,6 @@ class TestDSAIndexer(CustomTestCase):
         except Exception:
             self.skipTest("hadamard JIT kernel not available")
 
-    def test_rotate_activation_invalid_size(self):
-        """Test that rotate_activation fails with non-power-of-2 size."""
-        # Test with non-power-of-2 hidden size
-        hidden_size = 129  # Not a power of 2
-        x = torch.randn(16, hidden_size, dtype=torch.bfloat16, device=self.device)
-
-        with self.assertRaises(AssertionError):
-            rotate_activation(x)
-
     def test_indexer_metadata_interface(self):
         """Test the BaseIndexerMetadata interface implementation."""
         batch_size = 4

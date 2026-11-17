@@ -126,6 +126,7 @@ from sglang.srt.runtime_context import (
     linear_attn_tp_size,
 )
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import is_npu
 from sglang.srt.utils.common import BumpAllocator, LazyValue
 from sglang.srt.utils.log_utils import log_info_on_rank0
 
@@ -242,6 +243,7 @@ class Glm5NextVisionBlock(GlmOcrVisionBlock):
             qkv_bias=attn_qkv_bias,
             proj_bias=True,
             qk_normalization_by_head_size=True,
+            layer_norm_eps=rms_norm_eps,
             flatten_batch=True,
             quant_config=quant_config,
             prefix=add_prefix("attn", prefix),
@@ -1306,6 +1308,16 @@ class Glm5NextForConditionalGeneration(nn.Module):
     hf_to_sglang_mapper = WeightsMapper(
         orig_to_new_substr={
             "model.visual": "visual",
+            **(
+                {
+                    # ModelSlim W8A8 checkpoint naming variants.
+                    ".forget_gate.": ".",
+                    ".attn_hc.": ".hc_attn_",
+                    ".ffn_hc.": ".hc_ffn_",
+                }
+                if is_npu()
+                else {}
+            ),
         },
         orig_to_new_prefix={
             "model.language_model.": "model.",
@@ -1320,6 +1332,19 @@ class Glm5NextForConditionalGeneration(nn.Module):
         "gate_up_proj": ["gate_proj", "up_proj"],
     }
     fall_back_to_pt_during_load = False
+
+    @classmethod
+    def register_modelslim_projection_aliases(
+        cls, quant_config: Optional[QuantizationConfig]
+    ) -> None:
+        if quant_config is None or quant_config.get_name() != "modelslim":
+            return
+        quant_config.update_packed_modules_mapping(
+            {
+                "f_a_proj": ["forget_gate.f_a_proj"],
+                "f_b_proj": ["forget_gate.f_b_proj"],
+            }
+        )
 
     def __init__(
         self,
@@ -1342,6 +1367,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.pp_group = get_parallel().pp_group
         self.config = text_config
         self.quant_config = quant_config
+        self.register_modelslim_projection_aliases(quant_config)
         self.use_dsa = is_deepseek_dsa(text_config)
         self.num_fused_shared_experts = 0
         self.model = None
@@ -1752,6 +1778,7 @@ class Glm5NextForConditionalGeneration(nn.Module):
             return hidden_states
 
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        weights = Glm5NextForConditionalGeneration.hf_to_sglang_mapper.apply(weights)
         if is_nextn:
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers

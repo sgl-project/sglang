@@ -1,4 +1,4 @@
-"""Kimi-K3 TP8 KDA recurrent launch on gfx950: the narrow tile for n <= 4 requests."""
+"""Kimi-K3 TP8 KDA recurrent launch on gfx950: narrow tiles for small batches."""
 
 import sys
 
@@ -31,16 +31,15 @@ def test_only_small_kimi_k3_kda_batches_take_the_narrow_tile():
         assert _select_recurrent_launch_config(
             n=n, h=H, hv=HV, k=K, v=V, is_kda=True, target_verify=False
         ) == (8, 1)
-    # Target verify takes the day-0 tiles measured for the 8-token K3.1 verify.
-    for n, tile in ((1, 4), (4, 8), (5, 16), (9, 32)):
+    for n, bv in ((1, 4), (2, 4), (4, 8), (5, 16), (8, 16), (9, 32)):
         assert _select_recurrent_launch_config(
             n=n, h=H, hv=HV, k=K, v=V, is_kda=True, target_verify=True
-        ) == (tile, 1)
+        ) == (bv, 1)
     assert _select_recurrent_launch_config(
         n=1, h=H, hv=HV, k=K, v=V, is_kda=False, target_verify=True
     ) == (32, 1)
     assert _select_recurrent_launch_config(
-        n=1, h=8, hv=8, k=K, v=V, is_kda=True, target_verify=False
+        n=1, h=8, hv=8, k=K, v=V, is_kda=True, target_verify=True
     ) == (32, 1)
 
 
@@ -80,7 +79,7 @@ def _run(monkeypatch, launch_config, inputs: dict, rings: dict) -> tuple:
     return out, state, rings
 
 
-@pytest.mark.parametrize("n", [1, 4])
+@pytest.mark.parametrize("n", [1, 4, 8])
 @pytest.mark.parametrize("t", [4, 8])
 def test_narrow_verify_launch_is_bit_exact(n: int, t: int, monkeypatch):
     """Verify output and ReplaySSM rings match the BV=32 launch bit for bit."""

@@ -3105,6 +3105,12 @@ Combining `--enable-response-store` with `--disaggregation-mode=prefill` or `dec
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>—</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: int (one or more)</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--gc-freeze-on-idle-secs`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>After the scheduler has been idle this many seconds, run a full garbage collection and freeze the surviving objects, so later collections do not scan them. Runs once per idle period. A cache flush or PD role switch unfreezes the heap until the next idle check. Any request, including a /health or /health_generate probe, restarts the idle timer. At most every 10 minutes, an idle freeze also unfreezes first, so frozen garbage is freed and logged. Set to 0 to disable.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`0.0`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: float</td>
+    </tr>
 </tbody>
 </table>
 
