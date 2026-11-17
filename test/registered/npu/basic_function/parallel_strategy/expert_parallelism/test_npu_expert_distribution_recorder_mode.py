@@ -11,14 +11,16 @@ from sglang.test.ascend.test_ascend_utils import (
 )
 from sglang.test.ci.ci_register import register_npu_ci
 from sglang.test.test_utils import (
+    ADMIN_LAUNCH_ARGS_FOR_TEST,
     DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
     DEFAULT_URL_FOR_TEST,
     CustomTestCase,
+    admin_post,
     popen_launch_server,
 )
 
-register_npu_ci(est_time=400, suite="base-b-test-2-npu-a3")
-register_npu_ci(est_time=400, suite="nightly-2-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="extra-b-test-2-npu-a3")
+register_npu_ci(est_time=400, suite="nightly-test-2-npu-a3", nightly=True)
 
 
 class TestExpertDistributionRecorderModeStatic(CustomTestCase):
@@ -30,6 +32,7 @@ class TestExpertDistributionRecorderModeStatic(CustomTestCase):
     """
 
     expert_distribution_recorder_mode = "stat"
+    enable_eplb = True
 
     path = "/tmp/pt"
 
@@ -50,13 +53,14 @@ class TestExpertDistributionRecorderModeStatic(CustomTestCase):
                 "2",
                 "--expert-parallel-size",
                 "2",
-                "--enable-eplb",
+                *(["--enable-eplb"] if cls.enable_eplb else []),
                 "--moe-a2a-backend",
                 "deepep",
                 "--deepep-mode",
                 "normal",
                 "--expert-distribution-recorder-mode",
                 cls.expert_distribution_recorder_mode,
+                *ADMIN_LAUNCH_ARGS_FOR_TEST,
             ],
             env={
                 "PYTORCH_NPU_ALLOC_CONF": (
@@ -77,7 +81,9 @@ class TestExpertDistributionRecorderModeStatic(CustomTestCase):
 
     def test_recorder_mode(self):
         # Start recording
-        requests.post(f"{DEFAULT_URL_FOR_TEST}/start_expert_distribution_record")
+        admin_post(
+            f"{DEFAULT_URL_FOR_TEST}/start_expert_distribution_record",
+        )
 
         response = requests.post(
             f"{DEFAULT_URL_FOR_TEST}/generate",
@@ -97,10 +103,14 @@ class TestExpertDistributionRecorderModeStatic(CustomTestCase):
         )
 
         # Stop recording
-        requests.post(f"{DEFAULT_URL_FOR_TEST}/stop_expert_distribution_record")
+        admin_post(
+            f"{DEFAULT_URL_FOR_TEST}/stop_expert_distribution_record",
+        )
 
         # Export the .pt file
-        requests.post(f"{DEFAULT_URL_FOR_TEST}/dump_expert_distribution_record")
+        admin_post(
+            f"{DEFAULT_URL_FOR_TEST}/dump_expert_distribution_record",
+        )
 
         # Check distribution_recorder_files
         distribution_recorder_suffixes = ["*.pt"]
@@ -124,10 +134,12 @@ class TestExpertDistributionRecorderModeStatApprox(
 
 class TestExpertDistributionRecorderPerPass(TestExpertDistributionRecorderModeStatic):
     expert_distribution_recorder_mode = "per_pass"
+    enable_eplb = False
 
 
 class TestExpertDistributionRecorderPerToken(TestExpertDistributionRecorderModeStatic):
     expert_distribution_recorder_mode = "per_token"
+    enable_eplb = False
 
 
 if __name__ == "__main__":

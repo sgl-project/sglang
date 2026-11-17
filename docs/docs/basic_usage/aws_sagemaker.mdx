@@ -144,5 +144,14 @@ model.tar.gz
   (60 to 3600 seconds) on the
   [ProductionVariant](https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_ProductionVariant.html)
   or [InferenceComponentStartupParameters](https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_InferenceComponentStartupParameters.html).
-- The endpoint exposes an OpenAI-compatible API, so the request body matches the SGLang server's
-  `/v1/chat/completions` schema.
+- SageMaker sends every inference request to `/invocations`, which picks the OpenAI-compatible
+  route from the request body. The first of these keys present wins:
+
+  | Body key | Handled as | Notes |
+  |---|---|---|
+  | `messages` | `/v1/chat/completions` | |
+  | `prompt` | `/v1/completions` | |
+  | `input` | `/v1/embeddings` | Launch the server with `--is-embedding` |
+
+  `stream: true` works for chat and completions. Send `Content-Type: application/json`.
+  Other routes (responses, classify, rerank, score) are not reachable through `/invocations`.

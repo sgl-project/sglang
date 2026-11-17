@@ -21,9 +21,9 @@ from sglang.kernels.ops.attention.dsv4.online_c128_mtp import (
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
 register_cuda_ci(
-    est_time=10, stage="base-b-kernel-benchmark", runner_config="1-gpu-large"
+    est_time=10, stage="base-b-kernel-benchmark", runner_config="1-gpu-small"
 )
-register_amd_ci(est_time=10, stage="jit-kernel-benchmark", runner_config="amd")
+register_amd_ci(est_time=10, stage="base-a-jit-kernel-benchmark", runner_config="amd")
 
 HEAD_DIM = 512
 STATE_DIM = HEAD_DIM * 3

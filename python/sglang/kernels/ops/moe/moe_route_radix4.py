@@ -12,8 +12,8 @@ from typing import TYPE_CHECKING, Optional, Tuple
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.jit.utils import cache_once, load_jit
-from sglang.kernels.jit.utils.common import is_hip_runtime
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -33,10 +33,8 @@ logger = logging.getLogger(__name__)
 def supported_hardware() -> bool:
     """Whether this device is one the kernel targets, before asking whether it
     builds. The kernel is wave64 and GFX9 DPP throughout, hence gfx942/gfx950."""
-    if not is_hip_runtime() or not torch.cuda.is_available():
-        return False
-    gcn_arch = torch.cuda.get_device_properties(0).gcnArchName
-    return any(arch in gcn_arch for arch in ("gfx942", "gfx950"))
+    hip = current_arch().hip
+    return hip is not None and hip.gcn_arch in ("gfx942", "gfx950")
 
 
 @cache_once

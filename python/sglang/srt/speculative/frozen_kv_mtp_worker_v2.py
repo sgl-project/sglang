@@ -36,12 +36,9 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.tp_worker import TpModelWorker
 from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.model_executor.pool_configurator import MemoryPoolConfig
 from sglang.srt.runtime_context import (
     attention_backends,
@@ -75,7 +72,6 @@ from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     draft_pp_context,
     draft_tp_context,
-    fast_topk,
     get_plan_stream,
     select_top_k_tokens,
     spec_stage_span,
@@ -86,6 +82,7 @@ from sglang.srt.utils.async_probe import (
     maybe_detect_nan,
     maybe_detect_oob,
 )
+from sglang.srt.utils.common import fast_topk
 
 logger = logging.getLogger(__name__)
 
@@ -358,6 +355,7 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
         fb_view = SimpleNamespace(
             batch_size=bs,
             forward_mode=ForwardMode.DECODE,
+            ragged_verify_layout=None,
             input_ids=getattr(forward_batch, "input_ids", None),
             req_pool_indices=forward_batch.req_pool_indices[:bs],
             seq_lens=forward_batch.seq_lens[:bs],
@@ -370,8 +368,8 @@ class FrozenKVMTPDraftWorker(EagleDraftWorkerBase, TpModelWorker):
             encoder_lens=None,
             out_cache_loc=getattr(forward_batch, "out_cache_loc", None),
             out_cache_loc_virtual=forward_batch.out_cache_loc_virtual,
-            kv_loc_plan=forward_batch.kv_loc_plan,
-            kv_loc_cols=forward_batch.kv_loc_cols,
+            iteration_ids=forward_batch.iteration_ids,
+            iteration_cols=forward_batch.iteration_cols,
             spec_info=None,
         )
         with self._frozen_kv_target_view(forward_batch):
