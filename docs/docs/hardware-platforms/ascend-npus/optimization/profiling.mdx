@@ -548,10 +548,10 @@ If the original data is still needed, back it up before running `analyse()`.
 ## Agent Workflow (SKILL)
 
 For a repeatable end-to-end bottleneck report from `operator_details.csv` /
-`trace_view.json`, use the repository skill at
-`.agents/skills/sglang-npu-profiler-analysis/SKILL.md`. It wraps the capture
-methods above and emits a standard markdown report via
-`summarize_npu_trace.py`.
+`trace_view.json`, use the NPU profiler analysis skill in
+[Ascend-SGLang-Skills PR #25](https://github.com/LinyuanLi0046/Ascend-SGLang-Skills/pull/25)
+(`skills/sglang-npu-profiler-analysis/`). It wraps the capture methods above and
+emits a standard markdown report via `summarize_npu_trace.py`.
 
 ## See Also
 
@@ -565,7 +565,3 @@ methods above and emits a standard markdown report via
   — Ascend NPU performance benchmarking
 - [Ascend NPU Environment Variables](/docs/hardware-platforms/ascend-npus/reference/environment_variables)
   — Environment variable reference
-
-## Agent skill (external)
-
-The NPU profiler analysis agent skill lives in [Ascend-SGLang-Skills PR #25](https://github.com/LinyuanLi0046/Ascend-SGLang-Skills/pull/25) (`skills/sglang-npu-profiler-analysis/`), not under `.agents/skills` in this repository.
