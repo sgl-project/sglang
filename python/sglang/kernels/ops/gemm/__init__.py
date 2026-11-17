@@ -598,6 +598,11 @@ _MUSE_SPARK_GFX950_KERNELS = [
         "unpool_gemm_norm_residual",
         "MoE unpooler GEMM + boundary norms + gated residual",
     ),
+    (
+        "unpool_gemm_norm_residual",
+        "unpool_gemm_norm_residual_tlx",
+        "MoE unpooler GEMM + boundary norms + gated residual on the TLX mm and norm_residual_norm",
+    ),
 ]
 for _mod, _fn, _desc in _MUSE_SPARK_GFX950_KERNELS:
     register_kernel(

@@ -56,6 +56,8 @@ from sglang.kernels.ops.gemm.router_gemm_fp32 import (
 )
 from sglang.kernels.ops.gemm.unpool_gemm_norm_residual import (
     unpool_gemm_norm_residual,
+    unpool_gemm_norm_residual_tlx,
+    unpool_gemm_norm_residual_tlx_supported,
 )
 from sglang.srt.configs.muse_spark import (
     MuseSparkTextConfig,
@@ -488,6 +490,8 @@ _DENSE_TILED = envs.SGLANG_ROCM_MUSE_DENSE_TILED.get()
 _DRAFT_TRITON_A16W16_GEMMS = ((24, 7168, 8192), (24, 8192, 3584))
 # Unpooler GEMM fused with the next FFN boundary's norms at decode / verify widths.
 _FUSED_UNPOOL_BOUNDARY = envs.SGLANG_ROCM_MUSE_FUSED_UNPOOL_BOUNDARY.get()
+# The fused unpooler + FFN boundary on the TLX mm and norm_residual_norm (gfx950).
+_TLX_BOUNDARY_NORM = envs.SGLANG_USE_TLX_BOUNDARY_NORM.get()
 # Device memory left for the KV pool, CUDA graphs and activations beside both MXFP4 expert layouts; below it
 # the experts keep only the a4w4 preshuffled copy. Arbitrary, not tuned.
 _A4W4_RESERVE_BYTES = 64 << 30
@@ -1709,6 +1713,22 @@ class MuseSpark1xDecoderLayer(nn.Module):
                 x_fp8=ffn_input_fp8,
             )
             ffn_boundary._ensure_cached_weights(torch.bfloat16)
+            if _TLX_BOUNDARY_NORM and unpool_gemm_norm_residual_tlx_supported(
+                expert_output, self.mlp.post_expert_proj.weight
+            ):
+                next_attn_input, stream = unpool_gemm_norm_residual_tlx(
+                    expert_output,
+                    self.mlp.post_expert_proj.weight,
+                    stream,
+                    ffn_boundary._cc_post_weight,
+                    ffn_boundary._cc_pre_weight,
+                    ffn_boundary._cc_alpha,
+                    ffn_boundary._cc_beta,
+                    ffn_boundary._post_norm.eps,
+                    ffn_boundary._pre_norm.eps,
+                    pre_bf16=pre_norm_dtype is torch.bfloat16,
+                )
+                return stream, next_attn_input, None
             next_attn_input, stream = unpool_gemm_norm_residual(
                 expert_output,
                 self.mlp.post_expert_proj.weight,

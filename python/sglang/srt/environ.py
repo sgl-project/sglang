@@ -1072,8 +1072,8 @@ class Envs:
     # (sglang.kernels.ops.gemm.tlx) ahead of every other dense GEMM path. Needs TLX (uTLX or fbtriton).
     SGLANG_USE_TLX_GEMM = EnvBool(False)
     # gfx950 ROCm Muse Spark: residual-stream boundaries that need no FP8 or router copy of their output run the
-    # vendored tlx.ops.norm_residual_norm (sglang.kernels.ops.layernorm.tlx) instead of the fused Triton kernel.
-    # Needs TLX (uTLX or fbtriton).
+    # vendored tlx.ops.norm_residual_norm (sglang.kernels.ops.layernorm.tlx) instead of the fused Triton kernel,
+    # and the fused unpooler + FFN boundary (2-16 rows) runs the TLX mm before it. Needs TLX (uTLX or fbtriton).
     SGLANG_USE_TLX_BOUNDARY_NORM = EnvBool(False)
     # Set by someone bisecting a numerical or performance regression to an
     # online-FP8 linear on gfx1250, to take the Triton tile out of the picture
