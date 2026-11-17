@@ -112,15 +112,13 @@ class TestFa3DcpMerge(CustomTestCase):
 
     def test_fa3_partials_merge_into_full_attention(self):
         generator = torch.Generator().manual_seed(0)
-        q_nope = (
-            torch.randn(3, _HEADS, _NOPE_DIM, generator=generator) * 0.2
-        ).to(torch.bfloat16)
-        q_rope = (
-            torch.randn(3, _HEADS, _ROPE_DIM, generator=generator) * 0.2
-        ).to(torch.bfloat16)
-        kv = (torch.randn(_CAPACITY, 576, generator=generator) * 0.1).to(
+        q_nope = (torch.randn(3, _HEADS, _NOPE_DIM, generator=generator) * 0.2).to(
             torch.bfloat16
         )
+        q_rope = (torch.randn(3, _HEADS, _ROPE_DIM, generator=generator) * 0.2).to(
+            torch.bfloat16
+        )
+        kv = (torch.randn(_CAPACITY, 576, generator=generator) * 0.1).to(torch.bfloat16)
         expected, expected_lse = _reference(q_nope, q_rope, kv)
 
         q_nope, q_rope = q_nope.cuda(), q_rope.cuda()
