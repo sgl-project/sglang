@@ -11,8 +11,11 @@ Covers the contract behind ``skip_attn_backend_init`` deprecation:
 Pure dataclass logic — CPU only.
 """
 
+import random
 import unittest
 import warnings
+from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -78,6 +81,91 @@ class TestForwardMetadataPlanRecord(CustomTestCase):
         fb.mark_forward_metadata_ready(replan_equivalent=True)
         self.assertFalse(fb.needs_forward_metadata_init())
         self.assertEqual(fb.forward_metadata_planned_bs, 4)
+
+
+def _mrope_batch(prefix, extend, *, mm=None, mirror=True, positions=None):
+    fb = object.__new__(ForwardBatch)
+    if positions is None:
+        positions = fbi.compute_position_torch(
+            torch.tensor(prefix, dtype=torch.int32),
+            torch.tensor(extend, dtype=torch.int32),
+        )[0]
+    fb.positions = positions
+    fb.extend_seq_lens_cpu = list(extend) if mirror else None
+    fb.extend_prefix_lens_cpu = list(prefix) if mirror else None
+    fb.seq_lens_cpu = torch.tensor([p + e for p, e in zip(prefix, extend)])
+    fb.mrope_positions = None
+    batch = SimpleNamespace(
+        extend_lens=list(extend),
+        prefix_lens=list(prefix),
+        multimodal_inputs=mm if mm is not None else [None] * len(extend),
+        dllm_config=None,
+        reqs=[SimpleNamespace(session=None) for _ in extend],
+    )
+    return fb, batch
+
+
+class TestMropeTextDevicePositions(CustomTestCase):
+    # text-only extend rows repeat self.positions; they must equal the host loop's
+
+    def _rows(self, *args, rl=None, **kwargs):
+        runner = SimpleNamespace(device="cpu")
+        exec_ = SimpleNamespace(deterministic=SimpleNamespace(rl_on_policy_target=rl))
+        with mock.patch.object(fbi, "get_exec", lambda: exec_):
+            fb, batch = _mrope_batch(*args, **kwargs)
+            device_rows = fb._text_only_mrope_positions(batch)
+            fb._compute_mrope_positions_extend(runner, batch)
+            loop, batch = _mrope_batch(*args, **kwargs)
+            with mock.patch.object(
+                ForwardBatch, "_text_only_mrope_positions", lambda self, b: None
+            ):
+                loop._compute_mrope_positions_extend(runner, batch)
+        return device_rows, fb.mrope_positions, loop.mrope_positions
+
+    def test_text_only_rows_equal_the_host_loop(self):
+        rng = random.Random(20261111)
+        layouts = [([0, 0, 0], [5, 3, 7]), ([64, 0, 128], [10, 20, 1])]
+        layouts.append(([5, 9, 0], [0, 4, 3]))
+        for _ in range(100):
+            bs = rng.randint(1, 64)
+            prefix = [rng.choice([0, rng.randint(1, 262000)]) for _ in range(bs)]
+            extend = [rng.randint(0, 64) for _ in range(bs)]
+            extend[0] = max(extend[0], 1)
+            layouts.append((prefix, extend))
+        for prefix, extend in layouts:
+            device_rows, rows, loop = self._rows(prefix, extend)
+            self.assertIsNotNone(device_rows)
+            self.assertEqual((rows.dtype, rows.shape), (loop.dtype, loop.shape))
+            self.assertTrue(torch.equal(rows, loop))
+
+    def test_rl_on_policy_target_treats_multimodal_rows_as_text(self):
+        mm = SimpleNamespace(mrope_positions=torch.randint(0, 99, (3, 40)))
+        device_rows, rows, loop = self._rows(
+            [0, 7, 0], [5, 40, 6], mm=[None, mm, None], rl="fsdp"
+        )
+        self.assertIsNotNone(device_rows)
+        self.assertTrue(torch.equal(rows, loop))
+
+    def test_other_batches_keep_the_host_loop(self):
+        mm = SimpleNamespace(mrope_positions=torch.randint(0, 99, (3, 40)))
+        padded = torch.cat([torch.arange(8), torch.full((8,), -7)])
+        for kwargs in (
+            dict(prefix=[0, 0, 0], extend=[5, 40, 6], mm=[None, mm, None]),
+            dict(prefix=[0, 0], extend=[4, 4], positions=padded),
+            dict(prefix=[0, 2], extend=[4, 4], mirror=False),
+        ):
+            with self.subTest(**{k: str(v) for k, v in kwargs.items()}):
+                device_rows, rows, loop = self._rows(**kwargs)
+                self.assertIsNone(device_rows)
+                self.assertTrue(torch.equal(rows, loop))
+
+    def test_rows_come_from_the_batch_positions(self):
+        shifted = fbi.compute_position_torch(
+            torch.tensor([3, 0], dtype=torch.int32),
+            torch.tensor([4, 2], dtype=torch.int32),
+        )[0]
+        _, rows, loop = self._rows([3, 0], [4, 2], positions=shifted + 1)
+        self.assertFalse(torch.equal(rows, loop))
 
 
 class TestDeprecatedSkipKwargShim(CustomTestCase):
