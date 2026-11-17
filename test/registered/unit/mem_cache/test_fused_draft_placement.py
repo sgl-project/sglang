@@ -64,6 +64,8 @@ TARGET_WINDOW = object()
 _HOSTS = ("full", TARGET_WINDOW)
 _HOSTS_TRI = ("full", TARGET_WINDOW, "mamba")
 _DTYPE = torch.bfloat16
+# The default draft quant config of `_decide`: the one the host's dtype came from.
+_LIKE_HOST = object()
 _WINDOW = DraftKVGeometry(head_num=2, head_dim=64, v_head_dim=64)
 _STATE = DraftStateGeometry(
     conv_state_shapes=((2, 4), (2, 4)),
@@ -112,7 +114,7 @@ def _place(profile, num_runners=1, host_names=_HOSTS, target_window=None):
         num_runners=num_runners,
         ctx=PlacementContext(
             host_names=tuple(window if h is TARGET_WINDOW else h for h in host_names),
-            target_window=target_window,
+            target_windows=() if target_window is None else (target_window,),
         ),
         store_dtype=_DTYPE,
     )
@@ -163,26 +165,6 @@ class TestPlaceFusedDraft(CustomTestCase):
             self.assertEqual(placement.lanes_for(r, "window_128"), range(r, r + 1))
             self.assertEqual(placement.lanes_for(r, "full"), range(0))
 
-    def test_window_layers_ride_in_the_target_window_sub_pool_by_its_name(self):
-        # The target's window sub-pool is named by the window its layers attend
-        # over (here one less than the configured window both models state):
-        # the draft rides in it under that name.
-        decision = place_fused_draft(
-            profile=_profile(window_layer_ids=(0,), window=128),
-            num_runners=1,
-            ctx=PlacementContext(
-                host_names=("full", "window_127"),
-                target_window=128,
-                target_window_sub_pool="window_127",
-            ),
-            store_dtype=_DTYPE,
-        )
-        placement = decision.placement
-        self.assertIsNotNone(placement, decision.declined)
-        self.assertEqual(placement.hosts(), ("window_127",))
-        self.assertEqual(placement.new_bands, {})
-        self.assertEqual(placement.host_kind("window_127").serves, LAYER_WINDOW)
-
     def test_per_depth_head_places_each_depth_by_its_kind(self):
         # Inkling shape: depth 1 is a local (window) block, depths 0 and 2 full.
         decision = _place(
@@ -230,15 +212,15 @@ class TestPlaceFusedDraft(CustomTestCase):
     def test_unmatched_windows_get_independent_bands(self):
         # A window the target does not declare gets a band named by its own
         # length.
-        for window, hosts, name in (
-            (256, _HOSTS, "window_256"),
-            (64, _HOSTS, "window_64"),
-            (64, ("full", "mamba"), "window_64"),
+        for window, hosts, target_window, name in (
+            (256, _HOSTS, 128, "window_256"),
+            (64, _HOSTS, 128, "window_64"),
+            (64, ("full", "mamba"), None, "window_64"),
         ):
             decision = _place(
                 _profile(window_layer_ids=(0,), window=window),
                 num_runners=2,
-                target_window=128,
+                target_window=target_window,
                 host_names=hosts,
             )
             placement = decision.placement
@@ -379,7 +361,7 @@ class TestDraftKVProfile(CustomTestCase):
             hf_config=SimpleNamespace(architectures=["DeepseekV2ForCausalLM"]),
         )
         with patch("sglang.srt.configs.hybrid_arch.mambaish_config", return_value=None):
-            profile = draft_kv_profile(config, num_layers=2, attn_tp_size=1)
+            profile = draft_kv_profile(config, num_layers=2, attn_tp_size=1, window=128)
         placement = _place(profile, target_window=16).placement
         for kind, host in ((LAYER_FULL, "full"), (LAYER_WINDOW, "window_128")):
             self.assertIsInstance(profile.kinds[kind].geometry, DraftMLAGeometry)
@@ -395,7 +377,9 @@ class TestDraftKVProfile(CustomTestCase):
 
     def test_heads_are_divided_by_attn_tp(self):
         with patch("sglang.srt.configs.hybrid_arch.mambaish_config", return_value=None):
-            profile = draft_kv_profile(_config(), num_layers=2, attn_tp_size=2)
+            profile = draft_kv_profile(
+                _config(), num_layers=2, attn_tp_size=2, window=128
+            )
         self.assertEqual(profile.num_depths, 1)
         self.assertEqual(set(profile.kinds), {LAYER_FULL, LAYER_WINDOW})
         full = profile.kinds[LAYER_FULL]
@@ -704,7 +688,7 @@ class TestUnifiedSWAHeadGeometry(CustomTestCase):
                 FusedDraftPlacement(
                     runners=(RunnerLanes(ranges={"window_128": (0, 1)}),),
                     regions={"window_128": region},
-                    hosted={"window_128": "swa"},
+                    hosted={"window_128": "window"},
                 ),
                 "window_128",
             )
@@ -714,6 +698,28 @@ class TestUnifiedSWAHeadGeometry(CustomTestCase):
         )
         self.assertIs(spec.draft_region, region)
         self.assertEqual(entry_bytes, spec.entry_bytes())
+
+
+class _RawWindowDraft:
+    """A draft architecture whose runner attends over its config's window."""
+
+
+class _MinusOneWindowDraft:
+    """A draft architecture attending over one less than its config's window."""
+
+    @staticmethod
+    def sliding_layer_window_size(config):
+        return config.sliding_window - 1
+
+    def get_attention_sliding_window_size(self):
+        return self.sliding_layer_window_size(self.config)
+
+
+class _InstanceOnlyDraft:
+    """A draft architecture whose window rule reads the built model."""
+
+    def get_attention_sliding_window_size(self):
+        return self.config.sliding_window - 1
 
 
 class TestFusedDraftDecision(CustomTestCase):
@@ -738,14 +744,22 @@ class TestFusedDraftDecision(CustomTestCase):
         retraction_backup=None,
         draft_parallel_layout=None,
         is_hip=False,
+        resolved_window=128,
+        draft_window=None,
+        draft_cls=None,
+        draft_quant_config=_LIKE_HOST,
+        quant_config_reads=None,
     ):
+        """``draft_quant_config`` is the quant config the draft model keeps
+        once built; by default one declaring an FP8 KV cache exactly when the
+        host's dtype is FP8. ``quant_config_reads`` collects every read of it."""
         from sglang.srt.configs.model_config import AttentionArch
         from sglang.srt.mem_cache import kv_cache_configurator as kvc
         from sglang.srt.speculative import draft_worker_common
 
         cfg = kvc.KVCacheConfigurator.__new__(kvc.KVCacheConfigurator)
         # The window the runner resolved for its layers.
-        cfg.sliding_window_size = 128
+        cfg.sliding_window_size = resolved_window
         cfg.draft_parallel_layout = draft_parallel_layout
         cfg.is_hybrid_swa = True
         cfg.is_hybrid_swa_compress = False
@@ -780,7 +794,13 @@ class TestFusedDraftDecision(CustomTestCase):
             draft_model_config=SimpleNamespace(
                 model_path="draft-model",
                 revision="test-revision",
-                is_hybrid_swa=False,
+                is_hybrid_swa=draft_window is not None,
+                swa_attention_layer_ids=[0],
+                sliding_window_size=draft_window,
+                attention_chunk_size=None,
+                get_swa_num_kv_heads=lambda tp: max(1, 4 // tp),
+                swa_head_dim=64,
+                swa_v_head_dim=64,
                 is_compressed_kv_arch=False,
                 num_nextn_predict_layers=None,
                 get_num_kv_heads=lambda tp: max(1, 4 // tp),
@@ -791,7 +811,10 @@ class TestFusedDraftDecision(CustomTestCase):
                 kv_lora_rank=8,
                 qk_rope_head_dim=4,
                 hf_config=draft_hf_config
-                or SimpleNamespace(architectures=["BailingMoeForCausalLMNextN"]),
+                or SimpleNamespace(
+                    architectures=["BailingMoeForCausalLMNextN"],
+                    sliding_window=draft_window,
+                ),
             ),
         )
         memory = SimpleNamespace(
@@ -802,6 +825,19 @@ class TestFusedDraftDecision(CustomTestCase):
             speculative_draft_kv_cache_dtype=draft_kv_dtype,
             speculative_draft_attention_backend=draft_backend,
         )
+        if draft_quant_config is _LIKE_HOST:
+            draft_quant_config = (
+                SimpleNamespace(kv_cache_quant_algo="FP8")
+                if host_kv_dtype == torch.float8_e4m3fn
+                else None
+            )
+
+        def read_draft_quant_config(draft_model_config):
+            self.assertIs(draft_model_config, cfg.spec_aux_config.draft_model_config)
+            if quant_config_reads is not None:
+                quant_config_reads.append(draft_model_config)
+            return draft_quant_config
+
         with (
             published_topology(
                 tp_size=tp_size,
@@ -809,6 +845,7 @@ class TestFusedDraftDecision(CustomTestCase):
                 attn_dp_size=attn_dp_size,
             ),
             patch.object(kvc, "get_memory", return_value=memory),
+            patch.object(kvc, "_draft_quant_config", read_draft_quant_config),
             patch.object(kvc, "_is_hip", is_hip),
             patch.object(
                 kvc,
@@ -831,11 +868,48 @@ class TestFusedDraftDecision(CustomTestCase):
             patch("sglang.srt.configs.hybrid_arch.mambaish_config", return_value=None),
             get_parallel().override(attn_dcp_size=dcp_size),
             override_platform(is_xpu=False, is_hip=False),
+            patch(
+                "sglang.srt.model_loader.utils.get_model_architecture",
+                return_value=(draft_cls or _RawWindowDraft, "Draft"),
+            ),
         ):
             return cfg._fused_draft_decision()
 
     def test_a_stateless_draft_is_placed(self):
         self.assertIsNotNone(self._decide().placement)
+
+    def test_a_draft_window_is_placed_by_the_drafts_own_rule(self):
+        # The target states 128 and attends over 127. A draft window shares the
+        # target's sub-pool only when its own rule resolves it to 127.
+        for draft_cls, stated, host, band in (
+            (_MinusOneWindowDraft, 128, "window_127", None),
+            (_RawWindowDraft, 128, None, "window_128"),
+            (_RawWindowDraft, 127, "window_127", None),
+            (_MinusOneWindowDraft, 65, None, "window_64"),
+            (_RawWindowDraft, 64, None, "window_64"),
+            (_MinusOneWindowDraft, 257, None, "window_256"),
+            (_RawWindowDraft, 256, None, "window_256"),
+        ):
+            with self.subTest(draft=draft_cls.__name__, stated=stated):
+                decision = self._decide(
+                    resolved_window=127, draft_window=stated, draft_cls=draft_cls
+                )
+                placement = decision.placement
+                self.assertIsNotNone(placement, decision.declined)
+                if host is not None:
+                    self.assertEqual(placement.hosts(), (host,))
+                    self.assertEqual(placement.new_bands, {})
+                else:
+                    self.assertEqual(set(placement.new_bands), {band})
+                    self.assertEqual(
+                        placement.new_bands[band].window, int(band.split("_")[1])
+                    )
+
+    def test_a_draft_window_known_only_once_built_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "sliding_layer_window_size"):
+            self._decide(
+                resolved_window=127, draft_window=128, draft_cls=_InstanceOnlyDraft
+            )
 
     def test_fused_placement_uses_resolved_width_for_every_protocol(self):
         from sglang.srt.configs.draft_parallel import DraftParallelLayout
@@ -926,41 +1000,51 @@ class TestFusedDraftDecision(CustomTestCase):
                     )
 
     def test_an_auto_draft_dtype_sizes_the_region_as_the_loaded_draft_resolves(self):
-        """BUG REGRESSION. An explicit draft KV dtype of `auto` sized the region
-        without the draft's quant config, in its compute dtype, while the
-        loaded draft, whose quant config declares an FP8 KV cache, resolved
-        FP8 and failed to bind. Until the draft loads, its `auto` takes the
-        host's dtype, as no flag does; an explicit dtype is its own."""
-        from sglang.srt.layers.quantization.fp8 import Fp8Config
+        """BUG REGRESSION. The region is sized in the dtype the loaded draft
+        resolves: an `auto` reads the quant config the draft will keep, an
+        explicit dtype never does; a BF16 MTP head over an FP8-KV target was
+        sized FP8 and failed to bind."""
         from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 
-        loaded_draft = SimpleNamespace(
-            quant_config=Fp8Config(
-                is_checkpoint_fp8_serialized=True, kv_cache_quant_algo="FP8"
-            )
-        )
-        for draft_kv_dtype in (None, "auto", "fp8_e4m3"):
-            with self.subTest(draft_kv_dtype=draft_kv_dtype):
+        fp8_kv = SimpleNamespace(kv_cache_quant_algo="FP8")
+        for flag, host, draft_flag, kept, region in (
+            # The draft keeps the checkpoint's FP8 KV declaration.
+            ("auto", torch.float8_e4m3fn, None, fp8_kv, torch.float8_e4m3fn),
+            # The draft keeps no quant config: an MTP head in BF16.
+            ("auto", torch.float8_e4m3fn, None, None, torch.bfloat16),
+            ("auto", torch.float8_e4m3fn, "auto", None, torch.bfloat16),
+            # The draft's `auto` replaces an explicit target dtype.
+            ("fp8_e4m3", torch.float8_e4m3fn, "auto", None, torch.bfloat16),
+            ("bf16", torch.bfloat16, "auto", fp8_kv, torch.float8_e4m3fn),
+            # Explicit dtypes never read the quant config.
+            ("fp8_e4m3", torch.float8_e4m3fn, None, None, torch.float8_e4m3fn),
+            ("auto", torch.float8_e4m3fn, "bf16", fp8_kv, torch.bfloat16),
+        ):
+            with self.subTest(flag=flag, draft_flag=draft_flag, kept=kept):
+                reads = []
                 decision = self._decide(
-                    draft_kv_dtype=draft_kv_dtype,
-                    host_kv_dtype=torch.float8_e4m3fn,
-                    kv_cache_dtype_flag="fp8_e4m3",
+                    kv_cache_dtype_flag=flag,
+                    host_kv_dtype=host,
+                    draft_kv_dtype=draft_flag,
+                    draft_quant_config=kept,
+                    quant_config_reads=reads,
                 )
                 self.assertIsNotNone(decision.placement, decision.declined)
                 # What the draft worker resolves once its model has loaded.
                 _, resolved = configure_kv_cache_dtype(
-                    server_args_kv_cache_dtype="fp8_e4m3",
-                    model=loaded_draft,
+                    server_args_kv_cache_dtype=flag,
+                    quant_config=kept,
                     model_dtype=_DTYPE,
                     is_draft_worker=True,
                     is_dflash=False,
                     speculative_draft_attention_backend=None,
-                    speculative_draft_kv_cache_dtype=draft_kv_dtype,
+                    speculative_draft_kv_cache_dtype=draft_flag,
                 )
-                self.assertEqual(resolved, torch.float8_e4m3fn)
+                self.assertEqual(resolved, region)
                 self.assertEqual(
-                    decision.placement.region("full").resolved_kv_dtype(), resolved
+                    decision.placement.region("full").resolved_kv_dtype(), region
                 )
+                self.assertEqual(len(reads), int((draft_flag or flag) == "auto"))
 
     def test_no_draft_backend_keeps_the_private_pool(self):
         """A fused draft reads its rows through the target's views and id

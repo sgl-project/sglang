@@ -31,9 +31,18 @@ Launch an SGLang online service and set the `SGLANG_TORCH_PROFILER_DIR`
 environment variable to control where performance files are saved. Once the
 service starts, profiling is ready on standby.
 
+<Note>
+`/start_profile` and `/stop_profile` are admin endpoints: the server must be
+launched with `SGLANG_ADMIN_API_KEY` set (or `--admin-api-key`), and each
+request must carry that key as `Authorization: Bearer <key>`. Without an admin
+key configured, the server answers HTTP 403. The examples below assume the key
+is exported as `SGLANG_ADMIN_API_KEY`.
+</Note>
+
 ```shell Command
 # Set the performance data output directory
 export SGLANG_TORCH_PROFILER_DIR=./sglang_profile
+export SGLANG_ADMIN_API_KEY=<key>
 
 # Start SGLang server (use local model path or HuggingFace model id)
 sglang serve \
@@ -131,6 +140,7 @@ manually call `analyse()`**.
 ```bash Command
 # Step 1: Start profiling (no num_steps, requires manual stop)
 curl -X POST http://127.0.0.1:30000/start_profile \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
     "output_dir": "./sglang_profile",
@@ -144,7 +154,8 @@ curl http://127.0.0.1:30000/generate \
   -d '{"text": "Hello", "sampling_params": {"max_new_tokens": 10}}'
 
 # Step 3: Stop profiling
-curl -X POST http://127.0.0.1:30000/stop_profile
+curl -X POST http://127.0.0.1:30000/stop_profile \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}"
 ```
 
 <Note>
@@ -164,6 +175,7 @@ automatically after N steps and generates output — **no need to manually send
 ```bash Command
 # num_steps=10, wait 3 warmup steps, auto-stop after 10 steps
 curl -X POST http://127.0.0.1:30000/start_profile \
+  -H "Authorization: Bearer ${SGLANG_ADMIN_API_KEY}" \
   -H "Content-Type: application/json" \
   -d '{
     "output_dir": "./sglang_profile",
@@ -239,6 +251,7 @@ redirect PyTorch Profiler's CUDA activity to NPU, so
   </thead>
   <tbody>
     <tr><td><code>--profile</code></td><td>Enable auto profiling start/stop</td></tr>
+    <tr><td><code>--admin-api-key</code></td><td>The server's admin API key, required by <code>--profile</code> (default: <code>SGLANG_ADMIN_API_KEY</code>)</td></tr>
     <tr><td><code>--profile-steps N</code></td><td>Auto-stop after N steps (skips /stop_profile)</td></tr>
     <tr><td><code>--profile-output-dir</code></td><td>Trace output directory</td></tr>
   </tbody>
@@ -303,6 +316,7 @@ Method C (bench_serving --profile) instead.
   </thead>
   <tbody>
     <tr><td><code>--url</code></td><td>SGLang server address</td></tr>
+    <tr><td><code>--admin-api-key</code></td><td>The server's admin API key, required by <code>/start_profile</code> (default: <code>SGLANG_ADMIN_API_KEY</code>)</td></tr>
     <tr>
       <td><code>--output-dir</code></td>
       <td>Output directory (defaults to <code>SGLANG_TORCH_PROFILER_DIR</code>)</td>
