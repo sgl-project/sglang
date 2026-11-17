@@ -1,18 +1,24 @@
 ---
 title: "DeepSeek-V4-Flash"
 metatags:
-  description: "Deploy DeepSeek-V4-Flash model with SGLang on A3 and 950PR/DT series NPUs, including multi-node PD disaggregation mode."
+  description: "Deploy DeepSeek-V4-Flash with SGLang on A3 and 950PR/DT series NPUs, including DSpark Compact, HiCache, and PD disaggregation."
 ---
 
 ## Introduction
 
-DeepSeek-V4-Flash is a Mixture-of-Experts (MoE) large language model developed by DeepSeek, featuring 284B total
-parameters with 13B active parameters. It employs hybrid sparse attention (CSA + HCA) and DeepSeekMoE architecture with
-a bundled multi-token prediction (MTP) draft head for speculative decoding, supporting a 1M-token context length.
+DeepSeek-V4-Flash is a Mixture-of-Experts (MoE) large language model developed by DeepSeek. It combines hybrid sparse
+attention (CSA + HCA) with the DeepSeekMoE architecture and supports a 1M-token context length. The 0731 checkpoint
+used in this tutorial includes a DSpark draft head for speculative decoding.
 
 This document demonstrates the deployment of DeepSeek-V4-Flash on Ascend NPUs using SGLang, covering both the A3
 Series and the 950PR/DT Series (SoC name A5), including single-node PD mixed deployment, multi-node PD disaggregation
-mode, feature configuration, and performance optimization.
+mode, DSpark speculative decoding with Static and optional Compact verification, HiCache L2/L3, feature configuration,
+and performance optimization.
+
+Compact combines confidence estimates with a profiled steps-per-second (SPS) cost table to select per-request
+draft-prefix lengths and pack them for target verification, reducing logical verification work. HiCache extends
+KV caching to host memory (L2) and optional storage backends (L3), enabling greater prefix reuse in long-context
+and multi-turn workloads. The Compact workflow in this document is scoped to single-node PD mixed deployment.
 
 This document is validated and written based on **SGLang v0.5.16**. The current model (DeepSeek-V4-Flash) is fully
 supported in this version. To use the latest features (e.g., PD disaggregation, speculative decoding), it is
@@ -29,10 +35,11 @@ recommended to use v0.5.16 or a later version.
 | PD Disaggregation             | `--disaggregation-mode prefill \`<br/>`--disaggregation-transfer-backend ascend`              |
 | Quantization                  | `--quantization modelslim`                                                                    |
 | NPU Graph                     | enabled by default; disable with `--disable-cuda-graph`;<br/>control range via `--cuda-graph-bs-decode` or `--cuda-graph-max-bs-decode`; e.g., `--cuda-graph-bs-decode 1 2 4 8 16 24 36 40 48 56` |
-| Speculative Decoding          | `--speculative-algorithm EAGLE \`<br/>`--speculative-num-steps 2 \`<br/>`--speculative-eagle-topk 1 \`<br/>`--speculative-num-draft-tokens 3` |
-| Overlap Schedule              | `export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1`                                                  |
+| Speculative Decoding (DSpark Static) | `--speculative-algorithm DSPARK`<br/>`--speculative-dspark-block-size 5`<br/>`--speculative-num-draft-tokens 6` |
+| DSpark Compact | `export SGLANG_RAGGED_VERIFY_MODE=compact`<br/>`--speculative-dspark-sps-table-path /path/to/dspark_sps.json`<br/>See [Compact workflow](#dspark-compact-optional). |
 | DP LM Head                    | `--enable-dp-lm-head`                                                                         |
 | DP Attention                  | `--dp-size 16 \`<br/>`--enable-dp-attention`                                                                           |
+| HiCache (L2/L3) | `--enable-hierarchical-cache`<br/>Add a configured `--hicache-storage-backend` for L3. See [HiCache](#hicache-l2-and-l3-optional). |
 
 <Note>
 The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
@@ -63,17 +70,17 @@ Before following this tutorial, complete the environment setup in the documents 
 Before downloading model weights, check the model size to reserve enough disk space.
 For multi-node deployment, download the weights to a shared directory accessible to all nodes.
 
-- [DeepSeek-V4-Flash-w8a8-mtp](https://www.modelscope.cn/models/Eco-Tech/DeepSeek-V4-Flash-w8a8-mtp) (W8A8 quantized version, 300GB)
-- [DeepSeek-V4-Flash-0731](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash-0731) (Native FP8 version, 155.44GB, for the 950PR/DT Series)
+- **910(A3):** [DeepSeek-V4-Flash-0731-w8a8](https://www.modelscope.cn/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8),
+  using ModelSlim W8A8 loading for both the target and matching DSpark draft weights.
+- **950(A5):** [DeepSeek-V4-Flash-0731](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash-0731),
+  using the native checkpoint for the 950PR/DT Series. The eight-device script below retains
+  `SGLANG_DSV4_FP4_EXPERTS=True`; use weights matching that loading configuration.
 
-<Info>
-The W8A8 variant (300GB) can be deployed on 8 × 64GB of device memory (`--tp-size 8`), which corresponds to
-8 dies on an A3 Series node (4 cards). The native FP8 variant (155.44GB) runs with `--tp-size 4` on the
-950PR/DT Series (4 cards).
-</Info>
-
-This is the minimum recommended configuration. For optimized configurations,
-see [Best practices](#best-practices), which may require additional cards or nodes.
+<Note>
+The two scripts use different checkpoint-loading configurations. Keep the weights, quantization flags, and matching
+draft weights consistent within each deployment. Compact additionally needs confidence estimates, supplied by trained
+Confidence Head weights or an online acceptance estimator supported by the selected runtime.
+</Note>
 
 For the hardware specifications (memory per die and dies per card),
 see [Ascend NPU Reference — Hardware](/docs/hardware-platforms/ascend-npus/reference/glossary#hardware).
@@ -91,10 +98,8 @@ Both **stable releases** and **daily builds** are available. CANN 9.1.0 has no s
 commands use the validated build tags `cann9.1.0-a3-B105` (A3 Series) and `cann9.1.0-950-B105` (950PR/DT Series).
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
 
-{/* TODO: Interim explanation (CANN 9.1.0 has no stable release yet). Remove it and switch the tags below to the stable release once it is published. */}
-
 <Tabs>
-  <Tab title="A3 Series">
+  <Tab title="910(A3)">
 
 ```bash Command
 docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
@@ -129,7 +134,7 @@ swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.
 ```
 
   </Tab>
-  <Tab title="950PR/DT Series">
+  <Tab title="950(A5)">
 
 ```bash Command
 docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-B105
@@ -164,6 +169,13 @@ swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.
 - Replace `${NAME}` with your own container name or remove `--name` to use default name.
 </Tip>
 
+<Note>
+The version paragraph in the Introduction describes the original tutorial baseline. Compact requires a SGLang build
+that includes NPU ragged verification and `sglang.benchmark.dspark_sps_profiler`, with matching CANN, TorchNPU,
+Triton-Ascend, and `sgl_kernel_npu` dependencies. The image tags above do not by themselves establish Compact support;
+install the matching build and device kernels before following the Compact workflow.
+</Note>
+
 ## Online service deployment
 
 ### Single-node PD mixed deployment
@@ -171,141 +183,300 @@ swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
 with limited hardware resources. Select the script for your platform and run it inside the container.
 
-<Tabs>
-  <Tab title="A3 Series">
+The DSpark examples below use one full 910(A3) node with 16 NPU dies (TP=16, DP Attention=16), or one full 950(A5)
+node with eight NPU devices (TP=8, DP Attention=8). Save the matching script and set `MODEL_PATH` to the local weights.
+SGLang uses Static verification by default. To enable Compact after profiling, set
+`SGLANG_RAGGED_VERIFY_MODE=compact` and pass `--speculative-dspark-sps-table-path` when restarting the matching script.
 
-DeepSeek-V4-Flash can be launched with half of an A3 Series node (4 cards, 8 dies). The configuration below was
-validated with `--tp-size 8`.
+<Tabs>
+  <Tab title="910(A3)">
+
+Save as `launch_dspark_a3.sh`. This full-node DSpark example uses the W8A8 checkpoint and ModelSlim draft loading;
+the matching DSpark draft weights must be present in that directory.
 
 ```bash Command
-# ============================================================
-# Before running, update the following variable:
-#   MODEL_PATH: path to the model weights directory
-# ============================================================
+#!/bin/bash
+set -e
 
-MODEL_PATH=/path/to/model-weights
+MODEL_PATH="${MODEL_PATH:-/path/to/DeepSeek-V4-Flash-0731-w8a8}"
+HOST="${HOST:-127.0.0.1}"
+PORT="${PORT:-6688}"
 
 source /usr/local/Ascend/ascend-toolkit/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
 source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash
 
-export DEEP_NORMAL_MODE_USE_INT8_QUANT=1
-export FORCE_DRAFT_MODEL_NON_QUANT=1
-export HCCL_BUFFSIZE=8
-export HCCL_OP_EXPANSION_MODE=AIV
-export INF_NAN_MODE_FORCE_DISABLE=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export SGLANG_DSV4_FP4_EXPERTS=False
-export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
-export SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
-export SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
-export SGLANG_OPT_DEEPGEMM_HC_PRENORM=False
-export SGLANG_OPT_FP8_WO_A_GEMM=0
-export SGLANG_OPT_FUSE_WQA_WKV=0
-export SGLANG_OPT_USE_FUSED_HASH_TOPK=False
-export SGLANG_OPT_USE_OVERLAP_STORE_CACHE=False
-export SGLANG_OPT_USE_TILELANG_MHC_POST=False
-export SGLANG_OPT_USE_TILELANG_MHC_PRE=False
-export SGLANG_SET_CPU_AFFINITY=1
-export SGLANG_ZBAL_BOOTSTRAP_URL="tcp://127.0.0.1:14699"
-export SGLANG_ZBAL_LOCAL_MEM_SIZE=62084
 export STREAMS_PER_DEVICE=32
-export ZBAL_ENABLE_GRAPH=1
-export ZBAL_NPU_ALLOC_CONF=use_vmm_for_static_memory:True
+export SGLANG_SET_CPU_AFFINITY=1
+export DEEPEP_HCCL_BUFFSIZE=2048
+export SGLANG_DSV4_FP4_EXPERTS=False
 
 python3 -m sglang.launch_server \
-    --model-path "${MODEL_PATH}" \
-    --page-size 128 \
-    --tp-size 8 \
+    --served-model-name deepseek-v4-flash \
     --trust-remote-code \
+    --model-path "${MODEL_PATH}" \
+    --tp-size 16 \
+    --page-size 128 \
     --device npu \
     --attention-backend dsv4 \
     --watchdog-timeout 9000 \
-    --host 127.0.0.1 --port 6688 \
-    --mem-fraction-static 0.8 \
+    --mem-fraction-static 0.7 \
     --prefill-max-requests 160 \
-    --max-prefill-tokens 80000 \
+    --max-prefill-tokens 65536 \
     --chunked-prefill-size 131072 \
     --max-running-requests 160 \
-    --dp-size 8 --enable-dp-attention \
-    --moe-a2a-backend deepep --deepep-mode auto \
-    --quantization modelslim --enable-dp-lm-head \
-    --kv-cache-dtype bfloat16
+    --dp-size 16 \
+    --enable-dp-attention \
+    --moe-a2a-backend deepep \
+    --deepep-mode auto \
+    --quantization modelslim \
+    --enable-dp-lm-head \
+    --kv-cache-dtype bfloat16 \
+    --speculative-algorithm DSPARK \
+    --speculative-draft-model-path "${MODEL_PATH}" \
+    --speculative-draft-model-quantization modelslim \
+    --speculative-draft-attention-backend ascend \
+    --speculative-num-draft-tokens 6 \
+    --speculative-dspark-block-size 5 \
+    --cuda-graph-bs-decode 1 2 4 8 10 \
+    --host "${HOST}" \
+    --port "${PORT}" \
+    "$@"
+```
+
+For ordinary Static serving:
+
+```bash Command
+MODEL_PATH=/path/to/DeepSeek-V4-Flash-0731-w8a8 bash launch_dspark_a3.sh
 ```
 
   </Tab>
-  <Tab title="950PR/DT Series">
+  <Tab title="950(A5)">
 
-The 950PR/DT Series (SoC name A5) exposes one device per card, and DeepSeek-V4-Flash can be launched with half of a
-node (4 cards). Use the native `DeepSeek-V4-Flash-0731` checkpoint. The configuration below was validated with
-`--tp-size 4` and DSPARK speculative decoding.
+Save as `launch_dspark_a5.sh`. The 950PR/DT Series (SoC name A5) exposes one NPU device per card. This example uses
+eight devices, port `8001`, `DEEPEP_HCCL_BUFFSIZE=1600`, and the `0731` checkpoint with
+`SGLANG_DSV4_FP4_EXPERTS=True`. Set the checkpoint and SPS-table paths for your deployment. The CPU and sysctl
+commands require the privileged container or corresponding host permissions.
+
+<Note>
+**950(A5) Compact: pending validation.** Validate SPS profiling, graph replay, accuracy, stability, and performance
+on 950(A5) before treating this as a validated Compact deployment.
+</Note>
 
 ```bash Command
-# ============================================================
-# Before running, update the following variable:
-#   MODEL_PATH: path to the model weights directory
-# ============================================================
+#!/bin/bash
+set -e
 
-MODEL_PATH=/path/to/model-weights
+echo performance | tee /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor
+sysctl -w vm.swappiness=0
+sysctl -w kernel.numa_balancing=0
 
 source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
 source /usr/local/Ascend/nnal/atb/set_env.sh
 source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
 source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash
 
-export ASCEND_CUSTOM_OPP_PATH=/usr/local/Ascend/extra-ops/vendors/custom_transformer/:$ASCEND_CUSTOM_OPP_PATH
-export DEEPEP_HCCL_BUFFSIZE=1600
-export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
-export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
-export DEEPEP_NORMAL_LONG_SEQ_ROUND=16
-export FORCE_DRAFT_MODEL_NON_QUANT=1
-export LD_LIBRARY_PATH=/usr/local/Ascend/extra-ops/vendors/custom_transformer/op_api/lib:$LD_LIBRARY_PATH
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=160
-export SGLANG_DSPARK_A5_EXTRA_OPS_SO=/usr/local/Ascend/extra-ops/vllm_ascend_C.cpython-312-x86_64-linux-gnu.so
-export SGLANG_DSPARK_FAST_KERNEL=0
-export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export STREAMS_PER_DEVICE=32
+export SGLANG_SET_CPU_AFFINITY=1
+
+export HCCL_SOCKET_IFNAME=lo
+export GLOO_SOCKET_IFNAME=lo
+export HCCL_INTRA_DMA_ENABLE=1
+
+export SGLANG_OPT_USE_OVERLAP_STORE_CACHE=False
+export FORCE_DRAFT_MODEL_NON_QUANT=1
+export SGLANG_DSV4_FP4_EXPERTS=True
+export SGLANG_OPT_FUSE_WQA_WKV=0
+export SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
+export SGLANG_OPT_USE_FUSED_HASH_TOPK=False
+export SGLANG_OPT_USE_TILELANG_MHC_PRE=False
+export SGLANG_OPT_DEEPGEMM_HC_PRENORM=False
+export SGLANG_OPT_USE_TILELANG_MHC_POST=False
+export SGLANG_OPT_FP8_WO_A_GEMM=False
+
 export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+
+export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=16
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=160
+export DEEPEP_HCCL_BUFFSIZE=1600
+
+export ASCEND_CUSTOM_OPP_PATH="/usr/local/Ascend/extra-ops/vendors/custom_transformer/${ASCEND_CUSTOM_OPP_PATH:+:${ASCEND_CUSTOM_OPP_PATH}}"
+export LD_LIBRARY_PATH="/usr/local/Ascend/extra-ops/vendors/custom_transformer/op_api/lib${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}"
+
 export SGLANG_ENABLE_WAR_BARRIER=1
 export SGLANG_FORCE_COARSE_WAR_BARRIER=1
-export SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
-export SGLANG_OPT_DEEPGEMM_HC_PRENORM=False
-export SGLANG_OPT_FP8_WO_A_GEMM=False
-export SGLANG_OPT_FUSE_WQA_WKV=0
-export SGLANG_OPT_USE_FUSED_HASH_TOPK=False
-export SGLANG_OPT_USE_OVERLAP_STORE_CACHE=False
-export SGLANG_OPT_USE_TILELANG_MHC_POST=False
-export SGLANG_OPT_USE_TILELANG_MHC_PRE=False
-export SGLANG_SET_CPU_AFFINITY=1
-export STREAMS_PER_DEVICE=32
+
+MODEL_PATH="${MODEL_PATH:-/path/to/DeepSeek-V4-Flash-0731}"
+HOST="${HOST:-0.0.0.0}"
+PORT="${PORT:-8001}"
 
 python3 -m sglang.launch_server \
-    --model-path "${MODEL_PATH}" \
+    --served-model-name deepseek-v4-flash \
+    --model-path "$MODEL_PATH" \
     --page-size 128 \
-    --tp-size 4 \
+    --tp-size 8 \
     --trust-remote-code \
-    --device npu \
     --attention-backend dsv4 \
+    --device npu \
     --watchdog-timeout 9000 \
-    --host 127.0.0.1 --port 6688 \
+    --host "${HOST}" --port "${PORT}" \
     --mem-fraction-static 0.72 \
     --max-running-requests 64 \
     --chunked-prefill-size 65536 \
     --max-prefill-tokens 65536 \
-    --cuda-graph-bs-decode 1 2 4 8 16 \
+    --cuda-graph-bs-decode 1 2 4 8 10 \
+    --kv-cache-dtype auto \
     --enable-dp-lm-head \
     --disable-radix-cache \
-    --enable-dp-attention --dp-size 4 \
+    --enable-dp-attention --dp-size 8 \
     --reasoning-parser deepseek-v4 \
     --speculative-algorithm DSPARK \
     --speculative-draft-attention-backend ascend \
     --speculative-num-draft-tokens 6 \
-    --speculative-dspark-block-size 5
+    --speculative-dspark-block-size 5 \
+    "$@"
+```
+
+For ordinary Static serving:
+
+```bash Command
+MODEL_PATH=/path/to/DeepSeek-V4-Flash-0731 bash launch_dspark_a5.sh
 ```
 
   </Tab>
 </Tabs>
+
+#### DSpark Compact (optional)
+
+Static is the upstream default. For the profiler's default one-dimensional sweep, first run a Static server, then
+generate an SPS table, stop the server, and restart in Compact mode with that table. The profiler connects to the
+running server; it does not launch one. Profile a separate table for each hardware, checkpoint, quantization,
+parallelism, draft width, and graph configuration that changes step cost.
+
+Keep NPU graphs enabled, pipeline parallelism at one, and attention context parallelism at one for these examples.
+With DP Attention, retain `--enable-dp-lm-head`. Compact needs trained confidence weights or the runtime's supported
+online estimator; Static alone does not require a trained Confidence Head.
+
+**1. Start the Static profiling server.** First start a Static DSpark service using the command for your hardware;
+then generate the SPS table in the next step. The default diagonal profiler requires
+`SGLANG_DSPARK_ENABLE_SPS_RECORD=1` and `SGLANG_SIMULATE_ACC_LEN=1.0`; these are profiling settings,
+not accuracy-evaluation or production defaults.
+
+<Tabs>
+  <Tab title="910(A3)">
+
+```bash Command
+MODEL_PATH=/path/to/DeepSeek-V4-Flash-0731-w8a8 \
+SGLANG_RAGGED_VERIFY_MODE=static \
+SGLANG_DSPARK_ENABLE_SPS_RECORD=1 \
+SGLANG_SIMULATE_ACC_LEN=1.0 \
+bash launch_dspark_a3.sh
+```
+
+  </Tab>
+  <Tab title="950(A5)">
+
+```bash Command
+MODEL_PATH=/path/to/DeepSeek-V4-Flash-0731 \
+SGLANG_RAGGED_VERIFY_MODE=static \
+SGLANG_DSPARK_ENABLE_SPS_RECORD=1 \
+SGLANG_SIMULATE_ACC_LEN=1.0 \
+bash launch_dspark_a5.sh
+```
+
+  </Tab>
+</Tabs>
+
+Wait until the server is ready before starting the profiler. Use a dedicated instance: profiling flushes caches and
+aborts its generated load between measurement rounds.
+
+**2. Generate the SPS table.** Keep the Static service running. Use the same SGLang installation to run the profiler
+against its endpoint and save the generated JSON table to the output path below.
+
+<Tabs>
+  <Tab title="910(A3)">
+
+```bash Command
+SPS_TABLE_PATH=/path/to/output/dspark_sps_a3.json
+mkdir -p "$(dirname "${SPS_TABLE_PATH}")"
+
+python3 -m sglang.benchmark.dspark_sps_profiler all \
+    --base-url http://127.0.0.1:6688 \
+    --batch-size 1 2 4 8 10 \
+    --out "${SPS_TABLE_PATH}"
+```
+
+  </Tab>
+  <Tab title="950(A5)">
+
+```bash Command
+SPS_TABLE_PATH=/path/to/output/dspark_sps_a5.json
+mkdir -p "$(dirname "${SPS_TABLE_PATH}")"
+
+python3 -m sglang.benchmark.dspark_sps_profiler all \
+    --base-url http://127.0.0.1:8001 \
+    --batch-size 1 2 4 8 10 \
+    --out "${SPS_TABLE_PATH}"
+```
+
+  </Tab>
+</Tabs>
+
+`all` collects measurements, fits the JSON table, and performs the read-back self-check.
+
+Both examples use `--batch-size 1 2 4 8 10`, measured **per DP rank**. Current upstream skips points that exceed
+the running-request limit reported by the server. With DP=8 and a 64-request limit on 950(A5), the point `10`
+requires 80 requests and is skipped; points through `8` are measured. To measure `10`, raise the server's effective
+running-request limit to at least 80 and verify sufficient memory. The sweep must also fit the captured graph range.
+
+**3. Restart in Compact mode.** After the SPS table has been generated, stop the Static service. Clear the profiling
+overrides, then restart the matching script in Compact mode with the generated table path:
+
+```bash
+unset SGLANG_SIMULATE_ACC_LEN
+unset SGLANG_DSPARK_ENABLE_SPS_RECORD
+unset SGLANG_DSPARK_DEBUG_DUMP
+```
+
+<Tabs>
+  <Tab title="910(A3)">
+
+```bash Command
+MODEL_PATH=/path/to/DeepSeek-V4-Flash-0731-w8a8 \
+SGLANG_RAGGED_VERIFY_MODE=compact \
+bash launch_dspark_a3.sh \
+    --speculative-dspark-sps-table-path /path/to/output/dspark_sps_a3.json
+```
+
+  </Tab>
+  <Tab title="950(A5)">
+
+```bash Command
+MODEL_PATH=/path/to/DeepSeek-V4-Flash-0731 \
+SGLANG_RAGGED_VERIFY_MODE=compact \
+bash launch_dspark_a5.sh \
+    --speculative-dspark-sps-table-path /path/to/output/dspark_sps_a5.json
+```
+
+  </Tab>
+</Tabs>
+
+**4. Verify serving and scheduling.** Check the startup log for
+`DSpark ragged-verify scheduler enabled`, `mode=compact`, and the intended SPS-table path.
+The runtime warns when the cost table is uninitialized and the budget degenerates to verify-all; selecting the mode
+alone is not evidence of token-budget savings. Send requests with the same API examples used for Static, then compare
+scheduled verification lengths, actual graph sizes, acceptance, TTFT, TPOT, throughput, and completed-request counts.
+
+For a five-token draft block, each Static window contains six positions including the anchor. With three requests,
+Compact lengths `[6, 4, 2]` contain 12 logical verification positions instead of 18. Graph padding and DP agreement
+can still keep the executed graph size unchanged. Keep prompts, sampling, thinking settings, concurrency, output
+limits, and warmup fixed between Static and Compact; leave simulated acceptance unset during these checks.
 
 For the complete benchmark data and additional single-node configurations, see
 [DeepSeek-V4-Flash Best Practice — PD Mixed On A3 Series](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_v4_flash#single-node-pd-mixed).
@@ -317,9 +488,41 @@ throughput for high-concurrency scenarios. This scenario is already covered in t
 deployment commands and benchmark data, see
 [DeepSeek-V4-Flash Best Practice — PD Disaggregation On A3 Series](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_v4_flash#pd-disaggregation).
 
+### HiCache L2 and L3 (optional)
+
+HiCache extends prefix KV caching from NPU memory (L1) to host memory (L2), with an optional storage backend (L3).
+It benefits repeated prefixes in long-context and multi-turn workloads; Compact changes decode verification work.
+Size host memory for the whole deployment, including every worker's cache pools.
+
+For L2 on Ascend, append the following arguments to the 910(A3) launch script. Use the Ascend `kernel_ascend` I/O backend
+and let the runtime select its compatible memory layout. For 950(A5), first remove `--disable-radix-cache` from its
+launch script before enabling HiCache.
+
+```bash Command
+MODEL_PATH=/path/to/DeepSeek-V4-Flash-0731-w8a8 \
+bash launch_dspark_a3.sh \
+    --enable-hierarchical-cache \
+    --hicache-ratio 2 \
+    --hicache-io-backend kernel_ascend \
+    --hicache-write-policy write_through
+```
+
+`--hicache-write-policy` controls when device KV cache is backed up to host memory. This example explicitly uses
+the default `write_through` policy, which proactively backs up cached KV for later reuse.
+
+L2 requires no storage-backend flag. For L3, configure the chosen backend and additionally pass
+`--hicache-storage-backend file`, `mooncake`, or another backend supported by the installed runtime. The `file` backend
+uses node-local storage by default; set `SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR` to a mounted directory with sufficient
+capacity when using it in a container. A storage-backend flag alone does not configure a remote storage service.
+
+For backend setup, write and prefetch policies, and cache-hit validation, see
+[HiCache Best Practices](/docs/advanced_features/hicache_best_practices). Keep cache settings identical when comparing
+Static and Compact. Validate their combined configuration on the selected hardware; 950(A5) Compact remains pending validation.
+
 ## Functional verification
 
-After the service is started, you can invoke the model by sending a prompt:
+After the service is started, you can invoke the model by sending a prompt. The launch scripts set the served model
+name to `deepseek-v4-flash`. Set `HOST` and `PORT` for 910(A3) (`127.0.0.1:6688`) or 950(A5) (`127.0.0.1:8001`):
 
 ```shell
 # ============================================================
@@ -346,9 +549,16 @@ see [Testing the Service](/docs/hardware-platforms/ascend-npus/getting-started/i
 
 For accuracy evaluation methods and datasets, see [Accuracy Evaluation on Ascend NPU](/docs/hardware-platforms/ascend-npus/evaluation/accuracy_evaluation).
 
+For Static/Compact accuracy comparisons, leave `SGLANG_SIMULATE_ACC_LEN` unset and keep prompts, sampling parameters,
+reasoning settings, and generation limits identical. Confirm normal completion, cancellation, and subsequent requests.
+
 ## Performance
 
 For performance data and benchmark commands, see [Performance Testing on Ascend NPU](/docs/hardware-platforms/ascend-npus/evaluation/performance_testing).
+
+Compare Static and Compact with the same workload, warmup, cache settings, and concurrency. Record acceptance,
+verification lengths, executed graph sizes, TTFT, TPOT, throughput, and completed-request counts. Fewer logical verify
+tokens do not guarantee a smaller graph or lower end-to-end latency.
 
 ## Best practices
 
@@ -365,3 +575,4 @@ guidance, see [Optimization on Ascend NPU](/docs/hardware-platforms/ascend-npus/
 ## FAQ
 
 For common environment, installation, and general parameter issues, please refer to the [Ascend NPU FAQ](/docs/hardware-platforms/ascend-npus/faq).
+
