@@ -50,10 +50,10 @@ from `main` by URL, so keep their names and location.
   ([SIL Open Font License 1.1](https://github.com/googlefonts/opensans)) and
   stored as outlines, so no font is loaded.
 - Each dot is a piece of a letter with noise added to it, more the further
-  right it sits. Most stay with their letter; the rest drift off to the right
-  and leave a hole behind.
-- The dots past the last letter have a soft glow: one blurred layer under the
-  word.
+  right it sits, so the dots scatter gradually into a wide tail. Each leaves
+  a small hole where it started; the letters keep their shapes.
+- The dots clear of the last letter have a soft glow: one blurred layer under
+  the word. It starts a short gap to the right of the N, so the N reads cleanly.
 - The drifting dots move slowly on a 12 second loop. The motion is CSS inside
   the SVG, with no script, and it stops under `prefers-reduced-motion`.
 
