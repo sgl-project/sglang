@@ -9,6 +9,7 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.platforms.cpu import CpuSRTPlatform
+from sglang.srt.platforms.mlu import MluSRTPlatform
 from sglang.srt.utils import serialization
 from sglang.srt.utils.serialization import (
     MultiprocessingSerializer,
@@ -133,6 +134,33 @@ class TestSafeUnpickler(CustomTestCase):
         with patch.object(serialization, "current_platform", CpuSRTPlatform()):
             with self.assertRaisesRegex(RuntimeError, "Blocked unsafe global"):
                 safe_pickle_loads(b"cos\nsystem\n.")
+
+    def test_mlu_rebuild_allowlist_is_exact(self):
+        """MLU payloads resolve rebuilds without allowing other backend globals."""
+        from sglang.srt.utils import mlu_ipc
+
+        native = SimpleNamespace(rebuild_mlu_tensor=lambda: None)
+        with (
+            patch.dict("sys.modules", {"torch_mlu.mlu.reductions": native}),
+            patch.object(serialization, "current_platform", MluSRTPlatform()),
+        ):
+            self.assertIs(
+                safe_pickle_loads(pickle.dumps(mlu_ipc._rebuild_mlu_tensor_modified)),
+                mlu_ipc._rebuild_mlu_tensor_modified,
+            )
+            unpickler = SafeUnpickler(io.BytesIO())
+            self.assertIs(
+                unpickler.find_class("torch_mlu.mlu.reductions", "rebuild_mlu_tensor"),
+                native.rebuild_mlu_tensor,
+            )
+            for module, name in (
+                (mlu_ipc.__name__, "register_mlu_reductions"),
+                ("torch_mlu.mlu.reductions", "_reduce_tensor"),
+                ("torch_mlu.mlu.reductions.other", "rebuild_mlu_tensor"),
+            ):
+                with self.subTest(module=module, name=name):
+                    with self.assertRaisesRegex(RuntimeError, "Blocked unsafe global"):
+                        unpickler.find_class(module, name)
 
     def test_builtin_globals_and_storage_loader_take_precedence(self):
         """Backend lookup must not replace built-ins or the restricted storage loader."""

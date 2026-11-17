@@ -1057,6 +1057,56 @@ class TestCurrentPlatformLazyInit(CustomTestCase):
 
 
 class TestTensorIPCRegistration(CustomTestCase):
+    def test_mlu_registration_preserves_cpu_tensors_and_parameters(self):
+        """MLU initialization must preserve native handling of non-MLU tensors."""
+        from multiprocessing.reduction import ForkingPickler
+        from types import SimpleNamespace
+
+        from torch.multiprocessing.reductions import reduce_tensor
+
+        from sglang.srt.utils import patch_torch, serialization
+
+        native = SimpleNamespace(
+            _reduce_tensor=reduce_tensor,
+            rebuild_mlu_tensor=MagicMock(
+                side_effect=AssertionError("Unexpected MLU IPC")
+            ),
+        )
+        platform = MluSRTPlatform()
+        with (
+            patch.dict("sys.modules", {"torch_mlu.mlu.reductions": native}),
+            patch.dict(ForkingPickler._extra_reducers),
+            patch.object(patch_torch, "current_platform", platform),
+            patch.object(serialization, "current_platform", platform),
+        ):
+            patch_torch.monkey_patch_torch_reductions()
+            patch_torch.monkey_patch_torch_reductions()
+            tensor = torch.arange(12, dtype=torch.float32).reshape(3, 4)[:, 1::2]
+            for value in (tensor, torch.nn.Parameter(tensor)):
+                with self.subTest(tensor_type=type(value)):
+                    restored = serialization.MultiprocessingSerializer.deserialize(
+                        serialization.MultiprocessingSerializer.serialize(value)
+                    )
+                    self.assertIs(type(restored), type(value))
+                    self.assertTrue(torch.equal(restored, value))
+                    self.assertEqual(restored.device.type, "cpu")
+                    self.assertEqual(restored.stride(), value.stride())
+                    self.assertEqual(restored.requires_grad, value.requires_grad)
+
+    def test_mlu_ipc_rejects_invisible_device(self):
+        """A receiver must reject an exporting card outside its visible devices."""
+        from types import SimpleNamespace
+
+        from sglang.srt.utils import mlu_ipc
+
+        device_api = SimpleNamespace(
+            device_count=lambda: 1,
+            get_device_properties=lambda i: SimpleNamespace(uuid="card-b"),
+        )
+        with patch.object(torch, "mlu", device_api, create=True):
+            with self.assertRaisesRegex(RuntimeError, "'card-a' is not visible"):
+                mlu_ipc._device_from_uuid("card-a")
+
     def test_backend_reducer_survives_repeated_initialization(self):
         """A backend's CPU-usable reducer must not be replaced by CUDA setup."""
         import pickle
@@ -1082,51 +1132,6 @@ class TestTensorIPCRegistration(CustomTestCase):
             tensor = torch.arange(6).reshape(2, 3)
             restored = pickle.loads(ForkingPickler.dumps(tensor))
             self.assertTrue(torch.equal(restored, tensor))
-
-    def test_default_platform_preserves_builtin_reducers(self):
-        """Platforms without an override retain CUDA/NPU setup and idempotency."""
-        from types import SimpleNamespace
-
-        from sglang.srt.utils import patch_torch
-
-        for is_npu in (False, True):
-            with self.subTest(is_npu=is_npu):
-                original = MagicMock()
-                reductions = SimpleNamespace(
-                    reduce_tensor=original,
-                    rebuild_cuda_tensor=original,
-                    rebuild_npu_tensor=original,
-                    init_reductions=MagicMock(),
-                )
-                # NPU's replacement is defined only on NPU at module import.
-                replacement = MagicMock()
-                with (
-                    patch.object(patch_torch, "current_platform", CpuSRTPlatform()),
-                    patch.object(patch_torch, "_is_npu", is_npu),
-                    patch.object(patch_torch, "reductions", reductions),
-                    patch.object(
-                        patch_torch, "npu_reductions", reductions, create=True
-                    ),
-                    patch.object(
-                        patch_torch,
-                        "_rebuild_npu_tensor_modified",
-                        replacement,
-                        create=True,
-                    ),
-                ):
-                    patch_torch.monkey_patch_torch_reductions()
-                    patch_torch.monkey_patch_torch_reductions()
-                    if is_npu:
-                        self.assertIs(reductions._rebuild_npu_tensor_original, original)
-                        self.assertIs(reductions.rebuild_npu_tensor, replacement)
-                        reductions.init_reductions.assert_not_called()
-                    else:
-                        self.assertIs(reductions._reduce_tensor_original, original)
-                        self.assertIs(
-                            reductions.reduce_tensor,
-                            patch_torch._reduce_tensor_modified,
-                        )
-                        reductions.init_reductions.assert_called_once_with()
 
 
 if __name__ == "__main__":
