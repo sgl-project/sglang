@@ -2,18 +2,10 @@ syntax = "proto3";
 
 package sglang.api.v1;
 
-// Draft contract for SglangService.Shutdown, tracked in #38075.
-// This file is deliberately NOT imported by service.proto yet: it does not
-// register an RPC or enable remote shutdown. Agree on the lifecycle trigger,
-// administrative access policy and supported topology before wiring it.
-//
-// Proposed signature on the existing service (not a separate lifecycle server):
-//   rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
-//
-// Reuse the native engine's SIGTERM drain and supervisor teardown. Starting
-// CoreHandle::begin_drain alone must not be presented as a complete process
-// shutdown implementation: listeners, scheduler ranks and parent supervision
-// must all follow the same existing shutdown path.
+// SglangService.Shutdown, tracked in #38075. Disabled unless
+// SGLANG_ENABLE_NATIVE_SHUTDOWN_RPC=1 and --admin-api-key is configured.
+// Initial scope: a single-node, single-DP owning runtime whose launcher has
+// installed the native SIGTERM drain and parent-supervisor notification.
 message ShutdownRequest {
   // Required, nonempty, and equal to GetServerInfoResponse.instance_id.
   // Reject an empty identity with INVALID_ARGUMENT and a different identity
@@ -25,21 +17,13 @@ message ShutdownRequest {
 message ShutdownResponse {
   // The owning runtime that accepted the operation; NOT a cluster-wide epoch.
   string instance_id = 1;
-  ShutdownAcceptance acceptance = 2;
+  // True when this runtime accepted shutdown, including an idempotent retry.
+  bool accepted = 2;
+  bool already_requested = 3;
 }
 
-enum ShutdownAcceptance {
-  // Never returned by an implemented handler as a successful acknowledgement.
-  SHUTDOWN_ACCEPTANCE_UNSPECIFIED = 0;
-  // This owning runtime accepted the request to begin its configured shutdown.
-  SHUTDOWN_ACCEPTANCE_ACCEPTED = 1;
-  // The same runtime is already shutting down; retries do not restart timers
-  // or turn a graceful drain into a force-stop.
-  SHUTDOWN_ACCEPTANCE_ALREADY_ACCEPTED = 2;
-}
-
-// Proposed semantics:
-// - Both successful values acknowledge acceptance only. Neither proves that
+// Semantics:
+// - A successful response acknowledges acceptance only. It does not prove that
 //   generations finished, scheduler/GPU/PD owners retired, or the process exited.
 // - RPC cancellation/disconnection after acceptance does not undo shutdown.
 //   A lost response is an ambiguous outcome; retry only against the same
@@ -48,11 +32,7 @@ enum ShutdownAcceptance {
 //   drain marks health unavailable but still admits requests until listener
 //   close. This draft does not promise a new stop-admission boundary, a drain
 //   deadline, or a drain-completion receipt.
-// - Unsupported ownership/topology must fail before mutation; an arbitrary DP
+// - Unsupported ownership/topology fails before mutation; an arbitrary DP
 //   listener is not automatically an authorized whole-engine shutdown owner.
-// - The eventual RPC needs explicit administrative exposure and authentication;
-//   adding a public message type does not authorize an unprotected endpoint.
-//
-// Follow-ups before exposing the RPC: reuse the authoritative lifecycle trigger,
-// generate bindings, gate access, and cover identity/retry, active-generation
-// drain, connection teardown, and scheduler/supervisor exit on a real engine.
+// - An Authorization bearer token matching --admin-api-key is required.
+//   The ordinary inference key does not grant shutdown permission.

@@ -48,17 +48,19 @@ impl DrainState {
 
     /// Start draining (idempotent); `force` skips the wait for in-flight
     /// requests.
-    pub(crate) fn begin(&self, force: bool) {
+    pub(crate) fn begin(&self, force: bool) -> bool {
         if force {
             self.forced.store(true, Ordering::SeqCst);
         }
-        if !self.draining.swap(true, Ordering::SeqCst) {
+        let first = !self.draining.swap(true, Ordering::SeqCst);
+        if first {
             tracing::warn!(
                 in_flight = self.in_flight.load(Ordering::SeqCst),
                 "Drain requested: health now answers 503; draining requests and shutting down"
             );
         }
         self.changed.notify_waiters();
+        first
     }
 
     pub(crate) fn is_draining(&self) -> bool {

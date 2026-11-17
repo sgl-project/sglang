@@ -12,7 +12,9 @@ use tonic::{Request, Response, Status};
 
 use super::{info, native_api};
 use crate::api_server::core::{HealthStatus, ReceivedAs};
-use crate::api_server::handlers::{AbortEnding, CoreHandle, HiCacheError, HiCacheManager};
+use crate::api_server::handlers::{
+    AbortEnding, CoreHandle, HiCacheError, HiCacheManager, ShutdownError,
+};
 use crate::message::config::{
     DEFAULT_GRPC_RESPONSE_TIMEOUT_SECS, PreferredSamplingParams, ServerArgs,
 };
@@ -43,6 +45,9 @@ pub(crate) struct GrpcService {
     core: CoreHandle,
     config: AdapterConfig,
     hicache_manager: Arc<HiCacheManager>,
+    shutdown_admin_key: Option<String>,
+    shutdown_enabled: bool,
+    shutdown_topology_supported: bool,
 }
 
 impl GrpcService {
@@ -52,6 +57,13 @@ impl GrpcService {
         hicache_manager: Arc<HiCacheManager>,
     ) -> Self {
         Self {
+            shutdown_admin_key: server_args.api_keys.admin_api_key.clone(),
+            shutdown_enabled: environ::env_bool("SGLANG_ENABLE_NATIVE_SHUTDOWN_RPC", false),
+            shutdown_topology_supported: server_args.deployment_info.nnodes == 1
+                && server_args.deployment_info.dp_size == 1
+                && !server_args.deployment_info.enable_dp_attention
+                && server_args.disaggregation_mode
+                    == crate::message::config::DisaggregationMode::Null,
             core,
             config: AdapterConfig {
                 preferred_sampling_params: server_args.preferred_sampling_params.clone(),
@@ -80,6 +92,9 @@ impl GrpcService {
             ..Default::default()
         };
         Self {
+            shutdown_admin_key: Some("sk-admin".into()),
+            shutdown_enabled: false,
+            shutdown_topology_supported: true,
             hicache_manager: Arc::new(HiCacheManager::new(core.clone(), &args)),
             core,
             config: AdapterConfig {
@@ -110,6 +125,67 @@ fn response_timeout(secs: u64) -> Duration {
 #[tonic::async_trait]
 impl SglangService for GrpcService {
     type GenerateStream = ResponseStream<api::GenerateStreamItem>;
+
+    async fn shutdown(
+        &self,
+        request: Request<api::ShutdownRequest>,
+    ) -> Result<Response<api::ShutdownResponse>, Status> {
+        if !self.shutdown_enabled {
+            return Err(Status::unimplemented("native Shutdown RPC is disabled"));
+        }
+        let key = self
+            .shutdown_admin_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .ok_or_else(|| Status::failed_precondition("Shutdown requires --admin-api-key"))?;
+        let authorized = request
+            .metadata()
+            .get_all("authorization")
+            .iter()
+            .collect::<Vec<_>>();
+        let token = (authorized.len() == 1)
+            .then(|| authorized[0].to_str().ok())
+            .flatten()
+            .and_then(|value| value.split_once(' '))
+            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+            .map(|(_, token)| token);
+        if !token.is_some_and(|token| {
+            token.len() == key.len()
+                && token
+                    .bytes()
+                    .zip(key.bytes())
+                    .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+                    == 0
+        }) {
+            return Err(Status::unauthenticated(
+                "Shutdown requires the admin bearer token",
+            ));
+        }
+        if !self.shutdown_topology_supported {
+            return Err(Status::unimplemented(
+                "Shutdown currently requires unified single-node single-DP serving",
+            ));
+        }
+        let first = self
+            .core
+            .request_shutdown(&request.into_inner().expected_instance_id)
+            .map_err(|error| match error {
+                ShutdownError::MissingIdentity => {
+                    Status::invalid_argument("expected_instance_id is required")
+                }
+                ShutdownError::DifferentInstance => {
+                    Status::failed_precondition("engine instance changed")
+                }
+                ShutdownError::NoOwner => {
+                    Status::failed_precondition("native shutdown supervisor is not installed")
+                }
+            })?;
+        Ok(Response::new(api::ShutdownResponse {
+            instance_id: self.core.owning_instance_id().to_owned(),
+            accepted: true,
+            already_requested: !first,
+        }))
+    }
 
     /// `/generate` over gRPC: one schema, one fan-out, one admission path. A
     /// body that fails normalization ends the RPC with INVALID_ARGUMENT before
@@ -332,6 +408,98 @@ mod tests {
         service: GrpcService,
         intake_rx: flume::Receiver<TmEvent>,
         abort_rx: flume::Receiver<AbortSource>,
+    }
+
+    fn shutdown_request(instance: &str, bearer: Option<&str>) -> Request<api::ShutdownRequest> {
+        let mut req = Request::new(api::ShutdownRequest {
+            expected_instance_id: instance.into(),
+        });
+        if let Some(bearer) = bearer {
+            req.metadata_mut()
+                .insert("authorization", bearer.parse().unwrap());
+        }
+        req
+    }
+
+    #[tokio::test]
+    async fn shutdown_auth_and_identity_fail_without_mutating_runtime() {
+        let mut h = Harness::new(4, true, Duration::from_secs(1));
+        let id = h.service.core.owning_instance_id().to_owned();
+        assert_eq!(
+            h.service
+                .shutdown(shutdown_request(&id, Some("Bearer sk-admin")))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unimplemented
+        );
+        h.service.shutdown_enabled = true;
+        for bearer in [
+            None,
+            Some("Bearer ordinary-inference-key"),
+            Some("Basic sk-admin"),
+        ] {
+            assert_eq!(
+                h.service
+                    .shutdown(shutdown_request(&id, bearer))
+                    .await
+                    .unwrap_err()
+                    .code(),
+                Code::Unauthenticated
+            );
+        }
+        assert_eq!(
+            h.service
+                .shutdown(shutdown_request("old-boot", Some("Bearer sk-admin")))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        assert!(!h.service.core.is_draining());
+        h.service.core.install_shutdown_owner(false);
+        let response = h
+            .service
+            .shutdown(shutdown_request(&id, Some("Bearer sk-admin")))
+            .await
+            .unwrap()
+            .into_inner();
+        assert_eq!(response.instance_id, id);
+        assert!(response.accepted && !response.already_requested);
+        assert!(h.service.core.is_draining());
+        let retry = h
+            .service
+            .shutdown(shutdown_request(&id, Some("Bearer sk-admin")))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(retry.accepted && retry.already_requested);
+    }
+
+    #[tokio::test]
+    async fn shutdown_requires_installed_supervisor_and_supported_topology() {
+        let mut h = Harness::new(4, true, Duration::from_secs(1));
+        h.service.shutdown_enabled = true;
+        let id = h.service.core.owning_instance_id().to_owned();
+        assert_eq!(
+            h.service
+                .shutdown(shutdown_request(&id, Some("Bearer sk-admin")))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::FailedPrecondition
+        );
+        h.service.core.install_shutdown_owner(false);
+        h.service.shutdown_topology_supported = false;
+        assert_eq!(
+            h.service
+                .shutdown(shutdown_request(&id, Some("Bearer sk-admin")))
+                .await
+                .unwrap_err()
+                .code(),
+            Code::Unimplemented
+        );
+        assert!(!h.service.core.is_draining());
     }
 
     struct GenerationIntake {
@@ -1059,6 +1227,9 @@ mod tests {
         let refusing = GrpcService {
             core: service.core.clone(),
             config: service.config.clone(),
+            shutdown_admin_key: None,
+            shutdown_enabled: false,
+            shutdown_topology_supported: true,
             hicache_manager: Arc::new(HiCacheManager::new(
                 service.core.clone(),
                 &ServerArgs::default(),

@@ -3964,6 +3964,124 @@ impl<'de> ::serde::Deserialize<'de> for HiCacheStorageResponse {
     }
 }
 
+impl ::serde::Serialize for ShutdownRequest {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "expected_instance_id",
+            &self.expected_instance_id,
+        )?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ShutdownRequest {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ShutdownRequest;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ShutdownRequest")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_expected_instance_id = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "expected_instance_id" => {
+                            if f_expected_instance_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "expected_instance_id",
+                                ));
+                            }
+                            f_expected_instance_id =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ShutdownRequest {
+                    expected_instance_id: f_expected_instance_id.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for ShutdownResponse {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "instance_id", &self.instance_id)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "accepted", &self.accepted)?;
+        ::serde::ser::SerializeMap::serialize_entry(
+            &mut map,
+            "already_requested",
+            &self.already_requested,
+        )?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for ShutdownResponse {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = ShutdownResponse;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct ShutdownResponse")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_instance_id = None;
+                let mut f_accepted = None;
+                let mut f_already_requested = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "instance_id" => {
+                            if f_instance_id.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("instance_id"));
+                            }
+                            f_instance_id =
+                                Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "accepted" => {
+                            if f_accepted.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("accepted"));
+                            }
+                            f_accepted = Some(map.next_value::<bool>()?);
+                        }
+                        "already_requested" => {
+                            if f_already_requested.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "already_requested",
+                                ));
+                            }
+                            f_already_requested = Some(map.next_value::<bool>()?);
+                        }
+                        _ => {
+                            map.next_value::<::serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(ShutdownResponse {
+                    instance_id: f_instance_id.unwrap_or_default(),
+                    accepted: f_accepted.unwrap_or_default(),
+                    already_requested: f_already_requested.unwrap_or_default(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
 impl ::serde::Serialize for ListModelsRequest {
     fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         let map = serializer.serialize_map(None)?;

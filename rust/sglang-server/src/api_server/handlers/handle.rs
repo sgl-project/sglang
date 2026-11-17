@@ -169,6 +169,9 @@ pub(super) struct CoreInner {
     /// Opaque owning-runtime boot identity for api.v1 `/server_info`. Minted
     /// once here; shared by every `CoreHandle` clone and protocol adapter.
     pub(super) instance_id: String,
+    /// Configured SIGTERM policy, installed only by a launcher with a parent
+    /// drain-notification channel. Absence means remote shutdown has no owner.
+    pub(super) shutdown_force: OnceLock<bool>,
     pub(super) generations: Generations,
     pub(super) metrics: Option<Arc<FrontendMetrics>>,
     pub(super) request_log: Option<Arc<RequestLog>>,
@@ -224,6 +227,7 @@ impl CoreHandle {
                 mm_processor: SetOnce::new(),
                 metadata: config.metadata,
                 instance_id: uuid::Uuid::new_v4().to_string(),
+                shutdown_force: OnceLock::new(),
                 generations: Generations::default(),
                 metrics: config.metrics,
                 request_log: config.request_log,

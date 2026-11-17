@@ -29,6 +29,13 @@ type ItemStream = Pin<Box<dyn Stream<Item = Result<api::GenerateStreamItem, Stat
 impl SglangService for Mock {
     type GenerateStream = ItemStream;
 
+    async fn shutdown(
+        &self,
+        _: Request<api::ShutdownRequest>,
+    ) -> Result<Response<api::ShutdownResponse>, Status> {
+        Err(Status::unimplemented("mock does not own an engine"))
+    }
+
     async fn generate(
         &self,
         request: Request<api::GenerateRequest>,

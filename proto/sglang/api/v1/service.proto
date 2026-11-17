@@ -10,6 +10,7 @@ package sglang.api.v1;
 
 import "sglang/api/v1/generate.proto";
 import "sglang/api/v1/hicache.proto";
+import "sglang/api/v1/shutdown.proto";
 import "sglang/json/v1/options.proto";
 
 service SglangService {
@@ -48,6 +49,10 @@ service SglangService {
   // Duplicate native IDs cancel all matching generations. A later reuse of the
   // ID is unaffected. Internal control/detokenization requests are not targeted.
   rpc Abort(AbortRequest) returns (AbortResponse);
+
+  // Opt-in administrative request to start the owning runtime's configured
+  // SIGTERM shutdown. Acceptance only, not a drain/process-exit receipt.
+  rpc Shutdown(ShutdownRequest) returns (ShutdownResponse);
 }
 
 message ListModelsRequest {}

@@ -267,6 +267,7 @@ impl Runtime {
     ) -> std::io::Result<std::os::fd::OwnedFd> {
         use std::io::Read;
 
+        let has_supervisor = notify.is_some();
         if let Some(notify) = notify {
             let _ = self.drain_notify.set(notify);
         }
@@ -294,6 +295,9 @@ impl Runtime {
                     }
                 }
             })?;
+        if has_supervisor {
+            self.core.install_shutdown_owner(force);
+        }
         Ok(write)
     }
 

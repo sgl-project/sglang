@@ -11,6 +11,8 @@ options exactly as the Rust server does. Decode with
 
 from __future__ import annotations
 
+import base64
+import binascii
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import msgspec
@@ -80,6 +82,17 @@ def _expect_str(v: Any, expected: str) -> str:
     if isinstance(v, str):
         return v
     raise _invalid_type(v, expected=expected)
+
+
+def _expect_bytes(v: Any, expected: str) -> bytes:
+    text = _expect_str(v, expected)
+    try:
+        data = base64.b64decode(text, validate=True)
+    except (ValueError, binascii.Error):
+        raise JsonContractError("invalid base64 bytes") from None
+    if base64.b64encode(data).decode("ascii") != text:
+        raise JsonContractError("invalid base64 bytes")
+    return data
 
 
 def _expect_seq(v: Any, expected: str) -> List[Any]:
@@ -580,6 +593,38 @@ class HiCacheStorageResponse(msgspec.Struct, kw_only=True, frozen=True):
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
         return encode_HiCacheStorageResponse(self)
+
+
+class ShutdownRequest(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ShutdownRequest: JSON object (unknown keys ignored)."""
+
+    expected_instance_id: str = ""
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ShutdownRequest":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ShutdownRequest(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ShutdownRequest(self)
+
+
+class ShutdownResponse(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.ShutdownResponse: JSON object (unknown keys ignored)."""
+
+    instance_id: str = ""
+    accepted: bool = False
+    already_requested: bool = False
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "ShutdownResponse":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_ShutdownResponse(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_ShutdownResponse(self)
 
 
 class ListModelsRequest(msgspec.Struct, kw_only=True, frozen=True):
@@ -2237,6 +2282,42 @@ def encode_HiCacheStorageResponse(v: HiCacheStorageResponse) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
     d["success"] = v.success
     d["message"] = v.message
+    return d
+
+
+def decode_ShutdownRequest(value: Any) -> ShutdownRequest:
+    m = _expect_map(value, expected="struct ShutdownRequest")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "expected_instance_id":
+            kw["expected_instance_id"] = _expect_str(x, expected="a string")
+    return ShutdownRequest(**kw)
+
+
+def encode_ShutdownRequest(v: ShutdownRequest) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["expected_instance_id"] = v.expected_instance_id
+    return d
+
+
+def decode_ShutdownResponse(value: Any) -> ShutdownResponse:
+    m = _expect_map(value, expected="struct ShutdownResponse")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "instance_id":
+            kw["instance_id"] = _expect_str(x, expected="a string")
+        elif key == "accepted":
+            kw["accepted"] = _expect_bool(x, expected="a boolean")
+        elif key == "already_requested":
+            kw["already_requested"] = _expect_bool(x, expected="a boolean")
+    return ShutdownResponse(**kw)
+
+
+def encode_ShutdownResponse(v: ShutdownResponse) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["instance_id"] = v.instance_id
+    d["accepted"] = v.accepted
+    d["already_requested"] = v.already_requested
     return d
 
 
