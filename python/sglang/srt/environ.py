@@ -515,8 +515,6 @@ class Envs:
     # found by the idle pool checks or the KV page check raises or only warns.
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
-    # With --gc-freeze-on-idle-secs, check every idle freeze for frozen objects
-    # that became cyclic garbage, and report them as a leak.
     SGLANG_ENABLE_GC_FROZEN_GARBAGE_CHECK = EnvBool(False)
     # The explicit environment variable still takes precedence over this CI
     # default, so production remains opt-in and CI remains opt-out if needed.

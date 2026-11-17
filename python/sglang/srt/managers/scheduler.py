@@ -273,7 +273,7 @@ from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
 )
 from sglang.srt.managers.scheduler_components.exit_ledger import record_send
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
-from sglang.srt.managers.scheduler_components.gc_manager import SchedulerGCManager
+from sglang.srt.managers.scheduler_components.gc_freezer import GCFreezer
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
     RustServerIdleSleeper,
@@ -785,7 +785,7 @@ class Scheduler(
         self.init_pool_stats_observer()
 
         self.init_invariant_checker()
-        self.init_gc_manager()
+        self.init_gc_freezer()
 
         self.init_load_publisher()
 
@@ -2829,14 +2829,14 @@ class Scheduler(
             scheduler_stage_metrics=self.scheduler_stage_metrics,
         )
 
-    def init_gc_manager(self) -> None:
-        """Control the cyclic GC from the invariant checker's idle and flush checks."""
-        self.gc_manager = SchedulerGCManager(
+    def init_gc_freezer(self) -> None:
+        """Freeze the heap when idle; warn on heap growth and frozen garbage."""
+        self.gc_freezer = GCFreezer(
             freeze_on_idle_secs=get_device().gc_freeze_on_idle_secs,
             check_frozen_garbage=envs.SGLANG_ENABLE_GC_FROZEN_GARBAGE_CHECK.get(),
             get_forward_ct=lambda: self.forward_ct,
         )
-        for check in self.gc_manager.checks():
+        for check in self.gc_freezer.checks():
             self.invariant_checker.register(check)
 
     def init_rank_consensus_checker(self) -> None:

@@ -53,7 +53,7 @@ class TestHandlePdRoleSwitch(unittest.TestCase):
         s.teardown_disaggregation = teardown_patcher.start()
         self.addCleanup(teardown_patcher.stop)
         s.init_disaggregation = MagicMock()
-        s.gc_manager = MagicMock()
+        s.gc_freezer = MagicMock()
         s._sync_disaggregation_mode_to_subcomponents = MagicMock()
         s._event_loop_should_restart = False
         s._pd_role_switch_in_progress = False

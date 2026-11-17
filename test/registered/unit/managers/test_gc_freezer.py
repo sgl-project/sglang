@@ -1,16 +1,11 @@
-"""The scheduler's GC manager freezes once per idle period that lasted the
-configured time, reports frozen cyclic garbage (a warning in production, a leak
-under the check env), refreezes after a cache reset only while freezing, warns
-on long-lived heap growth, and `refreeze_gc` frees the frozen garbage."""
-
 import collections
 import gc
 import unittest
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
-from sglang.srt.managers.scheduler_components import gc_manager
-from sglang.srt.managers.scheduler_components.gc_manager import SchedulerGCManager
+from sglang.srt.managers.scheduler_components import gc_freezer
+from sglang.srt.managers.scheduler_components.gc_freezer import GCFreezer
 from sglang.srt.managers.scheduler_components.state_check import Severity
 from sglang.srt.utils.gc_utils import refreeze_gc
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -25,7 +20,7 @@ class _Node:
             parent.children.append(self)
 
 
-class TestSchedulerGCManager(unittest.TestCase):
+class TestGCFreezer(unittest.TestCase):
     def setUp(self):
         self.now = [100.0]
         self.forward_ct = [7]
@@ -39,53 +34,52 @@ class TestSchedulerGCManager(unittest.TestCase):
             ("refreeze_gc", self.gc_ops.refreeze_gc),
             ("logger", self.gc_ops.logger),
         ):
-            patcher = patch.object(gc_manager, target, value)
+            patcher = patch.object(gc_freezer, target, value)
             patcher.start()
             self.addCleanup(patcher.stop)
 
-    def _manager(self, *, freeze_on_idle_secs, check_frozen_garbage=False):
-        manager = SchedulerGCManager(
+    def _freezer(self, *, freeze_on_idle_secs, check_frozen_garbage=False):
+        freezer = GCFreezer(
             freeze_on_idle_secs=freeze_on_idle_secs,
             check_frozen_garbage=check_frozen_garbage,
             get_forward_ct=lambda: self.forward_ct[0],
         )
-        manager._reporter = self.gc_ops.reporter
-        return manager
+        freezer._reporter = self.gc_ops.reporter
+        return freezer
 
     def _gc_calls(self):
         names = ("collect", "freeze_gc", "refreeze_gc", "unfreeze")
         return [c for c in self.gc_ops.mock_calls if c[0] in names]
 
-    def _two_idle_periods(self, manager):
-        manager._on_idle()
+    def _two_idle_periods(self, freezer):
+        freezer._on_idle()
         self.now[0] += 4.9
-        manager._on_idle()
+        freezer._on_idle()
         self.assertEqual(self._gc_calls(), [])
         self.now[0] += 0.1
         for _ in range(3):
-            manager._on_idle()
-        # A launched batch starts a new idle period.
+            freezer._on_idle()
         self.forward_ct[0] += 1
-        manager._on_idle()
+        freezer._on_idle()
         self.now[0] += 5.0
-        manager._on_idle()
+        freezer._on_idle()
 
     def test_idle_freeze_collects_then_freezes_once_per_idle_period(self):
-        self._two_idle_periods(self._manager(freeze_on_idle_secs=5.0))
+        self._two_idle_periods(self._freezer(freeze_on_idle_secs=5.0))
         once = [call.collect(), call.freeze_gc("Scheduler")]
         self.assertEqual(self._gc_calls(), once + once)
 
     def test_frozen_garbage_warns_in_production_and_is_a_leak_under_the_env(self):
-        manager = self._manager(freeze_on_idle_secs=5.0)
-        manager._next_garbage_check = 0.0
-        self._two_idle_periods(manager)
+        freezer = self._freezer(freeze_on_idle_secs=5.0)
+        freezer._next_garbage_check = 0.0
+        self._two_idle_periods(freezer)
         self.assertEqual(self._gc_calls()[0], call.refreeze_gc("Scheduler"))
         self.gc_ops.logger.warning.assert_called_once()
         self.gc_ops.reporter.report.assert_not_called()
 
         self.gc_ops.reset_mock()
         self._two_idle_periods(
-            self._manager(freeze_on_idle_secs=5.0, check_frozen_garbage=True)
+            self._freezer(freeze_on_idle_secs=5.0, check_frozen_garbage=True)
         )
         self.assertEqual(self._gc_calls(), [call.refreeze_gc("Scheduler")] * 2)
         self.assertEqual(
@@ -94,22 +88,22 @@ class TestSchedulerGCManager(unittest.TestCase):
         )
 
     def test_cache_reset_refreezes_only_while_freezing(self):
-        self._manager(freeze_on_idle_secs=0.0).on_cache_reset()
+        self._freezer(freeze_on_idle_secs=0.0).on_cache_reset()
         self.assertEqual(self._gc_calls(), [])
-        self._manager(freeze_on_idle_secs=5.0).on_cache_reset()
+        self._freezer(freeze_on_idle_secs=5.0).on_cache_reset()
         self.assertEqual(
             self._gc_calls(),
             [call.unfreeze(), call.collect(), call.freeze_gc("Scheduler")],
         )
 
     def test_heap_growth_warns_at_each_half_again(self):
-        manager = self._manager(freeze_on_idle_secs=0.0)
+        freezer = self._freezer(freeze_on_idle_secs=0.0)
         self.gc_ops.get_freeze_count.return_value = 0
         warned = []
         for count in (1000, 1400, 1500, 2000, 2250):
             self.gc_ops.get_objects.return_value = [object()] * count
             self.gc_ops.logger.warning.reset_mock()
-            manager._check_heap_growth()
+            freezer._check_heap_growth()
             warned.append(self.gc_ops.logger.warning.called)
         self.assertEqual(warned, [False, False, True, False, True])
 

@@ -14,27 +14,11 @@ from sglang.srt.utils.gc_utils import freeze_gc, refreeze_gc
 
 logger = logging.getLogger(__name__)
 
-# Arbitrary; the checks run only while the scheduler is idle.
 GC_CHECK_INTERVAL_SECS = 600.0
-# Warn when the long-lived objects exceed the last warned count by this factor.
 HEAP_GROWTH_WARN_RATIO = 1.5
 
 
-class SchedulerGCManager:
-    """The scheduler's control of the cyclic GC, run from its idle and flush checks.
-
-    - Heap growth: warns when the long-lived objects (gen2 and frozen) grow; full
-      passes slow down with the unfrozen ones.
-    - Idle freeze (--gc-freeze-on-idle-secs): once per idle period that lasts
-      that long, collect and freeze the survivors, so later full passes skip them.
-    - Frozen garbage: a frozen object that later sits in a garbage cycle is never
-      freed. Every GC_CHECK_INTERVAL_SECS an idle freeze refreezes instead and
-      warns about those objects; with SGLANG_ENABLE_GC_FROZEN_GARBAGE_CHECK, at
-      every idle freeze and as a leak.
-    - A cache reset drops the radix tree, whose parent and child links form
-      cycles: while freezing, unfreeze, collect, and freeze again.
-    """
-
+class GCFreezer:
     def __init__(
         self,
         *,
@@ -64,7 +48,6 @@ class SchedulerGCManager:
         ]
 
     def on_cache_reset(self) -> None:
-        """Collect the radix tree a cache reset dropped, and freeze the rest again."""
         if self._freezes:
             gc.unfreeze()
             gc.collect()

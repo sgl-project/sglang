@@ -1,5 +1,3 @@
-"""Process-level control of Python's cyclic garbage collector."""
-
 import collections
 import gc
 import logging
@@ -74,15 +72,14 @@ def freeze_gc(context: str, gc_threshold: Optional[Sequence[int]] = None):
 
 
 def _describe(obj) -> str:
-    """The type of `obj`; for a function, also where it is defined."""
     if isinstance(obj, types.FunctionType):
         return f"function {obj.__module__}.{obj.__qualname__}"
     return type(obj).__qualname__
 
 
 def refreeze_gc(context: str) -> collections.Counter:
-    """Unfreeze, collect, and freeze again; return the types of the frozen
-    objects that had become cyclic garbage, which a frozen heap never frees."""
+    """Unfreeze, collect, and freeze again; return the frozen objects that had
+    become cyclic garbage, by type."""
     gc.collect()
     gc.unfreeze()
     saved = len(gc.garbage)
