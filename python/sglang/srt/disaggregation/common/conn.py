@@ -2522,6 +2522,7 @@ class CommonKVSender(BaseKVSender):
         state_indices: Optional[List] = None,
         num_kv_tokens: Optional[int] = None,
         indices_event: Optional[object] = None,
+        send_aux: bool = True,
     ):
         if self.conclude_state in (KVPoll.Success, KVPoll.Failed):
             return
@@ -2547,7 +2548,8 @@ class CommonKVSender(BaseKVSender):
             kv_indices,
             index_slice,
             is_last_chunk,
-            aux_index=self.aux_index if is_last_chunk else None,
+            # send_aux=False: another PP stage writes this room's aux (Mooncake).
+            aux_index=self.aux_index if is_last_chunk and send_aux else None,
             state_indices=state_indices if is_last_chunk else None,
             num_kv_tokens=num_kv_tokens,
             wait_event=wait_event,

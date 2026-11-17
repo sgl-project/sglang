@@ -307,6 +307,15 @@ class SchedulerPPMixin:
         release_rids: Optional[Dict[str, bool]] = None
         send_transfer_work = []
         send_release_work = []
+        early_send = self._pp_pd_early_send_enabled()
+        if early_send:
+            self.disagg_prefill_early_sent_rids = set()
+            self.disagg_prefill_early_send_pending = deque()
+            self.disagg_prefill_early_send_stats = {"early": 0, "waited": 0}
+            logger.info(
+                "PP PD prefill: each stage sends a request's last KV chunk when its "
+                "own forward ends (SGLANG_PP_PD_PREFILL_EARLY_SEND)."
+            )
 
         while True:
             server_is_idle = True
@@ -375,6 +384,12 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+                    if early_send:
+                        self._pp_pd_early_send_last_chunks(
+                            cur_batch, result, self.launch_event
+                        )
+                if early_send:
+                    self._pp_pd_flush_early_sends()
                 if get_parallel().pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -394,6 +409,13 @@ class SchedulerPPMixin:
                 # post-process the coming microbatch
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
+                    if early_send:
+                        # Its early sends must be made and ended first. The forward
+                        # just launched stays queued, so the GPU keeps busy.
+                        self._pp_pd_flush_early_sends(
+                            max(self.mbs[next_mb_id].forward_iter, self.forward_ct - 1)
+                        )
+                        self._pp_pd_settle_early_sends(self.mbs[next_mb_id])
                     self._pp_process_batch_result(
                         self.mbs[next_mb_id],
                         next_batch_result,

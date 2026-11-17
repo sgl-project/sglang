@@ -906,9 +906,13 @@ class MetadataBuffers:
             )
         self.output_customized_info_len[idx, 0] = len(payload)
 
-    def set_buf(self, req: Req):
+    def set_buf(self, req: Req, first_output_id: Optional[int] = None):
+        # first_output_id: the sampled first token, for a send made before the
+        # request's result appends it to output_ids.
         self._set_customized_info(req)
-        self.output_ids[req.metadata_buffer_index][0] = req.output_ids[0]
+        self.output_ids[req.metadata_buffer_index][0] = (
+            req.output_ids[0] if first_output_id is None else first_output_id
+        )
         # The cached_tokens buffer is (size, 16); slots 0-3 hold cached token
         # counts and slots 4-6 are reused for multimodal prompt token counts
         # (slots 7-15 remain spare). This avoids adding new RDMA buffers.

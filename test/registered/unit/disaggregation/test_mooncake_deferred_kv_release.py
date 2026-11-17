@@ -7,6 +7,7 @@ Only the transfer worker can send that ACK after its write has drained.
 import threading
 import unittest
 from collections import defaultdict
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import numpy as np
@@ -18,8 +19,13 @@ from test_deferred_decode_kv_release import (
 )
 
 from sglang.srt.disaggregation.base.conn import KVPoll
-from sglang.srt.disaggregation.common.conn import AckTarget, CommonKVManager
+from sglang.srt.disaggregation.common.conn import (
+    AckTarget,
+    CommonKVManager,
+    CommonKVSender,
+)
 from sglang.srt.disaggregation.common.utils import TransferKVChunk
+from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager, TransferInfo
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
@@ -239,6 +245,67 @@ class TestMooncakeAbortNotification(
 
                 manager.send_aux.assert_called_once()
                 self.assertEqual(manager._sent, [])
+
+
+class TestMooncakeLastChunkWithoutAux(CustomTestCase):
+    """A PP prefill stage that sends its last chunk before its first token
+    (SGLANG_PP_PD_PREFILL_EARLY_SEND) leaves the aux write to the last stage."""
+
+    def test_sender_leaves_out_the_aux_index_when_asked(self):
+        kv_mgr = MagicMock()
+        kv_mgr.prepare_send_state_indices = lambda state_indices: state_indices
+        for send_aux, aux_index in ((True, 3), (False, None)):
+            with self.subTest(send_aux=send_aux):
+                sender = SimpleNamespace(
+                    conclude_state=None,
+                    aux_index=3,
+                    bootstrap_room=ROOM,
+                    kv_mgr=kv_mgr,
+                    trace_ctx=MagicMock(),
+                    _transfer_start_time=None,
+                    _early_send_wait_event=None,
+                    _prepare_send_indices=lambda kv, state: (
+                        kv,
+                        slice(0, 1),
+                        True,
+                        False,
+                    ),
+                    _record_transfer_indices=lambda *args: None,
+                )
+                CommonKVSender.send(
+                    sender, np.array([1], dtype=np.int32), [[1]], send_aux=send_aux
+                )
+                kwargs = kv_mgr.add_transfer_request.call_args.kwargs
+                self.assertEqual(kwargs["aux_index"], aux_index)
+                self.assertEqual(kwargs["state_indices"], [[1]])
+
+    def test_last_chunk_without_aux_sends_state_and_concludes(self):
+        manager = _manager()
+        TestMooncakeAbortNotification._prepare_worker(self, manager)
+        manager.disaggregation_mode = DisaggregationMode.PREFILL
+        manager.transfer_queues = [MagicMock()]
+        manager.send_record = MagicMock()
+        manager.note_send_enqueued = MagicMock()
+        (info,) = manager.transfer_infos[ROOM].values()
+        manager.transfer_infos[ROOM] = {f"{DECODE_IP}:{DECODE_PORT}": info}
+        manager.add_transfer_request(
+            ROOM,
+            np.array([1], dtype=np.int32),
+            slice(0, 1),
+            True,
+            aux_index=None,
+            state_indices=[[1]],
+        )
+        chunk = manager.transfer_queues[0].put.call_args.args[0]
+        self.assertIsNone(chunk.prefill_aux_index)
+
+        manager.transfer_infos[ROOM] = {(DECODE_IP, DECODE_PORT): info}
+        queue = MagicMock()
+        queue.get.side_effect = [chunk, None]
+        manager.transfer_worker(queue, MagicMock())
+        manager.maybe_send_extra.assert_called_once()
+        manager.send_aux.assert_not_called()
+        self.assertEqual(manager.request_status[ROOM], KVPoll.Success)
 
 
 if __name__ == "__main__":
