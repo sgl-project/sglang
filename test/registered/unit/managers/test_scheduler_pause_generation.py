@@ -692,6 +692,15 @@ class TestSchedulerPauseGeneration(CustomTestCase):
                 self.assertFalse(scheduler.result_queue)
                 self.assertFalse(batch.prefill_chunk_processed)
 
+    def test_retract_after_live_scale_already_drained_result(self):
+        scheduler = self._new_scheduler()
+        scheduler.enable_overlap = True
+        scheduler.last_batch = ScheduleBatch(reqs=[], forward_mode=ForwardMode.EXTEND)
+        scheduler.process_batch_result = MagicMock()
+        scheduler.pause_generation(PauseGenerationReqInput(mode="retract"))
+        scheduler.process_batch_result.assert_not_called()
+        self.assertIsNone(scheduler.last_batch)
+
     def test_pd_decode_retract_includes_transferred_waiting_reqs(self):
         """A transferred request waiting for a running slot holds a request row
         and KV; retract must rebuild it too, so a paused flush cannot free it."""

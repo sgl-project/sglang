@@ -17,6 +17,8 @@ from sglang.srt.distributed import utils as distributed_utils
 from sglang.srt.elastic_ep import elastic_ep, live_prepare, live_scale
 from sglang.srt.environ import envs, exportable_env_vars
 from sglang.srt.layers.moe.token_dispatcher import nixl
+from sglang.srt.managers import scheduler as scheduler_module
+from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.dp_attn import MLPSyncBatchInfo
 from sglang.srt.managers.tokenizer_manager import TokenizerManager
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -287,6 +289,111 @@ class TestLiveScale(unittest.TestCase):
                         coordinator.prepare(4, 8)
                 else:
                     self.assertEqual(coordinator.prepare(4, 8), bool(vote))
+
+    def test_overlap_requires_reuse_and_waits_for_all_preparation_votes(self):
+        self.patch(
+            runtime_context,
+            get_schedule=lambda: SimpleNamespace(disable_overlap_schedule=False),
+        )
+        coordinator = self.coordinator()
+        self.state.pending_ep_size = 8
+        self.state.pending_since = time.monotonic()
+        coordinator.preparation = Mock()
+        for vote, target in ((0, 0), (1, 8), (-1, -1)):
+            coordinator.preparation.poll.return_value = vote
+            self.assertEqual(coordinator.local_control_target(), target)
+        coordinator.observe_control_targets([8, 0, 8, 8])
+        coordinator.tick()
+        coordinator.runner.maybe_join_ep_ranks.assert_not_called()
+        self.moe.elastic_ep_reuse_cuda_graph = False
+        with self.assertRaisesRegex(ValueError, "requires graph reuse"):
+            self.coordinator()
+
+    def test_overlap_drains_only_before_admission(self):
+        runner = model_runner.ModelRunner.__new__(model_runner.ModelRunner)
+        runner.live_scale = Mock()
+        runner._finalize_scale_up = Mock()
+        self.state.pending_ep_size = 8
+        self.state.pending_since = time.monotonic()
+        self.state.scale_phase = "joining"
+        events = []
+        self.patch(current_platform, synchronize=lambda: events.append("synchronize"))
+        self.patch(
+            model_runner,
+            try_admit_scale_ranks=lambda _: events.append("admit") or True,
+        )
+        drain = lambda: events.append("drain")
+        runner.live_scale.prepare.return_value = False
+        runner.maybe_join_ep_ranks(before_admission=drain)
+        self.assertEqual(events, [])
+        runner.live_scale.prepare.return_value = True
+        runner.maybe_join_ep_ranks(before_admission=drain)
+        self.assertEqual(events, ["drain", "synchronize", "admit"])
+        runner._finalize_scale_up.assert_called_once()
+
+    def test_overlap_commit_preserves_batch_merge_and_consumes_results_once(self):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.gracefully_exit = False
+        scheduler.pause_state = SimpleNamespace(paused=False)
+        scheduler.running_batch = Mock()
+        scheduler.last_batch = None
+        scheduler.is_generation = True
+        scheduler.enable_unified_memory = False
+        scheduler.invariant_checker = Mock()
+        scheduler.schedule_stream = Mock()
+        scheduler.forward_stream = Mock()
+        scheduler.ingest_requests = Mock(side_effect=[None, None, None, StopIteration])
+        for name in (
+            "increment_scheduler_iterations",
+            "tick_elastic_scale",
+            "_apply_war_barrier",
+            "launch_batch_sample_if_needed",
+            "_maybe_report_active_ranks",
+            "on_idle",
+        ):
+            setattr(scheduler, name, Mock())
+        self.patch(scheduler_module, get_exec=lambda: SimpleNamespace(moe=self.moe))
+        coordinator = SimpleNamespace(agreed_target=8)
+        scheduler.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(live_scale=coordinator)
+        )
+        batches = [Mock(), Mock(), None]
+        for batch in batches[:2]:
+            batch.copy.return_value = batch
+        plans = iter(batches)
+        previous = []
+
+        def plan(**kwargs):
+            previous.append(kwargs["last_batch"])
+            return SimpleNamespace(
+                running_batch=scheduler.running_batch, batch_to_run=next(plans)
+            )
+
+        scheduler.get_next_batch_to_run = plan
+        scheduler.should_process_last_batch_early = Mock(return_value=True)
+        scheduler.run_batch = Mock(side_effect=["prefill result", "decode result"])
+        consumed = []
+        scheduler.process_batch_result = lambda batch, result: consumed.append(
+            (batch, result)
+        )
+
+        def commit(before_admission):
+            scheduler.launch_batch_sample_if_needed.assert_called_once()
+            scheduler.schedule_stream.wait_stream.assert_called_once_with(
+                scheduler.forward_stream
+            )
+            before_admission()
+            self.assertFalse(scheduler.result_queue)
+            coordinator.agreed_target = 0
+
+        coordinator.tick = commit
+        with self.assertRaises(StopIteration):
+            scheduler.event_loop_overlap()
+        self.assertEqual(previous, [None, batches[0], batches[1]])
+        self.assertEqual(
+            consumed, [(batches[0], "prefill result"), (batches[1], "decode result")]
+        )
+        self.assertFalse(scheduler.result_queue)
 
     def test_joiner_capture_failure_prevents_admission(self):
         self.moe.is_ep_scale_joiner = True

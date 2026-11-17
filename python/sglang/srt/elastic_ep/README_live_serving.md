@@ -11,6 +11,10 @@ Set `SGLANG_ELASTIC_LIVE_SCALE=split` uniformly on all ranks, including scale an
 `--elastic-ep-reuse-cuda-graph` and a common `--max-ep-size` to retain the original
 decode graphs and capture only joining ranks before admission. Start all joiners
 before posting `/scale_elastic_ep`; a cohort is admitted together after preparation.
+With graph reuse, the standard overlap scheduler can remain enabled. Preparation
+continues alongside serving; admission drains pending results before changing the
+topology. Without graph reuse, pass `--disable-overlap-schedule`.
+
 Configure `--admin-api-key` and send it as a bearer token on scale requests, as
 required by the upstream HTTP API.
 
@@ -40,7 +44,8 @@ control protocol as the original serving ranks.
 
 ## Current scope
 
-- Non-overlap scheduler; attention TP/CP/DCP/PP all 1; Mooncake PG and NIXL EP.
+- Standard overlap scheduling with graph reuse; otherwise the non-overlap scheduler.
+- Attention TP/CP/DCP/PP all 1; Mooncake PG and NIXL EP.
 - Graph reuse additionally requires dense TP 1 and DP LM head.
 - No speculative decoding, two-batch overlap, graph-pool borrowing, or LP dispatch
   solver with live graph reuse.

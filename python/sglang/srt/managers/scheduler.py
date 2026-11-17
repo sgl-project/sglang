@@ -2265,8 +2265,10 @@ class Scheduler(
                 self._record_scheduler_state_for_paused_engine()
                 continue
 
-            process_last_batch_early = self.should_process_last_batch_early(
-                self.last_batch
+            last_result_pending = bool(self.result_queue)
+            process_last_batch_early = (
+                last_result_pending
+                and self.should_process_last_batch_early(self.last_batch)
             )
             if process_last_batch_early:
                 pop_and_process()
@@ -2298,7 +2300,7 @@ class Scheduler(
 
             # Process the last batch
             if self.last_batch:
-                if not process_last_batch_early:
+                if last_result_pending and not process_last_batch_early:
                     pop_and_process()
             elif batch is None:
                 # When the server is idle, do self-check and re-init some states
@@ -2312,7 +2314,21 @@ class Scheduler(
             # Update last_batch
             self.last_batch = batch
 
+            if get_exec().moe.elastic_ep_backend is not None:
+                live_scale = self.tp_worker.model_runner.live_scale
+                if live_scale is not None and live_scale.agreed_target:
+                    # Preparation votes use WORLD too; queue them behind NIXL work.
+                    self.schedule_stream.wait_stream(self.forward_stream)
+                    live_scale.tick(before_admission=self._drain_overlap_results)
+                    self._maybe_report_active_ranks()
+
             self.invariant_checker.run(CheckPhase.BUSY, batch)
+
+    def _drain_overlap_results(self):
+        while self.result_queue:
+            batch, result = self.result_queue.popleft()
+            self.process_batch_result(batch, result)
+        # Keep last_batch for the next tick's prefill merge and filtering.
 
     def should_process_last_batch_early(
         self, last_batch: Optional[ScheduleBatch]
@@ -6703,7 +6719,7 @@ class Scheduler(
             self._publish_paused_state()
             return
 
-        if self.enable_overlap and self.last_batch:
+        if self.enable_overlap and self.result_queue:
             if (
                 self.disaggregation_mode == DisaggregationMode.PREFILL
                 and (req := self.chunked_req) is not None

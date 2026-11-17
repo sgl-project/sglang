@@ -2812,7 +2812,9 @@ class ModelRunner:
                 exc_info=True,
             )
 
-    def maybe_join_ep_ranks(self) -> None:
+    def maybe_join_ep_ranks(
+        self, before_admission: Optional[Callable[[], None]] = None
+    ) -> None:
         if not ElasticEPStateManager.is_scaling():
             return
 
@@ -2908,6 +2910,8 @@ class ModelRunner:
             if not self.live_scale.prepare(effective_size, pending_size):
                 return
             self.live_scale.event("activation_start", target=pending_size)
+        if before_admission is not None:
+            before_admission()
         current_platform.synchronize()
         ElasticEPStateManager.mark_joining()
         admit = try_recover_ranks if pending_recover else try_admit_scale_ranks

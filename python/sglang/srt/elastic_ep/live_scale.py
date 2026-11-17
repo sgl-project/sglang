@@ -63,8 +63,8 @@ class LiveScaleCoordinator:
         self.service_steps = int(envs.SGLANG_ELASTIC_CAPTURE_SERVICE_STEPS.get())
         if self.service_steps < 1:
             raise ValueError("SGLANG_ELASTIC_CAPTURE_SERVICE_STEPS must be positive")
-        if not get_schedule().disable_overlap_schedule:
-            raise ValueError("Live scale requires --disable-overlap-schedule")
+        if not get_schedule().disable_overlap_schedule and not self.reuse_graphs:
+            raise ValueError("Live scale with overlap scheduling requires graph reuse")
         if (
             get_exec().moe.elastic_ep_backend != "mooncake"
             or get_exec().moe.moe_a2a_backend != "nixl"
@@ -143,7 +143,7 @@ class LiveScaleCoordinator:
         from sglang.srt.model_executor.model_runner_components.cuda_graph_setup import (
             resolve_elastic_cuda_graph_config,
         )
-        from sglang.srt.runtime_context import get_exec
+        from sglang.srt.runtime_context import get_exec, get_schedule
 
         if self.preparation is not None and self.preparation.target_size == target:
             return
@@ -163,6 +163,7 @@ class LiveScaleCoordinator:
                 target,
                 self.service_steps,
                 get_exec().moe.elastic_ep_reuse_cuda_graph,
+                get_schedule().disable_overlap_schedule,
                 NixlEPBuffer.live_layout_signature(),
                 resolve_elastic_cuda_graph_config(self.runner).signature(),
             )
@@ -438,12 +439,20 @@ class LiveScaleCoordinator:
                 if self.preparation is not None and not state.pending_recover_ranks:
                     return -1
                 return -2
+        if self.candidate is None and self.preparation is not None:
+            vote = self.preparation.poll()
+            if vote < 0:
+                return -1
+            if vote == 0:
+                # Use the next DP gather to agree on readiness instead of
+                # synchronizing a separate vote on every forward.
+                return 0
         return state.pending_ep_size
 
     def observe_control_targets(self, targets):
         """Consume the existing DP batch gather; never add an idle WORLD op."""
         if -1 in targets:
-            raise RuntimeError("Timed out during live preparation; restart required")
+            raise RuntimeError("Live preparation failed or timed out; restart required")
         if -2 in targets:
             self.agreed_target = -2
             return
@@ -452,7 +461,7 @@ class LiveScaleCoordinator:
             raise RuntimeError("Conflicting live scale targets across DP ranks")
         self.agreed_target = targets[0] if targets and len(set(targets)) == 1 else 0
 
-    def tick(self):
+    def tick(self, before_admission=None):
         import torch.distributed as dist
 
         from sglang.srt.elastic_ep.elastic_ep import ElasticEPStateManager
@@ -470,7 +479,7 @@ class LiveScaleCoordinator:
             # Wait for DP target agreement: an idle WORLD op could race
             # the joiner's launch-time TP gather.
             if self.agreed_target > 0:
-                mr.maybe_join_ep_ranks()
+                mr.maybe_join_ep_ranks(before_admission=before_admission)
             return
         size = self.progress.next_step()
         if size is None:
