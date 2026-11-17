@@ -42,12 +42,18 @@ class _SingletonDimUtil:
     @staticmethod
     def sanitize_names(names: list[str]) -> list[str]:
         """Replace '1' with 'singleton0', 'singleton1', ... for named tensor compatibility."""
+        used_names: set[str] = {n for n in names if n != SQUEEZE_DIM_NAME}
         result: list[str] = []
         sq_idx: int = 0
 
         for name in names:
             if name == SQUEEZE_DIM_NAME:
-                result.append(_SingletonDimUtil.make_name(sq_idx))
+                candidate = _SingletonDimUtil.make_name(sq_idx)
+                while candidate in used_names:
+                    sq_idx += 1
+                    candidate = _SingletonDimUtil.make_name(sq_idx)
+                result.append(candidate)
+                used_names.add(candidate)
                 sq_idx += 1
             else:
                 result.append(name)
@@ -88,9 +94,15 @@ def parse_dims(dims_str: str) -> DimsSpec:
     dp_group_alias: Optional[str] = comment_suffix.dp_group_alias
     replicated_axes: frozenset[ParallelAxis] = comment_suffix.replicated_axes
 
-    sharded_axes: set[ParallelAxis] = {
+    all_sharded_axes: list[ParallelAxis] = [
         m.axis for spec in dims for m in spec.parallel_modifiers
-    }
+    ]
+    sharded_axes: set[ParallelAxis] = set(all_sharded_axes)
+    if len(all_sharded_axes) != len(sharded_axes):
+        duplicate_axes = sorted(
+            {a.value for a in all_sharded_axes if all_sharded_axes.count(a) > 1}
+        )
+        raise ValueError(f"Duplicate parallel axis across dims: {duplicate_axes}")
     conflict: frozenset[ParallelAxis] = replicated_axes & sharded_axes
     if conflict:
         conflict_names: str = ", ".join(sorted(a.value for a in conflict))
