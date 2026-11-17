@@ -751,6 +751,7 @@ class Step3p5ForCausalLM(nn.Module):
                 self.lm_head.weight.copy_(emb_token_weight)
 
         self.logits_processor = LogitsProcessor(config)
+        self._startup_load_done = False
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()
@@ -927,6 +928,12 @@ class Step3p5ForCausalLM(nn.Module):
                             expert_id=expert_id,
                         )
                         loaded_params.add(actual_param_name)
+
+        # Online weight updates call load_weights once per bucket, so only the
+        # startup load has to carry every parameter.
+        if self._startup_load_done:
+            return
+        self._startup_load_done = True
 
         # Derived parameters (e.g. blockscale_swizzled from NVFP4 quantization)
         # are computed in process_weights_after_loading, not loaded from checkpoint.
