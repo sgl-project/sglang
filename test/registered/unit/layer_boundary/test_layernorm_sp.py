@@ -1,13 +1,13 @@
 """Unit tests for srt/layers/layernorm_sp (Megatron LayerNorm sequence parallelism).
 
-Covers the pure logic that gates SP -- the Qwen3 allowlist, the config guards, and
-the prefill-only activation rule -- without launching a server. The collectives and
-fused matmul fast-paths need a real TP group and are covered by the e2e test.
+Covers the pure gating logic and the fused matmul+collective fast-path decisions
+(NPU CANN MC2) without launching a server; real collectives are e2e-tested.
 """
 
 import gc
 import unittest
 import weakref
+from contextlib import ExitStack
 from functools import partial
 from types import SimpleNamespace
 from typing import ClassVar
@@ -49,7 +49,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.communicator_patch import patch_communicator
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=11, suite="base-a-test-cpu")
+register_cpu_ci(est_time=15, suite="base-a-test-cpu")
 
 
 def _initialize(*, enable=True, arch="Qwen3ForCausalLM", min_tokens=0):
@@ -447,6 +447,275 @@ class TestSpRegionSteps(CustomTestCase):
             out = postprocess_output(communicator.output, hidden, residual, object())
             self.assertIs(out[0], hidden)
             self.assertIs(out[1], residual)
+
+
+class TestNpuMc2FusedPaths(CustomTestCase):
+    """NPU CANN MC2 fast-paths: eligibility, MC2 call contract, and fallback."""
+
+    def setUp(self):
+        layernorm_sp.set_sp_num_tokens(0)
+
+    def tearDown(self):
+        layernorm_sp.set_sp_num_tokens(0)
+
+    def _tp_group(self, tp_size=2, rank=0):
+        backend = MagicMock()
+        backend.get_hccl_comm_name.return_value = "hcom://0"
+        device_group = MagicMock()
+        device_group._get_backend.return_value = backend
+        device_group.group_name = "tp"
+        return SimpleNamespace(
+            world_size=tp_size,
+            rank=rank,
+            rank_in_group=rank,
+            device_group=device_group,
+            all_gather_into_tensor=MagicMock(),
+            reduce_scatter_tensor=MagicMock(),
+        )
+
+    @staticmethod
+    def _linear(weight, tp_group, quant_method, bias=None):
+        return SimpleNamespace(
+            weight=weight,
+            bias=bias,
+            tp_group=tp_group,
+            quant_method=quant_method,
+        )
+
+    def _enter_npu(self, stack, tp_group, mc2_attr=None, mc2_mock=None):
+        stack.enter_context(patch.object(layernorm_sp, "is_npu", return_value=True))
+        stack.enter_context(patch.object(layernorm_sp, "_HAS_NPU_MC2_FUSED", True))
+        stack.enter_context(
+            patch.object(layernorm_sp, "_npu_hccl_comm_name", return_value="hcom")
+        )
+        stack.enter_context(
+            patch.object(
+                layernorm_sp,
+                "get_parallel",
+                return_value=SimpleNamespace(tp_group=tp_group),
+            )
+        )
+        if mc2_attr is not None:
+            stack.enter_context(patch.object(layernorm_sp, mc2_attr, mc2_mock))
+
+    def _unquant(self):
+        # Deferred import mirrors the production code (heavy package).
+        from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+
+        return UnquantizedLinearMethod()
+
+    # --- eligibility -------------------------------------------------------------
+
+    def test_eligible_on_npu_with_mc2_and_2d_weight(self):
+        linear = self._linear(
+            torch.zeros(4, 3, dtype=torch.bfloat16), self._tp_group(), self._unquant()
+        )
+        with (
+            patch.object(layernorm_sp, "is_npu", return_value=True),
+            patch.object(layernorm_sp, "_HAS_NPU_MC2_FUSED", True),
+        ):
+            self.assertTrue(layernorm_sp.sp_fused_matmul_eligible(linear))
+
+    def test_npu_rejects_3d_weight(self):
+        """CANN MC2 matmuls are 2-D-only; a 3-D weight must keep the fallback."""
+        linear = self._linear(
+            torch.zeros(2, 4, 3, dtype=torch.bfloat16),
+            self._tp_group(),
+            self._unquant(),
+        )
+        with (
+            patch.object(layernorm_sp, "is_npu", return_value=True),
+            patch.object(layernorm_sp, "_HAS_NPU_MC2_FUSED", True),
+        ):
+            self.assertFalse(layernorm_sp.sp_fused_matmul_eligible(linear))
+
+    def test_npu_rejects_when_mc2_unavailable(self):
+        linear = self._linear(
+            torch.zeros(4, 3, dtype=torch.bfloat16), self._tp_group(), self._unquant()
+        )
+        with (
+            patch.object(layernorm_sp, "is_npu", return_value=True),
+            patch.object(layernorm_sp, "_HAS_NPU_MC2_FUSED", False),
+        ):
+            self.assertFalse(layernorm_sp.sp_fused_matmul_eligible(linear))
+
+    def test_ineligible_with_bias(self):
+        linear = self._linear(
+            torch.zeros(4, 3, dtype=torch.bfloat16),
+            self._tp_group(),
+            self._unquant(),
+            bias=torch.zeros(4, dtype=torch.bfloat16),
+        )
+        with (
+            patch.object(layernorm_sp, "is_npu", return_value=True),
+            patch.object(layernorm_sp, "_HAS_NPU_MC2_FUSED", True),
+        ):
+            self.assertFalse(layernorm_sp.sp_fused_matmul_eligible(linear))
+
+    def test_ineligible_when_quantized(self):
+        linear = self._linear(
+            torch.zeros(4, 3, dtype=torch.bfloat16), self._tp_group(), MagicMock()
+        )
+        with (
+            patch.object(layernorm_sp, "is_npu", return_value=True),
+            patch.object(layernorm_sp, "_HAS_NPU_MC2_FUSED", True),
+        ):
+            self.assertFalse(layernorm_sp.sp_fused_matmul_eligible(linear))
+
+    def test_ineligible_fp32(self):
+        linear = self._linear(
+            torch.zeros(4, 3, dtype=torch.float32), self._tp_group(), self._unquant()
+        )
+        with (
+            patch.object(layernorm_sp, "is_npu", return_value=True),
+            patch.object(layernorm_sp, "_HAS_NPU_MC2_FUSED", True),
+        ):
+            self.assertFalse(layernorm_sp.sp_fused_matmul_eligible(linear))
+
+    def test_non_npu_keeps_symm_mem_and_cutlass_decision(self):
+        linear = self._linear(
+            torch.zeros(4, 3, dtype=torch.bfloat16), self._tp_group(), self._unquant()
+        )
+        with (
+            patch.object(layernorm_sp, "is_npu", return_value=False),
+            patch.object(layernorm_sp, "_HAS_TORCH_SYMM_MEM_FUSED", True),
+        ):
+            self.assertTrue(layernorm_sp.sp_fused_matmul_eligible(linear))
+        with (
+            patch.object(layernorm_sp, "is_npu", return_value=False),
+            patch.object(layernorm_sp, "_HAS_TORCH_SYMM_MEM_FUSED", False),
+        ):
+            self.assertFalse(layernorm_sp.sp_fused_matmul_eligible(linear))
+            linear._sp_use_cutlass = True
+            self.assertTrue(layernorm_sp.sp_fused_matmul_eligible(linear))
+
+    # --- hccl handle -------------------------------------------------------------
+
+    def test_hccl_comm_name_comes_from_tp_rank(self):
+        tp = self._tp_group(tp_size=2, rank=3)
+        with (
+            patch.object(
+                layernorm_sp, "get_parallel", return_value=SimpleNamespace(tp_group=tp)
+            ),
+            patch.object(layernorm_sp, "get_device", return_value="cpu"),
+        ):
+            self.assertEqual(layernorm_sp._npu_hccl_comm_name(), "hcom://0")
+        (device_arg,) = tp.device_group._get_backend.call_args.args
+        self.assertIsInstance(device_arg, torch.device)
+        tp.device_group._get_backend.return_value.get_hccl_comm_name.assert_called_once_with(
+            3
+        )
+
+    # --- column-parallel g (all-gather + matmul) ----------------------------------
+
+    def test_column_npu_mc2_invokes_op_and_narrows_tokens(self):
+        tp = self._tp_group(tp_size=2, rank=1)
+        weight = torch.zeros(4, 3, dtype=torch.bfloat16)
+        linear = self._linear(weight, tp, self._unquant())
+        x = torch.randn(3, 3, dtype=torch.bfloat16)  # shard of 6 padded rows
+        full = torch.arange(24, dtype=torch.bfloat16).reshape(6, 4)
+        mc2 = MagicMock(return_value=(full, None))
+        layernorm_sp.set_sp_num_tokens(5)
+        with ExitStack() as st:
+            self._enter_npu(st, tp, "_npu_all_gather_base_mm", mc2)
+            out = layernorm_sp.column_parallel_g_matmul(linear, x, None)
+        mc2.assert_called_once()
+        args, _ = mc2.call_args
+        self.assertIs(args[0], x)  # contiguous() on an already-contiguous input
+        self.assertTrue(torch.equal(args[1], weight.t()))
+        self.assertEqual(args[2], "hcom")
+        self.assertEqual(args[3], 2)  # linear.tp_group.world_size
+        torch.testing.assert_close(out, full[:5])  # padded rows dropped
+
+    def test_column_npu_mc2_failure_falls_back_to_plain_collective(self):
+        tp = self._tp_group(tp_size=2)
+        quant = MagicMock(spec=type(self._unquant()))
+        gathered = torch.zeros(5, 3, dtype=torch.bfloat16)
+        expected = torch.zeros(5, 4, dtype=torch.bfloat16)
+        quant.apply.return_value = expected
+        linear = self._linear(torch.zeros(4, 3, dtype=torch.bfloat16), tp, quant)
+        layernorm_sp.set_sp_num_tokens(5)
+        with (
+            patch.object(layernorm_sp, "is_npu", return_value=True),
+            patch.object(layernorm_sp, "_HAS_NPU_MC2_FUSED", True),
+            patch.object(
+                layernorm_sp,
+                "_npu_all_gather_base_mm",
+                MagicMock(side_effect=RuntimeError("no mc2")),
+            ),
+            patch.object(layernorm_sp, "_npu_hccl_comm_name", return_value="hcom"),
+            patch.object(layernorm_sp, "sp_exit_gather", return_value=gathered),
+        ):
+            out = layernorm_sp.column_parallel_g_matmul(linear, torch.randn(3, 3), None)
+        quant.apply.assert_called_once_with(linear, gathered, None)
+        self.assertIs(out, expected)
+
+    # --- row-parallel g-bar (matmul + reduce-scatter) ------------------------------
+
+    def test_row_npu_mc2_pads_tokens_to_tp_multiple(self):
+        tp = self._tp_group(tp_size=2)
+        weight = torch.zeros(4, 3, dtype=torch.bfloat16)
+        linear = self._linear(weight, tp, self._unquant())
+        x = torch.arange(15, dtype=torch.bfloat16).reshape(5, 3)
+        sentinel = torch.full((3, 4), 7.0, dtype=torch.bfloat16)
+        mc2 = MagicMock(return_value=sentinel)
+        with ExitStack() as st:
+            self._enter_npu(st, tp, "_npu_mm_reduce_scatter_base", mc2)
+            out = layernorm_sp.row_parallel_gbar_matmul(linear, x, None)
+        mc2.assert_called_once()
+        args, kwargs = mc2.call_args
+        self.assertEqual(args[0].shape, (6, 3))  # 5 rows padded to tp multiple
+        self.assertTrue(torch.equal(args[0][:5], x))
+        self.assertTrue(
+            torch.equal(args[0][5:], torch.zeros(1, 3, dtype=torch.bfloat16))
+        )
+        self.assertTrue(torch.equal(args[1], weight.t()))
+        self.assertEqual(args[2], "hcom")
+        self.assertEqual(args[3], 2)
+        self.assertEqual(kwargs, {"reduce_op": "sum"})
+        self.assertIs(out, sentinel)
+
+    def test_row_npu_mc2_skips_padding_when_divisible(self):
+        tp = self._tp_group(tp_size=2)
+        weight = torch.zeros(4, 3, dtype=torch.bfloat16)
+        linear = self._linear(weight, tp, self._unquant())
+        x = torch.arange(18, dtype=torch.bfloat16).reshape(6, 3)
+        mc2 = MagicMock(return_value=torch.zeros(3, 4, dtype=torch.bfloat16))
+        with ExitStack() as st:
+            self._enter_npu(st, tp, "_npu_mm_reduce_scatter_base", mc2)
+            layernorm_sp.row_parallel_gbar_matmul(linear, x, None)
+        args, _ = mc2.call_args
+        self.assertIs(args[0], x)  # already divisible: no pad, no copy
+
+    def test_row_npu_mc2_failure_falls_back_to_matmul_reduce_scatter(self):
+        tp = self._tp_group(tp_size=2)
+        quant = MagicMock(spec=type(self._unquant()))
+        full = torch.ones(6, 4, dtype=torch.bfloat16)
+        quant.apply.return_value = full
+        linear = self._linear(torch.zeros(4, 3, dtype=torch.bfloat16), tp, quant)
+        x = torch.arange(15, dtype=torch.bfloat16).reshape(5, 3)
+        with (
+            patch.object(layernorm_sp, "is_npu", return_value=True),
+            patch.object(layernorm_sp, "_HAS_NPU_MC2_FUSED", True),
+            patch.object(
+                layernorm_sp,
+                "_npu_mm_reduce_scatter_base",
+                MagicMock(side_effect=RuntimeError("no mc2")),
+            ),
+            patch.object(layernorm_sp, "_npu_hccl_comm_name", return_value="hcom"),
+            patch.object(
+                layernorm_sp, "get_parallel", return_value=SimpleNamespace(tp_group=tp)
+            ),
+        ):
+            out = layernorm_sp.row_parallel_gbar_matmul(linear, x, None)
+        args, _ = quant.apply.call_args
+        self.assertIs(args[0], linear)
+        self.assertEqual(args[1].shape, (6, 3))  # matmul runs on the padded input
+        tp.reduce_scatter_tensor.assert_called_once()
+        output, gathered_full = tp.reduce_scatter_tensor.call_args[0]
+        self.assertEqual(output.shape, (3, 4))  # padded // tp_size
+        self.assertIs(gathered_full, full)
+        self.assertIs(out, output)
 
 
 if __name__ == "__main__":
