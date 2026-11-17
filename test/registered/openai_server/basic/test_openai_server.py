@@ -598,7 +598,6 @@ class TestOpenAIChatWithRust(TestOpenAICompletionWithRust):
     test_regex = TestOpenAIServer.test_regex
     test_penalty = TestOpenAIServer.test_penalty
     test_model_list = TestOpenAIServer.test_model_list
-    test_retrieve_model = TestOpenAIServer.test_retrieve_model
 
     # This class is a Chat gate; Completion already has its own Rust matrix.
     test_completion = None
