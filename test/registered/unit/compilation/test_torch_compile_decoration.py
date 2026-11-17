@@ -1,3 +1,4 @@
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -8,6 +9,7 @@ from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=6, suite="base-a-test-cpu")
 
+from sglang.srt.compilation import torch_compile_decoration
 from sglang.srt.compilation.compile import (
     _infer_dynamic_arg_dims_from_annotations,
     _mark_dynamic_forward_batch,
@@ -72,6 +74,50 @@ def test_forward_batch_marks_token_and_batch_metadata_dynamic():
     assert (id(batch.seq_lens), (0,)) in marked
     assert (id(batch.mrope_positions), (1,)) in marked
     assert all(value_id != id(batch.scalar) for value_id, _ in marked)
+
+
+def _patch_model_compile_kwargs(*, is_hip):
+    captured = {}
+
+    def record_compile(fn, **kwargs):
+        captured.update(kwargs)
+        return fn
+
+    with (
+        patch.object(torch_compile_decoration, "_is_hip", is_hip),
+        patch("torch.compile", side_effect=record_compile),
+        torch_compile_decoration.patch_model(
+            torch.nn.Linear(1, 1),
+            enable_compile=True,
+            num_tokens=1,
+            tp_group=SimpleNamespace(ca_comm=None),
+        ),
+    ):
+        pass
+    return captured
+
+
+def test_patch_model_takes_its_compile_knobs_from_the_environment():
+    """`SGLANG_TORCH_DYNAMIC_SHAPE` must accept every boolean spelling the env
+    registry does, as the CPU graph runner already does for the same variable,
+    and stays a ROCm-only switch on this path."""
+    with patch.dict(os.environ):
+        os.environ.pop("SGLANG_TORCH_COMPILE_MODE", None)
+        os.environ.pop("SGLANG_TORCH_DYNAMIC_SHAPE", None)
+        assert _patch_model_compile_kwargs(is_hip=True) == {
+            "mode": "max-autotune-no-cudagraphs",
+            "dynamic": False,
+        }
+        os.environ["SGLANG_TORCH_COMPILE_MODE"] = "reduce-overhead"
+        os.environ["SGLANG_TORCH_DYNAMIC_SHAPE"] = "yes"
+        assert _patch_model_compile_kwargs(is_hip=True) == {
+            "mode": "reduce-overhead",
+            "dynamic": True,
+        }
+        assert _patch_model_compile_kwargs(is_hip=False) == {
+            "mode": "reduce-overhead",
+            "dynamic": False,
+        }
 
 
 if __name__ == "__main__":

@@ -36,7 +36,6 @@ class RuntimeEndpoint(BaseBackend):
         admin_api_key: Optional[str] = None,
     ):
         super().__init__()
-        self.support_concate_and_append = True
 
         self.base_url = base_url
         self.api_key = api_key
@@ -91,9 +90,10 @@ class RuntimeEndpoint(BaseBackend):
         )
         self._assert_success(res)
 
-    def start_profile(self):
+    def start_profile(self, **kwargs):
         res = http_request(
             self.base_url + "/start_profile",
+            json=kwargs or None,
             api_key=self.admin_api_key or self.api_key,
             verify=self.verify,
         )
@@ -375,7 +375,7 @@ class Runtime:
 
         Args:
             log_level: Log level for the server.
-            timeout: Timeout in seconds for waiting for the server to start.
+            launch_timeout: Timeout in seconds for waiting for the server to start.
             *args: Additional arguments passed to ServerArgs.
             **kwargs: Additional keyword arguments passed to ServerArgs.
         """
@@ -458,8 +458,8 @@ class Runtime:
             kill_process_tree(self.pid, wait_timeout=None)
             self.pid = None
 
-    def start_profile(self):
-        self.endpoint.start_profile()
+    def start_profile(self, **kwargs):
+        self.endpoint.start_profile(**kwargs)
 
     def stop_profile(self):
         self.endpoint.stop_profile()

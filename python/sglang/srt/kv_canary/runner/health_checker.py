@@ -8,6 +8,7 @@ import torch
 
 from sglang.kernels.ops.kv_canary.verify import CanaryLaunchTag
 from sglang.srt.kv_canary.config import CanaryConfig
+from sglang.srt.kv_canary.endpoint import is_sweep_tag
 from sglang.srt.kv_canary.runner.future_tensor import DelayedDeviceHostHandler
 from sglang.srt.kv_canary.runner.kernel_launcher import passes_v_half_gate
 from sglang.srt.kv_canary.state import CanaryDeviceState
@@ -16,14 +17,6 @@ logger = logging.getLogger(__name__)
 
 _HEALTH_CHECK_EVERY_N_STEPS: int = 100
 _HEALTH_CHECK_WARMUP_STEPS: int = 100
-_SWEEP_TAGS: frozenset[CanaryLaunchTag] = frozenset(
-    (
-        CanaryLaunchTag.SWEEP_K_FULL,
-        CanaryLaunchTag.SWEEP_V_FULL,
-        CanaryLaunchTag.SWEEP_K_SWA,
-        CanaryLaunchTag.SWEEP_V_SWA,
-    )
-)
 
 
 class KernelRunCounterHealthChecker:
@@ -81,5 +74,5 @@ class KernelRunCounterHealthChecker:
         # The scheduler attaches the radix cache only to the target runner, so
         # only its sweep launches; a missing attach there must still fail here.
         if self._config.sweep_interval <= 0 or self._is_draft_runner:
-            tags = tuple(tag for tag in tags if tag not in _SWEEP_TAGS)
+            tags = tuple(tag for tag in tags if not is_sweep_tag(tag))
         return tuple(tag for tag in tags if passes_v_half_gate(tag))

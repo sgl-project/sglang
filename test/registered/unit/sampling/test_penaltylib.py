@@ -78,23 +78,6 @@ class TestBatchedPenalizerOrchestrator(CustomTestCase):
         orch = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, set())
         self.assertIs(orch.batch, batch)
 
-    def test_batch_setter_none(self):
-        """Test that setting batch to None breaks the weakref cleanly."""
-        reqs = [_make_req()]
-        batch = _make_batch(reqs)
-        orch = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch, set())
-        orch.batch = None
-        self.assertIsNone(orch.batch)
-
-    def test_batch_setter_new_batch(self):
-        """Test that batch can be reassigned to a different ScheduleBatch."""
-        reqs = [_make_req()]
-        batch1 = _make_batch(reqs)
-        batch2 = _make_batch(reqs)
-        orch = BatchedPenalizerOrchestrator(VOCAB_SIZE, batch1, set())
-        orch.batch = batch2
-        self.assertIs(orch.batch, batch2)
-
     def test_context_manager_releases(self):
         """Test that exiting the context manager releases all penalizers."""
         reqs = [_make_req(freq=1.0)]

@@ -459,7 +459,9 @@ def _get_processor(
 
     if tokenizer.chat_template is None:
         local_path = download_from_hf(
-            tokenizer_name, allow_patterns=["*.json", "*.jinja", "*.model"]
+            tokenizer_name,
+            allow_patterns=["*.json", "*.jinja", "*.model"],
+            revision=revision,
         )
         jinja_path = Path(local_path) / "chat_template.jinja"
         if jinja_path.is_file():

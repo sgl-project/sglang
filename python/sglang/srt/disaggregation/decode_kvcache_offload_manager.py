@@ -4,12 +4,12 @@ import json
 import logging
 import threading
 import time
-from typing import TYPE_CHECKING, Dict
+from typing import TYPE_CHECKING, Dict, Optional
 from weakref import WeakKeyDictionary as WeakKeyDict
 
+import msgspec
 import torch
 
-from sglang.srt.disaggregation.kv_events import OffloadedState
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController
 from sglang.srt.managers.scheduler_components.request_list import (
@@ -50,6 +50,15 @@ if TYPE_CHECKING:
     )
 
 logger = logging.getLogger(__name__)
+
+
+class OffloadedState(msgspec.Struct):
+    """Decode-side offload progress for one request, keyed by Req in the manager."""
+
+    # Decode-incremental length already submitted for D2H offload.
+    inc_len: int = 0
+    # Tail of the page hash chain, extended as each offloaded chunk is backed up.
+    last_hash: Optional[str] = None
 
 
 class DecodeKVCacheOffloadManager:

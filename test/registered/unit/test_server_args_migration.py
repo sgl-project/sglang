@@ -7,6 +7,8 @@ translates field annotations into argparse arguments.
 import argparse
 import contextlib
 import io
+import os
+import tempfile
 import unittest
 
 from sglang.srt.arg_groups.overrides import resolution_result
@@ -17,6 +19,7 @@ from sglang.srt.multimodal.media_io import (
 )
 from sglang.srt.runtime_context import get_model, publish, reset_context
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.server_args_config_parser import ConfigArgumentMerger
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -141,11 +144,8 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
 
     def test_literal_auto_derives_choices(self):
         """Literal type annotations produce argparse choices automatically."""
-        sa = self._parse(
-            ["--deepep-mode", "low_latency", "--elastic-ep-backend", "none"]
-        )
+        sa = self._parse(["--deepep-mode", "low_latency"])
         self.assertEqual(sa.deepep_mode, "low_latency")
-        self.assertEqual(sa.elastic_ep_backend, "none")
 
     def test_startup_weight_load_mode(self):
         """The startup loading mode keeps serial as the safe default."""
@@ -217,6 +217,42 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
                 self.assertIn(f"'{flag}' is deprecated", "\n".join(logs.output))
                 self.assertEqual(vars(args), baseline)
 
+    def test_num_continuous_decode_steps_warns_and_changes_nothing(self):
+        """Nothing reads `--num-continuous-decode-steps N`, but published
+        recipes pass it: it must still parse with its value, say that it has
+        no effect, and leave the arguments as if it were absent -- on the
+        command line, in a config file and as an Engine keyword."""
+        base_args = ["--model", "dummy"]
+        baseline = vars(self.parser.parse_args(base_args))
+        config = tempfile.NamedTemporaryFile(mode="w", suffix=".yaml", delete=False)
+        self.addCleanup(os.unlink, config.name)
+        with config:
+            config.write("num-continuous-decode-steps: 2\n")
+        for argv in (
+            base_args + ["--num-continuous-decode-steps", "2"],
+            base_args + ["--num-continuous-decode-steps=4"],
+            ConfigArgumentMerger(self.parser).merge_config_with_args(
+                ["--config", config.name] + base_args
+            ),
+        ):
+            with self.subTest(argv=argv):
+                with self.assertLogs(
+                    "sglang.srt.arg_groups.argparse_actions", level="WARNING"
+                ) as logs:
+                    args = self.parser.parse_args(argv)
+                self.assertIn(
+                    "'--num-continuous-decode-steps' is deprecated and has no effect",
+                    "\n".join(logs.output),
+                )
+                self.assertEqual(vars(args), baseline)
+
+        with self.assertLogs("sglang.srt.server_args", level="WARNING") as logs:
+            ServerArgs(model_path="dummy", num_continuous_decode_steps=2)
+        self.assertIn(
+            "'num_continuous_decode_steps' is deprecated and has no effect",
+            "\n".join(logs.output),
+        )
+
     def test_no_op_python_inputs_still_construct_and_warn(self):
         """Engine kwargs reach the ServerArgs constructor without CLI parsing."""
         with self.assertNoLogs("sglang.srt.server_args", level="WARNING"):
@@ -259,15 +295,16 @@ class TestServerArgsAnnotatedCli(CustomTestCase):
                 self.assertEqual(getattr(args, flag[2:].replace("-", "_")), "dsv4")
 
     def test_each_deprecation_shape_does_its_job(self):
-        """The four `Deprecated*Action` shapes, on a throwaway parser.
+        """Four `Deprecated*Action` shapes, on a throwaway parser.
 
         `ServerArgs` registers `DeprecatedStoreTrueAction`
-        (`--disable-cuda-graph`, covered above, and `--enable-dp-attention`)
-        and the no-op form of `DeprecatedAction` (covered above). The other
-        two, and `DeprecatedAction` with `error_message=`, are kept for the
-        next flag that needs them, which makes this the only thing standing
-        between them and silent rot -- and it doubles as the worked example of
-        which shape to reach for.
+        (`--disable-cuda-graph`, covered above, and `--enable-dp-attention`),
+        `DeprecatedAliasStoreAction` (`--mamba-max-states-per-path`) and the
+        no-op form of `DeprecatedAction` (covered above).
+        `DeprecatedStoreConstAction` and `DeprecatedAction` with
+        `error_message=` are kept for the next flag that needs them, which
+        makes this the only thing standing between them and silent rot -- and
+        it doubles as the worked example of which shape to reach for.
         """
         from sglang.srt.arg_groups.argparse_actions import (
             DeprecatedAction,

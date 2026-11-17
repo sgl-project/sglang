@@ -1,9 +1,8 @@
-"""KV pools carrying the QSA sparse-attention indexer caches.
+"""KV pool carrying the QSA sparse-attention indexer caches.
 
 ``QSATokenToKVPool`` (compressed, Qwen4-Exp) adds the per-request pending
 index-key/RoPE ring and the paged compressed-K cache on top of the hybrid
-full/linear KV pool. ``QwenDSATokenToKVPool`` (tokenwise,
-Qwen3Next-DSA) adds only the flat per-token index-K cache.
+full/linear KV pool.
 """
 
 from __future__ import annotations

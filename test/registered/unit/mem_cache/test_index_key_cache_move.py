@@ -7,22 +7,26 @@ import pytest
 import torch
 
 from sglang.srt.mem_cache import index_key_cache
+from sglang.srt.mem_cache.dsa_cache_layer_split import LayerSplitIndexKeyCache
 from sglang.srt.mem_cache.index_key_cache import IndexKeyCache
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
+# The layer-split cache keeps the same physical layout; its 0-row layers are
+# the ones this rank does not own.
+@pytest.mark.parametrize("cache_cls", [IndexKeyCache, LayerSplitIndexKeyCache])
 @pytest.mark.parametrize("preshuffle", [False, True])
 @pytest.mark.parametrize("allocation_page_size", [64, 256])
 @pytest.mark.parametrize("source_slots", [[], [1, 2], [15, 16, 63, 64, 127, 255]])
 def test_move_preserves_physical_layout(
-    monkeypatch, preshuffle, allocation_page_size, source_slots
+    monkeypatch, cache_cls, preshuffle, allocation_page_size, source_slots
 ):
     page_size, head_dim, num_pages = 64, 128, 4
     num_tokens = page_size * num_pages
     monkeypatch.setattr(index_key_cache, "_use_aiter_preshuffle", preshuffle)
-    cache = IndexKeyCache.__new__(IndexKeyCache)
+    cache = cache_cls.__new__(cache_cls)
     cache.pool = SimpleNamespace(
         page_size=allocation_page_size,
         index_page_size=page_size,

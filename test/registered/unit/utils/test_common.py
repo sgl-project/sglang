@@ -1,5 +1,7 @@
 import gc
 import io
+import os
+import subprocess
 import sys
 import unittest
 from array import array
@@ -8,7 +10,9 @@ from unittest import mock
 import torch
 from PIL import Image
 
+from sglang.srt.environ import envs
 from sglang.srt.multimodal.media_io import _load_image
+from sglang.srt.utils import aiter as aiter_utils
 from sglang.srt.utils.common import flatten_arrays_to_int64_tensor
 from sglang.srt.utils.device import (
     _get_device_sm_via_nvml,
@@ -304,6 +308,38 @@ class TestFreezeGc(CustomTestCase):
     def test_applies_configured_threshold(self):
         freeze_gc("test", [700, 10, 1000])
         self.assertEqual(gc.get_threshold(), (700, 10, 1000))
+
+
+class TestDeclaredBoolEnvSpellings(CustomTestCase):
+    """These variables are declared as ``EnvBool``, so ``yes`` must mean true
+    wherever they are read, as it does for the other readers of ``envs``."""
+
+    def test_use_aiter_accepts_yes(self):
+        with (
+            envs.SGLANG_USE_AITER.override("yes"),
+            mock.patch.object(aiter_utils, "is_hip", return_value=True),
+            mock.patch.object(aiter_utils, "_aiter_chip_info_cached", False),
+            mock.patch.dict(os.environ, {"CU_NUM": "1", "GPU_ARCHS": "gfx942"}),
+        ):
+            aiter_utils.maybe_pre_warm_aiter_chip_info()
+            self.assertTrue(aiter_utils._aiter_chip_info_cached)
+
+    def test_torch_inference_mode_accepts_yes(self):
+        # The flag is read once at import, so it needs a fresh interpreter.
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from sglang.srt.utils import common\n"
+                "print(common._ENABLE_TORCH_INFERENCE_MODE)",
+            ],
+            env={**os.environ, "SGLANG_ENABLE_TORCH_INFERENCE_MODE": "yes"},
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip().splitlines()[-1], "True")
 
 
 if __name__ == "__main__":

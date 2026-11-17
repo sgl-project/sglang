@@ -53,9 +53,6 @@ class EncoderHealthServicer(health_pb2_grpc.HealthServicer):
     Implements grpc.health.v1.Health for Kubernetes probes.
     """
 
-    OVERALL_SERVER = ""
-    ENCODER_SERVICE = "sglang.grpc.encoder.SglangEncoder"
-
     def __init__(self):
         self._serving = False
 
@@ -87,11 +84,9 @@ class SGLangEncoderServer(SGLangEncoderServicer):
         self,
         encoder: MMEncoder,
         send_sockets: List[zmq.Socket],
-        server_args: ServerArgs,
     ):
         self.encoder = encoder
         self.send_sockets = send_sockets
-        self.server_args = server_args
 
     async def _dispatch_encode(self, request_dict: dict):
         for socket in self.send_sockets:
@@ -287,7 +282,6 @@ async def serve_grpc_encoder(server_args: ServerArgs):
     encoder_servicer = SGLangEncoderServer(
         encoder=encoder,
         send_sockets=send_sockets,
-        server_args=server_args,
     )
     add_SGLangEncoderServicer_to_server(encoder_servicer, server)
 

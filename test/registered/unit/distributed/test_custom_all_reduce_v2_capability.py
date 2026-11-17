@@ -1,3 +1,4 @@
+import logging
 from unittest.mock import Mock
 
 import pytest
@@ -6,6 +7,7 @@ from sglang.srt.distributed.device_communicators import (
     custom_all_reduce_utils,
     custom_all_reduce_v2,
     dpx_hier_all_reduce,
+    quick_all_reduce,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -524,6 +526,20 @@ def test_skip_p2p_check_accepts_true(monkeypatch):
         Mock(side_effect=AssertionError("ran the P2P probe")),
     )
     assert custom_all_reduce_utils.can_p2p(rank=0, world_size=2)
+
+
+def test_quick_all_reduce_names_invalid_quantization_level(monkeypatch, caplog):
+    """An unknown ROCM_QUICK_REDUCE_QUANTIZATION value leaves quick all-reduce
+    disabled and the warning names the rejected value."""
+    monkeypatch.setenv("ROCM_QUICK_REDUCE_QUANTIZATION", "int4")
+    quick = quick_all_reduce.QuickAllReduce.__new__(quick_all_reduce.QuickAllReduce)
+    quick.disabled = True
+
+    with caplog.at_level(logging.WARNING, logger=quick_all_reduce.logger.name):
+        quick.init_quick_all_reduce()
+
+    assert quick.disabled
+    assert "Invalid quantization level: int4" in caplog.text
 
 
 if __name__ == "__main__":

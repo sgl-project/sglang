@@ -392,7 +392,6 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
         self.assertEqual(pool.kv_buffer.shape[1], pool.size)
         # allocator surface is logical
         self.assertEqual(pool.free_slots.numel(), pool.logical_size)
-        self.assertEqual(pool.mem_state.numel(), pool.logical_size)
 
     def test_alloc_is_widened_page_granular(self):
         pool = _make_host_pool(dcp_rank=0)

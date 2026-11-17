@@ -29,7 +29,6 @@ import sys
 import threading
 import time
 import traceback
-import types
 import uuid
 from array import array
 from collections import OrderedDict
@@ -40,7 +39,6 @@ from importlib.metadata import PackageNotFoundError, version
 from json import JSONDecodeError
 from pathlib import Path
 from typing import (
-    TYPE_CHECKING,
     Any,
     Callable,
     Generic,
@@ -65,9 +63,6 @@ from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_flags,
 )
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 torch_release = pkg_version.parse(torch.__version__).release
@@ -179,9 +174,7 @@ def temp_set_env(*, allow_sglang: bool = False, **env_vars: Any):
                 os.environ[key] = value
 
 
-_ENABLE_TORCH_INFERENCE_MODE = get_bool_env_var(
-    "SGLANG_ENABLE_TORCH_INFERENCE_MODE", "false"
-)
+_ENABLE_TORCH_INFERENCE_MODE = envs.SGLANG_ENABLE_TORCH_INFERENCE_MODE.get()
 
 
 class DynamicGradMode(_DecoratorContextManager):
@@ -647,7 +640,7 @@ def lru_cache_frozenset(maxsize=128):
 
 def apply_module_patch(target_module, target_function, wrappers):
     original_module, original_function = parse_module_path(
-        target_module, target_function, False
+        target_module, target_function
     )
 
     original_function_id = id(original_function)
@@ -671,31 +664,9 @@ def apply_module_patch(target_module, target_function, wrappers):
             logger.warning(f"Ignore {value} reports ImportError with:\n{str(e)}")
 
 
-def parse_module_path(module_path, function_name, create_dummy):
-    from importlib.machinery import ModuleSpec
-
-    def create_dummy_module(full_path, parent=None):
-        """Create and register a placeholder module"""
-        dummy = types.ModuleType(full_path)
-        dummy.__file__ = "vllm_ascend.dummy_module.py"
-        dummy.__spec__ = ModuleSpec(full_path, None)
-        sys.modules[full_path] = dummy
-        if parent:
-            setattr(parent, full_path.split(".")[-1], dummy)
-        return dummy
-
-    def create_placeholder_function(func_name):
-        """Create dummy function that raises when called"""
-
-        def placeholder(*args, **kwargs):
-            raise NotImplementedError(f"Function {func_name} is a placeholder")
-
-        placeholder.__name__ = func_name
-        return placeholder
-
+def parse_module_path(module_path, function_name):
     modules = module_path.split(".")
     current_module = None
-    processed_path = []
 
     for idx, part in enumerate(modules):
         current_path = ".".join(modules[: idx + 1])
@@ -712,36 +683,18 @@ def parse_module_path(module_path, function_name, create_dummy):
                 # Check for early function resolution
                 if function_name and hasattr(current_module, function_name):
                     return current_module, getattr(current_module, function_name)
-                if function_name and create_dummy:
-                    ph_func = create_placeholder_function(function_name)
-                    setattr(current_module, function_name, ph_func)
-                    return current_module, ph_func
                 if function_name:
                     raise AttributeError(
                         f"Function {function_name} missing in {current_path}"
                     )
             else:
-                if not create_dummy:
-                    raise
-                # Create and register dummy module
-                current_module = create_dummy_module(
-                    current_path,
-                    parent=(
-                        importlib.import_module(parent_path) if parent_path else None
-                    ),
-                )
-
-        processed_path.append(part)
+                raise
 
     # Final function handling
     final_module = sys.modules[module_path]
     if function_name is not None:
         if not hasattr(final_module, function_name):
-            if create_dummy:
-                ph_func = create_placeholder_function(function_name)
-                setattr(final_module, function_name, ph_func)
-            else:
-                setattr(final_module, function_name, None)
+            setattr(final_module, function_name, None)
         return final_module, getattr(final_module, function_name)
 
     return final_module, None

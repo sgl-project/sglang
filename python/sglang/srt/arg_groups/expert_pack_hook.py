@@ -5,7 +5,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 from typing import Any
 
@@ -127,8 +126,8 @@ def handle_expert_pack(server_args: Any) -> None:
 
     pack_path = None
     if not raw_preparation_failed:
-        pack_path_value = loader_config.get("pack_path") or os.getenv(
-            "SGLANG_EXPERT_PACK_PATH"
+        pack_path_value = (
+            loader_config.get("pack_path") or envs.SGLANG_EXPERT_PACK_PATH.get()
         )
         pack_path = parse_path("pack_path", pack_path_value)
         if pack_path is None:

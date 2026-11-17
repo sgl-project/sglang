@@ -13,6 +13,7 @@ from transformers import (
     PreTrainedTokenizerFast,
 )
 
+from sglang.srt.environ import envs
 from sglang.srt.utils.hf_transformers_patches import apply_all_hf_patches
 
 # This module loads tokenizers and processors straight from transformers.
@@ -32,7 +33,7 @@ def parse_custom_headers(header_list: List[str]) -> Dict[str, str]:
 
 
 def get_model(pretrained_model_name_or_path: str) -> str:
-    if os.getenv("SGLANG_USE_MODELSCOPE", "false").lower() == "true":
+    if envs.SGLANG_USE_MODELSCOPE.get():
         import huggingface_hub.constants
         from modelscope import snapshot_download
 

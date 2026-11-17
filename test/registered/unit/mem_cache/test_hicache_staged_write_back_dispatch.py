@@ -1200,7 +1200,6 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
         host.staging_buffer = torch.empty(
             4, host.layer_num, 1, host.indexer_page_stride_size, dtype=torch.uint8
         )
-        host.can_use_jit = False
         host.can_use_write_back_jit = True
         src_registry = {_ptr_key_from_layers(device_layers): device_layers}
 

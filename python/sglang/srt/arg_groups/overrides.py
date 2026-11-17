@@ -247,8 +247,7 @@ def remote_instance_transfer_engine_of(cfg: Any, load_format: Any = None) -> boo
 
     ``load_format`` overrides the config's: a draft runner loading under
     ``--speculative-draft-load-format`` needs its own transfer engine. Every
-    input is a ``model`` leaf, so this serves both the pre-publish member and
-    the post-publish accessor."""
+    input is a ``model`` leaf, so the published ``model`` bag answers it."""
     if cfg.remote_instance_weight_loader_start_seed_via_transfer_engine:
         return True
     if (load_format or cfg.load_format) != "remote_instance":
@@ -627,20 +626,6 @@ def _check_dsa_backend_constraints(
     major, minor = torch.cuda.get_device_capability()
     if (major, minor) < (8, 9):
         raise ValueError("CUDA TileLang FP8 KV requires SM89 or newer.")
-
-
-def _check_tilelang_dsa_fp8_kv(
-    kv_cache_dtype: str,
-    prefill_backend: Optional[str],
-    decode_backend: Optional[str],
-    *,
-    hip: bool,
-    dcp_size: int = 1,
-) -> None:
-    """Backward-compatible entry point for the TileLang DSA validation."""
-    _check_dsa_backend_constraints(
-        kv_cache_dtype, prefill_backend, decode_backend, hip=hip, dcp_size=dcp_size
-    )
 
 
 @register_post_process

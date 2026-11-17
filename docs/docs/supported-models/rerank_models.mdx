@@ -150,7 +150,7 @@ curl -X POST http://127.0.0.1:8001/v1/rerank \
 `/v1/rerank` returns a list of objects (sorted by descending score):
 
 - `score`: float, higher means more relevant
-- `document`: the original document string (only included when `return_documents` is `true`)
+- `document`: the original document, a string or the content parts of a multimodal document (only included when `return_documents` is `true`)
 - `index`: the original index in the input `documents`
 - `meta_info`: optional debug/usage info (may be present for some models)
 

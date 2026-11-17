@@ -1086,12 +1086,13 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
 
         threading.Thread(target=decode_listener_thread, daemon=True).start()
 
-    def _prefetch_staging_reqs(self, room: int):
+    def _prefetch_staging_reqs(self, room: int, upto_tokens: Optional[int] = None):
         """Send STAGING_REQ for all chunks before the prefill forward starts.
 
         Idempotent per room: the first call for a given room does the full
         fan-out (one STAGING_REQ per chunk per peer); subsequent calls return
-        immediately, so the caller can invoke this on every chunk.
+        immediately, so the caller can invoke this on every chunk. upto_tokens
+        is the scheduler's lazy-prefetch bound and is not applied here.
         """
         if not self.enable_staging or self.kv_buffer_tensors is None:
             return

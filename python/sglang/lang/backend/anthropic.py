@@ -34,7 +34,8 @@ class Anthropic(BaseBackend):
             messages = [{"role": "user", "content": s.text_}]
 
         if messages and messages[0]["role"] == "system":
-            system = messages.pop(0)["content"]
+            system = messages[0]["content"]
+            messages = messages[1:]
         else:
             system = ""
 
@@ -59,7 +60,8 @@ class Anthropic(BaseBackend):
             messages = [{"role": "user", "content": s.text_}]
 
         if messages and messages[0]["role"] == "system":
-            system = messages.pop(0)["content"]
+            system = messages[0]["content"]
+            messages = messages[1:]
         else:
             system = ""
 

@@ -940,9 +940,6 @@ def handle_multimodal_feature_transport(server_args: Any):
         "_handle_multimodal_feature_transport",
         mm_feature_transport=requested_transport,
     )
-    envs.SGLANG_USE_CUDA_IPC_TRANSPORT.set(
-        "1" if requested_transport == "cuda_ipc" else "0"
-    )
 
 
 _ssl_verify_warned = False

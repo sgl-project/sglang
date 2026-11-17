@@ -51,7 +51,7 @@ class CanaryEndpoint:
         violation_log: ViolationLog,
         real_kv_hash_mode: RealKvHashMode,
     ) -> None:
-        if _is_sweep_tag(self.kernel_kind):
+        if is_sweep_tag(self.kernel_kind):
             raise NotImplementedError(
                 f"kv-canary: launch_per_forward not supported on sweep endpoint {self.kernel_kind.name}"
             )
@@ -96,7 +96,7 @@ class CanaryEndpoint:
         violation_log: ViolationLog,
         real_kv_hash_mode: RealKvHashMode,
     ) -> None:
-        if not _is_sweep_tag(self.kernel_kind):
+        if not is_sweep_tag(self.kernel_kind):
             raise NotImplementedError(
                 f"kv-canary: launch_sweep not supported on non-sweep endpoint {self.kernel_kind.name}"
             )
@@ -129,7 +129,7 @@ class CanaryEndpoint:
         )
 
 
-def _is_sweep_tag(tag: CanaryLaunchTag) -> bool:
+def is_sweep_tag(tag: CanaryLaunchTag) -> bool:
     return tag in (
         CanaryLaunchTag.SWEEP_K_FULL,
         CanaryLaunchTag.SWEEP_V_FULL,

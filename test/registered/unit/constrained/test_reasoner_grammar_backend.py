@@ -7,12 +7,14 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
+from llguidance import LLTokenizer
 from xgrammar import TokenizerInfo
 
 from sglang.srt.constrained.base_grammar_backend import (
     BaseGrammarBackend,
     BaseGrammarObject,
 )
+from sglang.srt.constrained.llguidance_backend import GuidanceBackend
 from sglang.srt.constrained.reasoner_grammar_backend import (
     ReasonerGrammarBackend,
     ReasonerGrammarObject,
@@ -293,6 +295,29 @@ class TestReasonerGrammarBackend(CustomTestCase):
         )
         self.assertIs(bare, inner_grammar)
 
+    def test_wraps_a_backend_that_masks_only_through_its_grammars(self):
+        """llguidance and outlines define the mask operations on the grammar
+        object, not on the backend. With a reasoning parser, a regex / JSON /
+        EBNF request on such a backend must still compile and mask through
+        the compiled grammar."""
+        backend = object.__new__(GuidanceBackend)
+        BaseGrammarBackend.__init__(backend)
+        backend.llguidance_tokenizer = LLTokenizer("byte")
+        reasoner = ReasonerGrammarBackend(
+            backend, self._make_parser(), self._make_tokenizer()
+        )
+
+        wrapped = reasoner._init_value_dispatch(("regex", "[0-9]{1,8}"), False)
+
+        self.assertIsInstance(wrapped, ReasonerGrammarObject)
+        vocab_size = backend.llguidance_tokenizer.vocab_size
+        mask = wrapped.allocate_vocab_mask(vocab_size, 1, "cpu")
+        wrapped.fill_vocab_mask(mask, 0)
+        logits = torch.zeros(1, vocab_size)
+        wrapped.apply_vocab_mask(logits, wrapped.move_vocab_mask(mask, "cpu"))
+        allowed = (logits[0] == 0).nonzero().flatten().tolist()
+        self.assertEqual(allowed, [ord(digit) for digit in "0123456789"])
+
     def _make_xgrammar_backend(self):
         # ASCII plus native framing IDs keeps these checks independent of model files.
         vocab = [""] * (max(INKLING_SPECIAL_TOKEN_IDS.values()) + 1)
@@ -312,6 +337,25 @@ class TestReasonerGrammarBackend(CustomTestCase):
             init_xgrammar=lambda: (info, None),
         )
         return XGrammarGrammarBackend(tokenizer, len(vocab)), tokenizer
+
+    def test_strict_thinking_without_a_grammar_masks_cpu_logits(self):
+        """A strict-thinking request with no grammar masks through the backend.
+        That path must apply its mask to CPU logits like a grammar object
+        does: the MLX runner builds its mask rows on the CPU."""
+        backend, tokenizer = self._make_xgrammar_backend()
+        reasoner = ReasonerGrammarBackend(
+            backend, self._make_parser(), tokenizer, enable_strict_thinking=True
+        )
+        strict = reasoner.init_strict_reasoning_grammar(reasoning=True)
+        mask = strict.allocate_vocab_mask(backend.vocab_size, 1, "cpu")
+        strict.fill_vocab_mask(mask, 0)
+        logits = torch.zeros(1, backend.vocab_size)
+
+        strict.apply_vocab_mask(logits, mask)
+
+        # "<tool_call>" is excluded while thinking; the tokenizer is byte-level.
+        self.assertEqual(logits[0, ord("<")].item(), float("-inf"))
+        self.assertEqual(logits[0, ord("x")].item(), 0.0)
 
     def _vocab_mask(self, grammar, vocab_size):
         mask = torch.full((1, (vocab_size + 31) // 32), -1, dtype=torch.int32)

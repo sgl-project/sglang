@@ -252,7 +252,6 @@ def _run_eagle_verify(hooks, graphs, *, kvcache=None, idle=False):
             topk=1,
             num_draft_tokens=7,
             device="cpu",
-            metadata_ready_pre_pad=False,
             finalize_tree_path=True,
             post_verify_graphs=graphs,
         )
