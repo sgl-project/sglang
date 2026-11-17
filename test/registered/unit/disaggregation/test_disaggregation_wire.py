@@ -1644,6 +1644,7 @@ class TestKvShardedCpTpPrefillPairing(unittest.TestCase):
         prefill.state_strides_validated = set()
         prefill.failure_records = {}
         prefill._staging_outstanding = defaultdict(int)
+        prefill.exchange_aux_item_lens = False
         prefill.request_status = {42: KVPoll.Transferring}
         prefill.req_to_decode_prefix_len = {42: 0}
         prefill.transfer_infos = {42: {}}
