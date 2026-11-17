@@ -22,6 +22,17 @@ class IndexKeyCache:
     def __init__(self, pool: DSATokenToKVPool, index_buf_size: int):
         self.pool = pool
         num_pages = (index_buf_size + pool.page_size + 1) // pool.page_size
+        self._fixed_fabric_owner = None
+        if pool.fixed_fabric_pool:
+            from sglang.srt.mem_cache.fixed_fabric_pool import FixedFabricBufferOwner
+
+            self._fixed_fabric_owner = FixedFabricBufferOwner(
+                device=pool.device,
+                dtype=pool.index_k_with_scale_buffer_dtype,
+                shapes=[self._buffer_shape(num_pages)] * pool.layer_num,
+            )
+            self.buffer = list(self._fixed_fabric_owner.tensors)
+            return
         with pool.memory_saver_adapter.region(GPU_MEMORY_TYPE_KV_CACHE):
             with (
                 torch.cuda.use_mem_pool(pool.custom_mem_pool)
@@ -58,6 +69,8 @@ class IndexKeyCache:
 
     def clear(self) -> None:
         del self.buffer
+        if self._fixed_fabric_owner is not None:
+            self._fixed_fabric_owner.close()
 
     def move(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
         if tgt_loc.numel() == 0:

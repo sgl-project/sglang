@@ -581,6 +581,8 @@ class KVCacheConfigurator:
 
     def configure(self, *, pre_model_load_memory: int) -> KVCacheConfigResult:
         """Apply a resolved MemoryPoolConfig and initialize pools."""
+        if envs.SGLANG_GLM_DSA_FIXED_FABRIC_POOL.get():
+            self._validate_fixed_fabric_launch()
         if current_platform.is_cpu() and self.kv_cache_dtype == torch.float8_e4m3fn:
             if self.use_mla_backend:
                 raise ValueError("CPU FP8 KV cache is only supported for MHA.")
@@ -2501,6 +2503,39 @@ class KVCacheConfigurator:
         )
         return token_to_kv_pool
 
+    def _validate_fixed_fabric_launch(self):
+        # Each entry would build another pool class or layout, resize the pool,
+        # or route its allocation through a hook (memory saver, Foundry).
+        parallel, memory, exec_config = get_parallel(), get_memory(), get_exec()
+        unsupported = {
+            "models other than GlmMoeDsaForCausalLM": (
+                self.model_config.hf_config.architectures != ["GlmMoeDsaForCausalLM"]
+            ),
+            "non-MLA attention backends": not self.use_mla_backend,
+            "speculative decoding": (
+                not self.spec_algorithm.is_none() or self.is_draft_worker
+            ),
+            "context parallelism": (
+                parallel.attn_cp_size != 1 or parallel.attn_dcp_size != 1
+            ),
+            "pipeline parallelism": parallel.pp_size != 1,
+            "KV cache sharding": self.kv_shard_rank is not None,
+            "hybrid SWA": self.is_hybrid_swa,
+            "unified memory": memory.enable_unified_memory,
+            "the page-major KV layout": memory.enable_page_major_kv_layout,
+            "HiSparse": memory.enable_hisparse,
+            "the memory saver": exec_config.features.enable_memory_saver,
+            "CUDA graph persistence": (
+                exec_config.graph.cuda_graph_persistence is not None
+            ),
+            "post-capture KV sizing": envs.SGLANG_ENABLE_POST_CAPTURE_KV_SIZING.get(),
+        }
+        found = [name for name, hit in unsupported.items() if hit]
+        if found:
+            raise ValueError(
+                "SGLANG_GLM_DSA_FIXED_FABRIC_POOL does not support " + ", ".join(found)
+            )
+
     def _build_dsa_kv_pool(
         self,
         *,
@@ -2547,6 +2582,11 @@ class KVCacheConfigurator:
             pool_kwargs["layer_shard_size"] = dsa_cp_layer_shard_size
         else:
             PoolCls = dsa_pool_class
+        if envs.SGLANG_GLM_DSA_FIXED_FABRIC_POOL.get():
+            # Checked after the class is chosen: sharding, HiSparse and CP swap it.
+            if PoolCls is not DSATokenToKVPool:
+                raise ValueError("fixed FABRIC backing requires the built-in DSA pool")
+            pool_kwargs["fixed_fabric_pool"] = True
         if self.loc_space_scale > 1:
             pool_kwargs["dcp_replicated"] = True
         if _should_elide_dsa_index_k(is_draft_worker=self.is_draft_worker):

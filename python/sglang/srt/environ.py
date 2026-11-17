@@ -698,6 +698,9 @@ class Envs:
     # SWA pool) instead of its full-attention slots. Needs draft window <= the
     # target's sliding window; ignored (with the reason logged) where it does not apply.
     SGLANG_ROCM_ENABLE_DFLASH_SWA_DRAFT_KV = EnvBool(True)
+    # Back the GLM DSA KV and index buffers with one FABRIC allocation each, fixed at
+    # startup, so an NVLink peer can import the whole pool.
+    SGLANG_GLM_DSA_FIXED_FABRIC_POOL = EnvBool(False)
 
     # ===================================================================
     # Scheduler token budgeting and admission
