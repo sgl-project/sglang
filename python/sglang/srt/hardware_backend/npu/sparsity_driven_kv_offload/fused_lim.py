@@ -27,7 +27,6 @@ class LIMSelection:
     miss_sources: torch.Tensor
     miss_slots: torch.Tensor
     miss_counts: torch.Tensor
-    prefix_lens: torch.Tensor
     sparse_rows: torch.Tensor
     valid_rows: torch.Tensor
     request_safe_slots: torch.Tensor
@@ -82,7 +81,6 @@ class LIMDecodeAdapter:
             out_block_table=self.block_table[:batch],
             safe_slots=self.request_safe_slots[:batch],
             lengths=self._pre_lengths[:batch],
-            prefixes=self._pre_prefixes[:batch],
             sparse_rows=self._pre_sparse[:batch],
             valid_rows=self._pre_valid[:batch],
             request_states=self._pre_states[:batch],
@@ -100,7 +98,7 @@ class LIMDecodeAdapter:
             block_table=self.block_table[:batch],
             query_ends=self.query_ends[width - 1, :batch],
             seq_lens=self._pre_lengths[:batch],
-            prefix_lens=self._pre_prefixes[:batch],
+            prefix_lens=self._pre_lengths[:batch],
             cache_sizes=self._pre_cache_sizes[:batch],
             request_state=self._pre_states[:batch],
             request_slots=self.request_safe_slots[:batch],
@@ -124,7 +122,6 @@ class LIMDecodeAdapter:
             self.miss_sources[:batch],
             self.miss_slots[:batch],
             self.miss_counts[:batch],
-            self._pre_prefixes[:batch],
             self._pre_sparse[:batch],
             self._pre_valid[:batch],
             self.request_safe_slots[:batch],

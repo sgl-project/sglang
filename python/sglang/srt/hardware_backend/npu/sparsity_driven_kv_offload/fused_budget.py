@@ -124,11 +124,10 @@ class BudgetPlan:
             ),
             "last_prefix": BufferSpec((num_layers, request_rows + 1), metadata_dtype),
         }
-        # Per batch row: six int32 metadata arrays and two boolean masks (26 bytes).
+        # Per batch row: five int32 metadata arrays and two boolean masks (22 bytes).
         for name in (
             "request_safe_slots",
             "_pre_lengths",
-            "_pre_prefixes",
             "_pre_states",
             "_pre_next_prefix",
             "_pre_cache_sizes",

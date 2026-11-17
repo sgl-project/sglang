@@ -24,7 +24,6 @@ def test_fused_copy_sfa_metadata_width_and_graph(width):
     sparse = torch.tensor([True, False, False], dtype=torch.bool, device=device)
     slots = torch.tensor([1, 2, request_rows], dtype=torch.int32, device=device)
     prefix = torch.tensor([16000, 2000, 0], dtype=torch.int32, device=device)
-    kv = torch.empty(batch, dtype=torch.int32, device=device)
     hbm = torch.empty((batch, capacity // 128), dtype=torch.int32, device=device)
 
     def run():
@@ -33,17 +32,16 @@ def test_fused_copy_sfa_metadata_width_and_graph(width):
             valid_rows=valid,
             sparse_rows=sparse,
             request_slots=slots,
-            seq_lens=prefix,
-            actual_seq_lengths_kv=kv,
+            actual_seq_lengths_kv=prefix,
             hbm_block_table=hbm,
             capacity=capacity,
             query_width=width,
         )
 
-    def check(valid_cpu, sparse_cpu, slots_cpu):
+    def check(valid_cpu, sparse_cpu, slots_cpu, lengths_cpu):
         torch.npu.synchronize()
-        assert kv.cpu().tolist() == [
-            capacity + width - 1 if sp else (int(prefix[row].cpu()) if v else 0)
+        assert prefix.cpu().tolist() == [
+            capacity + width - 1 if sp else (lengths_cpu[row] if v else 0)
             for row, (v, sp) in enumerate(zip(valid_cpu, sparse_cpu))
         ]
         for row in range(batch):
@@ -60,7 +58,12 @@ def test_fused_copy_sfa_metadata_width_and_graph(width):
             )
 
     run()
-    check([True, True, False], [True, False, False], [1, 2, request_rows])
+    check(
+        [True, True, False],
+        [True, False, False],
+        [1, 2, request_rows],
+        [16000, 2000, 0],
+    )
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
         run()
@@ -71,4 +74,9 @@ def test_fused_copy_sfa_metadata_width_and_graph(width):
     prefix.copy_(torch.tensor([0, 18000, 19000], dtype=torch.int32, device=device))
     source.copy_(original)
     graph.replay()
-    check([False, True, True], [False, True, True], [request_rows, 2, 3])
+    check(
+        [False, True, True],
+        [False, True, True],
+        [request_rows, 2, 3],
+        [0, 18000, 19000],
+    )

@@ -15,7 +15,6 @@ def _lim_copy_sfa_metadata_kernel(
     request_slots_ptr,
     actual_seq_lengths_kv_ptr,
     hbm_block_table_ptr,
-    seq_lens_ptr,
     K: tl.constexpr,
     Q: tl.constexpr,
     C: tl.constexpr,
@@ -47,7 +46,7 @@ def _lim_copy_sfa_metadata_kernel(
         mask=col < HBM_PAGES,
     )
 
-    seq_len = tl.load(seq_lens_ptr + row_id)
+    seq_len = tl.load(actual_seq_lengths_kv_ptr + row_id)
     # Native MTP subtracts Q - 1 - query_index from this cache-relative length.
     sparse_length = C + Q - 1
     logical_length = tl.where(is_sparse, sparse_length, seq_len)
@@ -66,10 +65,9 @@ def prepare_copy_sfa_metadata(
     actual_seq_lengths_kv: torch.Tensor,
     hbm_block_table: torch.Tensor,
     capacity: int,
-    seq_lens: torch.Tensor,
     query_width: int = 1,
 ) -> None:
-    """Prepare native scheduling lengths, HBM pages, and invalid source IDs."""
+    """Update scheduling lengths in place and prepare HBM pages and invalid source IDs."""
     batch = source_ids.shape[0] // query_width
     hbm_pages = hbm_block_table.shape[1]
     _lim_copy_sfa_metadata_kernel[(batch,)](
@@ -79,7 +77,6 @@ def prepare_copy_sfa_metadata(
         request_slots,
         actual_seq_lengths_kv,
         hbm_block_table,
-        seq_lens,
         source_ids.shape[1],
         query_width,
         capacity,

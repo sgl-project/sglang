@@ -16,7 +16,6 @@ def _prepare_kernel(
     out_table_ptr,
     safe_slot_ptr,
     length_ptr,
-    prefix_ptr,
     sparse_ptr,
     valid_ptr,
     state_ptr,
@@ -66,16 +65,14 @@ def _prepare_kernel(
         )
         safe_slot = tl.where(valid, raw_slot, ROWS).to(tl.int32)
         length = tl.where(valid, raw_length, 0).to(tl.int32)
-        prefix = length
-        sparse = valid & (prefix >= CAPACITY)
+        sparse = valid & (length >= CAPACITY)
         previous = tl.load(last_ptr + safe_slot).to(tl.int32)
-        warm = (previous >= 0) & (prefix >= previous)
+        warm = (previous >= 0) & (length >= previous)
         state = tl.where(sparse, tl.where(warm, -1, -2), -3).to(tl.int32)
-        next_prefix = tl.where(sparse, prefix, -1).to(tl.int32)
+        next_prefix = tl.where(sparse, length, -1).to(tl.int32)
         cache_size = tl.where(sparse, CAPACITY, 0).to(tl.int32)
         tl.store(safe_slot_ptr + row, safe_slot)
         tl.store(length_ptr + row, length)
-        tl.store(prefix_ptr + row, prefix)
         tl.store(sparse_ptr + row, sparse)
         tl.store(valid_ptr + row, valid)
         tl.store(state_ptr + row, state)
@@ -92,7 +89,6 @@ def fused_prepare_lim_metadata(
     out_block_table,
     safe_slots,
     lengths,
-    prefixes,
     sparse_rows,
     valid_rows,
     request_states,
@@ -116,7 +112,6 @@ def fused_prepare_lim_metadata(
         out_block_table,
         safe_slots,
         lengths,
-        prefixes,
         sparse_rows,
         valid_rows,
         request_states,

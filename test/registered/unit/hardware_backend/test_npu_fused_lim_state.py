@@ -439,6 +439,7 @@ class TestLIMState(CustomTestCase):
         slot_values = source_values.remainder(manager.cache_capacity)
 
         def native_lim(*tensors, full_visible=False):
+            self.assertEqual(tensors[5].data_ptr(), tensors[6].data_ptr())
             self.assertEqual(tensors[11].shape, source_values.shape)
             self.assertEqual(tensors[12].shape, slot_values.shape)
             tensors[11].copy_(source_values)
@@ -473,7 +474,6 @@ class TestLIMState(CustomTestCase):
         self.assertEqual(
             selection.device_slots.data_ptr(), adapter.device_slots.data_ptr()
         )
-        selection.prefix_lens.copy_(torch.tensor([9000, 100], dtype=torch.int32))
         expected_copy_lengths = torch.tensor(
             [manager.cache_capacity + manager.max_query_width - 1, 100],
             dtype=torch.int32,
@@ -509,13 +509,22 @@ class TestLIMState(CustomTestCase):
         manager._copy_sfa_operator = native_copy_sfa
 
         def prepare_metadata(**kwargs):
+            self.assertEqual(
+                kwargs["actual_seq_lengths_kv"].data_ptr(),
+                adapter._pre_lengths.data_ptr(),
+            )
+            torch.testing.assert_close(
+                kwargs["actual_seq_lengths_kv"],
+                torch.tensor([9000, 100], dtype=torch.int32),
+            )
             kwargs["actual_seq_lengths_kv"].copy_(expected_copy_lengths)
 
         post.prepare_copy_sfa_metadata.side_effect = prepare_metadata
-        prefix_before = selection.prefix_lens.clone()
         with patch.dict(sys.modules, {prefix + "npu_lim_copy_sfa_metadata": post}):
-            for stale in (-10, -20):
-                adapter._pre_lengths[:2].fill_(stale)
+            for _ in range(2):
+                adapter._pre_lengths[:2].copy_(
+                    torch.tensor([9000, 100], dtype=torch.int32)
+                )
                 result = manager.copy_sfa_attention(
                     SimpleNamespace(layer_id=0, scaling=0.1),
                     torch.zeros(rows, 8, 512, dtype=torch.bfloat16),
@@ -527,7 +536,9 @@ class TestLIMState(CustomTestCase):
                         torch.ones(rows, dtype=torch.bool),
                     ),
                 )
-                torch.testing.assert_close(selection.prefix_lens, prefix_before)
+                torch.testing.assert_close(
+                    adapter._pre_lengths[:2], expected_copy_lengths
+                )
         torch.testing.assert_close(
             result, torch.full((rows, 8 * 512), 3, dtype=result.dtype)
         )

@@ -240,7 +240,6 @@ class FusedSparseKVCacheManager:
             hbm_block_table=self.planner_hbm_block_table[:batch],
             capacity=adapter.capacity,
             query_width=plan.query_width,
-            seq_lens=plan.prefix_lens,
         )
         query_heads = query_nope.shape[1]
         current, positions, valid = current_inputs

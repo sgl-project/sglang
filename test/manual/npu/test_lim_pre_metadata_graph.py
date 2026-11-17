@@ -39,7 +39,6 @@ def test_npu_graph_replay_matches_torch_reference(
     out_table = torch.empty((batch, dst_cols), dtype=torch.int32, device=device)
     safe = torch.empty(batch, dtype=torch.int32, device=device)
     out_len = torch.empty_like(safe)
-    prefix = torch.empty_like(safe)
     sparse = torch.empty(batch, dtype=torch.bool, device=device)
     valid = torch.empty_like(sparse)
     state = torch.empty_like(safe)
@@ -55,7 +54,6 @@ def test_npu_graph_replay_matches_torch_reference(
             out_block_table=out_table,
             safe_slots=safe,
             lengths=out_len,
-            prefixes=prefix,
             sparse_rows=sparse,
             valid_rows=valid,
             request_states=state,
@@ -120,7 +118,7 @@ def test_npu_graph_replay_matches_torch_reference(
             lengths.cpu().tolist(),
             src_table.cpu(),
         )
-        expected_safe, expected_len, expected_prefix, expected_sparse = [], [], [], []
+        expected_safe, expected_len, expected_sparse = [], [], []
         expected_valid, expected_state, expected_next, expected_cache = [], [], [], []
         for slot, length in zip(host_slots, host_lengths):
             ok = slot > 0 and slot < rows and length > 0
@@ -131,7 +129,6 @@ def test_npu_graph_replay_matches_torch_reference(
             warm = sp and old >= 0 and pre >= old
             expected_safe.append(slot if ok else rows)
             expected_len.append(ln)
-            expected_prefix.append(pre)
             expected_sparse.append(sp)
             expected_valid.append(ok)
             expected_state.append(-1 if warm else (-2 if sp else -3))
@@ -140,7 +137,6 @@ def test_npu_graph_replay_matches_torch_reference(
         pairs = [
             (safe, expected_safe),
             (out_len, expected_len),
-            (prefix, expected_prefix),
             (sparse, expected_sparse),
             (valid, expected_valid),
             (state, expected_state),
