@@ -47,7 +47,15 @@ def _select_recurrent_launch_config(
         and v == 128
     ):
         return (8, 4) if n == 1 else (16, 2)
-    if _is_gfx95 and is_kda and target_verify and 0 < n <= 8 and k == 128 and v == 128:
+    if (
+        _is_gfx95
+        and is_kda
+        and target_verify
+        and 0 < n <= 8
+        and h == hv == 12
+        and k == 128
+        and v == 128
+    ):
         # Measured on MI350X (K3.1 TP8 8-token verify), bit-identical across widths;
         # past 8 requests the BV=32 default applies (it wins from 16).
         return (4 if n <= 2 else 8 if n <= 4 else 16), 1
