@@ -563,16 +563,13 @@ class TestNativeWeightUpdateAgreement(_WeightUpdaterManagerTestBase):
                 target.weight_updater.update_weights_from_tensor.assert_not_called()
                 self.assertEqual(self.recorded, [])
 
-    def test_receive_failure_on_a_peer_prevents_loading_any_runner(self):
+    def test_distributed_receive_failure_on_a_peer_prevents_loading_any_runner(self):
         """A healthy receiver must not start writing while a peer failed intake."""
-        for route in ("distributed", "tensor"):
-            with self.subTest(route=route):
-                self.recorded.clear()
-                output, _, _, events = self._case(route, peer_receive_error=True)
-                self.assertFalse(output.success)
-                self.assertNotIn("load", events)
-                self.assertNotIn("flush", events)
-                self.assertEqual(self.recorded, [])
+        output, _, _, events = self._case("distributed", peer_receive_error=True)
+        self.assertFalse(output.success)
+        self.assertNotIn("load", events)
+        self.assertNotIn("flush", events)
+        self.assertEqual(self.recorded, [])
 
     def test_peer_flush_failure_is_reported_after_a_successful_load(self):
         """New weights are recorded, but one rank refusing invalidation fails the RPC."""

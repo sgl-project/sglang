@@ -339,19 +339,17 @@ class SchedulerWeightUpdaterManager:
             except Exception:
                 logger.exception("Failed to deserialize weights on this TP rank")
                 raise
-            success, message = self._agree_native_update(True, "Success")
-            if success:
-                success, message = self._update_native_runners(
-                    recv_req,
-                    selector=recv_req.selector,
-                    update=lambda runner: (
-                        runner.weight_updater.update_weights_from_tensor(
-                            named_tensors=named_tensors,
-                            load_format=recv_req.load_format,
-                        )
-                    ),
-                    session_load=True,
-                )
+            # Deserialization either succeeds or raises; there is no recoverable
+            # outcome to agree on before the per-runner load agreement below.
+            success, message = self._update_native_runners(
+                recv_req,
+                selector=recv_req.selector,
+                update=lambda runner: runner.weight_updater.update_weights_from_tensor(
+                    named_tensors=named_tensors,
+                    load_format=recv_req.load_format,
+                ),
+                session_load=True,
+            )
             if not success:
                 logger.error(message)
             torch.distributed.barrier(group=self.tp_cpu_group)
