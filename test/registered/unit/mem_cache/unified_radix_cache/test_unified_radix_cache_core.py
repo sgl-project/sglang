@@ -1657,9 +1657,12 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         with envs.SGLANG_OPT_UNIFIED_CACHE_FREE_OUT_OF_WINDOW_SLOTS.override(True):
             cache.checkpoint(req, up_to=forward_len)
 
-        # Only the branch point is cached; the forward past it is released.
+        # The branch point and the forward end are both cached.
+        self.assertEqual(req.kv.cache_protected_len, forward_len)
+        self.assertEqual(match_prefix(cache, tokens).device_prefix_len, forward_len)
         self.assertEqual(
-            match_prefix(cache, tokens).device_prefix_len, branching_seqlen
+            match_prefix(cache, tokens[:branching_seqlen] + [0]).device_prefix_len,
+            branching_seqlen,
         )
         expected_evicted = forward_len - 1 - self.cfg.sliding_window_size
         self.assertEqual(
@@ -1667,7 +1670,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         )
 
         # The cached branch keeps SWA for its last window; the forward overshoot
-        # past it is released, and the request keeps its own live window.
+        # past it is released, and the tree keeps the forward end's live window.
         branch_freed = branching_seqlen - 1 - self.cfg.sliding_window_size
         mapping = allocator.full_to_swa_index_mapping
         self.assertEqual(
@@ -1691,6 +1694,97 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         )
         cache.unlock(req.lock)
         cache.sanity_check()
+
+    def _check_branch_checkpoint_keeps_prompt_end(self, *, tail_len, chunked):
+        """A prompt that branches below its end must stay matchable at its last
+        full page after decode retires the request's own window."""
+        cache, allocator, req_to_token_pool = build_fixture(self.cfg)
+        ps = self.cfg.page_size
+        window_pages = -(-self.cfg.sliding_window_size // ps)
+        full_total = allocator.full_available_size()
+        swa_total = allocator.swa_available_size()
+
+        # An earlier turn left its prompt end with Full KV but no SWA window.
+        shared = self._make_seq(1, window_pages + 1)
+        branching_seqlen = len(shared)
+        earlier = shared + self._make_seq(1000, window_pages + 1)
+        earlier_kv = self._alloc(allocator, len(earlier))
+        allocator.free_swa_segment(earlier_kv[:branching_seqlen], start_pos=0)
+        cache.insert(
+            InsertParams(
+                key=RadixKey(array("q", earlier)),
+                value=earlier_kv,
+                component_evicted_seqlens={ComponentType.SWA: branching_seqlen},
+            )
+        )
+
+        prompt = (
+            shared
+            + self._make_seq(2000, 2 * window_pages + 2)
+            + list(range(7000, 7000 + tail_len))
+        )
+        prompt_floor = len(prompt) // ps * ps
+        output = self._make_seq(3000, window_pages + 1)
+        match = match_prefix(cache, prompt)
+        self.assertEqual(match.swa_branching_seqlen, branching_seqlen)
+
+        req, _ = self._make_inflight_req(
+            cache, allocator, req_to_token_pool, prompt, output, allocated=True
+        )
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", prompt)
+        req.swa_branching_seqlen = match.swa_branching_seqlen
+        chunk_ends = [len(prompt)]
+        if chunked:
+            chunk_ends.insert(0, branching_seqlen + (window_pages + 1) * ps)
+        for end in chunk_ends:
+            req.extend_end = end
+            req.kv.kv_committed_len = end
+            cache.checkpoint(req, up_to=end)
+            # Earlier chunks stop at the branch point; the next one inserts the rest.
+            protected = end // ps * ps if end == len(prompt) else branching_seqlen
+            self.assertEqual(req.kv.cache_protected_len, protected)
+            cache.sanity_check()
+
+        # Decode moves past the window, then the request finishes.
+        owned = len(prompt) + len(output)
+        req.output_ids = array("q", output)
+        req.kv.kv_committed_len = owned
+        retire_window(req, owned - 1, cache)
+        req.finished_reason = FINISH_LENGTH(length=len(output))
+        release_kv_cache(req, cache, checkpoint=True)
+
+        follow_up = prompt + self._make_seq(4000, 1)
+        self.assertEqual(match_prefix(cache, follow_up).device_prefix_len, prompt_floor)
+        sibling = shared + self._make_seq(5000, 1)
+        self.assertEqual(
+            match_prefix(cache, sibling).device_prefix_len, branching_seqlen
+        )
+
+        self.assertEqual(
+            allocator.full_available_size() + cache.full_evictable_size(), full_total
+        )
+        self.assertEqual(
+            allocator.swa_available_size() + window_evictable(cache), swa_total
+        )
+        cache.sanity_check()
+
+    @requires_swa_only
+    def test_swa_branch_checkpoint_keeps_prompt_end_window(self):
+        self._check_branch_checkpoint_keeps_prompt_end(tail_len=0, chunked=False)
+
+    @requires_swa_only
+    def test_swa_branch_checkpoint_keeps_unaligned_prompt_end_window(self):
+        # The prompt's last page is partial, as with page_size 256 in serving.
+        self._check_branch_checkpoint_keeps_prompt_end(
+            tail_len=max(1, self.cfg.page_size // 2), chunked=False
+        )
+
+    @requires_swa_only
+    def test_swa_branch_checkpoint_keeps_prompt_end_window_across_chunks(self):
+        self._check_branch_checkpoint_keeps_prompt_end(
+            tail_len=max(1, self.cfg.page_size // 2), chunked=True
+        )
 
 
 define_config_test_classes(UnifiedRadixCacheCoreSuite, globals())

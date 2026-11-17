@@ -2839,8 +2839,7 @@ class Scheduler(
     def init_gc_freezer(self) -> None:
         """Freeze the heap when idle; warn on heap growth and frozen garbage."""
         self.gc_freezer = GCFreezer(
-            freeze_on_idle_secs=get_device().gc_freeze_on_idle_secs,
-            enable_frozen_garbage_check=envs.SGLANG_ENABLE_GC_FROZEN_GARBAGE_CHECK.get(),
+            freeze_on_idle_secs=get_device().gc_freeze_on_idle_secs
         )
 
     def init_rank_consensus_checker(self) -> None:
