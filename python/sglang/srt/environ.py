@@ -2393,6 +2393,9 @@ class Envs:
     # TP4 / TP8 compact A4 verify: one kernel runs the MoE finalize and pushes the all-reduce over xGMI (bitwise the
     # FlyDSL finalize + aiter two-stage all-reduce).
     SGLANG_ROCM_MUSE_FINALIZE_AR_PUSH = EnvBool(True)
+    # gfx1250: the attention O projection's all-reduce at 2shot_push widths runs in the attention boundary kernel
+    # (rocm_muse_spark/all_reduce_boundary.py); the branch is bitwise the plain push all-reduce's.
+    SGLANG_ROCM_MUSE_AR_BOUNDARY = EnvBool(False)
     SGLANG_ROCM_MUSE_DENSE_TUNED = EnvBool(True)
     SGLANG_ROCM_MUSE_SHARED_ROUTER_POOLER = EnvBool(True)
     SGLANG_ROCM_MUSE_JOINT_ROUTER_POOLER = EnvBool(True)
