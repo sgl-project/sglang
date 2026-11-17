@@ -85,6 +85,19 @@ struct NgramCorpusObj : public tvm::ffi::Object {
     ngram_->eraseMatchState(state_ids);
   }
 
+  // corpus_ids is newline-separated, matching list_external_corpora().
+  void set_corpus_filter(int64_t state_id, const std::string& corpus_ids) {
+    std::vector<std::string> ids;
+    size_t start = 0;
+    while (start < corpus_ids.size()) {
+      size_t end = corpus_ids.find('\n', start);
+      if (end == std::string::npos) end = corpus_ids.size();
+      ids.emplace_back(corpus_ids.substr(start, end - start));
+      start = end + 1;
+    }
+    ngram_->setCorpusFilter(state_id, std::move(ids));
+  }
+
   void start_external_corpus_load() {
     ngram_->startExternalCorpusLoad();
   }
@@ -159,6 +172,7 @@ void register_ngram_corpus() {
       .def("async_insert", &NgramCorpusObj::async_insert)
       .def("batch_match_stateful", &NgramCorpusObj::batch_match_stateful)
       .def("erase_match_state", &NgramCorpusObj::erase_match_state)
+      .def("set_corpus_filter", &NgramCorpusObj::set_corpus_filter)
       .def("start_external_corpus_load", &NgramCorpusObj::start_external_corpus_load)
       .def("append_external_corpus_tokens", &NgramCorpusObj::append_external_corpus_tokens)
       .def("finish_external_corpus_load", &NgramCorpusObj::finish_external_corpus_load)

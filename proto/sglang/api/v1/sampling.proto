@@ -101,6 +101,9 @@ message SamplingParams {
   // Literal alternatives. The server lowers these to an escaped regex before
   // grammar compilation, matching the legacy native gRPC contract.
   repeated string choice = 28;
+  // NGRAM speculative decoding: external corpus ids to draft from. Absent uses
+  // every loaded corpus; an empty list uses none.
+  StringList ngram_corpus_ids = 29;
 }
 
 message WatermarkRequestConfig {
