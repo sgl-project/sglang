@@ -252,9 +252,10 @@ class TestPrefillAdder(CustomTestCase):
         req.full_untruncated_fill_ids = list(range(12))
         return req
 
-    def create_shortest_prefill_adder(self, *, chunk_tokens=4096):
+    def create_shortest_prefill_adder(self, *, chunk_tokens=4096, encoder_replay=False):
         override = get_context().override_server_args(
-            schedule_policy="shortest-prefill-first"
+            schedule_policy="shortest-prefill-first",
+            enable_encoder_swa_bounded_replay=encoder_replay,
         )
         override.install()
         self.addCleanup(override.restore)
@@ -297,6 +298,40 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(adder.new_chunked_req)
         self.assertEqual(adder.rem_chunk_tokens, 0)
         self.assertGreaterEqual(adder.rem_total_tokens, 0)
+
+    def test_shortest_prefill_reserves_encoder_replay_rows_of_hits(self):
+        # Admission charges a hit's replay rows to the chunk. A reservation
+        # without them leaves the hit unable to fit whole, so it waits and the
+        # room reserved for it goes unused.
+        adder = self.create_shortest_prefill_adder(encoder_replay=True)
+        policy = SchedulePolicy(
+            policy="shortest-prefill-first",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        continuation = self.create_shared_req("continuation")
+        continuation.full_untruncated_fill_ids = list(range(16384))
+        hit = self.create_shared_req("hit")
+        hit.origin_input_ids = list(range(4096 + 1024))
+        hit.full_untruncated_fill_ids = hit.origin_input_ids
+        hit.num_matched_prefix_tokens = 4096
+        hit.prefix_len = 4096
+        hit.kv.req_pool_idx = None
+        hit.is_retracted = False
+        adder.chunked_req_limit = policy.shortest_prefill_chunk_limit(
+            continuation,
+            [hit],
+            adder.rem_chunk_tokens,
+            adder.page_size,
+            processed_tokens=0,
+        )
+        adder.add_chunked_req(continuation)
+        # 1024 extend + 128 replay rows reserved, page-floored: 4096 - 1280.
+        self.assertEqual(continuation.extend_len, 2816)
+        adder.add_one_req(hit, has_chunked_req=True, truncation_align_size=None)
+        self.assertEqual(adder.can_run_list, [continuation, hit])
 
     def test_shortest_prefill_rejects_second_unfinished_chunk(self):
         adder = self.create_shortest_prefill_adder(chunk_tokens=512)
