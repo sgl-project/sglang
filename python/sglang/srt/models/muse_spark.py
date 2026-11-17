@@ -93,8 +93,14 @@ from sglang.srt.model_executor.forward_context import (
     get_attn_backend,
     get_token_to_kv_pool,
 )
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_loader.weight_utils import default_weight_loader
-from sglang.srt.runtime_context import get_forward, get_memory, get_parallel
+from sglang.srt.runtime_context import (
+    get_forward,
+    get_memory,
+    get_parallel,
+    get_platform,
+)
 from sglang.srt.state_capturer.routed_experts import get_global_experts_capturer
 from sglang.srt.utils import is_cpu, is_hip, use_intel_amx_backend
 from sglang.srt.utils.device import get_device_capability, is_cuda
@@ -194,6 +200,25 @@ def _use_split_bf16_router(num_tokens: int) -> bool:
     if num_tokens <= _FP32_ROUTER_MAX_TOKENS or not _split_bf16_router_supported():
         return False
     return True
+
+
+# The only value measured (SGLang v0.5.23, Marlin experts, 8x H200 at TP8);
+# not swept, safe to change.
+_ROW_SPLIT_MIN_TOKENS = 2048
+
+
+def _row_split_projection(
+    x: torch.Tensor, weight: torch.Tensor, *, x_is_tp_partial: bool
+) -> torch.Tensor:
+    """``x @ weight.T``, each TP rank computing its own token rows. ``x`` is
+    replicated, or with ``x_is_tp_partial`` this rank's addend of an all-reduce."""
+    if x_is_tp_partial:
+        rows = layernorm_sp.reduce_scatter_token_rows(x)
+    else:
+        rows = layernorm_sp.shard_token_rows(x)
+    return layernorm_sp.all_gather_token_rows(
+        bf16_gemm_dispatch(rows, weight, None), total_rows=x.shape[0]
+    )
 
 
 def _fused_norm_boundary(
@@ -546,6 +571,13 @@ class MuseSpark1xMoE(nn.Module):
         else:
             self.pre_expert_proj = None
             self.post_expert_proj = None
+        # Measured only on H200 at TP8, one NVLink node; across nodes the extra
+        # all-gathers would run at network speed.
+        self.row_split_supported = (
+            self.pre_expert_proj is not None
+            and self.tp_size == 8
+            and get_platform().is_sm90
+        )
         if (
             self.pre_expert_proj is not None
             and self.tp_size in (4, 8)
@@ -708,23 +740,41 @@ class MuseSpark1xMoE(nn.Module):
                 )
                 ar_workspace.fallback_logged = True
             ar_workspace = None
+        # Decided once from batch-wide facts, so the pooler and the unpooler split
+        # the same passes and every TP rank issues the same collectives.
+        row_split = forward_batch is not None and self._uses_row_split(
+            forward_batch.forward_mode, hidden_states.shape[0]
+        )
         output = self._forward_experts(
             hidden_states,
             router_input,
             ar_workspace=ar_workspace,
+            row_split=row_split,
         )
-        return self._reduce_and_unpool(output, already_reduced=ar_workspace is not None)
+        return self._reduce_and_unpool(
+            output, already_reduced=ar_workspace is not None, row_split=row_split
+        )
 
     def _reduce_and_unpool(
-        self, output: torch.Tensor, *, already_reduced: bool = False
+        self,
+        output: torch.Tensor,
+        *,
+        already_reduced: bool = False,
+        row_split: bool = False,
     ) -> torch.Tensor:
         # Expert TP already reduced across ranks, before its post-expert norm.
-        if (
+        needs_reduce = (
             self.tp_size > 1
             and self.moe_tp_size == 1
             and not getattr(get_forward(), "sp_active", False)
             and not already_reduced
-        ):
+        )
+        if row_split:
+            # A pending all-reduce becomes a reduce-scatter onto this rank's rows.
+            return _row_split_projection(
+                output, self.post_expert_proj.weight, x_is_tp_partial=needs_reduce
+            )
+        if needs_reduce:
             output = tensor_model_parallel_all_reduce(output)
         if self.post_expert_proj is not None:
             if _is_cpu:
@@ -740,6 +790,16 @@ class MuseSpark1xMoE(nn.Module):
                 return gemm_ag(comm, output, self.post_expert_proj.weight)
             output = bf16_gemm_dispatch(output, self.post_expert_proj.weight, None)
         return output
+
+    def _uses_row_split(self, forward_mode: ForwardMode, num_tokens: int) -> bool:
+        # EXTEND and MIXED only: is_extend() also admits TARGET_VERIFY, which
+        # replays in decode CUDA graphs. Layernorm SP already splits the rows.
+        return (
+            self.row_split_supported
+            and forward_mode.is_extend_or_draft_extend_or_mixed()
+            and num_tokens >= _ROW_SPLIT_MIN_TOKENS
+            and not get_forward().sp_active
+        )
 
     def _defers_unpool_gather(self, comm, num_tokens: int) -> bool:
         boundary = self.unpool_gather_boundary
@@ -777,6 +837,7 @@ class MuseSpark1xMoE(nn.Module):
         router_input: Optional[torch.Tensor] = None,
         *,
         ar_workspace=None,
+        row_split: bool = False,
     ) -> torch.Tensor:
         if hidden_states.shape[0] == 0:
             return hidden_states.new_zeros((0, self.expert_hidden_size))
@@ -825,6 +886,10 @@ class MuseSpark1xMoE(nn.Module):
                 and gemm_ag_supported(comm, hidden_states, self.pre_expert_proj.weight)
             ):
                 expert_input = gemm_ag(comm, hidden_states, self.pre_expert_proj.weight)
+            elif row_split:
+                expert_input = _row_split_projection(
+                    hidden_states, self.pre_expert_proj.weight, x_is_tp_partial=False
+                )
             else:
                 expert_input = bf16_gemm_dispatch(
                     hidden_states, self.pre_expert_proj.weight, None
