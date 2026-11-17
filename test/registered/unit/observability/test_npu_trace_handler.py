@@ -31,8 +31,12 @@ class TestNPUTraceHandler(unittest.TestCase):
 
     def test_policy_depends_on_process_not_workload_name(self):
         api = SimpleNamespace(tensorboard_trace_handler=Mock())
-        profiler = SimpleNamespace(prof_if=SimpleNamespace(prof_path="rank1_ascend_pt"))
         for daemon in (False, True):
+            events = []
+            profiler = SimpleNamespace(
+                stop=Mock(side_effect=lambda: events.append("stop")),
+                prof_if=SimpleNamespace(prof_path="rank1_ascend_pt"),
+            )
             with (
                 self.subTest(daemon=daemon),
                 patch.object(
@@ -48,32 +52,142 @@ class TestNPUTraceHandler(unittest.TestCase):
                 patch.object(
                     profile_analysis_npu,
                     "start_npu_profile_analysis",
-                    return_value=Path("sglang_analysis.json"),
+                    side_effect=lambda _: events.append("submit"),
                 ) as analyze,
             ):
-                handler = profile_analysis_npu.NPUTraceHandler("traces")
-                self.assertEqual(handler.npu_auto_analysis_in_daemon, daemon)
+                callback = profile_analysis_npu.NPUTraceHandler.get_on_trace_ready(
+                    "traces"
+                )
                 api.tensorboard_trace_handler.assert_called_with(
                     "traces", analyse_flag=not daemon
                 )
-                self.assertIs(
-                    handler.on_trace_ready, api.tensorboard_trace_handler.return_value
-                )
-                trace = handler.export(profiler)
+                self.assertIs(callback, api.tensorboard_trace_handler.return_value)
+                profile_analysis_npu.NPUTraceHandler.stop_capture(profiler)
                 if daemon:
                     analyze.assert_called_once_with("rank1_ascend_pt")
-                    self.assertEqual(trace, Path("sglang_analysis.json"))
+                    self.assertEqual(events, ["stop", "submit"])
                 else:
                     analyze.assert_not_called()
-                    self.assertIsNone(trace)
+                    self.assertEqual(events, ["stop"])
+
+    def test_patch_modes_preserve_replacements_in_either_order(self):
+        api = SimpleNamespace(
+            profile=object(),
+            schedule=object(),
+            ProfilerActivity=SimpleNamespace(CPU=object(), NPU=object()),
+        )
+        for modes in (("diffusion", "srt"), ("srt", "diffusion")):
+            applied = {}
+            npu = SimpleNamespace(
+                profiler=api,
+                _apply_patches=Mock(
+                    side_effect=lambda patches: applied.update(patches)
+                ),
+            )
+            with (
+                self.subTest(modes=modes),
+                patch.object(profile_analysis_npu, "get_torch_npu", return_value=npu),
+            ):
+                for mode in modes:
+                    profile_analysis_npu.NPUTraceHandler.apply_patches(mode)
+                    expected = {"profiler.profile"}
+                    if mode == "diffusion":
+                        expected.add("profiler.schedule")
+                    else:
+                        expected.update(
+                            (
+                                "profiler.ProfilerActivity.CPU",
+                                "profiler.ProfilerActivity.CUDA",
+                            )
+                        )
+                    self.assertEqual(
+                        {name for name, _ in npu._apply_patches.call_args.args[0]},
+                        expected,
+                    )
+                self.assertEqual(
+                    applied,
+                    {
+                        "profiler.profile": api.profile,
+                        "profiler.schedule": api.schedule,
+                        "profiler.ProfilerActivity.CPU": api.ProfilerActivity.CPU,
+                        "profiler.ProfilerActivity.CUDA": api.ProfilerActivity.NPU,
+                    },
+                )
+
+    def test_invalid_patch_mode_does_not_import_npu(self):
+        with patch.object(profile_analysis_npu, "get_torch_npu") as get_npu:
+            with self.assertRaisesRegex(ValueError, "patch mode"):
+                profile_analysis_npu.NPUTraceHandler.apply_patches("unknown")
+        get_npu.assert_not_called()
+
+    def test_error_cleanup_skips_group_and_analysis(self):
+        profiler = SimpleNamespace(stop=Mock())
+        with (
+            patch.object(
+                multiprocessing,
+                "current_process",
+                return_value=SimpleNamespace(daemon=True),
+            ),
+            patch.object(torch.distributed, "get_world_size") as world_size,
+            patch.object(torch.distributed, "all_gather_object") as gather,
+            patch.object(profile_analysis_npu, "start_npu_profile_analysis") as analyze,
+        ):
+            profile_analysis_npu.NPUTraceHandler.stop_capture(
+                profiler, export_trace=False, rank=1, cpu_group=object()
+            )
+        profiler.stop.assert_called_once()
+        world_size.assert_not_called()
+        gather.assert_not_called()
+        analyze.assert_not_called()
+
+    def test_local_stop_error_propagates_without_parsing(self):
+        for daemon in (False, True):
+            error = RuntimeError("capture failed")
+            profiler = SimpleNamespace(stop=Mock(side_effect=error))
+            with (
+                self.subTest(daemon=daemon),
+                patch.object(
+                    multiprocessing,
+                    "current_process",
+                    return_value=SimpleNamespace(daemon=daemon),
+                ),
+                patch.object(
+                    profile_analysis_npu, "start_npu_profile_analysis"
+                ) as analyze,
+                self.assertRaises(RuntimeError) as raised,
+            ):
+                profile_analysis_npu.NPUTraceHandler.stop_capture(profiler)
+            self.assertIs(raised.exception, error)
+            analyze.assert_not_called()
+
+    def test_non_daemon_does_not_add_error_collectives(self):
+        with (
+            patch.object(
+                multiprocessing,
+                "current_process",
+                return_value=SimpleNamespace(daemon=False),
+            ),
+            patch.object(torch.distributed, "get_world_size") as world_size,
+            patch.object(torch.distributed, "all_gather_object") as gather,
+            patch.object(profile_analysis_npu, "start_npu_profile_analysis") as analyze,
+        ):
+            profile_analysis_npu.NPUTraceHandler.stop_capture(
+                SimpleNamespace(stop=Mock()), rank=0, cpu_group=object()
+            )
+        world_size.assert_not_called()
+        gather.assert_not_called()
+        analyze.assert_not_called()
 
     def test_background_launch_failure_is_logged_not_raised(self):
-        profiler = SimpleNamespace(prof_if=SimpleNamespace(prof_path="rank0_ascend_pt"))
-        handler = profile_analysis_npu.NPUTraceHandler.__new__(
-            profile_analysis_npu.NPUTraceHandler
+        profiler = SimpleNamespace(
+            stop=Mock(), prof_if=SimpleNamespace(prof_path="rank0_ascend_pt")
         )
-        handler.npu_auto_analysis_in_daemon = True
         with (
+            patch.object(
+                multiprocessing,
+                "current_process",
+                return_value=SimpleNamespace(daemon=True),
+            ),
             patch.object(
                 profile_analysis_npu,
                 "start_npu_profile_analysis",
@@ -81,7 +195,7 @@ class TestNPUTraceHandler(unittest.TestCase):
             ),
             self.assertLogs(profile_analysis_npu.logger, level="ERROR") as logs,
         ):
-            self.assertIsNone(handler.export(profiler))
+            profile_analysis_npu.NPUTraceHandler.stop_capture(profiler)
         self.assertIn("cannot exec", "\n".join(logs.output))
 
 
@@ -225,7 +339,7 @@ class TestSRTNPUTraceHandler(unittest.TestCase):
                 self.analyze.assert_not_called()
                 self.assertEqual(self.events, ["native analysis", "barrier"])
 
-    def test_both_srt_paths_use_shared_daemon_export_after_stop(self):
+    def test_both_srt_paths_submit_daemon_analysis_after_stop(self):
         self.process.return_value.daemon = True
         for v2 in (False, True):
             with self.subTest(v2=v2):

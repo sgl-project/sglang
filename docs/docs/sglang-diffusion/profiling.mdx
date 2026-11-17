@@ -101,6 +101,8 @@ NPU traces use the native Ascend directory layout rather than the `*.trace.json.
 
 Diffusion workers are daemon processes, where the native NPU analyzer cannot create its multiprocessing pool. SGLang saves the raw capture, then starts an independent parser immediately after profiling stops **without waiting**. Remaining generation and request completion do not wait for analysis. Each participating rank submits its own capture; the `NPU profile analysis submitted; status:` log identifies its status file, which may not exist until the new interpreter starts. Non-daemon callers keep native automatic parsing.
 
+On a normal stop, daemon workers coordinate capture-stop errors across the participating ranks before submitting analysis. A capture-stop error is reported to all participating ranks; it is distinct from a background parser failure. If the request fails or is cancelled, profiling cleanup stays local, does not submit another parser, and preserves the original request error. Repeated cleanup does not stop or submit the same capture again.
+
 The parser runs without a fixed timeout and can finish after the generation worker exits. It writes progress and results atomically to `sglang_analysis.json`:
 
 - `running`: analysis has started; a trace may not be ready yet.

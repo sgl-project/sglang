@@ -18,7 +18,9 @@ import tempfile
 import threading
 import time
 import traceback
+from collections.abc import Callable
 from pathlib import Path
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
@@ -35,32 +37,105 @@ def get_torch_npu():
 
 
 class NPUTraceHandler:
-    """Keep native analysis or submit a daemon capture for background parsing."""
+    """Own NPU profiler patches, callbacks, and capture-stop/analysis policy.
 
-    def __init__(self, log_dir: str):
+    The public helpers are stateless; callers keep their profiler's lifecycle.
+    Imports stay local so the detached parser does not import SGLang or torch
+    before reporting its analysis status.
+    """
+
+    @staticmethod
+    def apply_patches(mode: Literal["diffusion", "srt"]) -> None:
+        """Install the existing replacements for one profiler entry point."""
+        if mode not in ("diffusion", "srt"):
+            raise ValueError(f"Unknown NPU profiler patch mode: {mode!r}")
+        from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
+
+        torch_npu = get_torch_npu()
+        patches = [["profiler.profile", torch_npu.profiler.profile]]
+        if mode == "diffusion":
+            patches.append(["profiler.schedule", torch_npu.profiler.schedule])
+        else:
+            patches.extend(
+                [
+                    [
+                        "profiler.ProfilerActivity.CUDA",
+                        torch_npu.profiler.ProfilerActivity.NPU,
+                    ],
+                    [
+                        "profiler.ProfilerActivity.CPU",
+                        torch_npu.profiler.ProfilerActivity.CPU,
+                    ],
+                ]
+            )
+        apply_torch_npu_patches(torch_npu, patches)
+
+    @staticmethod
+    def get_on_trace_ready(log_dir: str) -> Callable[[Any], None]:
+        """Choose native analysis from the process mode, not the workload name."""
         # TODO(https://gitcode.com/Ascend/msprof/issues/265): Remove this
         # daemon-specific background analysis workaround once supported
         # torch_npu versions can automatically parse traces from multiprocessing
         # daemon workers. Native analysis currently creates child processes,
         # which daemon workers cannot spawn.
-        self.npu_auto_analysis_in_daemon = multiprocessing.current_process().daemon
-        self.on_trace_ready = get_torch_npu().profiler.tensorboard_trace_handler(
-            log_dir, analyse_flag=not self.npu_auto_analysis_in_daemon
+        return get_torch_npu().profiler.tensorboard_trace_handler(
+            log_dir, analyse_flag=not multiprocessing.current_process().daemon
         )
 
-    def export(self, profiler) -> Path | None:
-        if self.npu_auto_analysis_in_daemon:
+    @staticmethod
+    def stop_capture(
+        profiler,
+        *,
+        export_trace: bool = True,
+        synchronize: bool = False,
+        rank: int | None = None,
+        cpu_group=None,
+    ) -> None:
+        """Stop capture and submit daemon analysis without waiting for parsing.
+
+        A rank opts into coordinated daemon capture-stop errors; an explicit
+        CPU group coordinates multiple ranks without using the default group.
+        SRT omits both and keeps its existing local stop/barrier behavior.
+        ``export_trace=False`` skips coordination and background submission for
+        local error cleanup. Native non-daemon callbacks retain their behavior.
+        """
+        import torch
+
+        daemon = multiprocessing.current_process().daemon
+        coordinate_errors = daemon and export_trace and rank is not None
+        error = None
+        try:
+            if synchronize:
+                torch.npu.synchronize()
+            profiler.stop()
+        except Exception as exc:
+            if not coordinate_errors:
+                raise
+            error = f"rank {rank}: {exc}"
+            logger.error("NPU profiler stop failed: %s", error)
+
+        if coordinate_errors:
+            errors = [error]
+            if cpu_group is not None:
+                world_size = torch.distributed.get_world_size(group=cpu_group)
+                if world_size > 1:
+                    # Coordinate capture errors, never background parser status.
+                    errors = [None] * world_size
+                    torch.distributed.all_gather_object(errors, error, group=cpu_group)
+            if any(errors):
+                raise RuntimeError(
+                    "NPU profiler stop failed: " + "; ".join(e for e in errors if e)
+                )
+
+        if daemon and export_trace:
             try:
                 status = start_npu_profile_analysis(profiler.prof_if.prof_path)
                 logger.info("NPU profile analysis submitted; status: %s", status)
-                return status
             except Exception:
                 # Profiling analysis must not fail an otherwise valid generation.
                 logger.exception(
                     "Could not start NPU profile analysis; raw data is retained"
                 )
-        # Non-daemon captures have already been parsed by the native callback.
-        return None
 
 
 def _trace_path(directory: Path) -> Path:
