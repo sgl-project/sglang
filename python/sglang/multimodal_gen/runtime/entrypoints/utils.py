@@ -1,12 +1,7 @@
 # Copied and adapted from: https://github.com/hao-ai-lab/FastVideo
 
 # SPDX-License-Identifier: Apache-2.0
-"""
-DiffGenerator module for sglang-diffusion.
-
-This module provides a consolidated interface for generating videos using
-diffusion models.
-"""
+"""Shared entrypoint helpers: build a Req from SamplingParams and materialize/save generated images, videos and actions."""
 
 import atexit
 import io
