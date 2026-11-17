@@ -2,6 +2,8 @@
 
 import multiprocessing
 import tempfile
+import threading
+import time
 import unittest
 from array import array
 from collections import Counter, deque
@@ -16,6 +18,7 @@ import torch.distributed as dist
 
 from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
+from sglang.srt.disaggregation.mooncake.conn import MooncakeKVManager
 from sglang.srt.disaggregation.prefill import SchedulerDisaggregationPrefillMixin
 from sglang.srt.disaggregation.utils import ReqToMetadataIdxAllocator
 from sglang.srt.environ import envs
@@ -25,6 +28,7 @@ from sglang.srt.managers.io_struct import (
     ShutdownReq,
     TokenizedGenerateReqInput,
 )
+from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import NextBatchPlan, Req, ScheduleBatch
 from sglang.srt.managers.schedule_policy import SchedulePolicy
 from sglang.srt.managers.scheduler import Scheduler, _dispatch_event_loop_once
@@ -1445,6 +1449,210 @@ class TestCachedPrefixEarlySend(CustomTestCase):
                     )
                 else:
                     scheduler.send_kv_chunk.assert_not_called()
+
+
+class _ForwardEvent:
+    """A launched forward's event: ready once the test says the forward ended."""
+
+    def __init__(self):
+        self.ready = False
+
+    def record(self, stream=None):
+        pass
+
+    def query(self):
+        return self.ready
+
+    def synchronize(self):
+        self.ready = True
+
+
+class _PPEarlySendScheduler(SchedulerDisaggregationPrefillMixin):
+    def __init__(self, is_last_rank):
+        self.pp_group = SimpleNamespace(is_last_rank=is_last_rank)
+        self.forward_stream_ctx = nullcontext()
+        self.device_module = SimpleNamespace(
+            Event=_ForwardEvent, current_stream=lambda: None
+        )
+        self.disagg_prefill_early_sent_rids = set()
+        self.disagg_prefill_early_send_pending = deque()
+        self.disagg_prefill_early_send_stats = {"early": 0, "waited": 0}
+        self.sent = []
+
+        def send(req, last_chunk=False, end_idx=None, **kwargs):
+            # The forward's event rides on the sender to the transfer worker,
+            # which consumes it with the first chunk.
+            sender = req.disagg_kv_sender
+            wait_event = sender._early_send_wait_event
+            sender._early_send_wait_event = None
+            self.sent.append((req.rid, last_chunk, kwargs, wait_event))
+
+        self._send_kv_chunk = send
+
+
+def _early_req(
+    rid, room, status=KVPoll.WaitingForInput, pulls_every_stage=True, **overrides
+):
+    kv_mgr = SimpleNamespace(
+        request_status={room: status},
+        decode_pulls_every_pp_stage=lambda bootstrap_room: pulls_every_stage,
+    )
+    fields = dict(
+        rid=rid,
+        bootstrap_room=room,
+        origin_input_ids=[1] * 8,
+        extend_end=8,
+        pending_bootstrap=False,
+        metadata_buffer_index=0,
+        discard_output_reason=None,
+        to_finish=None,
+        finished_reason=None,
+        return_logprob=False,
+        return_sampling_mask=False,
+        grammar=None,
+        bootstrap_host="10.0.0.1",
+        disagg_kv_sender=SimpleNamespace(
+            kv_mgr=kv_mgr,
+            bootstrap_room=room,
+            supports_host_tensor_indices=True,
+            _early_send_wait_event=None,
+        ),
+    )
+    fields.update(overrides)
+    return SimpleNamespace(**fields)
+
+
+def _launched(reqs, forward_iter, chunked_req=None):
+    return SimpleNamespace(
+        reqs=reqs, forward_iter=forward_iter, chunked_req=chunked_req
+    )
+
+
+def _sampled(*token_ids, customized_info=None):
+    return SimpleNamespace(
+        next_token_ids=torch.tensor(token_ids),
+        logits_output=SimpleNamespace(customized_info=customized_info),
+    )
+
+
+class TestPPPrefillEarlySend(CustomTestCase):
+    def test_stage_sends_last_chunk_at_its_forward_and_leaves_aux_to_last_stage(self):
+        done = _early_req("done", 1)
+        chunked = _early_req("chunked", 2, extend_end=4)
+        logprob = _early_req("logprob", 3, return_logprob=True)
+        aborted = _early_req("aborted", 4, to_finish=FINISH_ABORT("abort"))
+        batch = _launched([done, chunked, logprob, aborted], 5, chunked_req=chunked)
+        launch_event = _ForwardEvent()
+
+        # A stage before the last sends now, fenced on its forward, without aux.
+        stage = _PPEarlySendScheduler(is_last_rank=False)
+        stage._pp_pd_early_send_last_chunks(batch, None, launch_event)
+        no_aux = dict(first_output_id=None, send_aux=False)
+        self.assertEqual(stage.sent, [("done", True, no_aux, launch_event)])
+        self.assertEqual(stage.disagg_prefill_early_sent_rids, {"done"})
+
+        # The last stage waits for its forward's first token, then sends it as aux.
+        last = _PPEarlySendScheduler(is_last_rank=True)
+        last._pp_pd_early_send_last_chunks(batch, _sampled(7, 8, 9, 10), launch_event)
+        last._pp_pd_flush_early_sends()
+        self.assertEqual(last.sent, [])
+        ((_, ready, _, _),) = last.disagg_prefill_early_send_pending
+        ready.ready = True
+        last._pp_pd_flush_early_sends()
+        self.assertEqual(
+            last.sent, [("done", True, dict(first_output_id=7, send_aux=True), None)]
+        )
+        self.assertFalse(last.disagg_prefill_early_send_pending)
+
+        # Customized info only exists with the result: that batch keeps its path.
+        last = _PPEarlySendScheduler(is_last_rank=True)
+        last._pp_pd_early_send_last_chunks(
+            batch, _sampled(7, 8, 9, 10, customized_info={"k": [1]}), launch_event
+        )
+        self.assertFalse(last.disagg_prefill_early_send_pending)
+
+        # Before a micro-batch's result its sends are forced out; an abort that
+        # arrived since launch leaves the request to the result path.
+        last = _PPEarlySendScheduler(is_last_rank=True)
+        late = _early_req("late", 5)
+        last._pp_pd_early_send_last_chunks(
+            _launched([done, late], 6), _sampled(3, 4), launch_event
+        )
+        late.to_finish = FINISH_ABORT("abort")
+        last._pp_pd_flush_early_sends(block_upto_forward_iter=5)
+        self.assertEqual(last.sent, [])
+        last._pp_pd_flush_early_sends(block_upto_forward_iter=6)
+        self.assertEqual([s[0] for s in last.sent], ["done"])
+        self.assertEqual(last.sent[0][2], dict(first_output_id=3, send_aux=True))
+
+    def test_stage_keeps_the_aux_for_a_pp_matched_decode(self):
+        # A decode rank holding only this stage's layers reads its aux from this
+        # stage, so the request keeps the result path, which sends the aux.
+        matched = _early_req("matched", 1, pulls_every_stage=False)
+        stage = _PPEarlySendScheduler(is_last_rank=False)
+        stage._pp_pd_early_send_last_chunks(
+            _launched([matched], 1), None, _ForwardEvent()
+        )
+        self.assertEqual(stage.sent, [])
+        self.assertEqual(stage.disagg_prefill_early_sent_rids, set())
+
+        def manager(local_layers, *peer_layers):
+            infos = {
+                f"s{i}": SimpleNamespace(is_dummy=False, mooncake_session_id=f"s{i}")
+                for i in range(len(peer_layers))
+            }
+            return SimpleNamespace(
+                kv_args=SimpleNamespace(kv_layer_ids=local_layers),
+                transfer_infos={7: infos},
+                decode_kv_args_table={
+                    f"s{i}": SimpleNamespace(dst_kv_layer_ids=layers)
+                    for i, layers in enumerate(peer_layers)
+                },
+            )
+
+        pulls = MooncakeKVManager.decode_pulls_every_pp_stage
+        # Decode without PP holds every layer: it pulls every prefill stage.
+        self.assertTrue(pulls(manager([0, 1], list(range(8))), 7))
+        # A PP-matched decode rank holds only this stage's layers.
+        self.assertFalse(pulls(manager([0, 1], list(range(8)), [0, 1]), 7))
+        # Unknown peers or rooms keep the aux on this stage.
+        self.assertFalse(pulls(manager([0, 1], []), 7))
+        self.assertFalse(pulls(manager([0, 1], list(range(8))), 8))
+
+    def test_result_skips_the_early_sent_chunk_after_its_transfer_ends(self):
+        stage = _PPEarlySendScheduler(is_last_rank=False)
+        req = _early_req("r", 1, status=KVPoll.Transferring)
+        self.assertFalse(stage._settle_early_sent_last_chunk(req, forget=True))
+        stage.disagg_prefill_early_sent_rids.add("r")
+
+        # The checkpoint after it may dedupe (free) pages the transfer still reads.
+        def finish():
+            time.sleep(0.05)
+            req.disagg_kv_sender.kv_mgr.request_status[1] = KVPoll.Success
+
+        threading.Thread(target=finish).start()
+        start = time.monotonic()
+        self.assertTrue(stage._settle_early_sent_last_chunk(req, forget=True))
+        self.assertGreaterEqual(time.monotonic() - start, 0.04)
+        self.assertEqual(stage.disagg_prefill_early_send_stats["waited"], 1)
+        self.assertFalse(stage._settle_early_sent_last_chunk(req, forget=True))
+
+    def test_gate_is_off_by_default_and_needs_pp_mooncake_and_aux_free_results(self):
+        stage = _PPEarlySendScheduler(is_last_rank=False)
+        stage.kv_checksum_computer = None
+        stage.enable_staging = False
+        stage.enable_unified_cache_external_linker = False
+        stage.spec_algorithm = SpeculativeAlgorithm.NONE
+        with published_topology(pp_size=2):
+            self.assertFalse(stage._pp_pd_early_send_enabled())
+            with envs.SGLANG_PP_PD_PREFILL_EARLY_SEND.override(True):
+                self.assertTrue(stage._pp_pd_early_send_enabled())
+                stage.spec_algorithm = SpeculativeAlgorithm.EAGLE
+                self.assertFalse(stage._pp_pd_early_send_enabled())
+        with published_topology(pp_size=1):
+            with envs.SGLANG_PP_PD_PREFILL_EARLY_SEND.override(True):
+                stage.spec_algorithm = SpeculativeAlgorithm.NONE
+                self.assertFalse(stage._pp_pd_early_send_enabled())
 
 
 if __name__ == "__main__":
