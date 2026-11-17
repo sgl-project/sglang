@@ -64,6 +64,8 @@ def _read_config_file(path: str) -> str:
                 raise WatermarkConfigError(
                     "watermark config must be a readable regular file"
                 )
+            if file_stat.st_size > _MAX_CONFIG_BYTES:
+                raise WatermarkConfigError("watermark config exceeds 4096 bytes")
             if stat.S_IMODE(file_stat.st_mode) & 0o077:
                 logger.warning(
                     "watermark config is readable by group or other users; "
@@ -105,12 +107,24 @@ def load_watermark_config(source: str) -> WatermarkServerConfig:
         raise WatermarkConfigError(
             "watermark config context_window must be an integer from 1 to 64"
         )
-    for name in ("mixing_probability", "max_probability"):
-        value = raw.get(name)
-        if value is not None and (
-            isinstance(value, bool) or not isinstance(value, (int, float))
-        ):
-            raise WatermarkConfigError(f"watermark config {name} must be a number")
+    mixing_probability = raw.get("mixing_probability")
+    if mixing_probability is not None and (
+        isinstance(mixing_probability, bool)
+        or not isinstance(mixing_probability, (int, float))
+        or not 0 < mixing_probability < 1
+    ):
+        raise WatermarkConfigError(
+            "watermark config mixing_probability must be a number strictly between 0 and 1"
+        )
+    max_probability = raw.get("max_probability")
+    if max_probability is not None and (
+        isinstance(max_probability, bool)
+        or not isinstance(max_probability, (int, float))
+        or not 0 < max_probability <= 1
+    ):
+        raise WatermarkConfigError(
+            "watermark config max_probability must be a number greater than 0 and at most 1"
+        )
     for name in ("default_enabled", "enforce_all"):
         if raw.get(name) is not None and not isinstance(raw[name], bool):
             raise WatermarkConfigError(f"watermark config {name} must be a boolean")

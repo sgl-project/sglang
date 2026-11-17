@@ -57,7 +57,7 @@ def position_coin(key_a: int, key_b: int, context_hash: int) -> int:
 
 
 def _gamma_log_survival(score: float, shape: int) -> float:
-    if score == 0:
+    if score <= 0:
         return 0.0
     log_score = math.log(score)
     terms = [k * log_score - math.lgamma(k + 1) for k in range(shape)]
@@ -109,6 +109,8 @@ class Tokenizer(Protocol):
 
 
 def _validate_token_ids(values: Iterable[int]) -> list[int]:
+    if isinstance(values, (str, bytes, bytearray)):
+        raise ValueError("token IDs must be unsigned 32-bit integers")
     token_ids = []
     for value in values:
         if (
@@ -237,11 +239,13 @@ def detect(
     prompt_token_ids: Iterable[int] = (),
     mixing_probability: float = 0.5,
     context_window: int = 4,
+    max_contexts: int = MAX_WATERMARKED_CONTEXTS_PER_REQUEST,
 ) -> WatermarkDetection:
     detector = WatermarkDetector(
         key,
         key_b=key_b,
         mixing_probability=mixing_probability,
         context_window=context_window,
+        max_contexts=max_contexts,
     )
     return detector.detect_tokens(token_ids, prompt_token_ids=prompt_token_ids)
