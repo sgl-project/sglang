@@ -275,6 +275,7 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
         """BF16, channel FP8/INT8 and W4A16 must propagate the activation protocol
         down to the actual launch."""
         from sglang.kernels.ops.moe import ep_moe_kernels as kernels
+        from sglang.srt.environ import envs
         from sglang.srt.hardware_backend.sail.moe import activations as sail_activations
         from sglang.srt.hardware_backend.sail.moe import deepgemm_ep as ep_module
         from sglang.srt.layers.moe.moe_runner import deep_gemm as runner_module
@@ -320,7 +321,7 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
                     else:
                         activation = lhs[0] if isinstance(lhs, tuple) else lhs
                         out.copy_(activation[..., : out.shape[-1]])
-                    return (16, 1)
+                    return None if variant == "w4a16" else (16, 1)
 
                 with ExitStack() as stack:
                     stack.enter_context(self.subTest(variant=variant, alpha=alpha))
@@ -344,6 +345,11 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
                         )
                     )
                     stack.enter_context(patch.object(kernels, "_is_sail", True))
+                    stack.enter_context(
+                        envs.SGLANG_SAIL_SILU_MUL_MASKED_QUANT_FP8_CHANNEL_CUDA.override(
+                            False
+                        )
+                    )
                     kernel_module, kernel = (
                         (kernels, "_silu_and_mul_post_quant_kernel_sail")
                         if variant in ("channel", "int8")
@@ -369,7 +375,8 @@ class TestDeepGemmMaskedActivationContract(CustomTestCase):
                     result = runner.run(payload, quant, state).hidden_states
                 torch.testing.assert_close(result, torch.full_like(result, 2))
                 self.assertEqual(
-                    state["meta_overlap_args"], {"block_m": 16, "threshold": 1}
+                    state["meta_overlap_args"],
+                    {} if variant == "w4a16" else {"block_m": 16, "threshold": 1},
                 )
                 self.assertEqual(len(launches), 1)
                 grid, kw = launches[0]
