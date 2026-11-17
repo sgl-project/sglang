@@ -5,7 +5,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=4, suite="jit-kernel-unit-test-amd")
+register_amd_ci(est_time=4, suite="base-a-jit-kernel-unit-test-amd")
 
 DEVICE = "cuda"
 
