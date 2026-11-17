@@ -16,11 +16,13 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchAck
+from sglang.srt.mem_cache import storage_key_binding
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
 )
 from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
+from sglang.srt.mem_cache.events import KVCacheEventRecorder, _StorageEventSpan
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorage,
@@ -124,6 +126,33 @@ class TestPPPrefetchTicket(CustomTestCase):
         with self.assertRaises(NotImplementedError):
             HiCacheStorage.confirm_lookup(None, [], [], 0, None, "scope")
 
+    @patch.object(storage_key_binding, "_event_namespace_seed", None)
+    def test_namespaced_storage_binding_matches_published_events(self):
+        """Salted and adapter-scoped hints must identify the published pages."""
+        recorder = KVCacheEventRecorder(enabled=True, page_size=2, dynamo_format=True)
+        for salt, extra_key in (
+            ("tenant-a", None),
+            (None, "adapter"),
+            ("租户-α", "adapter"),
+        ):
+            with self.subTest(salt=salt, extra_key=extra_key):
+                key = RadixKey(
+                    array("q", range(1, 9)), extra_key=extra_key, cache_salt=salt
+                )
+                storage = get_storage_hash_str(key, page_size=2)
+                published = recorder.storage_metadata(_StorageEventSpan(key))
+                mapping = storage_key_to_event_hashes(
+                    key[4:], 2, list(key.raw_token_ids()[:4]), storage[1]
+                )
+                self.assertEqual(
+                    mapping,
+                    {
+                        page: published[page].block_hashes[0] & ((1 << 64) - 1)
+                        for page in storage[2:]
+                    },
+                )
+
+    @patch.object(storage_key_binding, "_event_namespace_seed", None)
     def test_storage_binding_rejects_unproven_namespace_prefix(self):
         key = RadixKey(array("q", range(8)), extra_key="adapter", cache_salt="tenant")
         storage = get_storage_hash_str(key, page_size=2)
@@ -180,6 +209,7 @@ class TestPPPrefetchTicket(CustomTestCase):
         )
         self.assertEqual(cache.query_storage_hit_length(0, list(range(8))), 0)
 
+    @patch.object(storage_key_binding, "_event_namespace_seed", None)
     def test_salted_decode_probe_binds_the_complete_prefix(self):
         key = RadixKey(array("q", range(16)), cache_salt="tenant-a")
         storage = get_storage_hash_str(key, page_size=4)
