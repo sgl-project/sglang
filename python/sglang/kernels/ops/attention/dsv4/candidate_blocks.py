@@ -159,6 +159,38 @@ def candidate_block_mask(
     return keep[..., :num_blocks].repeat_interleave(block_size, dim=-1)[..., :width]
 
 
+@triton.jit
+def _xpu_candidate_block_scores(
+    LOGITS,
+    LENGTHS,
+    OUTPUT,
+    WIDTH: tl.constexpr,
+    SCORE_ROW_STRIDE: tl.constexpr,
+    SCORE_COL_STRIDE: tl.constexpr,
+    NUM_BLOCKS: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    BLOCK_ELEMENTS: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    blocks = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    offsets = tl.arange(0, BLOCK_ELEMENTS)
+    positions = blocks[:, None] * BLOCK_SIZE + offsets[None, :]
+    scores = tl.load(
+        LOGITS + row * SCORE_ROW_STRIDE + positions * SCORE_COL_STRIDE,
+        (blocks[:, None] < NUM_BLOCKS)
+        & (offsets[None, :] < BLOCK_SIZE)
+        & (positions < WIDTH),
+        -float("inf"),
+    ).to(tl.float32)
+    maxima = tl.max(scores, axis=1)
+    length = tl.load(LENGTHS + row)
+    maxima = tl.where(
+        (length > 0) & (blocks == (length - 1) // BLOCK_SIZE), float("inf"), maxima
+    )
+    tl.store(OUTPUT + row * NUM_BLOCKS + blocks, maxima, blocks < NUM_BLOCKS)
+
+
 def select_candidate_block_ids(
     logits: torch.Tensor,
     compress_lens: Union[torch.Tensor, int],
@@ -170,6 +202,47 @@ def select_candidate_block_ids(
     ``[rows, min(topk_blocks, blocks)]``, unordered, ``-1`` past the finite blocks.
     ``logits`` must be ``-inf`` past each row's causal length."""
     width = logits.size(-1)
+    if logits.device.type == "xpu":
+        from sgl_kernel import topk_among_blocks as xpu_topk_among_blocks
+
+        assert logits.ndim == 2 and block_size > 0
+        rows = logits.shape[0]
+        num_blocks = triton.cdiv(width, block_size)
+        count = min(topk_blocks, num_blocks)
+        if rows == 0 or count == 0:
+            return torch.empty((rows, count), dtype=torch.int32, device=logits.device)
+        lengths = (
+            torch.as_tensor(compress_lens, device=logits.device)
+            .expand(rows, 1)
+            .reshape(-1)
+            .contiguous()
+        )
+        block_scores = torch.empty(
+            (rows, num_blocks), dtype=torch.float32, device=logits.device
+        )
+        _xpu_candidate_block_scores[(rows, triton.cdiv(num_blocks, 128))](
+            logits,
+            lengths,
+            block_scores,
+            width,
+            logits.stride(0),
+            logits.stride(1),
+            num_blocks,
+            block_size,
+            triton.next_power_of_2(block_size),
+            128,
+        )
+        candidates = (
+            torch.arange(num_blocks, dtype=torch.int32, device=logits.device)
+            .expand(rows, -1)
+            .contiguous()
+        )
+        block_lengths = torch.full(
+            (rows,), num_blocks, dtype=torch.int64, device=logits.device
+        )
+        return xpu_topk_among_blocks(
+            block_scores, block_lengths, candidates, count, 1
+        ).to(torch.int32)
     padding = -width % block_size
     scores = F.pad(logits, (0, padding), value=-torch.inf) if padding else logits
     scores = scores.unflatten(-1, (-1, block_size)).amax(dim=-1)
@@ -192,6 +265,10 @@ def topk_among_blocks(
     """Top-``k`` of each row of ``scores`` ``[rows, width]`` within its ``blocks``
     ``[rows, n]`` (``-1`` padded) and its causal ``lens``: int64 ``[rows, k]``
     positions, unordered, ``-1`` where fewer than ``k`` candidates are finite."""
+    if scores.device.type == "xpu":
+        from sgl_kernel import topk_among_blocks as xpu_topk_among_blocks
+
+        return xpu_topk_among_blocks(scores, lens, blocks, k, block_size)
     rows, width = scores.shape
     n = blocks.shape[1]
     if width == 0 or n == 0:

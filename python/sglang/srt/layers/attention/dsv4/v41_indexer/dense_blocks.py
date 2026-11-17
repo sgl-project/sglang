@@ -7,6 +7,8 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import msgspec
 import torch
+import triton
+import triton.language as tl
 
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     amax_topk_blocks,
@@ -16,12 +18,17 @@ from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     topk_among_blocks,
 )
 from sglang.kernels.ops.attention.dsv4.index_logits import FLAT_LOGITS_WIDTH_ALIGN
+from sglang.srt.layers.attention.dsv4.metadata import expand_index_page_table
+from sglang.srt.utils import is_xpu
 
 from .scoring import (
     DeepGEMMPrefillData,
     PagedDecodeScores,
+    _index_q_and_weights,
     decode_scores,
+    get_deep_gemm_decode_data,
     get_deep_gemm_prefill_data,
+    get_index_k_cache,
     prefill_requests,
     score_tiles,
     select_decode,
@@ -38,6 +45,46 @@ from .types import (
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
+
+
+@triton.jit
+def _xpu_write_candidate_selection(
+    INDICES,
+    PAGE_TABLE,
+    OUT_PAGES,
+    OUT_RAW,
+    TOPK: tl.constexpr,
+    PAGE_STRIDE: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    OUT_PAGE_ROW_STRIDE: tl.constexpr,
+    OUT_PAGE_COL_STRIDE: tl.constexpr,
+    OUT_RAW_ROW_STRIDE: tl.constexpr,
+    OUT_RAW_COL_STRIDE: tl.constexpr,
+    WRITE_PAGES: tl.constexpr,
+    WRITE_RAW: tl.constexpr,
+    TILE: tl.constexpr,
+):
+    row = tl.program_id(0)
+    columns = tl.program_id(1) * TILE + tl.arange(0, TILE)
+    indices = tl.load(INDICES + row * TOPK + columns, columns < TOPK, -1)
+    if WRITE_PAGES:
+        page = tl.load(
+            PAGE_TABLE + row * PAGE_STRIDE + indices // PAGE_SIZE,
+            (columns < TOPK) & (indices >= 0),
+            0,
+        )
+        slots = page * PAGE_SIZE + indices % PAGE_SIZE
+        tl.store(
+            OUT_PAGES + row * OUT_PAGE_ROW_STRIDE + columns * OUT_PAGE_COL_STRIDE,
+            tl.where(indices >= 0, slots, -1),
+            columns < TOPK,
+        )
+    if WRITE_RAW:
+        tl.store(
+            OUT_RAW + row * OUT_RAW_ROW_STRIDE + columns * OUT_RAW_COL_STRIDE,
+            indices,
+            columns < TOPK,
+        )
 
 
 class BlockIds(CandidateMetadata, msgspec.Struct):
@@ -76,6 +123,8 @@ class DenseBlocksBackend:
         self.use_deep_gemm_prefill = use_deep_gemm_prefill
 
     def publish_prefill(self, inputs: PrefillInputs):
+        if is_xpu():
+            return self._xpu_publish_prefill(inputs)
         if self.use_deep_gemm_prefill:
             return self._deep_gemm_publish_prefill(inputs)
         return self._torch_publish_prefill(inputs)
@@ -85,12 +134,18 @@ class DenseBlocksBackend:
         inputs: PrefillInputs,
         published: Optional[BlockIds],
     ) -> None:
+        if is_xpu():
+            assert published is not None
+            self._xpu_consume_prefill(inputs, published)
+            return
         if self.use_deep_gemm_prefill:
             self._deep_gemm_consume_prefill(inputs, published)
         else:
             self._torch_consume_prefill(inputs, published)
 
     def publish_decode(self, inputs: DecodeInputs):
+        if is_xpu():
+            return self._xpu_decode(inputs, None)
         d = decode_scores(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
@@ -124,6 +179,10 @@ class DenseBlocksBackend:
         inputs: DecodeInputs,
         published: Optional[BlockIds],
     ) -> None:
+        if is_xpu():
+            assert published is not None
+            self._xpu_decode(inputs, published)
+            return
         d = decode_scores(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
@@ -142,6 +201,219 @@ class DenseBlocksBackend:
             d.scores, d.lens, published.blocks, k, block_size=self.block_size
         )
         write_decode(inputs, d, idx.masked_fill(idx < 0, d.lmax))
+
+    def _xpu_paged_rows(
+        self,
+        q,
+        scales,
+        weights,
+        lengths,
+        cache,
+        page_table,
+        max_len,
+        page_size,
+        out_pages,
+        out_raw,
+        published_blocks,
+    ):
+        from sgl_kernel import (
+            fp4_paged_mqa_logits,
+            topk_transform,
+            topk_transform_ragged,
+        )
+
+        rows = q.shape[0]
+        result = None
+        if published_blocks is None:
+            result = torch.full(
+                (rows, min(self.topk_blocks, triton.cdiv(max_len, self.block_size))),
+                -1,
+                dtype=torch.int32,
+                device=q.device,
+            )
+        if rows == 0 or max_len == 0:
+            return result
+        topk = out_raw.shape[1] if out_raw is not None else out_pages.shape[1]
+        rows_per_chunk = max(1, (64 << 20) // max(max_len * 4, 1))
+        for start in range(0, rows, rows_per_chunk):
+            end = min(start + rows_per_chunk, rows)
+            chunk_lengths = lengths[start:end].to(torch.int32).contiguous()
+            chunk_pages = page_table[start:end].to(torch.int32).contiguous()
+            scores = fp4_paged_mqa_logits(
+                (q[start:end], scales[start:end]),
+                cache,
+                weights[start:end].float(),
+                chunk_lengths,
+                chunk_pages,
+                None,
+                max_len,
+                clean_logits=False,
+            )
+            if result is not None:
+                visible = (
+                    torch.arange(max_len, device=q.device)[None, :]
+                    < chunk_lengths[:, None]
+                )
+                scores = scores.masked_fill(~visible, -torch.inf)
+                result[start:end] = select_candidate_block_ids(
+                    scores, chunk_lengths[:, None], self.topk_blocks, self.block_size
+                )
+                if out_pages is not None:
+                    topk_transform(
+                        scores,
+                        chunk_lengths,
+                        chunk_pages,
+                        out_pages[start:end],
+                        page_size,
+                        out_raw[start:end] if out_raw is not None else None,
+                    )
+                else:
+                    assert out_raw is not None
+                    topk_transform_ragged(
+                        scores,
+                        chunk_lengths,
+                        out_raw[start:end],
+                        torch.zeros_like(chunk_lengths),
+                    )
+                continue
+
+            selected = topk_among_blocks(
+                scores,
+                chunk_lengths,
+                published_blocks[start:end],
+                topk,
+                block_size=self.block_size,
+            )
+            if topk:
+                page_out = out_pages[start:end] if out_pages is not None else None
+                raw_out = out_raw[start:end] if out_raw is not None else None
+                _xpu_write_candidate_selection[(end - start, triton.cdiv(topk, 256))](
+                    selected,
+                    chunk_pages,
+                    page_out,
+                    raw_out,
+                    topk,
+                    chunk_pages.stride(0),
+                    page_size,
+                    page_out.stride(0) if page_out is not None else 0,
+                    page_out.stride(1) if page_out is not None else 0,
+                    raw_out.stride(0) if raw_out is not None else 0,
+                    raw_out.stride(1) if raw_out is not None else 0,
+                    page_out is not None,
+                    raw_out is not None,
+                    256,
+                )
+        return result
+
+    def _xpu_publish_prefill(self, inputs: PrefillInputs):
+        return self._xpu_prefill_impl(inputs, None)
+
+    def _xpu_consume_prefill(self, inputs: PrefillInputs, published: BlockIds) -> None:
+        self._xpu_prefill_impl(inputs, published)
+
+    def _xpu_prefill_impl(self, inputs: PrefillInputs, published: Optional[BlockIds]):
+        inputs.reset_outputs()
+        assert inputs.seq_lens_cpu is not None and inputs.rows_per_request is not None
+        rows = inputs.positions.numel()
+        max_len = max(
+            (length // inputs.compress_ratio for length in inputs.seq_lens_cpu),
+            default=0,
+        )
+        if published is None:
+            blocks = torch.full(
+                (rows, min(self.topk_blocks, triton.cdiv(max_len, self.block_size))),
+                -1,
+                dtype=torch.int32,
+                device=inputs.positions.device,
+            )
+        else:
+            assert published.blocks.shape[0] == rows
+            blocks = published.blocks
+        if rows == 0 or max_len == 0:
+            if published is None:
+                return BlockIds(blocks=blocks, rows_per_request=inputs.rows_per_request)
+            return None
+        q, scales, weights = _index_q_and_weights(
+            indexer=inputs.indexer,
+            x=inputs.x,
+            q_lora=inputs.q_lora,
+            freqs_cis=inputs.freqs_cis,
+            positions=inputs.positions,
+        )
+        lengths = ((inputs.positions + 1) // inputs.compress_ratio).to(torch.int32)
+        page_size = self.token_to_kv_pool.get_index_k_page_size(inputs.compress_ratio)
+        pages = expand_index_page_table(
+            inputs.kv_page_table,
+            full_page_size=self.token_to_kv_pool.page_size,
+            compress_ratio=inputs.compress_ratio,
+            index_page_size=page_size,
+        )
+        cache = get_index_k_cache(
+            token_to_kv_pool=self.token_to_kv_pool,
+            layer_id=inputs.layer_id,
+            page_size=page_size,
+        )
+        start = 0
+        for request, request_rows in enumerate(inputs.rows_per_request):
+            end = start + request_rows
+            if request_rows:
+                published_chunk = None if published is None else blocks[start:end]
+                result = self._xpu_paged_rows(
+                    q[start:end].unsqueeze(1),
+                    scales[start:end].unsqueeze(1),
+                    weights[start:end],
+                    lengths[start:end],
+                    cache,
+                    pages[request : request + 1].expand(request_rows, -1),
+                    max_len,
+                    page_size,
+                    (
+                        inputs.out_page_indices[start:end]
+                        if inputs.out_page_indices is not None
+                        else None
+                    ),
+                    inputs.out_raw_indices[start:end],
+                    published_chunk,
+                )
+                if published is None:
+                    blocks[start:end].copy_(result)
+            start = end
+        assert start == rows
+        if published is None:
+            return BlockIds(blocks=blocks, rows_per_request=inputs.rows_per_request)
+        return None
+
+    def _xpu_decode(self, inputs: DecodeInputs, published: Optional[BlockIds]):
+        inputs.reset_outputs()
+        metadata = inputs.paged_metadata
+        rows = inputs.positions.numel()
+        if published is not None:
+            assert published.blocks.shape[0] == rows
+        if rows == 0 or metadata.max_compressed_seq_len == 0:
+            if published is None:
+                return BlockIds(
+                    blocks=torch.empty(
+                        (rows, 0), dtype=torch.int32, device=inputs.positions.device
+                    )
+                )
+            return None
+        data = get_deep_gemm_decode_data(inputs, self.token_to_kv_pool)
+        n = metadata.rows_per_request
+        pages = metadata.page_table[::n].repeat_interleave(n, dim=0).contiguous()
+        blocks = self._xpu_paged_rows(
+            data.q_fp4,
+            data.q_sf,
+            data.weights,
+            metadata.compressed_seq_lens.reshape(-1),
+            data.k_cache,
+            pages,
+            metadata.max_compressed_seq_len,
+            metadata.compressed_page_size,
+            inputs.out_page_indices,
+            None,
+            None if published is None else published.blocks,
+        )
+        return BlockIds(blocks=blocks) if published is None else None
 
     # ---------- DeepGEMM: flattened-K scores ----------
 
