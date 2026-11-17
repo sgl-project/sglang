@@ -172,7 +172,7 @@ Before H2D or D2H, both index lists keep positions owned by this rank and map `i
 
 The current scope is MLA L1/L2. L3, LMCache, HiSparse, non-MLA KV host pools, speculative decoding, and PD decode are not supported in this combination.
 
-### DCP × DSA (GLM-5 family)
+### DCP × DSA (GLM-5.2, GLM-5.3)
 
 DeepSeek Sparse Attention attends over a top-k slice of the context, so DCP keeps the target's latent KV striped by position while the **index-K cache stays replicated** on every rank: each rank scores the whole sequence, takes the global top-k, and attends over the selected slots it owns. Decode, target verify and extend all follow the same path, so the prefix KV is never gathered.
 
