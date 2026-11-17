@@ -210,7 +210,7 @@ from sglang.srt.utils import (
     is_mps,
     kill_process_tree,
 )
-from sglang.srt.utils.auth import add_api_key_middleware
+from sglang.srt.utils.auth import add_api_key_middleware, warn_single_key_admin_optional
 from sglang.srt.utils.json_response import (
     SGLangORJSONResponse,
     dumps_json,
@@ -3008,6 +3008,10 @@ def _setup_and_run_http_server(
     try:
         # Update logging configs
         set_uvicorn_logging_configs(server_args)
+
+        warn_single_key_admin_optional(
+            get_serving().api_key, get_serving().admin_api_key
+        )
 
         if get_serving().ssl_certfile:
             logger.info(
