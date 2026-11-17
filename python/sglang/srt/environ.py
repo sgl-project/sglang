@@ -365,6 +365,11 @@ class Envs:
     # ASGI import string that multi-worker Uvicorn and Granian processes load;
     # point it at an app that extends `http_server.app` with extra routes.
     SGLANG_HTTP_SERVER_APP_PATH = EnvStr("sglang.srt.entrypoints.http_server:app")
+    SGLANG_OLLAMA_ROOT_ROUTE = EnvStr(None)
+    SGLANG_OLLAMA_CHAT_ROUTE = EnvStr("/api/chat")
+    SGLANG_OLLAMA_GENERATE_ROUTE = EnvStr("/api/generate")
+    SGLANG_OLLAMA_TAGS_ROUTE = EnvStr("/api/tags")
+    SGLANG_OLLAMA_SHOW_ROUTE = EnvStr("/api/show")
     SGLANG_ENABLE_HEALTH_ENDPOINT_GENERATION = EnvBool(True)
     SGLANG_EXPOSE_OWN_ENV_VARS = EnvBool(False)
     SGLANG_DIAG_BYPASS_HEALTH_GENERATE = EnvBool(False)
@@ -2019,6 +2024,8 @@ class Envs:
     # Shorter prompts use the single-call encode; below this the gain is eaten
     # by rayon dispatch and the id merge.
     SGLANG_PARALLEL_PROMPT_ENCODE_MIN_CHARS = EnvInt(32768)
+    SGLANG_CPU_WORKERS = EnvInt(None)
+    SGLANG_IO_WORKERS = EnvInt(0)
     SGLANG_REQUEST_STATE_WAIT_TIMEOUT = EnvInt(4)
     SGLANG_DEFAULT_THINKING = EnvBool(False)
 

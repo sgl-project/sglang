@@ -60,8 +60,6 @@ RUST_SERVER_LAUNCH_SOURCES: Tuple[Tuple[Path, Optional[Tuple[str, ...]]], ...] =
 RUST_SERVER_IGNORED_BY_DESIGN: Dict[str, str] = {
     "SGLANG_RUST_SERVER": "The frontend selector itself.",
     # Python's own process, thread and event-loop plumbing.
-    "SGLANG_CPU_WORKERS": "Sizes Python's multimodal process pool; Rust MM workers follow --mm-processor-worker-num.",
-    "SGLANG_IO_WORKERS": "Sizes Python's media-loading pool; the Rust MM workers load media themselves.",
     "rl_on_policy_target": "Puts Python's fast image processor on CPU and caps its workers; the Rust resize runs on CPU.",
     "mm_feature_transport": "Python's feature transport; Rust pipelines pick their own.",
     "trust_remote_code": "Rust tokenizes with tokenizer.json; no tokenizer code is loaded.",
@@ -70,11 +68,6 @@ RUST_SERVER_IGNORED_BY_DESIGN: Dict[str, str] = {
     # The Python HTTP server.
     "grpc_worker_threads": "Python gRPC server thread pool.",
     # Routes the Rust server does not serve: their clients get a 404.
-    "SGLANG_OLLAMA_ROOT_ROUTE": "Ollama routes are not served.",
-    "SGLANG_OLLAMA_CHAT_ROUTE": "Ollama routes are not served.",
-    "SGLANG_OLLAMA_GENERATE_ROUTE": "Ollama routes are not served.",
-    "SGLANG_OLLAMA_TAGS_ROUTE": "Ollama routes are not served.",
-    "SGLANG_OLLAMA_SHOW_ROUTE": "Ollama routes are not served.",
     "asr_max_concurrent_sessions": "/v1/realtime is not served.",
     "enable_response_store": "/v1/responses is not served.",
     "tool_server": "/v1/responses is not served.",
@@ -132,6 +125,13 @@ RUST_SERVER_HANDLED_ELSEWHERE: Dict[str, str] = {
     "SGLANG_MM_AVOID_RETOKENIZE": "Refused when explicitly configured (rust_server_unsupported_args).",
     "SGLANG_BATCH_TOKENIZER_OUTPUTS": "Refused when explicitly configured (rust_server_unsupported_args).",
     "SGLANG_ENABLE_COLOCATED_BATCH_GEN": "Refused when explicitly configured: Rust does not send the Python batch blocker markers (rust_server_unsupported_args).",
+    "SGLANG_CPU_WORKERS": "Refused when explicitly configured (rust_server_unsupported_args).",
+    "SGLANG_IO_WORKERS": "Refused when explicitly configured (rust_server_unsupported_args).",
+    "SGLANG_OLLAMA_ROOT_ROUTE": "Refused when explicitly configured (rust_server_unsupported_args).",
+    "SGLANG_OLLAMA_CHAT_ROUTE": "Refused when explicitly configured (rust_server_unsupported_args).",
+    "SGLANG_OLLAMA_GENERATE_ROUTE": "Refused when explicitly configured (rust_server_unsupported_args).",
+    "SGLANG_OLLAMA_TAGS_ROUTE": "Refused when explicitly configured (rust_server_unsupported_args).",
+    "SGLANG_OLLAMA_SHOW_ROUTE": "Refused when explicitly configured (rust_server_unsupported_args).",
     "grammar_backend": "Per-turn Beam grammar is refused while scheduler grammar remains supported (rust_server_unsupported_args).",
     "context_length": "Passed as model_config.context_len (_build_server_args).",
     "language_model_only": "Passed as model_config.is_multimodal (_build_server_args).",
