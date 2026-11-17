@@ -26,9 +26,13 @@ class PrefillReferenceTest(unittest.TestCase):
         adapter = ModuleType("row_metadata_test_adapter")
 
         def prefill_plan(
-            batch,
-            manager,
+            request_ids,
+            seq_lens,
+            request_map,
             total,
+            max_seq_len,
+            request_rows,
+            context_len,
             *,
             current_metadata=None,
             current_valid=None,
@@ -37,22 +41,20 @@ class PrefillReferenceTest(unittest.TestCase):
             if (current_metadata is None) != (current_valid is None):
                 raise ValueError("current metadata and validity must be paired")
             rows, positions = [], []
-            for req, length in zip(batch.req_pool_indices_cpu, batch.seq_lens_cpu):
+            for req, length in zip(request_ids, seq_lens):
                 if req >= 0 and length > 0:
                     rows.extend([int(req)] * int(length))
                     positions.extend(range(int(length)))
-            source = manager.host_source_indices(
-                torch.tensor(rows), torch.tensor(positions)
-            )
+            source = request_map[torch.tensor(rows), torch.tensor(positions)]
             current_mapping = None
             if current_metadata is not None and current_valid is not None:
-                n = batch.req_pool_indices_cpu.numel()
+                n = request_ids.numel()
                 starts, prefixes, extends, widths = current_metadata.split(n)
                 dst = torch.zeros(current_valid.numel(), dtype=torch.long)
                 eligible = torch.zeros_like(current_valid, dtype=torch.bool)
                 for i, (req, start, prefix, extend, width) in enumerate(
                     zip(
-                        batch.req_pool_indices_cpu.tolist(),
+                        request_ids.tolist(),
                         starts.tolist(),
                         prefixes.tolist(),
                         extends.tolist(),
@@ -62,11 +64,7 @@ class PrefillReferenceTest(unittest.TestCase):
                     for col in range(extend):
                         row = start + col
                         if req > 0:
-                            dst[row] = (
-                                sum(int(x) for x in batch.seq_lens_cpu[:i])
-                                + prefix
-                                + col
-                            )
+                            dst[row] = sum(int(x) for x in seq_lens[:i]) + prefix + col
                             eligible[row] = True
                 mask = eligible & current_valid.bool()
                 host_mask = torch.ones(total, dtype=torch.bool)
@@ -88,9 +86,7 @@ class PrefillReferenceTest(unittest.TestCase):
         self.enterContext(
             patch.dict(
                 sys.modules,
-                {
-                    "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.row_metadata": adapter
-                },
+                {"sgl_kernel_npu.sparsity_driven_kv_offload.row_metadata": adapter},
             )
         )
 
@@ -108,13 +104,11 @@ class TestLogicalPrefillPlan(PrefillReferenceTest):
         valid,
         dtype,
     ):
-        class Manager:
-            size = 8
-            max_context_len = 8
-            device = torch.device("cpu")
-
-            def host_source_indices(self, rows, positions):
-                return request_map[rows, positions]
+        manager = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(req_to_token=request_map),
+            actual_request_rows=request_map.shape[0],
+            logical_max_context_len=request_map.shape[1],
+        )
 
         batch = SimpleNamespace(
             req_pool_indices=torch.tensor(req),
@@ -149,7 +143,7 @@ class TestLogicalPrefillPlan(PrefillReferenceTest):
             current_row += width
             output_offset += length
         plan = module.make_fused_prefill_plan(
-            batch, Manager(), current_valid=torch.tensor(valid)
+            batch, manager, current_valid=torch.tensor(valid)
         )
         mapping = plan.current_mapping
         if mapping is None:
@@ -319,6 +313,8 @@ class TestWorkspaceLifecycle(PrefillReferenceTest):
             table = torch.tensor(
                 [[0, 1, 2, 3], [9, 3, 12, 5], [3, 7, 2, 8], [4, 6, 10, 11]]
             )
+            m.req_to_token_pool = SimpleNamespace(req_to_token=table)
+            m.actual_request_rows, m.logical_max_context_len = table.shape
             m.host_source_indices = lambda rows, pos: table[rows, pos]
             host = (
                 torch.arange(16 * 576, dtype=torch.float32)

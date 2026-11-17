@@ -24,6 +24,15 @@ register_cpu_ci(est_time=3, stage="base-a", runner_config="cpu")
 
 
 class TestLIMState(CustomTestCase):
+    def assert_buffers_match(self, owner, specs):
+        for name, spec in specs.items():
+            value = getattr(owner, name)
+            values = value if isinstance(value, list) else [value]
+            self.assertEqual(len(values), spec.count)
+            for tensor in values:
+                self.assertEqual(tuple(tensor.shape), spec.shape)
+                self.assertEqual(tensor.dtype, spec.dtype)
+
     def options(self, **kwargs):
         return dict(
             model_config=SimpleNamespace(
@@ -97,6 +106,11 @@ class TestLIMState(CustomTestCase):
         self.assertEqual(plan.managed_hbm_bytes - base.managed_hbm_bytes, 129 * 576 * 2)
         self.assertEqual(plan.prefill_workspace_bytes, 129 * 576 * 2)
         self.assertEqual(plan.copy_sfa_bytes, base.copy_sfa_bytes)
+        without_workspace = plan.without_prefill_workspace()
+        self.assertEqual(plan.prefill_workspace_tokens, 129)
+        self.assertIn("prefill_nope", plan.manager_buffers)
+        self.assertEqual(without_workspace.managed_hbm_bytes, base.managed_hbm_bytes)
+        self.assertNotIn("prefill_nope", without_workspace.manager_buffers)
         fitting = resolve_sparse_kv_budget(
             **self.options(
                 prefill_workspace_tokens=129, hbm_budget_bytes=plan.managed_hbm_bytes
@@ -143,17 +157,28 @@ class TestLIMState(CustomTestCase):
             )
             configurator = DefaultPoolConfigurator.__new__(DefaultPoolConfigurator)
             configurator._sparse_budget = plan
+            configurator._kvc = SimpleNamespace(
+                sparse_kv_budget_plan=plan, sparse_kv_budget_finalized=False
+            )
             configurator._sparse_min_tokens = 129
             configurator._cell_size = 8
             configurator._fixed_overhead_bytes = plan.managed_hbm_bytes
             required = plan.managed_hbm_bytes + 256 * 8
             result = configurator.calculate_pool_sizes(required - int(not fits), 128)
-            self.assertEqual(plan.prefill_workspace_tokens, 129 if fits else 0)
+            selected = configurator._kvc.sparse_kv_budget_plan
+            self.assertEqual(plan.prefill_workspace_tokens, 129)
+            self.assertEqual(selected.prefill_workspace_tokens, 129 if fits else 0)
             self.assertGreaterEqual(result.max_total_num_tokens, 256)
-            # Later recalculation cannot alter an already selected plan.
+            # A later configurator uses the shared finalized decision.
+            later = DefaultPoolConfigurator.__new__(DefaultPoolConfigurator)
+            later._kvc = configurator._kvc
+            later._sparse_budget = selected
+            later._sparse_min_tokens = 129
+            later._cell_size = 8
+            later._fixed_overhead_bytes = selected.managed_hbm_bytes
             with self.assertRaisesRegex(RuntimeError, "Not enough memory"):
-                configurator.calculate_pool_sizes(0, 128)
-            self.assertEqual(plan.prefill_workspace_tokens, 129 if fits else 0)
+                later.calculate_pool_sizes(0, 128)
+            self.assertIs(later._kvc.sparse_kv_budget_plan, selected)
 
     def test_graph_padding_grows_scratch_not_request_residency(self):
         small = resolve_sparse_kv_budget(
@@ -230,7 +255,7 @@ class TestLIMState(CustomTestCase):
                 if isinstance(t, torch.Tensor)
             )
             self.assertEqual(manager.budget.adapter_bytes, allocated)
-            manager.budget.validate_buffers(adapter, manager.budget.adapter_buffers)
+            self.assert_buffers_match(adapter, manager.budget.adapter_buffers)
             self.assertEqual(
                 adapter.query_ends.tolist(),
                 [[i * j for j in range(1, 9)] for i in range(1, width + 1)],
@@ -369,8 +394,8 @@ class TestLIMState(CustomTestCase):
                 req_pool, 2048, paged_kv_cache=pool
             )
         self.assertIs(manager.budget, plan)
-        plan.validate_buffers(manager, plan.manager_buffers)
-        plan.validate_buffers(manager.lim_adapter, plan.adapter_buffers)
+        self.assert_buffers_match(manager, plan.manager_buffers)
+        self.assert_buffers_match(manager.lim_adapter, plan.adapter_buffers)
         self.assertEqual(
             [tuple(component[0].shape) for component in manager.host_pool.buffers],
             [
@@ -395,7 +420,8 @@ class TestLIMState(CustomTestCase):
 
         self.assertEqual(
             actual_bytes(manager, plan.manager_buffers)
-            + actual_bytes(manager.lim_adapter, plan.adapter_buffers),
+            + actual_bytes(manager.lim_adapter, plan.adapter_buffers)
+            + plan.output_scratch_bytes,
             plan.managed_hbm_bytes,
         )
         self.assertFalse(hasattr(manager.lim_adapter, "key_scale"))
@@ -406,11 +432,6 @@ class TestLIMState(CustomTestCase):
             ).tolist(),
             [73, 73],
         )
-        original = manager.lim_adapter.source_ids
-        manager.lim_adapter.source_ids = original[:1]
-        with self.assertRaises(ValueError):
-            plan.validate_buffers(manager.lim_adapter, plan.adapter_buffers)
-        manager.lim_adapter.source_ids = original
         # Exercise both native boundaries: selecting column zero would silently
         # truncate the plan, while a framework unsqueeze would break CopySFA's ABI.
         rows = 2 * manager.max_query_width

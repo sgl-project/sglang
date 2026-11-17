@@ -293,7 +293,7 @@ class TestPDSplitKVPool(CustomTestCase):
         package = ModuleType("memfabric_hybrid")
         package.offload = offload
         row_module = ModuleType(
-            "sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.row_metadata"
+            "sgl_kernel_npu.sparsity_driven_kv_offload.row_metadata"
         )
         row_module.copy_rows_metadata = lambda s, d, si, di, valid: (
             s,

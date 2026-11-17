@@ -254,6 +254,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
 
     def __init__(self, kvc: KVCacheConfigurator):
         self._sparse_budget = None
+        self._kvc = kvc
         self.kv_cache_dtype_str = kvc.kv_cache_dtype_str
         dcp_size = get_parallel().attn_dcp_size
         # Determine effective number of layers for KV cache
@@ -789,7 +790,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         self, available_bytes: int, page_size: int
     ) -> MemoryPoolConfig:
         budget = self._sparse_budget
-        if budget is not None and not budget.prefill_workspace_sizing_finalized:
+        if budget is not None and not self._kvc.sparse_kv_budget_finalized:
             min_tokens = (
                 (self._sparse_min_tokens + page_size - 1) // page_size * page_size
             )
@@ -805,8 +806,9 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     available_bytes,
                 )
                 self._fixed_overhead_bytes -= budget.prefill_workspace_bytes
-                budget.disable_prefill_workspace()
-            budget.prefill_workspace_sizing_finalized = True
+                self._sparse_budget = budget.without_prefill_workspace()
+                self._kvc.sparse_kv_budget_plan = self._sparse_budget
+            self._kvc.sparse_kv_budget_finalized = True
         available_bytes = max(available_bytes - self._fixed_overhead_bytes, 0)
         max_total_num_tokens = (
             available_bytes // self._cell_size

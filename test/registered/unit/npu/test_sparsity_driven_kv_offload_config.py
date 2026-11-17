@@ -183,8 +183,8 @@ class TestSparsityDrivenKVOffloadConfig(CustomTestCase):
                     )
                     self.assertEqual(plan.copy_sfa_query_heads, native_heads)
                     self.assertEqual(
-                        plan.manager_buffers["fused_attn_out"].shape,
-                        (4, native_heads, 512),
+                        plan.output_scratch_bytes,
+                        4 * native_heads * 512 * 2,
                     )
                     self.assertNotIn("query_scale", plan.adapter_buffers)
 

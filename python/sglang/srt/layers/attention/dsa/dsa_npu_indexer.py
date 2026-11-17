@@ -310,14 +310,8 @@ class DSANPUIndexerMixin:
             )
 
             backend = get_attn_backend()
-            manager = getattr(backend, "sparse_kv_manager", None)
-            if (
-                manager is not None
-                and getattr(backend, "use_fused_sparse_kv", False)
-                and not is_prefill
-            ):
-                if use_quant_indexer:
-                    raise ValueError("Native LIM requires BF16 index keys.")
+            if not is_prefill and getattr(backend, "use_fused_sparse_kv", False):
+                manager = backend.sparse_kv_manager
                 plan = manager.lim_adapter.select(
                     manager,
                     query=q.view(-1, self.n_heads, self.head_dim),

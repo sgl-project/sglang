@@ -244,12 +244,16 @@ class FusedSparseKVCacheManager:
         )
         query_heads = query_nope.shape[1]
         current, positions, valid = current_inputs
-        padded_heads = self.fused_attn_out.shape[1]
+        padded_heads = self.budget.copy_sfa_query_heads
         if query_nope.shape[1] < padded_heads:
             padding = padded_heads - query_nope.shape[1]
             query_nope = torch.nn.functional.pad(query_nope, (0, 0, 0, padding))
             query_rope = torch.nn.functional.pad(query_rope, (0, 0, 0, padding))
-        output = self.fused_attn_out[:rows]
+        output = torch.empty(
+            (rows, padded_heads, self.kv_lora_rank),
+            dtype=query_nope.dtype,
+            device=query_nope.device,
+        )
         layer_idx = layer.layer_id - self.start_layer
         cache = self.device_kv_buffer[layer_idx].view(
             -1, self.page_size, self.head_num, self.kv_lora_rank
@@ -408,11 +412,7 @@ class FusedSparseKVCacheManager:
         """
         layer_id = layer.layer_id if hasattr(layer, "layer_id") else int(layer)
         layer_idx = layer_id - self.start_layer
-        device = (
-            forward_batch.req_pool_indices.device
-            if forward_batch.req_pool_indices.device.type == "npu"
-            else self.device
-        )
+        device = self.device
         if plan is not None:
             total = plan.total_tokens
             nope = self.prefill_nope[:total]

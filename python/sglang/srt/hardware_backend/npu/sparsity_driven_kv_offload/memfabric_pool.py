@@ -81,10 +81,6 @@ class MemFabricKVPool:
     def __init__(
         self, *, tokens, layers, page_size, head_num, widths, dtype, device, group
     ):
-        if tokens <= 0 or tokens % page_size or layers <= 0:
-            raise ValueError("MF split KV requires page-aligned token capacity")
-        if dtype not in (torch.float16, torch.bfloat16):
-            raise ValueError("MF split KV requires FP16 or BF16 storage")
         from memfabric_hybrid import offload
 
         self.offload = offload
@@ -153,7 +149,7 @@ class MemFabricKVPool:
         """Enqueue byte-addressed MF sparse copies on the current NPU stream."""
         if source_rows.numel() == 0:
             return
-        from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.row_metadata import (
+        from sgl_kernel_npu.sparsity_driven_kv_offload.row_metadata import (
             copy_rows_metadata,
         )
 

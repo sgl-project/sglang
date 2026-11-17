@@ -418,6 +418,7 @@ class KVCacheConfigurator:
     dflash_draft_loc_space_scale: int = field(init=False, default=1)
     draft_model_idx: Optional[int] = None
     sparse_kv_budget_plan: Optional[BudgetPlan] = field(default=None, init=False)
+    sparse_kv_budget_finalized: bool = field(default=False, init=False)
     _dsa_indexer_layer_ids: Optional[tuple[int, ...]] = field(default=None, init=False)
     kv_cache_dtype_str: Optional[str] = None
     extra_mamba_cache_bytes_per_req: int = 0

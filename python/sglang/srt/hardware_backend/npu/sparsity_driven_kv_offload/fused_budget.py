@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from copy import copy
 from dataclasses import dataclass
 from math import prod
 from typing import TYPE_CHECKING
@@ -39,13 +40,6 @@ class BufferSpec:
             return torch.full(self.shape, fill_value, dtype=self.dtype, device=device)
         return torch.empty(self.shape, dtype=self.dtype, device=device)
 
-    def validate(self, value, name: str) -> None:
-        values = value if isinstance(value, list) else [value]
-        if len(values) != self.count or any(
-            tuple(t.shape) != self.shape or t.dtype != self.dtype for t in values
-        ):
-            raise ValueError(f"Sparse KV buffer {name} does not match {self}.")
-
 
 class BudgetPlan:
     """Persistent buffer geometry and accounting for one native KV pool."""
@@ -81,7 +75,6 @@ class BudgetPlan:
         self.index_head_dim = index_head_dim
         self.kv_cache_dim = kv_lora_rank + qk_rope_head_dim
         self.prefill_workspace_tokens = prefill_workspace_tokens
-        self.prefill_workspace_sizing_finalized = False
         metadata_dtype = torch.int32
         self.manager_buffers = {
             "device_kv_buffer": BufferSpec(
@@ -101,14 +94,6 @@ class BudgetPlan:
             "resident_end": BufferSpec((num_layers, request_rows), metadata_dtype),
             "planner_hbm_block_table": BufferSpec(
                 (batch_capacity, cache_tokens // page_size), metadata_dtype
-            ),
-            "fused_attn_out": BufferSpec(
-                (
-                    batch_capacity * max_query_width,
-                    copy_sfa_query_heads,
-                    kv_lora_rank,
-                ),
-                kv_dtype,
             ),
         }
         if prefill_workspace_tokens:
@@ -156,6 +141,11 @@ class BudgetPlan:
             for n in ("device_kv_buffer", "device_rope_buffer")
         )
         self.slot_map_bytes = self.manager_buffers["device_slot_map"].nbytes
+        # Reserve one maximal forward output without allocating it persistently.
+        self.output_scratch_bytes = BufferSpec(
+            (batch_capacity * max_query_width, copy_sfa_query_heads, kv_lora_rank),
+            kv_dtype,
+        ).nbytes
         self.copy_sfa_bytes = sum(
             s.nbytes
             for n, s in self.manager_buffers.items()
@@ -177,6 +167,7 @@ class BudgetPlan:
             self.device_kv_bytes
             + self.slot_map_bytes
             + self.copy_sfa_bytes
+            + self.output_scratch_bytes
             + self.prefill_workspace_bytes
             + self.adapter_bytes
         )
@@ -188,14 +179,17 @@ class BudgetPlan:
             raise RuntimeError("Bind the native KV pool before reading Host KV bytes.")
         return self.host_kv_spec.nbytes
 
-    def disable_prefill_workspace(self) -> None:
-        """Drop the optional allocation before the plan is bound to a pool."""
-        if self.host_token_capacity is not None:
-            raise ValueError("Cannot change a bound sparse KV budget plan.")
-        for name in ("prefill_nope", "prefill_rope"):
-            self.manager_buffers.pop(name, None)
-        self.prefill_workspace_tokens = 0
-        self.prefill_workspace_bytes = 0
+    def without_prefill_workspace(self) -> BudgetPlan:
+        """Return an unbound plan without the optional workspace."""
+        result = copy(self)
+        result.manager_buffers = {
+            name: spec
+            for name, spec in self.manager_buffers.items()
+            if name not in ("prefill_nope", "prefill_rope")
+        }
+        result.prefill_workspace_tokens = 0
+        result.prefill_workspace_bytes = 0
+        return result
 
     def bind_native_pool(self, pool) -> BudgetPlan:
         """Bind the physical layout once after native pool creation."""
@@ -219,10 +213,6 @@ class BudgetPlan:
             self.num_layers,
         )
         return self
-
-    def validate_buffers(self, owner, specs: dict[str, BufferSpec]) -> None:
-        for name, spec in specs.items():
-            spec.validate(getattr(owner, name), name)
 
 
 def resolve_sparse_kv_budget(
@@ -266,7 +256,7 @@ def resolve_sparse_kv_budget(
         raise ValueError(
             "Native LIM cache capacity must cover query width * TopK, be <= 32640 and aligned to 128."
         )
-    result = BudgetPlan(
+    plan_options = dict(
         request_rows=request_rows,
         context_len=ceil_div(context_len, page_size) * page_size,
         num_layers=num_layers,
@@ -280,21 +270,31 @@ def resolve_sparse_kv_budget(
         kv_lora_rank=kv_lora_rank,
         qk_rope_head_dim=qk_rope_head_dim,
         index_head_dim=index_head_dim,
-        prefill_workspace_tokens=prefill_workspace_tokens,
     )
+    base = BudgetPlan(**plan_options)
+    workspace_bytes = sum(
+        BufferSpec((prefill_workspace_tokens, 1, width), kv_dtype).nbytes
+        for width in (kv_lora_rank, qk_rope_head_dim)
+    )
+    planned_bytes = base.managed_hbm_bytes + workspace_bytes
     if (
         prefill_workspace_tokens
         and hbm_budget_bytes
-        and result.managed_hbm_bytes > hbm_budget_bytes
+        and planned_bytes > hbm_budget_bytes
     ):
         logger.warning(
             "Disabling sparse prefill workspace (%d tokens): planned HBM %d bytes "
             "exceeds budget %d bytes.",
             prefill_workspace_tokens,
-            result.managed_hbm_bytes,
+            planned_bytes,
             hbm_budget_bytes,
         )
-        result.disable_prefill_workspace()
+        prefill_workspace_tokens = 0
+    result = (
+        BudgetPlan(**plan_options, prefill_workspace_tokens=prefill_workspace_tokens)
+        if prefill_workspace_tokens
+        else base
+    )
     if hbm_budget_bytes and result.managed_hbm_bytes > hbm_budget_bytes:
         raise ValueError(
             f"Sparse KV manager needs {result.managed_hbm_bytes} bytes, exceeding SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB ({hbm_budget_bytes} bytes)."

@@ -535,13 +535,13 @@ class TestDefaultConfigurator(CustomTestCase):
             cfg = DefaultPoolConfigurator(mr)
             second_cfg = DefaultPoolConfigurator(mr)
 
-        # One compact target indexer, one FP32 scale workspace, and the
-        # draft's full native CKV/KPE plus indexer remain in HBM.
+        # The compact target indexer and the draft's full native CKV/KPE
+        # plus indexer remain in HBM; native BF16 LIM needs no scale buffer.
         self.assertEqual(len(owner_ids), 21)
-        self.assertEqual(cfg._cell_size, (21 + 1) * 128 * 2 + 576 * 2 + 4)
+        self.assertEqual(cfg._cell_size, (21 + 1) * 128 * 2 + 576 * 2)
         self.assertEqual(
             cfg._fixed_overhead_bytes,
-            mr.sparse_kv_budget_plan.managed_hbm_bytes + 128 * 4,
+            mr.sparse_kv_budget_plan.managed_hbm_bytes,
         )
         self.assertEqual(second_cfg._fixed_overhead_bytes, cfg._fixed_overhead_bytes)
         self.assertEqual(mock_sparse_budget.call_count, 1)
@@ -1232,8 +1232,8 @@ class TestEagleConfigurator(CustomTestCase):
                 self.assertGreater(padded.batch_capacity, unpadded.batch_capacity)
                 self.assertEqual(padded.copy_sfa_query_heads, 16)
                 self.assertEqual(
-                    padded.manager_buffers["fused_attn_out"].shape,
-                    (padded.batch_capacity * 3, 16, 512),
+                    padded.output_scratch_bytes,
+                    padded.batch_capacity * 3 * 16 * 512 * 2,
                 )
 
     def test_sparse_mtp_budget_rows_follow_attention_dp_worker_capacity(self):

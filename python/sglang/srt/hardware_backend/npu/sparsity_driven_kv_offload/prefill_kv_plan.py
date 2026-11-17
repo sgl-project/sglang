@@ -34,6 +34,8 @@ class FusedPrefillPlan:
 
 
 def make_fused_prefill_plan(batch, manager, *, prepared=None, current_valid=None):
+    from sgl_kernel_npu.sparsity_driven_kv_offload.row_metadata import prefill_plan
+
     _, total = (
         prepare_prefill_gather_rows(
             batch.req_pool_indices_cpu,
@@ -42,18 +44,20 @@ def make_fused_prefill_plan(batch, manager, *, prepared=None, current_valid=None
         if prepared is None
         else prepared
     )
-    from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.row_metadata import (
-        prefill_plan,
-    )
-
     current_metadata = None
     max_current_width = 0
     if current_valid is not None:
-        current_metadata, max_current_width = _current_metadata(batch, current_valid)
+        current_metadata, max_current_width = _pack_current_row_metadata(
+            batch, current_valid
+        )
     source, destination, valid, current_mapping = prefill_plan(
-        batch,
-        manager,
+        batch.req_pool_indices,
+        batch.seq_lens,
+        manager.req_to_token_pool.req_to_token,
         total,
+        int(batch.seq_lens_cpu.max()) if total else 0,
+        manager.actual_request_rows,
+        manager.logical_max_context_len,
         current_valid=(
             current_valid.reshape(-1) if current_metadata is not None else None
         ),
@@ -63,7 +67,7 @@ def make_fused_prefill_plan(batch, manager, *, prepared=None, current_valid=None
     return FusedPrefillPlan(total, source, destination, valid, current_mapping)
 
 
-def _current_metadata(batch, current_valid):
+def _pack_current_row_metadata(batch, current_valid):
     """Build native fused-plan metadata for compact or padded current rows."""
     req = batch.req_pool_indices_cpu
     ext = batch.extend_seq_lens_cpu
