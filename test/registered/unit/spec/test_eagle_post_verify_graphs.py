@@ -276,6 +276,23 @@ class TestPostVerifyGraphs(CustomTestCase):
                 self.assertIsNone(worker._post_verify_graphs)
                 self.assertIsNone(worker._simulated_acc_len_rng)
 
+    def test_a_new_key_past_the_graph_key_bound_runs_eagerly(self):
+        """SGLANG_POST_VERIFY_MAX_GRAPH_KEYS bounds the graph sets, 64 unless raised; a
+        new key past it gets no graph set and leaves the forced-length stream alone."""
+        self.assertEqual(envs.SGLANG_POST_VERIFY_MAX_GRAPH_KEYS.default, 64)
+        graphs = eagle_post_verify_graphs._PostVerifyGraphs(
+            body=None, commit=None, sim_rng=torch.Generator()
+        )
+        graphs._states = {key: SimpleNamespace(turn=0) for key in range(3)}
+        with (
+            patch.object(eagle_post_verify_graphs, "_MAX_POST_VERIFY_STATES", 3),
+            patch.object(graphs, "_draw_sim_len", side_effect=AssertionError),
+        ):
+            self.assertIsNone(
+                graphs.run(key=3, inputs={}, make_slot=None, sim_max_len=1)
+            )
+        self.assertEqual(set(graphs._states), {0, 1, 2})
+
     def test_a_kv_pool_that_clears_c128_draft_states_keeps_the_eager_verify(self):
         """The post-verify graphs skip the eager verify's cleanup of rejected c128
         draft states (DeepSeek-V4), so a KV pool that has one never reaches them;

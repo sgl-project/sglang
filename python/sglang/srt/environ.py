@@ -1766,6 +1766,9 @@ class Envs:
     SGLANG_ENABLE_EAGLE_POST_VERIFY_CUDA_GRAPH = EnvBool(
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get
     )
+    # Post-verify graph sets (one per batch size, sampling mode, ...) kept before a new
+    # key runs eagerly.
+    SGLANG_POST_VERIFY_MAX_GRAPH_KEYS = EnvInt(64)
     # Let an unchanged top-k-1 EAGLE round read the previous round's top-1 and hidden
     # rows where the draft-extend graph left them instead of relaying copies.
     SGLANG_OPT_SPEC_RELAY_IN_PLACE = EnvBool(
