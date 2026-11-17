@@ -125,6 +125,21 @@ class TestDerivedWeightCache(CustomTestCase):
             "derived scales require restart",
         )
 
+    def test_child_declaration_invalidates_cached_parent_check(self):
+        """A parent checked earlier in the request must see its child's new refusal."""
+        model = torch.nn.Sequential(torch.nn.Module())
+        reason = "plugin owns relocated weights"
+        with (
+            weight_update_request(),
+            patch(
+                "sglang.kernels.ops.gemm.bf16_fp32.hpc_bf16xfp32_gemm_enabled",
+                return_value=False,
+            ),
+        ):
+            self.assertIsNone(_unsupported_derived_weight_cache_error(model))
+            declare_weight_update_unsupported(model[0], reason)
+            self.assertEqual(_unsupported_derived_weight_cache_error(model), reason)
+
     def test_public_declaration_rejects_each_load_path_before_writing(self):
         model = torch.nn.Sequential(torch.nn.Linear(2, 2, bias=False))
         reason = "plugin owns relocated weights"
