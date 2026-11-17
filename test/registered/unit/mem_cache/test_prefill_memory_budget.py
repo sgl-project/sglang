@@ -1,5 +1,9 @@
 """CPU regressions for allocator-owned prefill admission and pending demand."""
 
+import contextlib
+import inspect
+import itertools
+import random
 import unittest
 from array import array
 from types import SimpleNamespace
@@ -11,6 +15,7 @@ from sglang.srt.disaggregation.mode import DisaggregationMode
 from sglang.srt.managers.schedule_batch import Req
 from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.mem_cache import prefill_budget
 from sglang.srt.mem_cache.allocator.hisparse import (
     DeepSeekV4HiSparseTokenToKVPoolAllocator,
 )
@@ -21,7 +26,12 @@ from sglang.srt.mem_cache.allocator.swa import (
 from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.capacity import create_prefill_budget
 from sglang.srt.mem_cache.common import evict_from_tree_cache
-from sglang.srt.mem_cache.kv.alloc.demand import KVDemand, WindowRetirement
+from sglang.srt.mem_cache.kv.alloc.demand import (
+    DemandPurpose,
+    KVDemand,
+    WindowRetirement,
+)
+from sglang.srt.mem_cache.prefill_budget import ChainPrefillBudget
 from sglang.srt.mem_cache.radix_cache import RadixCache
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.sampling.sampling_params import SamplingParams
@@ -627,6 +637,265 @@ class TestSharedPrefillAdmission(unittest.TestCase):
                     req, has_chunked_req=False, truncation_align_size=None
                 )
                 self.assertEqual(adder.can_run_list, [req])
+
+
+def _state_cache():
+    cache = _cache()
+    cache.sliding_window_size = 16
+    cache.supports_mamba = lambda: True
+    cache.mamba_evictable_size = lambda: 0
+    return cache
+
+
+def _random_passes(allocator, cache, rng, *, passes=12, steps=8):
+    """Drive budgets through randomized admission passes over ``allocator``:
+    admission, the shape check, commitment, a continuation's chunk, the
+    fixed-length decode check, a load-back's windows, and the pass state the
+    scheduler asks between candidates. Memory and the evictable credit change
+    between checks, as takes, frees and prefix locks change them. Returns
+    every answer and the reservations they led to."""
+    windows = allocator.window_pool_names()
+    trace, held = [], []
+
+    def request():
+        return dict(
+            extend_input_len=rng.choice((4, 9, 16, 30, 48)),
+            max_new_tokens=rng.choice((0, 3, 16)),
+            chunk_limit=rng.choice((None, 8, 16, 32)),
+            state_slots=rng.choice((0, 1, 2)),
+            cached=rng.choice((0, 4, 12)),
+            extra=rng.choice((0, 4)),
+            hits=rng.choice((None, {}, {windows[0]: 8}, {windows[-1]: 5})),
+        )
+
+    for _ in range(passes):
+        budget = create_prefill_budget(allocator, cache)
+        requests = [request() for _ in range(3)]
+        for _ in range(steps):
+            r = rng.choice(requests)
+            extend, max_new = r["extend_input_len"], r["max_new_tokens"]
+            extra = r["extra"]
+            shape = dict(
+                extend_input_len=extend,
+                max_new_tokens=max_new,
+                chunk_limit=r["chunk_limit"],
+                state_slots=r["state_slots"],
+            )
+            trace.append(("more", budget.admits_more()))
+            admitted, limit = budget.check_prefill(
+                total_tokens=extend + max_new + 4 + extra,
+                input_tokens=extend + r["cached"],
+                window_host_hit_lengths=r["hits"],
+                chunk_align=rng.choice((None, 8)),
+                **shape,
+            )
+            shaped = admitted and budget.can_allocate_prefill(
+                paged_input=-(-extend // 4) * 4 + 4 + extra,
+                window_host_hit_lengths=r["hits"],
+                admitted_chunk_limit=limit,
+                cached_tokens=r["cached"],
+                **shape,
+            )
+            trace.append(("admit", admitted, limit, shaped))
+            if shaped:
+                budget.reserve(
+                    extend,
+                    max_new,
+                    extra_tokens=extra,
+                    state_slots=r["state_slots"],
+                    chunk_limit=r["chunk_limit"],
+                    admitted_chunk_limit=limit,
+                    cached_tokens=r["cached"],
+                )
+            elif r["chunk_limit"] is not None:
+                trace.append(
+                    ("chunk", budget.fit_chunk(_NO_ROW_REQ, chunk_align=8, **shape))
+                )
+            trace.append(
+                (
+                    "decode",
+                    budget.ignore_eos_decode_fits(
+                        [(8, 16)],
+                        paged_input=extend + 4,
+                        reserve_tokens=2,
+                        cached_tokens=r["cached"],
+                        **shape,
+                    ),
+                )
+            )
+            budget.window_tokens(
+                extend,
+                max_new,
+                purpose=rng.choice((DemandPurpose.ADMIT, DemandPurpose.LOAD_BACK)),
+                chunk_limit=r["chunk_limit"],
+                host_hit_lengths=r["hits"],
+                cached_tokens=r["cached"],
+            )
+            trace.append(
+                (
+                    "reserved",
+                    budget.total_offset,
+                    budget.current_offset,
+                    budget.pending_state_slots,
+                    dict(budget.window_offsets),
+                )
+            )
+            # A take or a free moves memory; a prefix lock moves the credit.
+            if rng.random() < 0.3 and (tokens := allocator.alloc(4)) is not None:
+                held.append(tokens)
+            elif rng.random() < 0.2 and held:
+                allocator.free(held.pop(rng.randrange(len(held))))
+            credit = rng.choice((0, 0, 4, 8))
+            cache.full_evictable_size = lambda credit=credit: credit
+            window_credit = rng.choice((0, 0, 8))
+            cache.window_evictable_size = lambda name, c=window_credit: c
+    for tokens in held:
+        allocator.free(tokens)
+    return trace
+
+
+class TestPassPricingReuse(unittest.TestCase):
+    def test_each_demand_is_built_once_and_equals_a_fresh_build(self):
+        """One pass asks a request's demand at several checks (admission, the
+        shape check, commitment, chunk searches). Over randomized passes, each
+        distinct question is built once per budget, and every answer equals a
+        fresh budget's for the same arguments: no argument is missing from what
+        identifies a demand, and no reservation or allocation changes it."""
+        allocator = _multi_window_state_allocator(tokens=64).allocator
+        cache = _state_cache()
+        signature = inspect.signature(ChainPrefillBudget.request_demand)
+        original = ChainPrefillBudget.request_demand
+        asked = []
+
+        def recording(budget, *args, **kwargs):
+            demand = original(budget, *args, **kwargs)
+            asked.append((budget, args, kwargs, demand))
+            return demand
+
+        def question(budget, args, kwargs):
+            bound = signature.bind(budget, *args, **kwargs)
+            bound.apply_defaults()
+            hits = bound.arguments.pop("host_hit_lengths") or {}
+            arguments = tuple(bound.arguments.items())[1:]
+            return id(budget), arguments, frozenset(hits.items())
+
+        with (
+            patch.object(ChainPrefillBudget, "request_demand", recording),
+            patch.object(
+                prefill_budget, "demand_inputs", wraps=prefill_budget.demand_inputs
+            ) as built,
+        ):
+            _random_passes(allocator, cache, random.Random(0))
+
+        questions = {question(b, a, k) for b, a, k, _ in asked}
+        self.assertGreater(len(asked), len(questions))
+        self.assertEqual(built.call_count, len(questions))
+        for _, args, kwargs, demand in asked:
+            fresh = create_prefill_budget(allocator, cache)
+            self.assertEqual(demand, fresh.request_demand(*args, **kwargs))
+        # A shared demand cannot be changed by a check that receives it.
+        with self.assertRaises(TypeError):
+            asked[0][3].window_tokens[allocator.window_pool_names()[0]] = 0
+
+    def test_reused_answers_decide_as_fresh_pricing(self):
+        """Over the same randomized passes, a budget that reuses the
+        allocator's answers within a memory state makes every decision, chunk
+        limit and reservation that pricing every question afresh makes, and
+        asks the allocator fewer questions: the memory state key and the
+        evictable credit are all an answer depends on beyond its question."""
+        runs = []
+        for reuse in (True, False):
+            allocator = _multi_window_state_allocator(tokens=64).allocator
+            with contextlib.ExitStack() as stack:
+                if not reuse:
+                    # A new memory state at every question: nothing is reused.
+                    keys = itertools.count()
+                    stack.enter_context(
+                        patch.object(
+                            type(allocator), "pricing_key", lambda self: next(keys)
+                        )
+                    )
+                priced = stack.enter_context(
+                    patch.object(allocator, "admits", wraps=allocator.admits)
+                )
+                trace = _random_passes(allocator, _state_cache(), random.Random(1))
+            runs.append((trace, priced.call_count))
+        (reused, reused_count), (fresh, fresh_count) = runs
+        self.assertEqual(reused, fresh)
+        self.assertEqual({e[1] for e in reused if e[0] == "admit"}, {True, False})
+        self.assertLess(reused_count, fresh_count)
+
+    def test_a_question_is_priced_once_per_memory_state(self):
+        """The scheduler asks the pass state after each admission and again
+        before the next candidate, and the shape check asks admission's own
+        question; with memory unchanged neither is priced again. A take or a
+        change of the evictable credit (a prefix lock) prices it afresh, and
+        the pass state reads the evictable credit once for its questions."""
+        allocator = _multi_window_state_allocator(tokens=64).allocator
+        cache = _state_cache()
+        budget = create_prefill_budget(allocator, cache)
+        request = dict(
+            extend_input_len=9,
+            total_tokens=16,
+            max_new_tokens=3,
+            input_tokens=9,
+            chunk_limit=None,
+            state_slots=1,
+        )
+        with (
+            patch.object(allocator, "admits", wraps=allocator.admits) as priced,
+            patch.object(
+                prefill_budget,
+                "evictable_by_sub_pool",
+                wraps=prefill_budget.evictable_by_sub_pool,
+            ) as credit,
+        ):
+            self.assertTrue(budget.has_capacity())
+            self.assertFalse(budget.state_slots_exhausted())
+            self.assertEqual(priced.call_count, 2)
+            self.assertTrue(budget.has_capacity())
+            self.assertFalse(budget.state_slots_exhausted())
+            self.assertEqual(priced.call_count, 2)
+
+            self.assertEqual(budget.check_prefill(**request), (True, None))
+            self.assertEqual(priced.call_count, 3)
+            self.assertTrue(
+                budget.can_allocate_prefill(
+                    paged_input=16,
+                    extend_input_len=9,
+                    max_new_tokens=3,
+                    chunk_limit=None,
+                    state_slots=1,
+                )
+            )
+            self.assertEqual(priced.call_count, 3)
+
+            held = allocator.alloc(8)
+            self.assertIsNotNone(held)
+            self.assertTrue(budget.has_capacity())
+            self.assertEqual(priced.call_count, 4)
+            cache.full_evictable_size = lambda: 8
+            self.assertTrue(budget.has_capacity())
+            self.assertEqual(priced.call_count, 5)
+
+            reads = credit.call_count
+            self.assertTrue(budget.admits_more())
+            self.assertEqual(credit.call_count, reads + 1)
+
+            # Questions that differ only in the token rows (a request slot
+            # reserve) or only in a window's rows (a cached prefix holds some)
+            # are priced apart.
+            asked = priced.call_count
+            for paged_input, cached in ((56, 0), (60, 0), (56, 12)):
+                budget.can_allocate_prefill(
+                    paged_input=paged_input,
+                    extend_input_len=48,
+                    max_new_tokens=16,
+                    chunk_limit=8,
+                    cached_tokens=cached,
+                )
+            self.assertEqual(priced.call_count, asked + 3)
+        allocator.free(held)
 
 
 class TestRunningDecodeReservation(CustomTestCase):
