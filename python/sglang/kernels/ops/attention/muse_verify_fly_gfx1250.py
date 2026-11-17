@@ -2,8 +2,9 @@
 
 Per rank (TP8): 2 KV heads, GQA 8, head_dim 64, 8 verify tokens, FP8 e4m3 paged KV ([pages, 16, 2, 64]).
 Workgroup = (request, KV head, split); 4 waves = the 4 query tiles (16 query columns each: 8 tokens x 8 heads).
-The page-table row is staged in LDS once; K / V move in 64-key chunks (4 pages) by async global->LDS copies into a
-4-deep ring (one barrier per chunk). Per chunk every wave computes
+The split's page-table slice is staged in LDS once (sized on the host from the table width and the split count);
+K / V move in 64-key chunks (4 pages) by async global->LDS copies into a 4-deep ring (one barrier per chunk).
+Per chunk every wave computes
   S^T = K Q^T  on V_WMMA_F32_16X16X64_FP8_FP8: K rows straight from LDS (32 contiguous dims per lane), Q quantized per
                query row to e4m3 in the prologue (same per-lane byte -> dim map on both operands),
   P^T          from the accumulator registers, e4m3 with a 2^8 bias folded into the exponent (shared by acc and denom,
@@ -36,6 +37,7 @@ QL, GQA, HD, PAGE, KVH = 8, 8, 64, 16, 2
 WAVE, NW = 32, 4
 CHUNK_TILES = 4  # 64 keys per chunk
 NS = 4  # async ring depth (chunks)
+MAX_TAB = 16384  # page-table slots staged in LDS at most (64 KB)
 ROW = 80  # padded LDS row (bytes) per key
 M_INIT = -1.0e30
 LOG2E = 1.0 / math.log(2.0)
@@ -95,16 +97,16 @@ def _exp2(x):
 
 
 @functools.lru_cache(maxsize=64)
-def _launcher(splits: int, scale_log2: float, window: int, q_s0: int, heads: int):
+def _launcher(
+    splits: int, scale_log2: float, window: int, q_s0: int, heads: int, ntab: int
+):
     ns = NS
     NDT = 4
     QS0W = q_s0 // 2
     CK = CHUNK_TILES * PAGE  # keys per chunk
     BUF = 2 * CK * ROW  # K + V of one chunk
     full = window == 0
-    NTAB = (
-        1024 if full else 256
-    )  # page-table slots staged in LDS (callers check the row fits)
+    NTAB = ntab  # page-table slots staged in LDS (_table_slots)
 
     @fx.struct
     class Lds:
@@ -193,10 +195,13 @@ def _launcher(splits: int, scale_log2: float, window: int, q_s0: int, heads: int
         loff = fx.Int64(lr * 128 + kvh * 64 + lh * 32)
 
         tabp = lds.tab.ptr
-        # stage this request's page-table row from tile_lo into LDS once (slot j -> tile min(tile_lo + j, tile_hi - 1))
-        for jj in range_constexpr(NTAB // (NW * WAVE)):
-            j = tid + jj * (NW * WAVE)
-            tt = tile_lo + j
+        # stage this split's page-table slice into LDS once (slot j -> tile min(tile_s + j, tile_hi - 1)); round 0
+        # always runs (an empty split still issues its clamped prologue), later rounds only up to the slice end
+        tile_s = tile_lo + c_begin * CHUNK_TILES
+        nrounds = ((c_end - c_begin) * CHUNK_TILES + (NW * WAVE - 1)) // (NW * WAVE)
+
+        def stage(j):
+            tt = tile_s + j
             tc = (tt < tile_hi).select(tt, tile_hi - 1)
             fx.ptr_store(
                 fx.Int32(
@@ -204,12 +209,15 @@ def _launcher(splits: int, scale_log2: float, window: int, q_s0: int, heads: int
                 ),
                 tabp + fx.Int64(j),
             )
+
+        stage(tid)
+        for jj in range(fx.Int32(1), nrounds, fx.Int32(1)):
+            stage(tid + jj * (NW * WAVE))
         gpu.barrier()
 
         def page_of(c):
             """This thread's page id for chunk c (from the LDS copy; clamped slots hold the last page)."""
-            j = c * CHUNK_TILES + lp
-            j = (j < NTAB).select(j, NTAB - 1)
+            j = (c - c_begin) * CHUNK_TILES + lp
             return fx.Int32(fx.ptr_load(tabp + fx.Int64(j), result_type=T.i32))
 
         zero4 = fx.full(4, 0, fx.Int32)
@@ -391,9 +399,19 @@ def _launcher(splits: int, scale_log2: float, window: int, q_s0: int, heads: int
 _ONE = {}
 
 
-def applies(q, k, v, seqused_k, block_table, window) -> bool:
+def _table_slots(width, window, splits):
+    """LDS page-table slots one split needs: a sliding window spans <= 130 pages; a full layer's split covers at most
+    ceil(ceil(width / 4) / splits) chunks of the table row."""
+    if window > 0:
+        return 256
+    chunks = -(-width // CHUNK_TILES)
+    per = -(-chunks // splits)
+    return -(-per * CHUNK_TILES // (NW * WAVE)) * (NW * WAVE)
+
+
+def applies(q, k, v, seqused_k, block_table, window, splits) -> bool:
     """The shapes this kernel serves: TP8 Muse verify (16 Q / 2 KV heads, HD 64), contiguous FP8 paged KV (page 16),
-    contiguous Q, int32 lengths / table; full layers only while a table row fits the LDS copy."""
+    contiguous Q, int32 lengths / table; a split's page-table slice fits the LDS copy."""
     return (
         q.dtype == torch.bfloat16
         and q.dim() == 3
@@ -409,7 +427,7 @@ def applies(q, k, v, seqused_k, block_table, window) -> bool:
         and v.stride() == k.stride()
         and seqused_k.dtype == torch.int32
         and block_table.dtype == torch.int32
-        and (window > 0 or block_table.shape[1] <= 1024)
+        and _table_slots(block_table.shape[1], window, splits) <= MAX_TAB
     )
 
 
@@ -450,6 +468,7 @@ def muse_verify_fly(
             int(window),
             int(q.stride(0)),
             int(heads),
+            _table_slots(block_table.shape[1], window, splits),
         ),
         q.view(torch.int32),
         int(k.data_ptr()),

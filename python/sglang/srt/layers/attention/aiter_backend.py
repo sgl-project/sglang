@@ -339,19 +339,20 @@ def _muse_verify_attention(
         # Above 16 requests (random pages) the KV-head-pair kernel with FP8 QK/PV runs the sliding layers, and full
         # layers use 4 splits x 64 keys.
         if sliding_window == 2047 and window_size[1] == 0 and "swa_gqa" in kernels:
+            fly_splits = 4 if num_seqs <= 32 else 2
             if (
                 num_seqs >= 12
                 and muse_verify_fly_gfx1250 is not None
                 and seqused_k_i32 is not None
                 and muse_verify_fly_gfx1250.applies(
-                    q, k, v, seqused_k_i32, block_table, sliding_window
+                    q, k, v, seqused_k_i32, block_table, sliding_window, fly_splits
                 )
             ):
                 # FlyDSL FP8-WMMA verify (16- / 64-request buckets): faster than the Triton kernels below
                 _defer_or_merged(
                     muse_verify_fly_gfx1250.muse_verify_fly(
                         q, k, v, out, seqused_k_i32, block_table, softmax_scale, sliding_window, k_descale, v_descale,
-                        splits=4 if num_seqs <= 32 else 2, defer_reduce=_VERIFY_REDUCE_DEFERRAL.requested,
+                        splits=fly_splits, defer_reduce=_VERIFY_REDUCE_DEFERRAL.requested,
                     ),
                     v_descale,
                 )  # fmt: skip
@@ -374,6 +375,26 @@ def _muse_verify_attention(
                     sliding_window, k_descale, v_descale,
                     splits=16 if small else 8, bn=32, num_warps=4 if small else 2,
                     num_stages=2, defer_reduce=_VERIFY_REDUCE_DEFERRAL.requested,
+                ),
+                v_descale,
+            )  # fmt: skip
+            return True
+        fly_splits = 16 if num_seqs <= 8 else (8 if num_seqs <= 16 else 4)
+        if (
+            sliding_window == 0
+            and "full_v2_fp8" in kernels
+            and num_seqs <= 32
+            and muse_verify_fly_gfx1250 is not None
+            and seqused_k_i32 is not None
+            and muse_verify_fly_gfx1250.applies(
+                q, k, v, seqused_k_i32, block_table, 0, fly_splits
+            )
+        ):
+            # FlyDSL FP8-WMMA verify up to 32 requests, same FP8 Q/K/P/V numerics as the Triton FP8 kernel below.
+            _defer_or_merged(
+                muse_verify_fly_gfx1250.muse_verify_fly(
+                    q, k, v, out, seqused_k_i32, block_table, softmax_scale, 0, k_descale, v_descale,
+                    splits=fly_splits, defer_reduce=_VERIFY_REDUCE_DEFERRAL.requested,
                 ),
                 v_descale,
             )  # fmt: skip

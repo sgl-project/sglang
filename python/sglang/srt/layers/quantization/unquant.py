@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import logging
 import time
 from enum import Enum
@@ -133,6 +134,65 @@ try:
     )
 except Exception:
     _is_gfx1250 = False
+
+if _use_aiter and _is_gfx1250:
+    from aiter.ops.triton.gemm.basic.gemm_a16w16 import (
+        gemm_a16w16_ as _aiter_gemm_a16w16,
+    )
+
+# gfx1250 BF16 GEMMs with the hipBLASLt / rocBLAS solution torch TunableOp picked for them, a row only where it beat
+# the default heuristic: the SP prefill shard widths (QKV+gate, O, unpooler) and the _GFX1250_HIPBLASLT_ROWS widths
+# (QKV+gate, conv). Tuning stays off: the file is only read, the same on every rank.
+_GFX1250_TUNABLEOP_CSV = os.path.normpath(
+    os.path.join(
+        os.path.dirname(__file__),
+        "..",
+        "..",
+        "rocm_muse_spark",
+        "configs",
+        "gfx1250_gemm_tunableop.csv",
+    )
+)
+
+
+@contextlib.contextmanager
+def gfx1250_tuned_gemms():
+    """TunableOp lookups in _GFX1250_TUNABLEOP_CSV for the GEMMs launched inside; restores the enclosing state."""
+    tunable = torch.cuda.tunable
+    if tunable.get_filename() != _GFX1250_TUNABLEOP_CSV:
+        tunable.tuning_enable(False)
+        tunable.set_filename(_GFX1250_TUNABLEOP_CSV, insert_device_ordinal=False)
+        tunable.read_file(_GFX1250_TUNABLEOP_CSV)
+    enabled = tunable.is_enabled()
+    tunable.enable(True)
+    try:
+        yield
+    finally:
+        tunable.enable(enabled)
+
+
+# gfx1250 weights (N, K) -> ((rows, config), ...) served by aiter's Gluon a16w16 with an explicit config (BF16
+# operands, FP32 accumulation, BF16 out): the attention O projection at 65..256 and 337..384 rows.
+_GLUON_O_WIDE = (
+    '{"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 128, "NUM_BUFFERS": 4, "num_warps": 4, '
+    '"kernel_type": "compute_bound", "waves_per_eu": 0}'
+)
+_GFX1250_GLUON_A16W16 = {
+    (8192, 1024): (
+        (range(65, 129), _GLUON_O_WIDE),
+        (
+            range(129, 193),
+            '{"BLOCK_M": 64, "BLOCK_N": 256, "BLOCK_K": 64, "NUM_BUFFERS": 4, "num_warps": 4, '
+            '"kernel_type": "compute_bound", "waves_per_eu": 0}',
+        ),
+        (
+            range(193, 257),
+            '{"BLOCK_M": 128, "BLOCK_N": 128, "BLOCK_K": 64, "NUM_BUFFERS": 4, "num_warps": 8, '
+            '"kernel_type": "compute_bound", "waves_per_eu": 1}',
+        ),
+        (range(337, 385), _GLUON_O_WIDE),
+    ),
+}
 
 # Route supported decode shapes that are absent from the tuned table.
 _A16W16_TRITON_MAX_K = 2048
@@ -1011,6 +1071,19 @@ class UnquantizedLinearMethod(LinearMethodBase):
         x: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        if _use_aiter and _is_gfx1250:
+            gluon = _GFX1250_GLUON_A16W16.get(tuple(layer.weight.shape))
+            if (
+                gluon is not None
+                and bias is None
+                and x.dim() == 2
+                and x.dtype == layer.weight.dtype == torch.bfloat16
+            ):
+                config = next((c for rows, c in gluon if x.shape[0] in rows), None)
+                if config is not None:
+                    return _aiter_gemm_a16w16(
+                        x, layer.weight, dtype=x.dtype, config=config, backend="gluon"
+                    )
         if (
             getattr(layer, "small_m_rowmajor", False)
             and bias is None
@@ -1054,7 +1127,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
                 and x.shape[0] in _GFX1250_HIPBLASLT_ROWS
                 and tuple(layer.weight.shape) in _GFX1250_HIPBLASLT_WEIGHTS
             ):
-                return F.linear(x, layer.weight, bias)
+                with gfx1250_tuned_gemms():
+                    return F.linear(x, layer.weight, bias)
             return tgemm.mm(x, layer.weight, bias, otype=x.dtype)
 
         elif (

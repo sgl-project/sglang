@@ -120,9 +120,11 @@ def sp_gather(shard: torch.Tensor, rows: int, push: bool = False) -> torch.Tenso
     if push:
         spc = _push_plane()[0]
         out = shard.new_empty((shard.shape[0] * group.world_size, *shard.shape[1:]))
-        spc.all_gather_push(
-            group.world_size, shard, out, tuning=spc.Tuning(*_push_tuning())
+        # ROCm: one warp group per peer, the same output bits.
+        gather = (
+            spc.all_gather_push_unrolled if torch.version.hip else spc.all_gather_push
         )
+        gather(group.world_size, shard, out, tuning=spc.Tuning(*_push_tuning()))
         return out[:rows]
     if shard.dtype == torch.uint8 and shard.dim() == 2 and shard.shape[1] % 2 == 0:
         # MXFP4 rows / E8M0 scales: gathered as bf16 words, so the aiter custom all-gather (f32 / f16 / bf16
@@ -526,6 +528,194 @@ def scatter_routed_mx(
     return payload, scale
 
 
+@triton.jit
+def _routed_dispatch_kernel(
+    PACKED,
+    IDS,
+    SC,
+    COUNT,
+    T2R,
+    MASKED,
+    STARTS,
+    PSUM,
+    OUTP,
+    OUTS,
+    rows,
+    local_start,
+    align_m,
+    K: tl.constexpr,
+    IDW: tl.constexpr,
+    SCW: tl.constexpr,
+    EL: tl.constexpr,
+    WMMA_REP: tl.constexpr,
+    BT: tl.constexpr,
+    CH: tl.constexpr,
+    HAS_COUNT: tl.constexpr,
+):
+    # One launch for the side unpack, aiter's EP route (g2l LUT, route, psum remap) and the grouped-row scatter of
+    # BT gathered rows. Every program counts all rows' local routes (each re-derives the per-expert totals and the
+    # count before its own rows; no cross-program sync), so a route's grouped row is its expert's tile-aligned start
+    # plus its rank in (token, slot) order. Outputs as aiter's: masked_m / starts / psum [EL] (program 0), the route
+    # rows T2R (-1: not here), and the payload / preshuffled scales of _routed_mx_scatter_kernel.
+    width = K // 4 + K // 64 + 2 * IDW + 2 * SCW
+    t0 = tl.program_id(0) * BT
+    e = tl.arange(0, EL)
+    j = tl.arange(0, IDW)
+    # this program's rows first: their loads overlap the counting below
+    t = t0 + tl.arange(0, BT)
+    live = t < rows
+    t64 = t.to(tl.int64)
+    src = PACKED + t64[:, None] * width
+    side = src + K // 4 + K // 64
+    ilo = tl.load(side + 2 * j[None, :], mask=live[:, None], other=0)
+    ihi = tl.load(side + 2 * j[None, :] + 1, mask=live[:, None], other=0)
+    js = tl.arange(0, SCW)
+    slo = tl.load(side + 2 * IDW + 2 * js[None, :], mask=live[:, None], other=0)
+    shi = tl.load(side + 2 * IDW + 2 * js[None, :] + 1, mask=live[:, None], other=0)
+    c = tl.arange(0, K // 4)
+    payload = tl.load(src + c[None, :], mask=live[:, None])
+    g = tl.arange(0, K // 128)
+    glo = tl.load(src + K // 4 + 2 * g[None, :], mask=live[:, None])
+    ghi = tl.load(src + K // 4 + 2 * g[None, :] + 1, mask=live[:, None])
+
+    # per-expert route counts of all rows and of the rows before this program's; other ranks' experts land in the
+    # spare upper half of the histogram
+    eb = tl.arange(0, 2 * EL)
+    total2 = tl.zeros((2 * EL,), dtype=tl.int32)
+    before2 = tl.zeros((2 * EL,), dtype=tl.int32)
+    for c0 in tl.range(0, rows, CH):
+        tc = c0 + tl.arange(0, CH)
+        # expert ids < 2^16: the low word of each id carries both of its bytes
+        lo = tl.load(
+            PACKED
+            + tc.to(tl.int64)[:, None] * width
+            + K // 4
+            + K // 64
+            + 2 * j[None, :],
+            mask=(tc < rows)[:, None],
+            other=0,
+        )
+        le = ((lo & 0xFF) | (((lo >> 16) & 0xFF) << 8)) - local_start
+        okl = (le >= 0) & (le < EL) & (tc < rows)[:, None]
+        total2 += tl.histogram(tl.reshape(tl.where(okl, le, EL), (CH * IDW,)), 2 * EL)
+        before2 += tl.histogram(
+            tl.reshape(tl.where(okl & (tc < t0)[:, None], le, EL), (CH * IDW,)), 2 * EL
+        )
+    total = tl.sum(tl.where(eb[:, None] == e[None, :], total2[:, None], 0), axis=0)
+    before = tl.sum(tl.where(eb[:, None] == e[None, :], before2[:, None], 0), axis=0)
+    aligned = (total + align_m - 1) // align_m * align_m
+    starts = tl.cumsum(aligned, axis=0) - aligned
+    if tl.program_id(0) == 0:
+        tl.store(MASKED + e, total)
+        tl.store(STARTS + e, starts)
+        tl.store(PSUM + e, starts + total)
+
+    ids = (
+        (ilo & 0xFF)
+        | (((ilo >> 16) & 0xFF) << 8)
+        | ((ihi & 0xFF) << 16)
+        | (((ihi >> 16) & 0xFF) << 24)
+    )
+    tl.store(IDS + t64[:, None] * IDW + j[None, :], ids, mask=live[:, None])
+    sc = (
+        (slo & 0xFF)
+        | (((slo >> 16) & 0xFF) << 8)
+        | ((shi & 0xFF) << 16)
+        | (((shi >> 16) & 0xFF) << 24)
+    )
+    tl.store(SC + t64[:, None] * SCW + js[None, :], sc, mask=live[:, None])
+    if HAS_COUNT:
+        tl.atomic_add(COUNT + ids, 1, mask=live[:, None], sem="relaxed")
+
+    # this program's routes in (token, slot) order: rank = routes of the same expert before them
+    le = tl.reshape(ids - local_start, (BT * IDW,))
+    local = (
+        (le >= 0)
+        & (le < EL)
+        & tl.reshape(tl.broadcast_to(live[:, None], (BT, IDW)), (BT * IDW,))
+    )
+    r = tl.arange(0, BT * IDW)
+    rank = tl.sum(
+        ((le[:, None] == le[None, :]) & (r[None, :] < r[:, None])).to(tl.int32), axis=1
+    )
+    base = tl.sum(
+        tl.where(le[:, None] == e[None, :], (starts + before)[None, :], 0), axis=1
+    )
+    dest = tl.reshape(tl.where(local, base + rank, -1), (BT, IDW))
+    tl.store(T2R + t64[:, None] * IDW + j[None, :], dest, mask=live[:, None])
+
+    dw = (
+        (glo & 0xFF)
+        | (((glo >> 16) & 0xFF) << 8)
+        | ((ghi & 0xFF) << 16)
+        | (((ghi >> 16) & 0xFF) << 24)
+    )
+    rows_per_tile = WMMA_REP * 16
+    for s in tl.static_range(IDW):
+        d = tl.sum(tl.where(j[None, :] == s, dest, 0), axis=1).to(tl.int64)
+        ok = d >= 0
+        tl.store(OUTP + d[:, None] * (K // 4) + c[None, :], payload, mask=ok[:, None])
+        sb = (
+            (d // rows_per_tile) * ((K // 128) * rows_per_tile)
+            + (d % rows_per_tile) // 16 * 16
+            + d % 16
+        )
+        tl.store(OUTS + sb[:, None] + g[None, :] * rows_per_tile, dw, mask=ok[:, None])
+
+
+@dataclass
+class RoutedDispatch:
+    """A verify-width routed-MX gather whose routing words are still packed: ``dispatch_routed_mx`` unpacks them,
+    routes and scatters in one launch inside aiter's MoE (mxfp4_moe hooks). ``ids`` / ``scores`` are the buffers
+    sp_gather_routed_mx returned, written by that launch."""
+
+    packed: torch.Tensor
+    k: int
+    ids: torch.Tensor
+    scores: torch.Tensor
+    rows: int
+    idw: int
+    scw: int
+    local_start: int
+    num_local: int
+    count: torch.Tensor | None
+    t2r: torch.Tensor | None = None
+    masked: torch.Tensor | None = None
+    starts: torch.Tensor | None = None
+    psum: torch.Tensor | None = None
+    align_m: int = 0
+
+
+# Gathered rows for which sp_gather_routed_mx(dispatch=True) defers the routing to dispatch_routed_mx: from 257
+# rows, where aiter runs its EP route (smaller batches take its one-launch local-ids route + psum), up to 768, since
+# every program re-reads all rows' routing words and the launch grows with the square of the rows.
+DISPATCH_MIN_ROWS, DISPATCH_MAX_ROWS = 257, 768
+
+
+def dispatch_routed_mx(
+    d: RoutedDispatch, max_m: int, wmma_rep: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """aiter's grouped MXFP8 GEMM input as scatter_routed_mx returns it, with ``d``'s ids / scores, aiter's route
+    outputs (``d.t2r`` / ``d.masked`` / ``d.starts`` / ``d.psum`` at ``d.align_m``) and the placement counts."""
+    k = d.k
+    payload = torch.empty((1, max_m, k), dtype=torch.uint8, device=d.packed.device)
+    scale = torch.empty(
+        (1, max_m // wmma_rep, k // 32 * wmma_rep),
+        dtype=torch.uint8,
+        device=d.packed.device,
+    )
+    has_count = d.count is not None
+    # 4 rows per program, 8 warps; the route count reads up to 512 rows per pass
+    bt = 4
+    _routed_dispatch_kernel[(triton.cdiv(d.rows, bt),)](
+        d.packed, d.ids.view(torch.int32), d.scores.view(torch.int32), d.count if has_count else d.ids, d.t2r,
+        d.masked, d.starts, d.psum, payload.view(torch.int32), scale.view(torch.int32), d.rows, d.local_start,
+        d.align_m, k, d.idw, d.scw, d.num_local, wmma_rep, bt, min(triton.next_power_of_2(d.rows), 512), has_count,
+        num_warps=8,
+    )  # fmt: skip
+    return payload, scale
+
+
 def sp_gather_routed_mx(
     x: torch.Tensor,
     topk_ids: torch.Tensor,
@@ -536,6 +726,7 @@ def sp_gather_routed_mx(
     mx: bool = False,
     norm: tuple[torch.Tensor, float] | None = None,
     local_experts: tuple[int, int] | None = None,
+    dispatch: bool = False,
 ) -> tuple[torch.Tensor | tuple, torch.Tensor, torch.Tensor]:
     """``sp_gather_routed`` with the expert input rows sent as MXFP8 under aiter's own MoE input-quant rule and
     widened back to BF16 on arrival (exact): the experts quantize them to the same values, at half the BF16 bytes,
@@ -543,7 +734,9 @@ def sp_gather_routed_mx(
     ``push``: on the push plane (verify SP), else the RCCL gather (prefill sizes). ``mx``: the rows stay as they
     travelled and only the routing is unpacked; the first return is then (rows int32 [rows, width], id words,
     score words per row, rank-local ids or None), for ``scatter_routed_mx``; ``local_experts`` = (first, count) of
-    this rank's experts asks for the local ids (int32 ids only). ``norm`` =
+    this rank's experts asks for the local ids (int32 ids only); with ``dispatch`` and ``DISPATCH_MIN_ROWS`` to
+    ``DISPATCH_MAX_ROWS`` rows the fourth element is instead a ``RoutedDispatch`` and the ids / scores stay unwritten
+    until aiter's MoE runs ``dispatch_routed_mx`` (``mxfp4_moe.run_gfx1250_a8w4``). ``norm`` =
     (BF16 weight, eps): ``x`` is the pre-norm row and the pack applies that RMSNorm (no separate norm pass)."""
     n, k = x.shape
     idw = topk_ids[0].numel() * topk_ids.element_size() // 4
@@ -564,6 +757,19 @@ def sp_gather_routed_mx(
         (rows, *topk_scores.shape[1:]), dtype=topk_scores.dtype, device=x.device
     )
     has_count = count is not None and topk_ids.dtype == torch.int32
+    if (
+        mx
+        and dispatch
+        and local_experts is not None
+        and topk_ids.dtype == torch.int32
+        and topk_scores.dtype == torch.float32
+        and DISPATCH_MIN_ROWS <= rows <= DISPATCH_MAX_ROWS
+    ):
+        d = RoutedDispatch(
+            gathered, k, ids, scores, rows, idw, scw, *local_experts,
+            count if has_count else None,
+        )  # fmt: skip
+        return (gathered, idw, scw, d), ids, scores
     if mx:
         local = (
             torch.empty_like(ids)

@@ -391,7 +391,8 @@ def joint_router_pooler_topk(
     return _joint_finish(partial, sk, m, bias, norm, multiplier, scale, eps, quant_out)
 
 
-# Warps per epilogue program; one program sums a 4096-wide row over SK partials (64 KB at SK 4).
+# Warps per epilogue program; one program sums a 4096-wide row over SK partials (64 KB at SK 4). Unsplit partials
+# (SK 1) take one warp.
 JOINT_EPILOGUE_WARPS = 4
 
 
@@ -420,7 +421,7 @@ def _joint_finish(
         eps,
         quant_out is not None,
         fp8_scales is not None,
-        num_warps=JOINT_EPILOGUE_WARPS,
+        num_warps=1 if sk == 1 else JOINT_EPILOGUE_WARPS,
     )
     return scores, ids, expert_input
 

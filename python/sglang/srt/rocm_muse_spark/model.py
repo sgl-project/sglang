@@ -70,6 +70,7 @@ from sglang.srt.layers.linear import (
 from sglang.srt.layers.logits_processor import LogitsProcessor as OSSLogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.unquant import (
+    gfx1250_tuned_gemms,
     register_gfx950_unquantized_gemm_shapes,
 )
 from sglang.srt.layers.quantization.utils import is_layer_skipped
@@ -365,33 +366,6 @@ _FINALIZE_PUSH_MAX_BYTES = 1 << 20
 # weight copies through aiter's CK GEMM from each weight's own minimum width (kernels/ops/gemm/fp8_prefill_gemm);
 # the O projection's copy and the pooler / unpooler copies exist for this path only.
 _PREFILL_DENSE_FP8 = _DENSE_FP8 and envs.SGLANG_ROCM_MUSE_PREFILL_DENSE_FP8.get()
-# gfx1250 SP prefill: the BF16 dense GEMMs at the shard widths (Ulysses QKV+gate / O, pooler, unpooler) run the
-# hipBLASLt / rocBLAS solutions torch TunableOp picked for them on gfx1250; any GEMM without a row keeps the default
-# heuristic.
-_PREFILL_GEMM_TUNABLEOP = (
-    os.path.join(
-        os.path.dirname(__file__), "configs", "gfx1250_prefill_gemm_tunableop.csv"
-    )
-    if mxfp4_moe._is_gfx1250()
-    else None
-)
-
-
-@contextlib.contextmanager
-def _prefill_tuned_gemms():
-    """TunableOp lookups (tuning off: the file is only read) for the GEMMs launched inside."""
-    tunable = torch.cuda.tunable
-    if tunable.get_filename() != _PREFILL_GEMM_TUNABLEOP:
-        tunable.tuning_enable(False)
-        tunable.set_filename(_PREFILL_GEMM_TUNABLEOP, insert_device_ordinal=False)
-        tunable.read_file(_PREFILL_GEMM_TUNABLEOP)
-    tunable.enable(True)
-    try:
-        yield
-    finally:
-        tunable.enable(False)
-
-
 # gfx1250 A8W4 experts under SP prefill: re-place the experts across EP ranks once from the counted prefill routing
 # (expert_placement); SGLANG_ROCM_MUSE_EXPERT_PLACEMENT=0 keeps the checkpoint order.
 _EXPERT_PLACEMENT = (
@@ -1205,11 +1179,12 @@ class MuseSpark1xMoE(nn.Module):
                 and getattr(self.experts, "gfx1250_a8w4", None) is not None
                 and mxfp4_moe.GFX1250_SP_MX_GATHER
             ):
-                # The rows stay packed (aiter's pre-quantized input, scattered straight from them) and the gather
-                # also hands back this rank's local expert ids for aiter's small-batch route.
+                # The rows stay packed (aiter's pre-quantized input, scattered straight from them). Small batches get
+                # this rank's local expert ids for aiter's small-batch route; larger ones unpack, route and scatter in
+                # one launch inside the experts (sequence_parallel.RoutedDispatch).
                 routed_mx, topk_ids, topk_scores = sp_gather_routed_mx(
                     expert_input, topk_ids, topk_scores, rows, self.expert_load_verify, mx=True,
-                    local_experts=(self.local_expert_start, self.num_local_experts),
+                    local_experts=(self.local_expert_start, self.num_local_experts), dispatch=True,
                 )  # fmt: skip
                 expert_input = None
             else:
@@ -1868,11 +1843,10 @@ class MuseSpark1xModel(nn.Module):
             attn_input = self.layers[0].self_attn_input_norm(stream)
             attn_input_fp8 = None
             last = len(self.layers) - 1
+            # gfx1250 SP prefill: the BF16 dense GEMMs at the shard widths run unquant's TunableOp picks.
             tuned = (
-                _prefill_tuned_gemms()
-                if _PREFILL_GEMM_TUNABLEOP is not None
-                and sp is not None
-                and not sp.verify
+                gfx1250_tuned_gemms()
+                if mxfp4_moe._is_gfx1250() and sp is not None and not sp.verify
                 else contextlib.nullcontext()
             )
             with tuned:
