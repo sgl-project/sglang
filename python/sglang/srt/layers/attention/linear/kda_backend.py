@@ -5,6 +5,9 @@ import torch
 
 from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention import kda_fused_decode
+from sglang.kernels.ops.attention.linear.kda_verify_gfx950 import (
+    kda_verify_gfx950_available,
+)
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -530,7 +533,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
         )
         self._fused_chain_verify_fn = None
         if (
-            envs.SGLANG_OPT_FUSED_KDA_VERIFY.get()
+            (
+                envs.SGLANG_OPT_FUSED_KDA_VERIFY.get()
+                or (is_hip() and is_gfx95_supported())
+            )
             and verify_backend.is_triton()
             and self.kernel_dispatcher.verify_kernel.supports_fused_chain_verify
         ):
@@ -1567,6 +1573,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
         ):
             return False
         replayssm_on = replayssm_rawv is not None
+        if is_hip() and not replayssm_on and not envs.SGLANG_OPT_FUSED_KDA_VERIFY.get():
+            # On by default on gfx950 only for the ReplaySSM ring; the snapshot path
+            # stays opt-in.
+            return False
         if draft_token_num < 3 or mixed_qkv.shape[0] % draft_token_num != 0:
             return False
         if (
@@ -1585,8 +1595,25 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         seq_len, dim = mixed_qkv.shape
         batch_size = seq_len // draft_token_num
-        if replayssm_on and (
-            batch_size != 1 or not (get_platform().is_sm90 or get_platform().is_sm100)
+        # gfx950 ring path, T=6 GLM-5.3-Flash TP4, us vs the pair: the Triton kernel wins
+        # up to B8; the FlyDSL kernel (kda_verify_gfx950) B6 7.4 vs 18.3, B16 12.3 vs
+        # 27.2, B64 31.9 vs 64.9.
+        gfx950_ring = (
+            replayssm_on
+            and is_hip()
+            and is_gfx95_supported()
+            and draft_token_num in (6, 8)
+            and kda_verify_gfx950_available()
+        )
+        if (
+            replayssm_on
+            and not (
+                is_hip() and is_gfx95_supported() and (batch_size <= 8 or gfx950_ring)
+            )
+            and (
+                batch_size != 1
+                or not (get_platform().is_sm90 or get_platform().is_sm100)
+            )
         ):
             # The runtime still uses BV=4, not the benchmark's best-BV sweep:
             # fused+ring wins at B=1 but regresses from B=4 (B=2 at T=8) on
@@ -1596,7 +1623,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             return False
         if is_hip() and not (
             is_gfx95_supported()
-            and 1 <= batch_size <= 16
+            and (1 <= batch_size <= 16 or gfx950_ring)
             and draft_token_num in (6, 8)
             and mixed_qkv.dtype == torch.bfloat16
             and layer.conv_weights.dtype == torch.float32
@@ -1633,10 +1660,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
             or (layer.bias is not None and layer.bias.dtype != layer.conv_weights.dtype)
         ):
             return False
+        # The ring path only reads the state; kda_verify_gfx950 widens a bf16 pool on load.
+        state_dtypes = (
+            (torch.float32, torch.bfloat16) if gfx950_ring else (torch.float32,)
+        )
         if (
             layer.A_log.dtype != torch.float32
             or layer.dt_bias.dtype != torch.float32
-            or ssm_states.dtype != torch.float32
+            or ssm_states.dtype not in state_dtypes
         ):
             return False
         if replayssm_on:

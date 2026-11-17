@@ -9,6 +9,9 @@ from sglang.kernels.ops.attention.linear.fused_kda_conv_recurrent_verify import 
 from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
+from sglang.kernels.ops.attention.linear.kda_verify_gfx950 import (
+    kda_verify_gfx950_supported,
+)
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_update,
 )
@@ -54,10 +57,9 @@ _RING_CASES += [
 _RING_LEN = 16
 
 
-def _make_ring_buffers(H, HV, K, V):
+def _make_ring_buffers(H, HV, K, V, slots=8):
     # Garbage-filled so a full-tensor bitwise compare proves both that written
     # positions match and that neither kernel scribbles outside them.
-    slots = 8
     return {
         "rawv": torch.randn(
             slots, HV, _RING_LEN, V, device=_DEVICE, dtype=torch.bfloat16
@@ -222,7 +224,7 @@ def _compare_case(case, num_warps=None, use_ring=False, weight_dtype=torch.bfloa
     B, T, H, HV, K, V, W, has_bias, lower_bound, neg_slot, seed = case
     inp = _make_inputs(B, T, H, HV, K, V, W, has_bias, neg_slot, seed, weight_dtype)
     if use_ring:
-        template = _make_ring_buffers(H, HV, K, V)
+        template = _make_ring_buffers(H, HV, K, V, slots=max(8, B + 2))
         rings_ref = {name: buf.clone() for name, buf in template.items()}
         rings_fus = {name: buf.clone() for name, buf in template.items()}
     else:
@@ -308,6 +310,96 @@ def test_output_does_not_depend_on_cta_scheduling():
 @pytest.mark.parametrize("case", _RING_CASES)
 def test_replayssm_ring_matches_unfused(case):
     _compare_case(case, num_warps=4, use_ring=True)
+
+
+def _is_gfx950():
+    return bool(torch.version.hip) and torch.cuda.get_device_properties(
+        0
+    ).gcnArchName.startswith("gfx950")
+
+
+# Shapes the gfx950 FlyDSL kernel (kda_verify_gfx950) takes: fp32 conv weights, safe
+# gate, no conv bias, T in (6, 8). B 1-4 use the 32-wide V tile, larger batches the
+# 64-wide one.
+_GFX950_RING_CASES = [
+    (1, 6, 16, 16, 128, 128, 4, False, -5.0, False, 30),
+    (6, 6, 16, 16, 128, 128, 4, False, -5.0, True, 31),
+    (16, 6, 16, 16, 128, 128, 4, False, -5.0, True, 32),
+    (3, 8, 16, 16, 128, 128, 4, False, -5.0, False, 33),
+    (9, 8, 16, 16, 128, 128, 4, False, -5.0, True, 34),
+    (5, 6, 4, 8, 128, 128, 4, False, -5.0, True, 35),
+]
+
+
+@pytest.mark.skipif(not _is_gfx950(), reason="gfx950 FlyDSL kernel")
+@pytest.mark.parametrize("case", _GFX950_RING_CASES)
+def test_gfx950_ring_matches_unfused(case):
+    B, T, H, HV, K, V, W, has_bias, lower_bound, neg_slot, seed = case
+    inp = _make_inputs(B, T, H, HV, K, V, W, has_bias, neg_slot, seed, torch.float32)
+    assert kda_verify_gfx950_supported(
+        mixed_qkv=inp["mixed"],
+        conv_weight=inp["w"],
+        conv_bias=None,
+        conv_state=inp["conv_pool"].transpose(-1, -2),
+        intermediate_conv_window=inp["win_pool"].transpose(-1, -2),
+        a=inp["a"],
+        b=inp["b"],
+        A_log=inp["A_log"],
+        dt_bias=inp["dt_bias"],
+        ssm_states=inp["ssm"],
+        T=T,
+        num_q_heads=H,
+        num_v_heads=HV,
+        head_k_dim=K,
+        head_v_dim=V,
+        lower_bound=lower_bound,
+        use_qk_l2norm_in_kernel=True,
+    )
+    _compare_case(case, use_ring=True, weight_dtype=torch.float32)
+
+
+@pytest.mark.skipif(not _is_gfx950(), reason="gfx950 FlyDSL kernel")
+@pytest.mark.parametrize("case", _GFX950_RING_CASES)
+def test_gfx950_ring_bf16_state_matches_fp32(case):
+    # A bf16 pool is widened on load, so it must match the fp32 pool holding the
+    # same values bit for bit.
+    B, T, H, HV, K, V, W, has_bias, lower_bound, neg_slot, seed = case
+    inp = _make_inputs(B, T, H, HV, K, V, W, has_bias, neg_slot, seed, torch.float32)
+    inp_bf16 = dict(inp, ssm=inp["ssm"].to(torch.bfloat16))
+    inp["ssm"] = inp_bf16["ssm"].float()
+    assert kda_verify_gfx950_supported(
+        mixed_qkv=inp["mixed"],
+        conv_weight=inp["w"],
+        conv_bias=None,
+        conv_state=inp["conv_pool"].transpose(-1, -2),
+        intermediate_conv_window=inp["win_pool"].transpose(-1, -2),
+        a=inp["a"],
+        b=inp["b"],
+        A_log=inp["A_log"],
+        dt_bias=inp["dt_bias"],
+        ssm_states=inp_bf16["ssm"],
+        T=T,
+        num_q_heads=H,
+        num_v_heads=HV,
+        head_k_dim=K,
+        head_v_dim=V,
+        lower_bound=lower_bound,
+        use_qk_l2norm_in_kernel=True,
+    )
+    template = _make_ring_buffers(H, HV, K, V, slots=max(8, B + 2))
+    rings32 = {name: buf.clone() for name, buf in template.items()}
+    rings16 = {name: buf.clone() for name, buf in template.items()}
+    o32, _, win32, _ = _run_fused(
+        inp, B, T, H, HV, K, V, lower_bound, None, rings=rings32
+    )
+    o16, _, win16, _ = _run_fused(
+        inp_bf16, B, T, H, HV, K, V, lower_bound, None, rings=rings16
+    )
+    valid = [i for i, slot in enumerate(inp["idx_vals"]) if slot >= 0]
+    assert torch.equal(o16.reshape(B, T, HV, V)[valid], o32.reshape(B, T, HV, V)[valid])
+    assert torch.equal(win16, win32)
+    for name in template:
+        assert torch.equal(rings16[name], rings32[name]), name
 
 
 if __name__ == "__main__":
