@@ -235,11 +235,12 @@ class HybridAttnBackend(AttentionBackend):
         return backend.get_indexer_metadata(layer_id, forward_batch)
 
     def update_mamba_state_after_mtp_verify(self, *args, **kwargs):
-        if self.spec_attn_is_decode:
-            backend = self.decode_backend
-        else:
-            backend = self.prefill_backend
-        return backend.update_mamba_state_after_mtp_verify(*args, **kwargs)
+        return self.target_verify_backend().update_mamba_state_after_mtp_verify(
+            *args, **kwargs
+        )
+
+    def forward_state_slots(self, *args, **kwargs):
+        return self.target_verify_backend().forward_state_slots(*args, **kwargs)
 
     def forward(
         self,

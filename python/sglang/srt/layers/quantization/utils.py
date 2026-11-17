@@ -6,8 +6,9 @@ from __future__ import annotations
 
 import re
 from copy import deepcopy
+from fractions import Fraction
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Dict, List, Mapping, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union
 
 import numpy
 import torch
@@ -65,6 +66,29 @@ _FALLBACK_FUSED_SHARDS: Mapping[str, List[str]] = {
     "qkv_proj": ["q_proj", "k_proj", "v_proj"],
     "gate_up_proj": ["gate_proj", "up_proj"],
 }
+
+# GPTQ dynamic negative rules reference checkpoint-side shard names, including
+# split GDN projections (`in_proj_qkv`/`in_proj_z` and `in_proj_b`/`in_proj_a`)
+# that are fused into `in_proj_qkvz` and `in_proj_ba` in SGLang.
+_DYNAMIC_FUSED_SHARDS: Mapping[str, List[str]] = {
+    **_FALLBACK_FUSED_SHARDS,
+    "in_proj_qkvz": ["in_proj_qkv", "in_proj_z"],
+    "in_proj_ba": ["in_proj_b", "in_proj_a"],
+}
+
+
+def resolve_dynamic_fused_shards(
+    config: Optional[QuantizationConfig], proj_name: str
+) -> Optional[List[str]]:
+    packed_mapping = getattr(config, "packed_modules_mapping", None)
+    if isinstance(packed_mapping, Mapping) and proj_name in packed_mapping:
+        candidate = packed_mapping[proj_name]
+        # Hardware backends (e.g. NPU) may insert nested module-tree dicts
+        # into packed_modules_mapping; only flat shard sequences apply here.
+        if isinstance(candidate, (list, tuple)):
+            return list(candidate)
+    shards = _DYNAMIC_FUSED_SHARDS.get(proj_name)
+    return list(shards) if shards is not None else None
 
 
 def is_layer_skipped(
@@ -230,7 +254,11 @@ def override_config(config: QuantizationConfig, prefix: str):
     if isinstance(desc_act, bool):
         config.desc_act = desc_act
 
-    config.pack_factor = 32 // config.weight_bits  # packed into int32
+    config.pack_factor = (
+        Fraction(32, config.weight_bits)
+        if config.get_name() == "gptq"
+        else 32 // config.weight_bits
+    )  # packed into int32
     if config.get_name() == "gptq_marlin":
         is_sym = get_dynamic_override(config, prefix, "sym", config.is_sym)
         if isinstance(is_sym, bool):
@@ -251,25 +279,178 @@ def override_config(config: QuantizationConfig, prefix: str):
             )
 
 
+_DYNAMIC_OVERRIDE_MISSING = object()
+_DYNAMIC_DEFAULT_COMPARE_KEYS = ("bits", "group_size", "desc_act", "sym")
+
+
+def _normalize_dynamic_override_value(value: Any) -> Any:
+    if isinstance(value, bool):
+        return (bool, value)
+    return value
+
+
+def _get_effective_dynamic_override_value(
+    config: QuantizationConfig,
+    override_dict: Optional[Mapping[str, Any]],
+    key: str,
+) -> Any:
+    if override_dict is not None and key in override_dict:
+        return _normalize_dynamic_override_value(override_dict[key])
+    if key == "bits":
+        return _normalize_dynamic_override_value(
+            getattr(config, "weight_bits", _DYNAMIC_OVERRIDE_MISSING)
+        )
+    if key == "sym":
+        if hasattr(config, "is_sym"):
+            return _normalize_dynamic_override_value(config.is_sym)
+        if hasattr(config, "sym"):
+            return _normalize_dynamic_override_value(config.sym)
+        return _DYNAMIC_OVERRIDE_MISSING
+    return _normalize_dynamic_override_value(
+        getattr(config, key, _DYNAMIC_OVERRIDE_MISSING)
+    )
+
+
+def _get_single_dynamic_override(
+    dynamic: Dict[str, Dict[str, Union[int, bool]]],
+    fused_name: str,
+    target_name: str,
+    key: Optional[str] = None,
+    default_value: Union[int, bool, None] = None,
+) -> Union[Dict, int, bool, None]:
+    for pattern, pattern_dict in dynamic.items():
+        # Negative match: matched modules are excluded from quantized init
+        if pattern.startswith("-:"):
+            regex = pattern.removeprefix("-:")
+            if re.match(regex, target_name) or (
+                fused_name != target_name and re.match(regex, fused_name)
+            ):
+                return False
+        # Positive match: matched modules have quant properties overrides
+        # base quant config
+        else:
+            regex = pattern.removeprefix("+:")
+            if re.match(regex, target_name) or (
+                fused_name != target_name and re.match(regex, fused_name)
+            ):
+                if key is None:
+                    return pattern_dict
+                return pattern_dict.get(key, default_value)
+    return default_value
+
+
 def get_dynamic_override(
     config: QuantizationConfig,
     layer_name: str,
     key: Optional[str] = None,
     default_value: Union[int, bool, None] = None,
 ) -> Union[Dict, int, bool, None]:
-    for pattern, pattern_dict in config.dynamic.items():
-        # Negative match: matched modules are excluded from quantized init
-        if pattern.startswith("-:"):
-            if re.match(pattern.removeprefix("-:"), layer_name):
-                return False
-        # Positive match: matched modules have quant properties overrides
-        # base quant config
-        elif re.match(pattern.removeprefix("+:"), layer_name):
-            if key is None:
-                return pattern_dict
-            else:
-                return pattern_dict.get(key, default_value)
-    return default_value
+    dynamic = getattr(config, "dynamic", None) or {}
+    proj_name = layer_name.split(".")[-1]
+    fused_shards = resolve_dynamic_fused_shards(config, proj_name)
+    if not fused_shards:
+        return _get_single_dynamic_override(
+            dynamic,
+            fused_name=layer_name,
+            target_name=layer_name,
+            key=key,
+            default_value=default_value,
+        )
+
+    shard_names = [layer_name.removesuffix(proj_name) + shard for shard in fused_shards]
+    shard_results = [
+        _get_single_dynamic_override(
+            dynamic,
+            fused_name=layer_name,
+            target_name=shard_name,
+            key=None,
+            default_value=None,
+        )
+        for shard_name in shard_names
+    ]
+    shard_skipped = [result is False for result in shard_results]
+    if all(shard_skipped):
+        return False
+    if any(shard_skipped):
+        raise ValueError(
+            f"Detected some but not all shards of {layer_name} "
+            "are excluded in dynamic quantization config. All shards "
+            "of fused layers must share the same precision."
+        )
+    if all(result is None for result in shard_results):
+        return default_value
+
+    if any(
+        result is not None and not isinstance(result, Mapping)
+        for result in shard_results
+    ):
+        if any(result != shard_results[0] for result in shard_results[1:]):
+            raise ValueError(
+                f"Detected mixed dynamic quantization overrides across shards of {layer_name}."
+            )
+        agreed = shard_results[0]
+        if key is None:
+            return agreed
+        return default_value if agreed is None else agreed
+
+    compare_keys = list(_DYNAMIC_DEFAULT_COMPARE_KEYS)
+    extra_keys = sorted(
+        {
+            k
+            for result in shard_results
+            if isinstance(result, Mapping)
+            for k in result
+            if k not in _DYNAMIC_DEFAULT_COMPARE_KEYS
+        }
+    )
+    compare_keys.extend(extra_keys)
+
+    normalized_shards = [
+        tuple(
+            _get_effective_dynamic_override_value(config, result, cmp_key)
+            for cmp_key in compare_keys
+        )
+        for result in shard_results
+    ]
+    if any(norm != normalized_shards[0] for norm in normalized_shards[1:]):
+        raise ValueError(
+            f"Detected mixed dynamic quantization overrides across shards of {layer_name}."
+        )
+
+    merged_overrides: Dict[str, Any] = {}
+    for result in shard_results:
+        if isinstance(result, Mapping):
+            merged_overrides.update(result)
+    if key is None:
+        return merged_overrides
+    return merged_overrides.get(key, default_value)
+
+
+_QUANTIZED_PARAM_SUFFIXES = ("qweight", "qzeros", "scales", "g_idx")
+
+
+def validate_quant_param_compatibility(
+    name: str,
+    params_dict: Mapping[str, torch.nn.Parameter],
+) -> None:
+    """Reject checkpoint weights whose precision conflicts with model params."""
+    if name in params_dict or "." not in name:
+        return
+    module_prefix, suffix = name.rsplit(".", 1)
+    if suffix in _QUANTIZED_PARAM_SUFFIXES:
+        dense_param = f"{module_prefix}.weight"
+        if dense_param in params_dict:
+            raise ValueError(
+                f"Incompatible quantized checkpoint shard '{name}' cannot be "
+                f"loaded into unquantized dense layer '{module_prefix}'."
+            )
+    elif suffix == "weight":
+        quant_param = f"{module_prefix}.qweight"
+        if quant_param in params_dict:
+            raise ValueError(
+                f"Incompatible dense checkpoint shard '{name}' cannot be "
+                f"loaded into quantized layer '{module_prefix}'."
+            )
 
 
 def get_linear_quant_method(

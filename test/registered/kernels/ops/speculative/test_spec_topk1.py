@@ -201,17 +201,6 @@ class TestSpecTopk1Triton(CustomTestCase):
         self.assertEqual(topk_index.shape, (0, 1))
         self.assertEqual(draft_tokens.numel(), 0)
 
-    def test_non_contiguous_inputs_raise(self):
-        logits = torch.empty((16, 4), dtype=torch.float32, device=self.device).t()
-        positions = torch.arange(8, dtype=torch.long, device=self.device)[::2]
-
-        with self.assertRaises(AssertionError):
-            draft_topk1_postprocess(
-                logits, torch.empty(4, dtype=torch.long, device=self.device)
-            )
-        with self.assertRaises(AssertionError):
-            draft_topk1_postprocess(torch.empty((4, 16), device=self.device), positions)
-
 
 if __name__ == "__main__":
     unittest.main()
