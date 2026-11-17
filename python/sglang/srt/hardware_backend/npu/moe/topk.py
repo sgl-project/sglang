@@ -1,6 +1,7 @@
 from typing import TYPE_CHECKING, Optional
 
 import torch
+from sgl_kernel_npu.operators.moe import moe_gating_top_k
 
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.eplb.expert_location_dispatch import topk_ids_logical_to_physical
@@ -29,14 +30,14 @@ def fused_topk_npu(
     correction_bias = topk_config.correction_bias
 
     # sqrtsoftplus (DSV4 noaux_tc): top-k over (scores + bias); weights from
-    # un-biased scores. The custom op fuses softplus/sqrt/topk/gather/norm/cast.
+    # un-biased scores. norm_type=2 fuses softplus/sqrt/topk/gather/norm/cast.
     if topk_config.scoring_func == "sqrtsoftplus":
         routed_scaling_factor = (
             topk_config.routed_scaling_factor
             if topk_config.apply_routed_scaling_factor_on_output
             else 1.0
         )
-        topk_weights, topk_ids, _ = torch.ops.custom.npu_moe_gating_top_k(
+        topk_weights, topk_ids, _ = moe_gating_top_k(
             x=router_logits.to(torch.float32),
             k=topk_config.top_k,
             bias=(
@@ -44,10 +45,8 @@ def fused_topk_npu(
                 if correction_bias is not None
                 else None
             ),
-            input_ids=None,
-            tid2eid=None,
-            routed_scaling_factor=float(routed_scaling_factor),
             norm_type=2,
+            routed_scaling_factor=float(routed_scaling_factor),
         )
         topk_weights = topk_weights.to(torch.float32)
 
@@ -74,8 +73,8 @@ def fused_topk_npu(
         or topk_config.scoring_func == "sigmoid"
         or num_token_non_padded is not None
     ):
-        topk_weights, topk_ids, _ = torch.ops.npu.npu_moe_gating_top_k(
-            router_logits.to(torch.float32),
+        topk_weights, topk_ids, _ = moe_gating_top_k(
+            x=router_logits.to(torch.float32),
             k=topk_config.top_k,
             bias=(
                 correction_bias.to(torch.float32)
@@ -86,7 +85,8 @@ def fused_topk_npu(
             k_group=topk_config.topk_group if use_grouped_topk else 1,
             group_count=topk_config.num_expert_group if use_grouped_topk else 1,
             group_select_mode=(1 if use_grouped_topk else 0),
-            renorm=renormalize,
+            # Sigmoid already normalizes selected weights; CANN 9.1 only accepts 0.
+            renorm=0 if topk_config.scoring_func == "sigmoid" else renormalize,
             # 1 for sigmoid, 0 for softmax
             norm_type=(0 if topk_config.scoring_func == "softmax" else 1),
             routed_scaling_factor=(

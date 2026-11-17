@@ -12,6 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::app::AppState;
+use super::auth::DeclaredRoute;
 use super::generate_hook::{
     GenerateFrameHook, GenerateFrameInfo, GenerateFrameKeys, GenerateHook, GenerateTerminal,
 };
@@ -489,7 +490,7 @@ impl serde::Serialize for NativeFrame {
 /// The routes this module owns, mounted by `api_server::serve`.
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/generate", post(generate))
+        .declared_route("/generate", post(generate))
         .merge(health_routes())
 }
 
@@ -539,8 +540,8 @@ fn health_routes() -> Router<Arc<AppState>> {
     };
     let probe = get(move |state: State<Arc<AppState>>| health_generate(state, timeout, true));
     Router::new()
-        .route("/health", health)
-        .route("/health_generate", probe)
+        .declared_route("/health", health)
+        .declared_route("/health_generate", probe)
 }
 
 async fn health_without_generation(State(state): State<Arc<AppState>>) -> Response {
@@ -757,9 +758,6 @@ pub(super) fn generate_requests(
     // Read before the fills below: only a `max_new_tokens` the client sent is
     // checked against the context window.
     let client_max_new_tokens = ClientMaxNewTokens::of_json(&body);
-    if let Some(fields) = body.as_object_mut() {
-        crate::message::request::move_deprecated_dp_rank(fields);
-    }
     // Launch-time preferred sampling params fill in beneath the request's own
     // keys before decoding, so an explicit request value (even a default or
     // null) wins: Python TokenizerManager's precedence.
@@ -1352,8 +1350,7 @@ mod tests {
 
     /// Also: an HTTP layer's [`crate::RequestStart`] starts the request's
     /// timing, so `e2e_latency` covers the layer's work too.
-    #[tokio::test]
-    async fn unary_http_generate_round_trips_through_frontend_handle() {
+    async fn assert_native_http_rid_echo(client_rid: &str, stream: bool) {
         let (intake_tx, intake_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::unbounded();
         let core = crate::api_server::handlers::CoreHandle::new(
@@ -1383,6 +1380,7 @@ mod tests {
             openai_chat: None,
         });
 
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
         let responder = tokio::spawn(async move {
             let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap()
             else {
@@ -1394,16 +1392,29 @@ mod tests {
             };
             assert_eq!(generate.input_ids.as_deref(), Some([1, 2].as_slice()));
             let rid = request.rid.clone();
+            if stream {
+                request
+                    .sink
+                    .try_send(ResponseItem::Frame(ChunkEvent {
+                        rid: rid.clone(),
+                        text: "o".into(),
+                        prompt_tokens: 2,
+                        completion_tokens: 1,
+                        ..Default::default()
+                    }))
+                    .unwrap();
+                finish_rx.await.unwrap();
+            }
             request
                 .sink
                 .try_send(ResponseItem::Done(ChunkEvent {
                     rid,
-                    text: "ok".into(),
+                    text: if stream { "k" } else { "ok" }.into(),
                     prompt_tokens: 2,
-                    completion_tokens: 1,
+                    completion_tokens: if stream { 1 } else { 2 },
                     finish_reason: serde_json::from_value(serde_json::json!({
                         "type": "length",
-                        "length": 1
+                        "length": 2
                     }))
                     .unwrap(),
                     ..Default::default()
@@ -1420,24 +1431,71 @@ mod tests {
                 Instant::now().checked_sub(layer_work).unwrap(),
             ))
             .body(Body::from(
-                r#"{"rid":"client-rid","input_ids":[1,2],"sampling_params":{"max_new_tokens":1}}"#,
+                serde_json::to_vec(&serde_json::json!({
+                    "rid": client_rid,
+                    "input_ids": [1, 2],
+                    "sampling_params": {"max_new_tokens": 2},
+                    "stream": stream,
+                }))
+                .unwrap(),
             ))
             .unwrap();
         let response = routes().with_state(state).oneshot(request).await.unwrap();
-        responder.await.unwrap();
-
         assert_eq!(response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
-            .await
-            .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let mut body_stream = response.into_body().into_data_stream();
+        let mut body = Vec::new();
+        if stream {
+            // Read the first SSE frame before Done, avoiding cumulative coalescing.
+            body.extend_from_slice(&body_stream.next().await.unwrap().unwrap());
+            finish_tx.send(()).unwrap();
+        }
+        while let Some(chunk) = body_stream.next().await {
+            body.extend_from_slice(&chunk.unwrap());
+        }
+        responder.await.unwrap();
+        let values: Vec<serde_json::Value> = if stream {
+            String::from_utf8(body.to_vec())
+                .unwrap()
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter(|data| *data != "[DONE]")
+                .map(|data| serde_json::from_str(data).unwrap())
+                .collect()
+        } else {
+            vec![serde_json::from_slice(&body).unwrap()]
+        };
+        assert!(!values.is_empty());
+        if stream {
+            assert!(
+                values.len() >= 2,
+                "stream must carry intermediate and terminal frames"
+            );
+        }
+        for value in &values {
+            assert_eq!(value["meta_info"]["id"], client_rid);
+        }
+        let value = values.last().unwrap();
         assert_eq!(value["text"], "ok");
-        assert_eq!(value["meta_info"]["id"], "client-rid");
+        assert_eq!(value["meta_info"]["id"], client_rid);
         assert_eq!(value["meta_info"]["prompt_tokens"], 2);
-        assert_eq!(value["meta_info"]["completion_tokens"], 1);
+        assert_eq!(value["meta_info"]["completion_tokens"], 2);
         let e2e_latency = value["meta_info"]["e2e_latency"].as_f64().unwrap();
         assert!(e2e_latency >= layer_work.as_secs_f64(), "{e2e_latency}");
         assert!(abort_rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn unary_http_generate_round_trips_through_frontend_handle() {
+        assert_native_http_rid_echo("client-rid", false).await;
+    }
+
+    #[tokio::test]
+    async fn long_rids_round_trip_through_unary_and_streaming_http() {
+        for client_rid in ["x".repeat(200), "é".repeat(128)] {
+            for stream in [false, true] {
+                assert_native_http_rid_echo(&client_rid, stream).await;
+            }
+        }
     }
 
     /// Each item `body` submits under `server_args`: its `max_new_tokens`, and
@@ -1635,9 +1693,8 @@ mod tests {
         assert!(logs.rejections().is_empty());
     }
 
-    /// `/generate` checks the DP rank a body names as Python does: the
-    /// deprecated `data_parallel_rank` when `routed_dp_rank` is unset, and a
-    /// rank outside the deployment is a 400 with Python's message, logged once.
+    /// `/generate` checks the DP rank a body names as Python does: a rank
+    /// outside the deployment is a 400 with Python's message, logged once.
     #[tokio::test]
     async fn generate_refuses_a_routed_dp_rank_out_of_range() {
         let state = Arc::new(AppState {
@@ -1665,40 +1722,33 @@ mod tests {
             generate_hook: None,
             openai_chat: None,
         });
-        for (body, rank) in [
-            (r#"{"input_ids": [1], "data_parallel_rank": 3}"#, 3),
-            (
-                r#"{"input_ids": [1], "routed_dp_rank": 2, "data_parallel_rank": 0}"#,
-                2,
-            ),
-        ] {
-            let logs = crate::utils::logging::capture_logs();
-            let request = Request::builder()
-                .method("POST")
-                .uri("/generate")
-                .header("content-type", "application/json")
-                .body(Body::from(body))
-                .unwrap();
-            let response = routes()
-                .with_state(state.clone())
-                .oneshot(request)
-                .await
-                .unwrap();
-            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
-            let reply = axum::body::to_bytes(response.into_body(), 64 * 1024)
-                .await
-                .unwrap();
-            let message = format!("routed_dp_rank={rank} out of range [0, 1)");
-            assert_eq!(
-                parse(std::str::from_utf8(&reply).unwrap())["error"]["message"],
-                message
-            );
-            let rejections = logs.rejections();
-            assert!(
-                matches!(rejections.as_slice(), [line] if line.contains("WARN") && line.contains(&message)),
-                "{rejections:?}"
-            );
-        }
+        let (body, rank) = (r#"{"input_ids": [1], "routed_dp_rank": 3}"#, 3);
+        let logs = crate::utils::logging::capture_logs();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/generate")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+        let response = routes()
+            .with_state(state.clone())
+            .oneshot(request)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{body}");
+        let reply = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .unwrap();
+        let message = format!("routed_dp_rank={rank} out of range [0, 1)");
+        assert_eq!(
+            parse(std::str::from_utf8(&reply).unwrap())["error"]["message"],
+            message
+        );
+        let rejections = logs.rejections();
+        assert!(
+            matches!(rejections.as_slice(), [line] if line.contains("WARN") && line.contains(&message)),
+            "{rejections:?}"
+        );
     }
 
     /// An item whose `sampling_params` name no `max_new_tokens` is marked

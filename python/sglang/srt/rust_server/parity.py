@@ -81,13 +81,11 @@ RUST_SERVER_IGNORED_BY_DESIGN: Dict[str, str] = {
     "enable_dp_attention_local_control_broadcast": "Fans Python's control requests out to DP ranks; each Rust listener serves its own rank.",
     # The Python HTTP server.
     "SGLANG_HTTP_SERVER_APP_PATH": "Python HTTP server (Granian) setting.",
-    "SGLANG_TIMEOUT_KEEP_ALIVE": "Python HTTP server idle timeout; axum::serve sets none, which keeps the router's >50 s idle connections.",
+    "SGLANG_TIMEOUT_KEEP_ALIVE": "Python HTTP server idle timeout; the Rust listener sets none, which keeps the router's >50 s idle connections.",
     "SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT": "Python HTTP server (uvicorn) setting.",
     "fastapi_root_path": "Python HTTP server (FastAPI) setting.",
     "enable_http_worker_reuseport": "Python HTTP server (multi-worker) setting.",
     "grpc_worker_threads": "Python gRPC server thread pool.",
-    "http2_initial_connection_window_size": "Only with --enable-http2, which is refused.",
-    "http2_max_concurrent_streams": "Only with --enable-http2, which is refused.",
     # Routes the Rust server does not serve: their clients get a 404.
     "SGLANG_OLLAMA_ROOT_ROUTE": "Ollama routes are not served.",
     "SGLANG_OLLAMA_CHAT_ROUTE": "Ollama routes are not served.",
@@ -158,7 +156,6 @@ RUST_SERVER_KNOWN_GAPS: Dict[str, str] = {
     "SGLANG_CUDA_COREDUMP_BEFORE_CRASH": "No crash diagnostics when a scheduler crashes.",
     "SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS": "No crash diagnostics when a scheduler crashes.",
     "speculative_num_draft_tokens": "No per-request speculative-decoding stats in meta_info (also behind the speculative_algorithm read, honored by name).",
-    "return_hidden_states_mode": "Rust gets the resolved enable_return_hidden_states only: a request above the server's mode is not refused.",
     "SGLANG_ENABLE_COLOCATED_BATCH_GEN": "Unverified: whether a batch's items are scheduled together.",
     "enable_encoder_swa_bounded_replay": "Unverified: Python refuses image requests off CUDA and warms up with text.",
     "SGLANG_INKLING_DEFAULT_REASONING_EFFORT": "Chat: the Rust chat route has no Inkling renderer.",
