@@ -68,6 +68,7 @@ class _Req:
         self.extend_end = None
         self.retracted_stain = False
         self.sampling_params = SimpleNamespace(max_new_tokens=0)
+        self.beam_group = None
         self.kv = SimpleNamespace(holds_kv=False)
         # Main's SPF ranking reads the HRRN aging axis on every request.
         self.arrival_processed_tokens = 0
