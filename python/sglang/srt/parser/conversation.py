@@ -151,13 +151,20 @@ class Conversation:
                     ret += role + "\n"
             return ret
         elif self.sep_style == SeparatorStyle.QWEN2_VL_EMBED:
-            ret = "" if system_prompt == "" else system_prompt + self.sep
+            ret = (
+                ""
+                if (not self.system_message or system_prompt == "")
+                else system_prompt + self.sep
+            )
             for role, message in self.messages:
                 if message:
                     ret += role + "\n" + message + self.sep
                 else:
                     ret += role + "\n"
-            ret += self.stop_str
+            if isinstance(self.stop_str, str):
+                ret += self.stop_str
+            elif isinstance(self.stop_str, (list, tuple)) and self.stop_str:
+                ret += self.stop_str[0]
             return ret
         elif self.sep_style == SeparatorStyle.NO_COLON_SINGLE:
             ret = system_prompt
@@ -373,11 +380,14 @@ class Conversation:
             counter = 1
             for role, message in self.messages:
                 if message:
-                    while self.audio_token in message:
-                        message = message.replace(
-                            self.audio_token, self.audio_token.format(idx=counter), 1
-                        )
-                        counter += 1
+                    if self.audio_token and "{idx}" in self.audio_token:
+                        while self.audio_token in message:
+                            message = message.replace(
+                                self.audio_token,
+                                self.audio_token.format(idx=counter),
+                                1,
+                            )
+                            counter += 1
 
                     ret += role + "\n" + message + self.sep
                 else:
