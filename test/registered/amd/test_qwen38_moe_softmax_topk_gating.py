@@ -7,14 +7,21 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.moe import topk as topk_module
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_gfx942_supported
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd")
 
-# Qwen3.8 and Qwen3.8-Flash-Next.
-HIDDEN_SIZES = (8192, 2560)
+# Qwen3.8, Qwen3.8-Flash-Next and Qwen3.5-397B-A17B.
+HIDDEN_SIZES = (8192, 2560, 4096)
+_IS_GFX95 = is_gfx95_supported()
+_MAX_ROWS = (
+    topk_module._AITER_TOPK_GATING_MAX_ROWS
+    if _IS_GFX95
+    else topk_module._AITER_TOPK_GATING_MAX_ROWS_GFX942
+)
 NUM_EXPERTS = 512
 TOPK = 10
 
@@ -45,8 +52,10 @@ def _envelope(
 
 
 @unittest.skipUnless(
-    torch.cuda.is_available() and torch.version.hip and is_gfx95_supported(),
-    "requires AMD gfx95",
+    torch.cuda.is_available()
+    and torch.version.hip
+    and (is_gfx95_supported() or is_gfx942_supported()),
+    "requires AMD gfx95 or gfx942",
 )
 class TestQwen38MoeSoftmaxTopKGating(CustomTestCase):
     def test_topk_gating_matches_legacy_launcher(self):
@@ -54,7 +63,7 @@ class TestQwen38MoeSoftmaxTopKGating(CustomTestCase):
 
         # aiter switches from the E=512 prefill kernel to its shared-memory
         # kernel above 1024 rows.
-        rows = (4, 128, 1024, 1025, 2048, topk_module._AITER_TOPK_GATING_MAX_ROWS)
+        rows = tuple(r for r in (4, 128, 1024, 1025, 2048, 4096) if r <= _MAX_ROWS)
         for hidden_size, num_tokens in itertools.product(HIDDEN_SIZES, rows):
             with self.subTest(hidden_size=hidden_size, num_tokens=num_tokens):
                 torch.manual_seed(num_tokens)
@@ -82,7 +91,8 @@ class TestQwen38MoeSoftmaxTopKGating(CustomTestCase):
                 with (
                     patch.object(topk_module, "_use_aiter", True),
                     patch.object(topk_module, "_use_aiter_topk_gating", True),
-                    patch.object(topk_module, "_is_gfx95", True),
+                    patch.object(topk_module, "_is_gfx95", _IS_GFX95),
+                    patch.object(topk_module, "_is_gfx942", not _IS_GFX95),
                     patch.object(
                         topk_module,
                         "aiter_fused_topk",
@@ -125,16 +135,17 @@ class TestQwen38MoeSoftmaxTopKGating(CustomTestCase):
         with (
             patch.object(topk_module, "_use_aiter", True),
             patch.object(topk_module, "_use_aiter_topk_gating", True),
-            patch.object(topk_module, "_is_gfx95", True),
+            patch.object(topk_module, "_is_gfx95", _IS_GFX95),
+            patch.object(topk_module, "_is_gfx942", not _IS_GFX95),
         ):
-            self.assertFalse(_envelope(logits, 4096))
+            self.assertFalse(_envelope(logits, 3072))
             for hidden_size in HIDDEN_SIZES:
                 with self.subTest(hidden_size=hidden_size):
                     self.assertTrue(_envelope(logits, hidden_size))
                     self.assertFalse(
                         _envelope(
                             torch.empty(
-                                topk_module._AITER_TOPK_GATING_MAX_ROWS + 1,
+                                _MAX_ROWS + 1,
                                 NUM_EXPERTS,
                                 device="cuda",
                                 dtype=torch.bfloat16,
@@ -172,6 +183,13 @@ class TestQwen38MoeSoftmaxTopKGating(CustomTestCase):
                         _envelope(logits, hidden_size, num_fused_shared_experts=1)
                     )
                     self.assertFalse(_envelope(logits, hidden_size, packed_out=packed))
+        with (
+            patch.object(topk_module, "_use_aiter", True),
+            patch.object(topk_module, "_is_gfx95", False),
+            patch.object(topk_module, "_is_gfx942", False),
+        ):
+            for hidden_size in HIDDEN_SIZES:
+                self.assertFalse(_envelope(logits, hidden_size))
         with patch.object(topk_module, "_use_aiter_topk_gating", False):
             for hidden_size in HIDDEN_SIZES:
                 self.assertFalse(_envelope(logits, hidden_size))
