@@ -12,6 +12,7 @@ from types import MethodType
 from typing import Any
 
 import torch
+import torch.distributed as dist
 import torch.distributed.tensor as dist_tensor
 from torch import nn
 from torch.distributed import DeviceMesh, init_device_mesh
@@ -42,6 +43,10 @@ from sglang.multimodal_gen.runtime.layers.quantization.bitsandbytes import (
 )
 from sglang.multimodal_gen.runtime.loader import rank_local_checkpoint
 from sglang.multimodal_gen.runtime.loader.host_spill import HostSpill
+from sglang.multimodal_gen.runtime.loader.replicated_weight_copy import (
+    replicated_copy_to_device,
+    uses_replicated_copy,
+)
 from sglang.multimodal_gen.runtime.loader.utils import (
     finalize_loaded_model,
     get_param_names_mapping,
@@ -275,6 +280,7 @@ def maybe_load_fsdp_model(
     weight_load_plan: WeightLoadPlan | None = None,
     checkpoint_key_filter: Callable[[str], bool] | None = None,
     weights_iterator: Generator[tuple[str, torch.Tensor], None, None] | None = None,
+    replicated_group: dist.ProcessGroup | None = None,
 ) -> torch.nn.Module:
     """Load a model with optional FSDP (Fully Sharded Data Parallel) support.
 
@@ -295,6 +301,9 @@ def maybe_load_fsdp_model(
         weights_iterator: Optional pre-built ``(name, tensor)`` source, used
             instead of reading ``weight_dir_list`` as safetensors. Set by callers
             whose checkpoint is not safetensors at all, such as GGUF.
+        replicated_group: Device group whose ranks all load this same model at
+            the same time (see ``load_model_from_full_model_state_dict``);
+            ignored under FSDP.
     """
     # NOTE(will): cast_forward_inputs=True shouldn't be needed as we are
     # manually casting the inputs to the model
@@ -477,6 +486,7 @@ def maybe_load_fsdp_model(
         ),
         preconverted_state_dict=preconverted_state_dict,
         host_spill=host_spill,
+        replicated_group=None if use_fsdp else replicated_group,
     )
     if host_spill is not None:
         host_spill.log_summary(type(model).__name__)
@@ -603,6 +613,7 @@ def load_model_from_full_model_state_dict(
     ) = None,
     allow_device_tensor_assignment: bool = False,
     host_spill: HostSpill | None = None,
+    replicated_group: dist.ProcessGroup | None = None,
 ) -> _IncompatibleKeys:
     """
     Converting full state dict into a sharded state dict
@@ -620,6 +631,10 @@ def load_model_from_full_model_state_dict(
             already materialized on the target device. This is reserved for an
             explicit full-state direct-device load; ordinary loading keeps its
             established parameter materialization path.
+        replicated_group (ProcessGroup | None): every rank of this device group
+            loads the same checkpoint into the same model at the same time; large
+            host tensors then reach the device through one host slice per rank
+            and an all-gather (same bytes).
     Returns:
         ``NamedTuple`` with ``missing_keys`` and ``unexpected_keys`` fields:
             * **missing_keys** is a list of str containing the missing keys
@@ -754,6 +769,10 @@ def load_model_from_full_model_state_dict(
             if cpu_offload:
                 sharded_tensor = sharded_tensor.cpu()
         elif not isinstance(meta_sharded_param, dist_tensor.DTensor):
+            if replicated_group is not None and uses_replicated_copy(full_tensor):
+                full_tensor = replicated_copy_to_device(
+                    full_tensor, checkpoint_load_device, replicated_group
+                )
             full_tensor = full_tensor.to(
                 device=checkpoint_load_device,
                 dtype=target_dtype,
