@@ -22,10 +22,10 @@ from sglang.test.test_utils import (
 register_cuda_ci(est_time=196, stage="base-b", runner_config="1-gpu-small")
 # Backend-specific: the llama3 and pythonic parsers run on real decoded text,
 # so ROCm decode divergence surfaces as tool calls that no longer parse.
-register_amd_ci(est_time=73, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=73, suite="base-b-test-1-gpu-small-amd")
 # Backend-specific: Ascend uses a local model mirror and its native
 # attention backend, while sharing the protocol assertions below.
-register_npu_ci(est_time=400, suite="full-1-npu-a3", nightly=True)
+register_npu_ci(est_time=400, suite="full-test-1-npu-a3", nightly=True)
 
 
 def _model_path():
@@ -343,8 +343,9 @@ class TestOpenAIServerFunctionCalling(CustomTestCase):
             model=self.model,
             max_tokens=2048,
             messages=messages,
-            temperature=0.9,
-            top_p=0.9,
+            # Greedy: at temperature 0.9 the 1B model writes the call as a
+            # Python dict (single quotes) in ~2-9% of runs, which isn't a tool call.
+            temperature=0,
             stream=True,
             tools=tools,
         )
