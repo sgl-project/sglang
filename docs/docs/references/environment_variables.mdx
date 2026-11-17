@@ -1977,6 +1977,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On gfx95x with <code>SGLANG_USE_AITER=1</code>, quantize the BF16 GDN <code>in_proj_qkvz</code> and <code>out_proj</code> of Qwen3.5 / Qwen3.8 to MXFP4 after load. Projections with N or K not a multiple of 256 stay BF16. Batches of up to 64 rows run the AITER preshuffled MXFP4 GEMM if AITER has a tuned config for the shape. All other batches run the ASM <code>gemm_a4w4</code>. Set to <code>0</code> to keep the BF16 projections.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_ROCM_QSA_FLYDSL_PREFILL</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>On gfx950, run the QSA extend attention of Qwen sparse-attention models (Qwen3.8-Flash-Next) on AITER's FlyDSL sparse prefill (<code>aiter.ops.qsa.qsa_sparse_prefill</code>, ROCm/aiter#7556) instead of the Triton kernels. Prefill CUDA graph runs and calls the op refuses stay on Triton; an AITER without the API logs a warning and keeps Triton.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
   </tbody>
 </table>
 
