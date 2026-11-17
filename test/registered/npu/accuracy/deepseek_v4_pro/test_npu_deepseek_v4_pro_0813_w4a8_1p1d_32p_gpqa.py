@@ -62,6 +62,21 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_DECODE_ENVS = {
     "DEEPEP_HCCL_BUFFSIZE": "1600",
 }
 
+# DSPARK speculative decoding arguments shared by the prefill and decode nodes:
+# the PD prefill worker prunes the draft to context-KV injection.
+DEEPSEEK_V4_PRO_W4A8_PD_SEP_SPECULATIVE_ARGS = [
+    "--speculative-algorithm",
+    "DSPARK",
+    "--speculative-draft-model-path",
+    DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH,
+    "--speculative-draft-model-quantization",
+    "modelslim",
+    "--speculative-draft-attention-backend",
+    "ascend",
+    "--speculative-num-draft-tokens",
+    6,
+]
+
 # Prefill node launch arguments
 DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ARGS = [
     "--nnodes",
@@ -116,18 +131,7 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_PREFILL_ARGS = [
     "write_through",
     "--max-total-tokens",
     140000,
-    # DSPARK configuration, kept in sync with the decode node: the PD prefill
-    # worker prunes the draft to context-KV injection.
-    "--speculative-algorithm",
-    "DSPARK",
-    "--speculative-draft-model-path",
-    DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH,
-    "--speculative-draft-model-quantization",
-    "modelslim",
-    "--speculative-draft-attention-backend",
-    "ascend",
-    "--speculative-num-draft-tokens",
-    6,
+    *DEEPSEEK_V4_PRO_W4A8_PD_SEP_SPECULATIVE_ARGS,
 ]
 
 # Decode node launch arguments
@@ -167,17 +171,8 @@ DEEPSEEK_V4_PRO_W4A8_PD_SEP_DECODE_ARGS = [
     1,
     2,
     8,
-    "--speculative-algorithm",
-    "DSPARK",
-    "--speculative-draft-model-path",
-    DEEPSEEK_V4_PRO_0813_W4A8_MODEL_PATH,
-    "--speculative-draft-model-quantization",
-    "modelslim",
-    "--speculative-draft-attention-backend",
-    "ascend",
-    "--speculative-num-draft-tokens",
-    6,
     "--enable-metrics",
+    *DEEPSEEK_V4_PRO_W4A8_PD_SEP_SPECULATIVE_ARGS,
 ]
 
 # Model config for DSV4-Pro W4A8 32P PD-Sep deployment.
