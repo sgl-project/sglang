@@ -592,8 +592,8 @@ class QSAIndexer(MultiPlatformOp):
         sequence_lengths: torch.Tensor,
         defer_expansion: bool = False,
     ) -> torch.Tensor:
-        # fast_topk (k = 512) writes 0..length-1 for rows that fit k without reading
-        # their scores, and never reads past a row's length.
+        # fast_topk and topk_v2 (k = 512) write 0..length-1 for rows that fit k
+        # without reading their scores, and ignore scores past a row's length.
         use_fast_topk = (
             not _is_npu
             and q.is_cuda
