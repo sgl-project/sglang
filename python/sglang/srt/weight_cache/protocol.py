@@ -54,6 +54,10 @@ class CacheConfig(msgspec.Struct):
     # Comparing these turns that into a clean mismatch. See compute_env_stamp().
     device_capability: str  # local compute capability, e.g. "8.0" ("" if N/A)
     torch_version: str  # torch.__version__ of the process that built the weights
+    # Platform-contributed identity, canonicalized by compute_env_stamp(). Empty
+    # on a device that needs none, so its fingerprint is unchanged. Defaulted so
+    # a peer that predates the field decodes to a clean mismatch, not a crash.
+    platform_env: str = ""
 
     def matches(self, other: "CacheConfig") -> bool:
         """Check if two configs are compatible for weight sharing."""
@@ -265,7 +269,19 @@ def compute_env_stamp() -> Dict[str, str]:
             device_capability = f"{cap.major}.{cap.minor}"
     except Exception:
         pass
-    return {"device_capability": device_capability, "torch_version": torch_version}
+    # Not wrapped: a platform that needs extra identity must fail loudly rather
+    # than let an unidentified device produce a fingerprint that matches another.
+    from sglang.srt.platforms import current_platform
+
+    platform_env = ",".join(
+        f"{key}={value}"
+        for key, value in sorted(current_platform.weight_cache_env_stamp().items())
+    )
+    return {
+        "device_capability": device_capability,
+        "torch_version": torch_version,
+        "platform_env": platform_env,
+    }
 
 
 def compute_global_rank(tp_size: int, pp_rank: int, tp_rank: int) -> int:

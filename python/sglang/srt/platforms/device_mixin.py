@@ -198,6 +198,19 @@ class DeviceMixin:
             return ("torch_ipc",)
         return ()
 
+    def weight_cache_env_stamp(self) -> dict[str, str]:
+        """[Active] Extra identity for the weight cache compatibility fingerprint.
+
+        Merged into ``compute_env_stamp``. A device whose post-processing or
+        kernel selection varies with its architecture or driver stack adds the
+        discriminating fields here, so a cache built on one generation cannot
+        be opened on another. Raise when a required field is unavailable; never
+        substitute a placeholder, because an empty value makes two different
+        devices compare equal. The default adds nothing, which keeps the
+        fingerprint of a device that needs no extra identity unchanged.
+        """
+        return {}
+
     def validate_weight_cache_allocator(self) -> None:
         """[Active] Reject an allocator config whose memory cannot be exported.
 
@@ -206,6 +219,14 @@ class DeviceMixin:
         actionable message instead of partway through it. The default carries
         the CUDA expandable-segments check the daemon applied unconditionally
         before this was a hook.
+
+        A device that can only export memory it allocated for export overrides
+        this once it has such an allocator. XPU does not override it yet: which
+        torch-xpu allocator configurations yield Level-Zero-exportable memory is
+        unestablished, and it cannot be settled before the Level Zero IPC
+        helpers exist. The hook is deliberately left permissive rather than
+        guessing a restriction, and XPU declares no transport, so the daemon
+        refuses there before reaching this check.
         """
         # The expandable-segments allocator hands out memory that cannot be
         # shared through torch's _share_cuda_ handle, so the export would fail
