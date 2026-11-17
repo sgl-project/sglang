@@ -15,6 +15,9 @@ order, so they differ from the eager path only in the K summation order.
   IEEE kernel). On gfx1250 the three terms are N-major rows of one bf16 weight [3N, K]
   (``_router_split_bf16x3_nk``) under aiter's Gluon a16w16 GEMM with an fp32 output, and the three fp32 partial
   logits are summed (``_router_sum3``).
+* ``router_gemm_tlx``: any M, fbtriton's ``tlx.ops.router_gemm`` (vendored in ``sglang.kernels.tlx_ops``, plain
+  Triton) on an ``[N, K]`` contiguous weight copy; BF16x3-split FP32 weight MFMA, deterministic split order.
+  MI355X, K=8192, N=256, HIP graphs: 2.3 us vs 6.1 us gemv at M=1, 125 us vs 337 us torch at M=8192.
 """
 
 from __future__ import annotations
@@ -29,6 +32,9 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.tlx_ops.kernels.router_gemm.gfx950 import (
+    router_gemm as tlx_router_gemm,
+)
 from sglang.srt.utils import get_device_name, log_info_on_rank0
 
 logger = logging.getLogger(__name__)
@@ -153,6 +159,26 @@ def router_gemv_fp32_supported(x: torch.Tensor, w: torch.Tensor) -> bool:
         and (w.shape[1] & (w.shape[1] - 1)) == 0
         and w.shape[0] % 8192 == 0
     )
+
+
+def router_gemm_tlx_supported(x: torch.Tensor, w_nk: torch.Tensor) -> bool:
+    return (
+        x.dim() == 2
+        and x.dtype == torch.bfloat16
+        and x.stride(1) == 1
+        and w_nk.dtype == torch.float32
+        and w_nk.dim() == 2
+        and w_nk.is_contiguous()
+        and w_nk.shape[1] == x.shape[1]
+        # The kernels' smallest N tile and K step.
+        and w_nk.shape[0] % 16 == 0
+        and x.shape[1] % 1024 == 0
+    )
+
+
+def router_gemm_tlx(x: torch.Tensor, w_nk: torch.Tensor) -> torch.Tensor:
+    """``x.float() @ w_nk.T`` for an ``[N, K]`` FP32 weight; FP32 ``[M, N]``."""
+    return tlx_router_gemm(x, w_nk, None)
 
 
 def router_gemv_fp32(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:

@@ -5,8 +5,9 @@ copied from `third_party/tlx/ops/` in
 [facebookexperimental/triton](https://github.com/facebookexperimental/triton)
 (MIT licence) at the commit listed below, at the same relative path. SGLang's own
 code for these kernels lives outside this directory: the wrappers and dispatch in
-the operator groups (`kernels/ops/<group>/tlx.py`) and the stock-Triton runtime
-support in `kernels/jit/utils/tlx_runtime.py`.
+the operator groups (`kernels/ops/<group>/tlx.py`, or beside the SGLang kernels
+of the same contract, as `gemm/router_gemm_fp32.py:router_gemm_tlx`) and the
+stock-Triton runtime support in `kernels/jit/utils/tlx_runtime.py`.
 
 | File | Upstream commit | Local edits |
 |---|---|---|

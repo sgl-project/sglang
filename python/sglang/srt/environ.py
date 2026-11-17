@@ -1075,6 +1075,9 @@ class Envs:
     # vendored tlx.ops.norm_residual_norm (sglang.kernels.ops.layernorm.tlx) instead of the fused Triton kernel,
     # and the fused unpooler + FFN boundary (2-16 rows) runs the TLX mm before it. Needs TLX (uTLX or fbtriton).
     SGLANG_USE_TLX_BOUNDARY_NORM = EnvBool(False)
+    # gfx950 ROCm Muse Spark: FP32 MoE router logits outside the shared router + pooler front run the vendored
+    # tlx.ops.router_gemm (plain Triton) on an [E, K] copy of each router weight, 8 MiB per MoE layer.
+    SGLANG_USE_TLX_ROUTER_GEMM = EnvBool(False)
     # Set by someone bisecting a numerical or performance regression to an
     # online-FP8 linear on gfx1250, to take the Triton tile out of the picture
     # without rebuilding. The tile is on by default because hipBLASLt ships no
