@@ -15,6 +15,8 @@ from sglang.srt.managers.schedule_policy import (
     SchedulePolicy,
 )
 from sglang.srt.managers.scheduler import Scheduler
+from sglang.srt.runtime_context import publish, reset_context
+from sglang.srt.server_args import ServerArgs
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
@@ -50,6 +52,8 @@ class _Budget:
     def has_capacity(self):
         return True
 
+    admits_more = has_capacity
+
     def state_slots_exhausted(self):
         return False
 
@@ -78,6 +82,11 @@ class _Req:
 
 
 class TestPrefillReservationBudget(CustomTestCase):
+    def setUp(self):
+        reset_context()
+        self.addCleanup(reset_context)
+        publish(ServerArgs(model_path="dummy"), role="tokenizer")
+
     def make_adder(self, *, page, input_budget, chunk_budget, granule=0):
         adder = PrefillAdder.__new__(PrefillAdder)
         adder.page_size = page
