@@ -68,7 +68,7 @@ on:
         required: false
         type: string
         default: ""
-        description: "Comma separated container patch sets under scripts/ci/npu/patches. Empty keeps the image untouched."
+        description: "Comma separated https URLs of container patch zip archives. This workflow downloads and extracts them into the mounted checkout, and each pod runs the install.sh shipped in its archive, which also owns dependency installation (including any package mirror). Empty keeps the image untouched."
       accuracy_dataset:
         required: false
         type: string
@@ -128,6 +128,59 @@ jobs:
           name: ${{ inputs.sgl_router_artifact }}
           path: sgl-router-bin
 
+      - name: Prepare container patches
+        id: container_patches
+        if: inputs.container_patches != ''
+        env:
+          CONTAINER_PATCHES: ${{ inputs.container_patches }}
+        run: |
+          set -euo pipefail
+          mkdir -p container-patches
+          dirs=""
+          while IFS= read -r url; do
+            url="$(echo "${url}" | tr -d '[:space:]')"
+            if [ -z "${url}" ]; then
+              continue
+            fi
+
+            # Only plain https .zip URLs: the archive path ends up in a pod
+            # command, so reject anything with shell metacharacters.
+            if ! echo "${url}" | grep -Eq '^https://[A-Za-z0-9._~:/@%+=-]+\.zip$'; then
+              echo "Invalid container patch url: ${url}"
+              exit 1
+            fi
+
+            slug="$(printf '%s' "${url}" | sha256sum | awk '{print $1}')"
+            dest="container-patches/${slug}"
+            # A repeated URL would otherwise install twice in the pods.
+            case ",${dirs}," in
+              *",${dest},"*) continue ;;
+            esac
+            rm -rf "${dest}"
+            mkdir -p "${dest}"
+            archive="/tmp/container-patch-${slug}.zip"
+
+            # OBS lives in the same region as the cluster; bypass any proxy.
+            if command -v curl >/dev/null 2>&1; then
+              ( unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; curl -fsSL -o "${archive}" "${url}" )
+            elif command -v wget >/dev/null 2>&1; then
+              ( unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY; wget -q -O "${archive}" "${url}" )
+            else
+              echo "Neither curl nor wget is available to download ${url}"
+              exit 1
+            fi
+
+            python3 -m zipfile -e "${archive}" "${dest}"
+            if [ -z "$(find "${dest}" -type f -name install.sh -print -quit)" ]; then
+              echo "install.sh not found in ${url}"
+              exit 1
+            fi
+
+            dirs="${dirs:+${dirs},}${dest}"
+          done <<< "$(echo "${CONTAINER_PATCHES}" | tr ',' '\n')"
+          echo "dirs=${dirs}" >> "$GITHUB_OUTPUT"
+          echo "Container patch dirs: ${dirs}"
+
       - name: Prepare code for testing
         timeout-minutes: 15
         run: |
@@ -173,6 +226,8 @@ jobs:
 
       - name: Run test
         timeout-minutes: 300
+        env:
+          CONTAINER_PATCH_DIRS: ${{ steps.container_patches.outputs.dirs }}
         run: |
           # sglang_source_relative_path is shared-disk path
           # Append run_id so concurrent runs do not overwrite each other on the shared PVC.
@@ -239,15 +294,9 @@ jobs:
             --kube-job-name-prefix ${KUBE_JOB_NAME} \
             --run-id ${{ github.run_id }}"
 
-          container_patches="${{ inputs.container_patches }}"
-          if [ "$container_patches" != "" ]; then
-            # The value is appended to a string that is later eval'ed, so it
-            # must be strictly validated here instead of only inside the pods.
-            if ! echo "${container_patches}" | grep -Eq '^[a-z0-9_]+(\.[a-z0-9_]+)*(,[a-z0-9_]+(\.[a-z0-9_]+)*)*$'; then
-              echo "Invalid container_patches: ${container_patches}"
-              exit 1
-            fi
-            echo "Container patches: ${container_patches}"
+          container_patches="${CONTAINER_PATCH_DIRS:-}"
+          if [ -n "${container_patches}" ]; then
+            echo "Container patch dirs: ${container_patches}"
             CMD="${CMD} --container-patches ${container_patches}"
           fi
 

@@ -718,6 +718,7 @@ def run_npu_e2e_test_case(
                 "run_id": run_id,
                 "use_image_sglang": use_image_sglang,
                 "test_method": test_method,
+                "container_patches": container_patches,
             }
             create_kube_yaml(
                 kube_yaml_template=KUBE_YAML_TEMPLATE.get(kube_job_type),
@@ -744,6 +745,7 @@ def run_npu_e2e_test_case(
                 "accuracy_dataset": accuracy_dataset,
                 "use_image_sglang": use_image_sglang,
                 "test_method": test_method,
+                "container_patches": container_patches,
             }
             template_key = (
                 KUBE_JOB_MULTI_PD_MIX_GREEN if env == "green" else kube_job_type
@@ -983,7 +985,10 @@ if __name__ == "__main__":
         type=str,
         required=False,
         default="",
-        help="Comma separated container patch sets applied inside every pod before the test. Empty keeps the image untouched.",
+        help="Comma separated directories (relative to the repo root) holding the "
+        "container patch archives the workflow already extracted. Each pod runs "
+        "the install.sh found in them before the test. Empty keeps the image "
+        "untouched.",
     )
 
     parser.add_argument(
