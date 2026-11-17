@@ -14,8 +14,8 @@ use serde_json::{Map, Value};
 use sglang_api_types::api::v1::{GenerateResponse, GenerateStreamError};
 use sglang_processor::dynamo_tokenizers::{DecodeResult, Tokenizer};
 use sglang_processor::openai::{
-    ChatModel, ChatResponder, OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, Reply, TokenPieces,
-    lower_chat,
+    ChatModel, ChatResponder, OpenAiHeaders, OpenAiSettings, OpenAiTokenizer, ROUTING_KEY_HEADER,
+    Reply, TokenPieces, lower_chat,
 };
 use sglang_processor::{DynamoTokenizer, TemplateArgs, TemplateError};
 
@@ -161,7 +161,7 @@ pub(super) async fn chat(
 ) -> Option<Response> {
     state.openai_chat.as_ref()?;
     let header = |name: &str| headers.get(name)?.to_str().ok().map(str::to_owned);
-    let routing_key = header("x-smg-routing-key");
+    let routing_key = header(ROUTING_KEY_HEADER);
     let sglext_ids = ["x-sglext-return-input-ids", "x-sglext-return-output-ids"]
         .into_iter()
         .any(|name| header(name).as_deref() == Some("1"));
@@ -612,10 +612,14 @@ mod tests {
         assert!(message.contains("byte limit"), "{message}");
     }
 
-    /// A scheduler rejection before any output retains its HTTP error status.
+    /// Initial bad requests retain HTTP400; other aborts keep their stream error shape.
     #[tokio::test]
     async fn streamed_abort_keeps_its_status() {
-        for status in [400] {
+        for (status, name) in [
+            (503, "SERVICE_UNAVAILABLE"),
+            (400, "BAD_REQUEST"),
+            (412, "PRECONDITION_FAILED"),
+        ] {
             let app = lowered_state(move |rid| {
                 let mut item = chunk(rid, "", true);
                 let ResponseItem::Done(output) = &mut item else {
@@ -628,9 +632,36 @@ mod tests {
             let messages = json!([{"role": "user", "content": "hi"}]);
             let body = json!({"model": "model", "messages": messages, "stream": true});
             let response = post_json(app, "/v1/chat/completions", body).await;
-            assert_eq!(response.status().as_u16(), status as u16);
-            let error = body_json(response).await;
-            assert!(error.to_string().contains("aborted"), "{error}");
+            if status == 400 {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let value = body_json(response).await;
+                assert!(value.to_string().contains("aborted"));
+                continue;
+            }
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers()[CONTENT_TYPE],
+                "text/event-stream; charset=utf-8"
+            );
+            let bytes = axum::body::to_bytes(response.into_body(), 1 << 16)
+                .await
+                .unwrap();
+            let text = String::from_utf8(bytes.to_vec()).unwrap();
+            let error: Value = text
+                .split("\n\n")
+                .filter_map(|event| event.strip_prefix("data: "))
+                .find_map(|data| {
+                    serde_json::from_str::<Value>(data)
+                        .ok()?
+                        .get("error")
+                        .cloned()
+                })
+                .unwrap_or_else(|| panic!("no error event: {text}"));
+            assert_eq!(
+                (error["type"].as_str(), error["code"].as_u64()),
+                (Some(name), Some(status))
+            );
+            assert!(text.trim_end().ends_with("data: [DONE]"), "{text}");
         }
     }
 

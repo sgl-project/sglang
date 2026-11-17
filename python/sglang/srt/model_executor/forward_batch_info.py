@@ -31,7 +31,7 @@ import hashlib
 import warnings
 from dataclasses import dataclass
 from functools import lru_cache
-from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
 import torch
 
@@ -666,6 +666,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     # For multimodal
     mm_input_embeds: Optional[torch.Tensor] = None
 
+    # spec.BuiltMegakernel's draft_step_fold for this EAGLE draft round
+    draft_step_fold: Optional[Any] = None
+
     # Encoder-decoder cross-attention mask
     cross_attention_custom_mask: Optional[torch.Tensor] = None
 
@@ -700,6 +703,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     tbo_children: Optional[List[ForwardBatch]] = None
 
     attn_cp_metadata: Optional[BaseContextParallelMetadata] = None
+    # Capture-stable local views, populated only by PrefillCPBCGInput.prepare.
+    cp_positions: Optional[torch.Tensor] = None
+    cp_input_ids: Optional[torch.Tensor] = None
 
     # For decode context parallel.
     # NOTE: DecodeContextParallelMetadata is imported under TYPE_CHECKING only (see the
@@ -1021,6 +1027,8 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             encoder_lens=batch.encoder_lens,
             encoder_out_cache_loc=batch.encoder_out_cache_loc,
             input_embeds=batch.input_embeds,
+            cp_positions=None,
+            cp_input_ids=None,
             replace_embeds=batch.replace_embeds,
             replace_positions=batch.replace_positions,
             # Scalar config / flags
@@ -1773,12 +1781,24 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         # Larger prefills fall back to eager and keep the memory-efficient
         # SUM_LEN. global_num_tokens is identical across ranks (all-gathered),
         # so the decision is consistent cluster-wide.
+        #
+        # Opt-in: with the env set, an idle (zero-token) DP rank keeps SUM_LEN
+        # instead of being padded to the capture bucket, so the step runs
+        # eagerly with only the rows that exist.  Off keeps the MAX_LEN path
+        # used by GPU prefill on MoE-TP; turn on for EP prefill (e.g. Ascend
+        # ascend_ops).
         prefill_cg = get_exec().graph.cuda_graph_config.prefill
+        max_len_with_idle_allowed = (
+            min(global_num_tokens) > 0
+            if envs.SGLANG_ENABLE_PREFILL_GRAPH_IDLE_RANK_EAGER.get()
+            else True
+        )
         if (
             self.can_run_dp_prefill_cuda_graph
             and self.is_extend_in_batch
             and prefill_cg.bs
             and max(global_num_tokens) <= max(prefill_cg.bs)
+            and max_len_with_idle_allowed
             and not prefill_graph_tolerates_sum_len()
         ):
             dp_padding_mode = DpPaddingMode.MAX_LEN

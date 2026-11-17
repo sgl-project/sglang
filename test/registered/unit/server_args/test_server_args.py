@@ -152,21 +152,21 @@ class TestServerArgsPositionalOrder(CustomTestCase):
             (95, "disable_attn_tp_gather"),
             (96, "enable_p2p_check"),
             (97, "device"),
-            (532, "grpc_response_timeout_secs"),
-            (533, "enable_paged_experts"),
-            (534, "paged_experts_num_resident"),
-            (535, "enable_nvidia_megakernel"),
-            (536, "enable_megamoe_for_layernorm_sp"),
+            (530, "grpc_response_timeout_secs"),
+            (531, "enable_paged_experts"),
+            (532, "paged_experts_num_resident"),
+            (533, "enable_nvidia_megakernel"),
+            (534, "enable_megamoe_for_layernorm_sp"),
         ):
             with self.subTest(index=index):
                 self.assertEqual(fields[index].name, name)
         defaults = ServerArgs(model_path="dummy")
         # deprecated constructor fields keep their historical slots
-        positional = [getattr(defaults, field.name) for field in fields[:533]]
+        positional = [getattr(defaults, field.name) for field in fields[:531]]
         positional[95] = True
         positional[96] = False
         positional[97] = "cpu"
-        positional[532] = 123.0
+        positional[530] = 123.0
 
         args = ServerArgs(*positional)
 
@@ -4542,8 +4542,8 @@ class TestHandleCrashDumpEnv(CustomTestCase):
 
 class TestGrpcServerArgs(CustomTestCase):
     """Native gRPC is enabled by --grpc-port (or SGLANG_GRPC_PORT) and runs
-    alongside HTTP; --smg-grpc-mode (and the deprecated --grpc-mode) select the
-    legacy SMG server. Worker-threads / max-prefill-tokens are env-only knobs.
+    alongside HTTP; --grpc-mode serves the encoder over gRPC. Worker-threads /
+    max-prefill-tokens are env-only knobs.
 
     The gRPC setup lives in `serving_hook.handle_deprecated_args`, which
     __post_init__ skips for dummy models, so these tests build a dummy
@@ -4657,11 +4657,6 @@ class TestGrpcServerArgs(CustomTestCase):
         with self.assertRaisesRegex(ValueError, "requires --grpc-port"):
             handle_deprecated_args(sa)
 
-    def test_sidecar_rejects_legacy_grpc(self):
-        sa = self._args(sidecar="example.sidecar", smg_grpc_mode=True)
-        with self.assertRaisesRegex(ValueError, "native gRPC server"):
-            handle_deprecated_args(sa)
-
     def test_sidecar_rejects_empty_value(self):
         sa = self._args(sidecar="", grpc_port=50051)
         with self.assertRaisesRegex(ValueError, "must not be empty"):
@@ -4771,24 +4766,6 @@ class TestGrpcServerArgs(CustomTestCase):
         proc.terminate.assert_called_once_with()
         proc.join.assert_called_once_with(timeout=42.0)
         kill_tree.assert_called_once_with(1234, wait_timeout=42.0)
-
-    def test_legacy_smg_derives_grpc_port_from_http_port(self):
-        sa = self._args(port=30000, smg_grpc_mode=True)
-        handle_deprecated_args(sa)
-        self.assertEqual(resolution_result(sa, "grpc_port"), 40000)
-
-    def test_grpc_mode_is_deprecated_alias_for_smg_grpc_mode(self):
-        sa = self._args(grpc_mode=True)
-        with self.assertLogs(serving_hook.logger, level="WARNING") as cm:
-            handle_deprecated_args(sa)
-        self.assertTrue(resolution_result(sa, "smg_grpc_mode"))
-        self.assertTrue(any("--grpc-mode is deprecated" in line for line in cm.output))
-
-    def test_legacy_smg_takes_precedence_over_grpc_port(self):
-        sa = self._args(grpc_port=50051, smg_grpc_mode=True)
-        handle_deprecated_args(sa)
-        self.assertTrue(resolution_result(sa, "smg_grpc_mode"))
-        self.assertEqual(resolution_result(sa, "grpc_port"), 50051)
 
     def test_native_grpc_rejects_multi_tokenizer(self):
         sa = self._args(grpc_port=40000, tokenizer_worker_num=2)
@@ -5412,10 +5389,10 @@ class TestLaunchCommand(CustomTestCase):
 
 
 class TestAccessKeyRedaction(CustomTestCase):
-    """The access keys and the TLS key password reach nothing that reports the
-    configuration: not the launch command, `/server_info`, the startup log or
-    the record's repr. Anyone holding the API key can read those, and the
-    admin key must stay out of their reach."""
+    """The access keys, the TLS key password and the HiCache storage config
+    reach nothing that reports the configuration: not the launch command,
+    `/server_info`, the startup log or the record's repr. Anyone holding the
+    API key can read those, and the admin key must stay out of their reach."""
 
     # Spellings argparse accepts: an abbreviation with `=`, a value with a
     # space, a value that spells another key flag, and a repeated flag.
@@ -5430,6 +5407,8 @@ class TestAccessKeyRedaction(CustomTestCase):
         "second-admin",
         "--ssl-keyfile-password",
         "tls-secret",
+        "--hicache-storage-backend-extra-config",
+        '{"secret_key": "s3-secret"}',
     ]
     SECRETS = (
         "alpha beta",
@@ -5437,6 +5416,7 @@ class TestAccessKeyRedaction(CustomTestCase):
         "--admin-api-key=x",
         "second-admin",
         "tls-secret",
+        "s3-secret",
     )
 
     def _assert_no_secret(self, text: str):
@@ -5449,7 +5429,8 @@ class TestAccessKeyRedaction(CustomTestCase):
             server_args.launch_command,
             "--model-path /tmp/x --api-key <redacted> --admin-api-ke=<redacted> "
             "--api-key=<redacted> --admin-api-key <redacted> "
-            "--ssl-keyfile-password <redacted>",
+            "--ssl-keyfile-password <redacted> "
+            "--hicache-storage-backend-extra-config <redacted>",
         )
         # Redaction is for display only: the server still authenticates with
         # the values the operator gave, the last of each repeated flag.
@@ -5463,6 +5444,7 @@ class TestAccessKeyRedaction(CustomTestCase):
         self.assertEqual(info["api_key"], "<redacted>")
         self.assertEqual(info["admin_api_key"], "<redacted>")
         self.assertEqual(info["ssl_keyfile_password"], "<redacted>")
+        self.assertEqual(info["hicache_storage_backend_extra_config"], "<redacted>")
         self._assert_no_secret(json.dumps(info, default=str))
         unset = build_server_info(prepare_server_args(["--model-path", "/tmp/x"]), {})
         self.assertIsNone(unset["api_key"])
@@ -5867,9 +5849,33 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         "enable_ssl_refresh": ["--enable-ssl-refresh"],
         "allowed_media_domains": ["--allowed-media-domains", "example.com"],
         "media_url_max_file_size_mb": ["--media-url-max-file-size-mb", "0"],
+        "media_url_timeout": ["--media-url-timeout", "5"],
+        "allow_local_media_files": ["--no-allow-local-media-files"],
         "enable_trace": ["--enable-trace"],
         "completion_template": ["--completion-template", "deepseek_coder"],
         "hf_chat_template_name": ["--hf-chat-template-name", "tool_use"],
+        "trust_request_chat_template": ["--trust-request-chat-template"],
+        "fastapi_root_path": ["--fastapi-root-path", "/sglang"],
+        "enable_http_worker_reuseport": ["--enable-http-worker-reuseport"],
+        "enable_encoder_swa_bounded_replay": ["--enable-encoder-swa-bounded-replay"],
+        "mm_io_worker_num": ["--mm-io-worker-num", "2"],
+        "disable_tokenizer_batch_decode": ["--disable-tokenizer-batch-decode"],
+        "enable_tokenizer_batch_encode": ["--enable-tokenizer-batch-encode"],
+        "enable_dynamic_batch_tokenizer": ["--enable-dynamic-batch-tokenizer"],
+        "dynamic_batch_tokenizer_batch_size": [
+            "--dynamic-batch-tokenizer-batch-size",
+            "64",
+        ],
+        "dynamic_batch_tokenizer_batch_timeout": [
+            "--dynamic-batch-tokenizer-batch-timeout",
+            "0.01",
+        ],
+        "batch_notify_size": ["--batch-notify-size", "32"],
+        "enable_response_store": ["--enable-response-store"],
+        "tool_server": ["--tool-server", "demo"],
+        "enable_streaming_session": ["--enable-streaming-session"],
+        "asr_max_buffer_seconds": ["--asr-max-buffer-seconds", "120"],
+        "asr_max_concurrent_sessions": ["--asr-max-concurrent-sessions", "64"],
         "enable_custom_logit_processor": ["--enable-custom-logit-processor"],
         "enable_return_routed_experts": ["--enable-return-routed-experts"],
         "enable_lora": ["--enable-lora"],
@@ -5916,6 +5922,60 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         message = str(ctx.exception)
         for cli_args in self.REFUSED.values():
             self.assertIn(cli_args[0], message)
+
+    def test_explicit_unsupported_environment_is_refused_by_name(self):
+        for name in validation_hook.RUST_SERVER_UNSUPPORTED_ENVS:
+            with self.subTest(name=name):
+                field = getattr(envs, name)
+                with field.override(field.default):
+                    with self.assertRaisesRegex(
+                        ValueError, f"does not support {name}:"
+                    ):
+                        self._resolve([])
+                    self._resolve([], rust_server=False)
+
+    def test_unsupported_per_turn_grammar_names_its_settings(self):
+        for args in (
+            ["--tool-call-parser", "beam"],
+            ["--tool-call-parser", "beam", "--grammar-backend", "xgrammar"],
+        ):
+            with self.subTest(args=args):
+                with self.assertRaisesRegex(
+                    ValueError, "--tool-call-parser beam.*--grammar-backend xgrammar"
+                ):
+                    self._resolve(args)
+                self._resolve(args, rust_server=False)
+        self._resolve(["--grammar-backend", "xgrammar"])
+
+    def test_gpu_feature_transport_is_not_silently_replaced(self):
+        for transport in ("cuda_ipc", "cuda_vmm"):
+            with self.subTest(transport=transport):
+                args = prepare_server_args(
+                    ["--model-path", "dummy", "--mm-feature-transport", transport]
+                )
+                self.assertIn(
+                    f"--mm-feature-transport {transport}",
+                    validation_hook.rust_server_unsupported_args(args),
+                )
+        self._resolve(["--mm-feature-transport", "cpu"])
+
+    def test_supported_environment_is_not_refused(self):
+        with envs.SGLANG_LOG_REQUEST_HEADERS.override(("x-request-id",)):
+            self._resolve([])
+
+    def test_model_package_can_honor_an_environment_setting(self):
+        args = prepare_server_args(["--model-path", "dummy"])
+        with envs.SGLANG_TIMEOUT_KEEP_ALIVE.override(30):
+            self.assertIn(
+                "SGLANG_TIMEOUT_KEEP_ALIVE",
+                validation_hook.rust_server_unsupported_args(args),
+            )
+            self.assertNotIn(
+                "SGLANG_TIMEOUT_KEEP_ALIVE",
+                validation_hook.rust_server_unsupported_args(
+                    args, honored={"SGLANG_TIMEOUT_KEEP_ALIVE"}
+                ),
+            )
 
     def test_tool_strict_level_is_refused(self):
         with envs.SGLANG_TOOL_STRICT_LEVEL.override(2):

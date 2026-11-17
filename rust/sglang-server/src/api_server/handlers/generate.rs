@@ -488,7 +488,7 @@ impl CoreCall {
         self.runtime.rid.client_facing()
     }
 
-    /// Check initial request validation before an HTTP adapter commits stream headers.
+    /// Preserve initial client validation failures before HTTP stream headers are sent.
     pub(crate) async fn preflight(&mut self) -> Result<(), CoreError> {
         match self.recv().await {
             Some(CoreEvent::Failed(error)) if error.http_status().as_u16() == 400 => Err(error),
@@ -499,7 +499,9 @@ impl CoreCall {
         }
     }
 
-    /// Receive the next semantic event, converting premature closure to a failure.
+    /// Receive the next semantic event. A runtime channel that closes before a
+    /// terminal response is converted into one terminal failure event; adapters
+    /// never need to infer whether an empty runtime channel means success.
     pub(crate) async fn recv(&mut self) -> Option<CoreEvent> {
         if let Some(event) = self.first_event.take() {
             return Some(event);

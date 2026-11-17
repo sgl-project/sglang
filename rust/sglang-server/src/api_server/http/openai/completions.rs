@@ -14,8 +14,8 @@ use axum::{
 use futures::StreamExt;
 use serde::Deserialize;
 use sglang_processor::dynamo_protocols::types::{
-    Choice, CompletionFinishReason, CompletionUsage, CreateCompletionRequest,
-    CreateCompletionResponse, Logprobs, Prompt, PromptTokensDetails, Stop,
+    Choice, CompletionFinishReason, CompletionTokensDetails, CompletionUsage,
+    CreateCompletionRequest, CreateCompletionResponse, Logprobs, Prompt, PromptTokensDetails, Stop,
 };
 
 use super::super::auth::DeclaredRoute;
@@ -241,6 +241,13 @@ async fn completions(
     }
 
     if stream {
+        if let Err(error) = futures::future::try_join_all(
+            submitted.iter_mut().map(|choice| choice.call.preflight()),
+        )
+        .await
+        {
+            return openai_error(error.http_status(), error.to_string(), false);
+        }
         let include_usage = request
             .stream_options
             .map(|o| o.include_usage)
@@ -418,6 +425,7 @@ pub(super) async fn unary_completion(
     let mut prompt_tokens = BTreeMap::<usize, u32>::new();
     let mut cached_tokens = BTreeMap::<usize, u32>::new();
     let mut completion_tokens = 0u64;
+    let mut reasoning_tokens = 0u64;
 
     for choice in submitted {
         let output = match collect_output(choice.call).await {
@@ -436,6 +444,7 @@ pub(super) async fn unary_completion(
             .entry(choice.prompt_index)
             .or_insert(output.cached_tokens);
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
+        reasoning_tokens = reasoning_tokens.saturating_add(output.reasoning_tokens);
         let (response_choice, extension) = completion_choice(
             choice.index,
             if echo {
@@ -458,6 +467,7 @@ pub(super) async fn unary_completion(
     let usage = completion_usage(
         prompt_tokens,
         u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+        reasoning_tokens,
         cache_report.then(|| cached_tokens.values().copied().fold(0, u32::saturating_add)),
     );
 
@@ -584,6 +594,7 @@ pub(super) fn completion_event_stream(
         let mut prompt_tokens_by_prompt = BTreeMap::<usize, u32>::new();
         let mut cached_tokens_by_prompt = BTreeMap::<usize, u32>::new();
         let mut completion_tokens_by_choice = vec![0u64; count];
+        let mut reasoning_tokens_by_choice = vec![0u64; count];
         let mut streams = Vec::with_capacity(count);
 
         for choice in submitted {
@@ -613,6 +624,7 @@ pub(super) fn completion_event_stream(
             }
             completion_tokens_by_choice[index] = completion_tokens_by_choice[index]
                 .saturating_add(output.completion_tokens);
+            reasoning_tokens_by_choice[index] = output.reasoning_tokens;
             let first = std::mem::replace(&mut first_chunks[index], false);
             let text = if echo && first {
                 echoes[index].clone() + &output.text
@@ -624,6 +636,7 @@ pub(super) fn completion_event_stream(
                 completion_usage(
                     output.prompt_tokens,
                     u32::try_from(completion_tokens_by_choice[index]).unwrap_or(u32::MAX),
+                    reasoning_tokens_by_choice[index],
                     None,
                 )
             });
@@ -654,6 +667,9 @@ pub(super) fn completion_event_stream(
             let completion_tokens = completion_tokens_by_choice
                 .into_iter()
                 .fold(0u64, u64::saturating_add);
+            let reasoning_tokens = reasoning_tokens_by_choice
+                .into_iter()
+                .fold(0u64, u64::saturating_add);
             let cached_tokens = cache_report.then(|| {
                 cached_tokens_by_prompt
                     .values()
@@ -670,6 +686,7 @@ pub(super) fn completion_event_stream(
                 usage: Some(completion_usage(
                     prompt_tokens,
                     u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+                    reasoning_tokens,
                     cached_tokens,
                 )),
             };
@@ -684,6 +701,7 @@ pub(super) fn completion_event_stream(
 pub(super) fn completion_usage(
     prompt_tokens: u32,
     completion_tokens: u32,
+    reasoning_tokens: u64,
     cached_tokens: Option<u32>,
 ) -> CompletionUsage {
     CompletionUsage {
@@ -694,7 +712,10 @@ pub(super) fn completion_usage(
             cached_tokens: Some(cached),
             ..Default::default()
         }),
-        ..Default::default()
+        completion_tokens_details: Some(CompletionTokensDetails {
+            reasoning_tokens: Some(u32::try_from(reasoning_tokens).unwrap_or(u32::MAX)),
+            ..Default::default()
+        }),
     }
 }
 
@@ -908,6 +929,10 @@ mod tests {
             assert_eq!(value["choices"][0]["matched_stop"], "</s>");
             assert_eq!(value["usage"]["prompt_tokens"], 5);
             assert_eq!(value["usage"]["completion_tokens"], 4);
+            assert_eq!(
+                value["usage"]["completion_tokens_details"]["reasoning_tokens"],
+                0
+            );
             // A prompt's cached tokens are its first choice's, as on Python.
             let details = &value["usage"]["prompt_tokens_details"];
             match cache_report {

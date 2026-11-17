@@ -79,7 +79,6 @@ from sglang.srt.utils.flatten import (
     RaggedPairColumns,
 )
 from sglang.srt.utils.json_response import ORJSON_RESPONSE_OPTIONS
-from sglang.srt.utils.log_utils import configure_gc_warning
 from sglang.srt.utils.network import NetworkAddress, get_local_ip_auto
 
 if TYPE_CHECKING:
@@ -462,6 +461,16 @@ class RustServer:
                 "embedding or reward model. Unset SGLANG_RUST_SERVER to serve it."
             )
 
+        if (
+            get_serving().tool_call_parser == "beam"
+            and get_exec().kernel.grammar_backend == "xgrammar"
+        ):
+            raise ValueError(
+                "Rust-server mode does not support --tool-call-parser beam with "
+                "--grammar-backend xgrammar: per-turn response-template grammar "
+                "is not implemented. Unset SGLANG_RUST_SERVER."
+            )
+
         # Force turn off HF tokenizers rayon's unpinned global thread pool.
         os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
         warmup_names = rust_server_warmup_names(get_serving().warmups)
@@ -567,10 +576,6 @@ class RustServer:
         )
 
         instance._watch_startup_failure()
-        # The Python tokenizer process's GC-pause warning; Rust mode has no such
-        # process, so it watches this listener-hosting scheduler instead.
-        if get_observability().gc_warning_threshold_secs > 0.0:
-            configure_gc_warning(get_observability().gc_warning_threshold_secs)
         # The base server handle: a package's extension handle may wrap it, and
         # only the base server owns the custom-warmup readiness gate.
         instance.warmup_thread = start_rust_server_warmups(

@@ -366,6 +366,12 @@ async fn chat_completions(
         },
     };
     if stream {
+        if let Err(error) =
+            futures::future::try_join_all(submitted.iter_mut().map(|(_, call)| call.preflight()))
+                .await
+        {
+            return openai_error(error.http_status(), error.to_string(), false);
+        }
         let event_stream = chat_event_stream(
             submitted,
             response_id,
@@ -646,6 +652,7 @@ pub(super) async fn unary_chat(
     let mut prompt_tokens = 0;
     let mut cached_tokens = 0;
     let mut completion_tokens = 0u64;
+    let mut reasoning_tokens = 0u64;
 
     for (index, call) in submitted {
         let output = match collect_output(call).await {
@@ -663,6 +670,7 @@ pub(super) async fn unary_chat(
             cached_tokens = output.cached_tokens;
         }
         completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
+        reasoning_tokens = reasoning_tokens.saturating_add(output.reasoning_tokens);
         let logprobs = want_logprobs.then(|| chat_logprobs(output.extras.as_deref()));
         let finish_reason = chat_finish_reason(&output);
         let (reasoning_text, content, tool_calls, finish_reason) = match &parsing {
@@ -750,6 +758,7 @@ pub(super) async fn unary_chat(
         usage: Some(completion_usage(
             prompt_tokens,
             u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+            reasoning_tokens,
             cache_report.then_some(cached_tokens),
         )),
     })
@@ -797,6 +806,7 @@ pub(super) fn chat_event_stream(
         let mut prompt_tokens = 0u32;
         let mut cached_tokens = 0u32;
         let mut completion_tokens = 0u64;
+        let mut reasoning_tokens_by_choice = vec![0u64; count];
         // One stateful reasoning splitter per choice (Python keeps a
         // `reasoning_parser_dict` per index).
         let mut reasoning_splitters: Vec<ReasoningStreamSplitter> =
@@ -860,6 +870,7 @@ pub(super) fn chat_event_stream(
                 cached_tokens = output.cached_tokens;
             }
             completion_tokens = completion_tokens.saturating_add(output.completion_tokens);
+            reasoning_tokens_by_choice[index] = output.reasoning_tokens;
             let mut finish_reason = chat_finish_reason(&output);
             let mut emitted = Vec::with_capacity(2);
             if let Some(parser) = deepseek_parsers.get_mut(index) {
@@ -978,6 +989,10 @@ pub(super) fn chat_event_stream(
                     usage: Some(completion_usage(
                         prompt_tokens,
                         u32::try_from(completion_tokens).unwrap_or(u32::MAX),
+                        reasoning_tokens_by_choice
+                            .iter()
+                            .copied()
+                            .fold(0u64, u64::saturating_add),
                         cache_report.then_some(cached_tokens),
                     )),
                 }),
@@ -1420,6 +1435,10 @@ mod tests {
             "the stub is not reported"
         );
         assert_eq!(value["usage"]["completion_tokens"], 2);
+        assert_eq!(
+            value["usage"]["completion_tokens_details"]["reasoning_tokens"],
+            0
+        );
         // `--enable-cache-report`: the first choice's cached tokens.
         assert_eq!(value["usage"]["prompt_tokens_details"]["cached_tokens"], 3);
     }

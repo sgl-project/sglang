@@ -25,7 +25,13 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
     parse_ib_device_config,
 )
 from sglang.srt.environ import envs
-from sglang.srt.runtime_context import attn_dp_enabled_of, get_platform, num_dp_ranks_of
+from sglang.srt.model_executor.cuda_graph_config import Backend
+from sglang.srt.runtime_context import (
+    attn_dp_enabled_of,
+    describe_kv_events_publisher,
+    get_platform,
+    num_dp_ranks_of,
+)
 from sglang.srt.sampling.watermarking.config import (
     MAX_WATERMARK_CONTEXT_WINDOW,
     parse_watermark_key,
@@ -124,9 +130,27 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     "allowed_media_domains",
     # The Rust media fetcher caps a download at this field's default, 64 MiB.
     "media_url_max_file_size_mb",
+    "media_url_timeout",
+    "allow_local_media_files",
     "enable_trace",
     "completion_template",
     "hf_chat_template_name",
+    "trust_request_chat_template",
+    "fastapi_root_path",
+    "enable_http_worker_reuseport",
+    "enable_encoder_swa_bounded_replay",
+    "mm_io_worker_num",
+    "disable_tokenizer_batch_decode",
+    "enable_tokenizer_batch_encode",
+    "enable_dynamic_batch_tokenizer",
+    "dynamic_batch_tokenizer_batch_size",
+    "dynamic_batch_tokenizer_batch_timeout",
+    "batch_notify_size",
+    "enable_response_store",
+    "tool_server",
+    "enable_streaming_session",
+    "asr_max_buffer_seconds",
+    "asr_max_concurrent_sessions",
     "enable_custom_logit_processor",
     "enable_return_routed_experts",
     "enable_lora",
@@ -146,6 +170,32 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     # Chat responses would lack the server-default sglext token ids.
     "return_input_ids",
     "return_output_ids",
+)
+
+
+RUST_SERVER_UNSUPPORTED_ENVS = (
+    "SGLANG_HTTP_SERVER_APP_PATH",
+    "SGLANG_TIMEOUT_KEEP_ALIVE",
+    "SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT",
+    "SGLANG_PYSPY_DUMP_BEFORE_CRASH",
+    "SGLANG_CUDA_COREDUMP_BEFORE_CRASH",
+    "SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS",
+    "SGLANG_INKLING_DEFAULT_REASONING_EFFORT",
+    "SGLANG_ENABLE_RESPONSE_TEMPLATE_TURN_GRAMMAR",
+    "SGLANG_DETOKENIZER_MAX_STATES",
+    "SGLANG_USE_IPC_POOL_HANDLE_CACHE",
+    "SGLANG_REQUEST_STATE_WAIT_TIMEOUT",
+    "SGLANG_MM_AVOID_RETOKENIZE",
+    "SGLANG_BATCH_TOKENIZER_OUTPUTS",
+    "SGLANG_ENABLE_COLOCATED_BATCH_GEN",
+    "SGLANG_CPU_WORKERS",
+    "SGLANG_IO_WORKERS",
+    "SGLANG_OLLAMA_ROOT_ROUTE",
+    "SGLANG_OLLAMA_CHAT_ROUTE",
+    "SGLANG_OLLAMA_GENERATE_ROUTE",
+    "SGLANG_OLLAMA_TAGS_ROUTE",
+    "SGLANG_OLLAMA_SHOW_ROUTE",
+    "SGLANG_GRPC_WORKER_THREADS",
 )
 
 
@@ -172,10 +222,20 @@ def rust_server_unsupported_args(
         else:
             is_set = value != default
         if is_set:
-            offending.append(_field_to_cli_name(name))
+            cli_name = _field_to_cli_name(name)
+            if name == "allow_local_media_files" and value is False:
+                cli_name = "--no-allow-local-media-files"
+            offending.append(cli_name)
+    if cfg.mm_feature_transport in ("cuda_ipc", "cuda_vmm"):
+        offending.append(f"--mm-feature-transport {cfg.mm_feature_transport}")
+    if cfg.tool_call_parser == "beam" and cfg.grammar_backend in (None, "xgrammar"):
+        offending.append("--tool-call-parser beam with --grammar-backend xgrammar")
     # The Rust chat route applies only each tool's own `strict`.
     if envs.SGLANG_TOOL_STRICT_LEVEL.get() > 0:
         offending.append("SGLANG_TOOL_STRICT_LEVEL")
+    for name in RUST_SERVER_UNSUPPORTED_ENVS:
+        if name not in honored and getattr(envs, name).is_set():
+            offending.append(name)
     return offending
 
 
@@ -220,12 +280,14 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
     assert cfg.disable_overlap_schedule, (
         "Pipeline parallelism is not compatible with overlap schedule"
     )
-    if cfg.speculative_algorithm == "DSPARK":
+    if cfg.speculative_algorithm in ("DSPARK", "DFLASH"):
         assert cfg.disaggregation_mode == "prefill", (
-            "Pipeline parallel DSPARK requires disaggregation-mode=prefill"
+            f"Pipeline parallel {cfg.speculative_algorithm} requires "
+            "disaggregation-mode=prefill"
         )
         assert not envs.SGLANG_ENABLE_PP_SPEC.get(), (
-            "SGLANG_ENABLE_PP_SPEC does not support DSPARK PD prefill"
+            f"SGLANG_ENABLE_PP_SPEC does not support {cfg.speculative_algorithm} "
+            "PD prefill"
         )
     elif cfg.speculative_algorithm is not None:
         assert (
@@ -294,6 +356,30 @@ def check_server_args(server_args: Any):
         "pp_max_micro_batch_size must be a positive integer or None (for auto-compute). "
         f"Got: {cfg.pp_max_micro_batch_size}"
     )
+
+    if cfg.device == "npu":
+        from sglang.srt.hardware_backend.npu.compile_backend import (
+            validate_npugraph_ex_config,
+        )
+
+        # Local import: server_args imports this module at load time.
+        from sglang.srt.server_args import compute_world_size
+
+        # cuda_graph_config stays None until handle_cuda_graph_config runs, which
+        # the resolution pipeline skips for a "none"/"dummy" model path.
+        graph_cfg = cfg.cuda_graph_config
+
+        validate_npugraph_ex_config(
+            enable_compile=cfg.enable_torch_compile,
+            graph_enabled=(
+                graph_cfg is not None and graph_cfg.decode.backend != Backend.DISABLED
+            ),
+            world_size=compute_world_size(
+                dp_size=cfg.dp_size,
+                tp_size=cfg.tp_size,
+                pp_size=cfg.pp_size,
+            ),
+        )
 
     assert not (cfg.disable_cuda_graph_padding and cfg.enable_torch_compile), (
         "--disable-cuda-graph-padding is incompatible with --enable-torch-compile. "
@@ -477,7 +563,7 @@ def check_server_args(server_args: Any):
 
     # grpc_port is None for HTTP-only launches, so the == comparison is
     # already False there; no explicit None check needed.
-    if not (cfg.smg_grpc_mode or cfg.grpc_mode) and cfg.grpc_port == cfg.port:
+    if cfg.grpc_port == cfg.port:
         raise ValueError(
             f"--grpc-port ({cfg.grpc_port}) must differ from --port ({cfg.port})"
         )
@@ -491,6 +577,8 @@ def check_server_args(server_args: Any):
             raise ValueError(
                 "When setting gc_threshold, it must contain 1 to 3 integers."
             )
+    if cfg.gc_freeze_on_idle_secs < 0:
+        raise ValueError("--gc-freeze-on-idle-secs must be >= 0.")
 
     if cfg.kv_canary_sweep_interval > 0 and cfg.kv_canary == "none":
         raise ValueError(
@@ -500,6 +588,7 @@ def check_server_args(server_args: Any):
     check_watermark_server_args(server_args)
 
     check_load_publish_args(server_args)
+    warn_multi_node_kv_events(server_args)
 
 
 def validate_buckets_rule(arg_name: str, buckets_rule: List[str]):
@@ -593,6 +682,57 @@ def check_load_publish_args(server_args: Any):
     )
     if reason:
         raise ValueError(reason)
+
+
+def warn_multi_node_kv_events(server_args: Any) -> None:
+    """Warn when /server_info's kv_events block cannot reach every
+    publishing rank: it advertises one host and one port base, while rank
+    ``r`` binds ``base + r`` on the node it runs on. Not an error, since
+    serving is unaffected; a subscriber just misses the remote ranks."""
+    descriptor = describe_kv_events_publisher(server_args)
+    if descriptor is None or descriptor["dp_size"] < 2:
+        return
+    cfg = resolving_view(server_args)
+    # Publishers are pp_rank 0 schedulers. PP stages take whole nodes first
+    # (`_calculate_rank_ranges` in engine.py), so pp_rank 0's TP group, and
+    # its attention-DP publishers with it, spans nnodes // pp_size nodes.
+    # Only the head node serves /server_info, so only its launcher warns.
+    if cfg.node_rank != 0 or cfg.nnodes // cfg.pp_size < 2:
+        return
+    from sglang.srt.disaggregation.kv_events import (
+        KVEventsConfig,
+        parse_bindable_tcp,
+    )
+
+    kv_config = KVEventsConfig.from_cli(cfg.kv_events_config)
+    # The publisher's own default: bind a wildcard host, connect to a
+    # concrete one. A connecting rank dials that host from any node.
+    kv_binds = kv_config.bind
+    if kv_binds is None:
+        kv_binds = parse_bindable_tcp(kv_config.endpoint) is not None
+    published = [
+        name
+        for name, binds in (
+            ("KV events", kv_binds),
+            # The load range always binds a wildcard host.
+            (
+                "load reports (--load-publish-endpoint)",
+                "load_endpoint_port_base" in descriptor,
+            ),
+        )
+        if binds
+    ]
+    if not published:
+        return
+    logger.warning(
+        f"{' and '.join(published)} are published per DP rank, and the "
+        f"{descriptor['dp_size']} publishing ranks span several of the "
+        f"{cfg.nnodes} nodes, but /server_info advertises one host and one "
+        f"port base for all of them. Only the ranks on the head node are "
+        f"reachable at the advertised address, so a router subscribing "
+        f"through /server_info (e.g. sgl-router's cache_aware policy) sees "
+        f"only part of the KV cache. Serving is unaffected."
+    )
 
 
 def validate_device_sampling_backend(
