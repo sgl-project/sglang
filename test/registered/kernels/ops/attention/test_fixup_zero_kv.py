@@ -53,5 +53,36 @@ def test_fixup_rows_across_grid_y_limit(batch_size, queries_per_seq):
     torch.testing.assert_close(lse, expected_lse, rtol=0, atol=0)
 
 
+def test_fixup_mla_width_offset_boundary():
+    """MLA-wide zero-KV rows must not corrupt large flat output offsets."""
+    num_tokens = 65538
+    rows = [65534, 65535, 65536, 65537]
+    kv_lens = torch.ones(num_tokens, device="cuda", dtype=torch.int32)
+    kv_lens[65535:65537] = 0
+    cu_seqlens_q = torch.arange(num_tokens + 1, device="cuda", dtype=torch.int32)
+
+    out = torch.empty((num_tokens, 64, 512), device="cuda", dtype=torch.bfloat16)
+    lse = torch.empty((num_tokens, 64), device="cuda", dtype=torch.float32)
+    initial_out = torch.tensor([1.0, 2.0, 3.0, 4.0], dtype=torch.bfloat16)
+    initial_lse = torch.tensor([5.5, 6.5, 7.5, 8.5], dtype=torch.float32)
+    out[rows] = initial_out[:, None, None].cuda()
+    lse[rows] = initial_lse[:, None].cuda()
+
+    # The second zero-KV row begins at 65536 * 64 * 512 == 2**31 elements.
+    fixup_zero_kv_rows(out, lse, kv_lens, cu_seqlens_q, 1)
+    torch.cuda.synchronize()
+
+    expected_out = initial_out.clone()
+    expected_out[1:3] = 0
+    expected_lse = initial_lse.clone()
+    expected_lse[1:3] = -torch.inf
+    torch.testing.assert_close(
+        out[rows].cpu(), expected_out[:, None, None].expand(4, 64, 512), rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        lse[rows].cpu(), expected_lse[:, None].expand(4, 64), rtol=0, atol=0
+    )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

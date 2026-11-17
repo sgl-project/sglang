@@ -85,12 +85,16 @@ __global__ void fixup_zero_kv_rows_kernel(
   const int num_tokens = tok_end - tok_start;
   if (num_tokens <= 0) return;
 
-  const int tok = tok_start + blockIdx.x % blocks_per_seq;
-  if (tok >= tok_end) return;
+  const int query_offset = static_cast<int>(blockIdx.x % blocks_per_seq);
+  if (query_offset >= num_tokens) return;
+
+  const int64_t tok = static_cast<int64_t>(tok_start) + query_offset;
+  const int64_t out_offset = tok * static_cast<int64_t>(out_stride);
+  const int64_t lse_offset = tok * static_cast<int64_t>(lse_stride);
 
   // Each block handles one token: zero out[tok] and set lse[tok] = -inf.
-  vec_zero_fill(out + tok * out_stride, out_stride);
-  vec_neginf_fill(lse + tok * lse_stride, lse_stride);
+  vec_zero_fill(out + out_offset, out_stride);
+  vec_neginf_fill(lse + lse_offset, lse_stride);
 }
 
 // -- host launcher ---------------------------------------------------------
@@ -120,6 +124,8 @@ void fixup_zero_kv_rows(
   const int bs = static_cast<int>(batch_size.unwrap());
   const int nh = static_cast<int>(num_heads.unwrap());
   const int vd = static_cast<int>(v_head_dim.unwrap());
+  const int64_t out_stride = static_cast<int64_t>(nh) * vd;
+  RuntimeCheck(out_stride >= 0 && out_stride <= 2147483647, "invalid fixup output stride");
 
   if (bs == 0 || max_seq_len == 0) return;
   const int64_t total_blocks = bs * max_seq_len;
@@ -133,7 +139,7 @@ void fixup_zero_kv_rows(
       static_cast<float*>(lse.data_ptr()),
       static_cast<const int32_t*>(kv_lens.data_ptr()),
       static_cast<const int32_t*>(cum_seq_lens.data_ptr()),
-      nh * vd,
+      static_cast<int>(out_stride),
       nh,
       static_cast<int>(max_seq_len));
 }
