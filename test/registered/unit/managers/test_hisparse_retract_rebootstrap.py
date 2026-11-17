@@ -114,7 +114,7 @@ def _retract(req: Req, allocator, backend: str = "cpu_tensor") -> bool:
 
 def _requeue(req: Req, allocator):
     queue = SimpleNamespace(
-        scheduler=SimpleNamespace(request_retirer=MagicMock()),
+        request_retirer=MagicMock(),
         token_to_kv_pool_allocator=allocator,
         retracted_queue=IndexedReqList(ListKind.PD_RETRACTED),
         pending_reqs=[],
