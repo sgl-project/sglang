@@ -10,6 +10,7 @@ import threading
 import time
 import unittest
 from collections import deque
+from functools import partial
 from http import HTTPStatus
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
@@ -21,7 +22,10 @@ maybe_stub_sgl_kernel()
 from sglang.srt.disaggregation import prefill as prefill_module  # noqa: E402
 from sglang.srt.disaggregation import utils  # noqa: E402
 from sglang.srt.disaggregation.base import KVPoll  # noqa: E402
-from sglang.srt.disaggregation.common.conn import CommonKVManager  # noqa: E402
+from sglang.srt.disaggregation.common.conn import (  # noqa: E402
+    CommonKVManager,
+    _PPStagingOutstanding,
+)
 from sglang.srt.disaggregation.pp_consensus_store import (  # noqa: E402
     PPConsensusStore,
 )
@@ -247,6 +251,63 @@ class TestPPPrefillReleaseConsensus(CustomTestCase):
             self.assertEqual(stage.streamed, [("x", "error")])
             self.assertEqual(list(stage.disagg_prefill_transfer_queue), [])
             stage.metrics_collector.increment_transfer_failed_reqs.assert_called_once()
+
+    def test_failure_waits_for_every_stage_to_conclude(self):
+        # One stage failed the room while the other stage's transfer worker
+        # still sends from (and into) its pages: no stage may free the KV yet.
+        for room, failed, sending in (
+            (30, self.pp0, self.pp1),
+            (31, self.pp1, self.pp0),
+        ):
+            with self.subTest(failed_stage=failed.pp_rank):
+                self.pp0.streamed.clear()
+                self.pp1.streamed.clear()
+                self._both("x", room)
+                failed.fail(room, "Failed to send kv chunk")
+                expected = [KVPoll.Transferring] * 2
+                expected[failed.pp_rank] = KVPoll.Failed
+                self._replicated(room, expected)
+
+                self._iterate()
+                for stage in (self.pp0, self.pp1):
+                    self.assertEqual(len(stage.disagg_prefill_transfer_queue), 1)
+                    self.assertEqual(stage.streamed, [])
+
+                # The sending stage concludes: both stages release together.
+                sending.store[room] = KVPoll.Success
+                expected[sending.pp_rank] = KVPoll.Success
+                self._replicated(room, expected)
+                self._iterate()
+                for stage in (self.pp0, self.pp1):
+                    self.assertEqual(list(stage.disagg_prefill_transfer_queue), [])
+                    self.assertEqual(stage.streamed, [("x", "error")])
+
+    def test_success_waits_for_staging_chunks_on_every_stage(self):
+        # A stage holds Success while its staging chunks are outstanding; PP0
+        # must see PP1's hold through the store.
+        for stage in (self.pp0, self.pp1):
+            mgr = stage.kv_mgr
+            mgr.defer_decode_allocation = False
+            mgr.staging_holds_success = partial(
+                CommonKVManager.staging_holds_success, mgr
+            )
+            mgr._staging_outstanding = _PPStagingOutstanding(mgr)
+        self._both("x", 40)
+        self.pp1.kv_mgr._staging_outstanding[40] += 1
+        self.pp0.store[40] = KVPoll.Success
+        self.pp1.store[40] = KVPoll.Success
+        self._replicated(40, [KVPoll.Success, KVPoll.Success])
+
+        self._iterate()
+        for stage in (self.pp0, self.pp1):
+            self.assertEqual(len(stage.disagg_prefill_transfer_queue), 1)
+
+        self.pp1.kv_mgr._staging_outstanding[40] -= 1
+        self._replicated("held:40", [None, 0])
+        self._iterate()
+        for stage in (self.pp0, self.pp1):
+            self.assertEqual(list(stage.disagg_prefill_transfer_queue), [])
+            self.assertEqual([rid for rid, _ in stage.streamed], ["x"])
 
     def test_idle_iteration_sends_nothing(self):
         self.assertEqual(self._iterate(), ([], []))
