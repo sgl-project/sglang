@@ -93,8 +93,9 @@ def select_text_bucket(seq: int, buckets: tuple[int, ...]) -> int | None:
         if seq <= bucket:
             return bucket
     logger.warning(
-        "[Diffusion BCG] text length %d exceeds max bucket %d; not padding "
-        "(this length captures its own graph). Raise --bcg-text-buckets.",
+        "[Diffusion BCG] text length %d exceeds max bucket %d; not padding, "
+        "so this length runs eagerly unless warmup captured it. "
+        "Raise --bcg-text-buckets.",
         seq,
         buckets[-1],
     )

@@ -690,8 +690,8 @@ class ModelOptFp4LinearMethod(LinearMethodBase):
         del input_size, output_size
         if not self.quant_config.is_checkpoint_nvfp4_serialized:
             raise ValueError(
-                "NVFP4 quantization was selected, "
-                " dynamic quantization is not supported."
+                "NVFP4 quantization was selected, but dynamic (online) NVFP4 "
+                "quantization is not supported; load a pre-quantized NVFP4 checkpoint."
             )
         if input_size_per_partition % 16 != 0:
             raise ValueError(

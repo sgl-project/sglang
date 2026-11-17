@@ -457,10 +457,10 @@ def initialize_model_parallel(
         raise RuntimeError(
             f"world_size ({world_size}) is less than "
             f"tensor_parallel_degree ({tensor_parallel_degree}) x "
-            f"pipeline_parallel_degree ({pipeline_parallel_degree}) x"
-            f"sequence_parallel_degree ({sequence_parallel_degree}) x"
+            f"pipeline_parallel_degree ({pipeline_parallel_degree}) x "
+            f"sequence_parallel_degree ({sequence_parallel_degree}) x "
             f"classifier_free_guidance_degree "
-            f"({classifier_free_guidance_degree}) x"
+            f"({classifier_free_guidance_degree}) x "
             f"data_parallel_degree ({data_parallel_size})"
         )
 

@@ -193,7 +193,8 @@ def resize_to_target(video: torch.Tensor, target_hw: tuple[int, int]) -> torch.T
     if target_h > height or target_w > width:
         raise ValueError(
             f"target {target_w}x{target_h} exceeds the SR result {width}x{height}; "
-            "pick a lower tier or a higher --resolution-scale for this source."
+            "pick a lower tier or a higher --sr-resolution-scale (sr_resolution_scale) "
+            "for this source."
         )
     source_ratio, target_ratio = width / height, target_w / target_h
     if abs(source_ratio - target_ratio) / target_ratio > ASPECT_MISMATCH_TOLERANCE:

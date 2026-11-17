@@ -65,8 +65,7 @@ class CPUWorker(GPUWorker):
             if self.server_args.tp_size > n_groups:
                 logger.warning(
                     f"TP size ({self.server_args.tp_size}) is larger than the number of NUMA/CBB CPU binding groups ({n_groups}), "
-                    f"in this case the available memory amount of each rank cannot be determined in prior. "
-                    f"Please set proper `--max-total-tokens` to avoid the out-of-memory error."
+                    f"in this case the available memory amount of each rank cannot be determined in prior."
                 )
 
         # Bind OpenMP threads to CPU cores

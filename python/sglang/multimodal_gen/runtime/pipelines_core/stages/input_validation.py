@@ -404,7 +404,7 @@ class InputValidationStage(PipelineStage):
         # Validate guidance scale if using classifier-free guidance
         if batch.do_classifier_free_guidance and batch.guidance_scale < 0:
             raise ValueError(
-                f"Guidance scale must be positive, but got {batch.guidance_scale}"
+                f"Guidance scale must be non-negative, but got {batch.guidance_scale}"
             )
 
         # A request that leaves CFG off is servable under CFG parallelism: the
