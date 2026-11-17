@@ -225,7 +225,8 @@ class TestPrimsTsNvfp4(CustomTestCase):
 
     def test_writer_layout_and_rounding(self):
         """Blocks of E2M1 multiples of a power-of-two scale round-trip exactly;
-        other values land within one E2M1 step; -1 locations write nothing."""
+        other values land within one E2M1 step; -1 locations and the reserved
+        slot 0 are never written."""
         from sglang.srt.layers.attention.dsa.prims_k_cache import (
             quantize_prims_k_cache_into,
         )
@@ -243,13 +244,18 @@ class TestPrimsTsNvfp4(CustomTestCase):
         scale = 2.0 ** torch.randint(-6, 4, (n, 32, 1), generator=gen, device="cuda")
         exact = (grid[codes] * sign * scale).view(n, KV_LORA)
         rope = torch.randn(n, ROPE, generator=gen, device="cuda").bfloat16()
-        kv = torch.full((n + 1, 1, 352), 0xAB, dtype=torch.uint8, device="cuda")
-        loc = torch.arange(n, device="cuda")
+        kv = torch.full((n + 2, 1, 352), 0xAB, dtype=torch.uint8, device="cuda")
+        loc = torch.arange(1, n + 1, device="cuda")
         quantize_prims_k_cache_into(exact.bfloat16(), rope, kv, loc)
+        # padding tokens point at slot 0, which the writer skips
+        quantize_prims_k_cache_into(
+            exact[:2].bfloat16(), rope[:2], kv, loc.new_zeros(2)
+        )
+        self.assertTrue(torch.all(kv[0] == 0xAB))
         got = _expand_nvfp4_rows(kv, loc)
         torch.testing.assert_close(got[:, :KV_LORA], exact, atol=0, rtol=0)
         torch.testing.assert_close(got[:, KV_LORA:], rope.float().to(FP8).float())
-        self.assertTrue(torch.all(kv[n] == 0xAB))
+        self.assertTrue(torch.all(kv[n + 1] == 0xAB))
 
         noisy = torch.randn(n, KV_LORA, generator=gen, device="cuda").bfloat16()
         dropped = torch.cat([loc[:-1], loc.new_tensor([-1])])
@@ -259,7 +265,7 @@ class TestPrimsTsNvfp4(CustomTestCase):
         # E2M1 steps are at most 2 x scale = amax / 3; rounding is within one step.
         step = x.abs().amax(-1, keepdim=True) / 3
         self.assertTrue(torch.all((got - x).abs() <= step * 1.01 + 1e-6))
-        self.assertTrue(torch.all(kv[n] == 0xAB))
+        self.assertTrue(torch.all(kv[n + 1] == 0xAB))
 
     def test_nvfp4_exact_plan_matches_reference(self):
         self._check_nvfp4_matches_reference(rows=8)

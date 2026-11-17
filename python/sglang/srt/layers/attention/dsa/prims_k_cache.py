@@ -90,6 +90,7 @@ def _write_k(
     C,
     L,
     SLOTS,
+    SKIP,
     NS: tl.constexpr,
     NF: tl.constexpr,
     RS: tl.constexpr,
@@ -97,7 +98,7 @@ def _write_k(
 ):
     t = tl.program_id(0).to(tl.int64)
     dst = tl.load(L + t).to(tl.int64)
-    valid = (dst >= 0) & (dst < SLOTS)
+    valid = (dst >= 0) & (dst < SLOTS) & (dst != SKIP)
     safe = tl.where(valid, dst, 0)
     b = tl.arange(0, 32).to(tl.int64)
     f = tl.arange(0, 16).to(tl.int64)
@@ -122,10 +123,14 @@ def _write_k(
     )
 
 
-def quantize_prims_k_cache_into(k_nope, k_rope, kv_buffer, loc) -> None:
+def quantize_prims_k_cache_into(
+    k_nope, k_rope, kv_buffer, loc, *, reserved_skip_index: int = 0
+) -> None:
     """Scatter keys without allocating expanded KV; invalid loc leaves bytes alone.
 
-    Valid locations must be unique within a launch (duplicate writes race).
+    Like the other MLA writers, writes to ``reserved_skip_index`` are skipped:
+    slot 0 is where padding tokens point (pass -1 to write it). Other valid
+    locations must be unique within a launch (duplicate writes race).
     BF16 is the model input; FP16/FP32 inputs are also accepted explicitly.
     """
     _cuda_same(k_nope, k_rope, kv_buffer, loc)
@@ -143,6 +148,7 @@ def quantize_prims_k_cache_into(k_nope, k_rope, kv_buffer, loc) -> None:
         rows,
         locations,
         rows.shape[0],
+        reserved_skip_index,
         n.stride(0),
         n.stride(1),
         r.stride(0),

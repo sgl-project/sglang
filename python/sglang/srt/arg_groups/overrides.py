@@ -824,14 +824,8 @@ def _prims_ts_nvfp4_backends(view: Any, hf_config: Any, major: int) -> Dict[str,
         raise ValueError("DSA NVFP4 KV (prims_ts) requires --page-size 64")
     if not getattr(view, "disable_radix_cache", False):
         raise ValueError("DSA NVFP4 KV (prims_ts) requires --disable-radix-cache")
-    if not (
-        getattr(view, "disable_prefill_cuda_graph", False)
-        or getattr(view, "disable_cuda_graph", False)
-    ):
-        raise ValueError(
-            "DSA NVFP4 KV (prims_ts) requires --disable-prefill-cuda-graph "
-            "(eager prefill; decode CUDA graphs are supported)"
-        )
+    # Prefill CUDA graphs are rejected at backend init, against the resolved
+    # cuda_graph_config (its JSON and per-phase flags override the booleans).
     unsupported = (
         "enable_mixed_chunk",
         "enable_hierarchical_cache",
@@ -843,12 +837,10 @@ def _prims_ts_nvfp4_backends(view: Any, hf_config: Any, major: int) -> Dict[str,
         "enable_page_major_kv_layout",
         "enable_unified_cache_external_linker",
         "enable_session_radix_cache",
-        "enable_pdmux",
         "enable_mis",
         "enable_kv_cache_sharding",
         "prefill_only_disable_kv_cache",
         "enable_torch_compile",
-        "enable_piecewise_cuda_graph",
     )
     bad = [name for name in unsupported if getattr(view, name, False)]
     if getattr(view, "speculative_algorithm", None):

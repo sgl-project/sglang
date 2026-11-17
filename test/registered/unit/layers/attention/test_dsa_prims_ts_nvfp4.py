@@ -218,9 +218,6 @@ class TestPrimsTSNvfp4Forward(_NoCapture):
         backend = _nvfp4_backend()
         backend._prims_ts_live_rows = 2
         cache = torch.zeros((64, 1, 352), dtype=torch.uint8)
-        backend.token_to_kv_pool = SimpleNamespace(
-            get_key_buffer=lambda _layer_id: cache
-        )
         casts = []
 
         def cast(q_nope, q_rope, heads, pad_heads=True):
@@ -244,7 +241,7 @@ class TestPrimsTSNvfp4Forward(_NoCapture):
         q_rope = torch.zeros((3, 4, 64), dtype=torch.bfloat16)
         ids = torch.zeros((3, 2048), dtype=torch.int32)
         out = DeepseekSparseAttnBackend._forward_prims_ts_nvfp4(
-            backend, q_nope, q_rope, layer, ids
+            backend, q_nope, q_rope, layer, cache, ids
         )
 
         self.assertEqual(out.shape, (3, 4, 512))
@@ -258,6 +255,30 @@ class TestPrimsTSNvfp4Forward(_NoCapture):
         self.assertIs(cast[0], q_nope)
         self.assertEqual(cast[2:4], (4, False))  # no head padding for Prims-TS
         self.assertIs(cast[4], call["q"])
+
+
+class TestPrimsTSNvfp4Metadata(_NoCapture):
+    def test_metadata_glue_graph_is_refused(self):
+        # A glue-graph replay would skip the host-side lengths refill.
+        backend = SimpleNamespace(
+            is_dsa_prims_nvfp4=True,
+            init_kernel_metadata=MethodType(
+                DeepseekSparseAttnBackend.init_kernel_metadata, object()
+            ),
+        )
+        prop = DeepseekSparseAttnBackend.requires_eager_metadata
+        self.assertTrue(prop.fget(backend))
+        backend.is_dsa_prims_nvfp4 = False
+        self.assertFalse(prop.fget(backend))
+
+    def test_graph_metadata_rejects_prefill(self):
+        backend = _nvfp4_backend()
+        batch = SimpleNamespace(
+            forward_mode=SimpleNamespace(is_decode_or_idle=lambda: False),
+            batch_size=4,
+        )
+        with self.assertRaisesRegex(RuntimeError, "graph metadata"):
+            DeepseekSparseAttnBackend.init_forward_metadata_out_graph(backend, batch)
 
 
 class TestPrimsTSNvfp4Pool(unittest.TestCase):
@@ -334,7 +355,6 @@ class TestPrimsTSNvfp4Arguments(unittest.TestCase):
         for view in (
             self._view(dsa_decode_backend="flashmla_kv"),
             self._view(disable_radix_cache=False),
-            self._view(disable_prefill_cuda_graph=False),
             self._view(page_size=1),
             self._view(speculative_algorithm="EAGLE"),
             self._view(dcp_size=2),
