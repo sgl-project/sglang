@@ -192,5 +192,8 @@ class Step3p7ForConditionalGeneration(nn.Module):
         if language_weights:
             self.language_model.load_weights(language_weights)
 
+    def post_load_weights(self) -> None:
+        self.language_model.post_load_weights()
+
 
 EntryClass = Step3p7ForConditionalGeneration

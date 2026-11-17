@@ -751,7 +751,7 @@ class Step3p5ForCausalLM(nn.Module):
                 self.lm_head.weight.copy_(emb_token_weight)
 
         self.logits_processor = LogitsProcessor(config)
-        self._startup_load_done = False
+        self._checkpoint_loaded = False
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.get_input_embeddings()
@@ -929,11 +929,10 @@ class Step3p5ForCausalLM(nn.Module):
                         )
                         loaded_params.add(actual_param_name)
 
-        # Online weight updates call load_weights once per bucket, so only the
-        # startup load has to carry every parameter.
-        if self._startup_load_done:
+        # Only the checkpoint load must be complete; later calls are update buckets.
+        if self._checkpoint_loaded:
             return
-        self._startup_load_done = True
+        self._checkpoint_loaded = True
 
         # Derived parameters (e.g. blockscale_swizzled from NVFP4 quantization)
         # are computed in process_weights_after_loading, not loaded from checkpoint.
@@ -943,6 +942,10 @@ class Step3p5ForCausalLM(nn.Module):
             if "blockscale_swizzled" not in p
         }
         assert len(print_params) == 0, f"Some parameters are not loaded: {print_params}"
+
+    def post_load_weights(self) -> None:
+        # Loaders that skip load_weights (dummy, sharded state, remote instance) call this.
+        self._checkpoint_loaded = True
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight
