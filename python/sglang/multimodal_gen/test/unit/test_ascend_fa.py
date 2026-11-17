@@ -481,8 +481,8 @@ def legacy_native(monkeypatch, adapter):
     monkeypatch.setattr(
         torch, "npu", SimpleNamespace(get_soc_version=lambda: 260), raising=False
     )
-    monkeypatch.setattr(ascend_fa.envs, "SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION", True)
-    monkeypatch.setattr(ascend_fa.envs, "SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE", 4)
+    monkeypatch.setenv("SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION", "true")
+    monkeypatch.setenv("SGLANG_DIFFUSION_MXFP8_FA_HEAD_CHUNK_SIZE", "4")
     monkeypatch.setattr(torch, "float8_e8m0fnu", torch.uint8, raising=False)
     quant = Mock(side_effect=lambda tensor, **kw: (tensor, torch.ones(1)))
     native_mx = Mock(side_effect=lambda q, *a, **kw: (torch.zeros_like(q), None))
@@ -672,14 +672,10 @@ def test_sd_execution_failure_never_retries_native(legacy_native, precision, err
 def test_legacy_nonquantized_calls_remain_native_float(
     monkeypatch, legacy_native, case
 ):
-    from sglang.multimodal_gen.runtime.layers.attention.backends import ascend_fa
-
     _, sd, build, quant, native_mx, native_float = legacy_native
     qc = None if case == "unquantized" else type("MXFP8Config", (), {})()
     if case == "disabled":
-        monkeypatch.setattr(
-            ascend_fa.envs, "SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION", False
-        )
+        monkeypatch.setenv("SGLANG_DIFFUSION_ENABLE_MXFP8_ATTENTION", "false")
     impl = build(
         quant_config=qc, causal=case == "causal", is_cross_attention=case == "cross"
     )
