@@ -3,6 +3,7 @@ from typing import Optional, Tuple, Union
 
 import torch
 
+from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention import kda_fused_decode
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
@@ -46,6 +47,7 @@ elif is_cpu():
 from sglang.srt.model_executor.cuda_graph_config import Backend as CudaGraphBackend
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.runtime_context import (
     get_disagg,
     get_exec,
@@ -1291,6 +1293,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
         speculative `intermediate_ssm` scratch so the central post-verify rollback
         (update_mamba_state_after_mtp_verify) can commit the accepted-length state.
         """
+        if mixed_qkv.shape[0] == 0:
+            return mixed_qkv.new_empty((1, 0, layer.num_v_heads, layer.head_v_dim))
         fm = self.forward_metadata
         seq_len = mixed_qkv.shape[0]
         query_start_loc = fm.query_start_loc
@@ -1818,9 +1822,14 @@ class KDAAttnBackend(MambaAttnBackendBase):
         """Return whether the fixed Kimi-K3/DSpARK CuTe contract is satisfied."""
         if not self.kernel_dispatcher.verify_backend.is_nv_cutedsl() or not is_cuda():
             return False
-        if importlib.util.find_spec("cutlass") is None:
+        cuda_arch = current_arch().cuda
+        if cuda_arch is None or cuda_arch.major not in (9, 10):
             return False
-        if torch.cuda.get_device_capability()[0] != 10:
+        # SM90 runs it only in CUDA graphs: an eager verify is bound by the
+        # launcher's host time, and Triton's kernels launch faster.
+        if cuda_arch.major == 9 and not get_is_capture_mode():
+            return False
+        if importlib.util.find_spec("cutlass") is None:
             return False
         if ragged_layout is not None or retrieve_parent_token is not None:
             return False
