@@ -1974,6 +1974,14 @@ class Envs:
     # still writes. Requires --enable-hierarchical-cache. Off keeps the
     # donated GPU slot and the previous ratio.
     SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT = EnvBool(False)
+    # Opt-in: with --enable-linear-replayssm-spec and a 16-bit --mamba-ssm-dtype,
+    # the EAGLE / NEXTN / NGRAM verify commit keeps accepted GDN history in the
+    # ring and folds a request into its checkpoint only when its next draft
+    # window would not fit, as an fp32 checkpoint does; the verify reads that
+    # history with the ring's low parts. Batches smaller than
+    # REPLAYSSM_LAZY_FOLD_MIN_STATES (gdn_replayssm_spec_decode.py) fold after
+    # every verify, as every batch does with the variable unset.
+    SGLANG_OPT_GDN_REPLAYSSM_LAZY_FOLD = EnvBool(False)
 
     # ===================================================================
     # CUDA graphs and execution buffers

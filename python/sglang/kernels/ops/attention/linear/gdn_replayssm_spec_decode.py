@@ -48,6 +48,23 @@ from sglang.srt.utils import is_gfx95_supported
 
 _IS_GFX95 = is_gfx95_supported()
 
+# Under SGLANG_OPT_GDN_REPLAYSSM_LAZY_FOLD a 16-bit checkpoint folds lazily only
+# in verify batches of at least this many request states (requests x value
+# heads) per layer; a smaller batch's commit folds every row, with all of its
+# pending ring history. The lazy fold trades a longer history read in the verify
+# for fewer folds, whose cost scales with the states. On MI355X at
+# Qwen3.8-Flash-Next's GDN shape and mean accept lengths 1.7-3.3 it is faster
+# at every measured batch from 34 requests x 48 value heads (TP1) and 68 x 24
+# (TP2), and slower at 48 x 24 and, at mean accept lengths 2.3 and 3.3, 32 x 48
+# (benchmark/kernels/attention/bench_gdn_replayssm_lazy_fold.py).
+REPLAYSSM_LAZY_FOLD_MIN_STATES = 34 * 48
+
+
+def replayssm_lazy_fold_pays(num_requests: int, num_value_heads: int) -> bool:
+    """Whether a verify batch is large enough for a 16-bit checkpoint's lazy
+    fold (``REPLAYSSM_LAZY_FOLD_MIN_STATES``)."""
+    return num_requests * num_value_heads >= REPLAYSSM_LAZY_FOLD_MIN_STATES
+
 
 @triton.jit
 def gdn_replayssm_spec_circular_kernel(
@@ -114,6 +131,7 @@ def gdn_replayssm_spec_circular_kernel(
     STRIDE_WP: tl.constexpr = 1,
     STRIDE_CB: tl.constexpr = 1,
     STRIDE_FL: tl.constexpr = 1,
+    COMPENSATED_HISTORY: tl.constexpr = False,
 ):
     i_v = tl.program_id(0)
     i_n = tl.program_id(1)
@@ -326,6 +344,20 @@ def gdn_replayssm_spec_circular_kernel(
                     khist_tile = khist_tile.to(k_cache.dtype.element_ty)
                 scores_q += tl.dot(khist_tile, qT, input_precision=DOT_PRECISION)
                 scores_k += tl.dot(khist_tile, kT, input_precision=DOT_PRECISION)
+                if COMPENSATED_HISTORY:
+                    # The ring keys' low parts, and this window's key residual,
+                    # as the commit and the in-window products use them.
+                    khist_lo = tl.load(
+                        rawk_cache
+                        + replay_idx * stride_rawk_slot
+                        + (i_h * MAX_CACHE_LEN + phys_c[:, None]) * K
+                        + o_kt[None, :],
+                        mask=cache_valid[:, None] & mask_kt[None, :],
+                        other=0.0,
+                    )
+                    scores_q += tl.dot(khist_lo, qT)
+                    scores_k += tl.dot(khist_lo, kT)
+                    scores_k += tl.dot(khist_tile, tl.trans(k_residual_tile))
 
         if write_k:
             spec_kt_mask = (
@@ -383,6 +415,15 @@ def gdn_replayssm_spec_circular_kernel(
             b_d_all = tl.load(
                 p_d_main, mask=mask_v[:, None] & cache_valid[None, :], other=0.0
             ).to(tl.float32)
+            if COMPENSATED_HISTORY:
+                b_d_all += tl.load(
+                    rawv_cache
+                    + replay_idx * stride_rawv_slot
+                    + (i_hv * MAX_CACHE_LEN + phys_c[None, :]) * V
+                    + o_v[:, None],
+                    mask=mask_v[:, None] & cache_valid[None, :],
+                    other=0.0,
+                ).to(tl.float32)
             b_d_scaled_fp32 = b_d_all * b_replay_decay[None, :]
             if STATE_FP32:
                 # Preserve the pre-existing fp32-checkpoint path: these dots
@@ -390,16 +431,33 @@ def gdn_replayssm_spec_circular_kernel(
                 b_d_scaled = b_d_scaled_fp32
             else:
                 b_d_scaled = b_d_scaled_fp32.to(d_cache.dtype.element_ty)
-            hw_q = b_total_decay * hw_q + tl.dot(
-                b_d_scaled,
-                scores_q.to(b_d_scaled.dtype),
-                input_precision=DOT_PRECISION,
-            )
-            hw_k = b_total_decay * hw_k + tl.dot(
-                b_d_scaled,
-                scores_k.to(b_d_scaled.dtype),
-                input_precision=DOT_PRECISION,
-            )
+            if COMPENSATED_HISTORY:
+                # Split both operands into 16-bit high and low parts, so the
+                # history adds no rounding a fold of the same ring would not.
+                d_lo = (b_d_scaled_fp32 - b_d_scaled.to(tl.float32)).to(
+                    b_d_scaled.dtype
+                )
+                sq_hi = scores_q.to(b_d_scaled.dtype)
+                sq_lo = (scores_q - sq_hi.to(tl.float32)).to(b_d_scaled.dtype)
+                sk_hi = scores_k.to(b_d_scaled.dtype)
+                sk_lo = (scores_k - sk_hi.to(tl.float32)).to(b_d_scaled.dtype)
+                hw_q = b_total_decay * hw_q + tl.dot(b_d_scaled, sq_hi)
+                hw_q += tl.dot(b_d_scaled, sq_lo)
+                hw_q += tl.dot(d_lo, sq_hi)
+                hw_k = b_total_decay * hw_k + tl.dot(b_d_scaled, sk_hi)
+                hw_k += tl.dot(b_d_scaled, sk_lo)
+                hw_k += tl.dot(d_lo, sk_hi)
+            else:
+                hw_q = b_total_decay * hw_q + tl.dot(
+                    b_d_scaled,
+                    scores_q.to(b_d_scaled.dtype),
+                    input_precision=DOT_PRECISION,
+                )
+                hw_k = b_total_decay * hw_k + tl.dot(
+                    b_d_scaled,
+                    scores_k.to(b_d_scaled.dtype),
+                    input_precision=DOT_PRECISION,
+                )
 
     # ------------------------------------------------------------------
     # strictly-lower A and T = (I + A)^{-1}.
@@ -980,6 +1038,7 @@ def _launch_gdn_spec(
     bs_min,
     null_block_id,
     dot_precision,
+    compensated_history=False,
 ):
     num_slots, HV, V, K = checkpoint_state.shape
     H = k.shape[1]
@@ -1075,6 +1134,9 @@ def _launch_gdn_spec(
         STRIDE_WP=write_pos.stride(0),
         STRIDE_CB=cache_base.stride(0),
         STRIDE_FL=is_flush.stride(0),
+        COMPENSATED_HISTORY=compensated_history
+        and store_residual
+        and checkpoint_state.dtype != torch.float32,
     )
 
 
@@ -1181,6 +1243,7 @@ def gdn_replayssm_spec_decode(
     launch_mode: str = "both",
     # Triton only accepts TF32 input precision on Ampere-or-newer NVIDIA GPUs.
     dot_precision: str = "tf32" if is_tf32_supported else "ieee",
+    compensated_history: bool = False,
 ):
     """GDN cached speculative-decode on a CIRCULAR ring cache (split-qkv varlen).
 
@@ -1194,6 +1257,10 @@ def gdn_replayssm_spec_decode(
          checkpoint (statically empty history).
     The circular history and cursors are request-keyed by ``replay_indices``;
     the checkpoint remains keyed by physical ``ssm_state_indices``.
+    ``compensated_history``: for rings that keep accepted history across
+    commits, a 16-bit checkpoint's verify reads that history with the rings'
+    low parts and splits its products into high and low parts; no effect on
+    an fp32 checkpoint or without the low-part rings.
     """
     if scale is None:
         scale = checkpoint_state.shape[-1] ** -0.5
@@ -1268,6 +1335,7 @@ def gdn_replayssm_spec_decode(
             bs_min,
             null_block_id,
             dot_precision,
+            compensated_history=compensated_history,
         )
     if launch_mode in ("both", "flush"):
         _launch_gdn_spec(

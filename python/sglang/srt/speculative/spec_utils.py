@@ -1354,6 +1354,7 @@ def commit_mamba_states_after_verify(
     ):
         from sglang.kernels.ops.attention.linear.gdn_replayssm_spec_decode import (
             commit_gdn_replayssm_after_verify,
+            replayssm_lazy_fold_pays,
         )
 
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
@@ -1371,7 +1372,16 @@ def commit_mamba_states_after_verify(
             accept_lens=accept_lens,
             last_correct_step_indices=last_correct_step_indices,
             max_spec_len=draft_token_num,
-            fold_every_commit=spec_state.temporal.dtype != torch.float32,
+            # An fp32 checkpoint folds only when the next window would not fit;
+            # a 16-bit one folds every commit unless the lazy fold is opted in
+            # and the batch is large enough for it to pay.
+            fold_every_commit=(
+                spec_state.temporal.dtype != torch.float32
+                and not (
+                    envs.SGLANG_OPT_GDN_REPLAYSSM_LAZY_FOLD.get()
+                    and replayssm_lazy_fold_pays(bs, spec_state.temporal.shape[2])
+                )
+            ),
             mamba_track_indices=replay_track_indices,
             mamba_steps_to_track=mamba_steps_to_track,
             src_indices_raw=src_indices_raw,

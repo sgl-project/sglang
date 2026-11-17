@@ -536,11 +536,53 @@ def handle_linear_attn_backend(server_args: Any):
                 mamba_ssm_dtype="float32",
             )
         elif cfg.mamba_ssm_dtype != "float32":
+            lazy_fold = envs.SGLANG_OPT_GDN_REPLAYSSM_LAZY_FOLD.get()
+            if lazy_fold:
+                # The checkpoint then lags its request's ring between folds, as
+                # an fp32 one does. Refuse what reads the checkpoint without
+                # the ring, what can grow the next window past the fold margin,
+                # and the commits that fold every window anyway.
+                conflicts = [
+                    flag
+                    for flag, refused in (
+                        ("--enable-mixed-chunk", cfg.enable_mixed_chunk),
+                        ("--enable-streaming-session", cfg.enable_streaming_session),
+                        ("--speculative-adaptive", cfg.speculative_adaptive),
+                        (
+                            "--disaggregation-mode decode",
+                            cfg.disaggregation_mode == "decode",
+                        ),
+                        (
+                            "the radix cache without an extra-buffer "
+                            "--mamba-radix-cache-strategy",
+                            not cfg.disable_radix_cache
+                            and not mamba_extra_buffer_of(resolved_view(server_args)),
+                        ),
+                        (
+                            f"--speculative-algorithm {cfg.speculative_algorithm}",
+                            (cfg.speculative_algorithm or "").upper()
+                            in ("DSPARK", "DFLASH"),
+                        ),
+                    )
+                    if refused
+                ]
+                if conflicts:
+                    raise ValueError(
+                        "SGLANG_OPT_GDN_REPLAYSSM_LAZY_FOLD keeps accepted GDN "
+                        "history in the ring between checkpoint folds and is not "
+                        "supported with " + ", ".join(conflicts) + "."
+                    )
             logger.warning(
                 "--enable-linear-replayssm-spec with --mamba-ssm-dtype=%s: the "
-                "compact checkpoint is materialized after each accepted "
-                "verify window; validate long-sequence accuracy and throughput.",
+                "compact checkpoint is materialized %s; validate long-sequence "
+                "accuracy and throughput.",
                 cfg.mamba_ssm_dtype,
+                (
+                    "when a request's next verify window would not fit its ring "
+                    "(after each accepted verify window in small batches)"
+                    if lazy_fold
+                    else "after each accepted verify window"
+                ),
             )
 
 

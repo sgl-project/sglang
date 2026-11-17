@@ -701,6 +701,14 @@ class GDNAttnBackend(MambaAttnBackendBase):
             )
         )
         self._use_strided_target_verify_qkv = False
+        # With the lazy fold a 16-bit checkpoint's ring keeps accepted history
+        # across commits (spec_utils.commit_mamba_states_after_verify), which
+        # the ReplaySSM target verify then reads with the ring's low parts, at
+        # every batch size: a batch below the lazy fold's size can hold history
+        # a larger one left.
+        self._replayssm_compensated_history = (
+            envs.SGLANG_OPT_GDN_REPLAYSSM_LAZY_FOLD.get()
+        )
         # A prefill batch never holds more requests than the pool.
         self.prefill_graph_max_seqs = min(
             self.req_to_token_pool.size, envs.SGLANG_GDN_PREFILL_GRAPH_MAX_SEQS.get()
@@ -2003,6 +2011,7 @@ class GDNAttnBackend(MambaAttnBackendBase):
             # Capacity folds are committed once across every GDN layer after
             # acceptance; the active path is therefore a single launch/layer.
             launch_mode="verify",
+            compensated_history=self._replayssm_compensated_history,
         )
         # Match the recurrent target_verify output shape (== value.shape).
         return out.reshape(value.shape)
