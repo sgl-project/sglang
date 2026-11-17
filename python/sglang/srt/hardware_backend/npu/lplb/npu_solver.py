@@ -27,7 +27,7 @@ DEFAULT_NUM_ITERS = 5
 # The NPU kernels are always the Triton-Ascend implementation.  Pin it instead
 # of relying on the operator's ``auto`` resolution so that a future default
 # change cannot silently switch this backend.
-_IMPL = "triton"
+_IMPL = "auto"
 
 # ``device`` is part of the key only to make repeated calls for a different
 # device cheap; in practice every rank has one NPU.
