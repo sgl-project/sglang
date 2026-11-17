@@ -20,11 +20,18 @@ from transformers import AutoProcessor
 
 from sglang.srt.configs.model_config import ModelConfig
 from sglang.srt.environ import envs
+from sglang.srt.hf_transformers import resolve_image_processor_backend
 from sglang.srt.multimodal.cache import parse_content_hash, snapshot_media
 from sglang.srt.multimodal.encoder_preprocessing import (
     EncoderMediaProcessorConfig,
     EncoderPreprocessOutput,
     invoke_encoder_preprocessor,
+)
+from sglang.srt.multimodal.media_io import (
+    CLIENT_MEDIA_EXCEPTIONS,
+    load_audio,
+    load_image,
+    load_video,
 )
 from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.glm4v import (
@@ -48,13 +55,6 @@ from sglang.srt.runtime_context import (
     get_serving,
 )
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import (
-    CLIENT_MEDIA_EXCEPTIONS,
-    load_audio,
-    load_image,
-    load_video,
-)
-from sglang.srt.utils.hf_transformers import resolve_image_processor_backend
 
 logger = logging.getLogger(__name__)
 

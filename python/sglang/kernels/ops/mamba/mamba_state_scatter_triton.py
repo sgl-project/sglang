@@ -13,7 +13,7 @@ import triton
 import triton.language as tl
 
 from sglang.kernels.ops.memory.ptr_table import make_ptr_table
-from sglang.srt.utils.common import get_device_core_count
+from sglang.srt.utils.device import get_device_core_count
 
 
 def _require_entry_contiguous_dst(
@@ -572,7 +572,7 @@ _CONV_MULTI_META_COLS = 12
 _conv_multi_meta_cache: dict = {}
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["idx1_ptr", "step1_ptr", "idx2_ptr", "step2_ptr", "n1"])
 def _fused_conv_window_scatter_multi_kernel(
     meta_ptr,  # int64 [num_types, 12]: src_ptr, dst_ptr, elem, s_l, s_r, s_s, s_d, s_w, d_l, d_r, block_start, last_axis
     idx1_ptr,

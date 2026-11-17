@@ -107,6 +107,8 @@ def _make_backend():
     from sglang.srt.layers.attention.dsa_backend import DeepseekSparseAttnBackend
 
     backend = DeepseekSparseAttnBackend.__new__(DeepseekSparseAttnBackend)
+    backend.dsa_shards_index_k = False
+    backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
     backend._q8kv8_born_q_stash = None
     backend._q8kv8_born_q_buf = None
     backend._q8kv8_qpad_buf = None

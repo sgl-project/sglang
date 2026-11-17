@@ -9,7 +9,7 @@ from sglang.kernels.ops.moe.gguf_moe_weights_aot import resolve_gguf_moe_weights
 from sglang.srt.utils import is_musa
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="nightly", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="nightly", runner_config="1-gpu-small")
 
 
 def torch_weight(outputs, weights, ids):

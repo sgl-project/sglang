@@ -20,6 +20,7 @@ from sglang.kernels.ops.attention.trtllm_mha_graph_metadata import (
     Q_MODE_CUMSUM,
     Q_MODE_NONE,
     Q_MODE_STRIDED,
+    update_draft_step_seqlens,
     update_trtllm_mha_graph_metadata,
 )
 from sglang.srt.environ import envs
@@ -95,6 +96,7 @@ def make_xqa_backend(monkeypatch):
             max_running_requests=4,
             model=SimpleNamespace(modules=lambda: []),
             is_draft_worker=False,
+            server_args=SimpleNamespace(enable_nvidia_megakernel=False),
         )
         return TRTLLMHAAttnBackend(runner)
 
@@ -663,6 +665,7 @@ def _translate_through_a_moving_page_map(backend):
             key=(IdSpaceKind.FULL, "test"), write=lambda ids: ids, read_v2p=v2p
         )
     }
+    runner_ids._role_sub_pools = {}
     runner_ids._rows = torch.arange(rows, dtype=torch.int64)
     backend.runner_ids = runner_ids
     return v2p
@@ -750,6 +753,95 @@ def test_unified_decode_replay_reads_only_this_replays_pages(monkeypatch):
         batch,
         lambda runner_ids, fb: runner_ids.bind_own_plan(fb),
     )
+
+
+def _ring_backend(monkeypatch):
+    from sglang.srt.speculative.dflash_draft_ring import (
+        DFlashDraftKVRing,
+        draft_kv_ring_paged_rows_per_req,
+    )
+
+    def recorded_kernel(**kwargs):
+        assert kwargs["page_table"] is None and kwargs["skip_page_table"]
+        bs = kwargs["bs"]
+        kwargs["cache_seqlens"][:bs].copy_(
+            kwargs["seq_lens"][:bs] + kwargs["seqlen_offset"]
+        )
+
+    monkeypatch.setattr(
+        trtllm_mha_backend, "update_trtllm_mha_graph_metadata", recorded_kernel
+    )
+    backend = _make_backend_for_hook_test(speculative_num_draft_tokens=8)
+    backend.expand_encoder_only_verify = True
+    backend.init_cuda_graph_state(max_bs=4, max_num_tokens=32)
+    ring = DFlashDraftKVRing(
+        rows_per_req=draft_kv_ring_paged_rows_per_req(
+            window_left=255, block_size=8, page_size=PAGE_SIZE
+        ),
+        dcp_size=1,
+        req_to_token_rows=4,
+        device="cpu",
+        window_left=255,
+        dcp_rank=0,
+        pool=SimpleNamespace(maybe_get_custom_mem_pool=lambda: None),
+        page_size=PAGE_SIZE,
+    )
+    ring.min_pos.copy_(torch.tensor([0, 300, 5, 0], dtype=torch.int32))
+    backend.set_draft_kv_ring(ring)
+    return backend, ring
+
+
+def _assert_reads_the_ring(backend, ring, req_pool_indices, seq_lens, block):
+    metadata = backend.forward_metadata
+    bs = len(seq_lens)
+    floors = ring.min_pos[req_pool_indices].tolist()
+    expected_lens = [n - f + block for n, f in zip(seq_lens, floors)]
+    assert metadata.cache_seqlens_int32[:bs].tolist() == expected_lens
+    cols = torch.arange(backend.max_num_pages) % ring.pages_per_req
+    for row, req in enumerate(req_pool_indices.tolist()):
+        expected = (1 + req * ring.pages_per_req + cols).to(torch.int32)
+        assert torch.equal(metadata.page_table[row], expected)
+    rows = bs * block
+    assert torch.equal(
+        metadata.encoder_page_table[:rows],
+        metadata.page_table[:bs].repeat_interleave(block, dim=0),
+    )
+    assert metadata.encoder_cache_seqlens[:rows].tolist() == [
+        n for n in expected_lens for _ in range(block)
+    ]
+
+
+def test_draft_kv_ring_graph_verify_reads_the_ring(monkeypatch):
+    backend, ring = _ring_backend(monkeypatch)
+    capture = _graph_batch([1, 1], ForwardMode.TARGET_VERIFY, None, 8)
+    backend.init_forward_metadata_out_graph(capture, in_capture=True)
+    backend.init_forward_metadata_in_graph(capture)
+    for seq_lens, reqs in (([700, 310], [3, 1]), ([9, 900], [2, 0])):
+        replay = _graph_batch(seq_lens, ForwardMode.TARGET_VERIFY, None, 8)
+        replay.req_pool_indices = torch.tensor(reqs, dtype=torch.int64)
+        backend.init_forward_metadata_out_graph(replay)
+        backend.init_forward_metadata_in_graph(replay)
+        _assert_reads_the_ring(backend, ring, replay.req_pool_indices, seq_lens, 8)
+
+
+def test_draft_kv_ring_eager_verify_reads_the_ring(monkeypatch):
+    backend, ring = _ring_backend(monkeypatch)
+    seq_lens = [310, 700]
+    forward_batch = _eager_batch(seq_lens, ForwardMode.TARGET_VERIFY, tokens_per_req=8)
+    forward_batch.req_pool_indices = torch.tensor([1, 3], dtype=torch.int64)
+    backend.runner_ids.bind_own_plan(forward_batch)
+    backend.init_forward_metadata(forward_batch)
+    _assert_reads_the_ring(backend, ring, forward_batch.req_pool_indices, seq_lens, 8)
+
+
+def test_draft_kv_ring_other_modes_stay_inside_the_ring(monkeypatch):
+    backend, ring = _ring_backend(monkeypatch)
+    forward_batch = _eager_batch([1000, 20], ForwardMode.DECODE)
+    backend.runner_ids.bind_own_plan(forward_batch)
+    backend.init_forward_metadata(forward_batch)
+    table = backend.forward_metadata.page_table
+    assert backend.forward_metadata.cache_seqlens_int32.tolist() == [1000, 20]
+    assert int(table.max()) < 1 + 4 * ring.pages_per_req and int(table.min()) >= 1
 
 
 def _eager_batch(seq_lens, forward_mode, spec_info=None, tokens_per_req=1):
@@ -1401,6 +1493,97 @@ def test_bs_zero_noop():
         max_seq_pages=0,
         page_size=PAGE_SIZE,
     )
+
+
+@pytest.mark.parametrize("bs", [1, 3, 16, 128])
+def test_shared_draft_metadata_reads_what_each_step_writes(bs):
+    """A shared last-step table and one lengths launch reproduce every step's metadata."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    steps, pool_size, max_num_pages = 5, 160, 16
+    req_to_token, req_pool_indices, seq_lens, _, _ = _build_inputs(
+        bs, pool_size, max_num_pages, None, (max_num_pages - 2) * PAGE_SIZE, 4321 + bs
+    )
+    seq_lens[0] = PAGE_SIZE - 2  # the later steps cross into the next page
+    common = dict(
+        req_pool_indices=req_pool_indices,
+        seq_lens=seq_lens,
+        req_to_token=req_to_token,
+        bs=bs,
+        max_seq_pages=max_num_pages,
+        page_size=PAGE_SIZE,
+    )
+    want = []
+    for step in range(steps):
+        lens = torch.zeros(bs, dtype=torch.int32, device=DEVICE)
+        cu_lens = torch.zeros(bs + 1, dtype=torch.int32, device=DEVICE)
+        table = torch.zeros(bs, max_num_pages, dtype=torch.int32, device=DEVICE)
+        update_trtllm_mha_graph_metadata(
+            cache_seqlens=lens,
+            cu_seqlens_k=cu_lens,
+            page_table=table,
+            seqlen_offset=step + 1,
+            **common,
+        )
+        want.append((lens, cu_lens, table))
+
+    lens = torch.zeros(steps, bs, dtype=torch.int32, device=DEVICE)
+    cu_lens = torch.zeros(steps, bs + 1, dtype=torch.int32, device=DEVICE)
+    table = torch.zeros(bs, max_num_pages, dtype=torch.int32, device=DEVICE)
+    update_trtllm_mha_graph_metadata(
+        cache_seqlens=lens[-1],
+        cu_seqlens_k=cu_lens[-1],
+        page_table=table,
+        seqlen_offset=steps,
+        **common,
+    )
+    update_draft_step_seqlens(
+        seq_lens=seq_lens,
+        cache_seqlens=lens,
+        cu_seqlens_k=cu_lens,
+        bs=bs,
+        steps=steps - 1,
+        first_offset=1,
+    )
+    torch.cuda.synchronize()
+    for step, (want_lens, want_cu, want_table) in enumerate(want):
+        assert torch.equal(lens[step], want_lens)
+        assert torch.equal(cu_lens[step], want_cu)
+        for row in range(bs):
+            live = -(-int(want_lens[row]) // PAGE_SIZE)
+            assert torch.equal(table[row, :live], want_table[row, :live])
+
+
+@pytest.mark.parametrize(
+    "runtime_optimization,steps,swa,translating,expected",
+    [
+        (False, 3, False, False, False),
+        (True, 1, False, False, False),
+        (True, 3, True, False, False),
+        (True, 3, False, True, False),
+        (True, 3, False, False, True),
+    ],
+)
+def test_shared_draft_metadata_policy_is_runtime_only_and_safe(
+    monkeypatch, runtime_optimization, steps, swa, translating, expected
+):
+    """The generic runtime switch, never plugin presence, owns metadata sharing."""
+    from sglang.srt.layers.attention.trtllm_mha_backend import (
+        TRTLLMHAAttnMultiStepDraftBackend,
+    )
+
+    backends = [
+        SimpleNamespace(
+            use_sliding_window_kv_pool=swa,
+            runner_ids=SimpleNamespace(is_translating=translating),
+        )
+        for _ in range(max(steps, 1))
+    ]
+    with envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.override(runtime_optimization):
+        assert (
+            TRTLLMHAAttnMultiStepDraftBackend._can_share_draft_metadata(backends, steps)
+            is expected
+        )
 
 
 if __name__ == "__main__":

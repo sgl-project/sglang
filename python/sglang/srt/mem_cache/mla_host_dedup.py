@@ -45,6 +45,7 @@ def mla_host_dedup_eligible(kv_cache, storage_backend: Optional[str]) -> bool:
     buffer is not covered by the broadcast)."""
     return (
         isinstance(kv_cache, MLAKVView)
+        and kv_cache.storage_rank_replicated
         and not isinstance(kv_cache, MLATokenToKVPoolFP4)
         and is_cuda()
         and storage_supports_host_dedup(storage_backend)

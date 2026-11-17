@@ -4,6 +4,7 @@ import unittest
 from sglang.test.ascend.e2e.test_npu_multi_node_utils import NIC_NAME
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
     AISBENCHMARK,
+    AISBENCHMARK_DATASET_GSM8K,
     KIMI_K3_DSPARK_MODEL_PATH,
     KIMI_K3_W4A8_MODEL_PATH,
     TestNpuPerfMultiNodePdMixTestCaseBase,
@@ -125,21 +126,21 @@ KIMI_K3_W4A8_32P_MODEL_CONFIG = {
 class TestNPUKimiK3W4A832PMixIn128kOut1kDecodePrefix(
     TestNpuPerfMultiNodePdMixTestCaseBase
 ):
-    """Pure decode low latency: 128k shared prefix in / 1024 out, C12,
-    mean TPOT <= 30 ms."""
+    """Pure decode low latency: 128k input with a fully shared prefix
+    (repeat_rate=1, ~100% cache hit) / 1024 out, C12, mean TPOT <= 30 ms,
+    via the official aisbench prefix mode."""
 
     model_config = KIMI_K3_W4A8_32P_MODEL_CONFIG
     benchmark_tool = AISBENCHMARK
-    dataset_type = "gsm8k-shared-prefix"
+    dataset_type = AISBENCHMARK_DATASET_GSM8K
     dataset_path = None
     input_len = 131072
     output_len = 1024
     num_prompts = 12
     max_concurrency = 12
-    request_rate = 0
-    api_type = "raw"
-    warmup_dp = 4
-    warmup_shape = 1
+    repeat_rate = 1
+    request_rate = 3
+    dp = 4
     tpot = 30.0
 
     def test_npu_kimi_k3_w4a8_32p_mix_in128k_out1k_decode_prefix(self):
