@@ -25,6 +25,7 @@ from sglang.srt.model_executor.cuda_graph_config import CudaGraphConfig, PhaseCo
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.model_executor.runner.decode_cuda_graph_runner import (
+    _DP_NO_PAD_ROWS,
     DecodeCudaGraphRunner,
 )
 from sglang.srt.runtime_context import get_context, get_flags, get_parallel
@@ -538,6 +539,40 @@ class TestPrefillGraphIdleRankPadding(CustomTestCase):
             fb = self._sync_with_idle_rank([9, 0, 6, 4])
         self.assertEqual(fb.dp_padding_mode, DpPaddingMode.SUM_LEN)
         self.assertEqual(fb.global_num_tokens_cpu, [9, 0, 6, 4])
+
+
+class TestDpPadRowMaskCounts(CustomTestCase):
+    """SGLANG_OPT_MASK_DP_PAD_MOE in decode graphs: the per-rank counts the
+    captured pad-row mask reads, as load_batch writes them before a replay."""
+
+    @staticmethod
+    def _runner(num_dp_ranks: int, tokens_per_request: int) -> DecodeCudaGraphRunner:
+        runner = DecodeCudaGraphRunner.__new__(DecodeCudaGraphRunner)
+        runner.captured_req_width = tokens_per_request
+        runner._dp_real_num_tokens_gpu = torch.ones(num_dp_ranks, dtype=torch.int64)
+        return runner
+
+    def test_mask_reads_real_rows_not_the_padded_width(self):
+        """With the padded count (every rank as wide as the busiest) no pad row
+        is dropped from the MoE; each rank must report its own rows."""
+        runner = self._runner(num_dp_ranks=4, tokens_per_request=2)
+        runner._set_dp_real_num_tokens_per_rank(
+            SimpleNamespace(original_global_num_tokens_cpu=[8, 1, 0, 3]),
+            is_ragged=False,
+        )
+        self.assertEqual(runner._dp_real_num_tokens_gpu.tolist(), [16, 2, 0, 6])
+
+    def test_unknown_row_layout_resets_to_no_masking(self):
+        """A count left from the previous replay would drop real rows."""
+        for request_counts, is_ragged in (([8, 1], True), (None, False), ([8], False)):
+            runner = self._runner(num_dp_ranks=2, tokens_per_request=1)
+            runner._set_dp_real_num_tokens_per_rank(
+                SimpleNamespace(original_global_num_tokens_cpu=request_counts),
+                is_ragged=is_ragged,
+            )
+            self.assertEqual(
+                runner._dp_real_num_tokens_gpu.tolist(), [_DP_NO_PAD_ROWS] * 2
+            )
 
 
 if __name__ == "__main__":
