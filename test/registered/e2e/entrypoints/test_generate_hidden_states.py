@@ -1,7 +1,7 @@
 """HTTP `/generate` returns hidden states when the server allows the mode:
 one vector for `return_hidden_states="last"`, and for `True` a matrix for the
-prefill step followed by one vector per decode step. The Rust server returns
-the same shape for `True` as the Python frontend."""
+prefill step followed by one vector per decode step. The Python frontend and
+the Rust server return the same shapes."""
 
 import json
 import unittest
@@ -20,7 +20,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=240, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=300, stage="base-b", runner_config="1-gpu-small")
 
 PROMPT = "The capital of France is"
 
@@ -165,6 +165,11 @@ class TestGenerateHiddenStatesFull(HiddenStatesServerCase):
 
 @unittest.skipUnless(is_rust_server_built(), "embedded rust server extension not built")
 class TestGenerateHiddenStatesFullRustServer(TestGenerateHiddenStatesFull):
+    env = {"SGLANG_RUST_SERVER": "1"}
+
+
+@unittest.skipUnless(is_rust_server_built(), "embedded rust server extension not built")
+class TestGenerateHiddenStatesLastRustServer(TestGenerateHiddenStatesLast):
     env = {"SGLANG_RUST_SERVER": "1"}
 
 
