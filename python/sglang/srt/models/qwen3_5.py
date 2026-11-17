@@ -25,7 +25,10 @@ from safetensors.torch import load_file
 from transformers.utils import cached_file
 
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
-from sglang.kernels.ops.attention.fla.layernorm_gated import _layer_norm_fwd
+from sglang.kernels.ops.attention.fla.layernorm_gated import (
+    _layer_norm_fwd,
+    quant_heads_num_warps,
+)
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
     qwen3_5_gdn_prefill_projection_views,
@@ -291,6 +294,10 @@ if _is_npu:
     from sgl_kernel_npu.fla.utils import fused_qkvzba_split_reshape_cat_contiguous
 
 
+# A producer quantizes for its linear when the forward has at most this many tokens, whatever its mode.
+_FP8_TUPLE_MAX_TOKENS = 256
+
+
 def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
     quant_method = getattr(linear, "quant_method", None)
     return quant_method.__class__.__name__ == "Fp8LinearMethod" and (
@@ -299,19 +306,31 @@ def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
     )
 
 
-def _fp8_tuple_input(linear: nn.Module, num_tokens: int) -> bool:
-    """Whether the producer hands ``linear`` a per-token FP8 (q, scale) pair for the gfx950 small-M FP8 GEMM."""
+def _fp8_tuple_input(linear: nn.Module, num_tokens: int, dtype: torch.dtype) -> bool:
+    """Whether the producer hands ``linear`` a per-token FP8 (q, scale) pair: the one apply_fp8_linear's own
+    per-token quant of the producer's BF16 output gives it, for at most ``_FP8_TUPLE_MAX_TOKENS`` tokens."""
     scheme = getattr(linear, "scheme", None)
     return (
         _use_aiter
-        and num_tokens > 0
+        # gfx950: the producers quantize to e4m3fn and the launch shapes are checked there
+        and _is_gfx95
+        and 0 < num_tokens <= _FP8_TUPLE_MAX_TOKENS
+        # the GEMM returns BF16
+        and dtype == torch.bfloat16
         and type(scheme).__name__ == "QuarkW8A8Fp8"
         and scheme.per_token
         and scheme.weight_qscheme == "per_channel"
-        and smallm_fp8_gemm_config(num_tokens, *linear.weight.shape[::-1]) is not None
+        # None: an output width the GEMM cannot take, served dequantized
+        and linear.weight_scale is not None
         and not torch.compiler.is_compiling()
         and not get_forward().sp_active
-        and smallm_fp8_gemm_enabled()
+    )
+
+
+def _smallm_fp8_gemm_takes(linear: nn.Module, num_tokens: int) -> bool:
+    return (
+        smallm_fp8_gemm_enabled()
+        and smallm_fp8_gemm_config(num_tokens, *linear.weight.shape[::-1]) is not None
     )
 
 
@@ -1084,7 +1103,16 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             core_attn_out = core_attn_out_pad
 
         nv = self.num_v_heads // self.attn_tp_size
-        if not use_strided_prefill_z and _fp8_tuple_input(self.out_proj, len(z) // nv):
+        if (
+            not use_strided_prefill_z
+            and _fp8_tuple_input(self.out_proj, len(z) // nv, z.dtype)
+            # without a launch that rounds as the unfused one does, the norm and the quant stay two
+            # launches; the small-M GEMM's shapes keep the launch they always had
+            and (
+                quant_heads_num_warps(len(z), z.shape[-1], nv, z.device) is not None
+                or _smallm_fp8_gemm_takes(self.out_proj, len(z) // nv)
+            )
+        ):
             fp8, _, _ = _layer_norm_fwd(
                 core_attn_out,
                 self.norm.weight,
@@ -1628,7 +1656,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         attn_output = self.attn(q, k, v, forward_batch)
 
         if self.attn_output_gate:
-            if _fp8_tuple_input(self.o_proj, attn_output.shape[0]):
+            if _fp8_tuple_input(self.o_proj, attn_output.shape[0], attn_output.dtype):
                 attn_output = fused_sigmoid_mul(attn_output, gate, quant=True)
             elif not _is_npu:
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
