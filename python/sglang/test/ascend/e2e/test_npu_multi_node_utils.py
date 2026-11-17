@@ -33,6 +33,9 @@ CONFIGMAP_NAME = os.environ.get("KUBE_CONFIG_MAP")
 ACTIVE_TEST_CLASS = "active-test-class"
 
 LOCAL_TIMEOUT = 3600
+# Filled in by launch_router() so the readiness wait can fail fast when the
+# router process exits instead of polling for the full timeout.
+_router_process = {}
 ALL_ROLE_SET = {"prefill", "decode", "router", "master", "worker"}
 
 # Port numbers
@@ -797,6 +800,7 @@ def launch_router(model_config, router_binary):
     logger.info(f"Starting router with command: {' '.join(router_command)}")
     try:
         router_process = subprocess.Popen(router_command)
+        _router_process["handle"] = router_process
         logger.info(f"Router process started with PID: {router_process.pid}")
     except Exception as e:
         raise RuntimeError(f"Failed to start router process: {e}")
@@ -816,16 +820,18 @@ def start_router_thread(model_config, base_url):
     # prefill and decode workers to be registered.
     health_check_url = f"{base_url}/readiness"
     logger.info(f"Waiting for router to be ready at {health_check_url}")
-    wait_server_ready(health_check_url)
+    wait_server_ready(health_check_url, process_holder=_router_process)
     return router_thread
 
 
-def wait_server_ready(url, timeout=LOCAL_TIMEOUT):
+def wait_server_ready(url, timeout=LOCAL_TIMEOUT, process_holder=None):
     """Wait for the server to be ready.
 
     Args:
         url (str): Server URL to check.
         timeout (int): Timeout in seconds.
+        process_holder (dict): Optional holder whose ``handle`` entry is the
+            server process; waiting stops early if that process exits.
 
     Raises:
         RuntimeError: If server fails to start within timeout.
@@ -835,6 +841,12 @@ def wait_server_ready(url, timeout=LOCAL_TIMEOUT):
     check_interval = 10
 
     while True:
+        process = (process_holder or {}).get("handle")
+        if process is not None and process.poll() is not None:
+            raise RuntimeError(
+                f"Server process exited with code {process.returncode} before {url} "
+                f"became ready (elapsed: {time.perf_counter() - start_time:.2f}s)"
+            )
         try:
             response = requests.get(url, timeout=30)
             if response.status_code == 200:
