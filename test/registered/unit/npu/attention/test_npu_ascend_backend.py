@@ -1071,50 +1071,5 @@ class TestMlaPrefixFia(unittest.TestCase):
                 self._check_prefix([3, 1], [16, 32], dtype, 0, 4, page_size=16)
 
 
-class TestC8SparseAttention(unittest.TestCase):
-    def test_fp8_and_int8_share_attention_contract(self):
-        for dtype in (torch.int8, torch.float8_e4m3fn):
-            with self.subTest(dtype=dtype):
-                backend = AscendAttnBackend.__new__(AscendAttnBackend)
-                backend.kv_cache_dtype = dtype
-                backend.qk_rope_head_dim = 64
-                backend.forward_metadata = SimpleNamespace(
-                    block_tables=torch.zeros(1, 1, dtype=torch.int32)
-                )
-                q = torch.ones(2, 4, 512, dtype=torch.bfloat16)
-                rope = torch.ones(2, 4, 64, dtype=torch.bfloat16)
-                cache = torch.zeros(1, 128, 1, 656, dtype=dtype)
-                lengths = torch.tensor([2], dtype=torch.int64)
-                topk = torch.zeros(2, 1, 2048, dtype=torch.int32)
-                output = torch.ones_like(q)
-                with patch(
-                    "sglang.srt.hardware_backend.npu.attention.ascend_backend."
-                    "torch_npu.npu_kv_quant_sparse_flash_attention",
-                    return_value=output,
-                ) as attention:
-                    result = backend._forward_c8_sparse(
-                        q,
-                        rope,
-                        cache,
-                        topk,
-                        SimpleNamespace(scaling=0.1),
-                        lengths,
-                        lengths,
-                    )
-                args = attention.call_args.kwargs
-                self.assertIs(result, output)
-                self.assertEqual(args["key"].dtype, dtype)
-                self.assertEqual(args["key"].data_ptr(), cache.data_ptr())
-                self.assertIs(args["value"], args["key"])
-                torch.testing.assert_close(args["query"], torch.cat((q, rope), -1))
-                self.assertEqual(args["query"].dtype, torch.bfloat16)
-                self.assertEqual(args["key_quant_mode"], 2)
-                self.assertEqual(args["value_quant_mode"], 2)
-                self.assertEqual(args["tile_size"], 128)
-                self.assertEqual(args["rope_head_dim"], 64)
-                self.assertEqual(args["quant_scale_repo_mode"], 1)
-                self.assertEqual(args["actual_seq_lengths_query"].dtype, torch.int32)
-
-
 if __name__ == "__main__":
     unittest.main()

@@ -95,42 +95,6 @@ class TestNpuIndexKElision(CustomTestCase):
         bf16_bytes = 2
         self.assertEqual(cell_size, INDEX_HEAD_DIM * len(INDEXER_LAYERS) * bf16_bytes)
 
-    @patch("sglang.srt.hardware_backend.npu.utils.is_npu_arch35", return_value=False)
-    @patch.object(pool_configurator, "_is_npu", True)
-    def test_int8_budget_and_pool_use_packed_c8(self, _):
-        kvc = _kvc()
-        kvc.kv_cache_dtype = torch.int8
-        with patch(
-            "sglang.srt.hardware_backend.npu.memory_pool_npu.NPUMLATokenToKVPool"
-        ) as pool_cls:
-            KVCacheConfigurator._build_ascend_mla_kv_pool(
-                kvc, max_total_num_tokens=1024, is_dsa_model=True
-            )
-        self.assertEqual(pool_cls.call_args.kwargs["kv_cache_dim"], 656)
-        self.assertEqual(pool_cls.call_args.kwargs["dtype"], torch.int8)
-        self.assertEqual(pool_cls.call_args.kwargs["indexer_layer_ids"], INDEXER_LAYERS)
-        cell_size = (
-            pool_configurator.DefaultPoolConfigurator._compute_dsa_indexer_cell_size(
-                None, kvc=kvc, num_layers=NUM_LAYERS
-            )
-        )
-        self.assertEqual(cell_size, (INDEX_HEAD_DIM + 2) * len(INDEXER_LAYERS))
-
-    @patch("sglang.srt.hardware_backend.npu.utils.is_npu_arch35", return_value=False)
-    def test_int8_dcp_rejected_before_allocating_incompatible_cache(self, _):
-        kvc = _kvc()
-        kvc.kv_cache_dtype = torch.int8
-        with (
-            patch(
-                "sglang.srt.mem_cache.kv_cache_configurator.get_parallel",
-                return_value=types.SimpleNamespace(attn_dcp_size=2),
-            ),
-            self.assertRaisesRegex(ValueError, "does not return LSE"),
-        ):
-            KVCacheConfigurator._build_ascend_mla_kv_pool(
-                kvc, max_total_num_tokens=1024, is_dsa_model=True
-            )
-
 
 if __name__ == "__main__":
     unittest.main()

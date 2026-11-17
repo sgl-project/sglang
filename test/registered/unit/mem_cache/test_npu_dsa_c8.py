@@ -8,7 +8,6 @@ import torch
 
 from sglang.srt.hardware_backend.npu import memory_pool_npu as pools
 from sglang.srt.layers.attention.dsa import dsa_npu_indexer as indexer
-from sglang.srt.mem_cache.kv_cache_dtype import configure_kv_cache_dtype
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -137,26 +136,6 @@ class TestNpuDsaC8(CustomTestCase):
         self.assertEqual(vendor.npu_dynamic_quant.call_count, 2)
         for call in vendor.npu_dynamic_quant.call_args_list:
             torch.testing.assert_close(call.args[0], rotated)
-
-    def test_int8_dtype_resolution_preserves_independent_draft_dtype(self):
-        for is_draft, expected in (
-            (False, ("int8", torch.int8)),
-            (True, ("bf16", torch.bfloat16)),
-        ):
-            with patch(
-                "sglang.srt.mem_cache.kv_cache_dtype.current_platform"
-            ) as platform:
-                platform.is_npu.return_value = True
-                result = configure_kv_cache_dtype(
-                    server_args_kv_cache_dtype="int8",
-                    quant_config=None,
-                    model_dtype=torch.bfloat16,
-                    is_draft_worker=is_draft,
-                    is_dflash=False,
-                    speculative_draft_attention_backend="ascend",
-                    speculative_draft_kv_cache_dtype="bf16",
-                )
-                self.assertEqual(result, expected)
 
 
 if __name__ == "__main__":

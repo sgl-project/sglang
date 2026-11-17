@@ -2370,7 +2370,7 @@ class KVCacheConfigurator:
             NPUMLATokenToKVPool,
         )
         from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
-        from sglang.srt.mem_cache.kv_cache_dtype import resolve_indexer_quant_mode
+        from sglang.srt.mem_cache.kv_cache_dtype import resolve_indexer_kv_cache_dtype
 
         # Indexer uses the allocator-global slot space on DCP target workers.
         dcp_size = get_parallel().attn_dcp_size
@@ -2447,8 +2447,8 @@ class KVCacheConfigurator:
                 else None
             ),
             is_draft_worker=self.is_draft_worker,
-            indexer_quant_mode=resolve_indexer_quant_mode(
-                self.server_args.indexer_kv_cache_dtype, self.kv_cache_dtype
+            indexer_dtype=resolve_indexer_kv_cache_dtype(
+                self.server_args.indexer_kv_cache_dtype
             ),
             layer_num=self.layer_info.num_effective_layers,
             device=self.device,

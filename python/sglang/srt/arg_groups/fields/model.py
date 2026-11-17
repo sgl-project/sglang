@@ -223,13 +223,13 @@ class Model(msgspec.Struct):
         Optional[str],
         Arg(
             help=(
-                "Quantization recipe for the DSA lightning-indexer KV cache "
-                "(Ascend NPU only). None disables the quantized indexer cache "
-                'and keeps the default indexer behavior. "int8" stores the '
-                "indexer keys in INT8 with FP16 scales to speed up the "
-                "lightning indexer."
+                "Storage dtype for the DSA lightning-indexer KV cache "
+                "(Ascend NPU only). Defaults to the main KV cache dtype. "
+                '"bf16" or "bfloat16" keeps indexer keys unquantized; '
+                '"int8" stores them in INT8 with FP16 scales, independently '
+                "of the main KV cache dtype."
             ),
-            choices=["int8"],
+            choices=["bf16", "bfloat16", "int8"],
         ),
     ] = None
     qsa_indexer_dtype: A[

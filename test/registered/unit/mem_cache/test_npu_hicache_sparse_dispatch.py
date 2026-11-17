@@ -423,19 +423,14 @@ class TestNPUSparseDispatch(unittest.TestCase):
             ("page_first_kv_split", (8, 3, 128, 1), (8, 2, 128, 1)),
             ("layer_first_kv_split", (3, 8, 128, 1), (2, 8, 128, 1)),
         ):
-            for packed, scale_bytes in ((False, 4), (True, 4), (True, 2)):
-                with self.subTest(
-                    layout=layout, packed=packed, scale_bytes=scale_bytes
-                ):
+            for packed in (False, True):
+                with self.subTest(layout=layout, packed=packed):
                     allocate.reset_mock()
                     reserve.reset_mock()
                     empty.reset_mock()
                     h.layout = layout
                     h.dsa_kv_cache_store_fp8 = packed
                     h.dtype = SimpleNamespace(itemsize=1 if packed else 2)
-                    self.native.index_scales.dtype = SimpleNamespace(
-                        itemsize=scale_bytes
-                    )
                     self.native.k_width = 656 if packed else 512
                     v_width = 0 if packed else 64
                     self.assertIs(h.init_kv_buffer(), h.k_buffer)
@@ -449,16 +444,9 @@ class TestNPUSparseDispatch(unittest.TestCase):
                     if v_width:
                         expected_blocks.append(8 * 128 * 3 * v_width * h.dtype.itemsize)
                     expected_blocks.extend(
-                        [
-                            8 * 128 * 2 * 128 * h.dtype.itemsize,
-                            8 * 128 * 2 * scale_bytes,
-                        ]
+                        [8 * 128 * 2 * 128 * h.dtype.itemsize, 8 * 128 * 2 * 4]
                     )
                     reserve.assert_called_once_with(sum(expected_blocks), 0)
-                    self.assertEqual(
-                        allocate.call_args.kwargs["dtype"],
-                        self.native.index_scales.dtype,
-                    )
                     self.assertEqual(allocate.call_count, 3 if v_width == 0 else 4)
                     self.assertEqual(empty.call_count, 1 if v_width == 0 else 0)
 
@@ -485,19 +473,14 @@ class TestNPUSparseDispatch(unittest.TestCase):
             ("page_first_kv_split", (8, 3, 128, 1), (8, 2, 128, 1)),
             ("layer_first_kv_split", (3, 8, 128, 1), (2, 8, 128, 1)),
         ):
-            for packed, scale_bytes in ((False, 4), (True, 4), (True, 2)):
-                with self.subTest(
-                    layout=layout, packed=packed, scale_bytes=scale_bytes
-                ):
+            for packed in (False, True):
+                with self.subTest(layout=layout, packed=packed):
                     allocate.reset_mock()
                     reserve.reset_mock()
                     empty.reset_mock()
                     h.layout = layout
                     h.dsa_kv_cache_store_fp8 = packed
                     h.dtype = SimpleNamespace(itemsize=1 if packed else 2)
-                    self.native.index_scales.dtype = SimpleNamespace(
-                        itemsize=scale_bytes
-                    )
                     self.native.k_width = 656 if packed else 512
                     v_width = 0 if packed else 64
                     self.assertIs(h.init_kv_buffer(), h.k_buffer)
@@ -511,16 +494,9 @@ class TestNPUSparseDispatch(unittest.TestCase):
                     if v_width:
                         expected_blocks.append(8 * 128 * 3 * v_width * h.dtype.itemsize)
                     expected_blocks.extend(
-                        [
-                            8 * 128 * 2 * 128 * h.dtype.itemsize,
-                            8 * 128 * 2 * scale_bytes,
-                        ]
+                        [8 * 128 * 2 * 128 * h.dtype.itemsize, 8 * 128 * 2 * 4]
                     )
                     reserve.assert_called_once_with(sum(expected_blocks), 0)
-                    self.assertEqual(
-                        allocate.call_args.kwargs["dtype"],
-                        self.native.index_scales.dtype,
-                    )
                     self.assertEqual(allocate.call_count, 3 if v_width == 0 else 4)
                     self.assertEqual(empty.call_count, 1 if v_width == 0 else 0)
 

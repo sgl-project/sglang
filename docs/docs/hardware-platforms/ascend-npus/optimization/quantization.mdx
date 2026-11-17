@@ -491,27 +491,6 @@ python3 -m sglang.launch_server \
 > - ModelSlim supplies packed MXFP4 `w13` and `w2` expert weights with UE8M0 block scales (block size 32).
 > - Ascend TP and DeepEP dispatch activations as BF16; this path does not request MXFP4 dispatch. SGLang dynamically quantizes each expert input to MXFP4 immediately before grouped matmul.
 
-## DSA INT8 KV cache on Ascend A3
-
-For DeepSeek-V3.2-style DSA models, including GLM-5.2, select INT8 C8 cache with `--kv-cache-dtype int8`. This uses the existing NPU C8 path for both the main Attention KV cache and the Lightning Indexer cache. Model weight quantization is configured separately.
-
-With your Ascend environment installed, run a GLM-5.2 checkpoint with:
-
-```bash
-python -m sglang.launch_server \
-  --model-path MODEL_PATH \
-  --attention-backend ascend \
-  --tp-size 16 \
-  --page-size 128 \
-  --kv-cache-dtype int8
-```
-
-`MODEL_PATH` is the local checkpoint directory or Hugging Face model identifier. Adjust tensor parallelism to your deployment. The main cache stores INT8 latent vectors, BF16 RoPE values, and FP32 scales per 128 latent elements. The Indexer applies a normalized Hadamard transform and stores INT8 keys with FP16 scales.
-
-Native preprocessing supports C8 cache without `SGLANG_NPU_USE_MLAPO`. To enable fused preprocessing, use dynamic INT8 QKV-A and Q-B projections with `SGLANG_NPU_USE_MLAPO=1`; the fused path uses MLAProlog's packed C8 cache mode. When using a BF16 MTP draft checkpoint, select `--speculative-draft-kv-cache-dtype bf16` independently.
-
-INT8 C8 cache currently requires the non-950 DSA backend and does not support decode context parallelism: its quantized sparse Attention operator does not return the LSE needed to merge DCP results. Use BF16 KV cache for DCP. The 950 FP8 path continues to use `--kv-cache-dtype fp8_e4m3`.
-
 ## Diffusion Model Quantization on Ascend NPU
 
 SGLang-Diffusion supports MXFP8 online and offline quantization for diffusion models (such as Wan2.2) on Ascend NPUs. MXFP8 requires 950PR/DT Series; the ModelSlim W8A8/W4A4 schemes work on A2/A3 Series.

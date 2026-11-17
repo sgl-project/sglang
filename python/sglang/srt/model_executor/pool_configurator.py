@@ -706,17 +706,16 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         )
         if _is_npu:
             from sglang.srt.mem_cache.kv_cache_dtype import (
-                QUANT_MODE_TOKEN_INT8,
-                resolve_indexer_quant_mode,
+                resolve_indexer_kv_cache_dtype,
             )
 
-            dtype = kvc.kv_cache_dtype
+            dtype = (
+                resolve_indexer_kv_cache_dtype(kvc.server_args.indexer_kv_cache_dtype)
+                or kvc.kv_cache_dtype
+            )
             # GPU sizing above assumes FP8 indexers; NPU also needs BF16 sizing.
             if dtype != torch.float8_e4m3fn:
-                indexer_quant_mode = resolve_indexer_quant_mode(
-                    kvc.server_args.indexer_kv_cache_dtype, dtype
-                )
-                if dtype == torch.int8 or indexer_quant_mode == QUANT_MODE_TOKEN_INT8:
+                if dtype == torch.int8:
                     if get_dsa_index_kpool(kvc.model_config.hf_config) > 1:
                         raise ValueError(
                             "INT8 indexer KV cache is not supported with NPU KPool."
