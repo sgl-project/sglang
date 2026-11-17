@@ -23,6 +23,10 @@ COMMON_ARGS = [
     json.dumps({"text_config": {"num_hidden_layers": 8}}),
     "--attn-dp-size",
     "2",
+    "--ep-size",
+    "2",
+    "--moe-a2a-backend",
+    "megamoe",
     "--moe-runner-backend",
     "flashinfer_mxfp4",
     "--decode-attention-backend",
@@ -43,8 +47,6 @@ COMMON_ARGS = [
     "--model-loader-extra-config",
     '{"enable_multithread_load": true, "num_threads": 6}',
 ]
-# K3's auto-enabled all-reduce fusion asserts under attention DP with TP MoE.
-SERVER_ENV = {"SGLANG_K3_AR_FUSION": "0"}
 PROMPT_LENGTHS = (100, 1000, 4000, 16000)
 
 
@@ -72,8 +74,6 @@ class TestKimiK3PDKdaWeightShard(PDDisaggregationServerBase):
     prefill_tp_size = 2
     decode_tp_size = 2
     decode_base_gpu_id = 2
-    extra_prefill_env = SERVER_ENV
-    extra_decode_env = SERVER_ENV
     extra_decode_args = COMMON_ARGS
 
     @classmethod
