@@ -13,6 +13,11 @@ Weights are the model's tensors, used in place and shareable with DeepGEMM MegaM
 """
 
 import torch
+from flashinfer import CuteDslMoEWrapper, SfLayout
+from flashinfer import autotune as flashinfer_autotune
+from flashinfer import mxfp8_quantize, nvfp4_quantize
+from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
+from flashinfer.quantization.nvfp4_quantization_utils import NVFP44Over6Config
 
 # NVFP4 activation global scale: 4over6 per-token scales with an E4M3 max of 256.
 _NVFP4_ACT_GLOBAL_SCALE = 1.0 / (6.0 * 256.0)
@@ -51,12 +56,6 @@ class Inkling2FlashInferMoE:
         """`w13` `[E, 2 * I, K]`, `w2` `[E, H, I]` (packed NVFP4 halves K), scales as above.
         `w13_alpha` / `w2_alpha` `[E]` float32: NVFP4 per-expert global weight scales (required for
         NVFP4, ignored for MXFP8)."""
-        from flashinfer import CuteDslMoEWrapper, SfLayout
-        from flashinfer.cute_dsl.utils import convert_sf_to_mma_layout
-        from flashinfer.quantization.nvfp4_quantization_utils import (
-            NVFP44Over6Config,
-        )
-
         self.nvfp4 = w13.dtype == torch.uint8
         assert self.nvfp4 or w13.dtype == torch.float8_e4m3fn
         num_local, rows, _ = w13.shape
@@ -117,8 +116,6 @@ class Inkling2FlashInferMoE:
         self, x: torch.Tensor, topk_weights: torch.Tensor, topk_ids: torch.Tensor
     ) -> torch.Tensor:
         """`x` `[T, H]` bf16, `topk_weights` / `topk_ids` `[T, top_k]` (global expert ids)."""
-        from flashinfer import mxfp8_quantize, nvfp4_quantize
-
         if self.nvfp4:
             values, scales, per_token = nvfp4_quantize(
                 x,
@@ -147,8 +144,6 @@ class Inkling2FlashInferMoE:
     def autotune(self) -> None:
         """Pick tactics for the power-of-two token counts up to `max_num_tokens`, on random routes.
         Run once before CUDA graph capture."""
-        from flashinfer import autotune
-
         tokens, device = self.max_num_tokens, self.weights["w1_weight"].device
         x = torch.randn(tokens, self.hidden, device=device, dtype=torch.bfloat16)
         ids = torch.stack(
@@ -158,7 +153,7 @@ class Inkling2FlashInferMoE:
             ]
         )
         weights = torch.rand(tokens, self.top_k, device=device, dtype=torch.float32)
-        with autotune(True):
+        with flashinfer_autotune(True):
             for n in _AUTOTUNE_TOKENS:
                 if n <= tokens:
                     self(x[:n], weights[:n], ids[:n])

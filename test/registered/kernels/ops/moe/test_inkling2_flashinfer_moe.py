@@ -3,8 +3,15 @@ the experts (local slice of a larger EP expert set) match a dequantized fp32 SiT
 
 import pytest
 import torch
+from flashinfer import block_scale_interleave
+from flashinfer.fused_moe import interleave_cute_dsl_moe_weights
 
 from sglang.kernels.arch import current_arch
+from sglang.kernels.ops.moe.inkling2_flashinfer_moe import (
+    Inkling2FlashInferMoE,
+    up_gate_block16_rows_,
+)
+from sglang.srt.layers.quantization.utils import swizzle_blockscale
 from sglang.test.ci.ci_register import register_cuda_ci
 
 register_cuda_ci(est_time=120, stage="base-b-kernel-unit", runner_config="4-gpu-b200")
@@ -29,10 +36,6 @@ def _up_gate(t):
 
 
 def test_up_gate_block16_rows_matches_flashinfer():
-    from flashinfer.fused_moe import interleave_cute_dsl_moe_weights
-
-    from sglang.kernels.ops.moe.inkling2_flashinfer_moe import up_gate_block16_rows_
-
     g = torch.Generator(device="cuda").manual_seed(0)
     w = torch.randint(
         0, 256, (3, 96, 40), dtype=torch.uint8, device="cuda", generator=g
@@ -50,10 +53,6 @@ def test_up_gate_block16_rows_matches_flashinfer():
     "dtype", [torch.float8_e4m3fn, torch.uint8], ids=["nvfp4", "mxfp8"]
 )
 def test_swizzle_blockscale_matches_flashinfer(dtype):
-    from flashinfer import block_scale_interleave
-
-    from sglang.srt.layers.quantization.utils import swizzle_blockscale
-
     g = torch.Generator(device="cuda").manual_seed(2)
     s = torch.randint(0, 256, (3, 96, 5), dtype=torch.uint8, device="cuda", generator=g)
     ours = swizzle_blockscale(s.view(dtype)).view(torch.uint8)
@@ -107,12 +106,6 @@ def _route(g):
 
 @pytest.mark.parametrize("nvfp4", [True, False], ids=["nvfp4", "mxfp8"])
 def test_matches_reference(nvfp4):
-    from sglang.kernels.ops.moe.inkling2_flashinfer_moe import (
-        Inkling2FlashInferMoE,
-        up_gate_block16_rows_,
-    )
-    from sglang.srt.layers.quantization.utils import swizzle_blockscale
-
     g = torch.Generator(device="cuda").manual_seed(1)
     w13, s13, ref13 = _experts(nvfp4, 2 * INTERMEDIATE, HIDDEN, g)
     w2, s2, ref2 = _experts(nvfp4, HIDDEN, INTERMEDIATE, g)
