@@ -15,7 +15,6 @@ explicit-location ABI (``cache_mode=2``); there is no paged state allocator or
 
 from __future__ import annotations
 
-import os
 from typing import List, Optional, Tuple
 
 import torch
@@ -583,12 +582,7 @@ class DSV4NPUTokenToKVPool(DeepSeekV4TokenToKVPool):
             )
         if cache_2d.shape[0] == 0:
             return
-        kv_compress_epilog(
-            buf,
-            cache_2d,
-            slot_mapping,
-            impl=os.environ.get("SGLANG_DSV4_KVWRITE_IMPL", "auto"),
-        )
+        kv_compress_epilog(buf, cache_2d, slot_mapping)
 
     def set_swa_key_buffer_radix_fused_norm_rope(
         self,
