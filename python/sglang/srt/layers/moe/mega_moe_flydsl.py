@@ -21,7 +21,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_flags, get_parallel
 from sglang.srt.utils import is_gfx1250_supported
 
 if TYPE_CHECKING:
@@ -153,6 +153,16 @@ def build_mega_moe_experts_weights(layer) -> None:
             raise ValueError(
                 "gfx1250 aiter MegaMoE needs interleaved gate/up experts; "
                 "unset SGLANG_USE_AITER_MOE_GU_ITLV=0."
+            )
+        # Only the native-MXFP4 aiter arm in fp8.py produces the shuffled, padded layout.
+        if not (
+            getattr(layer.w13_weight, "is_shuffled", False)
+            and hasattr(layer, "hidden_pad")
+            and hasattr(layer, "intermediate_pad")
+        ):
+            raise ValueError(
+                "gfx1250 aiter MegaMoE needs MXFP4 experts loaded through the "
+                "aiter MoE path; set SGLANG_USE_AITER=1."
             )
         layer._mega_moe_weights_built = True
         return
@@ -306,6 +316,10 @@ def _recv_token_bound(num_tokens: int, ep_world: int, max_recv: int) -> int | No
     # the group's token total; a python int keeps the GEMM grid graph-static.
     # An idle rank still dispatches one dummy row with real expert ids.
     # Without an MLP all-gather the list holds only the local count.
+    # Prefill graphs may replay a different bucket on each DP rank, so a bound
+    # captured from one rank's bucket can drop rows its peers send.
+    if get_flags().dp.capturing_prefill_graph:
+        return None
     global_num_tokens = get_dp_global_num_tokens()
     if (
         not isinstance(global_num_tokens, (list, tuple))
@@ -418,10 +432,12 @@ def _run_mega_routed(
         )
         if rank_sync or _is_gfx1250:
             ep_rank, ep_world = _ep_rank_world()
-            expert_base = ep_rank * (experts // ep_world)
+            local_experts = experts // ep_world
+            # Keep the dummy ids on this rank even when topk > local_experts.
             topk_ids = (
-                expert_base
+                ep_rank * local_experts
                 + torch.arange(topk, device=hidden_states.device, dtype=torch.int32)
+                % local_experts
             ).unsqueeze(0)
             topk_weights = (
                 hidden_states.new_full((1, topk), 1.0 / topk, dtype=torch.float32)
