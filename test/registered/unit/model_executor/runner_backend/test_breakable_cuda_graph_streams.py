@@ -47,7 +47,7 @@ class TestCaptureStatus(unittest.TestCase):
                         ),
                     )
                     with (
-                        patch.object(bcg, "_is_npu", npu),
+                        patch.object(bcg, "is_npu", return_value=npu),
                         patch.object(bcg, "_is_xpu", xpu),
                         patch.object(bcg, "is_hip", return_value=hip),
                         patch.object(bcg, "is_musa", return_value=musa),
@@ -68,7 +68,7 @@ class TestCaptureStatus(unittest.TestCase):
         )
         stream = SimpleNamespace(cuda_stream=42)
         with (
-            patch.object(bcg, "_is_npu", False),
+            patch.object(bcg, "is_npu", return_value=False),
             patch.object(bcg, "_is_xpu", False),
             patch.object(bcg, "is_hip", return_value=False),
             patch.object(bcg, "is_musa", return_value=False),

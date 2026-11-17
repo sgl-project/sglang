@@ -45,7 +45,6 @@ if TYPE_CHECKING:
         HiCacheGraphEvents,
     )
 
-_is_npu = is_npu()
 _is_xpu = is_xpu()
 
 __all__ = [
@@ -98,13 +97,21 @@ def _is_stream_capturing(stream: torch.Stream) -> bool:
     # use the portable device API. On NVIDIA, keep querying the CUDA runtime
     # directly via cuda-python because torch.cuda.is_current_stream_capturing()
     # has proven unreliable there.
-    if is_hip() or is_musa() or _is_npu or _is_xpu:
+    if is_npu() or is_hip() or is_musa() or _is_xpu:
         with get_device_module().stream(stream):
             return get_device_module().is_current_stream_capturing()
     return (
         _capture_status(stream.cuda_stream)
         == rt.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive
     )
+
+
+def _device_graph_cls():
+    if is_npu():
+        return torch.npu.NPUGraph
+    if _is_xpu:
+        return torch.xpu.XPUGraph
+    return torch.cuda.CUDAGraph
 
 
 # Hook torch.cuda.Stream.wait_stream to track side-stream forks/joins that happen
@@ -433,7 +440,7 @@ class BreakableCUDAGraphCapture:
         return False
 
     def _begin_new_segment(self) -> None:
-        graph_cls = torch.xpu.XPUGraph if _is_xpu else torch.cuda.CUDAGraph
+        graph_cls = _device_graph_cls()
         # keep_graph retains the raw graph for dedup; skip it on the plain path.
         # Dedup is CUDA-only (it introspects the raw graph via cuda-python), so
         # XPU always takes the plain path below.

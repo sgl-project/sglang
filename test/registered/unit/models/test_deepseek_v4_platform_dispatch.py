@@ -7,6 +7,8 @@ from unittest.mock import Mock, patch
 
 import torch
 
+from sglang.srt.environ import envs
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.models import deepseek_v4
 from sglang.srt.models import deepseek_v4_dspark as dspark
 from sglang.srt.models import deepseek_v4_nextn as nextn
@@ -14,6 +16,82 @@ from sglang.srt.models import deepseek_v4_platform_stage as platform_stage
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+class TestPrefillAttentionGraphBoundary(unittest.TestCase):
+    def test_batched_source_metadata_keeps_attention_eager(self):
+        # Exercise the real MQALayer.forward decision with CPU tensors. Source
+        # graphs have fixed compressor/indexer buffers, but attention needs the
+        # live request axis and therefore an eager break at every layer.
+        query = torch.ones(8, 1, 4)
+        layer = SimpleNamespace(
+            alt_streams=None,
+            compress_ratio=4,
+            use_mega_attention=False,
+            is_dsv41=False,
+            n_local_heads=1,
+            head_dim=4,
+            attn_mqa=SimpleNamespace(v_head_dim=4, layer_id=0),
+            _kernel_num_heads=lambda _: 1,
+            _local_attn_sink=lambda _: None,
+            _forward_prepare=lambda *args, **kwargs: (query, None),
+            _project_wo_a=lambda output, **kwargs: output,
+            _project_wo_b=lambda output, *_: output,
+        )
+        batch = SimpleNamespace(forward_mode=ForwardMode.EXTEND)
+
+        def eager_attention(q, k, output, *args):
+            output.fill_(1)
+
+        def captured_attention(q, k, output, *args):
+            output.fill_(2)
+
+        for npu, metadata, expected in (
+            (True, SimpleNamespace(source_graph_topk={}), 1),
+            (True, SimpleNamespace(dsv4_prefill_graph_state=object()), 2),
+            (False, SimpleNamespace(dsv4_prefill_graph_state=object()), 1),
+        ):
+            with self.subTest(npu=npu, expected=expected):
+                backend = SimpleNamespace(
+                    forward_metadata=metadata,
+                    use_captured_forward_metadata_for_breakable_cuda_graph=True,
+                )
+                with (
+                    envs.SGLANG_NPU_USE_MULTI_STREAM.override(False),
+                    patch.object(deepseek_v4, "_is_npu", npu),
+                    patch.object(deepseek_v4, "_is_hip", False),
+                    patch.object(deepseek_v4, "_is_cuda", False),
+                    patch.object(deepseek_v4, "_is_gfx95_supported", False),
+                    patch.object(deepseek_v4, "get_attn_backend", return_value=backend),
+                    patch.object(
+                        deepseek_v4,
+                        "get_attn_tp_context",
+                        return_value=SimpleNamespace(input_scattered=True),
+                    ),
+                    patch(
+                        "sglang.srt.layers.attention.dsv4.unified_kv_gate.is_unified_kv_triton",
+                        return_value=False,
+                    ),
+                    patch.object(
+                        deepseek_v4, "is_in_breakable_cuda_graph", return_value=True
+                    ),
+                    patch.object(
+                        deepseek_v4,
+                        "bcg_deepseek_v4_attention_with_output",
+                        side_effect=eager_attention,
+                    ) as eager,
+                    patch.object(
+                        deepseek_v4,
+                        "deepseek_v4_attention_with_output",
+                        side_effect=captured_attention,
+                    ) as captured,
+                ):
+                    result = deepseek_v4.MQALayer.forward(
+                        layer, torch.ones(8, 4), torch.arange(8), batch
+                    )
+                torch.testing.assert_close(result, torch.full_like(query, expected))
+                self.assertEqual(eager.call_count, int(expected == 1))
+                self.assertEqual(captured.call_count, int(expected == 2))
 
 
 class TestPlatformDispatch(unittest.TestCase):

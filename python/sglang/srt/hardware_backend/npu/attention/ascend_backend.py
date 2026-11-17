@@ -35,6 +35,11 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     is_sparsity_driven_kv_offload_enabled,
 )
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.dsa.dsa_token_shard import (
+    dsa_token_shard_cumulative_query_lens,
+    dsa_token_shard_key_lens,
+    get_dsa_token_shard_plan,
+)
 from sglang.srt.layers.attention.dsa.utils import (
     dsa_use_prefill_cp,
     is_dsa_enable_prefill_cp,
@@ -114,8 +119,7 @@ class ForwardMetadata:
     cu_seqlens_q: Optional[torch.Tensor] = None  # Query offsets, including leading 0.
     actual_seq_lengths_q: Optional[torch.Tensor] = None
     actual_seq_lengths_q_pa: Optional[torch.Tensor] = None
-    # CPU mirror of actual_seq_lengths_q_pa for the host metadata op
-    # (torch.ops.npu.sparse_attn_sharedkv_metadata_host reads CPU int32 inputs).
+    # CPU mirror of actual_seq_lengths_q_pa for host-side padding trims.
     actual_seq_lengths_q_pa_cpu: Optional[torch.Tensor] = None
     actual_seq_lengths_kv: Optional[torch.Tensor] = None
     seqused_q: Optional[torch.Tensor] = None  # Valid query counts; padding is 0.
@@ -422,6 +426,17 @@ class AscendAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.dcp_fp8_sparse_attention = None
+        if self.dsa_dcp_target and self.kv_cache_dtype == torch.float8_e4m3fn:
+            if not self.token_to_kv_pool.dsa_kv_cache_store_fp8:
+                raise ValueError(
+                    "Ascend DSA DCP with FP8 KV requires the A5 packed KV pool."
+                )
+            from sgl_kernel_npu.operators.attention import (
+                kv_quant_sparse_flash_attention,
+            )
+
+            self.dcp_fp8_sparse_attention = kv_quant_sparse_flash_attention
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.enable_sparsity_driven_kv_offload = is_sparsity_driven_kv_offload_enabled(
@@ -2072,8 +2087,18 @@ class AscendAttnBackend(AttentionBackend):
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
 
+        # The token shard replaces the query lengths, built once per forward.
+        dsa_token_shard_plan = get_dsa_token_shard_plan(forward_batch)
+        dsa_token_shard_qlen = None
+        if dsa_token_shard_plan is not None:
+            dsa_token_shard_qlen = dsa_token_shard_cumulative_query_lens(
+                forward_batch, dsa_token_shard_plan, q.device
+            )
+
         if is_prefill:
-            if self.forward_metadata.actual_seq_lengths_q is not None:
+            if dsa_token_shard_qlen is not None:
+                actual_seq_qlen = dsa_token_shard_qlen
+            elif self.forward_metadata.actual_seq_lengths_q is not None:
                 actual_seq_qlen = self.forward_metadata.actual_seq_lengths_q
             else:
                 actual_seq_qlen = torch.cumsum(forward_batch.extend_seq_lens, dim=0)
@@ -2107,6 +2132,12 @@ class AscendAttnBackend(AttentionBackend):
         else:
             actual_seq_lengths_kv = self.forward_metadata.seq_lens
 
+        # The plan is refused under prefill CP, so this never meets its layout.
+        if dsa_token_shard_plan is not None and is_prefill:
+            actual_seq_lengths_kv = dsa_token_shard_key_lens(
+                forward_batch, dsa_token_shard_plan, q.device
+            )
+
         if (
             is_prefill
             and is_dsa_enable_prefill_cp()
@@ -2138,6 +2169,7 @@ class AscendAttnBackend(AttentionBackend):
                     forward_batch=forward_batch,
                     speculative_num_draft_tokens=self.speculative_num_draft_tokens,
                     scaling=layer.scaling,
+                    fp8_attention=self.dcp_fp8_sparse_attention,
                 )
             if self.kv_cache_dtype == torch.float8_e4m3fn:
                 attn_out = self._forward_fp8_sparse(
