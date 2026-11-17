@@ -88,10 +88,17 @@ class RolloutRequest(BaseModel):
 
     rollout_return_denoising_env: bool = False
     rollout_return_dit_trajectory: bool = False
+    # The latents, debug and cond tensors and the generated output go to the server's output store;
+    # the response carries the ref.
+    rollout_return_outputs_via_store: bool = False
+    # False skips the VAE decode: the response carries only the rollout trajectory.
+    rollout_return_generated_output: bool = True
 
     # 0-indexed denoising-loop step filters. None = all steps.
     rollout_sde_step_indices: Optional[list[int]] = None
     rollout_return_step_indices: Optional[list[int]] = None
+    # last denoising step to run; it steps straight to the terminal sigma
+    rollout_stop_step_index: Optional[int] = None
 
     image_path: Optional[list[str]] = None
 
@@ -115,6 +122,7 @@ class RolloutResponse(BaseModel):
 
     inference_time_s: Optional[float] = None
     peak_memory_mb: Optional[float] = None
+    output_store_ref: Optional[dict[str, Any]] = None
 
 
 @dataclass

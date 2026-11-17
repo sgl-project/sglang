@@ -187,6 +187,8 @@ class MuseSpark1xBf16Experts(nn.Module):
         would otherwise be captured into a CUDA graph.
         """
         if self.use_trtllm or self.use_triton:
+            # Already prepared: only the finalize op's norm weight copy goes stale.
+            self._refresh_finalize_norm_weight(post_expert_norm)
             return
         if not _trtllm_bf16_moe_supported(self.gate_up_proj.device):
             if _triton_bf16_moe_supported(self.gate_up_proj.device):
@@ -208,6 +210,17 @@ class MuseSpark1xBf16Experts(nn.Module):
             bind_megamoe_shared_weights(self, "bf16xbf16")
         self._build_finalize_op(post_expert_norm)
         self.use_trtllm = True
+
+    @torch.no_grad()
+    def _refresh_finalize_norm_weight(
+        self, post_expert_norm: Optional[nn.Module]
+    ) -> None:
+        if post_expert_norm is None or self._post_expert_norm_weight is None:
+            return
+        weight = post_expert_norm._get_effective_weight()
+        if weight is None:
+            weight = torch.ones_like(self._post_expert_norm_weight)
+        self._post_expert_norm_weight.copy_(weight.detach().to(torch.bfloat16))
 
     def _build_triton_runner_config(self):
         from sglang.srt.layers.moe.moe_runner import MoeRunnerConfig

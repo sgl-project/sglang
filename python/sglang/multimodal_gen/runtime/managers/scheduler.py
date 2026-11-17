@@ -15,6 +15,7 @@ from typing import Any, Callable, Iterator, List
 import msgspec
 import zmq
 
+from sglang.multimodal_gen.configs.sample.sampling_params import SamplingParams
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.disaggregation.scheduler_mixin import (
     SchedulerDisaggMixin,
@@ -577,6 +578,11 @@ class Scheduler(
         generation-affecting `extra.diffusers_kwargs` and profiling settings
         used by grouped execution.
         """
+        # The batched split carries no rollout trajectory, so a rollout request
+        # never shares a dynamic batch. Action sampling params have no rollout.
+        sampling_params = req.sampling_params
+        if isinstance(sampling_params, SamplingParams) and sampling_params.rollout:
+            return None
         signature_items = self._sampling_param_signature_items(req)
         if signature_items is None:
             return None

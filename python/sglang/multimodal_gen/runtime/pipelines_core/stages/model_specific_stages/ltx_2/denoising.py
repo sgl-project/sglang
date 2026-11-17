@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.platforms import (
     current_platform,
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
+    VISUAL_STREAM,
     rollout_step_kwargs,
 )
 from sglang.multimodal_gen.runtime.server_args import (
@@ -1574,6 +1575,12 @@ class LTX2DenoisingStage(DenoisingStage):
         ctx.audio_latents = batch.audio_latents
         # Video and audio keep separate scheduler state throughout the denoising loop.
         ctx.audio_scheduler = clone_scheduler_runtime(ctx.scheduler)
+        rollout_controller = batch.rollout_controllers.get(VISUAL_STREAM)
+        if rollout_controller is not None:
+            # The audio stream has no controller of its own; it follows the video
+            # stream's schedule so a requested stop ends both streams together.
+            ctx.audio_scheduler.sigmas = rollout_controller.sigmas
+            ctx.audio_scheduler.timesteps = rollout_controller.timesteps
 
         if ctx.use_ltx23_legacy_one_stage:
             batch.ltx23_audio_replicated_for_sp = False

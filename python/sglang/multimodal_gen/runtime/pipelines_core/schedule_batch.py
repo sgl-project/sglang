@@ -472,6 +472,9 @@ class OutputBatch:
 
     # tensors or numpy frames
     output: Sequence[Any] | None = None
+    # Set only when the request asked for no generated output and the decode
+    # stage skipped the VAE; output is None for other reasons too.
+    generated_output_skipped: bool = False
     raw_frame_batches: list[list[bytes]] | None = None
     raw_frame_content_type: str = "application/x-raw-rgb"
     raw_frame_metadata: dict[str, Any] | None = None

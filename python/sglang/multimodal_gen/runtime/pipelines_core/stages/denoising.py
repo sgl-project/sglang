@@ -149,6 +149,7 @@ from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     init_rollout_env_if_enabled,
     prepare_rollout_if_enabled,
     rollout_step_kwargs,
+    set_rollout_early_stop_if_enabled,
 )
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
@@ -1235,9 +1236,15 @@ class DenoisingStage(PipelineStage):
             if uses_boundary_transformer_2
             else None
         )
-        # Get timesteps and calculate warmup steps
+        prepare_rollout_if_enabled(
+            batch=batch, pipeline_config=server_args.pipeline_config
+        )
+        set_rollout_early_stop_if_enabled(batch=batch)
         timesteps = batch.timesteps
-        num_inference_steps = batch.num_inference_steps
+        # A stopped rollout runs fewer steps than the request asked for.
+        num_inference_steps = (
+            len(timesteps) if batch.rollout else batch.num_inference_steps
+        )
         num_warmup_steps = len(timesteps) - num_inference_steps * scheduler.order
 
         if uses_boundary_transformer_2:
@@ -1256,10 +1263,6 @@ class DenoisingStage(PipelineStage):
 
         if freshly_loaded:
             register_loaded_transformer(self, server_args, pipeline)
-
-        prepare_rollout_if_enabled(
-            batch=batch, pipeline_config=server_args.pipeline_config
-        )
 
         # Prepare extra step kwargs for scheduler
         extra_step_kwargs = self.prepare_extra_func_kwargs(

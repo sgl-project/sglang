@@ -80,6 +80,7 @@ from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
     init_rollout_env_if_enabled,
     prepare_rollout_if_enabled,
     rollout_step_kwargs,
+    set_rollout_early_stop_if_enabled,
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_scheduler import (
     prepare_rollout_request_scheduler,
@@ -1599,7 +1600,6 @@ class Cosmos3DenoisingStage(PipelineStage):
         action_raw_dim = batch.extra.get("raw_action_dim")
         action_start_frame_offset = batch.extra.get("action_start_frame_offset", 1)
         action_fps = getattr(batch.sampling_params, "action_fps", None)
-        timesteps = batch.timesteps
         guidance_scale = batch.guidance_scale
 
         # Seed the scheduler's stochastic (SDE) noise from the request seed so it
@@ -1643,6 +1643,8 @@ class Cosmos3DenoisingStage(PipelineStage):
         prepare_rollout_if_enabled(
             batch=batch, pipeline_config=server_args.pipeline_config
         )
+        set_rollout_early_stop_if_enabled(batch=batch)
+        timesteps = batch.timesteps
         init_rollout_env_if_enabled(
             batch=batch,
             image_kwargs={},

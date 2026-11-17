@@ -12,7 +12,7 @@ from radix_transfer_plugins.schema import (
     Stash,
     StoreRef,
 )
-from radix_transfer_plugins.store import OutputStore, ReadBuffer
+from radix_transfer_plugins.store import OutputStore, ReadBuffer, ReadSlot
 
 __all__ = [
     "FieldSpec",
@@ -20,6 +20,7 @@ __all__ = [
     "RangeRead",
     "RawField",
     "ReadBuffer",
+    "ReadSlot",
     "Stash",
     "StorageBackend",
     "StoreRef",

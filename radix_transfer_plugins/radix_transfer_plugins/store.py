@@ -101,6 +101,10 @@ class OutputStore:
         """``nbytes`` of memory to read ranges into, registered until its ``close()``."""
         return ReadBuffer(backend=self._backend, nbytes=nbytes)
 
+    def read_slot(self) -> ReadSlot:
+        """A place for the ``ReadBuffer`` of reads that repeat, which keeps it between them."""
+        return ReadSlot(self)
+
     def read_ranges(self, reads: Sequence[RangeRead], *, into: ReadBuffer) -> None:
         """Read byte ranges of stored fields into ``into``, without registering memory.
 
@@ -197,6 +201,34 @@ class ReadBuffer:
         if not self.closed:
             self.closed = True
             self.backend.unregister(self.view)
+
+
+class ReadSlot:
+    """Keeps one ``ReadBuffer`` for reads that repeat, so that they register memory only
+    when a read needs more than the last one held.
+
+    A buffer ``reserve`` returned is closed once a later ``reserve`` replaces it; its
+    views stay valid. One read at a time may use the slot.
+    """
+
+    def __init__(self, store: OutputStore) -> None:
+        self.store = store
+        self._buffer: Optional[ReadBuffer] = None
+
+    def reserve(self, nbytes: int) -> ReadBuffer:
+        """The kept buffer when it holds ``nbytes``; otherwise a new one that does, kept
+        in its place."""
+        if self._buffer is None or self._buffer.nbytes < nbytes:
+            # Closed first: registered memory never holds both buffers.
+            self.close()
+            self._buffer = self.store.read_buffer(nbytes)
+        return self._buffer
+
+    def close(self) -> None:
+        """Close the kept buffer; a later ``reserve`` registers a new one."""
+        if self._buffer is not None:
+            self._buffer.close()
+            self._buffer = None
 
 
 def _as_bytes(data: memoryview) -> memoryview:

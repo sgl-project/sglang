@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from fastapi import APIRouter, HTTPException, Response
@@ -14,6 +14,9 @@ from sglang.multimodal_gen.runtime.entrypoints.openai.utils import build_samplin
 from sglang.multimodal_gen.runtime.entrypoints.post_training.io_struct import (
     RolloutRequest,
     RolloutResponse,
+)
+from sglang.multimodal_gen.runtime.entrypoints.post_training.output_store import (
+    rollout_output_store,
 )
 from sglang.multimodal_gen.runtime.entrypoints.post_training.request_timing import (
     STAGES_HEADER,
@@ -28,6 +31,9 @@ from sglang.multimodal_gen.runtime.entrypoints.post_training.utils import (
 )
 from sglang.multimodal_gen.runtime.entrypoints.utils import prepare_request
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBatch
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+    SKIP_DECODE_UNSUPPORTED_ERROR,
+)
 from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
     RolloutDebugTensors,
     RolloutDenoisingEnv,
@@ -37,6 +43,9 @@ from sglang.multimodal_gen.runtime.post_training.rl_dataclasses import (
 from sglang.multimodal_gen.runtime.scheduler_client import async_scheduler_client
 from sglang.multimodal_gen.runtime.server_args import get_global_server_args
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
+
+if TYPE_CHECKING:
+    from radix_transfer_plugins import StoreRef
 
 logger = init_logger(__name__)
 router = APIRouter(prefix="/rollout", tags=["rollout"])
@@ -150,6 +159,155 @@ def _slice_rollout_trajectory_for_sample(
     )
 
 
+def _store_leaves(
+    obj: Any,
+    sample_idx: int,
+    batch_size: int,
+    *,
+    path: str,
+    stored: dict[str, torch.Tensor],
+    current_key: str | None = None,
+) -> Any:
+    """``_extract_single_sample_tensor`` with every tensor put in ``stored`` and a marker in its place."""
+    if isinstance(obj, torch.Tensor):
+        # One field per sample of a batched tensor, so a reader fetches only its samples.
+        if obj.dim() >= 1 and obj.shape[0] == batch_size:
+            path, obj = f"{path}.{sample_idx}", obj[sample_idx]
+        stored[path] = obj
+        return {"__store__": path}
+    if isinstance(obj, dict):
+        return {
+            k: _store_leaves(
+                v,
+                sample_idx,
+                batch_size,
+                path=f"{path}.{k}",
+                stored=stored,
+                current_key=k,
+            )
+            for k, v in obj.items()
+        }
+    if isinstance(obj, (list, tuple)):
+        if current_key == "img_shapes" and len(obj) == batch_size:
+            return [obj[sample_idx]]
+        return [
+            _store_leaves(
+                v,
+                sample_idx,
+                batch_size,
+                path=f"{path}.{i}",
+                stored=stored,
+                current_key=current_key,
+            )
+            for i, v in enumerate(obj)
+        ]
+    return _maybe_serialize(obj)
+
+
+def _store_steps(
+    tensor: torch.Tensor | None,
+    sample_idx: int,
+    *,
+    path: str,
+    stored: dict[str, torch.Tensor],
+    steps: list[int] | None = None,
+) -> list[dict] | None:
+    """One field per step of a ``[B, steps, ...]`` tensor's sample, named by its original step number."""
+    if tensor is None:
+        return None
+    if steps is None:
+        steps = range(tensor.shape[1])
+    markers = []
+    for position, step in enumerate(steps):
+        field = f"{path}.{sample_idx}.{step}"
+        stored[field] = tensor[sample_idx, position]
+        markers.append({"__store__": field})
+    return markers
+
+
+def _serialize_rollout_trajectory_via_store(
+    rtd: RolloutTrajectoryData,
+    sample_idx: int,
+    batch_size: int,
+    *,
+    stored: dict[str, torch.Tensor],
+    serialized_dit_timesteps: dict | None,
+    serialized_dit_sigmas: dict | None,
+) -> tuple[dict | None, dict | None, dict | None, dict | None]:
+    """``_serialize_rollout_trajectory`` of the batched trajectory, its large tensors going to ``stored``."""
+    log_probs = rtd.rollout_log_probs
+    if (
+        isinstance(log_probs, torch.Tensor)
+        and log_probs.dim() >= 1
+        and log_probs.shape[0] == batch_size
+    ):
+        log_probs = log_probs[sample_idx].contiguous()
+    serialized_debug_tensors = None
+    if rtd.rollout_debug_tensors:
+        serialized_debug_tensors = {
+            name: _store_steps(
+                tensor,
+                sample_idx,
+                path=f"rollout_debug_tensors.{name}",
+                stored=stored,
+            )
+            for name, tensor in vars(rtd.rollout_debug_tensors).items()
+        }
+    serialized_denoising_env = None
+    if rtd.denoising_env:
+        env = rtd.denoising_env
+        serialized_denoising_env = {
+            name: (
+                _store_leaves(
+                    kwargs,
+                    sample_idx,
+                    batch_size,
+                    path=f"denoising_env.{name}",
+                    stored=stored,
+                )
+                if kwargs
+                else None
+            )
+            for name, kwargs in (
+                ("image_kwargs", env.image_kwargs),
+                ("pos_cond_kwargs", env.pos_cond_kwargs),
+                ("neg_cond_kwargs", env.neg_cond_kwargs),
+            )
+        }
+        serialized_denoising_env["guidance"] = (
+            _maybe_serialize(
+                _extract_single_sample_tensor(env.guidance, sample_idx, batch_size)
+            )
+            if env.guidance is not None
+            else None
+        )
+    serialized_dit_trajectory = None
+    if rtd.dit_trajectory:
+        dit = rtd.dit_trajectory
+        serialized_dit_trajectory = {
+            "latents": _store_steps(
+                dit.latents,
+                sample_idx,
+                path="dit_trajectory.latents",
+                stored=stored,
+                steps=(
+                    dit.latent_step_indices.tolist()
+                    if dit.latent_step_indices is not None
+                    else None
+                ),
+            ),
+            "timesteps": serialized_dit_timesteps,
+            "sigmas": serialized_dit_sigmas,
+            "latent_step_indices": _maybe_serialize(dit.latent_step_indices),
+        }
+    return (
+        _maybe_serialize(log_probs),
+        serialized_debug_tensors,
+        serialized_denoising_env,
+        serialized_dit_trajectory,
+    )
+
+
 def _serialize_rollout_trajectory(
     rtd: RolloutTrajectoryData | None,
     *,
@@ -216,11 +374,15 @@ def _build_response(
     rollout: bool,
     result: OutputBatch,
     video_dtype: str | None = None,
+    stored: dict[str, torch.Tensor] | None = None,
+    num_outputs: int | None = None,
 ) -> list[RolloutResponse]:
     """
     rollout: bool - set to False when evaluating the model
+    stored: collects the batched tensors to put in the output store, or None to inline them
+    num_outputs: the response count when the batch carries no decoded output
     """
-    batch_size = result.output.shape[0]
+    batch_size = result.output.shape[0] if result.output is not None else num_outputs
     inference_time_s = (
         result.metrics.total_duration_s
         if result.metrics and result.metrics.total_duration_s > 0
@@ -245,37 +407,56 @@ def _build_response(
 
     responses: list[RolloutResponse] = []
     for sample_idx in range(batch_size):
-        out_i = result.output[sample_idx]
+        out_i = result.output[sample_idx] if result.output is not None else None
         if isinstance(out_i, torch.Tensor):
             if video_dtype == "uint8":
                 out_i = _quantize_video_uint8(out_i)
             out_i = out_i.contiguous()
-        serialized_generated_output = _maybe_serialize(out_i)
         if not rollout:
             responses.append(
                 RolloutResponse(
                     request_id=request_id,
                     prompt=prompt,
                     seed=seed,
-                    generated_output=serialized_generated_output,
+                    generated_output=_maybe_serialize(out_i),
                     inference_time_s=inference_time_s,
                     peak_memory_mb=peak_memory_mb,
                 )
             )
             continue
-        per_sample_trajectory = _slice_rollout_trajectory_for_sample(
-            result.rollout_trajectory_data, sample_idx, batch_size
-        )
+        if stored is None:
+            serialized_generated_output = _maybe_serialize(out_i)
+            per_sample_trajectory = _slice_rollout_trajectory_for_sample(
+                result.rollout_trajectory_data, sample_idx, batch_size
+            )
+            serialized = _serialize_rollout_trajectory(
+                per_sample_trajectory,
+                serialized_dit_timesteps=serialized_dit_timesteps,
+                serialized_dit_sigmas=serialized_dit_sigmas,
+            )
+        else:
+            # None when the request skipped the decode
+            serialized_generated_output = None
+            if out_i is not None:
+                # some pipelines return a numpy array, which the inline path serializes as a tensor too
+                stored[f"generated_output.{sample_idx}"] = torch.as_tensor(out_i)
+                serialized_generated_output = {
+                    "__store__": f"generated_output.{sample_idx}"
+                }
+            serialized = _serialize_rollout_trajectory_via_store(
+                result.rollout_trajectory_data,
+                sample_idx,
+                batch_size,
+                stored=stored,
+                serialized_dit_timesteps=serialized_dit_timesteps,
+                serialized_dit_sigmas=serialized_dit_sigmas,
+            )
         (
             serialized_log_probs,
             serialized_debug_tensors,
             serialized_denoising_env,
             serialized_dit_trajectory,
-        ) = _serialize_rollout_trajectory(
-            per_sample_trajectory,
-            serialized_dit_timesteps=serialized_dit_timesteps,
-            serialized_dit_sigmas=serialized_dit_sigmas,
-        )
+        ) = serialized
         responses.append(
             RolloutResponse(
                 request_id=request_id,
@@ -291,6 +472,11 @@ def _build_response(
             )
         )
     return responses
+
+
+def _engine_error(error: str) -> HTTPException:
+    status_code = 400 if error == SKIP_DECODE_UNSUPPORTED_ERROR else 500
+    return HTTPException(status_code=status_code, detail=error)
 
 
 def _build_sampling_kwargs(request: RolloutRequest) -> dict:
@@ -315,8 +501,10 @@ def _build_sampling_kwargs(request: RolloutRequest) -> dict:
         rollout_debug_mode=request.rollout_debug_mode,
         rollout_return_denoising_env=request.rollout_return_denoising_env,
         rollout_return_dit_trajectory=request.rollout_return_dit_trajectory,
+        rollout_return_generated_output=request.rollout_return_generated_output,
         rollout_sde_step_indices=request.rollout_sde_step_indices,
         rollout_return_step_indices=request.rollout_return_step_indices,
+        rollout_stop_step_index=request.rollout_stop_step_index,
         suppress_logs=request.suppress_logs,
         save_output=False,
         return_trajectory_latents=False,
@@ -326,6 +514,16 @@ def _build_sampling_kwargs(request: RolloutRequest) -> dict:
         sampling_kwargs.update(request.extra_sampling_params)
         sampling_kwargs["rollout"] = request.rollout
     return {k: v for k, v in sampling_kwargs.items() if v is not None}
+
+
+def _stream_parts(parts: list[bytes], ref: StoreRef | None):
+    sent = False
+    try:
+        yield from parts
+        sent = True
+    finally:
+        if ref is not None and not sent:
+            rollout_output_store.delete(ref)
 
 
 @router.post(
@@ -344,6 +542,12 @@ async def rollout_generate(request: RolloutRequest):
     request_id = generate_request_id()
     stamps.request_id = request_id
     server_args = get_global_server_args()
+    if request.rollout_return_outputs_via_store and not rollout_output_store.enabled:
+        raise HTTPException(
+            status_code=400,
+            detail="rollout_return_outputs_via_store needs a server started with "
+            "--output-store-backend",
+        )
     sampling_kwargs = _build_sampling_kwargs(request)
     try:
         sampling_params = build_sampling_params(request_id, **sampling_kwargs)
@@ -365,9 +569,10 @@ async def rollout_generate(request: RolloutRequest):
             status_code=500, detail=f"Generation failed: {exc}"
         ) from exc
     if output_batch.error:
-        raise HTTPException(status_code=500, detail=output_batch.error)
+        raise _engine_error(output_batch.error)
 
-    def _serialize_response() -> list[bytes]:
+    def _serialize_response() -> tuple[list[bytes], StoreRef | None]:
+        stored = {} if request.rollout_return_outputs_via_store else None
         with stamps.span("build"):
             rollout_responses = _build_response(
                 request_id,
@@ -376,14 +581,27 @@ async def rollout_generate(request: RolloutRequest):
                 request.rollout,
                 output_batch,
                 video_dtype=request.rollout_video_dtype,
+                stored=stored,
+                num_outputs=sampling_params.num_outputs_per_prompt,
             )
-        with stamps.span("dump"):
-            payload = [r.model_dump() for r in rollout_responses]
-        with stamps.span("msgpack"):
-            return msgpack_encode_spliced(payload)
+        ref = None
+        if stored:
+            with stamps.span("store"):
+                ref = rollout_output_store.put(stored)
+            for rollout_response in rollout_responses:
+                rollout_response.output_store_ref = ref.to_builtins()
+        try:
+            with stamps.span("dump"):
+                payload = [r.model_dump() for r in rollout_responses]
+            with stamps.span("msgpack"):
+                return msgpack_encode_spliced(payload), ref
+        except BaseException:
+            if ref is not None:
+                rollout_output_store.delete(ref)
+            raise
 
     # Off the event loop: building the response copies hundreds of MB
-    parts = await asyncio.to_thread(_serialize_response)
+    parts, ref = await asyncio.to_thread(_serialize_response)
 
     # Timing rides a header: the last marks postdate the encoded body. The
     # explicit content-length keeps uvicorn on identity framing, not chunked.
@@ -395,7 +613,7 @@ async def rollout_generate(request: RolloutRequest):
     if stages:
         headers[STAGES_HEADER] = stages
     return StreamingResponse(
-        iter(parts),
+        _stream_parts(parts, ref),
         media_type="application/msgpack",
         headers=headers,
     )

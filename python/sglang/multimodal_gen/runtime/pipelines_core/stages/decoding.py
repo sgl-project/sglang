@@ -5,7 +5,9 @@
 Decoding stage for diffusion pipelines.
 """
 
+import functools
 import weakref
+from typing import ClassVar
 
 import torch
 import torch.nn as nn
@@ -106,6 +108,39 @@ def _to_unit_range(image: torch.Tensor) -> torch.Tensor:
     return (image / 2 + 0.5).clamp(0, 1)
 
 
+def rollout_output_without_decode(batch: Req) -> OutputBatch:
+    """The rollout trajectory alone, for a request with ``rollout_return_generated_output=False``."""
+    return OutputBatch(
+        generated_output_skipped=True,
+        trajectory_timesteps=batch.trajectory_timesteps,
+        trajectory_latents=batch.trajectory_latents,
+        rollout_trajectory_data=batch.rollout_trajectory_data,
+        metrics=batch.metrics,
+        usage=batch.usage,
+    )
+
+
+# Returned by the worker before any forward when a skip request reaches a
+# server that cannot honor it (disaggregated roles, or a last stage that is not
+# a DecodingStage supporting the skip); rollout_api maps it to 400.
+SKIP_DECODE_UNSUPPORTED_ERROR = (
+    "rollout_return_generated_output=False is not supported by this server: it "
+    "needs a monolithic pipeline whose last stage can skip the decode"
+)
+
+
+def skip_decode_if_requested(forward):
+    """Return the trajectory alone, without running the VAE, when the request asks for no generated output."""
+
+    @functools.wraps(forward)
+    def wrapper(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
+        if not batch.rollout_return_generated_output:
+            return rollout_output_without_decode(batch)
+        return forward(self, batch, server_args)
+
+    return wrapper
+
+
 class DecodingStage(PipelineStage):
     """
     Stage for decoding latent representations into pixel space.
@@ -113,6 +148,10 @@ class DecodingStage(PipelineStage):
     This stage handles the decoding of latent representations into the final
     output format (e.g., pixel values).
     """
+
+    # False on a stage whose forward also advances state (a session's streaming
+    # decoder, a memory bank); admission rejects skip requests for it.
+    skip_decode_supported: ClassVar[bool] = True
 
     @property
     def role_affinity(self):
@@ -384,6 +423,7 @@ class DecodingStage(PipelineStage):
             return None
         return EncodeWhileDecoding(save_file_path, batch)
 
+    @skip_decode_if_requested
     @torch.no_grad()
     def forward(
         self,

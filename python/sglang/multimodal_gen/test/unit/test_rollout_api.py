@@ -11,9 +11,16 @@ import json
 import time
 import types
 import unittest
+from unittest.mock import patch
 
+import msgspec
 import torch
 
+from radix_transfer_plugins import StorageBackend
+from sglang.multimodal_gen.runtime.entrypoints.post_training import rollout_api
+from sglang.multimodal_gen.runtime.entrypoints.post_training.output_store import (
+    RolloutOutputStore,
+)
 from sglang.multimodal_gen.runtime.entrypoints.post_training.request_timing import (
     MARKS,
     RequestStamps,
@@ -397,10 +404,12 @@ class TestBuildSamplingKwargs(unittest.TestCase):
             self._make_request(
                 rollout_sde_step_indices=[0, 2],
                 rollout_return_step_indices=[1, 3],
+                rollout_stop_step_index=2,
             )
         )
         self.assertEqual(kwargs["rollout_sde_step_indices"], [0, 2])
         self.assertEqual(kwargs["rollout_return_step_indices"], [1, 3])
+        self.assertEqual(kwargs["rollout_stop_step_index"], 2)
 
     def test_step_index_filters_default_dropped_as_none(self):
         from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
@@ -411,6 +420,32 @@ class TestBuildSamplingKwargs(unittest.TestCase):
         # None values are stripped; absence here is the correct default-path behavior.
         self.assertNotIn("rollout_sde_step_indices", kwargs)
         self.assertNotIn("rollout_return_step_indices", kwargs)
+
+    def test_generated_output_switch_reaches_the_pipeline_request(self):
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
+            _build_sampling_kwargs,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+
+        kwargs = _build_sampling_kwargs(
+            self._make_request(rollout_return_generated_output=False)
+        )
+        self.assertIs(kwargs["rollout_return_generated_output"], False)
+        sp = SamplingParams(
+            prompt="x",
+            rollout=True,
+            rollout_return_generated_output=kwargs["rollout_return_generated_output"],
+        )
+        self.assertIs(Req(sampling_params=sp).rollout_return_generated_output, False)
+        self.assertIs(
+            Req(
+                sampling_params=SamplingParams(prompt="x")
+            ).rollout_return_generated_output,
+            True,
+        )
 
     def test_sampling_params_exposes_filters_via_req_getattr(self):
         from sglang.multimodal_gen.configs.sample.sampling_params import (
@@ -489,6 +524,523 @@ class TestStagesHeader(unittest.TestCase):
     def test_no_metrics_or_no_stages_yields_no_header(self):
         self.assertEqual(stages_header(None), "")
         self.assertEqual(stages_header(types.SimpleNamespace(stages={})), "")
+
+
+class _MemoryBackend(StorageBackend):
+    name = "memory"
+    config_type = msgspec.Struct
+
+    def __init__(self):
+        self.objects = {}
+
+    def put_many(self, objects):
+        keys = []
+        for parts in objects:
+            key = f"mem/{len(self.objects)}"
+            self.objects[key] = {name: bytes(data) for name, data in parts.items()}
+            keys.append(key)
+        return keys
+
+    def get_many(self, keys, *, parts):
+        return [
+            {name: memoryview(bytearray(self.objects[key][name])) for name, _ in named}
+            for key, named in zip(keys, parts)
+        ]
+
+    def register(self, memory):
+        pass
+
+    def unregister(self, memory):
+        pass
+
+    def get_ranges(self, reads, *, into):
+        raise NotImplementedError
+
+    def delete_many(self, keys, *, parts):
+        for key in keys:
+            del self.objects[key]
+
+    def close(self):
+        pass
+
+
+def _store_batch(B=2, T=2, D=4, L=5, latent_steps=(0, 1, 2)):
+    K = len(latent_steps)
+    batch = OutputBatch(
+        output=torch.randn(B, 1, 8, 8),
+        rollout_trajectory_data=RolloutTrajectoryData(
+            rollout_log_probs=torch.randn(B, T),
+            rollout_debug_tensors=RolloutDebugTensors(
+                rollout_model_outputs=torch.randn(B, T, D),
+            ),
+            denoising_env=RolloutDenoisingEnv(
+                pos_cond_kwargs={
+                    "encoder_hidden_states": [torch.randn(B, L, D)],
+                    "pooled": torch.randn(L, D),
+                    "img_shapes": [[1, 2, 3], [4, 5, 6]],
+                    "txt_seq_lens": [7, 8],
+                },
+                guidance=torch.tensor([1.0, 2.0]),
+            ),
+            dit_trajectory=RolloutDitTrajectory(
+                latents=torch.randn(B, K, D),
+                timesteps=torch.linspace(1.0, 0.0, T),
+                sigmas=torch.linspace(1.0, 0.0, T + 1),
+                latent_step_indices=torch.tensor(latent_steps),
+            ),
+        ),
+    )
+    batch.metrics = types.SimpleNamespace(total_duration_s=1.0)
+    return batch
+
+
+def _assert_same_tensors(test, inline, via_store, stored):
+    """Every marker in ``via_store`` resolves to the tensor ``inline`` carries there."""
+    if isinstance(via_store, dict) and "__store__" in via_store:
+        tensor = stored[via_store["__store__"]]
+        test.assertTrue(torch.equal(_maybe_deserialize(inline), tensor))
+    elif isinstance(via_store, list) and "__tensor__" in inline:
+        rows = _maybe_deserialize(inline)
+        test.assertEqual(len(rows), len(via_store))
+        for row, marker in zip(rows, via_store):
+            test.assertTrue(torch.equal(row, stored[marker["__store__"]]))
+    elif isinstance(via_store, dict):
+        test.assertEqual(set(inline), set(via_store))
+        for key in via_store:
+            _assert_same_tensors(test, inline[key], via_store[key], stored)
+    elif isinstance(via_store, list):
+        test.assertEqual(len(inline), len(via_store))
+        for a, b in zip(inline, via_store):
+            _assert_same_tensors(test, a, b, stored)
+    else:
+        test.assertEqual(inline, via_store)
+
+
+class TestBuildResponseViaStore(unittest.TestCase):
+    def test_batched_tensors_are_stored_one_field_per_sample_and_step(self):
+        batch = _store_batch()
+        rtd = batch.rollout_trajectory_data
+        stored = {}
+        resps = _build_response("r", "p", 0, True, batch, stored=stored)
+        self.assertEqual(
+            set(stored),
+            {
+                *(f"dit_trajectory.latents.{b}.{k}" for b in (0, 1) for k in (0, 1, 2)),
+                *(
+                    f"rollout_debug_tensors.rollout_model_outputs.{b}.{t}"
+                    for b in (0, 1)
+                    for t in (0, 1)
+                ),
+                "denoising_env.pos_cond_kwargs.encoder_hidden_states.0.0",
+                "denoising_env.pos_cond_kwargs.encoder_hidden_states.0.1",
+                "denoising_env.pos_cond_kwargs.pooled",
+                "generated_output.0",
+                "generated_output.1",
+            },
+        )
+        self.assertTrue(
+            torch.equal(
+                stored["dit_trajectory.latents.1.2"], rtd.dit_trajectory.latents[1, 2]
+            )
+        )
+        self.assertTrue(torch.equal(stored["generated_output.1"], batch.output[1]))
+        self.assertIs(
+            stored["denoising_env.pos_cond_kwargs.pooled"],
+            rtd.denoising_env.pos_cond_kwargs["pooled"],
+        )
+        for row, resp in enumerate(resps):
+            self.assertEqual(
+                resp.generated_output, {"__store__": f"generated_output.{row}"}
+            )
+            self.assertEqual(
+                resp.dit_trajectory["latents"],
+                [{"__store__": f"dit_trajectory.latents.{row}.{k}"} for k in (0, 1, 2)],
+            )
+            self.assertEqual(
+                resp.rollout_debug_tensors["rollout_model_outputs"],
+                [
+                    {
+                        "__store__": f"rollout_debug_tensors.rollout_model_outputs.{row}.{t}"
+                    }
+                    for t in (0, 1)
+                ],
+            )
+            cond = resp.denoising_env["pos_cond_kwargs"]
+            self.assertEqual(
+                cond["encoder_hidden_states"],
+                [
+                    {
+                        "__store__": f"denoising_env.pos_cond_kwargs.encoder_hidden_states.0.{row}"
+                    }
+                ],
+            )
+            self.assertEqual(
+                cond["pooled"], {"__store__": "denoising_env.pos_cond_kwargs.pooled"}
+            )
+            self.assertEqual(cond["img_shapes"], [[[1, 2, 3], [4, 5, 6]][row]])
+            self.assertEqual(cond["txt_seq_lens"], [7, 8])
+            self.assertIsNone(resp.rollout_debug_tensors["rollout_variance_noises"])
+            self.assertIsNone(resp.output_store_ref)
+
+    def test_windowed_latents_are_named_by_their_original_step(self):
+        batch = _store_batch(latent_steps=(2, 3, 7))
+        latents = batch.rollout_trajectory_data.dit_trajectory.latents
+        stored = {}
+        resps = _build_response("r", "p", 0, True, batch, stored=stored)
+        for row, resp in enumerate(resps):
+            self.assertEqual(
+                resp.dit_trajectory["latents"],
+                [{"__store__": f"dit_trajectory.latents.{row}.{s}"} for s in (2, 3, 7)],
+            )
+            for position, step in enumerate((2, 3, 7)):
+                self.assertTrue(
+                    torch.equal(
+                        stored[f"dit_trajectory.latents.{row}.{step}"],
+                        latents[row, position],
+                    )
+                )
+
+    def test_small_tensors_stay_inline(self):
+        batch = _store_batch(T=2)
+        resps = _build_response("r", "p", 0, True, batch, stored={})
+        for row, resp in enumerate(resps):
+            self.assertEqual(
+                bytes_to_tensor(resp.rollout_log_probs["data"]).shape, (2,)
+            )
+            self.assertEqual(
+                bytes_to_tensor(resp.denoising_env["guidance"]["data"]).item(),
+                row + 1.0,
+            )
+            self.assertEqual(
+                bytes_to_tensor(resp.dit_trajectory["timesteps"]["data"]).shape, (2,)
+            )
+            self.assertEqual(
+                bytes_to_tensor(
+                    resp.dit_trajectory["latent_step_indices"]["data"]
+                ).tolist(),
+                [0, 1, 2],
+            )
+
+    def test_markers_resolve_to_the_inline_tensors(self):
+        batch = _store_batch()
+        fields = (
+            "generated_output",
+            "rollout_debug_tensors",
+            "denoising_env",
+            "dit_trajectory",
+        )
+        for video_dtype in (None, "uint8"):
+            stored = {}
+            inline = _build_response("r", "p", 0, True, batch, video_dtype=video_dtype)
+            via_store = _build_response(
+                "r", "p", 0, True, batch, video_dtype=video_dtype, stored=stored
+            )
+            for a, b in zip(inline, via_store):
+                for field in fields:
+                    _assert_same_tensors(
+                        self, getattr(a, field), getattr(b, field), stored
+                    )
+
+    def test_numpy_output_is_stored_as_the_tensor_the_inline_path_sends(self):
+        batch = _store_batch()
+        batch.output = batch.output.numpy()
+        stored = {}
+        inline = _build_response("r", "p", 0, True, batch)
+        via_store = _build_response("r", "p", 0, True, batch, stored=stored)
+        for a, b in zip(inline, via_store):
+            _assert_same_tensors(self, a.generated_output, b.generated_output, stored)
+
+    def test_skipped_decode_stores_no_output(self):
+        """A request that skipped the decode has no output; storing one would fail on None."""
+        batch = _store_batch()
+        num_outputs = batch.output.shape[0]
+        batch.output = None
+        stored = {}
+        resps = _build_response(
+            "r", "p", 0, True, batch, stored=stored, num_outputs=num_outputs
+        )
+        self.assertEqual([resp.generated_output for resp in resps], [None] * len(resps))
+        self.assertFalse(any(key.startswith("generated_output.") for key in stored))
+
+    def test_eval_response_stores_nothing(self):
+        batch = OutputBatch(
+            output=torch.randn(2, 1, 8, 8), rollout_trajectory_data=None
+        )
+        batch.metrics = None
+        stored = {}
+        _build_response("r", "p", 0, False, batch, stored=stored)
+        self.assertEqual(stored, {})
+
+
+class TestRolloutOutputStore(unittest.TestCase):
+    def _store(self):
+        backend = _MemoryBackend()
+        store = RolloutOutputStore()
+        args = types.SimpleNamespace(
+            output_store_backend="memory", output_store_backend_extra_config=None
+        )
+        with patch("radix_transfer_plugins.create_backend", return_value=backend):
+            store.initialize(args)
+        return store, backend
+
+    def test_disabled_without_a_backend(self):
+        store = RolloutOutputStore()
+        store.initialize(types.SimpleNamespace(output_store_backend="none"))
+        self.assertFalse(store.enabled)
+
+    def test_put_and_delete(self):
+        store, backend = self._store()
+        self.assertTrue(store.enabled)
+        ref = store.put({"x": torch.ones(2, dtype=torch.bfloat16)})
+        self.assertEqual(
+            [(f.name, f.dtype, f.shape) for f in ref.fields], [("x", "bfloat16", (2,))]
+        )
+        self.assertIn(ref.key, backend.objects)
+        store.delete(ref)
+        self.assertEqual(backend.objects, {})
+        store.delete(ref)
+        store.close()
+        self.assertFalse(store.enabled)
+
+    def test_unsent_response_deletes_its_object(self):
+        store, backend = self._store()
+        ref = store.put({"x": torch.ones(2)})
+        with patch.object(rollout_api, "rollout_output_store", store):
+            parts = rollout_api._stream_parts([b"a", b"b"], ref)
+            next(parts)
+            parts.close()
+        self.assertEqual(backend.objects, {})
+
+    def test_sent_response_keeps_its_object(self):
+        store, backend = self._store()
+        ref = store.put({"x": torch.ones(2)})
+        with patch.object(rollout_api, "rollout_output_store", store):
+            self.assertEqual(
+                list(rollout_api._stream_parts([b"a", b"b"], ref)), [b"a", b"b"]
+            )
+        self.assertIn(ref.key, backend.objects)
+
+
+# Every module that defines a DecodingStage subclass; the completeness test
+# walks the subclass tree after importing them.
+_DECODING_STAGE_MODULES = (
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.glm_image",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.helios_decoding",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.hunyuan_image3.decoding",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.joy_echo.memory",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.kandinsky6.decoding",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ltx_2.decoding_av",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.ming_image",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.decoding",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.nomas.stages",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.base",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.refiner",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.sana_wm.streaming",
+    "sglang.multimodal_gen.runtime.pipelines_core.stages.realtime.vae",
+    "sglang.multimodal_gen.runtime.pipelines.glm_image",
+)
+
+
+def _all_subclasses(cls: type) -> set[type]:
+    found = set()
+    for sub in cls.__subclasses__():
+        found.add(sub)
+        found |= _all_subclasses(sub)
+    return found
+
+
+class TestRolloutWithoutGeneratedOutput(unittest.TestCase):
+    """rollout_return_generated_output=False: the decoders return the trajectory without running the VAE."""
+
+    def _request(self):
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+
+        req = Req(
+            sampling_params=SamplingParams(
+                prompt="x", rollout=True, rollout_return_generated_output=False
+            )
+        )
+        req.rollout_trajectory_data = RolloutTrajectoryData(
+            rollout_log_probs=torch.randn(2, 3)
+        )
+        return req
+
+    def test_decoders_return_the_trajectory_without_the_vae(self):
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+            DecodingStage,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.decoding import (
+            MiniMaxH3DecodingStage,
+        )
+
+        class _UnusedVAE(torch.nn.Module):
+            def decode(self, latents):
+                raise AssertionError("the VAE ran")
+
+        for stage in (
+            DecodingStage(_UnusedVAE()),
+            object.__new__(MiniMaxH3DecodingStage),
+        ):
+            req = self._request()
+            output = stage.forward(req, server_args=None)
+            self.assertIsNone(output.output)
+            self.assertIs(output.rollout_trajectory_data, req.rollout_trajectory_data)
+
+    def test_h3_verification_accepts_only_a_rollout_trajectory_without_media(self):
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+            rollout_output_without_decode,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.decoding import (
+            MiniMaxH3DecodingStage,
+        )
+
+        stage = object.__new__(MiniMaxH3DecodingStage)
+        trajectory_only = rollout_output_without_decode(self._request())
+        self.assertTrue(stage.verify_output(trajectory_only, None).is_valid())
+        # An empty output that is not a rollout trajectory still fails.
+        self.assertFalse(stage.verify_output(OutputBatch(), None).is_valid())
+
+    def test_every_decoding_stage_skips_or_declares_it_cannot(self):
+        """A subclass whose forward is not wrapped reaches its VAE (or indexes output) and fails here,
+        unless it declares skip_decode_supported = False, which admission turns into a rejection."""
+        import importlib
+
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+            DecodingStage,
+        )
+
+        for module in _DECODING_STAGE_MODULES:
+            importlib.import_module(module)
+        # test-local subclasses elsewhere in the suite are not stages a server runs
+        stages = {
+            cls
+            for cls in _all_subclasses(DecodingStage)
+            if cls.__module__.startswith("sglang.multimodal_gen.runtime")
+        }
+        self.assertGreaterEqual(len(stages), 14)
+        stateful = {cls.__name__ for cls in stages if not cls.skip_decode_supported}
+        # the forwards that also advance state; a new entry needs its own reason
+        self.assertEqual(
+            stateful,
+            {"JoyEchoAVDecodingStage", "NomasDecodingStage", "CausalVaeDecodingStage"},
+        )
+        for stage_cls in (DecodingStage, *sorted(stages, key=lambda c: c.__name__)):
+            if not stage_cls.skip_decode_supported:
+                continue
+            req = self._request()
+            output = stage_cls.forward(object.__new__(stage_cls), req, None)
+            self.assertTrue(output.generated_output_skipped, stage_cls.__name__)
+            self.assertIsNone(output.output, stage_cls.__name__)
+            self.assertIs(output.rollout_trajectory_data, req.rollout_trajectory_data)
+
+    def test_h3_verification_accepts_a_skipped_decode_without_a_trajectory(self):
+        """The skip signal alone must satisfy verification; a rule that infers the skip from a trajectory misses this."""
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.decoding import (
+            MiniMaxH3DecodingStage,
+        )
+
+        stage = object.__new__(MiniMaxH3DecodingStage)
+        skipped = OutputBatch(generated_output_skipped=True)
+        self.assertTrue(stage.verify_output(skipped, None).is_valid())
+
+    def test_skipped_decode_does_not_release_the_allocator_cache(self):
+        """Cache release means the decoded tensor left output; a skip never produced one."""
+        from sglang.multimodal_gen.runtime.managers.gpu_worker import (
+            _releases_cache_after,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+            rollout_output_without_decode,
+        )
+
+        req = self._request()
+        self.assertFalse(_releases_cache_after(rollout_output_without_decode(req), req))
+        self.assertTrue(
+            _releases_cache_after(OutputBatch(output_file_paths=["out.mp4"]), req)
+        )
+
+    def test_skip_request_is_rejected_before_the_forward_unless_the_last_stage_decodes(
+        self,
+    ):
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+        from sglang.multimodal_gen.runtime.entrypoints.post_training.rollout_api import (
+            _engine_error,
+        )
+        from sglang.multimodal_gen.runtime.managers.gpu_worker import (
+            _skip_decode_error,
+        )
+        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+            SKIP_DECODE_UNSUPPORTED_ERROR,
+            DecodingStage,
+        )
+
+        class _StatefulDecode(DecodingStage):
+            skip_decode_supported = False
+
+        decode = object.__new__(DecodingStage)
+        stateful = object.__new__(_StatefulDecode)
+        other = types.SimpleNamespace()
+        skip = [self._request()]
+        wants_output = [Req(sampling_params=SamplingParams(prompt="x"))]
+        self.assertIsNone(_skip_decode_error([other, decode], skip, disagg_mode=False))
+        self.assertEqual(
+            _skip_decode_error([decode, other], skip, disagg_mode=False),
+            SKIP_DECODE_UNSUPPORTED_ERROR,
+        )
+        self.assertEqual(
+            _skip_decode_error([other, stateful], skip, disagg_mode=False),
+            SKIP_DECODE_UNSUPPORTED_ERROR,
+        )
+        # the skip signal does not cross the disaggregated role boundary
+        self.assertEqual(
+            _skip_decode_error([other, decode], skip, disagg_mode=True),
+            SKIP_DECODE_UNSUPPORTED_ERROR,
+        )
+        self.assertIsNone(
+            _skip_decode_error([decode, other], wants_output, disagg_mode=True)
+        )
+        self.assertEqual(_engine_error(SKIP_DECODE_UNSUPPORTED_ERROR).status_code, 400)
+        self.assertEqual(_engine_error("forward failed").status_code, 500)
+
+    def test_rollout_requests_never_share_a_dynamic_batch(self):
+        """The batched split carries no rollout trajectory, so a rollout request must get no batch signature."""
+        from sglang.multimodal_gen.configs.sample.sampling_params import (
+            SamplingParams,
+        )
+        from sglang.multimodal_gen.runtime.managers.scheduler import Scheduler
+        from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.server_args = types.SimpleNamespace(
+            pipeline_config=types.SimpleNamespace(
+                supports_sequential_dit_inference=lambda: False
+            )
+        )
+        self.assertIsNone(scheduler._build_dynamic_batch_signature(self._request()))
+        plain = Req(sampling_params=SamplingParams(prompt="x"))
+        self.assertIsInstance(scheduler._build_dynamic_batch_signature(plain), tuple)
+
+    def test_response_has_one_entry_per_output_and_no_media(self):
+        from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+            rollout_output_without_decode,
+        )
+
+        batch = rollout_output_without_decode(self._request())
+        resps = _build_response("rn", "p", 0, True, batch, num_outputs=2)
+        self.assertEqual(len(resps), 2)
+        for index, resp in enumerate(resps):
+            self.assertIsNone(resp.generated_output)
+            self.assertTrue(
+                torch.equal(
+                    bytes_to_tensor(resp.rollout_log_probs["data"]),
+                    batch.rollout_trajectory_data.rollout_log_probs[index],
+                )
+            )
 
 
 if __name__ == "__main__":

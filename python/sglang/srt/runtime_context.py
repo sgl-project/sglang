@@ -503,6 +503,18 @@ def draft_attn_tp_size() -> int:
     return getattr(get_parallel(), f"{draft_attn_parallel_group()}_size")
 
 
+def is_scheduler_io_rank() -> bool:
+    """Whether this scheduler rank receives requests from the tokenizer and
+    sends outputs to the detokenizer: pipeline, attention-TP and attention-CP
+    rank 0, one per attention-DP group."""
+    parallel = get_parallel()
+    return (
+        parallel.pp_rank == 0
+        and parallel.attn_tp_rank == 0
+        and parallel.attn_cp_rank == 0
+    )
+
+
 class _FlagGroupBase(msgspec.Struct):
     """Shared flag-group behavior: typo-safe writes + transactional ``override()``.
 

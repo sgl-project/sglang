@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Unit tests for the Cosmos3 RL rollout path: rollout scheduler grid
-selection and fused-parameter shard-id plumbing in the weights updater."""
+selection, the denoise loop on the serving scheduler and on a stopped rollout
+schedule, and fused-parameter shard-id plumbing in the weights updater."""
 
 import types
 import unittest
@@ -146,6 +147,70 @@ class TestCosmos3ServingStep(unittest.TestCase):
         with mock.patch.object(cosmos3, "get_sp_world_size", return_value=1):
             stage.forward(batch, server_args)
         torch.testing.assert_close(batch.latents, torch.ones_like(batch.latents))
+
+    def test_rollout_stop_runs_the_controller_schedule(self):
+        """Cosmos3 builds its rollout controller from the per-request scheduler, so
+        a requested stop must shorten its loop too: steps 0..i run, step i lands
+        on x_i's x0 prediction, and the scheduler's own grid stays whole."""
+        stage = cosmos3.Cosmos3DenoisingStage.__new__(cosmos3.Cosmos3DenoisingStage)
+        stage.scheduler = _serving_scheduler()
+        stage.transformer = mock.Mock()
+        stage._logged_parallel_config = True
+        stage.log_info = mock.Mock()
+        stage.progress_bar = lambda iterable, **kwargs: iterable
+        stage.use_declared_component = lambda **kwargs: nullcontext()
+        step_inputs = []
+
+        def run_transformer(**kwargs):
+            step_inputs.append(kwargs["latents"].clone())
+            return torch.tanh(kwargs["latents"])
+
+        stage._run_transformer = run_transformer
+        scheduler = FlowMatchEulerDiscreteScheduler(
+            num_train_timesteps=NUM_TRAIN_TIMESTEPS
+        )
+        scheduler.set_shift(3.0)
+        scheduler.set_timesteps(4, device="cpu")
+        stop_step_index = 1
+        text = torch.ones(1, 2, dtype=torch.long)
+        batch = Req(
+            sampling_params=SamplingParams(
+                prompt="test",
+                guidance_scale=1.0,
+                rollout=True,
+                rollout_sde_type="ode",
+                rollout_log_prob_no_const=True,
+                rollout_stop_step_index=stop_step_index,
+            ),
+            latents=torch.randn(
+                1, 1, 2, 2, 2, generator=torch.Generator().manual_seed(0)
+            ),
+            timesteps=scheduler.timesteps,
+            scheduler=scheduler,
+            extra={
+                "cond_text_ids": text,
+                "cond_text_mask": text,
+                "uncond_text_ids": text,
+                "uncond_text_mask": text,
+                "cond_text_seq_len": 2,
+                "video_shape": (1, 1, 1),
+            },
+        )
+        server_args = types.SimpleNamespace(
+            pipeline_config=None, enable_cfg_parallel=False
+        )
+        with mock.patch.object(cosmos3, "get_sp_world_size", return_value=1):
+            stage.forward(batch, server_args)
+
+        self.assertEqual(len(step_inputs), stop_step_index + 1)
+        x_i = step_inputs[stop_step_index]
+        x0_pred = x_i - scheduler.sigmas[stop_step_index] * torch.tanh(x_i)
+        torch.testing.assert_close(batch.latents, x0_pred, rtol=0, atol=1e-6)
+        self.assertEqual(
+            batch.rollout_trajectory_data.rollout_log_probs.shape,
+            (1, stop_step_index + 1),
+        )
+        self.assertEqual(len(scheduler.timesteps), 4)
 
     def test_cfg_window_check_reads_host_timesteps(self):
         """The per-step CFG window check reads a host copy of the schedule: a

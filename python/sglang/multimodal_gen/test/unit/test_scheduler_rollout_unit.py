@@ -23,6 +23,10 @@ TestSchedulerFlowGRPOStepAlignmentUnit
     SDE / CPS match the verbatim FlowGRPO reference; bf16 model_output still
     yields fp32 noise and log-probs; sde_step_indices gates the noise draw;
     return_step_indices filters latents while timesteps cover every step.
+TestRolloutStopStepUnit
+    a stop at step i runs steps 0..i on the controller's schedule and lands on
+    x_i's x0 prediction while the scheduler's grid is untouched; a loop on its
+    own grid fails loudly; MiniMax H3 cuts its own video/audio grids alike.
 """
 
 import functools
@@ -39,18 +43,40 @@ from sglang.multimodal_gen.runtime.models.schedulers.scheduling_flow_match_euler
     FlowMatchEulerDiscreteScheduler,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import Req
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.constants import (
+    MINIMAX_H3_SIGMAS_EXTRA_KEY,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.minimax_h3_rollout import (
+    minimax_h3_rollout_update_video_target,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.timestep_preparation import (
+    MiniMaxH3TimestepPreparationStage,
+)
+from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.time_request import (
+    minimax_h3_time_shift_sigmas,
+)
 from sglang.multimodal_gen.runtime.post_training.flow_rollout_controller import (
     FlowRolloutController,
 )
 from sglang.multimodal_gen.runtime.post_training.rollout_hooks import (
+    finalize_rollout_if_enabled,
+    init_rollout_env_if_enabled,
     prepare_rollout_if_enabled,
+    rollout_step_kwargs,
+    set_rollout_early_stop_if_enabled,
 )
 
 _SIGMAS = torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2, 0.0], dtype=torch.float32)
+_TIMESTEPS = _SIGMAS[:-1] * 1000.0
 
 
 def _make_rollout_controller(
-    batch, pipeline_config=None, ode_transition=None, generator=None
+    batch,
+    pipeline_config=None,
+    ode_transition=None,
+    generator=None,
+    sigmas=_SIGMAS,
+    timesteps=_TIMESTEPS,
 ) -> FlowRolloutController:
     """The controller the denoising stage creates for ``batch`` (single GPU)."""
     return FlowRolloutController(
@@ -66,7 +92,8 @@ def _make_rollout_controller(
             batch=batch, latents=latents
         )[0],
         gather_for_sp=lambda batch, stacked_latents: stacked_latents,
-        sigmas=_SIGMAS,
+        sigmas=sigmas,
+        timesteps=timesteps,
         latents_shape=tuple(batch.latents.shape),
         ode_transition=ode_transition,
     )
@@ -83,6 +110,7 @@ class TestRolloutControllerOwnership(unittest.TestCase):
         batch = Req(sampling_params=SamplingParams(prompt="test", rollout=True))
         batch.scheduler = FlowMatchEulerDiscreteScheduler(shift=3.0)
         batch.scheduler.set_timesteps(5)
+        batch.timesteps = batch.scheduler.timesteps
         batch.latents = torch.zeros(1, 4, 8, 8)
         prepare_rollout_if_enabled(batch=batch, pipeline_config=types.SimpleNamespace())
         self.assertTrue(batch.rollout_controllers)
@@ -226,7 +254,11 @@ class TestSchedulerRolloutOdeUnit(unittest.TestCase):
             scheduler.set_timesteps(5)
             scheduler.set_begin_index(0)
         batch = self._build_batch(debug_mode=False)
-        current_rollout_controller = _make_rollout_controller(batch)
+        current_rollout_controller = _make_rollout_controller(
+            batch,
+            sigmas=rollout_scheduler.sigmas,
+            timesteps=rollout_scheduler.timesteps,
+        )
 
         g = torch.Generator().manual_seed(0)
         sample = torch.randn(2, 4, 8, 8)
@@ -692,6 +724,233 @@ class TestSchedulerFlowGRPOStepAlignmentUnit(unittest.TestCase):
         self.assertEqual(_recorded_steps([0, 1, 2]), [0, 1, 2])
         # Filter includes only step_index=T -> only the final latent survives.
         self.assertEqual(_recorded_steps([3]), [3])
+
+
+class TestRolloutStopStepUnit(unittest.TestCase):
+    """A stop at step i runs steps 0..i on the controller's schedule, with step i
+    sent to the terminal sigma; the scheduler keeps its full grid throughout."""
+
+    def _batch(self, sde_type: str) -> types.SimpleNamespace:
+        return types.SimpleNamespace(
+            rollout_log_prob_no_const=True,
+            rollout_noise_level=1.0,
+            rollout_sde_type=sde_type,
+            rollout_debug_mode=False,
+            rollout_sde_step_indices=None,
+            rollout_return_dit_trajectory=False,
+            rollout_return_step_indices=None,
+            latents=torch.randn(1, 4, 8, 8, generator=torch.Generator().manual_seed(0)),
+        )
+
+    def _run(
+        self, stop_step_index: int | None
+    ) -> tuple[
+        FlowMatchEulerDiscreteScheduler, FlowRolloutController, list, torch.Tensor
+    ]:
+        scheduler = FlowMatchEulerDiscreteScheduler(shift=3.0)
+        scheduler.set_timesteps(4)
+        batch = self._batch("cps")
+        pipeline_config = types.SimpleNamespace(
+            shard_latents_for_sp=lambda batch, latents: (latents, False)
+        )
+        current_rollout_controller = _make_rollout_controller(
+            batch,
+            pipeline_config,
+            generator=torch.Generator().manual_seed(1),
+            sigmas=scheduler.sigmas,
+            timesteps=scheduler.timesteps,
+        )
+        if stop_step_index is not None:
+            current_rollout_controller.stop_at(stop_step_index)
+        transition = functools.partial(
+            current_rollout_controller.transition, batch=batch
+        )
+        latents, step_inputs = batch.latents, []
+        for t in current_rollout_controller.timesteps:
+            step_inputs.append(latents)
+            latents = scheduler.step(
+                torch.tanh(latents), t, latents, transition=transition
+            ).prev_sample
+        return scheduler, current_rollout_controller, step_inputs, latents
+
+    def test_stopped_rollout_keeps_prefix_and_returns_x0_prediction(self):
+        """Stopping at step i must replay the full rollout's x_i bit for bit and
+        land on x_i's x0 prediction, while the scheduler's own grid is untouched:
+        only the controller's next sigma may send the last step to the terminal."""
+        full_scheduler, _, full_inputs, _ = self._run(None)
+        stop_step_index = 2
+        scheduler, controller, stopped_inputs, final = self._run(stop_step_index)
+
+        self.assertEqual(len(stopped_inputs), stop_step_index + 1)
+        for full, stopped in zip(full_inputs, stopped_inputs):
+            self.assertTrue(torch.equal(full, stopped))
+        x_i = stopped_inputs[stop_step_index]
+        x0_pred = x_i - scheduler.sigmas[stop_step_index] * torch.tanh(x_i)
+        torch.testing.assert_close(final, x0_pred, rtol=0, atol=1e-6)
+
+        self.assertTrue(torch.equal(scheduler.sigmas, full_scheduler.sigmas))
+        self.assertTrue(torch.equal(scheduler.timesteps, full_scheduler.timesteps))
+        self.assertTrue(
+            torch.equal(
+                controller.sigmas,
+                torch.cat([scheduler.sigmas[:3], scheduler.sigmas[-1:]]),
+            )
+        )
+        self.assertTrue(torch.equal(controller.timesteps, scheduler.timesteps[:3]))
+
+    def test_stop_at_step_zero_keeps_the_full_grids_sigma_max(self):
+        """The SDE std at sigma == 1 uses sigma_max = sigmas[1] of the model's grid;
+        a stop at step 0 cuts the grid to [1, 0] and must not read 0 there, or the
+        stopped rollout's first step draws different noise than the full one."""
+        controller = _make_rollout_controller(self._batch("sde"))
+        controller.stop_at(0)
+        self.assertEqual(controller.sigma_max, _SIGMAS[1].item())
+        self.assertTrue(torch.equal(controller.sigmas, torch.tensor([1.0, 0.0])))
+        self.assertTrue(torch.equal(controller.timesteps, _TIMESTEPS[:1]))
+
+    def test_stop_step_outside_schedule_is_rejected(self):
+        with self.assertRaises(ValueError):
+            _make_rollout_controller(self._batch("cps")).stop_at(5)
+
+    def test_default_builder_iterates_the_pipelines_published_timesteps(self):
+        """A pipeline may publish batch.timesteps on the DiT's own scale while
+        stepping the same scheduler (Krea-2 feeds raw sigmas between 0 and 1; the
+        scheduler reports sigma * 1000). The stop must cut those values, not
+        replace them with the scheduler's, or every rollout of such a pipeline
+        feeds a wrong t."""
+        batch = Req(
+            sampling_params=SamplingParams(
+                prompt="test", rollout=True, rollout_stop_step_index=1
+            )
+        )
+        batch.scheduler = FlowMatchEulerDiscreteScheduler(shift=3.0)
+        batch.scheduler.set_timesteps(4)
+        batch.timesteps = batch.scheduler.sigmas[:4]
+        batch.latents = torch.zeros(1, 4, 8, 8)
+        prepare_rollout_if_enabled(batch=batch, pipeline_config=types.SimpleNamespace())
+        set_rollout_early_stop_if_enabled(batch=batch)
+        self.assertTrue(torch.equal(batch.timesteps, batch.scheduler.sigmas[:2]))
+
+    def test_loop_on_its_own_grid_is_rejected(self):
+        """A loop that iterates the scheduler's full grid instead of the controller's
+        schedule would return a full rollout as if it had stopped. The step past the
+        schedule fails in the transition and a finalize whose step count disagrees
+        with the schedule fails too."""
+        batch = Req(
+            sampling_params=SamplingParams(
+                prompt="test",
+                rollout=True,
+                rollout_sde_type="ode",
+                rollout_log_prob_no_const=True,
+                rollout_stop_step_index=2,
+            )
+        )
+        batch.scheduler = FlowMatchEulerDiscreteScheduler(shift=3.0)
+        batch.scheduler.set_timesteps(4)
+        batch.timesteps = batch.scheduler.timesteps
+        batch.latents = torch.zeros(1, 4, 8, 8)
+        pipeline_config = types.SimpleNamespace()
+        prepare_rollout_if_enabled(batch=batch, pipeline_config=pipeline_config)
+        init_rollout_env_if_enabled(
+            batch=batch,
+            image_kwargs={},
+            pos_cond_kwargs={},
+            neg_cond_kwargs={},
+            guidance=None,
+        )
+        set_rollout_early_stop_if_enabled(batch=batch)
+        timesteps = batch.timesteps
+        self.assertEqual(len(timesteps), 3)
+        self.assertEqual(len(batch.scheduler.timesteps), 4)
+
+        latents = batch.latents
+        for t in timesteps:
+            latents = batch.scheduler.step(
+                torch.tanh(latents), t, latents, **rollout_step_kwargs(batch)
+            ).prev_sample
+        with self.assertRaises(ValueError):
+            batch.scheduler.step(
+                torch.tanh(latents),
+                batch.scheduler.timesteps[3],
+                latents,
+                **rollout_step_kwargs(batch),
+            )
+
+        def finalize(num_inference_steps: int) -> None:
+            finalize_rollout_if_enabled(
+                batch=batch,
+                latents=latents,
+                num_inference_steps=num_inference_steps,
+                final_timestep=timesteps.new_zeros(()),
+                pipeline_config=pipeline_config,
+            )
+
+        with self.assertRaises(ValueError):
+            finalize(len(batch.scheduler.timesteps))
+        finalize(len(timesteps))
+        self.assertEqual(batch.rollout_trajectory_data.rollout_log_probs.shape, (1, 3))
+        self.assertEqual(batch.rollout_controllers, {})
+
+    def _run_minimax_h3(
+        self, stop_step_index: int | None
+    ) -> tuple[dict[str, list[float]], list[torch.Tensor], torch.Tensor]:
+        sigmas = {
+            name: minimax_h3_time_shift_sigmas(num_steps=4, shift_scale=shift)
+            for name, shift in (("video", 12.0), ("audio", 3.0))
+        }
+        batch = types.SimpleNamespace(
+            rollout=True,
+            rollout_stop_step_index=stop_step_index,
+            rollout_sde_type="cps",
+            rollout_noise_level=1.0,
+            rollout_log_prob_no_const=True,
+            rollout_sde_step_indices=None,
+            extra={MINIMAX_H3_SIGMAS_EXTRA_KEY: sigmas},
+        )
+        MiniMaxH3TimestepPreparationStage._truncate_rollout_schedule(batch)
+        video_sigmas = sigmas["video"]
+        generator = torch.Generator().manual_seed(1)
+        latents = torch.randn(16, 8, generator=torch.Generator().manual_seed(0))
+        step_inputs, noise_buffer = [], None
+        for step in range(len(video_sigmas) - 1):
+            step_inputs.append(latents)
+            latents, _, _, noise_buffer = minimax_h3_rollout_update_video_target(
+                latents,
+                torch.tanh(latents),
+                sigma_curr=video_sigmas[step],
+                sigma_next=video_sigmas[step + 1],
+                batch=batch,
+                generator=generator,
+                loop_step_index=step,
+                noise_buffer=noise_buffer,
+            )
+        return sigmas, step_inputs, latents
+
+    def test_minimax_h3_stopped_rollout_keeps_prefix_and_returns_x0_prediction(self):
+        """H3 builds its own video/audio grids; stopping at step i must cut both alike,
+        replay the full rollout's x_i bit for bit and land on x_i's x0 prediction."""
+        full_sigmas, full_inputs, _ = self._run_minimax_h3(None)
+        stop_step_index = 2
+        sigmas, stopped_inputs, final = self._run_minimax_h3(stop_step_index)
+
+        self.assertEqual(
+            sigmas,
+            {
+                name: values[: stop_step_index + 1] + values[-1:]
+                for name, values in full_sigmas.items()
+            },
+        )
+        self.assertEqual(len(stopped_inputs), stop_step_index + 1)
+        for full, stopped in zip(full_inputs, stopped_inputs):
+            self.assertTrue(torch.equal(full, stopped))
+
+        x_i = stopped_inputs[stop_step_index]
+        x0_pred = x_i + sigmas["video"][stop_step_index] * torch.tanh(x_i)
+        # H3's cps floors the predicted-noise weight at sqrt(1e-12).
+        torch.testing.assert_close(final, x0_pred, rtol=0, atol=1e-5)
+
+        with self.assertRaises(ValueError):
+            self._run_minimax_h3(4)
 
 
 if __name__ == "__main__":

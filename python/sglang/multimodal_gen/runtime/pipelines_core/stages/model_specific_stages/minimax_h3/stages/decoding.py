@@ -24,7 +24,10 @@ from sglang.multimodal_gen.runtime.pipelines_core.schedule_batch import OutputBa
 from sglang.multimodal_gen.runtime.pipelines_core.stages.base import (
     StageParallelismType,
 )
-from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import DecodingStage
+from sglang.multimodal_gen.runtime.pipelines_core.stages.decoding import (
+    DecodingStage,
+    skip_decode_if_requested,
+)
 from sglang.multimodal_gen.runtime.pipelines_core.stages.encode_while_decoding import (
     EncodeWhileDecoding,
     streamed_video_output_path,
@@ -307,6 +310,8 @@ class MiniMaxH3DecodingStage(DecodingStage):
         self, batch: OutputBatch, server_args: ServerArgs
     ) -> VerificationResult:
         result = VerificationResult()
+        if batch.generated_output_skipped:
+            return result
         if not batch.output_file_paths:
             result.add_check("output", batch.output, [V.is_tensor, V.with_dims(5)])
         result.add_check("audio", batch.audio, [V.is_tensor, V.with_dims(3)])
@@ -421,6 +426,7 @@ class MiniMaxH3DecodingStage(DecodingStage):
             frames = canonical_frames
         return frames
 
+    @skip_decode_if_requested
     @torch.no_grad()
     def forward(self, batch: Req, server_args: ServerArgs) -> OutputBatch:
         _minimax_h3_decoder_task(batch)
