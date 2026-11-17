@@ -4,6 +4,7 @@
 //! Messages request → chat request.
 
 use serde_json::{json, Map, Value};
+use std::fmt::Display;
 
 #[derive(Debug, Clone)]
 pub struct EchoContext {
@@ -29,7 +30,9 @@ const FORWARDED: &[&str] = &[
 ];
 
 /// `count_only`: `count_tokens` shape, no `max_tokens` required.
-pub fn to_chat(req: Value, count_only: bool) -> Result<Converted, String> {
+/// `inline_system`: the engine's chat template renders a system message after
+/// the first, so a system turn stays in place instead of joining the first.
+pub fn to_chat(req: Value, count_only: bool, inline_system: bool) -> Result<Converted, String> {
     let Value::Object(req) = req else {
         return Err("request body must be a JSON object".into());
     };
@@ -52,24 +55,44 @@ pub fn to_chat(req: Value, count_only: bool) -> Result<Converted, String> {
         Some(v) => return Err(format!("max_tokens: must be a positive integer, got {v}")),
     };
 
-    let mut messages = Vec::new();
-    if let Some(s) = system_text(req.get("system"))? {
-        messages.push(json!({"role": "system", "content": s}));
-    }
+    let mut system = system_text(req.get("system"), "system")?;
     let Some(Value::Array(turns)) = req.get("messages") else {
         return Err("messages: field required and must be an array".into());
     };
     if turns.is_empty() {
         return Err("messages: at least one message is required".into());
     }
-    for turn in merge_turns(turns)? {
-        match turn.role {
-            "user" => convert_user(&turn.blocks, turn.at, &mut messages)?,
-            _ => convert_assistant(&turn.blocks, turn.at, &mut messages)?,
+    let (merged, lifted) = merge_turns(turns, inline_system)?;
+    // Lifted text joins the first system message, as the engine's own Messages
+    // adapter (`AnthropicServing`) places it; keep the two in step.
+    for turn in lifted {
+        if let Some(s) = system_turn_text(turn)? {
+            system = Some(match system {
+                Some(acc) => acc + "\n" + &s,
+                None => s,
+            });
         }
     }
-    // A final assistant turn is a prefill the reply continues.
-    let prefill = messages.last().is_some_and(|m| m["role"] == "assistant");
+    let mut messages = Vec::new();
+    if let Some(s) = system {
+        messages.push(json!({"role": "system", "content": s}));
+    }
+    for turn in merged {
+        match turn.role {
+            "user" => convert_user(&turn.blocks, turn.at, &mut messages)?,
+            "assistant" => convert_assistant(&turn.blocks, turn.at, &mut messages)?,
+            _ => messages
+                .extend(system_turn_text(turn)?.map(|s| json!({"role": "system", "content": s}))),
+        }
+    }
+    // A final assistant turn is a prefill the reply continues; a system turn
+    // after it asks for a new reply even once lifted.
+    let ends_with_system = turns
+        .last()
+        .and_then(|t| t.get("role"))
+        .and_then(Value::as_str)
+        == Some("system");
+    let prefill = !ends_with_system && messages.last().is_some_and(|m| m["role"] == "assistant");
 
     let mut chat = Map::new();
     for (k, v) in &req {
@@ -214,7 +237,8 @@ fn thinking_enabled(thinking: &Value) -> Result<bool, String> {
     }
 }
 
-fn system_text(system: Option<&Value>) -> Result<Option<String>, String> {
+/// `field` is where the text sits in the request, for error messages.
+fn system_text(system: Option<&Value>, field: impl Display) -> Result<Option<String>, String> {
     let text = match system {
         None | Some(Value::Null) => return Ok(None),
         Some(Value::String(s)) => s.clone(),
@@ -231,7 +255,7 @@ fn system_text(system: Option<&Value>) -> Result<Option<String>, String> {
                     }
                     other => {
                         return Err(format!(
-                            "system: block type `{}` is not supported; only text",
+                            "{field}: block type `{}` is not supported; only text",
                             other.unwrap_or("<missing>")
                         ))
                     }
@@ -239,9 +263,21 @@ fn system_text(system: Option<&Value>) -> Result<Option<String>, String> {
             }
             parts.join("\n")
         }
-        Some(_) => return Err("system: must be a string or an array of text blocks".into()),
+        Some(_) => {
+            return Err(format!(
+                "{field}: must be a string or an array of text blocks"
+            ))
+        }
     };
     Ok((!text.trim().is_empty()).then_some(text))
+}
+
+/// A system turn holds text only, as the top-level `system` does.
+fn system_turn_text(turn: Turn) -> Result<Option<String>, String> {
+    system_text(
+        Some(&Value::Array(turn.blocks)),
+        format_args!("messages.{}.content", turn.at),
+    )
 }
 
 /// One turn after consecutive same-role turns are merged, as the Messages
@@ -252,14 +288,22 @@ struct Turn<'a> {
     blocks: Vec<Value>,
 }
 
-fn merge_turns(turns: &[Value]) -> Result<Vec<Turn<'_>>, String> {
+/// Returns (merged turns, lifted system turns). Unless `inline_system`, a
+/// system turn is lifted out. Either way it keeps the turns either side of it
+/// apart, as the engine's own Messages adapter does.
+fn merge_turns(
+    turns: &[Value],
+    inline_system: bool,
+) -> Result<(Vec<Turn<'_>>, Vec<Turn<'_>>), String> {
     let mut out: Vec<Turn> = Vec::new();
+    let mut lifted = Vec::new();
+    let mut prev_role = None;
     for (i, turn) in turns.iter().enumerate() {
         let role = match turn.get("role").and_then(Value::as_str) {
-            Some(r @ ("user" | "assistant")) => r,
+            Some(r @ ("user" | "assistant" | "system")) => r,
             Some(other) => {
                 return Err(format!(
-                    "messages.{i}.role: expected user or assistant, got `{other}`"
+                    "messages.{i}.role: expected user, assistant or system, got `{other}`"
                 ))
             }
             None => return Err(format!("messages.{i}.role: field required")),
@@ -279,16 +323,23 @@ fn merge_turns(turns: &[Value]) -> Result<Vec<Turn<'_>>, String> {
                 ))
             }
         };
+        let merge = prev_role == Some(role) && role != "system";
+        prev_role = Some(role);
+        let turn = Turn {
+            role,
+            at: i,
+            blocks,
+        };
+        if role == "system" && !inline_system {
+            lifted.push(turn);
+            continue;
+        }
         match out.last_mut() {
-            Some(last) if last.role == role => last.blocks.extend(blocks),
-            _ => out.push(Turn {
-                role,
-                at: i,
-                blocks,
-            }),
+            Some(last) if merge => last.blocks.extend(turn.blocks),
+            _ => out.push(turn),
         }
     }
-    Ok(out)
+    Ok((out, lifted))
 }
 
 fn convert_user(blocks: &[Value], i: usize, messages: &mut Vec<Value>) -> Result<(), String> {
@@ -637,7 +688,7 @@ mod tests {
     use super::*;
 
     fn chat(req: Value) -> Value {
-        to_chat(req, false).expect("converts").chat
+        to_chat(req, false, false).expect("converts").chat
     }
 
     #[test]
@@ -829,12 +880,13 @@ mod tests {
                 "video",
             ),
         ] {
-            let err = to_chat(req.clone(), false).expect_err(&req.to_string());
+            let err = to_chat(req.clone(), false, false).expect_err(&req.to_string());
             assert!(err.contains(needle), "{req}: {err}");
         }
         assert!(to_chat(
             json!({"model": "m", "messages": [{"role": "user", "content": "x"}]}),
-            true
+            true,
+            false
         )
         .is_ok());
     }
@@ -878,6 +930,53 @@ mod tests {
             req(json!([{"role": "user", "content": "q"}, {"role": "assistant", "content": "p"}]));
         r["continue_final_message"] = json!(false);
         assert_eq!(chat(r)["continue_final_message"], false);
+    }
+
+    /// System turns between the others, as Claude Code sends them.
+    fn inline_system_req() -> Value {
+        json!({"model": "m", "max_tokens": 8, "system": "be brief", "messages": [
+            {"role": "user", "content": "fix the test"},
+            {"role": "system", "content": "<env>"},
+            {"role": "user", "content": "go"},
+            {"role": "assistant", "content": "done"},
+            {"role": "system", "content": [{"type": "text", "text": "<todo>"}]},
+            {"role": "system", "content": "<tip>"},
+        ]})
+    }
+
+    #[test]
+    fn inline_system_turns_stay_in_place_when_the_template_renders_them() {
+        let c = to_chat(inline_system_req(), false, true).unwrap().chat;
+        assert_eq!(
+            c["messages"],
+            json!([
+                {"role": "system", "content": "be brief"},
+                {"role": "user", "content": "fix the test"},
+                {"role": "system", "content": "<env>"},
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": "done"},
+                {"role": "system", "content": "<todo>"},
+                {"role": "system", "content": "<tip>"},
+            ])
+        );
+        assert!(c.get("continue_final_message").is_none());
+    }
+
+    #[test]
+    fn inline_system_turns_join_the_first_otherwise() {
+        let c = to_chat(inline_system_req(), false, false).unwrap().chat;
+        // No system message after the first; the user turns either side of a
+        // lifted one stay apart, and the final assistant turn is not a prefill.
+        assert_eq!(
+            c["messages"],
+            json!([
+                {"role": "system", "content": "be brief\n<env>\n<todo>\n<tip>"},
+                {"role": "user", "content": "fix the test"},
+                {"role": "user", "content": "go"},
+                {"role": "assistant", "content": "done"},
+            ])
+        );
+        assert!(c.get("continue_final_message").is_none());
     }
 
     #[test]
@@ -936,7 +1035,8 @@ mod tests {
         let with = |thinking: Value| {
             let mut r = req(json!([{"role": "user", "content": "q"}]));
             r["thinking"] = thinking;
-            to_chat(r, false).map(|c| c.chat["chat_template_kwargs"]["enable_thinking"].clone())
+            to_chat(r, false, false)
+                .map(|c| c.chat["chat_template_kwargs"]["enable_thinking"].clone())
         };
         assert_eq!(
             with(json!({"type": "adaptive", "display": "omitted"})),
@@ -969,8 +1069,13 @@ mod tests {
     fn rejects_inputs_outside_the_spec() {
         for (messages, needle) in [
             (
-                json!([{"role": "system", "content": "s"}]),
-                "expected user or assistant",
+                json!([{"role": "tool", "content": "t"}]),
+                "expected user, assistant or system",
+            ),
+            (
+                json!([{"role": "user", "content": "q"}, {"role": "system", "content": [
+                    {"type": "image", "source": {"type": "url", "url": "u"}}]}]),
+                "messages.1.content: block type `image`",
             ),
             (
                 json!([{"role": "user", "content": []}]),
@@ -991,7 +1096,7 @@ mod tests {
                 "redacted_thinking",
             ),
         ] {
-            let err = to_chat(req(messages.clone()), false).unwrap_err();
+            let err = to_chat(req(messages.clone()), false, false).unwrap_err();
             assert!(err.contains(needle), "{messages}: {err}");
         }
         // Clients also send `stop_sequences` as a bare string.
