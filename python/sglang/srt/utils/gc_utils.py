@@ -60,6 +60,8 @@ def configure_gc_logging(process_name: str) -> None:
 def freeze_gc(context: str, gc_threshold: Optional[Sequence[int]] = None):
     if gc_threshold is not None:
         gc.set_threshold(*gc_threshold)
+    # Collect first, so cycles that are already garbage are freed, not frozen.
+    gc.collect()
     if not logger.isEnabledFor(logging.DEBUG):
         gc.freeze()
         return
@@ -94,6 +96,5 @@ def refreeze_gc(context: str) -> collections.Counter:
         gc.set_debug(debug)
     frozen_garbage = collections.Counter(map(_describe, gc.garbage[saved:]))
     del gc.garbage[saved:]
-    gc.collect()
     freeze_gc(context)
     return frozen_garbage
