@@ -1796,7 +1796,7 @@ SGLang supports various environment variables that can be used to configure its 
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND</code></td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Skip draft_extend while adaptive spec is at steps=0; saves a draft forward but the draft KV goes stale.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Skip the draft forward while adaptive spec is at steps=0: decode draft_extend, and prefill when DP attention is off. Saves draft compute, but the draft KV of those tokens is never written, so later drafts on them (including radix-cached prefixes) accept less. Verify stays exact.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>

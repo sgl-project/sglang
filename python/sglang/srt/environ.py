@@ -1706,9 +1706,10 @@ class Envs:
     SGLANG_LILICORR_REQUIRE_SAMPLING = EnvBool(False)
     SGLANG_RAGGED_VERIFY_MODE = EnvStr("static")
     SGLANG_TEST_RAGGED_VERIFY_FORCE_UNIFORM_CAPTURE = EnvBool(False)
-    # Skip draft_extend while adaptive spec is at steps=0 (drafting disabled).
-    # Saves the per-step draft forward, but the draft KV goes stale: an upshift
-    # back to steps>0 starts from a cold draft state (low accept until it recovers).
+    # Skip the draft forward while adaptive spec is at steps=0 (drafting disabled),
+    # for decode draft_extend and, without DP attention, for prefill. The draft KV
+    # of those tokens is never written: an upshift to steps>0 drafts from a cold
+    # state, and radix hits on such prefixes keep a lower accept rate.
     SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND = EnvBool(False)
     # Which speculative decisions rank 0 broadcasts to its TP group; narrowing
     # it under live traffic isolates where ranks actually diverge. Comma

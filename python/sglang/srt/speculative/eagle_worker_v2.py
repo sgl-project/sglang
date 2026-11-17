@@ -1367,6 +1367,7 @@ class EAGLEWorkerV2(BaseSpecWorker):
         self.enable_dp_spec_prefill_coordination = (
             envs.SGLANG_ENABLE_DP_SPEC_PREFILL_COORDINATION.get()
         )
+        self.skip_zero_step_draft_prefill = self._can_skip_zero_step_draft_prefill()
 
         # Only the last PP stage runs the draft; other EAGLEWorkerV2 instances
         # return proxies so scheduler dispatch remains rank-uniform.
@@ -1655,6 +1656,16 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 ),
             )
 
+        if (
+            self.skip_zero_step_draft_prefill
+            and self.speculative_num_steps == 0
+            and not batch.forward_mode.is_idle()
+        ):
+            batch_output.next_draft_input = self._skipped_prefill_draft_input(
+                batch=batch, bonus_tokens=batch_output.next_token_ids
+            )
+            return batch_output
+
         # Draft prefill
         with (
             draft_tp_context(self.draft_worker.parallel_layout),
@@ -1814,23 +1825,56 @@ class EAGLEWorkerV2(BaseSpecWorker):
         state (cold recovery), which is the documented cost of this experimental flag.
         """
         next_draft_input: EagleDraftInput = batch_output.next_draft_input
-        bs = batch.seq_lens.shape[0]
+        topk_p, topk_index, hidden_states = self._zero_draft_state(
+            batch.seq_lens.shape[0]
+        )
+        next_draft_input.topk_p = topk_p
+        next_draft_input.topk_index = topk_index
+        if hidden_states is not None:
+            next_draft_input.hidden_states = hidden_states
+
+    @staticmethod
+    def _can_skip_zero_step_draft_prefill() -> bool:
+        # DP ranks pick steps from their local batch size and idle ranks still
+        # run the draft forward with its collectives, so they cannot skip alone.
+        return (
+            envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.get()
+            and get_parallel().attn_dp_size == 1
+        )
+
+    def _skipped_prefill_draft_input(
+        self, batch: ScheduleBatch, bonus_tokens: torch.Tensor
+    ) -> EagleDraftInput:
+        # The prompt's draft KV is never written, and a radix hit on it later
+        # drafts from that hole even at steps>0; verify stays exact.
+        topk_p, topk_index, hidden_states = self._zero_draft_state(
+            batch.seq_lens.shape[0]
+        )
+        return EagleDraftInput(
+            topk_p=topk_p,
+            topk_index=topk_index,
+            hidden_states=hidden_states,
+            bonus_tokens=bonus_tokens,
+            num_tokens_per_req=1,
+            num_tokens_for_logprob_per_req=1,
+            cuda_graph_compatible=not self.draft_worker.seed_dsa_topk_from_draft_extend,
+        )
+
+    def _zero_draft_state(
+        self, bs: int
+    ) -> tuple[torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
         device = self.device
-        next_draft_input.topk_p = torch.zeros(
-            (bs, self.topk), dtype=torch.float32, device=device
-        )
-        next_draft_input.topk_index = torch.zeros(
-            (bs, self.topk), dtype=torch.int64, device=device
-        )
+        topk_p = torch.zeros((bs, self.topk), dtype=torch.float32, device=device)
+        topk_index = torch.zeros((bs, self.topk), dtype=torch.int64, device=device)
         hidden_size, hidden_dtype = get_draft_recurrent_hidden_state_spec(
             self.draft_worker.draft_runner
         )
-        if hidden_size is not None:
-            next_draft_input.hidden_states = torch.zeros(
-                (bs, hidden_size),
-                dtype=hidden_dtype,
-                device=device,
-            )
+        hidden_states = (
+            None
+            if hidden_size is None
+            else torch.zeros((bs, hidden_size), dtype=hidden_dtype, device=device)
+        )
+        return topk_p, topk_index, hidden_states
 
     def on_verify_complete_cpu(
         self, num_correct_drafts_per_req: list[int], batch_size: int = 0

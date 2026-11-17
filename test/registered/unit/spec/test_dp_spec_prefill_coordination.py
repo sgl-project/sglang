@@ -321,6 +321,7 @@ class TestDPSpecPrefillCoordinationWorker(CustomTestCase):
                 worker = object.__new__(EAGLEWorkerV2)
                 worker.device = "cpu"
                 worker.topk = 1
+                worker.skip_zero_step_draft_prefill = False
                 worker.speculative_algorithm = SpeculativeAlgorithm.EAGLE
                 worker._target_worker = SimpleNamespace(forward_batch_generation=target)
                 worker._draft_worker = SimpleNamespace(
@@ -417,6 +418,57 @@ class TestDPSpecPrefillCoordinationWorker(CustomTestCase):
         result = worker.forward_batch_generation(batch)
         self.assertIs(result, worker._forward_prefill_batch.return_value)
         worker._forward_dp_spec_prefill_coordination.assert_not_called()
+
+    def test_zero_step_draft_prefill_skip_needs_single_dp_rank(self):
+        """DP ranks would diverge on the draft forward's collectives if one skipped."""
+        with envs.SGLANG_SPEC_SKIP_ZERO_STEP_DRAFT_EXTEND.override(True):
+            for attn_dp_size, expected in ((1, True), (2, False)):
+                with patch(
+                    f"{WORKER_MODULE}.get_parallel",
+                    return_value=SimpleNamespace(attn_dp_size=attn_dp_size),
+                ):
+                    self.assertEqual(
+                        EAGLEWorkerV2._can_skip_zero_step_draft_prefill(), expected
+                    )
+
+    def test_zero_step_prefill_skip_returns_mergeable_draft_input(self):
+        """The skipped prefill still hands the next round a full-shape draft input."""
+        bs = 3
+        next_token_ids = torch.tensor([5, 6, 7])
+        result = SimpleNamespace(
+            new_seq_lens=None,
+            next_token_ids=next_token_ids,
+            iteration_ids=None,
+        )
+        worker = object.__new__(EAGLEWorkerV2)
+        worker.device = "cpu"
+        worker.topk = 1
+        worker.speculative_num_steps = 0
+        worker.skip_zero_step_draft_prefill = True
+        worker.speculative_algorithm = SpeculativeAlgorithm.EAGLE
+        worker._target_worker = SimpleNamespace(
+            forward_batch_generation=lambda batch, **kwargs: result
+        )
+        extend = MagicMock()
+        worker._draft_worker = SimpleNamespace(
+            draft_runner=SimpleNamespace(),
+            seed_dsa_topk_from_draft_extend=False,
+            _draft_extend_for_prefill=extend,
+        )
+        batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND, seq_lens=torch.tensor([9, 10, 11])
+        )
+        with patch(
+            f"{WORKER_MODULE}.get_draft_recurrent_hidden_state_spec",
+            return_value=(16, torch.float32),
+        ):
+            out = worker._forward_prefill_batch(batch)
+        extend.assert_not_called()
+        draft_input = out.next_draft_input
+        self.assertIs(draft_input.bonus_tokens, next_token_ids)
+        self.assertEqual(draft_input.topk_p.shape, (bs, 1))
+        self.assertEqual(draft_input.topk_index.shape, (bs, 1))
+        self.assertEqual(draft_input.hidden_states.shape, (bs, 16))
 
 
 if __name__ == "__main__":
