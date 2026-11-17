@@ -232,6 +232,39 @@ fn floats_print_as_python_repr() {
     }
 }
 
+/// Python `_dataclass_to_string_truncated` of a list: every item is cut in
+/// turn, and a dict item's keys are quoted as they are.
+#[test]
+fn lists_print_as_python_sequence_to_string_truncated() {
+    use serde_json::json;
+    for (value, max_length, python) in [
+        (json!([1, 2.5, true, null]), 4, "[1, 2.5, True, None]"),
+        (json!(["abcdefgh", "xy"]), 4, "['ab' ... 'gh', 'xy']"),
+        (
+            json!(["abcdef", "b", "c", "d", "uvwxyz"]),
+            4,
+            "['ab' ... 'ef', 'b'] ... ['d', 'uv' ... 'yz']",
+        ),
+        (json!([[1, 2, 3, 4, 5]]), 4, "[[1, 2] ... [4, 5]]"),
+        (
+            json!([{"k": "abcdefgh", "it's": 1, "n": [1, 2, 3, 4, 5]}]),
+            4,
+            "[{'k': 'ab' ... 'gh', 'it's': 1, 'n': [1, 2] ... [4, 5]}]",
+        ),
+        (json!([]), 0, "[]"),
+        (json!(["ab"]), 0, "[] ... ['' ... 'ab']"),
+        (
+            json!([{"watermark": {"key": "k1", "enabled": true}, "watermark_key": "s"}]),
+            16,
+            "[{'watermark': {'key': '<redacted>', 'enabled': True}, 'watermark_key': '<redacted>'}]",
+        ),
+    ] {
+        let mut out = String::new();
+        write_truncated(&mut out, &value, max_length, false);
+        assert_eq!(out, python, "{value} at {max_length}");
+    }
+}
+
 fn chunk(rid: &Rid, text: &str, ids: &[i64], finish: Option<FinishReason>) -> ChunkEvent {
     ChunkEvent {
         rid: rid.clone(),
