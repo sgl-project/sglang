@@ -40,9 +40,7 @@ from sglang.srt.distributed.parallel_state import graph_capture
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.kernel_plugins.nvidia.binding import megakernel_verify_variants
-from sglang.srt.layers.attention.base_attn_backend import (
-    SharedReadEnds,
-)
+from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.dsa.utils import is_dsa_enable_prefill_cp
 from sglang.srt.layers.attention.graph_variants import (
     DSV41_EARLY_VERIFY_VARIANTS,
@@ -392,7 +390,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if model_runner.spec_algorithm.is_speculative():
             if self.model_runner.is_draft_worker:
                 # Draft workers can use TARGET_VERIFY mode.
-                if not self.model_runner.spec_algorithm.supports_target_verify_for_draft():
+                if (
+                    not self.model_runner.spec_algorithm.supports_target_verify_for_draft()
+                ):
                     raise RuntimeError("This should not happen")
             self.capture_forward_mode = ForwardMode.TARGET_VERIFY
         elif self.is_dllm:
@@ -1426,13 +1426,20 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
 
         # Sanity-check: --debug-cuda-graph requires breakable backend.
         if get_exec().graph.debug_cuda_graph:
-            assert isinstance(self.backend, BreakableCudaGraphBackend), (
-                "Breakable CUDA graph is required for --debug-cuda-graph"
-            )
+            assert isinstance(
+                self.backend, BreakableCudaGraphBackend
+            ), "Breakable CUDA graph is required for --debug-cuda-graph"
 
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
             bs, num_tokens=num_tokens
         )
+        if getattr(self.model_runner.model, "mtp_prefix_graph_preconditioned", False):
+            forward_batch.mtp_prefix_scheduler_ready = True
+            forward_batch.mtp_prefix_preconditioned = True
+            if not hasattr(attn_backend, "mtp_anchor_fa3"):
+                raise RuntimeError(
+                    "DMTP draft capture requires its anchor-relative FA3 adapter"
+                )
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
         # DeepEP adapter, …) so they must run inside the same ForwardContext
@@ -1914,9 +1921,9 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if ids is None:
             return
         n = ids.shape[0]
-        assert n <= bs <= self._verify_checkpoint_ids.shape[0], (
-            f"checkpoint ids do not fit the replay: {n=} {bs=}"
-        )
+        assert (
+            n <= bs <= self._verify_checkpoint_ids.shape[0]
+        ), f"checkpoint ids do not fit the replay: {n=} {bs=}"
         self._verify_checkpoint_ids[:n].copy_(ids, non_blocking=True)
         if n < bs:
             self._verify_checkpoint_ids[n:bs].zero_()
