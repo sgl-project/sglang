@@ -40,7 +40,6 @@ from sglang.multimodal_gen.registry import (
     _get_config_info,
 )
 from sglang.multimodal_gen.runtime.models.dits import cosmos_dreams
-from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
     CosmosDreamsKVSlot,
     CosmosDreamsTransformer,
@@ -86,6 +85,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.c
     SelectedKVHistory,
     new_kv_history,
 )
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.server_args import ServerArgs
 from sglang.multimodal_gen.runtime.warmup_request_builder import (
     _lighter_valid_num_frames,
@@ -1842,10 +1842,16 @@ class TestCosmosDreamsJointAttentionBackendDefault(unittest.TestCase):
 
     def _default(self, *, is_cuda=True, is_sm120=False, is_blackwell=False):
         with (
-            mock.patch.object(cosmos_dreams.current_platform, "is_cuda", return_value=is_cuda),
-            mock.patch.object(cosmos_dreams.current_platform, "is_sm120", return_value=is_sm120),
             mock.patch.object(
-                cosmos_dreams.current_platform, "is_blackwell", return_value=is_blackwell
+                cosmos_dreams.current_platform, "is_cuda", return_value=is_cuda
+            ),
+            mock.patch.object(
+                cosmos_dreams.current_platform, "is_sm120", return_value=is_sm120
+            ),
+            mock.patch.object(
+                cosmos_dreams.current_platform,
+                "is_blackwell",
+                return_value=is_blackwell,
             ),
         ):
             return cosmos_dreams.default_joint_attention_backend()
@@ -1854,9 +1860,7 @@ class TestCosmosDreamsJointAttentionBackendDefault(unittest.TestCase):
         self.assertIs(self._default(is_blackwell=True), AttentionBackendEnum.FA)
 
     def test_sm12x_prefers_flashinfer_fa2(self):
-        self.assertIs(
-            self._default(is_sm120=True), AttentionBackendEnum.FLASHINFER_FA2
-        )
+        self.assertIs(self._default(is_sm120=True), AttentionBackendEnum.FLASHINFER_FA2)
 
     def test_other_cuda_parts_and_non_cuda_keep_the_platform_default(self):
         self.assertIsNone(self._default())
