@@ -87,11 +87,6 @@ RUST_SERVER_IGNORED_BY_DESIGN: Dict[str, str] = {
     "enable_http_worker_reuseport": "Python HTTP server (multi-worker) setting.",
     "grpc_worker_threads": "Python gRPC server thread pool.",
     # Routes the Rust server does not serve: their clients get a 404.
-    "SGLANG_OLLAMA_ROOT_ROUTE": "Ollama routes are not served.",
-    "SGLANG_OLLAMA_CHAT_ROUTE": "Ollama routes are not served.",
-    "SGLANG_OLLAMA_GENERATE_ROUTE": "Ollama routes are not served.",
-    "SGLANG_OLLAMA_TAGS_ROUTE": "Ollama routes are not served.",
-    "SGLANG_OLLAMA_SHOW_ROUTE": "Ollama routes are not served.",
     "asr_max_concurrent_sessions": "/v1/realtime is not served.",
     "enable_response_store": "/v1/responses is not served.",
     "tool_server": "/v1/responses is not served.",
