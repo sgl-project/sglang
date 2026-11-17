@@ -9,6 +9,7 @@ import json
 import math
 import os
 import random
+import re
 import tempfile
 import time
 import unittest
@@ -37,6 +38,26 @@ def require_model_snapshot(repo_id: str, filename: str = "config.json") -> str:
     # Hub errors derive from these: offline cache miss, gated or missing repo.
     except (OSError, ValueError) as error:
         raise unittest.SkipTest(f"model_unavailable: {repo_id} ({error})") from error
+
+
+def mha_chunk_rows(name: str) -> int:
+    """K and V rows, one per token and layer, of an MHA chunk object."""
+    coordinate = name[: -len(".bin")].split("_", 2)[2]
+    first, last = re.match(r"[LD](\d+)-(\d+)", coordinate).groups()
+    return (int(last) - int(first)) * 2 * PAGE_SIZE
+
+
+def row_cosines(a: bytes, b: bytes, rows: int):
+    """Cosine similarity of each of `rows` equal slices of two bfloat16 objects."""
+    import numpy as np
+
+    def decode(data):
+        bits = np.frombuffer(data, dtype="<u2").astype(np.uint32) << 16
+        return bits.view(np.float32).astype(np.float64).reshape(rows, -1)
+
+    x, y = decode(a), decode(b)
+    norms = np.linalg.norm(x, axis=1) * np.linalg.norm(y, axis=1)
+    return (x * y).sum(axis=1) / np.where(norms > 0, norms, 1.0)
 
 
 class HiCacheUnifiedSpecStorageMixin:
@@ -91,9 +112,12 @@ class HiCacheUnifiedSpecStorageMixin:
 
     @classmethod
     def launch_server(
-        cls, spec_args: List[str], extra_args: Optional[List[str]] = None
+        cls, spec_args: List[str], extra_args: Optional[List[str]] = None, log=None
     ):
-        """Start a server on the class's L3 store, replacing a running one."""
+        """Start a server on the class's L3 store, replacing a running one.
+
+        `log`, a text sink, also receives what the server prints.
+        """
         cls.stop_server()
         default_port = int(DEFAULT_URL_FOR_TEST.rsplit(":", 1)[1])
         cls.base_url = f"http://127.0.0.1:{find_available_port(default_port)}"
@@ -134,6 +158,7 @@ class HiCacheUnifiedSpecStorageMixin:
             timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH,
             other_args=args,
             env=env,
+            return_stdout_stderr=(log, log) if log is not None else None,
         )
 
     @classmethod
@@ -195,12 +220,20 @@ class HiCacheUnifiedSpecStorageMixin:
         meta = result["meta_info"]
         return meta["spec_verify_ct"], meta["spec_accept_length"]
 
-    def generate(self, input_ids: List[int], cache_salt: Optional[str] = None) -> Dict:
+    def generate(
+        self,
+        input_ids: List[int],
+        cache_salt: Optional[str] = None,
+        max_new_tokens: Optional[int] = None,
+    ) -> Dict:
+        """One request, or one batch when `input_ids` is a list of prompts."""
+        if max_new_tokens is None:
+            max_new_tokens = self.max_new_tokens
         body = {
             "input_ids": input_ids,
             "sampling_params": {
                 "temperature": 0,
-                "max_new_tokens": self.max_new_tokens,
+                "max_new_tokens": max_new_tokens,
                 "ignore_eos": True,
             },
             "return_logprob": True,
@@ -222,6 +255,18 @@ class HiCacheUnifiedSpecStorageMixin:
         response = requests.get(f"{self.base_url}/server_info", timeout=30)
         response.raise_for_status()
         return response.json()
+
+    def assert_device_hit(self, result: Dict, pages: Optional[int] = None) -> Dict:
+        details = result["meta_info"].get("cached_tokens_details") or {}
+        expected = (pages or self.prompt_pages) * PAGE_SIZE
+        self.assertEqual(details.get("device"), expected, details)
+        return result
+
+    def compute_and_hit(self, input_ids: List[int], salt: str) -> Dict:
+        """Compute a prompt, then return its device-cache hit."""
+        computed = self.generate(input_ids, salt)
+        self.assertEqual(computed["meta_info"]["cached_tokens"], 0)
+        return self.assert_device_hit(self.generate(input_ids, salt))
 
     def assert_storage_hit(self, result: Dict, pages: Optional[int] = None):
         details = result["meta_info"].get("cached_tokens_details") or {}
@@ -292,11 +337,7 @@ class HiCacheUnifiedSpecStorageMixin:
         it bit for bit. Between the two, another prompt of the same length
         is computed, so device slots no longer hold what the first run left.
         """
-        computed = self.generate(input_ids, salt)
-        self.assertEqual(computed["meta_info"]["cached_tokens"], 0)
-        device_hit = self.generate(input_ids, salt)
-        details = device_hit["meta_info"]["cached_tokens_details"]
-        self.assertEqual(details["device"], self.prompt_pages * PAGE_SIZE, details)
+        device_hit = self.compute_and_hit(input_ids, salt)
         self.flush_cache()
         self.generate(self.scrub_prompt(seed + 1), uuid.uuid4().hex)
         self.flush_cache()
@@ -327,6 +368,47 @@ class HiCacheUnifiedSpecStorageMixin:
                 return self.l3_objects()
             time.sleep(1)
         self.fail("the L3 store kept changing")
+
+    def use_new_store(self) -> str:
+        """Point the class at another, empty file store until the test ends.
+
+        Returns the directory of the store used so far.
+        """
+        directory = tempfile.TemporaryDirectory(prefix="hicache_unified_spec_")
+        previous = self.storage_path
+        self.addCleanup(directory.cleanup)
+        self.addCleanup(setattr, type(self), "storage_path", previous)
+        # Runs first: no server may write into a store that is being removed.
+        self.addCleanup(self.stop_server)
+        type(self).storage_path = directory.name
+        return previous
+
+    def zero_objects(self, names):
+        """Overwrite objects of the file backend with zeros of the same size."""
+        for name in names:
+            path = os.path.join(self.storage_path, name)
+            with open(path, "r+b") as f:
+                f.write(bytes(os.path.getsize(path)))
+
+    def matching_rows(self, names, store_a: str, store_b: str) -> tuple:
+        """Compare same-named MHA chunk objects of two stores row by row.
+
+        Returns (share of rows whose cosine similarity is at least 0.999,
+        lowest cosine). Rows computed twice from the same tokens differ by
+        rounding only; a missing or misplaced row has nothing in common.
+        """
+        matching, total, lowest = 0, 0, 1.0
+        for name in sorted(names):
+            with open(os.path.join(store_a, name), "rb") as f:
+                a = f.read()
+            with open(os.path.join(store_b, name), "rb") as f:
+                b = f.read()
+            cosines = row_cosines(a, b, mha_chunk_rows(name))
+            matching += int((cosines >= 0.999).sum())
+            total += len(cosines)
+            lowest = min(lowest, float(cosines.min()))
+        self.assertGreater(total, 0)
+        return matching / total, lowest
 
     def l3_objects(self) -> Dict[str, tuple]:
         """name -> (size, sha256) of every object of the file backend."""
