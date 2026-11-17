@@ -221,7 +221,7 @@ jobs:
     #
     # !cancelled() so a skipped call-gate does not take this job with it, since a
     # docs-only PR still installs sglang in every stage.
-    if: |
+    if: &build-gate |
       !cancelled() &&
       needs.check-changes.result == 'success' &&
       (github.event_name != 'pull_request' ||
@@ -234,24 +234,13 @@ jobs:
     with:
       runs_on: ubuntu-22.04
       git_ref: ${{ inputs.git_ref || '' }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true }}
     secrets: inherit
 
   # gb300 is Grace, and PyO3 modules are portable across neither arch nor
   # interpreter, so it can use nothing the job above builds.
   rust-ext-build-aarch64:
     needs: [check-changes, call-gate]
-    # Same gate as rust-ext-build: every main-ref run has to seed the cache, and a
-    # docs-only PR still installs sglang on gb300.
-    if: |
-      !cancelled() &&
-      needs.check-changes.result == 'success' &&
-      (github.event_name != 'pull_request' ||
-       needs.check-changes.outputs.multimodal_gen != 'true' ||
-       needs.check-changes.outputs.main_package == 'true' ||
-       needs.check-changes.outputs.jit_kernel == 'true' ||
-       needs.check-changes.outputs.sgl_kernel == 'true') &&
-      (needs.call-gate.result == 'success' || needs.call-gate.result == 'skipped')
+    if: *build-gate
     uses: ./.github/workflows/_pr-test-rust-ext-build.yml
     with:
       runs_on: ubuntu-22.04-arm
@@ -259,7 +248,25 @@ jobs:
       artifact_name: rust-ext-aarch64
       cache_key_prefix: rust-ext-aarch64-cp312
       git_ref: ${{ inputs.git_ref || '' }}
-      skip_pr_test_health_check: ${{ inputs.skip_pr_test_health_check == true || inputs.test_parallel_dispatch == true || inputs.run_all_tests == true }}
+    secrets: inherit
+
+  sgl-router-build:
+    needs: [check-changes, call-gate]
+    if: *build-gate
+    uses: ./.github/workflows/_pr-test-sgl-router-build.yml
+    with:
+      runs_on: ubuntu-22.04
+      git_ref: ${{ inputs.git_ref || '' }}
+    secrets: inherit
+
+  sgl-router-build-aarch64:
+    needs: [check-changes, call-gate]
+    if: *build-gate
+    uses: ./.github/workflows/_pr-test-sgl-router-build.yml
+    with:
+      runs_on: ubuntu-22.04-arm
+      artifact_name: sgl-router-aarch64
+      git_ref: ${{ inputs.git_ref || '' }}
     secrets: inherit
 
   call-sgl-kernel-tests:
@@ -349,7 +356,7 @@ jobs:
 
   base-b-test:
     name: base-b-test-${{ matrix.runner_config }}
-    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, rust-ext-build]
+    needs: [check-changes, call-gate, wait-for-base-a, sgl-kernel-build-wheels, rust-ext-build, sgl-router-build]
     # A cancelled need is neither failure() nor cancelled(), so check it explicitly.
     if: ${{ !failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' }}
     strategy:
@@ -371,6 +378,7 @@ jobs:
       run_timeout_minutes: ${{ matrix.run_timeout }}
       timeout_per_file: ${{ matrix.timeout_per_file }}
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+      sgl_router_artifact: ${{ needs.sgl-router-build.outputs.artifact_name }}
     secrets: inherit
 
   call-multimodal-gen-tests:
@@ -384,6 +392,8 @@ jobs:
     with:
       runs_on_map: ${{ needs.check-changes.outputs.runs_on_map }}
       multimodal_gen: ${{ needs.check-changes.outputs.multimodal_gen }}
+      multimodal_gen_server: ${{ needs.check-changes.outputs.multimodal_gen_server }}
+      diffusion_sm103: ${{ needs.check-changes.outputs.diffusion_sm103 }}
       sgl_kernel: ${{ needs.check-changes.outputs.sgl_kernel }}
       continue_on_error: ${{ needs.check-changes.outputs.continue_on_error }}
       git_ref: ${{ inputs.git_ref || '' }}
@@ -396,7 +406,7 @@ jobs:
     name: base-c-test-${{ matrix.runner_config }}
     # wait-for-base-a is listed only to read its result: when it is cancelled,
     # wait-for-base-b ends `skipped`, which alone would let this stage through.
-    needs: [check-changes, call-gate, wait-for-base-a, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build]
+    needs: [check-changes, call-gate, wait-for-base-a, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build, sgl-router-build]
     if: ${{ !failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.wait-for-base-b.result != 'cancelled' }}
     strategy:
       fail-fast: false
@@ -415,13 +425,14 @@ jobs:
       run_timeout_minutes: ${{ matrix.run_timeout }}
       timeout_per_file: ${{ matrix.timeout_per_file }}
       rust_ext_artifact: ${{ needs.rust-ext-build.outputs.artifact_name }}
+      sgl_router_artifact: ${{ needs.sgl-router-build.outputs.artifact_name }}
     secrets: inherit
 
   # Separate only because `needs` cannot vary per matrix row: this stage takes
   # the aarch64 build, and neither table should wait on the other's.
   base-c-test-aarch64:
     name: base-c-test-${{ matrix.runner_config }}
-    needs: [check-changes, call-gate, wait-for-base-a, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build-aarch64]
+    needs: [check-changes, call-gate, wait-for-base-a, wait-for-base-b, sgl-kernel-build-wheels, rust-ext-build-aarch64, sgl-router-build-aarch64]
     if: ${{ !failure() && !cancelled() && needs.wait-for-base-a.result != 'cancelled' && needs.wait-for-base-b.result != 'cancelled' }}
     strategy:
       fail-fast: false
@@ -439,6 +450,7 @@ jobs:
       run_timeout_minutes: ${{ matrix.run_timeout }}
       timeout_per_file: ${{ matrix.timeout_per_file }}
       rust_ext_artifact: ${{ needs.rust-ext-build-aarch64.outputs.artifact_name }}
+      sgl_router_artifact: ${{ needs.sgl-router-build-aarch64.outputs.artifact_name }}
     secrets: inherit
 
   # List every build and test job: `skipped` passes here, so an omission turns that
@@ -455,6 +467,8 @@ jobs:
 
         rust-ext-build,
         rust-ext-build-aarch64,
+        sgl-router-build,
+        sgl-router-build-aarch64,
 
         wait-for-base-a,
         wait-for-base-b,

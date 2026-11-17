@@ -25,6 +25,7 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import InsertParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
+from sglang.srt.mem_cache.kv.alloc.demand import KVDemand
 from sglang.srt.mem_cache.kv.alloc.forward_steps import (
     ForwardLaunch,
     forward_steps_of,
@@ -36,7 +37,8 @@ from sglang.test.tree_slots import storage_tree_slots
 from sglang.test.unified_allocator_fixtures import (
     UnifiedGeometry,
     build_unified_bundle,
-    pin_every_band,
+    hold_every_band,
+    release_every_band,
     setup_allocator_context,
 )
 
@@ -137,7 +139,6 @@ class BuilderAdapter:
         self.steps = forward_steps_of(self.allocator)
         self.launches: List[ForwardLaunch] = []
         self.tree = self._build_tree() if config.chain == "swa" else None
-        pin_every_band(self.allocator, lambda: not self.gate_open)
 
     def _build_tree(self) -> UnifiedRadixCache:
         return UnifiedRadixCache(
@@ -169,6 +170,7 @@ class BuilderAdapter:
     # -- operations; each returns the ids it produced, or None on refusal --
 
     def extend(self, tokens: List[int], n: int) -> Optional[List[int]]:
+        self._sync_hold()
         if self.page_size == 1:
             # Production allocates page-1 pools token by token (`alloc_token_slots`).
             return self.alloc(n)
@@ -186,6 +188,7 @@ class BuilderAdapter:
         return None if out is None else out.tolist()
 
     def decode(self, token_lists: List[List[int]]) -> Optional[List[int]]:
+        self._sync_hold()
         if self.page_size == 1:
             return self.alloc(len(token_lists))
         seq = torch.tensor(
@@ -201,6 +204,7 @@ class BuilderAdapter:
         return None if out is None else out.tolist()
 
     def alloc(self, n: int) -> Optional[List[int]]:
+        self._sync_hold()
         out = self.allocator.alloc(n)
         return None if out is None else out.tolist()
 
@@ -224,6 +228,7 @@ class BuilderAdapter:
             self.allocator.free_group_end()
 
     def state_alloc(self, n: int) -> Optional[List[int]]:
+        self._sync_hold()
         out = self.state_allocator.alloc(n)
         return None if out is None else out.tolist()
 
@@ -233,19 +238,35 @@ class BuilderAdapter:
         )
 
     def flush(self, member: Optional[str]) -> None:
+        self._sync_hold()
         if member is None:
             self.allocator.flush_opportunistic()
         else:
             self._member(member).flush_for_allocation()
 
     def ensure(self, full: int, window: int) -> bool:
-        return bool(self.allocator.ensure_capacity(full, window))
+        self._sync_hold()
+        names = self.allocator.window_pool_names()
+        return bool(
+            self.allocator.ensure_capacity(KVDemand(full, dict.fromkeys(names, window)))
+        )
 
     def prepare_state(self, n: int) -> None:
-        self.allocator.prepare_mamba_allocation(n)
+        self._sync_hold()
+        # Lay the chain out so ``n`` state slots then fit in place.
+        state = self.allocator.mamba_allocator.sub_pool_name
+        self.allocator.lay_out_for({state: n})
 
     def gate(self, open_: bool) -> None:
         self.gate_open = open_
+        self._sync_hold()
+
+    def _sync_hold(self) -> None:
+        """A closed gate holds every band's live pages, re-taken before each
+        operation so pages freed meanwhile drop out and new ones join."""
+        release_every_band(self.allocator)
+        if not self.gate_open:
+            hold_every_band(self.allocator)
 
     def forward(self, ids: List[int]) -> None:
         event = FakeEvent()
@@ -269,6 +290,7 @@ class BuilderAdapter:
         self.launches.clear()
 
     def reserve(self, member: str, n: int) -> Optional[List[int]]:
+        self._sync_hold()
         out = self._member(member).alloc_physical(n)
         return None if out is None else out.tolist()
 
@@ -282,7 +304,10 @@ class BuilderAdapter:
         )
 
     def evict(self, n: int) -> bool:
-        return bool(self.allocator.evict_to_free_tokens(self.tree, n))
+        self._sync_hold()
+        from sglang.srt.mem_cache.capacity import evict_to_free_tokens
+
+        return bool(evict_to_free_tokens(self.tree, self.allocator, n))
 
     def _member(self, name: str):
         return next(m for m in self.members() if m.sub_pool_name == name)
@@ -306,7 +331,6 @@ class BuilderAdapter:
                 None if m.free_virtual_ids is None else m.free_virtual_ids.tolist()
             )
             out[f"{p}.available"] = m.available_size()
-            out[f"{p}.schedulable"] = m.schedulable_available_size()
         a = self.allocator
         out["available"] = a.available_size()
         if self.config.chain in WINDOW_CHAINS:

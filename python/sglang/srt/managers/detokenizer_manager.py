@@ -29,7 +29,6 @@ from sglang.srt.beam_search.output import (
     decode_beam_search_output,
     is_beam_search_batch,
 )
-from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
 from sglang.srt.hf_transformers import get_tokenizer
 from sglang.srt.kv_canary.perturb.detokenizer import (
@@ -64,7 +63,12 @@ from sglang.srt.runtime_context import (
     publish,
 )
 from sglang.srt.server_args import PortArgs, ServerArgs
-from sglang.srt.utils import configure_logger, freeze_gc, kill_itself_when_parent_died
+from sglang.srt.utils import (
+    configure_gc_logging,
+    configure_logger,
+    freeze_gc,
+    kill_itself_when_parent_died,
+)
 from sglang.srt.utils.common import TypeBasedDispatcher
 from sglang.srt.utils.network import get_zmq_socket
 from sglang.srt.utils.patch_tokenizer import decode_without_hf_kwargs
@@ -141,6 +145,7 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             soft=True,
             test_stuck_time=envs.SGLANG_TEST_STUCK_DETOKENIZER.get(),
         )
+        configure_gc_logging("Detokenizer Manager")
 
         if get_observability().enable_metrics:
             start_cpu_monitor_thread("detokenizer")
@@ -476,10 +481,6 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
     def handle_configure_logging_req(self, recv_req: ConfigureLoggingReq):
         if recv_req.log_level is not None:
             logging.getLogger().setLevel(recv_req.log_level.upper())
-
-
-def is_health_check_request(rid: Optional[str]) -> bool:
-    return isinstance(rid, str) and rid.startswith(HEALTH_CHECK_RID_PREFIX)
 
 
 def run_detokenizer_process(
