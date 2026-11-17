@@ -49,9 +49,9 @@ MUSE_SPARK_DRAFT_PATH = os.environ.get(
     "MUSE_SPARK_DRAFT_PATH", "RadixArk/Muse-Spark-Open-DFlash2"
 )
 SERVER_LAUNCH_TIMEOUT = 9000
-# Measured 0.790 on rocm10 (100 samples, real draft acceptance); measured -
-# 0.05, as for the GSM8K gate.
-BASELINE_ACCURACY = 0.74
+# Measured 0.790 and 0.750 in two rocm10 runs (100 samples, real draft
+# acceptance); the lower score - 0.05, since 100 samples swing by ~0.04.
+BASELINE_ACCURACY = 0.70
 TP_SIZE = 8
 MAX_RUNNING_REQUESTS = 64
 
