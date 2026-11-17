@@ -2114,6 +2114,13 @@ class OpenAIServingChat(OpenAIServingBase):
             extra_template_kwargs = {}
             if request.reasoning_effort is not None:
                 extra_template_kwargs["reasoning_effort"] = request.reasoning_effort
+            if request.response_format is not None:
+                # Chat templates that state the requested format read it here.
+                extra_template_kwargs["response_format"] = (
+                    request.response_format.model_dump(
+                        mode="json", by_alias=True, exclude_none=True
+                    )
+                )
             if request.chat_template_kwargs:
                 extra_template_kwargs.update(request.chat_template_kwargs)
 

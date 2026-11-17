@@ -75,6 +75,8 @@ from pydantic import (
 )
 from typing_extensions import Literal
 
+from sglang.srt.sampling.sampling_params import set_request_answer_allows_tools
+
 try:
     from xgrammar import StructuralTag
 except:
@@ -1373,6 +1375,13 @@ class ChatCompletionRequest(PDRoutingFields):
                 response_format.model_dump(by_alias=True)
             )
 
+        set_request_answer_allows_tools(
+            sampling_params,
+            "json_schema" in sampling_params
+            and bool(self.tools)
+            and self.tool_choice != "none",
+        )
+
         # Check if there are already existing output constraints
         has_existing_constraints = (
             sampling_params.get("regex")
@@ -2242,6 +2251,23 @@ class ResponsesRequest(PDRoutingFields):
     def has_json_schema_constraint(self) -> bool:
         return self._json_schema_from_text_format(self.text) is not None
 
+    def chat_response_format(self) -> Optional[ResponseFormat]:
+        """``text.format`` in the Chat Completions ``response_format`` shape."""
+        response_format = self.text.format if self.text is not None else None
+        if isinstance(response_format, ResponseFormatJSONObject):
+            return ResponseFormat(type="json_object")
+        if isinstance(response_format, ResponseFormatTextJSONSchemaConfig):
+            return ResponseFormat(
+                type="json_schema",
+                json_schema=JsonSchemaResponseFormat(
+                    name=response_format.name,
+                    description=response_format.description,
+                    schema=response_format.schema_,
+                    strict=response_format.strict,
+                ),
+            )
+        return None
+
     def effective_tool_choice(self) -> Union[str, Dict[str, Any]]:
         """``tool_choice`` reduced to what the server can actually honor: of the
         object forms only a named ``function`` / ``custom`` tool survives, the
@@ -2324,6 +2350,9 @@ class ResponsesRequest(PDRoutingFields):
         json_schema = self._json_schema_from_text_format(self.text)
         if json_schema is not None:
             params["json_schema"] = json_schema
+            set_request_answer_allows_tools(
+                params, bool(self.tools) and self.tool_choice != "none"
+            )
 
         has_existing_constraints = (
             params.get("regex")
