@@ -5762,6 +5762,8 @@ class Scheduler(
             return_hidden_states=batch.return_hidden_states,
         )
         self.copy_stream.wait_stream(self.forward_stream)
+        if batch_result.side_stream_done is not None:
+            self.copy_stream.wait_event(batch_result.side_stream_done)
         with self.copy_stream_ctx:
             if not self.enable_async_d2h_copy:
                 copy_fn()
