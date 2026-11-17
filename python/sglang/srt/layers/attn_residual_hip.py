@@ -11,6 +11,7 @@ from sglang.kernels.ops.attention import k3_attn_res_read_hip
 from sglang.srt.layers.attn_residual import AttnResidual, get_cw
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
+from sglang.srt.models.utils import bind_or_assign
 
 if TYPE_CHECKING:
     from sglang.kernels.ops.communication.k3_ll_comm_hip import LLComm
@@ -51,12 +52,15 @@ class StagedRead(msgspec.Struct, frozen=True):
         return None
 
 
-def get_fp32_norm_weight(norm: RMSNorm) -> torch.Tensor:
+def get_fp32_norm_weight(norm: RMSNorm, *, refresh: bool = False) -> torch.Tensor:
     """Cached fp32 copy of an output RMSNorm weight, the dtype the fused gfx950
     collective reads consume."""
     weight = getattr(norm, "_attn_res_fp32_weight", None)
-    if weight is None:
-        weight = norm._attn_res_fp32_weight = norm.weight.float().contiguous()
+    if weight is None or refresh:
+        # Refresh in place: captured graphs retain the original cache storage.
+        weight = norm._attn_res_fp32_weight = bind_or_assign(
+            weight, norm.weight.float().contiguous()
+        )
     return weight
 
 
