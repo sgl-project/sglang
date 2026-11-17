@@ -320,7 +320,6 @@ jobs:
 
   # The router the PD tests in nightly-4-npu-a3 and nightly-poc-multi-node-tests launch.
   sgl-router-build-aarch64:
-    if: false # TEMP: only the GLM-5.3 DCP/PCP 32p single-point accuracy suite is under validation
     needs: [set-image-config]
     uses: ./.github/workflows/_pr-test-sgl-router-build.yml
     with:
@@ -441,7 +440,7 @@ jobs:
   tmp-validate-glm53-rotate:
     name: tmp-glm53-rotate-accuracy
     if: ${{ !cancelled() }}
-    needs: [set-image-config]
+    needs: [set-image-config, sgl-router-build-aarch64]
     strategy:
       fail-fast: false
       matrix:
@@ -467,7 +466,7 @@ jobs:
       transformers_version: ''
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
       accuracy_dataset: ${{ needs.set-image-config.outputs.accuracy_dataset }}
-      sgl_router_artifact: ''
+      sgl_router_artifact: ${{ needs.sgl-router-build-aarch64.outputs.artifact_name }}
 
   check-all-jobs:
     if: false # TEMP: only the GLM-5.3 DCP/PCP 32p single-point accuracy suite is under validation
