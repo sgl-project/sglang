@@ -177,14 +177,7 @@ class TestZImageSPPadding(CustomTestCase):
                 cap_freq = torch.zeros(32, 4)
                 global_tokens = torch.cat([*tokens, torch.zeros(1, 32, 4)], dim=1)
                 for rank in range(8):
-                    gathered_values = iter(
-                        (
-                            tokens,
-                            image_freqs,
-                            image_freqs,
-                            list(global_tokens.chunk(8, dim=1)),
-                        )
-                    )
+                    gathered_values = iter((tokens, image_freqs, image_freqs))
 
                     def gather(outputs, value, group):
                         for output, source in zip(
@@ -192,9 +185,32 @@ class TestZImageSPPadding(CustomTestCase):
                         ):
                             output.copy_(source)
 
+                    # A unified shard is target_len + 4 rows, so rank r must take
+                    # the 4 * r rows that sit in front of its own shard. Both sides
+                    # are checked against the global sequence.
+                    def exchange(output, value, out_splits, in_splits, group=None):
+                        chunk = target_len + 4
+                        if rank + 1 < 8:
+                            sent = global_tokens[
+                                :, (rank + 1) * target_len : (rank + 1) * chunk
+                            ]
+                            torch.testing.assert_close(
+                                value, sent.transpose(0, 1), rtol=0, atol=0
+                            )
+                            self.assertEqual(in_splits[rank + 1], 4 * (rank + 1))
+                        else:
+                            self.assertEqual(value.shape[0], 0)
+                        start = rank * target_len
+                        output.copy_(
+                            global_tokens[:, start : start + 4 * rank].transpose(0, 1)
+                        )
+
                     with (
                         patch(f"{module}.get_ulysses_parallel_rank", return_value=rank),
                         patch("torch.distributed.all_gather", side_effect=gather),
+                        patch(
+                            "torch.distributed.all_to_all_single", side_effect=exchange
+                        ),
                     ):
                         output = model.forward(
                             images[rank],

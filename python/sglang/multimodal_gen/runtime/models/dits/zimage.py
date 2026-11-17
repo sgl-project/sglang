@@ -512,7 +512,9 @@ class ZImageAttention(nn.Module):
             )
 
         pad_heads = 0
-        if not skip_sequence_parallel_override:
+        # Layers that bypass Ulysses attend locally over all heads, so the head
+        # count does not have to divide the Ulysses degree for them.
+        if not (skip_sequence_parallel_override or self.attn.skip_sequence_parallel):
             pad_heads = -q.shape[2] % get_ulysses_parallel_world_size()
         if pad_heads:
             if q.shape[2] != k.shape[2]:
@@ -1409,6 +1411,50 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
         self._unified_freqs_cis = (sources, unified)
         return self._pin_for_active_capture(unified)
 
+    @staticmethod
+    def _take_image_shard(
+        unified: torch.Tensor,
+        *,
+        image_local_len: int,
+        cap_per_rank: int,
+        ulysses_size: int,
+        rank: int,
+        group,
+    ) -> torch.Tensor:
+        """Return this rank's image rows out of its shard of the unified sequence.
+
+        A unified shard holds ``image_local_len + cap_per_rank`` rows, so the shard
+        of rank r starts ``r * cap_per_rank`` rows after the first image row that
+        rank must return. Each rank therefore takes that many rows from the rank
+        below it and keeps the front of its own shard. Only the misaligned window
+        moves, which is at most the caption length in total.
+        """
+        if (ulysses_size - 1) * cap_per_rank > image_local_len:
+            gathered = [torch.empty_like(unified) for _ in range(ulysses_size)]
+            torch.distributed.all_gather(gathered, unified.contiguous(), group=group)
+            full = torch.cat(gathered, dim=1)
+            return full[:, rank * image_local_len : (rank + 1) * image_local_len]
+
+        send_len = (rank + 1) * cap_per_rank if rank + 1 < ulysses_size else 0
+        recv_len = rank * cap_per_rank
+        input_splits = [0] * ulysses_size
+        output_splits = [0] * ulysses_size
+        if send_len:
+            input_splits[rank + 1] = send_len
+        if recv_len:
+            output_splits[rank - 1] = recv_len
+
+        send = unified[:, unified.shape[1] - send_len :] if send_len else unified[:, :0]
+        send = send.transpose(0, 1).contiguous()
+        recv = send.new_empty((recv_len, *send.shape[1:]))
+        torch.distributed.all_to_all_single(
+            recv, send, output_splits, input_splits, group=group
+        )
+        kept = unified[:, : image_local_len - recv_len]
+        if not recv_len:
+            return kept
+        return torch.cat([recv.transpose(0, 1), kept], dim=1)
+
     def _get_attn_mask_and_meta(
         self, cache_attr: str, lengths: list[int], target_len: int, device: torch.device
     ) -> Tuple[Optional[torch.Tensor], Optional[dict]]:
@@ -1725,8 +1771,6 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
 
         cap_seq_len = cap_feats.shape[1]
-        unified = torch.cat([x, cap_feats], dim=1)
-        unified_freqs_cis = self._get_unified_freqs_cis(x_freqs_cis, cap_freqs_cis)
         unified_attn_mask, unified_attn_mask_meta = self._get_joint_attn_mask_and_meta(
             x_attn_lens,
             x.shape[1],
@@ -1734,25 +1778,28 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             cap_seq_len,
             device,
         )
-        (
-            unified_rope_cos_sin_cache,
-            unified_rope_positions,
-            unified_rope_freqs_complex,
-        ) = self._get_rope_cache("unified", unified_freqs_cis)
-        num_replicated_suffix = cap_seq_len
         ulysses_size = get_ulysses_parallel_world_size()
         shard_unified = (
             ulysses_size > 1
             and get_sp_world_size() == ulysses_size
             and unified_attn_mask is None
-            and (x.shape[1] * ulysses_size + cap_seq_len) % ulysses_size == 0
+            and cap_seq_len % ulysses_size == 0
             and not torch.is_grad_enabled()
             and not torch.compiler.is_compiling()
             and not is_in_breakable_cuda_graph()
             and not torch.cuda.is_current_stream_capturing()
         )
         image_local_len = x.shape[1]
-        if shard_unified:
+        if not shard_unified:
+            unified = torch.cat([x, cap_feats], dim=1)
+            unified_freqs_cis = self._get_unified_freqs_cis(x_freqs_cis, cap_freqs_cis)
+            (
+                unified_rope_cos_sin_cache,
+                unified_rope_positions,
+                unified_rope_freqs_complex,
+            ) = self._get_rope_cache("unified", unified_freqs_cis)
+            num_replicated_suffix = cap_seq_len
+        else:
             rank = get_ulysses_parallel_rank()
             group = get_sp_group().ulysses_group
             gathered = [torch.empty_like(x) for _ in range(ulysses_size)]
@@ -1804,10 +1851,14 @@ class ZImageTransformer2DModel(CachableDiT, LayerwiseOffloadableModuleMixin):
             )
 
         if shard_unified:
-            gathered = [torch.empty_like(unified) for _ in range(ulysses_size)]
-            torch.distributed.all_gather(gathered, unified.contiguous(), group=group)
-            unified = torch.cat(gathered, dim=1)
-            unified = unified[:, rank * image_local_len : (rank + 1) * image_local_len]
+            unified = self._take_image_shard(
+                unified,
+                image_local_len=image_local_len,
+                cap_per_rank=cap_seq_len // ulysses_size,
+                ulysses_size=ulysses_size,
+                rank=rank,
+                group=group,
+            )
         else:
             unified = unified[:, :image_local_len]
         unified = self.all_final_layer[f"{patch_size}-{f_patch_size}"](
