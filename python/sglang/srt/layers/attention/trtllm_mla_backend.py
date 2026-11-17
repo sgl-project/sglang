@@ -867,7 +867,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             if seq_lens_cpu is None:
                 max_seq = self.max_context_len
             elif seq_lens_cpu.numel() == 0:
-                # Eager attention-DP rank with no requests joining the step.
                 max_seq = 1
             else:
                 max_seq = seq_lens_cpu.max().item()
