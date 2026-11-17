@@ -384,7 +384,7 @@ class SimOpusTimePredictor(InferTimePredictor):
                 self._system,
                 "sglang",
                 str(self.config.backend_version),
-                systems_root=systems_root,
+                perfdb_dir=systems_root,
                 database_mode="SILICON",
             )
             provider = build_umd_static_model(

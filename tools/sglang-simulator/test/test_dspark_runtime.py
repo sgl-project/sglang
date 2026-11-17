@@ -280,7 +280,7 @@ def test_adp2_needs_actual_peer_scheduling_not_a_partition_of_global_batch(runti
 
 
 def test_sampling_capture_checks_all_sdk_fields_at_adapter_entry():
-    sdk = pytest.importorskip("simopus.sdk.native_sampling")
+    sdk = pytest.importorskip("simopus.sdk")
     params = NS(**dict.fromkeys(sdk.SAMPLING_FIELDS))
     params.is_normalized = True
     params.max_new_tokens = 20

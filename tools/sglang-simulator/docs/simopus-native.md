@@ -128,8 +128,8 @@ model/assets pair from `load_native_region_assets` and
 must not load assets or construct a second pair again.
 
 The adapter retains exact model/assets type checks, numeric-API callability and
-the model's `_native_region_assets` identity check. That private identity field
-is a pinned SDK compatibility check, not a new public SDK interface. A missing
+the model's public, read-only `native_region_assets` identity property. The
+SDK owns the binding; adapters do not inspect its private fields. A missing
 API or an incompatible pair fails initialization with
 `provider_initialization_failed`; numeric mode does not silently fall back or
 relax source/runtime/topology guards.

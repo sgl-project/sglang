@@ -8,6 +8,7 @@ from array import array
 
 import msgspec
 from msgspec.structs import replace
+
 from sglang_simulator.simulation.sglang.dspark import (
     STEP_ATTRIBUTE,
     DSparkGroup,
@@ -164,7 +165,7 @@ def capture_simulator_source_facts(native_batch):
 def sampling_snapshot(params):
     # The SDK owns the source-pinned field inventory; do not maintain a second
     # simulator sampling schema or discard normalized defaults.
-    from simopus.sdk.native_sampling import SAMPLING_FIELDS
+    from simopus.sdk import SAMPLING_FIELDS
 
     def builtins(value):
         if isinstance(value, dict):
@@ -196,7 +197,6 @@ def prepare_cpu_decode(draft_input, batch):
     uses ReqToTokenPool.write for the same table update.
     """
     import torch
-
     from sglang.srt.mem_cache.allocation import (
         alloc_paged_token_slots_extend,
         alloc_token_slots,
@@ -294,7 +294,6 @@ class NativeDSparkResults:
 
     def build(self, *, batch, prediction):
         import torch
-
         from sglang.srt.layers.logits_processor import LogitsProcessorOutput
         from sglang.srt.managers.utils import GenerationBatchResult
         from sglang.srt.speculative.draft_worker_common import make_draft_input_v2
@@ -603,7 +602,7 @@ class DSparkNativeRuntime:
             result = self.results.build(batch=batch, prediction=prediction)
             evidence = getattr(self.session.cost_model, "evaluated_evidence_for", None)
             if evidence is not None:
-                setattr(result, "_simopus_evaluated_costs", evidence(before))
+                result._simopus_evaluated_costs = evidence(before)
             candidate = (
                 None
                 if transaction is None

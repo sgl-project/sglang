@@ -62,11 +62,11 @@ def test_factory_loads_real_native_assets_and_public_umd(
     public_adapter, tmp_path, monkeypatch, cpu_detail
 ):
     import simopus
-    import simopus.sdk as sdk
     from sglang_simulator.time_predictor import (
         dspark_progress,
         simopus_dspark,
     )
+    from simopus import sdk
 
     adapter, database, options = public_adapter
     if cpu_detail == "off":
@@ -78,7 +78,7 @@ def test_factory_loads_real_native_assets_and_public_umd(
     args["model_revision"] = "main"
     # An exact pin is still required; the packaged model resource accepts its
     # declared checkpoint rather than arbitrary main for actual initialization.
-    from simopus.sdk.perf_database.dsv41_dspark_proposal import MODEL_REVISION
+    from simopus.sdk.perf_database.native.proposal import MODEL_REVISION
 
     args["model_revision"] = MODEL_REVISION
     raw = json.dumps(options["execution_profile"].to_dict()).encode()
@@ -129,7 +129,7 @@ def test_factory_loads_real_native_assets_and_public_umd(
     assert len(asset_loads) == 1
     costs = result.dspark_runtime.session.cost_model
     assert costs.assets is asset_loads[0]
-    assert costs.model._native_region_assets is costs.assets
+    assert costs.model.native_region_assets is costs.assets
     assert (
         result.dspark_runtime.session.cost_model.assets.execution_profile_id
         == options["native_segment_profile_id"]

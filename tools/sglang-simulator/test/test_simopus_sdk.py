@@ -1,9 +1,28 @@
 """The optional provider requires the SimOpus SDK exclusively."""
 
+import ast
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from sglang_simulator.time_predictor import simopus_sdk
+
+
+def test_runtime_uses_only_public_sdk_imports_and_bindings():
+    root = Path(simopus_sdk.__file__).resolve().parents[1]
+    violations = []
+    for path in root.rglob("*.py"):
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if (
+                isinstance(node, ast.ImportFrom)
+                and (node.module or "").startswith("simopus.sdk.")
+                or isinstance(node, ast.Import)
+                and any(alias.name.startswith("simopus.sdk.") for alias in node.names)
+                or isinstance(node, ast.Attribute)
+                and node.attr == "_native_region_assets"
+            ):
+                violations.append(f"{path.relative_to(root)}:{node.lineno}")
+    assert not violations, violations
 
 
 def test_loads_only_simopus_sdk(monkeypatch):

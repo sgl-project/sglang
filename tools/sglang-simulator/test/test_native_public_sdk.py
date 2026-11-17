@@ -38,10 +38,8 @@ def public_adapter(request, monkeypatch):
             "simopus.sdk",
             reason="install the current SimOpus SDK for native public integration controls",
         )
-    from simopus.sdk import DecodeExecutionProfile
+    from simopus.sdk import DatabaseMode, DatabaseProvenance, DecodeExecutionProfile
     from simopus.sdk.models.umd import umd_static
-    from simopus.sdk.models.umd.prediction_result import DatabaseProvenance
-    from simopus.sdk.perf_database.common import DatabaseMode
 
     root = (
         Path(__file__).parent / "fixtures/simopus-native-source" / f"tp{request.param}"
@@ -86,7 +84,7 @@ def public_adapter(request, monkeypatch):
 
 
 def step_for(adapter, mode="DECODE", batch=2):
-    from simopus.sdk.native_sampling import SAMPLING_FIELDS
+    from simopus.sdk import SAMPLING_FIELDS
 
     recipe = dict.fromkeys(SAMPLING_FIELDS)
     recipe.update(
@@ -159,8 +157,8 @@ def step_for(adapter, mode="DECODE", batch=2):
 
 @pytest.fixture
 def leaves(monkeypatch):
-    from simopus.sdk.operations.compute.dsv41_native_segment import DSV41NativeSegment
-    from simopus.sdk.perf_database.performance_result import PerformanceResult
+    from simopus.sdk import PerformanceResult
+    from simopus.sdk.operations.compute.region.cost import DSV41NativeSegment
 
     calls = []
 
@@ -288,7 +286,7 @@ def test_public_nine_stages_keep_ordered_work_and_full_evidence(
 def test_late_missing_cost_retains_evaluation_without_progress_or_commit(
     public_adapter, leaves, monkeypatch
 ):
-    from simopus.sdk.perf_database.database import PerfDataNotAvailableError
+    from simopus.sdk import PerfDataNotAvailableError
 
     adapter, _, _ = public_adapter
     step = step_for(adapter)
@@ -323,7 +321,7 @@ def test_public_source_policy_cannot_be_enabled_without_golden_originals(
     public_adapter,
 ):
     _adapter, database, options = public_adapter
-    from simopus.sdk.native_segment_module import SOURCE_WORK_POLICY
+    from simopus.sdk.operations.compute.region.query import SOURCE_WORK_POLICY
 
     with pytest.raises(PredictorError):
         SimOpusNativeCostAdapter.from_sdk(

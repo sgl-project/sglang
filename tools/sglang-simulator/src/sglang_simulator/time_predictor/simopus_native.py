@@ -86,7 +86,7 @@ class SimOpusNativeCostAdapter:
         if (
             type(model) is not UMDStaticModel
             or type(assets) is not NativeRegionAssets
-            or getattr(model, "_native_region_assets", None) is not assets
+            or getattr(model, "native_region_assets", None) is not assets
             or not callable(getattr(model, "estimate_prepared_forward_ms", None))
         ):
             raise PredictorError(
@@ -277,8 +277,7 @@ class SimOpusNativeCostAdapter:
         return mode, inputs, requests
 
     def query_phase(self, phase, step):
-        from simopus.sdk import PredictionResult
-        from simopus.sdk.perf_database.database import PerfDataNotAvailableError
+        from simopus.sdk import PerfDataNotAvailableError, PredictionResult
 
         try:
             mode, inputs, requests = self._phase_inputs(phase, step)

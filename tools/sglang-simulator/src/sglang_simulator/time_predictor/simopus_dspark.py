@@ -118,6 +118,8 @@ class SimOpusDSparkTimePredictor(InferTimePredictor):
             "synthetic output token must be in the vocabulary",
         )
 
+        from simopus.sdk import build_model_description, load_model_config
+
         from sglang_simulator.simulation.sglang.dspark import (
             DSparkSession,
             DSparkTopology,
@@ -129,8 +131,6 @@ class SimOpusDSparkTimePredictor(InferTimePredictor):
             SimOpusNativeCostAdapter,
         )
         from sglang_simulator.time_predictor.simopus_sdk import load_sdk
-        from simopus.sdk.models.model_config import load_model_config
-        from simopus.sdk.models.umd import build_model_description
 
         package, sdk = load_sdk()
         _require(
@@ -156,7 +156,7 @@ class SimOpusDSparkTimePredictor(InferTimePredictor):
                 system,
                 "sglang",
                 config.backend_version,
-                systems_root=systems_root,
+                perfdb_dir=systems_root,
                 database_mode=database_mode,
             )
             _, capture_raw, capture_sha = _asset(

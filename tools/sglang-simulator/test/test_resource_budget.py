@@ -381,7 +381,7 @@ import sglang_simulator.simulation.resource_budget
 
 
 def test_real_sdk_small_dense_budget(tmp_path, monkeypatch):
-    pytest.importorskip("simopus.sdk.resources.models")
+    pytest.importorskip("simopus.sdk")
     import simopus
 
     # Exercise actual resource contracts without depending on the wheel build used by CI.

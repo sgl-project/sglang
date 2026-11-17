@@ -111,7 +111,7 @@ def test_source_and_policy_guards_survive(public_adapter, monkeypatch, detail):
         SimOpusNativeCostAdapter.from_sdk(
             database, "deepseek-ai/DeepSeek-V4.1-Flash", **bad
         )
-    from simopus.sdk.native_segment_module import SOURCE_WORK_POLICY
+    from simopus.sdk.operations.compute.region.query import SOURCE_WORK_POLICY
 
     with pytest.raises(PredictorError):
         SimOpusNativeCostAdapter.from_sdk(
@@ -174,7 +174,7 @@ def test_numeric_invalid_cost_refused(public_adapter, monkeypatch, value):
 def test_numeric_late_failure_does_not_draw_progress_or_commit(
     public_adapter, leaves, monkeypatch
 ):
-    from simopus.sdk.perf_database.database import PerfDataNotAvailableError
+    from simopus.sdk import PerfDataNotAvailableError
 
     full, _, _ = public_adapter
     step = step_for(full)
