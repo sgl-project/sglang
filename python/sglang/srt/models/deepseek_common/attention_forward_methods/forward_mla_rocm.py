@@ -191,13 +191,9 @@ def _absorb_bmm_config(heads: int, m: int, n: int) -> Optional[dict]:
     while block_m < 64 and heads * cdiv(m, block_m) * n_tiles > 2 * num_cu:
         block_m *= 2
     workgroups = heads * cdiv(m, block_m) * n_tiles
-    waves_per_eu = max(1, cdiv(workgroups, num_cu))
-    # The original gfx950 M=256 reproducer aborts in LLVM with a four-wave
-    # budget. A cap of two avoids that compiler failure while preserving the
-    # hand-tuned tile shape; zero leaves the original budget available for tuning.
-    max_waves = envs.SGLANG_ROCM_ABSORB_BMM_MAX_WAVES_PER_EU.get()
-    if max_waves > 0:
-        waves_per_eu = min(waves_per_eu, max_waves)
+    # Cap at two waves per EU. Four aborts LLVM on the gfx950 M=256 decode
+    # shape (#46829), and more than two is slower for most shapes on MI355X.
+    waves_per_eu = min(2, max(1, cdiv(workgroups, num_cu)))
     return {
         "BLOCK_SIZE_M": block_m,
         "BLOCK_SIZE_N": block_n,

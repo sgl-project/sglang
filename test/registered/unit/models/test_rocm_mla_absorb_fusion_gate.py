@@ -16,7 +16,6 @@ from unittest import mock
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.layers.rotary_embedding.bailing_mrope import BailingMRotaryEmbedding
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.rope_variant import (
@@ -92,7 +91,6 @@ class TestFusedAbsorbGate(CustomTestCase):
 
 class TestAbsorbBmmConfig(CustomTestCase):
     def setUp(self):
-        self.enterContext(envs.SGLANG_ROCM_ABSORB_BMM_MAX_WAVES_PER_EU.override(2))
         self._saved = forward_mla_rocm._absorb_bmm_num_cu
         forward_mla_rocm._absorb_bmm_num_cu = 256
         self.addCleanup(
@@ -147,16 +145,6 @@ class TestAbsorbBmmConfig(CustomTestCase):
         for m in range(1, 257):
             with self.subTest(m=m):
                 self.assertLessEqual(_ABSORB_CONFIG(64, m, 512)["waves_per_eu"], 2)
-
-    def test_wave_cap_is_configurable(self):
-        with envs.SGLANG_ROCM_ABSORB_BMM_MAX_WAVES_PER_EU.override(4):
-            self.assertEqual(_ABSORB_CONFIG(64, 256, 512)["waves_per_eu"], 4)
-        with envs.SGLANG_ROCM_ABSORB_BMM_MAX_WAVES_PER_EU.override(1):
-            self.assertEqual(_ABSORB_CONFIG(64, 256, 512)["waves_per_eu"], 1)
-        # 0 lifts the cap entirely, which is what the gfx950 team needs to
-        # sweep the trigger value.
-        with envs.SGLANG_ROCM_ABSORB_BMM_MAX_WAVES_PER_EU.override(0):
-            self.assertEqual(_ABSORB_CONFIG(64, 256, 512)["waves_per_eu"], 4)
 
     def test_no_compute_units_falls_back(self):
         forward_mla_rocm._absorb_bmm_num_cu = 0
