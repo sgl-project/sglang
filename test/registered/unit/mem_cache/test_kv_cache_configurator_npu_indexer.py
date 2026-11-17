@@ -100,6 +100,7 @@ class TestNPUIndexerMemorySizing(CustomTestCase):
             (None, torch.bfloat16, 1, 256),
             (None, torch.bfloat16, 4, 64),
             ("int8", torch.bfloat16, 1, 130),
+            ("int8", torch.bfloat16, 4, 33),
             (None, torch.float8_e4m3fn, 1, 132),
         ]
         for indexer_dtype, kv_dtype, kpool, expected in cases:
@@ -147,7 +148,12 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
     """--indexer-kv-cache-dtype=int8 may replace only the BF16 indexer cache."""
 
     def _build_pool(
-        self, dtype, kv_cache_dim=None, indexer_quant_mode=None, hierarchical=False
+        self,
+        dtype,
+        kv_cache_dim=None,
+        indexer_quant_mode=None,
+        hierarchical=False,
+        index_kpool=1,
     ):
         with (
             get_context().override_server_args(enable_hierarchical_cache=hierarchical),
@@ -169,6 +175,9 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
                 index_head_dim=128,
                 kv_cache_dim=kv_cache_dim,
                 indexer_quant_mode=indexer_quant_mode,
+                index_kpool=index_kpool,
+                index_kpool_compress=index_kpool > 1,
+                max_running_requests=4 if index_kpool > 1 else None,
             )
 
     def test_int8_mode_rejects_hierarchical_cache_in_server_args(self):
@@ -214,6 +223,22 @@ class TestNPUIndexerInt8Cache(CustomTestCase):
                 scale = pool.index_k_scale_buffer
                 self.assertEqual(pool.index_k_buffer.dtype, key_dtype)
                 self.assertEqual(None if scale is None else scale.dtype, scale_dtype)
+
+    def test_int8_mode_with_kpool_stores_int8_pooled_keys(self):
+        pool = self._build_pool(
+            torch.bfloat16,
+            indexer_quant_mode=QUANT_MODE_TOKEN_INT8,
+            index_kpool=4,
+        )
+        self.assertEqual(pool.index_k_buffer.dtype, torch.int8)
+        self.assertEqual(pool.index_k_scale_buffer.dtype, torch.float16)
+        self.assertEqual(pool.index_page_size, 128 // 4)
+        self.assertEqual(
+            pool.index_k_scale_buffer.shape,
+            (*pool.index_k_buffer.shape[:-2], 1),
+        )
+        # KPool quantizes pooled rows without rotating keys or queries.
+        self.assertIsNone(pool.indexer_hadamard_128)
 
     def test_resolve_indexer_quant_mode(self):
         self.assertIsNone(resolve_indexer_quant_mode(None, torch.bfloat16))

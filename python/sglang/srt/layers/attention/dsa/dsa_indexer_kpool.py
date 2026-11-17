@@ -1854,7 +1854,7 @@ class IndexerKPool(MultiPlatformOp):
         dynamic_scale: torch.Tensor = None,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
-        """BF16 compression and request-level pooled-key selection on A3/A5."""
+        """BF16/INT8 compression and request-level pooled-key selection on A3/A5."""
 
         metadata = get_attn_backend().get_indexer_metadata(layer_id, forward_batch)
         if metadata is None:

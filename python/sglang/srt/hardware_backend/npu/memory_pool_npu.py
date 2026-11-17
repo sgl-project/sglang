@@ -737,8 +737,6 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     ):
         if use_fp4_indexer:
             raise ValueError("FP4 indexer KV cache is not supported on NPU.")
-        if index_kpool > 1 and indexer_quant_mode == QUANT_MODE_TOKEN_INT8:
-            raise ValueError("INT8 indexer KV cache is not supported with NPU KPool.")
         self.kv_scale_ue8m0 = kv_scale_ue8m0
         self.kpool_use_compress = index_kpool > 1 and index_kpool_compress
         assert index_kpool <= 1 or self.kpool_use_compress, (
@@ -928,7 +926,8 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     device=self.device,
                 )
                 if (
-                    self.dsa_kv_cache_store_fp8 or self.indexer_kv_store_int8
+                    self.dsa_kv_cache_store_fp8
+                    or (self.indexer_kv_store_int8 and self.index_kpool == 1)
                 ) and self.num_indexer_layers > 0:
                     from sglang.srt.layers.attention.dsa.dsa_npu_indexer import (
                         create_npu_hadamard_128,
@@ -941,6 +940,14 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     )
                     self.indexer_hadamard_128 = create_npu_hadamard_128(
                         self.index_head_dim, self.device
+                    )
+                elif self.indexer_kv_store_int8 and self.num_indexer_layers > 0:
+                    # KPool quantizes each pooled row symmetrically without
+                    # rotating keys or queries, so no Hadamard buffer is needed.
+                    self.index_k_scale_buffer = torch.zeros(
+                        (*self.index_k_buffer.shape[:-2], 1),
+                        dtype=self.index_k_scale_dtype,
+                        device=self.device,
                     )
 
         self._compress_tail_k = None
