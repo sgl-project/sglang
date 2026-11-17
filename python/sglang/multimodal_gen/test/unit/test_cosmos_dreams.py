@@ -40,6 +40,7 @@ from sglang.multimodal_gen.registry import (
     _get_config_info,
 )
 from sglang.multimodal_gen.runtime.models.dits import cosmos_dreams
+from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum
 from sglang.multimodal_gen.runtime.models.dits.cosmos_dreams import (
     CosmosDreamsKVSlot,
     CosmosDreamsTransformer,
@@ -1831,6 +1832,55 @@ class TestCosmosDreamsPromptAndCanvas(unittest.TestCase):
         )
         torch.testing.assert_close(
             fitted[:, 2:, :], fitted[:, 1:2, :].expand(-1, 6, -1)
+        )
+
+
+class TestCosmosDreamsJointAttentionBackendDefault(unittest.TestCase):
+    """The joint [text | history | chunk] attention keeps the FA (FA4) route on
+    sm_10x instead of the platform's dynamic cuDNN SDPA default (GQA on cuDNN is
+    ~50% slower per rollout step on GB200 and changes the numerics)."""
+
+    def _default(self, *, is_cuda=True, is_sm120=False, is_blackwell=False):
+        with (
+            mock.patch.object(cosmos_dreams.current_platform, "is_cuda", return_value=is_cuda),
+            mock.patch.object(cosmos_dreams.current_platform, "is_sm120", return_value=is_sm120),
+            mock.patch.object(
+                cosmos_dreams.current_platform, "is_blackwell", return_value=is_blackwell
+            ),
+        ):
+            return cosmos_dreams.default_joint_attention_backend()
+
+    def test_sm10x_prefers_fa_over_the_dynamic_cudnn_default(self):
+        self.assertIs(self._default(is_blackwell=True), AttentionBackendEnum.FA)
+
+    def test_sm12x_prefers_flashinfer_fa2(self):
+        self.assertIs(
+            self._default(is_sm120=True), AttentionBackendEnum.FLASHINFER_FA2
+        )
+
+    def test_other_cuda_parts_and_non_cuda_keep_the_platform_default(self):
+        self.assertIsNone(self._default())
+        self.assertIsNone(self._default(is_cuda=False, is_blackwell=True))
+
+    def test_cross_attention_passes_the_default_through(self):
+        with (
+            mock.patch.object(
+                cosmos_dreams,
+                "default_joint_attention_backend",
+                return_value=AttentionBackendEnum.FA,
+            ),
+            mock.patch.object(
+                cosmos_dreams.Cosmos3CrossAttention, "__init__", return_value=None
+            ) as init,
+        ):
+            cosmos_dreams.CosmosDreamsCrossAttention(
+                hidden_size=4096,
+                num_attention_heads=32,
+                num_key_value_heads=8,
+                head_dim=128,
+            )
+        self.assertIs(
+            init.call_args.kwargs["default_attention_backend"], AttentionBackendEnum.FA
         )
 
 
