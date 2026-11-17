@@ -36,7 +36,10 @@ class TestEmptyBatchFullLatch(CustomTestCase):
         s.processed_tokens_counter = 0
         s.disagg_prefill_bootstrap_queue = None
         # Reaching the policy means the admission gates were passed.
-        s.policy = SimpleNamespace(calc_priority=Mock(side_effect=_AdmissionAttempted))
+        s.policy = SimpleNamespace(
+            calc_priority=Mock(side_effect=_AdmissionAttempted),
+            poll_storage_prefetches=lambda waiting_queue: None,
+        )
         return s
 
     def test_latched_empty_batch_still_admits(self):
