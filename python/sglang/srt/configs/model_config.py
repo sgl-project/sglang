@@ -50,7 +50,7 @@ from sglang.srt.hf_transformers import (
 from sglang.srt.hf_transformers.config import POINTER_ADAPTER_BASES
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, is_npu, retry
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, retry
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -256,12 +256,15 @@ def is_glm_moe_dsa(config) -> bool:
     )
 
 
+KIMI_K3_ARCHS = (
+    "KimiK3ForConditionalGeneration",
+    "KimiK31ForConditionalGeneration",
+    "KimiK3LinearForCausalLM",
+)
+
+
 def is_kimi_k3(config) -> bool:
-    return _hf_arch(config) in (
-        "KimiK3ForConditionalGeneration",
-        "KimiK31ForConditionalGeneration",
-        "KimiK3LinearForCausalLM",
-    )
+    return _hf_arch(config) in KIMI_K3_ARCHS
 
 
 _KIMI_K31_ARCHS = (
@@ -1799,9 +1802,6 @@ class ModelConfig:
         if rope_scaling:
             self.scaling = compute_mla_mscale_scaling(rope_scaling, self.scaling)
 
-    def get_total_num_attention_heads(self) -> int:
-        return self.num_attention_heads
-
     def get_num_attention_heads(self, tensor_parallel_size) -> int:
         # Pure-SSM (Mamba) models have no attention; num_attention_heads is None.
         total_num_attention_heads = self.num_attention_heads or 0
@@ -2204,6 +2204,8 @@ class ModelConfig:
             "quark_mxfp4",
             "minimax_m3_nvfp4",
         ]
+        if is_gfx95_supported():
+            rocm_supported_quantization.append("modelopt_fp8")
         optimized_quantization_methods = [
             "fp8",
             "marlin",
@@ -2606,6 +2608,9 @@ multimodal_model_archs = [
     "LlavaForConditionalGeneration",
     "LlavaVidForCausalLM",
     "Lfm2VlForConditionalGeneration",
+    "Lfm3VlForConditionalGeneration",
+    "Lfm3AudioForConditionalGeneration",
+    "Lfm3OmniForConditionalGeneration",
     "LightOnOCRForConditionalGeneration",
     *MIMO_V2_MULTIMODAL_ARCHS,
     "MiMoV2ASRForCausalLM",

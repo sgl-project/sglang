@@ -64,11 +64,13 @@ jobs:
     needs: check-changes
     if: needs.check-changes.outputs.main_package == 'true'
     uses: ./.github/workflows/pr-gate.yml
+    with:
+      require-label: run-ci-arm64-extra
     secrets: inherit
 
   build-test:
     needs: [check-changes, pr-gate]
-    if: needs.check-changes.outputs.main_package == 'true'
+    if: needs.check-changes.outputs.main_package == 'true' && needs.pr-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-24.04-arm
     steps:
       - name: Checkout repository

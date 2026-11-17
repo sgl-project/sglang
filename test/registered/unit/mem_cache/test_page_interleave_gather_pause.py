@@ -77,6 +77,7 @@ class TestPageInterleaveGatherPause(CustomTestCase):
             (torch.cuda, "current_stream", lambda device=None: "forward-stream"),
             (torch.cuda, "is_current_stream_capturing", lambda: False),
             (parallel_state, "is_hip", lambda: False),
+            (parallel_state, "_is_cpu", False),
         ):
             patcher = patch.object(owner, name, value)
             patcher.start()

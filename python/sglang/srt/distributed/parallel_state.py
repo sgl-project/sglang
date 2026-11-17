@@ -74,6 +74,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_cuda_alike,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_hip,
     is_mlu,
     is_musa,
@@ -153,6 +154,10 @@ class GraphCaptureContext:
 class P2PWork:
     work: Optional[torch.distributed.Work]
     payload: Optional[torch.Tensor]
+
+    def wait(self) -> None:
+        if self.work is not None:
+            self.work.wait()
 
 
 def _split_tensor_dict(
@@ -925,7 +930,7 @@ class GroupCoordinator:
     ) -> Optional[Tuple[torch.Tensor, ...]]:
         """Attempt fused all-reduce + RMSNorm + per-group FP8 quant.
 
-        ROCm/aiter/gfx95-only entry point. Returns ``None`` on any other
+        ROCm/aiter entry point for gfx942 and gfx95. Returns ``None`` on any other
         platform or when the aiter custom-all-reduce communicator cannot
         service the request, letting the caller fall back to the existing
         ``fused_allreduce_rmsnorm`` + separate per-group quant path.
@@ -940,7 +945,7 @@ class GroupCoordinator:
         the column-major layout the gfx95 bpreshuffle GEMM consumes, so the
         caller can skip the post-kernel scale transpose.
         """
-        if not (is_hip() and is_gfx95_supported()):
+        if not (is_hip() and (is_gfx95_supported() or is_gfx942_supported())):
             return None
 
         ca_comm = self.ca_comm
@@ -1180,6 +1185,10 @@ class GroupCoordinator:
             )
             with pynccl_comm.change_state(enable=True):
                 pynccl_comm.reduce_scatter(output, input)
+        elif _is_cpu and is_shm_available(
+            input.dtype, self.world_size, self.local_size
+        ):
+            torch.ops.sgl_kernel.shm_reduce_scatter_tensor(output, input, REDUCE_OP_SUM)
         else:
             reduce_scatter_single(output, input, group=self.device_group)
         return output
@@ -1196,7 +1205,6 @@ class GroupCoordinator:
                 .view_as(output)
             )
         elif _is_cpu:
-            # TODO: add optimized reduce_scatter_tensor kernel for cpu
             self._reduce_scatter_tensor(output, input)
         elif self._maybe_aiter_reduce_scatter(output, input):
             return
@@ -1392,6 +1400,10 @@ class GroupCoordinator:
             with pynccl_comm.change_state(enable=True):
                 with _pause_kv_shard_gather():
                     pynccl_comm.all_gather(output, input)
+        elif _is_cpu and is_shm_available(
+            input.dtype, self.world_size, self.local_size
+        ):
+            torch.ops.sgl_kernel.shm_allgather_into_tensor(output, input)
         else:
             with _pause_kv_shard_gather():
                 all_gather_single(output, input, group=self.device_group)
@@ -1416,7 +1428,6 @@ class GroupCoordinator:
 
     def all_gather_into_tensor(self, output: torch.Tensor, input: torch.Tensor):
         if _is_cpu:
-            # TODO: add optimized all_gather_into_tensor kernel for cpu
             self._all_gather_into_tensor(output, input)
         else:
             # NPU, XPU, and CUDA all go through reg_all_gather_into_tensor (custom_op)
@@ -2151,6 +2162,15 @@ class GroupCoordinator:
         if self.pcie_ipc_comm is not None:
             self.pcie_ipc_comm.destroy()
             self.pcie_ipc_comm = None
+        # Also before destroy_process_group(): the symmetric workspace is released
+        # collectively on cpu_group, after the custom all-reduce drops its views.
+        self.ca_comm = None
+        if self.cpu_group is not None:
+            from sglang.srt.distributed.device_communicators.symm_workspace import (
+                close_group_symm_workspaces,
+            )
+
+            close_group_symm_workspaces(self.cpu_group)
         if self.device_group is not None:
             torch.distributed.destroy_process_group(self.device_group)
             self.device_group = None
@@ -2161,8 +2181,6 @@ class GroupCoordinator:
             self.pynccl_comm = None
         if self.pymscclpp_comm is not None:
             self.pymscclpp_comm.destroy()
-        if self.ca_comm is not None:
-            self.ca_comm = None
         if self.mq_broadcaster is not None:
             self.mq_broadcaster = None
 
@@ -3374,17 +3392,29 @@ def close_custom_all_reduce() -> None:
     """
     if not is_hip():
         return
+    from sglang.srt.distributed.device_communicators.symm_workspace import (
+        close_multinode_symm_workspaces,
+        is_multinode_symm_group,
+    )
+
     for name in sorted(_groups):
         group = _groups[name]()
-        if group is None or not getattr(group.ca_comm, "_is_multinode", False):
+        if group is None or not is_multinode_symm_group(group.cpu_group):
             continue
         try:
-            group.ca_comm.close()
+            if group.ca_comm is not None:
+                group.ca_comm.close()
         except Exception as e:
             logger.warning(
                 f"Custom all-reduce close on shutdown failed, {type(e).__name__}: {e}"
             )
         group.ca_comm = None
+    try:
+        close_multinode_symm_workspaces()
+    except Exception as e:
+        logger.warning(
+            f"Symmetric workspace close on shutdown failed, {type(e).__name__}: {e}"
+        )
 
 
 def abort_distributed_environment() -> None:
@@ -3572,7 +3602,7 @@ def _warn_if_called_from_outside(name: str, replacement: str):
     def decorate(fn):
         @functools.wraps(fn)
         def wrapper(*args, **kwargs):
-            if name not in _ALREADY_WARNED:
+            if not torch.compiler.is_compiling() and name not in _ALREADY_WARNED:
                 caller = sys._getframe(1).f_globals.get("__name__", "")
                 if not caller.startswith(_EXEMPT_CALLERS):
                     _ALREADY_WARNED.add(name)

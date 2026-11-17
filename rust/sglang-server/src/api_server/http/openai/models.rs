@@ -11,12 +11,13 @@ use std::sync::Arc;
 
 use sglang_api_types::api::v1 as api;
 
+use super::super::auth::DeclaredRoute;
 use super::{AppState, openai_error, unix_seconds_u32};
 
 pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
-        .route("/v1/models", get(available_models))
-        .route("/v1/models/{model}", get(retrieve_model))
+        .declared_route("/v1/models", get(available_models))
+        .declared_route("/v1/models/{model}", get(retrieve_model))
 }
 
 /// `GET /v1/models` — OpenAI-compatible model list. Served from core metadata;
