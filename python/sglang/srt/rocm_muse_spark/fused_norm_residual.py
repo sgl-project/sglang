@@ -18,6 +18,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.environ import envs
 from sglang.srt.rocm_muse_spark import fused_op_tuning
 from sglang.srt.rocm_muse_spark.base_fused_op import BaseFusedOp
 from sglang.srt.rocm_muse_spark.layers import (
@@ -26,6 +27,8 @@ from sglang.srt.rocm_muse_spark.layers import (
 )
 
 logger = logging.getLogger(__name__)
+
+_USE_TLX_BOUNDARY_NORM = envs.SGLANG_USE_TLX_BOUNDARY_NORM.get()
 
 
 def _fused_norm_residual_config(
@@ -310,6 +313,36 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
         M, H = branch.shape
 
         self._ensure_cached_weights(branch_dtype)
+
+        if (
+            _USE_TLX_BOUNDARY_NORM
+            and router_dtype is None
+            and not fp8_out
+            and self._cc_alpha.numel() in (0, 1, H)
+        ):
+            from sglang.kernels.ops.layernorm.tlx import (
+                norm_residual_norm,
+                norm_residual_norm_supported,
+            )
+
+            if norm_residual_norm_supported(stream, branch):
+                output, new_stream = norm_residual_norm(
+                    stream,
+                    branch,
+                    post_weight=(
+                        self._cc_post_weight if self._post_norm.has_weight else None
+                    ),
+                    post_norm_input_scale=self._post_norm_is_input_scale,
+                    pre_weight=(
+                        self._cc_pre_weight if self._pre_norm.has_weight else None
+                    ),
+                    alpha=self._cc_alpha if self._use_residual_gate else None,
+                    beta=self._cc_beta if self._use_residual_gate else None,
+                    post_eps=self._post_norm.eps,
+                    pre_eps=self._pre_norm.eps,
+                    pre_norm_bf16=pre_norm_dtype is torch.bfloat16,
+                )
+                return output, new_stream, None
 
         output = torch.empty(M, H, dtype=branch_dtype, device=branch.device)
         new_stream_out = torch.empty(M, H, dtype=torch.float32, device=branch.device)
