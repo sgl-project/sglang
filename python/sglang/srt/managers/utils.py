@@ -88,9 +88,7 @@ def _async_d2h_rows(rows: List[Any]) -> List[Any]:
     flat = torch.cat([row.reshape(-1) for row in tensors])
     device = flat.device
     if device.type != "cpu" and is_pin_memory_available(device):
-        # The cat is only queued on the current stream. Record the rows there, as
-        # `_async_d2h` does for the tensor it copies, so the stream they were
-        # allocated on cannot reuse their memory before the cat has read them.
+        # use record_stream so rows don't get reused before torch.cat finished
         stream = torch.get_device_module(device).current_stream()
         for row in tensors:
             row.record_stream(stream)
