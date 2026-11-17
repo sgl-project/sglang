@@ -45,9 +45,9 @@ Use this order when standing up a new model on Ascend NPU:
 
 | Workload class | Typical hardware (A2 / A3 Series) | Cards (published examples) | Deploy mode | Notes |
 | --- | --- | --- | --- | --- |
-| Dense ≤8B low latency | Atlas 800I A3 | **1** | PD Mixed | e.g. Qwen3-8B W8A8 @ 5–11ms TPOT on 3.5k/6k+1.5k |
-| Dense ~30B MoE-A3B | Atlas 800I A3 | **1** | PD Mixed | e.g. Qwen3-30B-A3B W8A8 ~10ms low-latency / ~50ms throughput |
-| Dense 32B | Atlas 800I A2/A3 | **2** (throughput) / **8** (ultra-low latency) | PD Mixed | 2-card W8A8 is 50ms on A3 and 55ms on A2; 8-card BF16 can reach 6ms on long context |
+| Dense ≤8B low latency | Atlas 800I A3 | **1** | PD Mixed | e.g. Qwen3-8B W8A8 — see model Best Practices for published points |
+| Dense ~30B MoE-A3B | Atlas 800I A3 | **1** | PD Mixed | e.g. Qwen3-30B-A3B W8A8 — low-latency vs throughput rows on Best Practices |
+| Dense 32B | Atlas 800I A2/A3 | **2** (throughput) / **8** (ultra-low latency) | PD Mixed | Prefer 2-card W8A8 for throughput; scale cards for ultra-low latency (see Best Practices) |
 | Large MoE ~235B | Atlas 800I A3 | **8** | PD Mixed | Qwen3-235B-A22B: BF16 low-latency or W8A8 throughput rows |
 | Frontier MoE (DeepSeek-R1) | Atlas 800I A3 | **8 / 16 / 32** | PD Mixed or PD Disaggregation | 8-card mixed throughput; 16–32-card PD for published low-latency points |
 | Long-context MoE (DeepSeek-V3.2) | Atlas 800I A3 | **32** | PD Disaggregation | Published points use 128k+1k style datasets |
