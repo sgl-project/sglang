@@ -4463,6 +4463,13 @@ class SchedulerDisaggregationDecodeMixin:
         ):
             token_budget = min(token_budget, schedule.chunked_prefill_size)
         max_admit = min(num_not_used_batch, token_budget // tail)
+        if max_admit <= 0:
+            return None
+
+        if self.enable_priority_scheduling:
+            self.waiting_queue.reorder(
+                self.policy.calc_priority(self.waiting_queue, running_batch)
+            )
 
         # A retraction restored into the host pool leaves a completion event
         # on the row. Finalize it before admission, or this request would be

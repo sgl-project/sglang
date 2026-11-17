@@ -1028,6 +1028,7 @@ class TestDecodePrebuilt(unittest.TestCase):
         scheduler.grammar_manager.has_waiting_grammars.return_value = False
         scheduler.waiting_queue = IndexedReqList(ListKind.WAITING)
         scheduler.enable_priority_scheduling = False
+        scheduler.last_batch = None
         scheduler.running_batch = MagicMock()
         scheduler.running_batch.batch_size.return_value = 0
         scheduler.req_to_token_pool = MagicMock(size=1)
@@ -1118,6 +1119,45 @@ class TestDecodePrebuilt(unittest.TestCase):
             scheduler.forward_stream
         )
         self.assertEqual(call_order, ["prepare", "wait", "process"])
+
+    def test_tail_extend_uses_policy_when_only_one_request_fits(self):
+        scheduler = self._new_scheduler(enable_overlap=False)
+        scheduler.enable_priority_scheduling = True
+        scheduler.kv_checksum_computer = None
+        move(
+            [
+                MagicMock(
+                    rid=rid,
+                    priority=priority,
+                    owner_list=None,
+                    bootstrap_host="prefill",
+                    output_ids=[],
+                    kv=ReqKvInfo(),
+                )
+                for rid, priority in (("low", 1), ("high", 10))
+            ],
+            scheduler.waiting_queue,
+        )
+        scheduler.policy.calc_priority.side_effect = lambda queue, _: sorted(
+            queue, key=lambda req: -req.priority
+        )
+        batch = MagicMock()
+        batch.is_empty.return_value = False
+        with (
+            patch(
+                "sglang.srt.disaggregation.decode.ScheduleBatch.init_new",
+                return_value=batch,
+            ) as init_new,
+            get_context().override_server_args(
+                disaggregation_decode_tail_tokens=4, max_prefill_tokens=4
+            ),
+        ):
+            self.assertIs(
+                scheduler._get_new_tail_extend_batch(scheduler.running_batch), batch
+            )
+
+        self.assertEqual([req.rid for req in init_new.call_args.args[0]], ["high"])
+        self.assertEqual([req.rid for req in scheduler.waiting_queue], ["low"])
 
     def test_prebuilt_requests_run_from_their_admission(self):
         """Admission moves the requests from waiting into running."""
