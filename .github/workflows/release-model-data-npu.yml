@@ -17,7 +17,7 @@ on:
         description: 'NPU image used by the prefill/decode pods.'
         required: false
         type: string
-        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B031'
+        default: 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B031'
       use_image_sglang:
         description: "If 'true' (default), pods import sglang from the image's site-packages. Set 'false' to use the PR checkout's sglang."
         required: false
@@ -113,7 +113,7 @@ jobs:
       decode_size: ${{ matrix.decode_size }}
       router_size: ${{ matrix.router_size }}
       test_case: ${{ matrix.test_case }}
-      image: ${{ inputs.image || 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.2.0-a3-B031' }}
+      image: ${{ inputs.image || 'swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B031' }}
       prefill_decode_deployment: ${{ matrix.prefill_decode_deployment }}
       container_patches: ${{ matrix.container_patches || '' }}
       run_start_metadata: ${{ needs.metadata.outputs.run_start_metadata }}
@@ -175,10 +175,14 @@ jobs:
               if (test_case, test_type) in cases:
                   print(f"Warning: duplicate metrics for {(test_case, test_type)}")
               raw_labels = data.get("labels")
+              metrics = data.get("metrics") or {}
+              # run_npu_e2e_test.py records "pass"/"fail"; older writers omit it.
+              status = data.get("status") or ("pass" if metrics else "unknown")
               cases[(test_case, test_type)] = {
                   "test_case": test_case,
                   "test_type": test_type,
-                  "metrics": data.get("metrics") or {},
+                  "status": status,
+                  "metrics": metrics,
                   "baselines": data.get("baselines") or {},
                   "labels": raw_labels if isinstance(raw_labels, dict) else {},
               }
@@ -195,32 +199,61 @@ jobs:
           with open(os.environ["OUTPUT_JSON"], "w", encoding="utf-8") as f:
               json.dump(payload, f, indent=2)
 
+          def accuracy_rows(case):
+              """Accuracy rows; the evaluated dataset comes from dump_metric labels."""
+              if not case["metrics"]:
+                  return [f"| {case['test_case']} | {case['status']} | - | - | - | - |"]
+              rows = []
+              for name in sorted(case["metrics"]):
+                  labels = case["labels"].get(name) or {}
+                  dataset = (
+                      labels.get("dataset", "-") if isinstance(labels, dict) else "-"
+                  )
+                  baseline = case["baselines"].get(name, "-")
+                  rows.append(
+                      f"| {case['test_case']} | {case['status']} | {dataset} | "
+                      f"{name} | {case['metrics'][name]} | {baseline} |"
+                  )
+              return rows
+
+          def performance_rows(case):
+              if not case["metrics"]:
+                  return [f"| {case['test_case']} | {case['status']} | - | - | - |"]
+              return [
+                  f"| {case['test_case']} | {case['status']} | {name} | "
+                  f"{case['metrics'][name]} | {case['baselines'].get(name, '-')} |"
+                  for name in sorted(case["metrics"])
+              ]
+
+          accuracy_cases = [case for case in ordered if case["test_type"] == "accuracy"]
+          performance_cases = [
+              case for case in ordered if case["test_type"] != "accuracy"
+          ]
+
           lines = ["# NPU Key Model Release Data", ""]
           if not ordered:
               lines.append("No metrics were collected.")
           else:
-              lines.append("| Test case | Type | Metric | Dataset | Value | Baseline |")
-              lines.append("| --- | --- | --- | --- | --- | --- |")
-              for case in ordered:
-                  if not case["metrics"]:
-                      lines.append(
-                          f"| {case['test_case']} | {case['test_type']} | - | - | - | - |"
-                      )
-                      continue
-                  for name in sorted(case["metrics"]):
-                      baseline = case["baselines"].get(name, "-")
-                      # Accuracy metrics carry the evaluated dataset in their
-                      # dump_metric labels (gpqa_diamond / gsm8k / ...).
-                      labels = case["labels"].get(name) or {}
-                      dataset = (
-                          labels.get("dataset", "-")
-                          if isinstance(labels, dict)
-                          else "-"
-                      )
-                      lines.append(
-                          f"| {case['test_case']} | {case['test_type']} | "
-                          f"{name} | {dataset} | {case['metrics'][name]} | {baseline} |"
-                      )
+              if accuracy_cases:
+                  lines += [
+                      "## Accuracy",
+                      "",
+                      "| Test case | Status | Dataset | Metric | Value | Baseline |",
+                      "| --- | --- | --- | --- | --- | --- |",
+                  ]
+                  for case in accuracy_cases:
+                      lines += accuracy_rows(case)
+                  lines.append("")
+              if performance_cases:
+                  lines += [
+                      "## Performance",
+                      "",
+                      "| Test case | Status | Metric | Value | Baseline |",
+                      "| --- | --- | --- | --- | --- |",
+                  ]
+                  for case in performance_cases:
+                      lines += performance_rows(case)
+                  lines.append("")
           markdown = "\n".join(lines) + "\n"
           with open(os.environ["OUTPUT_MARKDOWN"], "w", encoding="utf-8") as f:
               f.write(markdown)
