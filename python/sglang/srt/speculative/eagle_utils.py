@@ -406,7 +406,7 @@ def eagle_prepare_for_verify(
         # Host upper bound of this batch's final KV lengths: bounds the
         # backend's replay page-table copies in mirrorless mode without a D2H sync.
         batch.max_seq_len_host = (
-            max((req.seq_len for req in batch.reqs), default=0)
+            max((req.seqlen for req in batch.reqs), default=0)
             + verify_input.draft_token_num
         )
         batch.input_ids = verify_input.draft_token
