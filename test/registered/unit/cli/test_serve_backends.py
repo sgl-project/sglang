@@ -489,7 +489,11 @@ def _launch_argv(argv):
 
 
 # Cookbook pages whose model runs only in an image built from a branch.
-NOT_IN_MAIN = {"stepfun-ai/Step-5-Preview"}
+NOT_IN_MAIN = {
+    "stepfun-ai/Step-5-Preview",
+    "thinkingmachines/Inkling-2-Small",
+    "thinkingmachines/Inkling-2-Small-MXFP8",
+}
 
 
 def _launchable():
