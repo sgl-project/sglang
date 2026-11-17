@@ -15,7 +15,11 @@ from sglang.srt.hardware_backend.npu.quantization.moe_methods import (
     NPUWNA16Int4MoEMethod,
 )
 from sglang.srt.layers.moe.moe_runner import MoeRunner, MoeRunnerConfig
-from sglang.srt.layers.moe.utils import MoeRunnerBackend, get_moe_runner_backend
+from sglang.srt.layers.moe.utils import (
+    MoeRunnerBackend,
+    get_moe_runner_backend,
+    route_dropped_experts_to_local,
+)
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     WNA16_SUPPORTED_BITS,
     CompressedTensorsMoEScheme,
@@ -575,6 +579,69 @@ class CompressedTensorsWNA16TritonMoE(CompressedTensorsWNA16MoE):
 
         quant_info = self.get_triton_quant_info(layer)
         return self.runner.run(dispatch_output, quant_info)
+
+
+class XPUCompressedTensorsWNA16MoE(CompressedTensorsWNA16TritonMoE):
+    """W4A16 MoE method using sgl-kernel-xpu's native INT4 grouped GEMM.
+
+    Shares the Triton scheme's packed layout, [E, N, K//2] uint8 weights and
+    [E, N, K//group_size] scales, and only changes the nibble encoding: the
+    native kernel reads a nibble as signed INT4 when no zero-point is given,
+    whereas compressed-tensors stores symmetric codes with a +8 offset.
+    """
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(layer, "is_xpu_int4_converted", False):
+            return
+
+        super().process_weights_after_loading(layer)
+        # Flipping each nibble's top bit maps code + 8 to the same value in
+        # two's complement, so no zero-point tensor has to be kept.
+        layer.w13_weight_packed.data.bitwise_xor_(0x88)
+        layer.w2_weight_packed.data.bitwise_xor_(0x88)
+        layer.is_xpu_int4_converted = True
+
+    def create_moe_runner(
+        self, layer: torch.nn.Module, moe_runner_config: MoeRunnerConfig
+    ):
+        self.moe_runner_config = moe_runner_config
+
+    def apply_weights(
+        self,
+        layer: torch.nn.Module,
+        dispatch_output: StandardDispatchOutput,
+    ) -> CombineInput:
+        from sgl_kernel import fused_experts
+
+        from sglang.srt.layers.moe.token_dispatcher import StandardCombineInput
+
+        moe_runner_config = self.moe_runner_config
+        x = dispatch_output.hidden_states
+        topk_weights, topk_ids, _ = dispatch_output.topk_output
+        if moe_runner_config.apply_router_weight_on_input:
+            x = x * topk_weights.to(x.dtype)
+            topk_weights = torch.ones_like(topk_weights)
+        # after the reset to 1, so dropped slots still end at weight 0
+        topk_weights, topk_ids = route_dropped_experts_to_local(
+            topk_weights=topk_weights, topk_ids=topk_ids
+        )
+
+        output = fused_experts(
+            x,
+            layer.w13_weight_packed,
+            layer.w2_weight_packed,
+            topk_weights,
+            topk_ids,
+            use_int4_w4a16=True,
+            w1_scale=layer.w13_weight_scale,
+            w2_scale=layer.w2_weight_scale,
+            activation=moe_runner_config.activation,
+            routed_scaling_factor=moe_runner_config.routed_scaling_factor,
+            gemm1_alpha=moe_runner_config.gemm1_alpha,
+            gemm1_limit=moe_runner_config.gemm1_clamp_limit,
+            swiglu_limit=moe_runner_config.swiglu_limit,
+        )
+        return StandardCombineInput(hidden_states=output)
 
 
 class NPUCompressedTensorsW4A16Int4DynamicMoE(CompressedTensorsMoEScheme):

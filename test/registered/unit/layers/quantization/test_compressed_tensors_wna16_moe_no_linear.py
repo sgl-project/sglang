@@ -11,6 +11,7 @@ from sglang.srt.layers.quantization.compressed_tensors.compressed_tensors import
 from sglang.srt.layers.quantization.compressed_tensors.schemes import (
     CompressedTensorsWNA16MoE,
     CompressedTensorsWNA16TritonMoE,
+    XPUCompressedTensorsWNA16MoE,
 )
 from sglang.srt.runtime_context import override_platform
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -48,6 +49,23 @@ def _make_wna16_moe_config(targets, num_bits, **weight_overrides):
         },
         "ignore": ["lm_head", "re:.*self_attn.*", "re:.*mlp.gate$"],
     }
+
+
+def _pack_int32_along_k(codes):
+    """Pack [E, K, N] 4-bit codes as compressed-tensors does: [E, K // 8, N] int32."""
+    experts, k, n = codes.shape
+    words = torch.zeros(experts, k // 8, n, dtype=torch.int64)
+    for i in range(8):
+        words |= codes[:, i::8, :].to(torch.int64) << (4 * i)
+    words = torch.where(words >= 2**31, words - 2**32, words)
+    return torch.nn.Parameter(words.to(torch.int32), requires_grad=False)
+
+
+def _signed_nibbles(packed):
+    """Decode [E, N, K // 2] uint8, low nibble first, as two's-complement INT4."""
+    low, high = (packed & 0xF).to(torch.int64), (packed >> 4).to(torch.int64)
+    nibbles = torch.stack((low, high), dim=-1).flatten(-2)
+    return torch.where(nibbles >= 8, nibbles - 16, nibbles)
 
 
 class TestWNA16MoENoLinearGroup(CustomTestCase):
@@ -134,32 +152,38 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
                 self.assertIsInstance(scheme, CompressedTensorsWNA16MoE)
                 self.assertNotIsInstance(scheme, CompressedTensorsWNA16TritonMoE)
 
-    def test_xpu_int4_auto_uses_triton(self):
+    def _xpu_moe_scheme(self, backend, **weight_overrides):
+        quant_config = CompressedTensorsConfig.from_config(
+            _make_wna16_moe_config(
+                ["re:.*mlp.experts.*"], num_bits=4, **weight_overrides
+            )
+        )
+        with (
+            mock.patch.object(compressed_tensors, "_is_xpu", True),
+            mock.patch.object(
+                compressed_tensors, "get_moe_runner_backend", return_value=backend
+            ),
+        ):
+            return quant_config.get_moe_scheme(
+                torch.nn.Module(), layer_name=EXPERTS_LAYER
+            )
+
+    def test_xpu_int4_auto_uses_the_native_kernel(self):
         for group_size in (32, 128):
             with self.subTest(group_size=group_size):
-                quant_config = CompressedTensorsConfig.from_config(
-                    _make_wna16_moe_config(
-                        ["re:.*mlp.experts.*"],
-                        num_bits=4,
-                        group_size=group_size,
-                    )
+                scheme = self._xpu_moe_scheme(
+                    MoeRunnerBackend.AUTO, group_size=group_size
                 )
 
-                with (
-                    mock.patch.object(compressed_tensors, "_is_xpu", True),
-                    mock.patch.object(
-                        compressed_tensors,
-                        "get_moe_runner_backend",
-                        return_value=MoeRunnerBackend.AUTO,
-                    ),
-                ):
-                    scheme = quant_config.get_moe_scheme(
-                        torch.nn.Module(), layer_name=EXPERTS_LAYER
-                    )
+                self.assertIsInstance(scheme, XPUCompressedTensorsWNA16MoE)
 
-                self.assertIsInstance(scheme, CompressedTensorsWNA16TritonMoE)
+    def test_xpu_explicit_triton_keeps_the_triton_scheme(self):
+        scheme = self._xpu_moe_scheme(MoeRunnerBackend.TRITON)
 
-    def test_xpu_rejects_unvalidated_triton_layouts(self):
+        # The native scheme subclasses the Triton one, so isinstance can't tell them apart.
+        self.assertIs(type(scheme), CompressedTensorsWNA16TritonMoE)
+
+    def test_xpu_rejects_unvalidated_layouts(self):
         cases = {
             "asymmetric": (4, {"symmetric": False}),
             "channel": (4, {"strategy": "channel", "group_size": None}),
@@ -167,25 +191,56 @@ class TestWNA16MoENoLinearGroup(CustomTestCase):
             "actorder": (4, {"actorder": "group"}),
             "int8": (8, {}),
         }
-        for name, (num_bits, overrides) in cases.items():
-            with self.subTest(name=name):
-                quant_config = CompressedTensorsConfig.from_config(
-                    _make_wna16_moe_config(
-                        ["re:.*mlp.experts.*"], num_bits=num_bits, **overrides
+        for backend in (MoeRunnerBackend.AUTO, MoeRunnerBackend.TRITON):
+            for name, (num_bits, overrides) in cases.items():
+                with self.subTest(backend=backend, name=name):
+                    quant_config = CompressedTensorsConfig.from_config(
+                        _make_wna16_moe_config(
+                            ["re:.*mlp.experts.*"], num_bits=num_bits, **overrides
+                        )
                     )
+                    with (
+                        mock.patch.object(compressed_tensors, "_is_xpu", True),
+                        mock.patch.object(
+                            compressed_tensors,
+                            "get_moe_runner_backend",
+                            return_value=backend,
+                        ),
+                        self.assertRaisesRegex(ValueError, "WNA16 MoE on XPU"),
+                    ):
+                        quant_config.get_moe_scheme(
+                            torch.nn.Module(), layer_name=EXPERTS_LAYER
+                        )
+
+    def test_xpu_native_scheme_stores_signed_nibbles(self):
+        """compressed-tensors stores code + 8; the native kernel reads signed INT4."""
+        experts, hidden, intermediate, group_size = 2, 64, 32, 32
+        scheme = self._xpu_moe_scheme(MoeRunnerBackend.AUTO, group_size=group_size)
+        w13_codes = torch.randint(0, 16, (experts, hidden, 2 * intermediate))
+        w2_codes = torch.randint(0, 16, (experts, intermediate, hidden))
+        layer = torch.nn.Module()
+        for name, codes in (("w13", w13_codes), ("w2", w2_codes)):
+            k, n = codes.shape[1], codes.shape[2]
+            setattr(layer, f"{name}_weight_packed", _pack_int32_along_k(codes))
+            setattr(
+                layer,
+                f"{name}_weight_scale",
+                torch.nn.Parameter(
+                    torch.ones(experts, k // group_size, n, dtype=torch.bfloat16),
+                    requires_grad=False,
+                ),
+            )
+
+        scheme.process_weights_after_loading(layer)
+        scheme.process_weights_after_loading(layer)  # must not flip back
+
+        for name, codes in (("w13", w13_codes), ("w2", w2_codes)):
+            with self.subTest(weight=name):
+                packed = getattr(layer, f"{name}_weight_packed")
+                self.assertEqual(packed.dtype, torch.uint8)
+                self.assertTrue(
+                    torch.equal(_signed_nibbles(packed), codes.transpose(1, 2) - 8)
                 )
-                with (
-                    mock.patch.object(compressed_tensors, "_is_xpu", True),
-                    mock.patch.object(
-                        compressed_tensors,
-                        "get_moe_runner_backend",
-                        return_value=MoeRunnerBackend.AUTO,
-                    ),
-                    self.assertRaisesRegex(ValueError, "WNA16 MoE on XPU"),
-                ):
-                    quant_config.get_moe_scheme(
-                        torch.nn.Module(), layer_name=EXPERTS_LAYER
-                    )
 
     def test_explicit_triton_rejects_unvalidated_layout(self):
         quant_config = CompressedTensorsConfig.from_config(
