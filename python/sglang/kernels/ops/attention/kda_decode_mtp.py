@@ -175,6 +175,7 @@ def kda_decode_mtp_kernel(
     ring_beta: cute.Tensor,
     onorm_g: cute.Tensor,
     onorm_weight: cute.Tensor,
+    ring_indices: cute.Tensor,
     smem_qk_layout: cute.Layout,
     smem_state_layout: cute.Layout,
     ssm_state_indices: cute.Tensor,
@@ -185,8 +186,10 @@ def kda_decode_mtp_kernel(
     P2_LANES_K: cutlass.Constexpr[int],
     lower_bound: cutlass.Constexpr[float],
     CACHE_RING: cutlass.Constexpr[bool],
+    SEPARATE_RING_INDEX: cutlass.Constexpr[bool],
     APPLY_ONORM: cutlass.Constexpr[bool],
     onorm_eps: cutlass.Constexpr[float],
+    USE_PACKED_FMA: cutlass.Constexpr[bool],
 ):
     """KDA MTP decode — SMEM pre-compute + register-resident state.
 
@@ -304,6 +307,10 @@ def kda_decode_mtp_kernel(
 
     # int64: `slot * stride` overflows int32 on envelope-strided pools.
     slot = cutlass.Int64(slot)
+    # A request-scoped ring has rows of its own; otherwise it rides the slot.
+    ring_slot = slot
+    if cutlass.const_expr(SEPARATE_RING_INDEX):
+        ring_slot = cutlass.Int64(ring_indices[i_n])
 
     # q/k/g each run on P1_JOB_WARPS warps split by token parity and the v-conv
     # takes the rest. Each token's conv is an independent window over globals,
@@ -508,7 +515,7 @@ def kda_decode_mtp_kernel(
                             if cutlass.const_expr(CACHE_RING):
                                 for i in range(VEC_SIZE):
                                     k_idx = i * WARP_SIZE + in_warp_tid
-                                    ring_rawk[slot, i_hv, i_t, k_idx] = (
+                                    ring_rawk[ring_slot, i_hv, i_t, k_idx] = (
                                         cutlass.BFloat16(r_k[i])
                                     )
                             sum_k = 0.0
@@ -537,7 +544,7 @@ def kda_decode_mtp_kernel(
                                     + cute.math.exp(-r_b_raw, fastmath=True)
                                 )
                                 if cutlass.const_expr(CACHE_RING):
-                                    ring_beta[slot, i_hv, i_t] = sBeta[i_t]
+                                    ring_beta[ring_slot, i_hv, i_t] = sBeta[i_t]
                         else:
                             # Gate warps do not otherwise use r_q in this phase.
                             for i in range(VEC_SIZE):
@@ -562,7 +569,7 @@ def kda_decode_mtp_kernel(
                                     qk_j % 4,
                                 ] = cute.math.exp(r_gk, fastmath=True)
                                 if cutlass.const_expr(CACHE_RING):
-                                    ring_g[slot, i_hv, i_t, k_idx] = r_gk
+                                    ring_g[ring_slot, i_hv, i_t, k_idx] = r_gk
                         if cutlass.const_expr(_job == 0):
                             for i in range(VEC_SIZE):
                                 k_idx = i * 32 + in_warp_tid
@@ -662,7 +669,7 @@ def kda_decode_mtp_kernel(
                         cutlass.Float32(1.0) + cute.math.exp(-gate_raw, fastmath=True)
                     )
                 if cutlass.const_expr(CACHE_RING):
-                    ring_rawv[slot, i_hv, _t, _v_idx] = cutlass.BFloat16(_vconv)
+                    ring_rawv[ring_slot, i_hv, _t, _v_idx] = cutlass.BFloat16(_vconv)
                 for _w in cutlass.range_constexpr(KERNEL_WIDTH - 1):
                     intermediate_conv_v[scratch_row, _t, head_off + _v_idx, _w] = (
                         cutlass.BFloat16(_win[_t + 1 + _w])
@@ -751,17 +758,26 @@ def kda_decode_mtp_kernel(
                     shk_2 = 0.0
                     for jp in range(P2_VEC // 2):
                         _p = jp * 2
-                        r_state[_st + _p], r_state[_st + _p + 1] = (
-                            cute.arch.mul_packed_f32x2(
-                                (r_decay[_p], r_decay[_p + 1]),
-                                (r_state[_st + _p], r_state[_st + _p + 1]),
+                        # Packed f32x2 math is SM100+; SM90 takes the scalar pair.
+                        if cutlass.const_expr(USE_PACKED_FMA):
+                            r_state[_st + _p], r_state[_st + _p + 1] = (
+                                cute.arch.mul_packed_f32x2(
+                                    (r_decay[_p], r_decay[_p + 1]),
+                                    (r_state[_st + _p], r_state[_st + _p + 1]),
+                                )
                             )
-                        )
-                        shk_1, shk_2 = cute.arch.fma_packed_f32x2(
-                            src_a=(r_state[_st + _p], r_state[_st + _p + 1]),
-                            src_b=(r_k[_p], r_k[_p + 1]),
-                            src_c=(shk_1, shk_2),
-                        )
+                            shk_1, shk_2 = cute.arch.fma_packed_f32x2(
+                                src_a=(r_state[_st + _p], r_state[_st + _p + 1]),
+                                src_b=(r_k[_p], r_k[_p + 1]),
+                                src_c=(shk_1, shk_2),
+                            )
+                        else:
+                            r_state[_st + _p] = r_decay[_p] * r_state[_st + _p]
+                            r_state[_st + _p + 1] = (
+                                r_decay[_p + 1] * r_state[_st + _p + 1]
+                            )
+                            shk_1 = r_state[_st + _p] * r_k[_p] + shk_1
+                            shk_2 = r_state[_st + _p + 1] * r_k[_p + 1] + shk_2
                     shk = shk_1 + shk_2
                     for offset in [16, 8, 4, 2, 1]:
                         if cutlass.const_expr(offset < P2_LANES_K):
@@ -773,18 +789,26 @@ def kda_decode_mtp_kernel(
                     shq_2 = 0.0
                     for jp in range(P2_VEC // 2):
                         _p = jp * 2
-                        r_state[_st + _p], r_state[_st + _p + 1] = (
-                            cute.arch.fma_packed_f32x2(
-                                src_a=(vnb, vnb),
-                                src_b=(r_k[_p], r_k[_p + 1]),
-                                src_c=(r_state[_st + _p], r_state[_st + _p + 1]),
+                        if cutlass.const_expr(USE_PACKED_FMA):
+                            r_state[_st + _p], r_state[_st + _p + 1] = (
+                                cute.arch.fma_packed_f32x2(
+                                    src_a=(vnb, vnb),
+                                    src_b=(r_k[_p], r_k[_p + 1]),
+                                    src_c=(r_state[_st + _p], r_state[_st + _p + 1]),
+                                )
                             )
-                        )
-                        shq_1, shq_2 = cute.arch.fma_packed_f32x2(
-                            src_a=(r_state[_st + _p], r_state[_st + _p + 1]),
-                            src_b=(r_q[_p], r_q[_p + 1]),
-                            src_c=(shq_1, shq_2),
-                        )
+                            shq_1, shq_2 = cute.arch.fma_packed_f32x2(
+                                src_a=(r_state[_st + _p], r_state[_st + _p + 1]),
+                                src_b=(r_q[_p], r_q[_p + 1]),
+                                src_c=(shq_1, shq_2),
+                            )
+                        else:
+                            r_state[_st + _p] = vnb * r_k[_p] + r_state[_st + _p]
+                            r_state[_st + _p + 1] = (
+                                vnb * r_k[_p + 1] + r_state[_st + _p + 1]
+                            )
+                            shq_1 = r_state[_st + _p] * r_q[_p] + shq_1
+                            shq_2 = r_state[_st + _p + 1] * r_q[_p + 1] + shq_2
                     shq = shq_1 + shq_2
                     for offset in [16, 8, 4, 2, 1]:
                         if cutlass.const_expr(offset < P2_LANES_K):
@@ -876,6 +900,7 @@ def _run_kda_decode_mtp_dspark(
     ring_beta: cute.Tensor,
     onorm_g: cute.Tensor,
     onorm_weight: cute.Tensor,
+    ring_indices: cute.Tensor,
     scale: cutlass.Constexpr[float],
     H: cutlass.Constexpr[int],
     N: cutlass.Constexpr[int],
@@ -883,8 +908,10 @@ def _run_kda_decode_mtp_dspark(
     BLOCK_THREADS: cutlass.Constexpr[int],
     lower_bound: cutlass.Constexpr[float],
     CACHE_RING: cutlass.Constexpr[bool],
+    SEPARATE_RING_INDEX: cutlass.Constexpr[bool],
     APPLY_ONORM: cutlass.Constexpr[bool],
     onorm_eps: cutlass.Constexpr[float],
+    USE_PACKED_FMA: cutlass.Constexpr[bool],
     stream: cuda.CUstream,
 ):
     """Launch the fixed Kimi-K3/DSpARK bonus + NUM_SPEC-draft specialization."""
@@ -965,6 +992,7 @@ def _run_kda_decode_mtp_dspark(
         ring_beta,
         onorm_g,
         onorm_weight,
+        ring_indices,
         smem_qk_layout,
         smem_state_layout,
         ssm_state_indices,
@@ -975,8 +1003,10 @@ def _run_kda_decode_mtp_dspark(
         p2_lanes,
         lower_bound,
         CACHE_RING,
+        SEPARATE_RING_INDEX,
         APPLY_ONORM,
         onorm_eps,
+        USE_PACKED_FMA,
     ).launch(
         grid=(H, N, 1),
         block=[BLOCK_THREADS, 1, 1],
@@ -1083,6 +1113,7 @@ def fused_kda_decode_mtp_dspark(
     onorm_gate=None,
     onorm_weight=None,
     onorm_eps=None,
+    replayssm_ring_indices=None,
 ):
     """Run Kimi-K3 KDA verify while preserving DSpARK rollback semantics.
 
@@ -1096,7 +1127,8 @@ def fused_kda_decode_mtp_dspark(
     CACHE_RING mode — per-step raw inputs go to the rings (consumed by the
     commit-time exact fold, see kda_replayssm_spec_decode.py) and the per-step
     intermediate_ssm state snapshots are skipped, so intermediate_ssm may be
-    None.
+    None. The rings are indexed by ``ssm_state_indices`` unless
+    ``replayssm_ring_indices`` ([N] int32) gives each request its ring row.
 
     Passing all three onorm_* arguments fuses gated RMSNorm into the recurrence
     kernel.
@@ -1173,6 +1205,16 @@ def fused_kda_decode_mtp_dspark(
             # Dead-branch placeholder: CACHE_RING skips every ht snapshot
             # write, but CuTe still type-checks the rank-5 indexing.
             intermediate_ssm = recurrent_state.unsqueeze(1)
+    separate_ring_index = replayssm_ring_indices is not None
+    if separate_ring_index and (
+        not cache_ring
+        or replayssm_ring_indices.dtype != torch.int32
+        or replayssm_ring_indices.numel() < N
+    ):
+        raise ValueError(
+            "replayssm_ring_indices needs the ReplaySSM rings and an int32 row "
+            "per request"
+        )
     if not cache_ring and (
         intermediate_ssm.shape[1] < 1 + num_spec
         or intermediate_ssm.shape[2:5] != (H, TILE_K, TILE_K)
@@ -1228,6 +1270,8 @@ def fused_kda_decode_mtp_dspark(
         replayssm_beta if cache_ring else intermediate_conv_q[..., 0],
         onorm_gate if apply_onorm else x_v,
         onorm_weight if apply_onorm else dt_bias,
+        # Placeholder when the rings ride the state slots.
+        replayssm_ring_indices if separate_ring_index else ssm_state_indices,
     )
     fits_32bit = tuple(_fits_32bit_stride(tensor) for tensor in args)
     cuda_arch = current_arch().cuda
@@ -1238,6 +1282,7 @@ def fused_kda_decode_mtp_dspark(
         num_spec,
         block_threads,
         cache_ring,
+        separate_ring_index,
         apply_onorm,
         float(onorm_eps) if apply_onorm else 0.0,
         float(scale),
@@ -1261,8 +1306,10 @@ def fused_kda_decode_mtp_dspark(
             BLOCK_THREADS=block_threads,
             lower_bound=float(lower_bound),
             CACHE_RING=cache_ring,
+            SEPARATE_RING_INDEX=separate_ring_index,
             APPLY_ONORM=apply_onorm,
             onorm_eps=float(onorm_eps) if apply_onorm else 0.0,
+            USE_PACKED_FMA=cuda_arch.major >= 10,
             stream=stream,
         )
         _DSPARK_COMPILED[key] = compiled
