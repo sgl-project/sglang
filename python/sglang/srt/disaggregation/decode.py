@@ -3007,6 +3007,20 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
         )
 
         fill_len = pre_alloc_fill_len(req)
+        if skip_host_alloc:
+            coordinator = self.scheduler.hisparse_coordinator
+            assert coordinator is not None
+            retained_len = int(
+                coordinator.req_to_host_pool_allocated_len[req.kv.req_pool_idx]
+            )
+            required_host_len = coordinator.host_token_len(fill_len)
+            if retained_len < required_host_len:
+                # Allocating more host slots cannot recreate missing KV data.
+                # Reject before claiming committed tokens or allocating slots.
+                raise ValueError(
+                    "Retained HiSparse host row does not cover committed KV: "
+                    f"{retained_len} retained vs {required_host_len} required"
+                )
         req.kv.commit_prealloc(fill_len)
 
         if prefix_len > 0:
@@ -3087,29 +3101,13 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 # HiSparse pools keep one window.
                 swa_tail_len=next(iter(window_tails.values()), fill_len),
             )
-            # Allocate host indices for the RDMA transfer target. A resumed
-            # state-preserving retraction keeps its host-pool row; extending
-            # alloc_paged_token_slots from the retained length covers the
-            # tokens generated since the retraction.
-            host_start = 0
             if skip_host_alloc:
-                host_start = int(
-                    coordinator.req_to_host_pool_allocated_len[req.kv.req_pool_idx]
-                )
-                if host_start < coordinator.host_token_len(fill_len):
-                    host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
-                        coordinator.req_to_host_pool,
-                        coordinator.req_to_host_pool_allocated_len,
-                        req.kv.req_pool_idx,
-                        host_start,
-                        coordinator.host_token_len(fill_len) - host_start,
-                    )
-                else:
-                    host_indices = coordinator.req_to_host_pool[
-                        req.kv.req_pool_idx,
-                        host_start : coordinator.host_token_len(fill_len),
-                    ]
+                # Recovery reuses saved data; it never creates a transfer target.
+                host_indices = coordinator.req_to_host_pool[
+                    req.kv.req_pool_idx, :required_host_len
+                ]
             else:
+                # Fresh requests need host indices for the RDMA transfer target.
                 host_indices = coordinator.mem_pool_host.alloc_paged_token_slots(
                     coordinator.req_to_host_pool,
                     coordinator.req_to_host_pool_allocated_len,

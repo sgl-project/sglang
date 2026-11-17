@@ -125,8 +125,8 @@ class RequestRetirer:
             ):
                 # HiSparse state-preserving retraction: the host pool already
                 # holds every committed token, so keep the req_to_host_pool row,
-                # free only the device side, and skip the cpu_tensor backup
-                # (which would raise NotImplementedError on HiSparse pools).
+                # free only the device side, and recover locally instead of
+                # asking prefill to recompute the prefix.
                 self.hisparse_coordinator.retract_req_state_preserving(req)
             else:
                 self.hisparse_coordinator.release_request(req)

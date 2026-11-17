@@ -135,6 +135,21 @@ class TestDecodeQueueCleanup(CustomTestCase):
                 kv_receiver=SimpleNamespace(init=lambda rank: None)
             )
         )
+        # Newly allocated host slots contain no saved KV. An incomplete
+        # retained row must fail before the resume claims committed tokens.
+        coordinator.mem_pool_host = SimpleNamespace(
+            alloc_paged_token_slots=lambda *args: torch.tensor([23])
+        )
+        coordinator.req_to_host_pool_allocated_len[row] = 2
+        coordinator.req_to_host_pool[row, 2] = -1
+        with self.assertRaisesRegex(ValueError, "Retained HiSparse host row"):
+            queue._pre_alloc(req, skip_host_alloc=True)
+        self.assertEqual(req.kv.kv_allocated_len, 0)
+        self.assertEqual(req.kv.kv_committed_len, 0)
+        self.assertEqual(coordinator.req_to_host_pool_allocated_len[row], 2)
+        self.assertEqual(coordinator.req_to_host_pool[row, 2], -1)
+        coordinator.req_to_host_pool_allocated_len[row] = 3
+        coordinator.req_to_host_pool[row, 2] = 22
         queue.add(req, is_retracted=True)
         self.assertEqual(list(queue.retracted_queue), [needs_row, req])
         ready = IndexedReqList(ListKind.WAITING)
