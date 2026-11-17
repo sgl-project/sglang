@@ -6,7 +6,7 @@
 - `cli/`: Command-line interface commands and entrypoints.
 - `kernels/`: Kernel interfaces, implementations, selection, and debugging utilities shared by the runtimes.
 - `lang/`: Deprecated language frontend that is no longer actively maintained.
-- `multimodal_gen/`: Core runtime for image, video, and audio generation models, most of which are diffusion models.
+- `multimodal_gen/`: SGLang Diffusion runtime for image, video, audio, and action generation models.
 - `srt/`: Core runtime for autoregressive language models. (SRT = SGLang Runtime.)
 - `test/`: Shared test and evaluation utilities.
 

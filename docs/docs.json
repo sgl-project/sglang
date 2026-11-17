@@ -107,7 +107,11 @@
     },
     {
       "source": "/advanced_features/dp_dpa_smg_guide.html",
-      "destination": "/docs/advanced_features/dp_dpa_smg_guide"
+      "destination": "/docs/advanced_features/dp_dpa_router_guide"
+    },
+    {
+      "source": "/docs/advanced_features/dp_dpa_smg_guide",
+      "destination": "/docs/advanced_features/dp_dpa_router_guide"
     },
     {
       "source": "/advanced_features/dp_for_multi_modal_encoder.html",
@@ -191,7 +195,11 @@
     },
     {
       "source": "/advanced_features/sgl_model_gateway.html",
-      "destination": "/docs/advanced_features/sgl_model_gateway"
+      "destination": "/docs/advanced_features/dp_dpa_router_guide"
+    },
+    {
+      "source": "/docs/advanced_features/sgl_model_gateway",
+      "destination": "/docs/advanced_features/dp_dpa_router_guide"
     },
     {
       "source": "/advanced_features/sglang_for_rl.html",
@@ -947,6 +955,7 @@
               "docs/advanced_features/server_arguments",
               "docs/advanced_features/session_radix_cache",
               "docs/advanced_features/radix_eviction_policy",
+              "docs/advanced_features/hybrid_cache_checkpoints",
               "docs/advanced_features/hyperparameter_tuning",
               "docs/advanced_features/text_watermarking",
               "docs/advanced_features/attention_backend",
@@ -961,7 +970,7 @@
               "docs/advanced_features/quantization",
               "docs/advanced_features/quantized_kv_cache",
               "docs/advanced_features/reasoning_aware_compression",
-              "docs/advanced_features/dp_dpa_smg_guide",
+              "docs/advanced_features/dp_dpa_router_guide",
               "docs/advanced_features/prefill_cp",
               "docs/advanced_features/kv_cache_sharing",
               "docs/advanced_features/dcp",
@@ -988,12 +997,12 @@
                   "docs/advanced_features/unified_memory_design"
                 ]
               },
+              "docs/advanced_features/hybrid_model_memory",
               "docs/advanced_features/sglang_simulator",
               "docs/advanced_features/vlm_query",
               "docs/advanced_features/dp_for_multi_modal_encoder",
               "docs/advanced_features/cuda_graph_for_multi_modal_encoder",
               "docs/advanced_features/breakable_cuda_graph",
-              "docs/advanced_features/sgl_model_gateway",
               "docs/advanced_features/llm-d",
               "docs/advanced_features/deterministic_inference",
               "docs/advanced_features/observability",
@@ -1543,6 +1552,7 @@
                   {
                     "group": "Thinking Machines",
                     "pages": [
+                      "cookbook/autoregressive/ThinkingMachines/Inkling-2-Small",
                       "cookbook/autoregressive/ThinkingMachines/Inkling",
                       "cookbook/autoregressive/ThinkingMachines/Inkling-Small"
                     ]
@@ -1718,6 +1728,13 @@
                     "tag": "NEW",
                     "pages": [
                       "cookbook/vla/OpenPI/Pi0.5"
+                    ]
+                  },
+                  {
+                    "group": "Runway",
+                    "tag": "NEW",
+                    "pages": [
+                      "cookbook/vla/Runway/Praxis-1"
                     ]
                   }
                 ]

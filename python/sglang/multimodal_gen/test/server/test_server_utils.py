@@ -870,6 +870,16 @@ class PerformanceValidator:
             )
 
 
+class ActionPerformanceValidator(PerformanceValidator):
+    """Action policies run no denoising loop, so only the denoise checks are skipped."""
+
+    def _validate_denoise_agg(self, summary: PerformanceSummary) -> None:
+        return None
+
+    def _validate_denoise_steps(self, summary: PerformanceSummary) -> None:
+        return None
+
+
 class VideoPerformanceValidator(PerformanceValidator):
     """Extended validator for video diffusion with frame-level metrics."""
 
@@ -1061,7 +1071,7 @@ VALIDATOR_REGISTRY = {
     "default": PerformanceValidator,
     "video": VideoPerformanceValidator,
     "mesh": MeshValidator,
-    "action": PerformanceValidator,
+    "action": ActionPerformanceValidator,
 }
 
 
@@ -1757,6 +1767,7 @@ def get_generate_fn(
                 ("base_0_rgb", "left_wrist_0_rgb", "right_wrist_0_rgb"),
             )
         )
+        observation_rows = int(extra.get("observation_rows", 0))
 
         def tensor_payload(array):
             return {
@@ -1776,7 +1787,18 @@ def get_generate_fn(
                 ),
                 axis=-1,
             )
-            return tensor_payload(image.astype(np.uint8))
+            image = image.astype(np.uint8)
+            if observation_rows:
+                # Frame stack [T, H, W, 3], oldest first (Praxis).
+                image = np.tile(image, (observation_rows, 1, 1, 1))
+            return tensor_payload(image)
+
+        def state_payload():
+            if "state_row" in extra:
+                # One valid pose row per frame, so the quaternion stays normalized.
+                row = np.asarray(extra["state_row"], dtype=np.float32)
+                return tensor_payload(np.tile(row, (max(observation_rows, 1), 1)))
+            return tensor_payload(np.linspace(-0.5, 0.5, state_dim, dtype=np.float32))
 
         rng = np.random.default_rng(int(extra.get("seed", 0)))
         request_id = f"{case_id}-{int(time.time() * 1000)}"
@@ -1791,9 +1813,7 @@ def get_generate_fn(
                         for index, camera in enumerate(camera_order)
                     },
                     "camera_order": list(camera_order),
-                    "state": tensor_payload(
-                        np.linspace(-0.5, 0.5, state_dim, dtype=np.float32)
-                    ),
+                    "state": state_payload(),
                     "noise": tensor_payload(
                         rng.standard_normal((action_horizon, action_dim)).astype(
                             np.float32
