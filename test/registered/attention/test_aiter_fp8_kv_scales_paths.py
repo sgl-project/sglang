@@ -8,23 +8,31 @@ with ``k_scale`` or skipping the cache dequantization does not change the result
 the scales are kept far from 1. For the same reason the softmax scale also runs at
 ``1 / head_dim`` (Granite's ``attention_multiplier``), far from ``head_dim**-0.5``.
 The SHUFFLE 5D prefill cases check only the softmax scale, with a bf16 cache. The
-unified-attention decode is covered by ``test_aiter_fp8_q_unified_attention.py``.
+gfx950 head-dim-256 fresh prefill runs through ``forward_extend``'s own cache write,
+NHD and SHUFFLE 5D, so it reads what that writer stored. The fp8 prefills that
+gather a cached prefix, SHUFFLE 5D and the gfx950 head-dim-256 context chunk, read
+what the pool's own write stored. The unified-attention decode is covered by
+``test_aiter_fp8_q_unified_attention.py``.
 """
 
 import itertools
 import math
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.kv.router import PlainPoolRouter
-from sglang.srt.utils import is_hip
+from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool
+from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd")
+# The head-dim-256 cases need gfx950.
+register_amd_ci(est_time=60, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 _RUNNABLE = is_hip()
 if _RUNNABLE:
@@ -135,15 +143,17 @@ class TestAiterFp8KvScalesPaths(CustomTestCase):
         backend.extend_attention_fwd = extend_attention_fwd
         return backend
 
-    def _make_layer(self, k_scale, v_scale, scaling=_HEAD_DIM**-0.5):
+    def _make_layer(
+        self, k_scale, v_scale, scaling=_HEAD_DIM**-0.5, head_dim=_HEAD_DIM
+    ):
         return SimpleNamespace(
             layer_id=0,
             tp_q_head_num=_NUM_Q_HEADS,
             tp_k_head_num=_NUM_KV_HEADS,
             tp_v_head_num=_NUM_KV_HEADS,
-            qk_head_dim=_HEAD_DIM,
-            v_head_dim=_HEAD_DIM,
-            head_dim=_HEAD_DIM,
+            qk_head_dim=head_dim,
+            v_head_dim=head_dim,
+            head_dim=head_dim,
             k_scale=k_scale,
             v_scale=v_scale,
             k_scale_float=k_scale.item() if k_scale is not None else None,
@@ -359,6 +369,190 @@ class TestAiterFp8KvScalesPaths(CustomTestCase):
                     qo_offsets, qo_offsets[1:], kv_offsets, kv_offsets[1:]
                 )
             ]
+        )
+        self._assert_close(out, expected)
+
+    @unittest.skipUnless(
+        _RUNNABLE and is_gfx95_supported(), "the head-dim-256 FP8 prefill is gfx950's"
+    )
+    def test_fresh_fp8_prefill_hd256_reads_what_the_cache_write_stored(self):
+        for layout in ("nhd", "vectorized_5d"):
+            with self.subTest(layout=layout):
+                self._check_fresh_fp8_prefill_hd256(layout)
+
+    def _check_fresh_fp8_prefill_hd256(self, layout):
+        head_dim, page_size = 256, _BLOCK_SIZE_5D
+        extend_lens = [300, 77, 512]
+        batch, offsets = len(extend_lens), _offsets(extend_lens)
+        num_tokens = offsets[-1]
+        q = 4 * torch.randn(
+            num_tokens, _NUM_Q_HEADS, head_dim, device=_DEVICE, dtype=torch.bfloat16
+        )
+        k = 0.5 * torch.randn(
+            num_tokens, _NUM_KV_HEADS, head_dim, device=_DEVICE, dtype=torch.bfloat16
+        )
+        v = torch.randn_like(k)
+        k_scale, v_scale = (
+            (x.abs().float().amax() / torch.finfo(fp8_dtype).max).view(1)
+            for x in (k, v)
+        )
+        num_slots = math.ceil(num_tokens / page_size) * page_size
+        # The AITER pool takes its layout from the environment; only that path
+        # sizes the SHUFFLE 5D buffers.
+        with (
+            patch("sglang.srt.mem_cache.memory_pool._use_aiter", True),
+            envs.SGLANG_AITER_KV_CACHE_LAYOUT.override(layout),
+        ):
+            pool = MHATokenToKVPool(
+                size=num_slots,
+                page_size=page_size,
+                dtype=fp8_dtype,
+                head_num=_NUM_KV_HEADS,
+                head_dim=head_dim,
+                layer_num=1,
+                device=_DEVICE,
+                enable_memory_saver=False,
+            )
+        backend = self._make_backend(None, None)
+        backend.token_to_kv_pool = pool
+        backend.kv_cache_is_vectorized_5d = layout == "vectorized_5d"
+        backend.use_sliding_window_kv_pool = False
+        backend.page_size = page_size
+        indptr = torch.tensor(offsets, dtype=torch.int32, device=_DEVICE)
+        slots = page_size + torch.randperm(num_slots, device=_DEVICE)[:num_tokens]
+        backend.forward_metadata = SimpleNamespace(
+            qo_indptr=indptr,
+            kv_indptr=indptr,
+            kv_indices=slots.to(torch.int32),
+            swa_page_table=None,
+            swa_out_cache_loc=None,
+            paged_kv_view=None,
+            max_q_len=max(extend_lens),
+            max_kv_len=max(extend_lens),
+        )
+        forward_batch = SimpleNamespace(
+            batch_size=batch,
+            forward_mode=ForwardMode.EXTEND,
+            attn_attend_prefix_cache=False,
+            extend_prefix_lens_cpu=[0] * batch,
+            seq_lens_sum=num_tokens,
+            out_cache_loc=slots,
+            out_cache_loc_is_physical=True,
+        )
+        layer = self._make_layer(k_scale, v_scale, head_dim**-0.5, head_dim)
+        # Before the forward: a cache write may divide k and v in place.
+        expected = torch.cat(
+            [
+                _reference_attention(q[s:e], k[s:e], v[s:e], True, layer.scaling)
+                for s, e in zip(offsets, offsets[1:])
+            ]
+        )
+
+        out = backend.forward_extend(
+            q.view(num_tokens, -1), k, v, layer, forward_batch, save_kv_cache=True
+        )
+        self._assert_close(out, expected)
+
+    def test_fp8_prefill_with_a_prefix_vectorized_5d(self):
+        # With a cached prefix the SHUFFLE 5D prefill gathers every request's
+        # K and V from the pool and runs on fp8 q, K and V.
+        self._check_fp8_prefill_from_the_pool("vectorized_5d", _HEAD_DIM)
+
+    @unittest.skipUnless(
+        _RUNNABLE and is_gfx95_supported(), "the head-dim-256 FP8 prefill is gfx950's"
+    )
+    def test_fp8_context_chunk_prefill_hd256(self):
+        # A later chunk of a head-dim-256 prompt gathers the NHD cache for the
+        # ASM varlen kernel.
+        self._check_fp8_prefill_from_the_pool("nhd", 256)
+
+    def _check_fp8_prefill_from_the_pool(self, layout, head_dim):
+        prefix_lens, extend_lens = [128, 0, 1000], [300, 77, 512]
+        batch = len(extend_lens)
+        seq_lens = [p + e for p, e in zip(prefix_lens, extend_lens)]
+        qo_offsets, kv_offsets = _offsets(extend_lens), _offsets(seq_lens)
+        num_q, num_kv = qo_offsets[-1], kv_offsets[-1]
+        q = 4 * torch.randn(
+            num_q, _NUM_Q_HEADS, head_dim, device=_DEVICE, dtype=torch.bfloat16
+        )
+        k = 0.5 * torch.randn(
+            num_kv, _NUM_KV_HEADS, head_dim, device=_DEVICE, dtype=torch.bfloat16
+        )
+        v = torch.randn_like(k)
+        k_scale, v_scale = (
+            (x.abs().float().amax() / torch.finfo(fp8_dtype).max).view(1)
+            for x in (k, v)
+        )
+        layer = self._make_layer(k_scale, v_scale, scaling=head_dim**-0.5)
+        layer.qk_head_dim = layer.v_head_dim = layer.head_dim = head_dim
+        # Before the pool's write, which may divide k and v in place.
+        expected = torch.cat(
+            [
+                _reference_attention(q[qs:qe], k[ks:ke], v[ks:ke], True, layer.scaling)
+                for qs, qe, ks, ke in zip(
+                    qo_offsets, qo_offsets[1:], kv_offsets, kv_offsets[1:]
+                )
+            ]
+        )
+        new_tokens = torch.cat(
+            [
+                torch.arange(s + p, e, device=_DEVICE)
+                for s, e, p in zip(kv_offsets, kv_offsets[1:], prefix_lens)
+            ]
+        )
+        k_new, v_new = k[new_tokens], v[new_tokens]
+
+        page_size = _BLOCK_SIZE_5D
+        num_slots = math.ceil(num_kv / page_size) * page_size
+        # The AITER pool takes its layout from the environment; only that path
+        # sizes the SHUFFLE 5D buffers.
+        with (
+            patch("sglang.srt.mem_cache.memory_pool._use_aiter", True),
+            envs.SGLANG_AITER_KV_CACHE_LAYOUT.override(layout),
+        ):
+            pool = MHATokenToKVPool(
+                size=num_slots,
+                page_size=page_size,
+                dtype=fp8_dtype,
+                head_num=_NUM_KV_HEADS,
+                head_dim=head_dim,
+                layer_num=1,
+                device=_DEVICE,
+                enable_memory_saver=False,
+            )
+        slots = page_size + torch.randperm(num_slots, device=_DEVICE)[:num_kv]
+        pool.set_kv_buffer(layer, slots, k, v, k_scale, v_scale)
+
+        backend = self._make_backend(None, None)
+        backend.token_to_kv_pool = pool
+        backend.kv_cache_is_vectorized_5d = layout == "vectorized_5d"
+        backend.use_sliding_window_kv_pool = False
+        backend.page_size = page_size
+        backend.forward_metadata = SimpleNamespace(
+            qo_indptr=torch.tensor(qo_offsets, dtype=torch.int32, device=_DEVICE),
+            kv_indptr=torch.tensor(kv_offsets, dtype=torch.int32, device=_DEVICE),
+            kv_indices=slots.to(torch.int32),
+            swa_page_table=None,
+            swa_out_cache_loc=None,
+            paged_kv_view=None,
+            asm_ctx_ready=False,
+            max_q_len=max(extend_lens),
+            max_kv_len=max(seq_lens),
+        )
+        forward_batch = SimpleNamespace(
+            batch_size=batch,
+            forward_mode=ForwardMode.EXTEND,
+            attn_attend_prefix_cache=False,
+            extend_prefix_lens_cpu=prefix_lens,
+            seq_lens_sum=num_kv,
+            seq_lens_cpu=torch.tensor(seq_lens),
+            seq_lens=torch.tensor(seq_lens, device=_DEVICE),
+            spec_info=None,
+            out_cache_loc=None,
+        )
+
+        out = backend.forward_extend(
+            q.view(num_q, -1), k_new, v_new, layer, forward_batch, save_kv_cache=False
         )
         self._assert_close(out, expected)
 
