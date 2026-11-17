@@ -15,7 +15,7 @@ import torch
 import sglang.srt.hf_transformers  # noqa: F401
 from sglang.test.ci.ci_register import register_npu_ci
 
-register_npu_ci(est_time=4, suite="base-a-test-npu")
+register_npu_ci(est_time=4, suite="extra-a-test-npu")
 
 for mod in (
     "torch_npu",
