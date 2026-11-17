@@ -662,7 +662,7 @@ class TestPrepareServerArgs(CustomTestCase):
             (None, "xpu", 4, Backend.FULL),
             (Version("2022.1.1"), "xpu", 1, Backend.FULL),
             (Version("2022.1.1"), "xpu", 2, Backend.DISABLED),
-            (Version("2022.1.1"), "cuda", 2, Backend.FULL),
+            (Version("2022.1.1"), "cpu", 2, Backend.FULL),
         ):
             with (
                 self.subTest(
