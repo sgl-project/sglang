@@ -14,10 +14,11 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=128, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=180, stage="base-b", runner_config="1-gpu-small")
 
 
-class _ChatRequestLengthValidation:
+class TestRequestLengthValidation(CustomTestCase):
+    process = None
     rust_frontend = False
     max_tokens_error = "max_completion_tokens is too large"
 
@@ -38,7 +39,7 @@ class _ChatRequestLengthValidation:
 
     @classmethod
     def tearDownClass(cls):
-        if getattr(cls, "process", None) is not None:
+        if cls.process is not None:
             terminate_and_kill_process_tree(cls.process)
 
     def test_input_length_longer_than_context_length(self):
@@ -110,8 +111,79 @@ class _ChatRequestLengthValidation:
             str(cm.exception),
         )
 
+    def test_openai_length_errors_are_json_before_stream_and_recover(self):
+        headers = {"Authorization": f"Bearer {self.api_key}"}
+        for path, prompt in (
+            ("/v1/completions", {"prompt": "hello " * 1200}),
+            (
+                "/v1/chat/completions",
+                {"messages": [{"role": "user", "content": "hello " * 1200}]},
+            ),
+        ):
+            for stream in (False, True):
+                with self.subTest(path=path, stream=stream):
+                    response = requests.post(
+                        self.base_url + path,
+                        headers=headers,
+                        json={
+                            "model": DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                            **prompt,
+                            "max_tokens": 8,
+                            "stream": stream,
+                        },
+                        timeout=30,
+                    )
+                    self.assertEqual(response.status_code, 400, response.text)
+                    self.assertIn("application/json", response.headers["content-type"])
+                    self.assertNotIn("data:", response.text)
+                    body = response.json()
+                    message = body.get("message") or body.get("error", {}).get(
+                        "message", ""
+                    )
+                    self.assertIn("context length", message)
+                    control = requests.post(
+                        self.base_url + "/v1/completions",
+                        headers=headers,
+                        json={
+                            "model": DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                            "prompt": "Hello",
+                            "max_tokens": 1,
+                            "temperature": 0,
+                        },
+                        timeout=30,
+                    )
+                    self.assertEqual(control.status_code, 200, control.text)
+                    self.assertTrue(control.json()["choices"])
 
-class TestRequestLengthValidation(_ChatRequestLengthValidation, CustomTestCase):
+    def test_output_limit_errors_before_stream_and_server_survives(self):
+        client = openai.Client(api_key=self.api_key, base_url=f"{self.base_url}/v1")
+        for stream in (False, True):
+            for route in ("chat", "completion"):
+                with self.subTest(stream=stream, route=route):
+                    with self.assertRaises(openai.BadRequestError):
+                        if route == "chat":
+                            client.chat.completions.create(
+                                model=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                                messages=[{"role": "user", "content": "Hello"}],
+                                max_tokens=1200,
+                                stream=stream,
+                            )
+                        else:
+                            client.completions.create(
+                                model=DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                                prompt="Hello",
+                                max_tokens=1200,
+                                stream=stream,
+                            )
+                    self.assertEqual(
+                        requests.get(
+                            self.base_url + "/health",
+                            timeout=10,
+                            headers={"Authorization": f"Bearer {self.api_key}"},
+                        ).status_code,
+                        200,
+                    )
+
     def test_token_ids_logprob_out_of_vocabulary(self):
         headers = {"Authorization": f"Bearer {self.api_key}"}
         for token_ids_logprob in ([-1], [2_000_000_000]):
@@ -178,8 +250,13 @@ class TestRequestLengthValidation(_ChatRequestLengthValidation, CustomTestCase):
 
 
 @unittest.skipUnless(is_rust_server_built(), "embedded rust server extension not built")
-class TestRustChatRequestLengthValidation(_ChatRequestLengthValidation, CustomTestCase):
+class TestRustChatRequestLengthValidation(TestRequestLengthValidation):
     rust_frontend = True
+    # Native logprob validation remains in the Python suite; this gate covers OpenAI.
+    test_token_ids_logprob_out_of_vocabulary = None
+    test_token_ids_logprob_rejects_nested_list = None
+    test_token_ids_logprob_batch_with_one_oov = None
+    test_token_ids_logprob_valid = None
     max_tokens_error = (
         "Requested token count exceeds the model's maximum context length"
     )

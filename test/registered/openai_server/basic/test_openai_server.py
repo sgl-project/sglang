@@ -29,6 +29,7 @@ from sglang.test.test_utils import (
     CustomTestCase,
     is_rust_server_built,
     popen_launch_server,
+    terminate_and_kill_process_tree,
 )
 
 register_cuda_ci(est_time=353, stage="base-b", runner_config="1-gpu-small")
@@ -553,6 +554,8 @@ The SmartHome Mini is a compact smart home assistant available in black or white
 class TestOpenAICompletionWithRust(CustomTestCase):
     """Run the existing Completion matrix unchanged through the Rust frontend."""
 
+    process = None
+
     @classmethod
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
@@ -570,7 +573,8 @@ class TestOpenAICompletionWithRust(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
-        kill_process_tree(cls.process.pid)
+        if cls.process is not None:
+            terminate_and_kill_process_tree(cls.process)
 
     # Reuse the reference test methods directly so Python and Rust coverage
     # cannot drift into separate matrices.
@@ -591,6 +595,10 @@ class TestOpenAIChatWithRust(TestOpenAICompletionWithRust):
     run_chat_completion_stream = TestOpenAIServer.run_chat_completion_stream
     test_chat_completion = TestOpenAIServer.test_chat_completion
     test_chat_completion_stream = TestOpenAIServer.test_chat_completion_stream
+    test_regex = TestOpenAIServer.test_regex
+    test_penalty = TestOpenAIServer.test_penalty
+    test_model_list = TestOpenAIServer.test_model_list
+    test_retrieve_model = TestOpenAIServer.test_retrieve_model
 
     # This class is a Chat gate; Completion already has its own Rust matrix.
     test_completion = None
