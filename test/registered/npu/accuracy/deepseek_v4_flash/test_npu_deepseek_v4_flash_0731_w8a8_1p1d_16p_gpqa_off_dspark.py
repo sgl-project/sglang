@@ -8,6 +8,9 @@ from sglang.test.ascend.e2e.test_npu_performance_utils import (
     assert_metrics,
     run_bench_serving,
 )
+from sglang.test.ascend.test_ascend_utils import write_memfabric_tent_conf
+
+
 from sglang.test.ci.ci_register import register_npu_ci
 
 register_npu_ci(
