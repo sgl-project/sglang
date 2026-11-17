@@ -854,6 +854,45 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(sizes, [[11, 23]])
         self.assertEqual(offsets, [[7, 35]])
 
+    def test_mla_dedup_broadcasts_packed_draft_buffers_with_their_layer(self):
+        """Dedup peers receive a packed MTP draft only through the broadcast of
+        the transfer layer carrying it; that layer maps several buffers."""
+        from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+        from sglang.srt.mem_cache.unified_cache.linker_mla_dedup import (
+            LinkerMLADedupBroadcaster,
+        )
+
+        def dsa_pool(layers):
+            pool = DSATokenToKVPool.__new__(DSATokenToKVPool)
+            pool.page_size, pool.layer_num, pool.start_layer = 2, layers, 0
+            pool.kv_buffer = [torch.zeros((8, 3), dtype=torch.uint8)] * layers
+            pool.index_key_cache = SimpleNamespace(
+                buffer=[torch.zeros((4, 7), dtype=torch.uint8)] * layers
+            )
+            return pool
+
+        group = resolve_hybrid_device_pool_group(
+            kvcache=dsa_pool(2),
+            page_size=2,
+            params=SimpleNamespace(mtp_draft_device_pools=(dsa_pool(1),)),
+            components={ComponentType.FULL},
+        )
+        broadcaster = LinkerMLADedupBroadcaster.__new__(LinkerMLADedupBroadcaster)
+        broadcaster.pools = group.entry_map
+        broadcaster.buffers = {
+            name: [list(component) for component in entry.components]
+            for name, entry in group.entry_map.items()
+        }
+        broadcaster.kv_staging = None
+        sent = []
+        broadcaster._bcast_layer = lambda buffers, staging, indices, elem, index: (
+            sent.append((buffers is broadcaster.buffers[PoolName.KV][0], index))
+        )
+        prepared = {name: (torch.tensor([0]), None) for name in group.entry_map}
+        for layer in range(group.num_layers):
+            broadcaster.broadcast_loaded_layer(layer, prepared)
+        self.assertEqual(sorted(index for is_kv, index in sent if is_kv), [0, 1, 2])
+
     def test_draft_plan_packs_only_nextn_mtp(self):
         from sglang.srt.speculative import base_spec_worker as spec
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
