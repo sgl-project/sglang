@@ -1635,6 +1635,16 @@ def _tp_refined_moe_block_sizes(
     return [w13_block_n, block_k], [block_n, w2_block_k]
 
 
+def _xpu_fused_experts_supports(moe_runner_config: MoeRunnerConfig) -> bool:
+    """sgl-kernel-xpu's FP8 MoE takes a SwiGLU clamp only with the GPT-OSS alpha;
+    its silu_and_mul_clamp clamps before SiLU, while gemm1_clamp_limit alone
+    (BailingMoeV3) clamps after it, as the triton runner does."""
+    return (
+        moe_runner_config.gemm1_clamp_limit is None
+        or moe_runner_config.gemm1_alpha is not None
+    )
+
+
 def _refined_block_scale_loader(weight_loader, *, repeats: tuple[int, int]):
     """Repeat checkpoint block scales onto the finer grid before TP sharding."""
 
@@ -3423,7 +3433,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             if quant_info is not None:
                 return self.runner.run(dispatch_output, quant_info)
 
-        if _is_xpu and not get_moe_runner_backend().is_triton():
+        if (
+            _is_xpu
+            and not get_moe_runner_backend().is_triton()
+            and _xpu_fused_experts_supports(moe_runner_config)
+        ):
             # sgl-kernel-xpu path
             from sgl_kernel import fused_experts
 
