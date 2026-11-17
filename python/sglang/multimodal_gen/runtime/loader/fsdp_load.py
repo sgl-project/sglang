@@ -374,11 +374,6 @@ def maybe_load_fsdp_model(
             for n, p in model.named_parameters()
             if getattr(p, "weight_loader", None)
         }
-        world_size = hsdp_replicate_dim * hsdp_shard_dim
-        if not fsdp_inference:
-            hsdp_replicate_dim = world_size
-            hsdp_shard_dim = 1
-
         device_mesh = init_device_mesh(
             current_platform.device_type,
             # (Replicate(), Shard(dim=0))

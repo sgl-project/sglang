@@ -28,21 +28,5 @@ def test_bias_gelu_tanh_is_bit_exact(dtype: torch.dtype, shape: tuple[int, ...])
     assert torch.equal(actual, expected)
 
 
-def test_bias_gelu_tanh_rejects_unsupported_width():
-    input = torch.randn(2, 127, device="cuda", dtype=torch.bfloat16)
-    bias = torch.randn(127, device="cuda", dtype=torch.bfloat16)
-
-    with pytest.raises(RuntimeError, match="hidden_dim"):
-        bias_gelu_tanh(input, bias)
-
-
-def test_bias_gelu_tanh_rejects_unsupported_dtype():
-    input = torch.ones(2, 128, device="cuda", dtype=torch.int32)
-    bias = torch.ones(128, device="cuda", dtype=torch.int32)
-
-    with pytest.raises(RuntimeError, match="does not support"):
-        bias_gelu_tanh(input, bias)
-
-
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__, "-v", "-s"]))

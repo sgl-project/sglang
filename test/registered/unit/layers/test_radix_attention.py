@@ -182,7 +182,9 @@ def test_direct_backend_dispatch(sparse):
     batch = make_batch()
     q = torch.zeros(4, 2, 3)
     result = object()
-    backend = SimpleNamespace(forward=lambda *args, **kwargs: result)
+    backend = SimpleNamespace(
+        forward=lambda *args, **kwargs: result, plans_padded_extend_rows=False
+    )
     with (
         attention_scope(batch, backend),
         patch(
