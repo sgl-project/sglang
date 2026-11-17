@@ -54,12 +54,25 @@ _MIN_GROUP_WAVES = 3
 _AUTO_PLAIN_MIN_BYTES = {3: 48 << 20, 4: 128 << 20}
 
 # What an expired in-kernel peer wait leaves in the transport's timeout word:
-# the code of its site. The plain exchange's spin_wait stores TIMEOUT_EXCHANGE
-# without the peer it waited for (kSpinWaitTimeout in ipc_a2a.cuh).
+# the code of its site, plus the peer it waited for where the wait knows it,
+# the first expiry winning. The plain exchange's spin_wait stores
+# TIMEOUT_EXCHANGE without the peer (kSpinWaitTimeout in ipc_a2a.cuh).
 TIMEOUT_EXCHANGE = 400
+TIMEOUT_PIPELINE_INPUT = 500
+TIMEOUT_PIPELINE_OUTPUT = 600
 _TIMEOUT_SITES = (
-    # (code, the path, its switch)
+    # (code of peer 0, the path, its switch)
     (TIMEOUT_EXCHANGE, "copy-engine all-to-all", "SGLANG_DIFFUSION_IPC_A2A_MULTI=0"),
+    (
+        TIMEOUT_PIPELINE_INPUT,
+        "head-group pipeline (input rows)",
+        "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS=0",
+    ),
+    (
+        TIMEOUT_PIPELINE_OUTPUT,
+        "head-group pipeline (output rows)",
+        "SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS=0",
+    ),
 )
 
 
@@ -890,8 +903,16 @@ class IpcA2AMultiState:
             stream = self.pipe_group_streams[g]
             stream.wait_event(own[g] if filled else placed)
             with torch.cuda.stream(stream):
-                for p in peers:
-                    mem.wait(stream, pool.fin_ptr[r] + 4 * p, base + g + 1)
+                if g == 0:
+                    # bounded: a peer that sends nothing this call expires here
+                    self.wait_peers(pool.fin_ptr[r], base + 1, TIMEOUT_PIPELINE_INPUT)
+                else:
+                    # front-end waits hold no SM while earlier groups attend (a
+                    # wait kernel per group slowed the q/k-filled call 1.2% at
+                    # 11648 rows per rank on B300); a peer that stops after its
+                    # first group expires in the output wait
+                    for p in peers:
+                        mem.wait(stream, pool.fin_ptr[r] + 4 * p, base + g + 1)
                 views = [slots.slot(pool, r, g, part) for part in range(3)]
                 if into:
                     out = full[:, :, start(r, g, 0) : start(r, g, 0) + hq]
@@ -954,8 +975,10 @@ class IpcA2AMultiState:
                             out_row,
                             n,
                         )
+                self.wait_peers(
+                    pool.fout_ptr[r] + 4 * g * world, call, TIMEOUT_PIPELINE_OUTPUT
+                )
                 for p in peers:
-                    mem.wait(stream, pool.fout_ptr[r] + 4 * (g * world + p), call)
                     # the block and the merged output both have one row pitch
                     # across the batch, so a single copy covers every batch row
                     mem.copy2d(
@@ -972,8 +995,9 @@ class IpcA2AMultiState:
         def gather(first: int, stop: int) -> None:
             # the peers' blocks of this rank's rows for groups [first, stop), one pass each
             for g in range(first, stop):
-                for p in peers:
-                    mem.wait(main, pool.fout_ptr[r] + 4 * (g * world + p), call)
+                self.wait_peers(
+                    pool.fout_ptr[r] + 4 * g * world, call, TIMEOUT_PIPELINE_OUTPUT
+                )
             outb = pool.outb[r]
             for p in peers:
                 blocks = outb.as_strided(
@@ -1108,6 +1132,15 @@ class IpcA2AMultiState:
                 self.budget_ns,
             )
         return buffers[r][slot]
+
+    def wait_peers(self, flags: int, target: int, code: int) -> None:
+        """Hold the current stream until every peer's entry of this rank's int32
+        [world] flag array at address ``flags`` reaches ``target``: one launch.
+        A wait that outlasts the budget stores ``code`` + the peer in the timeout
+        word, and every wait gives up at once while that word is set."""
+        self.ops.wait_peers(
+            self.timed_out, flags, self.world, self.rank, target, code, self.budget_ns
+        )
 
     def check_timeout(self) -> None:
         """Fail the request on every rank if any rank's in-kernel peer wait

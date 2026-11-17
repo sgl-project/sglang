@@ -19,6 +19,8 @@ import sglang.multimodal_gen.runtime.pipelines_core.executors.sync_executor as s
 from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
     TIMEOUT_EXCHANGE,
+    TIMEOUT_PIPELINE_INPUT,
+    TIMEOUT_PIPELINE_OUTPUT,
     IpcPeerTimeoutError,
     describe_peer_timeouts,
 )
@@ -40,21 +42,40 @@ from sglang.multimodal_gen.runtime.scheduler_client import AsyncSchedulerClient
 RANKS = list(range(8))
 
 
-def test_message_names_ranks_path_and_switch() -> None:
-    # the plain exchange's spin flags both sides and does not record the peer
-    error = describe_peer_timeouts([TIMEOUT_EXCHANGE] * 8, RANKS, 10.0)
+def test_message_names_ranks_peers_paths_and_switches() -> None:
+    # ranks 0-2 and 4-6 waited for rank 3's input rows in the head-group
+    # pipeline, rank 7 for its output rows; rank 3 itself saw every peer arrive
+    codes = [TIMEOUT_PIPELINE_INPUT + 3] * 3 + [0] + [TIMEOUT_PIPELINE_INPUT + 3] * 3
+    codes.append(TIMEOUT_PIPELINE_OUTPUT + 3)
+    error = describe_peer_timeouts(codes, RANKS, 10.0)
     assert error.startswith("Ulysses IPC peer wait timed out after 10 s: ")
     assert (
-        "ranks 0, 1, 2, 3, 4, 5, 6, 7 waited for a peer in the copy-engine "
-        "all-to-all." in error
+        "ranks 0, 1, 2, 4, 5, 6 waited for rank 3 in the head-group pipeline (input "
+        "rows); rank 7 waited for rank 3 in the head-group pipeline (output rows)."
+        in error
     )
     assert "restart the server's process group" in error
-    assert error.endswith("turn the path off with SGLANG_DIFFUSION_IPC_A2A_MULTI=0.")
-    # a member whose waits all completed is left out
-    error = describe_peer_timeouts([0, TIMEOUT_EXCHANGE], [4, 5], 0.25)
-    assert (
-        "after 0.25 s: rank 5 waited for a peer in the copy-engine all-to-all." in error
+    assert error.endswith(
+        "turn the path off with SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS=0."
     )
+
+
+def test_message_decodes_every_site() -> None:
+    def single(code: int) -> str:
+        return describe_peer_timeouts([code, 0], [4, 5], 0.25)
+
+    # the plain exchange's spin flags both sides and does not record the peer
+    error = single(TIMEOUT_EXCHANGE)
+    assert "after 0.25 s: rank 4 waited for a peer in the copy-engine all-to-all." in (
+        error
+    )
+    assert error.endswith("with SGLANG_DIFFUSION_IPC_A2A_MULTI=0.")
+    assert "rank 4 waited for rank 5 in the head-group pipeline (input rows)" in (
+        single(TIMEOUT_PIPELINE_INPUT + 1)
+    )
+    error = single(TIMEOUT_PIPELINE_OUTPUT + 1)
+    assert "rank 4 waited for rank 5 in the head-group pipeline (output rows)" in error
+    assert error.endswith("with SGLANG_DIFFUSION_ULYSSES_PIPELINE_GROUPS=0.")
 
 
 class _Stage:

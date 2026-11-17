@@ -361,7 +361,10 @@ def _worker() -> int:
 def _timeout_worker() -> int:
     """An expired peer wait: the last rank arrives three budgets late, so its
     peers' waits expire after SGLANG_DIFFUSION_IPC_A2A_TIMEOUT_MS and
-    check_timeout fails the request on every rank, naming the path."""
+    check_timeout fails the request on every rank, naming who waited for whom.
+    The plain exchange, then the head-group pipeline: its input rows; its
+    output rows, with the late rank stalled inside its first attention, on the
+    group streams and on the gathering stream."""
     import time
 
     import torch.distributed as dist
@@ -381,6 +384,8 @@ def _timeout_worker() -> int:
     from sglang.multimodal_gen.runtime.distributed.device_communicators.ipc_a2a_multi import (
         IPC_A2A_MULTI,
         TIMEOUT_EXCHANGE,
+        TIMEOUT_PIPELINE_INPUT,
+        TIMEOUT_PIPELINE_OUTPUT,
         IpcPeerTimeoutError,
         ipc_a2a_multi_ready,
     )
@@ -394,10 +399,13 @@ def _timeout_worker() -> int:
     budget_s = budget_ns / 1e9
     late = world - 1
     failures = []
+    # the late rank's stall inside its next attention call (head-group pipeline)
+    stall_in_attend = []
 
-    def run_late(name, call, expected, waited, max_budgets):
+    def run_late(name, call, expected, waited, max_budgets, in_attend=False):
         # the first call sets up the buffers (a collective) under a budget no
-        # setup skew reaches; then the late rank sleeps through three budgets
+        # setup skew reaches; then the late rank sleeps through three budgets,
+        # before the calls or, with its input rows sent, inside the first one
         state.budget_ns = 60 * 10**9
         if call() is None:
             failures.append(f"{name}: the transport declined the call")
@@ -405,7 +413,10 @@ def _timeout_worker() -> int:
         dist.barrier()
         state.budget_ns = budget_ns
         if rank == late:
-            time.sleep(3 * budget_s)
+            if in_attend:
+                stall_in_attend.append(3 * budget_s)
+            else:
+                time.sleep(3 * budget_s)
         start = time.monotonic()
         for _ in range(4):
             call()
@@ -436,6 +447,50 @@ def _timeout_worker() -> int:
         f"ranks {everyone} waited for a peer in the copy-engine all-to-all",
         max_budgets=5,
     )
+
+    # the head-group pipeline: only the waiting ranks hold the code, which names
+    # the late rank; the first wait expires and every later bounded wait gives
+    # up at once, while the later groups' front-end input waits end when the
+    # late rank's rows arrive
+    def attend(q, k, v):
+        if stall_in_attend:
+            time.sleep(stall_in_attend.pop())
+        return _attend_rows(q, k, v)
+
+    def attend_into(q, k, v, out):
+        if out is not None:
+            out.copy_(attend(q, k, v))
+        return True
+
+    s_local, heads, head_dim = 384, 2 * world, 64
+    q, k, v = (
+        torch.randn(1, s_local, heads, head_dim, dtype=torch.bfloat16, device="cuda")
+        for _ in range(3)
+    )
+    waiting = ", ".join(map(str, range(late)))
+    waiting = f"rank{'s' if late > 1 else ''} {waiting} waited for rank {late}"
+    for name, kwargs, code, rows, in_attend in (
+        ("pipeline in", {}, TIMEOUT_PIPELINE_INPUT, "input", False),
+        ("pipeline out", {}, TIMEOUT_PIPELINE_OUTPUT, "output", True),
+        (
+            "pipeline gather",
+            {"attend_into": attend_into},
+            TIMEOUT_PIPELINE_OUTPUT,
+            "output",
+            True,
+        ),
+    ):
+        state.reset()
+        if not ipc_a2a_multi_ready(group, enabled=True):
+            failures.append(f"{name}: the transport did not come back")
+        run_late(
+            name,
+            lambda: state.pipelined_attention(q, k, v, attend, 2, **kwargs),
+            0 if rank == late else code + late,
+            f"{waiting} in the head-group pipeline ({rows} rows)",
+            max_budgets=4,
+            in_attend=in_attend,
+        )
 
     verdict = torch.tensor([len(failures)], device="cuda")
     dist.all_reduce(verdict)
@@ -501,8 +556,8 @@ class TestIpcA2AMultiGpu(CustomTestCase):
 
 
 class TestPeerTimeoutMultiGpu(CustomTestCase):
-    """An expired peer wait fails the request on every rank and names the path
-    it waited in."""
+    """An expired peer wait fails the request on every rank and names the rank
+    it waited for; the bounded waits after it give up at once."""
 
     def _run(self, world: int, port: int):
         _run_ranks(
