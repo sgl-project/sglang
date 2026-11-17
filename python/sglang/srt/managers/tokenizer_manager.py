@@ -216,7 +216,7 @@ from sglang.srt.speculative.spec_decoding_metrics import (
     populate_spec_info,
 )
 from sglang.srt.utils import (
-    configure_gc_warning,
+    configure_gc_logging,
     freeze_gc,
     get_or_create_event_loop,
     kill_process_tree,
@@ -907,8 +907,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             start_cpu_monitor_thread("tokenizer")
 
-        if get_observability().gc_warning_threshold_secs > 0.0:
-            configure_gc_warning(get_observability().gc_warning_threshold_secs)
+        configure_gc_logging("Tokenizer Manager")
         self.soft_watchdog = Watchdog.create(
             debug_name="TokenizerManager",
             watchdog_timeout=get_device().soft_watchdog_timeout,
