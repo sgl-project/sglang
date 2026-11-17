@@ -61,8 +61,6 @@ def fast_topk(
     CUDA int32 tensor [B, topk]
     """
     batch = score.shape[0]
-    if row_starts is None:
-        row_starts = torch.zeros(batch, dtype=torch.int32, device=score.device)
     indices = score.new_empty((batch, topk), dtype=torch.int32)
 
     module = _jit_fast_topk_module(topk)
