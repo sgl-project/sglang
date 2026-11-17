@@ -642,6 +642,11 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def set_mamba_path_cap_counts_host(self, enabled: bool) -> None:
+        """Make the per-path Mamba cap count and free host copies (HiCache init)."""
+        ...
+
+    @abstractmethod
     def insert_host(
         self,
         node_id: NodeId,

@@ -646,6 +646,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.cache_controller is not None
             and self.cache_controller.write_policy == "write_back"
         )
+        self._init_mamba_path_cap_counts_host()
         # Pre-seed the logical dropped-tokens series.
         if self.metrics_collector is not None and self.cache_controller is not None:
             reasons = ["host_pressure"]
@@ -4493,6 +4494,21 @@ class UnifiedRadixCache(BasePrefixCache):
         if comp is None:
             return False
         return comp._mamba_host_only_checkpoint()
+
+    def _init_mamba_path_cap_counts_host(self) -> None:
+        """Let the per-path Mamba state cap count and free host copies; a no-op
+        without a cap (checkpoints level 3) or a host tier in cache mode."""
+        comp = self.components.get(ComponentType.MAMBA)
+        cap = comp.mamba_max_states_per_path if comp is not None else -1
+        if (
+            not envs.SGLANG_MAMBA_PATH_CAP_COUNTS_HOST.get()
+            or cap < 0
+            or self.cache_controller is None
+            or self.host_memory_mode == "buffer_only"
+        ):
+            return
+        self.tree_core.set_mamba_path_cap_counts_host(True)
+        logger.info("Mamba path cap counts host copies (cap %d)", cap)
 
     # ---- HiCache: Scheduler Entry Points ----
 

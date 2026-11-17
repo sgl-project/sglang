@@ -1,6 +1,7 @@
 """CPU-only unit tests for the per-path Mamba checkpoint cap."""
 
 from sglang.srt.arg_groups.mamba_hook import handle_mamba_backend
+from sglang.srt.environ import envs
 from sglang.test.ci.ci_register import register_cpu_ci, register_cuda_ci
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -8,6 +9,7 @@ register_cuda_ci(est_time=13, stage="base-b", runner_config="1-gpu-small")
 
 import unittest
 from collections import defaultdict
+from types import SimpleNamespace
 from unittest import mock
 
 import torch
@@ -22,6 +24,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
     UnifiedTreeCore,
     UnifiedTreeNode,
 )
+from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.server_args import ServerArgs
 from sglang.test.kits.unified_radix_cache.config import (
     CacheConfig,
@@ -48,6 +51,7 @@ class _FakeTreeCore:
                 ComponentType.MAMBA, self.tree_components, use_host_ptr=True
             )
         }
+        self.mamba_path_cap_counts_host = False
         self.evicted = []
         self.cascaded = []
         # No joint token/window LRU: this tree keeps no window.
@@ -176,6 +180,97 @@ class TestMambaPathStateCap(unittest.TestCase):
         self.assertIsNone(mamba_data.value)
         self.assertIsNotNone(mamba_data.host_value)
         self.assertTrue(core.host_lru_lists[ComponentType.MAMBA].in_list(nodes[0]))
+
+    def _chain_with_host_copies(self):
+        # nodes[0]: host-only state; nodes[1]: device + host copy; nodes[2]: tail.
+        component, nodes, core, cache = _build_unified_chain(cap=1)
+        host_only = nodes[0].component_data[ComponentType.MAMBA]
+        host_only.value = None
+        core.lru_lists[ComponentType.MAMBA].remove_node(nodes[0])
+        core.component_evictable_size_[ComponentType.MAMBA] -= 1
+        host_only.host_value = torch.tensor([10])
+        core.host_lru_lists[ComponentType.MAMBA].insert_mru(nodes[0])
+        nodes[1].component_data[ComponentType.MAMBA].host_value = torch.tensor([11])
+        return component, nodes, core
+
+    def test_unified_cache_counts_and_frees_host_copies_when_counting_host(self):
+        for counts_host in (False, True):
+            with self.subTest(counts_host=counts_host):
+                component, nodes, core = self._chain_with_host_copies()
+                core.mamba_path_cap_counts_host = counts_host
+                device_frees = defaultdict(list)
+                host_frees = defaultdict(list)
+                component._evict_excess_path_states(
+                    nodes[-1], device_frees, host_frees, []
+                )
+                self.assertEqual(
+                    [v.item() for v in device_frees[ComponentType.MAMBA]], [1]
+                )
+                freed_host = [v.item() for v in host_frees[ComponentType.MAMBA]]
+                host_lru = core.host_lru_lists[ComponentType.MAMBA]
+                if counts_host:
+                    self.assertEqual(freed_host, [10, 11])
+                    for node in nodes[:2]:
+                        self.assertIsNone(
+                            node.component_data[ComponentType.MAMBA].host_value
+                        )
+                        self.assertFalse(host_lru.in_list(node))
+                else:
+                    self.assertEqual(freed_host, [])
+                    self.assertIsNotNone(
+                        nodes[0].component_data[ComponentType.MAMBA].host_value
+                    )
+                    self.assertTrue(host_lru.in_list(nodes[1]))
+                self.assertIsNotNone(
+                    nodes[-1].component_data[ComponentType.MAMBA].value
+                )
+
+    def test_unified_cache_keeps_host_copies_that_are_locked_or_in_flight(self):
+        for guard in ("host_lock", "backup", "load_back"):
+            with self.subTest(guard=guard):
+                component, nodes, core = self._chain_with_host_copies()
+                core.mamba_path_cap_counts_host = True
+                if guard == "host_lock":
+                    nodes[0].component_data[ComponentType.MAMBA].host_lock_ref = 1
+                elif guard == "backup":
+                    nodes[0].write_through_pending_id = 1
+                else:
+                    nodes[0].load_back_pending_id = 1
+                host_frees = defaultdict(list)
+                component._evict_excess_path_states(
+                    nodes[-1], defaultdict(list), host_frees, []
+                )
+                self.assertIsNotNone(
+                    nodes[0].component_data[ComponentType.MAMBA].host_value
+                )
+                self.assertEqual(
+                    [v.item() for v in host_frees[ComponentType.MAMBA]], [11]
+                )
+
+    def test_host_counting_is_on_by_default_with_a_cap_and_a_cache_mode_host_tier(self):
+        for name, host_mode, env, enabled in (
+            ("default", "cache", True, True),
+            ("buffer_only", "buffer_only", True, False),
+            ("env_off", "cache", False, False),
+        ):
+            with (
+                self.subTest(name),
+                envs.SGLANG_MAMBA_PATH_CAP_COUNTS_HOST.override(env),
+            ):
+                cache = SimpleNamespace(
+                    components={
+                        ComponentType.MAMBA: SimpleNamespace(
+                            mamba_max_states_per_path=1
+                        )
+                    },
+                    cache_controller=object(),
+                    host_memory_mode=host_mode,
+                    tree_core=mock.Mock(),
+                )
+                UnifiedRadixCache._init_mamba_path_cap_counts_host(cache)
+                self.assertEqual(
+                    cache.tree_core.set_mamba_path_cap_counts_host.called, enabled
+                )
 
     def test_unified_cache_negative_one_disables_cap(self):
         component, nodes, core, cache = _build_unified_chain(cap=-1)
