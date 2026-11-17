@@ -488,7 +488,9 @@ def tilelang_qsa_mqa_prefill_relative(
     ``[r, row_starts[r]:row_ends[r]]``. Columns past a row's length are left
     undefined: callers must read only each row's own section (the fast top-k
     reads ``[start, start + length)``). ``width`` must cover the longest row
-    and comes from host lengths, so no device sync is needed to size it."""
+    and comes from host lengths, so no device sync is needed to size it. A
+    ``score_scale`` of 1 skips the division pass: the scores come back unscaled,
+    for callers that only order them."""
 
     if not HAS_TILELANG:
         raise RuntimeError("TileLang is unavailable")
@@ -532,7 +534,9 @@ def tilelang_qsa_mqa_prefill_relative(
         ends,
     )
     logits = logits[:rows]
-    logits.div_(score_scale or math.sqrt(head_dim))
+    scale = score_scale or math.sqrt(head_dim)
+    if scale != 1.0:
+        logits.div_(scale)
     return logits
 
 

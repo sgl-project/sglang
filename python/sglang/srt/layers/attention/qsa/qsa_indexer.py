@@ -34,6 +34,7 @@ from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
+from sglang.srt.utils import is_gfx95_supported
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
@@ -48,6 +49,30 @@ def _qsa_prefill_row_chunk_size(rows: int, keys: int, heads: int) -> int:
     max_padded_rows = max(block_q, _QSA_PREFILL_LOGITS_BUDGET_BYTES // bytes_per_row)
     max_padded_rows = max(block_q, max_padded_rows // block_q * block_q)
     return min(rows, max_padded_rows)
+
+
+# topk_v2 loads 16-byte vectors of fp32 scores: a logits row stride must be a
+# multiple of this many columns.
+_TOPK_V2_ROW_ALIGNMENT = 4
+
+
+def _exact_block_topk(
+    logits: torch.Tensor, lengths: torch.Tensor, topk: int
+) -> torch.Tensor:
+    """Top-k blocks of each request-relative logits row (-1 padded), from topk_v2.
+    In batch-invariant mode, ties at the k-th score go to the smallest block indices,
+    as qsa_fast_topk breaks them off ROCm."""
+    from sglang.kernels.ops.attention.dsv4.topk import topk_transform_ragged_v2
+
+    block_indices = logits.new_empty((logits.shape[0], topk), dtype=torch.int32)
+    topk_transform_ragged_v2(
+        logits,
+        lengths,
+        out_offsets=torch.zeros_like(lengths),
+        out_indices=block_indices,
+        deterministic=is_batch_invariant_mode_enabled(),
+    )
+    return block_indices
 
 
 class QSAIndexer(MultiPlatformOp):
@@ -461,9 +486,20 @@ class QSAIndexer(MultiPlatformOp):
         relative = (
             max_row_keys is not None and max_row_keys > 0 and q.is_cuda and HAS_TILELANG
         )
+        # On gfx95 the blocks come from topk_v2, which (unless SGLANG_TOPK_V2_MODE=0) is
+        # exact where fast_topk drops members of an overfull threshold bin (as in
+        # sgl-project/sglang#36807). It only reads the order of the scores, so they stay
+        # unscaled, and it needs the logits row stride to be a multiple of
+        # _TOPK_V2_ROW_ALIGNMENT.
+        use_topk_v2 = relative and is_gfx95_supported()
+        score_scale = 1.0 if use_topk_v2 else None
+        logits_width = max_row_keys
+        if use_topk_v2:
+            logits_width = -(-max_row_keys // _TOPK_V2_ROW_ALIGNMENT)
+            logits_width *= _TOPK_V2_ROW_ALIGNMENT
         row_chunk_size = _qsa_prefill_row_chunk_size(
             rows,
-            max_row_keys if relative else compressed_keys.shape[0],
+            logits_width if relative else compressed_keys.shape[0],
             q.shape[1],
         )
         for row_start in range(0, rows, row_chunk_size):
@@ -485,14 +521,20 @@ class QSAIndexer(MultiPlatformOp):
                     compressed_keys,
                     chunk_starts,
                     row_ends[chunk_slice],
-                    max_row_keys,
+                    logits_width,
+                    score_scale,
                 )
-                block_indices = qsa_fast_topk(
-                    logits,
-                    torch.zeros_like(chunk_starts),
-                    chunk_lengths,
-                    topk=self.block_topk,
-                )
+                if use_topk_v2:
+                    block_indices = _exact_block_topk(
+                        logits, chunk_lengths, self.block_topk
+                    )
+                else:
+                    block_indices = qsa_fast_topk(
+                        logits,
+                        torch.zeros_like(chunk_starts),
+                        chunk_lengths,
+                        topk=self.block_topk,
+                    )
             else:
                 logits = qsa_mqa_prefill(
                     q[chunk_slice],
