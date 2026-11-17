@@ -57,6 +57,7 @@ from sglang.multimodal_gen.runtime.server_args import (
     ServerArgs,
     _normalize_ltx2_two_stage_device_mode,
 )
+from sglang.multimodal_gen.runtime.utils.hf_diffusers_utils import maybe_download_model
 from sglang.multimodal_gen.runtime.utils.logging_utils import init_logger
 
 logger = init_logger(__name__)
@@ -376,7 +377,15 @@ class _BaseLTX2Pipeline(LoRAPipeline):
             return
         if server_args.component_paths.get("transformer"):
             return
-        full_path = os.path.join(str(model_path), cls._DEV_TRANSFORMER_SUBFOLDER)
+        model_root = str(model_path)
+        if not os.path.exists(model_root):
+            # A hub id; resolve it to its local snapshot as _load_config does later.
+            model_root = maybe_download_model(
+                model_root,
+                force_diffusers_model=True,
+                revision=server_args.revision,
+            )
+        full_path = os.path.join(model_root, cls._DEV_TRANSFORMER_SUBFOLDER)
         if not os.path.isdir(full_path):
             raise ValueError(
                 f"--model-variant {server_args.model_variant} requires "
