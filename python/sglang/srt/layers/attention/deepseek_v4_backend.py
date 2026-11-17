@@ -2211,7 +2211,12 @@ class DeepseekV4AttnBackend(
                     out=self._bcg_tail_num_token_non_padded,
                 )
                 forward_batch.global_num_token_non_padded = bound
-                forward_batch.num_token_non_padded = bound
+                # Idle eager peers keep LOCAL and GLOBAL as distinct tensors.
+                # Preserve that count domain on busy peers too, otherwise tail
+                # graph keys diverge and only some ranks enter capture barriers.
+                forward_batch.num_token_non_padded = (
+                    bound if tail.real_rows_count is not None else bound.clone()
+                )
         tail_core = tail_metadata.core_attn_metadata
         self.forward_metadata = tail_metadata
         if self.token_to_kv_pool.request_window is not None:
