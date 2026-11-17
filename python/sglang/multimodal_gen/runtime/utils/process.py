@@ -33,6 +33,17 @@ def kill_itself_when_parent_died() -> None:
         os.kill(os.getpid(), signal.SIGKILL)
 
 
+def use_thread_lock_for_tqdm() -> None:
+    """Keep tqdm off its default multiprocessing RLock, a POSIX semaphore.
+
+    A worker killed by SIGTERM or PDEATHSIG never unlinks it, so shutdown prints
+    resource_tracker's "leaked semaphore objects" warning.
+    """
+    from tqdm import tqdm
+
+    tqdm.set_lock(threading.RLock())
+
+
 _full_gc_lock = threading.Lock()
 _full_gc_deferrals = 0
 _gc_thresholds = gc.get_threshold()
