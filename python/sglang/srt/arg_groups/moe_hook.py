@@ -77,6 +77,15 @@ def handle_moe_kernel_config(server_args: Any):
         raise ValueError(
             "The argument paged-experts-enable-disk requires --enable-paged-experts."
         )
+    if cfg.paged_experts_host_memory_gb is not None:
+        if not cfg.enable_paged_experts:
+            raise ValueError(
+                "The argument paged-experts-host-memory-gb requires --enable-paged-experts."
+            )
+        if not 0 < cfg.paged_experts_host_memory_gb < float("inf"):
+            raise ValueError(
+                "--paged-experts-host-memory-gb must be a finite number greater than 0."
+            )
 
     run_post_process_pass(server_args, _moe_runner_backend_quant_constraints)
 

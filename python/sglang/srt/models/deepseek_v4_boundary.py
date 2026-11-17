@@ -221,7 +221,14 @@ class HcReadCall(HcRead):
                 if mhc.use_stats_stream(layer.hc_cfg, self.batch, streams)
                 else None
             )
-            mhc.fork_stats_stream(stream)
+            if (
+                self.attention
+                and stream is not None
+                and layer.self_attn.use_mega_attention
+            ):
+                mhc.defer_attn_stats_fork(stream)
+            else:
+                mhc.fork_stats_stream(stream)
             quantized = (
                 []
                 if self.attention and layer.self_attn.accepts_mxfp8_swizzled_input()
