@@ -2415,6 +2415,33 @@ _NVFP4_SM90_CHECKPOINT_PARAMS = (
 )
 
 
+def _check_nvfp4_sm90_runner_config(config: MoeRunnerConfig) -> None:
+    """Refuse every expert variant the nvfp4_w4a16_sm90 op does not compute.
+
+    The op runs plain SiLU(gate) * up with the router weights applied after the
+    down projection. A layer that asks for a clamped or scaled SwiGLU, or for the
+    router weight on the input, would otherwise run without it and give wrong
+    output with no error.
+    """
+    if not config.is_gated or config.activation != "silu":
+        raise ValueError(
+            "--moe-runner-backend nvfp4_w4a16_sm90 supports gated SiLU experts, "
+            f"got {config.activation=} {config.is_gated=}."
+        )
+    unsupported = [
+        name
+        for name in ("gemm1_alpha", "gemm1_beta", "gemm1_clamp_limit", "swiglu_limit")
+        if getattr(config, name) is not None
+    ]
+    if config.apply_router_weight_on_input:
+        unsupported.append("apply_router_weight_on_input")
+    if unsupported:
+        raise ValueError(
+            "--moe-runner-backend nvfp4_w4a16_sm90 does not support "
+            f"{', '.join(unsupported)} on this layer; use the default backend."
+        )
+
+
 class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
     """
        MoE Method for FP4 Quantization with Blockscales and PerTensorScales
@@ -3183,12 +3210,7 @@ class ModelOptNvFp4FusedMoEMethod(FusedMoEMethodBase):
             repack_modelopt_nvfp4_moe_for_sm90,
         )
 
-        config = layer.moe_runner_config
-        if not config.is_gated or config.activation != "silu":
-            raise ValueError(
-                "--moe-runner-backend nvfp4_w4a16_sm90 supports gated SiLU experts, "
-                f"got {config.activation=} {config.is_gated=}."
-            )
+        _check_nvfp4_sm90_runner_config(layer.moe_runner_config)
         if layer.params_dtype != torch.bfloat16:
             raise ValueError(
                 "--moe-runner-backend nvfp4_w4a16_sm90 needs bfloat16 activations."

@@ -12,7 +12,10 @@ from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.srt.layers.moe.token_dispatcher.standard import StandardDispatchOutput
 from sglang.srt.layers.moe.topk import StandardTopKOutput
 from sglang.srt.layers.moe.utils import MoeRunnerBackend
-from sglang.srt.layers.quantization.modelopt_quant import ModelOptNvFp4FusedMoEMethod
+from sglang.srt.layers.quantization.modelopt_quant import (
+    ModelOptNvFp4FusedMoEMethod,
+    _check_nvfp4_sm90_runner_config,
+)
 from sglang.srt.runtime_context import get_context, get_exec, get_flags
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
@@ -89,6 +92,31 @@ def _reference(ck, x, ids, w, scale):
         )
         out.index_add_(0, t, y * w[t, k].unsqueeze(1))
     return out * scale
+
+
+class TestRunnerConfigRefusals(CustomTestCase):
+    """The op computes plain SiLU(gate) * up with router weights applied after the down projection. Any other expert
+    math must be refused, not run without it: GLM-5.3-Flash and DeepSeek-V4.1-Flash set a SwiGLU clamp of 10, and the
+    runner used to drop it with no error."""
+
+    def test_plain_gated_silu_passes(self):
+        _check_nvfp4_sm90_runner_config(MoeRunnerConfig())
+
+    def test_refuses_each_unsupported_variant(self):
+        for field, value in (
+            ("swiglu_limit", 10.0),
+            ("gemm1_clamp_limit", 10.0),
+            ("gemm1_alpha", 1.702),
+            ("gemm1_beta", 1.0),
+            ("apply_router_weight_on_input", True),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(ValueError, field):
+                    _check_nvfp4_sm90_runner_config(MoeRunnerConfig(**{field: value}))
+
+    def test_refuses_other_activations(self):
+        with self.assertRaisesRegex(ValueError, "gated SiLU"):
+            _check_nvfp4_sm90_runner_config(MoeRunnerConfig(activation="gelu"))
 
 
 @unittest.skipIf(
