@@ -14,6 +14,7 @@ from __future__ import annotations
 import logging
 from typing import TYPE_CHECKING, Optional
 
+from sglang.srt.arg_groups.kv_shard_hook import kv_shard_storage_backend_supported
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.buffer_mode.pipeline import validate_buffer_only_stack
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
@@ -88,7 +89,9 @@ class StorageAttachment:
                 "HiCache is not initialized (no cache controller); "
                 "launch with --enable-hierarchical-cache to attach a backend.",
             )
-        if page_interleave_shard_size(cache.token_to_kv_pool_allocator) > 1:
+        if page_interleave_shard_size(
+            cache.token_to_kv_pool_allocator
+        ) > 1 and not kv_shard_storage_backend_supported(storage_backend):
             # Runtime attach bypasses kv_shard_hook.py's startup validation.
             return (
                 False,
