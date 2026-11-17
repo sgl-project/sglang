@@ -64,10 +64,9 @@ class TestGCFreezer(CustomTestCase):
         self.now[0] += 5.0
         freezer.on_idle(self.forward_ct[0])
 
-    def test_idle_freeze_collects_then_freezes_once_per_idle_period(self):
+    def test_idle_freeze_runs_once_per_idle_period(self):
         self._two_idle_periods(self._freezer(freeze_on_idle_secs=5.0))
-        once = [call.collect(), call.freeze_gc("Scheduler")]
-        self.assertEqual(self._gc_calls(), once + once)
+        self.assertEqual(self._gc_calls(), [call.freeze_gc("Scheduler")] * 2)
 
     def test_frozen_garbage_warns_in_production_and_is_a_leak_under_the_env(self):
         freezer = self._freezer(freeze_on_idle_secs=5.0)
@@ -97,7 +96,7 @@ class TestGCFreezer(CustomTestCase):
         freezer.on_idle(self.forward_ct[0])
         self.assertEqual(
             self._gc_calls(),
-            [call.unfreeze(), call.collect(), call.freeze_gc("Scheduler")],
+            [call.unfreeze(), call.freeze_gc("Scheduler")],
         )
 
     def test_heap_growth_warns_at_each_half_again(self):

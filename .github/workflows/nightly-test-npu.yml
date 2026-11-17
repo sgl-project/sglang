@@ -506,6 +506,9 @@ jobs:
       run_start_metadata: ${{ needs.set-image-config.outputs.run_start_metadata }}
       accuracy_dataset: ${{ matrix.test_config.test_type == 'accuracy' && needs.set-image-config.outputs.accuracy_dataset || '' }}
       sgl_router_artifact: ${{ needs.sgl-router-build-aarch64.outputs.artifact_name }}
+      # Validate the pinned image: pods import sglang from the image instead of
+      # the checkout.
+      use_image_sglang: 'true'
 
   nightly-poc-multi-node-mix-tests:
     name: multi-node-mix-poc

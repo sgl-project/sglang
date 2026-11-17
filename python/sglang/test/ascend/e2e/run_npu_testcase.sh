@@ -6,6 +6,15 @@ if [ ! -f "${sglang_source_path}/${test_case}" ];then
   exit 0
 fi
 
+# Optional single test method ("Class.method") injected as NPU_TEST_METHOD;
+# empty runs every test defined in the test case file.
+test_method="${NPU_TEST_METHOD:-}"
+test_method_args=()
+if [ -n "${test_method}" ]; then
+  echo "Restricting run to test method: ${test_method}"
+  test_method_args=("${test_method}")
+fi
+
 # Leave the image WORKDIR (/sgl-workspace): the sglang repo cloned there can
 # shadow the installed package on sys.path.
 cd "${sglang_source_path}"
@@ -16,6 +25,35 @@ export HF_MODULES_CACHE="${HF_MODULES_CACHE:-/tmp/hf_modules}"
 
 echo "NPU info:"
 npu-smi info
+
+# Apply the container patches prepared by the workflow: every entry in
+# SGLANG_NPU_CONTAINER_PATCHES is a directory (relative to the repo root) whose
+# install.sh ships with that patch archive. The workflow downloads and extracts
+# the archives before the pods start; install.sh owns everything else, including
+# dependency installation and any package mirror configuration.
+if [ -n "${SGLANG_NPU_CONTAINER_PATCHES:-}" ]; then
+    echo "===== Apply container patches - Begin ====="
+    while IFS= read -r patch_dir; do
+        patch_dir="$(echo "${patch_dir}" | tr -d '[:space:]')"
+        if [ -z "${patch_dir}" ]; then
+            continue
+        fi
+        install_sh="${sglang_source_path}/${patch_dir}/install.sh"
+        if [ ! -f "${install_sh}" ]; then
+            echo "install.sh not found: ${install_sh}" >&2
+            exit 1
+        fi
+        echo "===== Apply container patch: ${patch_dir} - Begin ====="
+        (
+            cd "$(dirname "${install_sh}")"
+            bash ./install.sh
+        )
+        echo "===== Apply container patch: ${patch_dir} - End ====="
+    done <<< "$(echo "${SGLANG_NPU_CONTAINER_PATCHES}" | tr ',' '\n')"
+    echo "===== Apply container patches - End ====="
+else
+    echo "No container patch requested, skip."
+fi
 
 echo "===== Install kubernetes - Begin ====="
 KUBERNETES_PKG_PATH_SOURCE=/root/.cache/.cache/kubernetes
@@ -109,25 +147,27 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-# Use the image's sglang and test layer; overlay only the NPU test utilities
-# and the PD fixture that owns the sgl-router launch helpers. Keeping the rest
-# of the image's test layer intact keeps it consistent with the image runtime.
-sglang_pkg_path=/sgl-workspace/sglang/python
-ascend_test_util_path=${sglang_pkg_path}/sglang/test/ascend
-mv "${ascend_test_util_path}" "${ascend_test_util_path}_bak" 2>/dev/null || true
-cp -r "${sglang_source_path}/python/sglang/test/ascend" "${ascend_test_util_path}"
-cp -f "${sglang_source_path}/python/sglang/test/server_fixtures/disaggregation_fixture.py" \
-  "${sglang_pkg_path}/sglang/test/server_fixtures/disaggregation_fixture.py"
+# SGLANG_USE_IMAGE=true keeps importing sglang from the image's site-packages
+# (release data runs against the published image). The checkout's test helpers
+# still have to be visible on top of whatever the image bundled, so they are
+# copied into site-packages before anything imports them.
+# Every other caller keeps the community behavior and imports the checked-out
+# sglang, so the pod tests the commit under test.
+if [ "${SGLANG_USE_IMAGE:-}" = "true" ] || [ "${SGLANG_USE_IMAGE:-}" = "True" ]; then
+    IMAGE_SGLANG_PKG="$(python -c 'import sglang, os; print(os.path.dirname(sglang.__file__))')"
+    if [ -d "${IMAGE_SGLANG_PKG}/test" ] && [ -d "${sglang_source_path}/python/sglang/test" ]; then
+        echo "Syncing PR sglang/test → ${IMAGE_SGLANG_PKG}/test"
+        cp -r "${sglang_source_path}/python/sglang/test/"* "${IMAGE_SGLANG_PKG}/test/"
+    fi
 
-# Keep the image-compatible test/ci snapshot, mirroring the single-node stage.
-ci_test_util_path=${sglang_pkg_path}/sglang/test/ci
-if [ -d "${ci_test_util_path}" ]; then mv "${ci_test_util_path}" "${ci_test_util_path}_bak"; fi
-cp -r "${sglang_source_path}/scripts/ci/npu/compat/ci" "${ci_test_util_path}"
-
-# The image's environ.py predates the sgl-router test env that the overlaid PD
-# fixture reads; register the missing env field in the module.
-environ_path=${sglang_pkg_path}/sglang/srt/environ.py
-if ! grep -q "SGLANG_TEST_PD_ROUTER_BINARY" "${environ_path}"; then
+    # Images built before these symbols existed still have to run the PR's test
+    # layer: the image's hf_transformers_patches.py lacks apply_all_hf_patches
+    # (imported by test_utils) and its environ.py has no
+    # SGLANG_TEST_PD_ROUTER_BINARY field (read by the PD fixture).
+    cp -f "${sglang_source_path}/python/sglang/srt/utils/hf_transformers_patches.py" \
+        "${IMAGE_SGLANG_PKG}/srt/utils/hf_transformers_patches.py"
+    environ_path=${IMAGE_SGLANG_PKG}/srt/environ.py
+    if ! grep -q "SGLANG_TEST_PD_ROUTER_BINARY" "${environ_path}"; then
 cat >> "${environ_path}" <<'EOF'
 
 # Compatibility field for images built before SGLANG_TEST_PD_ROUTER_BINARY.
@@ -136,6 +176,9 @@ if not hasattr(Envs, "SGLANG_TEST_PD_ROUTER_BINARY"):
     _router_binary_env.name = "SGLANG_TEST_PD_ROUTER_BINARY"
     Envs.SGLANG_TEST_PD_ROUTER_BINARY = _router_binary_env
 EOF
+    fi
+else
+    export PYTHONPATH="${sglang_source_path}/python${PYTHONPATH:+:${PYTHONPATH}}"
 fi
 
 # set environment of cann
@@ -149,6 +192,7 @@ export SGLANG_DSPARK_A5_EXTRA_OPS_SO=/usr/local/Ascend/extra-ops/vllm_ascend_C.c
 export ASCEND_CUSTOM_OPP_PATH=/usr/local/Ascend/extra-ops/vendors/custom_transformer/:$ASCEND_CUSTOM_OPP_PATH
 export LD_LIBRARY_PATH=/usr/local/Ascend/extra-ops/vendors/custom_transformer/op_api/lib:$LD_LIBRARY_PATH
 
+export TORCH_EXTENSIONS_DIR=/tmp/torch_extensions
 ${PYTHON_FOR_SGLANG} -c "import sglang; print('sglang from:', sglang.__file__)"
 
 echo "Running test case ${test_case}"
@@ -166,10 +210,10 @@ echo "Log path: ${log_path}"
 
 if [ "${TROUBLE_SHOTTING}" = "true" ] || [ "${TROUBLE_SHOTTING}" = "True" ];then
     echo "TROUBLE_SHOTTING=true, the pod will keep alive for four hour."
-    ( ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" 2>&1 || true ) | tee -a "${log_path}/${tc_name}.log"
+    ( ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" "${test_method_args[@]}" 2>&1 || true ) | tee -a "${log_path}/${tc_name}.log"
     sleep 14400
 else
-    ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" 2>&1 | tee -a "${log_path}/${tc_name}.log"
+    ${PYTHON_FOR_SGLANG} -u "${sglang_source_path}/${test_case}" "${test_method_args[@]}" 2>&1 | tee -a "${log_path}/${tc_name}.log"
 fi
 echo "Finished test case ${test_case}"
 
