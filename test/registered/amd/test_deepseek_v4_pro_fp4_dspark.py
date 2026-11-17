@@ -5,7 +5,7 @@ SGLANG_HACK_FLASHMLA_BACKEND=unified_kv_triton. The test uses the full GSM8K set
 to catch regressions in unified-KV target-hidden injection, verify metadata, and
 DSpark acceptance.
 
-Registry: nightly-amd-8-gpu-mi35x-deepseek-v4-pro-dspark suite
+Registry: nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro-dspark suite
 """
 
 import os
@@ -36,7 +36,9 @@ from sglang.test.test_utils import (
 )
 
 register_amd_ci(
-    est_time=7200, suite="nightly-amd-8-gpu-mi35x-deepseek-v4-pro-dspark", nightly=True
+    est_time=7200,
+    suite="nightly-test-8-gpu-amd-mi35x-deepseek-v4-pro-dspark",
+    nightly=True,
 )
 
 DEEPSEEK_V4_DSPARK_MODEL_PATH = os.environ.get(
