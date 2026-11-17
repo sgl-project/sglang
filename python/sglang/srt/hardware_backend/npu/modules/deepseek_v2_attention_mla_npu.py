@@ -567,6 +567,153 @@ def _pad_dcp_extend_send(shards: torch.Tensor, plan) -> torch.Tensor:
     return send
 
 
+# Side stream for the extend KV prefetch, leased from the runtime context so
+# the stream is built on the published device, not on whichever device was
+# current at import time. The completion event is created per issue instead,
+# so two prefetches can be in flight.
+_DCP_EXTEND_KV_PREFETCH_STREAM = "npu_dcp_extend_kv_prefetch"
+
+
+def _dcp_prefetch_slot(layer_id: int) -> int:
+    # A layer's prefetch lands in the slot of its parity, and two in-flight
+    # prefetches never share one: the cap in maybe_prefetch_dcp_extend_kv_npu
+    # allows two, but the hook only ever issues for the immediately next
+    # layer, so the pair is always consecutive -- opposite parity, different
+    # slot. maybe_prefetch_dcp_extend_kv_npu rejects anything else loudly.
+    return layer_id % 2
+
+
+def _dcp_prefetch_piece_layout(plan):
+    """(offsets, rows, gathered, total) per piece for the prefetch buffer.
+
+    Each piece's region is its rank-major prefix run with the piece's
+    own-row tail after it, so the consumer never copies the prefix again."""
+    dcp_size = runtime_context.get_parallel().dcp_size
+    offsets, rows_list, gathered_list, total = [], [], [], 0
+    for piece in plan.pieces:
+        gathered = (piece.send_end - piece.send_start) * dcp_size
+        offsets.append(total)
+        rows_list.append(piece.scratch_rows)
+        gathered_list.append(gathered)
+        total += piece.scratch_rows
+    return offsets, rows_list, gathered_list, total
+
+
+def _dcp_extend_prefetch_buffers(
+    k_nope, k_pe, plan, layer_id: int, must_exist: bool = False
+):
+    """The side stream's gathered prefix, rank-major within each piece.
+
+    The slots are named process-global buffers, so one DCP extend must be
+    issuing at a time: today only the non-TBO layer loop passes the next
+    layer's id down to the hook, and the TBO stage path does not, which is
+    what keeps two interleaved ubatches from racing these slots.
+
+    ``must_exist`` is the consumer's side of the issue/consume handshake:
+    the buffers are keyed by (name, dtype, trailing shape), and a mismatch
+    between the issue-time send tensors and the consume-time own-KV tensors
+    would otherwise look up a fresh, never-written buffer and read it as
+    gathered KV -- silently. The issue call creates; the consume call must
+    find."""
+    rows = _dcp_prefetch_piece_layout(plan)[3]
+    slot = _dcp_prefetch_slot(layer_id)
+    bufs = [
+        dcp_layout.dcp_extend_gather_buffer(
+            f"latent_prefetch{slot}", k_nope, rows, must_exist=must_exist
+        )
+    ]
+    bufs.append(
+        dcp_layout.dcp_extend_gather_buffer(
+            f"rope_prefetch{slot}", k_pe, rows, must_exist=must_exist
+        )
+    )
+    return bufs
+
+
+def _dcp_extend_send_rows(pool, md, plan, layer_id: int):
+    """This rank's padded prefix shard for ``layer_id`` -- the gather's input.
+
+    Prefix rows only, so it reads nothing the current forward wrote. That is
+    what lets the prefetch call it a layer early. One send per gathered key.
+    """
+    if not plan.send_rows:
+        return [None, None]
+    send_nope, send_rope = pool.get_mla_kv_buffer(
+        None, md.dcp_local_prefix_kv_indices, layer_id=layer_id
+    )
+    if plan.local_lens != plan.padded_lens:
+        # Served prefixes are cycle-aligned and need no padding; this is the
+        # general case.
+        send_nope = _pad_dcp_extend_send(send_nope, plan)
+        send_rope = _pad_dcp_extend_send(send_rope, plan)
+    return [send_nope, send_rope]
+
+
+def _prefetch_dcp_extend_kv(forward_batch: "ForwardBatch", layer_id: int) -> None:
+    """Gather ``layer_id``'s prefix KV on the side stream, for a layer not yet run.
+
+    Only the prefix crosses the wire here: this chunk's own KV for that layer
+    does not exist until the layer runs, so the consumer appends it and
+    ``index_select``s into place. Doing the collective a layer early keeps it
+    off the critical path; the buffers are reused, so the consumer's wait and
+    the next issue are ordered by the stream dependencies below.
+    """
+    md = forward_batch.attn_dcp_metadata
+    if md is None or md.dcp_local_prefix_kv_indices is None:
+        raise RuntimeError(
+            "DCP extend KV prefetch needs attn_dcp_metadata."
+            "dcp_local_prefix_kv_indices; refusing to read the paged pool instead"
+        )
+    pool = forward_context.get_token_to_kv_pool()
+    plan = forward_batch.npu_dcp_extend_gather
+    if plan is None or not plan.send_rows or not plan.pieces:
+        return
+
+    stream = runtime_context.get_stream(_DCP_EXTEND_KV_PREFETCH_STREAM)
+
+    parallel = runtime_context.get_parallel()
+    offsets, _, gathered_list, _ = _dcp_prefetch_piece_layout(plan)
+    stream.wait_stream(torch.npu.current_stream())
+    with torch.npu.stream(stream):
+        sends = _dcp_extend_send_rows(pool, md, plan, layer_id)
+        bufs = _dcp_extend_prefetch_buffers(sends[0], sends[1], plan, layer_id)
+        for piece, offset, gathered in zip(plan.pieces, offsets, gathered_list):
+            if not gathered:
+                continue
+            for buf, send in zip(bufs, sends):
+                parallel.dcp_group.all_gather_into_tensor(
+                    buf[offset : offset + gathered],
+                    send[piece.send_start : piece.send_end],
+                )
+    event = torch.npu.Event()
+    event.record(stream)
+    # The in-flight collectives still read `sends`; holding them until the
+    # consumer's wait keeps the allocator from recycling their blocks first.
+    entries = forward_batch.npu_dcp_extend_kv_prefetch or []
+    forward_batch.npu_dcp_extend_kv_prefetch = entries + [(layer_id, event, sends)]
+
+
+def maybe_prefetch_dcp_extend_kv_npu(
+    forward_batch: "ForwardBatch", next_layer_id: Optional[int]
+) -> None:
+    if next_layer_id is None or not envs.SGLANG_NPU_ENABLE_DCP_EXTEND_KV_PREFETCH.get():
+        return
+    if not _dsa_dcp_extend_gathers_kv(forward_batch):
+        return
+    entries = forward_batch.npu_dcp_extend_kv_prefetch or []
+    if len(entries) >= 2 or any(e[0] == next_layer_id for e in entries):
+        return
+    # The in-flight entry, if any, is for a layer whose slot must differ from
+    # this one's: same parity here means the buffers of the two collectives
+    # overlap, and whichever finishes first would clobber the other's rows.
+    if any(e[0] % 2 == next_layer_id % 2 for e in entries):
+        raise RuntimeError(
+            f"DCP extend KV prefetch slot collision: layer {next_layer_id} "
+            f"shares its buffer slot with in-flight {sorted(e[0] for e in entries)}"
+        )
+    _prefetch_dcp_extend_kv(forward_batch, next_layer_id)
+
+
 def _dcp_gather_extend_kv_npu(
     m: "DeepseekV2AttentionMLA",
     forward_batch: "ForwardBatch",
@@ -606,6 +753,52 @@ def _dcp_gather_extend_kv_npu(
     total_rows = plan.pieces[-1].out_end if plan.pieces else 0
     out_nope = dcp_layout.dcp_extend_gather_buffer("latent", k_nope, total_rows)
     out_rope = dcp_layout.dcp_extend_gather_buffer("rope", k_pe, total_rows)
+
+    # A prefetch issued at the previous layer's tail may be in flight for this
+    # layer: use it, or wait it out before gathering inline -- the side-stream
+    # collective shares its group with the one this call issues, and the two
+    # must not be in flight together.
+    layer_id = m.attn_mqa.layer_id
+    entries = forward_batch.npu_dcp_extend_kv_prefetch or []
+    mine = next((e for e in entries if e[0] == layer_id), None)
+    use_prefetch = (
+        envs.SGLANG_NPU_ENABLE_DCP_EXTEND_KV_PREFETCH.get() and mine is not None
+    )
+    remaining = [e for e in entries if e is not mine]
+    if use_prefetch:
+        torch.npu.current_stream().wait_event(mine[1])
+    elif entries:
+        # Entries with no match for this layer. In the shipped flow this is
+        # the batch's first full-attention layer: its block-start hook has
+        # already issued the NEXT layer's gather, and nothing was ever issued
+        # for this one, so the block-end hook re-issues it after this gather.
+        # Any other visitor (an entry whose layer never consumed) is held to
+        # the same rule: nothing may still be in flight on the shared group
+        # when this call issues its inline collective, so wait it out and drop.
+        for e in entries:
+            torch.npu.current_stream().wait_event(e[1])
+        remaining = []
+    forward_batch.npu_dcp_extend_kv_prefetch = remaining or None
+
+    if use_prefetch:
+        prefetched_kv = _dcp_extend_prefetch_buffers(
+            k_nope, k_pe, plan, layer_id, must_exist=True
+        )
+        offsets, rows_list, gathered_list, _ = _dcp_prefetch_piece_layout(plan)
+        outs = (out_nope, out_rope)
+        owns = (k_nope, k_pe)
+        for i, piece in enumerate(plan.pieces):
+            rows = rows_list[i]
+            if rows <= 0:
+                continue
+            for j, (out, own) in enumerate(zip(outs, owns)):
+                region = prefetched_kv[j][offsets[i] : offsets[i] + rows]
+                region[gathered_list[i] :] = own[piece.extend_start : piece.extend_end]
+                torch.index_select(
+                    region, 0, piece.index, out=out[piece.out_start : piece.out_end]
+                )
+        return out_nope, out_rope
+
     scratches = [
         (
             dcp_layout.dcp_extend_gather_buffer(
@@ -622,17 +815,12 @@ def _dcp_gather_extend_kv_npu(
     ]
 
     # Prefix rows only, so it reads nothing this forward wrote.
-    sends = [None, None]
-    if plan.send_rows:
-        sends = list(
-            get_token_to_kv_pool().get_mla_kv_buffer(
-                m.attn_mqa, forward_batch.attn_dcp_metadata.dcp_local_prefix_kv_indices
-            )
-        )
-        if plan.local_lens != plan.padded_lens:
-            # Served prefixes are cycle-aligned and need no padding; this is
-            # the general case.
-            sends = [_pad_dcp_extend_send(send, plan) for send in sends]
+    sends = _dcp_extend_send_rows(
+        forward_context.get_token_to_kv_pool(),
+        forward_batch.attn_dcp_metadata,
+        plan,
+        layer_id,
+    )
 
     # Every rank runs (or skips) the same collectives in the same order. Gather
     # and index_select stay INTERLEAVED per piece: pieces share one scratch, so
@@ -641,7 +829,7 @@ def _dcp_gather_extend_kv_npu(
         gathered = (piece.send_end - piece.send_start) * parallel.dcp_size
         rows = gathered + piece.extend_end - piece.extend_start
         for out, (buf, own), send in zip((out_nope, out_rope), scratches, sends):
-            if gathered:
+            if send is not None and gathered:
                 parallel.dcp_group.all_gather_into_tensor(
                     buf[:gathered], send[piece.send_start : piece.send_end]
                 )

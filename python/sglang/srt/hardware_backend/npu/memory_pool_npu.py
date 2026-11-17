@@ -877,15 +877,19 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         layer: "RadixAttention",
         loc: torch.Tensor,
         dst_dtype: Optional[torch.dtype] = None,
+        layer_id: Optional[int] = None,
     ):
         """Gather ``(nope, rope)`` at physical rows ``loc``.
 
         Overridden because the inherited Triton read assumes one fused buffer
         and this pool keeps the halves apart. ``loc`` is already rank-local and
         physical (the read door's contract), so no owner filter here.
+        ``layer_id`` reads another layer's KV, for the gather prefetch; when
+        given, ``layer`` may be None.
         """
-        k = self.get_key_buffer(layer.layer_id).view(-1, self.kv_lora_rank)
-        v = self.get_value_buffer(layer.layer_id).view(-1, self.qk_rope_head_dim)
+        read_layer_id = layer.layer_id if layer_id is None else layer_id
+        k = self.get_key_buffer(read_layer_id).view(-1, self.kv_lora_rank)
+        v = self.get_value_buffer(read_layer_id).view(-1, self.qk_rope_head_dim)
         idx = loc.to(torch.int64)
         cache_k_nope = k.index_select(0, idx).unsqueeze(1)
         cache_k_rope = v.index_select(0, idx).unsqueeze(1)
@@ -893,6 +897,19 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             cache_k_nope = cache_k_nope.to(dst_dtype)
             cache_k_rope = cache_k_rope.to(dst_dtype)
         return cache_k_nope, cache_k_rope
+
+    def maybe_prefetch_dcp_extend_kv(self, forward_batch, next_layer_id) -> None:
+        """Issue the next layer's DCP extend KV gather on the side stream.
+
+        The layer-ahead hook calls this duck-typed, mirroring the layer-split
+        pools' ``prefetch_kv_buffer``; pools without it are no-ops. Imported
+        lazily: the attention module reads this pool at call time.
+        """
+        from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
+            maybe_prefetch_dcp_extend_kv_npu,
+        )
+
+        maybe_prefetch_dcp_extend_kv_npu(forward_batch, next_layer_id)
 
     def get_state_buf_infos(self):
         if self.index_head_dim is None:

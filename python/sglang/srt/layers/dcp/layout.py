@@ -314,16 +314,28 @@ def dcp_extend_gathers_kv(
 _dcp_extend_gather_buffers: Dict[Tuple, torch.Tensor] = {}
 
 
-def dcp_extend_gather_buffer(name: str, ref: torch.Tensor, rows: int) -> torch.Tensor:
+def dcp_extend_gather_buffer(
+    name: str, ref: torch.Tensor, rows: int, must_exist: bool = False
+) -> torch.Tensor:
     """A reusable ``rows``-row buffer shaped and typed like ``ref``. Grow-only.
 
     Allocated per layer, the peak moved with whatever the allocator held when a
     layer asked for another ~1.1 GiB. Two callers sharing ``name`` share the
     buffer and must not hold slices across each other's calls.
+
+    ``must_exist`` flips the miss case from allocate to raise: a consumer that
+    must find what an earlier call wrote gets a loud error instead of a fresh,
+    never-written buffer.
     """
     key = (name, ref.dtype, ref.device, tuple(ref.shape[1:]))
     buf = _dcp_extend_gather_buffers.get(key)
     if buf is None or buf.shape[0] < rows:
+        if must_exist:
+            raise RuntimeError(
+                f"DCP extend gather buffer {name!r} for key {key} was never "
+                f"written for {rows} rows: the writer and the reader disagree "
+                "on dtype, shape or slot"
+            )
         # Drop every reference first, or the peak is briefly both buffers.
         _dcp_extend_gather_buffers.pop(key, None)
         buf = None

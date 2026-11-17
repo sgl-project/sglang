@@ -2812,6 +2812,10 @@ class DeepseekV2DecoderLayer(nn.Module):
             quant_format=self._resolve_gfx95_quant_format(),
         )
 
+        maybe_prefetch_next_full_attention_kv(
+            forward_batch, next_full_attention_layer_id
+        )
+
         with self.self_attn.maybe_use_decode_attn_tp(forward_batch):
             hidden_states = self.self_attn(
                 positions=positions,

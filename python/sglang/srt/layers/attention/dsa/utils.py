@@ -310,17 +310,24 @@ def maybe_prefetch_next_full_attention_kv(
     forward_batch: "ForwardBatch",
     next_full_attention_layer_id: Optional[int],
 ) -> None:
-    """Prefetch (owner-broadcast) the next layer's DSA KV under layer split.
+    """Prefetch the next layer's DSA KV, one layer ahead of its attention.
 
-    No-op unless the current batch runs DSA prefill-CP and the active KV pool is
-    a layer-sharded pool exposing ``prefetch_kv_buffer`` (i.e.
-    ``LayerSplitDSATokenToKVPool``). Kicking the broadcast off one layer ahead
-    overlaps it with the current layer's attention compute.
+    Layer split (prefill-CP) owner-broadcasts it across CP ranks. Under DCP the
+    extend pool gathers the next layer's prefix KV on a side stream instead.
+    Both are pool-provided hooks and no-ops outside their own mode.
     """
-    if next_full_attention_layer_id is None or not dsa_use_prefill_cp(forward_batch):
+    if next_full_attention_layer_id is None:
         return
 
-    prefetch_kv_buffer = getattr(get_token_to_kv_pool(), "prefetch_kv_buffer", None)
+    pool = get_token_to_kv_pool()
+    maybe_prefetch_dcp = getattr(pool, "maybe_prefetch_dcp_extend_kv", None)
+    if maybe_prefetch_dcp is not None:
+        maybe_prefetch_dcp(forward_batch, next_full_attention_layer_id)
+
+    if not dsa_use_prefill_cp(forward_batch):
+        return
+
+    prefetch_kv_buffer = getattr(pool, "prefetch_kv_buffer", None)
     if prefetch_kv_buffer is not None:
         prefetch_kv_buffer(next_full_attention_layer_id)
 
