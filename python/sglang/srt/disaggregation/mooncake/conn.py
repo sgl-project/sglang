@@ -3500,9 +3500,19 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
             if info.is_dummy:
                 continue
             peer = self.decode_kv_args_table.get(info.mooncake_session_id)
-            if peer is None or not any(
-                layer_id in last_stage_layers for layer_id in peer.dst_kv_layer_ids
-            ):
+            if peer is None:
+                return False
+            if peer.dst_kv_layer_ids:
+                pulls_last = any(
+                    layer_id in last_stage_layers for layer_id in peer.dst_kv_layer_ids
+                )
+            else:
+                # Positional pairing: decode PP is 1 or matches prefill's, so a
+                # peer holding every layer runs no PP and pulls every stage.
+                ptrs_per_layer = 1 if self.is_mla_backend else 2
+                num_layers = len(peer.dst_kv_ptrs) // ptrs_per_layer
+                pulls_last = num_layers >= last_stage_layers.stop
+            if not pulls_last:
                 return False
         return True
 

@@ -1605,9 +1605,12 @@ class TestPPPrefillEarlySend(CustomTestCase):
                 for i in range(len(peer_layers))
             }
             return SimpleNamespace(
+                is_mla_backend=False,
                 transfer_infos={7: infos},
                 decode_kv_args_table={
-                    f"s{i}": SimpleNamespace(dst_kv_layer_ids=layers)
+                    f"s{i}": SimpleNamespace(
+                        dst_kv_layer_ids=layers, dst_kv_ptrs=[0] * 2 * len(layers)
+                    )
                     for i, layers in enumerate(peer_layers)
                 },
             )
@@ -1624,9 +1627,18 @@ class TestPPPrefillEarlySend(CustomTestCase):
         self.assertFalse(pulls(list(range(8)), [0, 1]))
         # Decode PP2: its first rank spans stages 0 and 1 but not the last one.
         self.assertFalse(pulls(list(range(4))))
-        # Positional pairing (no layer ids) or an unknown room keeps the aux here.
-        self.assertFalse(pulls([]))
+        # An unknown room keeps the aux here.
         self.assertFalse(pulls(list(range(8)), room=8))
+
+        # Positional pairing (no layer ids): decode PP is 1 or matches prefill's,
+        # so only a peer with every layer's K and V pointers pulls the last stage.
+        def positional(num_dst_layers):
+            peer = manager([])
+            peer.decode_kv_args_table["s0"].dst_kv_ptrs = [0] * 2 * num_dst_layers
+            return MooncakeKVManager.decode_pulls_last_pp_stage(peer, 7, range(6, 8))
+
+        self.assertTrue(positional(8))
+        self.assertFalse(positional(2))
 
     def test_result_skips_the_early_sent_chunk_after_its_transfer_ends(self):
         stage = _PPEarlySendScheduler(is_last_rank=False)

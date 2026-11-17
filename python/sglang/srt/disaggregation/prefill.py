@@ -2008,8 +2008,10 @@ class SchedulerDisaggregationPrefillMixin:
         state_types = ()
         if last_chunk:
             try:
-                if send_aux:
+                if first_output_id is not None:
                     self.disagg_metadata_buffers.set_buf(req, first_output_id)
+                elif send_aux:
+                    self.disagg_metadata_buffers.set_buf(req)
             except CustomizedInfoError as exc:
                 # customized_info may be unserializable or exceed the transfer buffer.
                 req.customized_info = None
