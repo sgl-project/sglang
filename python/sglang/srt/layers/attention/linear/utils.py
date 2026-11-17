@@ -27,6 +27,7 @@ class LinearAttnKernelBackend(Enum):
     PTX_KDA = "ptx_kda"
     HELION = "helion"
     INTEL_XPU = "intel_xpu"
+    AITER = "aiter"
     CUSTOM = "custom"
 
     @classmethod
@@ -59,6 +60,9 @@ class LinearAttnKernelBackend(Enum):
 
     def is_intel_xpu(self):
         return self == LinearAttnKernelBackend.INTEL_XPU
+
+    def is_aiter(self):
+        return self == LinearAttnKernelBackend.AITER
 
     def is_custom(self):
         return self == LinearAttnKernelBackend.CUSTOM
@@ -93,10 +97,14 @@ def resolve_linear_attn_backends(
         mamba.linear_attn_prefill_backend or prefill_default or base
     )
 
-    # Unset verify follows decode (flashinfer -> its recurrent kernel, else triton).
+    # Unset verify follows decode for backends with their own verify kernel.
     verify = mamba.linear_attn_verify_backend
     if verify is None:
-        verify = decode.value if decode.is_flashinfer() else "triton"
+        verify = (
+            decode.value
+            if decode.is_flashinfer() or decode.is_intel_xpu()
+            else "triton"
+        )
 
     backends = LinearAttnBackends(
         decode=decode, prefill=prefill, verify=LinearAttnKernelBackend(verify)
@@ -116,6 +124,10 @@ def select_verify_intermediate_state_indices(
 
     import torch
 
+    # A callable `valid` is evaluated only here, so per-layer callers launch no
+    # mask kernel when stable rows are off.
+    if callable(valid):
+        valid = valid()
     req_rows = req_pool_indices[: valid.shape[0]]
     return torch.where(valid, req_rows, torch.full_like(req_rows, pool_size)).to(
         torch.int32
