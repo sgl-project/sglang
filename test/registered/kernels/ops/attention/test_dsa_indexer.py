@@ -1594,6 +1594,8 @@ class TestDSAIndexer(CustomTestCase):
                 backend.dsa_index_topk = 2048
                 backend.dsa_index_kpool = 1
                 backend.dsa_decode_impl = "fa3"
+                backend._flashmla_kv_pad_q_in_place = False
+                backend._trtllm_fused_q = False
                 backend._memory_saver_adapter = TorchMemorySaverAdapter.create(
                     enable=False
                 )

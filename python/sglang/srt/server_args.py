@@ -346,6 +346,7 @@ class ServerArgs:
         "MuseGlimmerForConditionalGeneration",
         "Cosmos3ForConditionalGeneration",
         "Cosmos3EdgeForConditionalGeneration",
+        "Gemma4ForConditionalGeneration",
     )
 
     # The attention-backend allow-list is enforced via
@@ -699,10 +700,17 @@ def _declared_default(name: str):
     )
 
 
-# Credentials -- the access keys and the TLS key's password: no display, log or
-# dump of the configuration carries them.
+# Credentials -- the access keys, the TLS key's password and the HiCache and
+# external-linker storage configs (they can carry storage credentials): no
+# display, log or dump of the configuration carries them.
 SERVER_ARGS_SECRET_FIELD_NAMES = frozenset(
-    {"api_key", "admin_api_key", "ssl_keyfile_password"}
+    {
+        "api_key",
+        "admin_api_key",
+        "ssl_keyfile_password",
+        "hicache_storage_backend_extra_config",
+        "unified_cache_external_linker_config",
+    }
 )
 _REDACTED = "<redacted>"
 
