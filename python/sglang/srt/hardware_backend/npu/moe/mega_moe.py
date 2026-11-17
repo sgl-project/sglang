@@ -42,11 +42,14 @@ def _get_symm_buffer(x, config, state, quant_mode, quant_dtype):
 
     buffers = get_buffer(_BUFFER_NAME, dict)
     topk = state.topk_ids.shape[1]
+    # One buffer per process group: the provider registers peermem once per
+    # group, so a second buffer (e.g. a separate prefill/decode capacity) makes
+    # the MegaMoE tiling fail with "Failed to get peermem base".
+    capacity = state.buffer_capacity or state.capacity
     key = (
         state.group,
         x.device,
         config.num_experts,
-        state.capacity,
         topk,
         config.hidden_size,
         config.intermediate_size_per_partition,
@@ -62,7 +65,7 @@ def _get_symm_buffer(x, config, state, quant_mode, quant_dtype):
         buffers[key] = get_symm_buffer_for_mega_moe(
             state.group,
             num_experts=config.num_experts,
-            num_max_tokens_per_rank=state.capacity,
+            num_max_tokens_per_rank=capacity,
             num_topk=topk,
             hidden=config.hidden_size,
             intermediate_hidden=config.intermediate_size_per_partition,
@@ -258,7 +261,11 @@ def run_mega_moe(
         )
 
     x, ids, weights, mask = _prepare_inputs(
-        x, state.topk_ids, state.topk_weights, state.capacity, is_arch35
+        x,
+        state.topk_ids,
+        state.topk_weights,
+        state.buffer_capacity or state.capacity,
+        is_arch35,
     )
     output, _ = mega_moe(
         x=x,

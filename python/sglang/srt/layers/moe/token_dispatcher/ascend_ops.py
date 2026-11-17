@@ -145,6 +145,10 @@ class _MegaMoEState:
     capacity: int
     topk_ids: torch.Tensor
     topk_weights: torch.Tensor
+    # Size of the single shared EP buffer. Both phases reuse it: the provider
+    # registers peermem per process group, so a second buffer on the same group
+    # makes the MegaMoE tiling fail with "Failed to get peermem base".
+    buffer_capacity: Optional[int] = None
 
 
 AscendOpsForwardState = _MC2State | _AllGatherState | _AllToAllVState | _MegaMoEState
@@ -224,6 +228,18 @@ class AscendOpsDispatcher(BaseDispatcher):
                 )
             self._fused_decode_capacity = decode_capacity
 
+        # One shared EP buffer for both phases. The provider registers peermem
+        # per process group, so creating a second buffer on the same group makes
+        # the MegaMoE tiling fail with "Failed to get peermem base".
+        self._fused_buffer_capacity = max(
+            capacity
+            for capacity in (
+                getattr(self, "_fused_prefill_capacity", None),
+                getattr(self, "_fused_decode_capacity", None),
+            )
+            if capacity
+        )
+
     def set_quant_config(self, quant_config: dict) -> None:
         """Store quantization settings used by the routing kernels."""
 
@@ -294,7 +310,13 @@ class AscendOpsDispatcher(BaseDispatcher):
             expert_tokens=None,
             group_list_type=1,
             exec_mode="fused_op",
-            forward_state=_MegaMoEState(self.ep_group, capacity, topk_ids, topk_weights),
+            forward_state=_MegaMoEState(
+                self.ep_group,
+                capacity,
+                topk_ids,
+                topk_weights,
+                buffer_capacity=self._fused_buffer_capacity,
+            ),
         )
 
     def _combine_fused_op(
