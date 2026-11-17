@@ -625,6 +625,10 @@ class Req(ReqDllmMixin):
         # match, it will be the tracked seqlen in the ping pong buffer for the
         # right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
+        # Set by the scheduler when another live request shares this prompt
+        # past what the tree gave it: the checkpoint that completes the prompt
+        # is then published instead of deferred to the request's end.
+        self.mamba_publish_prompt: bool = False
         # Total cached prefix length (on-device prefix_len + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule
         # time and used to estimate uncached tokens / sort by longest prefix for
@@ -1517,6 +1521,7 @@ class Req(ReqDllmMixin):
         self.temp_input_token_ids_logprobs_val = None
         self.temp_input_token_ids_logprobs_idx = None
         self.mamba_branching_seqlen = None
+        self.mamba_publish_prompt = False
         self.already_computed = 0
         self.kv.reset_for_retract()
         self.prefill_weight_versions = None

@@ -586,6 +586,13 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         state slots it needs from one take made ahead; nothing here."""
         return nullcontext()
 
+    def shared_prompt_checkpoint_grid(self) -> Optional[int]:
+        """The grid on which the scheduler compares a prompt that completes in
+        a prefill with the other live requests' prompts, to mark it shared
+        (`Req.mamba_publish_prompt`) so its checkpoint is published; None when
+        this cache publishes every prompt it would share anyway."""
+        return None
+
     def free_kv_row(self, kv: Any, ranges: list[tuple[int, int]]) -> None:
         """Give back ascending, disjoint, half-open row-position ranges
         of the ``kv`` record's row; one call keeps a shared page freed once.

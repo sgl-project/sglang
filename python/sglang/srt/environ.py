@@ -1905,6 +1905,11 @@ class Envs:
     # still writes. Requires --enable-hierarchical-cache. Off keeps the
     # donated GPU slot and the previous ratio.
     SGLANG_OPT_MAMBA_HOST_ONLY_CHECKPOINT = EnvBool(False)
+    # Below --hybrid-cache-checkpoints-level 3, publish a running request's
+    # prompt-end checkpoint when another live request shares a prefix of the
+    # prompt deeper than the tree holds, instead of only at the request's end.
+    # Off = only branching points and request ends (escape hatch).
+    SGLANG_MAMBA_PUBLISH_SHARED_PROMPTS = EnvBool(True)
 
     # ===================================================================
     # CUDA graphs and execution buffers

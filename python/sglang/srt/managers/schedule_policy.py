@@ -39,6 +39,7 @@ logger = logging.getLogger(__name__)
 # ==============================================================================
 """Request scheduler policy"""
 
+import itertools
 import os
 import random
 from collections import Counter
@@ -860,6 +861,53 @@ def windows_retire_behind_checkpoints(tree_cache: Optional[BasePrefixCache]) -> 
         and tree_cache.window_sub_pools()
         and tree_cache.window_checkpoint_interval() > 0
     )
+
+
+def mark_shared_prompt_checkpoints(
+    reqs: Iterable[Req],
+    live_reqs: Iterable[Iterable[Req]],
+    grid: int,
+    max_compared: int = WAITING_QUEUE_PREFIX_MATCH_MAX,
+) -> None:
+    """Mark each of ``reqs`` whose extend completes its prompt to publish the
+    prompt's checkpoint (`Req.mamba_publish_prompt`) when another live request
+    shares a prefix of it deeper than the first ``grid`` depth past what the
+    tree gave it. A request that defers that checkpoint to its end (level 2)
+    otherwise keeps the prompt out of the tree while it decodes, and every
+    request sharing it prefills it again.
+
+    ``live_reqs`` holds the other live requests, waiting ones first: they
+    match the published prompt when admitted. The running ones show a prefix
+    many requests share. At most ``max_compared`` of them are compared with
+    each prompt, so the cost stays bounded on a long queue.
+    """
+    for req in reqs:
+        req.mamba_publish_prompt = False
+        prompt = req.origin_input_ids
+        if req.skip_radix_cache_insert or req.extend_end < len(prompt):
+            continue
+        # A branching point inside this prompt is published regardless.
+        cached = max(req.kv.cache_protected_len, req.mamba_branching_seqlen or 0)
+        # The shallowest depth that holds a state the tree does not.
+        depth = (cached // grid + 1) * grid
+        if depth > len(prompt):
+            continue
+        last = prompt[depth - 1]
+        head = prompt[:depth]
+        for other in itertools.islice(
+            itertools.chain.from_iterable(live_reqs), max_compared
+        ):
+            ids = other.origin_input_ids
+            if (
+                other is not req
+                and len(ids) >= depth
+                and ids[depth - 1] == last
+                and other.extra_key == req.extra_key
+                and other.cache_salt == req.cache_salt
+                and ids[:depth] == head
+            ):
+                req.mamba_publish_prompt = True
+                break
 
 
 class PrefillAdder:

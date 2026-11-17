@@ -242,6 +242,8 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
         tree_cache.checkpoint(req, up_to=req.extend_end)
     # The next extend resumes after this one, published or not.
     req.prefix_len = req.extend_end
+    # The mark applies to the checkpoint that completes the prompt only.
+    req.mamba_publish_prompt = False
 
 
 def evict_from_tree_cache(

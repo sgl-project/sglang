@@ -9,8 +9,10 @@ from unittest.mock import MagicMock, patch
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.managers.req_types import FINISH_LENGTH, FINISH_MATCHED_TOKEN
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
+from sglang.srt.managers.schedule_policy import mark_shared_prompt_checkpoints
 from sglang.srt.managers.scheduler_components.batch_result_processor import (
     SchedulerBatchResultProcessor,
 )
@@ -20,6 +22,7 @@ from sglang.srt.managers.scheduler_components.request_list import (
 )
 from sglang.srt.managers.utils import GenerationBatchResult
 from sglang.srt.mem_cache.base_prefix_cache import MatchPrefixParams
+from sglang.srt.mem_cache.common import checkpoint_kv_cache
 from sglang.srt.mem_cache.kv.advance import TrackingAdvance
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.static_kv_storage import acquire_rows, kv_storage_of
@@ -34,10 +37,11 @@ from sglang.srt.speculative.spec_utils import (
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.kits.unified_radix_cache.config import CacheConfig
 from sglang.test.kits.unified_radix_cache.fixtures import build_fixture
+from sglang.test.mem_cache_utils import finish_req
 from sglang.test.scheduler_test_utils import release_only_retirer
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=20, suite="base-a-test-cpu")
+register_cpu_ci(est_time=25, suite="base-a-test-cpu")
 
 PROMPT = list(range(1, 17))
 
@@ -47,6 +51,7 @@ def _build(
     components=(ComponentType.FULL, ComponentType.MAMBA),
     page_size=4,
     enable_mamba_extra_buffer=True,
+    mamba_cache_size=8,
     **kwargs,
 ):
     cfg = CacheConfig(
@@ -55,7 +60,7 @@ def _build(
         enable_mamba_extra_buffer=enable_mamba_extra_buffer,
         kv_size=64,
         max_context_len=64,
-        mamba_cache_size=8,
+        mamba_cache_size=mamba_cache_size,
         hybrid_cache_checkpoints_level=level,
         **kwargs,
     )
@@ -66,24 +71,24 @@ def _build(
         return build_fixture(cfg, mamba_cache_chunk_size=4)
 
 
-def _running_req(cache, allocator, pool, up_to):
+def _running_req(cache, allocator, pool, up_to, prompt=PROMPT, rid="running"):
     req = Req(
-        rid="running",
+        rid=rid,
         origin_input_text="",
-        origin_input_ids=array("q", PROMPT),
+        origin_input_ids=array("q", prompt),
         sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
     )
     acquire_rows(pool, pool.state, [req])
     req.output_ids = array("q")
     req.refresh_fill_ids()
-    req.kv.kv_committed_len = len(PROMPT)
-    req.kv.kv_allocated_len = len(PROMPT)
+    req.kv.kv_committed_len = len(prompt)
+    req.kv.kv_allocated_len = len(prompt)
     req.kv.cache_protected_len = 0
     if cache.enable_mamba_extra_buffer:
         req.kv.mamba_last_track_seqlen = up_to
     pool.write(
-        (req.kv.req_pool_idx, slice(0, len(PROMPT))),
-        allocator.alloc(len(PROMPT)),
+        (req.kv.req_pool_idx, slice(0, len(prompt))),
+        allocator.alloc(len(prompt)),
     )
     req.last_node = cache.root_node_handle()
     req.lock = None
@@ -204,6 +209,245 @@ class TestRequestEndCheckpoints(CustomTestCase):
         cache.sanity_check()
 
 
+# A burst of requests over one shared system prompt: B and C share A's first 12
+# tokens and differ after them.
+SHARED = 12
+B_PROMPT = PROMPT[:SHARED] + [101, 102, 103, 104]
+C_PROMPT = PROMPT[:SHARED] + [201, 202, 203, 204]
+
+
+def _prompt_req(prompt, rid, extend_end=None, cached=0, **fields):
+    req = Req(
+        rid=rid,
+        origin_input_text="",
+        origin_input_ids=array("q", prompt),
+        sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
+        **fields,
+    )
+    req.extend_end = len(prompt) if extend_end is None else extend_end
+    req.kv.cache_protected_len = cached
+    return req
+
+
+def _marked(req, live, grid=4, **kwargs):
+    mark_shared_prompt_checkpoints([req], [live], grid, **kwargs)
+    return req.mamba_publish_prompt
+
+
+class TestMarkSharedPrompts(CustomTestCase):
+    """Which prompts the scheduler marks for publishing at their end."""
+
+    def test_prompt_shared_by_a_waiting_request_is_marked(self):
+        a = _prompt_req(PROMPT, "a")
+        self.assertTrue(_marked(a, [a, _prompt_req(B_PROMPT, "b")]))
+
+    def test_lone_prompt_is_not_marked(self):
+        a = _prompt_req(PROMPT, "a")
+        a.mamba_publish_prompt = True  # a stale mark is cleared
+        unrelated = _prompt_req([900 + i for i in range(16)], "u")
+        # Sharing less than one grid step is no share.
+        template = _prompt_req(PROMPT[:3] + [300] * 13, "t")
+        self.assertFalse(_marked(a, []))
+        self.assertFalse(_marked(a, [a]))
+        self.assertFalse(_marked(a, [unrelated, template]))
+
+    def test_share_within_the_cached_prefix_is_not_marked(self):
+        # A continuation already matched its first 12 tokens (a multi-turn
+        # session); a request sharing only those gains nothing.
+        a = _prompt_req(PROMPT, "a", cached=SHARED)
+        self.assertFalse(_marked(a, [_prompt_req(B_PROMPT, "b")]))
+        # Control: a request sharing the whole prompt does gain.
+        self.assertTrue(_marked(a, [_prompt_req(PROMPT + [7], "fork")]))
+
+    def test_branching_point_counts_as_cached(self):
+        a = _prompt_req(PROMPT, "a")
+        a.mamba_branching_seqlen = SHARED
+        self.assertFalse(_marked(a, [_prompt_req(B_PROMPT, "b")]))
+        a.mamba_branching_seqlen = 8
+        self.assertTrue(_marked(a, [_prompt_req(B_PROMPT, "b")]))
+
+    def test_chunk_short_of_the_prompt_end_is_not_marked(self):
+        a = _prompt_req(PROMPT, "a", extend_end=8)
+        self.assertFalse(_marked(a, [_prompt_req(B_PROMPT, "b")]))
+        a.extend_end = len(PROMPT)
+        self.assertTrue(_marked(a, [_prompt_req(B_PROMPT, "b")]))
+
+    def test_other_cache_namespace_is_not_marked(self):
+        a = _prompt_req(PROMPT, "a")
+        salted = _prompt_req(B_PROMPT, "b", cache_salt="tenant")
+        keyed = _prompt_req(B_PROMPT, "c", extra_key="lora")
+        self.assertFalse(_marked(a, [salted, keyed]))
+        self.assertTrue(_marked(a, [salted, keyed, _prompt_req(B_PROMPT, "d")]))
+
+    def test_unpublishable_prompt_is_not_marked(self):
+        a = _prompt_req(PROMPT, "a")
+        a.skip_radix_cache_insert = True
+        self.assertFalse(_marked(a, [_prompt_req(PROMPT, "b")]))
+
+    def test_comparisons_are_bounded(self):
+        a = _prompt_req(PROMPT, "a")
+        live = [_prompt_req([900] * 16, "u"), _prompt_req(B_PROMPT, "b")]
+        self.assertFalse(_marked(a, live, max_compared=1))
+        self.assertTrue(_marked(a, live, max_compared=2))
+
+
+class TestSharedPromptCheckpoints(CustomTestCase):
+    """Level 2 publishes a prompt end that another live request shares."""
+
+    def _burst(self, level=2, mark=True):
+        """A finishes its prefill while B waits; then B prefills while C waits.
+        Returns B's match after A's prefill and C's cached prefix after B's."""
+        cache, allocator, pool = _build(level, mamba_cache_size=16)
+        grid = cache.shared_prompt_checkpoint_grid()
+        a = _running_req(cache, allocator, pool, len(PROMPT), rid="a")
+        b_waiting = _prompt_req(B_PROMPT, "b")
+        if mark and grid is not None:
+            mark_shared_prompt_checkpoints([a], [[b_waiting]], grid)
+        checkpoint_kv_cache(a, cache)
+        self.assertFalse(a.mamba_publish_prompt)
+        b_match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", B_PROMPT)))
+        )
+
+        # B is admitted with that match: it tracks its branching point, if any.
+        b = _running_req(cache, allocator, pool, len(B_PROMPT), B_PROMPT, "b")
+        b.mamba_branching_seqlen = b_match.mamba_branching_seqlen
+        if b.mamba_branching_seqlen is not None:
+            b.kv.mamba_last_track_seqlen = b.mamba_branching_seqlen
+        if mark and grid is not None:
+            mark_shared_prompt_checkpoints([b], [[_prompt_req(C_PROMPT, "c")]], grid)
+            # B's own share with C lies within the branch it publishes anyway.
+            self.assertFalse(b.mamba_publish_prompt)
+        checkpoint_kv_cache(b, cache)
+        c_cached = _cached_len(cache, C_PROMPT)
+        for req in (a, b):
+            if req.lock is not None:
+                cache.unlock(req.lock)
+        cache.sanity_check()
+        return b_match, c_cached
+
+    def test_level2_burst_reuses_the_shared_prefix(self):
+        b_match, c_cached = self._burst()
+        # A's published prompt gives B the shared KV and its branching point;
+        # B publishes there, so C matches the shared prefix.
+        self.assertEqual(b_match.full_kv_hit_length, SHARED)
+        self.assertEqual(b_match.mamba_branching_seqlen, SHARED)
+        self.assertEqual(c_cached, SHARED)
+
+    def test_level2_burst_without_the_mark_shares_nothing(self):
+        # Negative control: unmarked, A keeps its prompt until it finishes.
+        b_match, c_cached = self._burst(mark=False)
+        self.assertEqual(b_match.full_kv_hit_length, 0)
+        self.assertIsNone(b_match.mamba_branching_seqlen)
+        self.assertEqual(c_cached, 0)
+
+    def test_escape_hatch_restores_deferral(self):
+        with envs.SGLANG_MAMBA_PUBLISH_SHARED_PROMPTS.override(False):
+            cache, allocator, pool = _build(2)
+            self.assertIsNone(cache.shared_prompt_checkpoint_grid())
+            req = _running_req(cache, allocator, pool, up_to=len(PROMPT))
+            req.mamba_publish_prompt = True
+            cache.checkpoint(req, up_to=len(PROMPT))
+        self.assertEqual(_cached_len(cache, PROMPT), 0)
+        cache.sanity_check()
+
+    def test_level2_marked_prompt_publishes_its_end(self):
+        for extra_buffer in (True, False):
+            with self.subTest(extra_buffer=extra_buffer):
+                cache, allocator, pool = _build(
+                    2,
+                    page_size=4 if extra_buffer else 1,
+                    enable_mamba_extra_buffer=extra_buffer,
+                )
+                self.assertEqual(cache.shared_prompt_checkpoint_grid(), 4)
+                req = _running_req(cache, allocator, pool, up_to=len(PROMPT))
+                req.mamba_publish_prompt = True
+                free_slots = pool.mamba_allocator.available_size()
+                cache.checkpoint(req, up_to=len(PROMPT))
+                # A request whose prompt extends this one (another sample of
+                # it) matches all of it.
+                self.assertEqual(_cached_len(cache, PROMPT + [7, 8]), len(PROMPT))
+                # The tree takes one state; the request keeps decoding on its own.
+                self.assertEqual(
+                    pool.mamba_allocator.available_size(), free_slots - 1
+                )
+                self.assertIsNone(req.kv.mamba_last_track_seqlen)
+                cache.unlock(req.lock)
+                cache.sanity_check()
+
+    def test_level2_mark_ignores_a_chunk_short_of_the_prompt_end(self):
+        cache, allocator, pool = _build(2)
+        req = _running_req(cache, allocator, pool, up_to=8)
+        req.mamba_publish_prompt = True
+        free_slots = pool.mamba_allocator.available_size()
+        cache.checkpoint(req, up_to=8)
+        self.assertEqual(_cached_len(cache, PROMPT), 0)
+        self.assertEqual(pool.mamba_allocator.available_size(), free_slots)
+        cache.sanity_check()
+
+    def test_level2_lone_request_still_defers(self):
+        cache, allocator, pool = _build(2)
+        req = _running_req(cache, allocator, pool, up_to=len(PROMPT))
+        mark_shared_prompt_checkpoints(
+            [req], [[req]], cache.shared_prompt_checkpoint_grid()
+        )
+        self.assertFalse(req.mamba_publish_prompt)
+        free_slots = pool.mamba_allocator.available_size()
+        checkpoint_kv_cache(req, cache)
+        self.assertEqual(_cached_len(cache, PROMPT), 0)
+        self.assertEqual(pool.mamba_allocator.available_size(), free_slots)
+        self.assertEqual(req.kv.mamba_last_track_seqlen, len(PROMPT))
+        self.assertIsNone(req.lock)
+        cache.sanity_check()
+
+    def test_level2_multi_turn_continuation_still_defers(self):
+        """Turn 2 extends turn 1's cached end; another session shares only the
+        system prompt, so turn 2 keeps one state on its path until it ends."""
+        cache, allocator, pool = _build(2, mamba_cache_size=16)
+        turn1 = _running_req(cache, allocator, pool, len(PROMPT), rid="turn1")
+        finish_req(cache, turn1, len(PROMPT))
+        self.assertEqual(_cached_len(cache, PROMPT), len(PROMPT))
+
+        turn2_prompt = PROMPT + list(range(17, 25))
+        turn2 = _running_req(cache, allocator, pool, len(turn2_prompt), turn2_prompt)
+        turn2.kv.cache_protected_len = len(PROMPT)
+        other_session = _prompt_req(PROMPT[:8] + [300] * 8, "other")
+        grid = cache.shared_prompt_checkpoint_grid()
+        mark_shared_prompt_checkpoints([turn2], [[other_session]], grid)
+        self.assertFalse(turn2.mamba_publish_prompt)
+        # Control: a fork of turn 2's new tokens would have marked it.
+        fork = _prompt_req(turn2_prompt + [5], "fork")
+        mark_shared_prompt_checkpoints([turn2], [[fork]], grid)
+        self.assertTrue(turn2.mamba_publish_prompt)
+
+        turn2.mamba_publish_prompt = False
+        free_slots = pool.mamba_allocator.available_size()
+        cache.checkpoint(turn2, up_to=len(turn2_prompt))
+        self.assertEqual(pool.mamba_allocator.available_size(), free_slots)
+        self.assertEqual(_cached_len(cache, turn2_prompt), len(PROMPT))
+        cache.sanity_check()
+
+    def test_level3_and_sliding_window_need_no_marks(self):
+        self.assertIsNone(_build(3)[0].shared_prompt_checkpoint_grid())
+        swa = _build(
+            2,
+            components=(ComponentType.FULL, ComponentType.SWA, ComponentType.MAMBA),
+            page_size=1,
+            sliding_window_size=4,
+        )[0]
+        self.assertIsNone(swa.shared_prompt_checkpoint_grid())
+        cache = _build(2)[0]
+        with get_disagg().override(disaggregation_mode="prefill"):
+            self.assertIsNone(cache.shared_prompt_checkpoint_grid())
+
+    def test_level3_burst_unchanged(self):
+        # Level 3 publishes every prompt end; it marks nothing.
+        b_match, c_cached = self._burst(level=3)
+        self.assertEqual(b_match.full_kv_hit_length, SHARED)
+        self.assertEqual(b_match.mamba_branching_seqlen, SHARED)
+        self.assertEqual(c_cached, SHARED)
+
+
 # The decode checkpoint grid is lcm(chunk, page, interval) = the interval. It is
 # twice the draft length so two verifies in a row never both cross a boundary,
 # as with a served model, whose grid is at least the 64-token FLA chunk.
@@ -227,7 +471,8 @@ class _SpecRequest:
     spec verifies, and a stop inside the last accepted run. ``written`` models the
     device: how many tokens the state in each tracking slot has consumed."""
 
-    def __init__(self, level, strategy, overlap, prompt_len):
+    def __init__(self, level, strategy, overlap, prompt_len, publish_prompt=False):
+        self.publish_prompt = publish_prompt
         self.lazy = strategy == "extra_buffer_lazy"
         self.overlap = overlap
         cfg = CacheConfig(
@@ -325,6 +570,8 @@ class _SpecRequest:
         # The token the prefill samples has no KV yet.
         req.output_ids.append(999)
         req.refresh_fill_ids()
+        # Left set through decode: only the prompt's checkpoint reads it.
+        req.mamba_publish_prompt = self.publish_prompt
         self.cache.checkpoint(req, up_to=len(self.prompt))
 
     def plan(self, device_seq_len):
@@ -423,8 +670,10 @@ class _SpecRequest:
         return states
 
 
-def _spec_request_states(level, strategy, overlap, prompt_len, accept_lens, stop_at):
-    req = _SpecRequest(level, strategy, overlap, prompt_len)
+def _spec_request_states(
+    level, strategy, overlap, prompt_len, accept_lens, stop_at, publish_prompt=False
+):
+    req = _SpecRequest(level, strategy, overlap, prompt_len, publish_prompt)
     with get_context().override_server_args(
         mamba_radix_cache_strategy=strategy,
         mamba_track_interval=SPEC_GRID,
@@ -484,6 +733,42 @@ class TestSpecDecodeRequestEndState(CustomTestCase):
         ):
             with self.subTest(strategy=strategy, overlap=overlap):
                 states = _spec_request_states(3, strategy, overlap, 11, (4, 4, 1), 0)
+                self.assertEqual(states, [(16, 16), (8, 8)])
+
+    def test_level2_shared_prompt_states_hold_their_keys(self):
+        # A marked prompt is donated at prefill as level 3 donates it; the
+        # request then decodes on a fresh tracking slot to its finish.
+        for level, strategy, overlap in SPEC_CONFIGS:
+            if level != 2:
+                continue
+            with self.subTest(strategy=strategy, overlap=overlap):
+                for prompt_len, accept_lens in itertools.product(
+                    (5, 8, 11), itertools.product((1, 4), repeat=3)
+                ):
+                    for stop_at in range(accept_lens[-1]):
+                        states = _spec_request_states(
+                            2,
+                            strategy,
+                            overlap,
+                            prompt_len,
+                            accept_lens,
+                            stop_at,
+                            publish_prompt=True,
+                        )
+                        wrong = [(key, got) for key, got in states if key != got]
+                        self.assertFalse(
+                            wrong, f"{prompt_len=} {accept_lens=} {stop_at=}: {wrong}"
+                        )
+
+    def test_level2_shared_prompt_keeps_the_prompt_state_past_the_finish(self):
+        # Unmarked, the finish keeps only (16, 16) (see above). Marked, the
+        # prompt's state at 8 is in the tree from the prefill on, and the
+        # request's lock on it keeps the cap from dropping it at the finish.
+        for strategy in ("extra_buffer", "extra_buffer_lazy"):
+            with self.subTest(strategy=strategy):
+                states = _spec_request_states(
+                    2, strategy, True, 11, (4, 4, 1), 0, publish_prompt=True
+                )
                 self.assertEqual(states, [(16, 16), (8, 8)])
 
     def test_level2_stop_before_the_crossing_falls_back_to_the_prompt_state(self):
