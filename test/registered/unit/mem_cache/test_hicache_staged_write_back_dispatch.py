@@ -769,6 +769,85 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             with self.subTest(layout=layout):
                 self.assertEqual(load.call_args.kwargs["block_quota"], 6)
 
+    def test_mamba_split_quota_selects_the_split_load(self):
+        """SGLANG_HICACHE_MAMBA_LOAD_BLOCK_QUOTA selects the split state load on
+        CUDA; unset or HIP keeps the stock kernel."""
+        from sglang.kernels.ops.mamba import transfer_mamba
+
+        quota = transfer_mamba.mamba_split_load_block_quota.__wrapped__
+        load_env = envs.SGLANG_HICACHE_MAMBA_LOAD_BLOCK_QUOTA
+        for hip, load, expected in (
+            (False, 8, 8),
+            (False, None, None),
+            (True, 8, None),
+        ):
+            with (
+                self.subTest(hip=hip, load=load),
+                load_env.override(load),
+                mock.patch.object(transfer_mamba, "is_hip_runtime", return_value=hip),
+            ):
+                self.assertEqual(quota(), expected)
+        with (
+            load_env.override(0),
+            mock.patch.object(transfer_mamba, "is_hip_runtime", return_value=False),
+            self.assertRaisesRegex(ValueError, "positive CTA count"),
+        ):
+            quota()
+
+    def test_mamba_split_copy_takes_its_quota_and_whole_16k_chunks(self):
+        from sglang.kernels.ops.mamba import transfer_mamba
+
+        chunk = transfer_mamba._split_chunk_bytes
+        # one chunk per CTA for a small copy, whole 16 KiB steps, never past an item
+        self.assertEqual(
+            chunk(total_bytes=1 << 20, item_size=1 << 20, block_quota=4), 1 << 18
+        )
+        self.assertEqual(chunk(total_bytes=100, item_size=100, block_quota=8), 100)
+        self.assertEqual(
+            chunk(total_bytes=40000, item_size=40000, block_quota=4), 16384
+        )
+        self.assertEqual(
+            chunk(total_bytes=64 << 20, item_size=1 << 20, block_quota=8), 1 << 20
+        )
+        src = torch.zeros(4, 2 * 4096, dtype=torch.uint8)
+        dst = torch.zeros(4, 4096, dtype=torch.uint8)
+        idx = _indices(0, 2)
+        split, stock = mock.MagicMock(), mock.MagicMock()
+        with (
+            mock.patch.object(
+                transfer_mamba, "mamba_split_load_block_quota", return_value=4
+            ),
+            mock.patch.object(
+                transfer_mamba, "_jit_transfer_mamba_split_module", return_value=split
+            ),
+            mock.patch.object(
+                transfer_mamba, "_jit_transfer_mamba_module", return_value=stock
+            ),
+        ):
+            transfer_mamba.transfer_kv_mamba_pf_lf(
+                src=src,
+                dst=dst,
+                src_indices=idx,
+                dst_indices=idx,
+                layer_id=1,
+                item_size=4096,
+                src_layout_dim=8192,
+            )
+            transfer_mamba.transfer_kv_mamba_lf_pf(
+                src_ptrs=torch.zeros(2, dtype=torch.uint64),
+                dst=src,
+                src_indices=idx,
+                dst_indices=idx,
+                item_size=4096,
+                dst_layout_dim=8192,
+                num_layers=2,
+            )
+        load_args = split.transfer_kv_mamba_pf_lf.call_args.args
+        self.assertEqual(load_args[-2:], (4, 4096))
+        split.transfer_kv_mamba_lf_pf.assert_not_called()
+        stock.transfer_kv_mamba_lf_pf.assert_called_once()
+        stock.transfer_kv_mamba_pf_lf.assert_not_called()
+
     def test_npu_mha_transfer_uses_contiguous_hicache_backing(self):
         """FIA views and packed drafts must restore without querying their owners."""
         from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
