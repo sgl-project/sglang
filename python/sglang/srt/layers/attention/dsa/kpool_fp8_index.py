@@ -265,6 +265,9 @@ def _prep_update_kpool_write_plan_launch(
     # N > kpool where one write closes multiple pools.
     max_closed_pools = kpool_max_closed_pools(num_draft_tokens, kpool)
     bs = write_start.shape[0]
+    page_table_rows = real_page_table.shape[0]  # in [bs*N, bs]
+    assert page_table_rows % bs == 0, f"{real_page_table.shape=}, {bs=}"
+    page_table_batch_stride = page_table_rows // bs
 
     assert write_loc_out.shape == (bs, max_closed_pools), write_loc_out.shape
     assert write_loc_out.stride(1) == 1, write_loc_out.stride()
@@ -299,6 +302,7 @@ def _prep_update_kpool_write_plan_launch(
         INDEX_PAGE_SIZE=index_page_size,
         MAX_CLOSED_POOLS=max_closed_pools,
         HAS_PER_Q=has_per_q_outputs,
+        PAGE_TABLE_BATCH_STRIDE=page_table_batch_stride,
     )
     return bs, args, constexprs
 
@@ -356,6 +360,7 @@ def _update_kpool_write_plan_kernel(
     INDEX_PAGE_SIZE: tl.constexpr,
     MAX_CLOSED_POOLS: tl.constexpr,
     HAS_PER_Q: tl.constexpr,
+    PAGE_TABLE_BATCH_STRIDE: tl.constexpr,
 ):
     b = tl.program_id(0)
     ws = tl.load(write_start_ptr + b).to(tl.int32)
@@ -384,7 +389,7 @@ def _update_kpool_write_plan_kernel(
         packed_page = (
             tl.load(
                 real_page_table_ptr
-                + (b * N).to(tl.int64) * real_page_table_stride_0
+                + (b * PAGE_TABLE_BATCH_STRIDE).to(tl.int64) * real_page_table_stride_0
                 + token_page_row
             ).to(tl.int64)
             // POOL_SIZE
