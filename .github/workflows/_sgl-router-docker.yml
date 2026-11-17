@@ -5,7 +5,7 @@ name: Build sgl-router Docker Image
 # one multi-arch manifest per requested tag so `docker pull` resolves the right
 # arch automatically. Callers: nightly-sgl-router-docker.yml
 # (lmsysorg/sglang-staging:sgl-router from main) and
-# release-sgl-router-docker.yml (lmsysorg/sgl-router:v<version> + :latest from
+# release-sgl-router.yml (lmsysorg/sgl-router:v<version> + :latest from
 # a `router-v*` tag; a no-push build on pull requests that touch the image).
 
 on:

@@ -676,15 +676,8 @@ WORKDIR /build
 COPY sgl-router /build/sgl-router
 COPY rust /build/rust
 
-# Install Rust at sgl-router's pinned toolchain, build the binary, then clean up
-RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
-        | sh -s -- -y --profile minimal --default-toolchain none \
-    && export PATH="/root/.cargo/bin:${PATH}" \
-    && cd /build/sgl-router \
-    && rustup toolchain install \
-    && cargo build --locked --release --bin sgl-router \
-    && cp target/release/sgl-router /build/sgl-router-bin \
-    && rm -rf /root/.cargo /root/.rustup /build/sgl-router/target
+# Install Rust at sgl-router's pinned toolchain and build the binary
+RUN bash /build/sgl-router/scripts/build.sh /build/sgl-router-bin
 
 ########################################################
 ########## Final Framework Image ######################

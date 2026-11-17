@@ -17,7 +17,7 @@
 # graph CI checked, tested, and license-audited.
 #
 # Published as lmsysorg/sgl-router (`:v<version>` and `:latest` from `router-v*`
-# tags by release-sgl-router-docker.yml); nightly-sgl-router-docker.yml pushes a
+# tags by release-sgl-router.yml); nightly-sgl-router-docker.yml pushes a
 # main build to lmsysorg/sglang-staging:sgl-router.
 #
 # Build (from the repo root):

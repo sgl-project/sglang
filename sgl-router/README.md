@@ -408,11 +408,17 @@ docker build -f docker/sgl-router.Dockerfile --build-arg CARGO_FEATURES=fips .
 ## Releases and versions
 
 `sgl-router` is versioned on its own semver track, independent of SGLang
-releases. It ships as a container image: `lmsysorg/sgl-router` tagged
-`v<version>` and `latest` (the newest release), and
-`lmsysorg/sglang-staging:sgl-router` (main, rebuilt every night). The crate is
-binary-only and is not published to crates.io or PyPI.
-`sgl-router --version` prints the version an image was built from.
+releases. Each release ships as:
+
+- a container image, `lmsysorg/sgl-router` tagged `v<version>` and `latest`
+  (the newest release);
+- a PyPI package, `pip install sgl-router`, whose wheel (linux x86_64 and
+  aarch64) puts the `sgl-router` binary on `PATH`.
+
+`lmsysorg/sglang-staging:sgl-router` is built from main every night, and the
+SGLang images build the router from their own source with
+`scripts/build.sh`. The crate itself is not published to crates.io.
+`sgl-router --version` prints the version a binary was built from.
 
 Releases are made manually:
 
@@ -422,9 +428,10 @@ Releases are made manually:
    Open a PR with the bump and the release notes.
 2. Once the bump is on main, a maintainer tags that commit
    `router-v<version>` and pushes the tag. That tag starts
-   `release-sgl-router-docker.yml`, which refuses a tag that differs from the
-   `Cargo.toml` version, builds the image for amd64 and arm64, and pushes
-   `lmsysorg/sgl-router:v<version>` and `:latest`.
+   `release-sgl-router.yml`, which refuses a tag that differs from the
+   `Cargo.toml` version, builds the image and the wheels for amd64 and arm64,
+   pushes `lmsysorg/sgl-router:v<version>` and `:latest`, and uploads the
+   wheels to PyPI.
 
 Do not tag a router release `v<version>`: SGLang's own PyPI and Docker release
 workflows run on every `v*` tag.

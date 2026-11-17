@@ -1,9 +1,10 @@
-name: Release sgl-router Docker Image
+name: Release sgl-router
 
 # `router-v<version>` tags in sgl-project/sglang: publish
-# lmsysorg/sgl-router:v<version> (and :latest) from docker/sgl-router.Dockerfile.
-# Pull requests that touch the image or these workflows: check the version and
-# build both arches without pushing.
+# lmsysorg/sgl-router:v<version> (and :latest) from docker/sgl-router.Dockerfile,
+# and the `sgl-router` wheels (linux x86_64 and aarch64) to PyPI.
+# Pull requests that touch the image, the packaging, or these workflows: check
+# the version and build both arches of both artifacts without publishing.
 # The router is versioned on its own track, separate from SGLang's `v*` tags,
 # which start the SGLang PyPI and Docker releases. Release steps:
 # sgl-router/README.md ("Releases and versions").
@@ -18,8 +19,9 @@ on:
       - "sgl-router/Cargo.toml"
       - "sgl-router/Cargo.lock"
       - "sgl-router/rust-toolchain.toml"
+      - "sgl-router/pyproject.toml"
       - ".github/workflows/_sgl-router-docker.yml"
-      - ".github/workflows/release-sgl-router-docker.yml"
+      - ".github/workflows/release-sgl-router.yml"
   workflow_dispatch:
     inputs:
       version:
@@ -41,6 +43,11 @@ on:
         required: false
         type: boolean
         default: true
+      publish_pypi:
+        description: "Also upload the wheels to PyPI (a version can be uploaded only once)"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -119,7 +126,7 @@ jobs:
           echo "tags=$tags" >> "$GITHUB_OUTPUT"
           echo "Building sgl-router $version from ${ref:-$GITHUB_SHA} with tags: $tags (push: $([[ $EVENT_NAME == pull_request ]] && echo no || echo yes))"
 
-  publish:
+  docker:
     needs: verify
     uses: ./.github/workflows/_sgl-router-docker.yml
     with:
@@ -128,3 +135,76 @@ jobs:
       ref: ${{ needs.verify.outputs.ref }}
       push: ${{ github.event_name != 'pull_request' }}
     secrets: inherit
+
+  # A binary-only wheel (maturin `bindings = "bin"`, see sgl-router/pyproject.toml)
+  # per arch, built natively in the manylinux_2_28 container. No sdist: the
+  # crate's path dependencies live outside sgl-router/.
+  pypi-build:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64
+            runner: ubuntu-24.04
+          - target: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    steps:
+      - name: Checkout the release ref
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.verify.outputs.ref }}
+          persist-credentials: false
+
+      - name: Read the pinned toolchain
+        id: toolchain
+        run: echo "channel=$(sed -n 's/^channel *= *"\([^"]*\)".*/\1/p' sgl-router/rust-toolchain.toml)" >> "$GITHUB_OUTPUT"
+
+      - name: Build the wheel
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: sgl-router
+          target: ${{ matrix.target }}
+          manylinux: "2_28"
+          rust-toolchain: ${{ steps.toolchain.outputs.channel }}
+          # Same as sgl-router/scripts/build.sh: link the vendored PCRE2.
+          docker-options: --env PCRE2_SYS_STATIC=1
+          args: --release --locked --out dist
+
+      - name: Install the wheel and run the binary
+        run: |
+          python3 -m venv /tmp/sgl-router-venv
+          /tmp/sgl-router-venv/bin/pip install sgl-router/dist/*.whl
+          /tmp/sgl-router-venv/bin/sgl-router --version
+
+      - name: Upload the wheel
+        uses: actions/upload-artifact@v4
+        with:
+          name: pypi-wheel-${{ matrix.target }}
+          path: sgl-router/dist/*.whl
+          retention-days: 7
+
+  # Trusted publishing: PyPI accepts this workflow's OIDC token for the
+  # sgl-router project, so no PyPI token is stored in the repo.
+  # After the image: a PyPI version can be uploaded only once, so the
+  # irreversible step waits for every other artifact of the release.
+  pypi-publish:
+    needs: [docker, pypi-build]
+    if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.publish_pypi)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - name: Download the wheels
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pypi-wheel-*
+          path: dist
+          merge-multiple: true
+
+      - name: Upload to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

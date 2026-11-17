@@ -222,9 +222,6 @@ RUN python -c "import nixl; nixl.nixl_agent('agent1')"
 
 # The PD tests launch sgl-router between the prefill and decode servers, built
 # from the same clone as the sglang install above.
-RUN cd /sgl-workspace/sglang/sgl-router && \
-    CARGO_TARGET_DIR=/tmp/sgl-router-target cargo build --locked --release --bin sgl-router && \
-    install -m 0755 /tmp/sgl-router-target/release/sgl-router /usr/local/bin/sgl-router && \
-    rm -rf /tmp/sgl-router-target
+RUN bash /sgl-workspace/sglang/sgl-router/scripts/build.sh /usr/local/bin/sgl-router
 
 CMD ["bash"]
