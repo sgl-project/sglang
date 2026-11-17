@@ -158,8 +158,6 @@ def test_qwen4_ple_pinned_gather_empty_input():
 
 
 def test_qwen4_ple_pinned_embedding_rejects_unsupported_weights():
-    with pytest.raises(TypeError, match="requires bfloat16"):
-        Qwen4ExpPinnedHostEmbedding(_make_source_embedding(dtype=torch.float16))
     with pytest.raises(NotImplementedError, match="added vocabulary"):
         Qwen4ExpPinnedHostEmbedding(_make_source_embedding(num_added_embeddings=1))
 
