@@ -77,6 +77,7 @@ from sglang.srt.eplb.expert_location import (
     set_global_expert_location_metadata,
 )
 from sglang.srt.eplb.expert_location_updater import ExpertLocationUpdater
+from sglang.srt.kernel_plugins import flashinfer_packages
 from sglang.srt.kernel_plugins.amd.binding import (
     install_monokernel_forward,
 )
@@ -755,6 +756,7 @@ class ModelRunner:
         self.init_token_oracle()
         self.sampler = create_sampler()
         self.load_model()
+        flashinfer_packages.activate(get_exec())
         if self.model_config.is_layer_types_hybrid_swa:
             check_layer_types_hybrid_swa_split(
                 model=self.model, model_config=self.model_config

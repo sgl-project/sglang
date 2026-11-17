@@ -1,0 +1,118 @@
+"""FlashInfer sealed kernel packages at SGLang functions marked ``kernel_site``."""
+
+import functools
+import inspect
+import logging
+import os
+import sys
+from pathlib import Path
+from typing import Any, Callable, Optional
+
+logger = logging.getLogger(__name__)
+
+_routes: dict[str, list[tuple[dict[str, Any], Callable[..., Any]]]] = {}
+
+
+def kernel_site(fn: Callable[..., Any]) -> Callable[..., Any]:
+    site = f"{fn.__module__}.{fn.__qualname__}"
+    params = inspect.signature(fn).parameters
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        if routes := _routes.get(site):
+            arguments = dict(zip(params, args)) | kwargs
+            for definition, run in routes:
+                if not (reason := _misfit(definition, arguments)):
+                    result = run(**{n: arguments[n] for n in definition["inputs"]})
+                    _count(site, "hit")
+                    return result
+            _count(site, f"fallback_{reason}")
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def weight_rewrite_error(*features: str) -> Optional[str]:
+    packages = sys.modules.get("flashinfer.trace_apply.packages")
+    if features and packages and (prepared := packages.setup_stats()):
+        return (
+            f"FlashInfer kernel packages for {', '.join(sorted(prepared))} keep state "
+            f"prepared from the weights, which {', '.join(features)} would rewrite."
+        )
+    return None
+
+
+def activate(exec_config: Any) -> None:
+    _routes.clear()
+    if not (selection := os.environ.get("FLASHINFER_KERNEL_PACKAGES", "").strip()):
+        return
+    try:
+        from flashinfer.trace_apply import packages, preloaded_entry
+    except ImportError:
+        logger.warning("FLASHINFER_KERNEL_PACKAGES needs FlashInfer >= 0.7.5; ignored.")
+        return
+
+    offload = exec_config.offload
+    features = {
+        "--enable-eplb": exec_config.moe.enable_eplb,
+        "--enable-memory-saver": exec_config.features.enable_memory_saver,
+        "--enable-weights-cpu-backup": exec_config.features.enable_weights_cpu_backup,
+        "--cpu-offload-gb": offload.cpu_offload_gb > 0,
+        "--offload-group-size": offload.offload_group_size > 0,
+    }
+    if error := weight_rewrite_error(*(name for name, on in features.items() if on)):
+        raise ValueError(error)
+
+    root = Path(os.environ.get(packages.ROOT_ENV) or packages.DEFAULT_PACKAGE_ROOT)
+    routed = set()
+    for digest in filter(None, map(str.strip, selection.split(","))):
+        try:
+            package = packages.verify_package(root, digest)
+            run = preloaded_entry(package.operation, str(package.solution.get("name")))
+            tags = (package.definition or {}).get("tags") or ()
+            site = next((t[7:] for t in tags if t.startswith("fi_api:")), "")
+        except Exception:
+            continue  # FlashInfer refused it at import, with a warning
+        if run is None or package.operation in routed:
+            continue
+        routed.add(package.operation)
+        _routes.setdefault(site, []).append((package.definition, run))
+        logger.info(
+            "FlashInfer kernel package %s: %s.", digest[:12], site or package.operation
+        )
+
+
+def _misfit(definition: dict[str, Any], arguments: dict[str, Any]) -> str:
+    inputs = definition["inputs"]
+    axes = {
+        name: axis.get("value")
+        for name, axis in (definition.get("axes") or {}).items()
+        if axis.get("type") == "const"
+    }
+    for name, spec in inputs.items():
+        if (value := arguments.get(name)) is None:
+            return f"missing_{name}"
+        if not (shape := spec.get("shape")):
+            continue
+        if getattr(value, "ndim", None) != len(shape):
+            return f"rank_{name}"
+        if spec.get("dtype") not in (None, str(value.dtype).removeprefix("torch.")):
+            return f"dtype_{name}"
+        for axis, size in zip(shape, value.shape):
+            bound = axes.setdefault(axis, int(axis) if str(axis).isdigit() else size)
+            if bound != size:
+                return f"axis_{axis}"
+    extra = [n for n, v in arguments.items() if n not in inputs and v is not None]
+    return f"extra_{extra[0]}" if extra else ""
+
+
+def _count(site: str, status: str) -> None:
+    from flashinfer.trace_apply.apply import bump_stat
+
+    bump_stat(site, status)
+    _log_first(site, status)
+
+
+@functools.cache
+def _log_first(site: str, status: str) -> None:
+    logger.info("%s: FlashInfer kernel package %s.", site, status)

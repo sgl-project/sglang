@@ -2441,5 +2441,10 @@ MPS and does not read them.
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Read by the NVIDIA megakernel plugin, not by SGLang. A comma-separated slot list that replaces the plugin's default slot policy; an empty value runs the stock paths. Unset keeps the plugin default.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Unset (plugin default)</td>
     </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>FLASHINFER_KERNEL_PACKAGES</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Read by FlashInfer 0.7.5+ and SGLang. Comma-separated digests of <a href="https://github.com/flashinfer-ai/flashinfer/blob/main/docs/trace_apply.rst#sealed-kernel-packages">sealed kernel packages</a> under <code>FLASHINFER_KERNEL_PACKAGE_ROOT</code> (default <code>/opt/flashinfer/kernel_packages</code>). A package whose Definition has an <code>fi_api</code> tag naming an SGLang function marked <code>kernel_site</code>, such as the Mamba2 chunk scan, also serves that function's matching calls. With a package that has a setup step, SGLang refuses <code>--enable-eplb</code>, <code>--enable-memory-saver</code>, <code>--enable-weights-cpu-backup</code>, <code>--cpu-offload-gb</code>, <code>--offload-group-size</code> and online weight updates. <code>FLASHINFER_KERNEL_PLUGINS_DISABLE=1</code> turns packages off.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Unset (off)</td>
+    </tr>
   </tbody>
 </table>
