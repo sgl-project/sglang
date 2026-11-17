@@ -2174,6 +2174,12 @@ class Scheduler(
         else:
             self.schedule_stream.wait_stream(self.forward_stream)
 
+    def wait_for_launched_forward(self) -> None:
+        """Order later schedule_stream work after every launched forward, not only
+        after its shared reads; an in_place pause can leave one reading the weights."""
+        if self.enable_overlap or get_parallel().pp_size > 1:
+            self.schedule_stream.wait_stream(self.forward_stream)
+
     def increment_scheduler_iterations(self) -> None:
         if get_observability().enable_metrics:
             self.metrics_collector.increment_scheduler_iterations()
@@ -5756,6 +5762,8 @@ class Scheduler(
             return_hidden_states=batch.return_hidden_states,
         )
         self.copy_stream.wait_stream(self.forward_stream)
+        if batch_result.side_stream_done is not None:
+            self.copy_stream.wait_event(batch_result.side_stream_done)
         with self.copy_stream_ctx:
             if not self.enable_async_d2h_copy:
                 copy_fn()
