@@ -1804,6 +1804,9 @@ class Envs:
         SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get,
         deprecated_name="SGLANG_Q35MF_EDGE_SPARSE_VERIFY_SAMPLING",
     )
+    # The compact verify support's full-distribution top-p bound in two split-row
+    # launches (the bound differs from the compiled one by fp32 summation order).
+    SGLANG_OPT_SPEC_FUSED_TOP_P_MASS = EnvBool(False)
     # A sampled verify result (predict, accept_index, num_correct_drafts) is one int32
     # buffer, broadcast to the TP group once.
     SGLANG_OPT_SPEC_PACKED_VERIFY_BCAST = EnvBoolWithAlias(
