@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import copy
 import functools
 import logging
 import math
@@ -259,7 +258,6 @@ class CompressorAscendBackendMixin:
             device=forward_batch.seq_lens.device,
             req_to_token_pool=self.req_to_token_pool,
             out_cache_loc_dsv4=forward_batch.out_cache_loc_dsv4,
-            seq_lens_max_override=self._prefill_graph_max_context_size(forward_batch),
         )
         for k, v in result.items():
             setattr(fm, k, v)
@@ -2236,7 +2234,7 @@ class DeepseekV4AscendAttnBackend(
             backend=self,
             seed=self.forward_metadata,
             num_tokens=int(forward_batch.positions.shape[0]),
-            max_context_len=self._prefill_graph_max_context_size(forward_batch),
+            max_context_len=forward_batch.max_seq_len_override,
         ).metadata
 
     def prepare_forward_metadata_for_breakable_cuda_graph_replay(
@@ -2255,16 +2253,7 @@ class DeepseekV4AscendAttnBackend(
         # live one.
         if forward_batch.can_run_tbo:
             raise RuntimeError("DSV4 prefill graph does not support TBO")
-        metadata_batch = forward_batch
-        if (
-            static_forward_batch is not None
-            and static_forward_batch.max_seq_len_override is not None
-        ):
-            metadata_batch = copy.copy(forward_batch)
-            metadata_batch.max_seq_len_override = (
-                static_forward_batch.max_seq_len_override
-            )
-        self.init_forward_metadata(metadata_batch)
+        self.init_forward_metadata(forward_batch)
         state.refresh(
             backend=self,
             live=self.forward_metadata,
