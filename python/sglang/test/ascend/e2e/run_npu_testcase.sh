@@ -109,21 +109,20 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-# Use the image's sglang; overlay the checkout's test layer so the test
-# utilities match the checked-out test cases (the image's test tools lag).
+# Use the image's sglang and test layer; overlay only the NPU test utilities
+# and the PD fixture that owns the sgl-router launch helpers. Keeping the rest
+# of the image's test layer intact keeps it consistent with the image runtime.
 sglang_pkg_path=/sgl-workspace/sglang/python
-test_util_path=${sglang_pkg_path}/sglang/test
-mv "${test_util_path}" "${test_util_path}_bak" 2>/dev/null || true
-cp -r "${sglang_source_path}/python/sglang/test" "${test_util_path}"
+ascend_test_util_path=${sglang_pkg_path}/sglang/test/ascend
+mv "${ascend_test_util_path}" "${ascend_test_util_path}_bak" 2>/dev/null || true
+cp -r "${sglang_source_path}/python/sglang/test/ascend" "${ascend_test_util_path}"
+cp -f "${sglang_source_path}/python/sglang/test/server_fixtures/disaggregation_fixture.py" \
+  "${sglang_pkg_path}/sglang/test/server_fixtures/disaggregation_fixture.py"
 
 # Keep the image-compatible test/ci snapshot, mirroring the single-node stage.
-rm -rf "${test_util_path}/ci"
-cp -r "${sglang_source_path}/scripts/ci/npu/compat/ci" "${test_util_path}/ci"
-
-# The image predates the hf_transformers_patches refactor, but the test layer
-# imports this stdlib-only module (apply_all_hf_patches) at import time.
-cp -f "${sglang_source_path}/python/sglang/srt/utils/hf_transformers_patches.py" \
-  "${sglang_pkg_path}/sglang/srt/utils/hf_transformers_patches.py"
+ci_test_util_path=${sglang_pkg_path}/sglang/test/ci
+if [ -d "${ci_test_util_path}" ]; then mv "${ci_test_util_path}" "${ci_test_util_path}_bak"; fi
+cp -r "${sglang_source_path}/scripts/ci/npu/compat/ci" "${ci_test_util_path}"
 
 # set environment of cann
 . /usr/local/Ascend/cann/set_env.sh
