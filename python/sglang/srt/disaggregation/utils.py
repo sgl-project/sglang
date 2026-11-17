@@ -33,6 +33,7 @@ from sglang.srt.disaggregation.base import KVPoll
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.distributed.parallel_state import GroupCoordinator
+from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
 from sglang.srt.environ import envs
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -66,21 +67,20 @@ def pp_sync_polls(
     pp_group: GroupCoordinator,
     pp_rank: int,
     pp_size: int,
-    sync_work_list: List,
+    send_window: PPSyncSendWindow,
 ) -> List[int]:
     """Synchronize poll states from PP0 through the PP pipeline.
 
     PP0 provides the data. Each later PP rank receives it from the previous
-    rank and asynchronously forwards it to the next rank.
+    rank and asynchronously forwards it to the next rank. The forwards stay
+    un-waited for the window's depth so this rank's rounds are not tied to the
+    next rank's.
     """
     if pp_size <= 1:
         assert polls is not None
         return polls
 
-    for p2p_work in sync_work_list:
-        p2p_work.work.wait()
-    sync_work_list.clear()
-
+    send_window.begin_round()
     data = polls
     if pp_rank > 0:
         data = pp_group.recv_object(
@@ -88,7 +88,7 @@ def pp_sync_polls(
             tag=P2PTag.DISAGG_BOOTSTRAP_PP_SYNC,
         )
     if pp_rank + 1 < pp_size:
-        sync_work_list.extend(
+        send_window.add(
             pp_group.send_object(
                 data,
                 dst=pp_rank + 1,
@@ -124,7 +124,7 @@ def poll_and_all_reduce_prefill_pp(
     pp_group: GroupCoordinator,
     pp_rank: int,
     pp_size: int,
-    pp_poll_sync_work_list: List[torch.distributed.Work],
+    pp_poll_send_window: PPSyncSendWindow,
 ) -> List[int]:
     polls: List[int] = []
     if pp_rank == 0:
@@ -132,7 +132,7 @@ def poll_and_all_reduce_prefill_pp(
         polls = _all_reduce_polls(polls, attn_tp_cpu_group)
         polls = _all_reduce_polls(polls, attn_cp_cpu_group)
     # Propagate PP0's data to other ranks
-    polls = pp_sync_polls(polls, pp_group, pp_rank, pp_size, pp_poll_sync_work_list)
+    polls = pp_sync_polls(polls, pp_group, pp_rank, pp_size, pp_poll_send_window)
     return polls
 
 
@@ -637,6 +637,7 @@ class CustomizedInfoError(ValueError):
 
 class MetadataBuffers:
     CUSTOMIZED_INFO_SLOTS = slice(6, 8)
+    DEFAULT_TOP_LOGPROBS_NUM = 128
 
     def __init__(
         self,
@@ -644,7 +645,7 @@ class MetadataBuffers:
         hidden_size: int,
         hidden_states_dtype: torch.dtype,
         max_sampling_mask_tokens: int,
-        max_top_logprobs_num: int = 128,
+        max_top_logprobs_num: int = DEFAULT_TOP_LOGPROBS_NUM,
         custom_mem_pool: torch.cuda.MemPool = None,
         output_dsa_topk_indices_dim: int = 0,
         *,
@@ -683,8 +684,6 @@ class MetadataBuffers:
             if self.custom_mem_pool
             else nullcontext()
         ):
-            # TODO: abort top_logprobs_num > 128 in PD
-
             # We transfer the metadata of first output token to decode
             # The minimal size for RDMA is 64Bytes, so we pad it to > 64Bytes
             self.output_ids = torch.zeros((size, 16), dtype=torch.int32, device=device)
@@ -1137,13 +1136,19 @@ def _get_cp_rank_page_bounds(
 
 def filter_kv_indices_for_shard_rank(
     *,
-    kv_indices: np.ndarray,
+    kv_indices: np.ndarray | torch.Tensor,
     index_slice: slice,
     shard_rank: int,
     shard_size: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Logical page l lives on rank l % N as local page l // N; returns the owned
-    local ids and their send positions, which replace the contiguous index_slice."""
+    local ids and their send positions, which replace the contiguous index_slice.
+
+    Host tensor inputs must be ready before this synchronous filter runs.
+    """
+    # A one-element torch bool tensor is interpreted as an integer index by
+    # NumPy. Keep the page ids and their positional mask in the same array type.
+    kv_indices = np.asarray(kv_indices)
     owned = kv_indices % shard_size == shard_rank
     positions = np.arange(index_slice.start, index_slice.stop, dtype=np.int64)
     return kv_indices[owned] // shard_size, positions[owned]
@@ -1838,6 +1843,7 @@ def setup_state_kv_args(
     total_kv_layers: Optional[int] = None,
     window_tails: Optional[Dict[str, int]] = None,
     draft_kv_ring: Optional[DFlashDraftKVRing] = None,
+    empty_draft_kv_ring: bool = False,
 ) -> None:
     """Register the storage's state entries in its wire order, and the flags
     peers read from its token KV layout. ``window_tails`` gives the tail each
@@ -1905,6 +1911,10 @@ def setup_state_kv_args(
         append_state_component(
             kv_args, StateType.REQUEST_ROW, *draft_kv_ring.floor_buf_infos()
         )
+    elif empty_draft_kv_ring:
+        # A PP stage without the draft keeps empty slots and sends nothing for them.
+        append_state_component(kv_args, StateType.DRAFT_RING, [], [], [])
+        append_state_component(kv_args, StateType.REQUEST_ROW, [], [], [])
     kv_args.state_window_tails = [
         (window_tails or {}).get(sub_pool) if sub_pool is not None else None
         for sub_pool in kv_args.state_sub_pools

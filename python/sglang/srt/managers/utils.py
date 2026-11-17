@@ -103,6 +103,8 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
+    # Side-stream work still writing this batch's KV; copy_done is recorded after it.
+    side_stream_done: Optional[torch.cuda.Event] = None
     # The unified pool's record of this forward; processing the result retires
     # it, so page moves stop treating its pages as in flight.
     unified_forward_done: Optional[torch.cuda.Event] = None
@@ -272,23 +274,6 @@ class GenerationBatchResult:
             self.auxiliary_host_output = device_output.copy_to_host(_async_d2h)
             self.logits_output.auxiliary_device_output = None
             self.forward_auxiliary_output = None
-
-    @classmethod
-    def from_pp_proxy(
-        cls, logits_output, next_pp_outputs: PPProxyTensors, can_run_cuda_graph
-    ):
-        # TODO(lsyin): refactor PP and avoid using dict
-        proxy_dict = next_pp_outputs.tensors
-        return cls(
-            logits_output=logits_output,
-            pp_hidden_states_proxy_tensors=None,
-            next_token_ids=next_pp_outputs["next_token_ids"],
-            extend_input_len_per_req=proxy_dict.get("extend_input_len_per_req", None),
-            extend_logprob_start_len_per_req=proxy_dict.get(
-                "extend_logprob_start_len_per_req", None
-            ),
-            can_run_cuda_graph=can_run_cuda_graph,
-        )
 
 
 def validate_input_length(
