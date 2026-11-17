@@ -195,6 +195,8 @@ class KVCRStore(HiCacheStorage):
         )
         if storage_config.should_split_heads:
             raise ValueError("KVCR does not support heterogeneous TP head splitting")
+        if storage_config.dcp_size != 1:
+            raise ValueError("KVCR HiCacheStorage does not support DCP yet")
         if storage_config.pp_size != 1:
             raise ValueError("KVCR HiCacheStorage currently requires PP=1")
         self.register_mem_pool_host(mem_pool_host)
@@ -503,7 +505,9 @@ class KVCRStore(HiCacheStorage):
                 )
                 os._exit(1)
             wait = (
-                _POLL_INTERVAL_SECONDS if busy else min(wait * 2, _IDLE_POLL_MAX_SECONDS)
+                _POLL_INTERVAL_SECONDS
+                if busy
+                else min(wait * 2, _IDLE_POLL_MAX_SECONDS)
             )
             self._stop_poll.wait(wait)
 

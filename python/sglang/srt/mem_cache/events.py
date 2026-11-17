@@ -21,8 +21,8 @@ it; the recorder owns the queue and needs nothing back from its owner.
 from __future__ import annotations
 
 import logging
-from collections import OrderedDict
 from array import array
+from collections import OrderedDict
 from typing import TYPE_CHECKING, Any, Iterable, Optional
 
 import msgspec

@@ -64,7 +64,9 @@ def storage_key_to_event_hashes(
 
 def storage_operation_extra_info(operation: Any, **fields: Any) -> dict[str, Any]:
     """Carry the request binding through queries, batches, and sidecar reads."""
-    fields["kv_hints"] = operation.kv_hints
+    hints = getattr(operation, "kv_hints", None)
+    if hints is not None:
+        fields["kv_hints"] = hints
     mapping = getattr(operation, "storage_key_to_event_hash", None)
     if mapping is not None:
         fields["storage_key_to_event_hash"] = mapping

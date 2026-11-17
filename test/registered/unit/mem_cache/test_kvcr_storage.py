@@ -358,10 +358,27 @@ class TestKVCRStorage(CustomTestCase):
         self.stub.start()
         self.addCleanup(self.stub.stop)
 
+    def test_rank_local_backup_preserves_upstream_writer_selection(self):
+        controller = object.__new__(HiCacheController)
+        controller.storage_config = SimpleNamespace(is_storage_writer=False)
+        controller.storage_backend = SimpleNamespace(requires_rank_local_backup=False)
+        self.assertTrue(controller.backup_skip)
+        controller.storage_backend.requires_rank_local_backup = True
+        self.assertFalse(controller.backup_skip)
+        controller.storage_backend.requires_rank_local_backup = False
+        controller.storage_config.is_storage_writer = True
+        self.assertFalse(controller.backup_skip)
+
+    def test_dcp_storage_fails_closed(self):
+        config = copy.copy(self.config)
+        config.dcp_size = 2
+        with self.assertRaisesRegex(ValueError, "does not support DCP"):
+            KVCRStore(config, self.pool)
+
     def test_replica_dp_storage_config_disambiguates_hint_sources(self):
         """Independent DP replicas must not advertise the same source address."""
         controller = object.__new__(HiCacheController)
-        controller.mem_pool_device = object()
+        controller.mem_pool_device = SimpleNamespace(dtype=torch.bfloat16)
         controller.mem_pool_host = self.pool
         controller.storage_host_pool = self.pool
         controller.mem_pool_host.storage_format_tag = None
@@ -371,7 +388,9 @@ class TestKVCRStorage(CustomTestCase):
         sources = []
         with get_context().override_server_args(tp_size=2, dp_size=2):
             for rank in (0, 1):
-                with get_parallel().override(tp_rank=0, pp_rank=0, dp_rank=rank):
+                with get_parallel().override(
+                    tp_rank=0, pp_rank=0, dp_rank=rank, attn_dcp_rank=0
+                ):
                     config = controller._generate_storage_config(
                         "glm-test", {"control_advertise_host": "source.example"}
                     )
@@ -389,7 +408,7 @@ class TestKVCRStorage(CustomTestCase):
         from sglang.srt.mem_cache.storage_events import StorageEventReducer
 
         controller = object.__new__(HiCacheController)
-        controller.mem_pool_device = object()
+        controller.mem_pool_device = SimpleNamespace(dtype=torch.bfloat16)
         controller.mem_pool_host = self.pool
         controller.storage_host_pool = self.pool
         controller.mem_pool_host.storage_format_tag = None
@@ -406,6 +425,7 @@ class TestKVCRStorage(CustomTestCase):
                     dp_rank=0,
                     attn_tp_rank=attn_tp_rank,
                     attn_cp_rank=cp_rank,
+                    attn_dcp_rank=0,
                 ):
                     config = controller._generate_storage_config(
                         "glm-test", {"control_advertise_host": "source.example"}
@@ -835,6 +855,7 @@ class TestKVCRStorage(CustomTestCase):
         c.pp_prefetch_command_group = None
         c.prefetch_queue, c.prefetch_sync_queue = Queue(), Queue()
         c.mem_pool_host = SimpleNamespace(entry_map={})
+        c.storage_stop_event = Event()
         hint = {
             "protocol_version": "0.1",
             "actions": [
@@ -965,10 +986,14 @@ class TestKVCRStorage(CustomTestCase):
         controller.prefetch_buffer = Queue()
         controller.pp_prefetch_command_group = None
         controller.prefetch_hits_sync_groups = []
+        controller._host_pool_schemas = []
         controller._all_reduce = lambda *_args, **_kwargs: None
         controller.mem_pool_host = SimpleNamespace(
-            entry_map={}, layout_lease=lambda: nullcontext()
+            entry_map=dict.fromkeys(source_pools),
+            anchor_entry=SimpleNamespace(host_pool=destination_pools[PoolName.KV]),
+            layout_lease=lambda: nullcontext(),
         )
+        controller.storage_stop_event = Event()
         hint = {
             "protocol_version": "0.1",
             "actions": [
@@ -1215,7 +1240,7 @@ class TestKVCRStorage(CustomTestCase):
         fetches_before = len(transport.fetches)
 
         def disagree_on_confirmation_flags(tensor, *_args, **_kwargs):
-            if tensor.numel() == len(PoolName) + 5:
+            if tensor.numel() == 5 + len(source_pools) + 4:
                 tensor[-2:] = 0
 
         controller._all_reduce = disagree_on_confirmation_flags
@@ -1752,6 +1777,8 @@ class TestKVCRStorage(CustomTestCase):
         transport = backend._runner = _CopyTransport(backend._layouts)
         controller = HiCacheController.__new__(HiCacheController)
         controller.storage_backend = backend
+        controller.storage_config = config
+        controller.storage_stop_event = Event()
         controller.page_size = 2
         controller.page_get_func = controller._page_get_zero_copy
         controller.prefetch_sync_queue = Queue()
@@ -1961,7 +1988,6 @@ class TestKVCRStorage(CustomTestCase):
         controller.mem_pool_host = SimpleNamespace(
             kv_buffer=pools[PoolName.KV].kv_buffer, layout_lease=ExitStack
         )
-        controller.backup_skip = False
         controller.page_set_func = controller._page_set_zero_copy
         controller.storage_backend.supports_combined_page_writes = combined
         operation = StorageOperation(

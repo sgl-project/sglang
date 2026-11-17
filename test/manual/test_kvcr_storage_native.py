@@ -13,6 +13,7 @@ import unittest
 from contextlib import ExitStack
 from copy import deepcopy
 from queue import Queue
+from threading import Event
 from types import SimpleNamespace
 
 import torch
@@ -147,7 +148,8 @@ class TestKVCRNativeStorage(CustomTestCase):
             indices = torch.arange(pages * page_size)
             backup = HybridCacheController.__new__(HybridCacheController)
             backup.storage_backend, backup.page_size = source, page_size
-            backup.backup_skip = False
+            backup.storage_config = source.config
+            backup.storage_stop_event = Event()
             backup.mem_pool_host = SimpleNamespace(
                 kv_buffer=pools[0][PoolName.KV].kv_buffer, layout_lease=ExitStack
             )
@@ -172,6 +174,7 @@ class TestKVCRNativeStorage(CustomTestCase):
             )
             c = HiCacheController.__new__(HiCacheController)
             c.storage_backend, c.page_size = target, page_size
+            c.storage_stop_event = Event()
             c.page_get_func = c._page_get_zero_copy
             c.prefetch_sync_queue = Queue()
             op = PrefetchOperation("native-large-read", list(range(pages * page_size)))

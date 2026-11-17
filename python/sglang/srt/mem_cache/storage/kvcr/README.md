@@ -39,6 +39,7 @@ recommendation. Account separately for GPU cache, HiCache host staging, and
 KVCR DRAM. The default rank-local mode allocates KVCR storage on each rank.
 Control ports must accommodate the rank offsets and be reachable by peers.
 The control endpoint's TCP scheme does not select the NIXL payload transport.
+The KVCR backend currently requires PP=1 and DCP=1.
 
 Combined reads/writes are opt-in and apply only to primary KV plus
 KV-derived `ALL_PAGES` sidecars. Independent and trailing/checkpoint pools

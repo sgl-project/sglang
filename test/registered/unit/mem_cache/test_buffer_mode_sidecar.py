@@ -4,7 +4,7 @@ import unittest
 from array import array
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import msgspec
@@ -58,6 +58,7 @@ def _hit_query_controller(*, entry_map=(PoolName.KV,), **fields):
     controller.prefetch_hits_sync_groups = []
     controller.mem_pool_host = SimpleNamespace(entry_map=dict.fromkeys(entry_map))
     controller._host_pool_schemas = []
+    controller.storage_backend = None
     for name, value in fields.items():
         setattr(controller, name, value)
     return controller
@@ -680,7 +681,13 @@ class TestResumeBoundarySync(CustomTestCase):
         for local_boundaries, peer_boundaries in (([1, 4], [1, 3]), ([1, 3], [1, 4])):
             with self.subTest(local=local_boundaries):
                 operation = PrefetchOperation(
-                    CacheRequestHandle("holes", 0), list(range(8))
+                    CacheRequestHandle("holes", 0),
+                    list(range(8)),
+                    pool_transfers=[
+                        PoolTransfer(
+                            PoolName.MAMBA, hit_policy=PoolHitPolicy.TRAILING_PAGES
+                        )
+                    ],
                 )
                 operation.all_hash_values = [f"page-{i}" for i in range(4)]
                 operation.query_pool_hit_pages = {PoolName.KV: 4}
@@ -689,13 +696,11 @@ class TestResumeBoundarySync(CustomTestCase):
 
                 def reduce_with_peer(values, reduce_op, groups):
                     calls.append(values.numel())
-                    if values.numel() == 4:
-                        peer = torch.tensor(
-                            [int(i in peer_boundaries) for i in range(1, 5)]
-                        )
-                        values.copy_(torch.minimum(values, peer))
-                    else:
-                        values[0] = min(values[0], max(peer_boundaries) * 2)
+                    peer = values.clone()
+                    peer[:5] = torch.tensor(
+                        [1] + [int(i in peer_boundaries) for i in range(1, 5)]
+                    )
+                    values.copy_(torch.minimum(values, peer))
 
                 controller = _controller_for_sync(
                     SimpleNamespace(requires_lookup_confirmation=False),
@@ -708,11 +713,17 @@ class TestResumeBoundarySync(CustomTestCase):
                 self.assertEqual(
                     operation.pool_storage_result.restorable_prefix_pages, [1]
                 )
-                self.assertEqual(calls, [len(PoolName) + 5, 4])
+                self.assertEqual(calls, [5 + len(_SCHEMA) + 4])
 
     def test_mixed_legacy_reply_never_enters_a_rank_only_collective(self):
         """An explicit/absent-set mix must reject the hit, not hang one rank."""
-        operation = PrefetchOperation(CacheRequestHandle("mixed", 0), list(range(8)))
+        operation = PrefetchOperation(
+            CacheRequestHandle("mixed", 0),
+            list(range(8)),
+            pool_transfers=[
+                PoolTransfer(PoolName.MAMBA, hit_policy=PoolHitPolicy.TRAILING_PAGES)
+            ],
+        )
         operation.all_hash_values = [f"page-{i}" for i in range(4)]
         operation.query_pool_hit_pages = {PoolName.KV: 4}
         operation.pool_storage_result.restorable_prefix_pages = [1, 4]
@@ -729,7 +740,7 @@ class TestResumeBoundarySync(CustomTestCase):
             HybridCacheController._sync_prefetch_hit_query(controller, operation, 8), 0
         )
         self.assertEqual(operation.pool_storage_result.restorable_prefix_pages, [])
-        self.assertEqual(calls, [len(PoolName) + 5])
+        self.assertEqual(calls, [5 + len(_SCHEMA) + 4])
 
 
 if __name__ == "__main__":

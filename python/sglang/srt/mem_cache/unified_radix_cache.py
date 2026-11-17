@@ -4258,8 +4258,11 @@ class UnifiedRadixCache(BasePrefixCache):
         exchange = self._shm_count_exchange()
         if exchange is not None:
             values = [
-                write_acks, load_acks, *storage_queue_sizes,
-                -inventory_count, *fold_u64(digest),
+                write_acks,
+                load_acks,
+                *storage_queue_sizes,
+                -inventory_count,
+                *fold_u64(digest),
             ]
             # Storage adds a count per extra host pool; a row wider than the table
             # takes the gloo reduce below.

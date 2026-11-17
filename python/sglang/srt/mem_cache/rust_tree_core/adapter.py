@@ -30,7 +30,6 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.events import (
     KVCacheEventRecorder,
     KvEventLoraNames,
-    enable_mm_routing_labels,
     mm_routing_spans,
 )
 from sglang.srt.mem_cache.evict_policy import StateCostStrategy

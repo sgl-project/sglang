@@ -43,6 +43,7 @@ def _holder(*, window: int) -> _Holder:
     holder.work_rounds = deque([[]])
     return holder
 
+
 class TestPPSyncDrain(CustomTestCase):
     def test_inventory_follower_drains_without_retaining_publish_queue(self):
         cache = object.__new__(UnifiedRadixCache)
@@ -61,6 +62,7 @@ class TestPPSyncDrain(CustomTestCase):
 
         backend.take_kv_events.assert_called_once()
         self.assertIsNone(cache._storage_event_backend)
+
 
 def _round(holder: _Holder, *, sends: int) -> list[_FakeWork]:
     # one scheduler round: bound the outstanding sends, then issue this round's

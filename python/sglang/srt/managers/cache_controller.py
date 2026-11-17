@@ -769,14 +769,6 @@ class HiCacheController:
             self.storage_backend.register_mem_pool_host(self.storage_host_pool)
             if not self._registers_host_pools_after_super_attach:
                 self.storage_backend.on_host_pools_registered()
-            # Rank-local stores need every MLA writer. A backend that explicitly
-            # provides shared replicated storage can use the TP0-only path.
-            self.backup_skip = (
-                self.storage_config.is_mla_model
-                and self.storage_config.tp_rank != 0
-                and self.storage_backend.requires_rank_local_backup is not True
-            )
-
             self.enable_storage = True
             # todo: threshold policy for prefetching
             self.prefetch_threshold = max(prefetch_threshold, self.page_size)
@@ -911,6 +903,15 @@ class HiCacheController:
 
     @property
     def backup_skip(self) -> bool:
+        if (
+            getattr(
+                getattr(self, "storage_backend", None),
+                "requires_rank_local_backup",
+                False,
+            )
+            is True
+        ):
+            return False
         return not self.storage_config.is_storage_writer
 
     def _generate_storage_config(
@@ -928,13 +929,18 @@ class HiCacheController:
             dp_rank = parallel.attn_dp_rank
         else:
             # KVCR offsets TP and CP separately, even when attention DP is off.
-            if self.storage_backend_type == "kvcr" and parallel.attn_cp_size > 1:
+            is_kvcr = getattr(self, "storage_backend_type", None) == "kvcr"
+            if is_kvcr and parallel.attn_cp_size > 1:
                 tp_rank = parallel.attn_tp_rank
                 tp_size = parallel.attn_tp_size
             else:
                 tp_rank = parallel.tp_rank
                 tp_size = parallel.tp_size
-            dp_rank = parallel.dp_rank if parallel.dp_rank is not None else 0
+            dp_rank = (
+                (parallel.dp_rank if parallel.dp_rank is not None else 0)
+                if is_kvcr
+                else 0
+            )
 
         # DeepSeekV4TokenToKVPool has compressed MLA-style rank-replicated cache
         # data. storage only needs rank 0 to write it back.
@@ -1423,7 +1429,9 @@ class HiCacheController:
 
     def _page_transfer(self, operation: PrefetchOperation) -> int:
         # Transfer batch by batch
-        batch_pages = self.storage_backend.prefetch_batch_pages
+        batch_pages = getattr(self.storage_backend, "prefetch_batch_pages", None)
+        if type(batch_pages) is not int or batch_pages <= 0:
+            batch_pages = STORAGE_BATCH_SIZE
         prefix_keys = operation.prefix_keys
         kv_derived_transfers = [
             transfer
@@ -1671,7 +1679,7 @@ class HiCacheController:
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         if (
-            operation.kv_hints is not None
+            getattr(operation, "kv_hints", None) is not None
             and getattr(operation, "storage_key_to_event_hash", None) is None
         ):
             # Probe-only callers may not have the complete matched prefix.

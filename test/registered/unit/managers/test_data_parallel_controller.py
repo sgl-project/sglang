@@ -318,6 +318,11 @@ class TestLocalKvEventSources(CustomTestCase):
             max_total_num_tokens=64,
             max_req_input_len=32,
             startup_time={},
+            get_init_info=lambda: {
+                "max_total_num_tokens": 64,
+                "max_req_input_len": 32,
+                "startup_time": {},
+            },
             local_kv_hint_sources=[{"dp_rank": 0}, {"dp_rank": 1}],
             local_kv_event_sources=[self._source(1), self._source(0)],
             event_loop=MagicMock(),

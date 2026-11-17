@@ -48,6 +48,11 @@ from sglang.srt.mem_cache.pool_host.mha import MHATokenToKVPoolHost
 from sglang.srt.mem_cache.pool_host.page_interleave import PageInterleaveHostPool
 from sglang.srt.mem_cache.pool_host.unified import UnifiedPageEnvelopeHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage_key_binding import (
+    storage_key_to_event_hashes,
+    storage_operation_extra_info,
+)
+from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.srt.observability.trace import (
     TraceNullContext,
     TraceReqContext,
@@ -55,17 +60,11 @@ from sglang.srt.observability.trace import (
     get_thread_caller_info,
     trace_set_thread_info,
 )
+from sglang.srt.utils import broadcast_pyobj
 
 if TYPE_CHECKING:
-    from sglang.srt.mem_cache.kv.storage import KVStorage
     from sglang.srt.mem_cache.allocator import BaseTokenToKVPoolAllocator
-
-from sglang.srt.mem_cache.storage_key_binding import (
-    storage_key_to_event_hashes,
-    storage_operation_extra_info,
-)
-from sglang.srt.mem_cache.utils import get_storage_hash_str
-from sglang.srt.utils import broadcast_pyobj
+    from sglang.srt.mem_cache.kv.storage import KVStorage
 
 logger = logging.getLogger(__name__)
 
@@ -1715,7 +1714,7 @@ class HybridCacheController(BaseHiCacheController):
 
     def _storage_hit_query(self, operation) -> tuple[list[str], int]:
         if (
-            operation.kv_hints is not None
+            getattr(operation, "kv_hints", None) is not None
             and getattr(operation, "storage_key_to_event_hash", None) is None
         ):
             operation.storage_key_to_event_hash = storage_key_to_event_hashes(
@@ -1884,13 +1883,21 @@ class HybridCacheController(BaseHiCacheController):
             if result == 0:
                 _finish_op_trace(operation)
             return result
-        if not reduced[-4] and not reduced[-3] or (needs_confirmation and not reduced[-4]):
+        if (
+            not reduced[-4]
+            and not reduced[-3]
+            or (needs_confirmation and not reduced[-4])
+        ):
             operation.pool_storage_result.restorable_prefix_pages = []
             if needs_confirmation:
                 self._release_lookup_claims(operation)
             _finish_op_trace(operation)
             return 0
-        common = [page for page, present in enumerate(reduced[: len(hits)]) if page and present]
+        common = [
+            page
+            for page, present in enumerate(reduced[: len(hits)])
+            if page and present
+        ]
         operation.pool_storage_result.restorable_prefix_pages = common
         if needs_confirmation:
             extra_info = HiCacheStorageExtraInfo(
@@ -2175,7 +2182,7 @@ class HybridCacheController(BaseHiCacheController):
             trace_extra = _storage_trace_extra(operation, include_request_id=False)
             extra_info = HiCacheStorageExtraInfo(
                 prefix_keys=prefix_keys,
-                extra_info=trace_extra or None,
+                extra_info=storage_operation_extra_info(operation, **trace_extra),
             )
             success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
             if not success:
@@ -2318,7 +2325,8 @@ class HybridCacheController(BaseHiCacheController):
                 extra_info=HiCacheStorageExtraInfo(
                     prefix_keys=prefix_keys,
                     extra_info=storage_operation_extra_info(
-                        operation, **_storage_trace_extra(operation, include_request_id=False)
+                        operation,
+                        **_storage_trace_extra(operation, include_request_id=False),
                     ),
                 ),
             )
