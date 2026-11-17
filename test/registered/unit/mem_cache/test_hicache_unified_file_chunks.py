@@ -1,6 +1,8 @@
 """Unified file objects retain their byte identity across TP/PP reshaping."""
 
 import tempfile
+import threading
+import time
 import unittest
 from dataclasses import replace
 from pathlib import Path
@@ -879,6 +881,231 @@ class TestUnifiedFileDraftSidecar(unittest.TestCase):
                         controller._page_transfer_kv_batch(*args, transfers),
                         hit_pages,
                     )
+
+
+# A read that should meet the other one waits this long before it gives up.
+_MEET_S = 10.0
+
+
+class TestUnifiedSidecarReadOverlapsTheKVRead(unittest.TestCase):
+    """Under unified keys a pool beside the KV pool is read while the KV pool
+    is, so a batch costs the slower of the two reads and not their sum."""
+
+    KEYS = ["page0", "page1", "page2"]
+
+    def _controller(self, kv_read, sidecar_read, config="unified"):
+        controller = object.__new__(HiCacheController)
+        controller.page_size = 4
+        controller.storage_backend = SimpleNamespace(batch_get_v2=sidecar_read)
+        controller.page_get_func = kv_read
+        if config != "no config":
+            controller.storage_config = SimpleNamespace(
+                unified_suffixes=("chunk",) if config == "unified" else None
+            )
+        self.addCleanup(self._end_helper, controller)
+        return controller
+
+    @staticmethod
+    def _end_helper(controller):
+        executor = getattr(controller, "_prefetch_sidecar_executor", None)
+        if executor is not None:
+            executor.shutdown(wait=True)
+
+    def _batch(self, controller, *names, extra_info=None):
+        return controller._page_transfer_kv_batch(
+            SimpleNamespace(request_id="r", is_terminated=lambda: False),
+            self.KEYS,
+            torch.arange(len(self.KEYS) * 4),
+            extra_info or HiCacheStorageExtraInfo(),
+            [PoolTransfer(name=name, indices_from_pool=PoolName.KV) for name in names],
+        )
+
+    def test_both_reads_are_in_flight_together(self):
+        started = {"kv": threading.Event(), "draft": threading.Event()}
+        met, threads, sidecar_calls = {}, {"kv": [], "draft": []}, []
+
+        def read(mine, other):
+            threads[mine].append(threading.current_thread())
+            started[mine].set()
+            # Reads issued one after the other never meet: the first one
+            # waits out its timeout and the test fails.
+            met.setdefault(mine, started[other].wait(_MEET_S))
+
+        def kv_read(operation, hashes, host_indices, extra_info):
+            read("kv", "draft")
+            return 3
+
+        def sidecar_read(transfers, extra_info=None):
+            sidecar_calls.append((transfers, extra_info))
+            read("draft", "kv")
+            return {transfer.name: [True, True, False] for transfer in transfers}
+
+        controller = self._controller(kv_read, sidecar_read)
+        extra_info = HiCacheStorageExtraInfo(prefix_keys=["p"])
+        self.assertEqual(
+            self._batch(controller, PoolName.DRAFT, extra_info=extra_info), 2
+        )
+        self.assertEqual(met, {"kv": True, "draft": True})
+        # The sidecar read is the one it always was, on a thread of its own.
+        ((transfers, sidecar_extra_info),) = sidecar_calls
+        self.assertIs(sidecar_extra_info, extra_info)
+        self.assertEqual([transfer.name for transfer in transfers], [PoolName.DRAFT])
+        self.assertEqual(transfers[0].keys, self.KEYS)
+        self.assertEqual(
+            transfers[0].host_indices.tolist(), list(range(len(self.KEYS) * 4))
+        )
+        self.assertIs(threads["kv"][0], threading.current_thread())
+        self.assertIsNot(threads["draft"][0], threading.current_thread())
+        self.assertTrue(threads["draft"][0].name.startswith("hicache-prefetch-sidecar"))
+        # One helper serves every batch.
+        self.assertEqual(self._batch(controller, PoolName.DRAFT), 2)
+        self.assertIs(threads["draft"][1], threads["draft"][0])
+
+    def test_the_fewest_restored_pages_are_published(self):
+        cases = (
+            (3, {"draft": [True] * 3}, 3),
+            (3, {"draft": [True, False, True]}, 1),
+            (3, {"draft": [False] * 3}, 0),
+            (1, {"draft": [True] * 3}, 1),
+            (0, {"draft": [True] * 3}, 0),
+            # A pool the backend did not report was not read.
+            (3, {}, 0),
+            (3, {"indexer": [True] * 3}, 0),
+        )
+        for kv_hits, reported, hit_pages in cases:
+            with self.subTest(kv_hits=kv_hits, reported=reported):
+                controller = self._controller(
+                    lambda *args, kv_hits=kv_hits: kv_hits,
+                    lambda transfers, extra_info=None, reported=reported: reported,
+                )
+                self.assertEqual(self._batch(controller, PoolName.DRAFT), hit_pages)
+
+    def test_a_failed_read_fails_the_batch_once_both_reads_ended(self):
+        cases = (
+            # (reads that raise, the read that ends last, whose error leaves)
+            (("kv",), "draft", "kv"),
+            (("draft",), "kv", "draft"),
+            (("kv", "draft"), "draft", "kv"),
+            (("kv", "draft"), "kv", "kv"),
+        )
+        for failing, last, raised in cases:
+            with self.subTest(failing=failing, last=last):
+                self._check_failed_batch(failing, last, raised)
+
+    def _check_failed_batch(self, failing, last, raised):
+        first_ended = threading.Event()
+        ended, met = [], []
+
+        def read(mine):
+            if mine == last:
+                # Still reading when the other read has ended.
+                met.append(first_ended.wait(_MEET_S))
+                time.sleep(0.05)
+                ended.append(mine)
+            else:
+                ended.append(mine)
+                first_ended.set()
+            if mine in failing:
+                raise RuntimeError(f"{mine} read failed")
+
+        def kv_read(*args):
+            read("kv")
+            return 3
+
+        def sidecar_read(transfers, extra_info=None):
+            read("draft")
+            return {"draft": [True] * 3}
+
+        controller = self._controller(kv_read, sidecar_read)
+        with self.assertRaisesRegex(RuntimeError, f"^{raised} read failed$"):
+            self._batch(controller, PoolName.DRAFT)
+        # Checked before anything else could let the last read end.
+        self.assertEqual(len(ended), 2, ended)
+        self.assertEqual(ended[-1], last)
+        self.assertEqual(met, [True])
+        # The helper outlives a failed batch.
+        controller.page_get_func = lambda *args: 3
+        controller.storage_backend.batch_get_v2 = lambda transfers, extra_info=None: {
+            "draft": [True] * 3
+        }
+        self.assertEqual(self._batch(controller, PoolName.DRAFT), 3)
+
+    def test_rank_suffix_keys_read_the_sidecar_after_the_kv_read(self):
+        """Without the unified scheme the reads are issued as they were: by
+        the calling thread, the sidecar read once the KV read has returned."""
+        for config in ("rank-suffix", "no config"):
+            with self.subTest(config):
+                sidecar_started = threading.Event()
+                events = []
+
+                def kv_read(*args):
+                    events.append(("kv start", threading.current_thread()))
+                    # A sidecar read issued beside this one would start now.
+                    self.assertFalse(sidecar_started.wait(0.2))
+                    events.append(("kv end", threading.current_thread()))
+                    return 3
+
+                def sidecar_read(transfers, extra_info=None):
+                    sidecar_started.set()
+                    events.append(("sidecar", threading.current_thread()))
+                    return {"indexer": [True, True, False]}
+
+                controller = self._controller(kv_read, sidecar_read, config)
+                self.assertEqual(self._batch(controller, PoolName.INDEXER), 2)
+                self.assertEqual(
+                    events,
+                    [
+                        (name, threading.current_thread())
+                        for name in ("kv start", "kv end", "sidecar")
+                    ],
+                )
+                self.assertFalse(hasattr(controller, "_prefetch_sidecar_executor"))
+                # A failed KV read still leaves before any sidecar read.
+                del events[:]
+                controller.page_get_func = lambda *args: 1 // 0
+                with self.assertRaises(ZeroDivisionError):
+                    self._batch(controller, PoolName.INDEXER)
+                self.assertEqual(events, [])
+
+    def test_a_batch_without_a_sidecar_pool_needs_no_helper(self):
+        def sidecar_read(transfers, extra_info=None):
+            raise AssertionError("no pool beside the KV pool was named")
+
+        controller = self._controller(lambda *args: 2, sidecar_read)
+        self.assertEqual(self._batch(controller), 2)
+        self.assertFalse(hasattr(controller, "_prefetch_sidecar_executor"))
+
+    def test_the_storage_stop_ends_the_helper(self):
+        helpers = []
+
+        def sidecar_read(transfers, extra_info=None):
+            helpers.append(threading.current_thread())
+            return {"draft": [True] * 3}
+
+        controller = self._controller(lambda *args: 3, sidecar_read)
+        # What a stop needs of a controller whose workers have exited.
+        controller.storage_stop_event = threading.Event()
+        controller._storage_worker_failures = {}
+        for worker in (
+            "prefetch_thread",
+            "prefetch_io_aux_thread",
+            "prefetch_sync_thread",
+            "backup_thread",
+        ):
+            setattr(controller, worker, None)
+        # A stop before any read has no helper to end.
+        controller._stop_storage_threads()
+        self.assertEqual(self._batch(controller, PoolName.DRAFT), 3)
+        self.assertTrue(helpers[0].is_alive())
+        controller._stop_storage_threads()
+        self.assertFalse(helpers[0].is_alive())
+        self.assertIsNone(controller._prefetch_sidecar_executor)
+        # A controller that is started again reads on a helper of its own.
+        self.assertEqual(self._batch(controller, PoolName.DRAFT), 3)
+        self.assertIsNot(helpers[1], helpers[0])
+        self.assertTrue(helpers[1].is_alive())
+        controller._stop_storage_threads()
+        self.assertFalse(helpers[1].is_alive())
 
 
 if __name__ == "__main__":
