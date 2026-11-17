@@ -67,6 +67,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler_components.output_streamer import (
         SchedulerOutputStreamer,
     )
+    from sglang.srt.managers.scheduler_components.request_list import ReqList
     from sglang.srt.managers.scheduler_components.request_retirer import (
         RequestRetirer,
     )
@@ -152,9 +153,10 @@ class SchedulerBatchResultProcessor:
     # Whether a request is still in the batch (running, prefill_launched or
     # chunked), so a step's frozen row for it may commit.
     still_in_batch: Callable
+    # The scheduler's prefill_launched_reqs, which a HiSparse prefill leaves for
+    # staging.
+    prefill_launched_reqs: ReqList
     uocr_runtime: Optional[UocrSchedulerRuntime] = None
-    # Hands requests out of the scheduler's prefill_launched_reqs.
-    leave_prefill_launched: Callable = lambda reqs: None
 
     def process_batch_result_prebuilt(self, batch: ScheduleBatch):
         assert self.disaggregation_mode == DisaggregationMode.DECODE
@@ -168,8 +170,11 @@ class SchedulerBatchResultProcessor:
                 req.time_stats.set_quick_finish_time()
                 self.request_retirer.release(req, checkpoint=True)
 
+        # Running requests send the prefill token with their first decode output.
         # Note: Logprobs should be handled on the prefill engine.
-        self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+        self.output_streamer.stream_output(
+            [req for req in batch.reqs if req.finished()], batch.return_logprob
+        )
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_end()
 
@@ -362,6 +367,7 @@ class SchedulerBatchResultProcessor:
         self.token_to_kv_pool_allocator.free_group_begin()
         # Each generation row's KV work, queued in row order for _flush_prefill.
         kv_ops: List[Callable[[], None]] = []
+        checkpoint_reqs: List[Req] = []
 
         if self.is_generation:
             if result.copy_done is not None:
@@ -511,8 +517,8 @@ class SchedulerBatchResultProcessor:
                         kv_ops.append(
                             partial(checkpoint_kv_cache, req, self.tree_cache)
                         )
+                        checkpoint_reqs.append(req)
                         if get_memory().enable_hisparse:
-                            self.leave_prefill_launched([req])
                             kv_ops.append(
                                 partial(
                                     self.hisparse_coordinator.admit_request_into_staging,
@@ -625,12 +631,14 @@ class SchedulerBatchResultProcessor:
                     # being chunked reqs' prefill is not finished
                     req.time_stats.set_last_chunked_prefill_finish_time()
 
-        self._flush_prefill(
-            batch,
-            self._reqs_still_in_batch(batch, still_in_batch_rows),
-            kv_ops,
-            skip_stream_req,
-        )
+        # The state slots the queued checkpoints take, taken in one take.
+        with self.tree_cache.lease_checkpoint_state_slots(checkpoint_reqs):
+            self._flush_prefill(
+                batch,
+                self._reqs_still_in_batch(batch, still_in_batch_rows),
+                kv_ops,
+                skip_stream_req,
+            )
 
         can_run_cuda_graph = result.can_run_cuda_graph
         # None on decode->extend converted batches; they are decode work and
@@ -1603,9 +1611,9 @@ class SchedulerBatchResultProcessor:
             self._maybe_collect_indexer_topk(req)
 
             if get_disagg().disaggregation_decode_enable_offload_kvcache:
-                # Asynchronously offload KV cache; release_kv_cache will be called after Device->Host transfer completes
-                if not self.decode_offload_manager.offload_kv_cache(req):
-                    self.decode_offload_manager.finalize_release_on_finish(req)
+                # The release waits for every Device->Host copy of the request to land.
+                self.decode_offload_manager.offload_kv_cache(req)
+                self.decode_offload_manager.finalize_release_on_finish(req)
             else:
                 self._prepare_kv_cache_release(req)
                 checkpoint = (
@@ -1626,6 +1634,7 @@ class SchedulerBatchResultProcessor:
             result.num_correct_drafts_per_req_cpu is None
             or req.kv.mamba_ping_pong_track_buffer is not None
             or not self.tree_cache.supports_mamba()
+            or self.tree_cache.request_mamba_only
         ):
             return True
 
@@ -1715,7 +1724,10 @@ class SchedulerBatchResultProcessor:
         Lazy: keep the same index (prealloc handles the swap) and run
         post-decode cleanup to free the temporary second slot.
         """
-        if req.kv.mamba_ping_pong_track_buffer is None:
+        if (
+            req.kv.mamba_ping_pong_track_buffer is None
+            or not batch.token_to_kv_pool_allocator.state.tracks_decode_state
+        ):
             return
 
         lazy = get_exec().mamba.enable_mamba_extra_buffer_lazy

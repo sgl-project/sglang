@@ -66,7 +66,7 @@ class TestFlashinferDispatcher(CustomTestCase):
         parallel = dict(tp_size=world_size, ep_size=world_size, attn_dp_size=world_size)
         server_args = ServerArgs(model_path="dummy", **parallel)
         server_args.moe_runner_backend = "flashinfer_cutlass"
-        server_args.moe_a2a_backend = "flashinfer"
+        server_args.moe_a2a_backend = "flashinfer_nvlink_one_sided"
         cls.server_args = server_args
         set_global_server_args_for_scheduler(server_args)
         publish(server_args, role="scheduler")
