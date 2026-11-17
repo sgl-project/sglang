@@ -829,6 +829,11 @@ class TboForwardBatchPreparer:
                 # sharding verdict; its counts above are already per-child.
                 attn_tp_sequence_sharded=batch.attn_tp_sequence_sharded,
                 encoder_swa_replay=batch.encoder_swa_replay,
+                # Pruning indices and graph rows belong to the parent's token
+                # layout. TBO uses the full-row path; children start unpruned.
+                last_layer_ffn_indices=None,
+                last_layer_ffn_pruned=False,
+                last_layer_ffn_graph_rows=0,
                 tbo_split_seq_index=None,
                 tbo_parent_token_range=(start_token_index, end_token_index),
                 tbo_children=None,

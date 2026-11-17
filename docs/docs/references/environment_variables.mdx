@@ -2459,6 +2459,7 @@ single NVIDIA GPU, with tensor, pipeline, and context parallel sizes of one.
 The optimization applies to complete prefills with no cached prefix. Requests
 for prompt logprobs, hidden states, embeddings, speculative decoding, multimodal
 inputs, or LoRA use the original path, as do intermediate prefill chunks.
+Two-batch overlap also retains the original path, including ordinary prefill graphs.
 
 With the breakable prefill CUDA graph backend, additional graph variants hold
 1, 4, or 16 selected rows. Batches larger than 16 use the ordinary graph.

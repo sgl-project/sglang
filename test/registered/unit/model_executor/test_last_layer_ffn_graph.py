@@ -44,6 +44,9 @@ class GraphTests(CustomTestCase):
     def test_unsupported_uses_original_graph(self):
         for key, value in [
             ("return_logprob", True),
+            ("tbo_split_seq_index", 0),
+            ("tbo_parent_token_range", (0, 128)),
+            ("tbo_children", []),
             ("extend_is_final_cpu", [False]),
             ("extend_prefix_lens_cpu", [64]),
             ("capture_hidden_mode", CaptureHiddenMode.FULL),
@@ -69,6 +72,9 @@ class GraphTests(CustomTestCase):
         self.assertIsNone(runner._shape_key(256, b).variant_label)
         b.return_logprob = False
         self.assertEqual(runner._shape_key(256, b).variant_label, "last_layer_ffn_4")
+        b.tbo_split_seq_index = 0
+        self.assertIsNone(runner._shape_key(256, b).variant_label)
+        b.tbo_split_seq_index = None
         runner.model_runner.model.enable_last_layer_ffn_pruning = False
         self.assertIsNone(runner._shape_key(256, b).variant_label)
 

@@ -42,6 +42,9 @@ class LastLayerFFNTests(CustomTestCase):
         self.assertTrue(eligible_batch(batch()))
         cases = {
             "forward_mode": ForwardMode.DECODE,
+            "tbo_split_seq_index": 0,
+            "tbo_parent_token_range": (0, 8),
+            "tbo_children": [],
             "return_logprob": True,
             "is_prefill_only": True,
             "spec_info": object(),

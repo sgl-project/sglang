@@ -770,6 +770,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         model = self.model_runner.model
         self._ffn_graph_enabled = (
             isinstance(self.backend, BreakableCudaGraphBackend)
+            and not get_exec().overlap.enable_two_batch_overlap
             and getattr(model, "_ffn_pruning_supported", False)
             and getattr(model, "enable_last_layer_ffn_pruning", False)
             and not getattr(model, "capture_aux_hidden_states", False)

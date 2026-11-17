@@ -12,6 +12,14 @@ def eligible_batch(batch):
     CPU metadata is used for decisions; never synchronize a CUDA tensor here.
     Static model/parallel/graph restrictions are checked by the model caller.
     """
+    # TBO splits/merges full token rows. Neither its parent nor a child may
+    # compact the final FFN output until that layout contract is supported.
+    if (
+        getattr(batch, "tbo_split_seq_index", None) is not None
+        or getattr(batch, "tbo_parent_token_range", None) is not None
+        or getattr(batch, "tbo_children", None) is not None
+    ):
+        return False
     if batch.forward_mode != ForwardMode.EXTEND:
         return False
     if batch.return_logprob or batch.is_prefill_only or batch.spec_info is not None:
