@@ -1,9 +1,8 @@
-"""MUSA tests for the autograd-opaque KV-cache store."""
+"""MUSA tests for the public Triton KV-cache store."""
 
 import pytest
 import torch
 
-from sglang.kernels.ops.kvcache.kvcache import store_cache_index_copy
 from sglang.srt.mem_cache.memory_pool import _set_kv_buffer_impl
 from sglang.srt.utils import is_musa
 from sglang.test.ci.ci_register import register_musa_ci
@@ -11,7 +10,27 @@ from sglang.test.ci.ci_register import register_musa_ci
 register_musa_ci(est_time=30, suite="nightly-musa-1-gpu", nightly=True)
 
 
-def test_store_cache_index_copy_is_autograd_opaque() -> None:
+def store(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    indices: torch.Tensor,
+) -> None:
+    _set_kv_buffer_impl(
+        k,
+        v,
+        k_cache,
+        v_cache,
+        indices,
+        row_dim=k.shape[-1],
+        store_dtype=k.dtype,
+        device_module=torch.musa,
+        size_limit=k_cache.shape[0],
+    )
+
+
+def test_musa_cache_store_is_autograd_opaque() -> None:
     if not is_musa():
         pytest.skip("MUSA is required")
 
@@ -23,7 +42,7 @@ def test_store_cache_index_copy_is_autograd_opaque() -> None:
     v_cache.requires_grad_(True)
     indices = torch.arange(8, device="musa", dtype=torch.int32)
 
-    store_cache_index_copy(k, v, k_cache, v_cache, indices)
+    store(k, v, k_cache, v_cache, indices)
     torch.musa.synchronize()
 
     assert torch.equal(k_cache[indices.long()], k)
@@ -32,7 +51,7 @@ def test_store_cache_index_copy_is_autograd_opaque() -> None:
     assert v_cache.grad_fn is None
 
 
-def test_store_cache_index_copy_is_graph_safe() -> None:
+def test_musa_cache_store_is_graph_safe() -> None:
     if not is_musa():
         pytest.skip("MUSA is required")
 
@@ -43,12 +62,12 @@ def test_store_cache_index_copy_is_graph_safe() -> None:
     indices = torch.arange(8, device="musa", dtype=torch.int64)
 
     for _ in range(2):
-        store_cache_index_copy(k, v, k_cache, v_cache, indices)
+        store(k, v, k_cache, v_cache, indices)
     torch.musa.synchronize()
 
     graph = torch.musa.MUSAGraph()
     with torch.musa.graph(graph):
-        store_cache_index_copy(k, v, k_cache, v_cache, indices)
+        store(k, v, k_cache, v_cache, indices)
     torch.musa.synchronize()
     graph.replay()
     torch.musa.synchronize()
@@ -57,7 +76,7 @@ def test_store_cache_index_copy_is_graph_safe() -> None:
     assert torch.equal(v_cache[indices], v)
 
 
-def test_memory_pool_routes_musa_store_through_opaque_op() -> None:
+def test_memory_pool_routes_musa_store_through_public_triton_kernel() -> None:
     if not is_musa():
         pytest.skip("MUSA is required")
 
