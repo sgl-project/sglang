@@ -15,11 +15,14 @@ store.
   without the draft reads the target chunks; one with it backfills.
 - For both, the draft KV that other paths write: a batched prefill cut at
   the chunk size, decode, and a reload under eviction pressure.
+- For both, a PD prefill server on the store: the decode server behind it
+  speculates on the draft KV that the prefill server reloads and transfers.
 
 Usage:
     python3 -m pytest test/registered/hicache/test_hicache_unified_spec_storage.py -v
 """
 
+import importlib.util
 import io
 import json
 import math
@@ -31,12 +34,17 @@ import time
 import unittest
 import uuid
 
+import requests
+
 from sglang.srt.utils.device import is_sm100_supported
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.hicache_unified_spec_storage_common import (
     PAGE_SIZE,
     HiCacheUnifiedSpecStorageMixin,
     require_model_snapshot,
+)
+from sglang.test.server_fixtures.disaggregation_fixture import (
+    PDDisaggregationServerBase,
 )
 from sglang.test.test_utils import (
     DEFAULT_DRAFT_MODEL_DFLASH,
@@ -46,7 +54,7 @@ from sglang.test.test_utils import (
 )
 
 # The ring needs a draft attention backend that only Blackwell serves.
-register_cuda_ci(est_time=4800, stage="nightly", runner_config="4-gpu-b200")
+register_cuda_ci(est_time=5000, stage="nightly", runner_config="4-gpu-b200")
 
 
 def _ring_eligible_draft_config(config: dict) -> dict:
@@ -941,6 +949,148 @@ class TestUnifiedKeysDFlashSidecarPaths(
 
     def second_prompt(self):
         return self.ledger_prompt(seed=2)
+
+
+class PrefillServerDraftKVMixin(PackedNextnMixin):
+    """A PD prefill server on the L3 store, a decode server without HiCache
+    behind it, and the minimal load balancer in front of both.
+
+    The decode server answers the requests. Its cache report is the prefill
+    server's, passed on without a backend name; its speculative statistics
+    are its own, on the draft KV that the transfer handed over. It keeps no
+    prefix between requests, so what its draft sees of a prompt is what the
+    prefill server held for that request.
+    """
+
+    spec_args: list = []
+    # The decode server has no storage backend to name.
+    expected_storage_backend = None
+
+    @classmethod
+    def setUpClass(cls):
+        if importlib.util.find_spec("sglang_router") is None:
+            raise unittest.SkipTest("the load balancer needs sglang_router")
+        super().setUpClass()
+        # The fixture's part: ports, transfer backend and RDMA devices.
+        super(HiCacheUnifiedSpecStorageMixin, cls).setUpClass()
+        cls.extra_prefill_args = [*cls.hicache_server_args(), *cls.spec_args]
+        cls.extra_prefill_env = cls.hicache_server_env()
+        cls.extra_decode_args = [
+            "--enable-cache-report",
+            "--page-size",
+            str(PAGE_SIZE),
+            *cls.base_server_args,
+            *cls.spec_args,
+        ]
+        cls.launch_all()
+
+    @classmethod
+    def tearDownClass(cls):
+        try:
+            # The fixture's part: the load balancer and both servers.
+            super(HiCacheUnifiedSpecStorageMixin, cls).tearDownClass()
+        finally:
+            super().tearDownClass()
+
+    def first_prompt(self):
+        raise NotImplementedError
+
+    def flush_cache(self):
+        """Drop the prefill server's device and host tiers."""
+        response = requests.post(
+            f"{self.prefill_url}/flush_cache", params={"timeout": 30}, timeout=40
+        )
+        response.raise_for_status()
+
+    def _print_stats(self, result, label):
+        details = result["meta_info"].get("cached_tokens_details")
+        print(f"{type(self).__name__} {label}: cached tokens {details}")
+        return super()._print_stats(result, label)
+
+    def test_decode_server_speculates_on_draft_kv_reloaded_by_prefill(self):
+        prompt = self.first_prompt()
+        salt = uuid.uuid4().hex
+        # Neither side keeps the draft KV in a ring of its own: it sits in
+        # pages that the prefill server stores, reloads and transfers.
+        for url in (self.prefill_url, self.decode_url):
+            response = requests.get(f"{url}/server_info", timeout=30)
+            response.raise_for_status()
+            self.assertFalse(response.json()["speculative_dflash_draft_kv_ring"])
+
+        # 1. The prefill server computes the prompt, hits on its device, and
+        # after a flush reads the pages from L3. The decode server then
+        # answers and speculates exactly as after the device hit.
+        device_hit, storage_hit = self.reload_in_process(prompt, salt, seed=1)
+        self._assert_draft_at_work(device_hit, "device hit")
+        self._print_stats(storage_hit, "storage hit")
+        self.assertEqual(self.spec_stats(storage_hit), self.spec_stats(device_hit))
+
+        # 2. The store holds the objects that a server which also decodes
+        # writes for the two prompts, and no page of generated tokens: those
+        # never reach the prefill server.
+        written = self.wait_for_backups()
+        _, draft = self._audit_pages(written, 2 * self.prompt_pages)
+        self.assertEqual(len(self._pages(written)), 2 * self.prompt_pages)
+
+        # 3. Another reload: reading leaves the store as it was.
+        self.flush_cache()
+        again = self.generate(prompt, salt)
+        self.assert_storage_hit(again)
+        self.assert_same_output(again, device_hit)
+        self._print_stats(again, "storage hit again")
+        self.assertEqual(self.spec_stats(again), self.spec_stats(device_hit))
+        self.assertEqual(self.wait_for_backups(), written)
+
+        # 4. Control: with every draft object zeroed, the pages still hit
+        # and the output holds, and the decode server's draft shows the
+        # loss. Without this, step 1 would not prove that draft KV is what
+        # the prefill server reloaded and sent.
+        self.zero_objects([name for name in written if f"_{draft}_" in name])
+        self.flush_cache()
+        degraded = self.generate(prompt, salt)
+        self._assert_draft_lost(degraded, device_hit, "draft objects zeroed")
+        self.assertEqual(degraded["output_ids"], device_hit["output_ids"])
+
+
+@unittest.skipUnless(get_gpu_count() >= 2, "Requires a GPU each for prefill and decode")
+class TestUnifiedKeysDFlashSidecarPD(
+    PrefillServerDraftKVMixin, DFlashSidecarMixin, PDDisaggregationServerBase
+):
+    """The draft KV pool's pages of the prompt, written by the prefill server
+    under the names and digests of TestUnifiedKeysDFlashSidecar. Measured on
+    B200, on the decode server: 30 verify steps for 96 tokens (accept length
+    3.20), with the draft objects zeroed 54 (1.78)."""
+
+    min_accept_length = DFLASH_MIN_ACCEPT_LENGTH
+    spec_args = DFlashSidecarMixin.dflash_args
+    target_chunks = {"L0-32_H0": 32 * 8 * LLAMA_LAYER_BYTES_PER_HEAD}
+    draft_chunks = {"D0-5_H0": 5 * 8 * LLAMA_LAYER_BYTES_PER_HEAD}
+    target_digest = "ukv1-b440160febf92487"
+    draft_digest = "ukd1-00b6f6f02b29851b"
+
+    def first_prompt(self):
+        return self.ledger_prompt(seed=1)
+
+
+@unittest.skipUnless(get_gpu_count() >= 2, "Requires a GPU each for prefill and decode")
+class TestUnifiedKeysPackedNextnPD(
+    PrefillServerDraftKVMixin, PDDisaggregationServerBase
+):
+    """The packed draft layer's rows of the prompt, written by the prefill
+    server under the names and digests of TestUnifiedKeysPackedNextnMHA.
+    Measured on B200, on the decode server: 45 verify steps for 96 tokens
+    (accept length 2.13), with the draft objects zeroed 52 (1.85)."""
+
+    model = MIMO
+    min_accept_length = MIMO_MIN_ACCEPT_LENGTH
+    spec_args = PackedNextnMixin.nextn_args
+    target_chunks = {"L0-36_H0": 36 * 8 * MIMO_LAYER_BYTES_PER_HEAD}
+    draft_chunks = {"D0-1_H0": 8 * MIMO_LAYER_BYTES_PER_HEAD}
+    target_digest = "ukv1-0934a4e4e4ce8776"
+    draft_digest = "ukd1-044423b746c1f19a"
+
+    def first_prompt(self):
+        return self.text_prompt(NOTICE)
 
 
 if __name__ == "__main__":

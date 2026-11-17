@@ -111,21 +111,13 @@ class HiCacheUnifiedSpecStorageMixin:
         cls._storage_dir.cleanup()
 
     @classmethod
-    def launch_server(
-        cls, spec_args: List[str], extra_args: Optional[List[str]] = None, log=None
-    ):
-        """Start a server on the class's L3 store, replacing a running one.
-
-        `log`, a text sink, also receives what the server prints.
-        """
-        cls.stop_server()
-        default_port = int(DEFAULT_URL_FOR_TEST.rsplit(":", 1)[1])
-        cls.base_url = f"http://127.0.0.1:{find_available_port(default_port)}"
+    def hicache_server_args(cls) -> List[str]:
+        """HiCache under unified keys on the class's L3 store."""
         extra_config = {
             "hicache_storage_pass_prefix_keys": True,
             "prefetch_threshold": PAGE_SIZE,
         }
-        args = [
+        return [
             "--enable-hierarchical-cache",
             "--enable-cache-report",
             "--page-size",
@@ -144,14 +136,29 @@ class HiCacheUnifiedSpecStorageMixin:
             json.dumps(extra_config),
             *cls.base_server_args,
             *cls.unified_server_args,
-            *spec_args,
-            *(extra_args or []),
         ]
-        env = {
-            **os.environ,
+
+    @classmethod
+    def hicache_server_env(cls) -> Dict[str, str]:
+        """Where a server finds the class's L3 store."""
+        return {
             "SGLANG_HICACHE_FILE_BACKEND_STORAGE_DIR": cls.storage_path,
             **(cls.mooncake.server_env() if cls.mooncake is not None else {}),
         }
+
+    @classmethod
+    def launch_server(
+        cls, spec_args: List[str], extra_args: Optional[List[str]] = None, log=None
+    ):
+        """Start a server on the class's L3 store, replacing a running one.
+
+        `log`, a text sink, also receives what the server prints.
+        """
+        cls.stop_server()
+        default_port = int(DEFAULT_URL_FOR_TEST.rsplit(":", 1)[1])
+        cls.base_url = f"http://127.0.0.1:{find_available_port(default_port)}"
+        args = [*cls.hicache_server_args(), *spec_args, *(extra_args or [])]
+        env = {**os.environ, **cls.hicache_server_env()}
         cls.process = popen_launch_server(
             cls.model,
             cls.base_url,
