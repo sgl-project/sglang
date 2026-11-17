@@ -20,7 +20,7 @@ from sglang.srt.layers.dp_attention import is_allocation_symmetric
 from sglang.srt.layers.utils.common import strict_contiguous
 from sglang.srt.runtime_context import get_parallel, get_platform
 from sglang.srt.utils import is_gfx95_supported, is_hip
-from sglang.srt.utils.device import is_gfx1250_supported
+from sglang.srt.utils.device import is_gfx1250_supported, is_npu
 
 _is_hip = is_hip()
 if _is_hip:
@@ -2049,6 +2049,10 @@ def _mhc_post_dispatch(
         if result is not None:
             return result
 
+    if is_npu():
+        from sgl_kernel_npu.operators.hyper_conn import mhc_post as npu_mhc_post
+
+        return npu_mhc_post(residual, comb_res_mix, x, post_layer_mix.squeeze(-1))
     if not _use_tilelang_mhc_post():
         return _mhc_post_torch(x, residual, post_layer_mix, comb_res_mix)
     return mhc_post(x, residual, post_layer_mix, comb_res_mix)
@@ -2085,20 +2089,35 @@ def hc_pre(
 
     fn = hc_fn if hc_norm_weight is None else hc_fn * hc_norm_weight
     residual_3d = x.view(s, hc_mult, hidden_size)
-    post_mix, comb_mix, layer_input, norm_fused = _mhc_pre_dispatch(
-        residual=residual_3d,
-        fn=fn,
-        hc_scale=hc_scale,
-        hc_base=hc_base,
-        rms_eps=rms_eps,
-        hc_pre_eps=hc_eps,
-        hc_sinkhorn_eps=hc_eps,
-        hc_post_mult_value=post_mult_value,
-        sinkhorn_repeat=sinkhorn_iters,
-        norm_weight=out_norm_weight,
-        norm_eps=out_norm_eps,
-        n_splits_pre=n_splits_pre,
-    )
+    if is_npu():
+        from sgl_kernel_npu.operators.hyper_conn import mhc_pre_sinkhorn
+
+        y, post, comb = mhc_pre_sinkhorn(
+            residual_3d,
+            fn,
+            hc_scale,
+            hc_base,
+            hc_mult=hc_mult,
+            num_iters=sinkhorn_iters,
+            norm_eps=rms_eps,
+            hc_eps=hc_eps,
+        )
+        post_mix, comb_mix, layer_input, norm_fused = post, comb, y, False
+    else:
+        post_mix, comb_mix, layer_input, norm_fused = _mhc_pre_dispatch(
+            residual=residual_3d,
+            fn=fn,
+            hc_scale=hc_scale,
+            hc_base=hc_base,
+            rms_eps=rms_eps,
+            hc_pre_eps=hc_eps,
+            hc_sinkhorn_eps=hc_eps,
+            hc_post_mult_value=post_mult_value,
+            sinkhorn_repeat=sinkhorn_iters,
+            norm_weight=out_norm_weight,
+            norm_eps=out_norm_eps,
+            n_splits_pre=n_splits_pre,
+        )
     return (
         layer_input,
         comb_mix.reshape(s, hc_mult * hc_mult),

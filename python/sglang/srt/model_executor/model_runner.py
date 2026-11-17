@@ -35,6 +35,7 @@ from sglang.srt.configs.model_config import (
     AttentionArch,
     ModelConfig,
     ModelImpl,
+    is_kimi_k31,
 )
 from sglang.srt.configs.update_config import adjust_config_with_unaligned_cpu_tp
 from sglang.srt.debug_utils.dumper import dumper
@@ -760,6 +761,7 @@ class ModelRunner:
                 model=self.model, model_config=self.model_config
             )
         prepare_moe_topk(model=self.model, model_config=self.model_config)
+        self.maybe_warmup_bf16_gemms()
 
         self.maybe_init_dwdp()
 
@@ -1346,6 +1348,18 @@ class ModelRunner:
         # so keep the PP group it was built with; read every other placement
         # value from the context where it is used.
         self.pp_group = get_parallel().pp_group
+
+    def maybe_warmup_bf16_gemms(self):
+        """Load cuBLASLt's kernel libraries, which CUDA_MODULE_LOADING=EAGER does not
+        cover; a first load during a PP prefill can hang in cuLibraryLoadData."""
+        max_m = envs.SGLANG_WARMUP_BF16_GEMM_MAX_M.get()
+        if max_m is None:
+            max_m = 16384 if is_kimi_k31(self.model_config.hf_config) else 0
+        if max_m <= 0 or self.device != "cuda":
+            return
+        from sglang.srt.layers.quantization.unquant import warmup_bf16_gemms
+
+        warmup_bf16_gemms(self.model, max_m)
 
     def load_model(self):
         tic_total = time.perf_counter()
