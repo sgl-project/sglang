@@ -1159,6 +1159,12 @@ class Envs:
     # oneshot below ~24 tokens, which on gfx950 costs 11-16 us vs 6-7 us for multi-phase at
     # E=385 / 129; outputs are identical and multi-phase is never slower up to 16384 tokens.
     SGLANG_AITER_MOE_SORTING_DISPATCH_POLICY = EnvInt(2)
+    # Quark MXFP4 MoE on gfx95: call aiter.fused_moe with stage2_fp8=True in every MoE
+    # layer except a speculative draft's. AITER then writes FP8 per-route outputs and sums
+    # them in fp32 where the tuned stage 2 allows it (a FlyDSL reduce, or an MXFP4 scatter
+    # after an MXMOE stage 1); not bitwise equal to the default. Needs an AITER whose
+    # fused_moe takes stage2_fp8. AITER_FLYDSL_STAGE2_FP8=1 applies to the draft as well.
+    SGLANG_AITER_MOE_STAGE2_FP8 = EnvBool(False)
     # Fold `silu(gate) * up` into the triton MoE up-GEMM epilogue. W13 rows are
     # permuted in place at load so gate/up land in adjacent columns of the same
     # output tile, which removes intermediate_cache1 and the standalone

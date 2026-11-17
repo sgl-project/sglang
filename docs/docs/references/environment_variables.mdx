@@ -1928,6 +1928,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>true</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AITER_MOE_STAGE2_FP8</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Quark MXFP4 MoE on gfx95: call AITER's <code>fused_moe</code> with <code>stage2_fp8=True</code> in every MoE layer except a speculative draft's. AITER then writes FP8 per-route outputs and sums them in fp32 where the tuned stage 2 allows it (a FlyDSL reduce, or an MXFP4 scatter after an MXMOE stage 1). Not bitwise equal to the default. Needs an AITER whose <code>fused_moe</code> takes <code>stage2_fp8</code>; AITER's <code>AITER_FLYDSL_STAGE2_FP8=1</code> also changes the draft.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_AITER_FUSE_RMSNORM_PAD</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Fuse the residual-add + RMSNorm + zero-pad triplet before the MoE block via the AITER Triton kernel (TP=1, post-attention layernorm path only).</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>

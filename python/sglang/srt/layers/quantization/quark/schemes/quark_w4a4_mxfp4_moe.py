@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.utils import get_moe_weight_sizes
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -170,6 +171,8 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
 
         self.static_input_scales = not self.input_quant.get("is_dynamic")
         self.with_bias = False
+        # Set per layer by create_moe_runner.
+        self._aiter_stage2_fp8 = False
 
         if not self.is_checkpoint_mxfp4_serialized:
             if not is_gfx95_supported():
@@ -1123,6 +1126,22 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
             self._owns_moe_runner = True
             self._owns_moe_weight_layout = True
+            # A speculative draft's MoE keeps the default stage 2.
+            self._aiter_stage2_fp8 = (
+                _is_gfx95
+                and envs.SGLANG_AITER_MOE_STAGE2_FP8.get()
+                and not layer.is_draft
+            )
+            if self._aiter_stage2_fp8:
+                from sglang.srt.layers.moe.moe_runner.aiter import (
+                    _aiter_fused_moe_supports_stage2_fp8,
+                )
+
+                if not _aiter_fused_moe_supports_stage2_fp8():
+                    raise RuntimeError(
+                        "SGLANG_AITER_MOE_STAGE2_FP8=1 needs an AITER build whose "
+                        "aiter.fused_moe accepts stage2_fp8."
+                    )
         else:
             raise NotImplementedError(
                 "Quark MXFP4 MoE currently requires the AITER runner; "
@@ -1164,6 +1183,8 @@ class QuarkW4A4MXFp4MoE(QuarkMoEScheme):
             # Quark checkpoints store gate and up projections as separate
             # contiguous row ranges. Keep that ordering for correctness.
             _fused_moe_kwargs = {"gate_mode": GateMode.SEPARATED.value}
+            if self._aiter_stage2_fp8:
+                _fused_moe_kwargs["stage2_fp8"] = True
         else:
             _fused_moe_kwargs = None
 
