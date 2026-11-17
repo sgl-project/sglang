@@ -89,7 +89,7 @@ def generate(spec: BuildSpec) -> str:
     )
     cudaflags = _quote_path_flags(
         toolchain.base_cuda_flags()
-        + toolchain.target_flags()
+        + toolchain.target_flags(spec.module_args[0])
         + list(spec.cuda_cflags)
         + include_flags
     )

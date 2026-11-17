@@ -11,6 +11,7 @@ import torch
 from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
     amax_topk_blocks,
     candidate_block_mask,
+    candidate_topk,
     select_candidate_block_ids,
     topk_among_blocks,
 )
@@ -66,16 +67,18 @@ class DenseBlocksBackend:
         req_to_token: torch.Tensor,
         candidate_topk_blocks: int,
         candidate_block_size: int,
-        use_deep_gemm_prefill: bool,
+        use_deep_gemm_publish: bool,
+        use_deep_gemm_consume: bool,
     ) -> None:
         self.token_to_kv_pool = token_to_kv_pool
         self.req_to_token = req_to_token
         self.topk_blocks = candidate_topk_blocks
         self.block_size = candidate_block_size
-        self.use_deep_gemm_prefill = use_deep_gemm_prefill
+        self.use_deep_gemm_publish = use_deep_gemm_publish
+        self.use_deep_gemm_consume = use_deep_gemm_consume
 
     def publish_prefill(self, inputs: PrefillInputs):
-        if self.use_deep_gemm_prefill:
+        if self.use_deep_gemm_publish:
             return self._deep_gemm_publish_prefill(inputs)
         return self._torch_publish_prefill(inputs)
 
@@ -84,7 +87,7 @@ class DenseBlocksBackend:
         inputs: PrefillInputs,
         published: Optional[BlockIds],
     ) -> None:
-        if self.use_deep_gemm_prefill:
+        if self.use_deep_gemm_consume:
             self._deep_gemm_consume_prefill(inputs, published)
         else:
             self._torch_consume_prefill(inputs, published)
@@ -220,19 +223,31 @@ class DenseBlocksBackend:
         inputs: PrefillInputs,
         published: Optional[BlockIds],
     ) -> None:
-        assert published is not None
+        if published is None:  # a DeepGEMM publish with no visible position
+            inputs.reset_outputs()
+            return
         for request, chunks in prefill_requests(
             inputs=inputs,
             token_to_kv_pool=self.token_to_kv_pool,
+            candidate_blocks=published.blocks,
+            candidate_block_size=self.block_size,
         ):
             for chunk in chunks:
-                idx = topk_among_blocks(
-                    chunk.scores,
-                    chunk.lens,
-                    published.blocks[chunk.tok],
-                    request.k,
-                    block_size=self.block_size,
-                )
+                if chunk.candidate_only:
+                    idx = candidate_topk(
+                        chunk.scores,
+                        published.blocks[chunk.tok],
+                        request.k,
+                        self.block_size,
+                    )
+                else:
+                    idx = topk_among_blocks(
+                        chunk.scores,
+                        chunk.lens,
+                        published.blocks[chunk.tok],
+                        request.k,
+                        block_size=self.block_size,
+                    )
                 write_prefill(
                     inputs, request, chunk, idx.masked_fill(idx < 0, request.lc)
                 )

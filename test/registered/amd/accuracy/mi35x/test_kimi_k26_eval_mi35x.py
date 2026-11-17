@@ -28,7 +28,10 @@ from sglang.test.test_utils import (
 
 # Register for AMD CI - Kimi K2.6 accuracy test on MI35x (~90 min)
 register_amd_ci(
-    est_time=5400, suite="nightly-amd-accuracy-8-gpu-mi35x-kimi-k26", nightly=True
+    est_time=5400,
+    suite="nightly-amd-accuracy-8-gpu-mi35x-kimi-k26",
+    nightly=True,
+    disabled="Older model generation; AMD nightly keeps the latest two per family",
 )
 
 KIMI_K26_MODEL_PATH = "moonshotai/Kimi-K2.6"
