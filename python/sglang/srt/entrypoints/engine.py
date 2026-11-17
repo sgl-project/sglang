@@ -151,6 +151,7 @@ from sglang.srt.utils import (
     configure_logger,
     get_bool_env_var,
     is_cuda,
+    is_hip,
     is_mnnvl_fabric_device,
     kill_process_tree,
     maybe_reindex_device_id,
@@ -1950,6 +1951,17 @@ class Engine(EngineScoreMixin, EngineBase):
     # score() and async_score() are provided by EngineScoreMixin
 
 
+_ROCM_BLASLT_WORKSPACE_KEYS = ("HIPBLASLT_WORKSPACE_SIZE", "CUBLASLT_WORKSPACE_SIZE")
+
+
+def _set_rocm_blas_envs():
+    if not is_hip() or any(k in os.environ for k in _ROCM_BLASLT_WORKSPACE_KEYS):
+        return
+    # With torch 2.11's 76 MiB default, hipblasLtMatmul fails some bf16 batched GEMMs
+    # and torch falls back to hipBLAS; pytorch/pytorch#197201 raises the default later.
+    os.environ["HIPBLASLT_WORKSPACE_SIZE"] = str(128 * 1024)
+
+
 def _set_envs_and_config(server_args: ServerArgs):
     cfg = resolving_view(server_args)
     # Set global environments
@@ -1975,6 +1987,7 @@ def _set_envs_and_config(server_args: ServerArgs):
         if cfg.dcp_size > 1:
             os.environ["NCCL_GRAPH_MIXING_SUPPORT"] = "0"
     os.environ["CUDA_DEVICE_MAX_CONNECTIONS"] = "8"
+    _set_rocm_blas_envs()
 
     if os.environ.get("TRTLLM_ENABLE_PDL", "1") != "0":
         # flashinfer uses this environment variable for various kernels from MoE to quant kernels
