@@ -13,7 +13,7 @@ FROM nvidia/cuda:${CUDA_VERSION}-cudnn-devel-ubuntu24.04 AS base
 ARG TARGETARCH
 ARG BUILD_TYPE=all
 ARG BRANCH_TYPE=remote
-ARG SGL_KERNEL_VERSION=0.4.9
+ARG SGL_KERNEL_VERSION=0.4.11
 ARG SGL_VERSION
 ARG USE_LATEST_SGLANG=0
 ARG GDRCOPY_VERSION=2.5.1
@@ -22,7 +22,7 @@ ARG PIP_DEFAULT_INDEX
 ARG UBUNTU_MIRROR
 ARG GITHUB_ARTIFACTORY=github.com
 ARG INSTALL_FLASHINFER_JIT_CACHE=0
-ARG FLASHINFER_VERSION=0.7.3
+ARG FLASHINFER_VERSION=0.7.4
 ARG MOONCAKE_VERSION=0.3.14
 ARG MSCCLPP_VERSION=sglang-v0.10.1
 
@@ -172,7 +172,7 @@ ENV LANG=en_US.UTF-8 \
 #     |                  \-> halops_wheel (prebuilt wheel download)
 #     |
 #     +-- devtools_builder (independent)
-#     +-- gateway_builder  (independent, only needs gateway source)
+#     +-- router_builder   (independent, only needs router source)
 #     |
 #     v
 #   framework (combines all artifacts)
@@ -373,33 +373,27 @@ RUN sh -c "$(curl --retry 3 --retry-delay 2 -fsSL https://raw.githubusercontent.
     && git clone --depth 1 https://github.com/zsh-users/zsh-syntax-highlighting.git ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
 
 ########################################################
-# PARALLEL STAGE 5: Gateway Builder (starts from base)
+# PARALLEL STAGE 5: Router Builder (starts from base)
 ########################################################
-# Builds sgl-model-gateway in isolation so Python-only changes
+# Builds sgl-router in isolation so Python-only changes
 # don't trigger a full Rust recompilation.
-FROM base AS gateway_builder
-
-ARG GITHUB_ARTIFACTORY
-ARG BRANCH_TYPE
-ARG SGL_VERSION
-ARG USE_LATEST_SGLANG
+FROM base AS router_builder
 
 WORKDIR /build
 
-# Copy ONLY the gateway source (not the full repo)
-COPY sgl-model-gateway /build/sgl-model-gateway
+# sgl-router and the rust/ workspace that holds its path dependencies
+COPY sgl-router /build/sgl-router
+COPY rust /build/rust
 
-# Install Rust, build gateway binary and Python bindings, then clean up Rust toolchain
-RUN --mount=type=cache,target=/root/.cache/uv \
-    curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs | sh -s -- -y \
+# Install Rust at sgl-router's pinned toolchain, build the binary, then clean up
+RUN curl --proto '=https' --tlsv1.2 --retry 3 --retry-delay 2 -sSf https://sh.rustup.rs \
+        | sh -s -- -y --profile minimal --default-toolchain none \
     && export PATH="/root/.cargo/bin:${PATH}" \
-    && uv pip install maturin \
-    && cd /build/sgl-model-gateway/bindings/python \
-    && ulimit -n 65536 && maturin build --release --features vendored-openssl --out /build/gateway_wheels \
-    && cd /build/sgl-model-gateway \
-    && cargo build --release --bin sgl-model-gateway --features vendored-openssl \
-    && cp target/release/sgl-model-gateway /build/sgl-model-gateway-bin \
-    && rm -rf /root/.cargo /root/.rustup /build/sgl-model-gateway/target /build/sgl-model-gateway/bindings/python/target
+    && cd /build/sgl-router \
+    && rustup toolchain install \
+    && cargo build --locked --release --bin sgl-router \
+    && cp target/release/sgl-router /build/sgl-router-bin \
+    && rm -rf /root/.cargo /root/.rustup /build/sgl-router/target
 
 ########################################################
 ########## Final Framework Image ######################
@@ -640,18 +634,38 @@ RUN if [ "$BRANCH_TYPE" = "local" ]; then \
 RUN --mount=type=cache,target=/root/.cache/uv \
     cd /sgl-workspace/sglang \
     && uv pip install --no-deps -e "python[${BUILD_TYPE}]" \
+    && kernels lock python \
+    && ( success=0; \
+         # aarch64: kernels-community/sgl-flash-attn3 ships no arm variants; JIT-compile at runtime.
+         # Remove this branch once arm cubins are published upstream.
+         if [ "$(uname -m)" = "aarch64" ]; then \
+             echo "Skipping kernels-community/sgl-flash-attn3 cubin download on aarch64 (no variants published upstream); kernels will be JIT-compiled at runtime"; \
+             success=1; \
+         else \
+             for i in 1 2 3; do \
+                 echo "Attempt $i/3: downloading sgl-kernel cubins..." && \
+                 kernels download python && \
+                 success=1 && break; \
+                 echo "sgl-kernel cubin download failed, retrying in 30s..." && sleep 30; \
+             done; \
+             # x86: if no prebuilt sgl-flash-attn3 variant matches this torch+CUDA \
+             # combo, fall back to runtime JIT instead of failing the build, \
+             # mirroring the aarch64 branch. \
+             if [ "$success" != "1" ]; then \
+                 echo "WARNING: no matching sgl-flash-attn3 cubin variant for this torch+CUDA; kernels will be JIT-compiled at runtime"; \
+                 success=1; \
+             fi; \
+         fi; \
+         [ "$success" = "1" ] ) \
     && mkdir -p /root/.cache/huggingface /root/.cache/sglang \
+    && ( if [ -f python/kernels.lock ]; then mv python/kernels.lock /root/.cache/sglang/; fi ) \
     && ( find /opt/sglang/lib/python3.12/site-packages -type d -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true )
 
 ENV SGLANG_RUST_BUILD_MODE=never
 
 
-# Install pre-built gateway artifacts from parallel builder
-COPY --from=gateway_builder /build/sgl-model-gateway-bin /opt/sglang/bin/sgl-model-gateway
-COPY --from=gateway_builder /build/gateway_wheels /tmp/gateway_wheels
-RUN --mount=type=cache,target=/root/.cache/uv \
-    uv pip install --reinstall /tmp/gateway_wheels/*.whl \
-    && rm -rf /tmp/gateway_wheels
+# Install the pre-built router from the parallel builder
+COPY --from=router_builder /build/sgl-router-bin /opt/sglang/bin/sgl-router
 
 # sgl-nvidia-mega: the NVIDIA megakernel plugin, inert unless a server passes
 # --enable-nvidia-megakernel. Installed with CUDA >= 12.9 only (its kernels are
