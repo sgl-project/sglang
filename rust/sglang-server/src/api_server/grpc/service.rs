@@ -335,7 +335,9 @@ mod tests {
 
     use super::GrpcService;
     use crate::api_server::handlers::{CoreConfig, CoreHandle, CoreMetadata, HiCacheManager};
-    use crate::message::config::{ModelConfig, PreferredSamplingParams, ServerArgs};
+    use crate::message::config::{
+        DisaggregationMode, ModelConfig, PreferredSamplingParams, ServerArgs,
+    };
     use crate::message::finish_reason::FinishReason;
     use crate::message::ids::Rid;
     use crate::message::request::{GenerateRequest, Request as RuntimeRequest, RequestKind};
@@ -384,7 +386,7 @@ mod tests {
                     response_capacity,
                     response_activity: Default::default(),
                     startup_ready,
-                    is_disaggregation: false,
+                    is_disaggregation: server_args.is_disaggregation(),
                     mm_limits: Default::default(),
                     multimodal: false,
                     peer_endpoints: Vec::new(),
@@ -527,6 +529,23 @@ mod tests {
             .map_or(&[], |ids| ids.ids.as_slice())
     }
 
+    fn decoded_rgb_request(epoch: &str, rid: &str) -> api::GenerateRequest {
+        let mut request = text_request("<image>", rid);
+        request.bootstrap_host = serde_json::from_value(serde_json::json!("prefill-host")).unwrap();
+        request.bootstrap_port = serde_json::from_value(serde_json::json!(31080)).unwrap();
+        request.bootstrap_room = serde_json::from_value(serde_json::json!(42)).unwrap();
+        request.bootstrap_pair_key = serde_json::from_value(serde_json::json!("pair-key")).unwrap();
+        request.decoded_media = Some(
+            serde_json::from_value(serde_json::json!({
+                "images": [{"width":2,"height":1,"row_stride_bytes":6,"pixel_format":"rgb8",
+                    "payload":{"mounted_shm":{"object_id":"unique-object-0123456789abcdef",
+                        "offset_bytes":1,"length_bytes":6,"engine_instance_id":epoch}}}]
+            }))
+            .unwrap(),
+        );
+        request
+    }
+
     /// Read completion is independent of token production. In particular, an
     /// admitted/cancelled request whose reader never finished cannot emit ACK.
     #[tokio::test]
@@ -576,6 +595,178 @@ mod tests {
             // No scheduler output was needed for this receipt.
             drop(response);
         }
+    }
+
+    /// Stage-local decoded RGB admission on Prefill and Decode: real
+    /// DecodedStore snapshot/receipt, bootstrap preserved, foreign epoch
+    /// rejected before intake, and encoded media still admits on the same
+    /// disaggregated harness.
+    #[tokio::test]
+    async fn decoded_pd_stage_admission_uses_local_epoch_and_keeps_bootstrap() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::sync::atomic::Ordering;
+
+        use crate::message::request::MmData;
+        use crate::multi_modality::{
+            decoded::{DecodedInput, DecodedStore},
+            worker::{MediaError, MmProcessOutput, MmProcessor},
+        };
+
+        struct StoreReader(DecodedStore);
+        impl MmProcessor for StoreReader {
+            fn process(&self, _: Vec<i64>, _: MmData) -> Result<MmProcessOutput, MediaError> {
+                unreachable!("this admission harness does not run model workers")
+            }
+            fn check_media(&self, mm: &MmData) -> Result<(), String> {
+                match &mm.decoded {
+                    Some(input) => self.0.check(input),
+                    None => Ok(()),
+                }
+            }
+            fn prepare_decoded(&self, input: &mut DecodedInput) -> Result<(), MediaError> {
+                self.0.snapshot(input)
+            }
+        }
+
+        const OBJECT: &str = "unique-object-0123456789abcdef";
+        for mode in [DisaggregationMode::Prefill, DisaggregationMode::Decode] {
+            let epoch = match mode {
+                DisaggregationMode::Prefill => "prefill-epoch",
+                DisaggregationMode::Decode => "decode-epoch",
+                DisaggregationMode::Null => unreachable!(),
+            };
+            let root = std::env::temp_dir().join(format!(
+                "sglang-grpc-pd-{}-{}",
+                epoch,
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir(&root).unwrap();
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let path = root.join(OBJECT);
+            std::fs::write(&path, [99u8, 1, 2, 3, 4, 5, 6]).unwrap();
+
+            let server_args = ServerArgs {
+                disaggregation_mode: mode,
+                ..test_server_args()
+            };
+            let harness = Harness::build(2, false, Duration::from_secs(1), true, None, server_args);
+            let epoch = harness.service.core.instance_id().to_owned();
+            assert!(harness.service.core.set_mm_processor(Arc::new(StoreReader(
+                DecodedStore::new(root.to_str().unwrap(), epoch.clone()).unwrap(),
+            ))));
+
+            let response = harness
+                .service
+                .generate(Request::new(decoded_rgb_request(&epoch, "pd-stage")))
+                .await
+                .unwrap();
+            assert_eq!(
+                response
+                    .metadata()
+                    .get("sglang-decoded-media-consumed")
+                    .map(|v| v.to_str().unwrap()),
+                Some("true")
+            );
+            let mut intake = harness.next_generation().await;
+            assert_eq!(
+                intake.request.bootstrap_host.as_deref(),
+                Some("prefill-host")
+            );
+            assert_eq!(intake.request.bootstrap_port, Some(31080));
+            assert_eq!(intake.request.bootstrap_room, Some(42));
+            assert_eq!(
+                intake.request.bootstrap_pair_key.as_deref(),
+                Some("pair-key")
+            );
+            assert!(intake.request.has_multimodal());
+            let decoded = intake
+                .request
+                .mm
+                .as_mut()
+                .unwrap()
+                .decoded
+                .as_mut()
+                .unwrap();
+            assert!(decoded.consumed.load(Ordering::Acquire));
+            std::fs::remove_file(&path).unwrap();
+            assert_eq!(decoded.take_images().unwrap()[0].rgb, [1, 2, 3, 4, 5, 6]);
+            assert!(intake.admission.try_accept());
+            drop(response);
+            let abort = tokio::time::timeout(Duration::from_secs(1), harness.abort_rx.recv_async())
+                .await
+                .expect("dropping the stage stream must route cancellation")
+                .unwrap();
+            assert_eq!(abort.rid(), &intake.rid);
+            assert_eq!(abort.rid().client_facing(), "pd-stage");
+
+            // Encoded media through the same disaggregated harness keeps
+            // bootstrap admission unchanged.
+            let mut encoded = decoded_rgb_request(&epoch, "pd-encoded");
+            encoded.decoded_media = None;
+            encoded.image_data = serde_json::from_str("\"data:image/png;base64,AQ==\"").unwrap();
+            let encoded_response = harness
+                .service
+                .generate(Request::new(encoded))
+                .await
+                .unwrap();
+            assert!(
+                encoded_response
+                    .metadata()
+                    .get("sglang-decoded-media-consumed")
+                    .is_none()
+            );
+            let encoded_intake = harness.next_generation().await;
+            assert_eq!(
+                encoded_intake.request.bootstrap_host.as_deref(),
+                Some("prefill-host")
+            );
+            assert_eq!(encoded_intake.request.bootstrap_port, Some(31080));
+            assert_eq!(encoded_intake.request.bootstrap_room, Some(42));
+            assert_eq!(
+                encoded_intake.request.bootstrap_pair_key.as_deref(),
+                Some("pair-key")
+            );
+            assert!(encoded_intake.request.has_multimodal());
+            assert!(
+                encoded_intake
+                    .request
+                    .mm
+                    .as_ref()
+                    .unwrap()
+                    .decoded
+                    .is_none()
+            );
+            drop(encoded_response);
+
+            let _ = std::fs::remove_dir_all(&root);
+        }
+
+        // Forwarding a Prefill epoch to Decode is INVALID_ARGUMENT before intake.
+        let d_root =
+            std::env::temp_dir().join(format!("sglang-grpc-pd-foreign-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&d_root).unwrap();
+        std::fs::set_permissions(&d_root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let decode_args = ServerArgs {
+            disaggregation_mode: DisaggregationMode::Decode,
+            ..test_server_args()
+        };
+        let decode = Harness::build(2, false, Duration::from_secs(1), true, None, decode_args);
+        assert!(decode.service.core.set_mm_processor(Arc::new(StoreReader(
+            DecodedStore::new(d_root.to_str().unwrap(), "decode-epoch".into()).unwrap(),
+        ))));
+        let error = decode
+            .service
+            .generate(Request::new(decoded_rgb_request(
+                "prefill-epoch",
+                "foreign-epoch",
+            )))
+            .await
+            .err()
+            .expect("a foreign stage reference must reject before intake");
+        assert_eq!(error.code(), Code::InvalidArgument);
+        assert!(error.message().contains("instance_id"));
+        assert!(decode.intake_rx.try_recv().is_err());
+        let _ = std::fs::remove_dir_all(&d_root);
     }
 
     #[tokio::test]

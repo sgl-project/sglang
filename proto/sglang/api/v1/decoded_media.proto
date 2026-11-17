@@ -55,11 +55,21 @@ message DecodedAudio {
   uint64 sample_frames = 4;
   MediaPayloadReference payload = 5;
 }
+// Prefill/decode stages each receive their own local object reference and the
+// receiving runtime's GetServerInfo.instance_id, with the same bootstrap pairing
+// as ordinary PD traffic. The caller publishes each stage's object locally;
+// this contract does not distribute files between stages. Do not blindly copy
+// one descriptor to both engines: a foreign instance is rejected before I/O.
+// Both stages run the existing native processor, including token expansion and
+// position computation, before the existing KV handoff; a prefill receipt alone
+// does not prepare decode's media or position state.
+//
 // gRPC Generate response initial metadata contains
 // `sglang-decoded-media-consumed: true` ONLY after all referenced bytes have
-// been copied into engine-owned storage. It is a read receipt, not scheduler
-// retirement. No metadata/error/cancel/timeout is NOT a receipt. A producer may
-// unlink after a receipt; it must never mutate or reuse a published name. An
-// unacknowledged object needs producer/supervisor cleanup, not Abort inference.
-// The engine never unlinks producer-owned objects. Both containers must mount
-// the same memory-backed volume. This is CPU input transport, not GPU IPC/RDMA.
+// been copied into engine-owned storage. It is a read receipt for that receiving
+// stage only, not scheduler retirement. No metadata/error/cancel/timeout is NOT
+// a receipt. A producer may unlink after every required reader has receipts; it
+// must never mutate or reuse a published name. An unacknowledged object needs
+// producer/supervisor cleanup, not Abort inference. The engine never unlinks
+// producer-owned objects. Both containers must mount the same memory-backed
+// volume. This is CPU input transport, not GPU IPC/RDMA.

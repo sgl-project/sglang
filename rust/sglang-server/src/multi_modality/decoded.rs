@@ -587,4 +587,77 @@ mod tests {
         mixed.image_data = serde_json::from_str("\"data:image/png;base64,AQ==\"").unwrap();
         assert!(into_requests(mixed, &GenerationPolicy::default()).is_err());
     }
+
+    fn descriptor_for(epoch: &str, object: &str) -> api::DecodedMediaInput {
+        let mut input = descriptor();
+        let region = input.images[0]
+            .payload
+            .as_mut()
+            .unwrap()
+            .mounted_shm
+            .as_mut()
+            .unwrap();
+        region.engine_instance_id = epoch.into();
+        region.object_id = object.into();
+        input
+    }
+
+    #[test]
+    fn decoded_pd_stages_keep_independent_epochs_leases_and_receipts() {
+        let p_root = Root::new();
+        let d_root = Root::new();
+        let p_object = "prefill-object-0123456789abcdef";
+        let d_object = "decode-object-0123456789abcdef";
+        std::fs::write(p_root.0.join(p_object), [99u8, 1, 2, 3, 4, 5, 6]).unwrap();
+        let mut p_store =
+            DecodedStore::new(p_root.0.to_str().unwrap(), "prefill-epoch".into()).unwrap();
+        let mut d_store =
+            DecodedStore::new(d_root.0.to_str().unwrap(), "decode-epoch".into()).unwrap();
+        p_store.permits = Arc::new(Semaphore::new(6));
+        d_store.permits = Arc::new(Semaphore::new(6));
+
+        // Forwarding a P descriptor to D fails before object I/O: no receipt
+        // and no lease against D's budget.
+        let mut foreign = DecodedInput::new(descriptor_for("prefill-epoch", p_object)).unwrap();
+        assert!(
+            matches!(d_store.snapshot(&mut foreign), Err(MediaError::Client(message))
+            if message.contains("instance_id"))
+        );
+        assert!(!foreign.consumed.load(Ordering::Acquire));
+        assert!(foreign.lease.is_none());
+        assert_eq!(d_store.permits.available_permits(), 6);
+        assert!(!d_root.0.join(p_object).exists());
+
+        let mut p_input = DecodedInput::new(descriptor_for("prefill-epoch", p_object)).unwrap();
+        let mut d_input = DecodedInput::new(descriptor_for("decode-epoch", d_object)).unwrap();
+        p_store.snapshot(&mut p_input).unwrap();
+        assert!(p_input.consumed.load(Ordering::Acquire));
+        assert!(!d_input.consumed.load(Ordering::Acquire));
+        assert_eq!(p_store.permits.available_permits(), 0);
+        assert_eq!(d_store.permits.available_permits(), 6);
+        std::fs::remove_file(p_root.0.join(p_object)).unwrap();
+        assert_eq!(p_input.bytes, [vec![1, 2, 3, 4, 5, 6]]);
+        assert_eq!(d_store.permits.available_permits(), 6);
+
+        std::fs::write(d_root.0.join(d_object), [99u8, 1, 2, 3, 4, 5, 6]).unwrap();
+        d_store.snapshot(&mut d_input).unwrap();
+        assert!(d_input.consumed.load(Ordering::Acquire));
+        assert_eq!(d_store.permits.available_permits(), 0);
+        std::fs::remove_file(d_root.0.join(d_object)).unwrap();
+        assert_eq!(d_input.take_images().unwrap()[0].rgb, [1, 2, 3, 4, 5, 6]);
+
+        // Cancelling/abandoning one stage releases only that stage's lease.
+        drop(p_input);
+        assert_eq!(p_store.permits.available_permits(), 6);
+        assert_eq!(d_store.permits.available_permits(), 0);
+        drop(d_input);
+        assert_eq!(d_store.permits.available_permits(), 6);
+
+        // A failed snapshot after epoch admission also returns the lease.
+        let mut missing = DecodedInput::new(descriptor_for("decode-epoch", d_object)).unwrap();
+        assert!(d_store.snapshot(&mut missing).is_err());
+        assert!(!missing.consumed.load(Ordering::Acquire));
+        assert!(missing.lease.is_none());
+        assert_eq!(d_store.permits.available_permits(), 6);
+    }
 }

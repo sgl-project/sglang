@@ -998,7 +998,7 @@ mod tests {
         stored.extend_from_slice(&[63; 13]);
         let object = format!("rgb-object-{}", uuid::Uuid::new_v4());
         let object_path = root.0.join(&object);
-        std::fs::write(&object_path, stored).unwrap();
+        std::fs::write(&object_path, &stored).unwrap();
 
         let processor = Arc::new(ImageMmProcessor {
             pipeline: sglang_processor::MmProcessor::from_spec(
@@ -1040,12 +1040,21 @@ mod tests {
         std::fs::remove_file(&object_path).unwrap();
 
         let ctx = MmContext::with_processor(processor, false);
-        let (actual_ids, actual_buffers) =
-            process(&ctx, NO_REQUEST, input_ids.clone(), mm).unwrap();
+        let (actual_ids, actual_buffers) = process(
+            &ctx,
+            MmRequestInfo {
+                rid: "prefill-rid",
+                runtime_rid: "prefill-runtime-rid",
+                bootstrap_room: Some(42),
+            },
+            input_ids.clone(),
+            mm,
+        )
+        .unwrap();
         let (expected_ids, expected_buffers) = process(
             &ctx,
             NO_REQUEST,
-            input_ids,
+            input_ids.clone(),
             MmData {
                 image_data: vec![MmItem::Source(encoded_path.to_str().unwrap().into())],
                 prefetched: vec![encoded.into()],
@@ -1093,6 +1102,80 @@ mod tests {
             .unwrap()
             .remove("hash");
         assert_eq!(actual_meta, expected_meta);
+
+        // Decode receives the same pixels through its own root, object name,
+        // runtime epoch and request identity. None may change expanded ids,
+        // feature identity/hash, item offsets, M-RoPE positions or delta.
+        let decode_root =
+            Root(std::env::temp_dir().join(format!("sglang-native-rgb-{}", uuid::Uuid::new_v4())));
+        std::fs::create_dir(&decode_root.0).unwrap();
+        std::fs::set_permissions(&decode_root.0, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let decode_object = format!("decode-object-{}", uuid::Uuid::new_v4());
+        let decode_path = decode_root.0.join(&decode_object);
+        std::fs::write(&decode_path, stored).unwrap();
+        let decode_processor = Arc::new(ImageMmProcessor {
+            pipeline: sglang_processor::MmProcessor::from_spec(
+                serde_json::from_value(case["spec"].clone()).unwrap(),
+            )
+            .unwrap(),
+            decoded: Some(
+                DecodedStore::new(decode_root.0.to_str().unwrap(), "decode-boot".into()).unwrap(),
+            ),
+        });
+        let mut decode_mm = MmData {
+            decoded: Some(Box::new(
+                DecodedInput::new(api::DecodedMediaInput {
+                    images: vec![api::DecodedImage {
+                        width: width as u32,
+                        height: height as u32,
+                        row_stride_bytes: (row + padding) as u64,
+                        pixel_format: "rgb8".into(),
+                        payload: Some(api::MediaPayloadReference {
+                            mounted_shm: Some(api::MountedSharedMemoryRegion {
+                                object_id: decode_object,
+                                offset_bytes: offset as u64,
+                                length_bytes: length as u64,
+                                engine_instance_id: "decode-boot".into(),
+                            }),
+                        }),
+                    }],
+                    ..Default::default()
+                })
+                .unwrap(),
+            )),
+            ..Default::default()
+        };
+        let decode_consumed = decode_mm.decoded.as_ref().unwrap().consumed.clone();
+        assert!(!decode_consumed.load(std::sync::atomic::Ordering::Acquire));
+        decode_processor
+            .prepare_decoded(decode_mm.decoded.as_mut().unwrap())
+            .unwrap();
+        assert!(decode_consumed.load(std::sync::atomic::Ordering::Acquire));
+        std::fs::remove_file(&decode_path).unwrap();
+        let (decode_ids, decode_buffers) = process(
+            &MmContext::with_processor(decode_processor, false),
+            MmRequestInfo {
+                rid: "decode-rid",
+                runtime_rid: "decode-runtime-rid",
+                bootstrap_room: Some(42),
+            },
+            input_ids,
+            decode_mm,
+        )
+        .unwrap();
+        assert_eq!(actual_ids, decode_ids);
+        assert_eq!(actual_buffers.len(), decode_buffers.len());
+        for (prefill, decode) in actual_buffers.iter().zip(&decode_buffers) {
+            assert_eq!(prefill.name, decode.name);
+            assert_eq!(prefill.shape, decode.shape);
+            let (BufferStore::Inline(prefill), BufferStore::Inline(decode)) =
+                (&prefill.store, &decode.store)
+            else {
+                panic!("expected single-rank inline buffers")
+            };
+            assert_eq!(prefill.dtype(), decode.dtype());
+            assert_eq!(prefill.as_bytes(), decode.as_bytes());
+        }
     }
 
     /// An external processor's result rides the same buffers: its tensor's

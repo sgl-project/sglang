@@ -304,11 +304,10 @@ class RustServer:
                     for name in ("nnodes", "tp_size", "dp_size", "pp_size")
                 )
                 or parallel.attn_dp_enabled
-                or get_disagg().disaggregation_mode != "null"
             ):
                 raise ValueError(
-                    "decoded RGB SHM currently requires unified single-node "
-                    "single-rank serving"
+                    "decoded RGB SHM currently requires single-node "
+                    "single-rank serving per engine"
                 )
         mm_spec = RustMmProcessor(
             server_args=scheduler.server_args,
