@@ -7,15 +7,18 @@ from unittest.mock import patch
 import torch
 
 from sglang.kernels.ops.attention.extend_attention import extend_attention_fwd
-from sglang.kernels.ops.attention.verify_mla import verify_shared_kv_fwd
+from sglang.kernels.ops.attention.verify_mla import (
+    verify_mla_draft_fwd,
+    verify_shared_kv_fwd,
+)
 from sglang.srt.layers.attention.triton_backend import (
     _should_use_verify_shared_kv,
 )
-from sglang.srt.utils import get_hip_version
+from sglang.srt.utils import get_hip_version, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=30, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=32, suite="stage-b-test-1-gpu-small-amd-mi35x")
 
 BF16_ATOL = 2e-2
 BF16_RTOL = 1e-2
@@ -31,6 +34,8 @@ def _build_inputs(
     v_head_dim,
     h_kv=1,
     cache_dtype=torch.bfloat16,
+    latent_values=False,
+    shuffle_cache=False,
 ):
     device = "cuda"
     dtype = torch.bfloat16
@@ -45,15 +50,28 @@ def _build_inputs(
 
     q = randn(num_extend_tokens, h_q, head_dim)
     k = randn(num_extend_tokens, h_kv, head_dim)
-    v = randn(num_extend_tokens, h_kv, v_head_dim)
-    k_buffer = randn(total_prefix, h_kv, head_dim).to(cache_dtype)
-    v_buffer = randn(total_prefix, h_kv, v_head_dim).to(cache_dtype)
+    v = (
+        k[..., :v_head_dim].contiguous()
+        if latent_values
+        else randn(num_extend_tokens, h_kv, v_head_dim)
+    )
+    cache_rows = total_prefix + 64 if shuffle_cache else total_prefix
+    k_buffer = randn(cache_rows, h_kv, head_dim).to(cache_dtype)
+    v_buffer = (
+        k_buffer[..., :v_head_dim]
+        if latent_values
+        else randn(cache_rows, h_kv, v_head_dim).to(cache_dtype)
+    )
     qo_indptr = torch.arange(
         0, num_extend_tokens + 1, l_ext, dtype=torch.int32, device=device
     )
     kv_indptr = torch.zeros(batch_size + 1, dtype=torch.int32, device=device)
     kv_indptr[1:] = torch.cumsum(prefix_lens_t, dim=0)
-    kv_indices = torch.arange(total_prefix, dtype=torch.int64, device=device)
+    kv_indices = (
+        torch.randperm(cache_rows, device=device, generator=generator)[:total_prefix]
+        if shuffle_cache
+        else torch.arange(total_prefix, dtype=torch.int64, device=device)
+    )
     return q, k, v, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices
 
 
@@ -341,6 +359,70 @@ class TestVerifySharedKV(CustomTestCase):
             return_value=False,
         ):
             self.assertFalse(_should_use_verify_shared_kv(qwen, 1, False, True))
+
+
+MLA = dict(h_q=12, h_kv=1, d=576, dv=512, l_ext=8, causal=True, mla=True)
+
+
+def _inputs(case, cache_dtype):
+    return _build_inputs(
+        prefix_lens=case["prefix_lens"],
+        l_ext=case["l_ext"],
+        h_q=case["h_q"],
+        head_dim=case["d"],
+        v_head_dim=case["dv"],
+        h_kv=case["h_kv"],
+        cache_dtype=cache_dtype,
+        latent_values=case["mla"],
+        shuffle_cache=True,
+    )
+
+
+def _scale(case):
+    # MLA scales by the 128 + 64 qk head of the target, not the latent width.
+    return (128 + 64) ** -0.5 if case["mla"] else case["d"] ** -0.5
+
+
+def _extend(case, inputs, kernel=extend_attention_fwd):
+    """The draft block's BF16-dot attention through kernel."""
+    q, k, v, k_buffer, v_buffer, qo_indptr, kv_indptr, kv_indices = inputs
+    out = torch.empty(*q.shape[:2], case["dv"], dtype=q.dtype, device="cuda")
+    extra = {"max_bs": len(kv_indptr) - 1} if kernel is verify_mla_draft_fwd else {}
+    ran = kernel(
+        q,
+        k,
+        v,
+        out,
+        k_buffer,
+        v_buffer,
+        qo_indptr,
+        kv_indptr,
+        kv_indices,
+        None,
+        case["causal"],
+        None,
+        case["l_ext"],
+        1.0,
+        1.0,
+        sm_scale=_scale(case),
+        sliding_window_size=case["window"],
+        bf16_dot=True,
+        **extra,
+    )
+    assert ran is True or kernel is extend_attention_fwd
+    return out
+
+
+@unittest.skipUnless(is_hip(), "ROCm DFLASH draft kernels")
+class TestDraftAttention(CustomTestCase):
+    def test_verify_matches_extend(self):
+        """The draft's verify kernel as DFLASH runs it: a 6-token block, a 1024-key
+        window and BF16 dots over an FP8 cache."""
+        case = dict(MLA, mla=False, prefix_lens=(600, 1024, 1100), l_ext=6, window=1024)
+        inputs = _inputs(case, torch.float8_e4m3fn)
+        actual = _extend(case, inputs, kernel=verify_mla_draft_fwd)
+        expected = _extend(case, inputs)
+        torch.testing.assert_close(actual, expected, atol=8e-2, rtol=2e-2)
 
 
 if __name__ == "__main__":
