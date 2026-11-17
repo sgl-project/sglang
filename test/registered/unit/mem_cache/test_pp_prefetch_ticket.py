@@ -15,6 +15,7 @@ import torch
 
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import HiCacheController, PrefetchAck
+from sglang.srt.managers.kv_hints import KvHintsEnvelope
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     CacheRequestOutcome,
@@ -26,6 +27,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
     PoolTransfer,
+    PoolTransferResult,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -37,6 +39,7 @@ from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.srt.mem_cache.utils import get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=19, suite="base-a-test-cpu")
 
@@ -115,7 +118,7 @@ class TestPrefetchAckSchema(unittest.TestCase):
         self.assertEqual(reduced[0], reduced[1])
 
 
-class TestPPPrefetchTicket(unittest.TestCase):
+class TestPPPrefetchTicket(CustomTestCase):
     def setUp(self):
         self.c = c = HybridCacheController.__new__(HybridCacheController)
         c.page_size = c.prefetch_threshold = 4
@@ -235,6 +238,55 @@ class TestPPPrefetchTicket(unittest.TestCase):
         while not self.c.prefetch_sync_queue.empty():
             acks.append(self.c.prefetch_sync_queue.get_nowait())
         return acks
+
+    def test_pp_follower_can_lookup_and_read_hinted_pages(self):
+        c = self.c
+        hint = KvHintsEnvelope(protocol_version="0.1", message_id="pp-hint")
+        key = RadixKey(array("q", range(8)), cache_salt="tenant")
+        keys = get_storage_hash_str(key, page_size=c.page_size)
+        bindings = dict(zip(keys, (42, 43), strict=True))
+
+        def is_bound(key, info):
+            fields = info.extra_info
+            return fields.get("kv_hints") == hint and (
+                fields.get("storage_key_to_event_hash", {}).get(key) == bindings[key]
+            )
+
+        def get_pages(keys, indices, info):
+            return [is_bound(key, info) for key in keys]
+
+        c._storage_hit_query = HybridCacheController._storage_hit_query.__get__(c)
+        c.page_get_func = c._page_get_zero_copy
+        c.storage_backend.batch_exists_v2.side_effect = lambda keys, pools, info: (
+            PoolTransferResult(sum(is_bound(key, info) for key in keys), {})
+        )
+        c.storage_backend.batch_get_v1.side_effect = get_pages
+        c.storage_backend.batch_get_v2.side_effect = lambda transfers, extra_info: {
+            transfer.name: get_pages(transfer.keys, transfer.host_indices, extra_info)
+            for transfer in transfers
+        }
+        c.submit_prefetch(
+            CacheRequestHandle("pp-hint", 0),
+            key,
+            None,
+            None,
+            [],
+            [PoolTransfer(name=PoolName.INDEXER, indices_from_pool=PoolName.KV)],
+            storage_read_metadata={
+                "kv_hints": hint,
+                "storage_key_to_event_hash": bindings,
+            },
+        )
+        ticket = pickle.loads(pickle.dumps(c.pp_prefetch_command_queue.get_nowait()))
+        c.pp_prefetch_states.clear()
+        c.storage_config.pp_rank = 1
+
+        self.run_commands(ticket)
+        acks = self.run_io(1)
+        self.assertEqual(
+            [ack.completed_tokens for ack in acks if ack.completed_tokens is not None],
+            [c.page_size, 2 * c.page_size],
+        )
 
     def test_stop_event_answers_tickets_as_misses_but_still_reduces(self):
         """A ticket delivered after the stop event is answered without a

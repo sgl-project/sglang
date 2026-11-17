@@ -30,6 +30,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.events import (
     KvEventLoraNames,
     enable_mm_routing_labels,
+    event_namespace_seed,
     mm_routing_spans,
 )
 from sglang.srt.mem_cache.evict_policy import StateCostStrategy
@@ -379,6 +380,13 @@ class _RustKVCacheEventRecorder:
             enable_mm_routing_labels()
         self._lora_names = lora_names
         self._dynamo_format = dynamo_format
+
+    def namespace_seed(
+        self, extra_key: Optional[str], cache_salt: Optional[str]
+    ) -> Optional[bytes]:
+        return event_namespace_seed(
+            extra_key, cache_salt, self._dynamo_format, self._lora_names
+        )
 
     def record_all_cleared(self) -> None:
         self._binding.record_all_cleared_event()
