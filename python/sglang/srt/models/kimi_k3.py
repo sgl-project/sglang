@@ -973,6 +973,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.mega_moe import (
             _configure_mega_moe_deep_gemm_num_sms,
+            _mega_moe_global_tokens_hint,
             _mega_moe_mma_type,
         )
 
@@ -1051,6 +1052,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 recipe=(1, 1, 32),
                 activation="situ",
                 fast_math=True,
+                global_num_tokens=_mega_moe_global_tokens_hint(buf),
             )
         y = y[:num_tokens]
         # fp8xfp4: the pre-dispatch routes rows past valid_token_count to -1 and

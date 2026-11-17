@@ -167,10 +167,10 @@ def padded_extend_real_tokens(
     mode = forward_batch.forward_mode
     if not mode.is_extend() or mode.is_target_verify():
         return None
-    if get_attn_backend().plans_padded_extend_rows:
-        return None
     real_num_tokens = forward_batch.global_num_token_non_padded_cpu
     if real_num_tokens is None or not 0 < real_num_tokens < num_tokens:
+        return None
+    if get_attn_backend().plans_padded_extend_rows:
         return None
     return real_num_tokens
 
