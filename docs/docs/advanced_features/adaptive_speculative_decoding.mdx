@@ -137,6 +137,20 @@ Example config:
 
 Non-integer keys (`ema_alpha`, `warmup_batches`, `update_interval`) are global overrides applied to every BS slot. Integer keys (`"1"`, `"8"`) define per-BS slots.
 
+## Memory budget for runtime states
+
+Every candidate step owns its own CUDA graphs and attention backends, so startup memory grows with the number of candidate steps. By default every candidate is built at startup. `--speculative-adaptive-memory-budget-gb` caps what the optional ones may take:
+
+- Some states are always built: the initial step (`--speculative-num-steps`) and the step each BS slot starts on, because the first batch routed to a slot activates that step without any acceptance feedback. These do not count against the budget.
+- The other candidate steps are built in priority order (nearest to a slot's starting step first) until the budget is spent. The cost of a state is only known after its graphs are captured, so the total can exceed the budget by one state.
+- Steps that were not built are removed from every slot's candidates for this launch; the policy never switches to them. The server log lists the dropped steps and the measured cost of each built state, so the budget can be tuned on the next launch.
+
+The cost of a state depends on the step count, on the batch sizes captured for it (`cuda_graph_bs_for_step` captures a step's graphs only for the batch sizes whose slot can reach it) and on the attention backend, and is known only after capture. Do not assume an ordering between steps; read the measured costs from the log.
+
+```bash
+--speculative-adaptive --speculative-adaptive-memory-budget-gb 4
+```
+
 ## Config file reference
 
 The config file is optional. When provided, each integer BS-slot key must specify `candidate_steps`; all other keys fall back to defaults.
@@ -241,13 +255,14 @@ The built-in default is conservative — safe for all draft models but may under
 
 ### Conservative (default) — for weak draft models
 
-This is the built-in default: BS 8–31 allows `[1, 3]`, and BS≥32 locks to `step=1` to avoid wasted compute. Best for models like MiniMax-M2.5, DSV4.
+This is the built-in default (`DEFAULT_ADAPTIVE_CONFIG`): BS 8–31 allows `[0, 1, 3]`, BS 32–63 allows `[0, 1]`, and BS≥64 locks to `step=0` (no drafting) to avoid wasted compute. Best for models like MiniMax-M2.5, DSV4.
 
 ```json
 {
-  "1":  {"candidate_steps": [1, 3, 7], "up_hysteresis": 0.0, "down_hysteresis": -0.25, "ceiling_coeff": 0},
-  "8":  {"candidate_steps": [1, 3],    "up_hysteresis": 0.0, "down_hysteresis": 0.0,   "ceiling_coeff": 0},
-  "32": {"candidate_steps": [1],       "up_hysteresis": 0.0, "down_hysteresis": 0.0,   "ceiling_coeff": 0}
+  "1":  {"candidate_steps": [1, 3, 5, 7], "up_hysteresis": 0.0, "down_hysteresis": -0.25, "ceiling_coeff": 0},
+  "8":  {"candidate_steps": [0, 1, 3],    "up_hysteresis": 0.0, "down_hysteresis": 0.0,   "ceiling_coeff": 0},
+  "32": {"candidate_steps": [0, 1],       "up_hysteresis": 0.0, "down_hysteresis": 0.0,   "ceiling_coeff": 0},
+  "64": {"candidate_steps": [0],          "up_hysteresis": 0.0, "down_hysteresis": 0.0,   "ceiling_coeff": 0}
 }
 ```
 
