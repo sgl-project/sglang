@@ -297,8 +297,6 @@ class TestNPUGLM5_3_W8A8_1P1D_32P_GPQA(TestNpuAccuracyMultiNodePdSepTestCaseBase
     """Test NPU accuracy for GLM-5.3-w8a8 PD separation 1p1d with DCP/PCP rotation on gpqa_diamond"""
 
     model_config = GLM_5_3_PD_SEP_MODEL_CONFIG
-    # Distinguishes the rotating DCP/PCP series in dumped accuracy metrics.
-    accuracy_variant = ACCURACY_VARIANT
     # Run evalscope only once (no retry on accuracy miss)
     max_retries = 1
     accuracy = 0.912

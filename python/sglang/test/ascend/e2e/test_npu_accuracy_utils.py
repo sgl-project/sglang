@@ -328,11 +328,6 @@ def assert_metrics(self, metrics):
             "type": "accuracy",
             "dataset": (self.datasets or ["unknown"])[0],
         }
-        # Cases that rotate between configurations (e.g. DCP/PCP) report the
-        # active variant so historical results stay in separate series.
-        variant = getattr(self, "accuracy_variant", None)
-        if variant:
-            labels["variant"] = variant
         dump_metric("accuracy", float(metrics["accuracy"]), labels=labels)
         dump_metric("accuracy_baseline", float(self.accuracy), labels=labels)
         self.assertGreaterEqual(
