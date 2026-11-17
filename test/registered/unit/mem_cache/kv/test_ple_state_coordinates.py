@@ -133,6 +133,7 @@ class TestPLEStateCoordinates(unittest.TestCase):
                         token_to_kv_pool=pool,
                         runner_ids=reader,
                         linear_attn_backend=backend,
+                        forward_state_slots=backend.forward_state_slots,
                     )
                 )
             ),
@@ -213,7 +214,8 @@ class TestPLEStateCoordinates(unittest.TestCase):
                     get_mamba_indices=lambda rows: mapping[rows],
                 )
                 reader = SimpleNamespace(
-                    state_ids=lambda _: SimpleNamespace(ids=lambda indices: indices)
+                    state_ids=lambda _: SimpleNamespace(ids=lambda indices: indices),
+                    request_ids=lambda: SimpleNamespace(ids=lambda rows: rows),
                 )
                 backend = AscendMambaAttnBackendBase(
                     SimpleNamespace(
@@ -257,6 +259,7 @@ class TestPLEStateCoordinates(unittest.TestCase):
                                 token_to_kv_pool=pool,
                                 runner_ids=reader,
                                 linear_attn_backend=backend,
+                                forward_state_slots=backend.forward_state_slots,
                             )
                         )
                     ),

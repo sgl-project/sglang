@@ -256,13 +256,13 @@ class MiniMaxH3PipelineConfig(PipelineConfig):
                     "pass --enable-torch-compile false"
                 )
         selected_backend = self.resolve_transformer_attention_backend(server_args)
-        if (
-            int(server_args.ring_degree or 1) > 1
-            and selected_backend is not AttentionBackendEnum.FA
+        if int(server_args.ring_degree or 1) > 1 and selected_backend not in (
+            AttentionBackendEnum.FA,
+            AttentionBackendEnum.AITER,
         ):
             raise ValueError(
-                "MiniMax-H3 ring parallelism requires the FlashAttention "
-                "backend for the transformer"
+                "MiniMax-H3 ring parallelism requires the FlashAttention or "
+                "aiter backend for the transformer"
             )
         if selected_backend is None:
             return
@@ -490,6 +490,8 @@ def register():
         model_detectors=[
             lambda model_id: (
                 "minimaxh3" in model_id.lower().replace("-", "").replace("_", "")
+                and "minimaxh3image"
+                not in model_id.lower().replace("-", "").replace("_", "")
                 and "vdn" not in model_id.lower()
             )
         ],

@@ -113,12 +113,6 @@ if HAS_RUNAI_MODEL_STREAMER:
 temp_dir = tempfile.gettempdir()
 
 
-class DisabledTqdm(tqdm):
-    def __init__(self, *args, **kwargs):
-        kwargs["disable"] = True
-        super().__init__(*args, **kwargs)
-
-
 def get_lock(model_name_or_path: str | Path, cache_dir: str | None = None):
     lock_dir = cache_dir or temp_dir
     model_name_or_path = str(model_name_or_path)
@@ -234,9 +228,6 @@ def safetensors_weights_iterator(
         device = str(checkpoint_device)
     else:
         device = "cpu" if to_cpu else str(get_local_torch_device())
-    # The caller may still pass the old boolean; map it onto a backend name so
-    # there is one place that decides, and it is the place that knows which
-    # backends can skip keys.
     requested = None
     if use_runai_model_streamer is not None:
         requested = (

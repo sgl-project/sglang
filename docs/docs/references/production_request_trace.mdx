@@ -32,8 +32,6 @@ This section explains how to configure the request tracing and export the trace 
     export SGLANG_OTLP_EXPORTER_MAX_EXPORT_BATCH_SIZE=64
     # start the prefill and decode server
     python -m sglang.launch_server --enable-trace --otlp-traces-endpoint 0.0.0.0:4317 <other option>
-    # start the model-gate-way
-    python -m sglang_router.launch_router --enable-trace --otlp-traces-endpoint 0.0.0.0:4317 <other option>
     ```
 
     Replace `0.0.0.0:4317` with the actual endpoint of the OpenTelemetry collector. If you launched the openTelemetry collector with tracing_compose.yaml, the default receiving port is 4317.

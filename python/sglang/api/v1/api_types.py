@@ -116,6 +116,8 @@ class ErrorBody(msgspec.Struct, kw_only=True, frozen=True):
 
     message: str = ""
     code: int = 0
+    type: Optional[str] = None
+    retryable: Optional[bool] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "ErrorBody":
@@ -784,6 +786,7 @@ class GetServerInfoResponse(msgspec.Struct, kw_only=True, frozen=True):
     allow_auto_truncate: bool = False
     skip_tokenizer_init: bool = False
     num_reserved_tokens: int = 0
+    instance_id: str = ""
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GetServerInfoResponse":
@@ -1157,6 +1160,10 @@ def decode_ErrorBody(value: Any) -> ErrorBody:
             kw["message"] = _expect_str(x, expected="a string")
         elif key == "code":
             kw["code"] = _expect_uint(x, expected="u32")
+        elif key == "type":
+            kw["type"] = None if x is None else _expect_str(x, expected="a string")
+        elif key == "retryable":
+            kw["retryable"] = None if x is None else _expect_bool(x, expected="a boolean")
     return ErrorBody(**kw)
 
 
@@ -1164,6 +1171,10 @@ def encode_ErrorBody(v: ErrorBody) -> Dict[str, Any]:
     d: Dict[str, Any] = {}
     d["message"] = v.message
     d["code"] = v.code
+    if v.type is not None:
+        d["type"] = v.type
+    if v.retryable is not None:
+        d["retryable"] = v.retryable
     return d
 
 
@@ -2469,6 +2480,8 @@ def decode_GetServerInfoResponse(value: Any) -> GetServerInfoResponse:
             kw["skip_tokenizer_init"] = _expect_bool(x, expected="a boolean")
         elif key == "num_reserved_tokens":
             kw["num_reserved_tokens"] = _expect_uint(x, expected="u64")
+        elif key == "instance_id":
+            kw["instance_id"] = _expect_str(x, expected="a string")
     return GetServerInfoResponse(**kw)
 
 
@@ -2492,6 +2505,7 @@ def encode_GetServerInfoResponse(v: GetServerInfoResponse) -> Dict[str, Any]:
     d["allow_auto_truncate"] = v.allow_auto_truncate
     d["skip_tokenizer_init"] = v.skip_tokenizer_init
     d["num_reserved_tokens"] = v.num_reserved_tokens
+    d["instance_id"] = v.instance_id
     return d
 
 
