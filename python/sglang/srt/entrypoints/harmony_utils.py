@@ -289,8 +289,8 @@ def get_streamable_parser_for_assistant() -> StreamableParser:
     return StreamableParser(get_encoding(), role=Role.ASSISTANT)
 
 
-# Narrow output recovery adapted from vLLM PR #59387, commit
-# 756ee24f369475638e4bb887828fa45333425864. Prompt rendering is unchanged.
+# Output-only recovery for malformed Harmony headers;
+# repairs duplicated header metadata and function calls missing <|message|>.
 def _harmony_token_id(text: str) -> int:
     return get_encoding().encode(text, allowed_special={text}, disallowed_special=())[0]
 
