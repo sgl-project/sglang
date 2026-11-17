@@ -115,6 +115,7 @@ from sglang.srt.utils import (
     is_cuda,
     is_flashinfer_available,
     is_gfx95_supported,
+    is_gfx942_supported,
     is_gfx1250_supported,
     is_hip,
     is_musa,
@@ -141,6 +142,7 @@ _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
 _is_xpu = is_xpu()
 _is_fp8_fnuz = is_fp8_fnuz()
+_is_gfx942_supported = is_gfx942_supported()
 _is_gfx95_supported = is_gfx95_supported()
 
 if _is_hip:
@@ -897,7 +899,7 @@ class Fp8LinearMethod(LinearMethodBase):
         if hasattr(layer, "_block_fp8_bf16_weight"):
             layer._block_fp8_bf16_weight = None
             layer._derived_weight_cache_error = None
-        if (
+        hopper_bf16_cache = (
             _is_cuda
             and get_platform().is_sm90
             and envs.SGLANG_OPT_HOPPER_BLOCK_FP8_BF16.get()
@@ -909,8 +911,16 @@ class Fp8LinearMethod(LinearMethodBase):
                     getattr(layer, "orig_dtype", None),
                 )
             )
-            and weight.is_cuda
             and weight.dtype == torch.float8_e4m3fn
+        )
+        gfx942_bf16_cache = (
+            _is_gfx942_supported
+            and envs.SGLANG_OPT_GFX942_BLOCK_FP8_BF16.get()
+            and weight.dtype == torch.float8_e4m3fnuz
+        )
+        if (
+            (hopper_bf16_cache or gfx942_bf16_cache)
+            and weight.is_cuda
             and self.weight_block_size == [32, 32]
             and getattr(self.quant_config, "scale_fmt", None) == "ue8m0"
             and getattr(layer, "orig_dtype", None) == torch.bfloat16
@@ -920,27 +930,32 @@ class Fp8LinearMethod(LinearMethodBase):
             from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
             from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 
-            # Keep even the smallest/largest finite E4M3 value representable
-            # as normal BF16, and reject mislabeled non-power-of-two scales.
+            # Keep every finite E4M3 value (down to 2^-9, or 2^-10 for FNUZ) a normal
+            # BF16 after scaling, and reject mislabeled non-power-of-two scales.
+            min_exact_scale = 2.0**-116 if gfx942_bf16_cache else 2.0**-117
             exact_bf16_scales = (
-                (weight_scale >= 2.0**-117)
+                (weight_scale >= min_exact_scale)
                 & (weight_scale <= 2.0**119)
                 & (torch.frexp(weight_scale)[0] == 0.5)
             ).all()
             if not is_batch_invariant_mode_enabled() and exact_bf16_scales.item():
-                # Hopper group32 FP8 accumulates each 32-wide block separately.
-                # Reuse a BF16 weight expansion for larger GEMMs, keeping the
-                # original FP8 weights for decode and weight reloads.
+                # Group32 FP8 GEMMs on Hopper and gfx942 are K-loop bound; reuse a BF16
+                # expansion, keeping the original FP8 weights for fallbacks and reloads.
                 layer.register_buffer(
                     "_block_fp8_bf16_weight",
                     block_quant_dequant(weight, weight_scale, [32, 32], torch.bfloat16),
                     persistent=False,
                 )
+                env_name = (
+                    "SGLANG_OPT_GFX942_BLOCK_FP8_BF16"
+                    if gfx942_bf16_cache
+                    else "SGLANG_OPT_HOPPER_BLOCK_FP8_BF16"
+                )
                 layer._derived_weight_cache_error = (
-                    "Online weight updates are not supported while Hopper FP8 "
+                    "Online weight updates are not supported while FP8 "
                     "BF16 weight caches are active: captured CUDA graphs retain "
-                    "these derived weights. Restart with "
-                    "SGLANG_OPT_HOPPER_BLOCK_FP8_BF16=0 to allow online updates."
+                    f"these derived weights. Restart with {env_name}=0 to allow "
+                    "online updates."
                 )
         if self.block_fp8_as_mxfp8:
             self._prepare_block_fp8_as_mxfp8(layer)

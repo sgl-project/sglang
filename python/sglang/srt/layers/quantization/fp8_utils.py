@@ -69,6 +69,7 @@ _is_hip = is_hip()
 _is_cuda = is_cuda()
 _is_xpu = is_xpu()
 _is_fp8_fnuz = is_fp8_fnuz()
+_is_gfx942_supported = is_gfx942_supported()
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
 _is_musa = is_musa()
@@ -2127,6 +2128,15 @@ def triton_w8a8_block_fp8_linear(
     act_scale_ue8m0: bool = False,
     weight_bf16: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if (
+        _is_gfx942_supported
+        and weight_bf16 is not None
+        and input_scale is None
+        and input.dtype == torch.bfloat16
+    ):
+        # gfx942 runs the cached BF16 weight on BF16 activations at every M, as
+        # the group32 activation quant only exists to feed the FP8 kernel.
+        return torch.nn.functional.linear(input, weight_bf16, bias)
     if input_scale is not None:
         # Pre-quantized input: ``input`` is already fp8 and ``input_scale`` is
         # its per-group scale (row-major (M, cdiv(K, 128))). Produced on HIP by
