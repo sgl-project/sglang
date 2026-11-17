@@ -3423,6 +3423,17 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
                 new_indices_cpu=keep_indices,
             )
 
+    def select_decode_rows(self, indices: List[int]) -> ScheduleBatch:
+        """Select retired rows, preserving their request pool and KV slots."""
+        selected = copy.copy(self)
+        selected.sampling_info = copy.copy(self.sampling_info)
+        selected.sampling_info.penalizer_orchestrator = (
+            self.sampling_info.penalizer_orchestrator.copy_for_filter(selected)
+        )
+        selected.filter_batch(keep_indices=indices)
+        selected.batch_is_full = False
+        return selected
+
     def merge_batch(self, other: ScheduleBatch):
         strip_beam_tail(self)
         strip_beam_tail(other)

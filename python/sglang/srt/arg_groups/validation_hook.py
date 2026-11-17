@@ -290,6 +290,31 @@ def check_server_args(server_args: Any):
     cfg = resolving_view(server_args)
 
     # Check parallel size constraints
+    if cfg.enable_pp_auto_balance:
+        if (
+            cfg.pp_size < 2
+            or cfg.disaggregation_mode != "null"
+            or cfg.enable_hisparse
+            or cfg.enable_lora
+            or cfg.speculative_algorithm is not None
+            or cfg.dllm_algorithm is not None
+        ):
+            raise ValueError(
+                "--enable-pp-auto-balance requires PP > 1 and colocated autoregressive "
+                "decoding without LoRA, HiSparse, or speculative decoding."
+            )
+        minimum = cfg.pp_auto_balance_min_micro_batch_size
+        if minimum < 1:
+            raise ValueError(
+                "--pp-auto-balance-min-micro-batch-size must be at least 1."
+            )
+        if (
+            cfg.pp_max_micro_batch_size is not None
+            and minimum > cfg.pp_max_micro_batch_size
+        ):
+            raise ValueError(
+                "--pp-auto-balance-min-micro-batch-size cannot exceed --pp-max-micro-batch-size."
+            )
     if cfg.ep_join_mode != "scale":
         assert (cfg.tp_size * cfg.pp_size) % cfg.nnodes == 0, (
             "tp_size must be divisible by number of nodes"

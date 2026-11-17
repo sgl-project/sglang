@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import abc
+import copy
 import weakref
 from typing import TYPE_CHECKING, Optional, Set, Type
 
@@ -41,6 +42,16 @@ class BatchedPenalizerOrchestrator:
 
     def reqs(self):
         return self.batch.reqs
+
+    def copy_for_filter(self, batch: ScheduleBatch) -> BatchedPenalizerOrchestrator:
+        # Keep accumulated penalties. Filtering rebinds the row tensors, so
+        # the owners must be distinct even when the original tensors are shared.
+        other = copy.copy(self)
+        other.batch = batch
+        other.penalizers = {kind: copy.copy(p) for kind, p in self.penalizers.items()}
+        for penalizer in other.penalizers.values():
+            penalizer._orchestrator_ref = weakref.ref(other)
+        return other
 
     def cumulate_output_tokens(self, output_ids: torch.Tensor):
         """

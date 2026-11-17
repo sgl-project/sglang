@@ -70,6 +70,13 @@ class Parallel(msgspec.Struct):
     pp_max_micro_batch_size: A[
         Optional[int], "The maximum micro batch size in pipeline parallelism."
     ] = None
+    enable_pp_auto_balance: A[
+        bool, "Redistribute active decode requests across pipeline microbatches."
+    ] = False
+    pp_auto_balance_min_micro_batch_size: A[
+        int,
+        "With --enable-pp-auto-balance, keep at least this many requests in each microbatch involved in a transfer.",
+    ] = 1
     pp_async_batch_depth: A[
         int,
         "The async batch depth of pipeline parallelism.",

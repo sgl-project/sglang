@@ -2813,6 +2813,7 @@ class Scheduler(
             get_running_batches=lambda: (
                 self.running_batch,
                 *(self.running_mbs if get_parallel().pp_size > 1 else ()),
+                *self._pp_incoming,
             ),
             get_pp_mbs=lambda: self.mbs if get_parallel().pp_size > 1 else (),
             # Hisparse pool counters diverge during host backup (see the
@@ -4355,6 +4356,11 @@ class Scheduler(
         if running_batch.batch_size() < running_bs:
             running_batch.batch_is_full = False
 
+        if self._pp_incoming:
+            running_batch = self._pp_balance_decode(
+                self._pp_balance_slot, running_batch
+            )
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch, staged)
         elif self._should_defer_prefill(running_batch):
@@ -4993,7 +4999,7 @@ class Scheduler(
     def _get_all_pp_reqs(self) -> List[Req]:
         return [
             req
-            for batch in (*self.running_mbs, *self.mbs)
+            for batch in (*self.running_mbs, *self.mbs, *self._pp_incoming)
             if batch is not None
             for req in batch.reqs
             if not req.finished()
@@ -6143,8 +6149,10 @@ class Scheduler(
     def _pp_microbatches_drained(self) -> bool:
         if get_parallel().pp_size == 1:
             return True
-        return all(x.is_empty() for x in self.running_mbs) and all(
-            mb is None or mb.is_empty() for mb in self.mbs
+        return (
+            all(x.is_empty() for x in self.running_mbs)
+            and all(mb is None or mb.is_empty() for mb in self.mbs)
+            and not any(self._pp_incoming)
         )
 
     def attach_hicache_storage_wrapped(
@@ -6476,7 +6484,7 @@ class Scheduler(
         if get_parallel().pp_size == 1:
             inflight_batches = [self.running_batch, self.last_batch]
         else:
-            inflight_batches = [*self.running_mbs, *self.mbs]
+            inflight_batches = [*self.running_mbs, *self.mbs, *self._pp_incoming]
         if self.enable_continuous_input_polling and self.result_queue:
             # Polling can run intake before the newest queued batch becomes last_batch.
             inflight_batches.extend(batch for batch, _ in self.result_queue)
