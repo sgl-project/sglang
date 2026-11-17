@@ -864,8 +864,13 @@ class FlashAttentionForwardSm100:
                 assert (
                     not self.use_tma_KV
                 ), "can't use TMA to load SFV if not interleaved in gmem"
+                # V scales follow V's transposed layout in PagedKVManager.
                 mSFV = cute.make_tensor(
-                    mSFV.iterator, cute.select(mSFV.layout, mode=KV_layout_transpose)
+                    mSFV.iterator,
+                    cute.select(
+                        cute.select(mSFV.layout, mode=KV_layout_transpose),
+                        mode=V_layout_transpose,
+                    ),
                 )
 
         # check type consistency
@@ -905,6 +910,12 @@ class FlashAttentionForwardSm100:
                     self.num_regs_other = (
                         512 - self.num_regs_softmax * 2 - self.num_regs_correction
                     )
+        if const_expr(
+            self.q_stage == 2
+            and self.o_dtype == Float32
+            and self.o_dtype.width > self.q_dtype.width
+        ):
+            self.overlap_sO_sQ = True
         self._setup_attributes()
         # Blockscaled SF TMEM offsets: the SFs for q_stage i live in the S
         # region of the OTHER stage (stage 0 SF -> col tmem_s_offset[1], stage 1
@@ -2815,6 +2826,7 @@ class FlashAttentionForwardSm100:
                         # ordering here.
                         if const_expr(not self.is_split_kv) or bias_max_idx0 >= 0:
                             cute.arch.griddepcontrol_wait()
+                            cute.arch.griddepcontrol_launch_dependents()
                         if issue_q_for_this_warp and (
                             const_expr(not self.is_split_kv) or bias_max_idx0 >= 0
                         ):

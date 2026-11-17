@@ -6,13 +6,17 @@ on:
         type: boolean
         default: true
       require-label:
-        description: "Opt-in tier label (run-ci-<tier>) the PR must carry besides run-ci (empty = disabled)"
+        description: "Opt-in tier label (run-ci-<tier>); without it the gate passes with opted-in=false (empty = disabled)"
         type: string
         default: ''
       cool-down-minutes:
         description: "Cooldown period in minutes for low-permission users; 0 disables rate limiting"
         type: number
         default: 120
+    outputs:
+      opted-in:
+        description: "'false' when the PR lacks require-label; callers skip their test jobs instead of failing"
+        value: ${{ jobs.pr-gate.outputs.opted-in }}
 
 jobs:
   pr-gate:
@@ -22,6 +26,8 @@ jobs:
     #    This job only reads PR metadata through the API and never checks out
     #    or executes PR code, so it is safe for pull_request_target callers.
     runs-on: ubuntu-latest
+    outputs:
+      opted-in: ${{ steps.opt-in.outputs.opted-in || 'true' }}
     env:
       IS_PR_EVENT: ${{ github.event_name == 'pull_request' || github.event_name == 'pull_request_target' }}
     steps:
@@ -73,19 +79,24 @@ jobs:
       # frozen event payload, which doesn't update on rerun, so
       # /tag-and-rerun-ci <tier> (slash handler adds the label then reruns)
       # could never un-skip. A runtime step on gh-api-fetched labels can.
-      # Slash-command tiers are registered in scripts/ci/opt_in_ci_tiers.json.
-      - name: Require opt-in tier label (optional)
+      # A missing label passes the gate with opted-in=false, so the caller's
+      # test jobs skip and the run stays green; the slash handler fully reruns
+      # green runs of a named tier. Tiers live in scripts/ci/opt_in_ci_tiers.json.
+      - name: Check opt-in tier label (optional)
+        id: opt-in
         if: env.IS_PR_EVENT == 'true' && inputs.require-label != ''
         env:
           REQUIRED_LABEL: ${{ inputs.require-label }}
         run: |
           if [[ "${{ contains(fromJson(steps.pr.outputs.labels), inputs.require-label) }}" == "false" ]]; then
-            echo "Missing required label '${REQUIRED_LABEL}' (in addition to 'run-ci'). Add the label to opt this PR into this workflow."
-            exit 1
+            echo "::notice::Not opted in: add '${REQUIRED_LABEL}' (or run /run-ci <hardware>) to run this workflow."
+            echo "opted-in=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "opted-in=true" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Enforce rate limit for low-permission actors (optional)
-        if: env.IS_PR_EVENT == 'true' && inputs.cool-down-minutes > 0
+        if: env.IS_PR_EVENT == 'true' && inputs.cool-down-minutes > 0 && steps.opt-in.outputs.opted-in != 'false'
         uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
