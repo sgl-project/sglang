@@ -169,6 +169,9 @@ def check_quantized_moe_compatibility(
             not envs.SGLANG_SHARED_EXPERT_TP1.get()
             and (moe_intermediate_size // moe_tp_size) % weight_block_size_n != 0
             and not _use_aiter
+            # Fp8MoEMethod refines such shards or rejects them at weight creation,
+            # before any weight is loaded; this check only runs after loading.
+            and quantization_config.get("quant_method") != "fp8"
             and not model_config.is_fp4_experts
         ):
             raise ValueError(

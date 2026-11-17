@@ -24,3 +24,13 @@ GEOMETRY_READY = Invariant("band.geometry_ready", Bucket.GUARD, IsTrue())
 # An allocator operation reads device state on the host only before its first
 # stream wait.
 HOST_READ_BEFORE_WAIT = Invariant("band.host_read_before_wait", Bucket.GUARD, IsTrue())
+# Under pipeline parallelism every stage makes the same capacity decisions and
+# holds the same units.
+STAGE_CAPACITY_AGREEMENT = Invariant(
+    "chain.stage_capacity_agreement", Bucket.FATAL_UNCONTAINABLE, IsTrue()
+)
+# A freed page is bound: freeing a virtual page twice, or one never allocated,
+# would return a tombstone to the free list.
+FREE_OF_BOUND_PAGE = Invariant(
+    "band.free_of_bound_page", Bucket.FATAL_UNCONTAINABLE, IsTrue()
+)

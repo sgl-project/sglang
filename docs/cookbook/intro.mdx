@@ -15,6 +15,10 @@ import { PopularModels } from "/src/snippets/_popular_models.jsx";
 
 ## Guides
 
+SGLang Diffusion covers image, video, audio, and action generation. Media and
+world-model recipes are in [Diffusion Models](/cookbook/diffusion/intro);
+dedicated robot action policies are in [VLA Models](/cookbook/vla/intro).
+
 <CardGroup cols={3}>
   <Card
     title="Autoregressive Models"
