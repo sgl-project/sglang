@@ -1141,7 +1141,7 @@ class TestUnifiedCacheLinkerPythonBackend(
                 self.assertEqual(value(consumed.linker_lookup_tokens), len(tokens))
                 self.assertEqual(value(consumed.linker_hit_tokens), len(tokens))
                 self.assertEqual(
-                    value(consumed.linker_load_tokens, mode="layer_wise"), len(tokens)
+                    value(consumed.linker_load_tokens, mode="layer_wise"), 0
                 )
                 # Restored tokens are reported as storage hits, not host hits.
                 self.assertTrue(req.host_hit_is_storage)
@@ -1153,6 +1153,10 @@ class TestUnifiedCacheLinkerPythonBackend(
                 )
                 aborted = consumer.finish_external_linker_loads([req])
                 self.assertEqual(aborted, [] if landed else [req])
+                self.assertEqual(
+                    value(consumed.linker_load_tokens, mode="layer_wise"),
+                    len(tokens) if landed else 0,
+                )
                 self.assertEqual(
                     len(consumed.observations(consumed.linker_finish_wait_seconds)), 1
                 )
@@ -2032,17 +2036,22 @@ def test_prefix_device_indices_includes_private_linker_tail(device_len, tail_len
 
 @pytest.mark.parametrize("landed", [True, False])
 @pytest.mark.parametrize("metrics_enabled", [True, False])
+@pytest.mark.parametrize("peer_landed", [True, False])
 def test_finish_loads_releases_private_index_references(
-    landed, metrics_enabled, caplog
+    landed, metrics_enabled, peer_landed, caplog
 ):
     """Completed batches release private indices and wait records even without metrics."""
     backend = _FakeLinker()
     backend.load_landed = landed
     backend.layer_done_counter = counter = LayerWiseLoadCounter(1)
     metrics = _RecordingRadixCacheMetrics() if metrics_enabled else None
+
+    def reduce_landed(value, op):
+        value.fill_(int(bool(value.item()) and peer_landed))
+
     wrapper = UnifiedCacheLinkerWrapper(
         _cache_for_wrapper(
-            _all_reduce_attn_groups=lambda value, op: None, metrics_collector=metrics
+            _all_reduce_attn_groups=reduce_landed, metrics_collector=metrics
         ),
         backend,
     )
@@ -2052,12 +2061,18 @@ def test_finish_loads_releases_private_index_references(
     # The forward recorded a blocked layer wait for this batch.
     counter.blocked_seconds[index] = 0.25
 
-    assert wrapper.finish_loads() == ([] if landed else ["rid"])
+    succeeded = landed and peer_landed
+    assert wrapper.finish_loads() == ([] if succeeded else ["rid"])
+    # Consuming an already completed batch must not count its tokens again.
+    assert wrapper.finish_loads() == []
     assert wrapper.private_load_indices == {}
     assert counter.blocked_seconds == {}
     if metrics is not None:
         assert metrics.observations(metrics.linker_forward_wait_seconds) == [0.25]
-    assert ("External linker load failed" in caplog.text) is (not landed)
+        assert metrics.value(metrics.linker_load_tokens, mode="layer_wise") == (
+            4 if succeeded else 0
+        )
+    assert ("External linker load failed" in caplog.text) is (not succeeded)
 
 
 @pytest.mark.parametrize("operation", ["reset", "close"])
@@ -2072,7 +2087,10 @@ def test_linker_lifecycle_releases_private_index_references(operation):
 
 def test_release_request_cancels_queued_load():
     linker = _FakeLinker()
-    wrapper = UnifiedCacheLinkerWrapper(_cache_for_wrapper(), linker)
+    metrics = _RecordingRadixCacheMetrics()
+    wrapper = UnifiedCacheLinkerWrapper(
+        _cache_for_wrapper(metrics_collector=metrics), linker
+    )
     wrapper.hit_markers["rid"] = object()
     wrapper.inflight_load_rids = ["rid"]
     linker.queued_loads["rid"] = [object()]
@@ -2084,6 +2102,8 @@ def test_release_request_cancels_queued_load():
     assert wrapper.inflight_load_rids == []
     assert "rid" not in linker.queued_loads
     assert wrapper.private_load_indices == {}
+    assert wrapper.finish_loads() == []
+    assert metrics.value(metrics.linker_load_tokens, mode="layer_wise") == 0
 
 
 def test_failed_offload_rolls_back_split_fragments():

@@ -756,10 +756,6 @@ class UnifiedCacheLinkerWrapper:
         self.inflight_load_rids.append(req.rid)
         # The tail comes from the external store, not a host tier.
         req.host_hit_is_storage = True
-        if self.metrics is not None:
-            self.metrics.increment_linker_load_tokens(
-                len(full_transfer.device_indices), "layer_wise"
-            )
         return len(full_transfer.device_indices), req.last_node
 
     def _update_load(
@@ -944,9 +940,14 @@ class UnifiedCacheLinkerWrapper:
         if self.metrics is not None:
             self.metrics.observe_linker_load_waits(forward_wait, finish_wait)
         self.cache._all_reduce_attn_groups(landed, torch.distributed.ReduceOp.MIN)
+        loaded_tokens = 0
         for rid in rids:
-            self.private_load_indices.pop(rid, None)
+            indices = self.private_load_indices.pop(rid, None)
+            if self.metrics is not None and indices is not None:
+                loaded_tokens += len(indices)
         if landed.item():
+            if self.metrics is not None:
+                self.metrics.increment_linker_load_tokens(loaded_tokens, "layer_wise")
             return []
         logger.error(
             "External linker load failed; aborting %d request(s): %s", len(rids), rids
