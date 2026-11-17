@@ -36,6 +36,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 _FP4_SF_VEC_SIZE = 16
+_MXFP8_SF_VEC_SIZE = 32
 _cutedsl_logged_scalarize: set = set()
 
 
@@ -305,8 +306,14 @@ def refresh_cutedsl_standard_scales_for_weight_update(
             current.copy_(new)
 
 
-def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
+def ensure_cutedsl_wrapper(
+    layer: torch.nn.Module, quant_mode: Optional[str] = None
+) -> None:
     """Lazily create CuteDslMoEWrapper and resolve scales on first forward.
+
+    ``quant_mode`` defaults to the NVFP4 modes; ``"mxfp8"`` serves MXFP8
+    experts (E4M3 weights with UE8M0 block-32 scales and MXFP8 activations),
+    whose block scales carry the whole dequantization, so no alphas apply.
 
     The wrapper is created lazily (not in __init__ / create_weights) because
     it depends on final weight shapes and EP configuration.  The wrapper's
@@ -328,7 +335,10 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             "Install with: pip install flashinfer"
         ) from e
 
-    quant_mode = "w4a16" if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get() else "w4a4"
+    if quant_mode is None:
+        quant_mode = (
+            "w4a16" if envs.SGLANG_FLASHINFER_CUTEDSL_NVFP4_W4A16.get() else "w4a4"
+        )
 
     assert layer.intermediate_size_per_partition > 0, (
         f"CuteDSL MoE: intermediate_size_per_partition must be > 0, "
@@ -396,11 +406,24 @@ def ensure_cutedsl_wrapper(layer: torch.nn.Module) -> None:
             **(dict(swiglu_limit=swiglu_limit) if swiglu_limit is not None else {}),
         )
 
-        w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
-            resolve_cutedsl_standard_scales(layer)
-        )
-        if layer.quant_config.use_per_token_activation and quant_mode == "w4a4":
-            used_input_scale = _make_per_token_global_scale(used_input_scale)
+        if quant_mode == "mxfp8":
+            ones = torch.ones(
+                layer.num_local_experts,
+                dtype=torch.float32,
+                device=layer.w13_weight.device,
+            )
+            w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
+                ones,
+                None,
+                ones,
+                None,
+            )
+        else:
+            w1_alpha, fc2_input_scale, w2_alpha, used_input_scale = (
+                resolve_cutedsl_standard_scales(layer)
+            )
+            if layer.quant_config.use_per_token_activation and quant_mode == "w4a4":
+                used_input_scale = _make_per_token_global_scale(used_input_scale)
     layer._cutedsl_scales = (w1_alpha, fc2_input_scale, w2_alpha)
     layer._cutedsl_input_scale = used_input_scale
 
@@ -505,6 +528,15 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         x_fp4 = hidden_states
         x_sf = None
         per_token_scale = None
+    elif quant_info.quant_mode == "mxfp8":
+        from flashinfer import mxfp8_quantize
+
+        seq_len, hidden_size = hidden_states.shape
+        x_fp4, x_sf = mxfp8_quantize(hidden_states, is_sf_swizzled_layout=False)
+        x_sf = x_sf.view(torch.uint8).reshape(
+            seq_len, hidden_size // _MXFP8_SF_VEC_SIZE
+        )
+        per_token_scale = None
     else:
         x_fp4, x_sf = fp4_quantize(
             hidden_states,
@@ -514,7 +546,7 @@ def fused_experts_none_to_flashinfer_cutedsl_fp4(
         )
         per_token_scale = None
 
-    if quant_info.quant_mode != "w4a16":
+    if quant_info.quant_mode in ("w4a4", "w4a8"):
         seq_len, hidden_size = hidden_states.shape
         x_fp4 = x_fp4.reshape(seq_len, hidden_size // 2)
         x_sf = x_sf.view(torch.float8_e4m3fn).reshape(

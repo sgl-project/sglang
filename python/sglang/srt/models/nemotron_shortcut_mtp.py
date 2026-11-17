@@ -92,6 +92,9 @@ class NemotronShortcutMTPLayer(nn.Module):
 
 
 class NemotronShortcutForCausalLMMTP(nn.Module):
+    # Matches the checkpoint's per-projection quantization ignore entries.
+    packed_modules_mapping = {"qkv_proj": ["q_proj", "k_proj", "v_proj"]}
+
     def __init__(
         self,
         *,

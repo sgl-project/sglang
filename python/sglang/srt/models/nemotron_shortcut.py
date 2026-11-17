@@ -353,7 +353,8 @@ class NemotronShortcutIndexer(nn.Module):
 
 def _check_clamped_relu2_backend() -> None:
     """The experts' soft-clamped squared ReLU runs on Marlin (W4A16), Triton (the
-    BF16 MTP experts) and FlashInfer's CuTe-DSL NVFP4 MoE (FlashInfer >= 0.7.4)."""
+    BF16 MTP experts) and FlashInfer's CuTe-DSL NVFP4 / MXFP8 MoE
+    (FlashInfer >= 0.7.4)."""
     backend = get_moe_runner_backend()
     if backend.is_marlin() or backend.is_triton():
         return
@@ -804,6 +805,15 @@ _STACKED_QKV = (
     ("qkv_proj", "v_proj", "v"),
 )
 
+# Experts stacked into one [num_experts, out, in] tensor per projection (the
+# MXFP8 checkpoint, and its BF16 MTP experts): FusedMoE param and shard.
+_FUSED_EXPERT_TENSORS = {
+    "up_proj": ("w13_weight", "w1"),
+    "up_proj_scale": ("w13_weight_scale_inv", "w1"),
+    "down_proj": ("w2_weight", "w2"),
+    "down_proj_scale": ("w2_weight_scale_inv", "w2"),
+}
+
 
 def nemotron_shortcut_expert_params_mapping(num_experts: int):
     # Non-gated experts: the checkpoint's up_proj is FusedMoE's w1.
@@ -829,6 +839,21 @@ def load_nemotron_shortcut_weight(
                 loaded.add(mapped)
                 return
     if ".moe.experts." in name:
+        module, _, tensor = name.rpartition(".moe.experts.")
+        if tensor in _FUSED_EXPERT_TENSORS:
+            param_suffix, shard_id = _FUSED_EXPERT_TENSORS[tensor]
+            mapped = f"{module}.moe.experts.{param_suffix}"
+            param = params_dict[mapped]
+            for expert_id in range(loaded_weight.shape[0]):
+                param.weight_loader(
+                    param,
+                    loaded_weight[expert_id],
+                    mapped,
+                    shard_id=shard_id,
+                    expert_id=expert_id,
+                )
+            loaded.add(mapped)
+            return
         for param_name, weight_name, expert_id, shard_id in expert_params_mapping:
             if weight_name in name:
                 mapped = name.replace(weight_name, param_name)

@@ -10,10 +10,14 @@ from sglang.test.test_utils import CustomTestCase, maybe_stub_sgl_kernel
 
 maybe_stub_sgl_kernel()
 
+from sglang.srt.layers.moe import MoeRunnerConfig  # noqa: E402
 from sglang.srt.layers.moe.moe_runner.flashinfer_cutedsl import (  # noqa: E402
     _cutedsl_wrapper_activation_type,
 )
 from sglang.srt.layers.moe.utils import MoeRunnerBackend  # noqa: E402
+from sglang.srt.layers.quantization.mxfp8_cutedsl_moe import (  # noqa: E402
+    Mxfp8CuteDslMoEMethod,
+)
 from sglang.srt.models.nemotron_shortcut import (  # noqa: E402
     _check_clamped_relu2_backend,
 )
@@ -60,6 +64,16 @@ class TestExpertActivation(CustomTestCase):
 
     def test_triton_serves_the_bf16_mtp_experts(self):
         _check_backend(MoeRunnerBackend.TRITON)
+
+
+class TestMxfp8CuteDsl(CustomTestCase):
+    def test_gated_experts_are_rejected(self):
+        # Gated experts would need w13 interleaved for the kernel; serving them
+        # as stored would silently pair the wrong rows.
+        method = Mxfp8CuteDslMoEMethod.__new__(Mxfp8CuteDslMoEMethod)
+        config = MoeRunnerConfig(activation="silu", is_gated=True)
+        with self.assertRaises(NotImplementedError):
+            method.create_moe_runner(SimpleNamespace(), config)
 
 
 if __name__ == "__main__":
