@@ -2428,7 +2428,7 @@ def _execute_server_warmup(server_args: ServerArgs):
     max_new_tokens = 8 if model_info["is_generation"] else 1
     json_data = {
         "sampling_params": {
-            "temperature": 0,
+            "temperature": 0.1,
             "max_new_tokens": max_new_tokens,
         },
     }
@@ -2469,7 +2469,7 @@ def _execute_server_warmup(server_args: ServerArgs):
             ],
             "max_tokens": max_new_tokens,
             "stream": False,
-            "temperature": 0.0,
+            "temperature": 0.1,
         }
     else:
         json_data["text"] = [
