@@ -22,6 +22,7 @@ from sglang.kernels.ops.speculative.dspark.dspark_accept import (
 )
 from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia.binding import megakernel_enabled
 from sglang.srt.kernel_plugins.nvidia.kimi_k31_dflash_binding import (
     bind_dflash_runtime,
 )
@@ -929,6 +930,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         """The fused selection (SM100), or None when it is off. Runs here: both models are loaded, and neither the
         KV cache sizing nor any graph capture has happened yet (it merges the head's weights)."""
         if self.selector is None or envs.SGLANG_DISABLE_DFLASH2_FUSED_SELECT.get():
+            return None
+        if megakernel_enabled():
+            # The megakernel was built on the target before this runs and may hold the head's
+            # weights, which the merge would move; it also brings its own draft selector head.
+            if self._target_tp_rank == 0:
+                logger.warning(
+                    "DFlash2 fused selection disabled: the NVIDIA megakernel serves DFLASH."
+                )
             return None
         target_model = self._target_worker.model_runner.model
         draft_config = self.draft_model.draft_config
