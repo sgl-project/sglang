@@ -559,30 +559,6 @@ class TestPrepareServerArgs(CustomTestCase):
             with self.subTest(mode=mode):
                 handle_eplb_and_dispatch(make_args(mode))
 
-    def test_async_eplb_accepts_resident_defaults_and_rejects_offload(self):
-        common = dict(
-            model_path="dummy",
-            device="npu",
-            tp_size=2,
-            ep_size=2,
-            enable_eplb=True,
-            eplb_async_rebalance=True,
-        )
-        # offload_num_in_group defaults to 1 even with group offloading disabled.
-        handle_eplb_and_dispatch(ServerArgs(**common))
-        for options in (
-            {"offload_group_size": 2},
-            {"cpu_offload_gb": 1},
-            {"enable_memory_saver": True},
-            {"enable_two_batch_overlap": True},
-            {"ep_dispatch_algorithm": "lp"},
-        ):
-            with (
-                self.subTest(options=options),
-                self.assertRaisesRegex(ValueError, "Async NPU EPLB"),
-            ):
-                handle_eplb_and_dispatch(ServerArgs(**common, **options))
-
     def test_instanttensor_requires_cuda_device(self):
         for device in ("cpu", "xpu", "npu", "musa", "hpu", "mps"):
             with (

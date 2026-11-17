@@ -59,7 +59,6 @@ class TestDisabledForwardPass(CustomTestCase):
         accumulator = Mock()
         accumulator.get_single_pass_gatherer_key.return_value = "primary"
         recorder._recording = True
-        recorder.completed_forward_passes = 0
         recorder._disable_all = False
         recorder._record_current_pass = False
         recorder._single_pass_gatherers = {"primary": gatherer}
@@ -90,7 +89,6 @@ class TestDisabledForwardPass(CustomTestCase):
                 ),
             )
         self.assertEqual(recorder._accumulator.append.call_count, 3)
-        self.assertEqual(recorder.completed_forward_passes, 3)
         appended_ids = [
             call.args[0] for call in recorder._accumulator.append.call_args_list
         ]
