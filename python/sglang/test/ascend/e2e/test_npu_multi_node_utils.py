@@ -1,3 +1,4 @@
+import hashlib
 import logging
 import os
 import re
@@ -35,15 +36,31 @@ ACTIVE_TEST_CLASS = "active-test-class"
 LOCAL_TIMEOUT = 3600
 ALL_ROLE_SET = {"prefill", "decode", "router", "master", "worker"}
 
-# Port numbers
-ASCEND_RT_VISIBLE_DEVICES = os.environ.get("ASCEND_RT_VISIBLE_DEVICES")
-SERVICE_PORT = (
-    6677
-    if not ASCEND_RT_VISIBLE_DEVICES
-    else 6677 + int(ASCEND_RT_VISIBLE_DEVICES.strip().split(",")[0])
-)
+# Port numbers. Multi-node pods use hostNetwork, so every port below must be
+# unique per job on the physical node. The service band avoids the single-node
+# test ports (20000-20799) and the PD store port (24666).
+PORT_RANGE_START = 21000
+PORT_RANGE_SIZE = 2048
+
+
+def _get_job_port_base():
+    # Pod names are <job>-<hash>-sglang-<role>-<index>; dropping the role/index
+    # suffix keeps the base identical for all pods of one job.
+    hostname = os.getenv("HOSTNAME", "")
+    job_id = re.sub(r"-sglang-[a-z]+-\d+$", "", hostname) or hostname or "local"
+    digest = hashlib.md5(f"{NAMESPACE or ''}/{job_id}".encode()).hexdigest()
+    return PORT_RANGE_START + int(digest[:6], 16) % PORT_RANGE_SIZE
+
+
+ASCEND_RT_VISIBLE_DEVICES = os.environ.get("ASCEND_RT_VISIBLE_DEVICES") or "0"
+DEVICE_PORT_OFFSET = int(ASCEND_RT_VISIBLE_DEVICES.split(",")[0])
+JOB_PORT_BASE = _get_job_port_base()
+SERVICE_PORT = JOB_PORT_BASE + DEVICE_PORT_OFFSET
 PREFILL_DECODE_PORT = 8000
 BOOTSTRAP_INIT_PORT = 8995
+
+# Router processes started in this pod, so tearDown can kill their process groups.
+_ROUTER_PROCESSES = []
 
 # Timeouts and delays
 ROUTER_CONFIGMAP_TIMEOUT = 300
@@ -795,8 +812,14 @@ def launch_router(model_config, router_binary):
     )
 
     logger.info(f"Starting router with command: {' '.join(router_command)}")
+    # Fail fast with a clear message instead of letting the router panic with
+    # "Address already in use" after a long wait.
+    ensure_port_available(SERVICE_PORT)
     try:
-        router_process = subprocess.Popen(router_command)
+        # A new session makes the router the leader of its own process group,
+        # so tearDown can take down the whole tree with os.killpg.
+        router_process = subprocess.Popen(router_command, start_new_session=True)
+        _ROUTER_PROCESSES.append(router_process)
         logger.info(f"Router process started with PID: {router_process.pid}")
     except Exception as e:
         raise RuntimeError(f"Failed to start router process: {e}")
@@ -874,6 +897,7 @@ class TestNpuMultiNodePdMixTestCaseBase(CustomTestCase):
 
     @classmethod
     def tearDownClass(cls):
+        stop_router_process()
         if cls.process:
             try:
                 kill_process_tree(cls.process.pid)
@@ -881,11 +905,16 @@ class TestNpuMultiNodePdMixTestCaseBase(CustomTestCase):
                 logger.error(f"Error during tearDown: {e}")
 
     @classmethod
+    def _launch_pd_mix_and_track(cls, model_config):
+        cls.process = launch_pd_mix_node(model_config)
+        logger.info(f"Pd mix node started with PID: {cls.process.pid}")
+
+    @classmethod
     @check_role(allowed_roles=["master"])
     def launch_pd_mix_master_node(cls):
         logger.info(f"Starting master node in thread...")
         cls.sglang_thread = threading.Thread(
-            target=launch_pd_mix_node, args=(cls.model_config,)
+            target=cls._launch_pd_mix_and_track, args=(cls.model_config,)
         )
         cls.sglang_thread.daemon = True
         cls.sglang_thread.start()
@@ -904,7 +933,7 @@ class TestNpuMultiNodePdMixTestCaseBase(CustomTestCase):
     def launch_pd_mix_worker_node(cls):
         logger.info(f"Starting master node in thread...")
         cls.sglang_thread = threading.Thread(
-            target=launch_pd_mix_node, args=(cls.model_config,)
+            target=cls._launch_pd_mix_and_track, args=(cls.model_config,)
         )
         cls.sglang_thread.daemon = True
         cls.sglang_thread.start()
@@ -971,19 +1000,19 @@ class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
         cls.port = SERVICE_PORT
         cls.base_url = f"http://{cls.host}:{cls.port}"
         cls.hostname = os.getenv("HOSTNAME")
-        cls.role = (
-            "router"
-            if "router" in cls.hostname
-            else "prefill"
-            if "prefill" in cls.hostname
-            else "decode"
-        )
+        if "router" in cls.hostname:
+            cls.role = "router"
+        elif "prefill" in cls.hostname:
+            cls.role = "prefill"
+        else:
+            cls.role = "decode"
         logger.info(f"Init {cls.host} {cls.role=}!")
         cls.sglang_thread = None
         cls.stop_event = threading.Event()
 
     @classmethod
     def tearDownClass(cls):
+        stop_router_process()
         if cls.process:
             try:
                 kill_process_tree(cls.process.pid)
@@ -1001,11 +1030,16 @@ class TestNpuMultiNodePdSepTestCaseBase(CustomTestCase):
         time.sleep(SERVER_INITIALIZATION_DELAY)
 
     @classmethod
+    def _launch_pd_sep_and_track(cls, model_config):
+        cls.process = launch_pd_separation_node(model_config)
+        logger.info(f"Pd separation node started with PID: {cls.process.pid}")
+
+    @classmethod
     @check_role(allowed_roles=["prefill", "decode"])
     def start_pd_server(cls):
         logger.info(f"Starting pd separation node in thread...")
         cls.sglang_thread = threading.Thread(
-            target=launch_pd_separation_node, args=(cls.model_config,)
+            target=cls._launch_pd_sep_and_track, args=(cls.model_config,)
         )
         cls.sglang_thread.daemon = True
         cls.sglang_thread.start()
@@ -1078,3 +1112,30 @@ def kill_process_group(process):
         logger.warning(f"no permission to kill process group pgid={process.pid}")
     except OSError as e:
         logger.warning(f"failed to kill process group pgid={process.pid}: {e}")
+
+
+def ensure_port_available(port):
+    """Raise if ``port`` is already bound on this node (hostNetwork pods)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        try:
+            sock.bind(("0.0.0.0", port))
+        except OSError as e:
+            raise RuntimeError(
+                f"Port {port} is already in use on this node "
+                f"(leftover process from a previous job?): {e}"
+            )
+
+
+def stop_router_process():
+    """Kill every router process group started in this pod."""
+    while _ROUTER_PROCESSES:
+        process = _ROUTER_PROCESSES.pop()
+        if process.poll() is not None:
+            continue
+        logger.info(f"Stopping router process group pgid={process.pid}")
+        kill_process_group(process)
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Router process pid={process.pid} ignored SIGKILL")

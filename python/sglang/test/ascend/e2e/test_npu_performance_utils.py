@@ -32,6 +32,7 @@ from sglang.test.ascend.e2e.test_npu_multi_node_utils import (
     launch_pd_separation_node,
     query_configmap,
     start_router_thread,
+    stop_router_process,
     wait_for_prefill_decode_exit,
     wait_server_ready,
 )
@@ -169,6 +170,9 @@ GLM_5_1_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.1-w
 GLM_5_2_W4A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.2-w4a8"
 GLM_5_2_W8A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.2-w8a8"
 GLM_5_3_W8A8_MODEL_PATH = "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.3-w8a8"
+GLM_5_3_FLASH_W8A8_MODEL_PATH = (
+    "/root/.cache/modelscope/hub/models/Eco-Tech/GLM-5.3-Flash-w8a8"
+)
 MINIMAX_M2_5_W8A8_MODEL_PATH = (
     "/root/.cache/modelscope/hub/models/Eco-Tech/MiniMax-M2.5-w8a8-QuaRot"
 )
@@ -1564,13 +1568,12 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
         cls.port = SERVICE_PORT
         cls.base_url = f"http://{cls.host}:{cls.port}"
         cls.hostname = os.getenv("HOSTNAME")
-        cls.role = (
-            "router"
-            if "router" in cls.hostname
-            else "prefill"
-            if "prefill" in cls.hostname
-            else "decode"
-        )
+        if "router" in cls.hostname:
+            cls.role = "router"
+        elif "prefill" in cls.hostname:
+            cls.role = "prefill"
+        else:
+            cls.role = "decode"
         logger.info(f"Init {cls.host} {cls.role=}!")
 
         cls.start_pd_server()
@@ -1579,6 +1582,7 @@ class TestNpuPerfMultiNodePdSepTestCaseBase(CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         logger.info("Start exec tearDownClass")
+        stop_router_process()
         if cls.process:
             try:
                 kill_process_tree(cls.process.pid)
