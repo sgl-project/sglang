@@ -977,6 +977,7 @@ def maybe_download_model(
     force_diffusers_model: bool = False,
     revision: str | None = None,
     skip_overlay_resolution: bool = False,
+    model_subfolder: str | None = None,
 ) -> str:
     """
     Check if the model path is a Hugging Face Hub model ID and download it if needed.
@@ -988,6 +989,8 @@ def maybe_download_model(
         is_lora: If True, skip model completeness verification (LoRA models don't have transformer/vae directories)
         force_diffusers_model: If True, apply diffusers model check. Otherwise it should be a component model
         revision: Specific Hugging Face Hub revision to resolve
+        model_subfolder: Pipeline subfolder whose metadata and local component weights
+            must be cached. The returned path remains the repository snapshot root.
     Returns:
         Local path to the model
     """
@@ -1073,6 +1076,19 @@ def maybe_download_model(
             for path in required_files
             if not os.path.isfile(os.path.join(local_path, path))
         ]
+        pipeline_path = (
+            os.path.join(local_path, model_subfolder)
+            if model_subfolder is not None
+            else local_path
+        )
+        if model_subfolder is not None:
+            if not os.path.isfile(_local_model_index_path(pipeline_path)):
+                missing_required_files.append(f"{model_subfolder}/model_index.json")
+            else:
+                missing_required_files.extend(
+                    f"{model_subfolder}/{path}"
+                    for path in _get_missing_declared_weight_components(pipeline_path)
+                )
         if missing_required_files:
             if not download:
                 raise ValueError(
@@ -1090,7 +1106,7 @@ def maybe_download_model(
             # maybe_download_model_index's model_index.json fetch materializes a full
             # cache entry, so this resolve reports that stub as a hit; returning it
             # would skip the download. LoRA repos declare no components.
-            if not is_lora and _is_metadata_only_pipeline_snapshot(local_path):
+            if not is_lora and _is_metadata_only_pipeline_snapshot(pipeline_path):
                 if not download:
                     raise ValueError(
                         f"Model {model_name_or_path} found in cache but only contains "
