@@ -16,6 +16,7 @@
     "out_skip_names": [
      "embedding",
      "output_ids",
+     "prompt_token_ids",
      "text"
     ],
     "json": false,
@@ -177,6 +178,7 @@
     "out_skip_names": [
      "embedding",
      "output_ids",
+     "prompt_token_ids",
      "text"
     ],
     "json": false,
@@ -639,6 +641,7 @@
     "out_skip_names": [
      "embedding",
      "output_ids",
+     "prompt_token_ids",
      "text"
     ],
     "json": true,
@@ -800,6 +803,7 @@
     "out_skip_names": [
      "embedding",
      "output_ids",
+     "prompt_token_ids",
      "text"
     ],
     "json": true,
