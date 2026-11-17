@@ -197,8 +197,8 @@ def _lazy_path(
     return _getter
 
 
-# The begin-* and end* here are used by the documentation generator
-# to extract the used env vars.
+# Diffusion env vars are declared in this dict and read lazily as attributes
+# of this module (e.g. envs.SGLANG_DIFFUSION_IPC_A2A).
 
 # begin-env-vars-definition
 
@@ -409,6 +409,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE": _lazy_bool(
         "SGLANG_DIFFUSION_DISABLE_LORA_MERGE_CACHE"
     ),
+    # ================== Ulysses / IPC all-to-all ==================
     # CUDA-IPC transport for 2-rank Ulysses all-to-all (NVLink same-node)
     "SGLANG_DIFFUSION_IPC_A2A": _lazy_bool("SGLANG_DIFFUSION_IPC_A2A", "true"),
     "SGLANG_DIFFUSION_IPC_A2A_MULTI": _lazy_bool(
@@ -483,13 +484,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "SGLANG_LINGBOT_LAZY_VAE_ENCODE_BLACK_FRAMES"
     ),
     # FlashInfer FP4 GEMM backend override for diffusion NVFP4.
-    # When unset, diffusion ModelOpt NVFP4 defaults to flashinfer_trtllm.
-    # Supported values:
-    # - auto
-    # - flashinfer_cudnn
-    # - flashinfer_cutlass
-    # - flashinfer_trtllm
-    # Legacy aliases `cudnn` and `trtllm` are also accepted.
+    # When unset: trtllm (auto on SM120).
+    # Values: auto, cudnn|flashinfer_cudnn, cutlass|flashinfer_cutlass,
+    # trtllm|flashinfer_trtllm.
     "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND": _lazy_str(
         "SGLANG_DIFFUSION_FLASHINFER_FP4_GEMM_BACKEND"
     ),
