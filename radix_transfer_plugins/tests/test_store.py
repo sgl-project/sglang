@@ -367,6 +367,25 @@ def test_a_read_buffer_registers_once_for_every_read_until_closed():
         store.read_buffer(0)
 
 
+def test_a_read_slot_registers_again_only_when_a_read_needs_more_memory():
+    backend = MemoryBackend()
+    slot = OutputStore(backend=backend).read_slot()
+    first = slot.reserve(64)
+    assert slot.reserve(64) is first and slot.reserve(16) is first
+    assert backend.registrations == 1
+
+    larger = slot.reserve(65)
+    assert larger is not first and larger.nbytes == 65 and first.closed
+    assert [m is larger.view for m in backend.registered] == [True]
+    assert backend.registrations == 2
+
+    slot.close()
+    slot.close()
+    assert larger.closed and backend.registered == []
+    again = slot.reserve(8)
+    assert again is not larger and not again.closed and backend.registrations == 3
+
+
 def test_read_ranges_check_every_range_before_reading():
     backend = MemoryBackend()
     store = OutputStore(backend=backend)
