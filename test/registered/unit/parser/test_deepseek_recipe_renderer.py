@@ -267,6 +267,37 @@ class TestDeepSeekRecipe(CustomTestCase):
                 }
             )
 
+    def test_message_tools_render_none_fields_as_absent(self):
+        """A message-declared tool's None fields, its type among them, render as if
+        absent, as the request's tools do; a null inside its schema stays."""
+
+        def encode(role, tool):
+            return self.deepseek_recipe.encode(
+                {
+                    "messages": [
+                        {"role": role, "content": "s", "tools": [tool]},
+                        {"role": "user", "content": "x"},
+                    ],
+                    "thinking": False,
+                    "tool_choice": "auto",
+                }
+            )
+
+        schema = {"type": "object", "properties": {"x": {"default": None}}}
+        nulls = {"description": None, "strict": None, "parameters": None}
+        for role in ("system", "developer"):
+            for function in ({"name": "f"}, {"name": "f", "parameters": schema}):
+                with self.subTest(role=role, schema="parameters" in function):
+                    declared = encode(
+                        role, {"type": None, "function": nulls | function}
+                    )
+                    self.assertEqual(declared, encode(role, {"function": function}))
+                    self.assertEqual(
+                        '"default": null'
+                        in self.tokenizer.decode(declared, skip_special_tokens=False),
+                        "parameters" in function,
+                    )
+
     def test_conversion_errors_locate_the_request_message(self):
         """An error names the message's index in the request, whatever number of
         earlier messages declare tools."""

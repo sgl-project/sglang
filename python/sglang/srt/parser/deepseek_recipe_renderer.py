@@ -306,10 +306,16 @@ class DeepSeekRecipe:
                     "DeepSeek-V4 cannot render tools declared in messages; declare "
                     "them in the request's tools"
                 )
-            # Conversion validates and normalizes the declared tools; recipe requires
-            # the type that SGLang defaults and the wire dump omits.
+            # Conversion validates and normalizes the declared tools; like the
+            # request's tools, they drop None fields and take the type recipe requires.
             normalized["tools"] = normalized.get("tools", []) + [
-                {"type": "function", **tool}
+                {"type": "function"}
+                | {k: v for k, v in tool.items() if v is not None}
+                | {
+                    "function": {
+                        k: v for k, v in tool["function"].items() if v is not None
+                    }
+                }
                 for _, _, tools in declarations
                 for tool in tools
             ]
