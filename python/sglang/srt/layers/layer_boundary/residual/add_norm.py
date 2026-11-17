@@ -20,6 +20,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.distributed.parallel_state import get_tp_group
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.flashinfer_comm_fusion import (
     is_flashinfer_allreduce_unavailable,
@@ -170,15 +171,24 @@ def aiter_ar_fusion_enabled_for(forward_mode: ForwardMode) -> bool:
     return not comm.disable_aiter_allreduce_fusion_in_decode
 
 
+def _aiter_ar_fusion_max_bytes() -> int:
+    # Aiter's should_custom_ar uses <= max_size/2 (64 MB); FlyDSL QuickReduce
+    # fuses up to its own workspace.
+    limit = 8 * 1024 * 8192
+    qr_comm = get_tp_group().qr_comm
+    if qr_comm is not None and not qr_comm.disabled:
+        limit = max(limit, getattr(qr_comm, "fused_rmsnorm_max_size", lambda: 0)())
+    return limit
+
+
 def aiter_ar_fusion_applies(input_tensor: torch.Tensor, forward_batch: ForwardBatch):
     n = input_tensor.shape[-1]
     total_bytes = input_tensor.numel() * input_tensor.element_size()
-    # Aiter's should_custom_ar uses <= max_size/2 (64 MB); match that boundary.
     return (
         _use_aiter
         and total_bytes > 0
         and n <= 16384
-        and total_bytes <= 8 * 1024 * 8192
+        and total_bytes <= _aiter_ar_fusion_max_bytes()
         and get_parallel().tp_size != 6
         and not is_dp_attention_enabled()
         and aiter_ar_fusion_enabled_for(forward_batch.forward_mode)
