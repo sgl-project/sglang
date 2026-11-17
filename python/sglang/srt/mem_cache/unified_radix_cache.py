@@ -136,6 +136,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.session.streaming_session import StreamingSession, is_virtual_node
 from sglang.srt.utils.common import ceil_align
 from sglang.srt.utils.device import get_device_module
+from sglang.srt.utils.log_utils import print_info_once
 from sglang.srt.utils.poll_timer import PollTimer
 
 if TYPE_CHECKING:
@@ -511,6 +512,8 @@ class UnifiedRadixCache(BasePrefixCache):
         # Reset Controller.
         self.session.slots.clear()
         self.ongoing_write_through: dict[int, _OngoingWriteThrough] = {}
+        # Write acks processed before their copies landed, for the duration metric.
+        self._unlanded_write_acks: list[HiCacheAck] = []
         self.ongoing_load_back: dict[
             int, _OngoingLoadBack | list[_OngoingLoadBack]
         ] = {}
@@ -1347,13 +1350,58 @@ class UnifiedRadixCache(BasePrefixCache):
     def _demote_backed_up(
         self, node_ids: list[NodeId], tracker: dict[ComponentType, int]
     ) -> None:
-        """Wait once for the queued copies, then demote the nodes in order."""
+        """Wait once for the queued copies, on the host or (ordered demotion) on
+        the GPU, then demote the nodes in order."""
         if not node_ids:
             return
-        self.writing_check(write_back=True)
+        if self._write_back_demote_ordered():
+            self._order_write_backs_before_reuse()
+        else:
+            self.writing_check(write_back=True)
         for node_id in node_ids:
             self._demote(node_id, tracker)
         node_ids.clear()
+
+    def _write_back_demote_ordered(self) -> bool:
+        cc = self.cache_controller
+        # A storage backend reads host copies on the host, and a unified pool's row
+        # moves are not ordered behind the copies: both keep the host wait.
+        return (
+            envs.SGLANG_OPT_HICACHE_WRITE_BACK_ORDERED_DEMOTE.get()
+            and cc is not None
+            and not cc.enable_storage
+            and cc.kv_storage is None
+        )
+
+    def _order_write_backs_before_reuse(self) -> None:
+        """writing_check(write_back=True) with the host wait replaced by waits on the
+        streams that can next write a freed page or read its host copy."""
+        cc = self.cache_controller
+        cc.start_writing()
+        if cc.ack_write_queue:
+            # The copies run in order on the engine's device-to-host stream.
+            landed = cc.ack_write_queue[-1].finish_event
+            streams = [device_module.current_stream()]
+            for stream in (
+                cc.write_fence_stream,
+                cc.load_fence_stream,
+                cc.l2_transfer_engine.host_to_device_stream,
+            ):
+                if stream is not None and stream not in streams:
+                    streams.append(stream)
+            for stream in streams:
+                stream.wait_event(landed)
+        for ack in cc.ack_write_queue:
+            for ack_id in ack.node_ids:
+                if ack_id in self.ongoing_write_through:
+                    self._finish_write_through_ack(ack_id)
+            self._log_write_ack_metrics(ack, landed=False)
+        cc.ack_write_queue.clear()
+        assert len(self.ongoing_write_through) == 0
+        print_info_once(
+            "HiCache write-back demotion ordered on the GPU, no host wait "
+            "(SGLANG_OPT_HICACHE_WRITE_BACK_ORDERED_DEMOTE)"
+        )
 
     def _evict_by_joint_lru(
         self,
@@ -4323,8 +4371,9 @@ class UnifiedRadixCache(BasePrefixCache):
             self._log_write_ack_metrics(ack)
             finish_count -= 1
 
-    def _log_write_ack_metrics(self, ack: HiCacheAck) -> None:
-        """Record D->H backup volume and duration for a completed write ack."""
+    def _log_write_ack_metrics(self, ack: HiCacheAck, landed: bool = True) -> None:
+        """Record D->H backup volume and duration for a write ack; the duration
+        of a copy not yet ``landed`` is recorded at a later ack once it has."""
         if self.metrics_collector is None:
             return
         for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
@@ -4334,8 +4383,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 )
         if ack.num_bytes > 0:
             self.metrics_collector.increment_backup_num_bytes(ack.num_bytes)
-        if ack.timing_enabled:
+        if ack.timing_enabled and not landed:
+            self._unlanded_write_acks.append(ack)
+        elif ack.timing_enabled:
             duration_ms = ack.start_event.elapsed_time(ack.finish_event)
+            self.metrics_collector.observe_backup_duration(duration_ms / 1000.0)
+        pending = self._unlanded_write_acks
+        while pending and pending[0].finish_event.query():
+            done = pending.pop(0)
+            duration_ms = done.start_event.elapsed_time(done.finish_event)
             self.metrics_collector.observe_backup_duration(duration_ms / 1000.0)
 
     def loading_check(self, finish_count: Optional[int] = None) -> None:

@@ -8,10 +8,13 @@ that wait, host room made per victim, and the load-back chain check.
 
 import unittest
 from array import array
+from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest import mock
 
 from sglang.srt.disaggregation.kv_events import BlockRemoved, BlockStored, StorageMedium
+from sglang.srt.environ import envs
+from sglang.srt.mem_cache import unified_radix_cache
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, InsertParams
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -48,9 +51,9 @@ class _FencedController(InstantWriteBackController):
     """Submits D->H copies through the controller's own start_writing, so a
     copy goes behind its write fence, onto streams and events that log what
     happens: ("fence",) when the D->H stream waits on the forward stream,
-    ("submit", n) for the n-th submission and ("sync", n) when its finish
-    event is waited on. ``submitted[n]`` maps each pool to the device pages
-    submission n reads."""
+    ("submit", n) for the n-th submission, ("sync", n) when its finish
+    event is waited on and ("wait", stream, n) when a stream waits on it.
+    ``submitted[n]`` maps each pool to the device pages submission n reads."""
 
     start_writing = HybridCacheController.start_writing
     _l2_transfers = HybridCacheController._l2_transfers
@@ -61,8 +64,9 @@ class _FencedController(InstantWriteBackController):
         self.log = []
         self.submitted = []
         self._pool_names = pool_names
-        forward = SimpleNamespace()
-        self.write_fence_stream = forward
+        forward = self._stream("forward")
+        self.write_fence_stream = self.load_fence_stream = forward
+        self.schedule_stream = self._stream("schedule")
 
         def wait_stream(stream):
             assert stream is forward
@@ -71,7 +75,14 @@ class _FencedController(InstantWriteBackController):
         self.l2_transfer_engine = SimpleNamespace(
             batch_direct=False,
             device_to_host_stream=SimpleNamespace(wait_stream=wait_stream),
+            host_to_device_stream=self._stream("load"),
             submit_device_to_host=self._submit,
+        )
+
+    def _stream(self, name):
+        return SimpleNamespace(
+            name=name,
+            wait_event=lambda event: self.log.append(("wait", name, event.n)),
         )
 
     def _move_write_operation(self, op):
@@ -91,7 +102,7 @@ class _FencedController(InstantWriteBackController):
         self.submitted.append(pages)
         self.log.append(("submit", n))
         finish = SimpleNamespace(
-            synchronize=lambda: self.log.append(("sync", n)), query=lambda: True
+            n=n, synchronize=lambda: self.log.append(("sync", n)), query=lambda: True
         )
         return SimpleNamespace(
             start_event=None, finish_event=finish, timing_enabled=False
@@ -137,6 +148,21 @@ class _FencedController(InstantWriteBackController):
                 for n, read in enumerate(self.submitted):
                     if pages & read.get(pool, set()):
                         test.assertIn(n, synced, f"freed {pool} pages copy {n} reads")
+
+    def ordered_demotion(self, enabled=True):
+        """The ordered-demotion switch, with the cache's current stream logged."""
+        stack = ExitStack()
+        stack.enter_context(
+            envs.SGLANG_OPT_HICACHE_WRITE_BACK_ORDERED_DEMOTE.override(enabled)
+        )
+        stack.enter_context(
+            mock.patch.object(
+                unified_radix_cache,
+                "device_module",
+                SimpleNamespace(current_stream=lambda: self.schedule_stream),
+            )
+        )
+        return stack
 
 
 class _WriteBackBatchingSuite:
@@ -236,6 +262,34 @@ class _WriteBackBatchingSuite:
         self.assertTrue(any(event[0] == "free" for event in cc.log))
         cc.assert_copies_behind_the_fence(self)
         cache.sanity_check()
+
+    def test_ordered_demotion_keeps_the_host_wait_for_storage_or_a_unified_pool(self):
+        """A storage backend reads host copies on the host, and a unified pool's
+        row moves are not ordered behind the copies: both take the blocking
+        path, as with the switch off."""
+        for case, attr, value in (
+            ("switch off", None, None),
+            ("storage backend", "enable_storage", True),
+            ("unified pool", "kv_storage", mock.Mock()),
+        ):
+            with self.subTest(case):
+                cache, allocator, host_pool = self._fill_host_with_one_batch()
+                for seq in batch_seqs(1):
+                    insert_seq(cache, allocator, seq)
+                cc = _FencedController(cache.cache_controller, {id(host_pool): "kv"})
+                if attr is not None:
+                    setattr(cc, attr, value)
+                cache.cache_controller = cc
+
+                with (
+                    cc.ordered_demotion(enabled=attr is not None),
+                    cc.record_frees("kv", allocator),
+                ):
+                    cache.evict(EvictParams(num_tokens=BATCH_TOKENS))
+
+                self.assertIn(("sync", 0), cc.log)
+                self.assertFalse([event for event in cc.log if event[0] == "wait"])
+                cc.assert_copies_behind_the_fence(self)
 
     def test_allocation_reclaim_on_a_token_chain_batches_its_copies(self):
         """Regression: on a token-only chain, an allocation reclaim's write-back
