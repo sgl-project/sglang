@@ -16,7 +16,7 @@ from sglang.test.test_utils import (
     terminate_and_kill_process_tree,
 )
 
-register_cuda_ci(est_time=150, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=270, stage="base-b", runner_config="1-gpu-small")
 
 TOKENIZER_WORKER_NUM = 4
 NUM_WARMUP_REQUESTS = 32
@@ -24,7 +24,9 @@ NUM_STREAMS = 2
 MAX_NEW_TOKENS = 8192
 
 
-class TestMultiTokenizerSigtermDrain(CustomTestCase):
+class _MultiTokenizerSigtermBase(CustomTestCase):
+    env = None
+
     @classmethod
     def setUpClass(cls):
         cls.base_url = DEFAULT_URL_FOR_TEST
@@ -38,6 +40,7 @@ class TestMultiTokenizerSigtermDrain(CustomTestCase):
                 "--enable-http-worker-reuseport",
                 "--incremental-streaming-output",
             ],
+            env=cls.env,
         )
 
     @classmethod
@@ -76,9 +79,7 @@ class TestMultiTokenizerSigtermDrain(CustomTestCase):
         except Exception as e:
             results[index] = repr(e)
 
-    def test_inflight_streams_finish_after_sigterm(self):
-        """With several tokenizer workers, in-flight streams must run to completion
-        after SIGTERM, even while other workers have no requests left to drain."""
+    def _sigterm_with_streams_in_flight(self) -> tuple:
         for _ in range(NUM_WARMUP_REQUESTS):
             self.assertEqual(self._generate(1, stream=False).status_code, 200)
 
@@ -96,6 +97,14 @@ class TestMultiTokenizerSigtermDrain(CustomTestCase):
         self.assertGreaterEqual(min(chunks_seen), 10)
 
         self.process.send_signal(signal.SIGTERM)
+        return threads, results
+
+
+class TestMultiTokenizerSigtermDrain(_MultiTokenizerSigtermBase):
+    def test_inflight_streams_finish_after_sigterm(self):
+        """With several tokenizer workers, in-flight streams must run to completion
+        after SIGTERM, even while other workers have no requests left to drain."""
+        threads, results = self._sigterm_with_streams_in_flight()
         for thread in threads:
             thread.join(timeout=300)
 
@@ -103,6 +112,18 @@ class TestMultiTokenizerSigtermDrain(CustomTestCase):
             self.assertIsInstance(result, dict, result)
             self.assertEqual(result["meta_info"]["completion_tokens"], MAX_NEW_TOKENS)
         self.assertEqual(self.process.wait(timeout=120), 0)
+
+
+class TestMultiTokenizerSigtermForceShutdown(_MultiTokenizerSigtermBase):
+    env = {"SGLANG_FORCE_SHUTDOWN": "1"}
+
+    def test_force_shutdown_exits_with_streams_in_flight(self):
+        threads, results = self._sigterm_with_streams_in_flight()
+        self.process.wait(timeout=90)
+        for thread in threads:
+            thread.join(timeout=30)
+        for result in results:
+            self.assertNotIsInstance(result, dict, result)
 
 
 if __name__ == "__main__":

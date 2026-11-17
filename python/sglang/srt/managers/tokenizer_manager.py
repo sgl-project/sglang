@@ -3710,6 +3710,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             await asyncio.sleep(5)
 
         # Drain requests
+        forced = False
         while True:
             remain_num_req = len(self.rid_to_state)
             remaining_rids = list(self.rid_to_state.keys())
@@ -3721,6 +3722,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 )
                 self.dump_requests_before_crash()
                 self.force_exit_handler()
+                forced = True
                 break
 
             elif envs.SGLANG_FORCE_SHUTDOWN.get():
@@ -3729,6 +3731,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     "Signal SIGTERM received while force shutdown flag set. Force exiting."
                 )
                 self.force_exit_handler()
+                forced = True
                 break
 
             logger.info(
@@ -3752,7 +3755,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 "Drained. The process that launched the schedulers shuts them down."
             )
         kill_process_tree(os.getpid(), include_parent=False, wait_timeout=60)
-        if self._server_stop_hook is not None:
+        if self._server_stop_hook is not None and not forced:
             # sys.exit() here raises SystemExit into the loop and kills it,
             # so the ASGI server never runs its lifespan shutdown.
             # The loop outlives this coroutine now, so drop our own tasks first;
