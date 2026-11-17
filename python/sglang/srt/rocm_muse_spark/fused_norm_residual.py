@@ -386,3 +386,42 @@ class FusedPostNormResidualPreNorm(BaseFusedOp):
         return self.forward_triton(
             stream, branch, branch_dtype, None, pre_norm_dtype, fp8_out=True
         )
+
+
+@triton.jit
+def _embed_attn_norms_kernel(X, STREAM, OUT, W, embed_eps, eps, N: tl.constexpr):
+    # One row: the weightless embedding RMSNorm in BF16 (F.rms_norm on BF16), the FP32 residual stream it starts, and
+    # the first attention pre-norm of that stream (F.rms_norm on FP32 with the weight, cast to BF16).
+    row = tl.program_id(0).to(tl.int64)
+    offs = tl.arange(0, N)
+    x = tl.load(X + row * N + offs).to(tl.float32)
+    e = (
+        (x * tl.rsqrt(tl.sum(x * x, axis=0) / N + embed_eps))
+        .to(tl.bfloat16)
+        .to(tl.float32)
+    )
+    tl.store(STREAM + row * N + offs, e)
+    a = e * tl.rsqrt(tl.sum(e * e, axis=0) / N + eps) * tl.load(W + offs).to(tl.float32)
+    tl.store(OUT + row * N + offs, a.to(tl.bfloat16))
+
+
+def embed_attn_norms(
+    x: torch.Tensor, embed_eps: float, weight: torch.Tensor, eps: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """(FP32 residual stream, BF16 first attention input) of the embedded BF16 rows ``x`` in one launch: the
+    weightless embedding norm, its FP32 stream and the weighted attention pre-norm (the eager form runs 9 launches)."""
+    m, n = x.shape
+    stream = torch.empty((m, n), dtype=torch.float32, device=x.device)
+    out = torch.empty((m, n), dtype=torch.bfloat16, device=x.device)
+    if m:
+        _embed_attn_norms_kernel[(m,)](
+            x.contiguous(),
+            stream,
+            out,
+            weight,
+            float(embed_eps),
+            float(eps),
+            n,
+            num_warps=8,
+        )
+    return stream, out

@@ -14,6 +14,7 @@ from sglang.kernels.ops.speculative.dflash import (
     _compute_dflash_accept_bonus_triton_unchecked,
     _prepare_dflash_draft_block_unchecked,
     _prepare_dflash_mamba_commit,
+    compact_draft_window,
     compute_dflash_correct_drafts_and_bonus,
 )
 from sglang.kernels.ops.speculative.dspark.dspark_accept import (
@@ -171,6 +172,7 @@ from sglang.srt.speculative.spec_utils import (
 )
 from sglang.srt.utils import async_h2d, is_cuda, is_hip, is_npu, is_xpu
 
+_is_hip = is_hip()
 _is_npu = is_npu()
 
 
@@ -1901,10 +1903,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         verify_out_cache_loc_2d: torch.Tensor,
         bs: int,
         block_size: int,
+        suffix_start: Optional[torch.Tensor] = None,
     ) -> None:
         """Write the draft-local compact req->token rows: the committed suffix
-        window at [0, draft_prefix_len) plus the verify block slots after it."""
-        suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(torch.int64)
+        window at [0, draft_prefix_len) plus the verify block slots after it.
+        ``suffix_start``: the window starts when the caller already has them (ROCm)."""
+        if suffix_start is None:
+            suffix_start = prefix_lens.to(torch.int64) - draft_prefix_lens.to(
+                torch.int64
+            )
         full_to_swa = self._draft_kv_full_to_swa_mapping()
         if self._use_triton_compact_rebuild:
             rebuild_compact_draft_req_to_token_func(
@@ -4009,7 +4016,16 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_cpu = self._draft_seq_lens_cpu_buf[:bs]
         if self.use_compact_draft_cache:
             # Rebuild the draft-local sliding-window view from committed target state.
-            draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
+            if _is_hip:
+                # ROCm: the compact lengths and their window starts in one launch.
+                draft_prefix_lens, suffix_start = compact_draft_window(
+                    prefix_lens.to(device=self.device),
+                    int(self.draft_window_size),
+                    self._draft_compact_page_size,
+                )
+            else:
+                draft_prefix_lens = self._compute_compact_draft_seq_lens(prefix_lens)
+                suffix_start = None
             self._fill_compact_seq_lens_cpu_bound(
                 batch_seq_lens_cpu=batch.seq_lens_cpu,
                 nxt_kv_lens_cpu=draft_input.nxt_kv_lens_cpu,
@@ -4022,6 +4038,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 verify_out_cache_loc_2d=verify_out_cache_loc_2d,
                 bs=bs,
                 block_size=block_size,
+                suffix_start=suffix_start,
             )
             draft_seq_lens = draft_prefix_lens
             draft_seq_lens_sum = int(seq_lens_cpu.sum().item())

@@ -41,6 +41,7 @@ def _hardware_key(device_index: int = 0) -> str | None:
     if not torch.cuda.is_available():
         return None
     if torch.version.hip:
+        # the device name of a gfx1250 partition reads "AMD Radeon Graphics"
         return torch.cuda.get_device_properties(device_index).gcnArchName.split(":")[0]
     return "_".join(torch.cuda.get_device_name(device_index).split())
 

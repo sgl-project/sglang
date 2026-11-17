@@ -25,6 +25,7 @@ from sglang.kernels.ops.moe.router_pooler_topk import (
     router_pooler_topk,
 )
 from sglang.srt.environ import envs
+from sglang.srt.rocm_muse_spark.sequence_parallel import pack_routed_mx
 
 logger = logging.getLogger(__name__)
 
@@ -102,10 +103,13 @@ def _routing_front_matches(moe, x: torch.Tensor) -> bool:
     )
 
 
-def route_with_shared_pooler(moe, x: torch.Tensor, quant_out=None, x_fp8=None):
+def route_with_shared_pooler(
+    moe, x: torch.Tensor, quant_out=None, x_fp8=None, pack_out=None
+):
     """(top-8 scores, expert ids, normalized expert input, MXFP4 input or None) for ``x``; requires
     ``can_share_router_pooler``. ``quant_out`` receives the compact A4 input on the shared (not joint) path.
-    ``x_fp8`` = (per-row FP8 copy of ``x``, scales) from the boundary kernel for the FP8 pooler tiles."""
+    ``x_fp8`` = (per-row FP8 copy of ``x``, scales) from the boundary kernel for the FP8 pooler tiles. ``pack_out``
+    receives the routed-MX rows (``sequence_parallel.pack_routed_mx``), from the joint epilogue on the joint paths."""
     m = x.shape[0]
     norm_weight = moe.pre_expert_norm._get_effective_weight()
     if (
@@ -135,6 +139,7 @@ def route_with_shared_pooler(moe, x: torch.Tensor, quant_out=None, x_fp8=None):
             float(moe.route_scale),
             float(moe.pre_expert_norm.eps),
             quant_out=quant_out,
+            pack_out=pack_out,
         ), quant_out
     if JOINT_ROUTER_POOLER and (
         m in _JOINT_ROWS
@@ -160,6 +165,7 @@ def route_with_shared_pooler(moe, x: torch.Tensor, quant_out=None, x_fp8=None):
             float(moe.route_scale),
             float(moe.pre_expert_norm.eps),
             quant_out=quant_out,
+            pack_out=pack_out,
         ), quant_out
     key = "shared" if m <= 16 else "shared_completed"
     if key not in _logged:
@@ -173,7 +179,7 @@ def route_with_shared_pooler(moe, x: torch.Tensor, quant_out=None, x_fp8=None):
             ),
             m,
         )
-    return *router_pooler_topk(
+    scores, ids, expert_input = router_pooler_topk(
         x,
         moe.router.weight,
         moe.pre_expert_proj.weight,
@@ -185,7 +191,10 @@ def route_with_shared_pooler(moe, x: torch.Tensor, quant_out=None, x_fp8=None):
         pooler_tiled=getattr(moe.pre_expert_proj, "small_m_tiled_weight", None),
         pooler_rowmajor=envs.SGLANG_ROCM_MUSE_DENSE_TILED.get(),
         quant_out=quant_out,
-    ), quant_out
+    )
+    if pack_out is not None:
+        pack_routed_mx(expert_input, ids, scores, out=pack_out)
+    return scores, ids, expert_input, quant_out
 
 
 @torch.no_grad()

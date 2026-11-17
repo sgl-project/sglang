@@ -255,30 +255,82 @@ def sp_gather_routed(
     """Verify SP: push-plane gather of the bf16 expert input rows with their routing in one collective. The ids /
     scores travel one byte per bf16 word as 0x01XX, so no pushed 32-bit word is zero (the Lamport empty marker)."""
     n, width = x.shape
-    side = torch.cat(
-        [
-            topk_ids.view(torch.uint8).view(n, -1),
-            topk_scores.view(torch.uint8).view(n, -1),
-        ],
-        dim=1,
-    )
-    words = (side.to(torch.int16) | 256).view(torch.bfloat16)
-    gathered = sp_gather(torch.cat([x, words], dim=1), rows, push=True)
-    side = (gathered[:, width:].view(torch.int16) & 255).to(torch.uint8)
     ids_bytes = topk_ids[0].numel() * topk_ids.element_size()
-    ids = (
-        side[:, :ids_bytes]
-        .contiguous()
-        .view(topk_ids.dtype)
-        .view(rows, *topk_ids.shape[1:])
+    sc_bytes = topk_scores[0].numel() * topk_scores.element_size()
+    packed = torch.empty(
+        (n, width + ids_bytes + sc_bytes), dtype=torch.int16, device=x.device
     )
-    scores = (
-        side[:, ids_bytes:]
-        .contiguous()
-        .view(topk_scores.dtype)
-        .view(rows, *topk_scores.shape[1:])
+    if n:
+        _routed_rows_pack_kernel[(n,)](
+            x.contiguous().view(torch.int16), topk_ids.contiguous().view(torch.uint8), topk_scores.contiguous().view(torch.uint8),
+            packed, width, ids_bytes, sc_bytes, triton.next_power_of_2(width), triton.next_power_of_2(ids_bytes + sc_bytes),
+            num_warps=4,
+        )  # fmt: skip
+    gathered = sp_gather(packed.view(torch.bfloat16), rows, push=True)
+    ids = torch.empty(
+        (rows, *topk_ids.shape[1:]), dtype=topk_ids.dtype, device=x.device
     )
+    scores = torch.empty(
+        (rows, *topk_scores.shape[1:]), dtype=topk_scores.dtype, device=x.device
+    )
+    if rows:
+        _routed_rows_side_unpack_kernel[(rows,)](
+            gathered.view(torch.int16), ids.view(torch.uint8), scores.view(torch.uint8), width, ids_bytes, sc_bytes,
+            triton.next_power_of_2(ids_bytes + sc_bytes), num_warps=1,
+        )  # fmt: skip
     return gathered[:, :width], ids, scores
+
+
+@triton.jit
+def _routed_rows_pack_kernel(
+    X, IDS, SC, OUT, width, ids_bytes, sc_bytes, BW: tl.constexpr, BS: tl.constexpr
+):
+    # One row: the bf16 expert input (as int16), then the id / score bytes one per 16-bit word as 0x01XX.
+    row = tl.program_id(0).to(tl.int64)
+    stride = width + ids_bytes + sc_bytes
+    c = tl.arange(0, BW)
+    tl.store(
+        OUT + row * stride + c,
+        tl.load(X + row * width + c, mask=c < width),
+        mask=c < width,
+    )
+    j = tl.arange(0, BS)
+    b = tl.where(
+        j < ids_bytes,
+        tl.load(IDS + row * ids_bytes + j, mask=j < ids_bytes, other=0),
+        tl.load(
+            SC + row * sc_bytes + (j - ids_bytes),
+            mask=(j >= ids_bytes) & (j < ids_bytes + sc_bytes),
+            other=0,
+        ),
+    )
+    tl.store(
+        OUT + row * stride + width + j,
+        (b.to(tl.int16) | 256),
+        mask=j < ids_bytes + sc_bytes,
+    )
+
+
+@triton.jit
+def _routed_rows_side_unpack_kernel(
+    G, IDS, SC, width, ids_bytes, sc_bytes, BS: tl.constexpr
+):
+    row = tl.program_id(0).to(tl.int64)
+    j = tl.arange(0, BS)
+    b = (
+        tl.load(
+            G + row * (width + ids_bytes + sc_bytes) + width + j,
+            mask=j < ids_bytes + sc_bytes,
+            other=0,
+        )
+        & 255
+    ).to(tl.uint8)
+    tl.store(IDS + row * ids_bytes + j, b, mask=j < ids_bytes)
+    tl.store(
+        SC + row * sc_bytes + (j - ids_bytes),
+        b,
+        mask=(j >= ids_bytes) & (j < ids_bytes + sc_bytes),
+    )
 
 
 @triton.jit
@@ -686,10 +738,42 @@ class RoutedDispatch:
     align_m: int = 0
 
 
-# Gathered rows for which sp_gather_routed_mx(dispatch=True) defers the routing to dispatch_routed_mx: from 257
-# rows, where aiter runs its EP route (smaller batches take its one-launch local-ids route + psum), up to 768, since
-# every program re-reads all rows' routing words and the launch grows with the square of the rows.
-DISPATCH_MIN_ROWS, DISPATCH_MAX_ROWS = 257, 768
+# Packed row width (int32 words) of a 4096-wide expert input with int32 top-8 ids and fp32 weights.
+ROUTED_MX_WIDTH = 4096 // 4 + 4096 // 64 + 2 * 8 + 2 * 8
+# Unsharded batches up to this many rows dispatch from the joint epilogue's packed rows
+# (local_routed_dispatch) in place of the local-ids, aiter route + psum and input quant launches.
+LOCAL_DISPATCH_MAX_ROWS = 64
+
+
+# Gathered rows for which sp_gather_routed_mx(dispatch=True) defers the routing to dispatch_routed_mx: from 128 rows
+# (one launch for the side unpack, aiter's local-ids route + psum and the scatter) up to 768: every program re-reads
+# all rows' routing words, so the launch grows with the square of the rows.
+DISPATCH_MIN_ROWS, DISPATCH_MAX_ROWS = 128, 768
+
+
+def local_routed_dispatch(
+    packed: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_scores: torch.Tensor,
+    local_start: int,
+    num_local: int,
+) -> tuple:
+    """``routed_mx`` for ``mxfp4_moe.run_gfx1250_a8w4`` from this rank's own packed rows (``pack_routed_mx`` of
+    the expert input with int32 ids / fp32 weights): dispatch_routed_mx routes and scatters them, rewriting
+    ``topk_ids`` / ``topk_scores`` with their own values."""
+    d = RoutedDispatch(
+        packed,
+        4096,
+        topk_ids,
+        topk_scores,
+        packed.shape[0],
+        8,
+        8,
+        local_start,
+        num_local,
+        None,
+    )
+    return packed, 8, 8, d
 
 
 def dispatch_routed_mx(
@@ -705,8 +789,8 @@ def dispatch_routed_mx(
         device=d.packed.device,
     )
     has_count = d.count is not None
-    # 4 rows per program, 8 warps; the route count reads up to 512 rows per pass
-    bt = 4
+    # 4 rows per program; the count reads all rows in one pass up to 512. One row per program up to 256 rows.
+    bt = 1 if d.rows <= 256 else 4
     _routed_dispatch_kernel[(triton.cdiv(d.rows, bt),)](
         d.packed, d.ids.view(torch.int32), d.scores.view(torch.int32), d.count if has_count else d.ids, d.t2r,
         d.masked, d.starts, d.psum, payload.view(torch.int32), scale.view(torch.int32), d.rows, d.local_start,
@@ -714,6 +798,29 @@ def dispatch_routed_mx(
         num_warps=8,
     )  # fmt: skip
     return payload, scale
+
+
+def pack_routed_mx(
+    x: torch.Tensor,
+    topk_ids: torch.Tensor,
+    topk_scores: torch.Tensor,
+    norm: tuple[torch.Tensor, float] | None = None,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """The routed-MX rows (int32 [n, width]) of ``x`` with its routing, as ``sp_gather_routed_mx`` sends them."""
+    n, k = x.shape
+    idw = topk_ids[0].numel() * topk_ids.element_size() // 4
+    scw = topk_scores[0].numel() * topk_scores.element_size() // 4
+    width = k // 4 + k // 64 + 2 * idw + 2 * scw
+    if out is None:
+        out = torch.empty((n, width), dtype=torch.int32, device=x.device)
+    if n:
+        weight, eps = norm if norm is not None else (x, 0.0)
+        _routed_mx_pack_kernel[(n,)](
+            x.contiguous(), topk_ids.contiguous().view(torch.int32), topk_scores.contiguous().view(torch.int32),
+            out, weight, eps, k, idw, scw, norm is not None, num_warps=4,
+        )  # fmt: skip
+    return out
 
 
 def sp_gather_routed_mx(
@@ -727,6 +834,7 @@ def sp_gather_routed_mx(
     norm: tuple[torch.Tensor, float] | None = None,
     local_experts: tuple[int, int] | None = None,
     dispatch: bool = False,
+    packed: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor | tuple, torch.Tensor, torch.Tensor]:
     """``sp_gather_routed`` with the expert input rows sent as MXFP8 under aiter's own MoE input-quant rule and
     widened back to BF16 on arrival (exact): the experts quantize them to the same values, at half the BF16 bytes,
@@ -736,19 +844,14 @@ def sp_gather_routed_mx(
     score words per row, rank-local ids or None), for ``scatter_routed_mx``; ``local_experts`` = (first, count) of
     this rank's experts asks for the local ids (int32 ids only); with ``dispatch`` and ``DISPATCH_MIN_ROWS`` to
     ``DISPATCH_MAX_ROWS`` rows the fourth element is instead a ``RoutedDispatch`` and the ids / scores stay unwritten
-    until aiter's MoE runs ``dispatch_routed_mx`` (``mxfp4_moe.run_gfx1250_a8w4``). ``norm`` =
-    (BF16 weight, eps): ``x`` is the pre-norm row and the pack applies that RMSNorm (no separate norm pass)."""
-    n, k = x.shape
+    until aiter's MoE runs ``dispatch_routed_mx`` (``mxfp4_moe.run_gfx1250_a8w4``). ``norm`` = (BF16 weight, eps): ``x``
+    is the pre-norm row and the pack applies that RMSNorm (no separate norm pass). ``packed``: the rows
+    ``pack_routed_mx`` would make of them, already written (the joint router / pooler epilogue's)."""
+    k = x.shape[1]
     idw = topk_ids[0].numel() * topk_ids.element_size() // 4
     scw = topk_scores[0].numel() * topk_scores.element_size() // 4
-    width = k // 4 + k // 64 + 2 * idw + 2 * scw
-    packed = torch.empty((n, width), dtype=torch.int32, device=x.device)
-    if n:
-        weight, eps = norm if norm is not None else (x, 0.0)
-        _routed_mx_pack_kernel[(n,)](
-            x.contiguous(), topk_ids.contiguous().view(torch.int32), topk_scores.contiguous().view(torch.int32),
-            packed, weight, eps, k, idw, scw, norm is not None, num_warps=4,
-        )  # fmt: skip
+    if packed is None:
+        packed = pack_routed_mx(x, topk_ids, topk_scores, norm)
     gathered = sp_gather(packed.view(torch.bfloat16), rows, push=push).view(torch.int32)
     ids = torch.empty(
         (rows, *topk_ids.shape[1:]), dtype=topk_ids.dtype, device=x.device

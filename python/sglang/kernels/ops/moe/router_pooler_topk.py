@@ -38,6 +38,8 @@ from sglang.kernels.ops.gemm.fp8w_small_m_gemm import (
     quantize_weight as quantize_fp8_weight,
 )
 from sglang.kernels.ops.gemm.router_gemm_fp32 import _router_partial_kernel
+from sglang.srt.rocm_muse_spark.mxfp4_moe import _mx_ru_quant
+from sglang.srt.rocm_muse_spark.sequence_parallel import _side_words
 
 
 @triton.jit
@@ -144,6 +146,7 @@ def _joint_epilogue(
     QS,
     XS,
     WS,
+    PK,
     M: tl.constexpr,
     SK: tl.constexpr,
     MULT: tl.constexpr,
@@ -151,7 +154,10 @@ def _joint_epilogue(
     EPS: tl.constexpr,
     QUANT: tl.constexpr,
     FP8: tl.constexpr,
+    PACK: tl.constexpr,
 ):
+    # P: [SK, M, 4608] partials (pooler columns [0, 4096), router columns [4096, 4608)). PACK: also each row as
+    # sequence_parallel._routed_mx_pack_kernel packs it (int32 [M, 1120]: MXFP8 payload, e8m0 words, id / score words).
     pid = tl.program_id(0)
     s = tl.arange(0, SK)
     if pid < M:
@@ -172,8 +178,16 @@ def _joint_epilogue(
             biased = tl.where(n == idx, -float("inf"), biased)
             ids = tl.where(slots == j, idx, ids)
             selected = tl.where(slots == j, score, selected)
+        weights = selected * (SCALE / (denominator + 1e-15))
         tl.store(IDS + pid * 8 + slots, ids)
-        tl.store(SCORES + pid * 8 + slots, selected * (SCALE / (denominator + 1e-15)))
+        tl.store(SCORES + pid * 8 + slots, weights)
+        if PACK:
+            side = PK + pid * 1120 + 1088
+            tl.store(side + tl.arange(0, 16), _side_words(ids))
+            tl.store(
+                side + 16 + tl.arange(0, 16),
+                _side_words(weights.to(tl.int32, bitcast=True)),
+            )
     else:
         row = pid - M
         dn = tl.arange(0, 4096)
@@ -193,6 +207,20 @@ def _joint_epilogue(
             )
             tl.store(Q + row * 2048 + tl.arange(0, 2048), tl.reshape(q, (2048,)))
             tl.store(QS + row * 128 + tl.arange(0, 128), tl.reshape(qs, (128,)))
+        if PACK:
+            q, e = _mx_ru_quant(
+                tl.reshape(result.to(tl.bfloat16).to(tl.float32), (128, 32))
+            )
+            qb = tl.reshape(q.to(tl.uint8, bitcast=True).to(tl.int32), (1024, 4))
+            tl.store(
+                PK + row * 1120 + tl.arange(0, 1024),
+                tl.sum(qb << (tl.arange(0, 4) * 8)[None, :], axis=1),
+            )
+            e0, e1 = tl.split(tl.reshape(e, (64, 2)))
+            tl.store(
+                PK + row * 1120 + 1024 + tl.arange(0, 64),
+                (e0 | (e1 << 16)) | 0x01000100,
+            )
 
 
 def router_pooler_topk(
@@ -365,10 +393,10 @@ def joint_router_pooler_applies(x, packed) -> bool:
 
 
 def joint_router_pooler_topk(
-    x, packed, bias, norm, multiplier, scale, eps, quant_out=None
+    x, packed, bias, norm, multiplier, scale, eps, quant_out=None, pack_out=None
 ):
     """Same outputs as ``router_pooler_topk`` from the packed joint weight (``joint_router_pooler_applies`` rows).
-    ``quant_out`` as in ``router_pooler_topk``."""
+    ``quant_out`` as in ``router_pooler_topk``; ``pack_out`` (int32 [M, 1120]) receives the routed-MX rows."""
     m, k = x.shape
     assert k == 8192 and packed.shape == (4608, 8192)
     if flydsl_gemm_applies(x, packed, torch.float32):
@@ -388,7 +416,9 @@ def joint_router_pooler_topk(
         bf16_splitk_gemm_partials(
             x, packed, partial, block_n=64, block_k=128, split_k=sk
         )
-    return _joint_finish(partial, sk, m, bias, norm, multiplier, scale, eps, quant_out)
+    return _joint_finish(
+        partial, sk, m, bias, norm, multiplier, scale, eps, quant_out, pack_out=pack_out
+    )
 
 
 # Warps per epilogue program; one program sums a 4096-wide row over SK partials (64 KB at SK 4). Unsplit partials
@@ -397,7 +427,17 @@ JOINT_EPILOGUE_WARPS = 4
 
 
 def _joint_finish(
-    partial, sk, m, bias, norm, multiplier, scale, eps, quant_out, fp8_scales=None
+    partial,
+    sk,
+    m,
+    bias,
+    norm,
+    multiplier,
+    scale,
+    eps,
+    quant_out,
+    fp8_scales=None,
+    pack_out=None,
 ):
     """The shared epilogue over the joint partials ``[SK, M, 4608]``; ``fp8_scales`` = (row activation scales,
     pooler channel scales) when the pooler tiles came from the FP8 GEMM."""
@@ -414,6 +454,7 @@ def _joint_finish(
         expert_input,
         *(quant_out or (expert_input, expert_input)),
         *(fp8_scales or (expert_input, expert_input)),
+        expert_input if pack_out is None else pack_out,
         m,
         sk,
         multiplier,
@@ -421,6 +462,7 @@ def _joint_finish(
         eps,
         quant_out is not None,
         fp8_scales is not None,
+        pack_out is not None,
         num_warps=1 if sk == 1 else JOINT_EPILOGUE_WARPS,
     )
     return scores, ids, expert_input
@@ -516,7 +558,18 @@ def joint_router_pooler_fp8_applies(xq, packed, pooler_fp8) -> bool:
 
 
 def joint_router_pooler_topk_fp8(
-    xq, xs, x, packed, pooler_fp8, bias, norm, multiplier, scale, eps, quant_out=None
+    xq,
+    xs,
+    x,
+    packed,
+    pooler_fp8,
+    bias,
+    norm,
+    multiplier,
+    scale,
+    eps,
+    quant_out=None,
+    pack_out=None,
 ):
     """``joint_router_pooler_topk`` with the pooler projection from the per-row FP8 activation ``xq`` / scales
     ``xs`` and the FP8 pooler copy ``pooler_fp8`` (``quantize_joint_pooler``); the router reads the BF16 ``x``."""
@@ -543,5 +596,15 @@ def joint_router_pooler_topk_fp8(
         matrix_instr_nonkdim=16,
     )
     return _joint_finish(
-        partial, sk, m, bias, norm, multiplier, scale, eps, quant_out, (xs, ws)
+        partial,
+        sk,
+        m,
+        bias,
+        norm,
+        multiplier,
+        scale,
+        eps,
+        quant_out,
+        (xs, ws),
+        pack_out=pack_out,
     )
