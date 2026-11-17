@@ -10,6 +10,7 @@ from typing import Any
 
 from sglang.srt.arg_groups.model_override_base import (
     attention_backends_of,
+    decode_state_free_radix_of,
     mamba_extra_buffer_of,
     model_config_of,
     resolved_view,
@@ -36,7 +37,6 @@ from sglang.srt.arg_groups.overrides import (
 from sglang.srt.arg_groups.resolution_hooks import run_hook
 from sglang.srt.configs.embedding_model_spec import BCGPrefillPolicy
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec
-from sglang.srt.configs.quant_utils import get_quantization_config
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
 from sglang.srt.hardware_backend.mlx.runtime import use_mlx
@@ -561,29 +561,6 @@ def handle_model_specific_adjustments(server_args: Any):
                 f"- Decode: {decode_attn_backend}\n"
             )
 
-        quant_method = get_quantization_config(hf_config)
-        is_mxfp4_quant_format = quant_method == "mxfp4"
-        if (
-            not attn_dp_enabled_of(resolved_view(server_args))
-            and cfg.nnodes == 1
-            and get_platform().is_hip
-        ):
-            # TODO (Hubert): Put this back later
-            # server_args.enable_aiter_allreduce_fusion = True
-            # logger.info("Enable Aiter AllReduce Fusion for GptOssForCausalLM")
-            pass
-
-        quantization_config = getattr(hf_config, "quantization_config", None)
-        is_mxfp4_quant_format = (
-            quantization_config is not None
-            and quantization_config.get("quant_method") == "mxfp4"
-        )
-        # The mxfp4 dtype override moved to the override registry
-        # (arg_groups/overrides.py: _gpt_oss_overrides).
-
-        # The moe_runner_backend selection moved to the override registry
-        # (arg_groups/overrides.py: _gpt_oss_overrides).
-
     elif model_arch in ("MiMoV2ForCausalLM", "MiMoV2FlashForCausalLM"):
         if model_arch == "MiMoV2ForCausalLM" and not cfg.encoder_only:
             expected_attn_tp_size = get_mimo_v2_fused_qkv_expected_tp_size(hf_config)
@@ -1092,7 +1069,8 @@ def handle_mamba_radix_cache(server_args: Any, hf_config: Any):
             hf_config,
             mamba_cache_chunk_size_of=lambda: mamba_cache_chunk_size(server_args),
         )
-    else:
+    elif not decode_state_free_radix_of(view):
+        # A state-free decode tree caches no state, so no_buffer's limits do not apply.
         validate_mamba_no_buffer(view, hf_config.architectures[0])
 
 
