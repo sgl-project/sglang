@@ -256,7 +256,7 @@ jobs:
         extra-a-test-2-gpu-large-amd,
         extra-b-test-4-gpu-amd,
       ]
-    if: always()
+    if: always() && needs.call-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses

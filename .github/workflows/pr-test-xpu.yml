@@ -329,7 +329,7 @@ jobs:
           fi
 
   finish:
-    if: always()
+    if: always() && needs.pr-gate.outputs.opted-in != 'false'
     needs: [extra-test-1-gpu-xpu, multimodal-gen-test-1-gpu-xpu, pr-gate]
     runs-on: ubuntu-latest
     steps:

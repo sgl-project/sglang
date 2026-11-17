@@ -234,9 +234,9 @@ jobs:
           python3 -m pytest tests/e2e/ -v -s --tb=short \
             --ignore=tests/e2e/k8s_integration
 
-  # Passes when every job succeeded, when the PR touches no sgl-router path
-  # and every job after `changes` was skipped, or when the gate passed but
-  # skipped the tests (a draft or no `run-ci`). Anything else fails.
+  # Passes when every job succeeded, or when the PR touches no sgl-router path
+  # and every job after `changes` was skipped. Skipped with the tests when the
+  # gate skips them (a draft or no `run-ci`).
   sgl-router-finish:
     name: finish
     needs:
@@ -246,7 +246,7 @@ jobs:
       - sgl-router-test
       - sgl-router-k8s-integration
       - sgl-router-e2e
-    if: always()
+    if: always() && needs.sgl-router-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -254,17 +254,13 @@ jobs:
         env:
           NEEDS: ${{ toJSON(needs) }}
           SHOULD_RUN: ${{ needs.sgl-router-changes.outputs.should_run }}
-          OPTED_IN: ${{ needs.sgl-router-gate.outputs.opted-in }}
         run: |
-          gate=$([[ "$SHOULD_RUN" == "true" ]] && echo success || echo skipped)
-          tests=$([[ "$SHOULD_RUN" == "true" && "$OPTED_IN" != "false" ]] && echo success || echo skipped)
+          expected=$([[ "$SHOULD_RUN" == "true" ]] && echo success || echo skipped)
           echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
-          unexpected=$(echo "$NEEDS" | jq -r --arg gate "$gate" --arg tests "$tests" \
-            'to_entries[] | select(
-              .key == "sgl-router-changes" and .value.result != "success"
-              or .key == "sgl-router-gate" and .value.result != $gate
-              or (.key | IN("sgl-router-changes", "sgl-router-gate") | not) and .value.result != $tests) | .key')
+          unexpected=$(echo "$NEEDS" | jq -r --arg expected "$expected" \
+            'to_entries[] | select(.key == "sgl-router-changes" and .value.result != "success"
+              or .key != "sgl-router-changes" and .value.result != $expected) | .key')
           if [[ -n "$unexpected" ]]; then
-            echo "::error::Unexpected sgl-router results (should_run=$SHOULD_RUN, opted_in=$OPTED_IN): $(echo $unexpected)"
+            echo "::error::Unexpected sgl-router results (should_run=$SHOULD_RUN): $(echo $unexpected)"
             exit 1
           fi

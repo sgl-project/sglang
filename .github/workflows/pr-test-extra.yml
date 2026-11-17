@@ -249,7 +249,7 @@ jobs:
         simulator-test-gpu,
         extra-test,
       ]
-    if: always()
+    if: always() && needs.call-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses

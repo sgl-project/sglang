@@ -1438,7 +1438,7 @@ jobs:
 
         setup-covstub,
       ]
-    if: always()
+    if: always() && needs.pr-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses

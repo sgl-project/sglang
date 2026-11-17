@@ -1404,7 +1404,7 @@ jobs:
         base-c-test-large-8-gpu-amd-mi35x,
 
       ]
-    if: always()
+    if: always() && needs.call-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses

@@ -240,7 +240,7 @@ jobs:
         multimodal-gen-layer-unit-test-musa,
         sgl-kernel-unit-test-musa,
       ]
-    if: always()
+    if: always() && needs.pr-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses

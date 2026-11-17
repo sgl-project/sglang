@@ -143,7 +143,7 @@ jobs:
   sgl-processor-finish:
     name: ${{ github.event.action == 'labeled' && github.event.label.name != 'run-ci' && 'ignored-label-sgl-processor-finish' || 'sgl-processor-finish' }}
     needs: [sgl-processor-changes, sgl-processor-gate, sgl-processor-lint, sgl-processor-test]
-    if: always() && (github.event.action != 'labeled' || github.event.label.name == 'run-ci')
+    if: always() && (github.event.action != 'labeled' || github.event.label.name == 'run-ci') && needs.sgl-processor-gate.outputs.opted-in != 'false'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -151,7 +151,6 @@ jobs:
         env:
           CHANGES_RESULT: ${{ needs.sgl-processor-changes.result }}
           GATE_RESULT: ${{ needs.sgl-processor-gate.result }}
-          OPTED_IN: ${{ needs.sgl-processor-gate.outputs.opted-in }}
           SHOULD_RUN: ${{ needs.sgl-processor-changes.outputs.should_run }}
           LINT_RESULT: ${{ needs.sgl-processor-lint.result }}
           TEST_RESULT: ${{ needs.sgl-processor-test.result }}
@@ -164,8 +163,6 @@ jobs:
             echo "All processor checks passed."
           elif [[ "$SHOULD_RUN" == "false" && "$GATE_RESULT" == "skipped" && "$LINT_RESULT" == "skipped" && "$TEST_RESULT" == "skipped" ]]; then
             echo "No processor-related changes; checks skipped."
-          elif [[ "$GATE_RESULT" == "success" && "$OPTED_IN" == "false" && "$LINT_RESULT" == "skipped" && "$TEST_RESULT" == "skipped" ]]; then
-            echo "A draft or no run-ci; checks skipped."
           else
             echo "::error::Unexpected processor results: should_run=$SHOULD_RUN, gate=$GATE_RESULT, lint=$LINT_RESULT, test=$TEST_RESULT."
             exit 1

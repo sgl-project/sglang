@@ -10,7 +10,8 @@ those workflows retain their existing event and path conditions.
 
 pr-gate.yml passes with `opted-in=false` instead of failing on a draft PR or
 one without `run-ci` or its tier label, so every job that needs it must skip on
-that output; only a `*finish` aggregator may run regardless.
+that output, finish jobs included, so a skipped run shows no passing check.
+Only `pr-test-finish`, the required check, runs regardless and fails.
 """
 
 import glob
@@ -22,6 +23,8 @@ import yaml
 
 TIERS_FILE = "scripts/ci/opt_in_ci_tiers.json"
 PR_GATE = "./.github/workflows/pr-gate.yml"
+# The required check; it fails when the gate skipped the tests.
+REQUIRED_FINISH = "pr-test-finish"
 # Tier names are slash-command arguments; these spellings mean other commands.
 RESERVED_TIER_NAMES = {"base", "cpu", "extra", "failed", "full"}
 _TIER_NAME = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
@@ -49,7 +52,7 @@ def jobs_ignoring_opt_in(workflow: dict) -> list[str]:
         needs = {needs} if isinstance(needs, str) else set(needs)
         if (
             needs & gates
-            and not name.endswith("finish")
+            and name != REQUIRED_FINISH
             and "opted-in" not in str(job.get("if", ""))
         ):
             ignoring.append(name)
