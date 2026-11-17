@@ -1068,7 +1068,9 @@ def fused_topk_torch_native(
     scoring_func: str = "softmax",
 ):
     def scoring_func_impl(gating_output: torch.Tensor) -> torch.Tensor:
-        if scoring_func == "softmax":
+        # softmax_noaux differs from softmax only in where the bias applies,
+        # which the correction_bias branch below already models.
+        if scoring_func in ("softmax", "softmax_noaux"):
             return gating_output.softmax(dim=-1)
         elif scoring_func == "sigmoid":
             return gating_output.sigmoid()
@@ -1869,6 +1871,10 @@ def is_expert_remapping_enabled() -> bool:
         or get_exec().moe.init_expert_location != "trivial"
         or get_exec().moe.ep_num_redundant_experts > 0
     )
+
+
+# Routers whose correction bias ranks the experts while the weights stay bias-free.
+_BIASED_SCORING_FUNCS = ("sqrtsoftplus", "sigmoid", "softmax_noaux")
 
 
 def _fused_gate_masks_padded_rows(scoring_func: str) -> bool:
@@ -2998,14 +3004,14 @@ def select_experts(
             scoring_func=scoring_func,
         )
     elif custom_routing_function is None:
-        fold_scale_after_routing = scoring_func not in ("sqrtsoftplus", "sigmoid")
+        fold_scale_after_routing = scoring_func not in _BIASED_SCORING_FUNCS
 
         # The JIT route depends on GPU-only topk_sigmoid/topk_softmax imports
         _can_use_jit_kernel = not _is_cpu
 
-        if _can_use_jit_kernel and (
-            scoring_func == "sqrtsoftplus" or scoring_func == "sigmoid"
-        ):
+        if _can_use_jit_kernel and scoring_func in _BIASED_SCORING_FUNCS:
+            if _is_xpu and scoring_func == "softmax_noaux":
+                raise NotImplementedError("softmax_noaux routing is not on XPU")
             _biased_topk = biased_topk_xpu if _is_xpu else biased_topk_jit_kernel_impl
             _packed_kwargs = {}
             if _fused_gate_emits_packed_ids(

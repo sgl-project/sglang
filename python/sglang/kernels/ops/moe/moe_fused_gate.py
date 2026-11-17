@@ -16,6 +16,8 @@ _SCORING_FUNC_MAP = {
     "sigmoid": 0,
     "sqrtsoftplus": 1,
     "softmax": 2,
+    # noaux_tc over softmax probabilities: rank on prob + bias, weight = prob.
+    "softmax_noaux": 3,
 }
 
 
@@ -42,7 +44,7 @@ def _router_triton_kernel(
     TOPK_GROUP: tl.constexpr,  # groups kept per token (grouped routing)
     EXPERTS_PER_GROUP: tl.constexpr,  # N // N_GROUP
     BLOCK_G: tl.constexpr,  # >= N_GROUP, power of 2
-    SCORING_FUNC: tl.constexpr,  # 0 = sigmoid, 1 = sqrtsoftplus, 2 = softmax
+    SCORING_FUNC: tl.constexpr,  # 0 sigmoid, 1 sqrtsoftplus, 2 softmax, 3 softmax_noaux
     SQRTSOFTPLUS_LOG1P: tl.constexpr,  # sqrtsoftplus via log1p (V4.1 numerics)
     HAS_SOFTCAP: tl.constexpr,  # tanh softcapping (softmax only)
     RENORMALIZE: tl.constexpr,
@@ -129,6 +131,15 @@ def _router_triton_kernel(
             log1p_z = tl.where(exact, z, z * tl.log(u) / tl.where(exact, 1.0, u - 1.0))
             sp = tl.maximum(scores, 0.0) + log1p_z
             activated = tl.sqrt(sp)
+        biased = activated + row_bias
+    elif SCORING_FUNC == 3:
+        # noaux_tc over softmax: the bias shifts the ranking of the bias-free
+        # probabilities, and the weight stays the bias-free probability.
+        logit = tl.where(mask_n[None, :], scores, -float("inf"))
+        row_max = tl.max(logit, axis=1)[:, None]  # [BLOCK_M, 1]
+        exp_row = tl.where(mask_n[None, :], tl.exp(logit - row_max), 0.0)
+        row_sum = tl.sum(exp_row, axis=1)[:, None]  # [BLOCK_M, 1]
+        activated = exp_row / row_sum
         biased = activated + row_bias
     else:
         # softmax over the row: weight is the softmax probability (bias kept), with
@@ -286,7 +297,9 @@ def moe_fused_gate(
 
     With ``num_expert_group > 1`` it performs DeepSeek-V3 grouped routing
     (per-group top-2-sum group scores, keep ``topk_group`` groups, then top-k
-    within). ``scores`` contains raw GEMM logits.
+    within). ``scores`` contains raw GEMM logits. ``softmax`` ranks and weights
+    softmax(logit + bias); ``softmax_noaux`` ranks softmax(logit) + bias and
+    weights the bias-free probability.
 
     Rows past the device scalar ``num_token_non_padded`` return zero weights and -1 ids.
     Positive ``renormalize_epsilon`` uses ``sum + epsilon`` instead of the zero-sum guard.
@@ -322,6 +335,9 @@ def moe_fused_gate(
             "scores and bias must have same num_experts"
         )
     assert topk > num_fused_shared_experts, "topk must be > num_fused_shared_experts"
+    assert scoring_func != "softmax_noaux" or moe_softcapping == 0.0, (
+        "softmax_noaux routing has no softcapping"
+    )
     if input_ids is not None:
         assert bias_alt is not None and bias_alt_token_id is not None
         assert bias is not None and bias_alt.shape == bias.shape

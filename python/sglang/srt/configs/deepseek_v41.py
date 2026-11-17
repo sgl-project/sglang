@@ -59,6 +59,8 @@ class DeepseekV41Config(DeepseekV3Config):
     engram_head_dim = 0
     engram_pad_token_id = 2
     engram_compressed_vocab_size = 0
+    hc_residual_mode = "sinkhorn"
+    n_dense_layers = 0
 
     def __init__(self, **kwargs):
         kwargs = normalize_deepseek_v41_config(kwargs)

@@ -502,6 +502,18 @@ class DeepseekV2MLP(nn.Module):
         return x
 
 
+def _deepseek_v4_scoring_func(
+    scoring_func: str, correction_bias: Optional[torch.Tensor]
+) -> str:
+    """A V4 softmax router with a noaux_tc bias ranks on softmax + bias and
+    weights the bias-free softmax, unlike plain softmax routing."""
+    if scoring_func != "softmax" or correction_bias is None:
+        return scoring_func
+    if _is_npu:
+        raise NotImplementedError("DeepSeek V4 softmax_noaux routing is not on NPU")
+    return "softmax_noaux"
+
+
 class MoEGate(nn.Module):
     def __init__(
         self,
@@ -816,7 +828,9 @@ class DeepseekV2MoE(nn.Module):
             if is_deepseek_v4:
                 topk_kwargs.update(
                     use_grouped_topk=False,
-                    scoring_func=config.scoring_func,
+                    scoring_func=_deepseek_v4_scoring_func(
+                        config.scoring_func, self.gate.e_score_correction_bias
+                    ),
                     sqrtsoftplus_log1p=(
                         getattr(config, "model_type", None) == "deepseek_v41"
                     ),

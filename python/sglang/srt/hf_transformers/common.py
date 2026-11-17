@@ -100,6 +100,7 @@ from sglang.srt.configs.all_configs import (
 )
 from sglang.srt.configs.deepseek_ocr import DeepseekVLV2Config
 from sglang.srt.configs.deepseek_v41 import DEEPSEEK_V41_CONFIG_CLASSES
+from sglang.srt.configs.dmodel_deepseek_v4 import DModelDeepseekV4FlashConfig
 from sglang.srt.configs.internvl import InternVLChatConfig
 from sglang.srt.utils import get_bool_env_var, logger, lru_cache_frozenset
 from sglang.srt.utils.hf_transformers_patches import normalize_rope_scaling_compat
@@ -225,11 +226,17 @@ try:
         engram_head_dim = 0
         engram_pad_token_id = 2
         engram_compressed_vocab_size = 0
+        hc_residual_mode = "sinkhorn"
+        n_dense_layers = 0
 
     _CONFIG_REGISTRY["deepseek_v32"] = _DeepseekV32ConfigAlias
     _CONFIG_REGISTRY["deepseek_v4"] = _DeepseekV4ConfigAlias
     _CONFIG_REGISTRY.update(
         {cls.model_type: cls for cls in DEEPSEEK_V41_CONFIG_CLASSES}
+    )
+    # DModel V4-Flash checkpoints run on the V4 runtime after normalization.
+    _CONFIG_REGISTRY[DModelDeepseekV4FlashConfig.model_type] = (
+        DModelDeepseekV4FlashConfig
     )
 
     # For kimi_k25_eagle3

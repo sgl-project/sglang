@@ -142,3 +142,7 @@ class DeepSeekV4Config(PretrainedConfig):
     q_head_norm: bool = True
     hc_sinkhorn_iters: int = 20
     hc_eps: float = 1e-6
+    # "sinkhorn" mixes the streams; "identity" keeps only the pre/post gates.
+    hc_residual_mode: str = "sinkhorn"
+    # The first n_dense_layers decoder layers run a dense FFN instead of a MoE.
+    n_dense_layers: int = 0
