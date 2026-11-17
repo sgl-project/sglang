@@ -8,7 +8,7 @@ from sglang.srt.utils.gc_utils import freeze_gc, refreeze_gc
 
 logger = logging.getLogger(__name__)
 
-GC_CHECK_INTERVAL_SECS = 1.0
+GC_CHECK_INTERVAL_SECS = 600.0
 HEAP_GROWTH_WARN_RATIO = 1.5
 
 

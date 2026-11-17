@@ -33,7 +33,6 @@ class TestGCFreezer(CustomTestCase):
             ("freeze_gc", self.gc_ops.freeze_gc),
             ("refreeze_gc", self.gc_ops.refreeze_gc),
             ("logger", self.gc_ops.logger),
-            ("GC_CHECK_INTERVAL_SECS", 600.0),
         ):
             patcher = patch.object(gc_freezer, target, value)
             patcher.start()
