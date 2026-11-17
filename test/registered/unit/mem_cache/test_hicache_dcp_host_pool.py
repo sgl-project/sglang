@@ -213,9 +213,7 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
                             )
 
     @staticmethod
-    def _attach_storage(
-        pool, mode="cache", backend="file", backend_extra_config=None
-    ):
+    def _attach_storage(pool, mode="cache", backend="file", backend_extra_config=None):
         cc = HiCacheController.__new__(HiCacheController)
         cc.mem_pool_host = cc.storage_host_pool = pool
         cc.page_size = pool.logical_page_size
@@ -408,7 +406,9 @@ class TestHostPoolSizingUnderDcp(CustomTestCase):
                 )
             with self.assertRaisesRegex(NotImplementedError, "supports_dcp_shards"):
                 self._attach_storage(pool, backend="dynamic")
-            with self.assertRaisesRegex(NotImplementedError, "requires file or Mooncake"):
+            with self.assertRaisesRegex(
+                NotImplementedError, "requires file or Mooncake"
+            ):
                 self._attach_storage(pool, backend="other")
             opted_in = dict(extra, class_name="_OptedIn")
             cc = self._attach_storage(
