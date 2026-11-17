@@ -1,4 +1,5 @@
-﻿"""Accuracy evaluation runner for benchmark.serving (#1096)."""
+"""Accuracy evaluation runner for benchmark.serving (#1096)."""
+
 from __future__ import annotations
 
 import json

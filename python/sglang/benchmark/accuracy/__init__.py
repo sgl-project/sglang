@@ -1,4 +1,4 @@
-﻿# SPDX-License-Identifier: Apache-2.0
+# SPDX-License-Identifier: Apache-2.0
 """Accuracy evaluation for benchmark.serving (#1096)."""
 
 from sglang.benchmark.accuracy.runner import (

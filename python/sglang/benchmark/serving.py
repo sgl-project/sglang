@@ -2164,9 +2164,7 @@ def run_benchmark(args_: argparse.Namespace):
             )
             sys.exit(1)
         result = run_accuracy_eval(args, base_url=base_url)
-        out_path = write_accuracy_result(
-            result, getattr(args, "accuracy_output", None)
-        )
+        out_path = write_accuracy_result(result, getattr(args, "accuracy_output", None))
         print("\n{s:{c}^{n}}".format(s=" Accuracy Evaluation Result ", n=50, c="="))
         print("{:<40} {:<10}".format("Dataset:", result.dataset))
         print("{:<40} {:<10}".format("Eval:", result.eval_name or ""))
@@ -2392,7 +2390,10 @@ def cli_main():
         help="Name of the dataset to benchmark on.",
     )
     parser.add_argument(
-        "--dataset-path", type=str, default="", help="Path to the dataset. For --eval-accuracy, also the optional local corpus file (gsm8k/gpqa/aime/mmmu)."
+        "--dataset-path",
+        type=str,
+        default="",
+        help="Path to the dataset. For --eval-accuracy, also the optional local corpus file (gsm8k/gpqa/aime/mmmu).",
     )
     parser.add_argument(
         "--dataset-offset",

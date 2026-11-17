@@ -1,4 +1,4 @@
-﻿# Adapted from https://github.com/openai/simple-evals/ and simple_eval_aime25.py
+# Adapted from https://github.com/openai/simple-evals/ and simple_eval_aime25.py
 """AIME competition math evaluation (AIME 2024鈥?026)."""
 
 import re
@@ -46,7 +46,9 @@ _AIME_SOURCES: Dict[int, List[AimeSource]] = {
     ],
     26: [
         AimeSource("MathArena/aime_2026", q_field="problem"),
-        AimeSource("96kevinli29/aime2026-en", q_field="problem", a_field="ground_truth"),
+        AimeSource(
+            "96kevinli29/aime2026-en", q_field="problem", a_field="ground_truth"
+        ),
     ],
 }
 
@@ -65,7 +67,9 @@ def normalize_aime_answer(answer: Optional[str]) -> Optional[str]:
     return answer
 
 
-def _row_question_answer(row: Dict[str, Any], q_field: str, a_field: str) -> Dict[str, str]:
+def _row_question_answer(
+    row: Dict[str, Any], q_field: str, a_field: str
+) -> Dict[str, str]:
     question = row.get(q_field)
     answer = row.get(a_field)
     if question is None or answer is None:
@@ -124,9 +128,7 @@ class AIMEEval(Eval):
     def __call__(self, sampler: SamplerBase) -> EvalResult:
         def fn(row: dict):
             prompt_messages = [
-                sampler._pack_message(
-                    content=QUERY_TEMPLATE.format(**row), role="user"
-                )
+                sampler._pack_message(content=QUERY_TEMPLATE.format(**row), role="user")
             ]
             response_text = sampler(prompt_messages) or ""
             match = re.search(ANSWER_PATTERN, response_text)
