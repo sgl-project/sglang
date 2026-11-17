@@ -160,6 +160,7 @@ class TestUBTreeState(CustomTestCase):
                     config = SimpleNamespace(
                         mambaish_config=SimpleNamespace(mamba2_cache_params=_params()),
                         extra_mamba_cache_bytes_per_req=0,
+                        extra_mamba_cache_bytes_per_request_row=0,
                         fused_entry_bytes=lambda name: None,
                         spec_algorithm=SpeculativeAlgorithm.from_string("UBTREE"),
                         is_draft_worker=False,
