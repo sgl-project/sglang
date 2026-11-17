@@ -13,8 +13,10 @@ register_cpu_ci(1.0, "base-a-test-cpu")
 class _Vocab:
     def __init__(self, tokens):
         self._vocab = {token: i for i, token in enumerate(tokens)}
+        self.get_vocab_calls = 0
 
     def get_vocab(self):
+        self.get_vocab_calls += 1
         return self._vocab
 
 
@@ -182,6 +184,14 @@ class TestMistralDetector(CustomTestCase):
         self.assertEqual(info.begin, "[TOOL_CALLS]get_weather[ARGS]")
         self.assertEqual(info.trigger, "[TOOL_CALLS]")
         self.assertEqual(info.end, "")
+
+    def test_vocab_read_once_per_tokenizer(self):
+        """Parsers are built per request; read the full vocab once per tokenizer."""
+        compact, legacy = _Vocab({"[ARGS]"}), _Vocab({"[TOOL_CALLS]"})
+        for _ in range(2):
+            self.assertTrue(MistralDetector(compact)._compact_format)
+            self.assertFalse(MistralDetector(legacy)._compact_format)
+        self.assertEqual((compact.get_vocab_calls, legacy.get_vocab_calls), (1, 1))
 
     def test_constrained_output_parses_every_call(self):
         info_func = MistralDetector(_Vocab({"[ARGS]"})).structure_info()
