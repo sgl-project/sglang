@@ -1700,6 +1700,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         sampling_params = self.sampling_params_class(**sampling_kwargs)
         sampling_params.max_new_tokens_defaulted = (
             "max_new_tokens" not in obj.sampling_params
+            or isinstance(obj, GenerateReqInput)
+            and obj._max_new_tokens_defaulted
         )
         sampling_params.normalize(self.tokenizer)
         sampling_params.verify(self.model_config.vocab_size)

@@ -278,6 +278,29 @@ class TestKVCapacityValidation(CustomTestCase):
         ]
         self.assertEqual(sorted(item["index"] for item in items), list(range(4)))
 
+    def test_completion_omitted_budget_is_not_explicit_sixteen(self):
+        for stream in (False, True):
+            for explicit in (False, True):
+                with self.subTest(stream=stream, explicit=explicit):
+                    body = {
+                        "model": DEFAULT_SMALL_MODEL_NAME_FOR_TEST,
+                        "prompt": [100] * 500,
+                        "stream": stream,
+                        "temperature": 0,
+                    }
+                    if explicit:
+                        body["max_tokens"] = 16
+                    response = requests.post(
+                        self.base_url + "/v1/completions", json=body, timeout=30
+                    )
+                    self.assertEqual(
+                        response.status_code, 400 if explicit else 200, response.text
+                    )
+                    if explicit:
+                        self.assertIn("max_new_tokens=16", response.text)
+                    else:
+                        self.assertNotIn('"error"', response.text)
+
     def test_default_budget_is_not_an_explicit_request(self):
         for params, expected_status in (({}, 200), ({"max_new_tokens": 128}, 400)):
             with self.subTest(params=params):

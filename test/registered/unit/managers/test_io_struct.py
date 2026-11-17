@@ -436,6 +436,20 @@ class TestGenerateReqInputNormalization(CustomTestCase):
             rid=["id1", "id2"],
         )
 
+    def test_adapter_budget_provenance_survives_batch_and_cannot_be_client_set(self):
+        with self.assertRaises(TypeError):
+            GenerateReqInput(text="Hello", _max_new_tokens_defaulted=True)
+        request = GenerateReqInput(
+            text=["a", "b"], sampling_params={"max_new_tokens": 16}
+        )
+        request._max_new_tokens_defaulted = True
+        request.normalize_batch_and_arguments()
+        for index in range(2):
+            self.assertTrue(request[index]._max_new_tokens_defaulted)
+            self.assertTrue(copy.copy(request[index])._max_new_tokens_defaulted)
+        native = GenerateReqInput(text="a", sampling_params={"max_new_tokens": 16})
+        self.assertFalse(native._max_new_tokens_defaulted)
+
     def test_sampling_params_are_owned_by_each_request(self):
         """Adjusting one request's token budget must preserve peers and caller defaults."""
         for n in (1, 2):

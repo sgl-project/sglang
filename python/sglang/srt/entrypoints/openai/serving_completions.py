@@ -143,6 +143,9 @@ class OpenAIServingCompletion(OpenAIServingBase):
             mm_processor_kwargs=request.mm_processor_kwargs,
         )
 
+        adapted_request._max_new_tokens_defaulted = (
+            "max_tokens" not in request.model_fields_set
+        )
         return adapted_request, request
 
     def _build_sampling_params(self, request: CompletionRequest) -> dict[str, Any]:

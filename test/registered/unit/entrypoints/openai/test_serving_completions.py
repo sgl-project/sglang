@@ -103,6 +103,15 @@ class ServingCompletionTestCase(unittest.TestCase):
                         error, f"logprobs must be in [0, 32000], got {logprobs}."
                     )
 
+    def test_completion_default_budget_keeps_caller_presence(self):
+        """A normalized default16 must not become an explicit KV budget."""
+        for kwargs, defaulted in (({}, True), ({"max_tokens": 16}, False)):
+            with self.subTest(kwargs=kwargs):
+                request = CompletionRequest(model="x", prompt=[1, 2], **kwargs)
+                internal, _ = self.sc._convert_to_internal_request(request)
+                self.assertEqual(internal.sampling_params["max_new_tokens"], 16)
+                self.assertEqual(internal._max_new_tokens_defaulted, defaulted)
+
     # ---------- prompt-handling ----------
     def test_single_token_ids_prompt(self):
         req = CompletionRequest(model="x", prompt=[1, 2, 3, 4], max_tokens=100)

@@ -211,6 +211,7 @@ async fn completions(
                 text: text.clone(),
                 input_ids: input_ids.clone(),
                 sampling_params: sampling.clone(),
+                max_new_tokens_defaulted: request.max_tokens.is_none(),
                 stream,
                 return_logprob: request.logprobs.is_some(),
                 logprob_start_len: if echo && request.logprobs.is_some() {
