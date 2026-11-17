@@ -47,6 +47,7 @@ BOOTSTRAP_INIT_PORT = 8995
 
 # Timeouts and delays
 ROUTER_CONFIGMAP_TIMEOUT = 300
+PD_WORKER_READY_TIMEOUT = 600
 SERVER_INITIALIZATION_DELAY = 30
 SERVICE_EXIT_WAIT_SECONDS = 120
 
@@ -386,6 +387,69 @@ def wait_for_all_ports_ready(ips, port, timeout=LOCAL_TIMEOUT, check_interval=15
 
     logger.info(f"Timeout: Not all nodes are ready after {timeout} seconds")
     return False
+
+
+def wait_for_pd_worker_roles(
+    expected_roles, port, timeout=PD_WORKER_READY_TIMEOUT, check_interval=5
+):
+    """Wait until every PD worker's `/server_info` reports its own role.
+
+    sgl-router classifies a worker as prefill/decode by introspecting
+    `/server_info` once when it starts, and static worker URLs are never
+    re-introspected. A worker that still accepts TCP but is too busy to answer
+    HTTP for a few seconds therefore stays registered as `Plain`, and the
+    decode side then rejects every request with "Disaggregated request
+    received without bootstrap room id". Waiting for the role here removes
+    that race before the router is launched.
+
+    Args:
+        expected_roles (dict): {pod_ip: "prefill" | "decode"}.
+        port (int): Worker HTTP port.
+        timeout (int): Total timeout in seconds.
+        check_interval (int): Interval between checks in seconds.
+
+    Raises:
+        RuntimeError: If a worker never reports the expected role.
+    """
+    start_time = time.time()
+    pending = dict(expected_roles)
+    last_seen = {}
+
+    while time.time() - start_time < timeout:
+        for ip, role in list(pending.items()):
+            url = f"http://{ip}:{port}/server_info"
+            try:
+                response = requests.get(url, timeout=10)
+                response.raise_for_status()
+                info = response.json()
+            except Exception as e:
+                last_seen[ip] = f"request failed: {e}"
+                continue
+
+            mode = info.get("disaggregation_mode")
+            bootstrap_port = info.get("disaggregation_bootstrap_port")
+            last_seen[ip] = f"disaggregation_mode={mode!r}"
+            if mode != role:
+                continue
+            if mode == "prefill" and not bootstrap_port:
+                last_seen[ip] += " (bootstrap port missing)"
+                continue
+            del pending[ip]
+            logger.info(
+                f"Worker {url} reports disaggregation_mode={mode} "
+                f"bootstrap_port={bootstrap_port}"
+            )
+
+        if not pending:
+            logger.info(f"All {len(expected_roles)} PD workers report their role")
+            return
+
+        time.sleep(check_interval)
+
+    raise RuntimeError(
+        f"PD workers did not report their disaggregation role within {timeout}s: "
+        f"{ {ip: last_seen.get(ip, 'no response') for ip in pending} }"
+    )
 
 
 def _get_arg_value(args_list, name):
@@ -800,6 +864,19 @@ def launch_router(model_config, router_binary, process_holder=None):
         ips=node_ip_list, port=PREFILL_DECODE_PORT, timeout=LOCAL_TIMEOUT
     ):
         raise RuntimeError("Failed to wait for all nodes to be ready")
+
+    # PD separation only: the router reads each worker's role from
+    # /server_info exactly once when it starts, so wait for the roles first.
+    # An open TCP port is not enough — a worker that is still warming up keeps
+    # accepting connections while it cannot answer HTTP yet, and the router
+    # would then register it as Plain and route PD requests to decode without
+    # a bootstrap room id.
+    if "prefill_args" in model_config and "decode_args" in model_config:
+        expected_roles = {}
+        for role, urls in (("prefill", prefill_url), ("decode", decode_url)):
+            for url in urls:
+                expected_roles[url.rsplit(":", 1)[0]] = role
+        wait_for_pd_worker_roles(expected_roles, port=PREFILL_DECODE_PORT)
 
     # Set environment variables
     set_environment_variables(model_config.get("router_envs"))
