@@ -55,9 +55,16 @@ from sglang.srt.model_executor.runner_utils.prefill_graph import (
 )
 from sglang.srt.models.deepseek_v2 import MoEOutput
 from sglang.srt.runtime_context import get_forward, get_parallel, get_platform
-from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, is_xpu
+from sglang.srt.utils import (
+    is_gfx95_supported,
+    is_gfx942_supported,
+    is_hip,
+    is_npu,
+    is_xpu,
+)
 
 _is_gfx95_supported = is_gfx95_supported()
+_is_gfx942_supported = is_gfx942_supported()
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_xpu = is_xpu()
@@ -399,10 +406,14 @@ def _mix_stats_impl(hc: HcSubLayer, x: torch.Tensor) -> HcTriplet:
     hopper_fused_stats = get_platform().is_sm90 and (
         x.shape[0] == 1 or (bf16_parts is not None and 32 <= x.shape[0] <= 65536)
     )
-    # gfx950 uses the fused Triton port at every row count (MI350X).
-    use_fused_stats = _is_gfx95_supported or (
-        torch.version.cuda is not None
-        and (get_platform().is_blackwell or hopper_fused_stats)
+    # gfx950 and gfx942 use the fused Triton port at every row count (MI350X, MI300X).
+    use_fused_stats = (
+        _is_gfx95_supported
+        or _is_gfx942_supported
+        or (
+            torch.version.cuda is not None
+            and (get_platform().is_blackwell or hopper_fused_stats)
+        )
     )
     if x.is_cuda and use_fused_stats and x.dtype == torch.bfloat16:
         # The default split-K/Sinkhorn fusion preserves batch invariance;
