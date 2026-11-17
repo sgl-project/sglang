@@ -306,7 +306,9 @@ class SamplingBatchInfo:
             top_ks=top_ks,
             min_ps=min_ps,
             sampling_seed=sampling_seed,
-            **_sampling_flags(top_ps_host, top_ks_host, min_ps_host),
+            **_sampling_flags(
+                top_ps=top_ps_host, top_ks=top_ks_host, min_ps=min_ps_host
+            ),
             vocab_size=vocab_size,
             penalizer_orchestrator=penalizer_orchestrator,
             has_custom_logit_processor=has_custom_logit_processor,
@@ -655,8 +657,14 @@ class SamplingBatchInfo:
         top_ks: List[int],
         min_ps: List[float],
     ) -> None:
-        """Set request-derived sampling flags from the kept batch rows."""
-        for name, value in _sampling_flags(top_ps, top_ks, min_ps).items():
+        """Recompute the flags that SamplingBatchInfo.filter_batch leaves sticky.
+
+        filter_batch keeps them as they were, which is safe but sticky: one
+        finished row keeps the rest of the running batch on its sampling path.
+        ScheduleBatch.filter_batch calls this with the kept requests' params.
+        """
+        flags = _sampling_flags(top_ps=top_ps, top_ks=top_ks, min_ps=min_ps)
+        for name, value in flags.items():
             setattr(self, name, value)
 
     def _merge_processor_entries(
@@ -734,6 +742,7 @@ def _top_k_flags(top_ks: List[int]) -> Dict[str, Any]:
 
 
 def _sampling_flags(
+    *,
     top_ps: List[float],
     top_ks: List[int],
     min_ps: List[float],

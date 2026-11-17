@@ -887,24 +887,30 @@ class TestFromScheduleBatch(CustomTestCase):
                 self.assertEqual(self._top_k_flags(info), self._top_k_flags(fresh))
 
     def test_refresh_sampling_flags_reads_only_the_given_params(self):
-        """The flags come from the requests' top_k, not from the top_ks tensor, so
-        a reassigned tensor cannot leave them stale."""
+        """Every flag comes from the given sampling params, not from the top_ks,
+        top_ps and min_ps tensors, so a reassigned tensor cannot leave one stale
+        -- and reading a device tensor here would sync the host."""
         batch = MagicMock()
         batch.reqs = [self._make_req(top_k=TOP_K_ALL), self._make_req(top_k=1)]
         batch.device = DEVICE
         info = SamplingBatchInfo.from_schedule_batch(batch, VOCAB_SIZE)
+        # The tensors disagree with the params below on every flag.
         info.top_ks = torch.tensor([5, 5], dtype=torch.int32)
+        info.top_ps = torch.tensor([1.0, 1.0], dtype=torch.float)
+        info.min_ps = torch.tensor([0.0, 0.0], dtype=torch.float)
 
         info.refresh_sampling_flags(
-            top_ps=[1.0, 1.0],
+            top_ps=[1.0, 0.8],
             top_ks=[TOP_K_ALL, 1],
-            min_ps=[0.0, 0.0],
+            min_ps=[0.0, 0.05],
         )
 
         self.assertTrue(info.is_any_greedy)
         self.assertFalse(info.is_all_greedy)
         self.assertTrue(info.need_top_k_sampling)
         self.assertIsNone(info.max_top_k)
+        self.assertTrue(info.need_top_p_sampling)
+        self.assertTrue(info.need_min_p_sampling)
 
     def test_refresh_sampling_flags_after_filter_matches_a_fresh_batch(self):
         """Filtering must select the same sampling path as a fresh kept batch."""
