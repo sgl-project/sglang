@@ -24,7 +24,8 @@ decides whether overlap scheduling can run:
   copy would hold a later state than its key. SGLang turns overlap scheduling off
   for this strategy. It needs nothing from the backend.
 - ``extra_buffer`` (``support_mamba_cache_extra_buffer=True``) keeps overlap
-  scheduling: each request gets two track slots, and the scheduler picks the
+  scheduling: each request gets two track slots (which the state pool sizing
+  reserves per running request), and the scheduler picks the
   tracked positions (in an extend, the last ``mamba_cache_chunk_size`` boundary of
   its new tokens, relative to the extend start; in decode, every
   ``mamba_track_interval`` tokens) and alternates between the slots. The backend
