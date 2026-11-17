@@ -30,7 +30,7 @@ from sglang.srt.runtime_context import (
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.state_capturer.base import TopkCaptureOutput
 from sglang.srt.utils.device import async_d2h as _async_d2h
-from sglang.srt.utils.device import is_cuda
+from sglang.srt.utils.device import is_cuda, is_pin_memory_available
 from sglang.srt.utils.weight_versions import compute_weight_version_spans
 
 if TYPE_CHECKING:
@@ -85,7 +85,16 @@ def _async_d2h_rows(rows: List[Any]) -> List[Any]:
     tensors = [row for row in rows if torch.is_tensor(row)]
     if len(tensors) < 2 or len({row.dtype for row in tensors}) > 1:
         return [_async_d2h(row) if torch.is_tensor(row) else row for row in rows]
-    host = _async_d2h(torch.cat([row.reshape(-1) for row in tensors]))
+    flat = torch.cat([row.reshape(-1) for row in tensors])
+    device = flat.device
+    if device.type != "cpu" and is_pin_memory_available(device):
+        # The cat is only queued on the current stream. Record the rows there, as
+        # `_async_d2h` does for the tensor it copies, so the stream they were
+        # allocated on cannot reuse their memory before the cat has read them.
+        stream = torch.get_device_module(device).current_stream()
+        for row in tensors:
+            row.record_stream(stream)
+    host = _async_d2h(flat)
     host_rows = iter(
         chunk.view(row.shape)
         for chunk, row in zip(host.split([row.numel() for row in tensors]), tensors)
