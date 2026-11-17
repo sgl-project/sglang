@@ -1005,6 +1005,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
             _use_aiter
             and not _skip_aiter_unquant
             and type(layer.weight.data) is torch.Tensor
+            # AITER GEMMs only take GPU tensors; CPU inputs use F.linear below.
+            and x.is_cuda
         ):
             if _is_gfx95 and _prefer_triton_a16w16(x, layer.weight):
                 return _aiter_triton_a16w16(x, layer.weight, bias, dtype=x.dtype)
