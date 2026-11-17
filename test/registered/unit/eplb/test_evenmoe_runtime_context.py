@@ -68,6 +68,9 @@ class TestEvenMoERuntimeContext(unittest.TestCase):
             self.assertEqual(kwargs["ep_size"], 2)
             self.assertEqual(kwargs["source_rank"], 1)
             self.assertEqual(kwargs["experts_per_rank"], 2)
+            # The default --eplb-algorithm is the balancer's default L1 policy.
+            self.assertEqual(kwargs["placement_policy"], "auto")
+            self.assertEqual(mlb.placement_policy, "auto")
             self.assertIs(type(mlb), MoELoadBalancer)
             extract.assert_called_once_with(model_config)
 

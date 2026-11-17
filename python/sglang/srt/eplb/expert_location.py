@@ -937,7 +937,7 @@ def compute_initial_expert_location_metadata(
     elif "logical_count" in data_dict:
         if (
             moe_load_balancer is not None
-            and moe_load_balancer.requires_per_source_rank_statistics()
+            and moe_load_balancer.placement_logical_count() == "per_source_rank"
             and data_dict.get("logical_count_layout") != "rank_layer_expert"
         ):
             raise ValueError(

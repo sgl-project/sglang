@@ -63,14 +63,24 @@ class LayerPlacementRefresher:
         if not self._should_refresh_layer(layer_id):
             return
 
-        from evenmoe.adapters.sglang import commit_placement, plan_layer_from_topk
-
-        # EvenMoE gathers every rank's counts over the EP group and plans the layer.
-        maps = plan_layer_from_topk(
-            self._moe_load_balancer, get_context(), layer_id, logical_topk_ids
+        from evenmoe.adapters.sglang import (
+            commit_placement,
+            count_logical_experts,
+            to_placement_request,
+            to_sglang_maps,
         )
+
+        live_metadata = get_global_expert_location_metadata()
+        local_count = count_logical_experts(
+            logical_topk_ids, live_metadata.num_logical_experts, dtype=torch.int32
+        )
+        # EvenMoE gathers every rank's counts over the EP group and plans the layer.
+        plan = self._moe_load_balancer.plan_layer_placement(
+            to_placement_request(context=get_context()), local_count
+        )
+        maps = to_sglang_maps(plan, layer_id=layer_id)
         layer_metadata = ExpertLocationMetadata._init_raw(
-            ep_size=get_global_expert_location_metadata().ep_size,
+            ep_size=live_metadata.ep_size,
             physical_to_logical_map=maps.physical_to_logical_map,
             logical_to_all_physical_map=maps.logical_to_all_physical_map,
             mlb_routing_metadata=maps.routing_metadata,

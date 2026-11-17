@@ -143,13 +143,7 @@ def test_current_batch_refresh_includes_idle_rank_and_commits_before_routing(emp
     from evenmoe import MoELoadBalancer
     from evenmoe.adapters.sglang.routing import _SGLangCollectives
 
-    mlb = Mock()
-    mlb.routing_capabilities.requires_placement_state = True
-    # EvenMoE combines the counts over SGLang's MoE EP group, the real way.
-    mlb.aggregate_logical_count.side_effect = MoELoadBalancer(
-        routing_pipeline="ultraep", collectives=_SGLangCollectives(context)
-    ).aggregate_logical_count
-    mlb.plan_placement.return_value = SimpleNamespace(
+    layer_plan = SimpleNamespace(
         physical_to_logical_map=plan.physical_to_logical_map,
         logical_to_all_physical_map=plan.logical_to_all_physical_map,
         logical_to_physical_count=plan.logical_to_all_physical_map_num_valid,
@@ -163,9 +157,19 @@ def test_current_batch_refresh_includes_idle_rank_and_commits_before_routing(emp
             torch.tensor([[0, 0] if empty else [2, 1], [4, 2]], dtype=torch.int32),
         )
         events.append("solve")
-        return mlb.plan_placement.return_value
+        return layer_plan
 
-    mlb.plan_placement.side_effect = solve
+    mlb = Mock()
+    mlb.routing_capabilities.requires_placement_state = True
+    # EvenMoE combines the counts over SGLang's MoE EP group and plans the
+    # layer, the real way, with a per-source-rank planner standing in for UltraEP.
+    mlb.plan_layer_placement.side_effect = MoELoadBalancer(
+        routing_pipeline="ultraep",
+        placement_planners={
+            "ultraep": SimpleNamespace(logical_count="per_source_rank", plan=solve)
+        },
+        collectives=_SGLangCollectives(context),
+    ).plan_layer_placement
     mlb.on_placement_committed.side_effect = lambda _: events.append("publish")
     updater = Mock()
 
@@ -501,8 +505,16 @@ def test_per_layer_refresh_replaces_the_periodic_rebalance(per_layer):
     runner = object.__new__(model_runner_module.ModelRunner)
     runner.is_draft_worker = False
     runner.model_config = object()
-    runner.moe_load_balancer = SimpleNamespace(
-        placement_policy="ultraep" if per_layer else None
+    from evenmoe import MoELoadBalancer
+
+    # The balancer's default L1 comes from --eplb-algorithm for every pipeline;
+    # only the routing pipeline decides whether placement refreshes per layer.
+    runner.moe_load_balancer = MoELoadBalancer.from_algorithm(
+        "ultraep" if per_layer else "lplb",
+        ep_size=2,
+        source_rank=0,
+        experts_per_rank=2,
+        placement_policy="ultraep" if per_layer else "auto",
     )
     context = get_context()
     with (

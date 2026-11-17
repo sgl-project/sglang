@@ -1043,14 +1043,15 @@ class _DetailAccumulator(_UtilizationRateAccumulatorMixin):
 
 
 def _keeps_per_source_rank_statistics() -> bool:
-    """Whether the EvenMoE placement policy solves from each source EP rank's own
-    counts, so the recorder keeps the rank dimension instead of summing it."""
+    """Whether the EvenMoE placement policy solves from the per-source-rank
+    logical_count view, so the recorder keeps the rank dimension instead of
+    summing it."""
     from sglang.srt.runtime_context import get_resources
 
     moe_load_balancer = get_resources().moe_load_balancer
     return (
         moe_load_balancer is not None
-        and moe_load_balancer.requires_per_source_rank_statistics()
+        and moe_load_balancer.placement_logical_count() == "per_source_rank"
     )
 
 

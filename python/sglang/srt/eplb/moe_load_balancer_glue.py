@@ -143,12 +143,12 @@ def uses_coupled_placement(pipeline_or_balancer) -> bool:
 
     Routing consumes state that placement produces (a per-source-rank quota), so
     the two run as a pair, and the layout keeps each rank's master experts
-    fixed. Accepts a RoutingPipeline or the MoELoadBalancer built from it.
+    fixed. Accepts a RoutingPipeline or the MoELoadBalancer built from it; a
+    balancer is asked about its routing pipeline, since its own default
+    placement policy is set from --eplb-algorithm for every pipeline.
     """
-    return (
-        pipeline_or_balancer is not None
-        and pipeline_or_balancer.placement_policy is not None
-    )
+    pipeline = getattr(pipeline_or_balancer, "routing_pipeline", pipeline_or_balancer)
+    return pipeline is not None and pipeline.placement_policy is not None
 
 
 def refreshes_placement_per_layer(pipeline_or_balancer) -> bool:
