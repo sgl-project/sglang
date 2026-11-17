@@ -45,7 +45,11 @@ from sglang.kernels.ops.kvcache.cache_move import (
     set_kv_buffer_prefix_valid_tiled_fp8,
 )
 from sglang.kernels.ops.kvcache.cache_ops import launch_reshape_and_cache_flash
-from sglang.kernels.ops.kvcache.kvcache import can_use_store_cache, store_cache
+from sglang.kernels.ops.kvcache.kvcache import (
+    can_use_store_cache,
+    store_cache,
+    store_cache_index_copy,
+)
 from sglang.kernels.ops.kvcache.mla_buffer import (
     get_mla_kv_buffer_triton,
     set_mla_kv_buffer_cast_triton,
@@ -209,6 +213,15 @@ def _set_kv_buffer_impl(
             v_cache,
             indices,
             row_dim,
+        )
+
+    if current_platform.is_musa():
+        return store_cache_index_copy(
+            k.reshape(-1, row_dim),
+            v.reshape(-1, v_row_dim),
+            k_cache.reshape(-1, row_dim),
+            v_cache.reshape(-1, v_row_dim),
+            indices,
         )
 
     from sglang.srt.model_executor.runner import get_is_capture_mode

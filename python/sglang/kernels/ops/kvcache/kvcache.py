@@ -118,3 +118,18 @@ def store_cache(
         size_limit,
         reserved_skip_index,
     )
+
+
+@register_custom_op(mutates_args=["k_cache", "v_cache"])
+def store_cache_index_copy(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    indices: torch.Tensor,
+) -> None:
+    """Autograd-opaque KV-cache store used when the JIT byte-copy kernel is unavailable."""
+    long_indices = indices.to(torch.int64)
+    with torch.no_grad():
+        k_cache.index_copy_(0, long_indices, k)
+        v_cache.index_copy_(0, long_indices, v)
