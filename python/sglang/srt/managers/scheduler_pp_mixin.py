@@ -1270,7 +1270,17 @@ class SchedulerPPMixin:
             p2p_work.extend(
                 self.pp_group.send_tensor_dict(
                     tensor_dict=tensor_dict,
-                    all_gather_group=(self.attn_tp_group),
+                    # Send last-stage outputs in full to stage 0 to avoid an
+                    # AllGather on the model group during graph replay.
+                    # The forward direction stays sharded for proxy messages.
+                    all_gather_group=(
+                        None
+                        if _is_npu
+                        and get_parallel().pp_size == 2
+                        and self.pp_group.is_last_rank
+                        and msg_type == "output"
+                        else self.attn_tp_group
+                    ),
                     async_send=async_send,
                 )
             )
@@ -1341,7 +1351,13 @@ class SchedulerPPMixin:
     ) -> Tuple[Dict[str, torch.Tensor], Optional[torch.Event]]:
         return self._pp_recv_typed_dict(
             expected_kind="output",
-            all_gather_group=(self.attn_tp_group),
+            all_gather_group=(
+                None
+                if _is_npu
+                and get_parallel().pp_size == 2
+                and self.pp_group.is_first_rank
+                else self.attn_tp_group
+            ),
         )
 
     def _pp_make_skip_output_result(
@@ -1586,6 +1602,16 @@ class SchedulerPPMixin:
             )
 
             next_draft_input = make_next_draft_input(
+                bonus_tokens=next_token_ids,
+                new_seq_lens=batch.seq_lens,
+            )
+            batch.spec_info = next_draft_input
+        elif batch.spec_algorithm.is_dflash():
+            from sglang.srt.speculative.draft_worker_common import (
+                make_draft_input_v2,
+            )
+
+            next_draft_input = make_draft_input_v2(
                 bonus_tokens=next_token_ids,
                 new_seq_lens=batch.seq_lens,
             )
@@ -2214,8 +2240,12 @@ class SchedulerPPMixin:
                         self.device_module.current_stream().wait_event(send_ready_event)
                     recv_dict = self.pp_group.send_recv_tensor_dict(
                         send_tensor_dict=send_dict,
-                        send_all_gather_group=all_gather_group,
-                        recv_all_gather_group=all_gather_group,
+                        send_all_gather_group=(
+                            None if self.pp_group.is_last_rank else all_gather_group
+                        ),
+                        recv_all_gather_group=(
+                            None if self.pp_group.is_first_rank else all_gather_group
+                        ),
                     )
                     output_recv_event = self._pp_record_comm_event()
             _handle_recv_dict(recv_dict, output_recv_event)

@@ -103,6 +103,8 @@ class GenerationBatchResult:
 
     # For overlap scheduling
     copy_done: Optional[Union[torch.cuda.Event, HostCopyDone]] = None
+    # Side-stream work still writing this batch's KV; copy_done is recorded after it.
+    side_stream_done: Optional[torch.cuda.Event] = None
     # The unified pool's record of this forward; processing the result retires
     # it, so page moves stop treating its pages as in flight.
     unified_forward_done: Optional[torch.cuda.Event] = None

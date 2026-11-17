@@ -14,6 +14,7 @@ from sglang.kernels.ops.sampling.topk import radix_topk
 from sglang.kernels.ops.speculative.verify_sampling import (
     tree_speculative_sampling_target_only,
 )
+from sglang.srt.environ import envs
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.sampler import (
     apply_custom_logit_processor,
@@ -598,6 +599,60 @@ def validate_dflash_mla_draft_config(draft_hf_config: Any) -> None:
             f"DFLASH mla drafts support rope_type in {sorted(_DFLASH_MLA_ROPE_TYPES)}, "
             f"got {rope_type!r}."
         )
+
+
+def mla_draft_compact_window_narrows(
+    *, dcp_size: int, page_size: int, megakernel: bool
+) -> bool:
+    return (
+        megakernel
+        # dcp_size must divide page_size so each compact slot keeps its owner.
+        and (dcp_size == 1 or page_size % dcp_size == 0)
+        and not envs.SGLANG_DISABLE_DFLASH_COMPACT_SWA_WINDOW.get()
+    )
+
+
+def resolve_mla_draft_compact_window(
+    draft_hf_config: Any,
+    *,
+    window_size: int,
+    dcp_size: int,
+    page_size: int = 1,
+    megakernel: bool = False,
+) -> Optional[int]:
+    """The ``--speculative-draft-window-size`` an MLA draft keeps on trtllm_mla
+    or cutedsl_mla, or None to serve the draft without the compact table."""
+    layer_types = get_dflash_layer_types(draft_hf_config)
+    if layer_types is not None and "sliding_attention" in layer_types:
+        if any(layer_type != "sliding_attention" for layer_type in layer_types):
+            raise ValueError(
+                "--speculative-draft-window-size with an MLA draft that mixes "
+                "full and sliding_attention layers is not supported on trtllm_mla "
+                "or cutedsl_mla: the compact draft table would narrow the full "
+                f"layers, and the native window cannot read it (layer_types="
+                f"{list(layer_types)})."
+            )
+        window_left = get_dflash_attention_sliding_window_size(draft_hf_config)
+        if window_left > window_size:
+            if mla_draft_compact_window_narrows(
+                dcp_size=dcp_size, page_size=page_size, megakernel=megakernel
+            ):
+                return window_size
+            raise ValueError(
+                f"--speculative-draft-window-size {window_size} is narrower than "
+                f"the draft's own sliding window (window_left={window_left}); "
+                "trtllm_mla and cutedsl_mla apply the draft's window and cannot "
+                "narrow it. Use a window size >= window_left or drop the flag."
+            )
+        return None
+    if dcp_size > 1:
+        raise ValueError(
+            "--speculative-draft-window-size with a full-attention MLA draft is "
+            "not supported under --dcp-size > 1: the compact draft table starts "
+            "on a page boundary, but the DCP page table walks pages of "
+            f"page_size * dcp_size positions (dcp_size={dcp_size})."
+        )
+    return window_size
 
 
 @dataclass(frozen=True)
