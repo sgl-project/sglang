@@ -4,6 +4,7 @@ import logging
 import re
 from copy import copy, deepcopy
 from fnmatch import fnmatchcase
+from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Dict, List, Mapping, Optional, Tuple, Union, cast
 
 import torch
@@ -748,6 +749,12 @@ class ModelSlimConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return ModelSlimLinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            if self._is_moe_layer_skipped(prefix):
+                logger.info_once(
+                    f"ModelSlim experts are unquantized (FLOAT) for layer {prefix}; "
+                    "using the unquantized MoE method."
+                )
+                return None
             moe_schemes = self.get_moe_scheme(layer, prefix)
             if moe_schemes is None:
                 raise ValueError(f"No ModelSlim MoE scheme found for layer {prefix}")
@@ -925,6 +932,68 @@ class ModelSlimConfig(QuantizationConfig):
         logger.info_once(f"Using {type(w2_scheme).__name__} for W2")
 
         return w13_scheme, w2_scheme
+
+    def _is_moe_layer_skipped(self, prefix: str) -> bool:
+        """Return whether all expert projections are explicitly unquantized."""
+        expert_name = prefix.split(".")[-1]
+        naming_conventions = [
+            ("gate_proj", "up_proj", "down_proj"),
+            ("w1", "w3", "w2"),
+        ]
+
+        for projection_names in naming_conventions:
+            projection_prefixes = [
+                f"{prefix}.0.{projection_name}" for projection_name in projection_names
+            ]
+            if all(
+                projection_prefix + ".weight" in self.quant_description
+                for projection_prefix in projection_prefixes
+            ):
+                fused_mapping = {
+                    expert_name: [
+                        f"{expert_name}.0.{projection_name}"
+                        for projection_name in projection_names
+                    ]
+                }
+                return self.is_layer_skipped(prefix, fused_mapping)
+
+        return False
+
+    def is_layer_skipped(
+        self, prefix: str, fused_mapping: Mapping[str, List[str]] = MappingProxyType({})
+    ):
+        # adapted from vllm.model_executor.layers.quantization.utils.quant_utils.is_layer_skipped
+        proj_name = prefix.split(".")[-1]
+        direct_prefix = self._resolve_quant_prefix(prefix)
+        if direct_prefix + ".weight" in self.quant_description:
+            return self.quant_description[direct_prefix + ".weight"] == "FLOAT"
+        if proj_name in fused_mapping:
+            shard_prefixes = [
+                prefix.replace(proj_name, shard_proj_name)
+                for shard_proj_name in fused_mapping[proj_name]
+            ]
+
+            is_skipped = None
+            for shard_prefix in shard_prefixes:
+                shard_prefix = self._resolve_quant_prefix(shard_prefix)
+                is_shard_skipped = (
+                    self.quant_description.get(shard_prefix + ".weight", "") == "FLOAT"
+                )
+
+                if is_skipped is None:
+                    is_skipped = is_shard_skipped
+                elif is_shard_skipped != is_skipped:
+                    raise ValueError(
+                        f"Detected some but not all shards of {prefix} "
+                        "are quantized. All shards of fused layers "
+                        "to have the same precision."
+                    )
+        else:
+            prefix = self._resolve_quant_prefix(prefix)
+            is_skipped = self.quant_description.get(prefix + ".weight", "") == "FLOAT"
+
+        assert is_skipped is not None
+        return is_skipped
 
     def get_scaled_act_names(self) -> List[str]:
         return []
