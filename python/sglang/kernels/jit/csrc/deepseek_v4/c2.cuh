@@ -76,6 +76,7 @@ template <
     typename PosT,
     typename LocT,
     deepseek_v4::KVLayout kLayout,
+    bool kWriteCache,
     bool kUsePDL>
 __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(const Compress2DecodeParams params) {
   using namespace device;
@@ -205,6 +206,7 @@ __global__ __launch_bounds__(kHeadDim / kC2VecSize) void flash_c2_decode_kernel(
   // before the trigger because that GEMM is the successor that reads it.
   out.store(params.kv_output, static_cast<int64_t>(row) * kCTASize + tx);
   PDLTriggerSecondary<kUsePDL>();
+  if constexpr (!kWriteCache) return;
 
   // ---- main-KV branch: RoPE tail, fp4 fake-quant, cache store ----
   // Match finish()'s bf16 rounding before RoPE.
@@ -326,7 +328,13 @@ __global__ __launch_bounds__(kHeadDim / 2) void c2_prefill_store_kernel(
   buf.store(params.kv_state + dst_row * kStride, threadIdx.x);
 }
 
-template <int64_t kHeadDim, int64_t kRopeDim, uint32_t kPageSize, deepseek_v4::KVLayout kLayout, bool kUsePDL>
+template <
+    int64_t kHeadDim,
+    int64_t kRopeDim,
+    uint32_t kPageSize,
+    deepseek_v4::KVLayout kLayout,
+    bool kWriteCache,
+    bool kUsePDL>
 struct FlashCompress2Kernel {
   static constexpr uint32_t kBlockSize = kHeadDim / kC2VecSize;
   static constexpr int32_t kPageBits = std::bit_width(kPageSize) - 1;
@@ -334,7 +342,7 @@ struct FlashCompress2Kernel {
   static_assert(kLayout != deepseek_v4::KVLayout::V4 || kPageBytes == host::div_ceil(584ll * kPageSize, 576) * 576);
   template <C2Mode kMode, typename PosT, typename LocT>
   static constexpr auto kernel =
-      flash_c2_decode_kernel<kMode, kHeadDim, kRopeDim, kPageBits, PosT, LocT, kLayout, kUsePDL>;
+      flash_c2_decode_kernel<kMode, kHeadDim, kRopeDim, kPageBits, PosT, LocT, kLayout, kWriteCache, kUsePDL>;
   template <typename PosT, typename LocT>
   static constexpr auto store_kernel = c2_prefill_store_kernel<kHeadDim, PosT, LocT, kUsePDL>;
 
@@ -477,9 +485,14 @@ struct FlashCompress2Kernel {
 
     // Real/imag interleaved, so the trailing dim is kRopeDim, not kRopeDim / 2.
     TensorMatcher({-1, kRopeDim}).with_dtype<fp32_t>().with_device(device_).verify(freqs_cis);
-    // The pool allocates the buffer as uint8 and hands it out viewed as its
-    // fp8 dtype (`get_extra_key_buffer`); both are one byte per element.
-    TensorMatcher({-1, kPageBytes}).with_dtype<uint8_t, fp8_e4m3_t>().with_device(device_).verify(kvcache);
+    if constexpr (kWriteCache) {
+      // The pool allocates the buffer as uint8 and hands it out viewed as its
+      // fp8 dtype (`get_extra_key_buffer`); both are one byte per element.
+      TensorMatcher({-1, kPageBytes}).with_dtype<uint8_t, fp8_e4m3_t>().with_device(device_).verify(kvcache);
+    } else {
+      // The Python wrapper aliases kv_output here; the kernel never dereferences it.
+      TensorMatcher({N, kHeadDim}).with_dtype<bf16_t>().with_device(device_).verify(kvcache);
+    }
 
     const auto num_tokens = static_cast<uint32_t>(N.unwrap());
     if (num_tokens == 0) return;

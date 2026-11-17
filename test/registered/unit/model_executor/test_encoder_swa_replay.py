@@ -742,6 +742,8 @@ class TestEncoderReplayDpStartupCheck(CustomTestCase):
 
         view = _View(
             dsv4_attn_backend="dsv4",
+            dsv41_main_kv_layout="auto",
+            dsv41_main_kv_consumer="auto",
             cuda_graph_config=SimpleNamespace(
                 prefill=SimpleNamespace(backend=Backend.DISABLED)
             ),

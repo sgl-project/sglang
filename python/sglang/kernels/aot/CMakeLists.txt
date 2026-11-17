@@ -407,3 +407,6 @@ target_include_directories(infllm_ops PRIVATE
 find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/lib" REQUIRED)
 target_link_libraries(infllm_ops PRIVATE ${TORCH_LIBRARIES} ${TORCH_PYTHON_LIBRARY} c10 cuda)
 install(TARGETS infllm_ops LIBRARY DESTINATION "sgl_kernel")
+
+# DSV4.1 packed Main-KV direct reader (SM90 only).
+include(${CMAKE_CURRENT_LIST_DIR}/cmake/flashmla_mixed.cmake)

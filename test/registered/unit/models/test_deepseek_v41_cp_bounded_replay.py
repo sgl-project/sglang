@@ -410,6 +410,8 @@ class TestCpBoundedReplayConfiguration(CustomTestCase):
             cfg = SimpleNamespace(
                 enable_encoder_swa_bounded_replay=False,
                 dsv4_attn_backend="auto",
+                dsv41_main_kv_layout="auto",
+                dsv41_main_kv_consumer="auto",
                 cuda_graph_config=SimpleNamespace(
                     prefill=SimpleNamespace(backend=backend)
                 ),
