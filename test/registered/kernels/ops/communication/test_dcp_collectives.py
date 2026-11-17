@@ -1,5 +1,10 @@
-"""Run with python on eight GPUs; validate peer exchange and graph replay."""
+"""Distributed DCP collective tests.
 
+Run the combined PCP+DCP cases with `--num-gpu 2 -k pcp_dcp` or
+`--num-gpu 4 -k pcp_dcp`.
+"""
+
+import math
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -31,6 +36,64 @@ def inputs(batch, rank, dim=512):
     lse = torch.randn(128, batch, device="cuda", generator=generator).t()[:, :96]
     lse[0] = -float("inf")
     return output, lse
+
+
+def test_pcp_dcp_prefix_gather():
+    from sglang.srt.layers.dcp.prefill import DcpPrefillWorkspace
+
+    fixture._init_world()
+    group = ps._WORLD
+    world, rank = group.world_size, group.rank_in_group
+    page_size, context_len, kv_dim = 8, 33, 576
+    workspace = DcpPrefillWorkspace(
+        context_len=context_len,
+        page_size=page_size,
+        dcp_size=world,
+        kv_dim=kv_dim,
+        dtype=torch.bfloat16,
+        device=group.device,
+    )
+    # Every row carries its token position. The physical row order is reversed.
+    full = torch.arange(context_len, dtype=torch.bfloat16, device=group.device)
+    full = full.view(-1, 1, 1).expand(-1, 1, kv_dim)
+    cache = full[rank::world].flip(0).contiguous()
+    rows = torch.arange(len(cache) - 1, -1, -1, device=group.device)
+
+    for length in (1, world + 1, page_size + 1, context_len):
+        local_count = len(full[rank:length:world])
+        workspace.gather_prefix(cache, rows[:local_count], length, group)
+        assert torch.equal(workspace.kv[:length], full[:length])
+
+
+def test_pcp_dcp_decode_merge():
+    from sglang.kernels.ops.attention.fixup_zero_kv import fixup_zero_kv_rows
+
+    fixture._init_world()
+    group = ps._WORLD
+    world, rank, device = group.world_size, group.rank_in_group, group.device
+    token_count = 2 * world + 1
+    lengths = torch.tensor([0, 1, world + 1, token_count], device=device)
+    batch_size, heads, dim = len(lengths), 8, 512
+    # Use the same inputs on all ranks so the reference attends over full KV.
+    gen = torch.Generator(device=device).manual_seed(42)
+    scores = torch.randn(batch_size, heads, token_count, device=device, generator=gen)
+    values = torch.randn(batch_size, token_count, dim, device=device, generator=gen)
+    valid = torch.arange(token_count, device=device) < lengths[:, None]
+    scores.masked_fill_(~valid[:, None, :], -torch.inf)
+    expected = scores.softmax(-1).nan_to_num() @ values
+
+    local_scores = scores[..., rank::world]
+    # All-masked shards yield NaN partial outputs. Decode must neutralize
+    # them before the base-2 LSE correction and cross-rank all-reduce.
+    out = (local_scores.softmax(-1) @ values[:, rank::world]).to(torch.bfloat16)
+    lse = (local_scores.logsumexp(-1) / math.log(2)).contiguous()
+    local_lens = valid[:, rank::world].sum(dim=-1, dtype=torch.int32)
+    q_indptr = torch.arange(batch_size + 1, device=device, dtype=torch.int32)
+    fixup_zero_kv_rows(out, lse, local_lens, q_indptr, 1)
+    actual = comm.cp_lse_ag_out_rs_mla(out, lse, group, replicated_heads=True)
+    torch.testing.assert_close(
+        actual.transpose(0, 1).float(), expected, atol=1e-2, rtol=1e-2
+    )
 
 
 @pytest.mark.parametrize("dim", [128, 512])

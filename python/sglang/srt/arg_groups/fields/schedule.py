@@ -87,7 +87,10 @@ class Schedule(msgspec.Struct):
     ] = 16384
     prefill_max_requests: A[
         Optional[int],
-        "The maximum number of requests in a prefill batch. If not specified, there is no limit.",
+        Arg(
+            help="The maximum number of requests in a prefill batch. If not specified, there is no limit.",
+            resolvable=True,
+        ),
     ] = None
     schedule_policy: A[
         str,

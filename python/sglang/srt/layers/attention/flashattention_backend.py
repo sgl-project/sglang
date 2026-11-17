@@ -38,6 +38,7 @@ from sglang.srt.layers.cp.base import (
     CPAttentionBackendKind,
     get_cp_strategy,
     is_cp_sharded_padded,
+    is_interleave,
 )
 from sglang.srt.layers.cp.utils import (
     get_cp_sharded_padded_cache_transfer_indices,
@@ -135,6 +136,8 @@ class FlashAttentionMetadata:
     window_size: tuple = (-1, -1)
     # Page table, the index of KV Cache Tables/Blocks
     page_table: torch.Tensor = None
+    dcp_prefix_rows: Optional[torch.Tensor] = None
+    dcp_interleave_kv_lens: Optional[torch.Tensor] = None
     # Page table for Sliding Window Attention
     swa_page_table: torch.Tensor = None
 
@@ -189,6 +192,7 @@ class FlashAttentionBackend(AttentionBackend):
     # Set from the pool type in __init__; the class default keeps the extend
     # metadata guard readable on instances built with __new__ (test stubs).
     _kv_shard_pool: Optional[PageInterleaveKVPoolMixin] = None
+    dcp_prefill_workspace = None
 
     # Chunked-prefix attention reads the stable ForwardBatch cu-seqlens and
     # KV-index buffers directly, so it needs no backend-private replay state.
@@ -227,6 +231,8 @@ class FlashAttentionBackend(AttentionBackend):
         self.kv_cache_dtype_str = model_runner.kv_cache_dtype_str
         self.kv_cache_is_mxfp8 = self.kv_cache_dtype_str == "mxfp8"
         self.page_size = model_runner.page_size
+        if get_parallel().dcp_over_attn_cp:
+            self.dcp_prefill_workspace = model_runner.dcp_prefill_workspace
         # Static page-table width (upper bound). The device-side page-table build
         # sizes to this constant, so no runtime host max is needed.
         self.max_num_pages = (
@@ -990,6 +996,9 @@ class FlashAttentionBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Initialize forward metadata hence all layers in the forward pass can reuse it."""
+        if self.dcp_prefill_workspace is not None:
+            self._init_dcp_prefill_metadata(forward_batch)
+            return
         metadata = FlashAttentionMetadata()
         seqlens_in_batch = forward_batch.seq_lens
         batch_size = forward_batch.batch_size
@@ -1474,6 +1483,80 @@ class FlashAttentionBackend(AttentionBackend):
             )
         return key_cache, value_cache
 
+    def _init_dcp_prefill_metadata(self, forward_batch: ForwardBatch):
+        assert forward_batch.forward_mode == ForwardMode.EXTEND
+        assert forward_batch.batch_size == 1
+        (prefix_len,) = forward_batch.extend_prefix_lens_cpu
+        (extend_len,) = forward_batch.extend_seq_lens_cpu
+        seq_len = prefix_len + extend_len
+        num_pages = (seq_len + self.page_size - 1) // self.page_size
+        page_table = self.dcp_prefill_workspace.page_table
+        assert num_pages <= page_table.shape[1]
+
+        parallel = get_parallel()
+        # Logical DCP pages start on a DCP-width boundary. Within a request the
+        # owner repeats every DCP-width positions, including a partial last page.
+        slots = self.req_to_token[
+            forward_batch.req_pool_indices,
+            parallel.attn_dcp_rank : prefix_len : parallel.attn_dcp_size,
+        ].flatten()
+        interleave_kv_lens = None
+        if is_interleave() and is_cp_active(forward_batch):
+            strategy = get_cp_strategy()
+            assert strategy is not None
+            interleave_kv_lens = (
+                strategy.local_q_indices(extend_len, forward_batch)
+                .to(torch.int32)
+                .add_(prefix_len + 1)
+            )
+        seq_lens = forward_batch.seq_lens.to(torch.int32)
+        self.forward_metadata = FlashAttentionMetadata(
+            cache_seqlens_int32=seq_lens,
+            max_seq_len_q=extend_len,
+            max_seq_len_k=seq_len,
+            cu_seqlens_q=torch.nn.functional.pad(
+                forward_batch.extend_seq_lens.to(torch.int32), (1, 0)
+            ),
+            cu_seqlens_k=torch.nn.functional.pad(seq_lens, (1, 0)),
+            page_table=page_table[:, :num_pages],
+            dcp_prefix_rows=self.runner_ids.translate_dcp_read_ids(slots),
+            dcp_interleave_kv_lens=interleave_kv_lens,
+        )
+
+    def _assemble_dcp_prefill_kv(self, forward_batch, layer, k, k_rope, cp_active):
+        metadata = self.forward_metadata
+        extend_len = metadata.max_seq_len_q
+        prefix_len = metadata.max_seq_len_k - extend_len
+        if cp_active:
+            strategy = get_cp_strategy()
+            assert strategy is not None
+            latent = strategy.gather_kv_cache(
+                torch.cat((k, k_rope), dim=-1), forward_batch
+            )
+            k, k_rope = latent.split((k.shape[-1], k_rope.shape[-1]), dim=-1)
+        k, k_rope = k[:extend_len], k_rope[:extend_len]
+        self.kv_layers.layer(layer.layer_id).store_mla(
+            layer,
+            KVWriteLoc(
+                forward_batch.out_cache_loc[:extend_len],
+                physical=forward_batch.out_cache_loc_is_physical,
+            ),
+            k,
+            k_rope,
+        )
+
+        workspace = self.dcp_prefill_workspace
+        workspace.gather_prefix(
+            self.kv_layers.read(layer.layer_id).key(),
+            metadata.dcp_prefix_rows,
+            prefix_len,
+            get_parallel().dcp_group,
+        )
+        new_rows = workspace.kv[prefix_len : metadata.max_seq_len_k]
+        new_rows[..., : k.shape[-1]].copy_(k)
+        new_rows[..., k.shape[-1] :].copy_(k_rope)
+        return workspace.kv[: metadata.page_table.shape[1] * self.page_size]
+
     def prepare_paged_mha_query(
         self,
         q: torch.Tensor,
@@ -1610,7 +1693,13 @@ class FlashAttentionBackend(AttentionBackend):
         extend_lse = None
         cp_active = is_cp_active(forward_batch)
 
-        if k is not None:
+        dcp_prefill_kv = None
+        if self.dcp_prefill_workspace is not None:
+            assert save_kv_cache and k is not None and k_rope is not None
+            dcp_prefill_kv = self._assemble_dcp_prefill_kv(
+                forward_batch, layer, k, k_rope, cp_active
+            )
+        elif k is not None:
             assert v is not None
 
             if save_kv_cache and not self.fa_skip_kv_cache:
@@ -2063,7 +2152,11 @@ class FlashAttentionBackend(AttentionBackend):
                 # call takes the same qv/ver arguments as this extend path.
                 assert self.fa_impl_ver in (3, 4), "Only FA3/FA4 support here"
                 # Do absorbed multi-latent attention
-                kv_cache = self.kv_layers.read(layer.layer_id).key().to(q.dtype)
+                kv_cache = (
+                    self.kv_layers.read(layer.layer_id).key()
+                    if dcp_prefill_kv is None
+                    else dcp_prefill_kv
+                ).to(q.dtype)
                 k_rope = kv_cache[:, :, layer.v_head_dim :]
                 c_kv = kv_cache[:, :, : layer.v_head_dim]
                 k_rope_cache = paged_view(k_rope, self.page_size)
@@ -2078,7 +2171,8 @@ class FlashAttentionBackend(AttentionBackend):
                     q_nope = q_all[:, :, : layer.v_head_dim]
                     q_rope = q_all[:, :, layer.v_head_dim :]
 
-                if cp_active:
+                interleave_kv_lens = metadata.dcp_interleave_kv_lens
+                if cp_active and interleave_kv_lens is None:
                     # MLA CP: q is rank-local zigzag-split; run the
                     # absorbed-MLA kernel twice (prev/next halves) against
                     # the full latent KV pool through the selected strategy.
@@ -2124,6 +2218,25 @@ class FlashAttentionBackend(AttentionBackend):
                         attention_backend=CPAttentionBackendKind.FLASH_ATTENTION,
                     )
                 else:
+                    live_rows = (
+                        interleave_kv_lens.numel()
+                        if interleave_kv_lens is not None
+                        else max_seqlen_q
+                    )
+                    padded_rows = 0
+                    if dcp_prefill_kv is not None and q_nope.shape[0] > live_rows:
+                        # Attention only consumes live Q rows, but the FFN
+                        # still needs the original padded row layout.
+                        padded_rows = q_nope.shape[0] - live_rows
+                        q_nope, q_rope = q_nope[:live_rows], q_rope[:live_rows]
+                    if interleave_kv_lens is not None:
+                        # Batch the interleaved queries as one-token sequences
+                        # that share KV pages but have distinct causal bounds.
+                        q_nope, q_rope = q_nope.unsqueeze(1), q_rope.unsqueeze(1)
+                        cache_seqlens = interleave_kv_lens
+                        page_table = page_table.expand(live_rows, -1)
+                        cu_seqlens_q = cu_seqlens_k = None
+                        max_seqlen_q = 1
                     result = self.flash_attn_with_kvcache(
                         q=q_rope,
                         k_cache=k_rope_cache,
@@ -2175,6 +2288,10 @@ class FlashAttentionBackend(AttentionBackend):
                         )
                     else:
                         o = result
+                        if interleave_kv_lens is not None:
+                            o = o.squeeze(1)
+                        if padded_rows > 0:
+                            o = torch.nn.functional.pad(o, (0, 0, 0, 0, 0, padded_rows))
 
         o = o.view(-1, layer.tp_q_head_num * layer.v_head_dim)
         if return_lse:

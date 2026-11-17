@@ -458,6 +458,9 @@ def maybe_flashinfer_autotune_extend(
     per-rank extend token count tunes all buckets up to it.
     """
     mr = runner.model_runner
+    if get_parallel().dcp_over_attn_cp:
+        # The packed synthetic extend batch lacks the single-request CP layout.
+        return
     # Prefer the per-rank scheduler buffer while preserving the legacy ceiling
     # when chunked prefill is disabled.
     num_tokens = max_prefill_buffer_tokens() or get_schedule().max_prefill_tokens
