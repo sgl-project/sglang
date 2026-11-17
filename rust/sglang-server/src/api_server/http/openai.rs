@@ -287,8 +287,7 @@ fn model_error(model: &str, served_model_name: &str) -> Option<String> {
 /// Why a chat or completions body's `n` cannot be served, if it cannot:
 /// Python's request models refuse it outside `[1, OPENAI_MAX_N]` in field
 /// validation, before the handler runs, and refuse `null`, which the typed
-/// requests take as unset. (The content-type check and model-level `before`
-/// validators come earlier.) The typed requests hold a `u8`, so this reads
+/// requests take as unset. The typed requests hold a `u8`, so this reads
 /// the raw body as Python's HTTP server does, with orjson: every number as
 /// `f64` past 64 bits. Only the refusal is read off that number, over an
 /// integral float as Python's lax `int` reads it; a value within the bound
@@ -318,7 +317,7 @@ fn n_error(body: &[u8]) -> Option<String> {
 
 /// A JSON object's last `n` member, as orjson keeps it, as its JSON text;
 /// the other members are skipped. `BodyRank` in `dp_relay.rs` is the same
-/// visitor over the two rank members.
+/// visitor over `routed_dp_rank`.
 struct BodyN<'a>(Option<&'a serde_json::value::RawValue>);
 
 impl<'de> serde::Deserialize<'de> for BodyN<'de> {

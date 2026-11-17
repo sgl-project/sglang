@@ -1244,7 +1244,8 @@ mod tests {
             panic!("1e39 is out of range but was accepted");
         };
         // orjson reads an integer past 64 bits as a float, so Python's message
-        // prints this one the same way. Its `int` branch is Engine-API only.
+        // prints this one the same way. No orjson int reaches the message:
+        // 64 bits bound them all well under the 1e30 limit.
         assert!(err.to_string().contains("got 1e+39 for token 0."), "{err}");
     }
 
