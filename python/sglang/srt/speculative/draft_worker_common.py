@@ -33,6 +33,22 @@ class DraftWorkerBundle(msgspec.Struct, frozen=True):
     resolved_attention_backend: str
 
 
+def dflash_dcp_mla_draft_backend() -> str:
+    """The draft backend of a DFLASH MLA draft under DCP; on ROCm, triton's
+    rank-local MLA window verify."""
+    return "triton" if get_platform().is_hip else "cutedsl_mla"
+
+
+def dflash_draft_reads_rows_by_position(
+    draft_backend: Optional[str], dcp_size: int
+) -> bool:
+    """Whether an MLA draft on ``draft_backend`` reads its ``req_to_token`` rows by
+    absolute position, as the MLA-only backends do."""
+    return draft_backend in DFLASH_MLA_ONLY_DRAFT_BACKENDS or (
+        dcp_size > 1 and draft_backend == dflash_dcp_mla_draft_backend()
+    )
+
+
 def resolve_draft_worker_attention_backend(*, algo_label: Optional[str] = None) -> str:
     """The attention backend `build_draft_tp_worker` gives a draft worker when
     the caller names none, from the published leaves.

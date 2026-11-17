@@ -35,6 +35,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
 from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
+from sglang.srt.layers.quantization.unquant_hip import a16w16_linear
 from sglang.srt.layers.rotary_embedding.base import RotaryEmbedding
 from sglang.srt.layers.rotary_embedding.rope_variant import (
     DeepseekScalingRotaryEmbedding,
@@ -360,7 +361,17 @@ def rocm_absorb_v_bmm(
                 device=attn_output.device,
                 dtype=torch.bfloat16,
             )
-            if _use_gfx1250_absorb_bmm and _gfx1250_absorb_bmm_ok(
+            from sglang.kernels.ops.attention.dsa import mla_v_absorb as _vab
+
+            if (
+                get_exec().kernel.enable_amd_monokernel
+                and isinstance(attn.w_scale, (int, float))
+                and attn.w_scale == 1.0
+                and _vab.covered(attn_output, attn.w_vc)
+            ):
+                # the monokernel's decode-sized batch: one launch, what the bmm writes
+                _vab.mla_v_absorb(attn_output, attn.w_vc, _bmm_buf)
+            elif _use_gfx1250_absorb_bmm and _gfx1250_absorb_bmm_ok(
                 x=attn_output, w=attn.w_vc, w_scale=attn.w_scale
             ):
                 batched_gemm_bf16(
@@ -590,7 +601,27 @@ class DeepseekMLARocmForwardMixin:
         )
         q_lora = None
         topk_indices = None
-        if self.q_lora_rank is not None:
+        # A monokernel plugin that already ran the projection front (fused_qkv_a,
+        # the q / kv norms, q_b: ``_mono_pre``) hands its outputs in.
+        pre = self.__dict__.get("_mono_pre")
+        if self.q_lora_rank is not None and pre is not None:
+            q = pre["q"].view(-1, self.num_local_heads, self.qk_head_dim)
+            latent_cache = pre["latent"]
+            k_nope = pre["k_nope"].unsqueeze(1)
+            q_lora = pre["q_lora"]
+            if self.should_run_indexer(prev_topk_indices):
+                topk_indices = self.indexer(
+                    x=hidden_states,
+                    q_lora=q_lora,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    layer_id=self.layer_id,
+                )
+            else:
+                topk_indices = maybe_capture_indexer_topk(
+                    self.layer_id, prev_topk_indices
+                )
+        elif self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
                 .fetch_qkv_latent()
@@ -711,7 +742,7 @@ class DeepseekMLARocmForwardMixin:
             else:
                 k_nope = k_nope.unsqueeze(1)
                 if q_replicate_active:
-                    q = torch.nn.functional.linear(q, self.q_b_proj_qrep_weight).view(
+                    q = a16w16_linear(q, self.q_b_proj_qrep_weight).view(
                         -1,
                         self.num_local_heads * self.dcp_size,
                         self.qk_head_dim,
@@ -734,9 +765,7 @@ class DeepseekMLARocmForwardMixin:
                         )
         else:
             if q_replicate_active:
-                q = torch.nn.functional.linear(
-                    hidden_states, self.q_b_proj_qrep_weight
-                ).view(
+                q = a16w16_linear(hidden_states, self.q_b_proj_qrep_weight).view(
                     -1,
                     self.num_local_heads * self.dcp_size,
                     self.qk_head_dim,
@@ -753,13 +782,19 @@ class DeepseekMLARocmForwardMixin:
 
         # The fused kernel wins at decode-sized batches (decode, target verify,
         # draft extend); prefill shapes run faster as the two separate launches.
+        # a monokernel plugin that ran q_nope @ w_kc hands q_nope_out in
+        pre_qn = pre.get("q_nope_out") if pre is not None else None
         fuse_bmm_rope_cache = (
-            not q_replicate_active
+            pre_qn is None
+            and not q_replicate_active
             and not forward_batch.forward_mode.is_extend_or_draft_extend_or_mixed()
             and _can_fuse_bmm_rope_cat_and_cache(self)
         )
 
-        if q_replicate_active and not is_in_tc_piecewise_cuda_graph():
+        if pre_qn is not None:
+            # the plugin's q_nope @ w_kc, already token-major
+            q_nope_out = pre_qn
+        elif q_replicate_active and not is_in_tc_piecewise_cuda_graph():
             # Write token-major directly; a head-major result would need a full
             # [T, H, kv_lora_rank] transpose copy before attention.
             q_nope_out = q_nope.new_empty(
@@ -841,9 +876,11 @@ class DeepseekMLARocmForwardMixin:
                     )
             elif forward_batch.forward_mode.is_extend():
                 # Assemble the full sequence into dcp_kv_buffer, which the
-                # backend attends over instead of the sharded local cache.
+                # backend attends over instead of the sharded local cache
+                # (K3.1's DSA backend gathers its own cache).
                 if (
-                    forward_batch.attn_dcp_metadata is not None
+                    not self.use_dsa
+                    and forward_batch.attn_dcp_metadata is not None
                     and forward_batch.attn_dcp_metadata.dcp_kv_buffer is not None
                 ):
                     all_gather_kv_cache_for_mla_extend(

@@ -220,7 +220,8 @@ class AiterRunnerCore(MoeRunnerCore):
         if self.config.activation == "situ":
             from aiter.ops.flydsl.moe_common import GateMode
 
-            extra["gate_mode"] = GateMode.SEPARATED.value
+            # setdefault: a GU-interleaved w13 passes INTERLEAVE in fused_moe_kwargs
+            extra.setdefault("gate_mode", GateMode.SEPARATED.value)
             if self.config.gemm1_alpha is not None:
                 extra["beta"] = float(self.config.gemm1_alpha)
             if self.config.gemm1_clamp_limit is not None:

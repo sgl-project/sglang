@@ -22,13 +22,14 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary import ops as comm_moves
 from sglang.srt.layers.layer_boundary import prepare as comm_ops
 from sglang.srt.layers.layer_boundary.ops import update_attn_tp_gather_output
-from sglang.srt.layers.layer_boundary.residual import attn_bank
+from sglang.srt.layers.layer_boundary.residual import attn_bank, attn_bank_hip
 from sglang.srt.layers.layer_boundary.residual.add_norm import REPLACE_AT_EXIT
 from sglang.srt.layers.layer_boundary.residual.attn_bank import (
     AttnBank,
     AttnBankOutputRead,
     AttnBankState,
 )
+from sglang.srt.layers.layernorm import RMSNorm
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -180,6 +181,32 @@ def _staged(
     )
     torch.testing.assert_close(head, contribution + residual, rtol=0, atol=0)
     return hidden
+
+
+class TestRowShard(CustomTestCase):
+    def test_shards_past_the_last_token_are_empty(self):
+        """9 tokens over 8 ranks: the last rank owns no real row; a negative count
+        would slice the wrong rows off the reduced shard."""
+        self.assertEqual(attn_bank_hip.row_shard(9, 8, 7), (14, 0))
+
+
+class TestColumnTailNormWeight(CustomTestCase):
+    def test_reload_refreshes_the_fp32_norm_in_place(self):
+        """The column tail reads the next layer's norm from an fp32 copy: a reload
+        that rewrites the norm must reach it, in the storage graphs captured."""
+        from sglang.srt.layers.attn_residual_hip import get_fp32_norm_weight
+        from sglang.srt.models.kimi_k3_amd.moe import prepare_hip_paths
+
+        norm = RMSNorm(HIDDEN).to(torch.bfloat16)
+        mlp = SimpleNamespace(
+            _prepare_hip_paths=lambda: None, next_attn_read=SimpleNamespace(norm=norm)
+        )
+        layer = SimpleNamespace(mlp=mlp, _o_proj_row_sharded=False)
+        cached = get_fp32_norm_weight(norm)  # filled by an earlier forward
+        norm.weight.data.copy_(torch.arange(HIDDEN, dtype=torch.bfloat16))
+        prepare_hip_paths(layer)  # post_load_weights after the reload
+        self.assertIs(get_fp32_norm_weight(norm), cached)
+        torch.testing.assert_close(cached, norm.weight.float())
 
 
 class TestAttnBankResidualOps(CustomTestCase):
