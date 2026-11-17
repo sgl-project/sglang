@@ -3,7 +3,7 @@ the torch implementations are the fallback and the reference."""
 
 import functools
 import math
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 
@@ -554,6 +554,117 @@ def _decode_ctas_per_row(rows: int, device: torch.device) -> int:
     return _DECODE_CTAS_PER_ROW_LEVELS[-1]
 
 
+def _new_decode_logits(
+    q: torch.Tensor, max_model_len: int, min_scored_len: int
+) -> torch.Tensor:
+    if min_scored_len > 0:
+        return torch.empty(
+            (q.shape[0], max_model_len), dtype=torch.float32, device=q.device
+        )
+    return torch.full(
+        (q.shape[0], max_model_len),
+        -float("inf"),
+        dtype=torch.float32,
+        device=q.device,
+    )
+
+
+def _pad_decode_query_heads(q: torch.Tensor) -> Tuple[torch.Tensor, int]:
+    # CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires
+    # sixteen. Zero-padding preserves the weight-free head sum on both paths.
+    rows, query_heads, head_dim = q.shape
+    head_alignment = 16 if is_hip() else 8
+    kernel_heads = max(
+        head_alignment,
+        ((query_heads + head_alignment - 1) // head_alignment) * head_alignment,
+    )
+    if kernel_heads != query_heads:
+        q = torch.cat(
+            [q, q.new_zeros(rows, kernel_heads - query_heads, head_dim)], dim=1
+        )
+    return q, kernel_heads
+
+
+# CTAs per request of the CUDA decode kernel. Each CTA strides over its request's
+# 64-key groups, so the count never changes a logit; 64 keeps the gathers busy
+# from short to 128K-token contexts.
+_CUDA_DECODE_CTAS_PER_REQUEST = 64
+# Shapes the CUDA decode kernel is built for; up to 8 rows share a page-table row.
+_CUDA_DECODE_HEADS = 8
+_CUDA_DECODE_HEAD_DIM = 128
+_CUDA_DECODE_PAGE_SIZE = 16
+_CUDA_DECODE_MAX_ROWS_PER_CTA = 8
+
+
+# Devices where the CUDA decode kernel matches the TileLang logits bit for bit
+# and is faster: B200/GB200, B300/GB300 and RTX PRO 6000 / RTX 50 series.
+_CUDA_DECODE_CAPABILITIES = ((10, 0), (10, 3), (12, 0))
+
+
+@functools.lru_cache(maxsize=None)
+def _cuda_decode_arch_supported(device_index: int) -> bool:
+    return torch.cuda.get_device_capability(device_index) in _CUDA_DECODE_CAPABILITIES
+
+
+def use_cuda_qsa_mqa_decode(q: torch.Tensor, k_cache: torch.Tensor) -> bool:
+    """Whether ``cuda_qsa_mqa_decode`` covers this call (bf16 scoring, at most 8
+    query heads of dim 128, 16 compressed keys per page)."""
+    return (
+        q.is_cuda
+        and not is_hip()
+        and q.dtype != torch.float8_e4m3fn
+        and k_cache.dtype == torch.bfloat16
+        and q.ndim == 3
+        and q.shape[1] <= _CUDA_DECODE_HEADS
+        and q.shape[2] == _CUDA_DECODE_HEAD_DIM
+        and k_cache.ndim == 4
+        and k_cache.shape[1] == _CUDA_DECODE_PAGE_SIZE
+        and _cuda_decode_arch_supported(q.device.index or 0)
+    )
+
+
+def cuda_qsa_mqa_decode(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    page_table: torch.Tensor,
+    context_lens: torch.Tensor,
+    max_model_len: int,
+    score_scale: Optional[float] = None,
+    *,
+    min_scored_len: int = 0,
+    rows_per_request: int = 1,
+) -> torch.Tensor:
+    """``tilelang_qsa_mqa_decode`` as a JIT CUDA kernel: the same logits, bit for
+    bit, for the calls ``use_cuda_qsa_mqa_decode`` accepts. With
+    ``rows_per_request`` > 1, that many consecutive rows (the verify rows of one
+    request) share one load of each key group."""
+    from sglang.kernels.ops.attention.qsa_mqa_decode import qsa_mqa_decode_logits
+
+    _validate_decode_inputs(q, k_cache, page_table, context_lens)
+    logits = _new_decode_logits(q, max_model_len, min_scored_len)
+    if not q.shape[0] or not max_model_len:
+        return logits
+    q_kernel, _ = _pad_decode_query_heads(q.to(torch.bfloat16))
+    rows_per_cta = (
+        rows_per_request
+        if 1 < rows_per_request <= _CUDA_DECODE_MAX_ROWS_PER_CTA
+        and q.shape[0] % rows_per_request == 0
+        else 1
+    )
+    qsa_mqa_decode_logits(
+        q_kernel.contiguous(),
+        k_cache.contiguous(),
+        page_table.to(device=q.device, dtype=torch.int32).contiguous(),
+        context_lens.to(device=q.device, dtype=torch.int32).contiguous(),
+        logits,
+        scale=float(score_scale or math.sqrt(q.shape[-1])),
+        min_scored_len=min_scored_len,
+        rows_per_cta=rows_per_cta,
+        ctas_per_request=_CUDA_DECODE_CTAS_PER_REQUEST,
+    )
+    return logits
+
+
 def tilelang_qsa_mqa_decode(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -580,37 +691,12 @@ def tilelang_qsa_mqa_decode(
             "TileLang QSA decode requires a compressed page size of "
             f"8/16/32/64 (64-row GEMM sub-page packing), got {page_size}"
         )
-    if min_scored_len > 0:
-        logits = torch.empty(
-            (q.shape[0], max_model_len), dtype=torch.float32, device=q.device
-        )
-    else:
-        logits = torch.full(
-            (q.shape[0], max_model_len),
-            -float("inf"),
-            dtype=torch.float32,
-            device=q.device,
-        )
+    logits = _new_decode_logits(q, max_model_len, min_scored_len)
     if not q.shape[0] or not max_model_len:
         return logits
-    # CUDA MMA accepts an eight-wide N dimension, while ROCm MFMA requires
-    # sixteen. Zero-padding preserves the weight-free head sum on both paths.
-    query_heads, head_dim = q.shape[1:]
-    head_alignment = 16 if is_hip() else 8
-    kernel_heads = max(
-        head_alignment,
-        ((query_heads + head_alignment - 1) // head_alignment) * head_alignment,
-    )
+    head_dim = q.shape[2]
     scoring_dtype = _scoring_dtype(q, k_cache)
-    q_kernel = q.to(scoring_dtype)
-    if kernel_heads != query_heads:
-        q_kernel = torch.cat(
-            [
-                q_kernel,
-                q_kernel.new_zeros(q.shape[0], kernel_heads - query_heads, head_dim),
-            ],
-            dim=1,
-        )
+    q_kernel, kernel_heads = _pad_decode_query_heads(q.to(scoring_dtype))
     _tilelang_qsa_mqa_decode_kernel(
         heads=kernel_heads,
         head_dim=head_dim,
@@ -668,7 +754,19 @@ def qsa_mqa_decode(
     score_scale: Optional[float] = None,
     *,
     min_scored_len: int = 0,
+    rows_per_request: int = 1,
 ) -> torch.Tensor:
+    if use_cuda_qsa_mqa_decode(q, k_cache):
+        return cuda_qsa_mqa_decode(
+            q,
+            k_cache,
+            page_table,
+            context_lens,
+            max_model_len,
+            score_scale,
+            min_scored_len=min_scored_len,
+            rows_per_request=rows_per_request,
+        )
     if q.is_cuda and HAS_TILELANG:
         return tilelang_qsa_mqa_decode(
             q,
@@ -686,6 +784,7 @@ def qsa_mqa_decode(
 
 __all__ = [
     "HAS_TILELANG",
+    "cuda_qsa_mqa_decode",
     "qsa_mqa_decode",
     "qsa_mqa_prefill",
     "qsa_mqa_prefill_relative",
@@ -695,4 +794,5 @@ __all__ = [
     "torch_qsa_mqa_decode",
     "torch_qsa_mqa_prefill",
     "torch_qsa_mqa_prefill_relative",
+    "use_cuda_qsa_mqa_decode",
 ]
