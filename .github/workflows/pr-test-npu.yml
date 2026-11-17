@@ -106,8 +106,6 @@ jobs:
     needs: check-changes
     if: ${{ inputs.coverage_mode != true && needs.check-changes.outputs.changes_exist == 'true' }}
     uses: ./.github/workflows/pr-gate.yml
-    with:
-      require-label: run-ci-npu-extra
     secrets: inherit
 
   set-image-config:
@@ -125,7 +123,7 @@ jobs:
   # torch_npu / sgl_kernel_npu before importing, so a hosted runner suffices.
   base-a-test-npu:
     needs: [check-changes, pr-gate]
-    if: ${{ !failure() && !cancelled() && inputs.coverage_mode != true && needs.check-changes.outputs.main_package == 'true' && needs.pr-gate.outputs.opted-in != 'false' }}
+    if: ${{ !failure() && !cancelled() && inputs.coverage_mode != true && needs.check-changes.outputs.main_package == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -343,8 +341,7 @@ jobs:
     needs: [check-changes, pr-gate]
     if: >-
       ${{ !failure() && !cancelled() &&
-      (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true')
-      && needs.pr-gate.outputs.opted-in != 'false' }}
+      (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
     uses: ./.github/workflows/_pr-test-sgl-router-build.yml
     with:
       runs_on: ubuntu-22.04-arm
@@ -356,8 +353,7 @@ jobs:
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
-      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_1_npu_a3 != 'false'
-      && needs.pr-gate.outputs.opted-in != 'false' }}
+      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_1_npu_a3 != 'false' }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-1-npu-a3
@@ -374,8 +370,7 @@ jobs:
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
-      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_2_npu_a3 != 'false'
-      && needs.pr-gate.outputs.opted-in != 'false' }}
+      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_2_npu_a3 != 'false' }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-2-npu-a3
@@ -392,8 +387,7 @@ jobs:
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
-      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_4_npu_a3 != 'false'
-      && needs.pr-gate.outputs.opted-in != 'false' }}
+      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_4_npu_a3 != 'false' }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-4-npu-a3
@@ -413,8 +407,7 @@ jobs:
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
-      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_8_npu_a3 != 'false'
-      && needs.pr-gate.outputs.opted-in != 'false' }}
+      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_8_npu_a3 != 'false' }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-8-npu-a3
@@ -431,8 +424,7 @@ jobs:
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
-      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_16_npu_a3 != 'false'
-      && needs.pr-gate.outputs.opted-in != 'false' }}
+      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_16_npu_a3 != 'false' }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-16-npu-a3
@@ -457,8 +449,7 @@ jobs:
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.multimodal_gen == 'true') &&
-      needs.recommend-tests-from-coverage.outputs.should_run_multimodal_gen_test_1_npu_a3 != 'false'
-      && needs.pr-gate.outputs.opted-in != 'false' }}
+      needs.recommend-tests-from-coverage.outputs.should_run_multimodal_gen_test_1_npu_a3 != 'false' }}
     runs-on: linux-aarch64-a3-800t-2
     strategy:
       fail-fast: false
@@ -600,8 +591,7 @@ jobs:
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.multimodal_gen == 'true') &&
-      needs.recommend-tests-from-coverage.outputs.should_run_multimodal_gen_test_4_npu_a3 != 'false'
-      && needs.pr-gate.outputs.opted-in != 'false' }}
+      needs.recommend-tests-from-coverage.outputs.should_run_multimodal_gen_test_4_npu_a3 != 'false' }}
     runs-on: linux-aarch64-a3-800t-4
     strategy:
       fail-fast: false
@@ -731,8 +721,7 @@ jobs:
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
-      needs.recommend-tests-from-coverage.outputs.should_run_base_c_test_acc_2_npu_a3 != 'false'
-      && needs.pr-gate.outputs.opted-in != 'false' }}
+      needs.recommend-tests-from-coverage.outputs.should_run_base_c_test_acc_2_npu_a3 != 'false' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: ${{ inputs.coverage_mode == true && 'linux-aarch64-a3-800t-2' || 'linux-aarch64-a3-2-' }}
@@ -751,8 +740,7 @@ jobs:
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
-      needs.recommend-tests-from-coverage.outputs.should_run_base_c_test_acc_16_npu_a3 != 'false'
-      && needs.pr-gate.outputs.opted-in != 'false' }}
+      needs.recommend-tests-from-coverage.outputs.should_run_base_c_test_acc_16_npu_a3 != 'false' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: ${{ inputs.coverage_mode == true && 'linux-aarch64-a3-800t-16' || 'linux-aarch64-a3-16-' }}
@@ -770,8 +758,7 @@ jobs:
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
-      needs.recommend-tests-from-coverage.outputs.should_run_base_c_test_perf_2_npu_a3 != 'false'
-      && needs.pr-gate.outputs.opted-in != 'false' }}
+      needs.recommend-tests-from-coverage.outputs.should_run_base_c_test_perf_2_npu_a3 != 'false' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a3-800t-2
@@ -789,8 +776,7 @@ jobs:
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
-      needs.recommend-tests-from-coverage.outputs.should_run_base_c_test_perf_16_npu_a3 != 'false'
-      && needs.pr-gate.outputs.opted-in != 'false' }}
+      needs.recommend-tests-from-coverage.outputs.should_run_base_c_test_perf_16_npu_a3 != 'false' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a3-800t-16
@@ -815,8 +801,7 @@ jobs:
       ${{ !failure() && !cancelled() &&
       github.event_name == 'pull_request' &&
       inputs.coverage_mode != true &&
-      needs.check-changes.outputs.changes_exist == 'true'
-      && needs.pr-gate.outputs.opted-in != 'false' }}
+      needs.check-changes.outputs.changes_exist == 'true' }}
     outputs:
       coverage_paths: ${{ steps.export-recs.outputs.coverage_paths }}
       should_run_base_b_test_1_npu_a3: ${{ steps.bucket-tests.outputs.should_run_base_b_test_1_npu_a3 }}

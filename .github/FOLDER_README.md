@@ -28,8 +28,10 @@ Every run-ci command takes hardware arguments: `nv`, `amd`, `xeon`, `npu`,
 `nv-extra`, and accepts several of them. The command picks the layer: `/run-ci`
 selects Base, `/run-extra-ci` Extra, and `/run-full-ci` both. NVIDIA and AMD
 have a Base tier (`nv`, `amd`, `label: null`, selecting existing runs and
-skipping missing ones) and an Extra tier. Every other hardware has only an
-Extra tier, `<hardware>-extra` with label `run-ci-<hardware>-extra`, which all
+skipping missing ones) and an Extra tier. NPU has only a Base selection
+(`npu`, `label: null`); it runs by default with `run-ci` and its checks are
+non-required. Use `/run-ci npu` or `/run-full-ci npu` to rerun it. The remaining
+hardware has only an Extra tier, `<hardware>-extra` with label `run-ci-<hardware>-extra`, which all
 three commands select. `/tag-run-ci-label` and `/tag-and-rerun-ci` resolve their
 arguments as `/run-ci` does; `/tag-and-rerun-ci` also reruns the opt-in
 workflows whose label it just added. Unknown arguments are rejected

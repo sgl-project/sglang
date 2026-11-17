@@ -340,7 +340,7 @@ def _resolve_tier_args(args, tiers, layer):
     """Return (tier_names, unknown_args) for one CI layer.
 
     A hardware name is a tier name without `-extra`. For the base layer, a
-    hardware with no base tier (all but nv and amd) selects its extra tier.
+    hardware with no base tier selects its extra tier.
     """
     names, unknown = [], []
     for arg in args:
