@@ -1,0 +1,1617 @@
+2026-11-15T15:49:42.3280262Z Current runner version: '2.338.0'
+2026-11-15T15:49:42.3287474Z Runner name: 'linux-amd64-cpu-4-v6fd2-runner-jcd6z'
+2026-11-15T15:49:42.3288498Z Runner group name: 'Default'
+2026-11-15T15:49:42.3289563Z Machine name: 'linux-amd64-cpu-4-v6fd2-runner-jcd6z'
+2026-11-15T15:49:42.3293668Z ##[group]GITHUB_TOKEN Permissions
+2026-11-15T15:49:42.3296438Z Contents: read
+2026-11-15T15:49:42.3297065Z Metadata: read
+2026-11-15T15:49:42.3297653Z Packages: read
+2026-11-15T15:49:42.3298235Z ##[endgroup]
+2026-11-15T15:49:42.3300743Z Secret source: None
+2026-11-15T15:49:42.3301984Z Cache mode: write
+2026-11-15T15:49:42.3303266Z Runner is running behind proxy server 'http://squid-cache.squid.svc.cluster.local:3128' for all HTTP requests.
+2026-11-15T15:49:42.3304784Z Runner is running behind proxy server 'http://squid-cache.squid.svc.cluster.local:3128' for all HTTPS requests.
+2026-11-15T15:49:42.3305812Z Prepare workflow directory
+2026-11-15T15:49:42.4098814Z Prepare all required actions
+2026-11-15T15:49:42.4151542Z Getting action download info
+2026-11-15T15:49:43.4951941Z Download action repository 'actions/checkout@v4' (SHA:11d5960a326750d5838078e36cf38b85af677262)
+2026-11-15T15:49:47.3816936Z Download action repository 'actions/download-artifact@v4' (SHA:d3f86a106a0bac45b974a628896c90dbdf5c8093)
+2026-11-15T15:49:52.4446706Z Uses: sgl-project/sglang/.github/workflows/nightly-test-npu-e2e-multi-node.yml@refs/pull/50500/merge (4587d034a572039306ad33018da21ba54c6cb6dd)
+2026-11-15T15:49:52.4451086Z ##[group] Inputs
+2026-11-15T15:49:52.4451893Z   runner: linux-amd64-cpu-4
+2026-11-15T15:49:52.4452275Z   test_type: accuracy
+2026-11-15T15:49:52.4452690Z   test_config_name: deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa
+2026-11-15T15:49:52.4453941Z   prefill_size: 2
+2026-11-15T15:49:52.4454282Z   decode_size: 1
+2026-11-15T15:49:52.4454635Z   router_size: 1
+2026-11-15T15:49:52.4454943Z   node_size: 0
+2026-11-15T15:49:52.4455628Z   test_case: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py
+2026-11-15T15:49:52.4456568Z   image: swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B106
+2026-11-15T15:49:52.4457201Z   prefill_decode_deployment: separation
+2026-11-15T15:49:52.4457615Z   transformers_version: 
+2026-11-15T15:49:52.4458287Z   run_start_metadata: {"branch_label": "YZY00Raiser-pryzy1112", "workflow_name": "Nightly Test (NPU)", "create_time": "20261115-2349"}
+2026-11-15T15:49:52.4458988Z   accuracy_dataset: gpqa_diamond
+2026-11-15T15:49:52.4459435Z   sgl_router_artifact: sgl-router-aarch64-nightly-npu
+2026-11-15T15:49:52.4459879Z ##[endgroup]
+2026-11-15T15:49:52.4460647Z Complete job name: multi-node-poc (deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa, 2, 1, 1, test/registered/npu/accuracy/... / deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa
+2026-11-15T15:49:52.5224848Z ##[group]Run '/home/runner/k8s/index.js'
+2026-11-15T15:49:52.5228275Z shell: /home/runner/externals/node24/bin/node {0}
+2026-11-15T15:49:52.5229106Z ##[endgroup]
+2026-11-15T15:49:52.7752736Z (node:109) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-11-15T15:49:52.7753696Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-11-15T15:49:52.7968367Z (node:109) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+2026-11-15T15:50:00.0610525Z (node:109) [DEP0005] DeprecationWarning: Buffer() is deprecated due to security and usability issues. Please use the Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.
+2026-11-15T15:50:02.1143104Z ##[group]Run pip3 install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple jinja2
+2026-11-15T15:50:02.1143999Z [36;1mpip3 install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple jinja2[0m
+2026-11-15T15:50:02.1144656Z [36;1mpip3 install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple psutil[0m
+2026-11-15T15:50:02.1145389Z [36;1m# Install kubernetes[0m
+2026-11-15T15:50:02.1145838Z [36;1mpip3 install -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple kubernetes[0m
+2026-11-15T15:50:02.1146329Z [36;1mcp $KUBECTL /usr/local/sbin/[0m
+2026-11-15T15:50:02.1149361Z shell: sh -e {0}
+2026-11-15T15:50:02.1149632Z ##[endgroup]
+2026-11-15T15:50:02.1300909Z ##[group]Run '/home/runner/k8s/index.js'
+2026-11-15T15:50:02.1302168Z shell: /home/runner/externals/node24/bin/node {0}
+2026-11-15T15:50:02.1302510Z ##[endgroup]
+2026-11-15T15:50:02.3699258Z (node:397) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-11-15T15:50:02.3700187Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-11-15T15:50:02.3931061Z (node:397) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+2026-11-15T15:50:02.4480084Z (node:397) [DEP0005] DeprecationWarning: Buffer() is deprecated due to security and usability issues. Please use the Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.
+2026-11-15T15:50:03.2301284Z Looking in indexes: https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+2026-11-15T15:50:03.2302250Z Requirement already satisfied: jinja2 in /usr/local/python3.11.13/lib/python3.11/site-packages (3.1.6)
+2026-11-15T15:50:03.2310054Z Requirement already satisfied: MarkupSafe>=2.0 in /usr/local/python3.11.13/lib/python3.11/site-packages (from jinja2) (3.0.3)
+2026-11-15T15:50:03.5501484Z WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+2026-11-15T15:50:03.6975196Z 
+2026-11-15T15:50:03.6975857Z [notice] A new release of pip is available: 25.3 -> 26.3
+2026-11-15T15:50:03.6976433Z [notice] To update, run: pip install --upgrade pip
+2026-11-15T15:50:04.1300819Z Looking in indexes: https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+2026-11-15T15:50:04.1301864Z Requirement already satisfied: psutil in /usr/local/python3.11.13/lib/python3.11/site-packages (6.0.0)
+2026-11-15T15:50:04.4479160Z WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+2026-11-15T15:50:04.4516109Z 
+2026-11-15T15:50:04.4516428Z [notice] A new release of pip is available: 25.3 -> 26.3
+2026-11-15T15:50:04.4517080Z [notice] To update, run: pip install --upgrade pip
+2026-11-15T15:50:04.8650497Z Looking in indexes: https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+2026-11-15T15:50:05.5216667Z Collecting kubernetes
+2026-11-15T15:50:05.5335256Z   Downloading https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/c8/9e/bb4b445924591c09e6451da66274ee4afd3acb783f15c17c3623b9a4824a/kubernetes-37.0.2-py2.py3-none-any.whl (7.5 MB)
+2026-11-15T15:50:05.5768329Z      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 7.5/7.5 MB 159.7 MB/s  0:00:00
+2026-11-15T15:50:05.5992423Z Requirement already satisfied: certifi>=2024.7.4 in /usr/local/python3.11.13/lib/python3.11/site-packages (from kubernetes) (2025.10.5)
+2026-11-15T15:50:05.6135222Z Collecting python-dateutil>=3.0.0 (from kubernetes)
+2026-11-15T15:50:05.6160166Z   Downloading https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/2f/a9/52b89563d154433d79b51ed1eb4842bf7334cb2696891a7fe135618853d7/python_dateutil-4.0.0-py3-none-any.whl (92 kB)
+2026-11-15T15:50:05.7701103Z Collecting pydantic>=2.14.2 (from kubernetes)
+2026-11-15T15:50:05.7726735Z   Downloading https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/72/b8/b864503789ef5c58597d2a7b4adbee62c26440ab1e682581fc6838df8947/pydantic-2.14.3-py3-none-any.whl (494 kB)
+2026-11-15T15:50:05.7866818Z Requirement already satisfied: PyYAML>=6.0.3 in /usr/local/python3.11.13/lib/python3.11/site-packages (from kubernetes) (6.0.3)
+2026-11-15T15:50:05.8695571Z Collecting websocket-client!=0.40.0,!=0.41.*,!=0.42.*,>=0.32.0 (from kubernetes)
+2026-11-15T15:50:05.8721734Z   Downloading https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/d5/d2/cc4dc1271e464942db7ee278baae2daa99ee77cb2af744025c04da585a3e/websocket_client-1.9.2-py3-none-any.whl (95 kB)
+2026-11-15T15:50:05.8805839Z Requirement already satisfied: requests in /usr/local/python3.11.13/lib/python3.11/site-packages (from kubernetes) (2.32.5)
+2026-11-15T15:50:05.9446722Z Collecting requests-oauthlib (from kubernetes)
+2026-11-15T15:50:05.9467445Z   Downloading https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/3b/5d/63d4ae3b9daea098d5d6f5da83984853c1bbacd5dc826764b249fe119d24/requests_oauthlib-2.0.0-py2.py3-none-any.whl (24 kB)
+2026-11-15T15:50:05.9648813Z Collecting oauthlib>=4.0.0 (from kubernetes)
+2026-11-15T15:50:05.9670998Z   Downloading https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/df/ef/3b8adde1b32a6f540758bff734d3442c621734c83708e5f02b0ba2f43b84/oauthlib-4.0.1-py3-none-any.whl (161 kB)
+2026-11-15T15:50:06.0441060Z Collecting typing-extensions>=4.16.0 (from kubernetes)
+2026-11-15T15:50:06.0463324Z   Downloading https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/49/d3/b8441a820a491ddfc024b0b0cf0393375b75ea13866d9c66727e54c2fc80/typing_extensions-4.16.0-py3-none-any.whl (45 kB)
+2026-11-15T15:50:06.1355388Z Collecting urllib3<3.0.0,>=2.8.0 (from kubernetes)
+2026-11-15T15:50:06.1356803Z   Downloading https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/92/9d/c4e665119135114480843e7ab388fa94d8480650450e6f8e26b70d323a4c/urllib3-2.8.0-py3-none-any.whl (135 kB)
+2026-11-15T15:50:06.2113879Z Collecting durationpy>=0.11 (from kubernetes)
+2026-11-15T15:50:06.2115046Z   Downloading https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/e6/c4/ebdf7837bc4ef6fd98cfb013c28855bb358467bf86c1af011bbc21e21df0/durationpy-0.11-py3-none-any.whl (4.1 kB)
+2026-11-15T15:50:06.8812436Z Collecting aiohttp<4.0.0,>=3.14.5 (from kubernetes)
+2026-11-15T15:50:06.8898283Z   Downloading https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/42/74/2a2b22953de15c6c8a80debf26db3047e4e8a5a5db6dd7c2c6c01eec0605/aiohttp-3.14.5-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (1.9 MB)
+2026-11-15T15:50:06.9056910Z      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.9/1.9 MB 101.3 MB/s  0:00:00
+2026-11-15T15:50:06.9768884Z Collecting aiohttp-retry>=2.9.1 (from kubernetes)
+2026-11-15T15:50:06.9791293Z   Downloading https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/1a/99/84ba7273339d0f3dfa57901b846489d2e5c2cd731470167757f1935fffbd/aiohttp_retry-2.9.1-py3-none-any.whl (10.0 kB)
+2026-11-15T15:50:06.9861892Z Requirement already satisfied: aiohappyeyeballs>=2.5.0 in /usr/local/python3.11.13/lib/python3.11/site-packages (from aiohttp<4.0.0,>=3.14.5->kubernetes) (2.6.1)
+2026-11-15T15:50:06.9864793Z Requirement already satisfied: aiosignal>=1.4.0 in /usr/local/python3.11.13/lib/python3.11/site-packages (from aiohttp<4.0.0,>=3.14.5->kubernetes) (1.4.0)
+2026-11-15T15:50:06.9868467Z Requirement already satisfied: attrs>=17.3.0 in /usr/local/python3.11.13/lib/python3.11/site-packages (from aiohttp<4.0.0,>=3.14.5->kubernetes) (25.4.0)
+2026-11-15T15:50:06.9872304Z Requirement already satisfied: frozenlist>=1.1.1 in /usr/local/python3.11.13/lib/python3.11/site-packages (from aiohttp<4.0.0,>=3.14.5->kubernetes) (1.8.0)
+2026-11-15T15:50:06.9876013Z Requirement already satisfied: multidict<8.0,>=4.5 in /usr/local/python3.11.13/lib/python3.11/site-packages (from aiohttp<4.0.0,>=3.14.5->kubernetes) (6.7.0)
+2026-11-15T15:50:06.9878866Z Requirement already satisfied: propcache>=0.2.0 in /usr/local/python3.11.13/lib/python3.11/site-packages (from aiohttp<4.0.0,>=3.14.5->kubernetes) (0.4.1)
+2026-11-15T15:50:07.3215821Z Collecting yarl<2.0,>=1.25.1 (from aiohttp<4.0.0,>=3.14.5->kubernetes)
+2026-11-15T15:50:07.3242163Z   Downloading https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/95/0c/a71501bbc1a674ff72c4d6c2b75f4d9a5af819f5244c3a7558080a8802c5/yarl-1.25.1-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (117 kB)
+2026-11-15T15:50:07.3393993Z Requirement already satisfied: idna>=2.0 in /usr/local/python3.11.13/lib/python3.11/site-packages (from yarl<2.0,>=1.25.1->aiohttp<4.0.0,>=3.14.5->kubernetes) (3.11)
+2026-11-15T15:50:07.3500154Z Requirement already satisfied: annotated-types>=0.6.0 in /usr/local/python3.11.13/lib/python3.11/site-packages (from pydantic>=2.14.2->kubernetes) (0.7.0)
+2026-11-15T15:50:08.2610458Z Collecting pydantic-core==2.50.4 (from pydantic>=2.14.2->kubernetes)
+2026-11-15T15:50:08.2650711Z   Downloading https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/56/51/cbb7a1bc0196ff94d3478d265eed7449f811759988eb760d41f4edd0893b/pydantic_core-2.50.4-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl (2.3 MB)
+2026-11-15T15:50:08.2860779Z      ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.3/2.3 MB 111.3 MB/s  0:00:00
+2026-11-15T15:50:08.3007922Z Collecting typing-inspection>=0.4.4 (from pydantic>=2.14.2->kubernetes)
+2026-11-15T15:50:08.3030612Z   Downloading https://mirrors.tuna.tsinghua.edu.cn/pypi/web/packages/de/0c/ea2544850a7c135e15033a5c7a8e7211136184b7ae63e2239d557c2b3019/typing_inspection-0.4.5-py3-none-any.whl (14 kB)
+2026-11-15T15:50:08.3116719Z Requirement already satisfied: tzdata in /usr/local/python3.11.13/lib/python3.11/site-packages (from python-dateutil>=3.0.0->kubernetes) (2025.2)
+2026-11-15T15:50:08.3235602Z Requirement already satisfied: charset_normalizer<4,>=2 in /usr/local/python3.11.13/lib/python3.11/site-packages (from requests->kubernetes) (3.4.4)
+2026-11-15T15:50:08.7226600Z Installing collected packages: durationpy, yarl, websocket-client, urllib3, typing-extensions, python-dateutil, oauthlib, typing-inspection, pydantic-core, requests-oauthlib, pydantic, aiohttp, aiohttp-retry, kubernetes
+2026-11-15T15:50:08.7307700Z   Attempting uninstall: yarl
+2026-11-15T15:50:08.7369530Z     Found existing installation: yarl 1.22.0
+2026-11-15T15:50:08.7401916Z     Uninstalling yarl-1.22.0:
+2026-11-15T15:50:08.7448209Z       Successfully uninstalled yarl-1.22.0
+2026-11-15T15:50:08.8363890Z   Attempting uninstall: urllib3
+2026-11-15T15:50:08.8398025Z     Found existing installation: urllib3 2.5.0
+2026-11-15T15:50:08.8436611Z     Uninstalling urllib3-2.5.0:
+2026-11-15T15:50:08.8531589Z       Successfully uninstalled urllib3-2.5.0
+2026-11-15T15:50:08.9289929Z   Attempting uninstall: typing-extensions
+2026-11-15T15:50:08.9325081Z     Found existing installation: typing_extensions 4.15.0
+2026-11-15T15:50:08.9339990Z     Uninstalling typing_extensions-4.15.0:
+2026-11-15T15:50:09.2067947Z       Successfully uninstalled typing_extensions-4.15.0
+2026-11-15T15:50:09.2376968Z   Attempting uninstall: python-dateutil
+2026-11-15T15:50:09.2417846Z     Found existing installation: python-dateutil 2.9.0.post0
+2026-11-15T15:50:09.2445217Z     Uninstalling python-dateutil-2.9.0.post0:
+2026-11-15T15:50:09.2506606Z       Successfully uninstalled python-dateutil-2.9.0.post0
+2026-11-15T15:50:09.3737587Z   Attempting uninstall: typing-inspection
+2026-11-15T15:50:09.3784585Z     Found existing installation: typing-inspection 0.4.2
+2026-11-15T15:50:09.3791696Z     Uninstalling typing-inspection-0.4.2:
+2026-11-15T15:50:09.3817188Z       Successfully uninstalled typing-inspection-0.4.2
+2026-11-15T15:50:09.3932409Z   Attempting uninstall: pydantic-core
+2026-11-15T15:50:09.3978484Z     Found existing installation: pydantic_core 2.41.5
+2026-11-15T15:50:09.3994372Z     Uninstalling pydantic_core-2.41.5:
+2026-11-15T15:50:09.4045213Z       Successfully uninstalled pydantic_core-2.41.5
+2026-11-15T15:50:09.4717975Z   Attempting uninstall: pydantic
+2026-11-15T15:50:09.4765282Z     Found existing installation: pydantic 2.12.4
+2026-11-15T15:50:09.4868004Z     Uninstalling pydantic-2.12.4:
+2026-11-15T15:50:09.5109018Z       Successfully uninstalled pydantic-2.12.4
+2026-11-15T15:50:09.7839271Z   Attempting uninstall: aiohttp
+2026-11-15T15:50:09.7931040Z     Found existing installation: aiohttp 3.13.2
+2026-11-15T15:50:09.7935831Z     Uninstalling aiohttp-3.13.2:
+2026-11-15T15:50:09.8153990Z       Successfully uninstalled aiohttp-3.13.2
+2026-11-15T15:50:15.9327092Z 
+2026-11-15T15:50:15.9411682Z ERROR: pip's dependency resolver does not currently take into account all the packages that are installed. This behaviour is the source of the following dependency conflicts.
+2026-11-15T15:50:15.9413109Z vllm 0.8.5.post1+empty requires xgrammar==0.1.18; platform_machine == "x86_64" or platform_machine == "aarch64", but you have xgrammar 0.1.25 which is incompatible.
+2026-11-15T15:50:15.9415281Z WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+2026-11-15T15:50:15.9417735Z Successfully installed aiohttp-3.14.5 aiohttp-retry-2.9.1 durationpy-0.11 kubernetes-37.0.2 oauthlib-4.0.1 pydantic-2.14.3 pydantic-core-2.50.4 python-dateutil-4.0.0 requests-oauthlib-2.0.0 typing-extensions-4.16.0 typing-inspection-0.4.5 urllib3-2.8.0 websocket-client-1.9.2 yarl-1.25.1
+2026-11-15T15:50:15.9455248Z 
+2026-11-15T15:50:15.9455570Z [notice] A new release of pip is available: 25.3 -> 26.3
+2026-11-15T15:50:15.9456172Z [notice] To update, run: pip install --upgrade pip
+2026-11-15T15:50:16.9307985Z ##[group]Run actions/checkout@v4
+2026-11-15T15:50:16.9308300Z with:
+2026-11-15T15:50:16.9308531Z   repository: sgl-project/sglang
+2026-11-15T15:50:16.9311448Z   token: ***
+2026-11-15T15:50:16.9311696Z   ssh-strict: true
+2026-11-15T15:50:16.9311930Z   ssh-user: git
+2026-11-15T15:50:16.9312180Z   persist-credentials: true
+2026-11-15T15:50:16.9312463Z   clean: true
+2026-11-15T15:50:16.9312705Z   sparse-checkout-cone-mode: true
+2026-11-15T15:50:16.9312988Z   fetch-depth: 1
+2026-11-15T15:50:16.9313210Z   fetch-tags: false
+2026-11-15T15:50:16.9313446Z   show-progress: true
+2026-11-15T15:50:16.9313763Z   lfs: false
+2026-11-15T15:50:16.9313978Z   submodules: false
+2026-11-15T15:50:16.9314217Z   set-safe-directory: true
+2026-11-15T15:50:16.9314503Z   allow-unsafe-pr-checkout: false
+2026-11-15T15:50:16.9314835Z ##[endgroup]
+2026-11-15T15:50:16.9380016Z ##[group]Run '/home/runner/k8s/index.js'
+2026-11-15T15:50:16.9380996Z shell: /home/runner/externals/node24/bin/node {0}
+2026-11-15T15:50:16.9381698Z ##[endgroup]
+2026-11-15T15:50:17.1749588Z (node:437) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-11-15T15:50:17.1750396Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-11-15T15:50:17.1979827Z (node:437) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+2026-11-15T15:50:17.2555407Z (node:437) [DEP0005] DeprecationWarning: Buffer() is deprecated due to security and usability issues. Please use the Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.
+2026-11-15T15:50:17.8083566Z Syncing repository: sgl-project/sglang
+2026-11-15T15:50:17.8085142Z ##[group]Getting Git version info
+2026-11-15T15:50:17.8085531Z Working directory is '/__w/sglang/sglang'
+2026-11-15T15:50:17.8086109Z [command]/usr/bin/git version
+2026-11-15T15:50:17.8096513Z git version 2.34.1
+2026-11-15T15:50:17.8098133Z ##[endgroup]
+2026-11-15T15:50:17.8103988Z Copying '/root/.gitconfig' to '/__w/_temp/79b38d3c-fb61-4994-9550-501692ea076d/.gitconfig'
+2026-11-15T15:50:17.8104742Z Temporarily overriding HOME='/__w/_temp/79b38d3c-fb61-4994-9550-501692ea076d' before making global git config changes
+2026-11-15T15:50:17.8105657Z Adding repository directory to the temporary git global config as a safe directory
+2026-11-15T15:50:17.8106291Z [command]/usr/bin/git config --global --add safe.directory /__w/sglang/sglang
+2026-11-15T15:50:17.8120718Z Deleting the contents of '/__w/sglang/sglang'
+2026-11-15T15:50:17.8124094Z ##[group]Initializing the repository
+2026-11-15T15:50:17.8128930Z [command]/usr/bin/git init /__w/sglang/sglang
+2026-11-15T15:50:17.8156619Z hint: Using 'master' as the name for the initial branch. This default branch name
+2026-11-15T15:50:17.8157202Z hint: is subject to change. To configure the initial branch name to use in all
+2026-11-15T15:50:17.8157757Z hint: of your new repositories, which will suppress this warning, call:
+2026-11-15T15:50:17.8158176Z hint: 
+2026-11-15T15:50:17.8158492Z hint: 	git config --global init.defaultBranch <name>
+2026-11-15T15:50:17.8158822Z hint: 
+2026-11-15T15:50:17.8159138Z hint: Names commonly chosen instead of 'master' are 'main', 'trunk' and
+2026-11-15T15:50:17.8159762Z hint: 'development'. The just-created branch can be renamed via this command:
+2026-11-15T15:50:17.8160169Z hint: 
+2026-11-15T15:50:17.8160394Z hint: 	git branch -m <name>
+2026-11-15T15:50:17.8168858Z Initialized empty Git repository in /__w/sglang/sglang/.git/
+2026-11-15T15:50:17.8176151Z [command]/usr/bin/git remote add origin https://github.com/sgl-project/sglang
+2026-11-15T15:50:17.8259019Z ##[endgroup]
+2026-11-15T15:50:17.8259657Z ##[group]Disabling automatic garbage collection
+2026-11-15T15:50:17.8260079Z [command]/usr/bin/git config --local gc.auto 0
+2026-11-15T15:50:17.8260903Z ##[endgroup]
+2026-11-15T15:50:17.8261452Z ##[group]Setting up auth
+2026-11-15T15:50:17.8262139Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-11-15T15:50:17.8279609Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-11-15T15:50:17.8544854Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-11-15T15:50:17.8573192Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-11-15T15:50:17.8833903Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-11-15T15:50:17.8863808Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-11-15T15:50:17.9133936Z [command]/usr/bin/git config --local http.https://github.com/.extraheader AUTHORIZATION: basic ***
+2026-11-15T15:50:17.9168076Z ##[endgroup]
+2026-11-15T15:50:17.9168486Z ##[group]Fetching the repository
+2026-11-15T15:50:17.9177455Z [command]/usr/bin/git -c protocol.version=2 fetch --no-tags --prune --no-recurse-submodules --depth=1 origin +4587d034a572039306ad33018da21ba54c6cb6dd:refs/remotes/pull/50500/merge
+2026-11-15T15:50:18.3829917Z warning: redirecting to http://git-cdn-service.git-cdn.svc.cluster.local:8000/sgl-project/sglang.git/
+2026-11-15T15:50:23.6481808Z From http://git-cdn-service.git-cdn.svc.cluster.local:8000/sgl-project/sglang
+2026-11-15T15:50:23.6482637Z  * [new ref]         4587d034a572039306ad33018da21ba54c6cb6dd -> pull/50500/merge
+2026-11-15T15:50:23.6501018Z ##[endgroup]
+2026-11-15T15:50:23.6501691Z ##[group]Determining the checkout info
+2026-11-15T15:50:23.6502192Z ##[endgroup]
+2026-11-15T15:50:23.6508031Z [command]/usr/bin/git sparse-checkout disable
+2026-11-15T15:50:23.6545630Z [command]/usr/bin/git config --local --unset-all extensions.worktreeConfig
+2026-11-15T15:50:23.6605206Z ##[group]Checking out the ref
+2026-11-15T15:50:23.6608584Z [command]/usr/bin/git checkout --progress --force refs/remotes/pull/50500/merge
+2026-11-15T15:50:24.5096266Z Note: switching to 'refs/remotes/pull/50500/merge'.
+2026-11-15T15:50:24.5096569Z 
+2026-11-15T15:50:24.5097125Z You are in 'detached HEAD' state. You can look around, make experimental
+2026-11-15T15:50:24.5097647Z changes and commit them, and you can discard any commits you make in this
+2026-11-15T15:50:24.5098180Z state without impacting any branches by switching back to a branch.
+2026-11-15T15:50:24.5098479Z 
+2026-11-15T15:50:24.5098691Z If you want to create a new branch to retain commits you create, you may
+2026-11-15T15:50:24.5099166Z do so (now or later) by using -c with the switch command. Example:
+2026-11-15T15:50:24.5099435Z 
+2026-11-15T15:50:24.5099559Z   git switch -c <new-branch-name>
+2026-11-15T15:50:24.5099741Z 
+2026-11-15T15:50:24.5099885Z Or undo this operation with:
+2026-11-15T15:50:24.5100063Z 
+2026-11-15T15:50:24.5100156Z   git switch -
+2026-11-15T15:50:24.5100295Z 
+2026-11-15T15:50:24.5100516Z Turn off this advice by setting config variable advice.detachedHead to false
+2026-11-15T15:50:24.5100835Z 
+2026-11-15T15:50:24.5101323Z HEAD is now at 4587d03 Merge 88f0ee634fcf03ae7026a1f130cf3935d0757d75 into e4c3f001d6bc8cb43e778b6b27d562af550db8c9
+2026-11-15T15:50:24.5120835Z ##[endgroup]
+2026-11-15T15:50:24.5160620Z [command]/usr/bin/git log -1 --format=%H
+2026-11-15T15:50:24.5186313Z 4587d034a572039306ad33018da21ba54c6cb6dd
+2026-11-15T15:50:25.1050708Z ##[group]Run actions/download-artifact@v4
+2026-11-15T15:50:25.1051036Z with:
+2026-11-15T15:50:25.1051483Z   name: sgl-router-aarch64-nightly-npu
+2026-11-15T15:50:25.1051806Z   path: sgl-router-bin
+2026-11-15T15:50:25.1052059Z   merge-multiple: false
+2026-11-15T15:50:25.1052329Z   repository: sgl-project/sglang
+2026-11-15T15:50:25.1052603Z   run-id: 43731798211
+2026-11-15T15:50:25.1052833Z ##[endgroup]
+2026-11-15T15:50:25.1075875Z ##[group]Run '/home/runner/k8s/index.js'
+2026-11-15T15:50:25.1076854Z shell: /home/runner/externals/node24/bin/node {0}
+2026-11-15T15:50:25.1077175Z ##[endgroup]
+2026-11-15T15:50:25.3439607Z (node:488) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-11-15T15:50:25.3440414Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-11-15T15:50:25.3666476Z (node:488) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+2026-11-15T15:50:25.4227960Z (node:488) [DEP0005] DeprecationWarning: Buffer() is deprecated due to security and usability issues. Please use the Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.
+2026-11-15T15:50:25.9884008Z Downloading single artifact
+2026-11-15T15:50:26.0056193Z (node:2567) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-11-15T15:50:26.0056942Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-11-15T15:50:27.7361033Z Preparing to download the following artifacts:
+2026-11-15T15:50:27.7362278Z - sgl-router-aarch64-nightly-npu (ID: 14167644957, Size: 15721823, Expected Digest: sha256:2a0d90e229898ecab8966c276091a0b712333b40b4e1d30f01a4f3278b4165b4)
+2026-11-15T15:50:28.3469239Z Redirecting to blob download url: https://productionresultssa32.blob.core.windows.net/actions-results/539a74af-fddd-82ec-8bea-db2b35f8f3b7/workflow-job-run-e29e67ea-d0b7-5973-b885-f4e287f64058/artifacts/766d272280ee4c78a9e8568aafbe405bbecf95a5e7dda2b4ab3222e025e2db25.zip
+2026-11-15T15:50:28.3470620Z Starting download of artifact to: /__w/sglang/sglang/sgl-router-bin
+2026-11-15T15:50:29.3265361Z (node:2567) [DEP0005] DeprecationWarning: Buffer() is deprecated due to security and usability issues. Please use the Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.
+2026-11-15T15:50:32.3275098Z SHA256 digest of downloaded artifact is 2a0d90e229898ecab8966c276091a0b712333b40b4e1d30f01a4f3278b4165b4
+2026-11-15T15:50:32.3275760Z Artifact download completed successfully.
+2026-11-15T15:50:32.3276106Z Total of 1 artifact(s) downloaded
+2026-11-15T15:50:32.3278418Z Download artifact has finished successfully
+2026-11-15T15:50:33.0180296Z ##[group]Run # Sweep orphaned sglang-{run_id} dirs left by jobs killed before Post process.
+2026-11-15T15:50:33.0181019Z [36;1m# Sweep orphaned sglang-{run_id} dirs left by jobs killed before Post process.[0m
+2026-11-15T15:50:33.0181813Z [36;1m# Backgrounded and capped: the shared PVC is slow, and a pre-existing backlog[0m
+2026-11-15T15:50:33.0182416Z [36;1m# must not block the critical path. fds are redirected so the runner does not[0m
+2026-11-15T15:50:33.0182894Z [36;1m# wait on the background job's stdout.[0m
+2026-11-15T15:50:33.0183368Z [36;1m( find /root/.cache/tests -regextype posix-extended -maxdepth 1 -type d \[0m
+2026-11-15T15:50:33.0183986Z [36;1m    -regex '.*/sglang-[0-9]+$' -mtime +7 -print 2>/dev/null \[0m
+2026-11-15T15:50:33.0184460Z [36;1m  | head -n 5 | xargs -r rm -rf ) >/dev/null 2>&1 </dev/null &[0m
+2026-11-15T15:50:33.0184839Z [36;1m[0m
+2026-11-15T15:50:33.0185187Z [36;1m# The download drops the executable bit; cp keeps it for the pods.[0m
+2026-11-15T15:50:33.0185775Z [36;1mchmod +x sgl-router-bin/sgl-router 2>/dev/null || true[0m
+2026-11-15T15:50:33.0186285Z [36;1mif [ "separation" = "separation" ] && [ ! -x sgl-router-bin/sgl-router ]; then[0m
+2026-11-15T15:50:33.0186950Z [36;1m  echo "::warning::No prebuilt sgl-router; the router pod falls back to sgl-router on the image's PATH."[0m
+2026-11-15T15:50:33.0187488Z [36;1mfi[0m
+2026-11-15T15:50:33.0187708Z [36;1m[0m
+2026-11-15T15:50:33.0187949Z [36;1m# copy source code to shared-disk[0m
+2026-11-15T15:50:33.0188359Z [36;1m# Append run_id to isolate concurrent runs sharing the same PVC.[0m
+2026-11-15T15:50:33.0188772Z [36;1mcurrent_path=$(pwd)[0m
+2026-11-15T15:50:33.0189114Z [36;1mtarget_path=/root/.cache/tests/sglang-43731798211[0m
+2026-11-15T15:50:33.0189477Z [36;1mrm -rf ${target_path}[0m
+2026-11-15T15:50:33.0189768Z [36;1mmkdir -p ${target_path}[0m
+2026-11-15T15:50:33.0190092Z [36;1mcp -r ${current_path}/* ${target_path}/[0m
+2026-11-15T15:50:33.0190541Z shell: sh -e {0}
+2026-11-15T15:50:33.0190781Z ##[endgroup]
+2026-11-15T15:50:33.0282875Z ##[group]Run '/home/runner/k8s/index.js'
+2026-11-15T15:50:33.0283941Z shell: /home/runner/externals/node24/bin/node {0}
+2026-11-15T15:50:33.0284281Z ##[endgroup]
+2026-11-15T15:50:33.2697931Z (node:552) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-11-15T15:50:33.2698724Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-11-15T15:50:33.2934758Z (node:552) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+2026-11-15T15:50:33.3486189Z (node:552) [DEP0005] DeprecationWarning: Buffer() is deprecated due to security and usability issues. Please use the Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.
+2026-11-15T15:51:57.4967782Z ##[group]Run cd ${ASCEND_E2E_TEST_CONFIG_PATH}
+2026-11-15T15:51:57.4968222Z [36;1mcd ${ASCEND_E2E_TEST_CONFIG_PATH}[0m
+2026-11-15T15:51:57.4968688Z [36;1mkubectl delete -f ./k8s_multi_pd_*.yaml --ignore-not-found=true || true[0m
+2026-11-15T15:51:57.4969121Z [36;1m[0m
+2026-11-15T15:51:57.4969374Z [36;1mpod_name_prefix="${KUBE_JOB_NAME}-"[0m
+2026-11-15T15:51:57.4969837Z [36;1mecho "kube name space: $NAMESPACE, pod name prefix: ${pod_name_prefix}"[0m
+2026-11-15T15:51:57.4970261Z [36;1mwhile true; do[0m
+2026-11-15T15:51:57.4970647Z [36;1m  if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_prefix}"; then[0m
+2026-11-15T15:51:57.4971296Z [36;1m    echo "Found exist sglang job, sleeping for 30 seconds..."[0m
+2026-11-15T15:51:57.4971747Z [36;1m    sleep 30[0m
+2026-11-15T15:51:57.4972257Z [36;1m    kubectl get pods | grep "${pod_name_prefix}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE || true[0m
+2026-11-15T15:51:57.4972801Z [36;1m  else[0m
+2026-11-15T15:51:57.4973355Z [36;1m    echo "No sglang job exist, start test case..."[0m
+2026-11-15T15:51:57.4973701Z [36;1m    break[0m
+2026-11-15T15:51:57.4973931Z [36;1m  fi[0m
+2026-11-15T15:51:57.4974154Z [36;1mdone[0m
+2026-11-15T15:51:57.4974510Z shell: sh -e {0}
+2026-11-15T15:51:57.4974746Z ##[endgroup]
+2026-11-15T15:51:57.5055427Z ##[group]Run '/home/runner/k8s/index.js'
+2026-11-15T15:51:57.5057070Z shell: /home/runner/externals/node24/bin/node {0}
+2026-11-15T15:51:57.5057540Z ##[endgroup]
+2026-11-15T15:51:57.7572698Z (node:656) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-11-15T15:51:57.7573531Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-11-15T15:51:57.7801493Z (node:656) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+2026-11-15T15:51:57.8321629Z (node:656) [DEP0005] DeprecationWarning: Buffer() is deprecated due to security and usability issues. Please use the Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.
+2026-11-15T15:51:58.3383310Z error: the path "./k8s_multi_pd_*.yaml" does not exist
+2026-11-15T15:51:58.3398245Z kube name space: sgl-project, pod name prefix: ascend-43731798211-
+2026-11-15T15:51:58.5995993Z No sglang job exist, start test case...
+2026-11-15T15:51:59.4805280Z ##[group]Run # sglang_source_relative_path is shared-disk path
+2026-11-15T15:51:59.4805883Z [36;1m# sglang_source_relative_path is shared-disk path[0m
+2026-11-15T15:51:59.4806404Z [36;1m# Append run_id so concurrent runs do not overwrite each other on the shared PVC.[0m
+2026-11-15T15:51:59.4806951Z [36;1msglang_source_relative_path=tests/sglang-43731798211[0m
+2026-11-15T15:51:59.4807441Z [36;1msglang_source_path=/root/.cache/${sglang_source_relative_path}[0m
+2026-11-15T15:51:59.4807906Z [36;1mecho "Source code path: ${sglang_source_path}"[0m
+2026-11-15T15:51:59.4808262Z [36;1m[0m
+2026-11-15T15:51:59.4808792Z [36;1mtest_case="test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py"[0m
+2026-11-15T15:51:59.4809448Z [36;1mif [ ! -f "${sglang_source_path}/${test_case}" ]; then[0m
+2026-11-15T15:51:59.4809926Z [36;1m  echo "The testcase does not exit: ${sglang_source_path}/${test_case}"[0m
+2026-11-15T15:51:59.4810374Z [36;1m  exit 1[0m
+2026-11-15T15:51:59.4810608Z [36;1mfi[0m
+2026-11-15T15:51:59.4810823Z [36;1m[0m
+2026-11-15T15:51:59.4811059Z [36;1m# prepare for output data[0m
+2026-11-15T15:51:59.4811604Z [36;1mtc_name=${test_case##*/}[0m
+2026-11-15T15:51:59.4812022Z [36;1mtc_name=${tc_name%.*}[0m
+2026-11-15T15:51:59.4812386Z [36;1m[0m
+2026-11-15T15:51:59.4812794Z [36;1m# Provided automatically by the GitHub server.[0m
+2026-11-15T15:51:59.4813467Z [36;1m# run_id is the unique identifier for the workflow run,[0m
+2026-11-15T15:51:59.4814291Z [36;1m# attempt represents the re‑run attempt count of the job.[0m
+2026-11-15T15:51:59.4814913Z [36;1mrun_id=43731798211[0m
+2026-11-15T15:51:59.4815408Z [36;1mrun_attempt=1[0m
+2026-11-15T15:51:59.4815831Z [36;1m[0m
+2026-11-15T15:51:59.4816394Z [36;1m# Parse run metadata (branch_label / workflow_name / create_time)[0m
+2026-11-15T15:51:59.4817387Z [36;1m# from run_start_metadata JSON input using GitHub fromJson expression, same as partitions input.[0m
+2026-11-15T15:51:59.4818400Z [36;1mbranch_label=$(echo "YZY00Raiser-pryzy1112" | tr '/:' '--')[0m
+2026-11-15T15:51:59.4819273Z [36;1mworkflow_name=$(echo "Nightly Test (NPU)" | tr ' ' '_' | tr -d '()')[0m
+2026-11-15T15:51:59.4820127Z [36;1mcreate_time="20261115-2349"[0m
+2026-11-15T15:51:59.4820904Z [36;1mif [ -z "${create_time}" ]; then create_time=$(date -u -d '+8 hours' +%Y%m%d-%H%M); fi[0m
+2026-11-15T15:51:59.4822114Z [36;1m# Append the image tag to the workflow-name segment so that runs with[0m
+2026-11-15T15:51:59.4823144Z [36;1m# different images (CANN 9.0.0/9.1.0, a3/a5) persist into distinct,[0m
+2026-11-15T15:51:59.4824210Z [36;1m# image-tagged output/log directories.[0m
+2026-11-15T15:51:59.4825587Z [36;1mimage_label=$(echo "swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B106" | sed 's#.*[/:]##')[0m
+2026-11-15T15:51:59.4826938Z [36;1mworkflow_name="${workflow_name}--${image_label}"[0m
+2026-11-15T15:51:59.4827545Z [36;1m[0m
+2026-11-15T15:51:59.4828110Z [36;1m# Print persistence‑directory‑prefix variables[0m
+2026-11-15T15:51:59.4829414Z [36;1mecho "Persistence prefix: run_id=${run_id} run_attempt=${run_attempt} branch_label=${branch_label} workflow_name=${workflow_name} create_time=${create_time}"[0m
+2026-11-15T15:51:59.4830633Z [36;1m[0m
+2026-11-15T15:51:59.4831676Z [36;1msglang_test_results_output_path=/root/.cache/tests/output/${branch_label}-${create_time}-${run_id}-${run_attempt}/${workflow_name}/accuracy/${tc_name}[0m
+2026-11-15T15:51:59.4832434Z [36;1mmkdir -p ${sglang_test_results_output_path}[0m
+2026-11-15T15:51:59.4832888Z [36;1mecho "Metrics file path: ${sglang_test_results_output_path}"[0m
+2026-11-15T15:51:59.4833277Z [36;1m[0m
+2026-11-15T15:51:59.4833532Z [36;1mprefill_decode_deployment="separation"[0m
+2026-11-15T15:51:59.4833874Z [36;1mkube_job_type=""[0m
+2026-11-15T15:51:59.4834220Z [36;1mif [ "$prefill_decode_deployment" = "separation" ];then[0m
+2026-11-15T15:51:59.4834645Z [36;1m  kube_job_type=multi-pd-separation[0m
+2026-11-15T15:51:59.4835354Z [36;1melif [ "$prefill_decode_deployment" = "mix" ];then[0m
+2026-11-15T15:51:59.4835740Z [36;1m  kube_job_type=multi-pd-mix[0m
+2026-11-15T15:51:59.4836042Z [36;1melse[0m
+2026-11-15T15:51:59.4836400Z [36;1m  echo "Unsupported deployment type: ${prefill_decode_deployment}"[0m
+2026-11-15T15:51:59.4836813Z [36;1m  exit 1[0m
+2026-11-15T15:51:59.4837042Z [36;1mfi[0m
+2026-11-15T15:51:59.4837259Z [36;1m[0m
+2026-11-15T15:51:59.4837609Z [36;1mtransformers_version=""[0m
+2026-11-15T15:51:59.4837918Z [36;1mcd ${ASCEND_E2E_TEST_CONFIG_PATH}[0m
+2026-11-15T15:51:59.4838269Z [36;1mCMD="python3 -u run_npu_e2e_test.py \[0m
+2026-11-15T15:51:59.4838606Z [36;1m  --env ci \[0m
+2026-11-15T15:51:59.4839120Z [36;1m  --image swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B106 \[0m
+2026-11-15T15:51:59.4839798Z [36;1m  --sglang-source-relative-path ${sglang_source_relative_path} \[0m
+2026-11-15T15:51:59.4840307Z [36;1m  --metrics-data-file ${sglang_test_results_output_path} \[0m
+2026-11-15T15:51:59.4840709Z [36;1m  --test-case ${test_case} \[0m
+2026-11-15T15:51:59.4841027Z [36;1m  --kube-name-space ${NAMESPACE} \[0m
+2026-11-15T15:51:59.4841539Z [36;1m  --kube-job-type ${kube_job_type} \[0m
+2026-11-15T15:51:59.4841910Z [36;1m  --kube-job-name-prefix ${KUBE_JOB_NAME} \[0m
+2026-11-15T15:51:59.4842257Z [36;1m  --run-id 43731798211"[0m
+2026-11-15T15:51:59.4842633Z [36;1m[0m
+2026-11-15T15:51:59.4842884Z [36;1maccuracy_dataset="gpqa_diamond"[0m
+2026-11-15T15:51:59.4843206Z [36;1mcase "${accuracy_dataset}" in[0m
+2026-11-15T15:51:59.4843520Z [36;1m  ""|gsm8k|gpqa_diamond) ;;[0m
+2026-11-15T15:51:59.4843937Z [36;1m  *) echo "Unsupported accuracy dataset: ${accuracy_dataset}"; exit 1 ;;[0m
+2026-11-15T15:51:59.4844363Z [36;1mesac[0m
+2026-11-15T15:51:59.4844618Z [36;1mif [ -n "${accuracy_dataset}" ]; then[0m
+2026-11-15T15:51:59.4845003Z [36;1m  CMD="${CMD} --accuracy-dataset ${accuracy_dataset}"[0m
+2026-11-15T15:51:59.4845450Z [36;1mfi[0m
+2026-11-15T15:51:59.4845664Z [36;1m[0m
+2026-11-15T15:51:59.4845970Z [36;1mif [ "$prefill_decode_deployment" = "separation" ];then[0m
+2026-11-15T15:51:59.4846339Z [36;1m  CMD="${CMD} \[0m
+2026-11-15T15:51:59.4846611Z [36;1m    --prefill-size 2 \[0m
+2026-11-15T15:51:59.4846903Z [36;1m    --decode-size 1 \[0m
+2026-11-15T15:51:59.4847189Z [36;1m    --router-size 1"[0m
+2026-11-15T15:51:59.4847527Z [36;1melif [ "$prefill_decode_deployment" = "mix" ];then[0m
+2026-11-15T15:51:59.4847893Z [36;1m  CMD="${CMD} --node-size 0"[0m
+2026-11-15T15:51:59.4848174Z [36;1melse[0m
+2026-11-15T15:51:59.4848710Z [36;1m  echo "Unsupported deployment type: ${prefill_decode_deployment}"[0m
+2026-11-15T15:51:59.4849125Z [36;1m  exit 1[0m
+2026-11-15T15:51:59.4849358Z [36;1mfi[0m
+2026-11-15T15:51:59.4849583Z [36;1m[0m
+2026-11-15T15:51:59.4849916Z [36;1mif [ "$SGLANG_IS_IN_CI" = "true" ] || [ "$SGLANG_IS_IN_CI" = "True" ];then[0m
+2026-11-15T15:51:59.4850334Z [36;1m  echo "Run test in ci."[0m
+2026-11-15T15:51:59.4850641Z [36;1m  CMD="${CMD} --sglang-is-in-ci"[0m
+2026-11-15T15:51:59.4850938Z [36;1mfi[0m
+2026-11-15T15:51:59.4851152Z [36;1m[0m
+2026-11-15T15:51:59.4851824Z [36;1mecho "commit id: 4587d034a572039306ad33018da21ba54c6cb6dd" > "$(dirname "${sglang_test_results_output_path}")/commit_id"[0m
+2026-11-15T15:51:59.4852403Z [36;1m[0m
+2026-11-15T15:51:59.4852653Z [36;1mif [ "$transformers_version" != "" ];then[0m
+2026-11-15T15:51:59.4853082Z [36;1m  CMD="${CMD} --transformers-version ${transformers_version}"[0m
+2026-11-15T15:51:59.4853460Z [36;1melse[0m
+2026-11-15T15:51:59.4853757Z [36;1m  echo "Use default transformers version in image."[0m
+2026-11-15T15:51:59.4854099Z [36;1mfi[0m
+2026-11-15T15:51:59.4854312Z [36;1m[0m
+2026-11-15T15:51:59.4854533Z [36;1mecho "Run command: ${CMD}"[0m
+2026-11-15T15:51:59.4854814Z [36;1meval "${CMD}"[0m
+2026-11-15T15:51:59.4855228Z shell: sh -e {0}
+2026-11-15T15:51:59.4855473Z ##[endgroup]
+2026-11-15T15:51:59.4939659Z ##[group]Run '/home/runner/k8s/index.js'
+2026-11-15T15:51:59.4941063Z shell: /home/runner/externals/node24/bin/node {0}
+2026-11-15T15:51:59.4941843Z ##[endgroup]
+2026-11-15T15:51:59.7362226Z (node:751) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-11-15T15:51:59.7363056Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-11-15T15:51:59.7588866Z (node:751) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+2026-11-15T15:51:59.8094201Z (node:751) [DEP0005] DeprecationWarning: Buffer() is deprecated due to security and usability issues. Please use the Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.
+2026-11-15T15:52:00.3594763Z Source code path: /root/.cache/tests/sglang-43731798211
+2026-11-15T15:52:00.3688797Z Persistence prefix: run_id=43731798211 run_attempt=1 branch_label=YZY00Raiser-pryzy1112 workflow_name=Nightly_Test_NPU--cann9.1.0-a3-B106 create_time=20261115-2349
+2026-11-15T15:52:00.3817186Z Metrics file path: /root/.cache/tests/output/YZY00Raiser-pryzy1112-20261115-2349-43731798211-1/Nightly_Test_NPU--cann9.1.0-a3-B106/accuracy/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa
+2026-11-15T15:52:00.3818132Z Run test in ci.
+2026-11-15T15:52:00.3876315Z Use default transformers version in image.
+2026-11-15T15:52:00.3879087Z Run command: python3 -u run_npu_e2e_test.py   --env ci   --image swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B106   --sglang-source-relative-path tests/sglang-43731798211   --metrics-data-file /root/.cache/tests/output/YZY00Raiser-pryzy1112-20261115-2349-43731798211-1/Nightly_Test_NPU--cann9.1.0-a3-B106/accuracy/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa   --test-case test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py   --kube-name-space sgl-project   --kube-job-type multi-pd-separation   --kube-job-name-prefix ascend-43731798211   --run-id 43731798211 --accuracy-dataset gpqa_diamond     --prefill-size 2     --decode-size 1     --router-size 1 --sglang-is-in-ci
+2026-11-15T15:52:00.6559037Z 2026-11-15 15:52:00,654 - INFO - KUBE_CONFIG: /root/.cache/.cache/kb.yaml
+2026-11-15T15:52:01.3021241Z 2026-11-15 15:52:01,300 - INFO - Apply k8s yaml... KUBE_NAME_SPACE:sgl-project, KUBE_CONFIG_MAP:sglang-configmap-55b9f08at33nmlmt, KUBE_JOB_TYPE:multi-pd-separation, KUBE_YAML_FILE:k8s_multi_pd_separation_55b9f08at33nmlmt.yaml
+2026-11-15T15:52:01.3298036Z 2026-11-15 15:52:01,328 - INFO - Pod YAML written to k8s_multi_pd_separation_55b9f08at33nmlmt.yaml
+2026-11-15T15:52:01.3803819Z 2026-11-15 15:52:01,379 - INFO - ConfigMap sglang-configmap-55b9f08at33nmlmt is created
+2026-11-15T15:52:01.4533375Z 2026-11-15 15:52:01,452 - INFO - Volcano job ascend-43731798211-55b9f08at33nmlmt is created
+2026-11-15T15:52:01.4534250Z 2026-11-15 15:52:01,452 - INFO - Waiting all pods to running...
+2026-11-15T15:52:01.5828458Z 2026-11-15 15:52:01,581 - INFO - No sglang pod, waiting...
+2026-11-15T15:52:06.6569156Z 2026-11-15 15:52:06,655 - INFO - Pod: ascend-43731798211-55b9f08at33nmlmt-sglang-decode-0, status: Pending
+2026-11-15T15:52:11.7236427Z 2026-11-15 15:52:11,722 - INFO - Pod: ascend-43731798211-55b9f08at33nmlmt-sglang-decode-0, status: Pending
+2026-11-15T15:52:16.7354942Z 2026-11-15 15:52:16,734 - INFO - Pod: ascend-43731798211-55b9f08at33nmlmt-sglang-decode-0, status: Running
+2026-11-15T15:52:16.7355935Z 2026-11-15 15:52:16,734 - INFO - Pod: ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-0, status: Running
+2026-11-15T15:52:16.7356738Z 2026-11-15 15:52:16,734 - INFO - Pod: ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-1, status: Running
+2026-11-15T15:52:16.7357439Z 2026-11-15 15:52:16,734 - INFO - Pod: ascend-43731798211-55b9f08at33nmlmt-sglang-router-0, status: Running
+2026-11-15T15:52:16.7358014Z 2026-11-15 15:52:16,734 - INFO - All sglang Pod is Running !
+2026-11-15T15:52:16.7509553Z 2026-11-15 15:52:16,749 - INFO - ConfigMap sglang-configmap-55b9f08at33nmlmt already exists. Updating...
+2026-11-15T15:52:16.7586125Z 2026-11-15 15:52:16,757 - INFO - ConfigMap sglang-configmap-55b9f08at33nmlmt updated successfully.
+2026-11-15T15:52:16.7589566Z 2026-11-15 15:52:16,757 - INFO - api_version='v1' binary_data=None data={'ascend-43731798211-55b9f08at33nmlmt-sglang-decode-0': '172.22.3.181', 'ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-0': '172.22.3.77', 'ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-1': '172.22.3.160', 'ascend-43731798211-55b9f08at33nmlmt-sglang-router-0': '172.22.3.158'} immutable=None kind='ConfigMap' metadata={'annotations': None,
+2026-11-15T15:52:16.7591696Z  'creation_timestamp': datetime.datetime(2026, 11, 15, 15, 52, 1, tzinfo=TzInfo(0)),
+2026-11-15T15:52:16.7592182Z  'deletion_grace_period_seconds': None,
+2026-11-15T15:52:16.7592501Z  'deletion_timestamp': None,
+2026-11-15T15:52:16.7592781Z  'finalizers': None,
+2026-11-15T15:52:16.7593056Z  'generate_name': None,
+2026-11-15T15:52:16.7593315Z  'generation': None,
+2026-11-15T15:52:16.7593558Z  'labels': None,
+2026-11-15T15:52:16.7593793Z  'managed_fields': None,
+2026-11-15T15:52:16.7594094Z  'name': 'sglang-configmap-55b9f08at33nmlmt',
+2026-11-15T15:52:16.7594436Z  'namespace': 'sgl-project',
+2026-11-15T15:52:16.7594726Z  'owner_references': None,
+2026-11-15T15:52:16.7594993Z  'resource_version': '492129204',
+2026-11-15T15:52:16.7595267Z  'self_link': None,
+2026-11-15T15:52:16.7595616Z  'uid': '4ab0b7c5-e45b-4018-bd00-2744cdec19ab'}
+2026-11-15T15:52:16.7597115Z 2026-11-15 15:52:16,758 - INFO - Starting to monitor logs for Pod: ascend-43731798211-55b9f08at33nmlmt-sglang-router-0
+2026-11-15T15:52:16.8535592Z NPU info:
+2026-11-15T15:52:16.8536411Z /root/sglang/python/sglang/test/ascend/e2e/run_npu_testcase.sh: line 18: npu-smi: command not found
+2026-11-15T15:52:16.8537305Z ===== Install kubernetes - Begin =====
+2026-11-15T15:52:16.8537619Z Install kubernetes locally.
+2026-11-15T15:52:16.8537945Z Looking in links: /tmp/kubernetes/
+2026-11-15T15:52:16.8538353Z Processing /tmp/kubernetes/kubernetes-35.0.0-py2.py3-none-any.whl
+2026-11-15T15:52:16.8539093Z Requirement already satisfied: certifi>=14.05.14 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (2026.7.22)
+2026-11-15T15:52:16.8539996Z Requirement already satisfied: six>=1.9.0 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (1.17.0)
+2026-11-15T15:52:16.8540898Z Requirement already satisfied: python-dateutil>=2.5.3 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (3.0.0)
+2026-11-15T15:52:16.8542412Z Requirement already satisfied: pyyaml>=5.4.1 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (6.0.1)
+2026-11-15T15:52:16.8543176Z Processing /tmp/kubernetes/websocket_client-1.9.0-py3-none-any.whl (from kubernetes)
+2026-11-15T15:52:16.8543929Z Requirement already satisfied: requests in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (2.34.2)
+2026-11-15T15:52:16.8544707Z Processing /tmp/kubernetes/requests_oauthlib-2.0.0-py2.py3-none-any.whl (from kubernetes)
+2026-11-15T15:52:16.8545569Z Requirement already satisfied: urllib3!=2.6.0,>=1.24.2 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (2.7.0)
+2026-11-15T15:52:16.8546323Z Processing /tmp/kubernetes/durationpy-0.10-py3-none-any.whl (from kubernetes)
+2026-11-15T15:52:16.8547120Z Requirement already satisfied: tzdata in /usr/local/python3.12.13/lib/python3.12/site-packages (from python-dateutil>=2.5.3->kubernetes) (2026.5)
+2026-11-15T15:52:16.8548151Z Requirement already satisfied: charset_normalizer<4,>=2 in /usr/local/python3.12.13/lib/python3.12/site-packages (from requests->kubernetes) (3.4.9)
+2026-11-15T15:52:16.8549127Z Requirement already satisfied: idna<4,>=2.5 in /usr/local/python3.12.13/lib/python3.12/site-packages (from requests->kubernetes) (3.18)
+2026-11-15T15:52:16.8550077Z Processing /tmp/kubernetes/oauthlib-3.3.1-py3-none-any.whl (from requests-oauthlib->kubernetes)
+2026-11-15T15:52:16.8550807Z Installing collected packages: durationpy, websocket-client, oauthlib, requests-oauthlib, kubernetes
+2026-11-15T15:52:16.8551370Z 
+2026-11-15T15:52:16.8551782Z Successfully installed durationpy-0.10 kubernetes-35.0.0 oauthlib-3.3.1 requests-oauthlib-2.0.0 websocket-client-1.9.0
+2026-11-15T15:52:16.8553533Z WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+2026-11-15T15:52:16.8555003Z ===== Install kubernetes - End =====
+2026-11-15T15:52:16.8555413Z ===== Install checkout runtime dependencies - Begin =====
+2026-11-15T15:52:16.8555822Z blake3 is missing from the image, install it online.
+2026-11-15T15:52:16.8556291Z Looking in indexes: https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+2026-11-15T15:52:16.8556711Z Collecting blake3
+2026-11-15T15:52:16.8557161Z   Downloading blake3-1.0.11-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl (369 kB)
+2026-11-15T15:52:16.8557687Z Installing collected packages: blake3
+2026-11-15T15:52:16.8558001Z Successfully installed blake3-1.0.11
+2026-11-15T15:52:16.8559404Z WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+2026-11-15T15:52:16.8560715Z 
+2026-11-15T15:52:16.8560876Z [notice] A new release of pip is available: 26.2 -> 26.3
+2026-11-15T15:52:16.8561385Z [notice] To update, run: pip install --upgrade pip
+2026-11-15T15:52:16.8561779Z ===== Install checkout runtime dependencies - End =====
+2026-11-15T15:52:16.8562141Z Transformers version for sglang:  5.12.1
+2026-11-15T15:52:16.8562440Z performance
+2026-11-15T15:52:16.8562663Z vm.swappiness = 0
+2026-11-15T15:52:16.8562918Z kernel.numa_balancing = 0
+2026-11-15T15:52:16.8563201Z kernel.sched_migration_cost_ns = 50000
+2026-11-15T15:52:16.8563551Z sgl-router: /root/sglang/sgl-router-bin/sgl-router
+2026-11-15T15:52:16.8563889Z ASCEND_VISIBLE_DEVICES=
+2026-11-15T15:52:18.0277349Z can not use command: npu-smi info
+2026-11-15T15:52:21.6481555Z Running test case test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py
+2026-11-15T15:52:21.6652903Z Log path: /root/.cache/tests/logs/log/YZY00Raiser-pryzy1112-20261115-2349-43731798211-1/Nightly_Test_NPU--cann9.1.0-a3-B106/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa/ascend-43731798211-55b9f08at33nmlmt-sglang-router-0
+2026-11-15T15:52:24.4948775Z can not use command: npu-smi info
+2026-11-15T15:52:31.7354007Z 2026-11-15 23:52:31,733 - INFO - get env NAMESPACE = sgl-project
+2026-11-15T15:52:31.7383275Z 2026-11-15 23:52:31,733 - INFO - get env KUBE_CONFIG_MAP = sglang-configmap-55b9f08at33nmlmt
+2026-11-15T15:52:31.7383857Z 2026-11-15 23:52:31,734 - INFO - The nic name matched is enp23s0f3
+2026-11-15T15:52:31.7384307Z 2026-11-15 23:52:31,735 - INFO - PYTHON_FOR_TEST_TOOL: python3
+2026-11-15T15:52:31.7762915Z 2026-11-15 23:52:31,774 - INFO - PYTHON_FOR_TEST_TOOL: python3
+2026-11-15T15:52:31.8137853Z 2026-11-15 23:52:31,811 - INFO - get env POD_IP = 172.22.3.158
+2026-11-15T15:52:32.3242830Z 2026-11-15 23:52:32,322 - INFO - get env KUBECONFIG = /root/.cache/.cache/kb.yaml
+2026-11-15T15:52:32.3707184Z 2026-11-15 23:52:32,368 - INFO - Successfully queried ConfigMap sglang-configmap-55b9f08at33nmlmt in namespace sgl-project
+2026-11-15T15:52:32.3740657Z 2026-11-15 23:52:32,369 - INFO - get env LANGUAGE = en_US:en
+2026-11-15T15:52:37.7659624Z 2026-11-15 23:52:37,763 - INFO - get env TORCHINDUCTOR_CACHE_DIR = /root/.cache/sglang/inductor
+2026-11-15T15:52:39.4084648Z 2026-11-15 23:52:39,405 - INFO - get env LD_LIBRARY_PATH = /usr/local/Ascend/extra-ops/vendors/custom_transformer/op_api/lib:/usr/local/Ascend/cann-9.1.0/opp/vendors/custom_transformer/op_api/lib/:/usr/local/Ascend/cann-9.1.0/opp/vendors/customize/op_api/lib/:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/cann-9.1.0/lib64:/usr/local/Ascend/cann-9.1.0/lib64/plugin/opskernel:/usr/local/Ascend/cann-9.1.0/lib64/plugin/nnengine:/usr/local/Ascend/cann-9.1.0/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64:/usr/local/lib:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling:/usr/local/python3.12.13/lib:
+2026-11-15T15:52:45.0321433Z 2026-11-15 23:52:45,029 - INFO - get env PATH = /usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/cann-9.1.0/bin:/usr/local/Ascend/cann-9.1.0/tools/ccec_compiler/bin:/usr/local/Ascend/cann-9.1.0/tools/profiler/bin:/usr/local/Ascend/cann-9.1.0/tools/ascend_system_advisor/asys:/usr/local/Ascend/cann-9.1.0/tools/show_kernel_debug_data:/usr/local/Ascend/cann-9.1.0/tools/msobjdump:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/usr/local/python3.12.13/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+2026-11-15T15:52:45.0456792Z 2026-11-15 23:52:45,043 - INFO - get env TRITON_CACHE_DIR = /root/.cache/sglang/triton
+2026-11-15T15:52:47.6057407Z CI_OFFLINE: Engine import failed, skip the offline hook: No module named 'sgl_kernel_npu.operators'
+2026-11-15T15:52:47.6086752Z 2026-11-15 23:52:47,604 - INFO - get env HOSTNAME = ascend-43731798211-55b9f08at33nmlmt-sglang-router-0
+2026-11-15T15:52:47.6303345Z CI_OFFLINE: Engine import failed, skip the offline hook: No module named 'sgl_kernel_npu.operators'
+2026-11-15T15:52:47.6348709Z 2026-11-15 23:52:47,628 - INFO - get env NPU_ACCURACY_DATASET = gpqa_diamond
+2026-11-15T15:52:47.6349227Z 2026-11-15 23:52:47,628 - INFO - Init 172.22.3.158 cls.role='router'!
+2026-11-15T15:52:47.6349869Z 2026-11-15 23:52:47,628 - INFO - The current node is router, skip this function start_pd_server.
+2026-11-15T15:52:47.6350413Z 2026-11-15 23:52:47,628 - INFO - Starting router in thread...
+2026-11-15T15:52:47.6350991Z 2026-11-15 23:52:47,628 - INFO - get env SGLANG_TEST_PD_ROUTER_BINARY = /root/sglang/sgl-router-bin/sgl-router
+2026-11-15T15:52:47.6351690Z 2026-11-15 23:52:47,630 - INFO - launch_router start ......
+2026-11-15T15:52:47.6352250Z 2026-11-15 23:52:47,630 - INFO - Waiting for router to be ready at http://172.22.3.158:6677/readiness
+2026-11-15T15:52:47.6352904Z 2026-11-15 23:52:47,630 - INFO - Waiting for the server to start at http://172.22.3.158:6677/readiness...
+2026-11-15T15:52:47.7895576Z 2026-11-15 23:52:47,787 - INFO - Discovered 3 worker nodes (prefill: 2, decode: 1)
+2026-11-15T15:52:47.8225746Z 2026-11-15 23:52:47,820 - INFO - Successfully queried ConfigMap sglang-configmap-55b9f08at33nmlmt in namespace sgl-project
+2026-11-15T15:52:47.8227841Z 2026-11-15 23:52:47,820 - INFO - Retrieved ConfigMap data: {'ascend-43731798211-55b9f08at33nmlmt-sglang-decode-0': '172.22.3.181', 'ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-0': '172.22.3.77', 'ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-1': '172.22.3.160', 'ascend-43731798211-55b9f08at33nmlmt-sglang-router-0': '172.22.3.158'}
+2026-11-15T15:52:47.8229871Z 2026-11-15 23:52:47,820 - INFO - ConfigMap monitoring complete: prefill_url=['172.22.3.77:8000'], decode_url=['172.22.3.181:8000'], node_ip_list=['172.22.3.181', '172.22.3.77']
+2026-11-15T15:53:34.6843659Z 2026-11-15 15:53:34,683 - ERROR - Pod ascend-43731798211-55b9f08at33nmlmt-sglang-decode-0 is not running, status: Succeeded
+2026-11-15T15:53:34.6844647Z 2026-11-15 15:53:34,683 - ERROR - Some pods are not running properly. Please check the sglang logs on these pods. Exiting...
+2026-11-15T15:53:34.7563524Z 2026-11-15 15:53:34,754 - ERROR - Test case failed: test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py
+2026-11-15T15:53:34.7564304Z Traceback (most recent call last):
+2026-11-15T15:53:34.7564905Z   File "/__w/sglang/sglang/python/sglang/test/ascend/e2e/run_npu_e2e_test.py", line 777, in run_npu_e2e_test_case
+2026-11-15T15:53:34.7565459Z     monitor_pod_logs(
+2026-11-15T15:53:34.7565950Z   File "/__w/sglang/sglang/python/sglang/test/ascend/e2e/run_npu_e2e_test.py", line 494, in monitor_pod_logs
+2026-11-15T15:53:34.7566658Z     raise Exception("Monitoring ended but target pattern was not detected")
+2026-11-15T15:53:34.7567169Z Exception: Monitoring ended but target pattern was not detected
+2026-11-15T15:53:34.7809085Z 2026-11-15 15:53:34,779 - INFO - Metrics JSON written to /root/.cache/tests/output/YZY00Raiser-pryzy1112-20261115-2349-43731798211-1/Nightly_Test_NPU--cann9.1.0-a3-B106/accuracy/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa/metrics.json
+2026-11-15T15:53:34.7928016Z ===== pod log (full): ascend-43731798211-55b9f08at33nmlmt-sglang-decode-0 =====
+2026-11-15T15:53:34.8167246Z NPU info:
+2026-11-15T15:53:34.8167662Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8168346Z | npu-smi 25.5.2                   Version: 25.5.2                                               |
+2026-11-15T15:53:34.8168933Z +---------------------------+---------------+----------------------------------------------------+
+2026-11-15T15:53:34.8169480Z | NPU   Name                | Health        | Power(W)    Temp(C)           Hugepages-Usage(page)|
+2026-11-15T15:53:34.8170053Z | Chip  Phy-ID              | Bus-Id        | AICore(%)   Memory-Usage(MB)  HBM-Usage(MB)        |
+2026-11-15T15:53:34.8170521Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8171565Z | 0     Ascend910           | OK            | 162.5       31                0    / 0             |
+2026-11-15T15:53:34.8172050Z | 0     0                   | 0000:9D:00.0  | 0           0    / 0          3148 / 65536         |
+2026-11-15T15:53:34.8172557Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8173093Z | 0     Ascend910           | OK            | -           33                0    / 0             |
+2026-11-15T15:53:34.8173557Z | 1     1                   | 0000:9F:00.0  | 0           0    / 0          2901 / 65536         |
+2026-11-15T15:53:34.8173977Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8174419Z | 1     Ascend910           | OK            | 172.6       32                0    / 0             |
+2026-11-15T15:53:34.8174874Z | 0     2                   | 0000:99:00.0  | 0           0    / 0          3182 / 65536         |
+2026-11-15T15:53:34.8175364Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8175865Z | 1     Ascend910           | OK            | -           33                0    / 0             |
+2026-11-15T15:53:34.8176325Z | 1     3                   | 0000:9B:00.0  | 0           0    / 0          2886 / 65536         |
+2026-11-15T15:53:34.8176963Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8177410Z | 2     Ascend910           | OK            | 155.5       32                0    / 0             |
+2026-11-15T15:53:34.8177867Z | 0     4                   | 0000:95:00.0  | 0           0    / 0          3172 / 65536         |
+2026-11-15T15:53:34.8178359Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8178861Z | 2     Ascend910           | OK            | -           32                0    / 0             |
+2026-11-15T15:53:34.8179314Z | 1     5                   | 0000:97:00.0  | 0           0    / 0          2899 / 65536         |
+2026-11-15T15:53:34.8179740Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8180180Z | 3     Ascend910           | OK            | 162.7       32                0    / 0             |
+2026-11-15T15:53:34.8180640Z | 0     6                   | 0000:91:00.0  | 0           0    / 0          3183 / 65536         |
+2026-11-15T15:53:34.8181121Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8181779Z | 3     Ascend910           | OK            | -           33                0    / 0             |
+2026-11-15T15:53:34.8182232Z | 1     7                   | 0000:93:00.0  | 0           0    / 0          2889 / 65536         |
+2026-11-15T15:53:34.8182656Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8183111Z | 4     Ascend910           | OK            | 165.2       32                0    / 0             |
+2026-11-15T15:53:34.8183569Z | 0     8                   | 0000:8D:00.0  | 0           0    / 0          3173 / 65536         |
+2026-11-15T15:53:34.8184051Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8184561Z | 4     Ascend910           | OK            | -           32                0    / 0             |
+2026-11-15T15:53:34.8185025Z | 1     9                   | 0000:8F:00.0  | 0           0    / 0          2902 / 65536         |
+2026-11-15T15:53:34.8185444Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8185888Z | 5     Ascend910           | OK            | 168.9       32                0    / 0             |
+2026-11-15T15:53:34.8186356Z | 0     10                  | 0000:89:00.0  | 0           0    / 0          3185 / 65536         |
+2026-11-15T15:53:34.8187005Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8187506Z | 5     Ascend910           | OK            | -           33                0    / 0             |
+2026-11-15T15:53:34.8187954Z | 1     11                  | 0000:8B:00.0  | 0           0    / 0          2887 / 65536         |
+2026-11-15T15:53:34.8188385Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8188828Z | 6     Ascend910           | OK            | 164.6       33                0    / 0             |
+2026-11-15T15:53:34.8189284Z | 0     12                  | 0000:85:00.0  | 0           0    / 0          3187 / 65536         |
+2026-11-15T15:53:34.8189778Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8190285Z | 6     Ascend910           | OK            | -           33                0    / 0             |
+2026-11-15T15:53:34.8190744Z | 1     13                  | 0000:87:00.0  | 0           0    / 0          2886 / 65536         |
+2026-11-15T15:53:34.8191242Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8191748Z | 7     Ascend910           | OK            | 160.6       32                0    / 0             |
+2026-11-15T15:53:34.8192310Z | 0     14                  | 0000:81:00.0  | 0           0    / 0          3174 / 65536         |
+2026-11-15T15:53:34.8192801Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8193302Z | 7     Ascend910           | OK            | -           33                0    / 0             |
+2026-11-15T15:53:34.8193764Z | 1     15                  | 0000:83:00.0  | 0           0    / 0          2901 / 65536         |
+2026-11-15T15:53:34.8194190Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8194660Z +---------------------------+---------------+----------------------------------------------------+
+2026-11-15T15:53:34.8195219Z | NPU     Chip              | Process id    | Process name             | Process memory(MB)      |
+2026-11-15T15:53:34.8195696Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8196176Z | No running processes found in NPU 0                                                            |
+2026-11-15T15:53:34.8196709Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8197197Z | No running processes found in NPU 1                                                            |
+2026-11-15T15:53:34.8197667Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8198138Z | No running processes found in NPU 2                                                            |
+2026-11-15T15:53:34.8198624Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8199096Z | No running processes found in NPU 3                                                            |
+2026-11-15T15:53:34.8199571Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8200051Z | No running processes found in NPU 4                                                            |
+2026-11-15T15:53:34.8200529Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8201004Z | No running processes found in NPU 5                                                            |
+2026-11-15T15:53:34.8201600Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8202081Z | No running processes found in NPU 6                                                            |
+2026-11-15T15:53:34.8202664Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8203140Z | No running processes found in NPU 7                                                            |
+2026-11-15T15:53:34.8203618Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8204010Z ===== Install kubernetes - Begin =====
+2026-11-15T15:53:34.8204323Z Install kubernetes locally.
+2026-11-15T15:53:34.8204613Z Looking in links: /tmp/kubernetes/
+2026-11-15T15:53:34.8205018Z Processing /tmp/kubernetes/kubernetes-35.0.0-py2.py3-none-any.whl
+2026-11-15T15:53:34.8205754Z Requirement already satisfied: certifi>=14.05.14 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (2026.7.22)
+2026-11-15T15:53:34.8206708Z Requirement already satisfied: six>=1.9.0 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (1.17.0)
+2026-11-15T15:53:34.8207610Z Requirement already satisfied: python-dateutil>=2.5.3 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (3.0.0)
+2026-11-15T15:53:34.8208525Z Requirement already satisfied: pyyaml>=5.4.1 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (6.0.1)
+2026-11-15T15:53:34.8209282Z Processing /tmp/kubernetes/websocket_client-1.9.0-py3-none-any.whl (from kubernetes)
+2026-11-15T15:53:34.8210119Z Requirement already satisfied: requests in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (2.34.2)
+2026-11-15T15:53:34.8210892Z Processing /tmp/kubernetes/requests_oauthlib-2.0.0-py2.py3-none-any.whl (from kubernetes)
+2026-11-15T15:53:34.8211880Z Requirement already satisfied: urllib3!=2.6.0,>=1.24.2 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (2.7.0)
+2026-11-15T15:53:34.8212649Z Processing /tmp/kubernetes/durationpy-0.10-py3-none-any.whl (from kubernetes)
+2026-11-15T15:53:34.8213453Z Requirement already satisfied: tzdata in /usr/local/python3.12.13/lib/python3.12/site-packages (from python-dateutil>=2.5.3->kubernetes) (2026.5)
+2026-11-15T15:53:34.8214484Z Requirement already satisfied: charset_normalizer<4,>=2 in /usr/local/python3.12.13/lib/python3.12/site-packages (from requests->kubernetes) (3.4.9)
+2026-11-15T15:53:34.8215455Z Requirement already satisfied: idna<4,>=2.5 in /usr/local/python3.12.13/lib/python3.12/site-packages (from requests->kubernetes) (3.18)
+2026-11-15T15:53:34.8216282Z Processing /tmp/kubernetes/oauthlib-3.3.1-py3-none-any.whl (from requests-oauthlib->kubernetes)
+2026-11-15T15:53:34.8217065Z Installing collected packages: durationpy, websocket-client, oauthlib, requests-oauthlib, kubernetes
+2026-11-15T15:53:34.8217491Z 
+2026-11-15T15:53:34.8217885Z Successfully installed durationpy-0.10 kubernetes-35.0.0 oauthlib-3.3.1 requests-oauthlib-2.0.0 websocket-client-1.9.0
+2026-11-15T15:53:34.8219622Z WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+2026-11-15T15:53:34.8221090Z ===== Install kubernetes - End =====
+2026-11-15T15:53:34.8221567Z ===== Install checkout runtime dependencies - Begin =====
+2026-11-15T15:53:34.8221971Z blake3 is missing from the image, install it online.
+2026-11-15T15:53:34.8222435Z Looking in indexes: https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+2026-11-15T15:53:34.8222927Z Collecting blake3
+2026-11-15T15:53:34.8223377Z   Using cached blake3-1.0.11-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl (369 kB)
+2026-11-15T15:53:34.8223913Z Installing collected packages: blake3
+2026-11-15T15:53:34.8224231Z Successfully installed blake3-1.0.11
+2026-11-15T15:53:34.8225630Z WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+2026-11-15T15:53:34.8227242Z 
+2026-11-15T15:53:34.8227418Z [notice] A new release of pip is available: 26.2 -> 26.3
+2026-11-15T15:53:34.8227817Z [notice] To update, run: pip install --upgrade pip
+2026-11-15T15:53:34.8228213Z ===== Install checkout runtime dependencies - End =====
+2026-11-15T15:53:34.8228572Z Transformers version for sglang:  5.12.1
+2026-11-15T15:53:34.8228883Z performance
+2026-11-15T15:53:34.8229104Z vm.swappiness = 0
+2026-11-15T15:53:34.8229353Z kernel.numa_balancing = 0
+2026-11-15T15:53:34.8229639Z kernel.sched_migration_cost_ns = 50000
+2026-11-15T15:53:34.8229994Z sgl-router: /root/sglang/sgl-router-bin/sgl-router
+2026-11-15T15:53:34.8230398Z ASCEND_VISIBLE_DEVICES=12,3,8,9,0,4,14,10,13,5,6,7,15,1,2,11
+2026-11-15T15:53:34.8230819Z ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+2026-11-15T15:53:34.8231597Z Running test case test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py
+2026-11-15T15:53:34.8232987Z Log path: /root/.cache/tests/logs/log/YZY00Raiser-pryzy1112-20261115-2349-43731798211-1/Nightly_Test_NPU--cann9.1.0-a3-B106/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa/ascend-43731798211-55b9f08at33nmlmt-sglang-decode-0
+2026-11-15T15:53:34.8234041Z 2026-11-15 23:52:45,125 - INFO - get env NAMESPACE = sgl-project
+2026-11-15T15:53:34.8234560Z 2026-11-15 23:52:45,126 - INFO - get env KUBE_CONFIG_MAP = sglang-configmap-55b9f08at33nmlmt
+2026-11-15T15:53:34.8235149Z 2026-11-15 23:52:45,126 - INFO - The nic name matched is enp23s0f3
+2026-11-15T15:53:34.8235582Z 2026-11-15 23:52:45,127 - INFO - PYTHON_FOR_TEST_TOOL: python3
+2026-11-15T15:53:34.8236000Z 2026-11-15 23:52:45,133 - INFO - PYTHON_FOR_TEST_TOOL: python3
+2026-11-15T15:53:34.8236403Z 2026-11-15 23:52:45,141 - INFO - get env POD_IP = 172.22.3.181
+2026-11-15T15:53:34.8236910Z 2026-11-15 23:52:45,472 - INFO - get env KUBECONFIG = /root/.cache/.cache/kb.yaml
+2026-11-15T15:53:34.8237595Z 2026-11-15 23:52:45,524 - INFO - Successfully queried ConfigMap sglang-configmap-55b9f08at33nmlmt in namespace sgl-project
+2026-11-15T15:53:34.8238228Z 2026-11-15 23:52:45,524 - INFO - get env LANGUAGE = en_US:en
+2026-11-15T15:53:34.8238728Z 2026-11-15 23:52:46,784 - INFO - get env TORCHINDUCTOR_CACHE_DIR = /root/.cache/sglang/inductor
+2026-11-15T15:53:34.8244395Z 2026-11-15 23:52:47,233 - INFO - get env LD_LIBRARY_PATH = /usr/local/Ascend/extra-ops/vendors/custom_transformer/op_api/lib:/usr/local/Ascend/cann-9.1.0/opp/vendors/custom_transformer/op_api/lib/:/usr/local/Ascend/cann-9.1.0/opp/vendors/customize/op_api/lib/:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/cann-9.1.0/lib64:/usr/local/Ascend/cann-9.1.0/lib64/plugin/opskernel:/usr/local/Ascend/cann-9.1.0/lib64/plugin/nnengine:/usr/local/Ascend/cann-9.1.0/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64:/usr/local/lib:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling:/usr/local/python3.12.13/lib:
+2026-11-15T15:53:34.8252498Z 2026-11-15 23:52:49,460 - INFO - get env PATH = /usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/cann-9.1.0/bin:/usr/local/Ascend/cann-9.1.0/tools/ccec_compiler/bin:/usr/local/Ascend/cann-9.1.0/tools/profiler/bin:/usr/local/Ascend/cann-9.1.0/tools/ascend_system_advisor/asys:/usr/local/Ascend/cann-9.1.0/tools/show_kernel_debug_data:/usr/local/Ascend/cann-9.1.0/tools/msobjdump:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/usr/local/python3.12.13/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+2026-11-15T15:53:34.8255175Z 2026-11-15 23:52:49,697 - INFO - get env TRITON_CACHE_DIR = /root/.cache/sglang/triton
+2026-11-15T15:53:34.8255791Z CI_OFFLINE: Engine import failed, skip the offline hook: No module named 'sgl_kernel_npu.operators'
+2026-11-15T15:53:34.8256513Z 2026-11-15 23:52:50,361 - INFO - get env HOSTNAME = ascend-43731798211-55b9f08at33nmlmt-sglang-decode-0
+2026-11-15T15:53:34.8257205Z CI_OFFLINE: Engine import failed, skip the offline hook: No module named 'sgl_kernel_npu.operators'
+2026-11-15T15:53:34.8257786Z 2026-11-15 23:52:50,369 - INFO - get env NPU_ACCURACY_DATASET = gpqa_diamond
+2026-11-15T15:53:34.8258337Z 2026-11-15 23:52:50,369 - INFO - Init 172.22.3.181 cls.role='decode'!
+2026-11-15T15:53:34.8258774Z 2026-11-15 23:52:50,369 - INFO - Starting pd separation node...
+2026-11-15T15:53:34.8259220Z 2026-11-15 23:52:50,369 - INFO - Launch pd separation node start ......
+2026-11-15T15:53:34.8259863Z 2026-11-15 23:52:50,407 - INFO - Successfully queried ConfigMap sglang-configmap-55b9f08at33nmlmt in namespace sgl-project
+2026-11-15T15:53:34.8261614Z 2026-11-15 23:52:50,407 - INFO - Retrieved ConfigMap data: {'ascend-43731798211-55b9f08at33nmlmt-sglang-decode-0': '172.22.3.181', 'ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-0': '172.22.3.77', 'ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-1': '172.22.3.160', 'ascend-43731798211-55b9f08at33nmlmt-sglang-router-0': '172.22.3.158'}
+2026-11-15T15:53:34.8263116Z 2026-11-15 23:52:50,407 - INFO - Setting ENV_VAR ASCEND_MF_STORE_URL=tcp://172.22.3.77:24666
+2026-11-15T15:53:34.8263714Z 2026-11-15 23:52:50,407 - INFO - Setting ENV_VAR PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+2026-11-15T15:53:34.8264247Z 2026-11-15 23:52:50,407 - INFO - Setting ENV_VAR STREAMS_PER_DEVICE=32
+2026-11-15T15:53:34.8264721Z 2026-11-15 23:52:50,407 - INFO - Setting ENV_VAR INF_NAN_MODE_FORCE_DISABLE=1
+2026-11-15T15:53:34.8265204Z 2026-11-15 23:52:50,407 - INFO - Setting ENV_VAR SGLANG_SET_CPU_AFFINITY=1
+2026-11-15T15:53:34.8265660Z 2026-11-15 23:52:50,407 - INFO - Setting ENV_VAR HCCL_SOCKET_IFNAME=lo
+2026-11-15T15:53:34.8266100Z 2026-11-15 23:52:50,407 - INFO - Setting ENV_VAR GLOO_SOCKET_IFNAME=lo
+2026-11-15T15:53:34.8266626Z 2026-11-15 23:52:50,407 - INFO - Setting ENV_VAR HCCL_HOST_SOCKET_PORT_RANGE=auto
+2026-11-15T15:53:34.8267122Z 2026-11-15 23:52:50,407 - INFO - Setting ENV_VAR HCCL_OP_EXPANSION_MODE=AIV
+2026-11-15T15:53:34.8267589Z 2026-11-15 23:52:50,407 - INFO - Setting ENV_VAR SGLANG_OPT_FP8_WO_A_GEMM=0
+2026-11-15T15:53:34.8268103Z 2026-11-15 23:52:50,407 - INFO - Setting ENV_VAR SGLANG_OPT_USE_OVERLAP_STORE_CACHE=False
+2026-11-15T15:53:34.8268643Z 2026-11-15 23:52:50,407 - INFO - Setting ENV_VAR FORCE_DRAFT_MODEL_NON_QUANT=1
+2026-11-15T15:53:34.8269133Z 2026-11-15 23:52:50,407 - INFO - Setting ENV_VAR SGLANG_DSV4_FP4_EXPERTS=False
+2026-11-15T15:53:34.8269612Z 2026-11-15 23:52:50,407 - INFO - Setting ENV_VAR SGLANG_OPT_FUSE_WQA_WKV=0
+2026-11-15T15:53:34.8270124Z 2026-11-15 23:52:50,407 - INFO - Setting ENV_VAR SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
+2026-11-15T15:53:34.8270663Z 2026-11-15 23:52:50,407 - INFO - Setting ENV_VAR SGLANG_OPT_USE_FUSED_HASH_TOPK=False
+2026-11-15T15:53:34.8271269Z 2026-11-15 23:52:50,407 - INFO - Setting ENV_VAR SGLANG_OPT_USE_TILELANG_MHC_PRE=False
+2026-11-15T15:53:34.8271824Z 2026-11-15 23:52:50,407 - INFO - Setting ENV_VAR SGLANG_OPT_DEEPGEMM_HC_PRENORM=False
+2026-11-15T15:53:34.8272469Z 2026-11-15 23:52:50,407 - INFO - Setting ENV_VAR SGLANG_OPT_USE_TILELANG_MHC_POST=False
+2026-11-15T15:53:34.8272970Z 2026-11-15 23:52:50,407 - INFO - Setting ENV_VAR SGLANG_ENABLE_SPEC_V2=1
+2026-11-15T15:53:34.8273457Z 2026-11-15 23:52:50,407 - INFO - Setting ENV_VAR SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+2026-11-15T15:53:34.8273955Z 2026-11-15 23:52:50,408 - INFO - Setting ENV_VAR USE_NPU_MOE_GATING_TOP_K=1
+2026-11-15T15:53:34.8274449Z 2026-11-15 23:52:50,408 - INFO - Setting ENV_VAR SGLANG_RAGGED_VERIFY_MODE=static
+2026-11-15T15:53:34.8274958Z 2026-11-15 23:52:50,408 - INFO - Setting ENV_VAR SGLANG_DSPARK_FAST_SAMPLING=0
+2026-11-15T15:53:34.8275458Z 2026-11-15 23:52:50,408 - INFO - Setting ENV_VAR SGLANG_DSPARK_ENABLE_MULTI_STREAM=0
+2026-11-15T15:53:34.8275962Z 2026-11-15 23:52:50,408 - INFO - Setting ENV_VAR SGLANG_DSPARK_QUANT_AUDIT=1
+2026-11-15T15:53:34.8276459Z 2026-11-15 23:52:50,408 - INFO - Setting ENV_VAR SGLANG_DSPARK_QUANT_AUDIT_STRICT=0
+2026-11-15T15:53:34.8277028Z 2026-11-15 23:52:50,408 - INFO - Setting ENV_VAR DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+2026-11-15T15:53:34.8277577Z 2026-11-15 23:52:50,408 - INFO - Setting ENV_VAR SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1800
+2026-11-15T15:53:34.8278169Z 2026-11-15 23:52:50,408 - INFO - Setting ENV_VAR SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1800
+2026-11-15T15:53:34.8278825Z 2026-11-15 23:52:50,408 - INFO - Setting ENV_VAR SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1
+2026-11-15T15:53:34.8279362Z 2026-11-15 23:52:50,408 - INFO - Setting ENV_VAR SGLANG_DSPARK_FAST_KERNEL=0
+2026-11-15T15:53:34.8279824Z 2026-11-15 23:52:50,408 - INFO - Setting ENV_VAR HCCL_BUFFSIZE=1200
+2026-11-15T15:53:34.8280287Z 2026-11-15 23:52:50,408 - INFO - Setting ENV_VAR DEEPEP_NORMAL_LONG_SEQ_ROUND=8
+2026-11-15T15:53:34.8280825Z 2026-11-15 23:52:50,408 - INFO - Setting ENV_VAR DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
+2026-11-15T15:53:34.8281498Z 2026-11-15 23:52:50,408 - INFO - Setting ENV_VAR DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+2026-11-15T15:53:34.8282099Z 2026-11-15 23:52:50,408 - INFO - Setting ENV_VAR SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+2026-11-15T15:53:34.8282650Z 2026-11-15 23:52:50,408 - INFO - Setting ENV_VAR SGLANG_NPU_USE_MULTI_STREAM=1
+2026-11-15T15:53:34.8283166Z 2026-11-15 23:52:50,408 - INFO - Setting ENV_VAR SGLANG_NPU_SPLIT_SHARED_EXPERT_OVERLAP=1
+2026-11-15T15:53:34.8283749Z 2026-11-15 23:52:50,408 - INFO - Setting ENV_VAR SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX=1
+2026-11-15T15:53:34.8284389Z 2026-11-15 23:52:50,408 - INFO - No node-rank specified - each decode node is an independent instance.
+2026-11-15T15:53:34.8288067Z 2026-11-15 23:52:50,408 - INFO - Starting decode node on 172.22.3.181 with args: ['--page-size', 128, '--tp-size', 16, '--trust-remote-code', '--device', 'npu', '--attention-backend', 'dsv4', '--watchdog-timeout', 9000, '--mem-fraction-static', 0.71, '--disaggregation-mode', 'decode', '--disaggregation-transfer-backend', 'ascend', '--max-running-requests', 256, '--dp-size', 16, '--enable-dp-attention', '--moe-a2a-backend', 'deepep', '--deepep-mode', 'low_latency', '--quantization', 'modelslim', '--enable-dp-lm-head', '--kv-cache-dtype', 'bfloat16', '--load-balance-method', 'round_robin', '--cuda-graph-bs-decode', 1, 2, 3, 4, 5, 6, '--speculative-algorithm', 'DSPARK', '--speculative-draft-model-path', '/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8', '--speculative-draft-model-quantization', 'modelslim', '--speculative-draft-attention-backend', 'ascend', '--speculative-num-draft-tokens', 6, '--node-rank', '0']
+2026-11-15T15:53:34.8294701Z command=sglang serve --model-path /root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8 --page-size 128 --tp-size 16 --trust-remote-code --device npu --attention-backend dsv4 --watchdog-timeout 9000 --mem-fraction-static 0.71 --disaggregation-mode decode --disaggregation-transfer-backend ascend --max-running-requests 256 --dp-size 16 --enable-dp-attention --moe-a2a-backend deepep --deepep-mode low_latency --quantization modelslim --enable-dp-lm-head --kv-cache-dtype bfloat16 --load-balance-method round_robin --cuda-graph-bs-decode 1 2 3 4 5 6 --speculative-algorithm DSPARK --speculative-draft-model-path /root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8 --speculative-draft-model-quantization modelslim --speculative-draft-attention-backend ascend --speculative-num-draft-tokens 6 --node-rank 0 --device npu --host 172.22.3.181 --port 8000
+2026-11-15T15:53:34.8298566Z CI_OFFLINE: Launching server HF_HUB_OFFLINE=0 model=/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8
+2026-11-15T15:53:34.8299620Z /root/sglang/python/sglang/srt/environ.py:2625: UserWarning: Environment variable SGLANG_DSPARK_FAST_SAMPLING is deprecated. DSpark draft sampling always uses Gumbel-max.
+2026-11-15T15:53:34.8300378Z   warnings.warn(message)
+2026-11-15T15:53:34.8301139Z [2026-11-15 23:53:13] The 'attentions' library is not installed. Falling back to native layernorm. Installing this library may improve performance on NPU. See: sgl-project/sgl-kernel-npu
+2026-11-15T15:53:34.8302717Z [2026-11-15 23:53:22] [1;33m'--enable-dp-attention' is deprecated and will be removed in a future release. Use '--attn-dp-size <dp-size>' instead.[0m
+2026-11-15T15:53:34.8303433Z [2026-11-15 23:53:22] Radix cache is disabled for decode server
+2026-11-15T15:53:34.8303966Z [2026-11-15 23:53:22] get env SGLANG_DSV4_FP4_EXPERTS = False
+2026-11-15T15:53:34.8304468Z [2026-11-15 23:53:22] Hybrid SWA model detected. architectures=['DeepseekV4ForCausalLM']
+2026-11-15T15:53:34.8305032Z [2026-11-15 23:53:22] Setting swa_full_tokens_ratio to 0.1 for DeepseekV4ForCausalLM.
+2026-11-15T15:53:34.8305649Z [2026-11-15 23:53:22] Use dsv4 attention backend for DeepseekV4ForCausalLM, setting page_size to 128.
+2026-11-15T15:53:34.8306302Z [2026-11-15 23:53:23] DP attention is enabled. chunked prefill size is adjusted from 8192 to 512.
+2026-11-15T15:53:34.8307067Z [2026-11-15 23:53:23] deepep MoE is enabled. The expert parallel size is adjusted from 1 to the tensor parallel size [16].
+2026-11-15T15:53:34.8307683Z [2026-11-15 23:53:23] get env SGLANG_RAGGED_VERIFY_MODE = static
+2026-11-15T15:53:34.8308101Z [2026-11-15 23:53:23] Set soft_watchdog_timeout since in CI
+2026-11-15T15:53:34.8308549Z [2026-11-15 23:53:23] get env TRITON_CACHE_DIR = /root/.cache/sglang/triton
+2026-11-15T15:53:34.8309086Z [2026-11-15 23:53:24] kill_process_tree called: parent_pid=740, include_parent=False, pid=740
+2026-11-15T15:53:34.8309549Z Error in sys.excepthook:
+2026-11-15T15:53:34.8309837Z Traceback (most recent call last):
+2026-11-15T15:53:34.8310412Z   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/utils/_error_code.py", line 121, in _excepthook
+2026-11-15T15:53:34.8311026Z     self._origin_excepthook(exc_type, exc, *args)
+2026-11-15T15:53:34.8311734Z   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/utils/_error_code.py", line 121, in _excepthook
+2026-11-15T15:53:34.8312346Z     self._origin_excepthook(exc_type, exc, *args)
+2026-11-15T15:53:34.8312927Z   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/utils/_error_code.py", line 121, in _excepthook
+2026-11-15T15:53:34.8313519Z     self._origin_excepthook(exc_type, exc, *args)
+2026-11-15T15:53:34.8313870Z   [Previous line repeated 997 more times]
+2026-11-15T15:53:34.8314231Z RecursionError: maximum recursion depth exceeded
+2026-11-15T15:53:34.8314469Z 
+2026-11-15T15:53:34.8314580Z Original exception was:
+2026-11-15T15:53:34.8314853Z Traceback (most recent call last):
+2026-11-15T15:53:34.8315216Z   File "/usr/local/python3.12.13/bin/sglang", line 6, in <module>
+2026-11-15T15:53:34.8315589Z     sys.exit(main())
+2026-11-15T15:53:34.8315822Z              ^^^^^^
+2026-11-15T15:53:34.8316132Z   File "/root/sglang/python/sglang/cli/main.py", line 51, in main
+2026-11-15T15:53:34.8316545Z     serve(args, extra_argv)
+2026-11-15T15:53:34.8316913Z   File "/root/sglang/python/sglang/cli/serve.py", line 246, in serve
+2026-11-15T15:53:34.8317448Z     registered.backend.run(request)
+2026-11-15T15:53:34.8317838Z   File "/root/sglang/python/sglang/cli/serve.py", line 108, in _run_llm
+2026-11-15T15:53:34.8318231Z     run_server(server_args)
+2026-11-15T15:53:34.8318616Z   File "/root/sglang/python/sglang/launch_server.py", line 65, in run_server
+2026-11-15T15:53:34.8319124Z     from sglang.srt.entrypoints.http_server import launch_server
+2026-11-15T15:53:34.8319668Z   File "/root/sglang/python/sglang/srt/entrypoints/http_server.py", line 86, in <module>
+2026-11-15T15:53:34.8320170Z     from sglang.srt.entrypoints.engine import (
+2026-11-15T15:53:34.8320656Z   File "/root/sglang/python/sglang/srt/entrypoints/engine.py", line 72, in <module>
+2026-11-15T15:53:34.8321253Z     from sglang.srt.managers.data_parallel_controller import (
+2026-11-15T15:53:34.8321867Z   File "/root/sglang/python/sglang/srt/managers/data_parallel_controller.py", line 56, in <module>
+2026-11-15T15:53:34.8322463Z     from sglang.srt.managers.scheduler import run_scheduler_process
+2026-11-15T15:53:34.8323008Z   File "/root/sglang/python/sglang/srt/managers/scheduler.py", line 102, in <module>
+2026-11-15T15:53:34.8323577Z     from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+2026-11-15T15:53:34.8324239Z   File "/root/sglang/python/sglang/srt/disaggregation/decode_kvcache_offload_manager.py", line 29, in <module>
+2026-11-15T15:53:34.8324969Z     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+2026-11-15T15:53:34.8325612Z   File "/root/sglang/python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py", line 30, in <module>
+2026-11-15T15:53:34.8326192Z     from sglang.srt.mem_cache.memory_pool_host import (
+2026-11-15T15:53:34.8326758Z   File "/root/sglang/python/sglang/srt/mem_cache/memory_pool_host.py", line 66, in <module>
+2026-11-15T15:53:34.8327275Z     from sgl_kernel_npu.operators.mem_cache import (
+2026-11-15T15:53:34.8327709Z ModuleNotFoundError: No module named 'sgl_kernel_npu.operators'
+2026-11-15T15:53:34.8328271Z [ERROR] 2026-11-15-23:53:24 (PID:740, Device:-1, RankID:-1) ERR99999 UNKNOWN applicaiton exception
+2026-11-15T15:53:34.8328929Z 2026-11-15 23:53:30,418 - INFO - kill_process_tree called: parent_pid=740, include_parent=True, pid=596
+2026-11-15T15:53:34.8329417Z E
+2026-11-15T15:53:34.8329664Z ======================================================================
+2026-11-15T15:53:34.8330136Z ERROR: setUpClass (__main__.TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh)
+2026-11-15T15:53:34.8330637Z ----------------------------------------------------------------------
+2026-11-15T15:53:34.8331024Z Traceback (most recent call last):
+2026-11-15T15:53:34.8331694Z   File "/root/sglang/python/sglang/test/ascend/e2e/test_npu_multi_node_utils.py", line 644, in launch_pd_separation_node
+2026-11-15T15:53:34.8332281Z     process = popen_launch_server(
+2026-11-15T15:53:34.8332569Z               ^^^^^^^^^^^^^^^^^^^^
+2026-11-15T15:53:34.8333005Z   File "/root/sglang/python/sglang/test/test_utils.py", line 896, in popen_launch_server
+2026-11-15T15:53:34.8333556Z     raise Exception(error_msg + ". Check server logs for errors.")
+2026-11-15T15:53:34.8334058Z Exception: Server process exited with code 1. Check server logs for errors.
+2026-11-15T15:53:34.8334380Z 
+2026-11-15T15:53:34.8334577Z During handling of the above exception, another exception occurred:
+2026-11-15T15:53:34.8334872Z 
+2026-11-15T15:53:34.8334987Z Traceback (most recent call last):
+2026-11-15T15:53:34.8335413Z   File "/root/sglang/python/sglang/test/test_utils.py", line 2494, in safe_setUpClass
+2026-11-15T15:53:34.8335852Z     orig_func(klass)
+2026-11-15T15:53:34.8336458Z   File "/root/sglang/test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py", line 302, in setUpClass
+2026-11-15T15:53:34.8337179Z     super().setUpClass()
+2026-11-15T15:53:34.8337586Z   File "/root/sglang/python/sglang/test/test_utils.py", line 2494, in safe_setUpClass
+2026-11-15T15:53:34.8338039Z     orig_func(klass)
+2026-11-15T15:53:34.8338501Z   File "/root/sglang/python/sglang/test/ascend/e2e/test_npu_accuracy_utils.py", line 705, in setUpClass
+2026-11-15T15:53:34.8339133Z     cls.start_pd_server()
+2026-11-15T15:53:34.8339594Z   File "/root/sglang/python/sglang/test/ascend/e2e/test_npu_multi_node_utils.py", line 368, in wrapper
+2026-11-15T15:53:34.8340118Z     return func(self, *args, **kwargs)
+2026-11-15T15:53:34.8340417Z            ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-11-15T15:53:34.8340928Z   File "/root/sglang/python/sglang/test/ascend/e2e/test_npu_accuracy_utils.py", line 739, in start_pd_server
+2026-11-15T15:53:34.8341662Z     cls.process = launch_pd_separation_node(cls.model_config)
+2026-11-15T15:53:34.8342050Z                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-11-15T15:53:34.8342638Z   File "/root/sglang/python/sglang/test/ascend/e2e/test_npu_multi_node_utils.py", line 651, in launch_pd_separation_node
+2026-11-15T15:53:34.8343313Z     raise RuntimeError(f"Failed to start {role} node on {host_ip}: {e}")
+2026-11-15T15:53:34.8343989Z RuntimeError: Failed to start decode node on 172.22.3.181: Server process exited with code 1. Check server logs for errors.
+2026-11-15T15:53:34.8344461Z 
+2026-11-15T15:53:34.8344624Z ----------------------------------------------------------------------
+2026-11-15T15:53:34.8344991Z Ran 0 tests in 44.902s
+2026-11-15T15:53:34.8345139Z 
+2026-11-15T15:53:34.8345241Z FAILED (errors=1)
+2026-11-15T15:53:34.8345844Z Finished test case test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py
+2026-11-15T15:53:34.8347104Z Metrics log saved to /root/.cache/tests/output/YZY00Raiser-pryzy1112-20261115-2349-43731798211-1/Nightly_Test_NPU--cann9.1.0-a3-B106/accuracy/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa/test_output.log
+2026-11-15T15:53:34.8347907Z 
+2026-11-15T15:53:34.8348139Z ===== end of pod log: ascend-43731798211-55b9f08at33nmlmt-sglang-decode-0 =====
+2026-11-15T15:53:34.8348692Z ===== pod log (full): ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-0 =====
+2026-11-15T15:53:34.8473067Z NPU info:
+2026-11-15T15:53:34.8473458Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8474060Z | npu-smi 25.5.1                   Version: 25.5.1                                               |
+2026-11-15T15:53:34.8474646Z +---------------------------+---------------+----------------------------------------------------+
+2026-11-15T15:53:34.8475210Z | NPU   Name                | Health        | Power(W)    Temp(C)           Hugepages-Usage(page)|
+2026-11-15T15:53:34.8475750Z | Chip  Phy-ID              | Bus-Id        | AICore(%)   Memory-Usage(MB)  HBM-Usage(MB)        |
+2026-11-15T15:53:34.8476227Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8476729Z | 0     Ascend910           | OK            | 167.5       32                0    / 0             |
+2026-11-15T15:53:34.8477208Z | 0     0                   | 0000:9D:00.0  | 0           0    / 0          3155 / 65536         |
+2026-11-15T15:53:34.8477710Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8478211Z | 0     Ascend910           | OK            | -           32                0    / 0             |
+2026-11-15T15:53:34.8478674Z | 1     1                   | 0000:9F:00.0  | 0           0    / 0          2891 / 65536         |
+2026-11-15T15:53:34.8479110Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8479561Z | 1     Ascend910           | OK            | 167.7       32                0    / 0             |
+2026-11-15T15:53:34.8480014Z | 0     2                   | 0000:99:00.0  | 0           0    / 0          3144 / 65536         |
+2026-11-15T15:53:34.8480504Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8481004Z | 1     Ascend910           | OK            | -           31                0    / 0             |
+2026-11-15T15:53:34.8481754Z | 1     3                   | 0000:9B:00.0  | 0           0    / 0          2902 / 65536         |
+2026-11-15T15:53:34.8482181Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8482628Z | 2     Ascend910           | OK            | 171.8       31                0    / 0             |
+2026-11-15T15:53:34.8483092Z | 0     4                   | 0000:95:00.0  | 0           0    / 0          3161 / 65536         |
+2026-11-15T15:53:34.8483587Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8484115Z | 2     Ascend910           | OK            | -           32                0    / 0             |
+2026-11-15T15:53:34.8484582Z | 1     5                   | 0000:97:00.0  | 0           0    / 0          2889 / 65536         |
+2026-11-15T15:53:34.8484993Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8485446Z | 3     Ascend910           | OK            | 169.5       33                0    / 0             |
+2026-11-15T15:53:34.8485901Z | 0     6                   | 0000:91:00.0  | 0           0    / 0          3141 / 65536         |
+2026-11-15T15:53:34.8486457Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8487115Z | 3     Ascend910           | OK            | -           31                0    / 0             |
+2026-11-15T15:53:34.8487569Z | 1     7                   | 0000:93:00.0  | 0           0    / 0          2904 / 65536         |
+2026-11-15T15:53:34.8487996Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8488441Z | 4     Ascend910           | OK            | 167.4       32                0    / 0             |
+2026-11-15T15:53:34.8488901Z | 0     8                   | 0000:8D:00.0  | 0           0    / 0          3156 / 65536         |
+2026-11-15T15:53:34.8489394Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8489905Z | 4     Ascend910           | OK            | -           32                0    / 0             |
+2026-11-15T15:53:34.8490354Z | 1     9                   | 0000:8F:00.0  | 0           0    / 0          2892 / 65536         |
+2026-11-15T15:53:34.8490779Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8491383Z | 5     Ascend910           | OK            | 174.2       32                0    / 0             |
+2026-11-15T15:53:34.8491854Z | 0     10                  | 0000:89:00.0  | 0           0    / 0          3144 / 65536         |
+2026-11-15T15:53:34.8492354Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8492864Z | 5     Ascend910           | OK            | -           32                0    / 0             |
+2026-11-15T15:53:34.8493345Z | 1     11                  | 0000:8B:00.0  | 0           0    / 0          2904 / 65536         |
+2026-11-15T15:53:34.8493767Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8494210Z | 6     Ascend910           | OK            | 166.6       32                0    / 0             |
+2026-11-15T15:53:34.8494672Z | 0     12                  | 0000:85:00.0  | 0           0    / 0          3143 / 65536         |
+2026-11-15T15:53:34.8495163Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8495663Z | 6     Ascend910           | OK            | -           32                0    / 0             |
+2026-11-15T15:53:34.8496111Z | 1     13                  | 0000:87:00.0  | 0           0    / 0          2902 / 65536         |
+2026-11-15T15:53:34.8496589Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8497126Z | 7     Ascend910           | OK            | 170.7       31                0    / 0             |
+2026-11-15T15:53:34.8497582Z | 0     14                  | 0000:81:00.0  | 0           0    / 0          3144 / 65536         |
+2026-11-15T15:53:34.8498063Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8498576Z | 7     Ascend910           | OK            | -           32                0    / 0             |
+2026-11-15T15:53:34.8499025Z | 1     15                  | 0000:83:00.0  | 0           0    / 0          2901 / 65536         |
+2026-11-15T15:53:34.8499446Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8499927Z +---------------------------+---------------+----------------------------------------------------+
+2026-11-15T15:53:34.8500471Z | NPU     Chip              | Process id    | Process name             | Process memory(MB)      |
+2026-11-15T15:53:34.8500946Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8501544Z | No running processes found in NPU 0                                                            |
+2026-11-15T15:53:34.8502032Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8502591Z | No running processes found in NPU 1                                                            |
+2026-11-15T15:53:34.8503069Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8503557Z | No running processes found in NPU 2                                                            |
+2026-11-15T15:53:34.8504030Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8504509Z | No running processes found in NPU 3                                                            |
+2026-11-15T15:53:34.8504994Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8505477Z | No running processes found in NPU 4                                                            |
+2026-11-15T15:53:34.8505956Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8506436Z | No running processes found in NPU 5                                                            |
+2026-11-15T15:53:34.8506986Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8507464Z | No running processes found in NPU 6                                                            |
+2026-11-15T15:53:34.8507941Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8508418Z | No running processes found in NPU 7                                                            |
+2026-11-15T15:53:34.8508896Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8509269Z ===== Install kubernetes - Begin =====
+2026-11-15T15:53:34.8509580Z Install kubernetes locally.
+2026-11-15T15:53:34.8509867Z Looking in links: /tmp/kubernetes/
+2026-11-15T15:53:34.8510281Z Processing /tmp/kubernetes/kubernetes-35.0.0-py2.py3-none-any.whl
+2026-11-15T15:53:34.8511004Z Requirement already satisfied: certifi>=14.05.14 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (2026.7.22)
+2026-11-15T15:53:34.8512033Z Requirement already satisfied: six>=1.9.0 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (1.17.0)
+2026-11-15T15:53:34.8512952Z Requirement already satisfied: python-dateutil>=2.5.3 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (3.0.0)
+2026-11-15T15:53:34.8513869Z Requirement already satisfied: pyyaml>=5.4.1 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (6.0.1)
+2026-11-15T15:53:34.8514743Z Processing /tmp/kubernetes/websocket_client-1.9.0-py3-none-any.whl (from kubernetes)
+2026-11-15T15:53:34.8515503Z Requirement already satisfied: requests in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (2.34.2)
+2026-11-15T15:53:34.8516287Z Processing /tmp/kubernetes/requests_oauthlib-2.0.0-py2.py3-none-any.whl (from kubernetes)
+2026-11-15T15:53:34.8517135Z Requirement already satisfied: urllib3!=2.6.0,>=1.24.2 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (2.7.0)
+2026-11-15T15:53:34.8517890Z Processing /tmp/kubernetes/durationpy-0.10-py3-none-any.whl (from kubernetes)
+2026-11-15T15:53:34.8518695Z Requirement already satisfied: tzdata in /usr/local/python3.12.13/lib/python3.12/site-packages (from python-dateutil>=2.5.3->kubernetes) (2026.5)
+2026-11-15T15:53:34.8519702Z Requirement already satisfied: charset_normalizer<4,>=2 in /usr/local/python3.12.13/lib/python3.12/site-packages (from requests->kubernetes) (3.4.9)
+2026-11-15T15:53:34.8520672Z Requirement already satisfied: idna<4,>=2.5 in /usr/local/python3.12.13/lib/python3.12/site-packages (from requests->kubernetes) (3.18)
+2026-11-15T15:53:34.8521603Z Processing /tmp/kubernetes/oauthlib-3.3.1-py3-none-any.whl (from requests-oauthlib->kubernetes)
+2026-11-15T15:53:34.8522427Z Installing collected packages: durationpy, websocket-client, oauthlib, requests-oauthlib, kubernetes
+2026-11-15T15:53:34.8522849Z 
+2026-11-15T15:53:34.8523246Z Successfully installed durationpy-0.10 kubernetes-35.0.0 oauthlib-3.3.1 requests-oauthlib-2.0.0 websocket-client-1.9.0
+2026-11-15T15:53:34.8524978Z WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+2026-11-15T15:53:34.8526424Z ===== Install kubernetes - End =====
+2026-11-15T15:53:34.8526832Z ===== Install checkout runtime dependencies - Begin =====
+2026-11-15T15:53:34.8527226Z blake3 is missing from the image, install it online.
+2026-11-15T15:53:34.8527704Z Looking in indexes: https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+2026-11-15T15:53:34.8528122Z Collecting blake3
+2026-11-15T15:53:34.8528573Z   Using cached blake3-1.0.11-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl (369 kB)
+2026-11-15T15:53:34.8529192Z Installing collected packages: blake3
+2026-11-15T15:53:34.8529619Z Successfully installed blake3-1.0.11
+2026-11-15T15:53:34.8531025Z WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+2026-11-15T15:53:34.8532458Z 
+2026-11-15T15:53:34.8532627Z [notice] A new release of pip is available: 26.2 -> 26.3
+2026-11-15T15:53:34.8533031Z [notice] To update, run: pip install --upgrade pip
+2026-11-15T15:53:34.8533421Z ===== Install checkout runtime dependencies - End =====
+2026-11-15T15:53:34.8533784Z Transformers version for sglang:  5.12.1
+2026-11-15T15:53:34.8534084Z performance
+2026-11-15T15:53:34.8534320Z vm.swappiness = 0
+2026-11-15T15:53:34.8534568Z kernel.numa_balancing = 0
+2026-11-15T15:53:34.8534849Z kernel.sched_migration_cost_ns = 50000
+2026-11-15T15:53:34.8535194Z sgl-router: /root/sglang/sgl-router-bin/sgl-router
+2026-11-15T15:53:34.8535599Z ASCEND_VISIBLE_DEVICES=3,4,11,15,1,6,7,9,12,10,13,14,0,2,5,8
+2026-11-15T15:53:34.8536016Z ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+2026-11-15T15:53:34.8536723Z Running test case test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py
+2026-11-15T15:53:34.8538098Z Log path: /root/.cache/tests/logs/log/YZY00Raiser-pryzy1112-20261115-2349-43731798211-1/Nightly_Test_NPU--cann9.1.0-a3-B106/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa/ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-0
+2026-11-15T15:53:34.8539154Z 2026-11-15 23:52:44,143 - INFO - get env NAMESPACE = sgl-project
+2026-11-15T15:53:34.8539680Z 2026-11-15 23:52:44,143 - INFO - get env KUBE_CONFIG_MAP = sglang-configmap-55b9f08at33nmlmt
+2026-11-15T15:53:34.8540216Z 2026-11-15 23:52:44,144 - INFO - The nic name matched is enp23s0f3
+2026-11-15T15:53:34.8540649Z 2026-11-15 23:52:44,144 - INFO - PYTHON_FOR_TEST_TOOL: python3
+2026-11-15T15:53:34.8541071Z 2026-11-15 23:52:44,152 - INFO - PYTHON_FOR_TEST_TOOL: python3
+2026-11-15T15:53:34.8541595Z 2026-11-15 23:52:44,163 - INFO - get env POD_IP = 172.22.3.77
+2026-11-15T15:53:34.8542052Z 2026-11-15 23:52:44,490 - INFO - get env KUBECONFIG = /root/.cache/.cache/kb.yaml
+2026-11-15T15:53:34.8542734Z 2026-11-15 23:52:44,539 - INFO - Successfully queried ConfigMap sglang-configmap-55b9f08at33nmlmt in namespace sgl-project
+2026-11-15T15:53:34.8543932Z 2026-11-15 23:52:44,539 - INFO - Starting npu_memcache MetaService: /usr/local/python3.12.13/bin/python -m sglang.srt.mem_cache.storage.npu_memcache.start_meta_service --config_path /tmp/npu_memcache_metaservice_config.json
+2026-11-15T15:53:34.8545211Z 2026-11-15 23:52:53.384271 INFO [738-738][MMC mmc_meta_service_process.cpp:231 ResolveAllUrlDomains] start resolving all URL domains.
+2026-11-15T15:53:34.8546140Z 2026-11-15 23:52:53,384 [INFO] npu_memcache.start_meta_service: MetaService setup succeeded with config=/tmp/npu_memcache_metaservice_config.json
+2026-11-15T15:53:34.8547453Z Meta service log level 1, log path: /var/log/memcache_hybrid/logs/mmc-meta.log, audit log path: /var/log/memcache_hybrid/logs/mmc-meta-audit.log, log rotation file size: 20971520, log rotation file count: 50, log output target: 1
+2026-11-15T15:53:34.8548498Z 2026-11-15 23:52:54,542 - INFO - npu_memcache MetaService is ready at 172.22.3.77:5007
+2026-11-15T15:53:34.8548981Z 2026-11-15 23:52:54,542 - INFO - get env LANGUAGE = en_US:en
+2026-11-15T15:53:34.8549477Z 2026-11-15 23:52:55,668 - INFO - get env TORCHINDUCTOR_CACHE_DIR = /root/.cache/sglang/inductor
+2026-11-15T15:53:34.8555164Z 2026-11-15 23:52:56,124 - INFO - get env LD_LIBRARY_PATH = /usr/local/Ascend/extra-ops/vendors/custom_transformer/op_api/lib:/usr/local/Ascend/cann-9.1.0/opp/vendors/custom_transformer/op_api/lib/:/usr/local/Ascend/cann-9.1.0/opp/vendors/customize/op_api/lib/:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/cann-9.1.0/lib64:/usr/local/Ascend/cann-9.1.0/lib64/plugin/opskernel:/usr/local/Ascend/cann-9.1.0/lib64/plugin/nnengine:/usr/local/Ascend/cann-9.1.0/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64:/usr/local/lib:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling:/usr/local/python3.12.13/lib:
+2026-11-15T15:53:34.8563156Z 2026-11-15 23:52:58,245 - INFO - get env PATH = /usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/cann-9.1.0/bin:/usr/local/Ascend/cann-9.1.0/tools/ccec_compiler/bin:/usr/local/Ascend/cann-9.1.0/tools/profiler/bin:/usr/local/Ascend/cann-9.1.0/tools/ascend_system_advisor/asys:/usr/local/Ascend/cann-9.1.0/tools/show_kernel_debug_data:/usr/local/Ascend/cann-9.1.0/tools/msobjdump:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/usr/local/python3.12.13/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+2026-11-15T15:53:34.8565940Z 2026-11-15 23:52:58,503 - INFO - get env TRITON_CACHE_DIR = /root/.cache/sglang/triton
+2026-11-15T15:53:34.8566602Z CI_OFFLINE: Engine import failed, skip the offline hook: No module named 'sgl_kernel_npu.operators'
+2026-11-15T15:53:34.8567306Z 2026-11-15 23:52:59,008 - INFO - get env HOSTNAME = ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-0
+2026-11-15T15:53:34.8567964Z 2026-11-15 23:52:59,015 - INFO - Host memory before cache cleanup: command=['free', '-g'], returncode=0
+2026-11-15T15:53:34.8568427Z stdout:
+2026-11-15T15:53:34.8568730Z                total        used        free      shared  buff/cache   available
+2026-11-15T15:53:34.8569172Z Mem:            2010          20        1980           0           9        1980
+2026-11-15T15:53:34.8569543Z Swap:              0           0           0
+2026-11-15T15:53:34.8569747Z 
+2026-11-15T15:53:34.8569834Z stderr:
+2026-11-15T15:53:34.8569954Z 
+2026-11-15T15:53:34.8570395Z 2026-11-15 23:53:00,321 - INFO - drop_caches execution result: command='sync && echo 1 > /proc/sys/vm/drop_caches', returncode=0
+2026-11-15T15:53:34.8570939Z stdout:
+2026-11-15T15:53:34.8571051Z 
+2026-11-15T15:53:34.8571141Z stderr:
+2026-11-15T15:53:34.8571364Z 
+2026-11-15T15:53:34.8571632Z 2026-11-15 23:53:00,340 - INFO - Host memory after cache cleanup: command=['free', '-g'], returncode=0
+2026-11-15T15:53:34.8572087Z stdout:
+2026-11-15T15:53:34.8572371Z                total        used        free      shared  buff/cache   available
+2026-11-15T15:53:34.8572806Z Mem:            2010          20        1982           0           7        1981
+2026-11-15T15:53:34.8573175Z Swap:              0           0           0
+2026-11-15T15:53:34.8573383Z 
+2026-11-15T15:53:34.8573481Z stderr:
+2026-11-15T15:53:34.8573592Z 
+2026-11-15T15:53:34.8573892Z CI_OFFLINE: Engine import failed, skip the offline hook: No module named 'sgl_kernel_npu.operators'
+2026-11-15T15:53:34.8574470Z 2026-11-15 23:53:00,354 - INFO - get env NPU_ACCURACY_DATASET = gpqa_diamond
+2026-11-15T15:53:34.8574933Z 2026-11-15 23:53:00,355 - INFO - Init 172.22.3.77 cls.role='prefill'!
+2026-11-15T15:53:34.8575370Z 2026-11-15 23:53:00,355 - INFO - Starting pd separation node...
+2026-11-15T15:53:34.8575815Z 2026-11-15 23:53:00,355 - INFO - Launch pd separation node start ......
+2026-11-15T15:53:34.8576463Z 2026-11-15 23:53:00,391 - INFO - Successfully queried ConfigMap sglang-configmap-55b9f08at33nmlmt in namespace sgl-project
+2026-11-15T15:53:34.8578130Z 2026-11-15 23:53:00,391 - INFO - Retrieved ConfigMap data: {'ascend-43731798211-55b9f08at33nmlmt-sglang-decode-0': '172.22.3.181', 'ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-0': '172.22.3.77', 'ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-1': '172.22.3.160', 'ascend-43731798211-55b9f08at33nmlmt-sglang-router-0': '172.22.3.158'}
+2026-11-15T15:53:34.8579603Z 2026-11-15 23:53:00,391 - INFO - Setting ENV_VAR ASCEND_MF_STORE_URL=tcp://172.22.3.77:24666
+2026-11-15T15:53:34.8580202Z 2026-11-15 23:53:00,391 - INFO - Setting ENV_VAR PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+2026-11-15T15:53:34.8580741Z 2026-11-15 23:53:00,391 - INFO - Setting ENV_VAR STREAMS_PER_DEVICE=32
+2026-11-15T15:53:34.8581290Z 2026-11-15 23:53:00,391 - INFO - Setting ENV_VAR INF_NAN_MODE_FORCE_DISABLE=1
+2026-11-15T15:53:34.8581783Z 2026-11-15 23:53:00,391 - INFO - Setting ENV_VAR SGLANG_SET_CPU_AFFINITY=1
+2026-11-15T15:53:34.8582235Z 2026-11-15 23:53:00,391 - INFO - Setting ENV_VAR HCCL_SOCKET_IFNAME=lo
+2026-11-15T15:53:34.8582674Z 2026-11-15 23:53:00,391 - INFO - Setting ENV_VAR GLOO_SOCKET_IFNAME=lo
+2026-11-15T15:53:34.8583141Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR HCCL_HOST_SOCKET_PORT_RANGE=auto
+2026-11-15T15:53:34.8583739Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR HCCL_OP_EXPANSION_MODE=AIV
+2026-11-15T15:53:34.8584213Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_OPT_FP8_WO_A_GEMM=0
+2026-11-15T15:53:34.8584736Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_OPT_USE_OVERLAP_STORE_CACHE=False
+2026-11-15T15:53:34.8585267Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR FORCE_DRAFT_MODEL_NON_QUANT=1
+2026-11-15T15:53:34.8585748Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_DSV4_FP4_EXPERTS=False
+2026-11-15T15:53:34.8586224Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_OPT_FUSE_WQA_WKV=0
+2026-11-15T15:53:34.8586780Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
+2026-11-15T15:53:34.8587302Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_OPT_USE_FUSED_HASH_TOPK=False
+2026-11-15T15:53:34.8587830Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_OPT_USE_TILELANG_MHC_PRE=False
+2026-11-15T15:53:34.8588372Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_OPT_DEEPGEMM_HC_PRENORM=False
+2026-11-15T15:53:34.8588903Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_OPT_USE_TILELANG_MHC_POST=False
+2026-11-15T15:53:34.8589404Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_ENABLE_SPEC_V2=1
+2026-11-15T15:53:34.8589983Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+2026-11-15T15:53:34.8590484Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR USE_NPU_MOE_GATING_TOP_K=1
+2026-11-15T15:53:34.8590968Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_RAGGED_VERIFY_MODE=static
+2026-11-15T15:53:34.8591589Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_DSPARK_FAST_SAMPLING=0
+2026-11-15T15:53:34.8592094Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_DSPARK_ENABLE_MULTI_STREAM=0
+2026-11-15T15:53:34.8592606Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_DSPARK_QUANT_AUDIT=1
+2026-11-15T15:53:34.8593106Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_DSPARK_QUANT_AUDIT_STRICT=0
+2026-11-15T15:53:34.8593617Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+2026-11-15T15:53:34.8594181Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1800
+2026-11-15T15:53:34.8594768Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1800
+2026-11-15T15:53:34.8595355Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1
+2026-11-15T15:53:34.8595958Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+2026-11-15T15:53:34.8596559Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR DEEPEP_HCCL_BUFFSIZE=2600
+2026-11-15T15:53:34.8597085Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=8192
+2026-11-15T15:53:34.8597624Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR DEEPEP_NORMAL_LONG_SEQ_ROUND=8
+2026-11-15T15:53:34.8598148Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+2026-11-15T15:53:34.8598738Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+2026-11-15T15:53:34.8599265Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_ENABLE_WAR_BARRIER=1
+2026-11-15T15:53:34.8599770Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_FORCE_COARSE_WAR_BARRIER=1
+2026-11-15T15:53:34.8600283Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_PROFILE_WITH_STACK=False
+2026-11-15T15:53:34.8600831Z 2026-11-15 23:53:00,392 - INFO - Setting ENV_VAR SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX=1
+2026-11-15T15:53:34.8601578Z 2026-11-15 23:53:00,393 - INFO - No node-rank specified - each prefill node is an independent instance.
+2026-11-15T15:53:34.8606589Z 2026-11-15 23:53:00,393 - INFO - Starting prefill node on 172.22.3.77 with args: ['--page-size', 128, '--tp-size', 8, '--pp-size', 2, '--trust-remote-code', '--device', 'npu', '--attention-backend', 'dsv4', '--watchdog-timeout', 9000, '--disaggregation-mode', 'prefill', '--disaggregation-transfer-backend', 'ascend', '--mem-fraction-static', 0.62, '--prefill-max-requests', 256, '--max-prefill-tokens', 70000, '--max-running-requests', 256, '--chunked-prefill-size', 131072, '--dp-size', 8, '--enable-dp-attention', '--tokenizer-worker-num', 16, '--moe-a2a-backend', 'deepep', '--deepep-mode', 'normal', '--quantization', 'modelslim', '--enable-dp-lm-head', '--kv-cache-dtype', 'bfloat16', '--disable-cuda-graph', '--load-balance-method', 'round_robin', '--enable-prefill-cp', '--cp-strategy', 'interleave', '--enable-cache-report', '--enable-hierarchical-cache', '--hicache-io-backend', 'kernel_ascend', '--hicache-ratio', 1.5, '--hicache-write-policy', 'write_through', '--enable-cache-report', '--max-total-tokens', 140000, '--hicache-storage-backend', 'npu_memcache', '--hicache-storage-backend-extra-config', '{"meta_service_url": "tcp://172.22.3.77:5007", "config_store_url": "tcp://172.22.3.77:6007", "log_level": "info", "world_size": 16, "protocol": "device_sdma", "dram_size": "4GB"}', '--node-rank', 0, '--disaggregation-bootstrap-port', '8995']
+2026-11-15T15:53:34.8616238Z command=sglang serve --model-path /root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8 --page-size 128 --tp-size 8 --pp-size 2 --trust-remote-code --device npu --attention-backend dsv4 --watchdog-timeout 9000 --disaggregation-mode prefill --disaggregation-transfer-backend ascend --mem-fraction-static 0.62 --prefill-max-requests 256 --max-prefill-tokens 70000 --max-running-requests 256 --chunked-prefill-size 131072 --dp-size 8 --enable-dp-attention --tokenizer-worker-num 16 --moe-a2a-backend deepep --deepep-mode normal --quantization modelslim --enable-dp-lm-head --kv-cache-dtype bfloat16 --disable-cuda-graph --load-balance-method round_robin --enable-prefill-cp --cp-strategy interleave --enable-cache-report --enable-hierarchical-cache --hicache-io-backend kernel_ascend --hicache-ratio 1.5 --hicache-write-policy write_through --enable-cache-report --max-total-tokens 140000 --hicache-storage-backend npu_memcache --hicache-storage-backend-extra-config '{"meta_service_url": "tcp://172.22.3.77:5007", "config_store_url": "tcp://172.22.3.77:6007", "log_level": "info", "world_size": 16, "protocol": "device_sdma", "dram_size": "4GB"}' --node-rank 0 --disaggregation-bootstrap-port 8995 --device npu --host 172.22.3.77 --port 8000
+2026-11-15T15:53:34.8621596Z CI_OFFLINE: Launching server HF_HUB_OFFLINE=0 model=/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8
+2026-11-15T15:53:34.8622641Z /root/sglang/python/sglang/srt/environ.py:2625: UserWarning: Environment variable SGLANG_DSPARK_FAST_SAMPLING is deprecated. DSpark draft sampling always uses Gumbel-max.
+2026-11-15T15:53:34.8623403Z   warnings.warn(message)
+2026-11-15T15:53:34.8624165Z [2026-11-15 23:53:24] The 'attentions' library is not installed. Falling back to native layernorm. Installing this library may improve performance on NPU. See: sgl-project/sgl-kernel-npu
+2026-11-15T15:53:34.8625561Z [2026-11-15 23:53:28] [1;33m'--enable-dp-attention' is deprecated and will be removed in a future release. Use '--attn-dp-size <dp-size>' instead.[0m
+2026-11-15T15:53:34.8626798Z [2026-11-15 23:53:28] [1;33m'--disable-cuda-graph' is deprecated and will be removed in a future release. Use '--cuda-graph-backend-{decode,prefill}=disabled' instead.[0m
+2026-11-15T15:53:34.8627580Z [2026-11-15 23:53:28] get env SGLANG_DSV4_FP4_EXPERTS = False
+2026-11-15T15:53:34.8628076Z [2026-11-15 23:53:28] Hybrid SWA model detected. architectures=['DeepseekV4ForCausalLM']
+2026-11-15T15:53:34.8628641Z [2026-11-15 23:53:29] Setting swa_full_tokens_ratio to 0.1 for DeepseekV4ForCausalLM.
+2026-11-15T15:53:34.8629271Z [2026-11-15 23:53:29] Use dsv4 attention backend for DeepseekV4ForCausalLM, setting page_size to 128.
+2026-11-15T15:53:34.8629999Z [2026-11-15 23:53:29] Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 context parallelism is enabled.
+2026-11-15T15:53:34.8631016Z [2026-11-15 23:53:29] Enable Context Parallel for DeepSeekV4, strategy=interleave, attn_dp_size=8, moe_dense_tp_size=1, attn_cp_size=1, ep_size=1, tp_size=8
+2026-11-15T15:53:34.8631995Z [2026-11-15 23:53:29] DP attention is enabled. chunked prefill size is adjusted from 131072 to 16384.
+2026-11-15T15:53:34.8632672Z [2026-11-15 23:53:29] Breakable prefill CUDA graph is not enabled for this prefill CP configuration.
+2026-11-15T15:53:34.8633405Z [2026-11-15 23:53:29] deepep MoE is enabled. The expert parallel size is adjusted from 1 to the tensor parallel size [8].
+2026-11-15T15:53:34.8634027Z [2026-11-15 23:53:29] Cuda graph is disabled because deepep_mode=`normal`
+2026-11-15T15:53:34.8634548Z [2026-11-15 23:53:29] Pipeline parallelism is incompatible with overlap schedule.
+2026-11-15T15:53:34.8635033Z [2026-11-15 23:53:29] Set soft_watchdog_timeout since in CI
+2026-11-15T15:53:34.8635475Z [2026-11-15 23:53:29] get env TRITON_CACHE_DIR = /root/.cache/sglang/triton
+2026-11-15T15:53:34.8636014Z [2026-11-15 23:53:29] kill_process_tree called: parent_pid=961, include_parent=False, pid=961
+2026-11-15T15:53:34.8636531Z Error in sys.excepthook:
+2026-11-15T15:53:34.8636853Z Traceback (most recent call last):
+2026-11-15T15:53:34.8637418Z   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/utils/_error_code.py", line 121, in _excepthook
+2026-11-15T15:53:34.8638116Z     self._origin_excepthook(exc_type, exc, *args)
+2026-11-15T15:53:34.8638710Z   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/utils/_error_code.py", line 121, in _excepthook
+2026-11-15T15:53:34.8639308Z     self._origin_excepthook(exc_type, exc, *args)
+2026-11-15T15:53:34.8639892Z   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/utils/_error_code.py", line 121, in _excepthook
+2026-11-15T15:53:34.8640474Z     self._origin_excepthook(exc_type, exc, *args)
+2026-11-15T15:53:34.8640834Z   [Previous line repeated 997 more times]
+2026-11-15T15:53:34.8641272Z RecursionError: maximum recursion depth exceeded
+2026-11-15T15:53:34.8641542Z 
+2026-11-15T15:53:34.8641646Z Original exception was:
+2026-11-15T15:53:34.8641928Z Traceback (most recent call last):
+2026-11-15T15:53:34.8642319Z   File "/usr/local/python3.12.13/bin/sglang", line 6, in <module>
+2026-11-15T15:53:34.8642698Z     sys.exit(main())
+2026-11-15T15:53:34.8642942Z              ^^^^^^
+2026-11-15T15:53:34.8643262Z   File "/root/sglang/python/sglang/cli/main.py", line 51, in main
+2026-11-15T15:53:34.8643654Z     serve(args, extra_argv)
+2026-11-15T15:53:34.8644013Z   File "/root/sglang/python/sglang/cli/serve.py", line 246, in serve
+2026-11-15T15:53:34.8644416Z     registered.backend.run(request)
+2026-11-15T15:53:34.8644820Z   File "/root/sglang/python/sglang/cli/serve.py", line 108, in _run_llm
+2026-11-15T15:53:34.8645216Z     run_server(server_args)
+2026-11-15T15:53:34.8645591Z   File "/root/sglang/python/sglang/launch_server.py", line 65, in run_server
+2026-11-15T15:53:34.8646091Z     from sglang.srt.entrypoints.http_server import launch_server
+2026-11-15T15:53:34.8646684Z   File "/root/sglang/python/sglang/srt/entrypoints/http_server.py", line 86, in <module>
+2026-11-15T15:53:34.8647190Z     from sglang.srt.entrypoints.engine import (
+2026-11-15T15:53:34.8647663Z   File "/root/sglang/python/sglang/srt/entrypoints/engine.py", line 72, in <module>
+2026-11-15T15:53:34.8648190Z     from sglang.srt.managers.data_parallel_controller import (
+2026-11-15T15:53:34.8648760Z   File "/root/sglang/python/sglang/srt/managers/data_parallel_controller.py", line 56, in <module>
+2026-11-15T15:53:34.8649479Z     from sglang.srt.managers.scheduler import run_scheduler_process
+2026-11-15T15:53:34.8650160Z   File "/root/sglang/python/sglang/srt/managers/scheduler.py", line 102, in <module>
+2026-11-15T15:53:34.8650854Z     from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+2026-11-15T15:53:34.8651878Z   File "/root/sglang/python/sglang/srt/disaggregation/decode_kvcache_offload_manager.py", line 29, in <module>
+2026-11-15T15:53:34.8652659Z     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+2026-11-15T15:53:34.8653284Z   File "/root/sglang/python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py", line 30, in <module>
+2026-11-15T15:53:34.8653865Z     from sglang.srt.mem_cache.memory_pool_host import (
+2026-11-15T15:53:34.8654399Z   File "/root/sglang/python/sglang/srt/mem_cache/memory_pool_host.py", line 66, in <module>
+2026-11-15T15:53:34.8654922Z     from sgl_kernel_npu.operators.mem_cache import (
+2026-11-15T15:53:34.8655357Z ModuleNotFoundError: No module named 'sgl_kernel_npu.operators'
+2026-11-15T15:53:34.8655922Z [ERROR] 2026-11-15-23:53:31 (PID:961, Device:-1, RankID:-1) ERR99999 UNKNOWN applicaiton exception
+2026-11-15T15:53:34.8656297Z 
+2026-11-15T15:53:34.8656582Z ===== end of pod log: ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-0 =====
+2026-11-15T15:53:34.8657136Z ===== pod log (full): ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-1 =====
+2026-11-15T15:53:34.8754522Z NPU info:
+2026-11-15T15:53:34.8754918Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8755531Z | npu-smi 25.5.1                   Version: 25.5.1                                               |
+2026-11-15T15:53:34.8756127Z +---------------------------+---------------+----------------------------------------------------+
+2026-11-15T15:53:34.8756998Z | NPU   Name                | Health        | Power(W)    Temp(C)           Hugepages-Usage(page)|
+2026-11-15T15:53:34.8757564Z | Chip  Phy-ID              | Bus-Id        | AICore(%)   Memory-Usage(MB)  HBM-Usage(MB)        |
+2026-11-15T15:53:34.8758044Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8758512Z | 0     Ascend910           | OK            | 160.2       32                0    / 0             |
+2026-11-15T15:53:34.8758997Z | 0     0                   | 0000:9D:00.0  | 0           0    / 0          3144 / 65536         |
+2026-11-15T15:53:34.8759496Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8760014Z | 0     Ascend910           | OK            | -           33                0    / 0             |
+2026-11-15T15:53:34.8760488Z | 1     1                   | 0000:9F:00.0  | 0           0    / 0          2898 / 65536         |
+2026-11-15T15:53:34.8760944Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8761560Z | 1     Ascend910           | OK            | 169.5       33                0    / 0             |
+2026-11-15T15:53:34.8762025Z | 0     2                   | 0000:99:00.0  | 0           0    / 0          3190 / 65536         |
+2026-11-15T15:53:34.8762522Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8763026Z | 1     Ascend910           | OK            | -           33                0    / 0             |
+2026-11-15T15:53:34.8763494Z | 1     3                   | 0000:9B:00.0  | 0           0    / 0          2890 / 65536         |
+2026-11-15T15:53:34.8763912Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8764360Z | 2     Ascend910           | OK            | 160.7       33                0    / 0             |
+2026-11-15T15:53:34.8764821Z | 0     4                   | 0000:95:00.0  | 0           0    / 0          3177 / 65536         |
+2026-11-15T15:53:34.8765308Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8765808Z | 2     Ascend910           | OK            | -           32                0    / 0             |
+2026-11-15T15:53:34.8766264Z | 1     5                   | 0000:97:00.0  | 0           0    / 0          2902 / 65536         |
+2026-11-15T15:53:34.8766740Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8767291Z | 3     Ascend910           | OK            | 156.7       33                0    / 0             |
+2026-11-15T15:53:34.8767761Z | 0     6                   | 0000:91:00.0  | 0           0    / 0          3188 / 65536         |
+2026-11-15T15:53:34.8768251Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8768758Z | 3     Ascend910           | OK            | -           33                0    / 0             |
+2026-11-15T15:53:34.8769215Z | 1     7                   | 0000:93:00.0  | 0           0    / 0          2892 / 65536         |
+2026-11-15T15:53:34.8769649Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8770088Z | 4     Ascend910           | OK            | 161.4       33                0    / 0             |
+2026-11-15T15:53:34.8770545Z | 0     8                   | 0000:8D:00.0  | 0           0    / 0          3187 / 65536         |
+2026-11-15T15:53:34.8771042Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8771684Z | 4     Ascend910           | OK            | -           34                0    / 0             |
+2026-11-15T15:53:34.8772139Z | 1     9                   | 0000:8F:00.0  | 0           0    / 0          2889 / 65536         |
+2026-11-15T15:53:34.8772673Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8773129Z | 5     Ascend910           | OK            | 166.8       33                0    / 0             |
+2026-11-15T15:53:34.8773594Z | 0     10                  | 0000:89:00.0  | 0           0    / 0          3188 / 65536         |
+2026-11-15T15:53:34.8774084Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8774598Z | 5     Ascend910           | OK            | -           33                0    / 0             |
+2026-11-15T15:53:34.8775063Z | 1     11                  | 0000:8B:00.0  | 0           0    / 0          2890 / 65536         |
+2026-11-15T15:53:34.8775488Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8775933Z | 6     Ascend910           | OK            | 162.1       32                0    / 0             |
+2026-11-15T15:53:34.8776397Z | 0     12                  | 0000:85:00.0  | 0           0    / 0          3177 / 65536         |
+2026-11-15T15:53:34.8776932Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8777431Z | 6     Ascend910           | OK            | -           32                0    / 0             |
+2026-11-15T15:53:34.8777899Z | 1     13                  | 0000:87:00.0  | 0           0    / 0          2902 / 65536         |
+2026-11-15T15:53:34.8778318Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8778777Z | 7     Ascend910           | OK            | 161.3       32                0    / 0             |
+2026-11-15T15:53:34.8779236Z | 0     14                  | 0000:81:00.0  | 0           0    / 0          3180 / 65536         |
+2026-11-15T15:53:34.8779735Z +------------------------------------------------------------------------------------------------+
+2026-11-15T15:53:34.8780238Z | 7     Ascend910           | OK            | -           33                0    / 0             |
+2026-11-15T15:53:34.8780686Z | 1     15                  | 0000:83:00.0  | 0           0    / 0          2901 / 65536         |
+2026-11-15T15:53:34.8781119Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8781727Z +---------------------------+---------------+----------------------------------------------------+
+2026-11-15T15:53:34.8782292Z | NPU     Chip              | Process id    | Process name             | Process memory(MB)      |
+2026-11-15T15:53:34.8782864Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8783358Z | No running processes found in NPU 0                                                            |
+2026-11-15T15:53:34.8783836Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8784330Z | No running processes found in NPU 1                                                            |
+2026-11-15T15:53:34.8784814Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8785304Z | No running processes found in NPU 2                                                            |
+2026-11-15T15:53:34.8785779Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8786255Z | No running processes found in NPU 3                                                            |
+2026-11-15T15:53:34.8786805Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8787287Z | No running processes found in NPU 4                                                            |
+2026-11-15T15:53:34.8787758Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8788322Z | No running processes found in NPU 5                                                            |
+2026-11-15T15:53:34.8788805Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8789281Z | No running processes found in NPU 6                                                            |
+2026-11-15T15:53:34.8789754Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8790241Z | No running processes found in NPU 7                                                            |
+2026-11-15T15:53:34.8790726Z +===========================+===============+====================================================+
+2026-11-15T15:53:34.8791109Z ===== Install kubernetes - Begin =====
+2026-11-15T15:53:34.8791548Z Install kubernetes locally.
+2026-11-15T15:53:34.8791846Z Looking in links: /tmp/kubernetes/
+2026-11-15T15:53:34.8792253Z Processing /tmp/kubernetes/kubernetes-35.0.0-py2.py3-none-any.whl
+2026-11-15T15:53:34.8792980Z Requirement already satisfied: certifi>=14.05.14 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (2026.7.22)
+2026-11-15T15:53:34.8793878Z Requirement already satisfied: six>=1.9.0 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (1.17.0)
+2026-11-15T15:53:34.8794804Z Requirement already satisfied: python-dateutil>=2.5.3 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (3.0.0)
+2026-11-15T15:53:34.8795709Z Requirement already satisfied: pyyaml>=5.4.1 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (6.0.1)
+2026-11-15T15:53:34.8796464Z Processing /tmp/kubernetes/websocket_client-1.9.0-py3-none-any.whl (from kubernetes)
+2026-11-15T15:53:34.8797268Z Requirement already satisfied: requests in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (2.34.2)
+2026-11-15T15:53:34.8798042Z Processing /tmp/kubernetes/requests_oauthlib-2.0.0-py2.py3-none-any.whl (from kubernetes)
+2026-11-15T15:53:34.8798831Z Requirement already satisfied: urllib3!=2.6.0,>=1.24.2 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (2.7.0)
+2026-11-15T15:53:34.8799575Z Processing /tmp/kubernetes/durationpy-0.10-py3-none-any.whl (from kubernetes)
+2026-11-15T15:53:34.8800379Z Requirement already satisfied: tzdata in /usr/local/python3.12.13/lib/python3.12/site-packages (from python-dateutil>=2.5.3->kubernetes) (2026.5)
+2026-11-15T15:53:34.8801524Z Requirement already satisfied: charset_normalizer<4,>=2 in /usr/local/python3.12.13/lib/python3.12/site-packages (from requests->kubernetes) (3.4.9)
+2026-11-15T15:53:34.8802597Z Requirement already satisfied: idna<4,>=2.5 in /usr/local/python3.12.13/lib/python3.12/site-packages (from requests->kubernetes) (3.18)
+2026-11-15T15:53:34.8803418Z Processing /tmp/kubernetes/oauthlib-3.3.1-py3-none-any.whl (from requests-oauthlib->kubernetes)
+2026-11-15T15:53:34.8804148Z Installing collected packages: durationpy, websocket-client, oauthlib, requests-oauthlib, kubernetes
+2026-11-15T15:53:34.8804576Z 
+2026-11-15T15:53:34.8804963Z Successfully installed durationpy-0.10 kubernetes-35.0.0 oauthlib-3.3.1 requests-oauthlib-2.0.0 websocket-client-1.9.0
+2026-11-15T15:53:34.8806740Z WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+2026-11-15T15:53:34.8808186Z ===== Install kubernetes - End =====
+2026-11-15T15:53:34.8808550Z ===== Install checkout runtime dependencies - Begin =====
+2026-11-15T15:53:34.8808957Z blake3 is missing from the image, install it online.
+2026-11-15T15:53:34.8809422Z Looking in indexes: https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+2026-11-15T15:53:34.8809841Z Collecting blake3
+2026-11-15T15:53:34.8810373Z   Using cached blake3-1.0.11-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl (369 kB)
+2026-11-15T15:53:34.8840544Z Installing collected packages: blake3
+2026-11-15T15:53:34.8840898Z Successfully installed blake3-1.0.11
+2026-11-15T15:53:34.8842547Z WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+2026-11-15T15:53:34.8843899Z 
+2026-11-15T15:53:34.8844079Z [notice] A new release of pip is available: 26.2 -> 26.3
+2026-11-15T15:53:34.8844483Z [notice] To update, run: pip install --upgrade pip
+2026-11-15T15:53:34.8844879Z ===== Install checkout runtime dependencies - End =====
+2026-11-15T15:53:34.8845247Z Transformers version for sglang:  5.12.1
+2026-11-15T15:53:34.8845565Z performance
+2026-11-15T15:53:34.8845802Z vm.swappiness = 0
+2026-11-15T15:53:34.8846056Z kernel.numa_balancing = 0
+2026-11-15T15:53:34.8846349Z kernel.sched_migration_cost_ns = 50000
+2026-11-15T15:53:34.8846768Z sgl-router: /root/sglang/sgl-router-bin/sgl-router
+2026-11-15T15:53:34.8847167Z ASCEND_VISIBLE_DEVICES=7,15,0,1,3,10,11,13,14,2,4,8,9,5,6,12
+2026-11-15T15:53:34.8847590Z ASCEND_RT_VISIBLE_DEVICES=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+2026-11-15T15:53:34.8848240Z Running test case test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py
+2026-11-15T15:53:34.8849627Z Log path: /root/.cache/tests/logs/log/YZY00Raiser-pryzy1112-20261115-2349-43731798211-1/Nightly_Test_NPU--cann9.1.0-a3-B106/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa/ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-1
+2026-11-15T15:53:34.8850692Z 2026-11-15 23:52:44,506 - INFO - get env NAMESPACE = sgl-project
+2026-11-15T15:53:34.8851312Z 2026-11-15 23:52:44,506 - INFO - get env KUBE_CONFIG_MAP = sglang-configmap-55b9f08at33nmlmt
+2026-11-15T15:53:34.8851861Z 2026-11-15 23:52:44,507 - INFO - The nic name matched is enp23s0f3
+2026-11-15T15:53:34.8852299Z 2026-11-15 23:52:44,508 - INFO - PYTHON_FOR_TEST_TOOL: python3
+2026-11-15T15:53:34.8852721Z 2026-11-15 23:52:44,514 - INFO - PYTHON_FOR_TEST_TOOL: python3
+2026-11-15T15:53:34.8853120Z 2026-11-15 23:52:44,524 - INFO - get env POD_IP = 172.22.3.160
+2026-11-15T15:53:34.8853576Z 2026-11-15 23:52:44,693 - INFO - get env KUBECONFIG = /root/.cache/.cache/kb.yaml
+2026-11-15T15:53:34.8854277Z 2026-11-15 23:52:44,742 - INFO - Successfully queried ConfigMap sglang-configmap-55b9f08at33nmlmt in namespace sgl-project
+2026-11-15T15:53:34.8855150Z 2026-11-15 23:52:44,742 - INFO - get env LANGUAGE = en_US:en
+2026-11-15T15:53:34.8855652Z 2026-11-15 23:52:46,498 - INFO - get env TORCHINDUCTOR_CACHE_DIR = /root/.cache/sglang/inductor
+2026-11-15T15:53:34.8861507Z 2026-11-15 23:52:47,067 - INFO - get env LD_LIBRARY_PATH = /usr/local/Ascend/extra-ops/vendors/custom_transformer/op_api/lib:/usr/local/Ascend/cann-9.1.0/opp/vendors/custom_transformer/op_api/lib/:/usr/local/Ascend/cann-9.1.0/opp/vendors/customize/op_api/lib/:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/cann-9.1.0/lib64:/usr/local/Ascend/cann-9.1.0/lib64/plugin/opskernel:/usr/local/Ascend/cann-9.1.0/lib64/plugin/nnengine:/usr/local/Ascend/cann-9.1.0/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64:/usr/local/lib:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling:/usr/local/python3.12.13/lib:
+2026-11-15T15:53:34.8869394Z 2026-11-15 23:52:49,462 - INFO - get env PATH = /usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/cann-9.1.0/bin:/usr/local/Ascend/cann-9.1.0/tools/ccec_compiler/bin:/usr/local/Ascend/cann-9.1.0/tools/profiler/bin:/usr/local/Ascend/cann-9.1.0/tools/ascend_system_advisor/asys:/usr/local/Ascend/cann-9.1.0/tools/show_kernel_debug_data:/usr/local/Ascend/cann-9.1.0/tools/msobjdump:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/usr/local/python3.12.13/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+2026-11-15T15:53:34.8872193Z 2026-11-15 23:52:49,725 - INFO - get env TRITON_CACHE_DIR = /root/.cache/sglang/triton
+2026-11-15T15:53:34.8872822Z CI_OFFLINE: Engine import failed, skip the offline hook: No module named 'sgl_kernel_npu.operators'
+2026-11-15T15:53:34.8873514Z 2026-11-15 23:52:50,363 - INFO - get env HOSTNAME = ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-1
+2026-11-15T15:53:34.8874190Z 2026-11-15 23:52:50,371 - INFO - Host memory before cache cleanup: command=['free', '-g'], returncode=0
+2026-11-15T15:53:34.8874659Z stdout:
+2026-11-15T15:53:34.8874964Z                total        used        free      shared  buff/cache   available
+2026-11-15T15:53:34.8875411Z Mem:            2010          20        1980           0           9        1981
+2026-11-15T15:53:34.8875797Z Swap:              0           0           0
+2026-11-15T15:53:34.8876001Z 
+2026-11-15T15:53:34.8876096Z stderr:
+2026-11-15T15:53:34.8876211Z 
+2026-11-15T15:53:34.8876646Z 2026-11-15 23:52:51,762 - INFO - drop_caches execution result: command='sync && echo 1 > /proc/sys/vm/drop_caches', returncode=0
+2026-11-15T15:53:34.8877194Z stdout:
+2026-11-15T15:53:34.8877314Z 
+2026-11-15T15:53:34.8877408Z stderr:
+2026-11-15T15:53:34.8877519Z 
+2026-11-15T15:53:34.8877798Z 2026-11-15 23:52:51,781 - INFO - Host memory after cache cleanup: command=['free', '-g'], returncode=0
+2026-11-15T15:53:34.8878258Z stdout:
+2026-11-15T15:53:34.8878543Z                total        used        free      shared  buff/cache   available
+2026-11-15T15:53:34.8878982Z Mem:            2010          20        1982           0           7        1982
+2026-11-15T15:53:34.8879474Z Swap:              0           0           0
+2026-11-15T15:53:34.8879681Z 
+2026-11-15T15:53:34.8879769Z stderr:
+2026-11-15T15:53:34.8879893Z 
+2026-11-15T15:53:34.8880197Z CI_OFFLINE: Engine import failed, skip the offline hook: No module named 'sgl_kernel_npu.operators'
+2026-11-15T15:53:34.8880793Z 2026-11-15 23:52:51,798 - INFO - get env NPU_ACCURACY_DATASET = gpqa_diamond
+2026-11-15T15:53:34.8881388Z 2026-11-15 23:52:51,798 - INFO - Init 172.22.3.160 cls.role='prefill'!
+2026-11-15T15:53:34.8881835Z 2026-11-15 23:52:51,798 - INFO - Starting pd separation node...
+2026-11-15T15:53:34.8882290Z 2026-11-15 23:52:51,798 - INFO - Launch pd separation node start ......
+2026-11-15T15:53:34.8882945Z 2026-11-15 23:52:51,838 - INFO - Successfully queried ConfigMap sglang-configmap-55b9f08at33nmlmt in namespace sgl-project
+2026-11-15T15:53:34.8884861Z 2026-11-15 23:52:51,838 - INFO - Retrieved ConfigMap data: {'ascend-43731798211-55b9f08at33nmlmt-sglang-decode-0': '172.22.3.181', 'ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-0': '172.22.3.77', 'ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-1': '172.22.3.160', 'ascend-43731798211-55b9f08at33nmlmt-sglang-router-0': '172.22.3.158'}
+2026-11-15T15:53:34.8886386Z 2026-11-15 23:52:51,838 - INFO - Setting ENV_VAR ASCEND_MF_STORE_URL=tcp://172.22.3.77:24666
+2026-11-15T15:53:34.8887141Z 2026-11-15 23:52:51,838 - INFO - Setting ENV_VAR PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+2026-11-15T15:53:34.8887683Z 2026-11-15 23:52:51,838 - INFO - Setting ENV_VAR STREAMS_PER_DEVICE=32
+2026-11-15T15:53:34.8888150Z 2026-11-15 23:52:51,838 - INFO - Setting ENV_VAR INF_NAN_MODE_FORCE_DISABLE=1
+2026-11-15T15:53:34.8888636Z 2026-11-15 23:52:51,838 - INFO - Setting ENV_VAR SGLANG_SET_CPU_AFFINITY=1
+2026-11-15T15:53:34.8889093Z 2026-11-15 23:52:51,838 - INFO - Setting ENV_VAR HCCL_SOCKET_IFNAME=lo
+2026-11-15T15:53:34.8889528Z 2026-11-15 23:52:51,838 - INFO - Setting ENV_VAR GLOO_SOCKET_IFNAME=lo
+2026-11-15T15:53:34.8890000Z 2026-11-15 23:52:51,838 - INFO - Setting ENV_VAR HCCL_HOST_SOCKET_PORT_RANGE=auto
+2026-11-15T15:53:34.8890504Z 2026-11-15 23:52:51,838 - INFO - Setting ENV_VAR HCCL_OP_EXPANSION_MODE=AIV
+2026-11-15T15:53:34.8890978Z 2026-11-15 23:52:51,838 - INFO - Setting ENV_VAR SGLANG_OPT_FP8_WO_A_GEMM=0
+2026-11-15T15:53:34.8891616Z 2026-11-15 23:52:51,838 - INFO - Setting ENV_VAR SGLANG_OPT_USE_OVERLAP_STORE_CACHE=False
+2026-11-15T15:53:34.8892155Z 2026-11-15 23:52:51,838 - INFO - Setting ENV_VAR FORCE_DRAFT_MODEL_NON_QUANT=1
+2026-11-15T15:53:34.8892648Z 2026-11-15 23:52:51,838 - INFO - Setting ENV_VAR SGLANG_DSV4_FP4_EXPERTS=False
+2026-11-15T15:53:34.8893125Z 2026-11-15 23:52:51,838 - INFO - Setting ENV_VAR SGLANG_OPT_FUSE_WQA_WKV=0
+2026-11-15T15:53:34.8893629Z 2026-11-15 23:52:51,838 - INFO - Setting ENV_VAR SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
+2026-11-15T15:53:34.8894175Z 2026-11-15 23:52:51,838 - INFO - Setting ENV_VAR SGLANG_OPT_USE_FUSED_HASH_TOPK=False
+2026-11-15T15:53:34.8894709Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR SGLANG_OPT_USE_TILELANG_MHC_PRE=False
+2026-11-15T15:53:34.8895241Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR SGLANG_OPT_DEEPGEMM_HC_PRENORM=False
+2026-11-15T15:53:34.8895778Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR SGLANG_OPT_USE_TILELANG_MHC_POST=False
+2026-11-15T15:53:34.8896293Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR SGLANG_ENABLE_SPEC_V2=1
+2026-11-15T15:53:34.8896843Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+2026-11-15T15:53:34.8897342Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR USE_NPU_MOE_GATING_TOP_K=1
+2026-11-15T15:53:34.8897846Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR SGLANG_RAGGED_VERIFY_MODE=static
+2026-11-15T15:53:34.8898346Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR SGLANG_DSPARK_FAST_SAMPLING=0
+2026-11-15T15:53:34.8898851Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR SGLANG_DSPARK_ENABLE_MULTI_STREAM=0
+2026-11-15T15:53:34.8899359Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR SGLANG_DSPARK_QUANT_AUDIT=1
+2026-11-15T15:53:34.8899975Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR SGLANG_DSPARK_QUANT_AUDIT_STRICT=0
+2026-11-15T15:53:34.8900493Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR DEEP_NORMAL_MODE_USE_INT8_QUANT=1
+2026-11-15T15:53:34.8901048Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR SGLANG_DISAGGREGATION_BOOTSTRAP_TIMEOUT=1800
+2026-11-15T15:53:34.8901753Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR SGLANG_DISAGGREGATION_WAITING_TIMEOUT=1800
+2026-11-15T15:53:34.8902357Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR SGLANG_DISAGGREGATION_ALL_CP_RANKS_TRANSFER=1
+2026-11-15T15:53:34.8902969Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=128
+2026-11-15T15:53:34.8903522Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR DEEPEP_HCCL_BUFFSIZE=2600
+2026-11-15T15:53:34.8904053Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=8192
+2026-11-15T15:53:34.8904593Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR DEEPEP_NORMAL_LONG_SEQ_ROUND=8
+2026-11-15T15:53:34.8905118Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+2026-11-15T15:53:34.8905679Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK=0
+2026-11-15T15:53:34.8906215Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR SGLANG_ENABLE_WAR_BARRIER=1
+2026-11-15T15:53:34.8906856Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR SGLANG_FORCE_COARSE_WAR_BARRIER=1
+2026-11-15T15:53:34.8907372Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR SGLANG_PROFILE_WITH_STACK=False
+2026-11-15T15:53:34.8907928Z 2026-11-15 23:52:51,839 - INFO - Setting ENV_VAR SGLANG_DISAGG_PREFILL_EARLY_SEND_CACHED_PREFIX=1
+2026-11-15T15:53:34.8908578Z 2026-11-15 23:52:51,839 - INFO - No node-rank specified - each prefill node is an independent instance.
+2026-11-15T15:53:34.8913675Z 2026-11-15 23:52:51,839 - INFO - Starting prefill node on 172.22.3.160 with args: ['--page-size', 128, '--tp-size', 8, '--pp-size', 2, '--trust-remote-code', '--device', 'npu', '--attention-backend', 'dsv4', '--watchdog-timeout', 9000, '--disaggregation-mode', 'prefill', '--disaggregation-transfer-backend', 'ascend', '--mem-fraction-static', 0.62, '--prefill-max-requests', 256, '--max-prefill-tokens', 70000, '--max-running-requests', 256, '--chunked-prefill-size', 131072, '--dp-size', 8, '--enable-dp-attention', '--tokenizer-worker-num', 16, '--moe-a2a-backend', 'deepep', '--deepep-mode', 'normal', '--quantization', 'modelslim', '--enable-dp-lm-head', '--kv-cache-dtype', 'bfloat16', '--disable-cuda-graph', '--load-balance-method', 'round_robin', '--enable-prefill-cp', '--cp-strategy', 'interleave', '--enable-cache-report', '--enable-hierarchical-cache', '--hicache-io-backend', 'kernel_ascend', '--hicache-ratio', 1.5, '--hicache-write-policy', 'write_through', '--enable-cache-report', '--max-total-tokens', 140000, '--hicache-storage-backend', 'npu_memcache', '--hicache-storage-backend-extra-config', '{"meta_service_url": "tcp://172.22.3.77:5007", "config_store_url": "tcp://172.22.3.77:6007", "log_level": "info", "world_size": 16, "protocol": "device_sdma", "dram_size": "4GB"}', '--node-rank', 0, '--disaggregation-bootstrap-port', '8996']
+2026-11-15T15:53:34.8923199Z command=sglang serve --model-path /root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8 --page-size 128 --tp-size 8 --pp-size 2 --trust-remote-code --device npu --attention-backend dsv4 --watchdog-timeout 9000 --disaggregation-mode prefill --disaggregation-transfer-backend ascend --mem-fraction-static 0.62 --prefill-max-requests 256 --max-prefill-tokens 70000 --max-running-requests 256 --chunked-prefill-size 131072 --dp-size 8 --enable-dp-attention --tokenizer-worker-num 16 --moe-a2a-backend deepep --deepep-mode normal --quantization modelslim --enable-dp-lm-head --kv-cache-dtype bfloat16 --disable-cuda-graph --load-balance-method round_robin --enable-prefill-cp --cp-strategy interleave --enable-cache-report --enable-hierarchical-cache --hicache-io-backend kernel_ascend --hicache-ratio 1.5 --hicache-write-policy write_through --enable-cache-report --max-total-tokens 140000 --hicache-storage-backend npu_memcache --hicache-storage-backend-extra-config '{"meta_service_url": "tcp://172.22.3.77:5007", "config_store_url": "tcp://172.22.3.77:6007", "log_level": "info", "world_size": 16, "protocol": "device_sdma", "dram_size": "4GB"}' --node-rank 0 --disaggregation-bootstrap-port 8996 --device npu --host 172.22.3.160 --port 8000
+2026-11-15T15:53:34.8928556Z CI_OFFLINE: Launching server HF_HUB_OFFLINE=0 model=/root/.cache/modelscope/hub/models/Eco-Tech/DeepSeek-V4-Flash-0731-w8a8
+2026-11-15T15:53:34.8929608Z /root/sglang/python/sglang/srt/environ.py:2625: UserWarning: Environment variable SGLANG_DSPARK_FAST_SAMPLING is deprecated. DSpark draft sampling always uses Gumbel-max.
+2026-11-15T15:53:34.8930367Z   warnings.warn(message)
+2026-11-15T15:53:34.8931127Z [2026-11-15 23:53:18] The 'attentions' library is not installed. Falling back to native layernorm. Installing this library may improve performance on NPU. See: sgl-project/sgl-kernel-npu
+2026-11-15T15:53:34.8932665Z [2026-11-15 23:53:22] [1;33m'--enable-dp-attention' is deprecated and will be removed in a future release. Use '--attn-dp-size <dp-size>' instead.[0m
+2026-11-15T15:53:34.8933943Z [2026-11-15 23:53:22] [1;33m'--disable-cuda-graph' is deprecated and will be removed in a future release. Use '--cuda-graph-backend-{decode,prefill}=disabled' instead.[0m
+2026-11-15T15:53:34.8934736Z [2026-11-15 23:53:22] get env SGLANG_DSV4_FP4_EXPERTS = False
+2026-11-15T15:53:34.8935231Z [2026-11-15 23:53:22] Hybrid SWA model detected. architectures=['DeepseekV4ForCausalLM']
+2026-11-15T15:53:34.8935792Z [2026-11-15 23:53:23] Setting swa_full_tokens_ratio to 0.1 for DeepseekV4ForCausalLM.
+2026-11-15T15:53:34.8936405Z [2026-11-15 23:53:23] Use dsv4 attention backend for DeepseekV4ForCausalLM, setting page_size to 128.
+2026-11-15T15:53:34.8937196Z [2026-11-15 23:53:23] Disabling SGLANG_OPT_FLASHMLA_SPARSE_PREFILL because DeepSeekV4 context parallelism is enabled.
+2026-11-15T15:53:34.8938111Z [2026-11-15 23:53:23] Enable Context Parallel for DeepSeekV4, strategy=interleave, attn_dp_size=8, moe_dense_tp_size=1, attn_cp_size=1, ep_size=1, tp_size=8
+2026-11-15T15:53:34.8938943Z [2026-11-15 23:53:23] DP attention is enabled. chunked prefill size is adjusted from 131072 to 16384.
+2026-11-15T15:53:34.8939605Z [2026-11-15 23:53:23] Breakable prefill CUDA graph is not enabled for this prefill CP configuration.
+2026-11-15T15:53:34.8940314Z [2026-11-15 23:53:23] deepep MoE is enabled. The expert parallel size is adjusted from 1 to the tensor parallel size [8].
+2026-11-15T15:53:34.8940937Z [2026-11-15 23:53:23] Cuda graph is disabled because deepep_mode=`normal`
+2026-11-15T15:53:34.8941550Z [2026-11-15 23:53:23] Pipeline parallelism is incompatible with overlap schedule.
+2026-11-15T15:53:34.8942031Z [2026-11-15 23:53:23] Set soft_watchdog_timeout since in CI
+2026-11-15T15:53:34.8942465Z [2026-11-15 23:53:23] get env TRITON_CACHE_DIR = /root/.cache/sglang/triton
+2026-11-15T15:53:34.8943004Z [2026-11-15 23:53:24] kill_process_tree called: parent_pid=744, include_parent=False, pid=744
+2026-11-15T15:53:34.8943469Z Error in sys.excepthook:
+2026-11-15T15:53:34.8943765Z Traceback (most recent call last):
+2026-11-15T15:53:34.8944333Z   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/utils/_error_code.py", line 121, in _excepthook
+2026-11-15T15:53:34.8944943Z     self._origin_excepthook(exc_type, exc, *args)
+2026-11-15T15:53:34.8945539Z   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/utils/_error_code.py", line 121, in _excepthook
+2026-11-15T15:53:34.8946135Z     self._origin_excepthook(exc_type, exc, *args)
+2026-11-15T15:53:34.8946774Z   File "/usr/local/python3.12.13/lib/python3.12/site-packages/torch_npu/utils/_error_code.py", line 121, in _excepthook
+2026-11-15T15:53:34.8947363Z     self._origin_excepthook(exc_type, exc, *args)
+2026-11-15T15:53:34.8947714Z   [Previous line repeated 997 more times]
+2026-11-15T15:53:34.8948174Z RecursionError: maximum recursion depth exceeded
+2026-11-15T15:53:34.8948408Z 
+2026-11-15T15:53:34.8948520Z Original exception was:
+2026-11-15T15:53:34.8948801Z Traceback (most recent call last):
+2026-11-15T15:53:34.8949184Z   File "/usr/local/python3.12.13/bin/sglang", line 6, in <module>
+2026-11-15T15:53:34.8949556Z     sys.exit(main())
+2026-11-15T15:53:34.8949793Z              ^^^^^^
+2026-11-15T15:53:34.8950104Z   File "/root/sglang/python/sglang/cli/main.py", line 51, in main
+2026-11-15T15:53:34.8950488Z     serve(args, extra_argv)
+2026-11-15T15:53:34.8950844Z   File "/root/sglang/python/sglang/cli/serve.py", line 246, in serve
+2026-11-15T15:53:34.8951352Z     registered.backend.run(request)
+2026-11-15T15:53:34.8951753Z   File "/root/sglang/python/sglang/cli/serve.py", line 108, in _run_llm
+2026-11-15T15:53:34.8952154Z     run_server(server_args)
+2026-11-15T15:53:34.8952534Z   File "/root/sglang/python/sglang/launch_server.py", line 65, in run_server
+2026-11-15T15:53:34.8953044Z     from sglang.srt.entrypoints.http_server import launch_server
+2026-11-15T15:53:34.8953584Z   File "/root/sglang/python/sglang/srt/entrypoints/http_server.py", line 86, in <module>
+2026-11-15T15:53:34.8954093Z     from sglang.srt.entrypoints.engine import (
+2026-11-15T15:53:34.8954566Z   File "/root/sglang/python/sglang/srt/entrypoints/engine.py", line 72, in <module>
+2026-11-15T15:53:34.8955174Z     from sglang.srt.managers.data_parallel_controller import (
+2026-11-15T15:53:34.8955752Z   File "/root/sglang/python/sglang/srt/managers/data_parallel_controller.py", line 56, in <module>
+2026-11-15T15:53:34.8956355Z     from sglang.srt.managers.scheduler import run_scheduler_process
+2026-11-15T15:53:34.8956939Z   File "/root/sglang/python/sglang/srt/managers/scheduler.py", line 102, in <module>
+2026-11-15T15:53:34.8957501Z     from sglang.srt.disaggregation.decode_kvcache_offload_manager import (
+2026-11-15T15:53:34.8958167Z   File "/root/sglang/python/sglang/srt/disaggregation/decode_kvcache_offload_manager.py", line 29, in <module>
+2026-11-15T15:53:34.8958827Z     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+2026-11-15T15:53:34.8959451Z   File "/root/sglang/python/sglang/srt/mem_cache/hybrid_cache/hybrid_pool_assembler.py", line 30, in <module>
+2026-11-15T15:53:34.8960030Z     from sglang.srt.mem_cache.memory_pool_host import (
+2026-11-15T15:53:34.8960543Z   File "/root/sglang/python/sglang/srt/mem_cache/memory_pool_host.py", line 66, in <module>
+2026-11-15T15:53:34.8961060Z     from sgl_kernel_npu.operators.mem_cache import (
+2026-11-15T15:53:34.8961629Z ModuleNotFoundError: No module named 'sgl_kernel_npu.operators'
+2026-11-15T15:53:34.8962193Z [ERROR] 2026-11-15-23:53:25 (PID:744, Device:-1, RankID:-1) ERR99999 UNKNOWN applicaiton exception
+2026-11-15T15:53:34.8962855Z 2026-11-15 23:53:31,854 - INFO - kill_process_tree called: parent_pid=744, include_parent=True, pid=596
+2026-11-15T15:53:34.8963331Z E
+2026-11-15T15:53:34.8963580Z ======================================================================
+2026-11-15T15:53:34.8964053Z ERROR: setUpClass (__main__.TestNPUDeepSeekV4Flash0731W8A8PDSEPGPQAHigh)
+2026-11-15T15:53:34.8964560Z ----------------------------------------------------------------------
+2026-11-15T15:53:34.8964932Z Traceback (most recent call last):
+2026-11-15T15:53:34.8965505Z   File "/root/sglang/python/sglang/test/ascend/e2e/test_npu_multi_node_utils.py", line 644, in launch_pd_separation_node
+2026-11-15T15:53:34.8966090Z     process = popen_launch_server(
+2026-11-15T15:53:34.8966376Z               ^^^^^^^^^^^^^^^^^^^^
+2026-11-15T15:53:34.8966855Z   File "/root/sglang/python/sglang/test/test_utils.py", line 896, in popen_launch_server
+2026-11-15T15:53:34.8967397Z     raise Exception(error_msg + ". Check server logs for errors.")
+2026-11-15T15:53:34.8967901Z Exception: Server process exited with code 1. Check server logs for errors.
+2026-11-15T15:53:34.8968228Z 
+2026-11-15T15:53:34.8968441Z During handling of the above exception, another exception occurred:
+2026-11-15T15:53:34.8968865Z 
+2026-11-15T15:53:34.8968986Z Traceback (most recent call last):
+2026-11-15T15:53:34.8969424Z   File "/root/sglang/python/sglang/test/test_utils.py", line 2494, in safe_setUpClass
+2026-11-15T15:53:34.8969874Z     orig_func(klass)
+2026-11-15T15:53:34.8970504Z   File "/root/sglang/test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py", line 302, in setUpClass
+2026-11-15T15:53:34.8971251Z     super().setUpClass()
+2026-11-15T15:53:34.8971693Z   File "/root/sglang/python/sglang/test/test_utils.py", line 2494, in safe_setUpClass
+2026-11-15T15:53:34.8972127Z     orig_func(klass)
+2026-11-15T15:53:34.8972592Z   File "/root/sglang/python/sglang/test/ascend/e2e/test_npu_accuracy_utils.py", line 705, in setUpClass
+2026-11-15T15:53:34.8973111Z     cls.start_pd_server()
+2026-11-15T15:53:34.8973575Z   File "/root/sglang/python/sglang/test/ascend/e2e/test_npu_multi_node_utils.py", line 368, in wrapper
+2026-11-15T15:53:34.8974105Z     return func(self, *args, **kwargs)
+2026-11-15T15:53:34.8974392Z            ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-11-15T15:53:34.8974897Z   File "/root/sglang/python/sglang/test/ascend/e2e/test_npu_accuracy_utils.py", line 739, in start_pd_server
+2026-11-15T15:53:34.8975492Z     cls.process = launch_pd_separation_node(cls.model_config)
+2026-11-15T15:53:34.8975878Z                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+2026-11-15T15:53:34.8976604Z   File "/root/sglang/python/sglang/test/ascend/e2e/test_npu_multi_node_utils.py", line 651, in launch_pd_separation_node
+2026-11-15T15:53:34.8977279Z     raise RuntimeError(f"Failed to start {role} node on {host_ip}: {e}")
+2026-11-15T15:53:34.8977954Z RuntimeError: Failed to start prefill node on 172.22.3.160: Server process exited with code 1. Check server logs for errors.
+2026-11-15T15:53:34.8978425Z 
+2026-11-15T15:53:34.8978593Z ----------------------------------------------------------------------
+2026-11-15T15:53:34.8978955Z Ran 0 tests in 47.122s
+2026-11-15T15:53:34.8979113Z 
+2026-11-15T15:53:34.8979209Z FAILED (errors=1)
+2026-11-15T15:53:34.8979727Z Finished test case test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py
+2026-11-15T15:53:34.8980925Z Metrics log saved to /root/.cache/tests/output/YZY00Raiser-pryzy1112-20261115-2349-43731798211-1/Nightly_Test_NPU--cann9.1.0-a3-B106/accuracy/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa/test_output.log
+2026-11-15T15:53:34.8981847Z 
+2026-11-15T15:53:34.8982079Z ===== end of pod log: ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-1 =====
+2026-11-15T15:53:34.8982631Z ===== pod log (full): ascend-43731798211-55b9f08at33nmlmt-sglang-router-0 =====
+2026-11-15T15:53:34.8983109Z NPU info:
+2026-11-15T15:53:34.8983555Z /root/sglang/python/sglang/test/ascend/e2e/run_npu_testcase.sh: line 18: npu-smi: command not found
+2026-11-15T15:53:34.8984088Z ===== Install kubernetes - Begin =====
+2026-11-15T15:53:34.8984404Z Install kubernetes locally.
+2026-11-15T15:53:34.8984695Z Looking in links: /tmp/kubernetes/
+2026-11-15T15:53:34.8985089Z Processing /tmp/kubernetes/kubernetes-35.0.0-py2.py3-none-any.whl
+2026-11-15T15:53:34.8985812Z Requirement already satisfied: certifi>=14.05.14 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (2026.7.22)
+2026-11-15T15:53:34.8986769Z Requirement already satisfied: six>=1.9.0 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (1.17.0)
+2026-11-15T15:53:34.8987668Z Requirement already satisfied: python-dateutil>=2.5.3 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (3.0.0)
+2026-11-15T15:53:34.8988581Z Requirement already satisfied: pyyaml>=5.4.1 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (6.0.1)
+2026-11-15T15:53:34.8989343Z Processing /tmp/kubernetes/websocket_client-1.9.0-py3-none-any.whl (from kubernetes)
+2026-11-15T15:53:34.8990102Z Requirement already satisfied: requests in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (2.34.2)
+2026-11-15T15:53:34.8990983Z Processing /tmp/kubernetes/requests_oauthlib-2.0.0-py2.py3-none-any.whl (from kubernetes)
+2026-11-15T15:53:34.8991899Z Requirement already satisfied: urllib3!=2.6.0,>=1.24.2 in /usr/local/python3.12.13/lib/python3.12/site-packages (from kubernetes) (2.7.0)
+2026-11-15T15:53:34.8992661Z Processing /tmp/kubernetes/durationpy-0.10-py3-none-any.whl (from kubernetes)
+2026-11-15T15:53:34.8993465Z Requirement already satisfied: tzdata in /usr/local/python3.12.13/lib/python3.12/site-packages (from python-dateutil>=2.5.3->kubernetes) (2026.5)
+2026-11-15T15:53:34.8994488Z Requirement already satisfied: charset_normalizer<4,>=2 in /usr/local/python3.12.13/lib/python3.12/site-packages (from requests->kubernetes) (3.4.9)
+2026-11-15T15:53:34.8995471Z Requirement already satisfied: idna<4,>=2.5 in /usr/local/python3.12.13/lib/python3.12/site-packages (from requests->kubernetes) (3.18)
+2026-11-15T15:53:34.8996284Z Processing /tmp/kubernetes/oauthlib-3.3.1-py3-none-any.whl (from requests-oauthlib->kubernetes)
+2026-11-15T15:53:34.8997060Z Installing collected packages: durationpy, websocket-client, oauthlib, requests-oauthlib, kubernetes
+2026-11-15T15:53:34.8997486Z 
+2026-11-15T15:53:34.8997875Z Successfully installed durationpy-0.10 kubernetes-35.0.0 oauthlib-3.3.1 requests-oauthlib-2.0.0 websocket-client-1.9.0
+2026-11-15T15:53:34.8999671Z WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+2026-11-15T15:53:34.9001096Z ===== Install kubernetes - End =====
+2026-11-15T15:53:34.9001579Z ===== Install checkout runtime dependencies - Begin =====
+2026-11-15T15:53:34.9001975Z blake3 is missing from the image, install it online.
+2026-11-15T15:53:34.9002442Z Looking in indexes: https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+2026-11-15T15:53:34.9002863Z Collecting blake3
+2026-11-15T15:53:34.9003318Z   Downloading blake3-1.0.11-cp312-cp312-manylinux_2_17_aarch64.manylinux2014_aarch64.whl (369 kB)
+2026-11-15T15:53:34.9003838Z Installing collected packages: blake3
+2026-11-15T15:53:34.9004149Z Successfully installed blake3-1.0.11
+2026-11-15T15:53:34.9005554Z WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+2026-11-15T15:53:34.9006907Z 
+2026-11-15T15:53:34.9007075Z [notice] A new release of pip is available: 26.2 -> 26.3
+2026-11-15T15:53:34.9007468Z [notice] To update, run: pip install --upgrade pip
+2026-11-15T15:53:34.9007853Z ===== Install checkout runtime dependencies - End =====
+2026-11-15T15:53:34.9008220Z Transformers version for sglang:  5.12.1
+2026-11-15T15:53:34.9008513Z performance
+2026-11-15T15:53:34.9008733Z vm.swappiness = 0
+2026-11-15T15:53:34.9008983Z kernel.numa_balancing = 0
+2026-11-15T15:53:34.9009277Z kernel.sched_migration_cost_ns = 50000
+2026-11-15T15:53:34.9009622Z sgl-router: /root/sglang/sgl-router-bin/sgl-router
+2026-11-15T15:53:34.9009961Z ASCEND_VISIBLE_DEVICES=
+2026-11-15T15:53:34.9010229Z can not use command: npu-smi info
+2026-11-15T15:53:34.9010790Z Running test case test/registered/npu/accuracy/deepseek_v4_flash/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa.py
+2026-11-15T15:53:34.9012160Z Log path: /root/.cache/tests/logs/log/YZY00Raiser-pryzy1112-20261115-2349-43731798211-1/Nightly_Test_NPU--cann9.1.0-a3-B106/test_npu_deepseek_v4_flash_0731_w8a8_1p1d_16p_gpqa/ascend-43731798211-55b9f08at33nmlmt-sglang-router-0
+2026-11-15T15:53:34.9013133Z can not use command: npu-smi info
+2026-11-15T15:53:34.9013489Z 2026-11-15 23:52:31,733 - INFO - get env NAMESPACE = sgl-project
+2026-11-15T15:53:34.9014127Z 2026-11-15 23:52:31,733 - INFO - get env KUBE_CONFIG_MAP = sglang-configmap-55b9f08at33nmlmt
+2026-11-15T15:53:34.9014653Z 2026-11-15 23:52:31,734 - INFO - The nic name matched is enp23s0f3
+2026-11-15T15:53:34.9015082Z 2026-11-15 23:52:31,735 - INFO - PYTHON_FOR_TEST_TOOL: python3
+2026-11-15T15:53:34.9015497Z 2026-11-15 23:52:31,774 - INFO - PYTHON_FOR_TEST_TOOL: python3
+2026-11-15T15:53:34.9015914Z 2026-11-15 23:52:31,811 - INFO - get env POD_IP = 172.22.3.158
+2026-11-15T15:53:34.9016363Z 2026-11-15 23:52:32,322 - INFO - get env KUBECONFIG = /root/.cache/.cache/kb.yaml
+2026-11-15T15:53:34.9017107Z 2026-11-15 23:52:32,368 - INFO - Successfully queried ConfigMap sglang-configmap-55b9f08at33nmlmt in namespace sgl-project
+2026-11-15T15:53:34.9017743Z 2026-11-15 23:52:32,369 - INFO - get env LANGUAGE = en_US:en
+2026-11-15T15:53:34.9018254Z 2026-11-15 23:52:37,763 - INFO - get env TORCHINDUCTOR_CACHE_DIR = /root/.cache/sglang/inductor
+2026-11-15T15:53:34.9024226Z 2026-11-15 23:52:39,405 - INFO - get env LD_LIBRARY_PATH = /usr/local/Ascend/extra-ops/vendors/custom_transformer/op_api/lib:/usr/local/Ascend/cann-9.1.0/opp/vendors/custom_transformer/op_api/lib/:/usr/local/Ascend/cann-9.1.0/opp/vendors/customize/op_api/lib/:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/cann-9.1.0/lib64:/usr/local/Ascend/cann-9.1.0/lib64/plugin/opskernel:/usr/local/Ascend/cann-9.1.0/lib64/plugin/nnengine:/usr/local/Ascend/cann-9.1.0/opp/built-in/op_impl/ai_core/tbe/op_tiling/lib/linux/aarch64:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/driver/lib64:/usr/local/lib:/usr/local/Ascend/driver/lib64:/usr/local/Ascend/driver/lib64/common:/usr/local/Ascend/driver/lib64/driver:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/lib:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/examples:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/tests/atbopstest:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64:/usr/local/Ascend/ascend-toolkit/latest/tools/aml/lib64/plugin:/usr/local/Ascend/ascend-toolkit/latest/lib64:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/opskernel:/usr/local/Ascend/ascend-toolkit/latest/lib64/plugin/nnengine:/usr/local/Ascend/ascend-toolkit/latest/opp/built-in/op_impl/ai_core/tbe/op_tiling:/usr/local/python3.12.13/lib:
+2026-11-15T15:53:34.9032225Z 2026-11-15 23:52:45,029 - INFO - get env PATH = /usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/cann-9.1.0/bin:/usr/local/Ascend/cann-9.1.0/tools/ccec_compiler/bin:/usr/local/Ascend/cann-9.1.0/tools/profiler/bin:/usr/local/Ascend/cann-9.1.0/tools/ascend_system_advisor/asys:/usr/local/Ascend/cann-9.1.0/tools/show_kernel_debug_data:/usr/local/Ascend/cann-9.1.0/tools/msobjdump:/usr/local/Ascend/nnal/atb/latest/atb/cxx_abi_1/bin:/usr/local/Ascend/ascend-toolkit/latest/bin:/usr/local/Ascend/ascend-toolkit/latest/compiler/ccec_compiler/bin:/usr/local/Ascend/ascend-toolkit/latest/tools/ccec_compiler/bin:/usr/local/python3.12.13/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+2026-11-15T15:53:34.9034901Z 2026-11-15 23:52:45,043 - INFO - get env TRITON_CACHE_DIR = /root/.cache/sglang/triton
+2026-11-15T15:53:34.9035532Z CI_OFFLINE: Engine import failed, skip the offline hook: No module named 'sgl_kernel_npu.operators'
+2026-11-15T15:53:34.9036213Z 2026-11-15 23:52:47,604 - INFO - get env HOSTNAME = ascend-43731798211-55b9f08at33nmlmt-sglang-router-0
+2026-11-15T15:53:34.9036940Z CI_OFFLINE: Engine import failed, skip the offline hook: No module named 'sgl_kernel_npu.operators'
+2026-11-15T15:53:34.9037522Z 2026-11-15 23:52:47,628 - INFO - get env NPU_ACCURACY_DATASET = gpqa_diamond
+2026-11-15T15:53:34.9037995Z 2026-11-15 23:52:47,628 - INFO - Init 172.22.3.158 cls.role='router'!
+2026-11-15T15:53:34.9038509Z 2026-11-15 23:52:47,628 - INFO - The current node is router, skip this function start_pd_server.
+2026-11-15T15:53:34.9039117Z 2026-11-15 23:52:47,628 - INFO - Starting router in thread...
+2026-11-15T15:53:34.9039676Z 2026-11-15 23:52:47,628 - INFO - get env SGLANG_TEST_PD_ROUTER_BINARY = /root/sglang/sgl-router-bin/sgl-router
+2026-11-15T15:53:34.9040226Z 2026-11-15 23:52:47,630 - INFO - launch_router start ......
+2026-11-15T15:53:34.9040751Z 2026-11-15 23:52:47,630 - INFO - Waiting for router to be ready at http://172.22.3.158:6677/readiness
+2026-11-15T15:53:34.9041512Z 2026-11-15 23:52:47,630 - INFO - Waiting for the server to start at http://172.22.3.158:6677/readiness...
+2026-11-15T15:53:34.9042106Z 2026-11-15 23:52:47,787 - INFO - Discovered 3 worker nodes (prefill: 2, decode: 1)
+2026-11-15T15:53:34.9042789Z 2026-11-15 23:52:47,820 - INFO - Successfully queried ConfigMap sglang-configmap-55b9f08at33nmlmt in namespace sgl-project
+2026-11-15T15:53:34.9044393Z 2026-11-15 23:52:47,820 - INFO - Retrieved ConfigMap data: {'ascend-43731798211-55b9f08at33nmlmt-sglang-decode-0': '172.22.3.181', 'ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-0': '172.22.3.77', 'ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-1': '172.22.3.160', 'ascend-43731798211-55b9f08at33nmlmt-sglang-router-0': '172.22.3.158'}
+2026-11-15T15:53:34.9046125Z 2026-11-15 23:52:47,820 - INFO - ConfigMap monitoring complete: prefill_url=['172.22.3.77:8000'], decode_url=['172.22.3.181:8000'], node_ip_list=['172.22.3.181', '172.22.3.77']
+2026-11-15T15:53:34.9046751Z 
+2026-11-15T15:53:34.9047090Z ===== end of pod log: ascend-43731798211-55b9f08at33nmlmt-sglang-router-0 =====
+2026-11-15T15:53:34.9165338Z ConfigMap sglang-configmap-55b9f08at33nmlmt is deleted.
+2026-11-15T15:53:34.9459595Z 2026-11-15 15:53:34,945 - INFO - Deleted job ascend-43731798211-55b9f08at33nmlmt
+2026-11-15T15:53:34.9462809Z 2026-11-15 15:53:34,945 - INFO - Response status: {'conditions': [{'lastTransitionTime': '2026-11-15T15:52:01Z', 'status': 'Pending'}, {'lastTransitionTime': '2026-11-15T15:52:02Z', 'status': 'Pending'}, {'lastTransitionTime': '2026-11-15T15:52:04Z', 'status': 'Pending'}, {'lastTransitionTime': '2026-11-15T15:52:12Z', 'status': 'Pending'}, {'lastTransitionTime': '2026-11-15T15:52:13Z', 'status': 'Pending'}, {'lastTransitionTime': '2026-11-15T15:52:14Z', 'status': 'Running'}, {'lastTransitionTime': '2026-11-15T15:53:34Z', 'status': 'Running'}], 'minAvailable': 4, 'running': 3, 'state': {'lastTransitionTime': '2026-11-15T15:53:34Z', 'phase': 'Running'}, 'succeeded': 1, 'taskStatusCount': {'sglang-decode': {'phase': {'Succeeded': 1}}, 'sglang-prefill': {'phase': {'Running': 2}}, 'sglang-router': {'phase': {'Running': 1}}}}
+2026-11-15T15:53:34.9465637Z Traceback (most recent call last):
+2026-11-15T15:53:34.9466146Z   File "/__w/sglang/sglang/python/sglang/test/ascend/e2e/run_npu_e2e_test.py", line 980, in <module>
+2026-11-15T15:53:34.9466832Z     run_npu_e2e_test_case(
+2026-11-15T15:53:34.9467465Z   File "/__w/sglang/sglang/python/sglang/test/ascend/e2e/run_npu_e2e_test.py", line 777, in run_npu_e2e_test_case
+2026-11-15T15:53:34.9468012Z     monitor_pod_logs(
+2026-11-15T15:53:34.9468493Z   File "/__w/sglang/sglang/python/sglang/test/ascend/e2e/run_npu_e2e_test.py", line 494, in monitor_pod_logs
+2026-11-15T15:53:34.9469674Z     raise Exception("Monitoring ended but target pattern was not detected")
+2026-11-15T15:53:34.9470202Z Exception: Monitoring ended but target pattern was not detected
+2026-11-15T15:53:35.0745375Z ##[error]Error: failed to run script step:
+  ✗ exit code: 1
+  → your script exited with a non-zero code; please check your script for errors
+------------------------------------------------------------
+Last output:
+  2026-11-15 23:52:47,628 - INFO - get env SGLANG_TEST_PD_ROUTER_BINARY = /root/sglang/sgl-router-bin/sgl-router
+  2026-11-15 23:52:47,630 - INFO - launch_router start ......
+  2026-11-15 23:52:47,630 - INFO - Waiting for router to be ready at http://172.22.3.158:6677/readiness
+  2026-11-15 23:52:47,630 - INFO - Waiting for the server to start at http://172.22.3.158:6677/readiness...
+  2026-11-15 23:52:47,787 - INFO - Discovered 3 worker nodes (prefill: 2, decode: 1)
+  2026-11-15 23:52:47,820 - INFO - Successfully queried ConfigMap sglang-configmap-55b9f08at33nmlmt in namespace sgl-project
+  2026-11-15 23:52:47,820 - INFO - Retrieved ConfigMap data: {'ascend-43731798211-55b9f08at33nmlmt-sglang-decode-0': '172.22.3.181', 'ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-0': '172.22.3.77', 'ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-1': '172.22.3.160', 'ascend-43731798211-55b9f08at33nmlmt-sglang-router-0': '172.22.3.158'}
+  2026-11-15 23:52:47,820 - INFO - ConfigMap monitoring complete: prefill_url=['172.22.3.77:8000'], decode_url=['172.22.3.181:8000'], node_ip_list=['172.22.3.181', '172.22.3.77']
+  ===== end of pod log: ascend-43731798211-55b9f08at33nmlmt-sglang-router-0 =====
+  ConfigMap sglang-configmap-55b9f08at33nmlmt is deleted.
+  2026-11-15 15:53:34,945 - INFO - Deleted job ascend-43731798211-55b9f08at33nmlmt
+  2026-11-15 15:53:34,945 - INFO - Response status: {'conditions': [{'lastTransitionTime': '2026-11-15T15:52:01Z', 'status': 'Pending'}, {'lastTransitionTime': '2026-11-15T15:52:02Z', 'status': 'Pending'}, {'lastTransitionTime': '2026-11-15T15:52:04Z', 'status': 'Pending'}, {'lastTransitionTime': '2026-11-15T15:52:12Z', 'status': 'Pending'}, {'lastTransitionTime': '2026-11-15T15:52:13Z', 'status': 'Pending'}, {'lastTransitionTime': '2026-11-15T15:52:14Z', 'status': 'Running'}, {'lastTransitionTime': '2026-11-15T15:53:34Z', 'status': 'Running'}], 'minAvailable': 4, 'running': 3, 'state': {'lastTransitionTime': '2026-11-15T15:53:34Z', 'phase': 'Running'}, 'succeeded': 1, 'taskStatusCount': {'sglang-decode': {'phase': {'Succeeded': 1}}, 'sglang-prefill': {'phase': {'Running': 2}}, 'sglang-router': {'phase': {'Running': 1}}}}
+  Traceback (most recent call last):
+    File "/__w/sglang/sglang/python/sglang/test/ascend/e2e/run_npu_e2e_test.py", line 980, in <module>
+      run_npu_e2e_test_case(
+    File "/__w/sglang/sglang/python/sglang/test/ascend/e2e/run_npu_e2e_test.py", line 777, in run_npu_e2e_test_case
+      monitor_pod_logs(
+    File "/__w/sglang/sglang/python/sglang/test/ascend/e2e/run_npu_e2e_test.py", line 494, in monitor_pod_logs
+      raise Exception("Monitoring ended but target pattern was not detected")
+  Exception: Monitoring ended but target pattern was not detected
+2026-11-15T15:53:35.0765773Z ##[error]Process completed with exit code 1.
+2026-11-15T15:53:35.0903483Z ##[error]Executing the custom container implementation failed. Please contact your self hosted runner administrator.
+2026-11-15T15:53:35.1493998Z ##[group]Run cd ${ASCEND_E2E_TEST_CONFIG_PATH}
+2026-11-15T15:53:35.1494687Z [36;1mcd ${ASCEND_E2E_TEST_CONFIG_PATH}[0m
+2026-11-15T15:53:35.1495400Z [36;1mkubectl get pods -n $NAMESPACE | grep $KUBE_JOB_NAME[0m
+2026-11-15T15:53:35.1496308Z [36;1mkubectl delete -f ./k8s_multi_pd_*.yaml --ignore-not-found=true || true[0m
+2026-11-15T15:53:35.1497138Z [36;1m[0m
+2026-11-15T15:53:35.1497562Z [36;1mpod_name_prefix="${KUBE_JOB_NAME}-"[0m
+2026-11-15T15:53:35.1498376Z [36;1mecho "kube name space: $NAMESPACE, pod name prefix: ${pod_name_prefix}"[0m
+2026-11-15T15:53:35.1499179Z [36;1mwhile true; do[0m
+2026-11-15T15:53:35.1499843Z [36;1m  if kubectl get po -A -n $NAMESPACE | grep -q "${pod_name_prefix}"; then[0m
+2026-11-15T15:53:35.1500772Z [36;1m    echo "Found exist sglang job, sleeping for 30 seconds..."[0m
+2026-11-15T15:53:35.1501584Z [36;1m    sleep 30[0m
+2026-11-15T15:53:35.1502520Z [36;1m    kubectl get pods | grep "${pod_name_prefix}" | awk '{print $1}' | xargs kubectl delete pod -n $NAMESPACE || true[0m
+2026-11-15T15:53:35.1503508Z [36;1m  else[0m
+2026-11-15T15:53:35.1503991Z [36;1m    echo "No sglang job exist, start test case..."[0m
+2026-11-15T15:53:35.1504609Z [36;1m    break[0m
+2026-11-15T15:53:35.1505006Z [36;1m  fi[0m
+2026-11-15T15:53:35.1505368Z [36;1mdone[0m
+2026-11-15T15:53:35.1505717Z [36;1m# Cleanup the run-scoped source code directory on the shared PVC.[0m
+2026-11-15T15:53:35.1506198Z [36;1mrm -rf /root/.cache/tests/sglang-43731798211 || true[0m
+2026-11-15T15:53:35.1506758Z shell: sh -e {0}
+2026-11-15T15:53:35.1507203Z ##[endgroup]
+2026-11-15T15:53:35.1586996Z ##[group]Run '/home/runner/k8s/index.js'
+2026-11-15T15:53:35.1587948Z shell: /home/runner/externals/node24/bin/node {0}
+2026-11-15T15:53:35.1588281Z ##[endgroup]
+2026-11-15T15:53:35.4057888Z (node:838) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-11-15T15:53:35.4058744Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-11-15T15:53:35.4287043Z (node:838) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+2026-11-15T15:53:35.4868805Z (node:838) [DEP0005] DeprecationWarning: Buffer() is deprecated due to security and usability issues. Please use the Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.
+2026-11-15T15:53:36.1138501Z ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-0   1/1     Terminating   0          94s
+2026-11-15T15:53:36.1139358Z ascend-43731798211-55b9f08at33nmlmt-sglang-prefill-1   0/1     Completed     0          94s
+2026-11-15T15:53:36.1140055Z ascend-43731798211-55b9f08at33nmlmt-sglang-router-0    1/1     Terminating   0          94s
+2026-11-15T15:53:36.1484324Z error: the path "./k8s_multi_pd_*.yaml" does not exist
+2026-11-15T15:53:36.1496633Z kube name space: sgl-project, pod name prefix: ascend-43731798211-
+2026-11-15T15:53:36.4406347Z Found exist sglang job, sleeping for 30 seconds...
+2026-11-15T15:54:06.6005406Z error: resource(s) were provided, but no name was specified
+2026-11-15T15:54:06.8530488Z No sglang job exist, start test case...
+2026-11-15T15:54:49.0727649Z Post job cleanup.
+2026-11-15T15:54:49.0758694Z ##[group]Run '/home/runner/k8s/index.js'
+2026-11-15T15:54:49.0759657Z shell: /home/runner/externals/node24/bin/node {0}
+2026-11-15T15:54:49.0760011Z ##[endgroup]
+2026-11-15T15:54:49.3158763Z (node:982) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-11-15T15:54:49.3159634Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-11-15T15:54:49.3387279Z (node:982) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+2026-11-15T15:54:49.3979218Z (node:982) [DEP0005] DeprecationWarning: Buffer() is deprecated due to security and usability issues. Please use the Buffer.alloc(), Buffer.allocUnsafe(), or Buffer.from() methods instead.
+2026-11-15T15:54:50.0474181Z [command]/usr/bin/git version
+2026-11-15T15:54:50.0511298Z git version 2.34.1
+2026-11-15T15:54:50.0541891Z Copying '/root/.gitconfig' to '/__w/_temp/e45ba3e6-2b97-4865-acde-7e16bfa84895/.gitconfig'
+2026-11-15T15:54:50.0551410Z Temporarily overriding HOME='/__w/_temp/e45ba3e6-2b97-4865-acde-7e16bfa84895' before making global git config changes
+2026-11-15T15:54:50.0552268Z Adding repository directory to the temporary git global config as a safe directory
+2026-11-15T15:54:50.0556163Z [command]/usr/bin/git config --global --add safe.directory /__w/sglang/sglang
+2026-11-15T15:54:50.0591996Z [command]/usr/bin/git config --local --name-only --get-regexp core\.sshCommand
+2026-11-15T15:54:50.0622876Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'core\.sshCommand' && git config --local --unset-all 'core.sshCommand' || :"
+2026-11-15T15:54:50.0922139Z [command]/usr/bin/git config --local --name-only --get-regexp http\.https\:\/\/github\.com\/\.extraheader
+2026-11-15T15:54:50.0944865Z http.https://github.com/.extraheader
+2026-11-15T15:54:50.0955838Z [command]/usr/bin/git config --local --unset-all http.https://github.com/.extraheader
+2026-11-15T15:54:50.0986511Z [command]/usr/bin/git submodule foreach --recursive sh -c "git config --local --name-only --get-regexp 'http\.https\:\/\/github\.com\/\.extraheader' && git config --local --unset-all 'http.https://github.com/.extraheader' || :"
+2026-11-15T15:54:50.1276121Z [command]/usr/bin/git config --local --name-only --get-regexp ^includeIf\.gitdir:
+2026-11-15T15:54:50.1305056Z [command]/usr/bin/git submodule foreach --recursive git config --local --show-origin --name-only --get-regexp remote.origin.url
+2026-11-15T15:54:51.3764873Z ##[group]Run '/home/runner/k8s/index.js'
+2026-11-15T15:54:51.3765944Z shell: /home/runner/externals/node24/bin/node {0}
+2026-11-15T15:54:51.3766298Z ##[endgroup]
+2026-11-15T15:54:51.6068805Z (node:1124) [DEP0040] DeprecationWarning: The `punycode` module is deprecated. Please use a userland alternative instead.
+2026-11-15T15:54:51.6069614Z (Use `node --trace-deprecation ...` to show where the warning was created)
+2026-11-15T15:54:51.6298554Z (node:1124) [DEP0169] DeprecationWarning: `url.parse()` behavior is not standardized and prone to errors that have security implications. Use the WHATWG URL API instead. CVEs are not issued for `url.parse()` vulnerabilities.
+2026-11-15T15:54:51.7826148Z Cleaning up orphan processes
+2026-11-15T15:54:51.7915039Z ##[warning]Node.js 20 is deprecated. The following actions target Node.js 20 but are being forced to run on Node.js 24: actions/checkout@v4, actions/download-artifact@v4. For more information see: https://github.blog/changelog/2025-09-19-deprecation-of-node-20-on-github-actions-runners/
