@@ -1164,7 +1164,7 @@ class MqaAttentionBase(nn.Module):
             # wo_a is quantized but never *applied* through its quant method:
             # the absorb GEMM in forward() reads .weight / .weight_scale_inv and
             # runs its own batched kernel (DeepGEMM fp8_einsum on CUDA, aiter
-            # mxscale BMM on gfx950), both of which want the plain row-major
+            # mxscale BMM on ROCm), both of which start from the plain row-major
             # [G, R, D] weight. Opt out of any backend-private weight layout the
             # linear method would otherwise install for its own GEMM -- on ROCm
             # that is aiter's B-preshuffle, which silently permutes the weight
@@ -2964,7 +2964,16 @@ class MQALayer(MqaAttentionBase):
                     # TRT-LLM returns BF16 even with FP8 queries.
                     dtype=x.dtype,
                 )
-                bcg_deepseek_v4_attention_with_output(
+                # NPU backends refresh capacity-sized metadata before each
+                # replay, so the attention can stay inside the captured
+                # segment.  Every other platform keeps ending the segment.
+                attention_with_output = (
+                    deepseek_v4_attention_with_output
+                    if _is_npu
+                    and attn_backend.use_captured_forward_metadata_for_breakable_cuda_graph
+                    else bcg_deepseek_v4_attention_with_output
+                )
+                attention_with_output(
                     attn_q,
                     attn_k,
                     o,
@@ -3091,7 +3100,7 @@ class MQALayer(MqaAttentionBase):
                     perm_y=(1, 0, 2),
                 )
             elif self.wo_a_fp8 and _wo_a_fp8_mxscale is not None:
-                # ROCm gfx950: same fp8 absorb GEMM as the DeepGEMM path below,
+                # ROCm gfx950/gfx1250: same fp8 absorb GEMM as the DeepGEMM path below,
                 # but through aiter's e8m0 block-scale batched GEMM. The
                 # activation is quantized per token-group inside the helper.
                 T, G, D = o.shape
@@ -5261,10 +5270,11 @@ class DeepseekV4ForCausalLM(
             if _wo_a_weight_scale_to_e8m0 is not None:
                 # ROCm: aiter's mxscale GEMM reads uint8 e8m0 block scales, and
                 # requantizes the weight when the checkpoint's scales are not
-                # already powers of two. It also needs the weight row-major, so
-                # check the linear method honoured keep_plain_weight_layout: a
-                # preshuffled weight has the same shape, dtype and strides and
-                # would only show up as garbage output.
+                # already powers of two. It starts from the row-major weight
+                # (and applies the layout its kernel reads itself), so check the
+                # linear method honoured keep_plain_weight_layout: a preshuffled
+                # weight has the same shape, dtype and strides and would only
+                # show up as garbage output.
                 assert not getattr(attn.wo_a, "aiter_bpreshuffled", False), (
                     "DSV4 wo_a was B-preshuffled by the fp8 linear method; the "
                     "aiter mxscale absorb GEMM needs the row-major weight"

@@ -34,7 +34,7 @@ from sglang.test.cpu_test_utils import (
     unpack_and_dequant_awq,
 )
 
-register_cpu_ci(est_time=7, suite="stage-a-test-cpu-intel")
+register_cpu_ci(est_time=7, suite="extra-test-cpu-intel")
 
 
 def run_fused_experts(
