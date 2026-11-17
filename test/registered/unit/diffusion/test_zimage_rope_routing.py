@@ -1,10 +1,12 @@
 """Z-Image RoPE routing: which platforms fold RoPE into the qk-norm call."""
 
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
 
+from sglang.multimodal_gen.runtime.distributed import parallel_state
 from sglang.multimodal_gen.runtime.layers.rotary_embedding import RotaryEmbedding
 from sglang.multimodal_gen.runtime.models.dits import zimage as zimage_module
 from sglang.multimodal_gen.runtime.models.dits.zimage import (
@@ -19,6 +21,17 @@ register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 HEADS = 2
 HEAD_DIM = 16
 SEQ_LEN = 6
+
+# Every sequence-parallel accessor reads this one group object, so a single-rank
+# stub gives the attention block the degrees it asks for without a process group.
+SINGLE_RANK_SP_GROUP = SimpleNamespace(
+    world_size=1,
+    rank_in_group=0,
+    ulysses_world_size=1,
+    ulysses_rank=0,
+    ring_world_size=1,
+    ring_rank=0,
+)
 
 
 class _FusedQKV(torch.nn.Module):
@@ -85,6 +98,9 @@ def _rope_tables():
 
 class TestZImageRopeRouting(CustomTestCase):
     def setUp(self):
+        sp_group = patch.object(parallel_state, "_SP", SINGLE_RANK_SP_GROUP)
+        sp_group.start()
+        self.addCleanup(sp_group.stop)
         self.attention = _build_attention()
         self.cos_sin_cache, self.freqs_complex = _rope_tables()
         self.hidden_states = torch.randn(
