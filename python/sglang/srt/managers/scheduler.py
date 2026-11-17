@@ -2098,12 +2098,15 @@ class Scheduler(
             result_dict["rust_server_pid"] = os.getpid()
         result_dict["hicache_object_layout"] = self._hicache_l3_layout()
 
-        if get_serving().grpc_port is not None:
-            result_dict["kv_event_sources"] = (
-                self.kv_events_publisher.local_kv_event_sources(
-                    self.page_size * get_parallel().dcp_size
-                )
+        cache_controller = getattr(self.tree_cache, "cache_controller", None)
+        if cache_controller is not None:
+            result_dict["kv_hint_sources"] = cache_controller.get_kv_hint_sources()
+
+        result_dict["kv_event_sources"] = (
+            self.kv_events_publisher.local_kv_event_sources(
+                self.page_size * get_parallel().dcp_size,
             )
+        )
         return result_dict
 
     def release_host_resources(self) -> None:
@@ -3250,8 +3253,8 @@ class Scheduler(
         # Only a cache whose events are taken prunes the table.
         if (
             self.kv_events_publisher.enable_kv_cache_events
-            and self.tree_cache.supports_prefix_sharing()
-        ):
+            or self.tree_cache.storage_kv_events_enabled is True
+        ) and self.tree_cache.supports_prefix_sharing():
             self.kv_event_lora_names.register(req, lora_name)
 
     def _maybe_namespace_elastic_radix_cache(self, req: Req) -> None:
@@ -3785,6 +3788,7 @@ class Scheduler(
                     extra_key=req.extra_key,
                     cache_salt=req.cache_salt,
                     storage_hit_end=storage_hit_end,
+                    kv_hints=req.kv_hints,
                 )
 
     def _process_storage_prefetch_retries(self):

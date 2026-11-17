@@ -37,6 +37,7 @@ def _controller(cls=HiCacheController):
     """A controller with the state its storage workers and stop path read."""
     cc = cls.__new__(cls)
     cc.page_size = PAGE
+    cc.storage_backend = SimpleNamespace()
     cc.storage_stop_event = threading.Event()
     cc.prefetch_thread = cc.prefetch_io_aux_thread = None
     cc.prefetch_sync_thread = cc.backup_thread = None

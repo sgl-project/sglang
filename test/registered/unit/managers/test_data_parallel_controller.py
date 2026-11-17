@@ -206,6 +206,7 @@ class TestLocalKvEventSources(CustomTestCase):
         scheduler.max_total_num_tokens = 64
         scheduler.max_req_input_len = 32
         scheduler.startup_time = {}
+        scheduler.tree_cache = SimpleNamespace(cache_controller=None)
         scheduler.page_size = 64
         scheduler.enable_hierarchical_cache = False
         scheduler.enable_unified_cache_external_linker = False
@@ -221,10 +222,25 @@ class TestLocalKvEventSources(CustomTestCase):
                 get_context().override_server_args(grpc_port=50051, dcp_size=4),
             ):
                 component.kv_event_publisher = owned_publisher
-                self.assertEqual(
-                    scheduler.get_init_info()["kv_event_sources"], expected
-                )
+                info = scheduler.get_init_info()
+                self.assertEqual(info["kv_event_sources"], expected)
+                self.assertNotIn("kv_hint_sources", info)
         publisher.describe_local_source.assert_called_once_with(256)
+
+        from sglang.srt.managers.cache_controller import HiCacheController
+
+        source = {
+            "dp_rank": 0,
+            "capabilities": ["router_hint"],
+            "source_control_endpoint": "tcp://worker-a:29017",
+        }
+        cache_controller = HiCacheController.__new__(HiCacheController)
+        cache_controller.storage_backend = SimpleNamespace(
+            get_kv_hint_source=lambda: source
+        )
+        scheduler.tree_cache.cache_controller = cache_controller
+        with get_context().override_server_args(grpc_port=None):
+            self.assertEqual(scheduler.get_init_info()["kv_hint_sources"], [source])
 
     def test_controller_collects_all_scheduler_sources(self):
         from sglang.srt.managers import data_parallel_controller as module
@@ -235,6 +251,7 @@ class TestLocalKvEventSources(CustomTestCase):
         controller._scheduler_init_infos = []
         controller.scheduler_procs = []
         controller.local_kv_event_sources = []
+        controller.local_kv_hint_sources = []
         controller.run_scheduler_process_func = MagicMock()
         controller.attn_replica_size = 1
         controller.prelaunched_schedulers = None
@@ -246,6 +263,14 @@ class TestLocalKvEventSources(CustomTestCase):
                         "max_total_num_tokens": 64,
                         "max_req_input_len": 32,
                         "kv_event_sources": sources,
+                        "kv_hint_sources": [
+                            {
+                                "dp_rank": source["dp_rank"],
+                                "capabilities": ["router_hint"],
+                                "source_control_endpoint": source["endpoint"],
+                            }
+                            for source in sources
+                        ],
                     }
                 )
             )
@@ -280,6 +305,60 @@ class TestLocalKvEventSources(CustomTestCase):
         self.assertEqual(
             controller.local_kv_event_sources, [self._source(2), self._source(3)]
         )
+        self.assertEqual(
+            [source["dp_rank"] for source in controller.local_kv_hint_sources], [2, 3]
+        )
+
+    def test_controller_forwards_sources_without_grpc(self):
+        """In-process DP workers need raw event endpoints for storage inventory."""
+        from sglang.srt.managers import data_parallel_controller as module
+
+        controller = SimpleNamespace(
+            scheduler_procs=[],
+            max_total_num_tokens=64,
+            max_req_input_len=32,
+            startup_time={},
+            get_init_info=lambda: {
+                "max_total_num_tokens": 64,
+                "max_req_input_len": 32,
+                "startup_time": {},
+            },
+            local_kv_hint_sources=[{"dp_rank": 0}, {"dp_rank": 1}],
+            local_kv_event_sources=[self._source(1), self._source(0)],
+            event_loop=MagicMock(),
+        )
+        pipe = MagicMock()
+        with (
+            get_context().override_server_args(grpc_port=None),
+            patch.object(module, "DataParallelController", return_value=controller),
+            patch.object(module.setproctitle, "setproctitle"),
+            patch.object(module.faulthandler, "enable"),
+            patch.object(module, "kill_itself_when_parent_died"),
+            patch.object(module.psutil, "Process"),
+            patch.object(module, "load_plugins"),
+            patch.object(module, "publish"),
+            patch.object(module, "configure_logger"),
+            patch.object(
+                module,
+                "get_observability",
+                return_value=SimpleNamespace(enable_trace=False),
+            ),
+            patch.object(
+                module, "get_parallel", return_value=SimpleNamespace(node_rank=0)
+            ),
+            patch.object(
+                module,
+                "get_exec",
+                return_value=SimpleNamespace(
+                    moe=SimpleNamespace(is_ep_scale_joiner=False)
+                ),
+            ),
+        ):
+            module.run_data_parallel_controller_process(MagicMock(), MagicMock(), pipe)
+
+        info = pipe.send.call_args.args[0]
+        self.assertEqual(info["kv_event_sources"], [self._source(0), self._source(1)])
+        self.assertEqual(info["kv_hint_sources"], [{"dp_rank": 0}, {"dp_rank": 1}])
 
 
 class TestInitInfoReply(CustomTestCase):

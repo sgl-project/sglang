@@ -9,6 +9,7 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from pathlib import Path
 from queue import Empty, Queue
+from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 
 import torch
@@ -22,6 +23,7 @@ from sglang.srt.mem_cache.base_prefix_cache import (
 from sglang.srt.mem_cache.buffer_mode.pipeline import BufferModePipeline
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
+    HiCacheStorage,
     HiCacheStorageConfig,
     PoolHitPolicy,
     PoolName,
@@ -33,10 +35,12 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
 )
 from sglang.srt.mem_cache.memory_pool_host import LogicalHostPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.storage_key_binding import storage_key_to_event_hashes
 from sglang.srt.mem_cache.storage_prefetch import StoragePrefetchRetries
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
-from sglang.srt.mem_cache.utils import get_storage_hash_str
+from sglang.srt.mem_cache.utils import get_event_hash_str, get_storage_hash_str
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=19, suite="base-a-test-cpu")
 
@@ -115,7 +119,98 @@ class TestPrefetchAckSchema(unittest.TestCase):
         self.assertEqual(reduced[0], reduced[1])
 
 
-class TestPPPrefetchTicket(unittest.TestCase):
+class TestPPPrefetchTicket(CustomTestCase):
+    def test_default_lookup_confirmation_fails_closed(self):
+        with self.assertRaises(NotImplementedError):
+            HiCacheStorage.confirm_lookup(None, [], [], 0, None, "scope")
+
+    def test_storage_binding_rejects_unproven_namespace_prefix(self):
+        key = RadixKey(array("q", range(8)), extra_key="adapter", cache_salt="tenant")
+        storage = get_storage_hash_str(key, page_size=2)
+        events = get_event_hash_str(key, page_size=2)
+        self.assertEqual(
+            storage_key_to_event_hashes(key[4:], 2, list(range(4)), storage[1]),
+            dict(zip(storage[2:], (int(h[:16], 16) for h in events[2:]))),
+        )
+        for prefix, last_hash in ((None, storage[1]), (list(range(4)), "bad")):
+            self.assertEqual(
+                storage_key_to_event_hashes(key[4:], 2, prefix, last_hash), {}
+            )
+
+    def test_combined_read_requires_valid_results_for_every_pool(self):
+        controller = HiCacheController.__new__(HiCacheController)
+        controller.storage_backend = Mock(supports_combined_page_reads=True)
+        operation = SimpleNamespace(request_id="combined")
+        transfer = PoolTransfer(
+            name=PoolName.INDEXER, hit_policy=PoolHitPolicy.ALL_PAGES
+        )
+        cases = (
+            ({"kv": [True, True], "indexer": [True, True]}, 2),
+            ({"kv": [True, True], "indexer": [True, False]}, 1),
+            ({"kv": [True, True]}, 0),
+            ({"kv": [True, True], "indexer": [True]}, 0),
+        )
+        for result, expected in cases:
+            with self.subTest(result=result):
+                controller.storage_backend.batch_get_v2.return_value = result
+                self.assertEqual(
+                    controller._page_transfer_kv_batch(
+                        operation, ["a", "b"], torch.arange(4), None, [transfer]
+                    ),
+                    expected,
+                )
+
+    def test_decode_storage_query_delivers_hint_to_controller(self):
+        hint = {"protocol_version": "0.1", "message_id": "decode-query"}
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.tree_core = Mock(enable_storage=True, is_eagle=False)
+        cache.page_size = cache.prefetch_threshold = 4
+
+        def query(operation):
+            # Observable hit length changes only if the request envelope
+            # survives UnifiedRadixCache -> PrefetchOperation -> controller.
+            return [], 8 if operation.kv_hints == hint else 0
+
+        cache.cache_controller = SimpleNamespace(
+            prefetch_rate_limited=lambda: False, _storage_hit_query=query
+        )
+        cache._all_reduce_attn_groups = Mock()
+        self.assertEqual(
+            cache.query_storage_hit_length(0, list(range(8)), kv_hints=hint), 8
+        )
+        self.assertEqual(cache.query_storage_hit_length(0, list(range(8))), 0)
+
+    def test_salted_decode_probe_binds_the_complete_prefix(self):
+        key = RadixKey(array("q", range(16)), cache_salt="tenant-a")
+        storage = get_storage_hash_str(key, page_size=4)
+        events = get_event_hash_str(key, page_size=4)
+        expected = dict(zip(storage[2:], (int(h[:16], 16) for h in events[2:])))
+        cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
+        cache.tree_core = Mock(enable_storage=True, is_eagle=False)
+        cache.page_size = cache.prefetch_threshold = 4
+        cache.cache_controller = SimpleNamespace(
+            prefetch_rate_limited=lambda: False,
+            _storage_hit_query=lambda operation: (
+                [],
+                8 if operation.storage_key_to_event_hash == expected else 0,
+            ),
+        )
+        cache._all_reduce_attn_groups = Mock()
+        arguments = dict(
+            last_hash=storage[1],
+            cache_salt="tenant-a",
+            kv_hints={"message_id": "probe"},
+        )
+        self.assertEqual(
+            cache.query_storage_hit_length(
+                0, list(range(8, 16)), matched_prefix_tokens=list(range(8)), **arguments
+            ),
+            8,
+        )
+        self.assertEqual(
+            cache.query_storage_hit_length(0, list(range(8, 16)), **arguments), 0
+        )
+
     def setUp(self):
         self.c = c = HybridCacheController.__new__(HybridCacheController)
         c.page_size = c.prefetch_threshold = 4
@@ -150,7 +245,11 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.mem_pool_host.layout_lease.side_effect = nullcontext
         c.mem_pool_host.alloc.side_effect = lambda size, **_: torch.arange(size)
         c.storage_backend_type = "mooncake"
-        c.storage_backend = Mock()
+        c.storage_backend = Mock(
+            prefetch_batch_pages=1,
+            supports_combined_page_reads=False,
+            supports_combined_page_writes=False,
+        )
         c._storage_hit_query = Mock(side_effect=self.query_hits)
         c._all_reduce = Mock()
         c._host_pool_schemas = []
@@ -317,7 +416,8 @@ class TestPPPrefetchTicket(unittest.TestCase):
                 def reduce_hits(tensor, op, groups):
                     self.assertEqual(op, torch.distributed.ReduceOp.MIN)
                     self.assertEqual(groups, c.prefetch_hits_sync_groups)
-                    self.assertEqual(tensor.numel(), 1 + len(_SCHEMA))
+                    self.assertEqual(tensor.numel(), 5 + len(_SCHEMA))
+                    self.assertEqual(tensor[-4:].tolist(), [0, 1, 0, 1])
                     self.assertEqual(tensor[0].item(), 8)
                     self.assertEqual(c.mem_pool_host.alloc.call_count, len(votes) + 1)
                     votes.append(tensor[0].item())
@@ -408,7 +508,8 @@ class TestPPPrefetchTicket(unittest.TestCase):
                     def reduce_hits(tensor, op, groups):
                         self.assertEqual(op, torch.distributed.ReduceOp.MIN)
                         self.assertEqual(groups, ["pp", "tp"])
-                        self.assertEqual(tensor.numel(), 1 + len(_SCHEMA))
+                        self.assertEqual(tensor.numel(), 5 + len(_SCHEMA))
+                        self.assertEqual(tensor[-4:].tolist(), [0, 1, 0, 1])
                         local_votes.append(tensor[0].item())
                         c.mem_pool_host.alloc.assert_called_once_with(
                             local_hit, pool=PoolName.KV
@@ -508,7 +609,8 @@ class TestPPPrefetchTicket(unittest.TestCase):
                         def reduce_hits(tensor, op, groups):
                             self.assertEqual(op, torch.distributed.ReduceOp.MIN)
                             self.assertEqual(groups, c.prefetch_hits_sync_groups)
-                            self.assertEqual(tensor.numel(), 1 + len(_SCHEMA))
+                            self.assertEqual(tensor.numel(), 5 + len(_SCHEMA))
+                            self.assertEqual(tensor[-4:].tolist(), [0, 1, 0, 1])
                             local_votes.append(tensor[0].item())
                             kv_index = 1 + _SCHEMA.index(PoolName.KV)
                             self.assertEqual(
@@ -634,7 +736,8 @@ class TestPPPrefetchTicket(unittest.TestCase):
                 def reduce_hits(tensor, op, groups):
                     self.assertEqual(op, torch.distributed.ReduceOp.MIN)
                     self.assertEqual(groups, ["pp", "tp"])
-                    self.assertEqual(tensor.numel(), 1 + len(_SCHEMA))
+                    self.assertEqual(tensor.numel(), 5 + len(_SCHEMA))
+                    self.assertEqual(tensor[-4:].tolist(), [0, 1, 0, 1])
                     local_votes.append(tensor[0].item())
                     if tensor[0].item():
                         self.assertEqual(c.mem_pool_host.alloc.call_args.args, (8,))
@@ -722,6 +825,31 @@ class TestPPPrefetchTicket(unittest.TestCase):
         self.assertTrue(result.operation.assume_stored)
         self.assertIs(c.prefetch_queue.get_nowait(), result.operation)
         c._storage_hit_query.assert_not_called()
+
+    def test_salted_peer_binding_survives_pp_ticket_and_receiver(self):
+        key = RadixKey(array("q", range(16)), cache_salt="tenant-a")
+        hashes = get_storage_hash_str(key, page_size=4)
+        events = get_event_hash_str(key, page_size=4)
+        hint = {"message_id": "salted-peer"}
+        result = self.c.submit_prefetch(
+            CacheRequestHandle("salted", 0),
+            key[8:],
+            hashes[1],
+            hashes[:2],
+            list(range(8)),
+            None,
+            kv_hints=hint,
+        )
+        expected = dict(zip(hashes[2:], (int(h[:16], 16) for h in events[2:])))
+        self.assertEqual(result.operation.storage_key_to_event_hash, expected)
+        ticket = pickle.loads(pickle.dumps(self.c.pp_prefetch_states["salted"].ticket))
+        self.assertEqual(ticket.storage_key_to_event_hash, expected)
+        self.c.storage_config.pp_rank = 1
+        self.c.pp_prefetch_states.clear()
+        self.run_commands(ticket)
+        received = self.c.prefetch_buffer.get_nowait()
+        self.assertEqual(received.storage_key_to_event_hash, expected)
+        self.assertEqual(received.kv_hints, hint)
 
     def test_downstream_request_and_ticket_order_preserves_pp0_admission(self):
         c, cache = self.c, self.cache
@@ -837,6 +965,7 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c.mem_pool_host.free.assert_called_once_with(kv, pool=PoolName.KV)
         c.page_get_func = Mock(return_value=1)
         c.storage_backend = Mock()
+        c.storage_backend.prefetch_batch_pages = 1
         c.storage_backend.batch_get_v2.return_value = {"swa": [True]}
         with (
             patch("sglang.srt.managers.cache_controller.STORAGE_BATCH_SIZE", 1),
@@ -935,7 +1064,8 @@ class TestPPPrefetchTicket(unittest.TestCase):
         c._all_reduce.assert_called_once()
         packed, op, groups = c._all_reduce.call_args.args
         self.assertEqual(packed[0].item(), 0)
-        self.assertEqual(packed.numel(), 1 + len(_SCHEMA))
+        self.assertEqual(packed.numel(), 5 + len(_SCHEMA))
+        self.assertEqual(packed[-4:].tolist(), [0, 1, 0, 1])
         self.assertEqual(op, torch.distributed.ReduceOp.MIN)
         self.assertEqual(groups, c.prefetch_hits_sync_groups)
         c.mem_pool_host.free.assert_not_called()
@@ -967,7 +1097,8 @@ class TestPPPrefetchTicket(unittest.TestCase):
 
                 def reduce_hits(tensor, op, groups):
                     self.assertEqual(tensor[0].item(), 8)
-                    self.assertEqual(tensor.numel(), 1 + len(_SCHEMA))
+                    self.assertEqual(tensor.numel(), 5 + len(_SCHEMA))
+                    self.assertEqual(tensor[-4:].tolist(), [0, 1, 0, 1])
                     self.assertEqual(op, torch.distributed.ReduceOp.MIN)
                     self.assertEqual(groups, c.prefetch_hits_sync_groups)
                     c.mem_pool_host.alloc.assert_called_once_with(8, pool=PoolName.KV)
@@ -1032,6 +1163,61 @@ class TestPPPrefetchTicket(unittest.TestCase):
                 self.submit(rid)
             with self.assertRaisesRegex(RuntimeError, "ticket thread exited"):
                 c.is_pp_prefetch_ready(rid)
+
+    def test_command_abort_releases_confirmed_unqueued_mamba_claim(self):
+        """A failure after checkpoint confirmation must not strand the source
+        claim when PP preparation aborts before host delivery is enqueued.
+        """
+        c = self.c
+        c.storage_backend.requires_lookup_confirmation = True
+        claims = set()
+        confirmed = []
+
+        def query_with_boundary(operation):
+            hashes, hit_count = self.query_hits(operation)
+            operation.pool_storage_result.restorable_prefix_pages = [1, 2]
+            return hashes, hit_count
+
+        def confirm(_keys, _transfers, _pages, _extra_info, scope):
+            confirmed.append(scope)
+            claims.add(scope)
+            return True
+
+        def allocate(_ticket, operation):
+            operation.host_indices = torch.arange(8)
+            return True
+
+        c._storage_hit_query.side_effect = query_with_boundary
+        c.storage_backend.confirm_lookup.side_effect = confirm
+        c.storage_backend.release_lookup.side_effect = claims.discard
+        with (
+            patch.object(c, "_allocate_pp_prefetch_buffers", side_effect=allocate),
+            patch.object(
+                c,
+                "_resolve_sidecar_kv_derived_pool_transfers",
+                side_effect=RuntimeError("pre-enqueue preparation failed"),
+            ),
+            patch(
+                f"{HybridCacheController.__module__}.broadcast_pyobj",
+                side_effect=lambda objects, *args, **kwargs: objects,
+            ),
+            self.assertLogs(level="ERROR"),
+        ):
+            operation = self.submit(
+                pools=[
+                    PoolTransfer(
+                        PoolName.MAMBA,
+                        keys=["checkpoint"],
+                        hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                    )
+                ]
+            ).operation
+            c.pp_prefetch_command_thread_func()
+
+        self.assertEqual(confirmed, [operation.storage_lookup_scope])
+        self.assertFalse(claims)
+        self.assertFalse(operation.storage_transfer_enqueued)
+        self.assertTrue(c.prefetch_buffer.empty())
 
     def test_idle_source_broadcasts_empty_then_processes_ticket_and_stop(self):
         c = self.c

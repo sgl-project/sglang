@@ -100,6 +100,8 @@ class HiCacheStorageExtraInfo:
     # Page hashes preceding the call's keys, from the sequence start;
     # prefix_keys + keys is one contiguous chain for KV batches and sidecars.
     prefix_keys: Optional[List[str]] = None
+    # Optional request-scoped router hints, key bindings, and storage metadata.
+    # Backends that do not use these fields may ignore them.
     extra_info: Optional[dict] = None
 
 
@@ -380,6 +382,66 @@ class HiCacheStorage(ABC):
     HiCacheStorage is a class that provides a generic key-value interface for storing and retrieving KV cache.
     It abstracts the underlying storage mechanism, allowing different implementations to be used.
     """
+
+    # An opt-in backend may read primary KV and KV-derived ALL_PAGES sidecars
+    # together. It must return a same-length per-entry result for EVERY pool;
+    # completion must protect all destinations until the native IO is terminal.
+    # Trailing/checkpoint pools retain their separate resume-boundary path.
+    supports_combined_page_reads = False
+
+    # Opt-in writes use one terminal completion for primary KV and KV-derived
+    # ALL_PAGES sidecars. A backup ACK must never claim success for KV alone.
+    supports_combined_page_writes = False
+
+    # Shared-store MLA backends can persist primary KV/indexer on TP0 only.
+    # A rank-local store must override this to retain every shard's writer.
+    requires_rank_local_backup = False
+
+    # Read batching only; write/query batches retain STORAGE_BATCH_SIZE. All
+    # ranks participating in prefetch ACK reduction must use the same value,
+    # including after a failed batch, to preserve their collective sequence.
+    prefetch_batch_pages = STORAGE_BATCH_SIZE
+
+    # An opt-in backend may return advisory trailing-state hits from a router
+    # hint. The controller must physically confirm each rank-agreed boundary
+    # before admission and retain the resulting claim until storage delivery.
+    requires_lookup_confirmation = False
+
+    # Optional actual-backend inventory, distinct from framework host residency.
+    publishes_kv_events = False
+
+    def pending_kv_events(self) -> int:
+        return 0
+
+    def take_kv_events(self) -> list:
+        return []
+
+    def get_kv_hint_source(self) -> Optional[dict]:
+        """Return resolved control coordinates for this rank, without starting IO.
+
+        This optional discovery contract describes configured addresses, not
+        socket readiness or cache residency. Backends without router hints
+        return None. Only the owner rank of a shared source should report it.
+        """
+        return None
+
+    def confirm_lookup(
+        self,
+        keys: List[str],
+        pool_transfers: List[PoolTransfer],
+        hit_pages: int,
+        extra_info: HiCacheStorageExtraInfo,
+        scope: str,
+    ) -> bool:
+        raise NotImplementedError(
+            "Backends requiring lookup confirmation must implement it"
+        )
+
+    def release_lookup(self, scope: str) -> None:
+        """Release a prefetch's confirmation claims after terminal delivery/drop."""
+
+    def release_all_lookup_claims(self) -> None:
+        """Release claims left by queued prefetches after threads stop."""
 
     # todo, the page size of storage backend does not have to be the same as the same as host memory pool
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
