@@ -164,23 +164,26 @@ class TestModelOptNvfp4Sm90Runner(CustomTestCase):
         TP8, with a 30MB allocation per layer for the rest of the layer's weights."""
         for e, h, i in ((256, 2560, 640), (256, 6144, 256)):
             with self.subTest(hidden=h, intermediate=i):
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-                key = "inactive_split_bytes.all.current"
-                start = torch.cuda.memory_stats()[key]
-                held = []
-                for _ in range(4):
-                    method, layer = self._layer(e, h, i)
-                    other = torch.empty(30 << 20, dtype=torch.uint8, device="cuda")
-                    held.append((method, layer, other))
-                for k, (method, layer, _) in enumerate(held):
-                    _fill(layer, seed=k)
-                    method.process_weights_after_loading(layer)
-                torch.cuda.synchronize()
-                torch.cuda.empty_cache()
-                split = torch.cuda.memory_stats()[key] - start
-                del held
-                self.assertLess(split, 8 << 20)
+                self.assertLess(self._split_bytes_after_load(e, h, i), 8 << 20)
+
+    def _split_bytes_after_load(self, e, h, i):
+        """Inactive split bytes left by building, loading and repacking four layers. Every tensor dies on return, so
+        the next call starts from an empty cache."""
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        key = "inactive_split_bytes.all.current"
+        start = torch.cuda.memory_stats()[key]
+        held = []
+        for _ in range(4):
+            method, layer = self._layer(e, h, i)
+            other = torch.empty(30 << 20, dtype=torch.uint8, device="cuda")
+            held.append((method, layer, other))
+        for k, (method, layer, _) in enumerate(held):
+            _fill(layer, seed=k)
+            method.process_weights_after_loading(layer)
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+        return torch.cuda.memory_stats()[key] - start
 
     def test_repack_in_place_matches_a_separate_repack_bitwise(self):
         """The loader writes checkpoint bytes into the repacked buffers, so the repack must read a copy, never bytes it
