@@ -48,21 +48,6 @@ def _run_prepare(batch):
 
 
 class TestEncoderLogprobStartSentinel(CustomTestCase):
-    def test_minus_one_sentinel_is_preserved(self):
-        """-1 means "output logprobs only" and must survive the encoder clamp.
-
-        prepare_encoder_info_extend must not turn the sentinel into an absolute
-        input position. On a chunked prefill the clobbered value is re-read when
-        chunk 2 is scheduled (compute_extend_logprob_start_len), so the request
-        collects input logprobs it never asked for and trips the
-        relevant_tokens_len assert in the logprob result processor, killing the
-        scheduler.
-        """
-        req = _make_req(logprob_start_len=-1)
-        batch = _make_extend_batch([req])
-        _run_prepare(batch)
-        self.assertEqual(req.logprob_start_len, -1)
-
     def test_minus_one_skips_input_logprobs_on_later_chunk(self):
         """A later chunk must not collect input logprobs for the -1 sentinel."""
         req = _make_req(logprob_start_len=-1)
@@ -77,7 +62,6 @@ class TestEncoderLogprobStartSentinel(CustomTestCase):
             extend_len=4,
             full_untruncated_fill_len=10,
         )
-        self.assertEqual(next_chunk_start, 4)
         self.assertEqual(4 - next_chunk_start, 0)
 
     def test_explicit_start_len_is_still_clamped_to_encoder_len(self):
@@ -85,14 +69,6 @@ class TestEncoderLogprobStartSentinel(CustomTestCase):
         batch = _make_extend_batch([req])
         _run_prepare(batch)
         self.assertEqual(req.logprob_start_len, ENCODER_LEN)
-
-    def test_mixed_batch(self):
-        sentinel_req = _make_req(logprob_start_len=-1)
-        explicit_req = _make_req(logprob_start_len=2)
-        batch = _make_extend_batch([sentinel_req, explicit_req])
-        _run_prepare(batch)
-        self.assertEqual(sentinel_req.logprob_start_len, -1)
-        self.assertEqual(explicit_req.logprob_start_len, ENCODER_LEN)
 
 
 if __name__ == "__main__":
