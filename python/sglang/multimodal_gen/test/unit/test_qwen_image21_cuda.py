@@ -41,6 +41,7 @@ from sglang.multimodal_gen.runtime.pipelines_core.stages.denoising import (
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.qwen_image21 import (
     QwenImage21DenoisingStage,
+    TextEncoderGraphs,
 )
 from sglang.multimodal_gen.runtime.platforms import current_platform
 from sglang.multimodal_gen.runtime.server_args import (
@@ -697,3 +698,35 @@ def test_packed_qkv_weights_share_storage_and_survive_in_place_updates(
     assert packed is not None
     assert torch.equal(packed[:rows], attn.to_q.weight)
     assert torch.equal(packed[2 * rows :], attn.to_v.weight)
+
+
+@torch.no_grad()
+def test_text_encoder_graphs_replay_bit_exact_and_follow_weights():
+    # A toy text-only forward: the second request of a length captures, later ones
+    # replay with the eager bits, and moved weights drop the stale graph.
+    torch.manual_seed(0)
+    encoder = torch.nn.Sequential(
+        torch.nn.Embedding(64, 32), torch.nn.Linear(32, 32), torch.nn.GELU()
+    ).cuda()
+
+    def run(inputs):
+        return encoder(inputs["input_ids"]) * inputs["attention_mask"][..., None]
+
+    def request(length, seed):
+        generator = torch.Generator(device="cuda").manual_seed(seed)
+        ids = torch.randint(0, 64, (1, length), device="cuda", generator=generator)
+        return {"input_ids": ids, "attention_mask": torch.ones_like(ids)}
+
+    graphs = TextEncoderGraphs()
+    for step in range(4):
+        inputs = request(7, step)
+        assert torch.equal(graphs(encoder, inputs, run).clone(), run(inputs))
+        assert list(graphs.graphs) == ([] if step == 0 else [7])
+    # an image request stays eager
+    image_inputs = {**request(7, 9), "pixel_values": torch.zeros(4, 8, device="cuda")}
+    assert torch.equal(graphs(encoder, image_inputs, run), run(image_inputs))
+    # replaced weights invalidate the captured addresses
+    encoder[1].weight = torch.nn.Parameter(encoder[1].weight.clone() + 1)
+    inputs = request(7, 10)
+    assert torch.equal(graphs(encoder, inputs, run), run(inputs))
+    assert not graphs.graphs

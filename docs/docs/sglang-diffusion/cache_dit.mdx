@@ -356,7 +356,7 @@ SVDQuant is Cache-DiT's built-in W4A4 PTQ quantization (weights and activations 
 NVFP4, with smoothed low-rank branches). It can be freely combined with DBCache caching and
 the DMD calibrator for the largest speedups.
 
-::::note
+<Note>
 SVDQuant requires a cache-dit build **with CUDA extension support** — a plain
 `pip install cache-dit` does NOT include it. Install one of:
 
@@ -370,7 +370,7 @@ cd cache-dit
 export CUDA_HOME=/usr/local/cuda
 CACHE_DIT_BUILD_SVDQUANT=1 pip install ".[quantization]" --no-build-isolation
 ```
-::::
+</Note>
 
 Valid `quant_type` values are `svdq_int4_r{32,64,128,256}_dq` (int4 W4A4) and
 `svdq_nvfp4_r{32,64,128,256}_dq` (NVFP4 W4A4; requires a Blackwell GPU). Example config
@@ -808,16 +808,17 @@ SGLang Diffusion x Cache-DiT supports almost all models originally supported in 
 
 - **SGLang-native pipelines**: Distributed Cache-DiT paths exist for supported pipelines. Hybrid SP+TP configurations add communication and cache coordination overhead, so validate them on the target model and hardware before using them as production defaults.
 - **DiT layerwise offload**: Compatible. Skipped blocks are not streamed, and the first layer after a skip may sync-load. Still incompatible with `--use-fsdp-inference`.
-- **SCM minimum steps**: SCM requires >= 8 inference steps to be effective. Some pipelines report `steps - 1` NFEs (for example MiniMax-H3 `num_inference_steps=8` is 7 NFEs), which trips the upstream `steps_mask` assertion; use at least 9 requested steps or custom bins.
+- **SCM minimum steps**: SCM presets require >= 8 inference steps (or exactly 4 or 6). Some pipelines report `steps - 1` NFEs (for example MiniMax-H3 `num_inference_steps=8` is 7 NFEs), which trips the upstream `steps_mask` assertion; use at least 9 requested steps or custom bins.
 - **Model support**: The model must be registered in Cache-DiT's
   `BlockAdapterRegister` or have an SGLang custom block adapter.
 
 ## Troubleshooting
 
-### SCM disabled for low step count
+### SCM with low step counts
 
-For models with < 8 inference steps (e.g., DMD distilled models), SCM will be automatically disabled. DBCache
-acceleration still works.
+With fewer than 8 steps, SGLang does not disable SCM automatically. cache-dit's preset masks support only 4 or 6
+steps there, and other step counts fail with an assertion. For low-step (e.g. distilled) models, leave `scm_preset`
+at `none` or pass custom `scm_compute_bins`/`scm_cache_bins`. DBCache acceleration still works.
 
 ### SVDQuant unavailable or load failure
 

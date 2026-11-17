@@ -7,9 +7,29 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.srt.mem_cache.kv.router import PlainPoolRouter
 from sglang.test.ci.ci_register import register_amd_ci
 
-register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd")
+register_amd_ci(est_time=45, suite="stage-b-test-1-gpu-small-amd-mi35x")
+
+
+class _Pool:
+    def __init__(self, k_cache, v_cache):
+        self.k_cache = k_cache
+        self.v_cache = v_cache
+        self.start_layer = 0
+        self.layer_num = 1
+        self.layer_transfer_counter = None
+        self.layer_router = PlainPoolRouter(self, "full")
+
+    def get_kv_buffer(self, _layer_id):
+        return self.k_cache, self.v_cache
+
+    def get_key_buffer(self, _layer_id):
+        return self.k_cache
+
+    def get_value_buffer(self, _layer_id):
+        return self.v_cache
 
 
 @unittest.skipUnless(torch.version.hip, "ROCm ASM prefill")
@@ -17,7 +37,7 @@ class TestMiniMaxHD128AsmPrefill(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         from sglang.srt.layers.attention import aiter_backend
-        from sglang.srt.model_executor.forward_batch_info import ForwardMode
+        from sglang.srt.model_executor.forward_mode import ForwardMode
 
         if "gfx950" not in torch.cuda.get_device_properties(0).gcnArchName:
             raise unittest.SkipTest("HD128 ASM prefill requires gfx950")
@@ -56,9 +76,7 @@ class TestMiniMaxHD128AsmPrefill(unittest.TestCase):
         backend.k_scale = torch.ones(1, device=device)
         backend.v_scale = torch.ones(1, device=device)
         backend.qo_indptr = cu_q
-        backend.token_to_kv_pool = SimpleNamespace(
-            get_kv_buffer=lambda _: (k_cache, v_cache)
-        )
+        backend.token_to_kv_pool = _Pool(k_cache, v_cache)
         backend.forward_metadata = self.ab.ForwardMetadata(
             kv_indptr=cu_k,
             kv_indices=token_ids,

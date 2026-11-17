@@ -26,7 +26,7 @@ import functools
 import threading
 import warnings
 from contextvars import ContextVar
-from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 import torch
 
@@ -38,7 +38,12 @@ except ImportError:
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.cuda_utils import (
     checkCudaErrors,
 )
-from sglang.srt.utils import get_device_module, is_hip, is_xpu
+from sglang.srt.utils import get_device_module, is_hip, is_musa, is_npu, is_xpu
+
+if TYPE_CHECKING:
+    from sglang.srt.model_executor.runner_backend_utils.hicache_graph_events import (
+        HiCacheGraphEvents,
+    )
 
 _is_xpu = is_xpu()
 
@@ -88,17 +93,25 @@ def _capture_status(stream_ptr: int) -> "rt.cudaStreamCaptureStatus":
 
 
 def _is_stream_capturing(stream: torch.Stream) -> bool:
-    # On ROCm/HIP and XPU, cuda-python is unavailable, so use the portable torch
-    # API (which maps to the HIP / XPU runtime). On NVIDIA, keep querying the
-    # CUDA runtime directly via cuda-python: torch.cuda.is_current_stream_capturing()
-    # has proven unreliable there, so we preserve the original behavior.
-    if is_hip() or _is_xpu:
+    # On ROCm/HIP, MUSA, and XPU, cuda-python is unavailable or unnecessary, so
+    # use the portable device API. On NVIDIA, keep querying the CUDA runtime
+    # directly via cuda-python because torch.cuda.is_current_stream_capturing()
+    # has proven unreliable there.
+    if is_npu() or is_hip() or is_musa() or _is_xpu:
         with get_device_module().stream(stream):
             return get_device_module().is_current_stream_capturing()
     return (
         _capture_status(stream.cuda_stream)
         == rt.cudaStreamCaptureStatus.cudaStreamCaptureStatusActive
     )
+
+
+def _device_graph_cls():
+    if is_npu():
+        return torch.npu.NPUGraph
+    if _is_xpu:
+        return torch.xpu.XPUGraph
+    return torch.cuda.CUDAGraph
 
 
 # Hook torch.cuda.Stream.wait_stream to track side-stream forks/joins that happen
@@ -157,18 +170,23 @@ def _uninstall_wait_stream_hook():
 
 
 def _weak_ref_if_tensor(x):
-    """Return a weak-ref view for nonempty accelerator tensors; recurse into
-    tuples/lists and keep CPU, empty, and non-tensor values unchanged.
-    Weak-ref'ing captured args lets the shared mempool reclaim per-layer
-    intermediates between segments — storage stays alive for each segment
-    CUDAGraph's lifetime via its pool use_count.
+    """Keep captured argument metadata without owning accelerator storage.
 
-    weak_ref_tensors is imported lazily because it hard-raises on
-    platforms without a CUDA/HIP/NPU backend; we only reach this code during
-    an active Breakable capture, which runs only on those backends."""
+    Empty accelerator tensors need only shape/stride metadata. Nonempty ones
+    use weak references so the shared graph pool can reuse their storage
+    between segments. CPU tensors and non-tensors keep their identity;
+    tuples and lists are processed recursively.
+    """
     if torch.is_tensor(x):
-        if x.numel() == 0 or x.device.type == "cpu":
+        if x.device.type == "cpu":
             return x
+        if x.numel() == 0:
+            # NoPE MLA's empty Q/K RoPE views otherwise pin the full projection
+            # allocations for every layer and captured bucket.
+            return torch.empty_strided(
+                x.shape, x.stride(), dtype=x.dtype, device=x.device
+            )
+        # Import lazily: this module requires a CUDA/HIP/NPU backend.
         from sglang.srt.model_executor.runner_backend_utils.weak_ref_tensor import (
             weak_ref_tensors,
         )
@@ -204,11 +222,35 @@ class _EagerOnGraphCallable:
         return bound
 
 
+def _copy_into_output(dst, src):
+    """Validate the fixed output layout before writing graph-owned storage."""
+    if dst is None and src is None:
+        return
+    if isinstance(dst, (tuple, list)):
+        assert type(dst) is type(src) and len(dst) == len(src), (
+            "BCG output structure changed"
+        )
+        for target, value in zip(dst, src):
+            _copy_into_output(target, value)
+        return
+    assert (
+        torch.is_tensor(dst)
+        and torch.is_tensor(src)
+        and dst.shape == src.shape
+        and dst.dtype == src.dtype
+        and dst.device == src.device
+    ), "BCG output layout changed"
+    if dst is not src:
+        dst.copy_(src)
+
+
 def eager_on_graph(
     fn: Optional[Callable] = None,
     on_capture: Optional[Callable] = None,
     *,
     enable: Optional[bool] = None,
+    output_factory: Optional[Callable] = None,
+    pass_output: bool = False,
 ):
     """Record an eager call between captured segments.
 
@@ -221,6 +263,13 @@ def eager_on_graph(
     Use ``fn.run_eager(...)`` to call the body inside an existing eager region.
     This explicit entry bypasses graph segmentation and ``on_capture``; methods
     bind their instance automatically.
+
+    ``output_factory(*args, **kwargs)`` optionally allocates fixed-layout tensor
+    outputs (or tuples/lists with None leaves) before ending the graph segment.
+    Their storage can then be reused by the graph pool after their consumers.
+    With ``pass_output=True``, the inner function also receives these buffers
+    as ``out`` and can return them directly to avoid a copy. Outside capture,
+    neither the factory nor the extra argument nor the output copies are used.
     """
 
     # Transitional support while model callers migrate to the bare decorator.
@@ -241,8 +290,17 @@ def eager_on_graph(
         def wrapper(*args, **kwargs):
             capture = _current_capture_var.get()
             if capture is None:
+                if output_factory is not None:
+                    return inner(*args, **kwargs)
                 run(*args, **kwargs)
                 return
+
+            # allocate while still capturing so output storage belongs to the pool
+            output = (
+                output_factory(*args, **kwargs) if output_factory is not None else None
+            )
+            if pass_output:
+                kwargs = dict(kwargs, out=output)
 
             # End the segment that captured up to this break point.
             capture._end_current_segment()
@@ -255,12 +313,24 @@ def eager_on_graph(
             # refs do not need to keep every intermediate alive.
             captured_args = tuple(_weak_ref_if_tensor(a) for a in args)
             captured_kwargs = {k: _weak_ref_if_tensor(v) for k, v in kwargs.items()}
-            capture.cuda_graph._break_fns.append(
-                functools.partial(run, *captured_args, **captured_kwargs)
-            )
+            if output_factory is None:
+                capture.cuda_graph._break_fns.append(
+                    functools.partial(run, *captured_args, **captured_kwargs)
+                )
+            else:
+                captured_output = _weak_ref_if_tensor(output)
+                if pass_output:
+                    captured_kwargs["out"] = captured_output
+
+                def replay_fn():
+                    new_out = inner(*captured_args, **captured_kwargs)
+                    _copy_into_output(captured_output, new_out)
+
+                capture.cuda_graph._break_fns.append(replay_fn)
 
             # Start a fresh CUDAGraph segment for the remainder of the forward.
             capture._begin_new_segment()
+            return output
 
         return functools.update_wrapper(_EagerOnGraphCallable(wrapper, inner), inner)
 
@@ -271,15 +341,26 @@ class BreakableCUDAGraph:
     """Container holding one torch.cuda.CUDAGraph per segment plus an
     eager break function between consecutive segments."""
 
-    def __init__(self, deduped_cuda_graph=None) -> None:
+    def __init__(
+        self,
+        deduped_cuda_graph=None,
+        *,
+        hicache_graph_events: "HiCacheGraphEvents | None" = None,
+    ) -> None:
         self._segments: list[Any] = []
         self._break_fns: list[Callable[[], Any]] = []
         self._deduped_cuda_graph = deduped_cuda_graph
+        self._hicache_graph_events = hicache_graph_events
+        self._hicache_wait_nodes = []
 
     def replay(self) -> None:
         stream = get_device_module().current_stream()
         token = _current_stream_var.set(stream)
         try:
+            if self._hicache_graph_events is not None:
+                self._hicache_graph_events.bind(
+                    self._segments, self._hicache_wait_nodes
+                )
             for i, seg in enumerate(self._segments):
                 seg.replay()
                 if i < len(self._break_fns):
@@ -294,6 +375,10 @@ class BreakableCUDAGraph:
         if needs_instantiate:
             graph.instantiate()
         self._segments.append(graph)
+        if self._hicache_graph_events is not None:
+            self._hicache_wait_nodes.append(
+                self._hicache_graph_events.find_wait_nodes(graph)
+            )
 
 
 class BreakableCUDAGraphCapture:
@@ -355,11 +440,14 @@ class BreakableCUDAGraphCapture:
         return False
 
     def _begin_new_segment(self) -> None:
-        graph_cls = torch.xpu.XPUGraph if _is_xpu else torch.cuda.CUDAGraph
+        graph_cls = _device_graph_cls()
         # keep_graph retains the raw graph for dedup; skip it on the plain path.
         # Dedup is CUDA-only (it introspects the raw graph via cuda-python), so
         # XPU always takes the plain path below.
-        if self.cuda_graph._deduped_cuda_graph is not None:
+        if self.cuda_graph._hicache_graph_events is not None:
+            graph = graph_cls(keep_graph=True)
+            self._current_graph_needs_instantiate = True
+        elif self.cuda_graph._deduped_cuda_graph is not None:
             try:
                 graph = graph_cls(keep_graph=True)
                 self._current_graph_needs_instantiate = True

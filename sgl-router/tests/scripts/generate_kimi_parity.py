@@ -44,6 +44,10 @@ with tempfile.NamedTemporaryFile(suffix=".model", mode="w+") as model:
     tokenizer = TikTokenTokenizer(model.name, **config)
 server = object.__new__(OpenAIServingChat)
 server.chat_encoding_spec = "kimi_k3"
+# A server without a reasoning parser or a custom encoding adapter, as the
+# router renders: the assistant prefix is appended with no answer opener.
+server._encoding_adapter = None
+server._reasoning_detector = None
 server.tokenizer_manager = SimpleNamespace(tokenizer=tokenizer)
 cases = json.loads((fixture / "prompts.json").read_text())
 for case in cases:
@@ -60,7 +64,9 @@ for case in cases:
     messages = [message.model_dump() for message in request.messages]
     for message in messages:
         normalize_assistant_tool_call_arguments(message, strict=False)
-    ids = server._encode_messages(messages, request, ThinkingMode.THINKING)
+    ids = server._encode_messages(
+        messages, request, ThinkingMode.THINKING, image_data=[]
+    )
     case["token_count"] = len(ids)
     case["sha256"] = hashlib.sha256(
         b"".join(token.to_bytes(4, "little") for token in ids)

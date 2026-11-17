@@ -11,7 +11,7 @@ maybe_stub_sgl_kernel()
 
 import torch
 
-from sglang.srt.managers.schedule_batch import Modality
+from sglang.srt.multimodal.modality import Modality
 from sglang.srt.multimodal.processors.dots_note_omni import DotsNoteOmniProcessor
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
