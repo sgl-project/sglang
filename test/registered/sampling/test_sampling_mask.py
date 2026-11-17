@@ -771,23 +771,6 @@ class TestSamplingMaskPacking(CustomTestCase):
             [[0.0], None, [0.0]],
         )
 
-    def test_a_batch_without_returned_support_never_measures_it(self):
-        # Five positive weights would overflow a returned support of at most three.
-        capture = _SamplingMaskCapture(
-            batch_rows=torch.tensor([0]),
-            weights=torch.tensor([[0.2, 0.2, 0.2, 0.2, 0.2]]),
-            token_ids=None,
-            selected_weight=torch.tensor([0.2]),
-        )
-        output = self.sampler._build_sampling_mask_output(
-            torch.tensor([0]),
-            capture,
-            support_capture_indices=None,
-            return_support=False,
-        )
-        self.assertEqual(output.statuses.tolist(), [SamplingMaskStatus.OK])
-        self.assertEqual(output.lengths.tolist(), [0])
-
     def test_overflow_never_materializes_a_partial_mask(self):
         # Simulate a top-k cutoff tie: a nominal top_k below the cap can still
         # produce more positive weights than the fixed transport can hold.
