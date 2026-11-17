@@ -167,6 +167,34 @@ def test_native_hybrid_encoder_matches_hf(
         torch.testing.assert_close(again, result.last_hidden_state, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize(
+    "hip_version, forces_math",
+    [("7.2.26015", True), ("10.0.0", False), (None, False)],
+)
+def test_masked_attention_forces_math_only_on_rocm72(
+    monkeypatch, hip_version, forces_math
+):
+    """Only torch built for ROCm 7.2 gets masked head_dim 32 wrong in efficient SDPA
+    (the [*-17] cases above); other builds must keep their default backend."""
+    from sglang.multimodal_gen.runtime.layers.attention import layer
+
+    entered = []
+    real_sdpa_kernel = layer.sdpa_kernel
+
+    def recording_sdpa_kernel(backends, *args, **kwargs):
+        entered.append(backends)
+        return real_sdpa_kernel(backends, *args, **kwargs)
+
+    attn = layer.LocalAttention(num_heads=2, head_size=32)
+    monkeypatch.setattr(layer, "sdpa_kernel", recording_sdpa_kernel)
+    monkeypatch.setattr(torch.version, "hip", hip_version)
+    q = torch.randn(1, 17, 2, 32)
+    mask = torch.ones(1, 17, dtype=torch.bool)
+    with torch.inference_mode(), set_forward_context(0, None):
+        attn(q, q, q, attn_mask=mask)
+    assert (SDPBackend.MATH in entered) is forces_math
+
+
 def test_encoder_rejects_non_text_prefill(small_text_encoder):
     model = native_encoder(small_text_encoder)
     ids = torch.ones(1, 4, dtype=torch.long)
