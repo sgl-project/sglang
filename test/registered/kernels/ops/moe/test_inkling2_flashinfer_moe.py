@@ -46,6 +46,20 @@ def test_up_gate_block16_rows_matches_flashinfer():
     assert torch.equal(w, ref_w) and torch.equal(s, ref_s)
 
 
+@pytest.mark.parametrize(
+    "dtype", [torch.float8_e4m3fn, torch.uint8], ids=["nvfp4", "mxfp8"]
+)
+def test_swizzle_blockscale_matches_flashinfer(dtype):
+    from flashinfer import block_scale_interleave
+
+    from sglang.srt.layers.quantization.utils import swizzle_blockscale
+
+    g = torch.Generator(device="cuda").manual_seed(2)
+    s = torch.randint(0, 256, (3, 96, 5), dtype=torch.uint8, device="cuda", generator=g)
+    ours = swizzle_blockscale(s.view(dtype)).view(torch.uint8)
+    assert torch.equal(ours.flatten(), block_scale_interleave(s).flatten())
+
+
 def _experts(nvfp4, rows, k, g):
     """Checkpoint storage: weights `[E, rows, k]` and row-major block scales, plus the fp32 dequant."""
     shape = (LOCAL, rows)
@@ -93,12 +107,11 @@ def _route(g):
 
 @pytest.mark.parametrize("nvfp4", [True, False], ids=["nvfp4", "mxfp8"])
 def test_matches_reference(nvfp4):
-    from flashinfer import block_scale_interleave
-
     from sglang.kernels.ops.moe.inkling2_flashinfer_moe import (
         Inkling2FlashInferMoE,
         up_gate_block16_rows_,
     )
+    from sglang.srt.layers.quantization.utils import swizzle_blockscale
 
     g = torch.Generator(device="cuda").manual_seed(1)
     w13, s13, ref13 = _experts(nvfp4, 2 * INTERMEDIATE, HIDDEN, g)
@@ -110,9 +123,9 @@ def test_matches_reference(nvfp4):
     up_gate_block16_rows_(s13)
     moe = Inkling2FlashInferMoE(
         w13,
-        block_scale_interleave(s13),
+        swizzle_blockscale(s13),
         w2,
-        block_scale_interleave(s2),
+        swizzle_blockscale(s2),
         num_experts=NUM_EXPERTS,
         top_k=TOP_K,
         local_expert_offset=NUM_EXPERTS - LOCAL,

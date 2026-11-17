@@ -8,7 +8,8 @@ reduces it across EP ranks.
 Weights are the model's tensors, used in place and shareable with DeepGEMM MegaMoE
 (`weight_layout="up_gate_block16"`):
 - w13 rows in FlashInfer's CuTe DSL swap-AB order (`up_gate_block16_rows_`), w2 rows plain.
-- Block scales in CUTLASS 128x4 atoms over the same rows (FlashInfer `block_scale_interleave`).
+- Block scales in CUTLASS 128x4 atoms over the same rows (`swizzle_blockscale`, the same bytes as
+  FlashInfer `block_scale_interleave`).
 """
 
 import torch
