@@ -123,5 +123,63 @@ class TestDynamicChunkSizerProfiling(CustomTestCase):
         )
 
 
+class TestChunkSizePredictorSmoothing(CustomTestCase):
+    """The smoothing factor and floor semantics the PP long-context guide promises."""
+
+    BASE = 12288
+    PAGE = 128
+    # Coefficients fitted on Llama-3.1-8B PP4 on Intel Arc Pro B60 (ms, tokens).
+    COEFFS = (1.18e-06, 3.85e-02, 22.5)
+    HISTORY = (12288, 32768, 65536, 98304, 131072, 262144, 524288)
+
+    def _predictor(self):
+        a, b, c = self.COEFFS
+        # Same probe shape as the profiler: 128 descending lengths up to 1.25x base.
+        top = int(self.BASE * 1.25)
+        lengths = [top - i * (top // 128) for i in range(128)]
+        predictor = module.ChunkSizePredictor()
+        predictor.fit(lengths, [a * n * n + b * n + c for n in lengths])
+        predictor.set_target_latency(self.BASE)
+        predictor.is_ready = True
+        return predictor
+
+    def _schedule(self, smooth_factor):
+        predictor = self._predictor()
+        with module.envs.SGLANG_DYNAMIC_CHUNKING_SMOOTH_FACTOR.override(smooth_factor):
+            return [
+                predictor.predict_next_chunk_size(
+                    history_len=history,
+                    base_chunk_size=self.BASE,
+                    page_size=self.PAGE,
+                    context_len=1 << 20,
+                    max_chunk_size=16384,
+                )
+                for history in self.HISTORY
+            ]
+
+    def test_zero_smoothing_keeps_the_fixed_chunk_size(self):
+        self.assertEqual(self._schedule(0.0), [self.BASE] * len(self.HISTORY))
+
+    def test_chunks_shrink_with_history_down_to_a_quarter_of_the_base(self):
+        for smooth_factor in (0.65, 0.75, 1.0):
+            with self.subTest(smooth_factor=smooth_factor):
+                sizes = self._schedule(smooth_factor)
+                self.assertEqual(sizes, sorted(sizes, reverse=True))
+                self.assertLess(sizes[-1], self.BASE)
+                for size in sizes:
+                    self.assertEqual(size % self.PAGE, 0)
+                    self.assertGreaterEqual(size, self.BASE // 4)
+        # Strict smoothing reaches the floor well inside a 512K prefix.
+        self.assertEqual(self._schedule(1.0)[-1], self.BASE // 4)
+
+    def test_larger_smoothing_factor_shrinks_chunks_faster(self):
+        gentle, default, strict = (self._schedule(s) for s in (0.65, 0.75, 1.0))
+        for g, d, s in zip(gentle, default, strict):
+            self.assertGreaterEqual(g, d)
+            self.assertGreaterEqual(d, s)
+        self.assertGreater(sum(gentle), sum(default))
+        self.assertGreater(sum(default), sum(strict))
+
+
 if __name__ == "__main__":
     unittest.main()
