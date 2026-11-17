@@ -536,8 +536,8 @@ class MultimemAllGatherer:
         return self._state is self._UNINIT
 
     def prebuild(self, *, hidden_size: int, dtype: torch.dtype) -> bool:
-        """Build the bf16 state outside graph capture; True when built. Other
-        dtypes disable it as ``_build`` does."""
+        """Build the bf16 state outside graph capture; True when built.
+        Other dtypes disable it, as ``_build`` does."""
         if self._state is not self._UNINIT:
             return False
         if dtype != torch.bfloat16:

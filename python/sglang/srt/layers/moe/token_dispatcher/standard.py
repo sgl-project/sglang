@@ -152,8 +152,8 @@ class StandardDispatcher(BaseDispatcher):
 
     @property
     def prebuild_pending(self) -> bool:
-        # The aiter runner derives expert_mask_gpu from the mapping, which the lazy
-        # build skips for non-standard top-k formats; only dispatch knows the format.
+        # Not for aiter, whose expert_mask_gpu follows the mapping;
+        # the lazy build skips both for non-standard top-k, known only at dispatch.
         return (
             self.moe_ep_size > 1
             and not self.skip_local_expert_mapping

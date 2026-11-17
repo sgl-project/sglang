@@ -442,7 +442,7 @@ class _DeepEPDispatcherImplBase:
         raise NotImplementedError
 
     def prebuild_buffer(self) -> None:
-        # Leaves the dispatch mode unset; the first dispatch selects it as before.
+        # Leaves the dispatch mode unset; the first dispatch selects it.
         DeepEPBuffer.get_deepep_buffer(
             group=self.group,
             hidden_size=self.hidden_size,

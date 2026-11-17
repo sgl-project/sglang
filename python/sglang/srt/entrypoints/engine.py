@@ -938,8 +938,8 @@ class Engine(EngineScoreMixin, EngineBase):
         prelaunched_schedulers = {}
         rust_listener_procs = []
 
-        # Foundry (--cuda-graph-persistence): activated here at the latest; it
-        # wraps every spawn below with its hook preload and environment pins.
+        # Foundry (--cuda-graph-persistence) is activated here at the latest;
+        # it wraps every spawn below with its hook preload and environment pins.
         foundry_adapter = activate_foundry(server_args)
         if not use_dp_controller or prelaunch_dp_schedulers:
             # Launch tensor parallel scheduler processes

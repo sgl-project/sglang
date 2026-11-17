@@ -1,32 +1,5 @@
-"""End-to-end test of --cuda-graph-persistence (Foundry CUDA graph save/restore).
-
-Three engines run in sequence on one GPU with the same CUDA graph
-sets: native capture, Foundry SAVE (captures and writes the archive) and
-Foundry LOAD (rebuilds the graphs from the archive instead of capturing). LOAD
-must produce the same greedy tokens as native, restore every archived graph
-(the summed restore time is printed, not bounded), and actually run Foundry.
-Three cases: test_restore_replays_every_archived_graph,
-test_greedy_output_matches_native and test_load_startup_stays_bounded (LOAD's
-capture loops and scheduler init stay under a bound in CI, and under half of
-native's capture time anywhere).
-
-Two configurations: Qwen3.5-2B (hybrid gated DeltaNet) with decode graphs
-only, since its full-backend prefill capture fails in SGLang (the GDN
-out-of-graph metadata is decode-only); and Qwen3-30B-A3B-FP8 with EAGLE3
-speculative decoding plus full-backend prefill graphs, which exercises the
-prefill set and the three decode-type graph kinds. Every engine runs with the
-environment pins of Foundry's recipes (_ENGINE_ENV); each engine prints
-SGLang's startup timings and LOAD its per-set capture-loop numbers.
-test_cuda_graph_persistence_nightly.py runs the second configuration without
-the pins, as the comparison.
-
-Needs Foundry: the optional dependency sglang[foundry], else the tests skip.
-In CI the tests install foundry-core into a scratch dir on the servers'
-PYTHONPATH (not into the shared site-packages) and skip when its torch pin
-differs from the runner's torch.
-
-Run:  python3 test/registered/e2e/cuda_graph/persistence/test_cuda_graph_persistence.py
-"""
+"""End-to-end test of --cuda-graph-persistence: native, SAVE and LOAD on one GPU;
+LOAD restores every archived graph and matches native's greedy tokens."""
 
 import atexit
 import glob
@@ -57,14 +30,14 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(est_time=560, stage="base-b", runner_config="1-gpu-large")
 
-# The environment Foundry's recipes (recipe/sglang/set_env.sh) give every engine, set
-# here for native, SAVE and LOAD alike so the three start from the same pins:
-# dynamo off (Foundry pins it on SAVE / LOAD anyway), no DeepGEMM precompile sweep,
-# and host-registered pinned buffers (the FlashInfer decode wrapper pins 8 MiB per
-# captured shape; registering is ~1.5x faster than one cudaHostAlloc each).
+# The env of Foundry's recipes (recipe/sglang/set_env.sh),
+# set for native, SAVE and LOAD alike so the three start from the same pins.
 _ENGINE_ENV = {
+    # Foundry pins it on SAVE / LOAD anyway.
     "TORCHDYNAMO_DISABLE": "1",
     "SGLANG_JIT_DEEPGEMM_PRECOMPILE": "0",
+    # The FlashInfer decode wrapper pins 8 MiB per captured shape;
+    # registering is ~1.5x faster than one cudaHostAlloc each.
     "PYTORCH_CUDA_ALLOC_CONF": os.environ.get(
         "PYTORCH_CUDA_ALLOC_CONF",
         "pinned_use_cuda_host_register:True,pinned_num_register_threads:8",
@@ -83,8 +56,8 @@ _PROMPTS = [
 _SAMPLING = {"temperature": 0, "max_new_tokens": 64, "ignore_eos": True}
 
 _ACTIVE = re.compile(r"\[Foundry\] cuda graph persistence active: pid=(\d+) mode=(\w+)")
-# "Loaded N SGLang graphs" (target decode) or "Loaded N SGLang <kind> graphs" (the
-# speculative-decoding kinds target_verify / draft_decode / draft_extend).
+# "Loaded N SGLang graphs" (target decode) or "Loaded N SGLang <kind> graphs",
+# <kind> being target_verify, draft_decode or draft_extend.
 _DECODE_LOADED = re.compile(
     r"\[Foundry\] Loaded (\d+) SGLang (?!prefill )(?:(\w+) )?graphs in ([0-9.]+)s"
 )
@@ -96,8 +69,8 @@ _LOAD_LOOP = re.compile(
     r"\[Foundry\] SGLang (\w+) capture loop on LOAD: ([0-9.]+)s \((\d+) shapes, "
     r"restore ([0-9.]+)s, per-shape prep ([0-9.]+)s\)"
 )
-# The decode-type batch sizes SGLang captured (rank 0 prints the list; the EP
-# and attention-TP layouts clamp or align the requested list).
+# The decode-type batch sizes SGLang captured, as rank 0 prints them;
+# the EP and attention-TP layouts clamp or align the requested list.
 _CAPTURED_BS = re.compile(
     r"Capture target (?:decode|verify) CUDA graph end\. bs=\[([0-9, ]*)\]"
 )
@@ -159,9 +132,8 @@ def _skip_unless_built_for_this_torch(target: str) -> None:
 
 
 def _write_toml(path: str, workspace: str) -> str:
-    # The region is virtual address space for everything allocated after setup,
-    # the KV pool included; 256GB covers an 80-192 GB GPU at this memory fraction.
-    # No mode key: --cuda-graph-persistence gives it.
+    # The region is VA space for every allocation after setup, the KV pool included;
+    # 256GB covers an 80-192 GB GPU at this memory fraction; the flag gives the mode.
     with open(path, "w") as f:
         f.write(
             'base_addr = 0x600000000000\nregion_size = "256GB"\n'
@@ -171,8 +143,8 @@ def _write_toml(path: str, workspace: str) -> str:
 
 
 def _startup_seconds(log: str):
-    """(scheduler init, time in the runners' capture loops over every graph set)
-    from the engine's startup-timings line, or None without one."""
+    """(scheduler init, time in the runners' capture loops over every graph set),
+    from the engine's startup-timings line; None without one."""
     match = _STARTUP_FIELDS.search(log)
     if match is None:
         return None
@@ -199,6 +171,8 @@ def _generate(base_url: str, text):
     _HAS_FOUNDRY, "Foundry is not installed (pip install 'sglang[foundry]')"
 )
 class TestFoundryGraphPersistence(CustomTestCase):
+    # Hybrid gated DeltaNet; SGLang's full-backend prefill capture fails for it,
+    # the GDN out-of-graph metadata being decode-only.
     model = "Qwen/Qwen3.5-2B"
     # Every decode batch size up to 128; EP / attention-TP layouts clamp or align it.
     decode_bs = list(range(1, 129))
@@ -206,9 +180,8 @@ class TestFoundryGraphPersistence(CustomTestCase):
     prefill_bs = []
     # None = SGLang's default (fa3 on Hopper).
     attention_backend = None
-    # Decode-type graph kinds SAVE archives and LOAD restores: [None] = the target
-    # decode graphs (archive files graph_*_FULL_t*); speculative decoding replaces
-    # them by target_verify / draft_decode / draft_extend (graph_*_DECODE-<kind>_t*).
+    # Decode-type graph kinds SAVE archives and LOAD restores: [None] = target decode;
+    # speculative decoding replaces it by target_verify, draft_decode, draft_extend.
     decode_kinds = [None]
     # Appended to the server args of every engine (subclasses: speculative decoding).
     extra_server_args = []
@@ -216,16 +189,15 @@ class TestFoundryGraphPersistence(CustomTestCase):
     engine_env = _ENGINE_ENV
     # Added to engine_env (subclasses: the EP rows' NVSHMEM / single-node pins).
     extra_env = {}
-    # Batched outputs are compared with native unless a subclass says otherwise
-    # (DP attention composes batches per rank, which differs run to run natively).
+    # Batched outputs are compared with native unless a subclass opts out;
+    # DP attention composes batches per rank, which differs run to run natively.
     compare_batched = True
-    # Upper bounds on the LOAD engine in CI, seconds, about twice what the H100
-    # runners measure: the capture loops of every graph set (restore + SGLang's
-    # per-shape prep) and the scheduler's whole init.
+    # LOAD upper bounds in CI, seconds, about twice what the H100 runners measure;
+    # all graph sets' capture loops (restore + per-shape prep), the scheduler init.
     load_graph_s = 4.0
     load_scheduler_s = 20.0
-    # A layout whose native engine cannot start on this machine (DeepEP without
-    # a usable NVSHMEM transport) is skipped instead of failed.
+    # Skip, not fail, a layout whose native engine cannot start on this machine,
+    # such as DeepEP without a usable NVSHMEM transport.
     native_failure_skips = False
     process = None
     tmp = None
@@ -259,15 +231,15 @@ class TestFoundryGraphPersistence(CustomTestCase):
             "--random-seed",
             "0",
             "--enable-metrics",
-            # The batched request reaches the scheduler as one batch, so every
-            # engine prefills the same batch composition.
+            # The batched request reaches the scheduler as one batch,
+            # so every engine prefills the same batch composition.
             "--enable-tokenizer-batch-encode",
         ]
         if cls.attention_backend is not None:
             cls.server_args += ["--attention-backend", cls.attention_backend]
         cls.server_args += cls.extra_server_args
-        # Native first: it also fills the JIT caches, which SAVE must not compile
-        # inside its capture window.
+        # Native first: it also fills the JIT caches,
+        # which SAVE must not compile inside its capture window.
         try:
             cls.runs = {"native": cls._run_engine("native", mode=None)}
         except Exception as e:
@@ -317,10 +289,10 @@ class TestFoundryGraphPersistence(CustomTestCase):
                 result["sequential"] = []
                 for prompt in _PROMPTS:
                     # A radix hit would shrink the prefill below the smallest bucket.
-                    # timeout: wait for the scheduler to drain the previous
-                    # request; without it /flush_cache answers 400 while busy.
                     requests.post(
                         cls.base_url + "/flush_cache",
+                        # Wait for the scheduler to drain the previous request;
+                        # without it /flush_cache answers 400 while busy.
                         params={"timeout": 30},
                         timeout=60,
                     ).raise_for_status()
@@ -338,8 +310,8 @@ class TestFoundryGraphPersistence(CustomTestCase):
                 cls.process = None
         with open(err_path) as f_err, open(out_path) as f_out:
             result["log"] = f_err.read() + f_out.read()
-        # Startup numbers for the log: compared across engines (and against the
-        # nightly run without the environment pins), not asserted.
+        # Startup numbers for the log, not asserted;
+        # compared across engines and against the nightly run without the env pins.
         loops = "; ".join(
             f"{kind}: {int(n)} shapes, restore {restore}s, prep {prep}s"
             for kind, _, n, restore, prep in _LOAD_LOOP.findall(result["log"])
@@ -369,8 +341,6 @@ class TestFoundryGraphPersistence(CustomTestCase):
         ]
 
     def _captured_decode_bs(self):
-        """The batch sizes the native engine captured, or the requested list
-        when the log has no such line."""
         match = _CAPTURED_BS.search(self.runs["native"]["log"])
         if match is None:
             return list(self.decode_bs)
@@ -383,15 +353,12 @@ class TestFoundryGraphPersistence(CustomTestCase):
         return glob.glob(os.path.join(self.workspace, "rank_0", pattern))
 
     def test_restore_replays_every_archived_graph(self):
-        """Without it a SAVE that archives too few graphs, a LOAD that restores
-        fewer than archived or never selects a restored prefill graph, Foundry
-        active in the native run or in another mode than the flag's, or a hook
-        allocation error all pass the output comparison."""
+        """Catches too few graphs archived or restored, an unused prefill graph,
+        Foundry in the wrong engine or mode, or a hook error; outputs miss these."""
         rank_dir = os.path.join(self.workspace, "rank_0")
         archived_prefill = glob.glob(os.path.join(rank_dir, "graph_*_PREFILL_t*.json"))
-        # SGLang clamps the requested decode batch sizes (DP attention divides
-        # --max-running-requests by the DP size, attention TP aligns them), so the
-        # archive must hold what native captured, one graph per kind and size.
+        # SGLang clamps or aligns the requested decode batch sizes per layout,
+        # so the archive must hold what native captured, one graph per kind and size.
         captured_bs = self._captured_decode_bs()
         for kind in self.decode_kinds:
             with self.subTest(archived_kind=kind):
@@ -414,8 +381,8 @@ class TestFoundryGraphPersistence(CustomTestCase):
         self.assertEqual(decode, {kind: len(captured_bs) for kind in self.decode_kinds})
         if self.prefill_bs:
             self.assertEqual(prefill, [len(archived_prefill)])
-            # A restored prefill graph that the runner never selects would pass the
-            # count checks and silently run eager prefills.
+            # Count checks pass even if the runner never picks a restored prefill graph;
+            # the prefills would then silently run eagerly.
             self.assertGreaterEqual(
                 self.runs["native"]["prefill_passes"], len(_PROMPTS)
             )
@@ -443,9 +410,8 @@ class TestFoundryGraphPersistence(CustomTestCase):
                 self.assertNotIn("[HOOK] ERROR", engine_log)
 
     def test_load_startup_stays_bounded(self):
-        """Without it a change that makes LOAD pay capture work again (a warmup
-        forward per shape, a compile inside the capture loop) passes the output
-        and count checks while the restore saves nothing."""
+        """Catches LOAD paying capture work again (a warmup forward per shape,
+        a compile inside the capture loop), which the output and count checks miss."""
         native, load = (
             _startup_seconds(self.runs[engine]["log"]) for engine in ("native", "load")
         )
@@ -473,14 +439,8 @@ class TestFoundryGraphPersistence(CustomTestCase):
 
 
 class TestFoundryGraphPersistenceSpecPrefill(TestFoundryGraphPersistence):
-    """EAGLE3 speculative decoding plus full-backend prefill graphs: the archive
-    holds the prefill graphs and the three decode-type kinds the EAGLE worker
-    captures (target_verify, draft_decode, draft_extend) in place of the target
-    decode graphs, and LOAD restores each set. A small chain (3 steps, top-k 1, 4
-    draft tokens) keeps the run short; greedy outputs stay deterministic. Dummy
-    weights (--load-format dummy, target and draft) keep CI from downloading
-    31 GB: the graphs, their restore and the target's outputs are exercised,
-    draft acceptance is not (a random draft accepts no token)."""
+    """EAGLE3 with full prefill graphs: the prefill set plus three decode-type kinds;
+    dummy weights avoid a 31 GB download, so draft acceptance is not exercised."""
 
     # Ungated target and draft (the default EAGLE3 pair's Llama target is gated).
     model = "Qwen/Qwen3-30B-A3B-FP8"

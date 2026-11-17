@@ -1,5 +1,5 @@
-"""State that the first forward otherwise creates lazily, built once before
-graph capture so that no capture records (or is broken by) its creation."""
+"""State the first forward otherwise creates lazily, built once before graph capture;
+no capture then records (or is broken by) its creation."""
 
 from __future__ import annotations
 
@@ -21,17 +21,17 @@ def prepare_capture_state(
     is_draft_worker: bool,
     is_ep_scale_joiner: bool,
 ) -> None:
-    """Build the MoE dispatchers' buffers / expert maps and the logits all-gather
-    state now; natively the first warmup forward builds the same objects."""
+    """Build the MoE dispatchers' buffers / expert maps and the logits all-gather state;
+    natively the first warmup forward builds the same objects."""
     # Lazy imports keep the runner package free of a layers import cycle.
     from sglang.srt.layers.logits_processor import prebuild_logits_gatherers
     from sglang.srt.layers.moe.token_dispatcher.base import prebuild_dispatchers
 
-    # A joiner's EP buffers are collectives with ranks it meets only at the
-    # elastic rendezvous; they keep their lazy (or post-rendezvous) creation.
+    # A joiner's EP buffers are collectives with ranks it meets only at the rendezvous;
+    # they keep their lazy (or post-rendezvous) creation.
     num_dispatchers = 0 if is_ep_scale_joiner else prebuild_dispatchers(model)
-    # A draft warms up after the target's graphs are captured, past the point
-    # where persisted graphs need driver-placed symmetric memory; it stays lazy.
+    # A draft warms up after the target's graphs are captured,
+    # past where persisted graphs need driver-placed symmetric memory; it stays lazy.
     num_gatherers = (
         0 if is_draft_worker else prebuild_logits_gatherers(model, dtype=dtype)
     )
@@ -46,8 +46,8 @@ def prepare_capture_state(
 
 
 def _probe_flashinfer_norm_cluster_size() -> None:
-    # FlashInfer >= 0.7.4 loads a module on its first norm kernel, which breaks SAVE's
-    # capture (no eager forward before it); drop once FlashInfer probes outside capture.
+    # FlashInfer >= 0.7.4 loads a module at the first norm call, breaking SAVE capture;
+    # no eager forward precedes it. Drop once FlashInfer probes outside capture.
     try:
         from flashinfer.norm.utils import get_sm_version, max_cluster_n
     except ImportError:

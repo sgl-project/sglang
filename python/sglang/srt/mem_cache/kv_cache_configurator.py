@@ -3464,8 +3464,8 @@ class KVCacheConfigurator:
             create_memory_pool_configurator,
         )
 
-        # Foundry: the pool sizes come from a free-memory profile that differs
-        # between SAVE and LOAD, so LOAD reuses the config SAVE resolved.
+        # Foundry LOAD reuses the pool config SAVE resolved;
+        # the free-memory profile the pool sizes come from differs between the two.
         replayed = get_foundry_adapter().replay_saved_memory_pool_config()
         if replayed is not None:
             return replayed

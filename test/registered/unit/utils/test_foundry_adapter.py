@@ -1,9 +1,5 @@
-"""Unit tests for the Foundry adapter and its call sites (--cuda-graph-persistence).
-
-TestFoundryAdapter drives the adapter against a fake foundry.integration.sglang.api;
-TestFoundryCallSites reads source only: Foundry's archive is valid only while the
-call sites keep their order. No GPU, no Foundry.
-"""
+"""Unit tests for the Foundry adapter, against a fake Foundry api, and its call sites;
+Foundry's archive is valid only while the call sites keep their order."""
 
 import ast
 import io
@@ -123,8 +119,7 @@ def _pin_lines(api, server_args):
 
 @contextmanager
 def _installed(api):
-    """``api`` importable as foundry.integration.sglang.api and a fresh
-    process-level adapter."""
+    """Makes ``api`` importable as foundry.integration.sglang.api; fresh adapter."""
     parents = {
         "foundry": types.ModuleType("foundry"),
         "foundry.integration": types.ModuleType("foundry.integration"),
@@ -139,8 +134,8 @@ def _installed(api):
 
 
 def _drive(adapter, body=lambda: None):
-    """Every adapter method in process order; ``body`` runs inside the capture
-    scope. Returns what the pool-config replay and capture_one gave."""
+    """Every adapter method in process order, ``body`` inside the capture scope;
+    returns what the pool-config replay and capture_one gave."""
     sa = _graph_sa()
     adapter.pin_server_args(sa)
     adapter.validate_resolved_server_args(sa)
@@ -189,8 +184,8 @@ class TestFoundryAdapter(CustomTestCase):
                 self.assertEqual(api.calls, [])
 
     def test_record_without_the_flag_in_an_enabled_process_is_refused(self):
-        """Foundry's hook, region and env pins cannot be undone in a live
-        process: a later record without the flag must not run there."""
+        """Foundry's hook, region and env pins cannot be undone in a live process;
+        a later record without the flag must not run there."""
         from sglang.srt.arg_groups.cuda_graph_hook import (
             validate_cuda_graph_persistence,
         )
@@ -208,8 +203,7 @@ class TestFoundryAdapter(CustomTestCase):
             self.assertIs(activate_foundry(_sa("save")), enabled)
 
     def test_every_adapter_method_reaches_the_api(self):
-        """A no-op method added without a real override would silently do
-        nothing with the flag set."""
+        """A method without a real override would silently no-op with the flag set."""
         api = _fake_api()
         with _installed(api):
             adapter = activate_foundry(_sa("save"))
@@ -223,10 +217,8 @@ class TestFoundryAdapter(CustomTestCase):
         self.assertEqual({name for name, _, _ in api.calls}, methods)
 
     def test_unsupported_at_any_step_falls_back_natively(self):
-        """After ``Unsupported`` at any step every later call is a no-op: the
-        pool config resolves natively, the capture loop runs once and captures
-        natively; Foundry is told once, and spawns still go through its wrapper
-        (the children learn about the fallback there)."""
+        """After ``Unsupported`` at any step, later calls no-op, capture is native once;
+        Foundry is told once, and spawns still pass its wrapper to tell the children."""
         before_spawn = ("activate", "pin_server_args", "validate_resolved_server_args")
         in_scope = ("capture_scope", "capture_one")
         for step in (
@@ -359,9 +351,8 @@ def _source(relpath, qualname):
 
 class TestFoundryCallSites(CustomTestCase):
     def test_call_sites_keep_their_order(self):
-        """Without it a call site dropped or moved across the work it brackets
-        (parallel init, the memory profile, the capture loop, the first publish)
-        passes here and fails at a user's LOAD."""
+        """A call site dropped or moved across the work it brackets fails only at LOAD;
+        that work: parallel init, memory profile, capture loop, first publish."""
         for path, qualname, first, then in _ORDER:
             with self.subTest(site=qualname, first=first, then=then):
                 source = _source(path, qualname)

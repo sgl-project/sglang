@@ -56,8 +56,7 @@ FOUNDRY_INSTALL_HINT = (
 
 
 class FoundryAdapter:
-    """No-op base: what every process uses unless ``--cuda-graph-persistence``
-    is set."""
+    """No-op base, used by every process without ``--cuda-graph-persistence``."""
 
     enabled = False
     mode: Optional[str] = None
@@ -98,8 +97,8 @@ class FoundryAdapter:
         yield
 
     def capture_one(self, *, shape_key: Any, forward_fn, pool: Any, stream: Any):
-        """Returns ``(graph, output)`` for the backend to store, or None: the
-        backend captures the shape natively."""
+        """Returns ``(graph, output)`` for the backend to store;
+        None: the backend captures the shape natively."""
         return None
 
     # End of the scheduler's init.
@@ -121,8 +120,6 @@ class _FoundryAdapterReal(FoundryAdapter):
         return self._unsupported is None
 
     def _guarded(self, fn, **kwargs):
-        """``fn(**kwargs)``, or None once unsupported; an ``Unsupported`` it
-        raises deactivates the adapter."""
         if self._unsupported is not None:
             return None
         try:
@@ -270,18 +267,17 @@ _active: FoundryAdapter = _NOOP
 
 
 def get_foundry_adapter() -> FoundryAdapter:
-    """This process's adapter: the one ``activate_foundry`` created, else the
-    no-op one."""
+    """This process's adapter: the one ``activate_foundry`` created, else the no-op."""
     return _active
 
 
 def activate_foundry(server_args: Any) -> FoundryAdapter:
-    """This process's adapter; with the flag, activates Foundry once per
-    process (see the process contract)."""
+    """This process's adapter; with the flag,
+    activates Foundry once per process (see the process contract)."""
     global _active
     mode = server_args.cuda_graph_persistence
-    # Only the two modes activate; None, and any stand-in a test passes for
-    # server_args, run the no-op adapter.
+    # Only the two modes activate;
+    # None, and any stand-in a test passes for server_args, run the no-op adapter.
     if mode not in ("save", "load"):
         if isinstance(_active, _FoundryAdapterReal):
             raise RuntimeError(

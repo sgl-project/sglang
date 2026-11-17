@@ -662,8 +662,8 @@ class LogitsProcessor(nn.Module):
         return self._logits_gatherer.prebuild_pending
 
     def prebuild_logits_gatherer(self, *, shard_width: int, dtype: torch.dtype) -> bool:
-        """Build the TP logits all-gather state; True when built. ``dtype`` is the
-        lm_head output dtype unless _compute_lm_head forces one."""
+        """Build the TP logits all-gather state; True when built.
+        ``dtype`` is the lm_head output dtype unless _compute_lm_head forces one."""
         if self.use_fp32_lm_head or self.use_fp32_lm_head_output:
             dtype = torch.float32
         elif self.rl_on_policy_target is not None:
@@ -1940,8 +1940,8 @@ def should_apply_lm_head_quant_method(lm_head, quant_method) -> bool:
 
 
 def prebuild_logits_gatherers(model: nn.Module, *, dtype: torch.dtype) -> int:
-    """Returns how many LogitsProcessors got their state; logits dtype is known
-    only at forward, so ``dtype`` is the model (lm_head) dtype."""
+    """Returns how many LogitsProcessors got their state;
+    logits dtype is known only at forward, so ``dtype`` is the model (lm_head) dtype."""
     processors = [
         module
         for module in model.modules()

@@ -76,8 +76,8 @@ def prepare_moe_topk(*, model, model_config: ModelConfig) -> None:
 
 
 def prebuild_deepep_v2_buffer(*, model) -> None:
-    """Build the deepep_v2 ElasticBuffer if still unbuilt (elastic-EP joiners, after
-    the rendezvous); the cap is checked in validate_deepep_v2_dispatch_token_budget."""
+    """Build the deepep_v2 ElasticBuffer if unbuilt (joiners, after the rendezvous);
+    the cap is checked in validate_deepep_v2_dispatch_token_budget."""
     from sglang.srt.layers.moe.token_dispatcher.base import prebuild_dispatchers
     from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 

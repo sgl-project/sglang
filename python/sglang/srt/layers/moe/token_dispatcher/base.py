@@ -435,18 +435,18 @@ class BaseDispatcher(ABC):
 
     @property
     def prebuild_pending(self) -> bool:
-        """True while ``prebuild()`` would still create state that the first
-        dispatch otherwise creates lazily."""
+        """True while ``prebuild()`` would still create state;
+        the first dispatch otherwise creates it lazily."""
         return False
 
     def prebuild(self) -> None:
-        """Create the lazily built dispatch state (communication buffers, expert
-        maps) now, outside any graph capture. Idempotent; a no-op by default."""
+        """Create the lazy dispatch state (comm buffers, expert maps) outside capture;
+        idempotent, a no-op by default."""
 
     @property
     def implements_prebuild(self) -> bool:
-        """Without a ``prebuild`` override, CUDA graph persistence falls back to
-        native capture."""
+        """Without a ``prebuild`` override,
+        CUDA graph persistence falls back to native capture."""
         return type(self).prebuild is not BaseDispatcher.prebuild
 
 

@@ -72,9 +72,8 @@ class TestStandardDispatcherPrebuild(CustomTestCase):
         )
 
     def test_prebuilt_mapping_matches_the_first_dispatch(self):
-        """Regression for EP2 garbage routing when the mapping fill was recorded
-        inside a capture: the prebuilt mapping must equal the one the first EP
-        dispatch builds, and layouts that never build it must stay unbuilt."""
+        """EP2 output was garbage when a capture recorded the expert-mapping fill;
+        the prebuilt mapping must equal the lazy one, or stay unbuilt like it."""
         topk_ids = torch.tensor([[0, 5], [8, 3]], dtype=torch.int32)
         topk_output = StandardTopKOutput(
             topk_weights=torch.ones_like(topk_ids, dtype=torch.float32),
@@ -109,9 +108,8 @@ class TestStandardDispatcherPrebuild(CustomTestCase):
                 self.assertIsNone(dispatcher.local_expert_mapping)
 
     def test_model_walk_prebuilds_every_dispatcher(self):
-        """Every dispatcher a module holds is prebuilt once, whatever the attribute
-        is named, including the two-batch-overlap wrapper's inners; one without a
-        ``prebuild`` override keeps its lazy build."""
+        """Each dispatcher a module holds is prebuilt once, whatever its attribute name,
+        two-batch-overlap inners included; one without ``prebuild`` stays lazy."""
         plain = _ep_dispatcher(moe_ep_rank=0)
         inners = [_ep_dispatcher(moe_ep_rank=1), _ep_dispatcher(moe_ep_rank=1)]
         wrapper = object.__new__(MaybeTboDeepEPDispatcher)

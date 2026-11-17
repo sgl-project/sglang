@@ -347,8 +347,8 @@ def apply_deepep_adjustments(server_args: Any):
 
 
 def handle_cuda_graph_persistence(server_args: Any):
-    """Activate Foundry and pin what a restored graph cannot replay (a contrary
-    explicit value falls back natively); before the prefill defaults."""
+    """Activate Foundry and pin what a restored graph cannot replay;
+    runs before the prefill defaults, a contrary explicit value falls back natively."""
     cfg = resolving_view(server_args)
     if cfg.cuda_graph_persistence is None:
         if cfg.cuda_graph_persistence_config is not None:

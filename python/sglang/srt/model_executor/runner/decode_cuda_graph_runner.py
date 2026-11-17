@@ -1338,8 +1338,8 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def _foundry_graph_kind(self) -> str:
-        # Names this runner's graph set in Foundry's archive (EAGLE subclasses
-        # included): target_decode, target_verify, draft_decode, draft_extend.
+        # Names this runner's graph set in Foundry's archive, EAGLE subclasses included:
+        # target_decode, target_verify, draft_decode, draft_extend.
         role = "draft" if self.model_runner.is_draft_worker else "target"
         mode = self.capture_forward_mode
         if mode.is_target_verify():

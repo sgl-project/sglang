@@ -45,9 +45,8 @@ class TestMultimemAllGathererPrebuild(CustomTestCase):
         )
 
     def test_prebuild_decides_like_the_first_call(self):
-        """Without it a prebuild that sizes the buffer for the shard instead of
-        the gathered width, rebuilds, or leaves an unsupported width or dtype
-        pending (a bf16 buffer for fp32 logits) escapes."""
+        """Catches a prebuild sized for the shard, not the gathered width, a rebuild,
+        or an unsupported width or dtype left pending (bf16 buffer for fp32 logits)."""
         gatherer = _lazy_gatherer()
         self.assertTrue(gatherer.prebuild_pending)
         self.assertTrue(gatherer.prebuild(hidden_size=128, dtype=torch.bfloat16))

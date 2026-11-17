@@ -101,8 +101,6 @@ def should_run_flashinfer_autotune(
 def _kernels_take_flashinfer_tactics(
     model_runner: ModelRunner, *, for_speculative_draft: bool
 ) -> bool:
-    """Whether the runner's MoE / GEMM kernels pick their tactics through
-    FlashInfer's AutoTuner (what the autotune pass tunes)."""
     mr = model_runner
     if for_speculative_draft:
         backend_str = (
@@ -182,8 +180,8 @@ def _kernels_take_flashinfer_tactics(
 def flashinfer_tactics_cache_for_persistence(
     model_runner: ModelRunner,
 ) -> Optional[str]:
-    """Tactics file CUDA graph persistence archives on SAVE and replaces with the
-    archived tactics on LOAD; None without persistence or FlashInfer-tuned kernels."""
+    """Tactics file Foundry archives on SAVE and replaces with the archived one on LOAD;
+    None without persistence or FlashInfer-tuned kernels."""
     mr = model_runner
     if (
         not get_foundry_adapter().enabled
