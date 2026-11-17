@@ -134,6 +134,9 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     "completion_template",
     "hf_chat_template_name",
     "trust_request_chat_template",
+    "fastapi_root_path",
+    "enable_http_worker_reuseport",
+    "enable_encoder_swa_bounded_replay",
     "enable_custom_logit_processor",
     "enable_return_routed_experts",
     "enable_lora",
@@ -153,6 +156,18 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     # Chat responses would lack the server-default sglext token ids.
     "return_input_ids",
     "return_output_ids",
+)
+
+
+RUST_SERVER_UNSUPPORTED_ENVS = (
+    "SGLANG_HTTP_SERVER_APP_PATH",
+    "SGLANG_TIMEOUT_KEEP_ALIVE",
+    "SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT",
+    "SGLANG_PYSPY_DUMP_BEFORE_CRASH",
+    "SGLANG_CUDA_COREDUMP_BEFORE_CRASH",
+    "SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS",
+    "SGLANG_INKLING_DEFAULT_REASONING_EFFORT",
+    "SGLANG_ENABLE_RESPONSE_TEMPLATE_TURN_GRAMMAR",
 )
 
 
@@ -183,6 +198,9 @@ def rust_server_unsupported_args(
     # The Rust chat route applies only each tool's own `strict`.
     if envs.SGLANG_TOOL_STRICT_LEVEL.get() > 0:
         offending.append("SGLANG_TOOL_STRICT_LEVEL")
+    for name in RUST_SERVER_UNSUPPORTED_ENVS:
+        if name not in honored and getattr(envs, name).is_set():
+            offending.append(name)
     return offending
 
 

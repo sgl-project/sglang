@@ -5853,6 +5853,9 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         "completion_template": ["--completion-template", "deepseek_coder"],
         "hf_chat_template_name": ["--hf-chat-template-name", "tool_use"],
         "trust_request_chat_template": ["--trust-request-chat-template"],
+        "fastapi_root_path": ["--fastapi-root-path", "/sglang"],
+        "enable_http_worker_reuseport": ["--enable-http-worker-reuseport"],
+        "enable_encoder_swa_bounded_replay": ["--enable-encoder-swa-bounded-replay"],
         "enable_custom_logit_processor": ["--enable-custom-logit-processor"],
         "enable_return_routed_experts": ["--enable-return-routed-experts"],
         "enable_lora": ["--enable-lora"],
@@ -5899,6 +5902,35 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         message = str(ctx.exception)
         for cli_args in self.REFUSED.values():
             self.assertIn(cli_args[0], message)
+
+    def test_explicit_unsupported_environment_is_refused_by_name(self):
+        for name in validation_hook.RUST_SERVER_UNSUPPORTED_ENVS:
+            with self.subTest(name=name):
+                field = getattr(envs, name)
+                with field.override(field.default):
+                    with self.assertRaisesRegex(
+                        ValueError, f"does not support {name}:"
+                    ):
+                        self._resolve([])
+                    self._resolve([], rust_server=False)
+
+    def test_supported_environment_is_not_refused(self):
+        with envs.SGLANG_LOG_REQUEST_HEADERS.override(("x-request-id",)):
+            self._resolve([])
+
+    def test_model_package_can_honor_an_environment_setting(self):
+        args = prepare_server_args(["--model-path", "dummy"])
+        with envs.SGLANG_TIMEOUT_KEEP_ALIVE.override(30):
+            self.assertIn(
+                "SGLANG_TIMEOUT_KEEP_ALIVE",
+                validation_hook.rust_server_unsupported_args(args),
+            )
+            self.assertNotIn(
+                "SGLANG_TIMEOUT_KEEP_ALIVE",
+                validation_hook.rust_server_unsupported_args(
+                    args, honored={"SGLANG_TIMEOUT_KEEP_ALIVE"}
+                ),
+            )
 
     def test_tool_strict_level_is_refused(self):
         with envs.SGLANG_TOOL_STRICT_LEVEL.override(2):

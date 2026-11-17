@@ -80,11 +80,6 @@ RUST_SERVER_IGNORED_BY_DESIGN: Dict[str, str] = {
     "SGLANG_BATCH_TOKENIZER_OUTPUTS": "Routes Python's multi-tokenizer outputs; Rust runs no tokenizer workers.",
     "enable_dp_attention_local_control_broadcast": "Fans Python's control requests out to DP ranks; each Rust listener serves its own rank.",
     # The Python HTTP server.
-    "SGLANG_HTTP_SERVER_APP_PATH": "Python HTTP server (Granian) setting.",
-    "SGLANG_TIMEOUT_KEEP_ALIVE": "Python HTTP server idle timeout; the Rust listener sets none, which keeps the router's >50 s idle connections.",
-    "SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT": "Python HTTP server (uvicorn) setting.",
-    "fastapi_root_path": "Python HTTP server (FastAPI) setting.",
-    "enable_http_worker_reuseport": "Python HTTP server (multi-worker) setting.",
     "grpc_worker_threads": "Python gRPC server thread pool.",
     # Routes the Rust server does not serve: their clients get a 404.
     "SGLANG_OLLAMA_ROOT_ROUTE": "Ollama routes are not served.",
@@ -135,6 +130,14 @@ RUST_SERVER_IGNORED_BY_DESIGN: Dict[str, str] = {
 # parentheses.
 RUST_SERVER_HANDLED_ELSEWHERE: Dict[str, str] = {
     "SGLANG_TOOL_STRICT_LEVEL": "Refused above OFF: the Rust chat route applies only each tool's own strict (rust_server_unsupported_args).",
+    "SGLANG_HTTP_SERVER_APP_PATH": "Refused when explicitly configured (rust_server_unsupported_args).",
+    "SGLANG_TIMEOUT_KEEP_ALIVE": "Refused when explicitly configured (rust_server_unsupported_args).",
+    "SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT": "Refused when explicitly configured (rust_server_unsupported_args).",
+    "SGLANG_PYSPY_DUMP_BEFORE_CRASH": "Refused when explicitly configured (rust_server_unsupported_args).",
+    "SGLANG_CUDA_COREDUMP_BEFORE_CRASH": "Refused when explicitly configured (rust_server_unsupported_args).",
+    "SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS": "Refused when explicitly configured (rust_server_unsupported_args).",
+    "SGLANG_INKLING_DEFAULT_REASONING_EFFORT": "Refused when explicitly configured (rust_server_unsupported_args).",
+    "SGLANG_ENABLE_RESPONSE_TEMPLATE_TURN_GRAMMAR": "Refused when explicitly configured (rust_server_unsupported_args).",
     "context_length": "Passed as model_config.context_len (_build_server_args).",
     "language_model_only": "Passed as model_config.is_multimodal (_build_server_args).",
     "image_processor_backend": "Selects the HF image processor the Rust resize mirrors (RustMmFamily).",
@@ -152,14 +155,8 @@ RUST_SERVER_HANDLED_ELSEWHERE: Dict[str, str] = {
 # Python-frontend reads Rust-server mode ignores but should not: each changes
 # what a client or operator gets. Refuse or implement each, then drop it here.
 RUST_SERVER_KNOWN_GAPS: Dict[str, str] = {
-    "SGLANG_PYSPY_DUMP_BEFORE_CRASH": "No crash diagnostics when a scheduler crashes.",
-    "SGLANG_CUDA_COREDUMP_BEFORE_CRASH": "No crash diagnostics when a scheduler crashes.",
-    "SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS": "No crash diagnostics when a scheduler crashes.",
     "speculative_num_draft_tokens": "No per-request speculative-decoding stats in meta_info (also behind the speculative_algorithm read, honored by name).",
     "SGLANG_ENABLE_COLOCATED_BATCH_GEN": "Unverified: whether a batch's items are scheduled together.",
-    "enable_encoder_swa_bounded_replay": "Unverified: Python refuses image requests off CUDA and warms up with text.",
-    "SGLANG_INKLING_DEFAULT_REASONING_EFFORT": "Chat: the Rust chat route has no Inkling renderer.",
-    "SGLANG_ENABLE_RESPONSE_TEMPLATE_TURN_GRAMMAR": "Chat: the Rust chat route builds no per-turn response-template tool grammar.",
     "grammar_backend": "Chat: the Rust chat route builds no per-turn response-template tool grammar.",
 }
 
