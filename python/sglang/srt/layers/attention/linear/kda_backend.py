@@ -4,6 +4,9 @@ from typing import Optional, Tuple, Union
 import torch
 
 from sglang.kernels.ops.attention import kda_fused_decode
+from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
+    kda_replayssm_verify_commits_in_place,
+)
 from sglang.kernels.ops.mamba.causal_conv1d_triton import (
     causal_conv1d_fn,
     causal_conv1d_update,
@@ -26,6 +29,7 @@ from sglang.srt.layers.attention.linear.utils import (
     select_verify_intermediate_state_indices,
 )
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
+from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.utils import is_cpu, is_cuda, is_hip, is_npu
 from sglang.srt.utils.common import is_gfx95_supported, rank0_log
 
@@ -1325,7 +1329,24 @@ class KDAAttnBackend(MambaAttnBackendBase):
 
         draft_token_num = forward_batch.spec_info.draft_token_num
         ragged_layout = forward_batch.ragged_verify_layout
-        if self._can_run_dspark_cutedsl_mtp(
+        step0_inplace = (
+            replayssm_on
+            and draft_token_num == 1
+            and self.state_pool.replayssm_spec_fold
+            and kda_replayssm_verify_commits_in_place(
+                draft_token_num=draft_token_num,
+                speculative_algorithm=SpeculativeAlgorithm.from_string(
+                    get_spec().speculative_algorithm
+                ),
+            )
+        )
+        if step0_inplace:
+            # The commit skips the fold on the same predicate; a ragged layout
+            # would need the ring.
+            assert ragged_layout is None
+            assert isinstance(self.kernel_dispatcher.verify_kernel, TritonKDAKernel)
+            ring_kwargs = {"inplace_single_step": True}
+        if not step0_inplace and self._can_run_dspark_cutedsl_mtp(
             layer=layer,
             mixed_qkv=mixed_qkv,
             a=a,
@@ -1363,7 +1384,7 @@ class KDAAttnBackend(MambaAttnBackendBase):
             # conv1d + transpose-copy + recurrence sequence. Chain (topk==1) only --
             # retrieve_* are None there; the tree path and any unsupported shape keep
             # the reference kernels.
-            if self._can_run_fused_chain_verify(
+            if not step0_inplace and self._can_run_fused_chain_verify(
                 layer=layer,
                 mixed_qkv=mixed_qkv,
                 a=a,

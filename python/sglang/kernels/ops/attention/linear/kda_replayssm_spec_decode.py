@@ -351,6 +351,79 @@ def commit_kda_replayssm_spec_all_layers(
     )
 
 
+def kda_replayssm_verify_commits_in_place(
+    *, draft_token_num: int, speculative_algorithm
+) -> bool:
+    """Whether the verify updates `temporal` in place instead of writing the ring.
+
+    A one-token chain verify always accepts its token, so it runs as a decode
+    step and the commit skips the fold. Only EAGLE-family workers commit through
+    ``commit_mamba_states_after_verify``, which honors this; other workers commit
+    through ``update_mamba_state_after_mtp_verify``, which always folds. The KDA
+    backend and the commit must both call this.
+    """
+    return draft_token_num == 1 and speculative_algorithm.is_eagle()
+
+
+# fused_mamba_state_scatter_with_mask needs a contiguous src, and `temporal` may
+# be a strided arena view, so this copies slot to slot within one tensor.
+@triton.jit
+def _step0_track_snapshot_kernel(
+    temporal,  # [num_layers, num_slots, ...], each (layer, slot) entry contiguous
+    state_indices,
+    track_indices,
+    steps_to_track,  # 0 = snapshot, -1 = skip (one-token verify has no other step)
+    stride_layer,
+    stride_slot,
+    N,  # elements per (layer, slot) entry
+    NULL_BLOCK_ID: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    i_n = tl.program_id(0)
+    i_layer = tl.program_id(1).to(tl.int64)
+    i_block = tl.program_id(2)
+    if tl.load(steps_to_track + i_n) != 0:
+        return
+    dst = tl.load(track_indices + i_n).to(tl.int64)
+    src = tl.load(state_indices + i_n).to(tl.int64)
+    if dst <= NULL_BLOCK_ID or src <= NULL_BLOCK_ID:
+        return
+    base = temporal + i_layer * stride_layer
+    offs = i_block * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N
+    data = tl.load(base + src * stride_slot + offs, mask=mask)
+    tl.store(base + dst * stride_slot + offs, data, mask=mask)
+
+
+def _snapshot_step0_track(
+    temporal: torch.Tensor,  # [num_layers, num_slots, HV, V, K]
+    state_indices: torch.Tensor,
+    track_indices: torch.Tensor,
+    steps_to_track: torch.Tensor,
+    null_block_id: int,
+) -> None:
+    num_layers = temporal.shape[0]
+    assert temporal[0, 0].is_contiguous()
+    num_rows = state_indices.shape[0]
+    if num_rows == 0:
+        return
+    entry_numel = temporal[0, 0].numel()
+    block = 2048
+    _step0_track_snapshot_kernel[
+        (num_rows, num_layers, triton.cdiv(entry_numel, block))
+    ](
+        temporal,
+        state_indices,
+        track_indices,
+        steps_to_track,
+        temporal.stride(0),
+        temporal.stride(1),
+        entry_numel,
+        NULL_BLOCK_ID=null_block_id,
+        BLOCK=block,
+    )
+
+
 def commit_kda_replayssm_after_verify(
     *,
     spec_state,  # MambaPool.SpeculativeState (all layers)
@@ -362,8 +435,13 @@ def commit_kda_replayssm_after_verify(
     src_indices_raw: torch.Tensor | None = None,
     null_block_id: int = -1,
     ring_indices: torch.Tensor | None = None,
+    ssm_committed_in_verify: bool = False,
 ) -> None:
     """Fold each layer's accepted window into `temporal` and roll back conv.
+
+    ``ssm_committed_in_verify``: the verify already updated `temporal` in place
+    (see ``kda_replayssm_verify_commits_in_place``), so only the track snapshot
+    is still due.
 
     Single commit entry point shared by the generic spec_utils commit and the
     dspark/dflash direct `update_mamba_state_after_mtp_verify` path. The SSM state
@@ -377,21 +455,31 @@ def commit_kda_replayssm_after_verify(
 
     L = spec_state.replayssm_rawv.shape[-2]
     num_k_heads = spec_state.replayssm_rawk.shape[2]
-    commit_kda_replayssm_spec_all_layers(
-        checkpoint_state=spec_state.temporal,
-        rawv_cache=spec_state.replayssm_rawv,
-        rawk_cache=spec_state.replayssm_rawk,
-        gk_cache=spec_state.replayssm_g,
-        beta_cache=spec_state.replayssm_beta,
-        ssm_state_indices=state_batch_indices,
-        accept_lens=accept_lens,
-        max_cache_len=L,
-        num_k_heads=num_k_heads,
-        mamba_track_indices=mamba_track_indices,
-        mamba_steps_to_track=mamba_steps_to_track,
-        null_block_id=null_block_id,
-        ring_indices=ring_indices,
-    )
+    if ssm_committed_in_verify:
+        if mamba_track_indices is not None and mamba_steps_to_track is not None:
+            _snapshot_step0_track(
+                temporal=spec_state.temporal,
+                state_indices=state_batch_indices,
+                track_indices=mamba_track_indices,
+                steps_to_track=mamba_steps_to_track,
+                null_block_id=null_block_id,
+            )
+    else:
+        commit_kda_replayssm_spec_all_layers(
+            checkpoint_state=spec_state.temporal,
+            rawv_cache=spec_state.replayssm_rawv,
+            rawk_cache=spec_state.replayssm_rawk,
+            gk_cache=spec_state.replayssm_g,
+            beta_cache=spec_state.replayssm_beta,
+            ssm_state_indices=state_batch_indices,
+            accept_lens=accept_lens,
+            max_cache_len=L,
+            num_k_heads=num_k_heads,
+            mamba_track_indices=mamba_track_indices,
+            mamba_steps_to_track=mamba_steps_to_track,
+            null_block_id=null_block_id,
+            ring_indices=ring_indices,
+        )
     # Conv rollback + track-slot conv snapshot, per conv group (fold already did
     # the ssm side via HAS_TRACK). Loop mirrors the recurrent commit's zip; track
     # scatter is mask-gated (step -1 => skip).

@@ -15,6 +15,8 @@ non-pow2 K/V, T<gamma, single head, and padding (-1) slots. Both gate branches
 GPU-only.
 """
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
@@ -32,7 +34,11 @@ from sglang.kernels.ops.attention.linear.fused_sigmoid_gating_recurrent import (
     fused_sigmoid_gating_delta_rule_update,
 )
 from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (  # noqa: E402
+    commit_kda_replayssm_after_verify,
     commit_kda_replayssm_spec,
+)
+from sglang.srt.layers.attention.linear.kernels.kda_triton import (  # noqa: E402
+    TritonKDAKernel,
 )
 
 DEV = "cuda"
@@ -137,6 +143,106 @@ def test_ring_fold_parity(bs, T, HV, H, K, V, lower_bound, pad):
         fold = ckpt[slots[j]]
         rel = ((fold - base).abs().max() / base.abs().max().clamp_min(1e-6)).item()
         assert rel < 1e-3, f"row={j}: rel={rel:.3e}"
+
+
+@pytest.mark.parametrize(
+    "lower_bound", [g[0] for g in GATES], ids=[g[1] for g in GATES]
+)
+def test_one_token_inplace_verify_matches_ring_fold(lower_bound):
+    """A one-token verify committed in place must leave the same state as ring + fold.
+
+    Covers every row kind: tracked (step 0), untracked (step -1), and a -1
+    padding slot whose state and track slot must stay untouched.
+    """
+    num_layers, bs, HV, H, K, V, L = 2, 6, 8, 4, 128, 128, 16
+    torch.manual_seed(0)
+    slots = torch.tensor([1, 2, 3, 4, 5, -1], device=DEV, dtype=torch.int32)
+    track = torch.tensor([7, 8, 9, 10, 11, 12], device=DEV, dtype=torch.int32)
+    steps_to_track = torch.tensor([0, -1, 0, -1, 0, 0], device=DEV, dtype=torch.int32)
+    num_slots = 13
+    qsl = torch.arange(bs + 1, device=DEV, dtype=torch.int32)
+    temporal = torch.randn(num_layers, num_slots, HV, V, K, device=DEV)
+    inputs = [
+        dict(
+            q=torch.randn(1, bs, H, K, device=DEV),
+            k=torch.randn(1, bs, H, K, device=DEV),
+            v=torch.randn(1, bs, HV, V, device=DEV),
+            a=torch.randn(1, bs, HV, K, device=DEV),
+            b=torch.randn(1, bs, HV, device=DEV),
+            A_log=torch.randn(HV, device=DEV),
+            dt_bias=torch.randn(HV, K, device=DEV),
+        )
+        for _ in range(num_layers)
+    ]
+    kernel = TritonKDAKernel()
+
+    def commit(state, ring, inplace):
+        commit_kda_replayssm_after_verify(
+            spec_state=SimpleNamespace(
+                temporal=state,
+                replayssm_rawv=ring[0],
+                replayssm_rawk=ring[1],
+                replayssm_g=ring[2],
+                replayssm_beta=ring[3],
+                conv=[],
+                intermediate_conv_window=[],
+            ),
+            state_batch_indices=slots,
+            accept_lens=torch.ones(bs, device=DEV, dtype=torch.int32),
+            last_correct_step_indices=torch.zeros(bs, device=DEV, dtype=torch.int32),
+            mamba_track_indices=track,
+            mamba_steps_to_track=steps_to_track,
+            null_block_id=-1,
+            ssm_committed_in_verify=inplace,
+        )
+
+    def run(inplace):
+        state = temporal.clone()
+        ring = (
+            torch.zeros(num_layers, num_slots, HV, L, V, device=DEV),
+            torch.zeros(num_layers, num_slots, H, L, K, device=DEV),
+            torch.zeros(num_layers, num_slots, HV, L, K, device=DEV),
+            torch.zeros(num_layers, num_slots, HV, L, device=DEV),
+        )
+        outs = []
+        for layer, x in enumerate(inputs):
+            ring_kwargs = (
+                {"inplace_single_step": True}
+                if inplace
+                else dict(
+                    cache_ring=True,
+                    replayssm_rawv=ring[0][layer],
+                    replayssm_rawk=ring[1][layer],
+                    replayssm_g=ring[2][layer],
+                    replayssm_beta=ring[3][layer],
+                )
+            )
+            outs.append(
+                kernel.target_verify(
+                    **x,
+                    ssm_states=state[layer],
+                    cache_indices=slots,
+                    query_start_loc=qsl,
+                    intermediate_states_buffer=None,
+                    intermediate_state_indices=slots,
+                    cache_steps=1,
+                    retrieve_parent_token=None,
+                    lower_bound=lower_bound,
+                    **ring_kwargs,
+                )
+            )
+        commit(state, ring, inplace)
+        return state, outs
+
+    ref_state, ref_outs = run(inplace=False)
+    state, outs = run(inplace=True)
+    real = slots >= 0
+    for ref_out, out in zip(ref_outs, outs):
+        torch.testing.assert_close(out[:, real], ref_out[:, real], rtol=1e-4, atol=1e-4)
+    torch.testing.assert_close(state, ref_state, rtol=1e-4, atol=1e-4)
+    # The padding row's track slot and the untracked rows' track slots keep h0.
+    for row in (1, 3, 5):
+        torch.testing.assert_close(state[:, track[row]], temporal[:, track[row]])
 
 
 if __name__ == "__main__":

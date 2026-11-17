@@ -185,8 +185,26 @@ class TritonKDAKernel(LinearAttnKernelBase):
         replayssm_g: Optional[torch.Tensor] = None,
         replayssm_beta: Optional[torch.Tensor] = None,
         ring_indices: Optional[torch.Tensor] = None,
+        inplace_single_step: bool = False,
         **kwargs,
     ) -> torch.Tensor:
+        if inplace_single_step:
+            # A one-token verify always accepts its token: update the state in
+            # place like decode; the ReplaySSM commit then skips its fold.
+            assert cache_steps == 1 and retrieve_parent_token is None
+            return self.decode(
+                q,
+                k,
+                v,
+                a,
+                b,
+                A_log=A_log,
+                dt_bias=dt_bias,
+                ssm_states=ssm_states,
+                cache_indices=cache_indices,
+                query_start_loc=query_start_loc,
+                lower_bound=lower_bound,
+            )
         # KDA MTP / speculative-decode verify via the fused KDA kernel (IS_KDA=True),
         # mirroring the GDN triton verify path. Reads the committed state, writes
         # per-draft-token intermediate states to the scratch buffer, does NOT mutate

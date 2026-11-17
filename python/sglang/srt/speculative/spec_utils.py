@@ -1331,7 +1331,9 @@ def commit_mamba_states_after_verify(
             return
         from sglang.kernels.ops.attention.linear.kda_replayssm_spec_decode import (
             commit_kda_replayssm_after_verify,
+            kda_replayssm_verify_commits_in_place,
         )
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
         spec_state = mamba_pool.get_speculative_mamba2_params_all_layers()
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
@@ -1379,6 +1381,12 @@ def commit_mamba_states_after_verify(
             src_indices_raw=src_indices_raw,
             null_block_id=-1,  # SGLang: valid slots >= 0, padding == -1
             ring_indices=ring_indices,
+            ssm_committed_in_verify=kda_replayssm_verify_commits_in_place(
+                draft_token_num=draft_token_num,
+                speculative_algorithm=SpeculativeAlgorithm.from_string(
+                    get_spec().speculative_algorithm
+                ),
+            ),
         )
         return
 
