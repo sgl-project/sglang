@@ -61,6 +61,11 @@ class BaseGrammarObject:
         self.grammar_stats = None
         self.current_token = None
 
+    def __repr__(self):
+        # Req.__repr__ prints the grammar, and rank consensus checks compare
+        # those reprs across ranks; the default repr carries a per-process address.
+        return f"{type(self).__name__}()"
+
     def maybe_init_reasoning(self, reasoning: bool):
         pass
 
@@ -72,6 +77,11 @@ class BaseGrammarObject:
 
     def rollback(self, k: int):
         raise NotImplementedError()
+
+    def try_accept_tokens(self, tokens: List[int]) -> bool:
+        """Accept all of ``tokens`` if the grammar allows them; otherwise leave the
+        state untouched and return False. Backends that cannot probe return False."""
+        return False
 
     def is_terminated(self):
         return False

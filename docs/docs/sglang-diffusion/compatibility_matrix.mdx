@@ -1,6 +1,6 @@
 ---
 title: "Supported Models"
-description: "Browse model families and public checkpoints supported by SGLang Diffusion."
+description: "Browse SGLang Diffusion model families for image, video, audio, 3D, and action generation."
 ---
 
 import { DiffusionModelCatalog } from '/src/snippets/diffusion/model-catalog.jsx';
@@ -12,6 +12,10 @@ Use a listed checkpoint as `--model-path` with `sglang generate` or
 family detection may also support compatible local directories. Open the linked
 Cookbook recipe for launch commands, optimizations, adapters, and model-specific
 notes.
+
+Action-generation models are listed under **World and action**. Their linked
+recipes cover robot observations, action outputs, and policy-specific APIs;
+the [VLA cookbook](/cookbook/vla/intro) groups dedicated action-policy recipes.
 
 <Tabs>
   <Tab title="Image and 3D">
