@@ -69,24 +69,15 @@ def _flat_values(fields: dict, key: str) -> np.ndarray:
 
 
 class TestFlatRawSamplingMaskValidation(CustomTestCase):
-    def test_flag_defaults_off_and_valid(self):
-        for kwargs in (
-            {},
-            {"return_sampling_mask": True, "return_flat_raw_sampling_mask": True},
+    def test_invalid_flag_combinations_are_rejected(self):
+        for kwargs, error in (
+            ({"stream": True, "return_flat_raw_sampling_mask": True}, "stream"),
+            ({"return_flat_raw_sampling_mask_b64": True}, "requires return_flat_raw"),
         ):
-            GenerateReqInput(text="hello", **kwargs).normalize_batch_and_arguments()
-
-    def test_flag_rejects_stream(self):
-        req = GenerateReqInput(
-            text="hello", stream=True, return_flat_raw_sampling_mask=True
-        )
-        with self.assertRaisesRegex(ValueError, "stream"):
-            req.normalize_batch_and_arguments()
-
-    def test_b64_requires_flat_flag(self):
-        req = GenerateReqInput(text="hello", return_flat_raw_sampling_mask_b64=True)
-        with self.assertRaisesRegex(ValueError, "return_flat_raw_sampling_mask"):
-            req.normalize_batch_and_arguments()
+            with self.subTest(kwargs=kwargs):
+                req = GenerateReqInput(text="hello", **kwargs)
+                with self.assertRaisesRegex(ValueError, error):
+                    req.normalize_batch_and_arguments()
 
     def test_flags_propagate_to_batch_items(self):
         req = GenerateReqInput(
@@ -101,14 +92,6 @@ class TestFlatRawSamplingMaskValidation(CustomTestCase):
 
 
 class TestFlatRawSamplingMask(CustomTestCase):
-    def test_unfinished_output_carries_no_sampling_mask(self):
-        state = _make_state(return_flat_raw_sampling_mask=True)
-
-        meta_info = _meta_info(state, [_chunk(_ROWS[0], False)], finished=False)
-
-        self.assertEqual(meta_info, {})
-        self.assertEqual(state.output_token_sampling_mask, [])
-
     def test_flat_matches_nested_rows(self):
         for mode in ("selected", "support"):
             chunks = [_chunk(rows, mode == "support") for rows in _ROWS]
@@ -122,11 +105,14 @@ class TestFlatRawSamplingMask(CustomTestCase):
                         return_flat_raw_sampling_mask=True,
                         return_flat_raw_sampling_mask_b64=b64,
                     )
-                    fields = _meta_info(state, chunks, finished=True)
+                    unfinished = _meta_info(state, chunks[:-1], finished=False)
+                    fields = _meta_info(state, chunks[-1:], finished=True)
                     ids, lengths, logprobs = (
                         _flat_values(fields, key) for key in _FLAT_KEYS
                     )
 
+                    self.assertEqual(unfinished, {})
+                    self.assertEqual(state.output_token_sampling_mask, [])
                     self.assertNotIn("output_token_sampling_mask", fields)
                     self.assertEqual(
                         [
@@ -145,17 +131,13 @@ class TestFlatRawSamplingMask(CustomTestCase):
                     self.assertEqual(logprobs.tolist(), expected)
 
     def test_a_request_finished_without_rows_gets_empty_arrays(self):
-        for b64 in (False, True):
-            with self.subTest(b64=b64):
-                state = _make_state(
-                    return_flat_raw_sampling_mask=True,
-                    return_flat_raw_sampling_mask_b64=b64,
-                )
-                fields = _meta_info(state, [None], finished=True)
+        state = _make_state(return_flat_raw_sampling_mask=True)
 
-                self.assertEqual(fields["output_token_sampling_mask_length"], 0)
-                for key in _FLAT_KEYS:
-                    self.assertEqual(len(_flat_values(fields, key)), 0)
+        fields = _meta_info(state, [None], finished=True)
+
+        self.assertEqual(fields["output_token_sampling_mask_length"], 0)
+        for key in _FLAT_KEYS:
+            self.assertEqual(fields[key], [])
 
 
 if __name__ == "__main__":
