@@ -6285,6 +6285,8 @@ class Scheduler(
 
             if self.draft_worker:
                 self.draft_worker.clear_cache_pool()
+            if self.idle_gc_freezer is not None:
+                self.idle_gc_freezer.on_cache_reset()
 
             if empty_cache:
                 current_platform.empty_cache()

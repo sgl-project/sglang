@@ -1,5 +1,6 @@
 """The idle GC freezer collects, then freezes, once per idle period, only after
-the period has lasted the configured time."""
+the period has lasted the configured time; a cache reset collects and refreezes
+at once."""
 
 import unittest
 from types import SimpleNamespace
@@ -22,7 +23,9 @@ class TestIdleGCFreezer(unittest.TestCase):
                 idle_gc_freezer, "time", SimpleNamespace(monotonic=lambda: now[0])
             ),
             patch.object(
-                idle_gc_freezer, "gc", SimpleNamespace(collect=gc_ops.collect)
+                idle_gc_freezer,
+                "gc",
+                SimpleNamespace(collect=gc_ops.collect, unfreeze=gc_ops.unfreeze),
             ),
             patch.object(idle_gc_freezer, "freeze_gc", gc_ops.freeze_gc),
         ):
@@ -42,6 +45,12 @@ class TestIdleGCFreezer(unittest.TestCase):
             now[0] += 5.0
             freezer.on_idle(forward_ct=8)
             self.assertEqual(gc_ops.mock_calls, once + once)
+
+            # A cache reset collects the dropped tree and refreezes at once.
+            freezer.on_cache_reset()
+            now[0] += 5.0
+            freezer.on_idle(forward_ct=8)
+            self.assertEqual(gc_ops.mock_calls, once + once + [call.unfreeze()] + once)
 
 
 if __name__ == "__main__":

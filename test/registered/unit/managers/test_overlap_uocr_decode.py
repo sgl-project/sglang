@@ -341,6 +341,7 @@ class TestFlushWithDocumentState(CustomTestCase):
         ):
             setattr(scheduler, name, Mock())
         scheduler.draft_worker = None
+        scheduler.idle_gc_freezer = None
         aborted = []
         scheduler._abort_uocr_doc_windows = lambda reqs, **kw: aborted.extend(reqs)
         self.assertTrue(scheduler.flush_cache(empty_cache=False))

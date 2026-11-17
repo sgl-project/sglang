@@ -274,6 +274,8 @@ def teardown_disaggregation(scheduler: Scheduler) -> None:
     scheduler.disagg_metadata_buffers = None
     scheduler.req_to_metadata_buffer_idx_allocator = None
     _release_prefix_cache_for_role_switch(scheduler)
+    if scheduler.idle_gc_freezer is not None:
+        scheduler.idle_gc_freezer.on_cache_reset()
 
 
 def _release_prefix_cache_for_role_switch(scheduler: Scheduler) -> None:
