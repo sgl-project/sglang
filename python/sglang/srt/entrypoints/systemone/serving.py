@@ -13,9 +13,10 @@ from urllib.parse import unquote, urlparse
 
 import orjson
 import pybase64
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import ORJSONResponse
 from PIL import Image
+from pydantic import ValidationError
 
 from sglang.srt.entrypoints.openai.serving_decisions import (
     EncodedQuestion,
@@ -35,6 +36,7 @@ from sglang.srt.entrypoints.systemone.joint_schema import (
 )
 from sglang.srt.entrypoints.systemone.kev import encode_kev
 from sglang.srt.entrypoints.systemone.protocol import (
+    NemotronDecisionRequest,
     SystemOneChoiceAnswer,
     SystemOneChoiceQuestion,
     SystemOneNoulAnswer,
@@ -81,8 +83,23 @@ class SystemOneServing(OpenAIServingDecisions):
         return "systemone-"
 
     def _validate_request(self, request: SystemOneRequest) -> Optional[str]:
+        if self.question_encoder is None and isinstance(
+            request, NemotronDecisionRequest
+        ):
+            try:
+                SystemOneRequest.model_validate(request.model_dump())
+            except ValidationError as error:
+                raise HTTPException(status_code=422, detail=str(error)) from error
         if self.joint_head_config is not None or self.pointer_head is not None:
             return self._validate_joint_schema_request(request)
+        if self.question_encoder is not None:
+            error = self.question_encoder.validate_request(request)
+            if error is not None:
+                return error
+            if request.packing not in (None, False, "none"):
+                return "Nemotron Decision supports per-question reads only; use packing='none'."
+            if request.long_mode not in (None, "full"):
+                return "Nemotron Decision reads the full prompt; compaction is not supported."
         return (
             self._validate_server(request.model)
             or self._validate_images(request.images)
@@ -319,6 +336,15 @@ class SystemOneServing(OpenAIServingDecisions):
         pair_labels = None
         for question_id, view in zip(request.questions, views):
             try:
+                if self.question_encoder is not None:
+                    if view.kind == "score":
+                        _check_legend(question_id, view)
+                    yield self.question_encoder.encode(
+                        request.state,
+                        request.questions[question_id],
+                        chat_template_kwargs,
+                    )
+                    continue
                 labels = default_labels(view)
                 if view.kind == "choice" and len(view.names) > len(labels):
                     if pair_labels is None:
@@ -431,9 +457,16 @@ class SystemOneServing(OpenAIServingDecisions):
         )
         answers = {}
         for i, question_id in enumerate(request.questions):
+            probabilities = result.scores[i]
+            if self.question_encoder is not None:
+                probabilities = self.question_encoder.calibrate(
+                    request.questions[question_id].type,
+                    probabilities,
+                    result.token_logprobs[i],
+                )
             answers[question_id] = _answer(
                 view=views[i],
-                probabilities=result.scores[i],
+                probabilities=probabilities,
                 mass=label_mass(result.token_logprobs[i]),
                 question_id=question_id,
             )

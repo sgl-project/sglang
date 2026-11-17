@@ -24,6 +24,7 @@ class TestSamplingMaskValidation(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
         self.manager = TokenizerManager.__new__(TokenizerManager)
+        self.manager.is_single_token_read = False
         self.manager.context_len = 128
         self.manager.num_reserved_tokens = 0
         self.manager.allow_auto_truncate = False

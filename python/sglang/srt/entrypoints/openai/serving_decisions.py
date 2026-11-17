@@ -26,6 +26,9 @@ from sglang.srt.entrypoints.openai.protocol import (
 )
 from sglang.srt.entrypoints.openai.serving_base import OpenAIServingBase
 from sglang.srt.entrypoints.openai.serving_chat import _CHAT_TEMPLATE_CLIENT_ERRORS
+from sglang.srt.entrypoints.systemone.nemotron_decide import (
+    create_decision_encoder,
+)
 from sglang.srt.multimodal.media_io import ImageData
 from sglang.srt.parser.jinja_template_utils import process_content_for_template_format
 from sglang.srt.parser.reasoning_parser import ReasoningParser
@@ -86,6 +89,11 @@ class OpenAIServingDecisions(OpenAIServingBase):
         self.joint_head_config = self.tokenizer_manager.model_config.joint_head_config
         self.pointer_head = self.tokenizer_manager.model_config.pointer_head
         tokenizer = self.tokenizer_manager.tokenizer
+        self.question_encoder = create_decision_encoder(
+            self.tokenizer_manager.model_config,
+            tokenizer,
+            self.tokenizer_manager.context_len,
+        )
         # Other tokenizers skip the shortcut in _encode_labels and check the full prompt.
         self.added_tokens = (
             {i: token for token, i in tokenizer.get_added_vocab().items()}
@@ -136,7 +144,7 @@ class OpenAIServingDecisions(OpenAIServingBase):
         )
         if error is not None:
             return error
-        if self.decision_config is not None:
+        if self.decision_config is not None or self.question_encoder is not None:
             return (
                 f"{self.route} does not serve decision checkpoints, use /v1/systemone, "
                 "which renders the prompt and answer codes they were trained with"
@@ -214,6 +222,8 @@ class OpenAIServingDecisions(OpenAIServingBase):
         self, chat_template_kwargs: Dict[str, Any]
     ) -> Optional[str]:
         """The answer position must follow the reasoning block, not sit inside it."""
+        if self.question_encoder is not None:
+            return None
         config = self.template_manager.reasoning_config
         if config is not None and config.always_on:
             return (
@@ -229,7 +239,9 @@ class OpenAIServingDecisions(OpenAIServingBase):
         return None
 
     def _chat_template_kwargs(self, request_kwargs: Dict[str, Any]) -> Dict[str, Any]:
-        """Reasoning off, then the server defaults, then the request kwargs."""
+        """Use the trained encoder's defaults, or turn reasoning off for generic reads."""
+        if self.question_encoder is not None:
+            return {**self.default_chat_template_kwargs, **request_kwargs}
         kwargs = {}
         if self.reasoning_toggle is not None:
             kwargs[self.reasoning_toggle] = False

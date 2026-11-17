@@ -4633,6 +4633,72 @@ class TestQwen3VLHopperServingOverrides(CustomTestCase):
         self.assertEqual(envs.SGLANG_MM_FEATURE_CACHE_MB.get(), 2048)
 
 
+class TestNemotronDecisionStartup(CustomTestCase):
+    def test_prefill_defaults_preserve_limits_and_other_architectures(self):
+        from sglang.srt.arg_groups.model_overrides.nemotron_decision import (
+            apply_nemotron_decision_prefill_defaults,
+        )
+        from sglang.srt.server_args import ServerArgs
+
+        for architecture, supplied, context, sidecar_limit, expected in (
+            ("NemotronForDecision", None, 262144, 131072, 32768),
+            ("NemotronForDecision", 16384, 262144, 131072, 16384),
+            ("NemotronForDecision", 65536, 262144, 131072, 65536),
+            ("NemotronForDecision", None, 8192, 131072, 8192),
+            ("NemotronForDecision", None, 262144, 4096, 4096),
+            ("Ministral3ForCausalLM", None, 262144, 131072, 16384),
+            ("Ministral3ForCausalLM", 4096, 262144, 131072, 4096),
+        ):
+            with self.subTest(
+                architecture=architecture,
+                supplied=supplied,
+                context=context,
+                sidecar_limit=sidecar_limit,
+            ):
+                args = ServerArgs(
+                    model_path="dummy",
+                    max_prefill_tokens=supplied,
+                    chunked_prefill_size=2048,
+                )
+                args._model_config = SimpleNamespace(
+                    hf_config=SimpleNamespace(architectures=[architecture]),
+                    context_len=context,
+                    nemotron_decision_config={"max_input_tokens": sidecar_limit},
+                )
+                apply_nemotron_decision_prefill_defaults(args, args._model_config)
+                self.assertEqual(
+                    resolution_result(args, "max_prefill_tokens"), expected
+                )
+                self.assertIs(args.max_prefill_tokens, supplied)
+                self.assertEqual(
+                    resolution_result(args, "chunked_prefill_size"),
+                    -1 if architecture == "NemotronForDecision" else 2048,
+                )
+
+    def test_registered_guard_rejects_generation_modes(self):
+        config = SimpleNamespace(is_causal=False, sliding_window=None)
+        args = SimpleNamespace(dllm_algorithm=None, speculative_algorithm=None)
+        self.assertEqual(
+            collect_model_override_declarations("NemotronForDecision", args, config), []
+        )
+        for field, value in (
+            ("dllm_algorithm", "LowConfidence"),
+            ("speculative_algorithm", "EAGLE"),
+        ):
+            with self.subTest(field=field):
+                invalid = SimpleNamespace(**{**vars(args), field: value})
+                with self.assertRaisesRegex(ValueError, "one bidirectional read"):
+                    collect_model_override_declarations(
+                        "NemotronForDecision", invalid, config
+                    )
+                self.assertEqual(
+                    collect_model_override_declarations(
+                        "Ministral3ForCausalLM", invalid, config
+                    ),
+                    [],
+                )
+
+
 class TestLfm3SpeculativeDecoding(CustomTestCase):
     def test_speculative_decoding_is_rejected(self):
         from sglang.srt.arg_groups.model_overrides.lfm3 import _lfm3_overrides

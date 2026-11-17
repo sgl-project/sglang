@@ -12,6 +12,7 @@ from sglang.srt.arg_groups.overrides import (
     _page_size_default,
     _pipeline_parallel_overlap_disable,
     _sampling_backend_default,
+    declare_resolution,
     run_post_process_pass,
 )
 from sglang.srt.arg_groups.resolution_hooks import run_hook
@@ -45,6 +46,10 @@ def run_resolution_pipeline(server_args: Any) -> None:
     )
 
     cfg = resolving_view(server_args)
+    if cfg.max_prefill_tokens is None:
+        declare_resolution(
+            server_args, "prefill_token_default", max_prefill_tokens=16384
+        )
 
     from sglang.srt.arg_groups.parallel_hook import handle_deprecated_dp_attention
 

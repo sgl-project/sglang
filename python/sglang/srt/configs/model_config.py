@@ -36,6 +36,10 @@ from sglang.srt.configs.ernie55 import (
     to_nextn_draft_config,
 )
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_config
+from sglang.srt.configs.nemotron_decision import (
+    is_nemotron_decision,
+    load_nemotron_decision_config,
+)
 from sglang.srt.configs.unlimited_ocr_v2 import (
     FALLBACK_CONTEXT_LENGTH,
     UocrDocumentConfig,
@@ -753,6 +757,11 @@ class ModelConfig:
             self.model_path, self.revision = base
             revision = self.revision
         self.hf_text_config = get_hf_text_config(self.hf_config)
+        self.nemotron_decision_config = (
+            load_nemotron_decision_config(self.model_path, revision)
+            if is_nemotron_decision(self.hf_config)
+            else None
+        )
         self.decision_config = None
         if self.hf_config.architectures == ["Qwen3_5Model"]:
             self.decision_config = load_decision_config(self.model_path, revision)

@@ -63,6 +63,7 @@ from sglang.srt.beam_search.output import (
     try_build_beam_search_out_dict,
 )
 from sglang.srt.configs.model_config import ModelConfig
+from sglang.srt.configs.nemotron_decision import is_nemotron_decision
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.encoder.receiver import create_mm_receiver
 from sglang.srt.disaggregation.mode import DisaggregationMode
@@ -652,6 +653,12 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         self.served_model_name = get_serving().served_model_name
         self.model_config = model_config_class.from_server_args(server_args)
         self.is_generation = self.model_config.is_generation
+        self.is_single_token_read = is_nemotron_decision(self.model_config.hf_config)
+        self.single_read_max_input_tokens = (
+            self.model_config.nemotron_decision_config["max_input_tokens"]
+            if self.is_single_token_read
+            else None
+        )
         self.context_len = self.model_config.context_len
         self.image_token_id = self.model_config.image_token_id
         self.max_req_input_len = None  # Will be set later in engine.py
@@ -1406,6 +1413,26 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         # A decision layout indexes the whole prompt, so it is checked before any
         # truncation below could cut the prompt.
         self._validate_joint_schema_request(obj, input_ids)
+        if self.is_single_token_read:
+            limit = max_joint_prompt_tokens(
+                context_len=self.context_len,
+                num_reserved_tokens=self.num_reserved_tokens,
+                max_req_input_len=self.max_req_input_len,
+                max_prefill_tokens=get_schedule().max_prefill_tokens,
+            )
+            limit = min(limit, self.single_read_max_input_tokens)
+            if len(input_ids) > limit:
+                raise ValueError(
+                    f"Nemotron Decision requires the complete prompt in one prefill "
+                    f"({len(input_ids)} tokens, limit {limit}); shorten the input "
+                    "or increase the server's prompt budget."
+                )
+            max_new_tokens = obj.sampling_params.get("max_new_tokens")
+            if max_new_tokens is None or max_new_tokens > 1:
+                raise ValueError(
+                    "Nemotron Decision supports single-token reads only; "
+                    "use /v1/systemone or max_new_tokens <= 1."
+                )
         _max_req_len = self.context_len
         input_token_num = len(input_ids) if input_ids is not None else 0
         input_token_num += self.num_reserved_tokens

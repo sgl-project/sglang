@@ -61,6 +61,7 @@ class TestSamplingParamsTruncation(CustomTestCase):
         override.install()
         self.addCleanup(override.restore)
         manager = TokenizerManager.__new__(TokenizerManager)
+        manager.is_single_token_read = False
         manager.context_len = 100
         manager.num_reserved_tokens = 0
         manager.allow_auto_truncate = True

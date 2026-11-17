@@ -293,6 +293,11 @@ def handle_gpu_memory_settings(server_args: Any):
 
     if cfg.mem_fraction_static is None:
         model_config = model_config_of(server_args)
+        from sglang.srt.arg_groups.model_overrides.nemotron_decision import (
+            apply_nemotron_decision_prefill_defaults,
+        )
+
+        apply_nemotron_decision_prefill_defaults(server_args, model_config)
         is_vlm = (
             model_config.is_multimodal
             and not cfg.language_only

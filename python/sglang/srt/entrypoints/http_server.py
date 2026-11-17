@@ -76,6 +76,7 @@ from pydantic import ValidationError
 from uvicorn.supervisors.multiprocess import Multiprocess
 
 from sglang.srt.configs.model_config import load_joint_head_config, load_pointer_head
+from sglang.srt.configs.nemotron_decision import is_nemotron_decision
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST, DisaggregationMode
 from sglang.srt.entrypoints.anthropic.protocol import (
@@ -132,7 +133,10 @@ from sglang.srt.entrypoints.server_utils import (
     set_uvicorn_logging_configs,
 )
 from sglang.srt.entrypoints.sidecar import rust_server_sidecar
-from sglang.srt.entrypoints.systemone.protocol import SystemOneRequest
+from sglang.srt.entrypoints.systemone.protocol import (
+    NemotronDecisionRequest,
+    SystemOneRequest,
+)
 from sglang.srt.entrypoints.systemone.serving import SystemOneServing
 from sglang.srt.entrypoints.warmup import execute_warmups
 from sglang.srt.environ import envs
@@ -2184,7 +2188,13 @@ async def anthropic_v1_count_tokens(
 
 ## System One compatible decision API
 @app.post("/v1/systemone", dependencies=[Depends(validate_json_request)])
-async def systemone_decisions(request: SystemOneRequest, raw_request: Request):
+async def systemone_decisions(
+    request: Annotated[
+        Union[SystemOneRequest, NemotronDecisionRequest],
+        Body(union_mode="left_to_right"),
+    ],
+    raw_request: Request,
+):
     """System One compatible decisions, answered by candidate scoring without generation."""
     return await raw_request.app.state.systemone_serving.handle_request(
         request, raw_request
@@ -2426,6 +2436,8 @@ def _execute_server_warmup(server_args: ServerArgs):
     else:
         request_name = "/encode"
     max_new_tokens = 8 if model_info["is_generation"] else 1
+    if is_nemotron_decision(_global_state.tokenizer_manager.model_config.hf_config):
+        max_new_tokens = 1
     json_data = {
         "sampling_params": {
             "temperature": 0,
