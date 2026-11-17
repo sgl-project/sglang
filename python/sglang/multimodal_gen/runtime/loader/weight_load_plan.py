@@ -11,7 +11,7 @@ class WeightLoadPlan:
     checkpoint_load_device: torch.device
     # Device required while running process_weights_after_loading; None means unchanged.
     weight_postprocess_device: torch.device | None = None
-    # Stage one module at a time when quantizing CPU-resident weights.
+    # Stage one module at a time from CPU for online quantization.
     layerwise_postprocess_device: torch.device | None = None
     # mps layerwise loading retains compatible safetensors tensors as CPU-backed
     # parameters instead of materializing a second unified-memory copy
