@@ -94,9 +94,9 @@ The following table summarizes quantization method support across NVIDIA and AMD
     <tr>
       <td><code>gptq</code></td>
       <td>No</td>
-      <td>No</td>
       <td>Yes</td>
-      <td>Removed on NVIDIA and AMD GPUs — use <code>gptq_marlin</code> instead. Uses CANN kernels on Ascend. Still supported on Intel CPUs with AMX</td>
+      <td>Yes</td>
+      <td>Removed on NVIDIA GPUs — use <code>gptq_marlin</code> instead. Triton W4A16 on AMD (4-bit, no <code>desc_act</code>, linear layers only). Uses CANN kernels on Ascend. Still supported on Intel CPUs with AMX</td>
     </tr>
     <tr>
       <td><code>compressed-tensors</code></td>

@@ -105,11 +105,23 @@ class AttentionBackend(ABC):
     those must migrate to ``init_forward_metadata_out_graph(fb, in_capture)``.
     """
 
+    # Whether extend metadata covers the rows MLP sync pads the batch to, so
+    # attention takes the padded queries rather than only the real rows.
+    plans_padded_extend_rows: bool = False
+
     # Resolved per-mode backend names, stamped by ModelRunner.init_attention_backend
     prefill_attention_backend_str: Optional[str] = None
     decode_attention_backend_str: Optional[str] = None
 
     supports_ragged_verify_graph: bool = False
+    # Bind-time cap on the window sub-pools one runner's layers attend through.
+    max_window_sub_pools: int = 1
+
+    def window_capacity_children(self) -> list:
+        """The backends a wrapper runs its layers' attention through, whose
+        window capacity binds in its place; none for a leaf."""
+        return []
+
     # Whether target verify runs correctly under decode context parallelism:
     # each rank reads its shard of the DCP-widened pages with the global causal
     # bound and returns its LSE for the cross-rank merge.

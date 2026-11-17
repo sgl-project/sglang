@@ -9,9 +9,9 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.deepseek_v4_backend import DeepseekV4AttnBackend
+from sglang.srt.layers.dp_attention import get_eager_max_batch_size
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_disagg, get_exec, max_prefill_buffer_tokens
-from sglang.srt.utils.common import get_eager_max_batch_size
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.model_runner import ModelRunner

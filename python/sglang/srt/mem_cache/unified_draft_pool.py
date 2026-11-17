@@ -235,22 +235,26 @@ def routed_draft_pool(
         layer_maps.append(
             (host, view, {layer_id: idx for idx, layer_id in enumerate(layer_ids)})
         )
-    # Layers route to their host sub-pool by its name. The window host plays
-    # the sliding-window role a backend's window rail reads; the draft's window
-    # layers share one window, so they have one host.
-    window_hosts = [
-        host
+    # A backend's one window rail reads the window host playing the
+    # sliding-window role: the longest, when the layers span several.
+    windows = {
+        host: plan.sub_pool(host).lifetime.window
         for host in lanes_by_host
         if isinstance(plan.sub_pool(host).lifetime, WindowLifetime)
-    ]
-    assert len(window_hosts) <= 1, f"draft window layers span {window_hosts}"
-    roles = {IdSpaceKind.SLIDING_WINDOW: window_hosts[0]} if window_hosts else {}
+    }
+    roles = {}
+    if windows:
+        roles[IdSpaceKind.SLIDING_WINDOW] = max(
+            windows,
+            key=lambda host: WindowLifetime(window=windows[host]).retention(),
+        )
     layer_ids = [layer_id for _, _, indices in layer_maps for layer_id in indices]
     lead = layer_maps[0][1]
     return RoutedKVCache(
         arena=arena,
         owner=owner,
         roles=roles,
+        windows=windows,
         layer_maps=layer_maps,
         page_size=page_size,
         start_layer=min(layer_ids),

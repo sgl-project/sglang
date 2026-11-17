@@ -20,10 +20,10 @@ from sglang.test.ci.ci_register import (
 from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
-register_amd_ci(est_time=120, stage="stage-b", runner_config="1-gpu-small-amd")
+register_amd_ci(est_time=120, stage="base-b", runner_config="1-gpu-small-amd")
 # Nightly, not a blocking lane: one case spawns a subprocess that trips a device-side
 # assert, so a wedge costs the whole subprocess timeout below.
-register_xpu_ci(est_time=300, suite="nightly-xpu-kernel-main-1-gpu", nightly=True)
+register_xpu_ci(est_time=300, suite="nightly-kernel-main-test-1-gpu-xpu", nightly=True)
 
 _DEVICE: torch.device = torch.device(get_device(device_id=0))
 _DEVICE_MODULE = torch.get_device_module(_DEVICE)
