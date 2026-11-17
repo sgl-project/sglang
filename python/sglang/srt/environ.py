@@ -525,11 +525,9 @@ class Envs:
     SGLANG_ENABLE_TP_MEMORY_INBALANCE_CHECK = EnvBool(True)
     # Scheduler state checks. BUSY runs the busy pool check (its value also sets
     # the log verbosity). IDLE runs no check of its own: it picks whether a leak
-    # found by the idle pool checks, the KV page check, or the GC frozen-garbage
-    # check raises or only warns.
+    # found by the idle pool checks or the KV page check raises or only warns.
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_BUSY = EnvInt(0)
     SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE = EnvBool(True)
-    SGLANG_ENABLE_GC_FROZEN_GARBAGE_CHECK = EnvBool(False)
     # The explicit environment variable still takes precedence over this CI
     # default, so production remains opt-in and CI remains opt-out if needed.
     SGLANG_ENABLE_TREE_CACHE_SANITY_CHECK = EnvBool(_default_on_in_ci)
@@ -747,6 +745,14 @@ class Envs:
     # Most per-request states the detokenizer keeps; past it, the oldest is
     # evicted. See https://github.com/sgl-project/sglang/issues/2812
     SGLANG_DETOKENIZER_MAX_STATES = EnvInt(1 << 16)
+
+    # ===================================================================
+    # Beam search
+    # ===================================================================
+    # Shared-prompt decode attention for wide beam batches (FlashInfer MHA only).
+    SGLANG_ENABLE_BEAM_SHARED_CONTEXT_ATTENTION = EnvBool(False)
+    # Replay the trie beam selection step as a CUDA graph.
+    SGLANG_ENABLE_BEAM_TRIE_SELECTION_GRAPH = EnvBool(False)
 
     # ===================================================================
     # Overlap scheduler and pipeline parallelism
