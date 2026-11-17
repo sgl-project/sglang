@@ -18,7 +18,6 @@ from sglang.srt.layers.attention.linear.utils import pp_spec_stable_rows_enabled
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.managers.mm_utils import strip_mm_features_for_pp_relay
 from sglang.srt.managers.overlap_utils import RelayPayload
-from sglang.srt.managers.pp_balance import plan_decode_transfers
 from sglang.srt.managers.req_types import FINISH_ABORT
 from sglang.srt.managers.schedule_batch import Req, ScheduleBatch
 from sglang.srt.managers.scheduler_components.state_check import CheckPhase
@@ -60,6 +59,20 @@ if TYPE_CHECKING:
     from sglang.srt.managers.scheduler import Scheduler
     from sglang.srt.mem_cache.kv.alloc.forward_steps import ForwardLaunch
     from sglang.srt.observability.forward_pass_metrics import FpmTiming
+
+
+def _plan_decode_transfers(sizes: list[int], source: int, capacity: int) -> list[int]:
+    """How many rows the retired source can donate to each pipeline slot."""
+    loads = sizes.copy()
+    transfers = [0] * len(loads)
+    while True:
+        smallest = min(loads)
+        if smallest >= capacity or loads[source] <= smallest + 1:
+            return transfers
+        target = loads.index(smallest)
+        loads[source] -= 1
+        loads[target] += 1
+        transfers[target] += 1
 
 
 def _pp_can_skip_output_comm(batch: ScheduleBatch) -> bool:
@@ -163,7 +176,7 @@ class SchedulerPPMixin:
                 size += pending.batch_size()
             loads.append(size)
         loads[slot] = running.batch_size()
-        transfers = plan_decode_transfers(
+        transfers = _plan_decode_transfers(
             loads, slot, get_parallel().pp_max_micro_batch_size
         )
         remaining = loads[slot]

@@ -3,7 +3,7 @@ from itertools import product
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.managers.pp_balance import plan_decode_transfers
+from sglang.srt.managers.scheduler_pp_mixin import _plan_decode_transfers
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=4, suite="base-a-test-cpu")
@@ -11,15 +11,15 @@ register_cpu_ci(est_time=4, suite="base-a-test-cpu")
 
 class TestPPAutoBalance(unittest.TestCase):
     def test_pp4_long_tail(self):
-        self.assertEqual(plan_decode_transfers([8, 0, 0, 0], 0, 8), [0, 2, 2, 2])
-        self.assertEqual(plan_decode_transfers([2, 1, 2, 1], 0, 8), [0] * 4)
-        self.assertEqual(plan_decode_transfers([8, 3, 3, 3], 0, 3), [0] * 4)
+        self.assertEqual(_plan_decode_transfers([8, 0, 0, 0], 0, 8), [0, 2, 2, 2])
+        self.assertEqual(_plan_decode_transfers([2, 1, 2, 1], 0, 8), [0] * 4)
+        self.assertEqual(_plan_decode_transfers([8, 3, 3, 3], 0, 3), [0] * 4)
 
     def test_one_rotation_balances_all_live_rows(self):
         for initial in product(range(6), repeat=4):
             sizes = list(initial)
             for source in range(4):
-                moves = plan_decode_transfers(sizes, source, 5)
+                moves = _plan_decode_transfers(sizes, source, 5)
                 self.assertEqual(moves[source], 0)
                 sizes[source] -= sum(moves)
                 sizes = [size + count for size, count in zip(sizes, moves)]
