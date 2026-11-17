@@ -28,6 +28,10 @@ from sglang.kernels.ops.attention.kv_indices import (
 )
 from sglang.kernels.ops.attention.utils import assert_buffer_fits
 from sglang.kernels.ops.speculative.cache_locs import generate_draft_decode_kv_indices
+from sglang.srt.layers.attention.aiter_flydsl_unified_attention import (
+    reset_flydsl_unified_attention_cache,
+    with_flydsl_unified_attention,
+)
 from sglang.srt.layers.attention.base_attn_backend import (
     AttentionBackend,
     resolve_window_id_space,
@@ -78,6 +82,7 @@ try:
     _unified_attention_has_equal_seqlen_q = (
         "equal_seqlen_q" in inspect.signature(unified_attention).parameters
     )
+    unified_attention = with_flydsl_unified_attention(unified_attention)
     from sglang.kernels.ops.attention.unified_attention_3d_mtp import (
         asm_verify_attn_enabled,
         reset_verify_attn_plan_cache,
@@ -2685,6 +2690,7 @@ class AiterAttnBackend(AttentionBackend):
         in_capture: bool = False,
     ):
         reset_verify_attn_plan_cache()
+        reset_flydsl_unified_attention_cache()
         seq_lens_cpu = (
             forward_batch.seq_lens.cpu() if in_capture else forward_batch.seq_lens_cpu
         )
@@ -2726,6 +2732,7 @@ class AiterAttnBackend(AttentionBackend):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for aiter attention backend."""
         reset_verify_attn_plan_cache()
+        reset_flydsl_unified_attention_cache()
 
         bs = forward_batch.batch_size
         kv_indptr = self.kv_indptr

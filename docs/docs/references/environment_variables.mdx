@@ -1903,6 +1903,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_AITER_FLYDSL_UNIFIED_ATTN</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>In the AITER attention backend, try AITER's FlyDSL BF16 unified attention before its Triton unified attention. FlyDSL covers gfx950, a BF16 KV cache, Q/K head 192 with V head 128, 16 query heads per KV head and <code>--page-size</code> 64 or 128 (MiMo-V2.6); other calls keep the Triton kernel. Needs an AITER with <code>aiter.ops.flydsl.unified_attention_bf16</code> and FlyDSL 0.5.0; without them it logs a warning and uses Triton.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_AITER_FP8_PER_TOKEN</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Use AITER FP8 per-token quantization.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
