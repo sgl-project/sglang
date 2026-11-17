@@ -646,12 +646,9 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         if tgt_loc.numel() == 0:
             return
         self._raise_if_native_kv_cache_disabled()
-        if (
-            not self.dsa_kv_cache_store_fp8
-            and self.index_k_buffer is None
-            and self.index_k_scale_buffer is None
-            and self.k_buffer.dtype in (torch.float16, torch.bfloat16)
-            and self.v_buffer.dtype in (torch.float16, torch.bfloat16)
+        if self.index_k_buffer is None and self.k_buffer.dtype in (
+            torch.float16,
+            torch.bfloat16,
         ):
             from sgl_kernel_npu.mem_cache.mla_cache_move import move_mla_kv_cache
 

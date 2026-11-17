@@ -2538,11 +2538,6 @@ class AscendAttnBackend(AttentionBackend):
                 "NGRAM on Ascend requires full decoder attention without "
                 "attention sinks or logit capping."
             )
-        draft_tokens = (
-            int(forward_batch.spec_info.draft_token_num)
-            if is_ngram
-            else self.speculative_num_draft_tokens
-        )
         if save_kv_cache:
             if self.use_mla:
                 k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
@@ -2577,7 +2572,7 @@ class AscendAttnBackend(AttentionBackend):
                 # operator's batchSize (TND layout); only target_verify has a
                 # uniform per-request width.
                 if forward_batch.forward_mode.is_target_verify():
-                    real_bs = query.shape[0] // draft_tokens
+                    real_bs = query.shape[0] // self.speculative_num_draft_tokens
 
             if self.forward_metadata.seq_lens_cpu_int is None:
                 # Graph mode: bind the Python list, which graph.update can
@@ -2594,7 +2589,11 @@ class AscendAttnBackend(AttentionBackend):
             ):
                 actual_seq_lengths_kv = actual_seq_lengths_kv[:real_bs]
 
-            if forward_batch.forward_mode.is_draft_extend_v2():
+            if is_ngram:
+                actual_seq_lengths = [self.speculative_num_draft_tokens] * (
+                    query.shape[0] // self.speculative_num_draft_tokens
+                )
+            elif forward_batch.forward_mode.is_draft_extend_v2():
                 extend_seq_lens_cpu = forward_batch.extend_seq_lens_cpu
                 if not self.graph_mode:
                     extend_seq_lens_cpu = extend_seq_lens_cpu[
@@ -2604,9 +2603,9 @@ class AscendAttnBackend(AttentionBackend):
             else:
                 # Static across replays ([spec_draft, 2*spec_draft, ...]).
                 actual_seq_lengths = np.arange(
-                    draft_tokens,
-                    draft_tokens + query.shape[0],
-                    draft_tokens,
+                    self.speculative_num_draft_tokens,
+                    self.speculative_num_draft_tokens + query.shape[0],
+                    self.speculative_num_draft_tokens,
                 )
 
             if not self.graph_mode:
@@ -2635,9 +2634,10 @@ class AscendAttnBackend(AttentionBackend):
                 # The paged MHA TND split-fuse path only accepts causal masks.
                 input_layout = "BSH"
                 query = query.reshape(
-                    -1, draft_tokens, layer.tp_q_head_num * layer.qk_head_dim
+                    -1,
+                    self.speculative_num_draft_tokens,
+                    layer.tp_q_head_num * layer.qk_head_dim,
                 )
-                actual_seq_lengths = [draft_tokens] * query.shape[0]
                 mask = self.forward_metadata.ngram_attn_mask
                 sparse_mode = 0
             elif layer.attn_type == AttentionType.ENCODER_ONLY:
@@ -2734,9 +2734,9 @@ class AscendAttnBackend(AttentionBackend):
                     self.forward_metadata.seq_lens_cpu_int.cpu().int().tolist()
                 )
             actual_seq_lengths = np.arange(
-                draft_tokens,
-                draft_tokens + q_nope.shape[0],
-                draft_tokens,
+                self.speculative_num_draft_tokens,
+                self.speculative_num_draft_tokens + q_nope.shape[0],
+                self.speculative_num_draft_tokens,
             )
 
             # When not in graph_mode, query is sliced to num_token_non_padded
@@ -2750,45 +2750,42 @@ class AscendAttnBackend(AttentionBackend):
                 block_table = self.forward_metadata.block_tables
 
             if (
-                is_ngram
-                and self.q_head_num_padding is not None
-                and self.q_head_num_padding > self.tp_q_head_num
-            ):
-                padding = self.q_head_num_padding - self.tp_q_head_num
-                q_nope = torch.nn.functional.pad(q_nope, (0, 0, 0, padding))
-                q_rope = torch.nn.functional.pad(q_rope, (0, 0, 0, padding))
-            elif (
                 self.q_head_num_padding is not None
                 and self.q_head_num_padding > self.tp_q_head_num
             ):
-                nope_padding = torch.empty(
-                    [
-                        q_nope.shape[0],
-                        self.q_head_num_padding - self.tp_q_head_num,
-                        self.kv_lora_rank,
-                    ],
-                    dtype=(
-                        self.model_dtype
-                        if self.model_dtype is not None
-                        else torch.bfloat16
-                    ),
-                    device=q_nope.device,
-                )
-                rope_padding = torch.empty(
-                    [
-                        q_rope.shape[0],
-                        self.q_head_num_padding - self.tp_q_head_num,
-                        self.qk_rope_head_dim,
-                    ],
-                    dtype=(
-                        self.model_dtype
-                        if self.model_dtype is not None
-                        else torch.bfloat16
-                    ),
-                    device=q_rope.device,
-                )
-                q_nope = torch.cat([q_nope, nope_padding], dim=1).contiguous()
-                q_rope = torch.cat([q_rope, rope_padding], dim=1).contiguous()
+                if is_ngram:
+                    padding = self.q_head_num_padding - self.tp_q_head_num
+                    q_nope = torch.nn.functional.pad(q_nope, (0, 0, 0, padding))
+                    q_rope = torch.nn.functional.pad(q_rope, (0, 0, 0, padding))
+                else:
+                    nope_padding = torch.empty(
+                        [
+                            q_nope.shape[0],
+                            self.q_head_num_padding - self.tp_q_head_num,
+                            self.kv_lora_rank,
+                        ],
+                        dtype=(
+                            self.model_dtype
+                            if self.model_dtype is not None
+                            else torch.bfloat16
+                        ),
+                        device=q_nope.device,
+                    )
+                    rope_padding = torch.empty(
+                        [
+                            q_rope.shape[0],
+                            self.q_head_num_padding - self.tp_q_head_num,
+                            self.qk_rope_head_dim,
+                        ],
+                        dtype=(
+                            self.model_dtype
+                            if self.model_dtype is not None
+                            else torch.bfloat16
+                        ),
+                        device=q_rope.device,
+                    )
+                    q_nope = torch.cat([q_nope, nope_padding], dim=1).contiguous()
+                    q_rope = torch.cat([q_rope, rope_padding], dim=1).contiguous()
 
             mask = self.forward_metadata.ngram_attn_mask if is_ngram else self.mtp_mask
             sparse_mode = 0 if is_ngram else 3
@@ -2797,7 +2794,7 @@ class AscendAttnBackend(AttentionBackend):
                 # The existing paged MLA cache is [block, KV_N, page, D].
                 # V2 consumes it with BNSD queries; keep the cache unchanged.
                 batch_size = len(actual_seq_lengths_kv)
-                query_seq_len = draft_tokens
+                query_seq_len = self.speculative_num_draft_tokens
                 assert q_nope.shape[0] == batch_size * query_seq_len, (
                     "FIAS V2 target verify requires one fixed draft block per request"
                 )
