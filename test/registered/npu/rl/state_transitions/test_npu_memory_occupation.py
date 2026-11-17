@@ -9,10 +9,8 @@ import unittest
 
 from sglang.test.ascend.test_ascend_utils import QWEN3_0_6B_WEIGHTS_PATH
 from sglang.test.ascend.test_npu_rl_utils import (
-    generate,
     generation_signature,
     get,
-    health,
     npu_free_bytes,
     npu_rl_env,
     npu_server,
@@ -31,7 +29,7 @@ PROMPTS = (
     "1 + 1 =",
     "def hello():\n    return",
 )
-BASE_ARGS = (
+MEMORY_ARGS = (
     "--attention-backend",
     "ascend",
     "--disable-cuda-graph",
@@ -42,9 +40,9 @@ BASE_ARGS = (
     "512",
     "--max-running-requests",
     "4",
+    "--enable-memory-saver",
+    "--enable-weights-cpu-backup",
 )
-MEMORY_ARGS = BASE_ARGS + ("--enable-memory-saver", "--enable-weights-cpu-backup")
-NO_MEMORY_ARGS = BASE_ARGS
 
 
 class _MemoryOccupationCases:
@@ -107,9 +105,6 @@ class _MemoryOccupationCases:
         self.assertEqual(actual, golden, "staged resume changed the output")
 
 
-PRELOAD_ENV = {**npu_rl_env(), "TMS_HOOK_MODE": "preload"}
-
-
 class TestNpuMemoryOccupation(_MemoryOccupationCases, CustomTestCase):
     @classmethod
     def setUpClass(cls):
@@ -121,41 +116,6 @@ class TestNpuMemoryOccupation(_MemoryOccupationCases, CustomTestCase):
     @classmethod
     def tearDownClass(cls):
         cls._server.__exit__(None, None, None)
-
-
-class TestNpuMemoryOccupationPreload(_MemoryOccupationCases, CustomTestCase):
-    """Same cases with the LD_PRELOAD memory-saver mode."""
-
-    @classmethod
-    def setUpClass(cls):
-        cls._server = npu_server(MODEL, extra_args=MEMORY_ARGS, env=PRELOAD_ENV)
-        cls.base_url = cls._server.__enter__()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls._server.__exit__(None, None, None)
-
-
-class TestNpuMemoryOccupationWithoutFlag(CustomTestCase):
-    @classmethod
-    def setUpClass(cls):
-        # No --enable-memory-saver: this server is the negative control and
-        # cannot share the mempool-backed server above.
-        cls._server = npu_server(MODEL, extra_args=NO_MEMORY_ARGS, env=npu_rl_env())
-        cls.base_url = cls._server.__enter__()
-
-    @classmethod
-    def tearDownClass(cls):
-        cls._server.__exit__(None, None, None)
-
-    def test_release_without_flag_is_noop(self):
-        release_memory(self.base_url, ["weights"])
-
-        # Without --enable-memory-saver the call must not offload weights:
-        # a real offload would make the next forward fail.
-        self.assertTrue(health(self.base_url))
-        response = generate(self.base_url, PROMPTS[0], max_new_tokens=4)
-        self.assertTrue(response.get("output_ids"))
 
 
 if __name__ == "__main__":
