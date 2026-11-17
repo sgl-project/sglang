@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 use super::app::AppState;
+use super::auth::DeclaredRoute;
 use super::native_api::native_error;
 use crate::api_server::core::{CoreError, FORWARD_PEER_PATH};
 use crate::api_server::handlers::{AbortEnding, ProfileOutcome};
@@ -34,19 +35,19 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
     Router::new()
         // Control-plane: the core performs the typed operation and this
         // adapter renders its result as one non-streamed JSON response.
-        .route("/server_info", get(server_info))
+        .declared_route("/server_info", get(server_info))
         // Static config, no scheduler round-trip. `/get_model_info` (+ `/model_info`
         // alias).
-        .route("/get_model_info", get(model_info))
-        .route("/model_info", get(model_info))
-        .route("/flush_cache", get(flush_cache).post(flush_cache))
-        .route("/weights_checker", get(check_weights).post(check_weights))
-        .route("/start_profile", get(start_profile).post(start_profile))
-        .route("/stop_profile", get(stop_profile).post(stop_profile))
-        .route("/abort_request", post(abort_request))
+        .declared_route("/get_model_info", get(model_info))
+        .declared_route("/model_info", get(model_info))
+        .declared_route("/flush_cache", get(flush_cache).post(flush_cache))
+        .declared_route("/weights_checker", get(check_weights).post(check_weights))
+        .declared_route("/start_profile", get(start_profile).post(start_profile))
+        .declared_route("/stop_profile", get(stop_profile).post(stop_profile))
+        .declared_route("/abort_request", post(abort_request))
         // Listener-to-listener: another DP rank's control request for this
         // rank's scheduler (see `api_server::core::peer`).
-        .route(FORWARD_PEER_PATH, post(forward_control_req))
+        .declared_route(FORWARD_PEER_PATH, post(forward_control_req))
 }
 
 /// `POST /internal/peer` — the body is a control message's wire bytes,
@@ -54,13 +55,20 @@ pub(super) fn routes() -> Router<Arc<AppState>> {
 /// encoded output. Errors are plain text so the relaying side can carry the
 /// message into its own merged error.
 async fn forward_control_req(State(state): State<Arc<AppState>>, body: Bytes) -> Response {
-    // Without an admin key, `HiCacheManager` refuses attach and detach before
-    // relaying them, so only a request sent straight to this route carries
-    // one; refuse it too, or the peer route would bypass that refusal.
+    let Some(routes) = forwarded_tag(&body).and_then(|tag| relayed_by(&tag)) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "not a control message a peer listener relays",
+        )
+            .into_response();
+    };
+    // Without an admin key the forced admin routes refuse before relaying,
+    // so only a request sent straight to this route carries their message;
+    // refuse it too, or the peer route would bypass that refusal.
     if state.server_args.api_keys.admin_api_key.is_none()
-        && forwarded_tag(&body).is_some_and(|tag| HICACHE_ADMIN_TAGS.contains(&tag.as_str()))
+        && routes.iter().copied().any(super::auth::is_admin_force)
     {
-        return super::hicache::admin_key_missing();
+        return super::auth::admin_key_missing();
     }
     match state.core.forward_control_req(body).await {
         Ok(reply) => (
@@ -73,11 +81,31 @@ async fn forward_control_req(State(state): State<Arc<AppState>>, body: Bytes) ->
     }
 }
 
-/// The forwarded control messages of a HiCache attach and detach.
-const HICACHE_ADMIN_TAGS: &[&str] = &[
-    "AttachHiCacheStorageReqInput",
-    "DetachHiCacheStorageReqInput",
+/// Each control message a peer listener relays, with the HTTP routes that fan it
+/// out; a relayed message is held to their levels in `auth_levels.json`.
+const RELAYED_BY: &[(&str, &[&str])] = &[
+    ("AbortReq", &["/abort_request"]),
+    ("GetInternalStateReq", &["/server_info"]),
+    ("FlushCacheReqInput", &["/flush_cache"]),
+    ("CheckWeightsReqInput", &["/weights_checker"]),
+    ("ClearHiCacheReqInput", &["/hicache/storage-backend/clear"]),
+    (
+        "DetachHiCacheStorageReqInput",
+        &["/hicache/storage-backend"],
+    ),
+    (
+        "AttachHiCacheStorageReqInput",
+        &["/hicache/storage-backend"],
+    ),
+    ("ProfileReq", &["/start_profile", "/stop_profile"]),
 ];
+
+fn relayed_by(tag: &str) -> Option<&'static [&'static str]> {
+    RELAYED_BY
+        .iter()
+        .find(|(relayed, _)| *relayed == tag)
+        .map(|(_, routes)| *routes)
+}
 
 /// A forwarded control message's type tag, the first element of its array.
 fn forwarded_tag(body: &[u8]) -> Option<String> {
@@ -512,6 +540,7 @@ mod tests {
                 metrics: None,
                 request_log: None,
                 generate_validator: None,
+                abort_hook: None,
             },
         );
         (
@@ -630,6 +659,7 @@ mod tests {
             "tp_size": 4,
             "max_total_num_tokens": 1,
             "launch_command": "launch --tp-size 4",
+            "instance_id": "stale-launch-instance-id",
         });
         // Gathered in no particular order; published by rank.
         let listeners = ["http://10.0.0.1:30000", "http://[fd00::2]:30000"];
@@ -759,12 +789,13 @@ mod tests {
             .map(String::as_str)
             .collect();
         assert_eq!(
-            keys[..5],
+            keys[..6],
             [
                 "model_path",
                 "tp_size",
                 "max_total_num_tokens",
                 "launch_command",
+                "instance_id",
                 "served_model_name"
             ]
         );
@@ -786,6 +817,14 @@ mod tests {
         assert_eq!(body["max_context_length"], 4096);
         assert_eq!(body["max_total_num_tokens"], 8192);
         assert_eq!(body["version"], "1.2.3");
+        let instance_id = body["instance_id"]
+            .as_str()
+            .expect("HTTP /server_info must carry typed instance_id");
+        assert_ne!(instance_id, "stale-launch-instance-id");
+        assert_eq!(
+            uuid::Uuid::parse_str(instance_id).unwrap().get_version(),
+            Some(uuid::Version::Random)
+        );
         assert_eq!(body["frontend"], "rust");
         assert_eq!(
             body["internal_states"][0]["rust_mm_transport"]["inline_features"],
@@ -1817,52 +1856,110 @@ mod tests {
         assert_eq!(done, "[DONE]");
     }
 
-    /// Without an admin key, the peer route refuses the HiCache attach and
-    /// detach `/hicache/storage-backend` refuses, before they reach the
+    /// Without an admin key, the peer route refuses the operations of the
+    /// forced admin routes, as those routes do, before they reach the
     /// scheduler; other control messages still go through.
     #[tokio::test]
-    async fn peer_route_refuses_hicache_storage_changes_without_an_admin_key() {
-        use crate::message::io_struct::{ControlRequest, DetachHiCacheStorageReqInput};
-        let detach = ControlRequest::DetachHiCacheStorageReqInput(
-            DetachHiCacheStorageReqInput::new("sender-rid".into()),
-        )
-        .encode()
-        .unwrap();
-        let post = |state: Arc<AppState>| {
+    async fn peer_route_refuses_forced_admin_operations_without_an_admin_key() {
+        use crate::message::io_struct::{
+            AttachHiCacheStorageReqInput, CheckWeightsReqInput, ControlRequest,
+            DetachHiCacheStorageReqInput, ProfileReq,
+        };
+        let rid = || "sender-rid".to_string();
+        let forced = [
+            ControlRequest::AttachHiCacheStorageReqInput(AttachHiCacheStorageReqInput::new(
+                rid(),
+                "file".into(),
+                None,
+                None,
+                None,
+            )),
+            ControlRequest::DetachHiCacheStorageReqInput(DetachHiCacheStorageReqInput::new(rid())),
+            ControlRequest::CheckWeightsReqInput(CheckWeightsReqInput::new(
+                rid(),
+                "checksum".into(),
+                false,
+                None,
+                "target".into(),
+                None,
+            )),
+            ControlRequest::ProfileReq(ProfileReq::stop(rid())),
+        ];
+        let post = |state: Arc<AppState>, message: &ControlRequest| {
             routes().with_state(state).oneshot(
                 HttpRequest::builder()
                     .method("POST")
                     .uri(FORWARD_PEER_PATH)
-                    .body(Body::from(detach.clone()))
+                    .body(Body::from(message.encode().unwrap()))
                     .unwrap(),
             )
         };
 
         let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
-        // A relayed detach would wait on the scheduler's reply forever.
-        let response = tokio::time::timeout(std::time::Duration::from_secs(5), post(state))
+        for message in &forced {
+            // A relayed operation would wait on the scheduler's reply forever.
+            let response = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                post(state.clone(), message),
+            )
             .await
             .expect("refused without waiting on the scheduler")
             .unwrap();
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        let body = to_bytes(response.into_body(), 1024).await.unwrap();
-        assert!(
-            String::from_utf8_lossy(&body).contains("requires admin API key"),
-            "{body:?}"
-        );
+            assert_eq!(response.status(), StatusCode::FORBIDDEN, "{message:?}");
+            let body = to_bytes(response.into_body(), 1024).await.unwrap();
+            assert!(
+                String::from_utf8_lossy(&body).contains("requires admin API key"),
+                "{body:?}"
+            );
+        }
         assert!(intake_rx.is_empty(), "refused before the scheduler");
 
         // With an admin key, the relayed detach reaches the scheduler.
         let mut args = ServerArgs::default();
         args.api_keys.admin_api_key = Some("sk-admin".into());
         let (state, intake_rx, _abort_rx) = test_state(args);
-        let response = tokio::spawn(post(state));
+        let response = tokio::spawn(post(state, &forced[1]));
         let TmEvent::Intake { request, admission } = intake_rx.recv_async().await.unwrap() else {
             panic!("the detach must reach the scheduler");
         };
         assert!(admission.try_accept());
         drop(request);
         let _ = response.await;
+    }
+
+    #[test]
+    fn relayed_by_covers_every_control_message() {
+        use crate::message::io_struct::ControlRequest;
+        let mut relayed: Vec<&str> = RELAYED_BY.iter().map(|(tag, _)| *tag).collect();
+        relayed.push("FreezeGCReq");
+        relayed.sort_unstable();
+        let mut tags = ControlRequest::TAGS.to_vec();
+        tags.sort_unstable();
+        assert_eq!(relayed, tags);
+        for route in RELAYED_BY.iter().flat_map(|(_, routes)| *routes) {
+            assert!(super::super::auth::has_level(route), "{route}");
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_route_refuses_a_message_no_listener_relays() {
+        let (state, intake_rx, _abort_rx) = test_state(ServerArgs::default());
+        for tag in ["FreezeGCReq", "UpdateWeightFromDiskReqInput"] {
+            let body = rmp_serde::to_vec(&(tag, "sender-rid", ())).unwrap();
+            let response = routes()
+                .with_state(state.clone())
+                .oneshot(
+                    HttpRequest::builder()
+                        .method("POST")
+                        .uri(FORWARD_PEER_PATH)
+                        .body(Body::from(body))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{tag}");
+        }
+        assert!(intake_rx.is_empty());
     }
 
     /// A forwarded control request reaches the local scheduler under the rid
@@ -1905,13 +2002,14 @@ mod tests {
         assert_eq!(body.as_ref(), b"scheduler-reply");
 
         // A body without a rid cannot be routed back: rejected before intake.
+        let no_rid = rmp_serde::to_vec(&("FlushCacheReqInput", (), ())).unwrap();
         let response = routes()
             .with_state(state)
             .oneshot(
                 HttpRequest::builder()
                     .method("POST")
                     .uri(FORWARD_PEER_PATH)
-                    .body(Body::from(Bytes::from_static(b"\xc0")))
+                    .body(Body::from(no_rid))
                     .unwrap(),
             )
             .await

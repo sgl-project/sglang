@@ -20,7 +20,7 @@ from unittest.mock import MagicMock, patch
 from sglang.srt.managers.scheduler_components.pause_state import PauseState
 from sglang.test.ci.ci_register import register_mlx_ci
 
-register_mlx_ci(est_time=5, suite="stage-a-unit-test-mlx")
+register_mlx_ci(est_time=5, suite="extra-unit-test-mlx")
 
 _IS_APPLE_SILICON = platform.system() == "Darwin" and platform.machine() == "arm64"
 _HAS_MLX = importlib.util.find_spec("mlx") is not None
@@ -368,6 +368,8 @@ class TestRetractPauseDrainsInflightJob(unittest.TestCase):
         scheduler.disaggregation_mode = DisaggregationMode.NULL
         scheduler.chunked_req = None
         scheduler.decode_offload_manager = None
+        scheduler.hisparse_coordinator = None
+        scheduler.dllm_config = None
         scheduler.last_batch = None
         scheduler.waiting_queue = []
         scheduler.result_queue = deque()
@@ -383,7 +385,7 @@ class TestRetractPauseDrainsInflightJob(unittest.TestCase):
         scheduler.pause_generation.side_effect = Scheduler.pause_generation.__get__(
             scheduler
         )
-        scheduler._retract_batch.side_effect = Scheduler._retract_batch.__get__(
+        scheduler._retract_batches.side_effect = Scheduler._retract_batches.__get__(
             scheduler
         )
 
