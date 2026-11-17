@@ -2765,9 +2765,10 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
         )
         self.linker_load_tokens = Counter(
             name="sglang:linker_load_tokens_total",
-            documentation="Tokens loaded from the external store into device KV, by "
-            "load mode: layer_wise loads overlap the forward that uses them, "
-            "prefetch loads complete before admission.",
+            documentation="External-store KV tokens by load mode: layer_wise counts "
+            "tokens accepted for queued loading, including later cancellation "
+            "or failure; prefetch counts tokens successfully published into "
+            "the cache.",
             labelnames=list(labels.keys()) + ["mode"],
         )
         for mode in ("layer_wise", "prefetch"):
@@ -2781,7 +2782,8 @@ class RadixCacheMetricsCollector(_StatLoggerDIMixin):
             name="sglang:linker_failures_total",
             documentation="External store operations that failed, by stage: lookup "
             "(a prefetch lookup raised), load (requests aborted because their "
-            "layer-wise load did not land), offload (writes the store rejected).",
+            "layer-wise load did not land), offload (accepted writes whose "
+            "asynchronous completion failed).",
             labelnames=list(labels.keys()) + ["stage"],
         )
         for stage in ("lookup", "load", "offload"):
