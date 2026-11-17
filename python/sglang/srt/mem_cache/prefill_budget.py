@@ -141,7 +141,9 @@ class PrefillBudget:
     def load_back_scope(self, **kwargs):
         return nullcontext()
 
-    def _available_and_evictable(self):
+    def headroom(self) -> tuple[int, int]:
+        """(allocator-free, cache-evictable) tokens of the pool the scalar
+        budget counts, before any offset."""
         evictable = (
             self.tree_cache.full_evictable_size()
             if self.tree_cache.supports_mamba()
@@ -150,7 +152,10 @@ class PrefillBudget:
         global_available_size = self.allocator.available_size()
         if is_cp_sharded_padded():
             global_available_size = from_cp_sharded(global_available_size)
-        return global_available_size + evictable
+        return global_available_size, evictable
+
+    def _available_and_evictable(self):
+        return sum(self.headroom())
 
     @property
     def remaining_total(self):
@@ -324,16 +329,16 @@ class SWAPrefillBudget(PrefillBudget):
 
         return self.tree_cache.window_evictable_size(BaseSWAKVPool.WINDOW_SUB_POOL)
 
-    def _available_and_evictable(self):
+    def headroom(self) -> tuple[int, int]:
         if self.all_swa:
             global_swa_available_size = self.allocator.swa_available_size()
             if is_cp_sharded_padded():
                 global_swa_available_size = from_cp_sharded(global_swa_available_size)
-            return global_swa_available_size + self._window_evictable()
+            return global_swa_available_size, self._window_evictable()
         global_full_available_size = self.allocator.full_available_size()
         if is_cp_sharded_padded():
             global_full_available_size = from_cp_sharded(global_full_available_size)
-        return global_full_available_size + self.tree_cache.full_evictable_size()
+        return global_full_available_size, self.tree_cache.full_evictable_size()
 
     @property
     def remaining_window_tokens(self):
@@ -598,6 +603,14 @@ class ChainPrefillBudget(PrefillBudget):
             "a budget over a shared memory has no remaining token count; ask "
             "it whether a demand fits"
         )
+
+    def headroom(self) -> tuple[int, int]:
+        # Owner (FULL) tokens, an observe-only estimate: admission asks demands
+        # (`_fits`); only the head-prefix pin's capacity gate reads this.
+        available = self.allocator.full_available_size()
+        if is_cp_sharded_padded():
+            available = from_cp_sharded(available)
+        return available, self.tree_cache.full_evictable_size()
 
     def request_demand(
         self,

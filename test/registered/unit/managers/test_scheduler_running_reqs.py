@@ -430,6 +430,7 @@ class TestRunningReqsHooks(CustomTestCase):
         s._set_or_validate_priority = Mock(return_value=True)
         s._abort_on_queued_limit = Mock(return_value=False)
         s._prefetch_kvcache = Mock()
+        s.head_prefix_lock = None
 
         new_batch, _ = s._get_new_batch_prefill_raw(None, running_batch)
 
