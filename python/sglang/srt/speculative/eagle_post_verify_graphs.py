@@ -38,6 +38,34 @@ _MAX_POST_VERIFY_STATES = envs.SGLANG_POST_VERIFY_MAX_GRAPH_KEYS.get()
 _ONE_LAUNCH_LOAD = envs.SGLANG_OPT_SPEC_POST_VERIFY_ONE_LAUNCH_LOAD.get()
 
 
+# Arbitrary headroom for the body's large temporaries besides its two sampling buffers.
+_PRESIZE_MARGIN = 64 << 20
+
+
+def pool_presize_bytes(
+    *, max_requests: int, tokens_per_request: int, vocab: int, free_bytes: int
+) -> int:
+    """Two fp32 [requests * tokens, vocab] sampling buffers plus a margin; 0 (the pool
+    grows per key) without 1 GiB to spare."""
+    nbytes = 2 * max_requests * tokens_per_request * vocab * 4 + _PRESIZE_MARGIN
+    if free_bytes < nbytes + (1 << 30):
+        logger.warning(
+            "The post-verify graph pool is not presized: %.2f GiB free for %.2f GiB",
+            free_bytes / 2**30,
+            nbytes / 2**30,
+        )
+        return 0
+    logger.info(
+        "The post-verify graph pool is presized to %.2f GiB (%d requests x %d tokens, "
+        "vocab %d)",
+        nbytes / 2**30,
+        max_requests,
+        tokens_per_request,
+        vocab,
+    )
+    return nbytes
+
+
 class EaglePostVerifyGraphs:
     """The verify's post-section in SGLang's own CUDA graphs, one set per key: batch
     size, sampling mode, forced acceptance, tracking and the verify logits buffer."""
@@ -58,6 +86,9 @@ class EaglePostVerifyGraphs:
             commit=self._commit,
             sim_rng=simulated_acc_len_rng,
         )
+        # A private pool never returns segments: the first sampled capture takes and frees
+        # the largest key's scratch, so later keys split that segment.
+        self._graphs.presize = self._pool_presize_bytes
 
     def run(
         self,
@@ -115,6 +146,16 @@ class EaglePostVerifyGraphs:
         """Order the current stream after the last side-stream mamba state commit; the
         worker calls it once the draft extend is enqueued."""
         self._graphs.join()
+
+    def _pool_presize_bytes(self, slot: SimpleNamespace) -> int:
+        torch.cuda.empty_cache()  # so the free reading counts cached blocks
+        graph_sizes = self._target_worker.model_runner.decode_cuda_graph_capture_bs
+        return pool_presize_bytes(
+            max_requests=max([slot.num_requests, *graph_sizes]),
+            tokens_per_request=slot.tokens_per_request,
+            vocab=slot.logits.shape[-1],
+            free_bytes=torch.cuda.mem_get_info()[0],
+        )
 
     def _key(
         self,
@@ -334,6 +375,8 @@ class _PostVerifyGraphs:
         self._sim_rng = sim_rng
         self._states: dict[tuple, SimpleNamespace] = {}
         self._pool = None
+        # slot -> bytes the first sampled key's capture takes and frees
+        self.presize: Optional[Callable] = None
         self._side_stream = self._main_done = self._commit_done = None
         self._commit_pending = False
         # The host runs up to ~2 rounds ahead; a pinned slot is rewritten only after
@@ -461,6 +504,10 @@ class _PostVerifyGraphs:
             self._pool = torch.cuda.graph_pool_handle()
             self._side_stream = torch.cuda.Stream()
             self._main_done, self._commit_done = torch.cuda.Event(), torch.cuda.Event()
+        presize = 0
+        if self.presize is not None and not slot.is_all_greedy:
+            # once, at the first sampled key: a greedy body needs no sampling scratch
+            presize, self.presize = self.presize(slot), None
         graph = torch.cuda.CUDAGraph()
         with graph_capture(stream=torch.cuda.current_stream()) as ctx:
             with torch.cuda.graph(
@@ -469,6 +516,11 @@ class _PostVerifyGraphs:
                 stream=ctx.stream,
                 capture_error_mode="thread_local",
             ):
+                if presize:  # one segment for the largest key; later keys split it
+                    scratch = torch.empty(
+                        presize, dtype=torch.uint8, device=slot.device
+                    )
+                    del scratch
                 outputs = self._body(slot)
         # Captured after the main graph in the same pool and replayed after it.
         commit_graph = torch.cuda.CUDAGraph()
