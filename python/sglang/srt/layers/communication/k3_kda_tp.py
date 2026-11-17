@@ -167,6 +167,13 @@ def _fast_collectives():
     return k3_sp_collective.tp_group_state()
 
 
+def _fits_symm_buffer(total_rows: int) -> bool:
+    from sglang.srt.layers.communication import k3_ar_fusion
+
+    # The K3 symmetric buffers hold one chunk; a DP-gathered prefill can exceed it.
+    return total_rows <= k3_ar_fusion._max_buffer_rows()
+
+
 def all_gather_rows(x: torch.Tensor, rows: int) -> torch.Tensor:
     # May return a persistent buffer that the next KDA TP all-gather overwrites.
     from sglang.srt.layers.communication import k3_sp_collective
@@ -178,7 +185,7 @@ def all_gather_rows(x: torch.Tensor, rows: int) -> torch.Tensor:
         x = torch.nn.functional.pad(x, (0, 0, 0, rows - x.shape[0]))
     x = x.contiguous()
     state = _fast_collectives()
-    if state is not None and rows > 0:
+    if state is not None and 0 < rows and _fits_symm_buffer(g.world_size * rows):
         out = k3_sp_collective.all_gather(
             x, state=state, buffer_name="kda_tp_all_gather"
         )
@@ -195,7 +202,7 @@ def o_proj_output(
     from sglang.srt.layers.communication import k3_sp_collective
 
     state = _fast_collectives()
-    if state is None or total_rows == 0:
+    if state is None or total_rows == 0 or not _fits_symm_buffer(total_rows):
         return None
     if not k3_sp_collective.requires_symmetric_rs(
         total_rows,
@@ -216,7 +223,7 @@ def reduce_scatter_rows(y: torch.Tensor, local_rows: int) -> torch.Tensor:
     g = group()
     rows = y.shape[0] // g.world_size
     state = _fast_collectives()
-    if state is not None and rows > 0:
+    if state is not None and rows > 0 and _fits_symm_buffer(y.shape[0]):
         out = k3_sp_collective.reduce_scatter_res(y, None, state=state)
         if out is not None:
             return out[:local_rows]
