@@ -8,6 +8,7 @@ import unittest
 import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cuda_ci(est_time=36, stage="base-b", runner_config="1-gpu-large")
 
@@ -62,6 +63,49 @@ class TestHopperBf16Gemv(unittest.TestCase):
         self.assertFalse(use_hopper_bf16_gemv(1, 5120, 6000))
         self.assertFalse(use_hopper_bf16_gemv(1, 248320, 5120))
         self.assertFalse(use_hopper_bf16_gemv(1, 16384, 5120))
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.cuda.get_device_capability() == (12, 0),
+    "Qwen3.5 bf16 GEMV extensions require an SM120 GPU",
+)
+class TestSm120Bf16Gemv(CustomTestCase):
+    SHAPES = (
+        (18432, 2560),  # MLP gate/up
+        (12288, 2560),  # GDN QKVZ
+        (248320, 2560),  # LM head
+    )
+
+    def test_qwen35_shapes(self):
+        from sglang.kernels.ops.gemm.hopper_bf16_gemv import hopper_bf16_gemv
+
+        for n, k in self.SHAPES:
+            with self.subTest(n=n, k=k):
+                torch.manual_seed(0)
+                x = torch.randn(1, k, dtype=torch.bfloat16, device="cuda")
+                w = torch.randn(n, k, dtype=torch.bfloat16, device="cuda") * 0.05
+                out = hopper_bf16_gemv(x, w)
+                self.assertEqual(out.shape, (1, n))
+                self.assertEqual(out.dtype, torch.bfloat16)
+                self.assertEqual(out.device, x.device)
+                self.assertTrue(torch.isfinite(out).all().item())
+                # Chunk the FP64 reference to bound memory for the LM head.
+                for start in range(0, n, 2048):
+                    ref = x.double() @ w[start : start + 2048].double().t()
+                    torch.testing.assert_close(
+                        out[:, start : start + 2048].double(),
+                        ref,
+                        rtol=2**-8,
+                        atol=1e-3,
+                    )
+
+    def test_qwen35_predicate(self):
+        from sglang.kernels.ops.gemm.hopper_bf16_gemv import use_hopper_bf16_gemv
+
+        for n, k in self.SHAPES:
+            with self.subTest(n=n, k=k):
+                self.assertTrue(use_hopper_bf16_gemv(1, n, k))
+                self.assertFalse(use_hopper_bf16_gemv(2, n, k))
 
 
 if __name__ == "__main__":
