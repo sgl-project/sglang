@@ -109,17 +109,16 @@ unset HTTPS_PROXY
 unset HTTP_PROXY
 unset ASCEND_LAUNCH_BLOCKING
 
-# Use the image's sglang; only overlay the checkout's test utilities.
+# Use the image's sglang; overlay the checkout's test layer so the test
+# utilities match the checked-out test cases (the image's test tools lag).
 sglang_pkg_path=/sgl-workspace/sglang/python
-ascend_test_util_path=${sglang_pkg_path}/sglang/test/ascend
-mkdir -p "${ascend_test_util_path}"
-mv "${ascend_test_util_path}" "${ascend_test_util_path}_bak" 2>/dev/null || true
-cp -r "${sglang_source_path}/python/sglang/test/ascend" "${ascend_test_util_path}"
+test_util_path=${sglang_pkg_path}/sglang/test
+mv "${test_util_path}" "${test_util_path}_bak" 2>/dev/null || true
+cp -r "${sglang_source_path}/python/sglang/test" "${test_util_path}"
 
 # Keep the image-compatible test/ci snapshot, mirroring the single-node stage.
-ci_test_util_path=${sglang_pkg_path}/sglang/test/ci
-if [ -d "${ci_test_util_path}" ]; then mv "${ci_test_util_path}" "${ci_test_util_path}_bak"; fi
-cp -r "${sglang_source_path}/scripts/ci/npu/compat/ci" "${ci_test_util_path}"
+rm -rf "${test_util_path}/ci"
+cp -r "${sglang_source_path}/scripts/ci/npu/compat/ci" "${test_util_path}/ci"
 
 # set environment of cann
 . /usr/local/Ascend/cann/set_env.sh
