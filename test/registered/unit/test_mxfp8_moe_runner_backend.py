@@ -11,7 +11,7 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from sglang.srt.arg_groups.model_override_base import ResolvedView
+from sglang.srt.arg_groups.model_override_base import ResolvedView, resolved_view
 from sglang.srt.arg_groups.overrides import (
     _a2a_backend_overrides,
     _moe_runner_backend_quant_constraints,
@@ -159,7 +159,7 @@ class TestSailMoeA2aBackend(CustomTestCase):
                     # The record keeps what the operator typed; the pass declares
                     # the waterfill rewrite and the hook must accept it.
                     self.assertEqual(args.moe_a2a_backend, backend)
-                    self.assertEqual(ResolvedView(args).moe_a2a_backend, expected)
+                    self.assertEqual(resolved_view(args).moe_a2a_backend, expected)
 
     def test_other_platforms_keep_megamoe(self):
         with override_platform(is_sail=False):
@@ -169,7 +169,7 @@ class TestSailMoeA2aBackend(CustomTestCase):
                 enable_waterfill=True,
             )
             handle_sail_backends(args)
-            self.assertEqual(ResolvedView(args).moe_a2a_backend, "megamoe")
+            self.assertEqual(resolved_view(args).moe_a2a_backend, "megamoe")
 
 
 if __name__ == "__main__":
