@@ -10,12 +10,14 @@ from types import SimpleNamespace
 import torch
 from safetensors.torch import save_file
 
-from sglang.multimodal_gen.configs.models.dits.minimax_h3 import MiniMaxH3DiTArchConfig
+from sglang.multimodal_gen.configs.models.dits.minimax_h3 import (
+    MINIMAX_H3_ADALN_MODALITY_NUM,
+    MiniMaxH3DiTArchConfig,
+)
 from sglang.multimodal_gen.runtime.distributed.parallel_state import (
     maybe_init_distributed_environment_and_model_parallel,
 )
 from sglang.multimodal_gen.runtime.models.dits.minimax_h3_adaln_cache import (
-    MINIMAX_H3_ADALN_MODALITY_NUM,
     MiniMaxH3AdalnCache,
 )
 from sglang.multimodal_gen.runtime.pipelines_core.stages.model_specific_stages.minimax_h3.stages.denoising import (
