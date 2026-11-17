@@ -3278,6 +3278,30 @@ class Scheduler(
             mm_inputs.release_features()
             req.multimodal_inputs = None
 
+    def _reject_unsupported_tail_request(self, req: Req) -> bool:
+        """Return True and abort when a tail-mode request cannot be served."""
+        if not (
+            self.disaggregation_mode != DisaggregationMode.NULL
+            and get_disagg().disaggregation_decode_tail_tokens
+            and (
+                getattr(req, "return_logprob", False)
+                or getattr(req, "return_hidden_states", False)
+                or getattr(req, "return_sampling_mask", False)
+                or getattr(req, "input_embeds", None) is not None
+                or getattr(req, "positional_embed_overrides", None) is not None
+            )
+        ):
+            return False
+        error_msg = (
+            "Invalid request: decode-tail mode does not support logprobs, "
+            "hidden states, sampling-mask returns or explicit embeddings "
+            f"yet. {req.rid=}"
+        )
+        logger.error(error_msg)
+        prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
+        self.request_retirer.retire_unadmitted(req)
+        return True
+
     def _create_generation_req(
         self, recv_req: TokenizedGenerateReqInput, *args, **kwargs
     ) -> Req:
@@ -3392,23 +3416,7 @@ class Scheduler(
 
             if self.disaggregation_mode != DisaggregationMode.NULL:
                 # Invalid request for disaggregated mode
-                if get_disagg().disaggregation_decode_tail_tokens and (
-                    recv_req.return_logprob
-                    or req.return_hidden_states
-                    or req.return_sampling_mask
-                    or req.input_embeds is not None
-                    or req.positional_embed_overrides is not None
-                ):
-                    # Phase 1 of the decode-tail mode: the tail extend runs on
-                    # decode and does not yet wire input-logprob metadata.
-                    error_msg = (
-                        "Invalid request: decode-tail mode does not support logprobs, "
-                        "hidden states, sampling-mask returns or explicit embeddings "
-                        f"yet. {req.rid=}"
-                    )
-                    logger.error(error_msg)
-                    prepare_abort(req, error_msg, status_code=HTTPStatus.BAD_REQUEST)
-                    self.request_retirer.retire_unadmitted(req)
+                if self._reject_unsupported_tail_request(req):
                     return
                 if (
                     recv_req.bootstrap_room is None
@@ -3447,6 +3455,10 @@ class Scheduler(
             if isinstance(req.finished_reason, FINISH_ABORT):
                 self.init_req_max_new_tokens(req)
                 self._add_request_to_queue(req)
+                return
+            # Session turns keep their own return_logprob / sampling-mask
+            # settings, so they must pass the same Phase 1 gate as new reqs.
+            if self._reject_unsupported_tail_request(req):
                 return
 
         else:

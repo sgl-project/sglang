@@ -684,11 +684,25 @@ class SchedulerDisaggregationPrefillMixin:
         if prefetch is None:
             return
         lazy = envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION.get()
+        tail = get_disagg().disaggregation_decode_tail_tokens
         for req in batch.reqs:
             room = getattr(req, "bootstrap_room", None)
             if room is not None and room in kv_mgr.transfer_infos:
-                if lazy and req.extend_end is not None:
-                    prefetch(room, upto_tokens=req.extend_end)
+                upto_tokens = None
+                if tail:
+                    # Reserve only the KV range this request will actually
+                    # send. In tail mode N<=W is a metadata-only handoff; a
+                    # full-size reservation there has no matching transfer and
+                    # would pin a staging slot until the request times out.
+                    upto_tokens = tail_transfer_input_len(
+                        len(req.origin_input_ids),
+                        tail,
+                        is_rebootstrap=req.disagg_rebootstrap,
+                    )
+                elif lazy and req.extend_end is not None:
+                    upto_tokens = req.extend_end
+                if upto_tokens is not None:
+                    prefetch(room, upto_tokens=upto_tokens)
                 else:
                     prefetch(room)
 

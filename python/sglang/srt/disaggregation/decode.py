@@ -206,6 +206,17 @@ def _is_tail_transfer(req: Req) -> bool:
     )
 
 
+def _truncate_to_tail_boundary(req: Req) -> None:
+    """Commit only the KV range the prefill actually transferred."""
+    req.kv.truncate_committed(
+        tail_transfer_input_len(
+            len(req.origin_input_ids),
+            get_disagg().disaggregation_decode_tail_tokens,
+            is_rebootstrap=getattr(req, "disagg_rebootstrap", False),
+        )
+    )
+
+
 def _bootstrap_addr(req: Req) -> str:
     # FIXME: make a property of a req
     return NetworkAddress(req.bootstrap_host, req.bootstrap_port).to_host_port_str()
@@ -1419,6 +1430,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self.token_to_kv_pool_allocator,
                 get_disagg().disaggregation_decode_retraction_backup,
             )
+            # _pre_alloc marks the whole row committed and sets extend_end to
+            # the full prompt. A tail request whose first sample was lost to a
+            # retraction must not re-enter the prebuilt path with that full
+            # committed length; restore the transferred boundary here.
+            if _is_tail_transfer(req):
+                _truncate_to_tail_boundary(req)
 
         move(resumed_reqs, dst)
 
@@ -3483,13 +3500,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             # tokens from a real extend and samples the first token itself,
             # so the prefill's handoff token is dropped here (grammar,
             # penalties and logprobs apply on decode's own sample).
-            req = decode_req.req
-            req.kv.truncate_committed(
-                tail_transfer_input_len(
-                    len(req.origin_input_ids),
-                    get_disagg().disaggregation_decode_tail_tokens,
-                )
-            )
+            _truncate_to_tail_boundary(decode_req.req)
         else:
             if _is_fake_transfer(decode_req.req):
                 committed_output_id = _generate_fake_prefill_handoff_output_id(

@@ -17,6 +17,8 @@ from unittest.mock import patch
 import torch
 
 import sglang.srt.disaggregation.decode_schedule_batch_mixin as mixin_module
+import sglang.srt.disaggregation.prefill as prefill_module
+import sglang.srt.managers.scheduler as scheduler_module
 from sglang.srt.arg_groups import pd_disaggregation_hook
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.configs.nemotron_h import NemotronHConfig
@@ -24,7 +26,7 @@ from sglang.srt.disaggregation import decode as decode_module
 from sglang.srt.disaggregation.decode_schedule_batch_mixin import (
     ScheduleBatchDisaggregationDecodeMixin,
 )
-from sglang.srt.disaggregation.mode import FAKE_BOOTSTRAP_HOST
+from sglang.srt.disaggregation.mode import DisaggregationMode, FAKE_BOOTSTRAP_HOST
 from sglang.srt.disaggregation.utils import pre_alloc_fill_len, tail_transfer_input_len
 from sglang.srt.managers.io_struct import GenerateReqInput, TokenizedGenerateReqInput
 from sglang.srt.managers.schedule_batch import Req, ReqKvInfo
@@ -256,6 +258,145 @@ class PrepareForTailExtendTest(CustomTestCase):
             + (torch.arange(56, 64) + 200).tolist(),
         )
         self.assertEqual(batch.seq_lens_cpu.tolist(), [64, 64])
+
+
+class StagingPrefetchTailBoundaryTest(CustomTestCase):
+    """Staging reservations follow the shortened transfer, including zero."""
+
+    def _prefetch(self, prompt_len, tail, *, rebootstrap=False):
+        seen = []
+        kv_mgr = SimpleNamespace(
+            _prefetch_staging_reqs=lambda room, upto_tokens=None: seen.append(
+                (room, upto_tokens)
+            ),
+            transfer_infos={7: {}},
+        )
+        scheduler = SimpleNamespace(
+            disagg_prefill_bootstrap_queue=SimpleNamespace(kv_manager=kv_mgr)
+        )
+        req = SimpleNamespace(
+            bootstrap_room=7,
+            origin_input_ids=list(range(prompt_len)),
+            disagg_rebootstrap=rebootstrap,
+            extend_end=prompt_len,
+        )
+        with (
+            patch.object(
+                prefill_module,
+                "get_disagg",
+                return_value=SimpleNamespace(disaggregation_decode_tail_tokens=tail),
+            ),
+            patch.object(
+                prefill_module.envs.SGLANG_ENABLE_NV_MEGA_RUNTIME_OPTIMIZATION,
+                "get",
+                return_value=False,
+            ),
+        ):
+            prefill_module.SchedulerDisaggregationPrefillMixin.maybe_prefetch_staging_for_batch(
+                scheduler, SimpleNamespace(reqs=[req])
+            )
+        return seen
+
+    def test_tail_reserves_only_the_transferred_prefix(self):
+        self.assertEqual(self._prefetch(10, 4), [(7, 6)])
+
+    def test_metadata_only_handoff_reserves_no_staging_slot(self):
+        self.assertEqual(self._prefetch(4, 10), [(7, 0)])
+        self.assertEqual(self._prefetch(1, 10), [(7, 0)])
+
+    def test_rebootstrap_reserves_the_full_restored_prefix(self):
+        self.assertEqual(self._prefetch(10, 4, rebootstrap=True), [(7, 10)])
+
+    def test_without_tail_keeps_the_previous_prefetch(self):
+        self.assertEqual(self._prefetch(10, 0), [(7, None)])
+
+
+class TailBoundaryRestoreTest(CustomTestCase):
+    """A retracted tail request resumes with the transferred prefix only."""
+
+    def _req(self, prompt_len, *, output_ids=(), rebootstrap=False):
+        req = SimpleNamespace(
+            rid="resume",
+            origin_input_ids=[42] * prompt_len,
+            output_ids=list(output_ids),
+            disagg_rebootstrap=rebootstrap,
+            kv=ReqKvInfo(req_pool_idx=0),
+        )
+        req.kv.set_row_len(prompt_len)
+        return req
+
+    def _truncate(self, req, tail):
+        with patch.object(
+            decode_module,
+            "get_disagg",
+            return_value=SimpleNamespace(disaggregation_decode_tail_tokens=tail),
+        ):
+            decode_module._truncate_to_tail_boundary(req)
+
+    def test_resume_restores_the_tail_boundary(self):
+        req = self._req(64)
+        req.extend_end = 64
+        self._truncate(req, 8)
+        self.assertEqual(req.kv.kv_committed_len, 56)
+        self.assertEqual(req.kv.kv_allocated_len, 64)
+        self.assertEqual(req.extend_end, 64)
+
+    def test_short_prompt_resume_commits_nothing(self):
+        req = self._req(1)
+        req.extend_end = 1
+        self._truncate(req, 10)
+        self.assertEqual(req.kv.kv_committed_len, 0)
+        self.assertEqual(req.extend_end, 1)
+
+    def test_rebootstrap_resume_keeps_the_full_prefix(self):
+        req = self._req(10, rebootstrap=True)
+        req.extend_end = 10
+        self._truncate(req, 4)
+        self.assertEqual(req.kv.kv_committed_len, 10)
+
+
+class TailIntakeValidationTest(CustomTestCase):
+    """Session turns pass the same Phase 1 gate as ordinary requests."""
+
+    def _validate(self, **attrs):
+        req = SimpleNamespace(rid="chat-1", **attrs)
+        retired = []
+        scheduler = SimpleNamespace(
+            disaggregation_mode=DisaggregationMode.DECODE,
+            request_retirer=SimpleNamespace(retire_unadmitted=retired.append),
+        )
+        with (
+            patch.object(
+                scheduler_module,
+                "get_disagg",
+                return_value=SimpleNamespace(disaggregation_decode_tail_tokens=4),
+            ),
+            patch.object(
+                scheduler_module,
+                "prepare_abort",
+                lambda req, msg, status_code: setattr(req, "abort_msg", msg),
+            ),
+        ):
+            rejected = scheduler_module.Scheduler._reject_unsupported_tail_request(
+                scheduler, req
+            )
+        return rejected, retired, req
+
+    def test_plain_request_is_admitted(self):
+        rejected, retired, _ = self._validate()
+        self.assertFalse(rejected)
+        self.assertEqual(retired, [])
+
+    def test_session_logprob_request_is_rejected(self):
+        rejected, retired, req = self._validate(return_logprob=True)
+        self.assertTrue(rejected)
+        self.assertEqual(retired, [req])
+        self.assertIn("does not support logprobs", req.abort_msg)
+
+    def test_explicit_embedding_request_is_rejected(self):
+        rejected, retired, req = self._validate(input_embeds=[[1.0]])
+        self.assertTrue(rejected)
+        self.assertEqual(retired, [req])
 
 
 if __name__ == "__main__":
