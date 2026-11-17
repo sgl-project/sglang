@@ -89,11 +89,11 @@ class DMTPSelectorGraphs:
         )
         self.graphs, self.outputs, self.checked = {}, {}, set()
         self.last_used = False
+        if not enable_graph:
+            return
         self.initial_signature = self.signature()
         self.done = torch.cuda.Event()
         self.done.record()
-        if not enable_graph:
-            return
         stream = torch.cuda.Stream(device=device)
         stream.wait_stream(torch.cuda.current_stream(device))
         pool = torch.cuda.graph_pool_handle()
@@ -193,6 +193,10 @@ class DMTPSelectorGraphs:
         )
         temperatures = info.temperatures.reshape(-1)[:bs].float().clamp_min(1e-5)
         mask = resolve_greedy_mask(bs=bs, sampling_info=info, device=hidden.device)
+        if hidden.device.type == "npu":
+            # The Ascend worker admits only greedy requests, so no random
+            # draws, CUDA events or graph parity checks are needed.
+            return self._reference(hidden, anchors, temperatures, mask, self.coins[:bs])
         # Broadcast a fresh draw before replay: both TP ranks and the first-use
         # eager reference must consume exactly the same random numbers.
         coins = torch.rand((bs, self.positions), device=hidden.device)

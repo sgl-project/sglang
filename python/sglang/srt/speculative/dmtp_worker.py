@@ -6,6 +6,7 @@ from copy import deepcopy
 from sglang.srt.runtime_context import get_exec, get_parallel, get_schedule
 from sglang.srt.speculative.dflash_worker_v2 import DFlashWorkerV2
 from sglang.srt.speculative.dmtp_runtime import scoped_config, validate_recipe
+from sglang.srt.utils import is_npu
 
 logger = logging.getLogger(__name__)
 
@@ -117,6 +118,11 @@ class DMTPWorkerV2(DFlashWorkerV2):
         return None
 
     def init_cuda_graphs(self):
+        if is_npu():
+            super().init_cuda_graphs()
+            self._mtp_first.native.init_cuda_graphs()
+            self._mtp_first.init_graphs()
+            return
         config = deepcopy(get_exec().graph.cuda_graph_config)
         config.decode.bs = list(range(1, get_schedule().max_running_requests + 1))
         with scoped_config(

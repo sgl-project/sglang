@@ -7,8 +7,10 @@ from contextlib import ExitStack, contextmanager
 from functools import wraps
 
 from sglang.srt.arg_groups.arg_utils import namespace_of
+from sglang.srt.model_executor.cuda_graph_config import cuda_graph_fully_disabled
 from sglang.srt.runtime_context import get_context
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils import is_npu
 
 
 @contextmanager
@@ -28,6 +30,10 @@ def scoped_config(**fields):
         yield
 
 
+def dmtp_attention_backend():
+    return "ascend" if is_npu() else "fa3"
+
+
 def mtp_config(owner):
     return dict(
         speculative_algorithm="EAGLE",
@@ -36,7 +42,7 @@ def mtp_config(owner):
         speculative_eagle_topk=1,
         speculative_num_steps=1,
         speculative_num_draft_tokens=8,
-        speculative_draft_attention_backend="fa3",
+        speculative_draft_attention_backend=dmtp_attention_backend(),
     )
 
 
@@ -50,14 +56,23 @@ def validate_recipe():
     ):
         if cfg(name):
             raise ValueError(f"DMTP does not support {name}")
-    if cfg("page_size") != 1 or cfg("quantization") is not None:
-        raise ValueError("DMTP requires page size 1 and unquantized weights")
+    if cfg("quantization") is not None or (not is_npu() and cfg("page_size") != 1):
+        raise ValueError("DMTP requires unquantized weights and page size 1 on CUDA")
     if cfg("speculative_num_draft_tokens") != 8:
         raise ValueError(
             "DMTP requires eight Target slots, not the checkpoint's DF block size"
         )
-    if cfg("speculative_draft_attention_backend") != "fa3":
-        raise ValueError("DMTP requires FA3 draft attention")
+    backend = dmtp_attention_backend()
+    if cfg("speculative_draft_attention_backend") != backend:
+        raise ValueError(f"DMTP requires the {backend} draft attention backend")
+    if is_npu():
+        if not cuda_graph_fully_disabled() or not cfg("disable_overlap_schedule"):
+            raise ValueError(
+                "Ascend DMTP requires decode/prefill graphs and overlap scheduling "
+                "to be disabled"
+            )
+        if cfg("enable_hierarchical_cache") or cfg("disaggregation_mode") != "null":
+            raise ValueError("Ascend DMTP requires a local KV cache without HiCache")
     capacity = cfg("max_running_requests")
     if capacity is None or not 1 <= capacity <= 32:
         raise ValueError("DMTP requires an explicit request capacity in 1..32")

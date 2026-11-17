@@ -43,7 +43,7 @@ class SkipMaskTests(unittest.TestCase):
             draft_slots=8,
             fused_mask=True,
         )
-        lengths = SimpleNamespace(is_cuda=True)
+        lengths = SimpleNamespace(is_cuda=True, device=SimpleNamespace(type="cuda"))
         with patch.dict("sys.modules", {module.__name__: module}):
             with patch.dict(os.environ, SGLANG_DMTP_FA3_SKIP_DENSE_MASK="0"):
                 self.assertIs(env["mask"](owner, lengths), sentinel)

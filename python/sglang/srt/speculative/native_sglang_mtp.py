@@ -11,20 +11,20 @@ import torch
 from sglang.srt.arg_groups.overrides import declare_resolution
 from sglang.srt.distributed import get_tp_group
 from sglang.srt.managers.tp_worker import TpModelWorker
-from sglang.srt.model_executor.forward_batch_info import (
-    CaptureHiddenMode,
-    ForwardBatch,
-    ForwardMode,
-)
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+from sglang.srt.model_executor.forward_mode import CaptureHiddenMode, ForwardMode
 from sglang.srt.speculative.dmtp_runtime import mtp_config, scoped_config
 from sglang.srt.speculative.mtp_append_pack import scatter_commit_mapping
 from sglang.srt.speculative.mtp_hidden_only import HiddenOnlyLogitsProcessor
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+from sglang.srt.utils import is_npu
 
 
 class NativeSGLangMTP:
     def __init__(self, owner):
-        self.graph_requested = os.getenv("SGLANG_MTP_PREFIX_MTP_GRAPH", "0") == "1"
+        self.graph_requested = (
+            not is_npu() and os.getenv("SGLANG_MTP_PREFIX_MTP_GRAPH", "0") == "1"
+        )
         self.graph_implementation = os.getenv(
             "SGLANG_MTP_PREFIX_MTP_GRAPH_IMPL", "native_bridge"
         )
@@ -36,15 +36,16 @@ class NativeSGLangMTP:
         self.graph_audit_count = 0
         self.owner = owner
         args = deepcopy(owner.server_args)
-        declare_resolution(args, "dmtp_private_mtp", **mtp_config(owner))
-        with scoped_config(**mtp_config(owner)):
+        config = mtp_config(owner)
+        declare_resolution(args, "dmtp_private_mtp", **config)
+        with scoped_config(**config):
             self.worker = TpModelWorker(
                 server_args=args,
                 gpu_id=owner.gpu_id,
                 nccl_port=owner.nccl_port,
                 is_draft_worker=True,
                 context_length=owner.model_runner.model_config.context_len,
-                draft_attention_backend="fa3",
+                draft_attention_backend=config["speculative_draft_attention_backend"],
                 random_seed=owner.target_worker.random_seed,
             )
         target = owner.target_worker.model_runner.model
@@ -97,6 +98,14 @@ class NativeSGLangMTP:
     def init_attention_backends(self):
         with scoped_config(**mtp_config(self.owner)):
             self.worker.init_attention_backends()
+        if is_npu():
+            from sglang.srt.hardware_backend.npu.attention.dmtp_attention import (
+                install_dmtp_attention,
+            )
+
+            install_dmtp_attention(
+                self.worker.model_runner.attn_backend, draft_block=False
+            )
 
     def init_cuda_graphs(self):
         with scoped_config(**mtp_config(self.owner)):
@@ -135,7 +144,7 @@ class NativeSGLangMTP:
         *,
         continuation=False,
         prepared=None,
-        request_ids=None
+        request_ids=None,
     ):
         count = tokens.numel()
         if (
@@ -333,6 +342,9 @@ class NativeSGLangMTP:
             ].long()
             pool = self.worker.model_runner.token_to_kv_pool
             keys, values = pool.get_kv_buffer(pool.start_layer)
+            # Ascend may expose [page, token, head, dim] views of the KV pool.
+            keys = keys.view(-1, *keys.shape[-2:])
+            values = values.view(-1, *values.shape[-2:])
             keys.index_copy_(0, dst, keys[src])
             values.index_copy_(0, dst, values[src])
             own[req_indices.long(), torch.tensor(prefixes, device=own.device) - 1] = (

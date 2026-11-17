@@ -9,6 +9,7 @@ import torch
 
 from sglang.srt.speculative.mtp_prefix_mask import build_full_prefix_mask
 from sglang.srt.speculative.native_sglang_mtp import NativeSGLangMTP
+from sglang.srt.utils import is_npu
 
 
 @dataclass
@@ -24,6 +25,13 @@ class RequestState:
 class MTPFirstController:
     @staticmethod
     def configure_attention(backend):
+        if is_npu():
+            from sglang.srt.hardware_backend.npu.attention.dmtp_attention import (
+                install_dmtp_attention,
+            )
+
+            install_dmtp_attention(backend, draft_block=True)
+            return
         if getattr(backend, "fa_impl_ver", None) == 3:
             from sglang.srt.speculative.mtp_anchor_fa3 import AnchorFA3Forward
 
@@ -56,8 +64,6 @@ class MTPFirstController:
                 "MTP-first requires 1..32 requests, "
                 "no quantization; compact draft KV parity is not yet validated"
             )
-        if args.speculative_draft_attention_backend != "fa3":
-            raise ValueError("FA3 alignment runtime requires FA3 draft attention")
         if float(os.getenv("SGLANG_SIMULATE_ACC_LEN", "0")) > 0:
             raise ValueError("MTP-first must not use mock acceptance")
         self.draft_slots = 8
@@ -74,9 +80,6 @@ class MTPFirstController:
         validate_mtp_target(config)
         self.vocab_size = getattr(config, "text_config", config).vocab_size
         self.head = target.lm_head
-        self.generator = torch.Generator(device=self.head.weight.device).manual_seed(
-            args.random_seed + 101
-        )
         self.native = NativeSGLangMTP(worker)
         self.final_hidden = None
         # This allocation must not move after graph capture. The copy in the
@@ -109,7 +112,7 @@ class MTPFirstController:
             Path(self.trace_dir).mkdir(parents=True, exist_ok=True)
 
     def init_graphs(self):
-        if self.native.bridge is None:
+        if not is_npu() and self.native.bridge is None:
             raise ValueError("T1 residual requires the native MTP bridge")
         from sglang.srt.speculative.dmtp_selector_graph import DMTPSelectorGraphs
 
@@ -117,6 +120,9 @@ class MTPFirstController:
         self.t1_selector = DMTPSelectorGraphs(self, t1=True, enable_graph=enabled)
         self.tail_selector = DMTPSelectorGraphs(self, t1=False, enable_graph=enabled)
         self.conditioner_graphs = None
+        self.t1_combined = None
+        if is_npu():
+            return
         if os.getenv("SGLANG_MTP_PREFIX_CONDITIONER_GRAPH", "0") == "1":
             from sglang.srt.speculative.mtp_conditioner_graph import ConditionerGraphs
 
@@ -125,7 +131,6 @@ class MTPFirstController:
                 module, self.worker.server_args.max_running_requests, owner=self
             )
             module.forward = self.conditioner_graphs.run
-        self.t1_combined = None
         if os.getenv("SGLANG_MTP_PREFIX_HEAD_CONDITIONER_GRAPH", "0") == "1":
             if self.conditioner_graphs is None:
                 raise ValueError(
@@ -175,7 +180,8 @@ class MTPFirstController:
 
     def alloc_hidden_cache(self):
         pool = self.native.worker.model_runner.token_to_kv_pool
-        rows = pool.get_key_buffer(pool.start_layer).shape[0]
+        keys = pool.get_key_buffer(pool.start_layer)
+        rows = keys.view(-1, *keys.shape[-2:]).shape[0]
         self.target_hidden_cache = torch.empty(
             (rows, self.final_buffer.shape[1]),
             device=self.final_buffer.device,
@@ -186,6 +192,8 @@ class MTPFirstController:
         info = batch.sampling_info
         if info is None:
             raise ValueError("MTP-first needs explicit sampling info")
+        if is_npu() and not info.is_all_greedy:
+            raise ValueError("Ascend DMTP currently requires greedy decoding")
         penalizer = info.penalizer_orchestrator
         if (
             info.need_min_p_sampling
@@ -324,7 +332,21 @@ class MTPFirstController:
     @torch.no_grad()
     def t1(self, batch, block_ids):
         self.prepared_embeds = None
-        return self.native.bridge.t1(batch, block_ids)
+        if not is_npu():
+            return self.native.bridge.t1(batch, block_ids)
+        self.graph_used = {}
+        self.eager_reqs = batch.req_pool_indices.tolist()
+        self.eager_prefixes = batch.seq_lens.tolist()
+        states = [self.states[req] for req in self.eager_reqs]
+        if any(
+            (state.anchor, state.token) != (prefix, token)
+            for state, prefix, token in zip(
+                states, self.eager_prefixes, block_ids[:, 0].tolist(), strict=True
+            )
+        ):
+            raise ValueError("DMTP request state does not match its pending anchor")
+        self.hidden = torch.stack([state.hidden for state in states])
+        self.prepare_t1(block_ids)
 
     @torch.no_grad()
     def proposal(self, draft_hidden, block_ids, positions):
@@ -352,6 +374,11 @@ class MTPFirstController:
         next_positions,
         cache_locations,
     ):
+        if is_npu():
+            self.commit_eager(
+                candidates, accept_len, bonus, next_positions, cache_locations
+            )
+            return
         return self.native.bridge.commit(
             candidates,
             accept_len,
@@ -361,7 +388,52 @@ class MTPFirstController:
             cache_locations,
         )
 
+    def commit_eager(
+        self, candidates, accept_len, bonus, next_positions, cache_locations
+    ):
+        from sglang.srt.speculative.dmtp_eager import pack_eager_commit
+
+        lengths = (accept_len + 1).tolist()
+        positions = next_positions.tolist()
+        if any(
+            prefix + count != position
+            for prefix, count, position in zip(
+                self.eager_prefixes, lengths, positions, strict=True
+            )
+        ):
+            raise ValueError(
+                "DMTP commit lengths do not match the new anchor positions"
+            )
+        hidden = self.target_hidden(candidates.numel()).reshape(*candidates.shape, -1)
+        tokens, rows, slots, last_rows = pack_eager_commit(
+            candidates, bonus, hidden, cache_locations, lengths
+        )
+        req_indices = torch.tensor(
+            self.eager_reqs, device=tokens.device, dtype=torch.long
+        )
+        updated = self.native.append(
+            tokens,
+            rows,
+            req_indices,
+            slots,
+            self.eager_prefixes,
+            lengths,
+            continuation=True,
+        )
+        self.target_hidden_cache.index_copy_(0, slots.long(), rows)
+        for req, position, token, row in zip(
+            self.eager_reqs, positions, bonus.tolist(), last_rows, strict=True
+        ):
+            state = self.states[req]
+            state.anchor = position
+            state.token = token
+            state.hidden = updated[row].clone()
+        self.graph_used["mtp_append"] = False
+        self.final_hidden = None
+
     def mask(self, seq_lens):
+        if seq_lens.device.type == "npu":
+            return None
         if os.getenv("SGLANG_DMTP_FA3_SKIP_DENSE_MASK", "0") == "1":
             from sglang.srt.speculative.mtp_anchor_fa3 import AnchorFA3Forward
 
