@@ -1,4 +1,5 @@
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import torch
@@ -376,6 +377,90 @@ class TestMtpVerifyHookSignature(CustomTestCase):
                 f"{rel}:{lineno} {self.HOOK} is missing {sorted(missing)}; "
                 "the spec workers call this hook by keyword.",
             )
+
+
+def _commit_inputs():
+    return dict(
+        checkpoint_state=torch.zeros(1, 1, 1, 128, 128, dtype=torch.bfloat16),
+        d_cache=torch.zeros(1, 1, 1, 16, 128, dtype=torch.bfloat16),
+        k_cache=torch.zeros(1, 1, 1, 16, 128, dtype=torch.bfloat16),
+        g_cache=torch.zeros(1, 1, 1, 16),
+        d_residual_cache=None,
+        k_residual_cache=None,
+        state_batch_indices=torch.zeros(1, dtype=torch.int64),
+        replay_indices=torch.zeros(1, dtype=torch.int64),
+        write_pos=torch.zeros(1, dtype=torch.int32),
+        cache_base=torch.zeros(1, dtype=torch.int32),
+        is_flush=torch.zeros(1, dtype=torch.int8),
+        accept_lens=torch.ones(1, dtype=torch.int32),
+    )
+
+
+class TestGdnTiledCommitDispatch(CustomTestCase):
+    def test_supported_shapes_launch_the_tiled_commit(self):
+        from sglang.kernels.ops.attention.linear import (
+            gdn_replayssm_spec_decode as replay,
+        )
+
+        for tiled in (False, True):
+            with (
+                self.subTest(tiled=tiled),
+                patch.object(replay, "_use_tiled_commit", return_value=tiled),
+                patch.object(
+                    replay, "_finish_gdn_replayssm_circular_fold_kernel", MagicMock()
+                ) as finish,
+                patch.object(
+                    replay, "gdn_replayssm_compact_commit_kernel", MagicMock()
+                ) as stock,
+                patch.object(
+                    replay, "gdn_replayssm_compact_commit_tiled_kernel", MagicMock()
+                ) as tiled_kernel,
+            ):
+                replay.commit_gdn_replayssm_circular(**_commit_inputs())
+                self.assertEqual(tiled_kernel.__getitem__.call_count, int(tiled))
+                self.assertEqual(stock.__getitem__.call_count, int(not tiled))
+                self.assertEqual(finish.__getitem__.call_count, 1)
+                launched = tiled_kernel if tiled else stock
+                kw = launched.__getitem__.return_value.call_args.kwargs
+                self.assertEqual(
+                    (kw["STRIDE_WP"], kw["STRIDE_CB"], kw["STRIDE_FL"]), (1, 1, 1)
+                )
+                if tiled:  # 32-row V tiles, one row per request
+                    grid = tiled_kernel.__getitem__.call_args.args[0]
+                    self.assertEqual(grid[:2], (128 // 32, 1))
+
+    def test_tiled_commit_needs_enough_programs_per_sm(self):
+        from sglang.kernels.ops.attention.linear import (
+            gdn_replayssm_spec_decode as replay,
+        )
+
+        # Qwen3.8 at TP1 and TP4: 36 GDN layers, 16 / 4 key and 48 / 12 value heads.
+        ring = SimpleNamespace(
+            dtype=torch.bfloat16, is_cuda=True, device=SimpleNamespace(index=0)
+        )
+        # 4 V tiles x B x 36 * HV / 4 programs against 16 per SM, 4 with track rows
+        cases = (
+            (16, 48, False, ((1, False), (2, True), (64, True))),
+            (16, 48, True, ((1, True), (64, True))),
+            (4, 12, False, ((4, False), (8, True))),
+            (4, 12, True, ((1, False), (2, True))),
+        )
+        with (
+            patch.object(torch.version, "hip", None),
+            patch.object(replay, "_sm_count", return_value=212),
+        ):
+            for H, HV, track, batches in cases:
+                state = SimpleNamespace(
+                    dtype=torch.bfloat16, shape=(36, 8, HV, 128, 128)
+                )
+                for batch, tiled in batches:
+                    self.assertEqual(
+                        replay._use_tiled_commit(
+                            state, ring, ring, H, HV, 128, 128, batch, track
+                        ),
+                        tiled,
+                        (H, HV, track, batch),
+                    )
 
 
 if __name__ == "__main__":
