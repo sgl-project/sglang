@@ -3936,6 +3936,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             self.elastic_scale_phase = "failed"
             self.elastic_last_error = msg.error
             self.elastic_retired_ranks = []
+            old_worker_count = self.elastic_worker_count
             # Retirees may exit before a shrink fails; never fan out to departed ranks.
             if msg.effective_ep_size and msg.effective_ep_size != self._elastic_ep_size:
                 logger.warning(
@@ -3948,6 +3949,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                     msg.effective_ep_size, self.attn_replica_size
                 )
                 self.update_control_communicator_fan_out(self.elastic_worker_count)
+            # The DPC still holds the retiring slots out of routing; release them.
+            if self.elastic_worker_count < old_worker_count:
+                # Ranks left before the failure: retire their slots instead.
+                self._dispatch_to_scheduler(
+                    ElasticScaleUpdateReq(
+                        success=False,
+                        effective_ep_size=msg.effective_ep_size,
+                        slot_offset=self.elastic_worker_count,
+                        slot_count=old_worker_count - self.elastic_worker_count,
+                        direction="shrink",
+                        error=msg.error,
+                    )
+                )
+            else:
+                self._clear_elastic_draining()
             self._open_elastic_shrink_gate()
             return
 

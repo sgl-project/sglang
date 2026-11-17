@@ -279,16 +279,27 @@ class DataParallelController:
         if get_observability().enable_metrics:
             start_cpu_monitor_thread("data_parallel_controller")
 
+    def _send_to_worker(self, slot: int, obj) -> None:
+        if slot not in self._draining_slots:
+            sock_send(self.workers[slot], obj)
+            return
+        # A retiree exits before the DPC learns it left, and a blocking send to its
+        # peerless PUSH socket would wedge this loop. A live peer never refuses
+        # (SNDHWM=0), so only a departed retiree's message is dropped.
+        try:
+            sock_send(self.workers[slot], obj, flags=zmq.NOBLOCK)
+        except zmq.Again:
+            logger.debug("[DPC] retiring slot %d has left; dropped %s", slot, type(obj))
+
     def send_to_all_workers(self, obj):
         for i, worker in enumerate(self.workers):
             if worker is not None and self.status[i]:
-                sock_send(worker, obj)
+                self._send_to_worker(i, obj)
 
     def send_control_message(self, obj):
         for i in self._active_workers[:: self.control_message_step]:
-            worker = self.workers[i]
-            if worker is not None:
-                sock_send(worker, obj)
+            if self.workers[i] is not None:
+                self._send_to_worker(i, obj)
 
     def update_active_ranks(self, ranks: ActiveRanksOutput):
         if len(ranks.status) != self.max_dp_size:
@@ -362,7 +373,7 @@ class DataParallelController:
     def _dispatch_elastic_scale_update(self, msg: ElasticScaleUpdateReq) -> None:
         # Terminal either way: the slots are gone, or the shrink failed and they stay.
         self._draining_slots = set()
-        # The tokenizer drops failure reports before dispatch; they carry no slots.
+        # A failure reaches here only when ranks departed; it carries their slots.
         if msg.direction == "shrink":
             self.remove_elastic_workers(msg.slot_offset, msg.slot_count)
         else:
@@ -894,7 +905,8 @@ class DataParallelController:
         if self.maybe_external_dp_rank_routing(req):
             return
 
-        active = self._active_workers
+        # Not a retiring slot: its scheduler may exit before the DPC learns it left.
+        active = self._routable_workers()
         if not active:
             raise RuntimeError("No active DP workers are available for health checks.")
 
@@ -912,6 +924,7 @@ class DataParallelController:
                 rank < 0
                 or rank >= len(self.workers)
                 or rank not in self._active_workers
+                or rank in self._draining_slots
                 or self.workers[rank] is None
             ):
                 raise DPRoutingUnavailable(f"DP rank {rank} is not active.")

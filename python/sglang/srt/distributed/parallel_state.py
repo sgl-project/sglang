@@ -2431,6 +2431,7 @@ def _create_global_tcp_store(
     world_size: int,
     dist_init_addr: Optional[str] = None,
     allow_dynamic_membership: bool = False,
+    required: bool = False,
 ) -> None:
     """Create a global TCPStore for coordination across ranks.
 
@@ -2486,6 +2487,14 @@ def _create_global_tcp_store(
             is_master,
         )
     except Exception as e:
+        if required:
+            # Running on without it splits the cohort: peers may reach another
+            # deployment's store on the same port and mix barrier and map keys.
+            raise RuntimeError(
+                f"Failed to create the global TCPStore at {master_ip}:"
+                f"{base_store_port} ({e}); Elastic EP scaling needs it. If another "
+                "deployment holds the port, set SGLANG_TCP_STORE_PORT."
+            ) from e
         logger.warning(
             "Failed to create global TCPStore at %s:%d: %s. "
             "Components requiring TCPStore (like NIXL) may not work.",
@@ -2563,14 +2572,13 @@ def init_distributed_environment(
 
         # Global TCPStore for NIXL and for the elastic-EP cohort barriers.
         if moe_a2a_backend == "nixl" or backend == "mooncake":
+            scalable = max_world_size is not None and max_world_size > world_size
             _create_global_tcp_store(
                 rank,
                 world_size,
                 dist_init_addr=distributed_init_method,
-                allow_dynamic_membership=(
-                    recovered_rank
-                    or (max_world_size is not None and max_world_size > world_size)
-                ),
+                allow_dynamic_membership=recovered_rank or scalable,
+                required=backend == "mooncake" and scalable,
             )
 
     # set the local rank

@@ -661,9 +661,10 @@ def assert_shrink_supported() -> None:
             "ranks as DP slots. Retiring whole logical replicas is not implemented yet",
         ),
         (
-            # The launch hook's "scalable" predicate.
-            parallel.max_ep_size is not None,
-            "--max-ep-size. Without it this deployment "
+            # Set only under the launch hook's "scalable" predicate (max_ep_size >
+            # tp_size); without it the expert map cannot be rebuilt at a smaller width.
+            parallel.elastic_ep_initial_size is not None,
+            "--max-ep-size larger than --tp-size. Without it this deployment "
             "was launched as fault-tolerance only, and the launch checks were relaxed "
             "on the understanding that it never retires a rank",
         ),
