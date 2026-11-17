@@ -162,8 +162,13 @@ class PrefillBudget:
         return 0
 
     def admission_capacity(self) -> tuple[int, ...] | None:
-        """Free plus evictable tokens left after this pass's admissions, which
-        a refused request waits on; None retries admission every round."""
+        """Cache only global exhaustion; candidate-specific refusals must retry.
+
+        Future-token reserves and prefix hits can improve without physical
+        capacity growing. CP padding may also admit at zero fresh capacity.
+        """
+        if is_cp_sharded_padded() or self.remaining_current > 0:
+            return None
         return (self.remaining_current,)
 
     def has_capacity(self) -> bool:
@@ -333,9 +338,9 @@ class SWAPrefillBudget(PrefillBudget):
         return global_full_available_size + self.tree_cache.full_evictable_size()
 
     def admission_capacity(self) -> tuple[int, ...] | None:
-        # Running decodes free window rows mid-step and finished backups make
-        # full rows evictable, so either may admit a request refused before.
-        return (self.remaining_current, self.remaining_window_tokens)
+        # Window demand depends on the candidate; only full-pool exhaustion
+        # rules out every ordinary candidate independently of prefix hits.
+        return super().admission_capacity()
 
     @property
     def remaining_window_tokens(self):

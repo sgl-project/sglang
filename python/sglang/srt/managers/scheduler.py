@@ -4508,6 +4508,10 @@ class Scheduler(
             for req in ready_grammar_requests:
                 self._add_request_to_queue(req)
 
+        if self.is_hybrid_swa:
+            # Publish completed reads before deciding whether admission can wait.
+            self.policy.poll_storage_prefetches(self.waiting_queue)
+
         if self.enable_priority_preemption:
             # Reset batch_is_full to try preemption with a prefill adder.
             running_batch.batch_is_full = False
@@ -4571,7 +4575,8 @@ class Scheduler(
         # After the early returns, so a full-batch pass does not scan the queue.
         self._ack_waiting_health_checks()
         # Get priority queue
-        self.policy.poll_storage_prefetches(self.waiting_queue)
+        if not self.is_hybrid_swa:
+            self.policy.poll_storage_prefetches(self.waiting_queue)
         self.waiting_queue.reorder(
             self.policy.calc_priority(
                 self.waiting_queue,
@@ -4712,8 +4717,9 @@ class Scheduler(
                 running_batch.batch_is_full = True
 
             if running_batch.batch_is_full:
-                if not self.enable_priority_preemption or not adder.preempt_to_schedule(
-                    req
+                if (
+                    not self.enable_priority_preemption
+                    or not adder.preempt_to_schedule(req)
                 ):
                     break
 

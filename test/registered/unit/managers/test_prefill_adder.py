@@ -2568,7 +2568,9 @@ class TestPrefillAdder(CustomTestCase):
         # Continuing chunks retain the original host-hit metadata.
         self.assertEqual(req.mamba_host_hit_length, 1)
         next_adder = self.create_adder(self.create_running_batch(), rem_chunk_tokens=4)
-        self.mock_token_allocator.mamba_allocator.schedulable_available_size.return_value = 0
+        self.mock_token_allocator.mamba_allocator.schedulable_available_size.return_value = (
+            0
+        )
         self.assertIsNone(next_adder.add_chunked_req(req))
         self.assertEqual(self._unreserved_state_slots(next_adder), 0)
         self.assertEqual(next_adder.memory_budget.total_offset, 4 + 8 + 1)
@@ -2949,8 +2951,16 @@ class TestPrefillAdder(CustomTestCase):
         budget.current_offset += 1500
         budget.swa_offset += 200
         refused = budget.admission_capacity()
-        self.assertEqual(refused, (500, 100))
-        allocator.full_available_size.return_value = 500
+        self.assertIsNone(refused)
+        # Even without capacity growth, reserve decay or a new/prefix-hit
+        # candidate can fit. Only global physical exhaustion may be cached.
+        self.assertTrue(
+            admission_capacity_grew(refused, allocator, self.mock_tree_cache)
+        )
+        budget.current_offset = 2000
+        refused = budget.admission_capacity()
+        self.assertEqual(refused, (0,))
+        allocator.full_available_size.return_value = 0
         allocator.swa_available_size.return_value = 100
         self.assertFalse(
             admission_capacity_grew(refused, allocator, self.mock_tree_cache)
@@ -2961,7 +2971,7 @@ class TestPrefillAdder(CustomTestCase):
         )
         self.mock_tree_cache.full_evictable_size.return_value = 0
         self.mock_tree_cache.window_evictable_size.return_value = 1
-        self.assertTrue(
+        self.assertFalse(
             admission_capacity_grew(refused, allocator, self.mock_tree_cache)
         )
         self.assertTrue(admission_capacity_grew(None, allocator, self.mock_tree_cache))
