@@ -2,6 +2,7 @@
 
 import unittest
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -49,6 +50,10 @@ class TestDotsOCRLanguageHead(CustomTestCase):
     def setUp(self):
         reset_context()
         self.addCleanup(reset_context)
+        # CPU CI does not enable the CPU engine; keep RoPE on the native path.
+        self.enterContext(
+            patch("sglang.srt.layers.rotary_embedding.base._is_cpu", True)
+        )
         publish(ServerArgs(model_path="dummy", device="cpu"), role="test")
 
     def test_embed_and_head_are_the_weights_the_checkpoint_fills(self):
