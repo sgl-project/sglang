@@ -338,6 +338,12 @@ def prepare_cm_data(namespace, pod_string, run_id=None):
     return data
 
 
+def _stream_pod_logs(process, tag):
+    """Print a streamed pod log, tagging each line with the pod's short name."""
+    for line in iter(process.stdout.readline, ""):
+        print(f"[{tag}] {line.rstrip()}")
+
+
 def monitor_pod_logs(
     kube_job_type, kube_job_prefix_name, namespace, timeout=LOCAL_TIMEOUT
 ):
@@ -348,6 +354,13 @@ def monitor_pod_logs(
         KUBE_JOB_MULTI_PD_SEPARATION: f"{kube_job_prefix_name}-sgl-router-0",
     }
     pod_name = monitor_pod_name.get(kube_job_type)
+
+    # In PD separation the test verdict is printed by the router pod, but the
+    # model servers (and most startup errors) live on the prefill/decode pods.
+    # Stream prefill-0's log as well, tagged per line, so its output is visible.
+    extra_pod_names = []
+    if kube_job_type == KUBE_JOB_MULTI_PD_SEPARATION:
+        extra_pod_names.append(f"{kube_job_prefix_name}-sglang-prefill-0")
 
     # Build kubectl command
     cmd = ["kubectl", "logs", "-f", "-n", namespace, pod_name]
@@ -370,6 +383,7 @@ def monitor_pod_logs(
     metric_pattern = re.compile(r"^\[METRIC\] (\S+)=(\S+)(?: labels=(.*))?$")
 
     process = None
+    extra_log_processes = []
     try:
         # Start kubectl logs process
         process = subprocess.Popen(
@@ -386,6 +400,24 @@ def monitor_pod_logs(
 
         # Use two threads: one for reading logs, one for checking pod status
         import threading
+
+        # Stream the auxiliary pods' logs alongside the monitored one.
+        for extra_pod_name in extra_pod_names:
+            extra_process = subprocess.Popen(
+                ["kubectl", "logs", "-f", "-n", namespace, extra_pod_name],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                universal_newlines=True,
+                bufsize=1,
+            )
+            extra_log_processes.append(extra_process)
+            extra_tag = extra_pod_name.rsplit("-sglang-", 1)[-1]
+            logger.info(f"Starting to stream logs for Pod: {extra_pod_name}")
+            threading.Thread(
+                target=_stream_pod_logs,
+                args=(extra_process, extra_tag),
+                daemon=True,
+            ).start()
 
         # Shared variables
         match_event = threading.Event()
@@ -517,6 +549,13 @@ def monitor_pod_logs(
         else:
             logger.info("The test result was OK!")
     finally:
+        for extra_process in extra_log_processes:
+            if extra_process.poll() is None:
+                extra_process.terminate()
+                try:
+                    extra_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    extra_process.kill()
         if process and process.poll() is None:
             process.terminate()
             try:
