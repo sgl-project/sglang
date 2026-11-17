@@ -14,7 +14,7 @@ The workflow files settle any disagreement with this guide. Counts that change w
 ## Naming Conventions
 
 - **Suite**: `{stage}-test-{runner_config}`, generated from each test's `register_cuda_ci(stage=..., runner_config=...)` (e.g. `base-b-test-1-gpu-small`, `nightly-test-8-gpu-b200`)
-- **runner_config**: a runner-pool key (`1-gpu-small`, `4-gpu-h100`, `2-gpu-gb300`); `scripts/ci/runner_configs.yml` maps it to the physical runner label. Runner configs are independent of tiers: any tier can run any runner config.
+- **runner_config**: a runner-pool key (`1-gpu-small`, `4-gpu-h100`, `2-gpu-gb300`); `scripts/ci/runner_configs.yml` maps it to the physical runner label and install. Runner configs are independent of tiers: any tier can run any runner config. A stage's kind (`diffusion` in `base-b-diffusion`) can replace the install through `kind_installs`; `scripts/ci/runner_configs.py` resolves the pair.
 - **Test group**: directory-level group under `test/registered/` (e.g. `hicache` maps to `test/registered/hicache/test_*.py`)
 
 ---
@@ -40,10 +40,10 @@ The workflow files settle any disagreement with this guide. Counts that change w
 | `.github/workflows/pr-test-extra.yml` | Extra tier, gated by `run-ci` and `run-ci-nv-extra` |
 | `.github/workflows/nightly-test-nvidia.yml`, `weekly-test-nvidia.yml` | Scheduled tiers: one matrix row per runner config |
 | `.github/workflows/_pr-test-stage.yml`, `_pr-test-stage-cpu.yml` | Reusable stage: checkout, health check, install, `run_suite.py` per shard |
-| `.github/workflows/_diffusion-pr-test-stage.yml` | Reusable diffusion lane, called by `pr-test-multimodal-gen.yml`: the same steps for one `diffusion-*` runner_config, one job per case partition |
+| `.github/workflows/_diffusion-pr-test-stage.yml` | Reusable diffusion lane, called by `pr-test-multimodal-gen.yml`: the same steps for one `base-b-diffusion*` stage and runner_config, one job per case partition |
 | `.github/workflows/_pr-test-check-changes.yml` | Path filters, partitions, retry and continue-on-error flags |
 | `scripts/ci/utils/compute_partitions.py` | Shard count and `max_parallel` per suite |
-| `scripts/ci/runner_configs.yml` | `runner_config` -> runner label |
+| `scripts/ci/runner_configs.yml` | `runner_config` -> runner label; stage kind -> install |
 | `test/run_suite.py` | Suite lists (`PER_COMMIT_SUITES`, `NIGHTLY_SUITES`, `OTHER_SUITES`); collects, filters, partitions, executes tests |
 | `python/sglang/test/ci/ci_register.py` | Test registration (AST-parsed markers), LPT auto-partition |
 | `python/sglang/test/ci/ci_utils.py` | `run_unittest_files()`: execution, retry, continue-on-error |
@@ -165,7 +165,7 @@ Retry classification: a failure matching `NON_RETRIABLE_PATTERNS` (import, synta
 
 Within a suite, `ci_register.py:auto_partition()` assigns files to shards with the LPT heuristic: sort by time descending (filename as tie-breaker), then give each file to the shard with the least total time.
 
-The `Compute partitions` step summary lists every suite's size and `max_parallel` for that run. CUDA diffusion lanes also run `test/run_suite.py` (suites `base-b-test-diffusion-*`), but partition the 1-gpu and 2-gpu lanes by case with `compute_diffusion_partitions.py`; AMD diffusion jobs call `python/sglang/multimodal_gen/test/run_suite.py`.
+The `Compute partitions` step summary lists every suite's size and `max_parallel` for that run. CUDA diffusion lanes also run `test/run_suite.py` (suites `base-b-diffusion*-test-*`), but partition the 1-gpu and 2-gpu lanes by case with `compute_diffusion_partitions.py`; AMD diffusion jobs call `python/sglang/multimodal_gen/test/run_suite.py`.
 
 ---
 

@@ -1075,8 +1075,8 @@ def detect_suite(file_path_from_test, hw=None):
     The registrations are read with ci_register's parser, the one run_suite.py
     selects tests with. A CUDA file yields one entry per
     `register_cuda_ci(runner_config=...)` call, its runner label, install
-    script, timeout, and rdma_devices resolved from
-    scripts/ci/runner_configs.yml, the same single source of truth that drives
+    script, timeout, and rdma_devices resolved from its stage and runner_config
+    by scripts/ci/runner_configs.py, the same single source of truth that drives
     the main PR test pipeline; the legacy single-string `suite=` carries no
     runner_config and is reported as non-dispatchable. A CPU file yields one
     entry, an NPU or AMD file one per `register_npu_ci(...)` or
@@ -1097,10 +1097,10 @@ def detect_suite(file_path_from_test, hw=None):
 
 def _resolve_runner_config(r, full_path):
     """The cuda entry of a `register_cuda_ci(runner_config=...)` registration."""
-    configs = _runner_configs.load()
-    cfg = configs.get(r.runner_config)
-    if cfg is None:
-        known = ", ".join(f"`{k}`" for k in sorted(configs))
+    try:
+        cfg = _runner_configs.resolve(r.runner_config, r.stage)
+    except ValueError:
+        known = ", ".join(f"`{k}`" for k in sorted(_runner_configs.load()))
         return (
             f"Unknown runner_config `{r.runner_config}` in `{full_path}` "
             f"— not in scripts/ci/runner_configs.yml.\n\n"
