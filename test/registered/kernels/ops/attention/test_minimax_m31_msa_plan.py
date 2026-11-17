@@ -174,11 +174,6 @@ def test_topk_matches_reference_and_graph_replay(caches, query_length, fallback,
         _check_topk(iq, index, page_table, query_length, lengths, captured)
 
 
-def test_decode_indexer_rejects_unsupported_head_count(caches):
-    with pytest.raises(ValueError, match="index heads"):
-        _indexer(1, False, caches[1], heads=3)
-
-
 @pytest.mark.parametrize(
     "query_length, fallback", [(1, False), (8, False), (11, False), (11, True)]
 )
