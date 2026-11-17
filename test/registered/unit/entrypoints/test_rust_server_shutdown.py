@@ -541,6 +541,75 @@ def test_main_process_bounds_a_wedged_scheduler(restore_sigterm, monkeypatch, ca
         wedged.join()
 
 
+def _rpc_drained_wedged_child(ready, notify_now, sent, name):
+    # Native RPC acceptance happens in the listener process, without first
+    # delivering SIGTERM to the launcher. The listener can close while its
+    # scheduler remains wedged and cannot exit on its own.
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    ready.set()
+    assert notify_now.wait(30)
+    _notify(name)
+    sent.set()
+    time.sleep(60)
+
+
+def test_owned_listener_notification_bounds_rpc_shutdown_without_parent_sigterm(
+    restore_sigterm, monkeypatch
+):
+    monkeypatch.setattr(rust_shutdown, "_SCHEDULER_EXIT_TIMEOUT_SECS", 0)
+    ctx = mp.get_context("fork")
+    name = _name()
+    ready, notify_now, sent = ctx.Event(), ctx.Event(), ctx.Event()
+    child = ctx.Process(
+        target=_rpc_drained_wedged_child, args=(ready, notify_now, sent, name)
+    )
+    child.start()
+    assert ready.wait(30)
+    watchdog = _FakeWatchdog()
+    drain = rust_shutdown.RustServerSigtermDrain([child], [child], watchdog, name)
+    drain.install()
+    try:
+        assert not drain._sigterm_received
+        notify_now.set()
+        assert sent.wait(30)
+        drain._poll_notify()
+        # These assertions fail before wait() on the old implementation,
+        # so a regression cannot leave this test hanging on the wedged child.
+        assert drain._sigterm_received and drain._drain_ended
+        assert watchdog.stopped
+        drain.wait()
+        assert child.exitcode == -signal.SIGKILL
+    finally:
+        if child.is_alive():
+            child.kill()
+        child.join(10)
+        drain._notify.close()
+
+
+def test_unowned_sender_cannot_adopt_rpc_shutdown():
+    # Same-UID and the exact correct bytes are insufficient: the sender must
+    # be one of this launcher's actual listener processes.
+    ctx = mp.get_context("fork")
+    ready = ctx.Event()
+    child = ctx.Process(target=_wedged_child, args=(ready,))
+    child.start()
+    assert ready.wait(30)
+    watchdog = _FakeWatchdog()
+    name = _name()
+    drain = rust_shutdown.RustServerSigtermDrain([child], [child], watchdog, name)
+    try:
+        _notify(name)  # This test parent is not the registered listener.
+        drain._poll_notify()
+        assert not drain._sigterm_received
+        assert not drain._drain_ended
+        assert not watchdog.stopped
+        assert child.is_alive()
+    finally:
+        child.kill()
+        child.join(10)
+        drain._notify.close()
+
+
 def _closes_sentinel_then_exits(ready, release, seconds):
     # Closes every inherited fd, the sentinel's write end too, as a process
     # does in the kernel's exit teardown before it can be reaped; it exits

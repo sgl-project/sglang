@@ -33,6 +33,11 @@ listener has closed (``RustServer.on_drain_rows``). Rust mode also forces
 the other DP groups (``DPShutdownVote``), so every rank on every node leaves
 the event loop at the same step.
 
+An administrative native Shutdown RPC can begin the listener drain without
+a SIGTERM in the launcher. A drain-ended datagram from a registered listener
+process, authenticated with Linux SCM_CREDENTIALS, adopts that shutdown and
+starts the same scheduler-exit bound. An arbitrary local sender cannot do so.
+
 A launcher that got no SIGTERM (another node's, or one scheduler's own, began
 the drain) treats its first scheduler exiting 0 as that gang shutdown: it
 stops its subprocess watchdog and bounds the other schedulers by the same
@@ -53,6 +58,7 @@ import multiprocessing.connection
 import os
 import signal
 import socket
+import struct
 import time
 from typing import Any, List, Optional
 
@@ -62,6 +68,7 @@ logger = logging.getLogger(__name__)
 
 # How often the wait re-checks for a SIGTERM.
 _POLL_SECS = 1.0
+_UCRED = struct.Struct("3i")
 # How long the killed schedulers get to be reaped: Python's drain reaps them
 # through ``kill_process_tree``, whose default ``wait_timeout`` this is.
 _REAP_TIMEOUT_SECS = 60
@@ -85,6 +92,7 @@ class RustServerSigtermDrain:
         self._sigterm_received = False
         self._drain_ended = False
         self._notify = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        self._notify.setsockopt(socket.SOL_SOCKET, socket.SO_PASSCRED, 1)
         self._notify.bind("\0" + notify_name)
         self._notify.setblocking(False)
 
@@ -109,12 +117,36 @@ class RustServerSigtermDrain:
             self._subprocess_watchdog.stop()
 
     def _poll_notify(self) -> None:
-        # The abstract socket has no permissions: any local process can send
-        # to it, so a datagram counts only once this process got SIGTERM.
+        # The abstract socket has no permissions. Without our own SIGTERM,
+        # trust only a kernel-authenticated registered listener, never a
+        # caller-supplied PID or an arbitrary same-UID local sender.
         try:
-            while self._notify.recv(64):
-                if self._sigterm_received:
-                    self._drain_ended = True
+            while True:
+                data, ancillary, flags, _ = self._notify.recvmsg(
+                    64, socket.CMSG_SPACE(_UCRED.size)
+                )
+                if data != b"drained" or flags & (socket.MSG_TRUNC | socket.MSG_CTRUNC):
+                    continue
+                if not self._sigterm_received:
+                    sender_pid = next(
+                        (
+                            _UCRED.unpack(value)[0]
+                            for level, kind, value in ancillary
+                            if level == socket.SOL_SOCKET
+                            and kind == socket.SCM_CREDENTIALS
+                            and len(value) == _UCRED.size
+                        ),
+                        None,
+                    )
+                    if sender_pid is None or not any(
+                        proc.pid == sender_pid for proc in self._listener_procs
+                    ):
+                        continue
+                    # The native RPC already applied its admin/epoch/owner
+                    # checks. Preserve SIGTERM's watchdog and relay policy,
+                    # even if this scheduler cannot return from a GPU call.
+                    self._on_sigterm()
+                self._drain_ended = True
         except BlockingIOError:
             pass
 
