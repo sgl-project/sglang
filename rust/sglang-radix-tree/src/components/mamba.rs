@@ -619,6 +619,7 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             if !host_lru.in_list(Some(node_id)) {
                 host_lru.insert_mru(node_id);
             }
+            tree_core.place_host_evict_first_state_(node_id);
         }
 
         (freed, host_freed)
@@ -1050,6 +1051,9 @@ impl<K: ChildKeyType> TreeComponent<K> for MambaComponent {
             let x_next = tree_core
                 .host_lru_list(MAMBA)
                 .get_prev_no_lock(cur, &tree_core.arena);
+            if tree_core.is_host_evict_first_(tree_core.arena.node(cur)) {
+                tree_core.note_host_evict_first_eviction_(MAMBA, 1);
+            }
             // The host LRU filters Mamba's own locks. A Full load-back pin may
             // cover an ancestor whose Mamba state is not being transferred.
             if tree_core.evictable_host_leaves.contains(cur) {
