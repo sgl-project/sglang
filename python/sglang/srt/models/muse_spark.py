@@ -796,7 +796,7 @@ class MuseSpark1xMoE(nn.Module):
             # Measured to help up to 128 tokens (decode c<=128); untested above.
             and hidden_states.shape[0] <= 128
             and not sp_active
-            and not getattr(self.experts, "use_marlin", False)
+            and not self.experts.use_w4a16
         )
         prepared_input = None
         use_side_stream = not _is_cpu and torch.cuda.is_available()
