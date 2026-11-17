@@ -361,6 +361,46 @@ def _quantize_pooled_indexer_query(
     return quantized.view(query.shape), scale.view(query.shape[:-1]).to(torch.float16)
 
 
+def _quantize_pooled_indexer_query_mxfp8(
+    query: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """MXFP8 query quantization for pooled-key scoring (Ascend A5).
+
+    KPool stores pooled keys without Hadamard rotation, so the query keeps
+    the same basis: one E8M0 scale per 32-element block, pair-packed as
+    [D/64, 2] to match the KPool descale layout.
+    """
+    D = query.shape[-1]
+    if query.numel() == 0:
+        return (
+            torch.empty_like(query, dtype=torch.float8_e4m3fn),
+            torch.zeros(
+                query.shape[:-1] + (D // 64, 2),
+                dtype=torch.uint8,
+                device=query.device,
+            ).view(torch.float8_e8m0fnu),
+        )
+    quantized, scale = torch.ops.npu.npu_dynamic_mx_quant(
+        query.reshape(-1, D), dst_type=torch.float8_e4m3fn, axis=-1
+    )
+    scale = scale.reshape(query.shape[:-1] + (D // 32,)).view(
+        query.shape[:-1] + (D // 64, 2)
+    )
+    if scale.dtype != torch.float8_e8m0fnu:
+        scale = scale.view(torch.float8_e8m0fnu)
+    return quantized.view(query.shape), scale
+
+
+def _index_k_scale_cache(pool, layer_id: int):
+    """Write-side KPool scale buffer: FP16 per-row scales for INT8, raw E8M0
+    bytes for MXFP8, None for the unquantized BF16 cache."""
+    if pool.indexer_kv_store_int8:
+        return pool.get_index_k_scale_buffer(layer_id)
+    if pool.indexer_kv_store_mxfp8:
+        return pool.get_index_k_scale_buffer(layer_id).view(torch.uint8)
+    return None
+
+
 def _get_topk_npu(
     layer_id: int,
     query: torch.Tensor,
@@ -412,6 +452,26 @@ def _get_topk_npu(
             pool_size=index_kpool,
             mask_mode=3,
             quant_mode=2,
+            return_value=False,
+            q_descale=query_descale,
+            k_descale=pool.get_index_k_scale_buffer(layer_id),
+        )
+    elif pool.indexer_kv_store_mxfp8:
+        query_safe, query_descale = _quantize_pooled_indexer_query_mxfp8(query_safe)
+        indices, _ = pool_key_indexer(
+            query=query_safe,
+            pool_key=pool.get_index_k_buffer(layer_id),
+            weights=weights_safe.to(torch.float16),
+            pool_tail_k=tail_lens_safe,
+            actual_seq_q=query_ends_safe,
+            actual_seq_k=pool_lens_safe,
+            block_table=page_table_safe,
+            layout_q="TND",
+            layout_k="PA_BBND",
+            topk=index_topk,
+            pool_size=index_kpool,
+            mask_mode=3,
+            quant_mode=1,
             return_value=False,
             q_descale=query_descale,
             k_descale=pool.get_index_k_scale_buffer(layer_id),
@@ -518,11 +578,7 @@ def _compress_write_mtp_npu(
         out_cache_loc=forward_batch.out_cache_loc,
         num_draft_tokens=plan.num_draft_tokens,
         effective_n_per_batch=plan.effective_n_per_batch,
-        scale_cache=(
-            pool.get_index_k_scale_buffer(layer_id)
-            if pool.indexer_kv_store_int8
-            else None
-        ),
+        scale_cache=_index_k_scale_cache(pool, layer_id),
     )
 
 
@@ -558,11 +614,7 @@ def _compress_write_decode_npu(
         out_cache_loc=forward_batch.out_cache_loc,
         pool_size=index_kpool,
         slots_per_page=pool.index_page_size,
-        scale_cache=(
-            pool.get_index_k_scale_buffer(layer_id)
-            if pool.indexer_kv_store_int8
-            else None
-        ),
+        scale_cache=_index_k_scale_cache(pool, layer_id),
     )
 
 
@@ -600,11 +652,7 @@ def _compress_write_extend_npu(
             tail_logical_base=writes.tail_logical_base,
             ape=compress_ape,
             loc=writes.write_loc,
-            scale_cache=(
-                pool.get_index_k_scale_buffer(layer_id)
-                if pool.indexer_kv_store_int8
-                else None
-            ),
+            scale_cache=_index_k_scale_cache(pool, layer_id),
         )
     if not tails.is_empty:
         scatter_kpool_tail_updates(

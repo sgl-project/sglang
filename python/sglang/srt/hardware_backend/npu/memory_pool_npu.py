@@ -6,7 +6,10 @@ import torch
 from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.dcp.layout import localize_dcp_indices
-from sglang.srt.mem_cache.kv_cache_dtype import QUANT_MODE_TOKEN_INT8
+from sglang.srt.mem_cache.kv_cache_dtype import (
+    QUANT_MODE_TOKEN_INT8,
+    QUANT_MODE_TOKEN_MXFP8,
+)
 from sglang.srt.mem_cache.memory_pool import (
     MHATokenToKOnlyPool,
     MHATokenToKVPool,
@@ -807,13 +810,13 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
         )
         self.kr_cache_dim = 0 if self.dsa_kv_cache_store_fp8 else qk_rope_head_dim
 
-        # --indexer-kv-cache-dtype=int8 opts into the INT8 indexer K cache
+        # --indexer-kv-cache-dtype opts into a quantized indexer K cache
         if (
-            indexer_quant_mode == QUANT_MODE_TOKEN_INT8
+            indexer_quant_mode in (QUANT_MODE_TOKEN_INT8, QUANT_MODE_TOKEN_MXFP8)
             and get_memory().enable_hierarchical_cache
         ):
             raise ValueError(
-                "--indexer-kv-cache-dtype=int8 is not supported with "
+                "--indexer-kv-cache-dtype is not supported with "
                 "--enable-hierarchical-cache"
             )
         self.indexer_kv_store_int8 = (
@@ -821,9 +824,23 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
             and not self.dsa_kv_cache_store_fp8
             and index_head_dim is not None
         )
+        self.indexer_kv_store_mxfp8 = (
+            indexer_quant_mode == QUANT_MODE_TOKEN_MXFP8
+            and not self.dsa_kv_cache_store_fp8
+            and index_head_dim is not None
+        )
+        if self.indexer_kv_store_mxfp8 and index_kpool <= 1:
+            raise ValueError(
+                "--indexer-kv-cache-dtype=mxfp8 requires the KPool pooled-key "
+                "indexer (index_kpool > 1); the lightning-indexer mxfp8 path "
+                "is tracked separately."
+            )
         if self.indexer_kv_store_int8:
             self.index_k_store_dtype = torch.int8
             self.index_k_scale_dtype = torch.float16
+        elif self.indexer_kv_store_mxfp8:
+            self.index_k_store_dtype = torch.float8_e4m3fn
+            self.index_k_scale_dtype = torch.uint8
         else:
             self.index_k_store_dtype = self.store_dtype
             self.index_k_scale_dtype = (
@@ -947,6 +964,19 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
                     self.index_k_scale_buffer = torch.zeros(
                         (*self.index_k_buffer.shape[:-2], 1),
                         dtype=self.index_k_scale_dtype,
+                        device=self.device,
+                    )
+                elif self.indexer_kv_store_mxfp8 and self.num_indexer_layers > 0:
+                    # KPool MXFP8 keeps keys and queries in the same unrotated
+                    # basis: one E8M0 byte per 32-element block, pair-packed
+                    # as [D/64, 2]; no Hadamard buffer is needed.
+                    self.index_k_scale_buffer = torch.zeros(
+                        (
+                            *self.index_k_buffer.shape[:-1],
+                            self.index_head_dim // 64,
+                            2,
+                        ),
+                        dtype=torch.uint8,
                         device=self.device,
                     )
 
@@ -1185,7 +1215,10 @@ class NPUMLATokenToKVPool(MLATokenToKVPool):
     def get_index_k_scale_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
-        return self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
+        buf = self.index_k_scale_buffer[self._get_indexer_slot(layer_id)]
+        if self.indexer_kv_store_mxfp8:
+            return buf.view(torch.float8_e8m0fnu)
+        return buf
 
     def set_index_k_scale_buffer(self, layer_id: int, loc, scale):
         assert scale.dtype == self.index_k_scale_dtype, (

@@ -361,12 +361,13 @@ def handle_kv4_compatibility(server_args: Any) -> None:
 
 
 def handle_indexer_kv_cache_compatibility(server_args: Any) -> None:
-    """Check the DSA lightning-indexer INT8 cache recipe.
+    """Check the DSA indexer INT8/MXFP8 cache recipes.
 
     npu_quant_lightning_indexer is a CANN op, so an explicitly requested
     indexer recipe only makes sense on Ascend NPU and on a model that
-    actually has a DSA lightning indexer. The recipe itself is resolved
-    against the resolved KV cache dtype later, at pool-build time.
+    actually has a DSA lightning indexer. The MXFP8 recipe additionally
+    requires Ascend A5 (arch35). The recipe itself is resolved against the
+    resolved KV cache dtype later, at pool-build time.
     """
     cfg = resolving_view(server_args)
 
@@ -385,6 +386,14 @@ def handle_indexer_kv_cache_compatibility(server_args: Any) -> None:
             "--indexer-kv-cache-dtype is only supported on Ascend NPU "
             "(npu_quant_lightning_indexer is a CANN op)."
         )
+
+    if cfg.indexer_kv_cache_dtype == "mxfp8":
+        from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
+
+        if not is_npu_arch35():
+            raise ValueError(
+                "--indexer-kv-cache-dtype=mxfp8 requires Ascend A5 (arch35)."
+            )
 
     if getattr(model_config_of(server_args), "index_head_dim", None) is None:
         raise ValueError(

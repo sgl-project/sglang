@@ -707,6 +707,7 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
         if _is_npu:
             from sglang.srt.mem_cache.kv_cache_dtype import (
                 QUANT_MODE_TOKEN_INT8,
+                QUANT_MODE_TOKEN_MXFP8,
                 resolve_indexer_quant_mode,
             )
 
@@ -720,6 +721,14 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     # INT8 key bytes plus one FP16 scale per pooled row.
                     indexer_size_per_token = ceil_div(
                         index_head_dim + torch._utils._element_size(torch.float16),
+                        get_dsa_index_kpool(kvc.model_config.hf_config),
+                    )
+                    element_size = 1
+                elif indexer_quant_mode == QUANT_MODE_TOKEN_MXFP8:
+                    # E4M3 key bytes plus one E8M0 byte per 32-element block
+                    # per pooled row.
+                    indexer_size_per_token = ceil_div(
+                        index_head_dim + index_head_dim // 32,
                         get_dsa_index_kpool(kvc.model_config.hf_config),
                     )
                     element_size = 1

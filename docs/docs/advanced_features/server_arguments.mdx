@@ -376,9 +376,9 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--indexer-kv-cache-dtype`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Quantization recipe for the DSA indexer KV cache (Ascend NPU only). None disables the quantized indexer cache and keeps the default indexer behavior. "int8" stores the indexer keys in INT8 with FP16 scales; the same recipe applies to both the lightning indexer and the pooled-key (KPool) indexer.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Quantization recipe for the DSA indexer KV cache (Ascend NPU only). None disables the quantized indexer cache and keeps the default indexer behavior. "int8" stores the indexer keys in INT8 with FP16 scales; the same recipe applies to both the lightning indexer and the pooled-key (KPool) indexer. "mxfp8" stores the indexer keys in MXFP8 (E4M3FN) with per-32-element E8M0 scales on Ascend A5 (arch35), for the KPool pooled-key indexer.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>int8</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>int8</code>, <code>mxfp8</code></td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-fp32-lm-head`</td>

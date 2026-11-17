@@ -24,14 +24,20 @@ TORCH_DTYPE_TO_KV_CACHE_STR = {
     torch.bfloat16: "bf16",
 }
 
-# Quantization recipes of the NPU DSA quantized indexer cache. Unlike the
-# quant_lightning_indexer (v2) FP8/MXFP8/FP4 quant modes, the INT8 recipe
-# runs the v1 npu_quant_lightning_indexer op, where the quantization is
-# implied by the INT8 key dtype (its quant_mode args stay 0).
+# Internal quantization recipe ids of the NPU DSA quantized indexer cache.
+# These are NOT the CANN KPool quant_mode values: the KPool pooled-key op
+# uses quant_mode=2 for INT8 and quant_mode=1 for MXFP8 (mapped in the
+# Ascend DSA backend). Unlike the quant_lightning_indexer (v2) FP8/MXFP8/FP4
+# quant modes, the INT8 recipe runs the v1 npu_quant_lightning_indexer op,
+# where the quantization is implied by the INT8 key dtype (its quant_mode
+# args stay 0). The MXFP8 recipe stores E4M3FN keys with per-32-element
+# E8M0 scales and is KPool-only on Ascend A5 (arch35).
 QUANT_MODE_TOKEN_INT8 = 0
+QUANT_MODE_TOKEN_MXFP8 = 1
 
 _INDEXER_KV_CACHE_DTYPE_TO_QUANT_MODE = {
     "int8": QUANT_MODE_TOKEN_INT8,
+    "mxfp8": QUANT_MODE_TOKEN_MXFP8,
 }
 
 
@@ -127,9 +133,9 @@ def resolve_indexer_quant_mode(
     None leaves the quantized indexer at its default: an FP8 main KV cache
     keeps the existing FP8 indexer (the DSA FP8 packed store), any other
     main dtype leaves the quantized indexer disabled (the DSA indexer then
-    runs the legacy bf16 npu_lightning_indexer path). The INT8 recipe only
-    exists on top of a non-FP8 main KV cache; the FP8 main cache already
-    stores the indexer cache quantized.
+    runs the legacy bf16 npu_lightning_indexer path). The INT8 and MXFP8
+    recipes only exist on top of a non-FP8 main KV cache; the FP8 main
+    cache already stores the indexer cache quantized.
     """
     if indexer_kv_cache_dtype is None:
         return None
