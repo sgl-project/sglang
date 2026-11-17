@@ -3,6 +3,9 @@ import unittest
 import torch
 
 from sglang.srt.layers.rotary_embedding import RotaryEmbedding
+from sglang.srt.layers.rotary_embedding.rope_variant import (
+    DeepseekScalingRotaryEmbedding,
+)
 from sglang.srt.utils import get_bool_env_var, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
@@ -89,6 +92,54 @@ class TestRotaryEmbeddingNative(CustomTestCase):
         for case in cases:
             with self.subTest(case=case):
                 self._run_case(*case)
+
+
+@unittest.skipUnless(_is_hip, "Requires AMD GPU")
+class TestDeepseekScalingRotaryEmbeddingHip(CustomTestCase):
+    # MLA rope: q_pe is the tail of each query head, k_pe the tail of the latent row.
+    def _run_case(self, is_neox: bool, num_tokens: int) -> None:
+        device, dtype = "cuda", torch.bfloat16
+        rope = DeepseekScalingRotaryEmbedding(
+            64,
+            64,
+            4096,
+            10000,
+            is_neox,
+            40.0,
+            dtype,
+            beta_fast=32,
+            beta_slow=1,
+            mscale=1.0,
+            mscale_all_dim=1.0,
+            device=device,
+        ).to(device)
+        self.assertNotEqual(rope._forward_method, rope.forward_native)
+
+        pos_ids = torch.randint(0, 4096 * 40, (num_tokens,), device=device)
+        q = torch.randn(num_tokens, 16, 128, dtype=dtype, device=device)
+        latent = torch.randn(num_tokens, 576, dtype=dtype, device=device)
+
+        q_ref, k_ref = rope.forward_native(
+            pos_ids, q[..., 64:].clone(), latent[..., 512:].unsqueeze(1).clone()
+        )
+        q_hip, latent_hip = q.clone(), latent.clone()
+        q_pe, k_pe = q_hip[..., 64:], latent_hip[..., 512:].unsqueeze(1)
+        q_out, k_out = rope(pos_ids, q_pe, k_pe)
+
+        self.assertEqual(q_out.data_ptr(), q_pe.data_ptr())
+        self.assertEqual(k_out.data_ptr(), k_pe.data_ptr())
+        torch.testing.assert_close(q_hip[..., :64], q[..., :64], atol=0, rtol=0)
+        torch.testing.assert_close(
+            latent_hip[..., :512], latent[..., :512], atol=0, rtol=0
+        )
+        torch.testing.assert_close(q_out, q_ref, atol=4e-2, rtol=1e-2)
+        torch.testing.assert_close(k_out, k_ref, atol=4e-2, rtol=1e-2)
+
+    def test_mla_views(self) -> None:
+        for is_neox in (False, True):
+            for num_tokens in (1, 4, 37, 4096):
+                with self.subTest(is_neox=is_neox, num_tokens=num_tokens):
+                    self._run_case(is_neox, num_tokens)
 
 
 @unittest.skipIf(not _use_aiter, reason="Requires AMD GPU plus SGLANG_USE_AITER=1")
