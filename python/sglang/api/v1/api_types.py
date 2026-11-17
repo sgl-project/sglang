@@ -11,8 +11,6 @@ options exactly as the Rust server does. Decode with
 
 from __future__ import annotations
 
-import base64
-import binascii
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import msgspec
@@ -82,17 +80,6 @@ def _expect_str(v: Any, expected: str) -> str:
     if isinstance(v, str):
         return v
     raise _invalid_type(v, expected=expected)
-
-
-def _expect_bytes(v: Any, expected: str) -> bytes:
-    text = _expect_str(v, expected)
-    try:
-        data = base64.b64decode(text, validate=True)
-    except (ValueError, binascii.Error):
-        raise JsonContractError("invalid base64 bytes") from None
-    if base64.b64encode(data).decode("ascii") != text:
-        raise JsonContractError("invalid base64 bytes")
-    return data
 
 
 def _expect_seq(v: Any, expected: str) -> List[Any]:
