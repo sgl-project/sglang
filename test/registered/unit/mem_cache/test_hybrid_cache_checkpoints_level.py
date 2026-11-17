@@ -266,11 +266,42 @@ class TestMarkSharedPrompts(CustomTestCase):
         a.mamba_branching_seqlen = 8
         self.assertTrue(_marked(a, [_prompt_req(B_PROMPT, "b")]))
 
-    def test_chunk_short_of_the_prompt_end_is_not_marked(self):
-        a = _prompt_req(PROMPT, "a", extend_end=8)
-        self.assertFalse(_marked(a, [_prompt_req(B_PROMPT, "b")]))
+    def test_chunk_is_marked_only_with_its_checkpoint_depth(self):
+        a = _prompt_req(PROMPT, "a", extend_end=10)
+        b = _prompt_req(B_PROMPT, "b")
+        self.assertFalse(_marked(a, [b]))
+        self.assertTrue(_marked(a, [b], chunk_checkpoint_len=lambda req: 8))
         a.extend_end = len(PROMPT)
-        self.assertTrue(_marked(a, [_prompt_req(B_PROMPT, "b")]))
+        self.assertTrue(_marked(a, [b]))
+
+    def test_chunk_share_shallower_than_its_checkpoint_is_not_marked(self):
+        # The chunk checkpoints at 8; a share of 6 cannot match that state,
+        # though a whole prompt sharing 6 would be marked (4 <= 6).
+        a = _prompt_req(PROMPT, "a", extend_end=10)
+        shallow = _prompt_req(PROMPT[:6] + [300] * 10, "s")
+        self.assertFalse(_marked(a, [shallow], chunk_checkpoint_len=lambda r: 8))
+        # Control: the same share marks a checkpoint at 4.
+        self.assertTrue(_marked(a, [shallow], chunk_checkpoint_len=lambda r: 4))
+        a.extend_end = len(PROMPT)
+        self.assertTrue(_marked(a, [shallow]))
+
+    def test_chunk_checkpoint_the_tree_holds_is_not_marked(self):
+        a = _prompt_req(PROMPT, "a", extend_end=10, cached=8)
+        b = _prompt_req(B_PROMPT, "b")
+        self.assertFalse(_marked(a, [b], chunk_checkpoint_len=lambda req: 8))
+        self.assertFalse(_marked(a, [b], chunk_checkpoint_len=lambda req: None))
+        # Control: a new depth is marked.
+        a.kv.cache_protected_len = 4
+        self.assertTrue(_marked(a, [b], chunk_checkpoint_len=lambda req: 8))
+
+    def test_branching_point_in_a_later_chunk_does_not_hold_a_chunk_back(self):
+        a = _prompt_req(PROMPT, "a", extend_end=10)
+        a.mamba_branching_seqlen = SHARED
+        b = _prompt_req(B_PROMPT, "b")
+        self.assertTrue(_marked(a, [b], chunk_checkpoint_len=lambda req: 8))
+        # Control: at the prompt end the same branching point counts as cached.
+        a.extend_end = len(PROMPT)
+        self.assertFalse(_marked(a, [b]))
 
     def test_other_cache_namespace_is_not_marked(self):
         a = _prompt_req(PROMPT, "a")
@@ -368,21 +399,97 @@ class TestSharedPromptCheckpoints(CustomTestCase):
                 # it) matches all of it.
                 self.assertEqual(_cached_len(cache, PROMPT + [7, 8]), len(PROMPT))
                 # The tree takes one state; the request keeps decoding on its own.
-                self.assertEqual(
-                    pool.mamba_allocator.available_size(), free_slots - 1
-                )
+                self.assertEqual(pool.mamba_allocator.available_size(), free_slots - 1)
                 self.assertIsNone(req.kv.mamba_last_track_seqlen)
                 cache.unlock(req.lock)
                 cache.sanity_check()
 
-    def test_level2_mark_ignores_a_chunk_short_of_the_prompt_end(self):
-        cache, allocator, pool = _build(2)
+    def _chunk(self, extra_buffer, mark):
+        """Checkpoint a chunk that ends at 10, short of the 16-token prompt,
+        having tracked the grid point 8 (extra buffer). Returns the depth the
+        cache names for it and the cached prefix after."""
+        cache, allocator, pool = _build(
+            2,
+            page_size=4 if extra_buffer else 1,
+            enable_mamba_extra_buffer=extra_buffer,
+        )
         req = _running_req(cache, allocator, pool, up_to=8)
-        req.mamba_publish_prompt = True
+        req.extend_end = 10
+        depth = cache.chunk_checkpoint_len(req)
+        req.mamba_publish_prompt = mark
         free_slots = pool.mamba_allocator.available_size()
-        cache.checkpoint(req, up_to=8)
-        self.assertEqual(_cached_len(cache, PROMPT), 0)
-        self.assertEqual(pool.mamba_allocator.available_size(), free_slots)
+        checkpoint_kv_cache(req, cache)
+        self.assertEqual(pool.mamba_allocator.available_size(), free_slots - int(mark))
+        cached = _cached_len(cache, PROMPT)
+        if req.lock is not None:
+            cache.unlock(req.lock)
+        cache.sanity_check()
+        return depth, cached
+
+    def test_level2_marked_chunk_publishes_its_tracked_grid_point(self):
+        self.assertEqual(self._chunk(extra_buffer=True, mark=True), (8, 8))
+
+    def test_level2_unmarked_chunk_defers(self):
+        for extra_buffer in (True, False):
+            with self.subTest(extra_buffer=extra_buffer):
+                _, cached = self._chunk(extra_buffer=extra_buffer, mark=False)
+                self.assertEqual(cached, 0)
+
+    def test_level2_marked_chunk_without_extra_buffer_publishes_its_end(self):
+        # The request's own slot holds the state at the extend end.
+        self.assertEqual(self._chunk(extra_buffer=False, mark=True), (10, 10))
+
+    def test_level2_burst_matches_a_published_chunk(self):
+        """A's first chunk ends at 8 while B (sharing 12) waits: B then
+        matches A's state at 8, not just its KV."""
+        cache, allocator, pool = _build(2, mamba_cache_size=16)
+        grid = cache.shared_prompt_checkpoint_grid()
+        a = _running_req(cache, allocator, pool, up_to=8, rid="a")
+        shallow = _prompt_req(PROMPT[:6] + [300] * 10, "s")
+        mark_shared_prompt_checkpoints(
+            [a], [[shallow]], grid, cache.chunk_checkpoint_len
+        )
+        self.assertFalse(a.mamba_publish_prompt)
+        b_waiting = _prompt_req(B_PROMPT, "b")
+        mark_shared_prompt_checkpoints(
+            [a], [[shallow, b_waiting]], grid, cache.chunk_checkpoint_len
+        )
+        self.assertTrue(a.mamba_publish_prompt)
+        checkpoint_kv_cache(a, cache)
+        self.assertEqual(_cached_len(cache, B_PROMPT), 8)
+        cache.unlock(a.lock)
+        cache.sanity_check()
+
+    def test_level2_path_cap_with_chunk_and_prompt_states(self):
+        """Chunks publish at 4 and 8, then the prompt end at 16. Each insert
+        keeps the state the request still locks; the prompt end's insert drops
+        the unlocked state at 4 and never blocks the publish."""
+        cache, allocator, pool = _build(2, mamba_cache_size=16)
+        req = _running_req(cache, allocator, pool, up_to=4)
+
+        def publish(up_to):
+            req.extend_end = up_to
+            req.kv.mamba_last_track_seqlen = up_to
+            req.mamba_publish_prompt = True
+            checkpoint_kv_cache(req, cache)
+
+        def states():
+            return [
+                depth
+                for depth in (4, 8, 16)
+                if _cached_len(cache, PROMPT[:depth] + [99]) == depth
+            ]
+
+        publish(4)
+        publish(8)
+        # The request locks 4 while 8 is inserted: one over the cap.
+        self.assertEqual(states(), [4, 8])
+        publish(len(PROMPT))
+        self.assertEqual(states(), [8, 16])
+        # The KV of the whole prompt stays.
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(array("q", PROMPT))))
+        self.assertEqual(match.full_kv_hit_length, len(PROMPT))
+        cache.unlock(req.lock)
         cache.sanity_check()
 
     def test_level2_lone_request_still_defers(self):
@@ -570,7 +677,7 @@ class _SpecRequest:
         # The token the prefill samples has no KV yet.
         req.output_ids.append(999)
         req.refresh_fill_ids()
-        # Left set through decode: only the prompt's checkpoint reads it.
+        # Left set through decode: no checkpoint of a running request follows.
         req.mamba_publish_prompt = self.publish_prompt
         self.cache.checkpoint(req, up_to=len(self.prompt))
 

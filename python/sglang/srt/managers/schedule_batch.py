@@ -626,8 +626,9 @@ class Req(ReqDllmMixin):
         # right prefill pass.
         self.mamba_branching_seqlen: Optional[int] = None
         # Set by the scheduler when another live request shares this prompt
-        # past what the tree gave it: the checkpoint that completes the prompt
-        # is then published instead of deferred to the request's end.
+        # past what the tree gave it: the checkpoint that ends the extend (a
+        # chunk or the whole prompt) is then published instead of deferred to
+        # the request's end.
         self.mamba_publish_prompt: bool = False
         # Total cached prefix length (on-device prefix_len + host_hit_length),
         # capped at the max allowed prefix. Set during prefix matching at schedule

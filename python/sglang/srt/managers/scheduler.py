@@ -4912,7 +4912,7 @@ class Scheduler(
         if shared_prompt_grid is not None:
             # The batch's requests already sit in the launched and chunked lists.
             mark_shared_prompt_checkpoints(
-                (req for req in can_run_list if req is not new_chunked_req),
+                can_run_list,
                 (
                     self.waiting_queue,
                     self.chunked_reqs,
@@ -4920,6 +4920,7 @@ class Scheduler(
                     self.running_reqs,
                 ),
                 shared_prompt_grid,
+                self.tree_cache.chunk_checkpoint_len,
             )
 
         if self.tp_worker.model_runner.prefill_aware_swa:

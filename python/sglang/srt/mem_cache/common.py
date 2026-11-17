@@ -242,7 +242,7 @@ def checkpoint_kv_cache(req: Req, tree_cache: BasePrefixCache) -> None:
         tree_cache.checkpoint(req, up_to=req.extend_end)
     # The next extend resumes after this one, published or not.
     req.prefix_len = req.extend_end
-    # The mark applies to the checkpoint that completes the prompt only.
+    # The mark applies to the checkpoint that ends this extend only.
     req.mamba_publish_prompt = False
 
 

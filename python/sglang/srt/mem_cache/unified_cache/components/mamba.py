@@ -965,8 +965,10 @@ class MambaComponent(TreeComponent):
     def shared_prompt_checkpoint_grid(self) -> Optional[int]:
         """The grid a published state lands on, when the scheduler should mark
         prompts that other live requests share (`Req.mamba_publish_prompt`);
-        None when every prompt end is published anyway (level 3, a
-        sliding-window tree, a PD prefill worker) or the marks are off."""
+        None when every checkpoint is published anyway (level 3, a
+        sliding-window tree), a PD prefill worker publishes its prompt ends
+        regardless and checkpoints its chunks its own way, or the marks are
+        off."""
         if (
             not self.publish_shared_prompts
             or self.checkpoints_level >= 3
@@ -976,13 +978,23 @@ class MambaComponent(TreeComponent):
             return None
         return self.mamba_checkpoint_grid
 
+    def chunk_checkpoint_len(self, req: Req) -> Optional[int]:
+        """The depth `prepare_for_caching_req` publishes ``req`` at when its
+        extend ends short of the prompt: the snapshot the extend tracked (or
+        an earlier one still kept) with the extra buffer, else the extend end,
+        where the request's own slot holds the state."""
+        if self.cache.enable_mamba_extra_buffer:
+            return req.kv.mamba_last_track_seqlen
+        return req.extend_end
+
     def _defers_checkpoint(
         self, req: Req, token_ids_len: int, checkpoint_len: int
     ) -> bool:
         """Below checkpoint level 3 a running request publishes a state only at
-        its branching point or once its prompt is complete, the latter on a PD
-        prefill worker or when the scheduler marked the prompt as shared by
-        another live request (`Req.mamba_publish_prompt`).
+        its branching point, once its prompt is complete on a PD prefill
+        worker, or at the end of an extend (a chunk or the whole prompt) the
+        scheduler marked as shared by another live request
+        (`Req.mamba_publish_prompt`).
         A sliding-window tree keeps every chunk: prefill frees window rows only
         behind a checkpoint the tree takes."""
         if self.checkpoints_level >= 3 or self.cache.is_swa_enabled:
@@ -993,12 +1005,13 @@ class MambaComponent(TreeComponent):
         branching_seqlen = req.mamba_branching_seqlen
         if branching_seqlen is not None and checkpoint_len == branching_seqlen:
             return False
-        if token_ids_len < len(req.origin_input_ids):
-            return True
-        if get_disagg().disaggregation_mode == "prefill":
+        # A request sharing the prompt can then match it while this one runs.
+        if self.publish_shared_prompts and req.mamba_publish_prompt:
             return False
-        # A request sharing this prompt can then match it while this one decodes.
-        return not (self.publish_shared_prompts and req.mamba_publish_prompt)
+        return not (
+            get_disagg().disaggregation_mode == "prefill"
+            and token_ids_len >= len(req.origin_input_ids)
+        )
 
     def prepare_for_caching_req(
         self,

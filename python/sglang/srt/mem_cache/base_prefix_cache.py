@@ -587,10 +587,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return nullcontext()
 
     def shared_prompt_checkpoint_grid(self) -> Optional[int]:
-        """The grid on which the scheduler compares a prompt that completes in
-        a prefill with the other live requests' prompts, to mark it shared
+        """The grid on which the scheduler compares a prompt that a prefill
+        extends with the other live requests' prompts, to mark it shared
         (`Req.mamba_publish_prompt`) so its checkpoint is published; None when
         this cache publishes every prompt it would share anyway."""
+        return None
+
+    def chunk_checkpoint_len(self, req: Req) -> Optional[int]:
+        """The depth the checkpoint ending ``req``'s extend short of its
+        prompt end would publish, or None; asked only when
+        `shared_prompt_checkpoint_grid` is not None."""
         return None
 
     def free_kv_row(self, kv: Any, ranges: list[tuple[int, int]]) -> None:
