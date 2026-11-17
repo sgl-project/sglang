@@ -39,7 +39,7 @@ by this document and may introduce breaking changes.
 <Note>
 The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
 mode, and workload. For parameter details, see
-[Feature descriptions](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#feature-descriptions); for
+[Parameter Reference](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#parameter-reference); for
 recommended configurations for each deployment scenario, see [Best practices](#best-practices).
 </Note>
 
@@ -144,9 +144,9 @@ deployment commands and benchmark data, see
 
 ### Multi-node PD disaggregation deployment
 
-#### 256K long-sequence PD disaggregation on 2 x Ascend A3 Series nodes (without CP)
+#### 256K long-sequence PD disaggregation on 2 x A3 Series nodes (without CP)
 
-This configuration uses PD disaggregation for **256K long-sequence inference** on 2 x Ascend A3 Series nodes with context parallel disabled.
+This configuration uses PD disaggregation for **256K long-sequence inference** on 2 x A3 Series nodes with context parallel disabled.
 The following command is based on the **W8A8** quantized model.
 
 1. Set the shared environment variables on both prefill and decode nodes:
@@ -248,18 +248,20 @@ python3 -m sglang.launch_server \
 #   PREFILL_HOST_IP: prefill node IP address
 #   DECODE_HOST_IP: decode node IP address
 #   ROUTER_HOST_IP: router node IP address
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 #============================================================
 
-python3 -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<PREFILL_HOST_IP>:8000 8995 \
-    --decode http://<DECODE_HOST_IP>:8232 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls http://<PREFILL_HOST_IP>:8000 http://<DECODE_HOST_IP>:8232 \
     --host <ROUTER_HOST_IP> \
-    --port 6689
+    --port 6689 \
+    --request-timeout-secs 1800 \
+    --stale-request-timeout-secs 1800
 ```
 
-#### Prefill Context Parallel (PCP) on 2 x Ascend A3 Series nodes
+#### Prefill Context Parallel (PCP) on 2 x A3 Series nodes
 
 This configuration enables **Prefill Context Parallel** (`--enable-prefill-cp`) to split the context
 across CP ranks during prefill, reducing per-device memory pressure and improving TTFT for long sequences.
@@ -365,13 +367,13 @@ python3 -m sglang.launch_server \
 #   PREFILL_HOST_IP: prefill node IP address
 #   DECODE_HOST_IP: decode node IP address
 #   ROUTER_HOST_IP: router node IP address
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 #============================================================
 
-python3 -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --policy cache_aware \
-    --prefill http://<PREFILL_HOST_IP>:8000 8995 \
-    --decode http://<DECODE_HOST_IP>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls http://<PREFILL_HOST_IP>:8000 http://<DECODE_HOST_IP>:8001 \
     --host <ROUTER_HOST_IP> \
     --port 6689
 ```

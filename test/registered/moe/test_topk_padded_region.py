@@ -2,14 +2,17 @@ import unittest
 from unittest.mock import patch
 
 import torch
+from torch.utils._python_dispatch import TorchDispatchMode
 
 import sglang.kernels.ops.moe.fill_padded_rows as fill_mod
 import sglang.srt.layers.moe.topk as topk_mod
+from sglang.kernels.ops.moe.fill_padded_rows import (
+    _can_fuse_padded_region,
+    _fill_padded_rows,
+)
 from sglang.srt.configs.shared_experts import SharedExpertsConfig
 from sglang.srt.layers.moe.topk import (
     TopKConfig,
-    _can_fuse_padded_region,
-    _fill_padded_rows,
     _mask_topk_ids_padded_region,
     _post_process_topk_ids,
     _zero_topk_weights_padded_region,
@@ -19,7 +22,7 @@ from sglang.srt.utils import is_hip
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-large")
+register_cuda_ci(est_time=20, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=60, stage="stage-b", runner_config="1-gpu-small-amd")
 
 _IS_HIP = is_hip()
@@ -32,6 +35,53 @@ def _eager_fill_padded_rows(x, num_token_non_padded, fill_value):
     indices = torch.arange(0, x.shape[0], device=x.device)
     out[indices >= num_token_non_padded, :] = fill_value
     return out
+
+
+class _ComparisonDtypeRecorder(TorchDispatchMode):
+    def __init__(self):
+        super().__init__()
+        self.input_dtypes = []
+
+    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+        if func is torch.ops.aten.ge.Tensor:
+            self.input_dtypes.append((args[0].dtype, args[1].dtype))
+        return func(*args, **(kwargs or {}))
+
+
+class TestTopkPaddedRegionEagerDtype(CustomTestCase):
+    def test_comparison_operands_follow_count_dtype(self):
+        """Mixed integer comparisons can fall back to CPU on accelerators that
+        require matching input dtypes, so every eager mask must use the routing
+        count's dtype while preserving the padded-row result.
+        """
+        cases = (
+            (
+                "ids",
+                torch.full((5, 3), 7, dtype=torch.int32),
+                _mask_topk_ids_padded_region,
+                -1,
+            ),
+            (
+                "weights",
+                torch.full((5, 3), 1.25, dtype=torch.float32),
+                _zero_topk_weights_padded_region,
+                0.0,
+            ),
+        )
+        for count_dtype in (torch.int32, torch.int64):
+            for name, source, helper, fill_value in cases:
+                with self.subTest(count_dtype=count_dtype, name=name):
+                    actual = source.clone()
+                    expected = source.clone()
+                    expected[3:] = fill_value
+                    count = torch.tensor(3, dtype=count_dtype)
+                    recorder = _ComparisonDtypeRecorder()
+                    with recorder:
+                        helper(actual, count)
+                    self.assertEqual(
+                        recorder.input_dtypes, [(count_dtype, count_dtype)]
+                    )
+                    self.assertTrue(torch.equal(actual, expected))
 
 
 @unittest.skipUnless(
@@ -76,13 +126,34 @@ class TestTopkPaddedRegion(CustomTestCase):
     def test_non_contiguous_falls_back_to_eager(self):
         # A column slice is not row-major contiguous, so the fused path must be
         # skipped while still producing the correct result via the eager branch.
-        base = torch.rand((32, 16), device=self.DEVICE, dtype=torch.float32) + 0.5
-        view = base[:, ::2]
-        self.assertFalse(_can_fuse_padded_region(view))
-        num_token_non_padded = torch.tensor(5, device=self.DEVICE, dtype=torch.int32)
-        expected = _eager_fill_padded_rows(view, num_token_non_padded, 0.0)
-        _zero_topk_weights_padded_region(view, num_token_non_padded)
-        self.assertTrue(torch.equal(view, expected))
+        cases = (
+            (
+                "ids",
+                torch.randint(1, 100, (32, 16), device=self.DEVICE, dtype=torch.int32),
+                _mask_topk_ids_padded_region,
+                0,
+            ),
+            (
+                "weights",
+                torch.rand((32, 16), device=self.DEVICE, dtype=torch.float32) + 0.5,
+                _zero_topk_weights_padded_region,
+                0.0,
+            ),
+        )
+        for name, base, helper, fill_value in cases:
+            with self.subTest(name=name):
+                view = base[:, ::2]
+                self.assertFalse(_can_fuse_padded_region(view))
+                count = torch.tensor(5, device=self.DEVICE, dtype=torch.int32)
+                expected = _eager_fill_padded_rows(view, count, fill_value)
+                recorder = _ComparisonDtypeRecorder()
+                with recorder:
+                    if helper is _mask_topk_ids_padded_region:
+                        helper(view, count, fill_value=fill_value)
+                    else:
+                        helper(view, count)
+                self.assertEqual(recorder.input_dtypes, [(count.dtype, count.dtype)])
+                self.assertTrue(torch.equal(view, expected))
 
     def test_cuda_graph_capture_and_replay(self):
         n, k = 256, 9

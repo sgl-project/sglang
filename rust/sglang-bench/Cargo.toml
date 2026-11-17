@@ -4,6 +4,7 @@ description = "Serving benchmark client: the Rust port of python/sglang/benchmar
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+publish = false
 
 # Consumed by python/setup.py: registers this crate as a PyO3 extension module
 # of the main sglang wheel at the given import path. debug = false keeps
