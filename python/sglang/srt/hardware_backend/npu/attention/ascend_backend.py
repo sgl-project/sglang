@@ -34,6 +34,7 @@ from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.config import (
     get_sparsity_driven_kv_offload_sparse_context_len,
     is_sparsity_driven_kv_offload_enabled,
 )
+from sglang.srt.hardware_backend.npu.utils import is_npu_arch35
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
 from sglang.srt.layers.attention.dsa.dsa_token_shard import (
     dsa_token_shard_cumulative_query_lens,
@@ -426,6 +427,17 @@ class AscendAttnBackend(AttentionBackend):
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
+        self.dcp_fp8_sparse_attention = None
+        if self.dsa_dcp_target and self.kv_cache_dtype == torch.float8_e4m3fn:
+            if not self.token_to_kv_pool.dsa_kv_cache_store_fp8:
+                raise ValueError(
+                    "Ascend DSA DCP with FP8 KV requires the A5 packed KV pool."
+                )
+            from sgl_kernel_npu.operators.attention import (
+                kv_quant_sparse_flash_attention,
+            )
+
+            self.dcp_fp8_sparse_attention = kv_quant_sparse_flash_attention
         self.graph_mode = False
         self.use_fa = get_bool_env_var("ASCEND_USE_FA", "False")
         self.enable_sparsity_driven_kv_offload = is_sparsity_driven_kv_offload_enabled(
@@ -643,7 +655,7 @@ class AscendAttnBackend(AttentionBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
-        self.forward_metadata = ForwardMetadata()
+        self.forward_metadata = self._create_forward_metadata()
         dense_mla_dcp_partial = self.dense_mla_dcp_target and (
             forward_batch.forward_mode.is_decode()
             or forward_batch.forward_mode.is_target_verify()
@@ -945,6 +957,10 @@ class AscendAttnBackend(AttentionBackend):
             )
         self.graph_mode = False
 
+    def _create_forward_metadata(self) -> ForwardMetadata:
+        """Create the metadata object for one forward pass."""
+        return ForwardMetadata()
+
     def _prepare_quant_flash_attn_metadata(
         self,
         metadata: ForwardMetadata,
@@ -1120,7 +1136,7 @@ class AscendAttnBackend(AttentionBackend):
         out_cache_loc: Optional[torch.Tensor] = None,
     ) -> ForwardMetadata:
         """Create and store the per-bs ForwardMetadata for CUDA graph capture."""
-        metadata = ForwardMetadata()
+        metadata = self._create_forward_metadata()
         if self.enable_sparsity_driven_kv_offload:
             from sglang.srt.hardware_backend.npu.sparsity_driven_kv_offload.host_callback import (
                 register_npu_host_callback_stream,
@@ -2031,12 +2047,29 @@ class AscendAttnBackend(AttentionBackend):
 
         if save_kv_cache:
             k = k.view(-1, layer.tp_k_head_num, self.kv_lora_rank)
-            k_rope = k_rope.view(-1, layer.tp_k_head_num, self.qk_rope_head_dim)
+            k_rope = k_rope.reshape(
+                k_rope.shape[0], layer.tp_k_head_num, self.qk_rope_head_dim
+            )
             self.token_to_kv_pool.set_kv_buffer(
                 layer, forward_batch.out_cache_loc, k, k_rope
             )
         q_nope, q_pe = q, q_rope
         k_nope, k_pe = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+
+        # SFA's MLA interface requires a fixed 64-dimensional query_rope even
+        # for models without RoPE.
+        if self.qk_rope_head_dim == 0 and is_npu_arch35():
+            k_pe = self._a5_zero_rope(k_nope, (*k_nope.shape[:-1], 64))
+            q_pe = self._a5_zero_rope(q_nope, (q.shape[0], layer.tp_q_head_num, 64))
+        elif self.qk_rope_head_dim == 0:
+            k_pe = k_nope.new_zeros((*k_nope.shape[:-1], 64))
+            q_pe = q_nope.new_zeros(
+                (
+                    q.shape[0],
+                    layer.tp_q_head_num,
+                    64,
+                )
+            )
 
         # The token shard replaces the query lengths, built once per forward.
         dsa_token_shard_plan = get_dsa_token_shard_plan(forward_batch)
@@ -2120,6 +2153,7 @@ class AscendAttnBackend(AttentionBackend):
                     forward_batch=forward_batch,
                     speculative_num_draft_tokens=self.speculative_num_draft_tokens,
                     scaling=layer.scaling,
+                    fp8_attention=self.dcp_fp8_sparse_attention,
                 )
             if self.kv_cache_dtype == torch.float8_e4m3fn:
                 attn_out = self._forward_fp8_sparse(
@@ -2156,6 +2190,15 @@ class AscendAttnBackend(AttentionBackend):
                 )
 
         return attn_out
+
+    def _a5_zero_rope(self, reference, shape):
+        # Cache the large pool-shaped dummy across graph captures/layers.
+        if not hasattr(self, "_a5_zero_rope_cache"):
+            self._a5_zero_rope_cache = {}
+        key = (tuple(shape), reference.dtype, reference.device)
+        if key not in self._a5_zero_rope_cache:
+            self._a5_zero_rope_cache[key] = reference.new_zeros(shape)
+        return self._a5_zero_rope_cache[key]
 
     def _load_mla_prefix_cache(
         self,
@@ -4555,6 +4598,8 @@ class AscendAttnMultiStepDraftBackend:
     draft decoding steps
     """
 
+    backend_cls = AscendAttnBackend
+
     def __init__(
         self,
         model_runner: ModelRunner,
@@ -4567,7 +4612,7 @@ class AscendAttnMultiStepDraftBackend:
         self.attn_backends = []
         for step_id in range(self.speculative_num_steps):
             self.attn_backends.append(
-                AscendAttnBackend(model_runner, speculative_step_id=step_id)
+                self.backend_cls(model_runner, speculative_step_id=step_id)
             )
         self.needs_cpu_seq_lens = any(b.needs_cpu_seq_lens for b in self.attn_backends)
 

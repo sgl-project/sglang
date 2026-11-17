@@ -216,7 +216,7 @@ from sglang.srt.speculative.spec_decoding_metrics import (
     populate_spec_info,
 )
 from sglang.srt.utils import (
-    configure_gc_warning,
+    configure_gc_logging,
     freeze_gc,
     get_bool_env_var,
     get_or_create_event_loop,
@@ -909,8 +909,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
 
             start_cpu_monitor_thread("tokenizer")
 
-        if get_observability().gc_warning_threshold_secs > 0.0:
-            configure_gc_warning(get_observability().gc_warning_threshold_secs)
+        configure_gc_logging("Tokenizer Manager")
         self.soft_watchdog = Watchdog.create(
             debug_name="TokenizerManager",
             watchdog_timeout=get_device().soft_watchdog_timeout,
@@ -2185,6 +2184,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     ):
         # Not all request types have `stream` (e.g., EmbeddingReqInput). Default to non-streaming.
         is_stream = getattr(obj, "stream", False)
+        # 0.0 polls on the first output, catching a client lost while queued.
+        next_disconnect_poll = 0.0
         while True:
             try:
                 if request is None:
@@ -2284,17 +2285,22 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 yield out
                 break
 
+            # is_disconnected() costs an event-loop pass, so poll at most once per wait
+            # timeout; StreamingResponse cancels a disconnected stream without polling.
+            now = time.monotonic()
             if (
                 request is not None
                 and not obj.background
-                and await request.is_disconnected()
+                and now >= next_disconnect_poll
             ):
-                # Abort the request for disconnected requests (running)
-                self.abort_request(obj.rid)
-                # Use exception to kill the whole call stack and asyncio task
-                raise ValueError(
-                    f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
-                )
+                next_disconnect_poll = now + _REQUEST_STATE_WAIT_TIMEOUT
+                if await request.is_disconnected():
+                    # Abort the request for disconnected requests (running)
+                    self.abort_request(obj.rid)
+                    # Use exception to kill the whole call stack and asyncio task
+                    raise ValueError(
+                        f"Request is disconnected from the client side (type 3). Abort request {obj.rid=}"
+                    )
 
             if is_stream:
                 # Record response sent time right before we send response.
