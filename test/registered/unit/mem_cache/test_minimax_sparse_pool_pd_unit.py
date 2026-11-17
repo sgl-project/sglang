@@ -73,8 +73,8 @@ class TestMiniMaxSparsePoolPD(CustomTestCase):
         pool = _make_k_only_pool(start_layer=4, enable_hisparse=True)
         with (
             patch(
-                "sglang.srt.mem_cache.pool_host.base.host_memory_budget_bytes",
-                return_value=1 << 30,
+                "sglang.srt.mem_cache.pool_host.base.host_memory_preflight",
+                return_value=(0, 1 << 30),
             ),
             patch("sglang.srt.mem_cache.pool_host.common._cuda_host_register"),
             patch("sglang.srt.mem_cache.pool_host.base._cuda_host_unregister"),

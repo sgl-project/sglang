@@ -665,6 +665,7 @@ def _translate_through_a_moving_page_map(backend):
             key=(IdSpaceKind.FULL, "test"), write=lambda ids: ids, read_v2p=v2p
         )
     }
+    runner_ids._role_sub_pools = {}
     runner_ids._rows = torch.arange(rows, dtype=torch.int64)
     backend.runner_ids = runner_ids
     return v2p
