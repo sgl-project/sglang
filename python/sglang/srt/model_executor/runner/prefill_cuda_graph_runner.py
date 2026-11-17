@@ -337,6 +337,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
     _backend_vote_prefill_cuda_graph = None
     _captured_attn_metadata_max_bs: Optional[int] = None
     _dcp_extend_active = False
+    _rocm_bcg_prefix_extend = False
     dllm_attention = None
 
     @property
