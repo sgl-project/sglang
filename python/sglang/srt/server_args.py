@@ -35,6 +35,7 @@ from sglang.srt.arg_groups.arg_utils import (
 )
 from sglang.srt.arg_groups.argparse_actions import (
     DeprecatedAction,
+    DeprecatedAliasStoreAction,
     DeprecatedChoiceToFlagAction,
     DeprecatedStoreTrueAction,
 )
@@ -345,6 +346,7 @@ class ServerArgs:
         "MuseGlimmerForConditionalGeneration",
         "Cosmos3ForConditionalGeneration",
         "Cosmos3EdgeForConditionalGeneration",
+        "Gemma4ForConditionalGeneration",
     )
 
     # The attention-backend allow-list is enforced via
@@ -441,6 +443,16 @@ class ServerArgs:
             help="Deprecated. Use --enable-amd-monokernel instead of "
             "--monokernel-backend amd, and --enable-nvidia-megakernel instead of "
             "--monokernel-backend msa.",
+        )
+        # `mamba_max_states_per_path` is `no_cli=True`; any cap still applies.
+        parser.add_argument(
+            "--mamba-max-states-per-path",
+            action=DeprecatedAliasStoreAction,
+            new_flag="--hybrid-cache-checkpoints-level 2",
+            dest="mamba_max_states_per_path",
+            type=int,
+            default=None,
+            help="Deprecated. Use --hybrid-cache-checkpoints-level 2 instead.",
         )
         for flag in (
             "--disable-outlines-disk-cache",
@@ -688,10 +700,17 @@ def _declared_default(name: str):
     )
 
 
-# Credentials -- the access keys and the TLS key's password: no display, log or
-# dump of the configuration carries them.
+# Credentials -- the access keys, the TLS key's password and the HiCache and
+# external-linker storage configs (they can carry storage credentials): no
+# display, log or dump of the configuration carries them.
 SERVER_ARGS_SECRET_FIELD_NAMES = frozenset(
-    {"api_key", "admin_api_key", "ssl_keyfile_password"}
+    {
+        "api_key",
+        "admin_api_key",
+        "ssl_keyfile_password",
+        "hicache_storage_backend_extra_config",
+        "unified_cache_external_linker_config",
+    }
 )
 _REDACTED = "<redacted>"
 

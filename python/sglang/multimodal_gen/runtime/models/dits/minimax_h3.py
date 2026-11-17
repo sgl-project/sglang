@@ -33,6 +33,7 @@ from sglang.kernels.ops.diffusion import (
     can_use_aten_head_rmsnorm,
     can_use_aten_head_rmsnorm_rope,
     can_use_fused_inplace_qknorm_rope,
+    can_use_indexed_gate_rmsnorm_scale_shift,
     can_use_rmsnorm_indexed_scale_shift,
     fused_inplace_qknorm_rope,
     fused_qknorm_rope_out_of_place,
@@ -40,6 +41,7 @@ from sglang.kernels.ops.diffusion import (
     indexed_gate_bf16_,
     indexed_gate_fp32,
     indexed_gate_fp32_,
+    indexed_gate_rmsnorm_scale_shift_,
     indexed_scale_shift_bf16_,
     indexed_scale_shift_fp32_,
     indexed_scale_shift_mxfp8_,
@@ -1995,6 +1997,23 @@ class MiniMaxH3DiTBlock(nn.Module):
             ulysses_active=ulysses_active,
             ring_active=ring_active,
         )
+        if self._fuses_gate_norm2(
+            residual, gate_msa, h, shift_mlp, scale_mlp, combined_indices
+        ):
+            # the gated residual and norm2 in one pass, at the same roundings
+            h = indexed_gate_rmsnorm_scale_shift_(
+                residual,
+                gate_msa,
+                h,
+                self.norm2.weight,
+                shift_mlp,
+                scale_mlp,
+                combined_indices,
+                self.norm2.eps,
+            )
+            return _modulate_gate(
+                residual, gate_mlp, self.mlp(h), combined_indices, dtype=_BF16_DTYPE
+            )
         x = _modulate_gate(
             residual,
             gate_msa,
@@ -2036,6 +2055,28 @@ class MiniMaxH3DiTBlock(nn.Module):
             h,
             combined_indices,
             dtype=_BF16_DTYPE,
+        )
+
+    def _fuses_gate_norm2(
+        self,
+        x: torch.Tensor,
+        gate: torch.Tensor,
+        other: torch.Tensor,
+        shift: torch.Tensor,
+        scale: torch.Tensor,
+        indices: torch.Tensor,
+    ) -> bool:
+        """Whether the attention's gated residual (in place) and the fused
+        norm2 modulation run as one kernel."""
+        return (
+            not self.preserve_input_for_cache_dit
+            and not _accepts_mxfp8_input(self.mlp.fc1)
+            and MINIMAX_H3_NORM_MODULATE.is_enabled(self)
+            and self.norm2.weight is not None
+            and self.norm2.eps is not None
+            and can_use_indexed_gate_rmsnorm_scale_shift(
+                x, gate, other, self.norm2.weight, shift, scale, indices
+            )
         )
 
 
