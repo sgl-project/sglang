@@ -17,7 +17,7 @@ use crate::utils::{
     build_classify_dict, build_embed_dict, build_generate_dict, build_text_embed_dict,
     build_text_generate_dict, extract_model_path,
 };
-use sglang_api_types::runtime::v1 as proto;
+use sglang_runtime_v1_types as proto;
 
 pub struct SglangServiceImpl {
     pub bridge: Arc<PyBridge>,

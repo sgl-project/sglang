@@ -2,7 +2,8 @@ import unittest
 from pathlib import Path
 
 from sglang.test.ascend.e2e.test_npu_performance_utils import (
-    BENCHMARK_TOOL_DEFAULT,
+    AISBENCHMARK,
+    AISBENCHMARK_DATASET_GSM8K,
     DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
     TestNpuPerfMultiNodePdSepTestCaseBase,
 )
@@ -38,7 +39,6 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_COMMON_ENVS = {
     "SGLANG_ENABLE_OVERLAP_PLAN_STREAM": "1",
     "USE_NPU_MOE_GATING_TOP_K": "1",
     "SGLANG_RAGGED_VERIFY_MODE": "static",
-    "SGLANG_DSPARK_FAST_KERNEL": "0",
     "SGLANG_DSPARK_FAST_SAMPLING": "0",
     "SGLANG_DSPARK_ENABLE_MULTI_STREAM": "0",
     "SGLANG_DSPARK_QUANT_AUDIT": "1",
@@ -79,6 +79,23 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ENVS = {
     "SGLANG_NPU_USE_MULTI_STREAM": "1",
     "SGLANG_NPU_SPLIT_SHARED_EXPERT_OVERLAP": "1",
 }
+
+# DSPARK speculative decoding arguments shared by the prefill and decode nodes:
+# the PD prefill worker prunes the draft to context-KV injection.
+DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_SPECULATIVE_ARGS = [
+    "--speculative-algorithm",
+    "DSPARK",
+    "--speculative-draft-model-path",
+    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
+    "--speculative-draft-model-quantization",
+    "modelslim",
+    "--speculative-draft-attention-backend",
+    "ascend",
+    "--speculative-num-draft-tokens",
+    6,
+    "--speculative-dspark-block-size",
+    5,
+]
 
 # Prefill node launch arguments for DSV4-Flash PD-Sep 128k1k
 DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
@@ -145,6 +162,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ARGS = [
     "stat",
     "--expert-distribution-recorder-buffer-size",
     512,
+    *DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_SPECULATIVE_ARGS,
 ]
 
 # Decode node launch arguments for DSV4-Flash PD-Sep 128k1k
@@ -182,17 +200,6 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ARGS = [
     "bfloat16",
     "--load-balance-method",
     "round_robin",
-    # DSPARK configuration.
-    "--speculative-algorithm",
-    "DSPARK",
-    "--speculative-draft-model-path",
-    DEEPSEEK_V4_FLASH_0731_W8A8_MODEL_PATH,
-    "--speculative-draft-model-quantization",
-    "modelslim",
-    "--speculative-draft-attention-backend",
-    "ascend",
-    "--speculative-num-draft-tokens",
-    6,
     "--enable-metrics",
     "--enable-cache-report",
     "--swa-full-tokens-ratio",
@@ -210,8 +217,7 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ARGS = [
     '{"use_index_cache":true,"index_topk_freq":2}',
     "--tokenizer-worker-num",
     16,
-    "--speculative-dspark-block-size",
-    5,
+    *DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_SPECULATIVE_ARGS,
 ]
 
 # Model config for DSV4-Flash W8A8 1P+1D PD-Sep 128k1k deployment
@@ -221,35 +227,33 @@ DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG = {
     "decode_args": DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ARGS,
     "prefill_envs": DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_PREFILL_ENVS,
     "decode_envs": DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_DECODE_ENVS,
-    "router_args": ["--policy", "cache_aware"],
+    "router_args": [],
     "router_envs": {},
 }
 
 
-class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20ms(
+class TestNPUDeepSeekV4FlashW8A81P1D16PIn128kOut1k20msAisBench(
     TestNpuPerfMultiNodePdSepTestCaseBase
 ):
-    """Test NPU performance for DeepSeek-V4-Flash W8A8 PD-Sep 1P+1D 16p in128k out1k."""
+    """Test NPU performance for DeepSeek-V4-Flash W8A8 PD-Sep 1P+1D 16p in128k out1k prefix90."""
 
-    benchmark_tool = BENCHMARK_TOOL_DEFAULT
     model_config = DEEPSEEK_V4_FLASH_W8A8_1P1D_128K_MODEL_CONFIG
-    dataset_name = "generated-shared-prefix"
-    max_concurrency = 55
-    num_prompts = 90
+    benchmark_tool = AISBENCHMARK
+    dataset_type = AISBENCHMARK_DATASET_GSM8K
+    dataset_path = None
     input_len = 131072
     output_len = 1024
-    random_range_ratio = 1
-    seed = 1
+    num_prompts = 90
+    max_concurrency = 54
     repeat_rate = 0.9
     request_rate = 3
-    warmup_requests = 16
-    pop_sglang_is_in_ci_for_gsp = True
+    dp = 16
     tpot = 20
     output_token_throughput = 964.864
     ttft = 7000
 
     def test_npu_deepseek_v4_flash_w8a8_1p1d_16p_in128k_out1k_prefix90_20ms(self):
-        """Run NPU performance test for DeepSeek-V4-Flash W8A8 1P+1D 16p in128k out1k."""
+        """Run NPU performance test for DeepSeek-V4-Flash W8A8 1P+1D 16p in128k out1k prefix90."""
         self.run_throughput()
 
 

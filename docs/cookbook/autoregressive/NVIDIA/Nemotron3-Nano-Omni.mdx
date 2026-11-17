@@ -81,7 +81,7 @@ This section provides a progressive guide from quick deployment to performance t
 
 - **Reasoning parser:**
 
-    Append `--reasoning-parser deepseek-r1` to enable structured reasoning traces (`reasoning_content` field in the response).
+    Append `--reasoning-parser nemotron_3` to enable structured reasoning traces (`reasoning_content` field in the response). It follows the per-request `enable_thinking` setting, so with reasoning off the answer stays in `content`.
 
 - **Tool calling:**
 
@@ -99,7 +99,7 @@ sglang serve \
   --tp 4 \
   --trust-remote-code \
   --tool-call-parser qwen3_coder \
-  --reasoning-parser deepseek-r1
+  --reasoning-parser nemotron_3
 ```
 
 ### 4.1 Basic Usage (Text)
@@ -448,7 +448,7 @@ sglang serve \
   --tp 4 \
   --trust-remote-code \
   --tool-call-parser qwen3_coder \
-  --reasoning-parser deepseek-r1
+  --reasoning-parser nemotron_3
 ```
 
 **NVFP4 variant** (maximum efficiency on Blackwell B200):
@@ -461,7 +461,7 @@ sglang serve \
   --tp 4 \
   --trust-remote-code \
   --tool-call-parser qwen3_coder \
-  --reasoning-parser deepseek-r1
+  --reasoning-parser nemotron_3
 ```
 
 ---
@@ -565,7 +565,7 @@ sglang serve \
   --trust-remote-code \
   --tp 4 \
   --attention-backend flashinfer \
-  --reasoning-parser deepseek-r1
+  --reasoning-parser nemotron_3
 ```
 
 #### 5.3.1 GSM8K Benchmark

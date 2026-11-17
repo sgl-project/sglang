@@ -123,9 +123,11 @@ def _build(n: int, ratio: int, seed: int):
         k_norm=k_norm,
         rope_head_dim=ROPE_DIM,
         index_head_dim=INDEX_HEAD_DIM,
+        # ROCm never takes the tiny GEMM for wk (_tiny_gemm_max_m returns -1).
+        wk_small_max_m=-1,
     )
-    # The real method, bound to the stand-in: it reads only wk and
-    # index_head_dim, and it is what decides whether the in-tree GEMM serves wk.
+    # The real method, bound to the stand-in: it reads only wk, index_head_dim
+    # and wk_small_max_m, and it is what decides whether the in-tree GEMM serves wk.
     captured = {}
 
     def forward_wk(latent):

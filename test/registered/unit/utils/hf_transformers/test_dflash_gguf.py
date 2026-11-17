@@ -19,12 +19,12 @@ import torch
 
 from sglang.srt.layers.radix_attention import AttentionType
 from sglang.srt.models import dflash
-from sglang.srt.utils.hf_transformers.config import get_config
-from sglang.srt.utils.hf_transformers.dflash_gguf import (
+from sglang.srt.hf_transformers.config import get_config
+from sglang.srt.hf_transformers.dflash_gguf import (
     build_plain_dflash_gguf_config,
     plain_dflash_gguf_weights,
 )
-from sglang.srt.utils.hf_transformers.gguf_native import (
+from sglang.srt.hf_transformers.gguf_native import (
     has_native_gguf_support,
     read_gguf_architecture,
 )
@@ -159,7 +159,7 @@ class TestDFlashGGUF(CustomTestCase):
             with (
                 track_readers() as (readers, token_parts),
                 patch(
-                    "sglang.srt.utils.hf_transformers.gguf_native._extract_dflash_gguf_metadata",
+                    "sglang.srt.hf_transformers.gguf_native._extract_dflash_gguf_metadata",
                     side_effect=AssertionError(
                         "DFlash extraction reached another model"
                     ),
@@ -293,7 +293,7 @@ class TestDFlashGGUF(CustomTestCase):
             path = Path(temp) / "draft.gguf"
             write_draft(path, lilicorr=True)
             with patch(
-                "sglang.srt.utils.hf_transformers.gguf_native._extract_dflash_gguf_metadata",
+                "sglang.srt.hf_transformers.gguf_native._extract_dflash_gguf_metadata",
                 side_effect=AssertionError("Plain DFlash extraction reached LiLiCorr"),
             ):
                 self.assertEqual(read_gguf_architecture(str(path)), "dflash")

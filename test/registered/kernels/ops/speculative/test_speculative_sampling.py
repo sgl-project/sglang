@@ -27,7 +27,7 @@ else:
         top_p_renorm_probs_triton as top_p_renorm_probs,
     )
 
-register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=15, stage="base-b-kernel-unit", runner_config="1-gpu-small")
 
 test_cases = [
     (

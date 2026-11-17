@@ -21,15 +21,15 @@ _LENGTH_FIELDS = {
     "cache_inserted_len",
     "kv_committed_len",
     "kv_allocated_len",
-    "swa_evict_floor",
-    "component_evicted_seqlens",
+    "window_evict_floor",
+    "window_evicted_seqlens",
 }
 _SCAN = dict(
     owner_scopes={"ReqKvInfo"},
     # The constructor and dataclasses.replace set fields by keyword.
     kwarg_funcs={"ReqKvInfo", "replace"},
     # A mutable field: any use outside ReqKvInfo can change it through an alias.
-    owned_only_fields={"component_evicted_seqlens"},
+    owned_only_fields={"window_evicted_seqlens"},
 )
 
 
@@ -65,7 +65,7 @@ class TestReqKvLengthMethods(CustomTestCase):
             cache_inserted_len=8,
             kv_committed_len=8,
             kv_allocated_len=10,
-            swa_evict_floor=2,
+            window_evict_floor=2,
         )
         cases = [
             ("set_row_len", (12,), dict(kv_committed_len=12, kv_allocated_len=12)),
@@ -95,7 +95,7 @@ class TestReqKvLengthMethods(CustomTestCase):
                 (),
                 dict(cache_protected_len=0, cache_inserted_len=0),
             ),
-            ("shield_swa_prefill", (9,), dict(swa_evict_floor=9)),
+            ("shield_window_prefill", (9,), dict(window_evict_floor=9)),
         ]
         for method, args, changed in cases:
             with self.subTest(method=method, args=args):
@@ -110,7 +110,7 @@ class TestReqKvLengthMethods(CustomTestCase):
             cache_inserted_len=8,
             kv_committed_len=8,
             kv_allocated_len=10,
-            swa_evict_floor=2,
+            window_evict_floor=2,
             retraction_backup=object(),
             restore_done_event=object(),
             mamba_ping_pong_empty=[True, False],
