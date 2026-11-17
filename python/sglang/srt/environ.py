@@ -1224,9 +1224,8 @@ class Envs:
     # Set to 0 to restore the separate SiTU + npu_dynamic_mx_quant path.
     SGLANG_NPU_MOE_SITU_MXFP8_FUSED = EnvBool(True)
     SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD = EnvBool(False)
-    # Per-request resident token capacity; 0 defaults to model TopK or auto-sizes
-    # from the manager HBM budget. Legacy uses LRU when C > K;
-    # native LIM maintains its own resident mapping.
+    # Native resident token capacity; 0 defaults to max query width * model TopK.
+    # The manager HBM budget caps fixed allocations and may disable prefill workspace.
     SGLANG_NPU_SPARSE_KV_CACHE_SIZE = EnvInt(0)
     # Per-rank persistent manager allocations, in MiB; 0 leaves the cap unset.
     SGLANG_NPU_SPARSE_KV_HBM_BUDGET_MB = EnvInt(0)

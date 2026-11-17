@@ -121,5 +121,37 @@ def test_draft_policy_is_private_to_fused_mode(monkeypatch, fused, draft):
     assert enabled is not (fused and draft)
 
 
+def test_fused_draft_bypasses_target_validation(monkeypatch):
+    def fail_if_target_validation_runs():
+        raise AssertionError("draft worker must bypass target validation")
+
+    monkeypatch.setattr(config, "attention_backends", fail_if_target_validation_runs)
+    with (
+        envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
+        envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
+    ):
+        assert not config.is_sparsity_driven_kv_offload_enabled(
+            model_config=None, use_mla_backend=True, is_draft_worker=True
+        )
+
+
+def test_fused_draft_keeps_native_kv_cell_price(monkeypatch):
+    monkeypatch.setattr(config, "is_npu", lambda: True)
+    with (
+        envs.SGLANG_NPU_ENABLE_SPARSE_KV_OFFLOAD.override(True),
+        envs.SGLANG_NPU_ENABLE_FUSED_LIM_COPYSFA.override(True),
+    ):
+        assert (
+            config.get_sparsity_driven_kv_offload_cell_size(
+                model_config=None,
+                use_mla_backend=True,
+                num_layers=1,
+                element_size=2,
+                is_draft_worker=True,
+            )
+            is None
+        )
+
+
 if __name__ == "__main__":
     sys.exit(pytest.main([__file__]))

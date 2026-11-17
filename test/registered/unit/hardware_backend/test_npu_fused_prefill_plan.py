@@ -8,8 +8,13 @@ from unittest.mock import patch
 
 import torch
 
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(est_time=2, stage="base-a", runner_config="cpu")
+
 PATH = (
-    Path(__file__).resolve().parents[3]
+    Path(__file__).resolve().parents[4]
     / "python/sglang/srt/hardware_backend/npu/sparsity_driven_kv_offload/prefill_kv_plan.py"
 )
 spec = importlib.util.spec_from_file_location("prefill_test_kv_plan", PATH)
@@ -19,7 +24,7 @@ sys.modules[spec.name] = module
 spec.loader.exec_module(module)
 
 
-class PrefillReferenceTest(unittest.TestCase):
+class PrefillReferenceTest(CustomTestCase):
     def setUp(self):
         # Exercise framework planning on CPU; device kernel parity is tested by
         # test_sparse_kv_row_metadata.py and the companion NPU kernel tests.
