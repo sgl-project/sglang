@@ -41,6 +41,7 @@ from sglang.srt.layers.attention.qsa.sparse_attn import (
     sparse_gqa_fwd_interface_triton,
     sparse_gqa_fwd_interface_triton_ck,
     sparse_gqa_packed_decode_triton,
+    sparse_gqa_paged_prefill_triton,
 )
 from sglang.srt.layers.attention.verify_mask import VerifyMask, maybe_create_verify_mask
 from sglang.srt.layers.cp.utils import (
@@ -51,7 +52,7 @@ from sglang.srt.layers.cp.utils import (
 )
 from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool, MHATokenToKVPool
 from sglang.srt.mem_cache.qsa_kv_pool import QSATokenToKVPool
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.srt.runtime_context import get_spec, get_stream
 from sglang.srt.utils import is_hip, is_sm100_supported, is_sm120
 
@@ -88,7 +89,7 @@ def _resolve_flash_attn_varlen_func():
 
         return qwen38_qsa_sm121_varlen
     if is_hip():
-        # ROCm ships neither flash_attn (FA2) nor flash-attn-4; aiter provides an
+        # ROCm ships neither flash_attn (FA2) nor the FA4 CuTe kernels; aiter provides an
         # FA2-compatible varlen kernel (CK) with the same call signature. Fall
         # through to the flash_attn probes below if aiter is unavailable.
         try:
@@ -110,7 +111,9 @@ def _resolve_flash_attn_varlen_func():
     except ImportError:
         pass
     try:
-        from flash_attn.cute.interface import flash_attn_varlen_func as cute_varlen_func
+        from sglang.kernels.ops.attention.flash_attn.cute.interface import (
+            flash_attn_varlen_func as cute_varlen_func,
+        )
 
         def flash_attn_varlen_func(*args, **kwargs):
             output = cute_varlen_func(*args, **kwargs)
@@ -120,7 +123,7 @@ def _resolve_flash_attn_varlen_func():
         return flash_attn_varlen_func
     except ImportError as exc:
         raise ImportError(
-            "QSA decode requires flash_attn (FA2), flash-attn-4 (FA4 cute), "
+            "QSA decode requires flash_attn (FA2), the vendored FA4 CuTe kernels, "
             "or aiter (ROCm) for its packed varlen fallback."
         ) from exc
 
@@ -212,6 +215,29 @@ class QSAMTPSharedSparseIndices:
             out.dtype
         )
         return out
+
+
+class QSAStepView(msgspec.Struct, frozen=True):
+    """A step's QSA data for a megakernel (graph-static under capture)."""
+
+    metadata: QwenSparseAttnMetadata
+    # a draft decode step's reused draft-extend selection, per QSA layer and slot
+    mtp_indices: Optional[torch.Tensor]
+    mtp_captured_len: Optional[torch.Tensor]
+
+
+class QSAPoolView(msgspec.Struct, frozen=True):
+    """The QSA pool's buffers per QSA layer (ascending), for a megakernel."""
+
+    layer_ids: Tuple[int, ...]
+    k: Tuple[torch.Tensor, ...]
+    v: Tuple[torch.Tensor, ...]
+    compressed_k: Tuple[torch.Tensor, ...]  # slot = token slot // compress_ratio
+    key_state: Tuple[torch.Tensor, ...]  # pending raw-key ring
+    rope_positions: torch.Tensor  # [request slots * ratio, 3] of the pending keys
+    compress_ratio: int
+    compressed_page_size: int
+    token_topk: int
 
 
 class QwenSparseAttnBackend(AttentionBackend):
@@ -1210,6 +1236,31 @@ class QwenSparseAttnBackend(AttentionBackend):
     def set_mtp_shared_sparse_indices(self, state) -> None:
         self._mtp_shared_sparse_indices = state
 
+    def megakernel_step_view(self, forward_batch) -> QSAStepView:
+        state = self._mtp_shared_sparse_indices
+        return QSAStepView(
+            metadata=self._resolve_metadata(forward_batch),
+            mtp_indices=None if state is None else state.indices,
+            mtp_captured_len=None if state is None else state.captured_len,
+        )
+
+    def megakernel_pool_view(self) -> QSAPoolView:
+        pool = self.token_to_kv_pool
+        router = pool.layer_router
+        layer_ids = router.layer_ids()
+        layers = tuple(router.read(i) for i in layer_ids)
+        return QSAPoolView(
+            layer_ids=layer_ids,
+            k=tuple(layer.key() for layer in layers),
+            v=tuple(layer.value() for layer in layers),
+            compressed_k=tuple(map(pool.get_qsa_compressed_k_buffer, layer_ids)),
+            key_state=tuple(map(pool.get_qsa_key_state_buffer, layer_ids)),
+            rope_positions=pool.qsa_rope_position_buffer,
+            compress_ratio=pool.qsa_compress_ratio,
+            compressed_page_size=pool.qsa_compressed_page_size,
+            token_topk=pool.qsa_token_topk,
+        )
+
     def should_reuse_mtp_sparse_indices(self, forward_batch) -> bool:
         """Draft decode steps reuse the draft-extend selection."""
         return (
@@ -1419,8 +1470,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             or q.shape[0] != rows
         ):
             return None
-        kc = pool.get_key_buffer(layer.layer_id)
-        vc = pool.get_value_buffer(layer.layer_id)
+        kc = pool.layer_router.read(layer.layer_id).key()
+        vc = pool.layer_router.read(layer.layer_id).value()
         if (
             kc.ndim != 3
             or vc.shape != kc.shape
@@ -1480,7 +1531,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             if fused_output is not None:
                 return fused_output
-            self.token_to_kv_pool.set_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store(
                 layer, forward_batch.out_cache_loc, k, v
             )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
@@ -1505,8 +1556,8 @@ class QwenSparseAttnBackend(AttentionBackend):
             pool = self.token_to_kv_pool
             output = qsa_sparse_attention(
                 q,
-                pool.get_key_buffer(layer.layer_id),
-                pool.get_value_buffer(layer.layer_id),
+                pool.layer_router.read(layer.layer_id).key(),
+                pool.layer_router.read(layer.layer_id).value(),
                 slots,
                 layer.scaling,
             )
@@ -1541,8 +1592,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         )
         cu_seqlens_k = F.pad(sequence_lens_tensor.cumsum(0), (1, 0)).contiguous()
         packed_k, packed_v = pack_qsa_prefill_kv(
-            k=pool.get_key_buffer(layer.layer_id),
-            v=pool.get_value_buffer(layer.layer_id),
+            k=pool.layer_router.read(layer.layer_id).key(),
+            v=pool.layer_router.read(layer.layer_id).value(),
             req_to_token=self.req_to_token_pool.req_to_token,
             req_indices=forward_batch.req_pool_indices,
             cu_k=cu_seqlens_k,
@@ -1618,7 +1669,7 @@ class QwenSparseAttnBackend(AttentionBackend):
         if save_kv_cache:
             # out_cache_loc was trimmed to the full extend token count by
             # prepare_cp_forward; write all new tokens on every rank.
-            self.token_to_kv_pool.set_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store(
                 layer, forward_batch.out_cache_loc, k_full, v_full
             )
         num_local_rows = int(meta.total_q_prev_tokens + meta.total_q_next_tokens)
@@ -1627,13 +1678,33 @@ class QwenSparseAttnBackend(AttentionBackend):
         seq_lens = [int(x) for x in forward_batch.seq_lens_cpu[: meta.bs]]
         extend_lens = [int(x) for x in forward_batch.extend_seq_lens_cpu[: meta.bs]]
         prefix_lens = [seq - extend for seq, extend in zip(seq_lens, extend_lens)]
+        if any(prefix_lens) and save_kv_cache and q.is_cuda:
+            # Every selected token, prefix or new, is in the pool now (the
+            # gathered new K/V was just written), so read it in place instead of
+            # packing each request's whole context per layer.
+            pool = self.token_to_kv_pool
+            output = sparse_gqa_paged_prefill_triton(
+                q,
+                pool.layer_router.read(layer.layer_id).key(),
+                pool.layer_router.read(layer.layer_id).value(),
+                metadata.token_slot_table[: meta.bs],
+                indices,
+                meta.cu_seqlens_q_combined_tensor,
+                meta.kv_len_combined_tensor,
+                layer.scaling,
+                max_q=meta.max_seqlen_q_combined,
+            )
+            if pending is not None:
+                # Keep the prefetched K/V alive through the cache write above.
+                get_stream("qsa_cp_kv").wait_stream(torch.cuda.current_stream())
+            return self._pad_extend_output(output, num_output_rows)
         if any(prefix_lens):
             # The all-gather contains only new tokens. Prefix K/V is already
             # replicated on each CP rank; pack prefix + new tokens per request
             # so absolute logical top-k indices address the full context.
             pool = self.token_to_kv_pool
-            k_buffer = pool.get_key_buffer(layer.layer_id)
-            v_buffer = pool.get_value_buffer(layer.layer_id)
+            k_buffer = pool.layer_router.read(layer.layer_id).key()
+            v_buffer = pool.layer_router.read(layer.layer_id).value()
             # Row i holds request i's req_to_token slots; indexing it by row
             # avoids a device sync on req_pool_indices in every layer.
             slot_table = metadata.token_slot_table
@@ -1887,7 +1958,7 @@ class QwenSparseAttnBackend(AttentionBackend):
             )
             if fused_output is not None:
                 return fused_output
-            self.token_to_kv_pool.set_kv_buffer(
+            self.kv_layers.layer(layer.layer_id).store(
                 layer, forward_batch.out_cache_loc, k, v
             )
         q = q.reshape(-1, layer.tp_q_head_num, layer.head_dim)
@@ -1901,8 +1972,8 @@ class QwenSparseAttnBackend(AttentionBackend):
         topk_indices: torch.Tensor,
     ) -> torch.Tensor:
         pool = self.token_to_kv_pool
-        k_buffer = pool.get_key_buffer(layer.layer_id)
-        v_buffer = pool.get_value_buffer(layer.layer_id)
+        k_buffer = pool.layer_router.read(layer.layer_id).key()
+        v_buffer = pool.layer_router.read(layer.layer_id).value()
         metadata = self._resolve_metadata(forward_batch)
         topk_indices = self._expand_block_indices(topk_indices, metadata)
         if not q.is_cuda:

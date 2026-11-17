@@ -206,7 +206,7 @@ def _build_camera_condition(
         width=width,
         height=height,
         device=device,
-        dtype=dtype,
+        dtype=torch.float32,
     )
     c2ws_prefix = compute_relative_poses(c2ws_prefix, framewise=True)
     c2ws_prefix = c2ws_prefix[-tail_chunk_size:]

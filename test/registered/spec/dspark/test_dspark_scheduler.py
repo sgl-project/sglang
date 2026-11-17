@@ -411,6 +411,25 @@ def _fake_model_runner(capture_num_tokens, max_bs):
     return types.SimpleNamespace(decode_cuda_graph_runner=runner)
 
 
+def _fake_compact_planner(
+    *, capture_num_tokens, max_bs, verify_num_draft_tokens, align=False
+):
+    from sglang.srt.speculative.dspark_components.dspark_planner import (
+        DSparkVerifyPlanner,
+    )
+    from sglang.srt.speculative.ragged_verify import RaggedVerifyMode
+
+    planner = DSparkVerifyPlanner.__new__(DSparkVerifyPlanner)
+    planner.model_runner = _fake_model_runner(capture_num_tokens, max_bs=max_bs)
+    planner.verify_num_draft_tokens = verify_num_draft_tokens
+    planner._ragged_verify_mode = RaggedVerifyMode.COMPACT
+    planner._schedule_cfg = DSparkScheduleConfig(gamma=verify_num_draft_tokens - 1)
+    planner._dynamic_graph_tier = False
+    planner._is_verify_all = False
+    planner._align_verify_tokens_to_graph_tier = align
+    return planner
+
+
 class TestBudgetTierSelection(CustomTestCase):
     def test_floor_uses_tier_hint_capped_at_uniform_window(self):
         from sglang.srt.speculative.dspark_components.dspark_planner import (
@@ -479,6 +498,56 @@ class TestBudgetTierSelection(CustomTestCase):
                 model_runner=model_runner,
             )
         )
+
+    def test_resolve_tier_past_captured_grid_skips_round_up(self):
+        planner = _fake_compact_planner(
+            capture_num_tokens=[8, 16, 1024], max_bs=256, verify_num_draft_tokens=8
+        )
+        tier = planner._resolve_verify_tier(
+            num_reqs=200, global_num_reqs=None, dp_tier_num_tokens=None, budget=None
+        )
+        self.assertTrue(tier.exceeds_captured_grid)
+        self.assertIsNone(tier.graph_num_tokens)
+        tier = planner._resolve_verify_tier(
+            num_reqs=100, global_num_reqs=200, dp_tier_num_tokens=1100, budget=None
+        )
+        self.assertTrue(tier.exceeds_captured_grid)
+        self.assertIsNone(tier.graph_num_tokens)
+        tier = planner._resolve_verify_tier(
+            num_reqs=4, global_num_reqs=None, dp_tier_num_tokens=None, budget=None
+        )
+        self.assertFalse(tier.exceeds_captured_grid)
+        self.assertEqual(tier.graph_num_tokens, 1024)
+
+    def test_schedule_layout_past_captured_grid_falls_back_to_eager(self):
+        planner = _fake_compact_planner(
+            capture_num_tokens=[8, 16, 1024], max_bs=256, verify_num_draft_tokens=8
+        )
+        bs = 200
+        planner._schedule_verify_lens = lambda **_: torch.ones(bs, dtype=torch.int32)
+        layout = planner.schedule_layout(
+            req_pool_indices=torch.arange(bs),
+            prefix_lens=torch.zeros(bs, dtype=torch.int64),
+            device=torch.device("cpu"),
+            confidence=None,
+            budget=None,
+        )
+        self.assertIsNone(layout)
+
+    def test_aligned_budget_past_captured_grid_is_unchanged(self):
+        planner = _fake_compact_planner(
+            capture_num_tokens=[8, 16, 1024],
+            max_bs=256,
+            verify_num_draft_tokens=8,
+            align=True,
+        )
+        budget = planner._budget_aligned_to_graph_tier(
+            req_pool_indices=torch.arange(200),
+            budget=300,
+            global_num_reqs=None,
+            dp_tier_num_tokens=None,
+        )
+        self.assertEqual(budget, 300)
 
 
 if __name__ == "__main__":

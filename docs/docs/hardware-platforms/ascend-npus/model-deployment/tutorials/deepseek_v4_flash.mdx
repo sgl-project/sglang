@@ -1,7 +1,7 @@
 ---
 title: "DeepSeek-V4-Flash"
 metatags:
-  description: "Deploy DeepSeek-V4-Flash model with SGLang on Ascend NPUs, including multi-node PD disaggregation mode."
+  description: "Deploy DeepSeek-V4-Flash model with SGLang on A3 and 950PR/DT series NPUs, including multi-node PD disaggregation mode."
 ---
 
 ## Introduction
@@ -10,8 +10,9 @@ DeepSeek-V4-Flash is a Mixture-of-Experts (MoE) large language model developed b
 parameters with 13B active parameters. It employs hybrid sparse attention (CSA + HCA) and DeepSeekMoE architecture with
 a bundled multi-token prediction (MTP) draft head for speculative decoding, supporting a 1M-token context length.
 
-This document demonstrates the deployment of DeepSeek-V4-Flash on Ascend NPUs using SGLang, including multi-node PD
-disaggregation mode, feature configuration, and performance optimization.
+This document demonstrates the deployment of DeepSeek-V4-Flash on Ascend NPUs using SGLang, covering both the A3
+Series and the 950PR/DT Series (SoC name A5), including single-node PD mixed deployment, multi-node PD disaggregation
+mode, feature configuration, and performance optimization.
 
 This document is validated and written based on **SGLang v0.5.16**. The current model (DeepSeek-V4-Flash) is fully
 supported in this version. To use the latest features (e.g., PD disaggregation, speculative decoding), it is
@@ -36,7 +37,7 @@ recommended to use v0.5.16 or a later version.
 <Note>
 The values in the **Example usage** column are for illustration only. Adjust them according to your hardware, deployment
 mode, and workload. For parameter details, see
-[Feature descriptions](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#feature-descriptions); for
+[Parameter Reference](/docs/hardware-platforms/ascend-npus/optimization/parameter_tuning#parameter-reference); for
 recommended configurations for each deployment scenario, see [Best practices](#best-practices).
 </Note>
 
@@ -63,10 +64,12 @@ Before downloading model weights, check the model size to reserve enough disk sp
 For multi-node deployment, download the weights to a shared directory accessible to all nodes.
 
 - [DeepSeek-V4-Flash-w8a8-mtp](https://www.modelscope.cn/models/Eco-Tech/DeepSeek-V4-Flash-w8a8-mtp) (W8A8 quantized version, 300GB)
+- [DeepSeek-V4-Flash-0731](https://modelscope.cn/models/deepseek-ai/DeepSeek-V4-Flash-0731) (Native FP8 version, 155.44GB, for the 950PR/DT Series)
 
 <Info>
 The W8A8 variant (300GB) can be deployed on 8 × 64GB of device memory (`--tp-size 8`), which corresponds to
-8 dies on an A3 Series node (4 cards).
+8 dies on an A3 Series node (4 cards). The native FP8 variant (155.44GB) runs with `--tp-size 4` on the
+950PR/DT Series (4 cards).
 </Info>
 
 This is the minimum recommended configuration. For optimized configurations,
@@ -84,17 +87,17 @@ Ensure sufficient disk space before pulling images. The Docker image requires at
 The dependencies required for the NPU runtime environment have been integrated into a Docker image and uploaded to the
 online platform. You can directly pull it.
 
-Both **stable releases** and **daily builds** are available. CANN 9.1.0 has no stable image yet, so the following
-command uses the daily build tag `main-cann9.1.0-a3`. Once the stable image is published, switch back to the stable
-release tag.
+Both **stable releases** and **daily builds** are available. CANN 9.1.0 has no stable release yet, so the following
+commands use the validated build tags `cann9.1.0-a3-B105` (A3 Series) and `cann9.1.0-950-B105` (950PR/DT Series).
 For details, see [Docker image versions](/docs/hardware-platforms/ascend-npus/faq#8-docker-image-versions-stable-release-vs-daily-build).
 
-{/* TODO: CANN 9.1.0 has no stable image yet, so this page temporarily references the daily build tag `main-cann9.1.0-a3`. Once the stable image is published, switch back to the stable release tag. */}
+{/* TODO: Interim explanation (CANN 9.1.0 has no stable release yet). Remove it and switch the tags below to the stable release once it is published. */}
+
+<Tabs>
+  <Tab title="A3 Series">
+
 ```bash Command
-# TODO: CANN 9.1.0 has no stable image yet, so this temporarily pulls the
-# daily build tag. Once the stable image is published, switch back to the
-# stable release tag.
-docker pull quay.io/ascend/sglang:main-cann9.1.0-a3
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
 
 docker run -itd --shm-size=16g --name ${NAME} \
 --privileged=true --net=host \
@@ -122,8 +125,38 @@ docker run -itd --shm-size=16g --name ${NAME} \
 --device=/dev/davinci_manager:/dev/davinci_manager \
 --device=/dev/hisi_hdc:/dev/hisi_hdc \
 --entrypoint=bash \
-quay.io/ascend/sglang:main-cann9.1.0-a3
+swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-a3-B105
 ```
+
+  </Tab>
+  <Tab title="950PR/DT Series">
+
+```bash Command
+docker pull swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-B105
+
+docker run -itd --shm-size=16g --name ${NAME} \
+--privileged=true --net=host \
+-v /var/queue_schedule:/var/queue_schedule \
+-v /etc/ascend_install.info:/etc/ascend_install.info \
+-v /usr/local/sbin:/usr/local/sbin \
+-v /usr/local/Ascend/driver:/usr/local/Ascend/driver \
+-v /usr/local/Ascend/firmware:/usr/local/Ascend/firmware \
+--device=/dev/davinci0:/dev/davinci0  \
+--device=/dev/davinci1:/dev/davinci1  \
+--device=/dev/davinci2:/dev/davinci2  \
+--device=/dev/davinci3:/dev/davinci3  \
+--device=/dev/davinci4:/dev/davinci4  \
+--device=/dev/davinci5:/dev/davinci5  \
+--device=/dev/davinci6:/dev/davinci6  \
+--device=/dev/davinci7:/dev/davinci7  \
+--device=/dev/davinci_manager:/dev/davinci_manager \
+--device=/dev/hisi_hdc:/dev/hisi_hdc \
+--entrypoint=bash \
+swr.cn-southwest-2.myhuaweicloud.com/base_image/dockerhub/lmsysorg/sglang:cann9.1.0-950-B105
+```
+
+  </Tab>
+</Tabs>
 
 <Tip>
 - If the model weights have already been downloaded to a shared directory, use `-v` to mount the model path into the
@@ -136,8 +169,13 @@ quay.io/ascend/sglang:main-cann9.1.0-a3
 ### Single-node PD mixed deployment
 
 Single-node deployment completes both prefill and decode within the same node (PD mixed mode), suitable for scenarios
-with limited hardware resources. In such scenarios, DeepSeek-V4-Flash can be launched with half of an Ascend A3 Series
-node (4 cards, 8 dies). The configuration below was validated with `--tp-size 8`.
+with limited hardware resources. Select the script for your platform and run it inside the container.
+
+<Tabs>
+  <Tab title="A3 Series">
+
+DeepSeek-V4-Flash can be launched with half of an A3 Series node (4 cards, 8 dies). The configuration below was
+validated with `--tp-size 8`.
 
 ```bash Command
 # ============================================================
@@ -195,6 +233,79 @@ python3 -m sglang.launch_server \
     --quantization modelslim --enable-dp-lm-head \
     --kv-cache-dtype bfloat16
 ```
+
+  </Tab>
+  <Tab title="950PR/DT Series">
+
+The 950PR/DT Series (SoC name A5) exposes one device per card, and DeepSeek-V4-Flash can be launched with half of a
+node (4 cards). Use the native `DeepSeek-V4-Flash-0731` checkpoint. The configuration below was validated with
+`--tp-size 4` and DSPARK speculative decoding.
+
+```bash Command
+# ============================================================
+# Before running, update the following variable:
+#   MODEL_PATH: path to the model weights directory
+# ============================================================
+
+MODEL_PATH=/path/to/model-weights
+
+source /usr/local/Ascend/ascend-toolkit/latest/set_env.sh
+source /usr/local/Ascend/nnal/atb/set_env.sh
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/customize/bin/set_env.bash
+source /usr/local/Ascend/ascend-toolkit/latest/opp/vendors/custom_transformer/bin/set_env.bash
+
+export ASCEND_CUSTOM_OPP_PATH=/usr/local/Ascend/extra-ops/vendors/custom_transformer/:$ASCEND_CUSTOM_OPP_PATH
+export DEEPEP_HCCL_BUFFSIZE=1600
+export DEEPEP_NORMAL_COMBINE_ENABLE_LONG_SEQ=1
+export DEEPEP_NORMAL_LONG_SEQ_PER_ROUND_TOKENS=2048
+export DEEPEP_NORMAL_LONG_SEQ_ROUND=16
+export FORCE_DRAFT_MODEL_NON_QUANT=1
+export LD_LIBRARY_PATH=/usr/local/Ascend/extra-ops/vendors/custom_transformer/op_api/lib:$LD_LIBRARY_PATH
+export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
+export SGLANG_DEEPEP_NUM_MAX_DISPATCH_TOKENS_PER_RANK=160
+export SGLANG_DSPARK_A5_EXTRA_OPS_SO=/usr/local/Ascend/extra-ops/vllm_ascend_C.cpython-312-x86_64-linux-gnu.so
+export SGLANG_DSPARK_FAST_KERNEL=0
+export SGLANG_ENABLE_OVERLAP_PLAN_STREAM=1
+export SGLANG_ENABLE_SPEC_V2=1
+export SGLANG_ENABLE_WAR_BARRIER=1
+export SGLANG_FORCE_COARSE_WAR_BARRIER=1
+export SGLANG_OPT_BF16_FP32_GEMM_ALGO=torch
+export SGLANG_OPT_DEEPGEMM_HC_PRENORM=False
+export SGLANG_OPT_FP8_WO_A_GEMM=False
+export SGLANG_OPT_FUSE_WQA_WKV=0
+export SGLANG_OPT_USE_FUSED_HASH_TOPK=False
+export SGLANG_OPT_USE_OVERLAP_STORE_CACHE=False
+export SGLANG_OPT_USE_TILELANG_MHC_POST=False
+export SGLANG_OPT_USE_TILELANG_MHC_PRE=False
+export SGLANG_SET_CPU_AFFINITY=1
+export STREAMS_PER_DEVICE=32
+
+python3 -m sglang.launch_server \
+    --model-path "${MODEL_PATH}" \
+    --page-size 128 \
+    --tp-size 4 \
+    --trust-remote-code \
+    --device npu \
+    --attention-backend dsv4 \
+    --watchdog-timeout 9000 \
+    --host 127.0.0.1 --port 6688 \
+    --mem-fraction-static 0.72 \
+    --max-running-requests 64 \
+    --chunked-prefill-size 65536 \
+    --max-prefill-tokens 65536 \
+    --cuda-graph-bs-decode 1 2 4 8 16 \
+    --enable-dp-lm-head \
+    --disable-radix-cache \
+    --enable-dp-attention --dp-size 4 \
+    --reasoning-parser deepseek-v4 \
+    --speculative-algorithm DSPARK \
+    --speculative-draft-attention-backend ascend \
+    --speculative-num-draft-tokens 6 \
+    --speculative-dspark-block-size 5
+```
+
+  </Tab>
+</Tabs>
 
 For the complete benchmark data and additional single-node configurations, see
 [DeepSeek-V4-Flash Best Practice — PD Mixed On A3 Series](/docs/hardware-platforms/ascend-npus/model-deployment/best-practices/deepseek_v4_flash#single-node-pd-mixed).

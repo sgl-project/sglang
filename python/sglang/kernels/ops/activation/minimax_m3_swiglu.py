@@ -1,10 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Fused SwiGLU-OAI (split layout) Triton kernel for MiniMax-M3 on AMD ROCm.
+"""Fused SwiGLU-OAI (split layout) Triton kernels for MiniMax-M3.
 
 SwiGLU-OAI on a ``[*, 2I]`` split-layout tensor (gate = first half, up = second
 half): ``gate * sigmoid(alpha * gate) * (up + beta)`` with optional clamp,
-computed in fp32. Used by the dense MLP / shared experts ``swigluoai``
-activation on ROCm in place of the ``@torch.compile`` bf16 elementwise variant.
+computed in fp32. Used by dense MLP / shared expert ``swigluoai`` activations
+on ROCm and by Marlin MoE activations on CUDA.
 """
 
 from typing import Optional
@@ -58,6 +58,7 @@ def swiglu_oai_split(
     beta: float,
     limit: Optional[float],
     out_dtype: Optional[torch.dtype] = None,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """SwiGLU-OAI on a split-layout ``[*, 2I]`` tensor -> ``[*, I]`` (fp32 math)."""
     orig_shape = gate_up.shape
@@ -66,7 +67,8 @@ def swiglu_oai_split(
     x2 = gate_up.reshape(-1, two_i)
     m = x2.shape[0]
     dt = out_dtype if out_dtype is not None else gate_up.dtype
-    out = torch.empty((m, n_inter), dtype=dt, device=gate_up.device)
+    if out is None:
+        out = torch.empty((m, n_inter), dtype=dt, device=gate_up.device)
     # Adaptive tile (tuned on gfx950). A 512-wide tile only helps
     # once the (TP-sharded) per-rank slice is large enough to be bandwidth-bound
     # (~1.25-1.35x faster than 256 at TP=1 prefill for the dense MLP I=12288).

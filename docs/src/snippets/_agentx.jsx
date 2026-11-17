@@ -14,7 +14,41 @@
 //                            to block i of this cell's submitted router).
 //   point.patch[r]           later points: null | {replace: blocks} | per-block
 //                            {args: {flag: [values]|null}, env: {k: v|null}} | {block: full}.
-export const AgentX = ({ data }) => {
+//   point.files[r]           later points whose config files differ from the cell's first point
+//                            (e.g. an nginx.conf for another frontend count): their file ids.
+// `data` may also be an array of such files (a generated snapshot plus a hand-maintained
+// platform): they render as one explorer, and each file's source.text labels its own hardware.
+export const AgentX = ({ data: input }) => {
+  // Concatenating shifts the cell indexes of cross-cell `ref` blocks and the `envRef` indexes, in
+  // base blocks and point patches alike.
+  const data = !Array.isArray(input) ? input : input.reduce((acc, d) => {
+    const shift = (b) => ({
+      ...b,
+      ...(b.ref ? { ref: [b.ref[0] + acc.cells.length, ...b.ref.slice(1)] } : {}),
+      ...(b.envRef !== undefined ? { envRef: b.envRef + acc.envs.length } : {}),
+    });
+    const shiftPatch = (p) => (!p ? p : Array.isArray(p)
+      ? p.map((x) => (x && x.block ? { ...x, block: shift(x.block) } : x))
+      : { ...p, replace: p.replace.map(shift) });
+    const cells = d.cells.map((c) => ({
+      ...c,
+      routers: Object.fromEntries(Object.entries(c.routers).map(([r, v]) => [r, { ...v, blocks: v.blocks.map(shift) }])),
+      points: c.points.map((pt) => (!pt.patch ? pt : {
+        ...pt,
+        patch: Object.fromEntries(Object.entries(pt.patch).map(([r, p]) => [r, shiftPatch(p)])),
+      })),
+    }));
+    return {
+      ...acc,
+      hardware: [...acc.hardware, ...d.hardware],
+      checkpoints: [...acc.checkpoints, ...d.checkpoints.filter((k) => !acc.checkpoints.some((a) => a.id === k.id))],
+      cells: [...acc.cells, ...cells],
+      envs: [...acc.envs, ...(d.envs || [])],
+      files: { ...acc.files, ...(d.files || {}) },
+      kvMooncake: acc.kvMooncake || d.kvMooncake,
+      hardwareText: { ...acc.hardwareText, ...Object.fromEntries(d.hardware.map((h) => [h.id, d.source.text || {}])) },
+    };
+  }, { ...input[0], hardware: [], checkpoints: [], cells: [], envs: [], files: {}, kvMooncake: null, hardwareText: {} });
   if (!data || !data.cells) {
     return <div style={{padding: 12, color: "#b91c1c"}}>AgentX: missing <code style={S.code}>data</code> prop</div>;
   }
@@ -87,7 +121,7 @@ export const AgentX = ({ data }) => {
   // KV-offload tiers: "none" | "hicache" | "mooncake" (external linker). A derived tier strips
   // the measured tier from the cache-owning workers and adds the target tier's settings
   // (cell.kv.hicache / data.kvMooncake), mirroring the generator's kv.py.
-  const LINKER_FLAGS = ["--enable-unified-cache-external-linker", "--unified-cache-external-linker-backend", "--hicache-storage-backend-extra-config"];
+  const LINKER_FLAGS = ["--enable-unified-cache-external-linker", "--unified-cache-external-linker-backend", "--unified-cache-external-linker-config", "--hicache-storage-backend-extra-config"];
   const STORE_ONLY_ENV = ["MOONCAKE_MASTER", "MOONCAKE_TE_META_DATA_SERVER", "MOONCAKE_GLOBAL_SEGMENT_SIZE", "MOONCAKE_STANDALONE_STORAGE"];
   const CACHE_ROLES = ["agg", "prefill"];
   const isKvFlag = (n) => n === "--enable-hierarchical-cache" || n.startsWith("--hicache-") || LINKER_FLAGS.includes(n);
@@ -121,11 +155,71 @@ export const AgentX = ({ data }) => {
     }
     return out;
   };
+  // Submissions record router flags that sgl-router does not all take; render the sgl-router command that
+  // python/sglang/test/agentx_common.py launches for them, and keep the two in step.
+  // sgl-router reads each worker's PD role from its /server_info, so one --worker-urls list
+  // replaces --prefill/--decode.
+  // Flags whose behavior is sgl-router's default, or that it has no counterpart for.
+  const ROUTER_FLAGS_DROPPED = new Set(["--pd-disaggregation", "--request-id-headers",
+    "--connect-timeout-secs", "--disable-health-check", "--disable-retries",
+    "--balance-abs-threshold", "--retry-backoff-multiplier"]);
+  // cache_aware learns prefixes only from the cache-owning workers' KV events. sgl-router finds
+  // them through each worker's /server_info: one port per DP rank from the advertised base, and
+  // with --load-publish-endpoint auto as many again for load reports. Workers sharing a node
+  // offset that base by LOCAL_WORKER_RANK.
+  const KV_EVENTS_PORT = 5557;
+  const kvEventsConfig = (port) => `{"publisher":"zmq","topic":"kv-events","endpoint":"tcp://*:${port}"}`;
+  // The router renders chats itself, so it needs the workers' render defaults.
+  const RENDER_ENV = ["SGLANG_DEFAULT_THINKING", "SGLANG_DSV4_REASONING_EFFORT", "SGLANG_DSV41_REASONING_EFFORT"];
+  const flag = (blk, name) => (((blk && blk.args) || []).find((a) => a[0] === name) || [])[1];
+  const withKvEvents = (w) => {
+    if (w.kind !== "worker" || !CACHE_ROLES.includes(w.role) || flag(w, "--kv-events-config")) return w;
+    const ranks = Number(flag(w, "--data-parallel-size") || flag(w, "--dp-size") || flag(w, "--dp") || 1)
+      * Number(flag(w, "--attn-dp-size") || 1);
+    const shared = w.local_ranks
+      ? `KV_EVENTS_CONFIG=${JSON.stringify(kvEventsConfig(`$((${KV_EVENTS_PORT} + ${2 * ranks} * LOCAL_WORKER_RANK))`))}`
+      : null;
+    const args = [...w.args, ["--kv-events-config", shared ? "$KV_EVENTS_CONFIG" : kvEventsConfig(KV_EVENTS_PORT)],
+      ["--load-publish-endpoint", "auto"]].sort(cmpArgs);
+    return { ...w, ...(shared ? { preamble: [...(w.preamble || []), shared] } : {}), args };
+  };
+  const toSglRouter = (blocks) => {
+    const b = blocks.find((x) => x.kind === "sgl-router");
+    const worker = blocks.find((w) => w.kind === "worker");
+    const model = flag(worker, "--model-path");
+    const served = flag(worker, "--served-model-name") || model;
+    const urls = [];
+    const rest = [];
+    for (const a of b.args || []) {
+      if (a[0] === "--prefill" || a[0] === "--decode") urls.push(a[1]);
+      else if (a[0] === "--worker-urls") urls.push(...a.slice(1));
+      // consistent_hashing pinned a routing key to a worker; cache_aware, which keeps a
+      // conversation on the worker holding its prefix, stands in for it (sgl-router's sticky
+      // is the exact counterpart, but needs clients to send the key).
+      else if (a[0] === "--policy") rest.push(["--policy", a[1] === "consistent_hashing" ? "cache_aware" : a[1]]);
+      // The recipe bounds the whole request; sgl-router bounds the time to response headers,
+      // the silence between chunks and the request lifetime separately.
+      else if (a[0] === "--request-timeout-secs") rest.push(a, ["--stream-idle-timeout-secs", a[1]], ["--stale-request-timeout-secs", a[1]]);
+      else if (a[0] === "--retry-max-retries") rest.push(["--retry-max-attempts", String(Number(a[1]) + 1)]);
+      else if (!ROUTER_FLAGS_DROPPED.has(a[0])) rest.push(a);
+    }
+    const cacheAware = rest.some((a) => a[0] === "--policy" && a[1] === "cache_aware");
+    if (!cacheAware) {
+      const router = { ...b, cmd: "sgl-router", args: [["--model-id", served], ["--no-tokenizer"], ["--worker-urls", ...urls], ...rest] };
+      return blocks.map((x) => (x === b ? router : x));
+    }
+    const cacheWorker = blocks.find((w) => w.kind === "worker" && CACHE_ROLES.includes(w.role));
+    const env = Object.fromEntries(Object.entries((cacheWorker && cacheWorker.env) || {}).filter(([k]) => RENDER_ENV.includes(k)));
+    const router = { ...b, cmd: "sgl-router", env: sortedObj({ ...(b.env || {}), ...env }),
+      args: [["--model-id", served], ["--tokenizer-path", model], ["--worker-urls", ...urls], ...rest] };
+    return blocks.map((x) => (x === b ? router : withKvEvents(x)));
+  };
   const blocksFor = (ci, pi, router, kv) => {
     const cell = data.cells[ci];
     const base = materialize(ci, router);
     const measured = pi === 0 ? base : applyPatch(base, ((cell.points[pi] || {}).patch || {})[router]);
-    return kvTransform(measured, cell.points[pi].kv, kv || cell.points[pi].kv, cell.kv, router);
+    const blocks = kvTransform(measured, cell.points[pi].kv, kv || cell.points[pi].kv, cell.kv, router);
+    return blocks.some((b) => b.kind === "sgl-router") ? toSglRouter(blocks) : blocks;
   };
 
   // ==== 2. Shell formatting ====
@@ -161,7 +255,7 @@ export const AgentX = ({ data }) => {
     "mooncake-master": "Mooncake master",
     "mooncake-store": "Mooncake store",
     "dynamo-frontend": "Dynamo frontend (OpenAI API)",
-    "sglang-router": "SGLang router (OpenAI API)",
+    "sgl-router": "SGLang router (OpenAI API)",
     nginx: "nginx — optional frontend load balancer",
   };
   const where = (b, router, workerCount) => {
@@ -170,7 +264,8 @@ export const AgentX = ({ data }) => {
       const parts = [];
       if (b.workers > 1) parts.push(`Start ${b.workers} ${b.role} workers${n > 1 ? `, each spanning ${n} nodes` : b.gpu_pinning ? " across the shared nodes" : ", one per node"}.`);
       if (n > 1) parts.push(`Run on every node of a worker with NODE_RANK=0..${n - 1}; ${ROLE_HEAD[b.role]} is that worker's first node.`);
-      if (b.gpu_pinning) parts.push(`Workers share nodes: pin GPUs per worker with CUDA_VISIBLE_DEVICES = ${b.gpu_pinning.map((w, i) => `worker ${i}: ${w.filter(Boolean).join(" / ") || "all"}`).join(" · ")}.`);
+      if (b.local_ranks) parts.push(`Workers share nodes: set LOCAL_WORKER_RANK per worker (${b.local_ranks.map((r, i) => `worker ${i}: ${r}`).join(" · ")}); the first lines pick its GPUs and ports.`);
+      else if (b.gpu_pinning) parts.push(`Workers share nodes: pin GPUs per worker with CUDA_VISIBLE_DEVICES = ${b.gpu_pinning.map((w, i) => `worker ${i}: ${w.filter(Boolean).join(" / ") || "all"}`).join(" · ")}.`);
       if (router === "sglang" && workerCount === 1 && b.role === "agg" && n === 1) parts.push("Serves the OpenAI API on port 30000.");
       if (router === "dynamo") parts.push("Workers register with Dynamo through etcd; start them after etcd/NATS.");
       return parts.join(" ") || `Run on the ${b.role} node.`;
@@ -186,7 +281,7 @@ export const AgentX = ({ data }) => {
     }
     if (b.kind === "dynamo-frontend") return (b.count > 1 ? `SA ran ${b.count} frontends on separate nodes behind nginx (previous tab; port 8180 each, nginx on 8000). One frontend on port 8000 also works.` : "Start once; clients connect to port 8000.") + " It finds the workers through etcd, so it can start before them.";
     if (b.kind === "nginx") return "Optional scale-out in front of the frontends (next tab): hashes each session onto one frontend and listens on port 8000, with nginx.conf (below) in the working directory.";
-    if (b.kind === "sglang-router") return "Start once after the workers; clients connect to port 8000.";
+    if (b.kind === "sgl-router") return "Start once after the workers; clients connect to port 8000.";
     return "";
   };
   const noteText = (S) => ({
@@ -197,6 +292,7 @@ export const AgentX = ({ data }) => {
     "nixl-libfabric": <><code style={S.code}>SGLANG_DISAGGREGATION_NIXL_BACKEND=LIBFABRIC</code> reflects SemiAnalysis's AWS-EFA B300 cluster. On InfiniBand, leave it unset to use NIXL's default UCX backend.</>,
     "ib-devices": <>Set <code style={S.code}>IB_DEVICES</code> to your node's RDMA NICs (comma-separated, e.g. <code style={S.code}>mlx5_0,mlx5_1</code>).</>,
     "mooncake-segment": <><code style={S.code}>MOONCAKE_GLOBAL_SEGMENT_SIZE</code> is the host DRAM each worker process contributes to the Mooncake store. Size it to your host memory.</>,
+    "sgl-router": <>The router command here is the recorded router flags translated to <code style={S.code}>sgl-router</code>, as the AgentX test harness launches it. Its <code style={S.code}>cache_aware</code> policy learns prefixes only from the workers' KV events, so the workers that hold the cache add <code style={S.code}>--kv-events-config</code> and <code style={S.code}>--load-publish-endpoint auto</code>.</>,
   });
   const notesFor = (blocks) => {
     const names = new Set(blocks.flatMap((b) => (b.args || []).map((a) => a[0])));
@@ -210,11 +306,12 @@ export const AgentX = ({ data }) => {
       env.SGLANG_DISAGGREGATION_NIXL_BACKEND === "LIBFABRIC" && "nixl-libfabric",
       env.MOONCAKE_GLOBAL_SEGMENT_SIZE !== undefined && "mooncake-segment",
       text.includes("$IB_DEVICES") && "ib-devices",
+      blocks.some((b) => b.kind === "sgl-router") && "sgl-router",
     ].filter(Boolean);
   };
   const PLACEHOLDERS = {
     NODE_RANK: "rank of this node within its worker (0 on the worker's first node)",
-    LOCAL_WORKER_RANK: "prefill worker index on this node (0 or 1; selects GPUs and distinct ports)",
+    LOCAL_WORKER_RANK: "this worker's index on its node (selects its GPUs and ports)",
     NODE_IP: "IP of the node the command runs on",
     ETCD_IP: "node running etcd",
     NATS_IP: "node running NATS",
@@ -224,6 +321,7 @@ export const AgentX = ({ data }) => {
     DECODE_HEAD_IP: "first node of this decode worker",
     IB_DEVICES: "the node's RDMA NICs",
     EFA_DEVICES: "EFA device filter (AWS EFA fabrics only)",
+    DRAFT_MODEL_DIR: "local snapshot directory of the draft checkpoint (see the setup note)",
   };
   const placeholderText = (name) =>
     PLACEHOLDERS[name] ||
@@ -265,7 +363,7 @@ export const AgentX = ({ data }) => {
   const tabSlug = (t) => (t.id === "exports" ? "env"
     : t.file ? t.file.name
     : t.block.kind === "worker" ? (t.block.role === "agg" ? "worker" : t.block.role)
-    : { "dynamo-frontend": "frontend", "sglang-router": "router" }[t.block.kind] || t.block.kind);
+    : { "dynamo-frontend": "frontend", "sgl-router": "router" }[t.block.kind] || t.block.kind);
 
   // Provenance: values shared by every point of a deployment live once in cell.prov, and GitHub
   // URLs are stored as ids (mirrors expand_point() in emit.py, which checks the round trip).
@@ -355,13 +453,14 @@ export const AgentX = ({ data }) => {
   const point = pointInfo(cell, cell.points[pi]);
   const kv = kvChoice && kvSelectable(cell, point, kvChoice) ? kvChoice : point.kv;
   const routerData = cell.routers[router];
+  const fileIds = ((cell.points[pi] || {}).files || {})[router] || routerData.files;
   const blocks = blocksFor(cellIdx, pi, router, kv);
   const status = router === cell.submitted && kv === point.kv ? point.status : "derived";
   const workerCount = blocks.filter((b) => b.kind === "worker").reduce((n, b) => n + (b.workers || 1), 0);
   const blockText = blocks.map(formatBlock);
   const blockTitle = (b) => (b.kind === "worker" ? ROLE_TITLE[b.role] : KIND_TITLE[b.kind] || b.kind);
   const allText = blocks.map((b, i) => `# ${blockTitle(b)}\n${blockText[i]}`).join("\n\n");
-  const usedPlaceholders = [...new Set((allText + JSON.stringify(routerData.files.map((f) => data.files[f]))).match(/\$[A-Z][A-Z0-9_]*/g) || [])]
+  const usedPlaceholders = [...new Set((allText + JSON.stringify(fileIds.map((f) => data.files[f]))).match(/\$[A-Z][A-Z0-9_]*/g) || [])]
     .map((p) => p.slice(1))
     .filter((p) => placeholderText(p));
   const exportText = usedPlaceholders.map((p) => `export ${p}=<${placeholderText(p)}>`).join("\n");
@@ -369,12 +468,12 @@ export const AgentX = ({ data }) => {
 
   const shortTitle = (b) => {
     const base = b.kind === "worker" ? { agg: "Worker", prefill: "Prefill", decode: "Decode" }[b.role]
-      : { etcd: "etcd", nats: "NATS", "mooncake-master": "Mooncake master", "mooncake-store": "Mooncake store", "dynamo-frontend": "Frontend", "sglang-router": "Router", nginx: "nginx (optional)" }[b.kind] || b.kind;
+      : { etcd: "etcd", nats: "NATS", "mooncake-master": "Mooncake master", "mooncake-store": "Mooncake store", "dynamo-frontend": "Frontend", "sgl-router": "Router", nginx: "nginx (optional)" }[b.kind] || b.kind;
     const n = b.kind === "worker" ? b.workers : b.count;
     return n > 1 ? `${base} ×${n}` : base;
   };
   // Config files sit in the tab of the process that reads them (nats.conf under NATS, ...).
-  const fileList = routerData.files.map((fid) => data.files[fid]);
+  const fileList = fileIds.map((fid) => data.files[fid]);
   const looseFiles = fileList.filter((f) => !blockText.some((t) => t.includes(f.name)));
   const tabs = [
     ...(usedPlaceholders.length ? [{ id: "exports", label: "Env Vars" }] : []),
@@ -469,11 +568,13 @@ export const AgentX = ({ data }) => {
     a: { color: accent, textDecoration: "underline" },
   };
 
+  // Pages whose launches were not measured in InferenceX name their source in data.source.text.
+  const T = (data.hardwareText || {})[hw] || data.source.text || {};
   const statusText = {
-    verified: "✓ Verified in SemiAnalysis InferenceX AgentX",
+    verified: T.verified || "✓ Verified in SemiAnalysis InferenceX AgentX",
     "verified-pr": `✓ Verified in SemiAnalysis InferenceX AgentX (PR #${point.pr}, pending merge)`,
     "in-progress": `◐ In progress in SemiAnalysis InferenceX AgentX (PR #${point.pr})`,
-    derived: "Derived — not run in SemiAnalysis InferenceX AgentX",
+    derived: T.derived || "Derived — not run in SemiAnalysis InferenceX AgentX",
   }[status];
   const routerLabel = { sglang: "SGLang", dynamo: "Dynamo + SGLang" };
   const concLabel = (p) => `c${p.concs.join(" / c")}`;
@@ -540,7 +641,7 @@ export const AgentX = ({ data }) => {
           {Object.keys(cell.routers).sort().map((r) => (
             <button key={r} value={r} style={S.chip(router === r)} onClick={() => pick(setRouter)(r)}>
               {routerLabel[r]}{r === cell.submitted ? " ✓" : ""}
-              <span style={S.sub}>{r === cell.submitted ? "as submitted to SA" : "derived"}</span>
+              <span style={S.sub}>{r === cell.submitted ? T.submitted || "as submitted to SA" : "derived"}</span>
             </button>
           ))}
         </div>
@@ -553,7 +654,7 @@ export const AgentX = ({ data }) => {
             {link(point.runUrl, "SA sweep run")}{point.runUrl && " · "}
             {point.prUrl && <>{link(point.prUrl, `InferenceX PR #${point.pr}`)} · </>}
             {point.jobUrl && <>{link(point.jobUrl, "job log")} · </>}
-            {point.date && <>dashboard date {point.date} · </>}
+            {point.date && <>{T.dateLabel || "dashboard date"} {point.date} · </>}
           </>}
           config <code style={S.code}>{cell.configKey}</code>
           {point.recipeUrl && <> · {link(point.recipeUrl, "recipe")}{point.override ? <> (<code style={S.code}>{point.override}</code>)</> : null}</>}
@@ -567,9 +668,9 @@ export const AgentX = ({ data }) => {
         )}
         {status === "derived" && (
           <ul style={S.list}>
-            <li>Derived from the verified launch ({routerLabel[cell.submitted]}, {KV_LABEL[point.kv].toLowerCase()}); SemiAnalysis did not run this combination.</li>
+            <li>Derived from the verified launch ({routerLabel[cell.submitted]}, {KV_LABEL[point.kv].toLowerCase()}); {T.notRun || "SemiAnalysis did not run this combination"}.</li>
             {router !== cell.submitted && (
-              <li>Router: re-rendered with srt-slurm's {router === "dynamo" ? "Dynamo" : "SGLang router"} frontend. Engine flags are unchanged; only the launcher, routing and router-specific flags differ.</li>
+              <li>Router: re-rendered with {router === "dynamo" ? "srt-slurm's Dynamo frontend" : "sgl-router"}. Engine flags are unchanged; only the launcher, routing and router-specific flags differ.</li>
             )}
             {kv !== point.kv && kv === "none" && <li>KV offload: removed; only the GPU KV cache is used.</li>}
             {kv !== point.kv && kv === "hicache" && (
@@ -582,6 +683,7 @@ export const AgentX = ({ data }) => {
         )}
         <ul style={S.list}>
           {cell.disclosures.includes("synthetic-acceptance") && point.goldenAL && (
+            T.acceptance ? <li>{T.acceptance.replace("{al}", point.goldenAL)}</li> :
             <li>{point.status === "in-progress" ? "The pending submission specifies" : "SemiAnalysis measured this point with"} a synthetic speculative-decoding acceptance length of {point.goldenAL} (InferenceX golden AL via <code style={S.code}>SGLANG_SIMULATE_ACC_LEN</code>), which is not part of these commands. Real speed depends on your workload's acceptance.</li>
           )}
           {cell.disclosures.includes("chat-template") && (

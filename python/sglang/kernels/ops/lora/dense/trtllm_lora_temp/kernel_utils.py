@@ -1,7 +1,4 @@
 from sglang.kernels.jit.utils import is_arch_support_pdl
-from sglang.kernels.ops.lora.dense.kernel_utils import (
-    _resolve_token_positions as _resolve_token_positions,
-)
 
 
 def get_pdl_launch_metadata() -> tuple[bool, dict]:

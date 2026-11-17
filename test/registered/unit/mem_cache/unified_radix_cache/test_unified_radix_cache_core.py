@@ -7,10 +7,9 @@ from unittest import mock
 import torch
 
 from sglang.srt.environ import envs
-from sglang.srt.managers.schedule_batch import (
-    FINISH_LENGTH,
-    Req,
-)
+from sglang.srt.managers.req_types import FINISH_LENGTH
+from sglang.srt.managers.schedule_batch import Req
+from sglang.srt.mem_cache.allocation import retire_window
 from sglang.srt.mem_cache.base_prefix_cache import (
     EvictParams,
     InsertParams,
@@ -25,27 +24,30 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
+from sglang.srt.mem_cache.kv.plan import TREE_WINDOW
 from sglang.srt.mem_cache.memory_pool import (
     ReqToTokenPool,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.static_kv_storage import StaticKVStorage, acquire_rows
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     FreeDeviceKV,
     RecoverSWAWithLockedFull,
     UpdatePendingBackupOnNodeSplit,
 )
-from sglang.srt.mem_cache.unified_cache.components.base import (
-    ComponentType,
-    EvictLayer,
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+from sglang.srt.mem_cache.unified_cache.components.base import EvictLayer
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+    UnifiedLRUList,
+    UnifiedTreeNode,
 )
 from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import (
     EvictDeviceLeafResult,
 )
 from sglang.srt.mem_cache.unified_radix_cache import (
     COMPONENT_REGISTRY,
-    UnifiedLRUList,
     UnifiedRadixCache,
-    UnifiedTreeNode,
     _OngoingWriteThrough,
 )
 from sglang.srt.runtime_context import (
@@ -96,6 +98,13 @@ from sglang.test.kits.unified_radix_cache.fixtures import (
 )
 from sglang.test.mem_cache_utils import finish_req
 from sglang.test.test_utils import CustomTestCase
+from sglang.test.tree_slots import (
+    FAMILY_OF,
+    index_slots,
+    tree_slots_of,
+    window_evictable,
+    window_protected,
+)
 
 register_cuda_ci(est_time=24, stage="base-b", runner_config="1-gpu-small")
 register_amd_ci(est_time=24, suite="stage-b-test-1-gpu-small-amd")
@@ -113,14 +122,18 @@ class TestUnifiedRadixComponentRegistryOverride(CustomTestCase):
             token_to_kv_pool_allocator=None,
             page_size=1,
             disable=True,
-            tree_components=(ComponentType.FULL,),
-            component_registry_override={ComponentType.FULL: FakeFullComponent},
+            tree_slots=tree_slots_of((ComponentType.FULL,)),
+            component_registry_override={
+                FAMILY_OF[ComponentType.FULL]: FakeFullComponent
+            },
         )
 
         cache = UnifiedRadixCache(params=params)
 
         self.assertIsInstance(cache.components[ComponentType.FULL], FakeFullComponent)
-        self.assertIsNot(COMPONENT_REGISTRY[ComponentType.FULL], FakeFullComponent)
+        self.assertIsNot(
+            COMPONENT_REGISTRY[FAMILY_OF[ComponentType.FULL]], FakeFullComponent
+        )
 
 
 class TestUnifiedRadixComponentLedgerUnits(CustomTestCase):
@@ -129,7 +142,9 @@ class TestUnifiedRadixComponentLedgerUnits(CustomTestCase):
         not len(value), or the ledger drifts from sanity_check's recount."""
         cache, allocator, _ = build_fixture(
             CacheConfig(),
-            component_registry_override={ComponentType.FULL: PagedFullComponent},
+            component_registry_override={
+                FAMILY_OF[ComponentType.FULL]: PagedFullComponent
+            },
             tree_core_backend="python",
         )
         component = cache.components[ComponentType.FULL]
@@ -294,7 +309,9 @@ class TestUnifiedRadixAllocationEvictionRealComponents(
                     self.assertEqual(result.num_tokens_evicted, 0)
                     self.assertEqual(drain_count, 1)
                     evicted = (
-                        result.swa_num_tokens_evicted
+                        result.window_num_tokens_evicted.get(
+                            cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+                        )
                         if component_type is ComponentType.SWA
                         else result.mamba_num_evicted
                     )
@@ -316,7 +333,13 @@ class TestUnifiedRadixAllocationEvictionRealComponents(
                         for node_id in (first, second)
                     )
                     params = (
-                        EvictParams(swa_num_tokens=request_count)
+                        EvictParams(
+                            window_num_tokens={
+                                cache.window_sub_pool_of_slot(
+                                    ComponentType.SWA
+                                ): request_count
+                            }
+                        )
                         if component_type is ComponentType.SWA
                         else EvictParams(mamba_num=request_count)
                     )
@@ -330,7 +353,9 @@ class TestUnifiedRadixAllocationEvictionRealComponents(
                         node_device_value(cache, leaf, ComponentType.FULL)
                     )
                     evicted = (
-                        result.swa_num_tokens_evicted
+                        result.window_num_tokens_evicted.get(
+                            cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+                        )
                         if component_type is ComponentType.SWA
                         else result.mamba_num_evicted
                     )
@@ -649,7 +674,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         )
         # The window already slid past [0, 6): those SWA slots are freed.
         allocator.free_swa(kv_indices[:evicted_len])
-        req.kv.set_evicted_seqlen(ComponentType.SWA, evicted_len)
+        req.kv.set_evicted_seqlen(cache.window_sub_pools()[0][0], evicted_len)
 
         cache.checkpoint(req, up_to=req.extend_end)
 
@@ -674,7 +699,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
             full_avail,
         )
         self.assertEqual(
-            allocator.swa_attn_allocator.available_size() + cache.swa_evictable_size(),
+            allocator.swa_attn_allocator.available_size() + window_evictable(cache),
             swa_avail,
         )
 
@@ -686,7 +711,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         tokens = self._make_seq(1, 8)
         evicted_len = 4
         req, _ = self._make_inflight_req(cache, allocator, req_to_token_pool, tokens)
-        req.kv.set_evicted_seqlen(ComponentType.SWA, evicted_len)
+        req.kv.set_evicted_seqlen(cache.window_sub_pools()[0][0], evicted_len)
 
         cache.checkpoint(req, up_to=req.extend_end)
 
@@ -852,7 +877,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
 
         lock_result = cache.inc_lock_ref(last_device_node)
         req, _ = self._make_inflight_req(cache, allocator, req_to_token_pool, tokens)
-        req.kv.set_evicted_seqlen(ComponentType.SWA, 0)
+        req.kv.set_evicted_seqlen(cache.window_sub_pools()[0][0], 0)
 
         full_available_before_insert = allocator.full_attn_allocator.available_size()
 
@@ -872,7 +897,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self.assertIsNotNone(swa_value)
         self.assertTrue(
             torch.equal(
-                allocator.translate_loc_from_full_to_swa(old_full_value),
+                allocator.id_spaces()[IdSpaceKind.SLIDING_WINDOW].ids(old_full_value),
                 swa_value,
             )
         )
@@ -966,7 +991,13 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         )
 
         # SWA eviction skips A's Full lock and cascades the unlocked lower-tier Mamba.
-        cache.evict(EvictParams(num_tokens=0, swa_num_tokens=len(seq_a)))
+        cache.evict(
+            EvictParams(
+                window_num_tokens={
+                    cache.window_sub_pool_of_slot(ComponentType.SWA): len(seq_a)
+                }
+            )
+        )
         self.assertGreaterEqual(
             node_device_lock_ref(cache, node_a, ComponentType.FULL),
             1,
@@ -1142,7 +1173,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
 
                 lock_result = cache.inc_lock_ref(leaf)
                 # SWA pins one window; full attention pins everything.
-                self.assertEqual(cache.swa_protected_size(), len(swa_val))
+                self.assertEqual(window_protected(cache), len(swa_val))
                 self.assertEqual(cache.full_protected_size(), len(seq))
                 cache.sanity_check()
                 cache.dec_lock_ref(
@@ -1275,7 +1306,13 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         m_side_before = match_prefix(cache, seq_side)
         self.assertEqual(m_side_before.device_prefix_len, len(seq_side))
 
-        cache.evict(EvictParams(num_tokens=0, swa_num_tokens=self.cfg.page_size))
+        cache.evict(
+            EvictParams(
+                window_num_tokens={
+                    cache.window_sub_pool_of_slot(ComponentType.SWA): self.cfg.page_size
+                }
+            )
+        )
 
         m_side_after = match_prefix(cache, seq_side)
         self.assertEqual(
@@ -1306,10 +1343,10 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         cushion = max(self.cfg.sliding_window_size, self.cfg.page_size)
         expected_evicted = (pre_len - 1) - cushion
         self.assertEqual(
-            req.kv.get_evicted_seqlen(ComponentType.SWA),
+            req.kv.get_evicted_seqlen(cache.window_sub_pools()[0][0]),
             expected_evicted,
             f"swa_evicted_seqlen should advance to (pre_len-1) - cushion = "
-            f"{expected_evicted}, got {req.kv.get_evicted_seqlen(ComponentType.SWA)}",
+            f"{expected_evicted}, got {req.kv.get_evicted_seqlen(cache.window_sub_pools()[0][0])}",
         )
 
         swa_avail_after = allocator.swa_attn_allocator.available_size()
@@ -1375,7 +1412,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
             cache.checkpoint(req, up_to=req.extend_end)
 
         self.assertEqual(
-            req.kv.get_evicted_seqlen(ComponentType.SWA),
+            req.kv.get_evicted_seqlen(cache.window_sub_pools()[0][0]),
             0,
             "Nothing should be evicted when prefill fits inside the cushion",
         )
@@ -1423,14 +1460,21 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
 
         evict_params = EvictParams(num_tokens=0)
         if aux == ComponentType.SWA:
-            evict_params.swa_num_tokens = aux_len
+            evict_params.window_num_tokens = {
+                cache.window_sub_pool_of_slot(aux): aux_len
+            }
         else:
             evict_params.mamba_num = aux_len
         result = cache.evict(evict_params)
 
         self.assertEqual(result.num_tokens_evicted, 0)
         if aux == ComponentType.SWA:
-            self.assertEqual(result.swa_num_tokens_evicted, aux_len)
+            self.assertEqual(
+                result.window_num_tokens_evicted.get(
+                    cache.window_sub_pool_of_slot(ComponentType.SWA), 0
+                ),
+                aux_len,
+            )
         else:
             self.assertEqual(result.mamba_num_evicted, aux_len)
         self.assertIsNotNone(node_device_value(cache, node, ComponentType.FULL))
@@ -1483,7 +1527,7 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         if self.cfg.has_mamba:
             self.assertEqual(cache.mamba_evictable_size(), 0)
         if self.cfg.has_swa:
-            self.assertEqual(cache.swa_evictable_size(), 0)
+            self.assertEqual(window_evictable(cache), 0)
         self.assertEqual(len(node_children(cache, cache.root_node_handle())), 0)
         cache.sanity_check()
 
@@ -1553,9 +1597,15 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
         self._insert(cache, allocator, req_to_token_pool, base)
         self._insert(cache, allocator, req_to_token_pool, leaf)
 
-        swa_before = cache.swa_evictable_size()
-        result = cache.evict(EvictParams(num_tokens=0, swa_num_tokens=swa_before * 2))
-        self.assertEqual(cache.swa_evictable_size(), 0)
+        swa_before = window_evictable(cache)
+        result = cache.evict(
+            EvictParams(
+                window_num_tokens={
+                    cache.window_sub_pool_of_slot(ComponentType.SWA): swa_before * 2
+                }
+            )
+        )
+        self.assertEqual(window_evictable(cache), 0)
         cache.sanity_check()
 
     @requires(
@@ -1612,7 +1662,9 @@ class UnifiedRadixCacheCoreSuite(UnifiedRadixCacheCoreFixtures):
             match_prefix(cache, tokens).device_prefix_len, branching_seqlen
         )
         expected_evicted = forward_len - 1 - self.cfg.sliding_window_size
-        self.assertEqual(req.kv.get_evicted_seqlen(ComponentType.SWA), expected_evicted)
+        self.assertEqual(
+            req.kv.get_evicted_seqlen(cache.window_sub_pools()[0][0]), expected_evicted
+        )
 
         # The cached branch keeps SWA for its last window; the forward overshoot
         # past it is released, and the request keeps its own live window.
@@ -1862,9 +1914,39 @@ class TestUnifiedRadixCacheInt8MambaCheckpoint(
         self.assertEqual(ckpt_pool.available_size(), ckpt_initial)
         self.assertEqual(cache.mamba_evictable_size(), 0)
 
+    def test_full_checkpoint_pool_evicts_a_cached_checkpoint(self):
+        """With the checkpoint pool full of cached states and active slots
+        free, storing one more checkpoint evicts a cached one first."""
+        cache, allocator, req_to_token_pool = build_fixture(
+            replace(self.cfg, kv_size=256)
+        )
+        ckpt_pool = req_to_token_pool.mamba_ckpt_pool
+        capacity = ckpt_pool.available_size()
+
+        def finish_and_release(tokens):
+            req = self._make_req(req_to_token_pool, tokens)
+            kv_indices = allocator.alloc(len(tokens))
+            self.assertIsNotNone(kv_indices)
+            req_to_token_pool.write(
+                (req.kv.req_pool_idx, slice(0, len(tokens))), kv_indices
+            )
+            req.last_node = cache.root_node_handle()
+            finish_req(cache, req, req.owned_kv_len())
+            req_to_token_pool.free(req)
+
+        for i in range(capacity):
+            finish_and_release([100 + i, 2, 3, 4])
+        self.assertEqual(ckpt_pool.available_size(), 0)
+        self.assertEqual(cache.mamba_evictable_size(), capacity)
+        self.assertGreater(req_to_token_pool.mamba_allocator.available_size(), 0)
+
+        finish_and_release([7, 8, 9, 10])
+        self.assertEqual(ckpt_pool.available_size(), 0)
+        self.assertEqual(cache.mamba_evictable_size(), capacity)
+
 
 def _component_with_cache(component_type, cache):
-    component = object.__new__(COMPONENT_REGISTRY[component_type])
+    component = object.__new__(COMPONENT_REGISTRY[FAMILY_OF[component_type]])
     component.cache = cache
     component.tree_core = cache.tree_core
     return component
@@ -1874,6 +1956,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
     def test_retraction_uses_engine_transfer_index_domains(self):
         cache = object.__new__(UnifiedRadixCache)
         cache.is_swa_enabled = True
+        index_slots(cache, (ComponentType.FULL, ComponentType.SWA))
         cache._sliding_window_size = 3
         cache.tree_core = mock.Mock(page_size=2)
         cache.page_size = 2
@@ -1882,9 +1965,17 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         cache.req_to_token_pool.req_to_token = torch.tensor(
             [[1, 2, 3, 4, 5, 0]], dtype=torch.int64
         )
-        cache.token_to_kv_pool_allocator = mock.Mock()
-        cache.token_to_kv_pool_allocator.translate_swa_indices_for_transfer.side_effect = (
-            lambda indices: indices + 100
+        cache.token_to_kv_pool_allocator = mock.Mock(hands_out_virtual_ids=False)
+        # Each window component reads its rows through the storage it lives in.
+        storage = mock.Mock()
+        storage.window_ids.side_effect = lambda sub_pool, indices: indices + 100
+        cache._components_tuple = (
+            SimpleNamespace(
+                slot=SimpleNamespace(family=TREE_WINDOW, window=3),
+                component_type=ComponentType.SWA,
+                pool_name=PoolName.SWA,
+                storage_and_sub_pool=lambda: (storage, "swa"),
+            ),
         )
         req = mock.Mock(rid="req", seqlen=6)
         req.kv.req_pool_idx = 0
@@ -1900,7 +1991,7 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
                 torch.tensor([103, 104, 105, 106]),
             )
         )
-        cache.token_to_kv_pool_allocator.translate_swa_indices_for_transfer.assert_called_once()
+        storage.window_ids.assert_called_once()
         cache.token_to_kv_pool_allocator.translate_kv_indices_for_transfer.assert_not_called()
         cache.token_to_kv_pool_allocator.translate_loc_from_full_to_swa.assert_not_called()
 
@@ -1920,10 +2011,12 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
     def test_apply_component_action_swa_recover_on_full_locked(self):
         cache = mock.MagicMock()
         alloc = cache.token_to_kv_pool_allocator
+        alloc.hands_out_virtual_ids = False
         kept_full = torch.tensor([1, 2], dtype=torch.int64)
         incoming_full = torch.tensor([3, 4], dtype=torch.int64)
         swa_value = torch.tensor([7, 8], dtype=torch.int64)
         alloc.translate_swa_indices_for_transfer.return_value = swa_value
+        cache.kv_storage = lambda: StaticKVStorage(None, alloc)
         component_with_cache(ComponentType.SWA, cache).apply_component_action(
             RecoverSWAWithLockedFull(
                 node_id=5,
@@ -1991,11 +2084,13 @@ class TestUnifiedRadixCacheActionRouting(CustomTestCase):
         order = mock.Mock()
         cache.linker = order.linker
         cache.token_to_kv_pool_allocator = order.allocator
+        cache.kv_storage = lambda: StaticKVStorage(None, order.allocator)
         cache.components = {
             ComponentType.SWA: order.swa,
             ComponentType.FULL: order.full,
             ComponentType.MAMBA: order.mamba,
         }
+        index_slots(cache, cache.components)
 
         def complete_match(params, result):
             return UnifiedRadixCache._finalize_match_result(cache, params, finalized)
@@ -2151,7 +2246,11 @@ class TestSWADraftHistory(SWADraftHistoryFixtures, CustomTestCase):
         mapping = allocator.full_to_swa_index_mapping
         before = mapping[needed].clone()
         self.assertTrue(bool((before > 0).all()))
-        cache.evict(EvictParams(swa_num_tokens=1))
+        cache.evict(
+            EvictParams(
+                window_num_tokens={cache.window_sub_pool_of_slot(ComponentType.SWA): 1}
+            )
+        )
         torch.testing.assert_close(mapping[needed], before)
         match = cache.match_prefix(
             MatchPrefixParams(key=RadixKey(req.origin_input_ids))
@@ -2160,7 +2259,7 @@ class TestSWADraftHistory(SWADraftHistoryFixtures, CustomTestCase):
 
         # Decode advances past the last recurrent checkpoint. Its complete
         # draft history must remain until a newer checkpoint replaces it.
-        cache.evict_sliding_windows(req, 1040)
+        retire_window(req, 1040, cache)
         torch.testing.assert_close(mapping[needed], before)
         cache.sanity_check()
 
@@ -2216,7 +2315,7 @@ class TestSWAWindowUnderBigramKey(SWAWindowUnderBigramKeyFixtures, CustomTestCas
             origin_input_ids=array("q"),
             sampling_params=SamplingParams(temperature=0, max_new_tokens=1),
         )
-        req_to_token_pool.alloc([req])
+        acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
         tokens = list(range(1, seq_len + 1))
         req.origin_input_ids = tokens
         req.output_ids = []
@@ -2235,10 +2334,10 @@ class TestSWAWindowUnderBigramKey(SWAWindowUnderBigramKeyFixtures, CustomTestCas
 
         boundary = (seq_len - 1) // page_size * page_size
         self.assertGreaterEqual(
-            boundary - req.kv.get_evicted_seqlen(ComponentType.SWA),
+            boundary - req.kv.get_evicted_seqlen(cache.window_sub_pools()[0][0]),
             self.cfg.sliding_window_size,
             f"leaf ending at {boundary} keeps only "
-            f"{boundary - req.kv.get_evicted_seqlen(ComponentType.SWA)} live SWA tokens against a "
+            f"{boundary - req.kv.get_evicted_seqlen(cache.window_sub_pools()[0][0])} live SWA tokens against a "
             f"{self.cfg.sliding_window_size} window",
         )
         self.assertEqual(
@@ -2269,7 +2368,7 @@ class TestSWAWindowUnderBigramKey(SWAWindowUnderBigramKeyFixtures, CustomTestCas
                 temperature=0, max_new_tokens=owned - prompt_len
             ),
         )
-        req_to_token_pool.alloc([req])
+        acquire_rows(req_to_token_pool, req_to_token_pool.state, [req])
         req.output_ids = []
         req.full_untruncated_fill_ids = array("q", tokens[:prompt_len])
         req.extend_end = prompt_len
@@ -2285,10 +2384,10 @@ class TestSWAWindowUnderBigramKey(SWAWindowUnderBigramKeyFixtures, CustomTestCas
 
         req.output_ids = tokens[prompt_len:]
         req.kv.kv_committed_len = owned
-        cache.evict_sliding_windows(req, owned - 1)
+        retire_window(req, owned - 1, cache)
         insert_boundary = (owned - 1) // page_size * page_size
         self.assertGreaterEqual(
-            insert_boundary - req.kv.get_evicted_seqlen(ComponentType.SWA),
+            insert_boundary - req.kv.get_evicted_seqlen(cache.window_sub_pools()[0][0]),
             self.cfg.sliding_window_size,
         )
         req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
@@ -2299,7 +2398,7 @@ class TestSWAWindowUnderBigramKey(SWAWindowUnderBigramKeyFixtures, CustomTestCas
             allocator.full_available_size() + cache.full_evictable_size(), full_total
         )
         self.assertEqual(
-            allocator.swa_available_size() + cache.swa_evictable_size(), swa_total
+            allocator.swa_available_size() + window_evictable(cache), swa_total
         )
         cache.sanity_check()
 
@@ -2328,7 +2427,7 @@ class TestUnifiedRadixCacheDecoderSwaBoundedReplayHoldBack(
                 # 200 of 260 cached: a plain hit would leave a 60-row extend
                 prompt = cached + list(range(1001, 1061))
                 self.assertEqual(
-                    cache.swa_reprefill_tail_tokens(), 128 if bounded_replay else 0
+                    cache.window_reprefill_tail_tokens(), 128 if bounded_replay else 0
                 )
                 self.assertEqual(self._matched_len(cache, prompt), matched)
 

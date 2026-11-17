@@ -47,6 +47,7 @@ runs:
         INPUT_FAIL_ON_TIMEOUT: ${{ inputs.fail-on-timeout }}
       with:
         github-token: ${{ inputs.github-token }}
+        retries: 3
         script: |
           const stageName = process.env.INPUT_STAGE_NAME;
           const jobSpecs = JSON.parse(process.env.INPUT_JOBS);

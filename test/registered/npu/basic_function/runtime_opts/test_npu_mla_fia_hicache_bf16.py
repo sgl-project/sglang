@@ -32,7 +32,10 @@ class TestAscendMlaFiaHicacheBf16(CustomTestCase, NPUGSM8KMixin):
     # The nightly pipeline runs the full GSM8K set to avoid sampling variance; the
     # PR pipeline only runs the mixin smoke request.
     gsm8k_num_examples = 1319
+    # evalscope is the harness the 0.83 Moonlight bf16 baseline was calibrated
+    # with (4-shot chat, temperature 1.0).
     gsm8k_accuracy_thres = 0.83
+    gsm8k_backend = "evalscope"
 
     @classmethod
     def setUpClass(cls):

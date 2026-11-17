@@ -16,8 +16,8 @@
 //! [`chat_finish_reason`] maps the scheduler's finish reason onto the OpenAI
 //! wire values.
 
-use dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
-use dynamo_protocols::types::{
+use sglang_processor::dynamo_parsers::{ToolChoice as DynamoToolChoice, ToolDefinition};
+use sglang_processor::dynamo_protocols::types::{
     ChatCompletionMessageContent, ChatCompletionMessageToolCall,
     ChatCompletionMessageToolCallChunk, ChatCompletionStreamResponseDelta,
     FinishReason as OpenAIFinishReason, FunctionCall, FunctionType, Role,
@@ -126,14 +126,16 @@ pub(super) fn chat_finish_reason(output: &CoreOutput) -> Option<OpenAIFinishReas
 mod tests {
     use super::{chat_delta, chat_finish_reason, parse_chat_tool_calls};
     use crate::api_server::core::CoreOutput;
-    use dynamo_parsers::tool_calling::jail::{Annotated, apply_tool_calling_jail};
-    use dynamo_protocols::types::CreateChatCompletionStreamResponse as StreamResponse;
-    use dynamo_protocols::types::{
+    use futures::{StreamExt, stream};
+    use sglang_processor::dynamo_parsers::tool_calling::jail::{
+        Annotated, apply_tool_calling_jail,
+    };
+    use sglang_processor::dynamo_protocols::types::CreateChatCompletionStreamResponse as StreamResponse;
+    use sglang_processor::dynamo_protocols::types::{
         ChatChoiceStream, ChatCompletionMessageContent, ChatCompletionMessageToolCallChunk,
         ChatCompletionToolChoiceOption, FinishReason as OpenAIFinishReason, FunctionCallStream,
         FunctionType, Role,
     };
-    use futures::{StreamExt, stream};
 
     fn stream_item(text: &str, finish: Option<OpenAIFinishReason>) -> Annotated<StreamResponse> {
         Annotated {

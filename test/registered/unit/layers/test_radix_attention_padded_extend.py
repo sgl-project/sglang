@@ -5,11 +5,11 @@ from unittest.mock import patch
 import torch
 
 from sglang.srt.layers.attention import graph_utils as radix_attention
-from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.model_executor.forward_mode import ForwardMode
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=12, suite="base-a-test-cpu")
 
 
 class _RecordingBackend:
@@ -87,7 +87,6 @@ class TestPaddedExtendAttention(CustomTestCase):
     its attention metadata covers only the real rows."""
 
     def test_only_padded_extend_batches_are_narrowed(self):
-        q = torch.zeros(8, 2)
         cases = [
             (ForwardMode.EXTEND, 5, 5),
             (ForwardMode.EXTEND, 8, None),  # nothing padded
@@ -98,7 +97,7 @@ class TestPaddedExtendAttention(CustomTestCase):
         for mode, real, expected in cases:
             with self.subTest(mode=mode, real=real):
                 self.assertEqual(
-                    radix_attention.padded_extend_real_tokens(q, _batch(mode, real)),
+                    radix_attention.padded_extend_real_tokens(8, _batch(mode, real)),
                     expected,
                 )
 

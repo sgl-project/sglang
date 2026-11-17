@@ -10,15 +10,17 @@ from typing import Any
 from sglang.srt.arg_groups.cp_tp_group_sharing_hook import (
     resolve_cp_tp_group_sharing,
 )
+from sglang.srt.arg_groups.model_override_base import (
+    model_config_of,
+    resolved_view,
+    resolving_view,
+)
 from sglang.srt.arg_groups.overrides import (
     _data_parallelism_defaults,
     _dcp_comm_backend_default,
     _dp_lm_head_validation,
     _tp_lm_head_all_to_all_default,
     declare_resolution,
-    model_config_of,
-    resolved_view,
-    resolving_view,
     run_post_process_pass,
     should_report_expert_balancedness,
 )
@@ -71,6 +73,7 @@ def _boundary_parallelism_overrides(cfg, model_type: str, architecture: str) -> 
     )
     kimi_k3 = architecture in (
         "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
         "KimiK3LinearForCausalLM",
     )
     if nemotron and cfg.attn_cp_size > 1:
@@ -191,13 +194,20 @@ def handle_context_parallelism(server_args: Any):
             "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
         )
 
-    from sglang.srt.layers.cp.base import init_cp_strategy
+    from sglang.srt.layers.cp.base import init_cp_strategy, is_cp_sharded_padded
 
     init_cp_strategy(
         enable_prefill_cp=bool(cfg.enable_prefill_cp),
         cp_size=cfg.attn_cp_size,
         cp_strategy=cfg.cp_strategy,
+        cp_kv_layout=cfg.cp_kv_layout,
     )
+    if cfg.enable_unified_memory and is_cp_sharded_padded():
+        raise ValueError(
+            f"--cp-kv-layout {cfg.cp_kv_layout} keeps each rank's KV sharded "
+            "and padded, which --enable-unified-memory does not support; "
+            "drop one of them."
+        )
 
 
 def handle_shared_experts_tp(server_args: Any):
@@ -212,17 +222,24 @@ def handle_shared_experts_tp(server_args: Any):
         attn_cp_size=view.attn_cp_size,
         attn_dp_size=cfg.attn_dp_size,
     )
-    if size < 1 or attn_tp_size % size != 0:
+    # Shared experts can gather token rows across CP as well as attention TP,
+    # then reduce-scatter to the original shards. A subgroup must still fit
+    # inside one attention-DP replica / PP stage.
+    replica_size = attn_tp_size * view.attn_cp_size
+    if size < 1 or replica_size % size != 0:
         raise ValueError(
             f"--shared-experts-tp-size ({size}) must be a positive divisor "
-            f"of attention TP size ({attn_tp_size})."
+            f"of attention replica size ({replica_size}, attention TP x CP)."
         )
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         raise ValueError(
             "--shared-experts-tp-size requires a Kimi-K3 model configuration."
         )
     model_arch = model_config_of(server_args).hf_config.architectures[0]
-    if model_arch != "KimiK3ForConditionalGeneration":
+    if model_arch not in (
+        "KimiK3ForConditionalGeneration",
+        "KimiK31ForConditionalGeneration",
+    ):
         raise ValueError("--shared-experts-tp-size is only supported for Kimi-K3.")
     if cfg.moe_a2a_backend not in (
         "deepep",
@@ -716,9 +733,6 @@ def handle_elastic_ep(server_args: Any):
             assert not cfg.forward_hooks, (
                 "Elastic EP CUDA graph recapture does not support forward hooks."
             )
-            assert not cfg.enable_pdmux, (
-                "Elastic EP CUDA graph recapture does not support PDMux."
-            )
         assert attn_dp_enabled_of(resolved), (
             "Elastic EP scale-up requires attention DP (--attn-dp-size); "
             "without it the TP group is not equivalent to WORLD and the "
@@ -757,6 +771,16 @@ def handle_eplb_and_dispatch(server_args: Any):
         )
         logger.warning(
             "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
+        )
+
+    if cfg.enable_eplb and cfg.expert_distribution_recorder_mode in (
+        "per_pass",
+        "per_token",
+    ):
+        raise ValueError(
+            "--enable-eplb needs --expert-distribution-recorder-mode stat or "
+            "stat_approx; the detailed recorder modes (per_pass/per_token) only "
+            f"support file dumps (got {cfg.expert_distribution_recorder_mode})."
         )
 
     # Without an a2a backend all EP ranks run the MoE over the same tokens and

@@ -21,7 +21,7 @@ from sglang.test.test_utils import (
 
 register_cuda_ci(
     est_time=60,
-    stage="base-b",
+    stage="extra-a",
     runner_config="1-gpu-small",
 )
 register_cpu_ci(est_time=49, suite="stage-b-test-cpu-intel")
