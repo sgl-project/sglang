@@ -1712,7 +1712,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 self.subTest(architecture=architecture),
                 override_platform(is_blackwell=False),
                 override_platform(is_sm100=False),
-                override_platform(is_cuda=False),
+                override_platform(is_cuda=True, device_capability=(12, 0)),
             ):
                 self.assertEqual(
                     collect_model_override_declarations(
@@ -1729,6 +1729,31 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             },
                         )
                     ],
+                )
+
+    def test_nemotron_h_bf16_keeps_auto_runner_on_rocm(self):
+        # flashinfer_cutlass is CUDA-only, so BF16 NemotronH on ROCm must keep
+        # the platform's auto MoE runner.
+        for architecture in (
+            "NemotronHForCausalLM",
+            "NemotronH_Nano_Omni_Reasoning_V3",
+            "NemotronH_Omni_Reasoning_V3",
+        ):
+            server_args, outer_config = self._nemotron_h_omni_args(architecture, None)
+            server_args._model_config.quantization = None
+            with (
+                self.subTest(architecture=architecture),
+                override_platform(is_blackwell=False),
+                override_platform(is_sm100=False),
+                override_platform(is_cuda=False, is_hip=True),
+            ):
+                self.assertEqual(
+                    collect_model_override_declarations(
+                        architecture,
+                        server_args,
+                        outer_config,
+                    ),
+                    [],
                 )
 
     def test_nemotron_h_nano_omni_mixed_nvfp4_pins_trtllm_on_sm100(self):
