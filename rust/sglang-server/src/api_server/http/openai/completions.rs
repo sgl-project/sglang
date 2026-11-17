@@ -241,6 +241,13 @@ async fn completions(
     }
 
     if stream {
+        if let Err(error) = futures::future::try_join_all(
+            submitted.iter_mut().map(|choice| choice.call.preflight()),
+        )
+        .await
+        {
+            return openai_error(error.http_status(), error.to_string(), false);
+        }
         let include_usage = request
             .stream_options
             .map(|o| o.include_usage)

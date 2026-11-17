@@ -366,6 +366,12 @@ async fn chat_completions(
         },
     };
     if stream {
+        if let Err(error) =
+            futures::future::try_join_all(submitted.iter_mut().map(|(_, call)| call.preflight()))
+                .await
+        {
+            return openai_error(error.http_status(), error.to_string(), false);
+        }
         let event_stream = chat_event_stream(
             submitted,
             response_id,

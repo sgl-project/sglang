@@ -130,9 +130,27 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     "allowed_media_domains",
     # The Rust media fetcher caps a download at this field's default, 64 MiB.
     "media_url_max_file_size_mb",
+    "media_url_timeout",
+    "allow_local_media_files",
     "enable_trace",
     "completion_template",
     "hf_chat_template_name",
+    "trust_request_chat_template",
+    "fastapi_root_path",
+    "enable_http_worker_reuseport",
+    "enable_encoder_swa_bounded_replay",
+    "mm_io_worker_num",
+    "disable_tokenizer_batch_decode",
+    "enable_tokenizer_batch_encode",
+    "enable_dynamic_batch_tokenizer",
+    "dynamic_batch_tokenizer_batch_size",
+    "dynamic_batch_tokenizer_batch_timeout",
+    "batch_notify_size",
+    "enable_response_store",
+    "tool_server",
+    "enable_streaming_session",
+    "asr_max_buffer_seconds",
+    "asr_max_concurrent_sessions",
     "enable_custom_logit_processor",
     "enable_return_routed_experts",
     "enable_lora",
@@ -152,6 +170,32 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     # Chat responses would lack the server-default sglext token ids.
     "return_input_ids",
     "return_output_ids",
+)
+
+
+RUST_SERVER_UNSUPPORTED_ENVS = (
+    "SGLANG_HTTP_SERVER_APP_PATH",
+    "SGLANG_TIMEOUT_KEEP_ALIVE",
+    "SGLANG_UVICORN_WORKER_HEALTHCHECK_TIMEOUT",
+    "SGLANG_PYSPY_DUMP_BEFORE_CRASH",
+    "SGLANG_CUDA_COREDUMP_BEFORE_CRASH",
+    "SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS",
+    "SGLANG_INKLING_DEFAULT_REASONING_EFFORT",
+    "SGLANG_ENABLE_RESPONSE_TEMPLATE_TURN_GRAMMAR",
+    "SGLANG_DETOKENIZER_MAX_STATES",
+    "SGLANG_USE_IPC_POOL_HANDLE_CACHE",
+    "SGLANG_REQUEST_STATE_WAIT_TIMEOUT",
+    "SGLANG_MM_AVOID_RETOKENIZE",
+    "SGLANG_BATCH_TOKENIZER_OUTPUTS",
+    "SGLANG_ENABLE_COLOCATED_BATCH_GEN",
+    "SGLANG_CPU_WORKERS",
+    "SGLANG_IO_WORKERS",
+    "SGLANG_OLLAMA_ROOT_ROUTE",
+    "SGLANG_OLLAMA_CHAT_ROUTE",
+    "SGLANG_OLLAMA_GENERATE_ROUTE",
+    "SGLANG_OLLAMA_TAGS_ROUTE",
+    "SGLANG_OLLAMA_SHOW_ROUTE",
+    "SGLANG_GRPC_WORKER_THREADS",
 )
 
 
@@ -178,10 +222,20 @@ def rust_server_unsupported_args(
         else:
             is_set = value != default
         if is_set:
-            offending.append(_field_to_cli_name(name))
+            cli_name = _field_to_cli_name(name)
+            if name == "allow_local_media_files" and value is False:
+                cli_name = "--no-allow-local-media-files"
+            offending.append(cli_name)
+    if cfg.mm_feature_transport in ("cuda_ipc", "cuda_vmm"):
+        offending.append(f"--mm-feature-transport {cfg.mm_feature_transport}")
+    if cfg.tool_call_parser == "beam" and cfg.grammar_backend in (None, "xgrammar"):
+        offending.append("--tool-call-parser beam with --grammar-backend xgrammar")
     # The Rust chat route applies only each tool's own `strict`.
     if envs.SGLANG_TOOL_STRICT_LEVEL.get() > 0:
         offending.append("SGLANG_TOOL_STRICT_LEVEL")
+    for name in RUST_SERVER_UNSUPPORTED_ENVS:
+        if name not in honored and getattr(envs, name).is_set():
+            offending.append(name)
     return offending
 
 

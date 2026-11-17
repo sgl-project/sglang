@@ -5849,9 +5849,33 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         "enable_ssl_refresh": ["--enable-ssl-refresh"],
         "allowed_media_domains": ["--allowed-media-domains", "example.com"],
         "media_url_max_file_size_mb": ["--media-url-max-file-size-mb", "0"],
+        "media_url_timeout": ["--media-url-timeout", "5"],
+        "allow_local_media_files": ["--no-allow-local-media-files"],
         "enable_trace": ["--enable-trace"],
         "completion_template": ["--completion-template", "deepseek_coder"],
         "hf_chat_template_name": ["--hf-chat-template-name", "tool_use"],
+        "trust_request_chat_template": ["--trust-request-chat-template"],
+        "fastapi_root_path": ["--fastapi-root-path", "/sglang"],
+        "enable_http_worker_reuseport": ["--enable-http-worker-reuseport"],
+        "enable_encoder_swa_bounded_replay": ["--enable-encoder-swa-bounded-replay"],
+        "mm_io_worker_num": ["--mm-io-worker-num", "2"],
+        "disable_tokenizer_batch_decode": ["--disable-tokenizer-batch-decode"],
+        "enable_tokenizer_batch_encode": ["--enable-tokenizer-batch-encode"],
+        "enable_dynamic_batch_tokenizer": ["--enable-dynamic-batch-tokenizer"],
+        "dynamic_batch_tokenizer_batch_size": [
+            "--dynamic-batch-tokenizer-batch-size",
+            "64",
+        ],
+        "dynamic_batch_tokenizer_batch_timeout": [
+            "--dynamic-batch-tokenizer-batch-timeout",
+            "0.01",
+        ],
+        "batch_notify_size": ["--batch-notify-size", "32"],
+        "enable_response_store": ["--enable-response-store"],
+        "tool_server": ["--tool-server", "demo"],
+        "enable_streaming_session": ["--enable-streaming-session"],
+        "asr_max_buffer_seconds": ["--asr-max-buffer-seconds", "120"],
+        "asr_max_concurrent_sessions": ["--asr-max-concurrent-sessions", "64"],
         "enable_custom_logit_processor": ["--enable-custom-logit-processor"],
         "enable_return_routed_experts": ["--enable-return-routed-experts"],
         "enable_lora": ["--enable-lora"],
@@ -5898,6 +5922,60 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         message = str(ctx.exception)
         for cli_args in self.REFUSED.values():
             self.assertIn(cli_args[0], message)
+
+    def test_explicit_unsupported_environment_is_refused_by_name(self):
+        for name in validation_hook.RUST_SERVER_UNSUPPORTED_ENVS:
+            with self.subTest(name=name):
+                field = getattr(envs, name)
+                with field.override(field.default):
+                    with self.assertRaisesRegex(
+                        ValueError, f"does not support {name}:"
+                    ):
+                        self._resolve([])
+                    self._resolve([], rust_server=False)
+
+    def test_unsupported_per_turn_grammar_names_its_settings(self):
+        for args in (
+            ["--tool-call-parser", "beam"],
+            ["--tool-call-parser", "beam", "--grammar-backend", "xgrammar"],
+        ):
+            with self.subTest(args=args):
+                with self.assertRaisesRegex(
+                    ValueError, "--tool-call-parser beam.*--grammar-backend xgrammar"
+                ):
+                    self._resolve(args)
+                self._resolve(args, rust_server=False)
+        self._resolve(["--grammar-backend", "xgrammar"])
+
+    def test_gpu_feature_transport_is_not_silently_replaced(self):
+        for transport in ("cuda_ipc", "cuda_vmm"):
+            with self.subTest(transport=transport):
+                args = prepare_server_args(
+                    ["--model-path", "dummy", "--mm-feature-transport", transport]
+                )
+                self.assertIn(
+                    f"--mm-feature-transport {transport}",
+                    validation_hook.rust_server_unsupported_args(args),
+                )
+        self._resolve(["--mm-feature-transport", "cpu"])
+
+    def test_supported_environment_is_not_refused(self):
+        with envs.SGLANG_LOG_REQUEST_HEADERS.override(("x-request-id",)):
+            self._resolve([])
+
+    def test_model_package_can_honor_an_environment_setting(self):
+        args = prepare_server_args(["--model-path", "dummy"])
+        with envs.SGLANG_TIMEOUT_KEEP_ALIVE.override(30):
+            self.assertIn(
+                "SGLANG_TIMEOUT_KEEP_ALIVE",
+                validation_hook.rust_server_unsupported_args(args),
+            )
+            self.assertNotIn(
+                "SGLANG_TIMEOUT_KEEP_ALIVE",
+                validation_hook.rust_server_unsupported_args(
+                    args, honored={"SGLANG_TIMEOUT_KEEP_ALIVE"}
+                ),
+            )
 
     def test_tool_strict_level_is_refused(self):
         with envs.SGLANG_TOOL_STRICT_LEVEL.override(2):
