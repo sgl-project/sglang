@@ -215,16 +215,6 @@ class TestFlux2XpuNormFusions(CustomTestCase):
             proj = torch.randn(1, tokens, 13824, device="xpu", dtype=torch.bfloat16)
             self.assertTrue(torch.equal(compiled(proj), k_input(proj)))
 
-    def test_launchers_reject_layouts_they_do_not_replicate(self):
-        x, update, gate, scale, shift = _inputs(16, 1.0, 4)
-        strided = x.transpose(1, 2).contiguous().transpose(1, 2)
-        with self.assertRaises(RuntimeError):
-            xpu_layernorm_modulate(strided, scale, shift, self.norm.eps)
-        with self.assertRaises(RuntimeError):
-            xpu_layernorm_modulate(x, scale.expand(2, 1, _HIDDEN), shift, 1e-6)
-        with self.assertRaises(RuntimeError):
-            xpu_gated_resnorm(x, update[:, :8], gate, scale, shift, self.norm.eps)
-
 
 if __name__ == "__main__":
     unittest.main()

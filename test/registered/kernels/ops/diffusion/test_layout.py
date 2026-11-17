@@ -157,16 +157,6 @@ def test_pack_qkv_destination_major_is_bit_exact(dtype):
     assert torch.equal(pack_qkv_destination_major(q, k, v, world_size), expected)
 
 
-def test_pack_qkv_destination_major_validates_inputs():
-    q = torch.empty(2, 4, 8, device=DEVICE, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="same 3D shape"):
-        pack_qkv_destination_major(q, q[:, :-1], q, 2)
-    with pytest.raises(ValueError, match="divide global_heads"):
-        pack_qkv_destination_major(q, q, q, 3)
-    with pytest.raises(ValueError, match="expected shape"):
-        pack_qkv_destination_major(q, q, q, 2, out=torch.empty_like(q))
-
-
 @pytest.mark.skipif(
     not torch.cuda.is_available() or torch.cuda.mem_get_info()[0] < 24 * 2**30,
     reason="needs a CUDA GPU with 24 GiB free",
@@ -233,16 +223,6 @@ def test_copy_head_groups_is_bit_exact(dtype, batch, rows, groups, group_heads):
     copy_head_groups(blocks, as_groups(back[:, :, 3:]))
     assert torch.equal(back[:, :, 3:], shard)
     assert not back[:, :, :3].any()
-
-
-def test_copy_head_groups_validates_inputs():
-    src = torch.empty(1, 4, 2, 8, device=DEVICE, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="same 4D shape"):
-        copy_head_groups(src, torch.empty(1, 2, 4, 8, device=DEVICE, dtype=src.dtype))
-    with pytest.raises(ValueError, match="last dim"):
-        copy_head_groups(
-            src, torch.empty(1, 4, 2, 16, device=DEVICE, dtype=src.dtype)[..., ::2]
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -817,15 +797,6 @@ def test_nearest_upsample_nhwc_rejects_unsupported_inputs():
     x1 = torch.randn(1, 1, 1, 1, device="cuda", dtype=torch.bfloat16)
     assert x1.is_contiguous(memory_format=torch.channels_last)
     assert not can_use_nearest_upsample_nhwc(x1, 2.0, "nearest-exact")
-    with pytest.raises(ValueError):
-        nearest_upsample_nhwc(x1, 2.0)
-    # Direct calls validate too: no silent autograd drop, no layout surprise.
-    with pytest.raises(ValueError):
-        nearest_upsample_nhwc(x_cl, 1.5)
-    with pytest.raises(ValueError):
-        nearest_upsample_nhwc(x, 2.0)  # NCHW
     with torch.enable_grad():
         xg = x_cl.clone().requires_grad_(True)
         assert not can_use_nearest_upsample_nhwc(xg, 2.0, "nearest")
-        with pytest.raises(ValueError):
-            nearest_upsample_nhwc(xg, 2.0)

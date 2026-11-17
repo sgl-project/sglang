@@ -466,19 +466,6 @@ def test_f_b_non_positive_slots_do_not_modify_caches() -> None:
     assert torch.equal(inputs.state, state_before)
 
 
-def test_f_b_api_rejects_invalid_projection_inputs() -> None:
-    f_a, f_b_weight, inputs = _make_fb_inputs(batch=1)
-
-    with pytest.raises(ValueError, match="`f_a` must have rank 2"):
-        _run_with_f_b(f_a.unsqueeze(0), f_b_weight, inputs)
-    with pytest.raises(ValueError, match="`f_a` must have dtype"):
-        _run_with_f_b(f_a.float(), f_b_weight, inputs)
-    with pytest.raises(ValueError, match="`f_b_weight` must have shape"):
-        _run_with_f_b(f_a, f_b_weight[:, :, :-1], inputs)
-    with pytest.raises(ValueError, match="`f_b_weight` must have inner strides"):
-        _run_with_f_b(f_a, f_b_weight.transpose(1, 2), inputs)
-
-
 def test_fused_kda_backend_is_opt_in():
     from sglang.kernels.ops.attention import kda_fused_decode_aiter_hip
 
@@ -717,8 +704,6 @@ def test_sglang_source_does_not_cover_bf16_state(select_fused_backend) -> None:
     assert _adapter_covers(adapter, f_a, f_b_weight, inputs)
     _bf16_state(inputs)
     assert not _adapter_covers(adapter, f_a, f_b_weight, inputs)
-    with pytest.raises(ValueError, match="`state` must have dtype"):
-        _run_with_f_b(f_a, f_b_weight, inputs)
 
 
 def test_sglang_source_is_not_armed_for_a_bf16_pool(

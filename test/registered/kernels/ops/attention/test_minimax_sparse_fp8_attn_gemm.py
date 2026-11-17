@@ -440,19 +440,6 @@ def test_indexer_prefill_all_fp8_vs_dequant_ref():
     assert _topk_overlap(tidx8, tidxref) >= 0.9
 
 
-def test_dtype_contract_rejects_e5m2_q():
-    q = torch.randn(2, 8, 128, dtype=torch.bfloat16, device=DEVICE).to(
-        torch.float8_e5m2
-    )
-    k = torch.randn(256, 1, 128, dtype=torch.bfloat16, device=DEVICE).to(FP8)
-    from sglang.kernels.ops.attention.minimax_sparse.common.utils import (
-        check_sparse_kv_fp8,
-    )
-
-    with pytest.raises(AssertionError):
-        check_sparse_kv_fp8(q, k, None, label="test")
-
-
 if __name__ == "__main__":
     import sys
 

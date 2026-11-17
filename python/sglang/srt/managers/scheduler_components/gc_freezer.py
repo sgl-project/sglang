@@ -56,7 +56,6 @@ class GCFreezer:
             self._next_garbage_check = now + GC_CHECK_INTERVAL_SECS
             self._report_frozen_garbage(refreeze_gc("Scheduler"))
         else:
-            gc.collect()
             freeze_gc("Scheduler")
 
     def _report_frozen_garbage(self, garbage: collections.Counter) -> None:

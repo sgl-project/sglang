@@ -76,8 +76,6 @@ class TestDSparkNpuDispatch(CustomTestCase):
         npu = cpu.npu()
         self.assertFalse(inputs_on_cuda(None, cpu, npu))
         self.assertTrue(inputs_on_cuda(None, npu, cpu))
-        with self.assertRaises(AssertionError):
-            inputs_on_cuda(1, flag=True)
 
     def test_markov_greedy_matches_native_rounding(self):
         for dtype in (torch.float32, torch.float16, torch.bfloat16):

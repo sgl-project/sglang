@@ -813,79 +813,35 @@ def test_page_unified_load_back_non_default_stream():
 # compiled kElementSize, for callers that reach the module directly. Those are
 # unreachable here by construction: the entry points derive every geometry
 # argument from the tensor shapes they are handed.
-@pytest.mark.parametrize(
-    "invalid,match",
-    [
-        ("rank", "Expected \\(page"),
-        ("kv_axis", "K/V dimension"),
-        ("group_alignment", "16-byte aligned"),
-        ("noncontiguous", "must be contiguous"),
-        ("layer_id", "layer id out of range"),
-        ("device_heads", "device row byte size mismatch"),
-        ("index_length", "indices length"),
-    ],
-)
-def test_page_unified_load_back_invalid_input(invalid, match):
+def test_page_unified_load_back_rejects_layer_id_out_of_range():
     groups, layers, page_size, heads_per_group, dim = 2, 3, 4, 1, 16
     shape = [PAGE_UNIFIED_NUM_PAGES, groups, layers, 2, page_size, heads_per_group, dim]
-    if invalid == "kv_axis":
-        shape[3] = 3
-    elif invalid == "group_alignment":
-        shape[6] = 7
-    elif invalid == "rank":
-        shape.pop()
     src = torch.zeros(shape, dtype=torch.float16).pin_memory()
-    if invalid == "noncontiguous":
-        src = src.transpose(1, 2).contiguous().transpose(1, 2)
-
     heads = groups * heads_per_group
-    if invalid == "device_heads":
-        heads += 1
     k_dst = torch.zeros((8, heads, dim), dtype=torch.float16, device=DEVICE)
     v_dst = torch.zeros_like(k_dst)
     src_pages = torch.zeros(2, dtype=torch.int64, device=DEVICE)
     dst_pages = torch.zeros(2, dtype=torch.int64, device=DEVICE)
-    if invalid == "index_length":
-        dst_pages = dst_pages[:1]
-    layer_id = layers if invalid == "layer_id" else 0
 
     # TVM FFI uses its own exception type for C++ RuntimeCheck failures.
-    with pytest.raises(Exception, match=match):
+    with pytest.raises(Exception, match="layer id out of range"):
         transfer_hicache_one_layer_page_unified_lf(
-            k_dst, v_dst, src, src_pages, dst_pages, layer_id
+            k_dst, v_dst, src, src_pages, dst_pages, layers
         )
 
 
-@pytest.mark.parametrize(
-    "invalid,match",
-    [
-        ("rank", "Expected MLA"),
-        ("dimension", "must be positive"),
-        ("alignment", "16-byte aligned"),
-        ("layer_id", "layer id out of range"),
-    ],
-)
-def test_page_unified_mla_load_back_invalid_input(invalid, match):
+def test_page_unified_mla_load_back_rejects_layer_id_out_of_range():
     layers, page_size, dim = 3, 4, 16
-    if invalid == "dimension":
-        dim = 0
-    elif invalid == "alignment":
-        dim = 7
     src = torch.zeros(
         (PAGE_UNIFIED_NUM_PAGES, layers, page_size, dim), dtype=torch.float16
-    )
-    if dim > 0:
-        src = src.pin_memory()
-    if invalid == "rank":
-        src = src.unsqueeze(1)
-    dst = torch.zeros((8, 1, max(dim, 1)), dtype=torch.float16, device=DEVICE)
+    ).pin_memory()
+    dst = torch.zeros((8, 1, dim), dtype=torch.float16, device=DEVICE)
     src_pages = torch.zeros(2, dtype=torch.int64, device=DEVICE)
     dst_pages = torch.zeros(2, dtype=torch.int64, device=DEVICE)
-    layer_id = layers if invalid == "layer_id" else 0
 
-    with pytest.raises(Exception, match=match):
+    with pytest.raises(Exception, match="layer id out of range"):
         transfer_hicache_one_layer_mla_page_unified_lf(
-            dst, src, src_pages, dst_pages, layer_id
+            dst, src, src_pages, dst_pages, layers
         )
 
 

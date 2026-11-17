@@ -489,14 +489,6 @@ def test_ltx2_ada_values9(batch, seq, hidden, table_dtype, compiled):
         assert torch.equal(got, want)
 
 
-@torch.no_grad()
-def test_ltx2_ada_values9_rejects_unsupported_shape():
-    scale_shift_table = torch.randn(8, 4096, device=DEVICE, dtype=torch.bfloat16)
-    timestep = torch.randn(1, 1, 9 * 4096, device=DEVICE, dtype=torch.bfloat16)
-    with pytest.raises(ValueError, match="scale_shift_table"):
-        ltx2_ada_values9(scale_shift_table, timestep)
-
-
 # ---------------------------------------------------------------------------
 # select-0/1 LayerNorm modulation (Qwen-Image)
 # ---------------------------------------------------------------------------

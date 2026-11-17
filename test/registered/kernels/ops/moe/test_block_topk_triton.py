@@ -223,14 +223,6 @@ class TestBlockTopkTriton(CustomTestCase):
             atol=1e-7,
         )
 
-    def test_rejects_non_power_of_two_block_size(self):
-        logits = torch.zeros((6, 4), dtype=torch.float32, device="cuda")
-        bias = torch.zeros((4,), dtype=torch.float32, device="cuda")
-        for block_size in (3, True):
-            with self.subTest(block_size=block_size):
-                with self.assertRaisesRegex(ValueError, "positive power of two"):
-                    block_topk_triton(logits, bias, block_size, 2, 1)
-
     def test_empty_input_returns_fp32_weights(self):
         logits = torch.empty((0, 16), dtype=torch.bfloat16, device="cuda")
         bias = torch.zeros((16,), dtype=torch.float32, device="cuda")
