@@ -5,6 +5,7 @@ from typing import Callable, List, Optional
 
 import torch
 
+from sglang.kernels.ops.sampling import argmax as sampling_argmax
 from sglang.kernels.ops.speculative.topk1 import (
     draft_topk1_argmax_only,
     draft_topk1_postprocess,
@@ -145,6 +146,10 @@ _is_xpu = is_xpu()
 
 
 logger = logging.getLogger(__name__)
+
+# Draft top-1 logits of at least this many entries take the sampler's split-row argmax;
+# below it torch.argmax's GPU time is within the JIT call's extra host time.
+_DRAFT_TOP1_SPLIT_ARGMAX_MIN_LOGITS = 1 << 23
 
 
 def _select_spec_graph_runner_cls(
@@ -1363,9 +1368,12 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             elif self.topk == 1:
                 # Gated to CUDA: see #26358 — ROCm's argmax tie-break corrupts
                 # MTP draft selection on FP8 logits.
-                ret_topk_index = torch.argmax(
-                    draft_logits_output.next_token_logits, dim=-1, keepdim=True
-                )
+                logits = draft_logits_output.next_token_logits
+                if logits.numel() >= _DRAFT_TOP1_SPLIT_ARGMAX_MIN_LOGITS:
+                    # Same token as torch.argmax for finite logits (ties: lowest index).
+                    ret_topk_index = sampling_argmax(logits).unsqueeze(-1)
+                else:
+                    ret_topk_index = torch.argmax(logits, dim=-1, keepdim=True)
                 ret_topk_p = torch.ones_like(ret_topk_index, dtype=torch.float32)
             else:
                 probs = renorm_draft_probs(
