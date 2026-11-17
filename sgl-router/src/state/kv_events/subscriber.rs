@@ -1,8 +1,8 @@
 //! Per-worker, per-DP-rank ZMQ subscriber for SGLang's `ZmqEventPublisher`.
 //!
 //! This module owns the I/O plumbing between SGLang workers (which publish on
-//! a PUB socket via `python/sglang/srt/utils/event_publisher.py` —
-//! KV-cache events from `disaggregation/kv_events.py`, load gauges from
+//! a PUB socket: KV-cache events from
+//! `python/sglang/srt/disaggregation/kv_events.py`, load gauges from
 //! `managers/scheduler_components/load_publisher.py`) and the in-memory state
 //! consumed by [`super::index::KvEventIndex`]. Each `(worker_url, dp_rank)`
 //! pair gets its own SUB socket on its own tokio task, decodes msgpack frames
@@ -34,7 +34,7 @@
 //! `tcp://{cfg.host}:{cfg.port_base + dp_rank}` per rank in
 //! `0..cfg.dp_size`. The host comes from the worker's `/server_info`
 //! introspection in production (so wildcard bind hosts resolve to the
-//! gateway-routable address) or from the worker URL as a fallback.
+//! address the router can reach) or from the worker URL as a fallback.
 //!
 //! # Reconnect
 //!
@@ -215,7 +215,7 @@ impl KvEventSubscriberRegistry {
     /// background tasks. Idempotent: a second `add_worker` for the same
     /// `(worker_url, dp_rank)` pair is a no-op.
     ///
-    /// `worker_url` is the HTTP URL the gateway uses for routing (e.g.,
+    /// `worker_url` is the HTTP URL the router uses for routing (e.g.,
     /// `"http://10.0.0.1:30000"`). It serves as the keying identity in the
     /// registry but the actual ZMQ endpoint comes from `cfg` — the policy
     /// layer is expected to have learned `cfg` from the worker's

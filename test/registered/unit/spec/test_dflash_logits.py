@@ -627,16 +627,28 @@ def test_sparse_verify_needs_a_softcapped_target_and_tp(
     assert enabled is expected
 
 
-def test_sparse_support_samples_even_with_a_resolved_argmax(monkeypatch):
+@pytest.mark.parametrize("bcast_on", [None, False, True])
+def test_sparse_support_samples_even_with_a_resolved_argmax(bcast_on, monkeypatch):
     """The sparse path also hands over the support's argmax as target_predict, which
-    alone means a greedy accept; the support must still route to the sampled accept."""
+    alone means a greedy accept; the support must still route to the sampled accept,
+    whose decision syncs like the dense selector accept's."""
     from sglang.srt.speculative import dflash_worker_v2 as worker_mod
 
     monkeypatch.setattr(worker_mod, "SIMULATE_ACC_LEN", 0)
     bs, block = 2, 4
     worker = worker_mod.DFlashWorkerV2.__new__(worker_mod.DFlashWorkerV2)
     worker._selector_sample = ("ids", "q")
-    worker._tp_sync = SimpleNamespace(sync=lambda site, tensor: None)
+    syncs = []
+    worker._tp_sync = SimpleNamespace(sync=lambda site, tensor: syncs.append(site))
+    bcasts = []
+
+    def fake_bcast(accept_len, bonus):
+        bcasts.append((accept_len.shape, bonus.shape))
+        return bcast_on
+
+    worker._megakernel_bcast = (
+        None if bcast_on is None else SimpleNamespace(rank0_broadcast=fake_bcast)
+    )
     worker.block_size = block
     sparse_calls = []
 
@@ -659,6 +671,10 @@ def test_sparse_support_samples_even_with_a_resolved_argmax(monkeypatch):
     )
     assert sparse_calls == ["support"]
     assert accept_len.tolist() == [1, 1]
+    assert len(bcasts) == (0 if bcast_on is None else 1)
+    assert syncs == (
+        [] if bcast_on else [worker_mod.SpecTpSyncSite.DFLASH_SELECTOR] * 2
+    )
 
 
 if __name__ == "__main__":
