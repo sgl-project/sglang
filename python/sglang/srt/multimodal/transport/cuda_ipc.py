@@ -263,6 +263,7 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
         # cross-device open.
         pool_handle = ipc_extra["pool_handle"]
         redirected_handle = (rebuild_device_idx,) + tuple(pool_handle)[1:]
+        target_device = torch.device(f"{_DEVICE_TYPE}:{rebuild_device_idx}")
         cache_key = _normalize_pool_cache_key(pool_handle, rebuild_device_idx)
 
         if _is_npu:
@@ -277,7 +278,7 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
             pool_tensor = torch.empty(
                 0,
                 dtype=torch.uint8,
-                device=torch.device(f"{_DEVICE_TYPE}:{rebuild_device_idx}"),
+                device=target_device,
             ).set_(pool_storage)
             slice_tensor = pool_tensor.as_strided(
                 size=shape,
@@ -285,8 +286,6 @@ class CudaIpcTensorTransportProxy(StreamOrderedPoolConsumerMixin):
                 storage_offset=ipc_extra["pool_byte_offset"],
             )
             return slice_tensor, pool_storage
-
-        target_device = torch.device(f"cuda:{rebuild_device_idx}")
 
         with torch.cuda.device(target_device):
             if use_cache:
