@@ -1436,6 +1436,7 @@ class SchedulerDisaggregationPrefillMixin:
                 parallel.pp_size,
                 self.pp_transfer_poll_send_window,
                 P2PTag.DISAGG_TRANSFER_PP_SYNC,
+                release=True,
             )
             if parallel.pp_rank > 0:
                 for sender, poll in zip(senders, polls):

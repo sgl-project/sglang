@@ -79,10 +79,8 @@ class _Sender:
         self.local_polls += 1
         return self.kv_mgr.request_status[self.bootstrap_room]
 
-    def poll_pp_consensus(self):
-        return CommonKVManager.check_status_pp_consensus(
-            self.kv_mgr, self.bootstrap_room
-        )
+    def poll_pp_release(self):
+        return CommonKVManager.check_status_pp_release(self.kv_mgr, self.bootstrap_room)
 
     def clear(self):
         pass
