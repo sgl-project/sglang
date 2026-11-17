@@ -8,7 +8,7 @@ import logging
 import os
 from typing import Any, Optional
 
-from packaging.version import Version
+from packaging.version import InvalidVersion, Version
 
 from sglang.kernels.arch import current_arch
 from sglang.srt.arg_groups.model_override_base import (
@@ -38,10 +38,10 @@ _XPU_GRAPH_MIN_ONECCL = Version("2022.1.2")
 
 
 def _pip_oneccl_version() -> Optional[Version]:
-    """oneCCL version of the pip wheel torch loads; None when oneCCL is not pip-installed."""
+    """oneCCL version of the pip wheel torch loads; None when it is not pip-installed or unparsable."""
     try:
         return Version(importlib.metadata.version("oneccl"))
-    except importlib.metadata.PackageNotFoundError:
+    except (importlib.metadata.PackageNotFoundError, InvalidVersion):
         return None
 
 

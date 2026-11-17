@@ -1,4 +1,5 @@
 import argparse
+import importlib.metadata
 import json
 import os
 import pickle
@@ -81,7 +82,10 @@ from sglang.srt.arg_groups.parallel_hook import (
     handle_eplb_and_dispatch,
 )
 from sglang.srt.arg_groups.pd_disaggregation_hook import handle_pd_disaggregation
-from sglang.srt.arg_groups.platform_hook import handle_xpu_backends
+from sglang.srt.arg_groups.platform_hook import (
+    _pip_oneccl_version,
+    handle_xpu_backends,
+)
 from sglang.srt.arg_groups.serving_hook import (
     handle_admin_api_key_env,
     handle_crash_dump_env,
@@ -672,6 +676,23 @@ class TestPrepareServerArgs(CustomTestCase):
                 handle_xpu_backends(
                     self._xpu_graph_args(device, tp_size, Phase.DECODE, backend)
                 )
+
+    def test_pip_oneccl_version_reads_installed_distribution(self):
+        """Missing or unparsable oneCCL metadata means no pip oneCCL, not a startup crash."""
+        for metadata_version, expected in (
+            ("2022.1.1", Version("2022.1.1")),
+            ("not-a-version", None),
+        ):
+            with (
+                self.subTest(version=metadata_version),
+                patch("importlib.metadata.version", return_value=metadata_version),
+            ):
+                self.assertEqual(_pip_oneccl_version(), expected)
+        with patch(
+            "importlib.metadata.version",
+            side_effect=importlib.metadata.PackageNotFoundError("oneccl"),
+        ):
+            self.assertIsNone(_pip_oneccl_version())
 
     def test_enable_w4a4_mxfp4_megamoe_preserves_legacy_deepgemm_env(self):
         deepgemm_env = {
