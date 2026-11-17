@@ -188,9 +188,14 @@ class SiluAndMul(BaseFusedOp):
         return self._musa_swish_glu(x)
 
     def forward_mlu(self, x: torch.Tensor) -> torch.Tensor:
-        if not x.is_contiguous():
-            return self.forward_native(x)
-        return torch_mlu_ops.active(input=x, act_mode="silu", is_gated=True)
+        if (
+            x.numel() > 0
+            and x.is_contiguous()
+            and x.shape[-1] % 2 == 0
+            and x.dtype in (torch.float16, torch.bfloat16)
+        ):
+            return torch_mlu_ops.active(input=x, act_mode="silu", is_gated=True)
+        return self.forward_native(x)
 
 
 class SituAndMul(BaseFusedOp):

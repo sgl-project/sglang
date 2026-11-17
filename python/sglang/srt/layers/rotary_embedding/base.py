@@ -624,6 +624,9 @@ class RotaryEmbedding(BaseFusedOp):
                 "fused_set_kv_buffer_arg is not supported for mlu implementation"
             )
 
+        if query.numel() == 0:
+            return query, key
+
         if self.cos_sin_cache.dtype != query.dtype or (
             self.cos_sin_cache.dtype != key.dtype
         ):

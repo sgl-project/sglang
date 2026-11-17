@@ -77,6 +77,20 @@ class TestRotaryEmbeddingMLU(CustomTestCase):
         for positions in (axes[0], axes):
             self._check(rope, positions, native=positions.ndim == 2)
 
+    def test_empty_batch(self):
+        """An empty batch must preserve Q/K without an ambiguous reshape."""
+        rope = RotaryEmbedding(64, 32, 128, 10000, True, torch.bfloat16).to("mlu")
+        positions = torch.empty(0, device="mlu", dtype=torch.int32)
+        q = torch.empty(0, 256, device="mlu", dtype=torch.bfloat16)
+        k = torch.empty(0, 128, device="mlu", dtype=torch.bfloat16)
+        with patch.object(
+            torch_mlu_ops, "apply_rotary", wraps=torch_mlu_ops.apply_rotary
+        ) as kernel:
+            q_out, k_out = rope(positions, q, k)
+        self.assertIs(q_out, q)
+        self.assertIs(k_out, k)
+        kernel.assert_not_called()
+
     def test_native_fallback(self):
         """FP32 coefficients and Ernie's specialized layout bypass the vendor op."""
         axes = torch.arange(9, device="mlu").reshape(3, 3)
