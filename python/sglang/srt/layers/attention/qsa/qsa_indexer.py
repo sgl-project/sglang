@@ -34,7 +34,9 @@ from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
-from sglang.srt.utils import is_gfx95_supported
+from sglang.srt.utils import is_gfx95_supported, is_npu
+
+_is_npu = is_npu()
 
 # Cap on the fp32 [query_rows, compressed_keys] prefill logits workspace;
 # top-k is per row, so tiling rows does not change the selection.
@@ -156,7 +158,8 @@ class QSAIndexer(MultiPlatformOp):
     def _use_fused_prep(self, tensor: torch.Tensor) -> bool:
         """Whether the fused indexer-prep kernels support this configuration."""
         return (
-            tensor.is_cuda
+            not _is_npu
+            and tensor.is_cuda
             and tensor.dtype in (torch.bfloat16, torch.float16)
             and self.index_head_dim in (64, 128, 256)
             and self.rotary_emb.rotary_dim % 2 == 0
@@ -261,9 +264,7 @@ class QSAIndexer(MultiPlatformOp):
     ) -> None:
         """Fused mean -> gemma norm -> MRoPE -> compressed-cache store;
         a None source_keys/source_rope reads the members from the pending ring."""
-        from sglang.kernels.ops.attention.qsa_indexer import (
-            qsa_index_k_compress_store,
-        )
+        from sglang.kernels.ops.attention.qsa_indexer import qsa_index_k_compress_store
 
         if source_keys is None:
             source_keys = pool.get_qsa_key_state_buffer(self.layer_id)
@@ -484,7 +485,11 @@ class QSAIndexer(MultiPlatformOp):
             return output
 
         relative = (
-            max_row_keys is not None and max_row_keys > 0 and q.is_cuda and HAS_TILELANG
+            not _is_npu
+            and max_row_keys is not None
+            and max_row_keys > 0
+            and q.is_cuda
+            and HAS_TILELANG
         )
         # On gfx95 the blocks come from topk_v2, which (unless SGLANG_TOPK_V2_MODE=0) is
         # exact where fast_topk drops members of an overfull threshold bin (as in
@@ -573,7 +578,8 @@ class QSAIndexer(MultiPlatformOp):
         # fast_topk (k = 512) writes 0..length-1 for rows that fit k without reading
         # their scores, and never reads past a row's length.
         use_fast_topk = (
-            q.is_cuda
+            not _is_npu
+            and q.is_cuda
             and self.block_topk == 512
             and not is_batch_invariant_mode_enabled()
         )
@@ -844,6 +850,17 @@ class QSAIndexer(MultiPlatformOp):
         )
 
     def forward_xpu(
+        self,
+        hidden_states: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch,
+        indexer_metadata,
+    ) -> torch.Tensor:
+        return self._forward_impl(
+            hidden_states, positions, forward_batch, indexer_metadata
+        )
+
+    def forward_npu(
         self,
         hidden_states: torch.Tensor,
         positions: torch.Tensor,
