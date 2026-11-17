@@ -47,17 +47,10 @@ class RowwiseFp8Config(QuantizationConfig):
         self.format_version = format_version
         self.fp8_layers = fp8_layers
         self.input_scale_layers = input_scale_layers
-        self.num_linear_layers = num_linear_layers
-        self.num_bf16_layers = num_bf16_layers
-        self.num_tensors = num_tensors
         self.is_checkpoint_fp8_serialized = True
         self.weight_qscheme = "per_channel"
         self.weight_block_size = None
         self.activation_scheme = "dynamic"
-
-    @property
-    def num_fp8_layers(self) -> int:
-        return len(self.fp8_layers)
 
     def has_input_scale(self, prefix: str) -> bool:
         return prefix in self.input_scale_layers
@@ -99,12 +92,11 @@ class RowwiseFp8Config(QuantizationConfig):
 
         quant_configs = config.get("quant_configs", {})
         fp8_layers: set[str] = set()
-        num_bf16 = 0
         for prefix, entry in layers.items():
             fmt = (entry or {}).get("format") if isinstance(entry, dict) else entry
             if fmt == BF16_FORMAT:
-                num_bf16 += 1
-            elif fmt == FP8_FORMAT:
+                continue
+            if fmt == FP8_FORMAT:
                 fp8_layers.add(prefix)
             else:
                 raise RowwiseFp8Error(
@@ -136,9 +128,6 @@ class RowwiseFp8Config(QuantizationConfig):
             format_version=version,
             fp8_layers=frozenset(fp8_layers),
             input_scale_layers=frozenset(input_scale_layers),
-            num_linear_layers=len(layers),
-            num_bf16_layers=num_bf16,
-            num_tensors=len(tensors) if tensors is not None else 0,
         )
 
     def get_quant_method(
@@ -151,9 +140,6 @@ class RowwiseFp8Config(QuantizationConfig):
         if prefix not in self.fp8_layers:
             return UnquantizedLinearMethod()
         return Fp8LinearMethod(self)
-
-    def get_scaled_act_names(self) -> list[str]:
-        return []
 
 
 def build_rowwise_fp8_config_from_metadata(

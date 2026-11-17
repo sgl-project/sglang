@@ -203,6 +203,12 @@ class StorageBackendFactory:
                 bytes_per_page = (
                     mem_pool_host.get_size_per_token() * mem_pool_host.page_size
                 )
+            else:
+                raise ValueError(
+                    "The hf3fs storage backend does not support "
+                    f"--hicache-mem-layout {mem_pool_host.layout!r}; supported "
+                    "layouts: page_first, page_first_direct, layer_first."
+                )
 
             dtype = mem_pool_host.dtype
             return backend_class.from_env_config(bytes_per_page, dtype, storage_config)

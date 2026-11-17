@@ -267,5 +267,31 @@ class TestDeprecatedEnvRegistry(unittest.TestCase):
         self.assertEqual(os.environ[new_name], "ABC")
 
 
+class TestDocumentedBooleanKnobs(unittest.TestCase):
+    """Documented booleans must accept `true`/`false`: compared to "1" or "0" at the
+    read site, `true` was ignored and even turned the MLA RoPE fusion off."""
+
+    DOCUMENTED_DEFAULTS = {
+        "SGLANG_SKIP_P2P_CHECK": False,
+        "SGLANG_FUSED_MLA_ENABLE_ROPE_FUSION": True,
+        "SGLANG_BLOCK_NONZERO_RANK_CHILDREN": True,
+    }
+
+    def test_default_and_true_false_spellings(self):
+        for name, default in self.DOCUMENTED_DEFAULTS.items():
+            field = vars(type(envs))[name]
+            with self.subTest(name=name), patch.dict(os.environ):
+                os.environ.pop(name, None)
+                self.assertIs(field.get(), default)
+                for value, expected in (
+                    ("true", True),
+                    ("1", True),
+                    ("false", False),
+                    ("0", False),
+                ):
+                    os.environ[name] = value
+                    self.assertIs(field.get(), expected)
+
+
 if __name__ == "__main__":
     unittest.main()
