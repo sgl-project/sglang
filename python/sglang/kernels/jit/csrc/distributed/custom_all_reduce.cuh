@@ -479,12 +479,10 @@ struct AllReduceKernel {
       // MI350X: from 128 KB a full block per CU beats the narrower pick for
       // 1shot_push (TP4/6 -4..-8%, TP8 up to -22%); 2shot_push does not gain
       if (!two_shot && num_vecs >= 8192) block_size = 1024u;
-      // gfx1250 (TP8, 64-block grid): from 512 KB the rule picks 512-1024 threads for
-      // 2shot_push; with ranks arriving skewed 256 is up to 40% faster up to 4 MB.
-      // Larger sizes keep the rule.
-      if (two_shot && is_gfx1250() && nbytes <= int64_t{4} << 20) block_size = 256u;
-      if constexpr (kWorldSize <= 8) {
-        if (two_shot && is_gfx1250() && nbytes >= kTwoShotPushUnrolledMinBytes<kWorldSize>) {
+      if constexpr (kWorldSize <= 16) {
+        // the unrolled kernel gives every peer a warp; smaller grids take the per-vector kernel
+        const bool enough_warps = push.default_blocks * (kTwoShotPushThreads / device::kWarpThreads) >= kWorldSize - 1;
+        if (two_shot && is_gfx1250() && enough_warps && nbytes >= kTwoShotPushUnrolledMinBytes<kWorldSize>) {
           LaunchKernel(push.default_blocks, kTwoShotPushThreads, stream)  //
               .enable_pdl(kUsePDL)(all_reduce_2shot_push_unrolled_kernel<T, kWorldSize, kUsePDL, PushParams>, params);
           return out;

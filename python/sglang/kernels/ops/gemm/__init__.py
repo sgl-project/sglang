@@ -26,6 +26,20 @@ _SM12X = frozenset({CapabilityRequirement.cuda(min_sm=(12, 0), max_sm=(12, 9))})
 _SM10X = frozenset({CapabilityRequirement.cuda(min_sm=(10, 0), max_sm=(10, 9))})
 _KDA_PACKAGE = "sglang.kernels.kda_kernels"
 
+for _name, _backend in (
+    ("linear_bf16_quack", KernelBackend.CUTE_DSL),
+    ("linear_bf16_cublaslt", KernelBackend.FLASHINFER),
+):
+    register_kernel(
+        KernelSpec(
+            op="gemm.linear_bf16",
+            backend=_backend,
+            target=f"sglang.kernels.ops.gemm.sm120_bf16:{_name}",
+            capabilities=_SM120,
+        )
+    )
+del _name, _backend
+
 
 for _name in ("npu_w8a8_block_fp8_linear", "npu_w8a8_block_fp8_grouped_matmul"):
     register_kernel(

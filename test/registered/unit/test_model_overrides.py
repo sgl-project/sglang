@@ -206,6 +206,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "disable_overlap_schedule",
                     "disable_radix_cache",
                     "uses_mamba_radix_cache",
+                    "decode_state_free_radix_default",
                     "mamba_radix_cache_strategy",
                     "mamba_full_memory_ratio",
                     "ple_offload_embedding",
@@ -251,6 +252,7 @@ class TestModelOverridableWhitelist(CustomTestCase):
                     "mm_preprocess_cache_size_mb",
                     "mm_feature_transport",
                     "mm_enable_dp_encoder",
+                    "enable_flashmla_prefill_token_packing",
                 }
             ),
         )
