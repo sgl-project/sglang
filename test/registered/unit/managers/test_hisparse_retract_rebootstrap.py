@@ -1,4 +1,7 @@
-"""A retracted HiSparse PD decode request resumes by rebootstrap, not from a host copy.
+"""HiSparse fallback retractions resume by rebootstrap, not from a host copy.
+
+Non-speculative DSV4 has a separate retained-state path. Exercise speculative
+DSV4 here so this regression continues to cover the recomputation fallback.
 
 `RequestRetirer.retract` lets HiSparse release the request before it takes the
 retraction backup, so by then the request's device buffer and host slots are
@@ -64,6 +67,7 @@ def _dsv4_hisparse_allocator():
 def _offloading_allocator():
     """A pool that keeps a host copy, as plain PD decode does."""
     return SimpleNamespace(
+        state=None,
         cpu_copy_carries_mamba=True,
         get_kvcache=lambda: SimpleNamespace(device="cpu"),
         get_cpu_copy=lambda indices, mamba_indices=None, req_pool_index=None: _CPU_COPY,
@@ -86,7 +90,9 @@ def _make_req(multimodal: bool = False) -> Req:
     return req
 
 
-def _retract(req: Req, allocator, backend: str = "cpu_tensor") -> bool:
+def _retract(
+    req: Req, allocator, backend: str = "cpu_tensor", *, speculative: bool = False
+) -> bool:
     reset_context()
     publish(
         ServerArgs(
@@ -102,10 +108,19 @@ def _retract(req: Req, allocator, backend: str = "cpu_tensor") -> bool:
         ),
         token_to_kv_pool_allocator=allocator,
     )
-    # HiSparse releases the request's KV before the backup would run.
+    # Fallback HiSparse releases the request's KV before the backup would run.
+    coordinator = None
+    if isinstance(allocator, HiSparseTokenToKVPoolAllocator):
+        coordinator = SimpleNamespace(
+            is_dsv4_hisparse=isinstance(
+                allocator, DeepSeekV4HiSparseTokenToKVPoolAllocator
+            ),
+            spec_swap=SimpleNamespace(enabled=speculative),
+            release_request=lambda req: None,
+        )
     retirer = release_only_retirer(
         tree_cache,
-        hisparse_coordinator=SimpleNamespace(release_request=lambda req: None),
+        hisparse_coordinator=coordinator,
     )
     with patch.object(request_retirer, "release_kv_cache"):
         return retirer.retract(req, offload_kv=True)
@@ -133,16 +148,16 @@ class TestHiSparseRetractRebootstrap(CustomTestCase):
         self.addCleanup(reset_context)
 
     def test_backup_and_requeue_agree_on_which_pools_recompute(self):
-        for name, make_allocator, recomputes in (
-            ("hisparse", _hisparse_allocator, True),
-            ("dsv4_hisparse", _dsv4_hisparse_allocator, True),
-            ("plain", _offloading_allocator, False),
+        for name, make_allocator, recomputes, speculative in (
+            ("hisparse", _hisparse_allocator, True, False),
+            ("dsv4_hisparse_spec", _dsv4_hisparse_allocator, True, True),
+            ("plain", _offloading_allocator, False, False),
         ):
             with self.subTest(pool=name):
                 allocator = make_allocator()
                 req = _make_req()
 
-                self.assertTrue(_retract(req, allocator))
+                self.assertTrue(_retract(req, allocator, speculative=speculative))
                 if recomputes:
                     self.assertIsNone(req.kv.retraction_backup)
                 else:
