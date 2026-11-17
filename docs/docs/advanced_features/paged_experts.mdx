@@ -51,9 +51,10 @@ requests, and breakable prefill graphs run the paged MoE layers as eager breaks.
   experts in the [expert cache](#the-expert-cache), so that later starts read them instead of
   loading and repacking them, and serve the experts that do not fit host memory from there
   (see [Disk tier](#disk-tier)). Off by default; requires `--enable-paged-experts`.
-- **`--paged-experts-host-memory-gb G`**: Pinned host memory, in GiB, for the experts of all MoE
-  layers. When every expert fits, nothing changes; otherwise the [disk tier](#disk-tier) holds the
-  rest, with `--paged-experts-enable-disk`, and without it the start fails. Unset, every expert is
+- **`--paged-experts-host-memory-gb G`**: Pinned host memory, in GiB per host, for the experts of
+  all MoE layers, shared equally by the TP ranks on that host. When every expert fits, nothing
+  changes; otherwise the [disk tier](#disk-tier) holds the rest, with
+  `--paged-experts-enable-disk`, and without it the start fails. Unset, every expert is
   pinned as before; with `--paged-experts-enable-disk`, the experts that do not fit what is
   available at startup (within the container's memory limit) go to the disk tier, which then
   keeps 10 GiB of that free. Requires `--enable-paged-experts`.
@@ -77,13 +78,16 @@ requests, and breakable prefill graphs run the paged MoE layers as eager breaks.
   | ModelOpt NVFP4 | Marlin | pass `--moe-runner-backend marlin`; runs W4A16 |
 
   Other quantization methods and MoE runners are rejected at startup.
-- **Tensor parallelism:** supported for unquantized BF16 experts with the triton runner. Each
-  TP rank holds its native expert shards in pinned host memory and its own K-slot GPU table;
-  ordinary TP1 usage keeps supporting the other formats above. Expert, pipeline and data
-  parallelism, EPLB, fused shared experts (use `--disable-shared-experts-fusion`) and
-  `--enable-fused-moe-sum-all-reduce` are rejected at startup. TP ranks use one shared K under
-  `auto`, chosen from their minimum free memory and shard size so CUDA graph capture and replay
-  stay aligned. The disk tier requires TP1: its cache does not distinguish TP ranks' shards.
+- **Parallelism:** TP is currently validated for unquantized BF16 experts with the triton
+  runner. Each TP rank holds its native expert shards in pinned host memory and its own K-slot
+  GPU table; TP1 also supports the other formats above. Expert, pipeline, data and attention
+  data parallelism require `--ep-size`, `--pp-size`, `--dp-size` and `--attn-dp-size` to be 1.
+  Under `auto`, K uses the minimum free memory across TP ranks. An explicit
+  `--paged-experts-num-resident K` must fit on the rank with the least free memory.
+  Startup checks that the final K and decode capture sizes agree across TP ranks.
+  The disk tier requires TP1: its cache does not distinguish TP ranks' shards.
+- **Other MoE features:** EPLB, fused shared experts (use `--disable-shared-experts-fusion`)
+  and `--enable-fused-moe-sum-all-reduce` are rejected at startup.
 - **Speculative decoding** is rejected at startup.
 - **Load formats:** `--load-format auto` (the default), `safetensors`, `pt`, `npcache`,
   `mistral`, `fastsafetensors`, `instanttensor` and `runai_streamer`. The others are rejected
@@ -93,9 +97,11 @@ requests, and breakable prefill graphs run the paged MoE layers as eager breaks.
   prefill graphs may use the `breakable` backend (the default on CUDA) or be disabled. Other
   combinations are rejected at startup.
 - **Host memory:** the host store holds all E experts of every MoE layer and is page-locked, so
-  the host must be able to pin that much memory, or the disk tier holds the rest. Under WSL2,
-  pinned memory is capped at about half of system RAM: set `--paged-experts-host-memory-gb`
-  below that.
+  the host must be able to pin that much memory, or the disk tier holds the rest. TP ranks
+  on one host share its RAM: their expert shards together occupy the full store for that host.
+  `--paged-experts-host-memory-gb` caps their combined stores, not each rank independently;
+  on multiple hosts each host has its own budget. Under WSL2, the pinned-memory cap of about
+  half of system RAM applies to this shared total: set `--paged-experts-host-memory-gb` below it.
 - **Disk tier** ([below](#disk-tier); R is the experts per layer in host memory): x86-64 hosts
   only for now. The first start writes every layer's file once, about the size of the expert
   weights, and keeps 8 GiB of the disk free; the space is checked at startup. The checkpoint must
@@ -380,7 +386,8 @@ and falls below it.
 Prompt and greedy decode logprobs are compared with the unpaged server under
 `--enable-deterministic-inference --attention-backend triton`, eager and with decode captured:
 
-- **triton runner (unquantized, FP8, INT8):** bit-identical;
+- **triton runner (unquantized, FP8, INT8):** bit-identical. BF16 TP2 comparisons against native
+  TP2 also matched tokens and logprobs exactly at K=8 and at auto-sized K=13;
 - **Marlin runner (GPTQ, AWQ, compressed-tensors, MXFP4, NVFP4):** Marlin's reduction depends on
   the batch shape, so a paged step (which runs the kernel on a different number of experts)
   differs from the unpaged one within Marlin's own batch-to-batch noise. On SM90 and newer the

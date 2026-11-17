@@ -227,7 +227,10 @@ class PagedExpertsMoEMethod(FusedMoEMethodBase, torch.nn.Module):
             return None
         rows = self.loads.rows_like
         if not get_exec().moe.paged_experts_enable_disk:
-            expert_cache.hint_disk(layer, rows, self.num_experts, self.contract.repacks)
+            if get_parallel().tp_size == 1:
+                expert_cache.hint_disk(
+                    layer, rows, self.num_experts, self.contract.repacks
+                )
             return None
         return ExpertCache.for_layer(
             layer,
@@ -490,7 +493,7 @@ def check_paged_experts_compat(layer, expert_format) -> None:
 
     problems = []
     parallel = get_parallel()
-    for name in ("ep_size", "pp_size", "dp_size"):
+    for name in ("ep_size", "pp_size", "dp_size", "attn_dp_size"):
         if getattr(parallel, name) > 1:
             problems.append(f"--{name.replace('_', '-')} must be 1 with paged experts")
     if parallel.tp_size > 1:
@@ -504,8 +507,8 @@ def check_paged_experts_compat(layer, expert_format) -> None:
             or layer.params_dtype != torch.bfloat16
         ):
             problems.append(
-                "TP > 1 is supported only for unquantized BF16 experts "
-                "using the triton runner"
+                "Tensor parallelism with paged experts is so far only validated "
+                "for unquantized BF16 experts"
             )
     if get_exec().moe.enable_eplb:
         problems.append("--enable-eplb is not supported")
@@ -622,7 +625,7 @@ def _host_rows(rows_like, num_experts: int, num_resident: int, layer_id) -> int:
     --paged-experts-host-memory-gb every expert, as without the disk tier: no budget is
     measured."""
     moe = get_exec().moe
-    if num_experts <= num_resident or not (
+    if not (
         moe.paged_experts_enable_disk or moe.paged_experts_host_memory_gb is not None
     ):
         return num_experts

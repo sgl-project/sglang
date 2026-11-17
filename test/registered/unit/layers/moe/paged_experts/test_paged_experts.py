@@ -207,7 +207,7 @@ def _exec(enable_disk=False):
     )
 
 
-def _load(method, layer, disk=False, router_top_k=K):
+def _load(method, layer, disk=False, router_top_k=K, tp_size=1):
     """The post-load step, with the host store on the CPU, the expert cache as ``disk`` says
     and the model's router top-k ``router_top_k`` (for a layer without one)."""
     model_config = SimpleNamespace(
@@ -217,6 +217,7 @@ def _load(method, layer, disk=False, router_top_k=K):
         patch.object(formats, "HostExpertStore", _CpuStore),
         patch(_EXPERT_CACHE + "HostExpertStore", _CpuStore),
         patch(_METHOD + "get_exec", return_value=_exec(disk)),
+        patch(_METHOD + "get_parallel", return_value=SimpleNamespace(tp_size=tp_size)),
         patch(_METHOD + "process_model_config", return_value=model_config),
     ):
         method.process_weights_after_loading(layer)
@@ -1200,7 +1201,9 @@ class TestCompat(CustomTestCase):
         layer = SimpleNamespace(
             top_k=TOP_K, num_fused_shared_experts=0, params_dtype=params_dtype
         )
-        parallel = SimpleNamespace(tp_size=tp_size, ep_size=1, pp_size=1, dp_size=1)
+        parallel = SimpleNamespace(
+            tp_size=tp_size, ep_size=1, pp_size=1, dp_size=1, attn_dp_size=1
+        )
         for name, size in (parallel_sizes or {}).items():
             setattr(parallel, name, size)
         with (
@@ -1242,14 +1245,45 @@ class TestCompat(CustomTestCase):
                 with self.assertRaisesRegex(RuntimeError, "--tp-size|unquantized BF16"):
                     self._check(tp_size=2, **kwargs)
         self._check(params_dtype=torch.float16)
+        self._check(expert_format=formats.Fp8BlockFormat())
 
     def test_tp_keeps_other_parallel_modes_rejected(self):
-        for name in ("ep_size", "pp_size", "dp_size"):
+        for name in ("ep_size", "pp_size", "dp_size", "attn_dp_size"):
             with self.subTest(name):
                 with self.assertRaisesRegex(
                     RuntimeError, f"--{name.replace('_', '-')}"
                 ):
                     self._check(tp_size=2, parallel_sizes={name: 2})
+
+    def test_attention_dp_is_rejected_after_resolving_the_legacy_flags(self):
+        from sglang.srt.arg_groups.overrides import resolution_result
+        from sglang.srt.arg_groups.parallel_hook import handle_deprecated_dp_attention
+        from sglang.srt.server_args import ServerArgs
+
+        args = ServerArgs(
+            model_path="dummy", tp_size=2, dp_size=2, enable_dp_attention=True
+        )
+        handle_deprecated_dp_attention(args)
+        self.assertEqual(resolution_result(args, "dp_size"), 1)
+        with self.assertRaisesRegex(RuntimeError, "--attn-dp-size must be 1"):
+            self._check(
+                tp_size=2,
+                num_resident=8,
+                parallel_sizes={
+                    "dp_size": resolution_result(args, "dp_size"),
+                    "attn_dp_size": resolution_result(args, "attn_dp_size"),
+                },
+            )
+
+    def test_tp_does_not_suggest_the_disabled_disk_cache(self):
+        for tp_size in (1, 2):
+            with (
+                self.subTest(tp_size=tp_size),
+                patch(_EXPERT_CACHE + "hint_disk") as hint,
+            ):
+                method, layer, _ = _paged_layer(load=False)
+                _load(method, layer, tp_size=tp_size)
+            self.assertEqual(hint.called, tp_size == 1)
 
     def test_only_loaders_that_fill_through_load_weights_are_accepted(self):
         """The loaders that fill the experts through model.load_weights and then run the
@@ -1518,6 +1552,56 @@ class TestSizing(CustomTestCase):
             ):
                 ks = slots.size(kv_tokens)
         return ks, built, caps, overrides
+
+    def test_tp_startup_rejects_different_final_slot_and_capture_plans(self):
+        # Equal free-memory measurements cannot guard against other sizing inputs:
+        # reserve two slots for prefill on one rank, and none on the other.
+        plans = []
+        models = []
+        for reserve in (0, 2):
+            ks, built, caps, _ = self._sized(budget_slots=4, reserve_slots=reserve)
+            plans.append((ks, [caps[0]], caps[0]))
+            models.append(torch.nn.ModuleList([layer for _, layer, _ in built]))
+        self.assertEqual([p[0] for p in plans], [[4, 4], [3, 3]])
+        # Also cover unequal list lengths: a tensor all-reduce without a length
+        # check would hang rather than report either of these mismatches.
+        for peer in (plans[0], plans[1], ([4, 4], [1, 2], 2), ([4], [2], 2)):
+            gathered = [plans[0], peer]
+            for rank in range(2):
+                local = gathered[rank]
+                decode = SimpleNamespace(bs=local[1], max_bs=local[2])
+                model = models[1] if local[0] == [3, 3] else models[0]
+                if len(local[0]) == 1:
+                    model = torch.nn.ModuleList([model[0]])
+
+                def gather(plan):
+                    self.assertEqual(plan, local)
+                    return gathered
+
+                group = SimpleNamespace(all_gather_object=gather)
+                with (
+                    self.subTest(peer=peer, rank=rank),
+                    patch(
+                        self._SIZING + "get_parallel",
+                        return_value=SimpleNamespace(tp_size=2),
+                    ),
+                    patch(
+                        self._SIZING + "get_exec",
+                        return_value=SimpleNamespace(
+                            graph=SimpleNamespace(
+                                cuda_graph_config=SimpleNamespace(decode=decode)
+                            )
+                        ),
+                    ),
+                    patch("sglang.srt.distributed.get_tp_group", return_value=group),
+                ):
+                    if peer == plans[0]:
+                        sizing.check_tp_sizing(model)
+                    else:
+                        with self.assertRaisesRegex(
+                            RuntimeError, "differ across TP ranks"
+                        ):
+                            sizing.check_tp_sizing(model)
 
     @staticmethod
     def _kvc():
@@ -2283,6 +2367,15 @@ class TestDiskTier(CustomTestCase):
 
 
 class TestDiskTierGuards(CustomTestCase):
+    def setUp(self):
+        super().setUp()
+        parallel = patch(
+            "sglang.srt.runtime_context.get_parallel",
+            return_value=SimpleNamespace(tp_size=1),
+        )
+        parallel.start()
+        self.addCleanup(parallel.stop)
+
     def _rows(
         self,
         budget_rows,
@@ -2650,6 +2743,73 @@ class TestDiskTierGuards(CustomTestCase):
                 rows = method_module._host_rows({"w": ((H, H), torch.float32)}, E, K, 0)
             self.assertEqual(rows, E)
             self.assertEqual(budget.called, measured)
+
+
+class TestTpHostBudget(CustomTestCase):
+    def _rows(self, hosts, rank, budget_gb, num_resident=K):
+        from sglang.srt.layers.moe.paged_experts import method as method_module
+
+        group = SimpleNamespace(
+            world_size=len(hosts), rank_in_group=rank, cpu_group=object()
+        )
+        exec_ctx = SimpleNamespace(
+            moe=SimpleNamespace(
+                paged_experts_host_memory_gb=budget_gb, paged_experts_enable_disk=False
+            )
+        )
+        with (
+            patch.object(disk_tier, "_MODEL", disk_tier.ModelContext()),
+            patch.object(method_module, "get_exec", return_value=exec_ctx),
+            patch("sglang.srt.runtime_context.get_exec", return_value=exec_ctx),
+            patch(
+                "sglang.srt.runtime_context.get_parallel",
+                return_value=SimpleNamespace(tp_size=len(hosts)),
+            ),
+            patch(
+                "sglang.srt.runtime_context.process_model_config",
+                return_value=SimpleNamespace(num_hidden_layers=2),
+            ),
+            patch("sglang.srt.distributed.get_tp_group", return_value=group),
+            patch(
+                "sglang.srt.distributed.parallel_state.in_the_same_node_as",
+                side_effect=lambda pg, source_rank: [
+                    host == hosts[source_rank] for host in hosts
+                ],
+            ),
+        ):
+            # Layout only: 2 GiB per rank across two layers, without allocating it.
+            return method_module._host_rows(
+                {"w": ((1 << 26,), torch.uint8)}, E, num_resident, 0
+            )
+
+    def test_tp_ranks_share_one_host_budget(self):
+        for rank in range(2):
+            with self.subTest(rank=rank):
+                with self.assertRaisesRegex(RuntimeError, "2 TP ranks.*in total"):
+                    self._rows([0, 0], rank, budget_gb=2)
+                self.assertEqual(self._rows([0, 0], rank, budget_gb=4), E)
+
+    def test_only_ranks_on_this_host_share_its_budget(self):
+        # TP4 across two hosts needs 4 GiB on each, rather than 8 GiB per host.
+        for rank in range(4):
+            with self.subTest(rank=rank):
+                self.assertEqual(self._rows([0, 0, 1, 1], rank, budget_gb=4), E)
+        # Unequal host populations must also use their actual local rank counts.
+        for rank in range(3):
+            with self.assertRaisesRegex(RuntimeError, "3 TP ranks.*in total"):
+                self._rows([0, 0, 0, 1], rank, budget_gb=4)
+        self.assertEqual(self._rows([0, 0, 0, 1], 3, budget_gb=4), E)
+
+    def test_tp1_and_fully_resident_experts_obey_the_budget(self):
+        for num_resident in (K, E):
+            with self.subTest(num_resident=num_resident):
+                self.assertEqual(self._rows([0], 0, 2, num_resident), E)
+                with self.assertRaisesRegex(
+                    RuntimeError, "--paged-experts-host-memory-gb"
+                ):
+                    self._rows([0], 0, 1, num_resident)
+                with self.assertRaisesRegex(RuntimeError, "2 TP ranks.*in total"):
+                    self._rows([0, 0], 0, 2, num_resident)
 
 
 class TestHostMemoryFlag(CustomTestCase):
