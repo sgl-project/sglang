@@ -338,10 +338,31 @@ def prepare_cm_data(namespace, pod_string, run_id=None):
     return data
 
 
-def _stream_pod_logs(process, tag):
-    """Print a streamed pod log, tagging each line with the pod's short name."""
-    for line in iter(process.stdout.readline, ""):
-        print(f"[{tag}] {line.rstrip()}")
+def dump_pod_logs(namespace, pod_name):
+    """Print the full log of ``pod_name`` under a banner.
+
+    Used once monitoring ends without success: streaming the pod live would
+    interleave with the test output and make the CI log unreadable, so the log
+    is fetched only when it is actually needed for debugging.
+    """
+    logger.error(f"===== begin logs of {pod_name} =====")
+    try:
+        result = subprocess.run(
+            # Keep the tail bounded: a long-serving prefill pod logs a lot and
+            # the most recent lines carry the failure that matters.
+            ["kubectl", "logs", "--tail=1000", "-n", namespace, pod_name],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        output = (result.stdout or "").strip()
+        if output:
+            print(output)
+        if result.returncode != 0:
+            logger.error(f"kubectl logs {pod_name} failed: {result.stderr.strip()}")
+    except Exception as e:
+        logger.error(f"Failed to dump logs of {pod_name}: {e}")
+    logger.error(f"===== end logs of {pod_name} =====")
 
 
 def monitor_pod_logs(
@@ -357,7 +378,7 @@ def monitor_pod_logs(
 
     # In PD separation the test verdict is printed by the router pod, but the
     # model servers (and most startup errors) live on the prefill/decode pods.
-    # Stream prefill-0's log as well, tagged per line, so its output is visible.
+    # Their logs are dumped only when the run fails, to keep the live log clean.
     extra_pod_names = []
     if kube_job_type == KUBE_JOB_MULTI_PD_SEPARATION:
         extra_pod_names.append(f"{kube_job_prefix_name}-sglang-prefill-0")
@@ -383,7 +404,8 @@ def monitor_pod_logs(
     metric_pattern = re.compile(r"^\[METRIC\] (\S+)=(\S+)(?: labels=(.*))?$")
 
     process = None
-    extra_log_processes = []
+    log_thread = None
+    test_succeeded = False
     try:
         # Start kubectl logs process
         process = subprocess.Popen(
@@ -400,24 +422,6 @@ def monitor_pod_logs(
 
         # Use two threads: one for reading logs, one for checking pod status
         import threading
-
-        # Stream the auxiliary pods' logs alongside the monitored one.
-        for extra_pod_name in extra_pod_names:
-            extra_process = subprocess.Popen(
-                ["kubectl", "logs", "-f", "-n", namespace, extra_pod_name],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                universal_newlines=True,
-                bufsize=1,
-            )
-            extra_log_processes.append(extra_process)
-            extra_tag = extra_pod_name.rsplit("-sglang-", 1)[-1]
-            logger.info(f"Starting to stream logs for Pod: {extra_pod_name}")
-            threading.Thread(
-                target=_stream_pod_logs,
-                args=(extra_process, extra_tag),
-                daemon=True,
-            ).start()
 
         # Shared variables
         match_event = threading.Event()
@@ -547,21 +551,22 @@ def monitor_pod_logs(
         elif not is_success:
             raise Exception("The test result was FAILED!")
         else:
+            test_succeeded = True
             logger.info("The test result was OK!")
     finally:
-        for extra_process in extra_log_processes:
-            if extra_process.poll() is None:
-                extra_process.terminate()
-                try:
-                    extra_process.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    extra_process.kill()
         if process and process.poll() is None:
             process.terminate()
             try:
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 process.kill()
+        if log_thread is not None:
+            log_thread.join(timeout=5)
+        # Dump the auxiliary pods' logs only when the run failed; they are
+        # noisy (model server startup) and would bury the test output.
+        if not test_succeeded:
+            for extra_pod_name in extra_pod_names:
+                dump_pod_logs(namespace, extra_pod_name)
 
     return streamed_metrics, streamed_labels
 
