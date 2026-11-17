@@ -2422,8 +2422,15 @@ class _KvStrategy(StackStrategy):
     def build_direct_linker_pool_group(self, *, kvcache, params, page_size):
         from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
             _build_kv_device_pool_group,
+            _build_plain_kv_device_pool_group,
+        )
+        from sglang.srt.mem_cache.memory_pool import (
+            MHATokenToKVPool,
+            MLATokenToKVPool,
         )
 
+        if type(kvcache) in (MLATokenToKVPool, MHATokenToKVPool):
+            return _build_plain_kv_device_pool_group(kvcache, params, page_size)
         return _build_kv_device_pool_group(
             kvcache, page_size, params.mtp_draft_device_pools
         )
