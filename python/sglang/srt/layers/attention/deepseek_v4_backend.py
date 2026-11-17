@@ -4127,7 +4127,12 @@ class DeepseekV4AttnBackend(
                 )
 
                 if try_sharded_verify(
-                    self, forward_batch.batch_size, inputs, is_source, is_consumer, published
+                    self,
+                    forward_batch.batch_size,
+                    inputs,
+                    is_source,
+                    is_consumer,
+                    published,
                 ):
                     return
             if is_source:

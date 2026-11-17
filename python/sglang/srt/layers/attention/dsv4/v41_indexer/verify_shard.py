@@ -73,7 +73,9 @@ def try_sharded_verify(backend, batch_size, inputs, is_source, is_consumer, publ
         return False
 
     # Keep each request and its candidate mask on the same rank.
-    shard = RowShard(group=group, rank=parallel.attn_cp_rank, world=world, row_align=width)
+    shard = RowShard(
+        group=group, rank=parallel.attn_cp_rank, world=world, row_align=width
+    )
     count = shard.rows_per_rank(rows)
     deep_select = (
         not (is_source or is_consumer)
@@ -104,7 +106,9 @@ def try_sharded_verify(backend, batch_size, inputs, is_source, is_consumer, publ
         backend._publish_candidate_metadata(
             BlockIds(
                 blocks=blocks,
-                decode_mask=candidate_block_mask(blocks, data.lmax, selector.block_size),
+                decode_mask=candidate_block_mask(
+                    blocks, data.lmax, selector.block_size
+                ),
             )
         )
 
@@ -122,8 +126,12 @@ def try_sharded_verify(backend, batch_size, inputs, is_source, is_consumer, publ
             dtype=torch.int32,
         ).expand(count, -1)
         raw = topk_page_transform(
-            data.scores, topk, page_table=identity, page_size=page_size,
-            end=data.lens, sorted_index=False,
+            data.scores,
+            topk,
+            page_table=identity,
+            page_size=page_size,
+            end=data.lens,
+            sorted_index=False,
         )
     else:
         raw = output.new_empty((count, topk))
@@ -132,11 +140,22 @@ def try_sharded_verify(backend, batch_size, inputs, is_source, is_consumer, publ
     # Gather logical positions because physical KV slots are rank-local.
     merged = shard.gather(raw, rows)
     _remap_verify_positions[(output.shape[0],)](
-        merged, inputs.req_rows, table, output, rows, topk, table.stride(0),
-        output.stride(0), data.ratio, page_size, triton.next_power_of_2(topk),
+        merged,
+        inputs.req_rows,
+        table,
+        output,
+        rows,
+        topk,
+        table.stride(0),
+        output.stride(0),
+        data.ratio,
+        page_size,
+        triton.next_power_of_2(topk),
         num_warps=4,
     )
     if not _logged:
-        logger.info("DSV4.1 Hopper verify indexer sharding active: %d rows per rank", count)
+        logger.info(
+            "DSV4.1 Hopper verify indexer sharding active: %d rows per rank", count
+        )
         _logged = True
     return True
