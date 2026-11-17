@@ -52,7 +52,7 @@ def _fused_dsa_decode_metadata_kernel(
     page_table_stride_1: tl.constexpr,
     real_page_table_stride_0,
     real_page_table_stride_1: tl.constexpr,
-    bs: tl.constexpr,
+    bs,
     max_len,
     dsa_index_topk: tl.constexpr,
     physical_page_size: tl.constexpr,
@@ -267,7 +267,7 @@ def _fused_dsa_target_verify_metadata_kernel(
     real_page_table_stride_1: tl.constexpr,
     paged_mqa_ctx_lens_stride_0: tl.constexpr,
     paged_mqa_ctx_lens_stride_1: tl.constexpr,
-    bs: tl.constexpr,
+    bs,
     max_seqlen_k,
     max_splits,
     dsa_index_topk: tl.constexpr,
@@ -282,7 +282,7 @@ def _fused_dsa_target_verify_metadata_kernel(
     BLOCK_N: tl.constexpr,
 ):
     pid = tl.program_id(0)
-    expanded_size: tl.constexpr = bs * next_n
+    expanded_size = bs * next_n
 
     if pid == 0:
         offs_b = tl.arange(0, BLOCK_BS)
@@ -527,7 +527,7 @@ def _fused_dsa_draft_extend_metadata_kernel(
     page_table_stride_1: tl.constexpr,
     real_page_table_stride_0,
     real_page_table_stride_1: tl.constexpr,
-    bs: tl.constexpr,
+    bs,
     total_len,
     max_seqlen_k,
     dsa_index_topk: tl.constexpr,
