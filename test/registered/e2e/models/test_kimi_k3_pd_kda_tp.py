@@ -24,6 +24,10 @@ COMMON_ARGS = [
     json.dumps({"text_config": {"num_hidden_layers": 8}}),
     "--attn-dp-size",
     "2",
+    "--ep-size",
+    "2",
+    "--moe-a2a-backend",
+    "megamoe",
     "--moe-runner-backend",
     "flashinfer_mxfp4",
     "--decode-attention-backend",
@@ -44,8 +48,6 @@ COMMON_ARGS = [
     "--model-loader-extra-config",
     '{"enable_multithread_load": true, "num_threads": 6}',
 ]
-# --shared-experts-tp-size needs an expert-parallel all-to-all backend.
-DECODE_ARGS = COMMON_ARGS + ["--ep-size", "2", "--moe-a2a-backend", "megamoe"]
 KDA_TP_ARGS = ["--enable-kda-tp", "--shared-experts-tp-size", "2"]
 PROMPT_LENGTHS = (100, 1000, 4000, 16000)
 MAX_NEW_TOKENS = 16
@@ -76,8 +78,6 @@ class TestKimiK3PDKdaTP(PDDisaggregationServerBase):
     prefill_tp_size = 2
     decode_tp_size = 2
     decode_base_gpu_id = 2
-    # K3's auto-enabled all-reduce fusion asserts under attention DP with TP MoE.
-    extra_prefill_env = {"SGLANG_K3_AR_FUSION": "0"}
 
     @classmethod
     def setUpClass(cls):
@@ -87,7 +87,7 @@ class TestKimiK3PDKdaTP(PDDisaggregationServerBase):
     def outputs(self, prefill_args, decode_args, late_stage="0"):
         cls = type(self)
         cls.extra_prefill_args = COMMON_ARGS + prefill_args
-        cls.extra_decode_args = DECODE_ARGS + decode_args
+        cls.extra_decode_args = COMMON_ARGS + decode_args
         cls.extra_decode_env = {"SGLANG_K3_KDA_TP_LATE_STAGE": late_stage}
         cls.launch_all()
         try:
