@@ -15,10 +15,10 @@ from sglang.multimodal_gen.configs.models.encoders.qwen3 import Qwen3TextConfig
 from sglang.multimodal_gen.configs.models.vaes.flux import FluxVAEConfig
 from sglang.multimodal_gen.configs.pipeline_configs.base import (
     ImagePipelineConfig,
-    ModelTaskType,
     TextConditioningOutput,
     pack_latents_2x2,
 )
+from sglang.multimodal_gen.configs.task_type import ModelTaskType
 from sglang.multimodal_gen.runtime.distributed.cfg_policy import CFGPolicy
 
 OVIS_IMAGE_SYSTEM_PROMPT = (

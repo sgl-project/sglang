@@ -48,6 +48,7 @@ from sglang.multimodal_gen.runtime.layers.linear import (
     RowParallelLinear,
     UnquantizedLinearMethod,
 )
+from sglang.multimodal_gen.runtime.layers.rotary_embedding.mrope import FluxPosEmbed
 from sglang.multimodal_gen.runtime.layers.rotary_embedding.utils import (
     _apply_rotary_emb_complex,
 )
@@ -65,7 +66,6 @@ from sglang.multimodal_gen.runtime.models.dits.base import BaseDiT
 from sglang.multimodal_gen.runtime.models.dits.common import get_qkv_projections
 from sglang.multimodal_gen.runtime.models.dits.flux import (
     FluxAttention,
-    FluxPosEmbed,
     _rope_complex_freqs,
 )
 from sglang.multimodal_gen.runtime.platforms import AttentionBackendEnum

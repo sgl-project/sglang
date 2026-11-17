@@ -1592,12 +1592,6 @@
                     ]
                   },
                   {
-                    "group": "Ovis",
-                    "pages": [
-                      "cookbook/diffusion/Ovis/Ovis-Image"
-                    ]
-                  },
-                  {
                     "group": "HiDream",
                     "tag": "NEW",
                     "pages": [
@@ -1670,6 +1664,12 @@
                     "pages": [
                       "cookbook/diffusion/MOVA/MOVA",
                       "cookbook/diffusion/OpenMOSS/MOSS-Image"
+                    ]
+                  },
+                  {
+                    "group": "Ovis",
+                    "pages": [
+                      "cookbook/diffusion/Ovis/Ovis-Image"
                     ]
                   },
                   {
