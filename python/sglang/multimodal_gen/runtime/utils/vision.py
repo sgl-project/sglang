@@ -17,7 +17,9 @@ import requests
 import torch
 from packaging import version
 
-from sglang.srt.utils.common import get_image_bytes as srt_get_image_bytes
+from sglang.kernels import get_kernel
+from sglang.srt.environ import envs
+from sglang.srt.multimodal.media_io import get_image_bytes as srt_get_image_bytes
 
 if version.parse(version.parse(PIL.__version__).base_version) >= version.parse("9.1.0"):
     PIL_INTERPOLATION = {
@@ -89,6 +91,49 @@ def normalize(images: np.ndarray | torch.Tensor) -> np.ndarray | torch.Tensor:
             The normalized image array.
     """
     return 2.0 * images - 1.0
+
+
+def preprocess_image(
+    image: PIL.Image.Image,
+    *,
+    device: torch.device,
+    size: tuple[int, int] | None = None,
+    crop: tuple[int, int, int, int] | None = None,
+) -> torch.Tensor:
+    """Pillow Lanczos resize, crop, and [-1, 1] normalization to [1, C, H, W].
+
+    Size is (width, height); crop is (top, left, height, width).
+    Non-RGB inputs and small images retain the CPU recipe.
+    """
+    width, height = size or image.size
+    if (
+        device.type != "cuda"
+        or torch.version.hip is not None
+        or envs.SGLANG_FORCE_CPU_IMAGE_PREPROCESSING.get()
+        or image.mode != "RGB"
+        or max(image.width * image.height, width * height) < 256 * 256
+    ):
+        if size is not None:
+            image = image.resize(size, PIL.Image.Resampling.LANCZOS)
+        if crop is not None:
+            top, left, height, width = crop
+            image = image.crop((left, top, left + width, top + height))
+        return normalize(numpy_to_pt(pil_to_numpy(image))).to(device)
+
+    # upload compact pixels; the lookup table preserves the CPU FP32 rounding
+    pixels = torch.from_numpy(np.array(image)).to(device, non_blocking=True)
+    resize_rgb = get_kernel("mm.lanczos_resize")
+    if crop == (0, 0, height, width):
+        crop = None
+    pixels = resize_rgb(
+        pixels,
+        height,
+        width,
+        crop=crop,
+        mean=(0.5, 0.5, 0.5),
+        std=(0.5, 0.5, 0.5),
+    )
+    return pixels.unsqueeze(0).permute(0, 3, 1, 2)
 
 
 # adapted from diffusers.utils import load_image
@@ -274,32 +319,11 @@ def resize(
     image: PIL.Image.Image | np.ndarray | torch.Tensor,
     height: int,
     width: int,
-    resize_mode: str = "default",  # "default", "fill", "crop"
+    resize_mode: str = "default",  # only "default" is supported
     resample: str = "lanczos",
 ) -> PIL.Image.Image | np.ndarray | torch.Tensor:
-    """
-    Resize image.
-
-    Args:
-        image (`PIL.Image.Image`, `np.ndarray` or `torch.Tensor`):
-            The image input, can be a PIL image, numpy array or pytorch tensor.
-        height (`int`):
-            The height to resize to.
-        width (`int`):
-            The width to resize to.
-        resize_mode (`str`, *optional*, defaults to `default`):
-            The resize mode to use, can be one of `default` or `fill`. If `default`, will resize the image to fit
-            within the specified width and height, and it may not maintaining the original aspect ratio. If `fill`,
-            will resize the image to fit within the specified width and height, maintaining the aspect ratio, and
-            then center the image within the dimensions, filling empty with data from image. If `crop`, will resize
-            the image to fit within the specified width and height, maintaining the aspect ratio, and then center
-            the image within the dimensions, cropping the excess. Note that resize_mode `fill` and `crop` are only
-            supported for PIL image input.
-
-    Returns:
-        `PIL.Image.Image`, `np.ndarray` or `torch.Tensor`:
-            The resized image.
-    """
+    """Resize a PIL image to (width, height) with the given resample filter,
+    ignoring the aspect ratio. Only ``resize_mode="default"`` is supported."""
     if resize_mode != "default" and not isinstance(image, PIL.Image.Image):
         raise ValueError(
             f"Only PIL image input is supported for resize_mode {resize_mode}"

@@ -1,4 +1,5 @@
-"""The node-split contract every tree component must satisfy."""
+"""The node-split contract every tree component must satisfy, and the records a
+node keeps for its tree's components."""
 
 import dataclasses
 import unittest
@@ -9,14 +10,26 @@ from unittest import mock
 import torch
 
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.base import (
+    ABSENT_COMPONENT_DATA,
     ComponentData,
-    ComponentType,
 )
-from sglang.srt.mem_cache.unified_radix_cache import COMPONENT_REGISTRY, UnifiedTreeNode
+from sglang.srt.mem_cache.unified_cache.unified_tree_core import (
+    UnifiedLRUList,
+    UnifiedTreeNode,
+)
+from sglang.srt.mem_cache.unified_radix_cache import COMPONENT_REGISTRY
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.tree_slots import FAMILY_OF
 
-register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+
+
+# The component ids whose family has a default component class.
+_REGISTERED_COMPONENTS = tuple(
+    ct for ct, family in FAMILY_OF.items() if family in COMPONENT_REGISTRY
+)
 
 
 class TestComponentSplitFieldCoverage(unittest.TestCase):
@@ -79,7 +92,7 @@ class TestComponentSplitFieldCoverage(unittest.TestCase):
     def test_policy_covers_every_component_and_field(self):
         self.assertEqual(
             set(self.SPLIT_POLICY),
-            set(COMPONENT_REGISTRY),
+            set(_REGISTERED_COMPONENTS),
             "a component in COMPONENT_REGISTRY has no split policy: decide what "
             "its split does with each ComponentData field and record it here",
         )
@@ -110,11 +123,11 @@ class TestComponentSplitFieldCoverage(unittest.TestCase):
 
     def _split(self, component_type):
         """Run the real hook over a fresh parent/child pair."""
-        component = object.__new__(COMPONENT_REGISTRY[component_type])
+        component = object.__new__(COMPONENT_REGISTRY[FAMILY_OF[component_type]])
         # The hooks only reach the tree core for the host LRU, and the marked
         # child keeps both halves out of it (device value present, host lock held).
         component.tree_core = mock.Mock(
-            host_lru_lists={ct: mock.Mock() for ct in COMPONENT_REGISTRY}
+            host_lru_lists={ct: mock.Mock() for ct in _REGISTERED_COMPONENTS}
         )
         component.cache = SimpleNamespace(tree_core=component.tree_core)
         child = self._marked_child(component_type)
@@ -187,6 +200,59 @@ class TestComponentSplitFieldCoverage(unittest.TestCase):
                     )
                 for key in set(before.metadata) - migrated:
                     self.assertEqual(child_cd.metadata.get(key), before.metadata[key])
+
+
+class TestNodeRecordsOfTreeComponents(unittest.TestCase):
+    """A node keeps a record and two LRU pointers only per component its tree
+    holds: window slots named by their sub-pools take ids after the fixed
+    ones, and those holes must not cost a record on every node."""
+
+    def test_only_the_trees_components_own_a_record(self):
+        target = ComponentType.of("window_128")
+        draft = ComponentType.of("window_4096")
+        components = (ComponentType.FULL, target, draft)
+        node = UnifiedTreeNode(components)
+        owned = [cd for cd in node.component_data if cd is not ABSENT_COMPONENT_DATA]
+        self.assertEqual(len(owned), len(components))
+        self.assertEqual(len({id(cd) for cd in owned}), len(components))
+        for ct in components:
+            self.assertIsNot(node.component_data[ct], ABSENT_COMPONENT_DATA)
+        for ct in (ComponentType.SWA, ComponentType.MAMBA, ComponentType.C128):
+            self.assertIs(node.component_data[ct], ABSENT_COMPONENT_DATA)
+        self.assertEqual(len(node.lru_prev), 2 * len(components))
+        self.assertEqual(len(node.lru_next), 2 * len(components))
+
+    def test_absent_record_reads_empty_and_refuses_writes(self):
+        node = UnifiedTreeNode((ComponentType.FULL, ComponentType.of("window_128")))
+        absent = node.component_data[ComponentType.MAMBA]
+        for name, value in vars(ComponentData()).items():
+            self.assertEqual(getattr(absent, name), value)
+        self.assertFalse(any(cd.lock_ref > 0 for cd in node.component_data))
+        with self.assertRaises(AttributeError):
+            absent.lock_ref += 1
+        with self.assertRaises(TypeError):
+            absent.metadata["uuid"] = 1
+
+    def test_device_and_host_lists_never_share_a_pointer(self):
+        components = (
+            ComponentType.FULL,
+            ComponentType.of("window_128"),
+            ComponentType.of("window_4096"),
+        )
+        lists = [
+            UnifiedLRUList(ct, components, use_host_ptr=host)
+            for ct in components
+            for host in (False, True)
+        ]
+        node = UnifiedTreeNode(components)
+        for lru in lists:
+            lru.insert_mru(node)
+        self.assertEqual(
+            sorted(lru._pt for lru in lists), list(range(2 * len(components)))
+        )
+        for lru in lists:
+            self.assertIs(node.lru_prev[lru._pt], lru.head)
+            self.assertIs(node.lru_next[lru._pt], lru.tail)
 
 
 if __name__ == "__main__":

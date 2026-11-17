@@ -58,6 +58,8 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let routing = cli.routing.chat_routing;
     init_tracing(&cli.server.log_level, cli.server.log_format)?;
+    #[cfg(feature = "fips")]
+    install_fips_crypto_provider()?;
     let config = cli
         .into_config()
         .context("resolve configuration from CLI flags")?;
@@ -199,6 +201,26 @@ fn init_tracing(default_level: &str, format: LogFormat) -> Result<()> {
     Ok(())
 }
 
+/// Make aws-lc-rs's FIPS module the process-wide rustls provider before any TLS
+/// client is built (reqwest and kube take the installed default), and refuse to
+/// start unless the module runs in FIPS mode.
+#[cfg(feature = "fips")]
+fn install_fips_crypto_provider() -> Result<()> {
+    rustls::crypto::default_fips_provider()
+        .install_default()
+        .map_err(|_| {
+            anyhow::anyhow!("a rustls crypto provider was installed before the FIPS one")
+        })?;
+    aws_lc_rs::try_fips_mode()
+        .map_err(|e| anyhow::anyhow!("aws-lc-rs is not in FIPS mode: {e}"))?;
+    ensure!(
+        rustls::crypto::CryptoProvider::get_default().is_some_and(|provider| provider.fips()),
+        "the installed rustls crypto provider is not FIPS-approved"
+    );
+    tracing::info!("FIPS mode: aws-lc-rs FIPS module is the rustls crypto provider");
+    Ok(())
+}
+
 fn install_signal_handlers() -> Result<(Signal, Signal)> {
     let sigterm = signal(SignalKind::terminate()).context("install SIGTERM handler")?;
     let sigint = signal(SignalKind::interrupt()).context("install SIGINT handler")?;
@@ -206,6 +228,9 @@ fn install_signal_handlers() -> Result<(Signal, Signal)> {
 }
 
 fn log_startup(config: &Config) {
+    // Resolve (and log, or warn about) SGLANG_ROUTER_MAX_BODY_BYTES with the
+    // rest of the startup configuration, not when the router is first built.
+    sgl_router::server::routes::chat::max_chat_body_bytes();
     if let Some(advisory) = sgl_router::config::shutdown_drain_advisory(
         config.server.shutdown_drain_secs,
         config.server.termination_grace_secs,
@@ -383,10 +408,26 @@ fn build_app_context(
             .cache_aware
             .as_ref()
             .is_some_and(|cache| cache.prefix_provider == CachePrefixProvider::RadixTree))
-    .then(|| RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle)));
+    .then(|| {
+        let provider =
+            RadixTreePrefixProvider::new(engine_state.tree(), Arc::clone(&block_size_oracle));
+        match config
+            .model
+            .cache_aware
+            .as_ref()
+            .and_then(|cache| cache.pending_prefix_consult_below)
+        {
+            Some(below) => provider.with_pending_consult_below(below),
+            None => provider,
+        }
+    });
     if let Some(cache) = config.model.cache_aware.as_ref() {
         let ttl = Duration::from_millis(cache.pending_prefix_ttl_ms);
         engine_state.tree().pending().enable(ttl);
+        engine_state
+            .tree()
+            .pending()
+            .set_max_followers(cache.pending_prefix_max_followers);
     }
     app_context.block_size_oracle = block_size_oracle;
     app_context.engine_reported_load = engine_state.engine_reported_load();

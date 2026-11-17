@@ -520,7 +520,7 @@ impl Node {
 }
 
 /// Where one `insert` hangs its chain. The two halves are separate because a
-/// root-attach still records the hash: [`TreeState::resolve_parent`]'s case 4
+/// root-attach still records the hash: [`TreeState::resolve_parent`]'s case 3
 /// keeps `parent_block_hash` on the chain's first node so a later
 /// `BlockStored` for that parent can relink it through the reverse index, and
 /// [`HashTree::route_insert`] has to force a root-attach in a shard that may
@@ -729,19 +729,19 @@ impl TreeState {
     ///
     /// Resolution order:
     /// 1. `parent_hash == None` → root.
-    /// 2. There's exactly one node carrying `parent_hash` → use it.
-    /// 3. Multiple candidates: prefer one already containing `worker`.
-    /// 4. None contain the worker: log at debug, fall back to root. The
+    /// 2. A carrier already containing `worker` → use it.
+    /// 3. No carrier contains the worker (none at all, or only other
+    ///    workers'): fall back to root. The
     ///    new chain still carries `parent_hash` on its first node so that
     ///    if the parent's `BlockStored` arrives later we can reconstruct
     ///    the link via the reverse index.
     ///
-    /// Takes only [`ParentLink::attach`]; case 4's breadcrumb is applied by
+    /// Takes only [`ParentLink::attach`]; case 3's breadcrumb is applied by
     /// the caller, which is why a forced root-attach can still record the
     /// hash. [`HashTree::route_insert`] has already made this decision
-    /// globally: case 1 and the ambiguous-with-no-owner fallback arrive as
-    /// `None`, a `parent_hash` no shard carries arrives unchanged and lands
-    /// on case 4 here, and cases 2 / 3 arrive pointing into this shard. The
+    /// globally: case 1 and the no-owner fallback arrive as `None`, a
+    /// `parent_hash` no shard carries arrives unchanged and lands on case 3
+    /// here, and case 2 arrives pointing into this shard. The
     /// remaining root fallback is defence against a routing/local
     /// disagreement.
     fn resolve_parent(&self, worker: &KvWorkerId, parent_hash: Option<i64>) -> NodeId {
@@ -757,10 +757,9 @@ impl TreeState {
             );
             return ROOT_ID;
         };
-        if candidates.len() == 1 {
-            return *candidates.iter().next().unwrap();
-        }
-        // Multiple candidates — prefer one this worker already holds.
+        // Only a carrier this worker holds: hanging the chain under another
+        // worker's node would hide it from `prefix_depths`, which counts a
+        // worker from level 1.
         for &cand in candidates {
             if self
                 .nodes
@@ -775,7 +774,7 @@ impl TreeState {
             dp_rank = worker.dp_rank,
             parent_hash,
             n_candidates = candidates.len(),
-            "ambiguous parent_hash with no worker-owned candidate; attaching to root",
+            "parent_hash carried only by other workers; attaching new chain to root",
         );
         ROOT_ID
     }
@@ -961,6 +960,13 @@ impl TreeState {
                 return;
             }
         }
+    }
+
+    /// Whether `hash` starts a chain in this shard: a direct child of the root.
+    fn is_chain_root(&self, hash: i64) -> bool {
+        self.nodes
+            .get(&ROOT_ID)
+            .is_some_and(|root| root.children.contains_key(&hash))
     }
 
     /// Read-only match path. Takes `&self` (not `&mut self`) so the public
@@ -1222,11 +1228,13 @@ impl HashTree {
     /// 1. `None` → root shard, nothing to attach to or record.
     /// 2. No shard carries it → root shard, attach `Some(p)`. No shard can
     ///    re-derive a parent from a hash none of them holds, so this lands on
-    ///    `resolve_parent`'s case 4 and root-attaches there.
-    /// 3. Exactly one node carries it → that shard, attach `Some(p)`.
-    /// 4. Several do → a `worker`-owned carrier's shard attaching `Some(p)`
-    ///    ("owned" = held on ANY tier); none owned → root shard, attach
-    ///    `None`.
+    ///    `resolve_parent`'s case 3 and root-attaches there.
+    /// 3. A `worker`-owned carrier ("owned" = held on ANY tier) → that
+    ///    carrier's shard, attach `Some(p)`.
+    /// 4. Only other workers' carriers → root shard, attach `None`: the
+    ///    chain becomes an orphan the match re-anchor finds, since hung under
+    ///    a node its worker does not hold it would be invisible to
+    ///    `prefix_depths`.
     ///
     /// Case 4's `attach: None` is load-bearing: a shard that happens to hold
     /// one local copy of `parent_hash` would otherwise re-derive a parent
@@ -1255,7 +1263,6 @@ impl HashTree {
         };
         // How many nodes carry `p`, and which shard holds one `worker` owns.
         let mut total_carriers = 0usize;
-        let mut single_carrier_shard: Option<usize> = None;
         let mut worker_owned_shard: Option<usize> = None;
         for (idx, shard) in self.shards.iter().enumerate() {
             let st = shard.read();
@@ -1271,7 +1278,6 @@ impl HashTree {
                 continue;
             }
             total_carriers += ids.len();
-            single_carrier_shard = Some(idx);
             if worker_owned_shard.is_none()
                 && ids.iter().any(|id| {
                     st.nodes
@@ -1283,40 +1289,31 @@ impl HashTree {
             }
         }
         let breadcrumb = Some(p);
-        match total_carriers {
+        match (total_carriers, worker_owned_shard) {
             // Nothing carries `p`, so no shard can resolve it to a node; it
-            // root-attaches inside the shard, on `resolve_parent`'s case 4.
-            0 => (
+            // root-attaches inside the shard, on `resolve_parent`'s case 3.
+            (0, _) => (
                 root_shard,
                 ParentLink {
                     attach: breadcrumb,
                     breadcrumb,
                 },
             ),
-            1 => (
-                single_carrier_shard.unwrap_or(root_shard),
+            (_, Some(idx)) => (
+                idx,
                 ParentLink {
                     attach: breadcrumb,
                     breadcrumb,
                 },
             ),
-            _ => match worker_owned_shard {
-                Some(idx) => (
-                    idx,
-                    ParentLink {
-                        attach: breadcrumb,
-                        breadcrumb,
-                    },
-                ),
-                // Forced root-attach, breadcrumb kept.
-                None => (
-                    root_shard,
-                    ParentLink {
-                        attach: None,
-                        breadcrumb,
-                    },
-                ),
-            },
+            // Forced root-attach, breadcrumb kept.
+            (_, None) => (
+                root_shard,
+                ParentLink {
+                    attach: None,
+                    breadcrumb,
+                },
+            ),
         }
     }
 
@@ -1560,19 +1557,54 @@ impl HashTree {
     /// `parent_hash = None`. (`insert` resolves the same ambiguity by
     /// preferring a worker-owned candidate; `match_prefix` has no worker
     /// context, so the asymmetry is intentional.)
+    ///
+    /// # Orphaned chains
+    /// When nothing matches from the root, the leading blocks may simply never
+    /// have been announced to this router: an engine publishes a block once,
+    /// when it stores it, so a router that subscribes after the engine cached a
+    /// shared prefix (the chat template's preamble, a coding agent's long system
+    /// prompt) never sees it, and every later chain arrives under an
+    /// unknown parent and is rooted at its own first hash (`resolve_parent`).
+    /// The root-anchored walk then misses at block 0 for every request. So
+    /// unless the root match covers the whole query, this re-anchors on each
+    /// later query block that starts a chain, however deep, counts the skipped
+    /// blocks as matched, and keeps the deepest match: neither a short root
+    /// match (another engine re-announced the preamble after a restart) nor one
+    /// worker's short orphan chain early in the query may hide a longer chain.
+    /// That is exact: block hashes chain over the whole prefix, so a stored
+    /// block equal to query block `s` means blocks `0..=s` are identical, and
+    /// an engine holding a block holds its ancestors.
     pub fn match_prefix(&self, parent_hash: Option<i64>, block_hashes: &[i64]) -> MatchResult {
         if block_hashes.is_empty() {
             return MatchResult::default();
         }
-        self.descend_match_shard(parent_hash, block_hashes, |shard, parent| {
+        let matched = self.descend_match_shard(parent_hash, block_hashes, |shard, parent| {
             shard.match_prefix(parent, block_hashes)
-        })
+        });
+        if parent_hash.is_some() || matched.matched_blocks == block_hashes.len() {
+            return matched;
+        }
+        let mut best = matched;
+        for (skip, shard) in self.chain_roots(block_hashes) {
+            let mut candidate = self.shards[shard]
+                .read()
+                .match_prefix(None, &block_hashes[skip..]);
+            candidate.matched_blocks += skip;
+            if candidate.matched_blocks > best.matched_blocks {
+                best = candidate;
+                if best.matched_blocks == block_hashes.len() {
+                    break;
+                }
+            }
+        }
+        best
     }
 
     /// How many leading blocks of `block_hashes` each worker holds
     /// contiguously, in one descent under one shard's read lock.
     /// [`Self::match_prefix`] names only the deepest matched node's holders,
-    /// so it cannot answer this. Absent = none.
+    /// so it cannot answer this. Absent = none. Re-anchors past an unseen
+    /// prefix exactly as [`Self::match_prefix`] does, so the two depths agree.
     pub fn prefix_depths(
         &self,
         parent_hash: Option<i64>,
@@ -1581,8 +1613,41 @@ impl HashTree {
         if block_hashes.is_empty() {
             return HashMap::new();
         }
-        self.descend_match_shard(parent_hash, block_hashes, |shard, parent| {
+        let mut depths = self.descend_match_shard(parent_hash, block_hashes, |shard, parent| {
             shard.prefix_depths(parent, block_hashes)
+        });
+        if parent_hash.is_some() || depths.values().any(|&d| d == block_hashes.len()) {
+            return depths;
+        }
+        for (skip, shard) in self.chain_roots(block_hashes) {
+            let found = self.shards[shard]
+                .read()
+                .prefix_depths(None, &block_hashes[skip..]);
+            for (worker, depth) in found {
+                let depth = depth + skip;
+                depths
+                    .entry(worker)
+                    .and_modify(|deepest| *deepest = (*deepest).max(depth))
+                    .or_insert(depth);
+            }
+        }
+        depths
+    }
+
+    /// Each query block after the first that starts a chain, with the shard
+    /// holding that chain. A chain is rooted in the shard of its first hash,
+    /// so each block costs one shard read lock and one map probe; skipped only
+    /// when the root-anchored match already covers the whole query.
+    fn chain_roots<'a>(
+        &'a self,
+        block_hashes: &'a [i64],
+    ) -> impl Iterator<Item = (usize, usize)> + 'a {
+        (1..block_hashes.len()).filter_map(move |skip| {
+            let shard = shard_of(block_hashes[skip]);
+            self.shards[shard]
+                .read()
+                .is_chain_root(block_hashes[skip])
+                .then_some((skip, shard))
         })
     }
 
@@ -1835,6 +1900,126 @@ mod test_support {
 mod tests {
     use super::test_support::{worker, workers};
     use super::*;
+
+    /// A router that subscribes after the engine cached the shared preamble
+    /// (block 10 here) never sees that block: every later store names it as the
+    /// parent, `resolve_parent` cannot find it, and the chain is rooted at its
+    /// own first hash, so without re-anchoring every request matched 0.
+    #[test]
+    fn match_reanchors_past_never_announced_preamble() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 0);
+        // Engine `a` stored [10, 11, 12, 13] before the router subscribed; the
+        // router only sees later continuations under the unknown parent 10.
+        tree.insert(&a, Some(10), &[11, 12, 13]);
+        tree.insert(&b, Some(10), &[21, 22]);
+
+        let m = tree.match_prefix(None, &[10, 11, 12, 13, 14]);
+        assert_eq!(m.matched_blocks, 4, "the unseen preamble block counts");
+        assert_eq!(m.workers(), workers(&[&a]));
+        let m = tree.match_prefix(None, &[10, 21, 22, 23]);
+        assert_eq!(m.matched_blocks, 3);
+        assert_eq!(m.workers(), workers(&[&b]));
+
+        // Per-worker depths re-anchor the same way.
+        let depths = tree.prefix_depths(None, &[10, 11, 12, 13, 14]);
+        assert_eq!(depths.get(&a), Some(&4));
+        assert_eq!(depths.get(&b), None);
+
+        // A request sharing only the preamble has nothing to re-anchor on.
+        assert_eq!(tree.match_prefix(None, &[10, 99, 98]).matched_blocks, 0);
+        assert!(tree.prefix_depths(None, &[10, 99, 98]).is_empty());
+    }
+
+    /// Re-anchoring never overrides a root-anchored match, and reaches past a
+    /// long unseen shared prefix: an 80-block system prompt the engine cached
+    /// before the router subscribed (a coding agent's, on MiniMax-M3.1).
+    /// A short orphan chain early in the query does not hide a longer one that
+    /// starts later: `a` holds only block 11, `b` (subscribed later) holds 13..17.
+    #[test]
+    fn reanchor_keeps_the_deepest_orphan_chain() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 0);
+        tree.insert(&a, Some(10), &[11]);
+        tree.insert(&b, Some(12), &[13, 14, 15, 16, 17]);
+
+        let query = [10, 11, 12, 13, 14, 15, 16, 17, 18];
+        let m = tree.match_prefix(None, &query);
+        assert_eq!(m.matched_blocks, 8);
+        assert_eq!(m.workers(), workers(&[&b]));
+        let depths = tree.prefix_depths(None, &query);
+        assert_eq!(depths.get(&a), Some(&2));
+        assert_eq!(depths.get(&b), Some(&8));
+    }
+
+    #[test]
+    fn reanchor_is_only_a_fallback_and_reaches_deep() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 0);
+        tree.insert(&a, None, &[1, 2]);
+        // An orphan (unknown parent 77) rooted at 2.
+        tree.insert(&b, Some(77), &[2, 3, 4]);
+        assert_eq!(tree.match_prefix(None, &[1, 2]).workers(), workers(&[&a]));
+
+        // Blocks 100..180 are the unseen system prompt; the session's own
+        // blocks 180.. were announced under the unknown parent 179.
+        let system: Vec<i64> = (100..180).collect();
+        tree.insert(&b, Some(179), &[180, 181, 182]);
+        let query: Vec<i64> = system.iter().copied().chain([180, 181, 182, 183]).collect();
+        let m = tree.match_prefix(None, &query);
+        assert_eq!(m.matched_blocks, 83);
+        assert_eq!(m.workers(), workers(&[&b]));
+        assert_eq!(tree.prefix_depths(None, &query).get(&b), Some(&83));
+        // A query sharing only the unseen system prompt still misses.
+        let fresh: Vec<i64> = system.iter().copied().chain([500, 501]).collect();
+        assert_eq!(tree.match_prefix(None, &fresh).matched_blocks, 0);
+    }
+
+    /// Once one worker re-announces the shared preamble from the root (a
+    /// restarted engine), another worker's longer orphan chain past it must
+    /// still win: the root match being non-zero cannot skip the re-anchor.
+    #[test]
+    fn reanchor_runs_past_a_shorter_root_match() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 0);
+        let session: Vec<i64> = (1000..1050).collect();
+        tree.insert(&b, Some(7), &session);
+        tree.insert(&a, None, &[7, 9999]);
+
+        let query: Vec<i64> = std::iter::once(7).chain(session.iter().copied()).collect();
+        let m = tree.match_prefix(None, &query);
+        assert_eq!(m.matched_blocks, 51);
+        assert_eq!(m.workers(), workers(&[&b]));
+        let depths = tree.prefix_depths(None, &query);
+        assert_eq!(depths.get(&a), Some(&1));
+        assert_eq!(depths.get(&b), Some(&51));
+    }
+
+    /// A chain stored under a parent that only another worker is known to
+    /// hold still counts for its own worker at full depth, and keeps counting
+    /// after that other worker drops the parent.
+    #[test]
+    fn depth_counts_a_chain_hung_under_another_workers_block() {
+        let tree = HashTree::new();
+        let a = worker("http://a", 0);
+        let b = worker("http://b", 0);
+        tree.insert(&a, None, &[10]);
+        tree.insert(&b, Some(10), &[11, 12, 13]);
+
+        let query = [10, 11, 12, 13, 14];
+        let depths = tree.prefix_depths(None, &query);
+        assert_eq!(depths.get(&a), Some(&1));
+        assert_eq!(depths.get(&b), Some(&4));
+
+        tree.clear_worker(&a);
+        let depths = tree.prefix_depths(None, &query);
+        assert_eq!(depths.get(&a), None);
+        assert_eq!(depths.get(&b), Some(&4));
+    }
 
     /// One descent answers for every worker at its *own* depth, where
     /// `match_prefix` names only whoever sits at the deepest matched node.
@@ -2523,7 +2708,7 @@ mod tests {
 
     /// A `parent_hash` no shard carries root-attaches, but the chain's first
     /// node keeps the hash so a later `BlockStored` for the parent can be
-    /// linked back through the reverse index (`resolve_parent`, case 4).
+    /// linked back through the reverse index (`resolve_parent`, case 3).
     /// Resolving the parent globally must not drop that breadcrumb on the
     /// way into the shard.
     #[test]
@@ -2606,8 +2791,11 @@ mod tests {
         );
         assert_eq!(m.workers(), workers(&[&c]));
 
-        // And 1->5 must NOT have grown a 1009 child.
-        let m = tree.match_prefix(None, &[1, 5, 1009]);
+        // And 1->5 must NOT have grown a 1009 child. Walk the shard itself:
+        // the tree-level match would re-anchor on the orphan 1009.
+        let m = tree.shards[shard_of(1)]
+            .read()
+            .match_prefix(None, &[1, 5, 1009]);
         assert_eq!(
             m.matched_blocks, 2,
             "1009 must NOT be attached under the shard's node carrying 5",

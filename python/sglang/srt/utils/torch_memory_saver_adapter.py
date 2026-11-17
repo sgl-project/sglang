@@ -2,7 +2,7 @@ import logging
 from abc import ABC
 from contextlib import contextmanager
 
-from sglang.srt.utils.common import is_xpu
+from sglang.srt.utils.device import is_xpu
 
 try:
     import torch_memory_saver

@@ -1227,9 +1227,9 @@ def _selected_slots(page_indices: torch.Tensor) -> list[list[int]]:
 
 
 # ---------------------------------------------------------------------------
-# DeepSeek-V4 C4 decode / DSpark target-verify on the row-group kernel
-# (SGLANG_HIP_DSV4_C4_INDEXER_ROWGROUP): the backend builds a row-group decode
-# workspace for both modes and the indexer scores verify rows as decode rows.
+# DeepSeek-V4 C4 decode / DSpark target-verify on the row-group kernel: the
+# backend builds a row-group decode workspace for both modes and the indexer
+# scores verify rows as decode rows.
 # ---------------------------------------------------------------------------
 
 _C4_RATIO = 4

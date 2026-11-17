@@ -10,6 +10,7 @@ from sglang.multimodal_gen.configs.pipeline_configs.wan import (
     Wan_Animate_2_14B_Config,
     Wan_Animate_2_14B_Distilled_Config,
 )
+from sglang.multimodal_gen.runtime.models import registry as model_registry
 
 
 @pytest.fixture(autouse=True)
@@ -119,3 +120,29 @@ def test_model_id_short_name_selects_the_variant_for_a_neutral_directory():
         "/models/ckpt-7f3a", model_id="Wan2.2-Animate-2-14B-Distilled-Diffusers"
     )
     assert info.pipeline_config_cls is Wan_Animate_2_14B_Distilled_Config
+
+
+@pytest.mark.parametrize("entry", ["Model", '[Model, "Model"]', '(Model, "Model")'])
+def test_model_discovery_preserves_nested_declarations(tmp_path, monkeypatch, entry):
+    """Skipping expression subtrees must retain declarations under statements."""
+    component = tmp_path / "dits"
+    component.mkdir()
+    (component / "example.py").write_text(
+        "import nonexistent_optional_backend\n"
+        "if True:\n"
+        "    class Model:\n"
+        "        _aliases = ['external.Model']\n"
+        "        def forward(self, x):\n"
+        "            return (x + 1) * 2\n"
+        f"    EntryClass = {entry}\n"
+    )
+    aliases = {}
+    monkeypatch.setattr(model_registry, "MODELS_PATH", str(tmp_path))
+    monkeypatch.setattr(model_registry, "COMPONENT_DIRS", ["dits"])
+    monkeypatch.setattr(model_registry, "_IMAGE_ENCODER_MODELS", {})
+    monkeypatch.setattr(model_registry, "_ALIAS_TO_MODEL", aliases)
+
+    # bypass the cache without changing the registry used by other tests
+    discovered = model_registry._discover_and_register_models.__wrapped__()
+    assert discovered == {"Model": ("dits", "example", "Model")}
+    assert aliases == {"external.Model": "Model"}

@@ -77,6 +77,14 @@ livenessProbe:
 See [Health endpoints](/docs/sglang-diffusion/api/cli#health-endpoints) for the
 status-code contract and warmup-mode behavior.
 
+## Checkpoint read failures
+
+Safetensors header validation fails without deleting checkpoint files, symlinks,
+or shared cache blobs. A read error can indicate permissions or storage I/O
+problems, not just an incomplete download. Check the underlying error before
+repairing or re-downloading weights. Do not remove shared cache files while other
+replicas may be using them.
+
 ## Stable Model Identity
 
 Use `--served-model-name` when the public model name must remain stable across replicas, hosts, or checkpoint mount paths:
@@ -115,7 +123,7 @@ See [OpenAI API: Served model name](/docs/sglang-diffusion/api/openai_api#served
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`auto`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default. Keeps legacy safe offload defaults and uses FSDP/CFG only on validated multi-GPU deployments where FSDP can replace DiT offload.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Default. Keeps every component resident when the least-free GPU has at least twice the model's per-GPU weights free (sized from the cached checkpoint; not with batching or on shared-memory devices). Otherwise keeps legacy safe offload defaults and uses FSDP/CFG only on validated multi-GPU deployments where FSDP can replace DiT offload.</td>
     </tr>
     <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`speed`</td>

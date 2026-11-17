@@ -149,7 +149,7 @@ class KVCacheQuantMethodBase(ABC):
         on a private ``ServerArgs`` helper, and keep pool sizing/allocation on
         the same selection path.
         """
-        from sglang.srt.arg_groups.overrides import (
+        from sglang.srt.arg_groups.model_override_base import (
             attention_backends_of,
             resolved_view,
         )

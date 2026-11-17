@@ -12,7 +12,7 @@ import torch
 
 from sglang.test.ci.ci_register import register_cpu_ci
 
-register_cpu_ci(est_time=10, suite="base-a-test-cpu")
+register_cpu_ci(est_time=9, suite="base-a-test-cpu")
 
 # These tests stub out mori with a fake in-process module, so they need neither
 # a real mori install nor a GPU and run on NVIDIA / CPU CI.
@@ -195,7 +195,7 @@ class TestUMBPHostAllocator(unittest.TestCase):
 
         with mock.patch.object(builtins, "__import__", fake_import):
             with self.assertLogs(level="WARNING") as cm:
-                from sglang.srt.mem_cache.memory_pool_host import (
+                from sglang.srt.mem_cache.pool_host.common import (
                     get_allocator_from_storage,
                 )
 

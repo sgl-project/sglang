@@ -40,9 +40,9 @@ class AsyncDictStore:
         self,
         *,
         after: Optional[str] = None,
-        limit: Optional[int] = None,
+        limit: int = 20,
         order: Optional[str] = "desc",
-    ) -> list[Dict[str, Any]]:
+    ) -> Dict[str, Any]:
         """Return a created-time ordered page, with OpenAI-style cursor semantics."""
         normalized_order = (order or "desc").lower()
         reverse = normalized_order != "asc"
@@ -58,9 +58,15 @@ class AsyncDictStore:
                 index = next(i for i, item in enumerate(items) if item["id"] == after)
                 items = items[index + 1 :]
             except StopIteration:
-                return []
+                items = []
 
-        return items[:limit] if limit is not None else items
+        page = items[:limit]
+        return {
+            "data": page,
+            "first_id": page[0]["id"] if page else None,
+            "last_id": page[-1]["id"] if page else None,
+            "has_more": len(items) > limit,
+        }
 
 
 # Global stores shared by OpenAI entrypoints

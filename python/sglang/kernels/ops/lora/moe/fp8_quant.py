@@ -5,14 +5,13 @@ Whole-row division uses fast math only on SM90; group quantization always does.
 
 from __future__ import annotations
 
-import torch
 import triton
 import triton.language as tl
 from triton.language.extra.cuda import libdevice
 
-_WHOLE_ROW_FAST_DIV = tl.constexpr(
-    torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0)
-)
+from sglang.kernels.arch import current_arch
+
+_WHOLE_ROW_FAST_DIV = tl.constexpr(current_arch().is_sm(9, 0))
 
 
 @triton.jit
