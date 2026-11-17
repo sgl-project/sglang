@@ -1,4 +1,4 @@
-"""Kimi-K3 (first eight layers, real weights) PD with --kda-weight-shard-size on
+"""Kimi-K3 (first eight layers, real weights) PD with --kda-dwdp-size on
 the prefill worker. Sharding only moves weights, so each prompt's first token
 and its logprob must match the replicated-weight prefill exactly.
 """
@@ -69,7 +69,7 @@ def generate(base_url, length, max_new_tokens):
     return response.json()["meta_info"]["output_token_logprobs"]
 
 
-class TestKimiK3PDKdaWeightShard(PDDisaggregationServerBase):
+class TestKimiK3PDKdaDwdp(PDDisaggregationServerBase):
     model = "moonshotai/Kimi-K3"
     prefill_tp_size = 2
     decode_tp_size = 2
@@ -104,7 +104,7 @@ class TestKimiK3PDKdaWeightShard(PDDisaggregationServerBase):
 
     def test_weight_shard_matches_replicated(self):
         replicated = self.first_tokens([])
-        sharded = self.first_tokens(["--kda-weight-shard-size", "2"])
+        sharded = self.first_tokens(["--kda-dwdp-size", "2"])
         for n, ref, out in zip(PROMPT_LENGTHS, replicated, sharded):
             self.assertEqual(ref, out, f"prompt_tokens={n}")
 

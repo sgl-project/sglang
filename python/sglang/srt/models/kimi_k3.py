@@ -3017,9 +3017,9 @@ def _stage_facts(
 
 
 _WEIGHT_SHARD_UPDATE_ERROR = (
-    "Online weight updates are not supported with --kda-weight-shard-size: the sharded "
+    "Online weight updates are not supported with --kda-dwdp-size: the sharded "
     "KDA projections and shared experts live in per-rank shards that are loaded once at "
-    "startup and gathered into reused slots. Restart without --kda-weight-shard-size to "
+    "startup and gathered into reused slots. Restart without --kda-dwdp-size to "
     "allow online updates."
 )
 
@@ -3029,7 +3029,7 @@ def _check_weight_shard_unquantized(what: str, modules) -> None:
         method = getattr(module, "quant_method", None)
         if not isinstance(method, UnquantizedLinearMethod):
             raise ValueError(
-                f"--kda-weight-shard-size shards unquantized weights only: {what} {name} "
+                f"--kda-dwdp-size shards unquantized weights only: {what} {name} "
                 f"uses {type(method).__name__}"
             )
 
@@ -3396,11 +3396,11 @@ class KimiK3LinearModel(nn.Module):
             )
         else:
             self.norm = PPMissingLayer()
-        shard_size = get_parallel().kda_weight_shard_size
+        shard_size = get_parallel().kda_dwdp_size
         if shard_size is not None:
             if self.pp_group.world_size > 1:
                 raise ValueError(
-                    "--kda-weight-shard-size does not support pipeline parallelism"
+                    "--kda-dwdp-size does not support pipeline parallelism"
                 )
             # Shared experts are replicated under EP a2a with shared-expert TP 1.
             shared_tp = get_parallel().shared_experts_tp_size

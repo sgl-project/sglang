@@ -1,4 +1,4 @@
-"""K3 KDA weight sharding for attention-DP prefill (``--kda-weight-shard-size N``).
+"""DWDP for K3 KDA projection and shared-expert weights (``--kda-dwdp-size N``).
 
 Each shard-group rank keeps 1/N of every KDA layer's projections; a layer's full weights
 are gathered into a rotating slot by copy-engine peer pulls before it runs.
@@ -623,7 +623,7 @@ def shard_group_layout(
     dp_size = len(ranks) // attn_tp
     if len(ranks) % attn_tp != 0 or dp_size % group_size != 0:
         raise ValueError(
-            f"--kda-weight-shard-size {group_size} must divide the attention-DP size "
+            f"--kda-dwdp-size {group_size} must divide the attention-DP size "
             f"{dp_size} (TP {len(ranks)}, attention TP {attn_tp})"
         )
     groups_per_slice = dp_size // group_size
@@ -652,10 +652,10 @@ def init_for_model(
     global _ACTIVE, _ACTIVE_SHARED
     if _ACTIVE is not None or _ACTIVE_SHARED is not None:
         raise RuntimeError(
-            "--kda-weight-shard-size: the weight shard stores were already built for a "
+            "--kda-dwdp-size: the weight shard stores were already built for a "
             "Kimi-K3 model in this process; a second K3-architecture model (e.g. a draft) "
             "cannot be weight-sharded too. Use a draft of another architecture, or drop "
-            "--kda-weight-shard-size."
+            "--kda-dwdp-size."
         )
     from sglang.srt.runtime_context import get_parallel
 
