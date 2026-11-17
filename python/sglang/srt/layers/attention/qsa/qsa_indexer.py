@@ -43,8 +43,8 @@ from sglang.srt.layers.layernorm import GemmaRMSNorm
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils.multi_platform import MultiPlatformOp
-from sglang.srt.utils import is_npu
 from sglang.srt.mem_cache.qsa_kv_pool import assert_qsa_indices_in_bounds
+from sglang.srt.utils import is_npu
 
 _is_npu = is_npu()
 
