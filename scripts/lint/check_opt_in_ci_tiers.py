@@ -10,8 +10,10 @@ those workflows retain their existing event and path conditions.
 
 pr-gate.yml passes with `opted-in=false` instead of failing on a draft PR or
 one without `run-ci` or its tier label, so every job that needs it must skip on
-that output, finish jobs included, so a skipped run shows no passing check.
-Only `pr-test-finish`, the required check, runs regardless and fails.
+that output, finish jobs included, so a skipped run shows no passing finish.
+Only `pr-test-finish`, the required check, runs regardless and fails. The
+slash command handler and pr-states.yml find such runs by the gate's
+`Skip tests` step, so that step's name is checked too.
 """
 
 import glob
@@ -25,8 +27,11 @@ TIERS_FILE = "scripts/ci/opt_in_ci_tiers.json"
 PR_GATE = "./.github/workflows/pr-gate.yml"
 # The required check; it fails when the gate skipped the tests.
 REQUIRED_FINISH = "pr-test-finish"
-# Tier names are slash-command arguments; these spellings mean other commands.
-RESERVED_TIER_NAMES = {"base", "cpu", "extra", "failed", "full"}
+# The pr-gate.yml step that runs only when the gate skips the caller's tests.
+GATE_SKIP_STEP = "Skip tests"
+# Tier names are slash-command arguments; the bare `extra` argument is rejected
+# as the retired shared tier.
+RESERVED_TIER_NAMES = {"extra"}
 _TIER_NAME = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
 
@@ -120,6 +125,17 @@ def main() -> int:
                     f"tier `{name}`: {path} gates on `{label}` but is not "
                     "listed, so /run-extra-ci never re-runs it"
                 )
+
+    gate_steps = [
+        step.get("name")
+        for job in workflows[PR_GATE.removeprefix("./")]["jobs"].values()
+        for step in job.get("steps") or []
+    ]
+    if GATE_SKIP_STEP not in gate_steps:
+        errors.append(
+            f"{PR_GATE}: no `{GATE_SKIP_STEP}` step, which the slash command "
+            "handler and pr-states.yml look for"
+        )
 
     for path, workflow in workflows.items():
         for job in jobs_ignoring_opt_in(workflow):

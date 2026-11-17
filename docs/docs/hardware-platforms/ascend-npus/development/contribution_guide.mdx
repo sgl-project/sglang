@@ -142,7 +142,7 @@ Users with permission are listed in the [CI_PERMISSIONS.json](https://github.com
 
 **PR authors** can always use `/rerun-failed-ci` on their own PRs, even if they are not listed in `CI_PERMISSIONS.json`.
 
-For CI to run on a pull request, it must have the "run-ci" label. Authorized users can add the label or rerun failed tests by commenting on the PR with one of these commands:
+For CI to run on a pull request, it must have the "run-ci" label and not be a draft; otherwise its CI workflows skip their tests. Authorized users can add the label or rerun failed tests by commenting on the PR with one of these commands:
 
 - `/tag-run-ci-label [<hardware> ...]`: Adds the "run-ci" label, plus the opt-in label of each named hardware. NPU CI runs on a PR only with both "run-ci" and "run-ci-npu-extra", so use `/tag-run-ci-label npu` to opt a PR in. Only **future** commits trigger CI; the current commit is unaffected. The retired `extra` argument is rejected with migration guidance.
 - `/rerun-failed-ci`: Reruns workflows from the latest commit with conclusion **failed, flaky, skipped, cancelled, or timed out**. Runs whose tests were skipped because the PR was a draft or lacked a label are rerun in full once the PR is ready and has the label.

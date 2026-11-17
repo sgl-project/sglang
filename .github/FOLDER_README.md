@@ -20,7 +20,7 @@ Command syntax and the per-hardware tiers are documented in the
 [contribution guide](https://docs.sglang.io/docs/developer_guide/contribution_guide#how-to-trigger-ci-tests).
 `/run-ci`, `/run-extra-ci` and `/run-full-ci` with hardware arguments add
 labels and rerun runs, so they need both keys. The
-labeling commands and the no-argument `/run-ci` aliases of `/tag-and-rerun-ci`
+labeling commands and the no-argument `/run-ci` alias of `/tag-and-rerun-ci`
 check each key for the step it gates.
 
 Each opt-in workflow passes `require-label: run-ci-<tier>` to `pr-gate.yml` and

@@ -177,7 +177,7 @@ jobs:
             async function skippedAtGate(run) {
               // A skipped run ends failed (Base) or green; notify-pr-states
               // refreshes this block when it does.
-              if (!isReal(run) || run.status !== 'completed') return false;
+              if (!isReal(run) || !['success', 'failure'].includes(run.conclusion)) return false;
               const jobs = await github.paginate(github.rest.actions.listJobsForWorkflowRun, {
                 owner: context.repo.owner,
                 repo: context.repo.repo,

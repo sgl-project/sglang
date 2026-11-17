@@ -233,4 +233,4 @@ An opt-in tier is a set of workflows a PR enters by carrying `run-ci-<tier>` on 
 2. **No `labeled` trigger.** GitHub's rerun API reuses the original event payload, so a run started by an unrelated label event and skipped by an `if` on that payload stays skipped on rerun. Adding a label after a push takes a rerun instead (`/run-extra-ci <hw>`).
 3. **Every directly selectable workflow that accepts the label is listed in the tier**, so `/run-extra-ci <hw>` re-runs all of them. Reusable jobs chained from a listed workflow stay part of that run.
 
-Tier names `base`, `cpu`, `extra`, `failed` and `full` are reserved: a tier name is also a slash-command hardware argument, and these words already name other commands or layers (`/run-ci`, `/run-cpu-ci`, `/run-extra-ci`, `/rerun-failed-ci`, `/run-full-ci`).
+The tier name `extra` is reserved: a tier name is also a slash-command hardware argument, and the bare `extra` argument is rejected as the retired shared tier.

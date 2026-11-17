@@ -132,17 +132,15 @@ jobs:
         timeout-minutes: 180
         run: |
           touch github_summary_ci.md
-          suites=extra-test-1-gpu-xpu
-          for suite in $suites; do
-            docker exec ci_sglang_xpu bash -c "
-              source /opt/venv/bin/activate &&
-              cd /sglang-checkout/test &&
-              GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary_ci.md \
-              SGLANG_IS_IN_CI=true \
-              ${{ inputs.ref && 'SGLANG_TEST_METRICS_FILE=/sglang-checkout/$suite-metrics.jsonl' || '' }} \
-              python3 run_suite.py --hw xpu --suite $suite --timeout-per-file 600 --retry-timeout-increase 0 --enable-retry ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
-            " || TEST_EXIT_CODE=$?
-          done
+          suite=extra-test-1-gpu-xpu
+          docker exec ci_sglang_xpu bash -c "
+            source /opt/venv/bin/activate &&
+            cd /sglang-checkout/test &&
+            GITHUB_STEP_SUMMARY=/sglang-checkout/github_summary_ci.md \
+            SGLANG_IS_IN_CI=true \
+            ${{ inputs.ref && 'SGLANG_TEST_METRICS_FILE=/sglang-checkout/$suite-metrics.jsonl' || '' }} \
+            python3 run_suite.py --hw xpu --suite $suite --timeout-per-file 600 --retry-timeout-increase 0 --enable-retry ${{ (github.event_name == 'schedule' || inputs.continue_on_error) && '--continue-on-error' || '' }}
+          " || TEST_EXIT_CODE=$?
           echo "$(<github_summary_ci.md)" >> $GITHUB_STEP_SUMMARY || true
           exit ${TEST_EXIT_CODE:-0}
 

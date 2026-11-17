@@ -533,6 +533,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
     tiers = _load_opt_in_tiers().values()
 
     rerun_count = 0
+    left_skipped = False
     for run in runs:
         if run.status != "completed":
             # A newer attempt is still in flight - nothing to recover.
@@ -555,6 +556,7 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
                     rerun_count += 1
                 else:
                     print(f"Leaving {run.name}: its gate still skips the tests")
+                    left_skipped = left_skipped or not can_run
                 continue
             if run.conclusion not in ("failure", "skipped", "cancelled", "timed_out"):
                 # action_required (fork PR awaiting approval) is deliberately
@@ -583,9 +585,25 @@ def handle_rerun_failed_ci(gh_repo, pr, comment, user_perms, react_on_success=Tr
         if react_on_success:
             comment.create_reaction("+1")
         return True
-    else:
-        print("No workflow found to rerun.")
-        return False
+    if left_skipped:
+        # Left alone, a run whose tests the gate skipped would read as the bot
+        # being down; say what the PR still lacks.
+        missing = [
+            step
+            for lacking, step in (
+                (pr.draft, "mark the PR ready for review"),
+                ("run-ci" not in labels, "add the `run-ci` label"),
+            )
+            if lacking
+        ]
+        pr.create_issue_comment(
+            "⛔ CI skipped its tests, so nothing was re-run. To run them, "
+            f"{' and '.join(missing)}, then comment `/rerun-failed-ci`."
+        )
+        if react_on_success:
+            comment.create_reaction("confused")
+    print("No workflow found to rerun.")
+    return False
 
 
 def _workflow_file(run):

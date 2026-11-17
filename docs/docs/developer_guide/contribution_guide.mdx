@@ -168,8 +168,8 @@ The rerun commands have the following permission rules:
 | Command | PR author | Other users | Additional rule for fork PRs |
 | --- | --- | --- | --- |
 | `/rerun-failed-ci` | Always allowed on their own PR | Must have `can_rerun_failed_ci` in `CI_PERMISSIONS.json` | None |
-| `/tag-and-rerun-ci`, no-argument `/run-ci` aliases | May retry their own PR; adding labels still requires `can_tag_run_ci_label` | Labeling and retrying independently require `can_tag_run_ci_label` and `can_rerun_failed_ci`, respectively | None |
-| `/run-ci <hardware...>`, `/run-extra-ci <hardware...>`, `/run-full-ci <hardware...>` and their aliases | Not auto-allowed -- these apply labels, which the PR-author allowance does not cover | Must have both `can_tag_run_ci_label` and `can_rerun_failed_ci` in `CI_PERMISSIONS.json` (every listed user has both) | None |
+| `/tag-and-rerun-ci`, no-argument `/run-ci` | May retry their own PR; adding labels still requires `can_tag_run_ci_label` | Labeling and retrying independently require `can_tag_run_ci_label` and `can_rerun_failed_ci`, respectively | None |
+| `/run-ci <hardware...>`, `/run-extra-ci <hardware...>`, `/run-full-ci <hardware...>` | Not auto-allowed -- these apply labels, which the PR-author allowance does not cover | Must have both `can_tag_run_ci_label` and `can_rerun_failed_ci` in `CI_PERMISSIONS.json` (every listed user has both) | None |
 | `/rerun-test`, `/rerun-group`, `/run-cpu-ci` | No special allowance; judged as any other commenter | Must have `cooldown_interval_minutes: 0` in `CI_PERMISSIONS.json`, or `write`/`admin` repository permission | None -- the same rule applies wherever the PR comes from |
 
 <Warning>

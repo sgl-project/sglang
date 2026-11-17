@@ -66,6 +66,8 @@ jobs:
       matrix:
         # One job per plan part; an unpartitioned lane runs as a single part 0.
         part: ${{ fromJson(inputs.partition_plan || '{"partitions":[{"part":0}]}').partitions.*.part }}
+    env:
+      SUITE: ${{ inputs.stage }}-test-${{ inputs.runner_config }}
     steps:
       - name: Record retry deadline
         if: inputs.retry_deadline_seconds > 0
@@ -131,14 +133,14 @@ jobs:
         run: |
           python3 test/run_suite.py \
             --hw cuda \
-            --suite ${{ inputs.stage }}-test-${{ inputs.runner_config }} \
+            --suite "$SUITE" \
             --timeout-per-file $(( ${{ inputs.run_timeout_minutes }} * 60 ))
 
       - name: Upload execution report
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: diffusion-report-${{ inputs.stage }}-test-${{ inputs.runner_config }}-${{ matrix.part }}-${{ github.run_attempt }}
+          name: diffusion-report-${{ env.SUITE }}-${{ matrix.part }}-${{ github.run_attempt }}
           path: |
             python/sglang/multimodal_gen/test/execution_report_*.json
             python/diffusion-results.json
@@ -149,7 +151,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: diffusion-failures-${{ inputs.stage }}-test-${{ inputs.runner_config }}-${{ matrix.part }}-${{ github.run_attempt }}
+          name: diffusion-failures-${{ env.SUITE }}-${{ matrix.part }}-${{ github.run_attempt }}
           path: diffusion-failures/
           if-no-files-found: ignore
           retention-days: 7
@@ -157,4 +159,4 @@ jobs:
       - uses: ./.github/actions/upload-cuda-coredumps
         if: failure()
         with:
-          artifact-suffix: ${{ inputs.stage }}-test-${{ inputs.runner_config }}-${{ matrix.part }}
+          artifact-suffix: ${{ env.SUITE }}-${{ matrix.part }}
