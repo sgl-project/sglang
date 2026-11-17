@@ -361,7 +361,20 @@ jobs:
             -print \
             -delete 2>/dev/null || true
 
+      # The self-hosted node keeps its own torchada in ~/.local. Install the
+      # pinned release into a job-local prefix so the build does not depend on
+      # whatever version the node happens to carry.
+      - name: Install torchada
+        run: |
+          python -m pip install --no-deps --target "${RUNNER_TEMP}/torchada" "torchada==0.1.112"
+          echo "PYTHONPATH=${RUNNER_TEMP}/torchada${PYTHONPATH:+:$PYTHONPATH}" >> "$GITHUB_ENV"
+
       - name: Build wheels
+        env:
+          # The build nodes reach github.com very slowly, so the pinned
+          # third-party sources are fetched through a mirror by default.
+          # Override it with the repository variable, or set it to `direct`.
+          SGLANG_MUSA_GIT_PROXY: ${{ vars.SGLANG_MUSA_GIT_PROXY || 'https://gh-proxy.org/' }}
         run: |
           cd python/sglang/kernels/aot
           mv pyproject_musa.toml pyproject.toml
