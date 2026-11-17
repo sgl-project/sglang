@@ -54,6 +54,7 @@ from sglang.srt.utils.common import ceil_align
 MUSE_SP_ARCHITECTURES = frozenset({"MuseSparkForConditionalGeneration"})
 SP_SUPPORTED_ARCHITECTURES = MUSE_SP_ARCHITECTURES | frozenset(
     {
+        "Glm5NextForConditionalGeneration",
         "Qwen3ForCausalLM",
         "Qwen4ExpForCausalLM",
         "Qwen4ExpForConditionalGeneration",
