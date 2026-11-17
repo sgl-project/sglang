@@ -208,7 +208,6 @@ else:
 
 def _eager_max_seqlen_k(forward_batch, draft_token_num: int, static_width: int) -> int:
     if forward_batch.seq_lens.numel() == 0:
-        # Idle attention-DP rank (0-row verify): width only sizes an empty table.
         return 1 + draft_token_num
     if forward_batch.seq_lens_cpu is not None:
         return int(forward_batch.seq_lens_cpu.max().item()) + draft_token_num

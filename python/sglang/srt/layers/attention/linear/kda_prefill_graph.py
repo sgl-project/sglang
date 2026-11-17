@@ -366,7 +366,6 @@ def kda_extend_in_graph(
         )
     )
     if meta.num_tokens < KDA_CHUNK_SIZE:
-        # FlashInfer's short-seq prefill lets NaN in stale pad rows reach real rows.
         pad_rows = meta.token_index >= meta.num_logical_tokens
         for x in (q, k, v):
             x.masked_fill_(pad_rows.view(-1, 1), 0)
@@ -382,7 +381,6 @@ def kda_extend_in_graph(
     if meta.track:
         h_track = torch.empty(
             (meta.max_seqs, *ssm_states.shape[1:]),
-            # FlashInfer requires checkpoints to match the initial-state pool.
             dtype=ssm_states.dtype if meta.flashinfer is not None else torch.float32,
             device=ssm_states.device,
         )
