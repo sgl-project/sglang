@@ -4120,6 +4120,7 @@ dependencies = [
 name = "sglang-processor"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "async-stream",
  "deepseek-recipe",
  "deepseek-recipe-core",

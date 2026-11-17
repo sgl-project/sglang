@@ -11,6 +11,7 @@ default = ["mm", "parser", "render", "tokenizer"]
 mm = ["dep:dynamo-multimodal"]
 parser = ["dep:dynamo-parsers", "dep:dynamo-protocols", "dep:regex", "dep:uuid"]
 render = [
+    "dep:anyhow",
     "dep:dynamo-protocols",
     "dep:dynamo-renderer",
     "dep:minijinja",
@@ -44,6 +45,8 @@ dynamo-multimodal = { version = "=0.2.3", default-features = false, optional = t
 dynamo-parsers = { version = "=11.0.13", optional = true }
 dynamo-protocols = { version = "10.0.2", optional = true }
 dynamo-renderer = { version = "10.4.3", optional = true }
+# The result type of Dynamo's formatter trait.
+anyhow = { version = "1", optional = true }
 hf-hub = { version = "0.4", default-features = false }
 regex = { version = "1", optional = true }
 uuid = { workspace = true, optional = true }
