@@ -5849,6 +5849,8 @@ class TestRustServerUnsupportedArgs(CustomTestCase):
         "enable_ssl_refresh": ["--enable-ssl-refresh"],
         "allowed_media_domains": ["--allowed-media-domains", "example.com"],
         "media_url_max_file_size_mb": ["--media-url-max-file-size-mb", "0"],
+        "media_url_timeout": ["--media-url-timeout", "5"],
+        "allow_local_media_files": ["--no-allow-local-media-files"],
         "enable_trace": ["--enable-trace"],
         "completion_template": ["--completion-template", "deepseek_coder"],
         "hf_chat_template_name": ["--hf-chat-template-name", "tool_use"],

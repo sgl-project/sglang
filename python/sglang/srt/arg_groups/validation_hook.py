@@ -130,6 +130,8 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     "allowed_media_domains",
     # The Rust media fetcher caps a download at this field's default, 64 MiB.
     "media_url_max_file_size_mb",
+    "media_url_timeout",
+    "allow_local_media_files",
     "enable_trace",
     "completion_template",
     "hf_chat_template_name",
@@ -220,7 +222,10 @@ def rust_server_unsupported_args(
         else:
             is_set = value != default
         if is_set:
-            offending.append(_field_to_cli_name(name))
+            cli_name = _field_to_cli_name(name)
+            if name == "allow_local_media_files" and value is False:
+                cli_name = "--no-allow-local-media-files"
+            offending.append(cli_name)
     if cfg.mm_feature_transport in ("cuda_ipc", "cuda_vmm"):
         offending.append(f"--mm-feature-transport {cfg.mm_feature_transport}")
     if cfg.tool_call_parser == "beam" and cfg.grammar_backend in (None, "xgrammar"):
