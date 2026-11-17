@@ -955,9 +955,10 @@ class TestTritonAttention(CustomTestCase):
 
     def test_grouped_decode_attention_split_programs_bitwise(self):
         """Above _MAX_SPLIT_PROGRAMS splits (deterministic mode sizes the split budget
-        by the context length) stage 1 runs a fixed number of blocks that loop over
-        the splits, and stage 2 stops at each request's own count. The output must be
-        bitwise the same as with one block per split."""
+        by the context length) stage 1 can run fewer blocks that loop over the
+        splits. With and without stage 2 stopping at each request's own count
+        (deterministic mode's stop_at_request_splits), the output must be bitwise
+        the same as with one block per split."""
         from sglang.kernels.ops.attention import decode_attention as da
 
         device = get_device()
@@ -977,7 +978,7 @@ class TestTritonAttention(CustomTestCase):
         num_kv_splits = ((lens + tile - 1) // tile).to(torch.int32)
         sinks = torch.randn(H_Q, dtype=torch.float32, device=device)
 
-        def run(max_split_programs):
+        def run(max_split_programs, stop_at_request_splits):
             old = da._MAX_SPLIT_PROGRAMS, da._device_core_count
             # One core: the block count is _MAX_SPLIT_PROGRAMS, whatever the device.
             da._MAX_SPLIT_PROGRAMS = max_split_programs
@@ -1004,17 +1005,20 @@ class TestTritonAttention(CustomTestCase):
                     D**-0.5,
                     1.0,
                     sinks=sinks,
+                    stop_at_request_splits=stop_at_request_splits,
                 )
                 return o
             finally:
                 da._MAX_SPLIT_PROGRAMS, da._device_core_count = old
 
-        one_block_per_split = run(max_kv_splits)
-        for programs in (1, 8, 32):
-            self.assertTrue(
-                torch.equal(run(programs), one_block_per_split),
-                f"{programs} blocks per request and head tile differ",
-            )
+        for stop in (False, True):
+            one_block_per_split = run(max_kv_splits, stop)
+            for programs in (1, 8, 32):
+                self.assertTrue(
+                    torch.equal(run(programs, stop), one_block_per_split),
+                    f"{programs} blocks per request and head tile differ "
+                    f"(stop_at_request_splits={stop})",
+                )
 
     def test_grouped_decode_split_programs_cover_the_device(self):
         """Stage 1 loops over splits only while the blocks still cover the device: a

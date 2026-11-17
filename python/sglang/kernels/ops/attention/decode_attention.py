@@ -1025,8 +1025,9 @@ def _fwd_kernel_stage2(
     else:
         kv_splits = tl.load(num_kv_splits + cur_batch)
         SPLIT_END: tl.constexpr = MAX_KV_SPLITS
-    # With a large split budget, stop at the request's own split count instead of
-    # walking the empty tail; the splits are merged in the same order either way.
+    # DYNAMIC_SPLIT_END (deterministic mode): stop at the request's own split count
+    # instead of walking the empty tail of a large budget. The partials are merged in
+    # the same order, but the dynamic bound can move the result a few ULP (above).
     if DYNAMIC_SPLIT_END:
         split_end = kv_splits
     else:
@@ -1088,6 +1089,7 @@ def _decode_softmax_reducev_fwd(
     sinks=None,
     use_pdl=False,
     forced_kv_splits: int = 0,
+    stop_at_request_splits: bool = False,
 ):
     batch, head_num = q.shape[0], q.shape[1]
     Lv = v_buffer.shape[-1]
@@ -1123,7 +1125,7 @@ def _decode_softmax_reducev_fwd(
         HAS_SINK=HAS_SINK,
         USE_PDL=use_pdl,
         FORCED_KV_SPLITS=forced_kv_splits,
-        DYNAMIC_SPLIT_END=not forced_kv_splits and MAX_KV_SPLITS > _MAX_SPLIT_PROGRAMS,
+        DYNAMIC_SPLIT_END=stop_at_request_splits and not forced_kv_splits,
         num_warps=4,
         num_stages=2,
         **({"launch_pdl": True} if use_pdl else {}),
@@ -1151,6 +1153,7 @@ def decode_attention_fwd_normal(
     score_mod=None,
     aux_tensors=None,
     uneven_batch=None,
+    stop_at_request_splits: bool = False,
 ):
     _decode_att_m_fwd(
         q,
@@ -1181,6 +1184,7 @@ def decode_attention_fwd_normal(
         num_kv_splits,
         max_kv_splits,
         sinks,
+        stop_at_request_splits=stop_at_request_splits,
     )
 
 
@@ -1206,6 +1210,7 @@ def decode_attention_fwd_grouped(
     score_mod=None,
     aux_tensors=None,
     uneven_batch=None,
+    stop_at_request_splits: bool = False,
 ):
     tune_mla, forced_kv_splits = _mla_launch_plan(q, k_buffer, max_kv_splits, has_mla)
     _decode_grouped_att_m_fwd(
@@ -1243,6 +1248,7 @@ def decode_attention_fwd_grouped(
         sinks,
         use_pdl=use_pdl,
         forced_kv_splits=forced_kv_splits,
+        stop_at_request_splits=stop_at_request_splits,
     )
 
 
@@ -1274,7 +1280,12 @@ def decode_attention_fwd(
     lean_Op=None,
     lean_locks=None,
     uneven_batch=None,
+    stop_at_request_splits: bool = False,
 ):
+    """``stop_at_request_splits``: the merge walks each request's own split count
+    instead of the whole budget. It skips the empty tail of a large budget
+    (deterministic mode sizes it by the context length) but can move the result a
+    few ULP (see ``_fwd_kernel_stage2``), so only deterministic mode turns it on."""
     assert max_kv_splits == attn_logits.shape[2]
     assert q.shape[0] <= kv_indptr.shape[0] - 1
     assert q.shape[0] <= attn_logits.shape[0]
@@ -1346,6 +1357,7 @@ def decode_attention_fwd(
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             uneven_batch=uneven_batch,
+            stop_at_request_splits=stop_at_request_splits,
         )
     else:
         # GQA/MQA/MLA
@@ -1371,6 +1383,7 @@ def decode_attention_fwd(
             score_mod=score_mod,
             aux_tensors=aux_tensors,
             uneven_batch=uneven_batch,
+            stop_at_request_splits=stop_at_request_splits,
         )
 
 
