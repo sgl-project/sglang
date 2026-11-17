@@ -487,29 +487,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check all dependent job statuses
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
         run: |
-          # Convert the 'needs' context to a JSON string
-          json_needs='${{ toJson(needs) }}'
-
-          # Get a list of all job names from the JSON keys
-          job_names=$(echo "$json_needs" | jq -r 'keys_unsorted[]')
-
-          for job in $job_names; do
-            # For each job, extract its result
-            result=$(echo "$json_needs" | jq -r --arg j "$job" '.[$j].result')
-
-            # Print the job name and its result
-            echo "$job: $result"
-
-            # Check for failure or cancellation and exit if found
-            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
-              echo "The above jobs failed."
-              exit 1
-            fi
-          done
-          # If the loop completes, all jobs were successful
-          echo "All jobs completed successfully"
-          exit 0
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$NEEDS_JSON"
+          if jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' <<< "$NEEDS_JSON" >/dev/null; then
+            echo "::error::A dependent job failed or was cancelled."
+            exit 1
+          fi
 
   # =============================================== notify pr-states ====================================================
   # Dispatches pr-states.yml after every attempt (initial + every rerun).

@@ -333,17 +333,12 @@ jobs:
     needs: [extra-test-1-gpu-xpu, multimodal-gen-test-1-gpu-xpu, pr-gate]
     runs-on: ubuntu-latest
     steps:
-      - name: Check job status
+      - name: Check all dependent job statuses
+        env:
+          NEEDS_JSON: ${{ toJson(needs) }}
         run: |
-          stage_a="${{ needs.stage-a-test-1-gpu-xpu.result }}"
-          multimodal_gen="${{ needs.multimodal-gen-test-1-gpu-xpu.result }}"
-          if [ "$stage_a" != "success" ] && [ "$stage_a" != "skipped" ]; then
-            echo "stage-a failed with result: $stage_a"
+          jq -r 'to_entries[] | "\(.key): \(.value.result)"' <<< "$NEEDS_JSON"
+          if jq -e 'any(.[]; .result == "failure" or .result == "cancelled")' <<< "$NEEDS_JSON" >/dev/null; then
+            echo "::error::A dependent job failed or was cancelled."
             exit 1
           fi
-          if [ "$multimodal_gen" != "success" ] && [ "$multimodal_gen" != "skipped" ]; then
-            echo "multimodal-gen failed with result: $multimodal_gen"
-            exit 1
-          fi
-          echo "All jobs completed successfully"
-          exit 0

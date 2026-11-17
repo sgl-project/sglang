@@ -103,7 +103,6 @@ jobs:
     if: needs.check-changes.outputs.ppu == 'true'
     uses: ./.github/workflows/pr-gate.yml
     with:
-      require-run-ci: true
       require-label: run-ci-ppu-extra
     secrets: inherit
 
