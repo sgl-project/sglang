@@ -885,6 +885,11 @@ SGLang supports various environment variables that can be used to configure its 
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HUMMING_USE_FP32_STREAM_K_REDUCE</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Opt eligible dense FP16-output A16 Humming linear layers with block-scaled FP8 E4M3 weights into FP32 Stream-K reduction on MMA/WGMMA kernels. Requires a Humming build with dense FP32 reduction support and <code>SGLANG_HUMMING_USE_F16_ACCUM=false</code>. Other layer formats, MoE, and intervals with Stream-K disabled retain their existing selection. The path allocates an FP32 workspace and disables TMA output; measure its cost before enabling it.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>false</code></td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_HUMMING_MOE_GEMM_TYPE</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Select the Humming MoE GEMM path for standard dispatch and DeepEP normal dispatch. <code>indexed</code> uses top-k expert ids directly and is the fallback for unset or unknown values. <code>grouped</code> maps to Humming grouped-contiguous GEMM. DeepEP low-latency dispatch uses grouped-masked GEMM internally and does not use this selector.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}><code>""</code> (<code>indexed</code>)</td>
