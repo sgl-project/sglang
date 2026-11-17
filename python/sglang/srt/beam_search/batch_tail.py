@@ -38,6 +38,7 @@ class BeamTailEntry(NamedTuple):
 class BeamTail(msgspec.Struct):
     num_base_rows: int
     entries: List[BeamTailEntry]  # one per group, in batch order
+    leader_idx_dev: torch.Tensor  # [num_groups] int64, leaders' row indices
 
 
 def append_beam_tail(batch: ScheduleBatch) -> None:
@@ -93,7 +94,11 @@ def append_beam_tail(batch: ScheduleBatch) -> None:
         ]
     )
     batch.seq_lens_sum = None
-    batch.beam_tail = BeamTail(num_base_rows=len(batch.reqs), entries=entries)
+    batch.beam_tail = BeamTail(
+        num_base_rows=len(batch.reqs),
+        entries=entries,
+        leader_idx_dev=leader_idx_dev,
+    )
 
 
 def strip_beam_tail(batch: ScheduleBatch) -> None:
