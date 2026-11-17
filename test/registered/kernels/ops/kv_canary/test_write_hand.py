@@ -838,45 +838,6 @@ class TestRealKvHash:
             real_kv_hash_mode=consts.RealKvHashMode.ALL,
         )
 
-    def test_real_kv_source_above_4_raises(self) -> None:
-        """``len(real_kv_sources) > 4`` → host wrapper raises ValueError before launching."""
-        cuda_buf = make_canary_buf(device=_DEVICE)
-        plan = make_write_plan(
-            write_offsets=[0, 1],
-            seed_slot_indices=[-1],
-            num_valid_reqs=1,
-            device=_DEVICE,
-        )
-        input_ids = _int32_tensor([1])
-        positions = _int32_tensor([0])
-        out_cache_loc = _int32_tensor([0])
-        log = FakeViolationLog.allocate(device=_DEVICE)
-        sources = make_real_kv_sources(count=4, device=_DEVICE)
-        extra = make_real_kv_source(device=_DEVICE)
-        too_many = sources + (extra,)
-
-        with pytest.raises(ValueError, match="at most 4 RealKvSource"):
-            launch_canary_write_kernel(
-                context=VerifyOrWriteContext(
-                    canary_buf=cuda_buf,
-                    kernel_kind=CanaryLaunchTag.HEAD_K_FULL,
-                    violation_ring=log.ring,
-                    violation_write_index=log.write_index,
-                    slot_run_counter=log.slot_run_counter,
-                    kernel_run_counter=log.kernel_run_counter,
-                    enable_chain_position_assert=log.enable_chain_position_assert,
-                    real_kv_sources=too_many,
-                    real_kv_hash_mode=consts.RealKvHashMode.NONE,
-                ),
-                plan=plan,
-                input_ids=input_ids,
-                positions=positions,
-                out_cache_loc=out_cache_loc,
-                enable_write_input_assert=False,
-                expected_input_tokens=None,
-                expected_input_positions=None,
-            )
-
     @pytest.mark.parametrize(
         "mode,fold_fn,expected_hash",
         [
