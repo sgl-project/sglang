@@ -1,6 +1,4 @@
 # SPDX-License-Identifier: Apache-2.0
-import json
-import os
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any, Optional
@@ -145,32 +143,6 @@ class NunchakuConfig(QuantizationConfig):
 
         if self.rank <= 0:
             raise ValueError(f"Rank must be positive, got {self.rank}")
-
-    @classmethod
-    def from_dict(cls, config_dict: dict) -> "NunchakuConfig":
-        """Create configuration from dictionary."""
-        return cls(**config_dict)
-
-    def to_dict(self) -> dict:
-        """Convert configuration to dictionary."""
-        return {
-            "precision": self.precision,
-            "rank": self.rank,
-            "group_size": self.group_size,
-            "act_unsigned": self.act_unsigned,
-            "transformer_weights_path": self.transformer_weights_path,
-        }
-
-    @classmethod
-    def from_pretrained(cls, model_path: str) -> Optional["NunchakuConfig"]:
-        for filename in cls.get_config_filenames():
-            config_path = os.path.join(model_path, filename)
-            if os.path.exists(config_path):
-                with open(config_path, "r") as f:
-                    config_dict = json.load(f)
-                if config_dict.get("quant_method") == cls.get_name():
-                    return cls.from_config(config_dict)
-        return None
 
 
 def _patch_native_svdq_linear(
