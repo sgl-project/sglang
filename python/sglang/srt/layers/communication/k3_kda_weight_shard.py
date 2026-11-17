@@ -1,4 +1,4 @@
-"""K3 KDA weight sharding for attention-DP prefill (``--kda-weight-shard-size N``).
+"""DWDP for K3 KDA projection and shared-expert weights (``--kda-dwdp-size N``).
 
 Each shard-group rank keeps 1/N of every KDA layer's projections; a layer's full weights
 are gathered into a rotating slot by copy-engine peer pulls before it runs.
@@ -7,15 +7,27 @@ are gathered into a rotating slot by copy-engine peer pulls before it runs.
 from __future__ import annotations
 
 import contextlib
-import ctypes
 import functools
 import logging
 import os
+import time
 import weakref
 from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import torch
+
+from sglang.srt.utils.cuda_vmm_utils import (
+    VmmReservation,
+    align_up,
+    check_drv,
+    exchange_shareable_handles,
+    get_device_granularity,
+    import_and_map_alloc,
+    make_device_allocation_prop,
+    release_mappings,
+    tensor_from_pointer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -434,302 +446,116 @@ class LayerWeightShard:
         return shard_b, self.slots.numel() * self.slots.element_size()
 
 
-class _CuMemLocation(ctypes.Structure):
-    _fields_ = [("type", ctypes.c_int), ("id", ctypes.c_int)]
+def _memcpy2d_args(
+    *, dst: int, dst_pitch: int, src: int, src_pitch: int, width: int, height: int
+):
+    from cuda.bindings import driver as drv
+
+    args = drv.CUDA_MEMCPY2D()
+    args.srcMemoryType = drv.CUmemorytype.CU_MEMORYTYPE_DEVICE
+    args.srcDevice = src
+    args.srcPitch = src_pitch
+    args.dstMemoryType = drv.CUmemorytype.CU_MEMORYTYPE_DEVICE
+    args.dstDevice = dst
+    args.dstPitch = dst_pitch
+    args.WidthInBytes = width
+    args.Height = height
+    return args
 
 
-class _CuMemAllocFlags(ctypes.Structure):
-    _fields_ = [
-        ("compressionType", ctypes.c_ubyte),
-        ("gpuDirectRDMACapable", ctypes.c_ubyte),
-        ("usage", ctypes.c_ushort),
-        ("reserved", ctypes.c_ubyte * 4),
-    ]
+def _memcpy2d(args, stream: torch.cuda.Stream) -> None:
+    from cuda.bindings import driver as drv
+
+    # Copy-engine strided copy; a torch copy into the strided view would launch a kernel.
+    check_drv(drv.cuMemcpy2DAsync(args, stream.cuda_stream), "cuMemcpy2DAsync")
 
 
-class _CuMemAllocationProp(ctypes.Structure):
-    _fields_ = [
-        ("type", ctypes.c_int),
-        ("requestedHandleTypes", ctypes.c_int),
-        ("location", _CuMemLocation),
-        ("win32HandleMetaData", ctypes.c_void_p),
-        ("allocFlags", _CuMemAllocFlags),
-    ]
+class _PeerShards:
+    """This rank's shard as one exportable cuMem allocation, and every group peer's
+    shard mapped into this rank's address space."""
 
-
-class _CuMemAccessDesc(ctypes.Structure):
-    _fields_ = [("location", _CuMemLocation), ("flags", ctypes.c_int)]
-
-
-_CU_MEM_ALLOCATION_TYPE_PINNED = 1
-_CU_MEM_LOCATION_TYPE_DEVICE = 1
-_CU_MEM_ACCESS_FLAGS_PROT_READWRITE = 3
-_CU_MEM_ALLOC_GRANULARITY_MINIMUM = 0
-_CU_MEM_HANDLE_TYPE_POSIX_FD = 1
-_CU_MEM_HANDLE_TYPE_FABRIC = 8
-_CU_MEM_HANDLE_TYPES = (0, _CU_MEM_HANDLE_TYPE_POSIX_FD, _CU_MEM_HANDLE_TYPE_FABRIC)
-
-
-class _CudaArray:
-    """Zero-copy tensor view of a device range; keeps its ``_Vmm`` (the mappings) alive."""
-
-    def __init__(self, ptr: int, nbytes: int, owner: _Vmm):
-        self.owner = owner
-        self.__cuda_array_interface__ = {
-            "shape": (nbytes,),
-            "typestr": "|u1",
-            "data": (ptr, False),
-            "strides": None,
-            "version": 3,
-        }
-
-
-class _Vmm:
-    """CUDA driver VMM allocations, mappings and tensor views on one device."""
-
-    def __init__(self, device: torch.device):
-        try:
-            self.lib = ctypes.CDLL("libcuda.so.1")
-        except OSError as e:
-            raise RuntimeError(
-                f"K3 KDA weight shard VMM: cannot load libcuda.so.1 ({e})"
-            ) from e
-        self.device = device
-        self.dev_index = (
+    def __init__(self, group, dtype: torch.dtype, device: torch.device):
+        self.group, self.dtype = group, dtype
+        self.device_id = (
             device.index if device.index is not None else torch.cuda.current_device()
         )
         # The primary context must exist before any driver call.
         torch.empty(0, device=device)
-        self._handles: List[int] = []
-        self._maps: List[Tuple[int, int]] = []  # (va, bytes)
-        self._reserved: List[Tuple[int, int]] = []
-        self._finalizer = weakref.finalize(
-            self,
-            _Vmm._release,
-            self.lib,
-            self.dev_index,
-            self._maps,
-            self._reserved,
-            self._handles,
+        self._local: Optional[VmmReservation] = None
+        self._handle = None
+        self._numel = self._nbytes = 0
+        self._peer_maps: list = []
+
+    def _view(self, va: int) -> torch.Tensor:
+        es = torch.empty((), dtype=self.dtype).element_size()
+        return tensor_from_pointer(
+            va,
+            self._numel * es,
+            shape=(self._numel,),
+            dtype=self.dtype,
+            device_id=self.device_id,
         )
 
-    def _check(self, rc: int, what: str) -> None:
-        if rc != 0:
-            msg = ctypes.c_char_p()
-            self.lib.cuGetErrorString(rc, ctypes.byref(msg))
-            raise RuntimeError(
-                f"K3 KDA weight shard VMM: {what} failed: CUresult {rc} ({msg.value})"
-            )
-
-    def _prop(self, handle_type: int) -> _CuMemAllocationProp:
-        return _CuMemAllocationProp(
-            type=_CU_MEM_ALLOCATION_TYPE_PINNED,
-            requestedHandleTypes=handle_type,
-            location=_CuMemLocation(_CU_MEM_LOCATION_TYPE_DEVICE, self.dev_index),
+    def alloc(self, numel: int) -> torch.Tensor:
+        gran = get_device_granularity(self.device_id)
+        es = torch.empty((), dtype=self.dtype).element_size()
+        self._numel, self._nbytes = numel, align_up(numel * es, gran)
+        self._local = VmmReservation(
+            self._nbytes,
+            make_device_allocation_prop(self.device_id),
+            self.device_id,
+            alignment=gran,
         )
+        self._handle = self._local.map(0, self._nbytes, retain_handle=True)
+        return self._view(self._local.base)
 
-    def _granularity_of(self, prop: _CuMemAllocationProp) -> int:
-        g = ctypes.c_size_t()
-        rc = self.lib.cuMemGetAllocationGranularity(
-            ctypes.byref(g), ctypes.byref(prop), _CU_MEM_ALLOC_GRANULARITY_MINIMUM
+    def peers(self, shard: torch.Tensor) -> List[torch.Tensor]:
+        dist = torch.distributed
+        rank, n = dist.get_rank(self.group), dist.get_world_size(self.group)
+        t0 = time.perf_counter()
+        logger.info("K3 KDA weight shard: mapping %d peer shards", n - 1)
+        use_fabric, peer_handles = exchange_shareable_handles(
+            [self._handle], self.group, rank, n
         )
-        return g.value if rc == 0 else 0
-
-    def granularity(self) -> int:
-        gs = [self._granularity_of(self._prop(ht)) for ht in _CU_MEM_HANDLE_TYPES]
-        gs = [g for g in gs if g]
-        if not gs:
-            raise RuntimeError(
-                "K3 KDA weight shard VMM: no allocation granularity on this device"
-            )
-        return max(gs)
-
-    def create(self, nbytes: int, handle_type: int = 0) -> int:
-        h = ctypes.c_ulonglong()
-        prop = self._prop(handle_type)
-        self._check(
-            self.lib.cuMemCreate(
-                ctypes.byref(h),
-                ctypes.c_size_t(nbytes),
-                ctypes.byref(prop),
-                ctypes.c_ulonglong(0),
-            ),
-            "cuMemCreate",
-        )
-        self._handles.append(h.value)
-        return h.value
-
-    def export(self, handle: int, handle_type: int):
-        if handle_type == _CU_MEM_HANDLE_TYPE_POSIX_FD:
-            fd = ctypes.c_int()
-            self._check(
-                self.lib.cuMemExportToShareableHandle(
-                    ctypes.byref(fd),
-                    ctypes.c_ulonglong(handle),
-                    handle_type,
-                    ctypes.c_ulonglong(0),
-                ),
-                "cuMemExportToShareableHandle",
-            )
-            return fd.value
-        fh = (ctypes.c_ubyte * 64)()
-        self._check(
-            self.lib.cuMemExportToShareableHandle(
-                fh, ctypes.c_ulonglong(handle), handle_type, ctypes.c_ulonglong(0)
-            ),
-            "cuMemExportToShareableHandle",
-        )
-        return bytes(fh)
-
-    def import_(self, shareable, handle_type: int) -> int:
-        h = ctypes.c_ulonglong()
-        if handle_type == _CU_MEM_HANDLE_TYPE_POSIX_FD:
-            arg = ctypes.c_void_p(shareable)
-        else:
-            arg = (ctypes.c_ubyte * 64).from_buffer_copy(shareable)
-        self._check(
-            self.lib.cuMemImportFromShareableHandle(ctypes.byref(h), arg, handle_type),
-            "cuMemImportFromShareableHandle",
-        )
-        self._handles.append(h.value)
-        return h.value
-
-    def map_flat(
-        self, handles: Sequence[int], nbytes: Sequence[int], dtype: torch.dtype
-    ) -> torch.Tensor:
-        total = sum(nbytes)
-        va = self.reserve(total, self.granularity())
-        off = 0
-        for h, nb in zip(handles, nbytes):
-            self.map(va + off, nb, h)
-            off += nb
-        self.set_access(va, total)
-        return self.tensor(va, total, dtype)
-
-    def reserve(self, nbytes: int, align: int) -> int:
-        va = ctypes.c_ulonglong()
-        self._check(
-            self.lib.cuMemAddressReserve(
-                ctypes.byref(va),
-                ctypes.c_size_t(nbytes),
-                ctypes.c_size_t(align),
-                ctypes.c_ulonglong(0),
-                ctypes.c_ulonglong(0),
-            ),
-            "cuMemAddressReserve",
-        )
-        self._reserved.append((va.value, nbytes))
-        return va.value
-
-    def map(self, va: int, nbytes: int, handle: int) -> None:
-        self._check(
-            self.lib.cuMemMap(
-                ctypes.c_ulonglong(va),
-                ctypes.c_size_t(nbytes),
-                ctypes.c_size_t(0),
-                ctypes.c_ulonglong(handle),
-                ctypes.c_ulonglong(0),
-            ),
-            "cuMemMap",
-        )
-        self._maps.append((va, nbytes))
-
-    def set_access(self, va: int, nbytes: int) -> None:
-        desc = _CuMemAccessDesc(
-            _CuMemLocation(_CU_MEM_LOCATION_TYPE_DEVICE, self.dev_index),
-            _CU_MEM_ACCESS_FLAGS_PROT_READWRITE,
-        )
-        self._check(
-            self.lib.cuMemSetAccess(
-                ctypes.c_ulonglong(va),
-                ctypes.c_size_t(nbytes),
-                ctypes.byref(desc),
-                ctypes.c_size_t(1),
-            ),
-            "cuMemSetAccess",
-        )
-
-    def tensor(self, va: int, nbytes: int, dtype: torch.dtype) -> torch.Tensor:
-        t = torch.as_tensor(_CudaArray(va, nbytes, self), device=self.device)
-        return t.view(dtype)
-
-    @staticmethod
-    def _release(lib, dev_index, maps, reserved, handles) -> None:
+        out = []
         try:
-            torch.cuda.synchronize(dev_index)
+            for p in range(n):
+                if p == rank:
+                    out.append(shard)
+                    continue
+                handle = peer_handles[(p, 0)]
+                va = import_and_map_alloc(
+                    handle if use_fabric else None,
+                    None if use_fabric else handle,
+                    self._nbytes,
+                    self.device_id,
+                    use_fabric=use_fabric,
+                    peer_rank=p,
+                )
+                self._peer_maps.append((va, self._nbytes, [(0, self._nbytes)]))
+                out.append(self._view(va))
+        finally:
+            if not use_fabric:
+                for fd in peer_handles.values():
+                    os.close(fd)
+        dist.barrier(group=self.group)  # every peer mapped before anyone pulls
+        logger.info(
+            "K3 KDA weight shard: peer shard mappings via %s done in %.2f s",
+            "FABRIC" if use_fabric else "POSIX fd",
+            time.perf_counter() - t0,
+        )
+        return out
+
+    def release(self) -> None:
+        try:
+            torch.cuda.synchronize(self.device_id)
         except Exception:
             # Interpreter shutdown: the driver tears the context down anyway.
             return
-        for va, nbytes in maps:
-            lib.cuMemUnmap(ctypes.c_ulonglong(va), ctypes.c_size_t(nbytes))
-        for va, nbytes in reserved:
-            lib.cuMemAddressFree(ctypes.c_ulonglong(va), ctypes.c_size_t(nbytes))
-        for h in handles:
-            lib.cuMemRelease(ctypes.c_ulonglong(h))
-        maps.clear(), reserved.clear(), handles.clear()
-
-
-class _CudaMemcpy2D(ctypes.Structure):
-    _fields_ = [
-        ("srcXInBytes", ctypes.c_size_t),
-        ("srcY", ctypes.c_size_t),
-        ("srcMemoryType", ctypes.c_int),
-        ("srcHost", ctypes.c_void_p),
-        ("srcDevice", ctypes.c_ulonglong),
-        ("srcArray", ctypes.c_void_p),
-        ("srcPitch", ctypes.c_size_t),
-        ("dstXInBytes", ctypes.c_size_t),
-        ("dstY", ctypes.c_size_t),
-        ("dstMemoryType", ctypes.c_int),
-        ("dstHost", ctypes.c_void_p),
-        ("dstDevice", ctypes.c_ulonglong),
-        ("dstArray", ctypes.c_void_p),
-        ("dstPitch", ctypes.c_size_t),
-        ("WidthInBytes", ctypes.c_size_t),
-        ("Height", ctypes.c_size_t),
-    ]
-
-
-_CU_MEMORYTYPE_DEVICE = 2
-_LIBCUDA = None
-
-
-def _libcuda():
-    global _LIBCUDA
-    if _LIBCUDA is None:
-        try:
-            _LIBCUDA = ctypes.CDLL("libcuda.so.1")
-        except OSError as e:
-            raise RuntimeError(
-                f"K3 KDA weight shard: cannot load libcuda.so.1 ({e})"
-            ) from e
-    return _LIBCUDA
-
-
-def _memcpy2d_args(
-    *, dst: int, dst_pitch: int, src: int, src_pitch: int, width: int, height: int
-) -> _CudaMemcpy2D:
-    return _CudaMemcpy2D(
-        srcMemoryType=_CU_MEMORYTYPE_DEVICE,
-        srcDevice=src,
-        srcPitch=src_pitch,
-        dstMemoryType=_CU_MEMORYTYPE_DEVICE,
-        dstDevice=dst,
-        dstPitch=dst_pitch,
-        WidthInBytes=width,
-        Height=height,
-    )
-
-
-def _memcpy2d(args: _CudaMemcpy2D, stream: torch.cuda.Stream) -> None:
-    # Copy-engine strided copy; a torch copy into the strided view would launch a kernel.
-    rc = _libcuda().cuMemcpy2DAsync_v2(
-        ctypes.byref(args), ctypes.c_void_p(stream.cuda_stream)
-    )
-    if rc != 0:
-        raise RuntimeError(
-            f"K3 KDA weight shard: cuMemcpy2DAsync failed: CUresult {rc}"
-        )
+        release_mappings(self._peer_maps)
+        if self._local is not None:
+            self._local.close()
+            self._local = None
 
 
 _ACTIVE: Optional[LayerWeightShard] = None
@@ -790,125 +616,6 @@ def finish_load() -> None:
         s.finish_load()
 
 
-def _exchange_fds(fds: List[int], group, timeout_s: float = 120.0) -> List[List[int]]:
-    import socket
-    import threading
-    import uuid
-
-    dist = torch.distributed
-    rank, n = dist.get_rank(group), dist.get_world_size(group)
-    tokens = [None] * n
-    dist.all_gather_object(tokens, uuid.uuid4().hex, group=group)
-    name = lambda r: f"\0k3-kda-ws-{tokens[0]}-{r}"  # noqa: E731
-    chunk = 200  # under SCM_MAX_FD (253) per message
-    srv = socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET)
-    srv.settimeout(timeout_s)
-    srv.bind(name(rank))
-    srv.listen(n)
-    errors: List[BaseException] = []
-
-    def serve():
-        try:
-            for _ in range(n - 1):
-                conn, _ = srv.accept()
-                with conn:
-                    for i in range(0, len(fds), chunk):
-                        socket.send_fds(conn, [b"f"], fds[i : i + chunk])
-        except BaseException as e:  # re-raised on the caller's thread
-            errors.append(e)
-
-    th = threading.Thread(target=serve, daemon=True)
-    th.start()
-    dist.barrier(group=group)  # every listener is bound
-    out: List[List[int]] = []
-    try:
-        for p in range(n):
-            if p == rank:
-                out.append(list(fds))
-                continue
-            got: List[int] = []
-            with socket.socket(socket.AF_UNIX, socket.SOCK_SEQPACKET) as c:
-                c.settimeout(timeout_s)
-                c.connect(name(p))
-                while len(got) < len(fds):
-                    _, rfds, _, _ = socket.recv_fds(c, 16, chunk)
-                    if not rfds:
-                        raise RuntimeError(
-                            f"K3 KDA weight shard: rank {p} closed the fd channel early"
-                        )
-                    got += rfds
-            out.append(got)
-        th.join(timeout_s)
-        if th.is_alive():
-            raise RuntimeError(
-                "K3 KDA weight shard: fd exchange timed out serving peers"
-            )
-        if errors:
-            raise errors[0]
-    finally:
-        srv.close()
-    dist.barrier(group=group)
-    return out
-
-
-def _vmm_alloc_and_peers(group, dtype: torch.dtype, device: torch.device):
-    import socket
-    import time
-
-    dist = torch.distributed
-    vmm = _Vmm(device)
-    es = torch.empty((), dtype=dtype).element_size()
-    rank, n = dist.get_rank(group), dist.get_world_size(group)
-    hosts = [None] * n
-    dist.all_gather_object(hosts, socket.gethostname(), group=group)
-    handle_type = (
-        _CU_MEM_HANDLE_TYPE_POSIX_FD
-        if len(set(hosts)) == 1
-        else _CU_MEM_HANDLE_TYPE_FABRIC
-    )
-    holder = {}
-
-    def alloc(numel: int) -> torch.Tensor:
-        g = vmm.granularity()
-        nbytes = [-(-numel * es // g) * g]
-        handles = [vmm.create(b, handle_type) for b in nbytes]
-        holder.update(handles=handles, nbytes=nbytes)
-        return vmm.map_flat(handles, nbytes, dtype)[:numel]
-
-    def peers(t: torch.Tensor) -> List[torch.Tensor]:
-        t0 = time.perf_counter()
-        logger.info(
-            "K3 KDA weight shard: exporting %d shard allocations to %d peers",
-            len(holder["handles"]),
-            n - 1,
-        )
-        shareable = [vmm.export(h, handle_type) for h in holder["handles"]]
-        if handle_type == _CU_MEM_HANDLE_TYPE_POSIX_FD:
-            per_rank = _exchange_fds(shareable, group)
-        else:
-            per_rank = [None] * n
-            dist.all_gather_object(per_rank, shareable, group=group)
-        out = []
-        for p in range(n):
-            if p == rank:
-                out.append(t)
-                continue
-            imported = [vmm.import_(x, handle_type) for x in per_rank[p]]
-            out.append(vmm.map_flat(imported, holder["nbytes"], dtype))
-        if handle_type == _CU_MEM_HANDLE_TYPE_POSIX_FD:
-            for p, fds in enumerate(per_rank):
-                for fd in fds:
-                    os.close(fd)
-        dist.barrier(group=group)  # every peer mapped before anyone pulls
-        logger.info(
-            "K3 KDA weight shard: peer shard mappings done in %.2f s",
-            time.perf_counter() - t0,
-        )
-        return out
-
-    return alloc, peers
-
-
 def shard_group_layout(
     ranks: Sequence[int], attn_tp: int, group_size: int, tp_rank: int
 ) -> tuple[list[list[int]], int, int]:
@@ -916,7 +623,7 @@ def shard_group_layout(
     dp_size = len(ranks) // attn_tp
     if len(ranks) % attn_tp != 0 or dp_size % group_size != 0:
         raise ValueError(
-            f"--kda-weight-shard-size {group_size} must divide the attention-DP size "
+            f"--kda-dwdp-size {group_size} must divide the attention-DP size "
             f"{dp_size} (TP {len(ranks)}, attention TP {attn_tp})"
         )
     groups_per_slice = dp_size // group_size
@@ -945,10 +652,10 @@ def init_for_model(
     global _ACTIVE, _ACTIVE_SHARED
     if _ACTIVE is not None or _ACTIVE_SHARED is not None:
         raise RuntimeError(
-            "--kda-weight-shard-size: the weight shard stores were already built for a "
+            "--kda-dwdp-size: the weight shard stores were already built for a "
             "Kimi-K3 model in this process; a second K3-architecture model (e.g. a draft) "
             "cannot be weight-sharded too. Use a draft of another architecture, or drop "
-            "--kda-weight-shard-size."
+            "--kda-dwdp-size."
         )
     from sglang.srt.runtime_context import get_parallel
 
@@ -973,27 +680,31 @@ def init_for_model(
         * config.linear_attn_config["head_dim"]
         // attn_tp
     )
-    group_barrier = functools.partial(
-        torch.distributed.barrier, group=cpu_groups[my_group]
-    )
-    if shared_expert_layers:
-        s_alloc, s_peers = _vmm_alloc_and_peers(cpu_groups[my_group], dtype, device)
-        I = shared_intermediate_size
-        _ACTIVE_SHARED = LayerWeightShard(
-            units=[
-                (layer, shared_expert_unit_shapes(I, H))
-                for layer in shared_expert_layers
-            ],
+    group = cpu_groups[my_group]
+
+    def build(units) -> LayerWeightShard:
+        vmm = _PeerShards(group, dtype, device)
+        store = LayerWeightShard(
+            units=units,
             num_layers=num_layers,
             group_rank=group_rank,
             group_size=group_size,
             dtype=dtype,
             device=device,
-            alloc_shard=s_alloc,
-            peer_shards=s_peers,
-            group_barrier=group_barrier,
+            alloc_shard=vmm.alloc,
+            peer_shards=vmm.peers,
+            group_barrier=functools.partial(torch.distributed.barrier, group=group),
         )
-        _ACTIVE_SHARED.dummy_load = dummy_load
+        store.dummy_load = dummy_load
+        # The shard and peer views do not own their memory; it lives as long as the store.
+        weakref.finalize(store, vmm.release)
+        return store
+
+    if shared_expert_layers:
+        I = shared_intermediate_size
+        _ACTIVE_SHARED = build(
+            [(layer, shared_expert_unit_shapes(I, H)) for layer in shared_expert_layers]
+        )
         s_shard_b, s_slot_b = _ACTIVE_SHARED.bytes_per_rank()
         logger.info(
             "K3 shared-expert weight sharding: %d MoE layers: shard %.2f GB + %d slots %.2f GB "
@@ -1004,19 +715,7 @@ def init_for_model(
             s_slot_b / 1e9,
             len(shared_expert_layers) * 3 * I * H * 2 / 1e9,
         )
-    alloc, peers = _vmm_alloc_and_peers(cpu_groups[my_group], dtype, device)
-    _ACTIVE = LayerWeightShard(
-        units=[(layer, kda_unit_shapes(P, H)) for layer in kda_ids],
-        num_layers=num_layers,
-        group_rank=group_rank,
-        group_size=group_size,
-        dtype=dtype,
-        device=device,
-        alloc_shard=alloc,
-        peer_shards=peers,
-        group_barrier=group_barrier,
-    )
-    _ACTIVE.dummy_load = dummy_load
+    _ACTIVE = build([(layer, kda_unit_shapes(P, H)) for layer in kda_ids])
     shard_b, slot_b = _ACTIVE.bytes_per_rank()
     replicated = len(kda_ids) * (4 * P * H + H * P) * 2
     logger.info(

@@ -130,9 +130,7 @@ class TestKimiK3PDKdaTP(PDDisaggregationServerBase):
         plain = self.outputs([], [])
         for late_stage in ("0", "1"):
             with self.subTest(late_stage=late_stage):
-                kda_tp = self.outputs(
-                    ["--kda-weight-shard-size", "2"], KDA_TP_ARGS, late_stage
-                )
+                kda_tp = self.outputs(["--kda-dwdp-size", "2"], KDA_TP_ARGS, late_stage)
                 self.assert_close(plain, kda_tp)
 
 

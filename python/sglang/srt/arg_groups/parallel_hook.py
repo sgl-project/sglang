@@ -253,13 +253,6 @@ def handle_shared_experts_tp(server_args: Any):
         )
 
 
-_KIMI_K3_ARCHITECTURES = (
-    "KimiK3ForConditionalGeneration",
-    "KimiK31ForConditionalGeneration",
-    "KimiK3LinearForCausalLM",
-)
-
-
 _KDA_WEIGHT_SHARD_LOAD_FORMATS_REFUSED = (
     "sharded_state",
     "presharded",
@@ -269,22 +262,21 @@ _KDA_WEIGHT_SHARD_LOAD_FORMATS_REFUSED = (
 )
 
 
-def handle_kda_weight_shard(server_args: Any):
+def handle_kda_dwdp(server_args: Any):
     cfg = resolving_view(server_args)
-    size = cfg.kda_weight_shard_size
+    size = cfg.kda_dwdp_size
     if size is None:
         return
     if cfg.disaggregation_mode != "prefill":
         raise ValueError(
-            "--kda-weight-shard-size runs on PD prefill workers only "
+            "--kda-dwdp-size runs on PD prefill workers only "
             f"(--disaggregation-mode prefill; got {cfg.disaggregation_mode!r}): a "
             "decoding server would re-gather the sharded weights every step (about "
             "54 GB per rank for K3 at attention TP 1 and N=8)."
         )
     if size < 2 or cfg.tp_size % size != 0:
         raise ValueError(
-            f"--kda-weight-shard-size ({size}) must be >= 2 and divide TP size "
-            f"({cfg.tp_size})."
+            f"--kda-dwdp-size ({size}) must be >= 2 and divide TP size ({cfg.tp_size})."
         )
     view = resolved_view(server_args)
     attn_tp_size = derive_attn_tp_size(
@@ -294,40 +286,39 @@ def handle_kda_weight_shard(server_args: Any):
     )
     if cfg.attn_dp_size <= 1 or cfg.attn_dp_size % size != 0:
         raise ValueError(
-            f"--kda-weight-shard-size ({size}) needs attention DP and must divide the "
+            f"--kda-dwdp-size ({size}) needs attention DP and must divide the "
             f"attention-DP size ({cfg.attn_dp_size}; attention TP {attn_tp_size})."
         )
     if view.attn_cp_size > 1:
-        raise ValueError("--kda-weight-shard-size does not support --attn-cp-size > 1.")
+        raise ValueError("--kda-dwdp-size does not support --attn-cp-size > 1.")
     if cfg.pp_size > 1:
-        raise ValueError(
-            "--kda-weight-shard-size does not support pipeline parallelism."
-        )
+        raise ValueError("--kda-dwdp-size does not support pipeline parallelism.")
     if cfg.load_format in _KDA_WEIGHT_SHARD_LOAD_FORMATS_REFUSED:
         raise ValueError(
-            f"--kda-weight-shard-size does not support --load-format {cfg.load_format}: "
+            f"--kda-dwdp-size does not support --load-format {cfg.load_format}: "
             "the shards are filled by the model's load_weights (use a checkpoint format "
             "such as auto or safetensors, or dummy)."
         )
     if cfg.weight_cache_mode != "off":
         raise ValueError(
-            "--kda-weight-shard-size does not support --weight-cache-mode "
+            "--kda-dwdp-size does not support --weight-cache-mode "
             f"{cfg.weight_cache_mode}: cached weights skip the shard loaders."
         )
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
+        raise ValueError("--kda-dwdp-size requires a Kimi-K3 model configuration.")
+    from sglang.srt.configs.model_config import is_kimi_k3
+
+    hf_config = model_config_of(server_args).hf_config
+    if not is_kimi_k3(hf_config):
         raise ValueError(
-            "--kda-weight-shard-size requires a Kimi-K3 model configuration."
-        )
-    architecture = model_config_of(server_args).hf_config.architectures[0]
-    if architecture not in _KIMI_K3_ARCHITECTURES:
-        raise ValueError(
-            f"--kda-weight-shard-size is only supported for Kimi-K3 (got {architecture})."
+            "--kda-dwdp-size is only supported for Kimi-K3 "
+            f"(got {hf_config.architectures[0]})."
         )
     graph = cfg.cuda_graph_config
     for phase in ("prefill", "decode"):
         if graph is not None and getattr(graph, phase).backend == Backend.FULL:
             raise ValueError(
-                "--kda-weight-shard-size issues its layer-weight gathers between graph "
+                "--kda-dwdp-size issues its layer-weight gathers between graph "
                 f"segments and cannot run inside a full {phase} CUDA graph; use "
                 f"--cuda-graph-backend-{phase} breakable or disabled."
             )
@@ -359,19 +350,22 @@ def handle_kda_tp(server_args: Any):
             f"attention CP (attention DP {cfg.attn_dp_size}, TP {cfg.tp_size}, "
             f"attention TP {attn_tp_size}, attention CP {view.attn_cp_size})."
         )
-    if cfg.kda_weight_shard_size is not None:
+    if cfg.kda_dwdp_size is not None:
         raise ValueError(
-            "--enable-kda-tp and --kda-weight-shard-size are mutually exclusive: KDA TP "
+            "--enable-kda-tp and --kda-dwdp-size are mutually exclusive: KDA TP "
             "already shards the KDA weights over the TP group."
         )
     if cfg.pp_size > 1:
         raise ValueError("--enable-kda-tp does not support pipeline parallelism.")
     if parse_connector_type(cfg.model_path) == ConnectorType.INSTANCE:
         raise ValueError("--enable-kda-tp requires a Kimi-K3 model configuration.")
-    architecture = model_config_of(server_args).hf_config.architectures[0]
-    if architecture not in _KIMI_K3_ARCHITECTURES:
+    from sglang.srt.configs.model_config import is_kimi_k3
+
+    hf_config = model_config_of(server_args).hf_config
+    if not is_kimi_k3(hf_config):
         raise ValueError(
-            f"--enable-kda-tp is only supported for Kimi-K3 (got {architecture})."
+            "--enable-kda-tp is only supported for Kimi-K3 "
+            f"(got {hf_config.architectures[0]})."
         )
 
 
