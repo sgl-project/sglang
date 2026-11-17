@@ -126,7 +126,8 @@ from sglang.srt.weight_sync.refusal import declare_weight_update_unsupported
 declare_weight_update_unsupported(module, "restart to replace offloaded weights")
 ```
 
-Use the same declaration on all ranks and keep it unchanged while serving.
+Declare the same refusal reason in every worker process, including every
+tensor-parallel rank in every pipeline stage. Keep it unchanged while serving.
 A string, including an empty string, blocks updates. Passing `None` clears
 only this declaration. Other types raise `TypeError`. Native restrictions,
 including a model's existing `_derived_weight_cache_error`, still apply.

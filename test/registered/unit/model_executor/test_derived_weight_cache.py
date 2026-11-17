@@ -1,6 +1,7 @@
 """Online updates must reject model-owned derived buffers before writing."""
 
 import unittest
+from contextvars import copy_context
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -17,7 +18,10 @@ from sglang.srt.model_executor.model_runner_components.weight_updater import (
     _unsupported_derived_weight_cache_error,
 )
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.weight_sync.refusal import declare_weight_update_unsupported
+from sglang.srt.weight_sync.refusal import (
+    declare_weight_update_unsupported,
+    weight_update_request,
+)
 
 
 class TestDerivedWeightCache(CustomTestCase):
@@ -101,6 +105,25 @@ class TestDerivedWeightCache(CustomTestCase):
                 self.assertEqual(
                     _unsupported_derived_weight_cache_error(model), "already refused"
                 )
+
+    def test_copied_context_rechecks_model_after_request_ends(self):
+        """A later check in a copied context must see a new native refusal."""
+        model = torch.nn.Module()
+        with (
+            weight_update_request(),
+            patch(
+                "sglang.kernels.ops.gemm.bf16_fp32.hpc_bf16xfp32_gemm_enabled",
+                return_value=False,
+            ),
+        ):
+            self.assertIsNone(_unsupported_derived_weight_cache_error(model))
+            copied = copy_context()
+
+        model._derived_weight_cache_error = "derived scales require restart"
+        self.assertEqual(
+            copied.run(_unsupported_derived_weight_cache_error, model),
+            "derived scales require restart",
+        )
 
     def test_public_declaration_rejects_each_load_path_before_writing(self):
         model = torch.nn.Sequential(torch.nn.Linear(2, 2, bias=False))

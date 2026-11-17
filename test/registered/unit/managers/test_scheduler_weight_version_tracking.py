@@ -434,6 +434,34 @@ class TestRecordWeightVersionAfterUpdate(_WeightUpdaterManagerTestBase):
 
 
 class TestWeightUpdateSession(_WeightUpdaterManagerTestBase):
+    def test_native_loads_scan_the_model_once_per_request(self):
+        """A native loader's refusal check must reuse the scheduler's model scan."""
+        target = _runner()
+        updater = target.weight_updater
+        model = updater.get_model()
+        manager = self._manager(target)
+
+        def check_before_write(*args, **kwargs):
+            reason = WeightUpdater.load_rejection(updater, "weight update")
+            return reason is None, reason or ""
+
+        for update, write in (
+            (manager.update_weights_from_disk, updater.update_weights_from_disk),
+            (manager.update_weights_from_ipc, updater.update_weights_from_ipc),
+            (manager.update_weights_from_tensor, updater.update_weights_from_tensor),
+            (
+                manager.update_weights_from_distributed,
+                updater.load_weights_from_distributed,
+            ),
+        ):
+            with self.subTest(update=update.__name__):
+                write.side_effect = check_before_write
+                with patch.object(model, "modules", wraps=model.modules) as scan:
+                    result = update(_request())
+                self.assertTrue(result.success, result.message)
+                write.assert_called_once()
+                scan.assert_called_once_with()
+
     def test_draft_refusal_precedes_disk_and_ipc_writes(self):
         target, draft = _runner(), _runner()
         declare_weight_update_unsupported(draft.weight_updater.get_model(), "draft")
