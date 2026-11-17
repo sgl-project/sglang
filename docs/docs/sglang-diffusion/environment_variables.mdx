@@ -79,6 +79,16 @@ description: "Configure SGLang diffusion behavior with environment variables."
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Head groups for pipelining the Ulysses exchange against dense attention over the copy engine. <code>-1</code> picks the largest count that divides the heads per rank while each group still fills the GPU; <code>0</code> keeps the sequential exchange; <code>N</code> forces <code>N</code> groups. Results are bit-identical either way.</td>
     </tr>
     <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_MINIMAX_H3_RESIZE_GPU</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>true</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>MiniMax-H3 image: quantize and LANCZOS-resize the decoded canvas on the GPU when a request is smaller than the minimum generation area. The first request of each geometry checks the result against Pillow and falls back to Pillow on any difference. Set to <code>0</code> to always resize with Pillow on the host. The output is byte-identical either way.</td>
+    </tr>
+    <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_DIFFUSION_MINIMAX_H3_RESIZE_THREADS</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>4</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Threads for the Pillow LANCZOS resize of MiniMax-H3 image output when it runs on the host (GPU resize disabled or not verified). The result is byte-identical for any value.</td>
+    </tr>
+    <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}><code>SGLANG_USE_RUNAI_MODEL_STREAMER</code></td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>true</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>Use Run:AI model streamer for model loading</td>
