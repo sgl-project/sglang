@@ -10,6 +10,7 @@ import contextlib
 import functools
 import logging
 import os
+import sys
 import time
 import weakref
 from dataclasses import dataclass
@@ -547,11 +548,10 @@ class _PeerShards:
         return out
 
     def release(self) -> None:
-        try:
-            torch.cuda.synchronize(self.device_id)
-        except Exception:
-            # Interpreter shutdown: the driver tears the context down anyway.
+        if sys.is_finalizing():
+            # The driver tears the context down at exit anyway.
             return
+        torch.cuda.synchronize(self.device_id)
         release_mappings(self._peer_maps)
         if self._local is not None:
             self._local.close()
