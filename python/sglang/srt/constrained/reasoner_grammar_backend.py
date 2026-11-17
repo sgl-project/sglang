@@ -36,6 +36,7 @@ logger = logging.getLogger(__name__)
 
 _OPEN_ANSWER_VARIANT = "open_answer"
 _THINK_BUDGET_VARIANT = "think_budget="
+_TOOLS_VARIANT = "tools"
 # Arbitrary bound; budgets are a per-request knob, so only recent variants stay cached.
 _BUDGET_VARIANT_CACHE_SIZE = 32
 
@@ -560,19 +561,22 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
         *,
         input_ids: Sequence[int],
         thinking_budget: Optional[int],
+        allows_tools: bool = False,
     ) -> Tuple[str, str]:
         key_type, key_string = key
         if not self._is_framed(key_type):
             return key
         if self._answer_frame.ends_in_open_answer_block(input_ids):
             return (f"{key_type}:{_OPEN_ANSWER_VARIANT}", key_string)
+        variants = [_TOOLS_VARIANT] if allows_tools else []
         # Mirrors the strict wrapper, which applies a request budget only while filtering.
-        if not self.enable_token_filter or thinking_budget is None:
+        if self.enable_token_filter and thinking_budget is not None:
+            budget = max(thinking_budget, -1)
+            if budget != max(self.max_think_tokens, -1):
+                variants.append(f"{_THINK_BUDGET_VARIANT}{budget}")
+        if not variants:
             return key
-        budget = max(thinking_budget, -1)
-        if budget == max(self.max_think_tokens, -1):
-            return key
-        return (f"{key_type}:{_THINK_BUDGET_VARIANT}{budget}", key_string)
+        return (f"{key_type}:{','.join(variants)}", key_string)
 
     def _is_framed(self, key_type: str) -> bool:
         return (
@@ -629,9 +633,11 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
     def _frame_answer(
         self, grammar: BaseGrammarObject, variant: str
     ) -> Optional[BaseGrammarObject]:
-        in_answer_block = variant == _OPEN_ANSWER_VARIANT
-        if variant.startswith(_THINK_BUDGET_VARIANT):
-            max_think_tokens = int(variant.removeprefix(_THINK_BUDGET_VARIANT))
+        variants = variant.split(",") if variant else []
+        in_answer_block = _OPEN_ANSWER_VARIANT in variants
+        budgets = [v for v in variants if v.startswith(_THINK_BUDGET_VARIANT)]
+        if budgets:
+            max_think_tokens = int(budgets[0].removeprefix(_THINK_BUDGET_VARIANT))
         elif self.enable_strict_thinking:
             max_think_tokens = self.max_think_tokens
         else:
@@ -642,5 +648,6 @@ class ReasonerGrammarBackend(BaseGrammarBackend):
                 content,
                 in_answer_block=in_answer_block,
                 max_think_tokens=max_think_tokens,
+                allows_tools=_TOOLS_VARIANT in variants,
             ),
         )

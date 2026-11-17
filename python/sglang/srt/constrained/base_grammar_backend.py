@@ -211,9 +211,10 @@ class BaseGrammarBackend:
         *,
         input_ids: Sequence[int],
         thinking_budget: Optional[int],
+        allows_tools: bool = False,
     ) -> Tuple[str, str]:
-        """Cache key for this request's grammar; may depend on how the prompt ends
-        and on the request's thinking budget."""
+        """Cache key for this request's grammar; may depend on how the prompt ends,
+        on the request's thinking budget, and on whether it offers tools."""
         return key
 
     def reserve_framing_tokens(self, token_ids: Sequence[int]) -> None:
