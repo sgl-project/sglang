@@ -62,6 +62,25 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _supports_pd_shutdown_drain() -> bool:
+    """Only backends/configurations with a local transfer-quiescence proof.
+    Unknown configurations keep their existing SIGTERM behavior and cannot
+    opt into the native P/D Shutdown RPC through missing launch metadata.
+    """
+    parallel = get_parallel()
+    return (
+        get_disagg().disaggregation_mode in ("prefill", "decode")
+        and parallel.nnodes == 1
+        and parallel.tp_size == 1
+        and parallel.pp_size == 1
+        and parallel.num_dp_ranks == 1
+        and parallel.attn_cp_size == 1
+        and not get_disagg().enable_pd_role_switch
+        and get_disagg().disaggregation_transfer_backend == "mooncake"
+        and envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.get()
+    )
+
+
 def _build_server_args(
     scheduler: Scheduler,
     *,
@@ -95,6 +114,10 @@ def _build_server_args(
         "node_rank": get_parallel().node_rank,
         "nnodes": get_parallel().nnodes,
         "dp_size": get_parallel().num_dp_ranks,
+        "tp_size": get_parallel().tp_size,
+        "pp_size": get_parallel().pp_size,
+        "pd_shutdown_supported": _supports_pd_shutdown_drain(),
+        "pd_role_switch_enabled": get_disagg().enable_pd_role_switch,
         "dp_rank": select_kv_publisher_dp_rank(
             get_parallel().attn_dp_size,
             get_parallel().attn_dp_rank,

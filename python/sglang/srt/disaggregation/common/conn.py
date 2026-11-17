@@ -312,6 +312,28 @@ class CommonKVManager(BaseKVManager):
     defer_decode_allocation: bool = False
     deferred_bootstrap: Optional[DeferredBootstrap] = None
     _staging_ctx = None
+    _shutdown_quiescence_lost: bool = False
+
+    def is_shutdown_quiescent(self) -> bool:
+        """A local proof for single-rank Mooncake native Shutdown.
+
+        Workers count a chunk before checking its room and before posting a
+        write. After every scheduler list is empty, an uncounted queued chunk
+        belongs to a cleared room and must skip posting; a counted chunk stays
+        visible here until worker cleanup. Even a zero entry holds cleanup.
+        A timed-out/poisoned transfer is never converted to a successful drain.
+        """
+        return (
+            self.enable_deferred_decode_kv_release
+            and not self._shutdown_quiescence_lost
+            and not self._staging_outstanding
+            and not self._deferred_ack_poisoned_rooms
+        )
+
+    def mark_shutdown_unquiescent(self) -> None:
+        # Engine-wide and monotonic: reusing a bootstrap room must not erase
+        # the fact that an earlier transfer could still be writing.
+        self._shutdown_quiescence_lost = True
 
     # Wire layout of the prefill->decode terminal status message. The legacy
     # layout (mooncake, and ascend which inherits it) is three untagged frames
@@ -737,6 +759,8 @@ class CommonKVManager(BaseKVManager):
             # Anything else would resurrect a concluded room and pollute a later
             # request that reuses the same bootstrap_room.
             if status in (KVPoll.Bootstrapping, KVPoll.WaitingForInput):
+                if self._staging_outstanding.get(bootstrap_room, 0) > 0:
+                    self.mark_shutdown_unquiescent()
                 # A new room lifecycle drops deferred-ACK state left by the
                 # previous request that used this bootstrap_room.
                 self._deferred_ack_targets.pop(bootstrap_room, None)
@@ -1192,6 +1216,7 @@ class CommonKVManager(BaseKVManager):
 
     def poison_deferred_ack_room(self, room: int) -> None:
         """Drop an ACK target when the backend cannot prove the room drained."""
+        self.mark_shutdown_unquiescent()
         self._deferred_ack_targets.pop(room, None)
         self._deferred_ack_poisoned_rooms.add(room)
 

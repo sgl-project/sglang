@@ -60,12 +60,15 @@ class _FakeServer:
         self.held = False
         self.release_calls = 0
         self.releases = 0
+        self.idle_reports = []
+        self.pending = []
         self.read_fd, self.write_fd = os.pipe()
         os.set_blocking(self.read_fd, False)
         os.set_blocking(self.write_fd, False)
 
     def recv_requests(self, limit):
-        return []
+        out, self.pending = self.pending[:limit], self.pending[limit:]
+        return out
 
     def drain_complete(self):
         return self.complete
@@ -78,6 +81,9 @@ class _FakeServer:
         if any(self.drains):
             state |= DRAIN_FORCE_REQUESTED
         return state | (DRAIN_CLOSED if self.closed else 0)
+
+    def report_scheduler_idle(self, idle):
+        self.idle_reports.append(idle)
 
     def hold_drain_end(self):
         assert not self.drains, "held after the drain began"
@@ -763,6 +769,223 @@ def test_main_process_raises_on_an_unreaped_scheduler(
         if wedged.exitcode is None:
             os.kill(wedged.pid, signal.SIGKILL)
         wedged.join()
+
+
+@pytest.fixture
+def pd_fake_server(restore_sigterm):
+    fake = _FakeServer()
+    yield fake
+    signal.set_wakeup_fd(-1)
+    os.close(fake.read_fd)
+    os.close(fake.write_fd)
+
+
+def test_pd_drain_reports_scheduler_idle_only_while_draining(pd_fake_server):
+    """Prefill/Decode drain reports idle/busy to the native gate; non-draining
+    polls must not evaluate the heavy callback."""
+    fake = pd_fake_server
+    server = RustServer(fake, http_port=0)
+    calls = []
+
+    def idle():
+        calls.append(True)
+        return True
+
+    server.install_sigterm_drain(scheduler_idle=idle)
+    assert server.drain(8) == []
+    assert calls == []
+    assert fake.idle_reports == []
+
+    fake.begin_drain(False)
+    assert server.drain(8) == []
+    assert calls == [True]
+    assert fake.idle_reports == [True]
+
+
+def test_pd_drain_pending_out_and_busy_callback_report_busy(pd_fake_server):
+    fake = pd_fake_server
+    server = RustServer(fake, http_port=0)
+    # The scheduler may still own a request after the API reader disappears.
+    server.install_sigterm_drain(scheduler_idle=lambda: False)
+    fake.begin_drain(False)
+    assert server.drain(8) == []
+    assert fake.idle_reports == [False]
+
+    fake.idle_reports = []
+    server._scheduler_idle = lambda: True
+
+    # A newly received request is not in the scheduler lists yet. An old
+    # idle snapshot must not close the listener before it is admitted.
+    class _Req:
+        header = b""
+        buffers = []
+
+    fake.pending = [_Req()]
+    server._admit = lambda header, buffers: object()
+    out = server.drain(8)
+    assert len(out) == 1
+    assert fake.idle_reports == [False]
+
+
+def test_pd_drain_scheduler_idle_covers_held_deferred_and_transfer_lists():
+    """Drain quiescence keeps PD_HELD / DEFERRED busy even when the real
+    ``is_fully_idle`` skips them, and also waits on bootstrap/sending/receiving."""
+    from unittest.mock import MagicMock
+
+    from sglang.srt.disaggregation.mode import DisaggregationMode
+    from sglang.srt.managers.scheduler import Scheduler
+    from sglang.srt.managers.scheduler_components.pause_state import PauseState
+    from sglang.srt.managers.scheduler_components.request_list import (
+        IndexedReqList,
+        ListKind,
+        move,
+    )
+
+    def _idle_scheduler(lists):
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler.is_fully_idle = Scheduler.is_fully_idle.__get__(scheduler)
+        scheduler.running_batch = MagicMock(is_empty=MagicMock(return_value=True))
+        scheduler.last_batch = None
+        scheduler.enable_overlap = False
+        scheduler.result_queue = []
+        scheduler._pp_microbatches_drained = MagicMock(return_value=True)
+        scheduler.request_receiver = MagicMock(
+            has_pending=MagicMock(return_value=False)
+        )
+        scheduler.uocr_runtime = None
+        scheduler.disaggregation_mode = DisaggregationMode.PREFILL
+        manager = SimpleNamespace(is_shutdown_quiescent=lambda: True)
+        scheduler.disagg_prefill_bootstrap_queue = SimpleNamespace(kv_manager=manager)
+        scheduler.disagg_decode_prealloc_queue = SimpleNamespace(kv_manager=manager)
+        scheduler.decode_offload_manager = None
+        scheduler.enable_hierarchical_cache = False
+        scheduler.enable_lmcache = False
+        scheduler.enable_unified_cache_external_linker = False
+        scheduler.pause_state = PauseState()
+        scheduler.waiting_queue = []
+        scheduler.request_lists = MagicMock(return_value=lists)
+        return scheduler
+
+    empty = {
+        ListKind.WAITING: [],
+        ListKind.PD_HELD: IndexedReqList(ListKind.PD_HELD),
+        ListKind.DEFERRED: IndexedReqList(ListKind.DEFERRED),
+        ListKind.PD_SENDING: IndexedReqList(ListKind.PD_SENDING),
+        ListKind.PD_BOOTSTRAP: IndexedReqList(ListKind.PD_BOOTSTRAP),
+        ListKind.PD_RECEIVING: IndexedReqList(ListKind.PD_RECEIVING),
+    }
+    assert Scheduler._pd_drain_scheduler_idle(_idle_scheduler(empty))
+
+    for kind in (
+        ListKind.PD_HELD,
+        ListKind.DEFERRED,
+        ListKind.PD_SENDING,
+        ListKind.PD_BOOTSTRAP,
+        ListKind.PD_RECEIVING,
+        ListKind.PD_PREALLOC,
+        ListKind.PD_RETRACTED,
+        ListKind.PD_RELEASING,
+        ListKind.PD_OFFLOADING,
+    ):
+        lists = dict(empty)
+        busy = IndexedReqList(kind)
+        move([MagicMock(owner_list=None, kv=MagicMock(holds_kv=False))], busy)
+        lists[kind] = busy
+        scheduler = _idle_scheduler(lists)
+        if kind in (ListKind.PD_HELD, ListKind.DEFERRED):
+            assert scheduler.is_fully_idle(), f"{kind.name} skipped by is_fully_idle"
+        else:
+            assert not scheduler.is_fully_idle(), f"{kind.name} busy for is_fully_idle"
+        assert not Scheduler._pd_drain_scheduler_idle(scheduler), kind.name
+
+    scheduler = _idle_scheduler(empty)
+    scheduler.disagg_prefill_bootstrap_queue.kv_manager.is_shutdown_quiescent = lambda: (
+        False
+    )
+    assert not Scheduler._pd_drain_scheduler_idle(scheduler)
+
+
+@pytest.mark.parametrize(
+    "mode,backend,deferred,tp,pp,dp,nnodes,supported",
+    [
+        ("prefill", "mooncake", True, 1, 1, 1, 1, True),
+        ("decode", "mooncake", True, 1, 1, 1, 1, True),
+        ("decode", "nixl", True, 1, 1, 1, 1, False),
+        ("prefill", "mori", True, 1, 1, 1, 1, False),
+        ("prefill", "mooncake", False, 1, 1, 1, 1, False),
+        ("prefill", "mooncake", True, 2, 1, 1, 1, False),
+        ("decode", "mooncake", True, 1, 2, 1, 1, False),
+        ("decode", "mooncake", True, 1, 1, 2, 1, False),
+        ("decode", "mooncake", True, 1, 1, 1, 2, False),
+        ("null", "mooncake", True, 1, 1, 1, 1, False),
+    ],
+)
+def test_pd_shutdown_capability_fails_closed(
+    mode, backend, deferred, tp, pp, dp, nnodes, supported
+):
+    from unittest.mock import patch
+
+    from sglang.srt.environ import envs
+    from sglang.srt.rust_server import config
+
+    with (
+        patch.object(
+            config,
+            "get_parallel",
+            return_value=SimpleNamespace(
+                nnodes=nnodes,
+                tp_size=tp,
+                pp_size=pp,
+                num_dp_ranks=dp,
+                attn_cp_size=1,
+            ),
+        ),
+        patch.object(
+            config,
+            "get_disagg",
+            return_value=SimpleNamespace(
+                disaggregation_mode=mode,
+                disaggregation_transfer_backend=backend,
+                enable_pd_role_switch=False,
+            ),
+        ),
+        envs.SGLANG_DISAGGREGATION_DEFERRED_DECODE_KV_RELEASE.override(deferred),
+    ):
+        assert config._supports_pd_shutdown_drain() is supported
+        config.get_disagg.return_value.enable_pd_role_switch = True
+        assert not config._supports_pd_shutdown_drain()
+
+
+def test_pd_shutdown_waits_for_worker_cleanup_and_remembers_unproven_writes():
+    from sglang.srt.disaggregation.base.conn import KVPoll
+    from sglang.srt.disaggregation.common.conn import CommonKVManager
+
+    manager = CommonKVManager.__new__(CommonKVManager)
+    manager.enable_deferred_decode_kv_release = True
+    manager._staging_outstanding = {}
+    manager._deferred_ack_poisoned_rooms = set()
+    manager._deferred_ack_targets = {}
+    manager.request_status = {}
+    assert manager.is_shutdown_quiescent()
+    for count in (1, 0):
+        manager._staging_outstanding[7] = count
+        assert not manager.is_shutdown_quiescent()
+    manager._staging_outstanding.clear()
+    assert manager.is_shutdown_quiescent()
+    manager.poison_deferred_ack_room(7)
+    manager.update_status(7, KVPoll.Bootstrapping)
+    assert not manager._deferred_ack_poisoned_rooms
+    assert not manager.is_shutdown_quiescent(), (
+        "room reuse cannot prove an old write settled"
+    )
+
+    manager._shutdown_quiescence_lost = False
+    manager._staging_outstanding[8] = 1
+    manager.update_status(8, KVPoll.Bootstrapping)
+    assert not manager._staging_outstanding
+    assert not manager.is_shutdown_quiescent(), (
+        "replacing an active room loses its drain proof"
+    )
 
 
 if __name__ == "__main__":

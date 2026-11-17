@@ -189,6 +189,19 @@ impl Runtime {
         self.core.begin_drain(force);
     }
 
+    /// Prefill/Decode scheduler quiescence (see
+    /// [`CoreHandle::report_scheduler_idle`]).
+    pub fn report_scheduler_idle(&self, idle: bool) {
+        self.core.report_scheduler_idle(idle);
+    }
+
+    /// Start a scheduler intake poll before releasing any pipeline guards.
+    /// Python may report idle again only after an empty, fully-idle poll.
+    pub fn recv_requests(&self, max: usize) -> Vec<crate::message::request::SchedulerRequest> {
+        self.core.report_scheduler_idle(false);
+        self.to_scheduler_rx.drain(max)
+    }
+
     /// Python's `--warmups` finished (see [`CoreHandle::finish_custom_warmups`]).
     pub fn finish_custom_warmups(&self) {
         self.core.finish_custom_warmups();
@@ -864,6 +877,76 @@ mod tests {
             );
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+    }
+
+    /// A reader may leave while its request is still on the Rust intake
+    /// ring. Draining that ring must invalidate the old idle report before
+    /// releasing the pipeline guard; otherwise the listener could close
+    /// before Python installs the request in its scheduler lists.
+    #[test]
+    fn pd_orphan_ring_work_needs_a_fresh_idle_after_scheduler_handoff() {
+        use crate::api_server::core::ReceivedAs;
+        use crate::message::config::DisaggregationMode;
+        use crate::message::request::GenerateRequest;
+
+        let (addr, _) = free_loopback_addrs();
+        let mut cfg = test_config(addr, None);
+        let args = Arc::make_mut(&mut cfg.server_args);
+        args.disaggregation_mode = DisaggregationMode::Prefill;
+        args.deployment_info.pd_shutdown_supported = true;
+        let rt = start(cfg, None).expect("start prefill runtime");
+        take_startup_freeze_gc(&rt);
+        let client = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let call = client
+            .block_on(rt.core.generate(
+                GenerateRequest {
+                    input_ids: Some(vec![1, 2, 3]),
+                    ..Default::default()
+                },
+                ReceivedAs::without_headers(),
+            ))
+            .unwrap();
+        assert!(rt.to_scheduler_rx.wait(std::time::Duration::from_secs(5)));
+        drop(call);
+        rt.begin_drain(false);
+        rt.report_scheduler_idle(true);
+        assert!(client.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(100), rt.core.drain_ended())
+                .await
+                .is_err()
+        }));
+
+        let pending = rt.recv_requests(256);
+        assert!(
+            pending
+                .iter()
+                .any(|request| request.pipeline_guard.is_some())
+        );
+        drop(pending);
+        // Reproduce Python processing the nonempty poll: no fresh idle ack.
+        assert!(client.block_on(async {
+            tokio::time::timeout(std::time::Duration::from_millis(100), rt.core.drain_ended())
+                .await
+                .is_err()
+        }));
+        assert!(!rt.drain_complete());
+        let route = read_response(send_http(
+            addr,
+            "GET",
+            "/route?prefill_dp_rank=-1&prefill_cp_rank=-1&target_tp_rank=-1&target_pp_rank=-1",
+            "",
+        ));
+        assert!(route.starts_with("HTTP/1.1 503"), "{route}");
+        assert!(
+            !rt.recv_requests(256)
+                .iter()
+                .any(|request| request.pipeline_guard.is_some())
+        );
+        rt.report_scheduler_idle(true);
+        wait_drain_complete(&rt);
     }
 
     /// The graceful drain, as Python's SIGTERM handling: health answers 503

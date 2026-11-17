@@ -152,6 +152,15 @@ class BaseKVManager(ABC):
     enable_deferred_decode_kv_release: bool = False
     supports_host_destination: bool = False
 
+    def is_shutdown_quiescent(self) -> bool:
+        """Whether backend work outside scheduler lists has provably settled.
+        Native P/D Shutdown is opt-in; an unknown backend supplies no proof.
+        """
+        return False
+
+    def mark_shutdown_unquiescent(self) -> None:
+        """Remember a transfer whose retirement could not be established."""
+
     def should_verify_kv_checksum(self, bootstrap_addr: str) -> bool:
         """Whether the checksum sent by the prefill at bootstrap_addr is comparable
         with one over this rank's local KV. A backend returns False for a peer

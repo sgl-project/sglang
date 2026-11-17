@@ -1020,6 +1020,7 @@ mod tests {
                 input_ids: Some(input_ids),
                 ..Default::default()
             })),
+            pipeline_guard: None,
         }
     }
 
@@ -1279,6 +1280,7 @@ mod tests {
                     token_ids: vec![1, 2],
                     skip_special_tokens: true,
                 },
+                pipeline_guard: None,
             })
             .unwrap();
         drop(mm_tx);

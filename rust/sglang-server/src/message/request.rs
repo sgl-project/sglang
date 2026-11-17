@@ -546,6 +546,10 @@ pub struct Request {
     pub sink: ResponseSink,
     /// Discriminant + variant body (generate vs control).
     pub kind: RequestKind,
+    /// Prefill/Decode pipeline drain guard: follows this request through
+    /// Intake/Tokenizer/MM and into [`SchedulerRequest`] until native
+    /// `recv_requests` hands it to Python. `None` outside P/D serving.
+    pub(crate) pipeline_guard: Option<crate::utils::inflight::InFlight>,
 }
 
 /// One to_scheduler channel entry: the scalar `header` (msgpack; `input_ids`
@@ -556,6 +560,9 @@ pub struct Request {
 pub struct SchedulerRequest {
     pub header: Bytes,
     pub buffers: Vec<Buffer>,
+    /// Moved from [`Request::pipeline_guard`]; dropped when `recv_requests`
+    /// converts this entry for Python.
+    pub(crate) pipeline_guard: Option<crate::utils::inflight::InFlight>,
 }
 
 /// Request variant — selects the request branch, scheduler wire message, and

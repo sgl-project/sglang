@@ -587,6 +587,13 @@ pub struct DeploymentInfo {
     pub node_rank: u32,
     pub nnodes: u32,
     pub dp_size: u32,
+    pub tp_size: u32,
+    /// Owning engine's pipeline stages. Zero means older launch metadata did
+    /// not report it; P/D Shutdown must not assume that means one stage.
+    pub pp_size: u32,
+    /// Private Python launch capability; absent/unknown stays false.
+    pub pd_shutdown_supported: bool,
+    pub pd_role_switch_enabled: bool,
     pub dp_rank: Option<u32>,
     pub dist_init_addr: Option<String>,
     pub base_gpu_id: u32,

@@ -686,11 +686,13 @@ def test_listener_rank_installs_the_sigterm_drain(hosts):
     scheduler = SimpleNamespace(
         _hosts_rust_server=lambda: hosts,
         _holds_rust_drain_end=lambda: False,
+        _pd_drain_scheduler_idle=lambda: True,
         get_rust_server_class=lambda: server_class,
         pause_state=PauseState(),
     )
     with (
         envs.SGLANG_RUST_SERVER.override(True),
+        get_context().override_server_args(disaggregation_mode="null"),
         patch.object(scheduler_module, "RustServerIdleSleeper"),
     ):
         scheduler_module.Scheduler.maybe_init_rust_server(
@@ -707,6 +709,7 @@ def test_listener_rank_installs_the_sigterm_drain(hosts):
         server.install_sigterm_drain.assert_called_once_with(
             notify=rust_server.drain_notify_name("dp-ports-test"),
             hold_drain_end=False,
+            scheduler_idle=None,
         )
     assert scheduler.rust_server is (server if hosts else None)
 

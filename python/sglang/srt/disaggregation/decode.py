@@ -3942,12 +3942,15 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             deadline = decode_req.receive_failed_at + self.deferred_kv_release_timeout
         # Once the deadline passes the answer stays true, so ranks that saw
         # the failure at different times still agree in the waiter's reduction.
-        return (
-            receiver.kv_mgr.is_abort_release_safe(
-                decode_req.req.bootstrap_room, required_acks
-            )
-            or time.monotonic() >= deadline
+        drained = receiver.kv_mgr.is_abort_release_safe(
+            decode_req.req.bootstrap_room, required_acks
         )
+        if drained:
+            return True
+        timed_out = time.monotonic() >= deadline
+        if timed_out:
+            receiver.kv_mgr.mark_shutdown_unquiescent()
+        return timed_out
 
     def _unregister_staging_room(self, room: int) -> None:
         if self.enable_staging and self.staging_handler.is_staging_room(room):
@@ -4026,7 +4029,9 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
         # Each release takes its entry out; a failed one is abandoned, not retried,
         # so the ranks' lists stay the same.
         for decode_req, start_time, idx, room, drained in to_release:
+            manager = decode_req.kv_receiver.kv_mgr
             if not drained:
+                manager.mark_shutdown_unquiescent()
                 logger.warning(
                     f"Deferred KV release for room {room} timed out after "
                     f"{self.deferred_kv_release_timeout}s without a full drain "
@@ -4036,6 +4041,7 @@ class DecodeTransferQueue(DecodeHiCacheTransferMixin):
             try:
                 self._do_release(decode_req, idx)
             except Exception as error:
+                manager.mark_shutdown_unquiescent()
                 # Isolate a failed release so the rest still run.
                 self.scheduler.request_retirer.abandon(decode_req.req, error)
                 outcome = "error"

@@ -29,8 +29,12 @@ impl CoreHandle {
         received: ReceivedAs,
     ) -> Result<CoreCall, CoreError> {
         // Counted from admission, media prefetch included: the drain waits
-        // for it.
+        // for it. Track before the late-P/D latch check so a stale idle report
+        // is invalidated even when this generation is then refused.
         let in_flight = self.inner.drain.track();
+        if self.rejects_late_pd_generation() {
+            return Err(CoreError::Unavailable);
+        }
         let generation = self
             .inner
             .generations
@@ -117,6 +121,9 @@ impl CoreHandle {
             pending.generation.rid == request.rid,
             "the request claims its hold"
         );
+        if self.rejects_late_pd_generation() {
+            return Err(CoreError::Unavailable);
+        }
         self.generate_registered(request, received, pending.generation, pending.in_flight)
             .await
     }
@@ -223,7 +230,11 @@ impl CoreHandle {
         // One refused item refuses the batch before any item is prepared.
         self.validate(&requests)?;
         // Counted from admission, media prefetch included (see `generate`).
+        // Batch tracking precedes the late-P/D latch check.
         let in_flight: Vec<InFlight> = requests.iter().map(|_| self.inner.drain.track()).collect();
+        if self.rejects_late_pd_generation() {
+            return Err(CoreError::Unavailable);
+        }
         let mut generations: Vec<_> = requests
             .iter()
             .map(|request| {
@@ -1704,6 +1715,65 @@ mod tests {
         assert!(ended().await.is_err());
         drop(call);
         assert_eq!(ended().await.ok(), Some(DrainEnd::Drained));
+    }
+
+    /// Prefill/Decode refuses a generation once the drain has latched; unified
+    /// serving still admits on connections the listener is finishing.
+    #[tokio::test]
+    async fn late_pd_generation_after_drain_latch_is_unavailable() {
+        let pd = Harness::pd(8);
+        pd.handle.begin_drain(false);
+        pd.handle.report_scheduler_idle(true);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), pd.handle.drain_ended())
+                .await
+                .ok(),
+            Some(DrainEnd::Drained)
+        );
+        let err = pd
+            .handle
+            .generate(GenerateRequest::default(), ReceivedAs::without_headers())
+            .await
+            .err()
+            .expect("late P/D generation must be refused");
+        assert_eq!(err.kind(), CoreErrorKind::Unavailable);
+
+        let batch = pd
+            .handle
+            .generate_batch(
+                vec![GenerateRequest::default(), GenerateRequest::default()],
+                ReceivedAs::without_headers(),
+            )
+            .await
+            .err()
+            .expect("late P/D batch must be refused after tracking");
+        assert_eq!(batch.kind(), CoreErrorKind::Unavailable);
+        let internal = pd
+            .handle
+            .generate_internal(
+                GenerateRequest::default(),
+                ReceivedAs::without_headers(),
+                false,
+            )
+            .await
+            .err()
+            .expect("an internal health generation cannot enter a closed P/D epoch");
+        assert_eq!(internal.kind(), CoreErrorKind::Unavailable);
+        assert!(pd.intake_rx.try_recv().is_err());
+
+        let unified = Harness::unbounded(8);
+        unified.handle.begin_drain(false);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), unified.handle.drain_ended())
+                .await
+                .ok(),
+            Some(DrainEnd::Drained)
+        );
+        unified
+            .handle
+            .generate(GenerateRequest::default(), ReceivedAs::without_headers())
+            .await
+            .expect("unified serving still admits after the drain latches");
     }
 
     /// An `/abort_request` that ends a call before Intake claims it records

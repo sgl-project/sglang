@@ -7,11 +7,16 @@
 //! probe had failed or the drain was forced (Python's `UnHealthy` and
 //! `SGLANG_FORCE_SHUTDOWN` exits). There is no deadline: like Python, the
 //! orchestrator's kill is the only bound on a drain.
+//!
+//! Prefill/Decode also waits for a fresh scheduler-idle report after the drain
+//! begins (see [`DrainState::report_scheduler_idle`]), so KV handoff and local
+//! PD queues can finish after the frontend in-flight count has already hit
+//! zero. Unified serving keeps the original in-flight-only wait.
 
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
-use tokio::sync::Notify;
+use crate::utils::inflight::{InFlight, InFlightCount};
 
 #[derive(Default)]
 pub(crate) struct DrainState {
@@ -21,13 +26,21 @@ pub(crate) struct DrainState {
     /// The last deep health probe stalled; a later healthy one clears it, as
     /// Python moves `server_status` between `UnHealthy` and `Up`.
     unhealthy: AtomicBool,
-    /// Client generation calls alive (see [`InFlight`]).
-    in_flight: AtomicUsize,
-    /// Latched once a drain is first seen with nothing in flight, so every
-    /// waiter (each listener's shutdown, the close deadline) agrees it ended
-    /// even if a request on a still-open connection is admitted afterwards.
+    /// Client generation / P/D pipeline work alive (see [`InFlight`]).
+    in_flight: Arc<InFlightCount>,
+    /// Prefill/Decode waits for [`Self::report_scheduler_idle`] after begin.
+    requires_scheduler_idle: bool,
+    /// Serialize P/D admission with the compound zero-work/idle close check.
+    /// Independent atomics alone could latch between tracking and validation.
+    admission: Mutex<()>,
+    /// Fresh idle report observed after the drain began (and since the last
+    /// [`Self::track`]); cleared when tracking invalidates a stale report.
+    scheduler_idle: AtomicBool,
+    /// Latched once a drain is first seen with nothing in flight (and, for
+    /// P/D, a fresh scheduler-idle report), so every waiter (each listener's
+    /// shutdown, the close deadline) agrees it ended even if a request on a
+    /// still-open connection is admitted afterwards.
     drained: AtomicBool,
-    changed: Notify,
 }
 
 /// How a drain ended.
@@ -40,31 +53,53 @@ pub(crate) enum DrainEnd {
 }
 
 impl DrainState {
-    /// Count one client request until the guard drops.
+    /// `requires_scheduler_idle` is set for Prefill/Decode serving
+    /// ([`CoreConfig::is_disaggregation`](crate::api_server::handlers::CoreConfig)).
+    pub(crate) fn new(requires_scheduler_idle: bool) -> Self {
+        Self {
+            requires_scheduler_idle,
+            ..Self::default()
+        }
+    }
+
+    /// Count one client request (or P/D pipeline hop) until the guard drops.
+    /// Invalidates any prior scheduler-idle report so a normal P/D drain must
+    /// observe a fresh idle after this work.
     pub(crate) fn track(self: &Arc<Self>) -> InFlight {
-        self.in_flight.fetch_add(1, Ordering::SeqCst);
-        InFlight(self.clone())
+        let _admission = self.admission_guard();
+        self.invalidate_scheduler_idle();
+        self.in_flight.track()
     }
 
     /// Start draining (idempotent); `force` skips the wait for in-flight
-    /// requests.
+    /// requests (and the P/D idle gate).
     pub(crate) fn begin(&self, force: bool) -> bool {
+        let _admission = self.admission_guard();
         if force {
             self.forced.store(true, Ordering::SeqCst);
         }
         let first = !self.draining.swap(true, Ordering::SeqCst);
         if first {
+            // A pre-drain idle report is stale; wait for a fresh one.
+            self.invalidate_scheduler_idle();
             tracing::warn!(
-                in_flight = self.in_flight.load(Ordering::SeqCst),
+                in_flight = self.in_flight.get(),
                 "Drain requested: health now answers 503; draining requests and shutting down"
             );
         }
-        self.changed.notify_waiters();
+        self.in_flight.changed.notify_waiters();
         first
     }
 
     pub(crate) fn is_draining(&self) -> bool {
         self.draining.load(Ordering::SeqCst)
+    }
+
+    /// Whether a normal drain has already latched its end. Prefill/Decode
+    /// refuses later generations once this is set; unified serving still
+    /// admits them on connections the listener is finishing.
+    pub(crate) fn is_latched(&self) -> bool {
+        self.drained.load(Ordering::SeqCst)
     }
 
     /// Whether the drain was begun forced (`SGLANG_FORCE_SHUTDOWN`). A failed
@@ -75,8 +110,39 @@ impl DrainState {
 
     pub(crate) fn set_unhealthy(&self, unhealthy: bool) {
         if self.unhealthy.swap(unhealthy, Ordering::SeqCst) != unhealthy {
-            self.changed.notify_waiters();
+            self.in_flight.changed.notify_waiters();
         }
+    }
+
+    /// Prefill/Decode quiescence: `true` once the scheduler reports fully idle
+    /// after the drain began. Ignored for unified serving and for
+    /// force/unhealthy drains.
+    pub(crate) fn report_scheduler_idle(&self, idle: bool) {
+        if !self.requires_scheduler_idle {
+            return;
+        }
+        let _admission = self.admission_guard();
+        if idle && !self.is_draining() {
+            return;
+        }
+        if self.scheduler_idle.swap(idle, Ordering::SeqCst) != idle {
+            self.in_flight.changed.notify_waiters();
+        }
+    }
+
+    fn invalidate_scheduler_idle(&self) {
+        if self.requires_scheduler_idle {
+            self.scheduler_idle.store(false, Ordering::SeqCst);
+        }
+    }
+
+    fn scheduler_quiesced(&self) -> bool {
+        !self.requires_scheduler_idle || self.scheduler_idle.load(Ordering::SeqCst)
+    }
+
+    fn admission_guard(&self) -> Option<MutexGuard<'_, ()>> {
+        self.requires_scheduler_idle
+            .then(|| self.admission.lock().expect("P/D drain admission lock"))
     }
 
     /// Why a drain skips its wait, in Python's words; `None` if it does not.
@@ -93,15 +159,17 @@ impl DrainState {
     }
 
     fn end(&self) -> Option<DrainEnd> {
+        let _admission = self.admission_guard();
         if !self.is_draining() {
             None
         } else if self.force_reason().is_some() {
             Some(DrainEnd::Forced)
-        } else if self.drained.load(Ordering::SeqCst) || self.in_flight.load(Ordering::SeqCst) == 0
+        } else if self.drained.load(Ordering::SeqCst)
+            || (self.in_flight.get() == 0 && self.scheduler_quiesced())
         {
             // Wake a waiter that checked between the load and this latch.
             if !self.drained.swap(true, Ordering::SeqCst) {
-                self.changed.notify_waiters();
+                self.in_flight.changed.notify_waiters();
             }
             Some(DrainEnd::Drained)
         } else {
@@ -114,7 +182,7 @@ impl DrainState {
         loop {
             // Register before checking, so a change between the check and
             // the await still wakes this waiter.
-            let notified = self.changed.notified();
+            let notified = self.in_flight.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             if let Some(value) = check(self) {
@@ -134,18 +202,6 @@ impl DrainState {
     /// connections the listener is finishing.
     pub(crate) async fn forced(&self) {
         self.wait_until(Self::force_reason).await;
-    }
-}
-
-/// One client request alive, counted for the drain. Health probes are not
-/// counted, matching Python, whose drain never waits for one.
-pub(crate) struct InFlight(Arc<DrainState>);
-
-impl Drop for InFlight {
-    fn drop(&mut self) {
-        if self.0.in_flight.fetch_sub(1, Ordering::SeqCst) == 1 && self.0.is_draining() {
-            self.0.changed.notify_waiters();
-        }
     }
 }
 
@@ -190,6 +246,61 @@ mod tests {
         state.begin(false);
         assert_eq!(settles(state.ended()).await, Some(DrainEnd::Drained));
         let _late = state.track();
+        assert_eq!(settles(state.ended()).await, Some(DrainEnd::Drained));
+    }
+
+    /// Prefill/Decode waits for a fresh idle report after begin; a pre-drain
+    /// idle is ignored, and tracking invalidates a stale report.
+    #[tokio::test]
+    async fn pd_drain_waits_for_fresh_scheduler_idle() {
+        let state = Arc::new(DrainState::new(true));
+        state.report_scheduler_idle(true);
+        state.begin(false);
+        assert_eq!(settles(state.ended()).await, None);
+        state.report_scheduler_idle(true);
+        assert_eq!(settles(state.ended()).await, Some(DrainEnd::Drained));
+        assert!(state.is_latched());
+    }
+
+    #[tokio::test]
+    async fn pd_tracking_invalidates_stale_idle_report() {
+        let state = Arc::new(DrainState::new(true));
+        state.begin(false);
+        state.report_scheduler_idle(true);
+        let _work = state.track();
+        assert_eq!(settles(state.ended()).await, None);
+        drop(_work);
+        assert_eq!(settles(state.ended()).await, None);
+        state.report_scheduler_idle(true);
+        assert_eq!(settles(state.ended()).await, Some(DrainEnd::Drained));
+    }
+
+    #[tokio::test]
+    async fn pd_force_and_unhealthy_bypass_idle_gate() {
+        let forced = Arc::new(DrainState::new(true));
+        let _keep = forced.track();
+        forced.begin(true);
+        assert_eq!(settles(forced.ended()).await, Some(DrainEnd::Forced));
+
+        let unhealthy = Arc::new(DrainState::new(true));
+        let _keep = unhealthy.track();
+        unhealthy.begin(false);
+        unhealthy.set_unhealthy(true);
+        assert_eq!(settles(unhealthy.ended()).await, Some(DrainEnd::Forced));
+    }
+
+    /// An orphan pipeline guard (reader dropped while the request is still on
+    /// the to-scheduler ring) keeps the P/D drain open until it is dropped.
+    #[tokio::test]
+    async fn orphan_pipeline_guard_holds_pd_drain() {
+        let state = Arc::new(DrainState::new(true));
+        state.begin(false);
+        state.report_scheduler_idle(true);
+        let pipeline = state.track();
+        assert_eq!(settles(state.ended()).await, None);
+        drop(pipeline);
+        assert_eq!(settles(state.ended()).await, None);
+        state.report_scheduler_idle(true);
         assert_eq!(settles(state.ended()).await, Some(DrainEnd::Drained));
     }
 }

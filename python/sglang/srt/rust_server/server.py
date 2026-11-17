@@ -22,7 +22,7 @@ import time
 from array import array
 from itertools import chain
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 
 import msgspec
 import orjson
@@ -247,6 +247,10 @@ class RustServer:
         # Set on the scheduler loop's first `drain`, from when the listener's
         # requests are served; the warmups wait for it.
         self._scheduler_loop_started = threading.Event()
+        # Prefill/Decode drain quiescence: optional callable that is true when
+        # the scheduler is fully idle and every request list (including
+        # PD_HELD / DEFERRED) is empty. Unified serving leaves this None.
+        self._scheduler_idle: Optional[Callable[[], bool]] = None
         # The launching process, which `_fail_startup` signals; looked up now,
         # so a failure after it died cannot signal whoever adopted this one.
         self._launcher = psutil.Process().parent()
@@ -632,7 +636,10 @@ class RustServer:
         return NetworkAddress(host, port).to_url()
 
     def install_sigterm_drain(
-        self, notify: Optional[str] = None, hold_drain_end: bool = False
+        self,
+        notify: Optional[str] = None,
+        hold_drain_end: bool = False,
+        scheduler_idle: Optional[Callable[[], bool]] = None,
     ) -> None:
         """Drain this listener on SIGTERM, which the main process forwards
         (``sglang.srt.rust_server.shutdown``), as Python mode's tokenizer
@@ -651,9 +658,14 @@ class RustServer:
         With ``hold_drain_end``, that rank's drain ends only once every
         attention-DP listener has closed too (see :meth:`on_drain_rows`), since
         the ``ShutdownReq`` stops every rank.
+
+        ``scheduler_idle`` is Prefill/Decode only: while draining, :meth:`drain`
+        reports that predicate (fully idle and every request list empty) to the
+        native pre-close gate. Unified serving leaves it ``None``.
         """
         force = envs.SGLANG_FORCE_SHUTDOWN.get()
         self._force_shutdown = force
+        self._scheduler_idle = scheduler_idle
         if hold_drain_end:
             self.server.hold_drain_end()
             self._holds_drain_end = True
@@ -875,6 +887,14 @@ class RustServer:
                 continue
             settle_shm_buffers(buffers, admitted=True)
             out.append(obj)
+        # Prefill/Decode pre-close gate: report idle only while draining, with
+        # an empty poll, a true scheduler_idle callback, and no pending out.
+        # Skip the heavy callback on non-draining iterations.
+        if self._scheduler_idle is not None and (
+            self.server.drain_state() & DRAIN_DRAINING
+        ):
+            idle = not out and self._scheduler_idle()
+            self.server.report_scheduler_idle(idle)
         if (
             self._broadcasts_shutdown
             and not self._shutdown_sent

@@ -188,6 +188,7 @@ mod tests {
         SchedulerRequest {
             header: Bytes::from_static(h),
             buffers: Vec::new(),
+            pipeline_guard: None,
         }
     }
 

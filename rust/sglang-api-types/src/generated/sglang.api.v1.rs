@@ -834,8 +834,10 @@ pub struct HiCacheStorageResponse {
 }
 /// SglangService.Shutdown, tracked in #38075. Disabled unless
 /// SGLANG_ENABLE_NATIVE_SHUTDOWN_RPC=1 and --admin-api-key is configured.
-/// Initial scope: a single-node, single-DP owning runtime whose launcher has
-/// installed the native SIGTERM drain and parent-supervisor notification.
+/// Scope: a single-node, single-DP owning runtime (unified, Prefill, or Decode)
+/// whose launcher has installed the native SIGTERM drain and parent-supervisor
+/// notification. P/D requires TP=DP=PP=1, Mooncake and deferred KV release.
+/// Role switching is excluded. This is per-role support, not cluster shutdown.
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ShutdownRequest {
     /// Required, nonempty, and equal to GetServerInfoResponse.instance_id.

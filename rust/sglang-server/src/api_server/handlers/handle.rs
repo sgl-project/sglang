@@ -213,6 +213,8 @@ impl CoreHandle {
         config: CoreConfig,
     ) -> Self {
         let dp_rank = config.metadata.deployment_info.dp_rank.unwrap_or(0);
+        let pd_shutdown_supported =
+            config.is_disaggregation && config.metadata.deployment_info.pd_shutdown_supported;
         Self {
             inner: Arc::new(CoreInner {
                 intake_tx,
@@ -235,7 +237,7 @@ impl CoreHandle {
                 peer_endpoints: config.peer_endpoints,
                 generate_validator: config.generate_validator,
                 abort_hook: config.abort_hook,
-                drain: Arc::default(),
+                drain: Arc::new(DrainState::new(pd_shutdown_supported)),
                 graceful_close_timeout: OnceLock::new(),
                 peer_abort_permits: tokio::sync::Semaphore::new(PEER_ABORT_MAX_IN_FLIGHT),
                 relayed: AtomicUsize::new(0),
@@ -305,6 +307,12 @@ impl CoreHandle {
         self.inner.drain.begin(force);
     }
 
+    /// Prefill/Decode quiescence signal from the scheduler (see
+    /// [`DrainState::report_scheduler_idle`]). No-op for unified serving.
+    pub(crate) fn report_scheduler_idle(&self, idle: bool) {
+        self.inner.drain.report_scheduler_idle(idle);
+    }
+
     /// Set the graceful-close timeout once, at boot; the first value wins.
     pub(crate) fn set_graceful_close_timeout(&self, timeout: Duration) {
         let _ = self.inner.graceful_close_timeout.set(timeout);
@@ -312,6 +320,15 @@ impl CoreHandle {
 
     pub(crate) fn is_draining(&self) -> bool {
         self.inner.drain.is_draining()
+    }
+
+    /// Whether a Prefill/Decode generation arriving after the drain latched
+    /// must be refused. Unified serving keeps admitting on finishing
+    /// connections.
+    pub(crate) fn rejects_late_pd_generation(&self) -> bool {
+        self.inner.is_disaggregation
+            && self.inner.metadata.deployment_info.pd_shutdown_supported
+            && self.inner.drain.is_latched()
     }
 
     /// Count a request this listener relayed to another DP rank's listener
@@ -385,6 +402,12 @@ impl CoreHandle {
         kind: RequestKind,
         generation: Option<Generation>,
     ) -> Result<RuntimeCall, CoreError> {
+        let pipeline_guard = (self.inner.is_disaggregation
+            && self.inner.metadata.deployment_info.pd_shutdown_supported)
+            .then(|| self.inner.drain.track());
+        if matches!(kind, RequestKind::Generate(_)) && self.rejects_late_pd_generation() {
+            return Err(CoreError::Unavailable);
+        }
         let rid = request_rid(&kind);
         let expected_response = ExpectedResponse::for_request(&kind);
         let (response_tx, response_rx) = mpsc::channel(self.inner.response_capacity);
@@ -411,6 +434,9 @@ impl CoreHandle {
             state: RequestState::Received,
             sink: ResponseSink::Local(response_tx),
             kind,
+            // Second drain guard for P/D: stays alive through Intake/Tokenizer/MM
+            // and the to-scheduler ring until `recv_requests` converts for Python.
+            pipeline_guard,
         };
 
         let sent = tokio::select! {

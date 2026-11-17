@@ -181,6 +181,7 @@ fn request_abort_keeps_the_sink_and_queues_behind_the_request() {
         assert!(request_ring.try_push(SchedulerRequest {
             header: b"request".to_vec().into(),
             buffers: Vec::new(),
+            pipeline_guard: None,
         }));
 
         intake.on_abort(AbortSource::Request("x".into()));
@@ -230,6 +231,7 @@ fn generate_req(id: u64, sampling_params: SamplingParams) -> Request {
             sampling_params,
             ..Default::default()
         })),
+        pipeline_guard: None,
     }
 }
 
@@ -560,6 +562,7 @@ fn detokenize_flows_register_then_decode_and_skips_the_channel() {
             token_ids: vec![7, 8, 9],
             skip_special_tokens: false,
         },
+        pipeline_guard: None,
     });
     assert!(
         matches!(detok_rx.try_recv(), Ok(DetokMsg::Register { rid, .. }) if rid.as_str() == "41"),
@@ -599,6 +602,7 @@ fn detokenize_negative_ids_reject_before_registration() {
             token_ids: vec![1, -1],
             skip_special_tokens: true,
         },
+        pipeline_guard: None,
     });
     let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
         panic!("sink must receive the validation error");
@@ -647,6 +651,7 @@ fn tokenize_goes_to_the_pool_without_detok_registration() {
                 text: "hi".into(),
                 add_special_tokens: false,
             }),
+            pipeline_guard: None,
         });
         if skip_tokenizer_init {
             let Ok(ResponseItem::Error(err)) = rx.try_recv() else {
@@ -729,6 +734,7 @@ fn one_way_control_bypasses_request_ring_capacity() {
     assert!(producer.try_push(SchedulerRequest {
         header: bytes::Bytes::from_static(b"filler"),
         buffers: Vec::new(),
+        pipeline_guard: None,
     }));
     let (tm_tx, tm_rx) = flume::unbounded();
     let (sd_tx, sd_rx) = flume::unbounded::<()>();
@@ -1144,6 +1150,7 @@ fn full_tokenizer_pool_rejects_without_blocking_intake() {
             text: "hi".into(),
             add_special_tokens: false,
         }),
+        pipeline_guard: None,
     };
     // On its own thread, so a blocking hand-off fails the test, not hangs it.
     let (done_tx, done_rx) = std::sync::mpsc::channel();
@@ -1216,6 +1223,7 @@ fn mm_generate_req(rid: &str) -> Request {
             })),
             ..Default::default()
         })),
+        pipeline_guard: None,
     }
 }
 
@@ -1281,6 +1289,41 @@ fn encode_like_worker(req: &mut Request, input_ids: Vec<i64>, buffers: Vec<Buffe
         g.mm_buffers = buffers;
     }
     req.state.apply(Event::EncodeDone).unwrap();
+}
+
+/// A disconnected reader must not erase ownership of a late MM result.
+/// Cancellation releases its guard only on pool return; a successful return
+/// keeps the same guard on the ring until the scheduler receives it.
+#[test]
+fn pd_pipeline_guard_survives_mm_pool_and_scheduler_ring() {
+    use crate::utils::inflight::InFlightCount;
+
+    for cancelled in [false, true] {
+        let (mut intake, _detok_rx, consumer, _tm_tx, mm_rx) = make_intake();
+        let count = std::sync::Arc::new(InFlightCount::default());
+        let mut request = mm_pretokenized_req("pd-mm");
+        request.pipeline_guard = Some(count.track());
+        intake.drive(request);
+        let mut request = mm_rx.try_recv().expect("request entered the MM pool");
+        assert_eq!(count.get(), 1);
+        if cancelled {
+            intake.on_abort(AbortSource::Guard("pd-mm".to_string().into()));
+            assert_eq!(count.get(), 1, "the MM worker still owns the request");
+        }
+        encode_like_worker(&mut request, vec![5, 6], Vec::new());
+        intake.drive(request);
+        let pending = consumer.drain(16);
+        if cancelled {
+            assert!(pending.is_empty());
+            assert_eq!(count.get(), 0);
+        } else {
+            assert_eq!(pending.len(), 1);
+            assert!(pending[0].pipeline_guard.is_some());
+            assert_eq!(count.get(), 1, "the ring still owns the request");
+            drop(pending);
+            assert_eq!(count.get(), 0);
+        }
+    }
 }
 
 /// An abort while the request is out in the mm pool cancels it: the sink is

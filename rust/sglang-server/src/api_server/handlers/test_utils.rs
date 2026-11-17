@@ -14,10 +14,26 @@ pub(super) struct Harness {
 
 impl Harness {
     pub(super) fn unbounded(response_capacity: usize) -> Self {
+        Self::with_disaggregation(response_capacity, false)
+    }
+
+    pub(super) fn pd(response_capacity: usize) -> Self {
+        Self::with_disaggregation(response_capacity, true)
+    }
+
+    fn with_disaggregation(response_capacity: usize, is_disaggregation: bool) -> Self {
         let (intake_tx, intake_rx) = flume::unbounded();
         let (abort_tx, abort_rx) = flume::unbounded();
         Self {
-            handle: test_handle(intake_tx, abort_tx, response_capacity),
+            handle: configured_handle(
+                intake_tx,
+                abort_tx,
+                response_capacity,
+                Default::default(),
+                false,
+                is_disaggregation,
+                Vec::new(),
+            ),
             intake_rx,
             abort_rx,
         }
@@ -61,7 +77,13 @@ pub(super) fn configured_handle(
             multimodal: false,
             metrics: None,
             peer_endpoints: Vec::new(),
-            metadata: CoreMetadata::default(),
+            metadata: CoreMetadata {
+                deployment_info: crate::message::config::DeploymentInfo {
+                    pd_shutdown_supported: is_disaggregation,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
             request_log: None,
             generate_validator: None,
             abort_hook: None,

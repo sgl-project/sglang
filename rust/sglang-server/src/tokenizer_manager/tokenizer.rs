@@ -195,6 +195,7 @@ mod tests {
                     sampling_params: sp,
                     ..Default::default()
                 })),
+                pipeline_guard: None,
             })
             .expect("send");
         drop(req_tx); // closes the loop after one request
@@ -231,6 +232,7 @@ mod tests {
                     token_ids: vec![1, 2],
                     skip_special_tokens: true,
                 },
+                pipeline_guard: None,
             })
             .expect("send");
         drop(req_tx);
@@ -282,6 +284,7 @@ mod tests {
                         chat_prompt,
                         ..Default::default()
                     })),
+                    pipeline_guard: None,
                 })
                 .expect("send");
             drop(req_tx);
@@ -326,6 +329,7 @@ mod tests {
                         text: text.into(),
                         add_special_tokens,
                     }),
+                    pipeline_guard: None,
                 })
                 .expect("send");
             drop(req_tx);

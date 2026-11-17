@@ -230,18 +230,25 @@ impl Server {
 
     /// Non-blocking drain of the to_scheduler channel: one [`IngressRequest`]
     /// per request, its buffers moved out of Rust rather than copied (see the
-    /// type docs for the layout).
+    /// type docs for the layout). Marks the scheduler non-idle first so a P/D
+    /// drain cannot latch on a stale idle report while this poll runs; any
+    /// [`crate::message::request::SchedulerRequest::pipeline_guard`] drops as
+    /// the entry converts.
     #[pyo3(signature = (max = 256))]
     pub fn recv_requests(&self, py: Python<'_>, max: usize) -> PyResult<Vec<IngressRequest>> {
         self.rt
-            .to_scheduler_rx
-            .drain(max)
+            .recv_requests(max)
             .into_iter()
             .map(|req| {
+                let crate::message::request::SchedulerRequest {
+                    header,
+                    buffers,
+                    pipeline_guard,
+                } = req;
+                drop(pipeline_guard);
                 Ok(IngressRequest {
-                    header: PyBytes::new(py, &req.header).unbind(),
-                    buffers: req
-                        .buffers
+                    header: PyBytes::new(py, &header).unbind(),
+                    buffers: buffers
                         .into_iter()
                         .map(|b| buffer_to_py(py, b))
                         .collect::<PyResult<_>>()?,
@@ -340,6 +347,12 @@ impl Server {
     #[pyo3(signature = (force = false))]
     pub fn begin_drain(&self, force: bool) {
         self.rt.begin_drain(force);
+    }
+
+    /// Prefill/Decode scheduler quiescence for the drain's pre-close gate.
+    /// Unified serving ignores this.
+    pub fn report_scheduler_idle(&self, idle: bool) {
+        self.rt.report_scheduler_idle(idle);
     }
 
     /// Python's `--warmups` finished: health may answer 200 once startup

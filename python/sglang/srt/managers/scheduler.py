@@ -390,6 +390,7 @@ from sglang.srt.observability.trace import process_tracing_init, trace_set_threa
 from sglang.srt.parser.reasoning_parser import ReasoningParser
 from sglang.srt.platforms import current_platform
 from sglang.srt.plugins import load_plugins
+from sglang.srt.rust_server.config import _supports_pd_shutdown_drain
 from sglang.srt.rust_server.server import (
     RustServer,
     claim_sigterm_before_compiles,
@@ -2590,6 +2591,19 @@ class Scheduler(
             and get_parallel().attn_cp_rank == 0
         )
 
+    def _pd_drain_scheduler_idle(self) -> bool:
+        """Prefill/Decode drain quiescence: ``is_fully_idle`` plus every
+        request list empty, including lists that idle skips (PD_HELD,
+        DEFERRED) so a held or deferred request cannot close the listener."""
+        if not self.is_fully_idle() or any(self.request_lists().values()):
+            return False
+        queue = (
+            self.disagg_prefill_bootstrap_queue
+            if self.disaggregation_mode == DisaggregationMode.PREFILL
+            else self.disagg_decode_prealloc_queue
+        )
+        return queue is not None and queue.kv_manager.is_shutdown_quiescent()
+
     def maybe_init_rust_server(self, port_args: PortArgs) -> None:
         """Start the embedded Rust server (rank 0) if ``SGLANG_RUST_SERVER`` is
         set, and point the ingress receiver at it. All the plumbing lives in
@@ -2618,9 +2632,13 @@ class Scheduler(
         rust_server = self.get_rust_server_class().launch(
             self, frontend_cpu_share=frontend_cpu_share
         )
+        # Prefill/Decode only: the native drain waits for a fresh idle report
+        # that includes PD_HELD / DEFERRED (is_fully_idle skips those lists).
+        pd_serving = _supports_pd_shutdown_drain()
         rust_server.install_sigterm_drain(
             notify=drain_notify_name(port_args.instance_id),
             hold_drain_end=self._holds_rust_drain_end(),
+            scheduler_idle=self._pd_drain_scheduler_idle if pd_serving else None,
         )
         self.rust_server = rust_server
         # The rust server *is* the ingress source: SchedulerRequestReceiver

@@ -59,11 +59,17 @@ impl GrpcService {
         Self {
             shutdown_admin_key: server_args.api_keys.admin_api_key.clone(),
             shutdown_enabled: environ::env_bool("SGLANG_ENABLE_NATIVE_SHUTDOWN_RPC", false),
+            // P/D adds a local scheduler quiescence proof, not consensus
+            // across PP stages. Unknown PP metadata also fails closed.
             shutdown_topology_supported: server_args.deployment_info.nnodes == 1
                 && server_args.deployment_info.dp_size == 1
                 && !server_args.deployment_info.enable_dp_attention
-                && server_args.disaggregation_mode
-                    == crate::message::config::DisaggregationMode::Null,
+                && !server_args.deployment_info.pd_role_switch_enabled
+                && (server_args.disaggregation_mode
+                    == crate::message::config::DisaggregationMode::Null
+                    || (server_args.deployment_info.tp_size == 1
+                        && server_args.deployment_info.pp_size == 1
+                        && server_args.deployment_info.pd_shutdown_supported)),
             core,
             config: AdapterConfig {
                 preferred_sampling_params: server_args.preferred_sampling_params.clone(),
@@ -163,7 +169,7 @@ impl SglangService for GrpcService {
         }
         if !self.shutdown_topology_supported {
             return Err(Status::unimplemented(
-                "Shutdown currently requires unified single-node single-DP serving",
+                "Shutdown requires static-role single-node single-DP serving; P/D also requires TP=PP=1 and a supported transfer-quiescence configuration",
             ));
         }
         let first = self
@@ -502,6 +508,124 @@ mod tests {
         assert!(!h.service.core.is_draining());
     }
 
+    #[test]
+    fn shutdown_topology_allows_prefill_and_decode_single_node_single_dp() {
+        use crate::message::config::DisaggregationMode;
+
+        let h = Harness::new(1, false, Duration::from_millis(20));
+        let supported = |mode: DisaggregationMode,
+                         nnodes: u32,
+                         dp_size: u32,
+                         dp_attn: bool,
+                         tp_size: u32,
+                         pp_size: u32,
+                         pd_shutdown_supported: bool| {
+            let args = ServerArgs {
+                disaggregation_mode: mode,
+                deployment_info: crate::message::config::DeploymentInfo {
+                    nnodes,
+                    dp_size,
+                    tp_size,
+                    pp_size,
+                    pd_shutdown_supported,
+                    enable_dp_attention: dp_attn,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            GrpcService::new(
+                h.service.core.clone(),
+                &args,
+                std::sync::Arc::new(HiCacheManager::new(h.service.core.clone(), &args)),
+            )
+            .shutdown_topology_supported
+        };
+
+        for mode in [
+            DisaggregationMode::Null,
+            DisaggregationMode::Prefill,
+            DisaggregationMode::Decode,
+        ] {
+            assert!(supported(mode, 1, 1, false, 1, 1, true), "{mode:?}");
+        }
+        assert!(!supported(
+            DisaggregationMode::Prefill,
+            2,
+            1,
+            false,
+            1,
+            1,
+            true
+        ));
+        assert!(!supported(
+            DisaggregationMode::Decode,
+            1,
+            2,
+            false,
+            1,
+            1,
+            true
+        ));
+        assert!(!supported(DisaggregationMode::Null, 1, 1, true, 1, 1, true));
+        for mode in [DisaggregationMode::Prefill, DisaggregationMode::Decode] {
+            assert!(!supported(mode, 1, 1, false, 1, 0, true));
+            assert!(!supported(mode, 1, 1, false, 1, 2, true));
+            assert!(!supported(mode, 1, 1, false, 0, 1, true));
+            assert!(!supported(mode, 1, 1, false, 2, 1, true));
+            assert!(!supported(mode, 1, 1, false, 1, 1, false));
+        }
+        assert!(supported(
+            DisaggregationMode::Null,
+            1,
+            1,
+            false,
+            0,
+            0,
+            false
+        ));
+        assert!(supported(
+            DisaggregationMode::Null,
+            1,
+            1,
+            false,
+            2,
+            2,
+            false
+        ));
+    }
+
+    #[test]
+    fn shutdown_rejects_mutable_roles_including_unified_launches() {
+        use crate::message::config::DisaggregationMode;
+
+        let h = Harness::new(1, false, Duration::from_millis(20));
+        for mode in [
+            DisaggregationMode::Null,
+            DisaggregationMode::Prefill,
+            DisaggregationMode::Decode,
+        ] {
+            let args = ServerArgs {
+                disaggregation_mode: mode,
+                deployment_info: crate::message::config::DeploymentInfo {
+                    nnodes: 1,
+                    dp_size: 1,
+                    tp_size: 1,
+                    pp_size: 1,
+                    pd_shutdown_supported: true,
+                    pd_role_switch_enabled: true,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let service = GrpcService::new(
+                h.service.core.clone(),
+                &args,
+                Arc::new(HiCacheManager::new(h.service.core.clone(), &args)),
+            );
+            assert!(!service.shutdown_topology_supported, "{mode:?}");
+        }
+    }
+
     struct GenerationIntake {
         request: Box<GenerateRequest>,
         rid: Rid,
@@ -570,6 +694,7 @@ mod tests {
                 sink,
                 kind,
                 state: _,
+                pipeline_guard: _,
             } = request;
             let RequestKind::Generate(request) = kind else {
                 panic!("expected generation request");
