@@ -13,7 +13,7 @@ from sglang.multimodal_gen.test.server.test_server_ovis_image import (
 from sglang.test.ci.ci_register import register_cuda_ci
 from sglang.test.test_utils import CustomTestCase, terminate_and_kill_process_tree
 
-register_cuda_ci(est_time=300, stage="base-b", runner_config="diffusion-1-gpu-b200")
+register_cuda_ci(est_time=300, stage="base-b-diffusion", runner_config="1-gpu-b200")
 
 
 class TestOvisImageHTTP(CustomTestCase):
