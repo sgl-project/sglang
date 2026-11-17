@@ -402,7 +402,7 @@ export const config = {
       nnodes: 1,
       verified: true,
       warn: "Verified on VR200 with --context-length 131072; longer contexts have not been run on Vera Rubin yet.",
-      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096", "SGLANG_OPT_INKLING2_MEGA_MOE_MIN_TOKENS=192"],
+      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
@@ -425,7 +425,7 @@ export const config = {
       nnodes: 1,
       verified: true,
       warn: "Verified on VR200 with --context-length 131072; longer contexts have not been run on Vera Rubin yet.",
-      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096", "SGLANG_OPT_INKLING2_MEGA_MOE_MIN_TOKENS=192"],
+      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
@@ -638,7 +638,7 @@ export const config = {
       nnodes: 1,
       verificationStatus: "in-progress",
       warn: "Same flags as the NVFP4 Vera Rubin recipe, which was verified with --context-length 131072; longer contexts have not been run on Vera Rubin yet.",
-      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096", "SGLANG_OPT_INKLING2_MEGA_MOE_MIN_TOKENS=192"],
+      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
@@ -661,7 +661,7 @@ export const config = {
       nnodes: 1,
       verificationStatus: "in-progress",
       warn: "Same flags as the NVFP4 Vera Rubin recipe, which was verified with --context-length 131072; longer contexts have not been run on Vera Rubin yet.",
-      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096", "SGLANG_OPT_INKLING2_MEGA_MOE_MIN_TOKENS=192"],
+      env: ["SGLANG_OPT_DEEPGEMM_MEGA_MOE_NUM_MAX_TOKENS_PER_RANK=4096"],
       flags: [
         "--model-path {{MODEL_NAME}}",
         "--tp 4",
