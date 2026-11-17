@@ -137,6 +137,13 @@ RUST_SERVER_UNSUPPORTED_ARGS = (
     "fastapi_root_path",
     "enable_http_worker_reuseport",
     "enable_encoder_swa_bounded_replay",
+    "mm_io_worker_num",
+    "disable_tokenizer_batch_decode",
+    "enable_tokenizer_batch_encode",
+    "enable_dynamic_batch_tokenizer",
+    "dynamic_batch_tokenizer_batch_size",
+    "dynamic_batch_tokenizer_batch_timeout",
+    "batch_notify_size",
     "enable_custom_logit_processor",
     "enable_return_routed_experts",
     "enable_lora",
@@ -168,6 +175,11 @@ RUST_SERVER_UNSUPPORTED_ENVS = (
     "SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS",
     "SGLANG_INKLING_DEFAULT_REASONING_EFFORT",
     "SGLANG_ENABLE_RESPONSE_TEMPLATE_TURN_GRAMMAR",
+    "SGLANG_DETOKENIZER_MAX_STATES",
+    "SGLANG_USE_IPC_POOL_HANDLE_CACHE",
+    "SGLANG_REQUEST_STATE_WAIT_TIMEOUT",
+    "SGLANG_MM_AVOID_RETOKENIZE",
+    "SGLANG_BATCH_TOKENIZER_OUTPUTS",
 )
 
 
