@@ -85,3 +85,9 @@ class Device(msgspec.Struct):
         Optional[List[int]],
         "Set the garbage collection thresholds (the collection frequency). Accepts 1 to 3 integers.",
     ] = None
+    gc_freeze_on_idle_secs: A[
+        float,
+        "After the scheduler has been idle this many seconds, run a full garbage collection "
+        "and freeze the surviving objects, so later collections do not scan them. Runs once per "
+        "idle period. Set to 0 to disable.",
+    ] = 0.0

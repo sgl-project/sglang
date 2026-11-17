@@ -496,6 +496,8 @@ def check_server_args(server_args: Any):
             raise ValueError(
                 "When setting gc_threshold, it must contain 1 to 3 integers."
             )
+    if cfg.gc_freeze_on_idle_secs < 0:
+        raise ValueError("--gc-freeze-on-idle-secs must be >= 0.")
 
     if cfg.kv_canary_sweep_interval > 0 and cfg.kv_canary == "none":
         raise ValueError(

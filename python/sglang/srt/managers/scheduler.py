@@ -273,6 +273,7 @@ from sglang.srt.managers.scheduler_components.dynamic_chunk_sizer import (
 )
 from sglang.srt.managers.scheduler_components.exit_ledger import record_send
 from sglang.srt.managers.scheduler_components.flush_wrapper import SchedulerFlushWrapper
+from sglang.srt.managers.scheduler_components.idle_gc_freezer import IdleGCFreezer
 from sglang.srt.managers.scheduler_components.idle_sleeper import (
     IdleSleeper,
     RustServerIdleSleeper,
@@ -615,6 +616,7 @@ class Scheduler(
         # Init inter-process communication
         self.init_ipc_channels(port_args)
         self.init_idle_sleeper()
+        self.maybe_init_idle_gc_freezer()
 
         # Init tokenizer
         self.init_tokenizer()
@@ -937,6 +939,11 @@ class Scheduler(
             )
         else:
             self.idle_sleeper = None
+
+    def maybe_init_idle_gc_freezer(self) -> None:
+        """Freeze the GC heap after an idle period, when --gc-freeze-on-idle-secs is set."""
+        idle_secs = get_device().gc_freeze_on_idle_secs
+        self.idle_gc_freezer = IdleGCFreezer(idle_secs) if idle_secs > 0 else None
 
     def publish_load_snapshot(self, force: bool = False):
         """Returns the LoadSnapshot it published, or None when disabled,
@@ -6043,6 +6050,9 @@ class Scheduler(
         self.load_publisher.publish_load_stat(
             self.load_inquirer.get_loads, force=True, snapshot=snapshot
         )
+
+        if self.idle_gc_freezer is not None:
+            self.idle_gc_freezer.on_idle(forward_ct=self.forward_ct)
 
         if self.deferred_responses.has_pending():
             # Held responses are released by polling, not by a socket event:

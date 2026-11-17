@@ -157,6 +157,7 @@ class TestAsyncShmIdleAccounting(CustomTestCase):
         scheduler.kv_events_publisher = MagicMock()
         scheduler.new_token_ratio_tracker = MagicMock()
         scheduler.idle_sleeper = MagicMock()
+        scheduler.idle_gc_freezer = None
         return scheduler
 
     def test_async_shm_entries_block_idle_until_drained(self):
