@@ -12,9 +12,9 @@ from sglang.srt.layers.dp_attention import (
     attn_tp_all_reduce,
     is_dp_attention_enabled,
 )
+from sglang.srt.layers.utils.common import set_weight_attrs
 from sglang.srt.model_loader.weight_utils import sharded_weight_loader
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils.common import set_weight_attrs
 
 
 class Mixer2RMSNormGated(BaseFusedOp):

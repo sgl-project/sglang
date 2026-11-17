@@ -21,6 +21,7 @@ from sglang.multimodal_gen.runtime.disaggregation.roles import RoleType
 from sglang.multimodal_gen.runtime.entrypoints.openai import utils as openai_utils
 from sglang.multimodal_gen.runtime.entrypoints.openai import video_api, video_progress
 from sglang.multimodal_gen.runtime.entrypoints.openai.stores import AsyncDictStore
+from sglang.multimodal_gen.runtime.entrypoints.openai.utils import select_output_variant
 from sglang.multimodal_gen.runtime.managers import progress_reporter
 from sglang.multimodal_gen.runtime.managers.progress_reporter import (
     ProgressReporter,
@@ -369,7 +370,7 @@ def test_temp_output_uploads_every_variant(monkeypatch, tmp_path):
     assert job["url"] == "s3://video_0.mp4"
     assert job["urls"] == ["s3://video_0.mp4", "s3://video_1.mp4"]
     assert job["file_path"] is None and job["file_paths"] is None
-    assert video_api._select_video_variant_url(job, "1") == "s3://video_1.mp4"
+    assert select_output_variant(job, "1", "urls", "url") == "s3://video_1.mp4"
 
 
 def test_persistent_output_reports_only_local_files(monkeypatch, tmp_path):
@@ -384,8 +385,8 @@ def test_persistent_output_reports_only_local_files(monkeypatch, tmp_path):
     assert job["file_path"] is None
     assert job["file_paths"] == [None, paths[1]]
     assert os.path.exists(paths[1])
-    assert video_api._select_video_variant_url(job, "1") is None
-    assert video_api._select_video_variant_path(job, "1") == paths[1]
+    assert select_output_variant(job, "1", "urls", "url") is None
+    assert select_output_variant(job, "1", "file_paths", "file_path") == paths[1]
 
 
 def test_content_variant_serves_lidar_artifacts_by_key(tmp_path):
@@ -408,8 +409,8 @@ def test_content_variant_serves_lidar_artifacts_by_key(tmp_path):
         video_api._select_lidar_artifact_path({"file_paths": [str(video)]}, "rangemap")
         is None
     )
-    assert video_api._select_video_variant_path(job, None) == str(video)
-    assert video_api._select_video_variant_path(job, "rangemap") is None
+    assert select_output_variant(job, None, "file_paths", "file_path") == str(video)
+    assert select_output_variant(job, "rangemap", "file_paths", "file_path") is None
     assert video_api._ARTIFACT_MEDIA_TYPES[".safetensors"] == "application/octet-stream"
 
 

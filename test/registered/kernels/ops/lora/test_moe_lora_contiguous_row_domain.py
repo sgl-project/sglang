@@ -21,6 +21,11 @@ from sglang.srt.lora.moe.quant_info import MoeLoraBf16QuantInfo
 from sglang.srt.lora.utils import Phase
 from sglang.srt.runtime_context import get_context
 from sglang.test.ci.ci_register import register_cuda_ci
+from sglang.test.kernels.moe_lora import (
+    cutedsl_ready,
+    make_token_lora_mapping,
+    standalone_output_allocation,
+)
 
 register_cuda_ci(est_time=25, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 # Also exercise the Blackwell implementation in per-PR CI.
@@ -88,19 +93,8 @@ triton_cuda_only = pytest.mark.skipif(
 )
 
 
-def _cutedsl_ready() -> bool:
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (9, 0):
-        return False
-    try:
-        import cuda.bindings.driver  # noqa: F401
-        import cutlass  # noqa: F401
-    except Exception:
-        return False
-    return True
-
-
 cutedsl_cuda_only = pytest.mark.skipif(
-    not _cutedsl_ready(),
+    not cutedsl_ready(),
     reason="the vendor oracle runs the CuTeDSL providers against Triton",
 )
 
@@ -258,24 +252,6 @@ def _make_gpu_tensors(
     return {name: tensor.to(device) for name, tensor in tensors.items()}
 
 
-def _token_lora_mapping(traffic: str, num_tokens: int) -> torch.Tensor:
-    if traffic == "active":
-        return torch.zeros(num_tokens, dtype=torch.int32)
-    if traffic == "mixed":
-        pattern = torch.tensor([0, -1, -1, 0, -1, -1], dtype=torch.int32)
-        return pattern.repeat((num_tokens + pattern.numel() - 1) // pattern.numel())[
-            :num_tokens
-        ].contiguous()
-    if traffic == "base_only":
-        return torch.full((num_tokens,), -1, dtype=torch.int32)
-    raise AssertionError(f"unknown traffic pattern {traffic}")
-
-
-def _standalone_output_allocation(runner, *, num_tokens, dtype, device):
-    """Allocate the output with the eager shape and no tensor-parallel group."""
-    return torch.empty((num_tokens, runner.hidden_size), dtype=dtype, device=device)
-
-
 def _build_runner(choice, vendor: str, gpu, num_experts):
     from sglang.srt.lora.moe.runner import MoeLoraRunner
 
@@ -364,9 +340,7 @@ def test_cutedsl_matches_triton_in_eager_and_cuda_graph(
     from sglang.srt.lora.moe.runner import MoeLoraRunner
 
     device = torch.device("cuda")
-    monkeypatch.setattr(
-        MoeLoraRunner, "_allocate_output", _standalone_output_allocation
-    )
+    monkeypatch.setattr(MoeLoraRunner, "_allocate_output", standalone_output_allocation)
     num_tokens, num_experts = 64, 16
     choice = _menu(architecture, layout)[fragment]
     gpu = _make_gpu_tensors(num_tokens, num_experts, device, shared=layout)
@@ -378,7 +352,7 @@ def test_cutedsl_matches_triton_in_eager_and_cuda_graph(
     for traffic in ("active", "mixed", "base_only"):
         triton.workspace.routes.clear()
         cutedsl.workspace.routes.clear()
-        token_lora_mapping = _token_lora_mapping(traffic, num_tokens).to(device)
+        token_lora_mapping = make_token_lora_mapping(traffic, num_tokens).to(device)
         reference = _run_once(triton, gpu, token_lora_mapping).hidden_states
         actual = _run_once(cutedsl, gpu, token_lora_mapping).hidden_states
         outputs[traffic] = actual
@@ -394,7 +368,7 @@ def test_cutedsl_matches_triton_in_eager_and_cuda_graph(
     # The vendor under test must apply the LoRA math.
     assert (outputs["active"] - outputs["base_only"]).abs().max().item() > 0.02
 
-    token_lora_mapping = _token_lora_mapping("active", num_tokens).to(device)
+    token_lora_mapping = make_token_lora_mapping("active", num_tokens).to(device)
 
     # The workspace keys scratch by stream: warm up on the capture stream.
     stream = torch.cuda.Stream()
