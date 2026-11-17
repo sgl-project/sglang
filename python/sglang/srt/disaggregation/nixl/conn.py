@@ -1552,7 +1552,7 @@ class NixlKVManager(StagingManagerMixin, CommonKVManager):
         whose single-layer buffer happens to have the same entry size.
         """
         layout = self._unified_wire_layout()
-        remote_layout = getattr(peer_info, "dst_unified_layout", None)
+        remote_layout = peer_info.dst_unified_layout
         if layout is None and remote_layout is None:
             return
         if layout != remote_layout:
