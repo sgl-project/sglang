@@ -84,7 +84,9 @@ class CompressedTensorsW4AFP8MoE(CompressedTensorsMoEScheme):
         input_quant,
     ):
         self.quant_config = quant_config
-        config = self.quant_config.target_scheme_map["Linear"].get("weights")
+        # A config that targets the experts by name or regex has no "Linear" group.
+        linear_scheme = self.quant_config.target_scheme_map.get("Linear")
+        config = linear_scheme.get("weights") if linear_scheme else weight_quant
         self.num_bits = config.num_bits
         self.packed_factor = 32 // config.num_bits
         self.group_size = config.group_size

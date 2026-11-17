@@ -1,7 +1,6 @@
 import logging
 import re
 from array import array
-from functools import lru_cache
 from typing import Iterable, List, Optional, Set, Tuple, Union
 
 import torch
@@ -15,7 +14,6 @@ from transformers import (
 )
 from transformers.models.auto.modeling_auto import AutoModel
 
-from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -37,8 +35,6 @@ from sglang.srt.multimodal.modality import Modality
 from sglang.srt.utils import flatten_nested_list
 
 logger = logging.getLogger(__name__)
-
-cached_get_processor = lru_cache(get_processor)
 
 
 class Gemma3nMultimodalEmbedder(nn.Module):
@@ -170,10 +166,6 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
         "gate_up_proj",
         "down_proj",
     ]
-    # Gemma does not apply LoRA to the embedding layer
-    embedding_modules = {}
-    embedding_padding_modules = []
-    supports_lora = True
 
     def __init__(
         self,
@@ -368,20 +360,6 @@ class Gemma3nForConditionalGeneration(PreTrainedModel):
                 device=next(self.parameters()).device,
                 dtype=self.language_model.dtype(),
             )
-
-    def get_per_layer_inputs(
-        self, input_ids: torch.LongTensor
-    ) -> Optional[torch.Tensor]:
-        return self.language_model.get_per_layer_inputs(input_ids)
-
-    def project_per_layer_inputs(
-        self,
-        inputs_embeds: torch.Tensor,
-        per_layer_inputs: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        return self.language_model.project_per_layer_inputs(
-            inputs_embeds, per_layer_inputs
-        )
 
     @torch.no_grad()
     def forward(

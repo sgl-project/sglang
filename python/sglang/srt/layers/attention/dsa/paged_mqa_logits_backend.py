@@ -11,9 +11,6 @@ class DSAPagedMQALogitsBackend(Enum):
     CUTEDSL = "cutedsl"
     AITER = "aiter"
 
-    def is_deepgemm(self) -> bool:
-        return self == DSAPagedMQALogitsBackend.DEEPGEMM
-
     def is_cutedsl(self) -> bool:
         return self == DSAPagedMQALogitsBackend.CUTEDSL
 

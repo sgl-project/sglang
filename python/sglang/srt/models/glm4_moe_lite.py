@@ -14,7 +14,6 @@
 
 """Inference-only GLM-4.7-Flash model compatible with HuggingFace weights."""
 
-import logging
 import re
 from typing import Iterable, List, Optional, Tuple, Union
 
@@ -93,7 +92,6 @@ from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import BumpAllocator, LazyValue, is_npu
 
-logger = logging.getLogger(__name__)
 _is_npu = is_npu()
 
 
@@ -154,10 +152,8 @@ class Glm4MoeLiteGate(nn.Module):
         self,
         config,
         prefix: str = "",
-        is_nextn: bool = False,
     ):
         super().__init__()
-        self.is_nextn = is_nextn
         self.weight = nn.Parameter(
             torch.empty(
                 (config.n_routed_experts, config.hidden_size), dtype=torch.float32
@@ -180,7 +176,6 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
         alt_stream: Optional[torch.cuda.Stream] = None,
-        is_nextn: bool = False,
     ):
         super().__init__()
         self.tp_size = get_parallel().tp_size
@@ -190,7 +185,6 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         self.config = config
         self.layer_id = layer_id
         self.alt_stream = alt_stream
-        self.is_nextn = is_nextn
 
         if self.tp_size > config.n_routed_experts:
             raise ValueError(
@@ -204,9 +198,7 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
                 "Only silu is supported for now."
             )
 
-        self.gate = Glm4MoeLiteGate(
-            config=config, prefix=add_prefix("gate", prefix), is_nextn=is_nextn
-        )
+        self.gate = Glm4MoeLiteGate(config=config, prefix=add_prefix("gate", prefix))
 
         self.experts = get_moe_impl_class(quant_config)(
             num_experts=config.n_routed_experts
@@ -240,7 +232,6 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
         )
         self.topk.bind_runner_backend(self.experts.runner_backend)
 
-        self.shared_experts_is_int8 = False
         self.shared_experts_is_fp8 = False
         self.shared_experts_weight_block_size = None
         self._shared_expert_tp1 = False
@@ -263,10 +254,6 @@ class Glm4MoeLiteSparseMoeBlock(nn.Module):
             )
             is_packed_weight = hasattr(
                 self.shared_experts.gate_up_proj.quant_method, "quant_config"
-            )
-            self.shared_experts_is_int8 = (
-                not is_packed_weight
-                and self.shared_experts.gate_up_proj.weight.dtype == torch.int8
             )
             self.shared_experts_is_fp8 = (
                 not is_packed_weight
@@ -459,7 +446,6 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
                 prefix=add_prefix("mlp", prefix),
                 layer_id=self.layer_id,
                 alt_stream=alt_stream,
-                is_nextn=is_nextn,
             )
         else:
             mlp_parallel_group = "replicated" if is_dense_ffn_fully_dp() else "tp"
@@ -542,7 +528,7 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.prepare(
             hidden_states,
             forward_batch,
-            quant_format=getattr(self, "_gfx95_quant_format", ""),
+            quant_format=self._gfx95_quant_format,
             capture=capture_output,
         )
 
@@ -567,8 +553,6 @@ class Glm4MoeLiteDecoderLayer(nn.Module):
 
 
 class Glm4MoeLiteModel(nn.Module):
-    fall_back_to_pt_during_load = False
-
     def __init__(
         self,
         config: PretrainedConfig,
@@ -954,10 +938,7 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         if params_dict is None:
             params_dict = dict(self.named_parameters())
 
-        weight_names = []
         for name, loaded_weight in weights:
-            weight_names.append(name)
-
             if not is_nextn:
                 if hasattr(self.config, "num_nextn_predict_layers"):
                     num_nextn_layers = self.config.num_nextn_predict_layers
@@ -1100,24 +1081,16 @@ class Glm4MoeLiteForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
                             "k_scale" in name or "v_scale" in name
                         ) and name not in params_dict:
                             # modelopt attn kv scale is named differently
-                            if any(scale in name for scale in ["k_scale", "v_scale"]):
-                                name = name.replace("_proj", "attn_mqa")
-                            else:
-                                logger.warning(
-                                    f"Unknown scale found in checkpoint: {name}"
-                                )
+                            name = name.replace("_proj", "attn_mqa")
 
                     if name not in params_dict:
                         continue
 
-                    if name in params_dict.keys():
-                        param = params_dict[name]
-                        weight_loader = getattr(
-                            param, "weight_loader", default_weight_loader
-                        )
-                        weight_loader(param, loaded_weight)
-                    else:
-                        logger.warning(f"Parameter {name} not found in params_dict")
+                    param = params_dict[name]
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
+                    weight_loader(param, loaded_weight)
 
         # DeepseekV2AttentionMLA.forward_* expects post_load_weights() to populate
         # per-layer packed weights like `w_kc`/`w_vc` (used during CUDA graph capture).

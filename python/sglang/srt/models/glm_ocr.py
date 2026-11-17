@@ -18,7 +18,6 @@
 """Inference-only GLM-OCR model compatible with HuggingFace weights."""
 
 import logging
-from functools import lru_cache
 from typing import Iterable, Optional, Tuple
 
 import torch
@@ -29,7 +28,6 @@ from transformers.models.glm_ocr.configuration_glm_ocr import (
     GlmOcrVisionConfig,
 )
 
-from sglang.srt.hf_transformers import get_processor
 from sglang.srt.layers.attention import vision_utils
 from sglang.srt.layers.attention.vision import (
     VisionAttention,
@@ -58,8 +56,6 @@ from sglang.srt.models.glm4v import (
 from sglang.srt.runtime_context import get_mm, get_parallel
 
 logger = logging.getLogger(__name__)
-
-cached_get_processor = lru_cache(get_processor)
 
 
 class GlmOcrRMSNorm(Glm4vRMSNorm):
@@ -432,18 +428,14 @@ class GlmOcrForConditionalGeneration(Glm4vForConditionalGeneration):
                     # adapt to VisionAttention
                     name = name.replace(r"attn.qkv.", r"attn.qkv_proj.")
 
-                try:
-                    # Skip loading extra bias for GPTQ models.
-                    if name.endswith(".bias") and name not in params_dict:
-                        continue
+                # Skip loading extra bias for GPTQ models.
+                if name.endswith(".bias") and name not in params_dict:
+                    continue
 
-                    if name not in params_dict:
-                        continue
+                if name not in params_dict:
+                    continue
 
-                    param = params_dict[name]
-                except KeyError:
-                    print(params_dict.keys())
-                    raise
+                param = params_dict[name]
 
                 weight_loader = getattr(param, "weight_loader", default_weight_loader)
                 if "visual" in name:

@@ -54,13 +54,9 @@ from sglang.srt.layers.linear import (
     RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
-from sglang.srt.layers.moe import (
-    get_deepep_mode,
-    get_moe_a2a_backend,
-)
+from sglang.srt.layers.moe import get_moe_a2a_backend
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
 from sglang.srt.layers.moe.fused_moe_triton.layer import FusedMoE
-from sglang.srt.layers.moe.token_dispatcher import DeepEPDispatcher
 from sglang.srt.layers.moe.topk import (
     StandardTopKOutput,
     TopK,
@@ -88,7 +84,6 @@ from sglang.srt.models.utils import (
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import LazyValue, is_cuda, is_npu
 
-LoraConfig = None
 logger = logging.getLogger(__name__)
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -637,7 +632,6 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
             renormalize=self.norm_topk_prob,
             use_grouped_topk=self.use_grouped_topk,
             num_expert_group=self.num_expert_group,
-            # num_fused_shared_experts=self.num_fused_shared_experts,
             topk_group=self.topk_group,
             correction_bias=self.correction_bias,
             scoring_func=self.score_function,
@@ -684,20 +678,6 @@ class LLaDA2MoeSparseMoeBlock(nn.Module):
                     or get_moe_a2a_backend().is_ascend_ops()
                 )
                 else "tp",
-            )
-        # dispatcher
-        if get_moe_a2a_backend().is_deepep():
-            self.deepep_dispatcher = DeepEPDispatcher(
-                group=get_parallel().tp_group.device_group,
-                router_topk=self.top_k,
-                permute_fusion=True,
-                num_experts=self.num_experts,
-                num_local_experts=config.num_experts // self.tp_size,
-                hidden_size=config.hidden_size,
-                params_dtype=config.torch_dtype,
-                deepep_mode=get_deepep_mode(),
-                async_finish=True,  # TODO
-                return_recv_hook=True,
             )
 
     def forward(
@@ -1160,8 +1140,6 @@ class LLaDA2MoeModel(nn.Module):
         else:
             self.word_embeddings = PPMissingLayer()
 
-        self.embedding_dropout = torch.nn.Dropout(config.embedding_dropout)
-
         self.layers, self.start_layer, self.end_layer = make_pp_layers(
             config.num_hidden_layers,
             lambda idx, prefix: LLaDA2MoeBlock(
@@ -1364,8 +1342,6 @@ class LLaDA2MoeModelLM(nn.Module):
                 and self.config.norm_head
                 and "lm_head.weight" in name
             ):
-                import torch.nn.functional as F
-
                 loaded_weight = F.normalize(loaded_weight, dim=0, p=2, eps=1e-7)
 
             for param_name, weight_name, shard_id in stacked_params_mapping:

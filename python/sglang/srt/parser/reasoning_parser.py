@@ -1692,7 +1692,6 @@ class Apertus2509Detector(BaseReasoningFormatDetector):
             previous_content=previous_content,
             force_nonempty_content=force_nonempty_content,
         )
-        self._force_reasoning = force_reasoning
         self._tool_start_token = "<|tools_prefix|>["
         self._tool_end_token = "<|tools_suffix|>"
         self._reasoning_acc: str = ""

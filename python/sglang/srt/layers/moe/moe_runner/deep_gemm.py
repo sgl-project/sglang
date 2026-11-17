@@ -43,7 +43,6 @@ from sglang.srt.runtime_context import (
 from sglang.srt.utils import (
     ceil_div,
     dispose_tensor,
-    get_bool_env_var,
     is_cuda,
     is_hip,
     is_musa,
@@ -72,7 +71,6 @@ if TYPE_CHECKING:
 _is_hip = is_hip()
 _is_npu = is_npu()
 _is_cuda = is_cuda()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_musa = is_musa()
 
 
@@ -427,7 +425,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         hidden_states_scale = runner_input.hidden_states_scale
         all_tokens = running_state["all_tokens"]
         hidden_states_device = running_state["hidden_states_device"]
-        hidden_states_dtype = running_state["hidden_states_dtype"]
         hidden_states_shape = running_state["hidden_states_shape"]
         m_indices = runner_input.m_indices
         trace_deepep_v2_contig = (
@@ -733,8 +730,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         quant_info: DeepGemmMoeQuantInfo,
         running_state: dict,
     ) -> torch.Tensor:
-        from sglang.srt.layers import deep_gemm_wrapper
-
         hidden_states = runner_input.hidden_states
         hidden_states_scale = runner_input.hidden_states_scale
         masked_m = runner_input.masked_m
@@ -938,7 +933,6 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         running_state: dict,
     ) -> torch.Tensor:
         from sglang.kernels.ops.moe.ep_moe_kernels import silu_and_mul_masked_fwd
-        from sglang.srt.layers import deep_gemm_wrapper
 
         hidden_states = runner_input.hidden_states
         masked_m = runner_input.masked_m
@@ -1024,12 +1018,7 @@ def pre_permute_standard_to_deep_gemm(
     topk_weights, topk_ids, _ = topk_output
     # SM120's DeepGEMM grouped GEMM consumes standard-layout activations only.
     # Feeding it the shared masked/swizzled layout does not raise -- it silently
-    # returns wrong results (GSM8K 0.96 -> 0.06, measured on 4x RTX 6000D), so
-    # refuse the combination rather than corrupt output.
-    assert deep_gemm_sm120.is_supported(), (
-        "--moe-runner-backend deep_gemm on consumer Blackwell (SM120) requires "
-        "the standard-layout MoE path, which is unavailable in this build."
-    )
+    # returns wrong results (GSM8K 0.96 -> 0.06, measured on 4x RTX 6000D).
     sm120_input = deep_gemm_sm120.maybe_pre_permute(
         hidden_states, topk_ids, topk_weights, quant_info, runner_config, running_state
     )
@@ -1040,8 +1029,6 @@ def pre_permute_standard_to_deep_gemm(
     hidden_states_dtype = hidden_states.dtype
     hidden_states_device = hidden_states.device
     hidden_states_ref = hidden_states
-
-    topk_weights, topk_ids = topk_weights, topk_ids
 
     if (
         deep_gemm_sm120.allows_masked_standard_layout()

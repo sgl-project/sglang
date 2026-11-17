@@ -20,10 +20,10 @@ The two ``cp_lse_ag_out_rs`` variants are kept distinct (``_mha`` torch/all-redu
 ``_mla`` Triton/reduce-scatter) because their bodies are backend-forced.
 
 Only the symbols imported by code OUTSIDE this subpackage are re-exported here.
-Package-internal helpers (the @triton.jit kernels, ``CPTritonContext``,
-``correct_attn_out``, ``create_dcp_kv_indices``, ``update_kv_lens_and_indices``,
-``_all_gather_dcp_kv_cache``) stay private to their submodules — import them from
-``sglang.srt.layers.dcp.{kernels,comm}`` if ever needed internally."""
+The other helpers stay in their defining modules: the @triton.jit kernels,
+``CPTritonContext``, ``correct_attn_out``, ``create_dcp_kv_indices`` and
+``update_kv_lens_and_indices`` in ``sglang.kernels.ops.attention.dcp_kernels``,
+``_all_gather_dcp_kv_cache`` in ``sglang.srt.layers.dcp.comm``."""
 
 from sglang.kernels.ops.attention.dcp_kernels import (
     create_triton_kv_indices_for_dcp_triton,
@@ -49,13 +49,9 @@ from sglang.srt.layers.dcp.layout import (
 )
 from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
 
-# NOTE: planner.py is intentionally NOT imported here. It depends on server_args
-# (get_server_args), whereas this package-init executes at module-load time
-# for every eager importer of the DCP primitives — triton_backend,
-# mem_cache.memory_pool, mem_cache.triton_ops.mla_buffer, mem_cache.kv_cache_builder,
-# the FlashInfer-MLA / FlashMLA backends, and the deepseek forward methods. Keeping
-# the init server_args-free avoids a load-time import edge into server_args. Import
-# planner functions from sglang.srt.layers.dcp.planner directly.
+# planner.py is not imported here: it imports model_executor.forward_context, and
+# this package init runs at module load for every importer of the DCP primitives.
+# Import planner functions from sglang.srt.layers.dcp.planner directly.
 
 __all__ = [
     "DecodeContextParallelMetadata",

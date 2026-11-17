@@ -816,7 +816,15 @@ class MiniCPMBaseModel(nn.Module):
         quant_config: Optional[QuantizationConfig],
         prefix: str = "",
     ) -> nn.Module:
-        raise NotImplementedError
+        model = Idefics2VisionTransformer(
+            config=config.vision_config, quant_config=quant_config, prefix=prefix
+        )
+        if self.config.drop_vision_last_layer:
+            model.encoder.layers = model.encoder.layers[:-1]
+
+        setattr(model, "embed_dim", model.embeddings.embed_dim)
+        setattr(model, "patch_size", model.embeddings.patch_size)
+        return model
 
     def init_resampler(
         self,
@@ -825,7 +833,18 @@ class MiniCPMBaseModel(nn.Module):
         quant_config: Optional[QuantizationConfig] = None,
         prefix: str = "",
     ) -> nn.Module:
-        raise NotImplementedError
+        with set_default_torch_dtype(torch.float16):
+            # The resampler in 2.6 remains consistent with the one in 2.5.
+            resampler = Resampler2_5(
+                num_queries=self.config.query_num,
+                embed_dim=embed_dim,
+                num_heads=embed_dim // 128,
+                kv_dim=vision_dim,
+                quant_config=quant_config,
+                prefix=prefix,
+            )
+
+        return resampler.to(device=get_device(), dtype=torch.get_default_dtype())
 
     def get_vision_embedding(
         self,
@@ -833,10 +852,72 @@ class MiniCPMBaseModel(nn.Module):
         patch_attn_mask: Optional[torch.Tensor] = None,
         tgt_sizes: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        raise NotImplementedError
+        vision_embedding = self.vpm(
+            pixel_values,
+            patch_attention_mask=patch_attn_mask,
+            tgt_sizes=tgt_sizes,
+        )
+        return vision_embedding
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        raise NotImplementedError
+        if items and items[0].format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
+            result = torch.cat([item.feature for item in items])
+            return result.reshape(-1, result.shape[-1])
+
+        # list of tensors
+        pixel_values = flatten_nested_list([item.feature for item in items])
+        tgt_sizes = torch.stack(
+            flatten_nested_list([item.tgt_size for item in items]), dim=0
+        )
+        assert len(pixel_values) == tgt_sizes.shape[0]
+
+        device = self.vpm.embeddings.position_embedding.weight.device
+        dtype = self.vpm.embeddings.position_embedding.weight.dtype
+        all_pixel_values_lst = [
+            i.flatten(end_dim=1).permute(1, 0) for i in pixel_values
+        ]
+
+        max_patches = (tgt_sizes[:, 0] * tgt_sizes[:, 1]).max().item()
+        assert isinstance(max_patches, int)
+        all_pixel_values = torch.nn.utils.rnn.pad_sequence(
+            all_pixel_values_lst, batch_first=True, padding_value=0.0
+        )
+
+        B, L, _ = all_pixel_values.shape
+        all_pixel_values = all_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
+        patch_attn_mask = torch.zeros(
+            (B, 1, max_patches), dtype=torch.bool, device=device
+        )
+
+        tgt_sizes_tensor = tgt_sizes.clone().to(device=patch_attn_mask.device)
+        mask_shapes = tgt_sizes_tensor[:, 0] * tgt_sizes_tensor[:, 1]
+        patch_attn_mask[:, 0, :] = torch.arange(
+            patch_attn_mask.size(2), device=patch_attn_mask.device
+        ).unsqueeze(0) < mask_shapes.unsqueeze(1)
+
+        vision_embedding = self.vpm(
+            all_pixel_values.type(dtype),
+            patch_attention_mask=patch_attn_mask,
+            tgt_sizes=tgt_sizes,
+        )
+        return self.resampler(vision_embedding, tgt_sizes)
+
+    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
+        # Get all special token IDs
+        im_start_id: int = image_inputs.im_start_id
+        im_end_id: int = image_inputs.im_end_id
+        slice_start_id: int = image_inputs.slice_start_id
+        slice_end_id: int = image_inputs.slice_end_id
+
+        media_token_pairs = [(im_start_id, im_end_id), (slice_start_id, slice_end_id)]
+        # Only increment data_idx on im_start (not slice_start) so all slices
+        # within one image share the same pad_value for per-image caching.
+        return pad_mm_token_pairs(
+            input_ids,
+            image_inputs,
+            data_token_pairs=media_token_pairs,
+            data_start_token_ids=[im_start_id],
+        )
 
 
 class MiniCPMV2_6(MiniCPMBaseModel):
@@ -896,115 +977,6 @@ class MiniCPMV2_6(MiniCPMBaseModel):
     ) -> nn.Module:
         return Qwen2ForCausalLM(config=config, quant_config=quant_config, prefix=prefix)
 
-    def init_vision_module(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig],
-        prefix: str = "",
-    ) -> nn.Module:
-        model = Idefics2VisionTransformer(
-            config=config.vision_config, quant_config=quant_config, prefix=prefix
-        )
-        if self.config.drop_vision_last_layer:
-            model.encoder.layers = model.encoder.layers[:-1]
-
-        setattr(model, "embed_dim", model.embeddings.embed_dim)
-        setattr(model, "patch_size", model.embeddings.patch_size)
-        return model
-
-    def init_resampler(
-        self,
-        embed_dim: int,
-        vision_dim: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> nn.Module:
-        with set_default_torch_dtype(torch.float16):
-            # The resampler in 2.6 remains consistent with the one in 2.5.
-            resampler = Resampler2_5(
-                num_queries=self.config.query_num,
-                embed_dim=embed_dim,
-                num_heads=embed_dim // 128,
-                kv_dim=vision_dim,
-                quant_config=quant_config,
-                prefix=prefix,
-            )
-
-        return resampler.to(device=get_device(), dtype=torch.get_default_dtype())
-
-    def get_vision_embedding(
-        self,
-        pixel_values: List[torch.Tensor],
-        patch_attn_mask: Optional[torch.Tensor] = None,
-        tgt_sizes: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        vision_embedding = self.vpm(
-            pixel_values,
-            patch_attention_mask=patch_attn_mask,
-            tgt_sizes=tgt_sizes,
-        )
-        return vision_embedding
-
-    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        if items and items[0].format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
-            result = torch.cat([item.feature for item in items])
-            return result.reshape(-1, result.shape[-1])
-
-        # list of tensors
-        pixel_values = flatten_nested_list([item.feature for item in items])
-        tgt_sizes = torch.stack(
-            flatten_nested_list([item.tgt_size for item in items]), dim=0
-        )
-        assert len(pixel_values) == tgt_sizes.shape[0]
-
-        device = self.vpm.embeddings.position_embedding.weight.device
-        dtype = self.vpm.embeddings.position_embedding.weight.dtype
-        all_pixel_values_lst = [
-            i.flatten(end_dim=1).permute(1, 0) for i in pixel_values
-        ]
-
-        max_patches = (tgt_sizes[:, 0] * tgt_sizes[:, 1]).max().item()
-        assert isinstance(max_patches, int)
-        all_pixel_values = torch.nn.utils.rnn.pad_sequence(
-            all_pixel_values_lst, batch_first=True, padding_value=0.0
-        )
-
-        B, L, _ = all_pixel_values.shape
-        all_pixel_values = all_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
-        patch_attn_mask = torch.zeros(
-            (B, 1, max_patches), dtype=torch.bool, device=device
-        )
-
-        tgt_sizes_tensor = tgt_sizes.clone().to(device=patch_attn_mask.device)
-        mask_shapes = tgt_sizes_tensor[:, 0] * tgt_sizes_tensor[:, 1]
-        patch_attn_mask[:, 0, :] = torch.arange(
-            patch_attn_mask.size(2), device=patch_attn_mask.device
-        ).unsqueeze(0) < mask_shapes.unsqueeze(1)
-
-        vision_embedding = self.vpm(
-            all_pixel_values.type(dtype),
-            patch_attention_mask=patch_attn_mask,
-            tgt_sizes=tgt_sizes,
-        )
-        return self.resampler(vision_embedding, tgt_sizes)
-
-    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
-        # Get all special token IDs
-        im_start_id: int = image_inputs.im_start_id
-        im_end_id: int = image_inputs.im_end_id
-        slice_start_id: int = image_inputs.slice_start_id
-        slice_end_id: int = image_inputs.slice_end_id
-
-        media_token_pairs = [(im_start_id, im_end_id), (slice_start_id, slice_end_id)]
-        # Only increment data_idx on im_start (not slice_start) so all slices
-        # within one image share the same pad_value for per-image caching.
-        return pad_mm_token_pairs(
-            input_ids,
-            image_inputs,
-            data_token_pairs=media_token_pairs,
-            data_start_token_ids=[im_start_id],
-        )
-
 
 class MiniCPMV4_0(MiniCPMBaseModel):
     packed_modules_mapping = {
@@ -1062,115 +1034,6 @@ class MiniCPMV4_0(MiniCPMBaseModel):
         prefix: str = "",
     ) -> nn.Module:
         return LlamaForCausalLM(config=config, quant_config=quant_config, prefix=prefix)
-
-    def init_vision_module(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig],
-        prefix: str = "",
-    ) -> nn.Module:
-        model = Idefics2VisionTransformer(
-            config=config.vision_config, quant_config=quant_config, prefix=prefix
-        )
-        if self.config.drop_vision_last_layer:
-            model.encoder.layers = model.encoder.layers[:-1]
-
-        setattr(model, "embed_dim", model.embeddings.embed_dim)
-        setattr(model, "patch_size", model.embeddings.patch_size)
-        return model
-
-    def init_resampler(
-        self,
-        embed_dim: int,
-        vision_dim: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        prefix: str = "",
-    ) -> nn.Module:
-        with set_default_torch_dtype(torch.float16):
-            # The resampler in 2.6 remains consistent with the one in 2.5.
-            resampler = Resampler2_5(
-                num_queries=self.config.query_num,
-                embed_dim=embed_dim,
-                num_heads=embed_dim // 128,
-                kv_dim=vision_dim,
-                quant_config=quant_config,
-                prefix=prefix,
-            )
-
-        return resampler.to(device=get_device(), dtype=torch.get_default_dtype())
-
-    def get_vision_embedding(
-        self,
-        pixel_values: List[torch.Tensor],
-        patch_attn_mask: Optional[torch.Tensor] = None,
-        tgt_sizes: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        vision_embedding = self.vpm(
-            pixel_values,
-            patch_attention_mask=patch_attn_mask,
-            tgt_sizes=tgt_sizes,
-        )
-        return vision_embedding
-
-    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        if items and items[0].format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
-            result = torch.cat([item.feature for item in items])
-            return result.reshape(-1, result.shape[-1])
-
-        # list of tensors
-        pixel_values = flatten_nested_list([item.feature for item in items])
-        tgt_sizes = torch.stack(
-            flatten_nested_list([item.tgt_size for item in items]), dim=0
-        )
-        assert len(pixel_values) == tgt_sizes.shape[0]
-
-        device = self.vpm.embeddings.position_embedding.weight.device
-        dtype = self.vpm.embeddings.position_embedding.weight.dtype
-        all_pixel_values_lst = [
-            i.flatten(end_dim=1).permute(1, 0) for i in pixel_values
-        ]
-
-        max_patches = (tgt_sizes[:, 0] * tgt_sizes[:, 1]).max().item()
-        assert isinstance(max_patches, int)
-        all_pixel_values = torch.nn.utils.rnn.pad_sequence(
-            all_pixel_values_lst, batch_first=True, padding_value=0.0
-        )
-
-        B, L, _ = all_pixel_values.shape
-        all_pixel_values = all_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
-        patch_attn_mask = torch.zeros(
-            (B, 1, max_patches), dtype=torch.bool, device=device
-        )
-
-        tgt_sizes_tensor = tgt_sizes.clone().to(device=patch_attn_mask.device)
-        mask_shapes = tgt_sizes_tensor[:, 0] * tgt_sizes_tensor[:, 1]
-        patch_attn_mask[:, 0, :] = torch.arange(
-            patch_attn_mask.size(2), device=patch_attn_mask.device
-        ).unsqueeze(0) < mask_shapes.unsqueeze(1)
-
-        vision_embedding = self.vpm(
-            all_pixel_values.type(dtype),
-            patch_attention_mask=patch_attn_mask,
-            tgt_sizes=tgt_sizes,
-        )
-        return self.resampler(vision_embedding, tgt_sizes)
-
-    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
-        # Get all special token IDs
-        im_start_id: int = image_inputs.im_start_id
-        im_end_id: int = image_inputs.im_end_id
-        slice_start_id: int = image_inputs.slice_start_id
-        slice_end_id: int = image_inputs.slice_end_id
-
-        media_token_pairs = [(im_start_id, im_end_id), (slice_start_id, slice_end_id)]
-        # Only increment data_idx on im_start (not slice_start) so all slices
-        # within one image share the same pad_value for per-image caching.
-        return pad_mm_token_pairs(
-            input_ids,
-            image_inputs,
-            data_token_pairs=media_token_pairs,
-            data_start_token_ids=[im_start_id],
-        )
 
 
 class MiniCPMV4_5(MiniCPMBaseModel):
@@ -1234,22 +1097,6 @@ class MiniCPMV4_5(MiniCPMBaseModel):
         )
         return llm
 
-    def init_vision_module(
-        self,
-        config: PretrainedConfig,
-        quant_config: Optional[QuantizationConfig],
-        prefix: str = "",
-    ) -> nn.Module:
-        model = Idefics2VisionTransformer(
-            config=config.vision_config, quant_config=quant_config, prefix=prefix
-        )
-        if self.config.drop_vision_last_layer:
-            model.encoder.layers = model.encoder.layers[:-1]
-
-        setattr(model, "embed_dim", model.embeddings.embed_dim)
-        setattr(model, "patch_size", model.embeddings.patch_size)
-        return model
-
     def init_resampler(
         self,
         embed_dim: int,
@@ -1258,7 +1105,6 @@ class MiniCPMV4_5(MiniCPMBaseModel):
         prefix: str = "",
     ) -> nn.Module:
         with set_default_torch_dtype(torch.float16):
-            # The resampler in 2.6 remains consistent with the one in 2.5.
             resampler = Resampler4_5(
                 num_queries=self.config.query_num,
                 embed_dim=embed_dim,
@@ -1269,79 +1115,6 @@ class MiniCPMV4_5(MiniCPMBaseModel):
             )
 
         return resampler.to(device=get_device(), dtype=torch.get_default_dtype())
-
-    def get_vision_embedding(
-        self,
-        pixel_values: List[torch.Tensor],
-        patch_attn_mask: Optional[torch.Tensor] = None,
-        tgt_sizes: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        vision_embedding = self.vpm(
-            pixel_values,
-            patch_attention_mask=patch_attn_mask,
-            tgt_sizes=tgt_sizes,
-        )
-        return vision_embedding
-
-    def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        if items and items[0].format == MultimodalInputFormat.PRECOMPUTED_EMBEDDING:
-            result = torch.cat([item.feature for item in items])
-            return result.reshape(-1, result.shape[-1])
-
-        # list of tensors
-        pixel_values = flatten_nested_list([item.feature for item in items])
-        tgt_sizes = torch.stack(
-            flatten_nested_list([item.tgt_size for item in items]), dim=0
-        )
-        assert len(pixel_values) == tgt_sizes.shape[0]
-
-        device = self.vpm.embeddings.position_embedding.weight.device
-        dtype = self.vpm.embeddings.position_embedding.weight.dtype
-        all_pixel_values_lst = [
-            i.flatten(end_dim=1).permute(1, 0) for i in pixel_values
-        ]
-
-        max_patches = (tgt_sizes[:, 0] * tgt_sizes[:, 1]).max().item()
-        assert isinstance(max_patches, int)
-        all_pixel_values = torch.nn.utils.rnn.pad_sequence(
-            all_pixel_values_lst, batch_first=True, padding_value=0.0
-        )
-
-        B, L, _ = all_pixel_values.shape
-        all_pixel_values = all_pixel_values.permute(0, 2, 1).reshape(B, 3, -1, L)
-        patch_attn_mask = torch.zeros(
-            (B, 1, max_patches), dtype=torch.bool, device=device
-        )
-
-        tgt_sizes_tensor = tgt_sizes.clone().to(device=patch_attn_mask.device)
-        mask_shapes = tgt_sizes_tensor[:, 0] * tgt_sizes_tensor[:, 1]
-        patch_attn_mask[:, 0, :] = torch.arange(
-            patch_attn_mask.size(2), device=patch_attn_mask.device
-        ).unsqueeze(0) < mask_shapes.unsqueeze(1)
-
-        vision_embedding = self.vpm(
-            all_pixel_values.type(dtype),
-            patch_attention_mask=patch_attn_mask,
-            tgt_sizes=tgt_sizes,
-        )
-        return self.resampler(vision_embedding, tgt_sizes)
-
-    def pad_input_ids(self, input_ids: array, image_inputs: MultimodalInputs) -> array:
-        # Get all special token IDs
-        im_start_id: int = image_inputs.im_start_id
-        im_end_id: int = image_inputs.im_end_id
-        slice_start_id: int = image_inputs.slice_start_id
-        slice_end_id: int = image_inputs.slice_end_id
-
-        media_token_pairs = [(im_start_id, im_end_id), (slice_start_id, slice_end_id)]
-        # Only increment data_idx on im_start (not slice_start) so all slices
-        # within one image share the same pad_value for per-image caching.
-        return pad_mm_token_pairs(
-            input_ids,
-            image_inputs,
-            data_token_pairs=media_token_pairs,
-            data_start_token_ids=[im_start_id],
-        )
 
     def eval(self):
         super().eval()
@@ -1730,17 +1503,7 @@ class MiniCPMV:
     ) -> None:
         super().__init__()
 
-        # 4.6+ carry their own ``model_type`` instead of a numeric
-        # ``config.version``; older versionless configs keep the legacy
-        # ``(2, 6)`` default.
-        model_type = getattr(config, "model_type", None)
-        if model_type in _MODEL_TYPE_VERSIONS:
-            version = _MODEL_TYPE_VERSIONS[model_type]
-        elif not hasattr(config, "version"):
-            version = (2, 6)
-        else:
-            version = str(config.version).split(".")
-            version = tuple([int(x) for x in version])
+        version = get_version_by_config(config)
         # Dispatch class based on version
         instance_class = _SUPPORT_VERSION.get(version)
         if instance_class is None:

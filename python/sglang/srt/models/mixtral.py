@@ -410,6 +410,7 @@ class MixtralForCausalLM(nn.Module):
         params_dict = dict(self.named_parameters())
         for name, loaded_weight in weights:
             layer_id = get_layer_id(name)
+            # GraniteMoeForCausalLM reuses this loader; its model has no start_layer.
             if (
                 layer_id is not None
                 and hasattr(self.model, "start_layer")
@@ -466,8 +467,6 @@ class MixtralForCausalLM(nn.Module):
                         continue
                     # Skip loading kv_scale from ckpts towards new design.
                     if name.endswith(".kv_scale") and name not in params_dict:
-                        continue
-                    if name is None:
                         continue
 
                     if name in params_dict.keys():

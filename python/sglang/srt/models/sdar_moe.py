@@ -24,9 +24,7 @@ from sglang.srt.layers.layer_boundary import (
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
-    QKVParallelLinear,
     ReplicatedLinear,
-    RowParallelLinear,
 )
 from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
@@ -40,8 +38,6 @@ from sglang.srt.layers.moe.utils import (
     filter_moe_weight_param_global_expert,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
-from sglang.srt.layers.radix_attention import AttentionType, RadixAttention
-from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.layers.utils.layer_list import make_pp_layers
@@ -54,11 +50,7 @@ from sglang.srt.model_loader.weight_utils import (
     default_weight_loader,
     maybe_remap_kv_scale_name,
 )
-from sglang.srt.models.utils import (
-    apply_qk_norm,
-    create_fused_set_kv_buffer_arg,
-    enable_fused_set_kv_buffer,
-)
+from sglang.srt.models.sdar import SDARAttention
 from sglang.srt.runtime_context import get_exec, get_parallel, get_stream
 from sglang.srt.utils import LazyValue, is_cuda
 
@@ -179,134 +171,6 @@ class SDARMoeSparseMoeBlock(nn.Module):
         ]
 
 
-class SDARMoeAttention(nn.Module):
-    def __init__(
-        self,
-        config: PretrainedConfig,
-        layer_id: int,
-        quant_config: Optional[QuantizationConfig] = None,
-        reduce_results: bool = True,
-        prefix: str = "",
-        alt_stream: Optional[torch.cuda.Stream] = None,
-    ):
-        super().__init__()
-        self.layer_id = layer_id
-        self.hidden_size = config.hidden_size
-        self.total_num_heads = config.num_attention_heads
-
-        attn_tp_size = get_parallel().attn_tp_size
-
-        assert self.total_num_heads % attn_tp_size == 0
-        self.num_heads = self.total_num_heads // attn_tp_size
-
-        self.total_num_kv_heads = config.num_key_value_heads
-        if self.total_num_kv_heads >= attn_tp_size:
-            assert self.total_num_kv_heads % attn_tp_size == 0
-        else:
-            assert attn_tp_size % self.total_num_kv_heads == 0
-        self.num_kv_heads = max(1, self.total_num_kv_heads // attn_tp_size)
-
-        self.head_dim = getattr(
-            config, "head_dim", self.hidden_size // self.total_num_heads
-        )
-        self.q_size = self.num_heads * self.head_dim
-        self.kv_size = self.num_kv_heads * self.head_dim
-        self.scale = self.head_dim**-0.5
-
-        self.qkv_proj = QKVParallelLinear(
-            self.hidden_size,
-            self.head_dim,
-            self.total_num_heads,
-            self.total_num_kv_heads,
-            bias=getattr(config, "attention_bias", False),
-            quant_config=quant_config,
-            prefix=add_prefix("qkv_proj", prefix),
-        )
-        self.o_proj = RowParallelLinear(
-            self.total_num_heads * self.head_dim,
-            self.hidden_size,
-            bias=getattr(config, "attention_bias", False),
-            quant_config=quant_config,
-            reduce_results=reduce_results,
-            parallel_group="attn_tp",
-            prefix=add_prefix("o_proj", prefix),
-        )
-
-        self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-
-        rope_theta = getattr(config, "rope_theta", 10000.0)
-        rope_scaling = getattr(config, "rope_scaling", None)
-        max_pos = getattr(config, "max_position_embeddings", 32768)
-        self.rotary_dim = self.head_dim
-        self.rotary_emb = get_rope(
-            self.head_dim,
-            rotary_dim=self.rotary_dim,
-            max_position=max_pos,
-            base=rope_theta,
-            rope_scaling=rope_scaling,
-        )
-
-        self.attn = RadixAttention(
-            self.num_heads,
-            self.head_dim,
-            self.scale,
-            num_kv_heads=self.num_kv_heads,
-            layer_id=layer_id,
-            attn_type=AttentionType.ENCODER_ONLY,
-            prefix=add_prefix("attn", prefix),
-        )
-        self.alt_stream = alt_stream
-
-    def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        forward_batch: ForwardBatch,
-    ) -> torch.Tensor:
-        if get_exec().deterministic.rl_on_policy_target is not None:
-            hidden_states = hidden_states.bfloat16()
-
-        qkv, _ = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        q, k = apply_qk_norm(
-            q=q,
-            k=k,
-            q_norm=self.q_norm,
-            k_norm=self.k_norm,
-            head_dim=self.head_dim,
-            alt_stream=self.alt_stream,
-        )
-        q, k = self.rotary_emb(
-            positions,
-            q,
-            k,
-            fused_set_kv_buffer_arg=(
-                create_fused_set_kv_buffer_arg(
-                    value=v,
-                    layer=self.attn,
-                    forward_batch=forward_batch,
-                )
-                if enable_fused_set_kv_buffer(forward_batch)
-                else None
-            ),
-        )
-
-        if get_exec().deterministic.rl_on_policy_target is not None:
-            q = q.to(torch.bfloat16)
-            k = k.to(torch.bfloat16)
-
-        context = self.attn(
-            q,
-            k,
-            v,
-            forward_batch,
-            save_kv_cache=not enable_fused_set_kv_buffer(forward_batch),
-        )
-        out, _ = self.o_proj(context)
-        return out
-
-
 class SDARMoeBlock(nn.Module):
     def __init__(
         self,
@@ -338,7 +202,7 @@ class SDARMoeBlock(nn.Module):
             self.hidden_size, eps=config.rms_norm_eps, **norm_kwargs
         )
 
-        self.self_attn = SDARMoeAttention(
+        self.self_attn = SDARAttention(
             config=config,
             layer_id=layer_id,
             quant_config=quant_config,
@@ -502,7 +366,6 @@ class SDARMoeForCausalLM(nn.Module):
             "Please set pp_size=1."
         )
 
-        self.pp_group = get_parallel().pp_group
         self.config = config
         self.quant_config = quant_config
         alt_stream = get_stream("alt") if _is_cuda else None

@@ -73,8 +73,8 @@ def copy_with_check(target: torch.Tensor, loaded_weight: torch.Tensor):
         raise ValueError(
             f"Downcasting not allowed: {target.dtype=}, {loaded_weight.dtype=}"
         )
-    if loaded_rank == torch.float8_e8m0fnu:
-        assert target_rank in {torch.float8_e8m0fnu, torch.float32}
+    if loaded_weight.dtype == torch.float8_e8m0fnu and target.dtype != torch.float32:
+        raise ValueError(f"E8M0 scales load only into E8M0 or float32: {target.dtype=}")
 
     target.copy_(loaded_weight)
 

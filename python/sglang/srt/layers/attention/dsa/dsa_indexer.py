@@ -66,11 +66,7 @@ from sglang.srt.layers.attention.dsa.utils import (
 from sglang.srt.layers.attention.graph_variants import DSA_DENSE
 from sglang.srt.layers.attention.mqa_logits_utils import (
     MQA_LOGITS_BYTES_PER_ELEM,
-    MQA_LOGITS_MAX_BYTES_ROCM,
-    MQA_LOGITS_STATIC_SKIP_ELEMS,
-    MQA_LOGITS_TOTAL_MEM_FRACTION,
     mqa_logits_budget_bytes,
-    mqa_logits_free_mem_fraction,
     mqa_logits_should_chunk,
     mqa_logits_static_budget_bytes,
 )
@@ -92,7 +88,6 @@ from sglang.srt.state_capturer.indexer_topk import (
 )
 from sglang.srt.utils import (
     ceil_align,
-    get_bool_env_var,
     is_cuda,
     is_gfx95_supported,
     is_gfx1250_supported,
@@ -143,7 +138,7 @@ if _is_cuda:
 else:
     pick_dsl_expand = None
 
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
 _is_gfx95_supported = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
@@ -157,12 +152,6 @@ if _use_aiter and not _use_aiter_preshuffle:
         "(needs Triton>=3.5.0 or AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1); "
         "falling back to legacy page_size=1 / KVBlockSize=1 path."
     )
-if _is_cuda:
-    try:
-        import deep_gemm
-    except ImportError as e:
-        deep_gemm = e
-
 if _is_xpu:
     from sgl_kernel import fp8_mqa_logits as sgl_fp8_mqa_logits
     from sgl_kernel import fp8_paged_mqa_logits as sgl_fp8_paged_mqa_logits
@@ -295,17 +284,10 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
 
 class Indexer(DSANPUIndexerMixin, BaseFusedOp):
     _MQA_LOGITS_BYTES_PER_ELEM = MQA_LOGITS_BYTES_PER_ELEM
-    _MQA_LOGITS_STATIC_SKIP_ELEMS = MQA_LOGITS_STATIC_SKIP_ELEMS
-    _MQA_LOGITS_TOTAL_MEM_FRACTION = MQA_LOGITS_TOTAL_MEM_FRACTION
-    _MQA_LOGITS_MAX_BYTES_ROCM = MQA_LOGITS_MAX_BYTES_ROCM
     # Index-K bytes per token: 128 FP8 values and one FP32 scale.
     _HEAD_DIM_WITH_SF = 132
     # One measured budget per device for the process lifetime.
     _mqa_logits_budget_bytes: Dict[int, int] = {}
-
-    @staticmethod
-    def _mqa_logits_free_mem_fraction() -> float:
-        return mqa_logits_free_mem_fraction()
 
     def __init__(
         self,
@@ -1679,7 +1661,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
     def _get_topk_ragged(
         self,
-        enable_dual_stream: bool,
         forward_batch: ForwardBatch,
         layer_id: int,
         q_fp8: torch.Tensor,
@@ -2560,7 +2541,6 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     "graph DSA split-op dispatch"
                 )
                 topk_result = self._get_topk_ragged(
-                    enable_dual_stream,
                     forward_batch,
                     layer_id,
                     q_fp8,

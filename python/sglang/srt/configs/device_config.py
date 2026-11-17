@@ -1,11 +1,8 @@
-import logging
 from typing import Optional
 
 import torch
 
 from sglang.srt.platforms import current_platform
-
-logger = logging.getLogger(__name__)
 
 SUPPORTED_DEVICES = ["cuda", "xpu", "hpu", "cpu", "npu", "musa", "mps"]
 

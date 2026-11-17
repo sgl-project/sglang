@@ -39,7 +39,6 @@ from sglang.srt.models.internvl import InternVisionEncoder
 logger = logging.getLogger(__name__)
 
 input_dim_t: TypeAlias = int | tuple[int, int]
-norm_t: TypeAlias = tuple[float, float, float] | torch.Tensor
 
 
 def _map_hf_radio_weight_name(name: str) -> tuple[str, str | None] | None:
@@ -213,7 +212,6 @@ class ViTPatchGenerator(nn.Module):
 
         self.video_temporal_patch_size = video_temporal_patch_size
         self.video_embedder = None
-        self._video_embedder_loaded = False
         if video_temporal_patch_size > 1 and separate_video_embedder:
             self.video_embedder = nn.Linear(
                 3 * video_temporal_patch_size * patch_size * patch_size,
@@ -266,16 +264,8 @@ class ViTPatchGenerator(nn.Module):
         return patches
 
     @property
-    def apply_cls_token(self):
-        return self.cls_token.enabled
-
-    @property
     def num_cls_tokens(self):
         return self.cls_token.num_tokens
-
-    @property
-    def num_cls_patches(self):
-        return self.cls_token.num_patches
 
     @property
     def num_registers(self):
@@ -284,54 +274,6 @@ class ViTPatchGenerator(nn.Module):
     @property
     def num_skip(self):
         return self.num_cls_tokens + self.num_registers
-
-    def _load_embed(self, src_embed: torch.Tensor, targ_embed: nn.Parameter):
-        if src_embed.shape != targ_embed.shape:
-            src_size = int(math.sqrt(src_embed.shape[1]))
-
-            assert src_size**2 == src_embed.shape[1], (
-                "Unable to interpolate non-square embedding"
-            )
-
-            src_embed = rearrange(
-                src_embed, "b (h w) c -> b c h w", h=src_size, w=src_size
-            )
-            src_embed = F.interpolate(
-                src_embed,
-                size=(self.num_rows, self.num_cols),
-                mode="bicubic",
-                align_corners=True,
-                antialias=False,
-            )
-            src_embed = rearrange(src_embed, "b c h w -> b (h w) c")
-        targ_embed.data.copy_(src_embed)
-
-    def _load_projection(
-        self, src_proj_weight: torch.Tensor, targ_proj_weight: torch.Tensor
-    ):
-        if src_proj_weight.shape != targ_proj_weight.shape:
-            src_patch_size = int(math.sqrt(src_proj_weight.shape[1] // 3))
-
-            assert (src_patch_size**2) * 3 == src_proj_weight.shape[1], (
-                "Unable to interpolate non-square patch size"
-            )
-
-            src_proj_weight = rearrange(
-                src_proj_weight,
-                "b (c h w) -> b c h w",
-                c=3,
-                h=src_patch_size,
-                w=src_patch_size,
-            )
-            src_proj_weight = F.interpolate(
-                src_proj_weight,
-                size=(self.patch_size, self.patch_size),
-                mode="bicubic",
-                align_corners=True,
-                antialias=False,
-            )
-            src_proj_weight = rearrange(src_proj_weight, "b c h w -> b (c h w)")
-        targ_proj_weight.data.copy_(src_proj_weight)
 
     def embed_patches(self, x: torch.Tensor) -> torch.Tensor:
         patches = self.im_to_patches(x)
@@ -496,9 +438,6 @@ class RadioInternVisionModel(nn.Module):
         num_patches = grid_size[0] * grid_size[1]
         return img_size, grid_size, num_patches
 
-    def get_input_embeddings(self):
-        return self.embeddings
-
     def forward(self, x: torch.Tensor) -> torch.FloatTensor:
         assert self.patch_generator is not None
         hidden_states = self.patch_generator(x)
@@ -641,8 +580,6 @@ class RadioModel(nn.Module):
                 else:
                     weight_loader(param, weight, loaded_shard_id)
                 loaded_params.add(name)
-                if "video_embedder" in name:
-                    self.model.patch_generator._video_embedder_loaded = True
             elif is_hf_export:
                 raise ValueError(
                     f"Unexpected HF RADIO weight: {source_name} (mapped to {name})"

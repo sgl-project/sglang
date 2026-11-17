@@ -60,8 +60,7 @@ def mamba2_config(model_config: ModelConfig):
     if isinstance(config, NemotronHConfig) and model_config.is_draft_model:
         # NemotronH MTP draft models have no Mamba layers (pattern like "*E")
         # so they shouldn't use HybridLinearAttnBackend
-        pattern = getattr(config, "mtp_hybrid_override_pattern", None)
-        if pattern is not None and "M" not in pattern:
+        if "M" not in config.mtp_hybrid_override_pattern:
             return None
     if isinstance(
         config,
@@ -85,9 +84,7 @@ def mamba2_config(model_config: ModelConfig):
         return config.llm_config
 
     if isinstance(config, GraniteMoeHybridConfig):
-        has_mamba = any(
-            layer_type == "mamba" for layer_type in getattr(config, "layer_types", [])
-        )
+        has_mamba = any(layer_type == "mamba" for layer_type in config.layer_types)
         if not has_mamba:
             return None
         else:

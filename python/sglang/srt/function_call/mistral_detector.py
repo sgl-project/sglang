@@ -40,6 +40,8 @@ class MistralDetector(BaseFormatDetector):
         self._tool_calls_marker = "[TOOL_CALLS"
         self.eot_token = "]"
         self.tool_call_separator = ", "
+        # True between a completed JSON-array call and the bracket closing the array.
+        self._array_close_pending = False
 
     def has_tool_call(self, text: str) -> bool:
         """Return True if the text contains either supported tool-call marker."""
@@ -51,7 +53,7 @@ class MistralDetector(BaseFormatDetector):
 
         :param text: The complete text to parse.
         :param tools: List of available tools.
-        :return: ParseResult indicating success or failure, consumed text, leftover text, and parsed calls.
+        :return: StreamingParseResult with normal text and parsed tool calls.
         """
         marker_idx = text.find(self._tool_calls_marker)
         if marker_idx == -1:
@@ -130,8 +132,10 @@ class MistralDetector(BaseFormatDetector):
             if not self._ends_with_partial_token(self._buffer, self._tool_calls_marker):
                 normal_text = self._buffer
                 self._buffer = ""
-                if self.eot_token in normal_text:
-                    normal_text = normal_text.replace(self.eot_token, "")
+                if self._array_close_pending and normal_text.strip():
+                    self._array_close_pending = False
+                    if normal_text.lstrip().startswith(self.eot_token):
+                        normal_text = normal_text.lstrip()[len(self.eot_token) :]
                 return StreamingParseResult(normal_text=normal_text)
             return StreamingParseResult()
 
@@ -190,7 +194,11 @@ class MistralDetector(BaseFormatDetector):
 
         # Canonical format delegates to the BaseFormatDetector JSON streaming logic.
         if self.bot_token in current_text:
-            return super().parse_streaming_increment(new_text="", tools=tools)
+            tool_id_before = self.current_tool_id
+            result = super().parse_streaming_increment(new_text="", tools=tools)
+            if tool_id_before >= 0 and self.current_tool_id > tool_id_before:
+                self._array_close_pending = True
+            return result
 
         # Otherwise, keep buffering.
         return StreamingParseResult()

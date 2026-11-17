@@ -178,11 +178,7 @@ class PetitNvFp4LinearMethod(LinearMethodBase):
                 "Unsupported model when in features size is not multiple of 16"
             )
 
-        weight_dtype = (
-            torch.float8_e4m3fn
-            if self.quant_config.is_checkpoint_nvfp4_serialized
-            else params_dtype
-        )
+        weight_dtype = torch.float8_e4m3fn
 
         weight = ModelWeightParameter(
             data=torch.empty(

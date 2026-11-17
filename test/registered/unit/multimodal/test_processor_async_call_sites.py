@@ -266,6 +266,35 @@ def test_processors_outside_the_worker_pool_are_declared():
     )
 
 
+def test_lfm2_vl_request_without_images_returns_typed_output():
+    """A request that carries media but no image still gets the typed output:
+    the tokenizer manager reads the result by attribute."""
+    import torch
+
+    from sglang.srt.managers.req_types import MultimodalProcessorOutput
+    from sglang.srt.multimodal.processors.lfm2_vl import Lfm2VlImageProcessor
+
+    processor = object.__new__(Lfm2VlImageProcessor)
+    processor.IMAGE_TOKEN_ID = 396
+    processor._tokenizer = lambda text, **kwargs: SimpleNamespace(
+        input_ids=torch.tensor([[5, 6, 7]])
+    )
+
+    output = asyncio.run(
+        processor.process_mm_data_async(
+            image_data=None,
+            audio_data=["clip.wav"],
+            input_text="Describe the clip.",
+            request_obj=None,
+        )
+    )
+
+    assert isinstance(output, MultimodalProcessorOutput)
+    assert output.input_ids == [5, 6, 7]
+    assert output.mm_items == []
+    assert output.im_token_id == 396
+
+
 def test_the_scan_actually_finds_call_sites():
     """Guard against the scan silently matching nothing after a rename."""
     assert len(list(_call_sites())) > 20

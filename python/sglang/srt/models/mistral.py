@@ -134,7 +134,7 @@ class Mistral3ForConditionalGeneration(LlavaForConditionalGeneration):
             if self.vision_feature_select_strategy in ["default", "patch"]:
                 selected_image_feature = selected_image_feature[:, 1:]
             elif self.vision_feature_select_strategy == "full":
-                selected_image_feature = selected_image_feature
+                pass
             else:
                 raise ValueError(
                     f"Unexpected select feature: {self.vision_feature_select_strategy}"

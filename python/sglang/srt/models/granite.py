@@ -408,19 +408,6 @@ class GraniteForCausalLM(nn.Module):
         else:
             return self.pooler(hidden_states, forward_batch)
 
-    def get_module_name_from_weight_name(self, name):
-        for param_name, weight_name, shard_id, num_shard in self.stacked_params_mapping:
-            if weight_name in name:
-                return (
-                    name.replace(weight_name, param_name)[: -len(".weight")],
-                    num_shard,
-                )
-        return name[: -len(".weight")], 1
-
-    def get_num_params(self):
-        params_dict = dict(self.named_parameters())
-        return len(params_dict)
-
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)

@@ -7,6 +7,7 @@ import torch
 from compressed_tensors.quantization import QuantizationStrategy
 
 from sglang.kernels.ops.quantization.fp8_kernel import is_fp8_fnuz, scaled_fp8_quant
+from sglang.srt.environ import envs
 from sglang.srt.layers.moe import MoeRunner, MoeRunnerBackend, MoeRunnerConfig
 from sglang.srt.layers.moe.moe_runner.flashinfer_trtllm import (
     FlashInferTrtllmFp8MoeQuantInfo,
@@ -27,7 +28,7 @@ from sglang.srt.layers.quantization.utils import (
     swap_w13_to_w31,
 )
 from sglang.srt.layers.utils.common import set_weight_attrs
-from sglang.srt.utils import get_bool_env_var, is_hip
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.fused_moe_triton import FusedMoE
@@ -39,7 +40,7 @@ if TYPE_CHECKING:
 __all__ = ["CompressedTensorsW8A8Fp8MoE"]
 
 _is_hip = is_hip()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+_use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 
 if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
@@ -372,8 +373,11 @@ class CompressedTensorsW8A8Fp8MoE(CompressedTensorsMoEScheme):
         ):
             self.runner = MoeRunner(moe_runner_backend, moe_runner_config)
         else:
-            # TODO(cwan): refactor other backends
-            pass
+            raise ValueError(
+                "compressed-tensors FP8 MoE supports --moe-runner-backend auto, "
+                "aiter, triton, flashinfer_trtllm and flashinfer_trtllm_routed; "
+                f"got {moe_runner_backend.value}."
+            )
 
     def apply_weights(
         self,

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from typing import Optional, Tuple
 
 import torch
@@ -26,8 +25,6 @@ from sglang.srt.layers.moe.topk import (
 from sglang.srt.layers.moe.utils import has_per_rank_fused_shared_slots
 from sglang.srt.runtime_context import get_flags, get_model
 from sglang.srt.utils import is_hip, is_npu, is_xpu
-
-logger = logging.getLogger(__name__)
 
 _is_hip = is_hip()
 _is_npu = is_npu()

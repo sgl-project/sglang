@@ -64,7 +64,9 @@ class YiVLForCausalLM(LlavaLlamaForCausalLM):
         elif self.vision_feature_select_strategy == "cls_patch":
             self.image_feature_len += 1
         else:
-            raise ValueError(f"Unexpected select feature: {self.select_feature}")
+            raise ValueError(
+                f"Unexpected select feature: {self.vision_feature_select_strategy}"
+            )
 
         # load mm_projector
         # TODO: support TP?

@@ -525,10 +525,6 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         # GLM-V specific tokens
         self.IMAGE_TOKEN = "<|image|>"
         self.VIDEO_TOKEN = "<|video|>"
-        self.IMAGE_START_TOKEN = "<|begin_of_image|>"
-        self.IMAGE_END_TOKEN = "<|end_of_image|>"
-        self.VIDEO_START_TOKEN = "<|begin_of_video|>"
-        self.VIDEO_END_TOKEN = "<|end_of_video|>"
 
         # Token IDs
         self.IM_TOKEN_ID = hf_config.image_token_id
@@ -539,11 +535,6 @@ class Glm4vImageProcessor(SGLangBaseProcessor):
         self.VIDEO_END_TOKEN_ID = hf_config.video_end_token_id
         self.IM_START_TOKEN_ID = self.IMAGE_START_TOKEN_ID
         self.IM_END_TOKEN_ID = self.IMAGE_END_TOKEN_ID
-
-        # Vision config
-        self.IMAGE_FACTOR = 28
-        self.MIN_PIXELS = 112 * 112
-        self.MAX_PIXELS = 30000 * 28 * 28 * 2
 
         self.mm_tokens = MultimodalSpecialTokens(
             image_token=self.IMAGE_TOKEN,

@@ -17,7 +17,7 @@ from sglang.srt.runtime_context import (
     get_parallel,
     get_platform,
 )
-from sglang.srt.utils import get_bool_env_var, is_cuda, is_gfx95_supported, is_hip
+from sglang.srt.utils import is_cuda, is_gfx95_supported, is_hip
 
 if TYPE_CHECKING:
     from sglang.srt.layers.activation import SiluAndMul
@@ -77,7 +77,7 @@ class DenseSiluAndMulQuant:
         self.enabled = False
         self.down_proj = down_proj
         self.quant_method = down_proj.quant_method
-        self.aiter = is_hip() and get_bool_env_var("SGLANG_USE_AITER")
+        self.aiter = is_hip() and envs.SGLANG_USE_AITER.get()
         # Resolved on the first decode: the bpreshuffle happens at weight load.
         self.aiter_enabled = None
         # ROCm: whether down_proj's weights turned out per-tensor, without a

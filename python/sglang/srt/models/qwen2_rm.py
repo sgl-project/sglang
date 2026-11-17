@@ -51,8 +51,6 @@ class Qwen2ForRewardModel(nn.Module):
         )
         self.pooler = Pooler(pooling_type=PoolingType.LAST, normalize=False)
 
-        self.eos_token_id = config.eos_token_id
-
     @torch.no_grad()
     def forward(
         self,

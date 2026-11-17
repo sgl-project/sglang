@@ -446,12 +446,9 @@ class HunyuanDetector(BaseFormatDetector):
                 self._buffer = self._buffer[boundary_pos:]
 
             # Phase 2: stream argument JSON of the current tool.
-            before_name = self._streaming_tool_name
             calls.extend(self._stream_args(tools))
             if self._streaming_tool_name is not None:
                 break  # current tool still open; need more data.
-            if self._streaming_tool_name == before_name:
-                break  # safety: avoid infinite loop if state didn't advance.
 
         return StreamingParseResult(normal_text=leading_normal, calls=calls)
 

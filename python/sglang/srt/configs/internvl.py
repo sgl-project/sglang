@@ -375,114 +375,6 @@ class InternVLChatConfig(PretrainedConfig):
         return output
 
 
-# # Modified from transformers.model.llama.tokenization_llama_fast.LlamaTokenizerFast -> InternLM2TokenizerFast
-# class InternLM2TokenizerFast(PreTrainedTokenizerFast):
-#     vocab_files_names = VOCAB_FILES_NAMES
-#     slow_tokenizer_class = InternLM2Tokenizer
-#     padding_side = 'left'
-#     model_input_names = ['input_ids', 'attention_mask']
-#     _auto_class = 'AutoTokenizer'
-#
-#     def __init__(
-#         self,
-#         vocab_file,
-#         unk_token='<unk>',
-#         bos_token='<s>',
-#         eos_token='</s>',
-#         pad_token='</s>',
-#         sp_model_kwargs: Optional[Dict[str, Any]] = None,
-#         add_bos_token=True,
-#         add_eos_token=False,
-#         decode_with_prefix_space=False,
-#         clean_up_tokenization_spaces=False,
-#         **kwargs,
-#     ):
-#         super().__init__(
-#             vocab_file=vocab_file,
-#             unk_token=unk_token,
-#             bos_token=bos_token,
-#             eos_token=eos_token,
-#             pad_token=pad_token,
-#             sp_model_kwargs=sp_model_kwargs,
-#             add_bos_token=add_bos_token,
-#             add_eos_token=add_eos_token,
-#             decode_with_prefix_space=decode_with_prefix_space,
-#             clean_up_tokenization_spaces=clean_up_tokenization_spaces,
-#             **kwargs,
-#         )
-#         self._add_bos_token = add_bos_token
-#         self._add_eos_token = add_eos_token
-#         self.update_post_processor()
-#         self.vocab_file = vocab_file
-#
-#     @property
-#     def can_save_slow_tokenizer(self) -> bool:
-#         return os.path.isfile(self.vocab_file) if self.vocab_file else False
-#
-#     def update_post_processor(self):
-#         """
-#         Updates the underlying post processor with the current `bos_token` and `eos_token`.
-#         """
-#         bos = self.bos_token
-#         bos_token_id = self.bos_token_id
-#         if bos is None and self.add_bos_token:
-#             raise ValueError('add_bos_token = True but bos_token = None')
-#
-#         eos = self.eos_token
-#         eos_token_id = self.eos_token_id
-#         if eos is None and self.add_eos_token:
-#             raise ValueError('add_eos_token = True but eos_token = None')
-#
-#         single = f"{(bos + ':0 ') if self.add_bos_token else ''}$A:0{(' ' + eos + ':0') if self.add_eos_token else ''}"
-#         pair = f"{single}{(' ' + bos + ':1') if self.add_bos_token else ''} $B:1{(' ' + eos + ':1') if self.add_eos_token else ''}"
-#
-#         special_tokens = []
-#         if self.add_bos_token:
-#             special_tokens.append((bos, bos_token_id))
-#         if self.add_eos_token:
-#             special_tokens.append((eos, eos_token_id))
-#         self._tokenizer.post_processor = processors.TemplateProcessing(
-#             single=single, pair=pair, special_tokens=special_tokens
-#         )
-#
-#     @property
-#     def add_eos_token(self):
-#         return self._add_eos_token
-#
-#     @property
-#     def add_bos_token(self):
-#         return self._add_bos_token
-#
-#     @add_eos_token.setter
-#     def add_eos_token(self, value):
-#         self._add_eos_token = value
-#         self.update_post_processor()
-#
-#     @add_bos_token.setter
-#     def add_bos_token(self, value):
-#         self._add_bos_token = value
-#         self.update_post_processor()
-#
-#     def save_vocabulary(self, save_directory: str, filename_prefix: Optional[str] = None) -> Tuple[str]:
-#         if not self.can_save_slow_tokenizer:
-#             raise ValueError(
-#                 'Your fast tokenizer does not have the necessary information to save the vocabulary for a slow '
-#                 'tokenizer.'
-#             )
-#
-#         if not os.path.isdir(save_directory):
-#             logger.error(f'Vocabulary path ({save_directory}) should be a directory')
-#             return
-#         out_vocab_file = os.path.join(
-#             save_directory, (filename_prefix + '-' if filename_prefix else '') + VOCAB_FILES_NAMES['vocab_file']
-#         )
-#
-#         if os.path.abspath(self.vocab_file) != os.path.abspath(out_vocab_file):
-#             copyfile(self.vocab_file, out_vocab_file)
-#
-#         return (out_vocab_file,)
-
-
 # Modified from transformers.model.llama.tokenization_llama.LlamaTokenizer
 class InternLM2Tokenizer(PreTrainedTokenizer):
     """
@@ -512,7 +404,6 @@ class InternLM2Tokenizer(PreTrainedTokenizer):
         clean_up_tokenization_spaces=False,
         **kwargs,
     ):
-        print("register succeed")
         self.sp_model_kwargs = {} if sp_model_kwargs is None else sp_model_kwargs
         self.vocab_file = vocab_file
         self.add_bos_token = add_bos_token

@@ -159,9 +159,6 @@ class KTEPWrapperMethod(FusedMoEMethodBase):
         # KT wrapper will be initialized in create_weights
         self.wrapper: Optional[KTMoEWrapper] = None
 
-        # Store parameters needed for KT initialization
-        self._layer_params = None
-
     def create_weights(
         self,
         layer: torch.nn.Module,
