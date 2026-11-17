@@ -22,6 +22,7 @@ from unittest import mock
 
 import torch
 
+from sglang.srt.models import qwen4_exp_ple_table
 from sglang.srt.models.qwen4_exp_ple_table import (
     PleFilePrefetcher,
     PleFileRssTrimmer,
@@ -406,6 +407,78 @@ class TestFileBackendDeviceCheck(CustomTestCase):
 
     def test_unqueryable_device_does_not_fault(self):
         self.assertIs(self._faults(error=OSError("no libcudart")), False)
+
+
+class _FakeHostRegister:
+    def __init__(self, rc):
+        self.rc, self.calls = rc, []
+
+    def cudaHostRegister(self, ptr, size, flags):
+        self.calls.append((ptr, size, flags))
+        return self.rc
+
+
+class TestPlePinnedHugepageTable(CustomTestCase):
+    def _allocate(self, hugepage_table):
+        with (
+            mock.patch.object(torch.version, "cuda", "13.0"),
+            mock.patch.object(
+                qwen4_exp_ple_table,
+                "_pinned_hugepage_table",
+                return_value=hugepage_table,
+            ) as hugepage,
+            mock.patch.object(
+                qwen4_exp_ple_table,
+                "_alloc_cuda_host_table",
+                return_value="cudaHostAlloc",
+            ) as host_alloc,
+        ):
+            table = allocate_ple_host_table((4, 8), torch.float32, "pinned")
+        hugepage.assert_called_once_with((4, 8), torch.float32)
+        return table, host_alloc
+
+    def test_pinned_backend_takes_the_hugepage_table(self):
+        sentinel = torch.zeros(4, 8)
+        table, host_alloc = self._allocate(sentinel)
+        self.assertIs(table, sentinel)
+        host_alloc.assert_not_called()
+
+    def test_falls_back_to_cuda_host_alloc(self):
+        table, host_alloc = self._allocate(None)
+        self.assertEqual(table, "cudaHostAlloc")
+        host_alloc.assert_called_once_with((4, 8), torch.float32)
+
+    def _table(self, rc, advice_ok=True):
+        cudart = _FakeHostRegister(rc)
+        advised = []
+
+        def madvise(addr, length, advice):
+            advised.append((addr, length, advice))
+            return advice_ok
+
+        with (
+            mock.patch.object(torch.cuda, "cudart", return_value=cudart),
+            mock.patch.object(qwen4_exp_ple_table, "_madvise", madvise),
+            mock.patch.object(qwen4_exp_ple_table, "_clear_cuda_last_error") as clear,
+        ):
+            table = qwen4_exp_ple_table._pinned_hugepage_table((100, 160), torch.uint8)
+        return table, cudart.calls, advised, clear.called
+
+    def test_aligned_registered_mapping(self):
+        table, registered, advised, cleared = self._table(rc=0)
+        align = qwen4_exp_ple_table._HUGEPAGE_ALIGN
+        self.assertEqual((tuple(table.shape), table.dtype), ((100, 160), torch.uint8))
+        self.assertEqual(table.data_ptr() % align, 0)
+        self.assertEqual(advised, [(table.data_ptr(), 16000, 14)])
+        self.assertEqual(registered, [(table.data_ptr(), 16000, 0)])
+        self.assertFalse(cleared)
+
+    def test_failed_registration_or_advice_returns_none(self):
+        table, _, _, cleared = self._table(rc=1)
+        self.assertIsNone(table)
+        self.assertTrue(cleared)
+        table, registered, _, _ = self._table(rc=0, advice_ok=False)
+        self.assertEqual((table, registered), (None, []))
 
 
 @unittest.skipUnless(
