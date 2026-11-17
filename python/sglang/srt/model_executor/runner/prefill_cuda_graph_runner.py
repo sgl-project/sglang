@@ -172,6 +172,7 @@ from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.runtime_context import (
     get_exec,
     get_flags,
+    get_forward,
     get_memory,
     get_parallel,
     get_schedule,
@@ -2510,7 +2511,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Optional[Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]]:
         self._validate_capture_hidden_mode(forward_batch)
-        with self.model_context(), self.backend.replay_session():
+        with (
+            self.model_context(),
+            self.backend.replay_session(),
+            # The captured body was recorded outside maybe_input_scattered, so
+            # the eager embedding and tail of this replay must not scatter.
+            get_forward().scoped(prefill_graph_replay=True),
+        ):
             static_forward_batch, shared_read_ends = self.load_batch(
                 forward_batch, **kwargs
             )

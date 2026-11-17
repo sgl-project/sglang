@@ -702,6 +702,10 @@ class ForwardFlags:
         # AttnTpContext.maybe_input_scattered / set_attn_inputs).
         "attn_input_scattered": False,
         "attn_inputs": None,
+        # This forward replays a prefill cuda graph. A captured body keeps the
+        # layout it was captured in (never input-scattered, since capture runs
+        # outside the model's scope), so the replay's eager parts must match.
+        "prefill_graph_replay": False,
         # Sticky across forwards: every ForwardBatch construction writes it;
         # graph runners force False around capture.
         "is_extend_in_batch": False,
@@ -734,6 +738,7 @@ class ForwardFlags:
         {
             "attn_input_scattered",
             "attn_inputs",
+            "prefill_graph_replay",
             "is_extend_in_batch",
             "mlp_reduce_scatter",
             "flashinfer_trtllm_bypass",
