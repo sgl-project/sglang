@@ -41,6 +41,7 @@ from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
     hash_str_to_int64,
 )
+from sglang.srt.mem_cache.storage_key_binding import register_event_namespace
 
 if TYPE_CHECKING:
     from sglang.srt.lora.lora_registry import LoRARef
@@ -286,6 +287,8 @@ class KVCacheEventRecorder:
         self.dynamo_format = dynamo_format
         self.lora_names = lora_names if lora_names is not None else KvEventLoraNames()
         self._queue: list = []
+        if enabled:
+            register_event_namespace(self.namespace_seed)
 
     def enqueue(self, event) -> None:
         """Append an event, coalescing it with a compatible queue tail.
@@ -355,17 +358,21 @@ class KVCacheEventRecorder:
             return None
         return hash_str_to_int64(parent_hash_values[-1])
 
-    def _namespace_seed(self, node: Any) -> Optional[bytes]:
+    def namespace_seed(
+        self, *, extra_key: Optional[str], cache_salt: Optional[str]
+    ) -> Optional[bytes]:
+        """The namespace seed of a key's published event hashes."""
         if not self.dynamo_format:
             return kv_event_namespace_seed(
                 extra_key=(
-                    node.key.extra_key
-                    if self.lora_names.get(node.key.extra_key) is not None
-                    else None
+                    extra_key if self.lora_names.get(extra_key) is not None else None
                 ),
                 cache_salt=None,
             )
-        return kv_event_namespace_seed(
+        return kv_event_namespace_seed(extra_key=extra_key, cache_salt=cache_salt)
+
+    def _namespace_seed(self, node: Any) -> Optional[bytes]:
+        return self.namespace_seed(
             extra_key=node.key.extra_key, cache_salt=node.key.cache_salt
         )
 

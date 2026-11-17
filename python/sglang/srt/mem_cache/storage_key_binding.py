@@ -4,10 +4,21 @@
 from __future__ import annotations
 
 from array import array
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.radix_cache import RadixKey
+
+# Namespace rule of this process's published KV event hashes, registered by the KV event
+# recorder. Under some event formats published hashes are namespaced per (extra_key,
+# cache_salt), and peer hints name published hashes.
+_event_namespace_seed: Optional[Callable[..., Optional[bytes]]] = None
+
+
+def register_event_namespace(seed_for: Callable[..., Optional[bytes]]) -> None:
+    """Bind storage keys to the event IDs that ``seed_for``'s recorder publishes."""
+    global _event_namespace_seed
+    _event_namespace_seed = seed_for
 
 
 def storage_key_to_event_hashes(
@@ -27,8 +38,13 @@ def storage_key_to_event_hashes(
         and getattr(key, "cache_salt", None) is None
     ):
         return None
+    from sglang.srt.disaggregation.kv_events import namespaced_block_hash
     from sglang.srt.mem_cache.radix_cache import RadixKey
-    from sglang.srt.mem_cache.utils import get_event_hash_str, get_storage_hash_str
+    from sglang.srt.mem_cache.utils import (
+        get_event_hash_str,
+        get_storage_hash_str,
+        hash_str_to_int64,
+    )
 
     prefix = matched_prefix_tokens or []
     if (
@@ -54,8 +70,17 @@ def storage_key_to_event_hashes(
     ):
         return {}
     event_hashes = get_event_hash_str(full_key, page_size=page_size)
+    namespace_seed = (
+        _event_namespace_seed(extra_key=key.extra_key, cache_salt=key.cache_salt)
+        if _event_namespace_seed is not None
+        else None
+    )
+    # Router IDs are the unsigned form of the published (possibly namespaced) int64 hash.
     return {
-        storage_hash: int(event_hash[:16], 16)
+        storage_hash: namespaced_block_hash(
+            hash_str_to_int64(event_hash), namespace_seed=namespace_seed
+        )
+        & ((1 << 64) - 1)
         for storage_hash, event_hash in zip(
             storage_hashes[prefix_pages:], event_hashes[prefix_pages:]
         )
