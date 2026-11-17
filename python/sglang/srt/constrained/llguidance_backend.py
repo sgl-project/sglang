@@ -36,6 +36,9 @@ from sglang.srt.constrained.base_grammar_backend import (
     InvalidGrammarObject,
     register_vocab_mask_buffer,
 )
+from sglang.srt.constrained.torch_ops.token_filter_torch_ops import (
+    set_token_filter_torch,
+)
 from sglang.srt.constrained.utils import is_legacy_structural_tag
 from sglang.srt.utils import get_int_env_var
 
@@ -121,6 +124,15 @@ class GuidanceGrammar(BaseGrammarObject):
             raise ValueError(f"Tokens not accepted: {token}")
         self.ll_matcher.consume_token(token)
         self._check_err()
+
+    def try_accept_tokens(self, tokens: List[int]) -> bool:
+        # consume_token on a rejected token leaves the matcher in its error state,
+        # so validate the whole sequence before consuming any of it.
+        if self.finished or self.ll_matcher.validate_tokens(tokens) != len(tokens):
+            return False
+        for token in tokens:
+            self.accept_token(token)
+        return True
 
     def rollback(self, num_tokens: int) -> None:
         if num_tokens <= 0:
@@ -223,6 +235,14 @@ class GuidanceBackend(BaseGrammarBackend):
             max_rows, self.llguidance_tokenizer.vocab_size
         )
         return register_vocab_mask_buffer(name, vocab_mask, max_rows)
+
+    @staticmethod
+    def set_token_filter(
+        vocab_mask, token_ids, batch_idx, is_allowed=True, reset_vocab_mask=True
+    ):
+        set_token_filter_torch(
+            vocab_mask, token_ids, batch_idx, is_allowed, reset_vocab_mask
+        )
 
     def _from_serialized(self, serialized_grammar) -> BaseGrammarObject:
         try:

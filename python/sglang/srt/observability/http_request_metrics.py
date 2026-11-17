@@ -1,5 +1,7 @@
 from typing import Dict, Optional, Tuple
 
+from sglang.srt.constants import ROUTING_KEY_HEADER
+
 
 class RefCountedGauge:
     def __init__(self, gauge):
@@ -82,7 +84,7 @@ def add_http_request_metrics_middleware(app):
         # But given that SGLang engines with metrics enabled are usually behind routers this looks safe.
         path, is_handled_path = _get_fastapi_request_path(request)
         method = request.method
-        routing_key = request.headers.get("x-smg-routing-key")
+        routing_key = request.headers.get(ROUTING_KEY_HEADER)
 
         metrics.requests_total.labels(endpoint=path, method=method).inc()
         metrics.requests_active.labels(endpoint=path, method=method).inc()

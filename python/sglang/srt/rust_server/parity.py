@@ -156,7 +156,6 @@ RUST_SERVER_KNOWN_GAPS: Dict[str, str] = {
     "SGLANG_CUDA_COREDUMP_BEFORE_CRASH": "No crash diagnostics when a scheduler crashes.",
     "SGLANG_CUDA_COREDUMP_BEFORE_CRASH_WAIT_SECS": "No crash diagnostics when a scheduler crashes.",
     "speculative_num_draft_tokens": "No per-request speculative-decoding stats in meta_info (also behind the speculative_algorithm read, honored by name).",
-    "return_hidden_states_mode": "Rust gets the resolved enable_return_hidden_states only: a request above the server's mode is not refused.",
     "SGLANG_ENABLE_COLOCATED_BATCH_GEN": "Unverified: whether a batch's items are scheduled together.",
     "enable_encoder_swa_bounded_replay": "Unverified: Python refuses image requests off CUDA and warms up with text.",
     "SGLANG_INKLING_DEFAULT_REASONING_EFFORT": "Chat: the Rust chat route has no Inkling renderer.",

@@ -32,7 +32,9 @@ register_cpu_ci(est_time=11, suite="base-a-test-cpu")
 
 def _scheduler_for_typed_config(load_snapshot_writer=None):
     return SimpleNamespace(
-        server_args=SimpleNamespace(enable_return_hidden_states=False),
+        server_args=SimpleNamespace(
+            enable_return_hidden_states=True, return_hidden_states_mode="last"
+        ),
         model_config=SimpleNamespace(
             context_len=2048,
             vocab_size=1000,
@@ -92,8 +94,6 @@ def _reported_deployment_info() -> api_types.DeploymentInfo:
             "timeout",
         ),
         ({"hicache_write_policy": "write_back"}, "hicache_write_policy", "write_back"),
-        ({"smg_grpc_mode": True}, "grpc_port", None),
-        ({"grpc_mode": True}, "grpc_port", None),
         (
             {"grpc_response_timeout_secs": 900},
             "grpc_response_timeout_secs",
@@ -129,8 +129,6 @@ def _reported_deployment_info() -> api_types.DeploymentInfo:
         "hicache_storage_backend_extra_config",
         "hicache_storage_prefetch_policy",
         "hicache_write_policy",
-        "legacy-smg",
-        "deprecated-legacy-smg",
         "grpc-response-timeout",
         "priority-off",
         "priority-on",
@@ -169,6 +167,8 @@ def test_typed_config_forwards_resolved_launch_fields(overrides, kwarg, expected
 
     assert extension.ServerArgs.call_args.kwargs[kwarg] == expected
     assert extension.ServerArgs.call_args.kwargs["default_max_new_tokens"] is None
+    # The mode, not only the resolved bool: Rust refuses a request above it.
+    assert extension.ServerArgs.call_args.kwargs["return_hidden_states_mode"] == "last"
     scheduler.get_init_info.assert_not_called()
     scheduler.kv_events_publisher.local_kv_event_sources.assert_called_once_with(16)
     deployment_info = json.loads(

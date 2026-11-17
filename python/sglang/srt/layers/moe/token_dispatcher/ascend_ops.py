@@ -249,10 +249,9 @@ class AscendOpsDispatcher(BaseDispatcher):
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> DispatchOutput:
         topk_weights, topk_ids, _ = topk_output
-        # Prefill graph capture clears the extend flag for other MoE backends.
-        is_prefill = get_is_extend_in_batch() or (
-            self.moe_ascend_ops_config.uses_fused_op and is_in_prefill_graph_scope()
-        )
+        # Capture clears the extend flag; keep every prefill graph on its
+        # configured prefill path, including fused_op, AllGather and AllToAllV.
+        is_prefill = get_is_extend_in_batch() or is_in_prefill_graph_scope()
         mode = (
             self.moe_ascend_ops_config.prefill
             if is_prefill

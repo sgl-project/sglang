@@ -120,9 +120,9 @@ permissions:
 jobs:
   # =============================================== PR Gate ====================================================
   # Runtime live-fetch label gate (mirrors pr-test-extra.yml's call-gate):
-  # requires `run-ci` and `run-ci-amd-extra`. A failure cascades to
-  # every test job via `needs`, so a PR without the labels ends in one red
-  # ~30s gate job plus a row of skipped jobs instead of consuming AMD runners.
+  # requires `run-ci` and opts in on `run-ci-amd-extra`. Without the opt-in
+  # the gate passes with opted-in=false and every test job skips, so the run
+  # is green and consumes no AMD runner.
   call-gate:
     uses: ./.github/workflows/pr-gate.yml
     with:
@@ -135,7 +135,7 @@ jobs:
   extra-a-test-1-gpu-small-amd:
     name: ${{ format('extra-a-test-1-gpu-small-amd ({0}, linux-{1}-1gpu-sglang, {2})', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300', matrix.part) }}
     needs: [call-gate]
-    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    if: ${{ !cancelled() && needs.call-gate.result == 'success' && needs.call-gate.outputs.opted-in != 'false' }}
     strategy:
       fail-fast: false
       matrix:
@@ -165,7 +165,7 @@ jobs:
   extra-a-test-1-gpu-large-amd:
     name: ${{ format('extra-a-test-1-gpu-large-amd ({0}, linux-{1}-1gpu-sglang, {2})', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300', matrix.part) }}
     needs: [call-gate]
-    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    if: ${{ !cancelled() && needs.call-gate.result == 'success' && needs.call-gate.outputs.opted-in != 'false' }}
     strategy:
       fail-fast: false
       matrix:
@@ -193,7 +193,7 @@ jobs:
   extra-a-test-2-gpu-large-amd:
     name: ${{ format('extra-a-test-2-gpu-large-amd ({0}, linux-{1}-2gpu-sglang, {2})', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300', matrix.part) }}
     needs: [call-gate]
-    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    if: ${{ !cancelled() && needs.call-gate.result == 'success' && needs.call-gate.outputs.opted-in != 'false' }}
     strategy:
       fail-fast: false
       matrix:
@@ -221,7 +221,7 @@ jobs:
   extra-b-test-4-gpu-amd:
     name: ${{ format('extra-b-test-4-gpu-amd ({0}, linux-{1}-4gpu-sglang)', inputs.rocm_version || 'rocm10', inputs.runner_arch || 'mi300') }}
     needs: [call-gate]
-    if: ${{ !cancelled() && needs.call-gate.result == 'success' }}
+    if: ${{ !cancelled() && needs.call-gate.result == 'success' && needs.call-gate.outputs.opted-in != 'false' }}
     runs-on: ${{ format('linux-{0}-4gpu-sglang', inputs.runner_arch || 'mi300') }}
     steps:
       - name: Checkout code

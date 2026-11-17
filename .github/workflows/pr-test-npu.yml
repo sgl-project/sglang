@@ -106,6 +106,8 @@ jobs:
     needs: check-changes
     if: ${{ inputs.coverage_mode != true && needs.check-changes.outputs.changes_exist == 'true' }}
     uses: ./.github/workflows/pr-gate.yml
+    with:
+      require-label: run-ci-npu-extra
     secrets: inherit
 
   set-image-config:
@@ -123,7 +125,7 @@ jobs:
   # torch_npu / sgl_kernel_npu before importing, so a hosted runner suffices.
   base-a-test-npu:
     needs: [check-changes, pr-gate]
-    if: ${{ !failure() && !cancelled() && inputs.coverage_mode != true && needs.check-changes.outputs.main_package == 'true' }}
+    if: ${{ !failure() && !cancelled() && inputs.coverage_mode != true && needs.check-changes.outputs.main_package == 'true' && needs.pr-gate.outputs.opted-in != 'false' }}
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
@@ -341,11 +343,12 @@ jobs:
     needs: [check-changes, pr-gate]
     if: >-
       ${{ !failure() && !cancelled() &&
-      (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') }}
+      (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true')
+      && needs.pr-gate.outputs.opted-in != 'false' }}
     uses: ./.github/workflows/_pr-test-sgl-router-build.yml
     with:
       runs_on: ubuntu-22.04-arm
-      artifact_name: sgl-router-aarch64
+      artifact_name: sgl-router-aarch64-npu
     secrets: inherit
 
   base-b-test-1-npu-a3:
@@ -353,7 +356,8 @@ jobs:
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
-      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_1_npu_a3 != 'false' }}
+      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_1_npu_a3 != 'false'
+      && needs.pr-gate.outputs.opted-in != 'false' }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-1-npu-a3
@@ -370,7 +374,8 @@ jobs:
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
-      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_2_npu_a3 != 'false' }}
+      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_2_npu_a3 != 'false'
+      && needs.pr-gate.outputs.opted-in != 'false' }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-2-npu-a3
@@ -387,7 +392,8 @@ jobs:
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
-      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_4_npu_a3 != 'false' }}
+      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_4_npu_a3 != 'false'
+      && needs.pr-gate.outputs.opted-in != 'false' }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-4-npu-a3
@@ -407,7 +413,8 @@ jobs:
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
-      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_8_npu_a3 != 'false' }}
+      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_8_npu_a3 != 'false'
+      && needs.pr-gate.outputs.opted-in != 'false' }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-8-npu-a3
@@ -424,7 +431,8 @@ jobs:
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
-      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_16_npu_a3 != 'false' }}
+      needs.recommend-tests-from-coverage.outputs.should_run_base_b_test_16_npu_a3 != 'false'
+      && needs.pr-gate.outputs.opted-in != 'false' }}
     uses: ./.github/workflows/_npu-pr-test-stage.yml
     with:
       self_name: base-b-test-16-npu-a3
@@ -449,7 +457,8 @@ jobs:
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.multimodal_gen == 'true') &&
-      needs.recommend-tests-from-coverage.outputs.should_run_multimodal_gen_test_1_npu_a3 != 'false' }}
+      needs.recommend-tests-from-coverage.outputs.should_run_multimodal_gen_test_1_npu_a3 != 'false'
+      && needs.pr-gate.outputs.opted-in != 'false' }}
     runs-on: linux-aarch64-a3-800t-2
     strategy:
       fail-fast: false
@@ -499,6 +508,8 @@ jobs:
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
           ONLY_TESTS: ${{ needs.recommend-tests-from-coverage.outputs.only_tests_multimodal_gen_test_1_npu_a3 }}
         run: |
+          set -o pipefail
+          mkdir -p "$SGLANG_DIFFUSION_ARTIFACT_DIR"
           # Coverage mode: enumerate this shard's targets with an NPU-only CI
           # helper (it reuses the shared diffusion runner read-only) and run
           # each target in its own `coverage run -m pytest` invocation. The
@@ -565,7 +576,7 @@ jobs:
             --suite 1-npu \
             --partition-id ${{ matrix.part }} \
             --total-partitions 2 \
-            "${FILTER_ARGS[@]}"
+            "${FILTER_ARGS[@]}" 2>&1 | tee "$SGLANG_DIFFUSION_ARTIFACT_DIR/run.log"
 
       - name: Upload diffusion failure artifacts
         if: always()
@@ -589,7 +600,8 @@ jobs:
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.multimodal_gen == 'true') &&
-      needs.recommend-tests-from-coverage.outputs.should_run_multimodal_gen_test_4_npu_a3 != 'false' }}
+      needs.recommend-tests-from-coverage.outputs.should_run_multimodal_gen_test_4_npu_a3 != 'false'
+      && needs.pr-gate.outputs.opted-in != 'false' }}
     runs-on: linux-aarch64-a3-800t-4
     strategy:
       fail-fast: false
@@ -634,6 +646,8 @@ jobs:
           SGLANG_DIFFUSION_ARTIFACT_DIR: ${{ github.workspace }}/diffusion-failures
           ONLY_TESTS: ${{ needs.recommend-tests-from-coverage.outputs.only_tests_multimodal_gen_test_4_npu_a3 }}
         run: |
+          set -o pipefail
+          mkdir -p "$SGLANG_DIFFUSION_ARTIFACT_DIR"
           # Coverage mode: enumerate this shard's targets with an NPU-only CI
           # helper (it reuses the shared diffusion runner read-only) and run
           # each target in its own `coverage run -m pytest` invocation. The
@@ -700,7 +714,7 @@ jobs:
             --suite 2-npu \
             --partition-id ${{ matrix.part }} \
             --total-partitions 2 \
-            "${FILTER_ARGS[@]}"
+            "${FILTER_ARGS[@]}" 2>&1 | tee "$SGLANG_DIFFUSION_ARTIFACT_DIR/run.log"
 
       - name: Upload diffusion failure artifacts
         if: always()
@@ -717,7 +731,8 @@ jobs:
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
-      needs.recommend-tests-from-coverage.outputs.should_run_base_c_test_acc_2_npu_a3 != 'false' }}
+      needs.recommend-tests-from-coverage.outputs.should_run_base_c_test_acc_2_npu_a3 != 'false'
+      && needs.pr-gate.outputs.opted-in != 'false' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: ${{ inputs.coverage_mode == true && 'linux-aarch64-a3-800t-2' || 'linux-aarch64-a3-2-' }}
@@ -736,7 +751,8 @@ jobs:
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
-      needs.recommend-tests-from-coverage.outputs.should_run_base_c_test_acc_16_npu_a3 != 'false' }}
+      needs.recommend-tests-from-coverage.outputs.should_run_base_c_test_acc_16_npu_a3 != 'false'
+      && needs.pr-gate.outputs.opted-in != 'false' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: ${{ inputs.coverage_mode == true && 'linux-aarch64-a3-800t-16' || 'linux-aarch64-a3-16-' }}
@@ -754,7 +770,8 @@ jobs:
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
-      needs.recommend-tests-from-coverage.outputs.should_run_base_c_test_perf_2_npu_a3 != 'false' }}
+      needs.recommend-tests-from-coverage.outputs.should_run_base_c_test_perf_2_npu_a3 != 'false'
+      && needs.pr-gate.outputs.opted-in != 'false' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a3-800t-2
@@ -772,7 +789,8 @@ jobs:
     if: >-
       ${{ !failure() && !cancelled() &&
       (inputs.coverage_mode == true || needs.check-changes.outputs.main_package == 'true') &&
-      needs.recommend-tests-from-coverage.outputs.should_run_base_c_test_perf_16_npu_a3 != 'false' }}
+      needs.recommend-tests-from-coverage.outputs.should_run_base_c_test_perf_16_npu_a3 != 'false'
+      && needs.pr-gate.outputs.opted-in != 'false' }}
     uses: ./.github/workflows/_npu-single-node-test-stage.yml
     with:
       runner: linux-aarch64-a3-800t-16
@@ -797,8 +815,10 @@ jobs:
       ${{ !failure() && !cancelled() &&
       github.event_name == 'pull_request' &&
       inputs.coverage_mode != true &&
-      needs.check-changes.outputs.changes_exist == 'true' }}
+      needs.check-changes.outputs.changes_exist == 'true'
+      && needs.pr-gate.outputs.opted-in != 'false' }}
     outputs:
+      coverage_paths: ${{ steps.export-recs.outputs.coverage_paths }}
       should_run_base_b_test_1_npu_a3: ${{ steps.bucket-tests.outputs.should_run_base_b_test_1_npu_a3 }}
       only_tests_base_b_test_1_npu_a3: ${{ steps.bucket-tests.outputs.only_tests_base_b_test_1_npu_a3 }}
       should_run_base_b_test_2_npu_a3: ${{ steps.bucket-tests.outputs.should_run_base_b_test_2_npu_a3 }}
@@ -935,6 +955,55 @@ jobs:
           path: recommended-tests-report.md
           if-no-files-found: warn
           retention-days: 7
+
+      - name: Export recommended paths for failure analysis
+        id: export-recs
+        continue-on-error: true
+        if: always()
+        run: |
+          FILE="recommended_pytest_paths.txt"
+          if [ -f "$FILE" ]; then
+            {
+              echo "coverage_paths<<EOF"
+              cat "$FILE"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            echo "Exported $(wc -l < "$FILE") recommended paths"
+          else
+            echo "coverage_paths=" >> "$GITHUB_OUTPUT"
+            echo "::notice::recommended_pytest_paths.txt not found"
+          fi
+
+  # ==================== Analyze Failure Report ==================== #
+  # Cross-references test failures with coverage recommendations.
+  # !cancelled() only: skipped jobs in needs poison success().
+  analyze-failure-report:
+    name: Analyze failure report
+    needs:
+      [
+        base-a-test-npu,
+        base-b-test-1-npu-a3,
+        base-b-test-2-npu-a3,
+        base-b-test-4-npu-a3,
+        base-b-test-8-npu-a3,
+        base-b-test-16-npu-a3,
+
+        multimodal-gen-test-1-npu-a3,
+        multimodal-gen-test-4-npu-a3,
+
+        base-c-test-acc-2-npu-a3,
+        base-c-test-acc-16-npu-a3,
+        base-c-test-perf-2-npu-a3,
+        base-c-test-perf-16-npu-a3,
+
+        recommend-tests-from-coverage,
+      ]
+    if: ${{ !cancelled() && inputs.coverage_mode != true }}
+    uses: ./.github/workflows/ci-failure-monitor-diffusion-npu.yml
+    with:
+      log_artifact_pattern: selected-test-logs-*
+      recommendations_content: ${{ needs.recommend-tests-from-coverage.outputs.coverage_paths || '' }}
+      upstream_job_results: ${{ toJSON(needs) }}
 
   # ==================== Coverage Assembly & Publish ==================== #
   # Assembles coverage data and publishes the baseline to OBS.

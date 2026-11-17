@@ -1136,13 +1136,19 @@ def _get_cp_rank_page_bounds(
 
 def filter_kv_indices_for_shard_rank(
     *,
-    kv_indices: np.ndarray,
+    kv_indices: np.ndarray | torch.Tensor,
     index_slice: slice,
     shard_rank: int,
     shard_size: int,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Logical page l lives on rank l % N as local page l // N; returns the owned
-    local ids and their send positions, which replace the contiguous index_slice."""
+    local ids and their send positions, which replace the contiguous index_slice.
+
+    Host tensor inputs must be ready before this synchronous filter runs.
+    """
+    # A one-element torch bool tensor is interpreted as an integer index by
+    # NumPy. Keep the page ids and their positional mask in the same array type.
+    kv_indices = np.asarray(kv_indices)
     owned = kv_indices % shard_size == shard_rank
     positions = np.arange(index_slice.start, index_slice.stop, dtype=np.int64)
     return kv_indices[owned] // shard_size, positions[owned]
@@ -1837,6 +1843,7 @@ def setup_state_kv_args(
     total_kv_layers: Optional[int] = None,
     window_tails: Optional[Dict[str, int]] = None,
     draft_kv_ring: Optional[DFlashDraftKVRing] = None,
+    empty_draft_kv_ring: bool = False,
 ) -> None:
     """Register the storage's state entries in its wire order, and the flags
     peers read from its token KV layout. ``window_tails`` gives the tail each
@@ -1904,6 +1911,10 @@ def setup_state_kv_args(
         append_state_component(
             kv_args, StateType.REQUEST_ROW, *draft_kv_ring.floor_buf_infos()
         )
+    elif empty_draft_kv_ring:
+        # A PP stage without the draft keeps empty slots and sends nothing for them.
+        append_state_component(kv_args, StateType.DRAFT_RING, [], [], [])
+        append_state_component(kv_args, StateType.REQUEST_ROW, [], [], [])
     kv_args.state_window_tails = [
         (window_tails or {}).get(sub_pool) if sub_pool is not None else None
         for sub_pool in kv_args.state_sub_pools

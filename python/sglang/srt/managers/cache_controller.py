@@ -340,6 +340,17 @@ def check_dcp_l3_extra_pool(entry: Any, anchor: Any) -> None:
     ):
         return  # index-K row-sharded like the MLA KV (Kimi-K3.1)
     if (
+        entry.name == PoolName.INDEXER
+        and isinstance(pool, DSAIndexerPoolHost)
+        and not dsa_shards_index_k()
+        and pool.dcp_size == 1
+        and pool.size == anchor.logical_size
+        and pool.storage_page_span == anchor.logical_page_size
+    ):
+        # index-K replicated (DeepSeek-V3.2, GLM): the mirror holds every
+        # rank's slots, so one key is dcp_size of its pages, not one per rank.
+        return
+    if (
         entry.name == PoolName.DRAFT
         and isinstance(pool, MLATokenToKVPoolHost)
         and pool.kv_buffer is not None

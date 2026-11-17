@@ -238,6 +238,10 @@ def _kimi_k31_overrides(server_args: Any, hf_config: Any) -> dict:
         ):
             logger.info("Kimi-K3.1 DCP enables replicated Q projection by default.")
             overrides["dcp_replicate_q_proj"] = True
+    if cfg.enable_flashmla_prefill_token_packing is None:
+        logger.info("Kimi-K3.1 enables FlashMLA prefill token packing by default.")
+        overrides["enable_flashmla_prefill_token_packing"] = True
+    overrides["decode_state_free_radix_default"] = True
     return overrides
 
 

@@ -224,8 +224,6 @@ class GenerateReqInput:
     # Stable identity shared by requests in the same session. Unlike
     # session_params, this does not alter or reconstruct the prompt.
     session_id: Optional[str] = field(default=None, kw_only=True)
-    # The session that spawned this one (an agent's sub-agent); cache hints only.
-    parent_session_id: Optional[str] = field(default=None, kw_only=True)
     # The input prompt. It can be a single prompt or a batch of prompts.
     text: Optional[Union[List[str], str]] = None
     # The token ids for text.
@@ -349,11 +347,6 @@ class GenerateReqInput:
 
     # For DP routing — external router assigns a specific DP worker
     routed_dp_rank: Optional[int] = None
-    # Deprecated alias for `routed_dp_rank`, still accepted because
-    # sgl-model-gateway's dp-aware mode injects this spelling into every
-    # request it forwards (DPAwareWorker::prepare_request), and the OpenAI
-    # entrypoints and Engine.generate() accept it as well.
-    data_parallel_rank: Optional[int] = None
     # For PD disagg — hint telling decode which prefill DP worker has the KV cache
     disagg_prefill_dp_rank: Optional[int] = None
     # Routing key for routing-key schedule policy
@@ -485,18 +478,6 @@ class GenerateReqInput:
             ValueError: If inputs are not properly specified (e.g., none or all of
                        text, input_ids, input_embeds are provided)
         """
-        if self.data_parallel_rank is not None:
-            import warnings
-
-            warnings.warn(
-                "'data_parallel_rank' is deprecated, use 'routed_dp_rank' instead.",
-                DeprecationWarning,
-                stacklevel=2,
-            )
-            if self.routed_dp_rank is None:
-                self.routed_dp_rank = self.data_parallel_rank
-            self.data_parallel_rank = None
-
         self._validate_inputs()
         self._determine_batch_size()
         if self.session_id is not None and self.session_params is not None:
@@ -1092,7 +1073,6 @@ class GenerateReqInput:
         sub = GenerateReqInput(
             rid=self.rid[i],
             session_id=self.session_id,
-            parent_session_id=self.parent_session_id,
             text=self.text[i] if self.text is not None else None,
             input_ids=self.input_ids[i] if self.input_ids is not None else None,
             input_embeds=(
@@ -1315,8 +1295,6 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # scheduler (encoder disaggregation). A defaulted tail field, so older
     # IPC senders decode as None.
     mm_routing_labels: Optional[Dict[str, List[str]]] = None
-    # See GenerateReqInput.parent_session_id; a defaulted tail field.
-    parent_session_id: Optional[str] = None
 
     def wrap_pickle_fields(self):
         self.mm_inputs = wrap_object_fields_as_pickle(self.mm_inputs)

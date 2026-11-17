@@ -85,6 +85,7 @@ _SECRETS = {
     "api_key": "api-secret",
     "admin_api_key": "admin-secret",
     "ssl_keyfile_password": "ssl-secret",
+    "hicache_storage_backend_extra_config": '{"secret_key": "s3-secret"}',
     "watermark_key": "abcdef0123456789",
     "watermark_key_b": "0123456789abcdef",
 }
@@ -223,10 +224,18 @@ class TestTokenizerManagerCrashDump(CustomTestCase):
                 _server_args_for_dump=lambda: passed,
                 _dump_config_snapshot=server_args.resolved_dict,
             )
+            context = create_context(server_args, role="test")
+            # A runtime HiCache attach logs its config among the config updates.
+            context.override(
+                "tokenizer.attach_hicache",
+                hicache_storage_backend_extra_config=_SECRETS[
+                    "hicache_storage_backend_extra_config"
+                ],
+            )
             with (
                 self.subTest(type(passed).__name__),
                 tempfile.TemporaryDirectory() as folder,
-                use_context(create_context(server_args, role="test")),
+                use_context(context),
                 patch.object(sys, "argv", list(_SECRET_ARGV)),
                 envs.SGLANG_PYSPY_DUMP_BEFORE_CRASH.override(False),
                 envs.SGLANG_CUDA_COREDUMP_BEFORE_CRASH.override(False),

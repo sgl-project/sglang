@@ -398,7 +398,7 @@ def _sparse_mla_fwd_split_dim_kernel(
     SEQ_BUCKET: tl.constexpr,
     BLOCK_N: tl.constexpr,
 ):
-    s_i = tl.program_id(0)
+    s_i = tl.program_id(0).to(tl.int64)
 
     h = tl.arange(0, H)
     dt = tl.arange(0, D_TAIL)
@@ -682,7 +682,7 @@ def _sparse_mla_fused_kernel(
     KV_SCALED: tl.constexpr = False,
 ):
     """Single-pass with head-block splitting. grid=(seq, head_blocks)."""
-    t = tl.program_id(0)
+    t = tl.program_id(0).to(tl.int64)
     pid_h = tl.program_id(1)
 
     h_offs = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
@@ -872,7 +872,7 @@ def _sparse_mla_split_k_kernel(
     KV_SCALED: tl.constexpr = False,
 ):
     """Split-K partial kernel. grid=(seq, head_blocks, kv_splits)."""
-    t = tl.program_id(0)
+    t = tl.program_id(0).to(tl.int64)
     pid_h = tl.program_id(1)
     pid_k = tl.program_id(2)
 
@@ -1059,7 +1059,7 @@ def _sparse_mla_reduce_kernel(
     STORE_LSE: tl.constexpr = False,
 ):
     """Reduce split-K partials via log-space combine. grid=(seq, H, d_v_chunks)."""
-    t = tl.program_id(0)
+    t = tl.program_id(0).to(tl.int64)
     h = tl.program_id(1)
     dc = tl.program_id(2)
 

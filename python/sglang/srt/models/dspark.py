@@ -513,6 +513,9 @@ def _has_mla_layers(layers) -> bool:
 
 class DSparkDraftMixin:
     supports_pre_gather_target_hidden_projection = True
+    # project_target_hidden may run before the target's SP gather on rank-local
+    # rows, where the split fc's TP all-reduce does not apply.
+    supports_fc_tp_split = False
     # Drafts whose base logits leave the vocab-parallel lm_head via a TP-sharded
     # VanillaMarkov step (per-shard candidates) or the multimem all-gather.
     supports_vocab_parallel_draft_logits = False

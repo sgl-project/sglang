@@ -19,7 +19,7 @@ from sglang.srt.utils.device import (
     is_gfx1250_supported,
     is_hip,
 )
-from sglang.srt.utils.log_utils import freeze_gc
+from sglang.srt.utils.gc_utils import freeze_gc
 from sglang.test.ci.ci_register import (
     register_amd_ci,
     register_cpu_ci,

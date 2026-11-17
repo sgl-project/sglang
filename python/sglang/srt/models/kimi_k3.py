@@ -959,6 +959,8 @@ class KimiK3MoE(nn.Module):
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.mega_moe import (
             _configure_mega_moe_deep_gemm_num_sms,
+            _mega_moe_global_tokens_hint,
+            _mega_moe_mma_type,
         )
 
         # Under SP-MoE these rows are this rank's shard of the batch; an unpadded
@@ -973,6 +975,7 @@ class KimiK3MoE(nn.Module):
             f"{num_max_tokens_per_rank}; K3 has no non-mega fallback — raise "
             f"the env var to cover the per-rank rows"
         )
+        mma_type = _mega_moe_mma_type(self.experts)
         buf = self._mega_moe_buffer()
 
         if num_tokens > 0:
@@ -986,7 +989,18 @@ class KimiK3MoE(nn.Module):
                 (0, self._mega_top_k), dtype=torch.float32
             )
 
-        mega_moe_pre_dispatch(
+        valid_rows = None
+        if valid_token_count is not None and mma_type == "mxf4xmxf4":
+            # The graph bucket is static; its live CP prefix changes on replay.
+            # Mask NaNs as well as routes before quantization/dispatch.
+            valid_rows = (
+                torch.arange(num_tokens, device=routed_input.device) < valid_token_count
+            )
+            routed_input = routed_input.masked_fill(~valid_rows[:, None], 0)
+            topk_ids_in = topk_ids_in.masked_fill(~valid_rows[:, None], -1)
+            topk_weights_in = topk_weights_in.masked_fill(~valid_rows[:, None], 0)
+
+        dispatch_args = (
             routed_input,
             topk_ids_in,
             topk_weights_in,
@@ -994,9 +1008,21 @@ class KimiK3MoE(nn.Module):
             buf.x_sf,
             buf.topk_idx,
             buf.topk_weights,
-            quant_group_size=32,
-            num_token_non_padded=valid_token_count,
         )
+        if mma_type == "mxf4xmxf4":
+            # The SGLang dispatcher writes FP8; packed E2M1 uses DeepGEMM.
+            deep_gemm.mega_moe_pre_dispatch(
+                *dispatch_args,
+                num_tokens=num_tokens,
+                group_size=32,
+                mma_type=mma_type,
+            )
+        else:
+            mega_moe_pre_dispatch(
+                *dispatch_args,
+                quant_group_size=32,
+                num_token_non_padded=valid_token_count,
+            )
         # At least one row so the tvm-ffi binding sees a non-null data_ptr.
         y = torch.empty(
             (max(num_tokens, 1), self.moe_hidden_size),
@@ -1012,10 +1038,12 @@ class KimiK3MoE(nn.Module):
                 recipe=(1, 1, 32),
                 activation="situ",
                 fast_math=True,
+                global_num_tokens=_mega_moe_global_tokens_hint(buf),
             )
         y = y[:num_tokens]
-        if valid_token_count is not None:
-            valid_rows = torch.arange(num_tokens, device=y.device) < valid_token_count
+        # fp8xfp4: the pre-dispatch routes rows past valid_token_count to -1 and
+        # the combine writes zeros for a row with no route, so only mxf4 masks.
+        if valid_rows is not None:
             y.masked_fill_(~valid_rows[:, None], 0)
         if not self.experts.should_fuse_routed_scaling_factor_in_topk:
             if (
@@ -1368,6 +1396,9 @@ class KimiK3MoE(nn.Module):
         topk_output = None
         if routed_input is not None:
             topk_output, routed_input = routed_input
+        elif hidden_states.shape[0] == 0:
+            # An idle DP-attention rank routes nothing but still enters the EP dispatch.
+            topk_output = self.topk.empty_topk_output(hidden_states.device)
         else:
             # MoEGate produces fp32 router logits on CUDA (via linear_bf16_fp32
             # or tiny_gemm_bf16); non-CUDA falls back to F.linear (bf16). The
@@ -2546,6 +2577,8 @@ class KimiK3DeltaAttention(nn.Module):
 class KimiK3MLAAttention(DeepseekV2AttentionMLA):
     """MLA with output gate for K3. Gate is applied in TP-local space before o_proj."""
 
+    # Kimi-K3.1 DSA layers (K3 has no indexer)
+    dsa_decode_absorb_under_indexer = True
     dcp_v_preproject = True
 
     def __init__(
@@ -3149,13 +3182,16 @@ class KimiK3DecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         if isinstance(self.mlp, KimiK3MoE) and self.mlp._use_mega_moe:
-            valid_token_count = None
             if is_interleave_extend(forward_batch):
                 from sglang.srt.layers.cp.base import get_cp_strategy
 
                 valid_token_count = get_cp_strategy().moe_num_token_non_padded(
                     forward_batch
                 )
+            else:
+                # Padded rows (a graph bucket, or SP rows rounded up to attention TP)
+                # would route stale contents onto a few experts every rank waits on.
+                valid_token_count = forward_batch.moe_num_token_non_padded()
             hidden_states = self.mlp(
                 hidden_states,
                 prefix_sum=(
@@ -3822,6 +3858,19 @@ class KimiK3LinearForCausalLM(nn.Module):
     def _check_dsa_indexer_loaded(self, loaded_params: set[str]) -> None:
         if self.config.dsa_config is None:
             return
+        start, end = self.model.start_layer, self.model.end_layer
+        num_dsa_layers = sum(
+            start <= i < end for i in self.config.full_attention_layer_ids
+        )
+        num_indexers = sum(
+            isinstance(layer.self_attn, KimiK3MLAAttention)
+            and layer.self_attn.indexer is not None
+            for layer in self.model.layers[start:end]
+        )
+        assert num_indexers == num_dsa_layers, (
+            f"Kimi-K3.1: built {num_indexers} DSA indexers for {num_dsa_layers} "
+            "DSA layers."
+        )
         expected = {
             name for name, _ in self.named_parameters() if ".self_attn.indexer." in name
         }
@@ -3937,6 +3986,12 @@ class KimiK3LinearForCausalLM(nn.Module):
             if isinstance(layer.self_attn, KimiK3DeltaAttention):
                 layer.self_attn._merge_bfa_weights()
                 layer.self_attn._prepare_fused_decode()
+            if (
+                isinstance(layer.self_attn, KimiK3MLAAttention)
+                and layer.self_attn.indexer is not None
+            ):
+                layer.self_attn.indexer.prepare_merged_k_gate()
+                layer.self_attn.indexer.tp_split_min_rows = 1024
 
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer) or not isinstance(

@@ -170,8 +170,11 @@ class SchedulerBatchResultProcessor:
                 req.time_stats.set_quick_finish_time()
                 self.request_retirer.release(req, checkpoint=True)
 
+        # Running requests send the prefill token with their first decode output.
         # Note: Logprobs should be handled on the prefill engine.
-        self.output_streamer.stream_output(batch.reqs, batch.return_logprob)
+        self.output_streamer.stream_output(
+            [req for req in batch.reqs if req.finished()], batch.return_logprob
+        )
         if use_free_group:
             self.token_to_kv_pool_allocator.free_group_end()
 
@@ -1631,6 +1634,7 @@ class SchedulerBatchResultProcessor:
             result.num_correct_drafts_per_req_cpu is None
             or req.kv.mamba_ping_pong_track_buffer is not None
             or not self.tree_cache.supports_mamba()
+            or self.tree_cache.request_mamba_only
         ):
             return True
 
