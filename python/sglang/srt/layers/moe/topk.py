@@ -1967,6 +1967,24 @@ def _biased_grouped_topk_postprocess(
     return topk_ids
 
 
+def _aiter_uses_jit_router(
+    num_expert_group: Optional[int],
+    topk_group: Optional[int],
+    dynamic_bias: bool,
+    num_fused_shared_experts: int,
+) -> bool:
+    """Single-group biased routing with fused shared experts on aiter gfx95 goes
+    through the Triton router, which also writes the shared-expert columns."""
+    return (
+        _use_aiter
+        and _is_gfx95
+        and not dynamic_bias
+        and num_fused_shared_experts > 0
+        and (num_expert_group or 1) == 1
+        and (topk_group or 1) == 1
+    )
+
+
 def biased_grouped_topk_gpu(
     hidden_states: torch.Tensor,
     gating_output: torch.Tensor,
@@ -1978,25 +1996,44 @@ def biased_grouped_topk_gpu(
     num_fused_shared_experts: int = 0,
     routed_scaling_factor: Optional[float] = None,
     apply_routed_scaling_factor_on_output: Optional[bool] = False,
+    router_logits_partials: Optional[torch.Tensor] = None,
+    num_token_non_padded: Optional[torch.Tensor] = None,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """router_logits_partials (ROCm split-K router GEMV): fp32 partials the Triton
+    router sums in place of gating_output, which is then left unfilled.
+    num_token_non_padded (aiter Triton router only): rows past it get routed ids 0,
+    the shared ids and zero weights, the padded rows of the unfused ROCm path."""
     num_tokens = gating_output.shape[0]
     num_experts = gating_output.shape[1]
     experts_per_group = (
         num_experts // num_expert_group if num_expert_group else num_experts
     )
     dynamic_bias = correction_bias.ndim == 2
+    assert (
+        router_logits_partials is None and num_token_non_padded is None
+    ) or _aiter_uses_jit_router(
+        num_expert_group, topk_group, dynamic_bias, num_fused_shared_experts
+    )
 
     # topk for routed experts only (shared experts are appended separately below)
     topk_routed = topk - num_fused_shared_experts
     # The JIT router accepts one shared bias vector, not per-token bias rows.
-    if (
-        not dynamic_bias
-        and (
-            (_is_cuda and num_expert_group and num_expert_group > 1)
-            # ROCm also admits single-group routing; CUDA's condition is unchanged.
-            or (_is_hip and num_expert_group)
+    # On ROCm it is the default for single-group routing: one launch replaces the
+    # fp32 cast, aiter biased_grouped_topk and the shared-expert append (GLM-5.3-Flash,
+    # 288 experts top-8 + 1 shared: 9.2-9.5 -> 4.7 us at 6-96 rows on MI355X).
+    if not dynamic_bias and (
+        (
+            (
+                (_is_cuda and num_expert_group and num_expert_group > 1)
+                # ROCm also admits single-group routing; CUDA's condition is unchanged.
+                or (_is_hip and num_expert_group)
+            )
+            and envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get()
         )
-    ) and envs.SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK.get():
+        or _aiter_uses_jit_router(
+            num_expert_group, topk_group, dynamic_bias, num_fused_shared_experts
+        )
+    ):
         # Opt-in: unified Triton router for DeepSeek-V3 grouped routing. Bit-exact
         # with the flashinfer/AOT paths on DeepSeek-V3.2 e2e (validated); handles any
         # experts-per-group (no <=32 cap). Off by default — see the env-var comment.
@@ -2009,7 +2046,7 @@ def biased_grouped_topk_gpu(
         #
         # AITER folds this route even when no shared slots are requested.
         return jit_grouped_gate(
-            gating_output,
+            gating_output if router_logits_partials is None else router_logits_partials,
             correction_bias.to(dtype=torch.float32),
             topk + num_fused_shared_experts if _use_aiter else topk,
             scoring_func="sigmoid",
@@ -2023,6 +2060,8 @@ def biased_grouped_topk_gpu(
             ),
             num_expert_group=num_expert_group,
             topk_group=topk_group,
+            num_token_non_padded=num_token_non_padded,
+            padded_routed_id=-1 if num_token_non_padded is None else 0,
         )
     if _is_cuda and not dynamic_bias and num_expert_group and num_expert_group > 1:
         # One-warp-per-token CUDA router (same selection as flashinfer's
@@ -2687,7 +2726,7 @@ def _post_process_topk_ids(
         _fold_pad_weights_into_append = (
             _fold_pad_into_append and not use_per_rank_shared_slots
         )
-        if not _fold_pad_into_append:
+        if not _fold_pad_into_append and not padded_rows_masked:
             _mask_topk_ids_padded_region(topk_ids, num_token_non_padded, fill_value=0)
         if (
             envs.SGLANG_AITER_MEGA_EPLB_PREFILL_ONLY.get()
@@ -2833,7 +2872,12 @@ def _post_process_topk_ids(
                 _padded_row_mask(topk_ids, num_token_non_padded)[:, None], -1
             )
 
-    if _is_hip and not _skip_hip_pad_mask and not _fold_pad_weights_into_append:
+    if (
+        _is_hip
+        and not _skip_hip_pad_mask
+        and not _fold_pad_weights_into_append
+        and not padded_rows_masked
+    ):
         # Shared-expert append/remap can introduce non-zero weights after the
         # initial HIP padding mask above. Ensure padded tokens leave this helper
         # with all expert weights zeroed.
@@ -2887,18 +2931,38 @@ def select_experts(
         )
     routing_overridden = simulate_uniform_experts or simulate_round_robin_experts
 
-    if router_logits_partials is not None and not (
-        _use_aiter
-        and scoring_func == "sqrtsoftplus"
-        and custom_routing_function is None
-        and not use_grouped_topk
-        and not torch_native
-        and expert_location_dispatch_info is None
-        and (
-            num_shared_topk_slots == 0
-            or has_per_rank_fused_shared_slots(num_shared_topk_slots)
-            or not is_expert_remapping_enabled()
+    # The aiter Triton router writes the shared columns and padded rows itself.
+    jit_router_writes_shared = (
+        use_grouped_topk
+        and correction_bias is not None
+        and dynamic_expert_bias is None
+        and not has_per_rank_fused_shared_slots(num_shared_topk_slots)
+        and _aiter_uses_jit_router(
+            num_expert_group, topk_group, False, num_shared_topk_slots
         )
+    )
+    partials_to_grouped_router = (
+        jit_router_writes_shared
+        and scoring_func == "sigmoid"
+        and expert_location_dispatch_info is None
+        and not routing_overridden
+    )
+    if (
+        router_logits_partials is not None
+        and not (
+            _use_aiter
+            and scoring_func == "sqrtsoftplus"
+            and custom_routing_function is None
+            and not use_grouped_topk
+            and not torch_native
+            and expert_location_dispatch_info is None
+            and (
+                num_shared_topk_slots == 0
+                or has_per_rank_fused_shared_slots(num_shared_topk_slots)
+                or not is_expert_remapping_enabled()
+            )
+        )
+        and not partials_to_grouped_router
     ):
         # only the aiter sqrtsoftplus gate takes the partials; every other route reads router_logits
         rocm_router_reduce_partials(router_logits_partials, router_logits)
@@ -2933,7 +2997,9 @@ def select_experts(
     # the shared columns, so the router selects and renormalizes routed experts only.
     if _use_aiter or has_per_rank_fused_shared_slots(num_shared_topk_slots):
         top_k_for_gate = num_routed_topk
-        num_shared_topk_slots_for_gate = 0
+        num_shared_topk_slots_for_gate = (
+            num_shared_topk_slots if jit_router_writes_shared else 0
+        )
     else:
         top_k_for_gate = top_k
         num_shared_topk_slots_for_gate = num_shared_topk_slots
@@ -2984,6 +3050,12 @@ def select_experts(
                     and num_shared_topk_slots == 0
                 ),
             )
+            jit_router_kwargs = {}
+            if jit_router_writes_shared:
+                jit_router_kwargs = dict(
+                    router_logits_partials=router_logits_partials,
+                    num_token_non_padded=num_token_non_padded,
+                )
             topk_weights, topk_ids = biased_grouped_topk(
                 hidden_states=hidden_states,
                 gating_output=router_logits,
@@ -2995,8 +3067,11 @@ def select_experts(
                 num_fused_shared_experts=num_shared_topk_slots_for_gate,
                 routed_scaling_factor=routed_scaling_factor,
                 apply_routed_scaling_factor_on_output=apply_routed_scaling_factor_on_output,
+                **jit_router_kwargs,
             )
-            padded_rows_masked = route_quant_handoff.take_padded_rows_masked()
+            padded_rows_masked = route_quant_handoff.take_padded_rows_masked() or (
+                jit_router_kwargs.get("num_token_non_padded") is not None
+            )
     elif torch_native and custom_routing_function is None:
         fold_scale_after_routing = True
         topk_weights, topk_ids = fused_topk_native(

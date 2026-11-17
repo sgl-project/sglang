@@ -12,6 +12,8 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 
 # the GEMV walks 16-row tiles inside one program, so every M runs the same tile (batch invariance)
 ROCM_ROUTER_MAX_TOKENS = 64
+# GLM-5.3-Flash MTP verify rows (16 x 6); [96, 4096] x [288, 4096].T is 5.2 us vs 6.4 us for hipBLASLt
+ROCM_GLM_ROUTER_MAX_TOKENS = 96
 
 _BLOCK_M = 16
 _BLOCK_N = 16
@@ -80,9 +82,8 @@ def rocm_router_gemv_split_k(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
     M, K = x.shape
     N, K_w = w.shape
     assert K == K_w and K % _BLOCK_K == 0 and N % _BLOCK_N == 0
-    assert 0 < M <= ROCM_ROUTER_MAX_TOKENS, (
-        f"{M} rows: the split-K GEMV serves at most {ROCM_ROUTER_MAX_TOKENS}"
-    )
+    max_rows = max(ROCM_ROUTER_MAX_TOKENS, ROCM_GLM_ROUTER_MAX_TOKENS)
+    assert 0 < M <= max_rows, f"{M} rows: the split-K GEMV serves at most {max_rows}"
     assert x.dtype == torch.bfloat16 and w.dtype == torch.bfloat16
     assert x.stride(1) == 1 and w.stride(1) == 1
     split_k = K // _BLOCK_K
