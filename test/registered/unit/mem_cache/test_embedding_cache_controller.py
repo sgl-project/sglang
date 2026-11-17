@@ -404,7 +404,10 @@ class _FakeDeviceTensor:
 class TestDeviceAgnosticCopyPath(unittest.TestCase):
     """The D2H staging path must dispatch on the tensor device, not on CUDA."""
 
-    def test_copy_tensor_to_pool_dispatches_on_npu_device(self):
+    def test_copy_tensor_to_pool_dispatches_on_non_cuda_device(self):
+        """Use a meta device (never cuda/cpu) to prove the D2H path dispatches
+        on the tensor's own device. meta parses in stock torch on any host,
+        unlike "npu" which requires torch_npu to be installed."""
         ctrl = _make_controller(num_pages=4, dim=4, page_size=2)
         entry = EmbeddingCacheEntry(
             hash="h",
@@ -415,7 +418,7 @@ class TestDeviceAgnosticCopyPath(unittest.TestCase):
             state=EntryState.FILLING,
         )
         ctrl.entries["h"] = entry
-        tensor = _FakeDeviceTensor("npu:0")
+        tensor = _FakeDeviceTensor("meta:0")
 
         producer_stream = MagicMock()
         copy_stream = MagicMock()
@@ -442,23 +445,23 @@ class TestDeviceAgnosticCopyPath(unittest.TestCase):
         ):
             handle = ctrl._copy_tensor_to_pool(tensor, entry, ctrl.vision_pool)
 
-        get_device_module.assert_called_once_with(torch.device("npu:0"))
-        device_module.current_stream.assert_called_once_with(torch.device("npu:0"))
-        create_device_event.assert_called_once_with(torch.device("npu:0"))
+        get_device_module.assert_called_once_with(torch.device("meta:0"))
+        device_module.current_stream.assert_called_once_with(torch.device("meta:0"))
+        create_device_event.assert_called_once_with(torch.device("meta:0"))
         device_stream_context.assert_called_once_with(copy_stream)
         copy_stream.wait_stream.assert_called_once_with(producer_stream)
         self.assertIs(tensor.recorded_stream, copy_stream)
         event.record.assert_called_once_with(copy_stream)
-        self.assertEqual(handle.device, torch.device("npu:0"))
+        self.assertEqual(handle.device, torch.device("meta:0"))
 
-    def test_load_to_device_async_dispatches_on_npu_device(self):
+    def test_load_to_device_async_dispatches_on_non_cuda_device(self):
         """The H2D cache-hit path (host pool -> NPU) must dispatch on the
         tensor device and run the copy on the side copy stream."""
         ctrl = _make_controller(num_pages=4, dim=4, page_size=2)
         src = torch.arange(8, dtype=torch.float32).reshape(2, 4)
         _insert_ready_entry(ctrl, "h", src)
 
-        dst = _FakeDeviceTensor("npu:0")
+        dst = _FakeDeviceTensor("meta:0")
         copy_stream = MagicMock()
         event = MagicMock()
 
@@ -498,10 +501,10 @@ class TestDeviceAgnosticCopyPath(unittest.TestCase):
                 handle = ctrl.load_to_device_async("h", dst, dst_token_offset=0)
 
         self.assertIsNotNone(handle)
-        create_device_event.assert_called_once_with(torch.device("npu:0"))
+        create_device_event.assert_called_once_with(torch.device("meta:0"))
         device_stream_context.assert_called_once_with(copy_stream)
         event.record.assert_called_once_with(copy_stream)
-        self.assertEqual(handle.device, torch.device("npu:0"))
+        self.assertEqual(handle.device, torch.device("meta:0"))
         self.assertEqual(handle.entry_hash, "h")
         # The READY entry stays pinned until wait_load_to_device().
         self.assertEqual(ctrl.entries["h"].ref_count, 1)
