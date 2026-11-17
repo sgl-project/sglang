@@ -43,6 +43,70 @@ logger = logging.getLogger(__name__)
 _DAEMON_LIVENESS_POLL_INTERVAL = 5.0
 
 
+def _capture_moe_bias_references(model, tensors, entries):
+    """Find only routing biases backed by registered tensors being replaced."""
+    from sglang.srt.layers.moe.topk import TopKConfig
+
+    targets = []
+    for module in model.modules():
+        # A2A paths can read a plain attribute in addition to the TopK config.
+        config = vars(module).get("topk_config")
+        holders = (module, config) if isinstance(config, TopKConfig) else (module,)
+        for holder in holders:
+            bias = vars(holder).get("correction_bias")
+            if isinstance(bias, torch.Tensor):
+                targets.append((holder, bias))
+    if not targets:
+        return []
+
+    by_object = {id(t): (name, t) for name, t in tensors.items() if name in entries}
+    # Every meta tensor has data_ptr() == 0, even with independent storage.
+    wanted_storages = {
+        (bias.untyped_storage()._cdata, bias.dtype)
+        for _, bias in targets
+        if id(bias) not in by_object and bias.layout == torch.strided
+    }
+    by_storage = {}
+    if wanted_storages:
+        for name, tensor in by_object.values():
+            if tensor.layout == torch.strided:
+                key = (tensor.untyped_storage()._cdata, tensor.dtype)
+                if key in wanted_storages:
+                    previous = by_storage.get(key)
+                    if previous is None or tensor.numel() > previous[1].numel():
+                        by_storage[key] = (name, tensor)
+
+    references = []
+    for holder, bias in targets:
+        source = by_object.get(id(bias))
+        if source is None and bias.layout == torch.strided:
+            source = by_storage.get((bias.untyped_storage()._cdata, bias.dtype))
+        if source is not None:
+            references.append((holder, bias, *source))
+    return references
+
+
+def _restore_moe_bias_references(model, references):
+    restored = {}
+    for holder, bias, name, old_source in references:
+        new_bias = restored.get(id(bias))
+        if new_bias is None:
+            parent, _, leaf = name.rpartition(".")
+            new_bias = getattr(model.get_submodule(parent), leaf)
+            if bias is not old_source:
+                if new_bias.stride() != old_source.stride():
+                    raise RuntimeError(f"Cannot restore MoE bias view of restrided {name}")
+                offset = bias.storage_offset() - old_source.storage_offset()
+                new_bias = new_bias.detach().as_strided(
+                    bias.shape, bias.stride(), new_bias.storage_offset() + offset
+                )
+            restored[id(bias)] = new_bias
+        if isinstance(holder, nn.Module):
+            holder.correction_bias = new_bias
+        else:
+            holder.set_correction_bias(new_bias)
+
+
 class IpcModelLoader(BaseModelLoader):
     """Load model weights from a Weight Cache Daemon via CUDA IPC handles.
 
@@ -345,6 +409,9 @@ class IpcModelLoader(BaseModelLoader):
         }
         existing_buffers = {name: buf for name, buf in model.named_buffers()}
         existing_names = set(existing_params) | set(existing_buffers)
+        bias_references = _capture_moe_bias_references(
+            model, existing_params | existing_buffers, entries
+        )
 
         imported_refs = []
         imported_count = 0
@@ -430,6 +497,7 @@ class IpcModelLoader(BaseModelLoader):
                 f"{'...' if len(still_on_meta_buffers) > 10 else ''}"
             )
 
+        _restore_moe_bias_references(model, bias_references)
         map_elapsed = time.perf_counter() - map_tic
 
         # Stash IPC refs on the model to prevent GC (which would unmap the memory)
