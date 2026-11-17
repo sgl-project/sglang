@@ -273,6 +273,9 @@ class GenerateReqInput:
     # Return routed experts, indexer top-k, and sampling mask via --output-store-backend
     # as meta_info.output_store_ref; one prompt, n=1, no streaming or beam search.
     return_outputs_via_store: bool = False
+    # Ascending layer ids in (0, num_hidden_layers) at which the stored routed experts
+    # and indexer top-k are cut into one field per layer block; tokenizer-only.
+    replay_layer_splits: Optional[List[int]] = None
 
     # The modalities of the image data [image, multi-images, video]
     modalities: Optional[List[str]] = None
@@ -1051,6 +1054,7 @@ class GenerateReqInput:
             routed_experts_start_len=self.routed_experts_start_len,
             return_indexer_topk=self.return_indexer_topk,
             return_outputs_via_store=self.return_outputs_via_store,
+            replay_layer_splits=self.replay_layer_splits,
             modalities=self.modalities[i] if self.modalities else None,
             session_params=self.session_params,
             lora_path=self.lora_path[i] if self.lora_path is not None else None,

@@ -1417,6 +1417,7 @@ class OpenAIServingChat(OpenAIServingBase):
             routed_experts_start_len=request.routed_experts_start_len,
             return_indexer_topk=request.return_indexer_topk,
             return_outputs_via_store=request.return_outputs_via_store,
+            replay_layer_splits=request.replay_layer_splits,
             rid=request.rid,
             session_id=request.session_id,
             extra_key=request.extra_key,

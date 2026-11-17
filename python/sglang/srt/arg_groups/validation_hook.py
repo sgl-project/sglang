@@ -167,6 +167,12 @@ def check_pipeline_parallel_compat(cfg: Any) -> None:
         "parallelism: allocatable slots per microbatch are bounded by "
         "pp-max-micro-batch-size, so the threshold may never be reached"
     )
+    assert not (cfg.enable_return_routed_experts or cfg.enable_return_indexer_topk), (
+        "--enable-return-routed-experts and --enable-return-indexer-topk are not "
+        "supported with pipeline parallelism: each stage captures only its own "
+        "layers and only the first stage's capture reaches the response, so the "
+        "other stages' layers would be returned as zeros"
+    )
 
 
 def check_server_args(server_args: Any):
