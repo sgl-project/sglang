@@ -20,6 +20,7 @@ It supports page size = 1.
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage1.py
 # https://github.com/ModelTC/lightllm/blob/96353e868a840db4d103138caf15ed9dbea8c186/lightllm/models/deepseek2/triton_kernel/gqa_flash_decoding_stage2.py
 
+import functools
 import logging
 import math
 from typing import NamedTuple, Optional, Tuple
@@ -32,18 +33,38 @@ from sglang.kernels.arch import current_arch
 from sglang.kernels.ops.attention.score_mod import unpack_aux_tensors
 from sglang.srt.environ import envs
 from sglang.srt.utils import (
+    get_device_core_count,
     is_gfx95_supported,
     is_gfx1250_supported,
     is_hip,
 )
 
-# Above this split budget the grouped stage 1 loops over splits in a fixed number of
-# blocks per (request, head tile) instead of launching one block per split.
+# Above this split budget the grouped stage 1 may loop over splits in a fixed number
+# of blocks per (request, head tile) instead of launching one block per split.
 _MAX_SPLIT_PROGRAMS = 32
 _is_hip = is_hip()
 _is_gfx1250 = _is_hip and is_gfx1250_supported()
 
 logger = logging.getLogger(__name__)
+
+
+@functools.lru_cache(maxsize=None)
+def _device_core_count(device_index: int) -> int:
+    return get_device_core_count(device_index)
+
+
+def _split_programs(
+    batch: int, head_tiles: int, max_kv_splits: int, core_count: int
+) -> int:
+    """Blocks per (request, head tile) for the grouped stage 1, or 0 for one block
+    per split. Looping is used only when enough blocks remain to cover the device,
+    so a budget sized by the core count (normal-mode MLA) keeps one block per split
+    at small batch. Every split is computed the same way for any block count."""
+    programs = max(
+        _MAX_SPLIT_PROGRAMS,
+        triton.next_power_of_2(triton.cdiv(core_count, batch * head_tiles)),
+    )
+    return programs if programs < max_kv_splits else 0
 
 
 _MIN_BLOCK_KV = 32
@@ -885,10 +906,13 @@ def _decode_grouped_att_m_fwd(
 
     # Blocks at or above the split count return immediately, so the grid shrinks too.
     # A large split budget (deterministic mode sizes it by the context length) would
-    # launch mostly empty blocks; a fixed number of blocks then loops over the splits.
+    # launch mostly empty blocks; enough blocks to cover the device then loop over the
+    # splits.
     split_stride = 0
     if not forced_kv_splits and MAX_KV_SPLITS > _MAX_SPLIT_PROGRAMS:
-        split_stride = _MAX_SPLIT_PROGRAMS
+        split_stride = _split_programs(
+            batch, head_tiles, MAX_KV_SPLITS, _device_core_count(q.device.index or 0)
+        )
     grid = (batch, head_tiles, forced_kv_splits or split_stride or MAX_KV_SPLITS)
 
     k_slot_stride, k_head_stride, k_page_stride, k_tok_stride = _extract_kv_strides(

@@ -978,8 +978,10 @@ class TestTritonAttention(CustomTestCase):
         sinks = torch.randn(H_Q, dtype=torch.float32, device=device)
 
         def run(max_split_programs):
-            old = da._MAX_SPLIT_PROGRAMS
+            old = da._MAX_SPLIT_PROGRAMS, da._device_core_count
+            # One core: the block count is _MAX_SPLIT_PROGRAMS, whatever the device.
             da._MAX_SPLIT_PROGRAMS = max_split_programs
+            da._device_core_count = lambda device_index: 1
             try:
                 o = torch.zeros(B, H_Q, D, dtype=dtype, device=device)
                 attn_logits = torch.empty(
@@ -1005,7 +1007,7 @@ class TestTritonAttention(CustomTestCase):
                 )
                 return o
             finally:
-                da._MAX_SPLIT_PROGRAMS = old
+                da._MAX_SPLIT_PROGRAMS, da._device_core_count = old
 
         one_block_per_split = run(max_kv_splits)
         for programs in (1, 8, 32):
@@ -1013,6 +1015,24 @@ class TestTritonAttention(CustomTestCase):
                 torch.equal(run(programs), one_block_per_split),
                 f"{programs} blocks per request and head tile differ",
             )
+
+    def test_grouped_decode_split_programs_cover_the_device(self):
+        """Stage 1 loops over splits only while the blocks still cover the device: a
+        budget sized by the core count (normal-mode MLA) keeps one block per split at
+        small batch, and a large batch still gets _MAX_SPLIT_PROGRAMS blocks."""
+        from sglang.kernels.ops.attention.decode_attention import _split_programs
+
+        # (batch, head_tiles, max_kv_splits, core_count, expected)
+        for batch, tiles, budget, cores, expected in [
+            (1, 1, 256, 256, 0),  # MLA, 16 heads per rank, batch 1: one per split
+            (2, 1, 256, 256, 128),
+            (8, 1, 256, 256, 32),
+            (64, 4, 512, 256, 32),  # deterministic budget at a large batch
+            (1, 4, 512, 256, 64),
+            (1, 1, 32, 256, 0),
+        ]:
+            with self.subTest(batch=batch, tiles=tiles, budget=budget, cores=cores):
+                self.assertEqual(_split_programs(batch, tiles, budget, cores), expected)
 
     def test_decode_attention_uneven_batch_graph_replay(self):
         """One captured decode graph replayed over uniform, padded and ragged batches.
