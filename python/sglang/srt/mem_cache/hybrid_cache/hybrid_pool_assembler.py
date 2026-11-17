@@ -56,6 +56,7 @@ from sglang.srt.mem_cache.unified_cache.component_type import (
     tree_slot_ids,
 )
 from sglang.srt.runtime_context import get_memory, get_parallel, get_serving
+from sglang.srt.utils import is_npu
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
@@ -1707,9 +1708,14 @@ def _build_mha_mla_host_pool(
     is_mha = isinstance(buffer_info, MHABufferInfo)
     # The global layout is page_first_kv_split only when the target model
     # uses MLA; that layout is MLA-specific, so MHA draft pools must use
-    # the non-MLA layout (NPU default: page_first_direct).
+    # the non-MLA layout (NPU default: page_first).
     if is_mha and layout in ("page_first_kv_split", "layer_first_kv_split"):
-        layout = "page_first_direct"
+        if is_npu():
+            layout = (
+                "layer_first" if layout == "layer_first_kv_split" else "page_first"
+            )
+        else:
+            layout = "page_first_direct"
 
     kwargs = dict(
         host_to_device_ratio=host_to_device_ratio,

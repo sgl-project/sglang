@@ -193,10 +193,9 @@ def set_default_server_args(args: "ServerArgs"):
             "set_default_server_args",
             hicache_io_backend="kernel_ascend",
         )
-        from sglang.srt.configs.model_config import is_deepseek_v4
+        from sglang.srt.configs.model_config import AttentionArch, is_deepseek_v4
 
-        # Only DSV4 and MLA have migrated to AIV transfers so far;
-        # all remaining paths will migrate soon.
+        # DSV4, MLA, and MHA use page-aware transfer operators.
         if is_deepseek_v4(model_config_of(args).hf_config):
             os.environ.setdefault("SGLANG_HICACHE_HOST_MEM_BACKEND", "acl")
             declare_resolution(
@@ -217,6 +216,17 @@ def set_default_server_args(args: "ServerArgs"):
                     "layer_first_kv_split"
                     if cfg.hicache_mem_layout in ("layer_first", "layer_first_kv_split")
                     else "page_first_kv_split"
+                ),
+            )
+        elif model_config_of(args).attention_arch == AttentionArch.MHA:
+            os.environ.setdefault("SGLANG_HICACHE_HOST_MEM_BACKEND", "acl")
+            declare_resolution(
+                args,
+                "set_default_server_args",
+                hicache_mem_layout=(
+                    "layer_first"
+                    if cfg.hicache_mem_layout == "layer_first"
+                    else "page_first"
                 ),
             )
         else:

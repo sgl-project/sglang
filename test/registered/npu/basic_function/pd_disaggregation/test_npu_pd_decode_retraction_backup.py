@@ -9,7 +9,7 @@ host_pool`. They verify:
    completion with the correct text.
 2. The NPU wiring for the host-pool backup is active on the decode server: the
    running server reports `hicache_io_backend == kernel_ascend` and
-   `hicache_mem_layout == page_first_direct`, which is exactly what the NPU backend
+   `hicache_mem_layout == page_first`, which is exactly what the NPU backend
    applies when the decode side uses (explicit or inferred) host_pool retraction
    backup.
 """
@@ -39,7 +39,7 @@ register_npu_ci(est_time=400, suite="base-b-test-17-npu-a3")
 register_npu_ci(est_time=400, suite="nightly-17-npu-a3", nightly=True)
 
 # Explicitly selected on the decode server; the NPU backend then forces
-# hicache_io_backend=kernel_ascend and hicache_mem_layout=page_first_direct.
+# hicache_io_backend=kernel_ascend and hicache_mem_layout=page_first.
 DECODE_RETRACTION_BACKUP = "host_pool"
 
 
@@ -149,7 +149,7 @@ class TestPDDecodeRetractionBackup(PDDisaggregationServerBase):
 
         The running decode server was launched with
         --disaggregation-decode-retraction-backup=host_pool, so the NPU backend must
-        have forced kernel_ascend IO and page_first_direct layout. Assert those
+        have forced kernel_ascend IO and page_first layout. Assert those
         resolved values via /server_info.
         """
         info = requests.get(self.decode_url + "/server_info", timeout=30).json()
@@ -163,8 +163,8 @@ class TestPDDecodeRetractionBackup(PDDisaggregationServerBase):
         )
         self.assertEqual(
             info.get("hicache_mem_layout"),
-            "page_first_direct",
-            f"NPU host-pool backup must use page_first_direct layout, got {info.get('hicache_mem_layout')}",
+            "page_first",
+            f"NPU host-pool backup must use page_first layout, got {info.get('hicache_mem_layout')}",
         )
 
 

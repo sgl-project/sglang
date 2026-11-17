@@ -326,6 +326,26 @@ def reserve_mla_split_host_memory(
     backend.ensure_capacity(total_bytes, torch.npu.current_device())
 
 
+def reserve_mha_host_memory(
+    *,
+    num_pages: int,
+    page_size: int,
+    num_layers: int,
+    head_num: int,
+    head_dim: int,
+    dtype: torch.dtype,
+) -> None:
+    """Declare the combined K/V host-buffer budget before MHA allocation."""
+    backend = get_host_memory_backend()
+    if backend is None:
+        return
+
+    total_bytes = (
+        2 * num_pages * page_size * num_layers * head_num * head_dim * dtype.itemsize
+    )
+    backend.ensure_capacity(total_bytes, torch.npu.current_device())
+
+
 def reserve_dsv4_paged_host_memory(
     *,
     infos: Mapping[PoolName, DevicePoolInfo],

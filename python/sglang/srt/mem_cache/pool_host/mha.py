@@ -53,6 +53,7 @@ from sglang.srt.mem_cache.pool_host.common import (
     make_kernel_ptr_table,
 )
 from sglang.srt.mem_cache.pool_host.hisparse import HiSparseHostPoolMixin
+from sglang.srt.mem_cache.pool_host.npu_host_memory import reserve_mha_host_memory
 from sglang.srt.mem_cache.pool_host.page_unified import PageUnifiedLayout
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import is_cuda, is_hip, is_mps, is_npu, is_xpu
@@ -93,7 +94,12 @@ elif _is_xpu:
         transfer_kv_per_layer_ph_lf,
     )
 if _is_npu:
-    from sgl_kernel_npu.kvcacheio import TransferDirection, transfer_kv_dim_exchange
+    from sgl_kernel_npu.operators.mem_cache import (
+        transfer_kv_all_layer_kv_split,
+        transfer_kv_all_layer_kv_split_lf_pf,
+        transfer_kv_per_layer_kv_split,
+        transfer_kv_per_layer_kv_split_pf_lf,
+    )
 
 logger = logging.getLogger(__name__)
 
@@ -246,6 +252,13 @@ class MHATokenToKVPoolHost(HostKVCache):
                 else buffer_info.buffers.v_data_ptrs
             )
         self._initialize_transfer_views(buffer_info, write_back_staging)
+        # Specialized MHA host pools own their transfer paths and buffer shapes.
+        if (
+            _is_npu
+            and type(self) is MHATokenToKVPoolHost
+            and self.layout in ("layer_first", "page_first")
+        ):
+            self._init_npu_transfer_bindings()
 
     def _initialize_transfer_views(self, buffer_info, write_back_staging) -> None:
         self.element_dim = self.head_num * self.head_dim
@@ -314,11 +327,25 @@ class MHATokenToKVPoolHost(HostKVCache):
         return self.get_size_per_token() // 2
 
     def init_kv_buffer(self):
+        if self._transfer_device.type == "npu" and self.layout in (
+            "layer_first",
+            "page_first",
+        ):
+            reserve_mha_host_memory(
+                num_pages=self.page_num,
+                page_size=self.page_size,
+                num_layers=self.layer_num,
+                head_num=self.head_num,
+                head_dim=self.head_dim,
+                dtype=self.dtype,
+            )
         if self.layout == "layer_first":
             dims = (2, self.layer_num, self.size, self.head_num, self.head_dim)
-        elif self.layout == "page_first":
+        elif self.layout == "page_first" and not _is_npu:
             dims = (2, self.size, self.layer_num, self.head_num, self.head_dim)
-        elif self.layout == "page_first_direct":
+        elif self.layout == "page_first_direct" or (
+            self.layout == "page_first" and _is_npu
+        ):
             dims = (
                 2,
                 self.page_num,
@@ -564,42 +591,89 @@ class MHATokenToKVPoolHost(HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
-            if self.layout == "page_first_direct":
-                # Ascend-specific: transfer KV data for all layers when layer_id == 0
-                if host_layer_id == 0:
-                    for (
-                        device_k,
-                        device_v,
-                        host_k,
-                        host_v,
-                    ) in self._npu_transfer_buffers():
-                        transfer_kv_dim_exchange(
-                            device_indices=device_indices,
-                            host_indices=host_indices,
-                            device_k=device_k,
-                            host_k=host_k,
-                            device_v=device_v,
-                            host_v=host_v,
-                            page_size=self.page_size,
-                            direction=TransferDirection.H2D,
-                        )
+            if self.layout == "page_first":
+                transfer = transfer_kv_per_layer_kv_split_pf_lf
+            elif self.layout == "layer_first":
+                transfer = transfer_kv_per_layer_kv_split
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+            if not 0 <= host_layer_id < len(self._npu_layer_bindings):
+                return
+            transfer(
+                device_indices=device_indices,
+                host_indices=host_indices,
+                **self._npu_layer_bindings[host_layer_id],
+                impl="auto",
+            )
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
-    def _npu_transfer_buffers(self):
+    def _init_npu_transfer_bindings(self):
+        if self.layout == "layer_first":
+            host_k = self.k_buffer.view(
+                self.layer_num,
+                self.page_num,
+                self.page_size,
+                self.head_num,
+                self.head_dim,
+            )
+            host_v = self.v_buffer.view(
+                self.layer_num,
+                self.page_num,
+                self.page_size,
+                self.head_num,
+                self.v_head_dim,
+            )
+            host_layer_axis = 0
+        else:
+            host_k, host_v = self.k_buffer, self.v_buffer
+            host_layer_axis = 1
+        layer_bindings = []
+        pool_bindings = []
         layer_start = 0
         for info in self._buffer_infos:
             device_k, device_v = info.transfer_buffers()
-            layer_end = layer_start + device_k.shape[0]
-            yield (
-                device_k,
-                device_v,
-                self.k_buffer[:, layer_start:layer_end],
-                self.v_buffer[:, layer_start:layer_end],
+            layer_count = device_k.shape[0]
+            pool_host_k = host_k.narrow(host_layer_axis, layer_start, layer_count)
+            pool_host_v = host_v.narrow(host_layer_axis, layer_start, layer_count)
+            pool_bindings.append(
+                dict(
+                    device_k=self._npu_split_view(device_k),
+                    host_k=self._npu_split_view(pool_host_k),
+                    device_v=self._npu_split_view(device_v),
+                    host_v=self._npu_split_view(pool_host_v),
+                    page_size=self.page_size,
+                )
             )
-            layer_start = layer_end
+            for local_layer in range(layer_count):
+                layer_bindings.append(
+                    dict(
+                        device_k=self._npu_split_view(
+                            device_k[local_layer : local_layer + 1]
+                        ),
+                        host_k=self._npu_split_view(
+                            pool_host_k.narrow(host_layer_axis, local_layer, 1)
+                        ),
+                        device_v=self._npu_split_view(
+                            device_v[local_layer : local_layer + 1]
+                        ),
+                        host_v=self._npu_split_view(
+                            pool_host_v.narrow(host_layer_axis, local_layer, 1)
+                        ),
+                        page_size=self.page_size,
+                        device_layer_id=0,
+                        host_layer_id=0,
+                    )
+                )
+            layer_start += layer_count
+        self._npu_layer_bindings = tuple(layer_bindings)
+        self._npu_pool_bindings = tuple(pool_bindings)
+
+    @staticmethod
+    def _npu_split_view(buffer: torch.Tensor) -> torch.Tensor:
+        # [layer/page, page/layer, token, head, dim] ->
+        # [layer/page, page/layer, token, 1, head * dim], without a copy.
+        return buffer.flatten(-2).unsqueeze(-2)
 
     def backup_from_device_all_layer(
         self, device_pool, host_indices, device_indices, io_backend
@@ -727,20 +801,19 @@ class MHATokenToKVPoolHost(HostKVCache):
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
         elif io_backend == "kernel_ascend":
-            if self.layout == "page_first_direct":
-                for device_k, device_v, host_k, host_v in self._npu_transfer_buffers():
-                    transfer_kv_dim_exchange(
-                        device_indices=device_indices,
-                        host_indices=host_indices,
-                        device_k=device_k,
-                        host_k=host_k,
-                        device_v=device_v,
-                        host_v=host_v,
-                        page_size=self.page_size,
-                        direction=TransferDirection.D2H,
-                    )
+            if self.layout == "page_first":
+                transfer = transfer_kv_all_layer_kv_split_lf_pf
+            elif self.layout == "layer_first":
+                transfer = transfer_kv_all_layer_kv_split
             else:
                 raise ValueError(f"Unsupported layout: {self.layout}")
+            for binding in self._npu_pool_bindings:
+                transfer(
+                    device_indices=device_indices,
+                    host_indices=host_indices,
+                    **binding,
+                    impl="auto",
+                )
         else:
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
@@ -750,9 +823,11 @@ class MHATokenToKVPoolHost(HostKVCache):
             data_page = self.kv_buffer[page_id : page_id + 1]
         elif self.layout == "layer_first":
             data_page = self.kv_buffer[:, :, index : index + self.page_size, :, :]
-        elif self.layout == "page_first":
+        elif self.layout == "page_first" and not _is_npu:
             data_page = self.kv_buffer[:, index : index + self.page_size, :, :, :]
-        elif self.layout in ["page_first_direct", "page_head"]:
+        elif self.layout in ["page_first_direct", "page_head"] or (
+            self.layout == "page_first" and _is_npu
+        ):
             real_index = index // self.page_size
             data_page = self.kv_buffer[:, real_index : real_index + 1, :, :, :, :]
         else:
@@ -785,13 +860,15 @@ class MHATokenToKVPoolHost(HostKVCache):
                     self.head_dim,
                 )
             )
-        elif self.layout == "page_first":
+        elif self.layout == "page_first" and not _is_npu:
             self.kv_buffer[:, index : index + self.page_size, :, :, :] = (
                 data_page.reshape(
                     2, self.page_size, self.layer_num, self.head_num, self.head_dim
                 )
             )
-        elif self.layout == "page_first_direct":
+        elif self.layout == "page_first_direct" or (
+            self.layout == "page_first" and _is_npu
+        ):
             real_index = index // self.page_size
             self.kv_buffer[:, real_index : real_index + 1, :, :, :, :] = (
                 data_page.reshape(
