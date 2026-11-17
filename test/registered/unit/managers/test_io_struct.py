@@ -133,6 +133,8 @@ class TestTokenizedReqInputMsgpack(unittest.TestCase):
                 "AddExternalCorpusReqInput",
                 "RemoveExternalCorpusReqInput",
                 "ListExternalCorporaReqInput",
+                "OpenSessionReqInput",
+                "CloseSessionReqInput",
                 "UpdateWeightFromDiskReqInput",
                 "UpdateWeightsFromDistributedReqInput",
                 "UpdateWeightsFromTensorReqInput",

@@ -120,6 +120,10 @@ service SglangService {
   rpc ContinueGeneration(ContinueGenerationRequest) returns (GenerationPauseResponse);
   rpc PdRoleSwitch(PdRoleSwitchRequest) returns (PdRoleSwitchResponse);
   rpc UpdateWeightVersion(UpdateWeightVersionRequest) returns (UpdateWeightVersionResponse);
+
+  // `/open_session`, `/close_session`: multi-turn sessions on the schedulers.
+  rpc OpenSession(OpenSessionRequest) returns (OpenSessionResponse);
+  rpc CloseSession(CloseSessionRequest) returns (CloseSessionResponse);
 }
 
 message ListModelsRequest {}

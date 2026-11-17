@@ -340,6 +340,18 @@ impl SglangService for Mock {
     ) -> Result<Response<api::LoraUpdateResponse>, Status> {
         Err(Status::unimplemented("unload_lora_adapter"))
     }
+    async fn open_session(
+        &self,
+        _: Request<api::OpenSessionRequest>,
+    ) -> Result<Response<api::OpenSessionResponse>, Status> {
+        Err(Status::unimplemented("open_session"))
+    }
+    async fn close_session(
+        &self,
+        _: Request<api::CloseSessionRequest>,
+    ) -> Result<Response<api::CloseSessionResponse>, Status> {
+        Err(Status::unimplemented("close_session"))
+    }
     async fn freeze_gc(
         &self,
         _: Request<api::FreezeGcRequest>,
