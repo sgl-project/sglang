@@ -1463,9 +1463,18 @@ class EAGLEWorkerV2(BaseSpecWorker):
                 cuda_graph_bs=(
                     None
                     if check_cuda_graph_backend(Phase.DECODE, Backend.DISABLED)
-                    else get_exec().graph.cuda_graph_bs_decode
+                    else self._resolved_decode_capture_bs()
                 ),
             )
+
+    @staticmethod
+    def _resolved_decode_capture_bs() -> Optional[list[int]]:
+        # The cuda_graph_bs_decode leaf stays None unless the user passes
+        # --cuda-graph-bs; the published config holds the resolved list.
+        graph = get_exec().graph
+        if graph.cuda_graph_config is None:
+            return graph.cuda_graph_bs_decode
+        return graph.cuda_graph_config.decode.bs
 
     def forward_batch_generation(
         self,

@@ -2,7 +2,7 @@
 
 import unittest
 from types import SimpleNamespace as NS
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 from sglang.srt.model_executor.cuda_graph_config import (
     Backend,
@@ -157,6 +157,20 @@ class TestAdaptiveGraphContract(unittest.TestCase):
             self.assertEqual(
                 get_spec().speculative_num_draft_tokens, s.speculative_num_draft_tokens
             )
+
+    def test_tiers_prune_default_capture_list(self):
+        """Without --cuda-graph-bs the leaf is None, so pruning must read the resolved list."""
+        scope = get_context().override_server_args(
+            cuda_graph_bs_decode=None, cuda_graph_config=self.cfg
+        )
+        scope.install()
+        self.addCleanup(scope.restore)
+        self.worker.adaptive_controller = Mock()
+        with patch.object(eagle.BaseSpecWorker, "init_cuda_graphs"):
+            self.worker.init_cuda_graphs()
+        self.worker.adaptive_controller.init_states.assert_called_once_with(
+            cuda_graph_bs=[1, 4, 8]
+        )
 
 
 if __name__ == "__main__":
