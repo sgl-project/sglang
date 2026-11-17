@@ -772,6 +772,15 @@ class DsparkStepObservers:
         self._sts_collect_path = envs.SGLANG_DSPARK_STS_COLLECT_PATH.get()
         self._sts_recorder: Optional[StsDataRecorder] = None
 
+    @property
+    def reads_target_logits(self) -> bool:
+        """Whether a sink reads the verify's full-vocabulary target rows."""
+        return (
+            bool(self._sts_collect_path)
+            or self._block_accept_recorder is not None
+            or envs.SGLANG_DSPARK_DEBUG_CONFIDENCE_METRICS.get()
+        )
+
     # --- step lifecycle -------------------------------------------------
 
     def begin_step(self) -> None:

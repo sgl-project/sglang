@@ -63,6 +63,7 @@ def _stats_kernel(
     TEMP,
     STATS,
     TARGET_S,
+    TARGET_START,
     START,
     WIDTH,
     PADDED,
@@ -79,7 +80,7 @@ def _stats_kernel(
     b, i = r // SLOTS, r % SLOTS
     has_x = i < SLOTS - 1
     inv_t = 1.0 / tl.maximum(tl.load(TEMP + b), 1e-5)
-    target = TARGET + r.to(tl.int64) * TARGET_S + START
+    target = TARGET + r.to(tl.int64) * TARGET_S + TARGET_START
     draft = DRAFT + (b * GAMMA + i).to(tl.int64) * PADDED
     t_m, t_s, d_m, d_s = -float("inf"), 0.0, -float("inf"), 0.0
     for k in range(0, WIDTH, BLOCK):
@@ -113,6 +114,7 @@ def _accept_kernel(
     PARTIAL,
     BS,
     TARGET_S,
+    TARGET_START,
     START,
     WIDTH,
     PADDED,
@@ -170,7 +172,7 @@ def _accept_kernel(
     j = part * BLOCK + tl.arange(0, BLOCK)
     valid = j < WIDTH
     inv_t = 1.0 / tl.maximum(tl.load(TEMP + b), 1e-5)
-    t_row = TARGET + (b * SLOTS + accepted).to(tl.int64) * TARGET_S + START
+    t_row = TARGET + (b * SLOTS + accepted).to(tl.int64) * TARGET_S + TARGET_START
     t = tl.load(t_row + j, valid, -float("inf")).to(tl.float32)
     d_row = DRAFT + (b * GAMMA + accepted).to(tl.int64) * PADDED
     d = tl.load(d_row + j, valid & residual, -float("inf")).to(tl.float32)
@@ -203,21 +205,26 @@ def accept_sampling_sharded(
     key: int,
     offset: torch.Tensor,
     verify_lens: Optional[torch.Tensor] = None,
+    target_start: Optional[int] = None,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Returns (correct_len int32, bonus int64, cap_trim_lens int32), each [bs].
 
     candidates     [bs, slots]
-    target_logits  [bs * slots, vocab]
+    target_logits  [bs * slots, vocab], or this rank's vocab shard with target_start 0
     draft_logits   [bs, gamma, padded]
     temperatures   [bs]
     key, offset    the draft's Philox key and its block counter
+    target_start   the target_logits column of token vocab_start (default vocab_start)
     """
     bs, slots = candidates.shape
     _, gamma, padded = draft_logits.shape
     assert slots - 1 <= gamma and target_logits.stride(1) == 1
     assert candidates.is_contiguous() and draft_logits.is_contiguous()
     assert vocab_start % 4 == 0, vocab_start
+    if target_start is None:
+        target_start = vocab_start
+    assert target_logits.shape[1] >= target_start + width, (target_logits.shape, width)
 
     device = candidates.device
     parts = triton.cdiv(padded, _BLOCK)
@@ -231,6 +238,7 @@ def accept_sampling_sharded(
         temperatures,
         stats,
         target_logits.stride(0),
+        target_start,
         vocab_start,
         width,
         padded,
@@ -259,6 +267,7 @@ def accept_sampling_sharded(
         partial,
         bs,
         target_logits.stride(0),
+        target_start,
         vocab_start,
         width,
         padded,

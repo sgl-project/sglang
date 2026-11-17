@@ -19,8 +19,11 @@ import triton
 import triton.language as tl
 
 from sglang.srt.environ import envs
+from sglang.srt.utils import is_hip
 
 logger = logging.getLogger(__name__)
+
+_is_hip = is_hip()
 
 
 _provider_spec = import_module("sglang.kernels.plugin_kernels.nvidia.spec")
@@ -677,14 +680,17 @@ def reduce_sharded_token_keys(
         )
     world = tp_group.world_size
     power_of_two_world = world > 0 and (world & (world - 1)) == 0
-    if 0 < keys.shape[0] <= _LL_MAX_ROWS and world <= 16 and power_of_two_world:
-        tokens = _ll_keys(keys, tp_group)
-        if tokens is not None:
-            return tokens
-    if 0 < keys.shape[0] <= _MC_MAX_ROWS and power_of_two_world:
-        tokens = _mc_gather_keys(keys, tp_group)
-        if tokens is not None:
-            return tokens
+    # The LL and multimem exchanges are NVLink multicast and PTX; on ROCm the
+    # one-hop XGMI probe can pass, so skip their symmetric-memory setup there.
+    if not _is_hip:
+        if 0 < keys.shape[0] <= _LL_MAX_ROWS and world <= 16 and power_of_two_world:
+            tokens = _ll_keys(keys, tp_group)
+            if tokens is not None:
+                return tokens
+        if 0 < keys.shape[0] <= _MC_MAX_ROWS and power_of_two_world:
+            tokens = _mc_gather_keys(keys, tp_group)
+            if tokens is not None:
+                return tokens
     gathered = torch.empty(world * keys.numel(), dtype=torch.int64, device=keys.device)
     tp_group.all_gather_into_tensor(gathered, keys.view(-1))
     return keys_to_tokens(gathered, world, splits)

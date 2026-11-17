@@ -215,8 +215,12 @@ class TestShardedGreedy(CustomTestCase):
                 VocabShard(0, shards[0].shape[1], full.shape[1]),
                 _FakeGroup(keys),
             )
-        ll.assert_called_once()
-        mc.assert_called_once()
+        if sharded_verify._is_hip:
+            ll.assert_not_called()
+            mc.assert_not_called()
+        else:
+            ll.assert_called_once()
+            mc.assert_called_once()
         self.assertTrue(torch.equal(got, torch.argmax(full.float(), dim=-1)))
 
 
