@@ -25,7 +25,7 @@ from sglang.test.test_utils import CustomTestCase
 # AMD only. The op under test is gfx950, so mi35x is the suite where the
 # device-dependent class runs rather than skips. No register_cuda_ci: the fused
 # path is unreachable off ROCm by construction.
-register_amd_ci(est_time=10, suite="stage-b-test-1-gpu-small-amd-mi35x")
+register_amd_ci(est_time=10, suite="base-b-test-1-gpu-small-amd-mi35x")
 
 _ENV = "SGLANG_QWEN3_NEXT_GDN_FUSED_BACKEND"
 
