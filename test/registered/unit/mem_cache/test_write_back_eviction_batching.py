@@ -245,6 +245,7 @@ class _WriteBackBatchingSuite:
         waits on a copy: the forward stream (and, without overlap, the current
         stream) waits on each copy's finish event before its victims' device
         pages are freed."""
+        setup_allocator_context()
         for forward_on_fence_stream in (True, False):
             with self.subTest(forward_on_fence_stream=forward_on_fence_stream):
                 cache, allocator, host_pool = self._fill_host_with_one_batch()
