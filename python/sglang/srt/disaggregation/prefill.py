@@ -71,6 +71,7 @@ from sglang.srt.disaggregation.utils import (
     state_indices_per_entry,
 )
 from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
+from sglang.srt.distributed.utils import get_pp_indices
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import get_cp_sharded_padded_cache_transfer_indices
@@ -1803,10 +1804,19 @@ class SchedulerDisaggregationPrefillMixin:
         if not reqs:
             return
         if not self.pp_group.is_last_rank:
+            pp_size = get_parallel().pp_size
+            last_stage_layers = range(
+                *get_pp_indices(
+                    self.model_config.num_hidden_layers, pp_size - 1, pp_size
+                )
+            )
             for _, req in reqs:
-                # A PP-matched decode rank reads its aux from this stage only.
+                # A decode rank that never pulls the last stage (decode runs PP)
+                # reads its aux from this stage, so it keeps the result path.
                 sender = req.disagg_kv_sender
-                if sender.kv_mgr.decode_pulls_every_pp_stage(sender.bootstrap_room):
+                if sender.kv_mgr.decode_pulls_last_pp_stage(
+                    sender.bootstrap_room, last_stage_layers
+                ):
                     self._pp_pd_send_last_chunk_early(req, launch_event, None)
             return
         logits_output = result.logits_output

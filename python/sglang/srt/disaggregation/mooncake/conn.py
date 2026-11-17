@@ -3487,21 +3487,22 @@ class MooncakeKVManager(StagingManagerMixin, CommonKVManager):
         t = self._start_heartbeat_checker_thread()
         self._worker_threads.append(t)
 
-    def decode_pulls_every_pp_stage(self, bootstrap_room: int) -> bool:
-        """Whether every decode peer of this room also pulls other prefill PP
-        stages. A peer whose layers all live on this stage is a PP-matched decode
-        rank that reads its aux from this stage only."""
-        local_layer_ids = set(self.kv_args.kv_layer_ids)
+    def decode_pulls_last_pp_stage(
+        self, bootstrap_room: int, last_stage_layers: range
+    ) -> bool:
+        """Whether every decode peer of this room also pulls the last prefill PP
+        stage, which writes the aux when this stage leaves it out. A decode rank
+        that runs PP may hold only earlier stages' layers and needs aux from here."""
         infos = self.transfer_infos.get(bootstrap_room)
-        if not local_layer_ids or not infos:
+        if not infos:
             return False
         for info in list(infos.values()):
             if info.is_dummy:
                 continue
             peer = self.decode_kv_args_table.get(info.mooncake_session_id)
-            if peer is None or not peer.dst_kv_layer_ids:
-                return False
-            if set(peer.dst_kv_layer_ids) <= local_layer_ids:
+            if peer is None or not any(
+                layer_id in last_stage_layers for layer_id in peer.dst_kv_layer_ids
+            ):
                 return False
         return True
 
