@@ -70,6 +70,7 @@ from sglang.srt.disaggregation.utils import (
     setup_state_kv_args,
     state_indices_per_entry,
 )
+from sglang.srt.distributed.pp_sync_window import PPSyncSendWindow
 from sglang.srt.environ import envs
 from sglang.srt.layers.cp.base import is_cp_sharded_padded
 from sglang.srt.layers.cp.utils import get_cp_sharded_padded_cache_transfer_indices
@@ -91,6 +92,7 @@ from sglang.srt.mem_cache.common import (
     kv_to_page_indices,
     kv_to_page_num,
     release_kv_cache,
+    suffix_page_indices,
 )
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.mem_cache.kv.alloc.id_space import IdSpaceKind
@@ -108,6 +110,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_parallel,
     get_schedule,
+    get_spec,
 )
 from sglang.srt.utils import is_npu, rank_consensus_checker
 from sglang.srt.utils.device import async_d2h
@@ -309,7 +312,11 @@ class PrefillBootstrapQueue:
             shard_size=self.scheduler.kv_shard_widening,
         )
         self.transfer_backend = transfer_backend
-        self.pp_poll_sync_work_list: List = []
+        # The PP loop runs pp_size + pp_async_batch_depth rounds deep; the poll
+        # forwards must stay un-waited that long or they lock the ranks together.
+        self.pp_poll_send_window = PPSyncSendWindow(
+            parallel.pp_size + parallel.pp_async_batch_depth
+        )
         if envs.SGLANG_DISAGG_STAGING_BUFFER.get():
             if self.is_mla_backend:
                 raise RuntimeError(
@@ -454,6 +461,7 @@ class PrefillBootstrapQueue:
             self.scheduler.model_config.num_hidden_layers,
             window_tails=storage.retained_window_lengths(),
             draft_kv_ring=self.draft_kv_ring,
+            empty_draft_kv_ring=get_spec().speculative_dflash_draft_kv_ring,
         )
 
         kv_manager_class = get_kv_class(self.transfer_backend, KVClassType.MANAGER)
@@ -607,7 +615,7 @@ class PrefillBootstrapQueue:
                 self.scheduler.pp_group,
                 self.pp_rank,
                 self.pp_size,
-                self.pp_poll_sync_work_list,
+                self.pp_poll_send_window,
             )
         else:
             polls = poll_and_all_reduce_attn_cp_tp_group(
@@ -1462,6 +1470,7 @@ class SchedulerDisaggregationPrefillMixin:
             maybe_release_metadata_buffer(
                 req, self.req_to_metadata_buffer_idx_allocator
             )
+            self._release_mm_inputs(req)
 
         return done_reqs
 
@@ -1728,23 +1737,10 @@ class SchedulerDisaggregationPrefillMixin:
         # The schedule stream may wait on the in-flight forward. A sender that takes
         # host-tensor indices waits on their copy's event itself, so the scheduler
         # never blocks on these device reads.
-        host_indices = (
-            # Only Mooncake's sender consumes the async host snapshots under
-            # indices_event. Other backends keep synchronous .cpu().numpy().
-            getattr(sender, "supports_host_tensor_indices", False)
-            # KV-sharded sends filter host values before enqueueing them.
-            and getattr(sender.kv_mgr, "kv_shard_size", 1) == 1
-            and not (
-                sender.kv_mgr.enable_all_cp_ranks_for_transfer
-                and not get_parallel().enable_dsa_cache_layer_split
-            )
+        host_indices = getattr(sender, "supports_host_tensor_indices", False) and not (
+            sender.kv_mgr.enable_all_cp_ranks_for_transfer
+            and not get_parallel().enable_dsa_cache_layer_split
         )
-
-        def _host_indices(indices: torch.Tensor):
-            # Copied to the host for the send below, behind the device ids.
-            if host_indices:
-                return _DeviceRows(indices)
-            return indices.cpu().numpy()
 
         def page_indices_of(kv_indices: torch.Tensor):
             """The pages a send takes, and the same pages for the page-move
@@ -1788,13 +1784,13 @@ class SchedulerDisaggregationPrefillMixin:
                     self.req_to_token_pool.state_sub_pool
                 )
                 return [
-                    _host_indices(
-                        state_ids.ids(
-                            self.req_to_token_pool.req_index_to_mamba_index_mapping[
-                                req.kv.req_pool_idx
-                            ]
-                        )
+                    state_ids.ids(
+                        self.req_to_token_pool.req_index_to_mamba_index_mapping[
+                            req.kv.req_pool_idx
+                        ]
                     )
+                    .cpu()
+                    .numpy()
                 ]
 
             def _swa_payload(sub_pool=None):
@@ -1832,10 +1828,12 @@ class SchedulerDisaggregationPrefillMixin:
                 # (decode_prefix_len, page-aligned), and its rows for a prefix
                 # still being restored point at no page yet: send only the
                 # suffix, positionally matching decode's _dsa_pages_payload.
-                return state_page_indices(
-                    self.req_to_token_pool.req_to_token[
-                        req.kv.req_pool_idx, req.disagg_decode_prefix_len : seq_len
-                    ]
+                return suffix_page_indices(
+                    self.req_to_token_pool.req_to_token,
+                    req.kv.req_pool_idx,
+                    req.disagg_decode_prefix_len,
+                    seq_len,
+                    page_size,
                 )
 
             def _dsa_tail_payload():

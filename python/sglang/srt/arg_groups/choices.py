@@ -66,6 +66,18 @@ QUANTIZATION_CHOICES = [
     "humming",
 ]
 
+BUILT_IN_KV_CACHE_DTYPES = (
+    "auto",
+    "fp8_e5m2",
+    "fp8_e4m3",
+    "mxfp8",
+    "bf16",
+    "bfloat16",
+    "nvfp4",
+    "fp4_mx_block16",
+)
+KV_CACHE_DTYPE_CHOICES = list(BUILT_IN_KV_CACHE_DTYPES)
+
 ATTENTION_BACKEND_CHOICES = [
     # Common
     "triton",
@@ -103,7 +115,6 @@ ATTENTION_BACKEND_CHOICES = [
 # earlier when its per-layer attention requirements are not met.
 DRAFT_ATTENTION_BACKEND_CHOICES = [
     "flashinfer",
-    "tokenspeed_mla",
     "fa3",
     "fa4",
     "triton",
@@ -193,7 +204,15 @@ FP4_GEMM_RUNNER_BACKEND_CHOICES = [
     "marlin",
 ]
 
-RADIX_EVICTION_POLICY_CHOICES = ["lru", "lfu", "slru", "priority", "tlru", "joint_lru"]
+RADIX_EVICTION_POLICY_CHOICES = [
+    "lru",
+    "lfu",
+    "slru",
+    "priority",
+    "tlru",
+    "joint_lru",
+    "state_cost",
+]
 
 RL_ON_POLICY_TARGET_CHOICES = ["fsdp"]
 
@@ -225,6 +244,9 @@ add_load_format_choices = LOAD_FORMAT_CHOICES.extend
 # choice let users create contradictory combos (see _handle_load_format).
 
 add_quantization_method_choices = QUANTIZATION_CHOICES.extend
+
+# Use register_kv_cache_dtype, which also records the value's storage dtype.
+add_kv_cache_dtype_choices = KV_CACHE_DTYPE_CHOICES.extend
 
 # --- Attention backends ---
 

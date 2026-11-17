@@ -25,7 +25,9 @@ import torch
 
 from sglang.srt.batch_overlap.two_batch_overlap import TboCudaGraphRunnerPlugin
 from sglang.srt.compilation.torch_compile_decoration import set_torch_compile_config
+from sglang.srt.configs.hybrid_arch import hybrid_gdn_config
 from sglang.srt.environ import envs
+from sglang.srt.kernel_plugins.nvidia.binding import prepare_megakernel
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.dp_attention import (
     DpPaddingMode,
@@ -273,7 +275,15 @@ class BaseRunner(ABC):
         )
         if prepare_model_resources is not None:
             prepare_model_resources(mr)
+        prepare_megakernel(mr)
         self._finalize_symm_workspaces()
+
+        if hybrid_gdn_config(mr.model_config) is not None:
+            from sglang.srt.layers.attention.linear.gdn_backend import (
+                prewarm_gdn_prefill_kernels,
+            )
+
+            prewarm_gdn_prefill_kernels(attn_backend=mr.attn_backend, model=mr.model)
 
         if should_run_flashinfer_autotune(self.model_runner):
             buffers, batch_size = self._autotune_buffers()

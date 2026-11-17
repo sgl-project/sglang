@@ -724,6 +724,8 @@ def _attention_backend(pool, req_to_token, device, prefill_impl="flashmla_sparse
     backend.flashmla_kv_num_q_heads_prefill = 64
     backend.flashmla_kv_format = "V32"
     backend.hisparse_coordinator = None
+    backend.flashmla_prefill_token_packing = False
+    backend._trtllm_fused_q = False
     backend.device_sm_major = (
         torch.cuda.get_device_capability()[0]
         if torch.device(device).type == "cuda"

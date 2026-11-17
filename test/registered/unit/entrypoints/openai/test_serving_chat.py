@@ -3904,13 +3904,12 @@ class ServingChatTestCase(CustomTestCase):
         self.assertEqual(remaining, '["get_weather"]')
         self.assertEqual(finish_reason["type"], "stop")
 
-    def test_required_tool_choice_overrides_conflicting_response_format(self):
-        """A forced tool call produces a tool_calls message with no content,
-        so response_format has nothing left to constrain: the tool-call
-        constraint wins and response_format is dropped with a warning
-        (OpenAI behavior), instead of rejecting the request."""
+    def test_required_tool_choice_rejects_conflicting_output_constraint(self):
+        """response_format and a forced tool call cannot both be honored: the
+        tool-call constraint was dropped with only a warning, so the model was
+        constrained to a shape that can never contain a tool call."""
         tools = [{"type": "function", "function": {"name": "get_weather"}}]
-        constraint = ("json_schema", {"type": "array"})
+        constraint = ("structural_tag", None)
         conflicting = [
             {"type": "json_object"},
             {
@@ -3931,41 +3930,13 @@ class ServingChatTestCase(CustomTestCase):
                         tool_choice=tool_choice,
                         response_format=response_format,
                     )
-                    with self.assertLogs(
-                        "sglang.srt.entrypoints.openai.protocol", level="WARNING"
-                    ) as logs:
-                        sampling_params = request.to_sampling_params(
+                    with self.assertRaises(ValueError) as ctx:
+                        request.to_sampling_params(
                             stop=[],
                             model_generation_config={},
                             tool_call_constraint=constraint,
                         )
-                    self.assertIn("ignoring response_format", "\n".join(logs.output))
-                    self.assertEqual(
-                        sampling_params["json_schema"], '{"type": "array"}'
-                    )
-                    self.assertIsNone(sampling_params.get("structural_tag"))
-
-    def test_required_tool_choice_still_rejects_regex_and_ebnf(self):
-        """regex/ebnf are explicit output constraints with no OpenAI
-        equivalent: silently dropping one would be surprising, so a forced
-        tool call combined with either stays a hard error."""
-        tools = [{"type": "function", "function": {"name": "get_weather"}}]
-        for extra in ({"regex": "a+"}, {"ebnf": 'root ::= "a"'}):
-            with self.subTest(extra=extra):
-                request = ChatCompletionRequest(
-                    model="x",
-                    messages=[{"role": "user", "content": "hi"}],
-                    tools=tools,
-                    tool_choice="required",
-                    **extra,
-                )
-                with self.assertRaises(ValueError) as ctx:
-                    request.to_sampling_params(
-                        stop=[],
-                        model_generation_config={},
-                        tool_call_constraint=("json_schema", {"type": "array"}),
-                    )
-                self.assertIn("cannot be combined", str(ctx.exception))
+                    self.assertIn("cannot be combined", str(ctx.exception))
 
     def test_auto_tool_choice_keeps_response_format_without_raising(self):
         """ "auto" means the model need not call a tool, so dropping the
@@ -6290,7 +6261,7 @@ class TestUsageReasoningTokens(CustomTestCase):
         no_reasoning = UsageProcessor.calculate_token_usage(
             prompt_tokens=5, completion_tokens=7
         )
-        self.assertIsNone(no_reasoning.completion_tokens_details)
+        self.assertEqual(no_reasoning.completion_tokens_details.reasoning_tokens, 0)
 
 
 class TestShouldIncludeUsage(CustomTestCase):

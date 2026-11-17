@@ -294,6 +294,7 @@ class TestSpecDecodeLengthSnapshot(CustomTestCase):
             SpeculativeAlgorithm.EAGLE3,
             SpeculativeAlgorithm.DFLASH,
             SpeculativeAlgorithm.DSPARK,
+            SpeculativeAlgorithm.STANDALONE,
         ):
             with self.subTest(algorithm=algorithm):
                 reporter = _make_reporter(self, types.SimpleNamespace())

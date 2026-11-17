@@ -1,4 +1,3 @@
-import json
 import logging
 import math
 import os
@@ -287,20 +286,19 @@ def _resolve_dflash_embedding_module(draft_model, target_model):
     return target_model.get_input_embeddings()
 
 
-def _hybrid_linear_backend(attn_backend):
-    """The HybridLinearAttnBackend that commits Mamba state after a verify, or None."""
-
-    if isinstance(attn_backend, HybridAttnBackend):
-        attn_backend = (
-            attn_backend.decode_backend
-            if attn_backend.spec_attn_is_decode
-            else attn_backend.prefill_backend
-        )
-    return attn_backend if isinstance(attn_backend, HybridLinearAttnBackend) else None
-
-
 def _is_all_greedy(sampling_info) -> bool:
     return sampling_info is None or sampling_info.is_all_greedy
+
+
+def _verify_logits_unadjusted(sampling_info) -> bool:
+    penalizer = sampling_info.penalizer_orchestrator
+    return not (
+        sampling_info.has_custom_logit_processor
+        or (penalizer is not None and penalizer.is_required)
+        or sampling_info.grammar_mask is not None
+        or sampling_info.logit_bias is not None
+        or sampling_info.sampling_mask_batch_indices is not None
+    )
 
 
 def _selector_lattice(draft_model, pred_hidden, anchor_token_ids):
@@ -413,13 +411,10 @@ class _MegakernelSelectorDraftSampler:
         pass
 
 
-# Cap on captured tails per batch size: one per target graph variant.
 _TAIL_VARIANTS_PER_BS = 4
 
 
 class _MegakernelTail:
-    """Post-verify megakernel tail for one batch size: static buffers and graphs."""
-
     def __init__(self, *, bs: int, block_size: int, device: torch.device):
         rows = bs * block_size
         self.prefix = torch.empty(bs, dtype=torch.int64, device=device)
@@ -442,7 +437,7 @@ class _MegakernelTail:
         )
         self.graphs: dict = {}
         self.pool = None
-        self.inputs: Tuple[int, ...] = ()
+        self.kda_state_ptrs: Tuple[int, ...] = ()
 
 
 class _DominoDraftSampler:
@@ -514,9 +509,9 @@ class DFlashWorkerV2(BaseSpecWorker):
     scheduler runs it synchronously when overlap is disabled.
     """
 
-    # Without pipeline parallelism every worker hosts the draft; __init__ narrows
-    # this to the last PP stage of a pipelined PD prefill.
     _hosts_draft: bool = True
+    _megakernel_embed = None
+    _aux_pending: bool = False
 
     def weight_update_runners(self) -> List[Tuple[str, "ModelRunner"]]:
         return [("draft", self.draft_model_runner)] if self._hosts_draft else []
@@ -571,18 +566,15 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         # Inside the draft scope the context answers the draft's narrowed rank.
         self._target_tp_rank = get_parallel().tp_rank
-        # On a pipelined PD prefill only the last stage holds the draft: the
-        # aux hidden states reach it on the PP proxy, and it materializes and
-        # sends the prompt's draft KV. Earlier stages run the target only.
+        # On a pipelined PD prefill only the last stage holds the draft: it gets the
+        # aux hidden states on the PP proxy and sends the prompt's draft KV.
         self._hosts_draft = get_parallel().pp_group.is_last_rank
         if not self._hosts_draft:
             self._draft_worker = None
             self.draft_model_runner = None
             self.draft_model = None
             return
-        # The draft worker exists on the last stage only: it reuses the
-        # target's seed and loads within the stage, so no all-rank collective
-        # waits on the earlier stages (as DSPARK does).
+        # The earlier stages returned above: the load must join no all-rank collective.
         load_group = get_pp_stage_load_group()
         with draft_pp_context(), draft_tp_context(self.draft_parallel_layout):
             bundle = build_draft_tp_worker(
@@ -602,7 +594,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             target_worker.model_runner.model_config.hf_config.architectures,
         )
         self._draft_sampler = None
-        self._megakernel_embed = None
         self.draft_model = bundle.draft_model
         self.selector = self.draft_model.candidate_selector
         # Ascend keeps selector proposal aligned with its greedy-only verify path.
@@ -783,22 +774,27 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._target_logits_processor = self._defer_target_verify_gather()
         self._aux_graphs = {}
+        self._megakernel_aux_graphs = {}
         self._mamba_commit_buffers = None
         self._use_commit_metadata = (
-            is_cuda() and envs.SGLANG_DFLASH_COMMIT_METADATA.get()
+            is_cuda() and envs.SGLANG_OPT_DFLASH_COMMIT_METADATA.get()
         )
         self._use_aux_graph = (
             is_cuda()
             and get_exec().graph.cuda_graph_config.decode.backend != Backend.DISABLED
             and self.lilicorr is None
-            and envs.SGLANG_DFLASH_AUX_GRAPH.get()
+            and envs.SGLANG_OPT_DFLASH_AUX_GRAPH.get()
         )
-        self._megakernel_aux = self._attach_megakernel_aux()
+        self._megakernel_aux = self._maybe_megakernel_aux()
         self._megakernel_aux_caches: Optional[List[torch.Tensor]] = None
         self._megakernel_kda = megakernel_kda_commit(
             self.target_worker.model_runner.model
         )
         self._megakernel_accept = self._maybe_attach_megakernel_accept()
+        self._sim_ring: Optional[SimAccLenRing] = None
+        if self._megakernel_accept is not None:
+            self._sim_ring = SimAccLenRing(self.device)
+        self._accept_target_buf: Optional[torch.Tensor] = None
         self._tail_graph = self._tail_graph_enabled()
         self._warn_megakernel_draft_chain_under_ring()
         self._megakernel_tails: dict = {}
@@ -820,9 +816,9 @@ class DFlashWorkerV2(BaseSpecWorker):
                 "on the main stream",
                 list(self._megakernel_aux.draft_aux_rows),
             )
+        self._batched_small_copy = envs.SGLANG_OPT_DFLASH_BATCHED_SMALL_COPY.get()
         # Side stream only where KV frees wait on it (overlap scheduler, no unified
         # memory or HiCache); the megakernel aux's collective keeps it on main.
-        self._batched_small_copy = envs.SGLANG_OPT_DFLASH_BATCHED_SMALL_COPY.get()
         self._aux_overlap = (
             self._use_aux_graph
             and self._megakernel_aux is None
@@ -833,12 +829,10 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         self._aux_stream: Optional[torch.cuda.Stream] = None
         self._aux_done: Optional[torch.cuda.Event] = None
-        self._aux_pending = False
         if self._aux_overlap:
             logger.info("DFLASH aux graph runs on a side stream beside the draft prep")
 
     def _prepare_megakernel_sampled_accept(self):
-        """Megakernel running the sampled accept on the verify vocab shards, or None."""
         target_lp = self._target_logits_processor
         built = megakernel_sampled_accept(self.target_worker.model_runner.model)
         # Declined before the build: it is collective.
@@ -848,14 +842,11 @@ class DFlashWorkerV2(BaseSpecWorker):
             or self._plain_deferral_refused("sampled accept")
         ):
             return None
-        lm_head = unwrap_lora_layer(
-            getattr(self.target_worker.model_runner.model, "lm_head", None)
-        )
-        width = getattr(lm_head, "num_embeddings_per_partition", None)
-        if width is None or not built.prepare_sampled_accept(
+        lm_head = unwrap_lora_layer(self.target_worker.model_runner.model.lm_head)
+        if not built.prepare_sampled_accept(
             vocab_size=int(target_lp.vocab_size),
             softcap=target_lp.final_logit_softcapping or None,
-            shard_width=int(width),
+            shard_width=int(lm_head.num_embeddings_per_partition),
             seed=int(torch.initial_seed()),
             topk=int(self.selector.top_k),
         ):
@@ -876,16 +867,10 @@ class DFlashWorkerV2(BaseSpecWorker):
             or self._block_verification
         ):
             return False
-        penalizer = sampling_info.penalizer_orchestrator
         return (
             not sampling_info.need_top_k_sampling
             and not sampling_info.need_top_p_sampling
-            and not sampling_info.has_custom_logit_processor
-            and getattr(sampling_info, "acc_linear_penalties", None) is None
-            and (penalizer is None or not penalizer.is_required)
-            and getattr(sampling_info, "grammar_mask", None) is None
-            and getattr(sampling_info, "logit_bias", None) is None
-            and getattr(sampling_info, "sampling_mask_batch_indices", None) is None
+            and _verify_logits_unadjusted(sampling_info)
             and self._megakernel_sampled.sampled_accept_fits(bs, shard)
         )
 
@@ -906,15 +891,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             return False
         if sampling_info is None:
             return self._selector_sample is None
-        penalizer = sampling_info.penalizer_orchestrator
-        if (
-            sampling_info.has_custom_logit_processor
-            or getattr(sampling_info, "acc_linear_penalties", None) is not None
-            or (penalizer is not None and penalizer.is_required)
-            or getattr(sampling_info, "grammar_mask", None) is not None
-            or getattr(sampling_info, "logit_bias", None) is not None
-            or sampling_info.sampling_mask_batch_indices is not None
-        ):
+        if not _verify_logits_unadjusted(sampling_info):
             return False
         if sampling_info.is_all_greedy:
             return self._selector_sample is None
@@ -1019,6 +996,7 @@ class DFlashWorkerV2(BaseSpecWorker):
     def init_cuda_graphs(self):
         if not self._hosts_draft:
             return
+        # Read outside the narrowed draft scope, which hides the target's DP flag.
         target_dp_enabled = get_parallel().attn_dp_enabled
         with (
             draft_pp_context(),
@@ -1039,14 +1017,8 @@ class DFlashWorkerV2(BaseSpecWorker):
                     type(current_platform).__name__,
                 )
             if _is_npu and target_dp_enabled and capture_decode_cuda_graph:
-                # Idle DP ranks skip the draft step, so they cannot join a
-                # shared graph capture/replay; keep the draft eager under dp
-                # attention. On CUDA the draft runs attn-TP-local
-                # (draft_tp_context, no cross-DP collective) and keys its
-                # graphs by the local batch size, so only busy DP groups
-                # replay (see DecodeCudaGraphRunner._forward_is_dp_local).
-                # target_dp_enabled is read outside the narrowed draft scope,
-                # which hides the target's DP flag.
+                # Idle DP ranks skip the draft step and cannot join a shared replay;
+                # CUDA avoids this by keying the draft's graphs on the local batch size.
                 capture_decode_cuda_graph = False
                 if self._target_tp_rank == 0:
                     logger.warning(
@@ -1225,7 +1197,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         return result
 
     def _maybe_attach_megakernel_head(self, lm_head):
-        """Megakernel candidate head if it covers every draft graph bs, else None."""
         head = megakernel_draft_selector_head(self.draft_model)
         graph_bs = set(get_exec().graph.cuda_graph_config.decode.bs)
         if head is None or not graph_bs <= set(head.draft_head_requests):
@@ -1261,7 +1232,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def _maybe_attach_megakernel_embed(self):
-        """Megakernel block embedding if it covers every draft graph bs, else None."""
         embed = megakernel_draft_embed(self.draft_model)
         graph_bs = set(get_exec().graph.cuda_graph_config.decode.bs)
         if embed is None or not graph_bs <= set(embed.draft_embed_requests):
@@ -1291,10 +1261,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         return embed
 
     def _default_sampling_is_greedy(self) -> bool:
-        """Whether a request that sets no sampling params samples greedily."""
         preferred = get_serving().preferred_sampling_params or {}
-        if isinstance(preferred, str):
-            preferred = json.loads(preferred)
         params = {
             **preferred,
             **self.model_runner.model_config.get_default_sampling_params(),
@@ -1302,7 +1269,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         return params.get("temperature", 1.0) == 0 or params.get("top_k", -1) == 1
 
     def _graph_proposal_unusable(self, sampling_info) -> bool:
-        """Whether this batch needs the eager selector (greedy-only megakernel head)."""
         if not isinstance(self._draft_sampler, _MegakernelSelectorDraftSampler):
             return False
         if self._draft_sampler.sampling_enabled or _is_all_greedy(sampling_info):
@@ -2609,8 +2575,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             stream = torch.cuda.Stream(device=target_hidden.device)
             current = torch.cuda.current_stream(target_hidden.device)
             stream.wait_stream(current)
-            # Warm CUBLAS/custom operators before capture. Repeating these
-            # prefix writes is idempotent; uncommitted cache rows stay untouched.
+            # Warm-up before capture: rewriting only the committed rows is idempotent.
             with torch.cuda.stream(stream):
                 append()
             current.wait_stream(stream)
@@ -2644,9 +2609,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         cache_loc_2d: torch.Tensor,
         commit_lens: torch.Tensor,
     ) -> None:
-        """Megakernel decode aux append, one graph per shape, on the main stream."""
-        key = ("megakernel", tuple(target_hidden.shape), tuple(cache_loc_2d.shape))
-        entry = self._aux_graphs.get(key)
+        key = (tuple(target_hidden.shape), tuple(cache_loc_2d.shape))
+        entry = self._megakernel_aux_graphs.get(key)
         inputs = (cache_loc, positions, commit_lens)
         parity = self._take_aux_parity()
         if entry is not None:
@@ -2668,7 +2632,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         loc_buf, pos_buf, commit_buf = static
         caches = self._draft_mla_caches()
 
-        # target_hidden is the target graph's capture buffer, read in place.
         def append(slot: int):
             self._megakernel_aux.draft_aux(
                 target_hidden=target_hidden,
@@ -2679,7 +2642,6 @@ class DFlashWorkerV2(BaseSpecWorker):
                 parity=slot,
             )
 
-        # This round's append runs eagerly (the capture warm-up); then both slots.
         stream = torch.cuda.Stream(device=target_hidden.device)
         current = torch.cuda.current_stream(target_hidden.device)
         stream.wait_stream(current)
@@ -2693,14 +2655,13 @@ class DFlashWorkerV2(BaseSpecWorker):
                 append(slot)
             pool, graphs[slot] = graph.pool(), graph
         current.wait_stream(stream)
-        self._aux_graphs[key] = (static, graphs, target_hidden.data_ptr())
+        self._megakernel_aux_graphs[key] = (static, graphs, target_hidden.data_ptr())
         logger.info(
             "DFLASH aux CUDA graph captured on the NVIDIA megakernel rows=%d",
             target_hidden.shape[0],
         )
 
     def _draft_mla_caches(self) -> List[torch.Tensor]:
-        """Each draft layer's MLA cache buffer, in draft layer order."""
         if self._megakernel_aux_caches is not None:
             return self._megakernel_aux_caches
         pool = self.draft_model_runner.token_to_kv_pool
@@ -2730,7 +2691,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         return caches
 
     def _replay_aux_overlapped(self, graph: torch.cuda.CUDAGraph) -> None:
-        """Replay the aux graph on the side stream; ``_join_aux`` joins it back."""
         current = torch.cuda.current_stream(self.device)
         if self._aux_stream is None:
             self._aux_stream = torch.cuda.Stream(device=self.device)
@@ -2908,25 +2868,26 @@ class DFlashWorkerV2(BaseSpecWorker):
                 mamba_steps_to_track = track_buf[:bs]
         else:
             last_correct_step_indices = commit_lens.to(torch.int64) - 1
-
-        if not self._use_commit_metadata and batch.mamba_track_indices is not None:
-            mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
-            to_track_mask = (
-                seq_lens_pre_verify // mamba_track_interval
-                != seq_lens_post_verify // mamba_track_interval
-            )
-            tracking_point = (
-                seq_lens_post_verify // mamba_track_interval * mamba_track_interval
-            )
-            to_track_ith = torch.clamp(tracking_point - seq_lens_pre_verify - 1, min=0)
-            can_track_mask = to_track_mask & (
-                to_track_ith < commit_lens.to(to_track_ith.dtype)
-            )
-            mamba_steps_to_track = torch.where(
-                can_track_mask,
-                to_track_ith.to(torch.int64),
-                torch.full_like(to_track_ith, -1, dtype=torch.int64),
-            )
+            if batch.mamba_track_indices is not None:
+                mamba_track_interval = mamba_track_grid(batch.tree_cache.page_size)
+                to_track_mask = (
+                    seq_lens_pre_verify // mamba_track_interval
+                    != seq_lens_post_verify // mamba_track_interval
+                )
+                tracking_point = (
+                    seq_lens_post_verify // mamba_track_interval * mamba_track_interval
+                )
+                to_track_ith = torch.clamp(
+                    tracking_point - seq_lens_pre_verify - 1, min=0
+                )
+                can_track_mask = to_track_mask & (
+                    to_track_ith < commit_lens.to(to_track_ith.dtype)
+                )
+                mamba_steps_to_track = torch.where(
+                    can_track_mask,
+                    to_track_ith.to(torch.int64),
+                    torch.full_like(to_track_ith, -1, dtype=torch.int64),
+                )
 
         model_runner = self.target_worker.model_runner
         if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):
@@ -2938,29 +2899,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 req_pool_indices=batch.req_pool_indices[: commit_lens.shape[0]],
             )
 
-    def _draft_block_embeds(
-        self, *, block_ids: torch.Tensor, embed_module, bs: int
-    ) -> Optional[torch.Tensor]:
-        """Block input embeds [bs * block, hidden]; None if the megakernel embeds."""
-        embed = self._megakernel_embed
-        if embed is not None and bs in embed.draft_embed_requests:
-            return None
-        if self._full_embed_gpu is not None:
-            # A borrowed embedding may use target-wide collectives, while
-            # other DP replicas are idle or looking up different token IDs.
-            noise_embedding = torch.nn.functional.embedding(
-                block_ids, self._full_embed_gpu
-            )
-        else:
-            noise_embedding = embed_module(block_ids)
-        if self._noise_embed_scale != 1.0:
-            noise_embedding = noise_embedding * self._noise_embed_scale
-        return noise_embedding.view(-1, noise_embedding.shape[-1])
-
     def _maybe_attach_megakernel_accept(self):
-        """The megakernel's one-launch greedy verify accept, or None for SGLang's."""
-        if self.draft_model is None:
-            return None
         accept = megakernel_draft_accept(self.draft_model)
         if accept is None or self._plain_deferral_refused("megakernel accept"):
             return None
@@ -2968,9 +2907,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             sim_real_token=SIMULATE_ACC_TOKEN_MODE == "real-draft-token"
         )
         self._arm_plain_deferral("megakernel accept")
-        self._sim_ring = SimAccLenRing(self.device)
-        self._sim_off = torch.zeros(1, dtype=torch.int32, device=self.device)
-        self._accept_target_buf: Optional[torch.Tensor] = None
         if self._target_tp_rank == 0:
             logger.info(
                 "DFLASH greedy verify accept runs on the NVIDIA megakernel for "
@@ -2980,7 +2916,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         return accept
 
     def _ring_declines(self, feature: str) -> bool:
-        """Off under the draft KV ring, which replaces the per-slot draft table."""
         if not get_spec().speculative_dflash_draft_kv_ring:
             return False
         if self._target_tp_rank == 0:
@@ -2991,9 +2926,8 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
         return True
 
-    def _attach_megakernel_aux(self):
-        """The megakernel's draft aux append, or None (also under the draft KV ring)."""
-        if not self._use_aux_graph or self.draft_model is None:
+    def _maybe_megakernel_aux(self):
+        if not self._use_aux_graph:
             return None
         aux = megakernel_draft_aux(self.draft_model)
         if aux is not None and self._ring_declines("draft aux"):
@@ -3001,7 +2935,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         return aux
 
     def _tail_graph_enabled(self) -> bool:
-        """SGLANG_OPT_DFLASH_MEGAKERNEL_TAIL_GRAPH, off under the draft KV ring."""
         if not envs.SGLANG_OPT_DFLASH_MEGAKERNEL_TAIL_GRAPH.get():
             return False
         ring = envs.SGLANG_ENABLE_DFLASH_DRAFT_KV_RING
@@ -3016,19 +2949,17 @@ class DFlashWorkerV2(BaseSpecWorker):
     def _warn_megakernel_draft_chain_under_ring(self) -> None:
         if (
             get_spec().speculative_dflash_draft_kv_ring
-            and self.draft_model is not None
             and built_megakernel(self.draft_model) is not None
             and self._target_tp_rank == 0
         ):
             logger.warning(
-                "DFLASH megakernel draft chain (M1a / M1b) with the draft KV ring has not "
+                "DFLASH megakernel draft chain with the draft KV ring has not "
                 "been validated; it writes at the ring's out_cache_loc rows"
             )
 
     def _plain_deferral_refused(self, consumer: str) -> bool:
-        """Whether SGLANG_DFLASH_DEFER_PLAIN_GATHER=0 keeps the full verify gather."""
         target_lp = self._target_logits_processor
-        plain = envs.SGLANG_DFLASH_DEFER_PLAIN_GATHER
+        plain = envs.SGLANG_OPT_DFLASH_DEFER_PLAIN_GATHER
         refused = (
             target_lp is not None
             and not target_lp.final_logit_softcapping
@@ -3037,14 +2968,14 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
         if refused and self._target_tp_rank == 0:
             logger.info(
-                "DFLASH %s off: SGLANG_DFLASH_DEFER_PLAIN_GATHER=0 keeps the full "
+                "DFLASH %s off: SGLANG_OPT_DFLASH_DEFER_PLAIN_GATHER=0 keeps the full "
                 "verify gather",
                 consumer,
             )
         return refused
 
     def _arm_plain_deferral(self, consumer: str) -> None:
-        """Turn on the plain verify deferral; must run before the graphs capture."""
+        """Must run before the graphs capture."""
         target_lp = self._target_logits_processor
         if (
             target_lp is None
@@ -3059,7 +2990,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
 
     def _tail_covered(self, bs: int) -> bool:
-        """Whether the captured megakernel tail can replace this round's steps."""
         accept = self._megakernel_accept
         return (
             self._tail_graph
@@ -3071,19 +3001,29 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def _tail_appends_aux(self, bs: int) -> bool:
-        """Whether the tail also does the context-KV append (aux covers these rows)."""
         aux = self._megakernel_aux
         return aux is not None and bs * int(self.block_size) in aux.draft_aux_rows
 
     def _take_accept_parity(self) -> int:
-        """Next ``draft_accept`` parity slot (alternates 0 / 1)."""
         slot, self._accept_parity = self._accept_parity, self._accept_parity ^ 1
         return slot
 
     def _take_aux_parity(self) -> int:
-        """Next ``draft_aux`` parity slot (alternates 0 / 1)."""
         slot, self._aux_parity = self._aux_parity, self._aux_parity ^ 1
         return slot
+
+    def _stage_sim_commit(self, block_size: int) -> torch.Tensor:
+        """This round's simulated commit length on device (zero when simulation is off)."""
+        if SIMULATE_ACC_LEN > 0:
+            return self._sim_ring.stage(
+                sample_simulated_acc_len(
+                    SIMULATE_ACC_LEN,
+                    SIMULATE_ACC_METHOD,
+                    block_size,
+                    generator=self._simulated_acc_len_rng,
+                )
+            )
+        return self._sim_ring.device_len
 
     def _tail_on_megakernel(
         self,
@@ -3101,7 +3041,7 @@ class DFlashWorkerV2(BaseSpecWorker):
         """Run or replay the megakernel post-verify tail; None keeps SGLang's steps."""
         with_aux = self._tail_appends_aux(bs)
         caches = self._draft_mla_caches() if with_aux else []
-        sim_buf = self._sim_ring.device_len if SIMULATE_ACC_LEN > 0 else self._sim_off
+        sim_buf = self._sim_ring.device_len
         # Keyed by input addresses: each target graph variant has its own buffers.
         key = (
             bs,
@@ -3128,24 +3068,13 @@ class DFlashWorkerV2(BaseSpecWorker):
         if kda is None:
             return None
         state = tuple(t.data_ptr() for t in kda.values() if isinstance(t, torch.Tensor))
-        if not first and state != tail.inputs:
+        if not first and state != tail.kda_state_ptrs:
             raise RuntimeError("DFLASH megakernel tail: the captured KDA state moved")
         tail.prefix.copy_(prefix_lens)
         tail.positions.copy_(positions)
         tail.slots.copy_(cache_loc)
         block_size = int(self.block_size)
-        sim_commit = (
-            self._sim_ring.stage(
-                sample_simulated_acc_len(
-                    SIMULATE_ACC_LEN,
-                    SIMULATE_ACC_METHOD,
-                    block_size,
-                    generator=self._simulated_acc_len_rng,
-                )
-            )
-            if SIMULATE_ACC_LEN > 0
-            else self._sim_off
-        )
+        sim_commit = self._stage_sim_commit(block_size)
 
         def body(accept_slot: int, aux_slot: Optional[int]) -> bool:
             out = tail.outs[accept_slot]
@@ -3179,7 +3108,7 @@ class DFlashWorkerV2(BaseSpecWorker):
             # First round eager, doubling as warm-up: the KDA commit must not run twice.
             if not body(*slots):
                 raise RuntimeError("DFLASH megakernel tail: the KDA commit turned off")
-            tail.inputs = state
+            tail.kda_state_ptrs = state
             self._megakernel_tails[key] = tail
         else:
             graph = tail.graphs.get(slots)
@@ -3191,7 +3120,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         return out
 
     def _capture_tail(self, tail: _MegakernelTail, body, slots) -> torch.cuda.CUDAGraph:
-        """Capture the tail for one (accept slot, aux slot) pair in the tail's pool."""
         stream = torch.cuda.Stream(device=self.device)
         current = torch.cuda.current_stream(self.device)
         stream.wait_stream(current)
@@ -3218,7 +3146,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         prefix_lens: torch.Tensor,
         bs: int,
     ):
-        """Greedy accept on the megakernel from this rank's row argmax."""
         accept_len, commit_lens, bonus, out_tokens, new_seq_lens = (
             self._next_accept_bonus_buffers(bs)
         )
@@ -3228,19 +3155,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 (bs, block_size), dtype=torch.int64, device=self.device
             )
         target_predict = self._accept_target_buf[:bs]
-        # One host draw per round, same generator as apply_dflash_simulated_acceptance.
-        sim_commit = (
-            self._sim_ring.stage(
-                sample_simulated_acc_len(
-                    SIMULATE_ACC_LEN,
-                    SIMULATE_ACC_METHOD,
-                    block_size,
-                    generator=self._simulated_acc_len_rng,
-                )
-            )
-            if SIMULATE_ACC_LEN > 0
-            else self._sim_off
-        )
+        sim_commit = self._stage_sim_commit(block_size)
         self._megakernel_accept.draft_accept(
             local=local,
             candidates=candidates,
@@ -3266,7 +3181,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         seq_lens_pre_verify: torch.Tensor,
         commit_lens: torch.Tensor,
     ) -> bool:
-        """Run the KDA commit on the target megakernel; False keeps SGLang's commit."""
         if self._megakernel_kda is None:
             return False
         bs = int(commit_lens.shape[0])
@@ -3294,27 +3208,29 @@ class DFlashWorkerV2(BaseSpecWorker):
         slots: torch.Tensor,
         track: torch.Tensor,
     ) -> Optional[dict]:
-        """The KDA commit kwargs, or None where SGLang's commit takes another branch."""
-        backend = _hybrid_linear_backend(self.target_worker.model_runner.attn_backend)
-        if backend is None or pp_spec_stable_rows_enabled():
-            return None
-        linear = backend.linear_attn_backend
-        req_pool = linear.req_to_token_pool
-        # Host-only checkpoints index the KDA ring by req_pool_idx; this commit
-        # writes it through the mamba slot, so SGLang's commit takes over.
+        backend = self.target_worker.model_runner.attn_backend
+        if isinstance(backend, HybridAttnBackend):
+            backend = backend.target_verify_backend()
         if (
-            not req_pool.mamba_pool.replayssm_is_kda
-            or req_pool.mamba_pool.replayssm_request_ring
+            not isinstance(backend, HybridLinearAttnBackend)
+            or pp_spec_stable_rows_enabled()
         ):
             return None
-        spec_state = linear.state_pool.get_speculative_mamba2_params_all_layers()
+        linear = backend.linear_attn_backend
+        state_pool = linear.state_pool
+        # Host-only checkpoints index the KDA ring by req_pool_idx; this commit
+        # writes it through the mamba slot, so SGLang's commit takes over.
+        if not state_pool.replayssm_is_kda or state_pool.replayssm_request_ring:
+            return None
+        spec_state = state_pool.get_speculative_mamba2_params_all_layers()
         if len(spec_state.conv) != 1:
             return None
-        slots.copy_(linear.forward_metadata.mamba_cache_indices[:bs])
-        if batch.mamba_track_indices is None:
+        state_slots = linear.forward_state_slots(bs, batch.mamba_track_indices)
+        slots.copy_(state_slots.working)
+        if state_slots.track is None:
             track.fill_(-1)
         else:
-            track.copy_(linear._translate_mamba_indices(batch.mamba_track_indices))
+            track.copy_(state_slots.track)
         return dict(
             temporal=spec_state.temporal,
             rawk=spec_state.replayssm_rawk,
@@ -3329,7 +3245,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         )
 
     def _kda_commit_inputs(self, bs: int) -> Tuple[torch.Tensor, ...]:
-        """Static int32 slots / track slots / commit lengths for the KDA commit."""
         if self._kda_commit_buffers is None or self._kda_commit_buffers[0].numel() < bs:
             self._kda_commit_buffers = tuple(
                 torch.empty(bs, dtype=torch.int32, device=self.device) for _ in range(3)
@@ -3423,9 +3338,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                 sampling_info=sampling_info,
                 draft_input=draft_input,
             )
-            # Rank 0's decision to all ranks: one megakernel hop (rank-uniform branch),
-            # else the two SGLANG_SPEC_TP_SYNC broadcasts.
-            bcast = self._megakernel_bcast if megakernel_enabled() else None
+            bcast = self._megakernel_bcast
             if bcast is None or not bcast.rank0_broadcast(accept_len, bonus):
                 self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, accept_len)
                 self._tp_sync.sync(SpecTpSyncSite.DFLASH_SELECTOR, bonus)
@@ -3564,8 +3477,6 @@ class DFlashWorkerV2(BaseSpecWorker):
         pp_proxy_tensors=None,
     ) -> GenerationBatchResult:
         if not self._hosts_draft:
-            # An earlier pipeline stage of a PD prefill: the target forward,
-            # whose captured aux hidden states ride the PP proxy onward.
             batch_output = self.target_worker.forward_batch_generation(
                 batch,
                 pp_proxy_tensors=pp_proxy_tensors,
@@ -3709,25 +3620,18 @@ class DFlashWorkerV2(BaseSpecWorker):
                     custom_mask=None,
                     capture_hidden_mode=CaptureHiddenMode.FULL,
                 )
-                # Deferred like the active ranks' verify under DP attention:
-                # ModelRunner plans after DP padding has fixed the shapes.
+                # ModelRunner plans the metadata after DP padding fixes the shapes.
                 idle_verify_forward_batch, idle_can_run_cuda_graph = (
                     idle_verify_input.prepare_for_verify(
                         batch, self._target_worker, defer_metadata_init=True
                     )
                 )
                 if _is_npu:
-                    # Force eager: NPU active ranks run eager verify when any
-                    # DP rank is idle (see the idle-guard below); a
-                    # graph-replaying idle rank would disagree with them on
-                    # DP-gather segment offsets (padded bucket vs raw counts).
+                    # Matches the active ranks, which go eager when any DP rank is idle.
                     idle_verify_forward_batch.can_run_decode_cuda_graph = False
                     idle_can_run_cuda_graph = False
-                # On CUDA the idle rank keeps prepare_for_verify's graph
-                # decision: the bucket is max(original_global_num_tokens_cpu)
-                # on every rank, so it replays the active ranks' graph with
-                # zero real rows (raw_bs=0) and the same [bucket*w]*ndp
-                # DP-gather layout, like plain decode and EAGLE idle ranks.
+                # On CUDA every rank pads to max(original_global_num_tokens_cpu), so
+                # the idle rank replays the active ranks' graph with zero real rows.
                 self._target_worker.forward_batch_generation(
                     batch=None,
                     forward_batch=idle_verify_forward_batch,
@@ -3845,9 +3749,22 @@ class DFlashWorkerV2(BaseSpecWorker):
             )
             verify_out_cache_loc_2d.copy_(verify_out_cache_loc.view(bs, block_size))
 
-        input_embeds = self._draft_block_embeds(
-            block_ids=block_ids, embed_module=embed_module, bs=bs
-        )
+        megakernel_embed = self._megakernel_embed
+        if megakernel_embed is not None and bs in megakernel_embed.draft_embed_requests:
+            # The megakernel embeds the block inside the draft forward.
+            input_embeds = None
+        else:
+            if self._full_embed_gpu is not None:
+                # A borrowed embedding may use target-wide collectives, while
+                # other DP replicas are idle or looking up different token IDs.
+                noise_embedding = torch.nn.functional.embedding(
+                    block_ids, self._full_embed_gpu
+                )
+            else:
+                noise_embedding = embed_module(block_ids)
+            if self._noise_embed_scale != 1.0:
+                noise_embedding = noise_embedding * self._noise_embed_scale
+            input_embeds = noise_embedding.view(-1, noise_embedding.shape[-1])
 
         positions = positions_2d.reshape(-1)
         verify_out_cache_loc = verify_out_cache_loc_2d.reshape(-1)
@@ -3926,9 +3843,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             global_num_token_non_padded_cpu=bs * block_size,
             can_run_decode_cuda_graph=batch.can_run_decode_cuda_graph,
         )
-        # Graph eligibility follows the target batch (the scheduler's DP vote),
-        # as for the DSpark draft; the draft keys its graph by local batch size.
-        forward_batch.can_run_decode_cuda_graph = batch.can_run_decode_cuda_graph
         # The draft block writes the whole window. A compact draft reads its
         # own `req_to_token` rows over its own lengths.
         draft_translator = self.draft_model_runner.runner_ids
@@ -4147,11 +4061,8 @@ class DFlashWorkerV2(BaseSpecWorker):
         batch.seq_lens_cpu = seq_lens_cpu_backup
         batch.seq_lens_sum = seq_lens_sum_backup
 
-        # Idle-DP guard (NPU): an idle rank's eager verify contributes raw
-        # scheduler counts while a graph-replaying rank assumes the padded
-        # bucket, so their DP-gather segment offsets disagree. Fall back to
-        # eager verify whenever any DP rank is idle this round. CUDA idle
-        # ranks replay the same bucket instead (see the idle branch above).
+        # Idle-DP guard (NPU): an eager idle rank's raw counts and a replaying rank's
+        # padded bucket disagree on DP-gather offsets, so any idle rank forces eager.
         if (
             _is_npu
             and get_parallel().attn_dp_enabled
@@ -4193,9 +4104,7 @@ class DFlashWorkerV2(BaseSpecWorker):
                         candidates=draft_tokens,
                         prefix_lens=prefix_lens,
                         positions=positions,
-                        cache_loc=ring_block_locs
-                        if ring_block_locs is not None
-                        else self._draft_write_ids(iteration_ids),
+                        cache_loc=self._draft_write_ids(iteration_ids),
                         batch=batch,
                         bs=bs,
                     )
@@ -4223,7 +4132,6 @@ class DFlashWorkerV2(BaseSpecWorker):
             elif self._can_megakernel_sample(
                 batch, sampling_info, bs, logits_output.next_token_logits
             ):
-                # The megakernel samples from the shard itself (_accept_block).
                 verify_shard = logits_output.next_token_logits
                 logits_output.next_token_logits = None
             else:

@@ -281,10 +281,7 @@ def ensure_mamba_capacity(
 
     # Byte-coordinated for the shared allocator; plain free slots otherwise.
     allocator = state.slots
-    # Only a tree that holds Mamba states can give slots back.
-    tree_holds_mamba = supports_mamba and not getattr(
-        tree_cache, "request_mamba_only", False
-    )
+    tree_holds_mamba = supports_mamba and not tree_cache.request_mamba_only
     if allocator.slots_fit(needed):
         return True
     if tree_holds_mamba:

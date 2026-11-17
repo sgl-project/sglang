@@ -54,10 +54,10 @@ def check_dcp_mla_draft(draft_hf_config) -> None:
     draft window is settled later, as for the MLA-only backends."""
     from sglang.srt.speculative.dflash_utils import (
         get_dflash_layer_types,
-        is_dflash_mla_draft_config,
+        parse_dflash_draft_config,
     )
 
-    if not is_dflash_mla_draft_config(draft_hf_config):
+    if not parse_dflash_draft_config(draft_hf_config=draft_hf_config).is_mla:
         return
     # Only the ROCm MLA forward (SGLANG_USE_AITER) hands this backend a DCP verify
     # window with gathered heads and merges its rank-local partials.

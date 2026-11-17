@@ -618,6 +618,15 @@ class ExecMamba(msgspec.Struct):
             resolvable=True,
         ),
     ] = False
+    decode_state_free_radix_default: A[
+        bool,
+        Arg(
+            help="(Resolved) the model's default for SGLANG_DECODE_STATE_FREE_RADIX; "
+            "set by model overrides, no CLI surface.",
+            no_cli=True,
+            resolvable=True,
+        ),
+    ] = False
     mamba_track_interval: A[
         int,
         "The interval to track the mamba state during decode.",
@@ -654,8 +663,8 @@ class ExecMamba(msgspec.Struct):
     linear_attn_verify_backend: A[
         Optional[str],
         Arg(
-            help="Override the kernel backend for linear attention speculative target-verify. If not set, follows the decode backend (flashinfer decode -> flashinfer verify, otherwise triton). KDA supports triton, nv_cutedsl, and flashinfer verify backends.",
-            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES + ["nv_cutedsl"],
+            help="Override the kernel backend for linear attention speculative target-verify. If not set, follows the decode backend (flashinfer decode -> flashinfer verify, otherwise triton). KDA supports triton, nv_cutedsl, and flashinfer verify backends. aiter (ROCm, GDN only) runs linear-chain verify on aiter's FlyDSL kernels.",
+            choices=LINEAR_ATTN_KERNEL_BACKEND_CHOICES + ["nv_cutedsl", "aiter"],
         ),
     ] = None
     # ReplaySSM buffered output-only linear-attn decode (GDN + KDA): per-slot

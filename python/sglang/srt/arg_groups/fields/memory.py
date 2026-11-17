@@ -34,7 +34,14 @@ class Memory(msgspec.Struct):
                 "a conversation that cannot affect tail TTFT before falling back "
                 "to LRU. 'joint_lru' evicts full-attention and SWA KV in one "
                 "shared least-recently-used order on a full/SWA hybrid model with "
-                "--enable-unified-memory, and acts as 'lru' elsewhere. See "
+                "--enable-unified-memory, and acts as 'lru' elsewhere. 'state_cost' "
+                "evicts cached recurrent-state checkpoints on hybrid models by the "
+                "prefill each one saves, aged by an eviction watermark (state-only, "
+                "inspired by FlashStates: paper "
+                "https://www.alphaxiv.org/abs/2611.flashstate, code "
+                "https://github.com/FutureMLS-Lab/FlashStates, project page "
+                "https://flashstates.ai), and acts as 'lru' on other models. "
+                "See "
                 "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy "
                 "for what each policy optimizes for."
             ),
@@ -54,7 +61,9 @@ class Memory(msgspec.Struct):
                 "protected_threshold (int, default 2), e.g. "
                 "'{\"protected_threshold\": 4}'; 'tlru' takes threshold and "
                 "next_prompt_estimate (ints, tokens), e.g. "
-                '\'{"threshold": 4096, "next_prompt_estimate": 512}\'. An '
+                "'{\"threshold\": 4096, \"next_prompt_estimate\": 512}'; 'state_cost' "
+                "takes the prefill cost coefficients d and e (floats, only their ratio "
+                'matters), e.g. \'{"d": 1.862e-5, "e": 3.33e-6}\'. An '
                 "unrecognized key fails at startup, naming the key and the "
                 "policy. See "
                 "https://docs.sglang.io/docs/advanced_features/radix_eviction_policy#policy-parameters "

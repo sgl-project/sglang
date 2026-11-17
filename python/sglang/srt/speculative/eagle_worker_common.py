@@ -271,6 +271,17 @@ if TYPE_CHECKING:
     from sglang.srt.speculative.eagle_post_verify_graphs import EaglePostVerifyGraphs
 
 
+def check_draft_branch_tail_copy(token_to_kv_pool, topk: int, page_size: int) -> None:
+    # duplicate_prefix_tail_to_draft_branches addresses slots raw, but DCP-collapsed
+    # rows live at loc // dcp_size: the tail page would land in rows the draft never reads.
+    if topk > 1 and page_size > 1 and token_to_kv_pool.rows_are_dcp_collapsed:
+        raise ValueError(
+            "--speculative-eagle-topk > 1 with --page-size > 1 does not support "
+            "a draft KV pool with DCP-collapsed rows; run with "
+            "--speculative-eagle-topk 1."
+        )
+
+
 def duplicate_prefix_tail_to_draft_branches(
     token_to_kv_pool,
     rows: torch.Tensor,
@@ -288,17 +299,6 @@ def duplicate_prefix_tail_to_draft_branches(
     """
     if topk <= 1:
         return
-    from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-    from sglang.srt.runtime_context import get_parallel
-
-    if get_parallel().dcp_enabled and isinstance(token_to_kv_pool, MLATokenToKVPool):
-        # This copy addresses slots raw; DCP MLA rows are owner-only at
-        # loc // dcp_size, so it would place the tail page in rows the draft
-        # never reads.
-        raise NotImplementedError(
-            "duplicate_prefix_tail_to_draft_branches does not support an MLA "
-            "draft under DCP; run with --speculative-eagle-topk 1."
-        )
     bs = rows.shape[0]
     page_off = torch.arange(page_size, device=rows.device, dtype=torch.int64)
     branches = torch.arange(1, topk, device=rows.device, dtype=torch.int64).view(

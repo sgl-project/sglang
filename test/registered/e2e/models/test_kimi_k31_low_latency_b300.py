@@ -1,9 +1,5 @@
-"""B300 CI coverage for the Kimi-K3.1 Low Latency recipe.
-
-Runs the TP8/DCP8 DFLASH recipe (block size 6) on eight B300 GPUs and checks
-MMMU-Pro quality, speculative acceptance, and single-request decode speed.
-The recipe's decode role runs colocated here: PD needs a second 8-GPU node.
-"""
+"""B300 CI for the Kimi-K3.1 Low-Latency recipe; unlike the cookbook's TP8 cell, it
+adds DCP8 and runs mem fraction 0.92 and 72 running requests, not 0.85 and 64."""
 
 import unittest
 
@@ -28,8 +24,6 @@ GPU_IDLE_TIMEOUT = 120
 
 
 class TestKimiK31LowLatencyB300(MMMUProMixin, SpecDecodingMixin, CustomTestCase):
-    """TP8/DCP8 Low Latency recipe with DFLASH linear ReplaySSM speculation."""
-
     mmmu_pro_score_threshold = 0.75
     mmmu_pro_num_examples = 200
     # sgl-eval has no Kimi-K3.1 preset yet; K3.1 shares K3's chat template and

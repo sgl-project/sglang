@@ -3,14 +3,16 @@
 
 from __future__ import annotations
 
-from sglang.kernels.plugin_kernels.nvidia.spec import Step
+from typing import TYPE_CHECKING
 
-# a module import: binding imports this module back
-from sglang.srt.kernel_plugins.nvidia import binding as megakernel_binding
+from sglang.kernels.plugin_kernels.nvidia.spec import Step
 from sglang.srt.model_executor.forward_context import get_attn_backend
 from sglang.srt.model_executor.runner_utils.capture_mode import (
     get_capture_attention_variant,
 )
+
+if TYPE_CHECKING:
+    from sglang.srt.kernel_plugins.nvidia.binding import MegakernelBinding
 
 
 class K31DecodeGraphVariants:
@@ -25,15 +27,15 @@ class K31DecodeGraphVariants:
 
 
 class K31DecodeHostBinding:
-    def __init__(self, model):
-        self.model = model
-        self.pools = megakernel_binding.MegakernelBinding(model=model)
+    def __init__(self, binding: MegakernelBinding):
+        self.model = binding.model
+        self.binding = binding
 
     def graph_variants(self):
         return K31DecodeGraphVariants()
 
     def pool_view(self, pool, req_pool):
-        return self.pools.preparation_view(pool, req_pool)
+        return self.binding.pool_view(pool, req_pool)
 
     def can_run_graph(self, built, forward_batch):
         # The graph runner pads live requests to a captured width before forward.
@@ -74,7 +76,6 @@ class K31DecodeHostBinding:
         rows = step.rows
         full = backend.full_attn_backend.forward_metadata
         linear = backend.linear_attn_backend.forward_metadata
-        # Captured graphs bake in their label; eager steps select from current lengths.
         label = get_capture_attention_variant()
         if label is None:
             label = K31DecodeGraphVariants().select(forward_batch)
@@ -99,5 +100,5 @@ class K31DecodeHostBinding:
         lm = self.model.language_model
         embeddings = lm.model.embed_tokens(input_ids)
         hidden = built.run_decode(input_ids, embeddings, view)
-        self.pools.finish_step(forward_batch)
+        self.binding.finish_step(forward_batch)
         return lm.logits_processor(input_ids, hidden, lm.lm_head, forward_batch, None)

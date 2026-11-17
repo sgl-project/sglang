@@ -767,9 +767,15 @@ def row_shard_bank_hooks_hip(layer) -> dict:
 
 def prepare_hip_paths(layer) -> None:
     """Post-load, after _merge_front_weights: a MoE KimiK3DecoderLayer's ROCm
-    paths, and the full o_proj weight its row-sharded o_proj applies (only
-    a MoE layer has row shards, see ffn_row_shards_hip)."""
+    paths, the fp32 next-layer norm weight its column tail reads, and the full
+    o_proj weight its row-sharded o_proj applies (only a MoE layer has row
+    shards, see ffn_row_shards_hip)."""
     layer.mlp._prepare_hip_paths()
+    if (read := layer.mlp.next_attn_read) is not None:
+        from sglang.srt.layers.attn_residual_hip import get_fp32_norm_weight
+
+        # a reload rewrites that norm in place; the tail reads only this copy
+        get_fp32_norm_weight(read.norm, refresh=True)
     if layer._o_proj_row_sharded:
         gather_full_o_proj(layer.self_attn.o_proj)
 

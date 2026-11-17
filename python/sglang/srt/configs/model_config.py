@@ -50,7 +50,7 @@ from sglang.srt.hf_transformers import (
 from sglang.srt.hf_transformers.config import POINTER_ADAPTER_BASES
 from sglang.srt.runtime_context import get_platform
 from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import is_hip, is_npu, retry
+from sglang.srt.utils import is_gfx95_supported, is_hip, is_npu, retry
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 
 logger = logging.getLogger(__name__)
@@ -215,9 +215,6 @@ def is_deepseek_dsa(config) -> bool:
             "Dots3NoteForCausalLMNextN",
             "HYV4ForCausalLM",
             "HYV4ForCausalLMNextN",
-            "KimiK31ForConditionalGeneration",
-            "KimiLinearForCausalLM",
-            "KimiK3LinearForCausalLM",
             "Ernie5_5_MoeForCausalLM",
             "Ernie5_5_MoeForCausalLMNextN",
         )
@@ -259,12 +256,15 @@ def is_glm_moe_dsa(config) -> bool:
     )
 
 
+KIMI_K3_ARCHS = (
+    "KimiK3ForConditionalGeneration",
+    "KimiK31ForConditionalGeneration",
+    "KimiK3LinearForCausalLM",
+)
+
+
 def is_kimi_k3(config) -> bool:
-    return _hf_arch(config) in (
-        "KimiK3ForConditionalGeneration",
-        "KimiK31ForConditionalGeneration",
-        "KimiK3LinearForCausalLM",
-    )
+    return _hf_arch(config) in KIMI_K3_ARCHS
 
 
 _KIMI_K31_ARCHS = (
@@ -1485,16 +1485,17 @@ class ModelConfig:
     def _derive_model_shapes(self):
         from sglang.srt.configs.dots3 import Dots3Config
 
-        self.is_dflash_mla_draft = False
-        # Only DFlash-family draft checkpoints carry a dflash_config.
+        is_dflash_mla_draft = False
         if getattr(self.hf_config, "dflash_config", None):
             from sglang.srt.speculative.dflash_utils import (
-                is_dflash_mla_draft_config,
+                parse_dflash_draft_config,
                 validate_dflash_mla_draft_config,
             )
 
-            self.is_dflash_mla_draft = is_dflash_mla_draft_config(self.hf_config)
-            if self.is_dflash_mla_draft:
+            is_dflash_mla_draft = parse_dflash_draft_config(
+                draft_hf_config=self.hf_config
+            ).is_mla
+            if is_dflash_mla_draft:
                 # Validate before the generic defaults below fill missing fields.
                 validate_dflash_mla_draft_config(self.hf_config)
 
@@ -1532,7 +1533,7 @@ class ModelConfig:
             setattr(self.hf_text_config, "swa_v_head_dim", self.swa_v_head_dim)
         # FIXME: temporary special judge for MLA architecture
         if (
-            self.is_dflash_mla_draft
+            is_dflash_mla_draft
             or "DeepseekV2ForCausalLM" in self.hf_config.architectures
             or "DeepseekV32ForCausalLM" in self.hf_config.architectures
             or "DeepseekV3ForCausalLM" in self.hf_config.architectures
@@ -1574,9 +1575,8 @@ class ModelConfig:
             else:
                 self.swa_kv_lora_rank = self.kv_lora_rank
                 self.swa_qk_rope_head_dim = self.qk_rope_head_dim
-            if self.is_dflash_mla_draft:
-                # Sliding draft layers share the full layers' latent rows; the
-                # template's GQA head_dim would size a separate triton buffer.
+            if is_dflash_mla_draft:
+                # Sliding draft layers share the latent rows, not a GQA head_dim.
                 self.swa_v_head_dim = self.v_head_dim
             self.index_head_dim = (
                 get_dsa_index_head_dim(self.hf_text_config)
@@ -2204,6 +2204,8 @@ class ModelConfig:
             "quark_mxfp4",
             "minimax_m3_nvfp4",
         ]
+        if is_gfx95_supported():
+            rocm_supported_quantization.append("modelopt_fp8")
         optimized_quantization_methods = [
             "fp8",
             "marlin",
@@ -2606,6 +2608,9 @@ multimodal_model_archs = [
     "LlavaForConditionalGeneration",
     "LlavaVidForCausalLM",
     "Lfm2VlForConditionalGeneration",
+    "Lfm3VlForConditionalGeneration",
+    "Lfm3AudioForConditionalGeneration",
+    "Lfm3OmniForConditionalGeneration",
     "LightOnOCRForConditionalGeneration",
     *MIMO_V2_MULTIMODAL_ARCHS,
     "MiMoV2ASRForCausalLM",

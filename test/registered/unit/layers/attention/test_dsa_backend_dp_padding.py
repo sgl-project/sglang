@@ -158,7 +158,6 @@ class TestDSABackendDPPadding(CustomTestCase):
         backend.attn_dcp_size, backend.attn_dcp_rank = 1, 0
         backend.__dict__.update(
             dsa_prefill_impl=implementation,
-            attn_dcp_size=1,
             use_mha=False,
             use_fused_topk=True,
             hisparse_coordinator=None,

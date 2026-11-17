@@ -362,11 +362,7 @@ class TestAutotuneCachePhases(CustomTestCase):
         tuner = AutoTuner.get()
         tuner.clear_cache()
         self.addCleanup(tuner.clear_cache)
-        runner = SimpleNamespace(
-            device="cuda",
-            forward_stream=torch.cuda.Stream(),
-            model_config=SimpleNamespace(hf_config=SimpleNamespace(architectures=None)),
-        )
+        runner = SimpleNamespace(device="cuda", forward_stream=torch.cuda.Stream())
         with tempfile.TemporaryDirectory() as directory:
             target, draft = (
                 Path(directory) / name for name in ("target.json", "draft.json")

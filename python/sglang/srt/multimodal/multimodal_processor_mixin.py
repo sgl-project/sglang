@@ -33,6 +33,7 @@ class MultimodalProcessorMixin:
     """Share media loading and preprocessing resources across training and serving."""
 
     gpu_image_decode = True  # Enable GPU decoding by default
+    gpu_video_decode = True
     smart_rgb_conversion = False
     auto_mm_io_worker_num = 4
     # Processors opt out only when their preprocessing is not thread-safe. The
@@ -203,6 +204,7 @@ class MultimodalProcessorMixin:
         frame_count_limit=None,
         audio_sample_rate: Optional[int] = None,
         discard_alpha_channel=True,
+        video_decode_device: Optional[str] = None,
     ):
         """
         Load a single multimodal data.
@@ -228,7 +230,11 @@ class MultimodalProcessorMixin:
                 img.load()
                 return img
             elif modality == Modality.VIDEO:
-                return load_video(data, use_gpu=cls.video_preprocessing_device != "cpu")
+                if video_decode_device is None:
+                    video_decode_device = cls.video_preprocessing_device
+                return load_video(
+                    data, use_gpu=cls.gpu_video_decode and video_decode_device != "cpu"
+                )
             elif modality == Modality.AUDIO:
                 return load_audio(data, audio_sample_rate)
 
@@ -276,6 +282,7 @@ class MultimodalProcessorMixin:
         modality: Modality,
         audio_sample_rate: Optional[int],
         discard_alpha_channel: bool,
+        video_decode_device: Optional[str] = None,
     ) -> List[Tuple[Modality, int, concurrent.futures.Future]]:
         """
         Simple version: For one modal data submit IO load task.
@@ -291,6 +298,12 @@ class MultimodalProcessorMixin:
             )
             return futures
 
+        # Legacy loader overrides predate the argument, so only a chosen device is sent.
+        load_kwargs = (
+            {}
+            if video_decode_device is None
+            else {"video_decode_device": video_decode_device}
+        )
         for idx, data in enumerate(data_list):
             logger.debug(
                 "[_submit_mm_data_loading_tasks_simple] submit load task: "
@@ -306,6 +319,7 @@ class MultimodalProcessorMixin:
                 None,  # frame_count_limit: no consider for fast path
                 audio_sample_rate,
                 discard_alpha_channel,
+                **load_kwargs,
             )
             futures.append((modality, idx, future))
 
@@ -363,6 +377,7 @@ class MultimodalProcessorMixin:
         *,
         audio_sample_rate: Optional[int],
         discard_alpha_channel: bool,
+        video_decode_device: Optional[str] = None,
     ) -> Tuple[List[Any], List[Any], List[Any]]:
         futures: List[Tuple[Modality, int, concurrent.futures.Future]] = []
 
@@ -375,7 +390,11 @@ class MultimodalProcessorMixin:
         for data_list, modality in modalities_data:
             futures.extend(
                 self._submit_mm_data_loading_tasks_simple(
-                    data_list, modality, audio_sample_rate, discard_alpha_channel
+                    data_list,
+                    modality,
+                    audio_sample_rate,
+                    discard_alpha_channel,
+                    video_decode_device=video_decode_device,
                 )
             )
 

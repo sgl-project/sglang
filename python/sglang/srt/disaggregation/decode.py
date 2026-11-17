@@ -168,6 +168,7 @@ from sglang.srt.runtime_context import (
     get_disagg,
     get_memory,
     get_parallel,
+    get_spec,
 )
 from sglang.srt.utils import ceil_align, is_npu, rank_consensus_checker
 from sglang.srt.utils.device import async_h2d
@@ -916,6 +917,7 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
             total_kv_layers=self.scheduler.model_config.num_hidden_layers,
             window_tails=storage.retained_window_lengths(),
             draft_kv_ring=self.draft_kv_ring,
+            empty_draft_kv_ring=get_spec().speculative_dflash_draft_kv_ring,
         )
         if get_disagg().disaggregation_decode_host_receive_threshold < 1:
             pool = self.token_to_kv_pool
@@ -1171,16 +1173,12 @@ class DecodePreallocQueue(DecodeHiCachePreallocMixin):
                 self._window_tails(fill_len).values(), default=fill_len
             )
         # Match and lock only reusable FULL KV. The entire SWA tail must be
-        # freshly allocated, including when the prefix comes from L2/L3. Prefill
-        # always sends the final Mamba state, so a Mamba tree needs no cached
-        # state at the hit: match FULL KV past the last one.
-        full_kv_only = self.tree_cache.supports_full_kv_only_match()
+        # freshly allocated, including when the prefix comes from L2/L3.
         result = match_kv_cache(
             req,
             self.tree_cache,
             req.origin_input_ids,
-            cow_mamba=self.tree_cache.supports_mamba() and not full_kv_only,
-            full_kv_only=full_kv_only,
+            cow_mamba=self.tree_cache.supports_mamba(),
             max_prefix_len=max_prefix_len,
         )
         req.lock = self.tree_cache.lock(result.last_device_node)

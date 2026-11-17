@@ -275,10 +275,18 @@ class UnifiedRadixCache(BasePrefixCache):
                 "--radix-eviction-policy joint_lru does not support "
                 "--enable-session-radix-cache"
             )
+        if (
+            params.eviction_policy.lower() == "state_cost"
+            and TREE_STATE in families
+            and params.enable_session_radix_cache
+        ):
+            raise ValueError(
+                "--radix-eviction-policy state_cost does not support "
+                "--enable-session-radix-cache on a model with recurrent states"
+            )
         # Whether a slot keeps a prefix's recurrent state checkpoints.
         self.is_mamba_enabled = TREE_STATE in families
-        # The tree holds no Mamba state but requests do: the cache only frees
-        # each request's own state slot when it leaves (state-free PD decode).
+        # The tree holds no Mamba state; the cache only frees each request's own slot.
         self.request_mamba_only = params.request_mamba_only
         assert not (self.request_mamba_only and self.is_mamba_enabled)
         # Whether the mamba extra (ping-pong) buffer is enabled.
@@ -695,9 +703,6 @@ class UnifiedRadixCache(BasePrefixCache):
     def _match_tree(self, params: MatchPrefixParams) -> MatchResult:
         if self.disable:
             return self.tree_core.empty_match_result
-        if params.full_kv_only:
-            assert self.supports_full_kv_only_match()
-            return self._match_full_kv_only(params)
         result = self.tree_core.match_prefix(params)
         # Apply the walk's actions (e.g. a pending write-through relocation on
         # a split) before the finalizers, which can evict or raise.
@@ -721,34 +726,6 @@ class UnifiedRadixCache(BasePrefixCache):
         ):
             result = self.linker.match(params.key, params.req, result)
         return result
-
-    def supports_full_kv_only_match(self) -> bool:
-        # Host or external-store hits carry Mamba-gated load plans.
-        return (
-            (self.is_mamba_enabled or self.request_mamba_only)
-            and not self.disable
-            and self.cache_controller is None
-            and self.linker is None
-        )
-
-    def _match_full_kv_only(self, params: MatchPrefixParams) -> MatchResult:
-        """The deepest FULL-KV device hit, past the last cached Mamba state. The
-        caller supplies the request's Mamba state, so nothing is copied from the
-        tree. The regular walk still splits the matched node and refreshes LRU."""
-        assert not params.cow_mamba, "a FULL-KV-only hit has no Mamba state to copy"
-        result = self.tree_core.match_prefix(params)
-        self._apply_cache_actions(result.cache_actions)
-        matched_len, node, _ = self.tree_core.match_full_device_prefix(params.key)
-        result = result._replace(cache_actions=())
-        if matched_len <= result.device_prefix_len:
-            return result
-        return result._replace(
-            device_prefix_len=matched_len,
-            last_device_node=node,
-            last_host_node=node,
-            best_match_node=node,
-            mamba_branching_seqlen=None,
-        )
 
     def _linker_offload_skip_prefix(self, req: Req, token_ids):
         # Skip uploads delegated to another writer (e.g. PD prefill), keeping local tree inserts.
@@ -1576,7 +1553,11 @@ class UnifiedRadixCache(BasePrefixCache):
             super().free_kv_row(kv, ranges)
 
     def claim_kv_row(self, req: Req) -> bool:
-        if self.linker is not None and req.finished():
+        if (
+            self.linker is not None
+            and self.linker.load_mode == "prefetch"
+            and req.finished()
+        ):
             self.linker.release_request(req.cache_request_handle)
         # Retraction also enters here: retain its ticket until actual finish.
         if (
@@ -1596,8 +1577,6 @@ class UnifiedRadixCache(BasePrefixCache):
         self._release_request_mamba(req)
 
     def _release_request_mamba(self, req: Req) -> None:
-        """Free the request's own Mamba state slot when no tree component takes
-        it over (``request_mamba_only``)."""
         if self.request_mamba_only and req.kv.holds_mamba:
             self.token_to_kv_pool_allocator.state.release(self.req_to_token_pool, req)
 
@@ -1606,6 +1585,21 @@ class UnifiedRadixCache(BasePrefixCache):
         if self.session.try_checkpoint(req, up_to=up_to, **kwargs):
             return
         self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
+
+    def lease_checkpoint_state_slots(self, reqs: Sequence[Req]):
+        mamba = self.components.get(ComponentType.MAMBA)
+        if self.disable or mamba is None:
+            return nullcontext()
+        # Only checkpoints that insert into the tree take a state slot; a
+        # streaming turn past its first prompt checkpoints into its session.
+        return mamba.lease_checkpoint_state_slots(
+            [
+                req
+                for req in reqs
+                if not req.skip_radix_cache_insert
+                and self.session.checkpoints_into_tree(req)
+            ]
+        )
 
     def checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
         """Insert ``[cache_protected_len, up_to)`` of the request's record and
@@ -3142,7 +3136,9 @@ class UnifiedRadixCache(BasePrefixCache):
         self._apply_cache_actions(insert_result.cache_actions)
 
         if insert_result.host_insert_dropped:
-            self._resolve_storage_prefetch_tokens(request, insert_result.prefix_len)
+            self._resolve_storage_prefetch_tokens(
+                request, insert_result.prefix_len, reason="already_cached"
+            )
             self._finish_storage_prefetch(request, fulfilled_tokens=0, reason="dropped")
             self.cache_controller.append_host_mem_release(
                 host_indices=host_indices[:completed_tokens],
@@ -3170,7 +3166,9 @@ class UnifiedRadixCache(BasePrefixCache):
             # Cache mode has only completed L3 -> L2 here. Keep the usable
             # storage span unresolved until admission proves that L2 -> L1
             # load-back actually materialized it for this request.
-            self._resolve_storage_prefetch_tokens(request, insert_result.prefix_len)
+            self._resolve_storage_prefetch_tokens(
+                request, insert_result.prefix_len, reason="already_cached"
+            )
 
         self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
         del self.ongoing_prefetch[request]

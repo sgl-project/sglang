@@ -94,7 +94,6 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 # Constants
-# Memory workspace size in MB
 DEFAULT_WORKSPACE_SIZE_MB = envs.SGLANG_TRTLLM_MLA_WORKSPACE_MB.get()
 
 # Block constraint from flashinfer requirements
@@ -219,13 +218,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
     # [bs, draft_token_num] layout in forward_extend; metadata stays uniform.
     supports_ragged_verify_graph: bool = True
 
-    # Sliding-window layers of a DFlash MLA draft run the verify window through
-    # trtllm-gen sparse MLA (_forward_sliding_window).
-    supports_dflash_sliding_window: bool = True
-    # Log base of the LSE the DCP merge expects from this backend's partials
-    # (is_mla_dcp_lse_base_on_e): trtllm-gen returns base 2.
-    dcp_lse_base_on_e: bool = False
-
     def update_verify_buffers_to_fill_after_draft(self, spec_info, cuda_graph_bs):
         pass
 
@@ -264,9 +256,6 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
 
         # Runtime parameters
         if backend == "trtllm-gen" and 64 < self.num_decode_q_heads < 128:
-            # flashinfer has no trtllm-gen MLA decode variant for this head
-            # count (e.g. a TP1 pipeline stage of a 96-head model) and would
-            # reject the multi-CTA counter buffer; run decode on cute-dsl.
             logger.info(
                 "trtllm_mla: %d decode q heads per rank has no trtllm-gen MLA "
                 "decode kernel; using the cute-dsl runner for decode.",
@@ -1310,8 +1299,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             return self._dummy_dcp_decode_for_autotune(q, layer)
         if layer.sliding_window_size >= 0:
             raise NotImplementedError(
-                "trtllm_mla applies a sliding window only to target-verify / "
-                "draft-extend forwards."
+                "trtllm_mla applies a sliding window only to target-verify forwards."
             )
 
         merge_query = q_rope is not None
@@ -1604,13 +1592,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             and get_in_autotune_dummy_run()
         ):
             return self._dummy_dcp_decode_for_autotune(q, layer)
-        if layer.sliding_window_size >= 0 and not (
-            forward_batch.forward_mode.is_target_verify()
-            or forward_batch.forward_mode.is_draft_extend_v2()
+        if (
+            layer.sliding_window_size >= 0
+            and not forward_batch.forward_mode.is_target_verify()
         ):
             raise NotImplementedError(
-                "trtllm_mla applies a sliding window only to target-verify / "
-                "draft-extend forwards."
+                "trtllm_mla applies a sliding window only to target-verify forwards."
             )
 
         # The fallback belongs to genuine extend forwards only. Target-verify /
@@ -1643,10 +1630,7 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
         )
         if (
             self.data_type == torch.float8_e4m3fn
-            and (
-                forward_batch.forward_mode.is_target_verify()
-                or forward_batch.forward_mode.is_draft_extend_v2()
-            )
+            and forward_batch.forward_mode.is_target_verify()
             and not prebuilt_fp8_query
         ):
             assert q_rope is not None and k_rope is not None

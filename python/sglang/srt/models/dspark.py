@@ -506,8 +506,16 @@ def build_confidence_head(config) -> Optional[nn.Module]:
 _DSPARK_SKIPPED_WEIGHT_PREFIXES = ("lm_head.", "rotary_emb.")
 
 
+def _has_mla_layers(layers) -> bool:
+    # MLA layers have no qkv_proj to slice; they write their own latent rows.
+    return any(isinstance(layer.self_attn, DFlashMLAAttention) for layer in layers)
+
+
 class DSparkDraftMixin:
     supports_pre_gather_target_hidden_projection = True
+    # project_target_hidden may run before the target's SP gather on rank-local
+    # rows, where the split fc's TP all-reduce does not apply.
+    supports_fc_tp_split = False
     # Drafts whose base logits leave the vocab-parallel lm_head via a TP-sharded
     # VanillaMarkov step (per-shard candidates) or the multimem all-gather.
     supports_vocab_parallel_draft_logits = False
@@ -701,7 +709,7 @@ class DSparkDraftMixin:
 
     def _build_fused_kv_write_bundle(self, pool) -> Optional[FusedKvWriteBundle]:
         layers = list(self.layers)
-        if not layers or not self.supports_fused_context_kv:
+        if not layers or _has_mla_layers(layers):
             return None
         weights = []
         for layer in layers:
@@ -805,10 +813,7 @@ class DSparkDraftMixin:
         Cached; None (per-layer fallback) when a QKV weight cannot be sliced
         (quantized) or layers disagree on norm epsilon / bias presence.
         """
-        if (
-            not envs.SGLANG_DSPARK_STACKED_CTX_KV.get()
-            or not self.supports_fused_context_kv
-        ):
+        if not envs.SGLANG_DSPARK_STACKED_CTX_KV.get() or _has_mla_layers(self.layers):
             return None
         cached = getattr(self, "_stacked_ctx_kv_cache", False)
         if cached is not False:

@@ -32,6 +32,7 @@ from sglang.srt.environ import envs
 from sglang.srt.eplb.expert_distribution import get_global_expert_distribution_recorder
 from sglang.srt.layers import zero_copy_context
 from sglang.srt.layers.activation import SiluAndMul, SituAndMul
+from sglang.srt.layers.attention.dsa.dsa_indexer import indexer_tp_split_min_rows
 from sglang.srt.layers.attn_residual import aggregate_stream, get_cw
 from sglang.srt.layers.aux_hidden_states import (
     AuxHiddenStateAccumulator,
@@ -67,9 +68,7 @@ from sglang.srt.layers.layer_boundary.residual.attn_bank import (
     AttnBank,
     AttnBankOutputRead,
     AttnBankState,
-    _bank_rows,
 )
-from sglang.srt.layers.layer_boundary.residual.attn_bank_hip import gather_row_shards
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelBatchedLinear,
@@ -974,6 +973,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         from sglang.srt.environ import envs
         from sglang.srt.layers.moe.mega_moe import (
             _configure_mega_moe_deep_gemm_num_sms,
+            _mega_moe_global_tokens_hint,
             _mega_moe_mma_type,
         )
 
@@ -1052,6 +1052,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
                 recipe=(1, 1, 32),
                 activation="situ",
                 fast_math=True,
+                global_num_tokens=_mega_moe_global_tokens_hint(buf),
             )
         y = y[:num_tokens]
         # fp8xfp4: the pre-dispatch routes rows past valid_token_count to -1 and
@@ -1410,8 +1411,7 @@ class KimiK3MoE(KimiK3MoEHipMixin, nn.Module):
         if routed_input is not None:
             topk_output, routed_input = routed_input
         elif hidden_states.shape[0] == 0:
-            # An idle DP-attention rank routes nothing but still enters the EP
-            # dispatch; like DeepseekV2MoE, skip the gate and TopK kernels.
+            # An idle DP-attention rank routes nothing but still enters the EP dispatch.
             topk_output = self.topk.empty_topk_output(hidden_states.device)
         else:
             # MoEGate produces fp32 router logits on CUDA (via linear_bf16_fp32
@@ -2902,10 +2902,10 @@ def _carries_bank_slices(config: KimiLinearConfig) -> bool:
     """Whether consecutive SP-MoE layers keep the stream and the
     attention-residual bank on each rank's attention-TP shard of the rows
     (SGLANG_K3_SP_ATTN_RES): each layer reads its attention input there, then
-    gathers what it read. DSpark gathers the pre-norm mixture at its capture
-    layers, but other aux-capture and pipeline paths need the whole bank;
-    this is decided at construction. Nor can a dense layer after an SP-MoE
-    one, whose FFN reads every row of the bank:
+    gathers what it read. A rank then holds only its own rows of the bank, so
+    neither a later pipeline rank nor a draft model's capture of the target's
+    hidden states can take them; it is decided at construction. Nor can a
+    dense layer after an SP-MoE one, whose FFN reads every row of the bank:
     every layer from the first MoE layer on must be one. This layout also
     works with NCCL: custom collective kernels only fuse the local bank
     read with the gather, and are not required to keep the bank sharded."""
@@ -2920,7 +2920,7 @@ def _carries_bank_slices(config: KimiLinearConfig) -> bool:
     if True not in moe or not all(moe[moe.index(True) :]):
         return False
     spec = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
-    return spec.is_dspark() or not (spec.is_eagle3() or spec.is_dflash_family())
+    return not (spec.is_eagle3() or spec.is_dflash_family())
 
 
 def _latent_moe_writes_stream(config: KimiLinearConfig, layer_idx: int) -> bool:
@@ -3226,9 +3226,8 @@ class KimiK3DecoderLayer(nn.Module):
                     forward_batch
                 )
             else:
-                # Padded rows (a graph bucket, or SP rows rounded up to the
-                # attention-TP size) would otherwise be routed: their stale
-                # contents pile onto a few experts that every rank then waits on.
+                # Padded rows (a graph bucket, or SP rows rounded up to attention TP)
+                # would route stale contents onto a few experts every rank waits on.
                 valid_token_count = forward_batch.moe_num_token_non_padded()
             hidden_states = self.mlp(
                 hidden_states,
@@ -3510,23 +3509,13 @@ class KimiK3LinearModel(nn.Module):
             score_proj = self.output_attn_res_proj
             score_norm = self.output_attn_res_norm
             nvb = _cdiv(self.end_layer, self.config.attn_res_block_size)
-        bank = self.attn_bank.require()
-        rows = _bank_rows(bank, hidden_states)
-        mixed = aggregate_stream(
+        return aggregate_stream(
             hidden_states,
-            bank.block_residual if rows is None else bank.block_residual[rows],
+            self.attn_bank.require().block_residual,
             nvb,
             score_proj,
             score_norm,
         )
-        # Only the mixture is needed by the draft. Keep the bank sharded and
-        # return owned storage so a later layer's gather cannot overwrite it.
-        if rows is not None:
-            if _is_hip and envs.SGLANG_ENABLE_ROCM_K3_ROW_SHARDED_STREAM.get():
-                # gfx950 row-sharded stream: short or empty last shards
-                return gather_row_shards(mixed, bank.block_residual.shape[0])
-            return get_parallel().attn_tp_group.all_gather(mixed, dim=0)
-        return mixed
 
 
 class KimiK3LinearForCausalLM(nn.Module):
@@ -3622,6 +3611,12 @@ class KimiK3LinearForCausalLM(nn.Module):
         if layer_ids is None:
             raise ValueError(
                 "DSPARK requires explicit layer_ids for aux hidden capture."
+            )
+        if self.model.carries_bank_slices:
+            raise RuntimeError(
+                "the model keeps each rank's shard of the rows across SP-MoE "
+                "layers (SGLANG_K3_SP_ATTN_RES), which leaves no layer output "
+                "to capture whole"
             )
         self.capture_aux_hidden_states = True
         self.model.dspark_layers_to_capture = list(layer_ids)
@@ -3902,18 +3897,22 @@ class KimiK3LinearForCausalLM(nn.Module):
     def _check_dsa_indexer_loaded(self, loaded_params: set[str]) -> None:
         if self.config.dsa_config is None:
             return
+        start, end = self.model.start_layer, self.model.end_layer
+        num_dsa_layers = sum(
+            start <= i < end for i in self.config.full_attention_layer_ids
+        )
+        num_indexers = sum(
+            isinstance(layer.self_attn, KimiK3MLAAttention)
+            and layer.self_attn.indexer is not None
+            for layer in self.model.layers[start:end]
+        )
+        assert num_indexers == num_dsa_layers, (
+            f"Kimi-K3.1: built {num_indexers} DSA indexers for {num_dsa_layers} "
+            "DSA layers."
+        )
         expected = {
             name for name, _ in self.named_parameters() if ".self_attn.indexer." in name
         }
-        num_dsa_layers = sum(
-            self.config.is_dsa_layer(i)
-            for i in range(self.model.start_layer, self.model.end_layer)
-        )
-        assert num_dsa_layers > 0 or not expected
-        assert len(expected) == 5 * num_dsa_layers, (
-            f"Kimi-K3.1: built {len(expected)} DSA indexer params, expected "
-            f"5 per DSA layer x {num_dsa_layers} layers."
-        )
         missing = sorted(expected - loaded_params)
         assert not missing, (
             f"Kimi-K3.1: {len(missing)} DSA indexer params were not loaded, "
@@ -4033,6 +4032,9 @@ class KimiK3LinearForCausalLM(nn.Module):
                 and layer.self_attn.indexer is not None
             ):
                 layer.self_attn.indexer.prepare_merged_k_gate()
+                layer.self_attn.indexer.tp_split_min_rows = indexer_tp_split_min_rows(
+                    1024
+                )
 
         for layer in self.model.layers:
             if isinstance(layer, PPMissingLayer) or not isinstance(

@@ -3,6 +3,7 @@ from __future__ import annotations
 import dataclasses
 import time
 from abc import ABC, abstractmethod
+from contextlib import nullcontext
 from enum import Enum, auto
 from types import MappingProxyType
 from typing import (
@@ -79,9 +80,6 @@ class MatchPrefixParams:
     # matched state, and the slot is bound with the request's row.
     defer_cow_slot: bool = False
     req: Optional[Req] = None
-    # Hit the deepest FULL-KV prefix even past the last cached Mamba state, for
-    # a caller that receives the request's Mamba state elsewhere (PD decode).
-    full_kv_only: bool = False
 
 
 @dataclasses.dataclass
@@ -583,6 +581,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         slot: ``release_kv_cache`` frees ``[cache_protected_len, up_to)`` and
         everything after, and unpins."""
 
+    def lease_checkpoint_state_slots(self, reqs: Sequence[Req]):
+        """A context in which checkpointing the unfinished ``reqs`` takes the
+        state slots it needs from one take made ahead; nothing here."""
+        return nullcontext()
+
     def free_kv_row(self, kv: Any, ranges: list[tuple[int, int]]) -> None:
         """Give back ascending, disjoint, half-open row-position ranges
         of the ``kv`` record's row; one call keeps a shared page freed once.
@@ -905,10 +908,6 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         return 0
 
     def supports_mamba(self) -> bool:
-        return False
-
-    def supports_full_kv_only_match(self) -> bool:
-        """Whether `MatchPrefixParams.full_kv_only` is honored."""
         return False
 
     def release_session(self, session_id: str) -> None:
