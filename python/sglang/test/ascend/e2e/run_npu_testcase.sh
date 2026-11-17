@@ -109,10 +109,12 @@ if [ "${INSTALL_SGLANG_FROM_SOURCE}" = "true" ] || [ "${INSTALL_SGLANG_FROM_SOUR
 else
     echo "Use sglang from docker image"
     sglang_pkg_path=/sgl-workspace/sglang/python
-    ascend_test_util_path=${sglang_pkg_path}/sglang/test/ascend
-    mkdir -p "${ascend_test_util_path}"
-    mv "${ascend_test_util_path}" "${ascend_test_util_path}_bak"
-    cp -r ${sglang_source_path}/python/sglang/test/ascend "${ascend_test_util_path}"
+    # Overlay the whole test tree from the checkout so that test helpers match
+    # the test case; only the product code under sglang/ comes from the image.
+    test_util_path=${sglang_pkg_path}/sglang/test
+    mkdir -p "${test_util_path}"
+    mv "${test_util_path}" "${test_util_path}_bak"
+    cp -r ${sglang_source_path}/python/sglang/test "${test_util_path}"
 fi
 
 # set environment of cann
