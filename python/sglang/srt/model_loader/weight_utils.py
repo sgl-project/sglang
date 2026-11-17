@@ -133,6 +133,38 @@ def probe_routed_expert_weight_dtype(model_path: str) -> Optional[str]:
     return None
 
 
+def probe_remote_routed_expert_weight_dtype(
+    repo_id: str, revision: Optional[str] = None
+) -> Optional[str]:
+    """Remote counterpart of :func:`probe_routed_expert_weight_dtype` for a
+    Hugging Face repo that is not in the local cache yet.
+
+    Downloads only ``model.safetensors.index.json`` and reads one shard's
+    safetensors header with an HTTP range request (no weight download).
+    Returns ``None`` when offline, on ModelScope, or on any error.
+    """
+    from sglang.srt.environ import envs
+
+    if envs.SGLANG_USE_MODELSCOPE.get() or huggingface_hub.constants.HF_HUB_OFFLINE:
+        return None
+    try:
+        index_path = hf_hub_download(
+            repo_id, "model.safetensors.index.json", revision=revision
+        )
+        with open(index_path) as f:
+            weight_map = json.load(f).get("weight_map", {}) or {}
+        for key, shard in weight_map.items():
+            if _ROUTED_EXPERT_KEY_RE.search(key):
+                meta = huggingface_hub.parse_safetensors_file_metadata(
+                    repo_id, shard, revision=revision
+                )
+                info = meta.tensors.get(key)
+                return info.dtype if info is not None else None
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Remote routed-expert dtype probe failed for %s: %s", repo_id, e)
+    return None
+
+
 # Block size for sequential checkpoint prefetch reads (page cache warming).
 _PREFETCH_BLOCK_SIZE = None
 _PREFETCH_STOP_TIMEOUT_SECONDS = 60.0
