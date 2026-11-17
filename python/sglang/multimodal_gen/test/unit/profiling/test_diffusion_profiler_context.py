@@ -14,9 +14,13 @@ class TestDiffusionProfilerContext(unittest.TestCase):
             patch.object(pipeline_executor, "SGLDiffusionProfiler")
         )
         self.profiler = self.factory.return_value
-        self.npu_platform = self.enterContext(
+        self.enterContext(
             patch.object(
-                pipeline_executor.current_platform, "is_npu", return_value=True
+                pipeline_executor.current_platform,
+                "is_npu",
+                side_effect=AssertionError(
+                    "The executor must not select profiler backends"
+                ),
             )
         )
         self.enterContext(
@@ -48,27 +52,14 @@ class TestDiffusionProfilerContext(unittest.TestCase):
         ):
             pass
 
-    def test_inference_error_or_cancel_skips_analysis(self):
+    def test_inference_error_or_cancel_delegates_cleanup(self):
         for error in (ValueError("model failed"), KeyboardInterrupt()):
             with self.subTest(error=type(error)):
                 self.profiler.reset_mock()
                 with self.assertRaises(type(error)), self.context():
                     raise error
-                self.profiler.stop.assert_called_once_with(
-                    export_trace=False, dump_rank=0
-                )
-
-    def test_cleanup_error_does_not_replace_inference_error(self):
-        self.profiler.stop.side_effect = RuntimeError("stop failed")
-        with self.assertRaisesRegex(ValueError, "model failed"), self.context():
-            raise ValueError("model failed")
-        self.profiler.stop.assert_called_once_with(export_trace=False, dump_rank=0)
-
-    def test_non_npu_error_cleanup_preserves_existing_export(self):
-        self.npu_platform.return_value = False
-        with self.assertRaisesRegex(ValueError, "model failed"), self.context():
-            raise ValueError("model failed")
-        self.profiler.stop.assert_called_once_with(export_trace=True, dump_rank=0)
+                self.profiler.stop_on_error.assert_called_once_with(dump_rank=0)
+                self.profiler.stop.assert_not_called()
 
 
 if __name__ == "__main__":

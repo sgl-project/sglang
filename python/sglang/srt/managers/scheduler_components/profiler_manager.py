@@ -27,7 +27,6 @@ from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device, get_parallel
 from sglang.srt.utils import is_mps, is_npu
 from sglang.srt.utils.profile_merger import ProfileMerger
-from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import ScheduleBatch
@@ -37,12 +36,7 @@ _is_mps = is_mps()
 if _is_npu:
     import torch_npu
 
-    patches = [
-        ["profiler.profile", torch_npu.profiler.profile],
-        ["profiler.ProfilerActivity.CUDA", torch_npu.profiler.ProfilerActivity.NPU],
-        ["profiler.ProfilerActivity.CPU", torch_npu.profiler.ProfilerActivity.CPU],
-    ]
-    apply_torch_npu_patches(torch_npu, patches)
+    NPUTraceHandler.apply_patches("srt")
 elif _is_mps:
     from sglang.srt.hardware_backend.mlx.profiler import apply_metal_profiler_patches
 
@@ -236,18 +230,15 @@ class SchedulerProfilerManager:
             self.rpd_profiler.rangePush("", "rpd profile range", "")
             self.profile_in_progress = True
         elif torchprof_activities:
-            self.npu_trace_handler = (
-                NPUTraceHandler(str(self.torch_profiler_output_dir))
-                if _is_npu
-                else None
-            )
             self.torch_profiler = torch.profiler.profile(
                 activities=torchprof_activities,
                 with_stack=with_stack if with_stack is not None else True,
                 record_shapes=record_shapes if record_shapes is not None else False,
                 on_trace_ready=(
-                    self.npu_trace_handler.on_trace_ready
-                    if self.npu_trace_handler is not None
+                    NPUTraceHandler.get_on_trace_ready(
+                        str(self.torch_profiler_output_dir)
+                    )
+                    if _is_npu
                     else None
                 ),
                 experimental_config=(
@@ -342,10 +333,10 @@ class SchedulerProfilerManager:
         stage_suffix = f"-{stage.name}" if stage else ""
         logger.info("Stop profiling" + stage_suffix + "...")
         if self.torch_profiler is not None:
-            self.torch_profiler.stop()
-            if self.npu_trace_handler is not None:
-                self.npu_trace_handler.export(self.torch_profiler)
+            if _is_npu:
+                NPUTraceHandler.stop_capture(self.torch_profiler)
             else:
+                self.torch_profiler.stop()
                 # Build filename with only non-zero ranks to maintain backward compatibility
                 filename_parts = [self.profile_id, f"TP-{get_parallel().tp_rank}"]
 

@@ -21,18 +21,10 @@ from sglang.srt.observability.profile_analysis_npu import NPUTraceHandler
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import get_device, get_parallel
 from sglang.srt.utils import is_npu
-from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 _is_npu = is_npu()
 if _is_npu:
-    import torch_npu
-
-    patches = [
-        ["profiler.profile", torch_npu.profiler.profile],
-        ["profiler.ProfilerActivity.CUDA", torch_npu.profiler.ProfilerActivity.NPU],
-        ["profiler.ProfilerActivity.CPU", torch_npu.profiler.ProfilerActivity.CPU],
-    ]
-    apply_torch_npu_patches(torch_npu, patches)
+    NPUTraceHandler.apply_patches("srt")
 
 logger = logging.getLogger(__name__)
 
@@ -336,7 +328,6 @@ class _ProfilerTorch(_ProfilerConcreteBase):
             activity_map[a] for a in self.activities if a in activity_map
         ]
 
-        self.npu_trace_handler = NPUTraceHandler(self.output_dir) if _is_npu else None
         self.torch_profiler = torch.profiler.profile(
             activities=torchprof_activities,
             with_stack=self.with_stack if self.with_stack is not None else True,
@@ -344,9 +335,7 @@ class _ProfilerTorch(_ProfilerConcreteBase):
                 self.record_shapes if self.record_shapes is not None else False
             ),
             on_trace_ready=(
-                self.npu_trace_handler.on_trace_ready
-                if self.npu_trace_handler is not None
-                else None
+                NPUTraceHandler.get_on_trace_ready(self.output_dir) if _is_npu else None
             ),
         )
         self.torch_profiler.start()
@@ -354,10 +343,10 @@ class _ProfilerTorch(_ProfilerConcreteBase):
     def stop(self):
         Path(self.output_dir).mkdir(parents=True, exist_ok=True)
 
-        self.torch_profiler.stop()
-        if self.npu_trace_handler is not None:
-            self.npu_trace_handler.export(self.torch_profiler)
+        if _is_npu:
+            NPUTraceHandler.stop_capture(self.torch_profiler)
         else:
+            self.torch_profiler.stop()
             # Build filename with only non-zero ranks to maintain backward compatibility
             filename_parts = [self.profile_id, f"TP-{get_parallel().tp_rank}"]
 

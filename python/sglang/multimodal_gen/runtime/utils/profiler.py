@@ -18,16 +18,11 @@ from sglang.srt.observability.profile_analysis_npu import (
     NPUTraceHandler,
     get_torch_npu,
 )
-from sglang.srt.utils.torch_npu_patch_utils import apply_torch_npu_patches
 
 if current_platform.is_npu():
     torch_npu = get_torch_npu()
 
-    patches = [
-        ["profiler.profile", torch_npu.profiler.profile],
-        ["profiler.schedule", torch_npu.profiler.schedule],
-    ]
-    apply_torch_npu_patches(torch_npu, patches)
+    NPUTraceHandler.apply_patches("diffusion")
 
 logger = init_logger(__name__)
 
@@ -102,9 +97,6 @@ class SGLDiffusionProfiler:
         except OSError:
             pass
 
-        self._npu_trace_handler = (
-            NPUTraceHandler(self.log_dir) if current_platform.is_npu() else None
-        )
         if activities:
             activities = self._resolve_activities(activities)
         else:
@@ -122,8 +114,8 @@ class SGLDiffusionProfiler:
             record_shapes=self.record_shapes,
             with_stack=self.with_stack,
             on_trace_ready=(
-                self._npu_trace_handler.on_trace_ready
-                if self._npu_trace_handler is not None
+                NPUTraceHandler.get_on_trace_ready(self.log_dir)
+                if current_platform.is_npu()
                 else None
             ),
         )
@@ -233,54 +225,33 @@ class SGLDiffusionProfiler:
             return
         self.has_stopped = True
         logger.info("Stopping Profiler...")
-        sync_npu_stop_errors = (
-            export_trace
-            and self._npu_trace_handler is not None
-            and self._npu_trace_handler.npu_auto_analysis_in_daemon
-        )
-        error = None
         try:
-            if current_platform.is_cuda_alike():
-                torch.cuda.synchronize()
             if current_platform.is_npu():
-                torch.npu.synchronize()
-            self.profiler.stop()
-        except Exception as exc:
-            if not sync_npu_stop_errors:
-                raise
-            error = f"rank {self.rank}: {exc}"
-            logger.error("NPU profiler stop failed: %s", error)
+                group = get_replica_group() if model_parallel_is_initialized() else None
+                NPUTraceHandler.stop_capture(
+                    self.profiler,
+                    export_trace=export_trace,
+                    synchronize=True,
+                    rank=self.rank,
+                    cpu_group=group.cpu_group if group is not None else None,
+                )
+            else:
+                if current_platform.is_cuda_alike():
+                    torch.cuda.synchronize()
+                self.profiler.stop()
+                if export_trace and (dump_rank is None or dump_rank == self.rank):
+                    self._export_trace()
         finally:
             SGLDiffusionProfiler._instance = None
 
-        if sync_npu_stop_errors:
-            errors = [error]
-            if model_parallel_is_initialized():
-                group = get_replica_group()
-                if group.world_size > 1:
-                    # Coordinate capture-stop failures only. Background analysis
-                    # status is rank-local and never gates continued generation.
-                    errors = [None] * group.world_size
-                    torch.distributed.all_gather_object(
-                        errors, error, group=group.cpu_group
-                    )
-            if any(errors):
-                raise RuntimeError(
-                    "NPU profiler stop failed: " + "; ".join(e for e in errors if e)
-                )
-
-        if export_trace and (
-            self._npu_trace_handler is not None
-            or dump_rank is None
-            or dump_rank == self.rank
-        ):
-            self._export_trace()
+    def stop_on_error(self, dump_rank: int | None = None):
+        """Clean up locally without masking an inference error or cancellation."""
+        try:
+            self.stop(export_trace=not current_platform.is_npu(), dump_rank=dump_rank)
+        except Exception:
+            logger.exception("Failed to stop profiler while handling a request error")
 
     def _export_trace(self):
-        if self._npu_trace_handler is not None:
-            self._npu_trace_handler.export(self.profiler)
-            return
-
         try:
             os.makedirs(self.log_dir, exist_ok=True)
 

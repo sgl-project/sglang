@@ -134,6 +134,13 @@ class TestDiffusionProfiler(unittest.TestCase):
                 return_value=False,
             )
         )
+        self.enterContext(
+            patch.object(
+                self.profiler_utils,
+                "get_replica_group",
+                return_value=SimpleNamespace(cpu_group=object()),
+            )
+        )
 
     def load_profiler_module(self, npu):
         # Execute the real module's import-time patch call in an isolated namespace.
@@ -293,11 +300,46 @@ class TestDiffusionProfiler(unittest.TestCase):
         self.parallel_initialized.return_value = True
         wrapper = self.make_profiler(full=True)
         with patch.object(torch.distributed, "all_gather_object") as gather:
-            wrapper.stop(export_trace=False)
+            wrapper.stop_on_error()
         gather.assert_not_called()
         self.analyze.assert_not_called()
         self.assertTrue(wrapper.has_stopped)
         self.assertIsNone(self.profiler_utils.SGLDiffusionProfiler.get_instance())
+
+    def test_cleanup_failure_is_logged_and_instance_is_cleared(self):
+        self.process.return_value.daemon = True
+        wrapper = self.make_profiler(full=True)
+        native_stop = wrapper.profiler.stop
+
+        def stop_then_fail():
+            native_stop()
+            raise RuntimeError("cleanup failed")
+
+        with (
+            patch.object(wrapper.profiler, "stop", side_effect=stop_then_fail),
+            self.assertLogs(self.profiler_utils.logger, level="ERROR") as logs,
+        ):
+            wrapper.stop_on_error()
+            wrapper.stop_on_error()
+        self.assertIn("cleanup failed", "\n".join(logs.output))
+        self.analyze.assert_not_called()
+        self.assertTrue(wrapper.has_stopped)
+        self.assertIsNone(self.profiler_utils.SGLDiffusionProfiler.get_instance())
+
+    def test_non_npu_error_cleanup_preserves_rank_filtered_export(self):
+        self.npu_platform.return_value = False
+        for rank in (0, 1):
+            with self.subTest(rank=rank):
+                wrapper = self.profiler_utils.SGLDiffusionProfiler.__new__(
+                    self.profiler_utils.SGLDiffusionProfiler
+                )
+                wrapper.rank = rank
+                wrapper.has_stopped = False
+                wrapper.profiler = SimpleNamespace(stop=Mock())
+                wrapper._export_trace = Mock()
+                wrapper.stop_on_error(dump_rank=0)
+                wrapper.profiler.stop.assert_called_once()
+                self.assertEqual(wrapper._export_trace.call_count, int(rank == 0))
 
     def test_non_npu_keeps_torch_profiler_and_chrome_export(self):
         self.npu_platform.return_value = False

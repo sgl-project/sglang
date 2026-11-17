@@ -34,25 +34,33 @@ def stop_worker(rank, root, failure):
         profiler.profiler = SimpleNamespace(
             stop=Mock(), prof_if=SimpleNamespace(prof_path=f"rank{rank}_ascend_pt")
         )
-        handler = profile_analysis_npu.NPUTraceHandler.__new__(
-            profile_analysis_npu.NPUTraceHandler
-        )
-        handler.npu_auto_analysis_in_daemon = True
-        handler.export = Mock(wraps=handler.export)
-        profiler._npu_trace_handler = handler
         if rank == 1 and failure == "stop":
             profiler.profiler.stop.side_effect = RuntimeError("stop failed")
         profiler_module.SGLDiffusionProfiler._instance = profiler
         group = SimpleNamespace(world_size=2, cpu_group=dist.group.WORLD)
         result = {"error": None, "continued": False}
         with (
+            patch.object(
+                multiprocessing,
+                "current_process",
+                return_value=SimpleNamespace(daemon=True),
+            ),
             patch.object(profiler_module.current_platform, "is_npu", return_value=True),
             patch.object(
                 profiler_module.current_platform, "is_cuda_alike", return_value=False
             ),
             patch.object(torch.cuda, "is_available", return_value=False),
             patch.object(
-                torch, "npu", SimpleNamespace(synchronize=Mock()), create=True
+                torch,
+                "npu",
+                SimpleNamespace(
+                    synchronize=Mock(
+                        side_effect=RuntimeError("sync failed")
+                        if rank == 1 and failure == "sync"
+                        else None
+                    )
+                ),
+                create=True,
             ),
             patch.object(
                 profiler_module, "model_parallel_is_initialized", return_value=True
@@ -64,7 +72,7 @@ def stop_worker(rank, root, failure):
                 side_effect=OSError("parser launch failed")
                 if rank == 1 and failure == "parser"
                 else None,
-            ),
+            ) as analyze,
         ):
             try:
                 profiler.stop(dump_rank=0)
@@ -76,7 +84,7 @@ def stop_worker(rank, root, failure):
             # Request cleanup must neither parse nor enter the collective again.
             profiler.stop(dump_rank=0)
         result["stop_calls"] = profiler.profiler.stop.call_count
-        result["export_calls"] = profiler._npu_trace_handler.export.call_count
+        result["export_calls"] = analyze.call_count
         result["instance_cleared"] = (
             profiler_module.SGLDiffusionProfiler.get_instance() is None
         )
@@ -112,8 +120,9 @@ class TestDiffusionProfilerDistributed(unittest.TestCase):
                         worker.kill()
                     if worker.pid is not None:
                         worker.join(5)
-        for result in results:
-            self.assertEqual(result["stop_calls"], 1)
+        for rank, result in enumerate(results):
+            expected_stops = 0 if failure == "sync" and rank == 1 else 1
+            self.assertEqual(result["stop_calls"], expected_stops)
             self.assertTrue(result["instance_cleared"])
         return results
 
@@ -136,6 +145,14 @@ class TestDiffusionProfilerDistributed(unittest.TestCase):
             self.assertIsNone(result["error"])
             self.assertTrue(result["continued"])
             self.assertEqual(result["export_calls"], 1)
+
+    def test_non_driver_device_sync_failure_reaches_every_rank(self):
+        results = self.run_workers("sync")
+        self.assertEqual(results[0]["error"], results[1]["error"])
+        for result in results:
+            self.assertIn("rank 1: sync failed", result["error"])
+            self.assertFalse(result["continued"])
+            self.assertEqual(result["export_calls"], 0)
 
 
 if __name__ == "__main__":
