@@ -75,6 +75,20 @@ ROW_MAJOR = {
     (14336, 8192, 16): (64, 256, 1, 4, 3),
     (14336, 8192, 32): (64, 256, 1, 8, 3),
 }
+# (N, K, BM) -> per-N-block K-start rotation stride (coprime to the per-split K-tile count, 16 or 32 here) of the
+# long-K launches, so concurrent workgroups stream different K tiles; 0 or absent: the canonical in-order K loop.
+# Measured per bucket over its M range: KT_PER <= 8 launches and every [8192, 7168] bucket lose with rotation.
+ROW_MAJOR_ROT = {
+    (8192, 4096, 64): 7,
+    (8192, 4096, 128): 5,
+    (8192, 2048, 128): 5,
+    (4096, 8192, 128): 5,
+    (4608, 8192, 64): 3,
+    (4608, 8192, 128): 3,
+    (2560, 8192, 128): 3,
+    (14336, 8192, 16): 7,
+    (14336, 8192, 32): 7,
+}
 
 
 @triton.jit
@@ -130,21 +144,37 @@ def _rowmajor_partial(
     BN: tl.constexpr,
     BK: tl.constexpr,
     SK: tl.constexpr,
+    ROT: tl.constexpr,
 ):
     pn, pk = tl.program_id(0), tl.program_id(1)
     KT_PER: tl.constexpr = K // BK // SK
     m = tl.arange(0, BM)
     kk = tl.arange(0, BK)
     n = pn * BN + tl.arange(0, BN)
-    bp = W + n[None, :].to(tl.int64) * K + (pk * KT_PER * BK + kk)[:, None]
-    ap = X + m[:, None] * K + (pk * KT_PER * BK + kk)[None, :]
     acc = tl.zeros((BM, BN), tl.float32)
-    for _ in range(KT_PER):
-        a = tl.load(ap, mask=m[:, None] < M, other=0.0)
-        b = tl.load(bp, cache_modifier=".cg")
-        acc = tl.dot(a, b, acc)
-        ap += BK
-        bp += BK
+    if ROT > 0:
+        # Long K loops: rotate each N-block's K start so the workgroups do not all stream the same K tile at once.
+        start = (pn * ROT) % KT_PER
+        for i in range(KT_PER):
+            kt = (start + i) % KT_PER
+            k0 = (pk * KT_PER + kt) * BK
+            a = tl.load(
+                X + m[:, None] * K + (k0 + kk)[None, :], mask=m[:, None] < M, other=0.0
+            )
+            b = tl.load(
+                W + n[None, :].to(tl.int64) * K + (k0 + kk)[:, None],
+                cache_modifier=".cg",
+            )
+            acc = tl.dot(a, b, acc)
+    else:
+        bp = W + n[None, :].to(tl.int64) * K + (pk * KT_PER * BK + kk)[:, None]
+        ap = X + m[:, None] * K + (pk * KT_PER * BK + kk)[None, :]
+        for _ in range(KT_PER):
+            a = tl.load(ap, mask=m[:, None] < M, other=0.0)
+            b = tl.load(bp, cache_modifier=".cg")
+            acc = tl.dot(a, b, acc)
+            ap += BK
+            bp += BK
     tl.store(
         P + pk * M * N + m[:, None] * N + n[None, :],
         acc.to(P.dtype.element_ty),
@@ -154,10 +184,19 @@ def _rowmajor_partial(
 
 @triton.jit
 def _sum_partials(P, Y, MN, SK: tl.constexpr, B: tl.constexpr):
+    # Flat 1-D reduction: each thread owns contiguous elements, all SK partial loads are independent and in flight.
     i = tl.program_id(0) * B + tl.arange(0, B)
-    s = tl.arange(0, SK)
-    p = tl.load(P + s[:, None] * MN + i[None, :], mask=i[None, :] < MN, other=0.0)
-    tl.store(Y + i, tl.sum(p, axis=0).to(Y.dtype.element_ty), mask=i < MN)
+    msk = i < MN
+    acc = tl.load(P + i, mask=msk, other=0.0)
+    for s in tl.static_range(1, SK):
+        acc += tl.load(P + s * MN + i, mask=msk, other=0.0)
+    tl.store(Y + i, acc.to(Y.dtype.element_ty), mask=msk)
+
+
+def _sum_block(mn: int):
+    """(elements per program, warps) of the partial sum: 4 FP32 per thread (one 16 B load per partial); one-wave
+    programs below 64K elements so small products still spread over the CUs."""
+    return (1024, 4) if mn >= 1 << 16 else (256, 1)
 
 
 @torch.no_grad()
@@ -237,7 +276,8 @@ def rowmajor_gemm(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
         return p
     m, n = p.shape[1:]
     y = torch.empty((m, n), device=x.device, dtype=torch.bfloat16)
-    _sum_partials[(triton.cdiv(m * n, 256),)](p, y, m * n, p.shape[0], 256, num_warps=4)
+    b, w = _sum_block(m * n)
+    _sum_partials[(triton.cdiv(m * n, b),)](p, y, m * n, p.shape[0], b, num_warps=w)
     return y
 
 
@@ -270,6 +310,7 @@ def rowmajor_gemm_partials(x: torch.Tensor, weight: torch.Tensor) -> torch.Tenso
         bn,
         bk,
         sk,
+        ROW_MAJOR_ROT.get((n, k, bm), 0),
         num_warps=warps,
         num_stages=stages,
         matrix_instr_nonkdim=16,
