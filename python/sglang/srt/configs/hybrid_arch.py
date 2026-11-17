@@ -31,13 +31,6 @@ def _get_linear_attn_registry_result(model_config: ModelConfig) -> Any:
     return model_config.linear_attn_registry_result
 
 
-def qwen3_next_config(model_config: ModelConfig):
-    config = model_config.hf_config
-    if isinstance(config, Qwen3NextConfig):
-        return config
-    return None
-
-
 def hybrid_lightning_config(model_config: ModelConfig):
     config = model_config.hf_config
     if isinstance(config, BailingHybridConfig) and not config.use_kda:

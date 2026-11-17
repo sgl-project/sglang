@@ -32,7 +32,10 @@ from sglang.srt.layers.moe.token_dispatcher.base import (
 )
 from sglang.srt.layers.moe.topk import TopKOutput
 from sglang.srt.layers.moe.utils import AscendOpsConfig, DispatcherOutputDtype
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.model_executor.runner_utils.prefill_graph import (
+    is_in_prefill_graph_scope,
+)
+from sglang.srt.runtime_context import get_forward, get_parallel
 from sglang.srt.utils import is_npu
 
 if is_npu():
@@ -112,10 +115,7 @@ class _AllGatherState:
     row_sizes: list[int]
     input_dtype: torch.dtype
     topk_weights: Optional[torch.Tensor] = None
-    topk_ids: Optional[torch.Tensor] = None
     expanded_row_idx: Optional[torch.Tensor] = None
-    expert_tokens: Optional[torch.Tensor] = None
-    num_routes: Optional[int] = None
 
 
 @dataclass
@@ -176,7 +176,9 @@ class AscendOpsDispatcher(BaseDispatcher):
         self, hidden_states: torch.Tensor, topk_output: TopKOutput
     ) -> DispatchOutput:
         topk_weights, topk_ids, _ = topk_output
-        if get_is_extend_in_batch():
+        # Capture forces is_extend_in_batch False; the scope term keeps a
+        # prefill graph on the prefill path instead of the decode MC2 path.
+        if get_is_extend_in_batch() or is_in_prefill_graph_scope():
             if self.moe_ascend_ops_config.prefill == "allgather":
                 return self._dispatch_allgather(
                     hidden_states, topk_weights, topk_ids, self.tp_group
@@ -426,20 +428,29 @@ class AscendOpsDispatcher(BaseDispatcher):
         dist.all_gather(gathered_rows, local_rows_tensor, group=group)
         return [int(rows.item()) for rows in gathered_rows]
 
+    def _resolve_allgather_row_sizes(self, local_rows: int, group, device) -> list[int]:
+        row_sizes = get_forward().ascend_allgather_row_sizes
+        # Use the same branch on every rank. A local mismatch is an invariant
+        # violation, so it cannot switch this rank to a different collective.
+        if row_sizes is None or len(row_sizes) != dist.get_world_size(group):
+            return self._allgather_row_sizes(local_rows, group, device)
+        rank = dist.get_rank(group)
+        if row_sizes[rank] != local_rows:
+            raise ValueError(
+                f"Ascend AllGather rank {rank} has {local_rows} rows, "
+                f"expected {row_sizes[rank]}"
+            )
+        return row_sizes
+
     def _dispatch_allgather(self, hidden_states, topk_weights, topk_ids, group):
         """Gather the full batch on every TP rank."""
         input_dtype = hidden_states.dtype
-        quant_mode = self._quant_mode("routing")
+        quant_mode = self._quant_mode("routing", "low_latency")
         if quant_mode not in (-1, INT8_QUANT_MODE, MXFP8_QUANT_MODE):
             raise NotImplementedError(
                 "NPU AllGather supports BF16, INT8 and MXFP8 routing"
             )
-        # CP and DP can split a batch unevenly (for example with interleaved or
-        # zigzag schedules).  Deriving row counts from DP metadata assumes an
-        # equal split and becomes incorrect as soon as CP is enabled.  Exchange
-        # the actual local row count so the subsequent padded all-gather and
-        # reduce-scatter use the exact layout produced by the attention path.
-        row_sizes = self._allgather_row_sizes(
+        row_sizes = self._resolve_allgather_row_sizes(
             hidden_states.shape[0], group, hidden_states.device
         )
         world_size = len(row_sizes)
@@ -592,7 +603,7 @@ class AscendOpsDispatcher(BaseDispatcher):
             topk_ids, group
         )
 
-        quant_mode = self._quant_mode("routing")
+        quant_mode = self._quant_mode("routing", "low_latency")
         routed = npu_moe_init_routing(
             hidden_states, topk_ids, self.num_experts, quant_mode=quant_mode
         )

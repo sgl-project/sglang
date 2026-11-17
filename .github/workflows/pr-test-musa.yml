@@ -95,12 +95,14 @@ jobs:
     needs: check-changes
     if: needs.check-changes.outputs.changes_exist == 'true'
     uses: ./.github/workflows/pr-gate.yml
+    with:
+      require-label: run-ci-musa-extra
     secrets: inherit
 
   # ==================== Multimodal Gen Tests ==================== #
   multimodal-gen-test-1-gpu-musa:
     needs: [check-changes, pr-gate]
-    if: needs.check-changes.outputs.multimodal_gen == 'true' || inputs.target_stage == 'multimodal-gen-test-1-gpu-musa'
+    if: (needs.check-changes.outputs.multimodal_gen == 'true' || inputs.target_stage == 'multimodal-gen-test-1-gpu-musa') && needs.pr-gate.outputs.opted-in != 'false'
     strategy:
       fail-fast: false
       matrix:
@@ -139,7 +141,7 @@ jobs:
 
   multimodal-gen-test-2-gpu-musa:
     needs: [check-changes, pr-gate]
-    if: needs.check-changes.outputs.multimodal_gen == 'true' || inputs.target_stage == 'multimodal-gen-test-2-gpu-musa'
+    if: (needs.check-changes.outputs.multimodal_gen == 'true' || inputs.target_stage == 'multimodal-gen-test-2-gpu-musa') && needs.pr-gate.outputs.opted-in != 'false'
     runs-on: s5000-2-gpu-runner
     timeout-minutes: 240
     env:
@@ -172,7 +174,7 @@ jobs:
 
   multimodal-gen-layer-unit-test-musa:
     needs: [check-changes, pr-gate]
-    if: needs.check-changes.outputs.multimodal_gen == 'true' || inputs.target_stage == 'multimodal-gen-layer-unit-test-musa'
+    if: (needs.check-changes.outputs.multimodal_gen == 'true' || inputs.target_stage == 'multimodal-gen-layer-unit-test-musa') && needs.pr-gate.outputs.opted-in != 'false'
     runs-on: s5000-1-gpu-runner
     timeout-minutes: 240
     env:
@@ -201,7 +203,7 @@ jobs:
 # =============================================== sgl-kernel ====================================================
   sgl-kernel-unit-test-musa:
     needs: [check-changes, pr-gate]
-    if: needs.check-changes.outputs.sgl_kernel == 'true' || inputs.target_stage == 'sgl-kernel-unit-test-musa'
+    if: (needs.check-changes.outputs.sgl_kernel == 'true' || inputs.target_stage == 'sgl-kernel-unit-test-musa') && needs.pr-gate.outputs.opted-in != 'false'
     runs-on: s5000-1-gpu-runner
     timeout-minutes: 240
     env:

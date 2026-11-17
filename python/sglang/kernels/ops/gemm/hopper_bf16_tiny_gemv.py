@@ -13,10 +13,6 @@ _MAX_M = 4  # x is re-read from global per token; past 4 tokens cuBLAS wins
 _MAX_N = 64
 
 
-def _max_m_bucket(m: int) -> int:
-    return 4 if m <= 4 else 8 if m <= 8 else 16
-
-
 @cache_once
 def _jit_hopper_bf16_tiny_gemv_module(max_m: int) -> Module:
     args = make_cpp_args(max_m)
@@ -34,9 +30,11 @@ def use_hopper_bf16_tiny_gemv(m: int, n: int, k: int) -> bool:
 
 
 def hopper_bf16_tiny_gemv(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
-    """out[M, N] = x[M, K] @ w[N, K]^T, all bf16, fp32 accumulation."""
+    """out[M, N] = x[M, K] @ w[N, K]^T, all bf16, fp32 accumulation.
+
+    Shapes must pass use_hopper_bf16_tiny_gemv."""
     m = x.shape[0]
     out = torch.empty((m, w.shape[0]), dtype=torch.bfloat16, device=x.device)
-    module = _jit_hopper_bf16_tiny_gemv_module(_max_m_bucket(m))
+    module = _jit_hopper_bf16_tiny_gemv_module(_MAX_M)
     module.run(x, w, out)
     return out

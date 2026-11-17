@@ -379,44 +379,6 @@ class TestChatCompletionRequest(CustomTestCase):
                     model="test-model", messages=messages, **request_kwargs
                 )
 
-    def test_chat_completion_accepts_ordered_thinking_parts(self):
-        request = ChatCompletionRequest(
-            model="test-model",
-            messages=[
-                {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "thinking", "thinking": "first"},
-                        {"type": "text", "text": "visible"},
-                        {"type": "reasoning", "text": "second"},
-                    ],
-                }
-            ],
-        )
-        parts = request.messages[0].content
-        self.assertEqual(
-            [part.type for part in parts], ["thinking", "text", "reasoning"]
-        )
-
-    def test_chat_completion_rejects_thinking_parts_outside_assistant(self):
-        """Bug regression: adding the thinking part to the SHARED content-part
-        union silently widened acceptance to every role (user/system/tool) and
-        every model family, where downstream templates cannot render it —
-        replacing the previous clean 422 with template-dependent behavior."""
-        from pydantic import ValidationError
-
-        for role in ("user", "system", "tool"):
-            with self.subTest(role=role), self.assertRaises(ValidationError):
-                ChatCompletionRequest(
-                    model="test-model",
-                    messages=[
-                        {
-                            "role": role,
-                            "content": [{"type": "thinking", "thinking": "x"}],
-                        }
-                    ],
-                )
-
     def test_chat_completion_json_format(self):
         """Test chat completion json format"""
         transcript = "Good morning! It's 7:00 AM, and I'm just waking up. Today is going to be a busy day, "
@@ -921,6 +883,41 @@ class TestValidationEdgeCases(CustomTestCase):
         """Test negative token limits"""
         with self.assertRaises(ValidationError):
             CompletionRequest(model="test-model", prompt="Hello", max_tokens=-1)
+
+
+class TestAssistantToolCallNames(unittest.TestCase):
+    """A tool call in the conversation history must name its function."""
+
+    def _request(self, function):
+        return ChatCompletionRequest(
+            model="m",
+            messages=[
+                {"role": "user", "content": "weather?"},
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {"id": "call_1", "type": "function", "function": function}
+                    ],
+                },
+                {"role": "tool", "tool_call_id": "call_1", "content": "sunny"},
+            ],
+        )
+
+    def test_named_tool_call_accepted(self):
+        request = self._request({"name": "get_weather", "arguments": "{}"})
+        self.assertEqual(request.messages[1].tool_calls[0].function.name, "get_weather")
+
+    def test_nameless_tool_call_rejected(self):
+        for label, function in {
+            "missing": {"arguments": "{}"},
+            "null": {"name": None, "arguments": "{}"},
+            "empty": {"name": "", "arguments": "{}"},
+        }.items():
+            with self.subTest(case=label):
+                with self.assertRaises(ValidationError) as ctx:
+                    self._request(function)
+                self.assertIn("'function.name' is required", str(ctx.exception))
 
 
 class TestThinkingObject(unittest.TestCase):

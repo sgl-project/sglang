@@ -23,6 +23,7 @@ from sglang.srt.managers.schedule_policy import (
 from sglang.srt.mem_cache.allocator.hisparse import HiSparseTokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.page_interleave import PageInterleavePoolAllocator
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
+from sglang.srt.mem_cache.allocator.token import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestHandle,
     DecLockRefParams,
@@ -175,6 +176,7 @@ class TestPrefillAdder(CustomTestCase):
             max_new_tokens=max_new_tokens, ignore_eos=False
         )
         req.time_stats = SimpleNamespace(wait_queue_entry_time=wait_time)
+        req.arrival_processed_tokens = 0
         req.retracted_stain = False
         req.host_hit_length = 0
         req.window_host_hit_lengths = {}
@@ -250,9 +252,10 @@ class TestPrefillAdder(CustomTestCase):
         req.full_untruncated_fill_ids = list(range(12))
         return req
 
-    def create_shortest_prefill_adder(self, *, chunk_tokens=4096):
+    def create_shortest_prefill_adder(self, *, chunk_tokens=4096, encoder_replay=False):
         override = get_context().override_server_args(
-            schedule_policy="shortest-prefill-first"
+            schedule_policy="shortest-prefill-first",
+            enable_encoder_swa_bounded_replay=encoder_replay,
         )
         override.install()
         self.addCleanup(override.restore)
@@ -281,7 +284,11 @@ class TestPrefillAdder(CustomTestCase):
             req.full_untruncated_fill_ids = list(range(length))
             req.num_matched_prefix_tokens = 0
         adder.chunked_req_limit = policy.shortest_prefill_chunk_limit(
-            continuation, waiting, adder.rem_chunk_tokens, adder.page_size
+            continuation,
+            waiting,
+            adder.rem_chunk_tokens,
+            adder.page_size,
+            processed_tokens=0,
         )
         self.assertIs(adder.add_chunked_req(continuation), continuation)
         self.assertEqual(continuation.extend_len, 2560)
@@ -291,6 +298,40 @@ class TestPrefillAdder(CustomTestCase):
         self.assertIsNone(adder.new_chunked_req)
         self.assertEqual(adder.rem_chunk_tokens, 0)
         self.assertGreaterEqual(adder.rem_total_tokens, 0)
+
+    def test_shortest_prefill_reserves_encoder_replay_rows_of_hits(self):
+        # Admission charges a hit's replay rows to the chunk. A reservation
+        # without them leaves the hit unable to fit whole, so it waits and the
+        # room reserved for it goes unused.
+        adder = self.create_shortest_prefill_adder(encoder_replay=True)
+        policy = SchedulePolicy(
+            policy="shortest-prefill-first",
+            tree_cache=RadixCache.create_simulated(),
+            enable_hierarchical_cache=True,
+            enable_priority_scheduling=False,
+            schedule_low_priority_values_first=False,
+        )
+        continuation = self.create_shared_req("continuation")
+        continuation.full_untruncated_fill_ids = list(range(16384))
+        hit = self.create_shared_req("hit")
+        hit.origin_input_ids = list(range(4096 + 1024))
+        hit.full_untruncated_fill_ids = hit.origin_input_ids
+        hit.num_matched_prefix_tokens = 4096
+        hit.prefix_len = 4096
+        hit.kv.req_pool_idx = None
+        hit.is_retracted = False
+        adder.chunked_req_limit = policy.shortest_prefill_chunk_limit(
+            continuation,
+            [hit],
+            adder.rem_chunk_tokens,
+            adder.page_size,
+            processed_tokens=0,
+        )
+        adder.add_chunked_req(continuation)
+        # 1024 extend + 128 replay rows reserved, page-floored: 4096 - 1280.
+        self.assertEqual(continuation.extend_len, 2816)
+        adder.add_one_req(hit, has_chunked_req=True, truncation_align_size=None)
+        self.assertEqual(adder.can_run_list, [continuation, hit])
 
     def test_shortest_prefill_rejects_second_unfinished_chunk(self):
         adder = self.create_shortest_prefill_adder(chunk_tokens=512)
@@ -389,6 +430,72 @@ class TestPrefillAdder(CustomTestCase):
         req.full_untruncated_fill_ids = list(range(8192))
         self.assertIs(adder.add_chunked_req(req), req)
         self.assertEqual(req.extend_len, 4096)
+
+    def test_continuation_parks_when_decode_headroom_exhausts_budget(self):
+        """A chunked continuation must not take KV reserved for running decodes;
+        it waits instead of overcommitting the pool."""
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_token_allocator.available_size.return_value = 3200
+        running = [
+            self.create_mock_req(f"decode{i}", priority=0, max_new_tokens=4096)
+            for i in range(4)
+        ]
+        adder = self.create_adder(
+            self.create_running_batch(running), page_size=64, rem_chunk_tokens=16384
+        )
+        req = self.create_shared_req("continuation")
+        req.full_untruncated_fill_ids = list(range(100_000))
+        self.assertIs(adder.add_chunked_req(req), req)
+        self.assertEqual(adder.can_run_list, [])
+
+    def test_continuation_parks_when_mixed_decode_exhausts_chunk_budget(self):
+        """With more mixed decode rows than the chunk holds, the chunk budget is
+        not positive; the continuation must not get an empty or negative chunk."""
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        self.mock_token_allocator.available_size.return_value = 1000
+        for decode_tokens in (16, 28):
+            with self.subTest(decode_tokens=decode_tokens):
+                adder = self.create_adder(
+                    self.create_running_batch(),
+                    rem_chunk_tokens=16,
+                    num_mixed_decode_tokens=decode_tokens,
+                )
+                req = self.create_shared_req("continuation")
+                before = adder.memory_budget.total_offset
+                self.assertIs(adder.add_chunked_req(req), req)
+                self.assertEqual(adder.can_run_list, [])
+                self.assertIsNone(req.extend_end)
+                self.assertEqual(adder.memory_budget.total_offset, before)
+
+    def test_sharded_continuation_waits_for_memory_but_not_for_a_short_chunk(self):
+        """Under KV sharding the chunk ends on a page; when that leaves nothing,
+        the continuation waits if memory bounds it, else runs the chunk as is."""
+        self.mock_tree_cache.supports_mamba.return_value = False
+        self.mock_tree_cache.supports_prefix_sharing.return_value = False
+        cases = [
+            # (free tokens, chunk tokens, expected extend_len; None parks)
+            (1000, 64, 64),
+            (3, 64, None),
+            (1000, 3, 3),
+        ]
+        for available, chunk, expected in cases:
+            with self.subTest(available=available, chunk=chunk):
+                self.mock_token_allocator.available_size.return_value = available
+                adder = self.create_adder(
+                    self.create_running_batch(), page_size=16, rem_chunk_tokens=chunk
+                )
+                adder.kv_shard_granule = 16
+                req = self.create_shared_req("continuation")
+                req.prefix_len = 16
+                req.full_untruncated_fill_ids = list(range(200))
+                self.assertIs(adder.add_chunked_req(req), req)
+                if expected is None:
+                    self.assertEqual(adder.can_run_list, [])
+                    self.assertIsNone(req.extend_end)
+                else:
+                    self.assertEqual(req.extend_len, expected)
 
     def test_exact_chunk_fill_keeps_mamba_chunks_page_aligned(self):
         # A Mamba checkpoint only lands on a page-aligned chunk end, so an
@@ -1239,16 +1346,25 @@ class TestPrefillAdder(CustomTestCase):
                 max_prefix_tokens=max_prefix_tokens,
                 chunk_tokens=chunk_tokens,
             )
-        allocator = PageInterleavePoolAllocator(
-            size=allocator_size,
-            physical_page_size=shard_spec.page_size,
-            shard_size=shard_spec.shard_size,
-            dtype=torch.int64,
-            device="cpu",
-            kvcache=None,
-            need_sort=False,
-            shard_spec=shard_spec,
-        )
+        if shard_spec.shard_size == 1:
+            allocator = TokenToKVPoolAllocator(
+                size=allocator_size,
+                dtype=torch.int64,
+                device="cpu",
+                kvcache=None,
+                need_sort=False,
+            )
+        else:
+            allocator = PageInterleavePoolAllocator(
+                size=allocator_size,
+                physical_page_size=shard_spec.page_size,
+                shard_size=shard_spec.shard_size,
+                dtype=torch.int64,
+                device="cpu",
+                kvcache=None,
+                need_sort=False,
+                shard_spec=shard_spec,
+            )
         return self.create_adder(
             self.create_running_batch(),
             page_size=shard_spec.page_size,
@@ -1433,17 +1549,17 @@ class TestPrefillAdder(CustomTestCase):
         self.assertEqual(adder.kv_shard_block_bound_pages, 2)
         self.assertEqual(adder.kv_shard_chunk_pages, 1)
 
-    def test_bootstrap_limit_is_the_sharded_admission_boundary(self):
-        """The P/D bootstrap check rejects every prompt that sharded admission
-        can never fit, so none of them waits in the queue forever."""
+    def test_bootstrap_limit_is_the_admission_boundary(self):
+        """The P/D bootstrap check rejects every prompt that admission can
+        never fit, so none of them waits in the queue forever."""
         page_size, tokens_per_rank = 64, 16384
         self.assertEqual(
             max_bootstrap_input_len(capacity=32768, page_size=64, shard_size=2), 32576
         )
         self.assertEqual(
-            max_bootstrap_input_len(capacity=16384, page_size=64, shard_size=1), 16384
+            max_bootstrap_input_len(capacity=16384, page_size=64, shard_size=1), 16256
         )
-        for shard_size in (2, 4):
+        for shard_size in (1, 2, 4):
             capacity = shard_size * tokens_per_rank
             queue = PrefillBootstrapQueue.__new__(PrefillBootstrapQueue)
             queue.scheduler = SimpleNamespace(
@@ -1595,8 +1711,11 @@ class TestPrefillAdder(CustomTestCase):
             prefill_retire_lag=0, decode_retire_lag=0, eviction_interval=1
         )
         budget.checkpoint_interval = 0
+        budget._demands = {}
         # 48 owner tokens free; nothing else holds memory to give back.
-        budget._fits = lambda full, windows, state_slots, **kwargs: full <= 48
+        budget._fits = lambda full, windows, state_slots, request_rows=0, **kwargs: (
+            full <= 48
+        )
         budget._others_hold_memory = lambda req: False
         adder.memory_budget = budget
         adder.mamba_chunk_grid = 64

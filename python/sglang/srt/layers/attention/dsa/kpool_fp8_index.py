@@ -265,6 +265,9 @@ def _prep_update_kpool_write_plan_launch(
     # N > kpool where one write closes multiple pools.
     max_closed_pools = kpool_max_closed_pools(num_draft_tokens, kpool)
     bs = write_start.shape[0]
+    page_table_rows = real_page_table.shape[0]  # in [bs*N, bs]
+    assert page_table_rows % bs == 0, f"{real_page_table.shape=}, {bs=}"
+    page_table_batch_stride = page_table_rows // bs
 
     assert write_loc_out.shape == (bs, max_closed_pools), write_loc_out.shape
     assert write_loc_out.stride(1) == 1, write_loc_out.stride()
@@ -299,6 +302,7 @@ def _prep_update_kpool_write_plan_launch(
         INDEX_PAGE_SIZE=index_page_size,
         MAX_CLOSED_POOLS=max_closed_pools,
         HAS_PER_Q=has_per_q_outputs,
+        PAGE_TABLE_BATCH_STRIDE=page_table_batch_stride,
     )
     return bs, args, constexprs
 
@@ -356,6 +360,7 @@ def _update_kpool_write_plan_kernel(
     INDEX_PAGE_SIZE: tl.constexpr,
     MAX_CLOSED_POOLS: tl.constexpr,
     HAS_PER_Q: tl.constexpr,
+    PAGE_TABLE_BATCH_STRIDE: tl.constexpr,
 ):
     b = tl.program_id(0)
     ws = tl.load(write_start_ptr + b).to(tl.int32)
@@ -384,7 +389,7 @@ def _update_kpool_write_plan_kernel(
         packed_page = (
             tl.load(
                 real_page_table_ptr
-                + (b * N).to(tl.int64) * real_page_table_stride_0
+                + (b * PAGE_TABLE_BATCH_STRIDE).to(tl.int64) * real_page_table_stride_0
                 + token_page_row
             ).to(tl.int64)
             // POOL_SIZE
@@ -1668,133 +1673,6 @@ def _scatter_kpool_tail_updates_kernel(
     )
     tl.store(tail_k_ptr + dst, k, mask=mask)
     tl.store(tail_score_ptr + dst, s, mask=mask)
-
-
-@triton.jit
-def _pack_pool_slots_to_payload_kernel(
-    buf_ptr,
-    locs_ptr,
-    payload_ptr,
-    payload_bytes: tl.constexpr,
-    index_page_size: tl.constexpr,
-    head_dim: tl.constexpr,
-    page_bytes: tl.constexpr,
-    scale_region_off: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    row = tl.program_id(0)
-    loc = tl.load(locs_ptr + row).to(tl.int64)
-    page = loc // index_page_size
-    slot = loc % index_page_size
-    page_base = page * page_bytes
-
-    offs = tl.arange(0, BLOCK_D)
-    mask = offs < head_dim
-    src = page_base + slot * head_dim + offs
-    val = tl.load(buf_ptr + src, mask=mask, other=0).to(tl.uint8)
-    tl.store(payload_ptr + row * payload_bytes + offs, val, mask=mask)
-
-    s_offs = tl.arange(0, 4)
-    s_src = page_base + scale_region_off + slot * 4 + s_offs
-    s_val = tl.load(buf_ptr + s_src).to(tl.uint8)
-    tl.store(payload_ptr + row * payload_bytes + head_dim + s_offs, s_val)
-
-
-@triton.jit
-def _select_and_scatter_pool_slots_kernel(
-    recv_ptr,
-    owner_ptr,
-    locs_ptr,
-    buf_ptr,
-    cp_rank: tl.constexpr,
-    payload_bytes: tl.constexpr,
-    index_page_size: tl.constexpr,
-    head_dim: tl.constexpr,
-    page_bytes: tl.constexpr,
-    scale_region_off: tl.constexpr,
-    n_total: tl.constexpr,
-    BLOCK_D: tl.constexpr,
-):
-    row = tl.program_id(0)
-    owner = tl.load(owner_ptr + row).to(tl.int64)
-    if owner == cp_rank:
-        return
-
-    loc = tl.load(locs_ptr + row).to(tl.int64)
-    page = loc // index_page_size
-    slot = loc % index_page_size
-    page_base = page * page_bytes
-    recv_row_base = (owner * n_total + row) * payload_bytes
-
-    offs = tl.arange(0, BLOCK_D)
-    mask = offs < head_dim
-    val = tl.load(recv_ptr + recv_row_base + offs, mask=mask, other=0).to(tl.uint8)
-    dst = page_base + slot * head_dim + offs
-    tl.store(buf_ptr + dst, val, mask=mask)
-
-    s_offs = tl.arange(0, 4)
-    s_val = tl.load(recv_ptr + recv_row_base + head_dim + s_offs).to(tl.uint8)
-    s_dst = page_base + scale_region_off + slot * 4 + s_offs
-    tl.store(buf_ptr + s_dst, s_val)
-
-
-def all_gather_and_scatter_pool_slots(
-    buf: torch.Tensor,
-    local_locs: torch.Tensor,
-    owner_rank: torch.Tensor,
-    cp_size: int,
-    cp_rank: int,
-    index_page_size: int,
-) -> None:
-    from sglang.srt.layers.dp_attention import attn_cp_all_gather_into_tensor
-
-    assert buf.is_contiguous()
-    n_total = local_locs.shape[0]
-    if n_total == 0 or cp_size <= 1:
-        return
-
-    head_dim = INDEX_HEAD_DIM
-    payload_bytes = head_dim + 4
-    scale_region_off = index_page_size * head_dim
-    page_bytes = buf.shape[1]
-    device = buf.device
-
-    send_payload = torch.empty(
-        (n_total, payload_bytes), dtype=torch.uint8, device=device
-    )
-    _pack_pool_slots_to_payload_kernel[(n_total,)](
-        buf,
-        local_locs,
-        send_payload,
-        payload_bytes=payload_bytes,
-        index_page_size=index_page_size,
-        head_dim=head_dim,
-        page_bytes=page_bytes,
-        scale_region_off=scale_region_off,
-        BLOCK_D=triton.next_power_of_2(head_dim),
-    )
-
-    recv = torch.empty(
-        (cp_size, n_total, payload_bytes), dtype=torch.uint8, device=device
-    )
-    attn_cp_all_gather_into_tensor(
-        recv.view(cp_size * n_total, payload_bytes), send_payload
-    )
-
-    _select_and_scatter_pool_slots_kernel[(n_total,)](
-        recv,
-        owner_rank,
-        local_locs,
-        buf,
-        cp_rank=cp_rank,
-        payload_bytes=payload_bytes,
-        index_page_size=index_page_size,
-        head_dim=head_dim,
-        page_bytes=page_bytes,
-        scale_region_off=scale_region_off,
-        n_total=n_total,
-        BLOCK_D=triton.next_power_of_2(head_dim),
-    )
 
 
 @triton.jit

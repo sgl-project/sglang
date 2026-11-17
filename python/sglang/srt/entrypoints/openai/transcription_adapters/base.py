@@ -22,6 +22,10 @@ class TranscriptionAdapter(ABC):
     def build_sampling_params(self, request: TranscriptionRequest) -> dict:
         """Return the ``sampling_params`` dict for ``GenerateReqInput``."""
 
+    def build_prompt(self, request: TranscriptionRequest, tokenizer) -> str:
+        """Build the transcription prompt; empty delegates to the processor."""
+        return ""
+
     @property
     def supports_language_detection(self) -> bool:
         """Whether this model supports automatic language detection.

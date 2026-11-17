@@ -198,15 +198,15 @@ done
 # Before running, replace the following placeholders:
 #   <your prefill ip>: prefill node IP address
 #   <your decode ip>: decode node IP address
+#   /path/to/model-weights: the MODEL_PATH the workers were launched with
 # ============================================================
 
-python -m sglang_router.launch_router \
-    --pd-disaggregation \
-    --prefill http://<your prefill ip>:8000 8998 \
-    --decode http://<your decode ip>:8001 \
+sgl-router \
+    --model-id /path/to/model-weights \
+    --no-tokenizer \
+    --worker-urls http://<your prefill ip>:8000 http://<your decode ip>:8001 \
     --host 127.0.0.1 \
-    --port 6688 \
-    --policy cache_aware
+    --port 6688
 ```
 
 #### Benchmark

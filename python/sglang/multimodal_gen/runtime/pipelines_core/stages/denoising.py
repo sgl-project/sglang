@@ -34,6 +34,7 @@ from sglang.kernels.ops.diffusion import (
     MINIMAX_H3_NORM_MODULATE,
     NVFP4_BIAS_GELU,
     QWEN_IMAGE_ADDED_QKV,
+    SANA_VIDEO2_SOFTMAX_ATTENTION,
     SANA_VIDEO_LINEAR_ATTENTION,
     WAN_ROCM_FLYDSL_NORM_SCALE_SHIFT,
     QualityGatedFusion,
@@ -202,6 +203,9 @@ _QUALITY_FUSION_HANDLERS: tuple[tuple[str, QualityGatedFusion], ...] = (
     # the first attention GEMM takes BF16 inputs where the reference
     # promotes them to FP32
     ("high", SANA_VIDEO_LINEAR_ATTENTION),
+    # the anchor layers' SDPA takes BF16 inputs where the reference promotes
+    # them to FP32, so the probabilities round to BF16 before the PV GEMM
+    ("high", SANA_VIDEO2_SOFTMAX_ATTENTION),
 )
 
 
@@ -366,12 +370,6 @@ class DenoisingStage(PipelineStage):
         self._attn_metadata_head_size = attn_head_size
         self._attention_backend_active_override: AttentionBackendEnum | None = None
         self._skip_softmax_forced_fa = False
-
-        # cfg
-        self.guidance = None
-
-        # misc
-        self.profiler = None
         self._extra_func_kwarg_names_cache: dict[int, tuple[bool, frozenset[str]]] = {}
 
     def _infer_transformer_attention_backend(self) -> AttentionBackendEnum | None:

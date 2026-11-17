@@ -357,6 +357,9 @@ class TestMambaPrefillTrackMetadata(unittest.TestCase):
                     mamba_track_seqlens=torch.tensor([65]),
                     mamba_prefill_track_mask_cpu=[True],
                     mamba_track_seqlens_cpu=[65],
+                    token_to_kv_pool_allocator=SimpleNamespace(
+                        state=SimpleNamespace(tracks_decode_state=True)
+                    ),
                 )
                 snapshot = batch.copy()
                 if verify:
@@ -468,6 +471,9 @@ def make_verify_batch():
             req_index_to_mamba_ping_pong_track_buffer_mapping=mapping
         ),
         mamba_lazy_spec_track_positions_cpu=[1, 0, 0],
+        token_to_kv_pool_allocator=SimpleNamespace(
+            state=SimpleNamespace(tracks_decode_state=True)
+        ),
     )
 
 

@@ -22,6 +22,7 @@ from sglang.kernels.ops.moe.mxfp4_compact_a4_moe import compact_a4_experts
 from sglang.kernels.ops.quantization.mxfp4_quant_rows import mxfp4_quant_rows
 from sglang.srt.environ import envs
 from sglang.srt.rocm_muse_spark import muse_moe_flydsl
+from sglang.srt.utils.device import is_gfx95_supported
 
 
 def _has_module(name: str) -> bool:
@@ -31,13 +32,15 @@ def _has_module(name: str) -> bool:
         return False
 
 
-# Both paths finalize through aiter's FlyDSL Muse finalize (3rdparty/amd/muse_spark aiter patch 04); an
-# aiter without it keeps the Triton expert path.
-_HAS_AITER_MUSE_FINALIZE = _has_module("aiter.ops.flydsl.muse_moe_finalize")
-COMPACT_A4_ENABLED = (
-    envs.SGLANG_ROCM_MUSE_COMPACT_A4_VERIFY.get() and _HAS_AITER_MUSE_FINALIZE
+# Both paths finalize through the FlyDSL Muse finalize (sglang.kernels.ops.moe.muse_moe_finalize), built on
+# FlyDSL and aiter's FlyDSL buffer helpers for gfx950; elsewhere the Triton expert path serves.
+_HAS_FLYDSL = (
+    is_gfx95_supported()
+    and _has_module("flydsl")
+    and _has_module("aiter.ops.flydsl.kernels.buffer_ops")
 )
-A4W4_ENABLED = envs.SGLANG_ROCM_MUSE_A4W4_MOE.get() and _HAS_AITER_MUSE_FINALIZE
+COMPACT_A4_ENABLED = envs.SGLANG_ROCM_MUSE_COMPACT_A4_VERIFY.get() and _HAS_FLYDSL
+A4W4_ENABLED = envs.SGLANG_ROCM_MUSE_A4W4_MOE.get() and _HAS_FLYDSL
 A4W4_MIN_ROWS = 256
 # Stage-1 launch (tile_n, async copy, waves per EU), MI355X prefill widths.
 _S1_TILE_N = 128

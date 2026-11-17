@@ -258,13 +258,12 @@ sgl-eval run aime25 \\
       router: {
         port: 8000,
         command:
-`python3 -m sglang_router.launch_router \\
-  --pd-disaggregation \\
-  --prefill http://<prefill-host>:{{PREFILL_PORT}} \\
-  --decode http://<decode-host>:{{DECODE_PORT}} \\
+`sgl-router \\
+  --model-id {{MODEL_NAME}} \\
+  --no-tokenizer \\
+  --worker-urls http://<prefill-host>:{{PREFILL_PORT}} http://<decode-host>:{{DECODE_PORT}} \\
   --host 0.0.0.0 --port {{ROUTER_PORT}} \\
-  --disable-circuit-breaker \\
-  --health-check-interval-secs 999999`,
+  --disable-circuit-breaker`,
       },
     },
 
@@ -288,7 +287,7 @@ sgl-eval run aime25 \\
   // worker topology; changing a GPU overlay must never rewrite these commands.
   resolveRecipe: (cell, s) => {
     if (!((s.hw === "a3" && s.nodes === "single") || (s.hw === "a5" && s.nodes === "multi-2")) || !["prefill", "decode", "router"].includes(s.pdMode)) return cell;
-    const router = { port: 30000, command: s.hw === "a5" ? config.npuRouterCommand.replace("--policy round_robin", "--policy cache_aware") : config.npuRouterCommand };
+    const router = { port: 30000, command: config.npuRouterCommand(s.hw === "a5" ? "glm52" : "glm-5") };
     if (s.pdMode === "router") return { ...cell, pd: true, pdMode: "router",
       nnodes: 1, verified: false, env: [], flags: [], warn: undefined,
       commands: { python: router.command, docker: `docker run --network host --rm ${s.hw === "a5" ? "<your-compatible-950pr-dt-series-image>" : "quay.io/ascend/sglang:v0.5.22-cann9.1.0-a3"} ${router.command}` }, router };
@@ -303,7 +302,7 @@ sgl-eval run aime25 \\
       commands: { python: command } };
   },
 
-  npuRouterCommand: "python3 -m sglang_router.launch_router \\\n  --pd-disaggregation \\\n  --prefill http://<prefill-head-ip>:30000 8998 \\\n  --decode http://<decode-head-ip>:30100 \\\n  --host {{HOST_IP}} --port {{PORT}} \\\n  --policy round_robin",
+  npuRouterCommand: (modelId) => `sgl-router \\\n  --model-id ${modelId} \\\n  --no-tokenizer \\\n  --worker-urls http://<prefill-head-ip>:30000 http://<decode-head-ip>:30100 \\\n  --host {{HOST_IP}} --port {{PORT}} \\\n  --policy round_robin`,
 
   npuPdRecipes: [
     {
