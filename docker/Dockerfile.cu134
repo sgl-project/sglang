@@ -491,6 +491,9 @@ RUN --mount=type=cache,target=/root/.cache/pip \
            sed -i "s|^  \"torch==.*|  \"torch==${TORCH_VERSION}\",|" pyproject.toml && \
            sed -i "s|^  \"torchaudio==.*|  \"torchaudio==${TORCHAUDIO_VERSION}\",|" pyproject.toml && \
            sed -i "s|^  \"torchvision\",\$|  \"torchvision==${TORCHVISION_VERSION}\",|" pyproject.toml && \
+           # sgl-fa3 pins the torch it was built against (non-stable torch C++ ABI) and only
+           # ships sm80/sm86/sm90a kernels, so no release fits this image; FA3 is imported lazily.
+           sed -i '/^  "sgl-fa3==/d' pyproject.toml && \
            if [ "${SGL_WHEELS_SOURCE}" = "source" ]; then \
                sed -i 's|"torchcodec==[0-9.]*|"torchcodec|' pyproject.toml && \
                sed -i 's|^  "sglang-kernel==.*|  "sglang-kernel",|' pyproject.toml && \
